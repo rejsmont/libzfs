@@ -534,17 +534,17 @@ class Get(Command, SListArgument, ZListArgument):
 
     @classmethod
     def _get(cls, ds: Optional[DatasetList] = None, properties: Optional[StringList] = 'all',
-             types: Optional[StringList] = 'all', sources: Optional[StringList] = None, recursive: bool = False,
+             types: Optional[StringList] = 'all', sources: Optional[StringList] = 'all', recursive: bool = False,
              depth: int = 0, lazy=False) -> Iterable[ZFS]:
 
         cmd = [ZFS_BIN, 'get', '-H', '-o', 'all']
+        sources = cls._slist_to_list(sources, validator=Validate.source)
 
         if not recursive and ds:
             cmd += ['-d', '1']
         elif depth > 0:
             cmd += ['-d', str(depth)]
 
-        sources = cls._slist_to_list(sources, validator=Validate.source)
         cmd += ['-t', cls._slist_to_str(types, validator=Validate.type)]
 
         properties = cls._slist_to_list(properties, validator=Validate.attribute)

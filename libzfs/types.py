@@ -138,6 +138,8 @@ PropertyItem = Tuple[str, Property]
 
 class ZFS:
 
+    _prop_names = []
+
     def __init__(self, name: str, properties: Optional[Properties] = None) -> None:
         self._name = name
         self._props = {}
@@ -251,16 +253,16 @@ class Volume(Dataset):
 
 
 class Snapshot(ZFS):
-    _prop_names = PropertyNames.snapshot + PropertyNames.filesystem + PropertyNames.volume
+    __prop_names = PropertyNames.snapshot
 
     def __init__(self, ds: Dataset, name: str, properties: Optional[Properties] = None) -> None:
         if not isinstance(ds, Dataset):
             raise ValueError('Expected Filesystem, Volume or Dataset, got ' + type(ds).__name__ + ' instead')
         name = ds.name + '@' + name.strip('@')
         Validate.snapshot(name)
-        super().__init__(name, properties)
         self._dataset = ds
         self._type = 'snapshot'
+        super().__init__(name, properties)
 
     @property
     def dataset(self) -> Dataset:
@@ -274,6 +276,15 @@ class Snapshot(ZFS):
     def from_name(cls, name: str, dstype='snapshot', properties: Optional[Properties] = None):
         ds, name = name.split('@')
         return cls(Dataset(ds), name, properties)
+
+    @property
+    def _prop_names(self):
+        if isinstance(self.dataset, Filesystem):
+            return self.__prop_names + PropertyNames.fs_snap
+        elif isinstance(self.dataset, Volume):
+            return self.__prop_names + PropertyNames.vol_snap
+        else:
+            return self.__prop_names + PropertyNames.fs_snap + PropertyNames.vol_snap
 
 
 class SnapshotRange:
