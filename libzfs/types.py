@@ -131,9 +131,9 @@ class Property:
         return self._value
 
 
-PropertyValue = Union[Property, str]
+PropertyValue = Union[Property, str, None]
 Properties = Dict[str, PropertyValue]
-PropertyItem = Tuple[str, Property]
+PropertyItem = Tuple[str, Optional[Property]]
 
 
 class ZFS:
@@ -163,16 +163,20 @@ class ZFS:
     def update(self, properties: Properties):
         for k, v in properties.items():
             Validate.attribute(k)
-            if v is None:
-                continue
-            if not isinstance(v, Property):
+            if v is not None and not isinstance(v, Property):
                 v = Property(v)
             try:
                 idx = self._prop_names.index(k)
-                self._props[idx] = v
+                if v is not None:
+                    self._props[idx] = v
+                elif idx in self._props:
+                    del self._props[idx]
             except ValueError:
                 if ':' in k:
-                    self._user_props[k] = v
+                    if v is not None:
+                        self._user_props[k] = v
+                    elif k in self._user_props:
+                        del self._user_props[k]
                 else:
                     raise ValueError(k + ' is not a valid ' + self.__class__.__name__ + ' property')
 

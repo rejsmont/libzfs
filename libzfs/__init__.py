@@ -1,4 +1,4 @@
-from libzfs.zfs import List, Create, Snapshot, Bookmark, Destroy, Rename, Allow, UnAllow, Clone, Get
+from libzfs.zfs import List, Create, Snapshot, Bookmark, Destroy, Rename, Allow, UnAllow, Clone, Get, Set, Inherit
 
 
 list = List()
@@ -11,3 +11,5 @@ allow = Allow()
 unallow = UnAllow()
 clone = Clone()
 get = Get()
+set = Set()
+inherit = Inherit()

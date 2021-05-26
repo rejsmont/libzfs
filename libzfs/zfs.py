@@ -540,9 +540,9 @@ class Get(Command, SListArgument, ZListArgument):
         cmd = [ZFS_BIN, 'get', '-H', '-o', 'all']
         sources = cls._slist_to_list(sources, validator=Validate.source)
 
-        if not recursive and ds:
-            cmd += ['-d', '1']
-        elif depth > 0:
+        if recursive:
+            cmd += ['-r']
+        if depth > 0:
             cmd += ['-d', str(depth)]
 
         cmd += ['-t', cls._slist_to_str(types, validator=Validate.type)]
@@ -566,7 +566,7 @@ class Get(Command, SListArgument, ZListArgument):
 
     @staticmethod
     def _lines_to_objects(lines, sources) -> Iterable[Datasets]:
-        dsname, properties = '', {}
+        name, dsname, properties = '', '', {}
         for line in lines:
             name, prop, value, received, source = line.split('\t')
             if not dsname:
@@ -576,8 +576,53 @@ class Get(Command, SListArgument, ZListArgument):
                 dstype = properties.pop('type', None)
                 if name and dstype:
                     yield ZFS.from_name(dsname, dstype, properties)
-                    dsname, properties = '', {}
+                dsname, properties = '', {}
             if prop == 'type':
                 properties[prop] = value
             elif 'all' in sources or source in sources:
                 properties[prop] = Property(value, source, received)
+
+        properties.pop('name', None)
+        dstype = properties.pop('type', None)
+        if name and dstype:
+            yield ZFS.from_name(dsname, dstype, properties)
+
+
+class Set(Command):
+
+    def __call__(self, *args, **kwargs):
+        return self._set(*args, **kwargs)
+
+    @classmethod
+    def _set(cls, ds: Datasets, properties: Properties) -> Datasets:
+
+        ds.update(properties)
+
+        cmd = [ZFS_BIN, 'set']
+        for k, v in properties:
+            cmd += [k + '=' + str(v)]
+        cmd += [str(ds)]
+        cls._exec(cmd)
+
+        return ds
+
+
+class Inherit(Command):
+
+    def __call__(self, *args, **kwargs):
+        return self._inherit(*args, **kwargs)
+
+    @classmethod
+    def _inherit(cls, ds: Datasets, prop: str, recursive: bool = False, received: bool = False) -> Datasets:
+
+        ds.update({prop: None})
+
+        cmd = [ZFS_BIN, 'inherit', prop]
+        if recursive:
+            cmd += ['-r']
+        if received:
+            cmd += ['-S']
+        cmd += [str(ds)]
+        cls._exec(cmd)
+
+        return ds
