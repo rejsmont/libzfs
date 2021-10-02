@@ -2,6 +2,7 @@ from libzfs.types import Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as
     SnapshotRange, Property, Properties
 from typing import Optional, Union, Dict, Iterable, Callable
 
+import io
 import subprocess
 import shutil
 
@@ -55,7 +56,20 @@ class Command:
         return None
 
 
-class SListArgument:
+class PropertyCommand:
+
+    @staticmethod
+    def _get_props(properties: Properties, flag: bool = False):
+        cmd = []
+        for k, v in properties:
+            if flag:
+                cmd += ['-o', k + '=' + str(v)]
+            else:
+                cmd += [k + '=' + str(v)]
+        return cmd
+
+
+class StringListArgument:
 
     @staticmethod
     def _slist_to_list(slist: StringList, separator: str = ',', validator: Optional[Callable[[str], None]] = None):
@@ -73,7 +87,7 @@ class SListArgument:
         return separator.join([str(s) for s in cls._slist_to_list(slist, separator, validator)])
 
 
-class DsListArgument:
+class DatasetListArgument:
 
     @staticmethod
     def _dslist_to_list(dslist: DatasetList):
@@ -92,7 +106,7 @@ class DsListArgument:
         return separator.join([str(s) for s in cls._dslist_to_list(dslist)])
 
 
-class ZListArgument:
+class ZFSListArgument:
 
     @staticmethod
     def _zlist_to_list(zlist: ZFSList):
@@ -111,7 +125,7 @@ class ZListArgument:
         return separator.join([str(s) for s in cls._zlist_to_list(dslist)])
 
 
-class List(Command, SListArgument, DsListArgument):
+class List(Command, StringListArgument, DatasetListArgument):
 
     def __call__(self, *args, **kwargs):
         """List ZFS datasets.
@@ -189,8 +203,18 @@ class List(Command, SListArgument, DsListArgument):
 
 
 class Create(Command):
-
+    
     def __call__(self, *args, **kwargs):
+        """Create ZFS filesystem or volume.
+
+        Keyword arguments:
+            ds: str -- dataset or volume name
+            properties: Properties -- properties to set on the created dataset / volume (default None)
+
+        Returns:
+            A ZFS Filesystem or Volume object
+        """
+
         return self._create(*args, **kwargs)
 
     @classmethod
@@ -202,6 +226,17 @@ class Create(Command):
 
     @classmethod
     def filesystem(cls, ds: str, properties: Optional[Properties] = None, mount=True, parents=False) -> Filesystem:
+        """Create ZFS filesystem.
+
+        Keyword arguments:
+            ds: str -- dataset name
+            properties: Properties -- properties to set on the created dataset (default None)
+            mount: bool -- should the created dataset be mounted (default True)
+            parents: bool -- whether to create parent datasets if needed (default False)
+
+        Returns:
+            A ZFS Filesystem object
+        """
 
         filesystem = Filesystem(ds, properties)
         cmd = [ZFS_BIN, 'create']
@@ -220,6 +255,19 @@ class Create(Command):
     @classmethod
     def volume(cls, ds: str, size: str, properties: Optional[Properties] = None, sparse=False,
                parents=False) -> Volume:
+        
+        """Create ZFS volume.
+
+        Keyword arguments:
+            ds: str -- dataset or volume name
+            size: str -- volume size
+            properties: Properties -- properties to set on the created volume (default None)
+            sparse: bool -- should the created volume be sparse (default False)
+            parents: bool -- whether to create parent datasets if needed (default False)
+
+        Returns:
+            A ZFS Volume object
+        """
 
         volume = Volume(ds, properties)
         cmd = [ZFS_BIN, 'create', '-V', size]
@@ -265,7 +313,6 @@ class Bookmark(Command):
 
     @classmethod
     def _bookmark(cls, ds: Union[Bookmk, Snap], name: str) -> Bookmk:
-
         if not isinstance(ds, (Bookmk, Snap)):
             raise ValueError('Expected Bookmark or Snapshot, got ' + type(ds).__name__ + ' instead')
 
@@ -423,7 +470,7 @@ class Rename(Command):
         return new
 
 
-class Allow(Command, SListArgument):
+class Allow(Command, StringListArgument):
 
     def __call__(self, *args, **kwargs):
         return self._allow(True, *args, **kwargs)
@@ -527,7 +574,7 @@ class Clone(Command):
         return dataset
 
 
-class Get(Command, SListArgument, ZListArgument):
+class Get(Command, StringListArgument, ZFSListArgument):
 
     def __call__(self, *args, **kwargs):
         return self._get(*args, **kwargs)
@@ -537,32 +584,42 @@ class Get(Command, SListArgument, ZListArgument):
              types: Optional[StringList] = 'all', sources: Optional[StringList] = 'all', recursive: bool = False,
              depth: int = 0, lazy=False) -> Iterable[ZFS]:
 
-        cmd = [ZFS_BIN, 'get', '-H', '-o', 'all']
         sources = cls._slist_to_list(sources, validator=Validate.source)
-
-        if recursive:
-            cmd += ['-r']
-        if depth > 0:
-            cmd += ['-d', str(depth)]
-
-        cmd += ['-t', cls._slist_to_str(types, validator=Validate.type)]
-
+        types = cls._slist_to_str(types, validator=Validate.type)
         properties = cls._slist_to_list(properties, validator=Validate.attribute)
-        if 'all' in properties:
-            properties = ['all']
-        else:
-            properties = ['name', 'type'] + properties
-        cmd += [','.join(properties)]
-
-        if ds:
-            cmd += [cls._zlist_to_str(ds)]
-
+        datasets = cls._zlist_to_str(ds)
+        cmd = [ZFS_BIN, 'get', '-H', '-o', 'all'] + \
+            cls._get_options(recursive=recursive, depth=depth, types=types, properties=properties, datasets=datasets)
         result = cls._lines_to_objects((line for line in cls._exec_out(cmd)), sources)
 
         if lazy:
             return (o for o in result if o is not None)
         else:
             return [o for o in result if o is not None]
+
+    @staticmethod
+    def _get_options(**kwargs):
+        cmd = []
+        if kwargs.get('recursive', False):
+            cmd += ['-r']
+
+        depth = kwargs.get('depth', 0)
+        if depth > 0:
+            cmd += ['-d', str(depth)]
+        cmd += ['-t', kwargs.get('types')]
+
+        properties = kwargs.get('properties')
+        if 'all' in properties:
+            properties = ['all']
+        else:
+            properties = ['name', 'type'] + properties
+        cmd += [','.join(properties)]
+
+        datasets = kwargs.get('datasets', False)
+        if datasets:
+            cmd += [datasets]
+
+        return cmd
 
     @staticmethod
     def _lines_to_objects(lines, sources) -> Iterable[Datasets]:
@@ -597,14 +654,20 @@ class Set(Command):
     def _set(cls, ds: Datasets, properties: Properties) -> Datasets:
 
         ds.update(properties)
-
-        cmd = [ZFS_BIN, 'set']
-        for k, v in properties:
-            cmd += [k + '=' + str(v)]
-        cmd += [str(ds)]
+        cmd = [ZFS_BIN, 'set'] + cls._get_props(properties) + [str(ds)]
         cls._exec(cmd)
 
         return ds
+
+    @staticmethod
+    def _get_props(properties: Properties, flag: bool = False):
+        cmd = []
+        for k, v in properties:
+            if flag:
+                cmd += ['-o', k + '=' + str(v)]
+            else:
+                cmd += [k + '=' + str(v)]
+        return cmd
 
 
 class Inherit(Command):
@@ -616,13 +679,419 @@ class Inherit(Command):
     def _inherit(cls, ds: Datasets, prop: str, recursive: bool = False, received: bool = False) -> Datasets:
 
         ds.update({prop: None})
-
-        cmd = [ZFS_BIN, 'inherit', prop]
-        if recursive:
-            cmd += ['-r']
-        if received:
-            cmd += ['-S']
-        cmd += [str(ds)]
+        cmd = [ZFS_BIN, 'inherit', prop] + cls._get_options(recursive=recursive, received=received) + [str(ds)]
         cls._exec(cmd)
 
         return ds
+
+    @staticmethod
+    def _get_options(**kwargs):
+        cmd = []
+        if kwargs.get('recursive', False):
+            cmd += ['-r']
+        if kwargs.get('received', False):
+            cmd += ['-S']
+        return cmd
+
+
+class Send:
+
+    def __call__(self, *args, **kwargs):
+        return self._send(*args, **kwargs)
+
+    @classmethod
+    def _send(cls, ds: Datasets, *args, **kwargs) -> Optional[io.BufferedReader]:
+        if isinstance(ds, Dataset):
+            return cls.dataset(ds, *args, **kwargs)
+        elif isinstance(ds, Snapshot):
+            return cls.snapshot(ds, *args, **kwargs)
+
+    @classmethod
+    def snapshot(cls, ds: Snapshot, since: Optional[Snapshot] = None, intermediate: bool = False,
+                 replicate: bool = False, holds: bool = False, properties: bool = False, backup: bool = False,
+                 raw: bool = False, compressed: bool = False, embed: bool = False, large_blocks: bool = False,
+                 skip_missing: bool = False) -> Optional[io.BufferedReader]:
+
+        cmd = [ZFS_BIN, 'send'] + \
+              cls._get_options(since=since, intermediate=intermediate, replicate=replicate, holds=holds,
+                               properties=properties, backup=backup, raw=raw, compressed=compressed, embed=embed,
+                               large_blocks=large_blocks, skip_missing=skip_missing) + [str(ds)]
+
+        return cls._exec_stream(cmd)
+
+    @classmethod
+    def dataset(cls, ds: Dataset, since: Optional[Snapshot] = None, replicate: bool = False, properties: bool = False,
+                raw: bool = False, compressed: bool = False, embed: bool = False,
+                large_blocks: bool = False) -> Optional[io.BufferedReader]:
+
+        cmd = [ZFS_BIN, 'send'] + \
+              cls._get_options(since=since, replicate=replicate, properties=properties, raw=raw,
+                               compressed=compressed, embed=embed, large_blocks=large_blocks) + [str(ds)]
+
+        return cls._exec_stream(cmd)
+
+    @classmethod
+    def redact(cls, ds: Dataset, redact: Bookmark, since: Optional[Snapshot] = None,
+               properties: bool = False, compressed: bool = False, embed: bool = False,
+               large_blocks: bool = False) -> Optional[io.BufferedReader]:
+
+        cmd = [ZFS_BIN, 'send', '--redact', str(redact)] + \
+              cls._get_options(since=since, properties=properties, compressed=compressed, embed=embed,
+                               large_blocks=large_blocks) + [str(ds)]
+
+        return cls._exec_stream(cmd)
+
+    @classmethod
+    def resume(cls, token: str, embed: bool = False) -> Optional[io.BufferedReader]:
+        cmd = [ZFS_BIN, 'send'] + cls._get_options(embed=embed) + ['-t', token]
+        return cls._exec_stream(cmd)
+
+    @classmethod
+    def partial(cls, ds: Dataset, since: Optional[Snapshot] = None) -> Optional[io.BufferedReader]:
+        cmd = [ZFS_BIN, 'send'] + cls._get_options(since=since) + ['-S', str(ds)]
+        return cls._exec_stream(cmd)
+
+    @staticmethod
+    def _get_options(**kwargs):
+        cmd = []
+        if kwargs.get('replicate', False):
+            cmd += ['-R']
+        if kwargs.get('holds', False):
+            cmd += ['-h']
+        if kwargs.get('properties', False):
+            cmd += ['-p']
+        if kwargs.get('backup', False):
+            cmd += ['-b']
+        if kwargs.get('raw', False):
+            cmd += ['-w']
+        if kwargs.get('compressed', False):
+            cmd += ['-c']
+        if kwargs.get('embed', False):
+            cmd += ['-e']
+        if kwargs.get('large_blocks', False):
+            cmd += ['-L']
+        if kwargs.get('skip_missing', False):
+            if kwargs.get('replicate', False):
+                cmd += ['-s']
+            else:
+                raise ValueError('skip_missing can only be specified together with replicate')
+        since = kwargs.get('since', False)
+        if since:
+            if not isinstance(since, Snap):
+                raise ValueError('Expected Snapshot, got ' + type(since).__name__ + ' instead')
+            elif kwargs.get('intermediate', False):
+                cmd += ['-I', str(since)]
+            else:
+                cmd += ['-i', str(since)]
+
+        return cmd
+
+    @classmethod
+    def _exec_stream(cls, cmd) -> Optional[io.BufferedReader]:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        errors = []
+        while True:
+            output = cls._exec_capture_bin(process, errors)
+            if output is False:
+                break
+            elif output is not None:
+                return output
+        return None
+
+    @staticmethod
+    def _exec_capture_bin(process, errors) -> Union[bool, io.BufferedReader, None]:
+        stdout = process.stdout.peek(8)
+        stderr = io.TextIOWrapper(process.stderr).readline()
+        rc = process.poll()
+        if stderr:
+            error = stderr.strip()
+            errors.append(error[0].upper() + error[1:])
+        if len(stdout):
+            return process.stdout
+        elif stderr != '' and rc is not None:
+            if rc != 0:
+                raise Exception('\n'.join(errors))
+            return False
+        else:
+            return None
+
+
+class Receive(StringListArgument):
+
+    def __call__(self, *args, **kwargs):
+        return self._receive(*args, **kwargs)
+
+    @classmethod
+    def _receive(cls, ds: Datasets, *args, **kwargs) -> Optional[io.BufferedWriter]:
+        if isinstance(ds, Filesystem):
+            return cls.filesystem(ds, *args, **kwargs)
+        else:
+            return cls.dataset(ds, *args, **kwargs)
+
+    @classmethod
+    def filesystem(cls, ds: Datasets, set: Optional[Properties] = None, reset: Optional[StringList] = None,
+                   origin: Optional[Snapshot] = None, force: bool = False, holds: bool = True, unmount: bool = False,
+                   save: bool = False, mount: bool = True, ignore_first: bool = False,
+                   ignore_all: bool = False) -> Optional[io.BufferedWriter]:
+
+        cmd = [ZFS_BIN, 'send'] + \
+              cls._get_options(set=set, reset=reset, origin=origin, force=force, holds=holds, unmount=unmount,
+                               save=save, mount=mount, ignore_first=ignore_first, ignore_all=ignore_all) + [str(ds)]
+
+        return cls._exec_stream_in(cmd)
+
+    @classmethod
+    def dataset(cls, ds: Datasets, set: Optional[Properties] = None, reset: Optional[StringList] = None,
+                origin: Optional[Snapshot] = None, force: bool = False, holds: bool = True, unmount: bool = False,
+                save: bool = False, mount: bool = True) -> Optional[io.BufferedWriter]:
+
+        cmd = [ZFS_BIN, 'send'] + \
+              cls._get_options(set=set, reset=reset, origin=origin, force=force, holds=holds, unmount=unmount,
+                               save=save, mount=mount) + [str(ds)]
+
+        return cls._exec_stream_in(cmd)
+
+    @classmethod
+    def _get_options(cls, **kwargs):
+        cmd = []
+        origin = kwargs.get('origin', None)
+        if origin:
+            cmd += ['-o', 'origin=' + str(origin)]
+        set = kwargs.get('set', None)
+        if set:
+            cmd += cls._get_props(set, True)
+        reset = kwargs.get('reset', None)
+        if reset:
+            cmd += ['-x ' + s for s in cls._slist_to_list(reset)]
+        if kwargs.get('force', False):
+            cmd += ['-F']
+        if not kwargs.get('holds', True):
+            cmd += ['-h']
+        if kwargs.get('unmount', False):
+            cmd += ['-M']
+        if kwargs.get('save', False):
+            cmd += ['-s']
+        if not kwargs.get('mount', True):
+            cmd += ['-u']
+        if kwargs.get('ignore_first', False):
+            cmd += ['-d']
+        if kwargs.get('ignore_sll', False):
+            cmd += ['-e']
+
+        return cmd
+
+    @staticmethod
+    def _get_props(properties: Properties, flag: bool = False):
+        cmd = []
+        for k, v in properties:
+            if flag:
+                cmd += ['-o', k + '=' + str(v)]
+            else:
+                cmd += [k + '=' + str(v)]
+        return cmd
+
+    @classmethod
+    def _exec_stream_in(cls, cmd) -> Optional[io.BufferedWriter]:
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        errors = []
+        while True:
+            output = cls._exec_input_bin(process, errors)
+            if output is False:
+                break
+            elif output is not None:
+                return output
+        return None
+
+    @staticmethod
+    def _exec_input_bin(process, errors):
+        stderr = io.TextIOWrapper(process.stderr).readline()
+        rc = process.poll()
+        if stderr:
+            error = stderr.strip()
+            errors.append(error[0].upper() + error[1:])
+        if rc is not None and rc != 0:
+            raise Exception('\n'.join(errors))
+        elif stderr != '':
+            return None
+        else:
+            return process.stdin
+
+
+class LoadKey(Command):
+
+    def __call__(self, *args, **kwargs):
+        """Load the dataset key
+
+        Keyword arguments:
+            ds: Filesystem -- ZFS filesystem to unload the key for, if None,
+                unload keys for all filesystems (default None)
+            location: str -- key location (default None)
+            recursive: bool -- whether to unload keys for all child datasets (default False)
+
+        Returns:
+            None
+        """
+        return self._load_key(*args, **kwargs)
+
+    @classmethod
+    def _load_key(cls, ds: Optional[Filesystem], location: Optional[str] = None, recursive: bool = False) -> None:
+        if ds is not None:
+            cmd = [ZFS_BIN, 'load-key'] + cls._get_options(location=location, recursive=recursive) + [str(ds)]
+        else:
+            if location is not None:
+                raise ValueError('Key location cannot be explicitly specified when loading all keys')
+            if recursive:
+                raise ValueError('Recursive cannot be specified when loading all keys')
+
+            cmd = [ZFS_BIN, 'load-key', '-a']
+
+        return cls._exec(cmd)
+
+    @classmethod
+    def _get_options(cls, **kwargs):
+        cmd = []
+        location = kwargs.get('location', None)
+        recursive = kwargs.get('recursive', False)
+        if location and recursive:
+            raise ValueError('Key location cannot be explicitly specified when loading keys recursively')
+        elif location:
+            cmd += ['-L ' + location]
+        elif recursive:
+            cmd += ['-r']
+
+        return cmd
+
+
+class UnLoadKey(Command):
+
+    def __call__(self, *args, **kwargs):
+        """Unload the dataset key
+
+        Keyword arguments:
+            ds: Filesystem -- ZFS filesystem to unload the key for, if None,
+                unload keys for all filesystems (default None)
+            recursive: bool -- whether to unload keys for all child datasets (default False)
+
+        Returns:
+            None
+        """
+        return self._unload_key(*args, **kwargs)
+
+    @classmethod
+    def _unload_key(cls, ds: Optional[Filesystem], recursive: bool = False) -> None:
+        if ds is not None:
+            cmd = [ZFS_BIN, 'unload-key'] + cls._get_options(recursive=recursive) + [str(ds)]
+        else:
+            if recursive:
+                raise ValueError('Recursive cannot be specified when unloading all keys')
+
+            cmd = [ZFS_BIN, 'unload-key', '-a']
+
+        return cls._exec(cmd)
+
+    @classmethod
+    def _get_options(cls, **kwargs):
+        return ['-r'] if kwargs.get('recursive', False) else []
+
+
+class ChangeKey(Command):
+
+    def __call__(self, *args, **kwargs):
+        """Change the dataset key
+
+        Keyword arguments:
+            ds: Filesystem -- ZFS filesystem to change the key for
+            inherit: bool -- inhherit the key from parent dataset (default False)
+            load: bool -- load the key before changing it (default False)
+            location: str -- key location (default None)
+            format: str -- key format (default None)
+            iterations: int -- the number of PBKDF2 iterations (default None)
+
+        Returns:
+            None
+        """
+        return self._change_key(*args, **kwargs)
+
+    @classmethod
+    def _change_key(cls, ds: Filesystem, inherit: bool = False, load: bool = False, location: Optional[str] = None,
+                    format: Optional[str] = None, iterations: Optional[int] = None) -> None:
+        cmd = [ZFS_BIN, 'change-key'] + \
+            cls._get_options(inherit=inherit, load=load, location=location,
+                             format=format, iterations=iterations) + [str(ds)]
+
+        return cls._exec(cmd)
+
+    @classmethod
+    def _get_options(cls, **kwargs):
+        cmd = []
+        location = kwargs.get('location', None)
+        format = kwargs.get('format', None)
+        iterations = kwargs.get('iterations', None)
+        if kwargs.get('inherit', None):
+            if location:
+                raise ValueError('Key location cannot be specified when inheriting keys')
+            if format:
+                raise ValueError('Key format cannot be specified when inheriting keys')
+            if iterations:
+                raise ValueError('Number of pbkdf2 iterations cannot be specified when inheriting keys')
+            cmd += ['-i']
+        if kwargs.get('load', None):
+            cmd += ['-l']
+        if location:
+            cmd += ['-o keylocation=' + location]
+        if format:
+            cmd += ['-o keyformat=' + format]
+        if iterations:
+            cmd += ['-o pbkdf2iters=' + str(iterations)]
+
+        return cmd
+
+
+class Mount(Command, PropertyCommand):
+
+    def __call__(self, *args, **kwargs):
+        """Mount ZFS dataset
+
+        Keyword arguments:
+            ds: Filesystem -- ZFS filesystem to mount, if None, mount all ZFS filesystems (default None)
+            flags: str | [str] -- mount flags (default None)
+            properties: str | [str] -- mount properties (default None)
+            overlay: bool -- proceed even if the mountpoint is not empty (default False)
+            load_keys: bool -- whether to load keys for each mounted filesystem (default False)
+            force: bool -- attempt to mount filesystems the normally would not be mounted (default False)
+
+        Returns:
+            None
+        """
+        return self._mount(*args, **kwargs)
+
+    @classmethod
+    def _mount(cls, ds: Optional[Filesystem], flags: Optional[StringList], properties: Optional[Properties],
+               overlay: bool = False, load_keys: bool = False, force: bool = False) -> None:
+        if ds is not None:
+            cmd = [ZFS_BIN, 'mount'] + cls._get_options(overlay=overlay, load_keys=load_keys, force=force) + \
+                  cls._get_properties(flags, properties) + [str(ds)]
+        else:
+            cmd = [ZFS_BIN, 'mount', '-a']
+
+        return cls._exec(cmd)
+
+    @classmethod
+    def _get_options(cls, **kwargs):
+        cmd = []
+        if kwargs.get('overlay', None):
+            cmd += ['-O']
+        if kwargs.get('load_keys', None):
+            cmd += ['-l']
+        if kwargs.get('force', None):
+            cmd += ['-f']
+
+        return cmd
+
+    @classmethod
+    def _get_properties(cls, flags: Optional[StringList], properties: Optional[Properties]):
+        return cls._get_flags(flags) + cls._get_props(properties, True)
+
+    @staticmethod
+    def _get_flags(flags: Optional[StringList]):
+        return [f if y else '-o' for f in flags for y in range(2)]

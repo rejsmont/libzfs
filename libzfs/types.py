@@ -38,6 +38,10 @@ class PropertyNames:
                'setuid', 'sharenfs', 'sharesmb', 'snapdir', 'snapshot_limit', 'utf8only', 'version', 'volblocksize',
                'volsize', 'vscan', 'xattr', 'zoned']
 
+    mount_opts = ['atime', 'noatime', 'auto', 'noauto' , 'dev', 'nodev', 'exec', 'noexec', 'ro', 'rw', 'relatime'
+                  'norelatime', 'suid', 'nosuid', 'xattr', 'noxattr', 'mand', 'nomand']
+    mount_props = ['context', 'fscontext', 'defcontext', 'rootcontext']
+
     all = apple + dataset + filesystem + volume + snapshot + fs_snap + vol_snap + bookmark + ['all']
 
 
