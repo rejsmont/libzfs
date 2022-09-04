@@ -694,7 +694,7 @@ class Inherit(Command):
         return cmd
 
 
-class Send:
+class Send(Command):
 
     def __call__(self, *args, **kwargs):
         return self._send(*args, **kwargs)
@@ -707,48 +707,116 @@ class Send:
             return cls.snapshot(ds, *args, **kwargs)
 
     @classmethod
-    def snapshot(cls, ds: Snapshot, since: Optional[Snapshot] = None, intermediate: bool = False,
+    def snapshot(cls, ds: Snap, since: Optional[Snap] = None, intermediate: bool = False,
                  replicate: bool = False, holds: bool = False, properties: bool = False, backup: bool = False,
                  raw: bool = False, compressed: bool = False, embed: bool = False, large_blocks: bool = False,
                  skip_missing: bool = False) -> Optional[io.BufferedReader]:
 
+        """Generate a send stream for a given ZFS snapshot
+
+        Keyword arguments:
+            ds: Snap -- source ZFS snapshot
+            since: Snap -- generate incremental stream from the specified snapshot (default None)
+            intermediate: bool -- generate intermediate stream (default False)
+            replicate: bool -- replicate the stream (default False)
+            holds: bool -- include hold tags (default False)
+            properties: bool -- include properties (default False)
+            backup: bool -- include backup stream header (default False)
+            raw: bool -- for encrypted datasets, send data exactly as it exists on disk (default False)
+            compressed: bool -- generate a more compact stream by using dataset compression (default False)
+            embed: bool -- generate a more compact stream by using the embedded_data pool feature (default False)
+            large_blocks: bool -- generate a stream which may contain blocks larger than 128KB (default False)
+            skip_missing: bool -- skip over missing snapshots (default False)
+
+        Returns:
+            BufferedReader
+        """
+
         cmd = [ZFS_BIN, 'send'] + \
-              cls._get_options(since=since, intermediate=intermediate, replicate=replicate, holds=holds,
-                               properties=properties, backup=backup, raw=raw, compressed=compressed, embed=embed,
-                               large_blocks=large_blocks, skip_missing=skip_missing) + [str(ds)]
+            cls._get_options(since=since, intermediate=intermediate, replicate=replicate, holds=holds,
+                             properties=properties, backup=backup, raw=raw, compressed=compressed, embed=embed,
+                             large_blocks=large_blocks, skip_missing=skip_missing) + [str(ds)]
 
         return cls._exec_stream(cmd)
 
     @classmethod
-    def dataset(cls, ds: Dataset, since: Optional[Snapshot] = None, replicate: bool = False, properties: bool = False,
-                raw: bool = False, compressed: bool = False, embed: bool = False,
-                large_blocks: bool = False) -> Optional[io.BufferedReader]:
+    def dataset(cls, ds: Dataset, since: Optional[Snap] = None, raw: bool = False, compressed: bool = False,
+                embed: bool = False, large_blocks: bool = False) -> Optional[io.BufferedReader]:
+
+        """Generate a send stream for a given ZFS dataset
+
+        Keyword arguments:
+            ds: Dataset -- source ZFS dataset (filesystem or volume)
+            since: Snap -- generate incremental stream from the specified snapshot (default None)
+            raw: bool -- for encrypted datasets, send data exactly as it exists on disk (default False)
+            compressed: bool -- generate a more compact stream by using dataset compression (default False)
+            embed: bool -- generate a more compact stream by using the embedded_data pool feature (default False)
+            large_blocks: bool -- generate a stream which may contain blocks larger than 128KB (default False)
+
+        Returns:
+            BufferedReader
+        """
 
         cmd = [ZFS_BIN, 'send'] + \
-              cls._get_options(since=since, replicate=replicate, properties=properties, raw=raw,
-                               compressed=compressed, embed=embed, large_blocks=large_blocks) + [str(ds)]
+            cls._get_options(since=since, raw=raw, compressed=compressed, embed=embed,
+                             large_blocks=large_blocks) + [str(ds)]
 
         return cls._exec_stream(cmd)
 
     @classmethod
-    def redact(cls, ds: Dataset, redact: Bookmark, since: Optional[Snapshot] = None,
+    def redact(cls, ds: Snap, redact: Bookmk, since: Union[Snap, Bookmk, None] = None,
                properties: bool = False, compressed: bool = False, embed: bool = False,
                large_blocks: bool = False) -> Optional[io.BufferedReader]:
 
+        """Generate a redacted send stream
+
+        Keyword arguments:
+            ds: Snap -- source ZFS snapshot
+            redact: Bookmk -- bookmark containing the redaction list of blocks to exclude from the stream
+            since: Snap -- generate incremental stream from the specified snapshot (default None)
+            properties: bool -- include dataset properties in the send stream (default False)
+            compressed: bool -- generate a more compact stream by using dataset compression (default False)
+            embed: bool -- generate a more compact stream by using the embedded_data pool feature (default False)
+            large_blocks: bool -- generate a stream which may contain blocks larger than 128KB (default False)
+
+        Returns:
+            BufferedReader
+        """
+
         cmd = [ZFS_BIN, 'send', '--redact', str(redact)] + \
-              cls._get_options(since=since, properties=properties, compressed=compressed, embed=embed,
-                               large_blocks=large_blocks) + [str(ds)]
+            cls._get_options(since=since, properties=properties, compressed=compressed, embed=embed,
+                             large_blocks=large_blocks) + [str(ds)]
 
         return cls._exec_stream(cmd)
 
     @classmethod
     def resume(cls, token: str, embed: bool = False) -> Optional[io.BufferedReader]:
+        """Creates a send stream which resumes an interrupted receive
+
+         Keyword arguments:
+            token: str -- resume token generated by the receiving side
+            embed: bool -- generate a more compact stream by using the embedded_data pool feature (default False)
+
+        Returns:
+            BufferedReader
+        """
         cmd = [ZFS_BIN, 'send'] + cls._get_options(embed=embed) + ['-t', token]
         return cls._exec_stream(cmd)
 
     @classmethod
     def partial(cls, ds: Dataset, since: Optional[Snapshot] = None) -> Optional[io.BufferedReader]:
+        """Generate a send stream from a dataset that has been partially received
+
+        Keyword arguments:
+            ds: Filesystem -- source ZFS filesystem
+            since: Snapshot -- generate incremental stream from the specified snapshot (default None)
+
+        Returns:
+            BufferedReader
+        """
+
         cmd = [ZFS_BIN, 'send'] + cls._get_options(since=since) + ['-S', str(ds)]
+
         return cls._exec_stream(cmd)
 
     @staticmethod
@@ -816,7 +884,7 @@ class Send:
             return None
 
 
-class Receive(StringListArgument):
+class Receive(Command, StringListArgument):
 
     def __call__(self, *args, **kwargs):
         return self._receive(*args, **kwargs)
@@ -829,27 +897,76 @@ class Receive(StringListArgument):
             return cls.dataset(ds, *args, **kwargs)
 
     @classmethod
-    def filesystem(cls, ds: Datasets, set: Optional[Properties] = None, reset: Optional[StringList] = None,
-                   origin: Optional[Snapshot] = None, force: bool = False, holds: bool = True, unmount: bool = False,
+    def filesystem(cls, ds: Filesystem, props: Optional[Properties] = None, reset: Optional[StringList] = None,
+                   origin: Optional[Snap] = None, force: bool = False, holds: bool = True, unmount: bool = False,
                    save: bool = False, mount: bool = True, ignore_first: bool = False,
                    ignore_all: bool = False) -> Optional[io.BufferedWriter]:
 
-        cmd = [ZFS_BIN, 'send'] + \
-              cls._get_options(set=set, reset=reset, origin=origin, force=force, holds=holds, unmount=unmount,
-                               save=save, mount=mount, ignore_first=ignore_first, ignore_all=ignore_all) + [str(ds)]
+        """Receive ZFS filesystem stream
+
+        Keyword arguments:
+            ds: Filesystem -- target ZFS filesystem
+            props: Properties -- properties to set on the target filesystem (default None)
+            reset: Properties -- properties to reset on the target filesystem (default None)
+            origin: Snap -- forces the stream to be received as a clone of the given snapshot (default None)
+            force: bool -- force discarding changes or incompatible snapshots from the target filesystem (default False)
+            holds: bool -- receive holds (default True)
+            unmount: bool -- unmount the target filesystem during transfer (default False)
+            save: bool -- save state token for resuming the transfer (default False)
+            mount: bool -- whether to mount the received filesystem (default True)
+            ignore_first: bool -- discard the first part of snapshot filesystem name (default False)
+            ignore_all: bool -- discard all but the last part of snapshot filesystem name (default False)
+
+        Returns:
+            BufferedWriter
+        """
+        cmd = [ZFS_BIN, 'receive'] + \
+            cls._get_options(props=props, reset=reset, origin=origin, force=force, holds=holds, unmount=unmount,
+                             save=save, mount=mount, ignore_first=ignore_first, ignore_all=ignore_all) + [str(ds)]
 
         return cls._exec_stream_in(cmd)
 
     @classmethod
-    def dataset(cls, ds: Datasets, set: Optional[Properties] = None, reset: Optional[StringList] = None,
-                origin: Optional[Snapshot] = None, force: bool = False, holds: bool = True, unmount: bool = False,
+    def dataset(cls, ds: Datasets, props: Optional[Properties] = None, reset: Optional[StringList] = None,
+                origin: Optional[Snap] = None, force: bool = False, holds: bool = True, unmount: bool = False,
                 save: bool = False, mount: bool = True) -> Optional[io.BufferedWriter]:
 
-        cmd = [ZFS_BIN, 'send'] + \
-              cls._get_options(set=set, reset=reset, origin=origin, force=force, holds=holds, unmount=unmount,
-                               save=save, mount=mount) + [str(ds)]
+        """Receive ZFS filesystem stream
+
+        Keyword arguments:
+            ds: Filesystem -- target ZFS filesystem
+            props: Properties -- properties to set on the target filesystem (default None)
+            reset: Properties -- properties to reset on the target filesystem (default None)
+            origin: Snap -- forces the stream to be received as a clone of the given snapshot (default None)
+            force: bool -- force discarding changes or incompatible snapshots from the target filesystem (default False)
+            holds: bool -- receive holds (default True)
+            unmount: bool -- unmount the target filesystem during transfer (default False)
+            save: bool -- save state token for resuming the transfer (default False)
+            mount: bool -- whether to mount the received filesystem (default True)
+
+        Returns:
+            BufferedWriter
+        """
+        cmd = [ZFS_BIN, 'receive'] + \
+            cls._get_options(props=props, reset=reset, origin=origin, force=force, holds=holds, unmount=unmount,
+                             save=save, mount=mount) + [str(ds)]
 
         return cls._exec_stream_in(cmd)
+
+    @classmethod
+    def abort(cls, ds: Datasets) -> None:
+        """Abort an interrupted ZFS receive operation, deleting its saved partially received state
+
+        Keyword arguments:
+            ds: Filesystem -- target ZFS filesystem
+
+        Returns:
+            None
+        """
+
+        cmd = [ZFS_BIN, '-A'] + [str(ds)]
+
+        return cls._exec(cmd)
 
     @classmethod
     def _get_options(cls, **kwargs):
@@ -857,9 +974,9 @@ class Receive(StringListArgument):
         origin = kwargs.get('origin', None)
         if origin:
             cmd += ['-o', 'origin=' + str(origin)]
-        set = kwargs.get('set', None)
-        if set:
-            cmd += cls._get_props(set, True)
+        props = kwargs.get('props', None)
+        if props:
+            cmd += cls._get_props(props, True)
         reset = kwargs.get('reset', None)
         if reset:
             cmd += ['-x ' + s for s in cls._slist_to_list(reset)]
@@ -1014,10 +1131,10 @@ class ChangeKey(Command):
 
     @classmethod
     def _change_key(cls, ds: Filesystem, inherit: bool = False, load: bool = False, location: Optional[str] = None,
-                    format: Optional[str] = None, iterations: Optional[int] = None) -> None:
+                    fmt: Optional[str] = None, iterations: Optional[int] = None) -> None:
         cmd = [ZFS_BIN, 'change-key'] + \
-            cls._get_options(inherit=inherit, load=load, location=location,
-                             format=format, iterations=iterations) + [str(ds)]
+              cls._get_options(inherit=inherit, load=load, location=location,
+                               fmt=fmt, iterations=iterations) + [str(ds)]
 
         return cls._exec(cmd)
 
@@ -1025,12 +1142,12 @@ class ChangeKey(Command):
     def _get_options(cls, **kwargs):
         cmd = []
         location = kwargs.get('location', None)
-        format = kwargs.get('format', None)
+        fmt = kwargs.get('fmt', None)
         iterations = kwargs.get('iterations', None)
         if kwargs.get('inherit', None):
             if location:
                 raise ValueError('Key location cannot be specified when inheriting keys')
-            if format:
+            if fmt:
                 raise ValueError('Key format cannot be specified when inheriting keys')
             if iterations:
                 raise ValueError('Number of pbkdf2 iterations cannot be specified when inheriting keys')
@@ -1039,8 +1156,8 @@ class ChangeKey(Command):
             cmd += ['-l']
         if location:
             cmd += ['-o keylocation=' + location]
-        if format:
-            cmd += ['-o keyformat=' + format]
+        if fmt:
+            cmd += ['-o keyformat=' + fmt]
         if iterations:
             cmd += ['-o pbkdf2iters=' + str(iterations)]
 
@@ -1056,9 +1173,9 @@ class Mount(Command, PropertyCommand):
             ds: Filesystem -- ZFS filesystem to mount, if None, mount all ZFS filesystems (default None)
             flags: str | [str] -- mount flags (default None)
             properties: str | [str] -- mount properties (default None)
-            overlay: bool -- proceed even if the mountpoint is not empty (default False)
+            overlay: bool -- proceed even if the mount point is not empty (default False)
             load_keys: bool -- whether to load keys for each mounted filesystem (default False)
-            force: bool -- attempt to mount filesystems the normally would not be mounted (default False)
+            force: bool -- attempt to mount the filesystems that normally would not be mounted (default False)
 
         Returns:
             None
@@ -1095,3 +1212,38 @@ class Mount(Command, PropertyCommand):
     @staticmethod
     def _get_flags(flags: Optional[StringList]):
         return [f if y else '-o' for f in flags for y in range(2)]
+
+
+class UnMount(Command):
+
+    def __call__(self, *args, **kwargs):
+        """Unmount ZFS filesystem
+
+        Keyword arguments:
+            ds: Filesystem -- ZFS filesystem to unmount, if None, unmount all ZFS filesystems (default None)
+            force: bool -- forcefully unmount the file system, even if it is currently in use (default False)
+            unload_keys: bool -- unload keys for any encryption roots being unmounted (default False)
+
+        Returns:
+            None
+        """
+        return self._unmount(*args, **kwargs)
+
+    @classmethod
+    def _unmount(cls, ds: Optional[Filesystem], force: bool = False, unload_keys: bool = False) -> None:
+        if ds is not None:
+            cmd = [ZFS_BIN, 'unmount'] + cls._get_options(force=force, unload_keys=unload_keys) + [str(ds)]
+        else:
+            cmd = [ZFS_BIN, 'unmount', '-a']
+
+        return cls._exec(cmd)
+
+    @classmethod
+    def _get_options(cls, **kwargs):
+        cmd = []
+        if kwargs.get('force', None):
+            cmd += ['-f']
+        if kwargs.get('unload_keys', None):
+            cmd += ['-u']
+
+        return cmd
