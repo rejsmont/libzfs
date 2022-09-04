@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "libzfs"
+version = "0.1.0"
+description = "Python interface to ZFS utilities"
+authors = ["Radoslaw Kamil Ejsmont <radoslaw@ejsmont.net>"]
+license = "BSD"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
+[tool.poetry.group.dev.dependencies]
+jupyter = "^1.0.0"
+notebook = "^6.4.12"
+pytest = "^7.1.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
