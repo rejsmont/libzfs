@@ -1,9 +1,9 @@
 [tool.poetry]
 name = "libzfs"
 version = "0.1.0"
-description = "Python interface to ZFS utilities"
+description = "Python interface to the ZFS utilities"
 authors = ["Radoslaw Kamil Ejsmont <radoslaw@ejsmont.net>"]
-license = "BSD"
+license = "MIT"
 readme = "README.md"
 
 [tool.poetry.dependencies]

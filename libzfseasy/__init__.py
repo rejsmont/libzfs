@@ -1,5 +1,5 @@
-from libzfs.zfs import List, Create, Snapshot, Bookmark, Destroy, Rename, Allow, UnAllow, Clone, Get, Set, Inherit,\
-     Send, Receive, ChangeKey, LoadKey, UnLoadKey
+from libzfseasy.zfs import List, Create, Snapshot, Bookmark, Destroy, Rename, Allow, UnAllow, Clone, Get, Set, \
+     Inherit, Send, Receive, ChangeKey, LoadKey, UnLoadKey
 
 allow = Allow()
 bookmark = Bookmark()

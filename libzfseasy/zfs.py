@@ -1,4 +1,4 @@
-from libzfs.types import Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as Snap, Bookmark as Bookmk, \
+from libzfseasy.types import Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as Snap, Bookmark as Bookmk, \
      SnapshotRange, Property, Properties
 from typing import Optional, Union, Dict, Iterable, Callable
 
