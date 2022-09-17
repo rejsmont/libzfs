@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "libzfs"
+name = "libzfseasy"
 version = "0.1.0"
 description = "Python interface to the ZFS utilities"
 authors = ["Radoslaw Kamil Ejsmont <radoslaw@ejsmont.net>"]
@@ -8,6 +8,7 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.10"
+libzfs = {git = "https://gitlab.vibfolks.eu/rejsmont/py-libzfs.git"}
 
 [tool.poetry.group.dev.dependencies]
 jupyter = "^1.0.0"
