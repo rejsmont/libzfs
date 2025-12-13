@@ -1,0 +1,14 @@
+# Test coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# Pytest cache
+.pytest_cache/
+__pycache__/
+
+# Test artifacts
+.tox/
+.hypothesis/
