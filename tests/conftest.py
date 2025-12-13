@@ -88,8 +88,8 @@ def mock_zfs_get_output():
     return [
         'testpool/filesystem\tname\ttestpool/filesystem\t-\t-\n',
         'testpool/filesystem\ttype\tfilesystem\t-\t-\n',
-        'testpool/filesystem\tcompression\tlz4\tlocal\t-\n',
-        'testpool/filesystem\tmountpoint\t/mnt/test\tlocal\t-\n',
+        'testpool/filesystem\tcompression\tlz4\t-\tlocal\n',
+        'testpool/filesystem\tmountpoint\t/mnt/test\t-\tlocal\n',
     ]
 
 
@@ -100,6 +100,15 @@ def sample_properties():
         'compression': 'lz4',
         'mountpoint': '/mnt/test',
         'quota': '10G'
+    }
+
+
+@pytest.fixture
+def dataset_properties():
+    """Return properties valid for generic Dataset objects (no fs/volume extras)."""
+    return {
+        'compression': 'lz4',
+        'reservation': '1G'
     }
 
 

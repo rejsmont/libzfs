@@ -153,11 +153,11 @@ class TestDataset:
             Dataset('invalid@name')
     
     @pytest.mark.unit
-    def test_dataset_with_properties(self, sample_pool, sample_properties):
+    def test_dataset_with_properties(self, sample_pool, dataset_properties):
         """Test creating Dataset with properties."""
-        ds = Dataset(f'{sample_pool}/dataset', sample_properties)
+        ds = Dataset(f'{sample_pool}/dataset', dataset_properties)
         assert ds['compression'].value == 'lz4'
-        assert ds['mountpoint'].value == '/mnt/test'
+        assert ds['reservation'].value == '1G'
     
     @pytest.mark.unit
     def test_dataset_property_access(self, sample_pool):
@@ -170,9 +170,18 @@ class TestDataset:
     def test_dataset_update_properties(self, sample_pool):
         """Test updating dataset properties."""
         ds = Dataset(f'{sample_pool}/dataset')
-        ds.update({'compression': 'gzip', 'quota': '10G'})
+        ds.update({'compression': 'gzip', 'reservation': '2G'})
         assert ds['compression'].value == 'gzip'
-        assert ds['quota'].value == '10G'
+        assert ds['reservation'].value == '2G'
+
+    @pytest.mark.unit
+    def test_dataset_rejects_filesystem_volume_props(self, sample_pool):
+        """Ensure Dataset does not accept filesystem/volume-only properties."""
+        ds = Dataset(f'{sample_pool}/dataset')
+        with pytest.raises(ValueError):
+            ds.update({'mountpoint': '/mnt/test'})
+        with pytest.raises(ValueError):
+            ds.update({'quota': '10G'})
     
     @pytest.mark.unit
     def test_dataset_from_name(self):
@@ -196,6 +205,8 @@ class TestFilesystem:
         """Test creating Filesystem with properties."""
         fs = Filesystem(f'{sample_pool}/filesystem', sample_properties)
         assert fs['compression'].value == 'lz4'
+        assert fs['mountpoint'].value == '/mnt/test'
+        assert fs['quota'].value == '10G'
 
 
 class TestVolume:

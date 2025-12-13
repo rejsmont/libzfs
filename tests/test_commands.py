@@ -358,7 +358,7 @@ class TestGetCommand:
         mock_subprocess.setup(stdout=[
             'testpool/filesystem\tname\ttestpool/filesystem\t-\t-\n',
             'testpool/filesystem\ttype\tfilesystem\t-\t-\n',
-            'testpool/filesystem\tcompression\tlz4\tlocal\t-\n',
+            'testpool/filesystem\tcompression\tlz4\t-\tlocal\n',
         ])
         
         cmd = GetCommand()
@@ -375,7 +375,7 @@ class TestGetCommand:
         mock_subprocess.setup(stdout=[
             'testpool/filesystem\tname\ttestpool/filesystem\t-\t-\n',
             'testpool/filesystem\ttype\tfilesystem\t-\t-\n',
-            'testpool/filesystem\tcompression\tlz4\tlocal\t-\n',
+            'testpool/filesystem\tcompression\tlz4\t-\tlocal\n',
         ])
         
         cmd = GetCommand()

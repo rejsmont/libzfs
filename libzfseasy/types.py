@@ -158,7 +158,7 @@ class ZFS:
     @property
     def properties(self) -> Iterable[PropertyItem]:
         yield from ((self._prop_names[k], v) for (k, v) in self._props.items())
-        yield from self._user_props
+        yield from self._user_props.items()
 
     def reset(self):
         self._props = {}

@@ -127,7 +127,7 @@ class TestPropertyManagement:
         mock_subprocess.setup(stdout=[
             f'{sample_pool}/data\tname\t{sample_pool}/data\t-\t-\n',
             f'{sample_pool}/data\ttype\tfilesystem\t-\t-\n',
-            f'{sample_pool}/data\tcompression\toff\tdefault\t-\n',
+            f'{sample_pool}/data\tcompression\toff\t-\tdefault\n',
         ])
         result = zfs.get(ds=fs, properties='compression')
         assert result[0]['compression'].value == 'off'
@@ -142,7 +142,7 @@ class TestPropertyManagement:
         mock_subprocess.setup(stdout=[
             f'{sample_pool}/data\tname\t{sample_pool}/data\t-\t-\n',
             f'{sample_pool}/data\ttype\tfilesystem\t-\t-\n',
-            f'{sample_pool}/data\tcompression\tlz4\tlocal\t-\n',
+            f'{sample_pool}/data\tcompression\tlz4\t-\tlocal\n',
         ])
         result = zfs.get(ds=fs, properties='compression')
         assert result[0]['compression'].value == 'lz4'

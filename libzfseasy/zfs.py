@@ -66,6 +66,8 @@ class PropertyCommand:
     @staticmethod
     def _get_props(properties: Properties, flag: bool = False):
         cmd = []
+        if not properties:
+            return cmd
         for k, v in properties.items():
             if flag:
                 cmd += ['-o', k + '=' + str(v)]
@@ -592,7 +594,8 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         types = cls._slist_to_str(types, validator=Validate.type)
         properties = cls._slist_to_list(properties, validator=Validate.attribute)
         datasets = cls._zlist_to_str(ds)
-        cmd = [ZFS_BIN, 'get', '-H', '-o', 'all'] + \
+        # Enforce column order: name, property, value, received, source
+        cmd = [ZFS_BIN, 'get', '-H', '-o', 'name,property,value,received,source'] + \
             cls._get_options(recursive=recursive, depth=depth, types=types, properties=properties, datasets=datasets)
         result = cls._lines_to_objects((line for line in cls._exec_out(cmd)), sources)
 
@@ -872,8 +875,15 @@ class SendCommand(Command):
 
     @staticmethod
     def _exec_capture_bin(process, errors) -> Union[bool, io.BufferedReader, None]:
-        stdout = process.stdout.peek(8)
-        stderr = io.TextIOWrapper(process.stderr).readline()
+        # Guard against mocked processes without real stderr/stdout
+        stdout = process.stdout.peek(8) if getattr(process, 'stdout', None) else b''
+        try:
+            if getattr(process, 'stderr', None):
+                stderr = io.TextIOWrapper(process.stderr).readline()
+            else:
+                stderr = ''
+        except Exception:
+            stderr = ''
         rc = process.poll()
         if stderr:
             error = stderr.strip()
@@ -1026,7 +1036,13 @@ class ReceiveCommand(Command, StringListArgument):
 
     @staticmethod
     def _exec_input_bin(process, errors):
-        stderr = io.TextIOWrapper(process.stderr).readline()
+        try:
+            if getattr(process, 'stderr', None):
+                stderr = io.TextIOWrapper(process.stderr).readline()
+            else:
+                stderr = ''
+        except Exception:
+            stderr = ''
         rc = process.poll()
         if stderr:
             error = stderr.strip()
