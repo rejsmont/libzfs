@@ -38,7 +38,7 @@ class PropertyNames:
                'setuid', 'sharenfs', 'sharesmb', 'snapdir', 'snapshot_limit', 'utf8only', 'version', 'volblocksize',
                'volsize', 'vscan', 'xattr', 'zoned']
 
-    mount_opts = ['atime', 'noatime', 'auto', 'noauto' , 'dev', 'nodev', 'exec', 'noexec', 'ro', 'rw', 'relatime'
+    mount_opts = ['atime', 'noatime', 'auto', 'noauto' , 'dev', 'nodev', 'exec', 'noexec', 'ro', 'rw', 'relatime',
                   'norelatime', 'suid', 'nosuid', 'xattr', 'noxattr', 'mand', 'nomand']
     mount_props = ['context', 'fscontext', 'defcontext', 'rootcontext']
 
@@ -303,8 +303,8 @@ class SnapshotRange:
         if dataset is not None and not isinstance(dataset, Dataset):
             raise ValueError('Expected Filesystem, Volume or Dataset, got ' + type(dataset).__name__ + ' instead')
         for snap in first, last:
-            if snap is not None and not isinstance(dataset, Snapshot):
-                raise ValueError('Expected Snapshot, got ' + type(dataset).__name__ + ' instead')
+            if snap is not None and not isinstance(snap, Snapshot):
+                raise ValueError('Expected Snapshot, got ' + type(snap).__name__ + ' instead')
 
         self._dataset = dataset
         self._first = first
@@ -336,7 +336,7 @@ class SnapshotRange:
 
     @property
     def short(self):
-        return self._first.short if self._first else '' + '%' + self._last.short if self._last else ''
+        return (self._first.short if self._first else '') + '%' + (self._last.short if self._last else '')
 
     @classmethod
     def from_name(cls, name: Optional[str] = None, first: Optional[str] = None, last: Optional[str] = None):

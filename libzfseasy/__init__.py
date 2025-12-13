@@ -1,26 +1,31 @@
-from libzfseasy.zfs import List, Create, Snapshot, Bookmark, Destroy, Rename, Allow, UnAllow, Clone, Get, Set, \
-     Inherit, Send, Receive, ChangeKey, LoadKey, UnLoadKey
+from libzfseasy.zfs import (
+    ListCommand, CreateCommand, SnapshotCommand, BookmarkCommand, DestroyCommand, RenameCommand,
+    AllowCommand, UnAllowCommand, CloneCommand, GetCommand, SetCommand, InheritCommand,
+    SendCommand, ReceiveCommand, ChangeKeyCommand, LoadKeyCommand, UnLoadKeyCommand,
+    MountCommand, UnMountCommand
+)
 
-list = List()
-create = Create()
-snapshot = Snapshot()
-bookmark = Bookmark()
-destroy = Destroy()
-rename = Rename()
-allow = Allow()
-unallow = UnAllow()
-clone = Clone()
-get = Get()
-set = Set()
-inherit = Inherit()
-send = Send()
-receive = Receive()
-recv = Receive()
-load_key = LoadKey()
-unload_key = UnLoadKey()
-change_key = ChangeKey()
-# mount
-# unmount
+# Create command instances
+list = ListCommand()
+create = CreateCommand()
+snapshot = SnapshotCommand()
+bookmark = BookmarkCommand()
+destroy = DestroyCommand()
+rename = RenameCommand()
+allow = AllowCommand()
+unallow = UnAllowCommand()
+clone = CloneCommand()
+get = GetCommand()
+set = SetCommand()
+inherit = InheritCommand()
+send = SendCommand()
+receive = ReceiveCommand()
+recv = ReceiveCommand()
+load_key = LoadKeyCommand()
+unload_key = UnLoadKeyCommand()
+change_key = ChangeKeyCommand()
+mount = MountCommand()
+unmount = UnMountCommand()
 
 # diff
 # groupspace
