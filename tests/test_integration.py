@@ -55,8 +55,11 @@ class TestSnapshotWorkflow:
         snap = zfs.snapshot(fs, 'snap1')
         assert snap.name == f'{sample_pool}/source@snap1'
         
-        # Clone snapshot
-        mock_subprocess.setup()
+        # Clone snapshot - needs two calls: clone then list
+        mock_subprocess.setup_multi(
+            ([''],),  # CloneCommand output
+            ([f'{sample_pool}/clone\tfilesystem'],)  # ListCommand output
+        )
         clone = zfs.clone(snap, f'{sample_pool}/clone')
         assert clone.name == f'{sample_pool}/clone'
     
@@ -270,30 +273,42 @@ class TestComplexWorkflow:
         source = zfs.create.filesystem(f'{sample_pool}/production', 
                                        properties={'compression': 'lz4', 'quota': '100G'})
         
-        # Step 2: Create initial snapshot
-        mock_subprocess.setup()
+        # Step 2: Create initial snapshot (recursive needs list then snapshot)
+        mock_subprocess.setup_multi(
+            ([f'{sample_pool}/production\tfilesystem'],),  # ListCommand for recursive
+            ([''],)  # SnapshotCommand output
+        )
         snap1 = zfs.snapshot(source, 'daily-2024-01-01', recursive=True)
         
         # Step 3: Create second snapshot for incremental
-        mock_subprocess.setup()
+        mock_subprocess.setup_multi(
+            ([f'{sample_pool}/production\tfilesystem'],),  # ListCommand for recursive
+            ([''],)  # SnapshotCommand output
+        )
         snap2 = zfs.snapshot(source, 'daily-2024-01-02', recursive=True)
         
         # Step 4: Send incremental snapshot
+        # Note: recursive snapshot returns a list, so extract first snapshot
+        snap2_main = snap2[0] if isinstance(snap2, list) else snap2
+        snap1_main = snap1[0] if isinstance(snap1, list) else snap1
+        
+        # Clear side_effect and set up mock for send (which needs special handling)
+        mock_subprocess.side_effect = None
         process_mock = MagicMock()
         process_mock.stdout.peek.return_value = b'ZFS_DATA'
         process_mock.poll.return_value = None
         mock_subprocess.return_value = process_mock
         
-        stream = zfs.send.snapshot(snap2, since=snap1, replicate=True)
+        stream = zfs.send.snapshot(snap2_main, since=snap1_main, replicate=True)
         assert stream is not None
         
         # Step 5: Create bookmark for snap1 before destroying
         mock_subprocess.setup()
-        bookmark = zfs.bookmark(snap1, 'daily-2024-01-01')
+        bookmark = zfs.bookmark(snap1_main, 'daily-2024-01-01')
         
         # Step 6: Destroy old snapshot
         mock_subprocess.setup(stdout=[f'destroy\t{sample_pool}/production@daily-2024-01-01\n'])
-        result = zfs.destroy.snapshots(snap1, destroy=True)
+        result = zfs.destroy.snapshots(snap1_main, destroy=True)
         
         # Step 7: Create target filesystem
         mock_subprocess.setup()

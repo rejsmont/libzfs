@@ -57,7 +57,7 @@ class Command:
             output = cls._exec_capture(process, errors)
             if output is False:
                 break
-            elif output != '':
+            elif output != '' and output is not None:
                 yield output
 
     @staticmethod
@@ -344,7 +344,7 @@ class BookmarkCommand(Command):
             raise ValueError('Expected Bookmark or Snapshot, got ' + type(ds).__name__ + ' instead')
 
         bookmark = Bookmark(ds.dataset, name)
-        cmd = [ZFS_BIN, 'bookmark', str(bookmark)]
+        cmd = [ZFS_BIN, 'bookmark', str(ds), str(bookmark)]
         cls._exec(cmd)
 
         return bookmark
@@ -424,12 +424,14 @@ class DestroyCommand(Command):
             return [o for o in result]
 
     @classmethod
-    def bookmark(cls, bookmark: Bookmark) -> None:
+    def bookmark(cls, bookmark: Bookmark, destroy: bool = True) -> None:
+        if not destroy:
+            return None
 
         if not isinstance(bookmark, Bookmark):
             raise ValueError('Expected Bookmark, got ' + type(bookmark).__name__ + ' instead')
 
-        cmd = [ZFS_BIN, 'destroy', bookmark]
+        cmd = [ZFS_BIN, 'destroy', str(bookmark.dataset.name) + '#' + str(bookmark.short)]
         cls._exec(cmd)
 
 
@@ -598,8 +600,11 @@ class CloneCommand(Command):
         cls._exec(cmd)
 
         props = properties.keys() if properties else None
+        result = ListCommand()(dataset, recursive=True, properties=props)
+        if len(result) == 1:
+            return result[0]
 
-        return ListCommand()(dataset, recursive=True, properties=props)
+        return result
 
 
 class GetCommand(Command, StringListArgument, ZFSListArgument):

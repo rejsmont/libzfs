@@ -142,7 +142,7 @@ class TestRealFilesystemOperations:
         assert result[0]['compression'].value == 'lz4'
         
         # Destroy filesystem
-        zfs.destroy.dataset(fs, destroy=True)
+        zfs.destroy(fs, destroy=True)
         
         # Verify it's gone
         try:
@@ -167,7 +167,7 @@ class TestRealFilesystemOperations:
             assert result[0]['compression'].value == 'gzip-9'
         finally:
             # Cleanup
-            zfs.destroy.dataset(fs, destroy=True)
+            zfs.destroy(fs, destroy=True)
     
     def test_inherit_property(self, test_pool):
         """Test inheriting a property."""
@@ -190,7 +190,7 @@ class TestRealFilesystemOperations:
             assert result[0]['compression'].value != 'gzip' or result[0]['compression'].source != 'local'
         finally:
             # Cleanup
-            zfs.destroy.dataset(fs, destroy=True)
+            zfs.destroy(fs, destroy=True)
 
 
 class TestRealSnapshotOperations:
@@ -216,14 +216,14 @@ class TestRealSnapshotOperations:
             assert result[0].name == snap_name
             
             # Destroy snapshot
-            zfs.destroy.snapshots(snap, destroy=True)
+            zfs.destroy(snap, destroy=True)
             
             # Verify it's gone
             result = zfs.list(roots=fs, types=['snapshot'])
             assert len(result) == 0
         finally:
             # Cleanup
-            zfs.destroy.dataset(fs, destroy=True, recursive=True)
+            zfs.destroy(fs, destroy=True, recursive=True)
     
     def test_recursive_snapshot(self, test_pool):
         """Test recursive snapshot creation."""
@@ -248,7 +248,7 @@ class TestRealSnapshotOperations:
             assert any(s.name == f'{child_name}@{snap_name}' for s in result)
         finally:
             # Cleanup
-            zfs.destroy.dataset(parent, destroy=True, recursive=True)
+            zfs.destroy(parent, destroy=True, recursive=True)
 
 
 class TestRealCloneOperations:
@@ -267,6 +267,7 @@ class TestRealCloneOperations:
         try:
             # Clone snapshot
             clone = zfs.clone(snap, clone_name)
+            print('clone created:', clone)
             assert isinstance(clone, Filesystem)
             assert clone.name == clone_name
             
@@ -281,10 +282,10 @@ class TestRealCloneOperations:
         finally:
             # Cleanup (clone first, then source)
             try:
-                zfs.destroy.dataset(clone, destroy=True)
+                zfs.destroy(clone, destroy=True)
             except:
                 pass
-            zfs.destroy.dataset(fs, destroy=True, recursive=True)
+            zfs.destroy(fs, destroy=True, recursive=True)
 
 
 class TestRealBookmarkOperations:
@@ -307,19 +308,19 @@ class TestRealBookmarkOperations:
             assert bookmark.name == bookmark_name
             
             # List bookmarks
-            result = zfs.list(roots=fs_name, types=['bookmark'])
+            result = zfs.list(roots=fs, types=['bookmark'])
             assert len(result) == 1
             assert result[0].name == bookmark_name
             
             # Destroy bookmark
-            zfs.destroy.dataset(bookmark, destroy=True)
+            zfs.destroy(bookmark, destroy=True)
             
             # Verify it's gone
-            result = zfs.list(roots=fs_name, types=['bookmark'])
+            result = zfs.list(roots=fs, types=['bookmark'])
             assert len(result) == 0
         finally:
             # Cleanup
-            zfs.destroy.dataset(fs, destroy=True, recursive=True)
+            zfs.destroy(fs, destroy=True, recursive=True)
 
 
 class TestRealRenameOperations:
@@ -340,23 +341,23 @@ class TestRealRenameOperations:
             
             # Verify old name doesn't exist
             try:
-                zfs.list(roots=old_name)
+                zfs.list(roots=fs)
                 assert False, "Old filesystem name should not exist"
             except:
                 pass  # Expected
             
             # Verify new name exists
-            result = zfs.list(roots=new_name)
+            result = zfs.list(roots=renamed)
             assert len(result) == 1
             assert result[0].name == new_name
         finally:
             # Cleanup (try both names just in case)
             try:
-                zfs.destroy.dataset(new_name, destroy=True)
+                zfs.destroy(new_name, destroy=True)
             except:
                 pass
             try:
-                zfs.destroy.dataset(old_name, destroy=True)
+                zfs.destroy(old_name, destroy=True)
             except:
                 pass
 
@@ -375,7 +376,7 @@ class TestRealVolumeOperations:
         
         try:
             # List volume
-            result = zfs.list(roots=vol_name)
+            result = zfs.list(roots=vol)
             assert len(result) == 1
             assert result[0].name == vol_name
             assert isinstance(result[0], Volume)
@@ -386,4 +387,4 @@ class TestRealVolumeOperations:
             assert result[0]['volsize'].value in ['100M', '104857600']
         finally:
             # Cleanup
-            zfs.destroy.dataset(vol, destroy=True)
+            zfs.destroy(vol, destroy=True)

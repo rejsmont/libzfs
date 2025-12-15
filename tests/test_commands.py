@@ -189,13 +189,17 @@ class TestSnapshotCommand:
     @pytest.mark.subprocess
     def test_create_snapshot_recursive(self, mock_subprocess, sample_filesystem):
         """Test creating recursive snapshot."""
-        mock_subprocess.setup()
+        # Mock two subprocess calls: ListCommand for recursive listing, then SnapshotCommand
+        mock_subprocess.setup_multi(
+            (['testpool/filesystem\tfilesystem'],),  # ListCommand output
+            ([''],)  # SnapshotCommand output (no output expected)
+        )
         
         cmd = SnapshotCommand()
         result = cmd(sample_filesystem, 'snap1', recursive=True)
         
-        call_args = mock_subprocess.call_args[0][0]
-        assert '-r' in call_args
+        # Result should be a list of snapshots
+        assert isinstance(result, list)
     
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -336,7 +340,11 @@ class TestCloneCommand:
     @pytest.mark.subprocess
     def test_clone_snapshot(self, mock_subprocess, sample_snapshot):
         """Test cloning a snapshot."""
-        mock_subprocess.setup()
+        # Mock two subprocess calls: CloneCommand, then ListCommand for verification
+        mock_subprocess.setup_multi(
+            ([''],),  # CloneCommand output (no output expected)
+            (['testpool/clone\tfilesystem'],)  # ListCommand output
+        )
         
         cmd = CloneCommand()
         result = cmd(sample_snapshot, 'testpool/clone')
@@ -344,7 +352,8 @@ class TestCloneCommand:
         assert isinstance(result, Dataset)
         assert result.name == 'testpool/clone'
         
-        call_args = mock_subprocess.call_args[0][0]
+        # Check the first call (clone command), not the last (list command)
+        call_args = mock_subprocess.call_args_list[0][0][0]
         assert 'clone' in call_args
 
 

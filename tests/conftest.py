@@ -10,8 +10,11 @@ def mock_subprocess(mocker):
     """Mock subprocess.Popen to avoid actual ZFS commands."""
     mock_popen = mocker.patch('subprocess.Popen')
     
+    # Queue to hold multiple mock configurations
+    mock_queue = []
+    
     def setup_mock(stdout='', stderr='', returncode=0):
-        """Helper to configure mock subprocess behavior."""
+        """Helper to configure mock subprocess behavior for a single call."""
         process_mock = MagicMock()
         
         # Setup stdout
@@ -29,10 +32,40 @@ def mock_subprocess(mocker):
         # Setup return code
         process_mock.poll.side_effect = [None] * len(stdout) + [returncode] if isinstance(stdout, list) else [returncode]
         
+        # Set as return_value and also add to queue
         mock_popen.return_value = process_mock
+        mock_queue.append(process_mock)
         return process_mock
     
+    def setup_multi(*configs):
+        """Helper to configure multiple subprocess calls in sequence.
+        
+        Args:
+            *configs: Tuples of (stdout, stderr, returncode) for each subprocess call
+        """
+        mock_queue.clear()
+        mock_popen.side_effect = popen_side_effect  # Enable side_effect for multi-call
+        for config in configs:
+            if len(config) == 1:
+                setup_mock(stdout=config[0])
+            elif len(config) == 2:
+                setup_mock(stdout=config[0], stderr=config[1])
+            else:
+                setup_mock(stdout=config[0], stderr=config[1], returncode=config[2])
+    
+    # Return mocks from queue in order
+    def popen_side_effect(*args, **kwargs):
+        if mock_queue:
+            return mock_queue.pop(0)
+        # Fallback - return a mock with poll() returning 0 immediately
+        fallback = MagicMock()
+        fallback.stdout.readline.return_value = ''
+        fallback.stderr.readline.return_value = ''
+        fallback.poll.return_value = 0
+        return fallback
+    
     mock_popen.setup = setup_mock
+    mock_popen.setup_multi = setup_multi
     return mock_popen
 
 
