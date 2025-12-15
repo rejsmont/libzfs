@@ -3,14 +3,25 @@ from libzfseasy.types import Validate, ZFS, Dataset, Filesystem, Volume, Snapsho
 from typing import Optional, Union, Dict, Iterable, Callable
 
 import io
+import os
 import subprocess
 import shutil
 
-ZFS_BIN = shutil.which('zfs')
+# Allow configuring zfs and zpool commands via environment variables
+ZFS_BIN = os.environ.get('ZFS_CMD') or shutil.which('zfs')
 if ZFS_BIN is None:
     raise RuntimeError(
         'zfs command not found in PATH. Ensure ZFS utilities are installed and available. '
-        'On macOS, install with: brew install openzfs'
+        'On macOS, install with: brew install openzfs '
+        'Or set ZFS_CMD environment variable to the path to the zfs command.'
+    )
+
+ZPOOL_BIN = os.environ.get('ZPOOL_CMD') or shutil.which('zpool')
+if ZPOOL_BIN is None:
+    raise RuntimeError(
+        'zpool command not found in PATH. Ensure ZFS utilities are installed and available. '
+        'On macOS, install with: brew install openzfs '
+        'Or set ZPOOL_CMD environment variable to the path to the zpool command.'
     )
 
 Snapshots = Union[Snapshot, SnapshotRange]
@@ -21,11 +32,14 @@ ZFSList = Union[ZFS, Iterable[ZFS]]
 StringList = Union[str, Iterable[str]]
 Sort = Union[str, Iterable[str], Dict[str, bool]]
 
+debug = True
 
 class Command:
 
     @classmethod
     def _exec(cls, cmd):
+        if debug:
+            print('Executing command: ' + ' '.join(cmd))
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         errors = []
         while True:
@@ -35,6 +49,8 @@ class Command:
 
     @classmethod
     def _exec_out(cls, cmd):
+        if debug:
+            print('Executing command: ' + ' '.join(cmd))
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         errors = []
         while True:
@@ -304,13 +320,17 @@ class SnapshotCommand(Command):
         cmd = [ZFS_BIN, 'snapshot']
         if recursive:
             cmd += ['-r']
+            datasets = ListCommand() (ds, recursive=recursive)
+            result = [Snapshot(cds, name, properties) for cds in datasets]
+        else:
+            result = snapshot
         if properties:
             for k, v in snapshot.properties:
                 cmd += ['-o', k + '=' + str(v)]
         cmd += [str(snapshot)]
         cls._exec(cmd)
 
-        return snapshot
+        return result
 
 
 class BookmarkCommand(Command):
@@ -577,7 +597,9 @@ class CloneCommand(Command):
         cmd += [str(snapshot), str(dataset)]
         cls._exec(cmd)
 
-        return dataset
+        props = properties.keys() if properties else None
+
+        return ListCommand()(dataset, recursive=True, properties=props)
 
 
 class GetCommand(Command, StringListArgument, ZFSListArgument):
@@ -632,6 +654,8 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
     def _lines_to_objects(lines, sources) -> Iterable[Datasets]:
         name, dsname, properties = '', '', {}
         for line in lines:
+            if not line:
+                continue
             name, prop, value, received, source = line.split('\t')
             if not dsname:
                 dsname = name
@@ -645,7 +669,6 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
                 properties[prop] = value
             elif 'all' in sources or source in sources:
                 properties[prop] = Property(value, source, received)
-
         properties.pop('name', None)
         dstype = properties.pop('type', None)
         if name and dstype:
@@ -683,11 +706,15 @@ class InheritCommand(Command):
         return self._inherit(*args, **kwargs)
 
     @classmethod
-    def _inherit(cls, ds: Datasets, prop: str, recursive: bool = False, received: bool = False) -> Datasets:
+    def _inherit(cls, ds: Datasets, props: StringList, recursive: bool = False, received: bool = False) -> Datasets:
 
-        ds.update({prop: None})
-        cmd = [ZFS_BIN, 'inherit', prop] + cls._get_options(recursive=recursive, received=received) + [str(ds)]
-        cls._exec(cmd)
+        if isinstance(props, str):
+            props = [props]
+
+        ds.update(dict.fromkeys(props, None))
+        for prop in props:
+            cmd = [ZFS_BIN, 'inherit', prop] + cls._get_options(recursive=recursive, received=received) + [str(ds)]
+            cls._exec(cmd)
 
         return ds
 

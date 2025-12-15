@@ -4,10 +4,11 @@ This directory contains the comprehensive test suite for the libzfseasy library.
 
 ## Overview
 
-The test suite is organized into three main categories:
+The test suite is organized into four main categories:
 
-- **Unit Tests** (`test_types.py`, `test_commands.py`) - Test individual components in isolation
-- **Integration Tests** (`test_integration.py`) - Test complete workflows and interactions
+- **Unit Tests** (`test_types.py`, `test_commands.py`) - Test individual components in isolation with mocked subprocess calls
+- **Integration Tests** (`test_integration.py`) - Test complete workflows and interactions with mocked subprocess calls
+- **Real ZFS Tests** (`test_real_zfs.py`) - Test against actual ZFS commands (requires ZFS installation and test pool)
 - **Fixtures** (`conftest.py`) - Shared test fixtures and configuration
 
 ## Installation
@@ -54,6 +55,51 @@ Run tests that mock subprocess:
 ```bash
 pytest -m subprocess
 ```
+
+### Real ZFS Integration Tests
+
+**WARNING: These tests run actual ZFS commands and require a test pool.**
+
+#### Setup Test Pool
+
+Create a file-backed test pool (safe for testing):
+
+```bash
+# Create a 512MB disk image
+dd if=/dev/zero of=/tmp/zfs-test-disk bs=1M count=512
+
+# Create test pool
+sudo zpool create testpool /tmp/zfs-test-disk
+```
+
+Or use an existing pool by setting the environment variable:
+```bash
+export TEST_ZFS_POOL=myexistingpool
+```
+
+#### Run Real ZFS Tests
+
+Run only the real ZFS tests (requires test pool):
+```bash
+pytest -m real_zfs
+```
+
+Run ALL tests including real ZFS tests:
+```bash
+pytest -m "not real_zfs"  # Skip real ZFS tests (default)
+pytest                     # Run all mocked tests (default - skips real_zfs)
+pytest -m real_zfs         # Run only real ZFS tests
+```
+
+#### Cleanup Test Pool
+
+When done testing:
+```bash
+sudo zpool destroy testpool
+rm /tmp/zfs-test-disk
+```
+
+**Note:** Real ZFS tests will automatically clean up test datasets they create, but the pool itself needs to be manually destroyed.
 
 ### Run specific test files
 
@@ -120,7 +166,7 @@ Tests for all ZFS command classes:
 
 ### test_integration.py
 
-End-to-end workflow tests:
+End-to-end workflow tests with mocked subprocess calls:
 - Basic create/list/destroy workflows
 - Snapshot creation and cloning
 - Incremental snapshots
@@ -130,6 +176,24 @@ End-to-end workflow tests:
 - Mount/unmount operations
 - Complex multi-step workflows
 - Error handling
+
+### test_real_zfs.py
+
+**Real ZFS integration tests that run actual ZFS commands:**
+- Filesystem creation, listing, and destruction
+- Property get/set/inherit operations
+- Snapshot creation and management
+- Recursive snapshots
+- Clone operations
+- Bookmark creation and management
+- Rename operations
+- Volume creation and management
+
+**Requirements:**
+- ZFS utilities must be installed
+- A test pool must exist (e.g., `testpool`)
+- Tests automatically skip if ZFS is not available
+- Tests clean up after themselves
 
 ### conftest.py
 
@@ -143,10 +207,11 @@ Shared test fixtures and configuration:
 
 Tests are marked with custom markers for categorization:
 
-- `@pytest.mark.unit` - Unit tests
-- `@pytest.mark.integration` - Integration tests
+- `@pytest.mark.unit` - Unit tests that test individual functions/methods
+- `@pytest.mark.integration` - Integration tests that test complete workflows
 - `@pytest.mark.subprocess` - Tests that mock subprocess calls
 - `@pytest.mark.slow` - Tests that take longer to run
+- `@pytest.mark.real_zfs` - Real ZFS integration tests (requires actual ZFS installation and test pool)
 
 ## Writing New Tests
 

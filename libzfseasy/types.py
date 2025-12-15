@@ -6,16 +6,16 @@ class PropertyNames:
     apple = ['com.apple.browse', 'com.apple.ignoreowner', 'com.apple.mimic', 'com.apple.devdisk']
 
     dataset = ['available', 'checksum', 'compression', 'compressratio', 'context', 'copies', 'createtxg', 'creation',
-               'dedup', 'defcontext', 'encryption', 'encryptionroot', 'fscontext', 'guid', 'keyformat', 'keylocation',
-               'keystatus',
-               'logbias', 'logicalreferenced', 'logicalused', 'mlslabel', 'objsetid', 'pbkdf2iters', 'primarycache',
+               'dedup', 'defcontext', 'direct', 'encryption', 'encryptionroot', 'fscontext', 'guid', 'keyformat', 'keylocation',
+               'keystatus', 'snapshots_changed', 'origin',
+               'logbias', 'logicalreferenced', 'logicalused', 'longname', 'mlslabel', 'objsetid', 'pbkdf2iters', 'primarycache',
                'readonly', 'redundant_metadata', 'refcompressratio', 'referenced', 'refreservation', 'reservation',
                'rootcontext', 'secondarycache', 'snapdev', 'snapshot_count', 'snapshot_limit', 'sync', 'type', 'used',
                'usedbychildren', 'usedbydataset', 'usedbyrefreservation', 'usedbysnapshots', 'volmode', 'written']
 
     filesystem = ['aclmode', 'aclinherit', 'acltype', 'atime', 'canmount', 'casesensitivity', 'devices', 'dnodesize',
                   'exec', 'filesystem_count', 'filesystem_limit', 'mounted', 'mountpoint', 'nbmand', 'normalization',
-                  'overlay', 'quota', 'recordsize', 'refquota', 'relatime', 'setuid', 'sharenfs', 'sharesmb',
+                  'overlay', 'prefetch', 'quota', 'recordsize', 'refquota', 'relatime', 'setuid', 'sharenfs', 'sharesmb',
                   'snapdir', 'special_small_blocks', 'utf8only', 'version', 'vscan', 'xattr', 'zoned']
 
     volume = ['volblocksize', 'volsize']
@@ -26,7 +26,7 @@ class PropertyNames:
                 'written']
 
     fs_snap = ['acltype', 'casesensitivity', 'devices', 'exec', 'nbmand', 'normalization', 'setuid', 'utf8only',
-               'version', 'xattr']
+               'version', 'xattr', 'prefetch']
 
     vol_snap = ['volsize']
 
@@ -203,6 +203,17 @@ class ZFS:
         except ValueError:
             raise ValueError(k + ' is not a valid ' + self.__class__.__name__ + ' property')
 
+    def __contains__(self, k: str) -> bool:
+        Validate.attribute(k)
+        try:
+            i = self._prop_names.index(k)
+            return i in self._props
+        except ValueError:
+            if ':' in k:
+                return k in self._user_props
+            else:
+                raise ValueError(k + ' is not a valid ' + self.__class__.__name__ + ' property')
+
     def __str__(self) -> str:
         return self._name
 
@@ -238,6 +249,7 @@ class Dataset(ZFS):
     def __init__(self, name: str, properties: Optional[Properties] = None) -> None:
         Validate.dataset(name)
         super().__init__(name, properties)
+        self._type = 'dataset'
 
     @classmethod
     def from_name(cls, name: str, dstype=None, properties: Optional[Properties] = None):
