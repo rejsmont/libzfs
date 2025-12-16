@@ -1,0 +1,73 @@
+# Example configuration for ZFS Backup Daemon
+#
+# This file defines datasets to backup, snapshot frequency,
+# and retention policies for automated ZFS snapshot management.
+
+# Global settings
+snapshot_prefix: "autosnap"  # Prefix for all managed snapshots
+check_interval: "5m"          # How often to check if snapshots are needed
+dry_run: false                # Set to true to test without creating/destroying snapshots
+
+# Datasets to backup
+datasets:
+  # Example 1: Simple dataset with default settings
+  - name: "tank/data"
+    enabled: true
+    frequency: "1h"           # Take snapshots every hour
+    recursive: false          # Don't snapshot child datasets
+    retention:
+      "1d": "1M"              # Snapshots 1 day old: keep for 1 month
+      "1w": "3M"              # Snapshots 1 week old: keep for 3 months  
+      "1M": "1y"              # Snapshots 1 month old: keep for 1 year
+
+  # Example 2: Home directory with more frequent snapshots
+  - name: "tank/home"
+    enabled: true
+    frequency: "15m"          # Snapshot every 15 minutes
+    recursive: true           # Include all subdirectories
+    retention:
+      "1h": "1d"              # Snapshots 1 hour old: keep for 1 day
+      "1d": "1w"              # Snapshots 1 day old: keep for 1 week
+      "1w": "1M"              # Snapshots 1 week old: keep for 1 month
+      "1M": "1y"              # Snapshots 1 month old: keep for 1 year
+
+  # Example 3: Database with frequent snapshots and long retention
+  - name: "tank/database"
+    enabled: true
+    frequency: "5m"           # Very frequent snapshots
+    recursive: false
+    retention:
+      "15m": "1d"             # Keep 15-min old snapshots for 1 day
+      "1d": "1w"              # Keep 1-day old snapshots for 1 week
+      "1w": "1M"              # Keep 1-week old snapshots for 1 month
+      "1M": "10y"             # Keep monthly snapshots for 10 years
+
+  # Example 4: Archive dataset with infrequent backups
+  - name: "tank/archives"
+    enabled: true
+    frequency: "1d"           # Daily snapshots
+    recursive: true
+    retention:
+      "1w": "3M"              # Keep weekly snapshots for 3 months
+      "1M": "10y"             # Keep monthly snapshots for 10 years
+
+  # Example 5: Disabled dataset
+  - name: "tank/temp"
+    enabled: false            # This dataset will be ignored
+    frequency: "1h"
+    retention:
+      "1d": "1w"
+
+# Time format reference:
+# h = hours   (e.g., "1h", "12h")
+# d = days    (e.g., "1d", "7d")
+# w = weeks   (e.g., "1w", "2w")
+# M = months  (e.g., "1M", "6M") - approximate as 30 days
+# y = years   (e.g., "1y", "10y") - approximate as 365 days
+#
+# Retention policy logic:
+# - Snapshots are matched against retention rules based on their age
+# - Each rule specifies: "snapshot age": "how long to keep"
+# - Example: "1d": "1M" means "snapshots that are 1 day old should be kept for 1 month"
+# - A snapshot expires when: (snapshot age) + (keep duration) > now
+# - Use multiple rules to create a tiered retention strategy

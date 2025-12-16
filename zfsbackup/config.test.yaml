@@ -1,0 +1,13 @@
+# Simple test configuration for ZFS Backup Daemon
+snapshot_prefix: "autosnap"
+check_interval: "1m"
+dry_run: true
+
+datasets:
+  - name: "tank/test"
+    enabled: true
+    frequency: "5m"
+    recursive: false
+    retention:
+      "1d": "1w"
+      "1w": "1M"
