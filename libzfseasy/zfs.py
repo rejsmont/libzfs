@@ -177,7 +177,7 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
         cmd = [ZFS_BIN, 'list', '-H']
 
         if not recursive:
-            cmd += ['-d', '1']
+            cmd += ['-d', '0']
         elif depth > 0:
             cmd += ['-d', str(depth)]
 

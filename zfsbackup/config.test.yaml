@@ -1,13 +1,29 @@
-# Simple test configuration for ZFS Backup Daemon
 snapshot_prefix: "autosnap"
 check_interval: "1m"
 dry_run: true
 
 datasets:
-  - name: "tank/test"
+  - name: "zpool/ROOT/macos_kX7pM9"
     enabled: true
-    frequency: "5m"
+    frequency: "15m"
     recursive: false
     retention:
-      "1d": "1w"
-      "1w": "1M"
+      "15m": "1h"
+      "1h": "6h"
+      "6h": "1d"
+  - name: "zpool/SRVDATA/lxd_g1ezjj"
+    enabled: true
+    frequency: "1m"
+    recursive: true
+    retention:
+      "1m": "15m"
+      "15m": "2h"
+      "1h": "1d"
+  - name: "zpool/USERDATA/home_aqqn2l"
+    enabled: true
+    frequency: "15m"
+    recursive: true
+    retention:
+      "5m": "30m"
+      "15m": "2h"
+      "1h": "1d"

@@ -43,3 +43,12 @@ unmount = UnMountCommand()
 # upgrade
 # userspace
 # wait
+
+def exists(ds):
+    try:
+        result = list(roots=ds)
+    except Exception as e:
+        if "dataset does not exist" in str(e).lower():  
+            return False
+        raise e
+    return len(result) == 1

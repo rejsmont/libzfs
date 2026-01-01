@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from zfsbackup.config import BackupConfig, parse_time_duration
-from zfsbackup.snapshot_manager import SnapshotManager
+from zfsbackup.backup_manager import SnapshotManager
 from datetime import timedelta
 
 

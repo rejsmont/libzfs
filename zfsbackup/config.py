@@ -12,24 +12,33 @@ def parse_time_duration(duration_str: str) -> timedelta:
     if not duration_str:
         raise ValueError("Duration string cannot be empty")
     
-    unit = duration_str[-1].lower()
+    if duration_str[0].lower() == 'm' and len(duration_str) > 1:
+        if duration_str[1].lower() == 'i':
+            unit = 'm'
+        else:
+            unit = 'M'
+    else:
+        unit = duration_str[-1]
+    
     try:
         value = int(duration_str[:-1])
     except ValueError:
         raise ValueError(f"Invalid duration format: {duration_str}")
     
-    if unit == 'h':
+    if unit == 'm':
+        return timedelta(minutes=value)
+    if unit.lower() == 'h':
         return timedelta(hours=value)
-    elif unit == 'd':
+    elif unit.lower() == 'd':
         return timedelta(days=value)
-    elif unit == 'w':
+    elif unit.lower() == 'w':
         return timedelta(weeks=value)
-    elif unit == 'm':
+    elif unit == 'M':
         return timedelta(days=value * 30)  # Approximate month as 30 days
-    elif unit == 'y':
+    elif unit.lower() == 'y':
         return timedelta(days=value * 365)  # Approximate year
     else:
-        raise ValueError(f"Unknown duration unit: {unit}. Use h/d/w/m/y")
+        raise ValueError(f"Unknown duration unit: {unit}. Use m/h/d/w/M/y")
 
 
 @dataclass
@@ -131,6 +140,7 @@ class BackupConfig:
             dry_run=dry_run
         )
     
-    def get_enabled_datasets(self) -> List[DatasetConfig]:
+    @property
+    def enabled_datasets(self) -> List[DatasetConfig]:
         """Return only enabled datasets."""
         return [ds for ds in self.datasets if ds.enabled]

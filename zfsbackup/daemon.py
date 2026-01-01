@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from zfsbackup.config import BackupConfig, DatasetConfig
-from zfsbackup.snapshot_manager import SnapshotManager
+from zfsbackup.backup_manager import DatasetInfo, DatasetManager, SnapshotManager
 
 
 # Configure logging
@@ -31,12 +31,7 @@ class BackupDaemon:
     
     def __init__(self, config: BackupConfig):
         self.config = config
-        self.manager = SnapshotManager(
-            snapshot_prefix=config.snapshot_prefix,
-            dry_run=config.dry_run
-        )
-        self.running = False
-        self.last_snapshot_times: Dict[str, Optional[datetime]] = {}
+        self.manager = DatasetManager(config)
         
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -48,45 +43,45 @@ class BackupDaemon:
         logger.info(f"Received {sig_name}, shutting down gracefully...")
         self.running = False
     
-    def _process_dataset(self, dataset_config: DatasetConfig):
+    def _process_dataset(self, dataset: DatasetInfo):
         """Process a single dataset: check if snapshot needed and apply retention."""
-        logger.debug(f"Processing dataset: {dataset_config.name}")
+        logger.debug(f"Processing dataset: {dataset.name}")
         
-        # Check if we need to create a new snapshot
-        needs_snap, last_snap_time = self.manager.needs_snapshot(dataset_config)
+        # # Check if we need to create a new snapshot
+        # needs_snap, last_snap_time = self.manager.needs_snapshot(dataset_config)
         
-        if needs_snap:
-            logger.info(
-                f"Dataset {dataset_config.name} needs snapshot "
-                f"(frequency={dataset_config.frequency}, last={last_snap_time})"
-            )
-            snapshot = self.manager.create_snapshot(
-                dataset_config.name,
-                recursive=dataset_config.recursive
-            )
-            if snapshot:
-                self.last_snapshot_times[dataset_config.name] = snapshot.timestamp
-        else:
-            logger.debug(
-                f"Dataset {dataset_config.name} does not need snapshot yet "
-                f"(last snapshot: {last_snap_time})"
-            )
+        # if needs_snap:
+        #     logger.info(
+        #         f"Dataset {dataset_config.name} needs snapshot "
+        #         f"(frequency={dataset_config.frequency}, last={last_snap_time})"
+        #     )
+        #     snapshot = self.manager.create_snapshot(
+        #         dataset_config.name,
+        #         recursive=dataset_config.recursive
+        #     )
+        #     if snapshot:
+        #         self.last_snapshot_times[dataset_config.name] = snapshot.timestamp
+        # else:
+        #     logger.debug(
+        #         f"Dataset {dataset_config.name} does not need snapshot yet "
+        #         f"(last snapshot: {last_snap_time})"
+        #     )
         
-        # Apply retention policy
-        expired_snapshots = self.manager.apply_retention_policy(dataset_config)
+        # # Apply retention policy
+        # expired_snapshots = self.manager.apply_retention_policy(dataset_config)
         
-        if expired_snapshots:
-            logger.info(
-                f"Found {len(expired_snapshots)} expired snapshots for {dataset_config.name}"
-            )
-            for snapshot in expired_snapshots:
-                self.manager.destroy_snapshot(snapshot)
-        else:
-            logger.debug(f"No expired snapshots for {dataset_config.name}")
+        # if expired_snapshots:
+        #     logger.info(
+        #         f"Found {len(expired_snapshots)} expired snapshots for {dataset_config.name}"
+        #     )
+        #     for snapshot in expired_snapshots:
+        #         self.manager.destroy_snapshot(snapshot)
+        # else:
+        #     logger.debug(f"No expired snapshots for {dataset_config.name}")
     
     def _run_cycle(self):
         """Run one complete cycle: process all enabled datasets."""
-        enabled_datasets = self.config.get_enabled_datasets()
+        enabled_datasets = self.config.enabled_datasets
         
         if not enabled_datasets:
             logger.warning("No enabled datasets configured")
@@ -110,25 +105,14 @@ class BackupDaemon:
         logger.info("=" * 60)
         logger.info("ZFS Backup Daemon Starting")
         logger.info("=" * 60)
-        logger.info(f"Config: {len(self.config.datasets)} datasets configured")
-        logger.info(f"Snapshot prefix: {self.config.snapshot_prefix}")
-        logger.info(f"Check interval: {self.config.check_interval}")
-        logger.info(f"Dry run mode: {self.config.dry_run}")
-        logger.info("=" * 60)
-        
-        for ds in self.config.get_enabled_datasets():
-            logger.info(f"  Dataset: {ds.name}")
-            logger.info(f"    Frequency: {ds.frequency}")
-            logger.info(f"    Recursive: {ds.recursive}")
-            logger.info(f"    Retention rules: {len(ds.retention_rules)}")
-            for rule in ds.retention_rules:
-                logger.info(f"      - Age {rule.age} -> Keep for {rule.keep_for}")
+
+        self.manager.dataset_report()
+        self.manager.verify_datasets()
         
         logger.info("=" * 60)
         logger.info("Starting main loop...")
         logger.info("=" * 60)
-        
-        # Run initial cycle
+
         self._run_cycle()
         
         last_check = time.time()
@@ -140,8 +124,6 @@ class BackupDaemon:
                 if self.running and (time.time() - last_check) >= sleep_seconds:
                     last_check = time.time()
                     self._run_cycle()
-                else:
-                    break
                 time.sleep(0.25)
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
