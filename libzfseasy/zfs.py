@@ -176,8 +176,8 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
 
         cmd = [ZFS_BIN, 'list', '-H']
 
-        if not recursive:
-            cmd += ['-d', '0']
+        if recursive:
+            cmd += ['-r']
         elif depth > 0:
             cmd += ['-d', str(depth)]
 
@@ -204,7 +204,7 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
         cmd += ['-o', ','.join(properties)]
 
         if roots:
-            cmd += ['-r', cls._dslist_to_str(roots)]
+            cmd += [cls._dslist_to_str(roots)]
 
         result = (cls._line_to_object(line, properties) for line in cls._exec_out(cmd))
 

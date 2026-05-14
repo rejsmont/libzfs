@@ -14,7 +14,6 @@ from zfsbackup.config import BackupConfig, DatasetConfig
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager, SnapshotManager
 
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -46,6 +45,13 @@ class BackupDaemon:
     def _process_dataset(self, dataset: DatasetInfo):
         """Process a single dataset: check if snapshot needed and apply retention."""
         logger.debug(f"Processing dataset: {dataset.name}")
+
+        if self.manager.needs_snapshot(dataset):
+            logger.info(
+                f"Dataset {dataset.name} needs snapshot "
+            )
+
+            snap = self.manager.create_snapshot(dataset)
         
         # # Check if we need to create a new snapshot
         # needs_snap, last_snap_time = self.manager.needs_snapshot(dataset_config)
@@ -81,7 +87,7 @@ class BackupDaemon:
     
     def _run_cycle(self):
         """Run one complete cycle: process all enabled datasets."""
-        enabled_datasets = self.config.enabled_datasets
+        enabled_datasets = self.manager.datasets
         
         if not enabled_datasets:
             logger.warning("No enabled datasets configured")
@@ -89,12 +95,12 @@ class BackupDaemon:
         
         logger.info(f"Running backup cycle for {len(enabled_datasets)} datasets")
         
-        for dataset_config in enabled_datasets:
+        for dataset in enabled_datasets:
             try:
-                self._process_dataset(dataset_config)
+                self._process_dataset(dataset)
             except Exception as e:
                 logger.error(
-                    f"Error processing dataset {dataset_config.name}: {e}",
+                    f"Error processing dataset {dataset.name}: {e}",
                     exc_info=True
                 )
     

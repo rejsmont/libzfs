@@ -1,29 +1,50 @@
 snapshot_prefix: "autosnap"
 check_interval: "1m"
-dry_run: true
+dry_run: false
 
 datasets:
-  - name: "zpool/ROOT/macos_kX7pM9"
+  # OS root — non-recursive, infrequent snapshots (scaled from 1h)
+  - name: "libzfs_test/ROOT/macos"
     enabled: true
-    frequency: "15m"
+    frequency: "5m"
     recursive: false
     retention:
-      "15m": "1h"
-      "1h": "6h"
-      "6h": "1d"
-  - name: "zpool/SRVDATA/lxd_g1ezjj"
+      "30m": "6h"             # scaled from 1d → 1M
+      "2h": "1d"              # scaled from 1w → 3M
+
+  # Home directories — recursive (scaled from 15m)
+  - name: "libzfs_test/USERDATA/home"
+    enabled: true
+    frequency: "2m"
+    recursive: true
+    retention:
+      "5m": "30m"             # scaled from 1h → 1d
+      "30m": "2h"             # scaled from 1d → 1w
+      "2h": "6h"              # scaled from 1w → 1M
+
+  # Postgres data — most frequent, recursive (scaled from 5m)
+  - name: "libzfs_test/SRVDATA/postgres"
     enabled: true
     frequency: "1m"
     recursive: true
     retention:
-      "1m": "15m"
-      "15m": "2h"
-      "1h": "1d"
-  - name: "zpool/USERDATA/home_aqqn2l"
+      "5m": "30m"             # scaled from 15m → 1d
+      "30m": "2h"             # scaled from 1d → 1w
+      "2h": "6h"              # scaled from 1w → 1M
+
+  # Media archive — least frequent, recursive (scaled from 1d)
+  - name: "libzfs_test/USERDATA/media"
     enabled: true
     frequency: "15m"
     recursive: true
     retention:
-      "5m": "30m"
-      "15m": "2h"
-      "1h": "1d"
+      "1h": "6h"              # scaled from 1w → 3M
+      "6h": "1d"              # scaled from 1M → 10y
+
+  # LXD containers — disabled example (scaled from 1h)
+  - name: "libzfs_test/SRVDATA/lxd"
+    enabled: false
+    frequency: "5m"
+    recursive: true
+    retention:
+      "30m": "2h"             # scaled from 1d → 1w

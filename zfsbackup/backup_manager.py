@@ -24,10 +24,19 @@ class DatasetInfo:
         self.dataset = dataset
         self.name = dataset.name
         self.config = config
+        self.snapshots: List[SnapshotInfo] = []
     
     @property
     def reference_time(self) -> datetime:
-        return self.reference_time()
+        return self.get_reference_time()
+
+    @property
+    def frequency(self) -> timedelta:
+        return self.config.frequency
+    
+    @property
+    def recursive(self) -> bool:
+        return self.config.recursive
 
     def get_reference_time(self, now: Optional[datetime] = None) -> datetime:
         """Return the aligned reference time for the given snapshot frequency.
@@ -82,6 +91,10 @@ class DatasetManager:
             self._datasets = self._get_datasets()
         return self._datasets
 
+    @property
+    def prefix(self) -> str:
+        return self.config.snapshot_prefix
+
     def _get_datasets(self) -> List[DatasetInfo]:
         """Get list of DatasetInfo objects for all configured datasets."""
         datasets = []
@@ -111,6 +124,88 @@ class DatasetManager:
             for rule in ds.retention_rules:
                 logger.info(f"      - Age {rule.age} -> Keep for {rule.keep_for}")
 
+    def needs_snapshot(self, dsi: DatasetInfo) -> bool:
+        
+        snapshots = self.list_snapshots(dsi, recursive=False)
+        
+        if not snapshots:
+            logger.debug(f"No snapshots found for {dsi.name}")
+            logger.debug(f"Dataset {dsi.name} needs snapshot: True (no existing snapshots)")
+            return True
+        
+        latest = snapshots[0]
+        age = latest.age
+
+        needs = age >= dsi.frequency
+
+        logger.debug(f"Latest snapshot for {dsi.name} is {latest.full_name} (age={age})")
+        logger.debug(f"Dataset {dsi.name} needs snapshot: {needs} (age={age}, frequency={dsi.frequency})")
+
+        return needs
+
+    def list_snapshots(self, dsi: DatasetInfo, recursive: bool = False) -> List[SnapshotInfo]:
+        """List all snapshots for a dataset."""
+        try:            
+            snapshots = zfs.list(
+                roots=dsi.dataset,
+                types='snapshot',
+                recursive=recursive,
+                properties=['creation']
+            )
+            
+            result: List[SnapshotInfo] = []
+            for snap in snapshots:
+                if isinstance(snap, ZFSSnapshot):
+                    info = SnapshotInfo(snap, self.prefix)
+                    if info.is_managed:
+                        result.append(info)
+            
+            dsi.snapshots = sorted(result, key=lambda s: s.timestamp, reverse=True)
+
+            return dsi.snapshots
+            
+        except Exception as e:
+            logger.error(f"Failed to list snapshots for {dsi.name}: {e}")
+            return []
+
+    def _generate_snapshot_name(self, timestamp: Optional[datetime] = None) -> str:
+        """Generate snapshot name with timestamp."""
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc)
+        
+        date_str = timestamp.strftime("%Y%m%d")
+        time_str = timestamp.strftime("%H%M%S")
+        return f"{self.prefix}_{date_str}{time_str}"
+
+    
+    def create_snapshot(self, dsi: DatasetInfo) -> Optional[SnapshotInfo]:
+        """Create a new snapshot for the dataset."""
+        
+        snap_name = self._generate_snapshot_name()
+        full_name = f"{dsi.name}@{snap_name}"
+        
+        try:
+            logger.info(f"Creating snapshot: {full_name} (recursive={dsi.recursive})")
+            
+            if self.config.dry_run:
+                logger.info(f"[DRY RUN] Would create snapshot: {full_name}")
+                return None
+            
+            result = zfs.snapshot(dsi.dataset, snap_name, recursive=dsi.recursive)
+            
+            if isinstance(result, list):
+                snapshot = result[0]
+            else:
+                snapshot = result
+            
+            dsi.snapshots.insert(0, SnapshotInfo(snapshot, self.prefix))
+            
+            logger.info(f"Successfully created snapshot: {full_name}")
+            return SnapshotInfo(snapshot, self.prefix)
+            
+        except Exception as e:
+            logger.error(f"Failed to create snapshot {full_name}: {e}")
+            return None
 
 class SnapshotInfo:
     """Information about a snapshot with parsed metadata."""
@@ -164,73 +259,6 @@ class SnapshotManager:
         self.zfs_snapshot = zfs.snapshot
         self.zfs_destroy = zfs.destroy
     
-    def generate_snapshot_name(self, dataset_config: DatasetConfig, timestamp: Optional[datetime] = None) -> str:
-        """Generate snapshot name with timestamp."""
-        if timestamp is None:
-            timestamp = datetime.now(timezone.utc)
-        
-        date_str = timestamp.strftime("%Y%m%d")
-        time_str = timestamp.strftime("%H%M%S")
-        return f"{self.prefix}_{date_str}{time_str}"
-
-    
-    def create_snapshot(self, dataset_name: str, snap_name: str, recursive: bool = False) -> Optional[SnapshotInfo]:
-        """Create a new snapshot for the dataset."""
-        full_name = f"{dataset_name}@{snap_name}"
-        
-        try:
-            logger.info(f"Creating snapshot: {full_name} (recursive={recursive})")
-            
-            if self.dry_run:
-                logger.info(f"[DRY RUN] Would create snapshot: {full_name}")
-                return None
-            
-            # Create the dataset object
-            dataset = Dataset(dataset_name)
-            
-            # Create snapshot
-            result = self.zfs_snapshot(dataset, snap_name, recursive=recursive)
-            
-            # If recursive, result is a list
-            if isinstance(result, list):
-                snapshot = result[0]  # Get the main dataset snapshot
-            else:
-                snapshot = result
-            
-            logger.info(f"Successfully created snapshot: {full_name}")
-            return SnapshotInfo(snapshot, self.prefix)
-            
-        except Exception as e:
-            logger.error(f"Failed to create snapshot {full_name}: {e}")
-            return None
-    
-    def list_snapshots(self, dataset_name: str, recursive: bool = False) -> List[SnapshotInfo]:
-        """List all snapshots for a dataset."""
-        try:
-            dataset = Dataset(dataset_name)
-            
-            # List snapshots
-            snapshots = self.zfs_list(
-                roots=dataset,
-                types='snapshot',
-                recursive=recursive,
-                properties=['creation']
-            )
-            
-            # Filter and wrap in SnapshotInfo
-            result = []
-            for snap in snapshots:
-                if isinstance(snap, ZFSSnapshot):
-                    info = SnapshotInfo(snap, self.prefix)
-                    if info.is_managed:
-                        result.append(info)
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Failed to list snapshots for {dataset_name}: {e}")
-            return []
-    
     def destroy_snapshot(self, snapshot_info: SnapshotInfo) -> bool:
         """Destroy a snapshot."""
         try:
@@ -247,25 +275,6 @@ class SnapshotManager:
         except Exception as e:
             logger.error(f"Failed to destroy snapshot {snapshot_info.full_name}: {e}")
             return False
-    
-    def needs_snapshot(self, dataset_config: DatasetConfig) -> Tuple[bool, Optional[datetime]]:
-        """
-        Check if a dataset needs a new snapshot.
-        
-        Returns:
-            Tuple of (needs_snapshot, last_snapshot_time)
-        """
-        snapshots = self.list_snapshots(dataset_config.name, recursive=False)
-        
-        if not snapshots:
-            return True, None
-        
-        # Find most recent snapshot
-        latest = max(snapshots, key=lambda s: s.timestamp)
-        age = latest.age
-        
-        needs = age >= dataset_config.frequency
-        return needs, latest.timestamp
     
     def apply_retention_policy(self, dataset_config: DatasetConfig) -> List[SnapshotInfo]:
         """
