@@ -105,38 +105,50 @@ class BackupConfig:
     datasets: List[DatasetConfig]
     snapshot_prefix: str = "autosnap"
     check_interval: timedelta = field(default_factory=lambda: timedelta(minutes=5))
+    prune_interval: timedelta = field(default_factory=lambda: timedelta(hours=1))
+    api_host: str = "127.0.0.1"
+    api_port: int = 8080
     dry_run: bool = False
-    
+
     @classmethod
     def from_file(cls, config_path: Path) -> 'BackupConfig':
         """Load configuration from YAML file."""
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
-        
+
         with open(config_path, 'r') as f:
             data = yaml.safe_load(f)
-        
+
         if not data:
             raise ValueError("Config file is empty")
-        
+
         # Parse datasets
         datasets_data = data.get('datasets', [])
         if not datasets_data:
             raise ValueError("No datasets configured")
-        
+
         datasets = [DatasetConfig.from_dict(ds) for ds in datasets_data]
-        
+
         # Parse global settings
         snapshot_prefix = data.get('snapshot_prefix', 'autosnap')
         dry_run = data.get('dry_run', False)
-        
+
         check_str = data.get('check_interval', '5m')
         check_interval = parse_time_duration(check_str)
-        
+
+        prune_str = data.get('prune_interval', '1h')
+        prune_interval = parse_time_duration(prune_str)
+
+        api_host = data.get('api_host', '127.0.0.1')
+        api_port = int(data.get('api_port', 8080))
+
         return cls(
             datasets=datasets,
             snapshot_prefix=snapshot_prefix,
             check_interval=check_interval,
+            prune_interval=prune_interval,
+            api_host=api_host,
+            api_port=api_port,
             dry_run=dry_run
         )
     

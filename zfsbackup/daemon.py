@@ -3,105 +3,101 @@
 
 import argparse
 import logging
+import multiprocessing
 import signal
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 from zfsbackup.config import BackupConfig
-from zfsbackup.backup_manager import DatasetInfo, DatasetManager
+from zfsbackup.backup_manager import DatasetManager
+from zfsbackup.workers import SnapshotWorker, PruningWorker, ApiWorker
 
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 
 logger = logging.getLogger(__name__)
 
+WORKER_RESTART_DELAY = 5   # seconds to wait before restarting a crashed worker
+SUPERVISOR_POLL = 5        # seconds between liveness checks
+
 
 class BackupDaemon:
-    """Main backup daemon that manages snapshots for multiple datasets."""
-    
-    def __init__(self, config: BackupConfig):
+    """Supervisor process: starts and monitors the snapshot and pruning workers."""
+
+    def __init__(self, config: BackupConfig, config_path: Path, verbose: bool = False):
         self.config = config
-        self.manager = DatasetManager(config)
-        
-        # Setup signal handlers
+        self.config_path = config_path
+        self.verbose = verbose
+        self._stop_event = multiprocessing.Event()
+        self._workers: Dict[str, multiprocessing.Process] = {}
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-    
+
     def _signal_handler(self, signum, frame):
-        """Handle shutdown signals gracefully."""
         sig_name = 'SIGINT' if signum == signal.SIGINT else 'SIGTERM'
         logger.info(f"Received {sig_name}, shutting down gracefully...")
-        self.running = False
-    
-    def _process_dataset(self, dataset: DatasetInfo):
-        """Process a single dataset: check if snapshot needed and apply retention."""
-        logger.debug(f"Processing dataset: {dataset.name}")
+        self._stop_event.set()
 
-        if self.manager.needs_snapshot(dataset):
-            logger.info(
-                f"Dataset {dataset.name} needs snapshot "
-            )
-            self.manager.create_snapshot(dataset)
-        self.manager.prune_snapshots(dataset)
-    
-    def _run_cycle(self):
-        """Run one complete cycle: process all enabled datasets."""
-        enabled_datasets = self.manager.datasets
-        
-        if not enabled_datasets:
-            logger.warning("No enabled datasets configured")
-            return
-        
-        logger.info(f"Running backup cycle for {len(enabled_datasets)} datasets")
-        
-        for dataset in enabled_datasets:
-            try:
-                self._process_dataset(dataset)
-            except Exception as e:
+    def _new_worker(self, name: str) -> multiprocessing.Process:
+        cls = {'snapshot': SnapshotWorker, 'pruning': PruningWorker, 'api': ApiWorker}[name]
+        return cls(self.config_path, self._stop_event, self.config.dry_run, self.verbose)
+
+    def _start_workers(self) -> None:
+        for name in ('snapshot', 'pruning', 'api'):
+            worker = self._new_worker(name)
+            worker.start()
+            logger.info(f"Started {name} worker (pid={worker.pid})")
+            self._workers[name] = worker
+
+    def _check_workers(self) -> None:
+        for name, worker in list(self._workers.items()):
+            if not worker.is_alive():
                 logger.error(
-                    f"Error processing dataset {dataset.name}: {e}",
-                    exc_info=True
+                    f"{name} worker (pid={worker.pid}) exited with code "
+                    f"{worker.exitcode}, restarting in {WORKER_RESTART_DELAY}s"
                 )
-    
-    def run(self):
-        """Main daemon loop."""
-        self.running = True
-        
+                time.sleep(WORKER_RESTART_DELAY)
+                new_worker = self._new_worker(name)
+                new_worker.start()
+                logger.info(f"Restarted {name} worker (pid={new_worker.pid})")
+                self._workers[name] = new_worker
+
+    def _shutdown_workers(self, timeout: int = 30) -> None:
+        for name, worker in self._workers.items():
+            worker.join(timeout=timeout)
+            if worker.is_alive():
+                logger.warning(f"{name} worker did not exit in {timeout}s, terminating")
+                worker.terminate()
+                worker.join(timeout=5)
+
+    def run(self) -> None:
         logger.info("=" * 60)
         logger.info("ZFS Backup Daemon Starting")
         logger.info("=" * 60)
 
-        self.manager.dataset_report()
-        self.manager.verify_datasets()
-        
+        manager = DatasetManager(self.config)
+        manager.dataset_report()
+        manager.verify_datasets()
+
         logger.info("=" * 60)
-        logger.info("Starting main loop...")
+        logger.info("Starting workers...")
         logger.info("=" * 60)
 
-        self._run_cycle()
-        
-        last_check = time.time()
-        sleep_seconds = self.config.check_interval.total_seconds()
-        
-        # Main loop
-        while self.running:
-            try:
-                if self.running and (time.time() - last_check) >= sleep_seconds:
-                    last_check = time.time()
-                    self._run_cycle()
-                time.sleep(0.25)
-            except Exception as e:
-                logger.error(f"Error in main loop: {e}", exc_info=True)
-                time.sleep(60)  # Sleep for a minute before retrying
+        self._start_workers()
+
+        while not self._stop_event.is_set():
+            time.sleep(SUPERVISOR_POLL)
+            if not self._stop_event.is_set():
+                self._check_workers()
+
+        logger.info("Shutting down workers...")
+        self._shutdown_workers()
         logger.info("Daemon stopped")
 
 
@@ -131,37 +127,33 @@ def main():
         action='store_true',
         help='Test configuration and exit'
     )
-    
+
     args = parser.parse_args()
-    
-    # Set logging level
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
         logger.setLevel(logging.DEBUG)
-    
-    # Load configuration
+
     try:
         logger.info(f"Loading configuration from: {args.config}")
         config = BackupConfig.from_file(args.config)
-        
-        # Override dry-run from command line
+
         if args.dry_run:
             config.dry_run = True
-        
+
         if args.test_config:
             logger.info("Configuration is valid!")
             logger.info(f"Datasets: {len(config.datasets)}")
             for ds in config.datasets:
                 logger.info(f"  - {ds.name} (enabled={ds.enabled})")
             return 0
-        
+
     except Exception as e:
         logger.error(f"Failed to load configuration: {e}")
         return 1
-    
-    # Start daemon
+
     try:
-        daemon = BackupDaemon(config)
+        daemon = BackupDaemon(config, args.config, verbose=args.verbose)
         daemon.run()
         return 0
     except Exception as e:

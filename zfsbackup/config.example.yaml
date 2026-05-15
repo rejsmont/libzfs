@@ -5,7 +5,10 @@
 
 # Global settings
 snapshot_prefix: "autosnap"  # Prefix for all managed snapshots
-check_interval: "5m"          # How often to check if snapshots are needed
+check_interval: "5m"          # How often the snapshot worker checks for due snapshots
+prune_interval: "1h"          # How often the pruning worker applies retention policy
+api_host: "127.0.0.1"         # Address the API worker binds to
+api_port: 8080                # Port the API worker listens on
 dry_run: false                # Set to true to test without creating/destroying snapshots
 
 # Datasets to backup
