@@ -33,7 +33,7 @@ if ! zpool list "$POOL_NAME" &> /dev/null; then
 fi
 
 echo "Current pool status:"
-sudo zpool status "$POOL_NAME"
+zpool status "$POOL_NAME"
 echo ""
 
 read -p "Destroy pool '$POOL_NAME' and remove disk image? (yes/no): " -r
@@ -43,7 +43,7 @@ if [[ $REPLY != "yes" ]]; then
 fi
 
 echo ""
-echo "Destroying pool..."
+echo "Destroying pool (requires sudo)..."
 sudo zpool destroy "$POOL_NAME"
 
 if [ -f "$DISK_IMAGE" ]; then

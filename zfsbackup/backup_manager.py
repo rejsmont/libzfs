@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import libzfseasy as zfs
 from libzfseasy.types import Dataset, Snapshot as ZFSSnapshot
-from zfsbackup.config import BackupConfig, DatasetConfig, RetentionRule
+from zfsbackup.config import BackupConfig, DatasetConfig
 
 
 logger = logging.getLogger(__name__)
@@ -51,28 +51,13 @@ class DatasetInfo:
         if self.config.frequency <= timedelta(0):
             raise ValueError("Snapshot frequency must be positive")
 
+        interval = self.config.frequency.total_seconds()
         if now is None:
             now = datetime.now(timezone.utc)
-        elif now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
-
-        if self.config.frequency < timedelta(minutes=1):
-            return now.replace(microsecond=0)
-
-        if self.config.frequency < timedelta(hours=1):
-            return now.replace(second=0, microsecond=0)
-
-        if self.config.frequency < timedelta(days=1):
-            return now.replace(minute=0, second=0, microsecond=0)            
-
-        if self.config.frequency > timedelta(years=1):
-            return now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        
-        if self.config.frequency > timedelta(months=1):
-            return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            
-        return now.replace(hour=0, minute=0, second=0, microsecond=0)
-
+        timestamp = int(now.timestamp())
+        aligned_timestamp = (timestamp // int(interval)) * int(interval)
+        return datetime.fromtimestamp(aligned_timestamp, tz=timezone.utc)
+    
     def __repr__(self):
         return f"DatasetInfo({self.name})"
 
@@ -127,7 +112,7 @@ class DatasetManager:
     def needs_snapshot(self, dsi: DatasetInfo) -> bool:
         
         snapshots = self.list_snapshots(dsi, recursive=False)
-        
+    
         if not snapshots:
             logger.debug(f"No snapshots found for {dsi.name}")
             logger.debug(f"Dataset {dsi.name} needs snapshot: True (no existing snapshots)")
@@ -142,6 +127,49 @@ class DatasetManager:
         logger.debug(f"Dataset {dsi.name} needs snapshot: {needs} (age={age}, frequency={dsi.frequency})")
 
         return needs
+
+    def needs_prunning(self, dsi: DatasetInfo) -> List['SnapshotInfo']:
+
+        snapshots = dsi.snapshots
+        if not snapshots or not dsi.config.retention_rules:
+            return []
+
+        plan = {
+            rule.keep_for.total_seconds(): rule.age.total_seconds()
+            for rule in dsi.config.retention_rules
+        }
+        sorted_expiries = sorted(plan.keys())
+
+        now = datetime.now(timezone.utc)
+        claimed: dict = {}
+        keep: set = {id(snapshots[0])}
+
+        for sni in reversed(snapshots):
+            if sni.timestamp is None:
+                continue
+
+            age_secs = (now - sni.timestamp).total_seconds()
+
+            applicable_expiry = None
+            for key in sorted_expiries:
+                if key >= age_secs:
+                    applicable_expiry = key
+                    break
+
+            if applicable_expiry is None:
+                continue
+
+            interval_secs = plan[applicable_expiry]
+            slot_key = (applicable_expiry, int(sni.timestamp.timestamp() / interval_secs))
+
+            if slot_key not in claimed:
+                claimed[slot_key] = True
+                keep.add(id(sni))
+
+        to_prune = [sni for sni in snapshots if id(sni) not in keep]
+        for sni in to_prune:
+            logger.debug(f"Snapshot {sni.full_name} marked for pruning")
+        return to_prune
 
     def list_snapshots(self, dsi: DatasetInfo, recursive: bool = False) -> List[SnapshotInfo]:
         """List all snapshots for a dataset."""
@@ -168,20 +196,20 @@ class DatasetManager:
             logger.error(f"Failed to list snapshots for {dsi.name}: {e}")
             return []
 
-    def _generate_snapshot_name(self, timestamp: Optional[datetime] = None) -> str:
+    def _generate_snapshot_name(self, dsi: DatasetInfo,timestamp: Optional[datetime] = None) -> str:
         """Generate snapshot name with timestamp."""
         if timestamp is None:
             timestamp = datetime.now(timezone.utc)
+        timestamp = dsi.get_reference_time(timestamp)
         
         date_str = timestamp.strftime("%Y%m%d")
         time_str = timestamp.strftime("%H%M%S")
         return f"{self.prefix}_{date_str}{time_str}"
-
     
     def create_snapshot(self, dsi: DatasetInfo) -> Optional[SnapshotInfo]:
         """Create a new snapshot for the dataset."""
         
-        snap_name = self._generate_snapshot_name()
+        snap_name = self._generate_snapshot_name(dsi)
         full_name = f"{dsi.name}@{snap_name}"
         
         try:
@@ -206,6 +234,33 @@ class DatasetManager:
         except Exception as e:
             logger.error(f"Failed to create snapshot {full_name}: {e}")
             return None
+
+    def prune_snapshots(self, dsi: DatasetInfo):
+        """Prune snapshots based on retention policy and return list of pruned snapshots."""
+        snapshots = self.list_snapshots(dsi, recursive=False)
+        
+        if not snapshots:
+            logger.debug(f"No snapshots to prune for {dsi.name}")
+            return []
+        
+        to_prune = self.needs_prunning(dsi)
+        
+        logger.info(f"Dataset {dsi.name} has {len(to_prune)} snapshots to prune")
+
+        batch_size = 20
+        for i in range(0, len(to_prune), batch_size):
+            batch = to_prune[i:i + batch_size]
+            names = ', '.join(s.full_name for s in batch)
+            logger.info(f"Pruning snapshots (batch {i // batch_size + 1}): {names}")
+            if self.config.dry_run:
+                logger.info(f"[DRY RUN] Would prune snapshots: {names}")
+                continue
+            try:
+                zfs.destroy([s.snapshot for s in batch], destroy=True, recursive=dsi.recursive)
+                logger.info(f"Successfully pruned {len(batch)} snapshots")
+            except Exception as e:
+                logger.error(f"Failed to prune snapshot batch: {e}")
+
 
 class SnapshotInfo:
     """Information about a snapshot with parsed metadata."""
@@ -248,72 +303,3 @@ class SnapshotInfo:
     def __repr__(self):
         return f"SnapshotInfo({self.full_name}, age={self.age()})"
 
-
-class SnapshotManager:
-    """Manages ZFS snapshots for datasets."""
-    
-    def __init__(self, snapshot_prefix: str = "autosnap", dry_run: bool = False):
-        self.prefix = snapshot_prefix
-        self.dry_run = dry_run
-        self.zfs_list = zfs.list
-        self.zfs_snapshot = zfs.snapshot
-        self.zfs_destroy = zfs.destroy
-    
-    def destroy_snapshot(self, snapshot_info: SnapshotInfo) -> bool:
-        """Destroy a snapshot."""
-        try:
-            logger.info(f"Destroying snapshot: {snapshot_info.full_name}")
-            
-            if self.dry_run:
-                logger.info(f"[DRY RUN] Would destroy snapshot: {snapshot_info.full_name}")
-                return True
-            
-            self.zfs_destroy(snapshot_info.snapshot, destroy=True)
-            logger.info(f"Successfully destroyed snapshot: {snapshot_info.full_name}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to destroy snapshot {snapshot_info.full_name}: {e}")
-            return False
-    
-    def apply_retention_policy(self, dataset_config: DatasetConfig) -> List[SnapshotInfo]:
-        """
-        Apply retention policy to snapshots and return list of snapshots to delete.
-        
-        The retention policy works as follows:
-        - For each snapshot, find the applicable retention rule based on its age
-        - If snapshot age + keep_for time < now, it should be deleted
-        """
-        snapshots = self.list_snapshots(dataset_config.name, recursive=dataset_config.recursive)
-        
-        if not snapshots:
-            return []
-        
-        now = datetime.now(timezone.utc)
-        to_delete = []
-        
-        for snapshot in snapshots:
-            age = snapshot.age()
-            
-            # Find applicable retention rule (largest age that's <= snapshot age)
-            applicable_rule = None
-            for rule in sorted(dataset_config.retention_rules, key=lambda r: r.age, reverse=True):
-                if age >= rule.age:
-                    applicable_rule = rule
-                    break
-            
-            # If no rule applies, use the first rule (youngest age threshold)
-            if applicable_rule is None and dataset_config.retention_rules:
-                applicable_rule = dataset_config.retention_rules[0]
-            
-            if applicable_rule:
-                # Check if snapshot has expired
-                expires_at = snapshot.timestamp + applicable_rule.age + applicable_rule.keep_for
-                if now >= expires_at:
-                    logger.info(
-                        f"Snapshot {snapshot.full_name} has expired "
-                        f"(age={age}, rule={applicable_rule}, expires_at={expires_at})"
-                    )
-                    to_delete.append(snapshot)
-        
-        return to_delete

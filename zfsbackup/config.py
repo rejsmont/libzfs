@@ -43,9 +43,9 @@ def parse_time_duration(duration_str: str) -> timedelta:
 
 @dataclass
 class RetentionRule:
-    """Retention rule for snapshots of a specific age."""
-    age: timedelta  # How old snapshots must be to apply this rule
-    keep_for: timedelta  # How long to keep snapshots of this age
+    """Retention rule defining one tier of a tiered retention policy."""
+    age: timedelta      # Thinning interval: keep one snapshot per this window
+    keep_for: timedelta  # Retention period: how long this tier applies
     
     def __repr__(self):
         return f"RetentionRule(age={self.age}, keep_for={self.keep_for})"

@@ -16,15 +16,15 @@ datasets:
     frequency: "1h"
     recursive: false
     retention:
-      "1d": "1M"              # Snapshots 1 day old: keep for 1 month
-      "1w": "3M"              # Snapshots 1 week old: keep for 3 months
-      "1M": "1y"              # Snapshots 1 month old: keep for 1 year
+      "1d": "1M"
+      "1w": "3M"
+      "1M": "1y"
 
   # Home directories — recursive to capture per-user datasets
   - name: "libzfs_test/USERDATA/home"
     enabled: true
-    frequency: "15m"          # Snapshot every 15 minutes
-    recursive: true           # Captures alice, bob, bob/projects
+    frequency: "15m"
+    recursive: true
     retention:
       "1h": "1d"
       "1d": "1w"
@@ -35,7 +35,7 @@ datasets:
   - name: "libzfs_test/SRVDATA/postgres"
     enabled: true
     frequency: "5m"
-    recursive: true           # Captures both data and wal
+    recursive: true
     retention:
       "15m": "1d"
       "1d": "1w"
@@ -46,7 +46,7 @@ datasets:
   - name: "libzfs_test/USERDATA/media"
     enabled: true
     frequency: "1d"
-    recursive: true           # Captures photos and videos
+    recursive: true
     retention:
       "1w": "3M"
       "1M": "10y"
@@ -67,8 +67,8 @@ datasets:
 # y = years   (e.g., "1y", "10y") - approximate as 365 days
 #
 # Retention policy logic:
-# - Snapshots are matched against retention rules based on their age
-# - Each rule specifies: "snapshot age": "how long to keep"
-# - Example: "1d": "1M" means "snapshots that are 1 day old should be kept for 1 month"
-# - A snapshot expires when: (snapshot age) + (keep duration) > now
+# - Each rule is "interval": "retention" — keep one snapshot per interval for retention duration
+# - Example: "1h": "1d" means keep hourly snapshots for 1 day
+# - Example: "1d": "1w" means keep daily snapshots for 1 week (after the hourly tier expires)
+# - Snapshots older than the longest retention period are deleted
 # - Use multiple rules to create a tiered retention strategy

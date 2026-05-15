@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
-from zfsbackup.config import BackupConfig, DatasetConfig
-from zfsbackup.backup_manager import DatasetInfo, DatasetManager, SnapshotManager
+from zfsbackup.config import BackupConfig
+from zfsbackup.backup_manager import DatasetInfo, DatasetManager
 
 
 logging.basicConfig(
@@ -50,40 +50,8 @@ class BackupDaemon:
             logger.info(
                 f"Dataset {dataset.name} needs snapshot "
             )
-
-            snap = self.manager.create_snapshot(dataset)
-        
-        # # Check if we need to create a new snapshot
-        # needs_snap, last_snap_time = self.manager.needs_snapshot(dataset_config)
-        
-        # if needs_snap:
-        #     logger.info(
-        #         f"Dataset {dataset_config.name} needs snapshot "
-        #         f"(frequency={dataset_config.frequency}, last={last_snap_time})"
-        #     )
-        #     snapshot = self.manager.create_snapshot(
-        #         dataset_config.name,
-        #         recursive=dataset_config.recursive
-        #     )
-        #     if snapshot:
-        #         self.last_snapshot_times[dataset_config.name] = snapshot.timestamp
-        # else:
-        #     logger.debug(
-        #         f"Dataset {dataset_config.name} does not need snapshot yet "
-        #         f"(last snapshot: {last_snap_time})"
-        #     )
-        
-        # # Apply retention policy
-        # expired_snapshots = self.manager.apply_retention_policy(dataset_config)
-        
-        # if expired_snapshots:
-        #     logger.info(
-        #         f"Found {len(expired_snapshots)} expired snapshots for {dataset_config.name}"
-        #     )
-        #     for snapshot in expired_snapshots:
-        #         self.manager.destroy_snapshot(snapshot)
-        # else:
-        #     logger.debug(f"No expired snapshots for {dataset_config.name}")
+            self.manager.create_snapshot(dataset)
+        self.manager.prune_snapshots(dataset)
     
     def _run_cycle(self):
         """Run one complete cycle: process all enabled datasets."""

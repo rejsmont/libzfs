@@ -1,18 +1,25 @@
 #!/bin/bash
-# Setup script for creating a ZFS test pool for real integration tests
+# Setup script for creating a ZFS test pool for real integration tests.
+# Requires sudo only for zpool create and zfs allow; all ZFS dataset
+# operations run as the current unprivileged user after delegation.
 
 set -e
 
 POOL_NAME="${TEST_ZFS_POOL:-testpool}"
 DISK_IMAGE="${ZFS_TEST_DISK:-/tmp/zfs-test-disk}"
 DISK_SIZE="${ZFS_TEST_SIZE:-512}"  # Size in MB
+CURRENT_USER="$(id -un)"
+
+# Permissions delegated to the current user on the pool
+ZFS_PERMISSIONS="create,destroy,snapshot,clone,rename,mount,bookmark,compression,mountpoint,quota,reservation,volsize,volblocksize"
 
 echo "=========================================="
 echo "ZFS Test Pool Setup"
 echo "=========================================="
-echo "Pool name: $POOL_NAME"
-echo "Disk image: $DISK_IMAGE"
-echo "Disk size: ${DISK_SIZE}MB"
+echo "Pool name:   $POOL_NAME"
+echo "Disk image:  $DISK_IMAGE"
+echo "Disk size:   ${DISK_SIZE}MB"
+echo "Grant user:  $CURRENT_USER"
 echo "=========================================="
 echo ""
 
@@ -42,7 +49,7 @@ if zpool list "$POOL_NAME" &> /dev/null; then
     read -p "Do you want to destroy it and recreate? (yes/no): " -r
     if [[ $REPLY == "yes" ]]; then
         echo "Destroying existing pool..."
-        zpool destroy "$POOL_NAME" || {
+        sudo zpool destroy "$POOL_NAME" || {
             echo "ERROR: Failed to destroy pool. It may be in use."
             exit 1
         }
@@ -66,12 +73,16 @@ if [ -f "$DISK_IMAGE" ]; then
     rm "$DISK_IMAGE"
 fi
 
-echo "Creating disk image..."
-dd if=/dev/zero of="$DISK_IMAGE" bs=1M count=$DISK_SIZE status=progress
+echo "Creating disk image (sparse)..."
+truncate -s "${DISK_SIZE}m" "$DISK_IMAGE"
 
 echo ""
-echo "Creating ZFS pool..."
-zpool create "$POOL_NAME" "$DISK_IMAGE"
+echo "Creating ZFS pool (requires sudo)..."
+sudo zpool create "$POOL_NAME" "$DISK_IMAGE"
+
+echo ""
+echo "Granting ZFS permissions to $CURRENT_USER..."
+sudo zfs allow -u "$CURRENT_USER" "$ZFS_PERMISSIONS" "$POOL_NAME"
 
 echo ""
 echo "=========================================="
@@ -79,12 +90,14 @@ echo "Test pool created successfully!"
 echo "=========================================="
 echo ""
 echo "Pool status:"
-sudo zpool status "$POOL_NAME"
+zpool status "$POOL_NAME"
+echo ""
+echo "Delegated permissions for $CURRENT_USER:"
+zfs allow "$POOL_NAME"
 echo ""
 echo "To run real ZFS tests:"
 echo "  pytest -m real_zfs"
 echo ""
 echo "To clean up when done:"
-echo "  sudo zpool destroy $POOL_NAME"
-echo "  rm $DISK_IMAGE"
+echo "  ./cleanup_test_pool.sh"
 echo ""
