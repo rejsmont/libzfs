@@ -1,4 +1,4 @@
-"""Worker processes for snapshot creation and pruning."""
+"""Worker processes for snapshot creation, pruning, API serving, and remote backup."""
 
 import logging
 import sys
@@ -7,9 +7,10 @@ from abc import abstractmethod
 from pathlib import Path
 from multiprocessing import Process
 from multiprocessing.synchronize import Event
+from typing import List
 
-from zfsbackup.config import BackupConfig
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
+from zfsbackup.config import BackupConfig
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -21,7 +22,7 @@ def _setup_logging(verbose: bool = False) -> None:
 
 
 class BaseWorker(Process):
-    """Base class for daemon worker processes with a shared run loop."""
+    """Base class for daemon worker processes with a shared polling loop."""
 
     def __init__(
         self,
@@ -45,6 +46,13 @@ class BaseWorker(Process):
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
         """Process a single dataset."""
 
+    def _get_datasets(self, manager: DatasetManager) -> List[DatasetInfo]:
+        """Return the list of datasets to iterate each cycle. Override to extend."""
+        return manager.datasets
+
+    def _before_loop(self, config: BackupConfig, manager: DatasetManager) -> None:
+        """Called once after setup but before the main loop. Override for per-run init."""
+
     def run(self) -> None:
         _setup_logging(self.verbose)
         logger = logging.getLogger(__name__)
@@ -60,10 +68,11 @@ class BaseWorker(Process):
 
         manager = DatasetManager(config)
         interval = self._get_interval(config)
+        self._before_loop(config, manager)
 
         while not self.stop_event.is_set():
             logger.debug(f"{self.name} cycle")
-            for dsi in manager.datasets:
+            for dsi in self._get_datasets(manager):
                 if self.stop_event.is_set():
                     break
                 try:
@@ -112,8 +121,54 @@ class PruningWorker(BaseWorker):
     def _get_interval(self, config: BackupConfig) -> float:
         return config.prune_interval.total_seconds()
 
+    def _get_datasets(self, manager: DatasetManager) -> List[DatasetInfo]:
+        return manager.datasets + manager.received_datasets()
+
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
         manager.prune_snapshots(dsi)
+
+
+class RemoteBackupWorker(BaseWorker):
+    """Worker that periodically sends snapshots to configured remote destinations."""
+
+    def __init__(
+        self,
+        config_path: Path,
+        stop_event: Event,
+        dry_run: bool = False,
+        verbose: bool = False,
+    ):
+        super().__init__('remote-backup-worker', config_path, stop_event, dry_run, verbose)
+        self._remote_manager = None
+
+    def _get_interval(self, config: BackupConfig) -> float:
+        freqs = [
+            (r.frequency or ds.frequency).total_seconds()
+            for ds in config.enabled_datasets
+            for r in ds.remote
+        ]
+        return min(freqs) if freqs else config.check_interval.total_seconds()
+
+    def _before_loop(self, config: BackupConfig, manager: DatasetManager) -> None:
+        from zfsbackup.remote import RemoteBackupManager
+        self._remote_manager = RemoteBackupManager(config, manager)
+
+    def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
+        if not dsi.config.remote:
+            return
+        logger = logging.getLogger(__name__)
+        for remote_cfg in dsi.config.remote:
+            freq = (remote_cfg.frequency or dsi.config.frequency).total_seconds()
+            anchor_name = manager.get_anchor(dsi, remote_cfg.destination)
+            if anchor_name:
+                snapshots = manager.list_snapshots(dsi)
+                anchor = next((s for s in snapshots if s.name == anchor_name), None)
+                if anchor and anchor.age.total_seconds() < freq:
+                    logger.debug(
+                        f"Backup of {dsi.name} to {remote_cfg.destination} not due yet"
+                    )
+                    continue
+            self._remote_manager.backup_dataset(dsi, remote_cfg)
 
 
 class ApiWorker(Process):

@@ -1,14 +1,25 @@
 """Flask API for inspecting daemon configuration and dataset snapshots."""
 
-from flask import Flask, jsonify
+import json
 
+from flask import Flask, jsonify, request
+from flask_sock import Sock
+from simple_websocket import ConnectionClosed
+
+import libzfseasy as zfs
+from libzfseasy.types import Dataset, Filesystem
+
+from zfsbackup.backup_manager import (
+    DatasetManager,
+    PROP_CONFIG, PROP_CLIENT_ID, PROP_SOURCE_DATASET,
+)
 from zfsbackup.config import BackupConfig
-from zfsbackup.backup_manager import DatasetManager
 
 
 def create_app(config: BackupConfig) -> Flask:
     app = Flask(__name__)
     app.config['PROPAGATE_EXCEPTIONS'] = True
+    sock = Sock(app)
     manager = DatasetManager(config)
 
     @app.route('/health')
@@ -49,7 +60,6 @@ def create_app(config: BackupConfig) -> Flask:
         dsi = next((d for d in manager.datasets if d.name == name), None)
         if dsi is None:
             return jsonify({'error': f'Dataset {name!r} not configured'}), 404
-
         snapshots = manager.list_snapshots(dsi)
         return jsonify([
             {
@@ -61,4 +71,160 @@ def create_app(config: BackupConfig) -> Flask:
             for s in snapshots
         ])
 
+    # Always register remote-backup routes so callers get a consistent API
+    # surface; handlers will return a 503 when remote backup is disabled.
+    _register_backup_routes(app, sock, config)
+
     return app
+
+
+def _register_backup_routes(app: Flask, sock: Sock, config: BackupConfig) -> None:
+    """Register backup receive endpoints. Only called when remote_backup is enabled."""
+
+    remote_backup = getattr(config, 'remote_backup', None)
+    enabled = bool(remote_backup and getattr(remote_backup, 'enabled', False))
+    target = getattr(remote_backup, 'target_dataset', None)
+
+    def _require_enabled():
+        if enabled and target:
+            return None
+        return jsonify({'error': 'remote_backup disabled'}), 503
+
+    def _server_dataset(client_id: str, client_dataset: str) -> str:
+        """Derive the server-side dataset path from the client's dataset name."""
+        parts = client_dataset.split('/', 1)
+        relative = parts[1] if len(parts) > 1 else ''
+        return f"{target}/{client_id}/{relative}" if relative else f"{target}/{client_id}"
+
+    @app.route('/backup/register', methods=['POST'])
+    def backup_register():
+        disabled = _require_enabled()
+        if disabled is not None:
+            return disabled
+        data = request.get_json(force=True)
+        client_id = data.get('client_id')
+        if not client_id:
+            return jsonify({'error': 'client_id required'}), 400
+
+        client_root = f"{target}/{client_id}"
+        if not zfs.exists(Dataset(client_root)):
+            if config.dry_run:
+                return jsonify({'target_dataset': client_root, 'dry_run': True})
+            zfs.create(Filesystem(client_root), parents=True)
+
+        return jsonify({'target_dataset': client_root})
+
+    @app.route('/backup/<client_id>/<path:dataset>/negotiate', methods=['POST'])
+    def backup_negotiate(client_id: str, dataset: str):
+        disabled = _require_enabled()
+        if disabled is not None:
+            return disabled
+        data = request.get_json(force=True)
+        client_snapshots: list = data.get('snapshots', [])
+        ds_config_encoded: str = data.get('config', '')
+
+        server_dataset = _server_dataset(client_id, dataset)
+        server_fs = Filesystem(server_dataset)
+
+        # Store client config on server dataset (create dataset if needed)
+        if ds_config_encoded:
+            if not zfs.exists(server_fs):
+                if not config.dry_run:
+                    zfs.create(server_fs, parents=True)
+            if not config.dry_run:
+                zfs.set(server_fs, {
+                    PROP_CONFIG: ds_config_encoded,
+                    PROP_CLIENT_ID: client_id,
+                    PROP_SOURCE_DATASET: dataset,
+                })
+
+        # Find the most recent snapshot present on both sides
+        common_snapshot = None
+        if zfs.exists(server_fs):
+            try:
+                server_snaps = zfs.list(roots=server_fs, types='snapshot', properties=['creation'])
+                server_names = {s.short for s in server_snaps}
+                for snap_name in client_snapshots:
+                    if snap_name in server_names:
+                        common_snapshot = snap_name
+                        break
+            except Exception as e:
+                return jsonify({'error': f'Failed to list server snapshots: {e}'}), 500
+
+        return jsonify({
+            'common_snapshot': common_snapshot,
+            'server_dataset': server_dataset,
+        })
+
+    @sock.route('/backup/<client_id>/<path:dataset>/stream')
+    def backup_stream(ws, client_id: str, dataset: str):
+        if not (enabled and target):
+            try:
+                ws.send(json.dumps({'error': 'remote_backup disabled'}))
+            except Exception:
+                pass
+            return
+        server_dataset = _server_dataset(client_id, dataset)
+        server_fs = Filesystem(server_dataset)
+
+        if not zfs.exists(server_fs):
+            if config.dry_run:
+                ws.send(json.dumps({'status': 'ok', 'dry_run': True}))
+                return
+            zfs.create(server_fs, parents=True)
+
+        if config.dry_run:
+            ws.send(json.dumps({'status': 'ok', 'dry_run': True}))
+            return
+
+        writer = zfs.receive.filesystem(server_fs, force=True, save=True, mount=False)
+        if writer is None:
+            ws.send(json.dumps({'error': 'Failed to start zfs receive'}))
+            return
+
+        try:
+            while True:
+                data = ws.receive()
+                if isinstance(data, str):
+                    msg = json.loads(data)
+                    if msg.get('done'):
+                        break
+                else:
+                    writer.write(data)
+            writer.close()
+            ws.send(json.dumps({'status': 'ok'}))
+        except ConnectionClosed:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                writer.close()
+            except Exception:
+                pass
+            try:
+                ws.send(json.dumps({'error': str(e)}))
+            except Exception:
+                pass
+
+    @app.route('/backup/<client_id>/<path:dataset>/resume_token')
+    def backup_resume_token(client_id: str, dataset: str):
+        disabled = _require_enabled()
+        if disabled is not None:
+            return disabled
+        server_dataset = _server_dataset(client_id, dataset)
+        server_fs = Filesystem(server_dataset)
+        if not zfs.exists(server_fs):
+            return jsonify({'resume_token': None})
+        try:
+            results = zfs.list(roots=server_fs, properties=['receive_resume_token'])
+            token = None
+            if results:
+                prop = results[0]['receive_resume_token']
+                if prop is not None:
+                    val = str(prop)
+                    token = val if val != 'none' else None
+            return jsonify({'resume_token': token})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500

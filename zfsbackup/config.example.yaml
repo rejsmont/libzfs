@@ -2,14 +2,32 @@
 #
 # This file targets the test pool created by create_test_pool.sh.
 # Run the script first:  sudo ./create_test_pool.sh
+#
+# A single daemon can act as both a backup client (destinations + dataset remote: lists)
+# and a backup server (remote_backup section) simultaneously.
 
 # Global settings
-snapshot_prefix: "autosnap"  # Prefix for all managed snapshots
+snapshot_prefix: "autosnap"   # Prefix for all managed snapshots
 check_interval: "5m"          # How often the snapshot worker checks for due snapshots
 prune_interval: "1h"          # How often the pruning worker applies retention policy
 api_host: "127.0.0.1"         # Address the API worker binds to
 api_port: 8080                # Port the API worker listens on
 dry_run: false                # Set to true to test without creating/destroying snapshots
+
+# Client identity file (auto-generated as <hostname>-<uuid8> on first run)
+# client_id_file: "/var/lib/zfsbackup/client_id"
+
+# Remote backup destinations (client side)
+# destinations:
+#   offsite:
+#     url: "http://backup-server.example.com:8080"
+#   datacenter2:
+#     url: "http://10.0.1.5:8080"
+
+# Remote backup receiver (server side)
+# remote_backup:
+#   enabled: true
+#   target_dataset: "libzfs_test/backups"   # must already exist
 
 # Datasets to backup
 datasets:
@@ -22,6 +40,11 @@ datasets:
       "1d": "1M"
       "1w": "3M"
       "1M": "1y"
+    # Send to remote destinations (uncomment when destinations are configured):
+    # remote:
+    #   - destination: offsite
+    #   - destination: datacenter2
+    #     frequency: "4h"   # override push frequency for this destination
 
   # Home directories — recursive to capture per-user datasets
   - name: "libzfs_test/USERDATA/home"
@@ -63,11 +86,12 @@ datasets:
       "1d": "1w"
 
 # Time format reference:
-# h = hours   (e.g., "1h", "12h")
-# d = days    (e.g., "1d", "7d")
-# w = weeks   (e.g., "1w", "2w")
-# M = months  (e.g., "1M", "6M") - approximate as 30 days
-# y = years   (e.g., "1y", "10y") - approximate as 365 days
+# m  = minutes (e.g., "5m", "15m")
+# h  = hours   (e.g., "1h", "12h")
+# d  = days    (e.g., "1d", "7d")
+# w  = weeks   (e.g., "1w", "2w")
+# M  = months  (e.g., "1M", "6M") - approximate as 30 days
+# y  = years   (e.g., "1y", "10y") - approximate as 365 days
 #
 # Retention policy logic:
 # - Each rule is "interval": "retention" — keep one snapshot per interval for retention duration
@@ -75,3 +99,9 @@ datasets:
 # - Example: "1d": "1w" means keep daily snapshots for 1 week (after the hourly tier expires)
 # - Snapshots older than the longest retention period are deleted
 # - Use multiple rules to create a tiered retention strategy
+#
+# Remote backup:
+# - Anchor snapshots (last successfully transferred) are excluded from pruning
+# - Server receives streams into <target_dataset>/<client_id>/<dataset_relative_path>
+# - Client config is stored on the server dataset as org.zfsbackup:config (base64 JSON)
+# - Anchor state is stored on the client dataset as org.zfsbackup:anchor.<destination>

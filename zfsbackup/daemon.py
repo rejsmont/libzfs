@@ -12,7 +12,7 @@ from typing import Dict
 
 from zfsbackup.config import BackupConfig
 from zfsbackup.backup_manager import DatasetManager
-from zfsbackup.workers import SnapshotWorker, PruningWorker, ApiWorker
+from zfsbackup.workers import SnapshotWorker, PruningWorker, ApiWorker, RemoteBackupWorker
 
 
 logging.basicConfig(
@@ -23,12 +23,12 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-WORKER_RESTART_DELAY = 5   # seconds to wait before restarting a crashed worker
-SUPERVISOR_POLL = 5        # seconds between liveness checks
+WORKER_RESTART_DELAY = 5
+SUPERVISOR_POLL = 5
 
 
 class BackupDaemon:
-    """Supervisor process: starts and monitors the snapshot and pruning workers."""
+    """Supervisor process: starts and monitors the snapshot, pruning, API, and remote workers."""
 
     def __init__(self, config: BackupConfig, config_path: Path, verbose: bool = False):
         self.config = config
@@ -45,11 +45,22 @@ class BackupDaemon:
         self._stop_event.set()
 
     def _new_worker(self, name: str) -> multiprocessing.Process:
-        cls = {'snapshot': SnapshotWorker, 'pruning': PruningWorker, 'api': ApiWorker}[name]
+        cls = {
+            'snapshot': SnapshotWorker,
+            'pruning': PruningWorker,
+            'api': ApiWorker,
+            'remote': RemoteBackupWorker,
+        }[name]
         return cls(self.config_path, self._stop_event, self.config.dry_run, self.verbose)
 
+    def _active_worker_names(self) -> list:
+        names = ['snapshot', 'pruning', 'api']
+        if any(ds.remote for ds in self.config.enabled_datasets):
+            names.append('remote')
+        return names
+
     def _start_workers(self) -> None:
-        for name in ('snapshot', 'pruning', 'api'):
+        for name in self._active_worker_names():
             worker = self._new_worker(name)
             worker.start()
             logger.info(f"Started {name} worker (pid={worker.pid})")
@@ -84,6 +95,9 @@ class BackupDaemon:
         manager = DatasetManager(self.config)
         manager.dataset_report()
         manager.verify_datasets()
+
+        logger.info("Syncing dataset configs to ZFS properties...")
+        manager.sync_all_config_properties()
 
         logger.info("=" * 60)
         logger.info("Starting workers...")
@@ -146,6 +160,10 @@ def main():
             logger.info(f"Datasets: {len(config.datasets)}")
             for ds in config.datasets:
                 logger.info(f"  - {ds.name} (enabled={ds.enabled})")
+            if config.destinations:
+                logger.info(f"Destinations: {list(config.destinations)}")
+            if config.remote_backup:
+                logger.info(f"Remote backup target: {config.remote_backup.target_dataset}")
             return 0
 
     except Exception as e:
