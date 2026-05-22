@@ -1,5 +1,6 @@
 """Flask API for inspecting daemon configuration and dataset snapshots."""
 
+import contextlib
 import json
 
 from flask import Flask, jsonify, request
@@ -21,6 +22,21 @@ def create_app(config: BackupConfig) -> Flask:
     app.config['PROPAGATE_EXCEPTIONS'] = True
     sock = Sock(app)
     manager = DatasetManager(config)
+
+    remote_backup = config.remote_backup
+    enabled = bool(remote_backup and remote_backup.enabled)
+    target = remote_backup.target_dataset if remote_backup else None
+
+    def _require_enabled():
+        if enabled and target:
+            return None
+        return jsonify({'error': 'remote_backup disabled'}), 503
+
+    def _server_dataset(client_id: str, client_dataset: str) -> str:
+        """Derive the server-side dataset path from the client's dataset name."""
+        parts = client_dataset.split('/', 1)
+        relative = parts[1] if len(parts) > 1 else ''
+        return f"{target}/{client_id}/{relative}" if relative else f"{target}/{client_id}"
 
     @app.route('/health')
     def health():
@@ -71,31 +87,6 @@ def create_app(config: BackupConfig) -> Flask:
             for s in snapshots
         ])
 
-    # Always register remote-backup routes so callers get a consistent API
-    # surface; handlers will return a 503 when remote backup is disabled.
-    _register_backup_routes(app, sock, config)
-
-    return app
-
-
-def _register_backup_routes(app: Flask, sock: Sock, config: BackupConfig) -> None:
-    """Register backup receive endpoints. Only called when remote_backup is enabled."""
-
-    remote_backup = getattr(config, 'remote_backup', None)
-    enabled = bool(remote_backup and getattr(remote_backup, 'enabled', False))
-    target = getattr(remote_backup, 'target_dataset', None)
-
-    def _require_enabled():
-        if enabled and target:
-            return None
-        return jsonify({'error': 'remote_backup disabled'}), 503
-
-    def _server_dataset(client_id: str, client_dataset: str) -> str:
-        """Derive the server-side dataset path from the client's dataset name."""
-        parts = client_dataset.split('/', 1)
-        relative = parts[1] if len(parts) > 1 else ''
-        return f"{target}/{client_id}/{relative}" if relative else f"{target}/{client_id}"
-
     @app.route('/backup/register', methods=['POST'])
     def backup_register():
         disabled = _require_enabled()
@@ -125,12 +116,14 @@ def _register_backup_routes(app: Flask, sock: Sock, config: BackupConfig) -> Non
 
         server_dataset = _server_dataset(client_id, dataset)
         server_fs = Filesystem(server_dataset)
+        server_fs_exists = zfs.exists(server_fs)
 
         # Store client config on server dataset (create dataset if needed)
         if ds_config_encoded:
-            if not zfs.exists(server_fs):
+            if not server_fs_exists:
                 if not config.dry_run:
                     zfs.create(server_fs, parents=True)
+                    server_fs_exists = True
             if not config.dry_run:
                 zfs.set(server_fs, {
                     PROP_CONFIG: ds_config_encoded,
@@ -140,7 +133,7 @@ def _register_backup_routes(app: Flask, sock: Sock, config: BackupConfig) -> Non
 
         # Find the most recent snapshot present on both sides
         common_snapshot = None
-        if zfs.exists(server_fs):
+        if server_fs_exists:
             try:
                 server_snaps = zfs.list(roots=server_fs, types='snapshot', properties=['creation'])
                 server_names = {s.short for s in server_snaps}
@@ -168,10 +161,8 @@ def _register_backup_routes(app: Flask, sock: Sock, config: BackupConfig) -> Non
         server_fs = Filesystem(server_dataset)
 
         if not zfs.exists(server_fs):
-            if config.dry_run:
-                ws.send(json.dumps({'status': 'ok', 'dry_run': True}))
-                return
-            zfs.create(server_fs, parents=True)
+            if not config.dry_run:
+                zfs.create(server_fs, parents=True)
 
         if config.dry_run:
             ws.send(json.dumps({'status': 'ok', 'dry_run': True}))
@@ -194,19 +185,13 @@ def _register_backup_routes(app: Flask, sock: Sock, config: BackupConfig) -> Non
             writer.close()
             ws.send(json.dumps({'status': 'ok'}))
         except ConnectionClosed:
-            try:
+            with contextlib.suppress(Exception):
                 writer.close()
-            except Exception:
-                pass
         except Exception as e:
-            try:
+            with contextlib.suppress(Exception):
                 writer.close()
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 ws.send(json.dumps({'error': str(e)}))
-            except Exception:
-                pass
 
     @app.route('/backup/<client_id>/<path:dataset>/resume_token')
     def backup_resume_token(client_id: str, dataset: str):
@@ -228,3 +213,6 @@ def _register_backup_routes(app: Flask, sock: Sock, config: BackupConfig) -> Non
             return jsonify({'resume_token': token})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
+
+
+    return app

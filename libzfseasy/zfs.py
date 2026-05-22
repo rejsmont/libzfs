@@ -530,14 +530,14 @@ class AllowCommand(Command, StringListArgument):
                 cmd += ['-u', cls._slist_to_str(users)]
             if groups:
                 cmd += ['-g', cls._slist_to_str(groups)]
-        cmd += [cls._slist_to_str(permissions), ds]
+        cmd += [cls._slist_to_str(permissions), str(ds)]
         cls._exec(cmd)
 
     @classmethod
     def _create(cls, allow: bool, ds: Dataset, permissions: StringList, recursive: bool = False) -> None:
 
         cmd = cls._base(allow, '-c', recursive)
-        cmd += [cls._slist_to_str(permissions), ds]
+        cmd += [cls._slist_to_str(permissions), str(ds)]
         cls._exec(cmd)
 
     @classmethod
@@ -551,7 +551,7 @@ class AllowCommand(Command, StringListArgument):
             raise ValueError(name + ' is not a valid ZFS permission set name')
 
         cmd = cls._base(allow, '-s', recursive)
-        cmd += [name, cls._slist_to_str(permissions), ds]
+        cmd += [name, cls._slist_to_str(permissions), str(ds)]
         cls._exec(cmd)
 
     @staticmethod

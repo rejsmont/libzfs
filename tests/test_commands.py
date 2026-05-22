@@ -6,9 +6,11 @@ from unittest.mock import MagicMock, call
 from libzfseasy.zfs import (
     ListCommand, CreateCommand, SnapshotCommand, BookmarkCommand,
     DestroyCommand, RenameCommand, CloneCommand, GetCommand, SetCommand,
-    InheritCommand, SendCommand, ReceiveCommand, MountCommand, UnMountCommand
+    InheritCommand, SendCommand, ReceiveCommand, MountCommand, UnMountCommand,
+    AllowCommand, UnAllowCommand, LoadKeyCommand, UnLoadKeyCommand, ChangeKeyCommand,
+    PropertyCommand, StringListArgument, DatasetListArgument, ZFSListArgument,
 )
-from libzfseasy.types import Dataset, Filesystem, Volume, Snapshot, Bookmark
+from libzfseasy.types import Dataset, Filesystem, Volume, Snapshot, SnapshotRange, Bookmark
 
 
 class TestListCommand:
@@ -613,13 +615,34 @@ class TestUnMountCommand:
         assert '-f' in call_args
 
 
+class TestPropertyCommand:
+    """Tests for PropertyCommand._get_props."""
+
+    @pytest.mark.unit
+    def test_get_props_with_flag(self):
+        result = PropertyCommand._get_props({'compression': 'lz4'}, flag=True)
+        assert result == ['-o', 'compression=lz4']
+
+    @pytest.mark.unit
+    def test_get_props_without_flag(self):
+        result = PropertyCommand._get_props({'compression': 'lz4'}, flag=False)
+        assert result == ['compression=lz4']
+
+    @pytest.mark.unit
+    def test_get_props_empty(self):
+        assert PropertyCommand._get_props({}) == []
+
+
 class TestStringListArgument:
     """Tests for StringListArgument helper methods."""
     
     @pytest.mark.unit
+    def test_slist_to_list_none(self):
+        assert StringListArgument._slist_to_list(None) == []
+
+    @pytest.mark.unit
     def test_slist_to_list_from_string(self):
         """Test converting comma-separated string to list."""
-        from libzfseasy.zfs import StringListArgument
         result = StringListArgument._slist_to_list('a,b,c')
         assert result == ['a', 'b', 'c']
     
@@ -656,3 +679,322 @@ class TestDatasetListArgument:
         result = DatasetListArgument._dslist_to_str([sample_filesystem, sample_volume])
         assert 'testpool/filesystem' in result
         assert 'testpool/volume' in result
+
+    @pytest.mark.unit
+    def test_dslist_to_list_none(self):
+        assert DatasetListArgument._dslist_to_list(None) == []
+
+    @pytest.mark.unit
+    def test_dslist_to_list_invalid_type(self, sample_filesystem):
+        bm = Bookmark(sample_filesystem, 'bm1')
+        with pytest.raises(ValueError, match='Expected Filesystem'):
+            DatasetListArgument._dslist_to_list([bm])
+
+
+class TestZFSListArgument:
+    """Tests for ZFSListArgument helper methods."""
+
+    @pytest.mark.unit
+    def test_zlist_to_list_none(self):
+        assert ZFSListArgument._zlist_to_list(None) == []
+
+    @pytest.mark.unit
+    def test_zlist_to_list_invalid_type(self):
+        with pytest.raises(ValueError, match='Expected Filesystem'):
+            ZFSListArgument._zlist_to_list(['not_a_zfs_object'])
+
+
+class TestListCommandOptions:
+    """Tests for ListCommand sort/depth/type options."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_with_depth(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup(stdout=[f'{sample_filesystem.name}\tfilesystem\n'])
+        cmd = ListCommand()
+        cmd(roots=sample_filesystem, depth=2)
+        call_args = mock_subprocess.call_args[0][0]
+        assert '-d' in call_args
+        assert '2' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_with_type_filter(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['testpool/fs\tfilesystem\n'])
+        cmd = ListCommand()
+        cmd(types='filesystem')
+        call_args = mock_subprocess.call_args[0][0]
+        assert '-t' in call_args
+        assert 'filesystem' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_sort_string_asc(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['testpool/fs\tfilesystem\n'])
+        cmd = ListCommand()
+        cmd(sort='creation', asc=True)
+        call_args = mock_subprocess.call_args[0][0]
+        assert '-s' in call_args
+        assert 'creation' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_sort_string_desc(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['testpool/fs\tfilesystem\n'])
+        cmd = ListCommand()
+        cmd(sort='creation', asc=False)
+        call_args = mock_subprocess.call_args[0][0]
+        assert 'S' in call_args
+        assert 'creation' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_sort_iterable(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['testpool/fs\tfilesystem\n'])
+        cmd = ListCommand()
+        cmd(sort=['creation', 'compression'])
+        call_args = mock_subprocess.call_args[0][0]
+        assert call_args.count('-s') >= 2
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_sort_dict(self, mock_subprocess):
+        # dict is Iterable, so the iterable branch fires and keys are used as sort fields
+        mock_subprocess.setup(stdout=['testpool/fs\tfilesystem\n'])
+        cmd = ListCommand()
+        cmd(sort={'creation': True, 'compression': False})
+        call_args = mock_subprocess.call_args[0][0]
+        assert call_args.count('-s') >= 2
+
+
+class TestCreateCommandExtended:
+    """Additional CreateCommand coverage."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_create_auto_detect_filesystem(self, mock_subprocess, sample_pool):
+        mock_subprocess.setup()
+        cmd = CreateCommand()
+        result = cmd(f'{sample_pool}/newfs')
+        assert isinstance(result, Filesystem)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_create_volume_with_parents(self, mock_subprocess, sample_pool):
+        mock_subprocess.setup()
+        cmd = CreateCommand()
+        cmd.volume(f'{sample_pool}/newvol', '10G', parents=True)
+        call_args = mock_subprocess.call_args[0][0]
+        assert '-p' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_create_volume_with_properties(self, mock_subprocess, sample_pool):
+        mock_subprocess.setup()
+        cmd = CreateCommand()
+        cmd.volume(f'{sample_pool}/newvol', '10G', properties={'volsize': '10G'})
+        call_args = mock_subprocess.call_args[0][0]
+        assert '-o' in call_args
+
+
+class TestBookmarkCommandExtended:
+    """Additional BookmarkCommand coverage."""
+
+    @pytest.mark.unit
+    def test_bookmark_invalid_input(self, sample_filesystem):
+        cmd = BookmarkCommand()
+        with pytest.raises(ValueError, match='Expected Bookmark or Snapshot'):
+            cmd(sample_filesystem, 'bm1')
+
+
+class TestDestroyCommandExtended:
+    """Additional DestroyCommand coverage."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_dispatch_dataset(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup(stdout=['destroy\ttestpool/filesystem\n'])
+        cmd = DestroyCommand()
+        cmd(sample_filesystem, destroy=True)
+        call_args = mock_subprocess.call_args[0][0]
+        assert 'destroy' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_dispatch_snapshot(self, mock_subprocess, sample_snapshot):
+        mock_subprocess.setup(stdout=['destroy\ttestpool/filesystem@snap1\n'])
+        cmd = DestroyCommand()
+        cmd(sample_snapshot, destroy=True)
+        call_args = mock_subprocess.call_args[0][0]
+        assert 'destroy' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_dispatch_snapshot_range(self, mock_subprocess, sample_filesystem):
+        snap1 = Snapshot(sample_filesystem, 'snap1')
+        snap2 = Snapshot(sample_filesystem, 'snap2')
+        sr = SnapshotRange(first=snap1, last=snap2)
+        mock_subprocess.setup(stdout=['destroy\ttestpool/filesystem@snap1%snap2\n'])
+        cmd = DestroyCommand()
+        cmd(sr, destroy=True)
+        call_args = mock_subprocess.call_args[0][0]
+        assert 'destroy' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_dispatch_bookmark(self, mock_subprocess, sample_bookmark):
+        mock_subprocess.setup()
+        cmd = DestroyCommand()
+        cmd(sample_bookmark)
+        call_args = mock_subprocess.call_args[0][0]
+        assert 'destroy' in call_args
+
+    @pytest.mark.unit
+    def test_destroy_dispatch_invalid_type(self):
+        from libzfseasy.types import Property
+        cmd = DestroyCommand()
+        with pytest.raises(ValueError, match='Expected Filesystem'):
+            cmd(Property('x'), destroy=True)
+
+    @pytest.mark.unit
+    def test_destroy_base_clones_without_recursive_raises(self):
+        with pytest.raises(ValueError, match='Clones can only be set to True'):
+            DestroyCommand._base(destroy=True, recursive=False, clones=True)
+
+    @pytest.mark.unit
+    def test_destroy_dataset_invalid_type(self):
+        cmd = DestroyCommand()
+        with pytest.raises(ValueError, match='Expected Filesystem or Volume'):
+            cmd.dataset('not_a_dataset', destroy=True)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_dataset_force(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup(stdout=['destroy\ttestpool/filesystem\n'])
+        cmd = DestroyCommand()
+        cmd.dataset(sample_filesystem, destroy=True, force=True)
+        call_args = mock_subprocess.call_args[0][0]
+        assert '-f' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_dataset_lazy(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup(stdout=['destroy\ttestpool/filesystem\n'])
+        cmd = DestroyCommand()
+        result = cmd.dataset(sample_filesystem, destroy=True, lazy=True)
+        assert hasattr(result, '__next__')
+
+    @pytest.mark.unit
+    def test_destroy_snapshots_invalid_type(self, sample_filesystem):
+        from libzfseasy.types import Property
+        cmd = DestroyCommand()
+        with pytest.raises(ValueError, match='Expected Snapshot or SnapshotRange'):
+            cmd.snapshots([Property('x')], destroy=True)
+
+    @pytest.mark.unit
+    def test_destroy_snapshots_different_datasets(self, sample_pool):
+        fs1 = Filesystem(f'{sample_pool}/fs1')
+        fs2 = Filesystem(f'{sample_pool}/fs2')
+        snap1 = Snapshot(fs1, 'snap1')
+        snap2 = Snapshot(fs2, 'snap2')
+        cmd = DestroyCommand()
+        with pytest.raises(ValueError, match='Snapshots must come from the same dataset'):
+            cmd.snapshots([snap1, snap2], destroy=True)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_snapshots_force(self, mock_subprocess, sample_snapshot):
+        mock_subprocess.setup(stdout=['destroy\ttestpool/filesystem@snap1\n'])
+        cmd = DestroyCommand()
+        cmd.snapshots(sample_snapshot, destroy=True, force=True)
+        call_args = mock_subprocess.call_args[0][0]
+        assert '-d' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_snapshots_lazy(self, mock_subprocess, sample_snapshot):
+        mock_subprocess.setup(stdout=['destroy\ttestpool/filesystem@snap1\n'])
+        cmd = DestroyCommand()
+        result = cmd.snapshots(sample_snapshot, destroy=True, lazy=True)
+        assert hasattr(result, '__next__')
+
+    @pytest.mark.unit
+    def test_destroy_bookmark_no_destroy_returns_none(self, sample_bookmark):
+        cmd = DestroyCommand()
+        result = cmd.bookmark(sample_bookmark, destroy=False)
+        assert result is None
+
+    @pytest.mark.unit
+    def test_destroy_bookmark_invalid_type(self, sample_filesystem):
+        cmd = DestroyCommand()
+        with pytest.raises(ValueError, match='Expected Bookmark'):
+            cmd.bookmark(sample_filesystem, destroy=True)
+
+
+class TestRenameCommandExtended:
+    """Additional RenameCommand coverage."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_rename_dispatch_volume(self, mock_subprocess, sample_volume):
+        mock_subprocess.setup()
+        cmd = RenameCommand()
+        result = cmd(sample_volume, 'testpool/newvol')
+        assert isinstance(result, Volume)
+
+    @pytest.mark.unit
+    def test_rename_dispatch_invalid_type(self):
+        ds = Dataset('pool/ds')
+        cmd = RenameCommand()
+        with pytest.raises(ValueError, match='Expected Filesystem, Volume or Snapshot'):
+            cmd(ds, 'pool/new')
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_rename_filesystem_force(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup()
+        cmd = RenameCommand()
+        cmd.filesystem(sample_filesystem, 'testpool/new', force=True)
+        call_args = mock_subprocess.call_args[0][0]
+        assert '-f' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_rename_filesystem_parents(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup()
+        cmd = RenameCommand()
+        cmd.filesystem(sample_filesystem, 'testpool/parent/new', parents=True)
+        call_args = mock_subprocess.call_args[0][0]
+        assert '-p' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_rename_filesystem_no_mount(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup()
+        cmd = RenameCommand()
+        cmd.filesystem(sample_filesystem, 'testpool/new', mount=False)
+        call_args = mock_subprocess.call_args[0][0]
+        assert '-u' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_rename_volume(self, mock_subprocess, sample_volume):
+        mock_subprocess.setup()
+        cmd = RenameCommand()
+        result = cmd.volume(sample_volume, 'testpool/newvol')
+        assert isinstance(result, Volume)
+        assert result.name == 'testpool/newvol'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_rename_snapshot_full_name(self, mock_subprocess, sample_snapshot):
+        mock_subprocess.setup()
+        cmd = RenameCommand()
+        result = cmd.snapshot(sample_snapshot, 'testpool/filesystem@snap2')
+        assert result.short == 'snap2'
+
+    @pytest.mark.unit
+    def test_rename_snapshot_cross_dataset_raises(self, sample_snapshot):
+        cmd = RenameCommand()
+        with pytest.raises(ValueError, match='Snapshots can only be renamed within the parent dataset'):
+            cmd.snapshot(sample_snapshot, 'testpool/other@snap2')

@@ -325,6 +325,39 @@ class TestComplexWorkflow:
         assert recv_stream is not None
 
 
+class TestExistsFunction:
+    """Tests for libzfseasy.exists()."""
+
+    @pytest.mark.integration
+    @pytest.mark.subprocess
+    def test_exists_returns_true(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup(stdout=[f'{sample_filesystem.name}\tfilesystem\n'])
+        assert zfs.exists(sample_filesystem) is True
+
+    @pytest.mark.integration
+    @pytest.mark.subprocess
+    def test_exists_returns_false_when_not_found(self, mock_subprocess, sample_filesystem):
+        from unittest.mock import MagicMock
+        process_mock = MagicMock()
+        process_mock.stdout.readline.side_effect = ['', '']
+        process_mock.stderr.readline.side_effect = ['dataset does not exist\n', '']
+        process_mock.poll.side_effect = [None, 1]
+        mock_subprocess.return_value = process_mock
+        assert zfs.exists(sample_filesystem) is False
+
+    @pytest.mark.integration
+    @pytest.mark.subprocess
+    def test_exists_reraises_other_exceptions(self, mock_subprocess, sample_filesystem):
+        from unittest.mock import MagicMock
+        process_mock = MagicMock()
+        process_mock.stdout.readline.side_effect = ['', '']
+        process_mock.stderr.readline.side_effect = ['permission denied\n', '']
+        process_mock.poll.side_effect = [None, 1]
+        mock_subprocess.return_value = process_mock
+        with pytest.raises(Exception, match='Permission denied'):
+            zfs.exists(sample_filesystem)
+
+
 class TestErrorHandling:
     """Test error handling in workflows."""
     

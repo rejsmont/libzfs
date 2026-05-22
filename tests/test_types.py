@@ -109,6 +109,45 @@ class TestValidate:
         with pytest.raises(ValueError):
             Validate.attribute('invalid_property')
 
+    @pytest.mark.unit
+    def test_propfield_valid(self):
+        valid = ['name', 'property', 'value', 'received', 'source', 'all']
+        for f in valid:
+            Validate.propfield(f)
+
+    @pytest.mark.unit
+    def test_propfield_invalid(self):
+        with pytest.raises(ValueError):
+            Validate.propfield('bogus')
+
+    @pytest.mark.unit
+    def test_attribute_invalid_name_with_space(self):
+        with pytest.raises(ValueError, match='is not a valid ZFS property name'):
+            Validate.attribute('invalid name')
+
+    @pytest.mark.unit
+    def test_property_validator_valid(self):
+        Validate.property('compression')
+
+    @pytest.mark.unit
+    def test_property_validator_invalid(self):
+        with pytest.raises(ValueError):
+            Validate.property('invalid_property')
+
+    @pytest.mark.unit
+    def test_snapshots_valid(self):
+        Validate.snapshots('pool/ds@snap1')
+        Validate.snapshots('pool/ds@snap1,snap2')
+        Validate.snapshots('pool/ds@%snap2')
+        Validate.snapshots('pool/ds@snap1%')
+
+    @pytest.mark.unit
+    def test_snapshots_invalid(self):
+        with pytest.raises(ValueError):
+            Validate.snapshots('pool/ds')
+        with pytest.raises(ValueError):
+            Validate.snapshots('@snap')
+
 
 class TestProperty:
     """Tests for Property class."""
@@ -134,6 +173,67 @@ class TestProperty:
         prop = Property('lz4')
         prop.value = 'gzip'
         assert prop.value == 'gzip'
+
+
+class TestZFS:
+    """Tests for ZFS base class methods."""
+
+    @pytest.mark.unit
+    def test_zfs_reset(self):
+        fs = Filesystem('pool/fs', {'compression': 'lz4'})
+        assert fs['compression'] is not None
+        fs.reset()
+        assert list(fs.properties) == []
+
+    @pytest.mark.unit
+    def test_update_user_prop_delete(self):
+        fs = Filesystem('pool/fs', {'custom:tag': 'v1'})
+        assert fs['custom:tag'].value == 'v1'
+        fs.update({'custom:tag': None})
+        assert fs['custom:tag'] is None
+
+    @pytest.mark.unit
+    def test_getitem_user_prop(self):
+        fs = Filesystem('pool/fs', {'custom:tag': 'v1'})
+        assert fs['custom:tag'].value == 'v1'
+
+    @pytest.mark.unit
+    def test_getitem_wrong_type_prop_raises(self):
+        fs = Filesystem('pool/fs')
+        with pytest.raises(ValueError):
+            _ = fs['volsize']
+
+    @pytest.mark.unit
+    def test_getattr_wrong_type_prop_raises(self):
+        fs = Filesystem('pool/fs')
+        with pytest.raises(ValueError):
+            _ = fs.volsize
+
+    @pytest.mark.unit
+    def test_contains_known_prop_present(self):
+        fs = Filesystem('pool/fs', {'compression': 'lz4'})
+        assert 'compression' in fs
+
+    @pytest.mark.unit
+    def test_contains_known_prop_absent(self):
+        fs = Filesystem('pool/fs')
+        assert 'compression' not in fs
+
+    @pytest.mark.unit
+    def test_contains_user_prop(self):
+        fs = Filesystem('pool/fs', {'custom:tag': 'v'})
+        assert 'custom:tag' in fs
+
+    @pytest.mark.unit
+    def test_contains_wrong_type_prop_raises(self):
+        fs = Filesystem('pool/fs')
+        with pytest.raises(ValueError):
+            _ = 'volsize' in fs
+
+    @pytest.mark.unit
+    def test_repr(self):
+        fs = Filesystem('pool/fs')
+        assert repr(fs) == 'pool/fs (filesystem)'
 
 
 class TestDataset:
@@ -259,6 +359,27 @@ class TestSnapshot:
         with pytest.raises(ValueError):
             Snapshot('not_a_dataset', 'snap1')
 
+    @pytest.mark.unit
+    def test_snapshot_prop_names_filesystem(self):
+        fs = Filesystem('pool/fs')
+        snap = Snapshot(fs, 'snap1')
+        assert 'acltype' in snap._prop_names
+        assert 'volsize' not in snap._prop_names
+
+    @pytest.mark.unit
+    def test_snapshot_prop_names_volume(self):
+        vol = Volume('pool/vol')
+        snap = Snapshot(vol, 'snap1')
+        assert 'volsize' in snap._prop_names
+        assert 'acltype' not in snap._prop_names
+
+    @pytest.mark.unit
+    def test_snapshot_prop_names_base_dataset(self):
+        ds = Dataset('pool/ds')
+        snap = Snapshot(ds, 'snap1')
+        assert 'acltype' in snap._prop_names
+        assert 'volsize' in snap._prop_names
+
 
 class TestSnapshotRange:
     """Tests for SnapshotRange class."""
@@ -299,9 +420,57 @@ class TestSnapshotRange:
         fs2 = Filesystem(f'{sample_pool}/fs2')
         snap1 = Snapshot(fs1, 'snap1')
         snap2 = Snapshot(fs2, 'snap2')
-        
+
         with pytest.raises(ValueError):
             SnapshotRange(first=snap1, last=snap2)
+
+    @pytest.mark.unit
+    def test_snapshot_range_invalid_dataset_type(self):
+        with pytest.raises(ValueError, match='Expected Filesystem'):
+            SnapshotRange(dataset='not_a_dataset')
+
+    @pytest.mark.unit
+    def test_snapshot_range_invalid_snap_type(self, sample_filesystem):
+        with pytest.raises(ValueError, match='Expected Snapshot'):
+            SnapshotRange(dataset=sample_filesystem, first='not_a_snap')
+
+    @pytest.mark.unit
+    def test_snapshot_range_no_dataset_raises(self):
+        with pytest.raises(ValueError, match='Could not determine snapshot dataset'):
+            SnapshotRange(first=None, last=None, dataset=None)
+
+    @pytest.mark.unit
+    def test_snapshot_range_name_property(self):
+        r = SnapshotRange.from_name('pool/ds@snap1%snap2')
+        assert str(r.name) == 'pool/ds@snap1%snap2'
+
+    @pytest.mark.unit
+    def test_snapshot_range_from_name_conflict_raises(self):
+        with pytest.raises(ValueError, match='Range can be specified either'):
+            SnapshotRange.from_name('pool/ds@snap1%snap2', first='pool/ds@snap1')
+
+    @pytest.mark.unit
+    def test_snapshot_range_from_name_no_percent_raises(self):
+        with pytest.raises(ValueError, match='is not a valid ZFS snapshot range specification'):
+            SnapshotRange.from_name('pool/ds@snap1')
+
+    @pytest.mark.unit
+    def test_snapshot_range_from_name_no_first(self):
+        r = SnapshotRange.from_name('pool/ds@%snap2')
+        assert r.first is None
+        assert r.last.short == 'snap2'
+
+    @pytest.mark.unit
+    def test_snapshot_range_from_name_no_last(self):
+        r = SnapshotRange.from_name('pool/ds@snap1%')
+        assert r.first.short == 'snap1'
+        assert r.last is None
+
+    @pytest.mark.unit
+    def test_snapshot_range_str_and_repr(self):
+        r = SnapshotRange.from_name('pool/ds@snap1%snap2')
+        assert str(r) == 'pool/ds@snap1%snap2'
+        assert repr(r) == 'pool/ds@snap1%snap2'
 
 
 class TestBookmark:

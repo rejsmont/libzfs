@@ -344,7 +344,7 @@ class SnapshotRange:
 
     @property
     def name(self):
-        return self.dataset + '@' + self.short
+        return str(self.dataset) + '@' + self.short
 
     @property
     def short(self):
