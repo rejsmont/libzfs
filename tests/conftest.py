@@ -155,6 +155,53 @@ def sample_property_objects():
     }
 
 
+@pytest.fixture
+def sample_backup_config():
+    """Minimal in-memory BackupConfig for zfsbackup tests."""
+    from zfsbackup.config import BackupConfig, DatasetConfig, RetentionRule
+    from datetime import timedelta
+    return BackupConfig(
+        datasets=[
+            DatasetConfig(
+                name='pool/data',
+                frequency=timedelta(hours=1),
+                retention_rules=[RetentionRule(timedelta(days=1), timedelta(days=30))],
+            ),
+        ],
+        snapshot_prefix='autosnap',
+    )
+
+
+@pytest.fixture
+def config_with_remote(tmp_path):
+    """BackupConfig with remote_backup enabled, writing config to a temp YAML file."""
+    from zfsbackup.config import BackupConfig, DatasetConfig, RemoteServerConfig
+    from datetime import timedelta
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text(
+        "datasets:\n"
+        "  - name: pool/data\n"
+        "remote_backup:\n"
+        "  target_dataset: pool/backups\n"
+        "  enabled: true\n"
+    )
+    return BackupConfig.from_file(cfg_file)
+
+
+@pytest.fixture
+def config_yaml_path(tmp_path):
+    """Write a minimal valid YAML config to a temp file and return the Path."""
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text(
+        "datasets:\n"
+        "  - name: pool/data\n"
+        "    frequency: 1h\n"
+        "    retention:\n"
+        "      1d: 30d\n"
+    )
+    return cfg_file
+
+
 # Test markers
 def pytest_configure(config):
     """Register custom markers."""
