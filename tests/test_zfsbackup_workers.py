@@ -212,3 +212,64 @@ class TestBaseWorkerRun:
         mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
         mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
         worker.run()
+
+
+class TestBaseWorkerLoop:
+    """Cover the main dataset-processing loop (lines 74-82) and _get_datasets (line 51)."""
+
+    def test_dataset_exception_logged_and_loop_exits_on_stop(self, config_yaml_path, mocker):
+        stop_event = multiprocessing.Event()
+        worker = SnapshotWorker(config_yaml_path, stop_event, dry_run=True)
+
+        two_dataset_config = BackupConfig(datasets=[
+            DatasetConfig(name='pool/a'),
+            DatasetConfig(name='pool/b'),
+        ])
+        mocker.patch('zfsbackup.workers.BackupConfig.from_file', return_value=two_dataset_config)
+        mocker.patch.object(SnapshotWorker, '_get_interval', return_value=0)
+
+        call_count = [0]
+
+        def process_side_effect(manager, dsi):
+            call_count[0] += 1
+            stop_event.set()      # trigger break on next dataset and exit the while loop
+            raise RuntimeError("injected error")
+
+        mocker.patch.object(SnapshotWorker, '_process_dataset', side_effect=process_side_effect)
+        worker.run()
+        # Only the first dataset is processed; second is skipped by the stop_event break
+        assert call_count[0] == 1
+
+
+class TestRemoteBackupWorkerBeforeLoop:
+    def test_before_loop_creates_remote_manager(self, tmp_path):
+        from zfsbackup.remote import RemoteBackupManager
+        from zfsbackup.config import Destination
+        config = BackupConfig(
+            datasets=[DatasetConfig(
+                name='pool/data',
+                remote=[RemoteDatasetConfig(destination='offsite')],
+            )],
+            destinations={'offsite': Destination(url='http://backup.example.com')},
+            client_id_file=tmp_path / 'client_id',
+        )
+        manager = MagicMock()
+        worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
+        worker._remote_manager = None
+        worker._before_loop(config, manager)
+        assert isinstance(worker._remote_manager, RemoteBackupManager)
+
+
+class TestApiWorkerThread:
+    def test_run_starts_thread_and_stops_on_event(self, config_yaml_path, mocker):
+        stop_event = multiprocessing.Event()
+        stop_event.set()  # stop_event.wait() returns immediately
+        worker = ApiWorker(config_yaml_path, stop_event, dry_run=True)  # dry_run covers line 198
+
+        mock_app = MagicMock()
+        mocker.patch('zfsbackup.api.create_app', return_value=mock_app)
+        mock_thread = MagicMock()
+        mocker.patch('zfsbackup.workers.threading.Thread', return_value=mock_thread)
+
+        worker.run()
+        mock_thread.start.assert_called_once()

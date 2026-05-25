@@ -2,12 +2,13 @@
 
 import multiprocessing
 import signal
+import sys
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
-from zfsbackup.config import BackupConfig, DatasetConfig, RemoteDatasetConfig
-from zfsbackup.daemon import BackupDaemon
+from zfsbackup.config import BackupConfig, DatasetConfig, RemoteDatasetConfig, RemoteServerConfig, Destination
+from zfsbackup.daemon import BackupDaemon, main
 from zfsbackup.workers import SnapshotWorker, PruningWorker, ApiWorker, RemoteBackupWorker
 
 
@@ -169,3 +170,99 @@ class TestDaemonRun:
 
         daemon._start_workers.assert_called_once()
         daemon._shutdown_workers.assert_called_once()
+
+    def test_run_supervisor_loop_checks_workers(self, config_yaml_path, sample_backup_config, mocker):
+        daemon = BackupDaemon(sample_backup_config, config_yaml_path)
+
+        mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
+        mocker.patch('zfsbackup.backup_manager.zfs.set')
+
+        mocker.patch.object(daemon, '_start_workers')
+        mocker.patch.object(daemon, '_check_workers')
+        mocker.patch.object(daemon, '_shutdown_workers')
+
+        sleep_calls = [0]
+
+        def sleep_and_maybe_stop(_):
+            sleep_calls[0] += 1
+            if sleep_calls[0] >= 2:
+                daemon._stop_event.set()
+
+        mocker.patch('zfsbackup.daemon.time.sleep', side_effect=sleep_and_maybe_stop)
+        daemon.run()
+
+        daemon._check_workers.assert_called_once()
+        daemon._shutdown_workers.assert_called_once()
+
+
+class TestMain:
+    def _patch_config(self, mocker, **kwargs):
+        defaults = dict(
+            datasets=[DatasetConfig(name='pool/data')],
+            destinations={},
+            remote_backup=None,
+            dry_run=False,
+        )
+        defaults.update(kwargs)
+        mock_config = MagicMock(spec=BackupConfig)
+        for k, v in defaults.items():
+            setattr(mock_config, k, v)
+        mocker.patch('zfsbackup.daemon.BackupConfig.from_file', return_value=mock_config)
+        return mock_config
+
+    def test_test_config_returns_zero(self, tmp_path, mocker):
+        self._patch_config(mocker)
+        with patch('sys.argv', ['daemon', '--test-config', '-c', str(tmp_path / 'cfg.yaml')]):
+            result = main()
+        assert result == 0
+
+    def test_test_config_with_destinations(self, tmp_path, mocker):
+        self._patch_config(
+            mocker,
+            destinations={'offsite': Destination(url='http://backup.example.com')},
+            remote_backup=MagicMock(target_dataset='pool/backups'),
+        )
+        with patch('sys.argv', ['daemon', '--test-config', '-c', str(tmp_path / 'cfg.yaml')]):
+            result = main()
+        assert result == 0
+
+    def test_config_load_failure_returns_one(self, tmp_path, mocker):
+        mocker.patch('zfsbackup.daemon.BackupConfig.from_file', side_effect=Exception('bad config'))
+        with patch('sys.argv', ['daemon', '-c', str(tmp_path / 'cfg.yaml')]):
+            result = main()
+        assert result == 1
+
+    def test_daemon_failure_returns_one(self, tmp_path, mocker):
+        self._patch_config(mocker)
+        mock_daemon = MagicMock()
+        mock_daemon.run.side_effect = Exception('crash')
+        mocker.patch('zfsbackup.daemon.BackupDaemon', return_value=mock_daemon)
+        with patch('sys.argv', ['daemon', '-c', str(tmp_path / 'cfg.yaml')]):
+            result = main()
+        assert result == 1
+
+    def test_normal_run_returns_zero(self, tmp_path, mocker):
+        self._patch_config(mocker)
+        mock_daemon = MagicMock()
+        mocker.patch('zfsbackup.daemon.BackupDaemon', return_value=mock_daemon)
+        with patch('sys.argv', ['daemon', '-c', str(tmp_path / 'cfg.yaml')]):
+            result = main()
+        assert result == 0
+        mock_daemon.run.assert_called_once()
+
+    def test_dry_run_flag_sets_config(self, tmp_path, mocker):
+        mock_config = self._patch_config(mocker)
+        mock_daemon = MagicMock()
+        mocker.patch('zfsbackup.daemon.BackupDaemon', return_value=mock_daemon)
+        with patch('sys.argv', ['daemon', '-d', '-c', str(tmp_path / 'cfg.yaml')]):
+            main()
+        assert mock_config.dry_run is True
+
+    def test_verbose_flag_sets_log_level(self, tmp_path, mocker):
+        self._patch_config(mocker)
+        mock_daemon = MagicMock()
+        mocker.patch('zfsbackup.daemon.BackupDaemon', return_value=mock_daemon)
+        with patch('sys.argv', ['daemon', '-v', '-c', str(tmp_path / 'cfg.yaml')]):
+            result = main()
+        assert result == 0

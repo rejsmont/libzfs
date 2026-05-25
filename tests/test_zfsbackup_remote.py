@@ -206,6 +206,144 @@ class TestGetResumeStream:
         stream = rbm._get_resume_stream('http://backup.example.com', 'client1', dsi, latest, None)
         assert stream is None
 
+    def test_falls_back_to_fresh_send_on_resume_token_error(self, tmp_path, requests_mock, mocker):
+        import requests as _requests
+        rbm, dsi = self._make_rbm(tmp_path)
+        requests_mock.get(
+            f'http://backup.example.com/backup/client1/{dsi.name}/resume_token',
+            exc=_requests.ConnectionError,
+        )
+        mock_stream = MagicMock()
+        mocker.patch('zfsbackup.remote.zfs.send.snapshot', return_value=mock_stream)
+        latest = MagicMock()
+        latest.snapshot = MagicMock()
+        stream = rbm._get_resume_stream('http://backup.example.com', 'client1', dsi, latest, None)
+        assert stream is mock_stream
+
+
+class TestTransfer:
+    def _make_rbm(self, tmp_path):
+        config = _make_config(client_id_file=tmp_path / 'client_id')
+        manager = DatasetManager(config)
+        return RemoteBackupManager(config, manager), manager.datasets[0]
+
+    def _make_snap(self, name='autosnap_20240101120000'):
+        snap = MagicMock()
+        snap.name = name
+        snap.snapshot = MagicMock()
+        return snap
+
+    def test_returns_false_when_stream_is_none(self, tmp_path, mocker):
+        rbm, dsi = self._make_rbm(tmp_path)
+        mocker.patch.object(rbm, '_get_resume_stream', return_value=None)
+        latest = self._make_snap()
+        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite')
+        assert result is False
+
+    def test_dry_run_returns_true_without_websocket(self, tmp_path, mocker):
+        config = _make_config(client_id_file=tmp_path / 'client_id', dry_run=True)
+        manager = DatasetManager(config)
+        rbm = RemoteBackupManager(config, manager)
+        dsi = manager.datasets[0]
+
+        mock_stream = MagicMock()
+        mocker.patch.object(rbm, '_get_resume_stream', return_value=mock_stream)
+        mock_ws_cls = mocker.patch('zfsbackup.remote.websocket.WebSocket')
+
+        latest = self._make_snap()
+        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite')
+        assert result is True
+        mock_ws_cls.assert_not_called()
+
+    def test_connection_error_returns_false(self, tmp_path, mocker):
+        rbm, dsi = self._make_rbm(tmp_path)
+        mock_stream = MagicMock()
+        mocker.patch.object(rbm, '_get_resume_stream', return_value=mock_stream)
+
+        mock_ws = MagicMock()
+        mock_ws.connect.side_effect = Exception('connection refused')
+        mocker.patch('zfsbackup.remote.websocket.WebSocket', return_value=mock_ws)
+
+        latest = self._make_snap()
+        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite')
+        assert result is False
+        mock_ws.close.assert_called()
+
+    def test_server_error_response_returns_false(self, tmp_path, mocker):
+        import json as _json
+        rbm, dsi = self._make_rbm(tmp_path)
+
+        mock_stream = MagicMock()
+        mock_stream.read.side_effect = [b'data', b'']
+        mocker.patch.object(rbm, '_get_resume_stream', return_value=mock_stream)
+
+        mock_ws = MagicMock()
+        mock_ws.recv.return_value = _json.dumps({'status': 'error', 'error': 'disk full'})
+        mocker.patch('zfsbackup.remote.websocket.WebSocket', return_value=mock_ws)
+
+        latest = self._make_snap()
+        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite')
+        assert result is False
+
+    def test_successful_transfer_sets_anchor(self, tmp_path, mocker):
+        import json as _json
+        rbm, dsi = self._make_rbm(tmp_path)
+
+        mock_stream = MagicMock()
+        mock_stream.read.side_effect = [b'chunk1', b'chunk2', b'']
+        mocker.patch.object(rbm, '_get_resume_stream', return_value=mock_stream)
+
+        mock_ws = MagicMock()
+        mock_ws.recv.return_value = _json.dumps({'status': 'ok'})
+        mocker.patch('zfsbackup.remote.websocket.WebSocket', return_value=mock_ws)
+
+        mock_set_anchor = mocker.patch.object(rbm.local_manager, 'set_anchor')
+
+        latest = self._make_snap('autosnap_20240202120000')
+        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite')
+        assert result is True
+        mock_set_anchor.assert_called_once_with(dsi, 'offsite', 'autosnap_20240202120000')
+
+    def test_successful_transfer_logs_superseded_anchor(self, tmp_path, mocker):
+        import json as _json
+        rbm, dsi = self._make_rbm(tmp_path)
+
+        mock_stream = MagicMock()
+        mock_stream.read.side_effect = [b'']
+        mocker.patch.object(rbm, '_get_resume_stream', return_value=mock_stream)
+
+        mock_ws = MagicMock()
+        mock_ws.recv.return_value = _json.dumps({'status': 'ok'})
+        mocker.patch('zfsbackup.remote.websocket.WebSocket', return_value=mock_ws)
+
+        mocker.patch.object(rbm.local_manager, 'get_anchor', return_value='autosnap_OLD')
+        mocker.patch.object(rbm.local_manager, 'set_anchor')
+
+        latest = self._make_snap('autosnap_20240202120000')
+        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite')
+        assert result is True
+
+    def test_incremental_transfer_uses_ws_url(self, tmp_path, mocker):
+        import json as _json
+        rbm, dsi = self._make_rbm(tmp_path)
+
+        mock_stream = MagicMock()
+        mock_stream.read.side_effect = [b'', ]
+        mocker.patch.object(rbm, '_get_resume_stream', return_value=mock_stream)
+
+        mock_ws = MagicMock()
+        mock_ws.recv.return_value = _json.dumps({'status': 'ok'})
+        mocker.patch('zfsbackup.remote.websocket.WebSocket', return_value=mock_ws)
+        mocker.patch.object(rbm.local_manager, 'set_anchor')
+
+        latest = self._make_snap('autosnap_20240202120000')
+        common = self._make_snap('autosnap_20240101120000')
+
+        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, common, 'offsite')
+        assert result is True
+        connect_url = mock_ws.connect.call_args[0][0]
+        assert 'from=autosnap_20240101120000' in connect_url
+
 
 class TestBackupDataset:
     def test_returns_false_when_destination_unknown(self, tmp_path):
@@ -244,6 +382,49 @@ class TestBackupDataset:
 
         result = rbm.backup_dataset(dsi, remote_cfg)
         assert result is False
+
+    def test_resolves_common_snap_from_negotiate_result(self, tmp_path, requests_mock, mocker):
+        config = _make_config(client_id_file=tmp_path / 'client_id')
+        manager = DatasetManager(config)
+        rbm = RemoteBackupManager(config, manager)
+        dsi = manager.datasets[0]
+        remote_cfg = dsi.config.remote[0]
+
+        requests_mock.post('http://backup.example.com/backup/register', json={})
+
+        client_id = rbm.identity.client_id
+        old_snap_name = 'autosnap_20240101120000'
+        new_snap_name = 'autosnap_20240202120000'
+
+        from libzfseasy.types import Filesystem, Snapshot as ZFSSnapshot
+        fs = Filesystem('pool/data')
+        old_snap = ZFSSnapshot(fs, old_snap_name)
+        new_snap = ZFSSnapshot(fs, new_snap_name)
+
+        from zfsbackup.backup_manager import SnapshotInfo
+        old_info = SnapshotInfo(old_snap, 'autosnap')
+        new_info = SnapshotInfo(new_snap, 'autosnap')
+
+        mocker.patch.object(manager, 'list_snapshots', return_value=[new_info, old_info])
+
+        requests_mock.post(
+            f'http://backup.example.com/backup/{client_id}/{dsi.name}/negotiate',
+            json={'common_snapshot': old_snap_name, 'server_dataset': 'pool/backups/c/pool/data'},
+        )
+
+        # Mock _transfer to avoid WebSocket and stream setup; we're testing the
+        # common_snap resolution logic in backup_dataset (line 85).
+        captured = {}
+
+        def capture_transfer(base_url, cid, d, latest, common_snap, destination):
+            captured['common_snap'] = common_snap
+            return True
+
+        mocker.patch.object(rbm, '_transfer', side_effect=capture_transfer)
+
+        result = rbm.backup_dataset(dsi, remote_cfg)
+        assert result is True
+        assert captured.get('common_snap') is old_info
 
     def test_dry_run_returns_true_without_transfer(self, tmp_path, requests_mock, mocker):
         config = _make_config(

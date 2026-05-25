@@ -357,3 +357,129 @@ class TestPruneSnapshots:
         mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
         manager.prune_snapshots(dsi)
         mock_destroy.assert_not_called()
+
+    def test_destroy_called_for_batch(self, mocker):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        snaps = [_make_snap_info('autosnap', 5 + i) for i in range(3)]
+        mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
+        mocker.patch.object(manager, 'get_anchors', return_value=set())
+        mocker.patch.object(manager, 'needs_prunning', return_value=snaps[1:])
+        mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
+        manager.prune_snapshots(dsi)
+        mock_destroy.assert_called_once()
+
+    def test_destroy_exception_does_not_propagate(self, mocker):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        snaps = [_make_snap_info('autosnap', 5 + i) for i in range(3)]
+        mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
+        mocker.patch.object(manager, 'get_anchors', return_value=set())
+        mocker.patch.object(manager, 'needs_prunning', return_value=snaps[1:])
+        mocker.patch('zfsbackup.backup_manager.zfs.destroy', side_effect=Exception('destroy failed'))
+        manager.prune_snapshots(dsi)  # must not raise
+
+
+class TestDatasetReport:
+    def test_smoke(self):
+        config = _make_config(datasets=[
+            DatasetConfig(
+                name='pool/data',
+                remote=[RemoteDatasetConfig(destination='offsite')],
+            ),
+        ])
+        manager = DatasetManager(config)
+        manager.dataset_report()  # must not raise
+
+    def test_no_remote(self):
+        manager = DatasetManager(_make_config())
+        manager.dataset_report()  # must not raise
+
+
+class TestSyncConfigPropertyException:
+    def test_zfs_set_exception_does_not_propagate(self, mocker):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        mocker.patch.object(manager, '_get_prop', return_value='old_value')
+        mocker.patch('zfsbackup.backup_manager.zfs.set', side_effect=Exception('set failed'))
+        manager.sync_config_property(dsi)  # must not raise
+
+    def test_sync_all_iterates_all_datasets(self, mocker):
+        config = _make_config(datasets=[
+            DatasetConfig(name='pool/a'),
+            DatasetConfig(name='pool/b'),
+        ])
+        manager = DatasetManager(config)
+        calls = []
+        mocker.patch.object(manager, 'sync_config_property', side_effect=lambda dsi: calls.append(dsi.name))
+        manager.sync_all_config_properties()
+        assert calls == ['pool/a', 'pool/b']
+
+
+class TestAnchorExceptions:
+    def test_set_anchor_exception_does_not_propagate(self, mocker):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        mocker.patch('zfsbackup.backup_manager.zfs.set', side_effect=Exception('set failed'))
+        manager.set_anchor(dsi, 'offsite', 'autosnap_20240101120000')  # must not raise
+
+    def test_clear_anchor_exception_does_not_propagate(self, mocker):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        mocker.patch('zfsbackup.backup_manager.zfs.inherit', side_effect=Exception('inherit failed'))
+        manager.clear_anchor(dsi, 'offsite')  # must not raise
+
+
+class TestReceivedDatasetsSuccess:
+    def _make_remote_config(self):
+        config = _make_config()
+        config.remote_backup = RemoteServerConfig(target_dataset='pool/backups', enabled=True)
+        return config
+
+    def test_returns_dataset_info_for_valid_props(self, mocker):
+        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+        from zfsbackup.config import DatasetConfig
+        config_encoded = DatasetConfig(name='pool/data').to_property()
+
+        mock_ds = MagicMock()
+        mock_ds.__getitem__ = MagicMock(side_effect=lambda k: {
+            PROP_CLIENT_ID: 'client1',
+            PROP_CONFIG: config_encoded,
+        }.get(k))
+        mock_ds.name = 'pool/backups/client1'
+
+        manager = DatasetManager(self._make_remote_config())
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[mock_ds])
+        result = manager.received_datasets()
+        assert len(result) == 1
+
+    def test_skips_ds_with_missing_client_id(self, mocker):
+        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+        from zfsbackup.config import DatasetConfig
+        config_encoded = DatasetConfig(name='pool/data').to_property()
+
+        mock_ds = MagicMock()
+        mock_ds.__getitem__ = MagicMock(side_effect=lambda k: {
+            PROP_CLIENT_ID: None,
+            PROP_CONFIG: config_encoded,
+        }.get(k))
+
+        manager = DatasetManager(self._make_remote_config())
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[mock_ds])
+        result = manager.received_datasets()
+        assert result == []
+
+    def test_skips_ds_with_invalid_config_prop(self, mocker):
+        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+
+        mock_ds = MagicMock()
+        mock_ds.__getitem__ = MagicMock(side_effect=lambda k: {
+            PROP_CLIENT_ID: 'client1',
+            PROP_CONFIG: 'not-valid-base64!!!',
+        }.get(k))
+        mock_ds.name = 'pool/backups/client1'
+
+        manager = DatasetManager(self._make_remote_config())
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[mock_ds])
+        result = manager.received_datasets()
+        assert result == []

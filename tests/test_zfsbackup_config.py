@@ -56,6 +56,26 @@ class TestParseTimeDuration:
             parse_time_duration("5z")
 
 
+class TestParseDurationMinutePrefix:
+    """Cover lines 17-21: the 'm'/'M'-prefix branch in parse_time_duration.
+
+    Inputs starting with 'm'/'M' enter the special-casing block that distinguishes
+    'mi' (minute) from plain 'M' (month), but value extraction via int(duration_str[:-1])
+    cannot succeed for prefix-unit formats — the branch is dead as currently written.
+    These tests document the behaviour and keep the lines covered.
+    """
+
+    def test_m_prefix_raises_invalid_format(self):
+        # "M5": hits line 17 (True), line 20-21 (else: unit='M'), then int("M") fails
+        with pytest.raises(ValueError, match="Invalid duration format"):
+            parse_time_duration("M5")
+
+    def test_mi_prefix_raises_invalid_format(self):
+        # "mi5": hits line 17 (True), lines 18-19 (unit='m'), then int("mi") fails
+        with pytest.raises(ValueError, match="Invalid duration format"):
+            parse_time_duration("mi5")
+
+
 class TestRetentionRule:
     def test_repr(self):
         rule = RetentionRule(age=timedelta(days=1), keep_for=timedelta(days=7))
