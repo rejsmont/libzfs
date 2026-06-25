@@ -49,8 +49,7 @@ def test_pool(auto_zfs_pool):
         subprocess.run([_zfs_cmd(), 'destroy', probe], check=True, capture_output=True)
     except subprocess.CalledProcessError:
         pytest.skip(
-            'ZFS permission delegation not available — '
-            'zfs allow at pool root is unsupported on this platform'
+            'ZFS dataset creation failed — ensure passwordless sudo for zfs/zpool'
         )
 
     yield auto_zfs_pool

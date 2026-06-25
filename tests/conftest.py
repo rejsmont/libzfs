@@ -206,7 +206,8 @@ def _auto_zfs_pool_local(tmp_path_factory):
     """Local pool creation path: file-backed pool via passwordless sudo."""
     import subprocess
     import os
-    from libzfseasy.zfs import ZFS_BIN
+    import stat
+    from libzfseasy.zfs import ZFS_BIN, ZPOOL_BIN
 
     def _has_zfs():
         try:
@@ -247,6 +248,21 @@ def _auto_zfs_pool_local(tmp_path_factory):
         capture_output=True,
     )
 
+    # Check whether delegation actually worked; if not, install sudo wrapper scripts
+    # so that _zfs_cmd()/_zpool_cmd() transparently prefix every command with sudo.
+    _probe = f'{pool_name}/_probe'
+    try:
+        subprocess.run([ZFS_BIN, 'create', _probe], check=True, capture_output=True)
+        subprocess.run([ZFS_BIN, 'destroy', _probe], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        script_dir = tmp_path_factory.mktemp('sudo_wrappers')
+        for tool, bin_path in [('zfs', ZFS_BIN), ('zpool', ZPOOL_BIN)]:
+            script = script_dir / tool
+            script.write_text(f'#!/bin/bash\nexec sudo {bin_path} "$@"\n')
+            script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        os.environ['ZFS_CMD'] = str(script_dir / 'zfs')
+        os.environ['ZPOOL_CMD'] = str(script_dir / 'zpool')
+
     from libzfseasy.types import Dataset
     try:
         yield Dataset.from_name(pool_name)
@@ -255,6 +271,8 @@ def _auto_zfs_pool_local(tmp_path_factory):
             ['sudo', '-n', 'zpool', 'destroy', '-f', pool_name],
             capture_output=True,
         )
+        os.environ.pop('ZFS_CMD', None)
+        os.environ.pop('ZPOOL_CMD', None)
 
 
 def _auto_zfs_pool_multipass(vm_name, tmp_path_factory):
