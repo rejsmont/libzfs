@@ -20,64 +20,40 @@ production pools.
 
 import pytest
 import subprocess
-import os
 import libzfseasy as zfs
-from libzfseasy.zfs import ZFS_BIN, ZPOOL_BIN
-from libzfseasy.types import Filesystem, Volume, Snapshot, Bookmark, Dataset
+from libzfseasy.zfs import ZFS_BIN
+from libzfseasy.types import Filesystem, Volume, Snapshot, Bookmark
 
 
 # Skip all tests in this file if ZFS is not available
 pytestmark = pytest.mark.real_zfs
 
 
-def has_zfs():
-    """Check if ZFS commands are available."""
-    try:
-        subprocess.run([ZFS_BIN, 'list'], capture_output=True, check=True)
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
-
-
-def pool_exists(pool_name):
-    """Check if a ZFS pool exists."""
-    try:
-        result = subprocess.run([ZPOOL_BIN, 'list', '-H', pool_name],
-                              capture_output=True, check=True, text=True)
-        return True
-    except subprocess.CalledProcessError:
-        return False
-
-
 @pytest.fixture(scope='module')
-def test_pool():
-    """Get or create a test pool for real ZFS testing.
-    
-    This fixture will:
-    1. Check for an existing test pool (testpool, test-pool, or from TEST_ZFS_POOL env var)
-    2. If found, use it and clean it up before tests
-    3. If not found, skip tests with a helpful message
+def test_pool(auto_zfs_pool):
+    """Provide a ZFS pool for real ZFS testing; auto-created via auto_zfs_pool fixture.
+
+    Skips if ZFS is unavailable or if permission delegation isn't supported on this platform.
     """
-    # Check for pool name from environment or use default
-    pool_name = os.environ.get('TEST_ZFS_POOL', 'testpool')
-    
-    if not has_zfs():
-        pytest.skip('ZFS commands not available - install ZFS utilities')
-    
-    if not pool_exists(pool_name):
+    if auto_zfs_pool is None:
         pytest.skip(
-            f'Test pool "{pool_name}" not found. Create it with:\n'
-            f'  dd if=/dev/zero of=/tmp/zfs-test-disk bs=1M count=512\n'
-            f'  sudo zpool create {pool_name} /tmp/zfs-test-disk\n'
-            f'Or set TEST_ZFS_POOL environment variable to an existing pool.'
+            'ZFS pool not available — install ZFS and grant NOPASSWD sudo for zpool/zfs'
         )
-    
-    # Clean up any existing test datasets
+    pool_name = auto_zfs_pool.name
     _cleanup_test_datasets(pool_name)
-    
-    yield Dataset.from_name(pool_name)
-    
-    # Clean up after all tests
+
+    # Verify the current user can create datasets (delegation may not work on all platforms)
+    probe = f'{pool_name}/_probe'
+    try:
+        subprocess.run([ZFS_BIN, 'create', probe], check=True, capture_output=True)
+        subprocess.run([ZFS_BIN, 'destroy', probe], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        pytest.skip(
+            'ZFS permission delegation not available — '
+            'zfs allow at pool root is unsupported on this platform'
+        )
+
+    yield auto_zfs_pool
     _cleanup_test_datasets(pool_name)
 
 
