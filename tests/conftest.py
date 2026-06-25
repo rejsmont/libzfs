@@ -202,6 +202,66 @@ def config_yaml_path(tmp_path):
     return cfg_file
 
 
+@pytest.fixture(scope='session')
+def auto_zfs_pool(tmp_path_factory):
+    """Auto-create and destroy a file-backed ZFS pool for zfsbackup integration tests.
+
+    Requires passwordless sudo for zpool/zfs commands. Returns None if ZFS is
+    unavailable or sudo requires a password; dependent fixtures call pytest.skip().
+    """
+    import subprocess
+    import os
+    from libzfseasy.zfs import ZFS_BIN, ZPOOL_BIN
+
+    def _has_zfs():
+        try:
+            subprocess.run([ZFS_BIN, 'list'], capture_output=True, check=True)
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
+    if not _has_zfs():
+        yield None
+        return
+
+    pool_name = f'zfsbackup_pytest_{os.getpid()}'
+    disk_dir = tmp_path_factory.mktemp('zfs_pool')
+    disk_image = str(disk_dir / 'disk.img')
+
+    subprocess.run(['truncate', '-s', '512m', disk_image], check=True)
+
+    result = subprocess.run(
+        ['sudo', '-n', 'zpool', 'create', pool_name, disk_image],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        yield None
+        return
+
+    current_user = subprocess.run(
+        ['id', '-un'], capture_output=True, text=True
+    ).stdout.strip()
+    perms = (
+        'create,destroy,snapshot,clone,rename,mount,bookmark,'
+        'receive,userprop,inherit,'
+        'compression,mountpoint,quota,reservation,volsize,volblocksize'
+    )
+    # Delegation is best-effort; some platforms don't support zfs allow on pool root.
+    subprocess.run(
+        ['sudo', '-n', 'zfs', 'allow', '-u', current_user, perms, pool_name],
+        capture_output=True,
+    )
+
+    from libzfseasy.types import Dataset
+    try:
+        yield Dataset.from_name(pool_name)
+    finally:
+        subprocess.run(
+            ['sudo', '-n', 'zpool', 'destroy', '-f', pool_name],
+            capture_output=True,
+        )
+
+
 # Test markers
 def pytest_configure(config):
     """Register custom markers."""

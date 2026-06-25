@@ -11,7 +11,7 @@ DISK_SIZE="${ZFS_TEST_SIZE:-512}"  # Size in MB
 CURRENT_USER="$(id -un)"
 
 # Permissions delegated to the current user on the pool
-ZFS_PERMISSIONS="create,destroy,snapshot,clone,rename,mount,bookmark,compression,mountpoint,quota,reservation,volsize,volblocksize"
+ZFS_PERMISSIONS="create,destroy,snapshot,clone,rename,mount,bookmark,receive,userprop,inherit,compression,mountpoint,quota,reservation,volsize,volblocksize"
 
 echo "=========================================="
 echo "ZFS Test Pool Setup"
