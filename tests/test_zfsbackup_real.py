@@ -22,7 +22,7 @@ import pytest
 
 import libzfseasy as zfs
 from libzfseasy.types import Dataset, Filesystem
-from libzfseasy.zfs import ZFS_BIN
+from libzfseasy.zfs import _zfs_cmd
 
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup.config import (
@@ -51,7 +51,7 @@ def snap_name_at(hours_ago: float, prefix: str = 'autosnap') -> str:
 def list_real_snapshot_names(dataset_name: str) -> List[str]:
     """Return short snapshot names (part after @) for *dataset_name* via the CLI."""
     result = subprocess.run(
-        [ZFS_BIN, 'list', '-H', '-t', 'snapshot', '-r', '-o', 'name', dataset_name],
+        [_zfs_cmd(), 'list', '-H', '-t', 'snapshot', '-r', '-o', 'name', dataset_name],
         capture_output=True, text=True,
     )
     return [
@@ -277,7 +277,7 @@ class TestRealSnapshotManager:
         manager.sync_config_property(dsi)
 
         result = subprocess.run(
-            [ZFS_BIN, 'get', '-H', '-o', 'value', 'org.zfsbackup:config', source_fs.name],
+            [_zfs_cmd(), 'get', '-H', '-o', 'value', 'org.zfsbackup:config', source_fs.name],
             capture_output=True, text=True, check=True,
         )
         value = result.stdout.strip()
@@ -306,9 +306,9 @@ class TestRealPruning:
     """Verify retention policy enforcement against real ZFS snapshots."""
 
     def test_prune_destroys_excess_snapshots(self, source_fs):
-        # 6 hourly snapshots (1h–6h ago); rule keeps one per hour for 3 hours.
-        # Slots: 1h, 2h, 3h within the 3h window; 4h, 5h, 6h are outside → prune 3.
-        for h in range(1, 7):
+        # 6 snapshots at 0.5h–5.5h ago (half-hour offsets avoid boundary timing issues).
+        # Rule keeps one per 1h slot for 3h: slots [0-1h],[1-2h],[2-3h] → keep 3; prune 3.
+        for h in [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]:
             zfs.snapshot(source_fs, snap_name_at(h))
 
         config = BackupConfig(

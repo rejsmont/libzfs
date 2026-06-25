@@ -202,16 +202,11 @@ def config_yaml_path(tmp_path):
     return cfg_file
 
 
-@pytest.fixture(scope='session')
-def auto_zfs_pool(tmp_path_factory):
-    """Auto-create and destroy a file-backed ZFS pool for zfsbackup integration tests.
-
-    Requires passwordless sudo for zpool/zfs commands. Returns None if ZFS is
-    unavailable or sudo requires a password; dependent fixtures call pytest.skip().
-    """
+def _auto_zfs_pool_local(tmp_path_factory):
+    """Local pool creation path: file-backed pool via passwordless sudo."""
     import subprocess
     import os
-    from libzfseasy.zfs import ZFS_BIN, ZPOOL_BIN
+    from libzfseasy.zfs import ZFS_BIN
 
     def _has_zfs():
         try:
@@ -260,6 +255,102 @@ def auto_zfs_pool(tmp_path_factory):
             ['sudo', '-n', 'zpool', 'destroy', '-f', pool_name],
             capture_output=True,
         )
+
+
+def _auto_zfs_pool_multipass(vm_name, tmp_path_factory):
+    """Multipass pool creation path: pool lives inside a Linux VM."""
+    import subprocess
+    import os
+    import stat
+
+    # Start VM if suspended/stopped (best-effort; no-op if already running)
+    subprocess.run(['multipass', 'start', vm_name], capture_output=True)
+
+    result = subprocess.run(
+        ['multipass', 'info', vm_name], capture_output=True, text=True
+    )
+    if 'Running' not in result.stdout:
+        yield None
+        return
+
+    # Auto-install ZFS inside the VM if absent
+    r = subprocess.run(
+        ['multipass', 'exec', vm_name, '--', 'which', 'zfs'],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        subprocess.run(
+            ['multipass', 'exec', vm_name, '--',
+             'sudo', 'apt-get', 'install', '-y', 'zfsutils-linux'],
+            check=True,
+        )
+
+    pool_name = f'zfsbackup_pytest_{os.getpid()}'
+    disk_image = f'/tmp/{pool_name}.img'
+
+    subprocess.run(
+        ['multipass', 'exec', vm_name, '--', 'truncate', '-s', '512m', disk_image],
+        check=True,
+    )
+
+    r = subprocess.run(
+        ['multipass', 'exec', vm_name, '--',
+         'sudo', 'zpool', 'create', pool_name, disk_image],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        subprocess.run(
+            ['multipass', 'exec', vm_name, '--', 'rm', '-f', disk_image],
+            capture_output=True,
+        )
+        yield None
+        return
+
+    # Create wrapper scripts so libzfseasy routes all zfs/zpool calls into the VM
+    script_dir = tmp_path_factory.mktemp('multipass_wrappers')
+    for tool in ('zfs', 'zpool'):
+        script = script_dir / tool
+        script.write_text(
+            f'#!/bin/bash\nexec multipass exec {vm_name} -- sudo /usr/sbin/{tool} "$@"\n'
+        )
+        script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    # _zfs_cmd() / _zpool_cmd() re-read these env vars at call time
+    os.environ['ZFS_CMD'] = str(script_dir / 'zfs')
+    os.environ['ZPOOL_CMD'] = str(script_dir / 'zpool')
+
+    from libzfseasy.types import Dataset
+    try:
+        yield Dataset.from_name(pool_name)
+    finally:
+        subprocess.run(
+            ['multipass', 'exec', vm_name, '--',
+             'sudo', 'zpool', 'destroy', '-f', pool_name],
+            capture_output=True,
+        )
+        subprocess.run(
+            ['multipass', 'exec', vm_name, '--', 'rm', '-f', disk_image],
+            capture_output=True,
+        )
+        os.environ.pop('ZFS_CMD', None)
+        os.environ.pop('ZPOOL_CMD', None)
+
+
+@pytest.fixture(scope='session')
+def auto_zfs_pool(tmp_path_factory):
+    """Auto-create and destroy a ZFS pool for real_zfs integration tests.
+
+    Without MULTIPASS_VM: creates a local file-backed pool via passwordless sudo.
+    With MULTIPASS_VM=<name>: creates the pool inside the named Multipass Linux VM,
+    routing all zfs/zpool commands through it for the duration of the session.
+    Returns None if setup fails; dependent fixtures call pytest.skip().
+    """
+    import os
+    vm = os.environ.get('MULTIPASS_VM')
+    if vm:
+        yield from _auto_zfs_pool_multipass(vm, tmp_path_factory)
+    else:
+        yield from _auto_zfs_pool_local(tmp_path_factory)
 
 
 # Test markers

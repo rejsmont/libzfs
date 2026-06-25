@@ -21,7 +21,7 @@ production pools.
 import pytest
 import subprocess
 import libzfseasy as zfs
-from libzfseasy.zfs import ZFS_BIN
+from libzfseasy.zfs import _zfs_cmd
 from libzfseasy.types import Filesystem, Volume, Snapshot, Bookmark
 
 
@@ -45,8 +45,8 @@ def test_pool(auto_zfs_pool):
     # Verify the current user can create datasets (delegation may not work on all platforms)
     probe = f'{pool_name}/_probe'
     try:
-        subprocess.run([ZFS_BIN, 'create', probe], check=True, capture_output=True)
-        subprocess.run([ZFS_BIN, 'destroy', probe], check=True, capture_output=True)
+        subprocess.run([_zfs_cmd(), 'create', probe], check=True, capture_output=True)
+        subprocess.run([_zfs_cmd(), 'destroy', probe], check=True, capture_output=True)
     except subprocess.CalledProcessError:
         pytest.skip(
             'ZFS permission delegation not available — '
@@ -60,7 +60,7 @@ def test_pool(auto_zfs_pool):
 def _cleanup_test_datasets(pool_name):
     """Remove all test datasets from the pool."""
     try:
-        result = subprocess.run([ZFS_BIN, 'list', '-H', '-r', '-o', 'name', pool_name],
+        result = subprocess.run([_zfs_cmd(), 'list', '-H', '-r', '-o', 'name', pool_name],
                               capture_output=True, text=True, check=True)
         datasets = [line.strip() for line in result.stdout.split('\n') if line.strip()]
         
@@ -68,7 +68,7 @@ def _cleanup_test_datasets(pool_name):
         for dataset in reversed(datasets):  # Reverse to destroy children first
             if dataset != pool_name and '/test_' in dataset:
                 try:
-                    subprocess.run([ZFS_BIN, 'destroy', '-r', dataset],
+                    subprocess.run([_zfs_cmd(), 'destroy', '-r', dataset],
                                  capture_output=True, check=True)
                 except subprocess.CalledProcessError:
                     pass  # Ignore errors during cleanup

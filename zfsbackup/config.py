@@ -27,6 +27,8 @@ def parse_time_duration(duration_str: str) -> timedelta:
     except ValueError:
         raise ValueError(f"Invalid duration format: {duration_str}")
 
+    if unit.lower() == 's':
+        return timedelta(seconds=value)
     if unit == 'm':
         return timedelta(minutes=value)
     if unit.lower() == 'h':
@@ -40,7 +42,7 @@ def parse_time_duration(duration_str: str) -> timedelta:
     elif unit.lower() == 'y':
         return timedelta(days=value * 365)
     else:
-        raise ValueError(f"Unknown duration unit: {unit}. Use m/h/d/w/M/y")
+        raise ValueError(f"Unknown duration unit: {unit}. Use s/m/h/d/w/M/y")
 
 
 @dataclass
