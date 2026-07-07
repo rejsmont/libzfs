@@ -124,10 +124,10 @@ class RemoteBackupManager:
         common_snap,
         destination: str,
     ) -> bool:
-        stream = self._get_resume_stream(base_url, client_id, dsi, latest, common_snap)
-        if stream is None:
-            return False
-
+        # Check dry-run *before* starting a real `zfs send` subprocess: a
+        # StreamHandle spawned here would otherwise be left unclosed (no
+        # wait()/reap, no error surfaced) since we'd return before ever
+        # reading or closing it.
         if self.config.dry_run:
             logger.info(
                 f"[DRY RUN] Would send {dsi.name}@{latest.name}"
@@ -135,6 +135,10 @@ class RemoteBackupManager:
                 + f" -> {base_url}"
             )
             return True
+
+        stream = self._get_resume_stream(base_url, client_id, dsi, latest, common_snap)
+        if stream is None:
+            return False
 
         ws_base = base_url.replace('https://', 'wss://', 1).replace('http://', 'ws://', 1)
         ws_url = f"{ws_base}/backup/{client_id}/{dsi.name}/stream"
@@ -145,11 +149,18 @@ class RemoteBackupManager:
         try:
             ws.connect(ws_url)
             chunk_size = 256 * 1024
-            while True:
-                chunk = stream.read(chunk_size)
-                if not chunk:
-                    break
-                ws.send_binary(chunk)
+            # `stream` is a StreamHandle wrapping the `zfs send` process's
+            # stdout. Its close()/__exit__ waits on the subprocess and raises
+            # if it exited non-zero, so drain it fully (the while loop below)
+            # *before* the `with` block exits -- closing early could either
+            # deadlock on a full pipe or reap the process before all data has
+            # been read.
+            with stream:
+                while True:
+                    chunk = stream.read(chunk_size)
+                    if not chunk:
+                        break
+                    ws.send_binary(chunk)
             ws.send(json.dumps({'done': True}))
             result = json.loads(ws.recv())
             if result.get('status') != 'ok':

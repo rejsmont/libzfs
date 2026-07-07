@@ -363,3 +363,124 @@ class TestRealVolumeOperations:
         finally:
             # Cleanup
             zfs.destroy(vol, destroy=True)
+
+
+class TestRealExecOutThreadCleanup:
+    """Regression test for the Command._exec_out() generator-cleanup fix.
+
+    The mocked test suite (tests/test_commands.py::TestExecCaptureRegressions
+    ::test_exec_out_abandoned_generator_terminates_child) can only assert that
+    process.terminate()/process.wait() get *called* on a MagicMock -- it
+    cannot prove that a real background stderr-reader thread, blocked on a
+    real OS pipe's readline(), actually gets unblocked and joined. Only a
+    real subprocess/pipe (i.e. real_zfs) can demonstrate that no thread (and
+    no zombie child) is left behind after a lazy generator is abandoned.
+    """
+
+    def test_lazy_list_abandoned_generator_leaves_no_thread(self, test_pool):
+        """Consume one element of a lazy `zfs list` generator over a dataset
+        with several children, then abandon it; the background stderr-reader
+        thread started for that command must not leak."""
+        import gc
+        import threading
+        import time
+
+        parent_name = f'{test_pool}/test_lazy_cleanup'
+        parent = zfs.create.filesystem(parent_name)
+        try:
+            for i in range(5):
+                zfs.create.filesystem(f'{parent_name}/child{i}')
+
+            baseline = threading.active_count()
+
+            gen = zfs.list(roots=parent, recursive=True, lazy=True)
+            first = next(gen)
+            assert first is not None
+
+            # Abandon the generator mid-iteration (as e.g. a caller
+            # `break`-ing out of a `for` loop over the lazy result would do).
+            gen.close()
+            del gen
+            gc.collect()
+
+            # The stderr-reader thread join() happens synchronously inside
+            # the generator's cleanup, so this should already be true; poll
+            # briefly regardless to avoid flakiness under CI scheduling.
+            deadline = time.time() + 5
+            while threading.active_count() > baseline and time.time() < deadline:
+                time.sleep(0.05)
+
+            assert threading.active_count() == baseline, (
+                'a background stderr-reader thread leaked after abandoning '
+                'a lazy _exec_out-backed generator'
+            )
+        finally:
+            zfs.destroy(parent, destroy=True, recursive=True)
+
+
+class TestRealSendReceiveStreamHandle:
+    """Regression tests for the StreamHandle fix: zfs.send/zfs.receive now
+    return a context-manager wrapper whose close()/__exit__ waits for the
+    subprocess and raises the bare subprocess Exception on non-zero exit,
+    instead of silently succeeding. This is the actual bug being fixed --
+    only provable end-to-end against a real `zfs send`/`zfs receive` pair.
+    """
+
+    def test_send_receive_round_trip_succeeds(self, test_pool):
+        """A genuine send -> receive round trip must succeed cleanly, with
+        both StreamHandles usable as context managers."""
+        src_name = f'{test_pool}/test_stream_src'
+        dst_name = f'{test_pool}/test_stream_dst'
+
+        src = zfs.create.filesystem(src_name)
+        try:
+            snap = zfs.snapshot(src, 'snap1')
+
+            with zfs.send.snapshot(snap) as send_stream:
+                data = send_stream.read()
+
+            assert len(data) > 0
+
+            with zfs.receive.filesystem(Filesystem(dst_name)) as recv_stream:
+                recv_stream.write(data)
+
+            result = zfs.list(roots=Filesystem(dst_name), types=['snapshot'], recursive=True)
+            assert any(s.name == f'{dst_name}@snap1' for s in result)
+        finally:
+            try:
+                zfs.destroy(Filesystem(dst_name), destroy=True, recursive=True)
+            except Exception:
+                pass
+            zfs.destroy(src, destroy=True, recursive=True)
+
+    def test_receive_truncated_stream_raises_on_close(self, test_pool):
+        """Induce a receive failure by feeding `zfs receive` a truncated (and
+        therefore corrupt/incomplete) send stream. Before the fix, ReceiveCommand
+        handed back a bare BufferedWriter and nothing ever checked the
+        subprocess's exit code, so this failure was silently swallowed. Now
+        it must surface via close()/__exit__ raising."""
+        src_name = f'{test_pool}/test_stream_trunc_src'
+        dst_name = f'{test_pool}/test_stream_trunc_dst'
+
+        src = zfs.create.filesystem(src_name)
+        try:
+            zfs.snapshot(src, 'snap1')
+            snap = zfs.list(roots=src, types=['snapshot'])[0]
+
+            with zfs.send.snapshot(snap) as send_stream:
+                full_data = send_stream.read()
+
+            # Sanity check: make sure we actually have a real stream to
+            # truncate, not a degenerate empty one.
+            assert len(full_data) > 0
+            truncated = full_data[: max(1, len(full_data) // 2)]
+
+            with pytest.raises(Exception):
+                with zfs.receive.filesystem(Filesystem(dst_name)) as recv_stream:
+                    recv_stream.write(truncated)
+        finally:
+            try:
+                zfs.destroy(Filesystem(dst_name), destroy=True, recursive=True)
+            except Exception:
+                pass
+            zfs.destroy(src, destroy=True, recursive=True)

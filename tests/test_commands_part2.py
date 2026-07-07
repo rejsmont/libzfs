@@ -2,10 +2,12 @@
 
 import pytest
 import io
+import os
+import subprocess
 from unittest.mock import MagicMock
 from libzfseasy.zfs import (
     AllowCommand, UnAllowCommand, CloneCommand, GetCommand, SetCommand,
-    InheritCommand, SendCommand, ReceiveCommand,
+    InheritCommand, SendCommand, ReceiveCommand, StreamHandle,
     LoadKeyCommand, UnLoadKeyCommand, ChangeKeyCommand,
     MountCommand, UnMountCommand,
 )
@@ -227,6 +229,25 @@ class TestGetCommandExtended:
         result = GetCommand()(ds=sample_filesystem, properties='compression')
         assert len(result) == 2
 
+    @pytest.mark.unit
+    def test_get_options_types_none_omits_dash_t(self):
+        """types=None must not emit a bare '-t' flag with no argument (this
+        used to unconditionally do `cmd += ['-t', kwargs.get('types')]`,
+        which appended a literal `None`)."""
+        argv = GetCommand._get_options(types=None, properties=['all'])
+        assert '-t' not in argv
+
+    @pytest.mark.unit
+    def test_get_options_types_empty_string_omits_dash_t(self):
+        argv = GetCommand._get_options(types='', properties=['all'])
+        assert '-t' not in argv
+
+    @pytest.mark.unit
+    def test_get_options_types_all_emits_dash_t(self):
+        argv = GetCommand._get_options(types='all', properties=['all'])
+        assert '-t' in argv
+        assert argv[argv.index('-t') + 1] == 'all'
+
 
 class TestSetCommandExtended:
 
@@ -245,6 +266,130 @@ class TestInheritCommandExtended:
         InheritCommand()(sample_filesystem, 'compression', received=True)
         call_args = mock_subprocess.call_args[0][0]
         assert '-S' in call_args
+
+
+class TestStreamHandle:
+    """Unit tests for StreamHandle, the send/receive context-manager wrapper."""
+
+    @pytest.mark.unit
+    def test_context_manager_round_trips_data(self):
+        """__enter__ returns the wrapped stream and __exit__ closes it (and
+        the process) cleanly when the process exits with rc == 0."""
+        stream = io.BytesIO(b'hello-zfs-stream')
+        process = MagicMock()
+        process.wait.return_value = 0
+        process.stderr = None
+
+        with StreamHandle(process, stream) as s:
+            data = s.read()
+
+        assert data == b'hello-zfs-stream'
+        assert stream.closed
+        process.wait.assert_called_once()
+
+    @pytest.mark.unit
+    def test_close_raises_on_nonzero_exit_after_send_drain(self):
+        """Send-side failure: the caller has finished reading (drained) the
+        stream, but the underlying `zfs send` process exited non-zero.
+        close()/__exit__ must surface that as the bare subprocess Exception
+        instead of silently succeeding."""
+        stream = io.BytesIO(b'')
+        stream.read()  # simulate the caller having fully drained the stream
+        process = MagicMock()
+        process.wait.return_value = 1
+        process.stderr = io.BytesIO(b'send failed: dataset does not exist\n')
+
+        handle = StreamHandle(process, stream)
+        with pytest.raises(Exception) as exc_info:
+            handle.close()
+
+        assert 'dataset does not exist' in str(exc_info.value)
+
+    @pytest.mark.unit
+    def test_close_raises_on_nonzero_exit_after_receive_stdin_close(self):
+        """Receive-side failure: the caller has finished writing and the
+        stdin pipe would normally just be closed, but `zfs receive` exited
+        non-zero (e.g. an incompatible stream). __exit__ must raise rather
+        than swallow the failure."""
+        stream = io.BufferedWriter(io.BytesIO())
+        stream.write(b'ZFS_DATA')
+        process = MagicMock()
+        process.wait.return_value = 1
+        process.stderr = io.BytesIO(b'cannot receive: destination has been modified\n')
+
+        with pytest.raises(Exception) as exc_info:
+            with StreamHandle(process, stream) as s:
+                pass
+
+        assert 'destination has been modified' in str(exc_info.value)
+        assert stream.closed
+
+    @pytest.mark.unit
+    def test_close_is_idempotent(self):
+        """A second close() call must be a no-op: no second process.wait(),
+        and it must not re-raise once the first close() already raised."""
+        stream = io.BytesIO(b'')
+        process = MagicMock()
+        process.wait.return_value = 1
+        process.stderr = io.BytesIO(b'boom\n')
+
+        handle = StreamHandle(process, stream)
+        with pytest.raises(Exception):
+            handle.close()
+
+        # Should not raise again, and should not call process.wait() again.
+        handle.close()
+        process.wait.assert_called_once()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_send_empty_stream_rc_zero_returns_handle_no_raise(self, mock_subprocess):
+        """An empty send stream -- the process exits 0 having produced no
+        stdout at all -- must still hand back a usable StreamHandle, and
+        closing it must not raise."""
+        process = MagicMock()
+        process.stdout.peek.return_value = b''
+        process.poll.return_value = 0  # exits immediately, never produced output
+        process.wait.return_value = 0
+        mock_subprocess.return_value = process
+
+        handle = SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
+
+        assert isinstance(handle, StreamHandle)
+        handle.close()
+        process.wait.assert_called_once()
+
+    @pytest.mark.unit
+    def test_close_closes_stderr_pipe_and_is_idempotent_on_real_fds(self):
+        """close() must close the real stderr pipe object it drained (not
+        just leak the fd), and must be safe to call twice on real,
+        OS-backed file objects -- no double-close exception. The wrapped
+        stream here IS process.stdout (the send-side case), so the
+        stdout-vs-self._stream branch must not attempt to close it a
+        second time via _close_pipe."""
+        stdout_r, stdout_w = os.pipe()
+        stderr_r, stderr_w = os.pipe()
+        os.close(stdout_w)
+        os.close(stderr_w)
+        stream = os.fdopen(stdout_r, 'rb')
+        stderr_pipe = os.fdopen(stderr_r, 'rb')
+
+        process = MagicMock()
+        process.wait.return_value = 0
+        process.stderr = stderr_pipe
+        process.stdout = stream  # send side: wrapped stream IS process.stdout
+
+        handle = StreamHandle(process, stream)
+        handle.close()
+
+        assert stream.closed
+        assert stderr_pipe.closed
+
+        # Idempotent: a second close() must not raise (e.g. an OSError
+        # from double-closing an already-closed fd-backed file object),
+        # and must not re-invoke process.wait().
+        handle.close()
+        process.wait.assert_called_once()
 
 
 class TestSendCommandExtended:
@@ -501,6 +646,26 @@ class TestReceiveCommandExtended:
         ReceiveCommand().filesystem(sample_filesystem, ignore_all=True)
         call_args = mock_subprocess.call_args[0][0]
         assert '-e' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_receive_uses_devnull_for_stdout(self, mock_subprocess, sample_filesystem):
+        """Regression guard: nothing ever drains process.stdout on the
+        receive side, so it must be opened as DEVNULL, not PIPE. If this
+        regressed back to PIPE, a chatty child filling the pipe could block
+        on write() forever, and StreamHandle.close()'s process.wait() would
+        then deadlock waiting for a child stuck writing to an undrained
+        pipe."""
+        process_mock = MagicMock()
+        process_mock.stdin = io.BufferedWriter(io.BytesIO())
+        process_mock.poll.return_value = None
+        mock_subprocess.return_value = process_mock
+
+        ReceiveCommand().filesystem(sample_filesystem)
+
+        _, call_kwargs = mock_subprocess.call_args
+        assert call_kwargs['stdout'] == subprocess.DEVNULL
+        assert call_kwargs['stdout'] != subprocess.PIPE
 
     @pytest.mark.unit
     def test_receive_get_props_with_flag(self):

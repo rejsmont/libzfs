@@ -83,10 +83,14 @@ class TestSnapshotWorkflow:
         process_mock = MagicMock()
         process_mock.stdout.peek.return_value = b'ZFS_DATA'
         process_mock.poll.return_value = None
+        process_mock.wait.return_value = 0
         mock_subprocess.return_value = process_mock
-        
-        stream = zfs.send.snapshot(snap2, since=snap1)
-        assert stream is not None
+
+        # zfs.send.* now returns a StreamHandle; use it as a context manager
+        # so close()/__exit__ is exercised and the (successful) subprocess
+        # wait/cleanup path runs without raising.
+        with zfs.send.snapshot(snap2, since=snap1) as stream:
+            assert stream is not None
 
 
 class TestBookmarkWorkflow:
@@ -175,24 +179,32 @@ class TestSendReceiveWorkflow:
         send_process = MagicMock()
         send_process.stdout.peek.return_value = b'ZFS_DATA'
         send_process.poll.return_value = None
+        send_process.wait.return_value = 0
         mock_subprocess.return_value = send_process
-        
-        send_stream = zfs.send.snapshot(snap)
-        assert send_stream is not None
-        
+
+        # zfs.send.* returns a StreamHandle; exercise it as a context manager.
+        with zfs.send.snapshot(snap) as send_stream:
+            assert send_stream is not None
+
         # Create target filesystem
         mock_subprocess.setup()
         target = zfs.create.filesystem(f'{sample_pool}/target')
-        
+
         # Receive snapshot
         import io
         recv_process = MagicMock()
         recv_process.stdin = io.BufferedWriter(io.BytesIO())
         recv_process.poll.return_value = None
+        recv_process.wait.return_value = 0
         mock_subprocess.return_value = recv_process
-        
-        recv_stream = zfs.receive.filesystem(target)
-        assert recv_stream is not None
+
+        # zfs.receive.* also returns a StreamHandle; write through it inside
+        # the `with` block, and let __exit__ close the real BufferedWriter
+        # and reap the (successful) subprocess.
+        with zfs.receive.filesystem(target) as recv_stream:
+            assert recv_stream is not None
+            recv_stream.write(b'ZFS_DATA')
+        assert recv_process.stdin.closed
 
 
 class TestMountWorkflow:
@@ -297,10 +309,12 @@ class TestComplexWorkflow:
         process_mock = MagicMock()
         process_mock.stdout.peek.return_value = b'ZFS_DATA'
         process_mock.poll.return_value = None
+        process_mock.wait.return_value = 0
         mock_subprocess.return_value = process_mock
-        
-        stream = zfs.send.snapshot(snap2_main, since=snap1_main, replicate=True)
-        assert stream is not None
+
+        # zfs.send.* returns a StreamHandle; exercise it as a context manager.
+        with zfs.send.snapshot(snap2_main, since=snap1_main, replicate=True) as stream:
+            assert stream is not None
         
         # Step 5: Create bookmark for snap1 before destroying
         mock_subprocess.setup()
@@ -319,10 +333,15 @@ class TestComplexWorkflow:
         recv_process = MagicMock()
         recv_process.stdin = io.BufferedWriter(io.BytesIO())
         recv_process.poll.return_value = None
+        recv_process.wait.return_value = 0
         mock_subprocess.return_value = recv_process
-        
-        recv_stream = zfs.receive.filesystem(target, force=True)
-        assert recv_stream is not None
+
+        # zfs.receive.* returns a StreamHandle; write through it inside the
+        # `with` block and let __exit__ close the stream and reap the process.
+        with zfs.receive.filesystem(target, force=True) as recv_stream:
+            assert recv_stream is not None
+            recv_stream.write(b'ZFS_DATA')
+        assert recv_process.stdin.closed
 
 
 class TestExistsFunction:

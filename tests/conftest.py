@@ -38,7 +38,13 @@ def mock_subprocess(mocker):
         
         # Setup return code
         process_mock.poll.side_effect = [None] * len(stdout) + [returncode] if isinstance(stdout, list) else [returncode]
-        
+
+        # Command._exec_capture() now falls back to process.wait() when
+        # stdout hits EOF but poll() still returns None (rather than
+        # spin-looping). Stub it to resolve to the same returncode that
+        # poll() would eventually report, so that fallback path works too.
+        process_mock.wait.return_value = returncode
+
         # Set as return_value and also add to queue
         mock_popen.return_value = process_mock
         mock_queue.append(process_mock)

@@ -46,6 +46,11 @@ Sort = Union[str, Iterable[str], Dict[str, bool]]
 
 debug = True
 
+# How long to give an abandoned child process to honor SIGTERM before
+# escalating to SIGKILL when reaping it in Command._exec_out's finally block.
+_TERMINATE_TIMEOUT = 5
+
+
 class Command:
 
     @classmethod
@@ -67,12 +72,35 @@ class Command:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         errors = []
         stderr_thread = cls._start_stderr_reader(process, errors)
-        while True:
-            output = cls._exec_capture(process, errors, stderr_thread)
-            if output is False:
-                break
-            elif output != '' and output is not None:
-                yield output
+        completed = False
+        try:
+            while True:
+                output = cls._exec_capture(process, errors, stderr_thread)
+                if output is False:
+                    completed = True
+                    break
+                elif output != '' and output is not None:
+                    yield output
+        finally:
+            # If the generator is abandoned mid-iteration (caller breaks out of
+            # a loop, or it's garbage collected), make sure the child is reaped
+            # and the stderr reader thread isn't left blocked on readline()
+            # forever. A normal, fully-consumed run has already reaped the
+            # child and joined the thread inside _exec_capture, so skip
+            # redoing that work (and an extra poll()) here.
+            if not completed:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=_TERMINATE_TIMEOUT)
+                    except subprocess.TimeoutExpired:
+                        # Child ignored SIGTERM; escalate rather than risk
+                        # the stderr thread staying blocked on readline()
+                        # (and this wait()) forever.
+                        process.kill()
+                        process.wait()
+                stderr_thread.join()
+                process.wait()
 
     @staticmethod
     def _start_stderr_reader(process, errors):
@@ -96,13 +124,95 @@ class Command:
         rc = process.poll()
         if stdout != '':
             return stdout.strip()
-        if stdout == '' and rc is not None:
-            if stderr_thread is not None:
-                stderr_thread.join()
-            if rc != 0:
-                raise Exception('\n'.join(errors))
-            return False
-        return None
+        # stdout hit EOF; block until the child actually exits instead of
+        # returning None and letting the caller's `while True` loop spin on
+        # readline()/poll() until it does.
+        if rc is None:
+            rc = process.wait()
+        if stderr_thread is not None:
+            stderr_thread.join()
+        if rc != 0:
+            raise Exception('\n'.join(errors))
+        return False
+
+
+class StreamHandle:
+    """Wraps the Popen and the binary pipe used for zfs send/receive streaming.
+
+    Proxies attribute access (read/write/close/...) to the underlying
+    BufferedReader (send) or BufferedWriter (receive), so existing
+    stream-based usage keeps working unchanged. Can also be used as a
+    context manager -- `__enter__` returns the wrapped stream and `__exit__`
+    calls `close()`.
+
+    Closing the handle (via `close()` or context-manager exit) closes the
+    underlying stream, waits for the subprocess to exit, drains any
+    remaining stderr, and raises the bare subprocess-error Exception if the
+    process exited with a non-zero return code. This must only be done after
+    the caller has finished reading (send) or writing (receive) the stream,
+    otherwise a full pipe could deadlock the child.
+
+    Keyword arguments:
+        process: subprocess.Popen -- the running zfs send/receive process
+        stream: io.BufferedReader | io.BufferedWriter -- process.stdout or process.stdin
+        errors: list -- stderr lines captured so far (mutated in place, default [])
+
+    Returns:
+        None
+    """
+
+    def __init__(self, process, stream, errors: Optional[list] = None):
+        self._process = process
+        self._stream = stream
+        self._errors = errors if errors is not None else []
+        self._closed = False
+
+    def __enter__(self):
+        return self._stream
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if not getattr(self._stream, 'closed', False):
+            self._stream.close()
+        rc = self._process.wait()
+        stderr = getattr(self._process, 'stderr', None)
+        if stderr is not None:
+            try:
+                remainder = stderr.read()
+            except Exception:
+                remainder = None
+            if remainder:
+                for line in remainder.decode('utf-8', errors='replace').splitlines():
+                    error = line.strip()
+                    if error:
+                        self._errors.append(error[0].upper() + error[1:])
+            self._close_pipe(stderr)
+        # process.stdout is only ever piped on the send side (the receive
+        # side opens it as DEVNULL); if it's a distinct file object from the
+        # wrapped stream, close it too so it isn't leaked until GC.
+        stdout = getattr(self._process, 'stdout', None)
+        if stdout is not None and stdout is not self._stream:
+            self._close_pipe(stdout)
+        if rc != 0:
+            raise Exception('\n'.join(self._errors))
+
+    @staticmethod
+    def _close_pipe(pipe):
+        if getattr(pipe, 'closed', False):
+            return
+        try:
+            pipe.close()
+        except Exception:
+            pass
 
 
 class PropertyCommand:
@@ -668,7 +778,9 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         depth = kwargs.get('depth', 0)
         if depth > 0:
             cmd += ['-d', str(depth)]
-        cmd += ['-t', kwargs.get('types')]
+        types = kwargs.get('types')
+        if types:
+            cmd += ['-t', types]
 
         properties = kwargs.get('properties')
         if 'all' in properties:
@@ -716,9 +828,9 @@ class SetCommand(Command):
     @classmethod
     def _set(cls, ds: Datasets, properties: Properties) -> Datasets:
 
-        ds.update(properties)
         cmd = [_zfs_cmd(), 'set'] + cls._get_props(properties) + [str(ds)]
         cls._exec(cmd)
+        ds.update(properties)
 
         return ds
 
@@ -744,10 +856,10 @@ class InheritCommand(Command):
         if isinstance(props, str):
             props = [props]
 
-        ds.update(dict.fromkeys(props, None))
         for prop in props:
             cmd = [_zfs_cmd(), 'inherit', prop] + cls._get_options(recursive=recursive, received=received) + [str(ds)]
             cls._exec(cmd)
+            ds.update({prop: None})
 
         return ds
 
@@ -767,7 +879,7 @@ class SendCommand(Command):
         return self._send(*args, **kwargs)
 
     @classmethod
-    def _send(cls, ds: Datasets, *args, **kwargs) -> Optional[io.BufferedReader]:
+    def _send(cls, ds: Datasets, *args, **kwargs) -> 'StreamHandle':
         if isinstance(ds, Dataset):
             return cls.dataset(ds, *args, **kwargs)
         elif isinstance(ds, Snapshot):
@@ -777,7 +889,7 @@ class SendCommand(Command):
     def snapshot(cls, ds: Snapshot, since: Optional[Snapshot] = None, intermediate: bool = False,
                  replicate: bool = False, holds: bool = False, properties: bool = False, backup: bool = False,
                  raw: bool = False, compressed: bool = False, embed: bool = False, large_blocks: bool = False,
-                 skip_missing: bool = False) -> Optional[io.BufferedReader]:
+                 skip_missing: bool = False) -> 'StreamHandle':
 
         """Generate a send stream for a given ZFS snapshot
 
@@ -796,7 +908,8 @@ class SendCommand(Command):
             skip_missing: bool -- skip over missing snapshots (default False)
 
         Returns:
-            BufferedReader
+            StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
+                for the subprocess and raises on non-zero exit
         """
 
         cmd = [_zfs_cmd(), 'send'] + \
@@ -808,7 +921,7 @@ class SendCommand(Command):
 
     @classmethod
     def dataset(cls, ds: Dataset, since: Optional[Snapshot] = None, raw: bool = False, compressed: bool = False,
-                embed: bool = False, large_blocks: bool = False) -> Optional[io.BufferedReader]:
+                embed: bool = False, large_blocks: bool = False) -> 'StreamHandle':
 
         """Generate a send stream for a given ZFS dataset
 
@@ -821,7 +934,8 @@ class SendCommand(Command):
             large_blocks: bool -- generate a stream which may contain blocks larger than 128KB (default False)
 
         Returns:
-            BufferedReader
+            StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
+                for the subprocess and raises on non-zero exit
         """
 
         cmd = [_zfs_cmd(), 'send'] + \
@@ -833,7 +947,7 @@ class SendCommand(Command):
     @classmethod
     def redact(cls, ds: Snapshot, redact: Bookmark, since: Union[Snapshot, Bookmark, None] = None,
                properties: bool = False, compressed: bool = False, embed: bool = False,
-               large_blocks: bool = False) -> Optional[io.BufferedReader]:
+               large_blocks: bool = False) -> 'StreamHandle':
 
         """Generate a redacted send stream
 
@@ -847,7 +961,8 @@ class SendCommand(Command):
             large_blocks: bool -- generate a stream which may contain blocks larger than 128KB (default False)
 
         Returns:
-            BufferedReader
+            StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
+                for the subprocess and raises on non-zero exit
         """
 
         cmd = [_zfs_cmd(), 'send', '--redact', str(redact)] + \
@@ -857,7 +972,7 @@ class SendCommand(Command):
         return cls._exec_stream(cmd)
 
     @classmethod
-    def resume(cls, token: str, embed: bool = False) -> Optional[io.BufferedReader]:
+    def resume(cls, token: str, embed: bool = False) -> 'StreamHandle':
         """Creates a send stream which resumes an interrupted receive
 
          Keyword arguments:
@@ -865,13 +980,14 @@ class SendCommand(Command):
             embed: bool -- generate a more compact stream by using the embedded_data pool feature (default False)
 
         Returns:
-            BufferedReader
+            StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
+                for the subprocess and raises on non-zero exit
         """
         cmd = [_zfs_cmd(), 'send'] + cls._get_options(embed=embed) + ['-t', token]
         return cls._exec_stream(cmd)
 
     @classmethod
-    def partial(cls, ds: Dataset, since: Optional[Snapshot] = None) -> Optional[io.BufferedReader]:
+    def partial(cls, ds: Dataset, since: Optional[Snapshot] = None) -> 'StreamHandle':
         """Generate a send stream from a dataset that has been partially received
 
         Keyword arguments:
@@ -879,7 +995,8 @@ class SendCommand(Command):
             since: Snapshot -- generate incremental stream from the specified snapshot (default None)
 
         Returns:
-            BufferedReader
+            StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
+                for the subprocess and raises on non-zero exit
         """
 
         cmd = [_zfs_cmd(), 'send'] + cls._get_options(since=since) + ['-S', str(ds)]
@@ -922,16 +1039,18 @@ class SendCommand(Command):
         return cmd
 
     @classmethod
-    def _exec_stream(cls, cmd) -> Optional[io.BufferedReader]:
+    def _exec_stream(cls, cmd) -> 'StreamHandle':
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         errors = []
         while True:
             output = cls._exec_capture_bin(process, errors)
             if output is False:
-                break
+                # Process exited successfully without ever producing output
+                # (e.g. an empty stream); still hand back a StreamHandle so
+                # callers have a uniform close()/context-manager API.
+                return StreamHandle(process, process.stdout, errors)
             elif output is not None:
-                return output
-        return None
+                return StreamHandle(process, output, errors)
 
     @staticmethod
     def _exec_capture_bin(process, errors) -> Union[bool, io.BufferedReader, None]:
@@ -970,7 +1089,7 @@ class ReceiveCommand(Command, StringListArgument):
         return self._receive(*args, **kwargs)
 
     @classmethod
-    def _receive(cls, ds: Datasets, *args, **kwargs) -> Optional[io.BufferedWriter]:
+    def _receive(cls, ds: Datasets, *args, **kwargs) -> 'StreamHandle':
         if isinstance(ds, Filesystem):
             return cls.filesystem(ds, *args, **kwargs)
         else:
@@ -980,7 +1099,7 @@ class ReceiveCommand(Command, StringListArgument):
     def filesystem(cls, ds: Filesystem, props: Optional[Properties] = None, reset: Optional[StringList] = None,
                    origin: Optional[Snapshot] = None, force: bool = False, holds: bool = True, unmount: bool = False,
                    save: bool = False, mount: bool = True, ignore_first: bool = False,
-                   ignore_all: bool = False) -> Optional[io.BufferedWriter]:
+                   ignore_all: bool = False) -> 'StreamHandle':
 
         """Receive ZFS filesystem stream
 
@@ -998,7 +1117,8 @@ class ReceiveCommand(Command, StringListArgument):
             ignore_all: bool -- discard all but the last part of snapshot filesystem name (default False)
 
         Returns:
-            BufferedWriter
+            StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
+                for the subprocess and raises on non-zero exit
         """
         cmd = [_zfs_cmd(), 'receive'] + \
             cls._get_options(props=props, reset=reset, origin=origin, force=force, holds=holds, unmount=unmount,
@@ -1009,7 +1129,7 @@ class ReceiveCommand(Command, StringListArgument):
     @classmethod
     def dataset(cls, ds: Datasets, props: Optional[Properties] = None, reset: Optional[StringList] = None,
                 origin: Optional[Snapshot] = None, force: bool = False, holds: bool = True, unmount: bool = False,
-                save: bool = False, mount: bool = True) -> Optional[io.BufferedWriter]:
+                save: bool = False, mount: bool = True) -> 'StreamHandle':
 
         """Receive ZFS filesystem stream
 
@@ -1025,7 +1145,8 @@ class ReceiveCommand(Command, StringListArgument):
             mount: bool -- whether to mount the received filesystem (default True)
 
         Returns:
-            BufferedWriter
+            StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
+                for the subprocess and raises on non-zero exit
         """
         cmd = [_zfs_cmd(), 'receive'] + \
             cls._get_options(props=props, reset=reset, origin=origin, force=force, holds=holds, unmount=unmount,
@@ -1089,14 +1210,19 @@ class ReceiveCommand(Command, StringListArgument):
         return cmd
 
     @classmethod
-    def _exec_stream_in(cls, cmd) -> Optional[io.BufferedWriter]:
-        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    def _exec_stream_in(cls, cmd) -> 'StreamHandle':
+        # Only stdin (the stream we write to) and stderr (for error
+        # reporting) are ever read from; stdout is intentionally discarded
+        # (not piped) since nothing drains it and a chatty child could
+        # otherwise fill the pipe and block on write(), deadlocking close()'s
+        # process.wait().
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         # Poll once to catch immediate startup failures; zfs receive emits no stderr while waiting for data
         rc = process.poll()
         if rc is not None and rc != 0:
             errors = process.stderr.read().decode('utf-8', errors='replace').strip()
             raise Exception(errors or f'Command failed with exit code {rc}')
-        return process.stdin
+        return StreamHandle(process, process.stdin)
 
 
 class LoadKeyCommand(Command):

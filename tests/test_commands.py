@@ -2,6 +2,7 @@
 
 import pytest
 import io
+import subprocess
 import threading
 from unittest.mock import MagicMock, call
 from libzfseasy.zfs import (
@@ -10,7 +11,7 @@ from libzfseasy.zfs import (
     InheritCommand, SendCommand, ReceiveCommand, MountCommand, UnMountCommand,
     AllowCommand, UnAllowCommand, LoadKeyCommand, UnLoadKeyCommand, ChangeKeyCommand,
     PropertyCommand, StringListArgument, DatasetListArgument, ZFSListArgument,
-    Command,
+    Command, _TERMINATE_TIMEOUT,
 )
 from libzfseasy.types import Dataset, Filesystem, Volume, Snapshot, SnapshotRange, Bookmark
 
@@ -443,39 +444,83 @@ class TestSetCommand:
         result = cmd(sample_filesystem, properties)
         
         assert result['compression'].value == 'gzip'
-        
+
         call_args = mock_subprocess.call_args[0][0]
         assert 'set' in call_args
         assert 'compression=gzip' in call_args
 
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_set_failure_raises_and_leaves_properties_unchanged(self, mock_subprocess, sample_pool):
+        """SetCommand._set() now calls ds.update() only *after* cls._exec()
+        succeeds, so a failing subprocess must both raise and leave the
+        dataset's in-memory properties exactly as they were before the call."""
+        fs = Filesystem(f'{sample_pool}/filesystem', {'compression': 'lz4'})
+        mock_subprocess.setup(returncode=1, stderr='cannot set property: invalid property value')
+
+        cmd = SetCommand()
+        with pytest.raises(Exception):
+            cmd(fs, {'compression': 'gzip'})
+
+        # Property must still hold its original value, not the attempted one.
+        assert fs['compression'].value == 'lz4'
+
 
 class TestInheritCommand:
     """Tests for InheritCommand class."""
-    
+
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_inherit_property(self, mock_subprocess, sample_filesystem):
         """Test inheriting a property."""
         mock_subprocess.setup()
-        
+
         cmd = InheritCommand()
         result = cmd(sample_filesystem, 'compression')
-        
+
         call_args = mock_subprocess.call_args[0][0]
         assert 'inherit' in call_args
         assert 'compression' in call_args
-    
+
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_inherit_property_recursive(self, mock_subprocess, sample_filesystem):
         """Test inheriting property recursively."""
         mock_subprocess.setup()
-        
+
         cmd = InheritCommand()
         result = cmd(sample_filesystem, 'compression', recursive=True)
-        
+
         call_args = mock_subprocess.call_args[0][0]
         assert '-r' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_inherit_partial_failure_commits_processed_props_only(self, mock_subprocess, sample_pool):
+        """InheritCommand._inherit() now commits ds.update({prop: None}) for
+        each property right after its own `zfs inherit` call succeeds
+        (per-prop commit), instead of clearing every property up front. If a
+        call partway through the list fails, properties already processed
+        must be cleared, but the failed property and anything after it must
+        retain their original values."""
+        fs = Filesystem(f'{sample_pool}/filesystem', {
+            'compression': 'lz4', 'quota': '10G', 'atime': 'on',
+        })
+        mock_subprocess.setup_multi(
+            ([''],),               # inherit compression -- succeeds
+            ([''], 'boom', 1),     # inherit quota -- fails
+            # atime's `zfs inherit` call is never reached
+        )
+
+        cmd = InheritCommand()
+        with pytest.raises(Exception):
+            cmd(fs, ['compression', 'quota', 'atime'])
+
+        # Processed before the failure: cleared (inherited -> no local value).
+        assert fs['compression'] is None
+        # The failed call and anything after it: untouched.
+        assert fs['quota'].value == '10G'
+        assert fs['atime'].value == 'on'
 
 
 class TestSendCommand:
@@ -760,6 +805,17 @@ class TestListCommandOptions:
         call_args = mock_subprocess.call_args[0][0]
         assert '-t' in call_args
         assert 'filesystem' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_types_none_omits_dash_t(self, mock_subprocess):
+        """types=None must not emit a bare '-t' flag (locks in existing,
+        already-correct ListCommand guard: `if types:` before appending)."""
+        mock_subprocess.setup(stdout=['testpool/fs\tfilesystem\n'])
+        cmd = ListCommand()
+        cmd(types=None)
+        call_args = mock_subprocess.call_args[0][0]
+        assert '-t' not in call_args
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -1140,3 +1196,79 @@ class TestExecCaptureRegressions:
 
         assert not any(isinstance(exc.exc_value, IndexError) for exc in thread_exceptions), \
             'A background thread raised IndexError while processing a blank stderr line'
+
+    @pytest.mark.unit
+    def test_exec_capture_eof_but_poll_none_calls_wait(self):
+        """Regression test for the EOF-but-still-running race: stdout hits
+        EOF (readline() == '') while poll() still reports None (the child
+        hasn't been reaped by the OS yet). _exec_capture must resolve the
+        return code by blocking on process.wait() rather than returning
+        None and leaving the caller's `while True` loop to spin on
+        readline()/poll() until the child eventually shows up as exited."""
+        process = MagicMock()
+        process.stdout.readline.return_value = ''
+        process.poll.return_value = None
+        process.wait.return_value = 0
+
+        result = Command._exec_capture(process, [])
+
+        process.wait.assert_called_once()
+        assert result is False
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_out_abandoned_generator_terminates_child(self, mock_subprocess):
+        """_exec_out() is a generator; if the caller abandons it mid-iteration
+        (breaks out of a `for` loop, or just drops the reference and lets it
+        get garbage collected) while the child is still running, the
+        generator's `finally` block must terminate the child, reap it, and
+        join the stderr-reader thread -- rather than leaking a background
+        thread and an orphaned/zombie subprocess."""
+        process = MagicMock()
+        process.stdout.readline.side_effect = ['row1\n', 'row2\n', 'row3\n', '']
+        process.stderr.readline.return_value = ''
+        process.poll.return_value = None  # still "running" from the caller's POV
+        process.wait.return_value = 0
+        mock_subprocess.return_value = process
+
+        gen = Command._exec_out(['zfs', 'list'])
+        first = next(gen)
+        assert first == 'row1'
+
+        # Abandon the generator mid-iteration.
+        gen.close()
+
+        process.terminate.assert_called_once()
+        assert process.wait.called
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_out_abandoned_generator_escalates_to_kill_on_terminate_timeout(self, mock_subprocess):
+        """Regression test for the SIGTERM-ignore escalation path: if the
+        abandoned child doesn't honor terminate() within _TERMINATE_TIMEOUT
+        seconds (process.wait(timeout=...) raises TimeoutExpired), the
+        finally block must escalate to kill() and reap the child rather than
+        blocking forever (or leaving a zombie/orphaned process). The existing
+        abandoned-generator test uses a MagicMock whose wait() never raises,
+        so it doesn't exercise this fallback."""
+        process = MagicMock()
+        process.stdout.readline.side_effect = ['row1\n', 'row2\n', 'row3\n', '']
+        process.stderr.readline.return_value = ''
+        process.poll.return_value = None  # still "running" from the caller's POV
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd='zfs', timeout=_TERMINATE_TIMEOUT),
+            0,  # wait() after kill()
+            0,  # final wait() after stderr_thread.join()
+        ]
+        mock_subprocess.return_value = process
+
+        gen = Command._exec_out(['zfs', 'list'])
+        first = next(gen)
+        assert first == 'row1'
+
+        # Abandon the generator mid-iteration; the child ignores SIGTERM.
+        gen.close()
+
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        assert process.wait.call_count == 3

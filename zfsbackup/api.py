@@ -168,7 +168,16 @@ def create_app(config: BackupConfig) -> Flask:
             ws.send(json.dumps({'status': 'ok', 'dry_run': True}))
             return
 
-        writer = zfs.receive.filesystem(server_fs, force=True, save=True, mount=False)
+        # zfs.receive.filesystem() returns a StreamHandle wrapping the `zfs
+        # receive` process's stdin. Startup failures now raise immediately
+        # instead of returning None; the `is None` check below is kept for
+        # defensive/backwards compatibility but real callers should expect
+        # an exception here.
+        try:
+            writer = zfs.receive.filesystem(server_fs, force=True, save=True, mount=False)
+        except Exception as e:
+            ws.send(json.dumps({'error': f'Failed to start zfs receive: {e}'}))
+            return
         if writer is None:
             ws.send(json.dumps({'error': 'Failed to start zfs receive'}))
             return
@@ -182,9 +191,18 @@ def create_app(config: BackupConfig) -> Flask:
                         break
                 else:
                     writer.write(data)
+            # writer.close() (StreamHandle.__exit__/close()) waits on the
+            # `zfs receive` subprocess and raises if it exited non-zero. That
+            # must happen only after all chunks have been written above (done
+            # here); if it raises, we fall through to the `except Exception`
+            # branch below, which reports the error to the client instead of
+            # sending 'status: ok'.
             writer.close()
             ws.send(json.dumps({'status': 'ok'}))
         except ConnectionClosed:
+            # Client already disconnected; best-effort reap the `zfs
+            # receive` process. Any error it raises here can't be reported
+            # back (the socket is gone) so it's intentionally suppressed.
             with contextlib.suppress(Exception):
                 writer.close()
         except Exception as e:
