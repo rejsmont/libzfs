@@ -205,8 +205,13 @@ class TestZFS:
 
     @pytest.mark.unit
     def test_getattr_wrong_type_prop_raises(self):
+        """__getattr__ raises AttributeError (not ValueError) for a property
+        that is a valid ZFS property in general but not applicable to this
+        object's type, matching Python's attribute-access protocol so that
+        hasattr()/getattr(default=)/copy.deepcopy() work correctly. See also
+        TestGetAttrAttributeErrorRegression below."""
         fs = Filesystem('pool/fs')
-        with pytest.raises(ValueError):
+        with pytest.raises(AttributeError):
             _ = fs.volsize
 
     @pytest.mark.unit
@@ -555,3 +560,41 @@ class TestZFSFromName:
         """Test creating ZFS object with invalid type."""
         with pytest.raises(ValueError):
             ZFS.from_name('pool/dataset', 'invalid')
+
+
+class TestGetAttrAttributeErrorRegression:
+    """Regression tests: ZFS.__getattr__ must raise AttributeError (not ValueError)
+    for a missing/invalid attribute, so that hasattr() and copy.deepcopy() behave
+    correctly. Prior to the fix, __getattr__ let ValueError escape (via
+    Validate.attribute), which hasattr() does not catch and which breaks
+    copy.deepcopy()'s probing of dunder methods (e.g. __deepcopy__)."""
+
+    @pytest.mark.unit
+    def test_getattr_nonexistent_attr_raises_attributeerror(self):
+        fs = Filesystem('pool/fs')
+        with pytest.raises(AttributeError):
+            _ = fs.nonexistent_attr
+
+    @pytest.mark.unit
+    def test_getattr_dunder_attr_raises_attributeerror(self):
+        """copy/pickle probe dunder attributes like __deepcopy__ via getattr();
+        these must raise AttributeError, not ValueError, or deepcopy() breaks."""
+        fs = Filesystem('pool/fs')
+        with pytest.raises(AttributeError):
+            _ = fs.__deepcopy__
+
+    @pytest.mark.unit
+    def test_hasattr_returns_false_for_invalid_attr(self):
+        fs = Filesystem('pool/fs')
+        assert hasattr(fs, 'nonexistent_attr') is False
+
+    @pytest.mark.unit
+    def test_deepcopy_works(self):
+        """copy.deepcopy() relies on getattr() raising AttributeError (not
+        ValueError) when probing for __deepcopy__/__reduce_ex__/etc."""
+        import copy
+        fs = Filesystem('pool/fs', {'compression': 'lz4'})
+        fs_copy = copy.deepcopy(fs)
+        assert fs_copy is not fs
+        assert fs_copy.name == fs.name
+        assert fs_copy['compression'].value == 'lz4'

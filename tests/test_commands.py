@@ -2,6 +2,7 @@
 
 import pytest
 import io
+import threading
 from unittest.mock import MagicMock, call
 from libzfseasy.zfs import (
     ListCommand, CreateCommand, SnapshotCommand, BookmarkCommand,
@@ -9,6 +10,7 @@ from libzfseasy.zfs import (
     InheritCommand, SendCommand, ReceiveCommand, MountCommand, UnMountCommand,
     AllowCommand, UnAllowCommand, LoadKeyCommand, UnLoadKeyCommand, ChangeKeyCommand,
     PropertyCommand, StringListArgument, DatasetListArgument, ZFSListArgument,
+    Command,
 )
 from libzfseasy.types import Dataset, Filesystem, Volume, Snapshot, SnapshotRange, Bookmark
 
@@ -73,11 +75,43 @@ class TestListCommand:
         
         cmd = ListCommand()
         result = cmd(lazy=True)
-        
+
         # Result should be a generator
         assert hasattr(result, '__iter__')
         items = list(result)
         assert len(items) == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_property_value_with_space_not_over_split(self, mock_subprocess, sample_pool):
+        """Regression test: `zfs list -H` output is tab-delimited, but a property
+        value (e.g. mountpoint) may legitimately contain spaces. The parser must
+        split on tabs only, not on arbitrary whitespace (str.split()), or the
+        value gets truncated/mangled."""
+        mock_subprocess.setup(stdout=[
+            f'{sample_pool}/filesystem\tfilesystem\t/mnt/my data\n'
+        ])
+
+        cmd = ListCommand()
+        result = cmd(properties=['mountpoint'])
+
+        assert len(result) == 1
+        assert result[0].name == f'{sample_pool}/filesystem'
+        assert isinstance(result[0], Filesystem)
+        assert result[0]['mountpoint'].value == '/mnt/my data'
+
+    @pytest.mark.unit
+    def test_line_to_object_property_value_with_space(self, sample_pool):
+        """Direct unit test of _line_to_object against a tab-delimited line
+        whose value contains an internal space."""
+        properties = ['name', 'type', 'mountpoint']
+        line = f'{sample_pool}/filesystem\tfilesystem\t/mnt/my data'
+
+        obj = ListCommand._line_to_object(line, properties)
+
+        assert obj.name == f'{sample_pool}/filesystem'
+        assert isinstance(obj, Filesystem)
+        assert obj['mountpoint'].value == '/mnt/my data'
 
 
 class TestCreateCommand:
@@ -998,3 +1032,111 @@ class TestRenameCommandExtended:
         cmd = RenameCommand()
         with pytest.raises(ValueError, match='Snapshots can only be renamed within the parent dataset'):
             cmd.snapshot(sample_snapshot, 'testpool/other@snap2')
+
+
+class TestExecCaptureRegressions:
+    """Regression tests for two bugs around Command's stdout/stderr draining
+    (libzfseasy/zfs.py):
+
+    1. A deadlock/hang when reading large stdout with little or no stderr. The
+       fix drains stdout and stderr independently (stderr is read on a
+       dedicated background thread via `Command._start_stderr_reader`, decoupled
+       from the stdout-reading loop in `_exec_capture`) so that a full stdout
+       pipe can never be blocked behind a stderr read, and vice versa. The
+       mock_subprocess fixture does not use real OS pipes (it drives
+       MagicMock.readline via side_effect lists), so it cannot reproduce the
+       actual blocking behavior of subprocess.PIPE. The tests below therefore
+       focus on what is fully testable through the fixture: correct, complete
+       parsing of a large multi-row result, and that stderr draining runs to
+       completion independently. A true no-hang guarantee under real OS pipe
+       backpressure would require a real subprocess/pipe based test (see
+       tests/test_real_zfs.py).
+
+    2. An IndexError raised when a stderr line is present but strips down to an
+       empty string (e.g. stderr == '\\n' or 'warning\\n\\n'), because the code
+       used to do `error[0].upper()` on the stripped (possibly empty) string
+       without checking its length first. This logic now lives inside the
+       stderr-reader thread's loop.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_large_stdout_returns_all_rows(self, mock_subprocess, sample_pool):
+        """Feed a large `zfs list -H` output (well over 64KB) with empty stderr
+        and assert every row is parsed back correctly without hanging."""
+        row_count = 5000
+        rows = [f'{sample_pool}/fs{i}\tfilesystem\n' for i in range(row_count)]
+        # Sanity-check the payload actually exceeds 64KB, per the bug report.
+        assert sum(len(r) for r in rows) > 64 * 1024
+
+        mock_subprocess.setup(stdout=rows, stderr='')
+
+        cmd = ListCommand()
+        result = cmd()
+
+        assert len(result) == row_count
+        assert result[0].name == f'{sample_pool}/fs0'
+        assert result[-1].name == f'{sample_pool}/fs{row_count - 1}'
+        assert all(isinstance(o, Filesystem) for o in result)
+
+    @pytest.mark.unit
+    def test_stderr_reader_blank_line_no_indexerror(self):
+        """Direct unit test of the stderr-draining helper: a stderr line
+        consisting only of a newline strips to '', and indexing error[0] must
+        not raise IndexError. Because the reader runs on a background thread,
+        an uncaught exception there would not normally fail the test, so we
+        install a temporary threading.excepthook to detect it."""
+        process = MagicMock()
+        process.stderr.readline.side_effect = ['\n', '   \n', 'real problem\n', '']
+
+        errors = []
+        thread_exceptions = []
+        original_hook = threading.excepthook
+
+        def hook(args):
+            thread_exceptions.append(args)
+
+        threading.excepthook = hook
+        try:
+            thread = Command._start_stderr_reader(process, errors)
+            thread.join(timeout=5)
+        finally:
+            threading.excepthook = original_hook
+
+        assert not thread.is_alive(), 'stderr reader thread did not finish'
+        assert not any(isinstance(exc.exc_value, IndexError) for exc in thread_exceptions), \
+            'stderr reader raised IndexError on a blank stderr line'
+        # Blank/whitespace-only lines contribute nothing; the real line is kept.
+        assert errors == ['Real problem']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_command_blank_stderr_line_no_indexerror(self, mock_subprocess, sample_pool):
+        """End-to-end: run a command through the mocked subprocess where a
+        stderr line is present but blank after stripping; must not raise
+        IndexError, whether that happens inline or on a background thread."""
+        mock_subprocess.setup(stdout=[''], stderr=['\n'])
+
+        thread_exceptions = []
+        original_hook = threading.excepthook
+
+        def hook(args):
+            thread_exceptions.append(args)
+
+        threading.excepthook = hook
+        try:
+            cmd = CreateCommand()
+            try:
+                cmd.filesystem(f'{sample_pool}/newfs')
+            except IndexError:
+                pytest.fail('Command._exec raised IndexError on a blank stderr line')
+            # Give any background stderr-reader thread a moment to run and
+            # report via excepthook before we check.
+            for t in threading.enumerate():
+                if t is not threading.main_thread():
+                    t.join(timeout=1)
+        finally:
+            threading.excepthook = original_hook
+
+        assert not any(isinstance(exc.exc_value, IndexError) for exc in thread_exceptions), \
+            'A background thread raised IndexError while processing a blank stderr line'

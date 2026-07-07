@@ -91,6 +91,24 @@ class TestAllowCommand:
         with pytest.raises(TypeError):
             AllowCommand._base(True, None, recursive=True)
 
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_allow_everyone_argv_no_none_token(self, mock_subprocess, sample_filesystem):
+        """Regression test: AllowCommand(ds, perms, everyone=True) must build the
+        argv with a bare '-e' flag (no trailing users argument), not ['-e', None]
+        (users is None in this branch since everyone/users are mutually
+        exclusive). A None token in argv would break subprocess.Popen or get
+        stringified as the literal text 'None'."""
+        mock_subprocess.setup()
+        AllowCommand()(sample_filesystem, 'create', everyone=True)
+
+        call_args = mock_subprocess.call_args[0][0]
+
+        assert '-e' in call_args
+        assert None not in call_args
+        # Also guard against the None being coerced to the string 'None'
+        assert 'None' not in call_args
+
 
 class TestUnAllowCommand:
 
@@ -645,6 +663,64 @@ class TestChangeKeyCommand:
         ChangeKeyCommand()(sample_filesystem, iterations=200000)
         call_args = mock_subprocess.call_args[0][0]
         assert any('pbkdf2iters' in a for a in call_args)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_change_key_location_argv_tokens_split(self, mock_subprocess, sample_filesystem):
+        """Regression test: `-o keylocation=...` must be built as two separate
+        argv tokens ('-o', 'keylocation=...'), not a single '-o keylocation=...'
+        token (which the real `zfs change-key` CLI would reject/mis-parse)."""
+        mock_subprocess.setup()
+        ChangeKeyCommand()(sample_filesystem, location='/etc/key')
+        call_args = mock_subprocess.call_args[0][0]
+
+        idx = call_args.index('-o')
+        assert call_args[idx + 1] == 'keylocation=/etc/key'
+        assert '-o keylocation=/etc/key' not in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_change_key_format_argv_tokens_split(self, mock_subprocess, sample_filesystem):
+        """Regression test: `-o keyformat=...` must be two separate argv tokens."""
+        mock_subprocess.setup()
+        ChangeKeyCommand()(sample_filesystem, fmt='passphrase')
+        call_args = mock_subprocess.call_args[0][0]
+
+        idx = call_args.index('-o')
+        assert call_args[idx + 1] == 'keyformat=passphrase'
+        assert '-o keyformat=passphrase' not in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_change_key_iterations_argv_tokens_split(self, mock_subprocess, sample_filesystem):
+        """Regression test: `-o pbkdf2iters=...` must be two separate argv tokens."""
+        mock_subprocess.setup()
+        ChangeKeyCommand()(sample_filesystem, iterations=200000)
+        call_args = mock_subprocess.call_args[0][0]
+
+        idx = call_args.index('-o')
+        assert call_args[idx + 1] == 'pbkdf2iters=200000'
+        assert '-o pbkdf2iters=200000' not in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_change_key_multiple_options_all_split_into_separate_tokens(
+            self, mock_subprocess, sample_filesystem):
+        """Regression test: when location, fmt and iterations are all given,
+        every `-o key=value` pair must appear as its own pair of argv tokens,
+        with exactly three '-o' flags (one per option)."""
+        mock_subprocess.setup()
+        ChangeKeyCommand()(sample_filesystem, location='/etc/key',
+                           fmt='passphrase', iterations=200000)
+        call_args = mock_subprocess.call_args[0][0]
+
+        assert call_args.count('-o') == 3
+        assert 'keylocation=/etc/key' in call_args
+        assert 'keyformat=passphrase' in call_args
+        assert 'pbkdf2iters=200000' in call_args
+        # None of these should ever be glued to the '-o' flag as one token.
+        for token in call_args:
+            assert token == '-o' or not token.startswith('-o ')
 
 
 class TestMountCommandExtended:

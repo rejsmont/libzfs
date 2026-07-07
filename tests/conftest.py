@@ -26,8 +26,15 @@ def mock_subprocess(mocker):
         # Setup stderr
         if isinstance(stderr, list):
             process_mock.stderr.readline.side_effect = stderr + ['']
+        elif stderr == '':
+            # Empty string already signals EOF on the very first read.
+            process_mock.stderr.readline.return_value = ''
         else:
-            process_mock.stderr.readline.return_value = stderr
+            # libzfseasy drains stderr on a dedicated background thread that
+            # loops "while readline() != ''". A constant non-empty
+            # return_value would make that thread (and any stderr_thread.join())
+            # spin/hang forever, so terminate after a single line.
+            process_mock.stderr.readline.side_effect = [stderr, '']
         
         # Setup return code
         process_mock.poll.side_effect = [None] * len(stdout) + [returncode] if isinstance(stdout, list) else [returncode]

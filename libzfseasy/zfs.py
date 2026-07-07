@@ -7,6 +7,7 @@ import os
 import select
 import subprocess
 import shutil
+import threading
 
 # Allow configuring zfs and zpool commands via environment variables
 ZFS_BIN = os.environ.get('ZFS_CMD') or shutil.which('zfs')
@@ -53,8 +54,9 @@ class Command:
             print('Executing command: ' + ' '.join(cmd))
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         errors = []
+        stderr_thread = cls._start_stderr_reader(process, errors)
         while True:
-            output = cls._exec_capture(process, errors)
+            output = cls._exec_capture(process, errors, stderr_thread)
             if output is False:
                 break
 
@@ -64,24 +66,39 @@ class Command:
             print('Executing command: ' + ' '.join(cmd))
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         errors = []
+        stderr_thread = cls._start_stderr_reader(process, errors)
         while True:
-            output = cls._exec_capture(process, errors)
+            output = cls._exec_capture(process, errors, stderr_thread)
             if output is False:
                 break
             elif output != '' and output is not None:
                 yield output
 
     @staticmethod
-    def _exec_capture(process, errors):
+    def _start_stderr_reader(process, errors):
+        # Drain stderr in a dedicated thread so a full stderr pipe can never
+        # block the child while we read stdout (and vice versa).
+        def reader():
+            while True:
+                line = process.stderr.readline()
+                if line == '':
+                    break
+                error = line.strip()
+                if error:
+                    errors.append(error[0].upper() + error[1:])
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        return thread
+
+    @staticmethod
+    def _exec_capture(process, errors, stderr_thread=None):
         stdout = process.stdout.readline()
-        stderr = process.stderr.readline()
         rc = process.poll()
-        if stderr:
-            error = stderr.strip()
-            errors.append(error[0].upper() + error[1:])
         if stdout != '':
             return stdout.strip()
-        if stdout == '' and stderr == '' and rc is not None:
+        if stdout == '' and rc is not None:
+            if stderr_thread is not None:
+                stderr_thread.join()
             if rc != 0:
                 raise Exception('\n'.join(errors))
             return False
@@ -226,7 +243,7 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
 
     @staticmethod
     def _line_to_object(line: str, properties: Iterable):
-        zfs_info = line.split()
+        zfs_info = line.split('\t')
         zfs_info = [i if not i == '-' else None for i in zfs_info]
         name, dstype = zfs_info[0:2]
         if len(zfs_info) > 2:
@@ -535,7 +552,7 @@ class AllowCommand(Command, StringListArgument):
         if everyone:
             if users or groups:
                 raise ValueError('Everyone and users or groups cannot be specified simultaneously')
-            cmd += ['-e', users]
+            cmd += ['-e']
         else:
             if users:
                 cmd += ['-u', cls._slist_to_str(users)]
@@ -1203,11 +1220,11 @@ class ChangeKeyCommand(Command):
         if kwargs.get('load', None):
             cmd += ['-l']
         if location:
-            cmd += ['-o keylocation=' + location]
+            cmd += ['-o', 'keylocation=' + location]
         if fmt:
-            cmd += ['-o keyformat=' + fmt]
+            cmd += ['-o', 'keyformat=' + fmt]
         if iterations:
-            cmd += ['-o pbkdf2iters=' + str(iterations)]
+            cmd += ['-o', 'pbkdf2iters=' + str(iterations)]
 
         return cmd
 

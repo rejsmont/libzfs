@@ -196,12 +196,12 @@ class ZFS:
                 raise ValueError(k + ' is not a valid ' + self.__class__.__name__ + ' property')
 
     def __getattr__(self, k: str) -> Optional[Property]:
-        Validate.attribute(k)
         try:
+            Validate.attribute(k)
             i = self._prop_names.index(k)
             return self._props.get(i, None)
         except ValueError:
-            raise ValueError(k + ' is not a valid ' + self.__class__.__name__ + ' property')
+            raise AttributeError(k + ' is not a valid ' + self.__class__.__name__ + ' property')
 
     def __contains__(self, k: str) -> bool:
         Validate.attribute(k)
