@@ -28,13 +28,13 @@ Real ZFS tests require a test pool. Use the provided helper script:
 
 ```bash
 # Create a test pool
-./setup_test_pool.sh
+./scenarios/setup_test_pool.sh
 
 # Run real ZFS tests
 pytest -m real_zfs
 
 # Clean up when done
-./cleanup_test_pool.sh
+./scenarios/cleanup_test_pool.sh
 ```
 
 See [tests/README.md](tests/README.md) for detailed testing documentation.

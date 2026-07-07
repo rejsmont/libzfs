@@ -4,7 +4,7 @@
 # All datasets use mountpoint=none to avoid cluttering the desktop.
 #
 # Usage:
-#   ./create_test_pool.sh [pool_name]
+#   ./scenarios/create_test_pool.sh [pool_name]
 #
 # Default pool name: libzfs_test
 #

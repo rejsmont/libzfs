@@ -1,7 +1,7 @@
 # Example configuration for ZFS Backup Daemon
 #
-# This file targets the test pool created by create_test_pool.sh.
-# Run the script first:  sudo ./create_test_pool.sh
+# This file targets the test pool created by scenarios/create_test_pool.sh.
+# Run the script first:  sudo ./scenarios/create_test_pool.sh
 #
 # A single daemon can act as both a backup client (destinations + dataset remote: lists)
 # and a backup server (remote_backup section) simultaneously.

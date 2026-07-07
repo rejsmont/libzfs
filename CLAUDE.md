@@ -28,9 +28,9 @@ pytest -m integration
 
 **Run real ZFS integration tests (requires a test pool):**
 ```bash
-./setup_test_pool.sh        # create file-backed pool
+./scenarios/setup_test_pool.sh        # create file-backed pool
 pytest -m real_zfs
-./cleanup_test_pool.sh      # destroy pool when done
+./scenarios/cleanup_test_pool.sh      # destroy pool when done
 ```
 
 **Run the backup daemon:**

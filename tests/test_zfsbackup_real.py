@@ -2,15 +2,15 @@
 
 REQUIREMENTS:
 - ZFS must be installed and available
-- Either passwordless sudo for zpool/zfs OR run ./setup_test_pool.sh first
+- Either passwordless sudo for zpool/zfs OR run ./scenarios/setup_test_pool.sh first
 
 SETUP (automatic, if you have NOPASSWD sudo for zpool/zfs):
   pytest -m real_zfs
 
 SETUP (manual):
-  ./setup_test_pool.sh
+  ./scenarios/setup_test_pool.sh
   pytest -m real_zfs
-  ./cleanup_test_pool.sh
+  ./scenarios/cleanup_test_pool.sh
 """
 
 import subprocess
@@ -93,7 +93,7 @@ def source_fs(auto_zfs_pool):
     if auto_zfs_pool is None:
         pytest.skip(
             'ZFS pool not available — install ZFS and grant NOPASSWD sudo for zpool/zfs, '
-            'or run ./setup_test_pool.sh first'
+            'or run ./scenarios/setup_test_pool.sh first'
         )
     name = f'{auto_zfs_pool.name}/zfsbackup_source'
     existing = Filesystem(name)
@@ -116,7 +116,7 @@ def target_root(auto_zfs_pool):
     if auto_zfs_pool is None:
         pytest.skip(
             'ZFS pool not available — install ZFS and grant NOPASSWD sudo for zpool/zfs, '
-            'or run ./setup_test_pool.sh first'
+            'or run ./scenarios/setup_test_pool.sh first'
         )
     name = f'{auto_zfs_pool.name}/zfsbackup_target'
     existing = Filesystem(name)
