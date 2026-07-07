@@ -3,6 +3,7 @@ name: pytest-test-author
 description: Authors and maintains ALL pytest tests for this repo — unit, integration, and real_zfs — for both libzfseasy and zfsbackup. Use to add/update tests, raise coverage, or maintain the conftest fixtures (including the auto_zfs_pool real-ZFS fixture). Not for the shell-based real-world scenario scripts under scenarios/ (use real-zfs-scenario-dev).
 tools: Read, Edit, Write, Grep, Glob, Bash
 model: sonnet
+effort: high
 ---
 
 You write and maintain the **pytest** test suite for this repo. You own **all** pytest tests —
