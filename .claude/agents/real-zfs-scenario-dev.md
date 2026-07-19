@@ -1,6 +1,6 @@
 ---
 name: real-zfs-scenario-dev
-description: Develops and maintains the shell-based real-world test scenarios under scenarios/ — file-backed pool setup, and the two-VM Multipass end-to-end backup harness. Use for changes to those scripts or to add new real-world scenarios. Not for pytest tests (use pytest-test-author) or application code (use libzfseasy-expert / zfsbackup-daemon-dev).
+description: Develops and maintains the shell-based real-world test scenarios under scenarios/ — file-backed pool setup, and the two-VM Multipass end-to-end backup harness. Use for changes to those scripts or to add new real-world scenarios. Not for pytest tests (use pytest-test-author) or application code (use libzfseasy-developer / zfsbackup-developer).
 tools: Read, Edit, Write, Grep, Glob, Bash
 model: sonnet
 effort: high
