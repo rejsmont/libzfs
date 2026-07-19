@@ -65,5 +65,5 @@ Patches `subprocess.Popen` (via `pytest-mock`). Use it for anything that shells 
 - After writing a test, run exactly it: `pytest path::Class::test`; for real tests use
   `pytest -m real_zfs` (they skip cleanly if no pool). Keep or raise coverage; add `--strict-markers`
   clean markers.
-- Trust the source over CLAUDE.md (it is stale). When testing behavior, read the implementation
+- Trust the source when it disagrees with any doc. When testing behavior, read the implementation
   first so mocked stdout matches what the real command emits.

@@ -27,26 +27,18 @@ When producing a plan:
 - **Map risks.** Call out what else could break, shared code paths, backward-compat concerns, and
   any hazards specific to the change (pipes, streams, process cleanup, etc.).
 - **Assign owners.** Route each unit to the right executor:
-  - `libzfseasy-expert` → `libzfseasy/` code (`types.py`, `zfs.py`)
+  - `libzfseasy-developer` → `libzfseasy/` code (`types.py`, `zfs.py`)
   - `pytest-test-author` → tests + conftest
   - `real-zfs-scenario-dev` → shell scenarios
   - `zfs-code-reviewer` → final review
   Note what can proceed in parallel vs. serially.
 - **Defer thoughtfully.** Explicitly list findings you recommend NOT doing now, with a brief reason,
   so nothing is silently dropped.
-
-## Output format
-
-Produce a single, ordered, structured plan:
-- Every item cites its basis (finding, request, or your judgment call).
-- Work units are small enough for one agent to execute in one pass.
-- Each item is independently approvable — the user can say yes to some and no to others.
-- Assumptions are stated plainly inline.
-- Make no edits to any file — you produce a plan, not code.
-
-**Close with "For your approval": a brief summary of what you're proposing, any open questions or
-assumptions that need confirmation, and an explicit invitation for the user to approve, adjust,
-reprioritize, or drop items before implementation begins.
+- **Tag a risk tier.** Mark every item `low-risk` or `needs-approval`. `needs-approval` covers any
+  change to the exec/stream contract, breaking public-API changes (renaming a `zfs.*` singleton,
+  altering `Validate`/error conventions, changing the integer-index property storage), pipe/stream
+  or process-cleanup hazards, and anything you are genuinely uncertain about. Everything else is
+  `low-risk`. This tier drives loop-mode auto-approval (see the closing section).
 
 ## libzfseasy-specific facts to plan around
 
@@ -92,7 +84,7 @@ reprioritize, or drop items before implementation begins.
 
 **Repo hygiene:**
 - Default branch is `master`; branch before committing.
-- CLAUDE.md is partially stale (references nonexistent `SnapshotManager`). Trust the source.
+- Trust the source when it disagrees with any doc (CLAUDE.md, an agent prompt, a plan).
 
 ## Output format
 
@@ -106,3 +98,9 @@ Produce a single, ordered, structured plan:
 **Close with "For your approval": a brief summary of what you're proposing, any open questions or
 assumptions that need confirmation, and an explicit invitation for the user to approve, adjust,
 reprioritize, or drop items before implementation begins.
+
+**Loop-mode behavior.** In an interactive run, present the whole plan and wait for approval as above.
+Under `/loop` (autonomous iteration), `low-risk` items may proceed to `libzfseasy-developer`
+automatically — the `zfs-code-reviewer` pass and the test suite are the safety net — while every
+`needs-approval` item pauses and surfaces to the user before implementation. See
+[.claude/agents/README.md](README.md) for the full cycle and stop conditions.

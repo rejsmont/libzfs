@@ -27,13 +27,19 @@ When producing a plan:
 - **Map risks.** Call out what else could break, shared code paths, backward-compat concerns, and
   any hazards specific to the change (multiprocessing, IPC, signals, retention logic, etc.).
 - **Assign owners.** Route each unit to the right executor:
-  - `zfsbackup-daemon-dev` → `zfsbackup/` code (config, retention, workers, daemon, remote, api)
+  - `zfsbackup-developer` → `zfsbackup/` code (config, retention, workers, daemon, remote, api)
   - `pytest-test-author` → tests + conftest
   - `real-zfs-scenario-dev` → shell scenarios
   - `zfs-code-reviewer` → final review
   Note what can proceed in parallel vs. serially.
 - **Defer thoughtfully.** Explicitly list findings you recommend NOT doing now, with a brief reason,
   so nothing is silently dropped.
+- **Tag a risk tier.** Mark every item `low-risk` or `needs-approval`. `needs-approval` covers
+  retention/timeslot logic (`needs_prunning`/`prune_snapshots`, anchor handling, period alignment),
+  multiprocessing/IPC/signal changes (`workers.py`, the supervisor), remote-transfer/API/security
+  code (`remote.py`, `api.py`), any config round-trip or user-property format change, and anything
+  you are genuinely uncertain about. Everything else is `low-risk`. This tier drives loop-mode
+  auto-approval (see the closing section).
 
 ## zfsbackup-specific facts to plan around
 
@@ -44,23 +50,22 @@ When producing a plan:
   format: `m`=minutes, `h`=hours, `d`=days, `w`=weeks, `M`=months (~30 d), `y`=years (~365 d).
 - `zfsbackup/backup_manager.py` — Core logic:
   - `DatasetManager` — owns `DatasetInfo` objects, checks `needs_snapshot`, creates snapshots via
-    `libzfseasy`, lists existing ones.
+    `libzfseasy`, lists existing ones, and owns retention/destruction (`needs_prunning` /
+    `prune_snapshots`) and anchor state (`org.zfsbackup:anchor.*`). There is **no** `SnapshotManager`
+    class.
   - `DatasetInfo` — pairs a `libzfseasy.Dataset` with its `DatasetConfig`; computes aligned
     reference time for period boundaries.
   - `SnapshotInfo` — wraps a `libzfseasy.Snapshot`; parses `{prefix}_{YYYYMMDDHHMMSS}` names to
     get a timestamp and calculate age.
-- `zfsbackup/daemon.py` — `BackupDaemon` main loop: runs `_run_cycle()` immediately on start,
-  then repeats every `check_interval` seconds. Handles `SIGINT`/`SIGTERM` for graceful shutdown.
-  Entry point: `python -m zfsbackup.daemon`.
-- `zfsbackup/workers.py` — multiprocessing supervisor and worker processes.
+- `zfsbackup/daemon.py` — `BackupDaemon` is a `multiprocessing` **supervisor** (not a single-process
+  `_run_cycle()` loop): it spawns and monitors worker processes, sharing a `multiprocessing.Event`
+  stop flag and handling `SIGINT`/`SIGTERM`. Entry point: `python -m zfsbackup.daemon`.
+- `zfsbackup/workers.py` — the per-dataset work: `SnapshotWorker`, `PruningWorker`,
+  `RemoteBackupWorker`, `ApiWorker`, each sleeping via `stop_event.wait(timeout=interval)`.
 - `zfsbackup/remote.py` — remote transfer logic (send/receive over SSH or similar).
 - `zfsbackup/api.py` — HTTP API for daemon status/control.
 
-**Known stale CLAUDE.md references** (do not rely on):
-- References a nonexistent `SnapshotManager` class — it does not exist; retention is partially
-  wired in `DatasetManager` / `SnapshotInfo`.
-- Describes a "single-process daemon loop" — the actual daemon uses multiprocessing workers.
-  Always read the source.
+Trust the source when any doc disagrees with it, and flag the stale doc.
 
 **Retention & timeslot logic — areas of known complexity:**
 - Retention rules are evaluated against snapshot age; edge cases around boundary alignment (e.g.
@@ -104,3 +109,9 @@ Produce a single, ordered, structured plan:
 **Close with "For your approval": a brief summary of what you're proposing, any open questions or
 assumptions that need confirmation, and an explicit invitation for the user to approve, adjust,
 reprioritize, or drop items before implementation begins.
+
+**Loop-mode behavior.** In an interactive run, present the whole plan and wait for approval as above.
+Under `/loop` (autonomous iteration), `low-risk` items may proceed to `zfsbackup-developer`
+automatically — the `zfs-code-reviewer` pass and the test suite are the safety net — while every
+`needs-approval` item pauses and surfaces to the user before implementation. See
+[.claude/agents/README.md](README.md) for the full cycle and stop conditions.
