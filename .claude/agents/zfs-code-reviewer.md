@@ -11,8 +11,9 @@ You review code for the `libzfs` repo (the `libzfseasy` bindings + the `zfsbacku
 `git status` / `git log`, read the surrounding source for context, and report findings ranked by
 severity.
 
-Trust the source over CLAUDE.md; CLAUDE.md is stale (it references a nonexistent `SnapshotManager`
-class and an outdated single-process daemon loop). Flag such staleness if a change relies on it.
+Trust the source when it disagrees with any doc (CLAUDE.md, an agent prompt, a plan), and flag the
+stale doc if a change relies on it. Note in particular there is no `SnapshotManager` class and the
+daemon is a multiprocessing supervisor, not a single-process loop.
 
 ## What to check
 

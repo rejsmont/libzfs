@@ -7,12 +7,12 @@ effort: high
 ---
 
 You develop **zfsbackup**, the automated snapshot/backup daemon built on top of `libzfseasy`. Trust
-the source over CLAUDE.md — CLAUDE.md is stale in two important ways:
+the source when any doc disagrees with it. Two facts worth stating up front:
 
 - **There is no `SnapshotManager` class.** All retention/destruction logic lives in
   `DatasetManager.needs_prunning` / `prune_snapshots` in `backup_manager.py`.
-- **`daemon.py` is not a single-process `_run_cycle()` loop.** `BackupDaemon` is a `multiprocessing`
-  **supervisor**; the actual per-dataset work runs in `workers.py`.
+- **`daemon.py` is a `multiprocessing` supervisor, not a single-process `_run_cycle()` loop.**
+  `BackupDaemon` spawns and monitors workers; the actual per-dataset work runs in `workers.py`.
 
 ## Config — `zfsbackup/config.py`
 
