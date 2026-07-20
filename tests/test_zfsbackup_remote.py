@@ -1,10 +1,13 @@
 """Unit tests for RemoteBackupManager and ClientIdentity."""
 
+import logging
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from zfsbackup.config import BackupConfig, DatasetConfig, RemoteDatasetConfig, Destination
+from zfsbackup.config import (
+    BackupConfig, DatasetConfig, RemoteDatasetConfig, Destination, RetentionRule, Duration,
+)
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
 from zfsbackup.remote import ClientIdentity, RemoteBackupManager
 
@@ -124,7 +127,7 @@ class TestRemoteBackupManagerNegotiate:
         )
         snaps = [MagicMock(name='autosnap_20240101120000')]
         snaps[0].name = 'autosnap_20240101120000'
-        result = rbm._negotiate('http://backup.example.com', 'client1', dsi, snaps)
+        result = rbm._negotiate('http://backup.example.com', 'client1', dsi, snaps, 'offsite')
         assert result == 'autosnap_20240101120000'
 
     def test_negotiate_returns_none_when_no_common(self, tmp_path, requests_mock):
@@ -133,7 +136,7 @@ class TestRemoteBackupManagerNegotiate:
             f'http://backup.example.com/backup/client1/{dsi.name}/negotiate',
             json={'common_snapshot': None, 'server_dataset': 'pool/b/c1'},
         )
-        result = rbm._negotiate('http://backup.example.com', 'client1', dsi, [])
+        result = rbm._negotiate('http://backup.example.com', 'client1', dsi, [], 'offsite')
         assert result is None
 
     def test_negotiate_returns_none_on_error(self, tmp_path, requests_mock):
@@ -143,8 +146,39 @@ class TestRemoteBackupManagerNegotiate:
             f'http://backup.example.com/backup/client1/{dsi.name}/negotiate',
             exc=requests.ConnectionError,
         )
-        result = rbm._negotiate('http://backup.example.com', 'client1', dsi, [])
+        result = rbm._negotiate('http://backup.example.com', 'client1', dsi, [], 'offsite')
         assert result is None
+
+    def test_negotiate_passes_destination_through_to_property(self, tmp_path, requests_mock):
+        """The whole point of the 5th `destination` argument: `_negotiate` must
+        call `to_property(destination)` with the destination it is negotiating
+        for, not the dataset-level rules unconditionally (item 3b)."""
+        config = _make_config(
+            client_id_file=tmp_path / 'client_id',
+            datasets=[DatasetConfig(
+                name='pool/data',
+                retention_rules=[RetentionRule(Duration('1h'), Duration('1d'))],
+                remote=[RemoteDatasetConfig(
+                    destination='offsite',
+                    retention_rules=[RetentionRule(Duration('1d'), Duration('5y'))],
+                )],
+            )],
+        )
+        manager = DatasetManager(config)
+        rbm = RemoteBackupManager(config, manager)
+        dsi = manager.datasets[0]
+
+        requests_mock.post(
+            f'http://backup.example.com/backup/client1/{dsi.name}/negotiate',
+            json={'common_snapshot': None, 'server_dataset': 'pool/b/c1'},
+        )
+        rbm._negotiate('http://backup.example.com', 'client1', dsi, [], 'offsite')
+
+        sent_config = requests_mock.last_request.json()['config']
+        # The destination declared its own retention, so the negotiated config
+        # must carry THAT ruleset -- not the dataset-level one.
+        assert sent_config == dsi.config.to_property('offsite')
+        assert sent_config != dsi.config.to_property()
 
 
 class TestGetResumeStream:
@@ -460,3 +494,154 @@ class TestBackupDataset:
 
         result = rbm.backup_dataset(dsi, remote_cfg)
         assert result is True
+
+
+class TestBackupDatasetNegotiateWiring:
+    """`backup_dataset` passes `remote_cfg.destination` into `_negotiate` --
+    previously untested: every negotiate test above calls `_negotiate`
+    directly with a literal `'offsite'`, and `TestBackupDataset` mocks around
+    the real negotiate call, so the one line of production wiring
+    (`backup_dataset` -> `_negotiate(..., remote_cfg.destination)`) had no
+    coverage. A wrong value here (e.g. `dsi.name` instead of
+    `remote_cfg.destination`) would send the wrong destination's rules."""
+
+    def test_backup_dataset_calls_negotiate_with_remote_cfg_destination(
+        self, tmp_path, requests_mock, mocker
+    ):
+        # Deliberately use a destination name distinct from dsi.name (and
+        # from other declared destinations) so a swap -- e.g. passing
+        # dsi.name, or the first destination in the mapping -- is caught.
+        config = _make_config(
+            client_id_file=tmp_path / 'client_id',
+            datasets=[DatasetConfig(
+                name='pool/data',
+                remote=[RemoteDatasetConfig(destination='dc2')],
+            )],
+            destinations={
+                'offsite': Destination(url='http://backup.example.com'),
+                'dc2': Destination(url='http://dc2.example.com'),
+            },
+        )
+        manager = DatasetManager(config)
+        rbm = RemoteBackupManager(config, manager)
+        dsi = manager.datasets[0]
+        remote_cfg = dsi.config.remote[0]
+
+        requests_mock.post('http://dc2.example.com/backup/register', json={})
+        snap = MagicMock()
+        snap.name = 'autosnap_20240101120000'
+        mocker.patch.object(manager, 'list_snapshots', return_value=[snap])
+        mock_negotiate = mocker.patch.object(rbm, '_negotiate', return_value=None)
+        mocker.patch.object(rbm, '_transfer', return_value=True)
+
+        result = rbm.backup_dataset(dsi, remote_cfg)
+        assert result is True
+        mock_negotiate.assert_called_once()
+        # Positional signature: (base_url, client_id, dsi, snapshots, destination)
+        assert mock_negotiate.call_args.args[-1] == 'dc2'
+
+
+class TestClientSideRetentionCollisionWarning:
+    """Client-side collision warning: previously a colliding *per-destination*
+    ruleset warned nowhere on the client -- the only warning appeared in the
+    receiving admin's journal, naming a server-side path the client operator
+    does not administer, with canonicalized literals. `RemoteBackupManager.
+    backup_dataset` now warns locally too, once per `(dataset, destination)`,
+    naming the operator's own literals."""
+
+    def _make_rbm(self, tmp_path, retention_rules=None, destination='offsite'):
+        config = _make_config(
+            client_id_file=tmp_path / 'client_id',
+            datasets=[DatasetConfig(
+                name='pool/data',
+                remote=[RemoteDatasetConfig(
+                    destination=destination,
+                    retention_rules=retention_rules or [],
+                )],
+            )],
+        )
+        manager = DatasetManager(config)
+        return RemoteBackupManager(config, manager), manager.datasets[0]
+
+    def _colliding_rules(self):
+        # 1h:7d and 1d:1w collide on keep_for -- both are 604800s.
+        return [
+            RetentionRule(Duration('1h'), Duration('7d')),
+            RetentionRule(Duration('1d'), Duration('1w')),
+        ]
+
+    def test_warns_once_for_colliding_destination_ruleset(self, tmp_path, requests_mock, caplog):
+        rbm, dsi = self._make_rbm(tmp_path, retention_rules=self._colliding_rules())
+        requests_mock.post('http://backup.example.com/backup/register', json={})
+        with patch.object(rbm.local_manager, 'list_snapshots', return_value=[]):
+            with caplog.at_level(logging.WARNING):
+                rbm.backup_dataset(dsi, dsi.config.remote[0])
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1
+        assert warnings[0].message.startswith('Dataset pool/data -> offsite:')
+
+    def test_warning_names_operator_literal_not_canonicalized(self, tmp_path, requests_mock, caplog):
+        # The message must contain "7d" -- the text the operator wrote --
+        # not the numerically-equal-but-different canonicalized "1w". That
+        # distinction is the entire point of warning client-side: the
+        # server-side message names its own (canonicalized) literals, which
+        # this client operator never sees and does not administer.
+        rbm, dsi = self._make_rbm(tmp_path, retention_rules=self._colliding_rules())
+        requests_mock.post('http://backup.example.com/backup/register', json={})
+        with patch.object(rbm.local_manager, 'list_snapshots', return_value=[]):
+            with caplog.at_level(logging.WARNING):
+                rbm.backup_dataset(dsi, dsi.config.remote[0])
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1
+        assert '7d' in warnings[0].message
+
+    def test_does_not_rewarn_same_ruleset(self, tmp_path, requests_mock, caplog):
+        rbm, dsi = self._make_rbm(tmp_path, retention_rules=self._colliding_rules())
+        requests_mock.post('http://backup.example.com/backup/register', json={})
+        with patch.object(rbm.local_manager, 'list_snapshots', return_value=[]):
+            with caplog.at_level(logging.WARNING):
+                rbm.backup_dataset(dsi, dsi.config.remote[0])
+                rbm.backup_dataset(dsi, dsi.config.remote[0])
+                rbm.backup_dataset(dsi, dsi.config.remote[0])
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1
+
+    def test_warns_separately_for_two_different_destinations(self, tmp_path, requests_mock, caplog):
+        rules = self._colliding_rules()
+        config = _make_config(
+            client_id_file=tmp_path / 'client_id',
+            datasets=[DatasetConfig(
+                name='pool/data',
+                remote=[
+                    RemoteDatasetConfig(destination='offsite', retention_rules=rules),
+                    RemoteDatasetConfig(destination='dc2', retention_rules=rules),
+                ],
+            )],
+            destinations={
+                'offsite': Destination(url='http://backup.example.com'),
+                'dc2': Destination(url='http://dc2.example.com'),
+            },
+        )
+        manager = DatasetManager(config)
+        rbm = RemoteBackupManager(config, manager)
+        dsi = manager.datasets[0]
+
+        requests_mock.post('http://backup.example.com/backup/register', json={})
+        requests_mock.post('http://dc2.example.com/backup/register', json={})
+        with patch.object(manager, 'list_snapshots', return_value=[]):
+            with caplog.at_level(logging.WARNING):
+                rbm.backup_dataset(dsi, dsi.config.remote[0])
+                rbm.backup_dataset(dsi, dsi.config.remote[1])
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 2
+        assert any(w.message.startswith('Dataset pool/data -> offsite:') for w in warnings)
+        assert any(w.message.startswith('Dataset pool/data -> dc2:') for w in warnings)
+
+    def test_no_collision_produces_no_warning(self, tmp_path, requests_mock, caplog):
+        rules = [RetentionRule(Duration('1h'), Duration('1d'))]
+        rbm, dsi = self._make_rbm(tmp_path, retention_rules=rules)
+        requests_mock.post('http://backup.example.com/backup/register', json={})
+        with patch.object(rbm.local_manager, 'list_snapshots', return_value=[]):
+            with caplog.at_level(logging.WARNING):
+                rbm.backup_dataset(dsi, dsi.config.remote[0])
+        assert [r for r in caplog.records if r.levelname == 'WARNING'] == []

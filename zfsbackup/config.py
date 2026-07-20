@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import yaml
 
 
@@ -214,6 +214,25 @@ def _duration_from_config(value, key: str) -> Duration:
     return Duration(value)
 
 
+def _positive_duration_from_config(value, key: str) -> Duration:
+    """Parse a retention-rule duration and reject a non-positive value.
+
+    A zero (or negative) `age` is a zero-width slot: it is a division-by-zero
+    in the slot-based retention algorithm (`DatasetManager.needs_prunning`,
+    `interval_secs` is a divisor). A zero or negative `keep_for` means
+    "expire immediately", which is at best a footgun and never a meaningful
+    retention tier either. Both endpoints are rejected here at load, before
+    either can reach the pruning worker.
+    """
+    d = _duration_from_config(value, key)
+    if d.timedelta <= timedelta(0):
+        raise ValueError(
+            f"{key}: duration must be positive, got {_retention_literal(d)!r} "
+            f"({d.total_seconds():.0f}s)"
+        )
+    return d
+
+
 def _mapping_from_config(value, key: str, expected: str) -> dict:
     """Ensure a value taken directly off parsed YAML is a mapping before it is
     indexed or iterated with `.items()`/`.get()`.
@@ -259,6 +278,128 @@ class RetentionRule:
         return f"RetentionRule(age={self.age}, keep_for={self.keep_for})"
 
 
+def _retention_literal(d: timedelta) -> str:
+    """Best-effort literal text for a duration, for validation error messages.
+
+    Falls back to `str(d)` for a plain `timedelta` (e.g. one constructed
+    directly in a test), which has no `.literal`.
+    """
+    literal = getattr(d, 'literal', None)
+    return literal if literal is not None else str(d)
+
+
+def validate_retention_uniqueness(rules: List[RetentionRule], key: str) -> None:
+    """Raise ValueError if any two rules in `rules` share an `age` or a `keep_for`.
+
+    Retention is meant to be a bijection between intervals (`age`) and expiries
+    (`keep_for`): one rule per age, one rule per keep_for. This is the strict
+    counterpart to the read-path resolution in `_collapse_retention_rules`
+    (below) -- write paths (the future config CLI's `set`/`edit`, `import`)
+    call this to reject ambiguous input outright, rather than silently
+    resolving it the way a running daemon must. Two rules that are exact
+    duplicates (same age AND same keep_for) are not a conflict and are
+    allowed through.
+
+    `key` is the caller's key path (e.g. ``datasets[pool/data].retention``),
+    used in the error message the same way `_duration_from_config` names its
+    key.
+    """
+    seen_keep_for: Dict[float, RetentionRule] = {}
+    for rule in rules:
+        keep_for = rule.keep_for.total_seconds()
+        existing = seen_keep_for.get(keep_for)
+        if existing is not None and existing.age.total_seconds() != rule.age.total_seconds():
+            raise ValueError(
+                f"{key}: {_retention_literal(existing.keep_for)!r} and "
+                f"{_retention_literal(rule.keep_for)!r} are the same duration "
+                f"({keep_for:.0f}s); one rule per keep_for"
+            )
+        seen_keep_for[keep_for] = rule
+
+    seen_age: Dict[float, RetentionRule] = {}
+    for rule in rules:
+        age = rule.age.total_seconds()
+        existing = seen_age.get(age)
+        if existing is not None and existing.keep_for.total_seconds() != rule.keep_for.total_seconds():
+            raise ValueError(
+                f"{key}: {_retention_literal(existing.age)!r} and "
+                f"{_retention_literal(rule.age)!r} are the same duration "
+                f"({age:.0f}s); one rule per age"
+            )
+        seen_age[age] = rule
+
+
+def _collapse_retention_rules(
+    rules: List[RetentionRule],
+) -> Tuple[Dict[float, float], List[str]]:
+    """Collapse retention rules into a `{keep_for_seconds: age_seconds}` plan,
+    resolving collisions on either axis toward retaining more data (see
+    docs/config_db_cli_plan.md item 2b -- this is the pre-existing data-loss
+    bug where the old `{rule.keep_for: rule.age for rule in rules}` dict
+    comprehension silently discarded the finer-grained rule on any collision):
+
+      - same `keep_for`, different `age`   -> take the min `age` (finer interval keeps more)
+      - same `age`, different `keep_for`   -> take the max `keep_for` (longer expiry keeps more)
+
+    Order is significant and the two passes do NOT commute: `keep_for` is
+    collapsed first, then `age`. Collapsing `age` first can discard a rule
+    that `keep_for`-first would have kept (see the plan for a worked example).
+
+    A rule pair that is an exact duplicate (same age AND same keep_for) is not
+    a conflict and is dropped silently -- no warning.
+
+    This is the lenient read-path counterpart to `validate_retention_uniqueness`
+    above -- callers that must resolve a running config rather than reject a
+    write use this. Never raises. Returns the resolved plan plus a list of
+    human-readable collision descriptions (empty if there was nothing to
+    resolve); the caller decides if/when to log them.
+    """
+    warnings: List[str] = []
+
+    # Pass 1: collapse rules sharing a keep_for -> keep the smaller age.
+    by_keep_for: Dict[float, RetentionRule] = {}
+    for rule in rules:
+        keep_for = rule.keep_for.total_seconds()
+        age = rule.age.total_seconds()
+        existing = by_keep_for.get(keep_for)
+        if existing is None:
+            by_keep_for[keep_for] = rule
+            continue
+        if existing.age.total_seconds() == age:
+            continue  # exact duplicate, silent
+        chosen = existing if existing.age.total_seconds() <= age else rule
+        warnings.append(
+            f"retention rules {_retention_literal(existing.age)!r}:{_retention_literal(existing.keep_for)!r} "
+            f"and {_retention_literal(rule.age)!r}:{_retention_literal(rule.keep_for)!r} have the same "
+            f"keep_for ({keep_for:.0f}s); keeping the finer age {_retention_literal(chosen.age)!r}"
+        )
+        by_keep_for[keep_for] = chosen
+
+    # Pass 2: collapse rules sharing an age -> keep the larger keep_for.
+    by_age: Dict[float, RetentionRule] = {}
+    for rule in by_keep_for.values():
+        age = rule.age.total_seconds()
+        existing = by_age.get(age)
+        if existing is None:
+            by_age[age] = rule
+            continue
+        if existing.keep_for.total_seconds() == rule.keep_for.total_seconds():
+            continue  # exact duplicate, silent
+        chosen = (
+            existing if existing.keep_for.total_seconds() >= rule.keep_for.total_seconds()
+            else rule
+        )
+        warnings.append(
+            f"retention rules {_retention_literal(existing.age)!r}:{_retention_literal(existing.keep_for)!r} "
+            f"and {_retention_literal(rule.age)!r}:{_retention_literal(rule.keep_for)!r} have the same "
+            f"age ({age:.0f}s); keeping the longer keep_for {_retention_literal(chosen.keep_for)!r}"
+        )
+        by_age[age] = chosen
+
+    plan = {rule.keep_for.total_seconds(): rule.age.total_seconds() for rule in by_age.values()}
+    return plan, warnings
+
+
 @dataclass
 class Destination:
     """A remote server that accepts backup streams."""
@@ -270,6 +411,9 @@ class RemoteDatasetConfig:
     """Per-destination remote backup config for a single dataset."""
     destination: str
     frequency: Optional[timedelta] = None  # None = inherit from DatasetConfig
+    # Empty = inherit DatasetConfig.retention_rules; non-empty REPLACES the
+    # dataset-level set entirely for this destination (override, not merge).
+    retention_rules: List[RetentionRule] = field(default_factory=list)
 
 
 @dataclass
@@ -289,8 +433,41 @@ class DatasetConfig:
     enabled: bool = True
     remote: List[RemoteDatasetConfig] = field(default_factory=list)
 
-    def to_property(self) -> str:
-        """Serialize to a base64-encoded JSON string for storage as a ZFS user property."""
+    def effective_retention_rules(self, destination: Optional[str] = None) -> List[RetentionRule]:
+        """Return the retention rules that apply when backing up to `destination`.
+
+        With no `destination` (the default), returns the dataset-level rules
+        used for local pruning.
+
+        With a `destination`, returns that destination's own `retention_rules`
+        override if it declared any, otherwise the dataset-level set (inherit,
+        not merge -- a destination that declares any rule replaces the whole
+        set). An unknown `destination` (not present in `self.remote`) falls
+        back to the dataset-level set, same as "no override declared".
+        """
+        if destination is not None:
+            remote_cfg = next((r for r in self.remote if r.destination == destination), None)
+            if remote_cfg is not None and remote_cfg.retention_rules:
+                return remote_cfg.retention_rules
+        return self.retention_rules
+
+    def to_property(self, destination: Optional[str] = None) -> str:
+        """Serialize to a base64-encoded JSON string for storage as a ZFS user property.
+
+        With no `destination` (the default), emits the dataset-level config used
+        for local pruning -- `sync_config_property` always calls it this way, and
+        the output is byte-identical to before this parameter existed (wire
+        compatibility with already-deployed servers).
+
+        With a `destination`, emits the *effective* config for backing up to that
+        destination: its own `retention_rules` override if it declared any,
+        otherwise the dataset-level set (inherit, not merge -- a destination that
+        declares any rule replaces the whole set). The output shape is identical
+        either way; only the contents of `retention_rules` change, so a receiving
+        server needs no changes to understand either form.
+        """
+        retention_rules = self.effective_retention_rules(destination)
+
         data = {
             'name': self.name,
             'recursive': self.recursive,
@@ -298,7 +475,7 @@ class DatasetConfig:
             'enabled': self.enabled,
             'retention_rules': [
                 {'age': r.age.total_seconds(), 'keep_for': r.keep_for.total_seconds()}
-                for r in self.retention_rules
+                for r in retention_rules
             ],
             'remote': [
                 {
@@ -312,7 +489,21 @@ class DatasetConfig:
 
     @classmethod
     def from_property(cls, encoded: str) -> 'DatasetConfig':
-        """Deserialize from a base64-encoded JSON ZFS user property value."""
+        """Deserialize from a base64-encoded JSON ZFS user property value.
+
+        NOTE: this is a *wire decoder*, not the inverse of `to_property`, and
+        must not be used as one. `to_property(destination)` intentionally
+        emits only the single *effective* `retention_rules` list for that
+        destination (dataset-level or the destination's override, never
+        both -- see `effective_retention_rules`); the other per-destination
+        overrides in `self.remote` are never put on the wire at all. Round-
+        tripping a decoded value back through `to_property` therefore always
+        yields a `DatasetConfig` with `remote[*].retention_rules == []` for
+        every entry, silently losing any per-destination rules the original
+        had. Do not reuse this pair as an ORM <-> dataclass round-trip (e.g.
+        for the config DB mapper); read the per-destination overrides from
+        their own source instead.
+        """
         data = json.loads(base64.b64decode(encoded).decode())
         return cls(
             name=data['name'],
@@ -357,19 +548,36 @@ class DatasetConfig:
 
         retention_rules = []
         retention_dict = data.get('retention')
-        if not retention_dict:
+        if retention_dict is None:
+            # Absent 'retention' has a documented meaning at dataset level:
+            # default to a single 1d->30d tier. `config.example.yaml` and
+            # long-standing behaviour rely on this.
             retention_dict = {'1d': '30d'}
         else:
+            # Shape check runs BEFORE the emptiness check below, so a
+            # malformed shape (list, string, int, ...) always raises a named
+            # ValueError instead of silently falling through to the default
+            # the way `if not retention_dict:` used to. Only a `dict` -- empty
+            # or not -- reaches the emptiness check.
             retention_dict = _mapping_from_config(
                 retention_dict,
                 f"datasets[{name}].retention",
                 "a mapping of age -> keep_for",
             )
-        # NOTE: duplicate age/keep_for validation belongs here, after the
-        # shape check and before rules are built.
+            if not retention_dict:
+                # An explicit but empty mapping (`retention: {}`) keeps the
+                # same documented default as an absent key. This deliberately
+                # differs from the destination-level override, where `{}` has
+                # no meaning and is rejected (see remote[*].retention below).
+                retention_dict = {'1d': '30d'}
+        # NOTE: this is the dataset-level rule set. Strict duplicate age/keep_for
+        # validation (`validate_retention_uniqueness`, defined above) is
+        # deliberately NOT called here -- load must never hard-fail on a
+        # colliding config (see docs/config_db_cli_plan.md item 2b); the write
+        # paths that should call it (CLI `set`/`edit`, `import`) don't exist yet.
         for age_str, keep_str in retention_dict.items():
-            age = _duration_from_config(age_str, f"datasets[{name}].retention")
-            keep_for = _duration_from_config(keep_str, f"datasets[{name}].retention")
+            age = _positive_duration_from_config(age_str, f"datasets[{name}].retention")
+            keep_for = _positive_duration_from_config(keep_str, f"datasets[{name}].retention")
             retention_rules.append(RetentionRule(age=age, keep_for=keep_for))
         retention_rules.sort(key=lambda r: r.age)
 
@@ -388,7 +596,34 @@ class DatasetConfig:
                 _duration_from_config(r['frequency'], f"datasets[{name}].remote[{dest}].frequency")
                 if r.get('frequency') is not None else None
             )
-            remote.append(RemoteDatasetConfig(destination=dest, frequency=freq))
+
+            remote_retention_rules: List[RetentionRule] = []
+            retention_override = r.get('retention')
+            if retention_override is not None:
+                retention_override = _mapping_from_config(
+                    retention_override,
+                    f"datasets[{name}].remote[{dest}].retention",
+                    "a mapping of age -> keep_for",
+                )
+                if not retention_override:
+                    raise ValueError(
+                        f"datasets[{name}].remote[{dest}].retention is empty; "
+                        "omit 'retention' to inherit the dataset-level rules, "
+                        "or declare at least one rule"
+                    )
+                for age_str, keep_str in retention_override.items():
+                    age = _positive_duration_from_config(
+                        age_str, f"datasets[{name}].remote[{dest}].retention"
+                    )
+                    keep_for = _positive_duration_from_config(
+                        keep_str, f"datasets[{name}].remote[{dest}].retention"
+                    )
+                    remote_retention_rules.append(RetentionRule(age=age, keep_for=keep_for))
+                remote_retention_rules.sort(key=lambda rr: rr.age)
+
+            remote.append(RemoteDatasetConfig(
+                destination=dest, frequency=freq, retention_rules=remote_retention_rules
+            ))
 
         return cls(
             name=name,
@@ -463,6 +698,21 @@ class BackupConfig:
             if not url:
                 raise ValueError(f"Destination '{dest_name}' requires 'url'")
             destinations[dest_name] = Destination(url=url)
+
+        for ds in datasets:
+            for r in ds.remote:
+                # Any reference to an undeclared destination fails at load,
+                # not just one carrying a 'retention' override: a destination
+                # absent from 'destinations:' can never be backed up to
+                # (RemoteBackupManager.backup_dataset looks it up the same
+                # way and errors every cycle forever), so there is no
+                # legitimate reason to let it load clean.
+                if r.destination not in destinations:
+                    raise ValueError(
+                        f"datasets[{ds.name}].remote[{r.destination}] references "
+                        f"destination '{r.destination}', which is not declared "
+                        "in 'destinations'"
+                    )
 
         remote_backup: Optional[RemoteServerConfig] = None
         rb_data = data.get('remote_backup')

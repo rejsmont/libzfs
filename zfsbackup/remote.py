@@ -6,14 +6,14 @@ import re
 import socket
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set, Tuple
 
 import requests
 import websocket
 
 import libzfseasy as zfs
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
-from zfsbackup.config import BackupConfig, Destination, RemoteDatasetConfig
+from zfsbackup.config import BackupConfig, Destination, RemoteDatasetConfig, _collapse_retention_rules
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,14 @@ class RemoteBackupManager:
         self.config = config
         self.local_manager = local_manager
         self.identity = ClientIdentity(config.client_id_file)
+        # (dataset name, destination) pairs whose effective per-destination
+        # retention-rule collisions have already been warned about, for this
+        # manager's lifetime. `to_property(destination)` ships the resolved
+        # ruleset unresolved (correct -- resolution is a read-path concern),
+        # and the ONLY collision warning used to appear in the *receiving*
+        # admin's journal, naming a server-side path the client operator does
+        # not administer. The client must warn about its own collisions too.
+        self._retention_warned: Set[Tuple[str, str]] = set()
 
     def backup_dataset(self, dsi: DatasetInfo, remote_cfg: RemoteDatasetConfig) -> bool:
         """Send a backup of dsi to the configured destination. Returns True on success."""
@@ -64,6 +72,8 @@ class RemoteBackupManager:
         if dest is None:
             logger.error(f"Unknown destination '{remote_cfg.destination}' for {dsi.name}")
             return False
+
+        self._warn_retention_collisions(dsi, remote_cfg.destination)
 
         base_url = dest.url.rstrip('/')
         client_id = self.identity.client_id
@@ -77,7 +87,9 @@ class RemoteBackupManager:
             return True
 
         latest = snapshots[0]
-        common_snap_name = self._negotiate(base_url, client_id, dsi, snapshots)
+        common_snap_name = self._negotiate(
+            base_url, client_id, dsi, snapshots, remote_cfg.destination
+        )
 
         # Resolve the common snapshot object for incremental send
         common_snap = None
@@ -85,6 +97,26 @@ class RemoteBackupManager:
             common_snap = next((s for s in snapshots if s.name == common_snap_name), None)
 
         return self._transfer(base_url, client_id, dsi, latest, common_snap, remote_cfg.destination)
+
+    def _warn_retention_collisions(self, dsi: DatasetInfo, destination: str) -> None:
+        """Warn locally about retention-rule collisions in the ruleset that
+        will actually be sent for `destination` (dataset-level, or the
+        destination's own override if it declared one -- see
+        `DatasetConfig.effective_retention_rules`). Once per (dataset,
+        destination) for this manager's lifetime; the client's own config is
+        loaded once at process start, so unlike the received-side warning in
+        `DatasetManager._retention_plan`, the ruleset here cannot change
+        without a restart (which creates a new manager and resets this set).
+        """
+        key = (dsi.name, destination)
+        if key in self._retention_warned:
+            return
+        rules = dsi.config.effective_retention_rules(destination)
+        _, collisions = _collapse_retention_rules(rules)
+        if collisions:
+            self._retention_warned.add(key)
+            for msg in collisions:
+                logger.warning(f"Dataset {dsi.name} -> {destination}: {msg}")
 
     def _register(self, base_url: str, client_id: str) -> bool:
         try:
@@ -99,13 +131,18 @@ class RemoteBackupManager:
             logger.error(f"Registration failed at {base_url}: {e}")
             return False
 
-    def _negotiate(self, base_url: str, client_id: str, dsi: DatasetInfo, snapshots) -> Optional[str]:
+    def _negotiate(
+        self, base_url: str, client_id: str, dsi: DatasetInfo, snapshots, destination: str
+    ) -> Optional[str]:
         try:
             resp = requests.post(
                 f"{base_url}/backup/{client_id}/{dsi.name}/negotiate",
                 json={
                     'snapshots': [s.name for s in snapshots],
-                    'config': dsi.config.to_property(),
+                    # Effective config for this destination -- a per-destination
+                    # retention override (if any) replaces the dataset-level set
+                    # entirely (see DatasetConfig.to_property and item 3b).
+                    'config': dsi.config.to_property(destination),
                 },
                 timeout=30,
             )

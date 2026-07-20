@@ -3,12 +3,15 @@
 import logging
 import pytest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
-from zfsbackup.backup_manager import DatasetManager, DatasetInfo, SnapshotInfo
+from zfsbackup.backup_manager import (
+    DatasetManager, DatasetInfo, SnapshotInfo, _collapse_retention_rules,
+)
 from zfsbackup.config import (
-    BackupConfig, DatasetConfig, RetentionRule, RemoteServerConfig, RemoteDatasetConfig,
+    BackupConfig, DatasetConfig, RetentionRule, RemoteServerConfig, RemoteDatasetConfig, Duration,
 )
 
 
@@ -483,3 +486,330 @@ class TestReceivedDatasetsSuccess:
         mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[mock_ds])
         result = manager.received_datasets()
         assert result == []
+
+
+class TestCollapseRetentionRules:
+    """Item 2b: `_collapse_retention_rules` resolves `keep_for`/`age` collisions
+    toward retaining more data, instead of the old `{keep_for: age}` dict
+    comprehension that silently discarded the finer-grained rule.
+    """
+
+    def test_realistic_trigger_keeps_hourly_not_daily(self):
+        # "1h": "7d" and "1d": "1w" both expire at 604800s -- mixed notation,
+        # not a contrived same-literal case. The old dict-comprehension
+        # collapse verifiably produced {604800.0: 86400.0} (daily wins,
+        # because rules are sorted by age ascending and dict-last-write-wins).
+        # The fix must keep the finer, hourly interval instead.
+        rules = [
+            RetentionRule(Duration('1h'), Duration('7d')),
+            RetentionRule(Duration('1d'), Duration('1w')),
+        ]
+        plan, warnings = _collapse_retention_rules(rules)
+        assert plan == {604800.0: 3600.0}
+        assert len(warnings) == 1
+
+    def test_same_keep_for_different_age_keeps_min_age(self):
+        rules = [
+            RetentionRule(Duration('6h'), Duration('30d')),
+            RetentionRule(Duration('1h'), Duration('30d')),
+        ]
+        plan, warnings = _collapse_retention_rules(rules)
+        assert plan == {2592000.0: 3600.0}
+        assert len(warnings) == 1
+        assert '1h' in warnings[0]
+
+    def test_same_age_different_keep_for_keeps_max_keep_for(self):
+        rules = [
+            RetentionRule(Duration('1d'), Duration('1w')),
+            RetentionRule(Duration('24h'), Duration('1M')),
+        ]
+        plan, warnings = _collapse_retention_rules(rules)
+        assert plan == {2592000.0: 86400.0}
+        assert len(warnings) == 1
+        assert '1M' in warnings[0]
+
+    def test_exact_duplicates_are_silent(self):
+        # Same age AND same keep_for is a true duplicate, not a conflict.
+        rules = [
+            RetentionRule(Duration('1d'), Duration('30d')),
+            RetentionRule(Duration('1d'), Duration('30d')),
+        ]
+        plan, warnings = _collapse_retention_rules(rules)
+        assert plan == {2592000.0: 86400.0}
+        assert warnings == []
+
+    def test_non_commuting_order_keeps_two_rules(self):
+        # {(1d,1w), (1d,1M), (1h,1M)}: collapsing `age` first collapses to a
+        # single rule {(1h,1M)}; collapsing `keep_for` first (the required
+        # order) keeps two: {(1d,1w), (1h,1M)}. Pin the two-rule outcome so a
+        # future refactor that swaps the pass order fails loudly.
+        rules = [
+            RetentionRule(Duration('1d'), Duration('1w')),
+            RetentionRule(Duration('1d'), Duration('1M')),
+            RetentionRule(Duration('1h'), Duration('1M')),
+        ]
+        plan, warnings = _collapse_retention_rules(rules)
+        assert plan == {604800.0: 86400.0, 2592000.0: 3600.0}
+        assert len(plan) == 2
+
+    def test_non_colliding_configs_produce_naive_plan(self):
+        # With no collisions, the resolved plan must be byte-identical to the
+        # pre-fix, unresolved {keep_for: age} dict comprehension.
+        rules = [
+            RetentionRule(Duration('1h'), Duration('1d')),
+            RetentionRule(Duration('1d'), Duration('1w')),
+            RetentionRule(Duration('1w'), Duration('1M')),
+        ]
+        plan, warnings = _collapse_retention_rules(rules)
+        naive = {r.keep_for.total_seconds(): r.age.total_seconds() for r in rules}
+        assert plan == naive
+        assert warnings == []
+
+    def test_example_config_retention_ladders_unaffected(self):
+        """The shipped config.example.yaml retention ladders have no
+        collisions; the resolved plan for each dataset must match the naive
+        pre-fix plan exactly (the fix must not alter normal configs)."""
+        example = Path(__file__).resolve().parent.parent / 'zfsbackup' / 'config.example.yaml'
+        config = BackupConfig.from_file(example)
+        assert config.datasets  # sanity: the file actually has datasets
+        for ds in config.datasets:
+            plan, warnings = _collapse_retention_rules(ds.retention_rules)
+            naive = {
+                r.keep_for.total_seconds(): r.age.total_seconds() for r in ds.retention_rules
+            }
+            assert plan == naive, f"dataset {ds.name} plan changed"
+            assert warnings == [], f"dataset {ds.name} unexpectedly collided"
+
+
+class TestRetentionPlanWarnings:
+    """Item 2b: the collision warning fires once per dataset, not once per
+    pruning cycle -- `needs_prunning` runs every cycle (`workers.py:122`)."""
+
+    def test_warning_fires_once_per_dataset_across_pruning_cycles(self, caplog):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        dsi.config.retention_rules = [
+            RetentionRule(Duration('1h'), Duration('7d')),
+            RetentionRule(Duration('1d'), Duration('1w')),
+        ]
+        dsi.snapshots = [_make_snap_info('autosnap', 0)]
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                manager.needs_prunning(dsi)
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1
+        assert 'pool/data' in warnings[0].message
+
+    def test_no_warning_for_non_colliding_rules(self, caplog):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        dsi.config.retention_rules = [
+            RetentionRule(Duration('1h'), Duration('1d')),
+        ]
+        dsi.snapshots = [_make_snap_info('autosnap', 0)]
+        with caplog.at_level(logging.WARNING):
+            manager.needs_prunning(dsi)
+        assert [r for r in caplog.records if r.levelname == 'WARNING'] == []
+
+    def test_load_never_hard_fails_and_still_prunes(self, tmp_path):
+        # A colliding config must load (never raise) and the daemon must
+        # still be able to compute a pruning plan from it.
+        cfg_file = tmp_path / 'colliding.yaml'
+        cfg_file.write_text(
+            "datasets:\n"
+            "  - name: pool/data\n"
+            "    retention:\n"
+            "      1h: 7d\n"
+            "      1d: 1w\n"
+        )
+        config = BackupConfig.from_file(cfg_file)  # must not raise
+        manager = DatasetManager(config)
+        dsi = manager.datasets[0]
+        dsi.snapshots = [_make_snap_info('autosnap', 0)]
+        to_prune = manager.needs_prunning(dsi)  # must not raise either
+        assert isinstance(to_prune, list)
+
+
+class TestPerDestinationRetentionScope:
+    """Item 3b: destination-level retention overrides live independently of
+    the dataset-level rule set that governs local pruning."""
+
+    def test_local_pruning_uses_dataset_level_rules_only(self):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        dsi.config.retention_rules = [
+            RetentionRule(Duration('1h'), Duration('1d')),
+        ]
+        dsi.config.remote = [
+            RemoteDatasetConfig(
+                destination='offsite',
+                retention_rules=[RetentionRule(Duration('1d'), Duration('5y'))],
+            ),
+        ]
+        plan = manager._retention_plan(dsi)
+        # Only the dataset-level rule governs local pruning; the
+        # destination's override never reaches it.
+        assert plan == {86400.0: 3600.0}
+
+    def test_destination_keep_for_collision_resolves_independently(self):
+        # The destination's own rule set collides on keep_for; the
+        # dataset-level set is collision-free. Item 2b's resolution applies
+        # within each (dataset, destination) scope independently.
+        #
+        # Rewired through the production path (`DatasetConfig.
+        # effective_retention_rules`, the method `RemoteBackupManager.
+        # backup_dataset` -> `_warn_retention_collisions` actually calls) --
+        # not hand-built lists fed straight to `_collapse_retention_rules` --
+        # so this fails loudly if per-destination resolution is ever removed
+        # (e.g. `effective_retention_rules` collapsed back to always
+        # returning the dataset-level set).
+        config = DatasetConfig(
+            name='pool/data',
+            retention_rules=[RetentionRule(Duration('1h'), Duration('1d'))],
+            remote=[RemoteDatasetConfig(
+                destination='offsite',
+                retention_rules=[
+                    RetentionRule(Duration('1h'), Duration('7d')),
+                    RetentionRule(Duration('1d'), Duration('1w')),
+                ],
+            )],
+        )
+
+        dataset_plan, dataset_warnings = _collapse_retention_rules(
+            config.effective_retention_rules()
+        )
+        dest_plan, dest_warnings = _collapse_retention_rules(
+            config.effective_retention_rules('offsite')
+        )
+
+        assert dataset_plan == {86400.0: 3600.0}
+        assert dataset_warnings == []
+        assert dest_plan == {604800.0: 3600.0}
+        assert len(dest_warnings) == 1
+
+
+class TestContentKeyedRetentionWarning:
+    """`DatasetManager._retention_warned` is keyed on `(dataset name,
+    frozenset of (age, keep_for) pairs)`, not name alone. `received_datasets()`
+    re-parses `PROP_CONFIG` every pruning cycle (`PruningWorker._get_datasets`
+    -> `received_datasets()`), so a client pushing a *different* colliding
+    ruleset under the same dataset name must still warn -- keying on name
+    alone silently swallowed that for the life of the process."""
+
+    def _dsi(self, name, rules):
+        config = DatasetConfig(name=name, retention_rules=rules)
+        return DatasetInfo(Filesystem(name), config)
+
+    def test_same_name_same_ruleset_warns_once_across_calls(self, caplog):
+        manager = DatasetManager(_make_config())
+        rules = [
+            RetentionRule(Duration('1h'), Duration('7d')),
+            RetentionRule(Duration('1d'), Duration('1w')),
+        ]
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                manager._retention_plan(self._dsi('pool/data', rules))
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1
+
+    def test_same_name_different_colliding_ruleset_warns_again(self, caplog):
+        manager = DatasetManager(_make_config())
+        rules_a = [
+            RetentionRule(Duration('1h'), Duration('7d')),
+            RetentionRule(Duration('1d'), Duration('1w')),
+        ]
+        rules_b = [
+            RetentionRule(Duration('6h'), Duration('30d')),
+            RetentionRule(Duration('1h'), Duration('30d')),
+        ]
+        with caplog.at_level(logging.WARNING):
+            manager._retention_plan(self._dsi('pool/data', rules_a))
+            manager._retention_plan(self._dsi('pool/data', rules_b))
+            manager._retention_plan(self._dsi('pool/data', rules_a))  # seen before -> no 3rd warning
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 2
+
+    def test_two_different_datasets_each_get_own_warning(self, caplog):
+        manager = DatasetManager(_make_config())
+        rules = [
+            RetentionRule(Duration('1h'), Duration('7d')),
+            RetentionRule(Duration('1d'), Duration('1w')),
+        ]
+        with caplog.at_level(logging.WARNING):
+            manager._retention_plan(self._dsi('pool/a', rules))
+            manager._retention_plan(self._dsi('pool/b', rules))
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 2
+        assert any('pool/a' in w.message for w in warnings)
+        assert any('pool/b' in w.message for w in warnings)
+
+
+class TestDatasetReportCollisionWarnings:
+    """`DatasetManager.dataset_report()` surfaces retention-rule collisions
+    at boot -- the first signal for a colliding config should be in the
+    supervisor's log, not a worker's first prune/backup cycle -- for both
+    the dataset-level rules and each declared destination's effective
+    rules."""
+
+    def test_dataset_level_collision_warns(self, caplog):
+        config = _make_config(datasets=[DatasetConfig(
+            name='pool/data',
+            retention_rules=[
+                RetentionRule(Duration('1h'), Duration('7d')),
+                RetentionRule(Duration('1d'), Duration('1w')),
+            ],
+        )])
+        manager = DatasetManager(config)
+        with caplog.at_level(logging.WARNING):
+            manager.dataset_report()
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1
+        assert warnings[0].message.startswith('Dataset pool/data:')
+
+    def test_destination_effective_collision_warns(self, caplog):
+        config = _make_config(datasets=[DatasetConfig(
+            name='pool/data',
+            retention_rules=[RetentionRule(Duration('1h'), Duration('1d'))],  # no collision
+            remote=[RemoteDatasetConfig(
+                destination='offsite',
+                retention_rules=[
+                    RetentionRule(Duration('1h'), Duration('7d')),
+                    RetentionRule(Duration('1d'), Duration('1w')),
+                ],
+            )],
+        )])
+        manager = DatasetManager(config)
+        with caplog.at_level(logging.WARNING):
+            manager.dataset_report()
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1
+        assert warnings[0].message.startswith('Dataset pool/data -> offsite:')
+
+    def test_no_collision_produces_no_warnings(self, caplog):
+        manager = DatasetManager(_make_config())
+        with caplog.at_level(logging.WARNING):
+            manager.dataset_report()
+        assert [r for r in caplog.records if r.levelname == 'WARNING'] == []
+
+    def test_dataset_and_destination_collisions_both_warn_independently(self, caplog):
+        config = _make_config(datasets=[DatasetConfig(
+            name='pool/data',
+            retention_rules=[
+                RetentionRule(Duration('1h'), Duration('7d')),
+                RetentionRule(Duration('1d'), Duration('1w')),
+            ],
+            remote=[RemoteDatasetConfig(
+                destination='offsite',
+                retention_rules=[
+                    RetentionRule(Duration('6h'), Duration('30d')),
+                    RetentionRule(Duration('1h'), Duration('30d')),
+                ],
+            )],
+        )])
+        manager = DatasetManager(config)
+        with caplog.at_level(logging.WARNING):
+            manager.dataset_report()
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 2
+        assert any(w.message.startswith('Dataset pool/data:') for w in warnings)
+        assert any(w.message.startswith('Dataset pool/data -> offsite:') for w in warnings)

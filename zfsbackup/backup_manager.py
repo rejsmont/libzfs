@@ -1,7 +1,7 @@
 """Snapshot manager for creating and managing ZFS snapshots."""
 
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 import logging
 import sys
 import os
@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import libzfseasy as zfs
 from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
-from zfsbackup.config import BackupConfig, DatasetConfig
+from zfsbackup.config import BackupConfig, DatasetConfig, _collapse_retention_rules
 
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,15 @@ class DatasetManager:
     def __init__(self, config: BackupConfig):
         self.config = config
         self._datasets = None
+        # (dataset name, ruleset) pairs whose retention-rule collisions have
+        # already been warned about, so `needs_prunning` (called every pruning
+        # cycle) warns once per distinct ruleset for this manager's lifetime
+        # rather than every cycle. Keyed on content, not name alone: received
+        # datasets are re-parsed fresh from PROP_CONFIG every pruning cycle
+        # (`PruningWorker._get_datasets` -> `received_datasets()`), so a
+        # client that re-negotiates and pushes a *different* colliding
+        # ruleset under the same dataset name must still warn.
+        self._retention_warned: Set[Tuple[str, FrozenSet[Tuple[float, float]]]] = set()
 
     @property
     def datasets(self) -> List[DatasetInfo]:
@@ -99,8 +108,20 @@ class DatasetManager:
             logger.info(f"    Retention rules: {len(ds.retention_rules)}")
             for rule in ds.retention_rules:
                 logger.info(f"      - Age {rule.age} -> Keep for {rule.keep_for}")
+            # Surface retention-rule collisions at startup, in the
+            # supervisor's log -- the first signal for a colliding config
+            # should be at boot, not a worker's first prune/backup cycle.
+            _, collisions = _collapse_retention_rules(ds.retention_rules)
+            for msg in collisions:
+                logger.warning(f"Dataset {ds.name}: {msg}")
             if ds.remote:
                 logger.info(f"    Remote destinations: {[r.destination for r in ds.remote]}")
+                for r in ds.remote:
+                    _, dest_collisions = _collapse_retention_rules(
+                        ds.effective_retention_rules(r.destination)
+                    )
+                    for msg in dest_collisions:
+                        logger.warning(f"Dataset {ds.name} -> {r.destination}: {msg}")
 
     # ── ZFS property helpers ──────────────────────────────────────────────────
 
@@ -208,15 +229,34 @@ class DatasetManager:
         logger.debug(f"Dataset {dsi.name} needs snapshot: {needs} (age={age}, frequency={dsi.frequency})")
         return needs
 
+    def _retention_plan(self, dsi: DatasetInfo) -> Dict[float, float]:
+        """Return the resolved `{keep_for_seconds: age_seconds}` plan for a
+        dataset's retention rules (see `_collapse_retention_rules`). Never
+        hard-fails; any collision is resolved toward retaining more data and
+        logged once per distinct ruleset for the lifetime of this manager
+        (re-fires if the ruleset actually changes -- see `_retention_warned`).
+        """
+        plan, collisions = _collapse_retention_rules(dsi.config.retention_rules)
+        if collisions:
+            key = (
+                dsi.name,
+                frozenset(
+                    (r.age.total_seconds(), r.keep_for.total_seconds())
+                    for r in dsi.config.retention_rules
+                ),
+            )
+            if key not in self._retention_warned:
+                self._retention_warned.add(key)
+                for msg in collisions:
+                    logger.warning(f"Dataset {dsi.name}: {msg}")
+        return plan
+
     def needs_prunning(self, dsi: DatasetInfo, anchors: Optional[Set[str]] = None) -> List['SnapshotInfo']:
         snapshots = dsi.snapshots
         if not snapshots or not dsi.config.retention_rules:
             return []
 
-        plan = {
-            rule.keep_for.total_seconds(): rule.age.total_seconds()
-            for rule in dsi.config.retention_rules
-        }
+        plan = self._retention_plan(dsi)
         sorted_expiries = sorted(plan.keys())
 
         now = datetime.now(timezone.utc)

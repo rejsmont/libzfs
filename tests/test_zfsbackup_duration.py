@@ -579,6 +579,9 @@ class TestConfigProducesDurationsWithLiterals:
             "    remote:\n"
             "      - destination: offsite\n"
             "        frequency: 30d\n"
+            "destinations:\n"
+            "  offsite:\n"
+            "    url: http://backup.example.com\n"
         )
         return BackupConfig.from_file(f)
 
