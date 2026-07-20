@@ -214,6 +214,41 @@ def _duration_from_config(value, key: str) -> Duration:
     return Duration(value)
 
 
+def _mapping_from_config(value, key: str, expected: str) -> dict:
+    """Ensure a value taken directly off parsed YAML is a mapping before it is
+    indexed or iterated with `.items()`/`.get()`.
+
+    YAML happily parses a list or a bare scalar wherever a mapping is
+    expected (e.g. ``retention: ["1d", "30d"]`` instead of
+    ``retention: {1d: 30d}``); left unchecked that surfaces as a raw
+    `AttributeError` deep inside dict-only code. Reject anything that isn't
+    already a `dict` here, before it reaches such code.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{key} must be {expected}, got {type(value).__name__} {value!r}"
+        )
+    return value
+
+
+def _list_from_config(value, key: str, expected: str) -> list:
+    """Ensure a value taken directly off parsed YAML is a list before it is
+    indexed or iterated as a sequence of entries.
+
+    YAML happily parses a mapping or a bare scalar wherever a list is
+    expected (e.g. ``remote: {destination: offsite}`` instead of
+    ``remote: [{destination: offsite}]``); left unchecked, iterating a
+    mapping silently yields its keys instead of raising, and iterating a
+    string silently yields characters. Reject anything that isn't already a
+    `list` here, before it reaches such code.
+    """
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{key} must be {expected}, got {type(value).__name__} {value!r}"
+        )
+    return value
+
+
 @dataclass
 class RetentionRule:
     """Retention rule defining one tier of a tiered retention policy."""
@@ -301,8 +336,15 @@ class DatasetConfig:
         )
 
     @classmethod
-    def from_dict(cls, data: dict) -> 'DatasetConfig':
-        """Create DatasetConfig from a YAML-parsed dictionary."""
+    def from_dict(cls, data: dict, key: str = 'datasets[?]') -> 'DatasetConfig':
+        """Create DatasetConfig from a YAML-parsed dictionary.
+
+        `key` is the caller's key path for this entry (e.g. ``datasets[2]``),
+        used only to name the dataset in errors raised before `name` itself
+        has been read off `data`.
+        """
+        data = _mapping_from_config(data, key, "a mapping")
+
         name = data.get('name')
         if not name:
             raise ValueError("Dataset 'name' is required")
@@ -314,20 +356,34 @@ class DatasetConfig:
         frequency = _duration_from_config(freq_str, f"datasets[{name}].frequency")
 
         retention_rules = []
-        retention_dict = data.get('retention', {})
+        retention_dict = data.get('retention')
         if not retention_dict:
             retention_dict = {'1d': '30d'}
+        else:
+            retention_dict = _mapping_from_config(
+                retention_dict,
+                f"datasets[{name}].retention",
+                "a mapping of age -> keep_for",
+            )
+        # NOTE: duplicate age/keep_for validation belongs here, after the
+        # shape check and before rules are built.
         for age_str, keep_str in retention_dict.items():
             age = _duration_from_config(age_str, f"datasets[{name}].retention")
             keep_for = _duration_from_config(keep_str, f"datasets[{name}].retention")
             retention_rules.append(RetentionRule(age=age, keep_for=keep_for))
         retention_rules.sort(key=lambda r: r.age)
 
+        remote_data = _list_from_config(
+            data.get('remote', []), f"datasets[{name}].remote", "a list of mappings"
+        )
         remote = []
-        for r in data.get('remote', []):
+        for idx, r in enumerate(remote_data):
+            r = _mapping_from_config(r, f"datasets[{name}].remote[{idx}]", "a mapping")
             dest = r.get('destination')
             if not dest:
-                raise ValueError("Each remote entry requires a 'destination'")
+                raise ValueError(
+                    f"datasets[{name}].remote[{idx}] requires a 'destination'"
+                )
             freq = (
                 _duration_from_config(r['frequency'], f"datasets[{name}].remote[{dest}].frequency")
                 if r.get('frequency') is not None else None
@@ -371,11 +427,17 @@ class BackupConfig:
 
         if not data:
             raise ValueError("Config file is empty")
+        data = _mapping_from_config(data, "config", "a top-level mapping")
 
-        datasets_data = data.get('datasets', [])
+        datasets_data = _list_from_config(
+            data.get('datasets', []), "datasets", "a list of dataset mappings"
+        )
         if not datasets_data:
             raise ValueError("No datasets configured")
-        datasets = [DatasetConfig.from_dict(ds) for ds in datasets_data]
+        datasets = [
+            DatasetConfig.from_dict(ds, key=f"datasets[{idx}]")
+            for idx, ds in enumerate(datasets_data)
+        ]
 
         snapshot_prefix = data.get('snapshot_prefix', 'autosnap')
         dry_run = data.get('dry_run', False)
@@ -389,16 +451,23 @@ class BackupConfig:
         api_host = data.get('api_host', '127.0.0.1')
         api_port = int(data.get('api_port', 8080))
 
+        destinations_data = _mapping_from_config(
+            data.get('destinations', {}), "destinations", "a mapping of name -> destination"
+        )
         destinations: Dict[str, Destination] = {}
-        for dest_name, dest_data in data.get('destinations', {}).items():
+        for dest_name, dest_data in destinations_data.items():
+            dest_data = _mapping_from_config(
+                dest_data, f"destinations[{dest_name}]", "a mapping"
+            )
             url = dest_data.get('url')
             if not url:
                 raise ValueError(f"Destination '{dest_name}' requires 'url'")
             destinations[dest_name] = Destination(url=url)
 
         remote_backup: Optional[RemoteServerConfig] = None
-        rb_data = data.get('remote_backup', {})
+        rb_data = data.get('remote_backup')
         if rb_data:
+            rb_data = _mapping_from_config(rb_data, "remote_backup", "a mapping")
             target = rb_data.get('target_dataset')
             if not target:
                 raise ValueError("remote_backup requires 'target_dataset'")
