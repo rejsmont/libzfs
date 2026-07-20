@@ -34,12 +34,16 @@ Path traversal via `client_id`/`dataset` is *mitigated* (the `Validate` name reg
 `..` and shell metacharacters) but handled by raising an uncaught `ValueError` → HTTP 500
 rather than a clean rejection.
 
-### B2 — `requests` is imported but is not a declared dependency
-`zfsbackup/remote.py:11` does `import requests`, but `pyproject.toml` declares only
-`pyyaml`, `flask`, `flask-sock`, `websocket-client`. `requests` is present only transitively
-via the **dev**-only `requests-mock`. A clean `poetry install --without dev` yields an
-environment where the entire client-side remote-backup path dies with `ModuleNotFoundError`
-on first use. (The two-VM harness works around this by `pip install requests` explicitly.)
+### ~~B2 — `requests` is imported but is not a declared dependency~~ — **RESOLVED**
+`zfsbackup/remote.py:11` does `import requests`, but `pyproject.toml` declared only
+`pyyaml`, `flask`, `flask-sock`, `websocket-client`. `requests` was present only transitively
+via the **dev**-only `requests-mock`. A clean `poetry install --without dev` yielded an
+environment where the entire client-side remote-backup path died with `ModuleNotFoundError`
+on first use. (The two-VM harness worked around this by `pip install requests` explicitly.)
+
+**Resolved** by item 1 of [config_db_cli_plan.md](config_db_cli_plan.md): `requests = "^2.31"` is now a
+declared direct dependency. `click` was promoted from transitive-via-Flask to direct in the same change,
+closing the identical latent gap before it could bite.
 
 ---
 
