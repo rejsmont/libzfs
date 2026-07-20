@@ -674,6 +674,19 @@ class BackupConfig:
             for idx, ds in enumerate(datasets_data)
         ]
 
+        # The store schema's `datasets.name UNIQUE` constraint is stricter
+        # than this loader: without this check, a YAML with two entries for
+        # the same dataset loads clean here and only fails later, as a bare
+        # IntegrityError, when imported into the store (item 8).
+        seen_names: Dict[str, int] = {}
+        for idx, ds in enumerate(datasets):
+            if ds.name in seen_names:
+                raise ValueError(
+                    f"datasets[{idx}]: duplicate dataset name {ds.name!r} "
+                    f"(already used by datasets[{seen_names[ds.name]}])"
+                )
+            seen_names[ds.name] = idx
+
         snapshot_prefix = data.get('snapshot_prefix', 'autosnap')
         dry_run = data.get('dry_run', False)
 
