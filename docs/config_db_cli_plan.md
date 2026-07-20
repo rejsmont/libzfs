@@ -410,6 +410,82 @@ Every operation performed on these values today, with the exact call site:
 
 ## Phase 1 — SQLite config store
 
+### Item 2b — Retention `keep_for` collapse: reject on write, min + warn on read
+
+Phase 1 opens with this because it is a **pre-existing data-loss bug**, independent of the DB work, and
+item 3's `UNIQUE(dataset_id, keep_for_seconds)` is the schema half of the same decision. It can land and
+ship on its own.
+
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(retention logic)* — **approved by the
+  user**; the strategy below is settled, the implementation still gets a review pass.
+- **Files:** `zfsbackup/backup_manager.py`, `zfsbackup/config.py`
+- **Basis:** `backup_manager.py:216-219` builds `plan = {keep_for: age}` by dict comprehension, so two
+  rules sharing a `keep_for` collapse to whichever is written last — **silently**, with no error and no
+  log line.
+
+**Why this matters more than the contrived `1M`/`30d` case.** The realistic trigger is mixed notation:
+
+```yaml
+retention:
+  "1h": "7d"     # hourly, kept a week
+  "1d": "1w"     # daily, kept a week      <- same expiry, 604800s
+```
+Verified: this yields `{604800.0: 86400.0}` — **one tier**. The hourly rule is gone; you asked for hourly
+granularity for a week and get daily.
+
+**The tie-break is systematically the worst available.** `config.py:155` sorts rules by `age` **ascending**,
+so the dict comprehension's last write is always the **largest interval**. On collision the code reliably
+discards the finer tier and keeps the coarser one — pruning *more* aggressively than either rule alone
+implies. Confirmed across all measured collision cases.
+
+**Strategy — strict on write, lenient but loud on read** *(user decision)*:
+
+1. **Reject on write.** Two rules with equal `keep_for` is a config error. Raise `ValueError` naming both
+   rules and both literals (e.g. `retention: "7d" and "1w" are the same duration (604800s); one rule per
+   keep_for`). Applies to the Phase 2 CLI `set`/`edit` paths, item 8's `import`, and is enforced
+   structurally by item 3's `UNIQUE(dataset_id, keep_for_seconds)`.
+2. **Resolve toward retaining more, and warn, on read.** If a collision reaches `needs_prunning` anyway,
+   never silently collapse. The governing principle on **both** axes is *keep whichever rule retains more
+   data*:
+
+   | collision | resolution | why |
+   |---|---|---|
+   | same `keep_for`, different `age` | take **min** `age` | finer interval keeps more snapshots, and subsumes the coarser |
+   | same `age`, different `keep_for` | take **max** `keep_for` | longer expiry keeps snapshots longer, and subsumes the shorter |
+
+   ```python
+   # 1. collapse on keep_for (min interval), 2. then on age (max expiry) -- order is significant
+   plan = {}
+   for rule in dsi.config.retention_rules:
+       expiry, interval = rule.keep_for.total_seconds(), rule.age.total_seconds()
+       if expiry in plan and plan[expiry] != interval:
+           logger.warning(...)          # dataset, both literals, chosen interval
+       plan[expiry] = min(plan.get(expiry, interval), interval)
+   ```
+
+   **⚠ The two dedupe passes do not commute — fix the order and test it.** Given
+   `{(1d,1w), (1d,1M), (1h,1M)}`: collapsing `age` first yields one rule `{(1h,1M)}`; collapsing
+   `keep_for` first yields two, `{(1d,1w), (1h,1M)}`. Specify **`keep_for` first, then `age`** — it is the
+   branch that retains more rules, consistent with the principle above. (In this example both outcomes
+   retain the same *snapshots*, since hourly-for-a-month subsumes daily-for-a-week, but the rule sets
+   differ and determinism matters for the item-3 constraints.)
+
+**Load never hard-fails** *(user decision — settled)*. A daemon running happily on such a config must not
+refuse to start after an upgrade; backups silently stopping is worse than a resolved-and-logged ambiguity.
+The read path stays permissive and loud; the write paths (CLI, `import`, item 3's constraints) ensure no
+*new* config can acquire the defect.
+
+- **Edge cases:** the warning must fire once per dataset per load, not once per snapshot evaluated
+  (`needs_prunning` runs every pruning cycle — see `workers.py:122`). Equal `keep_for` **and** equal
+  interval is a true duplicate, not a conflict: dedupe silently, no warning.
+- **Deliberately unchanged:** the tightest-tier-only semantics of step 3 (each snapshot is claimed by
+  exactly one tier, not by every applicable tier). Whether that or znapzend-style union-of-tiers was
+  intended is a **separate question** affecting every config, not just colliding ones — out of scope here.
+- **Verification:** `pytest tests/test_zfsbackup_manager.py -k retention` — the `7d`/`1w` config keeps the
+  hourly tier; the warning fires once and names both literals; equal-interval duplicates are silent;
+  non-colliding configs produce a byte-identical plan to today.
+- **Tests:** `pytest-test-author`, same cycle.
+
 ### Item 3 — Schema + ORM models
 
 - **Owner:** `zfsbackup-developer` · **Tag:** `low-risk` *(new files, nothing wired in yet)*
@@ -422,53 +498,46 @@ Every operation performed on these values today, with the exact call site:
     (items 15 and 17).
   - `datasets` — `id`, `name UNIQUE NOT NULL`, `recursive`, `frequency_seconds`, `frequency_literal`,
     `enabled` (`config.py:79-86`).
-  - `retention_rules` — `id`, `dataset_id FK ON DELETE CASCADE`, `age_seconds`, `age_literal`,
-    `keep_for_seconds`, `keep_for_literal`, **`UNIQUE(dataset_id, age_seconds)`** — enforces the
-    dict-key uniqueness YAML gives for free at `config.py:151`.
+  - `retention_rules` — `id`, `dataset_id FK ON DELETE CASCADE`,
+    **`destination_name FK → destinations(name) ON DELETE CASCADE, NULL`**, `age_seconds`, `age_literal`,
+    `keep_for_seconds`, `keep_for_literal`, with
+    **`UNIQUE(dataset_id, destination_name, age_seconds)`** and
+    **`UNIQUE(dataset_id, destination_name, keep_for_seconds)`** — see item 2b and item 3b.
 
-    > **⚠ This constraint as written guards the WRONG AXIS — do not implement it unchanged.**
-    > *(Raised in the first Phase 0 review, then corrected in the second; the original recommendation
-    > here was wrong and is retained below only as a warning.)*
-    >
-    > A YAML retention map may contain two keys that are textually distinct but numerically identical —
-    > `{"1M": ..., "30d": ...}` — because YAML sees two different string keys. It was initially assumed
-    > that duplicate *ages* were the hazard, and `UNIQUE(dataset_id, age_seconds)` was recommended to
-    > reject them. **That is backwards.** The retention engine does not key on age. At
-    > `backup_manager.py:216-219`:
-    >
-    > ```python
-    > plan = {
-    >     rule.keep_for.total_seconds(): rule.age.total_seconds()
-    >     for rule in dsi.config.retention_rules
-    > }
+    `destination_name IS NULL` means the **dataset-level** rule set: what governs local pruning, and what
+    a destination with no rules of its own inherits. A non-NULL `destination_name` scopes the rule to that
+    destination only.
+
+    > **⚠ SQLite treats NULLs as distinct in UNIQUE constraints**, so `UNIQUE(dataset_id,
+    > destination_name, age_seconds)` does **not** constrain the dataset-level rows at all — every
+    > `NULL` destination compares unequal to every other. This is the classic nullable-column-in-a-unique-key
+    > trap and it silently defeats the item-2b invariant exactly where it matters most (local pruning).
+    > Use a **partial unique index** for the NULL case, or store a sentinel (`''`) rather than NULL:
+    > ```sql
+    > CREATE UNIQUE INDEX ... ON retention_rules(dataset_id, age_seconds)
+    >   WHERE destination_name IS NULL;
+    > CREATE UNIQUE INDEX ... ON retention_rules(dataset_id, keep_for_seconds)
+    >   WHERE destination_name IS NULL;
     > ```
+    > Verify with an actual duplicate insert in item 9 — this is not something to take on faith.
+
+    > **Both axes are unique** *(user decision — settled)*. Retention is a **bijection between intervals
+    > and expiries**: one rule per `age`, one rule per `keep_for`. Two constraints, not one.
     >
-    > The dict is keyed on **`keep_for`**. Measured against the running code:
+    > `keep_for` uniqueness is what `needs_prunning` structurally requires — `plan[applicable_expiry]`
+    > (`backup_manager.py:237`) is a single lookup, so expiry → interval must be a function.
     >
-    > | config | rules parsed | runtime `plan` entries | tiers lost |
-    > |---|---|---|---|
-    > | `{"1M": "1y", "30d": "3M"}` — duplicate **age** | 2 | 2 | **0** |
-    > | `{"1d": "1M", "1w": "30d"}` — duplicate **keep_for** | 2 | 1 | **1** |
-    > | `{"1d": "1y", "1w": "365d"}` — duplicate **keep_for** | 2 | 1 | **1** |
+    > `age` uniqueness is a **semantic** requirement rather than a mechanical one: two rules sharing an
+    > interval differ only in expiry, and the longer expiry entirely subsumes the shorter.
+    > `{"1d": "1w", "24h": "1M"}` is not two tiers — it is "daily for a month", written confusingly, with a
+    > redundant clause. The runtime tolerates it today (2 distinct expiry keys, no collapse), which is why
+    > it is a config-hygiene rule rather than a bug fix.
     >
-    > So the case the proposed constraint rejects is **benign** — two tiers with equal intervals but
-    > distinct expiries, both of which survive. The case that actually **destroys a retention tier** has
-    > distinct ages, passes `UNIQUE(dataset_id, age_seconds)` cleanly, and silently drops a tier via
-    > last-writer-wins in the dict comprehension — no error, no log line, and more aggressive pruning
-    > than the user asked for. Implementing the constraint as originally written would reject a working
-    > config while continuing to accept the destructive one.
-    >
-    > **This silent tier collapse is a pre-existing bug**, not introduced by Phase 0, and it is the same
-    > `1M`/`30d` collision item 2 exists to address — reaching the retention engine instead of the config
-    > text.
-    >
-    > **Decide before implementing item 3**, and decide the `keep_for` axis, not just the age axis:
-    > (a) **fix the collapse at its source** — rekey `plan` on `(keep_for, age)` or have `needs_prunning`
-    > iterate the rule list rather than build a dict, making the constraint unnecessary
-    > (**recommended** — the constraint is only ever a proxy for this bug); (b) add
-    > `UNIQUE(dataset_id, keep_for_seconds)` alongside or instead of the age constraint, which converts
-    > silent tier loss into a loud import failure but leaves the runtime bug live for YAML users;
-    > (c) no constraint. Option (a) is a retention-logic change and is squarely `needs-approval`.
+    > Earlier drafts of this plan got this wrong twice, recorded so neither is re-proposed: constraining
+    > **only** `age` (wrong — it is `keep_for` that the algorithm structurally depends on), and rekeying
+    > `plan` on `(keep_for, age)` (wrong on mechanics — a tuple key breaks the `sorted_expiries` scan and
+    > the `plan[...]` lookup in step 3). A third draft then argued duplicate `age` was *legitimate* — also
+    > wrong, per the subsumption argument above.
   - `destinations` — `name PRIMARY KEY`, `url NOT NULL` (`config.py:220-225`).
   - `dataset_remotes` — `id`, `dataset_id FK CASCADE`, `destination_name FK`, `frequency_seconds NULL`,
     `frequency_literal NULL`. NULL frequency = inherit, per `config.py:68`.
@@ -477,6 +546,76 @@ Every operation performed on these values today, with the exact call site:
 - **Edge cases:** `PRAGMA foreign_keys=ON` must be set per-connection (SQLite defaults it off) — item 5.
   No ordering column needed for retention; rules are sorted by age at read time (`config.py:155`).
 - **Verification:** `pytest tests/test_zfsbackup_store.py -k schema`
+
+### Item 3b — Per-destination retention rules
+
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(retention + remote/wire behaviour)*
+- **Files:** `zfsbackup/config.py`, `zfsbackup/remote.py`, `zfsbackup/backup_manager.py`
+- **Basis:** user decision. Today `RemoteDatasetConfig` (`config.py:66-69`) carries only `destination` and
+  an optional `frequency`; retention is dataset-wide. The requirement is that a client can keep, say,
+  hourly-for-a-month locally but daily-for-five-years at an offsite destination.
+
+**The transport already supports this with no wire-schema change — this is the key finding.** Config does
+**not** travel via `zfs send -p`. The client POSTs it explicitly, **per destination**, at negotiate time
+(`remote.py:102-110`), and the server stores the blob verbatim on the received dataset and prunes with it
+(`api.py` negotiate handler → `backup_manager.py:188` → `workers.py:125`). Therefore:
+
+- **The receiving machine never needs to identify itself.** It does not need to know it is called
+  `offsite` by this client. The client already knows which destination it is negotiating with and sends
+  that destination's *effective* rules.
+- **`to_property()`'s output shape is unchanged** — still `retention_rules: [{age, keep_for}]`. Only the
+  *contents* differ per destination. An existing server understands it as-is, so this is
+  **backward compatible with already-deployed servers**, which the plan otherwise treats as frozen.
+
+**Changes:**
+- `RemoteDatasetConfig` gains `retention_rules: List[RetentionRule]` (default empty).
+- **`to_property(destination: str | None = None)`** — emits the effective rules for that destination.
+  `remote.py:108` passes the destination it is negotiating with. `sync_config_property`
+  (`backup_manager.py:118`), which describes the *local* dataset, keeps calling it with no argument and so
+  emits the dataset-level rules. `from_property` is unchanged.
+- Local pruning uses dataset-level rules only (`destination_name IS NULL`).
+
+**Inheritance — override, not merge** *(user decision)*. A destination with no rules of its own inherits
+the dataset-level set; a destination that declares **any** rule replaces the set entirely. This is the same
+principle the user stated for the receive side — *"if new rules are received, these rules overwrite the
+whole ruleset for the received dataset"* — applied consistently at both ends: **whatever ruleset applies to
+a scope is complete and replaces what was there**, never merged.
+
+Consequences:
+- The client computes the effective ruleset for a destination and sends it complete; the server adopts it
+  wholesale, discarding any previous rules for that received dataset. That is what `api.py`'s negotiate
+  handler already does (it `zfs set`s `PROP_CONFIG` verbatim), so **the receive side needs no change**.
+- A destination override must restate every tier it still wants. Predictable, and it matches the existing
+  `frequency` precedent at `config.py:68` (`None = inherit from DatasetConfig`).
+
+**Proposed YAML shape** (extends `config.example.yaml:43-47`):
+```yaml
+    retention:              # dataset-level: local pruning, and the inherited default
+      "1h": "1d"
+      "1d": "1M"
+    remote:
+      - destination: offsite
+        frequency: "4h"
+        retention:          # overrides the above for this destination only
+          "1d": "5y"
+      - destination: datacenter2
+        # no retention key -> inherits the dataset-level set
+```
+
+- **Item 2b applies per scope:** uniqueness and the collision fallback are evaluated within each
+  `(dataset, destination)` rule set independently, not across the union.
+- **Edge cases:** a destination declaring an empty `retention: {}` is **rejected** *(user decision)* — it
+  could plausibly mean "inherit" or "keep everything forever", and guessing the second direction fills the
+  pool. Error must state both alternatives: omit the key to inherit, or declare rules. Note there is
+  consequently **no way to express "never prune at this destination"**; if that is wanted later it needs an
+  explicit spelling (`retention: none`), not an empty map. Deleting a
+  destination must cascade its retention rows (item 3's FK). A destination referenced with retention but
+  never declared in `destinations:` must fail validation.
+- **Verification:** `pytest tests/test_zfsbackup_manager.py -k "per_destination or retention"` — a
+  destination with rules emits those in `to_property(dest)`; one without emits the dataset-level set;
+  local pruning is unaffected by destination rules; `to_property()` with no argument is byte-identical to
+  today for a config with no per-destination rules (**wire-compatibility assertion — required**).
+- **Tests:** `pytest-test-author`, same cycle.
 
 ### Item 4 — Mapper layer (ORM ⇄ dataclass)
 
@@ -537,30 +676,60 @@ Every operation performed on these values today, with the exact call site:
 - **Default DB path: `/var/lib/zfsbackup/config.db`** (per user decision).
 - **Resolution order** (first match wins), used identically by daemon and CLI:
   1. Explicit `-c/--config` argument.
-  2. `ZFSBACKUP_CONFIG` environment variable. *(Recommended — it is what makes the CLI usable in
-     containers and test harnesses without repeating `-c` on every invocation, and `scenarios/` will
-     want it.)*
+  2. `ZFSBACKUP_CONFIG` environment variable — makes the CLI usable in containers and test harnesses
+     without repeating `-c`, and `scenarios/` will want it.
   3. `/var/lib/zfsbackup/config.db` if it exists.
-  4. `/etc/zfsbackup/config.yaml` if it exists — **preserves today's default** (`daemon.py:126`) so
-     existing deployments are unaffected.
-  5. Otherwise: error, listing every path tried.
-- **Creation policy — daemon errors, CLI creates only on explicit import.** Recommended split:
+  4. Otherwise: error, listing every path tried. **`/etc/zfsbackup/config.yaml` is no longer a daemon
+     source** — see item 8; the error message must say so and point at `zfsbackup-config import`.
+- **Creation policy — daemon errors, CLI creates only on explicit import.**
   - The **daemon must never auto-create** a config DB. An empty config means "back up nothing", silently.
     `config.py:204-205` already errors on no datasets; preserve that posture.
-  - The **CLI creates** only via `zfsbackup-config import` (item 8), which makes directory and file
-    creation an explicit, intentional act. All other CLI commands error with a message naming the
-    default path and suggesting `import`.
-- **Permissions — and a non-obvious WAL trap.** The daemon typically runs as root; the CLI may not.
-  - Directory `/var/lib/zfsbackup/` → `0750 root:zfsbackup`; `config.db` → `0660 root:zfsbackup`.
-  - **A WAL-mode SQLite reader needs write permission on both the database file and its containing
-    directory**, because it may need to create or update `-wal` and `-shm`. A read-only user therefore
-    cannot open a WAL database at all. This surprises people; document it prominently.
-  - Consequence: anyone editing config must be in the `zfsbackup` group. That is the trade-off of WAL
-    and it should be stated, not discovered.
-  - The CLI must produce a clear diagnostic on `EACCES` — "you are not in the `zfsbackup` group" — rather
-    than a raw `sqlite3.OperationalError: unable to open database file`.
+  - The **CLI creates** only via `zfsbackup-config import` (item 8), making directory and file creation an
+    explicit, intentional act. All other CLI commands error with a message naming the default path and
+    suggesting `import`.
+
+- **Run-as model — dedicated non-root daemon user, `zfsbackup` group for the CLI** *(user decision)*.
+  - Daemon runs as user `zfsbackup`, group `zfsbackup`.
+  - Directory `/var/lib/zfsbackup/` → `0770 zfsbackup:zfsbackup`; `config.db` → `0660
+    zfsbackup:zfsbackup`. **Directory must be group-writable**, not `0750` — see the WAL trap below.
+  - Operators who edit config join the `zfsbackup` group. The CLI must produce a clear diagnostic on
+    `EACCES` — "you are not in the `zfsbackup` group" — rather than a raw
+    `sqlite3.OperationalError: unable to open database file`.
+  - **The WAL trap is why the directory is `0770`:** a WAL-mode SQLite *reader* needs write permission on
+    **both the database file and its containing directory**, because it may create or update `-wal` and
+    `-shm`. A read-only user cannot open a WAL database at all. Document prominently.
+
+  > **⚠ Running the daemon non-root is a real deployment project on Linux, not a permissions tweak.**
+  > Flagging it here because the plan cannot deliver it by choosing file modes, and discovering it during
+  > Phase 3 would be expensive. Everything the daemon does to ZFS needs delegation via `zfs allow`:
+  >
+  > | operation | code | delegation needed |
+  > |---|---|---|
+  > | create snapshots | `SnapshotWorker` | `snapshot` |
+  > | prune | `prune_snapshots` | `destroy`, `mount` |
+  > | send | `remote.py` | `send` |
+  > | receive (server) | `api.py` | `create`, `receive`, `mount` |
+  > | config + anchor properties | `backup_manager.py:118,162` (`org.zfsbackup:*`) | `userprop` |
+  >
+  > **The hard part is `mount`.** On Linux, `zfs allow mount` is necessary but **not sufficient** —
+  > `mount(2)` itself is privileged, so a delegated non-root user still cannot mount a filesystem.
+  > `destroy` on a mounted dataset and `receive` that mounts both hit this. Practical mitigations:
+  > receive with `-u` so the dataset is never mounted, keep received datasets `canmount=noauto`, or grant
+  > the daemon `CAP_SYS_ADMIN` — each with its own trade-offs.
+  >
+  > **Decision — non-root is DEFERRED to its own workstream** *(user decision: `zfs allow` is not currently
+  > set up)*. Phase 1 ships the **file layout only**: `zfsbackup:zfsbackup` ownership, `0770` directory,
+  > `0660` DB, and group-based CLI access. **The daemon continues to run as root for now.** The permission
+  > model above is correct for both cases — only the ZFS delegation differs — so nothing here needs redoing
+  > when non-root lands.
+  >
+  > Tracked in the deferrals table. That workstream owns: the `zfs allow` recipe per operation, the Linux
+  > `mount` restriction and which mitigation to adopt, a real-pool scenario proving each delegated
+  > operation, and a systemd unit running as `zfsbackup`.
+
 - **Verification:** `pytest tests/test_zfsbackup_store.py -k "resolution or permission"` (permissions via
-  `tmp_path` + `chmod`, skipped when running as root).
+  `tmp_path` + `chmod`, skipped when running as root). Non-root ZFS delegation is out of scope for pytest
+  and belongs in a `scenarios/` script (item 22).
 
 ### Item 7 — Alembic scaffolding + initial revision
 
@@ -573,29 +742,75 @@ Every operation performed on these values today, with the exact call site:
   code** (forward-compatibility guard).
 - **Verification:** `pytest tests/test_zfsbackup_store.py -k migration`
 
-### Item 8 — Config source dispatch + YAML import; YAML support policy
+### Item 8 — DB as canonical config source; YAML demoted to import + edit buffer
 
 - **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(daemon config-loading contract + IPC payload)*
 - **Files:** `zfsbackup/config.py`, `zfsbackup/daemon.py`, `zfsbackup/workers.py`, new
   `zfsbackup/store/importer.py`
 - **Basis:** `daemon.py:153`, `daemon.py:54`, `workers.py:62`, `workers.py:196`.
-- **Recommended policy — YAML stays fully supported.** The DB is an *additional* store, not a
-  replacement. YAML remains the natural format for config management (Ansible, containers, git), the
-  example files stay valid, and every existing test and scenario keeps working. The DB earns its place by
-  enabling Phase 2's transactional editing, not by deprecating YAML.
+
+- **Policy — the DB is canonical; YAML is not a runtime config source** *(user decision — this reverses an
+  earlier draft that kept YAML first-class)*. YAML survives in exactly two roles:
+  1. **Import**, for migrating an existing deployment or bootstrapping a new one.
+  2. **The transient edit buffer** — the CLI renders YAML from the DB, opens `$EDITOR`, validates on exit,
+     and writes back (item 12). The file is scratch, not a source of truth.
+
+  **The daemon reads only the DB.** `python -m zfsbackup.daemon -c config.yaml` stops working.
+
+  > **⚠ This has real churn beyond the daemon, all of which lands in this item's cycle.** The following
+  > currently obtain config from YAML and must move to import-then-point-at-DB:
+  >
+  > | consumer | current | needed |
+  > |---|---|---|
+  > | `tests/conftest.py:201` | calls `from_file` directly | fixture imports YAML → temp DB |
+  > | `tests/test_zfsbackup_real.py:415` | `from_file` on a YAML path | same |
+  > | `tests/test_zfsbackup_daemon.py:211,231`, `tests/test_zfsbackup_workers.py:228` | patch `from_file` by name | patch the new loader |
+  > | `scenarios/test_two_vm_backup.sh` | writes YAML, starts daemon on it | import step before daemon start |
+  > | `config.example.yaml` / `config.test.yaml` | documented daemon inputs | documented **import** inputs |
+  >
+  > This is the largest single source of churn in Phase 1 and the reason item 8 and item 9 must land
+  > together. It is worth doing — a single source of truth is what makes Phase 2's transactional editing
+  > and Phase 3's reload coherent — but it should be a conscious cost, not a surprise.
+
 - **Changes:**
-  - `BackupConfig.from_source(source)` dispatching on the argument: `.yaml`/`.yml` → existing
-    `from_file`; `.db`/`.sqlite`/`sqlite://` → `store.load_config`. Replace the three `from_file` call
-    sites with `from_source`. **Keep `from_file` public and unchanged** — `tests/test_zfsbackup_real.py:415`
-    and `tests/conftest.py:201` call it directly.
-  - `import_yaml(yaml_path, db_url, *, replace: bool)` — parses via `BackupConfig.from_file` (single
-    source of validation truth), then `save_config`. `replace=True` wipes and reinserts in one
-    transaction; `replace=False` refuses to touch a non-empty DB.
-- **Target behaviour:** `python -m zfsbackup.daemon -c /etc/zfsbackup/config.yaml` behaves identically to
-  today; `-c /var/lib/zfsbackup/config.db` uses the DB. `--test-config` (`daemon.py:158-167`) works for
-  both. The value crossing the process boundary remains a plain path/URL string — pickle-safe, no engine,
-  no session. **Do not pass a loaded `BackupConfig` to workers**; that would break item 5's fork safety
-  and defeat Phase 3.
+  - `BackupConfig.from_db(url)` (or `store.load_config`) becomes the daemon's only loader. Replace the
+    three `from_file` call sites (`daemon.py:153`, `workers.py:62`, `workers.py:196`).
+  - **`from_file` is retained and stays public** — it remains the single YAML *parser*, used by `import`
+    and by the item-12 edit-buffer validation. It simply stops being a daemon config source. Its existing
+    tests keep passing unchanged; only its callers move.
+  - **`import_yaml(yaml_path, db_url)` — always a FULL REPLACE** *(user decision)*. Parses via `from_file`
+    (single source of validation truth), then wipes and reinserts in **one transaction**. There is no
+    `--replace` flag, because replacement is the only semantic: `import` means "make the DB be this file".
+    **If the DB already holds a config, emit a WARNING** naming what is being replaced (dataset count, and
+    the destination count) — it proceeds, it does not prompt, so the config-as-code flow below stays
+    non-interactive.
+  - **This makes `import` destructive by design**, which is correct for its purpose but worth one safety
+    net: **auto-export the outgoing config to a timestamped file** (e.g.
+    `/var/lib/zfsbackup/config.pre-import-<ts>.yaml`) before wiping, and name that path in the warning.
+    Cheap, and it turns "I imported the wrong file" from data loss into a one-command recovery.
+    *(Recommended — not explicitly requested; drop it if you'd rather not have the CLI writing extra files.)*
+  - **Migration ergonomics:** when the daemon is given a `.yaml`/`.yml` path, do **not** print a generic
+    "unsupported"; detect it and emit the exact `zfsbackup-config import <path>` command to run. This is
+    the single most likely upgrade stumble.
+  - **Deployment flows this supports** *(user decision — explicit import, nothing implicit)*:
+    ```
+    # one-time upgrade of an existing deployment
+    zfsbackup-config import /etc/zfsbackup/config.yaml
+
+    # config-as-code: YAML stays in git, DB is a derived artifact
+    zfsbackup-config import cfg.yaml     # warns that it is replacing
+    systemctl reload zfsbackup           # picks it up (phase 3)
+    ```
+    **The daemon never imports anything**, so "the CLI is the only writer" — which item 5's fork-safety and
+    WAL design depends on — stays true.
+- **Target behaviour:** `-c /var/lib/zfsbackup/config.db` loads; `--test-config` (`daemon.py:158-167`)
+  validates the DB. The value crossing the process boundary remains a plain path/URL string —
+  pickle-safe, no engine, no session. **Do not pass a loaded `BackupConfig` to workers**; that would break
+  item 5's fork safety and defeat Phase 3.
+- **Consequence worth noting:** because the DB is now canonical and every edit buffer is regenerated from
+  it, **duration literal preservation (item 2) becomes load-bearing rather than a nicety.** Every `edit`
+  round-trip reads literals out of `age_literal`/`keep_for_literal`/`frequency_literal`; if those were not
+  stored, a user's `30d` would silently become `1M` on their next edit.
 - **Edge cases:** durations import as literals (item 2), so `"1M"` from `config.example.yaml:38` survives.
   Commented-out sections (`config.example.yaml:21-30`) import as absent, not empty. The `config_path`
   attribute name is asserted at `tests/test_zfsbackup_daemon.py:25`; `from_file` patch targets at
@@ -1091,6 +1306,7 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 |---|---|---|
 | **Pre-fork engine inherited by workers** — SQLite fd sharing corrupts the DB, not just errors | `daemon.py:62-68`, `store/db.py` | pid-keyed engine cache (item 5); supervisor disposes engine before `_start_workers()`; explicit fork test (item 9) |
 | **A duration library silently mis-parses `1M` as 1 minute** — retention collapses, snapshots pruned immediately | `config.py:12-45` | **Verified failure in `pytimeparse` and `humanfriendly`.** No library added; hand-rolled parse/render reusing the existing tested parser (item 2) |
+| **Duplicate retention `keep_for` silently drops a tier** — pre-existing. `{"1h":"7d","1d":"1w"}` collapses to one tier, and the tie-break systematically keeps the **coarser** interval, pruning harder than configured | `backup_manager.py:216-219`, tie-break via `config.py:155` | Reject on write (CLI, import, `UNIQUE(dataset_id, keep_for_seconds)`); `min` + `WARNING` on read so a collision can never be silent (item 2b) |
 | **`Duration` wrapper breaks reflected comparison** — `age >= dsi.frequency` silently misbehaves | `backup_manager.py:205-206` | Subclass `timedelta` rather than wrap (item 2); explicit reflected-comparison test (item 9) |
 | **`Duration` breaks `or`-truthiness** — a zero duration stops being falsy, changing inherited-frequency logic | `workers.py:146-150,161` | Inherited `__bool__` via subclassing; explicit zero-duration test (item 9) |
 | **Literal rewritten across pickle/deepcopy** — a missing `__reduce__` no longer raises (native-kwargs support) and no longer yields `None` (synthesis); it **silently substitutes the canonical literal**, so `30d`→`1M` and `12h6d`→`6d12h` while canonical values look correct | `daemon.py:34`, test comparisons | `__reduce__` on the subclass (item 2); item-9 assertion **must use a non-canonical literal** — testing `1M` passes even with the bug present |
@@ -1107,7 +1323,9 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 | **SIGHUP latency** — handler flag not seen for up to 5s | `daemon.py:109` (PEP 475 sleep retry) | Event-based wake replaces `time.sleep` (item 17) |
 | **Shutdown-latency regression** — restructuring the poll loop for reload could add up to 5s to `SIGINT`/`SIGTERM` if only SIGHUP sets the wake event | `daemon.py:39-45,109` (item 17) | Existing stop handlers must set the wake event too; asserted in item 20 |
 | **Reload is not atomic across workers** | Item 18 | Safe because workers share no in-memory state; stated explicitly so it is not assumed otherwise |
-| **WAL requires write access even to read** — non-root CLI users get an opaque error | Item 6 | `0660 root:zfsbackup` + group membership documented; CLI translates `EACCES` into a clear message |
+| **WAL requires write access even to read** — CLI users get an opaque error | Item 6 | Dir `0770` (not `0750`) + `0660 zfsbackup:zfsbackup`, group membership documented; CLI translates `EACCES` into a clear message |
+| **Non-root daemon needs ZFS delegation the plan cannot grant** — `zfs allow` for snapshot/destroy/send/receive/userprop, and on Linux `mount` stays privileged even when delegated | Item 6 | Treated as its own workstream with a documented recipe and a real-pool scenario; DB permissions shipped independently so the layout is right either way |
+| **DB-canonical migration breaks every YAML consumer** — conftest, real-ZFS tests, daemon/worker patch targets, and the two-VM scenario all obtain config from YAML today | Item 8 | Enumerated migration table in item 8; items 8 and 9 land in one cycle; daemon detects a `.yaml` argument and prints the exact `import` command |
 | **Stale pidfile → SIGHUP to an unrelated recycled pid** | Item 19 | Verify the pid is actually a zfsbackup daemon before signalling |
 | **Test patch targets break** — `from_file` patched by name in 3 places | `test_zfsbackup_workers.py:228`, `test_zfsbackup_daemon.py:211,231` | Items 8 and 9 land in the same cycle |
 | **Undeclared deps** — repeat of the `requests` problem | `pyproject.toml:9-16` | Item 1 declares everything before any code uses it |
@@ -1118,6 +1336,14 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 ## Sequencing and parallelism
 
 - **Phase 0:** item 1 → item 2. Item 2 gates everything; nothing in Phase 1 should start before it lands.
+- **Item 2b is independent** of the whole DB effort — a standalone pre-existing bug fix that can land,
+  review, and ship on its own before anything else in Phase 1 starts.
+- **Item 3b must precede item 3**, despite its number. 3b adds per-destination retention to the *dataclass*
+  model, and item 3's schema mirrors that model — designing the tables before the dataclasses exist would
+  mean revising them immediately. Order: **2b → 3b → 3 → 4 → 5 → 6 → 8**. (3b's `remote.py` half —
+  passing the destination to `to_property` — is independent of the schema and can land with either.)
+- Both 2b and 3b are pure `zfsbackup` changes with **no DB dependency at all**, so both can be implemented,
+  reviewed, and merged before any SQLAlchemy code is written. Recommended: ship them as their own cycle.
 - **Phase 1 serial chain:** 3 → 4 → 5 → 6 → 8. Item 7 (Alembic) runs parallel to 4-6. Item 8 needs 4 and 6.
 - **Phase 1 coordination point:** items 8 and 9 must be reviewed together (patch-target breakage).
 - **Phase 2 parallel:** items 11, 12, 13 are independent once 10 lands. Item 14 needs 12's editor
@@ -1140,6 +1366,7 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 | **Encrypting destination credentials in the DB** | `Destination` is URL-only today (`config.py:58-61`); no secrets exist to protect yet. Revisit when auth lands |
 | **Replacing the base64 user-property format** with a DB-derived one | Would break client/server compatibility (`remote.py:108`). Out of scope |
 | **Multi-host / shared config DB** | SQLite over NFS is unsafe. If needed, that is a Postgres conversation — and the item-4 mapper layer is exactly what makes that migration possible later |
+| **Running the daemon as a non-root user** | `zfs allow` delegation is not set up in the target environment, and on Linux `mount` stays privileged even when delegated — so `destroy` on a mounted dataset and `receive` both need a mitigation (`receive -u`, `canmount=noauto`, or `CAP_SYS_ADMIN`). Phase 1 ships the `zfsbackup:zfsbackup` file layout so nothing needs redoing; the daemon stays root until this workstream lands (item 6) |
 | **Auto-cleanup of orphaned server-side datasets after a rename** | Requires deleting data on a remote machine based on a local config edit. Too dangerous to automate; item 14 prints the path instead |
 | ~~**Fixing the odd leading-`m` branch** at `config.py:17-23`~~ — **no longer deferred** | Compound-literal support (item 2) rewrites the parser, and this branch is **dead code**: it computes a `unit` that `int(duration_str[:-1])` then always discards by raising. Verified — `m5`, `M5`, `mi5`, `mi` all raise. It is deleted as a side effect; both covering tests assert only `ValueError` and keep passing |
 | **Making `to_property()` carry duration literals** | Would change the wire format and break compatibility with already-deployed servers. Remote-derived `Duration`s render canonically instead (item 2) |
@@ -1176,9 +1403,19 @@ rollback. Phase 3 adds SIGHUP-triggered live reload via cooperative worker cycli
    mid send/receive is **never** killed — reload defers indefinitely for an in-flight transfer. Structured
    as its own phase after the CLI, so it can be dropped without affecting Phases 1-2.
 4. **`/var/lib/zfsbackup/config.db`** with resolution order explicit `-c` > `ZFSBACKUP_CONFIG` > default DB
-   > legacy `/etc/zfsbackup/config.yaml` > error. Daemon never auto-creates; CLI creates only on `import`.
-   Permissions `0660 root:zfsbackup`, with the non-obvious WAL trap called out: **a WAL reader needs write
-   access to the file and its directory**, so read-only access is not achievable.
+   > error. Daemon never auto-creates; CLI creates only on `import`. Daemon runs as a dedicated non-root
+   `zfsbackup` user with operators in the `zfsbackup` group; dir `0770`, DB `0660` — **`0770`, not `0750`,
+   because a WAL reader needs write access to the file *and its directory***. Non-root operation also
+   requires `zfs allow` delegation, and on Linux `mount` remains privileged even when delegated — item 6
+   flags this as its own workstream rather than something file modes can deliver.
+8. **The DB is canonical; YAML is import + transient edit buffer only.** The daemon no longer reads YAML.
+   `from_file` is retained as the single YAML parser (used by `import` and edit-buffer validation) but
+   stops being a config source. This is the largest churn in Phase 1 — conftest, the real-ZFS tests, the
+   daemon/worker patch targets, and the two-VM scenario all move to import-then-point-at-DB — and it makes
+   item 2's literal preservation load-bearing, since every edit buffer is regenerated from the DB.
+9. **Per-destination retention** (item 3b), with override-not-merge semantics at both ends. The transport
+   needs no wire-schema change: config is POSTed per destination at negotiate time, so the receiving
+   machine never has to identify itself.
 5. **`Duration` is a drop-in `timedelta`.** Its constructor accepts a literal (`Duration("1M")`), an
    existing `timedelta`, **or** the full native `timedelta` kwargs (`Duration(days=30)`). It additionally
    parses **compound literals** (`6d12h`, `1y2M3d`) — a genuine parser rewrite, not a relocation, which
