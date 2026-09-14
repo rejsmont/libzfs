@@ -2,8 +2,8 @@
 
 This package is a **separate persistence layer** from the runtime config
 dataclasses in `zfsbackup.config` (`BackupConfig`, `DatasetConfig`,
-`RetentionRule`, ...). It does not replace them and nothing in `zfsbackup/`
-imports the dataclasses in here or vice versa at this stage.
+`RetentionRule`, ...). It does not replace them, and nothing in `zfsbackup/`
+imports the ORM classes defined in here.
 
 Why a separate layer rather than making the dataclasses declarative models
 (see docs/config_db_cli_plan.md, "Recommended architecture"):
@@ -22,11 +22,21 @@ Why a separate layer rather than making the dataclasses declarative models
    at all; keeping the dataclasses pure keeps all of them working unchanged.
 
 `zfsbackup/store/models.py` defines the ORM schema (`Base` plus one class
-per table). A mapper module (`zfsbackup/store/mapper.py`, a later item)
-converts between ORM rows and the dataclasses; engine/session setup
-(`zfsbackup/store/db.py`) and Alembic migrations are later items too. This
-package currently defines schema only -- nothing here is wired into the
-daemon, workers, or CLI.
+per table). `zfsbackup/store/mapper.py` converts between ORM rows and the
+dataclasses: `load_config(session) -> BackupConfig` builds a fully detached
+`BackupConfig` (replicating `BackupConfig.from_file`'s defaulting exactly,
+except `prune_interval`'s fallback to `check_interval` and the
+`client_id_file` default, which the writer -- `save_config` -- materialises
+once at write time, since both columns are `NOT NULL` and can never be
+"absent" the way a YAML key can), and `save_config(session, config)` does a
+full wipe-and-reinsert of the store from a `BackupConfig` (no diff-and-merge,
+no internal `commit()`/`begin()` -- the caller owns the transaction).
+Engine/session setup (`zfsbackup/store/db.py`) and Alembic migrations are
+later items. This package is not yet wired into the daemon, workers, or CLI.
+
+`mapper.py` is a new, deliberately one-directional coupling: it imports
+`zfsbackup.config`, so `store` now depends on `config`, but `config.py`
+still imports nothing from `store`. Do not let that direction reverse.
 
 `Base.metadata` already carries an explicit `naming_convention` (see
 `models.NAMING_CONVENTION`), deliberately landed ahead of item 7's initial
@@ -52,6 +62,7 @@ from zfsbackup.store.models import (
     RemoteServer,
     RetentionRule,
 )
+from zfsbackup.store.mapper import load_config, save_config
 
 __all__ = [
     "Base",
@@ -62,4 +73,6 @@ __all__ = [
     "NAMING_CONVENTION",
     "RemoteServer",
     "RetentionRule",
+    "load_config",
+    "save_config",
 ]

@@ -20,7 +20,9 @@ a genuine `UNIQUE` violation look like a scope-mixing bug -- the fresh-DB
 discipline avoids that class of false failure entirely.
 """
 
+import logging
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, delete, event, inspect
@@ -28,6 +30,25 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+from zfsbackup.config import (
+    BackupConfig,
+    DatasetConfig,
+    Duration,
+    RemoteDatasetConfig,
+    RemoteServerConfig,
+)
+from zfsbackup.config import Destination as ConfigDestination
+from zfsbackup.config import RetentionRule as ConfigRetentionRule
+from zfsbackup.store.mapper import (
+    _assert_scope_integrity,
+    _dataset_level_rules,
+    _dataset_to_dataclass,
+    _dedupe_exact_duplicates,
+    _duration_from_row,
+    _scoped_rules,
+    load_config,
+    save_config,
+)
 from zfsbackup.store.models import (
     Base,
     Dataset,
@@ -73,6 +94,33 @@ def engine():
 @pytest.fixture
 def session(engine):
     with Session(engine) as s:
+        yield s
+
+
+@pytest.fixture
+def engine_no_fk():
+    """A fresh in-memory SQLite engine with FK enforcement left OFF.
+
+    Only for tests that must deliberately construct a DB state the
+    composite FK (`fk_retention_rules_dataset_remote`) would otherwise make
+    impossible -- see `_assert_scope_integrity`'s docstring in
+    `zfsbackup/store/mapper.py` for why that mapper-side check exists as
+    the belt to this braces. SQLite's default is FK-off, so this is simply
+    the `engine` fixture minus the `connect` listener.
+    """
+    eng = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(eng)
+    yield eng
+    eng.dispose()
+
+
+@pytest.fixture
+def session_no_fk(engine_no_fk):
+    with Session(engine_no_fk) as s:
         yield s
 
 
@@ -939,3 +987,1005 @@ class TestDatasetRemoteInheritFrequency:
         session.add(remote)
         session.commit()  # must not raise
         assert remote.frequency_seconds == 14400
+
+
+# ---------------------------------------------------------------------------
+# Item 4 -- the mapper layer (zfsbackup/store/mapper.py)
+# ---------------------------------------------------------------------------
+#
+# Selectable via `pytest -k mapper`. Covers `_duration_from_row` (Q2),
+# retention scope partitioning (Q4 -- the highest-risk part of the mapper),
+# `load_config`'s no-silent-drops table (Q7), `save_config` (Q5/Q6), list
+# ordering, and the `==` + literal-projection equivalence contract (Q8).
+# See scratchpad item4_plan.md section 4.7 for the matrix this follows.
+
+
+def _literal_projection(config: BackupConfig) -> list:
+    """Walk a `BackupConfig` and collect every duration's `.literal` (or
+    `None` for a plain `timedelta`/inherited value), in the same order
+    `==` would traverse the underlying lists.
+
+    Structural `==` is literal-blind (`Duration('30d') == Duration('1M')`
+    is `True`), so it alone cannot catch a mapper that reconstructs every
+    `Duration` from `*_seconds` and drops every stored `*_literal`. This
+    projection is the second half of the equivalence contract -- see Q8 in
+    scratchpad item4_plan.md.
+    """
+    literals = [
+        getattr(config.check_interval, "literal", None),
+        getattr(config.prune_interval, "literal", None),
+    ]
+    for ds in config.datasets:
+        literals.append(getattr(ds.frequency, "literal", None))
+        for rule in ds.retention_rules:
+            literals.append(getattr(rule.age, "literal", None))
+            literals.append(getattr(rule.keep_for, "literal", None))
+        for remote in ds.remote:
+            literals.append(
+                None if remote.frequency is None
+                else getattr(remote.frequency, "literal", None)
+            )
+            for rule in remote.retention_rules:
+                literals.append(getattr(rule.age, "literal", None))
+                literals.append(getattr(rule.keep_for, "literal", None))
+    return literals
+
+
+def _minimal_backup_config(**dataset_kwargs) -> BackupConfig:
+    """One dataset, one dataset-level retention rule -- the minimum shape
+    `save_config` can write without raising.
+    """
+    kwargs = dict(
+        name="tank/a",
+        frequency=Duration("1h"),
+        retention_rules=[ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))],
+    )
+    kwargs.update(dataset_kwargs)
+    return BackupConfig(datasets=[DatasetConfig(**kwargs)])
+
+
+# ---------------------------------------------------------------------------
+# 4.1 -- _duration_from_row, all four branches (Q2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMapperDurationFromRow:
+    """The four branches from item4_plan.md Q2. The exact-match and
+    literal-None cases are trivial round-trips; the two "literal disagrees
+    with seconds" cases are the ones the plan explicitly calls a regression
+    class ("reading `*_seconds` alone silently rewrites a user's `30d` as
+    `1M`") -- both must discard the stored literal, keep the seconds value,
+    and log a WARNING naming the key.
+    """
+
+    def test_exact_match_literal_is_preserved(self):
+        d = _duration_from_row(2592000.0, "30d", "check_interval")
+        assert d.literal == "30d"  # NOT re-synthesized to "1M"
+        assert d.total_seconds() == 2592000.0
+
+    def test_literal_none_synthesizes_canonical_form(self):
+        d = _duration_from_row(2592000.0, None, "check_interval")
+        assert d.literal == "1M"  # synthesized, NOT "30d"
+        assert d.total_seconds() == 2592000.0
+
+    def test_literal_none_sub_second_value_has_no_literal(self):
+        d = _duration_from_row(0.5, None, "check_interval")
+        assert d.literal is None
+        assert d.total_seconds() == 0.5
+
+    def test_unparseable_literal_falls_back_to_seconds_and_warns(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.store.mapper"):
+            d = _duration_from_row(3600.0, "nonsense", "datasets[tank/a].frequency")
+        assert d.total_seconds() == 3600.0
+        assert d.literal == "1h"  # re-synthesized, the bad literal is gone
+        assert Duration(d.literal) == d
+        assert any(
+            "datasets[tank/a].frequency" in r.message and "nonsense" in r.message
+            for r in caplog.records
+        )
+
+    def test_disagreeing_literal_falls_back_to_seconds_and_warns(self, caplog):
+        # "2h" parses fine but is 7200s, not the 3600s this row claims.
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.store.mapper"):
+            d = _duration_from_row(3600.0, "2h", "datasets[tank/a].frequency")
+        assert d.total_seconds() == 3600.0
+        assert d.literal == "1h"  # seconds wins, "2h" is discarded
+        assert Duration(d.literal) == d
+        assert any(
+            "datasets[tank/a].frequency" in r.message and "2h" in r.message
+            for r in caplog.records
+        )
+
+
+# ---------------------------------------------------------------------------
+# 4.2 -- the scope filter (Q4). The single highest-value regression test.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMapperScopeFilter:
+    """`Dataset.retention_rules` mixes dataset-level rows with every
+    per-destination override for that dataset (it joins on `dataset_id`
+    alone). A mapper that forgets `if r.dataset_remote_id is None` promotes
+    every override into local pruning -- no error, no log, just a dataset
+    pruned on tiers nobody configured at the dataset level. This is item
+    4's #1 ranked risk; build BOTH scopes, never just one.
+    """
+
+    def _seed(self, session):
+        session.add(make_global_settings(id=1))
+        make_destination(session, name="offsite")
+        ds = make_dataset(session, name="tank/data")
+        remote = make_dataset_remote(session, ds.id, destination_name="offsite")
+        session.add(
+            make_rule(
+                ds.id, None, age_seconds=3600, age_literal="1h",
+                keep_for_seconds=86400, keep_for_literal="1d",
+            )
+        )
+        session.add(
+            make_rule(
+                ds.id, remote.id, age_seconds=7200, age_literal="2h",
+                keep_for_seconds=172800, keep_for_literal="2d",
+            )
+        )
+        session.commit()
+        return ds, remote
+
+    def test_load_config_never_promotes_or_drops(self, session):
+        self._seed(session)
+        config = load_config(session)
+        ds_config = config.datasets[0]
+
+        # Never 2 and 0 -- exactly one rule per scope.
+        assert len(ds_config.retention_rules) == 1
+        assert len(ds_config.remote[0].retention_rules) == 1
+        assert ds_config.retention_rules == [
+            ConfigRetentionRule(age=Duration("1h"), keep_for=Duration("1d"))
+        ]
+        assert ds_config.remote[0].retention_rules == [
+            ConfigRetentionRule(age=Duration("2h"), keep_for=Duration("2d"))
+        ]
+
+    def test_dataset_level_rules_helper_filters_scoped_rows(self, session):
+        ds, _ = self._seed(session)
+        session.expire_all()
+        reloaded = session.get(Dataset, ds.id)
+        rules = _dataset_level_rules(reloaded)
+        assert len(rules) == 1
+        assert rules[0] == ConfigRetentionRule(age=Duration("1h"), keep_for=Duration("1d"))
+
+    def test_scoped_rules_helper_excludes_dataset_level_rows(self, session):
+        _, remote = self._seed(session)
+        session.expire_all()
+        reloaded = session.get(DatasetRemote, remote.id)
+        rules = _scoped_rules(reloaded)
+        assert len(rules) == 1
+        assert rules[0] == ConfigRetentionRule(age=Duration("2h"), keep_for=Duration("2d"))
+
+
+# ---------------------------------------------------------------------------
+# 4.4 -- load_config's Q7 no-silent-drops table
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMapperLoadConfigQ7:
+    def test_global_settings_absent_raises(self, session):
+        make_dataset(session)  # a dataset alone is not enough
+        session.commit()
+        with pytest.raises(ValueError, match="uninitialized"):
+            load_config(session)
+
+    def test_remote_server_absent_yields_remote_backup_none(self, session):
+        session.add(make_global_settings(id=1))
+        ds = make_dataset(session)
+        session.add(make_rule(ds.id, None))
+        session.commit()
+
+        config = load_config(session)
+        assert config.remote_backup is None
+
+    def test_remote_server_present_is_not_none(self, session):
+        # Deliberately contrasted with the test above: GlobalSettings
+        # absent is always an error, RemoteServer absent is not -- a
+        # mapper that special-cased the wrong table would fail one of
+        # these two and pass the other.
+        session.add(make_global_settings(id=1))
+        ds = make_dataset(session)
+        session.add(make_rule(ds.id, None))
+        session.add(RemoteServer(id=1, target_dataset="tank/received", enabled=True))
+        session.commit()
+
+        config = load_config(session)
+        assert config.remote_backup == RemoteServerConfig(
+            target_dataset="tank/received", enabled=True
+        )
+
+    def test_zero_datasets_raises(self, session):
+        session.add(make_global_settings(id=1))
+        session.commit()
+        with pytest.raises(ValueError, match="No datasets configured"):
+            load_config(session)
+
+    def test_zero_dataset_level_retention_rows_applies_default_and_warns(
+        self, session, caplog
+    ):
+        session.add(make_global_settings(id=1))
+        make_dataset(session, name="tank/empty")
+        session.commit()
+
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.store.mapper"):
+            config = load_config(session)
+
+        assert config.datasets[0].retention_rules == [
+            ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+        ]
+        assert any("tank/empty" in r.message for r in caplog.records)
+
+    def test_unreferenced_destination_still_appears(self, session):
+        session.add(make_global_settings(id=1))
+        make_destination(session, name="unused", url="ssh://unused/pool")
+        ds = make_dataset(session)
+        session.add(make_rule(ds.id, None))
+        session.commit()
+
+        config = load_config(session)
+        assert config.destinations["unused"] == ConfigDestination(url="ssh://unused/pool")
+
+    def test_scoped_rule_dataset_id_mismatch_raises_with_fk_off(self, session_no_fk):
+        # The composite FK normally makes this state impossible, but only
+        # with PRAGMA foreign_keys=ON, which item 5 has not yet applied
+        # anywhere. Build it directly with FK off to exercise the mapper's
+        # own belt-and-braces check.
+        session = session_no_fk
+        session.add(Destination(name="offsite", url="ssh://offsite/pool"))
+        ds1 = Dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
+        ds2 = Dataset(name="tank/b", frequency_seconds=3600, frequency_literal="1h")
+        session.add_all([ds1, ds2])
+        session.commit()
+        remote = DatasetRemote(
+            dataset_id=ds1.id, destination_name="offsite",
+            frequency_seconds=None, frequency_literal=None,
+        )
+        session.add(remote)
+        session.commit()
+
+        # dataset_remote_id belongs to ds1's remote, but dataset_id claims
+        # ds2 -- rejected by the composite FK when it's on; here it isn't.
+        bad_rule = RetentionRule(
+            dataset_id=ds2.id, dataset_remote_id=remote.id,
+            age_seconds=3600, age_literal="1h",
+            keep_for_seconds=86400, keep_for_literal="1d",
+        )
+        session.add(bad_rule)
+        session.commit()  # only succeeds because FK enforcement is off here
+
+        session.expire_all()
+        reloaded_ds2 = session.get(Dataset, ds2.id)
+        with pytest.raises(ValueError, match="dataset_remote_id"):
+            _assert_scope_integrity(reloaded_ds2)
+
+        with pytest.raises(ValueError):
+            _dataset_to_dataclass(reloaded_ds2, {"offsite": ConfigDestination(url="x")})
+
+    def test_undeclared_destination_reference_raises_with_fk_off(self, session_no_fk):
+        # Also normally impossible with the FK on (destination_name FKs to
+        # destinations.name); re-checked anyway per config.py:715-728.
+        session = session_no_fk
+        session.add(make_global_settings(id=1))
+        ds = make_dataset(session, name="tank/a")
+        session.add(make_rule(ds.id, None))
+        session.add(
+            DatasetRemote(
+                dataset_id=ds.id, destination_name="ghost",
+                frequency_seconds=None, frequency_literal=None,
+            )
+        )
+        session.commit()
+
+        with pytest.raises(ValueError, match="ghost"):
+            load_config(session)
+
+
+# ---------------------------------------------------------------------------
+# 4.5 -- save_config
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMapperSaveConfig:
+    def _two_dest_config(self) -> BackupConfig:
+        return BackupConfig(
+            datasets=[
+                DatasetConfig(
+                    name="tank/a",
+                    frequency=Duration("1h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+                    ],
+                    remote=[RemoteDatasetConfig(destination="offsite")],
+                ),
+            ],
+            destinations={"offsite": ConfigDestination(url="ssh://offsite/pool")},
+        )
+
+    def test_repeat_save_does_not_raise_on_delete_order(self, session):
+        # Regression for the delete-order dependency (Q6): datasets must be
+        # deleted before destinations, since dataset_remotes.destination_name
+        # has no ON DELETE clause (deliberate RESTRICT). The first save
+        # against an empty DB can't discriminate order (every DELETE is a
+        # no-op); the second save, against a now-populated DB, can.
+        config = self._two_dest_config()
+        save_config(session, config)
+        session.commit()
+
+        save_config(session, config)  # must not raise IntegrityError
+        session.commit()
+
+        loaded = load_config(session)
+        assert loaded.destinations["offsite"] == ConfigDestination(url="ssh://offsite/pool")
+
+    def test_exact_duplicate_retention_rules_are_deduped(self, session):
+        config = _minimal_backup_config(
+            retention_rules=[
+                ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d")),
+                ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d")),
+            ]
+        )
+        save_config(session, config)
+        session.commit()
+        assert session.query(RetentionRule).count() == 1
+
+    def test_genuine_retention_collision_raises(self, session):
+        # Seed a good config FIRST and assert it survives the failed call --
+        # a bare `assert session.query(Dataset).count() == 0` against a
+        # fresh DB (the original form of this test) is vacuous, because the
+        # count is already 0 before `save_config` ever runs; it cannot tell
+        # "validated before the DELETE" from "validated after". See
+        # `test_undeclared_destination_raises_before_any_delete` above for
+        # the same pattern, which this test now mirrors for the retention
+        # half of the invariant.
+        good = _minimal_backup_config(name="tank/good")
+        save_config(session, good)
+        session.commit()
+
+        config = _minimal_backup_config(
+            name="tank/bad",
+            retention_rules=[
+                ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d")),
+                ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("60d")),
+            ]
+        )
+        with pytest.raises(ValueError):
+            save_config(session, config)
+
+        session.expire_all()
+        surviving = session.query(Dataset).all()
+        assert [d.name for d in surviving] == ["tank/good"]
+
+    def test_undeclared_destination_raises_before_any_delete(self, session):
+        good = _minimal_backup_config(name="tank/a")
+        save_config(session, good)
+        session.commit()
+
+        bad = _minimal_backup_config(
+            name="tank/b", remote=[RemoteDatasetConfig(destination="ghost")]
+        )
+        with pytest.raises(ValueError, match="ghost"):
+            save_config(session, bad)
+
+        # The pre-existing good config must survive the failed call
+        # untouched -- validation runs before the first DELETE.
+        session.expire_all()
+        surviving = session.query(Dataset).all()
+        assert [d.name for d in surviving] == ["tank/a"]
+
+    def test_generation_increments_and_does_not_reset_on_existing_db(self, session):
+        config = _minimal_backup_config()
+
+        save_config(session, config)
+        session.commit()
+        assert session.get(GlobalSettings, 1).generation == 0
+
+        save_config(session, config)
+        session.commit()
+        session.expire_all()
+        assert session.get(GlobalSettings, 1).generation == 1
+
+        save_config(session, config)
+        session.commit()
+        session.expire_all()
+        assert session.get(GlobalSettings, 1).generation == 2
+
+    def test_plain_timedelta_backup_config_round_trips_without_attributeerror(
+        self, session, sample_backup_config
+    ):
+        # `getattr(d, 'literal', None)` is what makes this work: a plain
+        # `timedelta` (tests/conftest.py's sample_backup_config fixture)
+        # has no `.literal` attribute at all.
+        save_config(session, sample_backup_config)
+        session.commit()  # must not raise AttributeError
+
+        loaded = load_config(session)
+        assert loaded.datasets[0].name == "pool/data"
+        # No literal was on record, so it's re-synthesized from the seconds
+        # value on read -- 3600s -> "1h".
+        assert loaded.datasets[0].frequency.literal == "1h"
+
+
+# ---------------------------------------------------------------------------
+# List ordering -- surrogate id order, not alphabetical
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMapperListOrdering:
+    def test_datasets_preserve_insertion_order(self, session):
+        config = BackupConfig(
+            datasets=[
+                DatasetConfig(
+                    name=name, frequency=Duration("1h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+                    ],
+                )
+                for name in ["zeta", "alpha", "mike"]
+            ]
+        )
+        save_config(session, config)
+        session.commit()
+
+        loaded = load_config(session)
+        assert [d.name for d in loaded.datasets] == ["zeta", "alpha", "mike"]
+
+    def test_remote_entries_preserve_insertion_order(self, session):
+        config = BackupConfig(
+            datasets=[
+                DatasetConfig(
+                    name="tank/a", frequency=Duration("1h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+                    ],
+                    remote=[
+                        RemoteDatasetConfig(destination="zzz"),
+                        RemoteDatasetConfig(destination="aaa"),
+                    ],
+                ),
+            ],
+            destinations={
+                "zzz": ConfigDestination(url="ssh://zzz/pool"),
+                "aaa": ConfigDestination(url="ssh://aaa/pool"),
+            },
+        )
+        save_config(session, config)
+        session.commit()
+
+        loaded = load_config(session)
+        assert [r.destination for r in loaded.datasets[0].remote] == ["zzz", "aaa"]
+
+
+# ---------------------------------------------------------------------------
+# Q8 -- the equivalence contract (== plus a literal projection)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMapperEquivalenceContract:
+    """`load_config(session_from(save_config(config))) == config` is the
+    mapper's headline property, but `==` alone is literal-blind (Q8):
+    `Duration('30d') == Duration('1M')` is `True`, so a mapper that dropped
+    every stored literal and rebuilt from `*_seconds` would pass `==` on
+    every case here. Both assertions in each test below are load-bearing.
+
+    Neither shipped reference YAML has any `destinations`/`remote` entries,
+    so neither alone exercises item 3b (per-destination overrides) at all
+    -- the synthetic fixture below is what stands in for item 8's YAML
+    importer, which does not exist yet.
+    """
+
+    @pytest.fixture
+    def synthetic_yaml(self, tmp_path):
+        # Deliberately covers all four remote shapes the plan calls out:
+        # tank/apps->offsite inherits both frequency and retention;
+        # tank/db->offsite overrides frequency only; tank/db->dc2 overrides
+        # retention only (inherits frequency). Every literal below is
+        # non-canonical ("30d" not "1M", "3650d" not "10y") so the
+        # projection assertion is meaningful, not vacuously true.
+        content = """
+snapshot_prefix: "custom"
+check_interval: "5m"
+prune_interval: "30d"
+api_host: "0.0.0.0"
+api_port: 9090
+dry_run: true
+client_id_file: "/var/lib/zfsbackup/client_id"
+
+destinations:
+  offsite:
+    url: "http://offsite.example.com:8080"
+  dc2:
+    url: "http://dc2.example.com:8080"
+
+datasets:
+  - name: "tank/apps"
+    frequency: "30d"
+    retention:
+      "1d": "30d"
+      "1w": "3M"
+    remote:
+      - destination: offsite
+
+  - name: "tank/db"
+    frequency: "15m"
+    retention:
+      "1h": "1d"
+      "1d": "3650d"
+    remote:
+      - destination: offsite
+        frequency: "4h"
+      - destination: dc2
+        retention:
+          "1h": "6h"
+
+remote_backup:
+  target_dataset: "tank/received"
+  enabled: true
+"""
+        p = tmp_path / "synthetic.yaml"
+        p.write_text(content)
+        return p
+
+    def test_synthetic_config_with_destinations_and_overrides_round_trips(
+        self, session, synthetic_yaml
+    ):
+        expected = BackupConfig.from_file(synthetic_yaml)
+        save_config(session, expected)
+        session.commit()
+
+        loaded = load_config(session)
+
+        assert loaded == expected
+        assert _literal_projection(loaded) == _literal_projection(expected)
+
+    @pytest.mark.parametrize("yaml_name", ["config.example.yaml", "config.test.yaml"])
+    def test_reference_yaml_round_trips(self, session, yaml_name):
+        # Neither reference config has destinations/remote entries -- they
+        # do not exercise the scope-filter half of the contract at all; see
+        # the synthetic test above for that.
+        #
+        # They also do NOT meaningfully exercise the literal-preservation
+        # half, despite appearances: every literal in both files ("1M",
+        # "10y", "15m", ...) is already canonical for its value --
+        # `Duration._synthesize`'s greedy largest-unit-first decomposition
+        # reconstructs the exact same string from `*_seconds` alone. The
+        # `_literal_projection` assertion below is therefore vacuous here: a
+        # mapper mutated to always rebuild every `Duration` from
+        # `*_seconds` (dropping every stored `*_literal`) still passes both
+        # parametrizations of this test, verified by mutation. Only
+        # `TestMapperEquivalenceContract::test_synthetic_config_with_destinations_and_overrides_round_trips`
+        # (whose fixture deliberately uses non-canonical literals such as
+        # "30d" where "1M" is the shorter form) carries the literal half of
+        # the contract. This test remains valid coverage of the *structural*
+        # round-trip against real, shipped config files -- keep it for that.
+        yaml_path = Path(__file__).resolve().parent.parent / "zfsbackup" / yaml_name
+        expected = BackupConfig.from_file(yaml_path)
+        save_config(session, expected)
+        session.commit()
+
+        loaded = load_config(session)
+
+        assert loaded == expected
+        assert _literal_projection(loaded) == _literal_projection(expected)
+
+
+# ---------------------------------------------------------------------------
+# item-3-review-pass fixes (item 9 regression coverage)
+#
+# Findings 1 and 2 (TestMapperWipeReinsertRegression,
+# TestMapperScopedRulesForeignDatasetRegression) live under `PRAGMA
+# foreign_keys=OFF`, which is SQLite's default and which nothing outside
+# this file's fixtures turns on until item 5 (engine/session setup) lands.
+# Their fix-pinning tests run against `session_no_fk` / `engine_no_fk`
+# deliberately -- against the FK-on `session` fixture the DB's own
+# cascade/FK behaviour papers over the bug and the test would pass for the
+# wrong reason (or pass either way), pinning nothing.
+#
+# Findings 3 and 4 (TestMapperSaveConfigStep1ValidationRegression) are NOT
+# FK-dependent -- the defects they pin are a plain-Python duplicate check,
+# `UniqueConstraint`/`CHECK`/`NOT NULL` violations, and an empty-list guard,
+# none of which involve `dataset_remote_id`/cascade behaviour at all. Their
+# tests are fixture-agnostic and correctly use the ordinary FK-on `session`
+# fixture; do not move them onto `session_no_fk`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMapperWipeReinsertRegression:
+    """Finding 1 (HIGH): `save_config`'s wipe step used to be a bulk
+    `delete(Dataset)` / `delete(Destination)`, relying on `ON DELETE
+    CASCADE` to take `dataset_remotes`/`retention_rules` down with it. A
+    bulk `delete()` issued through the ORM never applies relationship
+    cascades -- only the DB's own `ON DELETE CASCADE` does that, and only
+    when `PRAGMA foreign_keys=ON`. With the pragma off, the child rows
+    survived the wipe and the next `save_config` call's freshly-inserted
+    dataset got handed the SAME rowid (SQLite reuses the lowest available
+    rowid once a table is emptied) -- silently re-adopting the previous
+    config's stale retention tiers and remote overrides into an unrelated
+    dataset, with no error and no log.
+
+    The fix deletes every child table explicitly, in dependency order
+    (`retention_rules -> dataset_remotes -> datasets -> destinations ->
+    global_settings -> remote_server`), which is correct whether the pragma
+    is on or off -- see `save_config`'s docstring, step 4.
+    """
+
+    def test_second_save_does_not_re_adopt_first_saves_orphans(self, session_no_fk):
+        session = session_no_fk
+        cfg1 = BackupConfig(
+            datasets=[
+                DatasetConfig(
+                    name="tank/a",
+                    frequency=Duration("1h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+                    ],
+                    remote=[
+                        RemoteDatasetConfig(
+                            destination="offsite",
+                            retention_rules=[
+                                ConfigRetentionRule(age=Duration("1h"), keep_for=Duration("7d"))
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+            destinations={"offsite": ConfigDestination(url="ssh://offsite/pool")},
+        )
+        save_config(session, cfg1)
+        session.commit()
+
+        # cfg2 reuses none of cfg1's shape: a different dataset name, a
+        # different (dataset-level-only) retention tier, and no remotes or
+        # destinations at all -- so anything cfg1-shaped that survives into
+        # the reload is unambiguously an orphan re-adoption, not a
+        # coincidence of matching values.
+        cfg2 = BackupConfig(
+            datasets=[
+                DatasetConfig(
+                    name="tank/b",
+                    frequency=Duration("1h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("2d"), keep_for=Duration("60d"))
+                    ],
+                ),
+            ],
+        )
+        save_config(session, cfg2)
+        session.commit()
+
+        loaded = load_config(session)
+
+        assert [d.name for d in loaded.datasets] == ["tank/b"]
+        assert loaded.datasets[0].retention_rules == [
+            ConfigRetentionRule(age=Duration("2d"), keep_for=Duration("60d"))
+        ]
+        # No re-adopted "offsite" remote or its 1h->7d override.
+        assert loaded.datasets[0].remote == []
+        # No re-adopted stale destination either -- cfg2 declared none.
+        assert loaded.destinations == {}
+
+
+@pytest.mark.unit
+class TestMapperScopedRulesForeignDatasetRegression:
+    """Finding 2: `DatasetRemote.retention_rules` (`models.py`) joins on
+    `dataset_remote_id` alone via a narrowed `primaryjoin`, and never
+    re-checks the row's own `dataset_id`. A row whose `dataset_remote_id`
+    correctly names a real remote but whose `dataset_id` names NO dataset
+    at all is therefore invisible to `Dataset.retention_rules`'s ordinary
+    join (which matches on `dataset_id`, so a nonexistent `dataset_id`
+    never appears in any real dataset's collection) -- before the fix, such
+    a row sailed straight through `_scoped_rules` and `load_config` silently
+    returned it as a genuine override of the remote's owning dataset.
+
+    `_assert_scope_integrity`'s SECOND loop (walking `ds.remotes[*]
+    .retention_rules`, not just `ds.retention_rules`) is what closes this --
+    see that function's docstring for why two independent loops are
+    required, not one.
+    """
+
+    def test_scoped_rules_rejects_rule_owned_by_nonexistent_dataset(
+        self, session_no_fk
+    ):
+        session = session_no_fk
+        session.add(make_global_settings(id=1))
+        session.add(Destination(name="offsite", url="ssh://offsite/pool"))
+        ds = Dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
+        session.add(ds)
+        session.commit()
+        session.add(
+            make_rule(
+                ds.id, None, age_seconds=86400, age_literal="1d",
+                keep_for_seconds=2592000, keep_for_literal="30d",
+            )
+        )
+        remote = DatasetRemote(
+            dataset_id=ds.id, destination_name="offsite",
+            frequency_seconds=None, frequency_literal=None,
+        )
+        session.add(remote)
+        session.commit()
+
+        # dataset_remote_id correctly names ds's own "offsite" remote, but
+        # dataset_id=999 names no dataset at all.
+        orphan_rule = RetentionRule(
+            dataset_id=999, dataset_remote_id=remote.id,
+            age_seconds=3600, age_literal="1h",
+            keep_for_seconds=604800, keep_for_literal="7d",
+        )
+        session.add(orphan_rule)
+        session.commit()  # only succeeds because FK enforcement is off here
+
+        session.expire_all()
+        reloaded = session.get(Dataset, ds.id)
+
+        # Direction 2 specifically: the mismatch is only visible by walking
+        # ds.remotes[*].retention_rules, since ds.retention_rules (joined on
+        # dataset_id alone) never contains this row at all -- dataset_id=999
+        # matches no real dataset, including this one.
+        with pytest.raises(ValueError, match="dataset_id"):
+            _assert_scope_integrity(reloaded)
+
+        with pytest.raises(ValueError):
+            load_config(session)
+
+
+@pytest.mark.unit
+class TestMapperSaveConfigStep1ValidationRegression:
+    """Finding 3 (plus one step-1 check that landed after the original four,
+    `remote_backup.target_dataset`): each input below previously either
+    reached the DB as a bare `IntegrityError` / `CHECK constraint failed` /
+    `NOT NULL constraint failed`, raised from inside the insert loop with
+    every `DELETE` already flushed, or -- for the empty-string cases --
+    inserted silently with no error at all. `save_config` now validates
+    every one of them before any `DELETE` runs and raises a named
+    `ValueError` instead.
+
+    Every case here asserts BOTH the named raise AND that a pre-seeded good
+    config survives the failed call untouched. Asserting only the raise (as
+    `test_genuine_retention_collision_raises` originally did -- finding 5)
+    cannot distinguish "validated before the DELETE" from "validated
+    after"; "cannot wipe a good DB" is the actual contract under test.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _seed_good_config(self, session):
+        good = _minimal_backup_config(name="tank/good")
+        save_config(session, good)
+        session.commit()
+
+    def _assert_good_survives(self, session):
+        session.expire_all()
+        surviving = session.query(Dataset).all()
+        assert [d.name for d in surviving] == ["tank/good"]
+
+    def test_duplicate_dataset_name_raises_before_delete(self, session):
+        bad = BackupConfig(
+            datasets=[
+                DatasetConfig(
+                    name="tank/dup", frequency=Duration("1h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+                    ],
+                ),
+                DatasetConfig(
+                    name="tank/dup", frequency=Duration("2h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("2d"), keep_for=Duration("60d"))
+                    ],
+                ),
+            ]
+        )
+        with pytest.raises(ValueError, match="duplicate dataset name"):
+            save_config(session, bad)
+        self._assert_good_survives(session)
+
+    def test_duplicate_remote_destination_on_one_dataset_raises_before_delete(
+        self, session
+    ):
+        # `DatasetConfig.from_dict` (`config.py:624-626`) never checks this
+        # -- a YAML `from_file` accepts it cleanly and only fails at insert,
+        # against `dataset_remotes`'s composite unique constraint, as a bare
+        # IntegrityError. `save_config` must catch it before the wipe since
+        # a direct `BackupConfig` (bypassing `from_dict`, e.g. a future CLI
+        # importer) is never guaranteed to pass through that check.
+        bad = BackupConfig(
+            datasets=[
+                DatasetConfig(
+                    name="tank/bad",
+                    frequency=Duration("1h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+                    ],
+                    remote=[
+                        RemoteDatasetConfig(destination="offsite"),
+                        RemoteDatasetConfig(destination="offsite", frequency=Duration("4h")),
+                    ],
+                ),
+            ],
+            destinations={"offsite": ConfigDestination(url="ssh://offsite/pool")},
+        )
+        with pytest.raises(ValueError, match="duplicate"):
+            save_config(session, bad)
+        self._assert_good_survives(session)
+
+    @pytest.mark.parametrize("field_name", ["age", "keep_for"])
+    def test_non_positive_dataset_level_retention_raises_before_delete(
+        self, session, field_name
+    ):
+        rule_kwargs = {"age": Duration("1d"), "keep_for": Duration("30d")}
+        rule_kwargs[field_name] = timedelta(seconds=0)
+        bad = _minimal_backup_config(
+            name="tank/bad", retention_rules=[ConfigRetentionRule(**rule_kwargs)]
+        )
+        with pytest.raises(ValueError, match="must be positive"):
+            save_config(session, bad)
+        self._assert_good_survives(session)
+
+    def test_non_positive_remote_scoped_retention_raises_before_delete(self, session):
+        # The dataset-level scope in this config is valid on its own -- only
+        # the per-destination override is non-positive, covering the "at
+        # either scope" half `_assert_positive_duration_rule` mirrors for
+        # remote-scoped rules specifically (not just dataset-level ones).
+        bad = BackupConfig(
+            datasets=[
+                DatasetConfig(
+                    name="tank/bad",
+                    frequency=Duration("1h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+                    ],
+                    remote=[
+                        RemoteDatasetConfig(
+                            destination="offsite",
+                            retention_rules=[
+                                ConfigRetentionRule(
+                                    age=timedelta(seconds=-1), keep_for=Duration("7d")
+                                )
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+            destinations={"offsite": ConfigDestination(url="ssh://offsite/pool")},
+        )
+        with pytest.raises(ValueError, match="must be positive"):
+            save_config(session, bad)
+        self._assert_good_survives(session)
+
+    @pytest.mark.parametrize("bad_url", [None, ""])
+    def test_destination_missing_url_raises_before_delete(self, session, bad_url):
+        bad = BackupConfig(
+            datasets=[
+                DatasetConfig(
+                    name="tank/bad",
+                    frequency=Duration("1h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+                    ],
+                ),
+            ],
+            destinations={"offsite": ConfigDestination(url=bad_url)},
+        )
+        with pytest.raises(ValueError, match="requires 'url'"):
+            save_config(session, bad)
+        self._assert_good_survives(session)
+
+    @pytest.mark.parametrize("bad_target_dataset", [None, ""])
+    def test_remote_backup_missing_target_dataset_raises_before_delete(
+        self, session, bad_target_dataset
+    ):
+        # Mirrors the `Destination.url` case above (`config.py:710-712`) for
+        # `remote_backup.target_dataset` (`config.py:735-737`). The two
+        # params matter for different reasons: `None` would fail anyway, as
+        # a bare `NOT NULL constraint failed` from `remote_server
+        # .target_dataset` (`models.py`), but loudly and late, after the
+        # wipe. `""` is the one that actually mattered before this check
+        # existed -- the NOT NULL column happily accepts an empty string,
+        # so it inserted silently and `load_config` loaded it back as
+        # `target_dataset=''`, a config `BackupConfig.from_file` can never
+        # produce (`config.py:735-737` rejects an empty value at the YAML
+        # boundary too). `not target_dataset` rejects both the same way,
+        # before any DELETE runs.
+        bad = BackupConfig(
+            datasets=[
+                DatasetConfig(
+                    name="tank/bad",
+                    frequency=Duration("1h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+                    ],
+                ),
+            ],
+            remote_backup=RemoteServerConfig(target_dataset=bad_target_dataset),
+        )
+        with pytest.raises(ValueError, match="requires 'target_dataset'"):
+            save_config(session, bad)
+        self._assert_good_survives(session)
+
+    def test_empty_datasets_raises_before_delete(self, session):
+        # Finding 4: `save_config(session, BackupConfig(datasets=[]))` used
+        # to succeed and leave a store `load_config` refuses to read at all
+        # ("No datasets configured"). It now raises up front instead.
+        #
+        # Deliberately NOT covered here (and must not be "fixed" later as a
+        # bug): a `DatasetConfig` with `retention_rules=[]` still writes
+        # zero retention rows for that dataset and still loads back as the
+        # 1d->30d default with a WARNING (`_dataset_level_rules`). That
+        # asymmetry is the user's binding decision -- refusing an
+        # empty-retention dataset is the CLI's job later, not this store
+        # layer's.
+        with pytest.raises(ValueError, match="No datasets configured"):
+            save_config(session, BackupConfig(datasets=[]))
+        self._assert_good_survives(session)
+
+
+@pytest.mark.unit
+class TestMapperDetachedSafety:
+    """Flagged by the reviewer as unpinned: `load_config` builds every
+    nested dataclass eagerly, before it returns (module docstring), so the
+    resulting `BackupConfig` must stay fully usable -- including every
+    nested retention rule and remote -- long after the session that
+    produced it is closed. This is structurally guaranteed today because
+    everything returned is a plain `@dataclass`, but that guarantee is the
+    entire reason the two-layer architecture (`store/__init__.py`'s
+    docstring) exists, so it is pinned directly here rather than left to
+    hold by accident.
+    """
+
+    def test_returned_config_is_fully_usable_after_session_close(self, engine):
+        config = BackupConfig(
+            datasets=[
+                DatasetConfig(
+                    name="tank/a",
+                    frequency=Duration("1h"),
+                    retention_rules=[
+                        ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+                    ],
+                    remote=[
+                        RemoteDatasetConfig(
+                            destination="offsite",
+                            frequency=Duration("4h"),
+                            retention_rules=[
+                                ConfigRetentionRule(age=Duration("1h"), keep_for=Duration("7d"))
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+            destinations={"offsite": ConfigDestination(url="ssh://offsite/pool")},
+            remote_backup=RemoteServerConfig(target_dataset="tank/received"),
+        )
+
+        with Session(engine) as session:
+            save_config(session, config)
+            session.commit()
+            loaded = load_config(session)
+        # `session` is closed now (the `with` block's __exit__) -- every
+        # attribute access below must be a plain dataclass access, not an
+        # ORM lazy-load, or this raises DetachedInstanceError.
+
+        assert loaded.datasets[0].name == "tank/a"
+        assert loaded.datasets[0].retention_rules == [
+            ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
+        ]
+        assert loaded.datasets[0].remote[0].destination == "offsite"
+        assert loaded.datasets[0].remote[0].frequency == Duration("4h")
+        assert loaded.datasets[0].remote[0].retention_rules == [
+            ConfigRetentionRule(age=Duration("1h"), keep_for=Duration("7d"))
+        ]
+        assert loaded.destinations["offsite"] == ConfigDestination(
+            url="ssh://offsite/pool"
+        )
+        assert loaded.remote_backup == RemoteServerConfig(target_dataset="tank/received")
