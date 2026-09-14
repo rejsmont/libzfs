@@ -641,15 +641,16 @@ class BackupConfig:
     datasets: List[DatasetConfig]
     snapshot_prefix: str = "autosnap"
     check_interval: timedelta = field(default_factory=lambda: Duration("5m"))
-    prune_interval: timedelta = field(default_factory=lambda: Duration("1h"))
+    # None means "derive from check_interval" -- see `effective_prune_interval`.
+    prune_interval: Optional[timedelta] = None
     api_host: str = "127.0.0.1"
     api_port: int = 8080
     dry_run: bool = False
     destinations: Dict[str, Destination] = field(default_factory=dict)
     remote_backup: Optional[RemoteServerConfig] = None
-    client_id_file: Path = field(
-        default_factory=lambda: Path.home() / '.config' / 'zfsbackup' / 'client_id'
-    )
+    # None means "derive from $HOME in the resolving process" -- see
+    # `effective_client_id_file`.
+    client_id_file: Optional[Path] = None
 
     @classmethod
     def from_file(cls, config_path: Path) -> 'BackupConfig':
@@ -693,8 +694,11 @@ class BackupConfig:
         check_str = data.get('check_interval', '5m')
         check_interval = _duration_from_config(check_str, "check_interval")
 
-        prune_str = data.get('prune_interval', check_str)
-        prune_interval = _duration_from_config(prune_str, "prune_interval")
+        prune_str = data.get('prune_interval')
+        prune_interval = (
+            _duration_from_config(prune_str, "prune_interval")
+            if prune_str is not None else None
+        )
 
         api_host = data.get('api_host', '127.0.0.1')
         api_port = int(data.get('api_port', 8080))
@@ -740,7 +744,7 @@ class BackupConfig:
             )
 
         cid = data.get('client_id_file')
-        client_id_file = Path(cid) if cid else Path.home() / '.config' / 'zfsbackup' / 'client_id'
+        client_id_file = Path(cid) if cid else None
 
         return cls(
             datasets=datasets,
@@ -754,6 +758,37 @@ class BackupConfig:
             remote_backup=remote_backup,
             client_id_file=client_id_file,
         )
+
+    @property
+    def effective_prune_interval(self) -> timedelta:
+        """Return the prune interval that actually governs pruning.
+
+        When `prune_interval` is `None` ("follow `check_interval`"), returns
+        `self.check_interval` itself -- not a copy -- so a `Duration`'s
+        `.literal` carries through unchanged. Otherwise returns
+        `self.prune_interval` as-is. Note `prune_interval` set to a present
+        but zero duration (e.g. ``"0m"``) is a real, distinct value from
+        `None` and is returned unchanged here; only `None` triggers fallback.
+        """
+        if self.prune_interval is None:
+            return self.check_interval
+        return self.prune_interval
+
+    @property
+    def effective_client_id_file(self) -> Path:
+        """Return the client ID file path that actually governs identity.
+
+        When `client_id_file` is `None` ("derive from `$HOME`"), returns
+        ``Path.home() / '.config' / 'zfsbackup' / 'client_id'``, computed
+        fresh on every call -- deliberately NOT memoized or cached on the
+        instance. The entire point is that `$HOME` is resolved in whichever
+        process calls this property (e.g. inside a forked worker, post-fork),
+        not frozen at config-load time in a possibly different process (e.g.
+        under `sudo` at import time).
+        """
+        if self.client_id_file is None:
+            return Path.home() / '.config' / 'zfsbackup' / 'client_id'
+        return self.client_id_file
 
     @property
     def enabled_datasets(self) -> List[DatasetConfig]:

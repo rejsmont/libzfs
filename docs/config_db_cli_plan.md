@@ -495,7 +495,8 @@ The read path stays permissive and loud; the write paths (CLI, `import`, item 3'
   - `global_settings` — single row (`CHECK (id = 1)`), mirroring `BackupConfig` scalars
     (`config.py:179-189`): `snapshot_prefix`, `check_interval_seconds` + `check_interval_literal`,
     `prune_interval_*`, `api_host`, `api_port`, `dry_run`, `client_id_file`, plus `generation INTEGER`
-    (items 15 and 17).
+    (items 15 and 17). **Superseded in part by item 3c:** `prune_interval_seconds` and
+    `client_id_file` are nullable, where NULL means "derive at read time".
   - `datasets` — `id`, `name UNIQUE NOT NULL`, `recursive`, `frequency_seconds`, `frequency_literal`,
     `enabled` (`config.py:79-86`).
   - `retention_rules` — `id`, `dataset_id FK ON DELETE CASCADE`,
@@ -617,6 +618,42 @@ Consequences:
   today for a config with no per-destination rules (**wire-compatibility assertion — required**).
 - **Tests:** `pytest-test-author`, same cycle.
 
+### Item 3c — Representable "unset" for derived global settings *(added after item 4 landed)*
+
+- **Owner:** **split** — `zfsbackup-store-developer` (3c.1, schema + mapper) → `zfsbackup-developer`
+  (3c.2, dataclass + consumers) → `pytest-test-author` (3c.3) → main session (3c.4, docs)
+  · **Tag:** `needs-approval` *(schema change + public dataclass shape + config load path)*
+- **Not in the original plan.** Added on the user's proposal after item 4 landed, and **must precede
+  item 7** — once Alembic baselines the schema, this needs an `ALTER` migration plus a backfill that
+  asks an unanswerable question of each existing row ("was this value derived or chosen?").
+- **Basis:** two global settings mean *derive at load time* when absent from YAML —
+  `prune_interval` (`config.py:696`, absent means follow `check_interval`) and `client_id_file`
+  (`config.py:742-743`, absent means resolve `$HOME` in the process that will use the file).
+  `from_file` resolved both eagerly and `models.py:120`/`:125` stored them `NOT NULL`, flattening the
+  derivation into whichever process wrote the row.
+- **Why it matters.** `zfsbackup-config import` run under `sudo` baked `/root/.config/...` into the
+  DB. `ClientIdentity._load_or_generate` (`remote.py:36-43`) does `mkdir(parents=True)` +
+  `write_text` on a miss, so a wrong `$HOME` silently **generates a brand-new client ID** — orphaning
+  the entire server-side `target/<client_id>/...` dataset tree from the previous identity. Separately,
+  a stored `prune_interval` stops tracking a later `check_interval` change.
+- **Second defect collapsed.** `config.py:644` defaulted `prune_interval` to `1h` for a directly
+  constructed `BackupConfig`, while `from_file` with the key absent gave `check_interval` (5m). Two
+  disagreeing defaults for one field, with no DB involved. Verified by execution before the change.
+- **Changes:** both columns nullable, NULL meaning *derive*, with a `CHECK (prune_interval_seconds
+  IS NOT NULL OR prune_interval_literal IS NULL)` for coherence; both dataclass fields `Optional`,
+  `None` meaning *derive*; two read-only accessors `BackupConfig.effective_prune_interval` (returns
+  the `check_interval` object itself, so the literal carries through) and `effective_client_id_file`
+  (**recomputed per call, never memoized** — that is the entire fix); `from_file` stops resolving
+  eagerly; `workers.py:122`, `api.py:50` and `remote.py:59` move to the accessors.
+- **`check_interval` deliberately stays `NOT NULL`** — its default is the constant `'5m'`, so there
+  is nothing to derive from and no second process can change the answer.
+- **Edge case:** a present-but-zero `prune_interval: "0m"` must stay distinct from absent. Every
+  branch tests `is None`, never truthiness.
+- **Downstream amendments** recorded on items 11 and 12: the CLI needs a way to express "unset" and
+  must render a derived value distinguishably, and the `$EDITOR` buffer must **omit** a derived key
+  rather than render its effective value — otherwise the next save re-freezes the derivation.
+- **Verification:** `pytest tests/ -q` — 788 before, 803 after.
+
 ### Item 4 — Mapper layer (ORM ⇄ dataclass)
 
 - **Owner:** `zfsbackup-store-developer` · **Tag:** `needs-approval` *(defines the config load contract)*
@@ -630,11 +667,14 @@ Consequences:
   same path — must construct dataclasses directly (`from_property`-style, with typed values) rather than
   routing DB rows back through `from_dict`.
 - **Changes:** `load_config(session) -> BackupConfig` and `save_config(session, config)`. `load_config`
-  replicates `from_file`'s defaulting exactly: `snapshot_prefix` default `"autosnap"` (`config.py:208`),
-  retention defaulting to `{'1d': '30d'}` when empty (`config.py:149-150`), retention sorted by age
-  (`config.py:155`), `prune_interval` falling back to `check_interval` (`config.py:214`),
-  `client_id_file` default (`config.py:238-239`), and the "No datasets configured" error
-  (`config.py:204-205`).
+  replicates `from_file`'s defaulting exactly: `snapshot_prefix` default `"autosnap"`,
+  retention defaulting to `{'1d': '30d'}` when empty, retention sorted by age, and the
+  "No datasets configured" error.
+  **Corrected during implementation** (line citations above were stale, and two claims were wrong):
+  `prune_interval` falling back to `check_interval` and the `client_id_file` default are **not**
+  `load_config`'s job. Item 3c makes both columns nullable and both dataclass fields `Optional`, so
+  the derivation happens in `BackupConfig.effective_prune_interval` /
+  `effective_client_id_file`, in the process that consumes the value.
 - **Target behaviour:** `load_config(session_from(yaml_imported(P))) == BackupConfig.from_file(P)` for
   every YAML in the repo — an equivalence property test in item 9.
 - **Verification:** `pytest tests/test_zfsbackup_store.py -k mapper`
@@ -955,6 +995,11 @@ Consequences:
   `api_port`; `bool` accepting `true/false/yes/no/on/off/1/0` case-insensitively; duration via
   `Duration(...)` (item 2), **storing the literal as typed**; `Path` for `client_id_file`. Unknown path →
   non-zero exit listing valid siblings.
+- **Item 3c amendment — the tri-state.** `prune_interval` and `client_id_file` are nullable, where NULL
+  means "derive". `set` needs a way to express that (an `unset` verb, or `set <path>` with an empty
+  value), and `get` must render a derived value distinguishably from a stored one —
+  `derived (5m)` vs `5m`. Without this the CLI can reach the tri-state's stored side but never return
+  to its derived side.
 - **Addressable paths:** `snapshot_prefix`, `check_interval`, `prune_interval`, `api_host`, `api_port`,
   `dry_run`, `client_id_file`, `datasets.<n>.{frequency,recursive,enabled}`,
   `datasets.<n>.retention.<age>`, `datasets.<n>.remote.<dest>.frequency`, `destinations.<name>.url`,
@@ -985,6 +1030,10 @@ Consequences:
   unlikely to want that.
   Same rule for `destinations:`.
 - **Flow:**
+  0. **Item 3c amendment:** a field whose value is derived (`prune_interval`, `client_id_file` unset)
+     must be **omitted** from the buffer, not rendered as its effective value. Rendering it concrete
+     would re-freeze the derivation on the next save — the exact bug item 3c removed, reintroduced
+     through the editor.
   1. `render_yaml(load_config(db))` → temp file, `0600`, in a private temp dir.
   2. Launch `$VISUAL` → `$EDITOR` → fall back to `vi`. Split with `shlex.split` so `EDITOR="code -w"`
      works. Run with **inherited stdio, not captured** — a captured-stdio editor hangs. This is the same
@@ -1340,11 +1389,18 @@ be reviewed while this is still in design, and a problem here cannot destabilise
   review, and ship on its own before anything else in Phase 1 starts.
 - **Item 3b must precede item 3**, despite its number. 3b adds per-destination retention to the *dataclass*
   model, and item 3's schema mirrors that model — designing the tables before the dataclasses exist would
-  mean revising them immediately. Order: **2b → 3b → 3 → 4 → 5 → 6 → 8**. (3b's `remote.py` half —
-  passing the destination to `to_property` — is independent of the schema and can land with either.)
+  mean revising them immediately. Order: **2b → 3b → 3 → 4 → 3c → 7 → 5 → 6 → 8**. (3b's `remote.py`
+  half — passing the destination to `to_property` — is independent of the schema and can land with
+  either.)
 - Both 2b and 3b are pure `zfsbackup` changes with **no DB dependency at all**, so both can be implemented,
   reviewed, and merged before any SQLAlchemy code is written. Recommended: ship them as their own cycle.
-- **Phase 1 serial chain:** 3 → 4 → 5 → 6 → 8. Item 7 (Alembic) runs parallel to 4-6. Item 8 needs 4 and 6.
+- **Phase 1 serial chain:** 3 → 4 → 5 → 6 → 8. Item 8 needs 4 and 6.
+- **Item 7 (Alembic) is no longer free-floating.** It baselines the schema, so **every intended schema
+  change must land before it** — concretely, item 3c. Item 7 may run parallel to 5 and 6, but not
+  before 3c. Ordering: **3c → 7**, and 7 before any later item that would otherwise need a migration.
+- **Item 6 reaches into Phase 2.** Its files are `store/db.py`, `daemon.py` *and* `cli/main.py`, but
+  `zfsbackup/cli/` does not exist until item 10. Split it: **6a** (resolution logic + daemon) stays in
+  the Phase 1 chain; **6b** (CLI wiring) folds into item 10 and inherits 6a's settled resolution order.
 - **Phase 1 coordination point:** items 8 and 9 must be reviewed together (patch-target breakage).
 - **Phase 2 parallel:** items 11, 12, 13 are independent once 10 lands. Item 14 needs 12's editor
   machinery. Item 15 is independent of 11-14 and can start immediately after 10.

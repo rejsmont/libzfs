@@ -420,7 +420,7 @@ class TestRealSendReceive:
 
     def _server_snap_names(self, target_root, source_fs, config):
         """Return short snapshot names present on the server-side target dataset."""
-        client_id = ClientIdentity(config.client_id_file).client_id
+        client_id = ClientIdentity(config.effective_client_id_file).client_id
         relative = source_fs.name.split('/', 1)[1]
         server_ds = f'{target_root}/{client_id}/{relative}'
         return list_real_snapshot_names(server_ds)
@@ -508,7 +508,7 @@ class TestRealSendReceive:
         snaps = manager.list_snapshots(dsi)
         remote_mgr.backup_dataset(dsi, dsi.config.remote[0])
 
-        client_id = ClientIdentity(config.client_id_file).client_id
+        client_id = ClientIdentity(config.effective_client_id_file).client_id
         url = f'{running_server}/backup/{client_id}/{source_fs.name}/negotiate'
         resp = req.post(url, json={
             'snapshots': [s.name for s in snaps],

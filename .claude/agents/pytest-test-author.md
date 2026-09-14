@@ -38,7 +38,7 @@ Patches `subprocess.Popen` (via `pytest-mock`). Use it for anything that shells 
 - `libzfseasy` unit: `tests/test_types.py` (pure, no subprocess), `tests/test_commands.py`
   (+ `tests/test_commands_part2.py`).
 - Workflows: `tests/test_integration.py`.
-- zfsbackup: `zfsbackup/test_basic.py`, plus `tests/test_zfsbackup_config.py`,
+- zfsbackup: `tests/test_zfsbackup_config.py`,
   `tests/test_zfsbackup_duration.py`, `tests/test_zfsbackup_manager.py`,
   `tests/test_zfsbackup_remote.py`, `tests/test_zfsbackup_workers.py`.
 - Config store: `tests/test_zfsbackup_store.py`. Config CLI: `tests/test_zfsbackup_cli.py`.

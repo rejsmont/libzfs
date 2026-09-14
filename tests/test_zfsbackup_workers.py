@@ -60,9 +60,15 @@ class TestPruningWorker:
         assert worker.daemon is True
 
     def test_get_interval_returns_prune_interval(self, sample_backup_config):
+        # sample_backup_config sets neither check_interval nor
+        # prune_interval, so prune_interval is None (unset) and the
+        # effective value derives from check_interval's default (5m/300s),
+        # not the old hard-coded prune_interval default (1h/3600s).
         worker = PruningWorker.__new__(PruningWorker)
         interval = worker._get_interval(sample_backup_config)
-        assert interval == sample_backup_config.prune_interval.total_seconds()
+        assert sample_backup_config.prune_interval is None
+        assert interval == sample_backup_config.effective_prune_interval.total_seconds()
+        assert interval == 300
 
     def test_process_dataset_calls_prune(self, mocker):
         manager = MagicMock()

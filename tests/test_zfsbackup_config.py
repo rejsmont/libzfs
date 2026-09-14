@@ -695,7 +695,8 @@ class TestBackupConfig:
         f = tmp_path / 'cfg.yaml'
         f.write_text("datasets:\n  - name: pool/data\ncheck_interval: 30m\n")
         cfg = BackupConfig.from_file(f)
-        assert cfg.prune_interval == cfg.check_interval
+        assert cfg.prune_interval is None
+        assert cfg.effective_prune_interval == cfg.check_interval
 
     def test_from_file_remote_backup_disabled(self, tmp_path):
         f = tmp_path / 'cfg.yaml'

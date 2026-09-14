@@ -56,7 +56,7 @@ class RemoteBackupManager:
     def __init__(self, config: BackupConfig, local_manager: DatasetManager):
         self.config = config
         self.local_manager = local_manager
-        self.identity = ClientIdentity(config.client_id_file)
+        self.identity = ClientIdentity(config.effective_client_id_file)
         # (dataset name, destination) pairs whose effective per-destination
         # retention-rule collisions have already been warned about, for this
         # manager's lifetime. `to_property(destination)` ships the resolved

@@ -119,7 +119,7 @@ class PruningWorker(BaseWorker):
         super().__init__('pruning-worker', config_path, stop_event, dry_run, verbose)
 
     def _get_interval(self, config: BackupConfig) -> float:
-        return config.prune_interval.total_seconds()
+        return config.effective_prune_interval.total_seconds()
 
     def _get_datasets(self, manager: DatasetManager) -> List[DatasetInfo]:
         return manager.datasets + manager.received_datasets()

@@ -76,6 +76,26 @@ class TestConfigEndpoint:
         assert 'api_port' in data
         assert 'dry_run' in data
 
+    def test_prune_interval_seconds_is_a_number_when_unset(self, mocker):
+        # config.py item 3c.3: BackupConfig.prune_interval defaults to None
+        # ("derive from check_interval"). The /config endpoint uses
+        # effective_prune_interval, so it must still emit a JSON number
+        # here, not null/None -- a client parsing this response should
+        # never have to special-case a missing prune interval.
+        config = _make_config()
+        assert config.prune_interval is None
+        dsi = _make_dsi()
+        mocker.patch.object(
+            DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[dsi]
+        )
+        app = create_app(config)
+        app.testing = True
+        resp = app.test_client().get('/config')
+        data = resp.get_json()
+        assert data['prune_interval_seconds'] is not None
+        assert isinstance(data['prune_interval_seconds'], (int, float))
+        assert data['prune_interval_seconds'] == config.check_interval.total_seconds()
+
     def test_config_values_match(self, mocker):
         config = _make_config(snapshot_prefix='testsnap', dry_run=True)
         dsi = _make_dsi()

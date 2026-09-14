@@ -46,12 +46,20 @@ Three invariants hold across every function here:
 exactly for everything the schema cannot itself default (see the table in
 the docstring of `load_config` below) -- but NOT for `prune_interval`
 falling back to `check_interval`, and NOT for the `client_id_file` default.
-Both of those columns are `NOT NULL` in `GlobalSettings`
-(`models.py`'s `prune_interval_seconds`, `client_id_file`), so a DB row can
-never be "absent" the way a YAML key can; `save_config` (the writer) is what
-materialises those defaults once, at write time. Implementing them again in
-the mapper would be dead code that can never execute against a
-schema-valid row.
+Both `GlobalSettings.prune_interval_seconds` and `.client_id_file` are
+nullable specifically so that "derive this at load time" is representable
+in the DB as `NULL` rather than flattened into a stored value by whichever
+process happens to write it (a `zfsbackup-config import` run under `sudo`
+freezing `/root/.config/...` into the DB was the motivating bug -- see
+`models.py`'s module docstring and `GlobalSettings`). This module therefore
+passes a `NULL` row straight through as `None` on both `BackupConfig`
+fields rather than deriving a value here: `BackupConfig.effective_prune_interval`
+and `.effective_client_id_file` (`config.py`) own the actual
+`check_interval`/`$HOME` derivation, resolved lazily on each access in
+whatever process calls them, not this mapper. `load_config` must not
+reimplement that derivation itself: doing so would re-flatten the very
+value this item made representable, one layer earlier than the accessor
+that now owns it.
 """
 
 from __future__ import annotations
@@ -314,20 +322,22 @@ def load_config(session: Session) -> BackupConfig:
 
     Replicates `BackupConfig.from_file`'s defaulting behaviour exactly for
     everything the schema itself cannot default -- see the module
-    docstring for the two defaults (`prune_interval` <- `check_interval`,
-    `client_id_file`) that are deliberately NOT reimplemented here because
-    `GlobalSettings` makes both columns `NOT NULL` (the writer,
-    `save_config`, is what materialises them, once, at write time).
+    docstring for the two fields (`prune_interval`, `client_id_file`) that
+    are deliberately NOT defaulted/derived here even though `from_file`
+    would: `GlobalSettings` makes both columns nullable specifically so a
+    DB row can represent "derive this elsewhere", and this function passes
+    that `NULL` through as `BackupConfig.prune_interval is None` /
+    `.client_id_file is None` rather than resolving it.
 
     | `from_file` default/behaviour | Who owns it on the DB path |
     |---|---|
     | `snapshot_prefix="autosnap"` | Schema `default=` |
     | `check_interval="5m"` | Writer (`NOT NULL`); this function reads |
-    | `prune_interval` <- `check_interval` | Writer only; NOT reimplemented here |
+    | `prune_interval` <- `check_interval` | NOT reimplemented; NULL row yields `None` |
     | `api_host`/`api_port`/`dry_run` | Schema `default=` |
     | `destinations={}` | Emergent -- empty table yields `{}` |
     | `remote_backup=None` | This function -- absent `RemoteServer` row |
-    | `client_id_file` default | Writer only; NOT reimplemented here |
+    | `client_id_file` default | NOT reimplemented; NULL row yields `None` |
     | "No datasets configured" | This function |
     | retention `{'1d': '30d'}` default | `_dataset_level_rules` |
     | retention sorted by age | `_dataset_level_rules`/`_scoped_rules` |
@@ -383,15 +393,30 @@ def load_config(session: Session) -> BackupConfig:
         check_interval=_duration_from_row(
             gs.check_interval_seconds, gs.check_interval_literal, "check_interval"
         ),
-        prune_interval=_duration_from_row(
-            gs.prune_interval_seconds, gs.prune_interval_literal, "prune_interval"
+        # NULL prune_interval_seconds means "derive from check_interval at
+        # read time" (models.py's module docstring) -- pass None straight
+        # through rather than calling _duration_from_row, which would reach
+        # Duration(seconds=None) and raise. The CHECK constraint in
+        # GlobalSettings guarantees prune_interval_literal is also NULL
+        # whenever prune_interval_seconds is, so there is no literal to lose
+        # here.
+        prune_interval=(
+            None if gs.prune_interval_seconds is None
+            else _duration_from_row(
+                gs.prune_interval_seconds, gs.prune_interval_literal, "prune_interval"
+            )
         ),
         api_host=gs.api_host,
         api_port=gs.api_port,
         dry_run=bool(gs.dry_run),
         destinations=destinations,
         remote_backup=remote_backup,
-        client_id_file=Path(gs.client_id_file),
+        # NULL means "resolve $HOME's default in the process that uses the
+        # file" -- see models.py's GlobalSettings docstring. Pass None
+        # through rather than resolving it here.
+        client_id_file=(
+            None if gs.client_id_file is None else Path(gs.client_id_file)
+        ),
     )
 
 
@@ -702,12 +727,26 @@ def save_config(session: Session, config: BackupConfig) -> None:
         snapshot_prefix=config.snapshot_prefix,
         check_interval_seconds=config.check_interval.total_seconds(),
         check_interval_literal=getattr(config.check_interval, "literal", None),
-        prune_interval_seconds=config.prune_interval.total_seconds(),
-        prune_interval_literal=getattr(config.prune_interval, "literal", None),
+        # None means "derive from check_interval at read time" -- write
+        # NULL to both columns (never a NULL-seconds/non-NULL-literal row,
+        # which the prune_literal_requires_seconds CHECK rejects).
+        prune_interval_seconds=(
+            None if config.prune_interval is None
+            else config.prune_interval.total_seconds()
+        ),
+        prune_interval_literal=(
+            None if config.prune_interval is None
+            else getattr(config.prune_interval, "literal", None)
+        ),
         api_host=config.api_host,
         api_port=config.api_port,
         dry_run=config.dry_run,
-        client_id_file=str(config.client_id_file),
+        # None means "resolve $HOME's default in the process that uses the
+        # file" -- write NULL rather than materialising this process's
+        # $HOME into the DB.
+        client_id_file=(
+            None if config.client_id_file is None else str(config.client_id_file)
+        ),
         generation=previous_generation + 1,
     ))
 

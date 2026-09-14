@@ -79,8 +79,15 @@ retention rules. Never reuse it as the DB→dataclass path either.
 
 `load_config(session)` must replicate `BackupConfig.from_file`'s defaulting *exactly*:
 `snapshot_prefix` default `"autosnap"`, retention defaulting to `{'1d': '30d'}` when empty, retention
-sorted by age, `prune_interval` falling back to `check_interval`, the `client_id_file` default, and
-the "No datasets configured" error. The target property is
+sorted by age, and the "No datasets configured" error.
+
+**Two settings are deliberately not on that list.** `prune_interval_seconds` and `client_id_file` are
+nullable, and NULL means "derive at read time" — the mapper passes NULL straight through as `None`
+and `BackupConfig.effective_prune_interval` / `effective_client_id_file` derive it in the process
+that consumes the value. This is not a nicety: `client_id_file` resolves `$HOME`, so freezing it at
+write time meant a DB imported under `sudo` pointed the daemon at `/root/.config/...`, and because
+`ClientIdentity` generates an ID on a miss, that silently orphaned the whole server-side dataset
+tree. Never re-materialise a derived value on the write path. The target property is
 `load_config(session_from(yaml_imported(P))) == BackupConfig.from_file(P)` for every YAML in the repo.
 
 ## Engine and session rules (item 5) — the highest-risk item in the plan

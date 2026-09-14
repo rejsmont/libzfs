@@ -103,7 +103,7 @@ Trust the source when any doc disagrees with it, and flag the stale doc.
 **Tests:**
 - Three tiers: mocked unit/integration (default) and `real_zfs` (needs a pool, `-m real_zfs`).
   Two-VM end-to-end scenarios live under `scenarios/`.
-- `zfsbackup` test files: `tests/test_zfsbackup_*.py` and `zfsbackup/test_basic.py`.
+- `zfsbackup` test files: `tests/test_zfsbackup_*.py`.
 - Run: `pytest tests/test_zfsbackup_*.py`; add `-m real_zfs` for real-ZFS tests.
 - Run daemon: `python -m zfsbackup.daemon -c zfsbackup/config.example.yaml --dry-run`
   or `--test-config` for config validation only.

@@ -25,6 +25,20 @@ cannot reach the DB via YAML, since `config.py`'s grammar is integer-only,
 but `DatasetConfig.from_property` can decode one from a wire float, so the
 model tolerates it here too.)
 
+`GlobalSettings.prune_interval_seconds` is the one column where a NULL
+`*_seconds` value is legal, and it means something entirely different from a
+NULL `*_literal`: `config.py`'s `BackupConfig.prune_interval` is `None`
+when absent from YAML ("follow `check_interval`"), and
+`BackupConfig.effective_prune_interval` resolves that fallback lazily, on
+each access, in whatever process calls it -- not once at load time --
+because which process's `check_interval` should "win" is not a question a
+stored value can answer. NULL `prune_interval_seconds` therefore means
+"derive at read time", not "no literal on record"; see `mapper.py`. No
+other `*_seconds` column is nullable for this reason: `check_interval` has
+a fixed default with nothing to derive from, and every other duration
+pair's NULL `*_seconds` state is simply unpopulated (dataset-level rows,
+required fields) rather than a deliberate "unset, compute elsewhere" marker.
+
 Retention scope (see item 3's basis, `backup_manager.py`'s
 `needs_prunning`): retention is a bijection between intervals (`age`) and
 expiries (`keep_for`) *within a scope*, where the scope is either a dataset
@@ -111,18 +125,38 @@ class GlobalSettings(Base):
         # name is given here, so passing the already-prefixed name would
         # double it up into "ck_global_settings_ck_global_settings_singleton".
         CheckConstraint("id = 1", name="singleton"),
+        # prune_interval_seconds NULL means "derive from check_interval at
+        # read time" (see the module docstring); prune_interval_literal is
+        # meaningless without a seconds value to agree or disagree with, so
+        # a NULL-seconds/non-NULL-literal row is an incoherent state this
+        # rejects outright rather than letting the mapper guess which side
+        # to trust.
+        CheckConstraint(
+            "prune_interval_seconds IS NOT NULL OR prune_interval_literal IS NULL",
+            name="prune_literal_requires_seconds",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
     snapshot_prefix: Mapped[str] = mapped_column(default="autosnap")
     check_interval_seconds: Mapped[float] = mapped_column(nullable=False)
     check_interval_literal: Mapped[Optional[str]] = mapped_column(nullable=True)
-    prune_interval_seconds: Mapped[float] = mapped_column(nullable=False)
+    # Nullable: NULL means "derive from check_interval at read time" --
+    # see the module docstring. Unlike every other *_seconds column in this
+    # module, this NULL is not "unpopulated", it is a deliberate marker.
+    prune_interval_seconds: Mapped[Optional[float]] = mapped_column(nullable=True)
     prune_interval_literal: Mapped[Optional[str]] = mapped_column(nullable=True)
     api_host: Mapped[str] = mapped_column(default="127.0.0.1")
     api_port: Mapped[int] = mapped_column(default=8080)
     dry_run: Mapped[bool] = mapped_column(default=False)
-    client_id_file: Mapped[str] = mapped_column(nullable=False)
+    # Nullable: NULL means "resolve $HOME's default in the process that
+    # uses the file" (config.py's `Path.home() / '.config' / 'zfsbackup' /
+    # 'client_id'`), not "no value stored". A stored, materialised path
+    # here would freeze whichever process ran `zfsbackup-config import`'s
+    # $HOME into the DB -- see the item-3c.1 plan item for why that is a
+    # real bug (ClientIdentity._load_or_generate silently generates a new
+    # client ID on a wrong-$HOME miss).
+    client_id_file: Mapped[Optional[str]] = mapped_column(nullable=True)
     # Bumped on every write; used by items 15/17 to detect concurrent
     # modification (read generation, write, compare-and-swap on save).
     generation: Mapped[int] = mapped_column(default=0, nullable=False)

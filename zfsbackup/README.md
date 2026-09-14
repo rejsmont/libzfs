@@ -84,6 +84,14 @@ python -m zfsbackup.daemon --test-config -c config.yaml
 
 - `snapshot_prefix`: Prefix for all managed snapshots (default: "autosnap")
 - `check_interval`: How often to check if snapshots are needed (e.g., "5m", "1h")
+- `prune_interval`: How often the pruning worker applies retention policy. **Omit to follow
+  `check_interval`** — the value is derived when the daemon reads its config, not frozen when the
+  config is written, so a later change to `check_interval` carries over.
+- `client_id_file`: Where this client's generated identity is stored. **Omit to derive**
+  `~/.config/zfsbackup/client_id` — resolved in the daemon's own `$HOME`, not that of whoever wrote
+  the config. Set it explicitly whenever the daemon and the config-managing user differ (systemd
+  units, `sudo`), because a wrong path makes the daemon generate a *new* identity and lose track of
+  its existing server-side backups.
 - `dry_run`: Set to `true` to test without making changes (default: false)
 
 ### Dataset Configuration

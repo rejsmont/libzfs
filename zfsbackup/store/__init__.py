@@ -26,11 +26,14 @@ per table). `zfsbackup/store/mapper.py` converts between ORM rows and the
 dataclasses: `load_config(session) -> BackupConfig` builds a fully detached
 `BackupConfig` (replicating `BackupConfig.from_file`'s defaulting exactly,
 except `prune_interval`'s fallback to `check_interval` and the
-`client_id_file` default, which the writer -- `save_config` -- materialises
-once at write time, since both columns are `NOT NULL` and can never be
-"absent" the way a YAML key can), and `save_config(session, config)` does a
-full wipe-and-reinsert of the store from a `BackupConfig` (no diff-and-merge,
-no internal `commit()`/`begin()` -- the caller owns the transaction).
+`client_id_file` default -- `GlobalSettings.prune_interval_seconds` and
+`.client_id_file` are nullable precisely so "derive this elsewhere" is
+representable as `NULL` rather than flattened into a stored value by
+whichever process writes it, and `load_config` passes a `NULL` row through
+as `None` rather than resolving it), and `save_config(session, config)` does
+a full wipe-and-reinsert of the store from a `BackupConfig` (no
+diff-and-merge, no internal `commit()`/`begin()` -- the caller owns the
+transaction).
 Engine/session setup (`zfsbackup/store/db.py`) and Alembic migrations are
 later items. This package is not yet wired into the daemon, workers, or CLI.
 

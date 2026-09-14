@@ -525,12 +525,31 @@ class TestDurationYamlBoundaryGuardRegression:
         with pytest.raises(ValueError, match="int"):
             BackupConfig.from_file(f)
 
-    def test_prune_interval_int_rejected_and_key_named(self, tmp_path):
+    @pytest.mark.parametrize(
+        "yaml_value, match",
+        [
+            # An int (truthy) -- the type guard rejects it regardless of
+            # whether the "is present" check uses `is not None` or
+            # truthiness, so this case alone cannot distinguish the two.
+            ("300", "prune_interval"),
+            # An int that is also falsy: a truthiness-based "is present"
+            # check (`if prune_str else None`) would treat this as
+            # "absent" and silently return None (derive from
+            # check_interval) instead of reaching the type guard at all --
+            # this is the case that actually kills that mutant.
+            ("0", "prune_interval"),
+            # An empty string is falsy but a real, present (if useless)
+            # string value -- it must still reach Duration and raise, not
+            # be waved through as "absent" by a truthiness check either.
+            ('""', "cannot be empty"),
+        ],
+    )
+    def test_prune_interval_int_rejected_and_key_named(self, tmp_path, yaml_value, match):
         f = tmp_path / "cfg.yaml"
         f.write_text(
-            "check_interval: 5m\nprune_interval: 300\ndatasets:\n  - name: pool/data\n"
+            f"check_interval: 5m\nprune_interval: {yaml_value}\ndatasets:\n  - name: pool/data\n"
         )
-        with pytest.raises(ValueError, match="prune_interval"):
+        with pytest.raises(ValueError, match=match):
             BackupConfig.from_file(f)
 
     def test_dataset_frequency_unquoted_sexagesimal_yaml_rejected(self, tmp_path):
@@ -618,6 +637,12 @@ class TestBackupConfigDurationDefaults:
     """The BackupConfig-level defaults the reviewer flagged as untested:
     check_interval/prune_interval defaults, and prune_interval falling back
     to check_interval when only the latter is set (config.py:214/386).
+
+    Item 3c.3: `prune_interval` (and `client_id_file`) are now
+    `Optional[...] = None`, where `None` means "derive at load/read time"
+    rather than a baked-in default. `effective_prune_interval` is the
+    accessor that resolves the derivation; `prune_interval` itself stays
+    `None` unless the config explicitly sets it.
     """
 
     def test_check_interval_default_is_duration_5m(self):
@@ -625,18 +650,42 @@ class TestBackupConfigDurationDefaults:
         assert isinstance(cfg.check_interval, Duration)
         assert cfg.check_interval.literal == "5m"
 
-    def test_prune_interval_default_is_duration_1h(self):
+    def test_prune_interval_default_is_none_and_effective_derives_check_interval(self):
+        # This test used to pin a bug: a directly-constructed BackupConfig
+        # defaulted prune_interval to Duration("1h") while from_file with
+        # the key absent produced "5m" -- two defaults for the same "unset"
+        # state disagreeing with each other, with no DB involved. Now both
+        # paths agree that "unset" is None, and effective_prune_interval is
+        # the single place that resolves it.
         cfg = BackupConfig(datasets=[DatasetConfig(name="pool/data")])
-        assert isinstance(cfg.prune_interval, Duration)
-        assert cfg.prune_interval.literal == "1h"
+        assert cfg.prune_interval is None
+        assert isinstance(cfg.effective_prune_interval, Duration)
+        assert cfg.effective_prune_interval.literal == "5m"
+        assert cfg.effective_prune_interval == cfg.check_interval
+
+    def test_direct_construction_and_from_file_defaults_agree(self, tmp_path):
+        # The regression this whole item exists to prevent: the two
+        # construction paths (direct dataclass construction vs. from_file
+        # with the key absent) must produce the same "unset" representation
+        # and the same effective value -- not two different defaults.
+        direct = BackupConfig(datasets=[DatasetConfig(name="pool/data")])
+
+        f = tmp_path / "cfg.yaml"
+        f.write_text("datasets:\n  - name: pool/data\n")
+        from_file = BackupConfig.from_file(f)
+
+        assert direct.prune_interval is from_file.prune_interval is None
+        assert direct.effective_prune_interval.literal == from_file.effective_prune_interval.literal
+        assert direct.effective_prune_interval == from_file.effective_prune_interval
 
     def test_from_file_prune_interval_falls_back_to_check_interval(self, tmp_path):
         f = tmp_path / "cfg.yaml"
         f.write_text("check_interval: 30m\ndatasets:\n  - name: pool/data\n")
         cfg = BackupConfig.from_file(f)
-        assert isinstance(cfg.prune_interval, Duration)
-        assert cfg.prune_interval.literal == "30m"
-        assert cfg.prune_interval == cfg.check_interval
+        assert cfg.prune_interval is None
+        assert isinstance(cfg.effective_prune_interval, Duration)
+        assert cfg.effective_prune_interval.literal == "30m"
+        assert cfg.effective_prune_interval == cfg.check_interval
 
     def test_from_file_prune_interval_independent_when_both_set(self, tmp_path):
         f = tmp_path / "cfg.yaml"
@@ -646,3 +695,78 @@ class TestBackupConfigDurationDefaults:
         cfg = BackupConfig.from_file(f)
         assert cfg.check_interval.literal == "30m"
         assert cfg.prune_interval.literal == "2h"
+        assert cfg.effective_prune_interval is cfg.prune_interval
+
+    def test_from_file_prune_interval_present_and_equal_to_check_interval(self, tmp_path):
+        # "present but happens to equal check_interval" must still be a
+        # real, non-None value -- not silently folded back to None because
+        # the numbers agree.
+        f = tmp_path / "cfg.yaml"
+        f.write_text(
+            "check_interval: 30m\nprune_interval: 30m\ndatasets:\n  - name: pool/data\n"
+        )
+        cfg = BackupConfig.from_file(f)
+        assert cfg.prune_interval is not None
+        assert cfg.prune_interval == cfg.check_interval
+        assert cfg.effective_prune_interval is cfg.prune_interval
+
+    def test_from_file_prune_interval_zero_is_not_none(self, tmp_path):
+        # "0m" is present-but-zero, a real value distinct from absent -- the
+        # implementation must use `is None`, not truthiness, to decide
+        # whether to derive from check_interval.
+        f = tmp_path / "cfg.yaml"
+        f.write_text("prune_interval: 0m\ndatasets:\n  - name: pool/data\n")
+        cfg = BackupConfig.from_file(f)
+        assert cfg.prune_interval is not None
+        assert cfg.prune_interval.total_seconds() == 0
+        assert cfg.effective_prune_interval is cfg.prune_interval
+
+    def test_effective_prune_interval_is_check_interval_object_when_unset(self):
+        # Not just equal -- the same object, so a Duration's .literal
+        # carries through unchanged rather than being reconstructed.
+        cfg = BackupConfig(datasets=[DatasetConfig(name="pool/data")])
+        assert cfg.prune_interval is None
+        assert cfg.effective_prune_interval is cfg.check_interval
+
+
+class TestEffectiveClientIdFile:
+    """`effective_client_id_file` derives from `Path.home()` and must be
+    recomputed on every call, never memoized on the instance -- the whole
+    point is that `$HOME` is resolved in whichever process calls this
+    property (e.g. a forked worker), not frozen at config-load time in a
+    possibly different process (e.g. under `sudo` at import time). A wrong
+    `$HOME` here would silently generate a brand-new client identity and
+    orphan the entire server-side dataset tree for the previous one.
+    """
+
+    def test_default_derives_from_home(self, monkeypatch, tmp_path):
+        home = tmp_path / "home1"
+        monkeypatch.setattr("pathlib.Path.home", lambda: home)
+        cfg = BackupConfig(datasets=[DatasetConfig(name="pool/data")])
+        assert cfg.client_id_file is None
+        assert cfg.effective_client_id_file == home / ".config" / "zfsbackup" / "client_id"
+
+    def test_not_cached_across_calls_on_same_instance(self, monkeypatch, tmp_path):
+        cfg = BackupConfig(datasets=[DatasetConfig(name="pool/data")])
+        assert cfg.client_id_file is None
+
+        home1 = tmp_path / "home1"
+        monkeypatch.setattr("pathlib.Path.home", lambda: home1)
+        first = cfg.effective_client_id_file
+        assert first == home1 / ".config" / "zfsbackup" / "client_id"
+
+        home2 = tmp_path / "home2"
+        monkeypatch.setattr("pathlib.Path.home", lambda: home2)
+        second = cfg.effective_client_id_file
+        assert second == home2 / ".config" / "zfsbackup" / "client_id"
+        assert first != second
+
+    def test_explicit_value_is_returned_unchanged_regardless_of_home(
+        self, monkeypatch, tmp_path
+    ):
+        explicit = tmp_path / "explicit_id"
+        cfg = BackupConfig(
+            datasets=[DatasetConfig(name="pool/data")], client_id_file=explicit
+        )
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "unused_home")
+        assert cfg.effective_client_id_file == explicit

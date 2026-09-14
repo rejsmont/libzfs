@@ -815,6 +815,42 @@ class TestGlobalSettingsSingleton:
 
 
 @pytest.mark.unit
+class TestGlobalSettingsPruneIntervalNullable:
+    """Item 3c.3: `prune_interval_seconds`/`_literal` are nullable, meaning
+    "derive from check_interval at read time" (models.py's module
+    docstring). The `prune_literal_requires_seconds` CHECK constraint rules
+    out the one incoherent combination: a literal on record with no seconds
+    value for it to agree or disagree with.
+    """
+
+    def test_both_null_is_a_valid_unset_state(self, session):
+        session.add(make_global_settings(
+            prune_interval_seconds=None, prune_interval_literal=None,
+        ))
+        session.commit()  # must not raise
+
+        session.expire_all()
+        row = session.get(GlobalSettings, 1)
+        assert row.prune_interval_seconds is None
+        assert row.prune_interval_literal is None
+
+    def test_seconds_present_literal_null_is_valid(self, session):
+        # A real value on record with no literal is the ordinary
+        # "re-synthesize on read" case, unrelated to the unset marker.
+        session.add(make_global_settings(
+            prune_interval_seconds=3600, prune_interval_literal=None,
+        ))
+        session.commit()  # must not raise
+
+    def test_null_seconds_with_literal_rejected_by_check_constraint(self, session):
+        session.add(make_global_settings(
+            prune_interval_seconds=None, prune_interval_literal="1h",
+        ))
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+@pytest.mark.unit
 class TestRemoteServerSingleton:
     def test_single_row_accepted(self, session):
         session.add(RemoteServer(id=1, target_dataset="tank/received"))
@@ -1000,20 +1036,36 @@ class TestDatasetRemoteInheritFrequency:
 # See scratchpad item4_plan.md section 4.7 for the matrix this follows.
 
 
+# `None` in the raw `.literal` projection is ambiguous three ways: a plain
+# `timedelta` (no `.literal` attribute at all), a `Duration` with a
+# sub-second value (no representable literal in the grammar), and -- since
+# item 3c.3 -- `BackupConfig.prune_interval is None` ("unset/derived", not a
+# duration value at all). `Duration(...).literal` can never legitimately be
+# this sentinel, so substituting it for the "unset" case keeps that state
+# distinguishable from the other two `None`s the projection already carries.
+_UNSET = object()
+
+
 def _literal_projection(config: BackupConfig) -> list:
     """Walk a `BackupConfig` and collect every duration's `.literal` (or
-    `None` for a plain `timedelta`/inherited value), in the same order
-    `==` would traverse the underlying lists.
+    `None` for a plain `timedelta`/inherited value, or `_UNSET` for
+    `prune_interval is None`), in the same order `==` would traverse the
+    underlying lists.
 
     Structural `==` is literal-blind (`Duration('30d') == Duration('1M')`
     is `True`), so it alone cannot catch a mapper that reconstructs every
     `Duration` from `*_seconds` and drops every stored `*_literal`. This
     projection is the second half of the equivalence contract -- see Q8 in
-    scratchpad item4_plan.md.
+    scratchpad item4_plan.md. It must also not collapse "derives from
+    check_interval" and "a literal-less stored duration" into the same
+    `None` -- see `_UNSET` above -- or the equivalence contract would stop
+    distinguishing a config that derives `prune_interval` from one that
+    stores a literal-less duration for it, silently, with no test failing.
     """
     literals = [
         getattr(config.check_interval, "literal", None),
-        getattr(config.prune_interval, "literal", None),
+        _UNSET if config.prune_interval is None
+        else getattr(config.prune_interval, "literal", None),
     ]
     for ds in config.datasets:
         literals.append(getattr(ds.frequency, "literal", None))
@@ -1042,6 +1094,42 @@ def _minimal_backup_config(**dataset_kwargs) -> BackupConfig:
     )
     kwargs.update(dataset_kwargs)
     return BackupConfig(datasets=[DatasetConfig(**kwargs)])
+
+
+@pytest.mark.unit
+class TestLiteralProjectionUnsetSentinel:
+    """`_literal_projection`'s `prune_interval` slot must distinguish three
+    states that all reach it as a bare `None` if left unguarded: a plain
+    `timedelta` (no `.literal`), a sub-second `Duration` with no
+    representable literal, and `prune_interval is None` ("unset/derived",
+    since item 3c.3). Only the last gets `_UNSET`; the pin below is that an
+    unset config and a literal-less-duration config must project
+    differently, even though both durations compare unequal to each other's
+    duration too -- the point is `_literal_projection` alone, not `==`.
+    """
+
+    def test_unset_prune_interval_projects_as_unset_sentinel(self):
+        config = _minimal_backup_config()
+        assert config.prune_interval is None
+        projection = _literal_projection(config)
+        assert projection[1] is _UNSET
+
+    def test_unset_and_literal_less_duration_project_differently(self):
+        unset_config = _minimal_backup_config()
+        unset_config.prune_interval = None
+
+        literal_less_config = _minimal_backup_config()
+        # A sub-second Duration has a real, present value with no
+        # representable literal -- `.literal` is None, same as an absent
+        # `.literal` attribute, but NOT the same as "unset/derived".
+        literal_less_config.prune_interval = Duration(seconds=0.5)
+
+        assert _literal_projection(unset_config)[1] is _UNSET
+        assert _literal_projection(literal_less_config)[1] is None
+        assert (
+            _literal_projection(unset_config)[1]
+            != _literal_projection(literal_less_config)[1]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1287,6 +1375,107 @@ class TestMapperLoadConfigQ7:
 
         with pytest.raises(ValueError, match="ghost"):
             load_config(session)
+
+
+@pytest.mark.unit
+class TestMapperPruneIntervalClientIdFileUnset:
+    """Item 3c.3: `GlobalSettings.prune_interval_seconds`/`_literal` and
+    `.client_id_file` are nullable specifically so `BackupConfig`'s "derive
+    this elsewhere" state (`prune_interval is None` /
+    `client_id_file is None`) is representable in the DB, rather than
+    flattened into a concrete value by whichever process happens to write
+    it (see models.py's module docstring for the `sudo`/`$HOME` bug this
+    fixes). `load_config`/`save_config` must pass `NULL` through as `None`
+    on both sides without ever deriving a value themselves.
+    """
+
+    def test_save_then_load_both_none_round_trips_as_null(self, session, mocker):
+        from zfsbackup.store import mapper as mapper_module
+
+        real_duration_from_row = mapper_module._duration_from_row
+        spy = mocker.patch.object(
+            mapper_module, "_duration_from_row", side_effect=real_duration_from_row
+        )
+
+        config = _minimal_backup_config()
+        assert config.prune_interval is None
+        assert config.client_id_file is None
+
+        save_config(session, config)
+        session.commit()
+
+        # The row itself: NULL, not a materialised value derived from
+        # whichever process ran save_config.
+        session.expire_all()
+        row = session.get(GlobalSettings, 1)
+        assert row.prune_interval_seconds is None
+        assert row.prune_interval_literal is None
+        assert row.client_id_file is None
+
+        spy.reset_mock()
+        loaded = load_config(session)
+        assert loaded.prune_interval is None
+        assert loaded.client_id_file is None
+
+        # _duration_from_row must never be reached for prune_interval --
+        # reaching it with seconds=None would raise, and reaching it at all
+        # would mean load_config tried to synthesize a value instead of
+        # passing NULL through as None.
+        prune_interval_calls = [
+            call for call in spy.call_args_list if call.args[2] == "prune_interval"
+        ]
+        assert prune_interval_calls == []
+        # check_interval is never nullable, so the spy must still have run
+        # at least once -- otherwise this assertion would be vacuous.
+        assert spy.call_count >= 1
+
+    def test_save_then_load_explicit_values_round_trip(self, session, tmp_path):
+        # Contrast case: explicit, non-None values must NOT round-trip as
+        # NULL -- only the deliberate None/derive state does.
+        config = _minimal_backup_config()
+        config.prune_interval = Duration("2h")
+        config.client_id_file = tmp_path / "client_id"
+
+        save_config(session, config)
+        session.commit()
+
+        session.expire_all()
+        row = session.get(GlobalSettings, 1)
+        assert row.prune_interval_seconds == 7200
+        assert row.prune_interval_literal == "2h"
+        assert row.client_id_file == str(tmp_path / "client_id")
+
+        loaded = load_config(session)
+        assert loaded.prune_interval == Duration("2h")
+        assert loaded.client_id_file == tmp_path / "client_id"
+
+    def test_save_then_load_zero_prune_interval_is_not_treated_as_unset(self, session):
+        # Duration("0m") and its stored seconds value (0.0) are both falsy
+        # in Python, but "configured to zero" is a real, present value --
+        # distinct from `prune_interval is None` ("unset/derive"). Both
+        # save_config (mapper.py's `prune_interval_seconds=`/`_literal=`)
+        # and load_config (mapper.py's `prune_interval=`) must branch on
+        # `is None`, not truthiness: a truthiness-based guard on either
+        # side would silently fold a configured "0m" into "derive from
+        # check_interval", returning check_interval's seconds (e.g. 300)
+        # from effective_prune_interval instead of 0 -- breaking
+        # `load_config(save_config(cfg)) == cfg` with nothing going red.
+        config = _minimal_backup_config()
+        config.prune_interval = Duration("0m")
+        assert config.prune_interval is not None  # sanity: falsy, not None
+
+        save_config(session, config)
+        session.commit()
+
+        session.expire_all()
+        row = session.get(GlobalSettings, 1)
+        assert row.prune_interval_seconds == 0  # NOT NULL
+        assert row.prune_interval_literal == "0m"
+
+        loaded = load_config(session)
+        assert loaded.prune_interval is not None
+        assert loaded.prune_interval.total_seconds() == 0
+        assert loaded.effective_prune_interval.total_seconds() == 0
 
 
 # ---------------------------------------------------------------------------

@@ -47,7 +47,7 @@ def create_app(config: BackupConfig) -> Flask:
         return jsonify({
             'snapshot_prefix': config.snapshot_prefix,
             'check_interval_seconds': config.check_interval.total_seconds(),
-            'prune_interval_seconds': config.prune_interval.total_seconds(),
+            'prune_interval_seconds': config.effective_prune_interval.total_seconds(),
             'api_host': config.api_host,
             'api_port': config.api_port,
             'dry_run': config.dry_run,

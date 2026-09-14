@@ -93,7 +93,8 @@ into the daemon or CLI yet.
 | `tests/test_commands.py` | Each command class, mocked subprocess |
 | `tests/test_integration.py` | End-to-end workflows, mocked subprocess |
 | `tests/test_real_zfs.py` | Real ZFS commands, marked `real_zfs` |
-| `zfsbackup/test_basic.py` | `zfsbackup` package tests |
+| `tests/test_zfsbackup_workers.py` | Worker loop and interval behaviour |
+| `tests/test_zfsbackup_api.py` | HTTP control API |
 | `tests/test_zfsbackup_config.py` | Config loading, retention collapse, per-destination rules |
 | `tests/test_zfsbackup_duration.py` | The `Duration` type and its literal preservation |
 | `tests/test_zfsbackup_store.py` | SQLAlchemy schema, constraints, mapper |

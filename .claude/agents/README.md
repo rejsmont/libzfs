@@ -38,7 +38,7 @@ into another's directory to save a handoff.
 | `zfsbackup/{config,backup_manager,daemon,workers,remote,api}.py` | `zfsbackup-developer` |
 | `zfsbackup/store/**`, `alembic/**` | `zfsbackup-store-developer` |
 | `zfsbackup/cli/**` | `zfsbackup-cli-developer` |
-| `tests/**`, `conftest.py`, `zfsbackup/test_basic.py` | `pytest-test-author` |
+| `tests/**`, `conftest.py` | `pytest-test-author` |
 | `scenarios/**` | `real-zfs-scenario-dev` |
 
 **A plan item that spans two owners is split by the planner** into sequenced sub-items, one per
