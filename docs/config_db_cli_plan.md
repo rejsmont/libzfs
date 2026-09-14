@@ -619,7 +619,7 @@ Consequences:
 
 ### Item 4 — Mapper layer (ORM ⇄ dataclass)
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(defines the config load contract)*
+- **Owner:** `zfsbackup-store-developer` · **Tag:** `needs-approval` *(defines the config load contract)*
 - **Files:** new `zfsbackup/store/mapper.py`
 - **Basis:** `BackupConfig.from_file` (`config.py:191-252`) is the only load path today; the DB path must
   produce an equivalent object graph or every downstream consumer shifts behaviour.
@@ -641,7 +641,7 @@ Consequences:
 
 ### Item 5 — Engine/session management, WAL, fork safety *(settled gating decision)*
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(multiprocessing)*
+- **Owner:** `zfsbackup-store-developer` *(run at **opus**; + `concurrency-reviewer`)* · **Tag:** `needs-approval` *(multiprocessing)*
 - **Files:** new `zfsbackup/store/db.py`
 - **Basis:** `daemon.py:62-68` spawns 3-4 `multiprocessing.Process` workers; `workers.py:62` and
   `workers.py:196` each open config inside the child. On Linux the default start method is `fork`, so
@@ -669,7 +669,7 @@ Consequences:
 
 ### Item 6 — DB path resolution, creation policy, permissions
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(daemon config-loading contract)*
+- **Owner:** **split** — `zfsbackup-store-developer` (`store/db.py`) → `zfsbackup-developer` (`daemon.py`) → `zfsbackup-cli-developer` (`cli/main.py`) · **Tag:** `needs-approval` *(daemon config-loading contract)*
 - **Files:** `zfsbackup/store/db.py`, `zfsbackup/daemon.py`, `zfsbackup/cli/main.py`
 - **Basis:** `daemon.py:123-128` defaults `-c` to `/etc/zfsbackup/config.yaml`;
   `config.example.yaml:17-18` documents `/var/lib/zfsbackup/` as the daemon state directory.
@@ -733,7 +733,7 @@ Consequences:
 
 ### Item 7 — Alembic scaffolding + initial revision
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `low-risk`
+- **Owner:** `zfsbackup-store-developer` · **Tag:** `low-risk`
 - **Files:** new `zfsbackup/store/migrations/` (env.py, versions/), `alembic.ini`
 - **Basis:** judgment call per the migrations recommendation above; new infrastructure, no existing code.
 - **Changes:** Alembic env reads the DB URL from the app rather than `alembic.ini`, so it works against
@@ -744,7 +744,7 @@ Consequences:
 
 ### Item 8 — DB as canonical config source; YAML demoted to import + edit buffer
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(daemon config-loading contract + IPC payload)*
+- **Owner:** **split** — `zfsbackup-store-developer` (store half) → `zfsbackup-developer` (daemon wiring, leads) *(+ `concurrency-reviewer`)* · **Tag:** `needs-approval` *(daemon config-loading contract + IPC payload)*
 - **Files:** `zfsbackup/config.py`, `zfsbackup/daemon.py`, `zfsbackup/workers.py`, new
   `zfsbackup/store/importer.py`
 - **Basis:** `daemon.py:153`, `daemon.py:54`, `workers.py:62`, `workers.py:196`.
@@ -904,7 +904,7 @@ Consequences:
 
 ### Item 10 — CLI skeleton + entry point
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `low-risk`
+- **Owner:** `zfsbackup-cli-developer` · **Tag:** `low-risk`
 - **Files:** new `zfsbackup/cli/__init__.py`, `zfsbackup/cli/__main__.py`, `zfsbackup/cli/main.py`;
   `pyproject.toml`
 - **Basis:** `daemon.py:118-145` establishes flag conventions (`-c/--config`, `-v/--verbose`,
@@ -937,7 +937,7 @@ Consequences:
 
 ### Item 11 — Dot-path get/set with type coercion
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(config write path)*
+- **Owner:** `zfsbackup-cli-developer` · **Tag:** `needs-approval` *(config write path)*
 - **Files:** new `zfsbackup/cli/dotpath.py`
 - **Basis:** the requested `datasets.tank/data.frequency=1h` form, resolved against the item-3 schema.
 - **⚠ Critical edge case — dot-splitting is unsafe.** ZFS dataset names legally contain dots
@@ -966,7 +966,7 @@ Consequences:
 
 ### Item 12 — Whole-config `$EDITOR` round-trip
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(config round-trip format)*
+- **Owner:** `zfsbackup-cli-developer` · **Tag:** `needs-approval` *(config round-trip format)*
 - **Files:** new `zfsbackup/cli/editor.py`, `zfsbackup/cli/render.py`
 - **Basis:** requested feature; render target is the format at `config.example.yaml:9-80` so generated
   YAML is drop-in compatible with `-c file.yaml`.
@@ -1004,7 +1004,7 @@ Consequences:
 
 ### Item 13 — `list datasets` / `list remotes`
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `low-risk`
+- **Owner:** `zfsbackup-cli-developer` · **Tag:** `low-risk`
 - **Files:** `zfsbackup/cli/main.py`
 - **Basis:** requested feature; columns mirror the existing report at `backup_manager.py:88-100` (name,
   enabled, frequency, recursive, retention-rule count) so CLI and daemon log agree.
@@ -1015,7 +1015,7 @@ Consequences:
 
 ### Item 14 — Per-dataset / per-remote edit *(revised: no identity key in buffer)* + `rename`
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(config round-trip + ZFS property side effects)*
+- **Owner:** **split** — `zfsbackup-cli-developer` (CLI + rename detection) → `zfsbackup-developer` (ZFS user-property side effect) · **Tag:** `needs-approval` *(config round-trip + ZFS property side effects)*
 - **Files:** `zfsbackup/cli/render.py`, `zfsbackup/cli/main.py`
 - **Basis:** requested feature; user decision 2.
 - **Per-dataset buffer contains no `name` field.** `edit dataset <name>` renders only
@@ -1058,7 +1058,7 @@ Consequences:
 
 ### Item 15 — Generation counter and concurrent-write detection
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(config write path)*
+- **Owner:** **split** — `zfsbackup-store-developer` (generation column) → `zfsbackup-cli-developer` (check on write) · **Tag:** `needs-approval` *(config write path)*
 - **Files:** `zfsbackup/cli/main.py`, `zfsbackup/store/db.py`
 - **Basis:** `workers.py:62` and `workers.py:196` load config once, before the loop at `workers.py:73`;
   nothing re-reads it. Retained from the original plan — the counter is still required for
@@ -1104,7 +1104,7 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 
 ### Item 17 — Reload trigger and supervisor state machine
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(signals, multiprocessing, supervisor)*
+- **Owner:** `zfsbackup-developer`  *(run at **opus**; + `concurrency-reviewer`)* · **Tag:** `needs-approval` *(signals, multiprocessing, supervisor)*
 - **Files:** `zfsbackup/daemon.py`
 - **Basis:** `daemon.py:39-45` (existing `SIGINT`/`SIGTERM` handlers), `daemon.py:47-60`
   (`_new_worker`/`_active_worker_names`), `daemon.py:69-80` (`_check_workers`), `daemon.py:108-111`
@@ -1171,7 +1171,7 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 
 ### Item 18 — Cooperative worker cycling (the mid-stream safety problem)
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(IPC contract change)*
+- **Owner:** `zfsbackup-developer`  *(run at **opus**; + `concurrency-reviewer`)* · **Tag:** `needs-approval` *(IPC contract change)*
 - **Files:** `zfsbackup/workers.py`, `zfsbackup/daemon.py`
 - **Basis:** `workers.py:32` (`stop_event` param), `workers.py:62`/`workers.py:196` (config loaded once),
   `workers.py:70-71` (`interval` and `_before_loop` computed once), `workers.py:73-82` (the loop),
@@ -1224,7 +1224,7 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 
 ### Item 19 — CLI reload trigger
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(daemon interaction)*
+- **Owner:** `zfsbackup-cli-developer` · **Tag:** `needs-approval` *(daemon interaction)*
 - **Files:** `zfsbackup/cli/main.py`, `zfsbackup/daemon.py`
 - **Basis:** item 15's stopgap notice; `daemon.py:90` (`run()` is where a pidfile would be written).
 - **Changes:**
@@ -1264,7 +1264,7 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 
 ### Item 21 — Documentation
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `low-risk`
+- **Owner:** **owning developer per surface** — `zfsbackup-store-developer`, `zfsbackup-cli-developer`, `zfsbackup-developer`; main session updates `CLAUDE.md` · **Tag:** `low-risk`
 - **Files:** `zfsbackup/README.md`, `CLAUDE.md`, `zfsbackup/config.example.yaml`
 - **Basis + stale-doc flag:** `CLAUDE.md` documents `zfsbackup/test_basic.py`, which **does not exist**;
   all zfsbackup tests live in `tests/test_zfsbackup_*.py`. Correct it.

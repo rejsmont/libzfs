@@ -1,6 +1,6 @@
 ---
 name: real-zfs-scenario-dev
-description: Develops and maintains the shell-based real-world test scenarios under scenarios/ — file-backed pool setup, and the two-VM Multipass end-to-end backup harness. Use for changes to those scripts or to add new real-world scenarios. Not for pytest tests (use pytest-test-author) or application code (use libzfseasy-developer / zfsbackup-developer).
+description: Develops and maintains the shell-based real-world test scenarios under scenarios/ — file-backed pool setup, and the two-VM Multipass end-to-end backup harness. Use for changes to those scripts or to add new real-world scenarios. Not for pytest tests (use pytest-test-author) or application code (use libzfseasy-developer / zfsbackup-developer / zfsbackup-store-developer / zfsbackup-cli-developer).
 tools: Read, Edit, Write, Grep, Glob, Bash
 model: sonnet
 effort: high
@@ -56,6 +56,24 @@ memories.)
 Remote backup is not deployment-ready: the `requests` dependency is undeclared (the harness installs
 it explicitly in the guests) and the API binds `0.0.0.0` without auth/TLS. Keep working around these
 rather than assuming they're fixed.
+
+## The SQLite config store — what scenarios must account for
+
+Once config lives in SQLite rather than YAML, scenarios stop writing a config file and start driving
+the `zfsbackup-config` CLI. Three things bite in shell:
+
+- **WAL sidecars.** The DB is opened in WAL mode, so `config.db-wal` and `config.db-shm` sit next to
+  `config.db`. Teardown that removes only `config.db` leaves them behind, and a stale `-wal` next to
+  a fresh DB is a confusing failure. Remove all three, and copy all three if a scenario snapshots a
+  DB between VMs.
+- **Seeding.** Prefer `zfsbackup-config import <yaml>` over hand-writing rows — it is the supported
+  path and it validates. Keep the example YAML as the source of truth for scenario fixtures.
+- **`$EDITOR` in a non-interactive shell.** Any scenario exercising `edit` must set `EDITOR` to a
+  small non-interactive script. Do **not** redirect the CLI's stdout to `/dev/null` on the host when
+  driving it through `multipass exec` — that is the recorded wedge; discard in-guest instead.
+
+The DB path default is `/var/lib/zfsbackup/config.db`, overridable with `-c` or the
+`ZFSBACKUP_CONFIG` environment variable — prefer the env var in harnesses so you set it once.
 
 ## Working rules
 

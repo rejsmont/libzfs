@@ -38,7 +38,10 @@ Patches `subprocess.Popen` (via `pytest-mock`). Use it for anything that shells 
 - `libzfseasy` unit: `tests/test_types.py` (pure, no subprocess), `tests/test_commands.py`
   (+ `tests/test_commands_part2.py`).
 - Workflows: `tests/test_integration.py`.
-- zfsbackup: `zfsbackup/test_basic.py`.
+- zfsbackup: `zfsbackup/test_basic.py`, plus `tests/test_zfsbackup_config.py`,
+  `tests/test_zfsbackup_duration.py`, `tests/test_zfsbackup_manager.py`,
+  `tests/test_zfsbackup_remote.py`, `tests/test_zfsbackup_workers.py`.
+- Config store: `tests/test_zfsbackup_store.py`. Config CLI: `tests/test_zfsbackup_cli.py`.
 - Real ZFS: `tests/test_real_zfs.py` and `tests/test_zfsbackup_real.py`.
 
 ## Real-ZFS tests — you maintain the fixture too
@@ -53,6 +56,33 @@ Patches `subprocess.Popen` (via `pytest-mock`). Use it for anything that shells 
   `pytest.skip(...)` — **skip, never error**. `MULTIPASS_VM` env switches to an in-VM pool path.
 - Every real test does its own create/list/get/destroy with `try/finally` cleanup, touching only
   `test_*` datasets. Preserve this skip-not-error and self-cleanup discipline when adding tests.
+
+## Database tests — `store` and `cli`
+
+These need no `mock_subprocess`; they need a real SQLite engine. Keep them fast and hermetic.
+
+- **In-memory default:** `sqlite:///:memory:` with `StaticPool` and `check_same_thread=False`.
+  WAL needs a real file, so the pragma listener skips it in memory — a test that asserts WAL
+  behaviour must use a `tmp_path` file DB, and must clean up the `-wal`/`-shm` sidecars.
+- **`foreign_keys=ON` is not SQLite's default.** A test that does not go through the project's
+  engine factory will silently not enforce the composite retention FK, and will pass while the
+  constraint it claims to test does nothing. Always build the engine through `store.db`.
+- **Cascade tests must traverse the relationship before deleting.** The item-3 retention-promotion
+  bug was invisible unless `dest.retention_rules` had been loaded first — that traversal is the
+  entire difference between catching it and missing it. Preserve that pattern.
+- **Partial-index tests** must assert the *dataset-level* (scope IS NULL) duplicate is rejected;
+  a test that only covers the scoped rows passes against a plain `UNIQUE` that constrains nothing.
+- **Fork safety** (`-k "fork or concurren"`): assert the engine cache is pid-keyed and rebuilds
+  after a fork, and that the supervisor holds no engine at spawn time. Guard these with
+  `@pytest.mark.skipif` on platforms without `fork`, and never leave a child process behind.
+- **Mapper equivalence** is a property test:
+  `load_config(session_from(yaml_imported(P))) == BackupConfig.from_file(P)` for every YAML in the
+  repo. This is the contract that keeps the DB path from shifting downstream behaviour.
+- **CLI tests** use Click's `CliRunner` with an isolated filesystem, and stub `$EDITOR` with a small
+  mutating script. Cover: no-op, abort, non-zero editor exit, invalid-then-abort, rename detection,
+  generation conflict, and dataset names containing dots.
+- Mutation-check the important ones — the existing suite's standard is that reverting the fix fails
+  a named count of tests. State that count when you add coverage for a bug fix.
 
 ## Config — `pytest.ini`
 

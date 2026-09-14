@@ -14,15 +14,46 @@ domain knowledge; the cross-agent workflow lives here (and is summarized in
 | Agent | Model / effort | Tools | Scope |
 |---|---|---|---|
 | `zfs-code-reviewer` | opus / high | read-only | Reviews the current diff (both packages); reports ranked findings, no edits |
+| `concurrency-reviewer` | opus / high | read-only | Depth review of fork-safety, SQLite/WAL, IPC and signal hazards only |
 | `libzfseasy-implementation-planner` | opus / high | read-only | Findings → ordered plan for `libzfseasy/` |
-| `zfsbackup-implementation-planner` | opus / high | read-only | Findings → ordered plan for `zfsbackup/` |
-| `libzfseasy-developer` | sonnet / high | edit | Implements plans in `libzfseasy/types.py`, `zfs.py` |
-| `zfsbackup-developer` | sonnet / high | edit | Implements plans in `zfsbackup/` (config, retention, workers, daemon, remote, api) |
+| `zfsbackup-implementation-planner` | opus / high | read-only | Findings → ordered plan for `zfsbackup/` (incl. `store/`, `cli/`) |
+| `libzfseasy-developer` | sonnet / high | edit | `libzfseasy/types.py`, `zfs.py` |
+| `zfsbackup-developer` | sonnet / high | edit | Daemon core: `config.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py` |
+| `zfsbackup-store-developer` | sonnet / high | edit | `zfsbackup/store/**`, `alembic/**` — models, mapper, engine/session, migrations |
+| `zfsbackup-cli-developer` | sonnet / high | edit | `zfsbackup/cli/**` — the `zfsbackup-config` Click application |
 | `pytest-test-author` | sonnet / high | edit | Owns **all** pytest tests + `conftest.py` fixtures (both packages) |
 | `real-zfs-scenario-dev` | sonnet / high | edit | Owns the shell scenarios under `scenarios/` |
 
-Read-only agents (reviewer, both planners) have no `Edit`/`Write` by design. Developers never write
-tests — `pytest-test-author` owns them.
+Read-only agents (both reviewers, both planners) have no `Edit`/`Write` by design. Developers never
+write tests — `pytest-test-author` owns them.
+
+## File ownership is exclusive
+
+Each source file has exactly one owning developer. No file is co-edited, and no developer reaches
+into another's directory to save a handoff.
+
+| Path | Owner |
+|---|---|
+| `libzfseasy/**` | `libzfseasy-developer` |
+| `zfsbackup/{config,backup_manager,daemon,workers,remote,api}.py` | `zfsbackup-developer` |
+| `zfsbackup/store/**`, `alembic/**` | `zfsbackup-store-developer` |
+| `zfsbackup/cli/**` | `zfsbackup-cli-developer` |
+| `tests/**`, `conftest.py`, `zfsbackup/test_basic.py` | `pytest-test-author` |
+| `scenarios/**` | `real-zfs-scenario-dev` |
+
+**A plan item that spans two owners is split by the planner** into sequenced sub-items, one per
+owner, each independently verifiable. The planner names which half lands first and what contract the
+second half consumes. Known boundary-spanning items: DB path resolution (store + daemon + CLI),
+DB-as-canonical-config (store + daemon), and `rename` (CLI + the daemon's ZFS user-property side
+effect).
+
+Two architectural boundaries the reviewers enforce:
+
+- **Daemon and CLI reach the database only through `zfsbackup.store.mapper`** — never through ORM
+  models. Config objects outlive any session; a detached instance raises `DetachedInstanceError`
+  lazily, deep inside a worker loop. The mapper is also what keeps a later Postgres move possible.
+- **The CLI is the only writer.** Workers open the store read-only, by construction rather than by
+  convention.
 
 ## The cycle
 
@@ -48,10 +79,24 @@ tests — `pytest-test-author` owns them.
 5. **Test** — the developer notes coverage gaps; `pytest-test-author` writes/updates pytest tests and
    `real-zfs-scenario-dev` handles shell-based real-world coverage (pipe/deadlock/two-VM cases that
    mocked tests cannot prove).
-6. **Re-review** — `zfs-code-reviewer` reviews the resulting diff.
+6. **Re-review** — `zfs-code-reviewer` reviews the resulting diff. For changes to engine/session
+   setup, daemon config loading, the reload state machine, signal handlers, IPC payloads, or worker
+   cycling, `concurrency-reviewer` reviews the same diff in parallel. The two are complementary:
+   breadth and depth on one hazard class. Run the depth pass **only** on those items — it is not a
+   second opinion on ordinary changes.
 
 Planners coordinate directly when a `libzfseasy` stream-contract change would surface in `zfsbackup`'s
 `remote.py`.
+
+**Parallelism.** Independent lanes run as concurrent `Agent` calls in a single message. In the
+current config-store workstream that means: Alembic scaffolding runs alongside the mapper and
+engine work, and the CLI's dot-path, editor, list, and generation-counter items all run in parallel
+once the CLI skeleton lands. Serial chains stay serial — schema → mapper → engine → DB path →
+DB-as-canonical, and reload trigger → worker cycling → CLI trigger.
+
+**Model overrides.** Developers default to sonnet. Pass `model: opus` on the `Agent` call for the
+items where being wrong corrupts data rather than failing a test: engine/session fork safety, the
+reload state machine, and cooperative worker cycling. Three items, not the whole plan.
 
 ## Stop conditions (one iteration)
 

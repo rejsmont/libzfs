@@ -78,6 +78,13 @@ Properties are stored internally as integer-indexed lists (using `_prop_names` c
 
 **[zfsbackup/remote.py](zfsbackup/remote.py)** / **[zfsbackup/api.py](zfsbackup/api.py)** — remote send/receive transfer (`RemoteBackupManager`) and the HTTP control API (`create_app`). Remote backup is **not deployment-ready** (no auth/TLS) — see [docs/production_readiness_report.md](docs/production_readiness_report.md).
 
+**[zfsbackup/store/](zfsbackup/store/)** — the SQLAlchemy config store (in progress, see
+[docs/config_db_cli_plan.md](docs/config_db_cli_plan.md)). `models.py` holds the ORM schema; a
+`mapper.py` converts ORM rows ⇄ the `config.py` dataclasses, and `db.py` will own engine/session
+setup. It is a **separate layer** from the dataclasses, not a replacement — `DatasetConfig` is also a
+remote wire format with no DB behind it, and config objects outlive any session. Nothing is wired
+into the daemon or CLI yet.
+
 ### Test layout
 
 | File | Coverage |
@@ -87,6 +94,9 @@ Properties are stored internally as integer-indexed lists (using `_prop_names` c
 | `tests/test_integration.py` | End-to-end workflows, mocked subprocess |
 | `tests/test_real_zfs.py` | Real ZFS commands, marked `real_zfs` |
 | `zfsbackup/test_basic.py` | `zfsbackup` package tests |
+| `tests/test_zfsbackup_config.py` | Config loading, retention collapse, per-destination rules |
+| `tests/test_zfsbackup_duration.py` | The `Duration` type and its literal preservation |
+| `tests/test_zfsbackup_store.py` | SQLAlchemy schema, constraints, mapper |
 
 The `mock_subprocess` fixture in `conftest.py` patches `subprocess.Popen`. Use `mock_subprocess.setup(stdout=[...], stderr='', returncode=0)` for a single call and `mock_subprocess.setup_multi(...)` for sequences.
 
@@ -101,20 +111,29 @@ orchestrates the cycle: subagents cannot call each other, so the main loop drive
 | Agent | Model / effort | Scope |
 |---|---|---|
 | `zfs-code-reviewer` | opus / high (read-only) | Reviews the current diff for both packages; reports findings |
+| `concurrency-reviewer` | opus / high (read-only) | Depth review of fork-safety, SQLite/WAL, IPC and signal hazards only |
 | `libzfseasy-implementation-planner` | opus / high (read-only) | Turns findings into an ordered plan for `libzfseasy/` |
 | `zfsbackup-implementation-planner` | opus / high (read-only) | Turns findings into an ordered plan for `zfsbackup/` |
 | `libzfseasy-developer` | sonnet / high | Implements plans in `libzfseasy/types.py`, `zfs.py` |
-| `zfsbackup-developer` | sonnet / high | Implements plans in `zfsbackup/` (config, retention, workers, daemon, remote, api) |
+| `zfsbackup-developer` | sonnet / high | Daemon core: `config.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py` |
+| `zfsbackup-store-developer` | sonnet / high | `zfsbackup/store/**`, `alembic/**` — ORM models, mapper, engine/session, migrations |
+| `zfsbackup-cli-developer` | sonnet / high | `zfsbackup/cli/**` — the `zfsbackup-config` Click application |
 | `pytest-test-author` | sonnet / high | Owns **all** pytest tests + `conftest.py` fixtures |
 | `real-zfs-scenario-dev` | sonnet / high | Owns the shell scenarios under `scenarios/` |
 
+**File ownership inside `zfsbackup/` is exclusive** — no file is co-edited. A plan item spanning two
+owners is split by the planner into sequenced sub-items. Daemon and CLI reach the config store only
+through `zfsbackup.store.mapper`, never through ORM models; the CLI is the only writer.
+
 **One cycle:** `zfs-code-reviewer` finds issues → the matching planner produces an ordered plan (a
-proposal) → **user approves** → the matching developer implements → `pytest-test-author` (and
-`real-zfs-scenario-dev` for shell coverage) add tests → `zfs-code-reviewer` re-reviews. A clean review
-ends the cycle; surviving findings loop back to the planner.
+proposal) → **user approves** → the owning developer implements → `pytest-test-author` (and
+`real-zfs-scenario-dev` for shell coverage) add tests → `zfs-code-reviewer` re-reviews, with
+`concurrency-reviewer` in parallel on fork/WAL/IPC/signal items. A clean review ends the cycle;
+surviving findings loop back to the planner.
 
 **Loop-style development (`/loop`):** planners tag each plan item `low-risk` or `needs-approval`. In an
 interactive run the whole plan waits for approval. Under `/loop`, `low-risk` items proceed
 automatically — the review pass and the test suite are the safety net — while `needs-approval` items
 (exec/stream-contract or breaking public-API changes in `libzfseasy`; retention, multiprocessing/IPC,
-or remote/API/security changes in `zfsbackup`) pause and surface to the user.
+remote/API/security, schema-migration/config-contract, or config-write changes in `zfsbackup`) pause
+and surface to the user.
