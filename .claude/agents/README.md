@@ -18,8 +18,8 @@ domain knowledge; the cross-agent workflow lives here (and is summarized in
 | `libzfseasy-implementation-planner` | opus / high | read-only | Findings → ordered plan for `libzfseasy/` |
 | `zfsbackup-implementation-planner` | opus / high | read-only | Findings → ordered plan for `zfsbackup/` (incl. `store/`, `cli/`) |
 | `libzfseasy-developer` | sonnet / high | edit | `libzfseasy/types.py`, `zfs.py` |
-| `zfsbackup-developer` | sonnet / high | edit | Daemon core: `config.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py` |
-| `zfsbackup-store-developer` | sonnet / high | edit | `zfsbackup/store/**` (incl. `migrations/`), `alembic.ini` — models, mapper, engine/session, migrations |
+| `zfsbackup-developer` | sonnet / high | edit | Daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py` |
+| `zfsbackup-store-developer` | sonnet / high | edit | `zfsbackup/config/store/**` (incl. `migrations/`), `alembic.ini` — models, mapper, engine/session, migrations |
 | `zfsbackup-cli-developer` | sonnet / high | edit | `zfsbackup/cli/**` — the `zfsbackup-config` Click application |
 | `pytest-test-author` | sonnet / high | edit | Owns **all** pytest tests + `conftest.py` fixtures (both packages) |
 | `real-zfs-scenario-dev` | sonnet / high | edit | Owns the shell scenarios under `scenarios/` |
@@ -36,7 +36,7 @@ into another's directory to save a handoff.
 |---|---|
 | `libzfseasy/**` | `libzfseasy-developer` |
 | `zfsbackup/{config,backup_manager,daemon,workers,remote,api}.py` | `zfsbackup-developer` |
-| `zfsbackup/store/**` (incl. `store/migrations/`), `alembic.ini` | `zfsbackup-store-developer` |
+| `zfsbackup/config/store/**` (incl. `store/migrations/`), `alembic.ini` | `zfsbackup-store-developer` |
 | `zfsbackup/cli/**` | `zfsbackup-cli-developer` |
 | `tests/**`, `conftest.py` | `pytest-test-author` |
 | `scenarios/**` | `real-zfs-scenario-dev` |
@@ -49,7 +49,7 @@ effect).
 
 Two architectural boundaries the reviewers enforce:
 
-- **Daemon and CLI reach the database only through `zfsbackup.store.mapper`** — never through ORM
+- **Daemon and CLI reach the database only through `zfsbackup.config.store.mapper`** — never through ORM
   models. Config objects outlive any session; a detached instance raises `DetachedInstanceError`
   lazily, deep inside a worker loop. The mapper is also what keeps a later Postgres move possible.
 - **The CLI is the only writer.** Workers open the store read-only, by construction rather than by

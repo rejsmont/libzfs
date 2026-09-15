@@ -31,7 +31,7 @@ daemon is a multiprocessing supervisor, not a single-process loop.
   storage convention respected; `Validate.*` raise `ValueError`, subprocess failures raise the bare
   `Exception('\n'.join(errors))`.
 
-**zfsbackup (`config.py`, `backup_manager.py`, `workers.py`, `daemon.py`, `remote.py`, `api.py`):**
+**zfsbackup (`config/model.py`, `backup_manager.py`, `workers.py`, `daemon.py`, `remote.py`, `api.py`):**
 - Duration parsing edge cases (the `m` minutes vs `M` months disambiguation).
 - Retention/anchor correctness in `needs_prunning`/`prune_snapshots` (always keeps `snapshots[0]`,
   skips anchored, newest-per-slot); `dry_run` honored in `create_snapshot`/`prune_snapshots`.
@@ -39,7 +39,7 @@ daemon is a multiprocessing supervisor, not a single-process loop.
 - Worker loop / `stop_event.wait` handling; supervisor restart logic; no blocking calls that ignore
   the stop event. Note the known-not-ready remote path (no auth/TLS, undeclared `requests` dep).
 
-**Config store (`zfsbackup/store/**` incl. `store/migrations/`, `alembic.ini`):**
+**Config store (`zfsbackup/config/store/**` incl. `store/migrations/`, `alembic.ini`):**
 - Retention rules scoped by the nullable `dataset_remote_id` — **never** by a `destination_name` FK
   back to `Destination`. That shape let a cascade-null promote a per-destination override to
   dataset-level, silently adding a retention tier. Flag any reintroduction.

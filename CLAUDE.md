@@ -64,7 +64,7 @@ Properties are stored internally as integer-indexed lists (using `_prop_names` c
 
 ### `zfsbackup` — Automated snapshot daemon
 
-**[zfsbackup/config.py](zfsbackup/config.py)** — YAML config loader. `BackupConfig.from_file()` parses global settings and a list of `DatasetConfig` objects. Each dataset has a `frequency` (how often to snapshot) and tiered `retention` rules (`RetentionRule(age, keep_for)`). Time durations use a custom format: `m`=minutes, `h`=hours, `d`=days, `w`=weeks, `M`=months (~30d), `y`=years (~365d).
+**[zfsbackup/config/model.py](zfsbackup/config/model.py)** — YAML config loader. `BackupConfig.from_file()` parses global settings and a list of `DatasetConfig` objects. Each dataset has a `frequency` (how often to snapshot) and tiered `retention` rules (`RetentionRule(age, keep_for)`). Time durations use a custom format: `m`=minutes, `h`=hours, `d`=days, `w`=weeks, `M`=months (~30d), `y`=years (~365d).
 
 **[zfsbackup/backup_manager.py](zfsbackup/backup_manager.py)** — Core logic:
 - `DatasetManager` — owns the list of `DatasetInfo` objects, checks whether a snapshot is due (`needs_snapshot`), creates snapshots via `libzfseasy`, and lists existing ones
@@ -78,12 +78,23 @@ Properties are stored internally as integer-indexed lists (using `_prop_names` c
 
 **[zfsbackup/remote.py](zfsbackup/remote.py)** / **[zfsbackup/api.py](zfsbackup/api.py)** — remote send/receive transfer (`RemoteBackupManager`) and the HTTP control API (`create_app`). Remote backup is **not deployment-ready** (no auth/TLS) — see [docs/production_readiness_report.md](docs/production_readiness_report.md).
 
-**[zfsbackup/store/](zfsbackup/store/)** — the SQLAlchemy config store (in progress, see
-[docs/config_db_cli_plan.md](docs/config_db_cli_plan.md)). `models.py` holds the ORM schema; a
-`mapper.py` converts ORM rows ⇄ the `config.py` dataclasses, and `db.py` will own engine/session
-setup. It is a **separate layer** from the dataclasses, not a replacement — `DatasetConfig` is also a
-remote wire format with no DB behind it, and config objects outlive any session. Nothing is wired
-into the daemon or CLI yet.
+**[zfsbackup/config/](zfsbackup/config/)** — the configuration package. `model.py` holds the runtime
+value types (`BackupConfig`, `DatasetConfig`, `Duration`, …) and `__init__.py` re-exports them, so
+`from zfsbackup.config import BackupConfig` is the supported spelling and importing from
+`zfsbackup.config.model` directly is unnecessary.
+
+**[zfsbackup/config/store/](zfsbackup/config/store/)** — the SQLAlchemy config store (in progress, see
+[docs/config_db_cli_plan.md](docs/config_db_cli_plan.md)). `models.py` holds the ORM schema,
+`mapper.py` converts ORM rows ⇄ the `config/model.py` dataclasses, `db.py` owns engine/session
+management (fork-safe engine cache, WAL pragmas, read-only worker sessions), and `migrate.py` plus
+`migrations/` own the Alembic baseline. It is a **separate layer** from the dataclasses, not a
+replacement — `DatasetConfig` is also a remote wire format with no DB behind it, and config objects
+outlive any session. Nothing is wired into the daemon or CLI yet.
+
+> **`zfsbackup/store/` is reserved and deliberately empty.** It is for *backup data* destinations —
+> object storage, cloud targets and the like. Configuration persistence lives under
+> `zfsbackup/config/store/`. Do not put config code in `zfsbackup/store/`, and do not move the config
+> store back out of `zfsbackup/config/`.
 
 ### Test layout
 
@@ -116,15 +127,15 @@ orchestrates the cycle: subagents cannot call each other, so the main loop drive
 | `libzfseasy-implementation-planner` | opus / high (read-only) | Turns findings into an ordered plan for `libzfseasy/` |
 | `zfsbackup-implementation-planner` | opus / high (read-only) | Turns findings into an ordered plan for `zfsbackup/` |
 | `libzfseasy-developer` | sonnet / high | Implements plans in `libzfseasy/types.py`, `zfs.py` |
-| `zfsbackup-developer` | sonnet / high | Daemon core: `config.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py` |
-| `zfsbackup-store-developer` | sonnet / high | `zfsbackup/store/**` (incl. `store/migrations/`), `alembic.ini` — ORM models, mapper, engine/session, migrations |
+| `zfsbackup-developer` | sonnet / high | Daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py` |
+| `zfsbackup-store-developer` | sonnet / high | `zfsbackup/config/store/**` (incl. `store/migrations/`), `alembic.ini` — ORM models, mapper, engine/session, migrations |
 | `zfsbackup-cli-developer` | sonnet / high | `zfsbackup/cli/**` — the `zfsbackup-config` Click application |
 | `pytest-test-author` | sonnet / high | Owns **all** pytest tests + `conftest.py` fixtures |
 | `real-zfs-scenario-dev` | sonnet / high | Owns the shell scenarios under `scenarios/` |
 
 **File ownership inside `zfsbackup/` is exclusive** — no file is co-edited. A plan item spanning two
 owners is split by the planner into sequenced sub-items. Daemon and CLI reach the config store only
-through `zfsbackup.store.mapper`, never through ORM models; the CLI is the only writer.
+through `zfsbackup.config.store.mapper`, never through ORM models; the CLI is the only writer.
 
 **One cycle:** `zfs-code-reviewer` finds issues → the matching planner produces an ordered plan (a
 proposal) → **user approves** → the owning developer implements → `pytest-test-author` (and

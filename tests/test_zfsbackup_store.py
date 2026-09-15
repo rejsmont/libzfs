@@ -1,12 +1,12 @@
-"""Tests for the SQLAlchemy ORM schema in `zfsbackup/store/models.py` (item 3
+"""Tests for the SQLAlchemy ORM schema in `zfsbackup/config/store/models.py` (item 3
 of docs/config_db_cli_plan.md), the mapper (item 4), migrations (item 7),
-and the engine/session module (item 5, `zfsbackup/store/db.py`).
+and the engine/session module (item 5, `zfsbackup/config/store/db.py`).
 
-This is store-layer coverage: `zfsbackup/store/` defines the schema, the
+This is store-layer coverage: `zfsbackup/config/store/` defines the schema, the
 dataclass<->ORM mapper, Alembic migrations, and engine/session management,
 and is not wired into the daemon, workers, or CLI yet.
 
-**Every fixture below goes through `zfsbackup.store.db`** (`make_engine`,
+**Every fixture below goes through `zfsbackup.config.store.db`** (`make_engine`,
 `get_engine`, `session_for_engine`, `session_scope`) rather than hand-rolling
 `create_engine`/pragma listeners. `foreign_keys` is a real, named parameter
 on `make_engine`, so `engine_no_fk`/`session_no_fk` below are simply
@@ -67,8 +67,8 @@ from zfsbackup.config import (
 )
 from zfsbackup.config import Destination as ConfigDestination
 from zfsbackup.config import RetentionRule as ConfigRetentionRule
-from zfsbackup.store import db as store_db
-from zfsbackup.store.db import (
+from zfsbackup.config.store import db as store_db
+from zfsbackup.config.store.db import (
     ReadOnlySessionError,
     _is_memory_url,
     dispose_all,
@@ -78,7 +78,7 @@ from zfsbackup.store.db import (
     session_scope,
     url_for_path,
 )
-from zfsbackup.store.mapper import (
+from zfsbackup.config.store.mapper import (
     _assert_scope_integrity,
     _dataset_level_rules,
     _dataset_to_dataclass,
@@ -88,13 +88,13 @@ from zfsbackup.store.mapper import (
     load_config,
     save_config,
 )
-from zfsbackup.store.migrate import (
+from zfsbackup.config.store.migrate import (
     SchemaSplitBrain,
     SchemaVersionMismatch,
     _build_config,
     ensure_schema,
 )
-from zfsbackup.store.models import (
+from zfsbackup.config.store.models import (
     Base,
     Dataset,
     DatasetRemote,
@@ -170,7 +170,7 @@ def engine_no_fk():
     5), not a workaround for item 5's absence. Only for tests that must
     deliberately construct a DB state the composite FK
     (`fk_retention_rules_dataset_remote`) would otherwise make impossible --
-    see `_assert_scope_integrity`'s docstring in `zfsbackup/store/mapper.py`
+    see `_assert_scope_integrity`'s docstring in `zfsbackup/config/store/mapper.py`
     for why that mapper-side check exists as the belt to this braces.
     """
     eng = make_engine("sqlite:///:memory:", foreign_keys=False)
@@ -403,7 +403,7 @@ class TestRetentionRuleUniqueness:
     scope that governs local pruning, so a defect here is the worst place
     for it to be.
 
-    `zfsbackup/store/models.py` closes this with partial unique indexes
+    `zfsbackup/config/store/models.py` closes this with partial unique indexes
     (`sqlite_where=text("dataset_remote_id IS NULL")`) in addition to the
     ordinary `UniqueConstraint`s. The `..._null_scope_...` tests below are
     the ones that actually discriminate between "partial index present" and
@@ -1129,7 +1129,7 @@ class TestDatasetRemoteInheritFrequency:
 
 
 # ---------------------------------------------------------------------------
-# Item 4 -- the mapper layer (zfsbackup/store/mapper.py)
+# Item 4 -- the mapper layer (zfsbackup/config/store/mapper.py)
 # ---------------------------------------------------------------------------
 #
 # Selectable via `pytest -k mapper`. Covers `_duration_from_row` (Q2),
@@ -1266,7 +1266,7 @@ class TestMapperDurationFromRow:
         assert d.total_seconds() == 0.5
 
     def test_unparseable_literal_falls_back_to_seconds_and_warns(self, caplog):
-        with caplog.at_level(logging.WARNING, logger="zfsbackup.store.mapper"):
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.mapper"):
             d = _duration_from_row(3600.0, "nonsense", "datasets[tank/a].frequency")
         assert d.total_seconds() == 3600.0
         assert d.literal == "1h"  # re-synthesized, the bad literal is gone
@@ -1278,7 +1278,7 @@ class TestMapperDurationFromRow:
 
     def test_disagreeing_literal_falls_back_to_seconds_and_warns(self, caplog):
         # "2h" parses fine but is 7200s, not the 3600s this row claims.
-        with caplog.at_level(logging.WARNING, logger="zfsbackup.store.mapper"):
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.mapper"):
             d = _duration_from_row(3600.0, "2h", "datasets[tank/a].frequency")
         assert d.total_seconds() == 3600.0
         assert d.literal == "1h"  # seconds wins, "2h" is discarded
@@ -1407,7 +1407,7 @@ class TestMapperLoadConfigQ7:
         make_dataset(session, name="tank/empty")
         session.commit()
 
-        with caplog.at_level(logging.WARNING, logger="zfsbackup.store.mapper"):
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.mapper"):
             config = load_config(session)
 
         assert config.datasets[0].retention_rules == [
@@ -1463,7 +1463,7 @@ class TestMapperLoadConfigQ7:
 
     def test_undeclared_destination_reference_raises_with_fk_off(self, session_no_fk):
         # Also normally impossible with the FK on (destination_name FKs to
-        # destinations.name); re-checked anyway per config.py:715-728.
+        # destinations.name); re-checked anyway per config/model.py:715-728.
         session = session_no_fk
         session.add(make_global_settings(id=1))
         ds = make_dataset(session, name="tank/a")
@@ -1493,7 +1493,7 @@ class TestMapperPruneIntervalClientIdFileUnset:
     """
 
     def test_save_then_load_both_none_round_trips_as_null(self, session, mocker):
-        from zfsbackup.store import mapper as mapper_module
+        from zfsbackup.config.store import mapper as mapper_module
 
         real_duration_from_row = mapper_module._duration_from_row
         spy = mocker.patch.object(
@@ -2086,7 +2086,7 @@ class TestMapperSaveConfigStep1ValidationRegression:
     def test_duplicate_remote_destination_on_one_dataset_raises_before_delete(
         self, session
     ):
-        # `DatasetConfig.from_dict` (`config.py:624-626`) never checks this
+        # `DatasetConfig.from_dict` (`config/model.py:624-626`) never checks this
         # -- a YAML `from_file` accepts it cleanly and only fails at insert,
         # against `dataset_remotes`'s composite unique constraint, as a bare
         # IntegrityError. `save_config` must catch it before the wipe since
@@ -2178,8 +2178,8 @@ class TestMapperSaveConfigStep1ValidationRegression:
     def test_remote_backup_missing_target_dataset_raises_before_delete(
         self, session, bad_target_dataset
     ):
-        # Mirrors the `Destination.url` case above (`config.py:710-712`) for
-        # `remote_backup.target_dataset` (`config.py:735-737`). The two
+        # Mirrors the `Destination.url` case above (`config/model.py:710-712`) for
+        # `remote_backup.target_dataset` (`config/model.py:735-737`). The two
         # params matter for different reasons: `None` would fail anyway, as
         # a bare `NOT NULL constraint failed` from `remote_server
         # .target_dataset` (`models.py`), but loudly and late, after the
@@ -2187,7 +2187,7 @@ class TestMapperSaveConfigStep1ValidationRegression:
         # existed -- the NOT NULL column happily accepts an empty string,
         # so it inserted silently and `load_config` loaded it back as
         # `target_dataset=''`, a config `BackupConfig.from_file` can never
-        # produce (`config.py:735-737` rejects an empty value at the YAML
+        # produce (`config/model.py:735-737` rejects an empty value at the YAML
         # boundary too). `not target_dataset` rejects both the same way,
         # before any DELETE runs.
         bad = BackupConfig(
@@ -2284,7 +2284,7 @@ class TestMapperDetachedSafety:
 
 
 # ---------------------------------------------------------------------------
-# Migrations (item 7: zfsbackup/store/migrations/, zfsbackup/store/migrate.py)
+# Migrations (item 7: zfsbackup/config/store/migrations/, zfsbackup/config/store/migrate.py)
 # ---------------------------------------------------------------------------
 
 
@@ -2391,8 +2391,8 @@ def _code_head(engine):
 
 @pytest.mark.unit
 class TestMigrations:
-    """Coverage for `zfsbackup/store/migrate.py` and
-    `zfsbackup/store/migrations/` (item 7).
+    """Coverage for `zfsbackup/config/store/migrate.py` and
+    `zfsbackup/config/store/migrations/` (item 7).
 
     Two DDL paths coexist in this codebase: `Base.metadata.create_all`
     (every fixture above this class) and `alembic upgrade head`
@@ -2401,7 +2401,7 @@ class TestMigrations:
     those two paths honest with each other -- it must never be deleted in
     favour of assertion 2 alone.
 
-    `Config` objects here are built via `zfsbackup.store.migrate.
+    `Config` objects here are built via `zfsbackup.config.store.migrate.
     _build_config` -- the same private helper `ensure_schema` itself calls
     -- rather than by reading `alembic.ini`, which `ensure_schema` never
     does. Using anything else (a hand-rolled `Config()`, or one that reads
@@ -2709,7 +2709,7 @@ class TestMigrations:
 
     @pytest.fixture
     def mapper_logger_state(self):
-        """Snapshot and restore `zfsbackup.store.mapper`'s `level` and
+        """Snapshot and restore `zfsbackup.config.store.mapper`'s `level` and
         `disabled` attributes around a test.
 
         Both are mutable global `logging` state, not per-test state --
@@ -2720,7 +2720,7 @@ class TestMigrations:
         one case and nothing at all in another, leaking mutated state into
         the rest of the pytest session regardless of which test ran first.
         """
-        logger = logging.getLogger("zfsbackup.store.mapper")
+        logger = logging.getLogger("zfsbackup.config.store.mapper")
         original_level = logger.level
         original_disabled = logger.disabled
         yield logger
@@ -2732,7 +2732,7 @@ class TestMigrations:
     ):
         """Guards against the stock `alembic init` template's
         `logging.config.fileConfig()` default of `disable_existing_loggers=
-        True`. Measured directly on this repo's own `zfsbackup.store.
+        True`. Measured directly on this repo's own `zfsbackup.config.store.
         mapper` logger, which several other tests in this file rely on via
         `caplog`.
         """
@@ -2977,7 +2977,7 @@ class TestMigrations:
 
 @pytest.mark.unit
 class TestMigrationsOverDbWriterConnection:
-    """`ensure_schema` atomicity through a `zfsbackup.store.db` WRITER
+    """`ensure_schema` atomicity through a `zfsbackup.config.store.db` WRITER
     engine, not the bare `empty_memory_engine` (plain `create_engine`,
     pysqlite's legacy implicit-transaction handling) every test above
     uses.
@@ -3065,7 +3065,7 @@ class TestMigrationsOverDbWriterConnection:
 
 
 # ---------------------------------------------------------------------------
-# Item 5 -- zfsbackup/store/db.py (engine/session, WAL, fork safety)
+# Item 5 -- zfsbackup/config/store/db.py (engine/session, WAL, fork safety)
 # ---------------------------------------------------------------------------
 #
 # `pytest -k "TestDbEngine or TestDbPool or TestDbPragma or TestDbFork or
@@ -3537,7 +3537,7 @@ class TestDbPragmaConnectListenerInternals:
 
     @pytest.fixture(autouse=True)
     def _db_logger_state(self):
-        """Snapshot and restore `zfsbackup.store.db`'s logger state.
+        """Snapshot and restore `zfsbackup.config.store.db`'s logger state.
 
         `TestMigrations.test_configure_logger_guard_reachable_via_real_ini`
         runs a real `logging.config.fileConfig()` against this repo's
@@ -3545,14 +3545,14 @@ class TestDbPragmaConnectListenerInternals:
         sqlalchemy, alembic` -- `fileConfig`'s default
         `disable_existing_loggers=True` therefore disables every other
         already-configured logger for the rest of the pytest session,
-        `zfsbackup.store.db` included. Without restoring it here, this
+        `zfsbackup.config.store.db` included. Without restoring it here, this
         class's `caplog`-based tests pass in isolation but fail when the
         full file runs (the disabled logger drops every `.warning()` call
         before it ever reaches `caplog`'s handler) -- exactly the kind of
         cross-test leak `TestMigrations.mapper_logger_state` guards against
         for the mapper's own logger.
         """
-        logger = logging.getLogger("zfsbackup.store.db")
+        logger = logging.getLogger("zfsbackup.config.store.db")
         original_level = logger.level
         original_disabled = logger.disabled
         logger.disabled = False
@@ -3609,7 +3609,7 @@ class TestDbPragmaConnectListenerInternals:
         # returns the UNCHANGED mode, silently, unless something checks it.
         eng, calls = self._build_stub_engine(journal_mode_row=("delete",))
         try:
-            with caplog.at_level(logging.WARNING, logger="zfsbackup.store.db"):
+            with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
                 with eng.connect():
                     pass
         finally:
@@ -3624,7 +3624,7 @@ class TestDbPragmaConnectListenerInternals:
     def test_wal_success_logs_no_warning(self, caplog):
         eng, calls = self._build_stub_engine(journal_mode_row=("wal",))
         try:
-            with caplog.at_level(logging.WARNING, logger="zfsbackup.store.db"):
+            with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
                 with eng.connect():
                     pass
         finally:

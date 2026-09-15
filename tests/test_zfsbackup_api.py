@@ -77,7 +77,7 @@ class TestConfigEndpoint:
         assert 'dry_run' in data
 
     def test_prune_interval_seconds_is_a_number_when_unset(self, mocker):
-        # config.py item 3c.3: BackupConfig.prune_interval defaults to None
+        # config/model.py item 3c.3: BackupConfig.prune_interval defaults to None
         # ("derive from check_interval"). The /config endpoint uses
         # effective_prune_interval, so it must still emit a JSON number
         # here, not null/None -- a client parsing this response should

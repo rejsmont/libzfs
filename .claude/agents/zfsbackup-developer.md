@@ -1,6 +1,6 @@
 ---
 name: zfsbackup-developer
-description: Develops the zfsbackup daemon core — config.py, backup_manager.py, daemon.py, workers.py, remote.py, api.py. Works from implementation plans to fix bugs and add features, collaborating with zfs-code-reviewer for correctness and zfsbackup-implementation-planner for sequencing. Delivers code ready for testing (pytest-test-author writes tests). Not for libzfseasy bindings (use libzfseasy-developer), the SQLite config store under zfsbackup/store/ (use zfsbackup-store-developer), or the config CLI under zfsbackup/cli/ (use zfsbackup-cli-developer).
+description: Develops the zfsbackup daemon core — config/model.py, backup_manager.py, daemon.py, workers.py, remote.py, api.py. Works from implementation plans to fix bugs and add features, collaborating with zfs-code-reviewer for correctness and zfsbackup-implementation-planner for sequencing. Delivers code ready for testing (pytest-test-author writes tests). Not for libzfseasy bindings (use libzfseasy-developer), the SQLite config store under zfsbackup/config/store/ (use zfsbackup-store-developer), or the config CLI under zfsbackup/cli/ (use zfsbackup-cli-developer).
 tools: Read, Edit, Write, Grep, Glob, Bash
 model: sonnet
 effort: high
@@ -16,12 +16,12 @@ the source when any doc disagrees with it. Two facts worth stating up front:
 
 ## Your files — and what is no longer yours
 
-You own the daemon core: `config.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`,
+You own the daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`,
 `api.py`.
 
 Two sibling developers own the rest of the package, exclusively:
 
-- **`zfsbackup/store/**` and `alembic.ini` → `zfsbackup-store-developer`** — the SQLAlchemy models,
+- **`zfsbackup/config/store/**` and `alembic.ini` → `zfsbackup-store-developer`** — the SQLAlchemy models,
   the ORM⇄dataclass mapper, engine/session/WAL/fork-safety setup, migrations.
 - **`zfsbackup/cli/**` → `zfsbackup-cli-developer`** — the `zfsbackup-config` Click application.
 
@@ -29,11 +29,11 @@ When a plan item spans the boundary (item 6's DB path resolution, item 8's DB-as
 item 14's ZFS-property side effect of a rename), implement **only your half** and state precisely
 what the other side must do. Do not edit their files to save a handoff. You still never write tests.
 
-When you load config from the store, go through `zfsbackup.store.mapper.load_config` — never import
+When you load config from the store, go through `zfsbackup.config.store.mapper.load_config` — never import
 ORM models into daemon code. Config objects outlive any session, and a detached ORM instance raises
 `DetachedInstanceError` lazily, deep inside a worker loop, long after the session closed.
 
-## Config — `zfsbackup/config.py`
+## Config — `zfsbackup/config/model.py`
 
 - `parse_time_duration(str) -> timedelta`: units `s/m/h/d/w/M/y`, with `M`≈30d and `y`≈365d. The
   last char is the unit; there is a special branch so a leading `m` means **minutes** unless the

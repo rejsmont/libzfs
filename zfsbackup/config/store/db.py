@@ -1,7 +1,7 @@
 """Engine and session management for the zfsbackup config store (item 5).
 
 This module owns every `Engine` the store ever creates, and it is the only
-place in `zfsbackup/store/` allowed to create one. `models.py` defines the
+place in `zfsbackup/config/store/` allowed to create one. `models.py` defines the
 schema, `mapper.py` converts rows to dataclasses, `migrate.py` takes an
 already-open `Connection` -- none of them builds an engine. Keeping engine
 construction in exactly one module is what makes the fork guarantee below
@@ -443,7 +443,7 @@ def make_engine(
         # the fix, so name it.
         raise ValueError(
             f"not a SQLAlchemy URL: {url!r}. If this is a filesystem path, "
-            "use zfsbackup.store.db.url_for_path(path) to build the URL."
+            "use zfsbackup.config.store.db.url_for_path(path) to build the URL."
         ) from exc
 
     backend = parsed.get_backend_name()
@@ -457,7 +457,7 @@ def make_engine(
         # Postgres move goes through `mapper.py`'s dataclass boundary and
         # gets its own engine module; it does not go through this function.
         raise ValueError(
-            f"zfsbackup.store.db only supports SQLite URLs, got {backend!r} "
+            f"zfsbackup.config.store.db only supports SQLite URLs, got {backend!r} "
             f"({url!r})"
         )
 

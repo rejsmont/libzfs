@@ -28,9 +28,9 @@ When producing a plan:
   any hazards specific to the change (multiprocessing, IPC, signals, retention logic, etc.).
 - **Assign owners.** File ownership inside `zfsbackup/` is **exclusive** — route each unit to the
   one executor that owns its files:
-  - `zfsbackup-developer` → daemon core: `config.py`, `backup_manager.py`, `daemon.py`,
+  - `zfsbackup-developer` → daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`,
     `workers.py`, `remote.py`, `api.py`
-  - `zfsbackup-store-developer` → `zfsbackup/store/**` incl. `store/migrations/`, `alembic.ini` (models, mapper, engine/session,
+  - `zfsbackup-store-developer` → `zfsbackup/config/store/**` incl. `store/migrations/`, `alembic.ini` (models, mapper, engine/session,
     migrations)
   - `zfsbackup-cli-developer` → `zfsbackup/cli/**` (the `zfsbackup-config` Click application)
   - `pytest-test-author` → tests + conftest
@@ -55,7 +55,7 @@ When producing a plan:
 ## zfsbackup-specific facts to plan around
 
 **Package layout:**
-- `zfsbackup/config.py` — YAML config loader. `BackupConfig.from_file()` parses global settings
+- `zfsbackup/config/model.py` — YAML config loader. `BackupConfig.from_file()` parses global settings
   and a list of `DatasetConfig` objects. Each dataset has a `frequency` (how often to snapshot)
   and tiered `retention` rules (`RetentionRule(age, keep_for)`). Time durations use a custom
   format: `m`=minutes, `h`=hours, `d`=days, `w`=weeks, `M`=months (~30 d), `y`=years (~365 d).
@@ -75,7 +75,7 @@ When producing a plan:
   `RemoteBackupWorker`, `ApiWorker`, each sleeping via `stop_event.wait(timeout=interval)`.
 - `zfsbackup/remote.py` — remote transfer logic (send/receive over SSH or similar).
 - `zfsbackup/api.py` — HTTP API for daemon status/control.
-- `zfsbackup/store/` — the SQLAlchemy config store: `models.py` (schema), `mapper.py` (ORM⇄dataclass),
+- `zfsbackup/config/store/` — the SQLAlchemy config store: `models.py` (schema), `mapper.py` (ORM⇄dataclass),
   `db.py` (engine/session, WAL pragmas, fork-safe engine cache). A **separate layer** from the
   dataclasses, not a replacement — `DatasetConfig` is also a remote wire format with no DB behind it,
   and config objects outlive any session. Plans must preserve that separation.

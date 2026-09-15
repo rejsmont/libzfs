@@ -6,7 +6,7 @@ plan measured against it:
 1. The stock template's `run_migrations_online()` always builds an `Engine`
    from `sqlalchemy.url` via `engine_from_config`, ignoring any connection
    the caller already has open. `ensure_schema()` (see
-   `zfsbackup/store/migrate.py`) -- and every in-memory test -- inject a
+   `zfsbackup/config/store/migrate.py`) -- and every in-memory test -- inject a
    live `Connection` via `config.attributes["connection"]` instead, because
    the DB they are targeting (an in-memory `StaticPool` engine, or one
    opened by a caller that must not be handed a second, independent
@@ -53,7 +53,7 @@ from sqlalchemy.engine import Connection
 
 from alembic import context
 
-from zfsbackup.store.models import Base
+from zfsbackup.config.store.models import Base
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

@@ -1,12 +1,12 @@
-"""Converts between the ORM rows in `zfsbackup/store/models.py` and the
-plain `@dataclass` config model in `zfsbackup/config.py`.
+"""Converts between the ORM rows in `zfsbackup/config/store/models.py` and the
+plain `@dataclass` config model in `zfsbackup/config/model.py`.
 
-See `zfsbackup/store/__init__.py` for why the two are kept as separate
+See `zfsbackup/config/store/__init__.py` for why the two are kept as separate
 layers rather than one declarative model; this module is the "later item"
-that docstring pointed at. It is a NEW coupling: `config.py` does not import
+that docstring pointed at. It is a NEW coupling: `config/model.py` does not import
 anything from `store`, but this module (and therefore the `store` package)
 now imports `zfsbackup.config`. That direction is deliberate and safe --
-`config.py` has no reason to know the store exists -- and should stay
+`config/model.py` has no reason to know the store exists -- and should stay
 one-directional.
 
 Three invariants hold across every function here:
@@ -26,7 +26,7 @@ Three invariants hold across every function here:
 3. **Neither `DatasetConfig.from_dict` nor `DatasetConfig.from_property` is
    the DB->dataclass path, and both are actively wrong if reused as one:**
    `from_dict` is a YAML-boundary parser with a Phase-0 type guard
-   (`config.py`'s `_duration_from_config`) that *rejects* any duration value
+   (`config/model.py`'s `_duration_from_config`) that *rejects* any duration value
    that is not already a `str` -- exactly what every column in this store
    is not (`*_seconds` is a `float`, and a DB-sourced `Duration` is a typed
    object, not YAML text). Round-tripping a DB row through a YAML-shaped
@@ -35,7 +35,7 @@ Three invariants hold across every function here:
    than the authoritative `*_seconds`, inverting invariant 1 above.
    `from_property` is a *wire* decoder for the `org.zfsbackup:config`
    ZFS user property, not a round-trip inverse of anything -- it drops
-   per-destination retention rules entirely, and `config.py` says so
+   per-destination retention rules entirely, and `config/model.py` says so
    in its own docstring, naming this exact use as something not to do.
    Every dataclass constructed here therefore uses direct keyword
    construction with already-typed `Duration`s, matching `from_property`'s
@@ -54,7 +54,7 @@ freezing `/root/.config/...` into the DB was the motivating bug -- see
 `models.py`'s module docstring and `GlobalSettings`). This module therefore
 passes a `NULL` row straight through as `None` on both `BackupConfig`
 fields rather than deriving a value here: `BackupConfig.effective_prune_interval`
-and `.effective_client_id_file` (`config.py`) own the actual
+and `.effective_client_id_file` (`config/model.py`) own the actual
 `check_interval`/`$HOME` derivation, resolved lazily on each access in
 whatever process calls them, not this mapper. `load_config` must not
 reimplement that derivation itself: doing so would re-flatten the very
@@ -81,14 +81,14 @@ from zfsbackup.config import (
     RetentionRule,
     validate_retention_uniqueness,
 )
-from zfsbackup.store import models
+from zfsbackup.config.store import models
 
 logger = logging.getLogger(__name__)
 
 
 # Dataset-level default applied when a dataset has zero dataset-level
 # retention rows -- mirrors `DatasetConfig.from_dict`'s default
-# (`config.py:552-572`), which means a `BackupConfig` produced by
+# (`config/model.py:552-572`), which means a `BackupConfig` produced by
 # `from_file` can never have an empty dataset-level retention set. Built as
 # `Duration` literals (not bare `timedelta`s) so the literal matches
 # `from_file`'s exactly ("1d"/"30d", not a re-synthesized equivalent).
@@ -191,7 +191,7 @@ def _scoped_rules(remote: models.DatasetRemote) -> List[RetentionRule]:
     relationship's `primaryjoin` is narrowed to `DatasetRemote.id ==
     RetentionRule.dataset_remote_id` (`models.py`), so unlike
     `Dataset.retention_rules` there is no promotion trap here. Zero rows
-    means "inherit the dataset-level set" (`config.py:414-416`,
+    means "inherit the dataset-level set" (`config/model.py:414-416`,
     `effective_retention_rules`) and is returned as `[]` UNCHANGED -- this
     is deliberately the opposite of `_dataset_level_rules`' empty-set
     handling; see that function's docstring for why the asymmetry is
@@ -209,7 +209,7 @@ def _assert_scope_integrity(ds: models.Dataset) -> None:
     The composite FK (`fk_retention_rules_dataset_remote`, `models.py`)
     normally makes this impossible -- but only when `PRAGMA
     foreign_keys=ON`, which is per-connection in SQLite and off by default.
-    Since item 5, `zfsbackup/store/db.py` sets that pragma on every
+    Since item 5, `zfsbackup/config/store/db.py` sets that pragma on every
     connection **it** creates. **This check stays regardless, and must not
     be deleted as obsolete**, for two independent reasons:
 
@@ -283,10 +283,10 @@ def _dataset_to_dataclass(
     `known_destinations` is the already-loaded `{name: Destination}` map
     from the whole `destinations` table (see `load_config`) -- used only to
     re-check that every `DatasetRemote.destination_name` is declared,
-    mirroring `config.py:715-728`'s load-time check. The FK on
+    mirroring `config/model.py:715-728`'s load-time check. The FK on
     `destination_name` normally makes an undeclared reference impossible,
     but (as with `_assert_scope_integrity`) that guarantee is conditional on
-    `PRAGMA foreign_keys=ON`. Item 5's `zfsbackup/store/db.py` now sets that
+    `PRAGMA foreign_keys=ON`. Item 5's `zfsbackup/config/store/db.py` now sets that
     pragma on every connection it creates, and **this re-check still stays**:
     connections that do not come from `db.py` (Alembic batch migrations,
     which must run FK-off; the `sqlite3` CLI; a fixture building its own
@@ -371,8 +371,8 @@ def load_config(session: Session) -> BackupConfig:
     `DetachedInstanceError` rationale).
 
     `validate_retention_uniqueness` and `_collapse_retention_rules`
-    (`config.py`) are deliberately NOT called here: the former has zero
-    production callers on the load path today (`config.py:573-577`), and
+    (`config/model.py`) are deliberately NOT called here: the former has zero
+    production callers on the load path today (`config/model.py:573-577`), and
     the latter is a pruning-time function, not a load-path one -- see this
     module's `save_config` for where uniqueness validation belongs instead.
     """
@@ -386,7 +386,7 @@ def load_config(session: Session) -> BackupConfig:
     destination_rows = session.scalars(select(models.Destination)).all()
     # ALL declared destinations, not just ones referenced by a dataset --
     # `BackupConfig.destinations` is every declared destination
-    # (`config.py:705-713`), so an unreferenced one must still round-trip.
+    # (`config/model.py:705-713`), so an unreferenced one must still round-trip.
     destinations: Dict[str, Destination] = {
         row.name: Destination(url=row.url) for row in destination_rows
     }
@@ -444,7 +444,7 @@ def load_config(session: Session) -> BackupConfig:
 def _assert_positive_duration_rule(rule: RetentionRule, key: str) -> None:
     """Reject a non-positive `age`/`keep_for` before it reaches the DB.
 
-    Mirrors `config.py`'s `_positive_duration_from_config` (age 0 is a
+    Mirrors `config/model.py`'s `_positive_duration_from_config` (age 0 is a
     division-by-zero in the slot-based retention algorithm,
     `DatasetManager.needs_prunning`; either duration <= 0 has no meaningful
     retention semantics) -- but that guard runs only on the YAML-boundary
@@ -472,7 +472,7 @@ def _dedupe_exact_duplicates(rules: List[RetentionRule]) -> List[RetentionRule]:
     preserving first-seen order.
 
     `validate_retention_uniqueness` deliberately PERMITS exact duplicates
-    (`config.py:300-302`, `test_exact_duplicates_are_silent`), but the DB's
+    (`config/model.py:300-302`, `test_exact_duplicates_are_silent`), but the DB's
     unique indexes on `age_seconds`/`keep_for_seconds` per scope do not --
     inserting two identical rules raises a bare `IntegrityError`. This is
     the gap between what validation tolerates and what the schema accepts;
@@ -509,26 +509,26 @@ def save_config(session: Session, config: BackupConfig) -> None:
 
     1. Validate, all of it BEFORE any DELETE runs, so a bad input never
        wipes a good DB: `config.datasets` must be non-empty
-       (`config.py:667-671`'s "No datasets configured", mirrored here so
+       (`config/model.py:667-671`'s "No datasets configured", mirrored here so
        the store and the YAML loader agree on what a valid config is);
-       dataset names must be unique (`config.py:677-688`'s check, which
+       dataset names must be unique (`config/model.py:677-688`'s check, which
        exists in `from_file` specifically because the store's
        `datasets.name UNIQUE` constraint is stricter than `from_dict`);
        every declared destination must have a non-empty `url`
-       (`config.py:710-712`'s check -- `destinations.url` is `NOT NULL`
+       (`config/model.py:710-712`'s check -- `destinations.url` is `NOT NULL`
        but not `CHECK`'d non-empty, so a `None` OR `""` url would
        otherwise reach the DB, the former as a bare `NOT NULL constraint
        failed`, the latter inserting silently); `config.remote_backup`, if
        present, must have a non-empty `target_dataset`
-       (`config.py:735-737`'s check, same reasoning as `url` above); within
+       (`config/model.py:735-737`'s check, same reasoning as `url` above); within
        each dataset, destinations referenced by `remote` entries must be
        unique per dataset (`dataset_remotes`'s composite unique constraint,
-       `models.py`, is stricter than `from_dict` -- see `config.py:624-626`,
+       `models.py`, is stricter than `from_dict` -- see `config/model.py:624-626`,
        which never checked this) and each must be a key of
        `config.destinations`; and every retention rule's `age`/
        `keep_for`, dataset-level and per-destination, must be positive
        (`_assert_positive_duration_rule`, mirroring
-       `config.py`'s `_positive_duration_from_config`) plus
+       `config/model.py`'s `_positive_duration_from_config`) plus
        `validate_retention_uniqueness` per scope. Skipping any of these
        does not fail loudly -- it fails as a bare `IntegrityError`/`CHECK
        constraint failed` raised mid-insert, well after the wipe.
@@ -591,14 +591,14 @@ def save_config(session: Session, config: BackupConfig) -> None:
     """
     # --- 1. Validate, before any DELETE runs. ---
     # Mirrors `BackupConfig.from_file`'s "No datasets configured"
-    # (`config.py:667-671`) -- see this function's docstring on why the
+    # (`config/model.py:667-671`) -- see this function's docstring on why the
     # empty-retention half of this asymmetry is deliberately NOT mirrored
     # here (that half is the CLI's job, decision 2 / boundary item B2).
     if not config.datasets:
         raise ValueError("No datasets configured")
 
     # Mirrors `from_file`'s duplicate-dataset-name check
-    # (`config.py:677-688`), which exists there for exactly this store's
+    # (`config/model.py:677-688`), which exists there for exactly this store's
     # `datasets.name UNIQUE` constraint -- without it here too, a
     # `BackupConfig` built directly (bypassing `from_dict`, e.g. by a
     # future CLI importer) hits a bare `IntegrityError` after the wipe.
@@ -612,7 +612,7 @@ def save_config(session: Session, config: BackupConfig) -> None:
         seen_dataset_names[ds.name] = idx
 
     # Mirrors `from_file`'s per-destination url requirement
-    # (`config.py:710-712`, `"Destination '{name}' requires 'url'"`).
+    # (`config/model.py:710-712`, `"Destination '{name}' requires 'url'"`).
     # `destinations.url` (`models.py`) is `NOT NULL` but not `CHECK`'d
     # non-empty, so without this check a `None` url reaches the DB as a
     # bare `NOT NULL constraint failed` mid-insert (after the wipe), and an
@@ -624,7 +624,7 @@ def save_config(session: Session, config: BackupConfig) -> None:
             raise ValueError(f"Destination {name!r} requires 'url'")
 
     # Mirrors `from_file`'s `remote_backup.target_dataset` requirement
-    # (`config.py:735-737`) the same way the `url` loop above mirrors its
+    # (`config/model.py:735-737`) the same way the `url` loop above mirrors its
     # `Destination.url` requirement: `remote_server.target_dataset`
     # (`models.py`) is `NOT NULL` but not `CHECK`'d non-empty, so `None`
     # would otherwise reach the final flush as a bare `NOT NULL constraint
@@ -640,7 +640,7 @@ def save_config(session: Session, config: BackupConfig) -> None:
         validate_retention_uniqueness(
             ds.retention_rules, f"datasets[{ds.name}].retention"
         )
-        # `from_dict` (`config.py:624-626`) never checks for two `remote`
+        # `from_dict` (`config/model.py:624-626`) never checks for two `remote`
         # entries naming the same destination -- a YAML `from_file` loads
         # cleanly here fails only at insert, as a bare `IntegrityError`,
         # against `dataset_remotes`'s `(dataset_id, destination_name)`

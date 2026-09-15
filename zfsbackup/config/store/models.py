@@ -1,10 +1,10 @@
 """SQLAlchemy 2.0 declarative ORM models for the zfsbackup config store.
 
-Mirrors the dataclass model in `zfsbackup/config.py` as it stands after
+Mirrors the dataclass model in `zfsbackup/config/model.py` as it stands after
 items 2b (retention keep_for/age uniqueness), 3b (per-destination retention
 overrides), and the item-3 review pass (retention overrides scoped by
 `dataset_remote_id` rather than a bare `destination_name`; see below). This
-module defines schema only -- see `zfsbackup/store/__init__.py` for why the
+module defines schema only -- see `zfsbackup/config/store/__init__.py` for why the
 ORM layer is kept separate from the `BackupConfig`/`DatasetConfig`
 dataclasses. No engine/session code lives here (that is a later item); no
 mapper conversion lives here either (also a later item).
@@ -15,19 +15,19 @@ the literal is what makes a YAML round-trip preserve a user's original text
 (``"30d"`` rather than rewriting it to the numerically-identical ``"1M"``).
 Most `*_literal` columns are nullable: `Duration.literal` is `Optional[str]`
 (it is `None` for sub-second values, which have no representable literal in
-`config.py`'s grammar -- see `Duration._synthesize`/`.literal`), and a plain
+`config/model.py`'s grammar -- see `Duration._synthesize`/`.literal`), and a plain
 `timedelta` has no `.literal` at all. A NULL `*_literal` means "no literal on
 record; re-synthesize a best-effort one from `*_seconds` on read" rather than
 an error -- synthesis is deterministic (`Duration._synthesize`), so nothing
 is lost, and this is strictly more forgiving than raising for a value the
 domain model itself considers legal. (In practice sub-second durations
-cannot reach the DB via YAML, since `config.py`'s grammar is integer-only,
+cannot reach the DB via YAML, since `config/model.py`'s grammar is integer-only,
 but `DatasetConfig.from_property` can decode one from a wire float, so the
 model tolerates it here too.)
 
 `GlobalSettings.prune_interval_seconds` is the one column where a NULL
 `*_seconds` value is legal, and it means something entirely different from a
-NULL `*_literal`: `config.py`'s `BackupConfig.prune_interval` is `None`
+NULL `*_literal`: `config/model.py`'s `BackupConfig.prune_interval` is `None`
 when absent from YAML ("follow `check_interval`"), and
 `BackupConfig.effective_prune_interval` resolves that fallback lazily, on
 each access, in whatever process calls it -- not once at load time --
@@ -150,7 +150,7 @@ class GlobalSettings(Base):
     api_port: Mapped[int] = mapped_column(default=8080)
     dry_run: Mapped[bool] = mapped_column(default=False)
     # Nullable: NULL means "resolve $HOME's default in the process that
-    # uses the file" (config.py's `Path.home() / '.config' / 'zfsbackup' /
+    # uses the file" (config/model.py's `Path.home() / '.config' / 'zfsbackup' /
     # 'client_id'`), not "no value stored". A stored, materialised path
     # here would freeze whichever process ran `zfsbackup-config import`'s
     # $HOME into the DB -- see the item-3c.1 plan item for why that is a
@@ -221,7 +221,7 @@ class Dataset(Base):
 
 class Destination(Base):
     """A remote server that accepts backup streams, mirroring `Destination`
-    (`config.py`). Keyed by name rather than a surrogate id: destination
+    (`config/model.py`). Keyed by name rather than a surrogate id: destination
     names are the natural key used throughout the config (dataset `remote`
     entries, `RemoteDatasetConfig.destination`, `to_property(destination)`)
     and there is no reason to invent a second identifier for them.
@@ -269,7 +269,7 @@ class Destination(Base):
 class DatasetRemote(Base):
     """Per-destination remote backup config for one dataset, mirroring
     `RemoteDatasetConfig`. A NULL `frequency_*` pair means "inherit the
-    dataset's own frequency" (`config.py`'s `RemoteDatasetConfig.frequency
+    dataset's own frequency" (`config/model.py`'s `RemoteDatasetConfig.frequency
     = None` precedent); a NULL `frequency_literal` alone (non-NULL
     `frequency_seconds`) means the sub-second "re-synthesize on read" case
     described in the module docstring -- the two NULL cases are
@@ -348,7 +348,7 @@ class DatasetRemote(Base):
 
 
 class RetentionRule(Base):
-    """One retention tier, mirroring `RetentionRule` (`config.py`), scoped
+    """One retention tier, mirroring `RetentionRule` (`config/model.py`), scoped
     to either a dataset (`dataset_remote_id IS NULL`, local pruning) or a
     single `DatasetRemote` row (`dataset_remote_id` set, a per-destination
     override for that one dataset+destination pairing -- see item 3b).

@@ -54,7 +54,7 @@ losing work if that commit does not happen, and they fail differently:
    `OperationalError: table ... already exists` from `command.upgrade`.
 
 **Item 5 changes which of the two cases applies, not the advice.** A
-`Connection` opened from a file-backed writer engine in `zfsbackup/store/
+`Connection` opened from a file-backed writer engine in `zfsbackup/config/store/
 db.py` runs with pysqlite's implicit transaction handling disabled and an
 explicit `BEGIN IMMEDIATE` at the first statement, so case 2 collapses into
 case 1: the `CREATE TABLE`s no longer auto-commit themselves, and the whole
@@ -86,9 +86,9 @@ from alembic.util.exc import CommandError
 from sqlalchemy import inspect
 from sqlalchemy.engine import Connection
 
-from zfsbackup.store.models import Base
+from zfsbackup.config.store.models import Base
 
-# zfsbackup/store/migrations/, not alembic.ini's script_location -- this
+# zfsbackup/config/store/migrations/, not alembic.ini's script_location -- this
 # path is fixed at install time and does not depend on `alembic.ini`
 # existing at all (see `_build_config`'s docstring).
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
@@ -168,7 +168,7 @@ def _build_config(connection: Connection) -> Config:
     CLI during development) and is not part of an installed deployment --
     nothing guarantees it exists, or that the process's current working
     directory is the repo root, wherever `ensure_schema` is called from. The
-    migration scripts themselves (`zfsbackup/store/migrations/`) are
+    migration scripts themselves (`zfsbackup/config/store/migrations/`) are
     resolved relative to this file instead, which ships with the package
     regardless of how it is installed.
 

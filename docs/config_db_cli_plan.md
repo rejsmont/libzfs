@@ -33,11 +33,11 @@ These facts, read from the code rather than the docs, shape every item below.
   lifetime (`zfsbackup/api.py:20-26`), `RemoteBackupManager` holds it (`zfsbackup/remote.py:56`),
   `DatasetManager` holds it (`zfsbackup/backup_manager.py:63`).
 - **`DatasetConfig` is also a wire format.** `to_property()`/`from_property()`
-  (`zfsbackup/config.py:88-132`) base64-JSON-encode it into the ZFS user property
+  (`zfsbackup/config/model.py:88-132`) base64-JSON-encode it into the ZFS user property
   `org.zfsbackup:config`, and it is transmitted to remote servers (`zfsbackup/remote.py:108`).
   Instances are reconstructed from remote data with no DB backing and **no duration literals**.
-- **Retention is a YAML mapping, not a list** (`zfsbackup/config.py:148-155`): keys are unique age
-  strings, sorted by age via `retention_rules.sort(key=lambda r: r.age)` at `config.py:155`.
+- **Retention is a YAML mapping, not a list** (`zfsbackup/config/model.py:148-155`): keys are unique age
+  strings, sorted by age via `retention_rules.sort(key=lambda r: r.age)` at `config/model.py:155`.
 - **Workers load config once and never re-read it** (`workers.py:62`, loop begins `workers.py:73`).
   This is the fact Phase 3 exists to address.
 - **Dependency reality:** `sqlalchemy`, `alembic`, `typer` are not installed. `click` 8.3.3 **is**
@@ -67,13 +67,13 @@ trigger.
 ## Recommended architecture
 
 **Keep the dataclasses as the runtime domain model; add a separate SQLAlchemy ORM layer plus an explicit
-mapper.** New package `zfsbackup/store/` with `models.py` (declarative ORM rows), `db.py`
+mapper.** New package `zfsbackup/config/store/` with `models.py` (declarative ORM rows), `db.py`
 (engine/session), `mapper.py` (ORM ⇄ dataclass conversion). `BackupConfig`/`DatasetConfig` stay plain
 dataclasses and remain the only types any consumer sees.
 
 Justification, tied to source:
 
-1. `DatasetConfig.from_property()` (`config.py:110`) constructs instances from *remote server data* with
+1. `DatasetConfig.from_property()` (`config/model.py:110`) constructs instances from *remote server data* with
    no DB behind them. If `DatasetConfig` were a declarative model, the same class would be
    simultaneously persistent, transient, and detached depending on origin — a session-identity hazard,
    and `session.add()` of a remote-derived object would silently persist foreign config.
@@ -117,8 +117,8 @@ way to `ALTER` on SQLite, which does not support most in-place column changes.
 ### Item 2 — `Duration` value type (full type, per user decision)
 
 - **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(config round-trip format)*
-- **Files:** `zfsbackup/config.py`
-- **Basis:** `zfsbackup/config.py:12-45`. `parse_time_duration("1M")` and `parse_time_duration("30d")`
+- **Files:** `zfsbackup/config/model.py`
+- **Basis:** `zfsbackup/config/model.py:12-45`. `parse_time_duration("1M")` and `parse_time_duration("30d")`
   both return `timedelta(days=30)`; `1y` and `365d` both return `timedelta(days=365)`. Verified:
 
   ```
@@ -207,7 +207,7 @@ accessors, and does **not** override `__str__`:
   positional `str` or `timedelta` can never collide with the native signature. `Duration(30)` means
   `days=30`, exactly as `timedelta(30)` does today.
 - **`Duration._parse(s)` — private** *(user decision)*. The parsing logic currently at
-  `config.py:12-45` moves into `Duration` as a private static method **and is rewritten** to support
+  `config/model.py:12-45` moves into `Duration` as a private static method **and is rewritten** to support
   compound literals (see below). Single-term behaviour and every existing error case are preserved; the
   vestigial leading-`m` branch is dropped. This makes `Duration` self-contained: the type owns both
   directions of its own conversion.
@@ -232,7 +232,7 @@ accessors, and does **not** override `__str__`:
 #### Compound literals *(user decision — this is a parser extension, not a relocation)*
 
 `Duration` must accept **multi-term literals**: `6d12h`, `1h30m`, `1y2M3d`, `1w2d`. The current parser is
-strictly single-term — `value = int(duration_str[:-1])` at `config.py:26` takes everything but the last
+strictly single-term — `value = int(duration_str[:-1])` at `config/model.py:26` takes everything but the last
 character as the number — so this is genuinely new capability and the parser is **rewritten, not moved**.
 
 **Grammar:** an optional leading `-`, then one or more `(integer)(unit)` terms with no separators and no
@@ -262,7 +262,7 @@ whitespace. The value is the sum of the terms.
   legal and equals `6d12h`); enforcing descending order buys nothing and rejects harmless input.
 - **All existing error cases must still raise `ValueError`:** `""`, `"xh"`, `"5z"`, `"M5"`, `"mi5"`,
   `"mi"`. A full-string anchored match satisfies every one of these naturally.
-- **The vestigial leading-`m` branch disappears, and that is safe.** Lines `config.py:17-23` compute a
+- **The vestigial leading-`m` branch disappears, and that is safe.** Lines `config/model.py:17-23` compute a
   `unit` that is then always discarded, because `int(duration_str[:-1])` raises for every input that
   reaches the branch — verified: `m5`, `M5`, `mi5`, and `mi` all raise `Invalid duration format`. The two
   tests covering it (`tests/test_zfsbackup_config.py:60-76`) assert only that a `ValueError` is raised,
@@ -291,7 +291,7 @@ When a `Duration` is constructed without a literal — from a `timedelta` or fro
   in `zfsbackup/` produces sub-second durations, so this is a corner case that only needs to be *defined*.
 
   > **⚠ Phase 2 must handle this on the remote path** *(found in the Phase 0 review)*. `from_property`
-  > (`config.py:110-132`) feeds `total_seconds()` **floats** off the wire into `Duration(seconds=...)`.
+  > (`config/model.py:110-132`) feeds `total_seconds()` **floats** off the wire into `Duration(seconds=...)`.
   > Whole-second values are fine, but a remote peer sending `"frequency": 0.5` produces a `Duration` with
   > `literal is None` — harmless today because nothing calls `render()`, but **Phase 2's `export` and
   > `edit` would crash on remote-derived config**. Before item 12 lands, either round to whole seconds at
@@ -308,7 +308,7 @@ When a `Duration` is constructed without a literal — from a `timedelta` or fro
   essentially every value, so it answers "what text represents this duration", not "what did the config
   say". Nothing in this plan needs the provenance distinction; if a later feature does, it needs a separate
   flag rather than an `is None` check.
-- **Upside for the remote path:** `from_property()` (`config.py:110-132`) rebuilds durations from
+- **Upside for the remote path:** `from_property()` (`config/model.py:110-132`) rebuilds durations from
   `timedelta(seconds=...)` with no literal available. Synthesis means remote-derived configs now render as
   `1M` rather than failing or emitting a raw timedelta — a real improvement over the `literal=None` design.
 - **Deliberate and acceptable:** a *reconstructed* 30-day value synthesizes `"1M"`, not `"30d"`. Values
@@ -319,7 +319,7 @@ When a `Duration` is constructed without a literal — from a `timedelta` or fro
 imported and asserted against **22 times across two test files** (`tests/test_zfsbackup_config.py:8` and
 `tests/test_zfsbackup_basic.py:9`), including the deliberate leading-`m` edge-case coverage at
 `tests/test_zfsbackup_config.py:60-76`. **Recommended: keep `parse_time_duration` as a thin public
-module-level shim** in `config.py` that delegates to `Duration._parse` and returns a plain `timedelta`:
+module-level shim** in `config/model.py` that delegates to `Duration._parse` and returns a plain `timedelta`:
 
 ```
 def parse_time_duration(duration_str: str) -> timedelta:
@@ -332,11 +332,11 @@ calls the shim — while leaving all 22 existing assertions passing unmodified. 
 outright) forces `pytest-test-author` to rewrite both files in the same cycle, and would lose the
 leading-`m` edge-case tests unless they are consciously ported. **Confirm which you want.**
 
-**Benefit of the constructor change worth noting:** the six internal parse sites at `config.py:145`,
-`config.py:152-153`, `config.py:162`, `config.py:212`, and `config.py:215` become `Duration(...)`
+**Benefit of the constructor change worth noting:** the six internal parse sites at `config/model.py:145`,
+`config/model.py:152-153`, `config/model.py:162`, `config/model.py:212`, and `config/model.py:215` become `Duration(...)`
 construction directly, so every duration loaded by `from_file` carries its literal with no separate
-wiring step. The `field(default_factory=...)` defaults at `config.py:83`, `config.py:180`, and
-`config.py:181` become `Duration("1h")`, `Duration("5m")`, `Duration("1h")` respectively.
+wiring step. The `field(default_factory=...)` defaults at `config/model.py:83`, `config/model.py:180`, and
+`config/model.py:181` become `Duration("1h")`, `Duration("5m")`, `Duration("1h")` respectively.
 
 **Details that must be got right:**
 
@@ -383,9 +383,9 @@ Every operation performed on these values today, with the exact call site:
 | **Reflected comparison** | `backup_manager.py:205-206` — `age >= dsi.frequency`, where `age` is a **bare `timedelta`** from `SnapshotInfo.age` (`backup_manager.py:346`) | `timedelta.__ge__(Duration)` must resolve. Subclassing makes this work natively; a wrapper would return `NotImplemented` and fall through to a reflected call that must be hand-written. **This is the case that kills the wrapper design.** |
 | `.total_seconds()` as dict key | `backup_manager.py:217` — `{rule.keep_for.total_seconds(): rule.age.total_seconds()}` | Floats, unaffected |
 | f-string interpolation | `backup_manager.py:97,101,208` | `__str__` **not overridden** — output byte-identical to today. Assert this in item 9 |
-| Sorting | `config.py:155` — `retention_rules.sort(key=lambda r: r.age)` | `__lt__` between `Duration`s |
-| `.total_seconds()` for JSON | `config.py:93,96,102` (`to_property`) | Inherited; **output must be byte-identical** |
-| Dataclass default | `config.py:83` — `field(default_factory=lambda: timedelta(hours=1))` | Becomes `Duration('1h')` |
+| Sorting | `config/model.py:155` — `retention_rules.sort(key=lambda r: r.age)` | `__lt__` between `Duration`s |
+| `.total_seconds()` for JSON | `config/model.py:93,96,102` (`to_property`) | Inherited; **output must be byte-identical** |
+| Dataclass default | `config/model.py:83` — `field(default_factory=lambda: timedelta(hours=1))` | Becomes `Duration('1h')` |
 | `.total_seconds()` | `workers.py:100` (`check_interval`), `workers.py:122` (`prune_interval`) | Inherited |
 | **Truthiness in `or`** | `workers.py:146-150` — `(r.frequency or ds.frequency).total_seconds()` | `__bool__`. `timedelta(0)` is falsy; `Duration` wrapping zero **must remain falsy** to preserve today's behaviour. Inherited correctly by subclassing. |
 | **Truthiness in `or`** | `workers.py:161` — `(remote_cfg.frequency or dsi.config.frequency)` | Same |
@@ -393,10 +393,10 @@ Every operation performed on these values today, with the exact call site:
 | Equality in tests | 8 test files constructing `BackupConfig(...)` | `__eq__` inherited; `Duration('1M') == timedelta(days=30)` is `True`, which is correct — literal is metadata, not identity |
 | Hashability | implied by dataclass/dict use | Inherited |
 
-- **Edge cases to preserve:** the leading-`m` branch at `config.py:17-23` is dead code and is deleted by
+- **Edge cases to preserve:** the leading-`m` branch at `config/model.py:17-23` is dead code and is deleted by
   the compound-parser rewrite; its two tests assert only `ValueError` and must keep passing.
-  **Negative durations (`-5d`) must keep working** — they parse today. `s` (seconds) is accepted at `config.py:30` but undocumented in
-  `config.example.yaml:84-90`; keep accepting it. `from_property()` (`config.py:110-132`) reconstructs
+  **Negative durations (`-5d`) must keep working** — they parse today. `s` (seconds) is accepted at `config/model.py:30` but undocumented in
+  `config.example.yaml:84-90`; keep accepting it. `from_property()` (`config/model.py:110-132`) reconstructs
   durations from remote JSON with **no literal available** — those `Duration`s synthesize one from the
   value and must render without error.
 - **Verification:** `pytest tests/test_zfsbackup_config.py tests/test_zfsbackup_basic.py` — **with the
@@ -418,7 +418,7 @@ ship on its own.
 
 - **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(retention logic)* — **approved by the
   user**; the strategy below is settled, the implementation still gets a review pass.
-- **Files:** `zfsbackup/backup_manager.py`, `zfsbackup/config.py`
+- **Files:** `zfsbackup/backup_manager.py`, `zfsbackup/config/model.py`
 - **Basis:** `backup_manager.py:216-219` builds `plan = {keep_for: age}` by dict comprehension, so two
   rules sharing a `keep_for` collapse to whichever is written last — **silently**, with no error and no
   log line.
@@ -433,7 +433,7 @@ retention:
 Verified: this yields `{604800.0: 86400.0}` — **one tier**. The hourly rule is gone; you asked for hourly
 granularity for a week and get daily.
 
-**The tie-break is systematically the worst available.** `config.py:155` sorts rules by `age` **ascending**,
+**The tie-break is systematically the worst available.** `config/model.py:155` sorts rules by `age` **ascending**,
 so the dict comprehension's last write is always the **largest interval**. On collision the code reliably
 discards the finer tier and keeps the coarser one — pruning *more* aggressively than either rule alone
 implies. Confirmed across all measured collision cases.
@@ -489,16 +489,16 @@ The read path stays permissive and loud; the write paths (CLI, `import`, item 3'
 ### Item 3 — Schema + ORM models
 
 - **Owner:** `zfsbackup-developer` · **Tag:** `low-risk` *(new files, nothing wired in yet)*
-- **Files:** new `zfsbackup/store/__init__.py`, `zfsbackup/store/models.py`
-- **Basis:** the dataclass set at `config.py:48-189`.
+- **Files:** new `zfsbackup/config/store/__init__.py`, `zfsbackup/config/store/models.py`
+- **Basis:** the dataclass set at `config/model.py:48-189`.
 - **Schema:**
   - `global_settings` — single row (`CHECK (id = 1)`), mirroring `BackupConfig` scalars
-    (`config.py:179-189`): `snapshot_prefix`, `check_interval_seconds` + `check_interval_literal`,
+    (`config/model.py:179-189`): `snapshot_prefix`, `check_interval_seconds` + `check_interval_literal`,
     `prune_interval_*`, `api_host`, `api_port`, `dry_run`, `client_id_file`, plus `generation INTEGER`
     (items 15 and 17). **Superseded in part by item 3c:** `prune_interval_seconds` and
     `client_id_file` are nullable, where NULL means "derive at read time".
   - `datasets` — `id`, `name UNIQUE NOT NULL`, `recursive`, `frequency_seconds`, `frequency_literal`,
-    `enabled` (`config.py:79-86`).
+    `enabled` (`config/model.py:79-86`).
   - `retention_rules` — **superseded during implementation; see `models.py` for the landed shape.**
     This draft scoped rules by a nullable `destination_name FK → destinations(name)`, which review
     rejected: the relationship had `passive_deletes` but no delete cascade, so the ORM disassociated
@@ -542,20 +542,20 @@ The read path stays permissive and loud; the write paths (CLI, `import`, item 3'
     > `plan` on `(keep_for, age)` (wrong on mechanics — a tuple key breaks the `sorted_expiries` scan and
     > the `plan[...]` lookup in step 3). A third draft then argued duplicate `age` was *legitimate* — also
     > wrong, per the subsumption argument above.
-  - `destinations` — `name PRIMARY KEY`, `url NOT NULL` (`config.py:220-225`).
+  - `destinations` — `name PRIMARY KEY`, `url NOT NULL` (`config/model.py:220-225`).
   - `dataset_remotes` — `id`, `dataset_id FK CASCADE`, `destination_name FK`, `frequency_seconds NULL`,
-    `frequency_literal NULL`. NULL frequency = inherit, per `config.py:68`.
-  - `remote_server` — single row, `target_dataset`, `enabled` (`config.py:71-75`).
+    `frequency_literal NULL`. NULL frequency = inherit, per `config/model.py:68`.
+  - `remote_server` — single row, `target_dataset`, `enabled` (`config/model.py:71-75`).
   - A key/value EAV table is rejected: it defeats typing and makes dot-path coercion guesswork.
 - **Edge cases:** `PRAGMA foreign_keys=ON` must be set per-connection (SQLite defaults it off) — item 5.
-  No ordering column needed for retention; rules are sorted by age at read time (`config.py:155`).
+  No ordering column needed for retention; rules are sorted by age at read time (`config/model.py:155`).
 - **Verification:** `pytest tests/test_zfsbackup_store.py -k schema`
 
 ### Item 3b — Per-destination retention rules
 
 - **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(retention + remote/wire behaviour)*
-- **Files:** `zfsbackup/config.py`, `zfsbackup/remote.py`, `zfsbackup/backup_manager.py`
-- **Basis:** user decision. Today `RemoteDatasetConfig` (`config.py:66-69`) carries only `destination` and
+- **Files:** `zfsbackup/config/model.py`, `zfsbackup/remote.py`, `zfsbackup/backup_manager.py`
+- **Basis:** user decision. Today `RemoteDatasetConfig` (`config/model.py:66-69`) carries only `destination` and
   an optional `frequency`; retention is dataset-wide. The requirement is that a client can keep, say,
   hourly-for-a-month locally but daily-for-five-years at an offsite destination.
 
@@ -590,7 +590,7 @@ Consequences:
   wholesale, discarding any previous rules for that received dataset. That is what `api.py`'s negotiate
   handler already does (it `zfs set`s `PROP_CONFIG` verbatim), so **the receive side needs no change**.
 - A destination override must restate every tier it still wants. Predictable, and it matches the existing
-  `frequency` precedent at `config.py:68` (`None = inherit from DatasetConfig`).
+  `frequency` precedent at `config/model.py:68` (`None = inherit from DatasetConfig`).
 
 **Proposed YAML shape** (extends `config.example.yaml:43-47`):
 ```yaml
@@ -630,8 +630,8 @@ Consequences:
   item 7** — once Alembic baselines the schema, this needs an `ALTER` migration plus a backfill that
   asks an unanswerable question of each existing row ("was this value derived or chosen?").
 - **Basis:** two global settings mean *derive at load time* when absent from YAML —
-  `prune_interval` (`config.py:696`, absent means follow `check_interval`) and `client_id_file`
-  (`config.py:742-743`, absent means resolve `$HOME` in the process that will use the file).
+  `prune_interval` (`config/model.py:696`, absent means follow `check_interval`) and `client_id_file`
+  (`config/model.py:742-743`, absent means resolve `$HOME` in the process that will use the file).
   `from_file` resolved both eagerly and `models.py:120`/`:125` stored them `NOT NULL`, flattening the
   derivation into whichever process wrote the row.
 - **Why it matters.** `zfsbackup-config import` run under `sudo` baked `/root/.config/...` into the
@@ -639,7 +639,7 @@ Consequences:
   `write_text` on a miss, so a wrong `$HOME` silently **generates a brand-new client ID** — orphaning
   the entire server-side `target/<client_id>/...` dataset tree from the previous identity. Separately,
   a stored `prune_interval` stops tracking a later `check_interval` change.
-- **Second defect collapsed.** `config.py:644` defaulted `prune_interval` to `1h` for a directly
+- **Second defect collapsed.** `config/model.py:644` defaulted `prune_interval` to `1h` for a directly
   constructed `BackupConfig`, while `from_file` with the key absent gave `check_interval` (5m). Two
   disagreeing defaults for one field, with no DB involved. Verified by execution before the change.
 - **Changes:** both columns nullable, NULL meaning *derive*, with a `CHECK (prune_interval_seconds
@@ -660,8 +660,8 @@ Consequences:
 ### Item 4 — Mapper layer (ORM ⇄ dataclass)
 
 - **Owner:** `zfsbackup-store-developer` · **Tag:** `needs-approval` *(defines the config load contract)*
-- **Files:** new `zfsbackup/store/mapper.py`
-- **Basis:** `BackupConfig.from_file` (`config.py:191-252`) is the only load path today; the DB path must
+- **Files:** new `zfsbackup/config/store/mapper.py`
+- **Basis:** `BackupConfig.from_file` (`config/model.py:191-252`) is the only load path today; the DB path must
   produce an equivalent object graph or every downstream consumer shifts behaviour.
 - **⚠ Do not reuse `from_dict` for the DB→dataclass direction** *(found in the Phase 0 review)*. Phase 0
   added a YAML-boundary type guard that rejects any non-`str` duration, so `from_dict` now raises on a
@@ -685,7 +685,7 @@ Consequences:
 ### Item 5 — Engine/session management, WAL, fork safety *(settled gating decision)*
 
 - **Owner:** `zfsbackup-store-developer` *(run at **opus**; + `concurrency-reviewer`)* · **Tag:** `needs-approval` *(multiprocessing)*
-- **Files:** new `zfsbackup/store/db.py`
+- **Files:** new `zfsbackup/config/store/db.py`
 - **Basis:** `daemon.py:62-68` spawns 3-4 `multiprocessing.Process` workers; `workers.py:62` and
   `workers.py:196` each open config inside the child. On Linux the default start method is `fork`, so
   **any engine or connection created in the supervisor before `_start_workers()` would be inherited by
@@ -700,7 +700,7 @@ Consequences:
     any fd close, against a file the parent believes it owns.
   - ~~**Supervisor holds no open engine while spawning.**~~ **Wrong on two counts.** There is no
     session at `daemon.py:153` — it is `BackupConfig.from_file`, pure YAML; nothing outside
-    `zfsbackup/store/` imports the store at all yet, so that sentence describes the post-item-8 world.
+    `zfsbackup/config/store/` imports the store at all yet, so that sentence describes the post-item-8 world.
     And more importantly, **there are two fork points, not one**: `_check_workers` re-forks on every
     worker crash at `daemon.py:77-78`, arbitrarily far into the supervisor's life. A one-time
     dispose-before-`run()` ordering discipline is therefore **structurally insufficient** — only the
@@ -737,7 +737,7 @@ Consequences:
 ### Item 6 — DB path resolution, creation policy, permissions
 
 - **Owner:** **split** — `zfsbackup-store-developer` (`store/db.py`) → `zfsbackup-developer` (`daemon.py`) → `zfsbackup-cli-developer` (`cli/main.py`) · **Tag:** `needs-approval` *(daemon config-loading contract)*
-- **Files:** `zfsbackup/store/db.py`, `zfsbackup/daemon.py`, `zfsbackup/cli/main.py`
+- **Files:** `zfsbackup/config/store/db.py`, `zfsbackup/daemon.py`, `zfsbackup/cli/main.py`
 - **Basis:** `daemon.py:123-128` defaults `-c` to `/etc/zfsbackup/config.yaml`;
   `config.example.yaml:17-18` documents `/var/lib/zfsbackup/` as the daemon state directory.
 - **Default DB path: `/var/lib/zfsbackup/config.db`** (per user decision).
@@ -750,7 +750,7 @@ Consequences:
      source** — see item 8; the error message must say so and point at `zfsbackup-config import`.
 - **Creation policy — daemon errors, CLI creates only on explicit import.**
   - The **daemon must never auto-create** a config DB. An empty config means "back up nothing", silently.
-    `config.py:204-205` already errors on no datasets; preserve that posture.
+    `config/model.py:204-205` already errors on no datasets; preserve that posture.
   - The **CLI creates** only via `zfsbackup-config import` (item 8), making directory and file creation an
     explicit, intentional act. All other CLI commands error with a message naming the default path and
     suggesting `import`.
@@ -801,7 +801,7 @@ Consequences:
 ### Item 7 — Alembic scaffolding + initial revision
 
 - **Owner:** `zfsbackup-store-developer` · **Tag:** `low-risk`
-- **Files:** new `zfsbackup/store/migrations/` (env.py, versions/), `alembic.ini`
+- **Files:** new `zfsbackup/config/store/migrations/` (env.py, versions/), `alembic.ini`
 - **Basis:** judgment call per the migrations recommendation above; new infrastructure, no existing code.
 - **Changes (as landed — this section's original text was superseded during implementation):**
   - **`ensure_schema(connection)`, not `ensure_schema(url)`.** It takes an open `Connection` and never
@@ -835,8 +835,8 @@ Consequences:
 ### Item 8 — DB as canonical config source; YAML demoted to import + edit buffer
 
 - **Owner:** **split** — `zfsbackup-store-developer` (store half) → `zfsbackup-developer` (daemon wiring, leads) *(+ `concurrency-reviewer`)* · **Tag:** `needs-approval` *(daemon config-loading contract + IPC payload)*
-- **Files:** `zfsbackup/config.py`, `zfsbackup/daemon.py`, `zfsbackup/workers.py`, new
-  `zfsbackup/store/importer.py`
+- **Files:** `zfsbackup/config/model.py`, `zfsbackup/daemon.py`, `zfsbackup/workers.py`, new
+  `zfsbackup/config/store/importer.py`
 - **Basis:** `daemon.py:153`, `daemon.py:54`, `workers.py:62`, `workers.py:196`.
 
 - **Policy — the DB is canonical; YAML is not a runtime config source** *(user decision — this reverses an
@@ -977,7 +977,7 @@ Consequences:
   - **Sub-second** — `Duration(microseconds=1)` constructs with `.literal is None`, and `.render()` raises
     `ValueError` rather than truncating.
 
-  - The `from_property` path (`config.py:110-132`) rebuilds from raw seconds and now yields a synthesized
+  - The `from_property` path (`config/model.py:110-132`) rebuilds from raw seconds and now yields a synthesized
     literal rather than `None` — assert it renders (e.g. 2592000s → `"1M"`) instead of failing.
   - Fork safety: parent opens DB, forks, child reads independently; assert no corruption.
   - Concurrent write-while-read under WAL.
@@ -1110,7 +1110,7 @@ Consequences:
 - **Basis:** requested feature; columns mirror the existing report at `backup_manager.py:88-100` (name,
   enabled, frequency, recursive, retention-rule count) so CLI and daemon log agree.
 - **Changes:** human-readable table by default; `--json` for scripting; `--enabled-only` matching
-  `BackupConfig.enabled_datasets` (`config.py:254-256`). Remotes list shows destination name, URL, and
+  `BackupConfig.enabled_datasets` (`config/model.py:254-256`). Remotes list shows destination name, URL, and
   which datasets reference it.
 - **Verification:** `pytest tests/test_zfsbackup_cli.py -k list`
 
@@ -1132,7 +1132,7 @@ Consequences:
   dataset. Consequences, all of which `rename` must handle explicitly:
   1. The old ZFS dataset retains a stale `org.zfsbackup:config` user property, written by
      `sync_all_config_properties()` (`daemon.py:100`) and read back by `DatasetConfig.from_property()`
-     (`config.py:110`). It will not be cleaned up by anything.
+     (`config/model.py:110`). It will not be cleaned up by anything.
   2. The old dataset retains stale `org.zfsbackup:anchor.<destination>` properties, read at
      `workers.py:162` via `manager.get_anchor()`. These are what keep the last-transferred snapshot
      exempt from pruning.
@@ -1144,7 +1144,7 @@ Consequences:
      server.
 - **Therefore `rename` must:**
   - Always print a warning naming the stale properties left on the old dataset.
-  - **Require `--force` when the dataset has any configured remote destinations** (`config.py:86`),
+  - **Require `--force` when the dataset has any configured remote destinations** (`config/model.py:86`),
     because of consequence (3). The warning must state explicitly that the next backup will be a full
     send and that the old server-side copy will be orphaned.
   - Offer `--clear-stale-props` to remove `org.zfsbackup:config` and `org.zfsbackup:anchor.*` from the
@@ -1160,7 +1160,7 @@ Consequences:
 ### Item 15 — Generation counter and concurrent-write detection
 
 - **Owner:** **split** — `zfsbackup-store-developer` (generation column) → `zfsbackup-cli-developer` (check on write) · **Tag:** `needs-approval` *(config write path)*
-- **Files:** `zfsbackup/cli/main.py`, `zfsbackup/store/db.py`
+- **Files:** `zfsbackup/cli/main.py`, `zfsbackup/config/store/db.py`
 - **Basis:** `workers.py:62` and `workers.py:196` load config once, before the loop at `workers.py:73`;
   nothing re-reads it. Retained from the original plan — the counter is still required for
   concurrent-CLI-write detection independently of Phase 3.
@@ -1369,7 +1369,7 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 - **Files:** `zfsbackup/README.md`, `CLAUDE.md`, `zfsbackup/config.example.yaml`
 - **Basis + stale-doc flag:** `CLAUDE.md` documents `zfsbackup/test_basic.py`, which **does not exist**;
   all zfsbackup tests live in `tests/test_zfsbackup_*.py`. Correct it.
-- **Changes:** document `zfsbackup/store/`, the CLI, YAML-or-SQLite config sources, the item-6 path
+- **Changes:** document `zfsbackup/config/store/`, the CLI, YAML-or-SQLite config sources, the item-6 path
   resolution order and the WAL write-permission trap, and the SIGHUP reload contract. Add a header comment
   to `config.example.yaml` noting it can be imported with `zfsbackup-config import`.
   **Do not otherwise alter `config.example.yaml` or `config.test.yaml`** — they are user-visible reference
@@ -1397,7 +1397,7 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 - **Scope:** full diff, with specific attention to: the fork/engine lifecycle (item 5); `Duration`'s
   reflected comparison and truthiness against every consumer in the item-2 table; transactional guarantees
   in items 11/12/14; the cooperative-cycling guarantee that no worker is killed mid-stream (item 18); and
-  whether `DatasetConfig.to_property()` (`config.py:88-107`) output is genuinely byte-unchanged.
+  whether `DatasetConfig.to_property()` (`config/model.py:88-107`) output is genuinely byte-unchanged.
 
 ---
 
@@ -1406,14 +1406,14 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 | Risk | Where | Mitigation |
 |---|---|---|
 | **Pre-fork engine inherited by workers** — SQLite fd sharing corrupts the DB, not just errors | `daemon.py:62-68`, `store/db.py` | pid-keyed engine cache (item 5); supervisor disposes engine before `_start_workers()`; explicit fork test (item 9) |
-| **A duration library silently mis-parses `1M` as 1 minute** — retention collapses, snapshots pruned immediately | `config.py:12-45` | **Verified failure in `pytimeparse` and `humanfriendly`.** No library added; hand-rolled parse/render reusing the existing tested parser (item 2) |
-| **Duplicate retention `keep_for` silently drops a tier** — pre-existing. `{"1h":"7d","1d":"1w"}` collapses to one tier, and the tie-break systematically keeps the **coarser** interval, pruning harder than configured | `backup_manager.py:216-219`, tie-break via `config.py:155` | Reject on write (CLI, import, `UNIQUE(dataset_id, keep_for_seconds)`); `min` + `WARNING` on read so a collision can never be silent (item 2b) |
+| **A duration library silently mis-parses `1M` as 1 minute** — retention collapses, snapshots pruned immediately | `config/model.py:12-45` | **Verified failure in `pytimeparse` and `humanfriendly`.** No library added; hand-rolled parse/render reusing the existing tested parser (item 2) |
+| **Duplicate retention `keep_for` silently drops a tier** — pre-existing. `{"1h":"7d","1d":"1w"}` collapses to one tier, and the tie-break systematically keeps the **coarser** interval, pruning harder than configured | `backup_manager.py:216-219`, tie-break via `config/model.py:155` | Reject on write (CLI, import, `UNIQUE(dataset_id, keep_for_seconds)`); `min` + `WARNING` on read so a collision can never be silent (item 2b) |
 | **`Duration` wrapper breaks reflected comparison** — `age >= dsi.frequency` silently misbehaves | `backup_manager.py:205-206` | Subclass `timedelta` rather than wrap (item 2); explicit reflected-comparison test (item 9) |
 | **`Duration` breaks `or`-truthiness** — a zero duration stops being falsy, changing inherited-frequency logic | `workers.py:146-150,161` | Inherited `__bool__` via subclassing; explicit zero-duration test (item 9) |
 | **Literal rewritten across pickle/deepcopy** — a missing `__reduce__` no longer raises (native-kwargs support) and no longer yields `None` (synthesis); it **silently substitutes the canonical literal**, so `30d`→`1M` and `12h6d`→`6d12h` while canonical values look correct | `daemon.py:34`, test comparisons | `__reduce__` on the subclass (item 2); item-9 assertion **must use a non-canonical literal** — testing `1M` passes even with the bug present |
-| **Wire-format breakage** — `to_property()` is sent to remote servers | `config.py:88-107`, `remote.py:108` | Base64-JSON format frozen; byte-equality assertion (item 9) |
-| **Duration round-trip corrupts retention** — `1M` → `30d` rewrites a user's policy | `config.py:12-45` vs. item 12 | Literal preservation (item 2), 9-row table (item 9), real-file diff (item 22) |
-| **Untyped YAML scalars reaching `Duration` directly** — `check_interval: 300` (meaning seconds) dispatches to native kwargs and silently becomes **300 days**, where the old parser raised. Found in the Phase 0 review | `config.py` load sites | Type guard at the config-loading boundary rejecting non-`str` with the offending key named; `Duration`'s constructor left unchanged. Regression test required |
+| **Wire-format breakage** — `to_property()` is sent to remote servers | `config/model.py:88-107`, `remote.py:108` | Base64-JSON format frozen; byte-equality assertion (item 9) |
+| **Duration round-trip corrupts retention** — `1M` → `30d` rewrites a user's policy | `config/model.py:12-45` vs. item 12 | Literal preservation (item 2), 9-row table (item 9), real-file diff (item 22) |
+| **Untyped YAML scalars reaching `Duration` directly** — `check_interval: 300` (meaning seconds) dispatches to native kwargs and silently becomes **300 days**, where the old parser raised. Found in the Phase 0 review | `config/model.py` load sites | Type guard at the config-loading boundary rejecting non-`str` with the offending key named; `Duration`'s constructor left unchanged. Regression test required |
 | **Dot-path ambiguity with dotted ZFS names** — silent wrong-target writes | Item 11 | Schema-directed greedy matching + bracket syntax + hard error on ambiguity |
 | **Half-updated DB on bad edit** | Items 11, 12, 14 | Validate fully in memory *before* opening a write transaction; single `session.begin()`; DB-hash-unchanged assertions |
 | **Rename orphans server-side backups and forces a full send** | `api.py:34-38`, `workers.py:162`, `daemon.py:100` | `rename` warns loudly, requires `--force` when remotes are configured, offers opt-in `--clear-stale-props` (item 14) |
@@ -1471,12 +1471,12 @@ be reviewed while this is still in design, and a problem here cannot destabilise
 | Deferred | Reason |
 |---|---|
 | **DB-backed write endpoints in the HTTP API** | `api.py` has no auth or TLS (`docs/production_readiness_report.md`). Exposing config *mutation* over an unauthenticated API would be a security regression. Blocked on remote-security work |
-| **Encrypting destination credentials in the DB** | `Destination` is URL-only today (`config.py:58-61`); no secrets exist to protect yet. Revisit when auth lands |
+| **Encrypting destination credentials in the DB** | `Destination` is URL-only today (`config/model.py:58-61`); no secrets exist to protect yet. Revisit when auth lands |
 | **Replacing the base64 user-property format** with a DB-derived one | Would break client/server compatibility (`remote.py:108`). Out of scope |
 | **Multi-host / shared config DB** | SQLite over NFS is unsafe. If needed, that is a Postgres conversation — and the item-4 mapper layer is exactly what makes that migration possible later |
 | **Running the daemon as a non-root user** | `zfs allow` delegation is not set up in the target environment, and on Linux `mount` stays privileged even when delegated — so `destroy` on a mounted dataset and `receive` both need a mitigation (`receive -u`, `canmount=noauto`, or `CAP_SYS_ADMIN`). Phase 1 ships the `zfsbackup:zfsbackup` file layout so nothing needs redoing; the daemon stays root until this workstream lands (item 6) |
 | **Auto-cleanup of orphaned server-side datasets after a rename** | Requires deleting data on a remote machine based on a local config edit. Too dangerous to automate; item 14 prints the path instead |
-| ~~**Fixing the odd leading-`m` branch** at `config.py:17-23`~~ — **no longer deferred** | Compound-literal support (item 2) rewrites the parser, and this branch is **dead code**: it computes a `unit` that `int(duration_str[:-1])` then always discards by raising. Verified — `m5`, `M5`, `mi5`, `mi` all raise. It is deleted as a side effect; both covering tests assert only `ValueError` and keep passing |
+| ~~**Fixing the odd leading-`m` branch** at `config/model.py:17-23`~~ — **no longer deferred** | Compound-literal support (item 2) rewrites the parser, and this branch is **dead code**: it computes a `unit` that `int(duration_str[:-1])` then always discards by raising. Verified — `m5`, `M5`, `mi5`, `mi` all raise. It is deleted as a side effect; both covering tests assert only `ValueError` and keep passing |
 | **Making `to_property()` carry duration literals** | Would change the wire format and break compatibility with already-deployed servers. Remote-derived `Duration`s render canonically instead (item 2) |
 
 ---

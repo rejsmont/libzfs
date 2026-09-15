@@ -636,7 +636,7 @@ class TestConfigProducesDurationsWithLiterals:
 class TestBackupConfigDurationDefaults:
     """The BackupConfig-level defaults the reviewer flagged as untested:
     check_interval/prune_interval defaults, and prune_interval falling back
-    to check_interval when only the latter is set (config.py:214/386).
+    to check_interval when only the latter is set (config/model.py:214/386).
 
     Item 3c.3: `prune_interval` (and `client_id_file`) are now
     `Optional[...] = None`, where `None` means "derive at load/read time"

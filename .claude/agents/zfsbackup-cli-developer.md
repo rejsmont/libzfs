@@ -14,13 +14,13 @@ the SQLite config store. Trust the source when any doc disagrees with it.
 `zfsbackup/cli/**` — `__init__.py`, `__main__.py`, `main.py`, `dotpath.py`, `editor.py`, `render.py`.
 You may add a `[tool.poetry.scripts]` entry to `pyproject.toml` for your console script.
 
-You do **not** edit `zfsbackup/store/**` (that is `zfsbackup-store-developer`) or the daemon files
-(`daemon.py`, `workers.py`, `config.py`, `remote.py`, `api.py` — `zfsbackup-developer`). You never
+You do **not** edit `zfsbackup/config/store/**` (that is `zfsbackup-store-developer`) or the daemon files
+(`daemon.py`, `workers.py`, `config/model.py`, `remote.py`, `api.py` — `zfsbackup-developer`). You never
 write tests; `pytest-test-author` does.
 
 ## The boundary that matters
 
-**Reach the database only through `zfsbackup.store.mapper` — `load_config(session)` and
+**Reach the database only through `zfsbackup.config.store.mapper` — `load_config(session)` and
 `save_config(session, config)`.** Never import ORM models, never build a `select()`, never touch a
 relationship. Two reasons: the mapper is what makes a later Postgres migration possible, and every
 schema invariant (partial unique indexes, the composite retention FK, the no-`destination_name`

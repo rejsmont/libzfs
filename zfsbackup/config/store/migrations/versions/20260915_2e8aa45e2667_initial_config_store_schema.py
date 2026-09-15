@@ -1,6 +1,6 @@
 """initial config store schema
 
-`zfsbackup/store/models.py` is the source of truth for this schema --
+`zfsbackup/config/store/models.py` is the source of truth for this schema --
 `Base.metadata` there, not this file, is what to change first. This
 revision is what `alembic revision --autogenerate` produces against an
 empty database when compared to that metadata: it creates all six tables
