@@ -21,7 +21,7 @@ You own the daemon core: `config.py`, `backup_manager.py`, `daemon.py`, `workers
 
 Two sibling developers own the rest of the package, exclusively:
 
-- **`zfsbackup/store/**` and `alembic/**` → `zfsbackup-store-developer`** — the SQLAlchemy models,
+- **`zfsbackup/store/**` and `alembic.ini` → `zfsbackup-store-developer`** — the SQLAlchemy models,
   the ORM⇄dataclass mapper, engine/session/WAL/fork-safety setup, migrations.
 - **`zfsbackup/cli/**` → `zfsbackup-cli-developer`** — the `zfsbackup-config` Click application.
 

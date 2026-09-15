@@ -39,7 +39,7 @@ daemon is a multiprocessing supervisor, not a single-process loop.
 - Worker loop / `stop_event.wait` handling; supervisor restart logic; no blocking calls that ignore
   the stop event. Note the known-not-ready remote path (no auth/TLS, undeclared `requests` dep).
 
-**Config store (`zfsbackup/store/**`, `alembic/**`):**
+**Config store (`zfsbackup/store/**` incl. `store/migrations/`, `alembic.ini`):**
 - Retention rules scoped by the nullable `dataset_remote_id` — **never** by a `destination_name` FK
   back to `Destination`. That shape let a cascade-null promote a per-destination override to
   dataset-level, silently adding a retention tier. Flag any reintroduction.

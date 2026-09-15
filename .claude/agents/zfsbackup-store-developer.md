@@ -12,7 +12,9 @@ Trust the source when any doc disagrees with it.
 ## Your files — exclusive ownership
 
 - `zfsbackup/store/**` — `models.py`, `mapper.py`, `db.py`, `__init__.py`
-- `alembic/**` and `alembic.ini`
+- `zfsbackup/store/migrations/**` (the Alembic environment and revisions) and `alembic.ini` at the
+  repo root. **The migrations live in-package, not in a top-level `alembic/`** — so `script_location`
+  derives from `Path(__file__).parent` and the tree stays installable.
 
 You do **not** edit `daemon.py`, `workers.py`, `config.py`, `remote.py`, `api.py`, or anything under
 `zfsbackup/cli/`. When an item needs a change there, implement your half, then state precisely what

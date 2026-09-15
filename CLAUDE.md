@@ -117,7 +117,7 @@ orchestrates the cycle: subagents cannot call each other, so the main loop drive
 | `zfsbackup-implementation-planner` | opus / high (read-only) | Turns findings into an ordered plan for `zfsbackup/` |
 | `libzfseasy-developer` | sonnet / high | Implements plans in `libzfseasy/types.py`, `zfs.py` |
 | `zfsbackup-developer` | sonnet / high | Daemon core: `config.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py` |
-| `zfsbackup-store-developer` | sonnet / high | `zfsbackup/store/**`, `alembic/**` — ORM models, mapper, engine/session, migrations |
+| `zfsbackup-store-developer` | sonnet / high | `zfsbackup/store/**` (incl. `store/migrations/`), `alembic.ini` — ORM models, mapper, engine/session, migrations |
 | `zfsbackup-cli-developer` | sonnet / high | `zfsbackup/cli/**` — the `zfsbackup-config` Click application |
 | `pytest-test-author` | sonnet / high | Owns **all** pytest tests + `conftest.py` fixtures |
 | `real-zfs-scenario-dev` | sonnet / high | Owns the shell scenarios under `scenarios/` |

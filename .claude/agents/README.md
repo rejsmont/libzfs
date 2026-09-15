@@ -19,7 +19,7 @@ domain knowledge; the cross-agent workflow lives here (and is summarized in
 | `zfsbackup-implementation-planner` | opus / high | read-only | Findings → ordered plan for `zfsbackup/` (incl. `store/`, `cli/`) |
 | `libzfseasy-developer` | sonnet / high | edit | `libzfseasy/types.py`, `zfs.py` |
 | `zfsbackup-developer` | sonnet / high | edit | Daemon core: `config.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py` |
-| `zfsbackup-store-developer` | sonnet / high | edit | `zfsbackup/store/**`, `alembic/**` — models, mapper, engine/session, migrations |
+| `zfsbackup-store-developer` | sonnet / high | edit | `zfsbackup/store/**` (incl. `migrations/`), `alembic.ini` — models, mapper, engine/session, migrations |
 | `zfsbackup-cli-developer` | sonnet / high | edit | `zfsbackup/cli/**` — the `zfsbackup-config` Click application |
 | `pytest-test-author` | sonnet / high | edit | Owns **all** pytest tests + `conftest.py` fixtures (both packages) |
 | `real-zfs-scenario-dev` | sonnet / high | edit | Owns the shell scenarios under `scenarios/` |
@@ -36,7 +36,7 @@ into another's directory to save a handoff.
 |---|---|
 | `libzfseasy/**` | `libzfseasy-developer` |
 | `zfsbackup/{config,backup_manager,daemon,workers,remote,api}.py` | `zfsbackup-developer` |
-| `zfsbackup/store/**`, `alembic/**` | `zfsbackup-store-developer` |
+| `zfsbackup/store/**` (incl. `store/migrations/`), `alembic.ini` | `zfsbackup-store-developer` |
 | `zfsbackup/cli/**` | `zfsbackup-cli-developer` |
 | `tests/**`, `conftest.py` | `pytest-test-author` |
 | `scenarios/**` | `real-zfs-scenario-dev` |

@@ -25,7 +25,12 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, delete, event, inspect
+from alembic import command
+from alembic.autogenerate import compare_metadata
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from sqlalchemy import create_engine, delete, event, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -48,6 +53,12 @@ from zfsbackup.store.mapper import (
     _scoped_rules,
     load_config,
     save_config,
+)
+from zfsbackup.store.migrate import (
+    SchemaSplitBrain,
+    SchemaVersionMismatch,
+    _build_config,
+    ensure_schema,
 )
 from zfsbackup.store.models import (
     Base,
@@ -2178,3 +2189,695 @@ class TestMapperDetachedSafety:
             url="ssh://offsite/pool"
         )
         assert loaded.remote_backup == RemoteServerConfig(target_dataset="tank/received")
+
+
+# ---------------------------------------------------------------------------
+# Migrations (item 7: zfsbackup/store/migrations/, zfsbackup/store/migrate.py)
+# ---------------------------------------------------------------------------
+
+
+def _schema_projection(bind):
+    """Order-insensitive, name-keyed reflection of a SQLite schema's
+    columns, primary key, foreign keys, unique constraints, check
+    constraints, and indexes -- one entry per table, `alembic_version`
+    excluded.
+
+    Deliberately NOT a `sqlite_master.sql` text compare: the item-7 plan
+    measured that `upgrade head` and `Base.metadata.create_all` emit
+    byte-different `CREATE TABLE` SQL for two tables in this schema, purely
+    from constraint-clause *reordering* -- the constraint sets are
+    identical, only their textual order differs. A raw string diff would
+    fail on both DDL paths this suite needs to agree, for no real
+    difference. Reflecting via `Inspector` and sorting every constraint
+    list makes that ordering irrelevant.
+
+    Two reflected values are stringified before comparison, because
+    neither defines a value-based `__eq__`:
+
+    - `get_indexes()`'s `dialect_options['sqlite_where']` is a `TextClause`;
+      two instances wrapping the identical SQL default-`repr()` to
+      different memory addresses, so leaving them as objects produces a
+      spurious failure on a schema that is actually identical -- the exact
+      trap the plan called out.
+    - `get_columns()`'s `'type'` is a `TypeEngine` instance (e.g.
+      `INTEGER()`); SQLAlchemy does not give these an `__eq__` either, so
+      two separately-constructed instances of the same type compare
+      unequal by identity.
+    """
+    insp = inspect(bind)
+    projection = {}
+    for table in sorted(insp.get_table_names()):
+        if table == "alembic_version":
+            continue
+
+        columns = sorted(
+            (col["name"], str(col["type"]), col["nullable"], bool(col["primary_key"]))
+            for col in insp.get_columns(table)
+        )
+
+        pk = insp.get_pk_constraint(table)
+        pk_projection = (
+            pk.get("name"),
+            tuple(sorted(pk.get("constrained_columns") or [])),
+        )
+
+        foreign_keys = sorted(
+            (
+                fk["name"],
+                tuple(fk["constrained_columns"]),
+                fk["referred_table"],
+                tuple(fk["referred_columns"]),
+                (fk.get("options") or {}).get("ondelete"),
+            )
+            for fk in insp.get_foreign_keys(table)
+        )
+
+        unique_constraints = sorted(
+            (uq["name"], tuple(sorted(uq["column_names"])))
+            for uq in insp.get_unique_constraints(table)
+        )
+
+        check_constraints = sorted(
+            (ck["name"], ck["sqltext"]) for ck in insp.get_check_constraints(table)
+        )
+
+        indexes = []
+        for ix in insp.get_indexes(table):
+            where = (ix.get("dialect_options") or {}).get("sqlite_where")
+            indexes.append(
+                (
+                    ix["name"],
+                    tuple(ix["column_names"]),
+                    bool(ix["unique"]),
+                    str(where) if where is not None else None,
+                )
+            )
+        indexes.sort()
+
+        projection[table] = {
+            "columns": columns,
+            "pk": pk_projection,
+            "foreign_keys": foreign_keys,
+            "unique_constraints": unique_constraints,
+            "check_constraints": check_constraints,
+            "indexes": indexes,
+        }
+    return projection
+
+
+def _code_head(engine):
+    """This installed package's Alembic head revision id, resolved via
+    `ScriptDirectory` alone -- reads the migration scripts on disk, never
+    the database, so it does not require (and does not perform) any
+    migration against `engine`. Used by tests that need to assert a
+    `SchemaSplitBrain`/`SchemaVersionMismatch` message names the right
+    revision without disturbing the database state under test to get it.
+    """
+    with engine.connect() as conn:
+        return ScriptDirectory.from_config(_build_config(conn)).get_heads()[0]
+
+
+@pytest.mark.unit
+class TestMigrations:
+    """Coverage for `zfsbackup/store/migrate.py` and
+    `zfsbackup/store/migrations/` (item 7).
+
+    Two DDL paths coexist in this codebase: `Base.metadata.create_all`
+    (every fixture above this class) and `alembic upgrade head`
+    (production, via `ensure_schema`). Assertion 1
+    (`test_upgrade_head_matches_create_all`) is the only thing keeping
+    those two paths honest with each other -- it must never be deleted in
+    favour of assertion 2 alone.
+
+    `Config` objects here are built via `zfsbackup.store.migrate.
+    _build_config` -- the same private helper `ensure_schema` itself calls
+    -- rather than by reading `alembic.ini`, which `ensure_schema` never
+    does. Using anything else (a hand-rolled `Config()`, or one that reads
+    the repo's `alembic.ini`) would test a code path production never
+    takes.
+    """
+
+    # -- assertion 1 / 1b: upgrade head == create_all -----------------
+
+    def test_upgrade_head_matches_create_all(self, tmp_path):
+        head_db = tmp_path / "head.db"
+        create_all_db = tmp_path / "create_all.db"
+
+        head_engine = create_engine(f"sqlite:///{head_db}")
+        with head_engine.connect() as conn:
+            ensure_schema(conn)
+            conn.commit()
+
+        create_all_engine = create_engine(f"sqlite:///{create_all_db}")
+        Base.metadata.create_all(create_all_engine)
+
+        try:
+            assert _schema_projection(head_engine) == _schema_projection(
+                create_all_engine
+            )
+        finally:
+            head_engine.dispose()
+            create_all_engine.dispose()
+
+    def test_upgrade_head_spot_checks(self, tmp_path):
+        """Three targeted checks so a failure names the culprit directly,
+        rather than only reporting "the two dicts differ somewhere" from
+        the previous, broader test.
+        """
+        db_path = tmp_path / "spot_check.db"
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.connect() as conn:
+                ensure_schema(conn)
+                conn.commit()
+
+            projection = _schema_projection(engine)
+
+            partial_index_names = {
+                "uq_retention_rules_dataset_age_null_remote",
+                "uq_retention_rules_dataset_keep_for_null_remote",
+            }
+            found_partial = {
+                name: where
+                for name, _cols, _unique, where in projection["retention_rules"][
+                    "indexes"
+                ]
+                if name in partial_index_names
+            }
+            assert found_partial == {
+                "uq_retention_rules_dataset_age_null_remote": "dataset_remote_id IS NULL",
+                "uq_retention_rules_dataset_keep_for_null_remote": "dataset_remote_id IS NULL",
+            }
+
+            check_constraints = dict(projection["global_settings"]["check_constraints"])
+            assert (
+                check_constraints["ck_global_settings_prune_literal_requires_seconds"]
+                == "prune_interval_seconds IS NOT NULL OR prune_interval_literal IS NULL"
+            )
+
+            composite_fks = [
+                fk
+                for fk in projection["retention_rules"]["foreign_keys"]
+                if fk[0] == "fk_retention_rules_dataset_remote"
+            ]
+            assert composite_fks == [
+                (
+                    "fk_retention_rules_dataset_remote",
+                    ("dataset_id", "dataset_remote_id"),
+                    "dataset_remotes",
+                    ("dataset_id", "id"),
+                    "CASCADE",
+                )
+            ]
+        finally:
+            engine.dispose()
+
+    # -- assertion 2: no-drift guard -----------------------------------
+
+    def test_upgrade_head_has_no_autogenerate_drift(self, tmp_path):
+        """`compare_metadata` reports zero diffs between a migrated DB and
+        `Base.metadata` -- i.e. a fresh `alembic revision --autogenerate`
+        against this DB would produce an empty `upgrade()`.
+
+        Does NOT replace `test_upgrade_head_matches_create_all`:
+        `compare_metadata` does not compare CHECK constraints at all (a
+        `CheckConstraint` dropped from `models.py`'s `__table_args__` but
+        left in the migration would report zero diffs here), which is
+        exactly why the reflected-projection test above is kept alongside
+        this one rather than being replaced by it.
+        """
+        db_path = tmp_path / "no_drift.db"
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.connect() as conn:
+                ensure_schema(conn)
+                conn.commit()
+
+            with engine.connect() as conn:
+                migration_context = MigrationContext.configure(conn)
+                diff = compare_metadata(migration_context, Base.metadata)
+            assert diff == []
+        finally:
+            engine.dispose()
+
+    # -- assertion 3 & 4: downgrade base, and the upgrade/downgrade/upgrade round trip --
+
+    def test_downgrade_base_leaves_only_alembic_version(self, tmp_path):
+        db_path = tmp_path / "downgrade.db"
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.connect() as conn:
+                ensure_schema(conn)
+                conn.commit()
+
+            with engine.connect() as conn:
+                command.downgrade(_build_config(conn), "base")
+                conn.commit()
+
+            insp = inspect(engine)
+            assert insp.get_table_names() == ["alembic_version"]
+        finally:
+            engine.dispose()
+
+    def test_upgrade_downgrade_upgrade_round_trip_reproduces_schema(self, tmp_path):
+        """Exercises the generated `downgrade()` body for real: nothing
+        else in this suite ever runs it. `upgrade head` -> `downgrade
+        base` -> `upgrade head` must reproduce the same reflected
+        projection as a single `upgrade head` (assertion 1's projection).
+        """
+        db_path = tmp_path / "round_trip.db"
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.connect() as conn:
+                ensure_schema(conn)
+                conn.commit()
+            first_projection = _schema_projection(engine)
+
+            with engine.connect() as conn:
+                command.downgrade(_build_config(conn), "base")
+                conn.commit()
+            insp = inspect(engine)
+            assert insp.get_table_names() == ["alembic_version"]
+
+            with engine.connect() as conn:
+                ensure_schema(conn)
+                conn.commit()
+            second_projection = _schema_projection(engine)
+
+            assert second_projection == first_projection
+        finally:
+            engine.dispose()
+
+    # -- assertions 5-7: in-memory, exercised through ensure_schema() ----
+    #
+    # These three physically cannot pass unless `env.py`'s
+    # `run_migrations_online()` honours `config.attributes["connection"]`
+    # ahead of building its own engine from a URL (env.py's module
+    # docstring, point 1) -- an in-memory `:memory:` database is not
+    # reachable by URL at all from a second connection without it. They
+    # therefore double as the acceptance test for that requirement.
+
+    @pytest.fixture
+    def empty_memory_engine(self):
+        """A fresh, empty (no `create_all`) in-memory SQLite engine.
+
+        `StaticPool` + `check_same_thread=False` for the same reason the
+        module-level `engine` fixture above uses it: without it, a second
+        connection drawn from the pool sees an empty, distinct
+        `:memory:` database rather than the one the first connection
+        already migrated.
+        """
+        eng = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        yield eng
+        eng.dispose()
+
+    def test_ensure_schema_raises_on_unrecognised_revision(self, empty_memory_engine):
+        with empty_memory_engine.connect() as conn:
+            code_head = ensure_schema(conn)
+            conn.commit()
+
+        with empty_memory_engine.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num='deadbeefcafe'")
+            )
+
+        with empty_memory_engine.connect() as conn:
+            with pytest.raises(SchemaVersionMismatch) as excinfo:
+                ensure_schema(conn)
+
+        message = str(excinfo.value)
+        assert "deadbeefcafe" in message
+        assert code_head in message
+        # `SchemaVersionMismatch` wraps the underlying Alembic error via
+        # `raise ... from`, so the original CommandError is still reachable.
+        assert excinfo.value.__cause__ is not None
+        assert "deadbeefcafe" in str(excinfo.value.__cause__)
+
+    def test_ensure_schema_is_idempotent(self, empty_memory_engine):
+        with empty_memory_engine.connect() as conn:
+            first_head = ensure_schema(conn)
+            conn.commit()
+
+        with empty_memory_engine.connect() as conn:
+            second_head = ensure_schema(conn)
+            conn.commit()
+
+        assert second_head == first_head
+
+        with empty_memory_engine.connect() as conn:
+            assert not conn.closed
+            third_head = ensure_schema(conn)
+            assert third_head == first_head
+            assert not conn.closed
+
+    def test_ensure_schema_never_commits_the_callers_pending_work(
+        self, empty_memory_engine
+    ):
+        """Pins the actual "never commits ... the caller owns the
+        transaction" contract from `ensure_schema`'s docstring, via real
+        database state rather than a mock.
+
+        This replaces an earlier version of this test that spied on
+        `Connection.commit` (`patch.object(type(conn), "commit")`) and was
+        close to vacuous for two reasons a review caught: (1) that spy only
+        sees `Connection.commit()` itself -- Alembic's own
+        `begin_transaction()` path can reach `Connection._commit_impl()`
+        through a `_ProxyTransaction`/`RootTransaction` object without ever
+        calling `Connection.commit()`, so a mutant that committed the
+        caller's work through a transaction object would still have passed
+        the spy; and (2) the spy was only exercised on a third call against
+        an already-current DB, where `command.upgrade` runs no migrations
+        at all -- nothing was ever going to commit there, in any
+        implementation, mutated or not. Verified directly: adding an
+        explicit `connection.commit()` to the end of `ensure_schema` is
+        caught by this test (the caller's row survives the rollback below)
+        but was not caught by the old spy-based version on its own second
+        call (the spy's call site).
+
+        Scoped to `ensure_schema`'s *second*, idempotent (already-at-head)
+        call rather than its first (schema-creating) call: on a fresh,
+        schema-less database, how a caller's already-open transaction
+        interacts with the first call's DDL/DML is a separate, real hazard
+        the store team is addressing independently (a corrected `migrate.py`
+        docstring and a named error for the resulting split-brain state),
+        and is expected to change out from under this file -- this test
+        should not pin exact pre-fix mechanics there. The already-at-head
+        no-op path is stable regardless of how that fix lands: a database
+        already at head runs no DDL at all on a second `ensure_schema`
+        call, so "does this disturb a caller's already-pending write" has
+        one well-defined answer independent of that other, unrelated fix.
+        """
+        with empty_memory_engine.connect() as conn:
+            ensure_schema(conn)
+            conn.commit()
+
+        with empty_memory_engine.connect() as conn:
+            # Caller-side write: a real domain row, not a scratch table --
+            # possible here only because the schema above is already
+            # committed. Left uncommitted deliberately.
+            conn.execute(
+                text(
+                    "INSERT INTO global_settings "
+                    "(id, snapshot_prefix, check_interval_seconds, "
+                    "api_host, api_port, dry_run, generation) "
+                    "VALUES (1, 'autosnap', 3600.0, '127.0.0.1', 8080, 0, 0)"
+                )
+            )
+            assert (
+                conn.execute(text("SELECT COUNT(*) FROM global_settings")).scalar()
+                == 1
+            )
+
+            ensure_schema(conn)  # idempotent no-op: already at head
+
+            # Still uncommitted after ensure_schema returns: it must not
+            # have committed the caller's pending write on its behalf.
+            assert not conn.closed
+            assert (
+                conn.execute(text("SELECT COUNT(*) FROM global_settings")).scalar()
+                == 1
+            )
+
+            conn.rollback()
+
+            # The caller's own uncommitted write is gone...
+            assert (
+                conn.execute(text("SELECT COUNT(*) FROM global_settings")).scalar()
+                == 0
+            )
+            # ...but the schema itself -- already committed before this
+            # block began -- is untouched by rolling back a transaction
+            # that only ever contained the caller's own pending INSERT.
+            insp = inspect(empty_memory_engine)
+            assert "global_settings" in insp.get_table_names()
+
+    @pytest.fixture
+    def mapper_logger_state(self):
+        """Snapshot and restore `zfsbackup.store.mapper`'s `level` and
+        `disabled` attributes around a test.
+
+        Both are mutable global `logging` state, not per-test state --
+        several tests below run a real `logging.config.fileConfig()` (via
+        Alembic, positive and negative) against this exact logger, and
+        several *other* tests elsewhere in this file assert against it via
+        `caplog`. An earlier version of these tests restored `disabled` in
+        one case and nothing at all in another, leaking mutated state into
+        the rest of the pytest session regardless of which test ran first.
+        """
+        logger = logging.getLogger("zfsbackup.store.mapper")
+        original_level = logger.level
+        original_disabled = logger.disabled
+        yield logger
+        logger.level = original_level
+        logger.disabled = original_disabled
+
+    def test_ensure_schema_does_not_disable_application_logging(
+        self, empty_memory_engine, mapper_logger_state
+    ):
+        """Guards against the stock `alembic init` template's
+        `logging.config.fileConfig()` default of `disable_existing_loggers=
+        True`. Measured directly on this repo's own `zfsbackup.store.
+        mapper` logger, which several other tests in this file rely on via
+        `caplog`.
+        """
+        mapper_logger_state.disabled = False
+        mapper_logger_state.setLevel(logging.DEBUG)
+
+        with empty_memory_engine.connect() as conn:
+            ensure_schema(conn)
+            conn.commit()
+
+        assert mapper_logger_state.disabled is False
+        assert mapper_logger_state.isEnabledFor(logging.WARNING) is True
+
+    def test_configure_logger_guard_reachable_via_real_ini(
+        self, empty_memory_engine, mapper_logger_state
+    ):
+        """`_build_config` (the helper `ensure_schema` itself uses) never
+        sets `config_file_name` -- `Config()` is built with no `file_`
+        argument -- so `env.py`'s `config.config_file_name is not None and
+        ...` guard is *never reached* from `ensure_schema`'s own call path;
+        the two `ensure_schema`-level tests in this class pass regardless
+        of whether the trailing `config.attributes.get("configure_logger",
+        True)` half of that `and` is present at all, because the leading
+        `config_file_name is not None` half is already `False` for them.
+
+        The `configure_logger` half only has an observable effect for a
+        caller that *does* supply a config file -- the repo's own
+        `alembic.ini`, exactly as a bare `alembic` CLI invocation would --
+        which is what this test builds directly, matching env.py's own
+        module docstring (point 2) and 7.1(d)'s stated requirement.
+
+        Both halves of the contract are pinned here, not just the
+        opt-out's happy path: `configure_logger=False` must protect the
+        logger (first block), AND omitting it entirely -- the bare
+        `alembic` CLI's own default -- must actually reproduce the hazard
+        the guard exists for (second block). Without the second half, this
+        test is a tautology about a flag nothing currently sets: it would
+        pass identically whether `fileConfig` does anything at all when
+        `configure_logger` is left unset, and would not have told anyone
+        the guard's *absence* is actually harmful. This repo's own
+        `alembic.ini` `[loggers]` section declares only `root, sqlalchemy,
+        alembic`, so `fileConfig`'s default `disable_existing_loggers=True`
+        disables every other already-configured logger, including this
+        one, when nothing opts out.
+        """
+        mapper_logger_state.disabled = False
+        mapper_logger_state.setLevel(logging.DEBUG)
+
+        ini_path = Path(__file__).resolve().parent.parent / "alembic.ini"
+        assert ini_path.is_file()
+        # Note: building a `Config` from this real ini and running it
+        # through `command.upgrade` causes `ScriptDirectory.from_config` to
+        # honour `alembic.ini`'s `prepend_sys_path = .`, which permanently
+        # prepends `'.'` to `sys.path` for the rest of the interpreter --
+        # an unreverted global mutation, same class of leak as the logger
+        # state this fixture restores. Harmless today (pytest's CWD is the
+        # repo root, already importable), so not worth guarding here, but
+        # worth flagging rather than leaving implicit.
+
+        # Opt-out present: the logger must survive.
+        with empty_memory_engine.connect() as conn:
+            cfg = Config(str(ini_path))
+            cfg.attributes["connection"] = conn
+            cfg.attributes["configure_logger"] = False
+            command.upgrade(cfg, "head")
+            conn.commit()
+
+        assert mapper_logger_state.disabled is False
+        assert mapper_logger_state.isEnabledFor(logging.WARNING) is True
+
+        # Opt-out absent (the bare `alembic` CLI's own default): the same
+        # ini-driven run must actually reproduce the hazard `env.py`'s
+        # `configure_logger` guard exists to prevent -- otherwise the
+        # block above is not proving the guard does anything.
+        mapper_logger_state.disabled = False
+        mapper_logger_state.setLevel(logging.DEBUG)
+
+        with empty_memory_engine.connect() as conn:
+            cfg = Config(str(ini_path))
+            cfg.attributes["connection"] = conn
+            # No `configure_logger` attribute set at all.
+            command.upgrade(cfg, "head")  # already at head: DDL-free no-op
+            conn.commit()
+
+        assert mapper_logger_state.disabled is True
+
+    # -- SchemaSplitBrain -------------------------------------------------
+
+    def test_ensure_schema_raises_schema_split_brain_via_create_all(
+        self, empty_memory_engine
+    ):
+        """Primary reproduction of the split-brain guard: build all six
+        application tables directly via `Base.metadata.create_all`,
+        bypassing Alembic entirely, so `alembic_version` never exists at
+        all. Preferred over a transaction-mechanics-dependent repro (see
+        the two tests below) because it does not depend on any pysqlite/
+        SQLAlchemy/Alembic transaction-boundary behaviour -- just the
+        `_has_existing_schema` table-name check `ensure_schema` runs
+        before attempting `command.upgrade`.
+
+        `ensure_schema` must detect this and raise `SchemaSplitBrain`
+        naming the code's head revision, rather than attempting
+        `command.upgrade` and failing with a bare, unrecoverable
+        `OperationalError: table ... already exists` on every retry.
+        """
+        Base.metadata.create_all(empty_memory_engine)
+        code_head = _code_head(empty_memory_engine)
+
+        with empty_memory_engine.connect() as conn:
+            with pytest.raises(SchemaSplitBrain) as excinfo:
+                ensure_schema(conn)
+
+        assert code_head in str(excinfo.value)
+
+    def test_ensure_schema_raises_schema_split_brain_via_rollback(
+        self, empty_memory_engine
+    ):
+        """A second, more "realistic" way to reach the same split-brain
+        state as the test above -- not by bypassing Alembic, but by
+        hitting the documented transaction hazard directly (see
+        `test_ensure_schema_first_call_on_clean_connection_leaves_split_
+        brain_on_rollback` below, which this setup is shared with): a
+        clean-connection `ensure_schema` call followed by a rollback
+        leaves the six application tables committed but `alembic_version`
+        empty. A second `ensure_schema` call against that same database
+        must then raise `SchemaSplitBrain`, naming the code's head
+        revision, rather than attempting `command.upgrade` again.
+        """
+        code_head = _code_head(empty_memory_engine)
+
+        with empty_memory_engine.connect() as conn:
+            ensure_schema(conn)
+            conn.rollback()
+
+        with empty_memory_engine.connect() as conn:
+            with pytest.raises(SchemaSplitBrain) as excinfo:
+                ensure_schema(conn)
+
+        assert code_head in str(excinfo.value)
+
+    # -- the transaction-boundary hazard (migrate.py's module docstring) --
+    #
+    # These two characterize documented, verified pysqlite/SQLAlchemy/
+    # Alembic mechanics -- not a decision this package's own code makes.
+    # They are pinned so that a future SQLAlchemy or Alembic upgrade that
+    # silently changes this transaction behaviour fails loudly here first,
+    # reading as "the platform changed" rather than "our code broke".
+    # Neither asserts `conn.in_transaction()` as the thing under test --
+    # each asserts observable database state after a rollback, the same
+    # pattern `test_ensure_schema_never_commits_the_callers_pending_work`
+    # already established.
+
+    def test_ensure_schema_first_call_inside_callers_open_transaction_loses_everything_on_rollback(
+        self, empty_memory_engine
+    ):
+        """Mechanism 1: when a caller already has an open transaction (any
+        prior DML on the same connection) at the time `ensure_schema`
+        performs the *first*, schema-creating migration, Alembic's DDL
+        runs inside that ambient transaction rather than opening its own.
+        A rollback triggered by something with nothing to do with the
+        migration itself (a bad YAML file, an `IntegrityError` from
+        `save_config`, an operator `^C`) then discards not just the
+        caller's own pending write but the entire migration: all six
+        application tables AND `alembic_version` are gone. Measured: only
+        the caller's own scratch table survives (its `CREATE TABLE` ran --
+        and autocommitted -- before any transaction was open at all).
+
+        This is exactly the scenario `migrate.py`'s module docstring
+        warns callers away from: never call `ensure_schema` on a
+        connection that already has pending work on it.
+        """
+        with empty_memory_engine.connect() as conn:
+            conn.execute(text("CREATE TABLE caller_marker (id INTEGER)"))
+            conn.execute(text("INSERT INTO caller_marker (id) VALUES (1)"))
+            ensure_schema(conn)
+            conn.rollback()
+
+        insp = inspect(empty_memory_engine)
+        assert set(insp.get_table_names()) == {"caller_marker"}
+
+    def test_ensure_schema_first_call_on_clean_connection_leaves_split_brain_on_rollback(
+        self, empty_memory_engine
+    ):
+        """Mechanism 2: the one item 8's importer will actually hit, since
+        it calls `ensure_schema` on a freshly opened connection with no
+        prior work. The six `CREATE TABLE` statements autocommit
+        individually (no ambient transaction is open yet), but the final
+        `INSERT INTO alembic_version` does open one -- the same open
+        transaction `test_ensure_schema_never_commits_the_callers_pending_
+        work` already pins as still open when `ensure_schema` returns. A
+        rollback -- or simply never calling `commit()` at all, which is
+        what an operator's `^C` between `ensure_schema` and the caller's
+        own commit produces -- discards only that one `INSERT`, leaving
+        exactly the split-brain state `SchemaSplitBrain` exists to detect
+        on any subsequent call: full schema, empty `alembic_version`.
+        """
+        with empty_memory_engine.connect() as conn:
+            ensure_schema(conn)
+            conn.rollback()
+
+        insp = inspect(empty_memory_engine)
+        expected_tables = {
+            "datasets",
+            "destinations",
+            "global_settings",
+            "remote_server",
+            "dataset_remotes",
+            "retention_rules",
+            "alembic_version",
+        }
+        assert expected_tables <= set(insp.get_table_names())
+
+        with empty_memory_engine.connect() as conn:
+            row_count = conn.execute(
+                text("SELECT COUNT(*) FROM alembic_version")
+            ).scalar()
+        assert row_count == 0
+
+    # -- happy path: commit immediately, as the docstring now instructs --
+
+    def test_committing_immediately_after_ensure_schema_stamps_alembic_version_at_head(
+        self, empty_memory_engine
+    ):
+        """The one thing `migrate.py`'s docstring now tells every caller
+        to actually do -- call `ensure_schema`, then `commit()`
+        immediately, before anything else touches the connection. Nothing
+        else in this class pins that doing so produces a correctly
+        stamped `alembic_version` row (as opposed to merely "did not
+        raise") -- this is that pin.
+        """
+        with empty_memory_engine.connect() as conn:
+            code_head = ensure_schema(conn)
+            conn.commit()
+
+        with empty_memory_engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).fetchall()
+
+        assert rows == [(code_head,)]

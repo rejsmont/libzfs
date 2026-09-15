@@ -30,7 +30,7 @@ When producing a plan:
   one executor that owns its files:
   - `zfsbackup-developer` → daemon core: `config.py`, `backup_manager.py`, `daemon.py`,
     `workers.py`, `remote.py`, `api.py`
-  - `zfsbackup-store-developer` → `zfsbackup/store/**`, `alembic/**` (models, mapper, engine/session,
+  - `zfsbackup-store-developer` → `zfsbackup/store/**` incl. `store/migrations/`, `alembic.ini` (models, mapper, engine/session,
     migrations)
   - `zfsbackup-cli-developer` → `zfsbackup/cli/**` (the `zfsbackup-config` Click application)
   - `pytest-test-author` → tests + conftest
@@ -48,7 +48,7 @@ When producing a plan:
   retention/timeslot logic (`needs_prunning`/`prune_snapshots`, anchor handling, period alignment),
   multiprocessing/IPC/signal changes (`workers.py`, the supervisor), remote-transfer/API/security
   code (`remote.py`, `api.py`), any config round-trip or user-property format change, schema
-  migrations and the config load/write contract (`store/mapper.py`, `store/db.py`, `alembic/`), any
+  migrations and the config load/write contract (`store/mapper.py`, `store/db.py`, `store/migrations/`), any
   CLI path that writes config, and anything you are genuinely uncertain about. Everything else is `low-risk`. This tier drives loop-mode
   auto-approval (see the closing section).
 
