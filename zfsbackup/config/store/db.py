@@ -106,11 +106,15 @@ config DB:
 
 - A WAL database needs **write permission on the containing directory**
   whenever the `-shm` has to be (re)created -- the first-reader-after-writer-
-  exit and post-crash cases. Measured: `-wal` + `-shm` present with
-  read-only files in a read-only directory opens fine even `mode=ro`; `-wal`
-  present with `-shm` missing in a read-only directory fails with
-  `OperationalError: unable to open database file`, with or without
-  `mode=ro`.
+  exit and post-crash cases. Measured: `-wal` + `-shm` both present, with
+  read-only files in a read-only directory, opens fine even `mode=ro`;
+  already-WAL with `-shm` missing (checkpointed away by a prior clean close)
+  in a read-only directory fails -- with `OperationalError: attempt to
+  write a readonly database`, **not** the `unable to open database file`
+  this docstring previously claimed. Never diagnose this case by matching
+  SQLite's message text: item 6's preflight (`config/store/paths.py`)
+  works from `stat` and the file header instead, precisely because this
+  message is not the stable, self-explanatory one it looks like.
 - Any copy or backup of the DB must take **all three** files, or use
   `VACUUM INTO`. Copying `config.db` alone while a `-wal` is pending
   silently loses the most recent commits.
@@ -254,9 +258,43 @@ def url_for_path(path: Union[str, Path]) -> str:
     so `sqlite:///config.db` and `sqlite:////abs/config.db` for one and the
     same file are two entries with two pools -- two writers racing each
     other on one database, which is the one thing the store's single-writer
-    design rules out. `resolve()` here is what makes the key canonical.
+    design rules out. `resolve()` here is what makes the key canonical, and
+    it must keep working on a path that does not exist yet (`Path.resolve()`
+    is non-strict) -- both the default-path error message (item 6) and
+    item 10's `import` on a brand-new file depend on that.
+
+    **Round-tripped through `make_url` and checked**, because a `?` in the
+    path is silently swallowed rather than rejected: SQLAlchemy's URL
+    grammar splits the string there and treats everything after it as query
+    parameters, so `url_for_path("/tmp/a?b.db")` used to build a URL whose
+    `.database` was `/tmp/a` -- a different, and possibly pre-existing,
+    file. Measured:
+
+        make_url("sqlite:////tmp/a?b.db").database == "/tmp/a"
+
+    `#` and spaces round-trip correctly and are accepted. This module
+    deliberately does **not** percent-encode a `?` to make it round-trip
+    instead of rejecting it -- a config DB path containing `?` is a mistake
+    to catch, not a use case to support, and silently re-encoding would
+    reintroduce the two-spellings-one-file problem `get_engine`'s docstring
+    describes, just one layer up (a percent-encoded and a literal spelling
+    of the same path would again be two cache entries for one file).
     """
-    return f"sqlite:///{Path(path).resolve()}"
+    resolved = Path(path).resolve()
+    url = f"sqlite:///{resolved}"
+    parsed = make_url(url)
+    if parsed.database != str(resolved):
+        raise ValueError(
+            f"path {str(path)!r} cannot be represented as a SQLite URL "
+            f"without ambiguity: building {url!r} and re-parsing it with "
+            f"make_url() yields database={parsed.database!r}, not "
+            f"{str(resolved)!r}. This means the path contains a character "
+            "-- most likely '?' -- that SQLAlchemy's URL grammar treats as "
+            "a delimiter, so the resulting URL silently addresses a "
+            "different file. Rename the file; this function deliberately "
+            "does not percent-encode paths to work around it."
+        )
+    return url
 
 
 def _install_pragmas(
@@ -295,14 +333,29 @@ def _install_pragmas(
                 # unfetched leaves the cursor in an odd state, so fetch it.
                 cursor.execute("PRAGMA journal_mode=WAL")
                 row = cursor.fetchone()
-                # ...and CHECK it. SQLite does not raise when it cannot
-                # switch journal modes -- it returns the UNCHANGED mode
-                # (a read-only file, a filesystem without the shared-memory
-                # primitives WAL needs, e.g. some network mounts). Every
-                # claim this module rests on -- readers never block, the
-                # single writer serialises on the write lock, the
-                # busy_timeout story -- silently evaporates in that case,
-                # so say so loudly rather than degrading in silence.
+                # ...and CHECK it. For SOME ways WAL can fail to engage,
+                # SQLite does not raise -- it returns the UNCHANGED mode
+                # (measured: a filesystem without the shared-memory
+                # primitives WAL needs, e.g. some network mounts). This
+                # branch exists for those.
+                #
+                # It is NOT reached for a never-yet-WAL, permission-denied
+                # file. An earlier version of this comment claimed
+                # otherwise; corrected during item 6a's review, measured:
+                # `PRAGMA journal_mode=WAL` against such a file raises
+                # `OperationalError: attempt to write a readonly database`
+                # at the `execute()` two lines up, before this `fetchone()`
+                # is ever reached. That case is instead refused before any
+                # engine is even built, by `config/store/paths.py`'s
+                # `check_config_db` (item 6a) -- see that module for the
+                # exact rule (an already-WAL file can open read-only fine;
+                # one that has never yet been switched cannot).
+                #
+                # Every claim this module rests on -- readers never block,
+                # the single writer serialises on the write lock, the
+                # busy_timeout story -- silently evaporates in the case
+                # this branch DOES catch, so say so loudly rather than
+                # degrading in silence.
                 if row is None or str(row[0]).lower() != "wal":
                     logger.warning(
                         "SQLite refused WAL journal mode for %s (still %r). "
@@ -418,6 +471,14 @@ def make_engine(
     url: str, *, readonly: bool = False, foreign_keys: bool = True
 ) -> Engine:
     """Build a new, **uncached** SQLite `Engine` with the store's pragmas.
+
+    For a config database resolved from `-c`/`ZFSBACKUP_CONFIG`/the
+    default path, prefer `config/store/paths.py`'s `open_config_db`
+    instead of calling this (or `get_engine`) directly on a hand-built
+    URL -- it runs `check_config_db`'s preflight first, which this
+    function cannot: `readonly=True` on a URL for a path that does not
+    yet exist silently creates a zero-byte file (see that module's
+    docstring for the measurement).
 
     Prefer `get_engine()`: this function has no pid awareness, so an engine
     it returns must not be allowed to cross a fork. It exists for tests and

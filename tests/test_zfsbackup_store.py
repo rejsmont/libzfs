@@ -41,10 +41,12 @@ import logging
 import multiprocessing
 import os
 import sqlite3
+import stat
 import threading
 import time
 from datetime import timedelta
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from alembic import command
@@ -68,6 +70,7 @@ from zfsbackup.config import (
 from zfsbackup.config import Destination as ConfigDestination
 from zfsbackup.config import RetentionRule as ConfigRetentionRule
 from zfsbackup.config.store import db as store_db
+from zfsbackup.config.store import paths as store_paths
 from zfsbackup.config.store.db import (
     ReadOnlySessionError,
     _is_memory_url,
@@ -89,10 +92,38 @@ from zfsbackup.config.store.mapper import (
     save_config,
 )
 from zfsbackup.config.store.migrate import (
+    SchemaError,
+    SchemaOutOfDate,
     SchemaSplitBrain,
     SchemaVersionMismatch,
     _build_config,
+    _MIGRATIONS_DIR,
+    check_schema,
     ensure_schema,
+)
+from zfsbackup.config.store.paths import (
+    CONFIG_DB_MODE,
+    CONFIG_DIR_MODE,
+    CONFIG_OWNER,
+    CONFIG_PATH_ENV,
+    DEFAULT_CONFIG_DB,
+    ConfigDbIsYaml,
+    ConfigDbNotADatabase,
+    ConfigDbNotAFile,
+    ConfigDbNotFound,
+    ConfigDbPathUnrepresentable,
+    ConfigDbPermissionError,
+    ConfigPathEnvError,
+    ResolvedConfigPath,
+    check_config_db,
+    create_config_db_file,
+    diagnose_open_failure,
+    ensure_config_db_mode,
+    ensure_config_dir,
+    open_config_connection,
+    open_config_session,
+    resolve_config_path,
+    resolve_config_url,
 )
 from zfsbackup.config.store.models import (
     Base,
@@ -2389,6 +2420,35 @@ def _code_head(engine):
         return ScriptDirectory.from_config(_build_config(conn)).get_heads()[0]
 
 
+def _config_with_fake_file_name(connection, config_file_name, *, configure_logger=None):
+    """A bare Alembic `Config` -- `script_location` set programmatically,
+    exactly like `_build_config`, but with `config_file_name` set to an
+    arbitrary (and deliberately non-existent) string, and WITHOUT
+    `_build_config`'s own automatic `attributes["configure_logger"] =
+    False`.
+
+    Exists so `env.py`'s `config.config_file_name is not None and
+    config.attributes.get("configure_logger", True)` guard can be
+    exercised in both directions without ever reading this repo's real
+    `alembic.ini` -- `fileConfig` is mocked by every caller of this
+    helper, so `config_file_name` never actually needs to resolve to a
+    file on disk. This is what lets the logger-reachability test avoid
+    both hazards a real ini read carries: it never risks actually running
+    `logging.config.fileConfig()` (which permanently disables every
+    already-instantiated `zfsbackup.*` logger for the rest of the pytest
+    session), and it never triggers `alembic.ini`'s own `prepend_sys_path
+    = .`, which `ScriptDirectory.from_config` would otherwise apply as an
+    unreverted `sys.path` mutation.
+    """
+    cfg = Config()
+    cfg.set_main_option("script_location", str(_MIGRATIONS_DIR))
+    cfg.attributes["connection"] = connection
+    cfg.config_file_name = config_file_name
+    if configure_logger is not None:
+        cfg.attributes["configure_logger"] = configure_logger
+    return cfg
+
+
 @pytest.mark.unit
 class TestMigrations:
     """Coverage for `zfsbackup/config/store/migrate.py` and
@@ -2747,7 +2807,7 @@ class TestMigrations:
         assert mapper_logger_state.isEnabledFor(logging.WARNING) is True
 
     def test_configure_logger_guard_reachable_via_real_ini(
-        self, empty_memory_engine, mapper_logger_state
+        self, empty_memory_engine
     ):
         """`_build_config` (the helper `ensure_schema` itself uses) never
         sets `config_file_name` -- `Config()` is built with no `file_`
@@ -2759,65 +2819,65 @@ class TestMigrations:
         `config_file_name is not None` half is already `False` for them.
 
         The `configure_logger` half only has an observable effect for a
-        caller that *does* supply a config file -- the repo's own
-        `alembic.ini`, exactly as a bare `alembic` CLI invocation would --
-        which is what this test builds directly, matching env.py's own
-        module docstring (point 2) and 7.1(d)'s stated requirement.
+        caller that *does* supply a config file -- a bare `alembic` CLI
+        invocation, or a future item-8/item-10 caller that reads a real
+        ini. What this test actually needs to prove is narrower than the
+        name's history suggests: that `env.py` *reaches* `fileConfig` when
+        `config_file_name` is set and no opt-out is given, and does NOT
+        reach it when the opt-out is given.
 
-        Both halves of the contract are pinned here, not just the
-        opt-out's happy path: `configure_logger=False` must protect the
-        logger (first block), AND omitting it entirely -- the bare
-        `alembic` CLI's own default -- must actually reproduce the hazard
-        the guard exists for (second block). Without the second half, this
-        test is a tautology about a flag nothing currently sets: it would
-        pass identically whether `fileConfig` does anything at all when
-        `configure_logger` is left unset, and would not have told anyone
-        the guard's *absence* is actually harmful. This repo's own
-        `alembic.ini` `[loggers]` section declares only `root, sqlalchemy,
-        alembic`, so `fileConfig`'s default `disable_existing_loggers=True`
-        disables every other already-configured logger, including this
-        one, when nothing opts out.
+        **Restructured, not merely renamed, after a review finding**: the
+        original version of this test drove that proof by running
+        `command.upgrade` against this repo's REAL `alembic.ini`, and let
+        `fileConfig` actually execute in the "opt-out absent" half. That
+        was a *global*, session-lifetime mutation: `fileConfig`'s default
+        `disable_existing_loggers=True` permanently disabled every
+        already-instantiated `zfsbackup.*` logger, not just this class's
+        own `mapper` logger, whichever ones happened to already exist at
+        that point in the session -- verified directly, both `...store.db`
+        and `...store.paths` came back `disabled` afterwards, and neither
+        had a restore fixture. Chasing that with one more per-logger
+        restore fixture is the wrong trend (this file already carries one
+        for `mapper`, and a second was added and then removed for `paths`
+        during this same review round). It also permanently prepended
+        `'.'` to `sys.path` via `alembic.ini`'s own `prepend_sys_path = .`,
+        a second unreverted global mutation the original test's own
+        comment already flagged but did not fix.
+
+        The fix is to never let `fileConfig` actually run at all:
+        `logging.config.fileConfig` is mocked, and `_config_with_fake_
+        file_name` (module-level helper above) builds a `Config` with an
+        arbitrary, non-existent `config_file_name` -- sufficient to make
+        `config.config_file_name is not None` true, which is all `env.py`
+        consults before deciding whether to call `fileConfig`, without
+        ever touching this repo's real `alembic.ini` or the filesystem at
+        all. This proves reachability (the mock IS or IS NOT called, with
+        the exact argument `env.py` would have passed to the real
+        function) without destroying any global state, and it incidentally
+        removes the `sys.path` leak too, since `ScriptDirectory.from_config`
+        never reads a real ini file's `prepend_sys_path` option in either
+        block below.
         """
-        mapper_logger_state.disabled = False
-        mapper_logger_state.setLevel(logging.DEBUG)
-
-        ini_path = Path(__file__).resolve().parent.parent / "alembic.ini"
-        assert ini_path.is_file()
-        # Note: building a `Config` from this real ini and running it
-        # through `command.upgrade` causes `ScriptDirectory.from_config` to
-        # honour `alembic.ini`'s `prepend_sys_path = .`, which permanently
-        # prepends `'.'` to `sys.path` for the rest of the interpreter --
-        # an unreverted global mutation, same class of leak as the logger
-        # state this fixture restores. Harmless today (pytest's CWD is the
-        # repo root, already importable), so not worth guarding here, but
-        # worth flagging rather than leaving implicit.
-
-        # Opt-out present: the logger must survive.
+        # Opt-out present: fileConfig must never be called.
         with empty_memory_engine.connect() as conn:
-            cfg = Config(str(ini_path))
-            cfg.attributes["connection"] = conn
-            cfg.attributes["configure_logger"] = False
-            command.upgrade(cfg, "head")
-            conn.commit()
+            cfg = _config_with_fake_file_name(
+                conn, "/nonexistent/fake.ini", configure_logger=False
+            )
+            with mock.patch("logging.config.fileConfig") as mock_file_config:
+                command.upgrade(cfg, "head")
+                conn.commit()
+            mock_file_config.assert_not_called()
 
-        assert mapper_logger_state.disabled is False
-        assert mapper_logger_state.isEnabledFor(logging.WARNING) is True
-
-        # Opt-out absent (the bare `alembic` CLI's own default): the same
-        # ini-driven run must actually reproduce the hazard `env.py`'s
-        # `configure_logger` guard exists to prevent -- otherwise the
-        # block above is not proving the guard does anything.
-        mapper_logger_state.disabled = False
-        mapper_logger_state.setLevel(logging.DEBUG)
-
+        # Opt-out absent (the bare `alembic` CLI's own default): env.py
+        # must reach fileConfig, called with exactly the config_file_name
+        # this Config carries -- otherwise the block above is not proving
+        # the guard does anything.
         with empty_memory_engine.connect() as conn:
-            cfg = Config(str(ini_path))
-            cfg.attributes["connection"] = conn
-            # No `configure_logger` attribute set at all.
-            command.upgrade(cfg, "head")  # already at head: DDL-free no-op
-            conn.commit()
-
-        assert mapper_logger_state.disabled is True
+            cfg = _config_with_fake_file_name(conn, "/nonexistent/fake.ini")
+            with mock.patch("logging.config.fileConfig") as mock_file_config:
+                command.upgrade(cfg, "head")  # already at head: DDL-free no-op
+                conn.commit()
+            mock_file_config.assert_called_once_with("/nonexistent/fake.ini")
 
     # -- SchemaSplitBrain -------------------------------------------------
 
@@ -2973,6 +3033,193 @@ class TestMigrations:
             ).fetchall()
 
         assert rows == [(code_head,)]
+
+
+@pytest.mark.unit
+class TestMigrateCheckSchema:
+    """`check_schema` (item 6a-5) -- the never-writes half extracted out of
+    what used to be `ensure_schema`'s single monolithic body, so the
+    daemon can honour "only checks, refuses to start on a mismatch, never
+    writes" (`migrate.py`'s module docstring) as an actual function call
+    rather than just a sentence.
+
+    `ensure_schema` is now defined as `check_schema` + `command.upgrade`
+    precisely so the two cannot drift apart -- see that function's
+    docstring. **Every one of `ensure_schema`'s own tests above (in
+    `TestMigrations`) is left untouched by this class and must still pass
+    unmodified**: that is the actual proof the extraction was
+    behaviour-preserving, not merely "these four new tests pass".
+
+    One case is intentionally not covered here and cannot be while this
+    package ships a single migration revision: a database whose recorded
+    heads are older than the code's head, but still a revision this
+    package's script directory recognises (the ordinary "operator has not
+    run `import`/migrate since upgrading the package" case). Reaching it
+    requires at least two revisions in `zfsbackup/config/store/migrations/`
+    so that `script.get_revision(revision)` succeeds for a known-but-not-
+    head revision. Today, `set(db_heads) != {code_head}` is only ever
+    reached with `db_heads` empty (no revision recorded at all -- the
+    brand-new/never-migrated case exercised below), because there is no
+    second revision to be "behind". Whoever adds the second migration
+    should add the genuinely-older-known-revision case here.
+    """
+
+    @pytest.fixture
+    def empty_memory_engine(self):
+        eng = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        yield eng
+        eng.dispose()
+
+    def test_current_database_passes_and_returns_the_code_head(
+        self, empty_memory_engine
+    ):
+        with empty_memory_engine.connect() as conn:
+            head = ensure_schema(conn)
+            conn.commit()
+
+        with empty_memory_engine.connect() as conn:
+            result = check_schema(conn)
+
+        assert result == head
+
+    def test_current_database_check_schema_writes_nothing(
+        self, empty_memory_engine
+    ):
+        """Distinguishes `check_schema` from `ensure_schema` on the
+        already-current path: `check_schema` alone must not even open a
+        write transaction, let alone commit one -- there is nothing here
+        for a caller to `commit()`, unlike `ensure_schema`'s documented
+        requirement.
+        """
+        with empty_memory_engine.connect() as conn:
+            ensure_schema(conn)
+            conn.commit()
+
+        with empty_memory_engine.connect() as conn:
+            check_schema(conn)
+            # No write of any kind occurred on this connection: nothing
+            # pending to roll back, and rolling back is a no-op either way.
+            conn.rollback()
+
+        with empty_memory_engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).fetchall()
+        assert len(rows) == 1
+
+    def test_empty_never_migrated_database_raises_schema_out_of_date(
+        self, empty_memory_engine
+    ):
+        """A brand-new database -- no `alembic_version`, no application
+        tables at all -- is `check_schema`'s refusal case, not the silent
+        "create it" `ensure_schema` alone used to provide. This is the
+        case item 6a's daemon-refusal contract (D5) exists for: an older
+        schema read through current ORM models risks silently
+        misinterpreting a column, so the daemon must refuse rather than
+        auto-migrate.
+        """
+        with empty_memory_engine.connect() as conn:
+            with pytest.raises(SchemaOutOfDate) as excinfo:
+                check_schema(conn)
+
+        message = str(excinfo.value)
+        assert "check_schema" in message
+        assert "never migrates" in message or "never write" in message.lower()
+
+    def test_split_brain_raises_schema_split_brain(self, empty_memory_engine):
+        """Full application schema, no recorded Alembic revision at all --
+        `check_schema` must not treat this as "brand new", and must not
+        let a caller's `command.upgrade` attempt fail with a bare `table
+        ... already exists`.
+        """
+        Base.metadata.create_all(empty_memory_engine)
+        code_head = _code_head(empty_memory_engine)
+
+        with empty_memory_engine.connect() as conn:
+            with pytest.raises(SchemaSplitBrain) as excinfo:
+                check_schema(conn)
+
+        assert code_head in str(excinfo.value)
+
+    def test_unrecognised_revision_raises_schema_version_mismatch(
+        self, empty_memory_engine
+    ):
+        with empty_memory_engine.connect() as conn:
+            code_head = ensure_schema(conn)
+            conn.commit()
+
+        with empty_memory_engine.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num='deadbeefcafe'")
+            )
+
+        with empty_memory_engine.connect() as conn:
+            with pytest.raises(SchemaVersionMismatch) as excinfo:
+                check_schema(conn)
+
+        message = str(excinfo.value)
+        assert "deadbeefcafe" in message
+        assert code_head in message
+
+
+@pytest.mark.unit
+class TestMigrateSchemaErrorHierarchy:
+    """`SchemaError(RuntimeError)` is the common base for the three
+    operator-fixable schema-state refusals, deliberately NOT shared by the
+    multi-head packaging-defect `RuntimeError` `check_schema` raises when
+    its own installed migration scripts have more than one head.
+
+    Pinning this matters because item 8's daemon half is expected to
+    catch `SchemaError` specifically (mirroring `ConfigPathError` in
+    `paths.py`): an `except RuntimeError` there would also silently
+    swallow the multi-head packaging bug into the same "clean refusal,
+    log and exit" handling meant for a stale-but-fixable schema, instead
+    of letting an actual bug in the installed package crash loudly as a
+    bug report. A test that only checked `isinstance(exc, RuntimeError)`
+    for all four would pass without ever noticing that distinction was
+    lost.
+    """
+
+    def test_schema_out_of_date_is_a_schema_error(self):
+        assert issubclass(SchemaOutOfDate, SchemaError)
+
+    def test_schema_version_mismatch_is_a_schema_error(self):
+        assert issubclass(SchemaVersionMismatch, SchemaError)
+
+    def test_schema_split_brain_is_a_schema_error(self):
+        assert issubclass(SchemaSplitBrain, SchemaError)
+
+    def test_schema_error_is_a_runtime_error(self):
+        assert issubclass(SchemaError, RuntimeError)
+
+    def test_multi_head_runtime_error_is_not_a_schema_error(self):
+        """Simulates "this installed package's own migration scripts have
+        more than one head" -- a packaging defect this repository's own
+        single-revision history cannot otherwise reproduce -- by patching
+        `ScriptDirectory.get_heads` to return two ids, exactly as
+        `check_schema`'s own guard comment describes reaching this branch.
+        """
+        eng = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        try:
+            with eng.connect() as conn:
+                with mock.patch.object(
+                    ScriptDirectory, "get_heads", return_value=["a", "b"]
+                ):
+                    with pytest.raises(RuntimeError) as excinfo:
+                        check_schema(conn)
+
+            assert not isinstance(excinfo.value, SchemaError)
+            assert type(excinfo.value) is RuntimeError
+        finally:
+            eng.dispose()
 
 
 @pytest.mark.unit
@@ -3188,6 +3435,32 @@ class TestDbUrlForPath:
         link = tmp_path / "link.db"
         link.symlink_to(real)
         assert url_for_path(link) == url_for_path(real)
+
+    def test_question_mark_raises_named_value_error(self, tmp_path):
+        """Measurement F (item 6a plan): a `?` in the path is a URL-grammar
+        delimiter to `make_url`, so a naive f-string build silently
+        addresses a different file (`make_url("sqlite:////tmp/a?b.db")
+        .database == "/tmp/a"`). `url_for_path` must reject it outright,
+        never percent-encode it -- percent-encoding would reintroduce the
+        exact two-spellings-one-file hazard `url_for_path` exists to
+        prevent, just one layer up.
+        """
+        bad_path = tmp_path / "a?b.db"
+        with pytest.raises(ValueError, match="ambiguity") as excinfo:
+            url_for_path(bad_path)
+        message = str(excinfo.value)
+        assert "?" in message
+        assert str(bad_path) in message
+
+    def test_hash_space_and_unicode_characters_still_round_trip(self, tmp_path):
+        """`#` and spaces are, per measurement F, NOT delimiters `make_url`
+        treats specially here -- and a non-ASCII filename must round-trip
+        too, since operators do not restrict themselves to ASCII paths.
+        """
+        for name in ("a#b.db", "a b.db", "café.db", "配置.db"):
+            path = tmp_path / name
+            url = url_for_path(path)
+            assert url == f"sqlite:///{path.resolve()}"
 
 
 @pytest.mark.unit
@@ -3839,10 +4112,34 @@ def _fork_child_get_engine(url, result_path):
     """Runs inside a forked child. Calls the real, guarded `get_engine()` --
     the pid check must notice this process did not build the cached entry
     and discard-and-rebuild rather than reuse the parent's pool.
+
+    `connect_event_fire_count` replaces an earlier, `id()`-based
+    discriminator for "is this a genuinely new physical DBAPI connection,
+    not the inherited one" (see `TestDbForkSafety.
+    test_child_rebuilds_a_fresh_engine_and_connection_after_fork`'s own
+    docstring for why `id()` equality/inequality is not a safe test of
+    that at all: CPython's allocator can legally reuse a just-freed
+    object's address for the very next allocation, which would make a
+    freshly-created replacement collide, by `id()`, with the inherited
+    object it replaced -- a false-failure, not a false-pass, but still not
+    a sound assertion). SQLAlchemy's `connect` event fires exactly once
+    per genuinely new physical DBAPI connection a pool creates, and never
+    on a pooled checkout of an already-connected one (verified directly:
+    a second `engine.connect()` against the same pool does not re-fire
+    it) -- so counting it, on a listener registered on THIS process's
+    freshly rebuilt `Engine` before the first `.connect()` call, is a
+    logical proof independent of any memory address, immune to allocator
+    reuse by construction.
     """
     engine = get_engine(url)
+    connect_fire_count = 0
+
+    @event.listens_for(engine, "connect")
+    def _count_new_physical_connections(dbapi_connection, connection_record):
+        nonlocal connect_fire_count
+        connect_fire_count += 1
+
     with engine.connect() as conn:
-        dbapi_id = id(conn.connection.dbapi_connection)
         names = [
             row[0]
             for row in conn.exec_driver_sql(
@@ -3853,7 +4150,7 @@ def _fork_child_get_engine(url, result_path):
     result = {
         "pid": os.getpid(),
         "engine_id": id(engine),
-        "dbapi_id": dbapi_id,
+        "connect_event_fire_count": connect_fire_count,
         "dataset_names": names,
         "integrity_check": integrity,
     }
@@ -4050,8 +4347,8 @@ class TestDbForkSafety:
         self, file_db_url, tmp_path
     ):
         parent_engine = self._seed(file_db_url)
-        with parent_engine.connect() as conn:
-            parent_dbapi_id = id(conn.connection.dbapi_connection)
+        with parent_engine.connect():
+            pass  # establish the parent's own physical connection first
 
         result_path = tmp_path / "fork_positive.json"
         ctx = multiprocessing.get_context("fork")
@@ -4066,32 +4363,26 @@ class TestDbForkSafety:
 
         # The child's engine is not the parent's object...
         assert result["engine_id"] != id(parent_engine)
-        # ...and its DBAPI connection is not the parent's either.
-        #
-        # KNOWN FLAKE RISK, documented rather than "fixed" with a more
-        # elaborate discriminator (a review pass looked for one and did not
-        # find a cheap one): `id()` is only guaranteed unique among objects
-        # simultaneously alive within ONE process's address space. Inside
-        # the child, `get_engine()`'s discard-and-rebuild path frees the
-        # INHERITED (stale) `dbapi_connection` wrapper -- via `dispose(
-        # close=False)` dropping the pool's last reference, then CPython's
-        # allocator reclaiming it -- strictly before the rebuilt engine's
-        # own first connect allocates its replacement. The replacement can
-        # therefore legally land on the just-freed block and get the SAME
-        # `id()`, which would fail this specific assertion despite the
-        # rebuild being entirely correct: a false-failure (flaky red), not
-        # a false-pass. Not reproduced in 25 forced trials on this
-        # platform/Python version, so left in place as the cheapest
-        # available corroborating signal -- `engine_id`, `dataset_names`,
-        # and `integrity_check` above are what actually prove freshness
-        # and correctness and do not share this risk (a brand-new `Engine`
-        # Python object is not freed-and-reallocated mid-call the way the
-        # short-lived DBAPI connection wrapper is). If this line ever
-        # flakes, that is the signal to replace it with a discriminator
-        # that does not depend on CPython's allocator reuse behaviour
-        # (e.g. a monotonic counter tagged onto each DBAPI connection via
-        # its own `connect` listener) rather than to loosen the test.
-        assert result["dbapi_id"] != parent_dbapi_id
+        # ...and its DBAPI connection is genuinely new, not the inherited
+        # one -- proven by the SQLAlchemy `connect` event (which fires
+        # exactly once per NEW physical DBAPI connection a pool creates,
+        # never on a pooled checkout of an already-connected one) firing
+        # exactly once inside the child, on a listener registered before
+        # its first `.connect()` call. Deliberately NOT an `id()`
+        # comparison: an earlier version of this assertion compared
+        # `id(child's dbapi_connection)` against `id(parent's)`, which
+        # carries a real, documented false-failure risk -- CPython's
+        # allocator can legally reuse a just-freed object's memory address
+        # for the very next allocation, and `get_engine()`'s
+        # discard-and-rebuild path frees the INHERITED (stale) DBAPI
+        # connection wrapper (via `dispose(close=False)`) strictly before
+        # the rebuilt engine's own first connect allocates its
+        # replacement -- so the replacement can legally land on the
+        # just-freed block and collide, by `id()`, with the very object it
+        # replaced. `connect_event_fire_count` is a logical proof of
+        # "genuinely new physical connection", independent of any memory
+        # address, and is immune to that risk by construction.
+        assert result["connect_event_fire_count"] == 1
         # The child reads correct data through its rebuilt connection.
         assert result["dataset_names"] == ["tank/fork"]
         # ...and the rebuilt connection is genuinely sound, not merely
@@ -5080,3 +5371,1608 @@ class TestDbChmodReadOnlyDatabase:
                 reader.dispose()
         finally:
             os.chmod(db_path, 0o644)
+
+
+# ---------------------------------------------------------------------------
+# zfsbackup/config/store/paths.py (item 6a) -- path resolution, preflight,
+# creation policy, and permissions.
+#
+# `require_writable=False`, `require_writable=True`'s six-step preflight,
+# `diagnose_open_failure`, `ensure_config_dir`, and `ensure_config_db_mode`
+# never build a SQLite engine (`check_config_db`'s whole reason to exist is
+# to run BEFORE one is built, per measurement E below) -- so most of this
+# section constructs a `ResolvedConfigPath` directly and/or a real SQLite
+# file via a bare `sqlite3.connect()`, not through `db.py`'s `make_engine`.
+# The two exceptions are the missing-path preflight's own positive control
+# and the sidecar-mode-inheritance tests, which deliberately DO open a real
+# connection -- that is the entire point of both.
+#
+# Marker rule (picked once, applied consistently below, per a review
+# finding that the two exceptions above were marked `unit` while every
+# adjacent permission class doing the same kind of work was `integration`):
+# a class is `integration` if any test in it performs a real `chmod`, opens
+# an actual SQLite connection (`sqlite3.connect`/`Engine.connect`), or
+# mutates process-global state (`os.umask`); otherwise it is `unit`, even
+# though every test in this section still uses `tmp_path` and touches the
+# real filesystem for plain file creation/`stat`.
+#
+# Root-CI caveat: all four `@pytest.mark.skipif(os.geteuid() == 0, ...)`
+# classes below mean a CI run executing as root loses every step-5 and
+# step-6 assertion in this section entirely, including the already-WAL
+# warn-vs-hard-fail split -- `os.access`'s own root-is-always-permitted
+# semantics (see `check_config_db`'s and `diagnose_open_failure`'s
+# docstrings) make those checks structurally untestable as root, not just
+# inconvenient; run this file's permission classes as a non-root user at
+# least once per change to this module.
+# ---------------------------------------------------------------------------
+
+
+def _make_sqlite_file(path, wal=False):
+    """A minimal, valid SQLite database file at `path` -- built with a bare
+    `sqlite3.connect()`, never `db.py`'s `make_engine`, so these tests
+    characterize `check_config_db` against a file `db.py` had no hand in
+    creating (the realistic case: an operator-provisioned or
+    packaging-provisioned file).
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        if wal:
+            conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+@pytest.mark.unit
+class TestPathsResolveConfigPath:
+    """`resolve_config_path`'s resolution matrix (6a-2). Deliberately pure
+    -- every test passes `environ` as a plain dict, never touches
+    `os.environ` or the filesystem, and needs no `tmp_path` at all, per the
+    function's own "pure by design" contract.
+    """
+
+    def test_explicit_wins_over_env_and_default(self):
+        resolved = resolve_config_path(
+            "/explicit/config.db",
+            environ={CONFIG_PATH_ENV: "/env/config.db"},
+        )
+        assert resolved.path == Path("/explicit/config.db")
+        assert resolved.source == "--config"
+
+    def test_env_wins_over_default_when_no_explicit(self):
+        resolved = resolve_config_path(
+            None, environ={CONFIG_PATH_ENV: "/env/config.db"}
+        )
+        assert resolved.path == Path("/env/config.db")
+        assert resolved.source == CONFIG_PATH_ENV
+
+    def test_default_when_neither_explicit_nor_env_given(self):
+        resolved = resolve_config_path(None, environ={})
+        assert resolved.path == DEFAULT_CONFIG_DB
+        assert resolved.source == "default"
+
+    def test_empty_env_value_is_treated_as_unset(self):
+        """D2: `ZFSBACKUP_CONFIG=""` must not out-rank the default -- the
+        same truthiness check `migrations/env.py`'s `_resolve_url()`
+        already applies to the sibling `ZFSBACKUP_DB_URL` variable.
+        """
+        resolved = resolve_config_path(None, environ={CONFIG_PATH_ENV: ""})
+        assert resolved.path == DEFAULT_CONFIG_DB
+        assert resolved.source == "default"
+
+    def test_env_value_with_sqlite_scheme_raises_config_path_env_error(self):
+        with pytest.raises(ConfigPathEnvError):
+            resolve_config_path(
+                None,
+                environ={
+                    CONFIG_PATH_ENV: "sqlite:////var/lib/zfsbackup/config.db"
+                },
+            )
+
+    def test_env_value_containing_scheme_separator_raises(self):
+        """Any `://`, not only a `sqlite:` prefix -- an operator mistakenly
+        pointing `ZFSBACKUP_CONFIG` at `ZFSBACKUP_DB_URL`'s own kind of
+        value (e.g. a `postgresql://` URL) must be caught too.
+        """
+        with pytest.raises(ConfigPathEnvError):
+            resolve_config_path(
+                None, environ={CONFIG_PATH_ENV: "postgresql://host/db"}
+            )
+
+    def test_env_error_names_both_variables(self):
+        with pytest.raises(ConfigPathEnvError) as excinfo:
+            resolve_config_path(
+                None,
+                environ={
+                    CONFIG_PATH_ENV: "sqlite:////var/lib/zfsbackup/config.db"
+                },
+            )
+        message = str(excinfo.value)
+        assert CONFIG_PATH_ENV in message
+        assert "ZFSBACKUP_DB_URL" in message
+
+    def test_relative_env_value_is_accepted_and_stays_relative(self):
+        """D3: a relative `ZFSBACKUP_CONFIG` is accepted, and `path` stays
+        exactly as given -- resolution against cwd happens only inside
+        `.url()`, never on the `path` attribute itself.
+        """
+        resolved = resolve_config_path(
+            None, environ={CONFIG_PATH_ENV: "relative/config.db"}
+        )
+        assert resolved.path == Path("relative/config.db")
+        assert not resolved.path.is_absolute()
+        assert resolved.source == CONFIG_PATH_ENV
+
+    def test_source_is_correct_for_every_case(self):
+        assert resolve_config_path("/x.db", environ={}).source == "--config"
+        assert (
+            resolve_config_path(
+                None, environ={CONFIG_PATH_ENV: "/x.db"}
+            ).source
+            == CONFIG_PATH_ENV
+        )
+        assert resolve_config_path(None, environ={}).source == "default"
+
+    def test_zfsbackup_db_url_alone_does_not_win_over_default(self):
+        """The non-collision regression, half A: `ZFSBACKUP_DB_URL` set
+        with nothing else present must not be mistaken for
+        `ZFSBACKUP_CONFIG` and promoted over the default.
+        """
+        resolved = resolve_config_path(
+            None,
+            environ={"ZFSBACKUP_DB_URL": "postgresql://otherhost/otherdb"},
+        )
+        assert resolved.path == DEFAULT_CONFIG_DB
+        assert resolved.source == "default"
+
+    def test_zfsbackup_db_url_set_to_a_different_value_is_ignored(self):
+        """The non-collision regression, half B -- the one the task
+        description calls out explicitly: `ZFSBACKUP_CONFIG` and
+        `ZFSBACKUP_DB_URL` live one file apart (`paths.py` / `migrations/
+        env.py`) and hold different kinds of value (path vs. URL). A
+        `ZFSBACKUP_DB_URL` carrying a value that DIFFERS from
+        `ZFSBACKUP_CONFIG` must be completely ignored by resolution -- not
+        merely "does not win", but never read, never compared, never
+        allowed to influence `path` or `source` at all. `paths.py` never
+        reads `ZFSBACKUP_DB_URL`; this pins that as an observable
+        behaviour, not just a docstring claim.
+        """
+        resolved = resolve_config_path(
+            None,
+            environ={
+                CONFIG_PATH_ENV: "/env/config.db",
+                "ZFSBACKUP_DB_URL": "postgresql://otherhost/otherdb",
+            },
+        )
+        assert resolved.path == Path("/env/config.db")
+        assert resolved.source == CONFIG_PATH_ENV
+
+    def test_resolve_config_url_matches_path_dot_url(self):
+        resolved = resolve_config_path("/explicit/config.db", environ={})
+        assert (
+            resolve_config_url("/explicit/config.db", environ={})
+            == resolved.url()
+        )
+
+    def test_explicit_empty_string_is_treated_as_unset(self):
+        """`--config ""` (the shape argparse produces for an explicitly
+        blank argument) must fall through to `ZFSBACKUP_CONFIG`/the
+        default, exactly like `ZFSBACKUP_CONFIG=""` already does --
+        without this, `Path("")` (the current directory) would be resolved
+        and fail later with a confusing message instead of behaving like
+        `-c` was never passed.
+        """
+        resolved = resolve_config_path(
+            "", environ={CONFIG_PATH_ENV: "/env/config.db"}
+        )
+        assert resolved.path == Path("/env/config.db")
+        assert resolved.source == CONFIG_PATH_ENV
+
+    def test_explicit_empty_string_falls_through_to_default(self):
+        resolved = resolve_config_path("", environ={})
+        assert resolved.path == DEFAULT_CONFIG_DB
+        assert resolved.source == "default"
+
+
+@pytest.mark.unit
+class TestPathsResolveConfigPathRealEnviron:
+    """The production path: `resolve_config_path(explicit=None,
+    environ=None)`, which reads the REAL `os.environ` (`environ=None` is
+    the default every actual caller uses -- `explicit=None, environ={}`
+    everywhere else in this file passes an explicit dict specifically to
+    avoid the real environment, which is correct for a pure-function test
+    but means, per a review finding, that a mutant replacing `os.environ`
+    with `{}` inside `resolve_config_path` would survive this file's
+    entire suite: nothing anywhere else calls the two-argument-omitted
+    form. `monkeypatch.setenv`/`delenv` isolate the real environment
+    variable for the duration of each test.
+    """
+
+    def test_unset_real_env_var_resolves_to_default(self, monkeypatch):
+        monkeypatch.delenv(CONFIG_PATH_ENV, raising=False)
+        resolved = resolve_config_path()
+        assert resolved.path == DEFAULT_CONFIG_DB
+        assert resolved.source == "default"
+
+    def test_set_real_env_var_is_actually_read(self, monkeypatch):
+        monkeypatch.setenv(CONFIG_PATH_ENV, "/real/env/config.db")
+        resolved = resolve_config_path()
+        assert resolved.path == Path("/real/env/config.db")
+        assert resolved.source == CONFIG_PATH_ENV
+
+    def test_explicit_still_wins_over_the_real_env_var(self, monkeypatch):
+        monkeypatch.setenv(CONFIG_PATH_ENV, "/real/env/config.db")
+        resolved = resolve_config_path("/explicit/config.db")
+        assert resolved.path == Path("/explicit/config.db")
+        assert resolved.source == "--config"
+
+
+@pytest.mark.unit
+class TestPathsCanonicalisation:
+    """Canonicalisation is single-sited in `url_for_path` (`db.py`).
+    `ResolvedConfigPath.path` itself is deliberately NOT `.resolve()`d
+    (measurement I: `.resolve()` rewrites `/var` to `/private/var` on
+    macOS, and an error message should echo what the operator typed) --
+    only `.url()` canonicalises, and it does so by delegating to
+    `url_for_path`, never by re-implementing resolution itself.
+    """
+
+    def test_resolved_path_is_byte_identical_to_what_was_passed_in(
+        self, tmp_path
+    ):
+        given = tmp_path / "sub" / ".." / "c.db"
+        resolved = resolve_config_path(str(given), environ={})
+        assert str(resolved.path) == str(given)
+
+    def test_url_equals_url_for_path_of_that_path(self, tmp_path):
+        db_path = tmp_path / "c.db"
+        resolved = resolve_config_path(str(db_path), environ={})
+        assert resolved.url() == url_for_path(db_path)
+
+    def test_two_spellings_of_one_file_produce_one_get_engine_cache_entry(
+        self, tmp_path
+    ):
+        direct = tmp_path / "c.db"
+        indirect = tmp_path / "sub" / ".." / "c.db"
+
+        url_a = resolve_config_path(str(direct), environ={}).url()
+        url_b = resolve_config_path(str(indirect), environ={}).url()
+        assert url_a == url_b
+
+        get_engine(url_a)
+        get_engine(url_b)
+
+        assert len(store_db._ENGINES) == 1
+
+    def test_same_relative_path_under_different_cwds_compares_unequal(
+        self, tmp_path, monkeypatch
+    ):
+        """The precise inverse of the two-spellings-one-file bug above,
+        and the reason `ResolvedConfigPath.__eq__`/`__hash__` now include
+        `resolved_path`: two objects built from the IDENTICAL relative
+        `Path("c.db")` string, under two different working directories,
+        address two DIFFERENT real files and must not compare equal or
+        collide in a hash-keyed structure. An earlier version of this
+        class excluded `resolved_path` from comparison (the auto-generated
+        dataclass `__eq__` compares `path` and `source` only), which made
+        this exact pair equal -- the opposite of the fix `resolved_path`
+        itself exists to provide, and dangerous in the silent direction:
+        it would silently merge two different databases into one identity
+        in any future dict/set keyed on this type.
+        """
+        dir_a = tmp_path / "dir_a"
+        dir_b = tmp_path / "dir_b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+
+        monkeypatch.chdir(dir_a)
+        a = resolve_config_path("c.db", environ={})
+        monkeypatch.chdir(dir_b)
+        b = resolve_config_path("c.db", environ={})
+
+        assert a.path == b.path  # same given spelling
+        assert a.resolved_path != b.resolved_path  # different real files
+        assert a != b
+        assert hash(a) != hash(b)
+        assert len({a, b}) == 2  # does not collapse to one set entry
+
+    def test_identical_construction_still_compares_equal(self, tmp_path):
+        """The positive control for the test above: two `ResolvedConfigPath`
+        built from the identical path under the identical cwd must still
+        compare equal -- the fix is about DIFFERING `resolved_path`, not
+        about breaking equality altogether.
+        """
+        db_path = tmp_path / "c.db"
+        a = ResolvedConfigPath(path=db_path, source="default")
+        b = ResolvedConfigPath(path=db_path, source="default")
+
+        assert a == b
+        assert hash(a) == hash(b)
+
+
+@pytest.mark.unit
+class TestPathsConfigDbPathUnrepresentable:
+    """A path `url_for_path` cannot turn into an unambiguous SQLite URL
+    (a `?`, see `db.py:url_for_path`) must surface as
+    `ConfigDbPathUnrepresentable` -- a `ConfigPathError` subclass -- from
+    every angle a caller might reach it, not just from `url_for_path`
+    itself raising a bare `ValueError` from a different exception
+    hierarchy.
+    """
+
+    def test_resolved_config_path_url_wraps_the_value_error(self, tmp_path):
+        bad = tmp_path / "a?b.db"
+        resolved = ResolvedConfigPath(path=bad, source="default")
+
+        with pytest.raises(ConfigDbPathUnrepresentable) as excinfo:
+            resolved.url()
+        assert excinfo.value.__cause__ is not None
+        assert isinstance(excinfo.value.__cause__, ValueError)
+
+    def test_check_config_db_step_0_raises_it_before_any_stat(self, tmp_path):
+        """The `?` path does not even need to exist -- step 0 is cheap,
+        no-I/O, and runs before the `os.stat` existence check, so this
+        must raise regardless of whether anything is actually at the
+        path.
+        """
+        bad = tmp_path / "a?b.db"
+        assert not bad.exists()
+        resolved = ResolvedConfigPath(path=bad, source="default")
+
+        with pytest.raises(ConfigDbPathUnrepresentable):
+            check_config_db(resolved)
+
+    def test_resolve_config_url_propagates_it(self, tmp_path):
+        """Drives it through `resolve_config_url` -- nothing else in this
+        file does.
+        """
+        bad = tmp_path / "a?b.db"
+        with pytest.raises(ConfigDbPathUnrepresentable):
+            resolve_config_url(str(bad), environ={})
+
+
+@pytest.mark.integration
+class TestPathsCheckConfigDbMissingFile:
+    """Measurement E is why `check_config_db`'s existence check has to be a
+    `stat` performed before any engine is built, not an exception caught
+    from an open: `make_engine(url, readonly=True).connect()` against a
+    path that does not exist silently creates a zero-byte file, because
+    `PRAGMA query_only=ON` is issued only after SQLite has already opened
+    -- and, for a missing path, created -- the database file.
+    """
+
+    def test_check_config_db_on_missing_path_does_not_create_a_file(
+        self, tmp_path
+    ):
+        missing = tmp_path / "config.db"
+        resolved = ResolvedConfigPath(path=missing, source="default")
+
+        with pytest.raises(ConfigDbNotFound):
+            check_config_db(resolved)
+
+        assert not missing.exists()
+
+    def test_positive_control_readonly_engine_does_create_a_file(
+        self, tmp_path
+    ):
+        """The other half of the assertion above. Without this positive
+        control, `not missing.exists()` in the test above cannot be told
+        apart from a test that never exercised the hazard at all -- this
+        proves the exact same kind of path, opened the way `check_config_db`
+        exists to prevent, really does create the file.
+        """
+        missing = tmp_path / "would_be_created.db"
+        assert not missing.exists()
+
+        engine = make_engine(url_for_path(missing), readonly=True)
+        try:
+            with engine.connect():
+                pass
+        finally:
+            engine.dispose()
+
+        assert missing.exists()
+
+
+@pytest.mark.unit
+class TestPathsCheckConfigDbNotFoundMessages:
+    """`check_config_db`'s not-found message differs deliberately by
+    `source` -- the `--config` case must never mention the default, since
+    implying a fallback that does not exist is worse than silence.
+    """
+
+    def test_default_source_message_content(self, tmp_path):
+        given = tmp_path / "default_config.db"
+        resolved = ResolvedConfigPath(path=given, source="default")
+
+        with pytest.raises(ConfigDbNotFound) as excinfo:
+            check_config_db(resolved)
+
+        message = str(excinfo.value)
+        assert str(given) in message
+        assert "--config" in message
+        assert CONFIG_PATH_ENV in message
+        assert "zfsbackup-config import" in message
+        assert "/etc/zfsbackup/config.yaml" in message
+
+    def test_config_flag_source_message_names_the_exact_value_and_omits_default(
+        self, tmp_path
+    ):
+        given = tmp_path / "explicit_config.db"
+        resolved = ResolvedConfigPath(path=given, source="--config")
+
+        with pytest.raises(ConfigDbNotFound) as excinfo:
+            check_config_db(resolved)
+
+        message = str(excinfo.value)
+        assert str(given) in message
+        # No mention of the default: it is not what will be tried next.
+        assert str(DEFAULT_CONFIG_DB) not in message
+        assert "default" not in message.lower()
+
+    def test_env_source_message_names_the_variable_and_its_value(
+        self, tmp_path
+    ):
+        given = tmp_path / "env_config.db"
+        resolved = ResolvedConfigPath(path=given, source=CONFIG_PATH_ENV)
+
+        with pytest.raises(ConfigDbNotFound) as excinfo:
+            check_config_db(resolved)
+
+        message = str(excinfo.value)
+        assert CONFIG_PATH_ENV in message
+        assert str(given) in message
+
+    def test_relative_env_value_message_shows_both_given_and_resolved_forms(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        resolved = resolve_config_path(
+            None, environ={CONFIG_PATH_ENV: "sub/config.db"}
+        )
+
+        with pytest.raises(ConfigDbNotFound) as excinfo:
+            check_config_db(resolved)
+
+        message = str(excinfo.value)
+        assert "sub/config.db" in message
+        assert str((tmp_path / "sub" / "config.db").resolve()) in message
+
+
+@pytest.mark.unit
+class TestPathsCheckConfigDbNotAFile:
+    def test_directory_at_the_resolved_path_raises(self, tmp_path):
+        directory = tmp_path / "config.db"
+        directory.mkdir()
+        resolved = ResolvedConfigPath(path=directory, source="default")
+
+        with pytest.raises(ConfigDbNotAFile):
+            check_config_db(resolved)
+
+    def test_not_a_directory_error_on_a_path_component_raises_not_found(
+        self, tmp_path
+    ):
+        """`.../config.db/x.db` -- a path component that exists but is a
+        regular file, not a directory. `os.stat` raises `NotADirectoryError`
+        here, which `check_config_db` folds into the same `ConfigDbNotFound`
+        as a genuinely missing path (both mean "nothing usable is here"),
+        rather than the residual `OSError` arm.
+        """
+        not_a_dir = tmp_path / "config.db"
+        _make_sqlite_file(not_a_dir)
+        bad_child = not_a_dir / "x.db"
+        resolved = ResolvedConfigPath(path=bad_child, source="default")
+
+        with pytest.raises(ConfigDbNotFound):
+            check_config_db(resolved)
+
+
+@pytest.mark.unit
+class TestPathsCheckConfigDbSymlinkFollowing:
+    """`check_config_db` uses `os.stat`, not `os.lstat`, deliberately --
+    the module docstring explains why (a symlinked config database is a
+    legitimate setup `os.lstat` would misreport as "not a regular file").
+    That divergence was previously pinned only by the docstring's prose,
+    so a future "the plan said `lstat`" revert would be silent. These two
+    tests would have caught the symlink-parent bug this same review round
+    found and fixed (see `TestPathsCheckConfigDbSymlinkParentResolution`
+    below) had they existed first.
+    """
+
+    def test_symlink_to_a_real_database_passes(self, tmp_path):
+        real = tmp_path / "real.db"
+        _make_sqlite_file(real)
+        link = tmp_path / "link.db"
+        link.symlink_to(real)
+        resolved = ResolvedConfigPath(path=link, source="default")
+
+        check_config_db(resolved)  # must not raise
+
+    def test_dangling_symlink_raises_config_db_not_found(self, tmp_path):
+        target = tmp_path / "does_not_exist.db"
+        dangling = tmp_path / "dangling.db"
+        dangling.symlink_to(target)
+        resolved = ResolvedConfigPath(path=dangling, source="default")
+
+        with pytest.raises(ConfigDbNotFound):
+            check_config_db(resolved)
+
+
+@pytest.mark.unit
+class TestPathsCheckConfigDbIsYaml:
+    """`ConfigDbIsYaml` is now a **subclass** of `ConfigDbNotADatabase`
+    (review finding), raised ONLY by the `.yaml`/`.yml` suffix branch --
+    the one case where "run `zfsbackup-config import <path>`" is actually
+    correct, copy-pasteable advice. A magic-bytes mismatch with no
+    `.yaml`/`.yml` suffix (a YAML file saved under a bare name, or the
+    zero-byte artifact a `readonly=True` open of a missing path leaves
+    behind) raises the PARENT, `ConfigDbNotADatabase`, whose message
+    deliberately does NOT tell the operator to import the file into
+    itself -- that used to be exactly what a zero-byte `config.db` at the
+    default path was told, and copy-pasting it hands a zero-byte file to
+    a YAML parser.
+    """
+
+    def test_yaml_suffix_raises_config_db_is_yaml(self, tmp_path):
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text("datasets: []\n")
+        resolved = ResolvedConfigPath(path=yaml_path, source="default")
+
+        with pytest.raises(ConfigDbIsYaml) as excinfo:
+            check_config_db(resolved)
+        assert f"zfsbackup-config import {yaml_path}" in str(excinfo.value)
+
+    def test_yml_suffix_raises_config_db_is_yaml(self, tmp_path):
+        yml_path = tmp_path / "config.yml"
+        yml_path.write_text("datasets: []\n")
+        resolved = ResolvedConfigPath(path=yml_path, source="default")
+
+        with pytest.raises(ConfigDbIsYaml):
+            check_config_db(resolved)
+
+    def test_no_extension_yaml_content_raises_not_a_database_not_is_yaml(
+        self, tmp_path
+    ):
+        """A YAML file saved with no extension -- the suffix check never
+        fires, so this is caught purely by the header not matching
+        SQLite's magic bytes. Raises the PARENT class, not `ConfigDbIsYaml`
+        -- `check_config_db` has no way to know this particular
+        not-a-database file happens to be YAML, so it must not claim to.
+        """
+        no_ext = tmp_path / "config"
+        no_ext.write_text("datasets: []\n")
+        resolved = ResolvedConfigPath(path=no_ext, source="default")
+
+        with pytest.raises(ConfigDbNotADatabase) as excinfo:
+            check_config_db(resolved)
+        assert not isinstance(excinfo.value, ConfigDbIsYaml)
+        assert f"zfsbackup-config import {no_ext}" not in str(excinfo.value)
+
+    def test_zero_byte_artifact_raises_not_a_database_not_is_yaml(self, tmp_path):
+        """The exact artifact measurement E leaves behind: a
+        `readonly=True` open against a missing path. Both this and the
+        no-extension-YAML case above look, to a bare `stat`, like "a file
+        exists here" -- only the header distinguishes them, which is why
+        `check_config_db` reads it rather than trusting existence alone.
+        This is the case the review finding names explicitly: telling an
+        operator to `zfsbackup-config import` a zero-byte file into itself
+        hands that zero-byte file straight to a YAML parser.
+        """
+        zero_byte = tmp_path / "zero_byte.db"
+        zero_byte.touch()
+        assert zero_byte.stat().st_size == 0
+        resolved = ResolvedConfigPath(path=zero_byte, source="default")
+
+        with pytest.raises(ConfigDbNotADatabase) as excinfo:
+            check_config_db(resolved)
+        assert not isinstance(excinfo.value, ConfigDbIsYaml)
+
+    def test_not_a_database_message_never_names_the_file_as_the_import_source(
+        self, tmp_path
+    ):
+        """The specific regression this whole restructuring exists to
+        prevent, pinned directly: a zero-byte `config.db` at the default
+        path must never be told "run `zfsbackup-config import
+        /var/lib/zfsbackup/config.db`" -- the daemon telling the operator
+        to import the file into itself. The message may still mention the
+        `zfsbackup-config import` command in the abstract (as advice for
+        IF the file turns out to be misnamed YAML), but must not pair it
+        with this exact file's own path as the argument.
+        """
+        zero_byte = tmp_path / "config.db"
+        zero_byte.touch()
+        resolved = ResolvedConfigPath(path=zero_byte, source="default")
+
+        with pytest.raises(ConfigDbNotADatabase) as excinfo:
+            check_config_db(resolved)
+
+        message = str(excinfo.value)
+        assert f"zfsbackup-config import {zero_byte}" not in message
+
+    def test_truncated_header_with_valid_magic_raises_not_a_database(
+        self, tmp_path
+    ):
+        """A file whose header matches SQLite's magic bytes but is far
+        too short to be a real database (SQLite's minimum page size is
+        512 bytes) must be reported as corrupt/truncated -- NOT fall
+        through to step 6's "not yet in WAL mode" diagnosis, which would
+        be actively misleading advice (chmod-ing a truncated file does
+        not fix it).
+        """
+        truncated = tmp_path / "truncated.db"
+        truncated.write_bytes(b"SQLite format 3\x00")  # exactly 16 bytes
+        assert 16 <= truncated.stat().st_size < 20
+        resolved = ResolvedConfigPath(path=truncated, source="default")
+
+        with pytest.raises(ConfigDbNotADatabase) as excinfo:
+            check_config_db(resolved)
+
+        message = str(excinfo.value)
+        assert "truncated" in message.lower() or "short" in message.lower()
+        assert "journal_mode=WAL" not in message
+
+    def test_yaml_named_symlink_to_a_real_database_passes(self, tmp_path):
+        """Review finding: the YAML decision reads `real.suffix` (the
+        RESOLVED target's own name), not `resolved.path.suffix` (the given
+        spelling). An operator keeping `/etc/zfsbackup/config.yaml` as a
+        compatibility symlink to a fully migrated, real SQLite database
+        must not get a hard `ConfigDbIsYaml` telling them to import a
+        working database into itself, just because of the symlink's own
+        `.yaml` name -- this used to hard-fail exactly that deployment.
+        """
+        real = tmp_path / "config.db"
+        _make_sqlite_file(real)
+        compat_symlink = tmp_path / "config.yaml"
+        compat_symlink.symlink_to(real)
+        resolved = ResolvedConfigPath(path=compat_symlink, source="default")
+
+        check_config_db(resolved)  # must not raise
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="permission checks are meaningless as root"
+)
+@pytest.mark.integration
+class TestPathsCheckConfigDbUnreadable:
+    def test_unreadable_file_raises_with_actual_and_target_details(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "config.db"
+        _make_sqlite_file(db_path)
+        os.chmod(db_path, 0o000)
+        try:
+            resolved = ResolvedConfigPath(path=db_path, source="default")
+            with pytest.raises(ConfigDbPermissionError) as excinfo:
+                check_config_db(resolved)
+
+            message = str(excinfo.value)
+            assert "zfsbackup" in message  # target group, from CONFIG_OWNER
+            assert f"{CONFIG_DB_MODE:04o}" in message
+            assert CONFIG_OWNER in message
+            assert "mode=0000" in message  # the file's actual mode
+        finally:
+            os.chmod(db_path, 0o644)
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="permission checks are meaningless as root"
+)
+@pytest.mark.integration
+class TestPathsCheckConfigDbDirectoryNotWritable:
+    def test_read_only_directory_raises_with_dir_message(self, tmp_path):
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        db_path = subdir / "config.db"
+        _make_sqlite_file(db_path)
+
+        os.chmod(subdir, 0o555)
+        try:
+            resolved = ResolvedConfigPath(path=db_path, source="default")
+            with pytest.raises(ConfigDbPermissionError) as excinfo:
+                check_config_db(resolved)
+
+            message = str(excinfo.value)
+            assert str(subdir) in message
+            assert "-wal" in message
+            assert "-shm" in message
+            assert f"{CONFIG_DIR_MODE:04o}" in message
+            assert CONFIG_OWNER in message
+        finally:
+            os.chmod(subdir, 0o755)
+
+    def test_directory_writable_but_not_searchable_raises(self, tmp_path):
+        """Review finding: step 5 now requires `os.X_OK` (search/execute
+        permission) as well as `os.W_OK` -- creating a file inside a
+        directory needs both, and checking only one lets a directory
+        missing the other through undetected.
+
+        Unreachable through real filesystem permissions alone on this
+        code path: a directory genuinely missing search permission also
+        blocks `os.stat` on anything inside it, so step 1 (not step 5)
+        would be what actually fires first in a real "chmod the directory"
+        scenario -- there is no real-world permission bit combination that
+        reaches step 5 with `W_OK` true and `X_OK` false for a file this
+        preflight can still `stat`/`open`. `_can_access` is therefore
+        patched directly to isolate step 5's own logic, the same
+        boundary-mocking approach `TestPathsCheckConfigDbSidecarLstatEacces`
+        below uses for the identical reason.
+        """
+        db_path = tmp_path / "config.db"
+        _make_sqlite_file(db_path)
+        resolved = ResolvedConfigPath(path=db_path, source="default")
+        directory = resolved.resolved_path.parent
+
+        real_can_access = store_paths._can_access
+
+        def fake_can_access(path, mode):
+            if path == directory and mode == os.X_OK:
+                return False
+            return real_can_access(path, mode)
+
+        with mock.patch.object(
+            store_paths, "_can_access", side_effect=fake_can_access
+        ):
+            with pytest.raises(ConfigDbPermissionError) as excinfo:
+                check_config_db(resolved)
+
+        message = str(excinfo.value)
+        assert "search" in message.lower()
+        assert str(directory) in message
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="permission checks are meaningless as root"
+)
+@pytest.mark.integration
+class TestPathsCheckConfigDbSymlinkParentResolution:
+    """The soundness gap a review found in the first version of this
+    module: `ResolvedConfigPath` now resolves `path` to an absolute,
+    symlink-followed form exactly once, at construction time
+    (`resolved_path`), and every filesystem check reads that one cached
+    value -- never the symlink's own, un-followed parent directory. Before
+    the fix, step 5's directory-writability check used `path.parent` (the
+    SYMLINK's directory), while SQLite itself creates `-wal`/`-shm` next
+    to the resolved TARGET, so the two directions of the bug were:
+
+    - symlink's directory read-only, target's directory writable: the old
+      code wrongly REJECTED a deployment that opens fine.
+    - symlink's directory writable, target's directory read-only: the old
+      code wrongly PASSED a preflight that then failed, undiagnosed, at
+      the actual open.
+
+    Both directions must be covered, not just the more obviously "broken"
+    first one -- a fix that only stopped rejecting good deployments while
+    leaving the second direction unchecked would still be unsound.
+    """
+
+    def test_symlink_dir_writable_but_target_dir_read_only_fails(
+        self, tmp_path
+    ):
+        target_dir = tmp_path / "target_dir"
+        target_dir.mkdir()
+        real_db = target_dir / "config.db"
+        _make_sqlite_file(real_db)
+
+        link_dir = tmp_path / "link_dir"
+        link_dir.mkdir()
+        link_path = link_dir / "config.db"
+        link_path.symlink_to(real_db)
+
+        os.chmod(target_dir, 0o555)
+        try:
+            resolved = ResolvedConfigPath(path=link_path, source="default")
+            with pytest.raises(ConfigDbPermissionError) as excinfo:
+                check_config_db(resolved)
+            # Names the TARGET's directory, not the symlink's own.
+            assert str(target_dir) in str(excinfo.value)
+        finally:
+            os.chmod(target_dir, 0o755)
+
+    def test_symlink_dir_read_only_but_target_dir_writable_passes(
+        self, tmp_path
+    ):
+        target_dir = tmp_path / "target_dir"
+        target_dir.mkdir()
+        real_db = target_dir / "config.db"
+        _make_sqlite_file(real_db)
+
+        link_dir = tmp_path / "link_dir"
+        link_dir.mkdir()
+        link_path = link_dir / "config.db"
+        link_path.symlink_to(real_db)
+
+        os.chmod(link_dir, 0o555)
+        try:
+            resolved = ResolvedConfigPath(path=link_path, source="default")
+            check_config_db(resolved)  # must not raise
+        finally:
+            os.chmod(link_dir, 0o755)
+
+
+@pytest.mark.unit
+class TestPathsCheckConfigDbResidualOSErrorArm:
+    """Every filesystem call `check_config_db` makes is wrapped so nothing
+    escapes the `ConfigPathError` hierarchy -- including cases that are
+    not simple permission denials at all. A symlink loop (`ELOOP`) and an
+    overlong path component (`ENAMETOOLONG`) both raise a bare `OSError`
+    from `os.stat`/`open`, neither `FileNotFoundError`/`NotADirectoryError`
+    nor `PermissionError`; the module's docstring calls this the "residual
+    `OSError` arm" and promises it becomes `ConfigDbPermissionError`, not a
+    bare `OSError` from a different hierarchy. This is the single-`except
+    ConfigPathError` promise item 8 is built around: any exception that
+    escapes this hierarchy from inside this module is a bug in the module,
+    not a documented possibility for the caller to handle separately.
+    """
+
+    def test_symlink_loop_raises_config_db_permission_error_not_os_error(
+        self, tmp_path
+    ):
+        """`ResolvedConfigPath(...)` construction must be INSIDE the
+        `pytest.raises` block, not before it. On Python 3.10-3.12,
+        `Path.resolve()` converts a symlink loop into a bare `RuntimeError`
+        at construction time (`_resolve_or_raise`, in `__post_init__`) --
+        `check_config_db` is never reached at all. On 3.13+, construction
+        succeeds and `check_config_db`'s own `os.stat` raises `OSError`
+        instead, caught by the same `except (OSError, RuntimeError)` one
+        layer up. Constructing outside the block (an earlier version of
+        this test did) only exercises the 3.13+ path and PASSES on those
+        interpreters while erroring on 3.10-3.12 with an uncaught
+        `RuntimeError` -- exactly the version-dependent gap this test
+        exists to close, and exactly the shape of test-structure defect
+        that let it go unnoticed: this repo's own `pyproject.toml`
+        declares `python = "^3.10"`, but only 3.14 was actually being run.
+        """
+        loop_path = tmp_path / "loop.db"
+        os.symlink(loop_path, loop_path)
+
+        with pytest.raises(ConfigDbPermissionError) as excinfo:
+            resolved = ResolvedConfigPath(path=loop_path, source="default")
+            check_config_db(resolved)
+        assert not isinstance(excinfo.value, OSError)
+        assert not isinstance(excinfo.value, RuntimeError)
+
+    def test_overlong_name_raises_config_db_permission_error_not_os_error(
+        self, tmp_path
+    ):
+        too_long = tmp_path / ("x" * 300 + ".db")
+        resolved = ResolvedConfigPath(path=too_long, source="default")
+
+        with pytest.raises(ConfigDbPermissionError) as excinfo:
+            check_config_db(resolved)
+        assert not isinstance(excinfo.value, OSError)
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="permission checks are meaningless as root"
+)
+@pytest.mark.integration
+class TestPathsCheckConfigDbHappyPath:
+    """No plain, nothing-wrong-at-all pass anywhere else in this file
+    returns all the way through `check_config_db` on a database laid out
+    exactly as `CONFIG_DIR_MODE`/`CONFIG_DB_MODE` prescribe -- every other
+    test in this section is specifically provoking one of the six checks.
+    """
+
+    def test_0660_file_in_0770_directory_returns_none(self, tmp_path):
+        directory = tmp_path / "happy_dir"
+        directory.mkdir()
+        os.chmod(directory, CONFIG_DIR_MODE)
+        db_path = directory / "config.db"
+        _make_sqlite_file(db_path)
+        os.chmod(db_path, CONFIG_DB_MODE)
+
+        resolved = ResolvedConfigPath(path=db_path, source="default")
+        assert check_config_db(resolved) is None
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="permission checks are meaningless as root"
+)
+@pytest.mark.integration
+class TestPathsCheckConfigDbFileNotWritable:
+    """Step 6 of `check_config_db` refuses a not-writable database file in
+    every shape, per a second review round: not-yet-WAL is fatal
+    (unchanged); already-WAL with sidecars missing is fatal
+    (`test_already_wal_sidecars_missing_raises`); already-WAL with a stuck
+    sidecar is fatal (`test_already_wal_stuck_sidecar_raises`); and --
+    changed in this round -- already-WAL with sidecars BOTH present and
+    writable is now **also** fatal
+    (`test_already_wal_sidecars_present_and_writable_raises`), not the
+    warn-and-continue case an earlier version of this test pinned.
+
+    That last case is not a false alarm: it was a genuine TOCTOU window
+    into the permanent-wedge state the other two arms exist to prevent.
+    Sidecars exist only because SOME OTHER connection currently has the
+    database open, and are checkpointed away the moment that connection
+    closes cleanly -- so a preflight that observed them present and
+    writable was, in normal operation, observing a transient state that
+    can flip to "sidecars gone" before this process's own (lazily opened)
+    connection ever arrives, at which point SQLite mints fresh sidecars at
+    this file's own unwritable mode, permanently. There is no stable safe
+    state to warn-and-continue about for a non-writable database file --
+    a caller that genuinely only needs read access has `require_writable=
+    False` for that, not this arm.
+    """
+
+    def test_never_wal_and_chmod_444_raises(self, tmp_path):
+        db_path = tmp_path / "config.db"
+        _make_sqlite_file(db_path, wal=False)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute("PRAGMA journal_mode").fetchone() == (
+                "delete",
+            )
+        finally:
+            conn.close()
+
+        os.chmod(db_path, 0o444)
+        try:
+            resolved = ResolvedConfigPath(path=db_path, source="default")
+            with pytest.raises(ConfigDbPermissionError) as excinfo:
+                check_config_db(resolved)
+
+            message = str(excinfo.value)
+            assert str(db_path) in message
+            assert "journal_mode=WAL" in message
+            assert f"{CONFIG_DB_MODE:04o}" in message
+        finally:
+            os.chmod(db_path, 0o644)
+
+    def test_already_wal_sidecars_missing_raises(self, tmp_path):
+        """`_make_sqlite_file(..., wal=True)` closes its connection
+        cleanly, which checkpoints `-wal`/`-shm` away -- exactly the state
+        a database that has been opened and closed at least once, and then
+        left alone, is normally found in. Opening this file again would
+        let SQLite CREATE fresh sidecars at this file's own (unwritable)
+        mode, permanently -- measured, and the whole reason this is now a
+        HARD failure, deliberately refusing a case a bare `open()` would
+        actually succeed at (measurement B).
+        """
+        db_path = tmp_path / "config.db"
+        _make_sqlite_file(db_path, wal=True)
+        wal_path = tmp_path / "config.db-wal"
+        shm_path = tmp_path / "config.db-shm"
+        assert not wal_path.exists()
+        assert not shm_path.exists()
+
+        os.chmod(db_path, 0o444)
+        try:
+            resolved = ResolvedConfigPath(path=db_path, source="default")
+            with pytest.raises(ConfigDbPermissionError) as excinfo:
+                check_config_db(resolved)
+
+            message = str(excinfo.value)
+            assert str(db_path) in message
+            assert "-wal" in message
+            assert "-shm" in message
+            # No literal "0660" any more: the rationale is OWNERSHIP, not
+            # mode bits -- a newly created sidecar is owned by whichever
+            # process creates it, independent of the database file's own
+            # owner/group, so a mode-bits-only fix does not actually solve
+            # the problem this message describes.
+            assert "OWNED by whichever process creates it" in message
+            assert "require_writable=False" in message
+        finally:
+            os.chmod(db_path, 0o644)
+
+    def test_already_wal_stuck_sidecar_raises(self, tmp_path):
+        """Sidecars present, but one of them is ITSELF unwritable -- the
+        H' state: the database file was chmod'd after these sidecars
+        already existed, and an existing sidecar is never re-chmod'd
+        (`ensure_config_db_mode`). The message must name the stuck
+        sidecar directly and prescribe `chmod`, never a blind `rm` of the
+        `-wal` file (which can hold committed, not-yet-checkpointed data).
+        """
+        db_path = tmp_path / "config.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE t (id INTEGER)")
+            conn.commit()
+            wal_path = tmp_path / "config.db-wal"
+            shm_path = tmp_path / "config.db-shm"
+            assert wal_path.exists()
+            assert shm_path.exists()
+
+            os.chmod(db_path, 0o444)
+            os.chmod(wal_path, 0o444)  # the stuck sidecar
+            try:
+                resolved = ResolvedConfigPath(path=db_path, source="default")
+                with pytest.raises(ConfigDbPermissionError) as excinfo:
+                    check_config_db(resolved)
+
+                message = str(excinfo.value)
+                assert str(wal_path) in message
+                assert str(shm_path) not in message  # only the stuck one
+                assert "Never blindly" in message  # the chmod-not-rm remedy
+                assert f"chmod {CONFIG_DB_MODE:04o}" in message
+            finally:
+                os.chmod(db_path, 0o644)
+                os.chmod(wal_path, 0o644)
+        finally:
+            conn.close()
+
+    def test_already_wal_sidecars_present_and_writable_raises(
+        self, tmp_path
+    ):
+        """Changed in the second review round: measurement B still shows
+        `open()` itself would succeed here (sidecars both present and
+        writable) -- but that is beside the point, and is exactly why an
+        earlier version of this test asserted a warning instead of this
+        raise. The state is transient: these sidecars exist only because
+        THIS TEST's own `conn` still has the database open, and would be
+        checkpointed away the moment `conn.close()` runs -- so a caller's
+        own later, lazily opened connection can just as easily be the one
+        that arrives after that happens, recreating the sidecars at this
+        file's unwritable mode, permanently. `check_config_db` must not
+        let a snapshot of "safe right now" stand in for "safe", so this
+        asserts the raise, not a warning.
+        """
+        db_path = tmp_path / "config.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE t (id INTEGER)")
+            conn.commit()
+            wal_path = tmp_path / "config.db-wal"
+            shm_path = tmp_path / "config.db-shm"
+            assert wal_path.exists()
+            assert shm_path.exists()
+
+            os.chmod(db_path, 0o444)
+            try:
+                resolved = ResolvedConfigPath(path=db_path, source="default")
+                with pytest.raises(ConfigDbPermissionError) as excinfo:
+                    check_config_db(resolved)
+
+                message = str(excinfo.value)
+                assert str(db_path) in message
+                assert "transient" in message
+                assert "require_writable=False" in message
+            finally:
+                os.chmod(db_path, 0o644)
+        finally:
+            conn.close()
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="permission checks are meaningless as root"
+)
+@pytest.mark.integration
+class TestPathsCheckConfigDbSidecarLstatEacces:
+    """Review finding: `_sidecar_lstat` uses `os.lstat` in a `try`, never
+    `Path.exists()`, because `Path.exists()` swallows EVERY `OSError`
+    (`EACCES`, `ELOOP`, a symlink loop in the sidecar's own path -- not
+    only `ENOENT`) into a bare `False`. Before this fix, "permission
+    denied while checking whether the -wal sidecar exists" and "the -wal
+    sidecar genuinely does not exist" were indistinguishable, and
+    `check_config_db` would confidently steer the former into the
+    "sidecars do not both already exist, opening would let SQLite create
+    them" message -- exactly the wrong diagnosis for "could not
+    determine", on a question step 6 could not afford to get wrong.
+
+    Unreachable through real filesystem permissions on this exact code
+    path for the same structural reason `TestPathsCheckConfigDbDirectory
+    NotWritable.test_directory_writable_but_not_searchable_raises` above
+    is: the sidecar lives in the same directory as the database file
+    itself, which step 5 has already confirmed this process can search,
+    so a real permission-denied `os.lstat` on the sidecar specifically
+    (as opposed to `ENOENT`) is not constructible from directory modes
+    alone. `os.lstat` is patched directly to isolate `_sidecar_lstat`'s
+    own exception handling.
+    """
+
+    def test_permission_denied_on_a_sidecar_is_not_read_as_missing(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "config.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE t (id INTEGER)")
+            conn.commit()
+        finally:
+            conn.close()
+        os.chmod(db_path, 0o444)
+
+        resolved = ResolvedConfigPath(path=db_path, source="default")
+        wal_path = tmp_path / "config.db-wal"
+
+        real_lstat = os.lstat
+
+        def fake_lstat(path, *args, **kwargs):
+            if Path(path) == wal_path:
+                raise PermissionError(13, "Permission denied")
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(
+            store_paths.os, "lstat", side_effect=fake_lstat
+        ):
+            with pytest.raises(ConfigDbPermissionError) as excinfo:
+                check_config_db(resolved)
+
+        message = str(excinfo.value)
+        # Must NOT be steered into the "sidecars do not both already
+        # exist" diagnosis -- that is the wrong conclusion for "could not
+        # determine", and is exactly what `Path.exists()`'s `EACCES`
+        # -> `False` collapse used to produce.
+        assert "do not both already exist" not in message
+        assert str(wal_path) in message
+
+    def test_genuinely_missing_sidecar_still_reads_as_missing(self, tmp_path):
+        """The positive control: `_sidecar_lstat` must still return `None`
+        -- not raise -- for the ordinary `ENOENT` case, so the fix above
+        does not turn every "sidecar genuinely absent" case into a hard
+        `ConfigDbPermissionError` of its own.
+        """
+        db_path = tmp_path / "config.db"
+        _make_sqlite_file(db_path, wal=True)  # closes cleanly: no sidecars
+        os.chmod(db_path, 0o444)
+        resolved = ResolvedConfigPath(path=db_path, source="default")
+
+        with pytest.raises(ConfigDbPermissionError) as excinfo:
+            check_config_db(resolved)
+
+        assert "do not both already exist" in str(excinfo.value)
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="permission checks are meaningless as root"
+)
+@pytest.mark.integration
+class TestPathsCheckConfigDbRequireWritableFalse:
+    """Zero coverage anywhere else: `require_writable=False` skips steps 5
+    (directory writable) and 6 (file writable) entirely.
+    """
+
+    def test_skips_directory_and_file_writability_checks(self, tmp_path):
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        db_path = subdir / "config.db"
+        _make_sqlite_file(db_path, wal=False)
+
+        os.chmod(db_path, 0o444)
+        os.chmod(subdir, 0o555)
+        try:
+            resolved = ResolvedConfigPath(path=db_path, source="default")
+            # Would raise ConfigDbPermissionError (directory, then file)
+            # under the default require_writable=True -- see the two
+            # classes above.
+            check_config_db(resolved, require_writable=False)
+        finally:
+            os.chmod(subdir, 0o755)
+            os.chmod(db_path, 0o644)
+
+
+@pytest.mark.integration
+class TestPathsDiagnoseOpenFailure:
+    """`diagnose_open_failure` re-runs `check_config_db`'s stat-based
+    diagnosis for a caller whose real SQLite open already failed --
+    `os.access` is uid-based and permissive under root, so a preflight
+    that already passed can still be followed by a real open failure.
+    """
+
+    def test_diagnosable_failure_chains_the_original_exception(
+        self, tmp_path
+    ):
+        missing = tmp_path / "missing.db"
+        resolved = ResolvedConfigPath(path=missing, source="default")
+        original = RuntimeError("simulated OperationalError from a real open")
+
+        diagnosed = diagnose_open_failure(resolved, original)
+
+        assert isinstance(diagnosed, ConfigDbNotFound)
+        assert diagnosed.__cause__ is original
+
+    def test_undiagnosable_failure_returns_none(self, tmp_path):
+        """A healthy, fully-passing database plus a failure that has
+        nothing to do with the filesystem (a lock held by another
+        process, in the real caller's case) -- `check_config_db` finds
+        nothing wrong, so this must return `None` and let the caller
+        re-raise its own exception rather than raising anything itself.
+        """
+        db_path = tmp_path / "config.db"
+        _make_sqlite_file(db_path)
+        resolved = ResolvedConfigPath(path=db_path, source="default")
+        original = RuntimeError("database is locked")
+
+        assert diagnose_open_failure(resolved, original) is None
+
+
+@pytest.mark.integration
+class TestPathsOpenConfigSession:
+    """`open_config_session` is the sanctioned route to a `Session` (review
+    item 9), replacing an earlier `open_config_db(...) -> Engine` that
+    reopened, by API shape, the exact fork hole `db.py` closes: a bare
+    `Engine` is the natural thing for a supervisor to stash as
+    `self._engine`, and a child forked after that point inherits it
+    without ever calling `get_engine` again -- the pid check never runs,
+    and two processes share one SQLite file descriptor. `open_config_
+    session` is a context manager instead: `check_config_db(resolved)`
+    then a `Session` from `db.py`'s `session_scope`, scoped to one `with`
+    block, resolved through the pid-keyed cache on every call.
+    """
+
+    def test_missing_path_raises_instead_of_creating_a_file(self, tmp_path):
+        missing = tmp_path / "config.db"
+        resolved = ResolvedConfigPath(path=missing, source="default")
+
+        with pytest.raises(ConfigDbNotFound):
+            with open_config_session(resolved, readonly=True):
+                pass
+
+        assert not missing.exists()
+
+    def test_healthy_database_yields_a_working_session(self, tmp_path):
+        db_path = tmp_path / "config.db"
+        _make_sqlite_file(db_path)
+        resolved = ResolvedConfigPath(path=db_path, source="default")
+
+        with open_config_session(resolved, readonly=True) as session:
+            assert session.execute(text("SELECT 1")).scalar() == 1
+
+    def test_call_returns_a_context_manager_not_a_storable_session(
+        self, tmp_path
+    ):
+        """Pins the API-shape fix directly: calling this function -- with
+        no `with` -- must hand back a context manager, not a `Session` a
+        caller could stash on `self` and carry across a `fork`. A caller
+        that tried the old `self._session = open_config_session(...)`
+        shape gets an object with no `execute`/`query`/`close` at all,
+        failing immediately and loudly rather than silently holding a
+        handle invisible to `get_engine`'s pid-keyed cache.
+        """
+        db_path = tmp_path / "config.db"
+        _make_sqlite_file(db_path)
+        resolved = ResolvedConfigPath(path=db_path, source="default")
+
+        ctx = open_config_session(resolved, readonly=True)
+        assert hasattr(ctx, "__enter__") and hasattr(ctx, "__exit__")
+        assert not hasattr(ctx, "execute")
+
+
+@pytest.mark.integration
+class TestPathsOpenConfigConnection:
+    """`open_config_connection` is the sanctioned route to a raw
+    `Connection` (review item 9), for `migrate.py`'s `check_schema`/
+    `ensure_schema`, which take a `Connection`, never a `Session` or a
+    URL. Same context-manager discipline as `open_config_session`, and
+    for the identical fork-safety reason.
+    """
+
+    def test_missing_path_raises_instead_of_creating_a_file(self, tmp_path):
+        missing = tmp_path / "config.db"
+        resolved = ResolvedConfigPath(path=missing, source="default")
+
+        with pytest.raises(ConfigDbNotFound):
+            with open_config_connection(resolved, readonly=True):
+                pass
+
+        assert not missing.exists()
+
+    def test_healthy_database_yields_a_working_connection(self, tmp_path):
+        db_path = tmp_path / "config.db"
+        _make_sqlite_file(db_path)
+        resolved = ResolvedConfigPath(path=db_path, source="default")
+
+        with open_config_connection(resolved, readonly=True) as conn:
+            assert conn.exec_driver_sql("SELECT 1").scalar() == 1
+
+    def test_connection_is_closed_after_the_with_block_exits(self, tmp_path):
+        db_path = tmp_path / "config.db"
+        _make_sqlite_file(db_path)
+        resolved = ResolvedConfigPath(path=db_path, source="default")
+
+        with open_config_connection(resolved, readonly=True) as conn:
+            pass
+
+        assert conn.closed
+
+    def test_call_returns_a_context_manager_not_a_storable_connection(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "config.db"
+        _make_sqlite_file(db_path)
+        resolved = ResolvedConfigPath(path=db_path, source="default")
+
+        ctx = open_config_connection(resolved, readonly=True)
+        assert hasattr(ctx, "__enter__") and hasattr(ctx, "__exit__")
+        assert not hasattr(ctx, "exec_driver_sql")
+
+    def test_usable_for_check_schema(self, tmp_path):
+        """The documented use case: `migrate.py`'s `check_schema`/
+        `ensure_schema` take a `Connection`, never a `Session` or a URL.
+        """
+        db_path = tmp_path / "config.db"
+        eng = create_engine(f"sqlite:///{db_path}")
+        try:
+            with eng.connect() as conn:
+                head = ensure_schema(conn)
+                conn.commit()
+        finally:
+            eng.dispose()
+
+        resolved = ResolvedConfigPath(path=db_path, source="default")
+        with open_config_connection(resolved) as conn:
+            assert check_schema(conn) == head
+
+
+@pytest.mark.integration
+class TestPathsEnsureConfigDir:
+    """`ensure_config_dir` (6a-4): `mkdir`'s own `mode=` is masked by
+    umask, so the explicit `os.chmod` after `mkdir` is load-bearing, not
+    redundant -- and it must be idempotent against a directory that
+    already exists at the wrong mode (e.g. left over from packaging).
+    """
+
+    @pytest.fixture
+    def preserve_umask(self):
+        """Umask is process-global state; restore it after the test
+        regardless of what the test itself sets it to.
+        """
+        original = os.umask(0)
+        os.umask(original)
+        yield
+        os.umask(original)
+
+    def test_creates_directory_at_0770_despite_umask(
+        self, tmp_path, preserve_umask
+    ):
+        os.umask(0o022)
+        target = tmp_path / "new" / "sub"
+
+        ensure_config_dir(target)
+
+        assert target.is_dir()
+        assert stat.S_IMODE(target.stat().st_mode) == CONFIG_DIR_MODE
+
+    def test_idempotent_and_corrects_an_existing_wrong_mode(
+        self, tmp_path, preserve_umask
+    ):
+        os.umask(0o022)
+        target = tmp_path / "existing"
+        target.mkdir()
+        os.chmod(target, 0o700)
+        assert stat.S_IMODE(target.stat().st_mode) != CONFIG_DIR_MODE
+
+        ensure_config_dir(target)  # re-running must not fail...
+
+        assert stat.S_IMODE(target.stat().st_mode) == CONFIG_DIR_MODE  # ...and must correct the mode
+
+
+@pytest.mark.integration
+class TestPathsCreateConfigDbFile:
+    """`create_config_db_file` creates a brand-new, empty database file
+    already fixed to `CONFIG_DB_MODE` in one step, so the mandated
+    create-then-chmod-before-first-connection ordering is not something a
+    caller can get backwards by writing the natural-looking "connect,
+    then chmod" sequence instead.
+    """
+
+    def test_creates_a_file_already_at_config_db_mode_despite_umask(
+        self, tmp_path
+    ):
+        original_umask = os.umask(0o022)
+        try:
+            target = tmp_path / "config.db"
+            create_config_db_file(target)
+
+            assert target.is_file()
+            assert target.stat().st_size == 0
+            assert stat.S_IMODE(target.stat().st_mode) == CONFIG_DB_MODE
+        finally:
+            os.umask(original_umask)
+
+    def test_refuses_to_overwrite_an_existing_file(self, tmp_path):
+        """`O_CREAT | O_EXCL`: `import` against an existing file is a
+        different, explicit operation this function must not silently
+        perform by truncating whatever was already there.
+        """
+        target = tmp_path / "config.db"
+        target.write_bytes(b"already here")
+
+        with pytest.raises(ConfigDbPermissionError) as excinfo:
+            create_config_db_file(target)
+
+        assert target.read_bytes() == b"already here"  # untouched
+        assert not isinstance(excinfo.value, OSError)
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="permission checks are meaningless as root"
+)
+@pytest.mark.integration
+class TestPathsCreationPolicyWrappedExceptions:
+    """`ensure_config_dir`, `create_config_db_file`, and
+    `ensure_config_db_mode` used to raise raw `PermissionError` on a
+    filesystem failure; every one of them now wraps it into
+    `ConfigDbPermissionError` with actual-vs-target detail (owner, group,
+    mode), matching the preflight's own diagnostic style, rather than
+    surfacing a bare `PermissionError: [Errno 13] Permission denied`.
+    """
+
+    def test_ensure_config_dir_wraps_permission_error(self, tmp_path):
+        parent = tmp_path / "noaccess"
+        parent.mkdir()
+        os.chmod(parent, 0o555)
+        try:
+            with pytest.raises(ConfigDbPermissionError) as excinfo:
+                ensure_config_dir(parent / "sub")
+            assert not isinstance(excinfo.value, OSError)
+        finally:
+            os.chmod(parent, 0o755)
+
+    def test_create_config_db_file_wraps_permission_error(self, tmp_path):
+        parent = tmp_path / "noaccess"
+        parent.mkdir()
+        os.chmod(parent, 0o555)
+        try:
+            with pytest.raises(ConfigDbPermissionError) as excinfo:
+                create_config_db_file(parent / "config.db")
+            assert not isinstance(excinfo.value, OSError)
+        finally:
+            os.chmod(parent, 0o755)
+
+    def test_ensure_config_db_mode_wraps_permission_error(self, tmp_path):
+        """`chmod` is governed by file ownership, not the containing
+        directory's permissions, so a read-only parent does not exercise
+        this path -- a missing target does (`FileNotFoundError` from
+        `os.chmod`, the same wrapped-`OSError` code path).
+        """
+        missing = tmp_path / "does_not_exist.db"
+
+        with pytest.raises(ConfigDbPermissionError) as excinfo:
+            ensure_config_db_mode(missing)
+        assert not isinstance(excinfo.value, OSError)
+
+
+@pytest.mark.integration
+class TestPathsSidecarModeInheritance:
+    """Measurement H/H': SQLite copies the DATABASE FILE's mode onto
+    `-wal`/`-shm` the moment it creates them, independent of the process
+    umask -- but it never re-chmods a sidecar that already exists. This is
+    the entire reason `ensure_config_db_mode` must run before the first
+    connection is opened, not merely "eventually", and it is why the
+    positive and negative cases below must be paired: a test that only
+    covers the "chmod'd first" case could not tell a real ordering
+    dependency apart from "sidecars always inherit the umask" being false
+    in general.
+    """
+
+    @pytest.fixture
+    def preserve_umask(self):
+        original = os.umask(0)
+        os.umask(original)
+        yield
+        os.umask(original)
+
+    def test_chmod_before_first_open_makes_sidecars_0660_under_umask_022(
+        self, tmp_path, preserve_umask
+    ):
+        db_path = tmp_path / "config.db"
+        db_path.touch()
+        ensure_config_db_mode(db_path)
+        assert stat.S_IMODE(db_path.stat().st_mode) == CONFIG_DB_MODE
+
+        os.umask(0o022)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE t (id INTEGER)")
+            conn.commit()
+
+            wal_path = tmp_path / "config.db-wal"
+            shm_path = tmp_path / "config.db-shm"
+            assert wal_path.exists()
+            assert shm_path.exists()
+            assert stat.S_IMODE(wal_path.stat().st_mode) == 0o660
+            assert stat.S_IMODE(shm_path.stat().st_mode) == 0o660
+        finally:
+            conn.close()
+
+    def test_no_chmod_before_first_open_leaves_sidecars_at_umask_default(
+        self, tmp_path, preserve_umask
+    ):
+        db_path = tmp_path / "config2.db"
+        os.umask(0o022)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE t (id INTEGER)")
+            conn.commit()
+
+            assert stat.S_IMODE(db_path.stat().st_mode) == 0o644
+
+            wal_path = tmp_path / "config2.db-wal"
+            shm_path = tmp_path / "config2.db-shm"
+            assert wal_path.exists()
+            assert shm_path.exists()
+            assert stat.S_IMODE(wal_path.stat().st_mode) == 0o644
+            assert stat.S_IMODE(shm_path.stat().st_mode) == 0o644
+        finally:
+            conn.close()
+
+    def test_ensure_config_db_mode_re_chmods_existing_sidecars(
+        self, tmp_path, preserve_umask
+    ):
+        """The correctness `ensure_config_db_mode`'s re-chmod behaviour is
+        FOR: a re-import against a database that already has stale-mode
+        `-wal`/`-shm` sidecars (created by a scenario harness, a plain
+        `cp` that brought them along, or a bare `sqlite3` invocation under
+        a permissive umask) must fix those sidecars too, not just the
+        database file -- an existing sidecar left at a stale mode is
+        exactly the H' state `check_config_db`'s step 6 detects and
+        refuses at open time, and this function existing at all is
+        supposed to prevent reaching that state in the first place.
+        """
+        db_path = tmp_path / "config.db"
+        os.umask(0o022)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE t (id INTEGER)")
+            conn.commit()
+
+            wal_path = tmp_path / "config.db-wal"
+            shm_path = tmp_path / "config.db-shm"
+            assert wal_path.exists()
+            assert shm_path.exists()
+            # Stale, umask-derived mode -- not yet fixed.
+            assert stat.S_IMODE(wal_path.stat().st_mode) == 0o644
+            assert stat.S_IMODE(shm_path.stat().st_mode) == 0o644
+
+            ensure_config_db_mode(db_path)
+
+            assert stat.S_IMODE(db_path.stat().st_mode) == CONFIG_DB_MODE
+            assert stat.S_IMODE(wal_path.stat().st_mode) == CONFIG_DB_MODE
+            assert stat.S_IMODE(shm_path.stat().st_mode) == CONFIG_DB_MODE
+        finally:
+            conn.close()
+
+    def test_ensure_config_db_mode_is_a_no_op_for_sidecars_that_do_not_exist(
+        self, tmp_path, preserve_umask
+    ):
+        db_path = tmp_path / "config.db"
+        db_path.touch()
+
+        ensure_config_db_mode(db_path)  # must not raise despite no sidecars
+
+        assert stat.S_IMODE(db_path.stat().st_mode) == CONFIG_DB_MODE
+
+
+@pytest.mark.unit
+class TestStorePackageReExports:
+    """`zfsbackup/config/store/__init__.py`'s 16 new item-6a re-exports
+    (`CONFIG_DB_MODE` through `resolve_config_url`, plus `SchemaError` and
+    friends) have zero coverage anywhere else in this file: every test
+    above imports directly from `...store.paths`/`...store.migrate`,
+    never from the package root. This does not re-test any behaviour --
+    it only pins that `from zfsbackup.config.store import *` actually
+    exposes what `__all__` promises, catching a name present in one but
+    not the other (a typo in `__all__`, or a forgotten re-export) that no
+    other test in this file would ever notice.
+    """
+
+    def test_star_import_exposes_every_name_in_all(self):
+        import zfsbackup.config.store as store_pkg
+
+        namespace: dict = {}
+        exec(
+            "from zfsbackup.config.store import *", namespace  # noqa: S102
+        )
+        for name in store_pkg.__all__:
+            assert name in namespace, f"{name!r} missing from star-import"
+            assert namespace[name] is getattr(store_pkg, name)
+
+    def test_all_and_module_namespace_agree(self):
+        """Every name `__all__` lists must actually resolve on the
+        package; the reverse (extra attributes not in `__all__`) is fine
+        and not asserted here -- `__all__` is a curated subset, not an
+        exhaustive listing.
+        """
+        import zfsbackup.config.store as store_pkg
+
+        for name in store_pkg.__all__:
+            assert hasattr(store_pkg, name), f"{name!r} in __all__ but missing"

@@ -106,6 +106,24 @@ Per-destination retention overrides (`RetentionRule`) are scoped by
 `dataset_remote_id`, an FK to `DatasetRemote`, not by a `destination_name`
 column on `RetentionRule` itself -- see `RetentionRule`'s docstring in
 `models.py` for why a direct `Destination` reference was rejected.
+
+`zfsbackup/config/store/paths.py` (item 6a) owns config-database path
+resolution (`resolve_config_path`/`resolve_config_url`: explicit `-c` >
+`ZFSBACKUP_CONFIG` > `/var/lib/zfsbackup/config.db`), the pre-engine
+existence/permission preflight (`check_config_db`,
+`diagnose_open_failure`) that a `readonly=True` `db.py` engine cannot
+itself provide (it would silently create a zero-byte file at a missing
+path instead of refusing), and the creation-policy constants and helpers
+(`ensure_config_dir`, `create_config_db_file`, `ensure_config_db_mode`)
+that item 10's `import` must call, in that order, before opening the
+database's first connection. Its only sanctioned ways to reach a live
+`Session`/`Connection` -- `open_config_session`/`open_config_connection`
+-- are context managers that preflight first and never hand back a bare,
+storable `Engine`: `db.py`'s pid-keyed fork-safety cache depends on
+nothing capturing a long-lived handle outside a `with` block, and an
+`Engine` returned by value from this module would be exactly such a
+handle. It has no caller in this repo yet; `daemon.py` still loads YAML,
+and wiring it into the daemon and CLI is item 8's job.
 """
 
 from zfsbackup.config.store.models import (
@@ -129,28 +147,82 @@ from zfsbackup.config.store.db import (
 )
 from zfsbackup.config.store.mapper import load_config, save_config
 from zfsbackup.config.store.migrate import (
+    SchemaError,
+    SchemaOutOfDate,
     SchemaSplitBrain,
     SchemaVersionMismatch,
+    check_schema,
     ensure_schema,
+)
+from zfsbackup.config.store.paths import (
+    CONFIG_DB_MODE,
+    CONFIG_DIR_MODE,
+    CONFIG_OWNER,
+    CONFIG_PATH_ENV,
+    DEFAULT_CONFIG_DB,
+    ConfigDbIsYaml,
+    ConfigDbNotADatabase,
+    ConfigDbNotAFile,
+    ConfigDbNotFound,
+    ConfigDbPathUnrepresentable,
+    ConfigDbPermissionError,
+    ConfigPathEnvError,
+    ConfigPathError,
+    ResolvedConfigPath,
+    check_config_db,
+    create_config_db_file,
+    diagnose_open_failure,
+    ensure_config_db_mode,
+    ensure_config_dir,
+    open_config_connection,
+    open_config_session,
+    resolve_config_path,
+    resolve_config_url,
 )
 
 __all__ = [
     "Base",
+    "CONFIG_DB_MODE",
+    "CONFIG_DIR_MODE",
+    "CONFIG_OWNER",
+    "CONFIG_PATH_ENV",
+    "ConfigDbIsYaml",
+    "ConfigDbNotADatabase",
+    "ConfigDbNotAFile",
+    "ConfigDbNotFound",
+    "ConfigDbPathUnrepresentable",
+    "ConfigDbPermissionError",
+    "ConfigPathEnvError",
+    "ConfigPathError",
     "Dataset",
     "DatasetRemote",
+    "DEFAULT_CONFIG_DB",
     "Destination",
     "GlobalSettings",
     "NAMING_CONVENTION",
     "ReadOnlySessionError",
     "RemoteServer",
+    "ResolvedConfigPath",
     "RetentionRule",
+    "SchemaError",
+    "SchemaOutOfDate",
     "SchemaSplitBrain",
     "SchemaVersionMismatch",
+    "check_config_db",
+    "check_schema",
+    "create_config_db_file",
+    "diagnose_open_failure",
     "dispose_all",
+    "ensure_config_db_mode",
+    "ensure_config_dir",
     "ensure_schema",
     "get_engine",
     "load_config",
     "make_engine",
+    "open_config_connection",
+    "open_config_session",
+    "resolve_config_path",
+    "resolve_config_url",
     "save_config",
     "session_for_engine",
     "session_scope",

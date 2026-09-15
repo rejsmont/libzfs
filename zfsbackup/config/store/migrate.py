@@ -14,6 +14,16 @@ to date; the daemon will only ever *check* the current revision against the
 package's head and refuse to start on a mismatch, never write -- "the CLI
 is the only writer" is what item 5's fork-safety and WAL design depend on.
 
+**`check_schema(connection)` (item 6a) is that check.** It is the
+never-writes half of what used to be `ensure_schema`'s single monolithic
+body -- see its own docstring -- and it is what makes the daemon's
+"only checks, never writes" promise above an actual function the daemon
+can call rather than just a sentence in this docstring. `ensure_schema`
+is now defined in terms of it (`check_schema` + `command.upgrade`) so the
+two cannot drift apart: a database `check_schema` accepts needs nothing
+done to it, and one it refuses is, by construction, exactly the state
+`ensure_schema`'s `except SchemaOutOfDate` branch migrates.
+
 **Binding note for item 8, verified against SQLAlchemy 2.0.51 / Alembic
 1.18.5 / pysqlite:** call `ensure_schema(connection)` as a standalone unit
 of work, then `connection.commit()` immediately -- before doing anything
@@ -94,7 +104,51 @@ from zfsbackup.config.store.models import Base
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 
-class SchemaVersionMismatch(RuntimeError):
+class SchemaError(RuntimeError):
+    """Base for the three schema-state refusals `check_schema`/
+    `ensure_schema` can raise: `SchemaSplitBrain`, `SchemaVersionMismatch`,
+    `SchemaOutOfDate`.
+
+    Deliberately **not** the base of the bare `RuntimeError` `check_schema`
+    raises when its own installed migration scripts have more than one
+    head (see that function) -- that is a packaging defect in this
+    installed zfsbackup package, not an operator-fixable database state,
+    and the two must not share a catchable base. Item 8's daemon half is
+    expected to catch `SchemaError` specifically, mirroring `ConfigPathError`
+    in `paths.py`: an `except RuntimeError` there would also silently
+    absorb the multi-head packaging bug into the same "clean refusal,
+    log and exit" handling meant for a stale-but-fixable schema, instead
+    of letting it crash loudly as a bug report.
+    """
+
+
+class SchemaOutOfDate(SchemaError):
+    """Raised by `check_schema` when a database's recorded Alembic
+    revision(s) are ones this installed package's migration scripts DO
+    recognise, but are not the package's head -- i.e. the database predates
+    an upgrade this package already knows how to perform.
+
+    This is the daemon's refusal case (item 6a / item 8; `migrate.py`'s
+    module docstring and `docs/config_db_cli_plan.md:821-823` both promise
+    "the daemon only *checks* and refuses to start on a mismatch, never
+    write"). The distinction from `SchemaVersionMismatch` matters: that
+    exception is a revision this package has never heard of (newer package
+    wrote it); this one is a revision this package HAS heard of and could
+    upgrade -- `ensure_schema` would happily run `command.upgrade(cfg,
+    "head")` and fix it. The daemon must not do that itself. Reading an
+    older schema through the current ORM models risks silently
+    misinterpreting a column that migrated meaning, or missing one that was
+    added -- e.g. reading pre-retention-scoping rows as if
+    `dataset_remote_id` already existed. Data loss (a daemon that refuses to
+    start) beats data corruption (a daemon that starts and mis-reads
+    config). The fix is always `zfsbackup-config import`/the CLI's
+    migration path, i.e. `ensure_schema`, run deliberately by an operator or
+    the CLI -- never automatically by a process that only ever opens the
+    database read-only.
+    """
+
+
+class SchemaVersionMismatch(SchemaError):
     """Raised by `ensure_schema` when a database's recorded Alembic
     revision is not one the installed package's migration scripts know
     about.
@@ -110,7 +164,7 @@ class SchemaVersionMismatch(RuntimeError):
     """
 
 
-class SchemaSplitBrain(RuntimeError):
+class SchemaSplitBrain(SchemaError):
     """Raised by `ensure_schema` when a database has no recorded Alembic
     revision (`alembic_version` missing or empty) but one or more tables
     this package's schema defines already exist.
@@ -193,48 +247,60 @@ def _build_config(connection: Connection) -> Config:
     return cfg
 
 
-def ensure_schema(connection: Connection) -> str:
-    """Bring `connection`'s database up to this installed package's
-    Alembic head revision, in place, and return that head revision's id.
+def check_schema(connection: Connection) -> str:
+    """Check `connection`'s database against this installed package's
+    Alembic head revision and return that head revision's id. **Never
+    writes anything** -- no DDL, no DML, not even `alembic_version`.
 
-    Idempotent: a database already at head is left untouched (Alembic's
-    `upgrade head` against a current DB runs no migrations). Never commits
-    or closes `connection` -- the caller owns the transaction, the same
-    contract `mapper.save_config` already follows. **`connection.commit()`
-    immediately after this call is not optional, even on a connection that
-    had no prior activity at all** -- see this module's docstring for the
-    two independently-verified ways of losing work otherwise (an already-
-    open caller transaction destroys the whole migration on rollback; a
-    clean connection still leaves the `alembic_version` stamp -- not the
-    schema -- uncommitted and at risk, because reading it is itself the
-    first thing this function does).
+    That is a statement about writes, not about transactions: `Migration
+    Context.configure(connection).get_current_heads()` and
+    `_has_existing_schema`'s `inspect(connection)` both issue `SELECT`s,
+    and on a file-backed connection from `store/db.py`'s reader engine a
+    bare `SELECT` still opens (or extends) a real SQLite read transaction
+    that pins a WAL read snapshot for as long as it stays open. The
+    caller does not need to `commit()` after `check_schema` -- there is
+    nothing to commit -- but a caller that keeps `connection` open and
+    idle afterwards is still holding that snapshot open, and under WAL an
+    open reader snapshot is exactly what prevents a checkpoint from
+    passing, letting the `-wal` file grow without bound (see `db.py`'s
+    module docstring, "Transaction start: readers and writers differ
+    deliberately"). Close or roll back `connection` once you are done
+    with the value `check_schema` returned, the same discipline
+    `session_for_engine`'s reader form already applies. This is the half of the old,
+    monolithic `ensure_schema` that item 6a's daemon-refusal contract
+    (`migrate.py`'s own module docstring, `docs/config_db_cli_plan.md:
+    821-823`) actually needs: "the daemon only *checks* and refuses to
+    start on a mismatch, never write". `ensure_schema` below is now
+    `check_schema` plus `command.upgrade` and nothing else, specifically so
+    the two functions cannot drift apart -- a case `check_schema` accepts
+    is by construction a case `ensure_schema` treats as already done, and a
+    case it refuses is by construction one only `ensure_schema` (an
+    operator-driven migration) can fix.
 
-    Before upgrading, checks that every revision the database currently
-    records (`MigrationContext.get_current_heads()`) is one this package's
-    migration scripts recognise (`ScriptDirectory.get_revision`). A
-    database migrated by a *newer* zfsbackup package -- one whose
-    migrations this installed package has never seen -- fails this check
-    and raises `SchemaVersionMismatch` naming both the database's revision
-    and this package's head, rather than either refusing to progress with
-    no explanation or, worse, attempting `upgrade head` against a history
-    Alembic cannot make sense of. A brand new (empty) database has no
-    current heads at all, so the loop below is a no-op for it and
-    `command.upgrade` performs the full initial migration.
+    Raises, in order:
 
-    A database can also have no current heads *and* already contain one or
-    more of this package's tables -- `alembic_version` missing or emptied
-    while the application tables it should describe remain. For a
-    connection that did not come from `store/db.py`'s writer engine this is
-    not a remote edge case at all: it is exactly what an earlier
-    `ensure_schema` call whose caller never committed (or rolled back)
-    leaves behind. Over a db.py writer connection the same mistake instead
-    rolls the whole migration back, so the state is reachable only through
-    a non-db.py connection or manual intervention -- see
-    `SchemaSplitBrain`'s docstring and this module's item-8 binding note.
-    It is detected (`_has_existing_schema`) and raised as `SchemaSplitBrain`
-    before attempting `command.upgrade`, which would otherwise fail with a
-    bare, unrecoverable `OperationalError: table ... already exists` on
-    every retry.
+    - `RuntimeError` if this package's own migration scripts have more than
+      one head -- a packaging defect, never an operator-fixable state (see
+      inline comment below).
+    - `SchemaSplitBrain` if the database has no recorded Alembic revision
+      (`alembic_version` missing or empty) but one or more of this
+      package's tables already exist -- `alembic_version` lost to an
+      uncommitted `ensure_schema` call, or the tables created some other
+      way. See that exception's docstring.
+    - `SchemaVersionMismatch` if the database records a revision this
+      installed package's migration scripts do not recognise -- written by
+      a *newer* zfsbackup package. See that exception's docstring.
+    - `SchemaOutOfDate` if the database's recorded revision(s) are ones
+      this package *does* recognise but are not its head -- including a
+      brand-new or empty database with no recorded revision at all (no
+      `alembic_version`, no tables): `check_schema` cannot itself perform
+      the initial migration, so that case is a refusal here, not the
+      silent "create it" that `ensure_schema` alone used to provide. See
+      that exception's docstring for why the daemon's refusal, not a
+      log-and-continue, is the deliberate behaviour.
+
+    Returns the code head with no exception only when the database's
+    recorded heads are exactly `{code_head}`.
     """
     cfg = _build_config(connection)
     script = ScriptDirectory.from_config(cfg)
@@ -242,7 +308,7 @@ def ensure_schema(connection: Connection) -> str:
     if len(code_heads) != 1:
         # get_current_head() (singular) raises a bare
         # `CommandError: The script directory has multiple heads` for this
-        # case instead of something ensure_schema's own error handling
+        # case instead of something this function's own error handling
         # would catch -- guard explicitly so a branched migration history
         # (which should never happen for this package -- a single linear
         # chain is the whole point of the item-7 baseline) fails with a
@@ -250,9 +316,10 @@ def ensure_schema(connection: Connection) -> str:
         # of the checks below.
         raise RuntimeError(
             f"zfsbackup's installed migration scripts have "
-            f"{len(code_heads)} heads {code_heads!r}; ensure_schema only "
-            f"supports a single, linear migration history. This is a "
-            f"packaging defect, not something fixable by an operator."
+            f"{len(code_heads)} heads {code_heads!r}; check_schema/"
+            f"ensure_schema only support a single, linear migration "
+            f"history. This is a packaging defect, not something fixable "
+            f"by an operator."
         )
     code_head = code_heads[0]
 
@@ -283,5 +350,94 @@ def ensure_schema(connection: Connection) -> str:
                 f"again."
             ) from exc
 
-    command.upgrade(cfg, "head")
+    if set(db_heads) != {code_head}:
+        if db_heads:
+            current = f"revision(s) {sorted(db_heads)!r}"
+        else:
+            current = (
+                "no recorded Alembic revision at all (alembic_version "
+                "missing or empty, and no application tables exist -- a "
+                "brand-new or empty database)"
+            )
+        raise SchemaOutOfDate(
+            f"Database schema is at {current}, which is behind this "
+            f"installed zfsbackup package's migration head {code_head!r}. "
+            f"check_schema() only checks -- it never migrates the "
+            f"database, so this is a refusal, not an automatic upgrade. "
+            f"Run `zfsbackup-config import` (or otherwise invoke "
+            f"ensure_schema()) to bring the database up to date, then "
+            f"start the daemon again."
+        )
+
     return code_head
+
+
+def ensure_schema(connection: Connection) -> str:
+    """Bring `connection`'s database up to this installed package's
+    Alembic head revision, in place, and return that head revision's id.
+
+    **Reimplemented as `check_schema(connection)` plus `command.upgrade`,
+    so the two can never drift.** `check_schema` alone decides whether the
+    database needs anything done to it; this function's only addition is
+    performing that migration when `check_schema` says `SchemaOutOfDate`,
+    then re-checking to confirm and return the head. Every other exception
+    `check_schema` can raise (`RuntimeError`, `SchemaSplitBrain`,
+    `SchemaVersionMismatch`) is not something a migration can fix, so it
+    propagates unchanged -- `ensure_schema` catches `SchemaOutOfDate`
+    specifically, nothing broader.
+
+    Idempotent: a database already at head is left untouched --
+    `check_schema` returns immediately with no exception and no write at
+    all (not even a no-op `command.upgrade` call), which is a strictly
+    stronger guarantee than the previous implementation's "Alembic's
+    `upgrade head` against a current DB runs no migrations" (that version
+    still opened and read `alembic_version` via `command.upgrade` on every
+    call; this one does not call into `command.upgrade` at all once the
+    database is current). Never commits or closes `connection` -- the
+    caller owns the transaction, the same contract `mapper.save_config`
+    already follows. **`connection.commit()` immediately after this call
+    is not optional, even on a connection that had no prior activity at
+    all** -- see this module's docstring for the two independently-
+    verified ways of losing work otherwise (an already-open caller
+    transaction destroys the whole migration on rollback; a clean
+    connection still leaves the `alembic_version` stamp -- not the schema
+    -- uncommitted and at risk, because reading it is itself the first
+    thing `check_schema` does).
+
+    A brand new (empty) database has no current heads at all, so
+    `check_schema` raises `SchemaOutOfDate` for it just like any other
+    behind-head database, and the migration below performs the full
+    initial migration via `command.upgrade`.
+
+    **`command.upgrade` deliberately runs OUTSIDE the `except` block**,
+    not nested inside it. An earlier version of this function called it
+    from within `except SchemaOutOfDate:`, which is correct in outcome
+    but wrong in presentation: had `command.upgrade` itself failed, Python
+    would report it chained as "During handling of the above exception,
+    another exception occurred" underneath `SchemaOutOfDate`'s own "run
+    the CLI to migrate" text -- telling the reader to run the very
+    command whose failure they are looking at, and burying the real
+    traceback under an exception that was never the problem. Capturing
+    "does this need a migration" as a plain boolean first, and running
+    `command.upgrade` only after leaving the `except` block entirely,
+    keeps a genuine upgrade failure an unchained, first-class exception.
+    """
+    needs_migration = False
+    try:
+        head = check_schema(connection)
+    except SchemaOutOfDate:
+        needs_migration = True
+
+    if not needs_migration:
+        return head
+
+    cfg = _build_config(connection)
+    command.upgrade(cfg, "head")
+    # Re-derive rather than trust anything computed above: this confirms
+    # the upgrade actually landed (a mutant that silently swallowed
+    # `command.upgrade`'s effect would fail this line, not just look
+    # correct), and it is the reason `ensure_schema` and `check_schema`
+    # cannot silently drift apart -- `ensure_schema` never computes "is
+    # this database current" by any means other than calling
+    # `check_schema`.
+    return check_schema(connection)
