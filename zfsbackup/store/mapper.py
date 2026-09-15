@@ -208,12 +208,27 @@ def _assert_scope_integrity(ds: models.Dataset) -> None:
 
     The composite FK (`fk_retention_rules_dataset_remote`, `models.py`)
     normally makes this impossible -- but only when `PRAGMA
-    foreign_keys=ON`, which is per-connection in SQLite, off by default,
-    and not yet applied anywhere (item 5, engine/session setup, has not
-    landed). Without this check, a row like that would silently vanish from
-    dataset A's config and reappear scoped under dataset B's -- a retention
-    change with no error and no log, exactly the failure class the FK
-    exists to prevent structurally. This is the belt to that braces.
+    foreign_keys=ON`, which is per-connection in SQLite and off by default.
+    Since item 5, `zfsbackup/store/db.py` sets that pragma on every
+    connection **it** creates. **This check stays regardless, and must not
+    be deleted as obsolete**, for two independent reasons:
+
+    - Not every connection comes from `db.py`. Alembic's SQLite batch
+      migrations recreate tables and must run with FK enforcement OFF
+      (`db.py`'s `foreign_keys=False` opt-out exists for exactly that);
+      the `sqlite3` CLI, a hand-rolled `create_engine` in a fixture, or a
+      restored/hand-edited database file are all FK-off paths into these
+      same rows.
+    - The second loop below catches a case **no FK covers at all** -- see
+      the paragraph on `DatasetRemote.retention_rules`: a row whose
+      `dataset_remote_id` is perfectly valid but whose `dataset_id` names a
+      different or nonexistent dataset satisfies every FK in the schema
+      while appearing in no dataset's `.retention_rules` collection.
+
+    Without this check, a row like that would silently vanish from dataset
+    A's config and reappear scoped under dataset B's -- a retention change
+    with no error and no log, exactly the failure class the FK exists to
+    prevent structurally. This is the belt to that braces.
 
     Two independent joins have to be checked, not one, because
     `Dataset.retention_rules` and `DatasetRemote.retention_rules` filter on
@@ -271,7 +286,13 @@ def _dataset_to_dataclass(
     mirroring `config.py:715-728`'s load-time check. The FK on
     `destination_name` normally makes an undeclared reference impossible,
     but (as with `_assert_scope_integrity`) that guarantee is conditional on
-    `PRAGMA foreign_keys=ON`, which nothing here can assume yet.
+    `PRAGMA foreign_keys=ON`. Item 5's `zfsbackup/store/db.py` now sets that
+    pragma on every connection it creates, and **this re-check still stays**:
+    connections that do not come from `db.py` (Alembic batch migrations,
+    which must run FK-off; the `sqlite3` CLI; a fixture building its own
+    engine) can leave rows behind that no FK ever vetted, and this is the
+    only place a `BackupConfig` built from them would otherwise acquire a
+    `remote` entry pointing at a destination it does not contain.
     """
     _assert_scope_integrity(ds)
 
@@ -511,6 +532,14 @@ def save_config(session: Session, config: BackupConfig) -> None:
        `validate_retention_uniqueness` per scope. Skipping any of these
        does not fail loudly -- it fails as a bare `IntegrityError`/`CHECK
        constraint failed` raised mid-insert, well after the wipe.
+
+       **None of step 1 is FK-related**, so item 5's `store/db.py` (which
+       enables `PRAGMA foreign_keys=ON` on every connection it creates)
+       makes none of it redundant: these checks run *before* any DELETE,
+       against in-memory dataclasses, precisely so a rejected config never
+       reaches the point where a constraint -- FK or otherwise -- could fire
+       at all. The whole value is in failing before the wipe, which no
+       DB-side constraint can do.
     2. Drop exact `(age, keep_for)` duplicates per scope (see
        `_dedupe_exact_duplicates`) -- the DB rejects what step 1 permits.
     3. Read the current `GlobalSettings.generation` (default -1 if the
@@ -523,8 +552,11 @@ def save_config(session: Session, config: BackupConfig) -> None:
        on `ON DELETE CASCADE` at all: an ORM-enabled bulk `delete()` never
        applies relationship cascades (only the DB's `ON DELETE CASCADE`
        does that, and only when `PRAGMA foreign_keys=ON`, which is
-       per-connection, off by default, and not guaranteed by anything
-       upstream of this module -- item 5 has not landed). Deleting only
+       per-connection and off by default; since item 5, `store/db.py` sets
+       it on every connection *it* creates, but Alembic batch migrations
+       deliberately run FK-off, and the `sqlite3` CLI and hand-built
+       engines never set it -- so this module still assumes nothing about
+       it). Deleting only
        `datasets`/`destinations` with the pragma off leaves
        `dataset_remotes` and `retention_rules` rows behind with a
        `dataset_id` SQLite will reassign to the next inserted dataset's
@@ -640,6 +672,15 @@ def save_config(session: Session, config: BackupConfig) -> None:
             )
 
     # --- 3. Read the generation to carry forward (before any DELETE). ---
+    # This read and the `previous + 1` written in step 6 are a read-modify-
+    # write with no CAS predicate of their own (see `GlobalSettings.
+    # generation` in `models.py`). It is safe only because the caller's
+    # session runs on a writer connection that took SQLite's write lock at
+    # `BEGIN IMMEDIATE` -- `store/db.py` installs that on every file-backed
+    # writer engine precisely so this read cannot race another writer's.
+    # Two writers without it both read N, both write N+1, and items 15/17
+    # never notice the second config. Do not "optimise" this read onto a
+    # separate connection or a read-only session.
     existing_gs = session.get(models.GlobalSettings, 1)
     previous_generation = existing_gs.generation if existing_gs is not None else -1
 
@@ -648,8 +689,11 @@ def save_config(session: Session, config: BackupConfig) -> None:
     # just `Dataset`/`Destination` and rely on `ON DELETE CASCADE`. A bulk
     # `delete()` issued through the ORM does not apply relationship
     # cascades; only the DB's own `ON DELETE CASCADE` does, and that only
-    # fires when `PRAGMA foreign_keys=ON`, which nothing upstream of this
-    # module guarantees yet (item 5). With the pragma off, deleting only
+    # fires when `PRAGMA foreign_keys=ON` -- which `store/db.py` sets on
+    # every connection it creates (item 5), but which is per-connection and
+    # off by default everywhere else: Alembic batch migrations must run
+    # FK-off, and the `sqlite3` CLI and any hand-built engine never set it.
+    # This module assumes nothing about it. With the pragma off, deleting only
     # `datasets` leaves `dataset_remotes`/`retention_rules` rows behind
     # with a `dataset_id` that SQLite will hand to the next inserted
     # dataset's reused rowid -- silently re-adopting stale retention tiers

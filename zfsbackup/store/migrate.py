@@ -53,6 +53,18 @@ losing work if that commit does not happen, and they fail differently:
    call against that database raises rather than hitting a bare
    `OperationalError: table ... already exists` from `command.upgrade`.
 
+**Item 5 changes which of the two cases applies, not the advice.** A
+`Connection` opened from a file-backed writer engine in `zfsbackup/store/
+db.py` runs with pysqlite's implicit transaction handling disabled and an
+explicit `BEGIN IMMEDIATE` at the first statement, so case 2 collapses into
+case 1: the `CREATE TABLE`s no longer auto-commit themselves, and the whole
+migration -- schema and version stamp alike -- lives or dies with the
+caller's commit. That is strictly better (a rolled-back migration leaves an
+untouched database rather than a `SchemaSplitBrain`), and it makes the
+commit below non-optional rather than merely advisable. Do not rely on the
+old auto-commit behaviour for a connection that came from `db.py`; do not
+assume the new behaviour for one that did not.
+
 Both cases are the same underlying advice from the caller's side: nothing
 `ensure_schema` does is durable until the caller commits, and that commit
 must happen immediately, on its own, before the connection does anything
@@ -103,14 +115,24 @@ class SchemaSplitBrain(RuntimeError):
     revision (`alembic_version` missing or empty) but one or more tables
     this package's schema defines already exist.
 
-    Not merely a defensive, hard-to-reach check -- this is the
-    **routinely** reachable outcome of the module docstring's item-8
-    binding note, case 2: call `ensure_schema` on a clean connection and
-    let the caller's process exit, crash, or simply forget to
-    `connection.commit()` before that same call returns, and the database
-    is left in exactly this state (verified directly: the six tables
-    commit durably as `ensure_schema` runs, the `alembic_version` stamp
-    does not, until the caller commits). It can also result from a rolled-
+    **How reachable this is depends on where the connection came from, and
+    that changed with item 5.** Over a connection from `store/db.py`'s
+    writer engine -- the sanctioned item-8 path -- it is *not* routinely
+    reachable: that connection runs under an explicit `BEGIN IMMEDIATE`
+    with pysqlite's implicit transaction handling disabled, so the
+    `CREATE TABLE`s no longer auto-commit ahead of the stamp and a missing
+    commit discards the whole migration instead of half of it (verified
+    both ways: rollback leaves zero tables; commit leaves seven tables and
+    the stamp). Over any *other* connection -- a hand-built engine, the
+    `sqlite3` CLI, a pre-item-5 caller -- it remains the **routinely**
+    reachable outcome of the module docstring's item-8 binding note, case
+    2: call `ensure_schema` on a clean connection and let the caller's
+    process exit, crash, or simply forget to `connection.commit()` before
+    that same call returns, and the database is left in exactly this state
+    (verified directly: the six tables commit durably as `ensure_schema`
+    runs, the `alembic_version` stamp does not, until the caller commits).
+    Either way this check stays -- it is cheap, and the states below do not
+    care how they arose. It can also result from a rolled-
     back caller transaction that had already begun before `ensure_schema`
     was called (case 1 there), a future multi-revision upgrade interrupted
     partway through, or manual intervention on the database file -- this
@@ -201,9 +223,13 @@ def ensure_schema(connection: Connection) -> str:
 
     A database can also have no current heads *and* already contain one or
     more of this package's tables -- `alembic_version` missing or emptied
-    while the application tables it should describe remain. This is not a
-    remote edge case: it is exactly what an earlier `ensure_schema` call
-    whose caller never committed (or rolled back) leaves behind -- see
+    while the application tables it should describe remain. For a
+    connection that did not come from `store/db.py`'s writer engine this is
+    not a remote edge case at all: it is exactly what an earlier
+    `ensure_schema` call whose caller never committed (or rolled back)
+    leaves behind. Over a db.py writer connection the same mistake instead
+    rolls the whole migration back, so the state is reachable only through
+    a non-db.py connection or manual intervention -- see
     `SchemaSplitBrain`'s docstring and this module's item-8 binding note.
     It is detected (`_has_existing_schema`) and raised as `SchemaSplitBrain`
     before attempting `command.upgrade`, which would otherwise fail with a

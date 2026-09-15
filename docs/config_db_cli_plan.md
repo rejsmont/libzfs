@@ -691,13 +691,21 @@ Consequences:
   **any engine or connection created in the supervisor before `_start_workers()` would be inherited by
   every child** — shared SQLite file descriptors corrupt the database, they do not merely error.
   Highest-risk item in the plan.
-- **Concurrency story:**
+- **Concurrency story** *(corrected during implementation — see the notes after each item):*
   - **Engine created lazily, per-process, never before fork.** Module-level engine cache keyed by
-    `(url, os.getpid())`; if the recorded pid differs from `os.getpid()`, discard and rebuild. This makes
-    an accidental pre-fork engine harmless rather than catastrophic.
-  - **Supervisor holds no open engine while spawning.** `daemon.py:153` loads config in `main()`; that
-    session is opened, read, closed, and the engine disposed before `BackupDaemon.run()` (`daemon.py:90`)
-    starts workers.
+    `(url, readonly, foreign_keys)` with the owning pid stored alongside; if the recorded pid differs
+    from `os.getpid()`, discard and rebuild. This makes an accidental pre-fork engine harmless rather
+    than catastrophic. **The discard must use `dispose(close=False)`** — a plain `dispose()` in the
+    child runs pysqlite's close path, including POSIX advisory-lock release which is process-wide on
+    any fd close, against a file the parent believes it owns.
+  - ~~**Supervisor holds no open engine while spawning.**~~ **Wrong on two counts.** There is no
+    session at `daemon.py:153` — it is `BackupConfig.from_file`, pure YAML; nothing outside
+    `zfsbackup/store/` imports the store at all yet, so that sentence describes the post-item-8 world.
+    And more importantly, **there are two fork points, not one**: `_check_workers` re-forks on every
+    worker crash at `daemon.py:77-78`, arbitrarily far into the supervisor's life. A one-time
+    dispose-before-`run()` ordering discipline is therefore **structurally insufficient** — only the
+    pid-keyed cache is a real guarantee. Daemon-side `dispose_all()` is deferred to item 8, where it
+    becomes belt to the cache's braces and must cover **both** fork points.
   - **WAL + pragmas** via a `connect` event listener: `journal_mode=WAL`, `synchronous=NORMAL`,
     `busy_timeout=5000`, `foreign_keys=ON`.
   - **Workers are read-only.** Each reads config once at startup (`workers.py:62`) and never writes it.
@@ -706,8 +714,24 @@ Consequences:
   - **The CLI is the only writer**, a separate short-lived process. Single-writer SQLite is adequate.
 - **Edge cases:** `sqlite:///:memory:` must still work for tests (`StaticPool` +
   `check_same_thread=False`); WAL requires a real file, so the pragma listener skips WAL for in-memory
-  URLs. WAL creates `-wal`/`-shm` sidecars next to the DB — relevant to packaging, permissions (item 6),
-  and `scenarios/` cleanup.
+  URLs — though that skip is **cosmetic, not a correctness requirement**: `journal_mode=WAL` on
+  `:memory:` returns `('memory',)` with no error.
+- **Two measured corrections with consequences for item 6:**
+  - **`PRAGMA journal_mode=WAL` succeeds under `query_only=ON`** — `query_only` governs database
+    *content*, not file-format state. So a "read-only" engine still opens the file read-write and can
+    flip a delete-journal DB to WAL. **The DB file and its containing directory must be writable by
+    the daemon user even though only the CLI writes config.**
+  - **item 6's "a read-only user cannot open a WAL database at all" is overstated.** Measured: with
+    both `-wal` and `-shm` present, a read-only open succeeds even on read-only files in a read-only
+    directory. The real rule is narrower and sharper — **a WAL database needs write permission on the
+    containing directory whenever the `-shm` must be created**, which is the post-crash and
+    first-reader-after-writer-exit case. That is the actual justification for the `0770` directory.
+- **Sidecars:** WAL creates `-wal`/`-shm` next to the DB. They are checkpointed away when the last
+  connection closes cleanly, so they do not persist in steady state. Consequences flagged for items 6
+  and 22: any copy or backup of the DB must take all three files or use `VACUUM INTO` — copying
+  `config.db` alone with a pending `-wal` **silently loses the most recent commits** — and `scenarios/`
+  cleanup must remove all three, since a stale `-wal` from a killed daemon is a plausible source of a
+  confusing "the old config came back" failure.
 - **Verification:** `pytest tests/test_zfsbackup_store.py -k "fork or concurren"`
 
 ### Item 6 — DB path resolution, creation policy, permissions

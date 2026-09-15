@@ -1,26 +1,48 @@
 """Tests for the SQLAlchemy ORM schema in `zfsbackup/store/models.py` (item 3
-of docs/config_db_cli_plan.md).
+of docs/config_db_cli_plan.md), the mapper (item 4), migrations (item 7),
+and the engine/session module (item 5, `zfsbackup/store/db.py`).
 
-This is schema-only coverage: `zfsbackup/store/models.py` defines tables and
-constraints and is not wired into the daemon, workers, or CLI yet, and there
-is no mapper (item 4) or engine/session module (item 5) yet either. Item 9
-will extend this file with mapper round-trip and fork-safety coverage once
-those land.
+This is store-layer coverage: `zfsbackup/store/` defines the schema, the
+dataclass<->ORM mapper, Alembic migrations, and engine/session management,
+and is not wired into the daemon, workers, or CLI yet.
 
-**`PRAGMA foreign_keys=ON` is per-connection in SQLite and off by default.**
-Item 5's engine setup (which will apply this pragma for real) does not exist
-yet, so every fixture here enables it explicitly via a `connect` event
-listener. Without it, the cascade/no-cascade tests below would silently pass
-without actually exercising cascading behaviour at all.
+**Every fixture below goes through `zfsbackup.store.db`** (`make_engine`,
+`get_engine`, `session_for_engine`, `session_scope`) rather than hand-rolling
+`create_engine`/pragma listeners. `foreign_keys` is a real, named parameter
+on `make_engine`, so `engine_no_fk`/`session_no_fk` below are simply
+`make_engine(url, foreign_keys=False)` -- that fixture is **not** a
+workaround for item 5's absence (item 5 has landed). It is the fixture for a
+mode that still exists after item 5: Alembic's SQLite `batch_alter_table`
+migrations must run FK-off (see `db.py`'s note for item 8's `ensure_schema`
+wrapper), and the FK-off regressions pinned by
+`TestMapperWipeReinsertRegression` /
+`TestMapperScopedRulesForeignDatasetRegression` below would pass for the
+wrong reason -- or not discriminate anything at all -- under an FK-on
+fixture, since the DB's own cascade/FK behaviour would paper over exactly
+the bug those tests exist to catch.
 
 **Each test gets a fresh in-memory database** (function-scoped `engine`/
 `session` fixtures) rather than sharing one across the module. Sharing an
 engine let rows accumulate across test cases during development, which made
 a genuine `UNIQUE` violation look like a scope-mixing bug -- the fresh-DB
 discipline avoids that class of false failure entirely.
+
+**`TestDb*` classes near the end of this file are item 5's own coverage**
+(`pytest -k "TestDbEngine or TestDbFork or TestDbWal or TestDbReadOnly or
+TestDbCrash or TestDbDispose or TestDbPragma or TestDbPool"`), including a
+fork-safety test pinned to `multiprocessing.get_context("fork")` and its
+negative control -- see that section's module docstring for why the
+positive test alone would pass vacuously on this machine (Python 3.14 on
+darwin, `spawn`-default).
 """
 
+import json
 import logging
+import multiprocessing
+import os
+import sqlite3
+import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -30,10 +52,11 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, delete, event, inspect, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import create_engine, delete, event, inspect, text, update
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool, SingletonThreadPool, StaticPool
 
 from zfsbackup.config import (
     BackupConfig,
@@ -44,6 +67,17 @@ from zfsbackup.config import (
 )
 from zfsbackup.config import Destination as ConfigDestination
 from zfsbackup.config import RetentionRule as ConfigRetentionRule
+from zfsbackup.store import db as store_db
+from zfsbackup.store.db import (
+    ReadOnlySessionError,
+    _is_memory_url,
+    dispose_all,
+    get_engine,
+    make_engine,
+    session_for_engine,
+    session_scope,
+    url_for_path,
+)
 from zfsbackup.store.mapper import (
     _assert_scope_integrity,
     _dataset_level_rules,
@@ -70,6 +104,14 @@ from zfsbackup.store.models import (
     RetentionRule,
 )
 
+# `multiprocessing`'s default start method is platform- and version-
+# dependent (spawn on this darwin/3.14 machine), so every fork-safety test
+# below pins `multiprocessing.get_context("fork")` explicitly rather than
+# relying on the default -- an unpinned fork test would pass here while
+# testing nothing (`db.py`'s module docstring). Skip cleanly, never error,
+# where "fork" is not an available start method at all.
+FORK_AVAILABLE = "fork" in multiprocessing.get_all_start_methods()
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -80,23 +122,14 @@ from zfsbackup.store.models import (
 def engine():
     """A fresh in-memory SQLite engine, per test, with FK enforcement on.
 
-    `StaticPool` + `check_same_thread=False` is the combination item 5's plan
-    text calls out for in-memory test engines -- without it, SQLite's default
+    Built via `make_engine` (item 5) rather than a hand-rolled
+    `create_engine`/pragma listener -- `StaticPool` + `check_same_thread=
+    False` for `:memory:` URLs, and `PRAGMA foreign_keys=ON`, are both
+    `db.py`'s job now. Without `StaticPool`, SQLite's default
     per-connection `:memory:` semantics mean a second connection from the
     pool would see an *empty* database, not the one `create_all` populated.
     """
-    eng = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-
-    @event.listens_for(eng, "connect")
-    def _enable_foreign_keys(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
+    eng = make_engine("sqlite:///:memory:", foreign_keys=True)
     Base.metadata.create_all(eng)
     yield eng
     eng.dispose()
@@ -104,6 +137,27 @@ def engine():
 
 @pytest.fixture
 def session(engine):
+    """A plain, directly-owned `Session` -- deliberately NOT
+    `session_for_engine`/`session_scope`.
+
+    Those context managers commit on clean exit, which does not match this
+    suite's long-standing contract: the majority of the `pytest.raises(
+    IntegrityError)` tests below call `session.commit()` themselves inside
+    the `raises` block and never roll back afterwards, leaving the session
+    in SQLAlchemy's "previous exception during flush" state on return. A
+    `session_for_engine`-based fixture would then attempt its own
+    `commit()` at teardown against that same aborted transaction and raise
+    `PendingRollbackError` from every one of those tests, as a fixture
+    teardown error rather than the intended, already-asserted
+    `IntegrityError` -- verified directly by swapping this fixture to
+    `session_for_engine` and rerunning the file: 20 of these tests turn from
+    passing into `ERROR` (`PendingRollbackError` at fixture teardown), and
+    the count is exact, not estimated. `db.py`'s own read/write and
+    read-only session behaviour is covered directly by the `TestDb*` session
+    classes near the end of this file, via `session_for_engine`/
+    `session_scope` themselves; this fixture only needs the pragma-carrying
+    `Engine` `make_engine` builds.
+    """
     with Session(engine) as s:
         yield s
 
@@ -112,18 +166,14 @@ def session(engine):
 def engine_no_fk():
     """A fresh in-memory SQLite engine with FK enforcement left OFF.
 
-    Only for tests that must deliberately construct a DB state the
-    composite FK (`fk_retention_rules_dataset_remote`) would otherwise make
-    impossible -- see `_assert_scope_integrity`'s docstring in
-    `zfsbackup/store/mapper.py` for why that mapper-side check exists as
-    the belt to this braces. SQLite's default is FK-off, so this is simply
-    the `engine` fixture minus the `connect` listener.
+    `make_engine(url, foreign_keys=False)` -- a real, named opt-out (item
+    5), not a workaround for item 5's absence. Only for tests that must
+    deliberately construct a DB state the composite FK
+    (`fk_retention_rules_dataset_remote`) would otherwise make impossible --
+    see `_assert_scope_integrity`'s docstring in `zfsbackup/store/mapper.py`
+    for why that mapper-side check exists as the belt to this braces.
     """
-    eng = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
+    eng = make_engine("sqlite:///:memory:", foreign_keys=False)
     Base.metadata.create_all(eng)
     yield eng
     eng.dispose()
@@ -133,6 +183,48 @@ def engine_no_fk():
 def session_no_fk(engine_no_fk):
     with Session(engine_no_fk) as s:
         yield s
+
+
+@pytest.fixture
+def file_db_url(tmp_path):
+    """A `tmp_path`-backed file SQLite URL.
+
+    The in-memory fixtures above cannot exercise WAL, sidecar files, fork,
+    or cross-process concurrency at all -- `:memory:` has no file on disk
+    for a second connection, let alone a second process, to open.
+    """
+    db_path = tmp_path / "store.db"
+    return f"sqlite:///{db_path}"
+
+
+@pytest.fixture
+def file_engine(file_db_url):
+    """A schema-initialized, pragma-carrying file engine for `file_db_url`,
+    built via `make_engine` (not the pid-keyed `get_engine` cache -- tests
+    that specifically need the cache use `get_engine` directly).
+    """
+    eng = make_engine(file_db_url)
+    Base.metadata.create_all(eng)
+    yield eng
+    eng.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _clean_db_engine_cache():
+    """Disposes every engine `get_engine()` has cached, before and after
+    every test in this file.
+
+    `db.py`'s pid-keyed `_ENGINES` cache is module-global state shared by
+    the whole pytest process; without this, a test that calls `get_engine`
+    would leak a live engine (and its open DBAPI connection/pool) into the
+    next test, which is exactly the class of hazard `db.py` exists to
+    prevent process-wide, not just across a fork. Autouse and file-scoped
+    (not just on the `TestDb*` classes) because the cache is a single piece
+    of global state regardless of which test populated it.
+    """
+    dispose_all()
+    yield
+    dispose_all()
 
 
 def make_dataset(session, name="tank/data", **kwargs):
@@ -2881,3 +2973,2110 @@ class TestMigrations:
             ).fetchall()
 
         assert rows == [(code_head,)]
+
+
+@pytest.mark.unit
+class TestMigrationsOverDbWriterConnection:
+    """`ensure_schema` atomicity through a `zfsbackup.store.db` WRITER
+    engine, not the bare `empty_memory_engine` (plain `create_engine`,
+    pysqlite's legacy implicit-transaction handling) every test above
+    uses.
+
+    `migrate.py`'s own module docstring calls this out explicitly: "Item 5
+    changes which of the two cases applies, not the advice." A `Connection`
+    from a file-backed writer engine runs with `isolation_level = None`
+    and an explicit `BEGIN IMMEDIATE` at the first statement
+    (`_install_begin_immediate`) -- so `migrate.py`'s "case 2" (a clean
+    connection, where the six `CREATE TABLE`s autocommit individually and
+    only the final `INSERT INTO alembic_version` opens a real transaction)
+    collapses into "case 1" (an already-open transaction, where NOTHING
+    autocommits and the whole migration lives or dies with one commit).
+    Concretely: over a db.py writer connection, `ensure_schema` +
+    `rollback()` must leave ZERO tables -- not `TestMigrations`'
+    `SchemaSplitBrain` state (full schema, empty `alembic_version`), which
+    is specific to the bare-connection "case 2" mechanics. This is the one
+    thing nothing in `TestMigrations` (deliberately built on a bare engine
+    to characterise the *platform* mechanics independent of this store's
+    own pragmas) can pin.
+    """
+
+    @pytest.fixture
+    def writer_engine(self, file_db_url):
+        eng = make_engine(file_db_url)
+        yield eng
+        eng.dispose()
+
+    def test_ensure_schema_then_rollback_leaves_zero_tables(self, writer_engine):
+        with writer_engine.connect() as conn:
+            ensure_schema(conn)
+            conn.rollback()
+
+        insp = inspect(writer_engine)
+        # Unlike the bare-connection case (`TestMigrations.test_ensure_
+        # schema_first_call_on_clean_connection_leaves_split_brain_on_
+        # rollback`), NO application table survives -- the six `CREATE
+        # TABLE`s never auto-committed themselves, because
+        # `isolation_level=None` + `BEGIN IMMEDIATE` mean this connection
+        # never runs in pysqlite's legacy autocommit-between-statements
+        # mode at all.
+        assert insp.get_table_names() == []
+
+    def test_ensure_schema_then_rollback_does_not_raise_schema_split_brain_on_retry(
+        self, writer_engine
+    ):
+        # The direct behavioural contrast with `TestMigrations.test_
+        # ensure_schema_raises_schema_split_brain_via_rollback`: over a
+        # writer connection, a rolled-back first call leaves a genuinely
+        # clean database, so a SECOND `ensure_schema` call on the same
+        # engine must succeed normally rather than raising
+        # `SchemaSplitBrain`.
+        with writer_engine.connect() as conn:
+            ensure_schema(conn)
+            conn.rollback()
+
+        with writer_engine.connect() as conn:
+            code_head = ensure_schema(conn)  # must not raise
+            conn.commit()
+
+        with writer_engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).fetchall()
+        assert rows == [(code_head,)]
+
+    def test_ensure_schema_then_commit_stamps_alembic_version_and_creates_tables(
+        self, writer_engine
+    ):
+        with writer_engine.connect() as conn:
+            code_head = ensure_schema(conn)
+            conn.commit()
+
+        insp = inspect(writer_engine)
+        assert {
+            "datasets", "destinations", "global_settings", "remote_server",
+            "dataset_remotes", "retention_rules", "alembic_version",
+        } <= set(insp.get_table_names())
+
+        with writer_engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).fetchall()
+        assert rows == [(code_head,)]
+
+
+# ---------------------------------------------------------------------------
+# Item 5 -- zfsbackup/store/db.py (engine/session, WAL, fork safety)
+# ---------------------------------------------------------------------------
+#
+# `pytest -k "TestDbEngine or TestDbPool or TestDbPragma or TestDbFork or
+# TestDbWal or TestDbReadOnly or TestDbCrash or TestDbDispose"` selects just
+# this section.
+#
+# `_clean_db_engine_cache` (file-scoped autouse fixture, above) disposes
+# every engine `get_engine()` has cached before and after each test here, so
+# nothing in this section leaks a live engine into the next test's process.
+
+
+@pytest.mark.unit
+class TestDbEngineValidation:
+    """`make_engine`'s two rejections (`db.py`): a non-SQLite URL, and a
+    `mode=ro` SQLite URL. Both are `ValueError`, both fail before any
+    `Engine` is constructed.
+    """
+
+    def test_non_sqlite_url_raises_value_error(self):
+        with pytest.raises(ValueError, match="SQLite"):
+            make_engine("postgresql://user@host/db")
+
+    def test_mode_ro_query_param_raises_value_error(self, tmp_path):
+        db_path = tmp_path / "ro.db"
+        with pytest.raises(ValueError, match="mode=ro"):
+            make_engine(f"sqlite:///{db_path}?mode=ro")
+
+    def test_mode_ro_raw_string_form_raises_value_error(self, tmp_path):
+        # `db.py` checks the raw string in addition to the parsed query
+        # dict specifically so an odd spelling of the same option cannot
+        # slip past `make_url`'s parsing. This URL is ALSO shared-cache
+        # (`cache=shared`) -- it doubles as the ordering pin between the
+        # two rejections in `TestDbSharedCacheRejection`: `mode=ro` is
+        # checked first in `make_engine`, so a URL matching both reasons
+        # must report the `mode=ro` one, not the shared-cache one.
+        db_path = tmp_path / "ro2.db"
+        with pytest.raises(ValueError, match="mode=ro"):
+            make_engine(f"sqlite:///{db_path}?mode=ro&cache=shared")
+
+    def test_bare_filesystem_path_raises_value_error_naming_url_for_path(
+        self, tmp_path
+    ):
+        # The likely mistake once a path-taking caller owns resolution: a
+        # filesystem path passed where a URL is wanted. `make_url` raises a
+        # bare `ArgumentError` that says nothing about the fix; `db.py`
+        # catches it and re-raises naming `url_for_path` explicitly.
+        db_path = tmp_path / "plain_path.db"
+        with pytest.raises(ValueError, match="url_for_path"):
+            make_engine(str(db_path))
+
+
+@pytest.mark.unit
+class TestDbSharedCacheRejection:
+    """`make_engine` refuses shared-cache in-memory SQLite URLs outright.
+
+    Not merely unsupported -- rejected, because it is the one URL shape on
+    which a two-writer guard test would demonstrate the pre-`BEGIN
+    IMMEDIATE` lost update *through the public API* while reporting green:
+    two engines on one `mode=memory&cache=shared` database are two real
+    connections onto one database (unlike a private `:memory:` engine,
+    where `StaticPool` hands out the SAME connection to everyone). And it
+    cannot be fixed by simply installing `BEGIN IMMEDIATE` there the way
+    the file case was: shared-cache mode uses table-level locking that
+    raises `SQLITE_LOCKED`, which the busy handler does not retry, so
+    every session -- including an uninvolved one -- would fail with
+    `database table is locked` instead. Refusing the URL is what makes a
+    future two-writer test against this shape structurally impossible to
+    write and have it silently pass.
+    """
+
+    def test_query_param_form_rejected(self):
+        with pytest.raises(ValueError, match="shared-cache"):
+            make_engine("sqlite:///:memory:?cache=shared")
+
+    def test_mode_memory_cache_shared_form_rejected(self):
+        with pytest.raises(ValueError, match="shared-cache"):
+            make_engine("sqlite:///?mode=memory&cache=shared")
+
+    def test_private_memory_url_is_not_rejected(self):
+        # Negative control for the two tests above: a PRIVATE in-memory
+        # URL (no `cache=shared`) must keep working -- this class is
+        # pinning the shared-cache predicate specifically, not merely
+        # "any URL containing 'memory' is now rejected".
+        eng = make_engine("sqlite:///:memory:")
+        try:
+            with eng.connect() as conn:
+                assert conn.exec_driver_sql("SELECT 1").scalar() == 1
+        finally:
+            eng.dispose()
+
+
+@pytest.mark.unit
+class TestDbUrlForPath:
+    """`url_for_path` builds the canonical SQLite URL for a filesystem
+    path -- `resolve()`'d, so a relative path and an equivalent absolute
+    or symlinked path produce the IDENTICAL cache key `get_engine` uses.
+    Skipping this normalisation is the one thing the store's single-writer
+    design rules out: `sqlite:///config.db` and
+    `sqlite:////abs/path/config.db` for the same file would be two cache
+    entries with two separate pools -- two writers racing each other on
+    one database.
+    """
+
+    def test_builds_canonical_absolute_url(self, tmp_path):
+        db_path = tmp_path / "canon.db"
+        url = url_for_path(db_path)
+        assert url == f"sqlite:///{db_path.resolve()}"
+        assert url.startswith("sqlite:////")  # absolute: 3 scheme slashes + leading /
+
+    def test_relative_path_resolves_to_the_same_url_as_absolute(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "canon2.db"
+        monkeypatch.chdir(tmp_path)
+        relative_url = url_for_path("canon2.db")
+        absolute_url = url_for_path(db_path)
+        assert relative_url == absolute_url
+
+    def test_symlinked_path_resolves_to_the_real_file_url(self, tmp_path):
+        real = tmp_path / "real.db"
+        real.write_text("")
+        link = tmp_path / "link.db"
+        link.symlink_to(real)
+        assert url_for_path(link) == url_for_path(real)
+
+
+@pytest.mark.unit
+class TestDbPoolSelection:
+    """5a: `StaticPool` for `:memory:` (a second pooled connection must see
+    the *same* database), plain `QueuePool` defaults for a file URL (the
+    pysqlite dialect already passes `check_same_thread=False` for file
+    URLs, so `make_engine` must not override the pool class there).
+    """
+
+    def test_memory_url_uses_static_pool(self):
+        eng = make_engine("sqlite:///:memory:")
+        try:
+            assert isinstance(eng.pool, StaticPool)
+        finally:
+            eng.dispose()
+
+    def test_file_url_uses_queue_pool(self, file_db_url):
+        eng = make_engine(file_db_url)
+        try:
+            assert isinstance(eng.pool, QueuePool)
+        finally:
+            eng.dispose()
+
+    def test_memory_url_second_checkout_sees_same_database(self):
+        # The actual reason StaticPool is load-bearing: without it, a
+        # second pooled connection to `:memory:` would see an *empty*
+        # database rather than the one the first connection populated.
+        #
+        # This must be done from a SECOND THREAD, not a second sequential
+        # checkout on the main thread. A single-threaded second checkout
+        # does not discriminate `StaticPool` from SQLAlchemy's fallback
+        # `SingletonThreadPool` (the pool `create_engine` would choose for
+        # a `:memory:` URL with no `poolclass=` override at all):
+        # `SingletonThreadPool` also reuses one connection *per thread*, so
+        # a single-threaded test passes identically whether
+        # `poolclass=StaticPool` is present or was deleted from
+        # `make_engine` -- verified directly: removing `poolclass=
+        # StaticPool` from `make_engine` failed only the `isinstance(eng.
+        # pool, StaticPool)` check in `test_memory_url_uses_static_pool`,
+        # not this test, before this fix. A cross-thread checkout is also
+        # the real hazard this pool choice exists for: `ApiWorker`
+        # (`workers.py`) runs the Flask app in a thread inside a worker
+        # process, so a second thread reaching the same in-memory engine is
+        # not a hypothetical.
+        eng = make_engine("sqlite:///:memory:")
+        try:
+            with eng.connect() as conn:
+                conn.exec_driver_sql("CREATE TABLE t (id INTEGER)")
+                conn.exec_driver_sql("INSERT INTO t (id) VALUES (1)")
+                conn.commit()
+
+            result = {}
+
+            def _read_from_other_thread():
+                try:
+                    with eng.connect() as conn:
+                        result["rows"] = conn.exec_driver_sql(
+                            "SELECT id FROM t"
+                        ).fetchall()
+                except Exception as exc:  # noqa: BLE001
+                    result["error"] = exc
+
+            thread = threading.Thread(target=_read_from_other_thread)
+            thread.start()
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+            assert "error" not in result, result.get("error")
+            assert result["rows"] == [(1,)]
+        finally:
+            eng.dispose()
+
+
+@pytest.mark.unit
+class TestDbIsMemoryUrl:
+    """`_is_memory_url` is decided from the **parsed** URL, never a raw
+    substring test -- see its docstring for the `'sqlite://'` false
+    negative a substring test produced. Table-driven over every spelling
+    the docstring names, plus the file-URL cases that must NOT be treated
+    as in-memory.
+    """
+
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            ("sqlite://", True),
+            ("sqlite:///", True),
+            ("sqlite:///:memory:", True),
+            ("sqlite:///?mode=memory&cache=shared", True),
+            ("sqlite:///relative.db", False),
+            ("sqlite:////abs/path.db", False),
+        ],
+    )
+    def test_is_memory_url_table(self, url, expected):
+        assert _is_memory_url(make_url(url)) is expected
+
+    def test_bare_sqlite_scheme_cross_thread_read_sees_same_database(self):
+        """The regression this table exists to catch: before the parsed-URL
+        fix, `'sqlite://'` (no path, no `:memory:` substring, no `mode=
+        memory`) took the FILE branch -- losing `StaticPool` and the
+        explicit `check_same_thread=False` override -- so a second thread
+        reading through the same engine saw an empty database (`no such
+        table`). `make_engine("sqlite://")` must behave exactly like
+        `make_engine("sqlite:///:memory:")` here.
+        """
+        eng = make_engine("sqlite://")
+        try:
+            assert isinstance(eng.pool, StaticPool)
+            with eng.connect() as conn:
+                conn.exec_driver_sql("CREATE TABLE t (id INTEGER)")
+                conn.exec_driver_sql("INSERT INTO t (id) VALUES (1)")
+                conn.commit()
+
+            result = {}
+
+            def _read_from_other_thread():
+                try:
+                    with eng.connect() as conn:
+                        result["rows"] = conn.exec_driver_sql(
+                            "SELECT id FROM t"
+                        ).fetchall()
+                except Exception as exc:  # noqa: BLE001
+                    result["error"] = exc
+
+            thread = threading.Thread(target=_read_from_other_thread)
+            thread.start()
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+            assert "error" not in result, result.get("error")
+            assert result["rows"] == [(1,)]
+        finally:
+            eng.dispose()
+
+
+@pytest.mark.unit
+class TestDbPragmaPersistence:
+    """5a: pragmas are set once by a `connect` event listener and survive
+    pool checkin/checkout -- not reissued per checkout. Pinned across
+    **three** sequential checkouts of the same engine (not just two), per
+    the plan's probe, and the connect-event count is asserted directly
+    rather than merely inferred from pragma values still being correct.
+    """
+
+    def test_pragmas_survive_three_sequential_checkouts(self, file_db_url):
+        eng = make_engine(file_db_url)
+        connect_events = []
+
+        @event.listens_for(eng, "connect")
+        def _count_connect(dbapi_connection, connection_record):
+            connect_events.append(1)
+
+        try:
+            for _ in range(3):
+                with eng.connect() as conn:
+                    fk = conn.exec_driver_sql("PRAGMA foreign_keys").scalar()
+                    jm = conn.exec_driver_sql("PRAGMA journal_mode").scalar()
+                    assert fk == 1
+                    assert jm == "wal"
+            # One real DBAPI connection served all three sequential
+            # checkouts (QueuePool reuse), so the connect event -- and
+            # therefore every pragma registered in it -- fired exactly
+            # once, not three times.
+            assert len(connect_events) == 1
+        finally:
+            eng.dispose()
+
+
+@pytest.mark.unit
+class TestDbForeignKeysParameter:
+    def test_foreign_keys_false_yields_zero(self, tmp_path):
+        db_path = tmp_path / "fk_off.db"
+        eng = make_engine(f"sqlite:///{db_path}", foreign_keys=False)
+        try:
+            with eng.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 0
+        finally:
+            eng.dispose()
+
+    def test_foreign_keys_true_yields_one(self, tmp_path):
+        db_path = tmp_path / "fk_on.db"
+        eng = make_engine(f"sqlite:///{db_path}", foreign_keys=True)
+        try:
+            with eng.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+        finally:
+            eng.dispose()
+
+    def test_foreign_keys_off_engine_does_not_leak_onto_fk_on_engine_same_url(
+        self, tmp_path
+    ):
+        # Two SEPARATE `make_engine` calls for the same URL get separate
+        # pools/connections -- an FK-off engine existing must not affect a
+        # later FK-on engine for the identical file.
+        db_path = tmp_path / "shared.db"
+        url = f"sqlite:///{db_path}"
+        fk_off = make_engine(url, foreign_keys=False)
+        fk_on = make_engine(url, foreign_keys=True)
+        try:
+            with fk_on.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+            # Re-check fk_off AFTER fk_on was built and used: still 0.
+            with fk_off.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 0
+        finally:
+            fk_off.dispose()
+            fk_on.dispose()
+
+
+@pytest.mark.unit
+class TestDbReaderWriterSeparatePools:
+    """5c: a read-only and a read-write engine for the same URL are
+    separate `Engine`/pool objects -- sharing one would leak `query_only=
+    ON` onto the writer's connections.
+    """
+
+    def test_writer_engine_unaffected_by_existing_reader_engine_same_url(
+        self, file_engine, file_db_url
+    ):
+        # `file_engine` (fixture) has already run create_all against
+        # `file_db_url` and owns its own disposal -- reuse it to create the
+        # file rather than building and leaking a second, throwaway engine.
+        reader = make_engine(file_db_url, readonly=True)
+        try:
+            with reader.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA query_only").scalar() == 1
+
+            writer = make_engine(file_db_url, readonly=False)
+            try:
+                with writer.connect() as conn:
+                    assert conn.exec_driver_sql("PRAGMA query_only").scalar() == 0
+            finally:
+                writer.dispose()
+        finally:
+            reader.dispose()
+
+
+@pytest.mark.unit
+class TestDbWriterTransactionSetup:
+    """5b/generation-race fix: a file-backed WRITER engine gets a `begin`
+    listener (`_install_begin_immediate`'s `_begin_immediate`, which issues
+    `BEGIN IMMEDIATE`) and disables pysqlite's legacy implicit `BEGIN`
+    (`isolation_level = None`) so that listener is the only thing that ever
+    starts a transaction. A READER engine gets neither -- see the module
+    docstring's "Never adopt SQLAlchemy's 'BEGIN on connect' recipe for
+    READER engines" warning.
+    """
+
+    def test_writer_engine_has_begin_listener_and_null_isolation_level(
+        self, file_db_url
+    ):
+        eng = make_engine(file_db_url, readonly=False)
+        try:
+            assert len(list(eng.dispatch.begin)) == 1
+            with eng.connect() as conn:
+                assert conn.connection.dbapi_connection.isolation_level is None
+        finally:
+            eng.dispose()
+
+    def test_reader_engine_has_no_begin_listener_and_default_isolation_level(
+        self, file_engine, file_db_url
+    ):
+        eng = make_engine(file_db_url, readonly=True)
+        try:
+            assert len(list(eng.dispatch.begin)) == 0
+            with eng.connect() as conn:
+                # pysqlite's own legacy default (an empty string, not
+                # `None`) -- readers must not opt into the writer's
+                # "BEGIN on connect" recipe.
+                assert conn.connection.dbapi_connection.isolation_level is not None
+        finally:
+            eng.dispose()
+
+    def test_memory_writer_engine_has_no_begin_listener(self):
+        # `_install_begin_immediate` is scoped to writer engines on pools
+        # that hand each checkout a distinct connection (the predicate is
+        # the POOL class, not the URL shape -- see `_SHARED_CONNECTION_
+        # POOLS`) -- `:memory:` uses `StaticPool`, which hands the same
+        # DBAPI connection to every checkout, so a second `Session` would
+        # hit `OperationalError: cannot start a transaction within a
+        # transaction` (see `_install_begin_immediate`'s docstring).
+        eng = make_engine("sqlite:///:memory:", readonly=False)
+        try:
+            assert isinstance(eng.pool, StaticPool)
+            assert len(list(eng.dispatch.begin)) == 0
+        finally:
+            eng.dispose()
+
+    def test_bare_sqlite_scheme_writer_engine_has_no_begin_listener(self):
+        # `sqlite://` is also an in-memory URL (`_is_memory_url`) and also
+        # lands on `StaticPool` via `make_engine`'s memory branch -- same
+        # exclusion as `sqlite:///:memory:`, pinned separately because this
+        # is exactly the URL spelling that used to slip through
+        # `_is_memory_url`'s pre-fix raw-substring check (see that
+        # function's own docstring).
+        eng = make_engine("sqlite://", readonly=False)
+        try:
+            assert isinstance(eng.pool, StaticPool)
+            assert len(list(eng.dispatch.begin)) == 0
+        finally:
+            eng.dispose()
+
+    def test_singleton_thread_pool_predicate_would_exclude_it_too(self):
+        """Direct pin of the SECOND member of `_SHARED_CONNECTION_POOLS`.
+
+        `make_engine` itself never actually builds a `SingletonThreadPool`
+        engine today -- its memory branch forces `poolclass=StaticPool`
+        explicitly. The predicate still names `SingletonThreadPool`
+        defensively: it is SQLAlchemy's own DEFAULT pool for a bare
+        `sqlite://`/`:memory:` URL when `poolclass` is left unset -- i.e.
+        exactly what `make_engine` would fall back to if a future change
+        ever dropped the explicit `poolclass=StaticPool` override (the
+        same shape as the pre-`_is_memory_url`-fix history the module
+        docstring measures: `'sqlite://' pool=SingletonThreadPool`). It
+        shares the same hazard `StaticPool` does -- one DBAPI connection
+        per thread, shared across every concurrent checkout in that
+        thread -- so a second `Session` on it would hit the identical
+        `OperationalError: cannot start a transaction within a
+        transaction`. This test builds a `SingletonThreadPool` engine
+        directly (bypassing `make_engine`, since it never produces one)
+        and evaluates `make_engine`'s own exclusion predicate --
+        `isinstance(engine.pool, store_db._SHARED_CONNECTION_POOLS)` --
+        against it, referencing the REAL tuple `db.py` uses rather than a
+        copy, so removing `SingletonThreadPool` from that tuple fails this
+        test.
+        """
+        eng = create_engine(
+            "sqlite://",
+            poolclass=SingletonThreadPool,
+            connect_args={"check_same_thread": False},
+        )
+        try:
+            assert isinstance(eng.pool, SingletonThreadPool)
+            assert isinstance(eng.pool, store_db._SHARED_CONNECTION_POOLS)
+        finally:
+            eng.dispose()
+
+
+@pytest.mark.unit
+class TestDbPragmaConnectListenerInternals:
+    """Whitebox coverage of `_install_pragmas`'s `connect` listener via a
+    stub DBAPI connection, so the WARNING branch (SQLite silently refusing
+    WAL) and the exact pragma statement order can be pinned without
+    depending on a filesystem or platform that actually refuses WAL.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _db_logger_state(self):
+        """Snapshot and restore `zfsbackup.store.db`'s logger state.
+
+        `TestMigrations.test_configure_logger_guard_reachable_via_real_ini`
+        runs a real `logging.config.fileConfig()` against this repo's
+        `alembic.ini`, whose `[loggers]` section names only `root,
+        sqlalchemy, alembic` -- `fileConfig`'s default
+        `disable_existing_loggers=True` therefore disables every other
+        already-configured logger for the rest of the pytest session,
+        `zfsbackup.store.db` included. Without restoring it here, this
+        class's `caplog`-based tests pass in isolation but fail when the
+        full file runs (the disabled logger drops every `.warning()` call
+        before it ever reaches `caplog`'s handler) -- exactly the kind of
+        cross-test leak `TestMigrations.mapper_logger_state` guards against
+        for the mapper's own logger.
+        """
+        logger = logging.getLogger("zfsbackup.store.db")
+        original_level = logger.level
+        original_disabled = logger.disabled
+        logger.disabled = False
+        yield
+        logger.level = original_level
+        logger.disabled = original_disabled
+
+    class _StubCursor:
+        def __init__(self, calls, journal_mode_row):
+            self._calls = calls
+            self._journal_mode_row = journal_mode_row
+
+        def execute(self, sql, *args):
+            self._calls.append(sql)
+
+        def fetchone(self):
+            if self._calls and "JOURNAL_MODE" in self._calls[-1].upper():
+                return self._journal_mode_row
+            return None
+
+        def close(self):
+            pass
+
+    class _StubDbapiConnection:
+        def __init__(self, calls, journal_mode_row=("wal",)):
+            self._calls = calls
+            self._journal_mode_row = journal_mode_row
+
+        def cursor(self):
+            return TestDbPragmaConnectListenerInternals._StubCursor(
+                self._calls, self._journal_mode_row
+            )
+
+        # The pysqlite dialect's own `on_connect` touches a few attributes
+        # (e.g. `isolation_level`) ahead of our listener; accept anything.
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    def _build_stub_engine(self, journal_mode_row):
+        calls = []
+
+        def _creator():
+            return self._StubDbapiConnection(calls, journal_mode_row)
+
+        eng = create_engine("sqlite://", creator=_creator, poolclass=StaticPool)
+        store_db._install_pragmas(
+            eng, readonly=False, foreign_keys=True, memory=False
+        )
+        return eng, calls
+
+    def test_wal_refusal_logs_warning_naming_the_unchanged_mode(self, caplog):
+        # Simulates a read-only file or a filesystem without WAL support:
+        # SQLite does not raise when it cannot switch journal modes -- it
+        # returns the UNCHANGED mode, silently, unless something checks it.
+        eng, calls = self._build_stub_engine(journal_mode_row=("delete",))
+        try:
+            with caplog.at_level(logging.WARNING, logger="zfsbackup.store.db"):
+                with eng.connect():
+                    pass
+        finally:
+            eng.dispose()
+
+        assert any(
+            "SQLite refused WAL journal mode" in record.message
+            and "'delete'" in record.message
+            for record in caplog.records
+        )
+
+    def test_wal_success_logs_no_warning(self, caplog):
+        eng, calls = self._build_stub_engine(journal_mode_row=("wal",))
+        try:
+            with caplog.at_level(logging.WARNING, logger="zfsbackup.store.db"):
+                with eng.connect():
+                    pass
+        finally:
+            eng.dispose()
+
+        assert not any(
+            "SQLite refused WAL journal mode" in record.message
+            for record in caplog.records
+        )
+
+    def test_busy_timeout_is_the_first_pragma_issued(self):
+        # "FIRST, before any statement that can contend for a lock" --
+        # `_install_pragmas`'s own comment. Filter out the pysqlite
+        # dialect's own connect-time housekeeping (e.g. `PRAGMA
+        # read_uncommitted`), which runs through a separate cursor before
+        # our listener fires and is not part of the sequence under test.
+        eng, calls = self._build_stub_engine(journal_mode_row=("wal",))
+        try:
+            with eng.connect():
+                pass
+        finally:
+            eng.dispose()
+
+        our_calls = [c for c in calls if "PRAGMA" in c.upper()]
+        pragma_order = [
+            c for c in our_calls
+            if any(
+                name in c.upper()
+                for name in (
+                    "BUSY_TIMEOUT", "JOURNAL_MODE", "SYNCHRONOUS",
+                    "FOREIGN_KEYS", "QUERY_ONLY",
+                )
+            )
+        ]
+        assert pragma_order[0] == "PRAGMA busy_timeout=5000"
+        assert pragma_order == [
+            "PRAGMA busy_timeout=5000",
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=FULL",
+            "PRAGMA foreign_keys=ON",
+        ]
+
+
+@pytest.mark.unit
+class TestDbPragmaValues:
+    """5a/D2: `journal_mode` is `wal` for a file URL, `memory` for
+    `:memory:`, neither raising. `synchronous` is FULL (2) for the writer
+    engine and NORMAL (1) for the reader engine (D2's binding decision).
+    """
+
+    def test_journal_mode_wal_for_file_url(self, file_db_url):
+        eng = make_engine(file_db_url)
+        try:
+            with eng.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA journal_mode").scalar() == "wal"
+        finally:
+            eng.dispose()
+
+    def test_journal_mode_memory_for_in_memory_url_does_not_raise(self):
+        eng = make_engine("sqlite:///:memory:")
+        try:
+            with eng.connect() as conn:
+                # Cosmetic per the plan, not a correctness requirement --
+                # issuing `journal_mode=WAL` against `:memory:` must not
+                # raise, and simply returns 'memory'.
+                assert conn.exec_driver_sql("PRAGMA journal_mode").scalar() == "memory"
+        finally:
+            eng.dispose()
+
+    def test_synchronous_full_for_writer_engine(self, file_db_url):
+        eng = make_engine(file_db_url, readonly=False)
+        try:
+            with eng.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA synchronous").scalar() == 2
+        finally:
+            eng.dispose()
+
+    def test_synchronous_normal_for_reader_engine(self, file_engine, file_db_url):
+        eng = make_engine(file_db_url, readonly=True)
+        try:
+            with eng.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA synchronous").scalar() == 1
+        finally:
+            eng.dispose()
+
+    def test_busy_timeout_is_5000(self, file_db_url):
+        # Every other pragma `_install_pragmas` sets has a direct value
+        # assertion somewhere in this class; `busy_timeout` did not, so
+        # deleting the `PRAGMA busy_timeout=5000` line failed zero tests.
+        # 5000ms is also what makes `TestDbGenerationRace`'s "blocked then
+        # fails" test's short override observable as a deliberate outlier
+        # rather than the default.
+        eng = make_engine(file_db_url)
+        try:
+            with eng.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA busy_timeout").scalar() == 5000
+        finally:
+            eng.dispose()
+
+
+@pytest.mark.unit
+class TestDbDisposeAll:
+    def test_idempotent_and_safe_on_empty_cache(self):
+        dispose_all()
+        dispose_all()  # must not raise the second time either
+        assert store_db._ENGINES == {}
+
+    def test_disposes_every_cached_engine_and_empties_the_cache(self, file_db_url):
+        get_engine(file_db_url)
+        get_engine(file_db_url, readonly=True)
+        assert len(store_db._ENGINES) == 2
+
+        dispose_all()
+
+        assert store_db._ENGINES == {}
+
+
+@pytest.mark.unit
+class TestDbDisposeAllPidGuard:
+    """`dispose_all()`'s own pid guard (`db.py`'s docstring: "Pid-guarded,
+    like `get_engine`"), pinned without an actual fork -- the same
+    whitebox technique `TestDbGetEngineStalePidHandling` uses for
+    `get_engine()`'s branch, applied to `dispose_all`'s separate one.
+
+    Not a redundant echo of that other class: earlier, `dispose_all`
+    unpacked `owner_pid` and then ignored it, always passing `close=True`.
+    A forked child calling it (daemon pre-fork hygiene, a worker's own
+    teardown) would run the close path on connections the PARENT still
+    believes it owns and exit 0 with no warning -- probed directly (see
+    `db.py`'s docstring) and confirmed as a real, silent hazard on this
+    function's own code path, not merely inherited from `get_engine`'s.
+    `TestDbForkSafety.
+    test_dispose_all_in_forked_child_does_not_disturb_parents_connection`
+    below is the same claim through a genuine fork.
+    """
+
+    def test_foreign_owner_pid_entry_disposed_with_close_false(
+        self, file_db_url, mocker
+    ):
+        stale_engine = make_engine(file_db_url)
+        fake_pid = os.getpid() + 1  # guaranteed to differ from this process's pid
+        key = (file_db_url, False, True)
+        store_db._ENGINES[key] = (fake_pid, stale_engine)
+
+        dispose_spy = mocker.spy(stale_engine, "dispose")
+
+        dispose_all()
+
+        dispose_spy.assert_called_once_with(close=False)
+        assert store_db._ENGINES == {}
+
+        # close=False did not actually close it (nobody forked this
+        # single-process test) -- close it for real so it does not leak.
+        stale_engine.dispose()
+
+    def test_own_pid_entry_disposed_with_close_true(self, file_db_url, mocker):
+        get_engine(file_db_url)  # cached under THIS process's pid
+        key = (file_db_url, False, True)
+        owner_pid, engine = store_db._ENGINES[key]
+        assert owner_pid == os.getpid()
+
+        dispose_spy = mocker.spy(engine, "dispose")
+
+        dispose_all()
+
+        dispose_spy.assert_called_once_with(close=True)
+        assert store_db._ENGINES == {}
+
+
+@pytest.mark.unit
+class TestDbGetEngineCaching:
+    """`get_engine()`'s cache-HIT path: the same `(url, readonly,
+    foreign_keys)` key returns the SAME `Engine` object on a second call
+    from the same process. `TestDbDisposeAll.
+    test_disposes_every_cached_engine_and_empties_the_cache` only counts
+    `len(_ENGINES)`, which an always-rebuild implementation (`if owner_pid
+    == pid: return engine` replaced with `if False:`) satisfies just as
+    well -- two calls still populate two cache entries, one per key, even
+    if each call silently replaces its entry with a fresh `Engine`. That
+    mutation opens a fresh connection plus every `connect`-event pragma
+    round-trip on EVERY `get_engine()` call -- a real cost in a worker's
+    poll loop -- and means `dispose_all()` no longer disposes what any
+    caller still holds a reference to. Only an identity check on repeated
+    calls catches it.
+    """
+
+    def test_same_key_returns_the_same_engine_object(self, file_db_url):
+        first = get_engine(file_db_url)
+        second = get_engine(file_db_url)
+        assert first is second
+
+    def test_readonly_and_readwrite_are_different_cached_engines(self, file_db_url):
+        writer = get_engine(file_db_url, readonly=False)
+        reader = get_engine(file_db_url, readonly=True)
+        assert writer is not reader
+        # ...and each is still itself stable across a repeat call.
+        assert get_engine(file_db_url, readonly=False) is writer
+        assert get_engine(file_db_url, readonly=True) is reader
+
+
+# ---------------------------------------------------------------------------
+# Fork safety (5b) -- the highest-risk item in the plan.
+#
+# These helpers are module-level so a `multiprocessing.get_context("fork")`
+# child can call them directly. Results cross the process boundary via a
+# plain JSON file rather than a `multiprocessing.Queue`, to keep the IPC
+# mechanism itself out of the way of what is under test.
+# ---------------------------------------------------------------------------
+
+
+def _fork_child_get_engine(url, result_path):
+    """Runs inside a forked child. Calls the real, guarded `get_engine()` --
+    the pid check must notice this process did not build the cached entry
+    and discard-and-rebuild rather than reuse the parent's pool.
+    """
+    engine = get_engine(url)
+    with engine.connect() as conn:
+        dbapi_id = id(conn.connection.dbapi_connection)
+        names = [
+            row[0]
+            for row in conn.exec_driver_sql(
+                "SELECT name FROM datasets ORDER BY id"
+            ).fetchall()
+        ]
+        integrity = conn.exec_driver_sql("PRAGMA integrity_check").scalar()
+    result = {
+        "pid": os.getpid(),
+        "engine_id": id(engine),
+        "dbapi_id": dbapi_id,
+        "dataset_names": names,
+        "integrity_check": integrity,
+    }
+    with open(result_path, "w") as fh:
+        json.dump(result, fh)
+
+
+def _fork_child_use_inherited_engine_directly(url, result_path):
+    """The negative control: bypasses `get_engine()` entirely and reaches
+    into `db._ENGINES` for the raw, inherited `(owner_pid, engine)` tuple --
+    exactly what a forked child would see the instant after fork, before
+    anyone calls `get_engine()`. Demonstrates the hazard 5b exists to
+    prevent: no exception of any kind, and the same DBAPI connection object
+    the parent still holds gets used to read (and, in the real bug, could
+    be used to write) from the child.
+    """
+    key = (url, False, True)  # (url, readonly=False, foreign_keys=True)
+    owner_pid, inherited_engine = store_db._ENGINES[key]
+    with inherited_engine.connect() as conn:
+        dbapi_id = id(conn.connection.dbapi_connection)
+        names = [
+            row[0]
+            for row in conn.exec_driver_sql(
+                "SELECT name FROM datasets ORDER BY id"
+            ).fetchall()
+        ]
+    result = {
+        "pid": os.getpid(),
+        "owner_pid_seen": owner_pid,
+        "engine_id": id(inherited_engine),
+        "dbapi_id": dbapi_id,
+        "dataset_names": names,
+    }
+    with open(result_path, "w") as fh:
+        json.dump(result, fh)
+
+
+def _fork_child_dispose_all(url, result_path):
+    """Runs inside a forked child. Calls the real, guarded `dispose_all()`
+    directly -- no `get_engine()` call first -- so the ONLY cache entry
+    that exists at all is the one inherited from the parent (`owner_pid ==
+    parent's pid`). `dispose_all()`'s own pid check must discard it with
+    `close=False`, exactly as `get_engine()` would, rather than the
+    unconditional `close=True` an earlier, pid-unaware implementation
+    passed regardless of ownership.
+    """
+    dispose_all()
+    result = {
+        "pid": os.getpid(),
+        "cache_emptied": store_db._ENGINES == {},
+    }
+    with open(result_path, "w") as fh:
+        json.dump(result, fh)
+
+
+@pytest.mark.unit
+class TestDbGetEngineStalePidHandling:
+    """Whitebox pin for `get_engine()`'s discard-and-rebuild branch,
+    without an actual fork -- runs unconditionally (no `FORK_AVAILABLE`
+    skip), since it needs no subprocess at all.
+
+    The real fork tests below (`TestDbForkSafety`) cannot, on their own,
+    tell "closed with `close=False`" from "closed with a bare `dispose()`"
+    apart: either way, the CHILD calls `sqlite3.connect()` fresh for its
+    rebuilt engine, so the child's own read/integrity-check assertions pass
+    identically under both. The actual difference `close=False` protects
+    against is what happens to the file descriptor the PARENT still
+    believes it owns -- an effect on a different process's kernel-level fd
+    state, which is unreliable and slow to assert directly in a unit test.
+    This test instead manufactures the exact precondition a forked child
+    inherits (a cache entry whose `owner_pid` is not this process's own)
+    without forking at all, and pins the *call itself*: `Engine.dispose`
+    must be invoked with `close=False`, not merely "invoked".
+    """
+
+    def test_stale_pid_entry_is_discarded_with_close_false_and_rebuilt(
+        self, file_db_url, mocker
+    ):
+        stale_engine = make_engine(file_db_url)
+
+        # Behavioural half of the pin (not just "dispose was called with
+        # close=False"): grab a live reference to the pooled DBAPI
+        # connection BEFORE the discard-and-rebuild runs. Holding this
+        # reference from Python is what makes `close=False` observable
+        # in-process at all -- see the sibling test below for the
+        # `close=True` contrast that proves this isn't just "nothing
+        # happened to be called".
+        with stale_engine.connect() as conn:
+            dbapi_conn = conn.connection.dbapi_connection
+
+        fake_pid = os.getpid() + 1  # guaranteed to differ from this process's pid
+        key = (file_db_url, False, True)
+        store_db._ENGINES[key] = (fake_pid, stale_engine)
+
+        dispose_spy = mocker.spy(stale_engine, "dispose")
+
+        rebuilt = get_engine(file_db_url)
+
+        # A genuinely different Engine object was built for THIS process...
+        assert rebuilt is not stale_engine
+        # ...and the stale one was dropped via close=False, never a bare
+        # dispose() -- "the single most important line" per db.py.
+        dispose_spy.assert_called_once_with(close=False)
+        # The cache now attributes the entry to this process, not the fake
+        # one, and holds the rebuilt engine.
+        assert store_db._ENGINES[key] == (os.getpid(), rebuilt)
+
+        # THE BEHAVIOURAL ASSERTION: `close=False` leaves the connection
+        # we still hold a reference to genuinely usable -- it was never
+        # explicitly closed, only de-referenced by the pool. Contrast with
+        # `test_bare_dispose_close_true_closes_a_still_referenced_connection`
+        # below, where the identical setup DOES raise. This was previously
+        # asserted only via the `dispose_spy` call args -- true, but the
+        # actual claim ("the connection is left usable") is observable
+        # in-process in microseconds, not "unreliable and slow to assert
+        # directly" as an earlier version of this test's rationale claimed.
+        dbapi_conn.execute("SELECT 1")
+        dbapi_conn.close()  # hygiene: avoid leaking this fd past the test
+
+        # dispose(close=False) deliberately does not close the real
+        # connection (that is the whole point for an actually-forked
+        # child, which must not touch the parent's fd) -- but nobody else
+        # owns `stale_engine` in this single-process test, so it must be
+        # closed for real here or its connection leaks for the rest of the
+        # suite.
+        stale_engine.dispose()
+
+    def test_bare_dispose_close_true_closes_a_still_referenced_connection(
+        self, file_db_url
+    ):
+        """The contrast that makes the test above meaningful: with the
+        default `close=True`, `Engine.dispose()` closes pooled connections
+        for real, even one this test still holds a Python reference to.
+        Without this negative half, `dbapi_conn.execute("SELECT 1")`
+        succeeding above could just as easily mean "the assertion doesn't
+        discriminate anything" as "close=False genuinely didn't close it".
+        """
+        eng = make_engine(file_db_url)
+        with eng.connect() as conn:
+            dbapi_conn = conn.connection.dbapi_connection
+
+        eng.dispose()  # close=True, the default
+
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            dbapi_conn.execute("SELECT 1")
+
+
+@pytest.mark.skipif(
+    not FORK_AVAILABLE,
+    reason="'fork' multiprocessing start method unavailable on this platform",
+)
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.filterwarnings(
+    "ignore:This process \\(pid=.*\\) is multi-threaded, use of fork\\(\\) "
+    "may lead to deadlocks in the child:DeprecationWarning"
+)
+class TestDbForkSafety:
+    """5b, pinned with `multiprocessing.get_context("fork")` explicitly --
+    this machine's default start method is `spawn` (Python 3.14 / darwin),
+    under which every process gets its own fresh interpreter and no
+    inherited file descriptor exists to corrupt anything. An unpinned test
+    here would pass while testing nothing.
+
+    Marked `integration`/`slow`, not `unit`: every test here forks a real
+    OS process and joins it with a 30s timeout. `pytest -m unit` should
+    mean "no subprocess, no real fork, fast" -- this class was previously
+    marked `unit` despite doing exactly the opposite.
+
+    The `filterwarnings` marker silences CPython's own `DeprecationWarning`
+    ("this process is multi-threaded, use of fork() may lead to
+    deadlocks") that `multiprocessing.Process.start()` raises on every test
+    here. It is expected, not a bug to fix: pytest's own process is
+    multi-threaded (coverage, capture, etc.), and forking a multi-threaded
+    process safely is *the exact subject matter this class exists to
+    test* -- `db.py`'s `_reinit_lock_after_fork` (`os.register_at_fork`)
+    is the module's own answer to that same hazard for its `_ENGINES_LOCK`.
+    Silencing it here, narrowly, is preferable to a global filter (which
+    would hide it for a genuinely new, unrelated multi-threaded-fork site
+    elsewhere) or leaving three identical, permanently-unactionable
+    warnings in every test run.
+    """
+
+    def _seed(self, url):
+        engine = get_engine(url)
+        Base.metadata.create_all(engine)
+        with session_for_engine(engine) as session:
+            session.add(
+                Dataset(name="tank/fork", frequency_seconds=3600, frequency_literal="1h")
+            )
+        return engine
+
+    def test_child_rebuilds_a_fresh_engine_and_connection_after_fork(
+        self, file_db_url, tmp_path
+    ):
+        parent_engine = self._seed(file_db_url)
+        with parent_engine.connect() as conn:
+            parent_dbapi_id = id(conn.connection.dbapi_connection)
+
+        result_path = tmp_path / "fork_positive.json"
+        ctx = multiprocessing.get_context("fork")
+        proc = ctx.Process(
+            target=_fork_child_get_engine, args=(file_db_url, str(result_path))
+        )
+        proc.start()
+        proc.join(timeout=30)
+        assert proc.exitcode == 0
+
+        result = json.loads(result_path.read_text())
+
+        # The child's engine is not the parent's object...
+        assert result["engine_id"] != id(parent_engine)
+        # ...and its DBAPI connection is not the parent's either.
+        #
+        # KNOWN FLAKE RISK, documented rather than "fixed" with a more
+        # elaborate discriminator (a review pass looked for one and did not
+        # find a cheap one): `id()` is only guaranteed unique among objects
+        # simultaneously alive within ONE process's address space. Inside
+        # the child, `get_engine()`'s discard-and-rebuild path frees the
+        # INHERITED (stale) `dbapi_connection` wrapper -- via `dispose(
+        # close=False)` dropping the pool's last reference, then CPython's
+        # allocator reclaiming it -- strictly before the rebuilt engine's
+        # own first connect allocates its replacement. The replacement can
+        # therefore legally land on the just-freed block and get the SAME
+        # `id()`, which would fail this specific assertion despite the
+        # rebuild being entirely correct: a false-failure (flaky red), not
+        # a false-pass. Not reproduced in 25 forced trials on this
+        # platform/Python version, so left in place as the cheapest
+        # available corroborating signal -- `engine_id`, `dataset_names`,
+        # and `integrity_check` above are what actually prove freshness
+        # and correctness and do not share this risk (a brand-new `Engine`
+        # Python object is not freed-and-reallocated mid-call the way the
+        # short-lived DBAPI connection wrapper is). If this line ever
+        # flakes, that is the signal to replace it with a discriminator
+        # that does not depend on CPython's allocator reuse behaviour
+        # (e.g. a monotonic counter tagged onto each DBAPI connection via
+        # its own `connect` listener) rather than to loosen the test.
+        assert result["dbapi_id"] != parent_dbapi_id
+        # The child reads correct data through its rebuilt connection.
+        assert result["dataset_names"] == ["tank/fork"]
+        # ...and the rebuilt connection is genuinely sound, not merely
+        # usable.
+        assert result["integrity_check"] == "ok"
+
+        # The parent still works after the child forked, discarded the
+        # inherited pool, and rebuilt its own.
+        with parent_engine.connect() as conn:
+            names = [
+                row[0]
+                for row in conn.exec_driver_sql("SELECT name FROM datasets").fetchall()
+            ]
+        assert names == ["tank/fork"]
+
+    def test_negative_control_bypassing_pid_check_reuses_parents_connection(
+        self, file_db_url, tmp_path
+    ):
+        """Without 5b's pid check, a forked child that reaches the
+        engine/pool at all reuses the PARENT's engine object and the exact
+        same DBAPI connection object -- with no error of any kind. This is
+        what makes the positive test above meaningful: it demonstrates the
+        actual hazard `get_engine()`'s pid check exists to prevent, rather
+        than merely asserting a property that happened to hold anyway.
+        """
+        parent_engine = self._seed(file_db_url)
+        with parent_engine.connect() as conn:
+            parent_dbapi_id = id(conn.connection.dbapi_connection)
+
+        result_path = tmp_path / "fork_negative_control.json"
+        ctx = multiprocessing.get_context("fork")
+        proc = ctx.Process(
+            target=_fork_child_use_inherited_engine_directly,
+            args=(file_db_url, str(result_path)),
+        )
+        proc.start()
+        proc.join(timeout=30)
+        # No error of any kind -- the corruption hazard is silent, not an
+        # exception.
+        assert proc.exitcode == 0
+
+        result = json.loads(result_path.read_text())
+
+        # The cached tuple's owner_pid is still the PARENT's pid -- the
+        # child never updated it, because it never went through
+        # get_engine().
+        assert result["owner_pid_seen"] == os.getpid()
+        # Same engine object (literally, not just equal) --...
+        assert result["engine_id"] == id(parent_engine)
+        # ...and the same underlying DBAPI connection, reused silently.
+        assert result["dbapi_id"] == parent_dbapi_id
+        # The child can still read through it -- nothing about this fails
+        # loudly, which is precisely the danger.
+        assert result["dataset_names"] == ["tank/fork"]
+
+    def test_dispose_all_in_forked_child_does_not_disturb_parents_connection(
+        self, file_db_url, tmp_path
+    ):
+        """`dispose_all()`'s own pid guard, through a genuine fork rather
+        than the whitebox manufactured-pid technique
+        `TestDbDisposeAllPidGuard` uses. The child calls `dispose_all()`
+        DIRECTLY, with no prior `get_engine()` call of its own -- the only
+        cache entry it sees at all is the one inherited from the parent.
+        An earlier, pid-unaware `dispose_all` always passed `close=True`;
+        run against an inherited entry in a real forked child, that closes
+        a DBAPI connection the parent still holds and is using.
+        """
+        parent_engine = self._seed(file_db_url)
+
+        result_path = tmp_path / "fork_dispose_all.json"
+        ctx = multiprocessing.get_context("fork")
+        proc = ctx.Process(
+            target=_fork_child_dispose_all, args=(file_db_url, str(result_path))
+        )
+        proc.start()
+        proc.join(timeout=30)
+        assert proc.exitcode == 0
+
+        result = json.loads(result_path.read_text())
+        # The child's own (inherited-then-discarded) cache is empty...
+        assert result["cache_emptied"] is True
+
+        # ...and the PARENT's engine/connection is unaffected: if the
+        # child's dispose_all() had run the close path against the
+        # inherited entry, this read would fail with
+        # `ProgrammingError: Cannot operate on a closed database`.
+        with parent_engine.connect() as conn:
+            names = [
+                row[0]
+                for row in conn.exec_driver_sql("SELECT name FROM datasets").fetchall()
+            ]
+        assert names == ["tank/fork"]
+
+
+@pytest.mark.unit
+class TestDbWalConcurrency:
+    def test_concurrent_write_while_reader_session_open_succeeds(self, file_db_url):
+        writer_engine = make_engine(file_db_url)
+        Base.metadata.create_all(writer_engine)
+        with session_for_engine(writer_engine) as session:
+            session.add(
+                Dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
+            )
+
+        reader_engine = make_engine(file_db_url, readonly=True)
+        try:
+            with session_for_engine(reader_engine, readonly=True) as reader_session:
+                # A live read, held open for the duration of the block
+                # below -- this is the state under WAL that must not block
+                # a concurrent writer.
+                _ = reader_session.query(Dataset).all()
+
+                writer2 = make_engine(file_db_url)
+                try:
+                    with session_for_engine(writer2) as writer_session:
+                        writer_session.add(
+                            Dataset(
+                                name="tank/b",
+                                frequency_seconds=7200,
+                                frequency_literal="2h",
+                            )
+                        )
+                finally:
+                    writer2.dispose()
+        finally:
+            reader_engine.dispose()
+
+        with writer_engine.connect() as conn:
+            names = sorted(
+                row[0] for row in conn.exec_driver_sql("SELECT name FROM datasets").fetchall()
+            )
+        assert names == ["tank/a", "tank/b"]
+        writer_engine.dispose()
+
+    def test_reader_reads_fine_while_a_writer_holds_the_begin_immediate_lock(
+        self, file_db_url
+    ):
+        """The other direction from the test above: a WRITER holds its
+        `BEGIN IMMEDIATE` write lock open (uncommitted), and a concurrent
+        reader must still succeed -- proving `_install_begin_immediate`
+        (the generation-race fix) did not regress "readers never block" for
+        writers, only serialise writers against each other.
+        """
+        writer_engine = make_engine(file_db_url)
+        Base.metadata.create_all(writer_engine)
+        with session_for_engine(writer_engine) as session:
+            session.add(
+                Dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
+            )
+        writer_engine.dispose()
+
+        held_writer = make_engine(file_db_url)
+        reader_engine = make_engine(file_db_url, readonly=True)
+        try:
+            with Session(held_writer) as holding_session:
+                # First statement on a file-backed writer engine issues
+                # `BEGIN IMMEDIATE` -- takes SQLite's write lock -- and it
+                # stays open because this session is never committed.
+                holding_session.execute(
+                    text("INSERT INTO datasets "
+                         "(name, recursive, frequency_seconds, enabled) "
+                         "VALUES ('tank/held', 0, 60.0, 1)")
+                )
+
+                # A concurrent reader must complete without waiting on
+                # `busy_timeout` at all -- readers under WAL are never
+                # blocked by a live writer transaction.
+                start = time.monotonic()
+                with session_for_engine(reader_engine, readonly=True) as reader_session:
+                    names = sorted(d.name for d in reader_session.query(Dataset).all())
+                elapsed = time.monotonic() - start
+
+                # Only the already-committed row is visible -- the
+                # writer's uncommitted INSERT is invisible to the reader,
+                # as WAL snapshot isolation requires.
+                assert names == ["tank/a"]
+                # Generous bound: a genuinely non-blocking read is
+                # near-instant; a busy_timeout wait would be seconds.
+                assert elapsed < 1.0
+
+                holding_session.rollback()
+        finally:
+            held_writer.dispose()
+            reader_engine.dispose()
+
+
+def _run_and_capture(target, *args, **kwargs):
+    """Runs `target` in a new `threading.Thread`, capturing any exception
+    it raises so the calling test can re-raise it on the main thread
+    (pytest never sees an exception raised inside a bare `threading.Thread`
+    -- it would just print to stderr and the test would pass regardless).
+    Returns the started, not-yet-joined `Thread`.
+    """
+    outcome = {}
+
+    def _wrapper():
+        try:
+            target(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001
+            outcome["exception"] = exc
+
+    thread = threading.Thread(target=_wrapper)
+    thread.outcome = outcome
+    thread.start()
+    return thread
+
+
+def _join_and_reraise(thread, timeout=10):
+    thread.join(timeout=timeout)
+    assert not thread.is_alive(), "thread did not finish within timeout"
+    if "exception" in thread.outcome:
+        raise thread.outcome["exception"]
+
+
+@pytest.mark.integration
+class TestDbGenerationRace:
+    """The generation-race fix: `_install_begin_immediate` makes every
+    file-backed writer transaction start as `BEGIN IMMEDIATE`, closing a
+    silent lost-update on `GlobalSettings.generation` (`db.py`'s own
+    docstring has the full measured writeup). Two concurrent
+    `zfsbackup-config` writers both reading generation N and both writing
+    N+1 means items 15/17 -- which poll `generation` to detect "config
+    changed" -- never notice the second save happened at all.
+
+    Every test here uses a FILE URL with two independent writer
+    connections/engines -- an in-memory engine uses `StaticPool`, which
+    hands the same DBAPI connection to every checkout, so a second
+    concurrent writer session on `:memory:` cannot exist as SQLite would
+    reject it (`cannot start a transaction within a transaction`) and there
+    would be nothing to serialise there anyway (one connection, one
+    process). A guard test built on `:memory:` would pass vacuously.
+    """
+
+    def _seed(self, url, name="tank/base"):
+        engine = make_engine(url)
+        try:
+            Base.metadata.create_all(engine)
+            with session_for_engine(engine) as session:
+                save_config(session, _minimal_backup_config(name=name))
+        finally:
+            engine.dispose()
+
+    def _read_generation(self, url):
+        """A throwaway `make_engine()` call used only to read the current
+        generation, disposed explicitly. Anonymous `make_engine(url)`
+        calls that are never disposed are exactly the leak class this
+        method exists to avoid -- `engine.dispose()` releases the pooled
+        DBAPI connection deterministically; relying on garbage collection
+        to do it eventually is what produces the `ResourceWarning:
+        unclosed database` that can surface in an unrelated, later test's
+        output once the GC finally runs.
+        """
+        engine = make_engine(url)
+        try:
+            with session_for_engine(engine) as s:
+                return s.get(GlobalSettings, 1).generation
+        finally:
+            engine.dispose()
+
+    def test_serialized_interleave_second_writer_reads_incremented_generation(
+        self, file_db_url
+    ):
+        """Two writers, deliberately interleaved via `threading.Event`s so
+        writer A's transaction is still open (holding SQLite's write lock)
+        when writer B starts. With `BEGIN IMMEDIATE` in force, B's own
+        first statement blocks until A commits, then B reads the
+        POST-A-commit generation -- N+1, never the stale N -- and writes
+        N+2. The final generation is base+2, proving no update was lost.
+        """
+        self._seed(file_db_url, name="tank/base")
+        base_generation = self._read_generation(file_db_url)
+
+        a_holds_lock = threading.Event()
+        b_read_generation = {}
+
+        def writer_a():
+            with session_scope(file_db_url) as s:
+                save_config(s, _minimal_backup_config(name="tank/a"))
+                # The DELETE/INSERT sequence above has already forced
+                # BEGIN IMMEDIATE to fire -- the write lock is held from
+                # here until this `with` block exits (commits).
+                a_holds_lock.set()
+                time.sleep(0.3)
+
+        def writer_b():
+            a_holds_lock.wait(timeout=5)
+            with session_scope(file_db_url) as s:
+                # Blocks here (busy_timeout, default 5000ms > A's 0.3s
+                # hold) until A commits, then reads A's committed value.
+                b_read_generation["value"] = s.get(GlobalSettings, 1).generation
+                save_config(s, _minimal_backup_config(name="tank/b"))
+
+        thread_a = _run_and_capture(writer_a)
+        thread_b = _run_and_capture(writer_b)
+        _join_and_reraise(thread_a)
+        _join_and_reraise(thread_b)
+
+        assert b_read_generation["value"] == base_generation + 1
+
+        with session_scope(file_db_url, readonly=True) as s:
+            final = load_config(s)
+            final_generation = s.get(GlobalSettings, 1).generation
+
+        assert final.datasets[0].name == "tank/b"  # B committed last
+        assert final_generation == base_generation + 2
+
+    def test_second_writer_fails_with_database_is_locked_past_busy_timeout(
+        self, file_db_url
+    ):
+        """The other observable half of the fix: if the first writer holds
+        the lock past the second's `busy_timeout`, the second fails LOUDLY
+        with `database is locked` rather than silently interleaving.
+        Overrides writer B's `busy_timeout` down to 100ms (via the raw
+        DBAPI cursor, bypassing SQLAlchemy's autobegin so the override
+        itself does not trigger `BEGIN IMMEDIATE` before it can take
+        effect) so this test does not need to wait out the real 5000ms
+        default.
+        """
+        self._seed(file_db_url, name="tank/base")
+
+        engine_a = make_engine(file_db_url)
+        engine_b = make_engine(file_db_url)
+        try:
+            conn_a = engine_a.connect()
+            # Any statement begins the SQLAlchemy-level transaction, which
+            # fires the `begin` listener -> `BEGIN IMMEDIATE` -> takes the
+            # write lock.
+            conn_a.execute(text("SELECT 1"))
+
+            conn_b = engine_b.connect()
+            raw_cursor = conn_b.connection.dbapi_connection.cursor()
+            raw_cursor.execute("PRAGMA busy_timeout=100")
+            raw_cursor.close()
+
+            with pytest.raises(OperationalError, match="database is locked"):
+                conn_b.execute(text("SELECT 1"))
+
+            conn_a.rollback()
+            conn_b.close()
+            conn_a.close()
+        finally:
+            engine_a.dispose()
+            engine_b.dispose()
+
+    def test_negative_control_without_begin_immediate_loses_an_update(
+        self, file_db_url, mocker
+    ):
+        """Patches `_install_begin_immediate` out to a no-op BEFORE either
+        writer engine is built, reproducing the pre-fix race the two tests
+        above guard against: both writers read the SAME (stale) generation
+        and both commit `previous + 1` -- the final generation reflects
+        only ONE increment despite TWO writes, which is exactly the silent
+        lost update items 15/17 would never notice. Without this negative
+        control, the guard tests above could be passing for the wrong
+        reason (or testing nothing) rather than actually depending on
+        `_install_begin_immediate` -- the same reasoning that makes
+        `TestDbForkSafety`'s negative control load-bearing.
+        """
+        mocker.patch.object(store_db, "_install_begin_immediate")
+
+        self._seed(file_db_url, name="tank/base")
+        base_generation = self._read_generation(file_db_url)
+
+        a_read_generation = {}
+        b_read_generation = {}
+        a_has_read = threading.Event()
+        b_has_read = threading.Event()
+
+        def writer_a():
+            with session_scope(file_db_url) as s:
+                a_read_generation["value"] = s.get(GlobalSettings, 1).generation
+                a_has_read.set()
+                # Wait for B to also read before either of us writes --
+                # this is the race window `BEGIN IMMEDIATE` exists to
+                # close. Without it, a bare SELECT takes no lock and no
+                # snapshot, so both threads can freely interleave here.
+                b_has_read.wait(timeout=5)
+                save_config(s, _minimal_backup_config(name="tank/a"))
+
+        def writer_b():
+            a_has_read.wait(timeout=5)
+            with session_scope(file_db_url) as s:
+                b_read_generation["value"] = s.get(GlobalSettings, 1).generation
+                b_has_read.set()
+                save_config(s, _minimal_backup_config(name="tank/b"))
+
+        thread_a = _run_and_capture(writer_a)
+        thread_b = _run_and_capture(writer_b)
+        _join_and_reraise(thread_a)
+        _join_and_reraise(thread_b)
+
+        # Both writers saw the same, stale generation -- the race
+        # precondition the guard exists to prevent.
+        assert a_read_generation["value"] == base_generation
+        assert b_read_generation["value"] == base_generation
+
+        with session_scope(file_db_url, readonly=True) as s:
+            final_generation = s.get(GlobalSettings, 1).generation
+
+        # THE BUG: only ONE increment recorded despite TWO writes -- a
+        # generation-based poller (items 15/17) would never notice the
+        # second config was ever saved. Contrast with the positive guard
+        # test above, where the equivalent final value is base+2.
+        assert final_generation == base_generation + 1
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+class TestDbNestedWriterDeadlock:
+    """`_install_begin_immediate`'s write lock is taken at the FIRST
+    STATEMENT of any transaction -- not the first write -- so it is held
+    by a writer session that never writes anything at all, and a SECOND
+    writer connection opened while the first is still live cannot make
+    progress: no thread is waiting to release anything, so this is a
+    guaranteed `busy_timeout` stall then a hard failure, not a race (see
+    `session_for_engine`'s docstring). Single-threaded throughout --
+    deadlock, not a race, needs no `threading`.
+
+    `busy_timeout` is shrunk to 200ms via a fixture-installed `connect`
+    listener, registered AFTER `make_engine`'s own so it overrides the
+    5000ms default on every connection the engine hands out -- without
+    this, each `OperationalError`-raising test here would cost the real
+    5s default. Marked `integration`/`slow` regardless: these are
+    deliberately slow-by-construction (~200ms of guaranteed blocking
+    each), not fast unit tests.
+    """
+
+    @pytest.fixture
+    def fast_writer_engine(self, file_db_url):
+        # Bootstrap the schema via `ensure_schema` (sequential, its own
+        # phase, committed and closed before anything else touches the
+        # file) rather than `Base.metadata.create_all` -- the latter
+        # leaves `alembic_version` missing, which would make the FK-off
+        # nested test below hit `SchemaSplitBrain` for a reason that has
+        # nothing to do with the lock contention it exists to pin. This
+        # way the database is genuinely at head, and a nested `ensure_
+        # schema` call inside a writer session is a legitimate "already
+        # migrated, no-op" case that STILL takes the write lock at its
+        # very first statement (reading `alembic_version`) -- exactly the
+        # "fires at the first statement, not the first write" behaviour
+        # under test.
+        bootstrap = make_engine(file_db_url, foreign_keys=False)
+        try:
+            with bootstrap.connect() as conn:
+                ensure_schema(conn)
+                conn.commit()
+        finally:
+            bootstrap.dispose()
+
+        eng = make_engine(file_db_url)
+
+        @event.listens_for(eng, "connect")
+        def _shrink_busy_timeout(dbapi_connection, connection_record):  # noqa: ANN001
+            cur = dbapi_connection.cursor()
+            cur.execute("PRAGMA busy_timeout=200")
+            cur.close()
+
+        yield eng
+        eng.dispose()
+
+    def test_nested_writer_session_self_deadlocks(self, fast_writer_engine):
+        with session_for_engine(fast_writer_engine) as outer:
+            outer.add(
+                Dataset(name="tank/outer", frequency_seconds=60, frequency_literal="1m")
+            )
+            # `add()` alone only stages the object in memory -- it emits
+            # no SQL and therefore begins no transaction. `flush()` is
+            # what actually issues the outer session's first statement,
+            # which is what takes the write lock this test needs live.
+            outer.flush()
+            with pytest.raises(OperationalError, match="database is locked"):
+                with session_for_engine(fast_writer_engine) as inner:
+                    # ANY statement -- including a read -- begins the
+                    # transaction and triggers BEGIN IMMEDIATE, which
+                    # blocks on the outer session's still-open write lock.
+                    inner.query(Dataset).all()
+
+    def test_nested_reader_inside_writer_succeeds_immediately(
+        self, fast_writer_engine, file_db_url
+    ):
+        # The asymmetry: a nested READER is fine even while the writer
+        # genuinely holds the lock (via the same `flush()` as above),
+        # because reader engines never take the write lock at all.
+        reader_engine = make_engine(file_db_url, readonly=True)
+        try:
+            with session_for_engine(fast_writer_engine) as outer:
+                outer.add(
+                    Dataset(
+                        name="tank/outer", frequency_seconds=60, frequency_literal="1m"
+                    )
+                )
+                outer.flush()
+                start = time.monotonic()
+                with session_for_engine(reader_engine, readonly=True) as inner:
+                    inner.query(Dataset).all()
+                elapsed = time.monotonic() - start
+            assert elapsed < 0.1
+        finally:
+            reader_engine.dispose()
+
+    def test_nested_fk_off_engine_self_deadlocks(self, fast_writer_engine, file_db_url):
+        # The FK-off Alembic migration engine (`get_engine(url,
+        # foreign_keys=False)`) is a second WRITER engine on the same
+        # file -- different cache key, own pool, same write lock. Nesting
+        # it inside a live writer session self-deadlocks exactly like a
+        # second full writer session would. This is what `store/
+        # __init__.py`'s item-8 note instructs against. The database is
+        # already at head (`fast_writer_engine`'s own bootstrap), so this
+        # nested `ensure_schema` call would otherwise be a harmless no-op
+        # -- it still deadlocks, because `MigrationContext.configure`'s
+        # own read of `alembic_version` is itself the first statement
+        # that takes the lock.
+        fk_off_engine = make_engine(file_db_url, foreign_keys=False)
+
+        @event.listens_for(fk_off_engine, "connect")
+        def _shrink_busy_timeout(dbapi_connection, connection_record):  # noqa: ANN001
+            cur = dbapi_connection.cursor()
+            cur.execute("PRAGMA busy_timeout=200")
+            cur.close()
+
+        try:
+            with session_for_engine(fast_writer_engine) as outer:
+                outer.add(
+                    Dataset(
+                        name="tank/outer", frequency_seconds=60, frequency_literal="1m"
+                    )
+                )
+                outer.flush()
+                with pytest.raises(OperationalError, match="database is locked"):
+                    with fk_off_engine.connect() as conn:
+                        ensure_schema(conn)
+        finally:
+            fk_off_engine.dispose()
+
+    def test_sequential_fk_off_engine_then_writer_session_succeeds(self, file_db_url):
+        # The documented fix: run ensure_schema + commit + close as a
+        # strictly sequential phase BEFORE opening any writer session --
+        # never nested. No deadlock, no shrunk timeout needed.
+        fk_off_engine = make_engine(file_db_url, foreign_keys=False)
+        try:
+            with fk_off_engine.connect() as conn:
+                ensure_schema(conn)
+                conn.commit()
+        finally:
+            fk_off_engine.dispose()
+
+        writer_engine = make_engine(file_db_url)
+        try:
+            with session_for_engine(writer_engine) as s:
+                save_config(s, _minimal_backup_config(name="tank/after-migrate"))
+        finally:
+            writer_engine.dispose()
+
+        reader_engine = make_engine(file_db_url, readonly=True)
+        try:
+            with session_for_engine(reader_engine, readonly=True) as s:
+                loaded = load_config(s)
+        finally:
+            reader_engine.dispose()
+        assert loaded.datasets[0].name == "tank/after-migrate"
+
+
+@pytest.mark.integration
+class TestDbReadOnlyWorkloadSerialization:
+    """`BEGIN IMMEDIATE` fires at the first statement of ANY transaction,
+    so a writer session that only READS still takes the exclusive write
+    lock and holds it until commit/close (`session_scope`'s docstring).
+    Two read-only workloads through the DEFAULT (read-write) form
+    therefore serialise on that lock; the identical workloads through
+    `readonly=True` do not, because reader engines never take it at all.
+    """
+
+    def _seed(self, url):
+        engine = make_engine(url)
+        try:
+            Base.metadata.create_all(engine)
+            with session_for_engine(engine) as s:
+                save_config(s, _minimal_backup_config(name="tank/a"))
+        finally:
+            engine.dispose()
+
+    def test_two_readonly_workloads_serialise_through_readwrite_form(
+        self, file_db_url
+    ):
+        self._seed(file_db_url)
+
+        a_holds = threading.Event()
+        timings = {}
+
+        def workload_a():
+            with session_scope(file_db_url) as s:
+                s.query(GlobalSettings).all()  # read-only WORK, writer FORM
+                a_holds.set()
+                time.sleep(0.3)
+
+        def workload_b():
+            a_holds.wait(timeout=5)
+            start = time.monotonic()
+            with session_scope(file_db_url) as s:
+                s.query(GlobalSettings).all()
+            timings["b_elapsed"] = time.monotonic() - start
+
+        thread_a = _run_and_capture(workload_a)
+        thread_b = _run_and_capture(workload_b)
+        _join_and_reraise(thread_a)
+        _join_and_reraise(thread_b)
+
+        # B waited out (most of) A's 0.3s hold -- the two read-only
+        # workloads serialised on the write lock the read-write form
+        # takes even though neither one writes anything.
+        assert timings["b_elapsed"] >= 0.2
+
+    def test_two_readonly_workloads_do_not_serialise_through_readonly_true(
+        self, file_db_url
+    ):
+        self._seed(file_db_url)
+
+        a_holds = threading.Event()
+        timings = {}
+
+        def workload_a():
+            with session_scope(file_db_url, readonly=True) as s:
+                s.query(GlobalSettings).all()
+                a_holds.set()
+                time.sleep(0.3)
+
+        def workload_b():
+            a_holds.wait(timeout=5)
+            start = time.monotonic()
+            with session_scope(file_db_url, readonly=True) as s:
+                s.query(GlobalSettings).all()
+            timings["b_elapsed"] = time.monotonic() - start
+
+        thread_a = _run_and_capture(workload_a)
+        thread_b = _run_and_capture(workload_b)
+        _join_and_reraise(thread_a)
+        _join_and_reraise(thread_b)
+
+        # B did NOT wait for A's 0.3s hold -- readers under WAL are never
+        # blocked, contrasting directly with the read-write form above.
+        assert timings["b_elapsed"] < 0.1
+
+
+@pytest.mark.integration
+class TestDbWalSidecars:
+    def test_sidecars_present_while_open_and_gone_after_dispose_all(self, tmp_path):
+        db_path = tmp_path / "sidecar.db"
+        url = f"sqlite:///{db_path}"
+        wal_path = db_path.with_name(db_path.name + "-wal")
+        shm_path = db_path.with_name(db_path.name + "-shm")
+
+        engine = get_engine(url)
+        Base.metadata.create_all(engine)
+        with session_for_engine(engine) as session:
+            session.add(
+                Dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
+            )
+
+        assert wal_path.exists()
+        assert shm_path.exists()
+
+        dispose_all()
+
+        assert db_path.exists()
+        assert not wal_path.exists()
+        assert not shm_path.exists()
+
+
+@pytest.mark.integration
+class TestDbCrashDurability:
+    def test_abandoning_a_connection_mid_save_leaves_previous_config_intact(
+        self, file_db_url
+    ):
+        """Simulates an operator `^C` / process kill between `save_config`
+        returning and the caller's own `commit()`: `save_config` is a
+        wipe-and-reinsert that owns no transaction policy of its own
+        (`session_scope`'s docstring), so abandoning the connection before
+        any commit must leave the store exactly as it was before the call,
+        not half-written.
+        """
+        engine = make_engine(file_db_url)
+        Base.metadata.create_all(engine)
+
+        good = _minimal_backup_config(name="tank/good")
+        with session_for_engine(engine) as session:
+            save_config(session, good)
+
+        # A bare Session, NOT session_for_engine -- nothing here commits or
+        # rolls back on our behalf; the connection is abandoned exactly as
+        # a crash would abandon it.
+        crashing_session = Session(engine)
+        bad = _minimal_backup_config(name="tank/bad")
+        save_config(crashing_session, bad)  # wipes + reinserts, no commit
+        crashing_session.close()  # abandoned: implicit rollback, no commit
+
+        with session_for_engine(engine, readonly=False) as session:
+            loaded = load_config(session)
+
+        assert loaded.datasets[0].name == "tank/good"
+        engine.dispose()
+
+
+@pytest.mark.unit
+class TestDbSessionForEngineRollback:
+    """`session_for_engine`'s writer contract: "rolls back on any
+    exception" (its own docstring). `Session.close()` also rolls back
+    implicitly -- which is exactly why deleting the explicit `except
+    Exception: session.rollback(); raise` block from `session_for_engine`
+    failed zero tests before this class existed: every behavioural
+    assertion "nothing was committed" still held via `close()`'s own
+    fallback. The spy below pins the CALL itself, not just its (already
+    guaranteed by SQLAlchemy) side effect, so a future refactor that
+    removes the explicit rollback is caught here even though its
+    observable behaviour would not change today.
+    """
+
+    def test_rollback_is_called_when_the_body_raises(self, engine, mocker):
+        rollback_spy = mocker.spy(Session, "rollback")
+
+        class _Boom(Exception):
+            pass
+
+        with pytest.raises(_Boom):
+            with session_for_engine(engine) as session:
+                session.add(
+                    Dataset(
+                        name="tank/never-committed",
+                        frequency_seconds=60,
+                        frequency_literal="1m",
+                    )
+                )
+                raise _Boom("simulated failure mid-transaction")
+
+        assert rollback_spy.call_count >= 1
+
+    def test_body_raising_leaves_nothing_committed(self, engine):
+        # The behavioural half -- true regardless of the explicit
+        # `rollback()` call (see class docstring), but still the actual
+        # contract `session_for_engine`'s docstring promises and worth
+        # pinning alongside the call-site spy above.
+        class _Boom(Exception):
+            pass
+
+        with pytest.raises(_Boom):
+            with session_for_engine(engine) as session:
+                session.add(
+                    Dataset(
+                        name="tank/never-committed",
+                        frequency_seconds=60,
+                        frequency_literal="1m",
+                    )
+                )
+                session.flush()
+                raise _Boom("simulated failure mid-transaction")
+
+        # A SEPARATE Session/connection, not the aborted one -- proves the
+        # row never reached the database, not merely that this particular
+        # Session object forgot about it.
+        with Session(engine) as verify:
+            assert verify.query(Dataset).count() == 0
+
+
+@pytest.mark.unit
+class TestDbSessionScopeWriterPath:
+    """`session_scope`'s DEFAULT (`readonly=False`) branch had never been
+    exercised on its own anywhere in this file -- every existing
+    `session_scope` call elsewhere passes `readonly=True`. This is the
+    CLI's entry point (item 10) and the only path that combines "resolve
+    the engine through the pid-keyed `get_engine()` cache" with "commit
+    exactly once", both at once; nothing else pins that combination.
+    """
+
+    def test_writer_session_scope_commits_and_is_visible_from_a_separate_readonly_scope(
+        self, file_db_url
+    ):
+        setup_engine = make_engine(file_db_url)
+        Base.metadata.create_all(setup_engine)
+        setup_engine.dispose()
+
+        with session_scope(file_db_url) as session:
+            save_config(
+                session, _minimal_backup_config(name="tank/via-session-scope")
+            )
+
+        # A SEPARATE session_scope call, resolving its OWN readonly=True
+        # engine through get_engine() -- exactly how a worker process
+        # would read what the CLI just wrote.
+        with session_scope(file_db_url, readonly=True) as session:
+            loaded = load_config(session)
+
+        assert loaded.datasets[0].name == "tank/via-session-scope"
+
+
+@pytest.mark.unit
+class TestDbReadOnlySessions:
+    """5c, both enforcement layers: `PRAGMA query_only=ON` (layer 1, SQLite
+    itself) and the `before_flush`/`do_orm_execute` `ReadOnlySessionError`
+    guard (layer 2, diagnosis). Every write attempt below also asserts the
+    database file's bytes are unchanged, not just that an exception was
+    raised.
+    """
+
+    @pytest.fixture
+    def seeded_file_db(self, tmp_path):
+        db_path = tmp_path / "seeded.db"
+        url = f"sqlite:///{db_path}"
+        engine = make_engine(url)
+        Base.metadata.create_all(engine)
+        with session_for_engine(engine) as session:
+            save_config(session, _minimal_backup_config(name="tank/a"))
+        engine.dispose()
+        return url, db_path
+
+    def test_orm_flush_raises_readonly_session_error(self, seeded_file_db):
+        url, db_path = seeded_file_db
+        before = db_path.read_bytes()
+
+        reader_engine = make_engine(url, readonly=True)
+        try:
+            with pytest.raises(ReadOnlySessionError):
+                with session_for_engine(reader_engine, readonly=True) as session:
+                    dataset = session.query(Dataset).first()
+                    dataset.frequency_seconds = 999
+                    session.flush()
+        finally:
+            reader_engine.dispose()
+
+        assert db_path.read_bytes() == before
+
+    def test_bulk_delete_raises_readonly_session_error(self, seeded_file_db):
+        url, db_path = seeded_file_db
+        before = db_path.read_bytes()
+
+        reader_engine = make_engine(url, readonly=True)
+        try:
+            with pytest.raises(ReadOnlySessionError):
+                with session_for_engine(reader_engine, readonly=True) as session:
+                    session.execute(delete(Dataset))
+        finally:
+            reader_engine.dispose()
+
+        assert db_path.read_bytes() == before
+
+    def test_bulk_update_raises_readonly_session_error(self, seeded_file_db):
+        url, db_path = seeded_file_db
+        before = db_path.read_bytes()
+
+        reader_engine = make_engine(url, readonly=True)
+        try:
+            with pytest.raises(ReadOnlySessionError):
+                with session_for_engine(reader_engine, readonly=True) as session:
+                    session.execute(update(Dataset).values(frequency_seconds=1))
+        finally:
+            reader_engine.dispose()
+
+        assert db_path.read_bytes() == before
+
+    def test_raw_text_update_raises_operational_error(self, seeded_file_db):
+        # Layer 2 (`ReadOnlySessionError`) does not recognise a raw
+        # `text()` statement as DML -- only Core `update()`/`delete()`
+        # constructs set `is_update`/`is_delete` on the event state. Layer
+        # 1 (`PRAGMA query_only=ON`) is what actually stops this one, and
+        # it surfaces as a bare `OperationalError`.
+        url, db_path = seeded_file_db
+        before = db_path.read_bytes()
+
+        reader_engine = make_engine(url, readonly=True)
+        try:
+            with pytest.raises(OperationalError):
+                with session_for_engine(reader_engine, readonly=True) as session:
+                    session.execute(text("UPDATE datasets SET frequency_seconds=999"))
+        finally:
+            reader_engine.dispose()
+
+        assert db_path.read_bytes() == before
+
+    def test_readonly_session_still_serves_load_config(self, seeded_file_db):
+        # The regression guard against over-blocking: a read-only session
+        # must still be able to do the one thing it exists for. Uses
+        # `session_scope` (not `session_for_engine`) deliberately -- this
+        # is the entry point a real worker process would call, and it
+        # resolves its own `readonly=True` engine through `get_engine()`
+        # rather than being handed one.
+        url, _db_path = seeded_file_db
+
+        with session_scope(url, readonly=True) as session:
+            loaded = load_config(session)
+
+        assert loaded.datasets[0].name == "tank/a"
+
+
+@pytest.mark.integration
+class TestDbChmodReadOnlyDatabase:
+    """Item 6's permissions requirement: `readonly=True` is an accident
+    guard on database *content* (`PRAGMA query_only=ON`), not a statement
+    that this process needs no filesystem write access at all -- see the
+    `db.py` module docstring's "Read-only is an accident guard, not a
+    privilege boundary" section. Touches real file permissions, hence
+    `integration` rather than `unit`.
+    """
+
+    def test_chmod_444_before_first_wal_open_fails_even_readonly(self, tmp_path):
+        """The realistic item-6 shape: a `config.db` provisioned with the
+        wrong permissions before it has EVER been opened in WAL mode (the
+        journal mode this module always tries to set). SQLite's
+        `PRAGMA journal_mode=WAL` has to actually rewrite the on-disk
+        journal-mode header the first time, which needs write access to
+        the main db file -- and fails loudly even though the caller only
+        asked to read.
+        """
+        db_path = tmp_path / "never_written.db"
+        # A bare sqlite3 connection, bypassing db.py entirely, so the file
+        # is created with SQLite's own default (non-WAL) journal mode --
+        # this module has never touched it.
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.commit()
+        assert conn.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        conn.close()
+
+        os.chmod(db_path, 0o444)
+        try:
+            url = f"sqlite:///{db_path}"
+            reader = make_engine(url, readonly=True)
+
+            # SQLAlchemy's pool has no cleanup path for a raw DBAPI
+            # connection whose FIRST-EVER `connect` event listener raises:
+            # `_ConnectionRecord.__init__`'s own `__connect()` call (which
+            # is where a brand-new pool creates its first connection) is
+            # NOT wrapped by `_ConnectionRecord.checkout()`'s try/except --
+            # that only wraps an ALREADY-CONSTRUCTED record's
+            # `get_connection()`. Confirmed empirically: neither the
+            # pool's `invalidate` nor `close` events fire on this path, so
+            # `reader.dispose()` alone does not close the connection this
+            # test's `db.py` pragma listener opened just before raising --
+            # it leaks as a bare `ResourceWarning: unclosed database`,
+            # attributed by Python's GC to whatever test happens to be
+            # running when the cyclic collector eventually reclaims it
+            # (observed landing on an unrelated sibling test). Registered
+            # with `insert=True` so this listener runs BEFORE `db.py`'s
+            # own pragma listener and can capture the raw connection while
+            # it is still reachable, then close it explicitly below.
+            opened_connections = []
+
+            @event.listens_for(reader, "connect", insert=True)
+            def _capture_raw_connection(dbapi_connection, connection_record):  # noqa: ANN001
+                opened_connections.append(dbapi_connection)
+
+            try:
+                with pytest.raises(
+                    OperationalError, match="readonly database"
+                ):
+                    with reader.connect():
+                        pass
+            finally:
+                reader.dispose()
+                for raw_conn in opened_connections:
+                    raw_conn.close()
+        finally:
+            os.chmod(db_path, 0o644)  # so tmp_path cleanup can remove it
+
+    def test_chmod_444_after_wal_already_set_opens_fine_readonly(self, tmp_path):
+        """The documented exception to the rule above, pinned so nobody
+        "fixes" the docstring's precondition note back into an
+        unconditional claim: a file already migrated to WAL mode by a
+        writer BEFORE the `chmod` opens fine read-only even at `chmod
+        444`, because re-affirming an already-set `journal_mode=WAL`
+        requires no write.
+        """
+        db_path = tmp_path / "already_wal.db"
+        url = f"sqlite:///{db_path}"
+        writer = make_engine(url)
+        Base.metadata.create_all(writer)
+        writer.dispose()
+
+        os.chmod(db_path, 0o444)
+        try:
+            reader = make_engine(url, readonly=True)
+            try:
+                with reader.connect() as conn:
+                    assert (
+                        conn.exec_driver_sql("PRAGMA journal_mode").scalar()
+                        == "wal"
+                    )
+            finally:
+                reader.dispose()
+        finally:
+            os.chmod(db_path, 0o644)

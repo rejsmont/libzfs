@@ -157,8 +157,24 @@ class GlobalSettings(Base):
     # real bug (ClientIdentity._load_or_generate silently generates a new
     # client ID on a wrong-$HOME miss).
     client_id_file: Mapped[Optional[str]] = mapped_column(nullable=True)
-    # Bumped on every write; used by items 15/17 to detect concurrent
-    # modification (read generation, write, compare-and-swap on save).
+    # Bumped on every write; polled by items 15/17 to detect "the config
+    # changed, reload it".
+    #
+    # NOT a compare-and-swap, despite what this comment used to claim.
+    # `mapper.save_config` reads the current value and writes `previous +
+    # 1` with no `WHERE generation = N` and no `version_id_col`, so the
+    # column does not by itself detect a concurrent modification: two
+    # writers that both read N both write N+1, and the loser's config is
+    # the one the daemon keeps running while the operator sees the
+    # winner's rows in the DB. What actually prevents that is the write
+    # lock -- `store/db.py` starts every file-backed WRITER transaction
+    # with `BEGIN IMMEDIATE`, so the read of this column and the write of
+    # `previous + 1` happen inside one exclusive write transaction and the
+    # second writer waits (then fails loudly with `database is locked`)
+    # rather than silently duplicating a generation number. If a writer
+    # ever appears that does not come from `db.py`'s writer engine, this
+    # column needs a real CAS (`version_id_col`, or an UPDATE predicated
+    # on the value read) -- it does not have one today.
     generation: Mapped[int] = mapped_column(default=0, nullable=False)
 
     def __repr__(self) -> str:
