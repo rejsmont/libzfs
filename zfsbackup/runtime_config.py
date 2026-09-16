@@ -222,15 +222,8 @@ def load_runtime_config(
         # one above, and the real answer to it is the `generation` counter
         # items 15/17 own, not a longer-lived reader.
         session.execute(text("BEGIN"))
-        import os as _os
-        _raw = session.connection().connection.dbapi_connection
-        _in1 = _raw.in_transaction
         try:
             config = load_config(session)
-            _raw2 = session.connection().connection.dbapi_connection
-            if not (_in1 and _raw2.in_transaction and _raw is _raw2):
-                with open("/tmp/snapdbg.log", "a") as _f:
-                    _f.write(f"VIOLATION pid={_os.getpid()} after_begin={_in1} after_load={_raw2.in_transaction} same_conn={_raw is _raw2}\n")
         except BaseException:
             try:
                 session.execute(text("ROLLBACK"))
