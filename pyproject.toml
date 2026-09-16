@@ -7,7 +7,7 @@ license = "MIT"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = "^3.11"
 pyyaml = "^6.0"
 # libzfs = {git = "https://gitlab.vibfolks.eu/rejsmont/py-libzfs.git"}
 flask = "^3.1.3"

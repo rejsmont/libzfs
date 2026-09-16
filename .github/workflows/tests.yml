@@ -1,0 +1,82 @@
+name: tests
+
+# The mocked suite needs no ZFS, so it runs anywhere. The 30 `real_zfs`
+# tests are excluded by pytest.ini's addopts and are NOT run here -- they
+# need a real pool, and whether ZFS loads on a hosted runner kernel is an
+# open question. See scenarios/ for the real-pool and two-VM harnesses.
+
+on:
+  push:
+    branches: [master, config-db-cli]
+  pull_request:
+
+# A superseded run tells you nothing; cancel it rather than pay for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: py${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # A wedged fork test must not burn an hour. The suite takes ~5s.
+    timeout-minutes: 10
+
+    strategy:
+      # When one version breaks, we need to know whether it is that
+      # version or all of them -- so never cancel the siblings.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        # 3.11 is the floor declared in pyproject.toml. Every version in
+        # between is listed deliberately: Path.resolve() changed its
+        # symlink-loop behaviour at 3.13, and that boundary hid a real
+        # bug in zfsbackup/config/store/paths.py until it was found by
+        # accident. Boundaries between versions are where things hide.
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          # Development happens on macOS, where the multiprocessing
+          # default start method is `spawn` rather than Linux's `fork`
+          # (or `forkserver` on 3.14). The fork-safety tests pin
+          # get_context("fork") explicitly, but their negative controls
+          # were written on a spawn-default machine -- so keep one darwin
+          # job to stop the dev platform silently diverging.
+          - os: macos-latest
+            python: "3.14"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install poetry
+        # Pinned: a poetry minor bump changing resolution is not something
+        # we want to discover as a red build on an unrelated PR.
+        run: pipx install poetry==2.1.1
+
+      - name: Cache the project virtualenv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py${{ matrix.python }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: |
+          poetry config virtualenvs.in-project true
+          poetry install --with dev
+
+      - name: Run the mocked test suite
+        run: poetry run pytest
+
+      - name: Upload coverage
+        # Coverage is informational for now -- no threshold is enforced.
+        # zfsbackup was only added to --cov in the same change that added
+        # this workflow, so the first real number is not yet known.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ runner.os }}-py${{ matrix.python }}
+          path: coverage.xml
+          if-no-files-found: ignore
