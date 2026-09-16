@@ -909,6 +909,75 @@ Consequences:
 - **Verification:** `pytest tests/test_zfsbackup_store.py -k import`, then the full
   `pytest tests/test_zfsbackup_*.py`.
 
+### Item 8x — SIGKILLed worker wedges the supervisor's stop path *(found during item 8; NOT part of it)*
+
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(signals, multiprocessing)* ·
+  **`concurrency-reviewer` required**
+- **PRIORITY — this is not an edge case.** It was first recorded as "reachable via the OOM killer or
+  `kill -9`". It is reachable by **an ordinary Ctrl-C, on every platform, today**. Measured after item
+  8's signal fix, with children correctly resetting to `SIG_DFL` and dying cleanly:
+
+  ```
+  fork    children exitcodes: [-2, -2, -2]  ==> supervisor WEDGED (>20s)
+  spawn   children exitcodes: [-2, -2, -2]  ==> supervisor WEDGED (>20s)
+  ```
+
+  Any child that dies while registered as a sleeper on the shared `Event` leaves a ghost token in
+  `_sleeping_count`; dying *correctly* from SIGINT does this just as surely as being SIGKILLed. So
+  `systemctl stop` and Ctrl-C both hang until something sends SIGKILL. **It should be fixed before
+  item 9.**
+- **Not in the original plan.** Found while validating item 8i's crash-loop guard, then reproduced
+  standalone. **Pre-existing** — it is `_stop_event`'s design and predates every DB change — but item
+  8i cannot be validated with `kill -9` until it is understood, and it is reachable in production via
+  the OOM killer, a container eviction, or an operator's `kill -9`.
+- **Measured, 5 trials out of 5, deterministic on macOS/CPython 3.14** (not a race; delays of 0.2s,
+  0.6s and 1.0s before the kill all wedge):
+
+  ```
+  child exitcode: -9
+  parent calling ev.is_set() ...
+    is_set() returned False after 0.00s
+  parent calling ev.set()   ... never returns (>25s, killed)
+  ```
+
+- **Mechanism (corrected — the first recorded explanation was wrong).** The killed child is **not**
+  holding a lock: `Condition.wait()` releases `self._lock` before sleeping. The block is in
+  `Condition.notify()`, which after waking sleepers does `self._woken_count.acquire()` once per
+  sleeper — "wait for a sleeper to wake". A SIGKILLed sleeper has already incremented
+  `_sleeping_count` and will never increment `_woken_count`, so `Event.set()` → `notify_all()` blocks
+  forever on a semaphore nobody will post. Workers spend essentially all their idle time inside
+  `stop_event.wait()` — `workers.py:132` in the main loop, `workers.py:263` where `ApiWorker` blocks
+  indefinitely — so the window is not narrow, it is the common case.
+
+  The originally recorded explanation ("POSIX semaphores are not robust; the killed process never
+  releases the lock") was **wrong**, and its own evidence disproved it: `Event.is_set()` is
+  `with self._cond:`, and it returned in 0.00s — which it could not have done against an orphaned
+  lock. It returns promptly *because* the lock is fine.
+
+- **Consequence.** `is_set()` returns normally, so the supervisor's poll loop at `daemon.py:199-201`
+  keeps running and the daemon looks healthy. But `set()` blocks forever, and `set()` is what the
+  **signal handler** calls (`daemon.py:75`). After one SIGKILLed worker the daemon **can no longer be
+  stopped by SIGTERM or SIGINT** — it blocks inside the handler, systemd waits out `TimeoutStopSec`,
+  then SIGKILLs it.
+
+- **Item 8i does not make this worse on its own.** Its all-workers-failed path calls `set()`
+  (`daemon.py:164`), but a worker exiting `EX_CONFIG` raises `SystemExit` from `_load_config` before
+  ever reaching `stop_event.wait()`, so `_sleeping_count` is 0 and `notify_all()` returns
+  immediately. The wedge requires a separately SIGKILLed sleeper.
+
+- **Platform-independent — the earlier "macOS-only, unverified on Linux" caveat is withdrawn.**
+  `multiprocessing/synchronize.py` is pure Python and identical across platforms, and `SemLock` is a
+  POSIX semaphore on both. Reproduced under `fork` **and** `spawn` on the same machine, which is the
+  same code path Linux takes.
+
+- **Fix directions, none chosen.** A non-blocking *signal handler* does **not** fix this — the block
+  is in `notify()`, so **any** caller of `set()` blocks, handler or main loop. What matches the
+  mechanism: replace the shared `Event` with something robust to a holder's death (a pipe, or
+  per-worker state the supervisor owns), or have the supervisor detect `exitcode == -SIGKILL` and
+  rebuild the Event before touching it.
+- **Constraint on tests until this is fixed:** no test may SIGKILL a worker — it hangs the run.
+  Simulate worker death with exit codes instead.
+
 ### Item 9 — Tests for Phase 1
 
 - **Owner:** `pytest-test-author` · **Tag:** `low-risk`

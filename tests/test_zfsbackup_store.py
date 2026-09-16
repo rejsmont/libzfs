@@ -36,6 +36,7 @@ positive test alone would pass vacuously on this machine (Python 3.14 on
 darwin, `spawn`-default).
 """
 
+import hashlib
 import json
 import logging
 import multiprocessing
@@ -101,6 +102,7 @@ from zfsbackup.config.store.migrate import (
     check_schema,
     ensure_schema,
 )
+from zfsbackup.config.store.importer import ImportResult, import_yaml
 from zfsbackup.config.store.paths import (
     CONFIG_DB_MODE,
     CONFIG_DIR_MODE,
@@ -240,22 +242,11 @@ def file_engine(file_db_url):
     eng.dispose()
 
 
-@pytest.fixture(autouse=True)
-def _clean_db_engine_cache():
-    """Disposes every engine `get_engine()` has cached, before and after
-    every test in this file.
-
-    `db.py`'s pid-keyed `_ENGINES` cache is module-global state shared by
-    the whole pytest process; without this, a test that calls `get_engine`
-    would leak a live engine (and its open DBAPI connection/pool) into the
-    next test, which is exactly the class of hazard `db.py` exists to
-    prevent process-wide, not just across a fork. Autouse and file-scoped
-    (not just on the `TestDb*` classes) because the cache is a single piece
-    of global state regardless of which test populated it.
-    """
-    dispose_all()
-    yield
-    dispose_all()
+# `_clean_db_engine_cache` (autouse, disposes every `get_engine()`-cached
+# engine before and after each test) moved to `tests/conftest.py` (item 8,
+# sub-item 8j) and is now session-wide rather than file-scoped, since the
+# daemon and worker tests added alongside item 8 build engines through
+# `db.py` too and would otherwise leak them into unrelated test files.
 
 
 def make_dataset(session, name="tank/data", **kwargs):
@@ -3312,6 +3303,225 @@ class TestMigrationsOverDbWriterConnection:
 
 
 # ---------------------------------------------------------------------------
+# Item 8, sub-item 8b -- zfsbackup/config/store/importer.py (YAML -> DB import)
+# ---------------------------------------------------------------------------
+#
+# `config_yaml_path` (conftest.py) is importer INPUT here, exactly as its
+# own docstring now says -- these tests are the sanctioned way to exercise
+# `import_yaml` end to end: real files on `tmp_path`, real `check_config_db`
+# preflights, real Alembic migration, real `save_config`. No mocking of
+# anything importer.py itself calls.
+
+
+@pytest.mark.unit
+class TestImporterFreshImport:
+    def test_creates_dir_0770_db_0660_schema_at_head_and_config_matches_from_file(
+        self, tmp_path, config_yaml_path
+    ):
+        target = tmp_path / "newdir" / "config.db"
+        resolved = resolve_config_path(str(target))
+
+        result = import_yaml(config_yaml_path, resolved)
+
+        assert result.created is True
+        assert result.replaced_datasets == 0
+        assert result.replaced_destinations == 0
+
+        assert stat.S_IMODE(target.parent.stat().st_mode) == CONFIG_DIR_MODE
+        assert stat.S_IMODE(target.stat().st_mode) == CONFIG_DB_MODE
+
+        with open_config_connection(resolved, readonly=True) as conn:
+            assert check_schema(conn) == result.head_revision
+
+        expected = BackupConfig.from_file(config_yaml_path)
+        with open_config_session(resolved, readonly=True) as session:
+            loaded = load_config(session)
+        assert loaded == expected
+
+
+@pytest.mark.unit
+class TestImporterReimport:
+    def test_reimport_replaces_everything_and_bumps_generation(
+        self, tmp_path, config_yaml_path, caplog
+    ):
+        target = tmp_path / "config.db"
+        resolved = resolve_config_path(str(target))
+
+        first = import_yaml(config_yaml_path, resolved)
+        assert first.created is True
+
+        with open_config_session(resolved, readonly=True) as session:
+            gen_after_first = load_config(session)  # noqa: F841 -- just proves it loads
+            first_gs_generation = session.query(GlobalSettings).one().generation
+
+        second_yaml = tmp_path / "config2.yaml"
+        second_yaml.write_text(
+            "datasets:\n"
+            "  - name: pool/other\n"
+            "    frequency: 2h\n"
+            "    retention:\n"
+            "      1d: 7d\n"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            second = import_yaml(second_yaml, resolved)
+
+        assert second.created is False
+        # The counts observed BEFORE phase 3 wiped them -- the config
+        # `first` (config_yaml_path's single "pool/data" dataset, no
+        # destinations) had already put in place.
+        assert second.replaced_datasets == 1
+        assert second.replaced_destinations == 0
+        assert "Replacing existing config store" in caplog.text
+
+        with open_config_session(resolved, readonly=True) as session:
+            loaded = load_config(session)
+            second_gs_generation = session.query(GlobalSettings).one().generation
+
+        assert [ds.name for ds in loaded.datasets] == ["pool/other"]
+        assert second_gs_generation == first_gs_generation + 1
+
+
+@pytest.mark.unit
+class TestImporterBadYamlNeverTouchesTarget:
+    """Mutation-checked: moving phase 0's `BackupConfig.from_file` parse
+    to AFTER phase 1 (target creation) -- i.e. exactly the reordering this
+    class's name warns against -- fails 1 of these 2 tests:
+    `test_bad_yaml_creates_no_target_at_all`, because phase 1 now runs
+    unconditionally and leaves a stray zero-byte file (and its directory)
+    at a target that previously did not exist.
+    `test_bad_yaml_leaves_an_existing_db_byte_identical` does NOT catch
+    this particular mutation and still passes under it -- for an ALREADY
+    EXISTING target, phase 1's branch is `ensure_config_db_mode` (a
+    chmod-only no-op on content), so reordering it ahead of the parse does
+    not, by itself, touch the file's bytes. That test still pins a real,
+    independent property (an existing database survives a failed
+    re-import unchanged) -- it is just not the one sensitive to THIS
+    reordering; `test_bad_yaml_creates_no_target_at_all` is what catches
+    it.
+    """
+
+    def test_bad_yaml_leaves_an_existing_db_byte_identical(self, tmp_path, config_yaml_path):
+        target = tmp_path / "config.db"
+        resolved = resolve_config_path(str(target))
+        import_yaml(config_yaml_path, resolved)
+        dispose_all()  # checkpoint -wal/-shm away so the main file holds everything
+
+        before_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("")  # BackupConfig.from_file: "Config file is empty"
+
+        with pytest.raises(ValueError, match="empty"):
+            import_yaml(bad_yaml, resolved)
+
+        dispose_all()
+        after_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+        assert after_hash == before_hash
+
+    def test_bad_yaml_creates_no_target_at_all(self, tmp_path, config_yaml_path):
+        """Phase 0 (parse) runs before phase 1 (create the target file),
+        so a bad YAML against a target that does not exist yet must leave
+        NOTHING on disk -- not a zero-byte file, not even the containing
+        directory.
+        """
+        target = tmp_path / "brandnew" / "config.db"
+        resolved = resolve_config_path(str(target))
+
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("")
+
+        with pytest.raises(ValueError, match="empty"):
+            import_yaml(bad_yaml, resolved)
+
+        assert not target.parent.exists()
+        assert not target.exists()
+
+
+@pytest.mark.unit
+class TestImporterAllowNewAndSuffixGuard:
+    def test_preexisting_one_byte_non_sqlite_file_is_rejected(
+        self, tmp_path, config_yaml_path
+    ):
+        target = tmp_path / "config.db"
+        target.write_bytes(b"x")  # 1 byte: allow_new's "exactly 0 bytes" carve-out excludes this
+        resolved = resolve_config_path(str(target))
+
+        with pytest.raises(ConfigDbNotADatabase):
+            import_yaml(config_yaml_path, resolved)
+
+    def test_yaml_suffixed_target_is_rejected_before_anything_is_created(
+        self, tmp_path, config_yaml_path
+    ):
+        target = tmp_path / "missing_dir" / "config.yaml"
+        resolved = resolve_config_path(str(target))
+
+        with pytest.raises(ConfigDbIsYaml):
+            import_yaml(config_yaml_path, resolved)
+
+        # The suffix guard runs immediately after phase 0, ahead of phase
+        # 1's ensure_config_dir -- an operator typo'ing `-c config.yaml`
+        # must not get a stray directory created at the very path they
+        # will likely retry with the correct `-c config.db`.
+        assert not target.parent.exists()
+
+
+@pytest.mark.unit
+class TestImporterNoNestedEnsureSchema:
+    """The nesting hazard `importer.py`'s own docstring measures at a
+    deterministic 5.2s `busy_timeout` stall followed by `database is
+    locked`: `ensure_schema` (phase 2) must run to completion, on a
+    connection that is fully CLOSED, before `save_config`'s session
+    (phase 3) ever opens. An explicit, short elapsed-time ceiling --
+    comfortably under the measured 5.2s -- is what makes a reintroduced
+    nesting bug fail fast here instead of turning this single test into a
+    multi-second stall that then fails anyway, which is a much worse
+    signal in CI.
+    """
+
+    def test_ensure_schema_runs_and_closes_before_save_config_opens_and_import_is_fast(
+        self, tmp_path, config_yaml_path, mocker
+    ):
+        target = tmp_path / "config.db"
+        resolved = resolve_config_path(str(target))
+
+        call_order = []
+        real_ensure_schema = ensure_schema
+        real_save_config = save_config
+
+        def spy_ensure_schema(conn):
+            call_order.append("ensure_schema:start")
+            result = real_ensure_schema(conn)
+            call_order.append("ensure_schema:end")
+            return result
+
+        def spy_save_config(session, config):
+            # By the time save_config is called, phase 2's connection must
+            # already be closed -- proven indirectly by the ordering below
+            # (ensure_schema fully finished, including its own commit)
+            # rather than by reaching into SQLAlchemy internals here.
+            call_order.append("save_config:start")
+            result = real_save_config(session, config)
+            call_order.append("save_config:end")
+            return result
+
+        mocker.patch("zfsbackup.config.store.importer.ensure_schema", side_effect=spy_ensure_schema)
+        mocker.patch("zfsbackup.config.store.importer.save_config", side_effect=spy_save_config)
+
+        start = time.monotonic()
+        import_yaml(config_yaml_path, resolved)
+        elapsed = time.monotonic() - start
+
+        assert call_order == [
+            "ensure_schema:start", "ensure_schema:end",
+            "save_config:start", "save_config:end",
+        ]
+        # Comfortably under the measured 5.2s busy_timeout stall a nested,
+        # self-deadlocking writer connection would produce.
+        assert elapsed < 2.0
+
+
+# ---------------------------------------------------------------------------
 # Item 5 -- zfsbackup/config/store/db.py (engine/session, WAL, fork safety)
 # ---------------------------------------------------------------------------
 #
@@ -3319,9 +3529,10 @@ class TestMigrationsOverDbWriterConnection:
 # TestDbWal or TestDbReadOnly or TestDbCrash or TestDbDispose"` selects just
 # this section.
 #
-# `_clean_db_engine_cache` (file-scoped autouse fixture, above) disposes
-# every engine `get_engine()` has cached before and after each test here, so
-# nothing in this section leaks a live engine into the next test's process.
+# `_clean_db_engine_cache` (autouse fixture, now in `tests/conftest.py`)
+# disposes every engine `get_engine()` has cached before and after each test
+# here, so nothing in this section leaks a live engine into the next test's
+# process.
 
 
 @pytest.mark.unit

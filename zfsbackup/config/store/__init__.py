@@ -122,8 +122,23 @@ database's first connection. Its only sanctioned ways to reach a live
 storable `Engine`: `db.py`'s pid-keyed fork-safety cache depends on
 nothing capturing a long-lived handle outside a `with` block, and an
 `Engine` returned by value from this module would be exactly such a
-handle. It has no caller in this repo yet; `daemon.py` still loads YAML,
-and wiring it into the daemon and CLI is item 8's job.
+handle. `daemon.py` and `workers.py` (item 8, Phase B, owned by
+`zfsbackup-developer`) now open the store through these two functions
+exclusively, via `zfsbackup/runtime_config.py`'s `load_runtime_config()`
+-- neither module builds an engine, opens a connection, or touches an
+ORM class directly; `BackupConfig.from_file` is gone from both.
+
+`zfsbackup/config/store/importer.py` (item 8, phase A / 8b) is this
+package's one caller of `paths.py`'s `allow_new` escape hatch, and the
+only place in the codebase that drives `ensure_schema` and `save_config`
+back to back in the mandated sequence: `import_yaml(yaml_path, resolved)`
+parses a YAML config (`BackupConfig.from_file`, never `from_dict`/
+`from_property` -- see `mapper.py`'s module docstring), then migrates the
+target database to head over its own connection, commits, closes it, and
+only then opens a fresh writer session to replace the store's contents
+wholesale via `save_config`. It also carries a throwaway `python -m
+zfsbackup.config.store.importer <yaml> [-c PATH]` CLI, deleted by item 10
+once `zfsbackup-config import` exists to call `import_yaml` directly.
 """
 
 from zfsbackup.config.store.models import (
@@ -170,6 +185,7 @@ from zfsbackup.config.store.paths import (
     ConfigPathError,
     ResolvedConfigPath,
     check_config_db,
+    check_config_db_suffix,
     create_config_db_file,
     diagnose_open_failure,
     ensure_config_db_mode,
@@ -179,6 +195,10 @@ from zfsbackup.config.store.paths import (
     resolve_config_path,
     resolve_config_url,
 )
+# Imported last: depends on mapper, migrate, AND paths all being importable
+# (it uses save_config, ensure_schema/SchemaError, and the paths helpers
+# together to drive the three-phase import in importer.py's own docstring).
+from zfsbackup.config.store.importer import ImportResult, import_yaml
 
 __all__ = [
     "Base",
@@ -199,6 +219,7 @@ __all__ = [
     "DEFAULT_CONFIG_DB",
     "Destination",
     "GlobalSettings",
+    "ImportResult",
     "NAMING_CONVENTION",
     "ReadOnlySessionError",
     "RemoteServer",
@@ -209,6 +230,7 @@ __all__ = [
     "SchemaSplitBrain",
     "SchemaVersionMismatch",
     "check_config_db",
+    "check_config_db_suffix",
     "check_schema",
     "create_config_db_file",
     "diagnose_open_failure",
@@ -217,6 +239,7 @@ __all__ = [
     "ensure_config_dir",
     "ensure_schema",
     "get_engine",
+    "import_yaml",
     "load_config",
     "make_engine",
     "open_config_connection",

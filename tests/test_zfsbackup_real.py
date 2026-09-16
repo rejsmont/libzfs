@@ -174,14 +174,52 @@ def server_cfg_path(tmp_path, source_fs, target_root):
 
 
 @pytest.fixture
-def running_server(server_cfg_path):
+def source_config_db(tmp_path, source_cfg_path):
+    """Import `source_cfg_path` into a fresh SQLite config store under
+    `tmp_path` and return the `ResolvedConfigPath` addressing it.
+
+    `source_cfg_path` itself keeps writing YAML unchanged -- it is this
+    fixture's *input*, exactly as `zfsbackup-config import`/`import_yaml`
+    expects (item 8). Not yet consumed by any test in this file (the
+    client side here drives `RemoteBackupManager`/`DatasetManager`
+    directly via `BackupConfig.from_file`, never through a worker), but
+    kept alongside `server_config_db` for symmetry and for any future
+    client-side worker test.
+    """
+    from zfsbackup.config.store import import_yaml, resolve_config_path
+
+    db_path = tmp_path / 'source_config.db'
+    resolved = resolve_config_path(str(db_path))
+    import_yaml(source_cfg_path, resolved)
+    return resolved
+
+
+@pytest.fixture
+def server_config_db(tmp_path, server_cfg_path):
+    """Import `server_cfg_path` into a fresh SQLite config store under
+    `tmp_path` and return the `ResolvedConfigPath` addressing it.
+
+    `running_server` builds a real `ApiWorker` (and every other worker
+    now, item 8) from a `ResolvedConfigPath`, never a YAML `Path` --
+    `server_cfg_path` remains this fixture's YAML input, unchanged.
+    """
+    from zfsbackup.config.store import import_yaml, resolve_config_path
+
+    db_path = tmp_path / 'server_config.db'
+    resolved = resolve_config_path(str(db_path))
+    import_yaml(server_cfg_path, resolved)
+    return resolved
+
+
+@pytest.fixture
+def running_server(server_config_db):
     """Start a real ApiWorker on port 18082; wait until ready; tear down after the test."""
     import multiprocessing
     import requests
     from zfsbackup.workers import ApiWorker
 
     stop = multiprocessing.Event()
-    worker = ApiWorker(server_cfg_path, stop, verbose=False)
+    worker = ApiWorker(server_config_db, stop, verbose=False)
     worker.start()
 
     deadline = time.time() + 15

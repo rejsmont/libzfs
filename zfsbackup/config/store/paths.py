@@ -20,9 +20,14 @@ walk the path's components with `lstat`/`readlink` -- see
 of this module's docstrings claimed the opposite; do not reintroduce that
 claim.
 
-This module has no daemon caller yet: `daemon.py` still loads YAML
-(`BackupConfig.from_file`), and wiring the daemon to `check_schema`/
-`open_config_session` is item 8's job, not this one's.
+The daemon (`daemon.py`/`workers.py`, item 8 Phase B) now reaches this
+module exclusively through `zfsbackup/runtime_config.py`'s
+`load_runtime_config()`, which sequences `open_config_connection`
+(`readonly=True`, for `check_schema`) and `open_config_session`
+(`readonly=True`, for `load_config`) as two separate, fully-closed
+handles -- never nested, and never the `allow_new`-carrying writer path
+`importer.py` uses. `BackupConfig.from_file` is gone from both
+`daemon.py` and `workers.py`.
 
 Why the existence check has to be a `stat`, not a caught exception
 --------------------------------------------------------------------
@@ -157,17 +162,32 @@ Creation policy
 ----------------
 This module creates nothing at import time and nothing on its own. The
 daemon must never auto-create a config database; the CLI creates one only
-via an explicit `zfsbackup-config import` (item 10), which must call, in
-order: `ensure_config_dir`, `create_config_db_file` (creates the file AND
-fixes its mode as one step, so the mandated create-then-chmod-before-
-first-connection ordering is not something item 10's implementation can
-get backwards), then open its first connection, then run
-`ensure_schema`. `ensure_config_db_mode` remains for the case of *fixing*
-the mode of a database this module did not itself create (an existing
-file handed to `import`, or a re-import) -- it also re-chmods any
+via an explicit `zfsbackup-config import` (item 10; `zfsbackup/config/
+store/importer.py`'s `import_yaml` in the item-8 interim), which must
+call, in order: `ensure_config_dir`, `create_config_db_file` (creates the
+file AND fixes its mode as one step, so the mandated create-then-chmod-
+before-first-connection ordering is not something item 10's
+implementation can get backwards), then open its first connection, then
+run `ensure_schema`. `ensure_config_db_mode` remains for the case of
+*fixing* the mode of a database this module did not itself create (an
+existing file handed to `import`, or a re-import) -- it also re-chmods any
 `-wal`/`-shm` that already exist next to it, since those are exactly as
 likely to be stuck at a stale mode as the case `ensure_config_db_mode`'s
 own docstring already warns about for the database file itself.
+
+That mandated sequence -- `create_config_db_file`, then the first
+connection -- runs straight into this module's own preflight:
+`create_config_db_file` leaves a file at exactly 0 bytes, and
+`check_config_db` (below) refuses that as `ConfigDbNotADatabase` by
+default (no SQLite magic to match). `check_config_db`'s `allow_new`
+parameter, plumbed through `open_config_connection`/`open_config_session`,
+is the narrow fix: it skips only the magic-bytes/truncation comparison,
+and only when `os.stat` measures the file at exactly 0 bytes -- every
+other check (the `.yaml`/`.yml` refusal, readability, directory
+`W_OK`/`X_OK`, file writability) still runs. See `check_config_db`'s own
+docstring for the exact rule. It has exactly one sanctioned caller,
+`importer.py`'s schema phase, and must never be reachable from the
+daemon.
 
 "The daemon only reads" describes config *content*, not the *file*: the
 daemon's read-only engine still opens the database file read-write at the
@@ -209,6 +229,7 @@ __all__ = [
     "DEFAULT_CONFIG_DB",
     "ResolvedConfigPath",
     "check_config_db",
+    "check_config_db_suffix",
     "create_config_db_file",
     "diagnose_open_failure",
     "ensure_config_db_mode",
@@ -701,6 +722,37 @@ def _yaml_message(resolved: ResolvedConfigPath) -> str:
     )
 
 
+def check_config_db_suffix(resolved: ResolvedConfigPath) -> None:
+    """Raise `ConfigDbIsYaml` if `resolved`'s fully resolved target has a
+    `.yaml`/`.yml` suffix -- **without requiring the target to exist**.
+
+    This is `check_config_db`'s own step 3 suffix decision (decided from
+    `resolved.resolved_path.suffix`, never `resolved.path.suffix` -- see
+    that function's docstring for why: a `/etc/zfsbackup/config.yaml`
+    compatibility symlink pointing at a real, migrated `config.db` must
+    not be refused just because of its own name), extracted into its own
+    function and called from there, so this remains the **one** place
+    that decides what "looks like YAML" means and builds the message --
+    `check_config_db` calls this too, rather than duplicating the
+    comparison, so the two can never drift apart.
+
+    Unlike the rest of `check_config_db`, this needs no I/O at all:
+    `resolved.resolved_path` is already computed, non-strictly, at
+    `ResolvedConfigPath` construction time (`Path.resolve(strict=False)`
+    does not require the path to exist). That is what makes this safe to
+    call from `importer.py`'s `import_yaml` **before** phase 1 creates
+    anything -- a `.yaml`-suffixed `-c` typo must be refused before a
+    stray zero-byte file is created at that path, the same
+    create-nothing-on-misuse property phase 0's "parse the YAML before
+    touching the target" ordering already gives for a bad *source* YAML.
+    Refusing an existing YAML target still goes through
+    `check_config_db`'s full step 3 as before; this function only adds
+    the pre-existence guard, it does not replace the in-preflight check.
+    """
+    if resolved.resolved_path.suffix in (".yaml", ".yml"):
+        raise ConfigDbIsYaml(_yaml_message(resolved))
+
+
 def _not_a_database_message(resolved: ResolvedConfigPath, real: Path) -> str:
     shown = _describe_real(resolved.path, real)
     return (
@@ -935,7 +987,10 @@ def _sidecar_lstat(path: Path) -> Optional[os.stat_result]:
 
 
 def check_config_db(
-    resolved: ResolvedConfigPath, *, require_writable: bool = True
+    resolved: ResolvedConfigPath,
+    *,
+    require_writable: bool = True,
+    allow_new: bool = False,
 ) -> None:
     """Raise a `ConfigPathError` subclass if `resolved.path` cannot be
     used as the config database, without ever building a SQLite engine.
@@ -1046,6 +1101,27 @@ def check_config_db(
     future caller that genuinely only needs read access (nothing in this
     repository is such a caller yet).
 
+    `allow_new=True` is a narrow escape hatch for item 8's importer, for
+    exactly the one moment `create_config_db_file` leaves a file this
+    preflight would otherwise refuse: a freshly created, **exactly
+    zero-byte** file, which has no SQLite magic to check at all. It is
+    never "skip the magic check" -- it skips step 3's magic-bytes and
+    truncation comparisons **only when `os.stat` already measured the file
+    at exactly 0 bytes**; a non-empty file that fails the magic-bytes
+    check (a 1-byte file, a corrupted database, a YAML file saved without
+    a `.yaml` suffix) still raises `ConfigDbNotADatabase` exactly as
+    without this flag. Every other check still runs unchanged: the
+    `.yaml`/`.yml` refusal (step 3, ahead of the magic-bytes check, so a
+    zero-byte file that happens to be *named* `.yaml` is still refused as
+    YAML, not silently admitted), readability (step 4), the containing
+    directory's `W_OK`/`X_OK` (step 5), and file writability (step 6) --
+    a zero-byte file that is also unwritable still hits step 6's
+    not-yet-WAL hard fail, correctly, since `_is_wal_header` can never be
+    true for a header this short. **Never reachable from the daemon**:
+    nothing in `daemon.py`/`workers.py`/`runtime_config.py` passes this;
+    it exists solely for `zfsbackup/config/store/importer.py`'s schema
+    phase, immediately after `create_config_db_file`.
+
     Returns `None` on success.
     """
     # Step 0.
@@ -1069,12 +1145,19 @@ def check_config_db(
             "SQLite database file."
         )
 
-    # Decided from the RESOLVED target's own suffix, not resolved.path's
-    # -- a `/etc/zfsbackup/config.yaml` compatibility symlink pointing at
-    # a real, fully migrated `config.db` must not be refused just
-    # because of its own name.
-    if real.suffix in (".yaml", ".yml"):
-        raise ConfigDbIsYaml(_yaml_message(resolved))
+    # Delegates to check_config_db_suffix -- the one place that decides
+    # what "looks like YAML" means, so this and importer.py's pre-phase-1
+    # guard can never drift apart. See that function's docstring for why
+    # it is decided from the RESOLVED target's own suffix, not
+    # resolved.path's.
+    check_config_db_suffix(resolved)
+
+    # The `allow_new` gate reads the `os.stat` size from step 1, not the
+    # header length read below -- st.st_size is the authoritative "exactly
+    # 0 bytes" measurement `create_config_db_file` produces, and deciding
+    # from it (rather than `len(header) == 0`) keeps this exact regardless
+    # of how much of the file the header read below actually returns.
+    skip_magic_check = allow_new and st.st_size == 0
 
     header: Optional[bytes]
     try:
@@ -1091,12 +1174,13 @@ def check_config_db(
             _residual_os_error_message(f"open {real}", exc)
         ) from exc
     else:
-        if not header.startswith(_SQLITE_MAGIC):
-            raise ConfigDbNotADatabase(_not_a_database_message(resolved, real))
-        if len(header) < 100:
-            raise ConfigDbNotADatabase(
-                _truncated_message(resolved, real, len(header))
-            )
+        if not skip_magic_check:
+            if not header.startswith(_SQLITE_MAGIC):
+                raise ConfigDbNotADatabase(_not_a_database_message(resolved, real))
+            if len(header) < 100:
+                raise ConfigDbNotADatabase(
+                    _truncated_message(resolved, real, len(header))
+                )
 
     if header is None or not _can_access(real, os.R_OK):
         raise ConfigDbPermissionError(_unreadable_message(resolved, real, st))
@@ -1185,7 +1269,11 @@ def diagnose_open_failure(
 
 @contextmanager
 def open_config_session(
-    resolved: ResolvedConfigPath, *, readonly: bool, require_writable: bool = True
+    resolved: ResolvedConfigPath,
+    *,
+    readonly: bool,
+    require_writable: bool = True,
+    allow_new: bool = False,
 ) -> Iterator[Session]:
     """`check_config_db(resolved)`, then a `Session` from `db.py`'s
     `session_scope(resolved.url(), readonly=readonly)`, scoped to this
@@ -1215,8 +1303,15 @@ def open_config_session(
     underlying file read-write at the OS level and needs a writable
     containing directory (see this module's docstring's closing
     paragraph).
+
+    `allow_new` is forwarded to `check_config_db` unchanged -- see its
+    docstring. Plumbed here for symmetry with `open_config_connection`;
+    item 8's importer opens its data phase (`save_config`) through this
+    function only *after* the schema phase has already run, so by the time
+    it does the file is no longer zero-byte and `allow_new` is left at its
+    default here in practice.
     """
-    check_config_db(resolved, require_writable=require_writable)
+    check_config_db(resolved, require_writable=require_writable, allow_new=allow_new)
     with session_scope(resolved.url(), readonly=readonly) as session:
         yield session
 
@@ -1228,6 +1323,7 @@ def open_config_connection(
     readonly: bool = False,
     foreign_keys: bool = True,
     require_writable: bool = True,
+    allow_new: bool = False,
 ) -> Iterator[Connection]:
     """`check_config_db(resolved)`, then a raw `Connection` from
     `get_engine(resolved.url(), readonly=readonly, foreign_keys=
@@ -1246,8 +1342,14 @@ def open_config_connection(
     should pass it. See `db.py`'s notes on sequencing this ahead of any
     writer session -- opening this nested inside a live
     `open_config_session` write self-deadlocks on SQLite's write lock.
+
+    `allow_new` is forwarded to `check_config_db` unchanged -- see its
+    docstring. This is the parameter item 8's importer actually needs: its
+    schema phase opens the connection that runs `ensure_schema` against a
+    file `create_config_db_file` just created, which is exactly zero bytes
+    until Alembic's first `CREATE TABLE`.
     """
-    check_config_db(resolved, require_writable=require_writable)
+    check_config_db(resolved, require_writable=require_writable, allow_new=allow_new)
     engine = get_engine(
         resolved.url(), readonly=readonly, foreign_keys=foreign_keys
     )

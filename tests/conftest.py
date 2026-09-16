@@ -203,7 +203,14 @@ def config_with_remote(tmp_path):
 
 @pytest.fixture
 def config_yaml_path(tmp_path):
-    """Write a minimal valid YAML config to a temp file and return the Path."""
+    """Write a minimal valid YAML config to a temp file and return the Path.
+
+    Kept exactly as it was before the daemon started reading the SQLite
+    config store (item 8): this is now **importer input**, not daemon
+    input -- `imported_config_db`/`sqlite_config_db` below are what daemon
+    and worker tests should construct `BackupDaemon`/`BaseWorker` subclasses
+    with.
+    """
     cfg_file = tmp_path / 'config.yaml'
     cfg_file.write_text(
         "datasets:\n"
@@ -213,6 +220,102 @@ def config_yaml_path(tmp_path):
         "      1d: 30d\n"
     )
     return cfg_file
+
+
+@pytest.fixture(autouse=True)
+def _clean_db_engine_cache():
+    """Disposes every engine `zfsbackup.config.store.get_engine()` has
+    cached, before and after every test in the whole suite.
+
+    Moved here from `tests/test_zfsbackup_store.py` (item 8, sub-item 8j)
+    and made autouse **session-wide** rather than file-scoped, and moved
+    first among the fixtures this file defines. `db.py`'s pid-keyed
+    `_ENGINES` cache is module-global state shared by the whole pytest
+    process; the daemon and worker tests added alongside this fixture
+    build engines through `zfsbackup.config.store.db` too (via
+    `load_runtime_config`), so without this move a daemon/worker test run
+    anywhere in the suite would leak a live engine (and its open DBAPI
+    connection/pool) into an unrelated test -- exactly the class of hazard
+    `db.py` exists to prevent process-wide, not just across a fork. Must
+    land before any test that touches the config store, which is why it
+    is a prerequisite for 8k.
+
+    Imports `zfsbackup.config.store` lazily, inside the fixture body, so
+    that `libzfseasy`-only test runs pay no cost for a package they never
+    touch.
+    """
+    from zfsbackup.config.store import dispose_all
+
+    dispose_all()
+    yield
+    dispose_all()
+
+
+@pytest.fixture(autouse=True)
+def _restore_signal_handlers():
+    """Saves `SIGINT`/`SIGTERM` dispositions before each test and restores
+    them after, process-wide.
+
+    `BackupDaemon.__init__` (`zfsbackup/daemon.py`) installs process-wide
+    `signal.signal(SIGINT, ...)`/`signal.signal(SIGTERM, ...)` handlers as
+    a plain construction side effect, and nearly every test in
+    `tests/test_zfsbackup_daemon.py` constructs one. Without this fixture,
+    the LAST `BackupDaemon` constructed anywhere in the whole pytest
+    process silently becomes the live SIGINT/SIGTERM handler for the rest
+    of the session -- bound to a `multiprocessing.Event` whose owning
+    daemon is long since garbage collected, and (per the item-8x wedge
+    hazard `workers._init_child_process` documents but does not fix) a
+    real Ctrl-C reaching that stale handler is not merely inert, it is a
+    process that can hang. Autouse and session-wide, not just for
+    `test_zfsbackup_daemon.py`: this is cheap (`getsignal`/`signal` are
+    O(1) syscalls) and protects any future test that touches signal
+    dispositions the same way, not only the ones that exist today.
+    """
+    import signal
+
+    saved = {
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+    }
+    yield
+    for sig, handler in saved.items():
+        if handler is not None:
+            signal.signal(sig, handler)
+
+
+@pytest.fixture
+def imported_config_db(tmp_path, config_yaml_path):
+    """Import `config_yaml_path` into a fresh SQLite config store under
+    `tmp_path` and return the `ResolvedConfigPath` addressing it.
+
+    This is the one fixture daemon/worker/basic tests should build
+    `BackupDaemon`/`BaseWorker` subclasses with now that both read the
+    config database, never a YAML file, at construction time (`daemon.py`,
+    `workers.py`) -- passing a bare `Path` where a `ResolvedConfigPath` is
+    required fails with `'PosixPath' object has no attribute 'url'` the
+    first time anything actually opens the store.
+
+    Goes through `import_yaml` (the sanctioned importer, item 8 sub-item
+    8b) exactly as an operator running `zfsbackup-config import` would --
+    never a raw `save_config`/`ensure_schema` call -- so the resulting
+    database is schema-current and holds the same config
+    `BackupConfig.from_file(config_yaml_path)` would produce.
+    """
+    from zfsbackup.config.store import import_yaml, resolve_config_path
+
+    db_path = tmp_path / 'config.db'
+    resolved = resolve_config_path(str(db_path))
+    import_yaml(config_yaml_path, resolved)
+    return resolved
+
+
+@pytest.fixture
+def sqlite_config_db(imported_config_db):
+    """Alias for `imported_config_db`, for daemon/worker test sites that
+    read more naturally naming *what* the fixture is (a SQLite config
+    database) rather than *how* it got there.
+    """
+    return imported_config_db
 
 
 def _auto_zfs_pool_local(tmp_path_factory):
