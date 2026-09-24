@@ -17,12 +17,25 @@ import threading
 from abc import abstractmethod
 from multiprocessing import Process
 from multiprocessing.synchronize import Event
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import ConfigPathError, ResolvedConfigPath, SchemaError
 from zfsbackup.runtime_config import EX_CONFIG, config_error_message, load_runtime_config
+from zfsbackup.stopflag import StopFlag
+
+#: What a worker accepts as its stop signal.
+#:
+#: The daemon passes a `StopFlag` (see `zfsbackup.stopflag`); a plain
+#: `multiprocessing.Event` is still accepted, and that is deliberate rather
+#: than transitional. Workers only ever call `.is_set()` and
+#: `.wait(timeout=...)`, both of which the two types implement identically,
+#: so callers holding an `Event` -- roughly thirty-five of them in the test
+#: suite, including one that hands a real `Event` to a real `ApiWorker` --
+#: keep working unchanged. Narrowing this to `StopFlag` would buy nothing at
+#: runtime and break all of them at once.
+StopEvent = Union[StopFlag, Event]
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -48,32 +61,60 @@ def _init_child_process(verbose: bool = False) -> None:
         spawn        SIGTERM=SIG_DFL            SIGINT=default_int_handler
         forkserver   SIGTERM=SIG_DFL            SIGINT=default_int_handler
 
-    The inherited case deadlocks the whole daemon. A tty Ctrl-C signals
-    every process in the foreground group, so each worker -- which sits in
-    `stop_event.wait()` essentially all of the time -- runs the
-    supervisor's handler on its own main thread: `Event.set()` ->
+    The inherited case **deadlocked** the whole daemon, for as long as the
+    stop signal was a `multiprocessing.Event`. A tty Ctrl-C signals every
+    process in the foreground group, so each worker -- which sits in
+    `stop_event.wait()` essentially all of the time -- ran the supervisor's
+    handler on its own main thread: `Event.set()` ->
     `Condition.notify_all()` -> wake a sleeper -> block acquiring
     `_woken_count`, waiting for the sleeper it just woke to respond. That
-    sleeper is this same thread, suspended inside the handler, so it never
-    will. The child wedges holding the shared `Condition`'s lock, and the
-    supervisor's own `is_set()` poll then blocks on that same lock
-    (measured: parent `is_set()` blocked >5s). It is invisible to CI --
-    macOS is spawn, Linux on 3.14 is forkserver, and no test raises a real
-    SIGINT.
+    sleeper was this same thread, suspended inside the handler, so it never
+    would; the handler then wedged *holding the shared `Condition`'s lock*,
+    and because `Event.is_set()` takes that same lock, the supervisor
+    froze too. Measured: parent `is_set()` blocked >5s. It was invisible to
+    CI -- macOS is spawn, Linux on 3.14 is forkserver, and no test raises a
+    real SIGINT.
+
+    With `zfsbackup.stopflag.StopFlag` that is no longer true: a fork child
+    that inherits `BackupDaemon._signal_handler` runs two plain stores and
+    returns, on every start method. **Item 8x alone is sufficient for the
+    fork case to be safe** -- item 8 alone was not (see the measurements
+    below). What still justifies the reset is the *other* reason:
 
     `SIG_DFL` makes the fork case behave exactly as spawn and forkserver
     already do: a Ctrl-C or a `terminate()` kills the child promptly rather
-    than being handled. That also restores `_shutdown_workers`'
-    `terminate()` escalation, which a handling child simply ignores. The
-    cost is that a worker interrupted mid-cycle does not finish it;
-    cooperative cancellation of a long `zfs send` is item 18's, and it is
-    not available today under any start method.
+    than being handled. That is what keeps `_shutdown_workers`' `terminate()`
+    escalation working -- a child that merely records the signal and keeps
+    running ignores SIGTERM in exactly the way that escalation exists to
+    punish (measured before this reset: `alive after terminate+join(5):
+    True exitcode None`). Deadlock avoidance is no longer the reason; the
+    escalation is. The cost is that a worker interrupted mid-cycle does not
+    finish it; cooperative cancellation of a long `zfs send` is item 18's,
+    and it is not available today under any start method.
 
-    A related rule this function does not implement, recorded so it is not
-    lost: `Event.set()` must never be called from a signal handler at all
-    -- including the supervisor's, where it remains -- because
-    `notify_all()` is not async-signal-safe. The fix is a plain flag set in
-    the handler and transferred by the poll loop. That is item 8x's.
+    That said, this reset alone made a plain Ctrl-C *less* survivable, not
+    more, for as long as the stop signal was a `multiprocessing.Event`.
+    With Python's default SIGINT disposition a child raises
+    `KeyboardInterrupt`, which unwinds through `Condition.wait`'s `finally`
+    and releases the notify token; `SIG_DFL` does not run any Python code,
+    so it does not. Measured, three workers parked in `stop_event.wait()`:
+
+        children at default_int_handler:  exitcodes=[1,1,1]     set() returned in 6.9 ms
+        children at SIG_DFL (item 8):     exitcodes=[-2,-2,-2]  set() WEDGED
+
+    So item 8's reset removed the fork inherited-handler deadlock above and,
+    in doing so, converted a survivable Ctrl-C into a wedging one on every
+    start method. Item 8x's `StopFlag` (see `zfsbackup.stopflag`) is what
+    removes that wedge -- and it removes the inherited-handler deadlock as
+    well, which is why reverting to an `Event` would be wrong even with
+    this reset in place. Item 8 is not a regression on its own, but it
+    should not be read in isolation.
+
+    Two related rules this function does not implement, both belonging to
+    `BackupDaemon._signal_handler` (where they now hold): a signal handler
+    must never call `Event.set()`, because `notify_all()` is not
+    async-signal-safe, and it must never log, because `logging` takes locks
+    and then blocks writing to a socket the handler cannot know is draining.
     """
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
@@ -130,7 +171,7 @@ class BaseWorker(Process):
         self,
         worker_name: str,
         resolved_config: ResolvedConfigPath,
-        stop_event: Event,
+        stop_event: StopEvent,
         dry_run: bool = False,
         verbose: bool = False,
     ):
@@ -188,7 +229,7 @@ class SnapshotWorker(BaseWorker):
     def __init__(
         self,
         resolved_config: ResolvedConfigPath,
-        stop_event: Event,
+        stop_event: StopEvent,
         dry_run: bool = False,
         verbose: bool = False,
     ):
@@ -210,7 +251,7 @@ class PruningWorker(BaseWorker):
     def __init__(
         self,
         resolved_config: ResolvedConfigPath,
-        stop_event: Event,
+        stop_event: StopEvent,
         dry_run: bool = False,
         verbose: bool = False,
     ):
@@ -232,7 +273,7 @@ class RemoteBackupWorker(BaseWorker):
     def __init__(
         self,
         resolved_config: ResolvedConfigPath,
-        stop_event: Event,
+        stop_event: StopEvent,
         dry_run: bool = False,
         verbose: bool = False,
     ):
@@ -275,7 +316,7 @@ class ApiWorker(Process):
     def __init__(
         self,
         resolved_config: ResolvedConfigPath,
-        stop_event: Event,
+        stop_event: StopEvent,
         dry_run: bool = False,
         verbose: bool = False,
     ):

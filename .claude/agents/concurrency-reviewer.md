@@ -17,7 +17,8 @@ interleaving is worth ten stylistic notes.
 ## The runtime you are reviewing
 
 `BackupDaemon` in `daemon.py` is a **multiprocessing supervisor**, not a single-process loop. It owns
-a shared `multiprocessing.Event` stop flag, installs `SIGINT`/`SIGTERM` handlers, spawns 3–4 worker
+a shared `zfsbackup.stopflag.StopFlag` stop flag (**not** a `multiprocessing.Event` — see below),
+installs `SIGINT`/`SIGTERM` handlers, spawns 3–4 worker
 processes, then polls and restarts any that die. The per-dataset work runs in `workers.py`;
 `BaseWorker.run` loads config, builds a `DatasetManager`, iterates datasets, and sleeps via
 `stop_event.wait(timeout=interval)`. `RemoteBackupWorker` drives real `zfs send`/`zfs receive`

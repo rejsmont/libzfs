@@ -87,7 +87,7 @@ closing the identical latent gap before it could bite.
 - `--test-config` validates parsing only — not that datasets exist or destinations resolve.
 - Flask's dev server (`app.run`) is used in the `ApiWorker` — not a production WSGI server.
 
-**Good:** graceful `SIGINT`/`SIGTERM` shutdown via a shared `Event`; anchor-aware retention
+**Good:** graceful `SIGINT`/`SIGTERM` shutdown via a shared `StopFlag` (was a `multiprocessing.Event`, which wedged the supervisor whenever a worker died mid-`wait()` — see plan item 8x); anchor-aware retention
 math is correct under the real_zfs tests; dataset-name validation blocks injection.
 
 ---

@@ -909,74 +909,103 @@ Consequences:
 - **Verification:** `pytest tests/test_zfsbackup_store.py -k import`, then the full
   `pytest tests/test_zfsbackup_*.py`.
 
-### Item 8x — SIGKILLed worker wedges the supervisor's stop path *(found during item 8; NOT part of it)*
+### Item 8x — A dying worker wedged the supervisor's stop path *(DONE; found during item 8, not part of it)*
 
-- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` *(signals, multiprocessing)* ·
-  **`concurrency-reviewer` required**
-- **PRIORITY — this is not an edge case.** It was first recorded as "reachable via the OOM killer or
-  `kill -9`". It is reachable by **an ordinary Ctrl-C, on every platform, today**. Measured after item
-  8's signal fix, with children correctly resetting to `SIG_DFL` and dying cleanly:
+- **Owner:** `zfsbackup-developer` + `pytest-test-author` · **Tag:** `needs-approval` *(signals,
+  multiprocessing)* · reviewed by `zfs-code-reviewer` and `concurrency-reviewer`
+- **Status: implemented.** New `zfsbackup/stopflag.py`; wired into `daemon.py`/`workers.py`; covered
+  by `tests/test_zfsbackup_stopflag.py` and `tests/test_zfsbackup_stop_signals.py`.
 
-  ```
-  fork    children exitcodes: [-2, -2, -2]  ==> supervisor WEDGED (>20s)
-  spawn   children exitcodes: [-2, -2, -2]  ==> supervisor WEDGED (>20s)
-  ```
+**The defect.** `Condition.wait` does `_sleeping_count.release()`, blocks in
+`_wait_semaphore.acquire(...)`, and only `finally:` does `_woken_count.release()`. `Condition.notify`
+drains `_woken_count`, consumes one `_sleeping_count` token per sleeper, then **blocks** on
+`_woken_count.acquire()` once per woken sleeper — and `Event.set` wraps all of it in `with self._cond`.
+A process killed inside `_wait_semaphore.acquire` never runs the `finally`, so the ghost is permanent:
+**every later `set()` blocks forever, holding the Condition's lock.** Workers spend essentially all
+their idle time in `stop_event.wait()`, so the window was not narrow — it was the common case.
 
-  Any child that dies while registered as a sleeper on the shared `Event` leaves a ghost token in
-  `_sleeping_count`; dying *correctly* from SIGINT does this just as surely as being SIGKILLed. So
-  `systemctl stop` and Ctrl-C both hang until something sends SIGKILL. **It should be fixed before
-  item 9.**
-- **Not in the original plan.** Found while validating item 8i's crash-loop guard, then reproduced
-  standalone. **Pre-existing** — it is `_stop_event`'s design and predates every DB change — but item
-  8i cannot be validated with `kill -9` until it is understood, and it is reachable in production via
-  the OOM killer, a container eviction, or an operator's `kill -9`.
-- **Measured, 5 trials out of 5, deterministic on macOS/CPython 3.14** (not a race; delays of 0.2s,
-  0.6s and 1.0s before the kill all wedge):
+**Severity, as finally established.** Three escalations over the course of diagnosis, each correcting
+the previous record:
 
-  ```
-  child exitcode: -9
-  parent calling ev.is_set() ...
-    is_set() returned False after 0.00s
-  parent calling ev.set()   ... never returns (>25s, killed)
-  ```
+1. It was first written up as an *orphaned lock*. **Wrong**, and its own evidence disproved it:
+   `Event.is_set()` is `with self._cond:` and returned in 0.02 ms, which it could not have done
+   against an orphaned lock. The dying child *has* released the lock.
+2. It was then recorded as *macOS-only, unverified on Linux*. **Wrong** — `multiprocessing/
+   synchronize.py` is pure Python and `SemLock` is a POSIX semaphore on both. Reproduced under
+   `fork`, `spawn` **and** `forkserver`.
+3. It was recorded as reachable via *the OOM killer or `kill -9`*. **Too narrow** — exit codes `-2`
+   and `-15` produce the ghost identically, so an ordinary **Ctrl-C hung the daemon on every
+   platform**, and so did `systemctl stop`.
 
-- **Mechanism (corrected — the first recorded explanation was wrong).** The killed child is **not**
-  holding a lock: `Condition.wait()` releases `self._lock` before sleeping. The block is in
-  `Condition.notify()`, which after waking sleepers does `self._woken_count.acquire()` once per
-  sleeper — "wait for a sleeper to wake". A SIGKILLed sleeper has already incremented
-  `_sleeping_count` and will never increment `_woken_count`, so `Event.set()` → `notify_all()` blocks
-  forever on a semaphore nobody will post. Workers spend essentially all their idle time inside
-  `stop_event.wait()` — `workers.py:132` in the main loop, `workers.py:263` where `ApiWorker` blocks
-  indefinitely — so the window is not narrow, it is the common case.
+And it was worse than "cannot be stopped": after the first wedged `set()`, `is_set()` blocks too, so
+the supervisor's poll loop froze, `_check_workers` never ran again and crashed workers were never
+restarted. **The daemon stopped supervising**, not merely stopped stopping.
 
-  The originally recorded explanation ("POSIX semaphores are not robust; the killed process never
-  releases the lock") was **wrong**, and its own evidence disproved it: `Event.is_set()` is
-  `with self._cond:`, and it returned in 0.00s — which it could not have done against an orphaned
-  lock. It returns promptly *because* the lock is fine.
+**Item 8's SIG_DFL reset is what made Ctrl-C (as opposed to SIGTERM) a wedge**, and this must not be
+misread as a regression in item 8. With Python's default SIGINT disposition a child raises
+`KeyboardInterrupt`, which unwinds through `Condition.wait`'s `finally` and releases the token;
+`SIG_DFL` does not. Measured, same harness, only the disposition differing:
 
-- **Consequence.** `is_set()` returns normally, so the supervisor's poll loop at `daemon.py:199-201`
-  keeps running and the daemon looks healthy. But `set()` blocks forever, and `set()` is what the
-  **signal handler** calls (`daemon.py:75`). After one SIGKILLed worker the daemon **can no longer be
-  stopped by SIGTERM or SIGINT** — it blocks inside the handler, systemd waits out `TimeoutStopSec`,
-  then SIGKILLs it.
+    children at default_int_handler:  exitcodes=[1,1,1]     set() returned in 6.9 ms
+    children at SIG_DFL (item 8):     exitcodes=[-2,-2,-2]  set() WEDGED
 
-- **Item 8i does not make this worse on its own.** Its all-workers-failed path calls `set()`
-  (`daemon.py:164`), but a worker exiting `EX_CONFIG` raises `SystemExit` from `_load_config` before
-  ever reaching `stop_event.wait()`, so `_sleeping_count` is 0 and `notify_all()` returns
-  immediately. The wedge requires a separately SIGKILLed sleeper.
+SIGTERM wedged either way. Item 8 correctly removed the fork inherited-handler deadlock and in doing
+so converted a survivable Ctrl-C into a wedging one. **Item 8 and 8x together** are what make the
+fork case safe; neither alone does.
 
-- **Platform-independent — the earlier "macOS-only, unverified on Linux" caveat is withdrawn.**
-  `multiprocessing/synchronize.py` is pure Python and identical across platforms, and `SemLock` is a
-  POSIX semaphore on both. Reproduced under `fork` **and** `spawn` on the same machine, which is the
-  same code path Linux takes.
+**The fix: `StopFlag`**, a `multiprocessing.Value('b', 0, lock=False)` behind a class exposing exactly
+the `Event` surface the daemon uses (`set`/`clear`/`is_set`/`wait`). `set()` is one shared-memory
+store — no lock, no condition variable, no sleeper accounting, nothing a dying process can leave
+behind — which also makes it **legal from a signal handler**, the second and independent reason the
+old design was wrong (`Event.set()` is not async-signal-safe even with no ghost sleeper).
 
-- **Fix directions, none chosen.** A non-blocking *signal handler* does **not** fix this — the block
-  is in `notify()`, so **any** caller of `set()` blocks, handler or main loop. What matches the
-  mechanism: replace the shared `Event` with something robust to a holder's death (a pipe, or
-  per-worker state the supervisor owns), or have the supervisor detect `exitcode == -SIGKILL` and
-  rebuild the Event before touching it.
-- **Constraint on tests until this is fixed:** no test may SIGKILL a worker — it hangs the run.
-  Simulate worker death with exit codes instead.
+Measured on the full daemon shape (supervisor + 2 loop workers + 1 untimed waiter; kill a worker
+abruptly, then signal the supervisor): **12/12 clean exits in 0.50–0.52 s** across
+fork/spawn/forkserver × {SIGKILL, SIGINT} × {SIGTERM, SIGINT}, where `mp.Event` wedged permanently.
+Live daemon after wiring: SIGKILL a worker then SIGTERM → **exit 0 in 0.265–0.554 s**, and
+supervision still works (SIGKILL pruning → restart 5.0 s later → SIGTERM → exit 0).
+
+`StopFlag` is also cheaper than what it replaces — a byte versus four semaphores — which matters
+because nearly every test in `test_zfsbackup_daemon.py` constructs a `BackupDaemon`.
+
+**Alternatives rejected, with the measurements:**
+- **A pipe + `selectors`** (30x faster wakeup) — three hazards, all of the silently-different-per-
+  start-method class this item existed to remove: EOF-broadcast **never woke `fork` children** (joins
+  timed out at 8/16/24 s) because siblings inherit each other's write ends and CLOEXEC does not apply
+  to fork; `Connection.recv_bytes` expects a 4-byte header so an async-signal-safe `os.write(fd,
+  b'\x01')` makes `poll()` return True and then blocks forever; and writing to a dead worker's pipe
+  raises `BrokenPipeError` (3/3), inside a signal handler.
+- **`Semaphore.release()`×N** — must know N, not idempotent, no token for a later-started worker, no
+  natural `is_set()`.
+- **"Detect `exitcode == -SIGKILL` and rebuild the Event"** — *unsound*, and was recorded here before
+  being struck: wrong trigger (-2 and -15 do it too), live workers hold the *old* Event from
+  fork/spawn time and would never see a new one, and detection only runs every 5 s while a signal can
+  arrive at any instant.
+
+**Also landed (8x-3b):** `BackupDaemon._supervisor_sleep` sleeps in ≤0.25 s slices and returns early
+on the flag, cutting SIGTERM-to-shutdown from ≤5 s. PEP 475 means `time.sleep` is *retried* with the
+remaining time after a handler returns — measured, handler at 0.50 s, `time.sleep(5.0)` still
+returned at 5.01 s — so the healthy path already cost a full `SUPERVISOR_POLL`. The named method also
+gives tests a stable seam instead of patching raw `time.sleep`.
+
+**Retired by this item:** the "no test may SIGKILL a worker" constraint, and `daemon.py`'s 31-line
+block recording 8i's dependency on 8x. **Item 8i is un-inverted** — its `set()` fires exactly when
+workers have died, which is now the case `StopFlag` is built for.
+
+**Not fixed here, and still item 18's:** a worker blocked in a long `zfs send` does not notice a stop
+until the subprocess returns, under *any* of these mechanisms — `terminate()` remains the answer.
+`StopFlag` does not foreclose item 18: add a second `Value('l')` reload generation read in the same
+poll and check it between datasets, which is where 18 must act anyway. A pipe can be added alongside
+later without changing `StopFlag`'s contract — record the three hazards above so they are not
+rediscovered.
+
+**Test-design traps worth keeping** (both cost real time here):
+- A readiness marker is **not** enough. Killing a worker on the supervisor's `Started … (pid=…)` line
+  kills it during config load, before it has entered `wait()` — no sleeper, no ghost, and the control
+  *passes against broken code*. Wait for the worker's own log output, with margin.
+- A regression here **hangs rather than fails**, so the candidate `set()` must run in a child-process
+  canary with a hard `join(timeout)` + `kill()`, never on the test's own main thread.
+
 
 ### Item 9 — Tests for Phase 1
 
@@ -1291,11 +1320,35 @@ be reviewed while this is still in design, and a problem here cannot destabilise
     log the transition — cheap, and it makes a spurious SIGHUP a no-op.
 - **Handler discipline:** the SIGHUP handler sets a flag only — `self._reload_requested = True` — exactly
   mirroring the existing `_stop_event.set()` pattern at `daemon.py:45`. No work in the handler.
-- **Latency — event-based immediate wake** *(user decision)*. The poll loop currently uses
+- **⚠ SUPERSEDED BY ITEM 8x — read this before implementing the block below.** The wake-event design
+  recorded here was written pre-8x and **must not be implemented as written**. Two things changed:
+
+  1. **`_supervisor_sleep` already delivers most of the stated motivation.** Item 8x made the poll
+     loop sleep in `SUPERVISOR_SLEEP_SLICE` (0.25s) slices with an early return on the flag, so the
+     "flag sits unseen for up to 5s" problem is gone. A reload flag checked in the same loop inherits
+     that latency for free.
+  2. **Setting a `threading.Event` from a signal handler is exactly the pattern 8x declared illegal.**
+     `threading.Event.__init__` is `Condition(Lock())` — a plain, non-reentrant lock. A handler runs at
+     an arbitrary instruction on the main thread, so if the interrupted code was anywhere inside that
+     same lock, the handler self-deadlocks. That is the rule `daemon.py`'s `_signal_handler` now
+     states, and the "Set the wake event from the existing `SIGINT`/`SIGTERM` handlers too" bullet
+     below would reintroduce the class of bug 8x removed.
+
+  **Do instead:** set a plain flag (a `StopFlag`-style lock-free store, or a bare attribute) in the
+  handler and let the existing sliced poll loop transfer it. If sub-100ms reload latency is ever
+  genuinely needed, add a pipe *alongside* `StopFlag` rather than replacing it — and note the three
+  hazards item 8x measured when evaluating pipes: EOF-broadcast never wakes `fork` children (siblings
+  inherit each other's write ends and CLOEXEC does not apply to fork); `Connection.recv_bytes` expects
+  a 4-byte header, so an async-signal-safe `os.write(fd, b'\x01')` makes `poll()` return True and then
+  blocks forever; and writing to a dead worker's pipe raises `BrokenPipeError`, inside a handler.
+
+  The line citations in this section (`daemon.py:109`, `:39-45`, `:69-80`, `workers.py:66-67`) are all
+  stale post-8x and post-item-8; trust the source.
+
+- **Latency — event-based immediate wake** *(user decision, superseded — see above)*. The poll loop used
   `time.sleep(SUPERVISOR_POLL)` (`daemon.py:109`). Under PEP 475, `time.sleep` is *retried* after `EINTR`
   unless the handler raises, so a SIGHUP would **not** cut the sleep short — the flag would sit unseen for
-  up to 5s. Replace the sleep with a wait on a dedicated wake event that the handler sets, so reload takes
-  effect immediately:
+  up to 5s. The original proposal was to replace the sleep with a wait on a dedicated wake event:
 
   ```
   def _handle_hup(self, signum, frame):

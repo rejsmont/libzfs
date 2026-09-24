@@ -67,6 +67,22 @@ jobs:
           poetry config virtualenvs.in-project true
           poetry install --with dev
 
+      # libzfseasy/zfs.py resolves the zfs/zpool binaries at IMPORT time and
+      # raises RuntimeError if neither $ZFS_CMD nor a binary on PATH is found
+      # -- so without this the suite cannot even be collected, let alone run,
+      # and every job fails identically at import. Hosted runners ship no
+      # zfsutils. The mocked suite never executes these (conftest patches
+      # subprocess.Popen), it only needs the names to resolve; the real_zfs
+      # tests are excluded by pytest.ini's addopts and are not run here.
+      - name: Provide stub zfs/zpool binaries
+        run: |
+          mkdir -p "$RUNNER_TEMP/zfsstub"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zfs"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zpool"
+          chmod +x "$RUNNER_TEMP/zfsstub/zfs" "$RUNNER_TEMP/zfsstub/zpool"
+          echo "ZFS_CMD=$RUNNER_TEMP/zfsstub/zfs" >> "$GITHUB_ENV"
+          echo "ZPOOL_CMD=$RUNNER_TEMP/zfsstub/zpool" >> "$GITHUB_ENV"
+
       - name: Run the mocked test suite
         run: poetry run pytest
 

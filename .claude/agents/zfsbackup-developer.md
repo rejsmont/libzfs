@@ -68,7 +68,16 @@ ORM models into daemon code. Config objects outlive any session, and a detached 
 
 ## Runtime — `zfsbackup/daemon.py` + `zfsbackup/workers.py`
 
-- `BackupDaemon` is a supervisor: a shared `multiprocessing.Event` stop flag, `SIGINT`/`SIGTERM`
+> **The stop flag must never be a `multiprocessing.Event`, and a signal handler must never call
+> anything that takes a lock.** `Event.set()` calls `Condition.notify_all()`, which blocks once per
+> registered sleeper waiting for it to answer. A worker that dies while parked in `wait()` — an
+> ordinary Ctrl-C does this — leaves a ghost that never answers, so every later `set()` blocks
+> forever holding the Condition's lock. Because `is_set()` takes that lock too, the supervisor's
+> poll loop then freezes and stops restarting crashed workers. Reproduced on fork, spawn and
+> forkserver. `StopFlag` is a lock-free shared byte with no sleeper accounting; reverting it to an
+> `Event`, or introducing a `threading.Event` wake-up set from a handler, reintroduces the bug.
+
+- `BackupDaemon` is a supervisor: a shared `zfsbackup.stopflag.StopFlag` stop flag, `SIGINT`/`SIGTERM`
   handlers that set it, and spawn/monitor of worker processes. `run()` reports config, verifies
   datasets, syncs config props, starts workers, then loops `sleep(SUPERVISOR_POLL); _check_workers()`
   (restarting dead workers after a delay); `_shutdown_workers` joins then `terminate()`.

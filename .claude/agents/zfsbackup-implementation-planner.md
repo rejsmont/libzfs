@@ -69,7 +69,7 @@ When producing a plan:
   - `SnapshotInfo` — wraps a `libzfseasy.Snapshot`; parses `{prefix}_{YYYYMMDDHHMMSS}` names to
     get a timestamp and calculate age.
 - `zfsbackup/daemon.py` — `BackupDaemon` is a `multiprocessing` **supervisor** (not a single-process
-  `_run_cycle()` loop): it spawns and monitors worker processes, sharing a `multiprocessing.Event`
+  `_run_cycle()` loop): it spawns and monitors worker processes, sharing a `zfsbackup.stopflag.StopFlag`
   stop flag and handling `SIGINT`/`SIGTERM`. Entry point: `python -m zfsbackup.daemon`.
 - `zfsbackup/workers.py` — the per-dataset work: `SnapshotWorker`, `PruningWorker`,
   `RemoteBackupWorker`, `ApiWorker`, each sleeping via `stop_event.wait(timeout=interval)`.

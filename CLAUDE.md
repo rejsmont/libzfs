@@ -9,10 +9,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 poetry install --with dev
 ```
 
-**Run tests (mocked, no ZFS required):**
+**Run tests (mocked — no ZFS *pool* required, but see below):**
 ```bash
 pytest
 ```
+
+`libzfseasy/zfs.py` resolves the `zfs`/`zpool` binaries at **import** time and raises `RuntimeError`
+if it finds neither `$ZFS_CMD`/`$ZPOOL_CMD` nor a binary on `PATH` — so the suite cannot even be
+*collected* without them, despite never executing them (`conftest.py` patches `subprocess.Popen`).
+On a machine with no ZFS installed, point them at stubs:
+
+```bash
+printf '#!/bin/sh\nexit 0\n' > /tmp/zfs && chmod +x /tmp/zfs
+ZFS_CMD=/tmp/zfs ZPOOL_CMD=/tmp/zfs pytest
+```
+
+This is what `.github/workflows/tests.yml` does. Making the resolution lazy would be the better fix
+and is an open item against `libzfseasy`.
 
 **Run a single test file or test:**
 ```bash
@@ -72,7 +85,7 @@ Properties are stored internally as integer-indexed lists (using `_prop_names` c
 - `SnapshotInfo` — wraps a `libzfseasy.Snapshot`; parses the `{prefix}_{YYYYMMDDHHMMSS}` name to get a timestamp and calculates age
 - Retention/destruction lives on `DatasetManager` too — the tiered slot-based `needs_prunning` (keeps the newest snapshot per time slot, always keeps `snapshots[0]`, skips anchored snapshots) and `prune_snapshots` (destroys in batches, honors `dry_run`). Anchor state is stored in the `org.zfsbackup:anchor.*` user properties.
 
-**[zfsbackup/daemon.py](zfsbackup/daemon.py)** — `BackupDaemon` is a **multiprocessing supervisor**, not a single-process loop: it owns a shared `multiprocessing.Event` stop flag, installs `SIGINT`/`SIGTERM` handlers, spawns the worker processes, then polls and restarts any that die. Entry point: `python -m zfsbackup.daemon` (flags `-c/--config`, `-d/--dry-run`, `-v/--verbose`, `--test-config`).
+**[zfsbackup/daemon.py](zfsbackup/daemon.py)** — `BackupDaemon` is a **multiprocessing supervisor**, not a single-process loop: it owns a shared **`zfsbackup.stopflag.StopFlag`** (a lock-free shared byte — **not** a `multiprocessing.Event`; see below), installs `SIGINT`/`SIGTERM` handlers, spawns the worker processes, then polls and restarts any that die. Entry point: `python -m zfsbackup.daemon` (flags `-c/--config`, `-d/--dry-run`, `-v/--verbose`, `--test-config`).
 
 **[zfsbackup/workers.py](zfsbackup/workers.py)** — the per-dataset work runs here. `BaseWorker.run` builds a `DatasetManager`, iterates its datasets calling an abstract `_process_dataset`, and sleeps via `stop_event.wait(timeout=interval)`. Subclasses: `SnapshotWorker`, `PruningWorker`, `RemoteBackupWorker` (lazy-imports `RemoteBackupManager`), `ApiWorker` (runs the Flask app in a thread).
 

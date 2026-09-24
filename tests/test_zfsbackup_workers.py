@@ -21,11 +21,26 @@ from zfsbackup.config.store import (
 )
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
 from zfsbackup.runtime_config import EX_CONFIG
+from zfsbackup.stopflag import StopFlag
 from zfsbackup.workers import (
     SnapshotWorker, PruningWorker, RemoteBackupWorker, ApiWorker, _load_config,
 )
 
 FORK_AVAILABLE = "fork" in multiprocessing.get_all_start_methods()
+
+#: The union `workers.StopEvent` actually accepts (see `workers.py`'s own
+#: module docstring): a plain `multiprocessing.Event` -- what ~35 existing
+#: call sites in this file still construct -- and `StopFlag`, the item-8x
+#: replacement every real `BackupDaemon` actually hands its workers today.
+#: Before this, no FAST (mocked) test ever drove a worker with a real
+#: `StopFlag` at all; only the skippable, `real_zfs`-adjacent
+#: `test_zfsbackup_stop_signals.py` did. Parametrizing over both here means
+#: a change to `BaseWorker.run`/`ApiWorker.run` that happens to work for
+#: `Event`'s specific implementation but not `StopFlag`'s (or vice versa)
+#: fails in the always-run mocked suite, not only in a slow, occasionally
+#: skipped integration module.
+STOP_EVENT_FACTORIES = [multiprocessing.Event, StopFlag]
+STOP_EVENT_IDS = ['mp_event', 'stopflag']
 
 
 class TestSnapshotWorker:
@@ -304,8 +319,13 @@ class TestRemoteBackupWorkerBeforeLoop:
 
 
 class TestApiWorkerThread:
-    def test_run_starts_thread_and_stops_on_event(self, sqlite_config_db, mocker):
-        stop_event = multiprocessing.Event()
+    @pytest.mark.parametrize(
+        'stop_event_factory', STOP_EVENT_FACTORIES, ids=STOP_EVENT_IDS
+    )
+    def test_run_starts_thread_and_stops_on_event(
+        self, sqlite_config_db, mocker, stop_event_factory
+    ):
+        stop_event = stop_event_factory()
         stop_event.set()  # stop_event.wait() returns immediately
         worker = ApiWorker(sqlite_config_db, stop_event, dry_run=True)  # dry_run covers line 198
 
@@ -368,11 +388,14 @@ class TestChildSignalDispositionWiring:
         assert signal.getsignal(signal.SIGINT) is signal.SIG_DFL
         assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
 
+    @pytest.mark.parametrize(
+        'stop_event_factory', STOP_EVENT_FACTORIES, ids=STOP_EVENT_IDS
+    )
     def test_api_worker_run_resets_signal_disposition_first(
-        self, sqlite_config_db, mocker
+        self, sqlite_config_db, mocker, stop_event_factory
     ):
         self._install_non_default_handlers()
-        stop_event = multiprocessing.Event()
+        stop_event = stop_event_factory()
         stop_event.set()  # stop_event.wait() returns immediately
         worker = ApiWorker(sqlite_config_db, stop_event, dry_run=True)
 

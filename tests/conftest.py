@@ -262,14 +262,20 @@ def _restore_signal_handlers():
     `tests/test_zfsbackup_daemon.py` constructs one. Without this fixture,
     the LAST `BackupDaemon` constructed anywhere in the whole pytest
     process silently becomes the live SIGINT/SIGTERM handler for the rest
-    of the session -- bound to a `multiprocessing.Event` whose owning
-    daemon is long since garbage collected, and (per the item-8x wedge
-    hazard `workers._init_child_process` documents but does not fix) a
-    real Ctrl-C reaching that stale handler is not merely inert, it is a
-    process that can hang. Autouse and session-wide, not just for
-    `test_zfsbackup_daemon.py`: this is cheap (`getsignal`/`signal` are
-    O(1) syscalls) and protects any future test that touches signal
-    dispositions the same way, not only the ones that exist today.
+    of the session -- bound to a `StopFlag` (`zfsbackup/stopflag.py`)
+    whose owning daemon is long since garbage collected. Since item 8x
+    replaced `BackupDaemon`'s stop mechanism with `StopFlag`, a stale
+    handler here is genuinely inert: `self._stop_event.set()` is a plain
+    store into shared memory nobody is left to read, not the
+    `multiprocessing.Event.set()` that pre-8x could wedge the whole
+    process on a ghost sleeper (see `tests/test_zfsbackup_stop_signals.py`
+    for the regression test that proves that mechanism is fixed). This
+    fixture still earns its place regardless -- leaving any stale handler
+    bound to a dead daemon's flag is wrong on principle, and cheap
+    (`getsignal`/`signal` are O(1) syscalls) to prevent. Autouse and
+    session-wide, not just for `test_zfsbackup_daemon.py`: it protects any
+    future test that touches signal dispositions the same way, not only
+    the ones that exist today.
     """
     import signal
 

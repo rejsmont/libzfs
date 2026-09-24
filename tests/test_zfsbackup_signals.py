@@ -34,10 +34,17 @@ reports a zombie (a child that has exited but not yet been reaped) as
 **No test here sends a real SIGINT/SIGTERM to anything.** Both children
 below only *read* their own signal disposition via `signal.getsignal` and
 report it back through a JSON file -- exactly the coordinator's own
-verification methodology. Actually delivering a signal to a live daemon
-with workers is the item-8x wedge hazard (`workers._init_child_process`'s
-own docstring); it is not reachable from here and must never be
-triggered by a test.
+verification methodology. That is a scope choice, not a safety
+constraint: this module only checks *disposition* (what handler is
+installed after `_init_child_process` runs), which needs no delivered
+signal at all. Actually delivering a real SIGINT/SIGTERM to a live daemon
+with workers -- including one killed mid-`stop_event.wait()`, the exact
+pre-8x wedge hazard `workers._init_child_process`'s own docstring
+describes -- is deliberately out of scope *here*, but it is no longer
+unsafe to do in a test: item 8x's `StopFlag` (`zfsbackup/stopflag.py`)
+fixed the underlying cause, and `tests/test_zfsbackup_stop_signals.py`
+is the regression test that proves it by doing precisely that, end to
+end, against the real `python -m zfsbackup.daemon` entry point.
 """
 
 import json

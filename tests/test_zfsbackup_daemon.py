@@ -3,6 +3,7 @@
 import multiprocessing
 import signal
 import sqlite3
+import time
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
@@ -56,6 +57,144 @@ class TestSignalHandler:
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
         daemon._signal_handler(signal.SIGTERM, None)
         assert daemon._stop_event.is_set()
+
+    def test_records_signum_for_report_stop_signal(self, sqlite_config_db, sample_backup_config):
+        """`_signal_handler` records which signal fired so `_report_stop_signal`
+        can name it later, from a context where logging is legal (see both
+        functions' docstrings). `None` means "raised by `_check_workers`,
+        not a signal" -- `_report_stop_signal` relies on that distinction to
+        stay silent for a configuration fault.
+        """
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
+        assert daemon._stop_signum is None
+        daemon._signal_handler(signal.SIGTERM, None)
+        assert daemon._stop_signum == signal.SIGTERM
+
+    def test_handler_does_no_logging(self, sqlite_config_db, sample_backup_config, caplog):
+        """A signal handler must not call anything that takes a lock --
+        `logger.info()` takes `logging._lock` and a `Handler.lock`, then
+        performs a blocking write a stalled journald or a full pipe buffer
+        can hang forever on, which would mean `set()` (and thus the flag
+        every worker polls) is never reached. See `_signal_handler`'s own
+        docstring for the measured before/after. `_report_stop_signal` --
+        called from `run()`'s poll loop, never from the handler itself --
+        is where the operator-facing line is actually emitted.
+        """
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
+        with caplog.at_level('DEBUG'):
+            daemon._signal_handler(signal.SIGTERM, None)
+        assert caplog.text == ''
+        assert caplog.records == []
+
+
+class TestReportStopSignal:
+    """`_report_stop_signal` is the operator-facing line `_signal_handler`
+    is deliberately forbidden from logging itself (see both docstrings).
+    Called from `run()`'s poll loop instead, where taking a lock and
+    blocking on a journald write is merely slow, not signal-handler-fatal.
+    """
+
+    def test_logs_sigterm_line(self, sqlite_config_db, sample_backup_config, caplog):
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
+        daemon._stop_signum = signal.SIGTERM
+        with caplog.at_level('INFO'):
+            daemon._report_stop_signal()
+        assert 'Received SIGTERM, shutting down gracefully' in caplog.text
+
+    def test_logs_sigint_line(self, sqlite_config_db, sample_backup_config, caplog):
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
+        daemon._stop_signum = signal.SIGINT
+        with caplog.at_level('INFO'):
+            daemon._report_stop_signal()
+        assert 'Received SIGINT, shutting down gracefully' in caplog.text
+
+    def test_idempotent_logs_only_once(self, sqlite_config_db, sample_backup_config, caplog):
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
+        daemon._stop_signum = signal.SIGTERM
+        with caplog.at_level('INFO'):
+            daemon._report_stop_signal()
+            daemon._report_stop_signal()
+            daemon._report_stop_signal()
+        assert caplog.text.count('Received SIGTERM') == 1
+
+    def test_silent_when_flag_raised_by_check_workers_not_a_signal(
+        self, sqlite_config_db, sample_backup_config, caplog
+    ):
+        """`_stop_signum` stays `None` when `_check_workers` raises the
+        flag itself (an `EX_CONFIG` fault) -- that path logs its own
+        explanation, and `_report_stop_signal` must add nothing.
+        """
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
+        assert daemon._stop_signum is None
+        with caplog.at_level('INFO'):
+            daemon._report_stop_signal()
+        assert caplog.text == ''
+
+
+class TestSupervisorSleep:
+    """`_supervisor_sleep` is the seam that bounds SIGTERM/SIGINT-to-
+    `_shutdown_workers` latency to `SUPERVISOR_SLEEP_SLICE` instead of the
+    full `SUPERVISOR_POLL` -- a bare `time.sleep(SUPERVISOR_POLL)` is not
+    interruptible mid-sleep (PEP 475: retried with the remaining time once
+    a signal handler returns), so the flag being set promptly buys nothing
+    without this. Exercised directly, not just through `run()`'s counting
+    tests above, so a regression that reintroduces the un-sliced sleep (or
+    breaks the early return) is caught even if the `run()`-level tests'
+    iteration counting is ever changed.
+    """
+
+    def test_returns_promptly_once_per_iteration(
+        self, sqlite_config_db, sample_backup_config, mocker
+    ):
+        """One call to `_supervisor_sleep` must not busy-loop internally in
+        a way a caller can observe as more than one real sleep -- assert it
+        actually calls `time.sleep` in slices no larger than
+        `SUPERVISOR_SLEEP_SLICE`, and stops as soon as the flag is set from
+        outside (mirroring a signal handler firing mid-sleep).
+        """
+        from zfsbackup.daemon import SUPERVISOR_SLEEP_SLICE
+
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
+        calls = []
+
+        def fake_sleep(seconds):
+            calls.append(seconds)
+            assert seconds <= SUPERVISOR_SLEEP_SLICE
+            if len(calls) == 2:
+                daemon._stop_event.set()
+
+        mocker.patch('zfsbackup.daemon.time.sleep', side_effect=fake_sleep)
+
+        daemon._supervisor_sleep(5)
+
+        # Stopped after the slice that set the flag, not after sleeping out
+        # the full 5s requested -- this is the entire point of slicing.
+        assert len(calls) == 2
+
+    def test_returns_immediately_if_flag_already_set(
+        self, sqlite_config_db, sample_backup_config, mocker
+    ):
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
+        daemon._stop_event.set()
+        sleep_mock = mocker.patch('zfsbackup.daemon.time.sleep')
+
+        daemon._supervisor_sleep(5)
+
+        sleep_mock.assert_not_called()
+
+    def test_respects_deadline_when_flag_never_set(
+        self, sqlite_config_db, sample_backup_config
+    ):
+        """No mocking: a real, short sleep budget must actually elapse
+        (within a generous margin) and return, rather than the flag check
+        alone governing how long the call takes.
+        """
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
+        start = time.monotonic()
+        daemon._supervisor_sleep(0.3)
+        elapsed = time.monotonic() - start
+        assert 0.3 <= elapsed < 5
+        assert not daemon._stop_event.is_set()
 
 
 class TestActiveWorkerNames:
@@ -262,6 +401,17 @@ class TestCrashLoopGuard:
         mocker.patch('zfsbackup.backup_manager.zfs.set')
         mocker.patch('zfsbackup.daemon.dispose_all')
         mocker.patch.object(daemon, '_new_worker')  # must NEVER be called
+        # Belt-and-braces alongside the `_supervisor_sleep` patch below: if
+        # the EX_CONFIG guard under test were ever broken, `_check_workers`
+        # would fall into the ordinary respawn loop and hit its own
+        # deliberately un-sliced `time.sleep(WORKER_RESTART_DELAY)` (see
+        # `_check_workers`'s comment on why that sleep stays raw) -- which
+        # this mock does NOT neutralise via the `_supervisor_sleep` seam,
+        # since that seam only wraps the per-iteration poll sleep, not this
+        # one. Left unpatched, a reverted guard would still fail this test
+        # (the assertions below would catch it), just ~5s slower per dead
+        # worker instead of instantly.
+        mocker.patch('zfsbackup.daemon.time.sleep')
 
         config_failed_worker = MagicMock()
         config_failed_worker.is_alive.return_value = False
@@ -287,7 +437,20 @@ class TestCrashLoopGuard:
         # this test targets) makes `self._config_failed` never populate,
         # so `_stop_event` never gets set and `run()`'s poll loop spins
         # forever; this cap turns that into a clean, fast assertion
-        # failure instead of a pytest hang.
+        # failure instead of a pytest hang. Patches `_supervisor_sleep`
+        # (one call per poll iteration), the named seam, rather than
+        # counting calls to the raw `time.sleep` it wraps in 0.25s slices
+        # internally -- that raw `time.sleep` is ALSO patched above (see
+        # the comment by that patch), but only to keep it from actually
+        # sleeping if the EX_CONFIG guard is broken and the un-sliced
+        # `WORKER_RESTART_DELAY` sleep in `_check_workers`'s respawn loop
+        # is reached; it is NOT counted by this cap. Counting the sliced
+        # primitive instead of `_supervisor_sleep` would multiply this
+        # figure by roughly 20 (`SUPERVISOR_POLL / SUPERVISOR_SLEEP_SLICE`)
+        # ONLY if `time.sleep` were left un-patched and actually slept in
+        # 0.25s slices; patched, as it is here, it returns instantly and
+        # is unbounded rather than 20x -- which is exactly why the cap is
+        # on `_supervisor_sleep`, not on `time.sleep`.
         sleep_calls = [0]
 
         def bounded_sleep(_):
@@ -295,7 +458,7 @@ class TestCrashLoopGuard:
             if sleep_calls[0] > 20:
                 daemon._stop_event.set()
 
-        mocker.patch('zfsbackup.daemon.time.sleep', side_effect=bounded_sleep)
+        mocker.patch.object(daemon, '_supervisor_sleep', side_effect=bounded_sleep)
 
         result = daemon.run()
 
@@ -344,12 +507,23 @@ class TestCrashLoopGuard:
         # keeps a broken guard from doing anything worse than looping in
         # pure Python.
         mocker.patch.object(daemon, '_new_worker', return_value=MagicMock(pid=999))
+        # Same belt-and-braces reasoning as
+        # `test_mixed_pass_no_respawn_at_all_and_run_returns_one`: patch
+        # the raw `time.sleep` too, so a broken guard that falls into the
+        # respawn loop hits its un-sliced `WORKER_RESTART_DELAY` sleep
+        # instantly rather than ~5s per dead worker later.
+        mocker.patch('zfsbackup.daemon.time.sleep')
         # Safety valve, not part of the assertion: caps the supervisor
         # poll loop at 20 iterations so a regression that breaks the
         # EX_CONFIG guard fails this test with a clean assertion instead
         # of hanging pytest (or, worse under an unmocked `_new_worker`,
         # fork-bombing the test host) -- verified by reverting the guard
-        # in `_check_workers` (see this class's own docstring).
+        # in `_check_workers` (see this class's own docstring). Patches
+        # `_supervisor_sleep`, the named per-iteration seam; counting
+        # calls to the raw (also-patched) `time.sleep` instead would be
+        # meaningless here since patched sleeps return instantly rather
+        # than in real 0.25s slices -- see the sibling test's comment for
+        # the full reasoning.
         sleep_calls = [0]
 
         def bounded_sleep(_):
@@ -357,7 +531,7 @@ class TestCrashLoopGuard:
             if sleep_calls[0] > 20:
                 daemon._stop_event.set()
 
-        mocker.patch('zfsbackup.daemon.time.sleep', side_effect=bounded_sleep)
+        mocker.patch.object(daemon, '_supervisor_sleep', side_effect=bounded_sleep)
 
         result = daemon.run()
 
@@ -501,9 +675,83 @@ class TestShutdownWorkers:
         assert 'survived SIGKILL' in caplog.text
         assert '4242' in caplog.text
 
+    def test_shutdown_budget_is_a_single_shared_deadline_not_per_worker(
+        self, sqlite_config_db, sample_backup_config, mocker
+    ):
+        """`timeout` is a budget shared across ALL workers, computed ONCE,
+        not re-granted in full to each one in turn -- the old per-worker
+        `timeout=30` meant four workers stuck in a long `zfs send` (the
+        case the budget exists for) could cost 4 x (30 + 5 + 5) = 160s
+        *after* the poll loop exited, against systemd's default
+        `TimeoutStopSec=90s`. See `_shutdown_workers`'s own docstring.
+
+        Modeled with a mocked `time.monotonic` whose `join()` side effect
+        advances the clock by exactly the `timeout` it was given -- the
+        worst case, a worker that stays busy for its entire granted
+        allowance (e.g. a genuinely stuck `zfs send`). Three workers, a
+        12s total budget: the first is offered the whole 12s and consumes
+        it; every worker after that must be offered exactly `0.0` (clamped
+        by `max(0.0, ...)`, never negative) because the shared deadline has
+        already passed -- not a fresh budget each time. The recorded
+        offered timeouts are non-increasing and sum to no more than the
+        12s budget, which is the property the docstring promises; a
+        reversion to per-worker timeouts would instead offer `12.0` to
+        every worker regardless of how much time the earlier ones took.
+        """
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
+
+        workers = {}
+        for name in ('snapshot', 'pruning', 'api'):
+            w = MagicMock()
+            w.is_alive.return_value = False
+            workers[name] = w
+        daemon._workers = workers
+
+        clock = [0.0]
+
+        def fake_monotonic():
+            return clock[0]
+
+        def advance_and_join(timeout=None):
+            clock[0] += timeout if timeout is not None else 0.0
+            return None
+
+        for w in workers.values():
+            w.join.side_effect = advance_and_join
+
+        mocker.patch('zfsbackup.daemon.time.monotonic', side_effect=fake_monotonic)
+
+        daemon._shutdown_workers(timeout=12)
+
+        recorded = [w.join.call_args.kwargs['timeout'] for w in workers.values()]
+        assert recorded == [12.0, 0.0, 0.0]
+        assert recorded == sorted(recorded, reverse=True)
+        assert sum(recorded) <= 12
+
 
 class TestDaemonRun:
-    def test_run_starts_and_shuts_down(self, sqlite_config_db, sample_backup_config, mocker):
+    def test_run_does_not_start_workers_when_stop_flag_pre_set(
+        self, sqlite_config_db, sample_backup_config, mocker, caplog
+    ):
+        """A SIGTERM landing during `verify_datasets()`/
+        `sync_all_config_properties()` -- both of which run before the
+        `_start_workers()` guard -- must not fork any worker at all: each
+        one would do `dispose_all()`, a schema check and a full config
+        load only to die at the loop guard's first evaluation a moment
+        later. With the flag pre-set (mirroring that startup SIGTERM),
+        `_start_workers` must never be called, `_shutdown_workers` still
+        must be (an empty `_workers` makes it a no-op, but the shutdown
+        tail is the single exit either way), `run()` must return 0 -- no
+        worker ever got the chance to hit `EX_CONFIG` -- and the log must
+        say so.
+
+        This replaces the pre-item-8x version of this test, which asserted
+        the opposite (`_start_workers.assert_called_once()`) -- that was
+        "forking into a shutdown", the exact hazard `run()`'s guard (and
+        `_check_workers`' matching one on the restart path) now exists to
+        prevent. See `run()`'s own docstring and the branch comment above
+        the guard.
+        """
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
 
         mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
@@ -515,10 +763,49 @@ class TestDaemonRun:
         mocker.patch.object(daemon, '_shutdown_workers')
 
         daemon._stop_event.set()
-        daemon.run()
+        with caplog.at_level('INFO'):
+            result = daemon.run()
+
+        daemon._start_workers.assert_not_called()
+        daemon._shutdown_workers.assert_called_once()
+        daemon._check_workers.assert_not_called()
+        assert result == 0
+        assert 'Shutdown requested during startup' in caplog.text
+
+    def test_run_starts_workers_when_stop_flag_set_from_inside_loop(
+        self, sqlite_config_db, sample_backup_config, mocker
+    ):
+        """The sibling of the pre-set case above: with the flag raised
+        from INSIDE the poll loop (the ordinary running case -- a signal
+        arriving once the daemon is up, or `_check_workers` raising it
+        itself), `_start_workers` MUST be called exactly once. Without
+        this, an inverted guard (e.g. `if not self._stop_event.is_set():`
+        turned into `if self._stop_event.is_set():`, or the guard's branch
+        arms swapped) would pass
+        `test_run_does_not_start_workers_when_stop_flag_pre_set` above
+        vacuously -- nothing would ever call `_start_workers` -- and the
+        daemon would never actually start a worker in normal operation.
+        """
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
+
+        mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
+        mocker.patch('zfsbackup.backup_manager.zfs.set')
+
+        mocker.patch.object(daemon, '_start_workers')
+        mocker.patch.object(daemon, '_check_workers')
+        mocker.patch.object(daemon, '_shutdown_workers')
+
+        def stop_after_start():
+            daemon._stop_event.set()
+
+        daemon._start_workers.side_effect = stop_after_start
+
+        result = daemon.run()
 
         daemon._start_workers.assert_called_once()
         daemon._shutdown_workers.assert_called_once()
+        assert result == 0
 
     def test_run_supervisor_loop_checks_workers(self, sqlite_config_db, sample_backup_config, mocker):
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
@@ -531,6 +818,11 @@ class TestDaemonRun:
         mocker.patch.object(daemon, '_check_workers')
         mocker.patch.object(daemon, '_shutdown_workers')
 
+        # Patches `_supervisor_sleep` -- the named, once-per-iteration seam
+        # -- rather than the raw `time.sleep` it now calls twenty times per
+        # iteration internally (0.25s slices of `SUPERVISOR_POLL=5`).
+        # `sleep_calls[0] >= 2` must fire on the second *iteration*, not the
+        # second slice of the first.
         sleep_calls = [0]
 
         def sleep_and_maybe_stop(_):
@@ -538,7 +830,7 @@ class TestDaemonRun:
             if sleep_calls[0] >= 2:
                 daemon._stop_event.set()
 
-        mocker.patch('zfsbackup.daemon.time.sleep', side_effect=sleep_and_maybe_stop)
+        mocker.patch.object(daemon, '_supervisor_sleep', side_effect=sleep_and_maybe_stop)
         daemon.run()
 
         daemon._check_workers.assert_called_once()
