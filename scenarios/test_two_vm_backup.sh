@@ -229,11 +229,13 @@ put_config() { # put_config <vm> ; reads config text on stdin, installs it to $C
         || die "config import failed on $vm"
 }
 
-# Remove the YAML and the config DB with its WAL sidecars (a stale -wal beside a fresh DB
-# is a confusing failure). Daemons must be stopped first. Output suppressed in the guest.
+# Remove the YAML, the config DB with its WAL sidecars (a stale -wal beside a fresh DB is a
+# confusing failure), and the item-15 lock files: <db>.daemon.pid (daemon presence lock; a leftover
+# one from a crash would name a dead supervisor and a stale generation) and <db>.writer.lock (CLI
+# writer lock). Daemons must be stopped first. Output suppressed in the guest.
 remove_config() {
     local vm="$1"
-    msh "$vm" "{ rm -f '$CFG' '$DB' '$DB-wal' '$DB-shm'; } >/dev/null 2>&1; true" || true
+    msh "$vm" "{ rm -f '$CFG' '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock'; } >/dev/null 2>&1; true" || true
 }
 
 write_server_config() {

@@ -343,7 +343,7 @@ stop_daemon() {
 reset_default_state() { # reset_default_state [keep-dir]
     stop_daemon
     local rmdir="rm -rf '$CFG_DIR'"; [ -n "${1:-}" ] && rmdir=":"
-    msh "{ rm -f '$DB' '$DB-wal' '$DB-shm'; $rmdir; } >/dev/null 2>&1; : >'$LOG'; chown '$SVC_USER' '$LOG'; true" || true
+    msh "{ rm -f '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock'; $rmdir; } >/dev/null 2>&1; : >'$LOG'; chown '$SVC_USER' '$LOG'; true" || true
 }
 
 start_daemon() { # start_daemon [extra daemon args...]  — runs as $SVC_USER on the default DB
@@ -713,7 +713,7 @@ else
     step "Tearing down"
     stop_daemon
     # DB + both WAL sidecars, the whole config dir, the (d) fixtures; users stay (idempotent).
-    msh "{ rm -f '$DB' '$DB-wal' '$DB-shm'; rm -rf '$CFG_DIR' /home/alice/cfg /var/lib/zfsb-perm-root; } >/dev/null 2>&1; true" || true
+    msh "{ rm -f '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock'; rm -rf '$CFG_DIR' /home/alice/cfg /var/lib/zfsb-perm-root; } >/dev/null 2>&1; true" || true
     if [ "$PURGE" -eq 1 ]; then
         info "deleting VM $PERM_VM (--purge; this VM only, never a global purge)"
         multipass delete --purge "$PERM_VM"
