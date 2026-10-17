@@ -10,24 +10,25 @@ An automated ZFS snapshot management daemon with configurable frequency and rete
 - 🗑️ **Automatic Cleanup**: Automatically purge expired snapshots based on retention rules
 - 🔍 **Dry Run Mode**: Test configuration without making changes
 - 📊 **Detailed Logging**: Comprehensive logging of all operations
-- ⚙️ **YAML Configuration**: Easy-to-read and maintain configuration files
+- ⚙️ **SQLite Config Store**: Config lives in a SQLite database; write it as YAML and import it
 
 ## Installation
 
 The daemon requires:
-- Python 3.7+
-- PyYAML
+- Python 3.11+
 - ZFS utilities (zfs, zpool)
 - The `libzfseasy` library (included in this project)
 
 Install dependencies:
 ```bash
-pip install PyYAML
+poetry install
 ```
 
 ## Configuration
 
-Create a configuration file (default location: `/etc/zfsbackup/config.yaml`):
+The daemon reads its configuration from a SQLite database (default `/var/lib/zfsbackup/config.db`,
+overridable with `-c` or `$ZFSBACKUP_CONFIG`). It does not read YAML and never creates the database.
+Write the configuration as YAML:
 
 ```yaml
 snapshot_prefix: "autosnap"
@@ -47,16 +48,24 @@ datasets:
 
 See [config.example.yaml](config.example.yaml) for more examples.
 
+Then import it. Import is a **full replace** of whatever the database already holds:
+
+```bash
+python -m zfsbackup.config.store.importer /path/to/config.yaml
+```
+
+This is an interim tool; it will be replaced by `zfsbackup-config import`, which is not implemented yet.
+
 ## Usage
 
 ### Start the Daemon
 
 ```bash
-# Using default config location
+# Using the default database location
 python -m zfsbackup.daemon
 
-# With custom config
-python -m zfsbackup.daemon -c /path/to/config.yaml
+# With a custom database
+python -m zfsbackup.daemon -c /path/to/config.db
 
 # Dry run mode (no changes made)
 python -m zfsbackup.daemon --dry-run
@@ -68,12 +77,12 @@ python -m zfsbackup.daemon -v
 ### Test Configuration
 
 ```bash
-python -m zfsbackup.daemon --test-config -c config.yaml
+python -m zfsbackup.daemon --test-config -c /path/to/config.db
 ```
 
 ### Command Line Options
 
-- `-c, --config PATH`: Path to configuration file (default: `/etc/zfsbackup/config.yaml`)
+- `-c, --config PATH`: Path to the config database (default: `$ZFSBACKUP_CONFIG`, then `/var/lib/zfsbackup/config.db`)
 - `-d, --dry-run`: Dry run mode - do not create or destroy snapshots
 - `-v, --verbose`: Enable verbose (debug) logging
 - `--test-config`: Test configuration and exit
@@ -194,7 +203,7 @@ After=zfs-import.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -m zfsbackup.daemon -c /etc/zfsbackup/config.yaml
+ExecStart=/usr/bin/python3 -m zfsbackup.daemon -c /var/lib/zfsbackup/config.db
 Restart=on-failure
 RestartSec=60
 
@@ -247,7 +256,7 @@ Use `-v` flag for debug-level logging.
 
 ```bash
 # Test configuration
-python -m zfsbackup.daemon --test-config -c config.yaml
+python -m zfsbackup.daemon --test-config -c /path/to/config.db
 ```
 
 ## License

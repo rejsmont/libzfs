@@ -105,8 +105,10 @@ Trust the source when any doc disagrees with it, and flag the stale doc.
   Two-VM end-to-end scenarios live under `scenarios/`.
 - `zfsbackup` test files: `tests/test_zfsbackup_*.py`.
 - Run: `pytest tests/test_zfsbackup_*.py`; add `-m real_zfs` for real-ZFS tests.
-- Run daemon: `python -m zfsbackup.daemon -c zfsbackup/config.example.yaml --dry-run`
-  or `--test-config` for config validation only.
+- Run daemon: the daemon reads only the SQLite config DB and refuses a `.yaml`. Import first —
+  `python -m zfsbackup.config.store.importer zfsbackup/config.example.yaml -c /tmp/zfsbackup/config.db`
+  — then `python -m zfsbackup.daemon -c /tmp/zfsbackup/config.db --dry-run`, or `--test-config` for
+  config validation only.
 
 **Repo hygiene:**
 - Default branch is `master`; branch before committing.

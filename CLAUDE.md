@@ -47,9 +47,15 @@ pytest -m real_zfs
 ```
 
 **Run the backup daemon:**
+
+The daemon reads its config **only** from the SQLite config store; a `.yaml` passed to `-c` is refused.
+Import YAML first (a destructive full replace of whatever the DB holds). Until the `zfsbackup-config`
+CLI exists (plan item 10), the import tool is the interim `python -m zfsbackup.config.store.importer`.
+
 ```bash
-python -m zfsbackup.daemon -c zfsbackup/config.example.yaml --dry-run
-python -m zfsbackup.daemon --test-config -c zfsbackup/config.example.yaml
+python -m zfsbackup.config.store.importer zfsbackup/config.example.yaml -c /tmp/zfsbackup/config.db
+python -m zfsbackup.daemon --test-config -c /tmp/zfsbackup/config.db
+python -m zfsbackup.daemon -c /tmp/zfsbackup/config.db --dry-run
 ```
 
 ## Architecture
@@ -96,13 +102,22 @@ value types (`BackupConfig`, `DatasetConfig`, `Duration`, …) and `__init__.py`
 `from zfsbackup.config import BackupConfig` is the supported spelling and importing from
 `zfsbackup.config.model` directly is unnecessary.
 
-**[zfsbackup/config/store/](zfsbackup/config/store/)** — the SQLAlchemy config store (in progress, see
-[docs/config_db_cli_plan.md](docs/config_db_cli_plan.md)). `models.py` holds the ORM schema,
-`mapper.py` converts ORM rows ⇄ the `config/model.py` dataclasses, `db.py` owns engine/session
-management (fork-safe engine cache, WAL pragmas, read-only worker sessions), and `migrate.py` plus
-`migrations/` own the Alembic baseline. It is a **separate layer** from the dataclasses, not a
-replacement — `DatasetConfig` is also a remote wire format with no DB behind it, and config objects
-outlive any session. Nothing is wired into the daemon or CLI yet.
+**[zfsbackup/config/store/](zfsbackup/config/store/)** — the SQLAlchemy config store, and the daemon's
+**only** config source (plan item 8; see [docs/config_db_cli_plan.md](docs/config_db_cli_plan.md)).
+`models.py` holds the ORM schema, `mapper.py` converts ORM rows ⇄ the `config/model.py` dataclasses,
+`db.py` owns engine/session management (fork-safe engine cache, WAL pragmas, read-only worker
+sessions), `paths.py` resolves and preflights the DB path (`-c` > `$ZFSBACKUP_CONFIG` >
+`/var/lib/zfsbackup/config.db`; the daemon never creates it), `importer.py` does the YAML → DB full
+replace, and `migrate.py` plus `migrations/` own the Alembic baseline. It is a **separate layer** from
+the dataclasses, not a replacement — `DatasetConfig` is also a remote wire format with no DB behind it,
+and config objects outlive any session. YAML survives only as an import format and (from Phase 2) the
+`$EDITOR` buffer; `BackupConfig.from_file` remains the single YAML parser.
+
+**[zfsbackup/runtime_config.py](zfsbackup/runtime_config.py)** — the daemon core's only door into the
+store: `daemon.py` and `workers.py` call `load_runtime_config()` and never open a connection or touch
+an ORM class. Read-only, one connection at a time, and only a path string crosses the process
+boundary — never a loaded `BackupConfig` or an engine. The config CLI (`zfsbackup/cli/`, Phase 2) does
+not exist yet.
 
 > **`zfsbackup/store/` is reserved and deliberately empty.** It is for *backup data* destinations —
 > object storage, cloud targets and the like. Configuration persistence lives under
@@ -117,11 +132,22 @@ outlive any session. Nothing is wired into the daemon or CLI yet.
 | `tests/test_commands.py` | Each command class, mocked subprocess |
 | `tests/test_integration.py` | End-to-end workflows, mocked subprocess |
 | `tests/test_real_zfs.py` | Real ZFS commands, marked `real_zfs` |
+| `tests/test_commands_part2.py` | Command classes `AllowCommand` through `MountCommand` |
+| `tests/test_zfsbackup_basic.py` | Package smoke tests |
+| `tests/test_zfsbackup_manager.py` | `DatasetManager`, retention/pruning |
+| `tests/test_zfsbackup_snapshot_info.py` | `SnapshotInfo` / `DatasetInfo` time computation |
+| `tests/test_zfsbackup_daemon.py` | `BackupDaemon` supervisor, DB-backed config loading |
 | `tests/test_zfsbackup_workers.py` | Worker loop and interval behaviour |
+| `tests/test_zfsbackup_runtime_config.py` | Torn-read protection in `load_runtime_config` |
+| `tests/test_zfsbackup_signals.py` | Fork-pinned SIGINT/SIGTERM reset in worker children |
+| `tests/test_zfsbackup_stopflag.py` | `StopFlag` semantics |
+| `tests/test_zfsbackup_stop_signals.py` | Real daemon: kill a worker, then signal the supervisor — must exit, not wedge |
 | `tests/test_zfsbackup_api.py` | HTTP control API |
+| `tests/test_zfsbackup_remote.py` | `RemoteBackupManager`, `ClientIdentity` |
 | `tests/test_zfsbackup_config.py` | Config loading, retention collapse, per-destination rules |
 | `tests/test_zfsbackup_duration.py` | The `Duration` type and its literal preservation |
-| `tests/test_zfsbackup_store.py` | SQLAlchemy schema, constraints, mapper |
+| `tests/test_zfsbackup_store.py` | SQLAlchemy schema, constraints, mapper, YAML import |
+| `tests/test_zfsbackup_real.py` | Daemon against a real pool, marked `real_zfs` |
 
 The `mock_subprocess` fixture in `conftest.py` patches `subprocess.Popen`. Use `mock_subprocess.setup(stdout=[...], stderr='', returncode=0)` for a single call and `mock_subprocess.setup_multi(...)` for sequences.
 

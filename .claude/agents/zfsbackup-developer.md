@@ -112,8 +112,9 @@ ORM models into daemon code. Config objects outlive any session, and a detached 
    changes minimal and idiomatic to the surrounding code.
 3. **Run tests** — execute `pytest zfsbackup/` to validate that existing behavior is preserved and
    (if the plan mentions new config options or behaviors) that stubs or placeholders work. Validate
-   config with `python -m zfsbackup.daemon --test-config -c zfsbackup/config.example.yaml` and
-   test dry-run mode.
+   config by importing it (`python -m zfsbackup.config.store.importer zfsbackup/config.example.yaml
+   -c /tmp/zfsbackup/config.db`) and running `python -m zfsbackup.daemon --test-config -c
+   /tmp/zfsbackup/config.db`, then test dry-run mode. The daemon refuses a `.yaml` passed to `-c`.
 4. **Note test gaps** — if the plan requires new test coverage (especially for multiprocessing
    crashes, IPC failures, or integration scenarios), document what should be tested and hand off to
    `pytest-test-author`. Do not write test code yourself.

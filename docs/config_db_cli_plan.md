@@ -1,8 +1,33 @@
 # zfsbackup: SQLite Config Store + Config CLI + Live Reload
 
-**Status:** proposal, revised after user decisions on the four open questions
+**Status (2026-10-17):** Phase 0 and Phase 1 **implemented** on branch `config-db-cli` (items 1–8x,
+with item 9's tests landed alongside item 8); mocked suite green at 1071 passed. **Checkpoint A pending.**
+Phases 2 and 3 not started. Sections below still read as the original proposal except where an item
+carries a status note or "as landed" text — where those disagree with the proposal, the note wins.
 **Scope:** `zfsbackup/` only. No `libzfseasy/` changes.
 **Author:** zfsbackup-implementation-planner
+
+### Progress
+
+| Item | State | Notes |
+|---|---|---|
+| 1 Dependencies | done | `sqlalchemy`, `alembic`, `click`, `requests` declared |
+| 2 `Duration` | done | |
+| 2b `keep_for` collapse | done | |
+| 3b Per-destination retention | done | |
+| 3 Schema | done | `retention_rules` shape superseded during implementation — see `models.py` |
+| 4 Mapper | done | |
+| 3c Representable "unset" | done | Added after item 4 |
+| 7 Alembic | done | "As landed" text in item 7 |
+| 5 Engine/session, fork safety | done | |
+| 6a Path resolution, permissions | done | 6b (CLI wiring) folds into item 10 |
+| 8 DB canonical | done, **with carry-overs** | See item 8's status note |
+| 8x `StopFlag` | done | Found during item 8 |
+| 9 Phase 1 tests | landed with 8 | Coverage audit against item 9's list is part of Checkpoint A |
+| **Checkpoint A** | **pending** | |
+| 10–16 Config CLI | not started | `zfsbackup/cli/` does not exist |
+| 17–20 Live reload | not started | Item 17 text predates 8x — must be revised before implementation |
+| 21–23 Docs, scenarios, final review | not started | |
 
 > **All design questions are settled; no open decisions remain.** Items 2 (duration handling) and 5 (fork
 > safety) were the gating pair: **item 2 = full `Duration` value type** subclassing `timedelta`, with
@@ -909,6 +934,21 @@ Consequences:
 - **Verification:** `pytest tests/test_zfsbackup_store.py -k import`, then the full
   `pytest tests/test_zfsbackup_*.py`.
 
+- **Status: implemented** (`ecd7ecc`), with these deviations and carry-overs:
+  - The loader is `zfsbackup/runtime_config.py`'s `load_runtime_config()`, not `BackupConfig.from_db` —
+    a store-aware method on the model would make `config/model.py` import from `store`, inverting the
+    dependency. `daemon.py` and `workers.py` reach the store only through it.
+  - **The pre-import auto-export safety net was deferred to item 10** (`importer.py` docstring, D-5 /
+    8c). Until then `import` is destructive with no backup of the outgoing config.
+  - **Interim import tool:** `python -m zfsbackup.config.store.importer <yaml> -c <db>`. It is marked
+    for deletion by item 10.
+  - **The daemon's `.yaml` refusal names `zfsbackup-config import <path>`, a command that does not exist
+    until item 10.** Correct once Phase 2 lands; misleading until then.
+  - **`scenarios/test_two_vm_backup.sh` was not migrated.** It still installs YAML at
+    `/etc/zfsbackup/config.yaml` and starts the daemon with `-c` on it, which the daemon now refuses —
+    the two-VM harness is broken on this branch until it gains an import step. This row of the
+    migration table above is open; it is a Checkpoint A item for `real-zfs-scenario-dev`.
+
 ### Item 8x — A dying worker wedged the supervisor's stop path *(DONE; found during item 8, not part of it)*
 
 - **Owner:** `zfsbackup-developer` + `pytest-test-author` · **Tag:** `needs-approval` *(signals,
@@ -1687,4 +1727,5 @@ latency, and CLI auto-reload — are settled above as decisions 5, 6, and 7.
 - **Phase 3 in principle** — it is deliberately severable. Phases 1-2 deliver the two requested features in
   full; Phase 3 only removes the daemon restart.
 
-**Nothing has been implemented — this is a proposal.**
+**Phases 0–1 are implemented (see Progress at the top); Checkpoint A is the next sign-off. Phases 2–3
+remain a proposal.**
