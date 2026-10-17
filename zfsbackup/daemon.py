@@ -4,10 +4,13 @@
 import argparse
 import logging
 import multiprocessing
+import os
 import signal
 import sys
 import time
-from typing import Dict, Set
+from typing import Dict, List, Optional, Set
+
+from sqlalchemy.exc import OperationalError
 
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
@@ -39,7 +42,23 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+#: Base of the per-worker restart backoff: the delay before the n-th
+#: consecutive restart is `WORKER_RESTART_DELAY * 2**(n-1)`, capped at
+#: `WORKER_RESTART_MAX_DELAY`. See `BackupDaemon._record_worker_death`.
+#:
+#: The 300s cap is currently unreachable: with
+#: `WORKER_MAX_CONSECUTIVE_FAILURES = 6` the daemon gives up after the sixth
+#: death, so the largest delay ever applied is 5 * 2**4 = 80s. The cap is kept
+#: deliberately, as a guard should the failure limit ever be raised.
 WORKER_RESTART_DELAY = 5
+WORKER_RESTART_MAX_DELAY = 300
+#: A worker that stayed up at least this long (seconds) before dying is
+#: considered to have recovered: its consecutive-failure count restarts at 1.
+WORKER_STABLE_UPTIME = 600
+#: This many consecutive deaths of one worker (none of them after a
+#: `WORKER_STABLE_UPTIME` run) is treated like `EX_CONFIG`: the daemon stops
+#: and exits 1 instead of respawning forever.
+WORKER_MAX_CONSECUTIVE_FAILURES = 6
 SUPERVISOR_POLL = 5
 #: Longest slice `_supervisor_sleep` sleeps for before re-reading the stop
 #: flag. This bounds one thing only: how long the supervisor stays in its
@@ -48,17 +67,16 @@ SUPERVISOR_POLL = 5
 #: it. The real worst case is the sum of three terms:
 #:
 #:   1. this slice, 0.25s, if the signal lands in the idle sleep;
-#:   2. `WORKER_RESTART_DELAY`, 5s, if it lands in `_check_workers`'
-#:      deliberately un-sliced `time.sleep` (PEP 475 retries that sleep
-#:      with the time remaining -- a SIGTERM one second in still costs the
-#:      full 5s; see the comment there for why it stays un-sliced);
+#:   2. nothing from the restart path: `_check_workers` no longer sleeps.
+#:      A crashed worker's restart is a per-worker `restart_at` deadline
+#:      checked once per poll, so backoff can never delay a shutdown;
 #:   3. `_shutdown_workers`' escalation, up to `timeout` + 5s terminate-join
 #:      + 5s kill-join per worker that will not exit. The 30s budget is now
 #:      a single deadline shared by all workers rather than per-worker, so
 #:      four workers stuck in a long `zfs send` cost up to 30 + 4x10 = 70s
 #:      there, not 4x40 = 160s.
 #:
-#: So roughly 0.25 + 5 + 70 ~= 75s worst case, under systemd's default
+#: So roughly 0.25 + 70 ~= 70s worst case, under systemd's default
 #: `TimeoutStopSec=90s`. On the healthy path -- workers parked in
 #: `stop_event.wait()` -- the tail is one worker's `stopflag.STOP_POLL`
 #: slice, not this one; measured end-to-end shutdowns land at 0.265-0.554s.
@@ -96,6 +114,26 @@ class BackupDaemon:
         self._workers: Dict[str, multiprocessing.Process] = {}
         #: Workers that exited `EX_CONFIG` and will never be respawned.
         self._config_failed: Set[str] = set()
+        #: Subset of `_config_failed` that got there by crashing
+        #: `WORKER_MAX_CONSECUTIVE_FAILURES` times in a row rather than by
+        #: exiting `EX_CONFIG`. Only changes the wording of the log line.
+        self._crash_looped: Set[str] = set()
+        #: Per-worker restart bookkeeping, all on the `time.monotonic()`
+        #: clock and all touched only by the supervisor's main thread.
+        #: `_restart_at[name]` exists exactly while `name` is dead and
+        #: waiting out its backoff; `_started_at[name]` is when the current
+        #: incarnation was forked; `_failures[name]` counts consecutive
+        #: deaths (reset by a run of >= `WORKER_STABLE_UPTIME`).
+        self._restart_at: Dict[str, float] = {}
+        self._started_at: Dict[str, float] = {}
+        self._failures: Dict[str, int] = {}
+        #: Workers that survived SIGKILL and were left behind by
+        #: `_shutdown_workers`. `main()` hard-exits when this is non-empty:
+        #: multiprocessing's atexit handler would otherwise `join()` them
+        #: with no timeout.
+        self.abandoned_workers: List[str] = []
+        #: Set by `_sighup_handler` (one plain store), consumed by `run()`.
+        self._hup_requested = False
         #: Set by `_signal_handler` (one plain store), read and logged by
         #: `run()`. `None` means the flag was raised by `_check_workers`,
         #: not by a signal.
@@ -103,6 +141,20 @@ class BackupDaemon:
         self._stop_reported = False
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGHUP, self._sighup_handler)
+
+    def _sighup_handler(self, signum, frame):
+        """Record that SIGHUP arrived and return -- nothing else.
+
+        SIGHUP's default action terminates the process, which would orphan
+        every worker. Live reload does not exist yet (Phase 3), so this is a
+        stopgap: one plain store, read and logged by `run()`'s poll loop
+        ("live reload not implemented; restart to apply"). Same rules as
+        `_signal_handler`: no logging, no lock, and above all **no database
+        access** -- `db._ENGINES_LOCK` is a non-reentrant lock that the
+        interrupted main thread may already hold.
+        """
+        self._hup_requested = True
 
     def _signal_handler(self, signum, frame):
         """Record the request and return; `run()`'s poll loop acts on it.
@@ -193,15 +245,22 @@ class BackupDaemon:
         """The **single fork point** for every worker, at startup and at
         every crash restart alike.
 
-        `dispose_all()` first, always. By the time this runs, `main()` has
-        already read the config database, and SQLAlchemy 2.0's default
-        `QueuePool` *retains* the connection it used -- so without this the
-        child would inherit a live SQLite file descriptor on the config
-        database. An inherited descriptor corrupts SQLite silently rather
-        than raising; `store/db.py`'s pid-keyed engine cache is the real
-        guarantee (a child asking for an engine gets a fresh one), and
-        `dispose_all()` is what stops a child ever *holding* the inherited
-        fd in the first place.
+        `dispose_all()` first, always, and it is **mandatory**, not
+        belt-and-braces. By the time this runs, `main()` has already read
+        the config database, and SQLAlchemy 2.0's default `QueuePool`
+        *retains* the connection it used -- so without this the child would
+        inherit a live SQLite file descriptor on the config database. An
+        inherited descriptor corrupts SQLite silently rather than raising.
+        `store/db.py`'s pid-keyed engine cache alone is **not** a guarantee:
+        it hands a child a fresh engine, but the inherited connection is
+        merely unreferenced, not closed, until the garbage collector gets to
+        it. The child's *close* of an inherited fd is harmless (POSIX locks
+        are per-process, so it releases nothing the parent holds); the harm
+        is SQLite's per-process inode lock bookkeeping, which the child
+        inherits and which its own later connections then share with the
+        stale one, so they skip kernel locks the parent cannot see. Only
+        `dispose_all()` at the fork point, in the process that owns the
+        connections, closes them before the fork.
 
         This is a choke point on purpose. `_check_workers` re-forks on
         every worker crash, arbitrarily late in the daemon's life; an
@@ -215,26 +274,96 @@ class BackupDaemon:
         dispose_all()
         worker = self._new_worker(name)
         worker.start()
-        logger.info(f"{verb} {name} worker (pid={worker.pid})")
+        # Recorded straight after `start()`, before anything that can raise
+        # (the log line): an untracked live child would never be joined or
+        # terminated at shutdown.
         self._workers[name] = worker
+        self._started_at[name] = self._monotonic()
+        logger.info(f"{verb} {name} worker (pid={worker.pid})")
+        self._restart_at.pop(name, None)
         return worker
 
+    def _monotonic(self) -> float:
+        """The supervisor's clock for restart deadlines: a named seam so
+        tests can advance time without patching the process-global
+        `time.monotonic` (which `_supervisor_sleep` also reads)."""
+        return time.monotonic()
+
     def _start_workers(self) -> None:
-        for name in self._active_worker_names():
+        names = self._active_worker_names()
+        for i, name in enumerate(names):
+            # Re-checked before every fork, not once: a SIGTERM arriving
+            # between spawns would otherwise still fork the remaining
+            # workers, each doing `dispose_all()`, a schema check and a
+            # config load only to be stopped a moment later.
+            if self._stop_event.is_set():
+                logger.info(
+                    "Shutdown requested while starting workers; not starting: "
+                    f"{', '.join(names[i:])}"
+                )
+                return
             self._spawn(name)
+
+    def _record_worker_death(self, name: str, worker: multiprocessing.Process) -> bool:
+        """Account for one dead worker and schedule its restart.
+
+        Returns `True` if the worker has now died
+        `WORKER_MAX_CONSECUTIVE_FAILURES` times in a row, in which case no
+        restart is scheduled and the caller must treat it like `EX_CONFIG`.
+
+        Backoff is `WORKER_RESTART_DELAY * 2**(n-1)` seconds before the n-th
+        consecutive restart, capped at `WORKER_RESTART_MAX_DELAY`. A
+        worker that stayed up at least `WORKER_STABLE_UPTIME` before dying
+        has recovered, so its count restarts at 1 -- a worker that crashes
+        once a day should never accumulate towards the limit. The delay is a
+        `restart_at` deadline, not a sleep: `_check_workers` returns
+        immediately and re-checks the deadline on the next poll, so a
+        backoff can never hold up a shutdown.
+        """
+        now = self._monotonic()
+        uptime = now - self._started_at.get(name, now)
+        if uptime >= WORKER_STABLE_UPTIME:
+            self._failures[name] = 0
+        failures = self._failures.get(name, 0) + 1
+        self._failures[name] = failures
+
+        if failures >= WORKER_MAX_CONSECUTIVE_FAILURES:
+            logger.error(
+                f"{name} worker (pid={worker.pid}) exited with code "
+                f"{worker.exitcode} for the {failures}th consecutive time "
+                f"(it never stayed up {WORKER_STABLE_UPTIME}s); giving up "
+                "instead of restarting it forever."
+            )
+            return True
+
+        delay = min(WORKER_RESTART_DELAY * 2 ** (failures - 1), WORKER_RESTART_MAX_DELAY)
+        self._restart_at[name] = now + delay
+        logger.error(
+            f"{name} worker (pid={worker.pid}) exited with code "
+            f"{worker.exitcode} after {uptime:.0f}s (consecutive failure "
+            f"{failures}/{WORKER_MAX_CONSECUTIVE_FAILURES}), restarting in {delay}s"
+        )
+        return False
 
     def _check_workers(self) -> None:
         """Restart workers that died -- except on a configuration fault,
         which no restart can fix and which stops the whole daemon.
 
+        Never sleeps. A dead worker gets a `restart_at` deadline (see
+        `_record_worker_death`) and is forked again by whichever later poll
+        finds the deadline passed, so one call takes microseconds however
+        many workers are down, and the stop flag is honoured at the next
+        `_supervisor_sleep` slice.
+
         A worker that exits `EX_CONFIG` has already logged the operator
         message (`workers._load_config`, via the same
         `config_error_message` this supervisor would use). Respawning it
-        would re-open SQLite every `WORKER_RESTART_DELAY` seconds forever
-        and turn a stale schema into what looks like a hang. Every other
-        non-zero exit -- including a transient `database is locked` after
-        `busy_timeout` expired, which surfaces as an `OperationalError` and
-        never as a `SchemaError` -- stays restartable exactly as before.
+        would re-open SQLite on a loop and turn a stale schema into what
+        looks like a hang. Every other non-zero exit -- including a transient
+        `database is locked` after `busy_timeout` expired, which surfaces as
+        an `OperationalError` and never as a `SchemaError` -- is restarted
+        with backoff, and escalated to the same fatal treatment after
+        `WORKER_MAX_CONSECUTIVE_FAILURES` consecutive deaths.
 
         **One `EX_CONFIG` exit is fatal to the daemon, not just to that
         worker.** An earlier version required *every* worker to have failed
@@ -256,7 +385,14 @@ class BackupDaemon:
         # single pass would fork a replacement for an unrelated crash and
         # then immediately kill it -- one more pointless open of the config
         # database, at the exact moment the database is the problem.
-        dead = [(name, w) for name, w in self._workers.items() if not w.is_alive()]
+        #
+        # Workers already waiting out a backoff are skipped: they are still
+        # in `_workers` (so `_shutdown_workers` reaps them) but have been
+        # accounted for.
+        dead = [
+            (name, w) for name, w in self._workers.items()
+            if name not in self._restart_at and not w.is_alive()
+        ]
 
         for name, worker in dead:
             if worker.exitcode == EX_CONFIG:
@@ -267,48 +403,43 @@ class BackupDaemon:
                 )
                 self._config_failed.add(name)
                 del self._workers[name]
+            elif self._record_worker_death(name, worker):
+                self._config_failed.add(name)
+                self._crash_looped.add(name)
+                del self._workers[name]
 
         if not self._config_failed:
-            for i, (name, worker) in enumerate(dead):
-                # Re-check the stop flag on both sides of the delay.
-                # `time.sleep` does NOT abort when a signal handler runs:
-                # per PEP 475 it is retried with the remaining time and
-                # resumes once the handler returns. With three workers
-                # crashed in one pass -- a large concurrent import, say --
-                # this loop is 15s of sleep-then-fork, and a SIGTERM
-                # arriving one second in would otherwise still fork all
-                # three, each doing `dispose_all()`, a schema check and a
-                # config load before dying at the loop guard a moment
-                # later. Forking into a shutdown is never right, and
-                # forking to re-open the database is the worst version of
-                # it.
+            now = self._monotonic()
+            due = [n for n, at in sorted(self._restart_at.items(), key=lambda kv: kv[1]) if at <= now]
+            for i, name in enumerate(due):
+                # Forking into a shutdown is never right, and forking to
+                # re-open the database is the worst version of it.
                 if self._stop_event.is_set():
                     logger.info(
                         "Shutdown requested; not restarting remaining "
-                        f"worker(s): {', '.join(n for n, _ in dead[i:])}"
-                    )
-                    return
-                logger.error(
-                    f"{name} worker (pid={worker.pid}) exited with code "
-                    f"{worker.exitcode}, restarting in {WORKER_RESTART_DELAY}s"
-                )
-                time.sleep(WORKER_RESTART_DELAY)
-                if self._stop_event.is_set():
-                    logger.info(
-                        f"Shutdown requested during the restart delay; "
-                        f"not restarting {name} worker"
+                        f"worker(s): {', '.join(due[i:])}"
                     )
                     return
                 self._spawn(name, verb='Restarted')
 
         if self._config_failed:
-            logger.error(
-                "Configuration error in worker(s): "
-                f"{', '.join(sorted(self._config_failed))}. The daemon "
-                "cannot run degraded -- shutting down the remaining "
-                f"workers ({', '.join(sorted(self._workers)) or 'none'}) "
-                "and exiting non-zero. Fix the configuration and restart."
-            )
+            config_names = sorted(self._config_failed - self._crash_looped)
+            if config_names:
+                logger.error(
+                    "Configuration error in worker(s): "
+                    f"{', '.join(config_names)}. The daemon "
+                    "cannot run degraded -- shutting down the remaining "
+                    f"workers ({', '.join(sorted(self._workers)) or 'none'}) "
+                    "and exiting non-zero. Fix the configuration and restart."
+                )
+            if self._crash_looped:
+                logger.error(
+                    "Worker(s) crashed repeatedly and were not restarted: "
+                    f"{', '.join(sorted(self._crash_looped))}. The daemon "
+                    "cannot run degraded -- shutting down the remaining "
+                    f"workers ({', '.join(sorted(self._workers)) or 'none'}) "
+                    "and exiting non-zero. See the worker errors above."
+                )
             # 8i's promise -- that a configuration fault produces a visible,
             # non-zero exit instead of a spin -- now holds unconditionally
             # here: this is precisely the "workers have died" case `StopFlag`
@@ -368,6 +499,7 @@ class BackupDaemon:
                     f"{name} worker (pid={worker.pid}) survived SIGKILL "
                     "(uninterruptible sleep?); abandoning it"
                 )
+                self.abandoned_workers.append(name)
 
     def _supervisor_sleep(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning as soon as the stop flag is set.
@@ -389,9 +521,8 @@ class BackupDaemon:
         would now see an *unbounded* number of calls per iteration instead
         of one -- a patched `time.sleep` does not sleep, so the loop below
         is bounded only by real `time.monotonic()` and spins a CPU for the
-        whole five seconds -- and `time.sleep(WORKER_RESTART_DELAY)` in
-        `_check_workers` is deliberately left raw so that the bare patches
-        of it keep counting what they mean to count.
+        whole five seconds. (`_check_workers` no longer sleeps at all; its
+        restart backoff is a deadline on `_monotonic()`.)
 
         Why this and not `self._stop_event.wait(seconds)`, which it
         otherwise duplicates: only the return value and the slice size
@@ -448,31 +579,49 @@ class BackupDaemon:
         # below stays the single exit: `_shutdown_workers` over an empty
         # `_workers` is a no-op, and the log ends with "Daemon stopped"
         # either way.
-        if self._stop_event.is_set():
-            # Idempotent, and called here too only so the "Received SIGTERM"
-            # line precedes its consequence in the log.
+        #
+        # The whole of it sits in a try/finally: an exception escaping the
+        # poll loop (`worker.start()` failing with EAGAIN under a tight
+        # TasksMax, say) used to skip `_shutdown_workers` entirely, and
+        # multiprocessing's exit handler then SIGTERMed workers with the
+        # default disposition mid-`zfs send`. The `finally` raises the stop
+        # flag first, so workers can reach a safe point on their own, then
+        # runs the usual escalating join; the exception still propagates to
+        # `_run`, which logs it and exits 1.
+        try:
+            if self._stop_event.is_set():
+                # Idempotent, and called here too only so the "Received SIGTERM"
+                # line precedes its consequence in the log.
+                self._report_stop_signal()
+                logger.info("Shutdown requested during startup; no workers started")
+            else:
+                logger.info("=" * 60)
+                logger.info("Starting workers...")
+                logger.info("=" * 60)
+
+                self._start_workers()
+
+                while not self._stop_event.is_set():
+                    self._supervisor_sleep(SUPERVISOR_POLL)
+                    self._report_hup()
+                    if not self._stop_event.is_set():
+                        self._check_workers()
+        finally:
+            self._stop_event.set()
+            # The line `_signal_handler` deliberately does not log itself. Here
+            # it is an ordinary call on the main thread, not a handler, so
+            # blocking on a journald socket is merely slow instead of fatal.
             self._report_stop_signal()
-            logger.info("Shutdown requested during startup; no workers started")
-        else:
-            logger.info("=" * 60)
-            logger.info("Starting workers...")
-            logger.info("=" * 60)
-
-            self._start_workers()
-
-            while not self._stop_event.is_set():
-                self._supervisor_sleep(SUPERVISOR_POLL)
-                if not self._stop_event.is_set():
-                    self._check_workers()
-
-        # The line `_signal_handler` deliberately does not log itself. Here
-        # it is an ordinary call on the main thread, not a handler, so
-        # blocking on a journald socket is merely slow instead of fatal.
-        self._report_stop_signal()
-        logger.info("Shutting down workers...")
-        self._shutdown_workers()
+            logger.info("Shutting down workers...")
+            self._shutdown_workers()
         logger.info("Daemon stopped")
         return 1 if self._config_failed else 0
+
+    def _report_hup(self) -> None:
+        """Log the SIGHUP stopgap message `_sighup_handler` must not log itself."""
+        if self._hup_requested:
+            self._hup_requested = False
+            logger.warning("Received SIGHUP: live reload not implemented; restart to apply")
 
 
 def main():
@@ -525,8 +674,9 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
         logger.setLevel(logging.DEBUG)
 
+    abandoned: List[str] = []
     try:
-        return _run(args)
+        code = _run(args, abandoned)
     finally:
         # Every return path -- `--test-config`, a config refusal, a
         # supervisor crash, a clean shutdown -- drops this process's
@@ -549,8 +699,34 @@ def main():
         # point, now applied at every process exit.
         dispose_all()
 
+    if abandoned:
+        # A worker survived SIGKILL (uninterruptible kernel sleep, typically
+        # a hung `zfs` call). Returning normally would hand control to
+        # multiprocessing's atexit handler, which `join()`s every child with
+        # NO timeout and so hangs until systemd's `TimeoutStopSec` SIGKILLs
+        # the cgroup. The orderly shutdown has already happened, so leave
+        # right now -- after `dispose_all()` above, and after flushing the
+        # logs that `os._exit` would otherwise discard.
+        _hard_exit(code, abandoned)
+    return code
 
-def _run(args: argparse.Namespace) -> int:
+
+def _hard_exit(code: int, abandoned: List[str]) -> None:  # pragma: no cover - exits
+    """Flush logging and leave without running atexit handlers."""
+    logger.error(
+        f"Exiting without waiting for abandoned worker(s): {', '.join(abandoned)}"
+    )
+    logging.shutdown()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    # Workers were abandoned, so this was not a clean stop: never report 0.
+    os._exit(code or 1)
+
+
+def _run(args: argparse.Namespace, abandoned: Optional[List[str]] = None) -> int:
     """`main()`'s body, minus argument parsing and the `dispose_all()` that
     must run on every return path. Split out so that cleanup is a single
     `finally` rather than something each `return` has to remember.
@@ -607,15 +783,29 @@ def _run(args: argparse.Namespace) -> int:
         # `diagnose_open_failure` and names the actual problem. It also
         # makes the supervisor's diagnosis word-for-word identical to the
         # child's, which `workers._load_config` already produced this way.
-        logger.error(config_error_message(resolved, e))
+        # `exc_info` for everything that is not an OperationalError (already
+        # diagnosed, with its cause, by `config_error_message`): a bare
+        # `KeyError` or `ValueError` from the mapper is otherwise
+        # undiagnosable from the log.
+        logger.error(
+            config_error_message(resolved, e),
+            exc_info=not isinstance(e, OperationalError),
+        )
         return 1
 
+    daemon = None
     try:
         daemon = BackupDaemon(config, resolved, verbose=args.verbose)
         return daemon.run()
     except Exception as e:
         logger.error(f"Daemon failed: {e}", exc_info=True)
         return 1
+    finally:
+        # Reported on every path out, including a crashed `run()`: its
+        # `finally` has already run `_shutdown_workers`, which is what
+        # records the abandoned ones.
+        if abandoned is not None and daemon is not None:
+            abandoned.extend(daemon.abandoned_workers)
 
 
 if __name__ == '__main__':  # pragma: no cover

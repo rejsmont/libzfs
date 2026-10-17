@@ -65,8 +65,10 @@ that now owns it.
 from __future__ import annotations
 
 import logging
+import os
+from datetime import timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -84,16 +86,6 @@ from zfsbackup.config import (
 from zfsbackup.config.store import models
 
 logger = logging.getLogger(__name__)
-
-
-# Dataset-level default applied when a dataset has zero dataset-level
-# retention rows -- mirrors `DatasetConfig.from_dict`'s default
-# (`config/model.py:552-572`), which means a `BackupConfig` produced by
-# `from_file` can never have an empty dataset-level retention set. Built as
-# `Duration` literals (not bare `timedelta`s) so the literal matches
-# `from_file`'s exactly ("1d"/"30d", not a re-synthesized equivalent).
-_DEFAULT_RETENTION_AGE = Duration("1d")
-_DEFAULT_RETENTION_KEEP_FOR = Duration("30d")
 
 
 def _duration_from_row(seconds: float, literal: Optional[str], key: str) -> Duration:
@@ -161,14 +153,23 @@ def _dataset_level_rules(ds: models.Dataset) -> List[RetentionRule]:
     optional -- omitting it silently promotes per-destination overrides
     into local pruning, with no error and no log.
 
-    Zero dataset-level rows is ambiguous in principle (a config a user
-    actually wants with no local retention at all is not representable
-    here) but `from_dict` can never produce it -- an absent or empty
-    `retention:` mapping defaults to `{'1d': '30d'}` before it ever reaches
-    a `RetentionRule`. Mirror that default here too (rather than raising or
-    passing an empty list through), logging a WARNING naming the dataset so
-    a zero-row dataset (e.g. one written directly against the DB, bypassing
-    `save_config`) is visible rather than silently defaulted.
+    Zero dataset-level rows means **never prune** and loads back as `[]`
+    (plus a WARNING naming the dataset). That is what an in-memory
+    `DatasetConfig.retention_rules == []` means to the pruner
+    (`DatasetManager.needs_prunning`), what `retention: forever` in YAML
+    produces, and what `validate_config` accepts -- so the load path must
+    not turn it into something else. It used to substitute the `from_dict`
+    default (1d -> 30d) here, which silently converted "keep everything"
+    into "destroy everything older than 30 days" on the first reload after
+    a round trip. The default belongs to the YAML boundary
+    (`DatasetConfig.from_dict`), which maps an absent/`null`/`{}`
+    `retention:` key to 1d -> 30d *before* a rule exists; by the time a
+    `DatasetConfig` is being saved, `[]` is a deliberate value.
+
+    The WARNING is not noise: zero rows is also what a dataset written
+    directly against the DB (bypassing `save_config`) looks like, and
+    "this dataset is never pruned" is an adverse behaviour that should be
+    visible in the log of whichever process loads it.
     """
     rules = [
         _rule_to_dataclass(r) for r in ds.retention_rules if r.dataset_remote_id is None
@@ -176,11 +177,10 @@ def _dataset_level_rules(ds: models.Dataset) -> List[RetentionRule]:
     rules.sort(key=lambda r: r.age)
     if not rules:
         logger.warning(
-            "dataset %r (id=%s) has zero dataset-level retention rules; "
-            "applying the default 1d -> 30d tier",
+            "dataset %r (id=%s) has no dataset-level retention rules; its "
+            "snapshots will never be pruned",
             ds.name, ds.id,
         )
-        return [RetentionRule(age=_DEFAULT_RETENTION_AGE, keep_for=_DEFAULT_RETENTION_KEEP_FOR)]
     return rules
 
 
@@ -193,9 +193,10 @@ def _scoped_rules(remote: models.DatasetRemote) -> List[RetentionRule]:
     `Dataset.retention_rules` there is no promotion trap here. Zero rows
     means "inherit the dataset-level set" (`config/model.py:414-416`,
     `effective_retention_rules`) and is returned as `[]` UNCHANGED -- this
-    is deliberately the opposite of `_dataset_level_rules`' empty-set
-    handling; see that function's docstring for why the asymmetry is
-    correct and must not be unified.
+    is NOT the same meaning as `_dataset_level_rules`' empty set (there, `[]`
+    is "never prune"; here it is "inherit the dataset-level set"), even
+    though both load as `[]`. The two scopes must not be unified: the
+    meaning belongs to where the list sits, not to the list.
     """
     rules = [_rule_to_dataclass(r) for r in remote.retention_rules]
     rules.sort(key=lambda r: r.age)
@@ -352,15 +353,15 @@ def load_config(session: Session) -> BackupConfig:
 
     | `from_file` default/behaviour | Who owns it on the DB path |
     |---|---|
-    | `snapshot_prefix="autosnap"` | Schema `default=` |
+    | `snapshot_prefix="autosnap"` | Writer (`NOT NULL`, no schema default); this function reads |
     | `check_interval="5m"` | Writer (`NOT NULL`); this function reads |
     | `prune_interval` <- `check_interval` | NOT reimplemented; NULL row yields `None` |
-    | `api_host`/`api_port`/`dry_run` | Schema `default=` |
+    | `api_host`/`api_port`/`dry_run` | Writer (`NOT NULL`, no schema default); this function reads |
     | `destinations={}` | Emergent -- empty table yields `{}` |
     | `remote_backup=None` | This function -- absent `RemoteServer` row |
     | `client_id_file` default | NOT reimplemented; NULL row yields `None` |
     | "No datasets configured" | This function |
-    | retention `{'1d': '30d'}` default | `_dataset_level_rules` |
+    | retention `{'1d': '30d'}` default | NOT reimplemented -- YAML boundary only; zero rows load as `[]` (never prune) + WARNING, `_dataset_level_rules` |
     | retention sorted by age | `_dataset_level_rules`/`_scoped_rules` |
     | undeclared destination rejected | `_dataset_to_dataclass` (belt to the FK) |
 
@@ -374,7 +375,10 @@ def load_config(session: Session) -> BackupConfig:
     (`config/model.py`) are deliberately NOT called here: the former has zero
     production callers on the load path today (`config/model.py:573-577`), and
     the latter is a pruning-time function, not a load-path one -- see this
-    module's `save_config` for where uniqueness validation belongs instead.
+    module's `validate_config` for where uniqueness validation belongs
+    instead. `validate_config` is likewise not run on load: a load must
+    reflect what is stored (a hand-edited row is the operator's to see in the
+    logs, not something to refuse to start over).
     """
     gs = session.get(models.GlobalSettings, 1)
     if gs is None:
@@ -383,7 +387,14 @@ def load_config(session: Session) -> BackupConfig:
             "found; run 'zfsbackup-config import' to populate it"
         )
 
-    destination_rows = session.scalars(select(models.Destination)).all()
+    # Ordered: `BackupConfig.destinations` is a dict, so insertion order is
+    # what a renderer (`zfsbackup-config show`/`export`, `$EDITOR`) emits.
+    # An unordered SELECT is free to return rowid order, index order, or
+    # whatever the planner picks -- and "no changes" detection compares
+    # post-normalisation renders, so the order must be deterministic.
+    destination_rows = session.scalars(
+        select(models.Destination).order_by(models.Destination.name)
+    ).all()
     # ALL declared destinations, not just ones referenced by a dataset --
     # `BackupConfig.destinations` is every declared destination
     # (`config/model.py:705-713`), so an unreferenced one must still round-trip.
@@ -441,30 +452,305 @@ def load_config(session: Session) -> BackupConfig:
     )
 
 
-def _assert_positive_duration_rule(rule: RetentionRule, key: str) -> None:
-    """Reject a non-positive `age`/`keep_for` before it reaches the DB.
+_MAX_PORT = 65535
+
+
+def _describe(value: object) -> str:
+    return f"{type(value).__name__} {value!r}"
+
+
+def _require_bool(value: object, key: str) -> None:
+    """Reject anything that is not exactly `bool`.
+
+    `type(value) is bool`, not `isinstance`: `bool` is a subclass of `int`,
+    but the reverse matters here -- an `int` 0/1, a `None`, or a YAML string
+    like `"false"` (truthy!) is the shape of the bugs this guards. The ORM
+    would coerce `1`/`0` silently and raise a bare `StatementError` for a
+    string, mid-insert, after the wipe.
+    """
+    if type(value) is not bool:
+        raise ValueError(f"{key} must be a boolean, got {_describe(value)}")
+
+
+def _require_str(value: object, key: str) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string, got {_describe(value)}")
+
+
+def _require_positive_duration(value: object, key: str, what: str = "") -> float:
+    """Reject a non-`timedelta`, or a non-positive one; return its seconds.
 
     Mirrors `config/model.py`'s `_positive_duration_from_config` (age 0 is a
     division-by-zero in the slot-based retention algorithm,
-    `DatasetManager.needs_prunning`; either duration <= 0 has no meaningful
-    retention semantics) -- but that guard runs only on the YAML-boundary
-    path, `DatasetConfig.from_dict`. A `BackupConfig` built directly
-    (bypassing `from_dict`, as a hand-built config or the item 8 CLI
-    importer might) never passes through it, so without this check the
-    DB's `CHECK(age_seconds > 0)`/`CHECK(keep_for_seconds > 0)` constraints
-    (`models.py`) are the only thing that would catch it -- as a bare
-    `CHECK constraint failed` raised mid-insert, with the wipe already
-    flushed.
+    `DatasetManager.needs_prunning`; an interval <= 0 makes
+    `StopFlag.wait(<=0)` return immediately, a worker hot loop shelling out
+    to `zfs list` per dataset) -- but that guard runs only on the
+    YAML-boundary path. A `BackupConfig` built directly (the Phase 2 CLI, a
+    test) never passes through it, so without this the DB's `CHECK (... > 0)`
+    constraints would be the only thing that catches it, as a bare `CHECK
+    constraint failed` raised mid-insert with the wipe already flushed.
     """
-    if rule.age.total_seconds() <= 0:
-        raise ValueError(
-            f"{key}: age must be positive, got {rule.age.total_seconds():.0f}s"
+    if not isinstance(value, timedelta):
+        raise ValueError(f"{key} must be a duration, got {_describe(value)}")
+    seconds = value.total_seconds()
+    if seconds <= 0:
+        raise ValueError(f"{key}: {what or 'duration'} must be positive, got {seconds:.0f}s")
+    return seconds
+
+
+def _literal(d: timedelta) -> str:
+    literal = getattr(d, "literal", None)
+    return literal if literal is not None else str(d)
+
+
+def _validate_rules(
+    rules: List[RetentionRule], key: str, warnings: List[str]
+) -> None:
+    """Validate one scope's rule list (dataset-level or one destination's).
+
+    Raises on a non-positive/mistyped duration or an age/keep_for collision
+    (`validate_retention_uniqueness`); appends a warning for each exact
+    duplicate, which `save_config` is about to drop (see
+    `_dedupe_exact_duplicates` for why the DB cannot store them).
+    """
+    for rule in rules:
+        _require_positive_duration(rule.age, f"{key}", "age")
+        _require_positive_duration(rule.keep_for, f"{key}", "keep_for")
+    validate_retention_uniqueness(rules, key)
+
+    seen: Dict[Tuple[float, float], RetentionRule] = {}
+    for rule in rules:
+        sig = (rule.age.total_seconds(), rule.keep_for.total_seconds())
+        first = seen.get(sig)
+        if first is None:
+            seen[sig] = rule
+            continue
+        warnings.append(
+            f"{key}: rules {_literal(first.age)}:{_literal(first.keep_for)} "
+            f"and {_literal(rule.age)}:{_literal(rule.keep_for)} are the same "
+            f"rule ({sig[0]:.0f}s -> {sig[1]:.0f}s); keeping "
+            f"{_literal(first.age)}:{_literal(first.keep_for)} and dropping "
+            "the duplicate"
         )
-    if rule.keep_for.total_seconds() <= 0:
+
+
+def validate_config(config: BackupConfig) -> List[str]:
+    """Check that `config` is storable and means what it says; pure.
+
+    Session-free and side-effect-free: no DB, no filesystem, and in
+    particular it never evaluates `BackupConfig.effective_client_id_file`
+    (which reads `$HOME`) or `effective_prune_interval`. Returns a list of
+    human-readable WARNINGS (adverse-but-accepted behaviour -- see below);
+    raises `ValueError` naming the offending key for anything that cannot
+    or must not be stored. Callers decide what to do with the warnings
+    (`save_config` does not; the importer logs them before it touches the
+    target and the Phase 2 CLI prints them).
+
+    This is the write-side twin of the YAML-boundary guards in
+    `config/model.py` (`DatasetConfig.from_dict` / `BackupConfig.from_file`),
+    and it must stay a *separate* check: a `BackupConfig` built in code
+    never passes through those guards, and the schema's own constraints can
+    only fail mid-insert, after `save_config`'s wipe -- which is why every
+    check here runs before the first DELETE. None of it is FK-related, so
+    `PRAGMA foreign_keys=ON` makes none of it redundant.
+
+    Raises (`ValueError`):
+
+    - no datasets; duplicate dataset names (`datasets.name UNIQUE`);
+    - wrong types: a bool field that is not exactly `bool`, a string field
+      that is not a `str`, `api_port` not an `int` (`bool` excluded) in
+      0..65535, a duration that is not a `timedelta`. A `None` here used to
+      be silently replaced by an ORM default at INSERT time -- `enabled:
+      null` (disabled under YAML) was stored as enabled, and
+      `remote_backup.enabled: null` switched the unauthenticated receive
+      path ON. `snapshot_prefix: None` is rejected rather than defaulted
+      (the runtime never worked with it: `None_*` snapshots); the message
+      tells an operator whose snapshots really are named `None_*` to set
+      `"None"` explicitly;
+    - `check_interval`, `prune_interval` (when set), dataset `frequency`
+      and destination `frequency` (when set) <= 0 (hot loop; mirrored by
+      CHECK constraints in the schema);
+    - a destination with an empty `url`; a `remote_backup` with an empty
+      `target_dataset`; a dataset `remote` entry naming an undeclared
+      destination or naming the same destination twice
+      (`dataset_remotes`' composite unique constraint; `from_dict` rejects
+      the same thing at the YAML boundary, so this is the backstop for
+      configs built in code);
+    - a `client_id_file` whose path is `"."` (`Path("")`, `Path(".")`, `"."`:
+      a directory, never a file);
+    - any retention rule with a non-positive `age`/`keep_for`, and any
+      `validate_retention_uniqueness` collision, per scope.
+
+    Warns (returned, not raised):
+
+    - a dataset with no dataset-level retention rules: `[]` means NEVER
+      PRUNE (`retention: forever`);
+    - a `snapshot_prefix` containing `_` (snapshot names are parsed by
+      splitting on `_`, so nothing under such a prefix is ever managed or
+      pruned -- a pre-existing parser limitation);
+    - `api_port` 0 (the OS picks an ephemeral port nothing can be told);
+    - an in-code `client_id_file` of `""`, which YAML treats as unset:
+      `save_config` stores NULL (derive from `$HOME`) instead of a value
+      that would reload as `Path(".")`;
+    - exact `(age, keep_for)` duplicates within a scope, naming both
+      literals -- `save_config` drops the later one because the DB's
+      unique indexes cannot hold them.
+    """
+    warnings: List[str] = []
+
+    if not config.datasets:
+        raise ValueError("No datasets configured")
+
+    # Mirrors `from_file`'s duplicate-dataset-name check, which exists there
+    # for exactly this store's `datasets.name UNIQUE` constraint -- without
+    # it here too, a `BackupConfig` built directly hits a bare
+    # `IntegrityError` after the wipe.
+    seen_dataset_names: Dict[str, int] = {}
+    for idx, ds in enumerate(config.datasets):
+        _require_str(ds.name, f"datasets[{idx}].name")
+        if not ds.name:
+            raise ValueError(f"datasets[{idx}]: Dataset 'name' is required")
+        if ds.name in seen_dataset_names:
+            raise ValueError(
+                f"datasets[{idx}]: duplicate dataset name {ds.name!r} "
+                f"(already used by datasets[{seen_dataset_names[ds.name]}])"
+            )
+        seen_dataset_names[ds.name] = idx
+
+    # --- global settings ---
+    if config.snapshot_prefix is None:
         raise ValueError(
-            f"{key}: keep_for must be positive, got "
-            f"{rule.keep_for.total_seconds():.0f}s"
+            "snapshot_prefix must be a string, got NoneType None. (The "
+            "runtime never worked with a null prefix: it named snapshots "
+            "'None_<timestamp>' and never pruned them. If your existing "
+            "snapshots really are named 'None_*', set snapshot_prefix to the "
+            "string \"None\" explicitly.)"
         )
+    _require_str(config.snapshot_prefix, "snapshot_prefix")
+    if "_" in config.snapshot_prefix:
+        warnings.append(
+            f"snapshot_prefix {config.snapshot_prefix!r} contains '_': "
+            "snapshot names are parsed by splitting on '_', so no snapshot "
+            "with this prefix will ever be managed or pruned"
+        )
+
+    _require_positive_duration(config.check_interval, "check_interval", "interval")
+    if config.prune_interval is not None:
+        _require_positive_duration(config.prune_interval, "prune_interval", "interval")
+
+    _require_str(config.api_host, "api_host")
+    # `bool` is an `int` subclass: `api_port: true` would otherwise pass as 1.
+    if not isinstance(config.api_port, int) or isinstance(config.api_port, bool):
+        raise ValueError(f"api_port must be an integer, got {_describe(config.api_port)}")
+    if not 0 <= config.api_port <= _MAX_PORT:
+        raise ValueError(
+            f"api_port must be between 0 and {_MAX_PORT}, got {config.api_port}"
+        )
+    if config.api_port == 0:
+        warnings.append(
+            "api_port 0 asks the OS for an ephemeral port that nothing is told about"
+        )
+    _require_bool(config.dry_run, "dry_run")
+    # Type only. NEVER evaluate `effective_client_id_file` here (reads $HOME).
+    if config.client_id_file is not None and not isinstance(
+        config.client_id_file, (str, os.PathLike)
+    ):
+        raise ValueError(
+            f"client_id_file must be a path, got {_describe(config.client_id_file)}"
+        )
+    if config.client_id_file is not None:
+        # `os.fspath`, not `str`, so `Path("")` (which IS `Path(".")`) is
+        # seen as the "." it really is. Pure string handling: no I/O.
+        raw_client_id_file = os.fspath(config.client_id_file)
+        if raw_client_id_file == ".":
+            # `Path("")`, `Path(".")` and "." all name the current
+            # directory, never a file: a client-id file there could not be
+            # read or written, so this never worked -- and YAML
+            # `client_id_file: "."` is refused here at import phase 0.
+            raise ValueError(
+                "client_id_file '.' names a directory, not a file; "
+                "omit it (or set it to \"\") to derive the default from $HOME"
+            )
+        if raw_client_id_file == "":
+            # YAML treats "" as unset (`from_file`: `Path(cid) if cid else
+            # None`). An in-code "" used to be stored verbatim and reload as
+            # `Path(".")` -- a different, unusable value. `save_config`
+            # stores NULL for it.
+            warnings.append(
+                'client_id_file "" means derive from $HOME; stored unset'
+            )
+
+    # Mirrors `from_file`'s per-destination url requirement
+    # (`"Destination '{name}' requires 'url'"`). `destinations.url` is NOT NULL
+    # but not CHECK'd non-empty, so an empty-string url would insert silently
+    # and produce a destination nothing can ever connect to. `not dest.url`
+    # rejects `None` and `""` the same way `from_file` does.
+    for name, dest in config.destinations.items():
+        _require_str(name, f"destinations key {name!r}")
+        if not dest.url:
+            raise ValueError(f"Destination {name!r} requires 'url'")
+        _require_str(dest.url, f"destinations[{name}].url")
+
+    # Mirrors `from_file`'s `remote_backup.target_dataset` requirement, same
+    # reasoning as `url` above.
+    if config.remote_backup is not None:
+        if not config.remote_backup.target_dataset:
+            raise ValueError("remote_backup requires 'target_dataset'")
+        _require_str(config.remote_backup.target_dataset, "remote_backup.target_dataset")
+        # Exactly bool: an enabled flag that is `None` is DISABLED under YAML.
+        _require_bool(config.remote_backup.enabled, "remote_backup.enabled")
+
+    # --- datasets ---
+    for ds in config.datasets:
+        key = f"datasets[{ds.name}]"
+        _require_bool(ds.recursive, f"{key}.recursive")
+        _require_bool(ds.enabled, f"{key}.enabled")
+        _require_positive_duration(ds.frequency, f"{key}.frequency", "frequency")
+
+        if not ds.retention_rules:
+            warnings.append(
+                f"{key}.retention is empty: this dataset's snapshots will "
+                "never be pruned"
+            )
+        _validate_rules(ds.retention_rules, f"{key}.retention", warnings)
+
+        # `DatasetConfig.from_dict` now rejects two `remote` entries naming
+        # the same destination (including exact duplicates) at the YAML
+        # boundary, with this same wording, so this check is the BACKSTOP
+        # for configs built in code, `from_property` and the like. Without
+        # it a duplicate would fail only at insert, as a bare
+        # `IntegrityError`, against `dataset_remotes`'s
+        # `(dataset_id, destination_name)` unique constraint.
+        seen_destinations: Dict[str, int] = {}
+        for idx, remote in enumerate(ds.remote):
+            _require_str(remote.destination, f"{key}.remote[{idx}].destination")
+            if remote.destination not in config.destinations:
+                raise ValueError(
+                    f"{key}.remote[{remote.destination}] "
+                    f"references destination '{remote.destination}', which "
+                    "is not declared in 'destinations'"
+                )
+            if remote.destination in seen_destinations:
+                raise ValueError(
+                    f"{key}.remote[{idx}]: duplicate "
+                    f"destination {remote.destination!r} (already used by "
+                    f"{key}.remote"
+                    f"[{seen_destinations[remote.destination]}])"
+                )
+            seen_destinations[remote.destination] = idx
+            if remote.frequency is not None:
+                _require_positive_duration(
+                    remote.frequency,
+                    f"{key}.remote[{remote.destination}].frequency",
+                    "frequency",
+                )
+            _validate_rules(
+                remote.retention_rules,
+                f"{key}.remote[{remote.destination}].retention",
+                warnings,
+            )
+
+    return warnings
 
 
 def _dedupe_exact_duplicates(rules: List[RetentionRule]) -> List[RetentionRule]:
@@ -507,41 +793,19 @@ def save_config(session: Session, config: BackupConfig) -> None:
     Steps, in order (see `models.py` for why the delete order and flush
     points are load-bearing, not stylistic):
 
-    1. Validate, all of it BEFORE any DELETE runs, so a bad input never
-       wipes a good DB: `config.datasets` must be non-empty
-       (`config/model.py:667-671`'s "No datasets configured", mirrored here so
-       the store and the YAML loader agree on what a valid config is);
-       dataset names must be unique (`config/model.py:677-688`'s check, which
-       exists in `from_file` specifically because the store's
-       `datasets.name UNIQUE` constraint is stricter than `from_dict`);
-       every declared destination must have a non-empty `url`
-       (`config/model.py:710-712`'s check -- `destinations.url` is `NOT NULL`
-       but not `CHECK`'d non-empty, so a `None` OR `""` url would
-       otherwise reach the DB, the former as a bare `NOT NULL constraint
-       failed`, the latter inserting silently); `config.remote_backup`, if
-       present, must have a non-empty `target_dataset`
-       (`config/model.py:735-737`'s check, same reasoning as `url` above); within
-       each dataset, destinations referenced by `remote` entries must be
-       unique per dataset (`dataset_remotes`'s composite unique constraint,
-       `models.py`, is stricter than `from_dict` -- see `config/model.py:624-626`,
-       which never checked this) and each must be a key of
-       `config.destinations`; and every retention rule's `age`/
-       `keep_for`, dataset-level and per-destination, must be positive
-       (`_assert_positive_duration_rule`, mirroring
-       `config/model.py`'s `_positive_duration_from_config`) plus
-       `validate_retention_uniqueness` per scope. Skipping any of these
-       does not fail loudly -- it fails as a bare `IntegrityError`/`CHECK
-       constraint failed` raised mid-insert, well after the wipe.
-
-       **None of step 1 is FK-related**, so item 5's `store/db.py` (which
-       enables `PRAGMA foreign_keys=ON` on every connection it creates)
-       makes none of it redundant: these checks run *before* any DELETE,
-       against in-memory dataclasses, precisely so a rejected config never
-       reaches the point where a constraint -- FK or otherwise -- could fire
-       at all. The whole value is in failing before the wipe, which no
-       DB-side constraint can do.
+    1. `validate_config(config)`, BEFORE any DELETE runs, so a bad input
+       never wipes a good DB -- the full list of what it rejects (and why
+       each check exists, and why none of it is made redundant by
+       `PRAGMA foreign_keys=ON`) is in its docstring. Its warnings are
+       deliberately NOT logged here: `save_config` has no way to show them
+       to an operator, and the callers that do (the importer's phase 0, the
+       CLI's write path) validate earlier -- before they open a write
+       transaction -- and report them themselves. Calling `save_config`
+       directly therefore skips the never-prune and duplicate-rule
+       warnings; call `validate_config` yourself to get them.
     2. Drop exact `(age, keep_for)` duplicates per scope (see
-       `_dedupe_exact_duplicates`) -- the DB rejects what step 1 permits.
+       `_dedupe_exact_duplicates`) -- the DB rejects what step 1 permits
+       (and `validate_config` has already warned, naming both literals).
     3. Read the current `GlobalSettings.generation` (default -1 if the
        table is empty/absent) so the fresh row below is `previous + 1`, not
        reset to 0 -- items 15/17 depend on `generation` as a
@@ -590,86 +854,7 @@ def save_config(session: Session, config: BackupConfig) -> None:
     read) instead of raising `AttributeError`.
     """
     # --- 1. Validate, before any DELETE runs. ---
-    # Mirrors `BackupConfig.from_file`'s "No datasets configured"
-    # (`config/model.py:667-671`) -- see this function's docstring on why the
-    # empty-retention half of this asymmetry is deliberately NOT mirrored
-    # here (that half is the CLI's job, decision 2 / boundary item B2).
-    if not config.datasets:
-        raise ValueError("No datasets configured")
-
-    # Mirrors `from_file`'s duplicate-dataset-name check
-    # (`config/model.py:677-688`), which exists there for exactly this store's
-    # `datasets.name UNIQUE` constraint -- without it here too, a
-    # `BackupConfig` built directly (bypassing `from_dict`, e.g. by a
-    # future CLI importer) hits a bare `IntegrityError` after the wipe.
-    seen_dataset_names: Dict[str, int] = {}
-    for idx, ds in enumerate(config.datasets):
-        if ds.name in seen_dataset_names:
-            raise ValueError(
-                f"datasets[{idx}]: duplicate dataset name {ds.name!r} "
-                f"(already used by datasets[{seen_dataset_names[ds.name]}])"
-            )
-        seen_dataset_names[ds.name] = idx
-
-    # Mirrors `from_file`'s per-destination url requirement
-    # (`config/model.py:710-712`, `"Destination '{name}' requires 'url'"`).
-    # `destinations.url` (`models.py`) is `NOT NULL` but not `CHECK`'d
-    # non-empty, so without this check a `None` url reaches the DB as a
-    # bare `NOT NULL constraint failed` mid-insert (after the wipe), and an
-    # empty-string url -- which the NOT NULL column happily accepts --
-    # inserts silently and produces a destination nothing can ever connect
-    # to. `not dest.url` rejects both the same way `from_file` does.
-    for name, dest in config.destinations.items():
-        if not dest.url:
-            raise ValueError(f"Destination {name!r} requires 'url'")
-
-    # Mirrors `from_file`'s `remote_backup.target_dataset` requirement
-    # (`config/model.py:735-737`) the same way the `url` loop above mirrors its
-    # `Destination.url` requirement: `remote_server.target_dataset`
-    # (`models.py`) is `NOT NULL` but not `CHECK`'d non-empty, so `None`
-    # would otherwise reach the final flush as a bare `NOT NULL constraint
-    # failed` (after the wipe -- the caller's session, not this function,
-    # is what a failed flush leaves to roll back), and `""` would insert
-    # and load back as a value `from_file` can never produce.
-    if config.remote_backup is not None and not config.remote_backup.target_dataset:
-        raise ValueError("remote_backup requires 'target_dataset'")
-
-    for ds in config.datasets:
-        for rule in ds.retention_rules:
-            _assert_positive_duration_rule(rule, f"datasets[{ds.name}].retention")
-        validate_retention_uniqueness(
-            ds.retention_rules, f"datasets[{ds.name}].retention"
-        )
-        # `from_dict` (`config/model.py:624-626`) never checks for two `remote`
-        # entries naming the same destination -- a YAML `from_file` loads
-        # cleanly here fails only at insert, as a bare `IntegrityError`,
-        # against `dataset_remotes`'s `(dataset_id, destination_name)`
-        # unique constraint (`models.py`).
-        seen_destinations: Dict[str, int] = {}
-        for idx, remote in enumerate(ds.remote):
-            if remote.destination not in config.destinations:
-                raise ValueError(
-                    f"datasets[{ds.name}].remote[{remote.destination}] "
-                    f"references destination '{remote.destination}', which "
-                    "is not declared in 'destinations'"
-                )
-            if remote.destination in seen_destinations:
-                raise ValueError(
-                    f"datasets[{ds.name}].remote[{idx}]: duplicate "
-                    f"destination {remote.destination!r} (already used by "
-                    f"datasets[{ds.name}].remote"
-                    f"[{seen_destinations[remote.destination]}])"
-                )
-            seen_destinations[remote.destination] = idx
-            for rule in remote.retention_rules:
-                _assert_positive_duration_rule(
-                    rule,
-                    f"datasets[{ds.name}].remote[{remote.destination}].retention",
-                )
-            validate_retention_uniqueness(
-                remote.retention_rules,
-                f"datasets[{ds.name}].remote[{remote.destination}].retention",
-            )
+    validate_config(config)
 
     # --- 3. Read the generation to carry forward (before any DELETE). ---
     # This read and the `previous + 1` written in step 6 are a read-modify-
@@ -788,8 +973,12 @@ def save_config(session: Session, config: BackupConfig) -> None:
         # None means "resolve $HOME's default in the process that uses the
         # file" -- write NULL rather than materialising this process's
         # $HOME into the DB.
+        # "" is stored as NULL too (`validate_config` warned): YAML treats
+        # it as unset, and a stored "" would reload as `Path(".")`.
         client_id_file=(
-            None if config.client_id_file is None else str(config.client_id_file)
+            None
+            if config.client_id_file is None or os.fspath(config.client_id_file) == ""
+            else str(config.client_id_file)
         ),
         generation=previous_generation + 1,
     ))

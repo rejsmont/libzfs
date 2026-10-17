@@ -8,11 +8,13 @@ nothing else. That is what keeps this module fork-safe by construction and
 lets it land ahead of item 5 without any risk of colliding with its
 pid-keyed engine cache -- there is no engine here to collide with.
 
-No caller is wired up yet. Per the item-7 plan: the CLI's `import` (item 8)
-will call `ensure_schema()` as part of bringing a fresh or existing DB up
-to date; the daemon will only ever *check* the current revision against the
-package's head and refuse to start on a mismatch, never write -- "the CLI
-is the only writer" is what item 5's fork-safety and WAL design depend on.
+Callers: `importer.py`'s `import_yaml` (the interim CLI, replaced by
+`zfsbackup-config import` in Phase 2) calls `ensure_schema()` as part of
+bringing a fresh or existing DB up to date; the daemon and its workers only
+ever *check* the current revision against the package's head
+(`check_schema`, via `zfsbackup/runtime_config.py`) and refuse to start on a
+mismatch, never write -- "the CLI is the only writer" is what item 5's
+fork-safety and WAL design depend on.
 
 **`check_schema(connection)` (item 6a) is that check.** It is the
 never-writes half of what used to be `ensure_schema`'s single monolithic

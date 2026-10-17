@@ -54,8 +54,8 @@ and worth recording so they are not reintroduced:
    `path` to an absolute, symlink-followed form **exactly once, at
    construction time** (`resolved_path`), via `_resolve_or_raise` --
    never a bare `Path.resolve()`. `pyproject.toml` declares
-   `python = "^3.10"`, and on 3.10/3.11/3.12 (verified directly on all
-   three) `Path.resolve(strict=False)` turns a symlink loop into a bare
+   `python = "^3.11"`, and on 3.11/3.12 (verified directly; 3.10 behaved
+   the same but is no longer supported) `Path.resolve(strict=False)` turns a symlink loop into a bare
    `RuntimeError`, not `OSError` -- so `ZFSBACKUP_CONFIG` pointing at a
    loop used to crash `resolve_config_path` itself, before
    `check_config_db` ever ran, with an exception item 8's single `except
@@ -169,11 +169,12 @@ file AND fixes its mode as one step, so the mandated create-then-chmod-
 before-first-connection ordering is not something item 10's
 implementation can get backwards), then open its first connection, then
 run `ensure_schema`. `ensure_config_db_mode` remains for the case of
-*fixing* the mode of a database this module did not itself create (an
-existing file handed to `import`, or a re-import) -- it also re-chmods any
-`-wal`/`-shm` that already exist next to it, since those are exactly as
-likely to be stuck at a stale mode as the case `ensure_config_db_mode`'s
-own docstring already warns about for the database file itself.
+*fixing* the mode of the DEFAULT database on a re-import -- and only that:
+a file at any other path is never chmod'd, and nothing (database or
+sidecar) is chmod'd unless this process owns it and its mode differs. See
+`_ensure_mode` and the "Mode/ownership policy" section below for the
+group-operator rules (setgid directory, no chmod by a non-owner, no
+touching sidecars owned by the daemon user).
 
 That mandated sequence -- `create_config_db_file`, then the first
 connection -- runs straight into this module's own preflight:
@@ -222,6 +223,7 @@ __all__ = [
     "ConfigDbNotADatabase",
     "ConfigDbNotAFile",
     "ConfigDbNotFound",
+    "ConfigDbOrphanedSidecars",
     "ConfigDbPathUnrepresentable",
     "ConfigDbPermissionError",
     "ConfigPathEnvError",
@@ -234,6 +236,8 @@ __all__ = [
     "diagnose_open_failure",
     "ensure_config_db_mode",
     "ensure_config_dir",
+    "is_default_config_dir",
+    "is_default_config_path",
     "open_config_connection",
     "open_config_session",
     "resolve_config_path",
@@ -268,7 +272,21 @@ _DB_URL_ENV_NAME = "ZFSBACKUP_DB_URL"
 #: and which one that is is genuinely unpredictable -- sidecars are
 #: checkpointed away on every clean close, so it is never simply "the
 #: writer creates them once".
-CONFIG_DIR_MODE = 0o770
+#:
+#: The setgid bit (`2` in `2770`) is what makes that unpredictability
+#: harmless for operators who are NOT the daemon user: on Linux a file
+#: created in a setgid directory inherits the DIRECTORY's group instead of
+#: its creator's primary group. Without it, an operator (user `alice`, in
+#: group `zfsbackup`) whose CLI is the first opener creates `-wal`/`-shm`
+#: as `alice:alice`; SQLite copies the DB file's mode onto them but never
+#: its group, so the de-rooted daemon is locked out of the sidecars and
+#: gets an undiagnosable "unable to open database file". (macOS assigns a
+#: new file the directory's group regardless, so this cannot be reproduced
+#: there -- it is mocked in the unit tests and proven on Linux by the
+#: `test_config_permissions.sh` scenario.) Note that `chmod` by an owner
+#: who is not a member of the directory's group silently DROPS the setgid
+#: bit on Linux -- `_ensure_mode` re-stats and warns when that happens.
+CONFIG_DIR_MODE = 0o2770
 
 #: Group-write for the CLI (the only writer of config *content*);
 #: owner-write for the daemon even though it writes no config content --
@@ -277,10 +295,16 @@ CONFIG_DIR_MODE = 0o770
 #: very first connection.
 CONFIG_DB_MODE = 0o660
 
-#: `chown` needs root, which the CLI operator invoking `import` is not.
-#: Creating this user/group is a packaging concern (`sysusers.d`/
-#: `tmpfiles.d`, or a systemd unit's `User=`/`Group=`), not something this
-#: module can or should do -- it must already exist before `import` runs.
+#: The service user and group the config store is meant to belong to.
+#: Creating them is a packaging concern (`sysusers.d`/`tmpfiles.d`, or a
+#: systemd unit's `User=`/`Group=`), not something this module can or
+#: should do -- they must already exist before `import` runs. This module
+#: changes ownership in exactly one case (Q7, `_chgrp_to_service_group`):
+#: when ROOT creates the default directory or database it `chgrp`s it to
+#: the GROUP half of this value (and warns if that group does not exist).
+#: The USER half is never applied -- nothing here ever `chown`s a user --
+#: and it is also used to build the "who should run chmod" advice in error
+#: messages.
 CONFIG_OWNER = "zfsbackup:zfsbackup"
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
@@ -394,6 +418,20 @@ class ConfigDbPermissionError(ConfigPathError):
     """
 
 
+class ConfigDbOrphanedSidecars(ConfigPathError):
+    """A first import was refused because `-wal`/`-shm`/`-journal` files
+    already exist next to a config database that does not.
+
+    Creating the database there would make SQLite replay an orphaned `-wal`
+    or `-journal` into the brand-new file (resurrecting somebody else's
+    pages), and a live process's `-shm` is shared by PATH, so a new database
+    would silently share lock state with whatever still has the old one
+    open. The importer therefore creates nothing and touches nothing; the
+    operator removes the files once no process has them open
+    (`fuser`/`lsof`), then retries.
+    """
+
+
 # --------------------------------------------------------------------------
 # Small helpers shared between resolution and the preflight.
 # --------------------------------------------------------------------------
@@ -402,7 +440,7 @@ class ConfigDbPermissionError(ConfigPathError):
 def _residual_os_error_message(action: str, exc: Exception) -> str:
     """Format a filesystem-level failure that is not a simple permission
     denial. Deliberately typed to accept more than `OSError`: see
-    `_resolve_or_raise` below for why -- on Python 3.10-3.12,
+    `_resolve_or_raise` below for why -- on Python 3.11-3.12,
     `Path.resolve()` can raise a bare `RuntimeError` (not `OSError`) for
     a symlink loop, so this cannot assume `.errno`/`.strerror` exist.
     """
@@ -430,12 +468,12 @@ def _resolve_or_raise(path: Path) -> Path:
     and two ways it does are neither obvious nor version-stable, found in
     review:
 
-    - A symlink loop. **On Python 3.10, 3.11, and 3.12** (this package
-      declares `python = "^3.10"` in `pyproject.toml`, so all three are
-      in scope), `Path.resolve(strict=False)` performs a final re-`stat`
+    - A symlink loop. **On Python 3.11 and 3.12** (this package
+      declares `python = "^3.11"` in `pyproject.toml`, so both are in
+      scope), `Path.resolve(strict=False)` performs a final re-`stat`
       of its own result and converts the underlying `OSError(ELOOP)`
       into a bare, undocumented `RuntimeError` ("Symlink loop from...");
-      verified directly on 3.10, 3.11, and 3.12. Python 3.13+ raises
+      verified directly on 3.11 and 3.12. Python 3.13+ raises
       `OSError` for the identical input instead. Both are caught here.
     - An unlinked current working directory: resolving a *relative* path
       needs `os.getcwd()`, which raises `FileNotFoundError` if the
@@ -447,10 +485,10 @@ def _resolve_or_raise(path: Path) -> Path:
     mode escaped *resolution*, before `check_config_db` ever ran, as an
     exception item 8's single `except ConfigPathError` does not catch:
     `ZFSBACKUP_CONFIG` pointing at a symlink loop used to crash
-    `resolve_config_path` itself with a bare `RuntimeError` on 3.10-3.12.
+    `resolve_config_path` itself with a bare `RuntimeError` on 3.11-3.12.
     This is also why `check_config_db`'s own residual `except OSError`
     arm on its `os.stat` step is defence in depth rather than the only
-    guard against ELOOP/ENAMETOOLONG-shaped failures: on 3.10-3.12 a
+    guard against ELOOP/ENAMETOOLONG-shaped failures: on 3.11-3.12 a
     symlink loop is caught here, at construction, before `check_config_db`
     is ever reached.
     """
@@ -715,10 +753,18 @@ def _not_found_message(resolved: ResolvedConfigPath) -> str:
 def _yaml_message(resolved: ResolvedConfigPath) -> str:
     given = str(resolved.path)
     shown = _describe_real(resolved.path, resolved.resolved_path)
+    # Two steps, because "import" alone leaves the daemon still pointed at
+    # the YAML it just refused: the import writes a NEW database, and `-c`
+    # (or ZFSBACKUP_CONFIG) must then be changed to name it. Suggested name:
+    # the YAML's own path with a `.db` suffix, which cannot collide with it.
+    db = str(resolved.path.with_suffix(".db"))
     return (
         f"{shown} has a .yaml/.yml extension. zfsbackup's config store "
         "is a SQLite database, not YAML. To migrate an existing YAML "
-        f"config, run: zfsbackup-config import {given}"
+        "config: (1) import it into a database with: "
+        f"zfsbackup-config import {given} -c {db}  "
+        f"and (2) point the daemon at that database instead of the YAML "
+        f"(-c {db}, or {CONFIG_PATH_ENV}={db})."
     )
 
 
@@ -883,6 +929,27 @@ def _transient_sidecars_message(resolved: ResolvedConfigPath, real: Path) -> str
     )
 
 
+def _sidecar_unusable_message(
+    resolved: ResolvedConfigPath, real: Path, sidecar: Path, st: os.stat_result
+) -> str:
+    shown = _describe_real(resolved.path, real)
+    owner = _username(st.st_uid)
+    return (
+        f"{shown} is writable, but its WAL sidecar {sidecar} (owner="
+        f"{owner} group={_groupname(st.st_gid)} mode="
+        f"{stat_module.S_IMODE(st.st_mode):04o}) is not readable and "
+        "writable by this process. SQLite would fail to open the database "
+        "with a bare 'unable to open database file'. The usual cause is a "
+        "process of another user having been the first to open the "
+        "database and exited uncleanly. Fix: the owner "
+        f"({owner}) or root must run: chmod {CONFIG_DB_MODE:04o} {sidecar}; "
+        f"chgrp {CONFIG_OWNER.split(':', 1)[1]} {sidecar}. Never blindly "
+        "`rm` a -wal file (it can hold committed data not yet "
+        "checkpointed); the -shm is safe to remove only when no process "
+        "has the database open."
+    )
+
+
 def _username(uid: int) -> str:
     try:
         import pwd
@@ -978,6 +1045,220 @@ def _sidecar_lstat(path: Path) -> Optional[os.stat_result]:
     except OSError as exc:
         raise ConfigDbPermissionError(
             _residual_os_error_message(f"check {path}", exc)
+        ) from exc
+
+
+# --------------------------------------------------------------------------
+# Mode/ownership policy (A-4). Group operators -- user `alice` in group
+# `zfsbackup` editing a database owned by user `zfsbackup` -- are in scope,
+# which changes three things about what this module may do to a file:
+#
+# - `chmod` by a non-owner is EPERM even when the mode would not change, so
+#   "always chmod" turns every non-owner re-import into an error;
+# - `chmod` of a mode the file already has is pointless work that can only
+#   fail or (for a directory) strip the setgid bit; and
+# - a file this process did not create and does not own must never be
+#   chmod'd at all (a sidecar owned by the daemon user, say).
+#
+# `_ensure_mode` is the single place all three rules live, for the
+# directory, the database, and the sidecars alike.
+# --------------------------------------------------------------------------
+
+
+def _is_owner(st: os.stat_result) -> bool:
+    """True if this process may chmod the file `st` describes. Root counts as
+    an owner of everything (it can chmod anything), which also means a root
+    import never takes the "not owned" branch for a daemon-owned file."""
+    euid = os.geteuid()
+    return euid == 0 or st.st_uid == euid
+
+
+def _ensure_mode(path: Path, mode: int, *, access: int, what: str) -> None:
+    """Make `path`'s permission bits equal `mode`, without ever fighting the
+    file's owner.
+
+    1. `stat` (following symlinks -- callers hand in resolved paths, and
+       sidecar callers have already `lstat`-rejected symlinks). A missing
+       path is not this function's concern. Mode already equal: do
+       NOTHING (no chmod syscall, so no EPERM for a non-owner, and no
+       setgid stripping for an owner). For a DIRECTORY the comparison
+       ignores the sticky bit (`S_ISVTX`) and a chmod preserves it: an
+       admin who set `3770` on the config directory (so group members
+       cannot delete each other's files) must not have it silently stripped
+       to `2770` by a re-import. Nothing is ever widened -- the sticky bit
+       only restricts. Files keep the exact comparison.
+    2. Owned (`_is_owner`: the file belongs to this process's effective
+       uid, OR this process is root, which can chmod anything and so never
+       takes the "not owned" branch): `chmod`, then re-`stat`. Linux
+       silently drops the setgid bit when the chmod-ing user is not a member
+       of the file's group, so a mode that did not stick is a WARNING naming
+       the difference, not an error -- the operation otherwise succeeded.
+       A path that vanishes between the `stat` and the `chmod` (a WAL
+       sidecar checkpointed away by another connection's last close) is
+       simply gone, not an error.
+    3. Not owned but `access` (a bitmask of `os.R_OK`/`W_OK`/`X_OK`) works
+       for this process: WARNING naming the owner, the actual mode and the
+       exact command the owner should run -- the store is usable, so
+       refusing would turn a cosmetic mismatch into an outage. If the
+       access check fails, the path is stat'ed once more: only a positive
+       ENOENT/ENOTDIR there means "vanished mid-check" (return quietly);
+       a path that still exists and is still unusable raises.
+    4. Not owned and not usable: `ConfigDbPermissionError` saying the owner
+       (or root) must run `chmod`.
+    """
+    try:
+        st = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    except OSError as exc:
+        raise ConfigDbPermissionError(
+            _residual_os_error_message(f"check {path}", exc)
+        ) from exc
+
+    actual = stat_module.S_IMODE(st.st_mode)
+    if stat_module.S_ISDIR(st.st_mode):
+        mode |= actual & stat_module.S_ISVTX
+    if actual == mode:
+        return
+
+    if _is_owner(st):
+        try:
+            os.chmod(path, mode)
+        except FileNotFoundError:
+            # A-10: the `stat` above saw it, then it went away -- the
+            # normal fate of a `-wal`/`-shm` whose last connection just
+            # closed. Root always takes this branch, so without this a
+            # root re-import racing a daemon exit failed on a file that no
+            # longer exists. Every other errno (EPERM, EROFS, ...) is a
+            # real problem and still raises below.
+            logger.debug("%s %s vanished before it could be chmod'd", what, path)
+            return
+        except OSError as exc:
+            raise ConfigDbPermissionError(
+                _permission_failure_message(
+                    f"chmod {path} to {mode:04o}", path, exc
+                )
+            ) from exc
+        try:
+            after = stat_module.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            return
+        if after != mode:
+            logger.warning(
+                "chmod %04o %s left it at %04o (%s). Linux drops the setgid "
+                "bit when the chmod-ing user is not a member of the file's "
+                "group; new files will not inherit group %r until someone "
+                "who is runs: chmod %04o %s",
+                mode, path, after, what,
+                _groupname(st.st_gid), mode, path,
+            )
+        return
+
+    owner = _username(st.st_uid)
+    usable = _can_access(path, access)
+    if not usable:
+        # A-10: `os.access` is False for a path that has just been deleted,
+        # too, and "deleted" is not "unusable" -- a sidecar checkpointed
+        # away by another connection's last close, between the `stat`
+        # above and here. A skip needs a POSITIVE ENOENT/ENOTDIR from a
+        # fresh `stat` (follow-symlink semantics kept, like the first one);
+        # anything else -- the path still there, or some other errno -- is
+        # a real problem and falls through to the raise. One re-check, no
+        # loop. (The caller has already proved the directory searchable, so
+        # ENOENT here means the entry itself is gone.)
+        try:
+            st = os.stat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        except OSError:
+            pass
+        else:
+            actual = stat_module.S_IMODE(st.st_mode)
+            owner = _username(st.st_uid)
+            usable = _can_access(path, access)
+    if usable:
+        logger.warning(
+            "%s %s is owned by %s (group %s) with mode %04o, not the %04o "
+            "this store expects, and you are not its owner so its mode was "
+            "left alone. It is usable by this process as it is; if other "
+            "group members are locked out, ask %s (or root) to run: "
+            "chmod %04o %s",
+            what, path, owner, _groupname(st.st_gid), actual, mode,
+            owner, mode, path,
+        )
+        return
+
+    raise ConfigDbPermissionError(
+        f"{what} {path} is owned by {owner} (group {_groupname(st.st_gid)}) "
+        f"with mode {actual:04o}, is not usable by this process, and you "
+        f"are not its owner so it cannot be fixed from here. {owner} (or "
+        f"root) must run: chmod {mode:04o} {path}"
+    )
+
+
+def _same_location(path: Union[str, Path], reference: Path) -> bool:
+    """True if `path` and `reference` name the same filesystem object --
+    by `(st_dev, st_ino)` when both exist (survives symlinks and macOS's
+    `/var` -> `/private/var`), else by comparing resolved paths."""
+    try:
+        a = os.stat(path)
+        b = os.stat(reference)
+        return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+    except OSError:
+        pass
+    try:
+        return Path(path).resolve() == reference.resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def is_default_config_dir(path: Union[str, Path]) -> bool:
+    """True if `path` is the directory holding the default config database
+    (`DEFAULT_CONFIG_DB.parent`) -- the one directory this package owns."""
+    return _same_location(path, DEFAULT_CONFIG_DB.parent)
+
+
+def is_default_config_path(path: Union[str, Path]) -> bool:
+    """True if `path` is the default config database file, however spelled."""
+    return _same_location(path, DEFAULT_CONFIG_DB)
+
+
+def _chgrp_to_service_group(path: Path, what: str, *, fd: Optional[int] = None) -> None:
+    """(Q7) When ROOT has just CREATED the default directory/database, give
+    it to the `zfsbackup` group, so group operators and the de-rooted daemon
+    can use what root made. Does nothing for a non-root caller (a plain
+    `chgrp` to a group you are not in is EPERM, and an operator-created
+    file already carries a group they chose).
+
+    If the group does not exist this WARNS rather than fails -- creating
+    users and groups is a packaging concern -- but says plainly that
+    operators who are not root will be locked out until it is fixed.
+    `fd` (for a freshly `os.open`ed file) avoids a path race.
+    """
+    if os.geteuid() != 0:
+        return
+    group = CONFIG_OWNER.split(":", 1)[1]
+    try:
+        import grp
+
+        gid = grp.getgrnam(group).gr_gid
+    except (ImportError, KeyError):
+        logger.warning(
+            "created %s %s as root, but the %r group does not exist, so it "
+            "keeps root's group and non-root operators will be locked out "
+            "of it. Create the group (packaging: sysusers.d) and run: "
+            "chgrp %s %s",
+            what, path, group, group, path,
+        )
+        return
+    try:
+        if fd is not None:
+            os.fchown(fd, -1, gid)
+        else:
+            os.chown(path, -1, gid)
+    except OSError as exc:
+        raise ConfigDbPermissionError(
+            _permission_failure_message(f"chgrp {path} to {group}", path, exc)
         ) from exc
 
 
@@ -1097,7 +1378,16 @@ def check_config_db(
        this ambiguous state into the "would be created read-only" arm on
        a wrong premise instead of surfacing the real problem.
 
-    `require_writable=False` skips steps 5 and 6 -- for a hypothetical
+    7. **Existing `-wal`/`-shm` sidecars** (writable-database path only):
+       each one that exists (`lstat`) must be readable and writable by this
+       process, else `ConfigDbPermissionError` -- SQLite would otherwise
+       fail with a bare "unable to open database file". A group that
+       differs from the database's is a WARNING. A sidecar that vanishes
+       between the `lstat` and the access check (another connection's last
+       close) counts as absent: a skip needs a positive ENOENT from a
+       fresh `lstat`, an existing-but-unusable sidecar still raises.
+
+    `require_writable=False` skips steps 5, 6 and 7 -- for a hypothetical
     future caller that genuinely only needs read access (nothing in this
     repository is such a caller yet).
 
@@ -1220,6 +1510,49 @@ def check_config_db(
         raise ConfigDbPermissionError(
             _transient_sidecars_message(resolved, real)
         )
+
+    # Step 7: existing sidecars, whether or not the DB file is writable (the
+    # branch above always raises for an unwritable DB, so reaching here
+    # means it IS writable -- and that says nothing about the sidecars). An
+    # operator's CLI that was the first opener and died (SIGHUP while in
+    # $EDITOR) leaves `-wal`/`-shm` owned by that operator in the
+    # operator's group; the DB file itself is perfectly writable by the
+    # daemon, so a check that only looked at the DB passed, and SQLite then
+    # failed with an undiagnosable "unable to open database file" on every
+    # respawn. Checked with `lstat` for existence, `os.access` for use.
+    for sidecar_suffix in ("-wal", "-shm"):
+        sidecar = Path(str(real) + sidecar_suffix)
+        sidecar_st = _sidecar_lstat(sidecar)
+        if sidecar_st is None:
+            continue
+        if not _can_access(sidecar, os.R_OK | os.W_OK):
+            # A-10: a sidecar is transient by design -- another connection's
+            # last close checkpoints and unlinks it, and `os.access` on a
+            # path that has just vanished is False, indistinguishable from
+            # "present but unusable". Raising here stopped the whole daemon
+            # (EX_CONFIG -> exit 1) when two worker schema checks, a respawn
+            # and a CLI exit, or a `systemctl stop` overlapped. So re-stat:
+            # a POSITIVE ENOENT means it vanished (nothing to be unusable);
+            # a sidecar that is still there gets one more access check and,
+            # if that still fails, raises from the FRESH stat. A real
+            # permission problem always still raises; no loop.
+            sidecar_st = _sidecar_lstat(sidecar)
+            if sidecar_st is None:
+                continue
+            if not _can_access(sidecar, os.R_OK | os.W_OK):
+                raise ConfigDbPermissionError(
+                    _sidecar_unusable_message(resolved, real, sidecar, sidecar_st)
+                )
+        if sidecar_st.st_gid != st.st_gid:
+            logger.warning(
+                "%s has group %s but the database %s has group %s: a "
+                "process in only one of those groups may be locked out. "
+                "Fix: chgrp %s %s (the directory should be setgid, mode "
+                "%04o, so new sidecars inherit its group).",
+                sidecar, _groupname(sidecar_st.st_gid), real,
+                _groupname(st.st_gid), _groupname(st.st_gid), sidecar,
+                CONFIG_DIR_MODE,
+            )
 
 
 def diagnose_open_failure(
@@ -1364,34 +1697,43 @@ def open_config_connection(
 
 
 def ensure_config_dir(path: Union[str, Path]) -> None:
-    """Create `path` as a directory (with any missing parents) and set it
-    to `CONFIG_DIR_MODE`, explicitly.
+    """Create `path` as a directory (with any missing parents) if needed and
+    bring it to `CONFIG_DIR_MODE` (setgid, group-writable), explicitly.
 
-    The explicit `os.chmod` after `mkdir` is not redundant: `Path.mkdir`'s
-    own `mode=` argument is masked by the process umask, so `mkdir(...,
-    mode=0o770)` under a umask of `0o022` would actually create a `0o750`
+    The explicit chmod after `mkdir` is not redundant: `Path.mkdir`'s own
+    `mode=` argument is masked by the process umask, so `mkdir(...,
+    mode=0o2770)` under a umask of `0o022` would actually create a `0o2750`
     directory -- silently missing the group-write bit every WAL sidecar
-    creation depends on. Chmod-ing explicitly makes the result
-    independent of whatever umask the calling process happens to have.
+    creation depends on. Chmod-ing explicitly makes the result independent
+    of whatever umask the calling process happens to have.
+
+    The chmod goes through `_ensure_mode`, so it is **not** unconditional
+    (it used to be, and that was the bug): a directory that already has the
+    right mode is not touched, a directory owned by someone else (the
+    normal case for a group operator: the directory belongs to user
+    `zfsbackup`) is never chmod'd -- that was EPERM -- and the setgid bit
+    surviving the chmod is verified rather than assumed. See `_ensure_mode`.
 
     Idempotent (`exist_ok=True`): re-running `import` against an existing,
-    correctly-laid-out directory must not fail, and the chmod is applied
-    unconditionally so a directory that exists but is not yet `0o770` is
-    corrected rather than silently left alone.
+    correctly-laid-out directory is a no-op.
 
-    Both the `mkdir` and the `chmod` are wrapped: an unprivileged
-    operator running `import` against a missing or unwritable
-    `/var/lib/zfsbackup` gets a `ConfigDbPermissionError` naming the
-    actual owner/group/mode of the parent directory and the target,
-    rather than a bare `PermissionError: [Errno 13]`.
+    Both the `mkdir` and the chmod are wrapped: an unprivileged operator
+    running `import` against a missing or unwritable `/var/lib/zfsbackup`
+    gets a `ConfigDbPermissionError` naming the actual owner/group/mode of
+    the parent directory and the target, rather than a bare
+    `PermissionError: [Errno 13]`.
 
-    **Does not `chown`.** Creating the `zfsbackup` user and group is a
-    packaging concern -- a `sysusers.d`/`tmpfiles.d` snippet, or a systemd
-    unit's `User=`/`Group=` -- and doing it here would need root, which
-    the CLI operator invoking `import` is not expected to have.
+    **Ownership.** Creating the `zfsbackup` user and group is a packaging
+    concern -- a `sysusers.d`/`tmpfiles.d` snippet, or a systemd unit's
+    `User=`/`Group=`. The one thing this function does about it: when run
+    as ROOT and it CREATES the default directory (`DEFAULT_CONFIG_DB.parent`),
+    it `chgrp`s it to `zfsbackup` if that group exists (and warns loudly if
+    not) -- see `_chgrp_to_service_group`. It never changes the group of a
+    directory it did not create.
     """
     directory = Path(path)
     try:
+        existed = os.path.isdir(directory)
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise ConfigDbPermissionError(
@@ -1399,14 +1741,11 @@ def ensure_config_dir(path: Union[str, Path]) -> None:
                 f"create directory {directory}", directory.parent, exc
             )
         ) from exc
-    try:
-        os.chmod(directory, CONFIG_DIR_MODE)
-    except OSError as exc:
-        raise ConfigDbPermissionError(
-            _permission_failure_message(
-                f"chmod {directory} to {CONFIG_DIR_MODE:04o}", directory, exc
-            )
-        ) from exc
+    if not existed and is_default_config_dir(directory):
+        _chgrp_to_service_group(directory, "config directory")
+    _ensure_mode(
+        directory, CONFIG_DIR_MODE, access=os.W_OK | os.X_OK, what="config directory"
+    )
 
 
 def create_config_db_file(path: Union[str, Path]) -> None:
@@ -1429,6 +1768,24 @@ def create_config_db_file(path: Union[str, Path]) -> None:
     existing database -- `import` against an existing file is a
     different, explicit operation this function deliberately does not
     perform.
+
+    (Q7) When run as ROOT on the DEFAULT path, the new file is `fchown`ed to
+    the `zfsbackup` group if it exists (warning if not), before the mode is
+    fixed -- the mode is set last because a chown can clear mode bits.
+
+    **Atomic: it either fully succeeds or leaves nothing behind.** If
+    anything raises after `O_EXCL` has created the file -- the Q7 `fchown`
+    (NFS `root_squash` makes that realistic), the `fchmod`, or a
+    `KeyboardInterrupt` -- the half-made file is unlinked again, so a retry
+    gets the first-import treatment (`created=True`) instead of finding a
+    zero-byte file, taking the re-import path, and being refused as
+    `ConfigDbNotADatabase` until someone deletes it by hand. The unlink
+    only happens when the open descriptor (`fstat`) and the path (`lstat`)
+    still name the same inode, so a file that was swapped in meanwhile is
+    never removed; it is done while the descriptor is still open and is best
+    effort (failure is logged, never raised over the original error). This
+    lives here, not in the importer, so every caller (the `import` CLI too)
+    gets it.
     """
     target = Path(path)
     try:
@@ -1440,68 +1797,113 @@ def create_config_db_file(path: Union[str, Path]) -> None:
             _permission_failure_message(f"create {target}", target.parent, exc)
         ) from exc
     try:
-        os.fchmod(fd, CONFIG_DB_MODE)
+        try:
+            if is_default_config_path(target):
+                _chgrp_to_service_group(target, "config database", fd=fd)
+            os.fchmod(fd, CONFIG_DB_MODE)
+        except OSError as exc:
+            raise ConfigDbPermissionError(
+                _permission_failure_message(
+                    f"chmod {target} to {CONFIG_DB_MODE:04o}", target, exc
+                )
+            ) from exc
+    except BaseException:
+        _unlink_if_same_file(fd, target)
+        raise
     finally:
         os.close(fd)
 
 
-def ensure_config_db_mode(path: Union[str, Path]) -> None:
-    """`os.chmod(path, CONFIG_DB_MODE)`, and the same for any `-wal`/
-    `-shm` that already exist next to it.
+def _unlink_if_same_file(fd: int, path: Path) -> None:
+    """Best-effort `os.unlink(path)` of the file `fd` was just created as,
+    but only if `path` still names the same inode (`fstat(fd)` vs
+    `lstat(path)`). Never raises: it runs while the real exception is
+    propagating (see `create_config_db_file`)."""
+    try:
+        opened = os.fstat(fd)
+        named = os.lstat(path)
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            return
+        os.unlink(path)
+    except OSError as exc:
+        logger.warning(
+            "could not remove the partially created %s after a failure: %s "
+            "-- remove it by hand before retrying the import", path, exc,
+        )
 
-    **Must be called immediately after the database file is created, and
-    before the first SQLite connection is opened against it** -- prefer
-    `create_config_db_file` for a brand-new file, which makes that
-    ordering structural rather than a prose requirement an implementation
-    can violate. This function remains for *fixing* the mode of a
-    database this module did not itself create (an existing file handed
-    to `import`, or a re-import).
+
+def ensure_config_db_mode(path: Union[str, Path]) -> None:
+    """Fix the permission bits of an EXISTING default config database and the
+    `-wal`/`-shm` sidecars next to it -- and nothing else.
+
+    **Only the default path is adjusted** (`DEFAULT_CONFIG_DB`, however
+    spelled). An existing file at any other path (`-c ~/x.db`, a test
+    fixture, a deliberately private `0600` file) is NEVER chmod'd: an
+    earlier version widened an operator-supplied `0600` file to `0660` on
+    every re-import. For such a file this only logs a WARNING if its group
+    cannot read and write it, since then group operators and a de-rooted
+    daemon will be locked out -- the operator chose that, but should know.
+
+    For the default path, everything goes through `_ensure_mode`: chmod
+    only when the mode differs AND the file is owned by this process (its
+    effective uid owns it, or this process is root -- root can chmod
+    anything, so it also brings a daemon-owned database or sidecar to
+    `CONFIG_DB_MODE`); otherwise warn (usable) or raise (unusable) without
+    touching it. Nothing is ever widened beyond `CONFIG_DB_MODE`. In
+    particular a **sidecar this process does not own is never chmod'd** (it
+    belongs to whichever process created it, typically the daemon user's
+    pooled connection), and sidecars are examined with `lstat` so a symlink
+    is skipped rather than followed. `-journal` is never touched: it is a
+    transient rollback-journal file that only exists during a transaction.
+
+    **Must be called before the first SQLite connection is opened against
+    the database** -- prefer `create_config_db_file` for a brand-new file,
+    which makes that ordering structural. This function remains for the
+    re-import case.
 
     This is not cosmetic. Measured: SQLite copies the *database file's*
     mode onto `-wal`/`-shm` the moment it creates them -- independent of
     the process's umask (tested under `0o022`, `0o007` and `0o077`: every
     umask produced `0o660` sidecars once the DB file itself was `0o660`
     before the first connection) -- but it never re-chmods a sidecar that
-    already exists. So if `import` instead let SQLite create `config.db`
-    first (inheriting whatever mode the process's umask produces) and
-    only chmod'd it to `0o660` afterwards, the DB file itself would end
-    up `0o660`, but **every `-wal`/`-shm` it ever creates for the rest of
-    that file's life would still come out at the earlier mode** (measured:
-    sidecars created after such a late chmod stayed at `0o644`), and a
-    second group member -- or a de-rooted daemon -- would be unable to
-    write them.
+    already exists, and never copies the group. Hence the setgid directory
+    (`CONFIG_DIR_MODE`) for the group, and re-fixing the mode of sidecars
+    we own here for the bits.
 
-    For the same reason, a **re-import** against a database that already
-    has `-wal`/`-shm` sidecars (created by a scenario harness, a plain
-    `cp` that brought them along, or a bare `sqlite3` invocation) must
-    re-chmod those sidecars too, not just the database file -- an
-    existing sidecar left at a stale mode is exactly the H' state
-    `check_config_db`'s step 6 detects and refuses at open time, and this
-    function existing at all is supposed to prevent reaching that state
-    in the first place.
-
-    Every `chmod` here is wrapped: a failure surfaces as
-    `ConfigDbPermissionError` with actual-vs-target detail, not a bare
-    `PermissionError`.
+    Every `chmod` is wrapped: a failure surfaces as `ConfigDbPermissionError`
+    with actual-vs-target detail, not a bare `PermissionError`.
     """
     target = Path(path)
-    try:
-        os.chmod(target, CONFIG_DB_MODE)
-    except OSError as exc:
-        raise ConfigDbPermissionError(
-            _permission_failure_message(
-                f"chmod {target} to {CONFIG_DB_MODE:04o}", target, exc
+    if not is_default_config_path(target):
+        try:
+            mode = stat_module.S_IMODE(os.stat(target).st_mode)
+        except OSError:
+            return  # the real preflight (check_config_db) diagnoses this
+        if mode & 0o060 != 0o060:
+            logger.warning(
+                "%s has mode %04o and is not at the default path, so its "
+                "permissions were left alone. Its group cannot read and "
+                "write it, so group operators and a daemon running as "
+                "another user are locked out unless they own it.",
+                target, mode,
             )
-        ) from exc
+        return
 
+    _ensure_mode(
+        target, CONFIG_DB_MODE, access=os.R_OK | os.W_OK, what="config database"
+    )
     for suffix in ("-wal", "-shm"):
         sidecar = Path(str(target) + suffix)
-        if sidecar.exists():
-            try:
-                os.chmod(sidecar, CONFIG_DB_MODE)
-            except OSError as exc:
-                raise ConfigDbPermissionError(
-                    _permission_failure_message(
-                        f"chmod {sidecar} to {CONFIG_DB_MODE:04o}", sidecar, exc
-                    )
-                ) from exc
+        sidecar_st = _sidecar_lstat(sidecar)
+        if sidecar_st is None:
+            continue
+        if stat_module.S_ISLNK(sidecar_st.st_mode):
+            logger.warning(
+                "%s is a symlink; leaving it alone (SQLite sidecars are "
+                "never expected to be links).", sidecar,
+            )
+            continue
+        _ensure_mode(
+            sidecar, CONFIG_DB_MODE, access=os.R_OK | os.W_OK,
+            what="WAL sidecar",
+        )

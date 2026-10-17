@@ -17,10 +17,11 @@ detached ORM instance raises `DetachedInstanceError` lazily, deep inside a
 worker loop, long after the session that loaded it closed. See
 `zfsbackup.config.store`'s docstring for the full reasoning.
 
-Note the deliberate distinction between this package and `zfsbackup.config.store`
-(reserved, not yet present), which is for *backup data* destinations --
+Note the deliberate distinction between this package and `zfsbackup.store`
+(reserved, deliberately empty), which is for *backup data* destinations --
 object storage, cloud targets and the like. This package is about the
-configuration itself, not about where backups are written.
+configuration itself, not about where backups are written;
+`zfsbackup.config.store` above is configuration persistence, not backup data.
 
 Every public name of `model` is re-exported here, so
 `from zfsbackup.config import BackupConfig` is the supported spelling and

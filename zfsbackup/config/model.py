@@ -2,12 +2,15 @@
 
 import base64
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 class Duration(timedelta):
@@ -229,6 +232,118 @@ def _positive_duration_from_config(value, key: str) -> Duration:
         raise ValueError(
             f"{key}: duration must be positive, got {_retention_literal(d)!r} "
             f"({d.total_seconds():.0f}s)"
+        )
+    return d
+
+
+def _bool_from_config(value, key: str, *, null_warning: Optional[str] = None) -> bool:
+    """Coerce a boolean taken directly off parsed YAML.
+
+    A real `bool` passes through. `None` (a bare ``enabled:`` with no
+    value) is falsy under every YAML consumer, so it normalizes to `False` --
+    with a WARNING when `null_warning` is given (for flags where "off" is a
+    surprising reading, e.g. ``enabled:``), silently otherwise. The integers
+    ``0`` and ``1`` behaved as written under truthiness, so they are accepted
+    as `False`/`True` with a WARNING (``remote_backup.enabled: 1`` says so
+    loudly, since it turns on the unauthenticated receive endpoint). Anything
+    else -- other ints, floats, and notably the string ``"false"``, which is
+    truthy -- is rejected rather than guessed at (decision (a),
+    docs/config_db_cli_plan.md).
+    """
+    if value is None:
+        if null_warning is not None:
+            logger.warning("%s is empty (null); %s", key, null_warning)
+        return False
+    if isinstance(value, bool):
+        return value
+    if type(value) is int and value in (0, 1):
+        result = bool(value)
+        extra = ""
+        if result and key == "remote_backup.enabled":
+            extra = " (this enables the unauthenticated receive endpoint)"
+        logger.warning(
+            "%s is the integer %d; treating it as %s%s -- write true/false",
+            key, value, "true" if result else "false", extra,
+        )
+        return result
+    raise ValueError(
+        f"{key} must be true or false, got {type(value).__name__} {value!r}"
+    )
+
+
+def _str_from_config(value, key: str) -> str:
+    """Ensure a value taken directly off parsed YAML is a string.
+
+    YAML types unquoted scalars (``name: 123``, ``prefix: yes``), and a
+    non-string flowing through changes type downstream (ZFS names, URLs,
+    snapshot prefixes) instead of failing at the boundary.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{key} must be a string, got {type(value).__name__} {value!r}"
+        )
+    return value
+
+
+def _port_from_config(value, key: str) -> int:
+    """Validate a TCP port taken directly off parsed YAML.
+
+    Accepts an `int` (not a `bool`, which YAML ``true`` would otherwise turn
+    into port 1) or a string of ASCII digits; rejects null, floats (silent
+    truncation) and anything outside 0-65535. Port 0 (bind to an ephemeral
+    port) is accepted with a WARNING because the API would then listen on a
+    port nobody can predict.
+    """
+    if isinstance(value, bool) or value is None:
+        raise ValueError(
+            f"{key} must be a port number (0-65535), got {type(value).__name__} {value!r}"
+        )
+    if isinstance(value, str):
+        if not re.fullmatch(r'[0-9]+', value):
+            raise ValueError(
+                f"{key} must be a port number (0-65535), got str {value!r}"
+            )
+        port = int(value)
+    elif isinstance(value, int):
+        port = value
+    else:
+        raise ValueError(
+            f"{key} must be a port number (0-65535), got {type(value).__name__} {value!r}"
+        )
+    if not 0 <= port <= 65535:
+        raise ValueError(f"{key} must be a port number (0-65535), got {port}")
+    if port == 0:
+        logger.warning(
+            "%s is 0: the API will bind an ephemeral port that changes on every start", key
+        )
+    return port
+
+
+def _interval_from_config(value, key: str, *, zero_inherits: bool = False) -> Optional[Duration]:
+    """Parse an interval taken directly off parsed YAML and reject a value
+    that would make a worker spin.
+
+    Unlike a retention duration, an interval of zero or less is a hot loop
+    (`StopFlag.wait(<=0)` returns immediately, so the worker shells out to
+    ``zfs`` flat out) or, for a dataset frequency, a per-cycle exception. Named
+    after the key so the operator sees which setting is wrong.
+
+    With `zero_inherits` (per-destination `frequency`), exactly zero is not an
+    error: it was always falsy and so meant "inherit the dataset frequency";
+    that is preserved by returning `None`, with a WARNING. Negative values are
+    still rejected.
+    """
+    d = _duration_from_config(value, key)
+    seconds = d.total_seconds()
+    if seconds == 0 and zero_inherits:
+        logger.warning(
+            "%s is %r (zero): treating it as unset, so the dataset frequency is inherited",
+            key, value,
+        )
+        return None
+    if seconds <= 0:
+        raise ValueError(
+            f"{key}: interval must be positive, got {value!r} ({seconds:.0f}s)"
         )
     return d
 
@@ -539,16 +654,38 @@ class DatasetConfig:
         name = data.get('name')
         if not name:
             raise ValueError("Dataset 'name' is required")
+        name = _str_from_config(name, f"{key}.name")
 
-        recursive = data.get('recursive', False)
-        enabled = data.get('enabled', True)
+        # `recursive: null` is falsy and so was never recursive: normalize
+        # silently. `enabled: null` is falsy too -- the dataset was skipped --
+        # which is a surprising reading of an empty value, so it warns.
+        recursive = _bool_from_config(
+            data.get('recursive', False), f"datasets[{name}].recursive"
+        )
+        enabled = _bool_from_config(
+            data.get('enabled', True),
+            f"datasets[{name}].enabled",
+            null_warning="treating the dataset as disabled; set 'enabled: true' to back it up",
+        )
 
         freq_str = data.get('frequency', '1h')
-        frequency = _duration_from_config(freq_str, f"datasets[{name}].frequency")
+        frequency = _interval_from_config(freq_str, f"datasets[{name}].frequency")
 
         retention_rules = []
         retention_dict = data.get('retention')
-        if retention_dict is None:
+        never_prune = isinstance(retention_dict, str) and retention_dict == 'forever'
+        if never_prune:
+            # `retention: forever` is the only YAML spelling of "never prune"
+            # (an empty rule list, which is what the pruner treats as
+            # keep-everything). Dataset level only: the destination-level
+            # override below still rejects an empty/non-mapping value.
+            logger.warning(
+                "datasets[%s].retention is 'forever': snapshots of this dataset "
+                "will never be pruned and will accumulate until the pool is full",
+                name,
+            )
+            retention_dict = {}
+        elif retention_dict is None:
             # Absent 'retention' has a documented meaning at dataset level:
             # default to a single 1d->30d tier. `config.example.yaml` and
             # long-standing behaviour rely on this.
@@ -562,7 +699,7 @@ class DatasetConfig:
             retention_dict = _mapping_from_config(
                 retention_dict,
                 f"datasets[{name}].retention",
-                "a mapping of age -> keep_for",
+                "a mapping of age -> keep_for, or the string 'forever'",
             )
             if not retention_dict:
                 # An explicit but empty mapping (`retention: {}`) keeps the
@@ -585,6 +722,7 @@ class DatasetConfig:
             data.get('remote', []), f"datasets[{name}].remote", "a list of mappings"
         )
         remote = []
+        seen_destinations: Dict[str, int] = {}
         for idx, r in enumerate(remote_data):
             r = _mapping_from_config(r, f"datasets[{name}].remote[{idx}]", "a mapping")
             dest = r.get('destination')
@@ -592,8 +730,21 @@ class DatasetConfig:
                 raise ValueError(
                     f"datasets[{name}].remote[{idx}] requires a 'destination'"
                 )
+            dest = _str_from_config(dest, f"datasets[{name}].remote[{idx}].destination")
+            if dest in seen_destinations:
+                raise ValueError(
+                    f"datasets[{name}].remote[{idx}]: duplicate "
+                    f"destination {dest!r} (already used by "
+                    f"datasets[{name}].remote"
+                    f"[{seen_destinations[dest]}])"
+                )
+            seen_destinations[dest] = idx
             freq = (
-                _duration_from_config(r['frequency'], f"datasets[{name}].remote[{dest}].frequency")
+                _interval_from_config(
+                    r['frequency'],
+                    f"datasets[{name}].remote[{dest}].frequency",
+                    zero_inherits=True,
+                )
                 if r.get('frequency') is not None else None
             )
 
@@ -689,32 +840,54 @@ class BackupConfig:
             seen_names[ds.name] = idx
 
         snapshot_prefix = data.get('snapshot_prefix', 'autosnap')
-        dry_run = data.get('dry_run', False)
+        if snapshot_prefix is None:
+            raise ValueError(
+                "snapshot_prefix must be a string, got null. A null prefix never "
+                "worked (every cycle raised a TypeError) but did leave snapshots "
+                "named 'None_<timestamp>' behind; if you have such snapshots and "
+                "want them managed, set snapshot_prefix: \"None\" explicitly"
+            )
+        snapshot_prefix = _str_from_config(snapshot_prefix, "snapshot_prefix")
+        if '_' in snapshot_prefix:
+            logger.warning(
+                "snapshot_prefix %r contains '_': the snapshot timestamp is read "
+                "from the second '_'-separated field of the name, so no snapshot "
+                "with this prefix will be recognised as managed or ever pruned; "
+                "use a prefix without '_'",
+                snapshot_prefix,
+            )
+        # `dry_run: null` is falsy: the daemon ran live. Keep that, silently.
+        dry_run = _bool_from_config(data.get('dry_run', False), "dry_run")
 
         check_str = data.get('check_interval', '5m')
-        check_interval = _duration_from_config(check_str, "check_interval")
+        check_interval = _interval_from_config(check_str, "check_interval")
 
         prune_str = data.get('prune_interval')
         prune_interval = (
-            _duration_from_config(prune_str, "prune_interval")
+            _interval_from_config(prune_str, "prune_interval")
             if prune_str is not None else None
         )
 
+        # `api_host: null` made Flask bind its own default, 127.0.0.1.
         api_host = data.get('api_host', '127.0.0.1')
-        api_port = int(data.get('api_port', 8080))
+        api_host = "127.0.0.1" if api_host is None else _str_from_config(api_host, "api_host")
+        api_port = _port_from_config(data.get('api_port', 8080), "api_port")
 
         destinations_data = _mapping_from_config(
             data.get('destinations', {}), "destinations", "a mapping of name -> destination"
         )
         destinations: Dict[str, Destination] = {}
         for dest_name, dest_data in destinations_data.items():
+            dest_name = _str_from_config(dest_name, "destinations key")
             dest_data = _mapping_from_config(
                 dest_data, f"destinations[{dest_name}]", "a mapping"
             )
             url = dest_data.get('url')
             if not url:
                 raise ValueError(f"Destination '{dest_name}' requires 'url'")
-            destinations[dest_name] = Destination(url=url)
+            destinations[dest_name] = Destination(
+                url=_str_from_config(url, f"destinations[{dest_name}].url")
+            )
 
         for ds in datasets:
             for r in ds.remote:
@@ -738,12 +911,22 @@ class BackupConfig:
             target = rb_data.get('target_dataset')
             if not target:
                 raise ValueError("remote_backup requires 'target_dataset'")
+            # `enabled: null` is falsy: the receive endpoint was OFF. The DB
+            # would otherwise fill in True and expose an unauthenticated
+            # receive path, so normalize to False and say so.
             remote_backup = RemoteServerConfig(
-                target_dataset=target,
-                enabled=rb_data.get('enabled', True),
+                target_dataset=_str_from_config(target, "remote_backup.target_dataset"),
+                enabled=_bool_from_config(
+                    rb_data.get('enabled', True),
+                    "remote_backup.enabled",
+                    null_warning="treating the remote receive endpoint as disabled; "
+                                 "set 'enabled: true' to accept incoming backups",
+                ),
             )
 
         cid = data.get('client_id_file')
+        if cid is not None:
+            cid = _str_from_config(cid, "client_id_file")
         client_id_file = Path(cid) if cid else None
 
         return cls(
@@ -766,9 +949,11 @@ class BackupConfig:
         When `prune_interval` is `None` ("follow `check_interval`"), returns
         `self.check_interval` itself -- not a copy -- so a `Duration`'s
         `.literal` carries through unchanged. Otherwise returns
-        `self.prune_interval` as-is. Note `prune_interval` set to a present
-        but zero duration (e.g. ``"0m"``) is a real, distinct value from
-        `None` and is returned unchanged here; only `None` triggers fallback.
+        `self.prune_interval` as-is. Only `None` triggers fallback. A zero
+        duration (e.g. ``"0m"``) is rejected when the YAML is parsed, so a
+        loaded config never carries one; a zero set directly on an in-code
+        config would be returned unchanged here (and `validate_config`
+        refuses it).
         """
         if self.prune_interval is None:
             return self.check_interval

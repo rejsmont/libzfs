@@ -3,8 +3,15 @@ of docs/config_db_cli_plan.md), the mapper (item 4), migrations (item 7),
 and the engine/session module (item 5, `zfsbackup/config/store/db.py`).
 
 This is store-layer coverage: `zfsbackup/config/store/` defines the schema, the
-dataclass<->ORM mapper, Alembic migrations, and engine/session management,
-and is not wired into the daemon, workers, or CLI yet.
+dataclass<->ORM mapper, Alembic migrations, engine/session management, path
+resolution/permissions and the interim YAML importer. The daemon and its
+workers read the store through `zfsbackup.runtime_config` (item 8); the
+config CLI (Phase 2) is not built yet.
+
+The Checkpoint A fix-up coverage (decision-(a) audit, A-3 CHECKs, A-4
+permissions, A-6.1 fork-vs-`-shm`) lives alongside, in
+`test_zfsbackup_config_audit.py`, `test_zfsbackup_store_permissions.py` and
+`test_zfsbackup_fork_shm.py`.
 
 **Every fixture below goes through `zfsbackup.config.store.db`** (`make_engine`,
 `get_engine`, `session_for_engine`, `session_scope`) rather than hand-rolling
@@ -91,6 +98,7 @@ from zfsbackup.config.store.mapper import (
     _scoped_rules,
     load_config,
     save_config,
+    validate_config,
 )
 from zfsbackup.config.store.migrate import (
     SchemaError,
@@ -249,8 +257,30 @@ def file_engine(file_db_url):
 # `db.py` too and would otherwise leak them into unrelated test files.
 
 
+
+def orm_dataset(**kwargs):
+    """A `Dataset` ORM row with the NOT NULL flags supplied explicitly.
+
+    `Dataset.recursive` / `.enabled` have no Python `default=` any more
+    (Checkpoint A, A-2 step 3): the writer must supply every value, so a
+    `None` fails loudly instead of being repaired into a different
+    behaviour. Tests that do not care about the flags get the YAML-default
+    values here; a test that does care passes them (or `None`) itself.
+    """
+    kwargs.setdefault("recursive", False)
+    kwargs.setdefault("enabled", True)
+    return Dataset(**kwargs)
+
+
+def orm_remote_server(**kwargs):
+    """A `RemoteServer` ORM row with `enabled` supplied explicitly (no
+    Python `default=` any more)."""
+    kwargs.setdefault("enabled", True)
+    return RemoteServer(**kwargs)
+
+
 def make_dataset(session, name="tank/data", **kwargs):
-    ds = Dataset(
+    ds = orm_dataset(
         name=name,
         frequency_seconds=kwargs.pop("frequency_seconds", 3600),
         frequency_literal=kwargs.pop("frequency_literal", "1h"),
@@ -308,6 +338,11 @@ def make_global_settings(**overrides):
         prune_interval_seconds=3600,
         prune_interval_literal="1h",
         client_id_file="/var/lib/zfsbackup/client_id",
+        # No Python `default=` on these any more (A-2 step 3): supply them.
+        snapshot_prefix="autosnap",
+        api_host="127.0.0.1",
+        api_port=8080,
+        dry_run=False,
     )
     fields.update(overrides)
     return GlobalSettings(**fields)
@@ -349,7 +384,7 @@ class TestDatasetsAndDestinations:
     def test_dataset_name_unique(self, session):
         make_dataset(session, name="tank/data")
         session.add(
-            Dataset(name="tank/data", frequency_seconds=7200, frequency_literal="2h")
+            orm_dataset(name="tank/data", frequency_seconds=7200, frequency_literal="2h")
         )
         with pytest.raises(IntegrityError):
             session.commit()
@@ -357,7 +392,7 @@ class TestDatasetsAndDestinations:
     def test_dataset_name_not_unique_across_different_names(self, session):
         make_dataset(session, name="tank/data")
         session.add(
-            Dataset(name="tank/other", frequency_seconds=7200, frequency_literal="2h")
+            orm_dataset(name="tank/other", frequency_seconds=7200, frequency_literal="2h")
         )
         session.commit()  # must not raise
         assert session.query(Dataset).count() == 2
@@ -978,21 +1013,21 @@ class TestGlobalSettingsPruneIntervalNullable:
 @pytest.mark.unit
 class TestRemoteServerSingleton:
     def test_single_row_accepted(self, session):
-        session.add(RemoteServer(id=1, target_dataset="tank/received"))
+        session.add(orm_remote_server(id=1, target_dataset="tank/received"))
         session.commit()  # must not raise
         assert session.query(RemoteServer).count() == 1
 
     def test_second_row_with_id_1_rejected_by_primary_key(self, session):
-        session.add(RemoteServer(id=1, target_dataset="tank/received"))
+        session.add(orm_remote_server(id=1, target_dataset="tank/received"))
         session.commit()
-        session.add(RemoteServer(id=1, target_dataset="tank/other"))
+        session.add(orm_remote_server(id=1, target_dataset="tank/other"))
         with pytest.raises(IntegrityError):
             session.commit()
 
     def test_second_row_with_different_id_rejected_by_check_constraint(self, session):
-        session.add(RemoteServer(id=1, target_dataset="tank/received"))
+        session.add(orm_remote_server(id=1, target_dataset="tank/received"))
         session.commit()
-        session.add(RemoteServer(id=2, target_dataset="tank/other"))
+        session.add(orm_remote_server(id=2, target_dataset="tank/other"))
         with pytest.raises(IntegrityError):
             session.commit()
 
@@ -1018,7 +1053,7 @@ class TestLiteralRoundTrip:
         return session.get(Dataset, dataset_id)
 
     def test_dataset_frequency_literal_round_trips_noncanonical(self, session):
-        ds = Dataset(
+        ds = orm_dataset(
             name="tank/data",
             frequency_seconds=timedelta(days=30).total_seconds(),
             frequency_literal="30d",
@@ -1408,7 +1443,7 @@ class TestMapperLoadConfigQ7:
         session.add(make_global_settings(id=1))
         ds = make_dataset(session)
         session.add(make_rule(ds.id, None))
-        session.add(RemoteServer(id=1, target_dataset="tank/received", enabled=True))
+        session.add(orm_remote_server(id=1, target_dataset="tank/received", enabled=True))
         session.commit()
 
         config = load_config(session)
@@ -1422,9 +1457,12 @@ class TestMapperLoadConfigQ7:
         with pytest.raises(ValueError, match="No datasets configured"):
             load_config(session)
 
-    def test_zero_dataset_level_retention_rows_applies_default_and_warns(
+    def test_zero_dataset_level_retention_rows_loads_empty_and_warns(
         self, session, caplog
     ):
+        # Zero dataset-level rows means NEVER PRUNE (`[]`), not the
+        # 1d -> 30d YAML default -- that default belongs to the YAML
+        # boundary only (Checkpoint A, A-2 step 2).
         session.add(make_global_settings(id=1))
         make_dataset(session, name="tank/empty")
         session.commit()
@@ -1432,10 +1470,12 @@ class TestMapperLoadConfigQ7:
         with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.mapper"):
             config = load_config(session)
 
-        assert config.datasets[0].retention_rules == [
-            ConfigRetentionRule(age=Duration("1d"), keep_for=Duration("30d"))
-        ]
-        assert any("tank/empty" in r.message for r in caplog.records)
+        assert config.datasets[0].retention_rules == []
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "tank/empty" in r.getMessage() and "never be pruned" in r.getMessage()
+            for r in warnings
+        )
 
     def test_unreferenced_destination_still_appears(self, session):
         session.add(make_global_settings(id=1))
@@ -1454,8 +1494,8 @@ class TestMapperLoadConfigQ7:
         # own belt-and-braces check.
         session = session_no_fk
         session.add(Destination(name="offsite", url="ssh://offsite/pool"))
-        ds1 = Dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
-        ds2 = Dataset(name="tank/b", frequency_seconds=3600, frequency_literal="1h")
+        ds1 = orm_dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
+        ds2 = orm_dataset(name="tank/b", frequency_seconds=3600, frequency_literal="1h")
         session.add_all([ds1, ds2])
         session.commit()
         remote = DatasetRemote(
@@ -1574,33 +1614,51 @@ class TestMapperPruneIntervalClientIdFileUnset:
         assert loaded.prune_interval == Duration("2h")
         assert loaded.client_id_file == tmp_path / "client_id"
 
-    def test_save_then_load_zero_prune_interval_is_not_treated_as_unset(self, session):
-        # Duration("0m") and its stored seconds value (0.0) are both falsy
-        # in Python, but "configured to zero" is a real, present value --
-        # distinct from `prune_interval is None` ("unset/derive"). Both
-        # save_config (mapper.py's `prune_interval_seconds=`/`_literal=`)
-        # and load_config (mapper.py's `prune_interval=`) must branch on
-        # `is None`, not truthiness: a truthiness-based guard on either
-        # side would silently fold a configured "0m" into "derive from
-        # check_interval", returning check_interval's seconds (e.g. 300)
-        # from effective_prune_interval instead of 0 -- breaking
-        # `load_config(save_config(cfg)) == cfg` with nothing going red.
+    def test_save_then_load_set_prune_interval_is_not_treated_as_unset(self, session):
+        # A configured prune_interval is a real, present value, distinct
+        # from `prune_interval is None` ("unset/derive"). Both save_config
+        # and load_config must branch on `is None`, not truthiness. (The
+        # original form of this test used "0m", which is falsy; interval 0
+        # is now rejected -- Checkpoint A, Q3 -- so the present-vs-unset
+        # distinction is pinned with a positive value that differs from
+        # check_interval, so a fold into "derive" would be visible.)
         config = _minimal_backup_config()
-        config.prune_interval = Duration("0m")
-        assert config.prune_interval is not None  # sanity: falsy, not None
+        config.check_interval = Duration("5m")
+        config.prune_interval = Duration("2h")
+        assert config.prune_interval is not None
 
         save_config(session, config)
         session.commit()
 
         session.expire_all()
         row = session.get(GlobalSettings, 1)
-        assert row.prune_interval_seconds == 0  # NOT NULL
-        assert row.prune_interval_literal == "0m"
+        assert row.prune_interval_seconds == 7200  # NOT NULL
+        assert row.prune_interval_literal == "2h"
 
         loaded = load_config(session)
         assert loaded.prune_interval is not None
-        assert loaded.prune_interval.total_seconds() == 0
-        assert loaded.effective_prune_interval.total_seconds() == 0
+        assert loaded.prune_interval.total_seconds() == 7200
+        assert loaded.effective_prune_interval.total_seconds() == 7200
+
+    @pytest.mark.parametrize("bad", ["0m", "-5m"])
+    def test_save_config_rejects_non_positive_prune_interval(self, session, bad):
+        config = _minimal_backup_config()
+        config.prune_interval = Duration(seconds=Duration(bad).total_seconds())
+        with pytest.raises(ValueError, match="prune_interval"):
+            validate_config(config)
+        with pytest.raises(ValueError, match="prune_interval"):
+            save_config(session, config)
+
+    def test_db_check_rejects_zero_prune_interval_row(self, session):
+        save_config(session, _minimal_backup_config())
+        session.commit()
+        with pytest.raises(IntegrityError, match="prune_interval_positive"):
+            session.execute(
+                update(GlobalSettings).values(
+                    prune_interval_seconds=0, prune_interval_literal="0m"
+                )
+            )
+            session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -2015,7 +2073,7 @@ class TestMapperScopedRulesForeignDatasetRegression:
         session = session_no_fk
         session.add(make_global_settings(id=1))
         session.add(Destination(name="offsite", url="ssh://offsite/pool"))
-        ds = Dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
+        ds = orm_dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
         session.add(ds)
         session.commit()
         session.add(
@@ -2108,12 +2166,12 @@ class TestMapperSaveConfigStep1ValidationRegression:
     def test_duplicate_remote_destination_on_one_dataset_raises_before_delete(
         self, session
     ):
-        # `DatasetConfig.from_dict` (`config/model.py:624-626`) never checks this
-        # -- a YAML `from_file` accepts it cleanly and only fails at insert,
-        # against `dataset_remotes`'s composite unique constraint, as a bare
-        # IntegrityError. `save_config` must catch it before the wipe since
-        # a direct `BackupConfig` (bypassing `from_dict`, e.g. a future CLI
-        # importer) is never guaranteed to pass through that check.
+        # `DatasetConfig.from_dict` now rejects this at the YAML boundary
+        # (A-16; see `test_zfsbackup_config_audit.py`), but a `BackupConfig`
+        # built in code bypasses `from_dict`, and without a check it would
+        # fail only at insert, against `dataset_remotes`'s composite unique
+        # constraint, as a bare IntegrityError. `save_config` must catch it
+        # before the wipe: this is the BACKSTOP for configs built in code.
         bad = BackupConfig(
             datasets=[
                 DatasetConfig(
@@ -4550,7 +4608,7 @@ class TestDbForkSafety:
         Base.metadata.create_all(engine)
         with session_for_engine(engine) as session:
             session.add(
-                Dataset(name="tank/fork", frequency_seconds=3600, frequency_literal="1h")
+                orm_dataset(name="tank/fork", frequency_seconds=3600, frequency_literal="1h")
             )
         return engine
 
@@ -4695,7 +4753,7 @@ class TestDbWalConcurrency:
         Base.metadata.create_all(writer_engine)
         with session_for_engine(writer_engine) as session:
             session.add(
-                Dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
+                orm_dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
             )
 
         reader_engine = make_engine(file_db_url, readonly=True)
@@ -4710,7 +4768,7 @@ class TestDbWalConcurrency:
                 try:
                     with session_for_engine(writer2) as writer_session:
                         writer_session.add(
-                            Dataset(
+                            orm_dataset(
                                 name="tank/b",
                                 frequency_seconds=7200,
                                 frequency_literal="2h",
@@ -4741,7 +4799,7 @@ class TestDbWalConcurrency:
         Base.metadata.create_all(writer_engine)
         with session_for_engine(writer_engine) as session:
             session.add(
-                Dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
+                orm_dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
             )
         writer_engine.dispose()
 
@@ -5057,7 +5115,7 @@ class TestDbNestedWriterDeadlock:
     def test_nested_writer_session_self_deadlocks(self, fast_writer_engine):
         with session_for_engine(fast_writer_engine) as outer:
             outer.add(
-                Dataset(name="tank/outer", frequency_seconds=60, frequency_literal="1m")
+                orm_dataset(name="tank/outer", frequency_seconds=60, frequency_literal="1m")
             )
             # `add()` alone only stages the object in memory -- it emits
             # no SQL and therefore begins no transaction. `flush()` is
@@ -5081,7 +5139,7 @@ class TestDbNestedWriterDeadlock:
         try:
             with session_for_engine(fast_writer_engine) as outer:
                 outer.add(
-                    Dataset(
+                    orm_dataset(
                         name="tank/outer", frequency_seconds=60, frequency_literal="1m"
                     )
                 )
@@ -5117,7 +5175,7 @@ class TestDbNestedWriterDeadlock:
         try:
             with session_for_engine(fast_writer_engine) as outer:
                 outer.add(
-                    Dataset(
+                    orm_dataset(
                         name="tank/outer", frequency_seconds=60, frequency_literal="1m"
                     )
                 )
@@ -5249,7 +5307,7 @@ class TestDbWalSidecars:
         Base.metadata.create_all(engine)
         with session_for_engine(engine) as session:
             session.add(
-                Dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
+                orm_dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
             )
 
         assert wal_path.exists()
@@ -5319,7 +5377,7 @@ class TestDbSessionForEngineRollback:
         with pytest.raises(_Boom):
             with session_for_engine(engine) as session:
                 session.add(
-                    Dataset(
+                    orm_dataset(
                         name="tank/never-committed",
                         frequency_seconds=60,
                         frequency_literal="1m",
@@ -5340,7 +5398,7 @@ class TestDbSessionForEngineRollback:
         with pytest.raises(_Boom):
             with session_for_engine(engine) as session:
                 session.add(
-                    Dataset(
+                    orm_dataset(
                         name="tank/never-committed",
                         frequency_seconds=60,
                         frequency_literal="1m",
@@ -7026,17 +7084,36 @@ class TestPathsCreationPolicyWrappedExceptions:
         finally:
             os.chmod(parent, 0o755)
 
-    def test_ensure_config_db_mode_wraps_permission_error(self, tmp_path):
-        """`chmod` is governed by file ownership, not the containing
-        directory's permissions, so a read-only parent does not exercise
-        this path -- a missing target does (`FileNotFoundError` from
-        `os.chmod`, the same wrapped-`OSError` code path).
+    def test_ensure_config_db_mode_wraps_permission_error(self, tmp_path, monkeypatch):
+        """An owned file at the default path whose `chmod` fails (the
+        filesystem refuses it) still surfaces as `ConfigDbPermissionError`,
+        not a bare `PermissionError`. A *non-owner's* EPERM is no longer
+        reachable here at all: `_ensure_mode` never calls chmod on a file
+        this process does not own (warns or raises its own
+        `ConfigDbPermissionError` instead -- covered in
+        `tests/test_zfsbackup_store_permissions.py`).
         """
-        missing = tmp_path / "does_not_exist.db"
+        db = tmp_path / "config.db"
+        db.touch()
+        os.chmod(db, 0o600)
+        monkeypatch.setattr(store_paths, "DEFAULT_CONFIG_DB", db)
 
+        def refuse(*_args, **_kwargs):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(store_paths.os, "chmod", refuse)
         with pytest.raises(ConfigDbPermissionError) as excinfo:
-            ensure_config_db_mode(missing)
+            ensure_config_db_mode(db)
         assert not isinstance(excinfo.value, OSError)
+
+    def test_ensure_config_db_mode_missing_default_path_is_a_no_op(
+        self, tmp_path, monkeypatch
+    ):
+        # A missing file is the real preflight's concern, not this function's.
+        missing = tmp_path / "does_not_exist.db"
+        monkeypatch.setattr(store_paths, "DEFAULT_CONFIG_DB", missing)
+        ensure_config_db_mode(missing)  # must not raise
+        assert not missing.exists()
 
 
 @pytest.mark.integration
@@ -7058,6 +7135,27 @@ class TestPathsSidecarModeInheritance:
         os.umask(original)
         yield
         os.umask(original)
+
+    @pytest.fixture(autouse=True)
+    def default_path_is_tmp(self, tmp_path, monkeypatch):
+        """`ensure_config_db_mode` only adjusts the DEFAULT path (A-4); a
+        file anywhere else is never chmod'd. Point the default at the
+        `config.db` these tests create so they exercise the default-path
+        branch -- `test_non_default_path_is_left_alone` is the converse."""
+        monkeypatch.setattr(store_paths, "DEFAULT_CONFIG_DB", tmp_path / "config.db")
+
+    def test_non_default_path_is_left_alone(self, tmp_path, preserve_umask):
+        other = tmp_path / "elsewhere.db"
+        other.touch()
+        os.chmod(other, 0o600)
+        wal = tmp_path / "elsewhere.db-wal"
+        wal.touch()
+        os.chmod(wal, 0o644)
+
+        ensure_config_db_mode(other)
+
+        assert stat.S_IMODE(other.stat().st_mode) == 0o600
+        assert stat.S_IMODE(wal.stat().st_mode) == 0o644
 
     def test_chmod_before_first_open_makes_sidecars_0660_under_umask_022(
         self, tmp_path, preserve_umask
@@ -7187,3 +7285,227 @@ class TestStorePackageReExports:
 
         for name in store_pkg.__all__:
             assert hasattr(store_pkg, name), f"{name!r} in __all__ but missing"
+
+    def test_config_db_orphaned_sidecars_is_exported_and_is_a_path_error(self):
+        # A-11.2: the CLI (item 10) catches `ConfigPathError`; the new refusal
+        # must be reachable from the package root and be one of those.
+        import zfsbackup.config.store as store_pkg
+        from zfsbackup.config.store.paths import ConfigPathError
+
+        assert "ConfigDbOrphanedSidecars" in store_pkg.__all__
+        assert issubclass(store_pkg.ConfigDbOrphanedSidecars, ConfigPathError)
+        assert not issubclass(store_pkg.ConfigDbOrphanedSidecars, OSError)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint A: A-2 step 3 (no Python column defaults) and A-3 (positivity
+# CHECKs, regenerated baseline)
+# ---------------------------------------------------------------------------
+
+
+_MISSING = object()  # "do not pass this column at all"
+
+
+@pytest.mark.unit
+class TestNoPythonColumnDefaults:
+    """The Python-side `default=` was dropped from every non-key NOT NULL
+    column (`snapshot_prefix`, `api_host`, `api_port`, `dry_run`,
+    `Dataset.recursive`, `Dataset.enabled`, `RemoteServer.enabled`).
+
+    The default is what substituted `True` for an explicit Python `None`
+    at INSERT time (finding A1: `enabled: null` imported as enabled,
+    `remote_backup.enabled: null` switched the unauthenticated receive path
+    on). A missing or `None` value must now fail loudly as NOT NULL.
+    `generation` deliberately keeps `default=0`
+    (`TestGlobalSettings...::test_generation_defaults_to_zero`).
+    """
+
+    def _dataset(self, **over):
+        fields = dict(
+            name="tank/a", frequency_seconds=3600, frequency_literal="1h",
+            recursive=False, enabled=True,
+        )
+        fields.update(over)
+        return Dataset(**{k: v for k, v in fields.items() if v is not _MISSING})
+
+    def _settings(self, **over):
+        fields = dict(
+            id=1, snapshot_prefix="autosnap", check_interval_seconds=60,
+            api_host="127.0.0.1", api_port=8080, dry_run=False,
+        )
+        fields.update(over)
+        return GlobalSettings(**{k: v for k, v in fields.items() if v is not _MISSING})
+
+    @pytest.mark.parametrize("column", ["recursive", "enabled"])
+    @pytest.mark.parametrize("value", [_MISSING, None])
+    def test_dataset_flags_have_no_default(self, session, column, value):
+        session.add(self._dataset(**{column: value}))
+        with pytest.raises(IntegrityError, match="NOT NULL"):
+            session.commit()
+
+    @pytest.mark.parametrize(
+        "column", ["snapshot_prefix", "api_host", "api_port", "dry_run"]
+    )
+    @pytest.mark.parametrize("value", [_MISSING, None])
+    def test_global_settings_columns_have_no_default(self, session, column, value):
+        session.add(self._settings(**{column: value}))
+        with pytest.raises(IntegrityError, match="NOT NULL"):
+            session.commit()
+
+    @pytest.mark.parametrize("value", [_MISSING, None])
+    def test_remote_server_enabled_has_no_default(self, session, value):
+        row = {"id": 1, "target_dataset": "tank/recv"}
+        if value is not _MISSING:
+            row["enabled"] = value
+        session.add(RemoteServer(**row))
+        with pytest.raises(IntegrityError, match="NOT NULL"):
+            session.commit()
+
+    def test_explicit_false_is_stored_as_false_not_replaced(self, session):
+        # The positive control: the removed default must not have turned
+        # into a "falsy -> True" substitution of some other kind.
+        session.add(self._dataset(recursive=False, enabled=False))
+        session.add(RemoteServer(id=1, target_dataset="tank/recv", enabled=False))
+        session.commit()
+        session.expire_all()
+        assert session.query(Dataset).one().enabled is False
+        assert session.get(RemoteServer, 1).enabled is False
+
+    def test_generation_keeps_its_default(self, session):
+        session.add(self._settings())
+        session.commit()
+        assert session.get(GlobalSettings, 1).generation == 0
+
+
+_BASELINE_REVISION = "a1c28e1b3f34"
+_SUPERSEDED_REVISION = "2e8aa45e2667"
+
+
+@pytest.fixture
+def migrated_db(tmp_path):
+    """A file database brought up by `ensure_schema` (alembic) -- NOT
+    `create_all` -- plus an FK-on engine over it for inserts."""
+    path = tmp_path / "migrated.db"
+    url = f"sqlite:///{path}"
+    migration_engine = create_engine(url)
+    with migration_engine.connect() as conn:
+        ensure_schema(conn)
+        conn.commit()
+    migration_engine.dispose()
+    engine = make_engine(url, foreign_keys=True)
+    yield engine
+    engine.dispose()
+
+
+def _exec(engine, sql, **params):
+    with engine.begin() as conn:
+        conn.execute(text(sql), params)
+
+
+_SETTINGS_INSERT = (
+    "INSERT INTO global_settings (id, snapshot_prefix, check_interval_seconds, "
+    "prune_interval_seconds, api_host, api_port, dry_run, generation) "
+    "VALUES (1, 'autosnap', :check, :prune, '127.0.0.1', 8080, 0, 0)"
+)
+_DATASET_INSERT = (
+    "INSERT INTO datasets (id, name, recursive, frequency_seconds, enabled) "
+    "VALUES (1, 'tank/a', 0, :freq, 1)"
+)
+
+
+@pytest.mark.unit
+class TestBaselinePositivityChecks:
+    """A-3: the four CHECKs added to the regenerated baseline, proven on a
+    database created by the real migration (not `create_all`, which the
+    ORM-level tests above use and which would pass even if the migration
+    script had been regenerated without them)."""
+
+    @pytest.mark.parametrize("value", [0, -1, -0.5])
+    def test_check_interval_must_be_positive(self, migrated_db, value):
+        with pytest.raises(IntegrityError, match="check_interval_positive"):
+            _exec(migrated_db, _SETTINGS_INSERT, check=value, prune=None)
+
+    @pytest.mark.parametrize("value", [0, -1, -0.5])
+    def test_prune_interval_must_be_positive_when_set(self, migrated_db, value):
+        with pytest.raises(IntegrityError, match="prune_interval_positive"):
+            _exec(migrated_db, _SETTINGS_INSERT, check=60, prune=value)
+
+    def test_prune_interval_null_is_still_legal(self, migrated_db):
+        _exec(migrated_db, _SETTINGS_INSERT, check=60, prune=None)  # "derive"
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_dataset_frequency_must_be_positive(self, migrated_db, value):
+        with pytest.raises(IntegrityError, match="frequency_positive"):
+            _exec(migrated_db, _DATASET_INSERT, freq=value)
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_remote_frequency_must_be_positive_when_set(self, migrated_db, value):
+        _exec(migrated_db, _DATASET_INSERT, freq=3600)
+        _exec(migrated_db, "INSERT INTO destinations (name, url) VALUES ('d', 'u')")
+        with pytest.raises(IntegrityError, match="frequency_positive"):
+            _exec(
+                migrated_db,
+                "INSERT INTO dataset_remotes (dataset_id, destination_name, "
+                "frequency_seconds) VALUES (1, 'd', :f)",
+                f=value,
+            )
+
+    def test_remote_frequency_null_means_inherit_and_is_legal(self, migrated_db):
+        _exec(migrated_db, _DATASET_INSERT, freq=3600)
+        _exec(migrated_db, "INSERT INTO destinations (name, url) VALUES ('d', 'u')")
+        _exec(
+            migrated_db,
+            "INSERT INTO dataset_remotes (dataset_id, destination_name, "
+            "frequency_seconds) VALUES (1, 'd', NULL)",
+        )
+
+    def test_positive_values_are_accepted(self, migrated_db):
+        _exec(migrated_db, _SETTINGS_INSERT, check=0.001, prune=0.001)
+        _exec(migrated_db, _DATASET_INSERT, freq=0.001)
+
+    def test_migrated_schema_carries_the_four_new_checks(self, migrated_db):
+        projection = _schema_projection(migrated_db)
+
+        def names(table):
+            return {name for name, _sql in projection[table]["check_constraints"]}
+
+        assert {
+            "ck_global_settings_check_interval_positive",
+            "ck_global_settings_prune_interval_positive",
+        } <= names("global_settings")
+        assert "ck_datasets_frequency_positive" in names("datasets")
+        assert "ck_dataset_remotes_frequency_positive" in names("dataset_remotes")
+
+    def test_migrated_schema_equals_create_all(self, tmp_path, migrated_db):
+        reference = create_engine(f"sqlite:///{tmp_path / 'create_all.db'}")
+        Base.metadata.create_all(reference)
+        try:
+            assert _schema_projection(migrated_db) == _schema_projection(reference)
+        finally:
+            reference.dispose()
+
+
+@pytest.mark.unit
+class TestBaselineRevision:
+    def test_head_revision_is_the_regenerated_baseline(self, migrated_db):
+        assert _code_head(migrated_db) == _BASELINE_REVISION
+        with migrated_db.connect() as conn:
+            assert (
+                conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+                == _BASELINE_REVISION
+            )
+
+    def test_there_is_exactly_one_baseline_script(self):
+        scripts = sorted(
+            p.name for p in (_MIGRATIONS_DIR / "versions").glob("*.py")
+            if not p.name.startswith("__")
+        )
+        assert len(scripts) == 1, scripts
+        assert _BASELINE_REVISION in scripts[0]
+        assert _SUPERSEDED_REVISION not in scripts[0]
+
+    def test_a_database_stamped_with_the_superseded_id_is_refused_loudly(self, migrated_db):
+        _exec(migrated_db, "UPDATE alembic_version SET version_num = :v", v=_SUPERSEDED_REVISION)
+        with migrated_db.connect() as conn:
+            with pytest.raises(SchemaVersionMismatch):
+                check_schema(conn)

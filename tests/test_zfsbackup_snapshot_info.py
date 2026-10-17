@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
 from zfsbackup.backup_manager import DatasetInfo, SnapshotInfo
-from zfsbackup.config import DatasetConfig
+from zfsbackup.config import DatasetConfig, Duration
 
 
 def _make_snap(short_name: str) -> ZFSSnapshot:
@@ -108,6 +108,43 @@ class TestDatasetInfo:
         dsi = _make_dsi(timedelta(0))
         with pytest.raises(ValueError, match="must be positive"):
             dsi.get_reference_time()
+
+    @pytest.mark.parametrize("frequency", [
+        Duration("0m"),
+        Duration(seconds=-1),
+        Duration("-5d"),
+    ])
+    def test_non_positive_duration_frequency_raises(self, frequency):
+        # Consumer-surface row of the Duration plan (`backup_manager.py:47`,
+        # `self.config.frequency <= timedelta(0)`): a `Duration` is compared
+        # against a bare `timedelta`. Zero AND negative are refused; this is
+        # the runtime backstop behind the write-side rejection of
+        # frequencies <= 0 (Checkpoint A, Q3).
+        dsi = _make_dsi(frequency)
+        with pytest.raises(ValueError, match="must be positive"):
+            dsi.get_reference_time()
+
+    @pytest.mark.parametrize("literal, expected", [
+        ("1h", datetime(2024, 6, 15, 13, 0, 0, tzinfo=timezone.utc)),
+        # Aligned to multiples of 5400s since the epoch, not to the clock.
+        ("90m", datetime.fromtimestamp(
+            (int(datetime(2024, 6, 15, 13, 45, 30, tzinfo=timezone.utc).timestamp()) // 5400) * 5400,
+            tz=timezone.utc,
+        )),
+        ("1s", datetime(2024, 6, 15, 13, 45, 30, tzinfo=timezone.utc)),
+    ])
+    def test_positive_duration_frequency_aligns(self, literal, expected):
+        dsi = _make_dsi(Duration(literal))
+        now = datetime(2024, 6, 15, 13, 45, 30, tzinfo=timezone.utc)
+        assert dsi.get_reference_time(now) == expected
+
+    def test_duration_frequency_compares_both_ways_with_bare_timedelta(self):
+        # `age >= dsi.frequency` where `age` is a bare timedelta
+        # (`backup_manager.py:205-206`): the reflected comparison.
+        dsi = _make_dsi(Duration("1h"))
+        assert timedelta(hours=2) >= dsi.frequency
+        assert not timedelta(minutes=59) >= dsi.frequency
+        assert dsi.frequency > timedelta(0)
 
     def test_reference_time_property(self):
         dsi = _make_dsi(timedelta(hours=1))

@@ -253,7 +253,7 @@ def _clean_db_engine_cache():
 
 @pytest.fixture(autouse=True)
 def _restore_signal_handlers():
-    """Saves `SIGINT`/`SIGTERM` dispositions before each test and restores
+    """Saves `SIGINT`/`SIGTERM`/`SIGHUP` dispositions before each test and restores
     them after, process-wide.
 
     `BackupDaemon.__init__` (`zfsbackup/daemon.py`) installs process-wide
@@ -279,9 +279,13 @@ def _restore_signal_handlers():
     """
     import signal
 
+    # SIGHUP too (A-6.2): `BackupDaemon.__init__` installs the supervisor's
+    # stopgap handler and `workers._init_child_process` sets SIG_IGN, and
+    # either would otherwise outlive the test that triggered it.
     saved = {
-        signal.SIGINT: signal.getsignal(signal.SIGINT),
-        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+        sig: signal.getsignal(sig)
+        for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None))
+        if sig is not None
     }
     yield
     for sig, handler in saved.items():
@@ -508,3 +512,25 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "subprocess: mark test as mocking subprocess"
     )
+
+
+# Q8 (Checkpoint A): every mocked test belongs to exactly one of the two
+# selectable tiers, so `pytest -m unit` + `pytest -m integration` together
+# cover the whole mocked suite. Most test modules never carried a marker at
+# all (only some classes were decorated), which made `-m unit` silently skip
+# the majority of the suite. Anything that declares none of the three tier
+# markers is a unit test.
+_TIER_MARKERS = ("unit", "integration", "real_zfs")
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config, items):
+    """Mark every test lacking a `unit`/`integration`/`real_zfs` marker as
+    `unit`.
+
+    `tryfirst` matters: pytest's own `-m` deselection runs in the same hook,
+    and a marker added after it would be invisible to `-m unit`.
+    """
+    for item in items:
+        if not any(item.get_closest_marker(name) for name in _TIER_MARKERS):
+            item.add_marker(pytest.mark.unit)

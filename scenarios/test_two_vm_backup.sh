@@ -49,7 +49,8 @@ SRC_DIR="/opt/zfsbackup-src"             # extracted repo inside each VM
 VENV="/opt/zfsbvenv"
 PY="${VENV}/bin/python"
 PIP="${VENV}/bin/pip"
-CFG="/etc/zfsbackup/config.yaml"
+CFG="/etc/zfsbackup/config.yaml"         # YAML import input (the daemon no longer reads YAML)
+DB="/var/lib/zfsbackup/config.db"        # SQLite config DB the daemon actually reads
 CLIENT_ID_FILE="/var/lib/zfsbackup/client_id"
 LOG="/var/log/zfsbackup.log"
 DISK_SIZE="512m"
@@ -191,7 +192,7 @@ start_daemon() {
         systemctl reset-failed zfsbackup 2>/dev/null || true
         systemd-run --unit=zfsbackup --collect \
             -p StandardOutput=append:'$LOG' -p StandardError=append:'$LOG' \
-            env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.daemon -c '$CFG' -v
+            env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.daemon -c '$DB' -v
     " || die "could not start daemon on $vm"
 }
 
@@ -206,7 +207,10 @@ daemon_running() { msh "$1" "pgrep -f 'zfsbackup.daemon' >/dev/null" 2>/dev/null
 # ─────────────────────────────── Config writers ─────────────────────────────
 # NOTE: config is delivered via `multipass transfer` (reliable) rather than piping a
 # heredoc into `multipass exec ... tee` — the latter hangs/spins on host stdin.
-put_config() { # put_config <vm> ; reads config text on stdin, installs it to $CFG
+# The daemon reads only the SQLite DB, so the YAML is imported (destructive FULL REPLACE;
+# creates the DB if missing) and the daemon must be (re)started afterwards — no live reload.
+# TODO(plan item 10): the interim importer below is replaced by `zfsbackup-config import`.
+put_config() { # put_config <vm> ; reads config text on stdin, installs it to $CFG, imports into $DB
     local vm="$1" tmp
     tmp="$(mktemp)"
     cat > "$tmp"
@@ -214,6 +218,15 @@ put_config() { # put_config <vm> ; reads config text on stdin, installs it to $C
     msh "$vm" "install -D -m600 /tmp/zfsbackup-config.yaml '$CFG' && rm -f /tmp/zfsbackup-config.yaml" \
         || die "config install failed on $vm"
     rm -f "$tmp"
+    msh "$vm" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.config.store.importer '$CFG' -c '$DB'" \
+        || die "config import failed on $vm"
+}
+
+# Remove the YAML and the config DB with its WAL sidecars (a stale -wal beside a fresh DB
+# is a confusing failure). Daemons must be stopped first. Output suppressed in the guest.
+remove_config() {
+    local vm="$1"
+    msh "$vm" "{ rm -f '$CFG' '$DB' '$DB-wal' '$DB-shm'; } >/dev/null 2>&1; true" || true
 }
 
 write_server_config() {
@@ -347,6 +360,7 @@ install_stack "$CLIENT_VM"
 
 # ── Phase 2: fresh pools ──
 stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
+remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"   # fresh DB (and no stale -wal/-shm)
 recreate_pool "$SERVER_VM" "$SERVER_POOL"
 recreate_pool "$CLIENT_VM" "$CLIENT_POOL"
 msh "$SERVER_VM" "zfs create -p '$TARGET_DS'" || die "failed to create $TARGET_DS"
@@ -485,6 +499,7 @@ if [ "$KEEP" -eq 1 ]; then
 else
     step "Tearing down"
     stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
+    remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"
     if [ "$KEEP_POOLS" -eq 0 ]; then
         destroy_pool "$SERVER_VM" "$SERVER_POOL"
         destroy_pool "$CLIENT_VM" "$CLIENT_POOL"

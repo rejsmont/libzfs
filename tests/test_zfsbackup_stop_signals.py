@@ -278,7 +278,9 @@ def _killpg_quiet(pid: int, sig: int = signal.SIGKILL) -> None:
         pass
 
 
-@pytest.mark.unit
+# No class-level `unit` mark: this module is `pytestmark = integration`, and a
+# test carrying both tier markers would be counted twice by `-m unit` +
+# `-m integration` (see tests/test_marker_tiers.py).
 class TestResolveZfsCmd:
     """`_resolve_zfs_cmd` is the seam that keeps this module's headline
     regression (and its own sensitivity control) out of CI's blind spot --

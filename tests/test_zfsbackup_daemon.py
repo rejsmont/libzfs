@@ -15,7 +15,7 @@ from zfsbackup.config.store import (
     import_yaml,
     resolve_config_path,
 )
-from zfsbackup.daemon import BackupDaemon, main
+from zfsbackup.daemon import BackupDaemon, WORKER_RESTART_DELAY, main
 from zfsbackup.runtime_config import EX_CONFIG
 from zfsbackup.workers import SnapshotWorker, PruningWorker, ApiWorker, RemoteBackupWorker
 
@@ -24,6 +24,14 @@ def _make_config(**kwargs) -> BackupConfig:
     defaults = dict(datasets=[DatasetConfig(name='pool/data')])
     defaults.update(kwargs)
     return BackupConfig(**defaults)
+
+
+def _fake_clock(daemon, mocker, start=1000.0):
+    """Drive the supervisor's restart deadlines through the `_monotonic`
+    seam. Returns a one-element list; assign `clock[0]` to advance time."""
+    clock = [start]
+    mocker.patch.object(daemon, '_monotonic', side_effect=lambda: clock[0])
+    return clock
 
 
 class TestBackupDaemonInit:
@@ -269,8 +277,17 @@ class TestCheckWorkers:
         new_worker.pid = 200
         mocker.patch.object(daemon, '_new_worker', return_value=new_worker)
         mocker.patch('zfsbackup.daemon.dispose_all')
-        mocker.patch('zfsbackup.daemon.time.sleep')
+        clock = _fake_clock(daemon, mocker)
 
+        # First pass only schedules the restart (a backoff deadline, no
+        # sleep): nothing is forked yet.
+        daemon._check_workers()
+        new_worker.start.assert_not_called()
+        assert daemon._workers['snapshot'] is dead_worker
+        assert 'snapshot' in daemon._restart_at
+
+        # Past the deadline the next poll forks the replacement.
+        clock[0] += WORKER_RESTART_DELAY
         daemon._check_workers()
         new_worker.start.assert_called_once()
         assert daemon._workers['snapshot'] is new_worker
@@ -356,7 +373,6 @@ class TestCrashLoopGuard:
         daemon._workers = {'snapshot': dead_worker}
         mocker.patch.object(daemon, '_new_worker')
         mocker.patch('zfsbackup.daemon.dispose_all')
-        mocker.patch('zfsbackup.daemon.time.sleep')
 
         daemon._check_workers()
 
@@ -377,8 +393,11 @@ class TestCrashLoopGuard:
         new_worker.pid = 200
         mocker.patch.object(daemon, '_new_worker', return_value=new_worker)
         mocker.patch('zfsbackup.daemon.dispose_all')
-        mocker.patch('zfsbackup.daemon.time.sleep')
+        clock = _fake_clock(daemon, mocker)
 
+        daemon._check_workers()
+        daemon._new_worker.assert_not_called()  # waiting out the backoff
+        clock[0] += WORKER_RESTART_DELAY
         daemon._check_workers()
 
         daemon._new_worker.assert_called_once_with('snapshot')
@@ -401,18 +420,6 @@ class TestCrashLoopGuard:
         mocker.patch('zfsbackup.backup_manager.zfs.set')
         mocker.patch('zfsbackup.daemon.dispose_all')
         mocker.patch.object(daemon, '_new_worker')  # must NEVER be called
-        # Belt-and-braces alongside the `_supervisor_sleep` patch below: if
-        # the EX_CONFIG guard under test were ever broken, `_check_workers`
-        # would fall into the ordinary respawn loop and hit its own
-        # deliberately un-sliced `time.sleep(WORKER_RESTART_DELAY)` (see
-        # `_check_workers`'s comment on why that sleep stays raw) -- which
-        # this mock does NOT neutralise via the `_supervisor_sleep` seam,
-        # since that seam only wraps the per-iteration poll sleep, not this
-        # one. Left unpatched, a reverted guard would still fail this test
-        # (the assertions below would catch it), just ~5s slower per dead
-        # worker instead of instantly.
-        mocker.patch('zfsbackup.daemon.time.sleep')
-
         config_failed_worker = MagicMock()
         config_failed_worker.is_alive.return_value = False
         config_failed_worker.pid = 100
@@ -438,19 +445,8 @@ class TestCrashLoopGuard:
         # so `_stop_event` never gets set and `run()`'s poll loop spins
         # forever; this cap turns that into a clean, fast assertion
         # failure instead of a pytest hang. Patches `_supervisor_sleep`
-        # (one call per poll iteration), the named seam, rather than
-        # counting calls to the raw `time.sleep` it wraps in 0.25s slices
-        # internally -- that raw `time.sleep` is ALSO patched above (see
-        # the comment by that patch), but only to keep it from actually
-        # sleeping if the EX_CONFIG guard is broken and the un-sliced
-        # `WORKER_RESTART_DELAY` sleep in `_check_workers`'s respawn loop
-        # is reached; it is NOT counted by this cap. Counting the sliced
-        # primitive instead of `_supervisor_sleep` would multiply this
-        # figure by roughly 20 (`SUPERVISOR_POLL / SUPERVISOR_SLEEP_SLICE`)
-        # ONLY if `time.sleep` were left un-patched and actually slept in
-        # 0.25s slices; patched, as it is here, it returns instantly and
-        # is unbounded rather than 20x -- which is exactly why the cap is
-        # on `_supervisor_sleep`, not on `time.sleep`.
+        # (one call per poll iteration), the named seam, rather than the
+        # raw `time.sleep` it wraps in 0.25s slices.
         sleep_calls = [0]
 
         def bounded_sleep(_):
@@ -507,23 +503,13 @@ class TestCrashLoopGuard:
         # keeps a broken guard from doing anything worse than looping in
         # pure Python.
         mocker.patch.object(daemon, '_new_worker', return_value=MagicMock(pid=999))
-        # Same belt-and-braces reasoning as
-        # `test_mixed_pass_no_respawn_at_all_and_run_returns_one`: patch
-        # the raw `time.sleep` too, so a broken guard that falls into the
-        # respawn loop hits its un-sliced `WORKER_RESTART_DELAY` sleep
-        # instantly rather than ~5s per dead worker later.
-        mocker.patch('zfsbackup.daemon.time.sleep')
         # Safety valve, not part of the assertion: caps the supervisor
         # poll loop at 20 iterations so a regression that breaks the
         # EX_CONFIG guard fails this test with a clean assertion instead
         # of hanging pytest (or, worse under an unmocked `_new_worker`,
         # fork-bombing the test host) -- verified by reverting the guard
         # in `_check_workers` (see this class's own docstring). Patches
-        # `_supervisor_sleep`, the named per-iteration seam; counting
-        # calls to the raw (also-patched) `time.sleep` instead would be
-        # meaningless here since patched sleeps return instantly rather
-        # than in real 0.25s slices -- see the sibling test's comment for
-        # the full reasoning.
+        # `_supervisor_sleep`, the named per-iteration seam.
         sleep_calls = [0]
 
         def bounded_sleep(_):
@@ -597,10 +583,13 @@ class TestSpawnOrdering:
         dead_worker.pid = 100
         dead_worker.exitcode = 1
         daemon._workers = {'pruning': dead_worker}
-        mocker.patch('zfsbackup.daemon.time.sleep')
+        clock = _fake_clock(daemon, mocker)
 
         call_order = self._record_calls(daemon, mocker)
 
+        daemon._check_workers()
+        assert call_order == []  # backoff pending: nothing forked yet
+        clock[0] += WORKER_RESTART_DELAY
         daemon._check_workers()
 
         assert call_order == ['dispose_all', 'new_worker:pruning', 'start']

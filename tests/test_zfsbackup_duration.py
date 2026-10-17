@@ -710,16 +710,28 @@ class TestBackupConfigDurationDefaults:
         assert cfg.prune_interval == cfg.check_interval
         assert cfg.effective_prune_interval is cfg.prune_interval
 
-    def test_from_file_prune_interval_zero_is_not_none(self, tmp_path):
-        # "0m" is present-but-zero, a real value distinct from absent -- the
-        # implementation must use `is None`, not truthiness, to decide
-        # whether to derive from check_interval.
+    def test_from_file_prune_interval_set_is_not_none(self, tmp_path):
+        # A configured prune_interval is present, a real value distinct
+        # from absent -- the implementation must use `is None`, not
+        # truthiness, to decide whether to derive from check_interval.
+        # (Originally pinned with "0m"; interval <= 0 is now rejected, so a
+        # value different from check_interval proves it is not derived.)
         f = tmp_path / "cfg.yaml"
-        f.write_text("prune_interval: 0m\ndatasets:\n  - name: pool/data\n")
+        f.write_text(
+            "check_interval: 5m\nprune_interval: 2h\ndatasets:\n  - name: pool/data\n"
+        )
         cfg = BackupConfig.from_file(f)
         assert cfg.prune_interval is not None
-        assert cfg.prune_interval.total_seconds() == 0
+        assert cfg.prune_interval.total_seconds() == 7200
         assert cfg.effective_prune_interval is cfg.prune_interval
+
+    @pytest.mark.parametrize("value", ["0m", "-5m"])
+    def test_from_file_prune_interval_non_positive_is_rejected(self, tmp_path, value):
+        # A zero/negative interval is a worker hot loop (Checkpoint A, Q3).
+        f = tmp_path / "cfg.yaml"
+        f.write_text(f"prune_interval: {value}\ndatasets:\n  - name: pool/data\n")
+        with pytest.raises(ValueError, match="prune_interval"):
+            BackupConfig.from_file(f)
 
     def test_effective_prune_interval_is_check_interval_object_when_unset(self):
         # Not just equal -- the same object, so a Duration's .literal

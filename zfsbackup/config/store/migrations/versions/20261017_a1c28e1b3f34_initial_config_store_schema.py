@@ -9,23 +9,33 @@ empty database when compared to that metadata: it creates all six tables
 declares -- both `retention_rules` partial unique indexes scoped to
 `dataset_remote_id IS NULL`, the composite FK tying
 `(dataset_id, dataset_remote_id)` to `dataset_remotes(dataset_id, id)`, all
-four CHECK constraints (both singletons, both retention-positivity checks,
+nine CHECK constraints (both singletons, both retention-positivity checks,
+the four interval/frequency positivity checks --
+`ck_global_settings_check_interval_positive`,
+`ck_global_settings_prune_interval_positive`,
+`ck_datasets_frequency_positive`, `ck_dataset_remotes_frequency_positive` --
 and `ck_global_settings_prune_literal_requires_seconds`), and every
 convention-derived name from `NAMING_CONVENTION`. DDL only -- no rows are
-seeded here (`GlobalSettings`'s single row is written by item 8's `import`,
-not by a migration).
+seeded here (`GlobalSettings`'s single row is written by `import`, not by a
+migration).
 
 The `upgrade()`/`downgrade()` bodies below are byte-for-byte what
 autogenerate produced; do not hand-edit them; regenerate instead if
-`models.py` changes. Free to regenerate wholesale until item 8 ships a real
-on-disk database -- once a deployed DB has recorded this revision id in its
-`alembic_version` table, replacing this file changes what "already at this
-revision" means for that DB, so from that point on schema changes must be
-new revisions instead.
+`models.py` changes.
 
-Revision ID: 2e8aa45e2667
+**Freeze point: this revision is frozen from the merge of `config-db-cli`
+to master.** Until then it may be regenerated wholesale (this id replaced
+`2e8aa45e2667`, which lacked the four positivity CHECKs -- Checkpoint A
+finding A5; a development database stamped with the old id fails loudly with
+`SchemaVersionMismatch` and must be deleted and re-imported). From the merge
+on, a deployed DB records this id in `alembic_version`, so replacing this
+file would change what "already at this revision" means for it, and every
+schema change must be a NEW revision (with `batch_alter_table` for anything
+SQLite cannot `ALTER` in place).
+
+Revision ID: a1c28e1b3f34
 Revises:
-Create Date: 2026-09-15 09:12:41.718134
+Create Date: 2026-10-17 13:14:33.138593
 
 """
 from typing import Sequence, Union
@@ -35,7 +45,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = '2e8aa45e2667'
+revision: str = 'a1c28e1b3f34'
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -51,6 +61,7 @@ def upgrade() -> None:
     sa.Column('frequency_seconds', sa.Float(), nullable=False),
     sa.Column('frequency_literal', sa.String(), nullable=True),
     sa.Column('enabled', sa.Boolean(), nullable=False),
+    sa.CheckConstraint('frequency_seconds > 0', name=op.f('ck_datasets_frequency_positive')),
     sa.PrimaryKeyConstraint('id', name=op.f('pk_datasets')),
     sa.UniqueConstraint('name', name=op.f('uq_datasets_name'))
     )
@@ -71,8 +82,10 @@ def upgrade() -> None:
     sa.Column('dry_run', sa.Boolean(), nullable=False),
     sa.Column('client_id_file', sa.String(), nullable=True),
     sa.Column('generation', sa.Integer(), nullable=False),
+    sa.CheckConstraint('check_interval_seconds > 0', name=op.f('ck_global_settings_check_interval_positive')),
     sa.CheckConstraint('id = 1', name=op.f('ck_global_settings_singleton')),
     sa.CheckConstraint('prune_interval_seconds IS NOT NULL OR prune_interval_literal IS NULL', name=op.f('ck_global_settings_prune_literal_requires_seconds')),
+    sa.CheckConstraint('prune_interval_seconds IS NULL OR prune_interval_seconds > 0', name=op.f('ck_global_settings_prune_interval_positive')),
     sa.PrimaryKeyConstraint('id', name=op.f('pk_global_settings'))
     )
     op.create_table('remote_server',
@@ -88,6 +101,7 @@ def upgrade() -> None:
     sa.Column('destination_name', sa.String(), nullable=False),
     sa.Column('frequency_seconds', sa.Float(), nullable=True),
     sa.Column('frequency_literal', sa.String(), nullable=True),
+    sa.CheckConstraint('frequency_seconds IS NULL OR frequency_seconds > 0', name=op.f('ck_dataset_remotes_frequency_positive')),
     sa.ForeignKeyConstraint(['dataset_id'], ['datasets.id'], name=op.f('fk_dataset_remotes_dataset_id_datasets'), ondelete='CASCADE'),
     sa.ForeignKeyConstraint(['destination_name'], ['destinations.name'], name=op.f('fk_dataset_remotes_destination_name_destinations')),
     sa.PrimaryKeyConstraint('id', name=op.f('pk_dataset_remotes')),

@@ -146,8 +146,16 @@ not exist yet.
 | `tests/test_zfsbackup_remote.py` | `RemoteBackupManager`, `ClientIdentity` |
 | `tests/test_zfsbackup_config.py` | Config loading, retention collapse, per-destination rules |
 | `tests/test_zfsbackup_duration.py` | The `Duration` type and its literal preservation |
-| `tests/test_zfsbackup_store.py` | SQLAlchemy schema, constraints, mapper, YAML import |
+| `tests/test_zfsbackup_store.py` | SQLAlchemy schema, constraints, mapper, YAML import, baseline revision |
+| `tests/test_zfsbackup_config_audit.py` | Empty-value / type audit through `from_file` and import, `validate_config` |
+| `tests/test_zfsbackup_importer_cleanup.py` | Failed-first-import cleanup never deletes a DB another process uses; orphaned-sidecar refusal |
+| `tests/test_zfsbackup_store_permissions.py` | Group-operator permission model (mocked Linux ownership) |
+| `tests/test_zfsbackup_daemon_resilience.py` | Restart backoff, shutdown `finally`, abandoned workers, SIGHUP stopgap |
+| `tests/test_zfsbackup_fork_shm.py` | Fork child must not let the parent delete `-wal`/`-shm` (runs in a timed subprocess) |
+| `tests/test_marker_tiers.py` | `unit` and `integration` partition the mocked suite |
 | `tests/test_zfsbackup_real.py` | Daemon against a real pool, marked `real_zfs` |
+
+Tests without a `unit`/`integration`/`real_zfs` marker are marked `unit` by a hook in `conftest.py`.
 
 The `mock_subprocess` fixture in `conftest.py` patches `subprocess.Popen`. Use `mock_subprocess.setup(stdout=[...], stderr='', returncode=0)` for a single call and `mock_subprocess.setup_multi(...)` for sequences.
 

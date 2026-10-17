@@ -23,7 +23,10 @@ Why a separate layer rather than making the dataclasses declarative models
 
 `zfsbackup/config/store/models.py` defines the ORM schema (`Base` plus one class
 per table). `zfsbackup/config/store/mapper.py` converts between ORM rows and the
-dataclasses: `load_config(session) -> BackupConfig` builds a fully detached
+dataclasses: `validate_config(config) -> list[str]` is the pure, session-free
+write-side check (warnings returned, `ValueError` raised) that `save_config`
+runs first and the importer runs before it touches the target;
+`load_config(session) -> BackupConfig` builds a fully detached
 `BackupConfig` (replicating `BackupConfig.from_file`'s defaulting exactly,
 except `prune_interval`'s fallback to `check_interval` and the
 `client_id_file` default -- `GlobalSettings.prune_interval_seconds` and
@@ -83,8 +86,10 @@ a **strictly sequential phase before any writer session is opened** --
 the same file and `db.py` takes SQLite's write lock at the start of every
 writer transaction. Nesting the two self-deadlocks even in a single thread
 (measured: `database is locked` after 5.2s, on a fresh database,
-deterministically). This package is not yet wired
-into the daemon, workers, or CLI -- no caller of `ensure_schema` exists yet.
+deterministically). That wrapper now exists as `importer.py`'s
+`import_yaml`, and the daemon and its workers read this package through
+`zfsbackup/runtime_config.py` (`check_schema` + `load_config`, read-only);
+the Phase 2 `zfsbackup-config` CLI is the one remaining consumer to land.
 
 `mapper.py` is a new, deliberately one-directional coupling: it imports
 `zfsbackup.config`, so `store` now depends on `config`, but `config/model.py`
@@ -160,7 +165,7 @@ from zfsbackup.config.store.db import (
     session_scope,
     url_for_path,
 )
-from zfsbackup.config.store.mapper import load_config, save_config
+from zfsbackup.config.store.mapper import load_config, save_config, validate_config
 from zfsbackup.config.store.migrate import (
     SchemaError,
     SchemaOutOfDate,
@@ -179,6 +184,7 @@ from zfsbackup.config.store.paths import (
     ConfigDbNotADatabase,
     ConfigDbNotAFile,
     ConfigDbNotFound,
+    ConfigDbOrphanedSidecars,
     ConfigDbPathUnrepresentable,
     ConfigDbPermissionError,
     ConfigPathEnvError,
@@ -210,6 +216,7 @@ __all__ = [
     "ConfigDbNotADatabase",
     "ConfigDbNotAFile",
     "ConfigDbNotFound",
+    "ConfigDbOrphanedSidecars",
     "ConfigDbPathUnrepresentable",
     "ConfigDbPermissionError",
     "ConfigPathEnvError",
@@ -250,4 +257,5 @@ __all__ = [
     "session_for_engine",
     "session_scope",
     "url_for_path",
+    "validate_config",
 ]

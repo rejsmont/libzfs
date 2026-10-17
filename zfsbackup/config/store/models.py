@@ -135,10 +135,36 @@ class GlobalSettings(Base):
             "prune_interval_seconds IS NOT NULL OR prune_interval_literal IS NULL",
             name="prune_literal_requires_seconds",
         ),
+        # Intervals must be positive. A worker sleeps with `StopFlag.wait(
+        # interval)`, which returns immediately for a timeout <= 0, so a zero
+        # or negative `check_interval`/`prune_interval` is a hot loop that
+        # shells out to `zfs list` per dataset as fast as the CPU allows
+        # (Checkpoint A finding A5; `_duration_from_config("-5m")` happily
+        # parses to -300s and "0m" to 0). `validate_config` rejects these
+        # before a write; the CHECK is the backstop for a hand-edited row.
+        # prune_interval_seconds NULL ("derive from check_interval") must
+        # stay legal, hence the IS NULL arm.
+        CheckConstraint("check_interval_seconds > 0", name="check_interval_positive"),
+        CheckConstraint(
+            "prune_interval_seconds IS NULL OR prune_interval_seconds > 0",
+            name="prune_interval_positive",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
-    snapshot_prefix: Mapped[str] = mapped_column(default="autosnap")
+    # No Python-side `default=` on any non-key NOT NULL column in this module
+    # (snapshot_prefix, api_host, api_port, dry_run, and the `recursive` /
+    # `enabled` flags below). A `default=` makes the ORM substitute its value
+    # for an explicit Python `None` at INSERT time, so a `BackupConfig`
+    # carrying `enabled=None` (disabled under YAML: `[d for d in datasets if
+    # d.enabled]`) was silently written as `True`, and `remote_backup:
+    # {enabled: null}` -- disabled under YAML -- turned the unauthenticated
+    # receive path ON after an import. The writer (`mapper.save_config`,
+    # guarded by `validate_config`) must supply every value; a `None` now
+    # fails loudly as `NOT NULL constraint failed` instead of being
+    # "repaired" into a different behaviour. Dropping `default=` is
+    # DDL-neutral (it is not a `server_default`), so no migration is implied.
+    snapshot_prefix: Mapped[str]
     check_interval_seconds: Mapped[float] = mapped_column(nullable=False)
     check_interval_literal: Mapped[Optional[str]] = mapped_column(nullable=True)
     # Nullable: NULL means "derive from check_interval at read time" --
@@ -146,9 +172,9 @@ class GlobalSettings(Base):
     # module, this NULL is not "unpopulated", it is a deliberate marker.
     prune_interval_seconds: Mapped[Optional[float]] = mapped_column(nullable=True)
     prune_interval_literal: Mapped[Optional[str]] = mapped_column(nullable=True)
-    api_host: Mapped[str] = mapped_column(default="127.0.0.1")
-    api_port: Mapped[int] = mapped_column(default=8080)
-    dry_run: Mapped[bool] = mapped_column(default=False)
+    api_host: Mapped[str]
+    api_port: Mapped[int]
+    dry_run: Mapped[bool]
     # Nullable: NULL means "resolve $HOME's default in the process that
     # uses the file" (config/model.py's `Path.home() / '.config' / 'zfsbackup' /
     # 'client_id'`), not "no value stored". A stored, materialised path
@@ -188,13 +214,20 @@ class Dataset(Base):
     """
 
     __tablename__ = "datasets"
+    __table_args__ = (
+        # Same hot-loop reasoning as `GlobalSettings.check_interval_positive`:
+        # a dataset's `frequency` is a divisor/period in `DatasetInfo`'s
+        # aligned-reference-time maths and a worker interval for remote
+        # backup, and <= 0 raises every cycle or spins.
+        CheckConstraint("frequency_seconds > 0", name="frequency_positive"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(unique=True, nullable=False)
-    recursive: Mapped[bool] = mapped_column(default=False)
+    recursive: Mapped[bool]
     frequency_seconds: Mapped[float] = mapped_column(nullable=False)
     frequency_literal: Mapped[Optional[str]] = mapped_column(nullable=True)
-    enabled: Mapped[bool] = mapped_column(default=True)
+    enabled: Mapped[bool]
 
     # DB already has ON DELETE CASCADE on the children's dataset_id FK, so
     # passive_deletes=True is paired with cascade="all, delete-orphan" to
@@ -292,6 +325,13 @@ class DatasetRemote(Base):
 
     __tablename__ = "dataset_remotes"
     __table_args__ = (
+        # NULL means "inherit the dataset's frequency" and stays legal; a
+        # stored 0 would be falsy in `to_property` (treated as inherit there)
+        # but a hot loop in `RemoteBackupWorker`, and negative is worse.
+        CheckConstraint(
+            "frequency_seconds IS NULL OR frequency_seconds > 0",
+            name="frequency_positive",
+        ),
         UniqueConstraint(
             "dataset_id", "destination_name",
             name="uq_dataset_remotes_dataset_destination",
@@ -485,7 +525,10 @@ class RemoteServer(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
     target_dataset: Mapped[str] = mapped_column(nullable=False)
-    enabled: Mapped[bool] = mapped_column(default=True)
+    # No `default=`: see GlobalSettings.snapshot_prefix. A Python default of
+    # True here is what turned `remote_backup.enabled: null` into an enabled
+    # receive path.
+    enabled: Mapped[bool]
 
     def __repr__(self) -> str:
         return f"RemoteServer(target_dataset={self.target_dataset!r}, enabled={self.enabled})"

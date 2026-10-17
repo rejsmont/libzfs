@@ -10,11 +10,36 @@ checkable by reading one file.
 Fork safety is the reason this module exists
 --------------------------------------------
 `daemon.py` is a `multiprocessing` supervisor: it spawns 3-4 worker
-processes at `daemon.py:65` (`_start_workers`) and re-spawns any that die at
-`daemon.py:77-78` (`_check_workers`) -- the second fork point happens
-arbitrarily far into the supervisor's life, so a one-time "dispose before
-`run()`" ordering rule is *structurally insufficient*. Only the pid-keyed
-cache in `get_engine()` is a real guarantee.
+processes in `BackupDaemon._start_workers` and re-spawns any that die from
+`BackupDaemon._check_workers` -- the second fork point happens arbitrarily
+far into the supervisor's life, so a one-time "dispose before `run()`"
+ordering rule is *structurally insufficient*: **every** fork point must
+call `dispose_all()` first, and `BackupDaemon._spawn` does, before every
+`Process.start()`. That call is **mandatory**, not belt-and-braces.
+
+The pid-keyed cache in `get_engine()` is the backstop for a fork point that
+forgot, and ON ITS OWN IT IS NOT ENOUGH. Measured (a parent holding a pooled
+reader connection at fork, a child that merely called `get_engine()` and
+kept its new connection open, then the parent closing everything): the
+parent's last close believed it was the last connection to the database,
+checkpointed, and DELETED `-wal`/`-shm` under the connected child. The cause
+is not file descriptors being shared but SQLite's per-PROCESS bookkeeping:
+the child inherits, by `fork`, the parent's in-memory record of which locks
+the connection holds and how many connections exist. A child connection
+opened while that inherited record is still alive reuses it without taking
+the kernel locks, so the parent can no longer see the child at all. (The
+child closing the inherited connection is harmless in itself -- `fcntl`
+locks are per-process, so it releases nothing the parent holds, and a
+pooled connection was already rolled back at check-in. What is harmful is
+the inherited record staying ALIVE while the child opens its own
+connection.) `get_engine()` therefore drops EVERY inherited engine on its
+first cache miss in a child, then runs `gc.collect()` once, before building
+anything: `dispose(close=False)` leaves the old pool and its connection
+records in a reference cycle, so the inherited `sqlite3.Connection` -- and
+with it the inherited bookkeeping -- would otherwise live until the garbage
+collector next happened to run. That guarantee holds for every cache key
+unless something calls `gc.freeze()` (frozen objects are invisible to the
+collector): any future `gc.freeze()` must come after `dispose_all()`.
 
 On platforms where the `multiprocessing` start method is `fork` (the default
 on Linux for CPython < 3.14, and still the default for the `fork` context
@@ -174,6 +199,7 @@ rule (at most one live writer connection per file per process).
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import threading
@@ -473,10 +499,10 @@ def make_engine(
     """Build a new, **uncached** SQLite `Engine` with the store's pragmas.
 
     For a config database resolved from `-c`/`ZFSBACKUP_CONFIG`/the
-    default path, prefer `config/store/paths.py`'s `open_config_db`
-    instead of calling this (or `get_engine`) directly on a hand-built
-    URL -- it runs `check_config_db`'s preflight first, which this
-    function cannot: `readonly=True` on a URL for a path that does not
+    default path, prefer `config/store/paths.py`'s `open_config_session`
+    / `open_config_connection` instead of calling this (or `get_engine`)
+    directly on a hand-built URL -- they run `check_config_db`'s preflight
+    first, which this function cannot: `readonly=True` on a URL for a path that does not
     yet exist silently creates a zero-byte file (see that module's
     docstring for the measurement).
 
@@ -606,7 +632,17 @@ _ENGINES: Dict[Tuple[str, bool, bool], Tuple[int, Engine]] = {}
 # process (`workers.py`), so two threads can reach `get_engine()` at once;
 # without this, both could build an engine and one would be leaked
 # unreferenced with an open fd.
-_ENGINES_LOCK = threading.Lock()
+#
+# A RLOCK, deliberately (unlike `dispose_all`, which runs its `gc.collect()`
+# after releasing the lock and so can use a plain one). `get_engine` must
+# collect INSIDE the lock and BEFORE it builds anything: moving the collect
+# out would hand the new engine out before the inherited connection is gone,
+# or let another thread build in between -- exactly the window the collect
+# exists to close. A collection runs arbitrary finalizers on this thread, and
+# one that reached `get_engine`/`dispose_all` would self-deadlock on a plain
+# lock; the re-entrant lock makes that merely re-entrant. (`get_engine`
+# leaves `_ENGINES` consistent before it collects, so re-entry is safe.)
+_ENGINES_LOCK = threading.RLock()
 
 
 def _reinit_lock_after_fork() -> None:
@@ -619,7 +655,7 @@ def _reinit_lock_after_fork() -> None:
     arbitrary point. The pid check in `get_engine()` owns the engines.
     """
     global _ENGINES_LOCK
-    _ENGINES_LOCK = threading.Lock()
+    _ENGINES_LOCK = threading.RLock()
 
 
 if hasattr(os, "register_at_fork"):  # POSIX only
@@ -632,18 +668,26 @@ def get_engine(
     """Return the cached `Engine` for `(url, readonly, foreign_keys)`,
     building it lazily **in the calling process**.
 
-    This is the fork guarantee. Nothing in this module builds an engine at
+    This is the fork *backstop*. Nothing in this module builds an engine at
     import time, and no engine is reachable from module or class state
     except through this cache, which is keyed by owning pid. If the cached
     engine was built by a different process -- i.e. this process inherited
-    it across a fork -- it is discarded and rebuilt, so an accidental
-    pre-fork engine becomes harmless instead of catastrophic.
-
-    Why the cache and not startup ordering: `daemon.py` forks at
-    `daemon.py:65` (`_start_workers`) *and* at `daemon.py:77-78`
-    (`_check_workers`, on every worker crash, arbitrarily late in the
-    supervisor's life, potentially after the supervisor has itself read the
-    DB). "Dispose before starting workers" cannot cover the second one.
+    it across a fork -- then on the first cache miss in this process EVERY
+    inherited entry, whatever its key, is discarded (not just the requested
+    key's: a child that asks for a different `(url, readonly,
+    foreign_keys)` than the parent cached would otherwise leave the
+    inherited engine strongly referenced forever, so the collect below could
+    never free its connection -- reproduced on 3.11-3.14), followed by one
+    `gc.collect()` before anything is built. So an accidental pre-fork
+    engine is survivable for every key -- **unless something calls
+    `gc.freeze()` between filling the cache and forking**, which hides the
+    inherited connection from the collector (reproduced); any `gc.freeze()`
+    must come after `dispose_all()`. It is **not** a substitute for `dispose_all()` at the fork
+    point, which every fork site must still call: the supervisor forks in
+    `BackupDaemon._start_workers` *and* in `BackupDaemon._check_workers`
+    (on every worker crash, arbitrarily late in its life, potentially after
+    it has itself read the DB), and `_spawn` runs `dispose_all()` before
+    each. The cache and the gc exist for the day a fork site forgets.
 
     Discard-and-rebuild, never warn-and-continue: a warning would imply the
     caller may proceed with an inherited connection, which is the exact
@@ -669,11 +713,20 @@ def get_engine(
 
     with _ENGINES_LOCK:
         cached = _ENGINES.get(key)
-        if cached is not None:
-            owner_pid, engine = cached
-            if owner_pid == pid:
-                return engine
+        if cached is not None and cached[0] == pid:
+            return cached[1]
+        cached = None
 
+        # Everything left in the cache that this process did not build was
+        # inherited across a fork. Purge ALL of it, not just `key`'s entry:
+        # an inherited engine under any other key stays strongly referenced
+        # by `_ENGINES`, so no collection could ever free its connection.
+        # Own-pid entries cannot coexist with inherited ones (the first miss
+        # in this process purges before it builds), so a hit above is safe.
+        purged = False
+        for stale_key, (owner_pid, engine) in list(_ENGINES.items()):
+            if owner_pid == pid:
+                continue
             # ------------------------------------------------------------
             # THE SINGLE MOST IMPORTANT LINE IN THIS MODULE.
             # ------------------------------------------------------------
@@ -697,12 +750,25 @@ def get_engine(
             #   [pid 97379] sqlite3.Connection DEALLOC
             #               (sqlite3_close_v2 runs on the INHERITED fd)
             #
-            # That is acceptable *here*, and was probed: a pooled
-            # connection was already rolled back at check-in, so the close
-            # is transaction-free, and WAL locking stops the child
-            # checkpointing under a live parent -- the parent's sidecars
-            # and reads were unaffected. `close=False` remains correct
-            # (SQLAlchemy's documented post-fork idiom; it skips the
+            # BUT "frees ... when the last reference drops" is the catch:
+            # `dispose(close=False)` leaves the old pool and its connection
+            # records in a reference cycle, so the inherited
+            # `sqlite3.Connection` is NOT freed here -- it lives until the
+            # garbage collector next runs, possibly long after the child
+            # has opened its own connection. In that window SQLite's
+            # inherited per-process lock bookkeeping is shared by the old
+            # and new connections, so the child's connection skips the
+            # kernel locks the parent then cannot see, and the parent's
+            # last close checkpoints and DELETES `-wal`/`-shm` under the
+            # connected child (reproduced; see the module docstring).
+            # Hence the explicit `gc.collect()` below: it forces the
+            # inherited connection to be closed NOW, before the rebuilt
+            # engine can open anything. Closing an inherited connection
+            # releases no lock the parent holds (`fcntl` locks are
+            # per-process), and a pooled connection was already rolled back
+            # at check-in, so the close itself is harmless -- the harm is the
+            # inherited in-memory lock bookkeeping outliving it. `close=False` remains
+            # correct (SQLAlchemy's documented post-fork idiom; it skips the
             # explicit close path and the `close` hooks, which is the part
             # that would actively interfere).
             #
@@ -710,16 +776,25 @@ def get_engine(
             # thread while another thread is inside a writer
             # `session_scope` block with a live `BEGIN IMMEDIATE`. That
             # connection is checked out, so `dispose(close=False)` does not
-            # touch it at all, and the child closing an fd to the file
-            # would drop the parent's POSIX advisory locks mid-transaction.
-            # Fork only from a quiescent process.
+            # touch it at all, and the child inherits a connection that
+            # believes it holds the write lock. Fork only from a quiescent
+            # process, after `dispose_all()`.
             #
             # The `connect` listener survives the rebuild: `Engine.dispose`
             # passes the old pool's dispatch into `Pool.recreate()`, so
             # pragmas keep firing on the new pool and must NOT be
             # re-registered (that would double-fire them).
             engine.dispose(close=False)
-            del _ENGINES[key]
+            del _ENGINES[stale_key]
+            purged = True
+        # Drop every remaining reference (the loop variables) and collect:
+        # see the comment above for why the inherited connections must be
+        # closed before this function can hand out -- or even build --
+        # another one. Inside the lock and before the build, on purpose:
+        # see `_ENGINES_LOCK`.
+        stale_key = owner_pid = engine = None  # noqa: F841
+        if purged:
+            gc.collect()
 
         engine = make_engine(url, readonly=readonly, foreign_keys=foreign_keys)
         _ENGINES[key] = (pid, engine)
@@ -732,9 +807,19 @@ def dispose_all() -> None:
     For test teardown, so no test leaks an engine into another test's
     process, and for item 8's pre-fork hygiene in the supervisor.
 
+    **This is the mandatory fork-point call.** Every site that forks while
+    this module's engines may exist must call it first (the daemon's
+    `_spawn` does, before every `Process.start()`); `get_engine`'s pid check
+    is only the backstop. Calling it in the PARENT, with the engines the
+    parent built, closes them for real -- which is what keeps the child from
+    ever inheriting a live connection.
+
     **Pid-guarded, like `get_engine`.** Each entry is closed for real only
     when this process is the one that built it; an entry inherited across a
-    fork is dropped with `close=False`, exactly as `get_engine` would.
+    fork is dropped with `close=False` and then `gc.collect()`ed, exactly
+    as `get_engine` would -- without the collect the inherited connection
+    would linger in a reference cycle and, in a child that goes on to open
+    its own connection, defeat SQLite's lock bookkeeping (see `get_engine`).
     Earlier this function ignored the `owner_pid` it was unpacking and
     always passed `close=True`; probed, a forked child calling it ran the
     close path on the parent's connections and exited 0 with no warning.
@@ -742,12 +827,25 @@ def dispose_all() -> None:
     for the *supervisor* -- i.e. it will be called near a fork point by
     design -- its guarantee has to be structural and not a sentence in this
     docstring. Entries are dropped either way.
+
+    A `gc.freeze()` before a fork defeats the collect (frozen objects are
+    ignored by the collector), so any future `gc.freeze()` must come AFTER
+    this function.
     """
     pid = os.getpid()
+    inherited = False
     with _ENGINES_LOCK:
-        for owner_pid, engine in _ENGINES.values():
+        for owner_pid, engine in list(_ENGINES.values()):
             engine.dispose(close=(owner_pid == pid))
+            inherited = inherited or owner_pid != pid
         _ENGINES.clear()
+        # Unbind the loop variables so no engine stays reachable from this
+        # frame when the collector runs.
+        owner_pid = engine = None  # noqa: F841
+    if inherited:
+        # An inherited engine was disposed with close=False, which leaves
+        # its connections in a reference cycle; see `get_engine`.
+        gc.collect()
 
 
 def _install_readonly_guard(session: Session) -> None:

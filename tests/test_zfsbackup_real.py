@@ -174,27 +174,6 @@ def server_cfg_path(tmp_path, source_fs, target_root):
 
 
 @pytest.fixture
-def source_config_db(tmp_path, source_cfg_path):
-    """Import `source_cfg_path` into a fresh SQLite config store under
-    `tmp_path` and return the `ResolvedConfigPath` addressing it.
-
-    `source_cfg_path` itself keeps writing YAML unchanged -- it is this
-    fixture's *input*, exactly as `zfsbackup-config import`/`import_yaml`
-    expects (item 8). Not yet consumed by any test in this file (the
-    client side here drives `RemoteBackupManager`/`DatasetManager`
-    directly via `BackupConfig.from_file`, never through a worker), but
-    kept alongside `server_config_db` for symmetry and for any future
-    client-side worker test.
-    """
-    from zfsbackup.config.store import import_yaml, resolve_config_path
-
-    db_path = tmp_path / 'source_config.db'
-    resolved = resolve_config_path(str(db_path))
-    import_yaml(source_cfg_path, resolved)
-    return resolved
-
-
-@pytest.fixture
 def server_config_db(tmp_path, server_cfg_path):
     """Import `server_cfg_path` into a fresh SQLite config store under
     `tmp_path` and return the `ResolvedConfigPath` addressing it.

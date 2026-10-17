@@ -37,6 +37,12 @@ from zfsbackup.stopflag import StopFlag
 #: runtime and break all of them at once.
 StopEvent = Union[StopFlag, Event]
 
+#: Smallest sleep between worker cycles. The config store rejects intervals
+#: <= 0 on write, but a hand-edited database can still hold one, and
+#: `StopFlag.wait(<=0)` returns immediately: the worker would shell out to
+#: `zfs` in a hot loop. `BaseWorker.run` floors the interval here.
+MIN_WORKER_INTERVAL = 1.0
+
 
 def _setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(
@@ -49,8 +55,11 @@ def _setup_logging(verbose: bool = False) -> None:
 def _init_child_process(verbose: bool = False) -> None:
     """First statement of **every** worker `run()`. Nothing may precede it.
 
-    Resets the `SIGINT`/`SIGTERM` dispositions this child must not own, and
-    only then configures logging.
+    Resets the `SIGINT`/`SIGTERM` dispositions this child must not own,
+    ignores `SIGHUP` (the supervisor's own SIGHUP stopgap logs "live reload
+    not implemented"; a worker dying on a stray hangup, or on the terminal
+    closing, would just be a crash to restart), and only then configures
+    logging.
 
     `BackupDaemon.__init__` installs the supervisor's handlers before any
     worker is created, and under the `fork` start method (CPython's default
@@ -118,6 +127,7 @@ def _init_child_process(verbose: bool = False) -> None:
     """
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
     _setup_logging(verbose)
 
 
@@ -207,6 +217,12 @@ class BaseWorker(Process):
 
         manager = DatasetManager(config)
         interval = self._get_interval(config)
+        if interval < MIN_WORKER_INTERVAL:
+            logger.warning(
+                f"{self.name} interval {interval}s is below the {MIN_WORKER_INTERVAL:g}s "
+                f"minimum (hand-edited config database?); using {MIN_WORKER_INTERVAL:g}s"
+            )
+            interval = MIN_WORKER_INTERVAL
         self._before_loop(config, manager)
 
         while not self.stop_event.is_set():

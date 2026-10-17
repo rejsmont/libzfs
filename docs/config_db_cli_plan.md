@@ -26,8 +26,9 @@ carries a status note or "as landed" text — where those disagree with the prop
 | 8x `StopFlag` | done | Found during item 8 |
 | 9 Phase 1 tests | landed with 8 | Coverage audit against item 9's list is part of Checkpoint A |
 | Checkpoint A review | done | Findings, decisions and audit under "Checkpoint A" |
-| **A-1…A-9 fix-up** | **implemented, uncommitted** | A-9 permissions scenario outstanding |
-| **A-10…A-20 review round** | **approved, in progress** | Fixes R1–R7 from the fix-up review; committed together with A-1…A-9 |
+| A-1…A-8, A-10…A-20 fix-up | done | Reviewed clean by both reviewers; mocked suite 1557 passed |
+| **A-21 follow-up** | **approved, in progress** | Five low items from the re-review |
+| **A-9 permissions scenario** | **outstanding** | Last item before Phase 2 (the two-VM D7 part is done) |
 | 10–16 Config CLI | approved, not started | Revised after Checkpoint A; order 10 → 15 → 13 → 11 → 12 → 14 → 16 |
 | 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
 | 21–23 Docs, scenarios, final review | not started | |
@@ -1256,7 +1257,7 @@ A-5, A-6.
   4. D2: `order_by(models.Destination.name)` at `mapper.py:386`.
   5. Importer: phase 0 is `from_file` + `validate_config` (warnings logged) before anything touches the
      target; if `created` and a later phase fails, unlink the DB and any `-wal`/`-shm`/`-journal` this
-     call created (lstat-checked); add `SQLAlchemyError` to `_main`'s except list until 10.3 deletes it;
+     call created (lstat-checked) *(superseded by A-11: never unlink a sidecar, never a DB in use)*; add `SQLAlchemyError` to `_main`'s except list until 10.3 deletes it;
      correct the docstring at `importer.py:17-21`.
 - **Edge cases:** `validate_config` must not evaluate `effective_client_id_file` (reads `$HOME`).
   Destination-scope `[]` still means inherit.
@@ -1505,6 +1506,30 @@ approved; exact-duplicate remotes rejected; A-17's exit 1 approved; item 15 gain
   (`test_zfsbackup_config_audit.py:276`) and `enabled-int`/`dry-run-int` (`:509`).
 - Leave `test_require_writable_false_skips_the_sidecar_check` as is.
 
+#### A-21 — Re-review follow-up *(approved 2026-10-17; separate commit)*
+Both re-reviews found the round correct and ready to commit; these low items follow in their own commit,
+straight to the developers (fixes fully specified by the reviewers), then tests and a short re-review.
+- **Store** (`importer.py`, `mapper.py`, `paths.py`, `db.py`):
+  1. A-11 residual window is wider than documented (reproduced with a forced stall): a whole concurrent
+     re-import can run between the probe's ROLLBACK and the unlink. Fingerprint the target with `lstat`
+     `(st_ino, st_size, st_mtime_ns, st_ctime_ns)` right after the probe closes (for zero-byte files, at
+     the top of `_remove_if_unused`) and require it unchanged at step 5. Size alone is not enough. Correct
+     the window description at `importer.py:48-51`, `:402-406` and the `_probe_config_empty` docstring.
+  2. A-11.2 wrong advice when two first imports race: after finding sidecars, `os.stat(target)` again;
+     if it now exists, raise "created concurrently by another process; retry" with no removal advice.
+  3. Skip WARNING wording: "… exist (another process may have it open)".
+  4. `validate_config`'s `client_id_file` check normalises before comparing (`os.path.normpath(raw) ==
+     "."`), so `"./"` and `"a/.."` are refused too.
+  5. `dispose_all`: run `gc.collect()` inside the (now re-entrant) lock, as `get_engine` does.
+  6. Stale header `paths.py:~1694-1695` ("record-only. Nothing here is called yet").
+- **Daemon** (`model.py`): reject `client_id_file` naming the current directory in `from_file`, using the
+  same normalised rule; update the stale comment at `model.py:~710-714` (import exists and calls
+  `validate_retention_uniqueness`).
+- **Tests:** each of the above, including a forced-stall test for (1) and the concurrent-create message
+  for (2).
+- **Documented exception:** the one remaining `from_file`-accepts / `validate_config`-rejects class is
+  any retention age/keep_for collision (both axes, both scopes), not only same-seconds keep_for.
+
 #### A-20 — Plan doc (main session, `low-risk`)
 - Audit-table rows, A-4.2 owner wording, item 10.2/11/15 amendments — done with this insertion.
 
@@ -1548,7 +1573,8 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
   - **Files:** new `zfsbackup/cli/{__init__,__main__,main,render,errors}.py`; `pyproject.toml`.
   - **Global:** `zfsbackup-config [-c DB] [-v]`, path from `resolve_config_path` with the daemon's order
     (6b). Only `import` may create a DB. Show A-11's "cleanup skipped" WARNING together with the import
-    error (e.g. `exc.add_note`). One error-mapping module; exit codes 0 ok, 1 invalid/refused,
+    error. A-11 currently only logs it; 10.1 adds the store side — `_remove_created_target` attaches the
+    same text to the in-flight exception with `exc.add_note` — so the CLI never has to capture log records. One error-mapping module; exit codes 0 ok, 1 invalid/refused,
     2 usage, 75 conflict/busy (retryable), 78 config DB unusable.
   - **`import <yaml>`:** always a full replace (no `--replace` flag — item 8). Prints warnings from
     `from_file` and `validate_config`. Writes `<dbdir>/<dbname>.pre-import-<UTC>.yaml` (O_EXCL, 0660)

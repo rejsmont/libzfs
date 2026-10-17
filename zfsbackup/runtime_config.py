@@ -255,7 +255,10 @@ def config_error_message(
     `require_writable=True` the open used (forwarding a different value
     would produce a confidently wrong diagnosis of an access mode the open
     never requested). If the re-run preflight finds nothing wrong, the
-    SQLite error is reported as-is rather than guessed at.
+    SQLite error is reported as-is rather than guessed at -- worded "Could
+    not open" only when SQLite itself reported `unable to open database`,
+    and "Failed to read" for any other `OperationalError` (e.g. `no such
+    table`, `database is locked`).
 
     `resolved` is `Optional` because `resolve_config_path` can itself raise
     a `ConfigPathError` (a symlink loop, an unlinked cwd) before any
@@ -273,6 +276,13 @@ def config_error_message(
         diagnosed = diagnose_open_failure(resolved, exc, require_writable=True)
         if diagnosed is not None:
             return str(diagnosed)
-        return f"Could not open the config database{where}: {exc}"
+        # "Could not open" is only true when SQLite said so. Anything else
+        # (`no such table`, `database is locked`, a read-only database) means
+        # the file opened fine and the *read* failed; mislabelling it sent
+        # operators hunting for a permissions problem that did not exist.
+        reason = str(getattr(exc, "orig", None) or exc)
+        if "unable to open database" in reason:
+            return f"Could not open the config database{where}: {exc}"
+        return f"Failed to read the config database{where}: {exc}"
 
     return f"Failed to load configuration{where}: {exc}"
