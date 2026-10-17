@@ -41,14 +41,27 @@ them, not a fourth phase:
    (3) a raw `sqlite3` probe under `BEGIN IMMEDIATE` finds `global_settings`
    absent or empty (it is written in the same transaction as all data, so
    it is the commit marker; a zero-byte file skips the probe -- nobody can
-   have written to one). Otherwise it removes NOTHING and logs one WARNING
-   naming the database, the reason and the next step. It never unlinks a
-   sidecar: the connection that created them removes them by path when it
-   closes, and deleting them by hand under a live process is how a WAL
-   database is corrupted. The window that remains -- another process
-   opening the file between the final check and the `unlink`, before it has
-   run any statement -- is closed by item 15.4's writer lock, which the CLI
-   will hold across the whole import. A failure over a pre-existing target
+   have written to one), and (4) an `lstat` fingerprint `(st_ino, st_size,
+   st_mtime_ns, st_ctime_ns)`, taken at the top of the cleanup BEFORE the
+   probe, is unchanged at the `unlink`. Otherwise it removes NOTHING and logs
+   one WARNING naming the database, the reason and the next step. It never
+   unlinks a sidecar: the connection that created them removes them by path
+   when it closes, and deleting them by hand under a live process is how a WAL
+   database is corrupted. The probe's verdict goes stale the moment its lock is
+   released -- a whole concurrent import can run between the probe's ROLLBACK
+   and the `unlink` (measured with a forced stall: it commits, exits and
+   checkpoints, leaving no sidecar for check (2) to see). The fingerprint
+   catches that, and is deliberately NOT re-taken after the probe: a retake
+   would adopt whatever a writer did in the gap as the new baseline. The probe
+   itself does not change the fingerprint (step (2) guarantees no WAL at
+   entry, so its last close checkpoints nothing; it only reads and rolls
+   back -- measured). What remains is (a) a writer that has attached but run
+   no statement yet, and (b) on a non-empty file, a writer whose whole commit
+   and checkpoint lands within one filesystem timestamp tick of the baseline
+   `lstat` (inode and size do not change; on Linux mtime/ctime come from a
+   coarse 1-10 ms clock). A zero-byte file is not affected: any write grows
+   it. Item 15.4's writer lock, which the CLI will hold across the whole
+   import, closes both. A failure over a pre-existing target
    leaves it exactly as it was -- phase 3 rolls back, and phase 2's
    migration is transactional.
 
@@ -57,6 +70,9 @@ them, not a fourth phase:
    exist next to it (`ConfigDbOrphanedSidecars`): SQLite would replay an
    orphaned `-wal`/`-journal` into the brand-new file, and a live orphan's
    `-shm` is shared by path.
+   If the database has appeared by the time the sidecars are found (two first
+   imports racing: the other one's live sidecars look identical), it raises
+   `ConfigDbCreatedConcurrently` instead -- retry, and never remove them.
 
    **The same "misuse creates nothing" property extends to a bad
    *target*, not just a bad source.** Immediately after phase 0,
@@ -177,6 +193,7 @@ from zfsbackup.config.store.paths import (
     CONFIG_DIR_MODE,
     CONFIG_PATH_ENV,
     DEFAULT_CONFIG_DB,
+    ConfigDbCreatedConcurrently,
     ConfigDbNotFound,
     ConfigDbOrphanedSidecars,
     ConfigPathError,
@@ -302,6 +319,18 @@ def _file_id(path: Path) -> Optional[Tuple[int, int]]:
     return (st.st_dev, st.st_ino)
 
 
+def _fingerprint(path: Path) -> Optional[Tuple[int, int, int, int]]:
+    """`(st_ino, st_size, st_mtime_ns, st_ctime_ns)` of `path` via `lstat`, or
+    `None` if it cannot be read. A concurrent import that commits and
+    checkpoints moves mtime/ctime (size does not necessarily change), unless
+    it lands within one filesystem timestamp tick of the baseline."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
 def _sidecars_present(target: Path) -> List[Path]:
     """The `-wal`/`-shm`/`-journal` files next to `target` that exist, by
     `lstat`. Only a positive ENOENT/ENOTDIR counts as "absent": any other
@@ -322,11 +351,24 @@ def _sidecars_present(target: Path) -> List[Path]:
 
 def _refuse_orphaned_sidecars(target: Path) -> None:
     """A-11.2: raise `ConfigDbOrphanedSidecars` if any sidecar exists next to
-    a database that does not. Creates and changes nothing."""
+    a database that does not (or `ConfigDbCreatedConcurrently` if the database
+    has appeared in the meantime). Creates and changes nothing."""
     orphans = _sidecars_present(target)
     if not orphans:
         return
+    # The sidecars are only "orphaned" if the database is still absent. A
+    # concurrent first import (which created the database after our existence
+    # check, and is holding its sidecars open right now) looks identical a
+    # moment ago, and the removal advice below would be wrong -- and harmful:
+    # deleting a live process's -wal/-shm corrupts its database. Look again.
     names = ", ".join(str(p) for p in orphans)
+    if _target_exists(target):
+        raise ConfigDbCreatedConcurrently(
+            f"{target} was created concurrently by another process while "
+            f"this import was starting ({names} are in use, not "
+            "orphaned). Nothing was created or changed here; retry the "
+            "import once the other process has finished."
+        )
     raise ConfigDbOrphanedSidecars(
         f"Refusing to create {target}: {names} already exist(s) but the "
         "database does not. Creating a database here would make SQLite "
@@ -351,6 +393,13 @@ def _probe_config_empty(target: Path) -> bool:
     returning. Busy (`timeout=1`), any `sqlite3.Error`, or a row present
     all mean "cannot prove it is empty" -- the first two raise, the last
     returns False.
+
+    The verdict holds only while the write lock is held: once the connection
+    closes, another process may import into the file. That is why the caller
+    fingerprints the file BEFORE calling this and re-checks it before
+    unlinking (`_fingerprint`); the verdict alone is not sufficient. This
+    function does not change the fingerprint: it only reads and rolls back,
+    and the caller has already established that no WAL exists.
     """
     conn = sqlite3.connect(
         target.as_uri() + "?mode=rw", uri=True, timeout=1, isolation_level=None
@@ -398,12 +447,22 @@ def _remove_created_target(target: Path, created_id: Optional[Tuple[int, int]]) 
        written to one).
     5. The probe's connection is closed BEFORE the unlink (its last close
        deletes the sidecars by path -- after an unlink that name may belong
-       to a new database), and 2 and 3 are re-checked immediately before
-       `os.unlink`. The window that remains is another process opening the
-       file between that last `lstat` and the `unlink` (or having opened it
-       without yet running a statement, so no sidecar exists); only item
-       15.4's writer lock, held by the CLI across the whole import, closes
-       it.
+       to a new database). A fingerprint `(st_ino, st_size, st_mtime_ns,
+       st_ctime_ns)` is taken by `lstat` at the top of `_remove_if_unused`,
+       BEFORE the probe (where the file's size is measured once), and 2 and 3
+       are re-checked, together with that fingerprint, immediately before
+       `os.unlink`. It is never re-taken after the probe: the probe's verdict
+       is stale once its lock is released, a whole concurrent import can run
+       before the `unlink` (measured), and a retake would adopt that import's
+       changes as the baseline. The probe does not itself change the
+       fingerprint (no WAL exists at entry, so its close checkpoints nothing).
+       The window that remains is (a) a writer that has attached but run no
+       statement and created no sidecar yet, and (b) on a non-empty file, a
+       writer whose whole commit and checkpoint lands within one filesystem
+       timestamp tick of the baseline `lstat` (coarse 1-10 ms clock on Linux;
+       inode and size do not change). Zero-byte files are not affected. Only
+       item 15.4's writer lock, held by the CLI across the whole import,
+       closes both.
     6. A sidecar is NEVER unlinked.
     7. Success logs INFO; any skip logs one WARNING (see
        `_cleanup_skipped`). Errors are logged, never raised -- this runs
@@ -428,8 +487,9 @@ def _cleanup_skipped(target: Path, reason: str, kind: str) -> None:
     """The one WARNING every skipped cleanup logs. `kind` selects the
     next step: `"zero-byte"` (the file is empty, so a re-import cannot adopt
     it), `"schema"` (a schema-only database, which a re-run of the import
-    reuses), `"imported"` (another process has imported a configuration)
-    or `"replaced"`/`"unknown"`."""
+    reuses), `"imported"` (another process has imported a configuration),
+    `"changed"` (its fingerprint moved between the check and the unlink) or
+    `"replaced"`/`"unknown"`."""
     if kind == "imported":
         step = (
             "Another process has since imported a configuration into "
@@ -439,6 +499,11 @@ def _cleanup_skipped(target: Path, reason: str, kind: str) -> None:
         step = f"Remove the empty {target} once nothing has it open, then retry."
     elif kind == "schema":
         step = "If it holds no configuration, re-running the import reuses it."
+    elif kind == "changed":
+        step = (
+            f"{target} was left intact. If it holds no configuration, "
+            "re-running the import reuses it."
+        )
     elif kind == "replaced":
         step = f"{target} is no longer the file this import created; it was left untouched."
     else:
@@ -452,10 +517,10 @@ def _cleanup_skipped(target: Path, reason: str, kind: str) -> None:
 
 def _remove_if_unused(target: Path, created_id: Optional[Tuple[int, int]]) -> None:
     """Steps 2-6 of `_remove_created_target`."""
-    try:
-        size = os.lstat(target).st_size
-    except OSError:
-        size = -1
+    # Measured once, BEFORE the probe: size/kind, and the fingerprint step 5
+    # compares against (never re-taken -- see the module docstring).
+    fingerprint = _fingerprint(target)
+    size = fingerprint[1] if fingerprint is not None else -1
     kind = "zero-byte" if size == 0 else "schema"
 
     # Step 2: replaced?
@@ -470,7 +535,7 @@ def _remove_if_unused(target: Path, created_id: Optional[Tuple[int, int]]) -> No
     if live:
         _cleanup_skipped(
             target,
-            "another process has it open: " + ", ".join(p.name for p in live) + " exist",
+            ", ".join(p.name for p in live) + " exist (another process may have it open)",
             kind,
         )
         return
@@ -487,10 +552,22 @@ def _remove_if_unused(target: Path, created_id: Optional[Tuple[int, int]]) -> No
         if not empty:
             _cleanup_skipped(target, "it now holds a configuration", "imported")
             return
+        # NOTE: no fingerprint retake here. The probe's lock is released, so
+        # its verdict is stale; step 5 compares against the fingerprint taken
+        # BEFORE the probe, or a writer landing in this gap would become the
+        # baseline. See the module docstring.
 
     # Step 5: the probe's connection is closed; re-check, then unlink.
     if _file_id(target) != created_id:
         _cleanup_skipped(target, "it was replaced during cleanup", "replaced")
+        return
+    if _fingerprint(target) != fingerprint:
+        _cleanup_skipped(
+            target,
+            "it changed since it was checked -- another process may have "
+            "written to it",
+            "changed",
+        )
         return
     live = _sidecars_present(target)
     if live:

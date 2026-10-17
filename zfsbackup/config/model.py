@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -709,9 +710,13 @@ class DatasetConfig:
                 retention_dict = {'1d': '30d'}
         # NOTE: this is the dataset-level rule set. Strict duplicate age/keep_for
         # validation (`validate_retention_uniqueness`, defined above) is
-        # deliberately NOT called here -- load must never hard-fail on a
-        # colliding config (see docs/config_db_cli_plan.md item 2b); the write
-        # paths that should call it (CLI `set`/`edit`, `import`) don't exist yet.
+        # deliberately NOT called here; the lenient collapse on load stays (see
+        # docs/config_db_cli_plan.md item 2b). The write paths own the strict
+        # check: `import` already calls it via the store's `validate_config`;
+        # the CLI `set`/`edit` commands (Phase 2) still have to. `from_file`'s
+        # only caller is now the importer, so the original "load must never
+        # hard-fail" rationale is historical -- the daemon loads from the
+        # store, not YAML -- but the behaviour is unchanged.
         for age_str, keep_str in retention_dict.items():
             age = _positive_duration_from_config(age_str, f"datasets[{name}].retention")
             keep_for = _positive_duration_from_config(keep_str, f"datasets[{name}].retention")
@@ -927,6 +932,17 @@ class BackupConfig:
         cid = data.get('client_id_file')
         if cid is not None:
             cid = _str_from_config(cid, "client_id_file")
+        # "" (like null) means unset; check it first because
+        # `os.path.normpath("")` is ".". Any other spelling of the current
+        # directory ("." "./" "././" "a/..") names a directory, never a file,
+        # so the client id could not be read or written there: refuse it
+        # rather than load a value that never worked. Same normalised rule as
+        # the store's `validate_config`. Pure string handling: no I/O.
+        if cid and os.path.normpath(cid) == ".":
+            raise ValueError(
+                f"client_id_file {cid!r} names a directory, not a file; "
+                "omit it (or set it to \"\") to derive the default from $HOME"
+            )
         client_id_file = Path(cid) if cid else None
 
         return cls(

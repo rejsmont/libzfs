@@ -27,7 +27,7 @@ carries a status note or "as landed" text — where those disagree with the prop
 | 9 Phase 1 tests | landed with 8 | Coverage audit against item 9's list is part of Checkpoint A |
 | Checkpoint A review | done | Findings, decisions and audit under "Checkpoint A" |
 | A-1…A-8, A-10…A-20 fix-up | done | Reviewed clean by both reviewers; mocked suite 1557 passed |
-| **A-21 follow-up** | **approved, in progress** | Five low items from the re-review |
+| A-21 follow-up | done | Five low items from the re-review, plus a corrected fingerprint placement found by the concurrency re-review |
 | **A-9 permissions scenario** | **outstanding** | Last item before Phase 2 (the two-VM D7 part is done) |
 | 10–16 Config CLI | approved, not started | Revised after Checkpoint A; order 10 → 15 → 13 → 11 → 12 → 14 → 16 |
 | 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
@@ -1529,6 +1529,14 @@ straight to the developers (fixes fully specified by the reviewers), then tests 
   for (2).
 - **Documented exception:** the one remaining `from_file`-accepts / `validate_config`-rejects class is
   any retention age/keep_for collision (both axes, both scopes), not only same-seconds keep_for.
+
+- **As landed:** the fingerprint is taken once, at the top of `_remove_if_unused`, before the probe —
+  not after it. A first version re-took it after the probe closed; the concurrency re-review reproduced a
+  whole concurrent import landing between the probe's close and that retake and becoming the baseline.
+  The probe never changes the fingerprint (no WAL frames exist at entry; measured 0/200 on WAL and
+  rollback-journal DBs). Remaining residual, closed by item 15.4: an opener that has run no statement as
+  of the final sidecar check, and on a non-empty file a writer whose commit and checkpoint land within
+  one filesystem timestamp tick of the baseline `lstat`.
 
 #### A-20 — Plan doc (main session, `low-risk`)
 - Audit-table rows, A-4.2 owner wording, item 10.2/11/15 amendments — done with this insertion.

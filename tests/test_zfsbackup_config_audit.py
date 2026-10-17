@@ -36,6 +36,11 @@ without the unauthenticated-receive-endpoint note 1; the duplicate-remote check
 in `DatasetConfig.from_dict` removed 6; `validate_config` not rejecting a
 `client_id_file` of `.` 5, `save_config` not storing `""` as NULL 1, no
 `""` warning 1.
+
+A-21 (the normalised current-directory rule, in `validate_config` and
+`from_file`), same method: `validate_config` comparing to the literal `"."` 7;
+`validate_config` also refusing `""` 4 (2 pre-existing); `from_file` comparing
+to the literal `"."` 5; `from_file` also refusing `""` 2 (1 pre-existing).
 """
 
 import logging
@@ -708,6 +713,100 @@ class TestClientIdFileEmptyAndDot:
 
 
 # ---------------------------------------------------------------------------
+# A-21.4 / daemon: every spelling of the current directory is refused, in BOTH
+# `from_file` and `validate_config` (the same `os.path.normpath(...) == "."` rule)
+# ---------------------------------------------------------------------------
+
+#: Spellings that normalise to "." (and are not the empty string, which is unset).
+DIRECTORY_SPELLINGS = [".", "./", "././", "a/..", "a/b/../.."]
+#: Neither the current directory nor empty: the operator's business.
+ACCEPTED_SPELLINGS = ["x/id", "..", "./a", "a/.", "client_id", "/", ".hidden", "../x"]
+
+
+class TestClientIdFileNormalisedDirectory:
+    @pytest.mark.parametrize("value", DIRECTORY_SPELLINGS)
+    def test_from_file_refuses_every_spelling_of_the_current_directory(self, tmp_path, value):
+        path = write(tmp_path, make(client_id_file=value))
+        with pytest.raises(ValueError, match="client_id_file") as excinfo:
+            BackupConfig.from_file(path)  # directly: no import involved
+        message = str(excinfo.value)
+        assert "names a directory, not a file" in message
+        assert repr(value) in message
+        assert "omit it" in message
+
+    @pytest.mark.parametrize("value", ["", None], ids=["empty-string", "null"])
+    def test_from_file_still_treats_empty_and_null_as_unset(self, tmp_path, value):
+        # `normpath("")` is "." too: "" must be decided BEFORE the directory rule.
+        assert os.path.normpath("") == "."
+        config = BackupConfig.from_file(write(tmp_path, make(client_id_file=value)))
+        assert config.client_id_file is None
+
+    def test_from_file_absent_key_is_unset(self, tmp_path):
+        config = BackupConfig.from_file(write(tmp_path, make()))
+        assert config.client_id_file is None
+
+    @pytest.mark.parametrize("value", ACCEPTED_SPELLINGS)
+    def test_from_file_accepts_everything_else(self, tmp_path, value):
+        config = BackupConfig.from_file(write(tmp_path, make(client_id_file=value)))
+        assert config.client_id_file == Path(value)
+
+    @pytest.mark.parametrize("value", ["./", "././", "a/..", "a/b/../.."])
+    def test_validate_config_refuses_the_same_spellings_as_strings(self, value):
+        with pytest.raises(ValueError, match="client_id_file") as excinfo:
+            validate_config(good_config(client_id_file=value))
+        message = str(excinfo.value)
+        assert "names a directory, not a file" in message
+        assert repr(value) in message
+
+    @pytest.mark.parametrize("value", ["a/..", "a/b/../.."])
+    def test_validate_config_refuses_path_objects_that_normalise_to_dot(self, value):
+        # `Path("a/..")` keeps its ".." (pathlib does not collapse it), so only
+        # the normalised comparison sees the directory.
+        assert os.fspath(Path(value)) != "."
+        with pytest.raises(ValueError, match="names a directory"):
+            validate_config(good_config(client_id_file=Path(value)))
+
+    def test_validate_config_empty_string_still_warns_and_is_not_refused(self):
+        warnings = validate_config(good_config(client_id_file=""))
+        assert len(warnings) == 1
+        assert "derive from $HOME" in warnings[0] and "stored unset" in warnings[0]
+
+    @pytest.mark.parametrize("value", ACCEPTED_SPELLINGS)
+    def test_validate_config_accepts_everything_else(self, value):
+        assert validate_config(good_config(client_id_file=Path(value))) == []
+
+    def test_the_two_doors_agree_on_every_spelling(self, tmp_path):
+        for value in DIRECTORY_SPELLINGS + ACCEPTED_SPELLINGS:
+            yaml_rejects = validate_rejects = False
+            try:
+                BackupConfig.from_file(write(tmp_path, make(client_id_file=value)))
+            except ValueError:
+                yaml_rejects = True
+            try:
+                validate_config(good_config(client_id_file=Path(value)))
+            except ValueError:
+                validate_rejects = True
+            assert yaml_rejects == validate_rejects == (value in DIRECTORY_SPELLINGS), value
+
+    @pytest.mark.parametrize("value", ["./", "a/.."])
+    def test_yaml_spelling_is_refused_at_import_with_nothing_created(self, tmp_path, value):
+        target = tmp_path / "brandnew" / "config.db"
+        with pytest.raises(ValueError, match="client_id_file"):
+            import_yaml(
+                write(tmp_path, make(client_id_file=value)),
+                resolve_config_path(str(target)),
+            )
+        assert not target.exists() and not target.parent.exists()
+
+    def test_empty_string_is_still_stored_as_null(self, tmp_path):
+        resolved = resolve_config_path(str(tmp_path / "cid" / "config.db"))
+        helper = TestClientIdFileEmptyAndDot()
+        raw, loaded = helper._save(resolved, good_config(client_id_file=""))
+        assert raw is None
+        assert loaded.client_id_file is None
+
+
+# ---------------------------------------------------------------------------
 # Listed gaps: non-canonical per-destination literals through the mapper
 # ---------------------------------------------------------------------------
 
@@ -1055,7 +1154,7 @@ class TestImporterFailureHandling:
         # catches a `{24h: 1M, 7d: 30d}` keep_for collision.
         path = tmp_path / "collide.yaml"
         path.write_text(COLLIDING_YAML)
-        config = BackupConfig.from_file(path)  # loads: load must never hard-fail
+        config = BackupConfig.from_file(path)  # lenient on load (the strict check is validate_config's)
         with pytest.raises(ValueError, match="same duration"):
             validate_config(config)
 

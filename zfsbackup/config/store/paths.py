@@ -219,6 +219,7 @@ __all__ = [
     "CONFIG_DIR_MODE",
     "CONFIG_OWNER",
     "CONFIG_PATH_ENV",
+    "ConfigDbCreatedConcurrently",
     "ConfigDbIsYaml",
     "ConfigDbNotADatabase",
     "ConfigDbNotAFile",
@@ -429,6 +430,17 @@ class ConfigDbOrphanedSidecars(ConfigPathError):
     open. The importer therefore creates nothing and touches nothing; the
     operator removes the files once no process has them open
     (`fuser`/`lsof`), then retries.
+    """
+
+
+class ConfigDbCreatedConcurrently(ConfigPathError):
+    """A first import found `-wal`/`-shm`/`-journal` files next to a database
+    that did not exist when it first looked, but does exist now: another
+    process created it in the meantime and has it open.
+
+    Distinct from `ConfigDbOrphanedSidecars` because the advice is the
+    opposite -- those sidecars are live, must NOT be removed, and the right
+    action is simply to retry once the other import has finished.
     """
 
 
@@ -1691,8 +1703,8 @@ def open_config_connection(
 
 
 # --------------------------------------------------------------------------
-# Creation policy (6a-4) -- record-only. Nothing here is called yet; item
-# 10's `import` is the sanctioned caller.
+# Creation policy (6a-4) -- called by `importer.import_yaml` (the only
+# sanctioned caller of the creation helpers).
 # --------------------------------------------------------------------------
 
 

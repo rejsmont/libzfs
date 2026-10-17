@@ -151,8 +151,9 @@ class BackupDaemon:
         stopgap: one plain store, read and logged by `run()`'s poll loop
         ("live reload not implemented; restart to apply"). Same rules as
         `_signal_handler`: no logging, no lock, and above all **no database
-        access** -- `db._ENGINES_LOCK` is a non-reentrant lock that the
-        interrupted main thread may already hold.
+        access** -- `db._ENGINES_LOCK` is an RLock, so a handler that
+        interrupts the main thread while it holds the lock would not
+        deadlock; it would re-enter and see `_ENGINES` half-mutated.
         """
         self._hup_requested = True
 

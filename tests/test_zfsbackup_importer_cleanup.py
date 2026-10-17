@@ -30,6 +30,23 @@ cleanup 1; a busy/garbage probe treated as "empty" 2; the probe ignoring a
 committed row 4; sidecars unlinked too 1; A-11.2 refusal removed 7, run after
 the directory work 1, run even when the database exists 5 (4 here plus
 `test_failed_import_over_existing_db_preserves_it`).
+
+A-21 (the fingerprint, the concurrent-create message), same method. The
+fingerprint is taken ONCE before the probe and compared at step 5; the stall
+tests (`stall`) land a whole concurrent import after the probe's close()
+("after_probe" -- the gap the removed retake turned into the baseline), just
+before step 5's `_file_id` and just before its fingerprint lstat. Mutations:
+the comparison removed 25; a fingerprint of `(ino, size)` only 23; without
+`st_ctime_ns` 12; without `st_mtime_ns` 5; the post-probe retake put back 14
+(including the three full-import stall tests and the cross-process one at
+"after_probe"); zero-byte files exempt 10; the "changed" skip under another
+kind 14; its next-step text reverted 5; no re-look at the database in
+`_refuse_orphaned_sidecars` 6; the concurrent-create message naming a
+hardcoded -wal/-shm instead of the sidecars found 3; that re-look always
+raising the concurrent-create error 10 (7 pre-existing orphan tests); the new
+error dropped from `zfsbackup.config.store` or `paths.__all__` 1 each. The
+`integration` class repeats the measured reproduction with B as a real
+separate process.
 """
 
 import json
@@ -41,12 +58,14 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
 from sqlalchemy.exc import OperationalError
 
 from zfsbackup.config.store import (
+    ConfigDbCreatedConcurrently,
     ConfigDbOrphanedSidecars,
     ConfigPathError,
     dispose_all,
@@ -224,7 +243,8 @@ class TestConnectedReaderKeepsItsFiles:
             assert held["conn"].execute("select count(*) from alembic_version").fetchone()[0] >= 0
 
             (message,) = [m for m in warnings_of(caplog) if "NOT removed" in m]
-            assert "another process has it open" in message
+            assert "exist (another process may have it open)" in message
+            assert "another process has it open" not in message
             assert "config.db-wal" in message and "config.db-shm" in message
             assert "re-running the import reuses it" in message
             assert message.endswith("Never delete its -wal/-shm files on their own.")
@@ -606,6 +626,514 @@ class TestRemoveCreatedTarget:
 
 
 # ---------------------------------------------------------------------------
+# A-21.1: the probe's verdict is stale once its lock is released -- the
+# fingerprint `(st_ino, st_size, st_mtime_ns, st_ctime_ns)`, taken ONCE before
+# the probe and compared at step 5, catches a writer that landed anywhere
+# between the two (never retaken after the probe: the retake's own gap let a
+# whole concurrent import become the baseline)
+# ---------------------------------------------------------------------------
+
+B_IMPORT = (
+    "import sys, logging; logging.disable(logging.WARNING);"
+    "from zfsbackup.config.store.importer import import_yaml;"
+    "from zfsbackup.config.store.paths import resolve_config_path;"
+    "r = import_yaml(sys.argv[1], resolve_config_path(sys.argv[2]));"
+    "print('B created=%s' % r.created)"
+)
+
+
+#: Where in `_remove_if_unused` a stalled cleanup lets another process run:
+#: "after_top"      -- right after the top-of-function fingerprint (before step 2);
+#: "after_probe"    -- right after `_probe_config_empty` returns, i.e. its
+#:                     connection has closed (the window the post-probe retake
+#:                     used to make fatal);
+#: "before_step5"   -- just before step 5's `_file_id` lstat;
+#: "before_compare" -- after step 5's `_file_id`, just before the fingerprint
+#:                     comparison's own lstat.
+STALL_POINTS = ("after_top", "after_probe", "before_step5", "before_compare")
+
+
+def stall(monkeypatch, point, action):
+    """Run `action()` once, at `point` of `_remove_if_unused`. Returns a dict
+    with `events` (`"fingerprint"` / `"probe"` / `"action"`, in order) and
+    `top` (the fingerprint the cleanup took before anything else)."""
+    assert point in STALL_POINTS
+    seen = {"events": [], "top": None}
+    state = {"started": False, "fired": False, "file_ids": 0, "fingerprints": 0}
+    real_fp = importer_module._fingerprint
+    real_probe = importer_module._probe_config_empty
+    real_file_id = importer_module._file_id
+
+    def fire():
+        if not state["fired"]:
+            state["fired"] = True
+            seen["events"].append("action")
+            action()
+
+    def fingerprint(path):
+        state["fingerprints"] += 1
+        if state["started"] and point == "before_compare":
+            fire()
+        value = real_fp(path)
+        seen["events"].append("fingerprint")
+        if not state["started"]:
+            state["started"] = True
+            seen["top"] = value
+            if point == "after_top":
+                fire()
+        return value
+
+    def probe(target):
+        verdict = real_probe(target)
+        seen["events"].append("probe")
+        if point == "after_probe":
+            fire()
+        return verdict
+
+    def file_id(path):
+        # `_file_id` calls after the top fingerprint: 1 is step 2, 2 is step 5.
+        if state["started"]:
+            state["file_ids"] += 1
+            if point == "before_step5" and state["file_ids"] == 2:
+                fire()
+        return real_file_id(path)
+
+    monkeypatch.setattr(importer_module, "_fingerprint", fingerprint)
+    monkeypatch.setattr(importer_module, "_probe_config_empty", probe)
+    monkeypatch.setattr(importer_module, "_file_id", file_id)
+    return seen
+
+
+class TestFingerprint:
+    def test_it_is_inode_size_mtime_and_ctime_from_lstat(self, tmp_path):
+        path = tmp_path / "f"
+        path.write_bytes(b"abc")
+        st = os.lstat(path)
+        assert importer_module._fingerprint(path) == (
+            st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+        )
+
+    def test_a_missing_path_is_none(self, tmp_path):
+        assert importer_module._fingerprint(tmp_path / "nope") is None
+
+    def test_a_symlink_is_fingerprinted_as_itself(self, tmp_path):
+        real = tmp_path / "real"
+        real.write_bytes(b"abc")
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        assert importer_module._fingerprint(link)[0] == os.lstat(link).st_ino
+        assert importer_module._fingerprint(link) != importer_module._fingerprint(real)
+
+    def test_utime_moves_mtime_and_ctime_but_not_inode_or_size(self, tmp_path):
+        path = tmp_path / "f"
+        path.write_bytes(b"abc")
+        before = importer_module._fingerprint(path)
+        time.sleep(0.05)
+        os.utime(path, ns=(before[2] - 10**10, before[2] - 10**10))
+        after = importer_module._fingerprint(path)
+        assert after[:2] == before[:2]  # size alone would not notice
+        assert after[2] != before[2] and after[3] != before[3]
+
+    def test_chmod_moves_only_ctime(self, tmp_path):
+        path = tmp_path / "f"
+        path.write_bytes(b"abc")
+        os.chmod(path, 0o600)
+        before = importer_module._fingerprint(path)
+        time.sleep(0.05)
+        os.chmod(path, 0o640)
+        after = importer_module._fingerprint(path)
+        assert after[:3] == before[:3]
+        assert after[3] != before[3]
+
+
+class TestFingerprintStall:
+    """A whole concurrent import runs while the cleanup is stalled somewhere
+    between its first fingerprint and the unlink. The fingerprint is taken
+    ONCE, before the probe, and step 5 compares against that: a retake after
+    the probe would let a writer landing in the gap become the baseline."""
+
+    CHANGED = "changed since it was checked"
+
+    def _run_concurrent_import(self, yaml_b, resolved):
+        time.sleep(0.05)  # a coarse-clock filesystem must see a later mtime/ctime
+        result = import_yaml(yaml_b, resolved)  # re-import branch: commits
+        assert result.created is False
+        dispose_all()  # B "exits": last close checkpoints and removes the sidecars
+
+    @pytest.mark.parametrize("point", ["after_probe", "before_step5", "before_compare"])
+    def test_a_full_import_in_the_stall_window_leaves_the_database_alone(
+        self, store, yaml_a, yaml_b, monkeypatch, caplog, point
+    ):
+        target, resolved = store
+        seen = {}
+        real_fp = importer_module._fingerprint  # not the recording wrapper
+
+        def b_runs():
+            self._run_concurrent_import(yaml_b, resolved)
+            seen["after"] = real_fp(target)
+
+        fail_phase3(monkeypatch)
+        stalled = stall(monkeypatch, point, b_runs)
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(OperationalError, match="database is locked"):
+                import_yaml(yaml_a, resolved)
+        monkeypatch.undo()
+
+        # Non-vacuous: the probe ran, B ran after the top fingerprint and
+        # before step 5's comparison.
+        assert stalled["events"] == ["fingerprint", "probe", "action", "fingerprint"]
+        top, after = stalled["top"], seen["after"]
+        # The measured case: same file, same size -- only the times moved.
+        # (A size-only comparison would have unlinked B's configuration.)
+        assert after[0] == top[0]
+        assert after[1] == top[1]
+        assert after[2] != top[2]
+        assert after[3] != top[3]
+
+        assert listing(target.parent) == ["config.db"]
+        with open_config_session(resolved, readonly=True) as session:
+            assert [d.name for d in load_config(session).datasets] == ["pool/B"]
+        (message,) = [m for m in warnings_of(caplog) if "NOT removed" in m]
+        assert self.CHANGED in message
+        assert "another process may have written to it" in message
+        assert f"{target} was left intact." in message
+        assert "If it holds no configuration, re-running the import reuses it." in message
+        assert message.endswith("Never delete its -wal/-shm files on their own.")
+        assert "it now holds a configuration" not in message  # not the "imported" kind
+        assert not any(r.getMessage().startswith("removed ") for r in caplog.records)
+
+    def test_the_original_error_is_not_masked_by_the_skip(
+        self, store, yaml_a, yaml_b, monkeypatch
+    ):
+        _target, resolved = store
+        fail_phase3(monkeypatch)
+        stall(monkeypatch, "after_probe", lambda: self._run_concurrent_import(yaml_b, resolved))
+        with pytest.raises(OperationalError):
+            import_yaml(yaml_a, resolved)
+
+    @pytest.mark.parametrize("point", ["after_probe", "before_step5", "before_compare"])
+    @pytest.mark.parametrize("touch", ["rewrite", "utime", "chmod"])
+    def test_a_touch_of_a_probed_database_is_noticed(
+        self, tmp_path, monkeypatch, caplog, touch, point
+    ):
+        directory = tmp_path / "d"
+        directory.mkdir()
+        db = directory / "config.db"
+        make_plain_db(db)
+        created_id = importer_module._file_id(db)
+        size = db.stat().st_size
+
+        def touched():
+            time.sleep(0.05)
+            if touch == "rewrite":  # same bytes, same size: only mtime/ctime move
+                with open(db, "r+b") as handle:
+                    handle.write(db.read_bytes()[:1])
+            elif touch == "utime":
+                mtime = os.lstat(db).st_mtime_ns
+                os.utime(db, ns=(mtime - 10**10, mtime - 10**10))
+            else:
+                os.chmod(db, 0o600 if (db.stat().st_mode & 0o777) != 0o600 else 0o640)
+
+        stalled = stall(monkeypatch, point, touched)
+        with caplog.at_level(logging.WARNING):
+            importer_module._remove_if_unused(db, created_id)
+
+        assert stalled["events"] == ["fingerprint", "probe", "action", "fingerprint"]
+        assert db.exists() and db.stat().st_size == size
+        (message,) = warnings_of(caplog)
+        assert self.CHANGED in message
+
+    @pytest.mark.parametrize("point", ["after_top", "before_step5", "before_compare"])
+    @pytest.mark.parametrize("touch", ["write", "utime", "chmod"])
+    def test_a_zero_byte_file_touched_after_the_top_fingerprint_is_not_removed(
+        self, store, yaml_a, monkeypatch, caplog, touch, point
+    ):
+        target, resolved = store
+
+        def touched():
+            time.sleep(0.05)
+            if touch == "write":
+                target.write_bytes(b"x")
+            elif touch == "utime":
+                mtime = os.lstat(target).st_mtime_ns
+                os.utime(target, ns=(mtime - 10**10, mtime - 10**10))
+            else:
+                mode = os.stat(target).st_mode & 0o777
+                os.chmod(target, 0o600 if mode != 0o600 else 0o640)
+
+        def failing(*_a, **_k):
+            raise RuntimeError("injected phase-2 failure")
+
+        monkeypatch.setattr(importer_module, "open_config_connection", failing)
+        stalled = stall(monkeypatch, point, touched)
+        monkeypatch.setattr(
+            importer_module, "_probe_config_empty",
+            lambda *_a: pytest.fail("probed a zero-byte file"),
+        )
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(RuntimeError, match="phase-2"):
+                import_yaml(yaml_a, resolved)
+
+        assert target.exists()
+        assert stalled["top"][1] == 0
+        # The top, then step 5's comparison -- no probe, nothing in between.
+        assert stalled["events"].count("fingerprint") == 2
+        (message,) = warnings_of(caplog)
+        assert self.CHANGED in message
+        assert f"{target} was left intact." in message
+
+    def test_an_unchanged_fingerprint_still_removes_the_database(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        directory = tmp_path / "d"
+        directory.mkdir()
+        db = directory / "config.db"
+        make_plain_db(db)
+        created_id = importer_module._file_id(db)
+        events = []
+        real_fp, real_probe = importer_module._fingerprint, importer_module._probe_config_empty
+        monkeypatch.setattr(
+            importer_module, "_fingerprint",
+            lambda p: (events.append("fingerprint"), real_fp(p))[1],
+        )
+        monkeypatch.setattr(
+            importer_module, "_probe_config_empty",
+            lambda t: (events.append("probe"), real_probe(t))[1],
+        )
+        with caplog.at_level(logging.INFO):
+            importer_module._remove_if_unused(db, created_id)
+
+        assert not db.exists()
+        assert warnings_of(caplog) == []
+        # The top one (kind/size and the baseline), the probe, step 5's
+        # comparison -- and NO retake between the probe and step 5.
+        assert events == ["fingerprint", "probe", "fingerprint"]
+
+    def test_an_unchanged_zero_byte_file_is_still_removed_with_two_fingerprints(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        directory = tmp_path / "d"
+        directory.mkdir()
+        db = directory / "config.db"
+        db.write_bytes(b"")
+        created_id = importer_module._file_id(db)
+        calls = []
+        real_fp = importer_module._fingerprint
+        monkeypatch.setattr(
+            importer_module, "_fingerprint", lambda p: (calls.append(p), real_fp(p))[1]
+        )
+        with caplog.at_level(logging.INFO):
+            importer_module._remove_if_unused(db, created_id)
+
+        assert not db.exists()
+        assert warnings_of(caplog) == []
+        assert len(calls) == 2  # the top, and step 5's
+
+    def test_the_replaced_check_still_wins_over_the_changed_check(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # Both differ after a swap; the message must say "replaced", not "changed".
+        directory = tmp_path / "d"
+        directory.mkdir()
+        db = directory / "config.db"
+        make_plain_db(db)
+        created_id = importer_module._file_id(db)
+        impostor = directory / "impostor"
+        make_plain_db(impostor, config_row=True)
+        stall(monkeypatch, "after_probe", lambda: os.rename(impostor, db))
+        with caplog.at_level(logging.WARNING):
+            importer_module._remove_if_unused(db, created_id)
+        (message,) = warnings_of(caplog)
+        assert "replaced during cleanup" in message
+        assert self.CHANGED not in message
+        assert importer_module._file_id(db) != created_id
+
+
+class TestTheProbeNeverChangesTheFingerprint:
+    """The invariant the single top-of-function fingerprint depends on: the
+    probe's own `BEGIN IMMEDIATE` / `ROLLBACK` / `close()` must leave
+    `(ino, size, mtime_ns, ctime_ns)` exactly as it found it, or every
+    probed cleanup would report itself as "changed"."""
+
+    def test_a_rollback_journal_database(self, tmp_path):
+        db = tmp_path / "config.db"
+        make_plain_db(db)
+        before = importer_module._fingerprint(db)
+        time.sleep(0.05)  # a probe that touched the file must show a later time
+        assert importer_module._probe_config_empty(db) is True
+        assert importer_module._fingerprint(db) == before
+        assert listing(tmp_path) == ["config.db"]
+
+    def test_a_wal_schema_only_database_from_a_real_failed_import(
+        self, store, yaml_a, monkeypatch
+    ):
+        target, resolved = store
+        real_fp, real_probe = importer_module._fingerprint, importer_module._probe_config_empty
+        seen = {}
+
+        def probe(path):
+            seen["before"] = real_fp(path)
+            time.sleep(0.05)
+            seen["verdict"] = real_probe(path)
+            seen["after"] = real_fp(path)
+            return seen["verdict"]
+
+        monkeypatch.setattr(importer_module, "_probe_config_empty", probe)
+        fail_phase3(monkeypatch)
+        with pytest.raises(OperationalError):
+            import_yaml(yaml_a, resolved)
+
+        assert seen["verdict"] is True  # the probe ran, and found it empty
+        assert seen["after"] == seen["before"]
+        assert not os.path.lexists(target)  # ...and, unchanged, it was removed
+
+
+# ---------------------------------------------------------------------------
+# A-21.2: sidecars next to a database that appeared in the meantime are live
+# ---------------------------------------------------------------------------
+
+
+class TestCreatedConcurrentlyIsNotOrphaned:
+    @pytest.fixture
+    def live_database(self, store, yaml_b):
+        """B's finished first import, plus a reader that keeps -wal/-shm live."""
+        target, resolved = store
+        import_yaml(yaml_b, resolved)
+        dispose_all()
+        reader = sqlite3.connect(str(target))
+        reader.execute("select count(*) from alembic_version").fetchall()
+        assert Path(f"{target}-wal").exists() and Path(f"{target}-shm").exists()
+        yield target, resolved, reader
+        reader.close()
+
+    @staticmethod
+    def stale_first_check(monkeypatch):
+        """`_target_exists` answers False once (what A saw before B created
+        the database), then tells the truth. Returns the call list."""
+        real = importer_module._target_exists
+        calls = []
+
+        def stale(path):
+            calls.append(Path(path))
+            return False if len(calls) == 1 else real(path)
+
+        monkeypatch.setattr(importer_module, "_target_exists", stale)
+        return calls
+
+    def test_the_database_appearing_after_the_first_check_is_reported_as_such(
+        self, live_database, yaml_a, monkeypatch
+    ):
+        target, resolved, reader = live_database
+        names = listing(target.parent)
+        before = {n: os.lstat(target.parent / n) for n in names}
+        calls = self.stale_first_check(monkeypatch)
+
+        with pytest.raises(ConfigDbCreatedConcurrently) as excinfo:
+            import_yaml(yaml_a, resolved)
+
+        assert len(calls) == 2  # the import's own check, then the re-look
+        assert isinstance(excinfo.value, ConfigPathError)
+        assert not isinstance(excinfo.value, ConfigDbOrphanedSidecars)
+        assert not isinstance(excinfo.value, OSError)
+        message = str(excinfo.value)
+        assert f"{target} was created concurrently by another process" in message
+        # ...and it names the sidecars that were actually found.
+        assert f"{target}-wal" in message and f"{target}-shm" in message
+        assert "-journal" not in message
+        assert "retry" in message
+        assert "Nothing was created or changed here" in message
+        # The advice for genuine orphans would be wrong -- and harmful -- here.
+        for advice in ("remove", "Remove", "delete", "fuser", "lsof", "orphan "):
+            assert advice not in message, advice
+        # Nothing created, nothing changed, B's configuration intact.
+        assert listing(target.parent) == names
+        for name, st in before.items():
+            now = os.lstat(target.parent / name)
+            assert (now.st_ino, now.st_size, now.st_mtime_ns) == (
+                st.st_ino, st.st_size, st.st_mtime_ns,
+            )
+        assert reader.execute("select count(*) from alembic_version").fetchone()[0] >= 0
+        monkeypatch.undo()
+        with open_config_session(resolved, readonly=True) as session:
+            assert [d.name for d in load_config(session).datasets] == ["pool/B"]
+
+    def test_a_database_that_is_still_absent_keeps_the_orphan_error(
+        self, store, yaml_a, monkeypatch
+    ):
+        target, resolved = store
+        orphan = Path(f"{target}-wal")
+        orphan.write_bytes(b"orphaned pages")
+        real = importer_module._target_exists
+        calls = []
+        monkeypatch.setattr(
+            importer_module, "_target_exists",
+            lambda p: (calls.append(p), real(p))[1],
+        )
+
+        with pytest.raises(ConfigDbOrphanedSidecars) as excinfo:
+            import_yaml(yaml_a, resolved)
+
+        assert not isinstance(excinfo.value, ConfigDbCreatedConcurrently)
+        assert len(calls) == 2  # the re-look happened, and still found nothing
+        message = str(excinfo.value)
+        assert "Refusing to create" in message
+        assert "fuser" in message and "lsof" in message
+        assert "once no process has them open" in message
+        assert listing(target.parent) == [orphan.name]
+        assert orphan.read_bytes() == b"orphaned pages"
+
+    def test_refuse_helper_directly_both_ways(self, store):
+        target, _resolved = store
+        wal = Path(f"{target}-wal")
+        wal.write_bytes(b"x")
+        with pytest.raises(ConfigDbOrphanedSidecars):
+            importer_module._refuse_orphaned_sidecars(target)
+        target.write_bytes(b"")  # the database appears
+        with pytest.raises(ConfigDbCreatedConcurrently):
+            importer_module._refuse_orphaned_sidecars(target)
+        wal.unlink()  # no sidecars: nothing to refuse, and no re-look needed
+        importer_module._refuse_orphaned_sidecars(target)
+
+    @pytest.mark.parametrize(
+        "found", [["-journal"], ["-wal"], ["-shm", "-journal"]], ids="+".join
+    )
+    def test_the_message_lists_exactly_the_sidecars_found(self, store, found):
+        target, _resolved = store
+        target.write_bytes(b"")  # the database exists
+        for suffix in found:
+            Path(f"{target}{suffix}").write_bytes(b"x")
+
+        with pytest.raises(ConfigDbCreatedConcurrently) as excinfo:
+            importer_module._refuse_orphaned_sidecars(target)
+
+        message = str(excinfo.value)
+        for suffix in ("-wal", "-shm", "-journal"):
+            assert (f"{target}{suffix}" in message) == (suffix in found), suffix
+        for advice in ("remove", "Remove", "fuser", "lsof"):
+            assert advice not in message, advice
+        assert "retry" in message
+
+    def test_no_sidecars_never_consult_the_database_check(self, store, monkeypatch):
+        target, _resolved = store
+        monkeypatch.setattr(
+            importer_module, "_target_exists",
+            lambda *_a: pytest.fail("looked for the database with no sidecar present"),
+        )
+        importer_module._refuse_orphaned_sidecars(target)
+
+    def test_the_new_error_is_exported_and_is_a_config_path_error(self):
+        import zfsbackup.config.store as store_pkg
+
+        assert store_pkg.ConfigDbCreatedConcurrently is store_paths.ConfigDbCreatedConcurrently
+        assert importer_module.ConfigDbCreatedConcurrently is store_paths.ConfigDbCreatedConcurrently
+        assert "ConfigDbCreatedConcurrently" in store_pkg.__all__
+        assert "ConfigDbCreatedConcurrently" in store_paths.__all__
+        assert issubclass(ConfigDbCreatedConcurrently, ConfigPathError)
+        assert not issubclass(ConfigDbCreatedConcurrently, ConfigDbOrphanedSidecars)
+        assert not issubclass(ConfigDbOrphanedSidecars, ConfigDbCreatedConcurrently)
+
+
+# ---------------------------------------------------------------------------
 # A-11.2: refuse a first import next to orphaned sidecars
 # ---------------------------------------------------------------------------
 
@@ -879,4 +1407,51 @@ class TestCleanupRaceAcrossProcesses:
         assert result["files"] == result["reader_files"], result
         assert result["same_inodes"] is True, result
         assert result["reader_still_reads"] is True, result
-        assert "another process has it open" in result["a_log"]
+        assert "exist (another process may have it open)" in result["a_log"]
+        assert "another process has it open" not in result["a_log"]
+
+
+@pytest.mark.integration
+class TestFingerprintStallAcrossProcesses:
+    """The measured reproduction of A-21.1: the concurrent importer is a real,
+    separate OS process that runs to completion (commit, close, exit) inside
+    the window between the probe's close() and step 5 (the gap the old
+    post-probe retake turned into the baseline)."""
+
+    @pytest.mark.parametrize("point", ["after_probe", "before_step5"])
+    def test_a_whole_importing_process_in_the_stall_window_is_noticed(
+        self, store, yaml_a, yaml_b, monkeypatch, caplog, point
+    ):
+        target, resolved = store
+        out = {}
+
+        def b_process_runs():
+            time.sleep(0.05)
+            proc = subprocess.run(
+                [sys.executable, "-c", B_IMPORT, str(yaml_b), str(target)],
+                cwd=ROOT, env=dict(os.environ, PYTHONPATH=str(ROOT)),
+                capture_output=True, text=True, timeout=60,
+            )
+            out["proc"] = proc
+            out["files_after_b"] = listing(target.parent)
+
+        fail_phase3(monkeypatch)
+        stall(monkeypatch, point, b_process_runs)
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(OperationalError):
+                import_yaml(yaml_a, resolved)
+        monkeypatch.undo()
+
+        proc = out["proc"]
+        assert proc.returncode == 0, proc.stderr
+        assert "B created=False" in proc.stdout  # B adopted A's schema-only file
+        assert out["files_after_b"] == ["config.db"]  # B exited: no sidecar left to see
+        assert target.exists()
+        conn = sqlite3.connect(str(target))
+        try:
+            assert [r[0] for r in conn.execute("select name from datasets")] == ["pool/B"]
+        finally:
+            conn.close()
+        (message,) = [m for m in warnings_of(caplog) if "NOT removed" in m]
+        assert "changed since it was checked" in message
+        assert "re-running the import reuses it" in message

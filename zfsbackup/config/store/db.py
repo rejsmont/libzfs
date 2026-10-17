@@ -633,15 +633,17 @@ _ENGINES: Dict[Tuple[str, bool, bool], Tuple[int, Engine]] = {}
 # without this, both could build an engine and one would be leaked
 # unreferenced with an open fd.
 #
-# A RLOCK, deliberately (unlike `dispose_all`, which runs its `gc.collect()`
-# after releasing the lock and so can use a plain one). `get_engine` must
-# collect INSIDE the lock and BEFORE it builds anything: moving the collect
-# out would hand the new engine out before the inherited connection is gone,
-# or let another thread build in between -- exactly the window the collect
-# exists to close. A collection runs arbitrary finalizers on this thread, and
-# one that reached `get_engine`/`dispose_all` would self-deadlock on a plain
-# lock; the re-entrant lock makes that merely re-entrant. (`get_engine`
-# leaves `_ENGINES` consistent before it collects, so re-entry is safe.)
+# A RLOCK, deliberately. `get_engine` and `dispose_all` both run their
+# `gc.collect()` INSIDE the lock: `get_engine` must collect before it builds
+# anything (moving the collect out would hand the new engine out before the
+# inherited connection is gone, or let another thread build in between --
+# exactly the window the collect exists to close), and `dispose_all` must not
+# return -- or let another thread's `get_engine` repopulate the cache -- while
+# inherited connections it just dropped are still alive. A collection runs
+# arbitrary finalizers on this thread, and one that reached
+# `get_engine`/`dispose_all` would self-deadlock on a plain lock; the
+# re-entrant lock makes that merely re-entrant. (Both functions leave
+# `_ENGINES` consistent before they collect, so re-entry is safe.)
 _ENGINES_LOCK = threading.RLock()
 
 
@@ -842,10 +844,13 @@ def dispose_all() -> None:
         # Unbind the loop variables so no engine stays reachable from this
         # frame when the collector runs.
         owner_pid = engine = None  # noqa: F841
-    if inherited:
-        # An inherited engine was disposed with close=False, which leaves
-        # its connections in a reference cycle; see `get_engine`.
-        gc.collect()
+        if inherited:
+            # An inherited engine was disposed with close=False, which leaves
+            # its connections in a reference cycle; see `get_engine`. Inside
+            # the (re-entrant) lock, like `get_engine`: otherwise another
+            # thread could build a fresh engine and open its own connection
+            # while the inherited one is still alive.
+            gc.collect()
 
 
 def _install_readonly_guard(session: Session) -> None:

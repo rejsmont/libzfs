@@ -576,8 +576,9 @@ def validate_config(config: BackupConfig) -> List[str]:
       (`dataset_remotes`' composite unique constraint; `from_dict` rejects
       the same thing at the YAML boundary, so this is the backstop for
       configs built in code);
-    - a `client_id_file` whose path is `"."` (`Path("")`, `Path(".")`, `"."`:
-      a directory, never a file);
+    - a `client_id_file` that normalises to the current directory
+      (`os.path.normpath(...) == "."`: `Path("")`, `Path(".")`, `"."`,
+      `"./"`, `"a/.."` -- a directory, never a file; `""` alone is "unset");
     - any retention rule with a non-positive `age`/`keep_for`, and any
       `validate_retention_uniqueness` collision, per scope.
 
@@ -662,22 +663,27 @@ def validate_config(config: BackupConfig) -> List[str]:
         # `os.fspath`, not `str`, so `Path("")` (which IS `Path(".")`) is
         # seen as the "." it really is. Pure string handling: no I/O.
         raw_client_id_file = os.fspath(config.client_id_file)
-        if raw_client_id_file == ".":
-            # `Path("")`, `Path(".")` and "." all name the current
-            # directory, never a file: a client-id file there could not be
-            # read or written, so this never worked -- and YAML
-            # `client_id_file: "."` is refused here at import phase 0.
-            raise ValueError(
-                "client_id_file '.' names a directory, not a file; "
-                "omit it (or set it to \"\") to derive the default from $HOME"
-            )
         if raw_client_id_file == "":
             # YAML treats "" as unset (`from_file`: `Path(cid) if cid else
             # None`). An in-code "" used to be stored verbatim and reload as
             # `Path(".")` -- a different, unusable value. `save_config`
-            # stores NULL for it.
+            # stores NULL for it. Decided BEFORE the normalised check below:
+            # `normpath("")` is also ".", but "" alone means unset.
             warnings.append(
                 'client_id_file "" means derive from $HOME; stored unset'
+            )
+        elif os.path.normpath(raw_client_id_file) == ".":
+            # `Path("")`, `Path(".")`, ".", "./" and "a/.." all name the
+            # current directory, never a file: a client-id file there could
+            # not be read or written, so this never worked -- and YAML
+            # `client_id_file: "./"` is refused here at import phase 0.
+            # Normalised, not compared to the literal ".", so the spellings
+            # `from_file` also refuses (same rule, `config/model.py`) cannot
+            # slip through a config built in code.
+            raise ValueError(
+                f"client_id_file {raw_client_id_file!r} names a directory, not a "
+                "file; omit it (or set it to \"\") to "
+                "derive the default from $HOME"
             )
 
     # Mirrors `from_file`'s per-destination url requirement

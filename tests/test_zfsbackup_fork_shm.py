@@ -43,6 +43,11 @@ collect on every miss 2; one collect per purged entry 2; a plain `Lock` at
 creation 2 (the re-entrant-finalizer test fails cleanly rather than hanging: it
 runs against a throwaway lock); a plain `Lock` in `_reinit_lock_after_fork` 1;
 building before collecting 1; the loop variables left bound 1.
+
+A-21.5 (`dispose_all` collects inside the lock), same method: the collect moved
+out of the lock 2; no collect in `dispose_all` 4 (3 here plus the pre-existing
+`test_child_dispose_all_keeps_the_sidecars_for_a_connected_child`); a plain
+`Lock` 4 (2 here plus 2 pre-existing).
 """
 
 import gc
@@ -486,14 +491,19 @@ class TestGetEnginePurgesEveryInheritedEntry:
 
         def lock_is_held():
             # Another thread cannot take it while this thread holds it.
+            # Acquire AND release on the probe's own thread: an RLock cannot
+            # be released by a thread that does not own it, and a lock left
+            # held by a dead thread would hang every later `dispose_all`.
             result = {}
-            probe = threading.Thread(
-                target=lambda: result.update(got=store_db._ENGINES_LOCK.acquire(blocking=False))
-            )
+
+            def probe_body():
+                result["got"] = store_db._ENGINES_LOCK.acquire(blocking=False)
+                if result["got"]:
+                    store_db._ENGINES_LOCK.release()
+
+            probe = threading.Thread(target=probe_body)
             probe.start()
             probe.join()
-            if result["got"]:
-                store_db._ENGINES_LOCK.release()
             return not result["got"]
 
         order = []
@@ -517,3 +527,156 @@ class TestGetEnginePurgesEveryInheritedEntry:
         assert held == {"collect": True, "build": True}
         # ...and the inherited connection is gone BEFORE anything is built.
         assert order == ["collect", "build"]
+
+
+# ---------------------------------------------------------------------------
+# A-21.5: `dispose_all` collects INSIDE the (re-entrant) lock, like `get_engine`
+# ---------------------------------------------------------------------------
+
+
+class TestDisposeAllCollectsInsideTheLock:
+    """Whitebox, without a fork (`os.getpid` patched so the entries read as
+    inherited). If the collect ran after the lock was released, another
+    thread's `get_engine` could build a fresh engine -- and open its own
+    connection -- while the inherited connection was still alive."""
+
+    @pytest.fixture
+    def urls(self, tmp_path):
+        return [f"sqlite:///{tmp_path / name}" for name in ("a.db", "b.db", "c.db")]
+
+    @staticmethod
+    def _as_inherited(monkeypatch):
+        fake = os.getpid() + 1
+        monkeypatch.setattr(store_db.os, "getpid", lambda: fake)
+
+    @staticmethod
+    def _another_thread_is_blocked():
+        """True if the module lock is held by THIS thread (a second thread
+        cannot take it)."""
+        result = {}
+
+        def probe_body():
+            # Acquire AND release on the probe's own thread: an RLock cannot
+            # be released by a thread that does not own it, and a lock left
+            # held by a dead thread would hang every later test.
+            result["got"] = store_db._ENGINES_LOCK.acquire(blocking=False)
+            if result["got"]:
+                store_db._ENGINES_LOCK.release()
+
+        probe = threading.Thread(target=probe_body)
+        probe.start()
+        probe.join()
+        return not result["got"]
+
+    def test_the_collect_runs_while_the_lock_is_held(self, urls, monkeypatch):
+        store_db.get_engine(urls[0], readonly=True)
+        store_db.get_engine(urls[1], readonly=False)
+        self._as_inherited(monkeypatch)
+        real_collect = store_db.gc.collect
+        seen = []
+
+        def collect(*args):
+            seen.append({
+                "owned": store_db._ENGINES_LOCK._is_owned(),
+                "blocks_others": self._another_thread_is_blocked(),
+                # consistent BEFORE the collect, so a re-entrant finalizer is safe
+                "cache": dict(store_db._ENGINES),
+            })
+            return real_collect(*args)
+
+        monkeypatch.setattr(store_db.gc, "collect", collect)
+
+        store_db.dispose_all()
+
+        assert seen == [{"owned": True, "blocks_others": True, "cache": {}}]
+        # ...and the lock is released again afterwards.
+        assert not store_db._ENGINES_LOCK._is_owned()
+        assert not self._another_thread_is_blocked()
+        assert store_db._ENGINES == {}
+
+    def test_no_collect_when_every_entry_is_this_processs_own(self, urls, monkeypatch):
+        store_db.get_engine(urls[0])
+        calls = []
+        monkeypatch.setattr(store_db.gc, "collect", lambda *a: calls.append(a) or 0)
+        store_db.dispose_all()
+        assert calls == []
+        assert store_db._ENGINES == {}
+
+    def test_a_finalizer_that_reenters_the_cache_during_the_collect_does_not_deadlock(
+        self, urls, monkeypatch
+    ):
+        """The collect now runs under the lock, so a finalizer that reaches
+        `get_engine`/`dispose_all` would self-deadlock on a plain `Lock`. Run
+        on a thread with a timeout, against a throwaway lock of the module's
+        own type, so a regression fails instead of hanging the suite."""
+        monkeypatch.setattr(store_db, "_ENGINES_LOCK", type(store_db._ENGINES_LOCK)())
+        store_db.get_engine(urls[0], readonly=True)
+        self._as_inherited(monkeypatch)
+        real_collect = store_db.gc.collect
+        seen = {}
+
+        def collect_with_reentrant_finalizer(*args):
+            seen["inner"] = store_db.get_engine(urls[1])  # re-enters the lock
+            store_db.dispose_all()                        # and again, nested
+            return real_collect(*args)
+
+        monkeypatch.setattr(store_db.gc, "collect", collect_with_reentrant_finalizer)
+        outcome = {}
+
+        def work():
+            try:
+                store_db.dispose_all()
+                outcome["done"] = True
+            except BaseException as exc:  # report, never hang
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        thread.join(timeout=15)
+
+        assert not thread.is_alive(), "dispose_all deadlocked re-entering _ENGINES_LOCK"
+        assert "error" not in outcome, outcome
+        assert outcome == {"done": True}
+        assert seen["inner"] is not None
+
+    def test_a_concurrent_get_engine_waits_for_the_collect(self, urls, monkeypatch):
+        """The point of the change: while `dispose_all` is collecting, another
+        thread's `get_engine` cannot build (and so cannot open a connection)."""
+        store_db.get_engine(urls[0], readonly=True)
+        self._as_inherited(monkeypatch)
+        real_collect = store_db.gc.collect
+        in_collect, release = threading.Event(), threading.Event()
+        order = []
+        real_make = store_db.make_engine
+
+        def slow_collect(*args):
+            in_collect.set()
+            assert release.wait(timeout=15)
+            order.append("collect-done")
+            return real_collect(*args)
+
+        def recording_make(*a, **k):
+            order.append("build")
+            return real_make(*a, **k)
+
+        monkeypatch.setattr(store_db.gc, "collect", slow_collect)
+        monkeypatch.setattr(store_db, "make_engine", recording_make)
+        disposer = threading.Thread(target=store_db.dispose_all, daemon=True)
+        built = {}
+        builder = threading.Thread(
+            target=lambda: built.update(engine=store_db.get_engine(urls[1])), daemon=True
+        )
+        disposer.start()
+        try:
+            assert in_collect.wait(timeout=15)
+            builder.start()
+            builder.join(timeout=0.5)
+            assert builder.is_alive(), "get_engine did not wait for dispose_all's collect"
+            assert order == []
+        finally:
+            release.set()
+        disposer.join(timeout=15)
+        builder.join(timeout=15)
+        assert not disposer.is_alive() and not builder.is_alive()
+        assert order == ["collect-done", "build"]
+        built["engine"].dispose()
