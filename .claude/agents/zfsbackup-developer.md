@@ -110,10 +110,10 @@ ORM models into daemon code. Config objects outlive any session, and a detached 
    approved plan from the user.
 2. **Implement the plan** — edit your daemon-core files per the plan items, and only those. Keep
    changes minimal and idiomatic to the surrounding code.
-3. **Run tests** — execute `pytest zfsbackup/` to validate that existing behavior is preserved and
-   (if the plan mentions new config options or behaviors) that stubs or placeholders work. Validate
-   config by importing it (`python -m zfsbackup.config.store.importer zfsbackup/config.example.yaml
-   -c /tmp/zfsbackup/config.db`) and running `python -m zfsbackup.daemon --test-config -c
+3. **Run tests** — execute `ZFS_CMD=/usr/bin/true ZPOOL_CMD=/usr/bin/true pytest tests/` to validate
+   that existing behavior is preserved and (if the plan mentions new config options or behaviors) that
+   stubs or placeholders work. Validate config by importing it (`python -m zfsbackup.cli -c
+   /tmp/zfsbackup/config.db import zfsbackup/config.example.yaml`) and running `python -m zfsbackup.daemon --test-config -c
    /tmp/zfsbackup/config.db`, then test dry-run mode. The daemon refuses a `.yaml` passed to `-c`.
 4. **Note test gaps** — if the plan requires new test coverage (especially for multiprocessing
    crashes, IPC failures, or integration scenarios), document what should be tested and hand off to
