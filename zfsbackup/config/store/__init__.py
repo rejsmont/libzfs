@@ -141,9 +141,8 @@ parses a YAML config (`BackupConfig.from_file`, never `from_dict`/
 `from_property` -- see `mapper.py`'s module docstring), then migrates the
 target database to head over its own connection, commits, closes it, and
 only then opens a fresh writer session to replace the store's contents
-wholesale via `save_config`. It also carries a throwaway `python -m
-zfsbackup.config.store.importer <yaml> [-c PATH]` CLI, deleted by item 10
-once `zfsbackup-config import` exists to call `import_yaml` directly.
+wholesale via `save_config`. `zfsbackup-config import` (`zfsbackup/cli/`)
+calls `import_yaml` directly; the module has no command line of its own.
 
 `migrate.py`'s `upgrade_schema(resolved) -> SchemaUpgrade` (item 10.1) is the
 in-place, atomic, foreign-key-verified migration `zfsbackup-config migrate`

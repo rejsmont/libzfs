@@ -877,6 +877,38 @@ class TestErrorMappingThroughTheCli:
         assert result.exit_code == 78
         assert "no such table" in result.stderr
 
+    def test_locked_database_message_reaches_the_operator_without_a_traceback(
+        self, run, db, failing_import
+    ):
+        # Ported from the deleted interim importer CLI (item 10.3): a
+        # SQLAlchemyError raised during import is a clean message, never a trace.
+        failing_import(_locked_error())
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 75
+        assert "Traceback" not in result.stderr
+        assert "database is locked" in result.stderr or "busy" in result.stderr.lower()
+
+    def test_bare_database_error_during_import_is_one_line_damaged_78(
+        self, run, db, failing_import
+    ):
+        blank_sqlite(db)
+        failing_import(DatabaseError("SELECT 1", {}, Exception("file is not a database")))
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 78
+        errors = [l for l in stderr_lines(result) if l.startswith("error:")]
+        assert len(errors) == 1
+        assert "is damaged or not an SQLite database" in errors[0]
+        assert "Traceback" not in result.stderr and "sqlalche.me" not in result.stderr
+
+    def test_other_sqlalchemy_error_during_import_is_an_internal_error_1(
+        self, run, db, failing_import
+    ):
+        failing_import(SQLAlchemyError("something odd"))
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 1
+        assert "internal error" in result.stderr
+        assert "damaged" not in result.stderr and "Traceback" not in result.stderr
+
     def test_schema_error_is_78(self, run, db, failing_import):
         failing_import(SchemaVersionMismatch("newer database"))
         result = run("import", EXAMPLE_YAML, "-c", db)
@@ -1413,6 +1445,45 @@ class TestImport:
 # --------------------------------------------------------------------------
 # export
 # --------------------------------------------------------------------------
+
+
+class TestImportOntoOrphanedSidecars:
+    """Item 10.3 (ported from the deleted interim importer CLI): a first import
+    onto a path whose database is absent but whose -wal/-shm/-journal remain is
+    refused through the real CLI, with nothing created and nothing touched."""
+
+    @pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+    def test_refused_78_nothing_created_orphans_untouched(self, run, db, suffix):
+        db.parent.mkdir(parents=True)
+        orphan = db.with_name(db.name + suffix)
+        orphan.write_bytes(b"orphaned pages")
+        before = os.lstat(orphan)
+
+        result = run("import", EXAMPLE_YAML, "-c", db)
+
+        assert result.exit_code == 78, result.stderr
+        assert not os.path.lexists(db)
+        assert sorted(p.name for p in db.parent.iterdir()) == [orphan.name]
+        after = os.lstat(orphan)
+        assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+            before.st_ino, before.st_size, before.st_mtime_ns,
+        )
+        assert orphan.read_bytes() == b"orphaned pages"
+        assert "Traceback" not in result.stderr
+
+    def test_message_names_every_orphan_and_the_way_out(self, run, db):
+        db.parent.mkdir(parents=True)
+        for suffix in ("-wal", "-shm"):
+            db.with_name(db.name + suffix).write_bytes(b"x")
+
+        result = run("import", EXAMPLE_YAML, "-c", db)
+
+        assert result.exit_code == 78, result.stderr
+        assert result.stderr.startswith("error: Refusing to create")
+        assert f"{db}-wal" in result.stderr and f"{db}-shm" in result.stderr
+        assert "fuser" in result.stderr and "lsof" in result.stderr
+        assert sidecars(db) == ["config.db-shm", "config.db-wal"]
+        assert backups(db) == []
 
 
 class TestExport:

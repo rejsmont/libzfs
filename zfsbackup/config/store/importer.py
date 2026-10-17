@@ -173,45 +173,27 @@ This module has exactly one caller of `check_config_db`'s `allow_new`
 escape hatch (via `open_config_connection`, phase 2 above) in the entire
 codebase. It must stay that way -- `allow_new` must never be reachable
 from the daemon; see `paths.py`'s docstring.
-
-8d -- interim CLI
-------------------
-`python -m zfsbackup.config.store.importer <yaml> [-c PATH]` (the `_main`
-function below) is a deliberately throwaway ~25-line argparse wrapper.
-**Item 10 deletes it** and replaces it with `zfsbackup-config import`, an
-operator-facing CLI entry point (`zfsbackup/cli/`, not owned by this
-package) that must call `import_yaml` directly -- exactly as this
-function does -- rather than reimplementing any of its phases. This
-exists only so the item-8 commit does not leave a tree with a daemon that
-refuses to start (per item 6a's hard YAML refusal) and no way at all to
-make it a database, which would break `scenarios/test_two_vm_backup.sh`
-and the smoke commands in `CLAUDE.md`.
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import os
 import sqlite3
 import stat as stat_module
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
-import yaml
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
 
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store.db import dispose_all
 from zfsbackup.config.store.mapper import load_config, save_config, validate_config
-from zfsbackup.config.store.migrate import SchemaError, ensure_schema
+from zfsbackup.config.store.migrate import ensure_schema
 from zfsbackup.config.store.models import Dataset, Destination, GlobalSettings
 from zfsbackup.config.store.paths import (
     CONFIG_DIR_MODE,
-    CONFIG_PATH_ENV,
     DEFAULT_CONFIG_DB,
     ConfigDbCreatedConcurrently,
     ConfigDbNotFound,
@@ -225,7 +207,6 @@ from zfsbackup.config.store.paths import (
     is_default_config_dir,
     open_config_connection,
     open_config_session,
-    resolve_config_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -293,8 +274,8 @@ def _prepare_target_dir(directory: Path) -> None:
     owns, `DEFAULT_CONFIG_DB.parent` (`/var/lib/zfsbackup`), where "fix a
     stale mode on re-import" is exactly the intended behaviour. It is the
     wrong behaviour for an arbitrary
-    operator-supplied `-c` path: measured, `python -m zfsbackup.config.
-    store.importer config.yaml -c ~/x.db` against an existing `$HOME`
+    operator-supplied `-c` path: measured (against the since-removed
+    interim importer CLI), `import config.yaml -c ~/x.db` on an existing `$HOME`
     (mode `0755`) silently widened it to `0770` -- a privilege escalation
     (group-writable `$HOME`, on many systems a *shared* group like
     `staff`/`users`) and a world-read drop, from a command whose stated
@@ -876,60 +857,3 @@ def import_yaml(
         replaced_destinations=replaced_destinations,
         backup_path=backup_path,
     )
-
-
-def _main(argv: Optional[List[str]] = None) -> int:
-    """See this module's "8d -- interim CLI" docstring section."""
-    parser = argparse.ArgumentParser(
-        prog="python -m zfsbackup.config.store.importer",
-        description="INTERIM tool, deleted by item 10 -- import a YAML "
-        "zfsbackup config into the SQLite config store.",
-    )
-    parser.add_argument("yaml_path", type=Path, help="YAML config to import.")
-    # Deliberately NOT type=Path: str(Path("")) == ".", which would turn
-    # `-c ""` into "the current directory" and defeat resolve_config_path's
-    # documented fallthrough to ZFSBACKUP_CONFIG. See paths.py's F3.
-    parser.add_argument(
-        "-c", "--config", default=None,
-        help=f"Config database path (default: ${CONFIG_PATH_ENV}, or {DEFAULT_CONFIG_DB}).",
-    )
-    args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO)
-
-    try:
-        resolved = resolve_config_path(args.config)
-        result = import_yaml(args.yaml_path, resolved)
-    except (
-        ConfigPathError,
-        SchemaError,
-        ValueError,
-        TypeError,
-        FileNotFoundError,
-        yaml.YAMLError,
-        # Interim, until item 10.3 deletes this wrapper: a storage-level
-        # failure (locked database, disk full, constraint) is an operator
-        # message, not a traceback.
-        SQLAlchemyError,
-    ) as exc:
-        # ValueError/TypeError/yaml.YAMLError: BackupConfig.from_file's own
-        # failure modes for a malformed YAML -- a bad parse
-        # (yaml.YAMLError), a value of the wrong shape rejected by
-        # config/model.py's own guards (ValueError), or something coerced
-        # with the wrong type, e.g. `int(api_port)` against a mapping/list
-        # (TypeError). A malformed YAML is *the* likely error for an
-        # import tool, so these must produce this tool's own clean
-        # "error: ..." line, not a bare traceback.
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-    print(
-        f"Imported {args.yaml_path} into {resolved.resolved_path}: "
-        f"created={result.created} head={result.head_revision} "
-        f"replaced {result.replaced_datasets} dataset(s), "
-        f"{result.replaced_destinations} destination(s)"
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(_main())

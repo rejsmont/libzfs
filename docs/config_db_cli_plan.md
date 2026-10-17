@@ -31,7 +31,8 @@ carries a status note or "as landed" text — where those disagree with the prop
 | A-9 scenarios | done | Two-VM harness 15/15 on the DB-backed config; `test_config_permissions.sh` 61/61 on real Linux. Startup exits 1 (not 78) on a sidecar permission error; 78 is the worker code |
 | Item 10.1 + 10.2 | done (cfa9d54) | `zfsbackup-config import/export/migrate`; reviewed by both reviewers |
 | Items 10.4–10.6 review fixes | done | Foreign-DB refusal, exit-code contract, ^C/SIGTERM/backup hygiene, connect-failure fd leak |
-| Item 10.3 | pending | Delete the interim importer after 10.4 |
+| Item 10.3 | done | Interim `python -m zfsbackup.config.store.importer` deleted; scenarios and docs use `zfsbackup-config import` |
+| **Item 15** | **in progress** | 15.2(c) daemon lock and 14.1 helpers started; 15.1 next |
 | 10–16 Config CLI | approved, not started | Revised after Checkpoint A; order 10 → 15 → 13 → 11 → 12 → 14 → 16 |
 | 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
 | 21–23 Docs, scenarios, final review | not started | |

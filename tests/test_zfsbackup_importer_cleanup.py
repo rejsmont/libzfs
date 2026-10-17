@@ -1259,16 +1259,6 @@ class TestOrphanedSidecarsRefused:
             reader.close()
         assert result.created is False
 
-    def test_the_interim_cli_reports_the_refusal_cleanly(
-        self, store, yaml_a, capsys
-    ):
-        target, _resolved = store
-        Path(f"{target}-shm").write_bytes(b"x")
-        code = importer_module._main([str(yaml_a), "-c", str(target)])
-        assert code == 1
-        assert "Refusing to create" in capsys.readouterr().err
-        assert listing(target.parent) == ["config.db-shm"]
-
 
 # ---------------------------------------------------------------------------
 # Cross-process variant of the two measured reproductions (integration)

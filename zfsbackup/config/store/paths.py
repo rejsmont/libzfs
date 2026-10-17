@@ -162,8 +162,8 @@ Creation policy
 ----------------
 This module creates nothing at import time and nothing on its own. The
 daemon must never auto-create a config database; the CLI creates one only
-via an explicit `zfsbackup-config import` (item 10; `zfsbackup/config/
-store/importer.py`'s `import_yaml` in the item-8 interim), which must
+via an explicit `zfsbackup-config import` (item 10; it calls `zfsbackup/
+config/store/importer.py`'s `import_yaml`), which must
 call, in order: `ensure_config_dir`, `create_config_db_file` (creates the
 file AND fixes its mode as one step, so the mandated create-then-chmod-
 before-first-connection ordering is not something item 10's

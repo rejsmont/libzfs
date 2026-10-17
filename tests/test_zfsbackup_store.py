@@ -4,7 +4,7 @@ and the engine/session module (item 5, `zfsbackup/config/store/db.py`).
 
 This is store-layer coverage: `zfsbackup/config/store/` defines the schema, the
 dataclass<->ORM mapper, Alembic migrations, engine/session management, path
-resolution/permissions and the interim YAML importer. The daemon and its
+resolution/permissions and the YAML importer used by `zfsbackup-config import`. The daemon and its
 workers read the store through `zfsbackup.runtime_config` (item 8); the
 config CLI (Phase 2) is not built yet.
 

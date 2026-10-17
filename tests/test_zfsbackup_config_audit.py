@@ -1290,16 +1290,3 @@ class TestImporterFailureHandling:
         import_yaml(config_yaml_path, resolved)
 
         assert (directory.stat().st_mode & 0o7777) == 0o755
-
-    def test_main_reports_sqlalchemy_errors_cleanly(
-        self, tmp_path, config_yaml_path, monkeypatch, capsys
-    ):
-        from sqlalchemy.exc import OperationalError
-
-        def locked(*_a, **_k):
-            raise OperationalError("stmt", {}, Exception("database is locked"))
-
-        monkeypatch.setattr(importer_module, "import_yaml", locked)
-        code = importer_module._main([str(config_yaml_path), "-c", str(tmp_path / "x.db")])
-        assert code == 1
-        assert "database is locked" in capsys.readouterr().err
