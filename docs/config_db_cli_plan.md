@@ -1,7 +1,8 @@
 # zfsbackup: SQLite Config Store + Config CLI + Live Reload
 
 **Status (2026-10-17):** Phase 0 and Phase 1 **implemented** on branch `config-db-cli` (items 1–8x,
-with item 9's tests landed alongside item 8); mocked suite green at 1071 passed. **Checkpoint A pending.**
+with item 9's tests landed alongside item 8); mocked suite green at 1071 passed. **Checkpoint A held
+2026-10-17; its fix-up cycle (A-1…A-9) and the revised Phase 2 are approved.**
 Phases 2 and 3 not started. Sections below still read as the original proposal except where an item
 carries a status note or "as landed" text — where those disagree with the proposal, the note wins.
 **Scope:** `zfsbackup/` only. No `libzfseasy/` changes.
@@ -24,9 +25,10 @@ carries a status note or "as landed" text — where those disagree with the prop
 | 8 DB canonical | done, **with carry-overs** | See item 8's status note |
 | 8x `StopFlag` | done | Found during item 8 |
 | 9 Phase 1 tests | landed with 8 | Coverage audit against item 9's list is part of Checkpoint A |
-| **Checkpoint A** | **pending** | |
-| 10–16 Config CLI | not started | `zfsbackup/cli/` does not exist |
-| 17–20 Live reload | not started | Item 17 text predates 8x — must be revised before implementation |
+| Checkpoint A review | done | Findings, decisions and audit under "Checkpoint A" |
+| **A-1…A-9 fix-up** | **approved, in progress** | Lands before Phase 2 |
+| 10–16 Config CLI | approved, not started | Revised after Checkpoint A; order 10 → 15 → 13 → 11 → 12 → 14 → 16 |
+| 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
 | 21–23 Docs, scenarios, final review | not started | |
 
 > **All design questions are settled; no open decisions remain.** Items 2 (duration handling) and 5 (fork
@@ -922,6 +924,8 @@ Consequences:
   validates the DB. The value crossing the process boundary remains a plain path/URL string —
   pickle-safe, no engine, no session. **Do not pass a loaded `BackupConfig` to workers**; that would break
   item 5's fork safety and defeat Phase 3.
+  *(Superseded by Checkpoint A decision Q4 / item 15.2: workers now receive the supervisor's
+  detached `BackupConfig` — a dataclass holding no file handle — and never read the DB.)*
 - **Consequence worth noting:** because the DB is now canonical and every edit buffer is regenerated from
   it, **duration literal preservation (item 2) becomes load-bearing rather than a nicety.** Every `edit`
   round-trip reads literals out of `age_literal`/`keep_for_literal`/`frequency_literal`; if those were not
@@ -1066,8 +1070,8 @@ rediscovered.
     `to_property()` output.
   - **`__str__` is unchanged** — `str(Duration("1M")) == "30 days, 0:00:00"`, asserted directly, so
     a later refactor cannot silently alter daemon log output.
-  - **`.literal` and `.timedelta` accessors** — `.literal` returns the source string (`None` for
-    values constructed from a `timedelta`); `.timedelta` returns a value equal to the `Duration` but of
+  - **`.literal` and `.timedelta` accessors** — `.literal` returns the source string (for values
+    constructed from a `timedelta`, a synthesized literal — see the constructor-forms bullet); `.timedelta` returns a value equal to the `Duration` but of
     **exactly** type `timedelta` (`type(d.timedelta) is timedelta`, not merely `isinstance`), carrying no
     literal.
   - **All three constructor forms** — `Duration("1M")` parses and sets `.literal`;
@@ -1123,209 +1127,433 @@ rediscovered.
   - New `sqlite_config_path` conftest fixture mirroring `config_yaml_path` (`tests/conftest.py:206-217`).
 - **Verification:** `pytest tests/test_zfsbackup_*.py` fully green.
 
-> ### ⛳ CHECKPOINT A — review before Phase 2
-> Phase 1 is independently useful and independently revertible. Confirm the schema, fork-safety approach,
-> `Duration` semantics (especially the `__str__` log-output change), and the path/permissions policy
-> before any CLI work. Phase 2's dot-path semantics depend directly on the item-3 schema.
+> ### ⛳ CHECKPOINT A — held 2026-10-17
+> Reviewed by two `zfs-code-reviewer` passes (config/store layer; daemon side) and `concurrency-reviewer`.
+> **Verdict: Phase 1 is safe in production as it stands** — no reachable path corrupts the DB or tears
+> a backup. Defects that Phase 2 would build on are fixed in the fix-up cycle below before any CLI work.
+> The de-duplicated findings (IDs A1–A5, B1–B5, C1–C3, D1–D7) are cited by the items that follow.
+>
+> **Verified clean:** Duration literal round-trip at every level including per-destination; override vs
+> inherit; tri-states; schema constraints (partial unique indexes, FK RESTRICT/cascades); `migrate.py`
+> revision cases; wire format byte-identical; torn-read protection; no engine at import time;
+> `dispose_all()` before every fork; read-only worker sessions; no checkpoint starvation; retention and
+> anchor behaviour unchanged for configs without per-destination rules; item 9 coverage complete except
+> the gaps listed in A-8.
+
+### Checkpoint A findings (summary)
+
+| ID | Sev. | Finding | Fixed in |
+|---|---|---|---|
+| A1 | MED | `None` bool/str fields replaced by ORM Python defaults on save — `enabled: null` (disabled under YAML) imports as enabled; `remote_backup.enabled: null` enables the unauthenticated receive path; `dry_run: "false"` crashes import with a traceback | A-1, A-2 |
+| A2 | MED | Validation only inside `save_config` (needs a session); importer validates after creating + migrating the target, leaving an empty stamped DB | A-2 |
+| A3 | MED | Empty dataset-level retention (`[]` = never prune) reloads as 1d→30d | A-1, A-2 |
+| A4 | MED-HIGH | Permission model broken for non-root operators: re-import widens a 0600 file to 0660; non-owner chmod is EPERM; chmod strips setgid; operator-owned `-wal`/`-shm` lock out the daemon | A-4 |
+| A5 | LOW-MED | Zero/negative intervals accepted → worker hot loop | A-1, A-2, A-3, A-5 |
+| B1 | MED | Schema check compares DB head with on-disk scripts (not in-memory code) on a separate connection | 10.1, 15.2 |
+| B2 | — | No generation CAS; FK-off migration connection never runs `foreign_key_check` | 10.1, 15.1 |
+| B3 | MED | Workers run on different config generations after a CLI edit | 15.2 |
+| B4 | MED | No-backoff respawn loop for non-EX_CONFIG load failures | A-5 |
+| B5 | — | `rename --clear-stale-props` while a daemon runs can destroy the incremental base | 14.2 |
+| C1 | HIGH (latent) | pid-keyed engine cache alone is not fork-safe; `dispose_all()` at the fork point is what protects | A-6.1 |
+| C2 | MED | Abandoned worker wedges interpreter exit; exception in the poll loop skips graceful shutdown | A-6.2 |
+| C3 | LOW | SIGHUP default-terminates; startup ignores the stop flag between spawns; systemd `KillMode`; websocket timeouts | A-6.2 (part), items 18/21 |
+| D1–D7 | LOW | Lossy duplicate dedupe; unordered destinations; tracebackless startup errors; YAML hint misses `-c`; stale docs; missing `packages`; two-VM scenario on YAML | A-2, A-5, A-7, 10.2, A-9 |
+
+### Checkpoint A decisions *(user, 2026-10-17)*
+
+- **(a) Empty values keep their YAML meaning.** If YAML allowed an empty value that produced a runtime
+  default or behaviour, the DB reproduces it; behaviours with adverse effects come with a WARNING
+  rather than a rejection. Values whose YAML behaviour was simply broken (a TypeError every cycle, a
+  hot loop) are rejected — see Q2 and Q3.
+- **(b) Non-root operators are in scope now** — group `zfsbackup` operators editing a DB owned by user
+  `zfsbackup`. Fixed in A-4, before Phase 2's write path is built.
+- **Q1** Never-prune YAML spelling: `retention: forever` (dataset level only). `null`, `{}` and an
+  absent key keep meaning the documented 1d→30d default.
+- **Q2** `snapshot_prefix: null` is rejected (the runtime never worked with it). The error tells an
+  operator with `None_*` snapshots to set `"None"` explicitly.
+- **Q3** Intervals ≤ 0 are rejected on write; the runtime also floors the worker interval at 1s.
+- **Q4** Workers receive the supervisor's detached `BackupConfig` and never read the DB. This
+  **reverses item 8's "do not pass a loaded `BackupConfig` to workers"**: a detached dataclass holds no
+  file handle, so fork safety is intact.
+- **Q5** Regenerate the baseline revision under a new id with the A5 CHECKs, and freeze it at the merge
+  of `config-db-cli` to master. Development DBs must be deleted and re-imported.
+- **Q6** CLI commands use "destination" (`list destinations`, `edit destination`, `rename destination`);
+  `remote:` survives only as the YAML / dot-path key under a dataset.
+- **Q7** A root import creating the default directory/file chgrps it to `zfsbackup` when that group
+  exists; otherwise it warns that operators will be locked out.
+- **Q8** A conftest hook marks unmarked tests `unit`.
+- **Q9** The pre-import backup is a YAML file, with `--no-backup` to opt out.
+
+### Decision (a) — field audit
+
+"Normalize" means `from_file` turns the value into the concrete value the YAML runtime already behaved
+as. "Reject" means a clean `ValueError` naming the key, raised before anything is written.
+
+| Field | YAML today (`from_file` → runtime) | DB today | Fix |
+|---|---|---|---|
+| `datasets[].enabled: null` | falsy → **disabled** | default **True** | Normalize `False` + WARNING |
+| `enabled`/`recursive`/`dry_run`/`remote_backup.enabled` as a string | truthy | `StatementError` traceback | Reject (type) |
+| `datasets[].recursive: null` | falsy | default False | Normalize `False`, silently |
+| `datasets[].frequency` ≤ 0 | raises each cycle / remote worker hot loop | stored | Reject |
+| `retention` absent / `null` / `{}` | default 1d→30d | one row | Unchanged |
+| dataset-level `[]` (direct, CLI, `forever`) | **never prune** | reloads as 1d→30d | Zero rows load as `[]` + WARNING |
+| `remote[].frequency: null` | inherit | NULL | Unchanged |
+| `remote[].frequency: 0m` | falsy → inherit | stored 0 | Normalize `None` (inherit) + WARNING |
+| `remote[].frequency` < 0 | negative interval, hot loop | stored | Reject |
+| `snapshot_prefix: null` / non-string | TypeError every cycle; `None_*` snapshots never pruned | silently `autosnap` | Reject (Q2) |
+| `snapshot_prefix` containing `_` | nothing is ever managed or pruned (pre-existing parser bug) | stored | WARNING; parser fix deferred |
+| `check_interval` / `prune_interval` ≤ 0 | hot loop | stored | Reject (Q3) |
+| `prune_interval: null` | derive (3c) | NULL | Unchanged |
+| `api_host: null` | Flask binds 127.0.0.1 | default 127.0.0.1 | Normalize `"127.0.0.1"`, silently |
+| `api_port` null / bool / float / out of range | TypeError / `true`→1 / truncation | n/a | Reject; digit strings accepted; 0 warns |
+| `dry_run: null` | falsy → live | default False | Normalize `False`, silently |
+| `client_id_file` non-string | TypeError | n/a | Reject |
+| dataset `name` / destination key not a string | flows through | type changes | Reject |
+| `remote_backup.enabled: null` | falsy → **disabled** | **True** (unauthenticated receive) | Normalize `False` + WARNING |
 
 ---
 
-## Phase 2 — Config CLI
+## Checkpoint A fix-up *(approved 2026-10-17; lands before Phase 2)*
 
-### Item 10 — CLI skeleton + entry point
+Two developer lanes on disjoint files, run in parallel: **store** A-2 → A-3 → A-4 → A-6.1 → A-7(store);
+**daemon** A-1 → A-5 → A-6.2 → A-7(dev). Contract between the lanes: a dataset-level `[]` means never
+prune, and `validate_config(config) -> list[str]` returns warnings and raises `ValueError`. A-8 tests
+follow; A-9 runs alongside. Gates: `zfs-code-reviewer` on every item, `concurrency-reviewer` on A-4,
+A-5, A-6.
 
-- **Owner:** `zfsbackup-cli-developer` · **Tag:** `low-risk`
-- **Files:** new `zfsbackup/cli/__init__.py`, `zfsbackup/cli/__main__.py`, `zfsbackup/cli/main.py`;
-  `pyproject.toml`
-- **Basis:** `daemon.py:118-145` establishes flag conventions (`-c/--config`, `-v/--verbose`,
-  `-d/--dry-run`); the CLI should match.
-- **Command surface** (revised per decision 2 — `rename` added; no identity keys in edit buffers):
+### A-1 — YAML-boundary empty-value and type semantics
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` (approved) · **Basis:** A1, A3, A5,
+  decision (a); `model.py:543-547, 595-598, 691-692, 703-704, 743-747`.
+- **Files:** `zfsbackup/config/model.py`
+- **Changes:** guards in the style of `_duration_from_config` — `_bool_from_config`,
+  `_str_from_config`, `_port_from_config`, a key-named positive-interval guard. Apply every Normalize
+  and Reject row of the audit. Accept `retention: forever` at dataset level only → `retention_rules=[]`
+  + WARNING; destination-level `{}` stays rejected (item-3b deferral of destination never-prune stands).
+  Module logger for the WARNINGs.
+- **Edge cases:** `enabled: null → False` doesn't change the wire format (disabled datasets never reach
+  `to_property`). Item 9's equivalence test still holds. Both repo YAMLs are unaffected. Item 3c's
+  `is None` discipline is unchanged.
+- **Verify:** `pytest tests/test_zfsbackup_config.py`, then `pytest tests/test_zfsbackup_*.py`.
 
-  ```
-  zfsbackup-config [-c <db>] get  <dot.path>
-  zfsbackup-config [-c <db>] set  <dot.path> <value>
-  zfsbackup-config [-c <db>] edit                        # whole config in $EDITOR
-  zfsbackup-config [-c <db>] list datasets
-  zfsbackup-config [-c <db>] list remotes
-  zfsbackup-config [-c <db>] edit dataset <name>         # buffer has NO name field
-  zfsbackup-config [-c <db>] edit remote  <name>         # buffer has NO name field
-  zfsbackup-config [-c <db>] rename dataset <old> <new>
-  zfsbackup-config [-c <db>] rename remote  <old> <new>
-  zfsbackup-config [-c <db>] import <yaml> [--replace]
-  zfsbackup-config [-c <db>] export [-o <file>]          # DB -> YAML, no editor
-  zfsbackup-config [-c <db>] reload                      # Phase 3, item 19
-  ```
+### A-2 — Session-free validation, never-prune load, import ordering
+- **Owner:** `zfsbackup-store-developer` · **Tag:** `needs-approval` (approved) · **Basis:** A1, A2,
+  A3, A5, D1, D2; `mapper.py:177-183, 386, 597-672`; `models.py:141,149-151,194,197,488`;
+  `importer.py:17-21, 262-311, 368-375`.
+- **Files:** `mapper.py`, `models.py`, `importer.py`, `store/__init__.py`
+- **Changes:**
+  1. Public pure `validate_config(config) -> list[str]` taking over `save_config` step 1, plus exact type
+     checks (`type(x) is bool`, str fields, int `api_port` excluding bool, port range) and rejection of
+     intervals ≤ 0 and remote frequency ≤ 0. Warnings: never-prune datasets, prefix containing `_`,
+     exact-duplicate rules about to be deduped (D1, naming both literals). `save_config` calls it first.
+  2. A3: zero dataset-level rows load as `[]` + WARNING; rewrite the docstrings that describe the old
+     default (`mapper.py:164-171`, `:363`, the asymmetry note in `_scoped_rules`).
+  3. A1 defence: drop the Python `default=` on non-key NOT NULL columns. DDL-neutral — the autogenerate
+     diff against the baseline stays empty.
+  4. D2: `order_by(models.Destination.name)` at `mapper.py:386`.
+  5. Importer: phase 0 is `from_file` + `validate_config` (warnings logged) before anything touches the
+     target; if `created` and a later phase fails, unlink the DB and any `-wal`/`-shm`/`-journal` this
+     call created (lstat-checked); add `SQLAlchemyError` to `_main`'s except list until 10.3 deletes it;
+     correct the docstring at `importer.py:17-21`.
+- **Edge cases:** `validate_config` must not evaluate `effective_client_id_file` (reads `$HOME`).
+  Destination-scope `[]` still means inherit.
+- **Verify:** `pytest tests/test_zfsbackup_store.py`
 
-- **Entry point: both.** `[tool.poetry.scripts]` console script
-  `zfsbackup-config = "zfsbackup.cli.main:main"` for ergonomics, plus `python -m zfsbackup.cli` via
-  `__main__.py` for parity with `python -m zfsbackup.daemon` (`daemon.py:182`) and so it works without an
-  installed entry point.
-- **Packaging note:** `pyproject.toml:1-7` declares the package as `libzfseasy` with no explicit
-  `packages` list. A console script pointing into `zfsbackup` may require an explicit `packages = [...]`
-  entry — the developer must verify `poetry install` actually exposes the script.
-- **Verification:** `pytest tests/test_zfsbackup_cli.py -k skeleton`
+### A-3 — Baseline positivity CHECKs (Q5)
+- **Owner:** `zfsbackup-store-developer` · **Tag:** `needs-approval` (approved) · **Basis:** A5,
+  following `ck_retention_rules_*_positive`.
+- **Files:** `models.py`; delete and regenerate `migrations/versions/20260915_2e8aa45e2667_…py` under a
+  new revision id.
+- **Changes:** CHECKs `check_interval_seconds > 0`; `prune_interval_seconds IS NULL OR > 0`;
+  `datasets.frequency_seconds > 0`; `dataset_remotes.frequency_seconds IS NULL OR > 0`. Regenerate the
+  revision from autogenerate. Docstring: "frozen from the merge of config-db-cli to master" (D5).
+- **Edge case:** existing dev DBs fail loudly with `SchemaVersionMismatch`; delete and re-import. Say so
+  in the commit message.
+- **Verify:** `pytest tests/test_zfsbackup_store.py -k "migration or check_constraint"`
 
-### Item 11 — Dot-path get/set with type coercion
+### A-4 — Permission model for group operators
+- **Owner:** `zfsbackup-store-developer` · **Tag:** `needs-approval` (approved) · **Gate:** +
+  `concurrency-reviewer` · **Basis:** A4, decision (b); `paths.py:271, 1195-1222, 1403, 1489,
+  1499-1501`; `importer.py:219, 306-307`.
+- **Files:** `paths.py`, `importer.py`
+- **Changes:**
+  1. `CONFIG_DIR_MODE = 0o2770`.
+  2. One helper `_ensure_mode(path, mode)` for the directory, the DB and the sidecars: lstat; equal →
+     nothing; owned (`st_uid == geteuid()`) → chmod then re-stat (Linux silently drops setgid for a
+     non-member: WARNING, not error); not owned but usable → WARNING naming owner, mode and fix;
+     otherwise `ConfigDbPermissionError` saying the owner must run `chmod`.
+  3. `ensure_config_db_mode` only adjusts the default path; an existing file at a non-default path is
+     never chmodded (0600 stays 0600); warn if the group can't read and write it.
+  4. Sidecars via `_sidecar_lstat`, never `Path.exists()`; never chmod a sidecar we don't own.
+  5. `check_config_db` checks sidecars whether or not the DB is writable: an existing sidecar this
+     process can't write is a `ConfigDbPermissionError` (→ EX_CONFIG); a sidecar whose group differs
+     from the DB's is a WARNING.
+  6. `importer.py:219`: compare directories by `(st_dev, st_ino)`.
+  7. (Q7) Running as root and *creating* the default dir/file: `chown(-1, gid(zfsbackup))` if the group
+     exists, else WARN.
+- **Edge cases:** macOS assigns the directory's group automatically, so Linux behaviour is mocked in
+  pytest and proven in A-9. Root passes every `os.access` check. Never touch `-journal`.
+- **Verify:** `pytest tests/test_zfsbackup_store.py -k "permission or mode or sidecar or setgid"`
 
-- **Owner:** `zfsbackup-cli-developer` · **Tag:** `needs-approval` *(config write path)*
-- **Files:** new `zfsbackup/cli/dotpath.py`
-- **Basis:** the requested `datasets.tank/data.frequency=1h` form, resolved against the item-3 schema.
-- **⚠ Critical edge case — dot-splitting is unsafe.** ZFS dataset names legally contain dots
-  (`tank/vm.01`, `tank/data.old`). Naive `path.split('.')` on `datasets.tank/vm.01.frequency` yields
-  `['datasets','tank/vm','01','frequency']` — wrong, and it fails *silently* into "no such dataset".
-  Two-part fix:
-  1. **Schema-directed resolution.** Walk left-to-right against the known schema. At `datasets.`, match
-     greedily against dataset names actually in the DB, longest-first, then parse the remainder. Same for
-     `destinations.`.
-  2. **Bracket escape hatch:** `datasets[tank/vm.01].frequency`. Always accepted, and it is what `export`
-     and error messages emit.
-  On genuine ambiguity (a dataset `a.b` and another `a` with field `b`), error and demand the bracket
-  form. **Never guess.**
-- **Type coercion by schema field type:** `str` verbatim; `int` via `int()` with range check for
-  `api_port`; `bool` accepting `true/false/yes/no/on/off/1/0` case-insensitively; duration via
-  `Duration(...)` (item 2), **storing the literal as typed**; `Path` for `client_id_file`. Unknown path →
-  non-zero exit listing valid siblings.
-- **Item 3c amendment — the tri-state.** `prune_interval` and `client_id_file` are nullable, where NULL
-  means "derive". `set` needs a way to express that (an `unset` verb, or `set <path>` with an empty
-  value), and `get` must render a derived value distinguishably from a stored one —
-  `derived (5m)` vs `5m`. Without this the CLI can reach the tri-state's stored side but never return
-  to its derived side.
-- **Addressable paths:** `snapshot_prefix`, `check_interval`, `prune_interval`, `api_host`, `api_port`,
-  `dry_run`, `client_id_file`, `datasets.<n>.{frequency,recursive,enabled}`,
-  `datasets.<n>.retention.<age>`, `datasets.<n>.remote.<dest>.frequency`, `destinations.<name>.url`,
-  `remote_backup.{target_dataset,enabled}`. **`datasets.<n>.name` is not addressable** — renaming is
-  `rename` only (item 14).
-- **Target behaviour:** `set` is a single transaction; it re-validates the whole resulting config by
-  round-tripping through `load_config` before committing, and rolls back on failure.
-- **Verification:** `pytest tests/test_zfsbackup_cli.py -k dotpath` — including dotted-dataset-name cases.
+### A-5 — Daemon: restart backoff, failure classification, interval floor
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` (approved) · **Gate:** +
+  `concurrency-reviewer` · **Basis:** B4, A4 (daemon half), A5, D3; `daemon.py:271-302, 597-611`;
+  `workers.py:152-160, 221`; `runtime_config.py:272-276`.
+- **Files:** `daemon.py`, `workers.py`, `runtime_config.py`
+- **Changes:**
+  1. Replace the blocking `time.sleep(WORKER_RESTART_DELAY)` with a per-worker `restart_at` deadline
+     checked every poll. Consecutive failures per worker: delay 5s·2^(n-1), capped at 300s; reset after
+     ≥10 min up; six consecutive failures → treated as EX_CONFIG (loud log, daemon stops, exit 1).
+  2. *(Failure classification is dropped: under Q4 the workers' `_load_config` is deleted in 15.2.)*
+  3. `config_error_message` says "Could not open" only for real open failures.
+  4. Floor the worker interval at 1s with a single WARNING (covers a hand-edited DB).
+  5. D3: `exc_info=True` in the `daemon.py:597-611` arm for non-OperationalError, non-config exceptions.
+- **Edge cases:** backoff never delays shutdown; EX_CONFIG stays fatal; tests patching raw `time.sleep`
+  in `_check_workers` move to the new deadline seam.
+- **Verify:** `pytest tests/test_zfsbackup_daemon.py tests/test_zfsbackup_workers.py`
+- **Note:** delivers item 17's "fix the infinite respawn" bullet; strike it when Phase 3 is revised.
+
+### A-6 — Fork and shutdown hardening (C1, C2, part of C3)
+- **A-6.1** — `zfsbackup-store-developer` · `needs-approval` (approved) · gate `concurrency-reviewer`.
+  `db.py`: `gc.collect()` after `dispose(close=False)` + `del _ENGINES[key]` (`:721-722`) and in
+  `dispose_all`'s non-owner branch. Correct docstrings `db.py:15-17, 635-650, 709-715` (the pid cache
+  alone is not enough; `dispose_all()` at the fork point is mandatory; a child closing an inherited fd
+  does not release the parent's locks). Fix stale refs at `:643-645`; `:476` names `open_config_db`,
+  which no longer exists. **Verify:** `pytest tests/test_zfsbackup_store.py -k fork`.
+- **A-6.2** — `zfsbackup-developer` · `needs-approval` (approved) · gate `concurrency-reviewer`.
+  Poll loop (`daemon.py:461-466`) in try/finally that sets the stop flag and calls `_shutdown_workers`.
+  Record abandoned workers (`:366-370`); if any, `main()` flushes logging and calls `os._exit(code)`
+  after `dispose_all()`, skipping multiprocessing's untimed join. `_start_workers` checks the stop flag
+  between spawns (`:222-224`). SIGHUP stopgap: the supervisor's handler only sets a flag and the poll
+  loop logs "live reload not implemented; restart to apply"; workers `SIG_IGN` SIGHUP in
+  `_init_child_process`. Correct the C1 claim in `_spawn`'s docstring. **Verify:**
+  `pytest tests/test_zfsbackup_daemon.py tests/test_zfsbackup_stop_signals.py`.
+- **Deferred from C3:** getppid parent-death detection → item 18; `KillMode=mixed` → item 21 docs;
+  websocket timeouts (`remote.py:185-202`) → item 18 + remote-security workstream.
+
+### A-7 — Stale docs and messages
+- **Tag:** `low-risk` · **Basis:** D4, D5.
+- **Store developer:** `_yaml_message` (`paths.py:715-722`) gives both steps — import into `<db>`, and
+  point the daemon's `-c` at `<db>`; `paths.py:56-57, 433-438` Python ^3.10 → ^3.11;
+  `store/__init__.py:86-87` and `migrate.py:11-15` drop "not wired".
+- **zfsbackup-developer:** `config/__init__.py:20-23` names `zfsbackup.store` as the reserved package.
+- **Main session:** item 9's `.literal` bullet (done with this insertion).
+
+### A-8 — Tests
+- **Owner:** `pytest-test-author` · **Tag:** `low-risk`
+- **Coverage:** one test per audit row through both `from_file` and import → `load_config`; A1–A3
+  reproductions (`enabled: null`, `remote_backup.enabled: null`, `dry_run: "false"`, a
+  `{24h: 1M, 7d: 30d}` import leaving no stray DB, `[]` round-trip, `retention: forever`); A-4 (mode
+  preservation on re-import, non-owner no-chmod, setgid, sidecar ownership refusal); A-5 (backoff
+  schedule, escalation, deadline not blocking shutdown); A-6 (GC-disabled fork child, try/finally,
+  abandon → `os._exit`, SIGHUP ignored); listed gaps — non-canonical per-destination literals (`90m`
+  remote frequency, `30d` scoped rules), the `frequency <= 0` consumer row, `config_error_message`'s
+  OperationalError → diagnose branch and `describe_config_source`, daemon "missing DB exits 1, creates
+  nothing", repeated non-EX_CONFIG respawn. Use or delete `source_config_db`
+  (`test_zfsbackup_real.py:177`); fix the stale docstring at `test_zfsbackup_store.py:7`; Q8 conftest
+  hook marking unmarked tests `unit`.
+- **Verify:** `pytest tests/test_zfsbackup_*.py`; `pytest -m unit` + `pytest -m integration` cover the
+  whole mocked suite.
+
+### A-9 — Scenarios
+- **Owner:** `real-zfs-scenario-dev` · **Tag:** `low-risk`
+- **D7** (done, uncommitted at time of writing): `test_two_vm_backup.sh` imports via the interim
+  importer and runs the daemon on the DB. It must switch to `zfsbackup-config import` before 10.3.
+- **New `scenarios/test_config_permissions.sh`** on a Linux Multipass VM: users `zfsbackup` and
+  `alice` (in group `zfsbackup`); root's first import; alice re-imports with the daemon running; a
+  SIGHUP-killed CLI leaves sidecars still in group `zfsbackup`; a non-default 0600 `-c` stays 0600.
+  Starts after A-4. **Verify:** manual run.
+
+---
+
+## Phase 2 — Config CLI *(revised after Checkpoint A, approved 2026-10-17)*
+
+**Order: 10 → 15 → 13 → 11 → 12 → 14 → 16.** Item 15 precedes every write command. Lanes: store
+10.1 → 15.1 → 10.3; daemon 15.2 → 14.1 (parallel with the store lane; 15.2 needs 10.1's constants);
+CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows each CLI item.
+`concurrency-reviewer` runs alongside on 10.1, 15.1 and 15.2.
+
+> **Corrections to the original Phase 2 text:** `global_settings.generation` already exists in the
+> baseline (`models.py:178`), so item 15 needs a CAS API, not a migration. No Phase 2 item needs a
+> schema change: every CLI write goes through the full-replace writer, including destination rename
+> (the `dataset_remotes.destination_name` FK has no ON UPDATE action). Renaming a destination does not
+> orphan server data — `_server_dataset` builds the path from client id + dataset name — but it does
+> drop anchor protection, because `get_anchors` reads only `anchor.<configured destination>`.
+
+### Item 10 — CLI skeleton, path wiring, `import` / `export` / `migrate`
+- **10.1** — `zfsbackup-store-developer` · `needs-approval` · gate + `concurrency-reviewer`.
+  - **B1, store half:** `EXPECTED_HEAD` and `KNOWN_REVISIONS` constants in `migrate.py`;
+    `check_schema` decides from them (no `ScriptDirectory` read on the check path, `migrate.py:305-307`);
+    the upgrade path first asserts the script head equals `EXPECTED_HEAD`.
+  - **`upgrade_schema(resolved) -> SchemaUpgrade(from_revs, to_rev, changed)`:** its own FK-off
+    connection with no surrounding transaction, opened with an explicit `BEGIN IMMEDIATE` (SQLAlchemy's
+    pysqlite recipe) so DDL is transactional. **B2:** `PRAGMA foreign_key_check` before commit — any
+    row rolls back and raises `SchemaIntegrityError`. Commit is the last statement; the connection is
+    closed before returning. `ensure_schema` gets the same check.
+  - `SchemaOutOfDate` docstring and message (`migrate.py:125-150, 362-370`) → `zfsbackup-config
+    migrate` (today it points at `import`, a full replace).
+  - **Pre-import backup contract (D-5 / 8c):** `import_yaml(yaml_path, resolved, *, backup=None,
+    allow_unreadable_outgoing=False) -> ImportResult(…, backup_path)`. Phase 3 loads the outgoing config
+    inside the same `BEGIN IMMEDIATE` before `save_config` and passes it to `backup`; if `backup`
+    raises, everything rolls back. An unreadable outgoing config raises `OutgoingConfigUnreadable`
+    unless allowed.
+  - **Verify:** `pytest tests/test_zfsbackup_store.py -k "expected_head or upgrade_schema or
+    foreign_key_check or import_backup"`, using a synthetic failing revision in a temp script dir.
+- **10.2** — `zfsbackup-cli-developer` · `needs-approval`.
+  - **Files:** new `zfsbackup/cli/{__init__,__main__,main,render,errors}.py`; `pyproject.toml`.
+  - **Global:** `zfsbackup-config [-c DB] [-v]`, path from `resolve_config_path` with the daemon's order
+    (6b). Only `import` may create a DB. One error-mapping module; exit codes 0 ok, 1 invalid/refused,
+    2 usage, 75 conflict/busy (retryable), 78 config DB unusable.
+  - **`import <yaml>`:** always a full replace (no `--replace` flag — item 8). Prints warnings from
+    `from_file` and `validate_config`. Writes `<dbdir>/<dbname>.pre-import-<UTC>.yaml` (O_EXCL, 0660)
+    and names it in the replace warning; `--no-backup` opts out and is the only way past an unreadable
+    outgoing DB (Q9).
+  - **`export [-o FILE]`:** stdout by default; `-o` refuses to overwrite without `--force`.
+  - **`migrate [--check]`:** prints from→to or "up to date"; `--check` exits 1 when behind; after a
+    change, says to restart the daemon.
+  - **`render.py` lives here** (export, import backup and the editor all use it). Contract:
+    `from_file(render(c))` reproduces `c` in value and literal, apart from D1's dedupe; 3c-derived
+    fields omitted; `enabled`/`recursive`/`dry_run` always explicit booleans; never-prune rendered as
+    `retention: forever`; a destination's `retention` only when it overrides; destinations sorted by
+    name; durations as quoted literals.
+  - **D6:** `packages = [{include="libzfseasy"},{include="zfsbackup"}]`; console script
+    `zfsbackup-config = "zfsbackup.cli.main:main"`; check the wheel contains `migrations/script.py.mako`
+    and `versions/*.py`.
+  - **Verify:** `pytest tests/test_zfsbackup_cli.py -k "skeleton or import or export or migrate or
+    render"`; `poetry build && unzip -l dist/*.whl | grep migrations`.
+- **10.3** — `zfsbackup-store-developer` · `low-risk`. Delete the interim `_main`, `__main__` and the
+  "8d — interim CLI" docstring (`importer.py:101-112, 347-397`). Only after 10.2 and the A-9/D7 switch.
+  Main session updates CLAUDE.md and `zfsbackup/README.md` in the same cycle. **Verify:**
+  `grep -rn config.store.importer zfsbackup scenarios CLAUDE.md` is empty; full suite green.
+
+### Item 15 — Generation CAS, daemon presence, consistent worker config *(moved ahead of 11/12/14)*
+- **15.1** — `zfsbackup-store-developer` · `needs-approval` · gate + `concurrency-reviewer`. **Basis:**
+  B2, `mapper.py:684-685`. No migration.
+  - `load_config_snapshot(session) -> ConfigSnapshot(config, generation)` from one read transaction.
+  - `save_config(…, expected_generation=None)` compares inside the caller's `BEGIN IMMEDIATE`, before
+    any DELETE, raising `ConfigConflict`.
+  - `write_config(resolved, config, *, expected_generation) -> new_gen`: preflight → `validate_config`
+    → writer session → CAS → save → commit. Maps "database is locked" after `busy_timeout` to
+    `ConfigBusy`. Never returns a session.
+  - Rewrite the generation comment at `models.py:162-177`. `import` bumps the generation too, so an
+    import between render and save is a conflict.
+  - **Verify:** `pytest tests/test_zfsbackup_store.py -k "generation or cas or busy"`
+- **15.2** — `zfsbackup-developer` · `needs-approval` · gate `concurrency-reviewer`.
+  - **(a) B1, daemon half:** `load_runtime_config` runs `check_schema(session.connection())` inside its
+    existing BEGIN (`runtime_config.py:183-232`), closing the residual window that comment describes;
+    returns the generation; the supervisor logs "generation N, schema R" at startup.
+  - **(b) B3 — config handoff (Q4):** `BaseWorker`/`ApiWorker` take the supervisor's detached
+    `BackupConfig` with dry-run already applied (`daemon.py:569-570`); `_load_config`
+    (`workers.py:123-163`) is deleted and workers never touch the DB. Under `spawn`,
+    `Duration.__reduce__` preserves literals. Phase 3's item 18 restarts workers with the new object.
+  - **(c) Daemon presence lock** — new `zfsbackup/daemonlock.py` (B5, 15.3's notice, basis for item
+    19). After config load and before the first fork, the supervisor opens `<db>.daemon.pid` (0660),
+    takes `flock(LOCK_EX|LOCK_NB)` (held → exit 1 naming the other pid, which also blocks two daemons on
+    one DB), writes `pid\ngeneration\n`, holds the lock for life, removes the file on clean exit.
+    `probe(resolved) -> Optional[(pid, generation)]` tests with `LOCK_SH|LOCK_NB` on a fresh fd; a stale
+    file is harmless because "running" means the lock is held. Under `fork`, workers inherit the lock
+    (orphans still count as running); under `spawn` they don't — document it.
+  - **Verify:** `pytest tests/test_zfsbackup_daemon.py tests/test_zfsbackup_workers.py
+    tests/test_zfsbackup_runtime_config.py -k "generation or handoff or daemon_lock or
+    schema_in_snapshot"`
+- **15.3** — `zfsbackup-cli-developer` · `needs-approval`. Every write: snapshot → mutate/parse →
+  `validate_config` (print warnings) → `write_config(expected_generation)`. `dispose_all()` before
+  launching `$EDITOR` or prompting — nothing stays open. `ConfigConflict` → exit 75 "config changed
+  underneath you (generation A, now B); re-run"; `ConfigBusy` → exit 75 "another write in progress;
+  retry". On success, `probe`: daemon found → "config updated (generation N); running daemon pid P is on
+  generation M and will not apply this until restarted"; otherwise "no running daemon detected for
+  <db>". The CLI never sends a signal. **Verify:** `pytest tests/test_zfsbackup_cli.py -k "conflict or
+  busy or daemon_notice"`
+
+### Item 11 — Dot-path `get` / `set` / `unset`
+- **Owner:** `zfsbackup-cli-developer` · **Tag:** `needs-approval` · **Files:** `cli/dotpath.py`,
+  `cli/main.py`
+- **Dotted names** (unchanged): schema-directed longest match; `datasets[tank/vm.01]` bracket form
+  always accepted and emitted; ambiguity is an error, never a guess.
+- **Addressable paths:**
+  - Globals: `snapshot_prefix`, `check_interval`, `api_host`, `api_port`, `dry_run`; tri-state
+    `prune_interval` and `client_id_file` (`unset` = derive; `get` shows `derived (5m)`).
+  - `datasets.<n>.{enabled,recursive,frequency}`.
+  - `datasets.<n>.retention`: `set forever` = never prune + WARNING; `unset` = default 1d→30d.
+  - `datasets.<n>.retention.<age>`: `set` adds/updates (matched by seconds, literal stored as typed);
+    `unset` removes; removing the last rule = never prune + WARNING.
+  - `datasets.<n>.remote.<dest>.frequency`: `set` overrides, `unset` inherits, `get` shows
+    `inherit (1h)`.
+  - `datasets.<n>.remote.<dest>.retention[.<age>]`: the first override rule replaces the inherited set
+    (print the resulting effective set); removing the last override rule or `unset` on the key =
+    inherit.
+  - `destinations.<name>.url`.
+  - `remote_backup.{target_dataset,enabled}`: setting `target_dataset` with no server role creates it
+    with `enabled=true` + WARNING that the receive API has no authentication; `unset remote_backup`
+    removes the role.
+- **Not addressable:** names (`rename`) and membership — adding/removing datasets, attaching/detaching
+  destinations (`edit`). The error points there.
+- **Coercion:** booleans from a fixed CLI word set; durations and ports via A-1's guards; ≤ 0 rejected.
+- **Verify:** `pytest tests/test_zfsbackup_cli.py -k dotpath`, including dotted names.
 
 ### Item 12 — Whole-config `$EDITOR` round-trip
+- **Owner:** `zfsbackup-cli-developer` · **Tag:** `needs-approval` · **Basis:** the import/`from_file`
+  round-trip contract of 10.2 (the old "drop-in with `-c file.yaml`" basis is obsolete).
+- **Flow:** (0) snapshot `(config, G)`, then `dispose_all()`. (1) render to a 0600 file in a 0700 dir.
+  (2–3) `$VISUAL` → `$EDITOR` → `vi`, `shlex.split`, inherited stdio; non-zero exit aborts. (4) "No
+  changes" is a canonical value + literal comparison after D1 dedupe — not bytes, and not dataclass `==`
+  (`Duration.__eq__` ignores literals, so a `30d→1M` edit would be lost). (5) `from_file` +
+  `validate_config`; show warnings; on error Retry/Abort, buffer preserved. (6) Names are set
+  membership; rename-shaped diffs refused unless `--allow-recreate`. **New:** dropping a destination
+  from a dataset's `remote:`, or deleting a destination, warns that its `anchor.<dest>` stops
+  protecting snapshots. (7) `write_config(expected_generation=G)`; on conflict keep the buffer at a
+  stable path.
+- **Edge cases:** a CLI killed in the editor holds no DB handles; non-tty stdin is refused with a
+  pointer to export/import.
+- **Verify:** `pytest tests/test_zfsbackup_cli.py -k editor`
 
-- **Owner:** `zfsbackup-cli-developer` · **Tag:** `needs-approval` *(config round-trip format)*
-- **Files:** new `zfsbackup/cli/editor.py`, `zfsbackup/cli/render.py`
-- **Basis:** requested feature; render target is the format at `config.example.yaml:9-80` so generated
-  YAML is drop-in compatible with `-c file.yaml`.
-- **Names in the whole-config buffer — decided (per decision 2 extension).** This buffer *is* keyed by
-  name (`datasets:` is a list of mappings each with `name:`, `config.example.yaml:35`). Names here are
-  **identity, and are treated as set-membership, not editable content**:
-  - a name present that was not before → **create**
-  - a name absent that was there → **delete**
-  - a name changed in place → interpreted as **delete + create**, not rename
+### Item 13 — `list datasets` / `list destinations`
+- **Owner:** `zfsbackup-cli-developer` · **Tag:** `low-risk`. Read-only via the snapshot reader;
+  columns follow `backup_manager.py:99-110`; retention shows `never` or a rule count; remote frequency
+  shows `inherit (X)`; `--json`, `--enabled-only`; datasets by id, destinations by name; the
+  destinations list shows name, URL and referencing datasets. **Verify:** `-k list`
 
-  The CLI **detects the delete+create-looks-like-a-rename case** (one deletion and one creation in the
-  same apply, with otherwise-identical field values) and **refuses**, printing:
-  *"this looks like a rename; use `zfsbackup-config rename dataset <old> <new>` instead, or pass
-  `--allow-recreate` if you really mean delete-and-create."* Rationale: silently treating it as
-  delete+create orphans ZFS user properties exactly as described in item 14, and the user is very
-  unlikely to want that.
-  Same rule for `destinations:`.
-- **Flow:**
-  0. **Item 3c amendment:** a field whose value is derived (`prune_interval`, `client_id_file` unset)
-     must be **omitted** from the buffer, not rendered as its effective value. Rendering it concrete
-     would re-freeze the derivation on the next save — the exact bug item 3c removed, reintroduced
-     through the editor.
-  1. `render_yaml(load_config(db))` → temp file, `0600`, in a private temp dir.
-  2. Launch `$VISUAL` → `$EDITOR` → fall back to `vi`. Split with `shlex.split` so `EDITOR="code -w"`
-     works. Run with **inherited stdio, not captured** — a captured-stdio editor hangs. This is the same
-     class of bug as the recorded multipass `/dev/null` wedge.
-  3. Editor exits non-zero → abort, DB untouched.
-  4. Content byte-identical → "no changes", exit 0, no transaction.
-  5. Parse and validate the edited YAML **fully in memory** before opening any write transaction.
-  6. On validation failure: print the error with line context, preserve the user's buffer at a stable
-     path, offer re-edit (`Retry / Abort`). **The DB is never opened for write until validation passes.**
-  7. On success: one transaction — wipe and reinsert — then commit.
-- **Rollback guarantee:** validate-before-transaction means a bad edit cannot half-update; the write is a
-  single `session.begin()` block, so even a mid-write failure (disk full, FK violation) rolls back whole.
-- **Edge cases:** `0600` + private dir so config does not leak on a shared `/tmp`; editor killed by signal
-  = abort; a concurrent `set` between render and apply is caught by the item-15 generation check.
-- **Verification:** `pytest tests/test_zfsbackup_cli.py -k editor` — `$EDITOR` stubbed with a mutating
-  script; assert no-op, abort, invalid-then-abort, rename-detection, and success paths.
-
-### Item 13 — `list datasets` / `list remotes`
-
-- **Owner:** `zfsbackup-cli-developer` · **Tag:** `low-risk`
-- **Files:** `zfsbackup/cli/main.py`
-- **Basis:** requested feature; columns mirror the existing report at `backup_manager.py:88-100` (name,
-  enabled, frequency, recursive, retention-rule count) so CLI and daemon log agree.
-- **Changes:** human-readable table by default; `--json` for scripting; `--enabled-only` matching
-  `BackupConfig.enabled_datasets` (`config/model.py:254-256`). Remotes list shows destination name, URL, and
-  which datasets reference it.
-- **Verification:** `pytest tests/test_zfsbackup_cli.py -k list`
-
-### Item 14 — Per-dataset / per-remote edit *(revised: no identity key in buffer)* + `rename`
-
-- **Owner:** **split** — `zfsbackup-cli-developer` (CLI + rename detection) → `zfsbackup-developer` (ZFS user-property side effect) · **Tag:** `needs-approval` *(config round-trip + ZFS property side effects)*
-- **Files:** `zfsbackup/cli/render.py`, `zfsbackup/cli/main.py`
-- **Basis:** requested feature; user decision 2.
-- **Per-dataset buffer contains no `name` field.** `edit dataset <name>` renders only
-  `enabled`, `frequency`, `recursive`, `retention:`, `remote:` — the shape at
-  `config.example.yaml:36-46` minus `name:`. The dataset being edited is shown as a YAML comment header
-  (`# dataset: tank/data  — to rename, use: zfsbackup-config rename dataset ...`) so the user knows what
-  they are editing, and the comment is ignored on parse. Identity comes from the command line, never the
-  buffer. If a `name:` key is present on parse, **reject** with a pointer to `rename`.
-- **Per-remote buffer likewise contains no name.** `edit remote <name>` renders only `url:`.
-- **`rename dataset <old> <new>` / `rename remote <old> <new>`** — the only way to change an identity.
-  Single transaction: rename the row; FK cascades keep retention rules and dataset_remotes attached.
-- **The stale-ZFS-property problem belongs here.** Renaming a *config entry* does **not** rename the ZFS
-  dataset. Consequences, all of which `rename` must handle explicitly:
-  1. The old ZFS dataset retains a stale `org.zfsbackup:config` user property, written by
-     `sync_all_config_properties()` (`daemon.py:100`) and read back by `DatasetConfig.from_property()`
-     (`config/model.py:110`). It will not be cleaned up by anything.
-  2. The old dataset retains stale `org.zfsbackup:anchor.<destination>` properties, read at
-     `workers.py:162` via `manager.get_anchor()`. These are what keep the last-transferred snapshot
-     exempt from pruning.
-  3. **Most seriously:** the server-side destination path is derived from the client dataset name
-     (`_server_dataset()` in `api.py:34-38` splits the client dataset name to build
-     `<target>/<client_id>/<relative>`). After a rename, the new name maps to a **different server-side
-     dataset**, and there is **no anchor** for it — so the next remote backup is a **full send, not an
-     incremental**. On a large dataset that can mean hours of transfer and a duplicated copy on the
-     server.
-- **Therefore `rename` must:**
-  - Always print a warning naming the stale properties left on the old dataset.
-  - **Require `--force` when the dataset has any configured remote destinations** (`config/model.py:86`),
-    because of consequence (3). The warning must state explicitly that the next backup will be a full
-    send and that the old server-side copy will be orphaned.
-  - Offer `--clear-stale-props` to remove `org.zfsbackup:config` and `org.zfsbackup:anchor.*` from the
-    old dataset. **Not the default** — destroying anchors is itself destructive, and the old dataset may
-    still be wanted.
-  - Never touch the remote server. Cleaning up the orphaned server-side dataset is a manual, deliberate
-    act; the CLI prints the path it would be at.
-  - Refuse if `<new>` already exists in the config.
-- **Destination deletion:** rejected while still referenced by a dataset's `remote:` list, with the
-  referencing datasets listed. The item-3 FK enforces this regardless.
-- **Verification:** `pytest tests/test_zfsbackup_cli.py -k "edit_dataset or edit_remote or rename"`
-
-### Item 15 — Generation counter and concurrent-write detection
-
-- **Owner:** **split** — `zfsbackup-store-developer` (generation column) → `zfsbackup-cli-developer` (check on write) · **Tag:** `needs-approval` *(config write path)*
-- **Files:** `zfsbackup/cli/main.py`, `zfsbackup/config/store/db.py`
-- **Basis:** `workers.py:62` and `workers.py:196` load config once, before the loop at `workers.py:73`;
-  nothing re-reads it. Retained from the original plan — the counter is still required for
-  concurrent-CLI-write detection independently of Phase 3.
-- **Changes:**
-  1. `generation` counter on `global_settings`, incremented on **every** write.
-  2. The CLI reads it before rendering and re-checks inside the write transaction; a mismatch means a
-     concurrent write → abort with "config changed underneath you, re-run". This is what makes the
-     read-edit-write window of item 12 safe.
-  3. Until Phase 3 lands, after a successful write the CLI detects a running daemon and prints:
-     *"config updated; running daemon (pid N) will not pick this up until restarted."* Phase 3 replaces
-     this notice with an actual reload.
-- **Writes are safe regardless:** WAL + single-writer means a CLI write never disturbs a reading worker.
-- **Verification:** `pytest tests/test_zfsbackup_cli.py -k generation`
+### Item 14 — Per-dataset / per-destination edit and `rename`
+- **14.1** — `zfsbackup-developer` · `needs-approval`. Module-level helpers in `backup_manager.py`
+  needing no `BackupConfig`: `read_zfsbackup_properties(ds)`; `copy_anchor_property(ds, old_dest,
+  new_dest)` (sets `anchor.<new>` only if absent; never deletes);
+  `clear_zfsbackup_properties(ds, *, config, anchors)` via `zfs inherit`. All take `dry_run`.
+  **Verify:** `pytest tests/test_zfsbackup_manager.py -k anchor_property`
+- **14.2** — `zfsbackup-cli-developer` · `needs-approval`; after 14.1 and 15.
+  - **`edit dataset <n>` / `edit destination <n>`:** no `name:` in the buffer (a present `name:` is
+    rejected with a pointer to `rename`); the fragment is parsed with `DatasetConfig.from_dict`, merged
+    into the snapshot, validated as a whole config, written with CAS.
+  - **`rename dataset <old> <new>`:** stale-property warning; `--force` when remotes are configured
+    (the server-side path changes, so the next send is full); refuse if `<new>` exists. **New:** if
+    `<old>` no longer exists in ZFS and `<new>` carries `org.zfsbackup:*` properties, the dataset was
+    `zfs rename`d — no stale-property warning, but `--force` still applies.
+  - **`rename destination <old> <new>`:** one full-replace write. Before it, `copy_anchor_property` on
+    every referencing dataset — copy, not move, so a daemon still on the old config stays protected.
+    Print the stale `anchor.<old>` properties. No `--force`: the incremental base is preserved and the
+    server path is unchanged.
+  - **`--clear-stale-props`:** refused while `probe()` reports a running daemon (B5).
+  - Deleting a still-referenced destination is refused, listing the referencing datasets.
+  - **Verify:** `pytest tests/test_zfsbackup_cli.py -k "edit_dataset or edit_destination or rename"`
 
 ### Item 16 — Tests for Phase 2
+- **Owner:** `pytest-test-author` · **Tag:** `low-risk`; written alongside each item, not at the end.
+- **Coverage:** `CliRunner` for every subcommand; every item-11 path including every tri-state and both
+  dotted-name forms; the decision-(a) audit rows through the CLI; the render round-trip property (repo
+  YAMLs, never-prune, non-canonical per-destination literals); a bad value leaves the DB byte-identical
+  (hash); `$EDITOR` stub — no-op, literal-only edit persists, abort, invalid, rename refusal and
+  `--allow-recreate`, anchor-loss warning; CAS (write between render and apply rejected; busy mapped);
+  daemon lock (held, free, stale file); handoff (a respawned worker keeps the supervisor's generation
+  after a DB write); destination rename copies anchors and never deletes; the B5 refusal; `migrate`
+  (no-op, synthetic upgrade, `foreign_key_check` failure rolls back); the import backup (name, mode,
+  O_EXCL; refusal on an unreadable outgoing DB); the console script resolves (`-m slow`).
+- **Verify:** `pytest tests/test_zfsbackup_*.py`
 
-- **Owner:** `pytest-test-author` · **Tag:** `low-risk`
-- **Files:** new `tests/test_zfsbackup_cli.py`; `tests/conftest.py`
-- **Basis:** items 10-15.
-- **Coverage required:** `click.testing.CliRunner` for every subcommand; get/set for each addressable
-  path and coerced type; **dotted dataset names** (`tank/vm.01`) in both greedy and bracket forms;
-  ambiguous-name error; bad value leaves DB byte-identical (assert via file hash); `$EDITOR` stub covering
-  no-op / abort / invalid-YAML / valid-change; **`name:` present in a per-dataset buffer is rejected**;
-  **whole-config rename-detection refusal and `--allow-recreate` override**; `rename` warning text,
-  `--force` gate when remotes are configured, and `--clear-stale-props`; generation-mismatch abort;
-  `list --json` shape.
-- **Verification:** `pytest tests/test_zfsbackup_*.py`
+**Phase 3 text to revise later:** item 17 loses the respawn-backoff work (now A-5) and replaces A-6.2's
+SIGHUP stopgap; item 19 reuses 15.2's lock file as its pidfile.
+
+**Deferred:** the `snapshot_prefix`-with-`_` parser bug (`backup_manager.py:373-382`; needs
+`name[len(prefix)+1:]`, which is retention logic — warning only for now); never-prune at destination
+level; C3's getppid detection, `KillMode=mixed`, websocket timeouts; lenient `remote:`/`destinations:`
+null (YAML never allowed it).
 
 > ### ⛳ CHECKPOINT B — review before Phase 3
 > The CLI is fully usable at this point, with the item-15 "restart required" notice as the honest
@@ -1727,5 +1955,5 @@ latency, and CLI auto-reload — are settled above as decisions 5, 6, and 7.
 - **Phase 3 in principle** — it is deliberately severable. Phases 1-2 deliver the two requested features in
   full; Phase 3 only removes the daemon restart.
 
-**Phases 0–1 are implemented (see Progress at the top); Checkpoint A is the next sign-off. Phases 2–3
-remain a proposal.**
+**Phases 0–1 are implemented and Checkpoint A is held (see Progress at the top). The fix-up cycle and the
+revised Phase 2 are approved; Phase 3 remains a proposal.**
