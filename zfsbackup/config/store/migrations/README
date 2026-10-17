@@ -1,1 +1,36 @@
-Generic single-database configuration.
+zfsbackup config store -- Alembic migrations
+
+Layout: this directory ships INSIDE the zfsbackup package
+(zfsbackup/config/store/migrations/). `migrate.py` builds the Alembic Config
+programmatically from this path; the repo-root alembic.ini is a developer
+convenience only and is never read at runtime.
+
+Adding a revision means editing THREE things together
+-----------------------------------------------------
+1. the new revision file in versions/ (alembic revision -m "...");
+2. EXPECTED_HEAD in zfsbackup/config/store/migrate.py -> the new revision id;
+3. KNOWN_REVISIONS in the same file -> add the new revision id (keep the old
+   ones: a database may still be recorded at any of them).
+
+Why: the daemon's startup check (migrate.check_schema) decides from those two
+constants and reads no migration scripts, so a packaging problem here cannot
+break daemon start. The price is that the constants must track the scripts.
+migrate._assert_scripts_match_constants checks them against the scripts on
+every write path (migrate, import) and raises MigrationPackagingError on any
+drift, and tests/test_zfsbackup_store_upgrade.py::TestExpectedHeadConstants
+fails CI if they disagree. Forgetting one of the three therefore fails loudly
+in CI -- never silently at daemon start.
+
+Rules for revision scripts
+--------------------------
+- Use op.batch_alter_table for anything SQLite cannot ALTER in place. Name
+  every constraint; models.NAMING_CONVENTION does that for you if you let it.
+- Never use autocommit_block(). The upgrade runs in ONE transaction that is
+  rolled back if PRAGMA foreign_key_check finds an orphan afterwards;
+  autocommit_block() commits mid-migration and defeats that rollback.
+- The migration connection runs with foreign_keys=OFF (batch migrations
+  rebuild tables). Rows you move or rewrite must still satisfy the foreign
+  keys when you are done -- the post-migration check will refuse otherwise.
+- A migration only ever runs against a database that already records an
+  older, known revision. Creating a database is `zfsbackup-config import`;
+  `migrate` never creates one and never touches a file without a revision.

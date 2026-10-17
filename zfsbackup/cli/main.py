@@ -26,8 +26,13 @@ message on stderr and an exit code (0 ok, 1 invalid/refused, 2 usage, 75
 conflict/busy, 78 config database unusable).
 """
 
+import errno
 import logging
 import os
+import shlex
+import signal
+import stat
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,7 +41,7 @@ from typing import Callable, List, Optional, Tuple
 import click
 import yaml
 
-from zfsbackup.cli.errors import BackupFailed, CliError, report
+from zfsbackup.cli.errors import BackupFailed, CliError, is_database_unusable, report
 from zfsbackup.cli.render import render_yaml
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
@@ -136,6 +141,46 @@ class State:
         return self.resolved
 
 
+EXIT_SIGINT = 130
+EXIT_SIGTERM = 143
+
+_APPLIED_CLAIM = "may or may not have been applied"
+
+
+class _Terminated(KeyboardInterrupt):
+    """SIGTERM, delivered as a `KeyboardInterrupt` so `kill` unwinds exactly as
+    ^C does: temp and backup files are removed, the transaction rolls back."""
+
+
+def _without_applied_claim(note: str) -> str:
+    """`note` without its "may or may not have been applied" clause, or "" if
+    nothing else is left. The CLI states that verdict itself, once. Only the
+    clause goes (from its leading ";" through its closing ")." or end of
+    sentence); whatever follows it, such as a "never delete its -wal/-shm"
+    warning, is kept."""
+    at = note.find(_APPLIED_CLAIM)
+    if at < 0:
+        return note
+    end = note.find(").", at)
+    if end >= 0:
+        end += 2
+    else:
+        stop = note.find(".", at)
+        end = len(note) if stop < 0 else stop + 1
+    tail = note[end:].strip()
+    cut = note.rfind(";", 0, at)
+    if cut < 0:
+        return tail
+    head = note[:cut]
+    # "...written to X; the import was interrupted; it may or may not ..."
+    if "interrupted" not in note[cut:at]:
+        before, sep, last = head.rpartition(";")
+        if sep and "interrupted" in last:
+            head = before
+    head = head.rstrip() + "."
+    return f"{head} {tail}" if tail else head
+
+
 class _Group(click.Group):
     """Maps every exception a command lets escape to a message and an exit
     code, so no command repeats a try/except and none can leak a traceback."""
@@ -145,9 +190,31 @@ class _Group(click.Group):
             return super().invoke(ctx)
         except (click.ClickException, click.exceptions.Exit, click.Abort):
             raise
-        except KeyboardInterrupt:
-            click.echo("interrupted", err=True)
-            ctx.exit(130)
+        except KeyboardInterrupt as exc:
+            state = ctx.obj if isinstance(ctx.obj, State) else None
+            terminated = isinstance(exc, _Terminated)
+            word = "terminated" if terminated else "interrupted"
+            notes = list(getattr(exc, "__notes__", ()))
+            if ctx.invoked_subcommand == "import":
+                # ^C can land before, inside or just after the commit; the
+                # store's notes say what it knows, but only the database says
+                # which it was.
+                where = ""
+                if state is not None and state.resolved is not None and state.resolved.source != "default":
+                    where = f" -c {shlex.quote(str(state.resolved.resolved_path))}"
+                click.echo(
+                    f"{word} -- the import may or may not have been applied; "
+                    f"run `zfsbackup-config{where} export` to check",
+                    err=True,
+                )
+                # Say that once: keep what else the notes know (the backup's
+                # path, a skipped cleanup), drop their copy of the verdict.
+                notes = [n for n in map(_without_applied_claim, notes) if n]
+            else:
+                click.echo(word, err=True)
+            for note in notes:
+                click.echo(note, err=True)
+            ctx.exit(EXIT_SIGTERM if terminated else EXIT_SIGINT)
         except Exception as exc:  # noqa: BLE001 - this is the catch-all by design
             state = ctx.obj if isinstance(ctx.obj, State) else None
             code = report(
@@ -232,6 +299,27 @@ def _create_exclusive(directory: Path, name_stem: str, suffix: str) -> Tuple[int
     raise FileExistsError(f"no free backup file name for {name_stem}{suffix} in {directory}")
 
 
+# A directory fsync some filesystems cannot do (FUSE, CIFS, vboxsf mounts):
+# the entry is as durable as that filesystem makes it, so carry on.
+_FSYNC_UNSUPPORTED = (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP)
+
+
+def _fsync_directory(directory) -> None:
+    """Flush `directory`'s entries (a created or renamed file) to disk."""
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        try:
+            os.fsync(dir_fd)
+        except OSError as exc:
+            if exc.errno not in _FSYNC_UNSUPPORTED:
+                raise
+            logging.getLogger(_LOGGER_NAME).debug(
+                "cannot fsync directory %s (%s); continuing", directory, exc.strerror
+            )
+    finally:
+        os.close(dir_fd)
+
+
 def _backup_writer(resolved: ResolvedConfigPath) -> Callable[[BackupConfig], Path]:
     """The `backup=` callback for `import_yaml`: renders the outgoing
     configuration to `<dbdir>/<dbname>.pre-import-<UTC>.yaml` (`O_EXCL`, 0660)
@@ -249,6 +337,7 @@ def _backup_writer(resolved: ResolvedConfigPath) -> Callable[[BackupConfig], Pat
                 "configuration without a backup."
             ) from exc
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        fd: Optional[int] = None
         path: Optional[Path] = None
         try:
             fd, path = _create_exclusive(
@@ -257,21 +346,39 @@ def _backup_writer(resolved: ResolvedConfigPath) -> Callable[[BackupConfig], Pat
             # The creation mode is masked by the umask; the file must be
             # exactly group-writable like the database it came from.
             os.fchmod(fd, BACKUP_MODE)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            # Clear `fd` BEFORE `fdopen`: once the file object exists it owns
+            # the descriptor, and a ^C between the two statements must not
+            # close that number a second time (it may be reused by then).
+            raw, fd = fd, None
+            handle = os.fdopen(raw, "w", encoding="utf-8")
+            with handle:
                 handle.write(text)
                 handle.flush()
                 os.fsync(handle.fileno())
-        except OSError as exc:
+            # The file is durable; make its directory entry durable too, or a
+            # crash could lose the only copy of the outgoing configuration
+            # after the import has gone on to replace it.
+            _fsync_directory(database.parent)
+        except BaseException as exc:
+            # Includes KeyboardInterrupt: a half-written "backup" must never
+            # be left looking like one.
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             if path is not None:
                 try:
                     os.unlink(path)
                 except OSError:
                     pass
-            raise BackupFailed(
-                f"cannot write the pre-import backup in {database.parent}: {exc}. "
-                "Nothing was replaced. Re-run with --no-backup to replace the "
-                "configuration without a backup."
-            ) from exc
+            if isinstance(exc, OSError):
+                raise BackupFailed(
+                    f"cannot write the pre-import backup in {database.parent}: {exc}. "
+                    "Nothing was replaced. Re-run with --no-backup to replace the "
+                    "configuration without a backup."
+                ) from exc
+            raise
         return path
 
     return write_backup
@@ -280,6 +387,7 @@ def _backup_writer(resolved: ResolvedConfigPath) -> Callable[[BackupConfig], Pat
 # Failures raised before the import has touched anything (a bad YAML, a bad
 # path): the "a retry replaces ..." reminder would be noise on those.
 _PRE_WRITE_ERRORS = (ValueError, TypeError, yaml.YAMLError, FileNotFoundError, ConfigPathError, SchemaError)
+
 
 
 @cli.command(
@@ -313,9 +421,14 @@ def import_cmd(yaml_file: Path, no_backup: bool, config_path: Optional[str], ver
 
     # `import_yaml` logs its own "Replacing existing config store" warning
     # before the result is known; the warning below says the same thing and
-    # also names the backup, so only that one is shown.
+    # also names the backup, so only that one is shown. Likewise a skipped
+    # first-import cleanup is logged ("Failed first import: ...") AND attached
+    # to the exception as a note, which `errors.report` prints; show it once.
     if state.handler is not None:
-        state.handler.drop_prefixes = ("Replacing existing config store",)
+        state.handler.drop_prefixes = (
+            "Replacing existing config store",
+            "Failed first import",
+        )
 
     try:
         result = import_yaml(
@@ -332,7 +445,7 @@ def import_cmd(yaml_file: Path, no_backup: bool, config_path: Optional[str], ver
         )
         raise
     except Exception as exc:
-        if existed and not isinstance(exc, _PRE_WRITE_ERRORS):
+        if existed and not isinstance(exc, _PRE_WRITE_ERRORS) and not is_database_unusable(exc):
             exc.add_note(_REPLACE_NOTE)
         raise
 
@@ -383,7 +496,11 @@ def _exists(path: Path) -> bool:
 )
 @click.option(
     "--force", is_flag=True, default=False,
-    help="Overwrite FILE if it already exists.",
+    help=(
+        "Overwrite FILE if it already exists. A regular file is replaced, not "
+        "rewritten (other hard links to it keep the old content), which needs "
+        "a writable directory; a FIFO or device is written to in place."
+    ),
 )
 @_common
 def export_cmd(output: Optional[str], force: bool, config_path: Optional[str], verbose: bool) -> None:
@@ -403,14 +520,117 @@ def export_cmd(output: Optional[str], force: bool, config_path: Optional[str], v
         click.echo(text, nl=False)
         return
 
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if force else os.O_EXCL)
     try:
-        fd = os.open(output, flags, 0o666)
-    except FileExistsError:
-        raise CliError(f"{output} already exists; use --force to overwrite it") from None
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
+        _write_output(output, text, force)
+    except OSError as exc:
+        # `exc` may name the temp file; the operator asked for `output`.
+        raise CliError(
+            f"cannot write {output}: {exc.strerror or exc}. "
+            "Any existing file was left untouched."
+        ) from exc
     click.echo(f"Exported the configuration in {resolved.resolved_path} to {output}.", err=True)
+
+
+def _write_output(output: str, text: str, force: bool) -> None:
+    """Write `text` to `output` through a temp file in the same directory and
+    rename it into place, so a failure (disk full, ^C) leaves an existing
+    target exactly as it was and never a truncated one.
+
+    Without `force` an existing `output` is refused (nothing is clobbered even
+    if it appears while this runs: the final step is a hard link, which fails
+    if the name exists). With `force` a regular file is replaced; a symlink is
+    followed, as the open-and-truncate this replaces did, and the existing
+    file's permission bits (and, where allowed, owner) are kept. Anything that
+    is not a regular file -- a FIFO, a device such as /dev/null -- is never
+    renamed over: it is opened and written in place.
+    """
+    target = os.path.realpath(output) if force else os.path.abspath(output)
+    directory = os.path.dirname(target)
+    existing: Optional[os.stat_result] = None
+    if force:
+        try:
+            existing = os.stat(target)
+        except OSError:
+            existing = None
+    elif os.path.lexists(output):
+        raise CliError(f"{output} already exists; use --force to overwrite it")
+
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        _write_in_place(output, target, text)
+        return
+
+    fd, temp = tempfile.mkstemp(dir=directory, prefix=".zfsbackup-export.")
+    try:
+        if existing is not None:
+            # chown first: it may clear set-id bits that the chmod then sets.
+            try:
+                os.fchown(fd, existing.st_uid, existing.st_gid)
+            except PermissionError:
+                pass  # not ours to give away; the replacement is ours
+            os.fchmod(fd, existing.st_mode & 0o7777)
+        else:
+            # New files get the usual 0666-minus-umask, as `open()` would.
+            umask = os.umask(0)
+            try:  # restore the umask even if a signal unwinds us here
+                os.fchmod(fd, 0o666 & ~umask)
+            finally:
+                os.umask(umask)
+        # Clear `fd` BEFORE `fdopen` (see `_backup_writer`).
+        raw, fd = fd, None
+        handle = os.fdopen(raw, "w", encoding="utf-8")
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if force:
+            os.replace(temp, target)
+        else:
+            try:
+                os.link(temp, target)
+            except FileExistsError:
+                raise CliError(f"{output} already exists; use --force to overwrite it") from None
+            except OSError:
+                # No hard links here (some network or FAT filesystems): fall
+                # back to rename, accepting the narrow check-then-rename race.
+                if os.path.lexists(target):
+                    raise CliError(f"{output} already exists; use --force to overwrite it") from None
+                os.replace(temp, target)
+            else:
+                os.unlink(temp)
+        temp = None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temp is not None:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+    try:
+        _fsync_directory(directory)
+    except OSError as exc:
+        raise CliError(
+            f"{output} was written, but flushing its directory failed: "
+            f"{exc.strerror or exc}. It may not survive a crash."
+        ) from exc
+
+
+def _write_in_place(output: str, target: str, text: str) -> None:
+    """`--force` onto something that is not a regular file: open it and write,
+    with no temp file and no rename -- replacing a FIFO or /dev/null with a
+    regular file would silently break whatever reads or relies on it."""
+    try:
+        # No O_CREAT, no O_TRUNC: it exists, and truncation means nothing
+        # to a pipe or a device.
+        fd = os.open(target, os.O_WRONLY)
+        raw, fd = fd, None
+        with os.fdopen(raw, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except OSError as exc:
+        raise CliError(f"cannot write {output}: {exc.strerror or exc}.") from exc
 
 
 # --------------------------------------------------------------------------
@@ -438,7 +658,12 @@ def migrate_cmd(check: bool, config_path: Optional[str], verbose: bool) -> None:
         try:
             revision = check_config_schema(resolved)
         except SchemaOutOfDate as exc:
-            raise CliError(str(exc)) from exc
+            # One line, this command's own verdict. The store's text already
+            # names the database, both revisions and the remedy (`migrate`,
+            # or `import` for a file with no recorded revision); the
+            # daemon's "start the daemon again" sentence is deliberately not
+            # part of it.
+            raise CliError(f"the schema is not up to date: {exc}") from exc
         click.echo(f"Schema is up to date (revision {revision}).")
         return
 
@@ -446,18 +671,52 @@ def migrate_cmd(check: bool, config_path: Optional[str], verbose: bool) -> None:
     if not upgrade.changed:
         click.echo(f"Schema is up to date (revision {upgrade.to_rev}).")
         return
-    before = ", ".join(upgrade.from_revs) or "none (no recorded revision)"
+    before = ", ".join(upgrade.from_revs)
     click.echo(f"Migrated the schema of {resolved.resolved_path} from {before} to {upgrade.to_rev}.")
     click.echo(
-        "Restart a running zfsbackup daemon: it checks the schema when it "
-        "starts and will not pick up the new one until then."
+        "Restart any running zfsbackup daemon now -- it is still running the "
+        "old schema check."
     )
+
+
+_sigterm_seen = False
+
+
+def _on_sigterm(signum, frame) -> None:
+    global _sigterm_seen
+    _sigterm_seen = True
+    # A second `kill` while the first is unwinding must not interrupt the
+    # cleanup; SIGKILL remains for a command that hangs.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise _Terminated()
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     """Console-script entry point (`zfsbackup-config`). Exits the process with
-    the command's exit code."""
-    cli.main(args=argv, prog_name="zfsbackup-config", standalone_mode=True)
+    the command's exit code.
+
+    SIGTERM is turned into a `KeyboardInterrupt` for the duration, so `kill`
+    unwinds like ^C (temp and backup files removed, the transaction rolled
+    back); the exit code is 143 instead of 130."""
+    global _sigterm_seen
+    _sigterm_seen = False
+    previous = None
+    try:
+        previous = signal.signal(signal.SIGTERM, _on_sigterm)
+    except ValueError:  # not the main thread: leave the signal alone
+        pass
+    try:
+        try:
+            cli.main(args=argv, prog_name="zfsbackup-config", standalone_mode=True)
+        except SystemExit as exc:
+            # A signal that landed outside the command (while Click parsed
+            # arguments) comes back as Click's generic Abort, exit 1.
+            if _sigterm_seen and exc.code in (1, EXIT_SIGINT):
+                raise SystemExit(EXIT_SIGTERM) from None
+            raise
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":  # pragma: no cover

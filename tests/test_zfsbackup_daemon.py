@@ -1012,7 +1012,39 @@ class TestMainConfigSourceResolution:
                 result = main()
 
         assert result == 1
-        # SchemaOutOfDate's message, logged VERBATIM (config_error_message
-        # returns ConfigPathError/SchemaError text unmodified).
-        assert "The daemon only checks the schema" in caplog.text
-        assert "Run `zfsbackup-config migrate`" in caplog.text
+        # Item 10.4: the store's SchemaOutOfDate text is neutral (here the
+        # "no recorded revision" variant, which points at `import`, because
+        # `migrate` never creates a database) and the daemon appends its own
+        # sentence after it.
+        assert "has no recorded schema revision (it holds no configuration tables)" in caplog.text
+        assert "`zfsbackup-config import`" in caplog.text
+        assert (
+            "The daemon only checks the schema and never migrates it; run the "
+            "command above, then start the daemon again." in caplog.text
+        )
+
+    def test_test_config_foreign_database_is_logged_verbatim_and_left_alone(
+        self, tmp_path, caplog
+    ):
+        """Item 10.4: an SQLite file with someone else's tables is
+        `NotAConfigDatabase`; the daemon logs the store's text with NO
+        appended "never migrates" sentence (it is not an out-of-date
+        schema) and does not modify the file (the reader engine no longer
+        switches the journal mode)."""
+        db_path = tmp_path / 'other.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.execute('CREATE TABLE orders(id INTEGER PRIMARY KEY, x TEXT)')
+        conn.commit()
+        conn.close()
+        before = db_path.read_bytes()
+
+        with patch('sys.argv', ['daemon', '--test-config', '-c', str(db_path)]):
+            with caplog.at_level('ERROR'):
+                result = main()
+
+        assert result == 1
+        assert "not a zfsbackup config database" in caplog.text
+        assert "tables: orders" in caplog.text
+        assert "The daemon only checks the schema" not in caplog.text
+        assert db_path.read_bytes() == before
+        assert before[18:20] == b"\x01\x01"

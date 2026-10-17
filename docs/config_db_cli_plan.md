@@ -30,7 +30,7 @@ carries a status note or "as landed" text — where those disagree with the prop
 | A-21 follow-up | done | Five low items from the re-review, plus a corrected fingerprint placement found by the concurrency re-review |
 | A-9 scenarios | done | Two-VM harness 15/15 on the DB-backed config; `test_config_permissions.sh` 61/61 on real Linux. Startup exits 1 (not 78) on a sidecar permission error; 78 is the worker code |
 | Item 10.1 + 10.2 | done (cfa9d54) | `zfsbackup-config import/export/migrate`; reviewed by both reviewers |
-| **Item 10.4 review fixes** | **in progress** | Foreign-DB refusal, exit-code contract, ^C/backup hygiene |
+| Items 10.4–10.6 review fixes | done | Foreign-DB refusal, exit-code contract, ^C/SIGTERM/backup hygiene, connect-failure fd leak |
 | Item 10.3 | pending | Delete the interim importer after 10.4 |
 | 10–16 Config CLI | approved, not started | Revised after Checkpoint A; order 10 → 15 → 13 → 11 → 12 → 14 → 16 |
 | 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
@@ -1636,6 +1636,24 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
     parse-boundary warnings) — needs a model/store contract change, do it with items 11/12 (the CLI
     currently prints e.g. the `forever` warning twice in different words); a raw `.db` copy when the
     outgoing config is unreadable; a first import's transient "uninitialized" window mapped as a refusal.
+
+- **10.5 / 10.6 — Follow-up rounds** *(done)*. 10.4's review found the writer still switched a foreign
+  Alembic-managed DB to WAL and `export -o --force` replaced FIFOs/devices. As landed:
+  - One rule decides both "may this file be switched to WAL" and "is this file ours":
+    `migrate.may_switch_to_wal` + `_unknown_revisions`. Switch only when the file has no tables, or
+    `alembic_version` has ≥1 row and every row is in `KNOWN_REVISIONS`; an empty `alembic_version`
+    never switches. Only "no such table/column" errors are read as "not ours"; locked/corrupt propagate.
+  - `SchemaSplitBrain` only when *all* of our tables are present with no stamp; any subset → `NotAConfigDatabase`.
+  - The connect listener closes the raw DBAPI connection when it raises — SQLAlchemy 2.0.51 doesn't, so
+    each failed connect (e.g. a corrupt-body file) used to leak an fd invisible to `dispose_all()`.
+  - CLI: `--force` renames only over regular files (others written in place); `mkstemp` temp names;
+    owner/mode kept; directory fsync; one-line damaged-DB message (78); other SQLAlchemy errors are
+    internal errors (1); SIGTERM handled like ^C (exit 143); the ^C "may or may not have been applied"
+    verdict printed once without dropping the "Never delete its -wal/-shm files" warning.
+  - **Deferred:** a WAL switch on a never-WAL file fails immediately against another process's RESERVED
+    lock (SQLite skips the busy handler there; pre-existing, rare); the daemon still words a damaged DB
+    with the generic "Failed to load configuration" text (fix with 15.1's shared `config_error_message`);
+    workers keep one idle pooled connection for life (moot after 15.2(b): workers stop reading the DB).
 
 ### Item 15 — Generation CAS, daemon presence, consistent worker config *(moved ahead of 11/12/14)*
 - **15.1** — `zfsbackup-store-developer` · `needs-approval` · gate + `concurrency-reviewer`. **Basis:**

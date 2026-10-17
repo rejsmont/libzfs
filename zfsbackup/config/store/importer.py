@@ -62,8 +62,10 @@ them, not a fourth phase:
    coarse 1-10 ms clock). A zero-byte file is not affected: any write grows
    it. Item 15.4's writer lock, which the CLI will hold across the whole
    import, closes both. A failure over a pre-existing target
-   leaves it exactly as it was -- phase 3 rolls back, and phase 2's
-   migration is transactional.
+   leaves its stored configuration exactly as it was -- phase 3 rolls back.
+   Phase 2 commits before phase 3 starts, so an existing database may
+   already have been migrated to the current schema (its content is
+   unchanged); phase 2's own failures roll back entirely.
 
    A first import (the target does not exist) is also refused, creating
    nothing and touching nothing, if `-wal`/`-shm`/`-journal` files already
@@ -115,7 +117,11 @@ them, not a fourth phase:
    would otherwise refuse as `ConfigDbNotADatabase`; see `paths.py`).
    `ensure_schema(conn)` migrates to head, and `conn.commit()` is the
    **last statement issued on this connection** -- nothing else runs on
-   it afterwards. Both hazards this ordering avoids are measured, not
+   it afterwards. `ensure_schema` raises `NotAConfigDatabase` for an existing
+   file that holds tables but records no zfsbackup revision (item 10.4): a
+   foreign database is refused, not grafted into, and a first import onto a
+   zero-byte or tableless file still works. Both hazards this ordering
+   avoids are measured, not
    theoretical:
 
    - Nesting this inside the phase-3 writer session self-deadlocks: the
@@ -516,7 +522,12 @@ def _remove_created_target(
         return
 
     try:
-        note = _remove_if_unused(target, created_id)
+        # A KeyboardInterrupt (any non-`Exception`) can land AFTER phase 3's
+        # COMMIT returned, so "this import was NOT applied" may be false.
+        if error is not None and not isinstance(error, Exception):
+            note = _remove_if_unused(target, created_id, interrupted=True)
+        else:
+            note = _remove_if_unused(target, created_id)
     except Exception as cleanup_exc:  # noqa: BLE001 - must not mask the real error
         logger.exception("unexpected error while cleaning up %s", target)
         note = (
@@ -528,7 +539,9 @@ def _remove_created_target(
         error.add_note(note)
 
 
-def _cleanup_skipped(target: Path, reason: str, kind: str) -> str:
+def _cleanup_skipped(
+    target: Path, reason: str, kind: str, interrupted: bool = False
+) -> str:
     """The one WARNING every skipped cleanup logs, and the same text returned
     so `_remove_created_target` can attach it to the in-flight exception
     (`add_note`) -- the CLI shows it with the import error without having to
@@ -537,8 +550,16 @@ def _cleanup_skipped(target: Path, reason: str, kind: str) -> str:
     it), `"schema"` (a schema-only database, which a re-run of the import
     reuses), `"imported"` (another process has imported a configuration),
     `"changed"` (its fingerprint moved between the check and the unlink) or
-    `"replaced"`/`"unknown"`."""
-    if kind == "imported":
+    `"replaced"`/`"unknown"`. `interrupted` (the in-flight exception was a
+    `KeyboardInterrupt`-style `BaseException`, which can land after the commit)
+    stops the `"imported"` text from claiming this import was not applied."""
+    if kind == "imported" and interrupted:
+        step = (
+            f"{target} holds a configuration and was left intact; the import "
+            "was interrupted, so it may or may not have been applied (run "
+            "`zfsbackup-config export` to check)."
+        )
+    elif kind == "imported":
         step = (
             "Another process has since imported a configuration into "
             f"{target}; it was left intact; this import was NOT applied."
@@ -565,7 +586,9 @@ def _cleanup_skipped(target: Path, reason: str, kind: str) -> str:
 
 
 def _remove_if_unused(
-    target: Path, created_id: Optional[Tuple[int, int]]
+    target: Path,
+    created_id: Optional[Tuple[int, int]],
+    interrupted: bool = False,
 ) -> Optional[str]:
     """Steps 2-6 of `_remove_created_target`. Returns the WARNING text when
     cleanup was SKIPPED (see `_cleanup_skipped`), else `None` (removed, or
@@ -600,7 +623,9 @@ def _remove_if_unused(
                 target, f"could not confirm it is empty ({exc})", kind
             )
         if not empty:
-            return _cleanup_skipped(target, "it now holds a configuration", "imported")
+            return _cleanup_skipped(
+                target, "it now holds a configuration", "imported", interrupted
+            )
         # NOTE: no fingerprint retake here. The probe's lock is released, so
         # its verdict is stale; step 5 compares against the fingerprint taken
         # BEFORE the probe, or a writer landing in this gap would become the
@@ -659,8 +684,7 @@ def _backup_outgoing(
             raise OutgoingConfigUnreadable(
                 f"The configuration currently stored in {target} cannot be "
                 f"read ({type(exc).__name__}: {exc}), so it cannot be backed "
-                "up before being replaced. Nothing was changed. Skip the "
-                "backup to replace it anyway."
+                "up before being replaced. Nothing was changed."
             ) from exc
         logger.warning(
             "The configuration currently stored in %s cannot be read (%s: "
@@ -698,7 +722,8 @@ def import_yaml(
     the same `BEGIN IMMEDIATE` as `save_config`, so the config it saves is
     exactly the one that gets replaced: nothing can commit between the two.
     If `backup` raises, phase 3 rolls back and the exception propagates; the
-    database is untouched. If a LATER step fails after `backup` succeeded
+    stored configuration is unchanged (the schema may already have been
+    upgraded by phase 2). If a LATER step fails after `backup` succeeded
     (the file is already written), the exception gets a note naming it.
     It is not called when there is nothing to back up (a database this call
     just created, or one that holds no configuration yet), and it is not
@@ -706,7 +731,7 @@ def import_yaml(
     `None`.
 
     An outgoing configuration that exists but cannot be loaded raises
-    `OutgoingConfigUnreadable` (nothing is replaced) unless
+    `OutgoingConfigUnreadable` (the stored configuration is not replaced) unless
     `allow_unreadable_outgoing` is True, in which case a WARNING is logged,
     no backup is taken, and the import proceeds. Only meaningful with
     `backup`; without one the outgoing config is never read.
@@ -809,9 +834,13 @@ def import_yaml(
                 backup_path = _backup_outgoing(
                     session, backup, allow_unreadable_outgoing, target
                 )
-                # save_config starts from a clean identity map, exactly as
-                # it did before the outgoing config was loaded here.
-                session.expunge_all()
+                # No `session.expunge_all()` here: `save_config`'s bulk
+                # `delete()`s (default `synchronize_session="auto"`) already
+                # evict every row `load_config` loaded, and the re-inserted
+                # rows reusing the same primary keys then flush cleanly
+                # (checked: re-import with a backup callback, twice, with
+                # and without an explicit expunge -- identical). An earlier
+                # `expunge_all()` guarded nothing observable.
             if replaced_datasets or replaced_destinations:
                 logger.warning(
                     "Replacing existing config store at %s: %d dataset(s) and "
@@ -822,10 +851,19 @@ def import_yaml(
             save_config(session, config)
     except BaseException as exc:
         if backup_path is not None:
+            if isinstance(exc, Exception):
+                outcome = "the stored configuration was not replaced."
+            else:
+                # KeyboardInterrupt etc. can land after phase 3's COMMIT
+                # returned (post-commit bookkeeping, session close), so
+                # neither outcome may be asserted.
+                outcome = (
+                    "the import was interrupted; it may or may not have "
+                    "been applied (run `zfsbackup-config export` to check)."
+                )
             exc.add_note(
                 f"A pre-import backup of the outgoing configuration was "
-                f"already written to {backup_path}; the stored configuration "
-                f"was not replaced."
+                f"already written to {backup_path}; {outcome}"
             )
         if created:
             _remove_created_target(target, created_id, exc)

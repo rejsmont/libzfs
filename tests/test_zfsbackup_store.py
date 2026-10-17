@@ -101,7 +101,10 @@ from zfsbackup.config.store.mapper import (
     validate_config,
 )
 from zfsbackup.config.store.migrate import (
+    EXPECTED_HEAD,
     KNOWN_REVISIONS,
+    MigrationPackagingError,
+    NotAConfigDatabase,
     SchemaError,
     SchemaOutOfDate,
     SchemaSplitBrain,
@@ -3016,13 +3019,20 @@ class TestMigrations:
         connection that already has pending work on it.
         """
         with empty_memory_engine.connect() as conn:
-            conn.execute(text("CREATE TABLE caller_marker (id INTEGER)"))
-            conn.execute(text("INSERT INTO caller_marker (id) VALUES (1)"))
+            # The caller's transaction is opened with a bare `BEGIN` rather
+            # than a scratch table: since item 10.4 a table that is not
+            # zfsbackup's makes `check_schema` refuse the file as
+            # `NotAConfigDatabase`, so a "caller_marker" table would end this
+            # test before it reached the migration it is about. An explicit
+            # `BEGIN` is what makes the DDL ambient (a bare SELECT/PRAGMA
+            # does not under pysqlite's legacy handling: the DDL then
+            # autocommits and only the version stamp is lost).
+            conn.exec_driver_sql("BEGIN")
             ensure_schema(conn)
             conn.rollback()
 
         insp = inspect(empty_memory_engine)
-        assert set(insp.get_table_names()) == {"caller_marker"}
+        assert insp.get_table_names() == []
 
     def test_ensure_schema_first_call_on_clean_connection_leaves_split_brain_on_rollback(
         self, empty_memory_engine
@@ -3172,10 +3182,15 @@ class TestMigrateCheckSchema:
 
         message = str(excinfo.value)
         assert "check_schema" not in message
-        assert "The daemon only checks the schema" in message
-        assert "Run `zfsbackup-config migrate`" in message
-        # `import` is a destructive full replace, never the remedy offered.
-        assert "zfsbackup-config import" not in message
+        # Item 10.4: the store's text is neutral (the daemon appends its own
+        # sentence, see test_zfsbackup_daemon_resilience.py), and for a file
+        # with no recorded revision the remedy is `import`, not `migrate`
+        # (which refuses to create a database).
+        assert "The daemon only checks the schema" not in message
+        assert "has no recorded schema revision (it holds no configuration tables)" in message
+        assert EXPECTED_HEAD in message
+        assert "`zfsbackup-config import`" in message
+        assert "zfsbackup-config migrate" not in message
 
     def test_split_brain_raises_schema_split_brain(self, empty_memory_engine):
         """Full application schema, no recorded Alembic revision at all --
@@ -3268,7 +3283,10 @@ class TestMigrateSchemaErrorHierarchy:
                         ensure_schema(conn)
 
             assert not isinstance(excinfo.value, SchemaError)
-            assert type(excinfo.value) is RuntimeError
+            # Item 10.4: its own class, still a RuntimeError, never a
+            # SchemaError (so `except SchemaError` cannot absorb it).
+            assert type(excinfo.value) is MigrationPackagingError
+            assert isinstance(excinfo.value, RuntimeError)
             assert "2 heads" in str(excinfo.value)
         finally:
             eng.dispose()
@@ -5546,6 +5564,798 @@ class TestDbReadOnlySessions:
         assert loaded.datasets[0].name == "tank/a"
 
 
+def _header_journal_bytes(path):
+    """File-format bytes 18-19: (1, 1) = rollback journal, (2, 2) = WAL."""
+    raw = Path(path).read_bytes()
+    return raw[18], raw[19]
+
+
+@pytest.mark.integration
+class TestJournalModeByEngineRole:
+    """Item 10.4: only WRITER engines switch a file to WAL, and not a file
+    that holds tables but no `alembic_version` (not ours); READER engines only
+    query the mode and warn once per engine. A reader that issued
+    `journal_mode=WAL` rewrote the header of whatever file `-c` pointed at."""
+
+    @pytest.fixture(autouse=True)
+    def _db_logger_state(self):
+        # Same leak guard as TestDbPragmaConnectListenerInternals: an earlier
+        # test's fileConfig() may have disabled this logger for the session.
+        logger = logging.getLogger("zfsbackup.config.store.db")
+        original = (logger.level, logger.disabled)
+        logger.disabled = False
+        yield
+        logger.level, logger.disabled = original
+
+    @staticmethod
+    def _sqlite_file(path, *statements):
+        conn = sqlite3.connect(str(path))
+        for statement in statements:
+            conn.execute(statement)
+        conn.commit()
+        conn.close()
+        return path
+
+    @staticmethod
+    def _connect_and_close(url, **kwargs):
+        eng = make_engine(url, **kwargs)
+        try:
+            with eng.connect() as conn:
+                conn.exec_driver_sql("SELECT 1").fetchall()
+        finally:
+            eng.dispose()
+
+    @staticmethod
+    def _mode_warnings(caplog):
+        return [
+            r.getMessage() for r in caplog.records
+            if r.name == "zfsbackup.config.store.db"
+            and r.levelno == logging.WARNING and "is not in WAL mode" in r.getMessage()
+        ]
+
+    def test_a_writer_switches_a_new_file_to_wal(self, tmp_path):
+        path = tmp_path / "new.db"
+        self._connect_and_close(f"sqlite:///{path}")
+        assert _header_journal_bytes(path) == (2, 2)
+
+    def test_a_writer_switches_a_tableless_file_to_wal(self, tmp_path):
+        path = self._sqlite_file(tmp_path / "empty.db", "PRAGMA user_version=1")
+        assert _header_journal_bytes(path) == (1, 1)
+        self._connect_and_close(f"sqlite:///{path}")
+        assert _header_journal_bytes(path) == (2, 2)
+
+    def test_a_writer_does_not_switch_a_file_whose_alembic_version_is_empty_but_has_tables(
+        self, tmp_path
+    ):
+        """10.5 inverted the 10.4 rule "has an `alembic_version` table": an
+        EMPTY one next to other tables records no revision, so the file is
+        not recognisably ours and is left alone."""
+        path = self._sqlite_file(
+            tmp_path / "ours.db",
+            "CREATE TABLE alembic_version (version_num VARCHAR(32))",
+            "CREATE TABLE datasets (id INTEGER)",
+        )
+        before = path.read_bytes()
+        self._connect_and_close(f"sqlite:///{path}")
+        assert _header_journal_bytes(path) == (1, 1)
+        assert path.read_bytes() == before
+
+    def test_a_writer_switches_a_file_with_a_known_alembic_revision(self, tmp_path):
+        path = self._sqlite_file(
+            tmp_path / "ours.db",
+            "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)",
+            f"INSERT INTO alembic_version VALUES ('{EXPECTED_HEAD}')",
+            "CREATE TABLE datasets (id INTEGER)",
+        )
+        self._connect_and_close(f"sqlite:///{path}")
+        assert _header_journal_bytes(path) == (2, 2)
+
+    def test_a_writer_leaves_a_foreign_file_byte_for_byte_alone(self, tmp_path):
+        path = self._sqlite_file(
+            tmp_path / "other.db", "CREATE TABLE orders (id INTEGER PRIMARY KEY, x TEXT)",
+            "INSERT INTO orders (x) VALUES ('a')",
+        )
+        before = path.read_bytes()
+        self._connect_and_close(f"sqlite:///{path}")
+        assert path.read_bytes() == before
+        assert _header_journal_bytes(path) == (1, 1)
+        assert sorted(os.listdir(tmp_path)) == ["other.db"]
+
+    def test_a_writer_leaves_ours_but_unstamped_tables_alone_too(self, tmp_path):
+        """Tables and no `alembic_version` is the guard's whole condition: a
+        split-brain file is refused by `check_schema` later, unmodified."""
+        path = self._sqlite_file(tmp_path / "split.db", "CREATE TABLE datasets (id INTEGER)")
+        before = path.read_bytes()
+        self._connect_and_close(f"sqlite:///{path}")
+        assert path.read_bytes() == before
+
+    def test_a_foreign_file_is_still_readable_and_writable_through_the_writer_engine(self, tmp_path):
+        """Skipping the WAL switch must not break the connection itself (the
+        schema check, not the engine, is what refuses it)."""
+        path = self._sqlite_file(tmp_path / "other.db", "CREATE TABLE orders (id INTEGER)")
+        eng = make_engine(f"sqlite:///{path}")
+        try:
+            with eng.begin() as conn:
+                conn.exec_driver_sql("INSERT INTO orders VALUES (7)")
+            with eng.connect() as conn:
+                assert conn.exec_driver_sql("SELECT id FROM orders").fetchall() == [(7,)]
+        finally:
+            eng.dispose()
+
+    def test_a_reader_leaves_a_rollback_journal_file_in_that_mode(self, tmp_path, caplog):
+        path = self._sqlite_file(
+            tmp_path / "rj.db", "CREATE TABLE alembic_version (version_num VARCHAR(32))"
+        )
+        before = path.read_bytes()
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+            self._connect_and_close(f"sqlite:///{path}", readonly=True)
+        assert _header_journal_bytes(path) == (1, 1)
+        assert path.read_bytes() == before
+        assert sorted(os.listdir(tmp_path)) == ["rj.db"]
+        (warning,) = self._mode_warnings(caplog)
+        assert str(path) in warning
+        assert "journal_mode=delete" in warning
+        assert "readers and writers will block each other." in warning
+        assert warning.endswith(
+            "(A zfsbackup-config write switches a zfsbackup config database to WAL.)"
+        )
+        # 10.5: the warning promises no switch ("will switch it to WAL" is
+        # gone) -- a foreign file never gets one.
+        assert "will switch" not in warning
+
+    def test_the_warning_is_logged_once_per_engine_across_pooled_connections(
+        self, tmp_path, caplog
+    ):
+        path = self._sqlite_file(tmp_path / "rj.db", "CREATE TABLE t (x)")
+        eng = make_engine(f"sqlite:///{path}", readonly=True)
+        try:
+            with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+                held = [eng.connect() for _ in range(4)]  # four distinct DBAPI connections
+                try:
+                    assert len({id(c.connection.dbapi_connection) for c in held}) == 4
+                finally:
+                    for c in held:
+                        c.close()
+                for _ in range(3):  # and again after the pool has recycled them
+                    with eng.connect() as c:
+                        c.exec_driver_sql("SELECT 1").fetchall()
+        finally:
+            eng.dispose()
+        assert len(self._mode_warnings(caplog)) == 1
+
+    def test_each_reader_engine_warns_once_for_itself(self, tmp_path, caplog):
+        path = self._sqlite_file(tmp_path / "rj.db", "CREATE TABLE t (x)")
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+            self._connect_and_close(f"sqlite:///{path}", readonly=True)
+            self._connect_and_close(f"sqlite:///{path}", readonly=True)
+        assert len(self._mode_warnings(caplog)) == 2
+
+    def test_a_reader_on_a_wal_file_is_silent_and_leaves_it_wal(self, tmp_path, caplog):
+        path = tmp_path / "wal.db"
+        self._connect_and_close(f"sqlite:///{path}")  # writer: switches to WAL
+        assert _header_journal_bytes(path) == (2, 2)
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+            self._connect_and_close(f"sqlite:///{path}", readonly=True)
+        assert self._mode_warnings(caplog) == []
+        assert _header_journal_bytes(path) == (2, 2)
+
+    def test_a_writer_after_a_reader_still_ends_up_in_wal(self, tmp_path):
+        """The next write by the CLI is what switches it (the warning's promise)
+        -- for a file that is ours: it records a known revision."""
+        path = self._sqlite_file(
+            tmp_path / "rj.db",
+            "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)",
+            f"INSERT INTO alembic_version VALUES ('{EXPECTED_HEAD}')",
+        )
+        self._connect_and_close(f"sqlite:///{path}", readonly=True)
+        assert _header_journal_bytes(path) == (1, 1)
+        self._connect_and_close(f"sqlite:///{path}")
+        assert _header_journal_bytes(path) == (2, 2)
+
+    def test_a_writer_leaves_a_stamp_only_file_in_rollback_mode(self, tmp_path):
+        """10.6: an empty `alembic_version` is not switched; `migrate` refuses
+        it and promises to leave it unchanged."""
+        path = self._sqlite_file(
+            tmp_path / "rj.db",
+            "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)",
+        )
+        before = path.read_bytes()
+        self._connect_and_close(f"sqlite:///{path}")
+        assert _header_journal_bytes(path) == (1, 1)
+        assert path.read_bytes() == before
+
+    def test_a_reader_never_issues_the_wal_pragma(self):
+        """Pragma-level pin with a stub DBAPI: the reader QUERIES the mode."""
+        calls = []
+
+        class Cursor:
+            def execute(self, sql, *a):
+                calls.append(sql)
+
+            def fetchone(self):
+                if calls and "JOURNAL_MODE" in calls[-1].upper():
+                    return ("wal",)
+                return None
+
+            def close(self):
+                pass
+
+        class Dbapi:
+            def cursor(self):
+                return Cursor()
+
+            def __getattr__(self, name):
+                return lambda *a, **k: None
+
+        eng = create_engine("sqlite://", creator=lambda: Dbapi(), poolclass=StaticPool)
+        store_db._install_pragmas(eng, readonly=True, foreign_keys=True, memory=False)
+        try:
+            with eng.connect():
+                pass
+        finally:
+            eng.dispose()
+        modes = [c for c in calls if "JOURNAL_MODE" in c.upper()]
+        assert modes == ["PRAGMA journal_mode"]
+        assert not any("=WAL" in c.upper() for c in calls)
+
+
+_KNOWN = EXPECTED_HEAD
+_UNKNOWN = "deadbeef0001"
+_STAMP_TABLE = "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+
+
+def _our_table_ddl():
+    """DDL for every table of zfsbackup's schema except `alembic_version`."""
+    return [
+        f"CREATE TABLE {name} (id INTEGER)"
+        for name in sorted(Base.metadata.tables)
+        if name != "alembic_version"
+    ]
+
+
+#: (id, statements building the file, may the WRITER switch it to WAL).
+#: `None` for the statements means a zero-byte file.
+_WAL_GATE_CASES = [
+    pytest.param(None, True, id="zero-byte"),
+    pytest.param(["PRAGMA user_version=1"], True, id="tableless-valid-file"),
+    # 10.6: an EMPTY alembic_version is never switched, whatever else the file
+    # holds -- `migrate` refuses it ("nothing to migrate") and promises to leave
+    # it unchanged.
+    pytest.param([_STAMP_TABLE], False, id="only-an-empty-alembic_version"),
+    pytest.param(
+        [_STAMP_TABLE, *_our_table_ddl()], False,
+        id="our-tables-and-an-empty-alembic_version",
+    ),
+    pytest.param(
+        ["CREATE TABLE orders (id INTEGER)", _STAMP_TABLE], False,
+        id="foreign-tables-and-empty-alembic_version",
+    ),
+    pytest.param(
+        ["CREATE TABLE orders (id INTEGER)", _STAMP_TABLE,
+         f"INSERT INTO alembic_version VALUES ('{_UNKNOWN}')"], False,
+        id="foreign-tables-and-a-foreign-revision",
+    ),
+    pytest.param(
+        [_STAMP_TABLE, f"INSERT INTO alembic_version VALUES ('{_UNKNOWN}')"], False,
+        id="only-alembic_version-holding-a-foreign-revision",
+    ),
+    pytest.param(
+        [_STAMP_TABLE, f"INSERT INTO alembic_version VALUES ('{_KNOWN}')",
+         f"INSERT INTO alembic_version VALUES ('{_UNKNOWN}')"], False,
+        id="a-known-row-and-an-unknown-row",
+    ),
+    pytest.param(
+        [_STAMP_TABLE, f"INSERT INTO alembic_version VALUES ('{_KNOWN}')"], True,
+        id="a-known-row-alone",
+    ),
+    pytest.param(
+        [_STAMP_TABLE, f"INSERT INTO alembic_version VALUES ('{_KNOWN}')",
+         *_our_table_ddl()], True,
+        id="a-known-row-and-our-tables",
+    ),
+    pytest.param(
+        [_STAMP_TABLE, f"INSERT INTO alembic_version VALUES ('{_KNOWN}')",
+         "CREATE TABLE operator_notes (x)"], True,
+        id="a-known-row-and-an-extra-table",
+    ),
+    pytest.param(
+        ["CREATE TABLE alembic_version (id INTEGER, note TEXT)"], False,
+        id="alembic_version-without-version_num-alone",
+    ),
+    pytest.param(
+        ["CREATE TABLE orders (id INTEGER)",
+         "CREATE TABLE alembic_version (id INTEGER, note TEXT)",
+         "INSERT INTO alembic_version VALUES (1, 'x')"], False,
+        id="alembic_version-without-version_num-and-foreign-tables",
+    ),
+    pytest.param(["CREATE TABLE orders (id INTEGER)"], False, id="foreign-tables-only"),
+    pytest.param(_our_table_ddl(), False, id="our-tables-and-no-stamp"),
+]
+
+
+def _build_gate_file(path, statements):
+    if statements is None:
+        path.write_bytes(b"")
+        return path
+    conn = sqlite3.connect(str(path))
+    for statement in statements:
+        conn.execute(statement)
+    conn.commit()
+    conn.close()
+    return path
+
+
+@pytest.mark.integration
+class TestWriterWalGating:
+    """Item 10.5 (M-1R): `PRAGMA journal_mode=WAL` rewrites the file header, so
+    a WRITER engine issues it only against a file that is brand new or
+    recognisably ours (`migrate.may_switch_to_wal`) -- never against a database
+    `check_schema` is about to refuse. The 10.4 rule ("an `alembic_version`
+    table exists") switched a foreign Alembic-managed file, and one with an
+    EMPTY `alembic_version`, and then refused it with a false "nothing was
+    changed".
+    """
+
+    @staticmethod
+    def _writer_connects(path):
+        eng = make_engine(f"sqlite:///{path}")
+        try:
+            with eng.connect() as conn:
+                conn.exec_driver_sql("SELECT 1").fetchall()
+        finally:
+            eng.dispose()
+
+    @pytest.mark.parametrize("statements, switched", _WAL_GATE_CASES)
+    def test_the_writer_switches_to_wal_only_a_file_that_is_new_or_ours(
+        self, tmp_path, statements, switched
+    ):
+        path = _build_gate_file(tmp_path / "f.db", statements)
+        before_bytes = path.read_bytes()
+        before_sha = hashlib.sha256(before_bytes).hexdigest()
+        files_before = sorted(os.listdir(tmp_path))
+
+        self._writer_connects(path)
+
+        raw = path.read_bytes()
+        if switched:
+            assert (raw[18], raw[19]) == (2, 2)
+        elif statements is not None:
+            assert (raw[18], raw[19]) == (before_bytes[18], before_bytes[19]) == (1, 1)
+            assert hashlib.sha256(raw).hexdigest() == before_sha
+            assert sorted(os.listdir(tmp_path)) == files_before
+
+    @pytest.mark.parametrize("statements, switched", _WAL_GATE_CASES)
+    def test_the_gate_function_says_the_same_on_a_raw_cursor(self, tmp_path, statements, switched):
+        from zfsbackup.config.store.migrate import may_switch_to_wal
+
+        path = _build_gate_file(tmp_path / "f.db", statements)
+        conn = sqlite3.connect(str(path))
+        try:
+            assert may_switch_to_wal(conn.cursor()) is switched
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize("statements, switched", [
+        c for c in _WAL_GATE_CASES
+        if c.id not in ("zero-byte", "alembic_version-without-version_num-alone",
+                        "alembic_version-without-version_num-and-foreign-tables",
+                        # The one deliberate divergence (10.6), pinned below.
+                        "only-an-empty-alembic_version")
+    ])
+    def test_the_gate_and_the_schema_check_agree_on_which_files_are_ours(
+        self, tmp_path, statements, switched
+    ):
+        """One decision, two callers: the writer may switch a file exactly when
+        `check_schema` would not refuse it as someone else's (foreign,
+        split-brain, or an unrecognised revision)."""
+        path = _build_gate_file(tmp_path / "f.db", statements)
+        eng = create_engine(f"sqlite:///{path}")
+        try:
+            with eng.connect() as conn:
+                try:
+                    check_schema(conn)
+                    refused = False
+                except (NotAConfigDatabase, SchemaSplitBrain, SchemaVersionMismatch):
+                    refused = True
+                except SchemaOutOfDate:
+                    refused = False
+        finally:
+            eng.dispose()
+        assert refused is (not switched)
+
+    def test_a_stamp_only_file_is_the_one_deliberate_divergence(self, tmp_path):
+        """10.6: `check_schema` does not refuse a stamp-only file as someone
+        else's (`SchemaOutOfDate`: unfinished, nothing to migrate), yet the
+        writer must not switch it -- `migrate` refuses it and promises to
+        leave it unchanged."""
+        path = _build_gate_file(tmp_path / "f.db", [_STAMP_TABLE])
+        eng = create_engine(f"sqlite:///{path}")
+        try:
+            with eng.connect() as conn:
+                with pytest.raises(SchemaOutOfDate):
+                    check_schema(conn)
+        finally:
+            eng.dispose()
+        self._writer_connects(path)
+        assert _header_journal_bytes(path) == (1, 1)
+
+    def test_the_gate_reads_the_known_revisions_at_call_time(self, tmp_path, monkeypatch):
+        """A newer package that adds a revision makes the older rows "ours"
+        without any other change; and a hard-coded copy of the set would not."""
+        statements = [_STAMP_TABLE, f"INSERT INTO alembic_version VALUES ('{_UNKNOWN}')"]
+        path = _build_gate_file(tmp_path / "f.db", statements)
+        self._writer_connects(path)
+        assert _header_journal_bytes(path) == (1, 1)
+
+        monkeypatch.setattr(
+            "zfsbackup.config.store.migrate.KNOWN_REVISIONS",
+            frozenset(KNOWN_REVISIONS | {_UNKNOWN}),
+        )
+        self._writer_connects(path)
+        assert _header_journal_bytes(path) == (2, 2)
+
+    def test_the_gate_never_writes(self, tmp_path):
+        """It runs on the raw cursor before any schema check: SELECTs only."""
+        from zfsbackup.config.store.migrate import may_switch_to_wal
+
+        statements = []
+
+        class Spy:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def execute(self, sql, *args):
+                statements.append(sql)
+                return self.inner.execute(sql, *args)
+
+            def fetchone(self):
+                return self.inner.fetchone()
+
+        path = _build_gate_file(
+            tmp_path / "f.db",
+            [_STAMP_TABLE, f"INSERT INTO alembic_version VALUES ('{_KNOWN}')"],
+        )
+        conn = sqlite3.connect(str(path))
+        try:
+            assert may_switch_to_wal(Spy(conn.cursor())) is True
+        finally:
+            conn.close()
+        assert statements and all(s.lstrip().upper().startswith("SELECT") for s in statements)
+
+    def test_unknown_revisions_is_sorted_and_empty_for_known_ones(self):
+        from zfsbackup.config.store.migrate import _unknown_revisions
+
+        assert _unknown_revisions([]) == []
+        assert _unknown_revisions([_KNOWN]) == []
+        assert _unknown_revisions(["zz", _KNOWN, "aa"]) == ["aa", "zz"]
+
+    def test_a_reader_never_switches_even_a_file_that_is_ours(self, tmp_path):
+        path = _build_gate_file(
+            tmp_path / "f.db",
+            [_STAMP_TABLE, f"INSERT INTO alembic_version VALUES ('{_KNOWN}')"],
+        )
+        before = path.read_bytes()
+        eng = make_engine(f"sqlite:///{path}", readonly=True)
+        try:
+            with eng.connect() as conn:
+                conn.exec_driver_sql("SELECT 1").fetchall()
+        finally:
+            eng.dispose()
+        assert path.read_bytes() == before
+
+
+def _corrupt_body_file(path):
+    """A file with a valid 100-byte SQLite header over garbage pages: opening
+    it succeeds, the FIRST statement that reads a page raises
+    `database disk image is malformed`."""
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE t (x INTEGER)")
+    conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(2000)])
+    conn.commit()
+    conn.close()
+    data = path.read_bytes()
+    path.write_bytes(data[:100] + b"\xff" * (len(data) - 100))
+    return path
+
+
+def _open_fd_count():
+    return len(os.listdir("/dev/fd"))
+
+
+@pytest.mark.skipif(not os.path.isdir("/dev/fd"), reason="needs /dev/fd to count descriptors")
+@pytest.mark.integration
+class TestFailedConnectClosesTheRawConnection:
+    """Item 10.6. SQLAlchemy 2.0.51 does not close the DBAPI connection when a
+    `connect` listener raises; it is left open inside a reference cycle, one
+    leaked descriptor per failed connect until the cyclic GC happens to run.
+    The listener now closes it itself. Every test here runs with the cyclic GC
+    DISABLED so that only an explicit close can satisfy it."""
+
+    @pytest.fixture
+    def gc_off(self):
+        import gc
+
+        gc.collect()
+        gc.disable()
+        try:
+            yield
+        finally:
+            gc.enable()
+
+    @pytest.mark.parametrize("readonly", [True, False], ids=["reader", "writer"])
+    def test_a_corrupt_body_file_leaves_no_open_connection_or_descriptor(
+        self, tmp_path, gc_off, readonly
+    ):
+        from sqlalchemy.exc import DatabaseError
+
+        path = _corrupt_body_file(tmp_path / "c.db")
+        eng = make_engine(f"sqlite:///{path}", readonly=readonly)
+        raw = []
+
+        # Ahead of db.py's listener (`insert=True`), so we hold the very
+        # DBAPI connection it is about to fail on.
+        @event.listens_for(eng, "connect", insert=True)
+        def _capture(dbapi_connection, connection_record):  # noqa: ANN001
+            raw.append(dbapi_connection)
+
+        fds_before = _open_fd_count()
+        try:
+            with pytest.raises(DatabaseError, match="malformed"):
+                eng.connect()
+            assert len(raw) == 1
+            for conn in raw:
+                with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                    conn.execute("SELECT 1")
+            assert _open_fd_count() == fds_before
+        finally:
+            for conn in raw:
+                conn.close()  # idempotent; keeps a regression from leaking onward
+            eng.dispose()
+
+    @pytest.mark.parametrize("readonly", [True, False], ids=["reader", "writer"])
+    def test_repeated_failed_connects_do_not_accumulate_descriptors(
+        self, tmp_path, gc_off, readonly
+    ):
+        from sqlalchemy.exc import DatabaseError
+
+        path = _corrupt_body_file(tmp_path / "c.db")
+        eng = make_engine(f"sqlite:///{path}", readonly=readonly)
+        raw = []
+
+        @event.listens_for(eng, "connect", insert=True)
+        def _capture(dbapi_connection, connection_record):  # noqa: ANN001
+            raw.append(dbapi_connection)
+
+        fds_before = _open_fd_count()
+        try:
+            for _ in range(5):
+                with pytest.raises(DatabaseError):
+                    eng.connect()
+            assert len(raw) == 5
+            assert _open_fd_count() == fds_before
+        finally:
+            for conn in raw:
+                conn.close()
+            eng.dispose()
+
+    @staticmethod
+    def _stub_engine(closes, fail, close_error=None):
+        """An engine over a stub DBAPI whose cursor raises `fail` on the
+        store's first pragma (SQLAlchemy's own dialect probes, which run on
+        the first connect ahead of it, must pass); `close()` appends to
+        `closes`, and raises `close_error`."""
+
+        class Cursor:
+            def execute(self, sql, *args):
+                if sql.startswith("PRAGMA busy_timeout"):
+                    raise fail
+
+            def fetchone(self):
+                return None
+
+            def fetchall(self):
+                return []
+
+            def close(self):
+                pass
+
+        class Dbapi:
+            def cursor(self):
+                return Cursor()
+
+            def close(self):
+                closes.append(True)
+                if close_error is not None:
+                    raise close_error
+
+            def __getattr__(self, name):
+                return lambda *a, **k: None
+
+        eng = create_engine("sqlite://", creator=lambda: Dbapi(), poolclass=StaticPool)
+        return eng
+
+    @pytest.mark.parametrize("readonly", [True, False], ids=["reader", "writer"])
+    def test_a_close_that_raises_does_not_mask_the_original_error(self, readonly):
+        from sqlalchemy.exc import DatabaseError
+
+        closes = []
+        eng = self._stub_engine(
+            closes, sqlite3.DatabaseError("the original failure"),
+            close_error=RuntimeError("close blew up"),
+        )
+        store_db._install_pragmas(eng, readonly=readonly, foreign_keys=True, memory=False)
+        try:
+            with pytest.raises(DatabaseError, match="the original failure") as excinfo:
+                eng.connect()
+        finally:
+            eng.dispose()
+        assert "close blew up" not in str(excinfo.value)
+        assert closes == [True]
+
+    def test_a_base_exception_closes_the_connection_and_propagates(self):
+        """Not just `Exception`: a ^C / SIGTERM landing inside the pragmas
+        must not leave the connection open either."""
+        closes = []
+        eng = self._stub_engine(closes, KeyboardInterrupt())
+        store_db._install_pragmas(eng, readonly=False, foreign_keys=True, memory=False)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                eng.connect()
+        finally:
+            eng.dispose()
+        assert closes == [True]
+
+    def test_a_base_exception_with_a_raising_close_still_propagates_the_original(self):
+        closes = []
+        eng = self._stub_engine(
+            closes, KeyboardInterrupt(), close_error=OSError("close blew up")
+        )
+        store_db._install_pragmas(eng, readonly=True, foreign_keys=True, memory=False)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                eng.connect()
+        finally:
+            eng.dispose()
+        assert closes == [True]
+
+    def test_a_connect_that_succeeds_is_not_closed(self, tmp_path):
+        path = tmp_path / "ok.db"
+        eng = make_engine(f"sqlite:///{path}")
+        raw = []
+
+        @event.listens_for(eng, "connect", insert=True)
+        def _capture(dbapi_connection, connection_record):  # noqa: ANN001
+            raw.append(dbapi_connection)
+
+        try:
+            with eng.connect() as conn:
+                assert conn.exec_driver_sql("SELECT 1").scalar() == 1
+                assert raw[0].execute("SELECT 1").fetchone() == (1,)
+        finally:
+            eng.dispose()
+
+
+class _ScriptedCursor:
+    """The minimal DBAPI cursor surface `may_switch_to_wal` uses: the first
+    `execute` lists tables, the second (the revision read) raises `error`."""
+
+    def __init__(self, tables, error=None, revisions=()):
+        self._tables = [(t,) for t in tables]
+        self._revisions = [(r,) for r in revisions]
+        self._error = error
+        self._rows = []
+
+    def execute(self, sql, *args):
+        if "sqlite_master" in sql:
+            self._rows = list(self._tables)
+        else:
+            if self._error is not None:
+                raise self._error
+            self._rows = list(self._revisions)
+
+    def fetchone(self):
+        return self._rows.pop(0) if self._rows else None
+
+
+@pytest.mark.unit
+class TestMaySwitchToWalErrorHandling:
+    """Item 10.6: only "no such table" / "no such column" `OperationalError`s mean
+    "not an Alembic version table". Anything else must propagate: answering
+    False for a locked or damaged file would silently leave a file of ours in
+    rollback-journal mode."""
+
+    @staticmethod
+    def _gate(cursor):
+        from zfsbackup.config.store.migrate import may_switch_to_wal
+
+        return may_switch_to_wal(cursor)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            sqlite3.OperationalError("database is locked"),
+            sqlite3.OperationalError("database table is locked"),
+            sqlite3.OperationalError("database disk image is malformed"),
+            sqlite3.DatabaseError("database disk image is malformed"),
+            sqlite3.OperationalError("disk I/O error"),
+            sqlite3.OperationalError("unable to open database file"),
+            RuntimeError("something else entirely"),
+        ],
+        ids=lambda e: f"{type(e).__name__}-{e}",
+    )
+    def test_anything_but_a_missing_table_or_column_propagates(self, error):
+        cursor = _ScriptedCursor(["alembic_version"], error=error)
+        with pytest.raises(type(error), match=str(error)):
+            self._gate(cursor)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            sqlite3.OperationalError("no such column: version_num"),
+            sqlite3.OperationalError("no such table: main.alembic_version"),
+            sqlite3.OperationalError("No Such Column: VERSION_NUM"),
+        ],
+    )
+    def test_a_missing_column_or_table_means_not_ours(self, error):
+        cursor = _ScriptedCursor(["alembic_version", "orders"], error=error)
+        assert self._gate(cursor) is False
+
+    def test_a_locked_table_listing_propagates_too(self):
+        class Locked:
+            def execute(self, sql, *args):
+                raise sqlite3.OperationalError("database is locked")
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            self._gate(Locked())
+
+    def test_a_really_locked_file_raises_rather_than_answering(self, tmp_path):
+        """No stubs: another connection holds the file's write lock, so a
+        rollback-journal reader cannot read and SQLite says so."""
+        path = _build_gate_file(
+            tmp_path / "f.db",
+            [_STAMP_TABLE, f"INSERT INTO alembic_version VALUES ('{_KNOWN}')"],
+        )
+        holder = sqlite3.connect(str(path), isolation_level=None)
+        reader = sqlite3.connect(str(path), timeout=0)
+        try:
+            holder.execute("BEGIN EXCLUSIVE")
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                self._gate(reader.cursor())
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+            reader.close()
+
+    def test_a_really_damaged_file_raises_rather_than_answering(self, tmp_path):
+        path = _corrupt_body_file(tmp_path / "c.db")
+        conn = sqlite3.connect(str(path))
+        try:
+            with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+                self._gate(conn.cursor())
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize(
+        "tables",
+        [["alembic_version"], ["alembic_version", "orders"], ["alembic_version", "datasets"]],
+        ids=["alone", "with-a-foreign-table", "with-one-of-ours"],
+    )
+    def test_an_empty_alembic_version_is_never_switched(self, tables):
+        assert self._gate(_ScriptedCursor(tables)) is False
+
+    def test_no_tables_at_all_is_switched(self):
+        assert self._gate(_ScriptedCursor([])) is True
+
+    def test_known_rows_are_switched_and_any_unknown_row_is_not(self):
+        assert self._gate(_ScriptedCursor(["alembic_version"], revisions=[_KNOWN])) is True
+        assert self._gate(
+            _ScriptedCursor(["alembic_version"], revisions=[_KNOWN, _UNKNOWN])
+        ) is False
+        assert self._gate(
+            _ScriptedCursor(["alembic_version"], revisions=[_UNKNOWN])
+        ) is False
+
+
 @pytest.mark.integration
 class TestDbChmodReadOnlyDatabase:
     """Item 6's permissions requirement: `readonly=True` is an accident
@@ -5556,14 +6366,16 @@ class TestDbChmodReadOnlyDatabase:
     `integration` rather than `unit`.
     """
 
-    def test_chmod_444_before_first_wal_open_fails_even_readonly(self, tmp_path):
-        """The realistic item-6 shape: a `config.db` provisioned with the
-        wrong permissions before it has EVER been opened in WAL mode (the
-        journal mode this module always tries to set). SQLite's
-        `PRAGMA journal_mode=WAL` has to actually rewrite the on-disk
-        journal-mode header the first time, which needs write access to
-        the main db file -- and fails loudly even though the caller only
-        asked to read.
+    def test_chmod_444_before_first_wal_open_reader_opens_and_leaves_file_alone(
+        self, tmp_path, caplog
+    ):
+        """Item 10.4 inverted this test. A `config.db` provisioned with the
+        wrong permissions before it was EVER opened in WAL mode used to fail
+        at a *reader's* connect, because every engine issued
+        `PRAGMA journal_mode=WAL`, which rewrites the header and so needs
+        write access. Readers no longer issue it (they query the mode and
+        warn), so the same file now opens read-only, is not modified, and the
+        non-WAL state is reported once.
         """
         db_path = tmp_path / "never_written.db"
         # A bare sqlite3 connection, bypassing db.py entirely, so the file
@@ -5574,47 +6386,64 @@ class TestDbChmodReadOnlyDatabase:
         conn.commit()
         assert conn.execute("PRAGMA journal_mode").fetchone() == ("delete",)
         conn.close()
+        before = db_path.read_bytes()
 
         os.chmod(db_path, 0o444)
         try:
-            url = f"sqlite:///{db_path}"
-            reader = make_engine(url, readonly=True)
+            reader = make_engine(f"sqlite:///{db_path}", readonly=True)
+            try:
+                with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+                    with reader.connect() as c:
+                        assert c.execute(text("SELECT count(*) FROM t")).scalar() == 0
+            finally:
+                reader.dispose()
+            assert db_path.read_bytes() == before
+            assert before[18:20] == b"\x01\x01"
+            assert sum("is not in WAL mode" in r.getMessage() for r in caplog.records) == 1
+        finally:
+            os.chmod(db_path, 0o644)  # so tmp_path cleanup can remove it
 
-            # SQLAlchemy's pool has no cleanup path for a raw DBAPI
-            # connection whose FIRST-EVER `connect` event listener raises:
-            # `_ConnectionRecord.__init__`'s own `__connect()` call (which
-            # is where a brand-new pool creates its first connection) is
-            # NOT wrapped by `_ConnectionRecord.checkout()`'s try/except --
-            # that only wraps an ALREADY-CONSTRUCTED record's
-            # `get_connection()`. Confirmed empirically: neither the
-            # pool's `invalidate` nor `close` events fire on this path, so
-            # `reader.dispose()` alone does not close the connection this
-            # test's `db.py` pragma listener opened just before raising --
-            # it leaks as a bare `ResourceWarning: unclosed database`,
-            # attributed by Python's GC to whatever test happens to be
-            # running when the cyclic collector eventually reclaims it
-            # (observed landing on an unrelated sibling test). Registered
-            # with `insert=True` so this listener runs BEFORE `db.py`'s
-            # own pragma listener and can capture the raw connection while
-            # it is still reachable, then close it explicitly below.
+    def test_chmod_444_before_first_wal_open_still_fails_for_a_writer(self, tmp_path):
+        """The writer half of the old claim is unchanged: a WRITER engine does
+        switch the file to WAL, which rewrites the header and so cannot work
+        on a `chmod 444` file that has never been WAL. (The file here records
+        a known revision, so it really is ours and the foreign-database guard
+        does not skip the switch; a bare empty `alembic_version` would be
+        skipped since 10.6.)
+        """
+        db_path = tmp_path / "ours_never_wal.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+        )
+        conn.execute(f"INSERT INTO alembic_version VALUES ('{EXPECTED_HEAD}')")
+        conn.commit()
+        conn.close()
+
+        os.chmod(db_path, 0o444)
+        try:
+            writer = make_engine(f"sqlite:///{db_path}")
             opened_connections = []
 
-            @event.listens_for(reader, "connect", insert=True)
+            # Capture the raw DBAPI connection ahead of db.py's listener
+            # (`insert=True`). Since 10.6 the listener closes it itself when
+            # it raises; the `finally` below keeps the test self-cleaning if
+            # that ever regresses (the dedicated assertion lives in
+            # TestFailedConnectClosesTheRawConnection).
+            @event.listens_for(writer, "connect", insert=True)
             def _capture_raw_connection(dbapi_connection, connection_record):  # noqa: ANN001
                 opened_connections.append(dbapi_connection)
 
             try:
-                with pytest.raises(
-                    OperationalError, match="readonly database"
-                ):
-                    with reader.connect():
+                with pytest.raises(OperationalError, match="readonly database"):
+                    with writer.connect():
                         pass
             finally:
-                reader.dispose()
+                writer.dispose()
                 for raw_conn in opened_connections:
                     raw_conn.close()
         finally:
-            os.chmod(db_path, 0o644)  # so tmp_path cleanup can remove it
+            os.chmod(db_path, 0o644)
 
     def test_chmod_444_after_wal_already_set_opens_fine_readonly(self, tmp_path):
         """The documented exception to the rule above, pinned so nobody
@@ -6587,7 +7416,11 @@ class TestPathsCheckConfigDbFileNotWritable:
 
             message = str(excinfo.value)
             assert str(db_path) in message
-            assert "journal_mode=WAL" in message
+            # Item 10.4: still refused, but the text no longer claims every
+            # engine issues `journal_mode=WAL`; it names the writer engine.
+            assert "not yet in WAL journal mode" in message
+            assert "writer engine" in message
+            assert "read-only engine does not switch it" in message
             assert f"{CONFIG_DB_MODE:04o}" in message
         finally:
             os.chmod(db_path, 0o644)

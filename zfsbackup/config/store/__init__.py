@@ -174,6 +174,8 @@ from zfsbackup.config.store.mapper import load_config, save_config, validate_con
 from zfsbackup.config.store.migrate import (
     EXPECTED_HEAD,
     KNOWN_REVISIONS,
+    MigrationPackagingError,
+    NotAConfigDatabase,
     SchemaError,
     SchemaIntegrityError,
     SchemaOutOfDate,
@@ -245,7 +247,9 @@ __all__ = [
     "GlobalSettings",
     "ImportResult",
     "KNOWN_REVISIONS",
+    "MigrationPackagingError",
     "NAMING_CONVENTION",
+    "NotAConfigDatabase",
     "OutgoingConfigUnreadable",
     "ReadOnlySessionError",
     "RemoteServer",

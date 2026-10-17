@@ -43,9 +43,12 @@ The five constraints every function here obeys
    value is forwarded to `diagnose_open_failure`, so a post-hoc diagnosis
    re-runs exactly the check the open itself performed.
 5. **Never catch bare `RuntimeError`.** `SchemaError` is a `RuntimeError`
-   subclass, but `check_schema` also raises a *bare* `RuntimeError` for a
-   multi-head migration history -- a packaging defect in the installed
-   zfsbackup, deliberately left outside the `SchemaError` hierarchy. An
+   subclass, but the store also has a *bare* `RuntimeError` family outside
+   it -- `MigrationPackagingError`, raised on the upgrade paths when the
+   shipped migration scripts do not match the pinned head. That is a
+   packaging defect in the installed zfsbackup, deliberately left outside
+   the `SchemaError` hierarchy. (`check_schema` does not raise it: it
+   decides from pinned constants and never loads the scripts.) An
    `except RuntimeError` here would absorb a real bug into the
    "log an operator message and exit cleanly" path.
 6. **One scoped read snapshot per load.** `load_config` is many statements,
@@ -70,6 +73,7 @@ from zfsbackup.config.store import (
     ConfigPathError,
     ResolvedConfigPath,
     SchemaError,
+    SchemaOutOfDate,
     check_schema,
     diagnose_open_failure,
     load_config,
@@ -96,6 +100,11 @@ __all__ = [
     "describe_config_source",
     "load_runtime_config",
 ]
+
+_SCHEMA_OUT_OF_DATE_DAEMON_NOTE = (
+    "The daemon only checks the schema and never migrates it; run the "
+    "command above, then start the daemon again."
+)
 
 _SOURCE_DESCRIPTIONS = {
     "--config": "via -c/--config",
@@ -243,7 +252,11 @@ def config_error_message(
     `ConfigPathError` and `SchemaError` messages are already operator-grade
     -- they name the file, the three candidate sources, and in
     `ConfigDbIsYaml`'s case a copy-pasteable `zfsbackup-config import
-    <path>` command. They are returned **verbatim**. Prefixing them with
+    <path>` command. They are returned **verbatim** (every `SchemaError`
+    subclass, `NotAConfigDatabase` included), with one exception:
+    `SchemaOutOfDate` gets the daemon's own "never migrates; run the
+    command above, then start the daemon again" sentence appended after
+    the store's text. Prefixing them with
     something like "Failed to load configuration: " would wrap a multi-line
     message that ends in a command the operator is meant to paste, which is
     exactly how that command stops being pasteable.
@@ -265,6 +278,11 @@ def config_error_message(
     `ResolvedConfigPath` exists -- and that is exactly the branch that
     needs none of it.
     """
+    if isinstance(exc, SchemaOutOfDate):
+        # The store's text is neutral (it is shared with the CLI and ends at
+        # the command to run); this sentence is the daemon's own. Appended,
+        # never prefixed, so the pasteable command stays where it was.
+        return f"{exc}\n{_SCHEMA_OUT_OF_DATE_DAEMON_NOTE}"
     if isinstance(exc, (ConfigPathError, SchemaError)):
         return str(exc)
 

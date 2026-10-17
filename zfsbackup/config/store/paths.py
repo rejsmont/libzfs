@@ -192,9 +192,11 @@ daemon.
 
 "The daemon only reads" describes config *content*, not the *file*: the
 daemon's read-only engine still opens the database file read-write at the
-OS level (it issues `PRAGMA journal_mode=WAL` on every connection, which
-must be able to rewrite the header the first time) and needs a writable
-containing directory for the `-shm` reason above.
+OS level and needs a writable containing directory for the `-shm` reason
+above. (Until item 10.4 it also issued `PRAGMA journal_mode=WAL` on every
+connection; it now only queries the mode and warns if it is not WAL -- see
+`db.py` -- so the writable-file requirement below is a provisioning check
+for the CLI's first write, not a requirement of the reader's connect.)
 """
 
 from __future__ import annotations
@@ -291,9 +293,9 @@ CONFIG_DIR_MODE = 0o2770
 
 #: Group-write for the CLI (the only writer of config *content*);
 #: owner-write for the daemon even though it writes no config content --
-#: its read-only engine still opens the file read-write at the OS level
-#: and needs write access to flip a not-yet-WAL file into WAL mode on its
-#: very first connection.
+#: its read-only engine still opens the file read-write at the OS level.
+#: (It no longer flips a not-yet-WAL file into WAL itself -- item 10.4 -- but
+#: the preflight still wants the file writable; see `check_config_db` step 6.)
 CONFIG_DB_MODE = 0o660
 
 #: The service user and group the config store is meant to belong to.
@@ -860,11 +862,12 @@ def _file_not_writable_message(resolved: ResolvedConfigPath, real: Path) -> str:
     shown = _describe_real(resolved.path, real)
     return (
         f"{shown} is not writable by this process, and is not yet in "
-        "WAL journal mode. Every engine this store builds -- including "
-        "read-only ones -- issues `PRAGMA journal_mode=WAL` on its "
-        "first connection (zfsbackup.config.store.db), which must "
-        "rewrite the file's journal-mode header the first time, and "
-        f"that needs write access. Target: {real} should be "
+        "WAL journal mode. The store's writer engine switches the file to "
+        "WAL on its first connection (zfsbackup.config.store.db), which "
+        "rewrites the file's journal-mode header and needs write access; a "
+        "read-only engine does not switch it (it only warns), but a "
+        "non-WAL database would make readers and the CLI writer block each "
+        f"other. Target: {real} should be "
         f"{CONFIG_DB_MODE:04o} owned by {CONFIG_OWNER}."
     )
 
@@ -1352,9 +1355,13 @@ def check_config_db(
        file's own mode: this is what `-wal`/`-shm` (re)creation needs.
     6. **File not writable.** In order:
        - Not yet in WAL mode (header bytes 18/19 != 2) -> hard fail.
-         Every engine this store builds re-issues `journal_mode=WAL` on
-         connect, which must rewrite the header and cannot without write
-         access (measurement A).
+         The store's WRITER engine issues `journal_mode=WAL` on connect,
+         which must rewrite the header and cannot without write access
+         (measurement A). Read-only engines no longer switch the mode
+         (item 10.4), so this refusal is now a provisioning check rather
+         than a prediction that a reader's connect would fail: a non-WAL
+         file the daemon cannot write is refused early because the CLI
+         writer and the daemon's readers would block each other on it.
        - Already WAL, but its `-wal`/`-shm` sidecars do not **both**
          already exist (checked with `os.lstat`, not `Path.exists()` --
          see below) -> hard fail. Opening now would let SQLite create

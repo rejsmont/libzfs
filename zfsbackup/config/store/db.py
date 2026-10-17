@@ -77,8 +77,15 @@ one engine:
     connect events: 1
 
 - `journal_mode=WAL` is **persistent DB-file state**, not per-connection, so
-  re-issuing it is a cheap no-op. Skipped for in-memory URLs, where it
-  returns `('memory',)` -- harmless, but pointless.
+  re-issuing it is a cheap no-op. Only WRITER engines issue it, and only
+  against a file that is brand new or recognisably ours --
+  `migrate.may_switch_to_wal`: no tables, or an `alembic_version` whose rows
+  are all in `KNOWN_REVISIONS` (a database that is not ours must not be
+  modified before a schema check can refuse it; item 10.5).
+  Reader engines only *query* `PRAGMA journal_mode` and log a WARNING, once
+  per engine, if it is not `wal` -- a reader that switched the mode rewrote
+  the header of whatever file it was pointed at (item 10.4). Both are
+  skipped for in-memory URLs, where the mode is `('memory',)`.
 - `synchronous`, `busy_timeout`, `foreign_keys` and `query_only` are
   **per-connection** and must be issued on every new connection, which is
   exactly what the `connect` event does.
@@ -150,27 +157,23 @@ Read-only is an accident guard, not a privilege boundary
 See `session_scope`/`session_for_engine`. `PRAGMA query_only=ON` is
 reversible by the very connection that set it (measured: yes), so it stops
 mistakes, not malice. It also governs changes to database *content* only: a
-"read-only" engine still opens the file read-write and will still flip a
-`delete`-journal database into WAL on connect (measured). Read-only here
-means "this session will not change your config", not "this process will not
-touch the file" -- which is why the DB file and its directory must be
-writable by the daemon user even though only the CLI writes config. Measured
-consequence for item 6: a `chmod 444 config.db` that has never yet been
-opened in WAL mode cannot be opened even by a `readonly=True` engine -- the
-`journal_mode=WAL` pragma this module issues on every connection (`_install_
-pragmas`) has to actually CHANGE the on-disk journal mode header, which
-needs write access, and raises `OperationalError: attempt to write a
-readonly database` at connect. This is the realistic item-6 shape: a
-`config.db` packaged or provisioned with the wrong permissions before the
-daemon's first (necessarily read-only, per this module's "CLI is the only
-writer" design) open of it. The precondition matters: if the file was
-already in WAL mode before the `chmod` (e.g. the CLI had already written to
-it at least once), re-issuing `journal_mode=WAL` when it is already `wal` is
-a no-op SQLite can satisfy without writing anything, so that specific
-already-migrated file opens read-only fine even at `chmod 444` -- do not
-generalise this into "a chmod 444 config.db always fails to open"; it is
-the "never yet opened for write" file that fails, and that is exactly the
-case item 6's provisioning has to get right.
+"read-only" engine still opens the file read-write. Since item 10.4 it no
+longer switches the journal mode, though: it only QUERIES `PRAGMA
+journal_mode` and warns (once per engine) if the file is not in WAL, because
+a reader that issued `journal_mode=WAL` rewrote the header of any
+rollback-journal database it was pointed at -- including one that is not a
+zfsbackup database (measured with `-c other.db export`). The first WRITE by
+`zfsbackup-config` switches the file to WAL.
+
+History, kept because `paths.check_config_db` still encodes the conservative
+half of it: before 10.4 a `chmod 444 config.db` that had never been opened in
+WAL mode could not be opened even by a `readonly=True` engine (the pragma had
+to CHANGE the header, which needs write access, and raised `OperationalError:
+attempt to write a readonly database` at connect). That failure is gone for
+readers, but the preflight still refuses a non-writable, not-yet-WAL file for
+the daemon: such a file is a provisioning mistake (the daemon would run on a
+rollback-journal database, where it and the CLI writer block each other),
+and refusing early is cheaper than diagnosing it later.
 
 Note for item 8's `ensure_schema` wrapper
 -----------------------------------------
@@ -323,6 +326,45 @@ def url_for_path(path: Union[str, Path]) -> str:
     return url
 
 
+def _switch_to_wal(cursor, engine: Engine) -> None:  # noqa: ANN001
+    """Writer engines only: `PRAGMA journal_mode=WAL`, and complain loudly if
+    SQLite leaves the mode unchanged."""
+    # Persistent DB-file state, so this is a no-op after the first time.
+    # `journal_mode` RETURNS A ROW; leaving it unfetched leaves the cursor in
+    # an odd state, so fetch it.
+    cursor.execute("PRAGMA journal_mode=WAL")
+    row = cursor.fetchone()
+    # ...and CHECK it. For SOME ways WAL can fail to engage, SQLite does not
+    # raise -- it returns the UNCHANGED mode (measured: a filesystem without
+    # the shared-memory primitives WAL needs, e.g. some network mounts). This
+    # branch exists for those.
+    #
+    # It is NOT reached for a never-yet-WAL, permission-denied file. An
+    # earlier version of this comment claimed otherwise; corrected during
+    # item 6a's review, measured: `PRAGMA journal_mode=WAL` against such a
+    # file raises `OperationalError: attempt to write a readonly database` at
+    # the `execute()` above, before this `fetchone()` is ever reached. That
+    # case is instead refused before any engine is even built, by
+    # `config/store/paths.py`'s `check_config_db` (item 6a) -- see that module
+    # for the exact rule.
+    #
+    # Every claim this module rests on -- readers never block, the single
+    # writer serialises on the write lock, the busy_timeout story -- silently
+    # evaporates in the case this branch DOES catch, so say so loudly rather
+    # than degrading in silence.
+    if row is None or str(row[0]).lower() != "wal":
+        logger.warning(
+            "SQLite refused WAL journal mode for %s (still %r). "
+            "Readers will now block writers and vice versa, and "
+            "the store's concurrency guarantees do not hold. "
+            "This usually means the database file is read-only "
+            "or lives on a filesystem without WAL support "
+            "(some network mounts).",
+            engine.url.render_as_string(hide_password=True),
+            None if row is None else row[0],
+        )
+
+
 def _install_pragmas(
     engine: Engine, *, readonly: bool, foreign_keys: bool, memory: bool
 ) -> None:
@@ -336,8 +378,30 @@ def _install_pragmas(
     after a dispose** -- that would double-fire every pragma below.
     """
 
+    # Reader engines warn about a non-WAL database once per engine, not once
+    # per pooled connection. A list, so the closure can mutate it.
+    warned_not_wal: list = []
+
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragmas(dbapi_connection, connection_record):  # noqa: ANN001
+        # SQLAlchemy 2.0's `_ConnectionRecord.__connect` never closes the
+        # DBAPI connection when a `connect` listener raises (measured on
+        # 2.0.51, pool/base.py): the connection is left open inside a
+        # reference cycle that neither the pool nor `dispose_all()` can see,
+        # one leaked fd per failed connect until the cyclic GC happens to run.
+        # A valid-header/corrupt-body file makes the pragmas below raise
+        # ("database disk image is malformed"), so close it ourselves. This
+        # matters most for a process that loads config and then forks.
+        try:
+            _apply_sqlite_pragmas(dbapi_connection)
+        except BaseException:
+            try:
+                dbapi_connection.close()
+            except Exception:
+                pass
+            raise
+
+    def _apply_sqlite_pragmas(dbapi_connection):  # noqa: ANN001
         cursor = dbapi_connection.cursor()
         try:
             # FIRST, before any statement that can contend for a lock.
@@ -353,45 +417,57 @@ def _install_pragmas(
             # would run with a zero busy timeout and fail instantly with
             # `database is locked` instead of waiting.
             cursor.execute("PRAGMA busy_timeout=5000")
-            if not memory:
-                # Persistent DB-file state, so this is a no-op after the
-                # first time. `journal_mode` RETURNS A ROW; leaving it
-                # unfetched leaves the cursor in an odd state, so fetch it.
-                cursor.execute("PRAGMA journal_mode=WAL")
+            if not memory and readonly:
+                # Readers OBSERVE the journal mode; they never set it. A
+                # read-only engine that issued `journal_mode=WAL` rewrote the
+                # file header (bytes 18-19) of any rollback-journal database
+                # it was pointed at -- including one that is not a zfsbackup
+                # config database at all (`zfsbackup-config -c other.db
+                # export` converted it; measured). "Read-only" has to mean
+                # the file is not modified, so a non-WAL file is only
+                # reported. A writer engine (below) switches it on the next
+                # write -- but only if it is recognisably ours, so the
+                # warning must not promise a switch (a foreign file never
+                # gets one).
+                cursor.execute("PRAGMA journal_mode")
                 row = cursor.fetchone()
-                # ...and CHECK it. For SOME ways WAL can fail to engage,
-                # SQLite does not raise -- it returns the UNCHANGED mode
-                # (measured: a filesystem without the shared-memory
-                # primitives WAL needs, e.g. some network mounts). This
-                # branch exists for those.
-                #
-                # It is NOT reached for a never-yet-WAL, permission-denied
-                # file. An earlier version of this comment claimed
-                # otherwise; corrected during item 6a's review, measured:
-                # `PRAGMA journal_mode=WAL` against such a file raises
-                # `OperationalError: attempt to write a readonly database`
-                # at the `execute()` two lines up, before this `fetchone()`
-                # is ever reached. That case is instead refused before any
-                # engine is even built, by `config/store/paths.py`'s
-                # `check_config_db` (item 6a) -- see that module for the
-                # exact rule (an already-WAL file can open read-only fine;
-                # one that has never yet been switched cannot).
-                #
-                # Every claim this module rests on -- readers never block,
-                # the single writer serialises on the write lock, the
-                # busy_timeout story -- silently evaporates in the case
-                # this branch DOES catch, so say so loudly rather than
-                # degrading in silence.
-                if row is None or str(row[0]).lower() != "wal":
+                mode = None if row is None else str(row[0]).lower()
+                if mode != "wal" and not warned_not_wal:
+                    warned_not_wal.append(True)  # once per engine, not per connection
                     logger.warning(
-                        "SQLite refused WAL journal mode for %s (still %r). "
-                        "Readers will now block writers and vice versa, and "
-                        "the store's concurrency guarantees do not hold. "
-                        "This usually means the database file is read-only "
-                        "or lives on a filesystem without WAL support "
-                        "(some network mounts).",
+                        "%s is not in WAL mode (journal_mode=%s); readers and "
+                        "writers will block each other. (A zfsbackup-config "
+                        "write switches a zfsbackup config database to WAL.)",
+                        engine.url.database or engine.url.render_as_string(hide_password=True),
+                        "unknown" if mode is None else mode,
+                    )
+            elif not memory:
+                # Never switch a database that is not ours. `migrate`/`import`
+                # pointed at a foreign SQLite file must leave it
+                # byte-for-byte alone until they have decided to refuse it,
+                # and `journal_mode=WAL` rewrites the header (bytes 18-19) --
+                # before any schema check can run. "Ours" is decided by
+                # `migrate.may_switch_to_wal`: a file with no tables, or one
+                # whose `alembic_version` rows are all in `KNOWN_REVISIONS`
+                # -- the rule `check_schema` uses. A stamp-only file (an
+                # EMPTY `alembic_version`) is not switched either (item
+                # 10.6): `migrate` refuses it and promises to leave it
+                # unchanged; `import` migrates it and the next engine
+                # switches it. Merely HAVING an `alembic_version` is not enough (item
+                # 10.5, M-1R): a foreign Alembic-managed database has one, so
+                # does a foreign file with an empty one, and both were
+                # switched and then refused with a false "nothing was
+                # changed". Imported lazily: `migrate` imports `paths`, which
+                # imports this module.
+                from zfsbackup.config.store.migrate import may_switch_to_wal
+
+                if may_switch_to_wal(cursor):
+                    _switch_to_wal(cursor, engine)
+                else:
+                    logger.debug(
+                        "not switching %s to WAL: it is not a recognisable "
+                        "zfsbackup config database",
                         engine.url.render_as_string(hide_password=True),
-                        None if row is None else row[0],
                     )
             # D2: FULL for the writer, NORMAL for readers. Under NORMAL a
             # power loss can silently discard a commit the CLI already
@@ -414,8 +490,9 @@ def _install_pragmas(
                 # pragmas above. Measured on SQLite 3.53.4:
                 # `journal_mode=WAL` still succeeds with `query_only=ON`
                 # (it governs changes to database *content*, not to
-                # file-format state), so the ordering is hygiene rather
-                # than a requirement -- but do not reorder on that basis.
+                # file-format state) -- which is why readers must not be
+                # trusted to leave the mode alone and simply never issue
+                # it; the ordering here is hygiene.
                 # Also measured: `query_only` is reversible by the very
                 # connection that set it. This is an accident guard, not a
                 # privilege boundary.

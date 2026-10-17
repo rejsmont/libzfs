@@ -46,7 +46,11 @@ import zfsbackup.daemon as daemon_module
 from zfsbackup.config.store import (
     ConfigDbPermissionError,
     ConfigPathError,
+    NotAConfigDatabase,
+    SchemaIntegrityError,
     SchemaOutOfDate,
+    SchemaSplitBrain,
+    SchemaVersionMismatch,
     resolve_config_path,
 )
 from zfsbackup.daemon import (
@@ -501,8 +505,28 @@ class TestConfigErrorMessage:
     def test_config_path_and_schema_errors_are_returned_verbatim(self, resolved):
         text = "multi\nline\n  zfsbackup-config import /x.yaml"
         assert config_error_message(resolved, ConfigDbPermissionError(text)) == text
-        assert config_error_message(resolved, SchemaOutOfDate(text)) == text
         assert config_error_message(None, ConfigPathError(text)) == text
+        # Every other SchemaError stays verbatim too (item 10.4 adds
+        # NotAConfigDatabase to the family).
+        for cls in (
+            SchemaSplitBrain,
+            SchemaVersionMismatch,
+            NotAConfigDatabase,
+            SchemaIntegrityError,
+        ):
+            assert config_error_message(resolved, cls(text)) == text, cls
+
+    def test_schema_out_of_date_gets_the_daemons_own_sentence_appended(self, resolved):
+        """The store's SchemaOutOfDate text is neutral (the CLI shows it as
+        is); the daemon appends what is true of the daemon only."""
+        text = "/x/config.db is at schema revision a; this package expects b. Run `zfsbackup-config migrate`."
+        message = config_error_message(resolved, SchemaOutOfDate(text))
+        assert message == (
+            text + "\nThe daemon only checks the schema and never migrates it; "
+            "run the command above, then start the daemon again."
+        )
+        # Appended, never prefixed: the pasteable command keeps its place.
+        assert message.startswith(text)
 
     def test_other_exceptions_get_the_generic_prefix(self, resolved):
         message = config_error_message(resolved, KeyError("boom"))
@@ -592,7 +616,24 @@ class TestMainFailureReporting:
                 assert main() == 1
         (record,) = self._failure_records(caplog)
         assert not record.exc_info
-        assert record.getMessage() == "stale schema"
+        assert record.getMessage() == (
+            "stale schema\nThe daemon only checks the schema and never "
+            "migrates it; run the command above, then start the daemon again."
+        )
+
+    def test_other_schema_errors_are_logged_verbatim_without_traceback(
+        self, tmp_path, mocker, caplog
+    ):
+        mocker.patch(
+            "zfsbackup.daemon.load_runtime_config",
+            side_effect=NotAConfigDatabase("not a zfsbackup config database"),
+        )
+        with patch("sys.argv", ["daemon", "-c", str(tmp_path / "c.db")]):
+            with caplog.at_level(logging.ERROR):
+                assert main() == 1
+        (record,) = self._failure_records(caplog)
+        assert not record.exc_info
+        assert record.getMessage() == "not a zfsbackup config database"
 
 
 class TestMissingDatabase:

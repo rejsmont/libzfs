@@ -25,12 +25,21 @@ all, so the daemon's startup check does no filesystem walk of the migrations
 package and cannot be broken by a packaging problem in it. The price is that
 the constants must track the scripts; the *upgrade* path pays for that by
 asserting, before it touches the database, that the scripts' head equals
-`EXPECTED_HEAD` and that their revision set equals `KNOWN_REVISIONS` (a bare
-`RuntimeError`, deliberately not a `SchemaError`: a packaging defect, not an
-operator-fixable database state). **Adding a migration therefore means
-editing three things together: the new revision file, `EXPECTED_HEAD`, and
-`KNOWN_REVISIONS`.** Forgetting any of them fails loudly at `migrate` /
-`import` time and in the test suite, never silently at daemon start.
+`EXPECTED_HEAD` and that their revision set equals `KNOWN_REVISIONS` (a
+`MigrationPackagingError`, deliberately not a `SchemaError`: a packaging
+defect, not an operator-fixable database state). **Adding a migration
+therefore means editing three things together: the new revision file,
+`EXPECTED_HEAD`, and `KNOWN_REVISIONS`** (see `migrations/README`).
+Forgetting any of them fails loudly at `migrate` / `import` time and in the
+test suite (`TestExpectedHeadConstants`), never silently at daemon start.
+
+**Never modify a database that is not ours (item 10.4).** A file with no
+recorded revision but with tables in it is not something this package may
+migrate: `check_schema`/`upgrade_schema` raise `NotAConfigDatabase` (or
+`SchemaSplitBrain` when every table is one of ours) and write nothing.
+`migrate` only upgrades a *recorded, known* older revision; creating a
+database is `zfsbackup-config import`'s job alone. The writer engine
+cooperates by not switching such a file to WAL on connect (`db.py`).
 
 **`check_schema(connection)` (item 6a) is that check.** It is the
 never-writes half of what used to be `ensure_schema`'s single monolithic
@@ -104,6 +113,7 @@ at the call site can.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
@@ -132,22 +142,116 @@ EXPECTED_HEAD = "a1c28e1b3f34"
 KNOWN_REVISIONS = frozenset({"a1c28e1b3f34"})
 
 
-class SchemaError(RuntimeError):
-    """Base for the three schema-state refusals `check_schema`/
-    `ensure_schema` can raise: `SchemaSplitBrain`, `SchemaVersionMismatch`,
-    `SchemaOutOfDate`.
+def _unknown_revisions(revisions) -> list:
+    """The members of `revisions` this package does not recognise, sorted.
 
-    Deliberately **not** the base of the bare `RuntimeError` `check_schema`
-    raises when its own installed migration scripts have more than one
-    head (see that function) -- that is a packaging defect in this
-    installed zfsbackup package, not an operator-fixable database state,
-    and the two must not share a catchable base. Item 8's daemon half is
-    expected to catch `SchemaError` specifically, mirroring `ConfigPathError`
-    in `paths.py`: an `except RuntimeError` there would also silently
-    absorb the multi-head packaging bug into the same "clean refusal,
-    log and exit" handling meant for a stale-but-fixable schema, instead
-    of letting it crash loudly as a bug report.
+    The ONE place "is this recorded revision one of ours" is decided. Both
+    `check_schema` (to refuse a newer/foreign history) and
+    `may_switch_to_wal` (to decide whether the writer engine may rewrite the
+    file header) call it, so the two cannot disagree about which databases
+    are ours (item 10.5, M-1R). Reads `KNOWN_REVISIONS` at call time.
     """
+    return sorted(r for r in revisions if r not in KNOWN_REVISIONS)
+
+
+def may_switch_to_wal(cursor) -> bool:  # noqa: ANN001
+    """Writer-engine connect hook: may this file be switched to WAL, i.e. is
+    it either brand new or already recognisably ours? Called by `db.py` on a
+    raw DBAPI `cursor`, before any schema check can run; only ever SELECTs.
+
+    `PRAGMA journal_mode=WAL` rewrites the file header (bytes 18-19), so it
+    must not be issued against a database `check_schema` is about to refuse
+    -- `migrate`/`import` pointed at a foreign file promise "nothing was
+    changed". The bug this prevents (item 10.5, M-1R): the old rule was "an
+    `alembic_version` table exists", but a foreign Alembic-managed database
+    has one too (holding the other application's revision), as does a
+    foreign file with an EMPTY one; both were switched, then refused.
+
+    True when:
+
+    - the file holds no tables at all (a brand-new/zero-byte file; `import`
+      creates the schema in it, so it must be WAL before any reader
+      attaches); or
+    - `alembic_version` holds at least one row and EVERY row is in
+      `KNOWN_REVISIONS` (the test `check_schema` applies).
+
+    False for everything else: foreign tables with a missing, empty or
+    unrecognised `alembic_version`, an `alembic_version` that is not an
+    Alembic version table -- and an EMPTY `alembic_version`, whatever else
+    the file holds (item 10.6). A stamp-only file is refused by `migrate`
+    (`SchemaOutOfDate`: no recorded revision, nothing to migrate), which
+    promises it left the file unchanged; switching it here would rewrite the
+    header first. `import` still works on one: its migration runs on the
+    unswitched file, and the next engine, now seeing a known revision,
+    switches it.
+
+    Only "no such table"/"no such column" `OperationalError`s are read as
+    "not an Alembic version table". Anything else ("database is locked",
+    "database disk image is malformed", ...) propagates: guessing False
+    there would silently leave a file of ours in rollback-journal mode.
+    """
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+    )
+    # `fetchone` loops rather than `fetchall`: only the minimal DBAPI cursor
+    # surface is assumed (the connect-hook tests stub exactly that).
+    tables = set()
+    while (row := cursor.fetchone()) is not None:
+        tables.add(row[0])
+    if not tables:
+        return True
+    if "alembic_version" not in tables:
+        return False
+    revisions: list = []
+    try:
+        cursor.execute("SELECT version_num FROM alembic_version")
+        while (row := cursor.fetchone()) is not None:
+            revisions.append(row[0])
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if "no such column" in message or "no such table" in message:
+            return False  # an `alembic_version` that is not Alembic's
+        raise
+    if not revisions:
+        return False
+    return not _unknown_revisions(revisions)
+
+
+class SchemaError(RuntimeError):
+    """Base for the schema-state refusals `check_schema`/`ensure_schema`/
+    `upgrade_schema` can raise: `SchemaSplitBrain`, `SchemaVersionMismatch`,
+    `SchemaOutOfDate`, `NotAConfigDatabase`, `SchemaIntegrityError`.
+
+    Deliberately **not** the base of `MigrationPackagingError`, which
+    `_assert_scripts_match_constants` raises when the installed migration
+    scripts disagree with `EXPECTED_HEAD`/`KNOWN_REVISIONS` or have more than
+    one head -- that is a packaging defect in this installed zfsbackup
+    package, not an operator-fixable database state, and the two must not
+    share a catchable base. The daemon catches `SchemaError` specifically,
+    mirroring `ConfigPathError` in `paths.py`: an `except RuntimeError` there
+    would also silently absorb the packaging bug into the same "clean
+    refusal, log and exit" handling meant for a stale-but-fixable schema,
+    instead of letting it crash loudly as a bug report.
+    """
+
+
+class MigrationPackagingError(RuntimeError):
+    """The installed migration scripts disagree with `EXPECTED_HEAD` /
+    `KNOWN_REVISIONS` (head, revision set, or more than one head). A defect in
+    the installed zfsbackup package -- nothing an operator can fix by
+    changing the database. Deliberately a `RuntimeError` but **not** a
+    `SchemaError`; see `SchemaError`."""
+
+
+class NotAConfigDatabase(SchemaError):
+    """The file is an SQLite database that holds tables but records no
+    zfsbackup schema revision, and not only zfsbackup's own tables: it belongs
+    to something else (or was never initialised by zfsbackup). Raised by
+    `check_schema` and `upgrade_schema` (hence `import` over an existing file)
+    *before* anything is written. Grafting zfsbackup's schema into someone
+    else's database -- and, for `migrate`, stamping it -- is the bug this
+    exists to prevent (item 10.4; reproduced with a foreign `orders` table)."""
 
 
 class SchemaOutOfDate(SchemaError):
@@ -191,6 +295,11 @@ class SchemaVersionMismatch(SchemaError):
     current either. Both would corrupt or misinterpret the schema. The fix
     is always on the operator's side: install a zfsbackup version whose
     migrations include the DB's revision.
+
+    The same state is what a foreign Alembic-managed database looks like
+    (another application's `alembic_version`), so the message says both
+    "newer zfsbackup package" and "not a zfsbackup config database"
+    (item 10.5).
     """
 
 
@@ -254,8 +363,8 @@ class SchemaIntegrityError(SchemaError):
 @dataclass(frozen=True)
 class SchemaUpgrade:
     """What `upgrade_schema` did. `from_revs` is the sorted tuple of
-    revision ids the database recorded before (empty for a database with no
-    recorded revision); `to_rev` is the head it is at now; `changed` is False
+    revision ids the database recorded before (never empty: a database with
+    no recorded revision is refused, not migrated); `to_rev` is the head it is at now; `changed` is False
     iff the database was already at head and nothing was written."""
 
     from_revs: Tuple[str, ...]
@@ -263,16 +372,59 @@ class SchemaUpgrade:
     changed: bool
 
 
-def _has_existing_schema(connection: Connection) -> bool:
-    """True if any table `Base.metadata` defines already exists on
-    `connection`. Used only to detect the split-brain state described by
-    `SchemaSplitBrain` -- a normal brand-new database has no current
-    Alembic heads *and* none of these tables, which is the expected state
-    `ensure_schema` performs the initial migration against.
+def _db_label(connection: Connection) -> str:
+    """The database path for messages (`:memory:` for an in-memory one)."""
+    return connection.engine.url.database or ":memory:"
+
+
+def _unrecorded_tables(connection: Connection) -> list:
+    """Sorted names of the tables on `connection`, ignoring SQLite's internal
+    `sqlite_*` tables (SQLAlchemy already omits them) and `alembic_version`
+    (the stamp table, not application data: an empty one alone is just an
+    unfinished initial migration). Only meaningful when no revision is
+    recorded -- see `_refuse_unrecorded_tables`.
     """
-    existing = set(inspect(connection).get_table_names())
-    expected = set(Base.metadata.tables.keys())
-    return bool(existing & expected)
+    return sorted(
+        t for t in inspect(connection).get_table_names() if t != "alembic_version"
+    )
+
+
+def _refuse_unrecorded_tables(connection: Connection) -> None:
+    """With NO recorded revision, a database that already holds tables is not
+    ours to migrate: raise instead of grafting the schema in (item 10.4).
+
+    - The tables are EXACTLY `Base.metadata`'s -> `SchemaSplitBrain` (our
+      tables, the stamp lost; the message says how to recover). Exactly, not
+      "a subset" (item 10.5): a foreign file whose only table is called
+      `datasets` must not be told to `alembic stamp head` a schema it does
+      not have.
+    - Anything else -- a strict subset of ours, alone or alongside foreign
+      tables -> `NotAConfigDatabase`.
+    - No tables (empty or brand-new file) -> return; that is the legitimate
+      state a first `import` migrates.
+    """
+    tables = _unrecorded_tables(connection)
+    if not tables:
+        return
+    if set(tables) == set(Base.metadata.tables.keys()):
+        raise SchemaSplitBrain(
+            f"{_db_label(connection)} has no recorded Alembic revision "
+            f"(alembic_version missing or empty) but all of this "
+            f"package's tables already exist. Refusing to attempt the "
+            f"initial migration, which would fail with 'table already "
+            f"exists'. If the existing tables are already at revision "
+            f"{EXPECTED_HEAD!r}, fix this by stamping them (`alembic stamp "
+            f"head`); otherwise restore the database from a backup or start "
+            f"over with a fresh file. Nothing was changed."
+        )
+    shown = ", ".join(tables[:6])
+    more = f" and {len(tables) - 6} more" if len(tables) > 6 else ""
+    raise NotAConfigDatabase(
+        f"{_db_label(connection)} is an SQLite database but not a zfsbackup "
+        f"config database (tables: {shown}{more}); nothing was changed. "
+        f"Point -c at the config database, or create one with "
+        f"`zfsbackup-config import`."
+    )
 
 
 def _build_config(connection: Connection) -> Config:
@@ -316,8 +468,9 @@ def _assert_scripts_match_constants() -> None:
     constants are only trustworthy if something checks them against the
     scripts, and this runs first on every path that is about to *write*
     (`ensure_schema`'s upgrade branch, hence `upgrade_schema` and `import`).
-    A bare `RuntimeError`, not a `SchemaError`: a packaging defect (a new
-    revision added without updating the constants, or a branched history),
+    Raises `MigrationPackagingError`, not a `SchemaError`: a packaging defect
+    (a new revision added without updating the constants, or a branched
+    history),
     never an operator-fixable database state -- the same reasoning as
     `SchemaError`'s docstring.
     """
@@ -329,14 +482,14 @@ def _assert_scripts_match_constants() -> None:
         # get_current_head() (singular) raises a bare
         # `CommandError: The script directory has multiple heads` for this
         # case instead of something with a named explanation.
-        raise RuntimeError(
+        raise MigrationPackagingError(
             f"zfsbackup's installed migration scripts have "
             f"{len(code_heads)} heads {code_heads!r}; the config store only "
             f"supports a single, linear migration history. This is a "
             f"packaging defect, not something fixable by an operator."
         )
     if code_heads[0] != EXPECTED_HEAD:
-        raise RuntimeError(
+        raise MigrationPackagingError(
             f"zfsbackup's installed migration scripts have head "
             f"{code_heads[0]!r} but migrate.EXPECTED_HEAD is "
             f"{EXPECTED_HEAD!r}. A migration was added or removed without "
@@ -345,7 +498,7 @@ def _assert_scripts_match_constants() -> None:
         )
     revisions = {rev.revision for rev in script.walk_revisions()}
     if revisions != set(KNOWN_REVISIONS):
-        raise RuntimeError(
+        raise MigrationPackagingError(
             f"zfsbackup's installed migration scripts define revisions "
             f"{sorted(revisions)!r} but migrate.KNOWN_REVISIONS is "
             f"{sorted(KNOWN_REVISIONS)!r}. A migration was added or removed "
@@ -381,7 +534,7 @@ def check_schema(connection: Connection) -> str:
 
     Decides from `EXPECTED_HEAD` / `KNOWN_REVISIONS` and reads **no migration
     scripts** (item 10.1, B1): the only things it touches are the database's
-    `alembic_version` and, for the split-brain test, its table list. The
+    `alembic_version` and, when none is recorded, its table list. The
     constants are checked against the scripts on the write paths
     (`_assert_scripts_match_constants`), not here.
 
@@ -412,68 +565,61 @@ def check_schema(connection: Connection) -> str:
 
     Raises, in order:
 
-    - `SchemaSplitBrain` if the database has no recorded Alembic revision
-      (`alembic_version` missing or empty) but one or more of this
-      package's tables already exist -- `alembic_version` lost to an
-      uncommitted `ensure_schema` call, or the tables created some other
-      way. See that exception's docstring.
+    - `NotAConfigDatabase` if the database records no revision but holds
+      tables that are not (only) this package's -- someone else's SQLite
+      database. Nothing is written, here or by any caller that gets this far.
+    - `SchemaSplitBrain` if it records no revision but every table in it is
+      one of this package's -- `alembic_version` lost to an uncommitted
+      `ensure_schema` call, or the tables created some other way. See that
+      exception's docstring.
     - `SchemaVersionMismatch` if the database records a revision not in
       `KNOWN_REVISIONS` -- written by a *newer* zfsbackup package. See that
       exception's docstring.
     - `SchemaOutOfDate` if the database's recorded revision(s) are ones
-      this package *does* recognise but are not `EXPECTED_HEAD` -- including
-      a brand-new or empty database with no recorded revision at all (no
-      `alembic_version`, no tables): `check_schema` cannot itself perform
-      the initial migration, so that case is a refusal here, not the
-      silent "create it" that `ensure_schema` alone used to provide. See
-      that exception's docstring for why the daemon's refusal, not a
-      log-and-continue, is the deliberate behaviour.
+      this package *does* recognise but are not `EXPECTED_HEAD`, or if it is
+      an empty/brand-new file with no recorded revision and no tables
+      (`check_schema` cannot perform the initial migration; the text points
+      at `zfsbackup-config import`, not `migrate`). The text is neutral
+      about who is asking -- the daemon appends its own sentence.
 
     Returns `EXPECTED_HEAD` with no exception only when the database's
     recorded heads are exactly `{EXPECTED_HEAD}`.
     """
     db_heads = MigrationContext.configure(connection).get_current_heads()
-    if not db_heads and _has_existing_schema(connection):
-        raise SchemaSplitBrain(
-            f"Database has no recorded Alembic revision (alembic_version "
-            f"missing or empty) but one or more of this package's tables "
-            f"already exist. Refusing to attempt the initial migration, "
-            f"which would fail with 'table already exists'. If the "
-            f"existing tables are already at revision {EXPECTED_HEAD!r}, fix "
-            f"this by stamping them (`alembic stamp head`); otherwise "
-            f"restore the database from a backup or start over with a "
-            f"fresh file."
-        )
+    if not db_heads:
+        _refuse_unrecorded_tables(connection)
 
-    for revision in db_heads:
-        if revision not in KNOWN_REVISIONS:
-            raise SchemaVersionMismatch(
-                f"Database schema is at revision {revision!r}, which this "
-                f"installed zfsbackup package (migrations head "
-                f"{EXPECTED_HEAD!r}) does not recognise. This usually means "
-                f"the database was created or migrated by a newer "
-                f"zfsbackup package. Upgrade the zfsbackup package "
-                f"installed on this host before opening this database "
-                f"again."
-            )
+    unknown = _unknown_revisions(db_heads)
+    if unknown:
+        revision = unknown[0]
+        raise SchemaVersionMismatch(
+            f"Database schema is at revision {revision!r}, which this "
+            f"installed zfsbackup package (migrations head "
+            f"{EXPECTED_HEAD!r}) does not recognise. {_db_label(connection)} "
+            f"was written by a newer zfsbackup package, or is not a "
+            f"zfsbackup config database; nothing was changed. If it is "
+            f"ours, upgrade the zfsbackup package installed on this host "
+            f"before opening it again; otherwise point -c at the config "
+            f"database."
+        )
 
     if set(db_heads) != {EXPECTED_HEAD}:
         if db_heads:
-            current = f"revision(s) {sorted(db_heads)!r}"
-        else:
-            current = (
-                "no recorded Alembic revision at all (alembic_version "
-                "missing or empty, and no application tables exist -- a "
-                "brand-new or empty database)"
+            # Neutral text: the daemon appends its own restart sentence and
+            # the CLI adds nothing; `migrate` is the remedy for both.
+            word = "revision" if len(db_heads) == 1 else "revisions"
+            raise SchemaOutOfDate(
+                f"{_db_label(connection)} is at schema {word} "
+                f"{', '.join(sorted(db_heads))}; this package expects "
+                f"{EXPECTED_HEAD}. Run `zfsbackup-config migrate`."
             )
+        # No recorded revision and no tables: an empty or brand-new file.
+        # `migrate` does not create databases, so the remedy is `import`.
         raise SchemaOutOfDate(
-            f"Database schema is at {current}, which is behind this "
-            f"installed zfsbackup package's migration head {EXPECTED_HEAD!r}. "
-            f"The daemon only checks the schema -- it never migrates the "
-            f"database, so this is a refusal, not an automatic upgrade. "
-            f"Run `zfsbackup-config migrate` to bring the database up to "
-            f"date (your stored configuration is kept), then start the "
-            f"daemon again."
+            f"{_db_label(connection)} has no recorded schema revision (it "
+            f"holds no configuration tables); this package expects "
+            f"{EXPECTED_HEAD}. Create "
+            f"the configuration database with `zfsbackup-config import`."
         )
 
     return EXPECTED_HEAD
@@ -493,6 +639,12 @@ def ensure_schema(connection: Connection) -> str:
     (`SchemaSplitBrain`, `SchemaVersionMismatch`) is not something a
     migration can fix, so it propagates unchanged -- `ensure_schema`
     catches `SchemaOutOfDate` specifically, nothing broader.
+
+    **Migrations must never use `autocommit_block()`.** It commits the
+    caller's transaction mid-migration, so the `PRAGMA foreign_key_check`
+    below can no longer roll the migration back and a failure leaves a
+    half-applied schema (`SchemaIntegrityError`'s "database is unchanged"
+    promise is void). Say so in any revision that is tempted to.
 
     **If this raises after `command.upgrade` ran (including
     `SchemaIntegrityError`), the caller must roll back, not commit** -- the
@@ -517,10 +669,13 @@ def ensure_schema(connection: Connection) -> str:
     -- uncommitted and at risk, because reading it is itself the first
     thing `check_schema` does).
 
-    A brand new (empty) database has no current heads at all, so
+    A brand new (empty, tableless) database has no current heads at all, so
     `check_schema` raises `SchemaOutOfDate` for it just like any other
     behind-head database, and the migration below performs the full
-    initial migration via `command.upgrade`.
+    initial migration via `command.upgrade` -- this is `import`'s first-import
+    path. A database that holds tables but records no revision never reaches
+    the migration: `check_schema` raises `NotAConfigDatabase` /
+    `SchemaSplitBrain`, which propagate unchanged.
 
     **`command.upgrade` deliberately runs OUTSIDE the `except` block**,
     not nested inside it. An earlier version of this function called it
@@ -548,6 +703,15 @@ def ensure_schema(connection: Connection) -> str:
     # only trustworthy if the scripts agree with them.
     _assert_scripts_match_constants()
 
+    # `check_schema` above autobegan a transaction, so this holds on every
+    # supported path; it is here so a refactor that hands Alembic a
+    # transaction-less connection fails loudly instead of letting the DDL,
+    # the version stamp and the FK check below commit piecemeal.
+    if not connection.in_transaction():
+        raise RuntimeError(
+            "ensure_schema must run inside the caller's transaction; "
+            "refusing to hand Alembic a connection with none open."
+        )
     cfg = _build_config(connection)
     command.upgrade(cfg, "head")
     # B2: still inside the caller's transaction, before it can commit.
@@ -568,6 +732,10 @@ def upgrade_schema(resolved: ResolvedConfigPath) -> SchemaUpgrade:
     `zfsbackup-config migrate`). Never creates a database -- a missing or
     zero-byte target is refused by `open_config_connection`'s preflight
     (`ConfigDbNotFound` / `ConfigDbNotADatabase`); only `import` may create.
+    It only upgrades a database with a *recorded, known* older revision: one
+    with no recorded revision is refused (`NotAConfigDatabase` /
+    `SchemaSplitBrain` if it holds tables, `SchemaOutOfDate` pointing at
+    `import` if it is empty) and left unchanged (item 10.4).
 
     Owns its connection end to end, so no caller can get the sequencing
     wrong (cf. `ensure_schema`'s binding note):
@@ -593,10 +761,11 @@ def upgrade_schema(resolved: ResolvedConfigPath) -> SchemaUpgrade:
       returns. A database already at head is rolled back, not committed
       (nothing was written).
 
-    Raises `SchemaSplitBrain` / `SchemaVersionMismatch` unchanged (a
-    migration cannot fix them), `SchemaIntegrityError`, the bare packaging
-    `RuntimeError` of `_assert_scripts_match_constants` (before the database
-    is opened at all), `ConfigPathError` subclasses from the preflight, and
+    Raises `NotAConfigDatabase` / `SchemaSplitBrain` /
+    `SchemaVersionMismatch` unchanged (a migration cannot fix them),
+    `SchemaIntegrityError`, the `MigrationPackagingError` of
+    `_assert_scripts_match_constants` (before the database is opened at
+    all), `ConfigPathError` subclasses from the preflight, and
     `sqlalchemy.exc.OperationalError` ("database is locked") if the write
     lock could not be had within `busy_timeout`. Does not dispose the engine
     cache; the caller's process-exit (or `dispose_all()`) does.
@@ -613,6 +782,17 @@ def upgrade_schema(resolved: ResolvedConfigPath) -> SchemaUpgrade:
             from_revs = tuple(
                 sorted(MigrationContext.configure(conn).get_current_heads())
             )
+            if not from_revs:
+                # Not a "known recorded revision": never migrate (and so
+                # never stamp) a database we cannot show is ours.
+                _refuse_unrecorded_tables(conn)
+                raise SchemaOutOfDate(
+                    f"{_db_label(conn)} has no recorded schema revision "
+                    f"(it holds no configuration tables), so there is nothing to "
+                    f"migrate. "
+                    f"Create the configuration database with "
+                    f"`zfsbackup-config import`."
+                )
             to_rev = ensure_schema(conn)
         except BaseException:
             trans.rollback()

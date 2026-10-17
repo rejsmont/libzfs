@@ -27,7 +27,17 @@ project's engine factory), so `foreign_keys=ON`, WAL and `BEGIN IMMEDIATE` are
 the real ones. No test here uses `mock_subprocess`.
 
 Mutation counts (scratch copy of the tree, one revert at a time; tests in this
-file that then fail) are recorded in the item 10.1 hand-off report.
+file that then fail) are recorded in the item 10.1 hand-off report. The item
+10.4 counts (foreign-database refusal, `MigrationPackagingError`, the
+`in_transaction` guard, the interrupt wording, reader/writer journal modes) are
+listed in `tests/test_zfsbackup_cli.py`'s docstring.
+
+Item 10.4 (the `Test...Foreign...`, `TestEnsureSchemaTransactionGuard`,
+`TestImporterInterruptNotes`, `TestReimportWithoutExpungeAll` classes at the end
+of this file; the reader/writer journal-mode tests live in
+`test_zfsbackup_store.py::TestJournalModeByEngineRole`). A schema-only database
+is built with `make_schema_only` (`ensure_schema` on a writer connection):
+`upgrade_schema` no longer initialises a tableless file.
 """
 
 import hashlib
@@ -61,6 +71,8 @@ from zfsbackup.config.store.mapper import load_config
 from zfsbackup.config.store.migrate import (
     EXPECTED_HEAD,
     KNOWN_REVISIONS,
+    MigrationPackagingError,
+    NotAConfigDatabase,
     SchemaError,
     SchemaIntegrityError,
     SchemaOutOfDate,
@@ -150,6 +162,33 @@ def sql(db: Path, statement: str):
         return conn.execute(statement).fetchall()
     finally:
         conn.close()
+
+
+def make_schema_only(resolved) -> None:
+    """A valid database at head holding NO configuration (`global_settings` is
+    empty): `ensure_schema` on a writer connection, committed.
+
+    `upgrade_schema` can no longer build this from a tableless file (item
+    10.4: it refuses a database with no recorded revision), and `import_yaml`
+    cleans up a failed first import. Going through `ensure_schema` is also what
+    a first import's phase 2 does. The file must already be a valid SQLite
+    database (`open_config_connection` refuses a zero-byte one).
+    """
+    with open_config_connection(resolved, readonly=False, foreign_keys=False) as conn:
+        trans = conn.begin()
+        ensure_schema(conn)
+        trans.commit()
+    dispose_all()
+
+
+def valid_empty_sqlite_file(db: Path) -> None:
+    """A non-zero-byte SQLite file with no tables (WAL header written)."""
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE _t(x)")
+    conn.execute("DROP TABLE _t")
+    conn.commit()
+    conn.close()
 
 
 def write_revision(scripts: Path, filename: str, body: str, *, rid=SYNTH,
@@ -340,10 +379,15 @@ class TestCheckSchemaKnownButBehind:
                 check_schema(conn)
         message = str(excinfo.value)
         # Names the recorded revision, not the "no recorded revision" branch.
-        assert repr([EXPECTED_HEAD]) in message
-        assert "brand-new" not in message
-        assert SYNTH in message
-        assert "zfsbackup-config migrate" in message
+        # Item 10.4's neutral wording: "<path> is at schema revision X; this
+        # package expects Y. Run `zfsbackup-config migrate`." -- no daemon
+        # sentence (the daemon appends its own).
+        assert message == (
+            f"{resolved.path} is at schema revision {EXPECTED_HEAD}; this "
+            f"package expects {SYNTH}. Run `zfsbackup-config migrate`."
+        )
+        assert "daemon" not in message
+        assert "no recorded schema revision" not in message
 
     def test_known_but_behind_is_not_a_version_mismatch(
         self, imported, resolved, synthetic_revision
@@ -359,13 +403,13 @@ class TestCheckSchemaKnownButBehind:
     ):
         """Documents why the fixture patches all three together: with
         `EXPECTED_HEAD` alone moved, the upgrade path refuses with the
-        packaging `RuntimeError` (the `KNOWN_REVISIONS` check), not a
+        `MigrationPackagingError` (the `KNOWN_REVISIONS` check), not a
         `SchemaError`."""
         synthetic_revision(BODY_GOOD)
         monkeypatch.setattr(
             migrate_module, "KNOWN_REVISIONS", frozenset({EXPECTED_HEAD})
         )
-        with pytest.raises(RuntimeError, match="KNOWN_REVISIONS") as excinfo:
+        with pytest.raises(MigrationPackagingError, match="KNOWN_REVISIONS") as excinfo:
             upgrade_schema(resolved)
         assert not isinstance(excinfo.value, SchemaError)
 
@@ -376,38 +420,44 @@ class TestCheckSchemaKnownButBehind:
 
 
 class TestAssertScriptsMatchConstants:
-    def test_head_mismatch_raises_a_bare_runtime_error(self, monkeypatch):
+    def test_head_mismatch_raises_a_migration_packaging_error(self, monkeypatch):
         monkeypatch.setattr(migrate_module, "EXPECTED_HEAD", "cccccccccccc")
         with pytest.raises(RuntimeError) as excinfo:
             _assert_scripts_match_constants()
-        assert type(excinfo.value) is RuntimeError
+        assert type(excinfo.value) is MigrationPackagingError
+        assert isinstance(excinfo.value, RuntimeError)
+        assert not isinstance(excinfo.value, SchemaError)
         assert "'cccccccccccc'" in str(excinfo.value)
         assert repr(EXPECTED_HEAD) in str(excinfo.value)
         assert "EXPECTED_HEAD" in str(excinfo.value)
 
-    def test_revision_set_mismatch_raises_a_bare_runtime_error(self, monkeypatch):
+    def test_revision_set_mismatch_raises_a_migration_packaging_error(self, monkeypatch):
         monkeypatch.setattr(
             migrate_module, "KNOWN_REVISIONS", frozenset({EXPECTED_HEAD, "zzzzzzzzzzzz"})
         )
         with pytest.raises(RuntimeError) as excinfo:
             _assert_scripts_match_constants()
-        assert type(excinfo.value) is RuntimeError
+        assert type(excinfo.value) is MigrationPackagingError
+        assert isinstance(excinfo.value, RuntimeError)
+        assert not isinstance(excinfo.value, SchemaError)
         assert "KNOWN_REVISIONS" in str(excinfo.value)
         assert "zzzzzzzzzzzz" in str(excinfo.value)
 
     def test_a_revision_missing_from_the_constants_is_a_mismatch(self, monkeypatch):
         monkeypatch.setattr(migrate_module, "KNOWN_REVISIONS", frozenset())
-        with pytest.raises(RuntimeError, match="KNOWN_REVISIONS"):
+        with pytest.raises(MigrationPackagingError, match="KNOWN_REVISIONS"):
             _assert_scripts_match_constants()
 
-    def test_multiple_heads_raise_a_bare_runtime_error(
+    def test_multiple_heads_raise_a_migration_packaging_error(
         self, synthetic_scripts, monkeypatch
     ):
         write_revision(synthetic_scripts, "one.py", BODY_GOOD, rid="b1b1b1b1b1b1")
         write_revision(synthetic_scripts, "two.py", BODY_GOOD, rid="b2b2b2b2b2b2")
         with pytest.raises(RuntimeError) as excinfo:
             _assert_scripts_match_constants()
-        assert type(excinfo.value) is RuntimeError
+        assert type(excinfo.value) is MigrationPackagingError
+        assert isinstance(excinfo.value, RuntimeError)
+        assert not isinstance(excinfo.value, SchemaError)
         assert "2 heads" in str(excinfo.value)
 
     @pytest.mark.parametrize("which", ["head", "revisions"])
@@ -423,7 +473,7 @@ class TestAssertScriptsMatchConstants:
                 migrate_module, "KNOWN_REVISIONS",
                 frozenset({EXPECTED_HEAD, "zzzzzzzzzzzz"}),
             )
-        with pytest.raises(RuntimeError) as excinfo:
+        with pytest.raises(MigrationPackagingError) as excinfo:
             upgrade_schema(resolved)
         assert not isinstance(excinfo.value, SchemaError)
 
@@ -523,19 +573,26 @@ class TestUpgradeSchema:
         )
         assert file_hashes(db_path.parent) == before
 
-    def test_a_schema_less_but_valid_sqlite_file_is_migrated(self, db_path, resolved):
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("CREATE TABLE _t(x)")
-        conn.execute("DROP TABLE _t")
-        conn.commit()
-        conn.close()
+    def test_a_schema_less_but_valid_sqlite_file_is_refused_and_pointed_at_import(
+        self, db_path, resolved
+    ):
+        """Item 10.4: `migrate` only upgrades a RECORDED, known revision. A
+        valid SQLite file with no tables is not migrated (and so not stamped):
+        `SchemaOutOfDate`, whose text points at `import`; the file gains no
+        table."""
+        valid_empty_sqlite_file(db_path)
+        before_tables = sql(db_path, "SELECT name FROM sqlite_master")
 
-        result = upgrade_schema(resolved)
+        with pytest.raises(SchemaOutOfDate) as excinfo:
+            upgrade_schema(resolved)
         dispose_all()
 
-        assert result == SchemaUpgrade(from_revs=(), to_rev=EXPECTED_HEAD, changed=True)
-        assert sql(db_path, "SELECT version_num FROM alembic_version") == [(EXPECTED_HEAD,)]
+        message = str(excinfo.value)
+        assert "no recorded schema revision" in message
+        assert "`zfsbackup-config import`" in message
+        assert "nothing to migrate" in message
+        assert "zfsbackup-config migrate" not in message
+        assert sql(db_path, "SELECT name FROM sqlite_master") == before_tables == []
 
     def test_the_connection_is_closed_before_it_returns(
         self, imported, resolved, synthetic_revision, monkeypatch
@@ -955,14 +1012,8 @@ class TestImportBackup:
     def test_a_schema_only_database_gets_no_callback_and_no_backup_path(
         self, db_path, resolved, new_yaml, tmp_path
     ):
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("CREATE TABLE _t(x)")
-        conn.execute("DROP TABLE _t")
-        conn.commit()
-        conn.close()
-        upgrade_schema(resolved)
-        dispose_all()
+        valid_empty_sqlite_file(db_path)
+        make_schema_only(resolved)
         assert sql(db_path, "SELECT count(*) FROM global_settings") == [(0,)]
 
         rec = Recorder(tmp_path / "bk.yaml")
@@ -1346,6 +1397,8 @@ NEW_NAMES = [
     "SchemaUpgrade",
     "upgrade_schema",
     "OutgoingConfigUnreadable",
+    "MigrationPackagingError",
+    "NotAConfigDatabase",
 ]
 
 
@@ -1369,6 +1422,8 @@ class TestItem10Exports:
         assert store_pkg.SchemaUpgrade is SchemaUpgrade
         assert store_pkg.SchemaIntegrityError is SchemaIntegrityError
         assert store_pkg.OutgoingConfigUnreadable is OutgoingConfigUnreadable
+        assert store_pkg.MigrationPackagingError is MigrationPackagingError
+        assert store_pkg.NotAConfigDatabase is NotAConfigDatabase
 
     def test_the_importer_module_all_lists_the_new_error(self):
         assert "OutgoingConfigUnreadable" in importer_module.__all__
@@ -1377,3 +1432,701 @@ class TestItem10Exports:
         assert issubclass(SchemaIntegrityError, SchemaError)
         assert issubclass(OutgoingConfigUnreadable, ConfigPathError)
         assert not issubclass(OutgoingConfigUnreadable, SchemaError)
+        # Item 10.4: a foreign database is an operator-fixable refusal; a
+        # packaging defect is not, and must not share its catchable base.
+        assert issubclass(NotAConfigDatabase, SchemaError)
+        assert issubclass(MigrationPackagingError, RuntimeError)
+        assert not issubclass(MigrationPackagingError, SchemaError)
+
+
+# ===========================================================================
+# Item 10.4 -- review fixes (store half)
+# ===========================================================================
+
+
+def make_foreign(db: Path, *tables: str, wal: bool = False) -> None:
+    """A rollback-journal (or `wal`) SQLite file holding only `tables`, none of
+    them zfsbackup's."""
+    conn = sqlite3.connect(str(db))
+    if wal:
+        conn.execute("PRAGMA journal_mode=WAL")
+    for name in tables or ("orders",):
+        conn.execute(f"CREATE TABLE {name} (id INTEGER PRIMARY KEY, x TEXT)")
+        conn.execute(f"INSERT INTO {name} (x) VALUES ('a')")
+    conn.commit()
+    conn.close()
+    os.chmod(db, 0o660)
+
+
+def fingerprint(db: Path):
+    """Full bytes, journal-mode header bytes 18-19, `sqlite_master`, and the
+    directory listing: everything a refusal must leave as it was."""
+    raw = db.read_bytes()
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        master = conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall()
+    finally:
+        conn.close()
+    return raw, (raw[18], raw[19]), master, sorted(p.name for p in db.parent.iterdir())
+
+
+def create_our_tables(db: Path) -> None:
+    """Every table of zfsbackup's schema, created without `alembic_version`
+    (the lost-stamp state)."""
+    eng = create_engine(f"sqlite:///{db}")
+    Base.metadata.create_all(eng)
+    eng.dispose()
+
+
+class TestForeignDatabaseRefusal:
+    """A database with tables but no recorded revision is not ours to modify
+    (item 10.4). Reproduced in review with a foreign `orders` table: `migrate`
+    grafted the schema into it and stamped it."""
+
+    @pytest.fixture
+    def foreign(self, db_path):
+        make_foreign(db_path)
+        return db_path
+
+    def test_check_schema_raises_not_a_config_database(self, foreign, resolved):
+        before = fingerprint(foreign)
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(NotAConfigDatabase) as excinfo:
+                check_schema(conn)
+        dispose_all()
+        message = str(excinfo.value)
+        assert isinstance(excinfo.value, SchemaError)
+        assert "not a zfsbackup config database" in message
+        assert "(tables: orders)" in message
+        assert "nothing was changed" in message
+        assert str(foreign) in message
+        assert "`zfsbackup-config import`" in message
+        assert fingerprint(foreign) == before
+        assert before[1] == (1, 1)
+
+    def test_upgrade_schema_raises_and_changes_nothing(self, foreign, resolved):
+        before = fingerprint(foreign)
+        with pytest.raises(NotAConfigDatabase):
+            upgrade_schema(resolved)
+        dispose_all()
+        assert fingerprint(foreign) == before
+        assert "alembic_version" not in [r[1] for r in before[2]]
+
+    def test_import_yaml_over_it_raises_and_changes_nothing(self, foreign, resolved):
+        before = fingerprint(foreign)
+        with pytest.raises(NotAConfigDatabase):
+            import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        assert foreign.exists()  # not created by this import, so never cleaned up
+        assert fingerprint(foreign) == before
+
+    def test_import_with_a_backup_callback_takes_no_backup(self, foreign, resolved, tmp_path):
+        rec = Recorder(tmp_path / "bk.yaml")
+        with pytest.raises(NotAConfigDatabase):
+            import_yaml(EXAMPLE_YAML, resolved, backup=rec)
+        dispose_all()
+        assert rec.configs == []
+        assert not (tmp_path / "bk.yaml").exists()
+
+    def test_a_foreign_database_that_is_already_wal_is_refused_unchanged(self, db_path, resolved):
+        make_foreign(db_path, wal=True)
+        dispose_all()
+        before = fingerprint(db_path)
+        assert before[1] == (2, 2)
+        for call in (upgrade_schema, lambda r: import_yaml(EXAMPLE_YAML, r)):
+            with pytest.raises(NotAConfigDatabase):
+                call(resolved)
+        dispose_all()
+        assert fingerprint(db_path) == before
+
+    def test_ours_mixed_with_a_foreign_table_is_not_a_config_database(self, db_path, resolved):
+        make_foreign(db_path, "orders")
+        create_our_tables(db_path)
+        before = fingerprint(db_path)
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(NotAConfigDatabase) as excinfo:
+                check_schema(conn)
+        assert "orders" in str(excinfo.value)
+        for call in (upgrade_schema, lambda r: import_yaml(EXAMPLE_YAML, r)):
+            with pytest.raises(NotAConfigDatabase):
+                call(resolved)
+        dispose_all()
+        assert fingerprint(db_path) == before
+
+    def test_only_our_tables_and_no_revision_is_split_brain_not_foreign(self, db_path, resolved):
+        """Kept deliberately: nothing of someone else's is at stake, and the
+        message offers the recovery (`alembic stamp head`)."""
+        db_path.write_bytes(b"")
+        create_our_tables(db_path)
+        before = fingerprint(db_path)
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(SchemaSplitBrain):
+                check_schema(conn)
+        with pytest.raises(SchemaSplitBrain):
+            upgrade_schema(resolved)
+        with pytest.raises(SchemaSplitBrain):
+            import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        assert fingerprint(db_path) == before
+
+    def test_an_empty_alembic_version_table_does_not_count_as_a_table_of_ours_or_theirs(
+        self, db_path, resolved
+    ):
+        """An unfinished initial migration (stamp table, no rows, nothing
+        else) is "no tables": the empty-file branch, pointing at `import`."""
+        valid_empty_sqlite_file(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        conn.commit()
+        conn.close()
+        with open_config_connection(resolved, readonly=True) as c:
+            with pytest.raises(SchemaOutOfDate) as excinfo:
+                check_schema(c)
+        assert "holds no configuration tables" in str(excinfo.value)
+        assert not isinstance(excinfo.value, NotAConfigDatabase)
+
+    def test_a_foreign_table_next_to_an_empty_alembic_version_is_still_foreign(
+        self, db_path, resolved
+    ):
+        make_foreign(db_path, "orders")
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        conn.commit()
+        conn.close()
+        with pytest.raises(NotAConfigDatabase):
+            upgrade_schema(resolved)
+
+    def test_a_recorded_revision_is_never_refused_for_extra_tables(self, imported, resolved):
+        """The guard is for UNRECORDED databases only: ours, at head, with an
+        extra table somebody added still checks out."""
+        conn = sqlite3.connect(str(imported))
+        conn.execute("CREATE TABLE operator_notes (x)")
+        conn.commit()
+        conn.close()
+        dispose_all()
+        with open_config_connection(resolved, readonly=True) as c:
+            assert check_schema(c) == EXPECTED_HEAD
+
+    def test_a_long_table_list_is_truncated_in_the_message(self, db_path, resolved):
+        names = [f"t{i}" for i in range(9)]
+        make_foreign(db_path, *names)
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(NotAConfigDatabase) as excinfo:
+                check_schema(conn)
+        message = str(excinfo.value)
+        assert "(tables: t0, t1, t2, t3, t4, t5 and 3 more)" in message
+        assert "t6" not in message
+
+    def test_a_tableless_valid_file_is_the_empty_branch_not_foreign(self, db_path, resolved):
+        valid_empty_sqlite_file(db_path)
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(SchemaOutOfDate):
+                check_schema(conn)
+        with pytest.raises(SchemaOutOfDate):
+            upgrade_schema(resolved)
+        # ...while import is the command that may initialise it.
+        result = import_yaml(EXAMPLE_YAML, resolved)
+        assert result.created is False and result.head_revision == EXPECTED_HEAD
+
+    def test_a_missing_or_zero_byte_target_is_still_refused_by_the_preflight(
+        self, db_path, resolved
+    ):
+        with pytest.raises(ConfigDbNotFound):
+            upgrade_schema(resolved)
+        db_path.write_bytes(b"")
+        with pytest.raises(ConfigDbNotADatabase):
+            upgrade_schema(resolved)
+
+
+class TestEnsureSchemaTransactionGuard:
+    """`ensure_schema` asserts it runs inside the caller's transaction before
+    handing Alembic the connection (item 10.4, 5)."""
+
+    @pytest.fixture
+    def memory_engine(self):
+        eng = create_engine(
+            "sqlite:///:memory:", connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        yield eng
+        eng.dispose()
+
+    def test_it_raises_when_the_connection_is_not_in_a_transaction(
+        self, memory_engine, monkeypatch
+    ):
+        calls = []
+
+        def out_of_date_with_no_transaction(connection):
+            connection.rollback()  # leaves the connection transaction-less
+            raise SchemaOutOfDate("behind")
+
+        monkeypatch.setattr(migrate_module, "check_schema", out_of_date_with_no_transaction)
+        monkeypatch.setattr(migrate_module.command, "upgrade", lambda *a, **k: calls.append(a))
+
+        with memory_engine.connect() as conn:
+            with pytest.raises(RuntimeError, match="must run inside the caller's transaction") as excinfo:
+                ensure_schema(conn)
+
+        assert calls == []  # Alembic was never handed the connection
+        assert not isinstance(excinfo.value, (SchemaError, MigrationPackagingError))
+        assert inspect(memory_engine).get_table_names() == []
+
+    def test_the_normal_path_runs_inside_a_transaction(self, memory_engine):
+        with memory_engine.connect() as conn:
+            assert ensure_schema(conn) == EXPECTED_HEAD
+            assert conn.in_transaction()
+            conn.commit()
+        assert "alembic_version" in inspect(memory_engine).get_table_names()
+
+    def test_the_script_check_runs_before_the_guard_and_before_any_write(
+        self, memory_engine, monkeypatch
+    ):
+        monkeypatch.setattr(migrate_module, "EXPECTED_HEAD", "cccccccccccc")
+        with memory_engine.connect() as conn:
+            with pytest.raises(MigrationPackagingError):
+                ensure_schema(conn)
+        assert inspect(memory_engine).get_table_names() == []
+
+
+class TestImporterInterruptNotes:
+    """A `KeyboardInterrupt` can land after phase 3's COMMIT returned, so the
+    importer's notes must not assert "was not replaced" / "NOT applied" for a
+    `BaseException` (item 10.4, CLI-4)."""
+
+    def _fail_in_save(self, monkeypatch, exc):
+        def failing(session, config):
+            raise exc
+
+        monkeypatch.setattr(importer_module, "save_config", failing)
+
+    def _interrupt_after_commit(self, monkeypatch):
+        from contextlib import contextmanager as cm
+
+        real = importer_module.open_config_session
+
+        @cm
+        def wrapper(*a, **k):
+            with real(*a, **k) as session:
+                yield session
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(importer_module, "open_config_session", wrapper)
+
+    def test_an_exception_after_the_backup_says_the_config_was_not_replaced(
+        self, imported, resolved, new_yaml, tmp_path, monkeypatch
+    ):
+        rec = Recorder(tmp_path / "bk.yaml")
+        self._fail_in_save(monkeypatch, ValueError("late"))
+        with pytest.raises(ValueError) as excinfo:
+            import_yaml(new_yaml, resolved, backup=rec)
+        (note,) = excinfo.value.__notes__
+        assert note == (
+            f"A pre-import backup of the outgoing configuration was already "
+            f"written to {tmp_path / 'bk.yaml'}; the stored configuration was not replaced."
+        )
+
+    def test_a_keyboard_interrupt_after_the_backup_does_not_assert_either_outcome(
+        self, imported, resolved, new_yaml, tmp_path, monkeypatch
+    ):
+        rec = Recorder(tmp_path / "bk.yaml")
+        self._fail_in_save(monkeypatch, KeyboardInterrupt())
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            import_yaml(new_yaml, resolved, backup=rec)
+        (note,) = excinfo.value.__notes__
+        assert f"already written to {tmp_path / 'bk.yaml'}" in note
+        assert "may or may not have been applied" in note
+        assert "`zfsbackup-config export`" in note
+        assert "was not replaced" not in note
+
+    def test_an_interrupt_after_the_commit_of_a_reimport_really_was_applied(
+        self, imported, db_path, resolved, new_yaml, tmp_path, monkeypatch
+    ):
+        rec = Recorder(tmp_path / "bk.yaml")
+        self._interrupt_after_commit(monkeypatch)
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            import_yaml(new_yaml, resolved, backup=rec)
+        monkeypatch.undo()
+        dispose_all()
+        assert "may or may not have been applied" in excinfo.value.__notes__[0]
+        assert state(db_path)[1] == [("tank/x",)]  # ...and here it was
+
+    def test_a_first_import_interrupted_after_the_commit_keeps_the_file_without_claiming_not_applied(
+        self, db_path, resolved, monkeypatch, caplog
+    ):
+        self._interrupt_after_commit(monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(KeyboardInterrupt) as excinfo:
+                import_yaml(EXAMPLE_YAML, resolved)
+        monkeypatch.undo()
+        dispose_all()
+
+        assert db_path.exists()
+        (note,) = excinfo.value.__notes__
+        assert "NOT applied" not in note
+        assert f"{db_path} holds a configuration and was left intact" in note
+        assert "may or may not have been applied" in note
+        assert "`zfsbackup-config export`" in note
+        assert cleanup_warnings(caplog) == [note]
+        assert state(db_path)[1]  # the configuration is there
+
+    def test_an_ordinary_exception_in_the_same_window_still_says_not_applied(
+        self, db_path, resolved, monkeypatch
+    ):
+        """The unchanged wording for an `Exception`: a concurrent import won
+        the race and this one did not apply."""
+        from zfsbackup.config.store import importer as imp
+
+        real = imp.open_config_session
+
+        @contextmanager
+        def failing_after_another_import_committed(*a, **k):
+            # Another writer imports first (the A-11 race), then this fails.
+            monkeypatch.setattr(imp, "open_config_session", real)
+            import_yaml(EXAMPLE_YAML, resolved)
+            dispose_all()
+            raise ValueError("this import lost")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(imp, "open_config_session", failing_after_another_import_committed)
+        with pytest.raises(ValueError) as excinfo:
+            import_yaml(new_yaml_text_path(db_path.parent), resolved)
+        (note,) = excinfo.value.__notes__
+        assert "this import was NOT applied" in note
+        assert "may or may not" not in note
+
+    def test_the_skipped_cleanup_text_for_imported_is_pinned_for_both_kinds(self, tmp_path):
+        plain = importer_module._cleanup_skipped(tmp_path / "x.db", "it now holds a configuration", "imported")
+        assert "this import was NOT applied" in plain
+        interrupted = importer_module._cleanup_skipped(
+            tmp_path / "x.db", "it now holds a configuration", "imported", interrupted=True
+        )
+        assert "NOT applied" not in interrupted
+        assert "may or may not have been applied" in interrupted
+        # Other kinds are unaffected by the flag.
+        other = importer_module._cleanup_skipped(tmp_path / "x.db", "r", "schema", interrupted=True)
+        assert other == importer_module._cleanup_skipped(tmp_path / "x.db", "r", "schema")
+
+
+def new_yaml_text_path(directory: Path) -> Path:
+    path = directory / "late.yaml"
+    path.write_text(NEW_YAML)
+    return path
+
+
+class TestReimportWithoutExpungeAll:
+    """`session.expunge_all()` was dropped from importer phase 3: the bulk
+    `delete()`s in `save_config` evict what `load_config` loaded. A re-import
+    that loaded the outgoing config for a backup must still be exactly right,
+    including rows that reuse primary keys and a destination graph."""
+
+    YAML_WITH_DESTINATIONS = textwrap.dedent(
+        """\
+        snapshot_prefix: dest
+        destinations:
+          offsite:
+            url: http://backup.example:8080
+        datasets:
+          - name: tank/a
+            frequency: 1h
+            retention:
+              "1d": "30d"
+              "1w": "6M"
+            remote:
+              - destination: offsite
+                frequency: 2h
+                retention:
+                  "1d": "7d"
+          - name: tank/b
+            frequency: 30m
+        """
+    )
+
+    @pytest.fixture
+    def dest_yaml(self, tmp_path):
+        path = tmp_path / "dest.yaml"
+        path.write_text(self.YAML_WITH_DESTINATIONS)
+        return path
+
+    def test_repeated_reimports_with_a_backup_callback_equal_from_file(
+        self, imported, db_path, resolved, dest_yaml, new_yaml, tmp_path
+    ):
+        for source in (dest_yaml, dest_yaml, new_yaml, dest_yaml, EXAMPLE_YAML, EXAMPLE_YAML):
+            rec = Recorder(tmp_path / "bk.yaml")
+            outgoing = None
+            with open_config_session(resolved, readonly=True) as session:
+                outgoing = load_config(session)
+            result = import_yaml(source, resolved, backup=rec)
+            dispose_all()
+
+            assert rec.configs == [outgoing]  # the callback saw the previous config
+            assert result.backup_path == tmp_path / "bk.yaml"
+            with open_config_session(resolved, readonly=True) as session:
+                assert load_config(session) == BackupConfig.from_file(source)
+            assert sql(db_path, "PRAGMA foreign_key_check") == []
+
+    def test_generation_advances_once_per_reimport(self, imported, db_path, resolved, dest_yaml, tmp_path):
+        start = sql(db_path, "SELECT generation FROM global_settings")[0][0]
+        for n in (1, 2, 3):
+            import_yaml(dest_yaml, resolved, backup=Recorder(tmp_path / "bk.yaml"))
+            dispose_all()
+            assert sql(db_path, "SELECT generation FROM global_settings")[0][0] == start + n
+
+    def test_a_failed_save_after_the_backup_rolls_back_to_the_loaded_config(
+        self, imported, db_path, resolved, dest_yaml, tmp_path, monkeypatch
+    ):
+        before = state(db_path)
+        real = importer_module.save_config
+
+        def failing(session, config):
+            real(session, config)  # wipe + insert happen ...
+            raise ValueError("late")  # ... and are rolled back
+
+        monkeypatch.setattr(importer_module, "save_config", failing)
+        with pytest.raises(ValueError):
+            import_yaml(dest_yaml, resolved, backup=Recorder(tmp_path / "bk.yaml"))
+        monkeypatch.undo()
+        dispose_all()
+        assert state(db_path) == before
+        with open_config_session(resolved, readonly=True) as session:
+            assert load_config(session) == BackupConfig.from_file(EXAMPLE_YAML)
+
+
+# ===========================================================================
+# Item 10.5 -- review fixes (store half)
+# ===========================================================================
+
+_STAMP_TABLE_DDL = "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+
+
+def make_alembic_foreign(db: Path, variant: str) -> None:
+    """A rollback-journal SQLite file in one of the review's three foreign
+    states that have an `alembic_version` table (see `foreign_alembic.py` in
+    the 10.5 review): `foreign_rev` (an `orders` table, revision
+    'deadbeef0001'), `empty_alembic` (an `orders` table, an EMPTY
+    `alembic_version`), `mixed_rows` (a known and an unknown revision)."""
+    conn = sqlite3.connect(str(db))
+    if variant in ("foreign_rev", "empty_alembic"):
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, x TEXT)")
+        conn.execute("INSERT INTO orders VALUES (1, 'a')")
+    conn.execute(_STAMP_TABLE_DDL)
+    if variant == "foreign_rev":
+        conn.execute("INSERT INTO alembic_version VALUES ('deadbeef0001')")
+    elif variant == "mixed_rows":
+        conn.execute(f"INSERT INTO alembic_version VALUES ('{EXPECTED_HEAD}')")
+        conn.execute("INSERT INTO alembic_version VALUES ('deadbeef0001')")
+    conn.commit()
+    conn.close()
+    os.chmod(db, 0o660)
+
+
+ALEMBIC_FOREIGN_VARIANTS = ["foreign_rev", "empty_alembic", "mixed_rows"]
+
+
+class TestForeignAlembicDatabaseIsNeverSwitchedToWal:
+    """Item 10.5, M-1R. The 10.4 gate switched any file that merely HAD an
+    `alembic_version` table; a foreign Alembic-managed database (or a foreign
+    file with an empty one) was converted to WAL and then refused with "nothing
+    was changed". Every store entry point must now leave it byte-for-byte alone.
+    """
+
+    @pytest.mark.parametrize("variant", ALEMBIC_FOREIGN_VARIANTS)
+    def test_every_store_entry_point_refuses_and_changes_nothing(
+        self, db_path, resolved, variant
+    ):
+        make_alembic_foreign(db_path, variant)
+        before = fingerprint(db_path)
+        sha = hashlib.sha256(db_path.read_bytes()).hexdigest()
+        assert before[1] == (1, 1)
+
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(SchemaError):
+                check_schema(conn)
+        dispose_all()
+        with pytest.raises(SchemaError):
+            upgrade_schema(resolved)
+        dispose_all()
+        with pytest.raises(SchemaError):
+            import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+
+        assert fingerprint(db_path) == before
+        assert hashlib.sha256(db_path.read_bytes()).hexdigest() == sha
+        assert db_path.read_bytes()[18:20] == b"\x01\x01"
+
+    @pytest.mark.parametrize(
+        "variant, expected",
+        [
+            ("foreign_rev", SchemaVersionMismatch),
+            ("mixed_rows", SchemaVersionMismatch),
+            ("empty_alembic", NotAConfigDatabase),
+        ],
+    )
+    def test_the_refusal_is_the_right_one(self, db_path, resolved, variant, expected):
+        make_alembic_foreign(db_path, variant)
+        with pytest.raises(expected):
+            upgrade_schema(resolved)
+        dispose_all()
+
+    def test_the_only_empty_alembic_version_file_is_not_switched_when_migrate_refuses_it(
+        self, db_path, resolved
+    ):
+        """10.6: `migrate` refuses a stamp-only file ("nothing to migrate") and
+        promises to leave it unchanged, so the writer engine must not rewrite
+        its header first. (`import` still migrates it, then the next engine
+        switches it -- see `TestFirstImportEndsInWal`.)"""
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(_STAMP_TABLE_DDL)
+        conn.commit()
+        conn.close()
+        before = db_path.read_bytes()
+        assert before[18:20] == b"\x01\x01"
+        with pytest.raises(SchemaOutOfDate, match="nothing to migrate"):
+            upgrade_schema(resolved)
+        dispose_all()
+        assert db_path.read_bytes()[18:20] == b"\x01\x01"
+        assert db_path.read_bytes() == before
+        assert hashlib.sha256(db_path.read_bytes()).hexdigest() == hashlib.sha256(before).hexdigest()
+        assert sorted(p.name for p in db_path.parent.iterdir() if p.name.startswith(db_path.name)) == [db_path.name]
+
+
+class TestFirstImportEndsInWal:
+    """A first import onto a file the writer may switch ends in WAL, whatever
+    state the (new, tableless or stamp-only) file started in."""
+
+    def test_a_new_file(self, db_path, resolved):
+        assert not db_path.exists()
+        result = import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        assert result.created is True
+        assert db_path.read_bytes()[18:20] == b"\x02\x02"
+
+    def test_a_valid_tableless_rollback_journal_file(self, db_path, resolved):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+        conn.close()
+        assert db_path.read_bytes()[18:20] == b"\x01\x01"
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        assert db_path.read_bytes()[18:20] == b"\x02\x02"
+        assert state(db_path)[1]
+
+    def test_a_file_whose_only_table_is_an_empty_alembic_version(self, db_path, resolved):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(_STAMP_TABLE_DDL)
+        conn.commit()
+        conn.close()
+        result = import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        assert result.head_revision == EXPECTED_HEAD
+        assert db_path.read_bytes()[18:20] == b"\x02\x02"
+        assert sql(db_path, "SELECT version_num FROM alembic_version") == [(EXPECTED_HEAD,)]
+
+    def test_a_zero_byte_file_is_refused_not_switched(self, db_path, resolved):
+        """The preflight, not the gate, decides about a zero-byte file."""
+        db_path.write_bytes(b"")
+        with pytest.raises(ConfigDbNotADatabase):
+            import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        assert db_path.read_bytes() == b""
+
+
+class TestUnrecordedTableSubsets:
+    """Item 10.5: `SchemaSplitBrain` only when the unrecorded tables are EXACTLY
+    this package's; any strict subset, alone or beside foreign tables, is
+    someone else's database (a lone `datasets` table must not be told to
+    `alembic stamp head`)."""
+
+    OURS = sorted(t for t in Base.metadata.tables if t != "alembic_version")
+
+    def _build(self, db: Path, names, *foreign: str) -> None:
+        conn = sqlite3.connect(str(db))
+        for name in (*names, *foreign):
+            conn.execute(f"CREATE TABLE {name} (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+        os.chmod(db, 0o660)
+
+    def _all_refuse_unchanged(self, db_path, resolved, expected):
+        before = fingerprint(db_path)
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(expected) as excinfo:
+                check_schema(conn)
+        for call in (upgrade_schema, lambda r: import_yaml(EXAMPLE_YAML, r)):
+            with pytest.raises(expected):
+                call(resolved)
+        dispose_all()
+        assert fingerprint(db_path) == before
+        return excinfo.value
+
+    def test_a_lone_datasets_table_is_not_a_config_database(self, db_path, resolved):
+        self._build(db_path, ["datasets"])
+        exc = self._all_refuse_unchanged(db_path, resolved, NotAConfigDatabase)
+        assert not isinstance(exc, SchemaSplitBrain)
+        assert "(tables: datasets)" in str(exc)
+        assert "alembic stamp" not in str(exc)
+
+    @pytest.mark.parametrize("missing", OURS)
+    def test_all_of_ours_but_one_is_not_a_config_database(self, db_path, resolved, missing):
+        self._build(db_path, [t for t in self.OURS if t != missing])
+        exc = self._all_refuse_unchanged(db_path, resolved, NotAConfigDatabase)
+        assert missing not in str(exc)
+
+    def test_a_subset_of_ours_beside_a_foreign_table_is_not_a_config_database(
+        self, db_path, resolved
+    ):
+        self._build(db_path, ["datasets", "destinations"], "orders")
+        exc = self._all_refuse_unchanged(db_path, resolved, NotAConfigDatabase)
+        assert "orders" in str(exc)
+
+    def test_all_of_ours_beside_a_foreign_table_is_not_a_config_database(self, db_path, resolved):
+        self._build(db_path, self.OURS, "orders")
+        self._all_refuse_unchanged(db_path, resolved, NotAConfigDatabase)
+
+    def test_exactly_all_of_ours_and_no_stamp_is_split_brain(self, db_path, resolved):
+        self._build(db_path, self.OURS)
+        exc = self._all_refuse_unchanged(db_path, resolved, SchemaSplitBrain)
+        assert "alembic stamp" in str(exc)
+        assert not isinstance(exc, NotAConfigDatabase)
+
+    def test_all_of_ours_and_an_empty_stamp_table_is_still_split_brain(self, db_path, resolved):
+        """`alembic_version` itself is not application data."""
+        self._build(db_path, self.OURS)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(_STAMP_TABLE_DDL)
+        conn.commit()
+        conn.close()
+        self._all_refuse_unchanged(db_path, resolved, SchemaSplitBrain)
+
+
+class TestSchemaVersionMismatchWording:
+    """Item 10.5: the text no longer claims the file is certainly from a newer
+    package -- a foreign Alembic database lands here too."""
+
+    def test_the_message(self, db_path, resolved):
+        make_alembic_foreign(db_path, "foreign_rev")
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(SchemaVersionMismatch) as excinfo:
+                check_schema(conn)
+        dispose_all()
+        message = str(excinfo.value)
+        assert message == (
+            f"Database schema is at revision 'deadbeef0001', which this installed "
+            f"zfsbackup package (migrations head {EXPECTED_HEAD!r}) does not "
+            f"recognise. {db_path} was written by a newer zfsbackup package, or is "
+            f"not a zfsbackup config database; nothing was changed. If it is ours, "
+            f"upgrade the zfsbackup package installed on this host before opening "
+            f"it again; otherwise point -c at the config database."
+        )
+
+    def test_the_first_unknown_revision_in_sorted_order_is_named(self, db_path, resolved):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(_STAMP_TABLE_DDL)
+        conn.execute("INSERT INTO alembic_version VALUES ('zzzz')")
+        conn.execute("INSERT INTO alembic_version VALUES ('aaaa')")
+        conn.commit()
+        conn.close()
+        with open_config_connection(resolved, readonly=True) as c:
+            with pytest.raises(SchemaVersionMismatch, match="revision 'aaaa'"):
+                check_schema(c)
+        dispose_all()

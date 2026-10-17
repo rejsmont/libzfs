@@ -42,20 +42,71 @@ export unwrapped 1; `migrate --check` exiting 0 when behind 2; no restart hint
 4; no-op reported as a migration 3; `--check` migrating 4; `dispose_all` not
 registered 4; log handler left attached 6 / level not restored 1;
 KeyboardInterrupt unmapped 1.
+
+Item 10.4 (same method; failing tests across the store, store-upgrade, CLI and
+daemon files): bare `RuntimeError` mapped to 78 3 / labelled an installation
+error 2; corrupt-body `DatabaseError` not 78 8 / not routed through
+`config_error_message` 1; retry note added for an unusable database 1;
+`SchemaOutOfDate` given the daemon's sentence by the CLI 2; `migrate` success
+text reverted 3; `--check` verdict prefix dropped 2; cleanup note printed twice
+1; ^C notes not printed 4 / import ^C worded as plain "interrupted" 5 / hint
+without `-c` 3 / hint not shell-quoted 1; backup fd left open when `fchmod`
+fails 2 / only `OSError` cleaned up 2 / directory not fsynced 3; `export -o`
+link replaced by rename (clobbers a mid-run target) 11 / `--force` symlink not
+followed 2 / dangling symlink not refused (`exists` for `lexists`) 1 / mode not
+kept 2 / temp left behind 6 / no-hard-link fallback dropped 2 / `OSError` not
+wrapped 2. Store side: no-revision tables not refused 22 / `upgrade_schema`
+migrating an empty file 3 / foreign -> split-brain 8 / ours-only -> foreign 7;
+reader switching to WAL 15 / writer ignoring the foreign-table guard 9 / reader
+warning per connection 1 / never 6; `in_transaction` guard removed 1;
+`MigrationPackagingError` a `SchemaError` 8 / a bare `RuntimeError` 2; the
+daemon sentence dropped 3 / added to every `SchemaError` 4; interrupted-import
+wording 3 + 2 + 3. Re-adding `session.expunge_all()` to importer phase 3 fails 0
+tests (the claim that it guarded nothing observable holds).
+
+Item 10.5 (same method; failing tests across `test_zfsbackup_store.py`,
+`test_zfsbackup_store_upgrade.py` and this file): writer always switches to WAL
+43 / empty `alembic_version` + foreign tables switched 34 / any recorded
+revision switched 13 / `alembic_version` without `version_num` switched 4 /
+the 10.4 "has an `alembic_version` table" rule 20 / subset of our tables
+reported as split-brain 9 / hard-coded known-revision set 8 / mismatch wording
+reverted 2 / reader warning wording reverted 6; `export --force` renames over a
+FIFO 5 / in-place open with `O_CREAT|O_TRUNC` 1 / temp name derived from the
+target 5 / `fchown` EPERM not ignored 1 / every `OSError` ignored 1 / `fchmod`
+before `fchown` 1 / no `fchown` 2 / mode not kept 3 / tolerated directory-fsync
+errnos emptied 6 / every directory-fsync error tolerated 3 / export directory
+not fsynced 3 / directory fsync before the rename 3 / temp not removed on
+failure 11; `is_database_unusable` as `isinstance` 12 / damaged message not cut
+to one line 1 / descriptor not cleared before `fdopen` 1 (export) + 1 (backup);
+`_without_applied_claim` the identity 8 / notes not trimmed 4 / empty notes
+printed 1; SIGTERM: second signal not ignored 2 / handler not restored 4 /
+parse-time Abort not remapped 4 / "seen" flag never set 4 / exit 130 for
+SIGTERM 2 / worded "interrupted" 6 / flag not reset per `main()` 3 / handler
+not installed 7; `migrate` restart text reverted 3. Any SQLAlchemyError other than
+OperationalError, IntegrityError and a bare DatabaseError (e.g. ProgrammingError) is
+an internal error: exit 1, no SQL, no sqlalche.me link.
 """
 
 import configparser
+import errno
+import gc
 import hashlib
 import io
 import logging
 import os
 import re
+import select
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
 import sys
+import textwrap
+import threading
+import time
 import tomllib
+import warnings
 import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -65,7 +116,8 @@ import click
 import pytest
 import yaml
 from click.testing import CliRunner
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy import exc as sa_exc
+from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError, SQLAlchemyError
 
 from zfsbackup.cli import errors as cli_errors
 from zfsbackup.cli import main as cli_main
@@ -79,13 +131,18 @@ from zfsbackup.config.store import (
     ConfigPathError,
     EXPECTED_HEAD,
     ImportResult,
+    KNOWN_REVISIONS,
+    MigrationPackagingError,
+    NotAConfigDatabase,
     OutgoingConfigUnreadable,
     SchemaIntegrityError,
     SchemaOutOfDate,
+    SchemaSplitBrain,
     SchemaUpgrade,
     SchemaVersionMismatch,
     dispose_all,
 )
+from zfsbackup.config.store import migrate as store_migrate
 from zfsbackup.config.store import paths as store_paths
 
 REPO = Path(__file__).resolve().parent.parent
@@ -100,6 +157,13 @@ check_interval: "5m"
 datasets:
 {datasets}
 """
+
+
+#: What `migrate` prints after a real upgrade (item 10.5 wording).
+RESTART_HINT = (
+    "Restart any running zfsbackup daemon now -- it is still running the old "
+    "schema check."
+)
 
 
 def mini_yaml(path: Path, prefix: str = "mini", names=("tank/a",)) -> Path:
@@ -219,6 +283,68 @@ def blank_sqlite(path: Path) -> Path:
     conn.execute("DROP TABLE t")
     conn.commit()
     conn.close()
+    return path
+
+
+#: The id of the synthetic second revision `stacked_revision` stacks on the head.
+SYNTH = "bbbbbbbbbbbb"
+
+_SYNTH_REVISION = '''"""synthetic revision for tests"""
+revision = "{rid}"
+down_revision = "{down}"
+branch_labels = None
+depends_on = None
+
+import sqlalchemy as sa
+from alembic import op
+
+
+def upgrade():
+    with op.batch_alter_table("datasets") as batch:
+        batch.add_column(sa.Column("note", sa.Text(), nullable=True))
+
+
+def downgrade():
+    pass
+'''
+
+
+@pytest.fixture
+def stacked_revision(tmp_path, monkeypatch):
+    """Factory: after `stacked_revision()` the installed package "expects" a
+    second revision, so a database built at the real head is genuinely *behind*.
+    Copies the real migrations tree and moves `_MIGRATIONS_DIR`, `EXPECTED_HEAD`
+    and `KNOWN_REVISIONS` together (see test_zfsbackup_store_upgrade.py)."""
+
+    def make() -> Path:
+        scripts = tmp_path / "scripts"
+        shutil.copytree(
+            store_migrate._MIGRATIONS_DIR, scripts,
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+        (scripts / "versions" / "synth.py").write_text(
+            _SYNTH_REVISION.format(rid=SYNTH, down=EXPECTED_HEAD)
+        )
+        monkeypatch.setattr(store_migrate, "_MIGRATIONS_DIR", scripts)
+        monkeypatch.setattr(store_migrate, "EXPECTED_HEAD", SYNTH)
+        monkeypatch.setattr(store_migrate, "KNOWN_REVISIONS", frozenset(KNOWN_REVISIONS | {SYNTH}))
+        return scripts
+
+    return make
+
+
+def foreign_sqlite(path: Path, *, wal: bool = False) -> Path:
+    """A rollback-journal SQLite file holding an unrelated `orders` table (the
+    item-10 review's reproduction): not a zfsbackup config database."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    if wal:
+        conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, x TEXT)")
+    conn.execute("INSERT INTO orders VALUES (1, 'a')")
+    conn.commit()
+    conn.close()
+    os.chmod(path, 0o660)
     return path
 
 
@@ -596,8 +722,18 @@ class TestErrorMapping:
             (SchemaOutOfDate("x"), 78),
             (SchemaVersionMismatch("x"), 78),
             (SchemaIntegrityError("x"), 78),
-            (RuntimeError("scripts disagree"), 78),
+            (NotAConfigDatabase("x"), 78),
+            (SchemaSplitBrain("x"), 78),
+            (MigrationPackagingError("scripts disagree"), 78),
+            # Item 10.4: only MigrationPackagingError is an installation
+            # problem; a bare RuntimeError is a bug.
+            (RuntimeError("scripts disagree"), 1),
             (SQLAlchemyError("x"), 1),
+            # A valid header over a corrupt body / a file that is not SQLite:
+            # the FILE is unusable (78); a constraint is the input (1).
+            (DatabaseError("s", {}, Exception("database disk image is malformed")), 78),
+            (DatabaseError("s", {}, Exception("file is not a database")), 78),
+            (IntegrityError("s", {}, Exception("UNIQUE constraint failed: datasets.name")), 1),
         ],
         ids=lambda v: v if isinstance(v, int) else type(v).__name__,
     )
@@ -634,13 +770,53 @@ class TestErrorMapping:
         assert "Traceback (most recent call last)" in buf.getvalue()
         assert buf.getvalue().startswith("error: deep")
 
-    def test_bare_runtime_error_is_labelled_an_installation_error(self):
+    def test_migration_packaging_error_is_labelled_an_installation_error(self):
         buf = io.StringIO()
-        code = cli_errors.report(RuntimeError("two heads"), None, stream=buf)
+        code = cli_errors.report(MigrationPackagingError("two heads"), None, stream=buf)
         assert code == 78
         out = buf.getvalue()
         assert out.startswith("installation error: two heads")
-        assert "reinstall zfsbackup" in out
+        assert "Reinstall zfsbackup." in out
+        # Item 10.4: the report does not claim anything about the database
+        # (migrate refuses before opening it, but import may have run phase 2).
+        assert "not touched" not in out
+
+    def test_bare_runtime_error_is_an_internal_error_not_an_installation_error(self):
+        buf = io.StringIO()
+        code = cli_errors.report(RuntimeError("some bug"), None, stream=buf)
+        assert code == 1
+        out = buf.getvalue()
+        assert out.startswith("internal error: some bug")
+        assert "installation" not in out
+        assert "-v" in out
+
+    def test_schema_out_of_date_is_printed_as_the_stores_own_text(self):
+        """The daemon's `config_error_message` would append "start the daemon
+        again", which is wrong advice for the CLI."""
+        text = "/x/config.db is at schema revision a; this package expects b. Run `zfsbackup-config migrate`."
+        buf = io.StringIO()
+        assert cli_errors.report(SchemaOutOfDate(text), None, stream=buf) == 78
+        assert buf.getvalue() == f"error: {text}\n"
+        assert "daemon" not in buf.getvalue()
+
+    def test_not_a_config_database_is_printed_verbatim_with_exit_78(self):
+        buf = io.StringIO()
+        assert cli_errors.report(NotAConfigDatabase("not a zfsbackup config database"), None, stream=buf) == 78
+        assert buf.getvalue() == "error: not a zfsbackup config database\n"
+
+    @pytest.mark.parametrize("reason", ["database disk image is malformed", "file is not a database"])
+    def test_unusable_database_goes_through_the_daemons_wording(self, reason):
+        """A `DatabaseError` that is not Integrity/Operational shares the
+        daemon's "Failed to read the config database" message."""
+        exc = DatabaseError("SELECT 1", {}, Exception(reason))
+        assert cli_errors.is_database_unusable(exc)
+        assert not cli_errors.is_database_unusable(IntegrityError("s", {}, Exception("x")))
+        assert not cli_errors.is_database_unusable(OperationalError("s", {}, Exception("x")))
+        assert not cli_errors.is_database_unusable(ValueError("x"))
+        buf = io.StringIO()
+        assert cli_errors.report(exc, None, stream=buf) == 78
+        assert buf.getvalue().startswith("error: ")
+        assert reason in buf.getvalue()
 
     def test_schema_errors_are_not_installation_errors(self):
         buf = io.StringIO()
@@ -707,16 +883,28 @@ class TestErrorMappingThroughTheCli:
         assert result.exit_code == 78
         assert result.stderr.startswith("error: newer database")
 
-    def test_bare_runtime_error_is_an_installation_error(self, run, db, monkeypatch):
+    def test_migration_packaging_error_is_an_installation_error(self, run, db, monkeypatch):
         import_ok(run, db)
 
         def packaging_defect(resolved):
-            raise RuntimeError("migration scripts disagree with EXPECTED_HEAD")
+            raise MigrationPackagingError("migration scripts disagree with EXPECTED_HEAD")
 
         monkeypatch.setattr(cli_main, "upgrade_schema", packaging_defect)
         result = run("migrate", "-c", db)
         assert result.exit_code == 78
         assert "installation error: migration scripts disagree" in result.stderr
+
+    def test_bare_runtime_error_is_an_internal_error_exit_1(self, run, db, monkeypatch):
+        import_ok(run, db)
+
+        def bug(resolved):
+            raise RuntimeError("something else entirely")
+
+        monkeypatch.setattr(cli_main, "upgrade_schema", bug)
+        result = run("migrate", "-c", db)
+        assert result.exit_code == 1
+        assert "internal error: something else entirely" in result.stderr
+        assert "installation error" not in result.stderr
 
     def test_unknown_exception_does_not_traceback_without_v(self, run, db, failing_import):
         failing_import(ZeroDivisionError("bug"))
@@ -1346,11 +1534,31 @@ class TestExport:
         run("export", "-c", db)
         assert digest(db) == before
 
-    def test_export_from_a_database_behind_the_schema_is_78(self, run, db):
+    def test_export_from_an_empty_database_is_78_and_points_at_import(self, run, db):
+        """No recorded revision and no tables: `migrate` would refuse (it never
+        creates a database), so the store's text points at `import`."""
         blank_sqlite(db)
+        before = digest(db)
         result = run("export", "-c", db)
         assert result.exit_code == 78
-        assert "zfsbackup-config migrate" in result.stderr
+        assert "has no recorded schema revision (it holds no configuration tables)" in result.stderr
+        assert "`zfsbackup-config import`" in result.stderr
+        assert "zfsbackup-config migrate" not in result.stderr
+        assert digest(db) == before
+
+    def test_export_from_a_database_behind_the_schema_is_78_and_points_at_migrate(
+        self, run, db, stacked_revision
+    ):
+        import_ok(run, db)
+        stacked_revision()
+        before = digest(db)
+        result = run("export", "-c", db)
+        assert result.exit_code == 78
+        assert f"is at schema revision {EXPECTED_HEAD}; this package expects {SYNTH}." in result.stderr
+        assert "Run `zfsbackup-config migrate`." in result.stderr
+        # The store's text only: the daemon's "start the daemon again" is not CLI advice.
+        assert "daemon" not in result.stderr
+        assert digest(db) == before
 
     def test_export_ends_with_a_single_newline_and_is_stable(self, run, db):
         import_ok(run, db)
@@ -1386,36 +1594,78 @@ class TestMigrate:
         assert digest(db) == before
         assert sidecars(db) == []
 
-    def test_no_recorded_revision_check_fails_with_exit_1(self, run, db):
+    def test_empty_database_check_fails_with_exit_1_and_points_at_import(self, run, db):
         blank_sqlite(db)
         before = digest(db)
         result = run("migrate", "--check", "-c", db)
         assert result.exit_code == 1
-        assert "no recorded Alembic revision" in result.stderr
-        assert "zfsbackup-config migrate" in result.stderr
+        assert result.stderr.startswith("error: the schema is not up to date: ")
+        assert "has no recorded schema revision (it holds no configuration tables)" in result.stderr
+        assert "`zfsbackup-config import`" in result.stderr
+        assert "zfsbackup-config migrate" not in result.stderr
+        assert "daemon" not in result.stderr
         assert digest(db) == before
 
-    def test_no_recorded_revision_migrate_upgrades_and_says_to_restart(self, run, db):
+    def test_check_on_a_database_behind_prints_the_stores_text_after_the_verdict(
+        self, run, db, stacked_revision
+    ):
+        import_ok(run, db)
+        stacked_revision()
+        before = digest(db)
+        result = run("migrate", "--check", "-c", db)
+        assert result.exit_code == 1
+        assert result.stderr == (
+            f"error: the schema is not up to date: {db} is at schema revision "
+            f"{EXPECTED_HEAD}; this package expects {SYNTH}. Run `zfsbackup-config migrate`.\n"
+        )
+        assert digest(db) == before
+
+    def test_migrate_refuses_an_empty_file_with_78_and_does_not_initialise_it(self, run, db):
+        """Item 10.4: `migrate` only upgrades a recorded, known revision; an
+        empty (tableless) file is `import`'s to create. It used to be
+        initialised here."""
         blank_sqlite(db)
+        before = digest(db)
+        result = run("migrate", "-c", db)
+        assert result.exit_code == 78
+        assert "no recorded schema revision" in result.stderr
+        assert "nothing to migrate" in result.stderr
+        assert "`zfsbackup-config import`" in result.stderr
+        assert "Migrated" not in result.stdout
+        assert digest(db) == before
+        with raw_db(db) as conn:
+            assert conn.execute("SELECT name FROM sqlite_master").fetchall() == []
+
+    def test_migrate_upgrades_a_database_behind_and_says_to_restart_the_daemon(
+        self, run, db, stacked_revision
+    ):
+        import_ok(run, db)
+        before_export = exported(run, db)
+        stacked_revision()
         result = run("migrate", "-c", db)
         assert result.exit_code == 0, result.stderr
-        assert f"from none (no recorded revision) to {EXPECTED_HEAD}" in result.stdout
-        assert "Restart a running zfsbackup daemon" in result.stdout
-        # ...and the next check is clean, and the next migrate is a no-op.
+        assert f"from {EXPECTED_HEAD} to {SYNTH}" in result.stdout
+        assert RESTART_HINT in result.stdout
+        assert "will stop at its next worker restart" not in result.stdout
+        # ...and the next check is clean, the next migrate is a no-op, and
+        # the stored configuration was kept.
         again = run("migrate", "--check", "-c", db)
         assert again.exit_code == 0
         assert "up to date" in again.stdout
         noop = run("migrate", "-c", db)
-        assert "up to date" in noop.stdout and "Restart" not in noop.stdout
+        assert "up to date" in noop.stdout and "daemon" not in noop.stdout
+        assert exported(run, db) == before_export
 
-    def test_migrated_database_can_be_imported_over_and_exported(self, run, db):
-        blank_sqlite(db)
+    def test_migrated_database_can_be_imported_over_and_exported(self, run, db, stacked_revision):
+        import_ok(run, db, TEST_YAML)
+        stacked_revision()
         assert run("migrate", "-c", db).exit_code == 0
         assert run("import", EXAMPLE_YAML, "-c", db).exit_code == 0
         assert "libzfs_test/ROOT/macos" in exported(run, db)
 
-    def test_check_never_changes_a_database_that_is_behind(self, run, db):
-        blank_sqlite(db)
+    def test_check_never_changes_a_database_that_is_behind(self, run, db, stacked_revision):
+        import_ok(run, db)
+        stacked_revision()
         before = digest(db)
         run("migrate", "--check", "-c", db)
         run("migrate", "--check", "-c", db)
@@ -1442,7 +1692,6 @@ class TestMigrate:
         [
             (("aaaa",), "from aaaa to bbbb"),
             (("aaaa", "cccc"), "from aaaa, cccc to bbbb"),
-            ((), "from none (no recorded revision) to bbbb"),
         ],
     )
     def test_from_to_message(self, run, db, monkeypatch, from_revs, expected):
@@ -1454,7 +1703,7 @@ class TestMigrate:
         result = run("migrate", "-c", db)
         assert result.exit_code == 0
         assert expected in result.stdout
-        assert "Restart a running zfsbackup daemon" in result.stdout
+        assert RESTART_HINT in result.stdout
 
     def test_unchanged_upgrade_prints_up_to_date_without_restart_hint(
         self, run, db, monkeypatch
@@ -1469,7 +1718,7 @@ class TestMigrate:
         assert "Restart" not in result.stdout
 
     def test_foreign_key_failure_is_78_and_rolls_back(self, run, db, monkeypatch):
-        blank_sqlite(db)
+        import_ok(run, db)
         before = digest(db)
 
         def broken(resolved):
@@ -1505,6 +1754,754 @@ class TestMigrate:
             holder.execute("ROLLBACK")
             holder.close()
         assert result.exit_code == 0, result.stderr
+
+
+# --------------------------------------------------------------------------
+# item 10.4 -- a database that is not ours is never touched
+# --------------------------------------------------------------------------
+
+
+def _foreign_snapshot(database: Path):
+    """Everything an operator could notice changing: the full bytes, the
+    journal-mode header bytes 18-19, `sqlite_master`, and the directory."""
+    raw = database.read_bytes()
+    with raw_db(database) as conn:
+        master = conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_master").fetchall()
+    return raw, (raw[18], raw[19]), master, sorted(os.listdir(database.parent))
+
+
+class TestForeignDatabase:
+    """The item-10 review's reproduction: `-c other.db <command>` on a
+    rollback-journal SQLite file with an unrelated table used to convert it to
+    WAL (readers) or graft zfsbackup's schema into it and stamp it
+    (`migrate`/`import`). Now every command refuses with exit 78 and leaves the
+    file byte-for-byte alone."""
+
+    @pytest.mark.parametrize(
+        "args",
+        [["export"], ["migrate", "--check"], ["migrate"], ["import", EXAMPLE_YAML]],
+        ids=["export", "migrate-check", "migrate", "import"],
+    )
+    def test_every_command_refuses_a_foreign_database_and_changes_nothing(self, run, db, args):
+        foreign_sqlite(db)
+        before = _foreign_snapshot(db)
+        assert before[1] == (1, 1)  # rollback journal
+
+        result = run(*args, "-c", db)
+
+        assert result.exit_code == 78, result.stderr
+        assert "not a zfsbackup config database" in result.stderr
+        assert "orders" in result.stderr
+        assert "Traceback" not in result.stderr
+        assert "retry" not in result.stderr.lower()
+        assert result.stdout == ""
+        assert _foreign_snapshot(db) == before
+        assert backups(db) == [] and sidecars(db) == []
+
+    def test_a_reader_reports_the_journal_mode_once_but_does_not_change_it(self, run, db):
+        foreign_sqlite(db)
+        result = run("export", "-c", db)
+        assert result.exit_code == 78
+        warns = [l for l in stderr_lines(result) if "is not in WAL mode" in l]
+        assert len(warns) == 1
+        assert warns[0].startswith("warning: ")
+        assert "(journal_mode=delete)" in warns[0]
+        assert warns[0].endswith(
+            "readers and writers will block each other. "
+            "(A zfsbackup-config write switches a zfsbackup config database to WAL.)"
+        )
+        # 10.5: a foreign file never gets a switch, so the warning must not
+        # promise one.
+        assert "will switch" not in warns[0]
+        assert db.read_bytes()[18:20] == b"\x01\x01"
+
+    def test_a_foreign_database_that_is_already_wal_is_refused_too(self, run, db):
+        foreign_sqlite(db, wal=True)
+        before = db.read_bytes()
+        for args in (["export"], ["migrate", "--check"], ["migrate"], ["import", EXAMPLE_YAML]):
+            result = run(*args, "-c", db)
+            assert result.exit_code == 78, (args, result.stderr)
+            assert "not a zfsbackup config database" in result.stderr
+        dispose_all()
+        with raw_db(db) as conn:
+            assert [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")] == ["orders"]
+        assert db.read_bytes()[18:20] == b"\x02\x02"
+        assert before[18:20] == b"\x02\x02"
+
+    def test_ours_mixed_with_a_foreign_table_and_no_revision_is_not_a_config_database(
+        self, run, db
+    ):
+        from zfsbackup.config.store.models import Base
+        from sqlalchemy import create_engine
+
+        foreign_sqlite(db)
+        engine = create_engine(f"sqlite:///{db}")
+        Base.metadata.create_all(engine)
+        engine.dispose()
+        before = _foreign_snapshot(db)
+        for args in (["export"], ["migrate", "--check"], ["migrate"], ["import", EXAMPLE_YAML]):
+            result = run(*args, "-c", db)
+            assert result.exit_code == 78, (args, result.stderr)
+            assert "not a zfsbackup config database" in result.stderr
+        assert _foreign_snapshot(db) == before
+
+    def test_only_our_tables_and_no_revision_is_still_split_brain(self, run, db):
+        """Kept deliberately: our tables with the stamp lost is a different,
+        recoverable state with its own message."""
+        from zfsbackup.config.store.models import Base
+        from sqlalchemy import create_engine
+
+        db.parent.mkdir(parents=True)
+        engine = create_engine(f"sqlite:///{db}")
+        Base.metadata.create_all(engine)
+        engine.dispose()
+        for args in (["export"], ["migrate", "--check"], ["migrate"]):
+            result = run(*args, "-c", db)
+            assert result.exit_code == 78, (args, result.stderr)
+            assert "no recorded Alembic revision" in result.stderr
+            assert "not a zfsbackup config database" not in result.stderr
+
+    def test_an_export_from_a_real_config_database_in_rollback_journal_mode_is_not_modified(
+        self, run, db
+    ):
+        """The reader change on OUR database: a config database that somehow is
+        in `delete` mode is read, reported, and left in that mode."""
+        import_ok(run, db)
+        dispose_all()
+        conn = sqlite3.connect(db)
+        assert conn.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
+        conn.close()
+        before = db.read_bytes()
+        assert before[18:20] == b"\x01\x01"
+
+        result = run("export", "-c", db)
+
+        assert result.exit_code == 0, result.stderr
+        assert "datasets:" in result.stdout
+        assert db.read_bytes() == before
+        assert len([l for l in stderr_lines(result) if "is not in WAL mode" in l]) == 1
+
+
+class TestCorruptDatabaseBody:
+    """A valid 100-byte SQLite header over garbage pages raises a
+    `DatabaseError` ("database disk image is malformed") that is neither an
+    `OperationalError` nor an `IntegrityError`: it used to fall through to
+    exit 1 with an internal error."""
+
+    @pytest.fixture
+    def corrupt(self, run, db):
+        import_ok(run, db)
+        dispose_all()
+        data = db.read_bytes()
+        assert db.with_name(db.name + "-wal").exists() is False
+        db.write_bytes(data[:100] + os.urandom(len(data) - 100))
+        return db
+
+    @pytest.mark.parametrize(
+        "args",
+        [["export"], ["migrate", "--check"], ["migrate"], ["import", EXAMPLE_YAML]],
+        ids=["export", "migrate-check", "migrate", "import"],
+    )
+    def test_is_78_with_the_daemons_wording_and_no_retry_note(self, run, corrupt, args):
+        result = run(*args, "-c", corrupt)
+        assert result.exit_code == 78, result.stderr
+        assert "database disk image is malformed" in result.stderr
+        assert "Traceback" not in result.stderr
+        assert "internal error" not in result.stderr
+        # An import over an existing database normally appends "a retry
+        # replaces whatever is in the database"; that is for failures AFTER
+        # the write began, not for an unreadable file.
+        assert "replaces whatever is in the database" not in result.stderr
+        assert backups(corrupt) == []
+
+    @pytest.mark.parametrize(
+        "args",
+        [["export"], ["migrate", "--check"], ["migrate"], ["import", EXAMPLE_YAML]],
+        ids=["export", "migrate-check", "migrate", "import"],
+    )
+    def test_a_failed_connect_leaks_no_connection(self, run, corrupt, args):
+        """Item 10.6: the failed connect used to leave its sqlite3 connection
+        open inside a reference cycle (an fd per command until the cyclic GC
+        ran), reported as `ResourceWarning: unclosed database` when it was
+        finally collected. Forced collection inside a recording window makes
+        the leak visible; `-W error::ResourceWarning` runs see it too."""
+        gc.collect()  # earlier tests' garbage is not this command's leak
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = run(*args, "-c", corrupt)
+            exit_code, stderr = result.exit_code, result.stderr
+            del result  # its exc_info would keep the leaked frames alive
+            dispose_all()
+            gc.collect()
+            leaked = [str(w.message) for w in caught if issubclass(w.category, ResourceWarning)]
+        assert exit_code == 78, stderr
+        assert leaked == []
+
+    def test_the_message_is_the_daemons_wording_naming_the_file_and_its_source(self, run, corrupt):
+        """Not the raw SQLAlchemy text: `config_error_message` names the
+        database and how it was chosen, as the daemon's own log line does."""
+        result = run("export", "-c", corrupt)
+        (line,) = [l for l in stderr_lines(result) if not l.startswith("warning: ")]
+        assert line.startswith(f"error: the config database {corrupt.resolve()}")
+        assert "(via -c/--config)" in line
+        assert line.endswith(
+            "is damaged or not an SQLite database: database disk image is "
+            "malformed; restore it from a backup."
+        )
+        # One line, SQLite's own words: no SQL statement, no SQLAlchemy link.
+        assert "SELECT" not in line and "sqlalche.me" not in line
+        assert "Failed to load configuration" not in line
+
+
+class TestFirstImportCleanupNote:
+    def test_the_skipped_cleanup_text_is_printed_exactly_once(self, run, db, monkeypatch):
+        """The store logs the skip AND attaches the same text to the exception
+        (`add_note`); the CLI shows the note, so the log line is dropped."""
+        from zfsbackup.config.store import importer as importer_module
+
+        held = []
+
+        def attach_reader_then_fail(session, config):
+            conn = sqlite3.connect(str(db))
+            conn.execute("SELECT count(*) FROM alembic_version").fetchall()
+            held.append(conn)
+            raise ValueError("late failure")
+
+        monkeypatch.setattr(importer_module, "save_config", attach_reader_then_fail)
+        try:
+            result = run("import", EXAMPLE_YAML, "-c", db)
+        finally:
+            for conn in held:
+                conn.close()
+
+        assert result.exit_code == 1
+        assert db.exists()  # the cleanup really was skipped
+        assert result.stderr.count("NOT removed") == 1
+        assert result.stderr.count("Failed first import") <= 1
+        lines = stderr_lines(result)
+        assert "error: late failure" in lines
+        note = [l for l in lines if "NOT removed" in l]
+        assert len(note) == 1 and str(db) in note[0]
+        assert not any(l.startswith("warning: ") and "NOT removed" in l for l in lines)
+
+
+class TestInterruptedImport:
+    """^C can land before, inside or just after the commit; the CLI says so
+    instead of asserting either outcome."""
+
+    @pytest.fixture
+    def interrupted(self, monkeypatch):
+        def install(*notes):
+            exc = KeyboardInterrupt()
+            for note in notes:
+                exc.add_note(note)
+
+            def fake(*args, **kwargs):
+                raise exc
+
+            monkeypatch.setattr(cli_main, "import_yaml", fake)
+
+        return install
+
+    def test_exit_130_prints_the_notes_and_does_not_assert_an_outcome(self, run, db, interrupted):
+        interrupted("a note from the store")
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 130
+        lines = stderr_lines(result)
+        assert lines[0].startswith("interrupted -- the import may or may not have been applied")
+        assert "a note from the store" in lines
+        assert lines.index("a note from the store") > 0
+        assert "Traceback" not in result.stderr
+        assert "not replaced" not in result.stderr and "NOT applied" not in result.stderr
+
+    def test_a_non_default_database_is_named_with_dash_c_in_the_export_hint(
+        self, run, db, interrupted
+    ):
+        interrupted()
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        resolved_path = store_paths.resolve_config_path(str(db)).path
+        assert f"run `zfsbackup-config -c {resolved_path} export` to check" in result.stderr
+
+    def test_a_path_with_spaces_is_shell_quoted(self, run, tmp_path, interrupted):
+        interrupted()
+        spaced = tmp_path / "a dir" / "config.db"
+        result = run("import", EXAMPLE_YAML, "-c", spaced)
+        resolved_path = store_paths.resolve_config_path(str(spaced)).path
+        assert f"`zfsbackup-config -c '{resolved_path}' export`" in result.stderr
+
+    def test_the_default_database_needs_no_dash_c(self, run, interrupted):
+        interrupted()
+        result = run("import", EXAMPLE_YAML)
+        assert result.exit_code == 130
+        assert "run `zfsbackup-config export` to check" in result.stderr
+        assert " -c " not in result.stderr
+
+    def test_the_environment_variable_counts_as_non_default(self, run, db, interrupted):
+        interrupted()
+        result = run("import", EXAMPLE_YAML, env={CONFIG_PATH_ENV: str(db)})
+        assert result.exit_code == 130
+        assert "`zfsbackup-config -c " in result.stderr
+
+    def test_other_commands_just_say_interrupted(self, run, db, monkeypatch):
+        import_ok(run, db)
+        exc = KeyboardInterrupt()
+        exc.add_note("export note")
+
+        def boom(resolved):
+            raise exc
+
+        monkeypatch.setattr(cli_main, "load_runtime_config", boom)
+        result = run("export", "-c", db)
+        assert result.exit_code == 130
+        lines = stderr_lines(result)
+        assert lines[0] == "interrupted"
+        assert "export note" in lines
+        assert "may or may not" not in result.stderr
+
+    @staticmethod
+    def _interrupt_after_commit(monkeypatch):
+        """^C lands just after phase 3's COMMIT returned (kbint.py in the
+        item-10 review): the wrapper re-raises after the real session closed."""
+        from zfsbackup.config.store import importer as importer_module
+
+        real = importer_module.open_config_session
+
+        @contextmanager
+        def wrapper(*args, **kwargs):
+            with real(*args, **kwargs) as session:
+                yield session
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(importer_module, "open_config_session", wrapper)
+
+    def test_a_first_import_interrupted_after_the_commit_keeps_the_database_and_does_not_say_not_applied(
+        self, run, db, monkeypatch
+    ):
+        self._interrupt_after_commit(monkeypatch)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+
+        assert result.exit_code == 130
+        assert db.exists()  # the import DID commit; cleanup must not remove it
+        text = result.stderr
+        assert "may or may not have been applied" in text
+        assert "NOT applied" not in text
+        assert "was left intact" in text
+        # ...and the hint is truthful here: export shows the configuration.
+        monkeypatch.undo()
+        assert "libzfs_test/ROOT/macos" in exported(run, db)
+
+    def test_a_reimport_interrupted_after_the_commit_names_the_backup_and_both_outcomes(
+        self, run, db, monkeypatch
+    ):
+        import_ok(run, db, TEST_YAML)
+        self._interrupt_after_commit(monkeypatch)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+
+        assert result.exit_code == 130
+        (backup,) = backups(db)
+        assert f"already written to {backup}" in result.stderr
+        assert "may or may not have been applied" in result.stderr
+        assert "was not replaced" not in result.stderr
+        monkeypatch.undo()
+        assert "libzfs_test/ROOT/macos" in exported(run, db)  # it was applied
+
+
+# --------------------------------------------------------------------------
+# item 10.4 -- the pre-import backup writer
+# --------------------------------------------------------------------------
+
+
+class TestBackupWriterHygiene:
+    @pytest.fixture
+    def writer(self, db):
+        db.parent.mkdir(parents=True)
+        db.touch()
+        return cli_main._backup_writer(store_paths.resolve_config_path(str(db)))
+
+    @pytest.fixture
+    def config(self):
+        return BackupConfig.from_file(EXAMPLE_YAML)
+
+    @pytest.fixture
+    def fds(self, monkeypatch):
+        """The descriptors `_create_exclusive` handed out."""
+        seen = []
+        real = cli_main._create_exclusive
+
+        def spy(*args, **kwargs):
+            fd, path = real(*args, **kwargs)
+            seen.append(fd)
+            return fd, path
+
+        monkeypatch.setattr(cli_main, "_create_exclusive", spy)
+        return seen
+
+    @staticmethod
+    def _is_open(fd: int) -> bool:
+        try:
+            os.fstat(fd)
+            return True
+        except OSError:
+            return False
+
+    def test_the_file_descriptor_is_closed_when_fchmod_fails(
+        self, writer, config, db, fds, monkeypatch
+    ):
+        def failing(fd, mode):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "fchmod", failing)
+        with pytest.raises(cli_errors.BackupFailed) as excinfo:
+            writer(config)
+
+        assert "Nothing was replaced" in str(excinfo.value)
+        assert "--no-backup" in str(excinfo.value)
+        (fd,) = fds
+        assert not self._is_open(fd)
+        assert backups(db) == []
+
+    def test_a_partial_file_is_unlinked_and_the_fd_closed_on_keyboard_interrupt(
+        self, writer, config, db, fds, monkeypatch
+    ):
+        def interrupt(fd):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(os, "fsync", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            writer(config)
+
+        assert backups(db) == []
+        assert sorted(os.listdir(db.parent)) == [db.name]
+        (fd,) = fds
+        assert not self._is_open(fd)
+
+    def test_an_interrupt_between_creation_and_the_write_leaves_nothing_and_no_open_fd(
+        self, writer, config, db, fds, monkeypatch
+    ):
+        """The window the old `except OSError` could not cover: the fd exists
+        but the file object does not yet own it."""
+
+        def interrupt(fd, mode):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(os, "fchmod", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            writer(config)
+        assert backups(db) == []
+        (fd,) = fds
+        assert not self._is_open(fd)
+
+    def test_the_directory_is_fsynced_after_the_file(self, writer, config, db, monkeypatch):
+        synced = []
+        real = os.fsync
+
+        def recording(fd):
+            kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+            synced.append(kind)
+            return real(fd)
+
+        monkeypatch.setattr(os, "fsync", recording)
+        path = writer(config)
+
+        assert synced == ["file", "dir"]
+        assert path.exists() and path.parent == db.parent
+        assert stat.S_IMODE(path.stat().st_mode) == cli_main.BACKUP_MODE
+
+    def test_the_synced_directory_is_the_databases_directory(self, writer, config, db, monkeypatch):
+        opened = []
+        real = os.open
+
+        def recording(path, flags, *a, **k):
+            if flags == os.O_RDONLY:
+                opened.append(Path(path))
+            return real(path, flags, *a, **k)
+
+        monkeypatch.setattr(os, "open", recording)
+        writer(config)
+        assert db.parent in opened
+
+    def test_a_failing_directory_fsync_is_a_backup_failure_that_removes_the_file(
+        self, writer, config, db, monkeypatch
+    ):
+        real = os.fsync
+
+        def failing_for_dirs(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(5, "Input/output error")
+            return real(fd)
+
+        monkeypatch.setattr(os, "fsync", failing_for_dirs)
+        with pytest.raises(cli_errors.BackupFailed, match="cannot write the pre-import backup"):
+            writer(config)
+        assert backups(db) == []
+
+    def test_a_clean_write_leaves_exactly_one_backup(self, writer, config, db):
+        path = writer(config)
+        assert backups(db) == [path]
+        assert yaml.safe_load(path.read_text())["datasets"]
+
+
+# --------------------------------------------------------------------------
+# item 10.4 -- export -o is atomic
+# --------------------------------------------------------------------------
+
+
+EXPORT_TEMP_PREFIX = ".zfsbackup-export."
+
+
+def _temp_files(directory: Path):
+    """The export's sibling temp files (`tempfile.mkstemp(prefix=...)`), item
+    10.5. The prefix is not derived from the target name any more, so a leaked
+    one is found by prefix alone."""
+    return sorted(p.name for p in directory.iterdir() if p.name.startswith(EXPORT_TEMP_PREFIX))
+
+
+class TestExportOutputFile:
+    @pytest.fixture
+    def populated(self, run, db):
+        import_ok(run, db)
+        return db
+
+    def test_the_file_is_written_whole_and_no_temp_file_is_left(self, run, populated, tmp_path):
+        out = tmp_path / "out.yaml"
+        result = run("export", "-c", populated, "-o", out)
+        assert result.exit_code == 0, result.stderr
+        assert out.read_text() == exported(run, populated)
+        assert _temp_files(tmp_path) == []
+        assert f"to {out}." in result.stderr
+
+    def test_the_file_is_never_written_in_place(self, run, populated, tmp_path, monkeypatch):
+        """The content goes to a sibling temp file first; the target only ever
+        appears by link/rename."""
+        out = tmp_path / "out.yaml"
+        opened = []
+        real = os.open
+
+        def recording(path, flags, *a, **k):
+            if flags & os.O_CREAT:
+                opened.append(Path(path))
+            return real(path, flags, *a, **k)
+
+        monkeypatch.setattr(os, "open", recording)
+        assert run("export", "-c", populated, "-o", out).exit_code == 0
+        assert out not in opened
+        (temp,) = opened
+        assert temp.parent == tmp_path and temp.name.startswith(EXPORT_TEMP_PREFIX)
+
+    def test_a_new_file_gets_the_usual_mode_for_the_umask(self, run, populated, tmp_path):
+        out = tmp_path / "out.yaml"
+        old = os.umask(0o027)
+        try:
+            assert run("export", "-c", populated, "-o", out).exit_code == 0
+        finally:
+            os.umask(old)
+        assert stat.S_IMODE(out.stat().st_mode) == 0o640
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_an_oserror_leaves_the_target_untouched_and_removes_the_temp(
+        self, run, populated, tmp_path, monkeypatch, force
+    ):
+        out = tmp_path / "out.yaml"
+        if force:
+            out.write_text("precious\n")
+
+        def disk_full(fd):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(os, "fsync", disk_full)
+        result = run("export", "-c", populated, "-o", out, *(["--force"] if force else []))
+
+        assert result.exit_code == 1
+        assert "cannot write" in result.stderr and "No space left on device" in result.stderr
+        assert "Any existing file was left untouched" in result.stderr
+        assert "Traceback" not in result.stderr
+        assert _temp_files(tmp_path) == []
+        if force:
+            assert out.read_text() == "precious\n"
+        else:
+            assert not out.exists()
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_keyboard_interrupt_leaves_the_target_untouched_and_removes_the_temp(
+        self, run, populated, tmp_path, monkeypatch, force
+    ):
+        out = tmp_path / "out.yaml"
+        if force:
+            out.write_text("precious\n")
+
+        def interrupt(fd):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(os, "fsync", interrupt)
+        result = run("export", "-c", populated, "-o", out, *(["--force"] if force else []))
+
+        assert result.exit_code == 130
+        assert _temp_files(tmp_path) == []
+        if force:
+            assert out.read_text() == "precious\n"
+        else:
+            assert not out.exists()
+
+    @staticmethod
+    def _creations(monkeypatch):
+        created = []
+        real = os.open
+
+        def recording(path, flags, *a, **k):
+            if flags & os.O_CREAT:
+                created.append(Path(path).name)
+            return real(path, flags, *a, **k)
+
+        monkeypatch.setattr(os, "open", recording)
+        return created
+
+    def test_an_existing_target_is_refused_without_force(self, run, populated, tmp_path, monkeypatch):
+        out = tmp_path / "out.yaml"
+        out.write_text("mine\n")
+        created = self._creations(monkeypatch)
+        result = run("export", "-c", populated, "-o", out)
+        assert result.exit_code == 1
+        assert f"{out} already exists; use --force to overwrite it" in result.stderr
+        assert out.read_text() == "mine\n"
+        assert _temp_files(tmp_path) == []
+        assert created == []  # refused up front: no temp file was even created
+
+    def test_a_target_that_appears_mid_run_is_not_clobbered_without_force(
+        self, run, populated, tmp_path, monkeypatch
+    ):
+        """The check-then-rename race: the final step is a hard link, which
+        fails if the name exists. A plain `os.replace` would overwrite it."""
+        out = tmp_path / "out.yaml"
+        real = os.fsync
+
+        def intruder(fd):
+            real(fd)
+            if not out.exists():
+                out.write_text("someone else's file\n")
+
+        monkeypatch.setattr(os, "fsync", intruder)
+        result = run("export", "-c", populated, "-o", out)
+
+        assert result.exit_code == 1
+        assert "already exists; use --force to overwrite it" in result.stderr
+        assert out.read_text() == "someone else's file\n"
+        assert _temp_files(tmp_path) == []
+
+    def test_without_hard_link_support_it_falls_back_to_a_rename(
+        self, run, populated, tmp_path, monkeypatch
+    ):
+        out = tmp_path / "out.yaml"
+
+        def no_links(src, dst, *a, **k):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "link", no_links)
+        result = run("export", "-c", populated, "-o", out)
+        assert result.exit_code == 0, result.stderr
+        assert out.read_text() == exported(run, populated)
+        assert _temp_files(tmp_path) == []
+
+    def test_the_rename_fallback_still_refuses_an_existing_target(
+        self, run, populated, tmp_path, monkeypatch
+    ):
+        out = tmp_path / "out.yaml"
+        real = os.fsync
+
+        def intruder(fd):
+            real(fd)
+            if not out.exists():
+                out.write_text("someone else's file\n")
+
+        def no_links(src, dst, *a, **k):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "fsync", intruder)
+        monkeypatch.setattr(os, "link", no_links)
+        result = run("export", "-c", populated, "-o", out)
+        assert result.exit_code == 1
+        assert "already exists; use --force" in result.stderr
+        assert out.read_text() == "someone else's file\n"
+        assert _temp_files(tmp_path) == []
+
+    def test_force_replaces_the_content_and_keeps_the_existing_mode(
+        self, run, populated, tmp_path
+    ):
+        out = tmp_path / "out.yaml"
+        out.write_text("old\n")
+        os.chmod(out, 0o600)
+        old = os.umask(0o000)
+        try:
+            result = run("export", "-c", populated, "-o", out, "--force")
+        finally:
+            os.umask(old)
+        assert result.exit_code == 0, result.stderr
+        assert out.read_text() == exported(run, populated)
+        assert stat.S_IMODE(out.stat().st_mode) == 0o600
+        assert _temp_files(tmp_path) == []
+
+    def test_force_follows_a_symlink_and_keeps_it_a_symlink(self, run, populated, tmp_path):
+        real_file = tmp_path / "real.yaml"
+        real_file.write_text("old\n")
+        os.chmod(real_file, 0o640)
+        link = tmp_path / "link.yaml"
+        link.symlink_to(real_file)
+
+        result = run("export", "-c", populated, "-o", link, "--force")
+
+        assert result.exit_code == 0, result.stderr
+        assert link.is_symlink() and os.readlink(link) == str(real_file)
+        assert real_file.read_text() == exported(run, populated)
+        assert stat.S_IMODE(real_file.stat().st_mode) == 0o640
+        assert _temp_files(tmp_path) == []
+
+    def test_a_symlink_is_refused_without_force_and_left_alone(self, run, populated, tmp_path):
+        real_file = tmp_path / "real.yaml"
+        real_file.write_text("old\n")
+        link = tmp_path / "link.yaml"
+        link.symlink_to(real_file)
+        result = run("export", "-c", populated, "-o", link)
+        assert result.exit_code == 1
+        assert "already exists" in result.stderr
+        assert real_file.read_text() == "old\n"
+
+    def test_a_dangling_symlink_is_refused_without_force(self, run, populated, tmp_path, monkeypatch):
+        target = tmp_path / "nowhere.yaml"
+        link = tmp_path / "dangling.yaml"
+        link.symlink_to(target)
+        assert not link.exists() and link.is_symlink()
+        created = self._creations(monkeypatch)
+
+        result = run("export", "-c", populated, "-o", link)
+
+        assert created == []  # `lexists`, not `exists`: refused before any write
+
+        assert result.exit_code == 1
+        assert f"{link} already exists; use --force to overwrite it" in result.stderr
+        assert not target.exists()
+        assert link.is_symlink()
+        assert _temp_files(tmp_path) == []
+
+    def test_force_through_a_dangling_symlink_creates_its_target(self, run, populated, tmp_path):
+        """What the `open(O_CREAT|O_TRUNC)` this replaced did."""
+        target = tmp_path / "nowhere.yaml"
+        link = tmp_path / "dangling.yaml"
+        link.symlink_to(target)
+        result = run("export", "-c", populated, "-o", link, "--force")
+        assert result.exit_code == 0, result.stderr
+        assert link.is_symlink()
+        assert target.read_text() == exported(run, populated)
+
+    def test_a_relative_output_path_lands_in_the_working_directory(self, run, populated, tmp_path):
+        result = run("export", "-c", populated, "-o", "rel.yaml")
+        assert result.exit_code == 0, result.stderr
+        assert (tmp_path / "rel.yaml").read_text() == exported(run, populated)
+        assert _temp_files(tmp_path) == []
+
+    def test_output_dash_is_still_stdout(self, run, populated, tmp_path):
+        result = run("export", "-c", populated, "-o", "-")
+        assert result.exit_code == 0
+        assert result.stdout == exported(run, populated)
+        assert not (tmp_path / "-").exists()
 
 
 # --------------------------------------------------------------------------
@@ -1605,3 +2602,1344 @@ class TestPackaging:
             capture_output=True, text=True, timeout=120,
         )
         assert missing.returncode == 78
+
+
+# --------------------------------------------------------------------------
+# item 10.5 -- foreign Alembic databases are never switched to WAL
+# --------------------------------------------------------------------------
+
+_STAMP_DDL = "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+
+
+def alembic_foreign(path: Path, variant: str) -> Path:
+    """The 10.5 review's reproduction (`foreign_alembic.py`): a rollback-journal
+    file that is Alembic-managed, but not by us."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    if variant in ("foreign_rev", "empty_alembic"):
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, x TEXT)")
+        conn.execute("INSERT INTO orders VALUES (1, 'a')")
+    conn.execute(_STAMP_DDL)
+    if variant == "foreign_rev":
+        conn.execute("INSERT INTO alembic_version VALUES ('deadbeef0001')")
+    elif variant == "mixed_rows":
+        conn.execute(f"INSERT INTO alembic_version VALUES ('{EXPECTED_HEAD}')")
+        conn.execute("INSERT INTO alembic_version VALUES ('deadbeef0001')")
+    conn.commit()
+    conn.close()
+    os.chmod(path, 0o660)
+    return path
+
+
+class TestForeignAlembicDatabase:
+    """Item 10.5 (M-1R). The writer engine used to switch to WAL any file with
+    an `alembic_version` table, so `migrate`/`import` converted a foreign
+    Alembic-managed database and then refused it with "nothing was changed"."""
+
+    ARGS = pytest.mark.parametrize(
+        "args",
+        [["export"], ["migrate", "--check"], ["migrate"], ["import", EXAMPLE_YAML]],
+        ids=["export", "migrate-check", "migrate", "import"],
+    )
+
+    @ARGS
+    @pytest.mark.parametrize("variant", ["foreign_rev", "empty_alembic", "mixed_rows"])
+    def test_every_command_refuses_and_the_file_is_byte_for_byte_unchanged(
+        self, run, db, args, variant
+    ):
+        alembic_foreign(db, variant)
+        before = _foreign_snapshot(db)
+        sha = digest(db)
+        assert before[1] == (1, 1)
+
+        result = run(*args, "-c", db)
+
+        assert result.exit_code == 78, result.stderr
+        assert result.stdout == ""
+        assert "Traceback" not in result.stderr
+        assert digest(db) == sha
+        assert _foreign_snapshot(db) == before
+        assert db.read_bytes()[18:20] == b"\x01\x01"
+        assert backups(db) == [] and sidecars(db) == []
+
+    @pytest.mark.parametrize(
+        "variant, fragment",
+        [
+            ("foreign_rev", "revision 'deadbeef0001'"),
+            ("mixed_rows", "revision 'deadbeef0001'"),
+            ("empty_alembic", "not a zfsbackup config database"),
+        ],
+    )
+    def test_the_refusal_names_the_right_problem(self, run, db, variant, fragment):
+        alembic_foreign(db, variant)
+        result = run("migrate", "-c", db)
+        assert fragment in result.stderr
+        assert "nothing was changed" in result.stderr
+
+    def test_a_file_whose_only_table_is_an_empty_alembic_version_is_still_imported_into(
+        self, run, db
+    ):
+        """A stamp-only file is an unfinished initial migration: `import`
+        migrates it (on the unswitched file) and the next engine, seeing a
+        known revision, switches it. So the import ENDS in WAL (10.6)."""
+        db.parent.mkdir(parents=True)
+        conn = sqlite3.connect(db)
+        conn.execute(_STAMP_DDL)
+        conn.commit()
+        conn.close()
+        assert db.read_bytes()[18:20] == b"\x01\x01"
+        import_ok(run, db)
+        assert db.read_bytes()[18:20] == b"\x02\x02"
+        assert "libzfs_test/ROOT/macos" in exported(run, db)
+
+    def test_migrate_refuses_the_stamp_only_file_and_leaves_it_untouched(self, run, db):
+        """10.6: `migrate` promises "nothing was changed" for a stamp-only
+        file, so the writer engine no longer switches it to WAL first."""
+        db.parent.mkdir(parents=True)
+        conn = sqlite3.connect(db)
+        conn.execute(_STAMP_DDL)
+        conn.commit()
+        conn.close()
+        before = db.read_bytes()
+        sha = hashlib.sha256(before).hexdigest()
+        result = run("migrate", "-c", db)
+        assert result.exit_code == 78
+        assert "nothing to migrate" in result.stderr
+        assert db.read_bytes()[18:20] == b"\x01\x01"
+        assert hashlib.sha256(db.read_bytes()).hexdigest() == sha
+        assert db.read_bytes() == before
+        assert backups(db) == [] and sidecars(db) == []
+
+    @pytest.mark.parametrize("prepare", ["new", "tableless"])
+    def test_a_first_import_ends_in_wal(self, run, db, prepare):
+        if prepare == "tableless":
+            db.parent.mkdir(parents=True)
+            conn = sqlite3.connect(db)
+            conn.execute("PRAGMA user_version=1")
+            conn.commit()
+            conn.close()
+            assert db.read_bytes()[18:20] == b"\x01\x01"
+        else:
+            assert not db.exists()
+        import_ok(run, db)
+        assert db.read_bytes()[18:20] == b"\x02\x02"
+        assert "libzfs_test/ROOT/macos" in exported(run, db)
+
+
+class TestTableSubsetsThroughTheCli:
+    """A strict subset of our tables is somebody else's database: 78, "not a
+    zfsbackup config database", never split-brain advice."""
+
+    OURS = sorted(
+        t for t in __import__("zfsbackup.config.store.models", fromlist=["Base"]).Base.metadata.tables
+        if t != "alembic_version"
+    )
+
+    @staticmethod
+    def build(path: Path, *names: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path)
+        for name in names:
+            conn.execute(f"CREATE TABLE {name} (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+        os.chmod(path, 0o660)
+
+    @pytest.mark.parametrize(
+        "names",
+        [("datasets",), ("datasets", "orders"), tuple(OURS[:-1])],
+        ids=["lone-datasets", "subset-plus-foreign", "all-but-one"],
+    )
+    def test_a_subset_is_not_a_config_database_and_not_split_brain(self, run, db, names):
+        self.build(db, *names)
+        before = _foreign_snapshot(db)
+        for args in (["export"], ["migrate", "--check"], ["migrate"], ["import", EXAMPLE_YAML]):
+            result = run(*args, "-c", db)
+            assert result.exit_code == 78, (args, result.stderr)
+            assert "not a zfsbackup config database" in result.stderr
+            assert "alembic stamp" not in result.stderr
+        assert _foreign_snapshot(db) == before
+
+    def test_exactly_all_of_ours_without_a_stamp_is_split_brain(self, run, db):
+        self.build(db, *self.OURS)
+        before = _foreign_snapshot(db)
+        for args in (["export"], ["migrate", "--check"], ["migrate"]):
+            result = run(*args, "-c", db)
+            assert result.exit_code == 78, (args, result.stderr)
+            assert "no recorded Alembic revision" in result.stderr
+            assert "alembic stamp" in result.stderr
+            assert "not a zfsbackup config database" not in result.stderr
+        assert _foreign_snapshot(db) == before
+
+
+class TestSchemaVersionMismatchThroughTheCli:
+    def test_a_newer_database_gets_the_new_wording_and_is_untouched(self, run, db):
+        import_ok(run, db)
+        with raw_db(db) as conn:
+            conn.execute("UPDATE alembic_version SET version_num = 'ffffffffffff'")
+        before = digest(db)
+        result = run("migrate", "-c", db)
+        assert result.exit_code == 78
+        assert (
+            "was written by a newer zfsbackup package, or is not a zfsbackup config "
+            "database; nothing was changed. If it is ours, upgrade the zfsbackup "
+            "package installed on this host before opening it again; otherwise "
+            "point -c at the config database."
+        ) in result.stderr
+        assert digest(db) == before
+
+
+# --------------------------------------------------------------------------
+# item 10.5 -- export -o onto something that is not a regular file
+# --------------------------------------------------------------------------
+
+
+class _FifoReader(threading.Thread):
+    """Drains a FIFO from a thread so the CLI's blocking `open(O_WRONLY)` has a
+    reader. Opened non-blocking and bounded by a deadline: if the code under
+    test regresses to rename-over the FIFO, this times out instead of hanging
+    the suite."""
+
+    def __init__(self, path: Path, deadline: float = 20.0) -> None:
+        super().__init__(daemon=True)
+        self.path = path
+        self.deadline = deadline
+        self.data = b""
+        self.opened = threading.Event()
+
+    def run(self) -> None:
+        fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+        self.opened.set()
+        try:
+            end = time.monotonic() + self.deadline
+            seen = False
+            while time.monotonic() < end:
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(fd, 65536)
+                except BlockingIOError:
+                    continue
+                if chunk:
+                    self.data += chunk
+                    seen = True
+                elif seen:
+                    return  # EOF after data: the writer closed
+                else:
+                    time.sleep(0.01)  # EOF before any writer attached
+        finally:
+            os.close(fd)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+class TestExportOntoAFifo:
+    @pytest.fixture
+    def populated(self, run, db):
+        import_ok(run, db)
+        return db
+
+    @pytest.fixture
+    def fifo(self, tmp_path):
+        path = tmp_path / "pipe"
+        os.mkfifo(path)
+        return path
+
+    def test_force_writes_in_place_and_it_stays_a_fifo(self, run, populated, fifo, tmp_path):
+        expected = exported(run, populated)
+        reader = _FifoReader(fifo)
+        reader.start()
+        assert reader.opened.wait(10)
+
+        result = run("export", "-c", populated, "-o", fifo, "--force")
+        reader.join(30)
+
+        assert result.exit_code == 0, result.stderr
+        assert not reader.is_alive()
+        assert reader.data.decode() == expected
+        assert stat.S_ISFIFO(os.stat(fifo).st_mode)
+        assert not fifo.is_symlink()
+        assert _temp_files(tmp_path) == []
+
+    def test_force_through_a_symlink_to_a_fifo_writes_in_place_too(
+        self, run, populated, fifo, tmp_path
+    ):
+        link = tmp_path / "link"
+        link.symlink_to(fifo)
+        expected = exported(run, populated)
+        reader = _FifoReader(fifo)
+        reader.start()
+        assert reader.opened.wait(10)
+
+        result = run("export", "-c", populated, "-o", link, "--force")
+        reader.join(30)
+
+        assert result.exit_code == 0, result.stderr
+        assert reader.data.decode() == expected
+        assert link.is_symlink() and stat.S_ISFIFO(os.stat(fifo).st_mode)
+        assert _temp_files(tmp_path) == []
+
+    def test_force_never_calls_the_temp_file_machinery(self, run, populated, fifo, monkeypatch):
+        """Not O_CREAT and not O_TRUNC: the in-place path opens `O_WRONLY` only."""
+        flags_seen = []
+        real = os.open
+
+        def recording(path, flags, *a, **k):
+            if os.fspath(path) == os.path.realpath(fifo):
+                flags_seen.append(flags)
+            return real(path, flags, *a, **k)
+
+        monkeypatch.setattr(os, "open", recording)
+        monkeypatch.setattr(
+            cli_main.tempfile, "mkstemp",
+            lambda *a, **k: pytest.fail("a temp file was created for a FIFO"),
+        )
+        reader = _FifoReader(fifo)
+        reader.start()
+        assert reader.opened.wait(10)
+        # The reader's own open also goes through `os.open` (O_NONBLOCK); only
+        # the writer's matters.
+        run("export", "-c", populated, "-o", fifo, "--force")
+        reader.join(30)
+        writer_flags = [f for f in flags_seen if not f & os.O_NONBLOCK]
+        assert writer_flags and all(
+            f & os.O_ACCMODE == os.O_WRONLY and not f & (os.O_CREAT | os.O_TRUNC)
+            for f in writer_flags
+        )
+
+    def test_without_force_a_fifo_is_refused_and_untouched(self, run, populated, fifo, tmp_path):
+        result = run("export", "-c", populated, "-o", fifo)
+        assert result.exit_code == 1
+        assert f"{fifo} already exists; use --force to overwrite it" in result.stderr
+        assert stat.S_ISFIFO(os.stat(fifo).st_mode)
+        assert _temp_files(tmp_path) == []
+
+    def test_an_unwritable_special_file_is_a_clean_error(self, run, populated, fifo, tmp_path):
+        os.chmod(fifo, 0o444)
+        result = run("export", "-c", populated, "-o", fifo, "--force")
+        assert result.exit_code == 1
+        assert f"error: cannot write {fifo}:" in result.stderr
+        assert "Traceback" not in result.stderr
+        assert stat.S_ISFIFO(os.stat(fifo).st_mode)
+        assert _temp_files(tmp_path) == []
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0 or not os.path.exists("/dev/null"),
+    reason="never exercised as root, and needs /dev/null",
+)
+class TestExportOntoACharacterDevice:
+    def test_force_to_dev_null_writes_in_place_and_leaves_the_device_alone(
+        self, run, db, tmp_path
+    ):
+        import_ok(run, db)
+        before = os.stat("/dev/null")
+        assert stat.S_ISCHR(before.st_mode)
+
+        result = run("export", "-c", db, "-o", "/dev/null", "--force")
+
+        assert result.exit_code == 0, result.stderr
+        after = os.stat("/dev/null")
+        assert stat.S_ISCHR(after.st_mode)
+        assert (after.st_dev, after.st_ino, after.st_rdev, after.st_mode) == (
+            before.st_dev, before.st_ino, before.st_rdev, before.st_mode
+        )
+        assert not [n for n in os.listdir("/dev") if n.startswith(EXPORT_TEMP_PREFIX)]
+        assert _temp_files(tmp_path) == []
+
+    def test_without_force_dev_null_is_refused(self, run, db):
+        import_ok(run, db)
+        result = run("export", "-c", db, "-o", "/dev/null")
+        assert result.exit_code == 1
+        assert "/dev/null already exists; use --force to overwrite it" in result.stderr
+        assert stat.S_ISCHR(os.stat("/dev/null").st_mode)
+
+
+# --------------------------------------------------------------------------
+# item 10.5 -- export -o: names, ownership, durability
+# --------------------------------------------------------------------------
+
+
+class TestWriteOutputRestoresTheUmask:
+    """`_write_output` reads the umask by setting it to 0, which is a
+    process-wide window: a signal (or any error) landing before the restore
+    would leave the whole process, daemon children included, at umask 0."""
+
+    @pytest.fixture
+    def umask(self):
+        old = os.umask(0o027)
+        try:
+            yield 0o027
+        finally:
+            os.umask(old)
+
+    @staticmethod
+    def _current_umask():
+        value = os.umask(0)
+        os.umask(value)
+        return value
+
+    @pytest.mark.parametrize("exc_type", [KeyboardInterrupt, OSError, cli_main._Terminated])
+    def test_an_interruption_between_the_two_umask_calls_restores_it(
+        self, tmp_path, monkeypatch, umask, exc_type
+    ):
+        target = tmp_path / "out.yaml"
+
+        def boom(fd, mode):
+            raise exc_type()
+
+        monkeypatch.setattr(cli_main.os, "fchmod", boom)
+        with pytest.raises(exc_type):
+            cli_main._write_output(str(target), "text", False)
+        assert self._current_umask() == umask
+        assert not target.exists()
+        assert [p.name for p in tmp_path.iterdir()] == []  # the temp file is removed too
+
+    def test_a_normal_write_restores_it_and_honours_it(self, tmp_path, umask):
+        target = tmp_path / "out.yaml"
+        cli_main._write_output(str(target), "text", False)
+        assert self._current_umask() == umask
+        assert stat.S_IMODE(target.stat().st_mode) == 0o666 & ~umask
+        assert target.read_text() == "text"
+
+
+class TestExportOutputFileDetails:
+    @pytest.fixture
+    def populated(self, run, db):
+        import_ok(run, db)
+        return db
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_a_245_character_name_works_and_leaves_no_temp(
+        self, run, populated, tmp_path, force
+    ):
+        """The old temp name was derived from the target's (`.<name>.tmp-...`),
+        so a name close to NAME_MAX made the TEMP name too long."""
+        if os.pathconf(tmp_path, "PC_NAME_MAX") < 250:
+            pytest.skip("filesystem NAME_MAX is too small for this test")
+        name = "n" * 240 + ".yaml"
+        assert len(name) == 245
+        out = tmp_path / name
+        if force:
+            out.write_text("old\n")
+        result = run("export", "-c", populated, "-o", out, *(["--force"] if force else []))
+        assert result.exit_code == 0, result.stderr
+        assert out.read_text() == exported(run, populated)
+        assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("n")) == [name]
+        assert _temp_files(tmp_path) == []
+
+    def test_the_temp_name_does_not_derive_from_the_target(self, run, populated, tmp_path, monkeypatch):
+        seen = []
+        real = cli_main.tempfile.mkstemp
+
+        def recording(*a, **k):
+            seen.append(k.get("prefix"))
+            return real(*a, **k)
+
+        monkeypatch.setattr(cli_main.tempfile, "mkstemp", recording)
+        assert run("export", "-c", populated, "-o", tmp_path / ("x" * 200)).exit_code == 0
+        assert seen == [EXPORT_TEMP_PREFIX]
+
+    def test_an_fchown_eperm_is_ignored_and_the_mode_is_kept(
+        self, run, populated, tmp_path, monkeypatch
+    ):
+        out = tmp_path / "out.yaml"
+        out.write_text("old\n")
+        os.chmod(out, 0o640)
+        old_stat = out.stat()
+        order = []
+        real_fchmod = os.fchmod
+
+        def denied(fd, uid, gid):
+            order.append(("fchown", uid, gid))
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+
+        def recording_fchmod(fd, mode):
+            order.append(("fchmod", mode))
+            return real_fchmod(fd, mode)
+
+        monkeypatch.setattr(os, "fchown", denied)
+        monkeypatch.setattr(os, "fchmod", recording_fchmod)
+
+        result = run("export", "-c", populated, "-o", out, "--force")
+
+        assert result.exit_code == 0, result.stderr
+        assert out.read_text() == exported(run, populated)
+        assert stat.S_IMODE(out.stat().st_mode) == 0o640
+        # chown first (it may clear set-id bits), then chmod puts them back.
+        assert order == [
+            ("fchown", old_stat.st_uid, old_stat.st_gid),
+            ("fchmod", 0o640),
+        ]
+        assert _temp_files(tmp_path) == []
+
+    def test_another_fchown_failure_is_not_swallowed(
+        self, run, populated, tmp_path, monkeypatch
+    ):
+        out = tmp_path / "out.yaml"
+        out.write_text("precious\n")
+
+        def broken(fd, uid, gid):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(os, "fchown", broken)
+        result = run("export", "-c", populated, "-o", out, "--force")
+        assert result.exit_code == 1
+        assert "cannot write" in result.stderr and "Input/output error" in result.stderr
+        assert out.read_text() == "precious\n"
+        assert _temp_files(tmp_path) == []
+
+    def test_a_new_file_is_not_chowned(self, run, populated, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            os, "fchown", lambda *a: pytest.fail("fchown on a file that did not exist")
+        )
+        assert run("export", "-c", populated, "-o", tmp_path / "new.yaml").exit_code == 0
+
+    def test_force_keeps_setid_free_modes_for_an_owner_only_file(self, run, populated, tmp_path):
+        out = tmp_path / "out.yaml"
+        out.write_text("old\n")
+        os.chmod(out, 0o400)
+        old = os.umask(0)
+        try:
+            result = run("export", "-c", populated, "-o", out, "--force")
+        finally:
+            os.umask(old)
+        assert result.exit_code == 0, result.stderr
+        assert stat.S_IMODE(out.stat().st_mode) == 0o400
+        assert out.read_text() == exported(run, populated)
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_the_directory_is_fsynced_after_the_file_lands(
+        self, run, populated, tmp_path, monkeypatch, force
+    ):
+        out = tmp_path / "out.yaml"
+        if force:
+            out.write_text("old\n")
+        events = []
+        real_fsync, real_link, real_replace = os.fsync, os.link, os.replace
+
+        def fsync(fd):
+            events.append("dir-fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file-fsync")
+            return real_fsync(fd)
+
+        def link(*a, **k):
+            events.append("link")
+            return real_link(*a, **k)
+
+        def replace(*a, **k):
+            events.append("replace")
+            return real_replace(*a, **k)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        monkeypatch.setattr(os, "link", link)
+        monkeypatch.setattr(os, "replace", replace)
+
+        assert run("export", "-c", populated, "-o", out, *(["--force"] if force else [])).exit_code == 0
+        assert events == ["file-fsync", "replace" if force else "link", "dir-fsync"]
+
+    @pytest.mark.parametrize("code", sorted({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}))
+    def test_a_filesystem_that_cannot_fsync_a_directory_is_tolerated(
+        self, run, populated, tmp_path, monkeypatch, code
+    ):
+        real = os.fsync
+
+        def fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(code, os.strerror(code))
+            return real(fd)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        out = tmp_path / "out.yaml"
+        result = run("export", "-c", populated, "-o", out)
+        assert result.exit_code == 0, result.stderr
+        assert out.read_text() == exported(run, populated)
+        assert "flushing its directory failed" not in result.stderr
+
+    def test_any_other_directory_fsync_failure_says_the_file_was_written(
+        self, run, populated, tmp_path, monkeypatch
+    ):
+        real = os.fsync
+
+        def fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "Input/output error")
+            return real(fd)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        out = tmp_path / "out.yaml"
+        result = run("export", "-c", populated, "-o", out)
+        assert result.exit_code == 1
+        assert (
+            f"error: {out} was written, but flushing its directory failed: "
+            "Input/output error. It may not survive a crash."
+        ) in result.stderr
+        assert "Any existing file was left untouched" not in result.stderr
+        assert out.exists()  # it IS there; only its durability is in doubt
+        assert _temp_files(tmp_path) == []
+
+    @pytest.mark.parametrize("code", sorted({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}))
+    def test_the_backup_writer_tolerates_the_same_directories(
+        self, run, db, monkeypatch, code
+    ):
+        import_ok(run, db, TEST_YAML)
+        real = os.fsync
+
+        def fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(code, os.strerror(code))
+            return real(fd)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 0, result.stderr
+        (backup,) = backups(db)
+        assert yaml.safe_load(backup.read_text())["datasets"]
+
+    def test_the_backup_writer_still_fails_on_a_real_directory_fsync_error(
+        self, run, db, monkeypatch
+    ):
+        import_ok(run, db, TEST_YAML)
+        before = exported(run, db)
+        real = os.fsync
+
+        def fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "Input/output error")
+            return real(fd)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 1
+        assert "cannot write the pre-import backup" in result.stderr
+        assert backups(db) == []
+        monkeypatch.undo()
+        assert exported(run, db) == before
+
+    @staticmethod
+    def _reuse_the_descriptor_number(monkeypatch):
+        """`os.fdopen` that hands back a file object which has ALREADY closed
+        the descriptor, immediately re-opens that number for someone else (the
+        lowest free descriptor is reused), and then raises ^C. Code that still
+        holds the old number and closes it again closes the stranger."""
+        victims = []
+        raws = []
+        real = os.fdopen
+
+        def fdopen(fd, *a, **k):
+            handle = real(fd, *a, **k)
+            handle.close()
+            victim = os.open(os.devnull, os.O_RDONLY)
+            raws.append(fd)
+            victims.append(victim)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(os, "fdopen", fdopen)
+        return raws, victims
+
+    def test_export_clears_its_descriptor_before_fdopen_takes_it_over(
+        self, run, tmp_path, db, monkeypatch
+    ):
+        import_ok(run, db)
+        raws, victims = self._reuse_the_descriptor_number(monkeypatch)
+        try:
+            result = run("export", "-c", db, "-o", tmp_path / "out.yaml")
+            assert result.exit_code == 130
+            assert victims and victims[0] == raws[0], "the descriptor number was not reused"
+            os.fstat(victims[0])  # still open: nobody closed it a second time
+        finally:
+            for victim in victims:
+                try:
+                    os.close(victim)
+                except OSError:
+                    pass
+        assert _temp_files(tmp_path) == []
+
+    def test_the_backup_writer_clears_its_descriptor_before_fdopen_takes_it_over(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "cfg" / "config.db"
+        target.parent.mkdir()
+        target.touch()
+        writer = cli_main._backup_writer(store_paths.resolve_config_path(str(target)))
+        config = BackupConfig.from_file(EXAMPLE_YAML)
+        raws, victims = self._reuse_the_descriptor_number(monkeypatch)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                writer(config)
+            assert victims and victims[0] == raws[0], "the descriptor number was not reused"
+            os.fstat(victims[0])
+        finally:
+            for victim in victims:
+                try:
+                    os.close(victim)
+                except OSError:
+                    pass
+        assert backups(target) == []
+
+
+# --------------------------------------------------------------------------
+# item 10.5 -- which database errors mean "the file is damaged"
+# --------------------------------------------------------------------------
+
+
+class TestDamagedDatabaseClassification:
+    @pytest.mark.parametrize(
+        "exc, unusable",
+        [
+            (DatabaseError("SELECT 1", {}, Exception("file is not a database")), True),
+            (sa_exc.ProgrammingError("SELECT 1", {}, Exception("no such column")), False),
+            (sa_exc.DataError("SELECT 1", {}, Exception("x")), False),
+            (sa_exc.InternalError("SELECT 1", {}, Exception("x")), False),
+            (sa_exc.NotSupportedError("SELECT 1", {}, Exception("x")), False),
+            (sa_exc.InterfaceError("SELECT 1", {}, Exception("x")), False),
+            (OperationalError("SELECT 1", {}, Exception("unable to open database file")), False),
+            (IntegrityError("INSERT", {}, Exception("UNIQUE constraint failed")), False),
+            (SQLAlchemyError("x"), False),
+            (ValueError("x"), False),
+        ],
+        ids=lambda v: type(v).__name__ if isinstance(v, BaseException) else str(v),
+    )
+    def test_only_a_plain_database_error_is_a_damaged_file(self, exc, unusable):
+        assert cli_errors.is_database_unusable(exc) is unusable
+        assert (cli_errors.exit_code_for(exc) == 78) is (
+            unusable or isinstance(exc, OperationalError)
+        )
+
+    def test_the_message_is_one_line_in_sqlites_own_words(self):
+        exc = DatabaseError(
+            "SELECT datasets.id FROM datasets", {}, Exception("database disk image is malformed\nsecond line")
+        )
+        resolved = store_paths.resolve_config_path("/tmp/does/not/matter.db")
+        (line,) = cli_errors.format_error(exc, resolved)
+        assert line.startswith("the config database ")
+        assert str(resolved.path) in line or "matter.db" in line
+        assert line.endswith(
+            "is damaged or not an SQLite database: database disk image is malformed; "
+            "restore it from a backup."
+        )
+        assert "\n" not in line
+        assert "SELECT" not in line and "sqlalche.me" not in line and "second line" not in line
+
+    @pytest.mark.parametrize("orig_message", ["", "   ", "\n"], ids=["empty", "blank", "newline"])
+    def test_an_empty_sqlite_message_falls_back_to_the_exception_type(self, orig_message):
+        """Item 10.6: `lines[0]` on an empty message was an IndexError, raised
+        from inside the error reporter itself."""
+        exc = DatabaseError("SELECT 1", {}, Exception(orig_message))
+        resolved = store_paths.resolve_config_path("/tmp/does/not/matter.db")
+        (line,) = cli_errors.format_error(exc, resolved)
+        assert line.endswith(
+            "is damaged or not an SQLite database: DatabaseError; restore it from a backup."
+        )
+        assert cli_errors._damaged_database_message(None, exc) == (
+            "the config database is damaged or not an SQLite database: "
+            "DatabaseError; restore it from a backup."
+        )
+
+    def test_an_exception_without_orig_and_without_text_names_its_type(self):
+        class Odd(Exception):
+            pass
+
+        assert cli_errors._damaged_database_message(None, Odd("")) == (
+            "the config database is damaged or not an SQLite database: "
+            "Odd; restore it from a backup."
+        )
+
+    def test_the_reporter_survives_an_empty_message_end_to_end(self, run, db):
+        import_ok(run, db)
+
+        def boom(resolved):
+            raise DatabaseError("SELECT 1", {}, Exception(""))
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(cli_main, "load_runtime_config", boom)
+            result = run("export", "-c", db)
+        assert result.exit_code == 78, result.stderr
+        assert "Traceback" not in result.stderr and "IndexError" not in result.stderr
+        assert "is damaged or not an SQLite database: DatabaseError;" in result.stderr
+
+    def test_without_a_resolved_path_the_subject_is_generic(self):
+        exc = DatabaseError("S", {}, Exception("file is not a database"))
+        (line,) = cli_errors.format_error(exc, None)
+        assert line == (
+            "the config database is damaged or not an SQLite database: "
+            "file is not a database; restore it from a backup."
+        )
+
+    def test_a_non_sqlite_file_through_the_cli_is_one_line_exit_78(self, run, db):
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b"SQLite format 3\x00" + os.urandom(4096))
+        before = digest(db)
+        result = run("export", "-c", db)
+        assert result.exit_code == 78, result.stderr
+        errors = [l for l in stderr_lines(result) if l.startswith("error:")]
+        assert len(errors) == 1
+        assert "sqlalche.me" not in result.stderr and "[SQL" not in result.stderr
+        assert "Traceback" not in result.stderr
+        assert digest(db) == before
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            sa_exc.ProgrammingError("SELECT oops", {}, Exception("no such column: oops")),
+            sa_exc.DataError("SELECT oops", {}, Exception("bad data")),
+            sa_exc.InternalError("SELECT oops", {}, Exception("internal")),
+        ],
+        ids=lambda e: type(e).__name__,
+    )
+    def test_a_statement_this_tool_built_wrongly_is_exit_1_and_not_called_damaged(
+        self, run, db, monkeypatch, exc
+    ):
+        import_ok(run, db)
+
+        def bug(resolved):
+            raise exc
+
+        monkeypatch.setattr(cli_main, "upgrade_schema", bug)
+        result = run("migrate", "-c", db)
+        assert result.exit_code == 1
+        assert "damaged" not in result.stderr
+        assert "restore it from a backup" not in result.stderr
+
+    def test_a_programming_error_is_labelled_an_internal_error(self, run, db, monkeypatch):
+        import_ok(run, db)
+
+        def bug(resolved):
+            raise sa_exc.ProgrammingError("SELECT oops", {}, Exception("no such column: oops"))
+
+        monkeypatch.setattr(cli_main, "upgrade_schema", bug)
+        result = run("migrate", "-c", db)
+        assert result.exit_code == 1
+        assert result.stderr.startswith("internal error: ")
+
+
+# --------------------------------------------------------------------------
+# item 10.5 -- ^C / SIGTERM wording
+# --------------------------------------------------------------------------
+
+
+class TestWithoutAppliedClaim:
+    BACKUP_NOTE = (
+        "A pre-import backup of the outgoing configuration was already written to "
+        "/x/c.db.pre-import-1.yaml; the import was interrupted; it may or may not have "
+        "been applied (run `zfsbackup-config export` to check)."
+    )
+    A11_NOTE = (
+        "Failed first import: /x/c.db was NOT removed (it now holds a configuration). "
+        "/x/c.db holds a configuration and was left intact; the import was "
+        "interrupted, so it may or may not have been applied (run "
+        "`zfsbackup-config export` to check)."
+    )
+
+    def test_the_backup_note_keeps_only_the_backup_fact(self):
+        assert cli_main._without_applied_claim(self.BACKUP_NOTE) == (
+            "A pre-import backup of the outgoing configuration was already written to "
+            "/x/c.db.pre-import-1.yaml."
+        )
+
+    def test_the_cleanup_note_keeps_only_what_was_left_intact(self):
+        trimmed = cli_main._without_applied_claim(self.A11_NOTE)
+        assert trimmed == (
+            "Failed first import: /x/c.db was NOT removed (it now holds a configuration). "
+            "/x/c.db holds a configuration and was left intact."
+        )
+        assert "may or may not" not in trimmed
+
+    def test_the_real_cleanup_note_keeps_the_never_delete_warning(self):
+        """The exact text `importer._cleanup_skipped` produces for an
+        interrupted first import whose file now holds a configuration. The
+        `Never delete its -wal/-shm files on their own.` sentence FOLLOWS the
+        "may or may not" clause and must survive it."""
+        from zfsbackup.config.store.importer import _cleanup_skipped
+
+        note = _cleanup_skipped(
+            Path("/x/c.db"), "it now holds a configuration", "imported", interrupted=True
+        )
+        assert note == (
+            "Failed first import: /x/c.db was NOT removed (it now holds a configuration). "
+            "/x/c.db holds a configuration and was left intact; the import was "
+            "interrupted, so it may or may not have been applied (run "
+            "`zfsbackup-config export` to check). "
+            "Never delete its -wal/-shm files on their own."
+        )
+        assert cli_main._without_applied_claim(note) == (
+            "Failed first import: /x/c.db was NOT removed (it now holds a configuration). "
+            "/x/c.db holds a configuration and was left intact. "
+            "Never delete its -wal/-shm files on their own."
+        )
+
+    def test_the_real_backup_note_loses_only_the_verdict(self):
+        """The backup note (`importer.import_yaml`) ENDS with the clause, so
+        nothing follows it."""
+        note = (
+            "A pre-import backup of the outgoing configuration was "
+            "already written to /x/c.db.pre-import-1.yaml; "
+            "the import was interrupted; it may or may not have "
+            "been applied (run `zfsbackup-config export` to check)."
+        )
+        assert cli_main._without_applied_claim(note) == (
+            "A pre-import backup of the outgoing configuration was "
+            "already written to /x/c.db.pre-import-1.yaml."
+        )
+
+    def test_a_trailing_sentence_after_the_clause_is_kept_verbatim(self):
+        note = "X was left; it may or may not have been applied (run foo). Keep this one. And this."
+        assert cli_main._without_applied_claim(note) == "X was left. Keep this one. And this."
+
+    def test_a_clause_without_a_closing_parenthesis_ends_at_the_sentence(self):
+        note = "X was left; it may or may not have been applied. Never delete -wal."
+        assert cli_main._without_applied_claim(note) == "X was left. Never delete -wal."
+
+    def test_a_clause_only_note_followed_by_a_sentence_keeps_the_sentence(self):
+        note = "it may or may not have been applied (run foo). Never delete its -wal/-shm files on their own."
+        assert cli_main._without_applied_claim(note) == (
+            "Never delete its -wal/-shm files on their own."
+        )
+
+    def test_a_note_without_the_claim_is_returned_unchanged(self):
+        note = "cleanup skipped: the file at X was left in place"
+        assert cli_main._without_applied_claim(note) == note
+
+    def test_a_note_that_is_only_the_claim_disappears(self):
+        assert cli_main._without_applied_claim("it may or may not have been applied") == ""
+
+    def test_a_semicolon_that_is_not_the_interrupted_clause_is_kept(self):
+        note = "kept fact; and another; it may or may not have been applied"
+        assert cli_main._without_applied_claim(note) == "kept fact; and another."
+
+
+class TestInterruptedImportSaysItOnce:
+    """The CLI states the "may or may not have been applied" verdict itself; the
+    store's notes keep their other facts but drop their copy of it."""
+
+    @staticmethod
+    def _interrupt_after_commit(monkeypatch, exc_type=KeyboardInterrupt):
+        from zfsbackup.config.store import importer as importer_module
+
+        real = importer_module.open_config_session
+
+        @contextmanager
+        def wrapper(*args, **kwargs):
+            with real(*args, **kwargs) as session:
+                yield session
+            raise exc_type
+
+        monkeypatch.setattr(importer_module, "open_config_session", wrapper)
+
+    def test_a_reimport_with_a_backup_says_it_exactly_once_and_names_the_backup(
+        self, run, db, monkeypatch
+    ):
+        import_ok(run, db, TEST_YAML)
+        self._interrupt_after_commit(monkeypatch)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+
+        assert result.exit_code == 130
+        assert result.stderr.count("may or may not have been applied") == 1
+        (backup,) = backups(db)
+        assert f"A pre-import backup of the outgoing configuration was already written to {backup}." in result.stderr
+        assert "the import was interrupted" not in result.stderr
+        lines = stderr_lines(result)
+        assert lines[0].startswith("interrupted -- the import may or may not have been applied")
+
+    def test_a_first_import_says_it_once_and_keeps_the_left_intact_fact(self, run, db, monkeypatch):
+        self._interrupt_after_commit(monkeypatch)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+
+        assert result.exit_code == 130
+        assert result.stderr.count("may or may not have been applied") == 1
+        assert f"{db.resolve()} holds a configuration and was left intact." in result.stderr
+        assert "NOT applied" not in result.stderr
+
+    def test_a_first_import_interrupted_after_the_commit_keeps_the_cleanup_warning_once(
+        self, run, db, monkeypatch
+    ):
+        """End to end: the store's cleanup note holds BOTH the verdict (which
+        the CLI states itself) and `Never delete its -wal/-shm files on their
+        own.` (which only the note states). The first goes, the second stays,
+        each exactly once."""
+        self._interrupt_after_commit(monkeypatch)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+
+        assert result.exit_code == 130
+        assert db.exists()
+        assert result.stderr.count("Never delete its -wal/-shm files") == 1
+        assert result.stderr.count("Never delete its -wal/-shm files on their own.") == 1
+        assert result.stderr.count("may or may not have been applied") == 1
+        assert f"{db.resolve()} holds a configuration and was left intact." in result.stderr
+        assert "Failed first import" in result.stderr
+
+    def test_a_note_that_is_only_the_claim_is_not_printed_as_an_empty_line(
+        self, run, db, monkeypatch
+    ):
+        exc = KeyboardInterrupt()
+        exc.add_note("the import may or may not have been applied")
+        exc.add_note("another fact")
+
+        def fake(*args, **kwargs):
+            raise exc
+
+        monkeypatch.setattr(cli_main, "import_yaml", fake)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.stderr.count("may or may not have been applied") == 1
+        assert stderr_lines(result)[-1] == "another fact"
+        assert "\n\n" not in result.stderr
+
+    def test_other_commands_keep_their_notes_untouched(self, run, db, monkeypatch):
+        import_ok(run, db)
+        exc = KeyboardInterrupt()
+        exc.add_note("a note that says it may or may not have been applied, verbatim")
+
+        def boom(resolved):
+            raise exc
+
+        monkeypatch.setattr(cli_main, "load_runtime_config", boom)
+        result = run("export", "-c", db)
+        assert "a note that says it may or may not have been applied, verbatim" in result.stderr
+
+    def test_a_terminated_import_is_worded_terminated_and_exits_143(self, run, db, monkeypatch):
+        import_ok(run, db, TEST_YAML)
+        self._interrupt_after_commit(monkeypatch, exc_type=cli_main._Terminated)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 143
+        assert stderr_lines(result)[0].startswith(
+            "terminated -- the import may or may not have been applied; run "
+        )
+        assert "interrupted" not in result.stderr
+        assert result.stderr.count("may or may not have been applied") == 1
+
+    def test_a_terminated_non_import_command_just_says_terminated(self, run, db, monkeypatch):
+        import_ok(run, db)
+
+        def boom(resolved):
+            raise cli_main._Terminated()
+
+        monkeypatch.setattr(cli_main, "load_runtime_config", boom)
+        result = run("export", "-c", db)
+        assert result.exit_code == 143
+        assert stderr_lines(result) == ["terminated"]
+
+    def test_terminated_is_a_keyboard_interrupt_so_plain_handlers_unwind(self):
+        assert issubclass(cli_main._Terminated, KeyboardInterrupt)
+
+
+@pytest.fixture
+def sigterm_restored():
+    previous = signal.getsignal(signal.SIGTERM)
+    yield previous
+    signal.signal(signal.SIGTERM, previous)
+
+
+class TestSigtermHandlerLifecycle:
+    """`main()` installs the SIGTERM handler for the duration of one command,
+    in the main thread, and puts the previous one back however it ends."""
+
+    @staticmethod
+    def _fake_cli(monkeypatch, behaviour):
+        seen = {}
+
+        def fake_main(*args, **kwargs):
+            seen["during"] = signal.getsignal(signal.SIGTERM)
+            behaviour(seen)
+
+        monkeypatch.setattr(cli_main.cli, "main", fake_main)
+        return seen
+
+    def test_the_handler_is_ours_during_and_restored_after_a_clean_exit(
+        self, sigterm_restored, monkeypatch
+    ):
+        def ok(seen):
+            raise SystemExit(0)
+
+        seen = self._fake_cli(monkeypatch, ok)
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main.main(["x"])
+        assert excinfo.value.code == 0
+        assert seen["during"] is cli_main._on_sigterm
+        assert signal.getsignal(signal.SIGTERM) is sigterm_restored
+
+    def test_the_real_main_restores_the_handler_after_help(self, sigterm_restored):
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main.main(["--help"])
+        assert excinfo.value.code == 0
+        assert signal.getsignal(signal.SIGTERM) is sigterm_restored
+
+    def test_the_handler_is_restored_when_the_command_raises(self, sigterm_restored, monkeypatch):
+        def boom(seen):
+            raise RuntimeError("bug")
+
+        self._fake_cli(monkeypatch, boom)
+        with pytest.raises(RuntimeError):
+            cli_main.main(["x"])
+        assert signal.getsignal(signal.SIGTERM) is sigterm_restored
+
+    def test_the_first_signal_ignores_further_ones_and_is_restored_in_finally(
+        self, sigterm_restored, monkeypatch
+    ):
+        def first_sigterm(seen):
+            with pytest.raises(cli_main._Terminated):
+                cli_main._on_sigterm(signal.SIGTERM, None)
+            seen["after_first"] = signal.getsignal(signal.SIGTERM)
+            raise SystemExit(130)
+
+        seen = self._fake_cli(monkeypatch, first_sigterm)
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main.main(["x"])
+        assert seen["after_first"] == signal.SIG_IGN
+        assert excinfo.value.code == 143  # remapped: a SIGTERM was seen
+        assert signal.getsignal(signal.SIGTERM) is sigterm_restored
+
+    @pytest.mark.parametrize("code", [1, 130])
+    def test_a_sigterm_during_argument_parsing_is_remapped_to_143(
+        self, sigterm_restored, monkeypatch, code
+    ):
+        """A signal that lands while Click parses arguments comes back as
+        Click's generic Abort (exit 1)."""
+
+        def parsing(seen):
+            with pytest.raises(cli_main._Terminated):
+                cli_main._on_sigterm(signal.SIGTERM, None)
+            raise SystemExit(code)
+
+        self._fake_cli(monkeypatch, parsing)
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main.main(["x"])
+        assert excinfo.value.code == 143
+
+    @pytest.mark.parametrize("code", [0, 1, 2, 75, 78, 130])
+    def test_without_a_sigterm_exit_codes_are_untouched(self, sigterm_restored, monkeypatch, code):
+        def plain(seen):
+            raise SystemExit(code)
+
+        self._fake_cli(monkeypatch, plain)
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main.main(["x"])
+        assert excinfo.value.code == code
+
+    @pytest.mark.parametrize("code", [0, 2, 75, 78])
+    def test_other_exit_codes_survive_a_sigterm(self, sigterm_restored, monkeypatch, code):
+        def finished_anyway(seen):
+            with pytest.raises(cli_main._Terminated):
+                cli_main._on_sigterm(signal.SIGTERM, None)
+            raise SystemExit(code)
+
+        self._fake_cli(monkeypatch, finished_anyway)
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main.main(["x"])
+        assert excinfo.value.code == code
+
+    def test_the_seen_flag_does_not_leak_into_the_next_invocation(
+        self, sigterm_restored, monkeypatch
+    ):
+        def first(seen):
+            with pytest.raises(cli_main._Terminated):
+                cli_main._on_sigterm(signal.SIGTERM, None)
+            raise SystemExit(0)
+
+        self._fake_cli(monkeypatch, first)
+        with pytest.raises(SystemExit):
+            cli_main.main(["x"])
+
+        def second(seen):
+            raise SystemExit(1)
+
+        self._fake_cli(monkeypatch, second)
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main.main(["x"])
+        assert excinfo.value.code == 1
+
+    def test_off_the_main_thread_the_signal_is_left_alone(self, sigterm_restored, monkeypatch):
+        outcome = {}
+
+        def fake_main(*args, **kwargs):
+            raise SystemExit(0)
+
+        monkeypatch.setattr(cli_main.cli, "main", fake_main)
+
+        def target():
+            try:
+                cli_main.main(["x"])
+            except SystemExit as exc:
+                outcome["code"] = exc.code
+            except BaseException as exc:  # pragma: no cover - the failure being tested
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=target)
+        thread.start()
+        thread.join(10)
+        assert outcome == {"code": 0}
+        assert signal.getsignal(signal.SIGTERM) is sigterm_restored
+
+
+_SIGNAL_DRIVER = textwrap.dedent(
+    '''
+    import os, sys, time
+    from pathlib import Path
+    from zfsbackup.cli import main as m
+
+    mode, marker = sys.argv[1], Path(sys.argv[2])
+    argv = sys.argv[3:]
+
+    def ready(suffix=""):
+        Path(str(marker) + suffix).write_text("x")
+
+    if mode in ("block_fsync", "slow_cleanup"):
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            ready()
+            time.sleep(120)
+
+        os.fsync = fsync
+    if mode == "slow_cleanup":
+        real_unlink = os.unlink
+
+        def unlink(path, *a, **k):
+            if os.path.basename(os.fspath(path)).startswith(".zfsbackup-export."):
+                ready(".cleanup")
+                time.sleep(2.0)
+            return real_unlink(path, *a, **k)
+
+        os.unlink = unlink
+    if mode == "block_import":
+        def blocked(*a, **k):
+            ready()
+            time.sleep(120)
+
+        m.import_yaml = blocked
+    if mode == "sigterm_in_parse":
+        import signal
+
+        real_parse = m._Group.parse_args
+
+        def parse_args(self, ctx, args):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(5)
+            return real_parse(self, ctx, args)
+
+        m._Group.parse_args = parse_args
+    m.main(argv)
+    '''
+)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not hasattr(signal, "SIGTERM") or os.name != "posix", reason="POSIX signals")
+class TestSigtermInARealProcess:
+    """SIGTERM must unwind like ^C: temp files removed, targets untouched, a
+    stable wording and exit code. Each case runs `zfsbackup.cli.main.main` in
+    its own interpreter under a hard timeout, and kills it if anything hangs."""
+
+    TIMEOUT = 40
+
+    def _launch(self, tmp_path, mode, *argv):
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ZFS_CMD", "ZPOOL_CMD", CONFIG_PATH_ENV)
+        }
+        env["PYTHONPATH"] = str(REPO)
+        marker = tmp_path / "ready.marker"
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _SIGNAL_DRIVER, mode, str(marker), *map(str, argv)],
+            cwd=tmp_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        return proc, marker
+
+    @staticmethod
+    def _wait_for(path, proc):
+        end = time.monotonic() + TestSigtermInARealProcess.TIMEOUT
+        while time.monotonic() < end:
+            if path.exists():
+                return
+            if proc.poll() is not None:
+                out, err = proc.communicate()
+                pytest.fail(f"the driver exited early ({proc.returncode}): {err}")
+            time.sleep(0.02)
+        pytest.fail(f"timed out waiting for {path}")
+
+    def _finish(self, proc):
+        try:
+            out, err = proc.communicate(timeout=self.TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            pytest.fail(f"the process did not exit after SIGTERM: {err}")
+        return proc.returncode, out, err
+
+    def _run(self, tmp_path, mode, *argv, second_signal=False):
+        proc, marker = self._launch(tmp_path, mode, *argv)
+        try:
+            self._wait_for(marker, proc)
+            proc.send_signal(signal.SIGTERM)
+            if second_signal:
+                self._wait_for(Path(str(marker) + ".cleanup"), proc)
+                proc.send_signal(signal.SIGTERM)
+            return self._finish(proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+    @pytest.fixture
+    def populated(self, run, db):
+        import_ok(run, db)
+        dispose_all()
+        return db
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_sigterm_during_an_export_cleans_up_and_exits_143(
+        self, populated, tmp_path, force
+    ):
+        out = tmp_path / "out.yaml"
+        if force:
+            out.write_text("precious\n")
+        before = digest(populated)
+
+        code, _, err = self._run(
+            tmp_path, "block_fsync", "export", "-c", populated, "-o", out,
+            *(["--force"] if force else []),
+        )
+
+        assert code == 143, err
+        assert err.strip().splitlines()[-1] == "terminated"
+        assert "Traceback" not in err and "interrupted" not in err
+        assert _temp_files(tmp_path) == []
+        if force:
+            assert out.read_text() == "precious\n"
+        else:
+            assert not out.exists()
+        assert digest(populated) == before
+        assert sidecars(populated) == []
+
+    def test_a_second_sigterm_during_cleanup_is_ignored(self, populated, tmp_path):
+        out = tmp_path / "out.yaml"
+        code, _, err = self._run(
+            tmp_path, "slow_cleanup", "export", "-c", populated, "-o", out,
+            second_signal=True,
+        )
+        assert code == 143, err
+        assert err.strip().splitlines()[-1] == "terminated"
+        # The cleanup the second signal tried to interrupt still finished.
+        assert _temp_files(tmp_path) == []
+        assert not out.exists()
+
+    def test_sigterm_during_an_import_says_terminated_and_that_it_may_have_applied(
+        self, db, tmp_path
+    ):
+        code, _, err = self._run(tmp_path, "block_import", "import", EXAMPLE_YAML, "-c", db)
+        assert code == 143, err
+        first = [l for l in err.splitlines() if l][0]
+        assert first.startswith("terminated -- the import may or may not have been applied; run ")
+        assert "interrupted" not in err
+        assert err.count("may or may not have been applied") == 1
+
+    def test_sigterm_while_click_parses_arguments_is_143_not_1(self, tmp_path):
+        proc, _ = self._launch(tmp_path, "sigterm_in_parse", "--help")
+        try:
+            code, _, err = self._finish(proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        assert code == 143, err
+        assert "Aborted" in err or "terminated" in err
