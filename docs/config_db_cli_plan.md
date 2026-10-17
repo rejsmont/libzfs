@@ -29,7 +29,9 @@ carries a status note or "as landed" text — where those disagree with the prop
 | A-1…A-8, A-10…A-20 fix-up | done | Reviewed clean by both reviewers; mocked suite 1557 passed |
 | A-21 follow-up | done | Five low items from the re-review, plus a corrected fingerprint placement found by the concurrency re-review |
 | A-9 scenarios | done | Two-VM harness 15/15 on the DB-backed config; `test_config_permissions.sh` 61/61 on real Linux. Startup exits 1 (not 78) on a sidecar permission error; 78 is the worker code |
-| **Phase 2** | **in progress** | Items 10.1 and 10.2 implemented, in test/review |
+| Item 10.1 + 10.2 | done (cfa9d54) | `zfsbackup-config import/export/migrate`; reviewed by both reviewers |
+| **Item 10.4 review fixes** | **in progress** | Foreign-DB refusal, exit-code contract, ^C/backup hygiene |
+| Item 10.3 | pending | Delete the interim importer after 10.4 |
 | 10–16 Config CLI | approved, not started | Revised after Checkpoint A; order 10 → 15 → 13 → 11 → 12 → 14 → 16 |
 | 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
 | 21–23 Docs, scenarios, final review | not started | |
@@ -1607,6 +1609,34 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
   Main session updates CLAUDE.md and `zfsbackup/README.md` in the same cycle. **Verify:**
   `grep -rn config.store.importer zfsbackup scenarios CLAUDE.md` is empty; full suite green.
 
+- **10.4 — Review fixes** *(after the item-10 review, 2026-10-17)* — store + CLI developers in parallel.
+  - **Store:** (1) never modify a database that isn't ours: when no revision is recorded, `check_schema`
+    and `upgrade_schema` refuse if `sqlite_master` holds any table (new `SchemaError` subclass, "not a
+    zfsbackup config database"), and `upgrade_schema` refuses `from_revs == ()` entirely, pointing at
+    `import` — `migrate` only upgrades a known, recorded revision; the no-revision `SchemaOutOfDate`
+    wording points at `import`. (2) Read-only engines no longer set `journal_mode=WAL`; they query it and
+    warn if it isn't `wal` (writers still switch). (3) `MigrationPackagingError(RuntimeError)` (not a
+    `SchemaError`) raised by `_assert_scripts_match_constants`. (4) Neutral `SchemaOutOfDate` text (the
+    daemon appends its own sentence); `OutgoingConfigUnreadable` ends at "Nothing was changed." (the CLI
+    adds `--no-backup`); "the stored configuration was not changed (the schema may have been upgraded)"
+    instead of "nothing was changed / untouched". (5) `assert connection.in_transaction()` before
+    `command.upgrade`, and document that migrations must not use `autocommit_block()`. (6) Test or drop the
+    `session.expunge_all()` claim. (7) Write the migration-constants rule into `migrations/README`.
+  - **CLI:** (1) `sqlalchemy.exc.DatabaseError` (not `IntegrityError`) → 78 via `config_error_message`
+    (a valid header with a corrupt body exits 1 today). (2) Only `MigrationPackagingError` is an
+    "installation error"; a bare `RuntimeError` is an internal error. (3) Don't print the A-11 cleanup
+    text twice. (4) ^C: print `__notes__`; say "the import may or may not have been applied — run `export`
+    to check" rather than asserting either way. (5) `write_backup`: close the fd if `fchmod` fails, unlink
+    on any `BaseException`, fsync the directory after creating the file. (6) `export -o` writes a temp file
+    and renames it into place. (7) `migrate` success text: a running daemon will stop at its next worker
+    restart — restart it now.
+  - **Daemon:** `runtime_config.py:45-49` no longer claims `check_schema` raises the multi-head
+    `RuntimeError`; the daemon's out-of-date message appends its own restart sentence.
+  - **Deferred:** a single source for semantic config warnings (`validate_config`; `from_file` keeps only
+    parse-boundary warnings) — needs a model/store contract change, do it with items 11/12 (the CLI
+    currently prints e.g. the `forever` warning twice in different words); a raw `.db` copy when the
+    outgoing config is unreadable; a first import's transient "uninitialized" window mapped as a refusal.
+
 ### Item 15 — Generation CAS, daemon presence, consistent worker config *(moved ahead of 11/12/14)*
 - **15.1** — `zfsbackup-store-developer` · `needs-approval` · gate + `concurrency-reviewer`. **Basis:**
   B2, `mapper.py:684-685`. No migration.
@@ -1618,6 +1648,12 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
     `ConfigBusy`. Never returns a session.
   - Rewrite the generation comment at `models.py:162-177`. `import` bumps the generation too, so an
     import between render and save is a conflict.
+  - **Shared read helper** *(added after the item-10 review)*: `read_config(resolved) ->
+    ConfigSnapshot(config, generation, schema_rev)` in the store's public API — one read-only connection,
+    `BEGIN`, `check_schema`, `load_config_snapshot`, `COMMIT`, close. Move `check_config_schema`,
+    `config_error_message` and `describe_config_source` from `runtime_config.py` into the store. The CLI
+    switches `export`/`migrate --check` to it; `load_runtime_config` becomes a thin daemon wrapper (15.2).
+    This lands 15.2(a)'s schema-check-inside-the-snapshot once, for both tools.
   - **Verify:** `pytest tests/test_zfsbackup_store.py -k "generation or cas or busy"`
 - **15.2** — `zfsbackup-developer` · `needs-approval` · gate `concurrency-reviewer`.
   - **(a) B1, daemon half:** `load_runtime_config` runs `check_schema(session.connection())` inside its
