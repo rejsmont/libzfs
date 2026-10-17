@@ -31,8 +31,12 @@
 # access path under test.
 #
 # Seeding: the fixtures are derived from zfsbackup/config.example.yaml (source of truth) and
-# imported with the INTERIM importer, `python -m zfsbackup.config.store.importer <yaml> -c <db>`
-# (TODO: `zfsbackup-config import` once the CLI exists). Files reach the VM with
+# imported with the config CLI, `python -m zfsbackup.cli import <yaml> [-c <db>]` (the module
+# form of `zfsbackup-config`: the venv does not pip-install the repo, so no console script).
+# Re-imports run WITH the default pre-import backup on purpose: the backup file is written by
+# the operator into the shared directory, so its owner/group/mode (0660, group zfsbackup via the
+# setgid directory) are asserted in (b) and (d); one `--no-backup` import in (d) proves the flag.
+# Exit codes: 0 ok, 1 invalid/refused, 75 busy, 78 config DB unusable (asserted in (e3)). Files reach the VM with
 # `multipass transfer`; all output discarding happens inside the guest.
 #
 # Usage:
@@ -364,9 +368,10 @@ install_fixtures
 echo
 step "CHECK (a) — root's first import of the default path"
 reset_default_state                     # also removes the directory: root must CREATE it
-out="$(msh "'$ENV_WRAP' '$PY' -m zfsbackup.config.store.importer '$FIX_DIR/root.yaml' 2>&1")"; rc=$?
+out="$(msh "'$ENV_WRAP' '$PY' -m zfsbackup.cli import '$FIX_DIR/root.yaml' 2>&1")"; rc=$?
 check "root import exits 0" "0" "$rc"
-check_re "importer reports a created database" "created=True" "$out"
+check_re "CLI reports a new database" "into new database $DB" "$out"
+check "first import writes no pre-import backup (nothing to back up)" "" "$(msh "ls $CFG_DIR | grep pre-import")"
 check_no_re "no 'group does not exist' warning (group was provisioned first)" "does not exist" "$out"
 check "config directory is setgid 2770 root:zfsbackup (Q7 chgrp)" "2770 root $SVC_GROUP" "$(stat_of "$CFG_DIR")"
 check "config database is 660 root:zfsbackup" "660 root $SVC_GROUP" "$(stat_of "$DB")"
@@ -389,9 +394,17 @@ info "supervisor pid=$pid_before workers=[$workers_before]"
 check_re "daemon loaded the original config as $SVC_USER" "Loading configuration from" "$(msh "cat '$LOG'")"
 
 for op in alice bob; do
-    out="$(asu "$op" "'$PY' -m zfsbackup.config.store.importer '$FIX_DIR/$op.yaml' 2>&1")"; rc=$?
+    out="$(asu "$op" "'$PY' -m zfsbackup.cli import '$FIX_DIR/$op.yaml' 2>&1")"; rc=$?
     check "$op's re-import (daemon running) exits 0" "0" "$rc"
-    check_re "$op's re-import reports success" "Imported .*created=False" "$out"
+    check_re "$op's re-import reports success" "Imported .*$op.yaml into $DB" "$out"
+    check_re "$op's re-import warns it replaced the stored configuration" "replaced the stored configuration in $DB" "$out"
+    bk="$(printf '%s' "$out" | grep -oE "$CFG_DIR/config\.db\.pre-import-[0-9TZ-]+\.yaml" | head -n1)"
+    if [ -n "$bk" ]; then
+        check "$op's pre-import backup is 660 $op:$SVC_GROUP (setgid dir inheritance)" "660 $op $SVC_GROUP" "$(stat_of "$bk")"
+        check_re "$op's pre-import backup is a readable YAML config" "^datasets:" "$(msh "cat '$bk'")"
+    else
+        fail "$op's re-import reported no pre-import backup path: $(printf '%s' "$out" | tr '\n' '|' | cut -c1-300)"
+    fi
     check_no_re "$op's re-import: no EPERM / permission / open failure" "EPERM|Operation not permitted|Permission denied|PermissionError|unable to open" "$out"
 done
 check "database still 660 group $SVC_GROUP after operators' imports" "660 root $SVC_GROUP" "$(stat_of "$DB")"
@@ -463,10 +476,10 @@ msh "
     install -d -o alice -g alice -m 755 /home/alice/cfg
     install -d -m 755 /var/lib/zfsb-perm-root
 " || die "could not create (d) directories"
-# import_as <who> <yaml> <db>  — who is alice (via sudo -u) or root
+# import_as <who> <yaml> <db> [extra import flags]  — who is alice (via sudo -u) or root
 import_as() {
-    local who="$1" yml="$2" dbp="$3"
-    local cmd="'$PY' -m zfsbackup.config.store.importer '$FIX_DIR/$yml' -c '$dbp' 2>&1"
+    local who="$1" yml="$2" dbp="$3" flags="${4:-}"
+    local cmd="'$PY' -m zfsbackup.cli -c '$dbp' import $flags '$FIX_DIR/$yml' 2>&1"
     if [ "$who" = root ]; then msh "'$ENV_WRAP' $cmd"; else asu "$who" "$cmd"; fi
 }
 for who in alice root; do
@@ -478,15 +491,27 @@ for who in alice root; do
     check "$who: precondition — database is 0600" "600" "$(stat_of "$dbp" | cut -d' ' -f1)"
     out="$(import_as "$who" "$yml" "$dbp")"; rc=$?
     check "$who: re-import over the 0600 file exits 0" "0" "$rc"
-    check_re "$who: re-import took the existing-database branch" "created=False" "$out"
+    check_re "$who: re-import took the existing-database branch" "replaced the stored configuration in $dbp" "$out"
     check "$who: database is STILL 0600 after re-import" "600" "$(stat_of "$dbp" | cut -d' ' -f1)"
+    bk="$(printf '%s' "$out" | grep -oE "$dbp\.pre-import-[0-9TZ-]+\.yaml" | head -n1)"
+    if [ -n "$bk" ]; then
+        check "$who: pre-import backup is 660 (independent of the 0600 database)" "660" "$(stat_of "$bk" | cut -d' ' -f1)"
+    else
+        fail "$who: re-import reported no pre-import backup path"
+    fi
+    nb_before="$(msh "ls $(dirname "$dbp") | grep -c pre-import")"
+    out="$(import_as "$who" "$yml" "$dbp" --no-backup)"; rc=$?
+    check "$who: --no-backup re-import exits 0" "0" "$rc"
+    check_re "$who: --no-backup re-import says nothing was backed up" "NOT backed up" "$out"
+    check "$who: --no-backup wrote no new backup file" "$nb_before" "$(msh "ls $(dirname "$dbp") | grep -c pre-import")"
+    check "$who: database is STILL 0600 after --no-backup re-import" "600" "$(stat_of "$dbp" | cut -d' ' -f1)"
 done
 
 # ───────────────────────────────── (e) ──────────────────────────────────────
 echo
 step "CHECK (e) — setgid removed: operator sidecar in alice's primary group -> clear preflight error"
 reset_default_state keep-dir            # fresh DB (and no stale -wal/-shm) in the existing dir
-out="$(msh "'$ENV_WRAP' '$PY' -m zfsbackup.config.store.importer '$FIX_DIR/root.yaml' 2>&1")"; rc=$?
+out="$(msh "'$ENV_WRAP' '$PY' -m zfsbackup.cli import '$FIX_DIR/root.yaml' 2>&1")"; rc=$?
 check "re-seed the default DB as root" "0" "$rc"
 msh "chgrp $SVC_GROUP '$CFG_DIR' '$DB'; chmod 2770 '$CFG_DIR'; chmod 660 '$DB'"   # reset_default_state kept the dir
 msh "chmod g-s '$CFG_DIR'" || die "could not remove the setgid bit"
@@ -523,6 +548,18 @@ if start_holder alice; then
     check_re "daemon log names the unusable sidecar and the fix" "WAL sidecar .*chgrp $SVC_GROUP" "$tail_log"
     check_no_re "daemon started no workers" "Started .* worker" "$tail_log"
     check_no_re "daemon log has no raw sqlite3.OperationalError / traceback (diagnosed, not opaque)" "OperationalError|sqlalche\\.me|Traceback" "$tail_log"
+
+    # (e3) the config CLI over the same state: must surface the same diagnosis, not the opaque
+    # sqlite error, and use the "config database unusable" exit code (78). The CLI runs as the
+    # service user (a group member, so it passes the file-permission checks and reaches the
+    # sidecar problem); --no-backup keeps the failure about the sidecar alone.
+    echo
+    step "CHECK (e3) — the config CLI reports the unusable sidecar the same way"
+    out="$(asu "$SVC_USER" "'$PY' -m zfsbackup.cli import --no-backup '$FIX_DIR/alice.yaml' 2>&1")"; rc=$?
+    check "CLI import over the unusable sidecar exits 78 (config database unusable)" "78" "$rc"
+    check_re "CLI names the WAL sidecar" "WAL sidecar .*config.db-(wal|shm)" "$out"
+    check_re "CLI names the sidecar's owner/group and the fix" "owner=alice group=alice.*chmod 0660.*chgrp $SVC_GROUP" "$out"
+    check_no_re "CLI error is not the raw sqlite3.OperationalError / traceback" "OperationalError|sqlalche\\.me|Traceback" "$out"
 else
     fail "could not start alice's holder (e)"
 fi

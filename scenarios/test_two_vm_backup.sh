@@ -213,7 +213,10 @@ daemon_running() { msh "$1" "pgrep -f 'zfsbackup.daemon' >/dev/null" 2>/dev/null
 # heredoc into `multipass exec ... tee` — the latter hangs/spins on host stdin.
 # The daemon reads only the SQLite DB, so the YAML is imported (destructive FULL REPLACE;
 # creates the DB if missing) and the daemon must be (re)started afterwards — no live reload.
-# TODO(plan item 10): the interim importer below is replaced by `zfsbackup-config import`.
+# Import goes through the config CLI (`python -m zfsbackup.cli`: the venv does not pip-install the
+# repo, so the `zfsbackup-config` console script does not exist; the module form is identical).
+# --no-backup: the harness re-seeds the same VMs over and over and wants a plain full replace,
+# not a pile of <db>.pre-import-<UTC>.yaml files next to the DB.
 put_config() { # put_config <vm> ; reads config text on stdin, installs it to $CFG, imports into $DB
     local vm="$1" tmp
     tmp="$(mktemp)"
@@ -222,7 +225,7 @@ put_config() { # put_config <vm> ; reads config text on stdin, installs it to $C
     msh "$vm" "install -D -m600 /tmp/zfsbackup-config.yaml '$CFG' && rm -f /tmp/zfsbackup-config.yaml" \
         || die "config install failed on $vm"
     rm -f "$tmp"
-    msh "$vm" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.config.store.importer '$CFG' -c '$DB'" \
+    msh "$vm" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$DB' import --no-backup '$CFG'" \
         || die "config import failed on $vm"
 }
 
