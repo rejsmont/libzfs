@@ -2,19 +2,35 @@
 
 Deliberately not named `db.py` -- item 5 owns that filename for
 engine/session setup (lazy, per-process, pid-keyed, created only after any
-`multiprocessing` fork). This module creates no `Engine` and no
-`Connection`; `ensure_schema()` takes an already-open `Connection` and does
-nothing else. That is what keeps this module fork-safe by construction and
-lets it land ahead of item 5 without any risk of colliding with its
-pid-keyed engine cache -- there is no engine here to collide with.
+`multiprocessing` fork). `check_schema()` and `ensure_schema()` create no
+`Engine` and no `Connection`; they take an already-open `Connection` and do
+nothing else, which is what keeps the daemon's path through this module
+fork-safe by construction. The one exception is `upgrade_schema()` (item
+10.1), the CLI's `zfsbackup-config migrate`: it opens its own connection, but
+only through `paths.open_config_connection` -> `db.get_engine`, i.e. the same
+pid-keyed cache every other caller uses, and it is never reachable from the
+daemon or a worker (the daemon only ever *checks*).
 
-Callers: `importer.py`'s `import_yaml` (the interim CLI, replaced by
-`zfsbackup-config import` in Phase 2) calls `ensure_schema()` as part of
-bringing a fresh or existing DB up to date; the daemon and its workers only
-ever *check* the current revision against the package's head
-(`check_schema`, via `zfsbackup/runtime_config.py`) and refuse to start on a
-mismatch, never write -- "the CLI is the only writer" is what item 5's
-fork-safety and WAL design depend on.
+Callers: `importer.py`'s `import_yaml` calls `ensure_schema()` as part of
+bringing a fresh or existing DB up to date; `zfsbackup-config migrate` calls
+`upgrade_schema()`; the daemon and its workers only ever *check* the current
+revision against the package's head (`check_schema`, via
+`zfsbackup/runtime_config.py`) and refuse to start on a mismatch, never
+write -- "the CLI is the only writer" is what item 5's fork-safety and WAL
+design depend on.
+
+**`EXPECTED_HEAD` / `KNOWN_REVISIONS` (item 10.1, B1).** `check_schema`
+decides from these two module constants and reads no `ScriptDirectory` at
+all, so the daemon's startup check does no filesystem walk of the migrations
+package and cannot be broken by a packaging problem in it. The price is that
+the constants must track the scripts; the *upgrade* path pays for that by
+asserting, before it touches the database, that the scripts' head equals
+`EXPECTED_HEAD` and that their revision set equals `KNOWN_REVISIONS` (a bare
+`RuntimeError`, deliberately not a `SchemaError`: a packaging defect, not an
+operator-fixable database state). **Adding a migration therefore means
+editing three things together: the new revision file, `EXPECTED_HEAD`, and
+`KNOWN_REVISIONS`.** Forgetting any of them fails loudly at `migrate` /
+`import` time and in the test suite, never silently at daemon start.
 
 **`check_schema(connection)` (item 6a) is that check.** It is the
 never-writes half of what used to be `ensure_schema`'s single monolithic
@@ -88,22 +104,32 @@ at the call site can.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Tuple
 
 from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from alembic.util.exc import CommandError
 from sqlalchemy import inspect
 from sqlalchemy.engine import Connection
 
 from zfsbackup.config.store.models import Base
+from zfsbackup.config.store.paths import ResolvedConfigPath, open_config_connection
 
 # zfsbackup/config/store/migrations/, not alembic.ini's script_location -- this
 # path is fixed at install time and does not depend on `alembic.ini`
 # existing at all (see `_build_config`'s docstring).
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+
+# The single head of `migrations/versions/`, and every revision id in that
+# history. `check_schema` decides from these and reads no scripts (item 10.1,
+# B1) -- see the module docstring. They MUST be edited together with any new
+# revision file; `_assert_scripts_match_constants` (run first on every upgrade
+# path, and by the test suite) fails loudly if they drift.
+EXPECTED_HEAD = "a1c28e1b3f34"
+KNOWN_REVISIONS = frozenset({"a1c28e1b3f34"})
 
 
 class SchemaError(RuntimeError):
@@ -143,10 +169,12 @@ class SchemaOutOfDate(SchemaError):
     added -- e.g. reading pre-retention-scoping rows as if
     `dataset_remote_id` already existed. Data loss (a daemon that refuses to
     start) beats data corruption (a daemon that starts and mis-reads
-    config). The fix is always `zfsbackup-config import`/the CLI's
-    migration path, i.e. `ensure_schema`, run deliberately by an operator or
-    the CLI -- never automatically by a process that only ever opens the
-    database read-only.
+    config). The fix is always `zfsbackup-config migrate` -- which
+    upgrades in place and keeps the stored configuration -- run deliberately
+    by an operator, never automatically by a process that only ever opens
+    the database read-only. (`zfsbackup-config import` also migrates, but it
+    is a destructive full replace of the stored configuration, so it is not
+    the remedy for "my schema is old".)
     """
 
 
@@ -204,6 +232,37 @@ class SchemaSplitBrain(SchemaError):
     """
 
 
+class SchemaIntegrityError(SchemaError):
+    """Raised when a migration leaves rows that violate a foreign key
+    (`PRAGMA foreign_key_check` returned any row) -- item 10.1, B2.
+
+    Why this exists: Alembic's SQLite batch migrations recreate tables and
+    must run with `PRAGMA foreign_keys=OFF` (it cannot be changed inside a
+    transaction, so the connection is FK-off from the start). With
+    enforcement off, a migration that moves or rewrites rows can leave an
+    orphan that nothing complains about, and the first `foreign_keys=ON`
+    writer to touch the table afterwards fails with a bare `FOREIGN KEY
+    constraint failed` -- long after the migration "succeeded". SQLite's own
+    documented recipe for table rebuilds is to run `PRAGMA foreign_key_check`
+    before committing; this is that step. The migration is rolled back
+    (`upgrade_schema` always; `ensure_schema`'s caller owns the transaction
+    and must not commit after this is raised), so the database is exactly as
+    it was before the attempt.
+    """
+
+
+@dataclass(frozen=True)
+class SchemaUpgrade:
+    """What `upgrade_schema` did. `from_revs` is the sorted tuple of
+    revision ids the database recorded before (empty for a database with no
+    recorded revision); `to_rev` is the head it is at now; `changed` is False
+    iff the database was already at head and nothing was written."""
+
+    from_revs: Tuple[str, ...]
+    to_rev: str
+    changed: bool
+
+
 def _has_existing_schema(connection: Connection) -> bool:
     """True if any table `Base.metadata` defines already exists on
     `connection`. Used only to detect the split-brain state described by
@@ -249,10 +308,82 @@ def _build_config(connection: Connection) -> Config:
     return cfg
 
 
+def _assert_scripts_match_constants() -> None:
+    """Fail loudly, before any database is touched, if the installed
+    migration scripts disagree with `EXPECTED_HEAD` / `KNOWN_REVISIONS`.
+
+    This is the other half of "`check_schema` reads no scripts": the
+    constants are only trustworthy if something checks them against the
+    scripts, and this runs first on every path that is about to *write*
+    (`ensure_schema`'s upgrade branch, hence `upgrade_schema` and `import`).
+    A bare `RuntimeError`, not a `SchemaError`: a packaging defect (a new
+    revision added without updating the constants, or a branched history),
+    never an operator-fixable database state -- the same reasoning as
+    `SchemaError`'s docstring.
+    """
+    cfg = Config()
+    cfg.set_main_option("script_location", str(_MIGRATIONS_DIR))
+    script = ScriptDirectory.from_config(cfg)
+    code_heads = script.get_heads()
+    if len(code_heads) != 1:
+        # get_current_head() (singular) raises a bare
+        # `CommandError: The script directory has multiple heads` for this
+        # case instead of something with a named explanation.
+        raise RuntimeError(
+            f"zfsbackup's installed migration scripts have "
+            f"{len(code_heads)} heads {code_heads!r}; the config store only "
+            f"supports a single, linear migration history. This is a "
+            f"packaging defect, not something fixable by an operator."
+        )
+    if code_heads[0] != EXPECTED_HEAD:
+        raise RuntimeError(
+            f"zfsbackup's installed migration scripts have head "
+            f"{code_heads[0]!r} but migrate.EXPECTED_HEAD is "
+            f"{EXPECTED_HEAD!r}. A migration was added or removed without "
+            f"updating EXPECTED_HEAD/KNOWN_REVISIONS in migrate.py. This is "
+            f"a packaging defect, not something fixable by an operator."
+        )
+    revisions = {rev.revision for rev in script.walk_revisions()}
+    if revisions != set(KNOWN_REVISIONS):
+        raise RuntimeError(
+            f"zfsbackup's installed migration scripts define revisions "
+            f"{sorted(revisions)!r} but migrate.KNOWN_REVISIONS is "
+            f"{sorted(KNOWN_REVISIONS)!r}. A migration was added or removed "
+            f"without updating KNOWN_REVISIONS in migrate.py. This is a "
+            f"packaging defect, not something fixable by an operator."
+        )
+
+
+def _assert_foreign_keys_intact(connection: Connection) -> None:
+    """`PRAGMA foreign_key_check`; raise `SchemaIntegrityError` if it returns
+    any row. See that exception for why. Valid on an FK-off connection (the
+    pragma reports violations regardless of the enforcement setting) and
+    inside a transaction. Read-only."""
+    rows = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    if not rows:
+        return
+    shown = "; ".join(
+        f"table {r[0]!r} rowid {r[1]!r} -> missing parent in {r[2]!r}"
+        for r in rows[:5]
+    )
+    more = f" (and {len(rows) - 5} more)" if len(rows) > 5 else ""
+    raise SchemaIntegrityError(
+        f"The migration left {len(rows)} foreign-key violation(s): "
+        f"{shown}{more}. The migration was not committed; the database is "
+        f"unchanged. This is a defect in the migration, not in your data."
+    )
+
+
 def check_schema(connection: Connection) -> str:
     """Check `connection`'s database against this installed package's
     Alembic head revision and return that head revision's id. **Never
     writes anything** -- no DDL, no DML, not even `alembic_version`.
+
+    Decides from `EXPECTED_HEAD` / `KNOWN_REVISIONS` and reads **no migration
+    scripts** (item 10.1, B1): the only things it touches are the database's
+    `alembic_version` and, for the split-brain test, its table list. The
+    constants are checked against the scripts on the write paths
+    (`_assert_scripts_match_constants`), not here.
 
     That is a statement about writes, not about transactions: `Migration
     Context.configure(connection).get_current_heads()` and
@@ -281,50 +412,26 @@ def check_schema(connection: Connection) -> str:
 
     Raises, in order:
 
-    - `RuntimeError` if this package's own migration scripts have more than
-      one head -- a packaging defect, never an operator-fixable state (see
-      inline comment below).
     - `SchemaSplitBrain` if the database has no recorded Alembic revision
       (`alembic_version` missing or empty) but one or more of this
       package's tables already exist -- `alembic_version` lost to an
       uncommitted `ensure_schema` call, or the tables created some other
       way. See that exception's docstring.
-    - `SchemaVersionMismatch` if the database records a revision this
-      installed package's migration scripts do not recognise -- written by
-      a *newer* zfsbackup package. See that exception's docstring.
+    - `SchemaVersionMismatch` if the database records a revision not in
+      `KNOWN_REVISIONS` -- written by a *newer* zfsbackup package. See that
+      exception's docstring.
     - `SchemaOutOfDate` if the database's recorded revision(s) are ones
-      this package *does* recognise but are not its head -- including a
-      brand-new or empty database with no recorded revision at all (no
+      this package *does* recognise but are not `EXPECTED_HEAD` -- including
+      a brand-new or empty database with no recorded revision at all (no
       `alembic_version`, no tables): `check_schema` cannot itself perform
       the initial migration, so that case is a refusal here, not the
       silent "create it" that `ensure_schema` alone used to provide. See
       that exception's docstring for why the daemon's refusal, not a
       log-and-continue, is the deliberate behaviour.
 
-    Returns the code head with no exception only when the database's
-    recorded heads are exactly `{code_head}`.
+    Returns `EXPECTED_HEAD` with no exception only when the database's
+    recorded heads are exactly `{EXPECTED_HEAD}`.
     """
-    cfg = _build_config(connection)
-    script = ScriptDirectory.from_config(cfg)
-    code_heads = script.get_heads()
-    if len(code_heads) != 1:
-        # get_current_head() (singular) raises a bare
-        # `CommandError: The script directory has multiple heads` for this
-        # case instead of something this function's own error handling
-        # would catch -- guard explicitly so a branched migration history
-        # (which should never happen for this package -- a single linear
-        # chain is the whole point of the item-7 baseline) fails with a
-        # named, explained error rather than an opaque one escaping ahead
-        # of the checks below.
-        raise RuntimeError(
-            f"zfsbackup's installed migration scripts have "
-            f"{len(code_heads)} heads {code_heads!r}; check_schema/"
-            f"ensure_schema only support a single, linear migration "
-            f"history. This is a packaging defect, not something fixable "
-            f"by an operator."
-        )
-    code_head = code_heads[0]
-
     db_heads = MigrationContext.configure(connection).get_current_heads()
     if not db_heads and _has_existing_schema(connection):
         raise SchemaSplitBrain(
@@ -332,27 +439,25 @@ def check_schema(connection: Connection) -> str:
             f"missing or empty) but one or more of this package's tables "
             f"already exist. Refusing to attempt the initial migration, "
             f"which would fail with 'table already exists'. If the "
-            f"existing tables are already at revision {code_head!r}, fix "
+            f"existing tables are already at revision {EXPECTED_HEAD!r}, fix "
             f"this by stamping them (`alembic stamp head`); otherwise "
             f"restore the database from a backup or start over with a "
             f"fresh file."
         )
 
     for revision in db_heads:
-        try:
-            script.get_revision(revision)
-        except CommandError as exc:
+        if revision not in KNOWN_REVISIONS:
             raise SchemaVersionMismatch(
                 f"Database schema is at revision {revision!r}, which this "
                 f"installed zfsbackup package (migrations head "
-                f"{code_head!r}) does not recognise. This usually means "
+                f"{EXPECTED_HEAD!r}) does not recognise. This usually means "
                 f"the database was created or migrated by a newer "
                 f"zfsbackup package. Upgrade the zfsbackup package "
                 f"installed on this host before opening this database "
                 f"again."
-            ) from exc
+            )
 
-    if set(db_heads) != {code_head}:
+    if set(db_heads) != {EXPECTED_HEAD}:
         if db_heads:
             current = f"revision(s) {sorted(db_heads)!r}"
         else:
@@ -363,15 +468,15 @@ def check_schema(connection: Connection) -> str:
             )
         raise SchemaOutOfDate(
             f"Database schema is at {current}, which is behind this "
-            f"installed zfsbackup package's migration head {code_head!r}. "
-            f"check_schema() only checks -- it never migrates the "
+            f"installed zfsbackup package's migration head {EXPECTED_HEAD!r}. "
+            f"The daemon only checks the schema -- it never migrates the "
             f"database, so this is a refusal, not an automatic upgrade. "
-            f"Run `zfsbackup-config import` (or otherwise invoke "
-            f"ensure_schema()) to bring the database up to date, then "
-            f"start the daemon again."
+            f"Run `zfsbackup-config migrate` to bring the database up to "
+            f"date (your stored configuration is kept), then start the "
+            f"daemon again."
         )
 
-    return code_head
+    return EXPECTED_HEAD
 
 
 def ensure_schema(connection: Connection) -> str:
@@ -380,13 +485,19 @@ def ensure_schema(connection: Connection) -> str:
 
     **Reimplemented as `check_schema(connection)` plus `command.upgrade`,
     so the two can never drift.** `check_schema` alone decides whether the
-    database needs anything done to it; this function's only addition is
-    performing that migration when `check_schema` says `SchemaOutOfDate`,
-    then re-checking to confirm and return the head. Every other exception
-    `check_schema` can raise (`RuntimeError`, `SchemaSplitBrain`,
-    `SchemaVersionMismatch`) is not something a migration can fix, so it
-    propagates unchanged -- `ensure_schema` catches `SchemaOutOfDate`
-    specifically, nothing broader.
+    database needs anything done to it; this function's only additions are
+    performing that migration when `check_schema` says `SchemaOutOfDate`
+    (after `_assert_scripts_match_constants`), verifying it with `PRAGMA
+    foreign_key_check` (`SchemaIntegrityError`), then re-checking to confirm
+    and return the head. Every other exception `check_schema` can raise
+    (`SchemaSplitBrain`, `SchemaVersionMismatch`) is not something a
+    migration can fix, so it propagates unchanged -- `ensure_schema`
+    catches `SchemaOutOfDate` specifically, nothing broader.
+
+    **If this raises after `command.upgrade` ran (including
+    `SchemaIntegrityError`), the caller must roll back, not commit** -- the
+    migration is sitting uncommitted in the caller's transaction on a
+    db.py writer connection. `upgrade_schema` and `import_yaml` both do.
 
     Idempotent: a database already at head is left untouched --
     `check_schema` returns immediately with no exception and no write at
@@ -433,8 +544,14 @@ def ensure_schema(connection: Connection) -> str:
     if not needs_migration:
         return head
 
+    # Before any write: the constants `check_schema` just decided from are
+    # only trustworthy if the scripts agree with them.
+    _assert_scripts_match_constants()
+
     cfg = _build_config(connection)
     command.upgrade(cfg, "head")
+    # B2: still inside the caller's transaction, before it can commit.
+    _assert_foreign_keys_intact(connection)
     # Re-derive rather than trust anything computed above: this confirms
     # the upgrade actually landed (a mutant that silently swallowed
     # `command.upgrade`'s effect would fail this line, not just look
@@ -443,3 +560,66 @@ def ensure_schema(connection: Connection) -> str:
     # this database current" by any means other than calling
     # `check_schema`.
     return check_schema(connection)
+
+
+def upgrade_schema(resolved: ResolvedConfigPath) -> SchemaUpgrade:
+    """Migrate the EXISTING config database `resolved` addresses to head, in
+    place, atomically, and report what happened (item 10.1; the CLI's
+    `zfsbackup-config migrate`). Never creates a database -- a missing or
+    zero-byte target is refused by `open_config_connection`'s preflight
+    (`ConfigDbNotFound` / `ConfigDbNotADatabase`); only `import` may create.
+
+    Owns its connection end to end, so no caller can get the sequencing
+    wrong (cf. `ensure_schema`'s binding note):
+
+    - The connection comes from `open_config_connection(readonly=False,
+      foreign_keys=False)`: FK enforcement OFF from the first byte (the
+      pragma cannot be changed inside a transaction, and Alembic's SQLite
+      batch migrations rebuild tables), and `db.py`'s writer-engine setup,
+      i.e. pysqlite's implicit `BEGIN` disabled (`isolation_level = None`,
+      SQLAlchemy's documented recipe for transactional DDL on pysqlite) and
+      `BEGIN IMMEDIATE` as the transaction start.
+    - `connection.begin()` is called explicitly, first, so `BEGIN
+      IMMEDIATE` -- the write lock -- is taken *before* `check_schema` reads
+      `alembic_version`. Two concurrent `migrate` runs therefore serialise:
+      the second waits (`busy_timeout`), then sees the first's head and
+      reports `changed=False` instead of racing it into `table already
+      exists`. The DDL, the version stamp and the foreign-key check are all
+      inside that one transaction: any failure rolls back to an untouched
+      database.
+    - `PRAGMA foreign_key_check` runs before the commit (via
+      `ensure_schema`); any row -> rollback and `SchemaIntegrityError`.
+    - `commit()` is the last statement; the connection is closed before this
+      returns. A database already at head is rolled back, not committed
+      (nothing was written).
+
+    Raises `SchemaSplitBrain` / `SchemaVersionMismatch` unchanged (a
+    migration cannot fix them), `SchemaIntegrityError`, the bare packaging
+    `RuntimeError` of `_assert_scripts_match_constants` (before the database
+    is opened at all), `ConfigPathError` subclasses from the preflight, and
+    `sqlalchemy.exc.OperationalError` ("database is locked") if the write
+    lock could not be had within `busy_timeout`. Does not dispose the engine
+    cache; the caller's process-exit (or `dispose_all()`) does.
+    """
+    # Cheap, needs no database, and must precede any lock: a script/constant
+    # mismatch is a packaging bug to report before touching the file.
+    _assert_scripts_match_constants()
+
+    with open_config_connection(
+        resolved, readonly=False, foreign_keys=False
+    ) as conn:
+        trans = conn.begin()  # db.py's `begin` listener issues BEGIN IMMEDIATE
+        try:
+            from_revs = tuple(
+                sorted(MigrationContext.configure(conn).get_current_heads())
+            )
+            to_rev = ensure_schema(conn)
+        except BaseException:
+            trans.rollback()
+            raise
+        changed = from_revs != (to_rev,)
+        if changed:
+            trans.commit()  # LAST statement on this connection
+        else:
+            trans.rollback()
+    return SchemaUpgrade(from_revs=from_revs, to_rev=to_rev, changed=changed)

@@ -144,6 +144,11 @@ only then opens a fresh writer session to replace the store's contents
 wholesale via `save_config`. It also carries a throwaway `python -m
 zfsbackup.config.store.importer <yaml> [-c PATH]` CLI, deleted by item 10
 once `zfsbackup-config import` exists to call `import_yaml` directly.
+
+`migrate.py`'s `upgrade_schema(resolved) -> SchemaUpgrade` (item 10.1) is the
+in-place, atomic, foreign-key-verified migration `zfsbackup-config migrate`
+calls; the daemon only ever uses `check_schema`, which decides from
+`EXPECTED_HEAD`/`KNOWN_REVISIONS` and reads no migration scripts.
 """
 
 from zfsbackup.config.store.models import (
@@ -167,12 +172,17 @@ from zfsbackup.config.store.db import (
 )
 from zfsbackup.config.store.mapper import load_config, save_config, validate_config
 from zfsbackup.config.store.migrate import (
+    EXPECTED_HEAD,
+    KNOWN_REVISIONS,
     SchemaError,
+    SchemaIntegrityError,
     SchemaOutOfDate,
     SchemaSplitBrain,
+    SchemaUpgrade,
     SchemaVersionMismatch,
     check_schema,
     ensure_schema,
+    upgrade_schema,
 )
 from zfsbackup.config.store.paths import (
     CONFIG_DB_MODE,
@@ -205,7 +215,11 @@ from zfsbackup.config.store.paths import (
 # Imported last: depends on mapper, migrate, AND paths all being importable
 # (it uses save_config, ensure_schema/SchemaError, and the paths helpers
 # together to drive the three-phase import in importer.py's own docstring).
-from zfsbackup.config.store.importer import ImportResult, import_yaml
+from zfsbackup.config.store.importer import (
+    ImportResult,
+    OutgoingConfigUnreadable,
+    import_yaml,
+)
 
 __all__ = [
     "Base",
@@ -227,16 +241,21 @@ __all__ = [
     "DatasetRemote",
     "DEFAULT_CONFIG_DB",
     "Destination",
+    "EXPECTED_HEAD",
     "GlobalSettings",
     "ImportResult",
+    "KNOWN_REVISIONS",
     "NAMING_CONVENTION",
+    "OutgoingConfigUnreadable",
     "ReadOnlySessionError",
     "RemoteServer",
     "ResolvedConfigPath",
     "RetentionRule",
     "SchemaError",
+    "SchemaIntegrityError",
     "SchemaOutOfDate",
     "SchemaSplitBrain",
+    "SchemaUpgrade",
     "SchemaVersionMismatch",
     "check_config_db",
     "check_config_db_suffix",
@@ -258,6 +277,7 @@ __all__ = [
     "save_config",
     "session_for_engine",
     "session_scope",
+    "upgrade_schema",
     "url_for_path",
     "validate_config",
 ]

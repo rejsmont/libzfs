@@ -143,6 +143,20 @@ them, not a fourth phase:
    YAML round-trips as `"1M"`, not a re-synthesized `"30d"` -- verified
    against `zfsbackup/config.example.yaml`.
 
+   **Pre-import backup (item 10.1, D-5).** With `backup=` given, phase 3
+   loads the OUTGOING configuration (`load_config`) on that same session,
+   after the counts and before `save_config`, and hands it to the callback,
+   which writes it somewhere and returns the path
+   (`ImportResult.backup_path`). Because the writer session's transaction is
+   `BEGIN IMMEDIATE` from its first statement, the config backed up is
+   exactly the config replaced -- no other writer can commit in between. A
+   callback that raises rolls the whole phase back. An existing config that
+   cannot be loaded raises `OutgoingConfigUnreadable` unless
+   `allow_unreadable_outgoing`. Phase 2's `ensure_schema` also verifies the
+   migration with `PRAGMA foreign_key_check` (`SchemaIntegrityError`), and a
+   skipped first-import cleanup attaches its WARNING text to the in-flight
+   exception (`add_note`) as well as logging it.
+
 **Never route through `DatasetConfig.from_dict` or `.from_property`.**
 See `mapper.py`'s module docstring, invariant 3 -- this module calls
 `BackupConfig.from_file` exactly once, at phase 0, and every dataclass
@@ -178,7 +192,7 @@ import stat as stat_module
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import yaml
 from sqlalchemy import select
@@ -186,9 +200,9 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store.db import dispose_all
-from zfsbackup.config.store.mapper import save_config, validate_config
+from zfsbackup.config.store.mapper import load_config, save_config, validate_config
 from zfsbackup.config.store.migrate import SchemaError, ensure_schema
-from zfsbackup.config.store.models import Dataset, Destination
+from zfsbackup.config.store.models import Dataset, Destination, GlobalSettings
 from zfsbackup.config.store.paths import (
     CONFIG_DIR_MODE,
     CONFIG_PATH_ENV,
@@ -210,7 +224,7 @@ from zfsbackup.config.store.paths import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ImportResult", "import_yaml"]
+__all__ = ["ImportResult", "OutgoingConfigUnreadable", "import_yaml"]
 
 
 @dataclass(frozen=True)
@@ -222,13 +236,28 @@ class ImportResult:
     one. `head_revision` is the Alembic head the schema phase left the
     database at. `replaced_datasets`/`replaced_destinations` are the row
     counts phase 3 observed BEFORE wiping them -- both are 0 for a
-    brand-new (`created=True`) database.
+    brand-new (`created=True`) database. `backup_path` is whatever the
+    `backup` callback returned (`None` when no callback was given, there was
+    no outgoing configuration to back up, or the outgoing one was unreadable
+    and `allow_unreadable_outgoing` let the import proceed).
     """
 
     created: bool
     head_revision: str
     replaced_datasets: int
     replaced_destinations: int
+    backup_path: Optional[Path] = None
+
+
+class OutgoingConfigUnreadable(ConfigPathError):
+    """The configuration already stored in the target database could not be
+    loaded, so the pre-import backup the caller asked for cannot be taken --
+    and `import_yaml` refuses to destroy a configuration it could not back
+    up. The underlying error is `__cause__`. Pass
+    `allow_unreadable_outgoing=True` (the CLI's `--no-backup`) to replace it
+    anyway. A `ConfigPathError` so that the same `except` the daemon and CLI
+    already have for "this config database is unusable" covers it.
+    """
 
 
 def _target_exists(path: Path) -> bool:
@@ -420,7 +449,11 @@ def _probe_config_empty(target: Path) -> bool:
         conn.close()
 
 
-def _remove_created_target(target: Path, created_id: Optional[Tuple[int, int]]) -> None:
+def _remove_created_target(
+    target: Path,
+    created_id: Optional[Tuple[int, int]],
+    error: Optional[BaseException] = None,
+) -> None:
     """Undo the file creation of a failed first import -- but never delete a
     database another process may be using.
 
@@ -465,26 +498,41 @@ def _remove_created_target(target: Path, created_id: Optional[Tuple[int, int]]) 
        closes both.
     6. A sidecar is NEVER unlinked.
     7. Success logs INFO; any skip logs one WARNING (see
-       `_cleanup_skipped`). Errors are logged, never raised -- this runs
-       while another exception is propagating and must not mask it.
+       `_cleanup_skipped`) and, when `error` (the in-flight exception) is
+       given, attaches the same text to it with `error.add_note` so the CLI
+       can show it next to the import error without capturing log records.
+       Errors are logged, never raised -- this runs while another exception
+       is propagating and must not mask it.
     """
     try:
         dispose_all()
     except Exception:  # noqa: BLE001 - cleanup must not mask the real error
         logger.exception("could not dispose engines while cleaning up %s", target)
-        _cleanup_skipped(
+        note = _cleanup_skipped(
             target, "could not close this process's database connections", "unknown"
         )
+        if error is not None:
+            error.add_note(note)
         return
 
     try:
-        _remove_if_unused(target, created_id)
-    except Exception:  # noqa: BLE001 - cleanup must not mask the real error
+        note = _remove_if_unused(target, created_id)
+    except Exception as cleanup_exc:  # noqa: BLE001 - must not mask the real error
         logger.exception("unexpected error while cleaning up %s", target)
+        note = (
+            f"Failed first import: cleanup of {target} failed unexpectedly "
+            f"({cleanup_exc!r}); {target} may still exist. Never delete its "
+            "-wal/-shm files on their own."
+        )
+    if note is not None and error is not None:
+        error.add_note(note)
 
 
-def _cleanup_skipped(target: Path, reason: str, kind: str) -> None:
-    """The one WARNING every skipped cleanup logs. `kind` selects the
+def _cleanup_skipped(target: Path, reason: str, kind: str) -> str:
+    """The one WARNING every skipped cleanup logs, and the same text returned
+    so `_remove_created_target` can attach it to the in-flight exception
+    (`add_note`) -- the CLI shows it with the import error without having to
+    capture log records. `kind` selects the
     next step: `"zero-byte"` (the file is empty, so a re-import cannot adopt
     it), `"schema"` (a schema-only database, which a re-run of the import
     reuses), `"imported"` (another process has imported a configuration),
@@ -508,15 +556,20 @@ def _cleanup_skipped(target: Path, reason: str, kind: str) -> None:
         step = f"{target} is no longer the file this import created; it was left untouched."
     else:
         step = f"{target} was left in place."
-    logger.warning(
-        "Failed first import: %s was NOT removed (%s). %s Never delete "
-        "its -wal/-shm files on their own.",
-        target, reason, step,
+    text = (
+        f"Failed first import: {target} was NOT removed ({reason}). {step} "
+        "Never delete its -wal/-shm files on their own."
     )
+    logger.warning("%s", text)
+    return text
 
 
-def _remove_if_unused(target: Path, created_id: Optional[Tuple[int, int]]) -> None:
-    """Steps 2-6 of `_remove_created_target`."""
+def _remove_if_unused(
+    target: Path, created_id: Optional[Tuple[int, int]]
+) -> Optional[str]:
+    """Steps 2-6 of `_remove_created_target`. Returns the WARNING text when
+    cleanup was SKIPPED (see `_cleanup_skipped`), else `None` (removed, or
+    already gone)."""
     # Measured once, BEFORE the probe: size/kind, and the fingerprint step 5
     # compares against (never re-taken -- see the module docstring).
     fingerprint = _fingerprint(target)
@@ -527,31 +580,27 @@ def _remove_if_unused(target: Path, created_id: Optional[Tuple[int, int]]) -> No
     if created_id is None or _file_id(target) != created_id:
         if _file_id(target) is None and created_id is not None:
             return  # already gone -- nothing to clean up
-        _cleanup_skipped(target, "it is not the file this import created", "replaced")
-        return
+        return _cleanup_skipped(target, "it is not the file this import created", "replaced")
 
     # Step 3: another connection attached?
     live = _sidecars_present(target)
     if live:
-        _cleanup_skipped(
+        return _cleanup_skipped(
             target,
             ", ".join(p.name for p in live) + " exist (another process may have it open)",
             kind,
         )
-        return
 
     # Step 4: provably no configuration inside? (non-empty files only)
     if size != 0:
         try:
             empty = _probe_config_empty(target)
         except sqlite3.Error as exc:
-            _cleanup_skipped(
+            return _cleanup_skipped(
                 target, f"could not confirm it is empty ({exc})", kind
             )
-            return
         if not empty:
-            _cleanup_skipped(target, "it now holds a configuration", "imported")
-            return
+            return _cleanup_skipped(target, "it now holds a configuration", "imported")
         # NOTE: no fingerprint retake here. The probe's lock is released, so
         # its verdict is stale; step 5 compares against the fingerprint taken
         # BEFORE the probe, or a writer landing in this gap would become the
@@ -559,33 +608,69 @@ def _remove_if_unused(target: Path, created_id: Optional[Tuple[int, int]]) -> No
 
     # Step 5: the probe's connection is closed; re-check, then unlink.
     if _file_id(target) != created_id:
-        _cleanup_skipped(target, "it was replaced during cleanup", "replaced")
-        return
+        return _cleanup_skipped(target, "it was replaced during cleanup", "replaced")
     if _fingerprint(target) != fingerprint:
-        _cleanup_skipped(
+        return _cleanup_skipped(
             target,
             "it changed since it was checked -- another process may have "
             "written to it",
             "changed",
         )
-        return
     live = _sidecars_present(target)
     if live:
-        _cleanup_skipped(
+        return _cleanup_skipped(
             target,
             "another process opened it during cleanup: "
             + ", ".join(p.name for p in live) + " appeared",
             kind,
         )
-        return
     try:
         os.unlink(target)
     except FileNotFoundError:
         return
     except OSError as exc:
-        _cleanup_skipped(target, f"could not unlink it: {exc}", kind)
-        return
+        return _cleanup_skipped(target, f"could not unlink it: {exc}", kind)
     logger.info("removed %s, created by this failed import", target)
+
+
+def _backup_outgoing(
+    session,  # noqa: ANN001 - a writer Session, mid-transaction
+    backup: Callable[[BackupConfig], Path],
+    allow_unreadable: bool,
+    target: Path,
+) -> Optional[Path]:
+    """Phase 3's pre-import backup step. See `import_yaml`'s `backup`.
+
+    "There is an outgoing configuration" means `GlobalSettings` row 1
+    exists: `save_config` writes it in the same transaction as all the data,
+    so its absence is exactly a fresh or schema-only database (nothing to
+    lose, no backup). Anything that goes wrong *loading* an existing one --
+    `load_config`'s own refusals (no datasets, a bad duration row, an orphan
+    scope) and any storage error -- is "unreadable", deliberately one
+    category: the question the caller is asking is only "can I snapshot what
+    I am about to destroy". A failure of `backup` itself is NOT caught here:
+    it propagates, and phase 3 rolls back.
+    """
+    try:
+        has_config = session.get(GlobalSettings, 1) is not None
+        outgoing = load_config(session) if has_config else None
+    except Exception as exc:  # noqa: BLE001 - any failure to read is "unreadable"
+        if not allow_unreadable:
+            raise OutgoingConfigUnreadable(
+                f"The configuration currently stored in {target} cannot be "
+                f"read ({type(exc).__name__}: {exc}), so it cannot be backed "
+                "up before being replaced. Nothing was changed. Skip the "
+                "backup to replace it anyway."
+            ) from exc
+        logger.warning(
+            "The configuration currently stored in %s cannot be read (%s: "
+            "%s); replacing it WITHOUT a backup.",
+            target, type(exc).__name__, exc,
+        )
+        return None
+    if outgoing is None:
+        return None
+    return backup(outgoing)
 
 
 def import_yaml(
@@ -593,6 +678,8 @@ def import_yaml(
     resolved: ResolvedConfigPath,
     *,
     create: bool = True,
+    backup: Optional[Callable[[BackupConfig], Path]] = None,
+    allow_unreadable_outgoing: bool = False,
 ) -> ImportResult:
     """Import `yaml_path` (a `BackupConfig.from_file`-shaped YAML config)
     into the config database `resolved` addresses, replacing its entire
@@ -604,6 +691,25 @@ def import_yaml(
     yet. `create=False`: require an existing target and raise
     `ConfigDbNotFound` if there is none -- for a caller that wants
     "re-import only", never "import or create".
+
+    `backup` (item 10.1, D-5): called with the OUTGOING configuration -- the
+    one this import is about to destroy -- and must write it somewhere and
+    return the path (`ImportResult.backup_path`). It runs in phase 3, inside
+    the same `BEGIN IMMEDIATE` as `save_config`, so the config it saves is
+    exactly the one that gets replaced: nothing can commit between the two.
+    If `backup` raises, phase 3 rolls back and the exception propagates; the
+    database is untouched. If a LATER step fails after `backup` succeeded
+    (the file is already written), the exception gets a note naming it.
+    It is not called when there is nothing to back up (a database this call
+    just created, or one that holds no configuration yet), and it is not
+    called -- and the outgoing config is not even loaded -- when `backup` is
+    `None`.
+
+    An outgoing configuration that exists but cannot be loaded raises
+    `OutgoingConfigUnreadable` (nothing is replaced) unless
+    `allow_unreadable_outgoing` is True, in which case a WARNING is logged,
+    no backup is taken, and the import proceeds. Only meaningful with
+    `backup`; without one the outgoing config is never read.
     """
     # Phase 0 -- parse first. Nothing below this line runs if the YAML
     # itself is invalid, so a bad YAML never touches the filesystem
@@ -677,6 +783,7 @@ def import_yaml(
         created = True
         created_id = _file_id(target)
 
+    backup_path: Optional[Path] = None
     try:
         # Phase 2 -- schema, its own connection, committed and closed before
         # phase 3 opens anything. `allow_new=created`: only a database THIS
@@ -693,8 +800,18 @@ def import_yaml(
         # Phase 3 -- data, in a brand-new writer session opened only now
         # that phase 2's connection has fully closed.
         with open_config_session(resolved, readonly=False) as session:
+            # First statement of the session: `BEGIN IMMEDIATE` (db.py), so
+            # everything below -- the counts, the outgoing config handed to
+            # `backup`, and `save_config`'s wipe -- sees one frozen state.
             replaced_datasets = len(session.scalars(select(Dataset)).all())
             replaced_destinations = len(session.scalars(select(Destination)).all())
+            if backup is not None:
+                backup_path = _backup_outgoing(
+                    session, backup, allow_unreadable_outgoing, target
+                )
+                # save_config starts from a clean identity map, exactly as
+                # it did before the outgoing config was loaded here.
+                session.expunge_all()
             if replaced_datasets or replaced_destinations:
                 logger.warning(
                     "Replacing existing config store at %s: %d dataset(s) and "
@@ -703,9 +820,15 @@ def import_yaml(
                     target, replaced_datasets, replaced_destinations, yaml_path,
                 )
             save_config(session, config)
-    except BaseException:
+    except BaseException as exc:
+        if backup_path is not None:
+            exc.add_note(
+                f"A pre-import backup of the outgoing configuration was "
+                f"already written to {backup_path}; the stored configuration "
+                f"was not replaced."
+            )
         if created:
-            _remove_created_target(target, created_id)
+            _remove_created_target(target, created_id, exc)
         raise
 
     return ImportResult(
@@ -713,6 +836,7 @@ def import_yaml(
         head_revision=head_revision,
         replaced_datasets=replaced_datasets,
         replaced_destinations=replaced_destinations,
+        backup_path=backup_path,
     )
 
 

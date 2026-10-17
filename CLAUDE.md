@@ -49,11 +49,14 @@ pytest -m real_zfs
 **Run the backup daemon:**
 
 The daemon reads its config **only** from the SQLite config store; a `.yaml` passed to `-c` is refused.
-Import YAML first (a destructive full replace of whatever the DB holds). Until the `zfsbackup-config`
-CLI exists (plan item 10), the import tool is the interim `python -m zfsbackup.config.store.importer`.
+Import YAML first with the config CLI (a destructive full replace of whatever the DB holds; the
+outgoing config is backed up next to the DB unless `--no-backup`). `python -m zfsbackup.cli` works
+without an installed entry point.
 
 ```bash
-python -m zfsbackup.config.store.importer zfsbackup/config.example.yaml -c /tmp/zfsbackup/config.db
+zfsbackup-config -c /tmp/zfsbackup/config.db import zfsbackup/config.example.yaml
+zfsbackup-config -c /tmp/zfsbackup/config.db export          # DB -> YAML on stdout
+zfsbackup-config -c /tmp/zfsbackup/config.db migrate --check # schema up to date?
 python -m zfsbackup.daemon --test-config -c /tmp/zfsbackup/config.db
 python -m zfsbackup.daemon -c /tmp/zfsbackup/config.db --dry-run
 ```
@@ -113,11 +116,15 @@ the dataclasses, not a replacement — `DatasetConfig` is also a remote wire for
 and config objects outlive any session. YAML survives only as an import format and (from Phase 2) the
 `$EDITOR` buffer; `BackupConfig.from_file` remains the single YAML parser.
 
-**[zfsbackup/runtime_config.py](zfsbackup/runtime_config.py)** — the daemon core's only door into the
+**[zfsbackup/runtime_config.py](zfsbackup/runtime_config.py)** — the daemon core's door into the
 store: `daemon.py` and `workers.py` call `load_runtime_config()` and never open a connection or touch
 an ORM class. Read-only, one connection at a time, and only a path string crosses the process
-boundary — never a loaded `BackupConfig` or an engine. The config CLI (`zfsbackup/cli/`, Phase 2) does
-not exist yet.
+boundary — never a loaded `BackupConfig` or an engine. The CLI currently reuses its read-only loader
+for `export` and `migrate --check`; that moves into the store's public API in item 15.1.
+
+**[zfsbackup/cli/](zfsbackup/cli/)** — the `zfsbackup-config` Click application (Phase 2, in progress):
+`import`, `export` and `migrate` today; `render.py` turns a `BackupConfig` back into YAML that
+`from_file` reproduces exactly, including duration literals. It is the only writer of the config DB.
 
 > **`zfsbackup/store/` is reserved and deliberately empty.** It is for *backup data* destinations —
 > object storage, cloud targets and the like. Configuration persistence lives under
@@ -152,6 +159,9 @@ not exist yet.
 | `tests/test_zfsbackup_store_permissions.py` | Group-operator permission model (mocked Linux ownership) |
 | `tests/test_zfsbackup_daemon_resilience.py` | Restart backoff, shutdown `finally`, abandoned workers, SIGHUP stopgap |
 | `tests/test_zfsbackup_fork_shm.py` | Fork child must not let the parent delete `-wal`/`-shm` (runs in a timed subprocess) |
+| `tests/test_zfsbackup_store_upgrade.py` | Pinned schema head, `upgrade_schema` (transactional, FK check, concurrency), import backup hook |
+| `tests/test_zfsbackup_cli.py` | `zfsbackup-config` commands, path resolution, exit codes, import backups |
+| `tests/test_zfsbackup_cli_render.py` | YAML renderer round trip (values and duration literals) |
 | `tests/test_marker_tiers.py` | `unit` and `integration` partition the mocked suite |
 | `tests/test_zfsbackup_real.py` | Daemon against a real pool, marked `real_zfs` |
 
@@ -182,7 +192,8 @@ orchestrates the cycle: subagents cannot call each other, so the main loop drive
 
 **File ownership inside `zfsbackup/` is exclusive** — no file is co-edited. A plan item spanning two
 owners is split by the planner into sequenced sub-items. Daemon and CLI reach the config store only
-through `zfsbackup.config.store.mapper`, never through ORM models; the CLI is the only writer.
+through the public API of `zfsbackup.config.store` (its `__all__`), never through ORM models; the CLI is
+the only writer.
 
 **One cycle:** `zfs-code-reviewer` finds issues → the matching planner produces an ordered plan (a
 proposal) → **user approves** → the owning developer implements → `pytest-test-author` (and

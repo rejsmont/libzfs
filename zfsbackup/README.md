@@ -51,10 +51,12 @@ See [config.example.yaml](config.example.yaml) for more examples.
 Then import it. Import is a **full replace** of whatever the database already holds:
 
 ```bash
-python -m zfsbackup.config.store.importer /path/to/config.yaml
+zfsbackup-config import /path/to/config.yaml
 ```
 
-This is an interim tool; it will be replaced by `zfsbackup-config import`, which is not implemented yet.
+The outgoing configuration is saved next to the database as `config.db.pre-import-<UTC>.yaml` first
+(`--no-backup` skips it). `zfsbackup-config export` prints the stored configuration as YAML, and
+`zfsbackup-config migrate` upgrades the database schema after a package upgrade.
 
 ## Usage
 

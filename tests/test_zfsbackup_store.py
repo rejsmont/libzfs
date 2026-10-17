@@ -101,6 +101,7 @@ from zfsbackup.config.store.mapper import (
     validate_config,
 )
 from zfsbackup.config.store.migrate import (
+    KNOWN_REVISIONS,
     SchemaError,
     SchemaOutOfDate,
     SchemaSplitBrain,
@@ -2713,10 +2714,11 @@ class TestMigrations:
         message = str(excinfo.value)
         assert "deadbeefcafe" in message
         assert code_head in message
-        # `SchemaVersionMismatch` wraps the underlying Alembic error via
-        # `raise ... from`, so the original CommandError is still reachable.
-        assert excinfo.value.__cause__ is not None
-        assert "deadbeefcafe" in str(excinfo.value.__cause__)
+        # Item 10.1: the verdict is a membership test against
+        # `KNOWN_REVISIONS`, not a script lookup that fails inside Alembic,
+        # so there is no underlying Alembic error to chain.
+        assert excinfo.value.__cause__ is None
+        assert "deadbeefcafe" not in KNOWN_REVISIONS
 
     def test_ensure_schema_is_idempotent(self, empty_memory_engine):
         with empty_memory_engine.connect() as conn:
@@ -3099,18 +3101,11 @@ class TestMigrateCheckSchema:
     unmodified**: that is the actual proof the extraction was
     behaviour-preserving, not merely "these four new tests pass".
 
-    One case is intentionally not covered here and cannot be while this
-    package ships a single migration revision: a database whose recorded
-    heads are older than the code's head, but still a revision this
-    package's script directory recognises (the ordinary "operator has not
-    run `import`/migrate since upgrading the package" case). Reaching it
-    requires at least two revisions in `zfsbackup/config/store/migrations/`
-    so that `script.get_revision(revision)` succeeds for a known-but-not-
-    head revision. Today, `set(db_heads) != {code_head}` is only ever
-    reached with `db_heads` empty (no revision recorded at all -- the
-    brand-new/never-migrated case exercised below), because there is no
-    second revision to be "behind". Whoever adds the second migration
-    should add the genuinely-older-known-revision case here.
+    The known-but-behind case (a recorded revision this package recognises
+    that is not the head) needs a second revision and lives in
+    `tests/test_zfsbackup_store_upgrade.py` (`TestCheckSchemaKnownButBehind`),
+    which builds a synthetic one in a temp script dir. So does the proof that
+    `check_schema` reads no migration scripts at all (item 10.1, B1).
     """
 
     @pytest.fixture
@@ -3176,8 +3171,11 @@ class TestMigrateCheckSchema:
                 check_schema(conn)
 
         message = str(excinfo.value)
-        assert "check_schema" in message
-        assert "never migrates" in message or "never write" in message.lower()
+        assert "check_schema" not in message
+        assert "The daemon only checks the schema" in message
+        assert "Run `zfsbackup-config migrate`" in message
+        # `import` is a destructive full replace, never the remedy offered.
+        assert "zfsbackup-config import" not in message
 
     def test_split_brain_raises_schema_split_brain(self, empty_memory_engine):
         """Full application schema, no recorded Alembic revision at all --
@@ -3249,8 +3247,12 @@ class TestMigrateSchemaErrorHierarchy:
         """Simulates "this installed package's own migration scripts have
         more than one head" -- a packaging defect this repository's own
         single-revision history cannot otherwise reproduce -- by patching
-        `ScriptDirectory.get_heads` to return two ids, exactly as
-        `check_schema`'s own guard comment describes reaching this branch.
+        `ScriptDirectory.get_heads` to return two ids.
+
+        Item 10.1: `check_schema` reads no scripts any more, so the guard
+        lives in `_assert_scripts_match_constants`, reached on the write
+        path -- driven here through `ensure_schema` (a brand-new database is
+        `SchemaOutOfDate`, so it goes on to the script check).
         """
         eng = create_engine(
             "sqlite:///:memory:",
@@ -3263,10 +3265,11 @@ class TestMigrateSchemaErrorHierarchy:
                     ScriptDirectory, "get_heads", return_value=["a", "b"]
                 ):
                     with pytest.raises(RuntimeError) as excinfo:
-                        check_schema(conn)
+                        ensure_schema(conn)
 
             assert not isinstance(excinfo.value, SchemaError)
             assert type(excinfo.value) is RuntimeError
+            assert "2 heads" in str(excinfo.value)
         finally:
             eng.dispose()
 

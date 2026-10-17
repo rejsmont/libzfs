@@ -1014,7 +1014,5 @@ class TestMainConfigSourceResolution:
         assert result == 1
         # SchemaOutOfDate's message, logged VERBATIM (config_error_message
         # returns ConfigPathError/SchemaError text unmodified).
-        assert (
-            "check_schema() only checks -- it never migrates the database"
-            in caplog.text
-        )
+        assert "The daemon only checks the schema" in caplog.text
+        assert "Run `zfsbackup-config migrate`" in caplog.text

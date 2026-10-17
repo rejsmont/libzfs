@@ -5,6 +5,13 @@ description = "Python interface to the ZFS utilities"
 authors = ["Radoslaw Kamil Ejsmont <radoslaw@ejsmont.net>"]
 license = "MIT"
 readme = "README.md"
+packages = [
+    {include = "libzfseasy"},
+    {include = "zfsbackup"},
+]
+
+[tool.poetry.scripts]
+zfsbackup-config = "zfsbackup.cli.main:main"
 
 [tool.poetry.dependencies]
 python = "^3.11"
