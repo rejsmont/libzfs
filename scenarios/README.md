@@ -15,6 +15,7 @@ The mocked/`real_zfs` **pytest** suites live under [`tests/`](../tests/), not he
 | [`create_test_pool.sh`](create_test_pool.sh) | Create a temp-file pool with nested datasets (`mountpoint=none`) matching [`../zfsbackup/config.example.yaml`](../zfsbackup/config.example.yaml). |
 | [`test_pool.sh`](test_pool.sh) | Ad-hoc scratch pool with a nested layout for manual experimentation. |
 | [`test_two_vm_backup.sh`](test_two_vm_backup.sh) | End-to-end two-VM (Multipass) harness exercising the real network transfer path — scenarios A (full) / B (incremental) / C (server-down resilience) / D (client-restart persistence). Flags: `--keep`, `--keep-pools`, `--purge`. |
+| [`test_config_permissions.sh`](test_config_permissions.sh) | One Multipass VM, users `zfsbackup` (daemon) + `alice`/`bob` (group operators): proves the SQLite config store's group-operator permission model on real Linux — root's first import (dir `2770 root:zfsbackup`, DB `0660`), operator re-imports while the daemon runs as `zfsbackup`, SIGHUP-killed first opener leaving sidecars in the service group, non-default `0600` `-c` staying `0600`, and the clear preflight error when the setgid bit is missing. Uses a stub `zfs`/`zpool` and `--dry-run` (the point is DB access, not ZFS ops). Flags: `--keep`, `--purge`. |
 
 ## Usage
 
@@ -38,3 +39,9 @@ editing these scripts:
   `sh -c '... >/dev/null 2>&1'`).
 - **Deliver config via `multipass transfer`, not heredoc-piped stdin** (`multipass exec ... tee`) —
   piping on host stdin hangs/spins.
+- **A guest command that exits with status 4 hangs `multipass exec` forever** (verified: `exit 4`
+  wedges, 2/3/104 do not). It bites `systemctl is-active` on a unit that no longer exists (exit 4 on
+  current systemd). `test_config_permissions.sh` runs every guest command in an inner shell that remaps
+  4 to 104; do the same in any new Multipass code that probes unit state.
+- `multipass purge` is global (it destroys every deleted VM, not just yours); prefer
+  `multipass delete --purge <vm>` for a single VM.

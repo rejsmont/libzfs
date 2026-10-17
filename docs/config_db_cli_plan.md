@@ -28,7 +28,8 @@ carries a status note or "as landed" text — where those disagree with the prop
 | Checkpoint A review | done | Findings, decisions and audit under "Checkpoint A" |
 | A-1…A-8, A-10…A-20 fix-up | done | Reviewed clean by both reviewers; mocked suite 1557 passed |
 | A-21 follow-up | done | Five low items from the re-review, plus a corrected fingerprint placement found by the concurrency re-review |
-| **A-9 permissions scenario** | **outstanding** | Last item before Phase 2 (the two-VM D7 part is done) |
+| A-9 scenarios | done | Two-VM harness 15/15 on the DB-backed config; `test_config_permissions.sh` 61/61 on real Linux. Startup exits 1 (not 78) on a sidecar permission error; 78 is the worker code |
+| **Phase 2** | **in progress** | Items 10.1 and 10.2 implemented, in test/review |
 | 10–16 Config CLI | approved, not started | Revised after Checkpoint A; order 10 → 15 → 13 → 11 → 12 → 14 → 16 |
 | 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
 | 21–23 Docs, scenarios, final review | not started | |

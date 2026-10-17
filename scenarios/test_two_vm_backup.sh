@@ -144,7 +144,10 @@ install_stack() {
     # a host temp file first, then transfer the file (avoids proxying host stdin through exec).
     step "Copying source into $vm:$SRC_DIR"
     local tar; tar="$(mktemp)"
-    ( cd "$(dirname "$0")" && git archive --format=tar HEAD ) > "$tar" || die "git archive failed"
+    # `git archive` run inside scenarios/ would archive ONLY that subtree, so anchor it at the
+    # repo top level.
+    local top; top="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)" || die "not in a git repo"
+    git -C "$top" archive --format=tar HEAD > "$tar" || die "git archive failed"
     multipass transfer "$tar" "$vm:/tmp/zfsbackup-src.tar" || die "source transfer failed for $vm"
     rm -f "$tar"
     msh "$vm" "rm -rf '$SRC_DIR' && mkdir -p '$SRC_DIR' && tar -xf /tmp/zfsbackup-src.tar -C '$SRC_DIR' && rm -f /tmp/zfsbackup-src.tar"
@@ -155,7 +158,8 @@ install_stack() {
         set -e
         test -x '$PY' || python3 -m venv '$VENV'
         '$PIP' install -q --upgrade pip
-        '$PIP' install -q pyyaml 'flask>=3' flask-sock websocket-client requests
+        '$PIP' install -q pyyaml 'flask>=3' flask-sock websocket-client requests \
+            'sqlalchemy>=2.0' 'alembic>=1.13' 'click>=8.1'
     " || die "pip install failed on $vm"
 
     msh "$vm" "mkdir -p /etc/zfsbackup /var/lib/zfsbackup"
