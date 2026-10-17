@@ -201,18 +201,23 @@ for the CLI's first write, not a requirement of the reader's connect.)
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import logging
 import os
 import stat as stat_module
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, List, Literal, Mapping, Optional, Union
+from typing import Iterator, List, Literal, Mapping, Optional, Set, Tuple, Union
 
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
 from zfsbackup.config.store.db import get_engine, session_scope, url_for_path
+from zfsbackup.config.store.errors import ConfigBusy
 
 logger = logging.getLogger(__name__)
 
@@ -232,7 +237,9 @@ __all__ = [
     "ConfigPathEnvError",
     "ConfigPathError",
     "DEFAULT_CONFIG_DB",
+    "DEFAULT_WRITER_LOCK_TIMEOUT",
     "ResolvedConfigPath",
+    "WRITER_LOCK_SUFFIX",
     "check_config_db",
     "check_config_db_suffix",
     "create_config_db_file",
@@ -245,6 +252,8 @@ __all__ = [
     "open_config_session",
     "resolve_config_path",
     "resolve_config_url",
+    "writer_lock",
+    "writer_lock_path",
 ]
 
 # --------------------------------------------------------------------------
@@ -1926,3 +1935,203 @@ def ensure_config_db_mode(path: Union[str, Path]) -> None:
             sidecar, CONFIG_DB_MODE, access=os.R_OK | os.W_OK,
             what="WAL sidecar",
         )
+
+
+# --------------------------------------------------------------------------
+# CLI writer lock (item 15.4)
+# --------------------------------------------------------------------------
+
+#: Appended to the resolved database path: `config.db` -> `config.db.writer.lock`.
+#: NOT `<db>.lock`: that is the name SQLite's `unix-dotfile` VFS uses for its
+#: own locking, and a file we flock'd under that name could be mistaken for
+#: (or interfere with) SQLite's.
+WRITER_LOCK_SUFFIX = ".writer.lock"
+
+#: How long `writer_lock` waits for another zfsbackup-config writer before
+#: giving up with `ConfigBusy`. Longer than `busy_timeout` (5 s) on purpose: a
+#: second writer queueing behind an `import` that is mid-migration should
+#: normally just wait its turn rather than fail.
+DEFAULT_WRITER_LOCK_TIMEOUT = 10.0
+
+#: `(st_dev, st_ino)` of the lock files this THREAD currently holds. `flock`
+#: locks belong to the open file description, so a second `writer_lock` in the
+#: same thread would open a new description and wait on itself for the whole
+#: timeout, then report a "busy" that names a writer that does not exist.
+#: Refusing loudly is the honest failure. Other threads are not affected:
+#: they legitimately contend and get `ConfigBusy` on timeout.
+_writer_locks_held = threading.local()
+
+
+def writer_lock_path(resolved: ResolvedConfigPath) -> Path:
+    """The lock file beside `resolved`'s database. Uses `resolved_path`, so
+    two spellings of one database (a symlink, a relative path) share a lock."""
+    return Path(str(resolved.resolved_path) + WRITER_LOCK_SUFFIX)
+
+
+def _open_writer_lock_fd(lock: Path, *, default_db: bool) -> int:
+    """Open (creating if missing) the lock file and return an fd, never
+    following a symlink. Follows `create_config_db_file`'s and
+    `_ensure_mode`'s rules: a file THIS call creates is brought to
+    `CONFIG_DB_MODE` on its own fd before anything else can see it (and, for
+    root on the default path, given to the service group); an existing file is
+    only ever chmod'd on the default path and only by its owner (`_ensure_mode`).
+    The file is never deleted -- an unlink would let one writer lock the old
+    inode while another creates and locks a new one, i.e. two holders."""
+    base = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    last_error: Optional[OSError] = None
+    for _ in range(3):
+        try:
+            fd = os.open(
+                str(lock), base | os.O_CREAT | os.O_EXCL | os.O_RDWR, CONFIG_DB_MODE
+            )
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise ConfigDbPermissionError(
+                _permission_failure_message(
+                    f"create the writer lock {lock}", lock.parent, exc
+                )
+            ) from exc
+        else:
+            try:
+                if default_db:
+                    _chgrp_to_service_group(lock, "writer lock file", fd=fd)
+                os.fchmod(fd, CONFIG_DB_MODE)
+            except OSError as exc:
+                os.close(fd)
+                raise ConfigDbPermissionError(
+                    _permission_failure_message(
+                        f"chmod {lock} to {CONFIG_DB_MODE:04o}", lock, exc
+                    )
+                ) from exc
+            except BaseException:
+                os.close(fd)
+                raise
+            return fd
+
+        # Exists. flock(2) needs no write access, so an operator who can only
+        # read a root-made lock file can still take the lock.
+        for access in (os.O_RDWR, os.O_RDONLY):
+            try:
+                fd = os.open(str(lock), base | access)
+            except FileNotFoundError:
+                break  # vanished (hand-deleted); try creating again
+            except PermissionError as exc:
+                last_error = exc
+                continue
+            except OSError as exc:
+                raise ConfigDbPermissionError(
+                    _permission_failure_message(
+                        f"open the writer lock {lock}", lock, exc
+                    )
+                ) from exc
+            if default_db:
+                try:
+                    _ensure_mode(
+                        lock, CONFIG_DB_MODE, access=os.R_OK, what="writer lock file"
+                    )
+                except BaseException:
+                    os.close(fd)
+                    raise
+            return fd
+        else:
+            raise ConfigDbPermissionError(
+                _permission_failure_message(
+                    f"open the writer lock {lock}", lock, last_error  # type: ignore[arg-type]
+                )
+            ) from last_error
+    raise ConfigDbPermissionError(
+        f"Cannot open the writer lock {lock}: it keeps appearing and "
+        "disappearing. Something is deleting it; it must never be removed."
+    )
+
+
+@contextmanager
+def writer_lock(
+    resolved: ResolvedConfigPath, *, timeout: float = DEFAULT_WRITER_LOCK_TIMEOUT
+) -> Iterator[Path]:
+    """Hold an exclusive `flock` on `<db>.writer.lock` for the `with` block.
+
+    Serialises every `zfsbackup-config` WRITER (`write_config`, `import_yaml`)
+    against every other, across processes. SQLite's own write lock already
+    serialises individual transactions; this one covers what SQLite cannot see:
+    a writer's decisions *before* it opens a transaction. Without it two
+    imports racing on a missing database both decide "I create it", and
+    `import_yaml`'s failed-first-import cleanup has to guess -- from sidecar
+    files and an `lstat` fingerprint -- whether anybody else has attached
+    (see `importer.py`'s A-11 notes). Under this lock, that question has an
+    answer: nobody who honours the lock.
+
+    **Scope.** It binds only openers that take it. A process that opens the
+    database directly (the `sqlite3` shell, a script, a different program) is
+    outside it, and the daemon never takes it -- the daemon only reads, and
+    under WAL a reader neither blocks nor is blocked by this lock's holder.
+
+    Blocks for up to `timeout` seconds (polling a non-blocking `flock`, so a
+    stuck holder cannot hang the CLI forever), then raises `ConfigBusy`.
+    `timeout=0` tries exactly once. Not re-entrant: taking it twice in one
+    thread raises `RuntimeError` instead of waiting on itself.
+
+    The lock file is created if missing (0660, in the setgid config directory,
+    group = the directory's, or the service group for root on the default path)
+    and NEVER deleted. The directory must already exist and be searchable --
+    this function creates no directories, so a caller that may be the first
+    to run (`import_yaml`) must create it first. It is released when the block
+    exits, by any means, and by the kernel if the process dies.
+
+    The lock file adds one more file next to the database, besides WAL's
+    `-wal`/`-shm`: it matters for packaging, backups (do not archive it as
+    state), and `scenarios/` cleanup.
+    """
+    lock = writer_lock_path(resolved)
+    fd = _open_writer_lock_fd(
+        lock, default_db=is_default_config_path(resolved.resolved_path)
+    )
+    try:
+        st = os.fstat(fd)
+        key = (st.st_dev, st.st_ino)
+        held: Set[Tuple[int, int]] = getattr(_writer_locks_held, "keys", None) or set()
+        _writer_locks_held.keys = held
+        if key in held:
+            raise RuntimeError(
+                f"writer_lock({lock}) is not re-entrant: this thread already "
+                "holds it. Take the lock once, at the outermost write."
+            )
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    raise ConfigDbPermissionError(
+                        _permission_failure_message(
+                            f"lock {lock}", lock, exc
+                        )
+                    ) from exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ConfigBusy(
+                        f"another zfsbackup-config write to {resolved.path} is "
+                        f"still in progress (waited {timeout:g}s for {lock}); "
+                        "retry in a moment."
+                    ) from None
+                time.sleep(min(0.05, remaining))
+
+        held.add(key)
+        try:
+            yield lock
+        finally:
+            held.discard(key)
+    finally:
+        # Closing releases the flock once the last descriptor on the open file
+        # description is gone. An explicit LOCK_UN ends it now even if a forked
+        # child still holds a duplicate of the description (flock locks belong
+        # to the description, which a fork shares): the block is over, so the
+        # lock is too.
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)

@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -84,6 +85,8 @@ from zfsbackup.config import (
     validate_retention_uniqueness,
 )
 from zfsbackup.config.store import models
+from zfsbackup.config.store.errors import ConfigConflict
+from zfsbackup.config.store.migrate import check_schema
 
 logger = logging.getLogger(__name__)
 
@@ -452,6 +455,56 @@ def load_config(session: Session) -> BackupConfig:
     )
 
 
+@dataclass(frozen=True)
+class ConfigSnapshot:
+    """A configuration together with the facts it was read at, all from ONE
+    read transaction.
+
+    `generation` is `GlobalSettings.generation` -- the compare-and-swap token
+    a writer hands back to `save_config`/`write_config` as
+    `expected_generation`. `schema_rev` is the Alembic revision the schema
+    check verified (always `EXPECTED_HEAD`; a snapshot of any other schema is
+    refused with a `SchemaError` before it exists). `config` is a fully
+    detached `BackupConfig` (see `load_config`): safe to hold for the life of
+    the process.
+    """
+
+    config: BackupConfig
+    generation: int
+    schema_rev: str
+
+
+def load_config_snapshot(
+    session: Session, *, schema_rev: Optional[str] = None
+) -> ConfigSnapshot:
+    """`load_config` plus the generation and schema revision, as one read.
+
+    The CALLER owns the transaction: `session` must already be inside the one
+    read transaction the snapshot is meant to be consistent with (for a
+    reader, an explicit `BEGIN` -- see `access.read_config`; for a writer
+    session, the `BEGIN IMMEDIATE` it opened with). Everything here is read
+    through it, so the config rows, the generation and the schema revision
+    cannot come from different commits. `generation` is deliberately not read
+    by a second, later query on a fresh transaction: that would let a write
+    land between the config and its token, and the token would then
+    authorise overwriting a config the caller never saw.
+
+    `schema_rev`: pass the revision a `check_schema` run on this same
+    transaction already returned. Left `None`, `check_schema` runs here, on
+    `session.connection()`, i.e. inside the same transaction -- so a snapshot
+    is never handed out for a schema this package cannot read. Raises
+    whatever `check_schema` / `load_config` raise.
+    """
+    if schema_rev is None:
+        schema_rev = check_schema(session.connection())
+    config = load_config(session)
+    # `load_config` raised if this row were absent, and it is already in the
+    # session's identity map from that very read.
+    gs = session.get(models.GlobalSettings, 1)
+    assert gs is not None
+    return ConfigSnapshot(config=config, generation=gs.generation, schema_rev=schema_rev)
+
+
 _MAX_PORT = 65535
 
 
@@ -781,8 +834,26 @@ def _dedupe_exact_duplicates(rules: List[RetentionRule]) -> List[RetentionRule]:
     return deduped
 
 
-def save_config(session: Session, config: BackupConfig) -> None:
-    """Replace the entire config store with `config`'s contents.
+def save_config(
+    session: Session,
+    config: BackupConfig,
+    *,
+    expected_generation: Optional[int] = None,
+) -> int:
+    """Replace the entire config store with `config`'s contents and return the
+    new `GlobalSettings.generation`.
+
+    `expected_generation` makes this a compare-and-swap: when given, the
+    stored generation is compared with it inside the caller's transaction,
+    BEFORE any `DELETE`, and a mismatch raises `ConfigConflict(expected,
+    actual)` with nothing written (`actual` is `None` if the store holds no
+    `GlobalSettings` row). Pass the `ConfigSnapshot.generation` the edit was
+    based on. `None` (the default) is an unconditional replace -- `import`'s
+    semantics: the operator is deliberately discarding whatever is there.
+    The comparison is only meaningful if the caller's transaction already
+    holds SQLite's write lock (`db.py`'s writer sessions open with `BEGIN
+    IMMEDIATE`); on a connection that does not, the read and the later
+    write are not atomic.
 
     Wipe-and-reinsert, not diff-and-merge: diffing would have to reconcile
     surrogate ids across a config with none of its own, and every
@@ -814,8 +885,9 @@ def save_config(session: Session, config: BackupConfig) -> None:
        (and `validate_config` has already warned, naming both literals).
     3. Read the current `GlobalSettings.generation` (default -1 if the
        table is empty/absent) so the fresh row below is `previous + 1`, not
-       reset to 0 -- items 15/17 depend on `generation` as a
-       compare-and-swap token surviving a save.
+       reset to 0 -- the generation is a compare-and-swap token surviving a
+       save. If `expected_generation` was given, compare it to this value
+       now, before anything is deleted (`ConfigConflict`).
     4. Delete in order **retention_rules -> dataset_remotes -> datasets ->
        destinations -> global_settings -> remote_server**, flushing between
        each. This is a superset of the FK-implied order and does NOT rely
@@ -862,18 +934,27 @@ def save_config(session: Session, config: BackupConfig) -> None:
     # --- 1. Validate, before any DELETE runs. ---
     validate_config(config)
 
-    # --- 3. Read the generation to carry forward (before any DELETE). ---
-    # This read and the `previous + 1` written in step 6 are a read-modify-
-    # write with no CAS predicate of their own (see `GlobalSettings.
-    # generation` in `models.py`). It is safe only because the caller's
-    # session runs on a writer connection that took SQLite's write lock at
-    # `BEGIN IMMEDIATE` -- `store/db.py` installs that on every file-backed
-    # writer engine precisely so this read cannot race another writer's.
-    # Two writers without it both read N, both write N+1, and items 15/17
-    # never notice the second config. Do not "optimise" this read onto a
-    # separate connection or a read-only session.
+    # --- 3. Read the generation, compare it, carry it forward. ---
+    # All before any DELETE: a conflict must leave the store byte-for-byte
+    # as it was, and the DELETEs below are not undoable short of the
+    # caller rolling back the whole session.
+    #
+    # This is the CAS the `GlobalSettings.generation` comment in `models.py`
+    # describes. Its atomicity comes from the caller's transaction holding
+    # SQLite's write lock from before this read until commit (`store/db.py`
+    # starts every file-backed writer transaction with `BEGIN IMMEDIATE`), so
+    # no one can commit between the compare here and the `previous + 1` write
+    # in step 6. Do not move this read onto a separate connection or a
+    # read-only session.
     existing_gs = session.get(models.GlobalSettings, 1)
     previous_generation = existing_gs.generation if existing_gs is not None else -1
+    if expected_generation is not None and (
+        existing_gs is None or existing_gs.generation != expected_generation
+    ):
+        raise ConfigConflict(
+            expected_generation,
+            None if existing_gs is None else existing_gs.generation,
+        )
 
     # --- 4. Delete in dependency order, flushing between each. ---
     # Every child table is deleted explicitly -- do NOT shrink this back to
@@ -997,3 +1078,4 @@ def save_config(session: Session, config: BackupConfig) -> None:
         ))
 
     session.flush()
+    return previous_generation + 1

@@ -47,6 +47,11 @@ raising the concurrent-create error 10 (7 pre-existing orphan tests); the new
 error dropped from `zfsbackup.config.store` or `paths.__all__` 1 each. The
 `integration` class repeats the measured reproduction with B as a real
 separate process.
+
+15.5 (the pre-lock call returns silently once the database has appeared; the
+under-lock call still raises), scratch copy, tests failing in this file: the
+`before_lock` early return removed 3; the pre-lock call not passing
+`before_lock=True` 2; the "created concurrently" branch removed altogether 9.
 """
 
 import json
@@ -58,13 +63,16 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 from sqlalchemy.exc import OperationalError
 
 from zfsbackup.config.store import (
+    ConfigBusy,
     ConfigDbCreatedConcurrently,
     ConfigDbOrphanedSidecars,
     ConfigPathError,
@@ -99,6 +107,50 @@ def warnings_of(caplog):
 
 def listing(directory: Path):
     return sorted(p.name for p in directory.iterdir())
+
+
+#: Since item 15.4 every `import_yaml` that gets as far as the target takes
+#: `<db>.writer.lock`; it is an empty file, created 0660 and never deleted,
+#: so it outlives even a failed first import's unlink of the database itself.
+LOCK = "config.db" + store_paths.WRITER_LOCK_SUFFIX
+
+
+@contextmanager
+def lock_ignoring_opener():
+    """Run the body as an opener that does NOT honour the writer lock (the
+    `sqlite3` shell, an old zfsbackup, a script). The A-11 cleanup heuristics
+    (inode, sidecars, probe, fingerprint) exist for exactly that party now:
+    a lock-honouring second writer cannot run inside A's critical section, so
+    the in-thread "B commits during A's failing phase" simulations model B
+    this way. B's calls to `import_yaml` resolve `importer.writer_lock` at call
+    time, so patching it here leaves A's already-entered lock alone."""
+
+    @contextmanager
+    def no_lock(*_a, **_k):
+        yield None
+
+    real = importer_module.writer_lock
+    importer_module.writer_lock = no_lock
+    try:
+        yield
+    finally:
+        importer_module.writer_lock = real
+
+
+def import_ignoring_the_lock(path, resolved):
+    with lock_ignoring_opener():
+        return import_yaml(path, resolved)
+
+
+def with_lock_timeout(monkeypatch, seconds):
+    """Make every FUTURE `import_yaml` wait at most `seconds` for the writer
+    lock (the default is 10 s, far too long for a test)."""
+    real = importer_module.writer_lock
+
+    def short(resolved, *, timeout=seconds):
+        return real(resolved, timeout=timeout)
+
+    monkeypatch.setattr(importer_module, "writer_lock", short)
 
 
 def inodes(*paths):
@@ -176,7 +228,7 @@ class TestAnotherWritersImportSurvives:
         target, resolved = store
 
         def writer_b():
-            result = import_yaml(yaml_b, resolved)  # re-import branch: commits
+            result = import_ignoring_the_lock(yaml_b, resolved)  # re-import: commits
             assert result.created is False
             dispose_all()
 
@@ -205,9 +257,162 @@ class TestAnotherWritersImportSurvives:
         self, store, yaml_a, yaml_b, monkeypatch
     ):
         _target, resolved = store
-        fail_phase3(monkeypatch, before=lambda: (import_yaml(yaml_b, resolved), dispose_all()))
+        fail_phase3(
+            monkeypatch,
+            before=lambda: (import_ignoring_the_lock(yaml_b, resolved), dispose_all()),
+        )
         with pytest.raises(OperationalError):
             import_yaml(yaml_a, resolved)
+
+
+# ---------------------------------------------------------------------------
+# Item 15.4: a second import that HONOURS the writer lock
+# ---------------------------------------------------------------------------
+
+
+class TestLockHonouringSecondImport:
+    """The A-11 race, re-stated under the writer lock. B cannot run inside A's
+    critical section any more -- in the same thread it is a `RuntimeError`
+    (not re-entrant), in another thread or process it WAITS. Either B runs
+    before A looked (A is then a re-import, creating and deleting nothing) or
+    after A's cleanup is over (B then finds what A left). No committed import
+    is lost in either order."""
+
+    @staticmethod
+    def _start_b(yaml_b, resolved, box):
+        def run():
+            try:
+                box["result"] = import_yaml(yaml_b, resolved)
+                dispose_all()
+            except BaseException as exc:  # reported to the test thread
+                box["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread
+
+    def test_the_same_thread_cannot_nest_a_second_import(
+        self, store, yaml_a, yaml_b, monkeypatch
+    ):
+        _target, resolved = store
+        seen = {}
+
+        def nested():
+            with pytest.raises(RuntimeError, match="not re-entrant") as excinfo:
+                import_yaml(yaml_b, resolved)
+            seen["message"] = str(excinfo.value)
+
+        fail_phase3(monkeypatch, before=nested)
+        with pytest.raises(OperationalError, match="database is locked"):
+            import_yaml(yaml_a, resolved)  # the nesting error did not mask it
+        assert "this thread already holds it" in seen["message"]
+
+    def test_b_waits_for_a_failed_first_imports_unlink_then_creates(
+        self, store, yaml_a, yaml_b, monkeypatch, caplog
+    ):
+        target, resolved = store
+        box = {}
+
+        def b_starts_and_waits():
+            box["thread"] = self._start_b(yaml_b, resolved, box)
+            box["thread"].join(0.5)
+            box["alive_in_phase3"] = box["thread"].is_alive()
+            box["db_in_phase3"] = target.exists()
+            box["listing_in_phase3"] = listing(target.parent)
+
+        fail_phase3(monkeypatch, before=b_starts_and_waits)
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(OperationalError, match="database is locked"):
+                import_yaml(yaml_a, resolved)
+        monkeypatch.undo()
+        box["thread"].join(30)
+
+        assert not box["thread"].is_alive() and "error" not in box, box
+        # B was genuinely parked inside A's critical section...
+        assert box["alive_in_phase3"] is True
+        assert box["db_in_phase3"] is True
+        # ...A's cleanup ran to the end (it unlinked its own empty database)...
+        assert any("created by this failed import" in r.getMessage() for r in caplog.records)
+        # ...and B then created its own, which is what is left.
+        assert box["result"].created is True
+        with open_config_session(resolved, readonly=True) as session:
+            assert [d.name for d in load_config(session).datasets] == ["pool/B"]
+        dispose_all()
+        assert listing(target.parent) == sorted(["config.db", LOCK])
+
+    def test_a_reimport_that_fails_leaves_the_second_import_s_commit_alone(
+        self, store, yaml_a, yaml_b, monkeypatch
+    ):
+        """A is a RE-import over an existing database and fails in phase 3
+        (rolled back); B waits and then commits. Final state: B's."""
+        target, resolved = store
+        import_yaml(yaml_a, resolved)
+        dispose_all()
+        box = {}
+
+        def b_starts():
+            box["thread"] = self._start_b(yaml_b, resolved, box)
+            box["thread"].join(0.3)
+            box["alive"] = box["thread"].is_alive()
+
+        fail_phase3(monkeypatch, before=b_starts)
+        with pytest.raises(OperationalError):
+            import_yaml(yaml_a, resolved)
+        monkeypatch.undo()
+        box["thread"].join(30)
+
+        assert box["alive"] is True and "error" not in box, box
+        assert box["result"].created is False
+        with open_config_session(resolved, readonly=True) as session:
+            assert [d.name for d in load_config(session).datasets] == ["pool/B"]
+
+    def test_b_gives_up_with_config_busy_and_a_s_cleanup_still_runs(
+        self, store, yaml_a, yaml_b, monkeypatch, caplog
+    ):
+        target, resolved = store
+        box = {}
+
+        def b_times_out():
+            with_lock_timeout(monkeypatch, 0.2)
+
+            def run():
+                try:
+                    import_yaml(yaml_b, resolved)
+                except ConfigBusy as exc:
+                    box["busy"] = exc
+                except BaseException as exc:  # pragma: no cover - reported below
+                    box["other"] = exc
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            thread.join(10)
+            box["finished"] = not thread.is_alive()
+
+        fail_phase3(monkeypatch, before=b_times_out)
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(OperationalError, match="database is locked"):
+                import_yaml(yaml_a, resolved)
+        monkeypatch.undo()
+
+        assert box.get("finished") is True and "other" not in box, box
+        busy = box["busy"]
+        assert isinstance(busy, ConfigBusy)
+        assert str(target) in str(busy)
+        assert not isinstance(busy, ConfigPathError)  # exit 75, not 78
+        # Nothing of B's was written: A's cleanup found an empty schema-only
+        # database it had itself created, and removed it.
+        assert any("created by this failed import" in r.getMessage() for r in caplog.records)
+        assert listing(target.parent) == [LOCK]
+
+    def test_the_lock_is_released_when_the_import_fails(self, store, yaml_a, yaml_b, monkeypatch):
+        """A failed import must not leave the lock held: the next one runs."""
+        target, resolved = store
+        fail_phase3(monkeypatch)
+        with pytest.raises(OperationalError):
+            import_yaml(yaml_a, resolved)
+        monkeypatch.undo()
+        with_lock_timeout(monkeypatch, 0.0)  # one try: a held lock would be ConfigBusy
+        assert import_yaml(yaml_b, resolved).created is True
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +442,9 @@ class TestConnectedReaderKeepsItsFiles:
                     import_yaml(yaml_a, resolved)
             monkeypatch.undo()
 
-            assert listing(target.parent) == ["config.db", "config.db-shm", "config.db-wal"]
+            assert listing(target.parent) == sorted(
+                ["config.db", "config.db-shm", "config.db-wal", LOCK]
+            )
             assert inodes(target, Path(f"{target}-wal"), Path(f"{target}-shm")) == held["before"]
             # The reader is not just "connected": its database is still readable.
             assert held["conn"].execute("select count(*) from alembic_version").fetchone()[0] >= 0
@@ -621,8 +828,12 @@ class TestRemoveCreatedTarget:
         with pytest.raises(OperationalError):
             import_yaml(yaml_a, resolved)
 
+        # The database -- and only the database. The writer lock file is not
+        # state, is never deleted (an unlink would let two writers lock two
+        # different inodes), and stays.
         assert unlinked == [target]
-        assert listing(target.parent) == []
+        assert listing(target.parent) == [LOCK]
+        assert (target.parent / LOCK).stat().st_size == 0
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +844,21 @@ class TestRemoveCreatedTarget:
 # whole concurrent import become the baseline)
 # ---------------------------------------------------------------------------
 
+#: B, an opener that does NOT honour the writer lock (the cleanup heuristics'
+#: remaining customer; a lock-honouring B cannot run inside A's cleanup at all).
 B_IMPORT = (
+    "import sys, logging, contextlib; logging.disable(logging.WARNING);"
+    "import zfsbackup.config.store.importer as imp;"
+    "imp.writer_lock = contextlib.contextmanager(lambda *a, **k: (yield None));"
+    "from zfsbackup.config.store.importer import import_yaml;"
+    "from zfsbackup.config.store.paths import resolve_config_path;"
+    "r = import_yaml(sys.argv[1], resolve_config_path(sys.argv[2]));"
+    "print('B created=%s' % r.created)"
+)
+
+
+#: B, an opener that DOES honour the writer lock (every zfsbackup-config writer).
+B_IMPORT_HONOURING = (
     "import sys, logging; logging.disable(logging.WARNING);"
     "from zfsbackup.config.store.importer import import_yaml;"
     "from zfsbackup.config.store.paths import resolve_config_path;"
@@ -756,7 +981,9 @@ class TestFingerprintStall:
 
     def _run_concurrent_import(self, yaml_b, resolved):
         time.sleep(0.05)  # a coarse-clock filesystem must see a later mtime/ctime
-        result = import_yaml(yaml_b, resolved)  # re-import branch: commits
+        # B ignores the writer lock: a lock-honouring B cannot run here at all
+        # (A holds the lock through its cleanup; see TestLockHonouringSecondImport).
+        result = import_ignoring_the_lock(yaml_b, resolved)  # re-import: commits
         assert result.created is False
         dispose_all()  # B "exits": last close checkpoints and removes the sidecars
 
@@ -790,7 +1017,7 @@ class TestFingerprintStall:
         assert after[2] != top[2]
         assert after[3] != top[3]
 
-        assert listing(target.parent) == ["config.db"]
+        assert listing(target.parent) == sorted(["config.db", LOCK])
         with open_config_session(resolved, readonly=True) as session:
             assert [d.name for d in load_config(session).datasets] == ["pool/B"]
         (message,) = [m for m in warnings_of(caplog) if "NOT removed" in m]
@@ -1020,42 +1247,89 @@ class TestCreatedConcurrentlyIsNotOrphaned:
         monkeypatch.setattr(importer_module, "_target_exists", stale)
         return calls
 
-    def test_the_database_appearing_after_the_first_check_is_reported_as_such(
+    def test_the_database_appearing_after_the_first_check_is_waited_for_not_refused(
         self, live_database, yaml_a, monkeypatch
     ):
+        """15.5: the pre-lock check no longer raises `ConfigDbCreatedConcurrently`.
+        A database that appeared after the caller's existence check is a
+        concurrent first import holding the writer lock; the right behaviour
+        is to queue behind it and re-import, which is what happens here (the
+        writer lock is free, so it queues for no time at all)."""
         target, resolved, reader = live_database
-        names = listing(target.parent)
-        before = {n: os.lstat(target.parent / n) for n in names}
         calls = self.stale_first_check(monkeypatch)
 
-        with pytest.raises(ConfigDbCreatedConcurrently) as excinfo:
-            import_yaml(yaml_a, resolved)
+        result = import_yaml(yaml_a, resolved)
 
-        assert len(calls) == 2  # the import's own check, then the re-look
-        assert isinstance(excinfo.value, ConfigPathError)
-        assert not isinstance(excinfo.value, ConfigDbOrphanedSidecars)
-        assert not isinstance(excinfo.value, OSError)
-        message = str(excinfo.value)
-        assert f"{target} was created concurrently by another process" in message
-        # ...and it names the sidecars that were actually found.
-        assert f"{target}-wal" in message and f"{target}-shm" in message
-        assert "-journal" not in message
-        assert "retry" in message
-        assert "Nothing was created or changed here" in message
-        # The advice for genuine orphans would be wrong -- and harmful -- here.
-        for advice in ("remove", "Remove", "delete", "fuser", "lsof", "orphan "):
-            assert advice not in message, advice
-        # Nothing created, nothing changed, B's configuration intact.
-        assert listing(target.parent) == names
-        for name, st in before.items():
-            now = os.lstat(target.parent / name)
-            assert (now.st_ino, now.st_size, now.st_mtime_ns) == (
-                st.st_ino, st.st_size, st.st_mtime_ns,
-            )
+        assert len(calls) >= 2  # the import's own (stale) check, then the re-look
+        assert result.created is False
+        assert result.generation == 1  # B's first import was generation 0
+        # The reader that kept -wal/-shm live was never disturbed.
         assert reader.execute("select count(*) from alembic_version").fetchone()[0] >= 0
         monkeypatch.undo()
         with open_config_session(resolved, readonly=True) as session:
-            assert [d.name for d in load_config(session).datasets] == ["pool/B"]
+            assert [d.name for d in load_config(session).datasets] == ["pool/A"]
+
+    def test_the_pre_lock_call_returns_silently_when_the_database_has_appeared(self, store):
+        target, _resolved = store
+        wal = Path(f"{target}-wal")
+        wal.write_bytes(b"x")
+        target.write_bytes(b"")  # the database appears
+        importer_module._refuse_orphaned_sidecars(target, before_lock=True)  # no raise
+        assert wal.read_bytes() == b"x"
+
+    def test_the_pre_lock_call_still_refuses_genuine_orphans(self, store):
+        target, _resolved = store
+        Path(f"{target}-wal").write_bytes(b"x")
+        with pytest.raises(ConfigDbOrphanedSidecars):
+            importer_module._refuse_orphaned_sidecars(target, before_lock=True)
+
+    def test_the_under_lock_check_still_reports_a_database_created_beneath_it(
+        self, store, yaml_a, monkeypatch
+    ):
+        """Reachable only if a process that ignores the writer lock creates the
+        database (plus its -wal/-shm) between `_import_locked`'s existence
+        check and its sidecar scan: nothing that honours the lock can. Then
+        the under-lock re-look must still say "created concurrently", never
+        the orphan advice (deleting a live -wal corrupts its database)."""
+        target, resolved = store
+        real_lock = importer_module.writer_lock
+        real_exists = importer_module._target_exists
+        state = {"armed": False, "consumed": False}
+        keep = []
+
+        @contextmanager
+        def lock_then_foreign_create(*a, **k):
+            with real_lock(*a, **k):
+                # A lock-ignoring process creates the database in WAL mode and
+                # keeps it open, so -wal/-shm are live.
+                conn = sqlite3.connect(str(target))
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("create table t (x)")
+                conn.commit()
+                keep.append(conn)
+                state["armed"] = True
+                yield
+
+        def stale_once_under_the_lock(path):
+            if state["armed"] and not state["consumed"] and Path(path) == target:
+                state["consumed"] = True
+                return False  # what `_import_locked` saw just before the create landed
+            return real_exists(path)
+
+        monkeypatch.setattr(importer_module, "writer_lock", lock_then_foreign_create)
+        monkeypatch.setattr(importer_module, "_target_exists", stale_once_under_the_lock)
+        try:
+            with pytest.raises(ConfigDbCreatedConcurrently) as excinfo:
+                import_yaml(yaml_a, resolved)
+        finally:
+            for conn in keep:
+                conn.close()
+        message = str(excinfo.value)
+        assert state["consumed"]
+        assert "created concurrently" in message and "retry" in message
+        for advice in ("remove", "Remove", "fuser", "lsof"):
+            assert advice not in message, advice
+        assert not isinstance(excinfo.value, ConfigDbOrphanedSidecars)
 
     def test_a_database_that_is_still_absent_keeps_the_orphan_error(
         self, store, yaml_a, monkeypatch
@@ -1154,7 +1428,9 @@ class TestOrphanedSidecarsRefused:
         assert isinstance(excinfo.value, ConfigPathError)
         assert not isinstance(excinfo.value, OSError)
         assert not os.path.lexists(target)
+        # Refused BEFORE the writer lock: not even the lock file exists.
         assert listing(target.parent) == [orphan.name]
+        assert not os.path.lexists(target.parent / LOCK)
         after = os.lstat(orphan)
         assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
             before.st_ino, before.st_size, before.st_mtime_ns,
@@ -1174,6 +1450,7 @@ class TestOrphanedSidecarsRefused:
         assert "once no process has them open" in message
         assert "fuser" in message and "lsof" in message
         assert "Nothing was created or changed" in message
+        assert not os.path.lexists(target.parent / LOCK)
 
     def test_the_default_directory_is_not_chmodded_either(
         self, tmp_path, yaml_a, monkeypatch
@@ -1234,6 +1511,7 @@ class TestOrphanedSidecarsRefused:
 
         with pytest.raises(ConfigDbNotFound):
             import_yaml(yaml_a, resolved, create=False)
+        assert listing(target.parent) == [f"{target.name}-wal"]  # no lock file either
 
     def test_an_invalid_yaml_is_still_reported_as_such(self, store, tmp_path):
         target, resolved = store
@@ -1242,6 +1520,7 @@ class TestOrphanedSidecarsRefused:
         bad.write_text("datasets:\n  - name: pool/data\n    enabled: 5\n")
         with pytest.raises(ValueError, match="enabled"):
             import_yaml(bad, resolved)
+        assert listing(target.parent) == [f"{target.name}-wal"]  # no lock file either
 
     def test_a_reimport_over_an_existing_database_is_not_refused(
         self, store, yaml_a, yaml_b
@@ -1266,7 +1545,10 @@ class TestOrphanedSidecarsRefused:
 
 DRIVER = textwrap.dedent(
     '''
-    """mode=import: A = first import (phase 3 fails after B ran); B = re-import.
+    """mode=import: A = first import (phase 3 fails after B ran); B = re-import by an
+    opener that IGNORES the writer lock (the cleanup heuristics' remaining customer).
+    mode=locked: as `import`, but B honours the writer lock: it must block until A's
+    cleanup is over, then run as a FIRST import (A unlinked its own empty database).
     mode=reader: A = first import (phase 3 fails while R holds a read connection).
     Prints one `RESULT <json>` line. Self-destructs via SIGALRM."""
     import json, logging, os, signal, sqlite3, sys, time
@@ -1313,13 +1595,39 @@ DRIVER = textwrap.dedent(
     while not inph3.exists():
         time.sleep(0.05)
     out["before_cleanup"] = files()
-    if mode == "import":
+    if mode in ("import", "locked"):
+        import contextlib, threading
         import zfsbackup.config.store.importer as imp
         from zfsbackup.config.store.paths import resolve_config_path
         from zfsbackup.config.store.db import dispose_all
-        out["b_created"] = imp.import_yaml(yb, resolve_config_path(str(db))).created
-        dispose_all()
+
+        @contextlib.contextmanager
+        def no_lock(*a, **k):
+            yield None
+
+        if mode == "import":
+            imp.writer_lock = no_lock
+        box = {}
+
+        def b_main():
+            try:
+                box["created"] = imp.import_yaml(yb, resolve_config_path(str(db))).created
+            except BaseException as exc:
+                box["error"] = repr(exc)
+
+        b = threading.Thread(target=b_main)
+        b.start()
+        if mode == "locked":
+            b.join(0.7)
+            out["b_blocked_while_a_holds_the_lock"] = b.is_alive()
+        else:
+            b.join(40)  # B commits BEFORE A's cleanup runs
         go.write_text("x")
+        b.join(40)
+        out["b_finished"] = not b.is_alive()
+        out["b_created"] = box.get("created")
+        out["b_error"] = box.get("error")
+        dispose_all()
         os.waitpid(pid, 0)
         out["files"] = files()
         if db.exists():
@@ -1389,11 +1697,32 @@ class TestCleanupRaceAcrossProcesses:
         assert "Another process has since imported a configuration" in result["a_log"]
         assert "this import was NOT applied" in result["a_log"]
 
+    def test_a_lock_honouring_second_import_waits_for_the_cleanup_then_creates(
+        self, tmp_path
+    ):
+        """A-11 under the writer lock (item 15.4), over a real `fork`: B starts
+        while A (a failing FIRST import) holds the lock, is observed blocked,
+        and only runs once A's cleanup -- the unlink of A's own empty
+        database -- is over. B then creates the database afresh and its
+        configuration is the one that survives; nothing committed is lost."""
+        result = run_driver(tmp_path, "locked")
+
+        assert "DRIVER-ERROR" not in result["a_log"], result
+        assert result["b_blocked_while_a_holds_the_lock"] is True, result
+        assert result["b_finished"] is True and result["b_error"] is None, result
+        assert result["b_created"] is True, result  # A's file was gone by the time B looked
+        assert result["datasets"] == ["pool/B"], result
+        assert result["files"] == sorted(["config.db", LOCK]), result
+        assert "created by this failed import" in result["a_log"], result  # A did unlink
+        assert "NOT removed" not in result["a_log"], result
+
     def test_a_connected_reader_keeps_db_wal_and_shm(self, tmp_path):
         result = run_driver(tmp_path, "reader")
 
         assert "DRIVER-ERROR" not in result["a_log"], result
-        assert result["reader_files"] == ["config.db", "config.db-shm", "config.db-wal"], result
+        assert result["reader_files"] == sorted(
+            ["config.db", "config.db-shm", "config.db-wal", LOCK]
+        ), result
         assert result["files"] == result["reader_files"], result
         assert result["same_inodes"] is True, result
         assert result["reader_still_reads"] is True, result
@@ -1435,7 +1764,8 @@ class TestFingerprintStallAcrossProcesses:
         proc = out["proc"]
         assert proc.returncode == 0, proc.stderr
         assert "B created=False" in proc.stdout  # B adopted A's schema-only file
-        assert out["files_after_b"] == ["config.db"]  # B exited: no sidecar left to see
+        # B exited: no sidecar left to see (and A's lock file is simply there)
+        assert out["files_after_b"] == sorted(["config.db", LOCK])
         assert target.exists()
         conn = sqlite3.connect(str(target))
         try:
@@ -1445,3 +1775,143 @@ class TestFingerprintStallAcrossProcesses:
         (message,) = [m for m in warnings_of(caplog) if "NOT removed" in m]
         assert "changed since it was checked" in message
         assert "re-running the import reuses it" in message
+
+    @pytest.mark.parametrize("point", ["after_probe", "before_step5"])
+    def test_a_lock_honouring_process_waits_for_the_unlink_then_creates(
+        self, store, yaml_a, yaml_b, monkeypatch, caplog, point
+    ):
+        """The same window, with B a real process that honours the writer lock:
+        it cannot run inside A's cleanup, so there is nothing for the
+        fingerprint to catch. B is parked until A's unlink is over, then
+        creates the database afresh; B's configuration is the one that
+        remains and A logs a plain removal, never a "NOT removed" skip."""
+        target, resolved = store
+        out = {}
+
+        def b_process_starts():
+            out["proc"] = subprocess.Popen(
+                [sys.executable, "-c", B_IMPORT_HONOURING, str(yaml_b), str(target)],
+                cwd=ROOT, env=dict(os.environ, PYTHONPATH=str(ROOT)),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            time.sleep(1.0)  # long enough for B to import and start waiting
+            out["blocked"] = out["proc"].poll() is None
+            out["files_during"] = listing(target.parent)
+
+        fail_phase3(monkeypatch)
+        stall(monkeypatch, point, b_process_starts)
+        try:
+            with caplog.at_level(logging.INFO):
+                with pytest.raises(OperationalError):
+                    import_yaml(yaml_a, resolved)
+            monkeypatch.undo()
+            stdout, stderr = out["proc"].communicate(timeout=60)
+        finally:
+            if "proc" in out and out["proc"].poll() is None:
+                out["proc"].kill()
+                out["proc"].communicate()
+
+        assert out["blocked"] is True
+        assert out["proc"].returncode == 0, stderr
+        assert "B created=True" in stdout
+        assert warnings_of(caplog) == []
+        assert any("created by this failed import" in r.getMessage() for r in caplog.records)
+        conn = sqlite3.connect(str(target))
+        try:
+            assert [r[0] for r in conn.execute("select name from datasets")] == ["pool/B"]
+        finally:
+            conn.close()
+        assert LOCK in listing(target.parent)
+
+
+#: Process A of the 15.5 pre-lock race: a real first import that HOLDS the
+#: writer lock after the database and its WAL exist (a reader keeps -wal/-shm
+#: live), until told to go. It re-enters `import_yaml` with the lock patched
+#: out only because the test needs to hold the real lock across the window.
+A_HOLDS_THE_LOCK = textwrap.dedent(
+    '''
+    import contextlib, logging, os, sqlite3, sys, time
+    logging.disable(logging.WARNING)
+    import zfsbackup.config.store.importer as imp
+    from zfsbackup.config.store import resolve_config_path, writer_lock
+
+    yaml_a, db, go = sys.argv[1:4]
+    resolved = resolve_config_path(db)
+    with writer_lock(resolved):
+        imp.writer_lock = contextlib.contextmanager(lambda *a, **k: (yield None))
+        r = imp.import_yaml(yaml_a, resolved)
+        reader = sqlite3.connect(db)
+        reader.execute("select count(*) from alembic_version").fetchall()
+        assert os.path.exists(db + "-wal") and os.path.exists(db + "-shm"), os.listdir(os.path.dirname(db))
+        print("ready", r.created, flush=True)
+        deadline = time.monotonic() + 60
+        while not os.path.exists(go) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        reader.close()
+    print("released", flush=True)
+    '''
+)
+
+
+@pytest.mark.integration
+class TestPreLockRaceAcrossProcesses:
+    """15.5, measured with a real second process: B's existence check saw no
+    database; A (a separate process) then created it plus its WAL under the
+    writer lock; B's pre-lock sidecar check ran while A still held the lock.
+    It used to raise `ConfigDbCreatedConcurrently`; it must wait and re-import.
+    """
+
+    def test_b_waits_for_a_then_reimports_over_it(self, store, yaml_a, yaml_b, tmp_path, monkeypatch):
+        target, resolved = store
+        go = tmp_path / "go"
+        proc = subprocess.Popen(
+            [sys.executable, "-c", A_HOLDS_THE_LOCK, str(yaml_a), str(target), str(go)],
+            cwd=ROOT, env=dict(os.environ, PYTHONPATH=str(ROOT)),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        box = {}
+        try:
+            assert proc.stdout.readline().split() == ["ready", "True"], proc.stderr.read()
+            assert Path(f"{target}-wal").exists() and Path(f"{target}-shm").exists()
+            assert target.exists()
+
+            # B's first existence check ran before A created the database.
+            real = importer_module._target_exists
+            calls = []
+
+            def stale(path):
+                calls.append(Path(path))
+                return False if len(calls) == 1 else real(path)
+
+            monkeypatch.setattr(importer_module, "_target_exists", stale)
+
+            def b_main():
+                try:
+                    box["result"] = import_yaml(yaml_b, resolve_config_path(str(target)))
+                except BaseException as exc:
+                    box["error"] = exc
+
+            b = threading.Thread(target=b_main)
+            b.start()
+            b.join(1.0)
+            assert b.is_alive(), f"B should be queued behind A's lock, got {box!r}"
+            assert "error" not in box and "result" not in box
+            assert len(calls) >= 2  # the stale check, then the pre-lock re-look
+
+            go.write_text("x")
+            b.join(30)
+            assert not b.is_alive()
+        finally:
+            go.write_text("x")
+            try:
+                proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+        assert "error" not in box, repr(box.get("error"))
+        assert box["result"].created is False
+        assert box["result"].generation == 1
+        monkeypatch.undo()
+        dispose_all()
+        with open_config_session(resolved, readonly=True) as session:
+            assert [d.name for d in load_config(session).datasets] == ["pool/B"]

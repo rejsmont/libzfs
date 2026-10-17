@@ -89,7 +89,9 @@ from zfsbackup.config.store.db import (
     session_scope,
     url_for_path,
 )
+from zfsbackup.config.store.errors import ConfigBusy, ConfigConflict
 from zfsbackup.config.store.mapper import (
+    ConfigSnapshot,
     _assert_scope_integrity,
     _dataset_level_rules,
     _dataset_to_dataclass,
@@ -97,6 +99,7 @@ from zfsbackup.config.store.mapper import (
     _duration_from_row,
     _scoped_rules,
     load_config,
+    load_config_snapshot,
     save_config,
     validate_config,
 )
@@ -5492,7 +5495,7 @@ class TestDbReadOnlySessions:
 
         reader_engine = make_engine(url, readonly=True)
         try:
-            with pytest.raises(ReadOnlySessionError):
+            with pytest.raises(ReadOnlySessionError) as excinfo:
                 with session_for_engine(reader_engine, readonly=True) as session:
                     dataset = session.query(Dataset).first()
                     dataset.frequency_seconds = 999
@@ -5500,6 +5503,11 @@ class TestDbReadOnlySessions:
         finally:
             reader_engine.dispose()
 
+        # Item 15.5 wording: the CLI is the ONLY writer (the daemon and the
+        # workers never write either), and the entity is named.
+        assert "Read-only sessions never write; the CLI is the only writer." in str(excinfo.value)
+        assert "Dataset" in str(excinfo.value)
+        assert "daemon" not in str(excinfo.value)
         assert db_path.read_bytes() == before
 
     def test_bulk_delete_raises_readonly_session_error(self, seeded_file_db):
@@ -8345,3 +8353,189 @@ class TestBaselineRevision:
         with migrated_db.connect() as conn:
             with pytest.raises(SchemaVersionMismatch):
                 check_schema(conn)
+
+
+# ---------------------------------------------------------------------------
+# Item 15.1 -- generation compare-and-swap in `save_config`, and
+# `load_config_snapshot`. In-memory, session-level; the file-backed
+# `write_config` / `read_config` / writer-lock coverage is in
+# `test_zfsbackup_store_access.py`.
+# ---------------------------------------------------------------------------
+
+
+def _dataset_names(session):
+    return sorted(d.name for d in session.query(Dataset).all())
+
+
+@pytest.mark.unit
+class TestSaveConfigGenerationCas:
+    """`save_config(..., expected_generation=)` compares inside the caller's
+    transaction, after `validate_config` and BEFORE any DELETE."""
+
+    def test_the_return_value_is_the_new_generation(self, session):
+        assert save_config(session, _minimal_backup_config(name="tank/a")) == 0
+        session.commit()
+        assert save_config(session, _minimal_backup_config(name="tank/a")) == 1
+        session.commit()
+        assert session.get(GlobalSettings, 1).generation == 1
+
+    def test_the_current_generation_succeeds_and_returns_plus_one(self, session):
+        save_config(session, _minimal_backup_config(name="tank/a"))
+        session.commit()
+        new = save_config(
+            session, _minimal_backup_config(name="tank/b"), expected_generation=0
+        )
+        session.commit()
+        assert new == 1
+        assert _dataset_names(session) == ["tank/b"]
+
+    def test_a_stale_generation_raises_conflict_with_both_numbers(self, session):
+        save_config(session, _minimal_backup_config(name="tank/a"))
+        session.commit()
+        save_config(session, _minimal_backup_config(name="tank/a"))
+        session.commit()  # now at generation 1
+
+        with pytest.raises(ConfigConflict) as excinfo:
+            save_config(
+                session, _minimal_backup_config(name="tank/b"), expected_generation=0
+            )
+        assert (excinfo.value.expected, excinfo.value.actual) == (0, 1)
+        assert "generation 0" in str(excinfo.value) and "generation 1" in str(excinfo.value)
+
+    def test_a_conflict_happens_before_any_delete(self, session):
+        """The row is still there in THIS session, un-rolled-back: a compare
+        placed after the wipe would already have flushed the DELETEs."""
+        save_config(session, _minimal_backup_config(name="tank/a"))
+        session.commit()
+        with pytest.raises(ConfigConflict):
+            save_config(
+                session, _minimal_backup_config(name="tank/b"), expected_generation=5
+            )
+        assert not session.deleted and not session.new
+        assert _dataset_names(session) == ["tank/a"]
+        # Every table the wipe would touch, not just the one it touches last:
+        # the wipe starts with `retention_rules`.
+        assert session.query(RetentionRule).count() == 1
+        assert session.query(Dataset).count() == 1
+        assert session.get(GlobalSettings, 1).generation == 0
+
+    def test_a_future_generation_conflicts_too(self, session):
+        save_config(session, _minimal_backup_config())
+        session.commit()
+        with pytest.raises(ConfigConflict) as excinfo:
+            save_config(session, _minimal_backup_config(), expected_generation=7)
+        assert (excinfo.value.expected, excinfo.value.actual) == (7, 0)
+
+    def test_none_is_an_unconditional_overwrite(self, session):
+        save_config(session, _minimal_backup_config(name="tank/a"))
+        session.commit()
+        save_config(session, _minimal_backup_config(name="tank/a"))
+        session.commit()
+        assert save_config(
+            session, _minimal_backup_config(name="tank/z"), expected_generation=None
+        ) == 2
+        session.commit()
+        assert _dataset_names(session) == ["tank/z"]
+
+    def test_an_empty_store_has_no_generation_to_match(self, session):
+        with pytest.raises(ConfigConflict) as excinfo:
+            save_config(session, _minimal_backup_config(), expected_generation=0)
+        assert (excinfo.value.expected, excinfo.value.actual) == (0, None)
+        assert "no configuration" in str(excinfo.value)
+        assert _dataset_names(session) == []
+
+    def test_a_vanished_global_settings_row_reports_actual_none(self, session):
+        save_config(session, _minimal_backup_config())
+        session.commit()
+        session.execute(delete(GlobalSettings))
+        session.commit()
+        with pytest.raises(ConfigConflict) as excinfo:
+            save_config(session, _minimal_backup_config(), expected_generation=0)
+        assert excinfo.value.actual is None
+        # ...and with no expectation the store is simply re-initialised at 0.
+        assert save_config(session, _minimal_backup_config()) == 0
+
+    def test_validation_runs_before_the_compare(self, session):
+        """An invalid config against a stale generation is the config's
+        problem (`ValueError`), not a conflict the caller would retry."""
+        save_config(session, _minimal_backup_config())
+        session.commit()
+        bad = BackupConfig(datasets=[])
+        with pytest.raises(ValueError):
+            save_config(session, bad, expected_generation=99)
+
+    def test_conflict_is_neither_a_path_nor_a_schema_error(self):
+        # The CLI maps those two to exit 78 ("the database is unusable") and
+        # a conflict to exit 75 ("look again and retry").
+        assert not issubclass(ConfigConflict, (store_paths.ConfigPathError, SchemaError))
+        assert not issubclass(ConfigBusy, (store_paths.ConfigPathError, SchemaError))
+
+    def test_a_conflicting_save_leaves_the_stored_config_intact_after_rollback(self, session):
+        save_config(session, _minimal_backup_config(name="tank/a"))
+        session.commit()
+        with pytest.raises(ConfigConflict):
+            save_config(session, _minimal_backup_config(name="tank/b"), expected_generation=3)
+        session.rollback()
+        assert load_config(session).datasets[0].name == "tank/a"
+
+
+@pytest.mark.unit
+class TestLoadConfigSnapshot:
+    @pytest.fixture
+    def head_engine(self):
+        eng = make_engine("sqlite:///:memory:", foreign_keys=True)
+        with eng.begin() as conn:
+            ensure_schema(conn)
+        yield eng
+        eng.dispose()
+
+    def test_config_generation_and_schema_rev_come_back_together(self, head_engine):
+        config = _minimal_backup_config(name="tank/snap")
+        with Session(head_engine) as s:
+            save_config(s, config)
+            save_config(s, config)
+            s.commit()
+            snap = load_config_snapshot(s)
+        assert isinstance(snap, ConfigSnapshot)
+        assert snap.config == config
+        assert snap.generation == 1
+        assert snap.schema_rev == EXPECTED_HEAD
+
+    def test_it_is_frozen(self, head_engine):
+        with Session(head_engine) as s:
+            save_config(s, _minimal_backup_config())
+            s.commit()
+            snap = load_config_snapshot(s)
+        with pytest.raises(Exception):
+            snap.generation = 99
+
+    def test_schema_rev_none_runs_check_schema_on_the_callers_transaction(self, engine):
+        # `engine` is create_all-only: every table, no stamp -> split brain.
+        # Only reachable if `load_config_snapshot` really runs `check_schema`.
+        with Session(engine) as s:
+            save_config(s, _minimal_backup_config())
+            s.commit()
+            with pytest.raises(SchemaSplitBrain):
+                load_config_snapshot(s)
+
+    def test_a_given_schema_rev_is_trusted_and_not_rechecked(self, engine):
+        with Session(engine) as s:
+            save_config(s, _minimal_backup_config())
+            s.commit()
+            snap = load_config_snapshot(s, schema_rev="whatever-the-caller-verified")
+        assert snap.schema_rev == "whatever-the-caller-verified"
+        assert snap.generation == 0
+
+    def test_an_uninitialised_store_is_a_value_error_not_a_none_generation(self, head_engine):
+        with Session(head_engine) as s:
+            with pytest.raises(ValueError):
+                load_config_snapshot(s)
+
+    def test_generation_tracks_each_save(self, head_engine):
+        with Session(head_engine) as s:
+            seen = []
+            for _ in range(3):
+                save_config(s, _minimal_backup_config())
+                s.commit()
+                seen.append(load_config_snapshot(s).generation)
+        assert seen == [0, 1, 2]

@@ -120,9 +120,9 @@ block and are never blocked" true under WAL. If a future change adds the
 documented `BEGIN`-on-connect recipe (for serializable isolation), every
 reader session pins a WAL read snapshot for its whole lifetime, and the
 `-wal` file grows without bound because a checkpoint cannot pass a live
-reader. The workers are long-lived readers; this would be a slow-motion disk
-exhaustion bug, not a test failure. The writer side does not have that
-problem: writer sessions are short-lived CLI commands, and a write
+reader. Any long-lived reader (the supervisor's later config polling, if
+it is added) would make this a slow-motion disk exhaustion bug, not a test
+failure. The writer side does not have that problem: writer sessions are short-lived CLI commands, and a write
 transaction has to hold the lock anyway.
 
 WAL sidecars
@@ -951,8 +951,8 @@ def _install_readonly_guard(session: Session) -> None:
             names = sorted({type(obj).__name__ for obj in changed})
             raise ReadOnlySessionError(
                 "write attempted through a read-only session (pending "
-                f"changes to: {', '.join(names)}). Worker processes open "
-                "the config store read-only; the CLI is the only writer."
+                f"changes to: {', '.join(names)}). Read-only sessions "
+                "never write; the CLI is the only writer."
             )
 
     @event.listens_for(session, "do_orm_execute")
@@ -1061,7 +1061,9 @@ def session_scope(url: str, *, readonly: bool = False) -> Iterator[Session]:
     pool, `PRAGMA query_only=ON`, `synchronous=NORMAL`) and installs the
     `ReadOnlySessionError` guard.
 
-    **Who passes what.** Worker processes: always `readonly=True`. CLI:
+    **Who passes what.** Every reader (the daemon supervisor's one startup
+    read, via `access.read_config`; worker processes never open the store):
+    always `readonly=True`. CLI:
     `readonly=True` for every command that only reads (`show`, `validate`,
     `export`, ...) and the default read-write form only for commands that
     mutate. That is not a stylistic preference. Since writer transactions

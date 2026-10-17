@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Dict, List, Optional, Set
 
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DatabaseError, OperationalError
 
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
@@ -19,16 +19,16 @@ from zfsbackup.config.store import (
     ConfigPathError,
     ResolvedConfigPath,
     SchemaError,
+    check_config_db,
     dispose_all,
     resolve_config_path,
 )
 from zfsbackup.runtime_config import (
-    EX_CONFIG,
-    check_config_schema,
     config_error_message,
     describe_config_source,
     load_runtime_config,
 )
+from zfsbackup import daemonlock
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup.stopflag import StopFlag
 from zfsbackup.workers import SnapshotWorker, PruningWorker, ApiWorker, RemoteBackupWorker
@@ -56,8 +56,8 @@ WORKER_RESTART_MAX_DELAY = 300
 #: considered to have recovered: its consecutive-failure count restarts at 1.
 WORKER_STABLE_UPTIME = 600
 #: This many consecutive deaths of one worker (none of them after a
-#: `WORKER_STABLE_UPTIME` run) is treated like `EX_CONFIG`: the daemon stops
-#: and exits 1 instead of respawning forever.
+#: `WORKER_STABLE_UPTIME` run) is fatal to the daemon: it stops and exits 1
+#: instead of respawning forever.
 WORKER_MAX_CONSECUTIVE_FAILURES = 6
 SUPERVISOR_POLL = 5
 #: Longest slice `_supervisor_sleep` sleeps for before re-reading the stop
@@ -92,15 +92,17 @@ class BackupDaemon:
         resolved_config: ResolvedConfigPath,
         verbose: bool = False,
     ):
+        #: The supervisor's detached `BackupConfig`, read once from the
+        #: config database before the first fork, with `--dry-run` already
+        #: applied. This one object is handed to every worker at startup and
+        #: at every crash restart (see `_new_worker`), so all workers always
+        #: run the same generation; a restart does not re-read the database
+        #: (live reload is Phase 3).
         self.config = config
-        #: The config *database* path, with its provenance -- not a YAML
-        #: path, and deliberately not the loaded `BackupConfig`. Each
-        #: worker re-loads from this in its own child process; see
-        #: `_spawn` for why nothing that owns a SQLite handle may cross a
-        #: fork. Renamed from `config_path` rather than merely retyped:
-        #: a silent `Path` -> `ResolvedConfigPath` swap under the old name
-        #: is exactly how a bare `Path` (whose `.url()`/`resolved_path`
-        #: this code needs) sneaks back in unnoticed.
+        #: The config *database* path, with its provenance. Kept for
+        #: diagnostics only: nothing here reads the database after startup
+        #: and no worker is given it. Renamed from `config_path` rather than
+        #: merely retyped, so a bare `Path` cannot sneak back in unnoticed.
         self.resolved_config = resolved_config
         self.verbose = verbose
         #: Not a `multiprocessing.Event`. `Event.set()` blocks forever --
@@ -112,11 +114,8 @@ class BackupDaemon:
         #: `zfsbackup.stopflag` for the mechanism and the measurements.
         self._stop_event = StopFlag()
         self._workers: Dict[str, multiprocessing.Process] = {}
-        #: Workers that exited `EX_CONFIG` and will never be respawned.
-        self._config_failed: Set[str] = set()
-        #: Subset of `_config_failed` that got there by crashing
-        #: `WORKER_MAX_CONSECUTIVE_FAILURES` times in a row rather than by
-        #: exiting `EX_CONFIG`. Only changes the wording of the log line.
+        #: Workers that crashed `WORKER_MAX_CONSECUTIVE_FAILURES` times in a
+        #: row and will never be respawned. Any entry stops the daemon.
         self._crash_looped: Set[str] = set()
         #: Per-worker restart bookkeeping, all on the `time.monotonic()`
         #: clock and all touched only by the supervisor's main thread.
@@ -234,7 +233,12 @@ class BackupDaemon:
             'api': ApiWorker,
             'remote': RemoteBackupWorker,
         }[name]
-        return cls(self.resolved_config, self._stop_event, self.config.dry_run, self.verbose)
+        # The same object for every worker and every respawn -- never a path
+        # to re-read. Under `fork` it is inherited; under `spawn` and
+        # `forkserver` it is pickled, and `Duration.__reduce__` carries the
+        # operator's literals across, so a respawned worker sees exactly the
+        # config its siblings run. `dry_run` is already applied to it.
+        return cls(self.config, self._stop_event, self.verbose)
 
     def _active_worker_names(self) -> list:
         names = ['snapshot', 'pruning', 'api']
@@ -247,20 +251,19 @@ class BackupDaemon:
         every crash restart alike.
 
         `dispose_all()` first, always, and it is **mandatory**, not
-        belt-and-braces. By the time this runs, `main()` has already read
-        the config database, and SQLAlchemy 2.0's default `QueuePool`
-        *retains* the connection it used -- so without this the child would
-        inherit a live SQLite file descriptor on the config database. An
-        inherited descriptor corrupts SQLite silently rather than raising.
-        `store/db.py`'s pid-keyed engine cache alone is **not** a guarantee:
-        it hands a child a fresh engine, but the inherited connection is
-        merely unreferenced, not closed, until the garbage collector gets to
-        it. The child's *close* of an inherited fd is harmless (POSIX locks
-        are per-process, so it releases nothing the parent holds); the harm
-        is SQLite's per-process inode lock bookkeeping, which the child
-        inherits and which its own later connections then share with the
-        stale one, so they skip kernel locks the parent cannot see. Only
-        `dispose_all()` at the fork point, in the process that owns the
+        belt-and-braces. The supervisor read the config database before the
+        first fork, and SQLAlchemy 2.0's default `QueuePool` *retains* the
+        connection it used -- so without this the child would inherit a live
+        SQLite file descriptor on the config database. Workers never use
+        it, but an inherited descriptor is not harmless merely because it is
+        unused: the child's garbage collector may finalise the unreferenced
+        pooled connection, and SQLite's close of a connection it believes is
+        the last one checkpoints and deletes the `-wal`/`-shm` sidecars out
+        from under the parent, while its per-process inode lock bookkeeping
+        no longer matches the kernel's. `store/db.py`'s pid-keyed engine
+        cache alone is **not** a guarantee: it hands a child a fresh engine,
+        but the inherited connection is merely unreferenced, not closed.
+        Only `dispose_all()` at the fork point, in the process that owns the
         connections, closes them before the fork.
 
         This is a choke point on purpose. `_check_workers` re-forks on
@@ -295,8 +298,7 @@ class BackupDaemon:
         for i, name in enumerate(names):
             # Re-checked before every fork, not once: a SIGTERM arriving
             # between spawns would otherwise still fork the remaining
-            # workers, each doing `dispose_all()`, a schema check and a
-            # config load only to be stopped a moment later.
+            # workers only for them to be stopped a moment later.
             if self._stop_event.is_set():
                 logger.info(
                     "Shutdown requested while starting workers; not starting: "
@@ -310,7 +312,7 @@ class BackupDaemon:
 
         Returns `True` if the worker has now died
         `WORKER_MAX_CONSECUTIVE_FAILURES` times in a row, in which case no
-        restart is scheduled and the caller must treat it like `EX_CONFIG`.
+        restart is scheduled and the caller must stop the daemon.
 
         Backoff is `WORKER_RESTART_DELAY * 2**(n-1)` seconds before the n-th
         consecutive restart, capped at `WORKER_RESTART_MAX_DELAY`. A
@@ -347,8 +349,8 @@ class BackupDaemon:
         return False
 
     def _check_workers(self) -> None:
-        """Restart workers that died -- except on a configuration fault,
-        which no restart can fix and which stops the whole daemon.
+        """Restart workers that died -- except a worker that keeps crashing,
+        which stops the whole daemon.
 
         Never sleeps. A dead worker gets a `restart_at` deadline (see
         `_record_worker_death`) and is forked again by whichever later poll
@@ -356,36 +358,28 @@ class BackupDaemon:
         many workers are down, and the stop flag is honoured at the next
         `_supervisor_sleep` slice.
 
-        A worker that exits `EX_CONFIG` has already logged the operator
-        message (`workers._load_config`, via the same
-        `config_error_message` this supervisor would use). Respawning it
-        would re-open SQLite on a loop and turn a stale schema into what
-        looks like a hang. Every other non-zero exit -- including a transient
-        `database is locked` after `busy_timeout` expired, which surfaces as
-        an `OperationalError` and never as a `SchemaError` -- is restarted
-        with backoff, and escalated to the same fatal treatment after
+        A restart hands the replacement the supervisor's own `self.config`
+        (see `_new_worker`); it does not re-read the config database, so a
+        crash can never move one worker onto a different generation than its
+        siblings. There is no configuration failure left to classify here:
+        a worker never opens the database, so a bad one is refused by
+        `_run` before any worker exists, and the `EX_CONFIG` exit a worker
+        used to report for it is gone. A worker that dies is restarted with
+        exponential backoff and escalated to the fatal treatment below after
         `WORKER_MAX_CONSECUTIVE_FAILURES` consecutive deaths.
 
-        **One `EX_CONFIG` exit is fatal to the daemon, not just to that
-        worker.** An earlier version required *every* worker to have failed
-        before stopping, which made the common case silent and inverted the
-        point of the guard: a daemon running at schema head A, an operator
-        importing after a package upgrade so the database moves to head B,
-        and then the `snapshot` worker dying for some unrelated reason
-        hours later. Its respawn verifies the schema (correctly) and exits
-        `EX_CONFIG`; `pruning`, `api` and `remote` are still alive, so the
-        supervisor stayed up forever -- **taking no snapshots**, while the
-        API kept answering and the pruning worker kept deleting, with one
-        ERROR line long since scrolled away. The fork storm this guard
-        replaced was at least loud. Partial degradation with no liveness
-        surface is worse for a backup daemon than an exit the service
-        manager can see, restart, and eventually report as failed.
+        **One crash-looping worker is fatal to the daemon, not just to that
+        worker.** A daemon that keeps three of four workers alive after the
+        fourth gave up -- say, taking no snapshots while the API keeps
+        answering and pruning keeps deleting, with one ERROR line long since
+        scrolled away -- is partial degradation with no liveness surface,
+        which is worse for a backup daemon than an exit the service manager
+        can see, restart, and eventually report as failed.
         """
         # Two passes on purpose: classify every dead worker first, so that
-        # a configuration failure is known before anything is respawned. A
-        # single pass would fork a replacement for an unrelated crash and
-        # then immediately kill it -- one more pointless open of the config
-        # database, at the exact moment the database is the problem.
+        # a worker that has given up is known before anything is respawned.
+        # A single pass would fork a replacement for an unrelated crash and
+        # then immediately shut it down.
         #
         # Workers already waiting out a backoff are skipped: they are still
         # in `_workers` (so `_shutdown_workers` reaps them) but have been
@@ -396,25 +390,15 @@ class BackupDaemon:
         ]
 
         for name, worker in dead:
-            if worker.exitcode == EX_CONFIG:
-                logger.error(
-                    f"{name} worker (pid={worker.pid}) exited with "
-                    f"{EX_CONFIG} (EX_CONFIG): the configuration database is "
-                    f"unusable, so restarting it cannot help."
-                )
-                self._config_failed.add(name)
-                del self._workers[name]
-            elif self._record_worker_death(name, worker):
-                self._config_failed.add(name)
+            if self._record_worker_death(name, worker):
                 self._crash_looped.add(name)
                 del self._workers[name]
 
-        if not self._config_failed:
+        if not self._crash_looped:
             now = self._monotonic()
             due = [n for n, at in sorted(self._restart_at.items(), key=lambda kv: kv[1]) if at <= now]
             for i, name in enumerate(due):
-                # Forking into a shutdown is never right, and forking to
-                # re-open the database is the worst version of it.
+                # Forking into a shutdown is never right.
                 if self._stop_event.is_set():
                     logger.info(
                         "Shutdown requested; not restarting remaining "
@@ -423,30 +407,19 @@ class BackupDaemon:
                     return
                 self._spawn(name, verb='Restarted')
 
-        if self._config_failed:
-            config_names = sorted(self._config_failed - self._crash_looped)
-            if config_names:
-                logger.error(
-                    "Configuration error in worker(s): "
-                    f"{', '.join(config_names)}. The daemon "
-                    "cannot run degraded -- shutting down the remaining "
-                    f"workers ({', '.join(sorted(self._workers)) or 'none'}) "
-                    "and exiting non-zero. Fix the configuration and restart."
-                )
-            if self._crash_looped:
-                logger.error(
-                    "Worker(s) crashed repeatedly and were not restarted: "
-                    f"{', '.join(sorted(self._crash_looped))}. The daemon "
-                    "cannot run degraded -- shutting down the remaining "
-                    f"workers ({', '.join(sorted(self._workers)) or 'none'}) "
-                    "and exiting non-zero. See the worker errors above."
-                )
-            # 8i's promise -- that a configuration fault produces a visible,
-            # non-zero exit instead of a spin -- now holds unconditionally
-            # here: this is precisely the "workers have died" case `StopFlag`
-            # (see `zfsbackup.stopflag`) was built for, and `set()` cannot
-            # wedge on a ghost sleeper the way `multiprocessing.Event` could.
-            # If this is ever reverted to `Event`, that guarantee is lost.
+        if self._crash_looped:
+            logger.error(
+                "Worker(s) crashed repeatedly and were not restarted: "
+                f"{', '.join(sorted(self._crash_looped))}. The daemon "
+                "cannot run degraded -- shutting down the remaining "
+                f"workers ({', '.join(sorted(self._workers)) or 'none'}) "
+                "and exiting non-zero. See the worker errors above."
+            )
+            # A visible, non-zero exit instead of a spin: this is precisely
+            # the "workers have died" case `StopFlag` (see
+            # `zfsbackup.stopflag`) was built for, and `set()` cannot wedge
+            # on a ghost sleeper the way `multiprocessing.Event` could. If
+            # this is ever reverted to `Event`, that guarantee is lost.
             self._stop_event.set()
 
     def _shutdown_workers(self, timeout: int = 30) -> None:
@@ -549,12 +522,11 @@ class BackupDaemon:
 
     def run(self) -> int:
         """Run the supervisor until the stop event is set. Returns the
-        daemon's process exit code: 0 for a clean shutdown in which no
-        worker ever hit a configuration fault, 1 if **any** worker exited
-        `EX_CONFIG` -- in which case `_check_workers` has already stopped
-        the whole daemon rather than let it run degraded. Returning a code
-        at all, rather than always 0, is what lets a service manager see
-        that a stale schema is not a successful run.
+        daemon's process exit code: 0 for a clean shutdown, 1 if **any**
+        worker crash-looped -- in which case `_check_workers` has already
+        stopped the whole daemon rather than let it run degraded. Returning
+        a code at all, rather than always 0, is what lets a service manager
+        see that a daemon that gave up is not a successful run.
         """
         logger.info("=" * 60)
         logger.info("ZFS Backup Daemon Starting")
@@ -570,12 +542,10 @@ class BackupDaemon:
         # Everything above this line shells out to `zfs` once per dataset
         # and takes tens of seconds on a large config, so a SIGTERM landing
         # in it is ordinary, not exotic. Without this guard `run()` forked
-        # every worker anyway -- each doing `dispose_all()`, a schema check
-        # and a full config load -- only for the loop guard below to be
-        # false on its first evaluation. Forking into a shutdown is never
-        # right (`_check_workers` says the same thing about the restart
-        # path, and guards it the same way), and forking to re-open the
-        # config database is the worst version of it. Structured as a
+        # every worker anyway, only for the loop guard below to be false on
+        # its first evaluation. Forking into a shutdown is never right
+        # (`_check_workers` says the same thing about the restart path, and
+        # guards it the same way). Structured as a
         # branch rather than an early return so that the shutdown tail
         # below stays the single exit: `_shutdown_workers` over an empty
         # `_workers` is a no-op, and the log ends with "Daemon stopped"
@@ -616,7 +586,7 @@ class BackupDaemon:
             logger.info("Shutting down workers...")
             self._shutdown_workers()
         logger.info("Daemon stopped")
-        return 1 if self._config_failed else 0
+        return 1 if self._crash_looped else 0
 
     def _report_hup(self) -> None:
         """Log the SIGHUP stopgap message `_sighup_handler` must not log itself."""
@@ -727,32 +697,97 @@ def _hard_exit(code: int, abandoned: List[str]) -> None:  # pragma: no cover - e
     os._exit(code or 1)
 
 
+def _release_refused(lock) -> None:
+    """A startup refusal after the presence lock was taken (the config failed
+    to load): remove the pid file and drop the lock, so a refused start leaves
+    nothing behind and does not look like a running daemon to `probe()`."""
+    if lock is not None:
+        lock.release()
+
+
 def _run(args: argparse.Namespace, abandoned: Optional[List[str]] = None) -> int:
     """`main()`'s body, minus argument parsing and the `dispose_all()` that
     must run on every return path. Split out so that cleanup is a single
     `finally` rather than something each `return` has to remember.
+
+    Startup order: resolve the path -> preflight (`check_config_db`, creates
+    nothing) -> take the presence lock -> read the config -> record its
+    generation in the lock -> `BackupDaemon.run`. `--test-config` skips the
+    lock. Any refusal after the lock was taken releases it.
     """
     resolved = None
+    lock = None
     try:
         # Inside the `try`: resolution itself performs filesystem I/O
         # (`Path.resolve()` walks each component) and can raise
         # `ConfigDbPermissionError` on a symlink loop or an unlinked cwd.
         resolved = resolve_config_path(args.config)
         logger.info(f"Loading configuration from: {describe_config_source(resolved)}")
-        config = load_runtime_config(resolved)
 
-        # In memory only. `--dry-run` is a property of this run, not of the
-        # stored configuration, and the daemon never writes to the database.
+        # Presence lock (item 15.2(c)), taken BEFORE the config is read.
+        # Order: resolve path -> preflight -> acquire -> read -> record the
+        # generation. Were the read first, a `zfsbackup-config` write plus
+        # its `probe()` landing between the read and the lock would print
+        # "no running daemon detected" while this daemon went on to run the
+        # OLD generation. With the lock first, any probe after this point
+        # finds a daemon, and a write that lands before the read is simply
+        # the generation this daemon loads.
+        #
+        # The preflight (`check_config_db`, stat-based, builds no engine and
+        # creates nothing) comes first so a missing database or directory is
+        # refused with the store's own message, never by creating a lock file
+        # beside a database that does not exist. Not taken for
+        # `--test-config`, which must work beside a running daemon. A second
+        # daemon on the same database stops here. The descriptor is held for
+        # the life of the process via `lock`; workers inherit it under
+        # `fork` (see `zfsbackup.daemonlock`).
+        if not args.test_config:
+            check_config_db(resolved)
+            try:
+                lock = daemonlock.acquire(resolved)
+            except daemonlock.DaemonAlreadyRunning as e:
+                logger.error(f"{e}. Refusing to start a second daemon.")
+                return 1
+            except daemonlock.DaemonLockError as e:
+                logger.error(f"Cannot take the daemon lock: {e}")
+                return 1
+
+        # The daemon's ONE read of the config database: a single read
+        # snapshot in which the schema check and the rows are the same
+        # database state. The supervisor hands the resulting detached
+        # `BackupConfig` to its workers, which never open the database
+        # (item 15.2(b)).
+        snapshot = load_runtime_config(resolved)
+        config = snapshot.config
+        generation = snapshot.generation
+        logger.info(
+            f"Configuration generation {generation}, "
+            f"schema revision {snapshot.schema_rev}"
+        )
+        # The generation recorded in the lock is the one the workers are
+        # about to run, which is what `zfsbackup-config` reports to an
+        # operator after an edit. Until this line the file's generation is
+        # empty ("not known yet").
+        if lock is not None:
+            lock.set_generation(generation)
+        # Nothing reads the database again for the life of this process
+        # (live reload is Phase 3), so do not sit on its pooled reader
+        # connection through the long dataset verification below, nor carry
+        # it towards the first fork. `_spawn` repeats this at every fork.
+        dispose_all()
+
+        # In memory only, and BEFORE the config is handed to any worker.
+        # `--dry-run` is a property of this run, not of the stored
+        # configuration, and the daemon never writes to the database.
         if args.dry_run:
             config.dry_run = True
 
         if args.test_config:
             logger.info("Configuration is valid!")
             # Proof that the schema was actually verified, not merely that
-            # some rows could be read. `check_config_schema` opens its own
-            # short-lived read-only connection -- it never migrates, and
-            # never creates anything.
-            logger.info(f"Schema revision: {check_config_schema(resolved)}")
+            # some rows could be read: `schema_rev` is what the check inside
+            # the snapshot returned. Nothing was migrated or created.
+            logger.info(f"Schema revision: {snapshot.schema_rev}")
             logger.info(f"Datasets: {len(config.datasets)}")
             for ds in config.datasets:
                 logger.info(f"  - {ds.name} (enabled={ds.enabled})")
@@ -770,6 +805,7 @@ def _run(args: argparse.Namespace, abandoned: Optional[List[str]] = None) -> int
         # configuration: " prefix would wrap a multi-line message whose
         # last line is meant to be pasted into a shell.
         logger.error(config_error_message(resolved, e))
+        _release_refused(lock)
         return 1
     except Exception as e:
         # Also `config_error_message`, not a bare f-string, and this arm is
@@ -781,23 +817,26 @@ def _run(args: argparse.Namespace, abandoned: Optional[List[str]] = None) -> int
         # Without this, the operator got "(sqlite3.OperationalError) unable
         # to open database file" and a SQLAlchemy documentation link;
         # `config_error_message` re-runs the preflight via
-        # `diagnose_open_failure` and names the actual problem. It also
-        # makes the supervisor's diagnosis word-for-word identical to the
-        # child's, which `workers._load_config` already produced this way.
-        # `exc_info` for everything that is not an OperationalError (already
-        # diagnosed, with its cause, by `config_error_message`): a bare
-        # `KeyError` or `ValueError` from the mapper is otherwise
+        # `diagnose_open_failure` and names the actual problem.
+        # `exc_info` for everything that is not a database failure (already
+        # diagnosed, with its cause, by `config_error_message`; a plain
+        # `DatabaseError` is a damaged file and gets its own one-liner): a
+        # bare `KeyError` or `ValueError` from the mapper is otherwise
         # undiagnosable from the log.
         logger.error(
             config_error_message(resolved, e),
-            exc_info=not isinstance(e, OperationalError),
+            exc_info=not (isinstance(e, OperationalError) or type(e) is DatabaseError),
         )
+        _release_refused(lock)
         return 1
 
     daemon = None
+    clean = False
     try:
         daemon = BackupDaemon(config, resolved, verbose=args.verbose)
-        return daemon.run()
+        code = daemon.run()
+        clean = True
+        return code
     except Exception as e:
         logger.error(f"Daemon failed: {e}", exc_info=True)
         return 1
@@ -807,6 +846,14 @@ def _run(args: argparse.Namespace, abandoned: Optional[List[str]] = None) -> int
         # records the abandoned ones.
         if abandoned is not None and daemon is not None:
             abandoned.extend(daemon.abandoned_workers)
+        # Remove the pid file only on a clean stop with no abandoned
+        # workers. After a crash, or when workers survived SIGKILL (the
+        # `_hard_exit` path -- under fork they still hold the inherited
+        # lock, correctly: they are still running), leave the file: the
+        # kernel drops our lock on exit, and a stale file is harmless
+        # because "running" means "lock held", never "file exists".
+        if clean and not (daemon is not None and daemon.abandoned_workers):
+            lock.release()
 
 
 if __name__ == '__main__':  # pragma: no cover

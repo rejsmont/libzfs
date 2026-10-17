@@ -15,7 +15,11 @@ worker hits it on every start and every crash restart, forever.
 `BEGIN`/`COMMIT` pair, scoped to the single call (never to the session's
 or connection's lifetime -- see that function's own docstring for why a
 longer-lived snapshot would violate `db.py`'s separate "never adopt
-BEGIN-on-connect for reader engines" rule instead).
+BEGIN-on-connect for reader engines" rule instead). Since item 15.1 that
+pair lives in the store's `read_config`, which `load_runtime_config` merely
+delegates to (and which also runs the schema check inside the same
+snapshot); the soak below therefore exercises the store's read path
+through the daemon's wrapper, as the supervisor does.
 
 **"No exception was raised" proves nothing here** -- every one of the
 1052 torn reads in the pre-fix soak was exception-free. The only sound
@@ -43,7 +47,8 @@ from zfsbackup.config.store import (
 )
 from zfsbackup.runtime_config import load_runtime_config
 
-pytestmark = [pytest.mark.integration, pytest.mark.slow]
+# The soak classes are `integration`/`slow`; the wrapper-contract classes at
+# the end are fast unit tests, so the markers are per class, not module-wide.
 
 # Two datasets, swapped order between the two YAMLs -- the writer
 # alternates between them so every commit either preserves or reverses
@@ -150,7 +155,7 @@ def _reader_loop(db_path: str, stop, out, use_snapshot: bool) -> None:
     while not stop.is_set():
         try:
             if use_snapshot:
-                config = load_runtime_config(resolved, verify_schema=False)
+                config = load_runtime_config(resolved).config
             else:
                 config = _load_runtime_config_no_snapshot(resolved)
         except Exception as e:  # pragma: no cover - diagnostic only
@@ -211,9 +216,11 @@ def _run_soak(tmp_path: Path, *, use_snapshot: bool, seconds: float = _SOAK_SECO
     return ok, torn, exc, samples, writer.exitcode, commit_count.value
 
 
+@pytest.mark.integration
+@pytest.mark.slow
 class TestLoadRuntimeConfigTornReadFix:
     """Mutation-checked: replacing `load_runtime_config`'s
-    `BEGIN`/`load_config`/`COMMIT` sequence with a bare
+    `BEGIN`/`load_config`/`COMMIT` sequence (now `access.read_config`'s) with a bare
     `return load_config(session)` (i.e. reverting the fix) fails 1 of the
     2 tests in this module -- this class's own
     `test_fixed_load_runtime_config_never_tears`, which caught 131 torn
@@ -245,6 +252,8 @@ class TestLoadRuntimeConfigTornReadFix:
         assert ok > 20, "soak produced too few reads to be a meaningful check"
 
 
+@pytest.mark.integration
+@pytest.mark.slow
 class TestLoadRuntimeConfigTornReadControl:
     """The harness's own sensitivity control (mandated alongside the fix
     itself): the SAME writer, the SAME invariant check, the SAME real
@@ -264,3 +273,127 @@ class TestLoadRuntimeConfigTornReadControl:
             "control did not detect any torn read -- the harness is "
             "insensitive, so the fixed-path test above proves nothing"
         )
+
+
+# ---------------------------------------------------------------------------
+# Item 15.2(a): the wrapper's contract -- what it returns, that it is the
+# store's read path, and what it no longer has.
+# ---------------------------------------------------------------------------
+
+import sqlite3
+
+from zfsbackup import runtime_config
+from zfsbackup.config import BackupConfig
+from zfsbackup.config.store import (
+    EXPECTED_HEAD,
+    ConfigSnapshot,
+    SchemaOutOfDate,
+    access as store_access,
+    read_config,
+)
+
+
+@pytest.mark.unit
+class TestLoadRuntimeConfigSnapshot:
+    def test_returns_a_config_snapshot_with_generation_and_schema_rev(
+        self, sqlite_config_db
+    ):
+        snapshot = load_runtime_config(sqlite_config_db)
+
+        assert isinstance(snapshot, ConfigSnapshot)
+        assert isinstance(snapshot.config, BackupConfig)
+        assert [d.name for d in snapshot.config.datasets] == ["pool/data"]
+        assert isinstance(snapshot.generation, int)
+        assert snapshot.schema_rev == EXPECTED_HEAD
+
+    def test_is_the_stores_read_config_and_nothing_more(self, sqlite_config_db):
+        direct = read_config(sqlite_config_db)
+        wrapped = load_runtime_config(sqlite_config_db)
+        assert wrapped.generation == direct.generation
+        assert wrapped.schema_rev == direct.schema_rev
+        assert wrapped.config == direct.config
+
+    def test_delegates_to_read_config_exactly_once_with_the_resolved_path(
+        self, sqlite_config_db, mocker
+    ):
+        sentinel = ConfigSnapshot(BackupConfig(datasets=[]), 41, "rev")
+        spy = mocker.patch.object(runtime_config, "read_config", return_value=sentinel)
+
+        assert load_runtime_config(sqlite_config_db) is sentinel
+        spy.assert_called_once_with(sqlite_config_db)
+
+    def test_generation_tracks_the_database(self, sqlite_config_db, config_yaml_path):
+        first = load_runtime_config(sqlite_config_db).generation
+        import_yaml(config_yaml_path, sqlite_config_db)  # an import bumps it
+        second = load_runtime_config(sqlite_config_db).generation
+        assert second > first
+
+    def test_verify_schema_keyword_is_gone(self, sqlite_config_db):
+        """The schema check is no longer optional: it is inside the read
+        snapshot, so there is nothing left to switch off."""
+        with pytest.raises(TypeError):
+            load_runtime_config(sqlite_config_db, verify_schema=False)
+
+    def test_ex_config_has_no_producer_and_is_gone(self):
+        assert not hasattr(runtime_config, "EX_CONFIG")
+
+    def test_check_config_schema_and_describe_config_source_are_the_stores(self):
+        from zfsbackup.config import store
+
+        assert runtime_config.check_config_schema is store.check_config_schema
+        assert runtime_config.describe_config_source is store.describe_config_source
+
+    def test_a_stale_schema_is_refused_and_the_file_is_not_touched(self, tmp_path):
+        db = tmp_path / "config.db"
+        # A valid SQLite file with no tables and no recorded revision: the
+        # shape of a database that was never migrated.
+        conn = sqlite3.connect(str(db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE _placeholder(x)")
+        conn.execute("DROP TABLE _placeholder")
+        conn.commit()
+        conn.close()
+        before = db.read_bytes()
+
+        with pytest.raises(SchemaOutOfDate):
+            load_runtime_config(resolve_config_path(str(db)))
+
+        assert db.read_bytes() == before  # never migrated, never created
+
+    def test_schema_in_snapshot_the_check_runs_inside_the_read_transaction(
+        self, sqlite_config_db, mocker
+    ):
+        """The schema check and the row load are one read snapshot: the
+        check runs on a connection that is already inside the transaction
+        `read_config` opened, and strictly before the rows are loaded -- so
+        a migration cannot land between them.
+
+        Mutation-checked (scratch copy of the store): running
+        `check_schema` before the `BEGIN` (the pre-15.1 shape) fails this
+        test."""
+        events = []
+        real_check = store_access.check_schema
+        real_load = store_access.load_config_snapshot
+
+        def in_sqlite_txn(connection):
+            # The DBAPI connection's own flag: SQLite has an open
+            # transaction, i.e. the explicit `BEGIN` has been issued.
+            # (SQLAlchemy's `Connection.in_transaction()` is also true
+            # after an autobegin, which proves nothing about a snapshot.)
+            return connection.connection.driver_connection.in_transaction
+
+        def check(connection):
+            events.append(("check", in_sqlite_txn(connection)))
+            return real_check(connection)
+
+        def load(session, **kw):
+            events.append(("load", in_sqlite_txn(session.connection())))
+            return real_load(session, **kw)
+
+        mocker.patch.object(store_access, "check_schema", side_effect=check)
+        mocker.patch.object(store_access, "load_config_snapshot", side_effect=load)
+
+        snapshot = load_runtime_config(sqlite_config_db)
+
+        assert events == [("check", True), ("load", True)]
+        assert snapshot.schema_rev == EXPECTED_HEAD

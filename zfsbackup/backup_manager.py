@@ -1,7 +1,7 @@
 """Snapshot manager for creating and managing ZFS snapshots."""
 
 from datetime import datetime, timedelta, timezone
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple, Union
 import logging
 import sys
 import os
@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import libzfseasy as zfs
 from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
+from libzfseasy.zfs import _zfs_cmd
 from zfsbackup.config import BackupConfig, DatasetConfig, _collapse_retention_rules
 
 
@@ -19,6 +20,127 @@ PROP_CONFIG = 'org.zfsbackup:config'
 PROP_CLIENT_ID = 'org.zfsbackup:client_id'
 PROP_SOURCE_DATASET = 'org.zfsbackup:source_dataset'
 PROP_ANCHOR_PREFIX = 'org.zfsbackup:anchor.'
+PROP_PREFIX = 'org.zfsbackup:'
+
+
+# ── Module-level property helpers (item 14.1) ─────────────────────────────────
+#
+# Used by the `zfsbackup-config` CLI's rename/edit commands, which have no
+# `BackupConfig` and no `DatasetManager`. Unlike the `DatasetManager` methods
+# they do NOT swallow ZFS errors: the CLI must be able to tell the operator
+# that a property copy failed. All take `dry_run` and then touch nothing.
+
+
+def read_zfsbackup_properties(ds: Dataset) -> Dict[str, str]:
+    """Return every `org.zfsbackup:*` user property set on `ds`, name -> value.
+
+    Properties are read with their `local` and `received` sources only (an
+    inherited value belongs to an ancestor, and acting on it would be acting
+    on the wrong dataset). Raises whatever `zfs get` raises.
+
+    Reads the raw `zfs get` lines and keeps only `org.zfsbackup:` names
+    BEFORE anything is turned into a libzfseasy object. `zfs.get(...)` builds
+    `ZFS` objects whose `update()` raises `ValueError` for any local/received
+    built-in property libzfseasy does not know (zvol `volthreading`, FreeBSD
+    `jailed`, ...), which would make rename/edit fail on such datasets.
+    """
+    cmd = [
+        _zfs_cmd(), 'get', '-H', '-o', 'name,property,value,received,source',
+        '-s', 'local,received', 'all', ds.name,
+    ]
+    result: Dict[str, str] = {}
+    for line in zfs.get._exec_out(cmd):
+        parts = line.rstrip('\n').split('\t')
+        if len(parts) < 5:
+            continue
+        name, prop, source = parts[0], parts[1], parts[-1]
+        if name != ds.name or not prop.startswith(PROP_PREFIX):
+            continue
+        if source not in ('local', 'received'):
+            continue
+        # A value may itself contain a tab. For a `local` property the
+        # `received` column is a single '-', so the value is everything
+        # between `property` and the last two columns. For a `received`
+        # property the `received` column repeats the value, so the value
+        # spans exactly half of the columns between `property` and `source`.
+        if source == 'received':
+            span = (len(parts) - 3) // 2
+            result[prop] = '\t'.join(parts[2:2 + span])
+        else:
+            result[prop] = '\t'.join(parts[2:-2])
+    return result
+
+
+def copy_anchor_property(
+    ds: Dataset, old_dest: str, new_dest: str, *, dry_run: bool = False
+) -> str:
+    """Set `anchor.<new_dest>` from `anchor.<old_dest>` on `ds`, only if the
+    new one is absent. Never deletes anything (the old property is left for
+    the caller to clear once the rename has actually landed).
+
+    Returns what happened: `'copied'`, `'dry-run'` (would have copied),
+    `'no-source'` (no `anchor.<old_dest>`), or `'exists'` (`anchor.<new_dest>`
+    already set; left alone). Raises whatever `zfs get`/`zfs set` raises.
+    """
+    old_prop = f"{PROP_ANCHOR_PREFIX}{old_dest}"
+    new_prop = f"{PROP_ANCHOR_PREFIX}{new_dest}"
+    props = read_zfsbackup_properties(ds)
+    if old_prop not in props:
+        return 'no-source'
+    if new_prop in props:
+        return 'exists'
+    if dry_run:
+        logger.info(f"[DRY RUN] Would set {new_prop}={props[old_prop]} on {ds.name}")
+        return 'dry-run'
+    zfs.set(ds, {new_prop: props[old_prop]})
+    logger.debug(f"Copied {old_prop} -> {new_prop} on {ds.name}")
+    return 'copied'
+
+
+def clear_zfsbackup_properties(
+    ds: Dataset,
+    *,
+    config: bool,
+    anchors: Union[Iterable[str], bool],
+    dry_run: bool = False,
+) -> List[str]:
+    """`zfs inherit` the named `org.zfsbackup:*` properties from `ds`.
+
+    `config=True` clears `org.zfsbackup:config`. `anchors` is an iterable of
+    destination names (clears `anchor.<name>` for each), or `True` for every
+    `org.zfsbackup:anchor.*` currently set on `ds`, or `False`/empty for none.
+    Only properties that are actually set (local/received) are inherited, so
+    a clear is idempotent. Returns the property names cleared (or, under
+    `dry_run`, that would have been). Raises whatever `zfs` raises.
+
+    A non-empty bare `str` for `anchors` is rejected with `TypeError`: iterating it
+    would treat each character as a destination name and silently clear
+    nothing. Pass `[name]` for one destination (an empty string is falsy,
+    like `False`, and clears nothing).
+    """
+    if anchors and isinstance(anchors, (str, bytes)):
+        raise TypeError(
+            "anchors must be True, False or an iterable of destination names, "
+            f"not a bare string {anchors!r}; pass [name]"
+        )
+    present = read_zfsbackup_properties(ds)
+    wanted: List[str] = []
+    if config and PROP_CONFIG in present:
+        wanted.append(PROP_CONFIG)
+    if anchors is True:
+        wanted.extend(sorted(n for n in present if n.startswith(PROP_ANCHOR_PREFIX)))
+    elif anchors:
+        for dest in anchors:
+            name = f"{PROP_ANCHOR_PREFIX}{dest}"
+            if name in present and name not in wanted:
+                wanted.append(name)
+    for name in wanted:
+        if dry_run:
+            logger.info(f"[DRY RUN] Would inherit {name} on {ds.name}")
+        else:
+            zfs.inherit(ds, name)
+            logger.debug(f"Cleared {name} on {ds.name}")
+    return wanted
 
 
 class DatasetInfo:

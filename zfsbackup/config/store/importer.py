@@ -9,7 +9,8 @@ the target database is discarded and replaced by the YAML's contents (see
 diff-and-merge, is the only sane semantics for a config with no surrogate
 ids of its own).
 
-Three phases, strictly sequential, never nested -- see `db.py`'s "Sequence
+The whole call runs under `paths.writer_lock` (item 15.4; see the notes on the
+cleanup below). Three phases, strictly sequential, never nested -- see `db.py`'s "Sequence
 it, do not nest it" and `migrate.py`'s binding note, both measured
 directly against this repo's own engine -- plus one guard in front of
 them, not a fourth phase:
@@ -55,13 +56,24 @@ them, not a fourth phase:
    would adopt whatever a writer did in the gap as the new baseline. The probe
    itself does not change the fingerprint (step (2) guarantees no WAL at
    entry, so its last close checkpoints nothing; it only reads and rolls
-   back -- measured). What remains is (a) a writer that has attached but run
-   no statement yet, and (b) on a non-empty file, a writer whose whole commit
-   and checkpoint lands within one filesystem timestamp tick of the baseline
-   `lstat` (inode and size do not change; on Linux mtime/ctime come from a
-   coarse 1-10 ms clock). A zero-byte file is not affected: any write grows
-   it. Item 15.4's writer lock, which the CLI will hold across the whole
-   import, closes both. A failure over a pre-existing target
+   back -- measured). These checks are heuristics for an opener that does not
+   honour the writer lock, and for that opener two windows remain: (a) a writer
+   that has attached but run no statement yet, and (b) on a non-empty file, a
+   writer whose whole commit and checkpoint lands within one filesystem
+   timestamp tick of the baseline `lstat` (inode and size do not change; on
+   Linux mtime/ctime come from a coarse 1-10 ms clock). A zero-byte file is not
+   affected: any write grows it.
+
+   **Both windows are closed for every zfsbackup-config writer** (item 15.4):
+   `import_yaml` takes `paths.writer_lock` -- an exclusive `flock` on
+   `<db>.writer.lock` -- before phase 1 decides whether the file exists, and
+   holds it through phases 1-3 and this cleanup. A concurrent `import` or
+   `write_config` therefore either finished before this call looked (and the
+   file exists, so this is a re-import and nothing is "created") or waits
+   until this call, including its unlink, is over. What stays out of scope is
+   an external opener that takes no lock: the `sqlite3` shell, a script, some
+   other program, or the daemon (which only reads, and cannot make this
+   file non-empty). A failure over a pre-existing target
    leaves its stored configuration exactly as it was -- phase 3 rolls back.
    Phase 2 commits before phase 3 starts, so an existing database may
    already have been migrated to the current schema (its content is
@@ -186,11 +198,13 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store.db import dispose_all
 from zfsbackup.config.store.mapper import load_config, save_config, validate_config
-from zfsbackup.config.store.migrate import ensure_schema
+from zfsbackup.config.store.access import check_config_schema
+from zfsbackup.config.store.migrate import SchemaOutOfDate, ensure_schema
 from zfsbackup.config.store.models import Dataset, Destination, GlobalSettings
 from zfsbackup.config.store.paths import (
     CONFIG_DIR_MODE,
@@ -207,6 +221,7 @@ from zfsbackup.config.store.paths import (
     is_default_config_dir,
     open_config_connection,
     open_config_session,
+    writer_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -226,7 +241,12 @@ class ImportResult:
     brand-new (`created=True`) database. `backup_path` is whatever the
     `backup` callback returned (`None` when no callback was given, there was
     no outgoing configuration to back up, or the outgoing one was unreadable
-    and `allow_unreadable_outgoing` let the import proceed).
+    and `allow_unreadable_outgoing` let the import proceed). `generation` is
+    the `GlobalSettings.generation` this import committed (what `save_config`
+    returned), so a caller can report it without a second read after the
+    writer lock is released -- by which time another writer may have moved it
+    on. `None` only for a result built by hand (the default keeps old
+    constructors working).
     """
 
     created: bool
@@ -234,6 +254,7 @@ class ImportResult:
     replaced_datasets: int
     replaced_destinations: int
     backup_path: Optional[Path] = None
+    generation: Optional[int] = None
 
 
 class OutgoingConfigUnreadable(ConfigPathError):
@@ -365,10 +386,21 @@ def _sidecars_present(target: Path) -> List[Path]:
     return found
 
 
-def _refuse_orphaned_sidecars(target: Path) -> None:
+def _refuse_orphaned_sidecars(target: Path, *, before_lock: bool = False) -> None:
     """A-11.2: raise `ConfigDbOrphanedSidecars` if any sidecar exists next to
     a database that does not (or `ConfigDbCreatedConcurrently` if the database
-    has appeared in the meantime). Creates and changes nothing."""
+    has appeared in the meantime). Creates and changes nothing.
+
+    `before_lock=True` is the pre-lock call in `import_yaml`: there, a database
+    that has appeared since the caller's existence check is NOT an error. It is
+    a concurrent first import that holds the writer lock right now, and the
+    right behaviour is to queue behind it, not to fail (measured with injected
+    timing: B's check saw no database, A then created it plus its WAL under
+    the lock, and B's pre-lock refusal raised `ConfigDbCreatedConcurrently`
+    instead of waiting). So the pre-lock call raises only the genuine
+    orphaned-sidecars refusal and returns otherwise, leaving the under-lock
+    re-check -- the one that can be trusted -- to decide.
+    """
     orphans = _sidecars_present(target)
     if not orphans:
         return
@@ -379,6 +411,8 @@ def _refuse_orphaned_sidecars(target: Path) -> None:
     # deleting a live process's -wal/-shm corrupts its database. Look again.
     names = ", ".join(str(p) for p in orphans)
     if _target_exists(target):
+        if before_lock:
+            return
         raise ConfigDbCreatedConcurrently(
             f"{target} was created concurrently by another process while "
             f"this import was starting ({names} are in use, not "
@@ -480,9 +514,11 @@ def _remove_created_target(
        statement and created no sidecar yet, and (b) on a non-empty file, a
        writer whose whole commit and checkpoint lands within one filesystem
        timestamp tick of the baseline `lstat` (coarse 1-10 ms clock on Linux;
-       inode and size do not change). Zero-byte files are not affected. Only
-       item 15.4's writer lock, held by the CLI across the whole import,
-       closes both.
+       inode and size do not change). Zero-byte files are not affected. Both
+       can only be an opener that ignores `paths.writer_lock`: `import_yaml`
+       holds it across the whole import including this unlink, so every
+       zfsbackup-config writer is excluded (item 15.4); the windows remain
+       only against an external, lock-ignoring opener.
     6. A sidecar is NEVER unlinked.
     7. Success logs INFO; any skip logs one WARNING (see
        `_cleanup_skipped`) and, when `error` (the in-flight exception) is
@@ -711,6 +747,16 @@ def import_yaml(
     called -- and the outgoing config is not even loaded -- when `backup` is
     `None`.
 
+    **Writer lock (item 15.4).** Phases 1-3 and the failed-first-import
+    cleanup run under `paths.writer_lock(resolved)`; a second zfsbackup-config
+    writer waits for it (up to `DEFAULT_WRITER_LOCK_TIMEOUT`) and then gets
+    `ConfigBusy`. The lock is taken only once the call is committed to
+    touching the target, so a bad YAML, a `.yaml`-suffixed target and a
+    `create=False` call against a missing database create no lock file. A
+    refusal later on (a foreign database, orphaned sidecars) can leave the
+    lock file behind: it is empty, never deleted, and harmless. `ConfigBusy`
+    is NOT a `SchemaError`/`ConfigPathError`.
+
     An outgoing configuration that exists but cannot be loaded raises
     `OutgoingConfigUnreadable` (the stored configuration is not replaced) unless
     `allow_unreadable_outgoing` is True, in which case a WARNING is logged,
@@ -745,6 +791,101 @@ def import_yaml(
     # change to their order.
     check_config_db_suffix(resolved)
 
+    # The writer lock (item 15.4) is taken BEFORE phase 1 decides whether the
+    # target exists, and held through the failed-first-import cleanup below.
+    # Two consequences, both of which used to be guesses: a first import is
+    # serialised against a concurrent re-import (neither can observe the
+    # other's half-made file), and `_remove_created_target`'s "has anyone else
+    # attached?" heuristics only ever have to answer for openers that do not
+    # honour the lock.
+    #
+    # The lock file lives in the database's directory, so the directory must
+    # exist first. If it does not, no database can either: create the
+    # directory now (the same `_prepare_target_dir` call the existing-
+    # directory path makes later) -- unless `create=False`, which refuses
+    # before creating anything, lock file included.
+    target = resolved.resolved_path
+    if not _target_exists(target):
+        if not create:
+            raise ConfigDbNotFound(_missing_target_message(target))
+        # A-11.2 "refused imports create nothing": orphaned sidecars next to
+        # an absent database are refused before the lock file exists too.
+        # Re-checked under the lock, which is where it can be trusted.
+        _refuse_orphaned_sidecars(target, before_lock=True)
+    else:
+        _refuse_foreign_before_locking(resolved)
+    directory_prepared = False
+    if not _target_exists(target.parent):
+        _prepare_target_dir(target.parent)
+        directory_prepared = True
+
+    with writer_lock(resolved):
+        return _import_locked(
+            config, yaml_path, resolved, target, create, backup,
+            allow_unreadable_outgoing, directory_prepared,
+        )
+
+
+def _refuse_foreign_before_locking(resolved: ResolvedConfigPath) -> None:
+    """Item 10.4 ("never touch a database that is not ours") vs. the writer
+    lock: the lock file is created in the database's directory, so taking it
+    first would leave an empty `<db>.writer.lock` beside another
+    application's SQLite file that this import then refuses. For an EXISTING
+    target, run the read-only schema check first and raise the refusals that
+    would be raised under the lock anyway -- `NotAConfigDatabase`,
+    `SchemaVersionMismatch`, `SchemaSplitBrain`, preflight `ConfigPathError`s
+    and a damaged file -- with nothing created.
+
+    NOT refused here: `SchemaOutOfDate` (a known-but-behind revision, or an
+    empty / tableless file) is exactly what an import is allowed to adopt and
+    migrate; and an `OperationalError` (busy, cannot open) is not proof of
+    anything, so it is left for the locked run to report. This is an
+    optimisation for "create nothing", not the authority: the same checks run
+    again under the lock, where a concurrent writer cannot change the answer.
+    The reader engine it opens is disposed again so no pooled connection (and
+    no `-shm`) outlives the check. It also stays out of the way of a racing
+    first import: a zero-byte file is left to the locked run.
+    """
+    # A zero-byte file is never refused here: it is what a concurrent first
+    # import looks like between `create_config_db_file` and its first CREATE
+    # TABLE (measured: 2 of 4 racing first imports were refused by this
+    # pre-check before this guard). The locked run decides; it refuses a
+    # zero-byte file nobody is creating.
+    try:
+        if os.stat(resolved.resolved_path).st_size == 0:
+            return
+    except OSError:
+        return
+    try:
+        check_config_schema(resolved)
+    except SchemaOutOfDate:
+        pass
+    except OperationalError:
+        pass
+    finally:
+        dispose_all()
+
+
+def _missing_target_message(target: Path) -> str:
+    return (
+        f"No config database exists at {target}, and create=False was "
+        "passed to import_yaml() -- this call only replaces an "
+        "EXISTING database. Pass create=True (the default) to create "
+        "one, or point at an existing database to re-import over it."
+    )
+
+
+def _import_locked(
+    config: BackupConfig,
+    yaml_path: Union[str, Path],
+    resolved: ResolvedConfigPath,
+    target: Path,
+    create: bool,
+    backup: Optional[Callable[[BackupConfig], Path]],
+    allow_unreadable_outgoing: bool,
+    directory_prepared: bool,
+) -> ImportResult:
+    """Phases 1-3 of `import_yaml`, run with the writer lock held."""
     # Phase 1 -- bring the target file into existence, or fix its mode.
     # The create=False refusal is decided FIRST, before anything below it
     # touches the filesystem: a `create=False` call against a missing
@@ -755,16 +896,14 @@ def import_yaml(
     # `ConfigDbNotFound` correctly but still left `<tmp>/nodir` created at
     # `0770` -- `ensure_config_dir` had already run on the branch that was
     # about to fail anyway.
-    target = resolved.resolved_path
+    #
+    # (Re-checked here, under the lock: the first check in `import_yaml` ran
+    # before it. Databases are never deleted by a zfsbackup writer, so this
+    # can only agree -- it is the decision the lock is protecting.)
     existing = _target_exists(target)
 
     if not existing and not create:
-        raise ConfigDbNotFound(
-            f"No config database exists at {target}, and create=False was "
-            "passed to import_yaml() -- this call only replaces an "
-            "EXISTING database. Pass create=True (the default) to create "
-            "one, or point at an existing database to re-import over it."
-        )
+        raise ConfigDbNotFound(_missing_target_message(target))
 
     # A-11.2: orphaned `-wal`/`-shm`/`-journal` next to an ABSENT database
     # are refused before anything is created, chmod'd or otherwise touched
@@ -776,7 +915,8 @@ def import_yaml(
     # Only the branch that will actually create/touch the target may also
     # create/touch its containing directory -- see _prepare_target_dir's
     # own docstring for why that call is gated the way it is.
-    _prepare_target_dir(target.parent)
+    if not directory_prepared:
+        _prepare_target_dir(target.parent)
 
     if existing:
         ensure_config_db_mode(target)
@@ -829,7 +969,7 @@ def import_yaml(
                     "contents of %s",
                     target, replaced_datasets, replaced_destinations, yaml_path,
                 )
-            save_config(session, config)
+            generation = save_config(session, config)
     except BaseException as exc:
         if backup_path is not None:
             if isinstance(exc, Exception):
@@ -856,4 +996,5 @@ def import_yaml(
         replaced_datasets=replaced_datasets,
         replaced_destinations=replaced_destinations,
         backup_path=backup_path,
+        generation=generation,
     )

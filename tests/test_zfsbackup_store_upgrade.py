@@ -1460,7 +1460,10 @@ def make_foreign(db: Path, *tables: str, wal: bool = False) -> None:
 
 def fingerprint(db: Path):
     """Full bytes, journal-mode header bytes 18-19, `sqlite_master`, and the
-    directory listing: everything a refusal must leave as it was."""
+    directory listing: everything a refusal must leave as it was. The listing
+    is exact on purpose: a database that is not ours (item 10.4) must not even
+    gain a `<db>.writer.lock` beside it -- `import_yaml` pre-checks the target
+    read-only BEFORE it takes the writer lock (item 15.4)."""
     raw = db.read_bytes()
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
@@ -1772,8 +1775,9 @@ class TestImporterInterruptNotes:
     def test_an_ordinary_exception_in_the_same_window_still_says_not_applied(
         self, db_path, resolved, monkeypatch
     ):
-        """The unchanged wording for an `Exception`: a concurrent import won
-        the race and this one did not apply."""
+        """The unchanged wording for an `Exception`: a concurrent import by an
+        opener that ignores the writer lock won the race and this one did not
+        apply."""
         from zfsbackup.config.store import importer as imp
 
         real = imp.open_config_session
@@ -1782,6 +1786,16 @@ class TestImporterInterruptNotes:
         def failing_after_another_import_committed(*a, **k):
             # Another writer imports first (the A-11 race), then this fails.
             monkeypatch.setattr(imp, "open_config_session", real)
+            # The "other writer" ignores the writer lock (item 15.4): a lock-
+            # honouring one cannot commit inside this import's critical
+            # section (same thread: RuntimeError; elsewhere: it waits). What
+            # is pinned here is the WORDING for the case where a lock-ignoring
+            # opener did, i.e. the unchanged "NOT applied" note.
+            @contextmanager
+            def no_lock(*_a, **_k):
+                yield None
+
+            monkeypatch.setattr(imp, "writer_lock", no_lock)
             import_yaml(EXAMPLE_YAML, resolved)
             dispose_all()
             raise ValueError("this import lost")

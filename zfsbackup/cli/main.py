@@ -2,9 +2,12 @@
 
 This is the only writer of the SQLite config store (the daemon and its workers
 only ever read it). It reaches the database exclusively through
-`zfsbackup.config.store`'s public API (path resolution, schema migration,
-`import_yaml`) and `zfsbackup.runtime_config`'s read-only loader -- never an
-ORM model, never a query -- so every schema invariant stays behind the mapper.
+`zfsbackup.config.store`'s public API (path resolution, `read_config`,
+`write_config`, schema migration, `import_yaml`) -- never an ORM model, never
+a query -- so every schema invariant stays behind the mapper. It imports
+nothing of the daemon (`runtime_config`, `daemon`, `workers`, ...); the one
+daemon-lane module it uses is `daemonlock`, to tell the operator after a write
+whether a daemon is running. Every write follows `write.py`'s discipline.
 
 Commands (this module is plan item 10.2; `get`/`set`/`edit`/`list`/`rename`
 follow in items 11-14 and are deliberately not stubbed here):
@@ -43,6 +46,7 @@ import yaml
 
 from zfsbackup.cli.errors import BackupFailed, CliError, is_database_unusable, report
 from zfsbackup.cli.render import render_yaml
+from zfsbackup.cli.write import notify_daemon, read_snapshot
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
     CONFIG_PATH_ENV,
@@ -52,12 +56,14 @@ from zfsbackup.config.store import (
     ResolvedConfigPath,
     SchemaError,
     SchemaOutOfDate,
+    check_config_schema,
     dispose_all,
     import_yaml,
+    read_config,
     resolve_config_path,
     upgrade_schema,
+    writer_lock,
 )
-from zfsbackup.runtime_config import check_config_schema, load_runtime_config
 
 #: Mode of the pre-import backup: same as the database (`CONFIG_DB_MODE`), so
 #: the operators who may replace the configuration may read what it replaced.
@@ -132,6 +138,15 @@ class State:
         if self.handler is not None:
             self.handler.setLevel(logging.DEBUG)
             logging.getLogger(_LOGGER_NAME).setLevel(logging.DEBUG)
+
+    def warn(self, message: str) -> None:
+        """Print `message` as a warning, once per distinct text per invocation
+        (the same dedupe as warnings arriving as log records)."""
+        if self.handler is not None:
+            if message in self.handler.seen:
+                return
+            self.handler.seen.add(message)
+        click.echo(f"warning: {message}", err=True)
 
     def resolve(self) -> ResolvedConfigPath:
         """The config database path, by the daemon's order. Cached so that
@@ -468,6 +483,24 @@ def import_cmd(yaml_file: Path, no_backup: bool, config_path: Optional[str], ver
         )
         click.echo(f"Imported {yaml_file} into {where}.")
     click.echo(f"Schema revision: {result.head_revision}")
+    _notify_after_import(resolved, getattr(result, "generation", None))
+
+
+def _notify_after_import(resolved: ResolvedConfigPath, generation: Optional[int] = None) -> None:
+    """The post-write daemon notice for an import. `generation` is the one the
+    import itself committed (`ImportResult.generation`); reading it back after
+    the writer lock is released could report a concurrent write's generation as
+    the import's, so that read is only a fallback for a store that does not
+    report one. The import is already durable, so no failure here may fail the
+    command."""
+    if generation is None:
+        try:
+            generation = read_config(resolved).generation
+        except Exception:  # noqa: BLE001 - fallback only; the notice just omits it
+            generation = None
+        finally:
+            dispose_all()
+    notify_daemon(resolved, generation)
 
 
 def _exists(path: Path) -> bool:
@@ -508,13 +541,10 @@ def export_cmd(output: Optional[str], force: bool, config_path: Optional[str], v
     resolved = state.resolve()
     # Render before opening the output, so a failure leaves no half-written
     # or truncated file behind.
-    try:
-        config = load_runtime_config(resolved)
-    except ValueError as exc:
-        # `load_config` refuses a stored configuration it cannot make sense of
-        # (no datasets, a bad duration row); say which stage failed.
-        raise CliError(f"the stored configuration cannot be loaded: {exc}") from exc
-    text = render_yaml(config)
+    # `read_snapshot` is the store's `read_config` (one read transaction, the
+    # schema checked inside it); it says which stage failed when `load_config`
+    # refuses a stored configuration (no datasets, a bad duration row).
+    text = render_yaml(read_snapshot(resolved).config)
 
     if output is None or output == "-":
         click.echo(text, nl=False)
@@ -667,15 +697,32 @@ def migrate_cmd(check: bool, config_path: Optional[str], verbose: bool) -> None:
         click.echo(f"Schema is up to date (revision {revision}).")
         return
 
-    upgrade = upgrade_schema(resolved)
+    # Refuse a database that is not ours BEFORE the writer lock puts a new file
+    # next to it (10.4: never touch a foreign database). Only "behind" (a
+    # recorded, older revision) goes on to the upgrade; every other schema
+    # error propagates -- including a SchemaOutOfDate with no recorded
+    # revision (a tableless file: migrate cannot help, `import` can). Not a substitute for the check under the lock:
+    # `upgrade_schema` repeats it inside its own transaction.
+    try:
+        check_config_schema(resolved)
+    except SchemaOutOfDate as exc:
+        if not getattr(exc, "recorded_revisions", None):
+            raise
+
+    # Serialise with `import` and every other write: the same writer lock they
+    # take (a concurrent migrate that won the race reports `changed=False`).
+    # `check_config_schema` above is also the preflight, so a missing database
+    # leaves no lock file behind. `ConfigBusy` -> exit 75.
+    with writer_lock(resolved):
+        upgrade = upgrade_schema(resolved)
     if not upgrade.changed:
         click.echo(f"Schema is up to date (revision {upgrade.to_rev}).")
         return
     before = ", ".join(upgrade.from_revs)
     click.echo(f"Migrated the schema of {resolved.resolved_path} from {before} to {upgrade.to_rev}.")
     click.echo(
-        "Restart any running zfsbackup daemon now -- it is still running the "
-        "old schema check."
+        "Restart any running zfsbackup daemon now so it runs this schema and "
+        "its configuration."
     )
 
 

@@ -32,7 +32,8 @@ carries a status note or "as landed" text — where those disagree with the prop
 | Item 10.1 + 10.2 | done (cfa9d54) | `zfsbackup-config import/export/migrate`; reviewed by both reviewers |
 | Items 10.4–10.6 review fixes | done | Foreign-DB refusal, exit-code contract, ^C/SIGTERM/backup hygiene, connect-failure fd leak |
 | Item 10.3 | done | Interim `python -m zfsbackup.config.store.importer` deleted; scenarios and docs use `zfsbackup-config import` |
-| **Item 15** | **in progress** | 15.2(c) daemon lock and 14.1 helpers started; 15.1 next |
+| Item 15 (15.1–15.5) + 14.1 | done | See the "As landed" note under item 15 |
+| **Items 13 → 11 → 12 → 14.2 → 16** | **next** | The editing commands |
 | 10–16 Config CLI | approved, not started | Revised after Checkpoint A; order 10 → 15 → 13 → 11 → 12 → 14 → 16 |
 | 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
 | 21–23 Docs, scenarios, final review | not started | |
@@ -1706,6 +1707,33 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
   generation M and will not apply this until restarted"; otherwise "no running daemon detected for
   <db>". The CLI never sends a signal. **Verify:** `pytest tests/test_zfsbackup_cli.py -k "conflict or
   busy or daemon_notice"`
+
+- **Item 15 as landed** *(reviewed by both reviewers)*:
+  - `write_config` returns `WriteResult(generation, warnings)`; it runs a read-only schema pre-check
+    before the writer lock and the authoritative `check_schema` inside the write transaction.
+  - `import_yaml` runs a read-only foreign-DB pre-check before the writer lock (zero-byte targets skip
+    it — they are judged under the lock — so a zero-byte target can still get a lock file); refusals
+    before the lock create nothing.
+  - `EX_CONFIG` is gone: workers can no longer hit a config error; the supervisor refuses a bad config
+    with exit 1 before any worker exists.
+  - `SchemaOutOfDate.recorded_revisions` lets `migrate` refuse a file with nothing recorded before
+    locking.
+  - The 15.4 line "A-11 cleanup skips the unlink when `daemonlock.probe()` finds a daemon" was not
+    implemented: the writer lock already serialises zfsbackup writers, and a running daemon holds an
+    inode the cleanup can't touch. **Revisit in Phase 3**, when reload reopens the path.
+  - `daemonlock.acquire` retries contention for up to 1 s, so a CLI `probe()` can't make a starting
+    daemon refuse.
+  - **15.5 review fixes:** the daemon takes its presence lock *before* reading the config (so "no
+    running daemon detected" can't race a starting daemon); a dead supervisor pid whose forked workers
+    still hold the lock is reported as such; `read_zfsbackup_properties` filters to `org.zfsbackup:`
+    before building libzfseasy objects (unknown built-in props such as zvol `volthreading` used to raise);
+    `ImportResult.generation`; `write_config`/`commit_config` release connections; stale docs.
+  - `read_zfsbackup_properties` reads raw `zfs get` lines through libzfseasy's private `_zfs_cmd` and
+    `zfs.get._exec_out` — a private-API dependency; replace it when libzfseasy's `get` parser learns to
+    skip unknown built-in properties (a `needs-approval` libzfseasy change).
+  - **Known residual:** generations are per file — deleting and re-importing the DB restarts at 0, so an
+    edit read from the old file could pass CAS against the new one (ABA). Rare; a store id in the
+    snapshot would close it.
 
 ### Item 11 — Dot-path `get` / `set` / `unset`
 - **Owner:** `zfsbackup-cli-developer` · **Tag:** `needs-approval` · **Files:** `cli/dotpath.py`,

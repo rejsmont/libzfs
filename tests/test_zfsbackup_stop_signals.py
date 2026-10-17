@@ -245,10 +245,10 @@ def _wait_for_worker_parked(log_path: Path, worker_name: str, timeout: float):
 
     Deliberately two separate checks rather than one combined regex: the
     supervisor's line can appear well before the worker's own marker (the
-    child still has to reset its signal dispositions, configure logging,
-    and load its own config -- see `workers._init_child_process` and
-    `workers._load_config`), and keying readiness off the supervisor's
-    line alone is exactly the trap this module's docstring records.
+    child still has to reset its signal dispositions and configure logging
+    -- see `workers._init_child_process`), and keying readiness off the
+    supervisor's line alone is exactly the trap this module's docstring
+    records.
     """
     marker = _PARKED_MARKER[worker_name]
 
@@ -458,7 +458,10 @@ def _mp_event_daemon_harness(resolved_config, log_path: str) -> None:
     from zfsbackup.daemon import BackupDaemon
     from zfsbackup.runtime_config import load_runtime_config
 
-    config = load_runtime_config(resolved_config)
+    # `load_runtime_config` returns a frozen `ConfigSnapshot` (item 15.1);
+    # `--dry-run` is applied to the detached `BackupConfig` inside it, as
+    # `daemon._run` does.
+    config = load_runtime_config(resolved_config).config
     config.dry_run = True
     daemon = BackupDaemon(config, resolved_config, verbose=True)
     daemon._stop_event = multiprocessing.Event()

@@ -28,22 +28,20 @@ class TestTimeDurationParsing:
 
 
 class TestWorkerInstantiation:
-    def test_snapshot_worker_name(self, sqlite_config_db):
-        # `sqlite_config_db` (item 8): a genuine `ResolvedConfigPath`
-        # addressing an imported SQLite config store, not the `config_
-        # yaml_path` `Path` this test used before the daemon started
-        # reading the config database. This test only constructs the
-        # worker and reads `.name`/`.daemon` -- it never loads config --
-        # so it passed even with a bare `Path` before this fix; it was
-        # "passing by accident" against a type the constructor no longer
-        # accepts anywhere a real load happens.
+    def test_snapshot_worker_name(self, worker_config):
+        # Workers take the supervisor's detached `BackupConfig` (item 15.2(b))
+        # -- never a database path. This only constructs the worker and reads
+        # `.name`/`.daemon`.
         stop_event = multiprocessing.Event()
-        sw = SnapshotWorker(sqlite_config_db, stop_event, dry_run=True)
+        sw = SnapshotWorker(worker_config, stop_event)
         assert sw.name == 'snapshot-worker'
         assert sw.daemon is True
+        assert sw.config is worker_config
 
-    def test_pruning_worker_name(self, sqlite_config_db):
+    def test_pruning_worker_name(self, worker_config):
         stop_event = multiprocessing.Event()
-        pw = PruningWorker(sqlite_config_db, stop_event, dry_run=True)
+        pw = PruningWorker(worker_config, stop_event, verbose=True)
         assert pw.name == 'pruning-worker'
         assert pw.daemon is True
+        assert pw.config is worker_config
+        assert pw.verbose is True

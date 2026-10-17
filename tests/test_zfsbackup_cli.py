@@ -119,12 +119,16 @@ from click.testing import CliRunner
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError, SQLAlchemyError
 
+from zfsbackup import daemonlock
 from zfsbackup.cli import errors as cli_errors
 from zfsbackup.cli import main as cli_main
+from zfsbackup.cli import write as cli_write
 from zfsbackup.cli.main import cli
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
     CONFIG_PATH_ENV,
+    ConfigBusy,
+    ConfigConflict,
     ConfigDbCreatedConcurrently,
     ConfigDbIsYaml,
     ConfigDbNotFound,
@@ -141,7 +145,13 @@ from zfsbackup.config.store import (
     SchemaUpgrade,
     SchemaVersionMismatch,
     dispose_all,
+    read_config,
+    validate_config,
+    write_config,
+    writer_lock,
 )
+from zfsbackup.config.store import config_error_message
+from zfsbackup.config.store import db as store_db
 from zfsbackup.config.store import migrate as store_migrate
 from zfsbackup.config.store import paths as store_paths
 
@@ -159,10 +169,11 @@ datasets:
 """
 
 
-#: What `migrate` prints after a real upgrade (item 10.5 wording).
+#: What `migrate` prints after a real upgrade (item 15.5 wording: the daemon
+#: reads the configuration too, so a restart is about both).
 RESTART_HINT = (
-    "Restart any running zfsbackup daemon now -- it is still running the old "
-    "schema check."
+    "Restart any running zfsbackup daemon now so it runs this schema and its "
+    "configuration."
 )
 
 
@@ -609,7 +620,7 @@ class TestPathResolution:
         def boom(resolved):
             raise ValueError("kaboom")
 
-        monkeypatch.setattr(cli_main, "load_runtime_config", boom)
+        monkeypatch.setattr(cli_write, "read_config", boom)
         args = ["-v", "export", "-c", db] if where == "before" else ["export", "-c", db, "-v"]
         result = run(*args)
         assert result.exit_code == 1
@@ -1700,7 +1711,7 @@ class TestMigrate:
         result = run("migrate", "-c", db)
         assert result.exit_code == 78
         assert "no recorded schema revision" in result.stderr
-        assert "nothing to migrate" in result.stderr
+        assert "no recorded schema revision" in result.stderr
         assert "`zfsbackup-config import`" in result.stderr
         assert "Migrated" not in result.stdout
         assert digest(db) == before
@@ -2121,7 +2132,7 @@ class TestInterruptedImport:
         def boom(resolved):
             raise exc
 
-        monkeypatch.setattr(cli_main, "load_runtime_config", boom)
+        monkeypatch.setattr(cli_write, "read_config", boom)
         result = run("export", "-c", db)
         assert result.exit_code == 130
         lines = stderr_lines(result)
@@ -2775,7 +2786,7 @@ class TestForeignAlembicDatabase:
         sha = hashlib.sha256(before).hexdigest()
         result = run("migrate", "-c", db)
         assert result.exit_code == 78
-        assert "nothing to migrate" in result.stderr
+        assert "no recorded schema revision" in result.stderr
         assert db.read_bytes()[18:20] == b"\x01\x01"
         assert hashlib.sha256(db.read_bytes()).hexdigest() == sha
         assert db.read_bytes() == before
@@ -3403,19 +3414,21 @@ class TestDamagedDatabaseClassification:
         assert line.endswith(
             "is damaged or not an SQLite database: DatabaseError; restore it from a backup."
         )
-        assert cli_errors._damaged_database_message(None, exc) == (
+        assert config_error_message(None, exc) == (
             "the config database is damaged or not an SQLite database: "
             "DatabaseError; restore it from a backup."
         )
 
-    def test_an_exception_without_orig_and_without_text_names_its_type(self):
+    def test_only_an_exact_database_error_is_called_damaged(self):
+        """The store's `config_error_message` (the CLI's one wording since
+        item 15.1) classifies by `type(exc) is DatabaseError`: an unrelated
+        exception with no text is NOT dressed up as a damaged database."""
+
         class Odd(Exception):
             pass
 
-        assert cli_errors._damaged_database_message(None, Odd("")) == (
-            "the config database is damaged or not an SQLite database: "
-            "Odd; restore it from a backup."
-        )
+        assert config_error_message(None, Odd("")).startswith("Failed to load configuration")
+        assert "damaged" not in config_error_message(None, Odd(""))
 
     def test_the_reporter_survives_an_empty_message_end_to_end(self, run, db):
         import_ok(run, db)
@@ -3424,7 +3437,7 @@ class TestDamagedDatabaseClassification:
             raise DatabaseError("SELECT 1", {}, Exception(""))
 
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(cli_main, "load_runtime_config", boom)
+            mp.setattr(cli_write, "read_config", boom)
             result = run("export", "-c", db)
         assert result.exit_code == 78, result.stderr
         assert "Traceback" not in result.stderr and "IndexError" not in result.stderr
@@ -3664,7 +3677,7 @@ class TestInterruptedImportSaysItOnce:
         def boom(resolved):
             raise exc
 
-        monkeypatch.setattr(cli_main, "load_runtime_config", boom)
+        monkeypatch.setattr(cli_write, "read_config", boom)
         result = run("export", "-c", db)
         assert "a note that says it may or may not have been applied, verbatim" in result.stderr
 
@@ -3685,7 +3698,7 @@ class TestInterruptedImportSaysItOnce:
         def boom(resolved):
             raise cli_main._Terminated()
 
-        monkeypatch.setattr(cli_main, "load_runtime_config", boom)
+        monkeypatch.setattr(cli_write, "read_config", boom)
         result = run("export", "-c", db)
         assert result.exit_code == 143
         assert stderr_lines(result) == ["terminated"]
@@ -4014,3 +4027,1137 @@ class TestSigtermInARealProcess:
                 proc.communicate()
         assert code == 143, err
         assert "Aborted" in err or "terminated" in err
+
+
+# ==========================================================================
+# Item 15.3 -- the write discipline: conflict / busy mapping, `commit_config`,
+# `notify_daemon`, the `migrate` writer lock, the `import` daemon notice.
+#
+# Mutation counts (scratch copy of the tree, one revert at a time; failing
+# tests across this file): see the item 15.3 hand-off report.
+# ==========================================================================
+
+WRITER_LOCK_NAME = "config.db" + store_paths.WRITER_LOCK_SUFFIX
+
+
+def _resolved(database: Path):
+    return store_paths.resolve_config_path(str(database))
+
+
+def _hold_writer_lock(resolved):
+    """Hold `<db>.writer.lock` from another thread until `release()` is called.
+    Returns `release`."""
+    entered, leave = threading.Event(), threading.Event()
+
+    def holder():
+        with writer_lock(resolved):
+            entered.set()
+            leave.wait(60)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert entered.wait(10)
+
+    def release():
+        leave.set()
+        thread.join(10)
+
+    return release
+
+
+@pytest.fixture
+def short_writer_lock(monkeypatch):
+    """Every writer-lock wait through the CLI gives up after 0.3 s (the
+    default is 10 s): `write_config` (via `commit_config`), `import_yaml` and
+    `migrate`."""
+    from zfsbackup.config.store import importer as importer_module
+
+    def patch_in(module, name="writer_lock"):
+        real = getattr(module, name)
+        monkeypatch.setattr(module, name, lambda resolved, **kw: real(resolved, timeout=0.3))
+
+    patch_in(importer_module)
+    patch_in(cli_main)
+
+    real_write = cli_write.write_config
+    monkeypatch.setattr(
+        cli_write, "write_config",
+        lambda resolved, config, **kw: real_write(resolved, config, lock_timeout=0.3, **kw),
+    )
+
+
+def _tank_config(name="tank/x", prefix="auto") -> BackupConfig:
+    from zfsbackup.config import DatasetConfig, Duration, RetentionRule
+
+    return BackupConfig(
+        snapshot_prefix=prefix,
+        datasets=[
+            DatasetConfig(
+                name=name,
+                frequency=Duration("1h"),
+                retention_rules=[RetentionRule(age=Duration("1d"), keep_for=Duration("30d"))],
+            )
+        ],
+    )
+
+
+class TestConflictAndBusyExitCodes:
+    """`ConfigConflict` and `ConfigBusy` are "look again and retry" (75), never
+    "the database is unusable" (78), and never an internal error."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [ConfigConflict(3, 4), ConfigConflict(0, None), ConfigBusy("x"), ConfigBusy("")],
+        ids=lambda e: f"{type(e).__name__}",
+    )
+    def test_exit_code_is_75(self, exc):
+        assert cli_errors.exit_code_for(exc) == 75
+
+    def test_they_are_checked_before_the_path_and_schema_families(self):
+        """If one ever gains a `ConfigPathError`/`SchemaError` base, 75 must
+        still win: the check order is the contract."""
+
+        class BusyAndPath(ConfigBusy, ConfigPathError):
+            pass
+
+        class ConflictAndSchema(ConfigConflict, SchemaVersionMismatch):
+            def __init__(self):
+                ConfigConflict.__init__(self, 1, 2)
+
+        assert cli_errors.exit_code_for(BusyAndPath("x")) == 75
+        assert cli_errors.exit_code_for(ConflictAndSchema()) == 75
+
+    def test_the_conflict_message_names_both_generations(self):
+        lines = cli_errors.format_error(ConfigConflict(3, 4), None)
+        assert lines[0] == "config changed underneath you (generation 3, now generation 4); re-run"
+        assert any("Nothing was written" in line for line in lines[1:])
+
+    def test_a_conflict_with_no_configuration_says_so(self):
+        lines = cli_errors.format_error(ConfigConflict(3, None), None)
+        assert lines[0] == "config changed underneath you (generation 3, now no configuration); re-run"
+
+    def test_the_busy_message_is_the_stores_text_as_one_line(self):
+        """15.5: the store's text already says what is busy and to retry, so
+        it is printed once, as the one line -- not under a generic header."""
+        lines = cli_errors.format_error(ConfigBusy("the store's detail line"), None)
+        assert lines == ["the store's detail line"]
+
+    def test_a_busy_without_text_falls_back_to_the_generic_line(self):
+        assert cli_errors.format_error(ConfigBusy(), None) == [
+            "another write is in progress; retry"
+        ]
+        assert cli_errors.format_error(ConfigBusy(""), None) == [
+            "another write is in progress; retry"
+        ]
+
+    def test_busy_notes_still_follow_the_one_line(self):
+        exc = ConfigBusy("held")
+        exc.add_note("a note")
+        assert cli_errors.format_error(exc, None) == ["held", "a note"]
+
+    def test_notes_are_kept(self):
+        exc = ConfigConflict(1, 2)
+        exc.add_note("a note")
+        assert cli_errors.format_error(exc, None)[-1] == "a note"
+
+    @pytest.mark.parametrize("exc", [ConfigConflict(1, 2), ConfigBusy("x")], ids=type)
+    def test_report_prints_error_not_internal_error_and_no_traceback_hint(self, exc):
+        buf = io.StringIO()
+        code = cli_errors.report(exc, None, stream=buf)
+        out = buf.getvalue()
+        assert code == 75
+        assert out.startswith("error: ")
+        assert "internal error" not in out and "re-run with -v" not in out.replace("re-run\n", "")
+        assert "Traceback" not in out
+
+    def test_a_conflict_through_the_cli_is_75(self, run, db, monkeypatch):
+        import_ok(run, db)
+
+        def conflict(resolved):
+            raise ConfigConflict(0, 1)
+
+        monkeypatch.setattr(cli_write, "read_config", conflict)
+        result = run("export", "-c", db)
+        assert result.exit_code == 75, result.stderr
+        assert result.stderr.splitlines()[0] == (
+            "error: config changed underneath you (generation 0, now generation 1); re-run"
+        )
+
+    def test_busy_through_the_cli_is_75_and_not_labelled_internal(self, run, db, monkeypatch):
+        import_ok(run, db)
+
+        def busy(*a, **k):
+            raise ConfigBusy("held by someone")
+
+        monkeypatch.setattr(cli_main, "import_yaml", busy)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 75, result.stderr
+        # The store's text IS the line; the import's own replace note may follow.
+        assert result.stderr.splitlines()[0] == "error: held by someone"
+        assert "another write is in progress; retry" not in result.stderr
+        assert "internal" not in result.stderr and "Traceback" not in result.stderr
+
+
+class TestReadSnapshot:
+    def test_returns_the_config_and_generation_and_releases_the_database(
+        self, run, db, monkeypatch
+    ):
+        import_ok(run, db)
+        released = []
+        real = cli_write.dispose_all
+        monkeypatch.setattr(cli_write, "dispose_all", lambda: (released.append(1), real())[1])
+        snap = cli_write.read_snapshot(_resolved(db))
+        assert snap.generation == 0
+        assert snap.config == BackupConfig.from_file(EXAMPLE_YAML)
+        assert released == [1]
+
+    def test_an_unloadable_stored_configuration_is_a_cli_error_and_still_releases(
+        self, run, db, monkeypatch
+    ):
+        import_ok(run, db)
+        empty_stored_config(db)
+        released = []
+        real = cli_write.dispose_all
+        monkeypatch.setattr(cli_write, "dispose_all", lambda: (released.append(1), real())[1])
+        with pytest.raises(cli_errors.CliError) as excinfo:
+            cli_write.read_snapshot(_resolved(db))
+        assert str(excinfo.value).startswith("the stored configuration cannot be loaded: ")
+        assert isinstance(excinfo.value.__cause__, ValueError)
+        assert released == [1]
+
+    def test_schema_errors_propagate_unwrapped(self, run, db):
+        import_ok(run, db)
+        dispose_all()
+        with raw_db(db) as conn:
+            conn.execute("UPDATE alembic_version SET version_num = 'ffffffffffff'")
+        with pytest.raises(SchemaVersionMismatch):
+            cli_write.read_snapshot(_resolved(db))
+
+    def test_release_database_is_dispose_all(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(cli_write, "dispose_all", lambda: calls.append(1))
+        cli_write.release_database()
+        assert calls == [1]
+
+
+class TestCommitConfig:
+    @pytest.fixture
+    def seeded(self, run, db):
+        import_ok(run, db)
+        resolved = _resolved(db)
+        return resolved, cli_write.read_snapshot(resolved)
+
+    def test_a_current_snapshot_commits_and_announces(self, seeded, capsys):
+        resolved, snap = seeded
+        result = cli_write.commit_config(resolved, snap, _tank_config("tank/new"))
+        assert result.generation == snap.generation + 1
+        out = capsys.readouterr()
+        assert out.out == (
+            f"config updated (generation {result.generation}); "
+            f"no running daemon detected for {resolved.resolved_path}\n"
+        )
+        assert out.err == ""
+        assert cli_write.read_snapshot(resolved).config == _tank_config("tank/new")
+
+    def test_announce_false_prints_nothing(self, seeded, capsys, monkeypatch):
+        resolved, snap = seeded
+        monkeypatch.setattr(
+            cli_write, "notify_daemon", lambda *a, **k: pytest.fail("announced")
+        )
+        cli_write.commit_config(resolved, snap, _tank_config(), announce=False)
+        assert capsys.readouterr().out == ""
+
+    def test_the_caller_can_announce_itself_afterwards(self, seeded, capsys):
+        resolved, snap = seeded
+        result = cli_write.commit_config(resolved, snap, _tank_config(), announce=False)
+        cli_write.notify_daemon(resolved, result.generation)
+        assert capsys.readouterr().out.startswith(f"config updated (generation {result.generation});")
+
+    def test_each_warning_is_passed_to_warn_exactly_once_and_before_the_write(
+        self, seeded, monkeypatch
+    ):
+        resolved, snap = seeded
+        risky = _tank_config(prefix="a_b")
+        expected = validate_config(risky)
+        assert expected
+        events = []
+        real_write = cli_write.write_config
+        monkeypatch.setattr(
+            cli_write, "write_config",
+            lambda *a, **k: (events.append("write"), real_write(*a, **k))[1],
+        )
+        cli_write.commit_config(
+            resolved, snap, risky, warn=lambda m: events.append(("warn", m))
+        )
+        assert events == [("warn", m) for m in expected] + ["write"]
+
+    def test_the_default_warn_prints_prefixed_lines_to_stderr_once(self, seeded, capsys):
+        resolved, snap = seeded
+        risky = _tank_config(prefix="a_b")
+        expected = validate_config(risky)
+        cli_write.commit_config(resolved, snap, risky)
+        err = capsys.readouterr().err
+        assert err.splitlines() == [f"warning: {m}" for m in expected]
+
+    def test_the_database_is_released_before_the_write(self, seeded, monkeypatch):
+        resolved, snap = seeded
+        events = []
+        monkeypatch.setattr(cli_write, "release_database", lambda: events.append("release"))
+        real_write = cli_write.write_config
+        monkeypatch.setattr(
+            cli_write, "write_config",
+            lambda *a, **k: (events.append("write"), real_write(*a, **k))[1],
+        )
+        cli_write.commit_config(resolved, snap, _tank_config(), announce=False)
+        # release, write, release: the second is in a `finally`, so nothing
+        # the write opened stays pooled while a caller runs `$EDITOR`.
+        assert events == ["release", "write", "release"]
+
+    def test_the_database_is_released_again_when_the_write_raises(self, seeded, monkeypatch):
+        resolved, snap = seeded
+        events = []
+        monkeypatch.setattr(cli_write, "release_database", lambda: events.append("release"))
+
+        def failing(*a, **k):
+            events.append("write")
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(cli_write, "write_config", failing)
+        with pytest.raises(RuntimeError, match="disk full"):
+            cli_write.commit_config(resolved, snap, _tank_config(), announce=False)
+        assert events == ["release", "write", "release"]
+
+    def test_no_notice_is_printed_when_the_write_raises(self, seeded, monkeypatch, capsys):
+        resolved, snap = seeded
+        monkeypatch.setattr(
+            cli_write, "write_config", lambda *a, **k: (_ for _ in ()).throw(OSError("x"))
+        )
+        with pytest.raises(OSError):
+            cli_write.commit_config(resolved, snap, _tank_config())
+        assert capsys.readouterr().out == ""
+
+    def test_the_engine_cache_is_empty_after_a_failed_write(self, seeded, monkeypatch):
+        """The real `dispose_all` runs in the `finally`, whatever the write did."""
+        resolved, snap = seeded
+
+        def open_then_fail(*a, **k):
+            read_config(resolved)  # leaves a cached engine, like any real attempt
+            assert store_db._ENGINES, "the premise: something is pooled"
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(cli_write, "write_config", open_then_fail)
+        with pytest.raises(RuntimeError):
+            cli_write.commit_config(resolved, snap, _tank_config(), announce=False)
+        assert store_db._ENGINES == {}
+
+    def test_it_passes_the_snapshots_generation_as_the_expectation(self, seeded, monkeypatch):
+        resolved, snap = seeded
+        seen = {}
+        real_write = cli_write.write_config
+
+        def spy(r, c, **kw):
+            seen.update(kw)
+            return real_write(r, c, **kw)
+
+        monkeypatch.setattr(cli_write, "write_config", spy)
+        cli_write.commit_config(resolved, snap, _tank_config(), announce=False)
+        assert seen == {"expected_generation": snap.generation}
+
+    def test_a_stale_snapshot_is_a_conflict_with_both_generations_and_the_store_is_unchanged(
+        self, run, db, seeded, capsys
+    ):
+        resolved, snap = seeded
+        import_ok(run, db, mini_yaml(db.parent / "other.yaml", names=("tank/theirs",)))
+        dispose_all()
+        before = exported(run, db)
+        capsys.readouterr()
+
+        with pytest.raises(ConfigConflict) as excinfo:
+            cli_write.commit_config(resolved, snap, _tank_config("tank/mine"))
+        assert (excinfo.value.expected, excinfo.value.actual) == (0, 1)
+        assert capsys.readouterr().out == ""  # no "config updated" for a write that did not happen
+
+        buf = io.StringIO()
+        assert cli_errors.report(excinfo.value, resolved, stream=buf) == 75
+        assert buf.getvalue().splitlines()[0] == (
+            "error: config changed underneath you (generation 0, now generation 1); re-run"
+        )
+        dispose_all()
+        assert exported(run, db) == before
+        assert "tank/mine" not in before
+
+    def test_a_second_commit_from_the_same_snapshot_is_the_conflict(self, seeded):
+        resolved, snap = seeded
+        cli_write.commit_config(resolved, snap, _tank_config("tank/a"), announce=False)
+        with pytest.raises(ConfigConflict) as excinfo:
+            cli_write.commit_config(resolved, snap, _tank_config("tank/b"), announce=False)
+        assert (excinfo.value.expected, excinfo.value.actual) == (0, 1)
+
+    def test_an_invalid_config_is_a_value_error_before_the_database_is_written_or_locked(
+        self, seeded, db, monkeypatch
+    ):
+        resolved, snap = seeded
+        (db.parent / WRITER_LOCK_NAME).unlink()  # the seeding import's
+        dispose_all()
+        before = digest(db)
+        monkeypatch.setattr(
+            cli_write, "write_config", lambda *a, **k: pytest.fail("write_config reached")
+        )
+        with pytest.raises(ValueError):
+            cli_write.commit_config(resolved, snap, BackupConfig(datasets=[]))
+        assert digest(db) == before
+        assert WRITER_LOCK_NAME not in os.listdir(db.parent)
+
+    def test_busy_when_another_writer_holds_the_lock(
+        self, seeded, db, capsys, short_writer_lock
+    ):
+        resolved, snap = seeded
+        before = digest(db)
+        release = _hold_writer_lock(resolved)
+        try:
+            with pytest.raises(ConfigBusy) as excinfo:
+                cli_write.commit_config(resolved, snap, _tank_config("tank/mine"))
+        finally:
+            release()
+        assert capsys.readouterr().out == ""
+        buf = io.StringIO()
+        assert cli_errors.report(excinfo.value, resolved, stream=buf) == 75
+        # The store's own text, once, as the one line.
+        assert buf.getvalue().splitlines() == [f"error: {excinfo.value}"]
+        assert "retry" in buf.getvalue()
+        dispose_all()
+        assert digest(db) == before
+        # ...and a retry once the lock is free succeeds from the same snapshot.
+        assert cli_write.commit_config(resolved, snap, _tank_config("tank/mine"), announce=False).generation == 1
+
+
+class TestNotifyDaemon:
+    @pytest.fixture
+    def resolved(self, db):
+        db.parent.mkdir(parents=True, exist_ok=True)
+        return _resolved(db)
+
+    def test_no_daemon(self, resolved, capsys):
+        cli_write.notify_daemon(resolved, 5)
+        out = capsys.readouterr()
+        assert out.out == (
+            f"config updated (generation 5); no running daemon detected for {resolved.resolved_path}\n"
+        )
+        assert out.err == ""
+
+    def test_unknown_generation_of_the_write_drops_the_clause(self, resolved, capsys):
+        cli_write.notify_daemon(resolved, None)
+        assert capsys.readouterr().out == (
+            f"config updated; no running daemon detected for {resolved.resolved_path}\n"
+        )
+
+    def test_a_running_daemon_is_named_with_its_pid_and_generation(
+        self, resolved, db, daemon_lock_holder, capsys
+    ):
+        holder = daemon_lock_holder(db, generation=2)
+        cli_write.notify_daemon(resolved, 3)
+        out = capsys.readouterr()
+        assert out.out == (
+            f"config updated (generation 3); running daemon pid {holder.pid} is on "
+            "generation 2 and will not apply this until restarted\n"
+        )
+        assert out.err == ""
+
+    def test_a_daemon_that_has_not_recorded_a_generation(
+        self, resolved, db, daemon_lock_holder, capsys
+    ):
+        holder = daemon_lock_holder(db, generation=None)
+        cli_write.notify_daemon(resolved, 3)
+        assert capsys.readouterr().out == (
+            f"config updated (generation 3); running daemon pid {holder.pid} is on "
+            "an unknown generation and will not apply this until restarted\n"
+        )
+
+    def test_a_daemon_whose_pid_is_not_yet_readable(self, resolved, capsys, monkeypatch):
+        monkeypatch.setattr(
+            daemonlock, "probe", lambda r: daemonlock.DaemonInfo(pid=None, generation=4)
+        )
+        cli_write.notify_daemon(resolved, 5)
+        assert capsys.readouterr().out == (
+            "config updated (generation 5); running daemon (pid unknown) is on "
+            "generation 4 and will not apply this until restarted\n"
+        )
+
+    def test_a_stale_file_left_by_kill_9_is_not_a_running_daemon(
+        self, resolved, db, daemon_lock_holder, capsys
+    ):
+        holder = daemon_lock_holder(db, generation=2)
+        holder.kill9()
+        assert daemonlock.lock_path(resolved).exists()
+        cli_write.notify_daemon(resolved, 3)
+        assert "no running daemon detected" in capsys.readouterr().out
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+    def test_an_orphaned_worker_holding_the_lock_says_the_supervisor_is_gone(
+        self, resolved, db, daemon_lock_holder, capsys
+    ):
+        """The lock is still held (a forked child keeps it), so it is not
+        "no running daemon" -- but the recorded pid is dead, so the notice
+        must not claim a daemon "is on generation N"."""
+        holder = daemon_lock_holder(db, generation=2, fork=True)
+        holder.kill9()  # the supervisor is gone; its forked child still holds the lock
+        cli_write.notify_daemon(resolved, 3)
+        out = capsys.readouterr()
+        assert out.out == (
+            f"config updated (generation 3); the daemon's supervisor (pid {holder.pid}) "
+            "is gone but processes it forked still hold the lock; restart the daemon "
+            "after they exit\n"
+        )
+        assert "no running daemon" not in out.out and "will not apply" not in out.out
+        assert out.err == ""
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+    def test_a_live_supervisor_with_forked_workers_is_a_running_daemon(
+        self, resolved, db, daemon_lock_holder, capsys
+    ):
+        holder = daemon_lock_holder(db, generation=2, fork=True)
+        cli_write.notify_daemon(resolved, 3)
+        assert capsys.readouterr().out == (
+            f"config updated (generation 3); running daemon pid {holder.pid} is on "
+            "generation 2 and will not apply this until restarted\n"
+        )
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            daemonlock.DaemonLockError(errno.EACCES, "Permission denied"),
+            OSError(errno.EIO, "Input/output error"),
+        ],
+        ids=["DaemonLockError", "OSError"],
+    )
+    def test_a_probe_failure_is_a_warning_not_an_error(
+        self, resolved, capsys, monkeypatch, error
+    ):
+        def failing(r):
+            raise error
+
+        monkeypatch.setattr(daemonlock, "probe", failing)
+        cli_write.notify_daemon(resolved, 3)  # must not raise
+        out = capsys.readouterr()
+        assert out.out == "config updated (generation 3)\n"
+        assert out.err == (
+            f"warning: could not check whether a daemon is running for "
+            f"{resolved.resolved_path}: {error.strerror}\n"
+        )
+
+    def test_it_never_signals_anything(
+        self, resolved, db, daemon_lock_holder, monkeypatch
+    ):
+        holder = daemon_lock_holder(db, generation=2)
+
+        def forbidden(*a, **k):
+            raise AssertionError("the CLI sent a signal")
+
+        # Scoped to the call: the holder fixture's own teardown needs `os.kill`.
+        with monkeypatch.context() as scoped:
+            scoped.setattr(os, "kill", forbidden)
+            scoped.setattr(os, "killpg", forbidden)
+            cli_write.notify_daemon(resolved, 3)
+        assert holder.proc.poll() is None  # still running, untouched
+
+    def test_probing_does_not_disturb_the_lock_file(self, resolved, db, daemon_lock_holder):
+        daemon_lock_holder(db, generation=2)
+        path = daemonlock.lock_path(resolved)
+        before = path.read_bytes()
+        cli_write.notify_daemon(resolved, 3)
+        assert path.read_bytes() == before
+
+
+class TestDaemonNoticeWording:
+    """Mutation counts (15.5, scratch copy, tests failing in this file): CLI
+    liveness ignored 4 (+2 strict-xfail flips); `None == None` read as "same
+    generation" 1; the same-generation branch removed 3; OSError on the notice
+    output not swallowed 5; `commit_config`'s `finally` release removed 3;
+    `ImportResult.generation` ignored by the CLI 2 (and by the importer 8 across
+    this file, test_zfsbackup_store_access.py and the importer file); the old
+    two-line ConfigBusy wording 7; the empty-text fallback removed 1.
+
+    `notify_daemon` is `_daemon_notice` (pure: probe -> text) plus a printing
+    wrapper (item 15.5). The generation comparison is three-way -- same, older,
+    UNKNOWN -- and an unknown one must never be mistaken for either of the
+    others."""
+
+    @pytest.fixture
+    def resolved(self, db):
+        db.parent.mkdir(parents=True, exist_ok=True)
+        return _resolved(db)
+
+    @staticmethod
+    def _daemon(monkeypatch, pid=4321, generation=None, alive=True):
+        monkeypatch.setattr(
+            daemonlock, "probe",
+            lambda r: daemonlock.DaemonInfo(pid=pid, generation=generation),
+        )
+        monkeypatch.setattr(daemonlock.os, "kill", (
+            (lambda p, s: None) if alive else _raising(ProcessLookupError(errno.ESRCH, "x"))
+        ))
+
+    def test_a_daemon_already_on_the_written_generation_has_nothing_to_restart(
+        self, resolved, monkeypatch
+    ):
+        self._daemon(monkeypatch, generation=5)
+        line, warning = cli_write._daemon_notice(resolved, 5)
+        assert line == "config updated (generation 5); running daemon pid 4321 is already on generation 5"
+        assert warning is None
+        assert "restarted" not in line
+
+    def test_the_same_generation_through_notify_prints_it(self, resolved, monkeypatch, capsys):
+        self._daemon(monkeypatch, generation=5)
+        cli_write.notify_daemon(resolved, 5)
+        out = capsys.readouterr()
+        assert out.out == (
+            "config updated (generation 5); running daemon pid 4321 is already on generation 5\n"
+        )
+        assert out.err == ""
+
+    def test_an_older_daemon_will_not_apply_it_until_restarted(self, resolved, monkeypatch):
+        self._daemon(monkeypatch, generation=2)
+        assert cli_write._daemon_notice(resolved, 5) == (
+            "config updated (generation 5); running daemon pid 4321 is on generation 2 "
+            "and will not apply this until restarted",
+            None,
+        )
+
+    def test_a_daemon_with_an_unknown_generation_is_neither_older_nor_same(
+        self, resolved, monkeypatch
+    ):
+        """The startup window: the lock is taken, the config not yet loaded."""
+        self._daemon(monkeypatch, generation=None)
+        line, _ = cli_write._daemon_notice(resolved, 5)
+        assert line == (
+            "config updated (generation 5); running daemon pid 4321 is on an unknown "
+            "generation and will not apply this until restarted"
+        )
+        assert "generation None" not in line and "already on" not in line
+
+    def test_an_unknown_written_generation_is_never_the_same_as_an_unknown_daemon_one(
+        self, resolved, monkeypatch
+    ):
+        """None == None must not read as "already on generation"."""
+        self._daemon(monkeypatch, generation=None)
+        line, _ = cli_write._daemon_notice(resolved, None)
+        assert line == (
+            "config updated; running daemon pid 4321 is on an unknown generation "
+            "and will not apply this until restarted"
+        )
+        assert "already on" not in line
+
+    def test_an_unknown_written_generation_with_a_known_daemon_one(self, resolved, monkeypatch):
+        self._daemon(monkeypatch, generation=3)
+        line, _ = cli_write._daemon_notice(resolved, None)
+        assert line == (
+            "config updated; running daemon pid 4321 is on generation 3 and will not "
+            "apply this until restarted"
+        )
+
+    def test_a_dead_supervisor_still_holding_the_lock(self, resolved, monkeypatch, capsys):
+        self._daemon(monkeypatch, pid=4321, generation=2, alive=False)
+        cli_write.notify_daemon(resolved, 3)
+        out = capsys.readouterr()
+        assert out.out == (
+            "config updated (generation 3); the daemon's supervisor (pid 4321) is gone "
+            "but processes it forked still hold the lock; restart the daemon after they exit\n"
+        )
+        assert "running daemon" not in out.out and "is on generation" not in out.out
+
+    def test_a_dead_supervisor_with_the_same_generation_is_still_reported_gone(
+        self, resolved, monkeypatch
+    ):
+        """Liveness is checked before the generation is compared: workers that
+        outlive the supervisor are not a daemon that "is already on" anything."""
+        self._daemon(monkeypatch, pid=4321, generation=5, alive=False)
+        line, _ = cli_write._daemon_notice(resolved, 5)
+        assert "supervisor (pid 4321) is gone" in line and "already on" not in line
+
+    def test_a_live_but_unsignalable_pid_is_a_running_daemon(self, resolved, monkeypatch):
+        """EPERM means the process exists (it is root's, we are not)."""
+        monkeypatch.setattr(
+            daemonlock, "probe", lambda r: daemonlock.DaemonInfo(pid=1, generation=2)
+        )
+        monkeypatch.setattr(
+            daemonlock.os, "kill", _raising(PermissionError(errno.EPERM, "nope"))
+        )
+        line, _ = cli_write._daemon_notice(resolved, 3)
+        assert "running daemon pid 1 is on generation 2" in line
+
+    def test_the_cli_does_not_signal_with_anything_but_signal_zero(self, resolved, monkeypatch):
+        sent = []
+        monkeypatch.setattr(
+            daemonlock, "probe", lambda r: daemonlock.DaemonInfo(pid=4321, generation=2)
+        )
+        monkeypatch.setattr(daemonlock.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+        cli_write._daemon_notice(resolved, 3)
+        assert sent and all(sig == 0 for _, sig in sent)
+
+    @pytest.mark.parametrize("how", ["pid_zero", "kill_eio"])
+    def test_a_pid_that_cannot_be_judged_is_not_reported_as_a_dead_supervisor(
+        self, resolved, monkeypatch, how
+    ):
+        pid = 0 if how == "pid_zero" else 4321
+        monkeypatch.setattr(
+            daemonlock, "probe", lambda r: daemonlock.DaemonInfo(pid=pid, generation=2)
+        )
+        monkeypatch.setattr(daemonlock.os, "kill", _raising(OSError(errno.EIO, "io")))
+        line, _ = cli_write._daemon_notice(resolved, 3)
+        assert "is gone" not in line
+
+    def test_pid_alive_falls_back_to_kill_zero_without_the_daemonlock_helper(
+        self, monkeypatch
+    ):
+        for name in ("pid_alive", "is_pid_alive", "pid_is_alive", "process_alive"):
+            monkeypatch.delattr(daemonlock, name, raising=False)
+        monkeypatch.setattr(os, "kill", _raising(ProcessLookupError(errno.ESRCH, "x")))
+        assert cli_write._pid_alive(4321) is False
+        monkeypatch.setattr(os, "kill", _raising(PermissionError(errno.EPERM, "x")))
+        assert cli_write._pid_alive(4321) is True
+        monkeypatch.setattr(os, "kill", _raising(OSError(errno.EIO, "x")))
+        assert cli_write._pid_alive(4321) is None
+        monkeypatch.setattr(os, "kill", lambda p, s: None)
+        assert cli_write._pid_alive(4321) is True
+
+    def test_pid_alive_uses_the_daemonlock_helper_when_it_exists(self, monkeypatch):
+        monkeypatch.setattr(
+            os, "kill", lambda *a: pytest.fail("the helper should have been used")
+        )
+        monkeypatch.setattr(daemonlock, "pid_is_alive", lambda pid: False)
+        assert cli_write._pid_alive(4321) is False
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            BrokenPipeError(errno.EPIPE, "Broken pipe"),
+            OSError(errno.EIO, "Input/output error"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        ],
+        ids=["EPIPE", "EIO", "ENOSPC"],
+    )
+    def test_an_output_failure_on_the_notice_is_swallowed(self, resolved, monkeypatch, error):
+        monkeypatch.setattr(
+            cli_write.click, "echo", lambda *a, **k: (_ for _ in ()).throw(error)
+        )
+        cli_write.notify_daemon(resolved, 3)  # must not raise
+
+    def test_a_failure_in_the_notice_itself_degrades_to_a_plain_update_with_a_warning(
+        self, resolved, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            cli_write, "_daemon_notice",
+            lambda r, g: (_ for _ in ()).throw(RuntimeError("kaboom")),
+        )
+        cli_write.notify_daemon(resolved, 3)
+        out = capsys.readouterr()
+        assert out.out == "config updated\n"
+        assert "warning: could not check for a running daemon: kaboom" in out.err
+
+    def test_a_broken_pipe_on_the_notice_after_a_real_edit_leaves_the_write_committed(
+        self, run, db, monkeypatch
+    ):
+        import_ok(run, db)
+        real_echo = click.echo
+
+        def echo(message=None, *a, **k):
+            if isinstance(message, str) and message.startswith("config updated"):
+                raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+            return real_echo(message, *a, **k)
+
+        monkeypatch.setattr(cli_write.click, "echo", echo)
+        resolved = _resolved(db)
+        snap = cli_write.read_snapshot(resolved)
+        cli_write.commit_config(resolved, snap, _tank_config("tank/piped"))  # no raise
+        after = cli_write.read_snapshot(resolved)
+        assert after.generation == snap.generation + 1
+        assert [d.name for d in after.config.datasets] == ["tank/piped"]
+
+
+def _raising(exc):
+    def fn(*args, **kwargs):
+        raise exc
+
+    return fn
+
+
+class TestStartupWindowNotice:
+    """Through the real CLI: a daemon that holds the lock but has not yet read
+    its configuration records no generation; the operator must be told the
+    daemon is on "an unknown generation", not "generation None" and not
+    "already on" the one just written."""
+
+    def test_a_real_import_beside_a_lock_with_no_recorded_generation(
+        self, run, db, daemon_lock_holder
+    ):
+        import_ok(run, db)
+        holder = daemon_lock_holder(db, generation=None)
+        result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))
+        assert result.stdout.splitlines()[-1] == (
+            f"config updated (generation 1); running daemon pid {holder.pid} is on an "
+            "unknown generation and will not apply this until restarted"
+        )
+
+    def test_an_import_over_a_daemon_on_the_previous_generation(
+        self, run, db, daemon_lock_holder
+    ):
+        import_ok(run, db)
+        holder = daemon_lock_holder(db, generation=0)
+        result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))  # writes generation 1
+        assert result.stdout.splitlines()[-1] == (
+            f"config updated (generation 1); running daemon pid {holder.pid} is on "
+            "generation 0 and will not apply this until restarted"
+        )
+
+    def test_an_import_whose_generation_the_daemon_already_runs(
+        self, run, db, daemon_lock_holder
+    ):
+        import_ok(run, db)
+        holder = daemon_lock_holder(db, generation=1)
+        result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))  # writes generation 1
+        assert result.stdout.splitlines()[-1] == (
+            f"config updated (generation 1); running daemon pid {holder.pid} is "
+            "already on generation 1"
+        )
+
+
+class TestImportNotice:
+    def test_a_first_import_says_generation_0_and_no_daemon(self, run, db):
+        result = import_ok(run, db)
+        resolved = _resolved(db)
+        assert result.stdout.splitlines()[-1] == (
+            f"config updated (generation 0); no running daemon detected for {resolved.resolved_path}"
+        )
+        assert result.stdout.index("Schema revision:") < result.stdout.index("config updated")
+
+    def test_a_re_import_reports_the_new_generation(self, run, db):
+        import_ok(run, db)
+        result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))
+        assert "config updated (generation 1); no running daemon detected" in result.stdout
+
+    def test_a_running_daemon_is_told_about(self, run, db, daemon_lock_holder):
+        import_ok(run, db)
+        holder = daemon_lock_holder(db, generation=0)
+        result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))
+        assert result.stdout.splitlines()[-1] == (
+            f"config updated (generation 1); running daemon pid {holder.pid} is on "
+            "generation 0 and will not apply this until restarted"
+        )
+        assert holder.proc.poll() is None
+
+    def test_a_failed_import_prints_no_notice(self, run, db, monkeypatch):
+        def failing(*a, **k):
+            raise ValueError("bad yaml")
+
+        monkeypatch.setattr(cli_main, "import_yaml", failing)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 1
+        assert "config updated" not in result.stdout + result.stderr
+
+    @staticmethod
+    def _import_without_generation(monkeypatch):
+        """Make `import_yaml` report no generation, as a store that predates
+        `ImportResult.generation` would."""
+        import dataclasses
+
+        real = cli_main.import_yaml
+
+        def no_generation(*a, **k):
+            return dataclasses.replace(real(*a, **k), generation=None)
+
+        monkeypatch.setattr(cli_main, "import_yaml", no_generation)
+
+    def test_an_unreadable_generation_does_not_fail_the_committed_import(
+        self, run, db, monkeypatch
+    ):
+        """The read-back is only a fallback for a result without a generation;
+        when that fails too the notice just omits the clause."""
+        self._import_without_generation(monkeypatch)
+
+        def broken(resolved):
+            raise OSError("disk went away")
+
+        monkeypatch.setattr(cli_main, "read_config", broken)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.splitlines()[-1] == (
+            f"config updated; no running daemon detected for {_resolved(db).resolved_path}"
+        )
+
+    def test_the_import_result_generation_is_used_without_a_read_back(
+        self, run, db, monkeypatch
+    ):
+        """`ImportResult.generation` is what the import committed; reading it
+        back after the writer lock is released could report a concurrent
+        write's generation as the import's."""
+        import_ok(run, db)
+
+        def forbidden(resolved):
+            pytest.fail("read_config reached although ImportResult.generation was set")
+
+        monkeypatch.setattr(cli_main, "read_config", forbidden)
+        result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))
+        assert result.stdout.splitlines()[-1] == (
+            f"config updated (generation 1); no running daemon detected for "
+            f"{_resolved(db).resolved_path}"
+        )
+
+    def test_the_result_generation_wins_over_a_disagreeing_read_back(
+        self, run, db, monkeypatch
+    ):
+        import dataclasses
+
+        import_ok(run, db)
+        real = cli_main.import_yaml
+        monkeypatch.setattr(
+            cli_main, "import_yaml",
+            lambda *a, **k: dataclasses.replace(real(*a, **k), generation=41),
+        )
+        result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))
+        assert "config updated (generation 41);" in result.stdout
+
+    def test_the_read_back_is_the_fallback_when_the_result_has_no_generation(
+        self, run, db, monkeypatch
+    ):
+        import_ok(run, db)
+        self._import_without_generation(monkeypatch)
+        result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))
+        assert "config updated (generation 1);" in result.stdout
+
+    def test_a_broken_pipe_on_the_notice_does_not_fail_the_committed_import(
+        self, run, db, monkeypatch
+    ):
+        real_echo = click.echo
+
+        def echo(message=None, *a, **k):
+            if isinstance(message, str) and message.startswith("config updated"):
+                raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+            return real_echo(message, *a, **k)
+
+        monkeypatch.setattr(cli_write.click, "echo", echo)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 0, result.stderr
+        assert "Traceback" not in result.stderr
+        # The write committed regardless of the dead pipe.
+        snap = read_config(_resolved(db))
+        dispose_all()
+        assert snap.generation == 0 and snap.config.datasets
+
+    def test_a_probe_failure_after_an_import_is_a_warning_and_exit_0(
+        self, run, db, monkeypatch
+    ):
+        def failing(r):
+            raise daemonlock.DaemonLockError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(daemonlock, "probe", failing)
+        result = run("import", EXAMPLE_YAML, "-c", db)
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.splitlines()[-1] == "config updated (generation 0)"
+        assert "warning: could not check whether a daemon is running for" in result.stderr
+
+    def test_the_import_leaves_no_connection_open_afterwards(self, run, db):
+        import_ok(run, db)
+        assert sidecars(db) == []
+
+    def test_import_against_a_held_writer_lock_is_75_and_changes_nothing(
+        self, run, db, short_writer_lock
+    ):
+        import_ok(run, db)
+        dispose_all()
+        before = digest(db)
+        release = _hold_writer_lock(_resolved(db))
+        try:
+            result = run("import", mini_yaml(db.parent / "m.yaml"), "-c", db)
+        finally:
+            release()
+        assert result.exit_code == 75, result.stderr
+        lines = result.stderr.splitlines()
+        # One line from the store; `import` appends only its own replace note.
+        assert lines[0].startswith("error: another zfsbackup-config write to ")
+        assert "retry" in lines[0]
+        assert "another write is in progress; retry" not in result.stderr
+        assert len(lines) <= 2
+        assert "config updated" not in result.stdout
+        assert digest(db) == before
+
+
+class TestMigrateWriterLock:
+    def test_migrate_against_a_held_writer_lock_is_75_and_upgrades_nothing(
+        self, run, db, stacked_revision, short_writer_lock
+    ):
+        import_ok(run, db)
+        stacked_revision()
+        dispose_all()
+        before = digest(db)
+        release = _hold_writer_lock(_resolved(db))
+        try:
+            result = run("migrate", "-c", db)
+        finally:
+            release()
+        assert result.exit_code == 75, result.stderr
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1, "ConfigBusy prints one line (the store's text)"
+        assert lines[0].startswith("error: another zfsbackup-config write to ")
+        assert "Migrated" not in result.stdout
+        assert digest(db) == before
+        # ...and once the lock is free the same command goes through.
+        assert run("migrate", "-c", db).exit_code == 0
+
+    def test_migrate_on_an_up_to_date_database_waits_for_the_lock_too(
+        self, run, db, short_writer_lock
+    ):
+        """`migrate` serialises with every other write, even a no-op one."""
+        import_ok(run, db)
+        release = _hold_writer_lock(_resolved(db))
+        try:
+            result = run("migrate", "-c", db)
+        finally:
+            release()
+        assert result.exit_code == 75, result.stderr
+
+    def test_migrate_check_never_waits_for_the_lock(self, run, db, short_writer_lock):
+        import_ok(run, db)
+        release = _hold_writer_lock(_resolved(db))
+        try:
+            result = run("migrate", "--check", "-c", db)
+        finally:
+            release()
+        assert result.exit_code == 0, result.stderr
+
+    def test_a_real_upgrade_leaves_the_empty_never_deleted_lock_file(
+        self, run, db, stacked_revision
+    ):
+        import_ok(run, db)
+        (db.parent / WRITER_LOCK_NAME).unlink()
+        stacked_revision()
+        result = run("migrate", "-c", db)
+        assert result.exit_code == 0, result.stderr
+        lock = db.parent / WRITER_LOCK_NAME
+        assert lock.exists() and lock.stat().st_size == 0
+        assert (lock.stat().st_mode & 0o7777) == 0o660
+
+    @pytest.mark.parametrize("wal", [False, True], ids=["rollback-journal", "wal"])
+    def test_migrate_on_a_foreign_database_creates_no_lock_file(self, run, db, wal):
+        foreign_sqlite(db, wal=wal)
+        names = sorted(os.listdir(db.parent))
+        result = run("migrate", "-c", db)
+        assert result.exit_code == 78, result.stderr
+        assert sorted(os.listdir(db.parent)) == names
+        assert WRITER_LOCK_NAME not in os.listdir(db.parent)
+
+    def test_migrate_on_a_missing_database_creates_nothing(self, run, tmp_path):
+        missing = tmp_path / "nodir" / "config.db"
+        result = run("migrate", "-c", missing)
+        assert result.exit_code == 78, result.stderr
+        assert not missing.parent.exists()
+
+    def test_migrate_on_an_empty_sqlite_file_creates_no_lock_file(self, run, db):
+        blank_sqlite(db)
+        result = run("migrate", "-c", db)
+        assert result.exit_code == 78, result.stderr
+        assert WRITER_LOCK_NAME not in os.listdir(db.parent)
+
+    def test_migrate_on_a_version_mismatch_creates_no_lock_file(self, run, db):
+        import_ok(run, db)
+        (db.parent / WRITER_LOCK_NAME).unlink()
+        dispose_all()
+        with raw_db(db) as conn:
+            conn.execute("UPDATE alembic_version SET version_num = 'ffffffffffff'")
+        result = run("migrate", "-c", db)
+        assert result.exit_code == 78, result.stderr
+        assert WRITER_LOCK_NAME not in os.listdir(db.parent)
+
+
+# --------------------------------------------------------------------------
+# `import` beside a REAL daemon process
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.skipif(os.name != "posix", reason="POSIX daemon lifecycle")
+class TestImportBesideARealDaemon:
+    """The notice end to end: a real `python -m zfsbackup.daemon` holds the
+    daemon lock; `zfsbackup-config import` replaces the configuration, says the
+    daemon is on the old generation, and never signals it. Hard timeouts
+    throughout; the daemon's process group is SIGKILLed whatever happens."""
+
+    STARTUP = 60.0
+
+    @pytest.fixture
+    def daemon(self, db, tmp_path, run, monkeypatch):
+        zfs = os.environ.get("ZFS_CMD") or shutil.which("zfs") or shutil.which("true") or "/usr/bin/true"
+        monkeypatch.setenv("ZFS_CMD", zfs)
+        monkeypatch.setenv("ZPOOL_CMD", os.environ.get("ZPOOL_CMD") or zfs)
+        import socket
+        import uuid
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        yaml_path = tmp_path / "daemon.yaml"
+        yaml_path.write_text(
+            "datasets:\n"
+            f"  - name: zfsbackup_cli_notice_{uuid.uuid4().hex[:8]}/nonexistent\n"
+            "api_host: 127.0.0.1\n"
+            f"api_port: {port}\n"
+        )
+        import_ok(run, db, yaml_path)
+        dispose_all()
+        log_path = tmp_path / "daemon.log"
+        log = open(log_path, "wb")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "zfsbackup.daemon", "-c", str(db), "--dry-run"],
+            stdout=log, stderr=subprocess.STDOUT, cwd=str(REPO),
+            env=dict(os.environ, PYTHONUNBUFFERED="1"), start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + self.STARTUP
+            resolved = _resolved(db)
+            info = None
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    pytest.fail(f"daemon exited early ({proc.returncode}):\n{log_path.read_text(errors='replace')}")
+                info = daemonlock.probe(resolved)
+                if info is not None and info.pid == proc.pid and info.generation is not None:
+                    break
+                time.sleep(0.1)
+            else:
+                pytest.fail(f"daemon never recorded a generation: {info}\n{log_path.read_text(errors='replace')}")
+            yield proc, log_path
+        finally:
+            log.close()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def test_the_notice_names_the_running_daemon_and_nothing_is_signalled(
+        self, run, db, daemon, tmp_path
+    ):
+        proc, log_path = daemon
+        result = run("import", mini_yaml(tmp_path / "new.yaml", names=("tank/new",)), "-c", db)
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.splitlines()[-1] == (
+            f"config updated (generation 1); running daemon pid {proc.pid} is on "
+            "generation 0 and will not apply this until restarted"
+        )
+        # Not signalled, not stopped, not reloaded.
+        time.sleep(0.5)
+        assert proc.poll() is None
+        log = log_path.read_text(errors="replace")
+        assert "Received signal" not in log and "reload" not in log.lower()
+
+    def test_after_the_daemon_stops_the_notice_goes_back_to_none(
+        self, run, db, daemon, tmp_path
+    ):
+        proc, log_path = daemon
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=30) == 0, log_path.read_text(errors="replace")
+        result = run("import", mini_yaml(tmp_path / "new.yaml"), "-c", db)
+        assert result.exit_code == 0, result.stderr
+        assert "no running daemon detected" in result.stdout.splitlines()[-1]

@@ -813,3 +813,619 @@ class TestDatasetReportCollisionWarnings:
         assert len(warnings) == 2
         assert any(w.message.startswith('Dataset pool/data:') for w in warnings)
         assert any(w.message.startswith('Dataset pool/data -> offsite:') for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# Item 14.1: module-level property helpers (no BackupConfig, no DatasetManager)
+#
+# Driven through the real `libzfseasy` command classes with `Popen` mocked, so
+# the stdout fed in is exactly the `zfs get -H -o name,property,value,received,
+# source` shape the parser reads, and the command lines actually issued can be
+# asserted (e.g. "no `zfs set` under dry-run").
+# ---------------------------------------------------------------------------
+
+from zfsbackup.backup_manager import (  # noqa: E402
+    PROP_ANCHOR_PREFIX, PROP_CONFIG, PROP_PREFIX,
+    clear_zfsbackup_properties, copy_anchor_property, read_zfsbackup_properties,
+)
+
+
+def _zget(name, props, ptype='filesystem'):
+    """`zfs get -H -o name,property,value,received,source all <name>` lines.
+
+    `props` is a list of `(property, value, source)`; a `received` source also
+    fills the `received` column, like the real command.
+    """
+    lines = [f'{name}\tname\t{name}\t-\t-\n', f'{name}\ttype\t{ptype}\t-\t-\n']
+    for prop, value, source in props:
+        received = value if source == 'received' else '-'
+        lines.append(f'{name}\t{prop}\t{value}\t{received}\t{source}\n')
+    return lines
+
+
+def _fail_get(mock_subprocess, stderr):
+    """A `zfs get` that exits 1. `poll()` must keep answering after the first
+    call because `Command._exec_out` polls again in its `finally` when the
+    generator is abandoned by the exception; the stock fixture's one-shot
+    `side_effect` would raise `StopIteration` there and mask the real error."""
+    proc = mock_subprocess.setup(stdout=[], stderr=stderr, returncode=1)
+    proc.poll.side_effect = None
+    proc.poll.return_value = 1
+    return proc
+
+
+def _cmds(mock_subprocess):
+    return [c.args[0] for c in mock_subprocess.call_args_list]
+
+
+def _subcommands(mock_subprocess):
+    return [cmd[1] for cmd in _cmds(mock_subprocess)]
+
+
+A = PROP_ANCHOR_PREFIX
+
+
+class TestReadZfsbackupProperties:
+    def test_returns_only_org_zfsbackup_properties(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            ('compression', 'lz4', 'local'),
+            (PROP_CONFIG, '{"x":1}', 'local'),
+            ('org.other:thing', 'nope', 'local'),
+            (A + 'offsite', 'autosnap_1', 'local'),
+            ('mountpoint', '/mnt', 'local'),
+        ]))
+        result = read_zfsbackup_properties(Filesystem('pool/data'))
+        assert result == {PROP_CONFIG: '{"x":1}', A + 'offsite': 'autosnap_1'}
+
+    def test_local_and_received_sources_are_kept(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (PROP_CONFIG, 'c', 'local'),
+            (A + 'dest', 'snap', 'received'),
+        ]))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {
+            PROP_CONFIG: 'c', A + 'dest': 'snap',
+        }
+
+    @pytest.mark.parametrize('source', [
+        'inherited from pool', 'default', 'temporary', '-',
+    ])
+    def test_other_sources_are_ignored(self, mock_subprocess, source):
+        """An inherited value belongs to an ancestor; acting on it would be
+        acting on the wrong dataset."""
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (PROP_CONFIG, 'ancestors', source),
+            (A + 'dest', 'ancestors', source),
+        ]))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {}
+
+    def test_a_local_property_is_kept_beside_an_inherited_one(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (PROP_CONFIG, 'inherited-config', 'inherited from pool'),
+            (A + 'dest', 'mine', 'local'),
+        ]))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'dest': 'mine'}
+
+    def test_values_are_returned_as_strings_verbatim(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (A + 'a', 'autosnap_20240101120000', 'local'),
+            (A + 'b', 'has spaces: and colons', 'local'),
+            (A + 'c', '12345', 'local'),
+        ]))
+        result = read_zfsbackup_properties(Filesystem('pool/data'))
+        assert result[A + 'a'] == 'autosnap_20240101120000'
+        assert result[A + 'b'] == 'has spaces: and colons'
+        assert result[A + 'c'] == '12345' and isinstance(result[A + 'c'], str)
+
+    def test_no_properties_gives_an_empty_dict(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {}
+
+    def test_empty_output_gives_an_empty_dict(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {}
+
+    def test_only_the_named_dataset_is_read(self, mock_subprocess):
+        """A line group for any other dataset (a child, say) is not ours."""
+        mock_subprocess.setup(stdout=(
+            _zget('pool/data', [(PROP_CONFIG, 'parent', 'local')])
+            + _zget('pool/data/child', [(PROP_CONFIG, 'child', 'local'),
+                                         (A + 'x', 'y', 'local')])
+        ))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {PROP_CONFIG: 'parent'}
+
+    def test_dotted_and_hyphenated_destination_names(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (A + 'off-site.eu', 'snap', 'local'),
+        ]))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'off-site.eu': 'snap'}
+
+    def test_issues_a_single_zfs_get_for_the_dataset_and_nothing_else(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        read_zfsbackup_properties(Filesystem('pool/data'))
+        (cmd,) = _cmds(mock_subprocess)
+        assert cmd[1] == 'get'
+        assert cmd[-1] == 'pool/data'
+        assert 'all' in cmd
+        assert '-r' not in cmd, 'a recursive get would read the whole subtree'
+
+    def test_works_on_a_plain_dataset_object(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [(PROP_CONFIG, 'c', 'local')]))
+        assert read_zfsbackup_properties(Dataset('pool/data')) == {PROP_CONFIG: 'c'}
+
+    def test_zfs_errors_propagate(self, mock_subprocess):
+        _fail_get(mock_subprocess, "cannot open 'pool/data': dataset does not exist")
+        with pytest.raises(Exception, match='dataset does not exist'):
+            read_zfsbackup_properties(Filesystem('pool/data'))
+
+    def test_prefix_constant(self):
+        assert PROP_PREFIX == 'org.zfsbackup:'
+        assert PROP_CONFIG.startswith(PROP_PREFIX) and PROP_ANCHOR_PREFIX.startswith(PROP_PREFIX)
+
+
+class TestReadZfsbackupPropertiesRawParse:
+    """Mutation counts (15.5, scratch copy, tests failing in this file's
+    `ReadZfsbackupProperties*` classes): the filter moved after a `zfs.get`
+    object build 11 (3 of them the unknown-builtin ones); the tab-preserving
+    join reduced to `parts[2]` 2; the source filter dropped 10; the name filter
+    dropped 2; `-s local,received` dropped from the command 2.
+
+    Item 15.5: `read_zfsbackup_properties` reads the raw `zfs get` lines and
+    filters BEFORE anything becomes a libzfseasy object. `zfs.get(...)` builds
+    `ZFS` objects whose `update()` raises `ValueError` for a local/received
+    built-in property libzfseasy does not know (zvol `volthreading`, FreeBSD
+    `jailed`), so the old shape made rename/edit fail on such datasets."""
+
+    #: Real-shaped `-o name,property,value,received,source` output with
+    #: built-in properties libzfseasy has no class for.
+    UNKNOWN_BUILTINS = [
+        ('volthreading', 'off', 'local'),
+        ('jailed', 'on', 'local'),
+        (PROP_CONFIG, 'cfg', 'local'),
+    ]
+
+    def test_unknown_builtin_local_properties_do_not_break_the_read(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/zv', self.UNKNOWN_BUILTINS, ptype='volume'))
+        assert read_zfsbackup_properties(Dataset('pool/zv')) == {PROP_CONFIG: 'cfg'}
+
+    @pytest.mark.parametrize('prop, value', [('volthreading', 'off'), ('jailed', 'on')])
+    def test_each_unknown_builtin_alone_is_ignored_not_raised(self, mock_subprocess, prop, value):
+        mock_subprocess.setup(stdout=_zget('pool/zv', [(prop, value, 'local')], ptype='volume'))
+        assert read_zfsbackup_properties(Dataset('pool/zv')) == {}
+
+    def test_the_same_output_would_have_broken_the_object_path(self, mock_subprocess):
+        """Control: this is the failure the raw parse avoids. Building ZFS
+        objects from the identical output raises for the unknown property."""
+        import libzfseasy as zfs
+
+        mock_subprocess.setup(stdout=_zget('pool/zv', self.UNKNOWN_BUILTINS, ptype='volume'))
+        with pytest.raises(ValueError):
+            list(zfs.get(Dataset('pool/zv'), properties=['all'], sources=['local', 'received']))
+
+    def test_the_exact_command_line(self, mock_subprocess, monkeypatch):
+        monkeypatch.setenv('ZFS_CMD', '/usr/bin/true')
+        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        read_zfsbackup_properties(Filesystem('pool/data'))
+        (cmd,) = _cmds(mock_subprocess)
+        assert cmd == [
+            '/usr/bin/true', 'get', '-H', '-o', 'name,property,value,received,source',
+            '-s', 'local,received', 'all', 'pool/data',
+        ]
+
+    def test_the_binary_is_resolved_at_call_time(self, mock_subprocess, monkeypatch):
+        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        monkeypatch.setenv('ZFS_CMD', '/opt/zfs/bin/zfs')
+        read_zfsbackup_properties(Filesystem('pool/data'))
+        assert _cmds(mock_subprocess)[0][0] == '/opt/zfs/bin/zfs'
+
+    def test_an_inherited_zfsbackup_property_is_excluded(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data/child', [
+            (PROP_CONFIG, 'from-parent', 'inherited from pool/data'),
+            (A + 'dest', 'mine', 'local'),
+        ]))
+        assert read_zfsbackup_properties(Filesystem('pool/data/child')) == {A + 'dest': 'mine'}
+
+    def test_a_tab_inside_a_value_survives(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (A + 'tabbed', 'left\tright', 'local'),
+            (A + 'two', 'a\tb\tc', 'local'),
+        ]))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {
+            A + 'tabbed': 'left\tright', A + 'two': 'a\tb\tc',
+        }
+
+    def test_a_received_value_without_a_tab_is_not_confused_with_its_received_column(
+        self, mock_subprocess
+    ):
+        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'r', 'xy', 'received')]))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'r': 'xy'}
+
+    def test_a_tabbed_received_value_survives(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'r', 'x\ty', 'received')]))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'r': 'x\ty'}
+
+    def test_an_empty_value_is_an_empty_string(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['pool/data\t' + A + 'e\t\t-\tlocal\n'])
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'e': ''}
+
+    def test_short_lines_are_skipped(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[
+            'pool/data\t' + A + 'bad\tvalue\n',
+            'garbage\n',
+            *_zget('pool/data', [(A + 'ok', 'v', 'local')]),
+        ])
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'ok': 'v'}
+
+    def test_a_foreign_dataset_name_is_excluded_even_with_a_matching_property(
+        self, mock_subprocess
+    ):
+        mock_subprocess.setup(stdout=_zget('pool/data2', [(A + 'x', 'y', 'local')]))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {}
+
+    def test_a_property_that_merely_contains_the_prefix_is_excluded(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            ('x' + PROP_CONFIG, 'v', 'local'),
+            ('org.zfsbackupX:cfg', 'v', 'local'),
+        ]))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {}
+
+    def test_no_libzfseasy_object_is_built(self, mock_subprocess, mocker):
+        """The filter runs on raw text: `ZFS.update` is never reached."""
+        mock_subprocess.setup(stdout=_zget('pool/zv', self.UNKNOWN_BUILTINS, ptype='volume'))
+        update = mocker.patch('libzfseasy.types.ZFS.update')
+        read_zfsbackup_properties(Dataset('pool/zv'))
+        update.assert_not_called()
+
+    def test_through_a_real_process_with_a_fake_zfs_command(self, tmp_path, monkeypatch):
+        """No `Popen` mock: a stand-in `zfs` writes real tab-separated output to
+        a real pipe, so the tab in the value and the argument vector are
+        proven end to end."""
+        argv_log = tmp_path / 'argv'
+        fake = tmp_path / 'zfs'
+        fake.write_text(
+            '#!/bin/sh\n'
+            f'printf \'%s\\n\' "$@" > {argv_log}\n'
+            "printf 'pool/data\\tvolthreading\\toff\\t-\\tlocal\\n'\n"
+            "printf 'pool/data\\tjailed\\ton\\t-\\tlocal\\n'\n"
+            "printf 'pool/data\\torg.zfsbackup:config\\ta\\tb\\t-\\tlocal\\n'\n"
+            "printf 'pool/data\\torg.zfsbackup:anchor.d\\tsnap\\t-\\tinherited from pool\\n'\n"
+            "printf 'pool/data\\torg.zfsbackup:anchor.r\\trv\\trv\\treceived\\n'\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv('ZFS_CMD', str(fake))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {
+            PROP_CONFIG: 'a\tb',
+            A + 'r': 'rv',
+        }
+        assert argv_log.read_text().split('\n')[:-1] == [
+            'get', '-H', '-o', 'name,property,value,received,source',
+            '-s', 'local,received', 'all', 'pool/data',
+        ]
+
+
+class TestCopyAnchorProperty:
+    DS = staticmethod(lambda: Filesystem('pool/data'))
+
+    def test_copy_anchor_property_copies_the_value_and_reports_copied(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', [(A + 'old', 'autosnap_20240101120000', 'local')]),),
+            ('',),
+        )
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
+        get_cmd, set_cmd = _cmds(mock_subprocess)
+        assert get_cmd[1] == 'get'
+        assert set_cmd[1:] == ['set', f'{A}new=autosnap_20240101120000', 'pool/data']
+
+    def test_copy_anchor_property_never_deletes_the_old_property(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', [(A + 'old', 'snap', 'local')]),),
+            ('',),
+        )
+        copy_anchor_property(self.DS(), 'old', 'new')
+        assert _subcommands(mock_subprocess) == ['get', 'set']
+        for cmd in _cmds(mock_subprocess):
+            assert 'inherit' not in cmd and 'destroy' not in cmd
+            assert f'{A}old' not in cmd[2:], 'the old property is not touched'
+
+    def test_copy_anchor_property_sets_only_the_new_property(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', [(A + 'old', 'snap', 'local'), (A + 'other', 'x', 'local')]),),
+            ('',),
+        )
+        copy_anchor_property(self.DS(), 'old', 'new')
+        set_cmd = _cmds(mock_subprocess)[1]
+        assert [a for a in set_cmd if '=' in a] == [f'{A}new=snap']
+
+    def test_copy_anchor_property_no_source(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [(PROP_CONFIG, 'c', 'local')]))
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'no-source'
+        assert _subcommands(mock_subprocess) == ['get']
+
+    def test_copy_anchor_property_no_source_even_if_the_destination_exists(self, mock_subprocess):
+        """Nothing to copy takes precedence over "target already there"."""
+        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'new', 'x', 'local')]))
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'no-source'
+        assert _subcommands(mock_subprocess) == ['get']
+
+    def test_copy_anchor_property_exists_is_left_alone(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (A + 'old', 'from-old', 'local'),
+            (A + 'new', 'already-there', 'local'),
+        ]))
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'exists'
+        assert _subcommands(mock_subprocess) == ['get'], 'must not overwrite'
+
+    def test_copy_anchor_property_an_inherited_old_value_is_not_a_source(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (A + 'old', 'ancestors', 'inherited from pool'),
+        ]))
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'no-source'
+
+    def test_copy_anchor_property_an_inherited_new_value_does_not_block_the_copy(
+        self, mock_subprocess
+    ):
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', [
+                (A + 'old', 'mine', 'local'),
+                (A + 'new', 'ancestors', 'inherited from pool'),
+            ]),),
+            ('',),
+        )
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
+
+    def test_copy_anchor_property_a_received_old_value_is_a_source(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', [(A + 'old', 'snap', 'received')]),),
+            ('',),
+        )
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
+
+    def test_copy_anchor_property_dry_run_issues_no_zfs_set(self, mock_subprocess, caplog):
+        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'old', 'snap', 'local')]))
+        with caplog.at_level(logging.INFO):
+            result = copy_anchor_property(self.DS(), 'old', 'new', dry_run=True)
+        assert result == 'dry-run'
+        assert _subcommands(mock_subprocess) == ['get']
+        assert 'DRY RUN' in caplog.text and f'{A}new=snap' in caplog.text
+
+    def test_copy_anchor_property_dry_run_does_not_change_the_other_outcomes(
+        self, mock_subprocess
+    ):
+        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True) == 'no-source'
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (A + 'old', 'a', 'local'), (A + 'new', 'b', 'local'),
+        ]))
+        assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True) == 'exists'
+        assert 'set' not in _subcommands(mock_subprocess)
+
+    def test_copy_anchor_property_dry_run_is_keyword_only(self):
+        with pytest.raises(TypeError):
+            copy_anchor_property(self.DS(), 'old', 'new', True)
+
+    def test_copy_anchor_property_dotted_destination_names(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', [(A + 'off.site-1', 'snap', 'local')]),),
+            ('',),
+        )
+        assert copy_anchor_property(self.DS(), 'off.site-1', 'off.site-2') == 'copied'
+        assert _cmds(mock_subprocess)[1][2] == f'{A}off.site-2=snap'
+
+    def test_copy_anchor_property_same_name_is_exists(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'same', 'snap', 'local')]))
+        assert copy_anchor_property(self.DS(), 'same', 'same') == 'exists'
+        assert _subcommands(mock_subprocess) == ['get']
+
+    def test_copy_anchor_property_a_set_failure_propagates(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', [(A + 'old', 'snap', 'local')]),),
+            ([], 'cannot set property: permission denied', 1),
+        )
+        with pytest.raises(Exception, match='permission denied'):
+            copy_anchor_property(self.DS(), 'old', 'new')
+
+    def test_copy_anchor_property_a_get_failure_propagates_and_nothing_is_set(
+        self, mock_subprocess
+    ):
+        _fail_get(mock_subprocess, 'dataset does not exist')
+        with pytest.raises(Exception, match='does not exist'):
+            copy_anchor_property(self.DS(), 'old', 'new')
+        assert _subcommands(mock_subprocess) == ['get']
+
+    def test_copy_anchor_property_is_idempotent(self, mock_subprocess):
+        """Second run sees the destination and does nothing."""
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', [(A + 'old', 'snap', 'local')]),),
+            ('',),
+            (_zget('pool/data', [(A + 'old', 'snap', 'local'), (A + 'new', 'snap', 'local')]),),
+        )
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'exists'
+        assert _subcommands(mock_subprocess) == ['get', 'set', 'get']
+
+
+class TestClearZfsbackupProperties:
+    DS = staticmethod(lambda: Filesystem('pool/data'))
+
+    FULL = [
+        (PROP_CONFIG, 'cfg', 'local'),
+        (PROP_PREFIX + 'client_id', 'cid', 'local'),
+        (A + 'zeta', 's1', 'local'),
+        (A + 'alpha', 's2', 'local'),
+        (A + 'mid', 's3', 'received'),
+        ('org.other:anchor.alpha', 'foreign', 'local'),
+        ('compression', 'lz4', 'local'),
+    ]
+
+    def _arrange(self, mock_subprocess, props=None):
+        n_inherits = 8
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', self.FULL if props is None else props),),
+            *[('',)] * n_inherits,
+        )
+
+    def _inherited(self, mock_subprocess):
+        return [cmd[2] for cmd in _cmds(mock_subprocess) if cmd[1] == 'inherit']
+
+    def test_config_true_clears_the_config_property(self, mock_subprocess):
+        self._arrange(mock_subprocess)
+        result = clear_zfsbackup_properties(self.DS(), config=True, anchors=False)
+        assert result == [PROP_CONFIG]
+        assert self._inherited(mock_subprocess) == [PROP_CONFIG]
+
+    def test_inherit_command_shape(self, mock_subprocess):
+        self._arrange(mock_subprocess)
+        clear_zfsbackup_properties(self.DS(), config=True, anchors=False)
+        inherit = _cmds(mock_subprocess)[1]
+        assert inherit[1:] == ['inherit', PROP_CONFIG, 'pool/data']
+        assert '-r' not in inherit
+
+    def test_config_false_leaves_the_config_property(self, mock_subprocess):
+        self._arrange(mock_subprocess)
+        result = clear_zfsbackup_properties(self.DS(), config=False, anchors=False)
+        assert result == []
+        assert self._inherited(mock_subprocess) == []
+
+    def test_config_true_but_not_set_is_a_no_op(self, mock_subprocess):
+        self._arrange(mock_subprocess, [(A + 'x', 'y', 'local')])
+        assert clear_zfsbackup_properties(self.DS(), config=True, anchors=False) == []
+        assert _subcommands(mock_subprocess) == ['get']
+
+    def test_anchors_true_clears_every_anchor_sorted_and_only_anchors(self, mock_subprocess):
+        self._arrange(mock_subprocess)
+        result = clear_zfsbackup_properties(self.DS(), config=False, anchors=True)
+        assert result == [A + 'alpha', A + 'mid', A + 'zeta']
+        assert self._inherited(mock_subprocess) == result
+        # not the config, not client_id, not another namespace's "anchor."
+        assert PROP_CONFIG not in result
+        assert PROP_PREFIX + 'client_id' not in result
+        assert 'org.other:anchor.alpha' not in result
+
+    def test_anchors_list_clears_only_the_named_ones_that_are_set(self, mock_subprocess):
+        self._arrange(mock_subprocess)
+        result = clear_zfsbackup_properties(
+            self.DS(), config=False, anchors=['zeta', 'absent', 'alpha'])
+        assert result == [A + 'zeta', A + 'alpha'], 'request order, unset names skipped'
+        assert self._inherited(mock_subprocess) == result
+
+    def test_anchors_list_deduplicates(self, mock_subprocess):
+        self._arrange(mock_subprocess)
+        result = clear_zfsbackup_properties(
+            self.DS(), config=False, anchors=['alpha', 'alpha', 'alpha'])
+        assert result == [A + 'alpha']
+        assert self._inherited(mock_subprocess) == [A + 'alpha']
+
+    @pytest.mark.parametrize('empty', [False, None, [], (), set(), 0, ''])
+    def test_falsy_anchors_clear_nothing(self, mock_subprocess, empty):
+        self._arrange(mock_subprocess)
+        assert clear_zfsbackup_properties(self.DS(), config=False, anchors=empty) == []
+        assert _subcommands(mock_subprocess) == ['get']
+
+    @pytest.mark.parametrize('bare', ['alpha', 'a', 'zeta', b'alpha', 'True', 'false'])
+    def test_a_non_empty_bare_string_for_anchors_is_a_type_error(self, mock_subprocess, bare):
+        """Iterating `'alpha'` would look up destinations `a`, `l`, `p`, `h`,
+        `a` and silently clear nothing. Refused before ANY zfs call, so a
+        caller that passes a name instead of `[name]` learns immediately.
+
+        Mutation-checked (scratch copy): deleting the `isinstance(anchors,
+        (str, bytes))` guard fails 7 tests: the 6 parametrizations here and
+        `test_a_bare_string_is_refused_even_with_config_true_and_dry_run`."""
+        self._arrange(mock_subprocess)
+        with pytest.raises(TypeError, match='bare string'):
+            clear_zfsbackup_properties(self.DS(), config=False, anchors=bare)
+        assert _subcommands(mock_subprocess) == [], 'nothing, not even the read, may run'
+
+    def test_a_bare_string_is_refused_even_with_config_true_and_dry_run(self, mock_subprocess):
+        """No partial work: `config=True` must not clear the config property
+        before the bad `anchors` argument is noticed."""
+        self._arrange(mock_subprocess)
+        for dry_run in (False, True):
+            with pytest.raises(TypeError):
+                clear_zfsbackup_properties(
+                    self.DS(), config=True, anchors='alpha', dry_run=dry_run)
+        assert _subcommands(mock_subprocess) == []
+
+    def test_the_empty_string_stays_falsy_and_a_one_name_list_still_works(self, mock_subprocess):
+        """The boundary of the new guard: `''` (falsy, like `False`) is not
+        an error, and `['alpha']` is the supported spelling for one name."""
+        self._arrange(mock_subprocess)
+        assert clear_zfsbackup_properties(self.DS(), config=False, anchors='') == []
+        self._arrange(mock_subprocess)
+        assert clear_zfsbackup_properties(self.DS(), config=False, anchors=['alpha']) == [A + 'alpha']
+
+    @pytest.mark.parametrize('make', [tuple, set, frozenset, iter])
+    def test_anchors_accepts_any_iterable(self, mock_subprocess, make):
+        self._arrange(mock_subprocess)
+        result = clear_zfsbackup_properties(
+            self.DS(), config=False, anchors=make(['alpha']))
+        assert result == [A + 'alpha']
+
+    def test_config_and_anchors_together_config_first(self, mock_subprocess):
+        self._arrange(mock_subprocess)
+        result = clear_zfsbackup_properties(self.DS(), config=True, anchors=True)
+        assert result == [PROP_CONFIG, A + 'alpha', A + 'mid', A + 'zeta']
+        assert self._inherited(mock_subprocess) == result
+
+    def test_config_and_listed_anchors(self, mock_subprocess):
+        self._arrange(mock_subprocess)
+        result = clear_zfsbackup_properties(self.DS(), config=True, anchors=['mid'])
+        assert result == [PROP_CONFIG, A + 'mid']
+
+    def test_only_properties_actually_set_are_inherited(self, mock_subprocess):
+        self._arrange(mock_subprocess, [(A + 'only', 'x', 'local')])
+        result = clear_zfsbackup_properties(self.DS(), config=True, anchors=['only', 'ghost'])
+        assert result == [A + 'only']
+        assert self._inherited(mock_subprocess) == [A + 'only']
+
+    def test_inherited_values_are_not_cleared(self, mock_subprocess):
+        """`zfs inherit` on a dataset whose value is already inherited is a
+        no-op at best; it must not even be attempted (idempotent clear)."""
+        self._arrange(mock_subprocess, [
+            (PROP_CONFIG, 'parents', 'inherited from pool'),
+            (A + 'x', 'parents', 'inherited from pool'),
+        ])
+        assert clear_zfsbackup_properties(self.DS(), config=True, anchors=True) == []
+        assert _subcommands(mock_subprocess) == ['get']
+
+    def test_dry_run_returns_the_would_be_names_and_issues_no_inherit(
+        self, mock_subprocess, caplog
+    ):
+        self._arrange(mock_subprocess)
+        with caplog.at_level(logging.INFO):
+            result = clear_zfsbackup_properties(
+                self.DS(), config=True, anchors=True, dry_run=True)
+        assert result == [PROP_CONFIG, A + 'alpha', A + 'mid', A + 'zeta']
+        assert _subcommands(mock_subprocess) == ['get']
+        assert caplog.text.count('DRY RUN') == 4
+
+    def test_dry_run_with_nothing_set_returns_empty(self, mock_subprocess):
+        self._arrange(mock_subprocess, [])
+        assert clear_zfsbackup_properties(
+            self.DS(), config=True, anchors=True, dry_run=True) == []
+
+    def test_options_are_keyword_only(self):
+        with pytest.raises(TypeError):
+            clear_zfsbackup_properties(self.DS(), True, True)
+
+    def test_returns_a_list_of_names(self, mock_subprocess):
+        self._arrange(mock_subprocess)
+        result = clear_zfsbackup_properties(self.DS(), config=True, anchors=['alpha'])
+        assert isinstance(result, list)
+        assert all(isinstance(n, str) for n in result)
+
+    def test_an_inherit_failure_propagates_and_stops_at_the_failure(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', self.FULL),),
+            ('',),                                                    # config ok
+            ([], "cannot inherit: permission denied", 1),             # first anchor fails
+            ('',),
+        )
+        with pytest.raises(Exception, match='permission denied'):
+            clear_zfsbackup_properties(self.DS(), config=True, anchors=True)
+        assert _subcommands(mock_subprocess) == ['get', 'inherit', 'inherit'], \
+            'must not carry on past the failure'
+
+    def test_a_get_failure_propagates_and_nothing_is_inherited(self, mock_subprocess):
+        _fail_get(mock_subprocess, 'dataset does not exist')
+        with pytest.raises(Exception, match='does not exist'):
+            clear_zfsbackup_properties(self.DS(), config=True, anchors=True)
+        assert _subcommands(mock_subprocess) == ['get']

@@ -9,14 +9,15 @@ fork-safe by construction. The one exception is `upgrade_schema()` (item
 10.1), the CLI's `zfsbackup-config migrate`: it opens its own connection, but
 only through `paths.open_config_connection` -> `db.get_engine`, i.e. the same
 pid-keyed cache every other caller uses, and it is never reachable from the
-daemon or a worker (the daemon only ever *checks*).
+daemon (the daemon only ever *checks*) or a worker (which never opens the
+store).
 
 Callers: `importer.py`'s `import_yaml` calls `ensure_schema()` as part of
 bringing a fresh or existing DB up to date; `zfsbackup-config migrate` calls
-`upgrade_schema()`; the daemon and its workers only ever *check* the current
-revision against the package's head (`check_schema`, via
-`zfsbackup/runtime_config.py`) and refuse to start on a mismatch, never
-write -- "the CLI is the only writer" is what item 5's fork-safety and WAL
+`upgrade_schema()`; the daemon supervisor only ever *checks* the current
+revision against the package's head (`check_schema`, inside `read_config`,
+via `zfsbackup/runtime_config.py`) and refuses to start on a mismatch, never
+write; workers never open the database at all -- "the CLI is the only writer" is what item 5's fork-safety and WAL
 design depend on.
 
 **`EXPECTED_HEAD` / `KNOWN_REVISIONS` (item 10.1, B1).** `check_schema`
@@ -279,7 +280,27 @@ class SchemaOutOfDate(SchemaError):
     the database read-only. (`zfsbackup-config import` also migrates, but it
     is a destructive full replace of the stored configuration, so it is not
     the remedy for "my schema is old".)
+
+    `recorded_revisions` is the tuple of revision id(s) found in
+    `alembic_version`, sorted, or `()` when none is recorded -- an empty or
+    tableless file, or a stamp-less one `import` may still adopt. It lets a
+    caller tell the two situations this one class covers apart without parsing
+    the message: a non-empty tuple is a database `migrate` can upgrade; `()`
+    is a file with nothing to migrate (`migrate` refuses it, `import` creates
+    into it). It defaults to `()` so a bare `SchemaOutOfDate("text")` keeps
+    working.
     """
+
+    def __init__(self, *args: object, recorded_revisions: Tuple[str, ...] = ()) -> None:
+        super().__init__(*args)
+        self.recorded_revisions: Tuple[str, ...] = tuple(recorded_revisions)
+
+    def __reduce__(self):  # keep the keyword-only attribute across pickle/copy
+        return (_rebuild_out_of_date, (self.args, self.recorded_revisions))
+
+
+def _rebuild_out_of_date(args: tuple, recorded_revisions: Tuple[str, ...]) -> SchemaOutOfDate:
+    return SchemaOutOfDate(*args, recorded_revisions=recorded_revisions)
 
 
 class SchemaVersionMismatch(SchemaError):
@@ -611,7 +632,8 @@ def check_schema(connection: Connection) -> str:
             raise SchemaOutOfDate(
                 f"{_db_label(connection)} is at schema {word} "
                 f"{', '.join(sorted(db_heads))}; this package expects "
-                f"{EXPECTED_HEAD}. Run `zfsbackup-config migrate`."
+                f"{EXPECTED_HEAD}. Run `zfsbackup-config migrate`.",
+                recorded_revisions=tuple(sorted(db_heads)),
             )
         # No recorded revision and no tables: an empty or brand-new file.
         # `migrate` does not create databases, so the remedy is `import`.
@@ -619,7 +641,8 @@ def check_schema(connection: Connection) -> str:
             f"{_db_label(connection)} has no recorded schema revision (it "
             f"holds no configuration tables); this package expects "
             f"{EXPECTED_HEAD}. Create "
-            f"the configuration database with `zfsbackup-config import`."
+            f"the configuration database with `zfsbackup-config import`.",
+            recorded_revisions=(),
         )
 
     return EXPECTED_HEAD
@@ -737,6 +760,11 @@ def upgrade_schema(resolved: ResolvedConfigPath) -> SchemaUpgrade:
     `SchemaSplitBrain` if it holds tables, `SchemaOutOfDate` pointing at
     `import` if it is empty) and left unchanged (item 10.4).
 
+    **Callers must hold `writer_lock(resolved)`** (the CLI's `migrate` does):
+    this function takes SQLite's write lock but not the cross-process writer
+    lock that serialises it against `import` and `write_config`, and does not
+    acquire it itself.
+
     Owns its connection end to end, so no caller can get the sequencing
     wrong (cf. `ensure_schema`'s binding note):
 
@@ -791,7 +819,8 @@ def upgrade_schema(resolved: ResolvedConfigPath) -> SchemaUpgrade:
                     f"(it holds no configuration tables), so there is nothing to "
                     f"migrate. "
                     f"Create the configuration database with "
-                    f"`zfsbackup-config import`."
+                    f"`zfsbackup-config import`.",
+                    recorded_revisions=(),
                 )
             to_rev = ensure_schema(conn)
         except BaseException:

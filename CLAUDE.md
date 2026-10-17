@@ -108,23 +108,39 @@ value types (`BackupConfig`, `DatasetConfig`, `Duration`, …) and `__init__.py`
 **[zfsbackup/config/store/](zfsbackup/config/store/)** — the SQLAlchemy config store, and the daemon's
 **only** config source (plan item 8; see [docs/config_db_cli_plan.md](docs/config_db_cli_plan.md)).
 `models.py` holds the ORM schema, `mapper.py` converts ORM rows ⇄ the `config/model.py` dataclasses,
-`db.py` owns engine/session management (fork-safe engine cache, WAL pragmas, read-only worker
-sessions), `paths.py` resolves and preflights the DB path (`-c` > `$ZFSBACKUP_CONFIG` >
-`/var/lib/zfsbackup/config.db`; the daemon never creates it), `importer.py` does the YAML → DB full
-replace, and `migrate.py` plus `migrations/` own the Alembic baseline. It is a **separate layer** from
+`db.py` owns engine/session management (fork-safe engine cache, WAL pragmas, read-only sessions),
+`paths.py` resolves and preflights the DB path (`-c` > `$ZFSBACKUP_CONFIG` >
+`/var/lib/zfsbackup/config.db`; the daemon never creates it) and owns the CLI writer lock,
+`access.py` is the read/write API (`read_config` — one snapshot incl. the schema check — and
+`write_config` — writer lock, generation compare-and-swap), `messages.py` the shared error wording,
+`errors.py` `ConfigConflict`/`ConfigBusy`, `importer.py` the YAML → DB full replace, and `migrate.py`
+plus `migrations/` the Alembic baseline (pinned head; `upgrade_schema`). It is a **separate layer** from
 the dataclasses, not a replacement — `DatasetConfig` is also a remote wire format with no DB behind it,
 and config objects outlive any session. YAML survives only as an import format and (from Phase 2) the
 `$EDITOR` buffer; `BackupConfig.from_file` remains the single YAML parser.
 
-**[zfsbackup/runtime_config.py](zfsbackup/runtime_config.py)** — the daemon core's door into the
-store: `daemon.py` and `workers.py` call `load_runtime_config()` and never open a connection or touch
-an ORM class. Read-only, one connection at a time, and only a path string crosses the process
-boundary — never a loaded `BackupConfig` or an engine. The CLI currently reuses its read-only loader
-for `export` and `migrate --check`; that moves into the store's public API in item 15.1.
+**[zfsbackup/runtime_config.py](zfsbackup/runtime_config.py)** — a thin daemon wrapper over the
+store's `read_config` that adds the daemon's own error wording. **Only the supervisor reads the config
+DB, once, at startup**; it then disposes every engine and hands its detached `BackupConfig` to every
+worker, including respawns (decision Q4) — workers never open the DB, so all workers always run the
+same generation. A running daemon does not pick up config edits until it is restarted (live reload is
+Phase 3).
+
+**[zfsbackup/daemonlock.py](zfsbackup/daemonlock.py)** — the daemon presence lock: `flock` on
+`<db>.daemon.pid` (`pid` and config generation inside). A second daemon on the same DB refuses to
+start; the CLI `probe()`s it to report whether a running daemon is on an older generation. "Running"
+means the lock is held, never that a pid exists, so a file left after a crash is harmless.
+
+Files next to the config DB: `config.db` (+ `-wal`/`-shm` while open), `config.db.writer.lock` (CLI
+writer lock — empty, never deleted), `config.db.daemon.pid` (daemon presence lock), and
+`config.db.pre-import-<UTC>.yaml` backups written by `import`.
 
 **[zfsbackup/cli/](zfsbackup/cli/)** — the `zfsbackup-config` Click application (Phase 2, in progress):
 `import`, `export` and `migrate` today; `render.py` turns a `BackupConfig` back into YAML that
-`from_file` reproduces exactly, including duration literals. It is the only writer of the config DB.
+`from_file` reproduces exactly, including duration literals; `write.py` is the shared read → edit →
+`write_config(expected_generation)` helper for the editing commands, with the post-write daemon notice.
+It is the only writer of the config DB. Exit codes: 0 ok, 1 invalid/refused, 2 usage, 75 retry
+(conflict/busy), 78 config DB unusable, 130/143 interrupted/terminated.
 
 > **`zfsbackup/store/` is reserved and deliberately empty.** It is for *backup data* destinations —
 > object storage, cloud targets and the like. Configuration persistence lives under
@@ -143,9 +159,11 @@ for `export` and `migrate --check`; that moves into the store's public API in it
 | `tests/test_zfsbackup_basic.py` | Package smoke tests |
 | `tests/test_zfsbackup_manager.py` | `DatasetManager`, retention/pruning |
 | `tests/test_zfsbackup_snapshot_info.py` | `SnapshotInfo` / `DatasetInfo` time computation |
-| `tests/test_zfsbackup_daemon.py` | `BackupDaemon` supervisor, DB-backed config loading |
-| `tests/test_zfsbackup_workers.py` | Worker loop and interval behaviour |
-| `tests/test_zfsbackup_runtime_config.py` | Torn-read protection in `load_runtime_config` |
+| `tests/test_zfsbackup_daemon.py` | `BackupDaemon` supervisor: single config read, handoff to workers, presence lock |
+| `tests/test_zfsbackup_workers.py` | Worker loop and interval behaviour; config pickling across start methods |
+| `tests/test_zfsbackup_daemonlock.py` | Daemon presence lock: held/stale/contention, permissions, fork vs spawn |
+| `tests/test_zfsbackup_runtime_config.py` | The daemon wrapper over `read_config`; torn-read protection |
+| `tests/test_zfsbackup_store_access.py` | `read_config` snapshot, `write_config` compare-and-swap, `ConfigBusy`, the writer lock |
 | `tests/test_zfsbackup_signals.py` | Fork-pinned SIGINT/SIGTERM reset in worker children |
 | `tests/test_zfsbackup_stopflag.py` | `StopFlag` semantics |
 | `tests/test_zfsbackup_stop_signals.py` | Real daemon: kill a worker, then signal the supervisor — must exit, not wedge |
@@ -160,7 +178,7 @@ for `export` and `migrate --check`; that moves into the store's public API in it
 | `tests/test_zfsbackup_daemon_resilience.py` | Restart backoff, shutdown `finally`, abandoned workers, SIGHUP stopgap |
 | `tests/test_zfsbackup_fork_shm.py` | Fork child must not let the parent delete `-wal`/`-shm` (runs in a timed subprocess) |
 | `tests/test_zfsbackup_store_upgrade.py` | Pinned schema head, `upgrade_schema` (transactional, FK check, concurrency), import backup hook |
-| `tests/test_zfsbackup_cli.py` | `zfsbackup-config` commands, path resolution, exit codes, import backups |
+| `tests/test_zfsbackup_cli.py` | `zfsbackup-config` commands, path resolution, exit codes, import backups, conflict/busy, daemon notice |
 | `tests/test_zfsbackup_cli_render.py` | YAML renderer round trip (values and duration literals) |
 | `tests/test_marker_tiers.py` | `unit` and `integration` partition the mocked suite |
 | `tests/test_zfsbackup_real.py` | Daemon against a real pool, marked `real_zfs` |

@@ -12,19 +12,21 @@ Exit codes (docs/config_db_cli_plan.md, item 10.2):
 78    the config database is unusable (`EX_CONFIG`)
 ====  =============================================================
 
-`78` is the same code the daemon's workers use for a configuration database
-they cannot read (`zfsbackup.runtime_config.EX_CONFIG`), so one number means
-"the DB, not your input" across both tools.
+`78` is sysexits.h's `EX_CONFIG`, used here as this CLI's own "the config
+database is unusable (the DB, not your input)" code. The daemon does not share
+it, and the CLI imports nothing from the daemon.
+
+`ConfigConflict` and `ConfigBusy` (a compare-and-swap that lost, a writer lock
+that stayed held) are 75 and are checked FIRST: they are "retry", not "the
+database is unusable".
 
 Messages from `ConfigPathError` and `SchemaError` already are operator-grade
 (they name the file, the source of the path, and the next command to run) and
-are shown verbatim; `OperationalError` goes through the daemon's own
-`config_error_message`, so both tools word the same failure the same way. A
-plain `DatabaseError` (a file that is not SQLite, a valid header over a corrupt
-body) gets one line built from SQLite's own message: the SQL statement and the
-documentation link SQLAlchemy appends are no help to the operator.
-The one exception is `SchemaOutOfDate`, whose store text is neutral: the daemon
-appends a restart sentence of its own, which would be wrong advice here.
+are shown verbatim; `OperationalError` and a plain `DatabaseError` (a file that
+is not SQLite, a valid header over a corrupt body) go through the store's own
+`config_error_message`, so the daemon and this tool word the same failure the
+same way (the store's `SchemaOutOfDate` text is neutral; the daemon appends its
+own restart sentence, which would be wrong advice here).
 Notes attached with `add_note` -- the store uses them for "the cleanup was
 skipped" and "a backup was already written" -- are printed after the message:
 they are often the part that says what state the filesystem was left in.
@@ -39,15 +41,16 @@ import yaml
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError, SQLAlchemyError
 
 from zfsbackup.config.store import (
+    ConfigBusy,
+    ConfigConflict,
     ConfigDbCreatedConcurrently,
     ConfigPathError,
     MigrationPackagingError,
     OutgoingConfigUnreadable,
     ResolvedConfigPath,
     SchemaError,
-    SchemaOutOfDate,
+    config_error_message,
 )
-from zfsbackup.runtime_config import EX_CONFIG, config_error_message, describe_config_source
 
 __all__ = [
     "EXIT_OK",
@@ -67,7 +70,7 @@ EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
 EXIT_BUSY = 75
-EXIT_CONFIG = EX_CONFIG  # 78
+EXIT_CONFIG = 78  # sysexits.h EX_CONFIG: the config database is unusable
 
 _LOCKED_MARKERS = ("database is locked", "database table is locked", "busy")
 
@@ -103,6 +106,10 @@ def exit_code_for(exc: BaseException) -> int:
     """The exit code `exc` maps to."""
     if isinstance(exc, CliError):
         return exc.exit_code
+    # Before ConfigPathError/SchemaError below: these mean "look again and
+    # retry", never "the database is unusable".
+    if isinstance(exc, (ConfigConflict, ConfigBusy)):
+        return EXIT_BUSY
     # Someone else holds the file or is creating it: retry, do not give up.
     if isinstance(exc, ConfigDbCreatedConcurrently):
         return EXIT_BUSY
@@ -149,29 +156,27 @@ def _is_internal_sqlalchemy(exc: BaseException) -> bool:
     ) and not is_database_unusable(exc)
 
 
-def _damaged_database_message(resolved: Optional[ResolvedConfigPath], exc: BaseException) -> str:
-    reason = _first_line(getattr(exc, "orig", None) or exc) or type(exc).__name__
-    if resolved is None:
-        subject = "the config database"
-    else:
-        subject = f"the config database {describe_config_source(resolved)}"
-    return (
-        f"{subject} is damaged or not an SQLite database: {reason}; "
-        "restore it from a backup."
-    )
-
-
 def format_error(exc: BaseException, resolved: Optional[ResolvedConfigPath]) -> List[str]:
     """The lines to print for `exc`: its message, then its notes."""
-    if isinstance(exc, SchemaOutOfDate):
-        # The store's text is neutral and ends at the command to run;
-        # `config_error_message` would append the daemon's own sentence.
-        message = str(exc)
-    elif is_database_unusable(exc):
-        # One line from SQLite's own words; the SQL statement and the
-        # sqlalche.me link in `str(exc)` are noise here.
-        message = _damaged_database_message(resolved, exc)
-    elif isinstance(exc, (ConfigPathError, SchemaError, OperationalError)):
+    if isinstance(exc, ConfigConflict):
+        actual = "no configuration" if exc.actual is None else f"generation {exc.actual}"
+        return [
+            f"config changed underneath you (generation {exc.expected}, now {actual}); re-run",
+            "Nothing was written. Re-run the command to start from the current configuration.",
+            *getattr(exc, "__notes__", ()),
+        ]
+    if isinstance(exc, ConfigBusy):
+        # The store's text already says what is busy and to retry; use it as
+        # the one line, and only fall back to a generic one without it.
+        return [
+            str(exc) or "another write is in progress; retry",
+            *getattr(exc, "__notes__", ()),
+        ]
+    if is_database_unusable(exc) or isinstance(
+        exc, (ConfigPathError, SchemaError, OperationalError)
+    ):
+        # The store's one wording (see its `config_error_message`): verbatim
+        # for path/schema errors, one clean line for a damaged file.
         message = config_error_message(resolved, exc)
     elif isinstance(exc, yaml.YAMLError):
         message = f"invalid YAML: {exc}"
@@ -214,7 +219,7 @@ def report(
         exc,
         (
             CliError, ConfigPathError, SchemaError, SQLAlchemyError, ValueError,
-            TypeError, KeyError, OSError, yaml.YAMLError,
+            TypeError, KeyError, OSError, yaml.YAMLError, ConfigConflict, ConfigBusy,
         ),
     ))
     lines = format_error(exc, resolved)

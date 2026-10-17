@@ -87,9 +87,10 @@ the same file and `db.py` takes SQLite's write lock at the start of every
 writer transaction. Nesting the two self-deadlocks even in a single thread
 (measured: `database is locked` after 5.2s, on a fresh database,
 deterministically). That wrapper now exists as `importer.py`'s
-`import_yaml`, and the daemon and its workers read this package through
-`zfsbackup/runtime_config.py` (`check_schema` + `load_config`, read-only);
-the Phase 2 `zfsbackup-config` CLI is the one remaining consumer to land.
+`import_yaml`. The daemon's supervisor reads this package exactly once, at
+startup, through `zfsbackup/runtime_config.py` -- a thin wrapper over
+`access.read_config` (read-only). Worker processes never open the database:
+they are handed the already-loaded config.
 
 `mapper.py` is a new, deliberately one-directional coupling: it imports
 `zfsbackup.config`, so `store` now depends on `config`, but `config/model.py`
@@ -127,11 +128,11 @@ database's first connection. Its only sanctioned ways to reach a live
 storable `Engine`: `db.py`'s pid-keyed fork-safety cache depends on
 nothing capturing a long-lived handle outside a `with` block, and an
 `Engine` returned by value from this module would be exactly such a
-handle. `daemon.py` and `workers.py` (item 8, Phase B, owned by
-`zfsbackup-developer`) now open the store through these two functions
-exclusively, via `zfsbackup/runtime_config.py`'s `load_runtime_config()`
--- neither module builds an engine, opens a connection, or touches an
-ORM class directly; `BackupConfig.from_file` is gone from both.
+handle. Only the daemon supervisor reads the store (once, at startup, via
+`zfsbackup/runtime_config.py`'s `load_runtime_config()` -> `access.read_config`,
+which uses these two functions); `workers.py` never opens it. Neither module
+builds an engine, opens a connection, or touches an ORM class directly;
+`BackupConfig.from_file` is gone from both.
 
 `zfsbackup/config/store/importer.py` (item 8, phase A / 8b) is this
 package's one caller of `paths.py`'s `allow_new` escape hatch, and the
@@ -148,6 +149,23 @@ calls `import_yaml` directly; the module has no command line of its own.
 in-place, atomic, foreign-key-verified migration `zfsbackup-config migrate`
 calls; the daemon only ever uses `check_schema`, which decides from
 `EXPECTED_HEAD`/`KNOWN_REVISIONS` and reads no migration scripts.
+
+`access.py` (item 15.1) is the whole-configuration entry point for every tool:
+`read_config(resolved) -> ConfigSnapshot(config, generation, schema_rev)` reads
+the schema check, the rows and the generation in ONE read snapshot (the daemon
+and the CLI's `export` / `migrate --check` / the read half of every edit), and
+`write_config(resolved, config, *, expected_generation) -> WriteResult` is the
+single compare-and-swap write: preflight, `validate_config`, the writer lock, a
+`BEGIN IMMEDIATE` session, the schema check again, the generation compare, then
+`save_config`. A stale generation is `ConfigConflict`; a lock that stays held
+(the `<db>.writer.lock` flock, or SQLite's `busy_timeout`) is `ConfigBusy`.
+Both live in `errors.py`, deliberately outside `SchemaError`/`ConfigPathError`
+(retry, not "unusable database"). `messages.py` holds the operator wording
+shared by the daemon and the CLI (`config_error_message`,
+`describe_config_source`). `paths.writer_lock` (item 15.4) serialises every
+zfsbackup-config writer, `import_yaml` included; it adds one more file next to
+the database (`<db>.writer.lock`, besides WAL's `-wal`/`-shm`) that is never
+deleted and should not be archived as state.
 """
 
 from zfsbackup.config.store.models import (
@@ -169,7 +187,14 @@ from zfsbackup.config.store.db import (
     session_scope,
     url_for_path,
 )
-from zfsbackup.config.store.mapper import load_config, save_config, validate_config
+from zfsbackup.config.store.errors import ConfigBusy, ConfigConflict
+from zfsbackup.config.store.mapper import (
+    ConfigSnapshot,
+    load_config,
+    load_config_snapshot,
+    save_config,
+    validate_config,
+)
 from zfsbackup.config.store.migrate import (
     EXPECTED_HEAD,
     KNOWN_REVISIONS,
@@ -191,6 +216,8 @@ from zfsbackup.config.store.paths import (
     CONFIG_OWNER,
     CONFIG_PATH_ENV,
     DEFAULT_CONFIG_DB,
+    DEFAULT_WRITER_LOCK_TIMEOUT,
+    WRITER_LOCK_SUFFIX,
     ConfigDbCreatedConcurrently,
     ConfigDbIsYaml,
     ConfigDbNotADatabase,
@@ -212,7 +239,10 @@ from zfsbackup.config.store.paths import (
     open_config_session,
     resolve_config_path,
     resolve_config_url,
+    writer_lock,
+    writer_lock_path,
 )
+from zfsbackup.config.store.messages import config_error_message, describe_config_source
 # Imported last: depends on mapper, migrate, AND paths all being importable
 # (it uses save_config, ensure_schema/SchemaError, and the paths helpers
 # together to drive the three-phase import in importer.py's own docstring).
@@ -221,6 +251,12 @@ from zfsbackup.config.store.importer import (
     OutgoingConfigUnreadable,
     import_yaml,
 )
+from zfsbackup.config.store.access import (
+    WriteResult,
+    check_config_schema,
+    read_config,
+    write_config,
+)
 
 __all__ = [
     "Base",
@@ -228,6 +264,8 @@ __all__ = [
     "CONFIG_DIR_MODE",
     "CONFIG_OWNER",
     "CONFIG_PATH_ENV",
+    "ConfigBusy",
+    "ConfigConflict",
     "ConfigDbCreatedConcurrently",
     "ConfigDbIsYaml",
     "ConfigDbNotADatabase",
@@ -238,9 +276,11 @@ __all__ = [
     "ConfigDbPermissionError",
     "ConfigPathEnvError",
     "ConfigPathError",
+    "ConfigSnapshot",
     "Dataset",
     "DatasetRemote",
     "DEFAULT_CONFIG_DB",
+    "DEFAULT_WRITER_LOCK_TIMEOUT",
     "Destination",
     "EXPECTED_HEAD",
     "GlobalSettings",
@@ -260,10 +300,15 @@ __all__ = [
     "SchemaSplitBrain",
     "SchemaUpgrade",
     "SchemaVersionMismatch",
+    "WRITER_LOCK_SUFFIX",
+    "WriteResult",
     "check_config_db",
     "check_config_db_suffix",
+    "check_config_schema",
     "check_schema",
+    "config_error_message",
     "create_config_db_file",
+    "describe_config_source",
     "diagnose_open_failure",
     "dispose_all",
     "ensure_config_db_mode",
@@ -272,9 +317,11 @@ __all__ = [
     "get_engine",
     "import_yaml",
     "load_config",
+    "load_config_snapshot",
     "make_engine",
     "open_config_connection",
     "open_config_session",
+    "read_config",
     "resolve_config_path",
     "resolve_config_url",
     "save_config",
@@ -283,4 +330,7 @@ __all__ = [
     "upgrade_schema",
     "url_for_path",
     "validate_config",
+    "write_config",
+    "writer_lock",
+    "writer_lock_path",
 ]

@@ -204,7 +204,9 @@ def run_driver(tmp_path, scenario):
 
 @pytest.mark.skipif(not FORK_AVAILABLE, reason="needs os.fork")
 class TestChildDoesNotLetParentDeleteSidecars:
-    EXPECTED = ["config.db", "config.db-shm", "config.db-wal"]
+    # The setup import (item 15.4) leaves its empty, never-deleted writer lock
+    # beside the database; the point here is that the three SQLite files stay.
+    EXPECTED = ["config.db", "config.db-shm", "config.db-wal", "config.db.writer.lock"]
 
     def test_inherited_engine_rebuild_keeps_the_sidecars_for_a_connected_child(
         self, tmp_path

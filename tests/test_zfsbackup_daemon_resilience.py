@@ -45,6 +45,7 @@ from sqlalchemy.exc import OperationalError
 import zfsbackup.daemon as daemon_module
 from zfsbackup.config.store import (
     ConfigDbPermissionError,
+    ConfigSnapshot,
     ConfigPathError,
     NotAConfigDatabase,
     SchemaIntegrityError,
@@ -62,7 +63,6 @@ from zfsbackup.daemon import (
     main,
 )
 from zfsbackup.runtime_config import (
-    EX_CONFIG,
     config_error_message,
     describe_config_source,
 )
@@ -150,11 +150,9 @@ class TestRestartBackoff:
             assert len(spawned) == failure  # exactly at the deadline
             assert "snapshot" not in daemon._restart_at
 
-        assert daemon._config_failed == set()
         with caplog.at_level(logging.ERROR):
             daemon._check_workers()  # the 6th consecutive death
         assert daemon._failures["snapshot"] == WORKER_MAX_CONSECUTIVE_FAILURES == 6
-        assert daemon._config_failed == {"snapshot"}
         assert daemon._crash_looped == {"snapshot"}
         assert "snapshot" not in daemon._workers
         assert len(spawned) == 5  # nothing further was forked
@@ -226,7 +224,6 @@ class TestRestartBackoff:
 
         assert daemon._failures["snapshot"] == 1  # reset, then counted
         assert daemon._restart_at["snapshot"] == clock[0] + WORKER_RESTART_DELAY
-        assert daemon._config_failed == set()
 
     def test_uptime_just_under_600s_does_not_reset(self, daemon, mocker):
         clock = fake_clock(daemon, mocker)
@@ -252,7 +249,6 @@ class TestRestartBackoff:
             clock[0] += WORKER_RESTART_MAX_DELAY
             daemon._check_workers()  # respawn
             clock[0] += WORKER_STABLE_UPTIME  # it then lives a long time
-        assert daemon._config_failed == set()
         assert len(spawned) == 12
 
     def test_a_worker_waiting_out_backoff_is_not_counted_again(self, daemon, mocker):
@@ -331,14 +327,25 @@ class TestRestartBackoff:
         assert "snapshot" not in daemon._workers
         assert "snapshot" not in daemon._started_at
 
-    def test_ex_config_is_fatal_immediately_not_backed_off(self, daemon, mocker):
-        mocker.patch.object(daemon, "_new_worker")
-        daemon._workers = {"snapshot": dead_worker(exitcode=EX_CONFIG)}
+    def test_exit_code_78_is_an_ordinary_crash_not_a_fatal_config_fault(self, daemon, mocker):
+        """Item 15.2(b): a worker never opens the config database, so the
+        `EX_CONFIG` (78) exit it used to report for a bad one no longer has
+        a producer and no meaning. An exit code of 78 is backed off and
+        restarted like any other; the supervisor has no "config failed" set
+        left. Mutation-checked (scratch copy): treating exit code 78 as
+        fatal again in `_check_workers` fails this test (1)."""
+        clock = fake_clock(daemon, mocker)
+        mocker.patch.object(daemon, "_new_worker", return_value=MagicMock(pid=2))
+        daemon._workers = {"snapshot": dead_worker(exitcode=78)}
         daemon._check_workers()
-        assert daemon._config_failed == {"snapshot"}
+        assert not hasattr(daemon, "_config_failed")
         assert daemon._crash_looped == set()
-        assert daemon._restart_at == {}
-        daemon._new_worker.assert_not_called()
+        assert daemon._restart_at == {"snapshot": clock[0] + WORKER_RESTART_DELAY}
+        assert not daemon._stop_event.is_set()
+        daemon._new_worker.assert_not_called()  # backing off, as for any crash
+        clock[0] += WORKER_RESTART_DELAY
+        daemon._check_workers()
+        daemon._new_worker.assert_called_once_with("snapshot")
 
 
 class TestBackoffNeverDelaysShutdown:
@@ -414,21 +421,21 @@ class TestBackoffNeverDelaysShutdown:
 
 
 class TestIntervalFloor:
-    def _run(self, sqlite_config_db, mocker, interval, cycles=3):
+    def _run(self, worker_config, mocker, interval, cycles=3):
         mocker.patch("zfsbackup.backup_manager.zfs.exists", return_value=True)
         mocker.patch("zfsbackup.backup_manager.zfs.list", return_value=[])
         stop = MagicMock()
         stop.is_set.side_effect = [False] * cycles + [True] * 100
-        worker = SnapshotWorker(sqlite_config_db, stop, dry_run=True)
+        worker = SnapshotWorker(worker_config, stop)
         mocker.patch.object(worker, "_get_interval", return_value=interval)
         mocker.patch.object(worker, "_process_dataset")
         return worker, stop
 
     @pytest.mark.parametrize("interval", [0.0, -5.0, 0.25, 0.999])
     def test_sub_second_interval_is_floored_with_one_warning(
-        self, sqlite_config_db, mocker, caplog, interval
+        self, worker_config, mocker, caplog, interval
     ):
-        worker, stop = self._run(sqlite_config_db, mocker, interval)
+        worker, stop = self._run(worker_config, mocker, interval)
         with caplog.at_level(logging.WARNING):
             worker.run()
 
@@ -440,9 +447,9 @@ class TestIntervalFloor:
 
     @pytest.mark.parametrize("interval", [1.0, 5.0, 300.0])
     def test_interval_at_or_above_the_floor_is_untouched_and_silent(
-        self, sqlite_config_db, mocker, caplog, interval
+        self, worker_config, mocker, caplog, interval
     ):
-        worker, stop = self._run(sqlite_config_db, mocker, interval)
+        worker, stop = self._run(worker_config, mocker, interval)
         with caplog.at_level(logging.WARNING):
             worker.run()
         waits = [c.kwargs["timeout"] for c in stop.wait.call_args_list]
@@ -469,7 +476,7 @@ class TestConfigErrorMessage:
     @pytest.fixture
     def no_diagnosis(self, mocker):
         return mocker.patch(
-            "zfsbackup.runtime_config.diagnose_open_failure", return_value=None
+            "zfsbackup.config.store.messages.diagnose_open_failure", return_value=None
         )
 
     def test_unable_to_open_says_could_not_open(self, resolved, no_diagnosis):
@@ -493,7 +500,7 @@ class TestConfigErrorMessage:
     def test_a_diagnosed_open_failure_replaces_the_sqlite_text(self, resolved, mocker):
         diagnosed = ConfigDbPermissionError("directory X is not writable; chmod it")
         spy = mocker.patch(
-            "zfsbackup.runtime_config.diagnose_open_failure", return_value=diagnosed
+            "zfsbackup.config.store.messages.diagnose_open_failure", return_value=diagnosed
         )
         exc = operational("unable to open database file")
 
@@ -576,42 +583,49 @@ class TestDescribeConfigSource:
 
 
 class TestMainFailureReporting:
+    """Each test is backed by a real (schema-current) database file: since
+    item 15.5 `_run` stats the database and takes the presence lock BEFORE
+    `load_runtime_config`, so a path with no database behind it is refused
+    by the preflight and never reaches the mocked load. `lock_spy` closes a
+    lock that a refusal path did not release.
+    """
+
     def _failure_records(self, caplog):
         return [
             r for r in caplog.records
             if r.name == "zfsbackup.daemon" and r.levelno == logging.ERROR
         ]
 
-    def test_unexpected_exceptions_are_logged_with_a_traceback(self, tmp_path, mocker, caplog):
+    def test_unexpected_exceptions_are_logged_with_a_traceback(self, sqlite_config_db, lock_spy, mocker, caplog):
         mocker.patch(
             "zfsbackup.daemon.load_runtime_config", side_effect=KeyError("surprise")
         )
-        with patch("sys.argv", ["daemon", "-c", str(tmp_path / "c.db")]):
+        with patch("sys.argv", ["daemon", "-c", str(sqlite_config_db.path)]):
             with caplog.at_level(logging.ERROR):
                 assert main() == 1
         (record,) = self._failure_records(caplog)
         assert record.exc_info is not None
         assert "surprise" in "".join(str(x) for x in record.exc_info[1].args)
 
-    def test_operational_errors_carry_no_traceback(self, tmp_path, mocker, caplog):
+    def test_operational_errors_carry_no_traceback(self, sqlite_config_db, lock_spy, mocker, caplog):
         mocker.patch(
             "zfsbackup.daemon.load_runtime_config",
             side_effect=operational("database is locked"),
         )
-        mocker.patch("zfsbackup.runtime_config.diagnose_open_failure", return_value=None)
-        with patch("sys.argv", ["daemon", "-c", str(tmp_path / "c.db")]):
+        mocker.patch("zfsbackup.config.store.messages.diagnose_open_failure", return_value=None)
+        with patch("sys.argv", ["daemon", "-c", str(sqlite_config_db.path)]):
             with caplog.at_level(logging.ERROR):
                 assert main() == 1
         (record,) = self._failure_records(caplog)
         assert not record.exc_info
         assert "Failed to read the config database" in record.getMessage()
 
-    def test_config_path_and_schema_errors_carry_no_traceback(self, tmp_path, mocker, caplog):
+    def test_config_path_and_schema_errors_carry_no_traceback(self, sqlite_config_db, lock_spy, mocker, caplog):
         mocker.patch(
             "zfsbackup.daemon.load_runtime_config",
             side_effect=SchemaOutOfDate("stale schema"),
         )
-        with patch("sys.argv", ["daemon", "-c", str(tmp_path / "c.db")]):
+        with patch("sys.argv", ["daemon", "-c", str(sqlite_config_db.path)]):
             with caplog.at_level(logging.ERROR):
                 assert main() == 1
         (record,) = self._failure_records(caplog)
@@ -622,13 +636,13 @@ class TestMainFailureReporting:
         )
 
     def test_other_schema_errors_are_logged_verbatim_without_traceback(
-        self, tmp_path, mocker, caplog
+        self, sqlite_config_db, lock_spy, mocker, caplog
     ):
         mocker.patch(
             "zfsbackup.daemon.load_runtime_config",
             side_effect=NotAConfigDatabase("not a zfsbackup config database"),
         )
-        with patch("sys.argv", ["daemon", "-c", str(tmp_path / "c.db")]):
+        with patch("sys.argv", ["daemon", "-c", str(sqlite_config_db.path)]):
             with caplog.at_level(logging.ERROR):
                 assert main() == 1
         (record,) = self._failure_records(caplog)
@@ -726,18 +740,24 @@ class TestRunFinally:
             daemon.run()
         assert seen == [True]
 
-    def test_main_reports_a_crashed_run_as_exit_one(self, tmp_path, mocker, caplog):
+    def test_main_reports_a_crashed_run_as_exit_one(
+        self, sqlite_config_db, lock_spy, mocker, caplog
+    ):
         mocker.patch(
-            "zfsbackup.daemon.load_runtime_config", return_value=MagicMock(dry_run=False)
+            "zfsbackup.daemon.load_runtime_config",
+            return_value=ConfigSnapshot(MagicMock(dry_run=False), 3, "rev"),
         )
         crashing = MagicMock()
         crashing.run.side_effect = RuntimeError("poll loop died")
         crashing.abandoned_workers = []
         mocker.patch("zfsbackup.daemon.BackupDaemon", return_value=crashing)
-        with patch("sys.argv", ["daemon", "-c", str(tmp_path / "c.db")]):
+        with patch("sys.argv", ["daemon", "-c", str(sqlite_config_db.path)]):
             with caplog.at_level(logging.ERROR):
                 assert main() == 1
         assert "Daemon failed: poll loop died" in caplog.text
+        # A crash is not a clean stop: the pid file is left (the kernel drops
+        # the lock when the process exits, and a stale file is harmless).
+        assert lock_spy and lock_spy[0].path.exists()
 
 
 class TestStartWorkersHonoursTheStopFlag:
@@ -814,14 +834,21 @@ class TestAbandonedWorkers:
             assert main() == 0
         hard.assert_not_called()
 
-    def test_run_collects_abandoned_workers_even_when_run_crashes(self, tmp_path, mocker):
+    def test_run_collects_abandoned_workers_even_when_run_crashes(
+        self, sqlite_config_db, lock_spy, mocker
+    ):
         crashing = MagicMock()
         crashing.run.side_effect = RuntimeError("x")
         crashing.abandoned_workers = ["api"]
-        mocker.patch("zfsbackup.daemon.load_runtime_config", return_value=MagicMock(dry_run=False))
+        mocker.patch(
+            "zfsbackup.daemon.load_runtime_config",
+            return_value=ConfigSnapshot(MagicMock(dry_run=False), 3, "rev"),
+        )
         mocker.patch("zfsbackup.daemon.BackupDaemon", return_value=crashing)
         collected = []
-        args = MagicMock(config=str(tmp_path / "c.db"), dry_run=False, test_config=False, verbose=False)
+        args = MagicMock(
+            config=str(sqlite_config_db.path), dry_run=False, test_config=False, verbose=False
+        )
         assert daemon_module._run(args, collected) == 1
         assert collected == ["api"]
 

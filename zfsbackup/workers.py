@@ -1,13 +1,18 @@
 """Worker processes for snapshot creation, pruning, API serving, and remote backup.
 
-Every worker loads its own `BackupConfig` **inside the child process**, from
-the config database `resolved_config` addresses, through
-`zfsbackup.runtime_config.load_runtime_config` -- read-only, schema-verified,
-and with both handles closed before the loop starts. The supervisor
-deliberately passes the *path*, never the loaded `BackupConfig` and never a
-`Session` or `Engine`: a handle checked out before a fork is invisible to
-`store/db.py`'s pid-keyed engine cache, and an inherited SQLite file
-descriptor corrupts the database silently rather than raising.
+Workers never open the config database. The supervisor reads it once, before
+the first fork (`zfsbackup.runtime_config.load_runtime_config`), applies
+`--dry-run` to the result in memory, and hands every worker -- at startup and
+at every crash restart -- that same detached `BackupConfig`. Under `fork` the
+child inherits the object; under `spawn`/`forkserver` it is pickled
+(`Duration.__reduce__` preserves the operator's literals), so a respawned
+worker sees exactly the configuration its siblings run: one generation for the
+whole daemon. A restart does not re-read the database; live reload is Phase 3.
+
+Nothing that owns a SQLite handle may cross the process boundary -- never a
+`Session`, an `Engine`, or an ORM instance -- and the supervisor calls
+`dispose_all()` before each fork so that no inherited descriptor exists
+either. A `BackupConfig` is plain dataclasses, safe on both counts.
 """
 
 import logging
@@ -17,12 +22,10 @@ import threading
 from abc import abstractmethod
 from multiprocessing import Process
 from multiprocessing.synchronize import Event
-from typing import List, Optional, Union
+from typing import List, Union
 
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
 from zfsbackup.config import BackupConfig
-from zfsbackup.config.store import ConfigPathError, ResolvedConfigPath, SchemaError
-from zfsbackup.runtime_config import EX_CONFIG, config_error_message, load_runtime_config
 from zfsbackup.stopflag import StopFlag
 
 #: What a worker accepts as its stop signal.
@@ -131,64 +134,22 @@ def _init_child_process(verbose: bool = False) -> None:
     _setup_logging(verbose)
 
 
-def _load_config(
-    resolved_config: ResolvedConfigPath,
-    dry_run: bool,
-    logger: logging.Logger,
-) -> Optional[BackupConfig]:
-    """Load this child's config, or classify the failure.
-
-    Three outcomes, and the distinction between the last two is the whole
-    point of this function:
-
-    - success: a detached `BackupConfig`, with `dry_run` applied in memory
-      only (it is never written back to the database).
-    - a **permanent** config fault (`ConfigPathError`/`SchemaError` -- a
-      stale schema, a missing or malformed database, a bad path): raise
-      `SystemExit(EX_CONFIG)`, so the child's exit code tells the
-      supervisor that respawning it cannot help. Without that signal a
-      stale schema makes every worker exit immediately and the supervisor
-      re-fork each one every `WORKER_RESTART_DELAY` seconds forever, each
-      re-fork reopening SQLite -- which looks like a hang rather than a
-      config error.
-    - anything else -- notably an `OperationalError` such as `database is
-      locked` after `busy_timeout` expired under a concurrent
-      `zfsbackup-config` write -- returns `None`. The caller returns from
-      `run()` and the supervisor restarts the worker as it always has,
-      because that failure genuinely is transient.
-
-    Both failure arms log through `config_error_message`, so a child's
-    diagnosis of a broken database is word-for-word the supervisor's.
-    """
-    try:
-        config = load_runtime_config(resolved_config)
-    except (ConfigPathError, SchemaError) as e:
-        logger.error(config_error_message(resolved_config, e))
-        raise SystemExit(EX_CONFIG)
-    except Exception as e:
-        logger.error(config_error_message(resolved_config, e))
-        return None
-
-    if dry_run:
-        config.dry_run = True
-    return config
-
-
 class BaseWorker(Process):
     """Base class for daemon worker processes with a shared polling loop."""
 
     def __init__(
         self,
         worker_name: str,
-        resolved_config: ResolvedConfigPath,
+        config: BackupConfig,
         stop_event: StopEvent,
-        dry_run: bool = False,
         verbose: bool = False,
     ):
+        """`config` is the supervisor's detached `BackupConfig`, with
+        `--dry-run` already applied. It is used as is; the worker never
+        reads the config database."""
         super().__init__(name=worker_name, daemon=True)
-        self.resolved_config = resolved_config
+        self.config = config
         self.stop_event = stop_event
-        self.dry_run = dry_run
         self.verbose = verbose
 
     @abstractmethod
@@ -211,10 +172,7 @@ class BaseWorker(Process):
         logger = logging.getLogger(__name__)
         logger.info(f"{self.name} started")
 
-        config = _load_config(self.resolved_config, self.dry_run, logger)
-        if config is None:
-            return
-
+        config = self.config
         manager = DatasetManager(config)
         interval = self._get_interval(config)
         if interval < MIN_WORKER_INTERVAL:
@@ -244,12 +202,11 @@ class SnapshotWorker(BaseWorker):
 
     def __init__(
         self,
-        resolved_config: ResolvedConfigPath,
+        config: BackupConfig,
         stop_event: StopEvent,
-        dry_run: bool = False,
         verbose: bool = False,
     ):
-        super().__init__('snapshot-worker', resolved_config, stop_event, dry_run, verbose)
+        super().__init__('snapshot-worker', config, stop_event, verbose)
 
     def _get_interval(self, config: BackupConfig) -> float:
         return config.check_interval.total_seconds()
@@ -266,12 +223,11 @@ class PruningWorker(BaseWorker):
 
     def __init__(
         self,
-        resolved_config: ResolvedConfigPath,
+        config: BackupConfig,
         stop_event: StopEvent,
-        dry_run: bool = False,
         verbose: bool = False,
     ):
-        super().__init__('pruning-worker', resolved_config, stop_event, dry_run, verbose)
+        super().__init__('pruning-worker', config, stop_event, verbose)
 
     def _get_interval(self, config: BackupConfig) -> float:
         return config.effective_prune_interval.total_seconds()
@@ -288,12 +244,11 @@ class RemoteBackupWorker(BaseWorker):
 
     def __init__(
         self,
-        resolved_config: ResolvedConfigPath,
+        config: BackupConfig,
         stop_event: StopEvent,
-        dry_run: bool = False,
         verbose: bool = False,
     ):
-        super().__init__('remote-backup-worker', resolved_config, stop_event, dry_run, verbose)
+        super().__init__('remote-backup-worker', config, stop_event, verbose)
         self._remote_manager = None
 
     def _get_interval(self, config: BackupConfig) -> float:
@@ -331,15 +286,15 @@ class ApiWorker(Process):
 
     def __init__(
         self,
-        resolved_config: ResolvedConfigPath,
+        config: BackupConfig,
         stop_event: StopEvent,
-        dry_run: bool = False,
         verbose: bool = False,
     ):
+        """`config` is the supervisor's detached `BackupConfig`, dry-run
+        already applied; see `BaseWorker`."""
         super().__init__(name='api-worker', daemon=True)
-        self.resolved_config = resolved_config
+        self.config = config
         self.stop_event = stop_event
-        self.dry_run = dry_run
         self.verbose = verbose
 
     def run(self) -> None:
@@ -347,12 +302,9 @@ class ApiWorker(Process):
         logger = logging.getLogger(__name__)
         logger.info("API worker started")
 
-        # Loaded before the Flask thread starts, and fully closed by the
-        # time it does: `create_app` gets a detached `BackupConfig`, so the
-        # server thread never touches a Session or an Engine.
-        config = _load_config(self.resolved_config, self.dry_run, logger)
-        if config is None:
-            return
+        # The supervisor's detached `BackupConfig`: the server thread never
+        # touches a Session or an Engine, because this process has none.
+        config = self.config
 
         from zfsbackup.api import create_app
         app = create_app(config)

@@ -58,6 +58,17 @@ The outgoing configuration is saved next to the database as `config.db.pre-impor
 (`--no-backup` skips it). `zfsbackup-config export` prints the stored configuration as YAML, and
 `zfsbackup-config migrate` upgrades the database schema after a package upgrade.
 
+**A running daemon does not pick up configuration changes.** It reads the database once at startup;
+restart it after an import. After every change `zfsbackup-config` tells you whether a daemon is
+running and which configuration generation it is on.
+
+Besides the database (and its `-wal`/`-shm` files while it is open) you will see
+`config.db.writer.lock`, which serialises `zfsbackup-config` writers, and `config.db.daemon.pid`,
+which marks a running daemon. Both are empty or tiny, both are safe to leave in place, and neither is
+configuration state — a `daemon.pid` left behind by a crash is harmless. If `zfsbackup-config` exits
+with status **75**, another write was in progress or the configuration changed underneath it: just
+run the command again.
+
 ## Usage
 
 ### Start the Daemon

@@ -319,6 +319,64 @@ def imported_config_db(tmp_path, config_yaml_path):
     return resolved
 
 
+#: A config whose Duration literals are deliberately NOT canonical (`60m`, not
+#: `1h`; `600s`; `90m`; a per-destination `120m` and `52w`), so that a
+#: handoff which re-synthesised literals from the numeric value would be
+#: visible. See `tests/_config_handoff.py::config_signature`.
+LITERAL_CONFIG_YAML = (
+    "snapshot_prefix: zb\n"
+    "check_interval: 600s\n"
+    "prune_interval: 90m\n"
+    "datasets:\n"
+    "  - name: pool/data\n"
+    "    frequency: 60m\n"
+    "    retention:\n"
+    "      1d: 4w\n"
+    "      1w: 1M\n"
+    "    remote:\n"
+    "      - destination: offsite\n"
+    "        frequency: 120m\n"
+    "        retention:\n"
+    "          1d: 52w\n"
+    "  - name: pool/other\n"
+    "    frequency: 1d\n"
+    "destinations:\n"
+    "  offsite:\n"
+    "    url: http://backup.example.com:8080\n"
+)
+
+
+@pytest.fixture
+def literal_config_db(tmp_path):
+    """A schema-current config database imported from `LITERAL_CONFIG_YAML`,
+    returned as a `ResolvedConfigPath`. Its dataset `pool/data` has a remote,
+    so a daemon built from it runs all four workers."""
+    from zfsbackup.config.store import import_yaml, resolve_config_path
+
+    src = tmp_path / "literal.yaml"
+    src.write_text(LITERAL_CONFIG_YAML)
+    resolved = resolve_config_path(str(tmp_path / "literal.db"))
+    import_yaml(src, resolved)
+    return resolved
+
+
+@pytest.fixture
+def worker_config(sqlite_config_db):
+    """The detached `BackupConfig` a worker is handed now (item 15.2(b)):
+    read once from the imported database exactly as the supervisor does
+    (`load_runtime_config`), with `--dry-run` applied in memory, and with the
+    reader engine disposed so nothing in the test process still holds the
+    database open. Workers are constructed with this -- never with a path.
+    """
+    from zfsbackup.config.store import dispose_all
+    from zfsbackup.runtime_config import load_runtime_config
+
+    config = load_runtime_config(sqlite_config_db).config
+    dispose_all()
+    config.dry_run = True
+    return config
+
+
 @pytest.fixture
 def sqlite_config_db(imported_config_db):
     """Alias for `imported_config_db`, for daemon/worker test sites that
@@ -534,3 +592,233 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if not any(item.get_closest_marker(name) for name in _TIER_MARKERS):
             item.add_marker(pytest.mark.unit)
+
+
+# ---------------------------------------------------------------------------
+# Daemon presence lock (item 15.2(c)): a real second process holding it.
+# ---------------------------------------------------------------------------
+
+_LOCK_HOLDER_SCRIPT = r"""
+import os, sys, time
+from zfsbackup import daemonlock
+
+path, gen, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+lock = daemonlock.acquire(path, generation=int(gen) if gen else None)
+orphan = 0
+if mode == "fork":
+    orphan = os.fork()
+    if orphan == 0:
+        # Inherits the descriptor (and so, under fork, the lock itself).
+        # Bounded: never outlives a forgotten teardown by more than a minute.
+        time.sleep(60)
+        os._exit(0)
+print("ready", os.getpid(), orphan, flush=True)
+time.sleep(60)
+"""
+
+
+class DaemonLockHolder:
+    """A real subprocess that has taken `daemonlock.acquire(path)`."""
+
+    def __init__(self, proc, pid, orphan_pid):
+        self.proc = proc
+        self.pid = pid
+        self.orphan_pid = orphan_pid or None
+
+    def kill9(self):
+        """`kill -9` the holder and reap it. An orphan (fork mode) lives on."""
+        import signal as _signal
+
+        self.proc.send_signal(_signal.SIGKILL)
+        self.proc.wait(timeout=10)
+
+    def kill_orphan(self, timeout=10):
+        import signal as _signal
+        import time as _time
+
+        if not self.orphan_pid:
+            return
+        import os as _os
+
+        try:
+            _os.kill(self.orphan_pid, _signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        # A killed orphan is reaped by init; a zombie has already closed its
+        # descriptors, so the lock is gone whether or not the pid lingers.
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            try:
+                _os.kill(self.orphan_pid, 0)
+            except ProcessLookupError:
+                return
+            _time.sleep(0.05)
+
+    def stop(self):
+        import signal as _signal
+
+        if self.proc.poll() is None:
+            self.proc.send_signal(_signal.SIGKILL)
+            try:
+                self.proc.wait(timeout=10)
+            except Exception:
+                pass
+        try:
+            self.proc.stdout.close()
+        except Exception:
+            pass
+        self.kill_orphan()
+
+
+@pytest.fixture
+def daemon_lock_holder():
+    """Factory: `holder = daemon_lock_holder(db_path, generation=None, fork=False)`.
+
+    Starts `python -c <acquire>` against `db_path`, waits (hard 30s timeout)
+    for it to report that it holds the lock, and returns a `DaemonLockHolder`.
+    Every holder (and, in fork mode, its orphan child) is SIGKILLed at
+    teardown whatever the test did.
+    """
+    import os
+    import select
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    holders = []
+
+    def start(db_path, generation=None, fork=False):
+        env = dict(os.environ)
+        env.setdefault("ZFS_CMD", shutil.which("true") or "/usr/bin/true")
+        env.setdefault("ZPOOL_CMD", env["ZFS_CMD"])
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-c", _LOCK_HOLDER_SCRIPT,
+                str(db_path), "" if generation is None else str(generation),
+                "fork" if fork else "plain",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            cwd=str(repo_root), env=env,
+        )
+        holder = DaemonLockHolder(proc, proc.pid, 0)
+        holders.append(holder)
+        ready, _, _ = select.select([proc.stdout], [], [], 30)
+        if not ready:
+            raise RuntimeError("lock holder subprocess never reported ready")
+        line = proc.stdout.readline().split()
+        if not line or line[0] != "ready":
+            raise RuntimeError(f"lock holder failed to start: {line!r}")
+        holder.pid = int(line[1])
+        holder.orphan_pid = int(line[2]) or None
+        return holder
+
+    yield start
+    for h in holders:
+        h.stop()
+
+
+@pytest.fixture
+def lock_spy(mocker):
+    """Wraps `daemonlock.acquire` so tests can inspect the `DaemonLock` that
+    `daemon._run` took. A lock `_run` deliberately did NOT release holds its
+    raw descriptor until the process exits (that is the point); this closes
+    any such descriptor at teardown so one test cannot leak a held lock into
+    the next."""
+    import os
+
+    from zfsbackup import daemon as daemon_module
+    from zfsbackup import daemonlock
+
+    locks = []
+    real = daemonlock.acquire
+
+    def spy(*args, **kwargs):
+        lock = real(*args, **kwargs)
+        locks.append(lock)
+        return lock
+
+    mocker.patch.object(daemon_module.daemonlock, 'acquire', side_effect=spy)
+    yield locks
+    for lock in locks:
+        fd, lock._fd = lock._fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+#: What the contention window is during the suite unless a test opts back in
+#: to the real one with `real_contention_window`. `daemonlock.acquire` keeps
+#: retrying a contended lock for a whole second before refusing; the dozens
+#: of tests that merely need "a second daemon is refused" would each pay it.
+_TEST_CONTENTION_WINDOW = 0.05
+
+
+@pytest.fixture(autouse=True)
+def _short_daemonlock_contention_window(monkeypatch):
+    """Shrinks `daemonlock._CONTENTION_WINDOW` to 50 ms for every test (it
+    only matters to a test that contends for the lock). The tests that pin
+    the real window -- the transient-holder success and the persistent-holder
+    refusal -- request `real_contention_window` instead, and a separate test
+    asserts the real constants are 1 s / 25 ms. Subprocess daemons are not
+    affected: they import the module themselves. Yields the production value.
+    """
+    import sys
+
+    # Only if some test module already imported it: libzfseasy-only runs
+    # (and the real-ZFS ones) must not pay for importing zfsbackup here.
+    daemonlock = sys.modules.get("zfsbackup.daemonlock")
+    if daemonlock is None:
+        yield None
+        return
+    production = daemonlock._CONTENTION_WINDOW
+    monkeypatch.setattr(daemonlock, "_CONTENTION_WINDOW", _TEST_CONTENTION_WINDOW)
+    yield production
+
+
+@pytest.fixture
+def real_contention_window(monkeypatch, _short_daemonlock_contention_window):
+    """Restore the production contention window (1 s) for this test. Depends
+    on the autouse shrink, so it runs after it and wins."""
+    from zfsbackup import daemonlock
+
+    monkeypatch.setattr(daemonlock, "_CONTENTION_WINDOW", _short_daemonlock_contention_window)
+    return _short_daemonlock_contention_window
+
+
+@pytest.fixture
+def forbid_db(mocker):
+    """Arms every way the config database could be opened from the process
+    under test to raise `DbTouched`, and records each attempt in the returned
+    list (which a test asserts is empty, in case something caught the raise).
+
+    Arm it AFTER the test has finished writing its fixture database: it
+    patches `sqlite3.connect` itself, so nothing -- not `read_config`, not an
+    ORM session, not the importer -- can open any SQLite file. Under `fork`
+    a child inherits the patched module, so a worker that opened the database
+    would explode there too.
+    """
+    from _config_handoff import DbTouched
+
+    touched = []
+
+    def boom(name):
+        def _raise(*args, **kwargs):
+            touched.append(name)
+            raise DbTouched(name)
+        return _raise
+
+    for target in (
+        "zfsbackup.runtime_config.load_runtime_config",
+        "zfsbackup.runtime_config.read_config",
+        "zfsbackup.config.store.access.read_config",
+        "zfsbackup.config.store.access.open_config_session",
+        "zfsbackup.config.store.paths.get_engine",
+        "zfsbackup.config.store.db.get_engine",
+        "sqlite3.connect",
+    ):
+        mocker.patch(target, side_effect=boom(target))
+    return touched

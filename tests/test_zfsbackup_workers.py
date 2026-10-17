@@ -1,32 +1,24 @@
 """Unit tests for zfsbackup worker classes."""
 
-import json
-import logging
+import copy
+import inspect
 import multiprocessing
-import os
+import pickle
 import signal
 import pytest
 from datetime import timedelta
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-from sqlalchemy.exc import OperationalError
-
-from zfsbackup.config import BackupConfig, DatasetConfig, RemoteDatasetConfig
-from zfsbackup.config.store import (
-    ConfigPathError,
-    SchemaOutOfDate,
-    get_engine,
-    resolve_config_path,
-)
+import zfsbackup.workers as workers_module
+from _config_handoff import config_signature, literals_in
+from zfsbackup.config import BackupConfig, DatasetConfig, Duration, RemoteDatasetConfig
+from zfsbackup.config.store import dispose_all
+from zfsbackup.runtime_config import load_runtime_config
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
-from zfsbackup.runtime_config import EX_CONFIG
 from zfsbackup.stopflag import StopFlag
 from zfsbackup.workers import (
-    SnapshotWorker, PruningWorker, RemoteBackupWorker, ApiWorker, _load_config,
+    BaseWorker, SnapshotWorker, PruningWorker, RemoteBackupWorker, ApiWorker,
 )
-
-FORK_AVAILABLE = "fork" in multiprocessing.get_all_start_methods()
 
 #: The union `workers.StopEvent` actually accepts (see `workers.py`'s own
 #: module docstring): a plain `multiprocessing.Event` -- what ~35 existing
@@ -44,9 +36,9 @@ STOP_EVENT_IDS = ['mp_event', 'stopflag']
 
 
 class TestSnapshotWorker:
-    def test_name_and_daemon(self, sqlite_config_db):
+    def test_name_and_daemon(self, worker_config):
         stop_event = multiprocessing.Event()
-        worker = SnapshotWorker(sqlite_config_db, stop_event, dry_run=True)
+        worker = SnapshotWorker(worker_config, stop_event)
         assert worker.name == 'snapshot-worker'
         assert worker.daemon is True
 
@@ -73,19 +65,19 @@ class TestSnapshotWorker:
         worker._process_dataset(manager, dsi)
         manager.create_snapshot.assert_not_called()
 
-    def test_run_loads_config_and_processes(self, mocker, sqlite_config_db):
+    def test_run_uses_handed_config_and_processes(self, mocker, worker_config):
         stop_event = multiprocessing.Event()
         stop_event.set()
-        worker = SnapshotWorker(sqlite_config_db, stop_event, dry_run=True)
+        worker = SnapshotWorker(worker_config, stop_event)
         mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
         mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
         worker.run()
 
 
 class TestPruningWorker:
-    def test_name_and_daemon(self, sqlite_config_db):
+    def test_name_and_daemon(self, worker_config):
         stop_event = multiprocessing.Event()
-        worker = PruningWorker(sqlite_config_db, stop_event, dry_run=True)
+        worker = PruningWorker(worker_config, stop_event)
         assert worker.name == 'pruning-worker'
         assert worker.daemon is True
 
@@ -118,19 +110,19 @@ class TestPruningWorker:
         assert local[0] in result
         assert received[0] in result
 
-    def test_run_stops_when_event_set(self, sqlite_config_db, mocker):
+    def test_run_stops_when_event_set(self, worker_config, mocker):
         stop_event = multiprocessing.Event()
         stop_event.set()
-        worker = PruningWorker(sqlite_config_db, stop_event, dry_run=True)
+        worker = PruningWorker(worker_config, stop_event)
         mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
         mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
         worker.run()
 
 
 class TestRemoteBackupWorker:
-    def test_name_and_daemon(self, sqlite_config_db):
+    def test_name_and_daemon(self, worker_config):
         stop_event = multiprocessing.Event()
-        worker = RemoteBackupWorker(sqlite_config_db, stop_event, dry_run=True)
+        worker = RemoteBackupWorker(worker_config, stop_event)
         assert worker.name == 'remote-backup-worker'
         assert worker.daemon is True
 
@@ -219,71 +211,46 @@ class TestRemoteBackupWorker:
 
 
 class TestApiWorker:
-    def test_name_and_daemon(self, sqlite_config_db):
+    def test_name_and_daemon(self, worker_config):
         stop_event = multiprocessing.Event()
-        worker = ApiWorker(sqlite_config_db, stop_event, dry_run=True)
+        worker = ApiWorker(worker_config, stop_event)
         assert worker.name == 'api-worker'
         assert worker.daemon is True
 
-    def test_run_bad_config_exits_cleanly(self, tmp_path, mocker):
-        # A genuine `ResolvedConfigPath` (not a bare `Path`) pointed at a
-        # `.yaml`-suffixed target: `check_config_db_suffix` refuses it with
-        # `ConfigDbIsYaml` (a `ConfigPathError`), the same permanent-fault
-        # class `_load_config` turns into `SystemExit(EX_CONFIG)` -- exactly
-        # the crash-loop-guard contract (item 8, sub-item 8i) this "exits
-        # cleanly" name now means: a distinct, non-restartable exit code,
-        # not a bare early `return`. A bare `Path` here (as before item 8)
-        # would raise `AttributeError: 'PosixPath' object has no attribute
-        # 'url'` deep inside `check_config_db`, then a SECOND, unrelated
-        # `AttributeError` (`'PosixPath' object has no attribute 'source'`)
-        # while `_load_config`'s except-Exception arm tries to log it via
-        # `config_error_message` -- that second, uncaught error is exactly
-        # what made this test fail after item 8 landed.
-        bad_config = tmp_path / 'bad.yaml'
-        bad_config.write_text('')
-        resolved = resolve_config_path(str(bad_config))
-        stop_event = multiprocessing.Event()
-        worker = ApiWorker(resolved, stop_event, dry_run=True)
-        with pytest.raises(SystemExit) as excinfo:
-            worker.run()
-        assert excinfo.value.code == EX_CONFIG
-
 
 class TestBaseWorkerRun:
-    def test_run_exits_on_bad_config(self, tmp_path, mocker):
-        # See `TestApiWorker.test_run_bad_config_exits_cleanly` for why this
-        # must be a real `ResolvedConfigPath`, and why the child now exits
-        # `EX_CONFIG` rather than returning quietly.
-        bad_config = tmp_path / 'bad.yaml'
-        bad_config.write_text('')
-        resolved = resolve_config_path(str(bad_config))
-        stop_event = multiprocessing.Event()
-        worker = SnapshotWorker(resolved, stop_event, dry_run=True)
-        with pytest.raises(SystemExit) as excinfo:
-            worker.run()
-        assert excinfo.value.code == EX_CONFIG
-
-    def test_run_sets_dry_run_from_flag(self, sqlite_config_db, mocker):
+    def test_run_uses_the_handed_config_with_dry_run_applied(self, worker_config, mocker):
+        """`run()` builds its `DatasetManager` from `self.config` -- the very
+        object it was constructed with, `dry_run` already applied by the
+        supervisor -- and does not substitute another."""
         stop_event = multiprocessing.Event()
         stop_event.set()
-        worker = SnapshotWorker(sqlite_config_db, stop_event, dry_run=True)
+        worker = SnapshotWorker(worker_config, stop_event)
         mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
         mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
+        seen = []
+        real_init = DatasetManager.__init__
+
+        def spy(self_, config, *a, **k):
+            seen.append(config)
+            return real_init(self_, config, *a, **k)
+
+        mocker.patch.object(DatasetManager, '__init__', spy)
         worker.run()
+        assert len(seen) == 1 and seen[0] is worker_config
+        assert seen[0].dry_run is True
 
 
 class TestBaseWorkerLoop:
     """Cover the main dataset-processing loop (lines 74-82) and _get_datasets (line 51)."""
 
-    def test_dataset_exception_logged_and_loop_exits_on_stop(self, sqlite_config_db, mocker):
+    def test_dataset_exception_logged_and_loop_exits_on_stop(self, mocker):
         stop_event = multiprocessing.Event()
-        worker = SnapshotWorker(sqlite_config_db, stop_event, dry_run=True)
-
         two_dataset_config = BackupConfig(datasets=[
             DatasetConfig(name='pool/a'),
             DatasetConfig(name='pool/b'),
         ])
-        mocker.patch('zfsbackup.workers.load_runtime_config', return_value=two_dataset_config)
+        worker = SnapshotWorker(two_dataset_config, stop_event)
         mocker.patch.object(SnapshotWorker, '_get_interval', return_value=0)
 
         call_count = [0]
@@ -323,11 +290,11 @@ class TestApiWorkerThread:
         'stop_event_factory', STOP_EVENT_FACTORIES, ids=STOP_EVENT_IDS
     )
     def test_run_starts_thread_and_stops_on_event(
-        self, sqlite_config_db, mocker, stop_event_factory
+        self, worker_config, mocker, stop_event_factory
     ):
         stop_event = stop_event_factory()
         stop_event.set()  # stop_event.wait() returns immediately
-        worker = ApiWorker(sqlite_config_db, stop_event, dry_run=True)  # dry_run covers line 198
+        worker = ApiWorker(worker_config, stop_event)  # dry_run covers line 198
 
         mock_app = MagicMock()
         mocker.patch('zfsbackup.api.create_app', return_value=mock_app)
@@ -374,12 +341,12 @@ class TestChildSignalDispositionWiring:
         signal.signal(signal.SIGTERM, _handler)
 
     def test_base_worker_run_resets_signal_disposition_first(
-        self, sqlite_config_db, mocker
+        self, worker_config, mocker
     ):
         self._install_non_default_handlers()
         stop_event = multiprocessing.Event()
         stop_event.set()  # zero loop iterations -- run() still must reset first
-        worker = SnapshotWorker(sqlite_config_db, stop_event, dry_run=True)
+        worker = SnapshotWorker(worker_config, stop_event)
         mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
         mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
 
@@ -392,12 +359,12 @@ class TestChildSignalDispositionWiring:
         'stop_event_factory', STOP_EVENT_FACTORIES, ids=STOP_EVENT_IDS
     )
     def test_api_worker_run_resets_signal_disposition_first(
-        self, sqlite_config_db, mocker, stop_event_factory
+        self, worker_config, mocker, stop_event_factory
     ):
         self._install_non_default_handlers()
         stop_event = stop_event_factory()
         stop_event.set()  # stop_event.wait() returns immediately
-        worker = ApiWorker(sqlite_config_db, stop_event, dry_run=True)
+        worker = ApiWorker(worker_config, stop_event)
 
         mock_app = MagicMock()
         mocker.patch('zfsbackup.api.create_app', return_value=mock_app)
@@ -410,99 +377,228 @@ class TestChildSignalDispositionWiring:
         assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
 
 
-class TestLoadConfigExitCodes:
-    """`_load_config`'s three-way outcome (item 8, sub-item 8i): a
-    permanent config fault raises `SystemExit(EX_CONFIG)`, so the child's
-    OS exit code tells the supervisor "do not restart me"; a transient
-    failure (e.g. `database is locked` under `busy_timeout`) returns
-    `None` and leaves the process free to exit normally (code 0) and be
-    respawned; a healthy load returns a real, `dry_run`-applied
-    `BackupConfig`.
+# ---------------------------------------------------------------------------
+# Item 15.2(b): workers are handed the supervisor's detached BackupConfig and
+# never open the config database.
+# ---------------------------------------------------------------------------
 
-    Mutation-checked: reverting `_load_config`'s `except (ConfigPathError,
-    SchemaError)` arm to fall through to the generic `except Exception`
-    (i.e. treating every failure as transient) fails 3 of these tests --
-    the two `SystemExit`-expecting cases and
-    `test_operational_error_is_never_mistaken_for_ex_config`, which would
-    then see a bare `None` returned but not distinguish the two failure
-    classes if the ordering were reversed instead (checked separately:
-    swapping the two `except` clauses so `ConfigPathError`/`SchemaError`
-    is caught by the generic arm first also fails the same 3).
-    """
+WORKER_CLASSES = [
+    pytest.param(SnapshotWorker, 'snapshot-worker', id='snapshot'),
+    pytest.param(PruningWorker, 'pruning-worker', id='pruning'),
+    pytest.param(RemoteBackupWorker, 'remote-backup-worker', id='remote'),
+    pytest.param(ApiWorker, 'api-worker', id='api'),
+]
 
-    def test_config_path_error_exits_ex_config(self, sqlite_config_db, mocker):
-        logger = logging.getLogger("test")
-        mocker.patch(
-            "zfsbackup.workers.load_runtime_config",
-            side_effect=ConfigPathError("no such database"),
-        )
-        with pytest.raises(SystemExit) as excinfo:
-            _load_config(sqlite_config_db, False, logger)
-        assert excinfo.value.code == EX_CONFIG
 
-    def test_schema_error_exits_ex_config(self, sqlite_config_db, mocker):
-        logger = logging.getLogger("test")
-        mocker.patch(
-            "zfsbackup.workers.load_runtime_config",
-            side_effect=SchemaOutOfDate("schema is stale"),
-        )
-        with pytest.raises(SystemExit) as excinfo:
-            _load_config(sqlite_config_db, False, logger)
-        assert excinfo.value.code == EX_CONFIG
+class TestWorkerConstructors:
+    """`(config, stop_event, verbose=False)` for every concrete worker;
+    `BaseWorker(worker_name, config, stop_event, verbose=False)`. There is no
+    path and no `dry_run` parameter any more: `--dry-run` is applied to the
+    config by the supervisor before the handoff.
 
-    def test_operational_error_is_never_mistaken_for_ex_config(
-        self, sqlite_config_db, mocker
+    Mutation-checked (scratch copy): re-adding a trailing `dry_run` parameter
+    to `SnapshotWorker.__init__` fails 2 tests
+    (`test_the_signature_is_exactly_config_stop_event_verbose[snapshot]` and
+    `test_the_old_dry_run_and_path_parameters_are_gone[snapshot]`)."""
+
+    @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
+    def test_positional_config_stop_event_verbose(self, cls, name, worker_config):
+        stop = multiprocessing.Event()
+        worker = cls(worker_config, stop, True)
+        assert worker.config is worker_config
+        assert worker.stop_event is stop
+        assert worker.verbose is True
+        assert worker.name == name and worker.daemon is True
+
+    @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
+    def test_verbose_defaults_to_false(self, cls, name, worker_config):
+        assert cls(worker_config, multiprocessing.Event()).verbose is False
+
+    @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
+    def test_the_signature_is_exactly_config_stop_event_verbose(self, cls, name):
+        params = list(inspect.signature(cls.__init__).parameters)
+        assert params == ['self', 'config', 'stop_event', 'verbose']
+
+    def test_base_worker_signature_takes_the_name_first(self):
+        params = list(inspect.signature(BaseWorker.__init__).parameters)
+        assert params == ['self', 'worker_name', 'config', 'stop_event', 'verbose']
+
+    @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
+    def test_the_old_dry_run_and_path_parameters_are_gone(self, cls, name, worker_config):
+        stop = multiprocessing.Event()
+        with pytest.raises(TypeError):
+            cls(worker_config, stop, dry_run=True)
+        with pytest.raises(TypeError):
+            cls(worker_config, stop, resolved_config=object())
+        with pytest.raises(TypeError):
+            cls(worker_config, stop, False, True)  # the old 4th positional (dry_run)
+
+    @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
+    def test_the_config_is_not_copied(self, cls, name, worker_config):
+        """Identity matters: all workers and every restart share one object."""
+        a = cls(worker_config, multiprocessing.Event())
+        b = cls(worker_config, multiprocessing.Event())
+        assert a.config is b.config is worker_config
+
+    def test_load_config_and_the_config_error_exit_are_gone(self):
+        assert not hasattr(workers_module, '_load_config')
+        assert not hasattr(workers_module, 'load_runtime_config')
+
+    def test_workers_module_imports_nothing_from_the_config_store(self):
+        """The strongest cheap guard that no worker can reach the database:
+        nothing in the module's namespace comes from the store or the
+        daemon's reader."""
+        offenders = [
+            name for name, obj in vars(workers_module).items()
+            if getattr(obj, '__module__', '').startswith(
+                ('zfsbackup.config.store', 'zfsbackup.runtime_config')
+            ) or (inspect.ismodule(obj) and obj.__name__.startswith(
+                ('zfsbackup.config.store', 'zfsbackup.runtime_config')
+            ))
+        ]
+        assert offenders == []
+
+
+class TestConfigSurvivesPickling:
+    """Under `spawn`/`forkserver` the config crosses the process boundary by
+    pickling. `Duration.__eq__` ignores literals, so equality alone proves
+    nothing: the signature comparison records each literal.
+
+    Mutation-checked (scratch copy): removing `Duration.__reduce__` fails 6 of
+    the 8 tests here -- `test_pickled_signature_is_identical` at all four
+    protocols, `test_every_duration_literal_survives` and
+    `test_deepcopy_agrees_with_pickle`."""
+
+    @pytest.fixture
+    def config(self, literal_config_db):
+        snapshot = load_runtime_config(literal_config_db)
+        dispose_all()
+        snapshot.config.dry_run = True
+        return snapshot.config
+
+    @pytest.mark.parametrize('protocol', range(2, pickle.HIGHEST_PROTOCOL + 1))
+    def test_pickled_signature_is_identical(self, config, protocol):
+        clone = pickle.loads(pickle.dumps(config, protocol))
+        assert clone is not config
+        assert clone == config
+        assert config_signature(clone) == config_signature(config)
+        assert clone.dry_run is True
+
+    def test_every_duration_literal_survives(self, config):
+        clone = pickle.loads(pickle.dumps(config))
+        expected = ['600s', '90m', '60m', '4w', '1M', '120m', '52w']
+        assert set(expected) <= set(literals_in(config_signature(config)))
+        assert set(expected) <= set(literals_in(config_signature(clone)))
+        ds = clone.datasets[0]
+        assert ds.frequency.literal == '60m'
+        assert [r.age.literal for r in ds.retention_rules] == ['1d', '1w']
+        assert [r.keep_for.literal for r in ds.retention_rules] == ['4w', '1M']
+        (remote,) = ds.remote
+        assert remote.frequency.literal == '120m'
+        assert [(r.age.literal, r.keep_for.literal) for r in remote.retention_rules] == [('1d', '52w')]
+        assert clone.check_interval.literal == '600s'
+        assert clone.prune_interval.literal == '90m'
+
+    def test_deepcopy_agrees_with_pickle(self, config):
+        assert config_signature(copy.deepcopy(config)) == config_signature(config)
+
+    def test_equality_alone_cannot_see_a_lost_literal(self):
+        """Why the signature exists: these compare equal, and are not the same."""
+        a, b = Duration('60m'), Duration('1h')
+        assert a == b
+        assert config_signature(a) != config_signature(b)
+
+    def test_a_pickled_worker_config_drives_a_worker_identically(self, config):
+        clone = pickle.loads(pickle.dumps(config))
+        for cls in (SnapshotWorker, PruningWorker):
+            original = cls(config, multiprocessing.Event())
+            copied = cls(clone, multiprocessing.Event())
+            assert original._get_interval(original.config) == copied._get_interval(copied.config)
+
+
+class TestWorkersNeverOpenTheConfigDatabase:
+    """Item 15.2(b): the supervisor read the database once; a worker's `run()`
+    must work with the database gone and every way of opening it armed to
+    explode. Run for real (stop flag already set, so zero loop iterations but
+    the whole setup path: signal reset, `DatasetManager`, interval, and
+    `_before_loop`).
+
+    Mutation-checked (scratch copy): making `BaseWorker.run` open any SQLite
+    connection fails 8 tests: 7 here (the three-class x two-stop-flag run test
+    and the loop test) and `TestForkedWorkerRunsOnTheInheritedConfig`."""
+
+    @pytest.fixture
+    def armed(self, literal_config_db, tmp_path, request, mocker):
+        """-> the config. Read first, then the database is deleted and every
+        way of opening it is armed (`forbid_db`, resolved here so it cannot
+        be armed before the read)."""
+        snapshot = load_runtime_config(literal_config_db)
+        dispose_all()
+        config = snapshot.config
+        config.dry_run = True
+        config.client_id_file = tmp_path / 'client_id'
+        for path in tmp_path.glob('literal.db*'):
+            path.unlink()
+        assert not list(tmp_path.glob('literal.db*'))
+        request.getfixturevalue('forbid_db')
+        mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
+        mocker.patch('zfsbackup.backup_manager.zfs.set')
+        return config
+
+    @pytest.mark.parametrize('stop_factory', STOP_EVENT_FACTORIES, ids=STOP_EVENT_IDS)
+    @pytest.mark.parametrize('cls', [SnapshotWorker, PruningWorker, RemoteBackupWorker])
+    def test_run_completes_without_touching_the_database(
+        self, cls, stop_factory, armed, forbid_db
     ):
-        """A `database is locked` `OperationalError` -- the shape a
-        concurrent `zfsbackup-config` write under `busy_timeout` produces
-        -- must return `None` (transient, stay restartable), not raise
-        `SystemExit`. Distinguishing this from the two tests above is the
-        entire point of `_load_config` having two `except` arms rather
-        than one.
-        """
-        logger = logging.getLogger("test")
-        mocker.patch(
-            "zfsbackup.workers.load_runtime_config",
-            side_effect=OperationalError(
-                "BEGIN IMMEDIATE", None, Exception("database is locked")
-            ),
-        )
-        result = _load_config(sqlite_config_db, False, logger)
-        assert result is None
+        stop = stop_factory()
+        stop.set()
+        cls(armed, stop).run()
+        assert forbid_db == []
 
-    def test_healthy_load_returns_config_with_dry_run_applied(
-        self, sqlite_config_db
+    @pytest.mark.parametrize('stop_factory', STOP_EVENT_FACTORIES, ids=STOP_EVENT_IDS)
+    def test_api_worker_run_completes_without_touching_the_database(
+        self, stop_factory, armed, forbid_db, mocker
     ):
-        logger = logging.getLogger("test")
-        config = _load_config(sqlite_config_db, True, logger)
-        assert isinstance(config, BackupConfig)
-        assert config.dry_run is True
+        stop = stop_factory()
+        stop.set()
+        app = MagicMock()
+        mocker.patch('zfsbackup.api.create_app', return_value=app)
+        mocker.patch('zfsbackup.workers.threading.Thread', return_value=MagicMock())
+        ApiWorker(armed, stop).run()
+        assert forbid_db == []
 
+    def test_the_api_app_is_built_from_the_handed_config(self, armed, mocker):
+        stop = multiprocessing.Event()
+        stop.set()
+        factory = mocker.patch('zfsbackup.api.create_app', return_value=MagicMock())
+        mocker.patch('zfsbackup.workers.threading.Thread', return_value=MagicMock())
+        ApiWorker(armed, stop).run()
+        factory.assert_called_once_with(armed)
 
-def _fork_child_worker_load(resolved_config, result_path):
-    """Runs inside a forked child (module-level so
-    `multiprocessing.get_context("fork")` can pickle/call it directly).
+    def test_the_worker_loop_runs_on_the_handed_config_not_a_reloaded_one(self, armed, mocker):
+        """A cycle processes the datasets of the config it was handed; there
+        is nowhere to get another one from."""
+        stop = multiprocessing.Event()
+        seen = []
 
-    Calls `_load_config` directly rather than `worker.run()` -- no loop,
-    no stop-event wait, so the child exits as soon as this returns. The
-    point of this test is the store's own fork guarantee (`db.py`'s
-    pid-keyed `_ENGINES` cache) reached through the ACTUAL path a worker
-    child uses, not a synthetic engine as `TestDbForkSafety` already
-    covers in `tests/test_zfsbackup_store.py`.
-    """
-    logger = logging.getLogger("fork_child")
-    config = _load_config(resolved_config, False, logger)
-    result = {
-        "pid": os.getpid(),
-        "loaded": config is not None,
-        "dataset_names": sorted(ds.name for ds in config.datasets) if config else [],
-    }
-    with open(result_path, "w") as fh:
-        json.dump(result, fh)
+        def process(self_, manager, dsi):
+            seen.append(dsi.name)
+            stop.set()
+
+        mocker.patch.object(SnapshotWorker, '_process_dataset', process)
+        SnapshotWorker(armed, stop).run()
+        assert seen == ['pool/data']  # first of the config's datasets, then stopped
+
+    def test_interval_comes_from_the_handed_config(self, armed):
+        assert SnapshotWorker(armed, multiprocessing.Event())._get_interval(armed) == 600.0
+        assert PruningWorker(armed, multiprocessing.Event())._get_interval(armed) == 5400.0
+        # min of the remote frequencies: the `offsite` override of 120m
+        assert RemoteBackupWorker(armed, multiprocessing.Event())._get_interval(armed) == 7200.0
 
 
 @pytest.mark.skipif(
-    not FORK_AVAILABLE,
+    "fork" not in multiprocessing.get_all_start_methods(),
     reason="'fork' multiprocessing start method unavailable on this platform",
 )
 @pytest.mark.integration
@@ -511,50 +607,32 @@ def _fork_child_worker_load(resolved_config, result_path):
     "ignore:This process \\(pid=.*\\) is multi-threaded, use of fork\\(\\) "
     "may lead to deadlocks in the child:DeprecationWarning"
 )
-class TestWorkerForkedChildLoadsConfig:
-    """A worker's config load, exercised through a genuine
-    `multiprocessing.get_context("fork")` child rather than an in-process
-    call -- see `tests/test_zfsbackup_store.py`'s `TestDbForkSafety` for
-    why this must be pinned to `fork` explicitly (this machine's default
-    start method is `spawn`, under which the hazard cannot occur at all).
+class TestForkedWorkerRunsOnTheInheritedConfig:
+    """A real forked child runs the real `SnapshotWorker.run` on the config it
+    inherited, with the database deleted and `sqlite3.connect` armed to raise
+    in the parent (a fork child inherits the patched module, so a child that
+    opened the database would die with `DbTouched` and a non-zero exit)."""
 
-    Establishes the parent's own engine for `sqlite_config_db`'s URL
-    first, so the child inherits a live cache entry exactly as a real
-    `BackupDaemon`-spawned worker would if `_spawn`'s `dispose_all()`
-    choke point were ever skipped -- and asserts the parent's own engine
-    cache entry (keyed by this process's pid) is untouched afterwards,
-    i.e. the child rebuilding its own engine never reaches back into the
-    parent's.
-    """
-
-    def test_child_loads_independently_and_parent_cache_is_untouched(
-        self, sqlite_config_db, tmp_path
+    def test_child_exits_cleanly_without_opening_the_database(
+        self, literal_config_db, tmp_path, mocker
     ):
-        from zfsbackup.config.store import db as store_db
+        from _config_handoff import ForkedSnapshotWorker
 
-        url = sqlite_config_db.url()
-        parent_engine = get_engine(url)
-        with parent_engine.connect():
-            pass  # establish the parent's own physical connection first
-        parent_cache_before = dict(store_db._ENGINES)
+        snapshot = load_runtime_config(literal_config_db)
+        dispose_all()
+        for path in tmp_path.glob('literal.db*'):
+            path.unlink()
+        forbid = mocker.patch('sqlite3.connect', side_effect=RuntimeError('db opened'))
+        mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
+        mocker.patch('zfsbackup.backup_manager.zfs.set')
+        stop = StopFlag()
+        stop.set()  # zero loop iterations; the whole setup path still runs
+        worker = ForkedSnapshotWorker(snapshot.config, stop)
+        worker.start_method = 'fork'
 
-        result_path = tmp_path / "fork_worker_load.json"
-        ctx = multiprocessing.get_context("fork")
-        proc = ctx.Process(
-            target=_fork_child_worker_load, args=(sqlite_config_db, str(result_path))
-        )
-        proc.start()
-        proc.join(timeout=30)
-        assert proc.exitcode == 0
+        worker.start()
+        worker.join(60)
 
-        with open(result_path) as fh:
-            result = json.load(fh)
-
-        assert result["pid"] != os.getpid()
-        assert result["loaded"] is True
-        assert result["dataset_names"] == ["pool/data"]
-
-        # The parent's own cache entry (this process's pid) is exactly what
-        # it was before the fork -- the child rebuilding its own engine
-        # never mutated the parent's dict nor disposed the parent's pool.
-        assert dict(store_db._ENGINES) == parent_cache_before
+        assert worker.exitcode == 0
+        forbid.assert_not_called()

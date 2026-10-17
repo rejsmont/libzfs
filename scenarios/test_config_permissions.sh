@@ -12,7 +12,15 @@
 #   (a) root's first import of the DEFAULT path /var/lib/zfsbackup/config.db  ->  directory
 #       2770 root:zfsbackup (Q7 chgrp), database 660 group zfsbackup.
 #   (b) the daemon runs as zfsbackup while alice (then bob) re-import: the import succeeds
-#       (no EPERM), the daemon keeps running, a respawned worker re-reads the new config.
+#       (no EPERM), the daemon keeps running. Item 15.2: the supervisor reads the config DB ONCE
+#       (logs "Configuration generation N, schema revision R", records "pid\ngeneration\n" in
+#       <db>.daemon.pid) and hands it to every worker; workers hold no config.db fd. So after a
+#       re-import bumps the DB generation, a kill -9'd-and-respawned worker keeps the STARTUP
+#       generation N (no second load logged, pid file still N, DB at N+k, no config.db fd), the
+#       CLI tells the operator "running daemon pid P is on generation N and will not apply this
+#       until restarted" (also as group operator alice, whose probe is read-only), a second daemon
+#       on the same DB exits 1 naming the first pid, and <db>.writer.lock / <db>.daemon.pid are
+#       0660 group zfsbackup.
 #   (c) alice's process is the FIRST opener of the DB and is killed with SIGHUP while holding
 #       it: the leftover -wal/-shm sit in group zfsbackup (setgid directory) and the daemon
 #       user can still open the DB.
@@ -27,8 +35,8 @@
 # Daemon choice: the point is DB ACCESS, not ZFS operations, so the daemon runs `--dry-run`
 # against a STUB `zfs`/`zpool` (the same trick .github/workflows/tests.yml uses) — no pool, no
 # `zfs allow` delegation, no ZFS install. Workers still start, still load the config from the
-# DB as user zfsbackup, and are still respawned (which re-reads the DB) — that is exactly the
-# access path under test.
+# DB as user zfsbackup, and are still respawned — that is exactly the access path under test.
+# (Since 15.2(b) only the supervisor reads the DB; workers receive its config, respawns included.)
 #
 # Seeding: the fixtures are derived from zfsbackup/config.example.yaml (source of truth) and
 # imported with the config CLI, `python -m zfsbackup.cli import <yaml> [-c <db>]` (the module
@@ -39,8 +47,13 @@
 # Exit codes: 0 ok, 1 invalid/refused, 75 busy, 78 config DB unusable (asserted in (e3)). Files reach the VM with
 # `multipass transfer`; all output discarding happens inside the guest.
 #
+# Source shipped to the VM: `git archive HEAD` by default. `ZFSB_SRC=worktree` packs the WORKING
+# TREE instead (tracked + untracked-not-ignored files that exist on disk, via `git ls-files -co
+# --exclude-standard`), so uncommitted code can be exercised. Nothing is committed or stashed.
+#
 # Usage:
 #   ./scenarios/test_config_permissions.sh           # run all checks; VM reused, state reset
+#   ZFSB_SRC=worktree ./scenarios/test_config_permissions.sh   # ship uncommitted code
 #   ./scenarios/test_config_permissions.sh --keep    # leave daemon + DB state for inspection
 #   ./scenarios/test_config_permissions.sh --purge   # delete the VM at the end
 #
@@ -164,12 +177,29 @@ install_stack() {
         if [ -n "$need" ]; then apt-get update -qq && apt-get install -y -qq $need; fi
     ' || die "package install failed"
 
-    # Ship the committed HEAD. `git archive` run from scenarios/ would archive ONLY that
-    # subtree, so anchor it at the repo top level.
-    step "Copying source into $PERM_VM:$SRC_DIR"
-    local tar top; tar="$(mktemp)"
+    # Ship the committed HEAD (default) or the working tree (ZFSB_SRC=worktree). `git archive`
+    # run from scenarios/ would archive ONLY that subtree, so anchor at the repo top level.
+    step "Copying source into $PERM_VM:$SRC_DIR (ZFSB_SRC=${ZFSB_SRC:-head})"
+    local tar top list n f; tar="$(mktemp)"
     top="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)" || die "not in a git repo"
-    git -C "$top" archive --format=tar HEAD > "$tar" || die "git archive failed"
+    case "${ZFSB_SRC:-head}" in
+        head)
+            git -C "$top" archive --format=tar HEAD > "$tar" || die "git archive failed"
+            ;;
+        worktree)
+            # -c lists tracked files (including ones deleted on disk: skipped below), -o the
+            # untracked-but-not-ignored ones. NUL-separated; no stash, no commit, no index change.
+            list="$(mktemp)"; n=0
+            while IFS= read -r -d '' f; do
+                if [ -f "$top/$f" ]; then printf '%s\0' "$f" >> "$list"; n=$((n+1)); fi
+            done < <(git -C "$top" ls-files -z -co --exclude-standard)
+            [ "$n" -gt 0 ] || die "worktree packaging found no files"
+            info "packing $n working-tree files"
+            COPYFILE_DISABLE=1 tar -cf "$tar" -C "$top" --null -T "$list" || die "tar of working tree failed"
+            rm -f "$list"
+            ;;
+        *) die "ZFSB_SRC must be 'head' or 'worktree' (got '${ZFSB_SRC}')" ;;
+    esac
     multipass transfer "$tar" "$PERM_VM:/tmp/zfsbackup-src.tar" || die "source transfer failed"
     rm -f "$tar"
     msh "rm -rf '$SRC_DIR' && mkdir -p '$SRC_DIR' && tar -m -xf /tmp/zfsbackup-src.tar -C '$SRC_DIR' && rm -f /tmp/zfsbackup-src.tar" \
@@ -253,6 +283,38 @@ with open_config_connection(r) as conn:
     time.sleep(3600)
 EOF
     put_file "$t/holder.py" "$FIX_DIR/holder.py" 644
+
+    # Read-only helpers for the item 15.2 checks (run as $SVC_USER / alice, never root, so no
+    # root-owned sidecar can appear). All use the DEFAULT database path.
+    # dbgen.py: print the stored config generation.
+    cat > "$t/dbgen.py" <<'EOF'
+from zfsbackup.config.store import dispose_all, read_config, resolve_config_path
+print(read_config(resolve_config_path(None)).generation)
+dispose_all()
+EOF
+    put_file "$t/dbgen.py" "$FIX_DIR/dbgen.py" 644
+    # fdprobe.py: POSITIVE CONTROL for the "no config.db fd" check - open the DB, then print
+    # this process's own /proc/self/fd link targets.
+    cat > "$t/fdprobe.py" <<'EOF'
+import os
+from zfsbackup.config.store import open_config_connection, resolve_config_path
+with open_config_connection(resolve_config_path(None), readonly=True) as conn:
+    conn.exec_driver_sql("SELECT count(*) FROM sqlite_master").fetchall()
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            print(os.readlink("/proc/self/fd/" + fd))
+        except OSError:
+            pass
+EOF
+    put_file "$t/fdprobe.py" "$FIX_DIR/fdprobe.py" 644
+    # probe.py: the daemon-presence probe the CLI runs after a write, on its own.
+    cat > "$t/probe.py" <<'EOF'
+from zfsbackup import daemonlock
+from zfsbackup.config.store import resolve_config_path
+info = daemonlock.probe(resolve_config_path(None))
+print("none" if info is None else "pid=%s generation=%s" % (info.pid, info.generation))
+EOF
+    put_file "$t/probe.py" "$FIX_DIR/probe.py" 644
     rm -rf "$t"
 
     # fixtures from the committed example
@@ -307,6 +369,16 @@ wait_workers_started() { # all three workers spawned (api is spawned last)
     done
     sleep 3                              # let each worker finish its first config load
 }
+# open_db_fds <pid> — readlink targets of that process's fds that ARE the config DB or a WAL
+# sidecar. (Exact match: a forked worker legitimately inherits the <db>.daemon.pid lock fd, which
+# a substring match on "config.db" would wrongly flag.) Root reads /proc/<pid>/fd.
+open_db_fds() {
+    msh "for f in /proc/$1/fd/*; do readlink \"\$f\"; done 2>/dev/null | grep -xE '$DB(-wal|-shm)?( \\(deleted\\))?'; true"
+}
+# "<mode> <group>" of a path (owner dropped)
+mode_group() { stat_of "$1" | awk '{print $1, $3}'; }
+PIDFILE="${DB}.daemon.pid"
+WLOCK="${DB}.writer.lock"
 log_lines()  { msh "wc -l < '$LOG'" | tr -d '[:space:]'; }
 log_since()  { msh "tail -n +$(( $1 + 1 )) '$LOG'"; }
 
@@ -393,6 +465,36 @@ mark_imports="$(log_lines)"
 info "supervisor pid=$pid_before workers=[$workers_before]"
 check_re "daemon loaded the original config as $SVC_USER" "Loading configuration from" "$(msh "cat '$LOG'")"
 
+# Item 15.2: one startup load, its generation logged and recorded in <db>.daemon.pid.
+gen0="$(msh "grep -oE 'Configuration generation [0-9]+' '$LOG' | head -n1 | grep -oE '[0-9]+\$'" | tr -d '[:space:]')"
+check_re "daemon logs 'Configuration generation N, schema revision R' at startup" \
+    "Configuration generation [0-9]+, schema revision [0-9a-f]+" "$(msh "cat '$LOG'")"
+check "startup load logged exactly once" "1" "$(msh "grep -c 'Configuration generation' '$LOG'" | tr -d '[:space:]')"
+check "pid file is '<supervisor pid>,<startup generation>' ($pid_before,$gen0)" "$pid_before,$gen0" \
+    "$(msh "paste -sd, '$PIDFILE'")"
+check "pid file is 660 group $SVC_GROUP" "660 $SVC_GROUP" "$(mode_group "$PIDFILE")"
+check "writer lock file exists and is 660 group $SVC_GROUP" "660 $SVC_GROUP" "$(mode_group "$WLOCK")"
+check "supervisor has no config.db fd open (it disposed its reader)" "" "$(open_db_fds "$pid_before")"
+for w in snapshot pruning api; do
+    check "$w worker (pid $(worker_pid $w)) holds no config.db fd (config handed over, not read)" "" "$(open_db_fds "$(worker_pid $w)")"
+done
+check_re "positive control: a process that DOES open the DB shows it in /proc/<pid>/fd" "^$DB\$" \
+    "$(asu "$SVC_USER" "'$PY' '$FIX_DIR/fdprobe.py' 2>&1")"
+
+# A group operator can see the daemon: the probe the CLI runs works read-only for alice.
+pf_before="$(msh "cksum '$PIDFILE'; stat -c %Y '$PIDFILE'")"
+check "alice's probe sees the running daemon (pid, startup generation)" "pid=$pid_before generation=$gen0" \
+    "$(asu alice "'$PY' '$FIX_DIR/probe.py' 2>&1")"
+check "the probe wrote nothing (pid file checksum and mtime unchanged)" "$pf_before" "$(msh "cksum '$PIDFILE'; stat -c %Y '$PIDFILE'")"
+
+# A second daemon on the same DB, as the service user, must refuse and name the first pid.
+out="$(asu "$SVC_USER" "'$PY' -m zfsbackup.daemon --dry-run 2>&1")"; rc=$?
+check "second daemon on the same DB exits 1" "1" "$rc"
+check_re "second daemon names the first daemon's pid ($pid_before)" "daemon \(pid $pid_before\) is already running" "$out"
+check_no_re "second daemon started no workers" "Started .* worker" "$out"
+daemon_active && pass "first daemon unaffected by the refused second one" || fail "first daemon died"
+check "pid file untouched by the refused second daemon" "$pid_before,$gen0" "$(msh "paste -sd, '$PIDFILE'")"
+
 for op in alice bob; do
     out="$(asu "$op" "'$PY' -m zfsbackup.cli import '$FIX_DIR/$op.yaml' 2>&1")"; rc=$?
     check "$op's re-import (daemon running) exits 0" "0" "$rc"
@@ -406,6 +508,8 @@ for op in alice bob; do
         fail "$op's re-import reported no pre-import backup path: $(printf '%s' "$out" | tr '\n' '|' | cut -c1-300)"
     fi
     check_no_re "$op's re-import: no EPERM / permission / open failure" "EPERM|Operation not permitted|Permission denied|PermissionError|unable to open" "$out"
+    check_re "$op's CLI says daemon pid $pid_before is on generation $gen0 and will not apply the import" \
+        "running daemon pid $pid_before is on generation $gen0 and will not apply this until restarted" "$out"
 done
 check "database still 660 group $SVC_GROUP after operators' imports" "660 root $SVC_GROUP" "$(stat_of "$DB")"
 check "directory still 2770 root:$SVC_GROUP after operators' imports" "2770 root $SVC_GROUP" "$(stat_of "$CFG_DIR")"
@@ -415,22 +519,47 @@ check "supervisor pid unchanged" "$pid_before" "$(daemon_pid)"
 check "no worker was restarted by the imports" "$workers_before" "snapshot=$(worker_pid snapshot) pruning=$(worker_pid pruning) api=$(worker_pid api)"
 check_no_re "no worker exit logged during the imports" "exited with" "$(log_since "$mark_imports")"
 
-# A respawned worker re-reads the DB as $SVC_USER: kill one, expect a restart + a clean load.
+# Item 15.2(b): a respawned worker gets the supervisor's STARTUP config; it does not re-read the DB.
+# Bump the DB generation with one more operator re-import, THEN kill -9 a worker.
+out="$(asu bob "'$PY' -m zfsbackup.cli import --no-backup '$FIX_DIR/bob.yaml' 2>&1")"; rc=$?
+check "bob's re-import before the kill exits 0" "0" "$rc"
+check_re "CLI notice on the re-import: daemon pid $pid_before is on generation $gen0, will not apply it" \
+    "running daemon pid $pid_before is on generation $gen0 and will not apply this until restarted" "$out"
+gen_cli="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+gen_db="$(asu "$SVC_USER" "'$PY' '$FIX_DIR/dbgen.py' 2>&1" | tr -d '[:space:]')"
+check "DB generation matches the generation the CLI reported" "$gen_cli" "$gen_db"
+if [ -n "$gen_db" ] && [ "$gen_db" -gt "$gen0" ] 2>/dev/null; then pass "DB generation ($gen_db) is ahead of the daemon's startup generation ($gen0)"; else
+    fail "DB generation ($gen_db) did not advance past the daemon's ($gen0)"
+fi
+
 victim="$(worker_pid snapshot)"
 mark="$(log_lines)"
 msh "kill -9 $victim" || true
 if wait_log "$mark" "Restarted snapshot worker" 90; then pass "supervisor respawned the killed snapshot worker"; else
     fail "no respawn logged after killing worker $victim"
 fi
-sleep 5                                  # the new worker reads the DB at startup
+sleep 5                                  # give a (wrongly) re-reading worker time to show it
 after="$(log_since "$mark")"
-check_no_re "respawned worker read the re-imported DB without a config/permission error" "ConfigDb|EX_CONFIG|unable to open|Failed to load|ConfigPathError|SchemaError" "$after"
+newpid="$(worker_pid snapshot)"
+if [ -n "$newpid" ] && [ "$newpid" != "$victim" ] && msh "test -d /proc/$newpid"; then pass "respawned worker is a new live process (pid $victim -> $newpid)"; else
+    fail "respawned worker pid not new/alive (victim=$victim new=$newpid)"
+fi
+check_no_re "respawned worker raised no config/permission error" "ConfigDb|EX_CONFIG|unable to open|Failed to load|ConfigPathError|SchemaError" "$after"
+check_no_re "respawn logged no second configuration load" "Loading configuration from|Configuration generation" "$after"
+check "daemon log has only the startup 'Configuration generation' line (N=$gen0)" "Configuration generation $gen0" \
+    "$(msh "grep -oE 'Configuration generation [0-9]+' '$LOG'" | tr -d '\r')"
+check "pid file still shows the startup generation $gen0 while the DB is at $gen_db" "$pid_before,$gen0" "$(msh "paste -sd, '$PIDFILE'")"
+check "respawned worker (pid $newpid) holds no config.db fd (handed the config, did not read the DB)" "" "$(open_db_fds "$newpid")"
+for w in pruning api; do
+    check "$w worker still holds no config.db fd after the respawn" "" "$(open_db_fds "$(worker_pid $w)")"
+done
 daemon_active && pass "daemon alive after respawn" || fail "daemon died after worker respawn"
 
 out="$(asu "$SVC_USER" "'$PY' -m zfsbackup.daemon --test-config 2>&1")"; rc=$?
 check "$SVC_USER --test-config (concurrent with the running daemon) exits 0" "0" "$rc"
 check_re "$SVC_USER sees bob's last import (3 datasets, not root's 5)" "Datasets: 3" "$out"
 stop_daemon
+check "clean stop removed the pid file" "gone" "$(exists "$PIDFILE" && echo present || echo gone)"
 
 # ───────────────────────────────── (c) ──────────────────────────────────────
 echo
