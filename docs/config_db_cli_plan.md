@@ -26,7 +26,8 @@ carries a status note or "as landed" text — where those disagree with the prop
 | 8x `StopFlag` | done | Found during item 8 |
 | 9 Phase 1 tests | landed with 8 | Coverage audit against item 9's list is part of Checkpoint A |
 | Checkpoint A review | done | Findings, decisions and audit under "Checkpoint A" |
-| **A-1…A-9 fix-up** | **approved, in progress** | Lands before Phase 2 |
+| **A-1…A-9 fix-up** | **implemented, uncommitted** | A-9 permissions scenario outstanding |
+| **A-10…A-20 review round** | **approved, in progress** | Fixes R1–R7 from the fix-up review; committed together with A-1…A-9 |
 | 10–16 Config CLI | approved, not started | Revised after Checkpoint A; order 10 → 15 → 13 → 11 → 12 → 14 → 16 |
 | 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
 | 21–23 Docs, scenarios, final review | not started | |
@@ -1210,6 +1211,9 @@ as. "Reject" means a clean `ValueError` naming the key, raised before anything i
 | `client_id_file` non-string | TypeError | n/a | Reject |
 | dataset `name` / destination key not a string | flows through | type changes | Reject |
 | `remote_backup.enabled: null` | falsy → **disabled** | **True** (unauthenticated receive) | Normalize `False` + WARNING |
+| bool fields as integer 0/1 *(A-15)* | truthiness — behaves as written | n/a | Normalize to `False`/`True` + WARNING; other ints rejected |
+| duplicate `remote:` destination on a dataset *(A-16)* | second entry's override silently ignored | rejected by `validate_config` | Reject (incl. exact duplicates) |
+| `client_id_file: ""` in-code *(A-14.1)* | YAML `""` = derive | reloads as `Path(".")` | Store NULL + WARNING; `"."` / `Path("")` rejected |
 
 ---
 
@@ -1278,7 +1282,7 @@ A-5, A-6.
 - **Changes:**
   1. `CONFIG_DIR_MODE = 0o2770`.
   2. One helper `_ensure_mode(path, mode)` for the directory, the DB and the sidecars: lstat; equal →
-     nothing; owned (`st_uid == geteuid()`) → chmod then re-stat (Linux silently drops setgid for a
+     nothing; owned (`st_uid == geteuid()`, or this process is root — A-14.2) → chmod then re-stat (Linux silently drops setgid for a
      non-member: WARNING, not error); not owned but usable → WARNING naming owner, mode and fix;
      otherwise `ConfigDbPermissionError` saying the owner must run `chmod`.
   3. `ensure_config_db_mode` only adjusts the default path; an existing file at a non-default path is
@@ -1363,6 +1367,148 @@ A-5, A-6.
   SIGHUP-killed CLI leaves sidecars still in group `zfsbackup`; a non-default 0600 `-c` stays 0600.
   Starts after A-4. **Verify:** manual run.
 
+### Fix-up review round *(A-10…A-20, approved 2026-10-17)*
+
+The A-1…A-8 diff was reviewed by `zfs-code-reviewer` and `concurrency-reviewer` (findings R1–R7:
+scratchpad `fixup_review_findings.md`). No new hang, wedge or corruption path in a running deployment;
+A-6.1 confirmed on Python 3.11–3.14. One reproduced data-loss path (R2) and one daemon-stopping race
+(R1) must be fixed before the fix-up is committed. Lanes: **store** A-10 → A-12 → A-11 (+A-11.2) →
+A-13 → A-14; **daemon** A-15 → A-16 → A-17 → A-18 (parallel, disjoint files); then A-19; re-review by
+both reviewers (concurrency-reviewer on A-10, A-11, A-11.2, A-13); then one commit for the whole fix-up.
+
+**Decisions (user, 2026-10-17):** integers 0/1 in boolean fields are accepted with a WARNING; A-11.2
+approved; exact-duplicate remotes rejected; A-17's exit 1 approved; item 15 gains a CLI writer lock.
+
+#### A-10 — A sidecar that vanishes mid-check stops the daemon (R1)
+- `zfsbackup-store-developer` · `needs-approval` · gate + `concurrency-reviewer` · `paths.py`
+- Three sites: `check_config_db` step 7 (`paths.py:1448-1456`, daemon path → EX_CONFIG → daemon exit 1);
+  `_ensure_mode` not-owned branch (`:1113`); `_ensure_mode` owned branch (`:1089-1096`) where `os.chmod`
+  on a just-checkpointed sidecar gets ENOENT — root always takes this branch.
+- Step 7: on `_can_access` failure, `_sidecar_lstat` again — `None` → continue; present → one more
+  `_can_access`; still failing → raise from the fresh stat. Not-owned branch: same with `os.stat`
+  (keeps follow-symlink semantics; F6 stays deferred); ENOENT/ENOTDIR → return. Owned branch:
+  `FileNotFoundError` from chmod → return (debug log); other errnos unchanged.
+- A real permission problem still raises: a skip needs a positive ENOENT from a stat of that path (step 5
+  already proved the directory searchable), an existing-but-unusable sidecar still raises, no loop.
+
+#### A-11 — Failed-first-import cleanup never deletes a DB someone else uses (R2)
+- `zfsbackup-store-developer` · `needs-approval` (config write) · gate + `concurrency-reviewer` ·
+  `importer.py` (replaces `_remove_created_target`, `importer.py:276-321`, called `:433-436`).
+- Reproduced (`a4/cleanup_race.py`): a concurrent re-import that committed is deleted and its author was
+  told it succeeded; a connected reader has DB, `-wal` and `-shm` unlinked under it.
+- Algorithm:
+  1. `dispose_all()`; if it raises, remove nothing (WARNING).
+  2. `_file_id(target) != created_id` → remove nothing (replaced).
+  3. Any `-wal`/`-shm`/`-journal` present (lstat) → remove nothing: in WAL mode the last closer deletes the
+     sidecars, so after our own dispose a surviving sidecar means another connection is attached.
+  4. If `st_size > 0`, probe with a raw `sqlite3.connect(target.as_uri() + "?mode=rw", uri=True,
+     timeout=1, isolation_level=None)` (never creates; bypasses `get_engine`): `BEGIN IMMEDIATE`; empty
+     iff `global_settings` is absent or has zero rows (it is written in the same transaction as all
+     data, so it is the commit marker); `ROLLBACK`; close. Busy, any `sqlite3.Error`, or a row present
+     → remove nothing. Zero-byte files skip the probe (nobody else can have written to one).
+  5. Release the connection **before** unlinking (its last close deletes sidecars by path, which after
+     an unlink may belong to a new DB). Re-check 2 and 3 immediately before `os.unlink(target)`. The
+     remaining window (an open between that lstat and the unlink, or an open that has run no statement)
+     is named in a comment; item 15's writer lock closes it.
+  6. Never unlink a sidecar. Remove the `sidecar_baseline` plumbing (`:396`, `:402`).
+  7. Operator messages: success → INFO "removed <db>, created by this failed import"; skip → one WARNING
+     naming <db>, the reason and the next step (schema-only DB: "re-running the import reuses it";
+     zero-byte: "remove the empty <db> once nothing has it open, then retry"; another import present:
+     "another process has since imported a configuration into <db>; it was left intact; this import
+     was NOT applied"; always "never delete -wal/-shm on their own"). Cleanup errors are logged, never
+     raised. Rewrite the module docstring (`importer.py:27-34`).
+
+#### A-11.2 — Refuse a first import next to orphaned sidecars
+- `zfsbackup-store-developer` · `needs-approval` (approved) · gate + `concurrency-reviewer` · `importer.py`
+- Before `create_config_db_file` (`importer.py:398-405`), if any `-wal`/`-shm`/`-journal` is present
+  while the DB is absent, raise a `ConfigPathError` subclass naming the files: "remove them once no
+  process has them open (`fuser`/`lsof`), then retry". Nothing is created; the orphans are untouched.
+  (An orphaned `-wal`/`-journal` would otherwise be replayed into the new file; a live orphan's `-shm` is
+  shared by path.)
+
+#### A-12 — `create_config_db_file` either fully succeeds or leaves nothing (R3)
+- `zfsbackup-store-developer` · `needs-approval` · `paths.py:1662-1701`
+- On any `BaseException` after `O_EXCL` succeeds: if `fstat(fd)` and `lstat(target)` agree on (dev, ino),
+  unlink while the fd is open (best effort, logged), close, re-raise. Wrap `os.fchmod`'s `OSError` in
+  `ConfigDbPermissionError`. Kept in `paths.py` so the function is atomic for item 10's CLI as well.
+
+#### A-13 — Engine cache purges every inherited entry (R4)
+- `zfsbackup-store-developer` · `needs-approval` · gate + `concurrency-reviewer` · `db.py`
+- In `get_engine`, under the lock: for every entry with `owner_pid != pid`, `dispose(close=False)` and
+  delete; drop references; one `gc.collect()`; then the existing lookup/build. Lazy purge in
+  `get_engine`, not a `register_at_fork` hook (a hook would close connections and collect at the child's
+  most fragile moment).
+- `gc.collect()` stays inside the lock and before the build (moving it out would hand out the new engine
+  before the collect, or let another thread build in between — C1 reopens). Make `_ENGINES_LOCK` a
+  `threading.RLock()` (both at creation and in `_reinit_lock_after_fork`) so a finalizer can't
+  self-deadlock; comment why this differs from `dispose_all`.
+- Docstrings: "survivable" holds for every key unless something calls `gc.freeze()`; any future
+  `gc.freeze()` must come after `dispose_all()`.
+
+#### A-14 — Small store-side fixes
+- **A-14.1** `client_id_file` (`needs-approval`): in-code `""` → `validate_config` WARNING ("means derive
+  from $HOME; stored unset") and `save_config` writes NULL; reject any value whose `os.fspath` is `"."`
+  (`Path("")`, `Path(".")`, `"."` — they name a directory and never worked). YAML `client_id_file: "."`
+  is therefore refused at import phase 0.
+- **A-14.2** (`low-risk`): `_ensure_mode` and `ensure_config_db_mode` docstrings say "owned by this
+  process, or this process is root"; the directory keeps `S_ISVTX` (compare/chmod to
+  `mode | (actual & S_ISVTX)`); files keep the exact compare; nothing is ever widened.
+- **A-14.3** (`low-risk`) stale docs: `importer.py:347` phantom `log_warnings`; `importer.py:52-53` (modes
+  adjusted on the default path only); `paths.py:1315` (`require_writable=False` skips steps 5–7; add step
+  7 to the list); `paths.py:297-300` `CONFIG_OWNER` vs Q7; migration docstring "eight" → "nine" CHECKs
+  (docstring only); `db.py:31-33` aligned with `:732-738`.
+
+#### A-15 — Integer 0/1 in boolean fields: accept with a WARNING
+- `zfsbackup-developer` · `needs-approval` (approved) · `model.py:253` `_bool_from_config`
+- `None` unchanged; `type(v) is bool` → v; `type(v) is int and v in (0, 1)` → `bool(v)` + WARNING
+  ("<key> is the integer N; treating it as true/false — write true/false"; for `remote_backup.enabled: 1`
+  say it enables the unauthenticated receive endpoint); anything else → `ValueError`.
+- `validate_config`'s `_require_bool` stays strict: YAML-sourced configs arrive normalized; an int in an
+  in-code config is a caller bug. Item 11's `set` parses through this same guard.
+
+#### A-16 — Reject duplicate `remote:` destinations at the YAML boundary (R5)
+- `zfsbackup-developer` · `needs-approval` · `model.py:710-754`
+- Reject duplicates, including exact duplicates, in `DatasetConfig.from_dict` with `validate_config`'s
+  wording (`mapper.py:703-709`). Under decision (a) this is rejected because the YAML never meant what it
+  said (the second entry's retention was silently ignored). Import already refused it, so nothing that
+  imports today changes outcome. `from_property` untouched.
+
+#### A-17 — Supervisor exit path
+- `zfsbackup-developer` · `needs-approval` (approved) · `daemon.py`
+- `_hard_exit` exits `code or 1` when workers were abandoned (`daemon.py:691-699`, `:714`).
+- `_spawn`: record `_workers[name]` and `_started_at` right after `start()`, before the log line
+  (`:268-270`).
+
+#### A-18 — Stale daemon-side docs (`low-risk`)
+- `model.py:929-931` (`"0m"` is now rejected); `_spawn` docstring `daemon.py:249-255` aligned with
+  `db.py:732-738`; `daemon.py:45-49` — the 300s cap is unreachable with 6 failures (largest delay 80s);
+  keep it.
+
+#### A-19 — Tests (`pytest-test-author`, `low-risk`)
+- R1: lstat stat→None with access False passes; stat→stat raises; second lstat `PermissionError` →
+  `ConfigDbPermissionError`; `_ensure_mode` not-owned vanish and owned chmod-ENOENT return quietly.
+- R2 in-process: (a) A's phase 3 first runs B's full `import_yaml` on the same path, then raises
+  "database is locked" → DB survives with B's config and the WARNING says so; (b) a raw sqlite3 reader
+  that has read → DB, `-wal`, `-shm` keep their inodes and the reader still reads; (c) a zero-byte file
+  from a phase-2 failure is removed; (d) a busy probe removes nothing; existing cleanup tests stay green;
+  optional cross-process variant (`integration`).
+- A-11.2: refused, nothing created, orphan untouched.
+- R3: `fchown`/`fchmod` failure or KeyboardInterrupt leaves nothing; retry gives `created=True`.
+- R4: one `get_engine` purges other-key foreign-pid entries and collects once (patched `os.getpid`);
+  other-key fork test with GC disabled in the child.
+- R5: duplicate and exact-duplicate remotes rejected by `from_file`; importing one creates nothing.
+- R6: `client_id_file` `""` → NULL + warning, reloads `None`; `Path("")`/`"."` rejected; 3770 directory
+  keeps its sticky bit; abandoned workers with code 0 exit 1; `_spawn` records the worker even if the
+  log call raises.
+- Bools: four fields × 0/1 → bool + warning through both doors; `2`, `-1`, `1.0`, `"1"` rejected;
+  in-code int still rejected by `validate_config`; flip `dataset-enabled-int`
+  (`test_zfsbackup_config_audit.py:276`) and `enabled-int`/`dry-run-int` (`:509`).
+- Leave `test_require_writable_false_skips_the_sidecar_check` as is.
+
+#### A-20 — Plan doc (main session, `low-risk`)
+- Audit-table rows, A-4.2 owner wording, item 10.2/11/15 amendments — done with this insertion.
+
+
 ---
 
 ## Phase 2 — Config CLI *(revised after Checkpoint A, approved 2026-10-17)*
@@ -1401,7 +1547,8 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
 - **10.2** — `zfsbackup-cli-developer` · `needs-approval`.
   - **Files:** new `zfsbackup/cli/{__init__,__main__,main,render,errors}.py`; `pyproject.toml`.
   - **Global:** `zfsbackup-config [-c DB] [-v]`, path from `resolve_config_path` with the daemon's order
-    (6b). Only `import` may create a DB. One error-mapping module; exit codes 0 ok, 1 invalid/refused,
+    (6b). Only `import` may create a DB. Show A-11's "cleanup skipped" WARNING together with the import
+    error (e.g. `exc.add_note`). One error-mapping module; exit codes 0 ok, 1 invalid/refused,
     2 usage, 75 conflict/busy (retryable), 78 config DB unusable.
   - **`import <yaml>`:** always a full replace (no `--replace` flag — item 8). Prints warnings from
     `from_file` and `validate_config`. Writes `<dbdir>/<dbname>.pre-import-<UTC>.yaml` (O_EXCL, 0660)
@@ -1455,6 +1602,12 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
   - **Verify:** `pytest tests/test_zfsbackup_daemon.py tests/test_zfsbackup_workers.py
     tests/test_zfsbackup_runtime_config.py -k "generation or handoff or daemon_lock or
     schema_in_snapshot"`
+- **15.4 — CLI writer lock** *(added by the A-11 review round, approved)* — `zfsbackup-store-developer`
+  (lock helper) → `zfsbackup-cli-developer` (use). `flock(LOCK_EX)` on `<db>.writer.lock` (0660, in the
+  setgid directory, never deleted; not `<db>.lock`, which SQLite's unix-dotfile VFS uses). Every CLI write
+  takes it, including `import`, which takes it before phase 1 decides whether the file exists and holds it
+  through cleanup — serialising a first import against a concurrent re-import so A-11's unlink happens
+  under the lock. A-11's cleanup also skips the unlink when 15.2(c)'s `daemonlock.probe()` finds a daemon.
 - **15.3** — `zfsbackup-cli-developer` · `needs-approval`. Every write: snapshot → mutate/parse →
   `validate_config` (print warnings) → `write_config(expected_generation)`. `dispose_all()` before
   launching `$EDITOR` or prompting — nothing stays open. `ConfigConflict` → exit 75 "config changed
@@ -1487,7 +1640,9 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
     removes the role.
 - **Not addressable:** names (`rename`) and membership — adding/removing datasets, attaching/detaching
   destinations (`edit`). The error points there.
-- **Coercion:** booleans from a fixed CLI word set; durations and ports via A-1's guards; ≤ 0 rejected.
+- **Coercion:** values are parsed through the same YAML-boundary guards as `from_file` (so `set … enabled 1`
+  gets A-15's accept-with-warning); durations and ports via A-1's guards; ≤ 0 rejected; `client_id_file ""`
+  means unset (A-14.1).
 - **Verify:** `pytest tests/test_zfsbackup_cli.py -k dotpath`, including dotted names.
 
 ### Item 12 — Whole-config `$EDITOR` round-trip
