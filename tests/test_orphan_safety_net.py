@@ -334,8 +334,9 @@ class TestSessionMarker:
         marker = os.environ["ZFSB_TEST_SESSION"]
         root = int(os.environ["ZFSB_TEST_SESSION_OWNER"])        # the controller (or the plain process)
         before = {row[0] for row in find_orphans(marker, grace=0, root_pid=root)}
+        tag = uuid.uuid4().hex     # on Linux the row text is the environment only (no command line)
         victim = subprocess.Popen(
-            [sys.executable, "-c", ORPHANER], env=dict(os.environ),   # carries the OUTER marker
+            [sys.executable, "-c", ORPHANER], env=dict(os.environ, ZFSB_ORPHAN_TAG=tag),   # carries the OUTER marker
         )
         victim.wait()
         found = []
@@ -344,7 +345,7 @@ class TestSessionMarker:
             while not found and time.monotonic() < deadline:
                 found = [
                     row for row in find_orphans(marker, grace=0, root_pid=root)
-                    if row[0] not in before and "time.sleep(120)" in row[3]
+                    if row[0] not in before and tag in row[3]
                 ]
                 time.sleep(0.1)
             assert found, "the staged orphan should be visible to the outer session"

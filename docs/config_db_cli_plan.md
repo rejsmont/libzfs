@@ -39,7 +39,7 @@ carries a status note or "as landed" text — where those disagree with the prop
 | **Phase 3 (live reload)** | **implemented 2026-10-18** (00cbb8c, 7b77735) | Gates G1–G4 passed; mocked suite 5701 passed. Remaining: 22 (VM scenarios, incl. Linux-only tests), 23 (final review) |
 | 10–16 Config CLI | done | Landed in order 10 → 15 → 13 → 11 → 12 → 14 → 16; see the per-item "as landed" notes |
 | 17–20 Live reload | done | 17.0 → G1; 18.0, 17.1, 18.1–18.5 → G2; 17.2 → G3; 19.1, 19.2 → G4; tests (20) alongside each |
-| 21–23 Docs, scenarios, final review | 21 done (README, CLAUDE.md); 22, 23 in progress | |
+| 21–23 Docs, scenarios, final review | 21, 22 done; 23 next | 22: Linux mocked suite on zfsb-perm 5705 passed (2 VM-timer-sensitive controls fail; all 13 Linux-only signal tests pass as user and root); `test_config_permissions.sh` 230/0 incl. live-reload group (f); `test_two_vm_backup.sh` 50/0 incl. reload during send/receive and kill -9 survivor wait. Open for 23: SQLAlchemy 2.1 emits DOUBLE vs the baseline's FLOAT (pin `<2.1` or make the model explicit) |
 
 > *(Historical — written for Phases 0–2; the reload design described here is superseded by the revised Phase 3 section.)* **All design questions are settled; no open decisions remain.** Items 2 (duration handling) and 5 (fork
 > safety) were the gating pair: **item 2 = full `Duration` value type** subclassing `timedelta`, with

@@ -1387,6 +1387,9 @@ class TestPidIsAlive:
                 raise effect
 
         monkeypatch.setattr(daemonlock.os, "kill", fake_kill)
+        # On Linux the zombie check (`procident.is_zombie`) falls back to its own kill(pid, 0)
+        # for a pid with no /proc entry; this test is about pid_is_alive's probe alone.
+        monkeypatch.setattr(daemonlock.procident, "is_zombie", lambda pid: None)
         assert daemonlock.pid_is_alive(4321) is expected
         assert calls == [(4321, 0)]  # signal 0: existence only, nothing is delivered
 
@@ -2634,6 +2637,11 @@ class TestRequestReloadOutcomes:
     def test_a_lock_table_that_cannot_be_read_is_unverified(self, db, start_helper, monkeypatch, spy):
         helper = start_helper(db)
         monkeypatch.setattr(procident, "flock_write_holders", lambda fd: None)
+        # The detail names the reason; on Linux the real reason would be "unknown", so pin the
+        # platform-dependent one this test asserts on.
+        monkeypatch.setattr(
+            procident, "flock_holders_unavailable_reason", lambda fd: procident.UNAVAILABLE_NOT_LINUX
+        )
         result = daemonlock.request_reload(db)
         assert result.outcome == "unverified"
         assert "Linux" in result.detail
@@ -2838,7 +2846,12 @@ class TestRequestReloadRealLockProof:
 
     def test_a_genuine_supervisor_is_proven_and_signalled(self, db, start_helper, spy):
         helper = start_helper(db)
-        assert helper.pid in procident.flock_write_holders(os.stat(lock_path(db)).st_ino)
+        fd = os.open(lock_path(db), os.O_RDONLY)
+        try:
+            holders = procident.flock_write_holders(fd)   # takes the open pid-file fd (device + inode)
+        finally:
+            os.close(fd)
+        assert holders is not None and helper.pid in holders
         assert daemonlock.request_reload(db).outcome == "signalled"
         assert helper.wait_for("HUP")
 

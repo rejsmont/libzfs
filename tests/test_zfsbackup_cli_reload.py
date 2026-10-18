@@ -654,6 +654,9 @@ class TestEveryOutcomeIsExitZero:
         assert generation(db) == gen + 1
         last = result.stdout.splitlines()[-1]
         assert last.startswith(f"config updated (generation {gen + 1})")
+        if sys.platform == "linux" and fragment == "can be verified only on Linux":
+            # The platform wording is for non-Linux hosts; on Linux the daemon's own detail is shown.
+            fragment = "(verified only on Linux)"
         assert fragment in last
 
     def test_a_broken_stdout_does_not_change_the_exit_code(self, run, rich, db, monkeypatch):

@@ -13,14 +13,16 @@
 #       2770 root:zfsbackup (Q7 chgrp), database 660 group zfsbackup.
 #   (b) the daemon runs as zfsbackup while alice (then bob) re-import: the import succeeds
 #       (no EPERM), the daemon keeps running. Item 15.2: the supervisor reads the config DB ONCE
-#       (logs "Configuration generation N, schema revision R", records "pid\ngeneration\n" in
-#       <db>.daemon.pid) and hands it to every worker; workers hold no config.db fd. So after a
-#       re-import bumps the DB generation, a kill -9'd-and-respawned worker keeps the STARTUP
-#       generation N (no second load logged, pid file still N, DB at N+k, no config.db fd), the
-#       CLI tells the operator "running daemon pid P is on generation N and will not apply this
-#       until restarted" (also as group operator alice, whose probe is read-only), a second daemon
-#       on the same DB exits 1 naming the first pid, and <db>.writer.lock / <db>.daemon.pid are
-#       0660 group zfsbackup.
+#       (logs "Configuration generation N, schema revision R" once, records the pid file v2 --
+#       "pid\ngeneration\nstart=..\napplied=<store>:<gen>" -- in <db>.daemon.pid) and hands it to
+#       every worker; workers hold no config.db fd. Phase 3 (live reload): the operators' imports
+#       cannot SIGHUP a daemon of another uid, so the CLI says "runs as another user and was not
+#       signalled; it picks up the change within 10s" (never "restart"), the daemon's generation poll
+#       accepts them (trigger: poll), every worker turns over (supervisor pid unchanged),
+#       `status --wait` reports "in sync", a kill -9'd-and-respawned worker is handed the supervisor's
+#       CURRENT config (no second load logged, pid file applied=<DB generation>, no config.db fd),
+#       a second daemon on the same DB exits 1 naming the first pid, and <db>.writer.lock /
+#       <db>.daemon.pid are 0660 group zfsbackup.
 #   (c) alice's process is the FIRST opener of the DB and is killed with SIGHUP while holding
 #       it: the leftover -wal/-shm sit in group zfsbackup (setgid directory) and the daemon
 #       user can still open the DB.
@@ -31,6 +33,24 @@
 #       ConfigDbPermissionError (exit non-zero, names the sidecar and the fix) instead of the
 #       opaque "unable to open database file". (e2) the full daemon refuses to start over the
 #       same state and starts no workers.
+#   (f) live config reload (Phase 3), the daemon running as zfsbackup:
+#       f1 root `set` -> verified and SIGHUPed ("accepted"/"now on", log "trigger: SIGHUP" within 5s,
+#          snapshot/pruning/api pids change, supervisor's does not, pid file applied=<store>:<gen>,
+#          `status` in sync, `status --wait`); an unchanged SIGHUP logs "unchanged", restarts nothing;
+#       f2 group operator alice `set` -> EPERM path: "not signalled; it picks up the change within 10s",
+#          the poll accepts it ("trigger: poll") within 15s;
+#       f3 the service user's own `set` -> signalled (same uid);
+#       f5 a raw sqlite3 UPDATE that makes the stored config invalid and bumps the generation, then
+#          SIGHUP -> "rejected", pids unchanged, pid file rejected=, unit active, status reports it
+#          (`--wait` exits 1), and a good re-import is accepted and clears rejected=;
+#       f4 forgery: a holder (alice) locks the pid file and names a root-owned decoy `sleep 600` with
+#          its correct start token (root-owned pid file -> lock-table proof refuses; alice-owned ->
+#          owner check refuses); root `set` never signals the decoy;
+#       f6 a CLI write during daemon startup: first deterministically (a stand-in surviving worker
+#          holds <db>.workers.lock, so the new daemon sits in its startup wait while the CLI writes and
+#          SIGHUPs it), then three times racing the CLI against a cold start. The daemon stays up and
+#          ends up on the new generation.
+#       The start method on the VM is recorded (forkserver on Python >= 3.14).
 #
 # Daemon choice: the point is DB ACCESS, not ZFS operations, so the daemon runs `--dry-run`
 # against a STUB `zfs`/`zpool` (the same trick .github/workflows/tests.yml uses) — no pool, no
@@ -315,6 +335,48 @@ info = daemonlock.probe(resolve_config_path(None))
 print("none" if info is None else "pid=%s generation=%s" % (info.pid, info.generation))
 EOF
     put_file "$t/probe.py" "$FIX_DIR/probe.py" 644
+    # forger.py: group (f4). Take LOCK_EX on a pid file and write a FORGED pid file naming some other
+    # process (pid + its correct start token), then hold the lock until killed. Prints READY.
+    # usage: forger.py <pidfile> <pid> <start-token> <store-id> <generation>
+    cat > "$t/forger.py" <<'EOF'
+import fcntl, os, sys, time
+path, pid, token, store, gen = sys.argv[1:6]
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o660)
+fcntl.flock(fd, fcntl.LOCK_EX)
+text = "%s\n%s\nstart=%s\napplied=%s:%s\n" % (pid, gen, token, store, gen)
+os.pwrite(fd, text.encode(), 0)
+os.ftruncate(fd, len(text))
+print("READY", flush=True)
+time.sleep(600)
+EOF
+    put_file "$t/forger.py" "$FIX_DIR/forger.py" 644
+    # wlock.py: group (f6b). Hold a SHARED lock on <db>.workers.lock, as a surviving worker of a previous
+    # daemon would. usage: wlock.py <workers-lock-path>
+    cat > "$t/wlock.py" <<'EOF'
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDONLY)
+fcntl.flock(fd, fcntl.LOCK_SH)
+print("READY", flush=True)
+time.sleep(600)
+EOF
+    put_file "$t/wlock.py" "$FIX_DIR/wlock.py" 644
+    # startmethod.py: the multiprocessing start method the daemon gets on this VM.
+    cat > "$t/startmethod.py" <<'EOF'
+import multiprocessing as m
+print(m.get_start_method())
+EOF
+    put_file "$t/startmethod.py" "$FIX_DIR/startmethod.py" 644
+    # breakconfig.py: group (f5). Make the stored config invalid (api_port out of range) with a RAW
+    # sqlite3 UPDATE that also bumps the generation - what a hand-edit or a buggy tool would do.
+    cat > "$t/breakconfig.py" <<'EOF'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1], timeout=20)
+con.execute("UPDATE global_settings SET api_port = 70000, generation = generation + 1")
+con.commit()
+print("generation", con.execute("SELECT generation FROM global_settings").fetchone()[0])
+con.close()
+EOF
+    put_file "$t/breakconfig.py" "$FIX_DIR/breakconfig.py" 644
     rm -rf "$t"
 
     # fixtures from the committed example
@@ -335,7 +397,7 @@ exists()   { msh "test -e '$1'" 2>/dev/null; }
 
 stop_daemon() {
     # All suppression happens in the guest; host stdout is never sent to /dev/null.
-    msh "{ systemctl stop $UNIT; systemctl reset-failed $UNIT; systemctl stop $HOLD_UNIT; systemctl reset-failed $HOLD_UNIT; } >/dev/null 2>&1; true" || true
+    msh "{ systemctl stop $UNIT; systemctl reset-failed $UNIT; systemctl stop $HOLD_UNIT; systemctl reset-failed $HOLD_UNIT; systemctl stop $FORGE_UNIT $DECOY_UNIT $WLOCK_UNIT; systemctl reset-failed $FORGE_UNIT $DECOY_UNIT $WLOCK_UNIT; } >/dev/null 2>&1; true" || true
 }
 
 # Wipe the default config state: units, DB + WAL sidecars (all three — a stale -wal next to a
@@ -343,7 +405,7 @@ stop_daemon() {
 reset_default_state() { # reset_default_state [keep-dir]
     stop_daemon
     local rmdir="rm -rf '$CFG_DIR'"; [ -n "${1:-}" ] && rmdir=":"
-    msh "{ rm -f '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock'; $rmdir; } >/dev/null 2>&1; : >'$LOG'; chown '$SVC_USER' '$LOG'; true" || true
+    msh "{ rm -f '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock' '$DB.workers.lock'; $rmdir; } >/dev/null 2>&1; : >'$LOG'; chown '$SVC_USER' '$LOG'; true" || true
 }
 
 start_daemon() { # start_daemon [extra daemon args...]  — runs as $SVC_USER on the default DB
@@ -359,8 +421,8 @@ daemon_pid()    { msh "systemctl show -p MainPID --value $UNIT" | tr -d '[:space
 # Worker pids come from the supervisor's own "Started <name> worker (pid=N)" log lines (the
 # last one wins, so respawns are followed). `pgrep -P` is NOT used: the supervisor's startup
 # also spawns short-lived `zfs` children that it would pick up.
-worker_pid() { # worker_pid <snapshot|pruning|api>
-    msh "grep -oE '(Started|Restarted) $1 worker \\(pid=[0-9]+\\)' '$LOG' | tail -n1 | grep -oE '[0-9]+'" 2>/dev/null | tr -d '[:space:]'
+worker_pid() { # worker_pid <snapshot|pruning|api>   (a live reload logs "Reloaded <name> worker")
+    msh "grep -oE '(Started|Restarted|Reloaded) $1 worker \\(pid=[0-9]+\\)' '$LOG' | tail -n1 | grep -oE '[0-9]+'" 2>/dev/null | tr -d '[:space:]'
 }
 wait_workers_started() { # all three workers spawned (api is spawned last)
     local waited=0
@@ -379,6 +441,19 @@ open_db_fds() {
 mode_group() { stat_of "$1" | awk '{print $1, $3}'; }
 PIDFILE="${DB}.daemon.pid"
 WLOCK="${DB}.writer.lock"
+WORKERS_LOCK="${DB}.workers.lock"
+FORGE_UNIT="zfsperm-forger"
+WLOCK_UNIT="zfsperm-wlock"
+DECOY_UNIT="zfsperm-decoy"
+# Pid file v2: lines 1-2 are "pid" and "generation"; from line 3 on, key=value lines
+# (start=, applied=<store>:<gen>, target=, rejected=).
+pf2()    { msh "head -n2 '$PIDFILE' | paste -sd,"; }                    # "<pid>,<generation>"
+pf_val() { msh "sed -n 's/^$1=//p' '$PIDFILE' 2>/dev/null | head -n1" | tr -d '[:space:]'; }
+# cli_as <who> <zfsbackup-config args...>  — who is root (via msh) or a user (via asu)
+cli_as() {
+    local who="$1"; shift
+    if [ "$who" = root ]; then msh "'$ENV_WRAP' '$PY' -m zfsbackup.cli $* 2>&1"; else asu "$who" "'$PY' -m zfsbackup.cli $* 2>&1"; fi
+}
 log_lines()  { msh "wc -l < '$LOG'" | tr -d '[:space:]'; }
 log_since()  { msh "tail -n +$(( $1 + 1 )) '$LOG'"; }
 
@@ -386,6 +461,26 @@ wait_log() { # wait_log <from-line> <ERE> [timeout]  — wait for a pattern afte
     local from="$1" re="$2" timeout="${3:-$DAEMON_TIMEOUT}" waited=0
     while :; do
         log_since "$from" | grep -qE -- "$re" && return 0
+        [ "$waited" -ge "$timeout" ] && return 1
+        sleep 2; waited=$((waited+2))
+    done
+}
+# wait_workers_changed "<snapshot pid> <pruning pid> <api pid>" [timeout] — every worker pid differs from the old one
+wait_workers_changed() {
+    local timeout="${2:-45}" waited=0 b_snap b_prune b_api
+    read -r b_snap b_prune b_api <<<"$1"
+    while :; do
+        [ "$(worker_pid snapshot)" != "$b_snap" ] && [ "$(worker_pid pruning)" != "$b_prune" ] \
+            && [ "$(worker_pid api)" != "$b_api" ] && return 0
+        [ "$waited" -ge "$timeout" ] && return 1
+        sleep 2; waited=$((waited+2))
+    done
+}
+# wait_pf_re <key> <ERE> [timeout] — wait until the pid file's key=value line matches
+wait_pf_re() {
+    local key="$1" re="$2" timeout="${3:-45}" waited=0
+    while :; do
+        pf_val "$key" | grep -qE -- "$re" && return 0
         [ "$waited" -ge "$timeout" ] && return 1
         sleep 2; waited=$((waited+2))
     done
@@ -470,8 +565,9 @@ gen0="$(msh "grep -oE 'Configuration generation [0-9]+' '$LOG' | head -n1 | grep
 check_re "daemon logs 'Configuration generation N, schema revision R' at startup" \
     "Configuration generation [0-9]+, schema revision [0-9a-f]+" "$(msh "cat '$LOG'")"
 check "startup load logged exactly once" "1" "$(msh "grep -c 'Configuration generation' '$LOG'" | tr -d '[:space:]')"
-check "pid file is '<supervisor pid>,<startup generation>' ($pid_before,$gen0)" "$pid_before,$gen0" \
-    "$(msh "paste -sd, '$PIDFILE'")"
+check "pid file starts '<supervisor pid>,<startup generation>' ($pid_before,$gen0)" "$pid_before,$gen0" "$(pf2)"
+check_re "pid file is v2: it carries a start= token (reload-capable)" "^linux:[0-9]+\$" "$(pf_val start)"
+check_re "pid file records applied=<store>:$gen0" "^[0-9]+:$gen0\$" "$(pf_val applied)"
 check "pid file is 660 group $SVC_GROUP" "660 $SVC_GROUP" "$(mode_group "$PIDFILE")"
 check "writer lock file exists and is 660 group $SVC_GROUP" "660 $SVC_GROUP" "$(mode_group "$WLOCK")"
 check "supervisor has no config.db fd open (it disposed its reader)" "" "$(open_db_fds "$pid_before")"
@@ -493,7 +589,7 @@ check "second daemon on the same DB exits 1" "1" "$rc"
 check_re "second daemon names the first daemon's pid ($pid_before)" "daemon \(pid $pid_before\) is already running" "$out"
 check_no_re "second daemon started no workers" "Started .* worker" "$out"
 daemon_active && pass "first daemon unaffected by the refused second one" || fail "first daemon died"
-check "pid file untouched by the refused second daemon" "$pid_before,$gen0" "$(msh "paste -sd, '$PIDFILE'")"
+check "pid file untouched by the refused second daemon" "$pid_before,$gen0" "$(pf2)"
 
 for op in alice bob; do
     out="$(asu "$op" "'$PY' -m zfsbackup.cli import '$FIX_DIR/$op.yaml' 2>&1")"; rc=$?
@@ -508,29 +604,55 @@ for op in alice bob; do
         fail "$op's re-import reported no pre-import backup path: $(printf '%s' "$out" | tr '\n' '|' | cut -c1-300)"
     fi
     check_no_re "$op's re-import: no EPERM / permission / open failure" "EPERM|Operation not permitted|Permission denied|PermissionError|unable to open" "$out"
-    check_re "$op's CLI says daemon pid $pid_before is on generation $gen0 and will not apply the import" \
-        "running daemon pid $pid_before is on generation $gen0 and will not apply this until restarted" "$out"
+    # Phase 3: the CLI cannot signal a daemon of another uid (operators are not the service user), so it
+    # says so and promises the poll will pick the write up. It never says "restart".
+    check_re "$op's CLI says daemon pid $pid_before runs as another user, was not signalled, and picks the import up within 10s" \
+        "daemon pid $pid_before runs as another user and was not signalled; it picks up the change within 10s" "$out"
+    check_no_re "$op's CLI no longer tells the operator to restart the daemon" "until restarted|restart it" "$out"
 done
 check "database still 660 group $SVC_GROUP after operators' imports" "660 root $SVC_GROUP" "$(stat_of "$DB")"
 check "directory still 2770 root:$SVC_GROUP after operators' imports" "2770 root $SVC_GROUP" "$(stat_of "$CFG_DIR")"
 
 daemon_active && pass "daemon still running after the operators' imports" || fail "daemon died during operators' imports"
 check "supervisor pid unchanged" "$pid_before" "$(daemon_pid)"
-check "no worker was restarted by the imports" "$workers_before" "snapshot=$(worker_pid snapshot) pruning=$(worker_pid pruning) api=$(worker_pid api)"
-check_no_re "no worker exit logged during the imports" "exited with" "$(log_since "$mark_imports")"
+# Phase 3 (live reload): nothing signalled the daemon, so its 10s generation poll picks the imports up,
+# and every worker turns over at a safe point - the pids change, the supervisor's does not.
+if wait_log "$mark_imports" "accepted \\(was [0-9]+; trigger: poll\\)" 25; then
+    pass "daemon picked the operators' imports up by its generation poll (trigger: poll)"
+else
+    fail "daemon never accepted the operators' imports by poll: $(log_since "$mark_imports" | tail -n 8 | tr '\n' '|')"
+fi
+asu bob "'$PY' -m zfsbackup.cli status --wait 40 >/dev/null 2>&1" ; rc=$?
+check "bob's 'status --wait 40' reports the daemon in sync with the imports (exit 0)" "0" "$rc"
+check_no_re "no worker crash logged while applying the imports" "exited with code [1-9]|crash" "$(log_since "$mark_imports")"
+if [ "$(worker_pid snapshot)" != "$(printf '%s' "$workers_before" | sed -n 's/.*snapshot=\([0-9]*\).*/\1/p')" ]; then
+    pass "workers were turned over onto the imported configuration (new pids, same supervisor)"
+else
+    fail "snapshot worker pid unchanged after the imports were applied"
+fi
 
-# Item 15.2(b): a respawned worker gets the supervisor's STARTUP config; it does not re-read the DB.
-# Bump the DB generation with one more operator re-import, THEN kill -9 a worker.
+# Item 15.2(b): a respawned worker is handed the supervisor's CURRENT config; it does not read the DB.
+# (Phase 3: "current" now follows the DB through the supervisor's reloads, but only the supervisor reads.)
+# Bump the DB generation with one more operator re-import, let the daemon apply it, THEN kill -9 a worker.
 out="$(asu bob "'$PY' -m zfsbackup.cli import --no-backup '$FIX_DIR/bob.yaml' 2>&1")"; rc=$?
 check "bob's re-import before the kill exits 0" "0" "$rc"
-check_re "CLI notice on the re-import: daemon pid $pid_before is on generation $gen0, will not apply it" \
-    "running daemon pid $pid_before is on generation $gen0 and will not apply this until restarted" "$out"
+check_re "CLI notice on the re-import: daemon pid $pid_before was not signalled, picks it up within 10s" \
+    "daemon pid $pid_before runs as another user and was not signalled; it picks up the change within 10s" "$out"
 gen_cli="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
 gen_db="$(asu "$SVC_USER" "'$PY' '$FIX_DIR/dbgen.py' 2>&1" | tr -d '[:space:]')"
 check "DB generation matches the generation the CLI reported" "$gen_cli" "$gen_db"
 if [ -n "$gen_db" ] && [ "$gen_db" -gt "$gen0" ] 2>/dev/null; then pass "DB generation ($gen_db) is ahead of the daemon's startup generation ($gen0)"; else
     fail "DB generation ($gen_db) did not advance past the daemon's ($gen0)"
 fi
+asu bob "'$PY' -m zfsbackup.cli status --wait 40 >/dev/null 2>&1" ; rc=$?
+check "daemon applies bob's last import by poll ('status --wait 40' exits 0)" "0" "$rc"
+check "pid file now records applied=<store>:$gen_db and line 2 = $gen_db" "$pid_before,$gen_db" "$(pf2)"
+check_re "pid file applied= is the DB generation $gen_db" "^[0-9]+:$gen_db\$" "$(pf_val applied)"
+check "supervisor pid still unchanged after the poll-applied reloads" "$pid_before" "$(daemon_pid)"
+for w in snapshot pruning api; do
+    check "$w worker (pid $(worker_pid $w)) still holds no config.db fd after the reload (config handed over, not read)" "" "$(open_db_fds "$(worker_pid $w)")"
+done
+check "supervisor still holds no config.db fd after the reloads" "" "$(open_db_fds "$pid_before")"
 
 victim="$(worker_pid snapshot)"
 mark="$(log_lines)"
@@ -546,9 +668,9 @@ if [ -n "$newpid" ] && [ "$newpid" != "$victim" ] && msh "test -d /proc/$newpid"
 fi
 check_no_re "respawned worker raised no config/permission error" "ConfigDb|EX_CONFIG|unable to open|Failed to load|ConfigPathError|SchemaError" "$after"
 check_no_re "respawn logged no second configuration load" "Loading configuration from|Configuration generation" "$after"
-check "daemon log has only the startup 'Configuration generation' line (N=$gen0)" "Configuration generation $gen0" \
+check "daemon log has only the startup 'Configuration generation' line (N=$gen0): reloads do not re-log it" "Configuration generation $gen0" \
     "$(msh "grep -oE 'Configuration generation [0-9]+' '$LOG'" | tr -d '\r')"
-check "pid file still shows the startup generation $gen0 while the DB is at $gen_db" "$pid_before,$gen0" "$(msh "paste -sd, '$PIDFILE'")"
+check "a worker respawn leaves the pid file on the applied generation $gen_db" "$pid_before,$gen_db" "$(pf2)"
 check "respawned worker (pid $newpid) holds no config.db fd (handed the config, did not read the DB)" "" "$(open_db_fds "$newpid")"
 for w in pruning api; do
     check "$w worker still holds no config.db fd after the respawn" "" "$(open_db_fds "$(worker_pid $w)")"
@@ -692,6 +814,299 @@ if start_holder alice; then
 else
     fail "could not start alice's holder (e)"
 fi
+stop_daemon
+
+# ───────────────────────────────── (f) ──────────────────────────────────────
+# Phase 3 (live reload). The daemon runs as $SVC_USER under its transient unit; the CLI writers are root,
+# a group operator (alice: a different uid, so SIGHUP is EPERM) and $SVC_USER itself (same uid).
+echo
+step "CHECK (f) — live config reload (SIGHUP and the 10s generation poll)"
+START_METHOD="$(msh "'$ENV_WRAP' '$PY' '$FIX_DIR/startmethod.py'" | tr -d '[:space:]')"
+info "multiprocessing start method on $PERM_VM: ${START_METHOD:-unknown} (fork on Linux<=3.13, forkserver on >=3.14)"
+check_re "the daemon's start method is a known platform default" "^(fork|forkserver|spawn)\$" "$START_METHOD"
+
+reset_default_state                      # also removes <db>.workers.lock; root re-creates the directory
+out="$(msh "'$ENV_WRAP' '$PY' -m zfsbackup.cli import '$FIX_DIR/root.yaml' 2>&1")"; rc=$?
+check "(f) seed: root imports the 5-dataset fixture" "0" "$rc"
+start_daemon
+wait_workers_started || warn "workers did not all start"
+daemon_active && pass "(f) daemon started as $SVC_USER" || fail "(f) daemon not active: $(msh "tail -n 15 '$LOG'")"
+sup="$(daemon_pid)"
+g0="$(pf_val applied | cut -d: -f2)"
+check_re "(f) daemon is reload-capable: pid file has start= and applied=<store>:<gen>" "^[0-9]+\$" "$g0"
+check "(f) workers lock file exists next to the DB, 660 group $SVC_GROUP" "660 $SVC_GROUP" "$(mode_group "$WORKERS_LOCK")"
+info "supervisor pid=$sup applied generation=$g0"
+
+# --- (f1) root writes: same-uid-or-root signalling path ------------------------------------------
+echo
+step "CHECK (f1) — root 'set': the CLI SIGHUPs the verified daemon"
+w_before="$(worker_pid snapshot) $(worker_pid pruning) $(worker_pid api)"
+mark="$(log_lines)"
+out="$(cli_as root set check_interval 2m)"; rc=$?
+check "(f1) root 'set check_interval 2m' exits 0" "0" "$rc"
+g1="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+check_re "(f1) CLI reports the reload request to daemon pid $sup" "reload requested from daemon pid $sup" "$out"
+check_re "(f1) CLI reports the daemon accepted it ('accepted' or 'now on')" "accepted generation $g1|now on generation $g1" "$out"
+check_no_re "(f1) CLI does not tell the operator to restart" "restart" "$out"
+if wait_log "$mark" "configuration generation $g1 accepted \\(was $g0; trigger: SIGHUP\\)" 6; then
+    pass "(f1) daemon logs 'generation $g1 accepted (was $g0; trigger: SIGHUP)' within 5s"
+else
+    fail "(f1) no 'accepted ... trigger: SIGHUP' for generation $g1 within 5s: $(log_since "$mark" | tail -n 8 | tr '\n' '|')"
+fi
+if wait_workers_changed "$w_before" 45; then
+    pass "(f1) snapshot, pruning and api workers all got new pids (turnover)"
+else
+    fail "(f1) not every worker turned over: before=[$w_before] now=[$(worker_pid snapshot) $(worker_pid pruning) $(worker_pid api)]"
+fi
+check "(f1) supervisor pid unchanged" "$sup" "$(daemon_pid)"
+if wait_pf_re applied "^[0-9]+:$g1\$" 45; then pass "(f1) pid file shows applied=<store>:$g1"; else
+    fail "(f1) pid file never showed applied=...:$g1 (applied='$(pf_val applied)' target='$(pf_val target)')"
+fi
+check "(f1) pid file line 2 is the applied generation $g1" "$sup,$g1" "$(pf2)"
+check "(f1) pid file has no target= once the reload completed" "" "$(pf_val target)"
+check_re "(f1) daemon logs 'generation $g1 applied by all workers'" "generation $g1 applied by all workers" "$(log_since "$mark")"
+check_re "(f1) the log names the new worker generation ('Reloaded <name> worker ... on generation $g1')" \
+    "Reloaded (snapshot|pruning|api) worker \\(pid=[0-9]+\\) on generation $g1" "$(log_since "$mark")"
+check_re "(f1) 'Reloading:' summary lists the changed setting" "Reloading: generation $g0 -> $g1 .*settings changed: check_interval" "$(log_since "$mark")"
+for w in snapshot pruning api; do
+    check "(f1) reloaded $w worker (pid $(worker_pid $w)) holds no config.db fd" "" "$(open_db_fds "$(worker_pid $w)")"
+done
+out="$(cli_as root status)"; rc=$?
+check "(f1) root 'status' exits 0" "0" "$rc"
+check_re "(f1) status: verdict 'in sync'" "^status: +in sync" "$out"
+check_re "(f1) status: names the daemon pid and reload-capable: yes" "daemon: +pid $sup \\(reload-capable: yes\\)" "$out"
+check_re "(f1) status: applied is generation $g1" "applied: +store [0-9]+, generation $g1" "$out"
+out="$(cli_as root status --wait 15)"; rc=$?
+check "(f1) root 'status --wait 15' exits 0 (already in sync)" "0" "$rc"
+# SIGHUP with an unchanged database: "unchanged", and no worker restarts.
+w_before="snapshot=$(worker_pid snapshot) pruning=$(worker_pid pruning) api=$(worker_pid api)"
+mark="$(log_lines)"
+msh "systemctl kill -s HUP --kill-whom=main $UNIT" || warn "systemctl kill failed"
+if wait_log "$mark" "SIGHUP: configuration unchanged \\(generation $g1\\)" 6; then
+    pass "(f1) SIGHUP with an unchanged DB logs 'configuration unchanged (generation $g1)'"
+else
+    fail "(f1) no 'unchanged' line after SIGHUP: $(log_since "$mark" | tail -n 5 | tr '\n' '|')"
+fi
+sleep 6
+check "(f1) an unchanged SIGHUP restarts no worker" "$w_before" "snapshot=$(worker_pid snapshot) pruning=$(worker_pid pruning) api=$(worker_pid api)"
+daemon_active && pass "(f1) daemon still running" || fail "(f1) daemon died"
+
+# --- (f2) group operator: EPERM -> poll fallback ------------------------------------------------
+echo
+step "CHECK (f2) — group operator alice 'set': not signalled; the 10s poll applies it"
+w_before="$(worker_pid snapshot) $(worker_pid pruning) $(worker_pid api)"
+g_prev="$(pf_val applied | cut -d: -f2)"
+mark="$(log_lines)"
+out="$(cli_as alice set check_interval 3m)"; rc=$?
+check "(f2) alice 'set check_interval 3m' exits 0" "0" "$rc"
+g2="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+check_re "(f2) CLI: 'runs as another user and was not signalled; it picks up the change within 10s'" \
+    "daemon pid $sup runs as another user and was not signalled; it picks up the change within 10s" "$out"
+check_no_re "(f2) CLI does not claim to have requested a reload" "reload requested" "$out"
+out="$(cli_as alice status)"
+check_re "(f2) alice's 'status' right after the write: behind or applying, never a restart hint" "daemon on|applying|in sync" "$out"
+check_no_re "(f2) status never says restart for a reload-capable daemon" "restart" "$out"
+out="$(cli_as alice status --wait 15)"; rc=$?
+check "(f2) alice 'status --wait 15' exits 0 once the poll applied generation $g2" "0" "$rc"
+check_re "(f2) status: 'in sync'" "^status: +in sync" "$out"
+if wait_log "$mark" "configuration generation $g2 accepted \\(was $g_prev; trigger: poll\\)" 15; then
+    pass "(f2) daemon logs 'generation $g2 accepted (was $g_prev; trigger: poll)' within 15s"
+else
+    fail "(f2) no 'accepted ... trigger: poll' for generation $g2: $(log_since "$mark" | tail -n 8 | tr '\n' '|')"
+fi
+check_no_re "(f2) it was NOT a SIGHUP reload (alice could not signal)" "generation $g2 accepted .*trigger: SIGHUP" "$(log_since "$mark")"
+if wait_workers_changed "$w_before" 45; then pass "(f2) all three worker pids changed"; else
+    fail "(f2) not every worker turned over: before=[$w_before]"
+fi
+check "(f2) supervisor pid unchanged" "$sup" "$(daemon_pid)"
+wait_pf_re applied "^[0-9]+:$g2\$" 45 && pass "(f2) pid file shows applied=<store>:$g2" || fail "(f2) pid file applied='$(pf_val applied)'"
+
+# --- (f3) the service user itself: same uid -> signalled -----------------------------------------
+echo
+step "CHECK (f3) — $SVC_USER 'set': same uid, so it is signalled"
+w_before="$(worker_pid snapshot) $(worker_pid pruning) $(worker_pid api)"
+mark="$(log_lines)"
+out="$(cli_as "$SVC_USER" set check_interval 4m)"; rc=$?
+check "(f3) $SVC_USER 'set' exits 0" "0" "$rc"
+g3="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+check_re "(f3) CLI: reload requested from daemon pid $sup (signalled, same uid)" "reload requested from daemon pid $sup" "$out"
+check_no_re "(f3) CLI does not say it was not signalled" "not signalled" "$out"
+if wait_log "$mark" "configuration generation $g3 accepted \\(was $g2; trigger: SIGHUP\\)" 6; then
+    pass "(f3) daemon logs 'accepted ... trigger: SIGHUP' within 5s"
+else
+    fail "(f3) no SIGHUP reload logged for generation $g3: $(log_since "$mark" | tail -n 8 | tr '\n' '|')"
+fi
+wait_workers_changed "$w_before" 45 && pass "(f3) worker pids changed" || fail "(f3) workers did not turn over"
+wait_pf_re applied "^[0-9]+:$g3\$" 45 && pass "(f3) pid file shows applied=<store>:$g3" || fail "(f3) pid file applied='$(pf_val applied)'"
+
+# --- (f5) a stored config the daemon must refuse (run before f4 stops the daemon) ----------------
+echo
+step "CHECK (f5) — an invalid stored config bumped by a raw sqlite3 UPDATE is rejected; the daemon keeps running"
+w_before="snapshot=$(worker_pid snapshot) pruning=$(worker_pid pruning) api=$(worker_pid api)"
+mark="$(log_lines)"
+good_applied="$(pf_val applied)"
+out="$(asu "$SVC_USER" "'$PY' '$FIX_DIR/breakconfig.py' '$DB' 2>&1")"; rc=$?
+check "(f5) raw UPDATE (api_port=70000, generation+1) succeeds" "0" "$rc"
+g5="$(printf '%s' "$out" | sed -n 's/^generation \([0-9]*\).*/\1/p' | head -n1)"
+msh "systemctl kill -s HUP --kill-whom=main $UNIT" || warn "systemctl kill failed"
+if wait_log "$mark" "configuration generation $g5 rejected \\(trigger: SIGHUP\\); still running generation $g3" 8; then
+    pass "(f5) daemon logs 'generation $g5 rejected (trigger: SIGHUP); still running generation $g3'"
+else
+    fail "(f5) no rejection logged: $(log_since "$mark" | tail -n 8 | tr '\n' '|')"
+fi
+check_re "(f5) the rejection names the offending setting (api_port)" "api_port" "$(log_since "$mark")"
+check_no_re "(f5) nothing was accepted" "generation $g5 accepted" "$(log_since "$mark")"
+sleep 12                                 # two polls: a rejected key is not retried
+check "(f5) worker pids unchanged" "$w_before" "snapshot=$(worker_pid snapshot) pruning=$(worker_pid pruning) api=$(worker_pid api)"
+check_re "(f5) pid file has rejected=<store>:$g5" "^[0-9]+:$g5\$" "$(pf_val rejected)"
+check "(f5) pid file still has the good applied= key" "$good_applied" "$(pf_val applied)"
+check "(f5) the unit is still active" "active" "$(daemon_active && echo active || echo not-active)"
+check "(f5) supervisor pid unchanged" "$sup" "$(daemon_pid)"
+check_re "(f5) a rejected key is logged once (not every poll)" "^1\$" "$(log_since "$mark" | grep -c "generation $g5 rejected")"
+out="$(cli_as root status)"
+check_re "(f5) status: 'daemon rejected generation $g5'" "daemon rejected generation $g5" "$out"
+out="$(cli_as root status --wait 5)"; rc=$?
+check "(f5) status --wait exits 1 for a rejected key" "1" "$rc"
+# repair: re-import good config -> daemon accepts it and clears rejected=
+mark="$(log_lines)"
+out="$(cli_as root import --no-backup "$FIX_DIR/root.yaml")"; rc=$?
+check "(f5) root re-imports a good config (exit 0)" "0" "$rc"
+g6="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+if wait_log "$mark" "configuration generation $g6 accepted" 10; then pass "(f5) daemon accepts the repaired generation $g6"; else
+    fail "(f5) repaired generation not accepted: $(log_since "$mark" | tail -n 6 | tr '\n' '|')"
+fi
+wait_pf_re applied "^[0-9]+:$g6\$" 45 && pass "(f5) pid file shows applied=<store>:$g6" || fail "(f5) pid file applied='$(pf_val applied)'"
+check "(f5) rejected= cleared by the next acceptance" "" "$(pf_val rejected)"
+
+# --- (f4) forgery: a pid file naming a decoy must never get the decoy signalled -------------------
+echo
+step "CHECK (f4) — forged pid file: the CLI signals only a proven lock holder"
+store_id="$(pf_val applied | cut -d: -f1)"; gen_f4="$(pf_val applied | cut -d: -f2)"
+stop_daemon
+msh "systemd-run --unit=$DECOY_UNIT --collect sleep 600" || warn "could not start the decoy"
+sleep 1
+decoy="$(msh "systemctl show -p MainPID --value $DECOY_UNIT" | tr -d '[:space:]')"
+token="$(msh "'$ENV_WRAP' '$PY' -c 'from zfsbackup import procident; print(procident.start_token($decoy))'" | tr -d '[:space:]')"
+info "decoy: root-owned 'sleep 600' pid=$decoy start token=$token"
+check_re "(f4) the decoy is alive and has a start token" "^linux:[0-9]+\$" "$token"
+# start_forger <owner-precreated:yes|no>  — alice holds LOCK_EX on the pid file and writes the forged v2 content
+start_forger() {
+    msh "
+        systemctl reset-failed $FORGE_UNIT 2>/dev/null || true
+        : > /tmp/forger.out; chmod 666 /tmp/forger.out
+        systemd-run --unit=$FORGE_UNIT --collect -p User=alice -p StandardOutput=append:/tmp/forger.out \
+            -p StandardError=append:/tmp/forger.out \
+            '$ENV_WRAP' '$PY' '$FIX_DIR/forger.py' '$PIDFILE' '$decoy' '$token' '$store_id' '$gen_f4'
+    " || return 1
+    local waited=0
+    while ! msh "grep -q READY /tmp/forger.out" 2>/dev/null; do
+        [ "$waited" -ge 30 ] && { warn "forger never printed READY: $(msh 'cat /tmp/forger.out')"; return 1; }
+        sleep 1; waited=$((waited+1))
+    done
+}
+# f4a: pid file root-owned (the owner check passes), so the LOCK-TABLE proof is what must refuse.
+msh "rm -f '$PIDFILE'; install -m 660 -o root -g $SVC_GROUP /dev/null '$PIDFILE'"
+if start_forger; then
+    pass "(f4a) alice holds LOCK_EX on the root-owned pid file, which names the decoy (pid $decoy) with its correct start token"
+    check "(f4a) the pid file really names the decoy" "$decoy" "$(msh "head -n1 '$PIDFILE'" | tr -d '[:space:]')"
+    out="$(cli_as root set check_interval 5m)"; rc=$?
+    check "(f4a) root 'set' still exits 0 (the write is durable)" "0" "$rc"
+    check_no_re "(f4a) the CLI did NOT report a reload request" "reload requested from daemon pid" "$out"
+    info "(f4a) CLI said: $(printf '%s' "$out" | grep 'config updated' | tail -n1)"
+    check_re "(f4a) the notice says the supervisor is gone / not signalled / unverified" \
+        "is gone|not signalled|was not signalled|could not verify|does not hold" "$out"
+    sleep 1
+    msh "kill -0 $decoy" && pass "(f4a) the decoy is still alive (never signalled)" || fail "(f4a) the decoy died - it was SIGHUPed"
+    check "(f4a) the decoy's unit is still active" "active" "$(msh "systemctl is-active $DECOY_UNIT" | tr -d '[:space:]')"
+    msh "systemctl stop $FORGE_UNIT" >/dev/null 2>&1 || true
+else
+    fail "(f4a) could not start the forger"
+fi
+# f4b: pid file owned by alice (a group operator may create it in the setgid directory); root must refuse it.
+msh "rm -f '$PIDFILE'" || true
+if start_forger; then
+    check "(f4b) the forged pid file is owned by alice" "alice" "$(stat_of "$PIDFILE" | awk '{print $2}')"
+    out="$(cli_as root set check_interval 6m)"; rc=$?
+    check "(f4b) root 'set' exits 0" "0" "$rc"
+    check_no_re "(f4b) the CLI did NOT report a reload request" "reload requested from daemon pid" "$out"
+    info "(f4b) CLI said: $(printf '%s' "$out" | grep 'config updated' | tail -n1)"
+    check_re "(f4b) the notice says it was not signalled / unverified / gone" "is gone|not signalled|could not verify|does not hold" "$out"
+    sleep 1
+    msh "kill -0 $decoy" && pass "(f4b) the decoy is still alive" || fail "(f4b) the decoy died - it was SIGHUPed"
+    out="$(cli_as alice status)"
+    msh "kill -0 $decoy" && pass "(f4b) the decoy survived 'status' too" || fail "(f4b) the decoy died during status"
+else
+    fail "(f4b) could not start the forger"
+fi
+stop_daemon                              # stops the forger and the decoy as well
+msh "rm -f '$PIDFILE'" || true
+
+# --- (f6) a CLI write while the daemon is still starting --------------------------------------
+echo
+step "CHECK (f6) — a CLI write during daemon startup: the daemon stays up and applies it"
+# (f6.0) deterministic window: a stand-in for a previous daemon's surviving worker holds the workers lock,
+# so the new daemon sits in its startup wait (presence lock taken, config NOT yet read) while root writes
+# and the CLI SIGHUPs it. Releasing the holder lets the daemon go on and read the new generation.
+stop_daemon
+msh "[ -e '$WORKERS_LOCK' ] || install -m 660 -o $SVC_USER -g $SVC_GROUP /dev/null '$WORKERS_LOCK'; : >'$LOG'; rm -f '$PIDFILE'" || true
+msh "
+    : > /tmp/wlock.out; chmod 666 /tmp/wlock.out
+    systemd-run --unit=$WLOCK_UNIT --collect -p User=$SVC_USER -p StandardOutput=append:/tmp/wlock.out \
+        -p StandardError=append:/tmp/wlock.out '$ENV_WRAP' '$PY' '$FIX_DIR/wlock.py' '$WORKERS_LOCK'
+" || warn "could not start the workers-lock holder"
+waited=0; until msh "grep -q READY /tmp/wlock.out" 2>/dev/null; do [ "$waited" -ge 30 ] && break; sleep 1; waited=$((waited+1)); done
+check_re "(f6.0) a stand-in for a previous daemon's worker holds the workers lock" "READY" "$(msh 'cat /tmp/wlock.out')"
+start_daemon
+if wait_log 0 "workers of a previous daemon still hold .*waiting for them to finish" 30; then
+    pass "(f6.0) the new daemon logs that it is waiting for the previous daemon's workers"
+else
+    fail "(f6.0) no 'waiting' line: $(msh "tail -n 8 '$LOG'" | tr '\n' '|')"
+fi
+sup6="$(daemon_pid)"
+check_no_re "(f6.0) the daemon has not started a worker yet" "Started .* worker" "$(msh "cat '$LOG'")"
+out="$(cli_as root set check_interval 7m)"; rc=$?
+check "(f6.0) root 'set' while the daemon waits to start exits 0" "0" "$rc"
+g_wait="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+info "(f6.0) CLI said: $(printf '%s' "$out" | grep 'config updated' | tail -n1)"
+sleep 3
+daemon_active && pass "(f6.0) the daemon survived the write (and any SIGHUP) during its startup wait" || fail "(f6.0) daemon died during its startup wait: $(msh "tail -n 12 '$LOG'" | tr '\n' '|')"
+check "(f6.0) same supervisor pid" "$sup6" "$(daemon_pid)"
+msh "systemctl stop $WLOCK_UNIT" >/dev/null 2>&1 || true
+wait_workers_started || warn "(f6.0) workers did not start after the holder went away"
+check_re "(f6.0) once released, the daemon starts its workers" "Started api worker" "$(msh "cat '$LOG'")"
+out="$(cli_as root status --wait 40)"; rc=$?
+check "(f6.0) 'status --wait 40' exits 0: the daemon runs generation $g_wait" "0" "$rc"
+daemon_active && pass "(f6.0) daemon running after the wait" || fail "(f6.0) daemon not running: $(msh "tail -n 12 '$LOG'" | tr '\n' '|')"
+check_re "(f6.0) pid file applied=<store>:$g_wait" "^[0-9]+:$g_wait\$" "$(pf_val applied)"
+check_no_re "(f6.0) no crash or traceback" "Traceback|crash loop|exited with code [1-9]" "$(msh "cat '$LOG'")"
+for trial in 1 2 3; do
+    stop_daemon
+    msh ": >'$LOG'" || true
+    mark=0
+    # Start the daemon and, the moment its pid file appears (the presence lock is taken before the
+    # config is read), write through the CLI as root. All in ONE guest shell so nothing is lost to
+    # multipass latency. The value alternates so every trial is a real generation bump.
+    val=$((trial + 1))
+    out="$(msh "
+        rm -f '$PIDFILE'
+        systemctl reset-failed $UNIT 2>/dev/null || true
+        systemd-run --unit=$UNIT --collect -p User=$SVC_USER -p Group=$SVC_GROUP \
+            -p StandardOutput=append:'$LOG' -p StandardError=append:'$LOG' \
+            '$ENV_WRAP' '$PY' -m zfsbackup.daemon --dry-run -v
+        i=0; until [ -s '$PIDFILE' ] || [ \$i -gt 400 ]; do sleep 0.05; i=\$((i+1)); done
+        '$ENV_WRAP' '$PY' -m zfsbackup.cli set check_interval ${val}m 2>&1
+    " 2>&1)"; rc=$?
+    check "(f6.$trial) root 'set' during startup exits 0" "0" "$rc"
+    g_race="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+    info "(f6.$trial) CLI said: $(printf '%s' "$out" | grep 'config updated' | tail -n1)"
+    wait_workers_started || warn "(f6.$trial) workers did not all start"
+    out="$(cli_as root status --wait 40)"; rc=$?
+    check "(f6.$trial) 'status --wait 40' exits 0: the daemon applied generation $g_race" "0" "$rc"
+    daemon_active && pass "(f6.$trial) daemon stayed up" || fail "(f6.$trial) daemon died: $(log_since "$mark" | tail -n 12 | tr '\n' '|')"
+    check_no_re "(f6.$trial) no crash, traceback or restart-limit exit in the log" "Traceback|crash loop|exited with code [1-9]|refus" "$(log_since "$mark")"
+    check_re "(f6.$trial) pid file applied=<store>:$g_race" "^[0-9]+:$g_race\$" "$(pf_val applied)"
+done
+
 stop_daemon
 
 # ─────────────────────────────── Report ─────────────────────────────────────
