@@ -40,7 +40,8 @@ zfsbackup-config [-c <db>] rename dataset <old> <new>
 zfsbackup-config [-c <db>] rename remote  <old> <new>
 zfsbackup-config [-c <db>] import <yaml> [--replace]
 zfsbackup-config [-c <db>] export [-o <file>]          # DB -> YAML, no editor
-zfsbackup-config [-c <db>] reload                      # Phase 3
+zfsbackup-config [-c <db>] status [--wait S] [--json]  # Phase 3; read-only, never signals
+# There is no `reload` command: every committed write asks the daemon to reload (D3/D4).
 ```
 
 Flag conventions match `daemon.py`: `-c/--config`, `-v/--verbose`, `-d/--dry-run`. Ship **both**

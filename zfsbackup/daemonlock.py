@@ -805,7 +805,13 @@ class ReloadRequest:
       device could not be established), `lock-holders-unknown`,
       `proc-hidden` (`hidepid`), `identity-unknown`;
     * `supervisor-gone`: `no-such-process`, `not-lock-holder`, `zombie`,
-      `reused`, `exited`.
+      `reused`, `file-not-open` (the pid does not have the pid file open: a
+      recycled pid the lock table still names), `exited`;
+    * `unverified` also: `fd-table-unreadable` (the target's `/proc/<pid>/fd`
+      cannot be read and a signal-0 probe was not refused);
+    * `not-permitted`: `other-user` (the fd table cannot be read and a
+      signal-0 probe is refused with EPERM: another user's process; nothing
+      is signalled).
     """
 
     outcome: str
@@ -813,6 +819,24 @@ class ReloadRequest:
     info: Optional[DaemonInfo] = None
     detail: str = ""
     reason_code: str = ""
+
+
+def _signal0_not_permitted(pid: int, pfd: int) -> bool:
+    """Would the kernel refuse to signal `pid`? Probed with signal 0, which
+    checks existence and permission and delivers nothing -- through the
+    pinned pidfd where there is one (no pid race), else `os.kill(pid, 0)`.
+    `True` only for `PermissionError`; anything else (success, gone, other
+    errors) is `False`. Never raises, never sends a real signal."""
+    try:
+        if pfd >= 0:
+            signal.pidfd_send_signal(pfd, 0)
+        else:
+            os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+    return False
 
 
 #: `procident.flock_holders_unavailable_reason` -> (`reason_code`, detail).
@@ -871,6 +895,17 @@ def request_reload(resolved, *, skip_if_applied: Optional[Tuple[int, int]] = Non
        other `'gone'` after a successful `pidfd_open` is `unverified`, not
        `supervisor-gone`: the process existed a moment ago, so the kernel hid
        its `/proc` entry (`hidepid`).
+    8b. the pid has this very file open: some `/proc/<pid>/fd/<n>` is the
+       same `(st_dev, st_ino)` as our descriptor, with an exclusive `FLOCK`
+       in its `fdinfo` where the kernel lists locks
+       (`procident.process_has_file_open`). The lock table keeps naming a
+       dead locker's pid while a forked worker holds the lock, so after pid
+       reuse step 7 alone would accept an unrelated process; a recycled pid
+       cannot have the file open. An unreadable fd table (`/proc/<pid>/fd`
+       needs root or the same user) is probed with signal 0 (via the pidfd
+       where available): EPERM is `not-permitted`, `other-user` -- the
+       SIGHUP would be refused anyway -- and anything else is `unverified`,
+       `fd-table-unreadable`. Nothing but signal 0 is sent here;
     9. only then `SIGHUP` -- exclusively that signal, to exactly that pid,
        through the pidfd where available (otherwise `os.kill`, with a
        check-to-kill window of microseconds), never to a process group.
@@ -919,9 +954,15 @@ def request_reload(resolved, *, skip_if_applied: Optional[Tuple[int, int]] = Non
                 "unverified", pid, info, "the daemon did not record its identity on this platform",
                 "no-identity",
             )
-        # 4
+        # 4 -- only for a supervisor that is not provably dead: a pid file
+        # left by a dead (or zombie, or pid-reused) supervisor still records
+        # its last `applied=`, and "already applied" would hide that nothing
+        # is running it. Such a pid falls through to the checks below.
         if skip_if_applied is not None and info.applied == tuple(skip_if_applied):
-            return ReloadRequest("already-applied", pid, info, "the daemon already applied this change")
+            if procident.identity(pid, info.start) not in ("gone", "mismatch"):
+                return ReloadRequest(
+                    "already-applied", pid, info, "the daemon already applied this change"
+                )
         # 5
         if pid <= 1 or pid == os.getpid():
             return ReloadRequest(
@@ -988,6 +1029,37 @@ def request_reload(resolved, *, skip_if_applied: Optional[Tuple[int, int]] = Non
             return ReloadRequest(
                 "unverified", pid, info, f"cannot verify the identity of pid {pid}",
                 "identity-unknown",
+            )
+        # 8b -- the target must have THIS file open (`/proc/<pid>/fd`). The
+        # lock table names the pid that took the lock and keeps naming it
+        # while a forked worker holds the open file description; once that
+        # pid is reused, step 7 would accept an unrelated process, and a
+        # group operator can write its pid and real start token into the
+        # file. A recycled pid cannot have the file open. Checked after the
+        # pidfd is open, i.e. against the pinned process; after the identity
+        # step so a zombie or a reused pid keeps its specific reason.
+        has_open = procident.process_has_file_open(pid, st.st_dev, st.st_ino)
+        if has_open is None and _signal0_not_permitted(pid, pfd):
+            # Another user's process: `/proc/<pid>/fd` needs root or the same
+            # user, and the SIGHUP itself would be refused too. Report it as
+            # the kernel would, so the operator wording ("runs as another
+            # user") is kept. Probed with signal 0 only -- no signal is sent.
+            return ReloadRequest(
+                "not-permitted", pid, info,
+                f"pid {pid} runs as another user; not permitted to signal it",
+                "other-user",
+            )
+        if has_open is None:
+            return ReloadRequest(
+                "unverified", pid, info,
+                f"cannot read the open files of pid {pid} to confirm it holds the daemon lock",
+                "fd-table-unreadable",
+            )
+        if not has_open:
+            return ReloadRequest(
+                "supervisor-gone", pid, info,
+                f"pid {pid} does not have the daemon lock file open",
+                "file-not-open",
             )
 
         # 9

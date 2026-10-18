@@ -128,9 +128,11 @@ database's first connection. Its only sanctioned ways to reach a live
 storable `Engine`: `db.py`'s pid-keyed fork-safety cache depends on
 nothing capturing a long-lived handle outside a `with` block, and an
 `Engine` returned by value from this module would be exactly such a
-handle. Only the daemon supervisor reads the store (once, at startup, via
-`zfsbackup/runtime_config.py`'s `load_runtime_config()` -> `access.read_config`,
-which uses these two functions); `workers.py` never opens it. Neither module
+handle. Only the daemon supervisor reads the store: at startup, on every
+10 s generation poll (`access.read_store_state`) and on every reload, each
+through `zfsbackup/runtime_config.py` -> `access.read_config` (which uses
+these two functions) and disposing its engines after each read;
+`workers.py` never opens it. Neither module
 builds an engine, opens a connection, or touches an ORM class directly;
 `BackupConfig.from_file` is gone from both.
 

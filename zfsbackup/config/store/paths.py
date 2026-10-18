@@ -718,7 +718,8 @@ def resolve_config_url(
     before building anything; calling this function directly and handing
     the result straight to `get_engine`/`session_scope` reintroduces the
     exact hazard this module exists to remove -- `readonly=True` on a URL
-    for a path that does not exist silently creates a zero-byte database.
+    for a path that does not exist fails with a bare "unable to open database
+    file" (a reader never creates it; a writer engine still would).
     Kept public for a caller that genuinely only needs the URL string and
     performs its own preflight (or genuinely wants no preflight at all,
     e.g. a diagnostic tool) -- nothing in this repository is such a
@@ -1302,10 +1303,12 @@ def check_config_db(
     used as the config database, without ever building a SQLite engine.
 
     **Must run before any engine is built.** `make_engine(url,
-    readonly=True).connect()` on a path that does not yet exist silently
-    creates a zero-byte file. A `stat`-based check performed first is the
-    only way to observe "did not previously exist" at all; see module
-    docstring.
+    readonly=True).connect()` on a path that does not yet exist used to
+    silently create a zero-byte file; reader engines now open `mode=rw`
+    (db.py) and fail instead, but a writer engine still creates. A
+    `stat`-based check performed first is the only way to observe "did not
+    previously exist" at all, and the only source of a precise error; see
+    module docstring.
 
     **Every actual filesystem check below targets `resolved.resolved_path`**
     -- the same fully (cwd- and symlink-) resolved path `resolved.url()`

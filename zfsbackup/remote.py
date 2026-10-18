@@ -288,15 +288,15 @@ class RemoteBackupManager:
             failed = True
             return False
         finally:
-            try:
-                if failed:
-                    # A dead or hung peer: do not let the close handshake
-                    # wait out the idle timeout (default 3s inside close()
-                    # only covers the read; the socket timeout covers sends).
+            if failed:
+                # A dead or hung peer: do not let the close handshake
+                # wait out the idle timeout (default 3s inside close()
+                # only covers the read; the socket timeout covers sends).
+                # Its own block: a failing `settimeout` must not skip close().
+                with contextlib.suppress(Exception):
                     ws.settimeout(5)
+            with contextlib.suppress(Exception):
                 ws.close()
-            except Exception:
-                pass
             if not entered:
                 # connect() failed or timed out before `with stream:`: the
                 # `zfs send` is already running and would block forever on a

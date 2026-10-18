@@ -53,8 +53,8 @@ memories.)
 
 ## Known daemon limitations these scenarios work around
 
-Remote backup is not deployment-ready: the `requests` dependency is undeclared (the harness installs
-it explicitly in the guests) and the API binds `0.0.0.0` without auth/TLS. Keep working around these
+Remote backup is not deployment-ready: the API binds `0.0.0.0` without auth/TLS. (`requests` is now
+declared in `pyproject.toml`; the harness still installs it explicitly in the guests.) Keep working around these
 rather than assuming they're fixed.
 
 ## The SQLite config store — what scenarios must account for

@@ -1321,3 +1321,210 @@ class TestLayering:
         )
         assert result.returncode == 0, result.stderr
         assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# process_has_file_open: the recycled-pid proof
+# ---------------------------------------------------------------------------
+
+
+class FdTable:
+    """A fixture `/proc/<pid>/{fd,fdinfo}` for one process, over real files:
+    `fd/<n>` is a symlink (so `stat` follows it to the file's real device and
+    inode, as the kernel's magic links do)."""
+
+    PID = 4321
+
+    def __init__(self, root, tmp_path):
+        self.root = root
+        self.tmp = tmp_path
+        self.target = tmp_path / "pidfile"
+        self.target.write_text("x")
+        self.other = tmp_path / "other"
+        self.other.write_text("y")
+        self.st = os.stat(self.target)
+        self.dev, self.ino = self.st.st_dev, self.st.st_ino
+        (root / str(self.PID) / "fd").mkdir(parents=True)
+        (root / str(self.PID) / "fdinfo").mkdir(parents=True)
+        self.n = 2
+
+    def add(self, target=None, lock_lines=None, fdinfo=True):
+        self.n += 1
+        os.symlink(str(target or self.target), self.root / str(self.PID) / "fd" / str(self.n))
+        if fdinfo:
+            text = "pos:\t0\nflags:\t02100000\nmnt_id:\t77\n"
+            for line in lock_lines or []:
+                text += f"lock:\t{line}\n"
+            (self.root / str(self.PID) / "fdinfo" / str(self.n)).write_text(text)
+        return self.n
+
+    DEFAULT = object()
+
+    def has_open(self, pid=DEFAULT, dev=None, ino=None):
+        return procident.process_has_file_open(
+            self.PID if pid is self.DEFAULT else pid,
+            self.dev if dev is None else dev,
+            self.ino if ino is None else ino,
+        )
+
+
+@pytest.fixture
+def fdtable(proc_root, tmp_path):
+    return FdTable(proc_root, tmp_path)
+
+
+def _lock(kind="FLOCK", mode="WRITE", ino=1):
+    return f"1: {kind}  ADVISORY  {mode} 4321 08:01:{ino} 0 EOF"
+
+
+@pytest.mark.unit
+class TestProcessHasFileOpen:
+    def test_open_with_an_exclusive_flock_is_true(self, fdtable):
+        fdtable.add(lock_lines=[_lock("FLOCK", "WRITE", fdtable.ino)])
+        assert fdtable.has_open() is True
+
+    def test_open_with_no_lock_lines_is_true(self, fdtable):
+        fdtable.add(lock_lines=[])
+        assert fdtable.has_open() is True
+
+    def test_open_without_any_fdinfo_is_true(self, fdtable):
+        fdtable.add(fdinfo=False)
+        assert fdtable.has_open() is True
+
+    def test_only_a_shared_flock_is_false(self, fdtable):
+        fdtable.add(lock_lines=[_lock("FLOCK", "READ", fdtable.ino)])
+        assert fdtable.has_open() is False
+
+    def test_only_a_posix_lock_is_false(self, fdtable):
+        fdtable.add(lock_lines=[_lock("POSIX", "WRITE", fdtable.ino)])
+        assert fdtable.has_open() is False
+
+    def test_an_ofd_lock_is_false(self, fdtable):
+        fdtable.add(lock_lines=[_lock("OFDLCK", "WRITE", fdtable.ino)])
+        assert fdtable.has_open() is False
+
+    def test_a_different_file_is_false(self, fdtable):
+        fdtable.add(target=fdtable.other, lock_lines=[_lock("FLOCK", "WRITE", 5)])
+        assert fdtable.has_open() is False
+
+    def test_the_same_inode_on_another_device_is_false(self, fdtable):
+        fdtable.add(lock_lines=[_lock("FLOCK", "WRITE", fdtable.ino)])
+        assert fdtable.has_open(dev=fdtable.dev + 1) is False
+        assert fdtable.has_open(ino=fdtable.ino + 1) is False
+
+    def test_an_empty_fd_table_is_false(self, fdtable):
+        assert fdtable.has_open() is False
+
+    def test_one_qualifying_descriptor_among_others_is_enough(self, fdtable):
+        fdtable.add(target=fdtable.other)
+        fdtable.add(lock_lines=[_lock("FLOCK", "READ", fdtable.ino)])      # not the locker's
+        fdtable.add(lock_lines=[_lock("FLOCK", "WRITE", fdtable.ino)])     # the locker's
+        assert fdtable.has_open() is True
+
+    def test_a_dangling_descriptor_is_skipped(self, fdtable):
+        os.symlink(str(fdtable.tmp / "gone"), fdtable.root / str(fdtable.PID) / "fd" / "9")
+        fdtable.add()
+        assert fdtable.has_open() is True
+
+    def test_only_a_dangling_descriptor_is_false(self, fdtable):
+        os.symlink(str(fdtable.tmp / "gone"), fdtable.root / str(fdtable.PID) / "fd" / "9")
+        assert fdtable.has_open() is False
+
+    def test_a_missing_fd_dir_is_none(self, fdtable):
+        os.rmdir(fdtable.root / str(fdtable.PID) / "fd")
+        assert fdtable.has_open() is None
+
+    def test_an_unreadable_fd_dir_is_none(self, fdtable, monkeypatch):
+        def deny(path):
+            raise PermissionError(errno.EACCES, "denied")
+
+        monkeypatch.setattr(procident.os, "listdir", deny)
+        assert fdtable.has_open() is None
+
+    def test_a_missing_pid_is_none(self, fdtable):
+        assert fdtable.has_open(pid=99999) is None
+
+    def test_an_unreadable_fdinfo_does_not_fail_the_check(self, fdtable, monkeypatch):
+        fdtable.add(lock_lines=[_lock("FLOCK", "WRITE", fdtable.ino)])
+        real = builtins.open
+
+        def fake_open(path, *a, **kw):
+            if "/fdinfo/" in str(path):
+                raise PermissionError(errno.EACCES, "denied")
+            return real(path, *a, **kw)
+
+        monkeypatch.setattr(procident, "open", fake_open, raising=False)
+        assert fdtable.has_open() is True              # no lock lines to contradict it
+
+    @pytest.mark.parametrize("platform", ["darwin", "freebsd14", "win32"])
+    def test_not_linux_is_none(self, fdtable, monkeypatch, platform):
+        fdtable.add()
+        monkeypatch.setattr(sys, "platform", platform)
+        assert fdtable.has_open() is None
+
+    @pytest.mark.parametrize("pid", [None, 0, -1, True, "4321", 2**31, 1.5])
+    def test_an_invalid_pid_is_none(self, fdtable, pid):
+        fdtable.add()
+        assert fdtable.has_open(pid=pid) is None
+
+    def test_it_never_raises(self, fdtable, monkeypatch):
+        monkeypatch.setattr(procident.os, "listdir", lambda p: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert fdtable.has_open() is None
+
+    def test_it_sends_nothing_and_opens_nothing(self, fdtable, monkeypatch):
+        fdtable.add()
+        monkeypatch.setattr(procident.os, "kill", lambda *a: pytest.fail("signalled"))
+        monkeypatch.setattr(procident.os, "open", lambda *a, **k: pytest.fail("opened a descriptor"))
+        assert fdtable.has_open() is True
+
+
+@pytest.mark.integration
+@linux_only
+class TestRealProcessHasFileOpen:
+    """[L] The real /proc/<pid>/fd and fdinfo."""
+
+    def test_a_real_child_holding_lock_ex_has_the_file_open(self, sleeper, tmp_path):
+        path = tmp_path / "locked"
+        path.write_text("x")
+        child = sleeper(
+            "import fcntl, os, time\n"
+            f"fd = os.open({str(path)!r}, os.O_RDWR)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(120)\n"
+        )
+        assert child.stdout.readline().strip() == b"ready"
+        st = os.stat(path)
+        assert procident.process_has_file_open(child.pid, st.st_dev, st.st_ino) is True
+
+    def test_a_real_child_holding_only_lock_sh_does_not_qualify(self, sleeper, tmp_path):
+        path = tmp_path / "shared"
+        path.write_text("x")
+        child = sleeper(
+            "import fcntl, os, time\n"
+            f"fd = os.open({str(path)!r}, os.O_RDONLY)\n"
+            "fcntl.flock(fd, fcntl.LOCK_SH)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(120)\n"
+        )
+        assert child.stdout.readline().strip() == b"ready"
+        st = os.stat(path)
+        assert procident.process_has_file_open(child.pid, st.st_dev, st.st_ino) is False
+
+    def test_an_unrelated_process_does_not_have_it_open(self, sleeper, tmp_path):
+        path = tmp_path / "locked"
+        path.write_text("x")
+        child = sleeper()
+        st = os.stat(path)
+        assert procident.process_has_file_open(child.pid, st.st_dev, st.st_ino) is False
+
+    def test_we_have_a_file_we_hold_open(self, tmp_path):
+        path = tmp_path / "ours"
+        path.write_text("x")
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            st = os.stat(path)
+            assert procident.process_has_file_open(os.getpid(), st.st_dev, st.st_ino) is True
+        finally:
+            os.close(fd)
+        assert procident.process_has_file_open(os.getpid(), st.st_dev, st.st_ino) is False

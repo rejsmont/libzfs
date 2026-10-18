@@ -183,12 +183,15 @@ class World:
         self.load_error = None
         self.poll_error = None
         self.on_load = None     # called inside the scripted read, before it returns
+        self.on_poll = None     # likewise, inside the scripted key read
         self.lock = FakeLock() if with_lock else None
 
         world = self
 
         def read_store_state(resolved):
             world.events.append("poll")
+            if world.on_poll is not None:
+                world.on_poll()
             if world.poll_error is not None:
                 raise world.poll_error
             return StoreState(store_id=world.db_key[0], generation=world.db_key[1])
@@ -1660,6 +1663,23 @@ class TestStopDuringAReload:
             assert kwargs["should_stop"]() is False
         world.daemon._stop_event.set()
         assert kwargs["should_stop"]() is True
+
+    def test_a_stop_during_the_polls_key_read_starts_no_full_read(self, world, mocker):
+        """The flag is re-checked after the poll's `read_store_state` and the
+        key comparison, before `_try_reload`: a changed key must not start a
+        full read (and a possible accept) into a shutdown."""
+        world.start_workers()
+        handoff = world.daemon._handoff
+        try_reload = mocker.spy(world.daemon, "_try_reload")
+        world.on_poll = world.daemon._stop_event.set        # SIGTERM lands during the poll
+        world.write((STORE, 1), prefix="changed")           # and the stored key differs
+        world.events.clear()
+        world.poll()
+        try_reload.assert_not_called()
+        assert "load" not in world.events
+        assert world.events == ["poll", "dispose"]          # dispose still ran
+        assert world.lock.calls == []                       # nothing published
+        assert world.daemon._handoff is handoff and world.daemon._reload_epoch.get() == 0
 
     def test_a_stop_during_the_read_accepts_nothing_and_describes_nothing(self, world, caplog):
         world.start_workers()

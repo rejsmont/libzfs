@@ -39,7 +39,7 @@ the lock module and the workers).
 
 import os
 import sys
-from typing import Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 #: Patchable root of the Linux proc filesystem.
 _PROC_ROOT = "/proc"
@@ -326,6 +326,62 @@ def flock_write_holders(fd: int) -> Optional[Set[int]]:
         if device is None:
             return None
         return _linux_flock_write_holders(device, os.fstat(fd).st_ino)
+    except Exception:
+        return None
+
+
+def _fdinfo_lock_lines(pid: int, name: str) -> Optional[List[str]]:
+    """The `lock:` lines of `/proc/<pid>/fdinfo/<name>`, or `None` if it
+    cannot be read."""
+    try:
+        with open(f"{_PROC_ROOT}/{pid}/fdinfo/{name}", "r", encoding="ascii", errors="replace") as fh:
+            return [line for line in fh if line.startswith("lock:")]
+    except OSError:
+        return None
+
+
+def process_has_file_open(pid, st_dev: int, st_ino: int) -> Optional[bool]:
+    """Does process `pid` have the file `(st_dev, st_ino)` open, as a lock
+    holder would? Linux only.
+
+    `True` if some `/proc/<pid>/fd/<n>` stats (following the magic link) to
+    exactly that device and inode -- and, where the kernel lists locks in
+    `/proc/<pid>/fdinfo/<n>`, that descriptor's `lock:` lines include an
+    `FLOCK ... WRITE` (a descriptor with lock lines but no exclusive flock is
+    not the locker's; one with no lock lines at all is accepted, since not
+    every kernel reports them). `False` if the fd table was read and no
+    descriptor qualifies. `None` when it cannot be told: not Linux, pid
+    invalid, or the fd table unreadable (`/proc/<pid>/fd` needs ptrace-read
+    access: root, or the same user) -- callers must treat `None` as
+    "unverified", never as proof. Never raises.
+
+    Why: `/proc/locks` names the pid that TOOK a lock and keeps naming it for
+    as long as any process holds the open file description -- a forked
+    worker, after the locker died. Once that pid number is reused, the lock
+    table "proves" an unrelated process. Having the very file open is
+    something a recycled pid cannot fake.
+    """
+    try:
+        if not _is_linux() or not _valid_pid(pid):
+            return None
+        base = f"{_PROC_ROOT}/{pid}/fd"
+        try:
+            names = os.listdir(base)
+        except OSError:
+            return None
+        for name in names:
+            try:
+                st = os.stat(f"{base}/{name}")
+            except OSError:
+                continue  # closed meanwhile, or a target we may not stat
+            if (st.st_dev, st.st_ino) != (st_dev, st_ino):
+                continue
+            locks = _fdinfo_lock_lines(pid, name)
+            if locks:
+                if not any("FLOCK" in line and "WRITE" in line for line in locks):
+                    continue
+            return True
+        return False
     except Exception:
         return None
 

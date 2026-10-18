@@ -324,7 +324,7 @@ def _daemon_notice(
         code = req.reason_code
         if code in ("zombie", "no-such-process", "exited"):
             gone = True
-        elif code in ("not-lock-holder", "reused"):
+        elif code in ("not-lock-holder", "reused", "file-not-open"):
             gone = False
         else:  # no reason code: fall back to asking about the pid itself
             gone = pid is not None and daemonlock.pid_is_alive(pid) is False

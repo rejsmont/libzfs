@@ -3,7 +3,8 @@
 **Status (2026-10-18):** Phases 0, 1 and 2 **implemented** on branch `config-db-cli` (Checkpoint A held
 2026-10-17 with fix-up A-1…A-21; Phase 2 items 10–16 landed 2026-10-17/18); mocked suite 3810 passed.
 **Checkpoint B review held 2026-10-18** (Phase 2 sound; close-out fixes landed). **Phase 3 (live
-reload) decided 2026-10-18 (D1–D11; D4 changed to "the CLI SIGHUPs the daemon") and in implementation.** Sections below still read as the original proposal except where an item
+reload) decided 2026-10-18 (D1–D11; D4 changed to "the CLI SIGHUPs the daemon") and implemented the same day;
+all gates and the final review passed; ready to merge.** Sections below still read as the original proposal except where an item
 carries a status note or "as landed" text — where those disagree with the proposal, the note wins.
 **Scope:** `zfsbackup/` only. No `libzfseasy/` changes.
 **Author:** zfsbackup-implementation-planner
@@ -36,10 +37,10 @@ carries a status note or "as landed" text — where those disagree with the prop
 | Items 13, 11, 12, 14.2 | done | `list`, `get`/`set`/`unset`, `edit` (whole + per entry), `rename dataset|destination`; mocked suite 3787 |
 | Warnings consolidation | done | `validate_config` is the single source of semantic warnings; `from_file` keeps parse-boundary ones; `load_config(warn_never_prune=)` |
 | Checkpoint B | held 2026-10-18 | Phase 2 reviewed end to end (incl. a 5-minute concurrent stress test); close-out fixes landed with it |
-| **Phase 3 (live reload)** | **implemented 2026-10-18** (00cbb8c, 7b77735) | Gates G1–G4 passed; mocked suite 5701 passed. Remaining: 22 (VM scenarios, incl. Linux-only tests), 23 (final review) |
+| **Phase 3 (live reload)** | **done 2026-10-18** | Gates G1–G4 and the final review passed; mocked suite 5825 passed (macOS) / 5835 (Linux) |
 | 10–16 Config CLI | done | Landed in order 10 → 15 → 13 → 11 → 12 → 14 → 16; see the per-item "as landed" notes |
 | 17–20 Live reload | done | 17.0 → G1; 18.0, 17.1, 18.1–18.5 → G2; 17.2 → G3; 19.1, 19.2 → G4; tests (20) alongside each |
-| 21–23 Docs, scenarios, final review | 21, 22 done; 23 next | 22: Linux mocked suite on zfsb-perm 5705 passed (2 VM-timer-sensitive controls fail; all 13 Linux-only signal tests pass as user and root); `test_config_permissions.sh` 230/0 incl. live-reload group (f); `test_two_vm_backup.sh` 50/0 incl. reload during send/receive and kill -9 survivor wait. Open for 23: SQLAlchemy 2.1 emits DOUBLE vs the baseline's FLOAT (pin `<2.1` or make the model explicit) |
+| 21–23 Docs, scenarios, final review | **done 2026-10-18** | 22: Linux mocked suite on zfsb-perm 5835 passed / 0 failed (all [L] tests as user and root); `test_config_permissions.sh` 239/0 incl. live reload (f) and recycled-pid forgery (f4c); `test_two_vm_backup.sh` 50/0. 23: both final reviews passed after the must-fixes (early-SIGHUP ignore, file-open proof, stop before reload read, SQLAlchemy 2.1 float map, `mode=rw` readers). Deferred follow-ups listed under Gate results. |
 
 > *(Historical — written for Phases 0–2; the reload design described here is superseded by the revised Phase 3 section.)* **All design questions are settled; no open decisions remain.** Items 2 (duration handling) and 5 (fork
 > safety) were the gating pair: **item 2 = full `Duration` value type** subclassing `timedelta`, with
@@ -2061,6 +2062,44 @@ Two lanes run in parallel (disjoint owners); everything inside the daemon lane i
       zombie-aware liveness;
     - a zombie supervisor counts as gone in `procident`;
     - `migrate` wording.
+
+- **Item 23 final review (2026-10-18): mergeable after must-fixes (both reviewers).**
+  - Clean:
+    - no kill or terminate on the reload path;
+    - fork safety under all three start methods, measured on a real daemon;
+    - no WAL read mark is held across any sleep;
+    - the state machine;
+    - the API drain and `shutdown()`;
+    - timeouts;
+    - the v2 pid file is compatible with two-line readers;
+    - `--dry-run`.
+  - Must-fix before merge:
+    - **A.** A SIGHUP in the first ~0.3 s of startup killed the daemon (rc 129), and `Restart=on-failure`
+      does not restart that. Fix: SIGHUP is ignored from process start and again at exit; the unit gets
+      `RestartForceExitStatus=SIGHUP`.
+    - **B.** A recycled locker pid passed the `/proc/locks` proof. `/proc/locks` keeps the dead locker's
+      pid number, so a forged pid file plus pid reuse could get a root CLI to SIGHUP an unrelated
+      process. Fix: the target must also have this file open (`/proc/<pid>/fd`); otherwise `unverified`.
+    - **D.** A stop check between the poll and the reload read.
+    - SQLAlchemy 2.1 drift (DOUBLE vs FLOAT): `type_annotation_map = {float: Float()}`.
+    - Readers opened with `mode=rw`, so a poll can never create a missing database.
+    - `ws.close()` is always attempted.
+    - `skip_if_applied` is checked only for a live supervisor.
+  - Docs:
+    - `KillMode=mixed` cuts orphaned transfers after a supervisor crash; documented, with `KillMode=process`
+      as the alternative;
+    - stop budget (90 s is right, about 35 s realistic);
+    - CLAUDE.md, readiness report and agent prompts refreshed.
+  - Deferred (follow-ups):
+    - a test bind of a changed `api_host`/`api_port` and a `ClientIdentity` check on reload (otherwise a
+      busy port crash-loops into D9);
+    - a supervisor `zfs` call on reload can block the loop on a hung pool;
+    - an identical re-import bumps the generation and turns over every worker;
+    - forkserver death makes workers exit as orphans (predates Phase 3);
+    - `--clear-stale-props` could be allowed once the daemon has applied the rename;
+    - a drain 503 on `/stream` logs ERROR;
+    - VM-timer-sensitive tests (`TestContentionWindow`, the torn-read control);
+    - the `TestRealLockHolderOnLinux` marker.
 
 ### Item 17.0 — Store id and cheap store state *(store)*
 

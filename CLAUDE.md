@@ -96,9 +96,9 @@ Properties are stored internally as integer-indexed lists (using `_prop_names` c
 - `SnapshotInfo` — wraps a `libzfseasy.Snapshot`; parses the `{prefix}_{YYYYMMDDHHMMSS}` name to get a timestamp and calculates age
 - Retention/destruction lives on `DatasetManager` too — the tiered slot-based `needs_prunning` (keeps the newest snapshot per time slot, always keeps `snapshots[0]`, skips anchored snapshots) and `prune_snapshots` (destroys in batches, honors `dry_run`). Anchor state is stored in the `org.zfsbackup:anchor.*` user properties.
 
-**[zfsbackup/daemon.py](zfsbackup/daemon.py)** — `BackupDaemon` is a **multiprocessing supervisor**, not a single-process loop: it owns a shared **`zfsbackup.stopflag.StopFlag`** (a lock-free shared byte — **not** a `multiprocessing.Event`; see below), installs `SIGINT`/`SIGTERM` handlers, spawns the worker processes, then polls and restarts any that die. Entry point: `python -m zfsbackup.daemon` (flags `-c/--config`, `-d/--dry-run`, `-v/--verbose`, `--test-config`).
+**[zfsbackup/daemon.py](zfsbackup/daemon.py)** — `BackupDaemon` is a **multiprocessing supervisor**, not a single-process loop: it owns a shared **`zfsbackup.stopflag.StopFlag`** (a lock-free shared byte — **not** a `multiprocessing.Event`; see below), installs `SIGINT`/`SIGTERM`/`SIGHUP` handlers, spawns the worker processes, then polls and restarts any that die. It also runs the live-reload state machine: a SIGHUP or the 10 s poll leads to read, validate and build; then the `Handoff` swap and a `ReloadEpoch` bump; then a staggered turnover (see Live reload below). Entry point: `python -m zfsbackup.daemon` (flags `-c/--config`, `-d/--dry-run`, `-v/--verbose`, `--test-config`).
 
-**[zfsbackup/workers.py](zfsbackup/workers.py)** — the per-dataset work runs here. `BaseWorker.run` builds a `DatasetManager`, iterates its datasets calling an abstract `_process_dataset`, and sleeps in short slices (`_wait`), checking at every safe point (loop top, between datasets, each slice) whether to stop or whether its supervisor has died (`_SupervisorWatch` — an orphaned worker exits on its own, never mid-transfer). Workers receive the supervisor's config object and never open the config DB. Subclasses: `SnapshotWorker`, `PruningWorker`, `RemoteBackupWorker` (lazy-imports `RemoteBackupManager`), `ApiWorker` (binds the HTTP server in its main thread and exits 1 if it cannot, so the supervisor's backoff applies).
+**[zfsbackup/workers.py](zfsbackup/workers.py)** — the per-dataset work runs here. `BaseWorker.run` builds a `DatasetManager`, iterates its datasets calling an abstract `_process_dataset`, and sleeps in short slices (`_wait`), checking at every safe point (loop top, between datasets and remote destinations, each slice) for an `ExitReason`: STOP, then SUPERVISOR_GONE, then RELOAD. RELOAD means the shared `ReloadEpoch` moved past the worker's `born_epoch`, and the worker exits with code 3 (`WORKER_EXIT_RELOAD`) to be respawned on the new config (`_SupervisorWatch` — an orphaned worker exits on its own, never mid-transfer). Workers receive the supervisor's config object and never open the config DB. Subclasses: `SnapshotWorker`, `PruningWorker`, `RemoteBackupWorker` (lazy-imports `RemoteBackupManager`), `ApiWorker` (binds the HTTP server in its main thread and exits 1 if it cannot, so the supervisor's backoff applies; on reload it drains in-flight receives through `api.StreamGate`, answering 503 + retry meanwhile, then calls `server.shutdown()`). Every worker holds `<db>.workers.lock` `LOCK_SH` for life.
 
 **[zfsbackup/remote.py](zfsbackup/remote.py)** / **[zfsbackup/api.py](zfsbackup/api.py)** — remote send/receive transfer (`RemoteBackupManager`) and the HTTP control API (`create_app`). Remote backup is **not deployment-ready** (no auth/TLS) — see [docs/production_readiness_report.md](docs/production_readiness_report.md).
 
@@ -113,9 +113,11 @@ value types (`BackupConfig`, `DatasetConfig`, `Duration`, …) and `__init__.py`
 `db.py` owns engine/session management (fork-safe engine cache, WAL pragmas, read-only sessions),
 `paths.py` resolves and preflights the DB path (`-c` > `$ZFSBACKUP_CONFIG` >
 `/var/lib/zfsbackup/config.db`; the daemon never creates it) and owns the CLI writer lock,
-`access.py` is the read/write API (`read_config` — one snapshot incl. the schema check — and
-`write_config` — writer lock, generation compare-and-swap), `messages.py` the shared error wording,
-`errors.py` `ConfigConflict`/`ConfigBusy`, `importer.py` the YAML → DB full replace, and `migrate.py`
+`access.py` is the read/write API (`read_config` — one snapshot incl. the schema check —,
+`write_config` — writer lock, `(store_id, generation)` compare-and-swap — and `read_store_state`, the
+daemon's cheap poll read), `messages.py` the shared error wording, `errors.py` `ConfigConflict`/`ConfigBusy`
+(`StoreIdConflict`, "the database was replaced", lives in `mapper.py`; the store id is `PRAGMA
+user_version`, stamped on first save), `importer.py` the YAML → DB full replace, and `migrate.py`
 plus `migrations/` the Alembic baseline (pinned head; `upgrade_schema`). It is a **separate layer** from
 the dataclasses, not a replacement — `DatasetConfig` is also a remote wire format with no DB behind it,
 and config objects outlive any session. YAML survives only as an import format and (from Phase 2) the
@@ -156,13 +158,16 @@ writer lock — empty, never deleted), `config.db.daemon.pid` (daemon presence l
 (held `LOCK_SH` by every worker, so a new daemon waits for a previous daemon's surviving workers), and
 `config.db.pre-import-<UTC>.yaml` backups written by `import`.
 
-**[zfsbackup/cli/](zfsbackup/cli/)** — the `zfsbackup-config` Click application (Phase 2):
+**[zfsbackup/cli/](zfsbackup/cli/)** — the `zfsbackup-config` Click application (Phases 2–3):
 `import`, `export`, `migrate`, `list`, `get`/`set`/`unset` (dot paths, `dotpath.py`), `edit`
 (whole config or one dataset/destination in `$EDITOR`, `editor.py`) and `rename dataset|destination`
 (`rename.py`, which also handles the ZFS anchor/property side effects); `render.py` turns a `BackupConfig` back into YAML that
 `from_file` reproduces exactly, including duration literals; `write.py` is the shared read → edit →
-`write_config(expected_generation)` helper for the editing commands, with the post-write daemon notice.
-It is the only writer of the config DB. Exit codes: 0 ok, 1 invalid/refused, 2 usage, 75 retry
+`write_config(expected_generation)` helper for the editing commands. After every committed write it calls
+`begin_reload`, which is the one `request_reload` call, before any output; it then waits up to
+`--reload-wait` (a global option, default 3 s) for the daemon to answer and prints the outcome.
+`status [--wait] [--json]` (`status.py`) reports the stored key vs the daemon's applied, target and
+rejected keys, and never signals. The CLI is the only writer of the config DB. Exit codes: 0 ok, 1 invalid/refused, 2 usage, 75 retry
 (conflict/busy), 78 config DB unusable, 130/143 interrupted/terminated.
 
 > **`zfsbackup/store/` is reserved and deliberately empty.** It is for *backup data* destinations —

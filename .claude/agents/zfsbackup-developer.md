@@ -101,8 +101,7 @@ ORM models into daemon code. Config objects outlive any session, and a detached 
 
 - Retention/timeslot design follows a znapzend-style algorithm — the reference is captured in the
   `ref_znapzend_time` memory.
-- Remote backup is **not deployment-ready**: no auth/TLS and the `requests` dependency is undeclared
-  (see the readiness memory). Flag, don't silently rely on, these when touching remote/API code.
+- Remote backup is **not deployment-ready**: no auth/TLS (see the readiness memory). Flag, don't silently rely on, these when touching remote/API code.
 
 ## Workflow
 

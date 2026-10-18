@@ -37,7 +37,7 @@ daemon is a multiprocessing supervisor, not a single-process loop.
   skips anchored, newest-per-slot); `dry_run` honored in `create_snapshot`/`prune_snapshots`.
 - Config base64/JSON round-trip (`to_property`/`from_property`) integrity.
 - Worker loop / `stop_event.wait` handling; supervisor restart logic; no blocking calls that ignore
-  the stop event. Note the known-not-ready remote path (no auth/TLS, undeclared `requests` dep).
+  the stop event. Note the known-not-ready remote path (no auth/TLS).
 
 **Config store (`zfsbackup/config/store/**` incl. `store/migrations/`, `alembic.ini`):**
 - Retention rules scoped by the nullable `dataset_remote_id` — **never** by a `destination_name` FK

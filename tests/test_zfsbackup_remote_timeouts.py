@@ -367,6 +367,7 @@ class TestCloseHandshakeAndStreamClose:
         ws.settimeout.side_effect = settimeout
         result, _ = transfer(rbm, mocker, FakeStream(), ws)
         assert result is False and calls == [WS_IDLE_TIMEOUT, 5]
+        ws.close.assert_called_once()            # a failing settimeout must not skip close()
 
     def test_the_logged_error_says_timed_out_even_when_the_stream_close_raises(self, rbm, mocker, caplog):
         """A killed `zfs send` makes `close()` raise its own empty failure; the
@@ -452,3 +453,56 @@ class TestCloseHandshakeAndStreamClose:
         ws.close.side_effect = OSError("closed")
         result, _ = transfer(rbm, mocker, stream, ws)
         assert result is False and stream.closes == 1
+
+
+class TestCleanupNeverEscapesOrSkips:
+    def test_a_failing_settimeout_on_a_failed_transfer_still_closes_the_websocket(self, rbm, mocker):
+        stream = FakeStream()
+        ws = ok_ws()
+        ws.send_binary.side_effect = websocket.WebSocketTimeoutException("timed out")
+        ws.settimeout.side_effect = lambda v: (_ for _ in ()).throw(OSError("closed")) if v == 5 else None
+        result, set_anchor = transfer(rbm, mocker, stream, ws)
+        assert result is False
+        ws.close.assert_called_once()
+        assert stream.closes == 1
+        set_anchor.assert_not_called()
+
+    def test_every_settimeout_failing_on_a_connect_failure_still_closes_both(self, rbm, mocker):
+        stream = FakeStream()
+        ws = ok_ws()
+        ws.connect.side_effect = ConnectionRefusedError("refused")
+        ws.settimeout.side_effect = OSError("closed")
+        result, _ = transfer(rbm, mocker, stream, ws)
+        assert result is False
+        ws.close.assert_called_once()
+        assert stream.closes == 1
+
+    def test_a_raising_ws_close_escapes_nothing_and_the_stream_cleanup_still_runs(self, rbm, mocker):
+        """connect fails (so the stream was never entered): `ws.close()` raising must
+        not stop `stream.close()` -- the `zfs send` would block forever."""
+        stream = FakeStream()
+        ws = ok_ws()
+        ws.connect.side_effect = ConnectionRefusedError("refused")
+        ws.close.side_effect = RuntimeError("close exploded")
+        result, _ = transfer(rbm, mocker, stream, ws)
+        assert result is False
+        assert stream.closes == 1
+
+    def test_a_raising_ws_close_after_success_does_not_undo_the_transfer(self, rbm, mocker):
+        ws = ok_ws()
+        ws.close.side_effect = RuntimeError("close exploded")
+        stream = FakeStream([b"a"])
+        result, set_anchor = transfer(rbm, mocker, stream, ws)
+        assert result is True
+        set_anchor.assert_called_once()
+        assert stream.closes == 1
+
+    def test_a_raising_ws_close_and_a_raising_stream_close_still_escape_nothing(self, rbm, mocker):
+        stream = FakeStream()
+        stream.close = MagicMock(side_effect=Exception("zfs send exited 1"))
+        ws = ok_ws()
+        ws.connect.side_effect = ConnectionRefusedError("refused")
+        ws.close.side_effect = RuntimeError("close exploded")
+        result, _ = transfer(rbm, mocker, stream, ws)
+        assert result is False
+        stream.close.assert_called_once()

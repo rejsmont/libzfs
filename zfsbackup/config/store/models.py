@@ -73,6 +73,7 @@ from typing import List, Optional
 
 from sqlalchemy import (
     CheckConstraint,
+    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -100,6 +101,14 @@ class Base(DeclarativeBase):
     """Declarative base for every table in the config store."""
 
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+    # `Mapped[float]` means `Float()` on SQLAlchemy 2.0 but `DOUBLE` on 2.1.
+    # The Alembic baseline says `sa.Float()`, so on 2.1 the schema-drift check
+    # (`compare_metadata`) reported every duration column as changed. Naming
+    # the type here pins the metadata to the baseline on both versions, with
+    # no migration and no version pin. (SQLite stores both as REAL, so
+    # runtime behaviour never differed; only the declared type did.)
+    type_annotation_map = {float: Float()}
 
 
 class GlobalSettings(Base):

@@ -205,10 +205,11 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterator, Tuple, Union
+from typing import Dict, Iterator, Optional, Tuple, Union
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine, URL, make_url
@@ -573,6 +574,23 @@ def _install_begin_immediate(engine: Engine) -> None:
         conn.exec_driver_sql("BEGIN IMMEDIATE")
 
 
+def _reader_creator(database: Optional[str]):
+    """A DBAPI-connection factory that opens `database` with SQLite's
+    `mode=rw` (read-write, never create). See `make_engine`."""
+    from urllib.parse import quote  # noqa: PLC0415
+
+    if not database:
+        raise ValueError("a read-only file engine needs a database path")
+    # SQLite URI filenames percent-decode, so `%`, `?` and `#` must be quoted;
+    # `/` is kept. (A relative path stays relative: `file:rel.db`.)
+    uri = "file:" + quote(database, safe="/") + "?mode=rw"
+
+    def creator():  # noqa: ANN202
+        return sqlite3.connect(uri, uri=True, check_same_thread=False)
+
+    return creator
+
+
 def make_engine(
     url: str, *, readonly: bool = False, foreign_keys: bool = True
 ) -> Engine:
@@ -582,9 +600,10 @@ def make_engine(
     default path, prefer `config/store/paths.py`'s `open_config_session`
     / `open_config_connection` instead of calling this (or `get_engine`)
     directly on a hand-built URL -- they run `check_config_db`'s preflight
-    first, which this function cannot: `readonly=True` on a URL for a path that does not
-    yet exist silently creates a zero-byte file (see that module's
-    docstring for the measurement).
+    first, which this function cannot. (A `readonly=True` engine no longer
+    CREATES a missing file -- it opens with SQLite `mode=rw` -- but the
+    preflight is still what turns a missing or foreign file into an
+    operator-grade error instead of a bare `unable to open database file`.)
 
     Prefer `get_engine()`: this function has no pid awareness, so an engine
     it returns must not be allowed to cross a fork. It exists for tests and
@@ -683,7 +702,25 @@ def make_engine(
         # passing it again is redundant, and `QueuePool` is the right pool
         # for a file DB. This is also why item 8's `ApiWorker` Flask thread
         # will not hit "SQLite objects created in a thread...".
-        engine = create_engine(url)
+        if readonly:
+            # READERS NEVER CREATE THE DATABASE. A plain `sqlite:///path` URL
+            # opens READWRITE|CREATE, so a reader that lost a race with an
+            # `rm config.db` (the daemon's 10 s poll, `status --wait`'s 0.2 s
+            # poll) would conjure a zero-byte file owned by the reader --
+            # root, for the daemon -- which then blocks the operator's
+            # re-import. `mode=rw` is READWRITE without CREATE: a missing file
+            # is `unable to open database file`, nothing is created.
+            #
+            # Deliberately `mode=rw` and not `mode=ro` (still refused above,
+            # see this function's docstring): a reader must be able to create
+            # the WAL `-shm` file, which only a read-write open can. The
+            # reader stays read-only the way it always was, via
+            # `PRAGMA query_only` (+ the ORM guard). The `creator` (rather
+            # than a `file:` URL) keeps `engine.url.database` the plain path
+            # for the cache key, messages and the not-WAL warning latch.
+            engine = create_engine(url, creator=_reader_creator(parsed.database))
+        else:
+            engine = create_engine(url)
 
     _install_pragmas(
         engine, readonly=readonly, foreign_keys=foreign_keys, memory=memory

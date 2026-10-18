@@ -78,8 +78,11 @@ means don't wait. The answer is one of:
 - no daemon is running.
 
 `zfsbackup-config status` shows the stored generation and the generation the daemon runs, accepted or
-rejected. `status --wait SECONDS` exits 0 once the daemon is in sync, 1 if it rejected the stored
-configuration (or will never catch up), and 75 on timeout. Use it in scripts.
+rejected. `status --wait SECONDS` is meant for scripts. It exits:
+- 0 once the daemon is in sync, or when no daemon is running;
+- 1 if the daemon rejected the stored configuration, or will never catch up;
+- 75 on timeout;
+- 78 if the database is unusable or its schema is out of date.
 
 **When the CLI does not signal.** It only signals a process it can prove is the daemon:
 - that process holds the daemon lock on that exact file;
@@ -133,7 +136,9 @@ from the name, so the next send is likely a full one. `--clear-stale-props` remo
 `org.zfsbackup:*` properties. It is refused up front when the new dataset doesn't exist in ZFS yet (if
 you are about to `zfs rename`, those properties follow it). If a daemon is running, the rename itself is
 still saved but the properties are left alone: the command prints the `zfs inherit` commands to run
-after stopping the daemon and exits 1.
+after stopping the daemon and exits 1. If you rename the ZFS dataset itself after renaming it in the
+configuration, run `systemctl reload zfsbackup` afterwards, so the daemon re-syncs the renamed dataset's
+`org.zfsbackup:config` property.
 
 `rename destination` and `--clear-stale-props` change ZFS user properties, so they need ZFS write
 rights on the datasets involved: run them as root, or grant them with
@@ -302,19 +307,31 @@ After=zfs-import.target
 Type=simple
 ExecStart=/usr/bin/python3 -m zfsbackup.daemon -c /var/lib/zfsbackup/config.db
 ExecReload=/bin/kill -HUP $MAINPID
-# SIGTERM only the supervisor. It stops its workers at their next safe point and
-# never tears a transfer; the default (control-group) would SIGTERM every worker
-# directly and kill a `zfs send` mid-stream.
+# On `systemctl stop`, SIGTERM only the supervisor. It raises its stop flag;
+# workers leave at their next safe point, and the API worker gives in-flight
+# receives up to 20 s. The default (control-group) would SIGTERM every worker
+# directly and cut a `zfs send` mid-stream.
 KillMode=mixed
-# Long enough for workers to reach a safe point. The supervisor itself gives up
-# on a worker after about 70 s.
+# The supervisor waits up to 30 s for workers, then escalates; a realistic stop
+# takes well under a minute. 90 s leaves room for a stop that lands during a
+# reload (a database read plus one `zfs` call).
 TimeoutStopSec=90
 Restart=on-failure
+# A daemon killed by a stray SIGHUP should be restarted, not treated as a clean exit.
+RestartForceExitStatus=SIGHUP
 RestartSec=60
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+**If the supervisor crashes** (OOM, `kill -9`), its workers finish their current dataset or transfer and
+exit on their own, and a newly started daemon waits for them (the `workers.lock`). With
+`KillMode=mixed`, though, systemd kills the remaining workers as soon as the supervisor is gone, so a
+transfer in progress is cut. It resumes from where it stopped (`zfs receive -s`) and nothing is lost, but
+the progress since the last resume point has to be sent again. If long transfers matter more to you than
+a clean cgroup, use `KillMode=process` instead: survivors then finish their transfer, at the cost of
+systemd not reaping them for you.
 
 Enable and start:
 ```bash

@@ -1,13 +1,34 @@
 #!/usr/bin/env python3
 """ZFS Backup Daemon - Main entry point."""
 
-import argparse
-import logging
-import multiprocessing
-import os
 import signal
-import sys
-import time
+
+# FIRST, before any other import: in the daemon process itself (`python -m
+# zfsbackup.daemon`), ignore SIGHUP. Its default action is terminate, and the
+# imports below (SQLAlchemy, Alembic, libzfseasy, ...) plus argparse take a
+# few hundred milliseconds before `_StartupHup.install()` can catch it -- so
+# `systemctl reload` straight after `start`, or a CLI write racing the start,
+# killed the daemon (exit 129, which `Restart=on-failure` does not restart).
+# Ignoring is lossless: the startup read happens later and sees every write
+# committed before it. `_StartupHup.install()` replaces this with its flag
+# handler, and `_StartupHup.restore()` puts it back. Only for `__main__`, so an
+# importer (the test suite, the CLI) keeps its own disposition -- and SIG_IGN,
+# unlike a handler, would survive into every process it execs.
+#
+# Accepted residual: the interpreter's own start-up before this line (exec,
+# `site`, runpy, the trivial `zfsbackup/__init__.py`; ~25 ms) cannot be closed
+# from Python -- a SIGHUP there still kills the process. The systemd unit
+# covers it with `RestartForceExitStatus=SIGHUP` (a SIGHUP death is
+# restarted, and the restart's startup read sees every committed write).
+if __name__ == '__main__':  # pragma: no cover - the real process only
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+import argparse  # noqa: E402
+import logging  # noqa: E402
+import multiprocessing  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -1003,6 +1024,10 @@ class BackupDaemon:
             stored = (state.store_id, state.generation)
             if stored in (h.key, self._rejected, self._poll_skip):
                 return
+            # The poll can block for up to `busy_timeout`: a stop that landed
+            # meanwhile must not start a full read and a reload.
+            if self._stop_event.is_set():
+                return
             self._try_reload('poll', startup=startup, polled=stored)
         else:
             self._try_reload('SIGHUP', startup=startup)
@@ -1719,5 +1744,17 @@ def _run_startup(
             lock.release()
 
 
+def _process_main() -> int:  # pragma: no cover - the real process only
+    """`main()` for the daemon process itself: SIGHUP is ignored again on the
+    way out, whatever path `main()` took, so a SIGHUP during interpreter
+    shutdown (multiprocessing's atexit joins, module teardown) cannot turn an
+    exit status into a signal death. Not part of `main()`, so embedded and
+    test callers keep their own disposition (`_StartupHup.restore()`)."""
+    try:
+        return main()
+    finally:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+
 if __name__ == '__main__':  # pragma: no cover
-    sys.exit(main())
+    sys.exit(_process_main())

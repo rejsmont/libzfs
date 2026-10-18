@@ -350,6 +350,38 @@ print("READY", flush=True)
 time.sleep(600)
 EOF
     put_file "$t/forger.py" "$FIX_DIR/forger.py" 644
+    # reloadreason.py: ask request_reload() what it would do and why (outcome + reason_code), exactly as the
+    # CLI does after a write. It SIGHUPs only a verified daemon; every forgery below must be refused.
+    cat > "$t/reloadreason.py" <<'EOF'
+from zfsbackup import daemonlock
+from zfsbackup.config.store import resolve_config_path
+r = daemonlock.request_reload(resolve_config_path(None))
+print("outcome=%s reason=%s pid=%s" % (r.outcome, r.reason_code, r.pid))
+EOF
+    put_file "$t/reloadreason.py" "$FIX_DIR/reloadreason.py" 644
+    # forger2.py: group (f4c), the recycled-pid shape. Take LOCK_EX on the pid file, fork a child that
+    # inherits the descriptor (so the lock outlives the parent's fd), write a pid file naming the PARENT
+    # with its real start token, then CLOSE the parent's descriptor and stay alive. The lock table still
+    # names the parent as the locker (step 7 passes) but the parent no longer has the file open (step 8b).
+    # usage: forger2.py <pidfile> <store-id> <generation>
+    cat > "$t/forger2.py" <<'EOF'
+import fcntl, os, sys, time
+from zfsbackup import procident
+path, store, gen = sys.argv[1:4]
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o660)
+fcntl.flock(fd, fcntl.LOCK_EX)
+if os.fork() == 0:
+    time.sleep(600)
+    os._exit(0)
+pid = os.getpid()
+text = "%s\n%s\nstart=%s\napplied=%s:%s\n" % (pid, gen, procident.start_token(pid), store, gen)
+os.pwrite(fd, text.encode(), 0)
+os.ftruncate(fd, len(text))
+os.close(fd)
+print("READY", flush=True)
+time.sleep(600)
+EOF
+    put_file "$t/forger2.py" "$FIX_DIR/forger2.py" 644
     # wlock.py: group (f6b). Hold a SHARED lock on <db>.workers.lock, as a surviving worker of a previous
     # daemon would. usage: wlock.py <workers-lock-path>
     cat > "$t/wlock.py" <<'EOF'
@@ -1009,6 +1041,8 @@ msh "rm -f '$PIDFILE'; install -m 660 -o root -g $SVC_GROUP /dev/null '$PIDFILE'
 if start_forger; then
     pass "(f4a) alice holds LOCK_EX on the root-owned pid file, which names the decoy (pid $decoy) with its correct start token"
     check "(f4a) the pid file really names the decoy" "$decoy" "$(msh "head -n1 '$PIDFILE'" | tr -d '[:space:]')"
+    check_re "(f4a) request_reload: refused by step 7 (the decoy is not in the lock table)" "outcome=supervisor-gone reason=not-lock-holder" \
+        "$(msh "'$ENV_WRAP' '$PY' '$FIX_DIR/reloadreason.py' 2>&1")"
     out="$(cli_as root set check_interval 5m)"; rc=$?
     check "(f4a) root 'set' still exits 0 (the write is durable)" "0" "$rc"
     check_no_re "(f4a) the CLI did NOT report a reload request" "reload requested from daemon pid" "$out"
@@ -1037,6 +1071,37 @@ if start_forger; then
     msh "kill -0 $decoy" && pass "(f4b) the decoy survived 'status' too" || fail "(f4b) the decoy died during status"
 else
     fail "(f4b) could not start the forger"
+fi
+# f4c: recycled-pid shape. The lock table names a LIVE process with a matching start token, but that
+# process no longer has the pid file open (a forked child holds the lock) - step 8b must refuse it.
+msh "systemctl stop $FORGE_UNIT" >/dev/null 2>&1 || true
+msh "rm -f '$PIDFILE'; install -m 660 -o root -g $SVC_GROUP /dev/null '$PIDFILE'"
+msh "
+    systemctl reset-failed $FORGE_UNIT 2>/dev/null || true
+    : > /tmp/forger.out; chmod 666 /tmp/forger.out
+    systemd-run --unit=$FORGE_UNIT --collect -p User=alice -p StandardOutput=append:/tmp/forger.out \
+        -p StandardError=append:/tmp/forger.out \
+        '$ENV_WRAP' '$PY' '$FIX_DIR/forger2.py' '$PIDFILE' '$store_id' '$gen_f4'
+" || warn "could not start forger2"
+waited=0; until msh "grep -q READY /tmp/forger.out" 2>/dev/null; do [ "$waited" -ge 30 ] && break; sleep 1; waited=$((waited+1)); done
+fpid="$(msh "head -n1 '$PIDFILE'" | tr -d '[:space:]')"
+if msh "grep -q READY /tmp/forger.out" 2>/dev/null && [ -n "$fpid" ]; then
+    pass "(f4c) alice's process $fpid holds the lock through a forked child, names itself with its real start token, and has closed the file"
+    check "(f4c) the pid file's pid has the file closed (no /proc/$fpid/fd entry for it)" "0" \
+        "$(msh "ls -l /proc/$fpid/fd | grep -c 'daemon.pid'")"
+    check_re "(f4c) the lock table still names pid $fpid as the locker (so step 7 alone would accept it)" "FLOCK +ADVISORY +WRITE $fpid " \
+        "$(msh "cat /proc/locks")"
+    check_re "(f4c) request_reload: refused by step 8b (reason file-not-open), not by the lock table" "outcome=supervisor-gone reason=file-not-open" \
+        "$(msh "'$ENV_WRAP' '$PY' '$FIX_DIR/reloadreason.py' 2>&1")"
+    out="$(cli_as root set check_interval 8m)"; rc=$?
+    check "(f4c) root 'set' exits 0" "0" "$rc"
+    info "(f4c) CLI said: $(printf '%s' "$out" | grep 'config updated' | tail -n1)"
+    check_no_re "(f4c) the CLI did NOT report a reload request" "reload requested from daemon pid" "$out"
+    check_re "(f4c) the notice says it was not signalled (does not have the lock file open)" "does not have the daemon lock file open|not signalled|was not signalled" "$out"
+    sleep 1
+    msh "kill -0 $fpid" && pass "(f4c) the process named in the pid file is still alive (never SIGHUPed)" || fail "(f4c) it was SIGHUPed"
+else
+    fail "(f4c) could not start forger2: $(msh 'cat /tmp/forger.out')"
 fi
 stop_daemon                              # stops the forger and the decoy as well
 msh "rm -f '$PIDFILE'" || true

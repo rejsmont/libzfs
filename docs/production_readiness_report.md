@@ -94,9 +94,16 @@ closing the identical latent gap before it could bite.
 
 ## Operations
 
-- No systemd unit / daemonization / PID file; the daemon runs foreground only.
-- Worker auto-restart loops every 5s indefinitely with no backoff cap (`daemon.py`).
-- `--test-config` validates parsing only — not that datasets exist or destinations resolve.
+- *(Updated 2026-10-18.)* A documented systemd unit ships in `zfsbackup/README.md`, with `ExecReload`,
+  `KillMode=mixed` and `TimeoutStopSec`. The daemon holds a presence lock and pid file
+  (`<db>.daemon.pid`), and reloads its configuration live on SIGHUP and on a 10 s poll.
+- Worker restarts use exponential backoff (5 s to 80 s). After 6 consecutive short-lived crashes the
+  daemon exits 1 and names the configuration generation (A-5, D9).
+- **Open:** a reload is checked by validating the config and building its dataset list, but its API bind
+  is not tested. A new `api_port` that is in use (or a low port for a non-root daemon) is accepted, and
+  the API worker then crash-loops into D9. Follow-up: test-bind on reload when the port changes.
+- `--test-config` validates the config and builds the dataset list. It does not check that datasets
+  exist or that destinations resolve.
 - Werkzeug's development server (`make_server`) is used in the `ApiWorker` — not a production WSGI server.
 
 **Good:** graceful `SIGINT`/`SIGTERM` shutdown via a shared `StopFlag` (was a `multiprocessing.Event`, which wedged the supervisor whenever a worker died mid-`wait()` — see plan item 8x); anchor-aware retention
@@ -114,8 +121,9 @@ unfinished areas are the security layer and resume.
 
 ## Suggested remediation order
 
-1. B2 (declare `requests`) — trivial, unblocks clean installs.
+1. ~~B2 (declare `requests`)~~ — done.
 2. B1 (auth + TLS on the API; validate/authorize `client_id`) — the real deployment gate.
 3. H5 (`-i` → `-I`) and H4 (finish or remove resume) — correctness/completeness.
 4. M6 (surface backup failures) and M7/M8 (pruning safety) — reliability hardening.
-5. Ops (systemd unit, production WSGI, restart backoff).
+5. Ops: production WSGI, and the reload-time API bind check (the systemd unit and restart backoff are
+   done).

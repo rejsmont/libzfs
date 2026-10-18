@@ -119,7 +119,7 @@ from click.testing import CliRunner
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError, SQLAlchemyError
 
-from _cli_support import FakeDaemon, UNVERIFIED_LINUX_ONLY, fake_daemon, store_key, unsignalable
+from _cli_support import FakeDaemon, UNVERIFIED_LINUX_ONLY, fake_daemon, live_daemon, store_key, unsignalable
 from zfsbackup import daemonlock
 from zfsbackup.cli import errors as cli_errors
 from zfsbackup.cli import main as cli_main
@@ -4696,27 +4696,29 @@ class TestDaemonNoticeWording:
         )
 
     def test_a_daemon_already_on_the_written_generation_has_nothing_to_restart(
-        self, resolved, db, fake_daemon
+        self, resolved, db, live_daemon
     ):
-        fake_daemon(db, generation=5, applied=(7, 5))
+        live_daemon(db, generation=5, applied=(7, 5))
         line, warning = cli_write._daemon_notice(resolved, 5, 7)
-        assert line == "config updated (generation 5); running daemon pid 4321 is already on generation 5"
+        assert line == (
+            f"config updated (generation 5); running daemon pid {os.getpid()} is already on generation 5"
+        )
         assert warning is None
         assert "restart" not in line
 
-    def test_the_same_generation_through_notify_prints_it(self, resolved, db, fake_daemon, capsys):
-        fake_daemon(db, generation=5, applied=(7, 5))
+    def test_the_same_generation_through_notify_prints_it(self, resolved, db, live_daemon, capsys):
+        live_daemon(db, generation=5, applied=(7, 5))
         cli_write.notify_daemon(resolved, 5, 7)
         out = capsys.readouterr()
         assert out.out == (
-            "config updated (generation 5); running daemon pid 4321 is already on generation 5\n"
+            f"config updated (generation 5); running daemon pid {os.getpid()} is already on generation 5\n"
         )
         assert out.err == ""
 
     def test_the_same_generation_of_another_store_is_not_already_applied(
-        self, resolved, db, fake_daemon
+        self, resolved, db, live_daemon
     ):
-        fake_daemon(db, generation=5, applied=(8, 5))
+        live_daemon(db, generation=5, applied=(8, 5))
         line, _ = cli_write._daemon_notice(resolved, 5, 7)
         assert "already on" not in line
 
@@ -4915,11 +4917,11 @@ class TestStartupWindowNotice:
             "config updated (generation 1); " + UNVERIFIED_LINUX_ONLY.format(pid=holder.pid)
         )
 
-    def test_an_import_whose_key_the_daemon_already_runs(self, run, db, fake_daemon, monkeypatch):
+    def test_an_import_whose_key_the_daemon_already_runs(self, run, db, live_daemon, monkeypatch):
         """The daemon applied exactly the key the import wrote (it was quicker
         than the CLI's own check): nothing to ask, and it says so."""
         import_ok(run, db)
-        daemon = fake_daemon(db, generation=0)
+        daemon = live_daemon(db, generation=0)
         real = daemonlock.request_reload
 
         def after_the_daemon_caught_up(resolved, *, skip_if_applied=None):
@@ -4929,7 +4931,7 @@ class TestStartupWindowNotice:
         monkeypatch.setattr(daemonlock, "request_reload", after_the_daemon_caught_up)
         result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))  # writes generation 1
         assert result.stdout.splitlines()[-1] == (
-            "config updated (generation 1); running daemon pid 4321 is already on generation 1"
+            f"config updated (generation 1); running daemon pid {os.getpid()} is already on generation 1"
         )
         assert store_key(db)[1] == 1
 

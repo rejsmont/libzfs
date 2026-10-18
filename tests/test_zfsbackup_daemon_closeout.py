@@ -35,7 +35,7 @@ import pytest
 
 from _hermetic import hermetic_env
 from test_zfsbackup_daemon import _args, _stub_daemon, no_hard_exit  # noqa: F401
-from test_zfsbackup_daemonlock import real_daemon_env  # noqa: F401  (fixture)
+from test_zfsbackup_daemonlock import real_daemon_env, spawn_daemon  # noqa: F401  (fixtures)
 from zfsbackup import daemon as daemon_module
 from zfsbackup import daemonlock, workers
 from zfsbackup.config import BackupConfig, DatasetConfig
@@ -907,3 +907,120 @@ class TestApiWorkerWithARealOccupiedPort:
             assert "API listening" not in caplog.text
         finally:
             blocker.server_close()
+
+
+# ---------------------------------------------------------------------------
+# SIGHUP before the daemon can catch it (final review, item A)
+# ---------------------------------------------------------------------------
+
+
+class TestEarlySighupDisposition:
+    @pytest.fixture
+    def keep_sighup(self):
+        previous = signal.getsignal(signal.SIGHUP)
+        yield
+        signal.signal(signal.SIGHUP, previous)
+
+    def test_importing_the_daemon_module_leaves_sighup_alone(self):
+        """The `SIG_IGN` is for `__main__` only: an importer (the test suite,
+        the CLI) keeps its disposition -- and an ignore would be inherited by
+        every process it execs."""
+        script = (
+            "import signal\n"
+            "signal.signal(signal.SIGHUP, signal.SIG_DFL)\n"
+            "import zfsbackup.daemon\n"
+            "print('DFL' if signal.getsignal(signal.SIGHUP) == signal.SIG_DFL else 'CHANGED')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=120,
+            cwd=str(REPO), env=hermetic_env(PYTHONPATH=str(REPO)),
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "DFL"
+
+    def test_importing_it_does_not_replace_a_custom_handler_either(self):
+        script = (
+            "import signal\n"
+            "def mine(s, f): pass\n"
+            "signal.signal(signal.SIGHUP, mine)\n"
+            "import zfsbackup.daemon\n"
+            "print('MINE' if signal.getsignal(signal.SIGHUP) is mine else 'CHANGED')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=120,
+            cwd=str(REPO), env=hermetic_env(PYTHONPATH=str(REPO)),
+        )
+        assert result.stdout.strip() == "MINE", result.stderr
+
+    @pytest.mark.parametrize("previous", [signal.SIG_DFL, signal.SIG_IGN])
+    def test_a_refusal_restores_the_previous_disposition(
+        self, sqlite_config_db, mocker, daemon_lock_holder, keep_sighup, no_hard_exit, previous
+    ):
+        daemon_lock_holder(sqlite_config_db.path, generation=3)
+        _stub_daemon(mocker)
+        signal.signal(signal.SIGHUP, previous)
+        assert daemon_module._run(_args(sqlite_config_db.path)) == 1
+        assert signal.getsignal(signal.SIGHUP) == previous
+
+    @pytest.mark.parametrize("previous", [signal.SIG_DFL, signal.SIG_IGN])
+    def test_test_config_leaves_the_disposition_alone(self, sqlite_config_db, keep_sighup, previous):
+        signal.signal(signal.SIGHUP, previous)
+        assert daemon_module._run(_args(sqlite_config_db.path, test_config=True)) == 0
+        assert signal.getsignal(signal.SIGHUP) == previous
+
+    @pytest.mark.parametrize("outcome", ["returns", "raises"])
+    def test_process_main_leaves_sighup_ignored_whatever_main_does(self, keep_sighup, mocker, outcome):
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        if outcome == "returns":
+            mocker.patch.object(daemon_module, "main", return_value=7)
+            assert daemon_module._process_main() == 7
+        else:
+            mocker.patch.object(daemon_module, "main", side_effect=RuntimeError("boom"))
+            with pytest.raises(RuntimeError):
+                daemon_module._process_main()
+        assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+
+    def test_process_main_is_what_the_module_runs(self):
+        source = Path(daemon_module.__file__).read_text()
+        assert "sys.exit(_process_main())" in source
+        assert source.index("signal.signal(signal.SIGHUP, signal.SIG_IGN)") < source.index("import argparse")
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+class TestEarlySighupInARealDaemon:
+    """`zfsbackup-config`'s auto-reload SIGHUP (or `systemctl reload` straight
+    after `start`) lands while the interpreter is still importing SQLAlchemy and
+    friends. A few tens of milliseconds are accepted residue (interpreter start-up
+    before the first line, which Python cannot close), so the earliest delay
+    tested is 50 ms -- never 0."""
+
+    @pytest.mark.parametrize("delay", [0.05, 0.1, 0.2])
+    def test_the_daemon_survives_and_a_later_sigterm_exits_zero(self, real_daemon_env, spawn_daemon, delay):
+        proc, log = spawn_daemon()
+        time.sleep(delay)
+        os.kill(proc.pid, signal.SIGHUP)
+        # alive well past the import window, and still alive when the workers start
+        assert wait_until(lambda: "Started snapshot worker" in log_text(log), 90), log_text(log)
+        assert proc.poll() is None, f"the daemon died of an early SIGHUP:\n{log_text(log)}"
+        os.kill(proc.pid, signal.SIGTERM)
+        assert proc.wait(timeout=60) == 0, log_text(log)
+
+    def test_a_hup_burst_during_startup_is_survived(self, real_daemon_env, spawn_daemon):
+        proc, log = spawn_daemon()
+        for _ in range(5):
+            time.sleep(0.08)
+            os.kill(proc.pid, signal.SIGHUP)
+        assert wait_until(lambda: "Started snapshot worker" in log_text(log), 90), log_text(log)
+        assert proc.poll() is None
+        os.kill(proc.pid, signal.SIGTERM)
+        assert proc.wait(timeout=60) == 0, log_text(log)
+
+    def test_the_hup_is_handled_as_a_reload_not_ignored_forever(self, real_daemon_env, spawn_daemon):
+        proc, log = spawn_daemon()
+        assert wait_until(lambda: "Started snapshot worker" in log_text(log), 90), log_text(log)
+        os.kill(proc.pid, signal.SIGHUP)
+        assert wait_until(lambda: "SIGHUP: configuration unchanged" in log_text(log), 60), log_text(log)
+        assert proc.poll() is None
+        os.kill(proc.pid, signal.SIGTERM)
+        assert proc.wait(timeout=60) == 0

@@ -2198,3 +2198,60 @@ class TestWorkerConfigHandoffToRealChildren:
         assert records_seen[0]['pid'] != records_seen[1]['pid']
         names = [d['name'] for d in records_seen[1]['signature']['datasets']]
         assert names == ['pool/data', 'pool/other']  # not 'pool/replaced'
+
+
+class TestReloadTickStopDuringThePoll:
+    """The poll can block for up to `busy_timeout`; a stop that lands meanwhile
+    must not start a full read and a reload."""
+
+    @pytest.fixture
+    def daemon(self, literal_config_db, mocker):
+        mocker.patch('zfsbackup.daemon.dispose_all')
+        config = BackupConfig(datasets=[DatasetConfig(name='pool/data')])
+        return BackupDaemon(config, literal_config_db, key=(1, 1))
+
+    def test_a_stop_raised_by_the_poll_itself_reads_nothing_and_reloads_nothing(self, daemon, mocker):
+        def read_store_state(resolved):
+            daemon._stop_event.set()                           # lands while the poll is blocked
+            return MagicMock(store_id=1, generation=2)         # ... and the key has changed
+
+        mocker.patch('zfsbackup.daemon.read_store_state', side_effect=read_store_state)
+        load = mocker.patch('zfsbackup.daemon.load_runtime_config')
+        try_reload = mocker.patch.object(daemon, '_try_reload')
+        daemon._reload_tick(startup=True)
+        try_reload.assert_not_called()
+        load.assert_not_called()
+
+    def test_without_the_stop_the_same_changed_key_does_reload(self, daemon, mocker):
+        """Non-vacuous: only the stop made the difference."""
+        mocker.patch('zfsbackup.daemon.read_store_state', return_value=MagicMock(store_id=1, generation=2))
+        try_reload = mocker.patch.object(daemon, '_try_reload')
+        daemon._reload_tick(startup=True)
+        try_reload.assert_called_once()
+        assert try_reload.call_args.args[0] == 'poll'
+
+    def test_a_stop_already_raised_skips_even_the_poll(self, daemon, mocker):
+        daemon._stop_event.set()
+        read = mocker.patch('zfsbackup.daemon.read_store_state')
+        try_reload = mocker.patch.object(daemon, '_try_reload')
+        daemon._reload_tick(startup=True)
+        read.assert_not_called()
+        try_reload.assert_not_called()
+
+    def test_an_unchanged_key_reloads_nothing_either_way(self, daemon, mocker):
+        mocker.patch('zfsbackup.daemon.read_store_state', return_value=MagicMock(store_id=1, generation=1))
+        try_reload = mocker.patch.object(daemon, '_try_reload')
+        daemon._reload_tick(startup=True)
+        try_reload.assert_not_called()
+
+    def test_the_engine_is_disposed_after_a_poll_that_raised_the_stop(self, daemon, mocker):
+        dispose = mocker.patch('zfsbackup.daemon.dispose_all')
+
+        def read_store_state(resolved):
+            daemon._stop_event.set()
+            return MagicMock(store_id=1, generation=2)
+
+        mocker.patch('zfsbackup.daemon.read_store_state', side_effect=read_store_state)
+        mocker.patch.object(daemon, '_try_reload')
+        daemon._reload_tick(startup=True)
+        dispose.assert_called()

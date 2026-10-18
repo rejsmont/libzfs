@@ -7044,26 +7044,28 @@ class TestPathsCheckConfigDbMissingFile:
 
         assert not missing.exists()
 
-    def test_positive_control_readonly_engine_does_create_a_file(
+    def test_a_readonly_engine_on_a_missing_path_raises_and_creates_nothing(
         self, tmp_path
     ):
-        """The other half of the assertion above. Without this positive
-        control, `not missing.exists()` in the test above cannot be told
-        apart from a test that never exercised the hazard at all -- this
-        proves the exact same kind of path, opened the way `check_config_db`
-        exists to prevent, really does create the file.
-        """
+        """The other half of the assertion above, inverted since readers open
+        with SQLite `mode=rw` (read-write, never create): the hazard
+        `check_config_db` exists to prevent -- a reader conjuring an empty
+        file -- is now closed in the engine itself, as well as by the
+        preflight. (Before, this test proved the opposite: that the engine
+        really did create the file.)"""
         missing = tmp_path / "would_be_created.db"
         assert not missing.exists()
 
         engine = make_engine(url_for_path(missing), readonly=True)
         try:
-            with engine.connect():
-                pass
+            with pytest.raises(OperationalError):
+                with engine.connect():
+                    pass
         finally:
             engine.dispose()
 
-        assert missing.exists()
+        assert not missing.exists()
+        assert sorted(os.listdir(tmp_path)) == []
 
 
 @pytest.mark.unit
@@ -9084,3 +9086,327 @@ class TestLoadConfigSnapshotWarnNeverPrune:
         load_config_snapshot(forever_session, warn_never_prune=False)
         load_config_snapshot(forever_session)
         assert seen == [{"warn_never_prune": False}, {"warn_never_prune": True}]
+
+
+# ==========================================================================
+# Item 23: readers open with SQLite `mode=rw` -- they never create the file
+# ==========================================================================
+
+
+def _store_path(tmp_path, name="store/config.db", source="--config"):
+    return ResolvedConfigPath(path=tmp_path / name, source=source)
+
+
+def _seeded(tmp_path, name="store/config.db"):
+    """A real database made by `import_yaml`; -> its `ResolvedConfigPath`."""
+    resolved = _store_path(tmp_path, name)
+    source = tmp_path / "seed.yaml"
+    source.write_text(
+        "datasets:\n  - name: tank/a\n    frequency: 1h\n    retention:\n      1d: 30d\n"
+    )
+    import_yaml(source, resolved)
+    dispose_all()
+    return resolved
+
+
+def _delete_database(resolved, *, keep_main=False):
+    dispose_all()
+    path = Path(str(resolved.resolved_path))
+    for suffix in ("-wal", "-shm", "-journal") if keep_main else ("", "-wal", "-shm", "-journal"):
+        Path(str(path) + suffix).unlink(missing_ok=True)
+
+
+def _only(directory):
+    return sorted(os.listdir(directory))
+
+
+@pytest.mark.unit
+class TestReadersNeverCreateTheDatabase:
+    def test_a_file_backed_reader_engine_connects_through_a_creator_with_mode_rw(self, tmp_path):
+        seen = []
+        real = sqlite3.connect
+
+        def spy(database, *args, **kwargs):
+            seen.append((database, kwargs.get("uri")))
+            return real(database, *args, **kwargs)
+
+        path = tmp_path / "x.db"
+        sqlite3.connect(str(path)).close()
+        with mock.patch.object(store_db.sqlite3, "connect", spy):
+            engine = make_engine(url_for_path(path), readonly=True)
+            try:
+                with engine.connect():
+                    pass
+            finally:
+                engine.dispose()
+        assert seen and seen[0][1] is True
+        assert seen[0][0].startswith("file:") and seen[0][0].endswith("?mode=rw")
+
+    def test_a_writer_engine_does_not_use_it(self, tmp_path):
+        engine = make_engine(url_for_path(tmp_path / "w.db"))
+        try:
+            assert not str(engine.pool._creator).count("_reader_creator")
+            with engine.connect():
+                pass
+        finally:
+            engine.dispose()
+        assert (tmp_path / "w.db").exists()
+
+    def test_the_engine_url_still_names_the_plain_path(self, tmp_path):
+        """Cache keys, messages and the not-WAL warning latch all use it."""
+        path = tmp_path / "x.db"
+        engine = make_engine(url_for_path(path), readonly=True)
+        try:
+            assert engine.url.database == str(path)
+        finally:
+            engine.dispose()
+
+    def test_a_missing_path_is_an_operational_error_with_nothing_created(self, tmp_path):
+        engine = make_engine(url_for_path(tmp_path / "nope.db"), readonly=True)
+        try:
+            with pytest.raises(OperationalError, match="unable to open database file"):
+                engine.connect()
+        finally:
+            engine.dispose()
+        assert _only(tmp_path) == []  # no file, no -wal, no -shm
+
+    def test_a_missing_directory_is_also_just_an_error(self, tmp_path):
+        engine = make_engine(url_for_path(tmp_path / "nodir" / "x.db"), readonly=True)
+        try:
+            with pytest.raises(OperationalError):
+                engine.connect()
+        finally:
+            engine.dispose()
+        assert _only(tmp_path) == []
+
+    def test_the_database_removed_between_preflight_and_connect_does_not_reappear(
+        self, tmp_path
+    ):
+        resolved = _seeded(tmp_path)
+        directory = resolved.resolved_path.parent
+        real_check = store_paths.check_config_db
+
+        def check_then_delete(*args, **kwargs):
+            result = real_check(*args, **kwargs)  # the preflight passes...
+            _delete_database(resolved)            # ...and then the file is gone
+            return result
+
+        with mock.patch.object(store_paths, "check_config_db", check_then_delete):
+            with pytest.raises(OperationalError):
+                with open_config_session(resolved, readonly=True) as session:
+                    session.execute(text("SELECT 1"))
+        dispose_all()
+        assert not Path(resolved.resolved_path).exists()
+        assert [n for n in _only(directory) if n.startswith("config.db") and not n.endswith(".lock")] == []
+
+    def test_a_wal_database_whose_sidecars_were_deleted_still_reads(self, tmp_path):
+        from zfsbackup.config.store import read_config, read_generation, read_store_state
+
+        resolved = _seeded(tmp_path)
+        _delete_database(resolved, keep_main=True)  # -wal / -shm gone, main file kept
+        state = read_store_state(resolved)
+        dispose_all()
+        assert state.generation == 0 and state.store_id != 0
+        assert read_generation(resolved) == 0
+        dispose_all()
+        snapshot = read_config(resolved)
+        dispose_all()
+        assert [d.name for d in snapshot.config.datasets] == ["tank/a"]
+        assert snapshot.store_id == state.store_id
+
+    def test_a_writer_works_after_the_readers_recreated_the_sidecars(self, tmp_path):
+        from zfsbackup.config.store import read_config, read_store_state, write_config
+
+        resolved = _seeded(tmp_path)
+        _delete_database(resolved, keep_main=True)
+        read_store_state(resolved)
+        dispose_all()
+        snapshot = read_config(resolved)
+        dispose_all()
+        result = write_config(resolved, snapshot.config, expected_generation=snapshot.generation)
+        assert result.generation == snapshot.generation + 1
+        dispose_all()
+        assert read_store_state(resolved).generation == snapshot.generation + 1
+        dispose_all()
+
+    @pytest.mark.parametrize(
+        "name",
+        ["we ird dir/config.db", "100%/config.db", "a#b/c.db", "pct%41/x.db", "uni\u00e9/c.db"],
+        ids=["space", "percent", "hash", "percent-escape-lookalike", "unicode"],
+    )
+    def test_awkward_path_characters_work(self, tmp_path, name):
+        """SQLite URI filenames percent-decode and end at `?`/`#`: the creator
+        must quote them, or it opens (or fails to find) a different file."""
+        from zfsbackup.config.store import read_store_state
+
+        resolved = _seeded(tmp_path, name)
+        assert read_store_state(resolved).generation == 0
+        dispose_all()
+        assert Path(resolved.resolved_path).exists()
+
+    def test_a_percent_escape_lookalike_does_not_open_the_decoded_name(self, tmp_path):
+        """A directory literally called `pct%41` and one called `pctA`: the
+        reader must read the first."""
+        from zfsbackup.config.store import read_store_state
+
+        resolved = _seeded(tmp_path, "pct%41/config.db")
+        (tmp_path / "pctA").mkdir()
+        assert read_store_state(resolved).store_id != 0
+        dispose_all()
+        assert _only(tmp_path / "pctA") == []
+
+    def test_the_creator_quotes_a_question_mark_and_a_hash(self, tmp_path):
+        """The paths layer refuses a `?` before it gets here, but the creator
+        must not depend on that: unquoted, `?` ends the filename."""
+        for name in ("c?d.db", "e#f.db", "g%h.db"):
+            target = tmp_path / name
+            sqlite3.connect(str(target)).close()
+            conn = store_db._reader_creator(str(target))()
+            try:
+                assert conn.execute("SELECT 1").fetchone() == (1,)
+            finally:
+                conn.close()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["c?d.db", "e#f.db", "g%h.db"]
+
+    def test_the_creator_never_creates(self, tmp_path):
+        with pytest.raises(sqlite3.OperationalError):
+            store_db._reader_creator(str(tmp_path / "missing.db"))()
+        assert _only(tmp_path) == []
+
+    def test_a_relative_path_is_read_relative_to_the_working_directory(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        sqlite3.connect("rel.db").close()
+        engine = make_engine("sqlite:///rel.db", readonly=True)
+        try:
+            with engine.connect() as conn:
+                assert conn.exec_driver_sql("SELECT 1").scalar() == 1
+        finally:
+            engine.dispose()
+
+    def test_a_readonly_engine_still_refuses_writes(self, tmp_path):
+        resolved = _seeded(tmp_path)
+        engine = make_engine(url_for_path(resolved.resolved_path), readonly=True)
+        try:
+            with engine.connect() as conn:
+                with pytest.raises(OperationalError, match="readonly|read-only|read only"):
+                    conn.exec_driver_sql("UPDATE global_settings SET generation = 99")
+        finally:
+            engine.dispose()
+        from zfsbackup.config.store import read_store_state
+
+        assert read_store_state(resolved).generation == 0
+        dispose_all()
+
+    @pytest.mark.parametrize("reader", ["read_store_state", "read_generation", "read_config"])
+    def test_the_access_readers_on_a_deleted_database_raise_and_create_nothing(
+        self, tmp_path, reader
+    ):
+        import zfsbackup.config.store as store
+
+        resolved = _seeded(tmp_path)
+        directory = resolved.resolved_path.parent
+        # What the daemon's poll or `status --wait` holds when the file is removed:
+        # a resolved path whose preflight is not repeated.
+        _delete_database(resolved)
+        before = _only(directory)
+        with pytest.raises(Exception):
+            getattr(store, reader)(resolved)
+        dispose_all()
+        assert _only(directory) == before
+        assert not Path(resolved.resolved_path).exists()
+
+    def test_the_cached_get_engine_for_readers_creates_nothing_either(self, tmp_path):
+        url = url_for_path(tmp_path / "cached.db")
+        engine = get_engine(url, readonly=True)
+        try:
+            with pytest.raises(OperationalError):
+                engine.connect()
+        finally:
+            dispose_all()
+        assert _only(tmp_path) == []
+
+    # -- what still creates ------------------------------------------------
+
+    def test_a_writer_engine_still_creates_the_file(self, tmp_path):
+        engine = make_engine(url_for_path(tmp_path / "w.db"))
+        try:
+            with engine.connect():
+                pass
+        finally:
+            engine.dispose()
+        assert (tmp_path / "w.db").exists()
+
+    def test_the_importer_still_creates_a_new_database(self, tmp_path):
+        resolved = _store_path(tmp_path, "fresh/config.db")
+        source = tmp_path / "s.yaml"
+        source.write_text("datasets:\n  - name: tank/a\n")
+        result = import_yaml(source, resolved)
+        dispose_all()
+        assert result.created and Path(resolved.resolved_path).exists()
+
+    def test_a_reader_can_read_what_the_importer_created(self, tmp_path):
+        from zfsbackup.config.store import read_store_state
+
+        resolved = _seeded(tmp_path, "fresh/config.db")
+        assert read_store_state(resolved).generation == 0
+        dispose_all()
+
+    def test_mode_ro_urls_are_still_refused(self, tmp_path):
+        for readonly in (True, False):
+            with pytest.raises(ValueError, match="mode=ro"):
+                make_engine(f"sqlite:///{tmp_path / 'x.db'}?mode=ro", readonly=readonly)
+
+    def test_a_memory_reader_is_unchanged(self):
+        engine = make_engine("sqlite:///:memory:", readonly=True)
+        try:
+            with engine.connect() as conn:
+                assert conn.exec_driver_sql("SELECT 1").scalar() == 1
+        finally:
+            engine.dispose()
+
+    def test_the_creator_requires_a_path(self):
+        with pytest.raises(ValueError):
+            store_db._reader_creator(None)
+
+
+@pytest.mark.unit
+class TestFloatTypeMap:
+    """`Mapped[float]` means `Float()` on SQLAlchemy 2.0 but `DOUBLE` on 2.1; the
+    schema (and the migration) say FLOAT, so the type map pins it. (Drift
+    against the migration is `compare_metadata`'s test.)"""
+
+    def test_the_annotation_map_sends_float_to_float(self):
+        from sqlalchemy import Double, Float
+
+        from zfsbackup.config.store import models
+
+        mapped = models.Base.type_annotation_map[float]
+        assert isinstance(mapped, Float) and not isinstance(mapped, Double)
+
+    def test_every_float_annotated_column_is_a_float_not_a_double(self):
+        import typing
+
+        from sqlalchemy import Double, Float
+        from sqlalchemy.orm import Mapped
+
+        from zfsbackup.config.store import models
+
+        columns = []
+        for cls in models.Base.__subclasses__():
+            hints = typing.get_type_hints(cls, include_extras=False)
+            for name, hint in hints.items():
+                if typing.get_origin(hint) is Mapped and typing.get_args(hint)[0] is float:
+                    columns.append((cls.__tablename__, name))
+        assert columns, "no Mapped[float] column found: the premise of this test is gone"
+        for table, name in columns:
+            column_type = models.Base.metadata.tables[table].c[name].type
+            assert isinstance(column_type, Float), (table, name, column_type)
+            assert not isinstance(column_type, Double), (table, name, column_type)
+
+    def test_the_known_float_columns_are_among_them(self):
+        from sqlalchemy import Float
+
+        from zfsbackup.config.store import models
+
+        table = models.Base.metadata.tables["global_settings"]
+        assert isinstance(table.c.check_interval_seconds.type, Float)

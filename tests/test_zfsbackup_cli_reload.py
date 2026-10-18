@@ -51,6 +51,7 @@ from _cli_support import (
     db,
     db_state,
     fake_daemon,
+    live_daemon,
     fake_zfs,
     generation,
     isolated,
@@ -276,11 +277,26 @@ class TestNoticeWording:
         assert reloaded_line == f"{self.HEAD}; no running daemon detected for {resolved.resolved_path}"
         assert warning is None
 
-    def test_already_applied(self, resolved, db, fake_daemon):
-        fake_daemon(db, pid=4321, applied=KEY)
+    def test_already_applied(self, resolved, db, live_daemon):
+        live_daemon(db, applied=KEY)
         assert self.notice(resolved) == (
-            f"{self.HEAD}; running daemon pid 4321 is already on generation 5", None
+            f"{self.HEAD}; running daemon pid {os.getpid()} is already on generation 5", None
         )
+
+    @pytest.mark.parametrize(
+        "identity, skipped",
+        [("match", True), ("unknown", True), ("gone", False), ("mismatch", False)],
+    )
+    def test_already_applied_needs_a_supervisor_that_is_not_known_to_be_gone(
+        self, resolved, db, fake_daemon, monkeypatch, identity, skipped
+    ):
+        """`applied == key` only means "nothing to do" while the recorded
+        supervisor is not known to be dead or a reused pid: a dead supervisor's
+        file still says what it last applied."""
+        fake_daemon(db, pid=4321, applied=KEY)
+        monkeypatch.setattr(daemonlock.procident, "identity", lambda pid, start: identity)
+        got = daemonlock.request_reload(resolved, skip_if_applied=KEY)
+        assert (got.outcome == "already-applied") is skipped, got
 
     def test_already_applied_asks_request_reload_to_skip_exactly_the_key(
         self, resolved, monkeypatch
@@ -416,6 +432,26 @@ class TestNoticeWording:
             None,
         )
 
+    def test_unverified_because_the_fd_table_cannot_be_read(self, resolved, monkeypatch):
+        detail = "cannot read the open files of pid 777 to confirm it holds the daemon lock"
+        reloaded(monkeypatch, "unverified", pid=777, detail=detail, code="fd-table-unreadable")
+        assert self.notice(resolved) == (
+            f"{self.HEAD}; could not verify that pid 777 is the daemon ({detail}), so it was "
+            f"not signalled; it picks up the change within {POLL}s",
+            None,
+        )
+
+    def test_not_permitted_because_it_is_another_users_process(self, resolved, monkeypatch):
+        reloaded(
+            monkeypatch, "not-permitted", pid=777,
+            detail="pid 777 runs as another user; not permitted to signal it", code="other-user",
+        )
+        assert self.notice(resolved) == (
+            f"{self.HEAD}; daemon pid 777 runs as another user and was not signalled; "
+            f"it picks up the change within {POLL}s",
+            None,
+        )
+
     def test_unverified_without_a_reason(self, resolved, monkeypatch):
         reloaded(monkeypatch, "unverified", pid=777, detail="")
         assert "(no reason given)" in self.notice(resolved)[0]
@@ -512,6 +548,24 @@ class TestNoticeWording:
             f"not signalled; a running daemon picks up the change within {POLL}s",
             None,
         )
+
+    def test_file_not_open_is_not_worded_as_a_dead_supervisor_while_the_pid_exists(
+        self, resolved, monkeypatch
+    ):
+        """Step 8b: the pid exists and is signalable, it just does not hold the
+        lock file (a reused pid). The operator must not be told the supervisor
+        is gone, whatever `pid_is_alive` says about a pid the CLI cannot see."""
+        reloaded(monkeypatch, "supervisor-gone", pid=4321, code="file-not-open")
+        monkeypatch.setattr(daemonlock, "pid_is_alive", lambda pid: True)
+        assert "is not the process holding the daemon lock" in self.notice(resolved)[0]
+        assert "supervisor pid" not in self.notice(resolved)[0]
+
+    def test_file_not_open_is_worded_like_not_lock_holder_whatever_pid_is_alive_says(
+        self, resolved, monkeypatch
+    ):
+        reloaded(monkeypatch, "supervisor-gone", pid=4321, code="file-not-open")
+        monkeypatch.setattr(daemonlock, "pid_is_alive", lambda pid: False)
+        assert "is not the process holding the daemon lock" in self.notice(resolved)[0]
 
     def test_supervisor_gone_without_a_code_asks_whether_the_pid_exists(self, resolved, monkeypatch):
         reloaded(monkeypatch, "supervisor-gone", pid=4321)
@@ -1843,6 +1897,7 @@ _HOLDER = textwrap.dedent(
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the lock holder is verified through /proc/locks")
+@pytest.mark.integration
 class TestRealLockHolderOnLinux:
     @pytest.fixture
     def holder(self, rich, db):
