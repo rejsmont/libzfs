@@ -695,7 +695,11 @@ def _backup_outgoing(
     """
     try:
         has_config = session.get(GlobalSettings, 1) is not None
-        outgoing = load_config(session) if has_config else None
+        # The outgoing config is being discarded; the new one is validated
+        # and warned about separately, so skip the never-prune warning.
+        outgoing = (
+            load_config(session, warn_never_prune=False) if has_config else None
+        )
     except Exception as exc:  # noqa: BLE001 - any failure to read is "unreadable"
         if not allow_unreadable:
             raise OutgoingConfigUnreadable(

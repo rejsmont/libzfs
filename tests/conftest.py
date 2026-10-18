@@ -251,6 +251,86 @@ def _clean_db_engine_cache():
     dispose_all()
 
 
+_INSTALLED_ZFS = None
+
+
+def _installed_zfs_binaries():
+    """Real paths of any `zfs` / `zpool` found on `PATH` (cached)."""
+    global _INSTALLED_ZFS
+    if _INSTALLED_ZFS is None:
+        import os
+        import shutil
+
+        _INSTALLED_ZFS = frozenset(
+            os.path.realpath(found)
+            for found in (shutil.which("zfs"), shutil.which("zpool"))
+            if found
+        )
+    return _INSTALLED_ZFS
+
+
+@pytest.fixture(autouse=True)
+def _never_run_a_real_zfs(request, monkeypatch):
+    """Fails any test (outside the `real_zfs` tier) whose code starts a process
+    that is a real `zfs` or `zpool`: a compiled program named `zfs` / `zpool`, or one that
+    resolves to the binary found on `PATH` under those names (fake scripts
+    named `zfs`, which start with `#!`, are fine).
+
+    The mocked tiers either patch `subprocess.Popen` wholesale (which this
+    guard never sees) or point `ZFS_CMD` / `ZPOOL_CMD` at a stub or a fake
+    script (`tests/_fake_zfs.py`); a code path that slips past both and reaches
+    a real binary would run against whatever pool the host happens to have.
+    Wraps `Popen.__init__` in place, so the class identity (and every
+    `isinstance` check) is unchanged.
+    """
+    if request.node.get_closest_marker("real_zfs"):
+        yield
+        return
+    import os
+    import shlex
+    import shutil
+    import subprocess
+
+    real_init = subprocess.Popen.__init__
+    installed = _installed_zfs_binaries()
+
+    def _is_compiled(path):
+        """A file named zfs/zpool that is not a `#!` script is a real binary
+        (the fake scripts the suite writes under those names start with `#!`)."""
+        try:
+            with open(path, "rb") as handle:
+                return handle.read(2) != b"#!"
+        except OSError:
+            return False
+
+    def guarded(self, args, *a, **kw):
+        if isinstance(args, bytes):
+            args = os.fsdecode(args)
+        if isinstance(args, str):
+            try:
+                program = (shlex.split(args) or [""])[0]
+            except ValueError:
+                program = args.split()[0] if args.split() else ""
+        elif isinstance(args, os.PathLike):
+            program = os.fspath(args)
+        else:
+            program = os.fsdecode(args[0]) if args else ""
+        if program:
+            base = os.path.basename(program)
+            resolved = shutil.which(program) or program
+            if os.path.realpath(resolved) in installed or (
+                base in ("zfs", "zpool") and _is_compiled(resolved)
+            ):
+                raise AssertionError(
+                    f"this test started a real {base!r} ({program}); use mock_subprocess "
+                    "or a fake script (tests/_fake_zfs.py) -- see _never_run_a_real_zfs"
+                )
+        return real_init(self, args, *a, **kw)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", guarded)
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _restore_signal_handlers():
     """Saves `SIGINT`/`SIGTERM`/`SIGHUP` dispositions before each test and restores

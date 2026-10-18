@@ -9,12 +9,17 @@ nothing of the daemon (`runtime_config`, `daemon`, `workers`, ...); the one
 daemon-lane module it uses is `daemonlock`, to tell the operator after a write
 whether a daemon is running. Every write follows `write.py`'s discipline.
 
-Commands (this module is plan item 10.2; `get`/`set`/`edit`/`list`/`rename`
-follow in items 11-14 and are deliberately not stubbed here):
+Commands:
 
 - `import YAML`  -- replace the stored configuration with a YAML file.
 - `export`       -- print the stored configuration as YAML.
 - `migrate`      -- bring the database schema up to this version.
+- `list datasets|destinations` -- read-only tables (`listing.py`).
+- `get PATH` / `set PATH VALUE` / `unset PATH` -- one setting at a time
+  (`dotpath.py`).
+- `edit`         -- the whole configuration in `$EDITOR` (`editor.py`);
+  `edit dataset|destination NAME` edits one entry.
+- `rename dataset|destination OLD NEW` (`rename.py`).
 
 Path resolution is the daemon's: `-c/--config`, then `$ZFSBACKUP_CONFIG`, then
 the default path. Only `import` may create a database; every other command
@@ -44,9 +49,11 @@ from typing import Callable, List, Optional, Tuple
 import click
 import yaml
 
+from zfsbackup.cli import dotpath, editor, rename
 from zfsbackup.cli.errors import BackupFailed, CliError, is_database_unusable, report
+from zfsbackup.cli.listing import render_datasets, render_destinations
 from zfsbackup.cli.render import render_yaml
-from zfsbackup.cli.write import notify_daemon, read_snapshot
+from zfsbackup.cli.write import commit_config, notify_daemon, read_snapshot
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
     CONFIG_PATH_ENV,
@@ -62,6 +69,7 @@ from zfsbackup.config.store import (
     read_config,
     resolve_config_path,
     upgrade_schema,
+    validate_config,
     writer_lock,
 )
 
@@ -92,13 +100,25 @@ class _LogHandler(logging.Handler):
         super().__init__(level)
         self.seen: set = set()
         self.drop_prefixes: Tuple[str, ...] = ()
+        #: Warning texts not to show: what the stored configuration already
+        #: warned about before this command changed anything (see `_edit`).
+        self.suppress: set = set()
+        #: Show nothing at all (while a baseline is being collected).
+        self.muted = False
+        #: Drop WARNING records (keep errors): read-only commands do not
+        #: comment on the stored configuration.
+        self.quiet_warnings = False
 
     def emit(self, record: logging.LogRecord) -> None:
         message = record.getMessage()
+        if self.muted:
+            return
+        if self.quiet_warnings and logging.WARNING <= record.levelno < logging.ERROR:
+            return
         if self.drop_prefixes and message.startswith(self.drop_prefixes):
             return
         if record.levelno >= logging.WARNING:
-            if message in self.seen:
+            if message in self.seen or message in self.suppress:
                 return
             self.seen.add(message)
             label = "error" if record.levelno >= logging.ERROR else "warning"
@@ -139,11 +159,17 @@ class State:
             self.handler.setLevel(logging.DEBUG)
             logging.getLogger(_LOGGER_NAME).setLevel(logging.DEBUG)
 
+    def quiet(self) -> None:
+        """Read-only command: show no warnings about the stored configuration
+        (errors are still shown)."""
+        if self.handler is not None:
+            self.handler.quiet_warnings = True
+
     def warn(self, message: str) -> None:
         """Print `message` as a warning, once per distinct text per invocation
         (the same dedupe as warnings arriving as log records)."""
         if self.handler is not None:
-            if message in self.handler.seen:
+            if message in self.handler.seen or message in self.handler.suppress:
                 return
             self.handler.seen.add(message)
         click.echo(f"warning: {message}", err=True)
@@ -723,6 +749,414 @@ def migrate_cmd(check: bool, config_path: Optional[str], verbose: bool) -> None:
     click.echo(
         "Restart any running zfsbackup daemon now so it runs this schema and "
         "its configuration."
+    )
+
+
+# --------------------------------------------------------------------------
+# list
+# --------------------------------------------------------------------------
+
+
+@cli.group(
+    "list",
+    help="Show the stored datasets or destinations (read-only).",
+)
+def list_group() -> None:
+    pass
+
+
+_JSON_OPTION = click.option(
+    "--json", "as_json", is_flag=True, default=False,
+    help="Machine-readable JSON (stable shape; see zfsbackup/cli/listing.py).",
+)
+
+
+@list_group.command(
+    "datasets",
+    help=(
+        "One row per dataset, in stored order: name, enabled, frequency, "
+        "recursive, RETENTION (the number of rules, or `never` for a dataset "
+        "that is never pruned) and its remote destinations (`inherit (X)` = the "
+        "dataset's own frequency X)."
+    ),
+)
+@_JSON_OPTION
+@click.option("--enabled-only", is_flag=True, default=False, help="Only enabled datasets.")
+@_common
+def list_datasets_cmd(
+    as_json: bool, enabled_only: bool, config_path: Optional[str], verbose: bool
+) -> None:
+    state = _state(config_path, verbose)
+    state.quiet()
+    config = read_snapshot(state.resolve()).config
+    click.echo(render_datasets(config, enabled_only=enabled_only, as_json=as_json), nl=False)
+
+
+@list_group.command(
+    "destinations",
+    help="One row per destination, by name: its URL and the datasets that send to it.",
+)
+@_JSON_OPTION
+@click.option(
+    "--enabled-only", is_flag=True, default=False,
+    help=(
+        "Count only enabled datasets as senders: a destination used only by "
+        "disabled datasets (or by none) is hidden."
+    ),
+)
+@_common
+def list_destinations_cmd(
+    as_json: bool, enabled_only: bool, config_path: Optional[str], verbose: bool
+) -> None:
+    state = _state(config_path, verbose)
+    state.quiet()
+    config = read_snapshot(state.resolve()).config
+    click.echo(render_destinations(config, enabled_only=enabled_only, as_json=as_json), nl=False)
+
+
+# --------------------------------------------------------------------------
+# get / set / unset
+# --------------------------------------------------------------------------
+
+_PATH_HELP = (
+    "PATH is a setting such as `check_interval`, `datasets.tank/data.frequency`, "
+    "`datasets.tank/data.retention.1d`, `datasets.tank/data.remote.offsite.frequency`, "
+    "`destinations.offsite.url` or `remote_backup.enabled`. A name containing dots "
+    "is matched against the names that exist; the bracket form "
+    "`datasets[tank/vm.01].frequency` is always accepted (quote it in the shell) and "
+    "is the form this tool prints. An ambiguous path is an error."
+)
+
+
+@cli.command(
+    "get",
+    help=f"Print one setting as stored (a duration as it was written). {_PATH_HELP}",
+)
+@click.argument("path", metavar="PATH")
+@_common
+def get_cmd(path: str, config_path: Optional[str], verbose: bool) -> None:
+    state = _state(config_path, verbose)
+    state.quiet()
+    config = read_snapshot(state.resolve()).config
+    segs = dotpath.resolve(path, config)
+    for line in dotpath.get_lines(config, segs):
+        click.echo(line)
+
+
+class _CollectWarnings(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.messages: set = set()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.add(record.getMessage())
+
+
+def _read_with_baseline(state: State, resolved: ResolvedConfigPath):
+    """`read_snapshot`, plus the set of warnings the stored configuration
+    already carries (a `forever` dataset, a prefix with `_`, ...), collected
+    without printing them, and installed on the log handler as "do not show".
+
+    `set` and `unset` re-parse and re-validate the WHOLE configuration, so
+    without this every edit would repeat the warnings of settings it did not
+    touch; only the warnings the edit introduces are shown. A baseline that
+    cannot be built is smaller (more is shown), never an error."""
+    logger = logging.getLogger(_LOGGER_NAME)
+    collector = _CollectWarnings()
+    if state.handler is not None:
+        state.handler.muted = True
+    logger.addHandler(collector)
+    try:
+        snapshot = read_snapshot(resolved)
+        baseline = set(collector.messages)
+        try:
+            baseline |= set(validate_config(snapshot.config))
+            dotpath.parse_dict(dotpath.to_dict(snapshot.config))
+        except Exception:  # noqa: BLE001
+            pass
+        baseline |= collector.messages
+    finally:
+        logger.removeHandler(collector)
+        if state.handler is not None:
+            state.handler.muted = False
+    if state.handler is not None:
+        state.handler.suppress = baseline
+    return snapshot
+
+
+def _edit(
+    state: State,
+    path: str,
+    apply: Callable[[BackupConfig, dotpath.Segs], "dotpath.Change"],
+) -> None:
+    """The shared flow of `set` and `unset`: snapshot, resolve, change in
+    memory, validate, compare-and-swap write. The database is opened for
+    reading only until `commit_config`, and nothing is written when the path,
+    the value or the resulting configuration is refused."""
+    resolved = state.resolve()
+    snapshot = _read_with_baseline(state, resolved)
+    config = snapshot.config
+    segs = dotpath.resolve(path, config)
+    change = apply(config, segs)
+    for message in change.warnings:
+        state.warn(message)
+
+    shown = change.scope or segs
+    if render_yaml(change.config) == render_yaml(config):
+        current = dotpath.compact(config, shown)
+        state_text = "not set" if current == dotpath.NOT_SET else f"already {current}"
+        click.echo(f"{dotpath.format_path(shown)} is {state_text}; nothing changed")
+        return
+
+    result = commit_config(resolved, snapshot, change.config, warn=state.warn, announce=False)
+    click.echo(
+        f"{dotpath.format_path(shown)}: {dotpath.compact(config, shown)} -> "
+        f"{dotpath.compact(change.config, shown)}"
+    )
+    notify_daemon(resolved, result.generation)
+
+
+@cli.command(
+    "set",
+    help=(
+        "Set one setting. VALUE is read as YAML, exactly as in a config file "
+        "(`true`, `5m`, `8080`, `forever`; quote text that YAML would read as "
+        "something else, e.g. '\"123\"'; `''` is an empty value). A duration is "
+        "stored as typed. The whole resulting configuration is validated before "
+        f"anything is written. {_PATH_HELP}"
+    ),
+)
+@click.argument("path", metavar="PATH")
+@click.argument("value", metavar="VALUE")
+@_common
+def set_cmd(path: str, value: str, config_path: Optional[str], verbose: bool) -> None:
+    state = _state(config_path, verbose)
+    _edit(state, path, lambda config, segs: dotpath.set_value(config, segs, value))
+
+
+@cli.command(
+    "unset",
+    help=(
+        "Revert one setting: prune_interval and client_id_file go back to "
+        "deriving their value; datasets.N.retention to the default 1d->30d; "
+        "retention.AGE removes that rule (the last one leaves the dataset "
+        "never pruned); a destination's remote frequency or retention goes "
+        "back to inheriting the dataset's; `remote_backup` removes the receive "
+        f"role. {_PATH_HELP}"
+    ),
+)
+@click.argument("path", metavar="PATH")
+@_common
+def unset_cmd(path: str, config_path: Optional[str], verbose: bool) -> None:
+    state = _state(config_path, verbose)
+    _edit(state, path, dotpath.unset_value)
+
+
+# --------------------------------------------------------------------------
+# edit
+# --------------------------------------------------------------------------
+
+
+_EDIT_META = "zfsbackup.edit"
+
+_EDIT_OPTIONS = (
+    click.option(
+        "--editor", "editor_cmd", default=None, metavar="CMD",
+        help="Editor command (overrides $VISUAL and $EDITOR); split like a shell would.",
+    ),
+    click.option(
+        "--no-prompt", is_flag=True, default=False,
+        help=(
+            "Never prompt and do not require a terminal (for scripts and tests): "
+            "a rejected buffer abandons the edit, exit 1, and is kept in a file."
+        ),
+    ),
+)
+
+
+def _edit_options(func: Callable) -> Callable:
+    for option in reversed(_EDIT_OPTIONS):
+        func = option(func)
+    return func
+
+
+@cli.group(
+    "edit",
+    invoke_without_command=True,
+    help=(
+        "Edit the configuration in $VISUAL / $EDITOR (default vi). Without a "
+        "subcommand, the whole configuration is rendered as YAML (as `export` "
+        "prints it); `edit dataset NAME` and `edit destination NAME` edit one "
+        "entry, whose buffer has no name. When you save, the result is "
+        "validated and written, but only if nobody else changed the "
+        "configuration meanwhile (otherwise exit 75 and your edit is kept in a "
+        "file). Saving a buffer with no real change writes nothing. A rejected "
+        "buffer can be retried or abandoned. Dataset and destination names are "
+        "identity: in the whole-config buffer a new name creates one and a "
+        "deleted name deletes one, and a diff that looks like a rename is "
+        "refused (use `rename`, or --allow-recreate). Needs a terminal unless "
+        "--no-prompt is given."
+    ),
+)
+@click.option(
+    "--allow-recreate", is_flag=True, default=False,
+    help="Whole-config edit: accept a rename-shaped edit as the delete + create it is.",
+)
+@_edit_options
+@_common
+@click.pass_context
+def edit_group(
+    ctx: click.Context, allow_recreate: bool, editor_cmd: Optional[str], no_prompt: bool,
+    config_path: Optional[str], verbose: bool,
+) -> None:
+    state = _state(config_path, verbose)
+    if ctx.invoked_subcommand is not None:
+        if allow_recreate:
+            raise click.UsageError("--allow-recreate applies to the whole-config edit only")
+        ctx.meta[_EDIT_META] = (editor_cmd, no_prompt)
+        return
+    resolved = state.resolve()
+    snapshot = _read_with_baseline(state, resolved)
+    editor.edit_config(
+        resolved, snapshot,
+        warn=state.warn, editor=editor_cmd,
+        allow_recreate=allow_recreate, prompt=not no_prompt,
+    )
+
+
+def _entry_edit(
+    kind: str, name: str, editor_cmd: Optional[str], no_prompt: bool,
+    config_path: Optional[str], verbose: bool,
+) -> None:
+    state = _state(config_path, verbose)
+    inherited_editor, inherited_no_prompt = click.get_current_context().meta.get(
+        _EDIT_META, (None, False)
+    )
+    resolved = state.resolve()
+    snapshot = _read_with_baseline(state, resolved)
+    run = editor.edit_dataset if kind == "dataset" else editor.edit_destination
+    run(
+        resolved, snapshot, name,
+        warn=state.warn, editor=editor_cmd or inherited_editor,
+        prompt=not (no_prompt or inherited_no_prompt),
+    )
+
+
+@edit_group.command(
+    "dataset",
+    help=(
+        "Edit one dataset's settings in $EDITOR. The buffer holds enabled, "
+        "frequency, recursive, retention and remote but NOT the name (a name: "
+        "key is rejected; use `rename dataset`). Omitted keys take their defaults."
+    ),
+)
+@click.argument("name", metavar="NAME")
+@_edit_options
+@_common
+def edit_dataset_cmd(
+    name: str, editor_cmd: Optional[str], no_prompt: bool,
+    config_path: Optional[str], verbose: bool,
+) -> None:
+    _entry_edit("dataset", name, editor_cmd, no_prompt, config_path, verbose)
+
+
+@edit_group.command(
+    "destination",
+    help="Edit one destination's url in $EDITOR (the buffer has no name; use `rename destination`).",
+)
+@click.argument("name", metavar="NAME")
+@_edit_options
+@_common
+def edit_destination_cmd(
+    name: str, editor_cmd: Optional[str], no_prompt: bool,
+    config_path: Optional[str], verbose: bool,
+) -> None:
+    _entry_edit("destination", name, editor_cmd, no_prompt, config_path, verbose)
+
+
+# --------------------------------------------------------------------------
+# rename
+# --------------------------------------------------------------------------
+
+
+@cli.group("rename", help="Rename a dataset or a destination in the configuration.")
+def rename_group() -> None:
+    pass
+
+
+_DRY_RUN = click.option(
+    "-d", "--dry-run", is_flag=True, default=False,
+    help="Print the ZFS property actions and the configuration change without doing them.",
+)
+
+
+@rename_group.command(
+    "dataset",
+    help=(
+        "Rename dataset OLD to NEW in the configuration. A dataset with remote "
+        "destinations needs --force: the server-side copy would move, so the "
+        "next backup is a full send and the old server copy is orphaned. The "
+        "org.zfsbackup:* properties on the old ZFS dataset do not follow; "
+        "--clear-stale-props removes them (refused while a daemon is running). "
+        "This does not rename the ZFS dataset."
+    ),
+)
+@click.argument("old", metavar="OLD")
+@click.argument("new", metavar="NEW")
+@click.option(
+    "--force", is_flag=True, default=False,
+    help="Rename a dataset that has remote destinations (next backup is a full send).",
+)
+@click.option(
+    "--clear-stale-props", is_flag=True, default=False,
+    help="Clear org.zfsbackup:config and anchor.* on the old dataset after the rename.",
+)
+@_DRY_RUN
+@_common
+def rename_dataset_cmd(
+    old: str, new: str, force: bool, clear_stale_props: bool, dry_run: bool,
+    config_path: Optional[str], verbose: bool,
+) -> None:
+    state = _state(config_path, verbose)
+    resolved = state.resolve()
+    snapshot = _read_with_baseline(state, resolved)
+    rename.rename_dataset(
+        resolved, snapshot, old, new,
+        force=force, clear_stale_props=clear_stale_props, dry_run=dry_run, warn=state.warn,
+    )
+
+
+@rename_group.command(
+    "destination",
+    help=(
+        "Rename destination OLD to NEW in the configuration and in every "
+        "dataset's remote: list. Each referencing dataset's "
+        "org.zfsbackup:anchor.OLD is copied to anchor.NEW first (copied, never "
+        "moved; a differing existing anchor.NEW is overwritten and both values "
+        "are printed); the old properties are left in place."
+    ),
+)
+@click.argument("old", metavar="OLD")
+@click.argument("new", metavar="NEW")
+@click.option(
+    "--skip-missing", is_flag=True, default=False,
+    help=(
+        "Proceed when a dataset that sends to OLD does not exist in ZFS, copying no "
+        "anchor for it (default: refuse)."
+    ),
+)
+@_DRY_RUN
+@_common
+def rename_destination_cmd(
+    old: str, new: str, skip_missing: bool, dry_run: bool,
+    config_path: Optional[str], verbose: bool,
+) -> None:
+    state = _state(config_path, verbose)
+    resolved = state.resolve()
+    snapshot = _read_with_baseline(state, resolved)
+    rename.rename_destination(
+        resolved, snapshot, old, new,
+        dry_run=dry_run, skip_missing=skip_missing, warn=state.warn,
     )
 
 

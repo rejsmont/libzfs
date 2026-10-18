@@ -280,13 +280,17 @@ class TestPropertyHelpers:
         manager.clear_anchor(dsi, 'offsite')
         mock_inherit.assert_called_once()
 
-    def test_get_anchors_empty_when_no_remote(self, mocker):
+    def test_get_anchors_empty_when_no_remote(self, mock_subprocess):
+        # No remote destinations and no anchor property on the dataset: nothing
+        # to protect. (The properties ARE read: orphan anchors count.)
         manager = DatasetManager(_make_config())
         dsi = manager.datasets[0]
         dsi.config.remote = []
+        mock_subprocess.setup(stdout=_zget('pool/data', []))
         assert manager.get_anchors(dsi) == set()
+        assert _subcommands(mock_subprocess) == ['get']
 
-    def test_get_anchors_returns_set_of_names(self, mocker):
+    def test_get_anchors_returns_set_of_names(self, mock_subprocess, mocker):
         config = _make_config(datasets=[
             DatasetConfig(
                 name='pool/data',
@@ -295,9 +299,12 @@ class TestPropertyHelpers:
         ])
         manager = DatasetManager(config)
         dsi = manager.datasets[0]
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (PROP_ANCHOR_PREFIX + 'offsite', 'autosnap_20240101120000', 'local'),
+        ]))
         mocker.patch.object(manager, 'get_anchor', return_value='autosnap_20240101120000')
         anchors = manager.get_anchors(dsi)
-        assert 'autosnap_20240101120000' in anchors
+        assert anchors == {'autosnap_20240101120000'}
 
 
 class TestSyncConfigProperty:
@@ -1429,3 +1436,320 @@ class TestClearZfsbackupProperties:
         with pytest.raises(Exception, match='does not exist'):
             clear_zfsbackup_properties(self.DS(), config=True, anchors=True)
         assert _subcommands(mock_subprocess) == ['get']
+
+
+# ---------------------------------------------------------------------------
+# Anchor decision ("overwrite + protect all"): the pruner protects EVERY
+# `org.zfsbackup:anchor.*` value on a dataset, configured destination or not;
+# `copy_anchor_property(..., overwrite=True)` is what `rename destination` uses.
+# ---------------------------------------------------------------------------
+
+
+def _anchor_manager(*destinations):
+    remote = [RemoteDatasetConfig(destination=d) for d in destinations]
+    config = _make_config(datasets=[DatasetConfig(name='pool/data', remote=remote)])
+    manager = DatasetManager(config)
+    return manager, manager.datasets[0]
+
+
+class TestGetAnchors:
+    def test_every_local_anchor_counts_configured_or_not(self, mock_subprocess, mocker):
+        manager, dsi = _anchor_manager('offsite')
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (A + 'offsite', 'autosnap_1', 'local'),
+            (A + 'renamed-away', 'autosnap_2', 'local'),
+        ]))
+        mocker.patch.object(manager, '_get_prop', return_value='autosnap_1')
+        assert manager.get_anchors(dsi) == {'autosnap_1', 'autosnap_2'}
+
+    def test_a_received_anchor_counts(self, mock_subprocess):
+        # on a receiving server it is the client's incremental base
+        manager, dsi = _anchor_manager()
+        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'client', 'autosnap_3', 'received')]))
+        assert manager.get_anchors(dsi) == {'autosnap_3'}
+
+    def test_an_inherited_value_is_not_in_the_raw_read(self, mock_subprocess, mocker):
+        manager, dsi = _anchor_manager('offsite')
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (A + 'ancestors', 'autosnap_9', 'inherited from pool'),
+        ]))
+        mocker.patch.object(manager, '_get_prop', return_value=None)
+        assert manager.get_anchors(dsi) == set()
+
+    def test_the_configured_get_anchor_value_is_unioned_in(self, mock_subprocess, mocker):
+        # `get_anchor` also sees inherited values: the result stays a superset
+        # of what it was before the raw read existed.
+        manager, dsi = _anchor_manager('offsite', 'dc2')
+        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'offsite', 'autosnap_1', 'local')]))
+        values = {'offsite': 'autosnap_1', 'dc2': 'autosnap_inherited'}
+        mocker.patch.object(manager, 'get_anchor', side_effect=lambda dsi_, dest: values[dest])
+        assert manager.get_anchors(dsi) == {'autosnap_1', 'autosnap_inherited'}
+
+    @pytest.mark.parametrize('value', ['-', ''])
+    def test_empty_and_dash_values_are_skipped(self, mock_subprocess, value):
+        manager, dsi = _anchor_manager()
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (A + 'x', value, 'local'), (A + 'y', 'autosnap_4', 'local'),
+        ]))
+        assert manager.get_anchors(dsi) == {'autosnap_4'}
+
+    def test_other_zfsbackup_properties_and_builtins_are_ignored(self, mock_subprocess):
+        manager, dsi = _anchor_manager()
+        lines = _zget('pool/data', [
+            (PROP_CONFIG, 'cfg', 'local'),
+            ('volthreading', 'on', 'local'),  # a built-in libzfseasy would choke on
+            (A + 'ok', 'autosnap_5', 'local'),
+        ])
+        mock_subprocess.setup(stdout=lines)
+        assert manager.get_anchors(dsi) == {'autosnap_5'}
+
+    def test_a_read_failure_raises(self, mock_subprocess):
+        manager, dsi = _anchor_manager('offsite')
+        _fail_get(mock_subprocess, 'dataset does not exist')
+        with pytest.raises(Exception, match='does not exist'):
+            manager.get_anchors(dsi)
+
+
+class TestOrphanAnchorLogging:
+    def orphans(self, caplog, level):
+        return [r for r in caplog.records if r.levelno == level and 'configured destination' in r.getMessage()]
+
+    def run_twice(self, manager, dsi, mock_subprocess, props, caplog, times=2):
+        for _ in range(times):
+            mock_subprocess.setup(stdout=_zget('pool/data', props))
+            manager.get_anchors(dsi)
+
+    def test_debug_every_call_and_info_once(self, mock_subprocess, caplog):
+        manager, dsi = _anchor_manager()
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            self.run_twice(manager, dsi, mock_subprocess, [(A + 'gone', 'autosnap_1', 'local')], caplog, times=3)
+        assert len(self.orphans(caplog, logging.DEBUG)) == 3
+        info = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert len(info) == 1
+        assert f'zfs inherit {A}gone pool/data' in info[0].getMessage()
+        assert 'autosnap_1' in info[0].getMessage()
+
+    def test_info_once_per_dataset_and_property(self, mock_subprocess, caplog):
+        manager, dsi = _anchor_manager()
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            self.run_twice(manager, dsi, mock_subprocess, [(A + 'one', 's1', 'local')], caplog, times=2)
+            self.run_twice(manager, dsi, mock_subprocess,
+                           [(A + 'one', 's1', 'local'), (A + 'two', 's2', 'local')], caplog, times=1)
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert sum(f'{A}one is not a configured' in m for m in infos) == 1
+        assert sum(f'{A}two is not a configured' in m for m in infos) == 1
+
+    def test_a_new_manager_announces_again(self, mock_subprocess, caplog):
+        props = [(A + 'gone', 's1', 'local')]
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            for _ in range(2):
+                manager, dsi = _anchor_manager()
+                self.run_twice(manager, dsi, mock_subprocess, props, caplog, times=1)
+        assert len([r for r in caplog.records if r.levelno == logging.INFO]) == 2
+
+    def test_a_configured_destinations_anchor_is_not_an_orphan(self, mock_subprocess, mocker, caplog):
+        manager, dsi = _anchor_manager('offsite')
+        mocker.patch.object(manager, '_get_prop', return_value=None)
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            self.run_twice(manager, dsi, mock_subprocess, [(A + 'offsite', 's1', 'local')], caplog, times=1)
+        assert self.orphans(caplog, logging.DEBUG) == []
+        assert [r for r in caplog.records if r.levelno == logging.INFO] == []
+
+
+def _pruning_manager(destinations=()):
+    manager, dsi = _anchor_manager(*destinations)
+    dsi.config.retention_rules = [RetentionRule(timedelta(hours=1), timedelta(hours=2))]
+    snaps = [_make_snap_info('autosnap', 5 + i) for i in range(4)]  # newest first, all past the 2h horizon
+    return manager, dsi, snaps
+
+
+class TestPruneHonoursEveryAnchor:
+    def destroyed(self, mock_destroy):
+        return [s for call in mock_destroy.call_args_list for s in call.args[0]]
+
+    def test_an_orphan_anchored_snapshot_is_not_pruned(self, mock_subprocess, mocker):
+        manager, dsi, snaps = _pruning_manager()
+        mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
+        dsi.snapshots = snaps
+        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'renamed-away', snaps[2].name, 'local')]))
+        mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
+        manager.prune_snapshots(dsi)
+        destroyed = self.destroyed(mock_destroy)
+        assert snaps[2].snapshot not in destroyed
+        assert destroyed == [snaps[1].snapshot, snaps[3].snapshot]
+
+    def test_without_the_orphan_anchor_the_same_snapshot_is_pruned(self, mock_subprocess, mocker):
+        manager, dsi, snaps = _pruning_manager()
+        mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
+        dsi.snapshots = snaps
+        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
+        manager.prune_snapshots(dsi)
+        assert self.destroyed(mock_destroy) == [s.snapshot for s in snaps[1:]]
+
+    def test_the_newest_snapshot_survives_whatever_is_anchored(self, mock_subprocess, mocker):
+        manager, dsi, snaps = _pruning_manager()
+        mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
+        dsi.snapshots = snaps
+        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'x', snaps[3].name, 'local')]))
+        mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
+        manager.prune_snapshots(dsi)
+        assert snaps[0].snapshot not in self.destroyed(mock_destroy)
+        assert snaps[3].snapshot not in self.destroyed(mock_destroy)
+
+    def test_a_configured_destinations_inherited_anchor_still_protects(self, mock_subprocess, mocker):
+        manager, dsi, snaps = _pruning_manager(['offsite'])
+        mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
+        dsi.snapshots = snaps
+        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        mocker.patch.object(manager, '_get_prop', return_value=snaps[1].name)
+        mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
+        manager.prune_snapshots(dsi)
+        assert snaps[1].snapshot not in self.destroyed(mock_destroy)
+
+    def test_an_anchor_read_failure_prunes_nothing_and_logs_an_error(self, mock_subprocess, mocker, caplog):
+        manager, dsi, snaps = _pruning_manager()
+        mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
+        dsi.snapshots = snaps
+        _fail_get(mock_subprocess, 'cannot open: permission denied')
+        mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
+        spy = mocker.spy(manager, 'needs_prunning')
+        with caplog.at_level(logging.ERROR, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)  # must not raise
+        mock_destroy.assert_not_called()
+        spy.assert_not_called()
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert 'Cannot read anchors for pool/data' in errors[0] and 'permission denied' in errors[0]
+
+    def test_a_read_failure_on_one_dataset_does_not_stop_the_next(self, mock_subprocess, mocker):
+        config = _make_config(datasets=[DatasetConfig(name='pool/a'), DatasetConfig(name='pool/b')])
+        manager = DatasetManager(config)
+        first, second = manager.datasets
+        calls = []
+
+        def anchors(dsi):
+            calls.append(dsi.name)
+            if dsi.name == 'pool/a':
+                raise RuntimeError('boom')
+            return set()
+
+        mocker.patch.object(manager, 'get_anchors', side_effect=anchors)
+        mocker.patch.object(manager, 'list_snapshots', return_value=[_make_snap_info('autosnap', 1)])
+        mocker.patch.object(manager, 'needs_prunning', return_value=[])
+        manager.prune_snapshots(first)
+        manager.prune_snapshots(second)
+        assert calls == ['pool/a', 'pool/b']
+
+
+class TestCopyAnchorPropertyOverwrite:
+    DS = staticmethod(lambda: Filesystem('pool/data'))
+
+    def props(self, old=None, new=None, new_source='local'):
+        rows = []
+        if old is not None:
+            rows.append((A + 'old', old, 'local'))
+        if new is not None:
+            rows.append((A + 'new', new, new_source))
+        return _zget('pool/data', rows)
+
+    def test_overwrite_with_an_absent_target_is_copied(self, mock_subprocess):
+        mock_subprocess.setup_multi((self.props('snap'),), ('',))
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'copied'
+        assert _cmds(mock_subprocess)[1][1:] == ['set', f'{A}new=snap', 'pool/data']
+
+    def test_overwrite_replaces_a_different_value(self, mock_subprocess):
+        mock_subprocess.setup_multi((self.props('newer', 'older'),), ('',))
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'overwritten'
+        assert _subcommands(mock_subprocess) == ['get', 'set']
+        assert _cmds(mock_subprocess)[1][2] == f'{A}new=newer'
+
+    def test_overwrite_with_an_equal_value_is_same_and_sets_nothing(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.props('snap', 'snap'))
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'same'
+        assert _subcommands(mock_subprocess) == ['get']
+
+    def test_without_overwrite_any_existing_value_is_exists(self, mock_subprocess):
+        for new in ('different', 'snap'):  # equal or not: left alone
+            for kwargs in ({}, {'overwrite': False}):
+                mock_subprocess.setup(stdout=self.props('snap', new))
+                assert copy_anchor_property(self.DS(), 'old', 'new', **kwargs) == 'exists'
+        assert 'set' not in _subcommands(mock_subprocess)
+
+    def test_no_source_is_decided_first_whatever_overwrite_says(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.props(None, 'something'))
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'no-source'
+        assert _subcommands(mock_subprocess) == ['get']
+
+    def test_dry_run_with_an_absent_target_is_dry_run(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.props('snap'))
+        assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True) == 'dry-run'
+        assert _subcommands(mock_subprocess) == ['get']
+
+    def test_dry_run_with_a_different_target_names_the_overwrite(self, mock_subprocess, caplog):
+        mock_subprocess.setup(stdout=self.props('newer', 'older'))
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            result = copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True)
+        assert result == 'dry-run'
+        assert _subcommands(mock_subprocess) == ['get']
+        assert 'Would overwrite' in caplog.text and 'older' in caplog.text and 'newer' in caplog.text
+
+    def test_dry_run_with_an_equal_target_is_still_same(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.props('snap', 'snap'))
+        assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True) == 'same'
+
+    def test_dry_run_without_overwrite_on_an_existing_target_is_exists(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.props('a', 'b'))
+        assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True) == 'exists'
+
+    def test_overwrite_is_keyword_only(self):
+        with pytest.raises(TypeError):
+            copy_anchor_property(self.DS(), 'old', 'new', False, True)
+        with pytest.raises(TypeError):
+            copy_anchor_property(self.DS(), 'old', 'new', True)
+
+    def test_overwrite_defaults_to_false(self):
+        import inspect
+
+        parameter = inspect.signature(copy_anchor_property).parameters['overwrite']
+        assert parameter.default is False and parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_overwrite_never_touches_the_old_property(self, mock_subprocess):
+        mock_subprocess.setup_multi((self.props('newer', 'older'),), ('',))
+        copy_anchor_property(self.DS(), 'old', 'new', overwrite=True)
+        for cmd in _cmds(mock_subprocess):
+            assert 'inherit' not in cmd and f'{A}old' not in cmd[2:]
+
+    def test_an_inherited_target_is_not_a_blocker_even_without_overwrite(self, mock_subprocess):
+        mock_subprocess.setup_multi((self.props('snap', 'ancestors', 'inherited from pool'),), ('',))
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'copied'
+
+    def test_a_received_target_counts_as_existing(self, mock_subprocess):
+        mock_subprocess.setup_multi((self.props('newer', 'older', 'received'),), ('',))
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'overwritten'
+
+    def test_overwrite_twice_is_overwritten_then_same(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (self.props('newer', 'older'),),
+            ('',),
+            (self.props('newer', 'newer'),),
+        )
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'overwritten'
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'same'
+        assert _subcommands(mock_subprocess) == ['get', 'set', 'get']
+
+    def test_a_failing_overwrite_set_propagates(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (self.props('newer', 'older'),),
+            ([], 'cannot set property: permission denied', 1),
+        )
+        with pytest.raises(Exception, match='permission denied'):
+            copy_anchor_property(self.DS(), 'old', 'new', overwrite=True)
+
+
+# Mutation counts for the anchor decision (scratch copy, one revert at a time;
+# failing tests across the manager, rename and edit test files): raw anchor read
+# ignored 15; `-` value protected 3; orphan INFO on every call 4; read failure
+# prunes blind 3 / uncaught 4; configured destination's anchor dropped 4;
+# `copy_anchor_property`: equal value not 'same' 7 / overwrite ignored 14 /
+# overwrite positional 5 / 'overwritten' reported as 'copied' 7 / dry run sets 7.

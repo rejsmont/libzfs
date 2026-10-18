@@ -40,9 +40,14 @@ from typing import Dict, List
 
 import yaml
 
-from zfsbackup.config import BackupConfig, DatasetConfig, Duration, RetentionRule
+from zfsbackup.config import BackupConfig, DatasetConfig, Destination, Duration, RetentionRule
 
-__all__ = ["render_yaml", "duration_literal"]
+__all__ = [
+    "render_yaml",
+    "render_dataset_fragment",
+    "render_destination_fragment",
+    "duration_literal",
+]
 
 
 class _Quoted(str):
@@ -183,3 +188,18 @@ def render_yaml(config: BackupConfig) -> str:
         chunks.append("datasets: []\n")
 
     return "\n".join(chunks)
+
+
+def render_dataset_fragment(ds: DatasetConfig) -> str:
+    """One dataset's settings as a YAML mapping WITHOUT its `name` (the buffer
+    of `edit dataset`: a name is identity, changed only by `rename`). Parsed
+    back, with the name restored, by the same per-dataset path as an entry of
+    a config file."""
+    entry = _dataset_entry(ds)
+    entry.pop("name")
+    return _dump(entry)
+
+
+def render_destination_fragment(dest: Destination) -> str:
+    """One destination's settings (`url`) as a YAML mapping, without its name."""
+    return _dump({"url": _Quoted(dest.url)})

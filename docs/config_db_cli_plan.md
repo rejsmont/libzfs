@@ -33,7 +33,9 @@ carries a status note or "as landed" text — where those disagree with the prop
 | Items 10.4–10.6 review fixes | done | Foreign-DB refusal, exit-code contract, ^C/SIGTERM/backup hygiene, connect-failure fd leak |
 | Item 10.3 | done | Interim `python -m zfsbackup.config.store.importer` deleted; scenarios and docs use `zfsbackup-config import` |
 | Item 15 (15.1–15.5) + 14.1 | done | See the "As landed" note under item 15 |
-| **Items 13 → 11 → 12 → 14.2 → 16** | **next** | The editing commands |
+| Items 13, 11, 12, 14.2 | done | `list`, `get`/`set`/`unset`, `edit` (whole + per entry), `rename dataset|destination`; mocked suite 3787 |
+| Warnings consolidation | done | `validate_config` is the single source of semantic warnings; `from_file` keeps parse-boundary ones; `load_config(warn_never_prune=)` |
+| **Checkpoint B** | **next** | Review before Phase 3 |
 | 10–16 Config CLI | approved, not started | Revised after Checkpoint A; order 10 → 15 → 13 → 11 → 12 → 14 → 16 |
 | 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
 | 21–23 Docs, scenarios, final review | not started | |
@@ -1734,6 +1736,28 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
   - **Known residual:** generations are per file — deleting and re-importing the DB restarts at 0, so an
     edit read from the old file could pass CAS against the new one (ABA). Rare; a store id in the
     snapshot would close it.
+
+- **Items 11–14.2 as landed** *(reviewed by both reviewers; fix round M1–M3, L1–L11)*:
+  - **Anchor decision (user, 2026-10-18 — "overwrite + protect all"):** `rename destination` overwrites a
+    differing pre-existing `anchor.NEW` with `anchor.OLD` (both values printed; the snapshot the old
+    value named is no longer pinned by it) via `copy_anchor_property(..., overwrite=True)` →
+    `no-source | copied | exists | same | overwritten | dry-run`; `DatasetManager.get_anchors` protects
+    the snapshot of every local or received `org.zfsbackup:anchor.*` (not only configured
+    destinations); a failed anchor read skips pruning that dataset for the cycle. Advice after a rename:
+    restart the daemon; keep `anchor.OLD` until a send to NEW succeeded, then `zfs inherit` it. This
+    supersedes the item-15 note that a renamed destination drops anchor protection.
+  - `rename dataset --clear-stale-props`: refused up front when ZFS is unavailable or NEW is absent
+    while OLD exists; the daemon check runs AFTER the write under a shared `flock` on `<db>.daemon.pid`
+    held through every `zfs inherit` (replaces B5's probe-before-write); `rename destination
+    --skip-missing`; destination names validated as ZFS property names.
+  - `edit`: unknown keys rejected at every level; rename-shaped and recreate-with-shared-destination
+    detection; a removed destination's anchor "stays behind and keeps pinning its snapshot until cleared
+    with `zfs inherit`"; editor signal handling like git (SIGINT/SIGQUIT ignored, SIGTERM forwarded,
+    10 s grace).
+  - **Deferred:** recursive pruning destroys `@snap` on child datasets without consulting the children's
+    anchors (pre-existing); a modified client could send a `-p` stream with `anchor.*` properties that
+    pin snapshots on the server (no new exposure — `retention: forever` already does; note it in the
+    readiness report); the no-real-zfs test guard covers only the pytest process.
 
 ### Item 11 — Dot-path `get` / `set` / `unset`
 - **Owner:** `zfsbackup-cli-developer` · **Tag:** `needs-approval` · **Files:** `cli/dotpath.py`,

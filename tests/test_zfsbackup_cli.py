@@ -378,11 +378,18 @@ def _locked_error() -> OperationalError:
 
 
 class TestSkeleton:
-    def test_help_lists_exactly_the_three_commands(self, run):
+    #: The commands that exist (Phase 2 items 10-14); nothing else may appear
+    #: unannounced. (`PLANNED` is for a command that has landed in the CLI
+    #: before this list is updated.)
+    COMMANDS = ["edit", "export", "get", "import", "list", "migrate", "rename", "set", "unset"]
+    PLANNED = set()
+
+    def test_help_lists_exactly_the_commands(self, run):
         result = run("--help")
         assert result.exit_code == 0
-        assert sorted(cli.commands) == ["export", "import", "migrate"]
-        for name in ("import", "export", "migrate"):
+        commands = set(cli.commands)
+        assert set(self.COMMANDS) <= commands <= set(self.COMMANDS) | self.PLANNED
+        for name in commands:
             assert name in result.stdout
 
     def test_short_help_flag(self, run):
@@ -1080,7 +1087,7 @@ class TestWarnings:
         assert len(hits) == 1
         assert hits[0].startswith("warning: ")
 
-    def test_from_file_and_validate_warnings_both_surface_for_forever(self, run, db, tmp_path):
+    def test_forever_warns_exactly_once_on_import(self, run, db, tmp_path):
         source = tmp_path / "forever.yaml"
         source.write_text(
             'check_interval: "5m"\n'
@@ -1092,7 +1099,9 @@ class TestWarnings:
         result = run("import", source, "-c", db)
         assert result.exit_code == 0
         lines = stderr_lines(result)
-        assert sum("retention is 'forever'" in l for l in lines) == 1
+        # `validate_config` is the single source; `from_file` no longer says it.
+        assert sum("retention is 'forever'" in l for l in lines) == 0
+        assert sum("never be pruned" in l for l in lines) == 1
         assert sum("retention is empty" in l for l in lines) == 1
 
     def test_warnings_precede_the_success_summary(self, run, db, tmp_path):

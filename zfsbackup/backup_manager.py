@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple, Union
 import logging
+import shlex
 import sys
 import os
 
@@ -72,27 +73,72 @@ def read_zfsbackup_properties(ds: Dataset) -> Dict[str, str]:
 
 
 def copy_anchor_property(
-    ds: Dataset, old_dest: str, new_dest: str, *, dry_run: bool = False
+    ds: Dataset,
+    old_dest: str,
+    new_dest: str,
+    *,
+    dry_run: bool = False,
+    overwrite: bool = False,
 ) -> str:
-    """Set `anchor.<new_dest>` from `anchor.<old_dest>` on `ds`, only if the
-    new one is absent. Never deletes anything (the old property is left for
-    the caller to clear once the rename has actually landed).
+    """Set `anchor.<new_dest>` from `anchor.<old_dest>` on `ds`. Never deletes
+    anything (the old property is left for the caller to clear once the rename
+    has actually landed).
 
-    Returns what happened: `'copied'`, `'dry-run'` (would have copied),
-    `'no-source'` (no `anchor.<old_dest>`), or `'exists'` (`anchor.<new_dest>`
-    already set; left alone). Raises whatever `zfs get`/`zfs set` raises.
+    Both properties are read with `read_zfsbackup_properties` (local and
+    received sources; an inherited value is neither a source nor a blocker).
+    A caller that wants to show the two values (e.g. for a dry run) reads
+    them with that function beforehand; this function returns only the outcome.
+
+    Returns exactly one of:
+
+    * `'no-source'`   -- no `anchor.<old_dest>` on `ds`; nothing is touched
+                         (checked first, whatever `overwrite` says).
+    * `'copied'`      -- `anchor.<new_dest>` was absent and has been set.
+    * `'dry-run'`     -- `dry_run` was true and a `zfs set` would have been
+                         issued (`anchor.<new_dest>` absent, or present with a
+                         different value and `overwrite=True`); nothing was set.
+    * `'overwritten'` -- `overwrite=True`, `anchor.<new_dest>` existed with a
+                         value different from `anchor.<old_dest>`'s, and has
+                         been set to the latter.
+    * `'same'`        -- `overwrite=True` and `anchor.<new_dest>` already
+                         equals `anchor.<old_dest>`; nothing is set.
+    * `'exists'`      -- `overwrite=False` and `anchor.<new_dest>` is already
+                         set (whatever its value); left alone.
+
+    `dry_run` never issues a `zfs set` and never changes the choice between
+    outcomes except `'copied'`/`'overwritten'` -> `'dry-run'`. Overwriting may
+    move `anchor.<new_dest>` BACKWARDS if a newer daemon already advanced it;
+    that is the caller's explicit choice. Note that an overwrite UNPINS the
+    snapshot the old `anchor.<new_dest>` value named: the pruner protects the
+    snapshots named by current `anchor.*` properties
+    (`DatasetManager.get_anchors`), not their previous values. Raises whatever
+    `zfs get`/`zfs set` raises.
     """
     old_prop = f"{PROP_ANCHOR_PREFIX}{old_dest}"
     new_prop = f"{PROP_ANCHOR_PREFIX}{new_dest}"
     props = read_zfsbackup_properties(ds)
     if old_prop not in props:
         return 'no-source'
-    if new_prop in props:
-        return 'exists'
+    value = props[old_prop]
+    exists = new_prop in props
+    if exists:
+        if not overwrite:
+            return 'exists'
+        if props[new_prop] == value:
+            return 'same'
     if dry_run:
-        logger.info(f"[DRY RUN] Would set {new_prop}={props[old_prop]} on {ds.name}")
+        if exists:
+            logger.info(
+                f"[DRY RUN] Would overwrite {new_prop}={props[new_prop]} "
+                f"with {value} on {ds.name}"
+            )
+        else:
+            logger.info(f"[DRY RUN] Would set {new_prop}={value} on {ds.name}")
         return 'dry-run'
-    zfs.set(ds, {new_prop: props[old_prop]})
+    zfs.set(ds, {new_prop: value})
+    if exists:
+        logger.debug(f"Overwrote {new_prop} from {old_prop} on {ds.name}")
+        return 'overwritten'
     logger.debug(f"Copied {old_prop} -> {new_prop} on {ds.name}")
     return 'copied'
 
@@ -194,6 +240,10 @@ class DatasetManager:
         # client that re-negotiates and pushes a *different* colliding
         # ruleset under the same dataset name must still warn.
         self._retention_warned: Set[Tuple[str, FrozenSet[Tuple[float, float]]]] = set()
+        # (dataset name, property) pairs of anchors belonging to no configured
+        # destination that were already announced at INFO (once each; the
+        # per-cycle repeat is DEBUG).
+        self._orphan_anchor_noted: Set[Tuple[str, str]] = set()
 
     @property
     def datasets(self) -> List[DatasetInfo]:
@@ -298,14 +348,53 @@ class DatasetManager:
             logger.warning(f"Failed to clear anchor property for {dsi.name}: {e}")
 
     def get_anchors(self, dsi: DatasetInfo) -> Set[str]:
-        """Return the set of snapshot names that are anchored for any destination."""
-        if not dsi.config.remote:
-            return set()
-        anchors = set()
-        for r in dsi.config.remote:
-            name = self.get_anchor(dsi, r.destination)
-            if name:
-                anchors.add(name)
+        """Return the snapshot names pinned by ANY `org.zfsbackup:anchor.*`
+        property on the dataset, whether or not its destination is configured.
+
+        This is the pruner's protect-set, and it may only ever err on the side
+        of protecting more. Sources:
+
+        * every `anchor.*` user property set `local` or `received` on the
+          dataset (via `read_zfsbackup_properties`: raw `zfs get`, filtered
+          before any libzfseasy object is built). An anchor of a destination
+          that was renamed or removed from the config still points at the
+          real incremental base until an operator clears it, and a daemon on
+          an older config may keep advancing it. `received` counts too: this
+          daemon's own sends carry no properties (no `-p`), so a received
+          anchor only appears on a dataset replicated with `-p` from another
+          host, where it names that origin's incremental base -- protecting it
+          errs toward keeping a snapshot.
+        * plus, as before, the per-configured-destination `get_anchor` value
+          (which also sees inherited values), so the result is a superset of
+          the old behaviour.
+
+        Raises if the property read fails: the caller must not prune on an
+        unknown protect-set (`prune_snapshots` skips the dataset instead).
+        """
+        anchors: Set[str] = set()
+        configured = {r.destination for r in (dsi.config.remote or [])}
+        for prop, value in read_zfsbackup_properties(dsi.dataset).items():
+            if not prop.startswith(PROP_ANCHOR_PREFIX) or not value or value == '-':
+                continue
+            anchors.add(value)
+            dest = prop[len(PROP_ANCHOR_PREFIX):]
+            if dest not in configured:
+                logger.debug(
+                    f"Anchor {prop}={value} on {dsi.name} belongs to no configured "
+                    "destination; still protecting it from pruning"
+                )
+                key = (dsi.name, prop)
+                if key not in self._orphan_anchor_noted:
+                    self._orphan_anchor_noted.add(key)
+                    logger.info(
+                        f"Dataset {dsi.name}: {prop} is not a configured destination but "
+                        f"still pins snapshot {value} against pruning. If it is stale, "
+                        f"release it with: zfs inherit {prop} {shlex.quote(dsi.name)}"
+                    )
+        for name in sorted(configured):
+            anchor = self.get_anchor(dsi, name)
+            if anchor:
+                anchors.add(anchor)
         return anchors
 
     def received_datasets(self) -> List[DatasetInfo]:
@@ -463,7 +552,12 @@ class DatasetManager:
             logger.debug(f"No snapshots to prune for {dsi.name}")
             return
 
-        anchors = self.get_anchors(dsi)
+        try:
+            anchors = self.get_anchors(dsi)
+        except Exception as e:
+            # Unknown protect-set: pruning blind could destroy an incremental base.
+            logger.error(f"Cannot read anchors for {dsi.name}; skipping pruning this cycle: {e}")
+            return
         to_prune = self.needs_prunning(dsi, anchors=anchors)
         logger.info(f"Dataset {dsi.name} has {len(to_prune)} snapshots to prune")
 

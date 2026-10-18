@@ -292,8 +292,8 @@ def _port_from_config(value, key: str) -> int:
     Accepts an `int` (not a `bool`, which YAML ``true`` would otherwise turn
     into port 1) or a string of ASCII digits; rejects null, floats (silent
     truncation) and anything outside 0-65535. Port 0 (bind to an ephemeral
-    port) is accepted with a WARNING because the API would then listen on a
-    port nobody can predict.
+    port) is accepted silently here: warning about it is the store's
+    `validate_config`, the single source of semantic warnings.
     """
     if isinstance(value, bool) or value is None:
         raise ValueError(
@@ -313,10 +313,6 @@ def _port_from_config(value, key: str) -> int:
         )
     if not 0 <= port <= 65535:
         raise ValueError(f"{key} must be a port number (0-65535), got {port}")
-    if port == 0:
-        logger.warning(
-            "%s is 0: the API will bind an ephemeral port that changes on every start", key
-        )
     return port
 
 
@@ -680,11 +676,8 @@ class DatasetConfig:
             # (an empty rule list, which is what the pruner treats as
             # keep-everything). Dataset level only: the destination-level
             # override below still rejects an empty/non-mapping value.
-            logger.warning(
-                "datasets[%s].retention is 'forever': snapshots of this dataset "
-                "will never be pruned and will accumulate until the pool is full",
-                name,
-            )
+            # No warning here: `validate_config` (the single source of
+            # semantic warnings) warns about the resulting empty rule list.
             retention_dict = {}
         elif retention_dict is None:
             # Absent 'retention' has a documented meaning at dataset level:
@@ -853,14 +846,7 @@ class BackupConfig:
                 "want them managed, set snapshot_prefix: \"None\" explicitly"
             )
         snapshot_prefix = _str_from_config(snapshot_prefix, "snapshot_prefix")
-        if '_' in snapshot_prefix:
-            logger.warning(
-                "snapshot_prefix %r contains '_': the snapshot timestamp is read "
-                "from the second '_'-separated field of the name, so no snapshot "
-                "with this prefix will be recognised as managed or ever pruned; "
-                "use a prefix without '_'",
-                snapshot_prefix,
-            )
+        # A '_' in the prefix is a semantic warning, owned by `validate_config`.
         # `dry_run: null` is falsy: the daemon ran live. Keep that, silently.
         dry_run = _bool_from_config(data.get('dry_run', False), "dry_run")
 

@@ -224,6 +224,14 @@ NORMALIZE = [
 ]
 
 
+#: The NORMALIZE warning fragments that are SEMANTIC (the value parses; the
+#: operator should still know what it does at run time). `validate_config` is
+#: the single source of those: `from_file` is silent for them and the import
+#: path (which validates) warns exactly once. The others are parse-boundary
+#: warnings and still come from `from_file`.
+SEMANTIC_WARNINGS = {"forever", "'_'", "api_port"}
+
+
 class TestNormalizeRows:
     @pytest.mark.parametrize("data, extract, expected, warning", NORMALIZE)
     def test_from_file(self, tmp_path, caplog, data, extract, expected, warning):
@@ -233,10 +241,22 @@ class TestNormalizeRows:
 
         assert extract(config) == expected
         found = warnings_of(caplog)
-        if warning is None:
+        if warning is None or warning in SEMANTIC_WARNINGS:
+            # Semantic warnings belong to `validate_config` alone.
             assert found == []
         else:
             assert any(warning in message for message in found), found
+
+    @pytest.mark.parametrize(
+        "data, extract, expected, warning",
+        [row for row in NORMALIZE if row.values[3] in SEMANTIC_WARNINGS],
+    )
+    def test_semantic_warning_comes_from_validate_config(
+        self, tmp_path, data, extract, expected, warning
+    ):
+        config = BackupConfig.from_file(write(tmp_path, data))
+        found = validate_config(config)
+        assert len(found) == 1 and warning in found[0], found
 
     @pytest.mark.parametrize("data, extract, expected, warning", NORMALIZE)
     def test_import_then_load_config(
@@ -1019,7 +1039,9 @@ class TestValidateConfigDirect:
 
     def test_warning_api_port_zero(self):
         warnings = validate_config(good_config(api_port=0))
-        assert len(warnings) == 1 and "api_port 0" in warnings[0]
+        assert warnings == [
+            "api_port is 0: the API will bind an ephemeral port that changes on every start"
+        ]
 
     def test_exact_duplicate_rules_warn_naming_both_literals(self):
         config = good_config()

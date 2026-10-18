@@ -136,7 +136,9 @@ writer lock — empty, never deleted), `config.db.daemon.pid` (daemon presence l
 `config.db.pre-import-<UTC>.yaml` backups written by `import`.
 
 **[zfsbackup/cli/](zfsbackup/cli/)** — the `zfsbackup-config` Click application (Phase 2, in progress):
-`import`, `export` and `migrate` today; `render.py` turns a `BackupConfig` back into YAML that
+`import`, `export`, `migrate`, `list`, `get`/`set`/`unset` (dot paths, `dotpath.py`), `edit`
+(whole config or one dataset/destination in `$EDITOR`, `editor.py`) and `rename dataset|destination`
+(`rename.py`, which also handles the ZFS anchor/property side effects); `render.py` turns a `BackupConfig` back into YAML that
 `from_file` reproduces exactly, including duration literals; `write.py` is the shared read → edit →
 `write_config(expected_generation)` helper for the editing commands, with the post-write daemon notice.
 It is the only writer of the config DB. Exit codes: 0 ok, 1 invalid/refused, 2 usage, 75 retry
@@ -180,6 +182,11 @@ It is the only writer of the config DB. Exit codes: 0 ok, 1 invalid/refused, 2 u
 | `tests/test_zfsbackup_store_upgrade.py` | Pinned schema head, `upgrade_schema` (transactional, FK check, concurrency), import backup hook |
 | `tests/test_zfsbackup_cli.py` | `zfsbackup-config` commands, path resolution, exit codes, import backups, conflict/busy, daemon notice |
 | `tests/test_zfsbackup_cli_render.py` | YAML renderer round trip (values and duration literals) |
+| `tests/test_zfsbackup_cli_list.py` | `list datasets|destinations`, text and `--json` |
+| `tests/test_zfsbackup_cli_dotpath.py` | `get`/`set`/`unset` dot paths, coercion, warnings |
+| `tests/test_zfsbackup_cli_edit.py` | `edit` in `$EDITOR`: buffers, retry/abort, rename detection, signals |
+| `tests/test_zfsbackup_cli_rename.py` | `rename dataset|destination` and their ZFS anchor/property effects (fake `zfs`) |
+| `tests/test_no_real_zfs_guard.py` | The conftest guard that fails any test reaching a real `zfs`/`zpool` |
 | `tests/test_marker_tiers.py` | `unit` and `integration` partition the mocked suite |
 | `tests/test_zfsbackup_real.py` | Daemon against a real pool, marked `real_zfs` |
 

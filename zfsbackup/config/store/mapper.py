@@ -145,7 +145,9 @@ def _rule_to_dataclass(row: models.RetentionRule) -> RetentionRule:
     )
 
 
-def _dataset_level_rules(ds: models.Dataset) -> List[RetentionRule]:
+def _dataset_level_rules(
+    ds: models.Dataset, *, warn_never_prune: bool = True
+) -> List[RetentionRule]:
     """The dataset-level (local pruning) retention set for `ds`.
 
     THE TRAP (see module docstring on `store/__init__.py` and this file's
@@ -172,13 +174,17 @@ def _dataset_level_rules(ds: models.Dataset) -> List[RetentionRule]:
     The WARNING is not noise: zero rows is also what a dataset written
     directly against the DB (bypassing `save_config`) looks like, and
     "this dataset is never pruned" is an adverse behaviour that should be
-    visible in the log of whichever process loads it.
+    visible in the log of whichever process loads it. `warn_never_prune=False`
+    silences it for the one caller that loads a config only to discard it
+    (`importer._backup_outgoing`): the new config is validated and warned
+    about separately, and repeating the outgoing one on every re-import is
+    noise.
     """
     rules = [
         _rule_to_dataclass(r) for r in ds.retention_rules if r.dataset_remote_id is None
     ]
     rules.sort(key=lambda r: r.age)
-    if not rules:
+    if not rules and warn_never_prune:
         logger.warning(
             "dataset %r (id=%s) has no dataset-level retention rules; its "
             "snapshots will never be pruned",
@@ -279,7 +285,10 @@ def _assert_scope_integrity(ds: models.Dataset) -> None:
 
 
 def _dataset_to_dataclass(
-    ds: models.Dataset, known_destinations: Dict[str, Destination]
+    ds: models.Dataset,
+    known_destinations: Dict[str, Destination],
+    *,
+    warn_never_prune: bool = True,
 ) -> DatasetConfig:
     """Map one `Dataset` row (with its `retention_rules` and `remotes`
     relationships) to a fully detached `config.DatasetConfig`.
@@ -336,13 +345,13 @@ def _dataset_to_dataclass(
         # path; coerce so `==` against `from_file`'s real `bool` holds.
         recursive=bool(ds.recursive),
         frequency=frequency,
-        retention_rules=_dataset_level_rules(ds),
+        retention_rules=_dataset_level_rules(ds, warn_never_prune=warn_never_prune),
         enabled=bool(ds.enabled),
         remote=remote_configs,
     )
 
 
-def load_config(session: Session) -> BackupConfig:
+def load_config(session: Session, *, warn_never_prune: bool = True) -> BackupConfig:
     """Build a fully detached `BackupConfig` from the config store.
 
     Replicates `BackupConfig.from_file`'s defaulting behaviour exactly for
@@ -382,6 +391,10 @@ def load_config(session: Session) -> BackupConfig:
     instead. `validate_config` is likewise not run on load: a load must
     reflect what is stored (a hand-edited row is the operator's to see in the
     logs, not something to refuse to start over).
+
+    `warn_never_prune=False` suppresses the per-dataset "never be pruned"
+    WARNING for a caller that discards the result (the importer's
+    outgoing-config backup). Leave it True everywhere else.
     """
     gs = session.get(models.GlobalSettings, 1)
     if gs is None:
@@ -411,7 +424,10 @@ def load_config(session: Session) -> BackupConfig:
     if not dataset_rows:
         raise ValueError("No datasets configured")
 
-    datasets = [_dataset_to_dataclass(ds, destinations) for ds in dataset_rows]
+    datasets = [
+        _dataset_to_dataclass(ds, destinations, warn_never_prune=warn_never_prune)
+        for ds in dataset_rows
+    ]
 
     remote_server = session.get(models.RemoteServer, 1)
     remote_backup = (
@@ -637,12 +653,20 @@ def validate_config(config: BackupConfig) -> List[str]:
 
     Warns (returned, not raised):
 
-    - a dataset with no dataset-level retention rules: `[]` means NEVER
-      PRUNE (`retention: forever`);
-    - a `snapshot_prefix` containing `_` (snapshot names are parsed by
-      splitting on `_`, so nothing under such a prefix is ever managed or
-      pruned -- a pre-existing parser limitation);
-    - `api_port` 0 (the OS picks an ephemeral port nothing can be told);
+    This is the SINGLE source of the semantic warnings below:
+    `BackupConfig.from_file` / `DatasetConfig.from_dict` no longer emit them
+    (they keep only parse-boundary warnings), so a config is warned about
+    exactly once, here, whichever way it was built.
+
+    - a dataset with no dataset-level retention rules (`retention: forever`):
+      `[]` means NEVER PRUNE, so its snapshots accumulate until the pool is
+      full;
+    - a `snapshot_prefix` containing `_` (the timestamp is read from the
+      second `_`-separated field of a snapshot name, so nothing under such a
+      prefix is ever recognised as managed or pruned -- a pre-existing
+      parser limitation);
+    - `api_port` 0 (the API binds an ephemeral port that changes on every
+      start);
     - an in-code `client_id_file` of `""`, which YAML treats as unset:
       `save_config` stores NULL (derive from `$HOME`) instead of a value
       that would reload as `Path(".")`;
@@ -684,8 +708,9 @@ def validate_config(config: BackupConfig) -> List[str]:
     if "_" in config.snapshot_prefix:
         warnings.append(
             f"snapshot_prefix {config.snapshot_prefix!r} contains '_': "
-            "snapshot names are parsed by splitting on '_', so no snapshot "
-            "with this prefix will ever be managed or pruned"
+            "the snapshot timestamp is read from the second '_'-separated "
+            "field of the name, so no snapshot with this prefix will be "
+            "recognised as managed or ever pruned; use a prefix without '_'"
         )
 
     _require_positive_duration(config.check_interval, "check_interval", "interval")
@@ -702,7 +727,8 @@ def validate_config(config: BackupConfig) -> List[str]:
         )
     if config.api_port == 0:
         warnings.append(
-            "api_port 0 asks the OS for an ephemeral port that nothing is told about"
+            "api_port is 0: the API will bind an ephemeral port that "
+            "changes on every start"
         )
     _require_bool(config.dry_run, "dry_run")
     # Type only. NEVER evaluate `effective_client_id_file` here (reads $HOME).
@@ -768,8 +794,9 @@ def validate_config(config: BackupConfig) -> List[str]:
 
         if not ds.retention_rules:
             warnings.append(
-                f"{key}.retention is empty: this dataset's snapshots will "
-                "never be pruned"
+                f"{key}.retention is empty ('retention: forever'): this "
+                "dataset's snapshots will never be pruned and will "
+                "accumulate until the pool is full"
             )
         _validate_rules(ds.retention_rules, f"{key}.retention", warnings)
 

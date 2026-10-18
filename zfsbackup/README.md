@@ -69,6 +69,42 @@ configuration state — a `daemon.pid` left behind by a crash is harmless. If `z
 with status **75**, another write was in progress or the configuration changed underneath it: just
 run the command again.
 
+### Changing the configuration
+
+```bash
+zfsbackup-config list datasets            # or: list destinations; --json for scripts
+zfsbackup-config get  'datasets[tank/data].retention'
+zfsbackup-config set  'datasets[tank/data].frequency' 30m
+zfsbackup-config set  'datasets[tank/data].retention.1w' 3M     # add/replace one rule
+zfsbackup-config unset prune_interval                           # back to "derived from check_interval"
+zfsbackup-config edit                                           # whole config in $EDITOR
+zfsbackup-config edit dataset tank/data                         # one dataset
+zfsbackup-config rename dataset tank/data tank/projects
+zfsbackup-config rename destination offsite dr
+```
+
+Values are read exactly as in the YAML file (`30m`, `true`, `forever`). Dataset names may contain dots;
+the bracket form `datasets[tank/vm.01].frequency` always works. A rejected change writes nothing.
+
+`edit` never saves a buffer it can't validate; it offers to retry, and keeps your buffer (and prints its
+path) if you abort, the editor fails, or another change got there first (exit 75).
+
+**Renaming.** Renaming a dataset in the configuration does **not** rename the ZFS dataset. If the dataset
+sends backups to a remote, `rename dataset` needs `--force`: the server stores it under a path derived
+from the name, so the next send is likely a full one. `--clear-stale-props` removes the old dataset's
+`org.zfsbackup:*` properties. It is refused up front when the new dataset doesn't exist in ZFS yet (if
+you are about to `zfs rename`, those properties follow it). If a daemon is running, the rename itself is
+still saved but the properties are left alone: the command prints the `zfs inherit` commands to run
+after stopping the daemon and exits 1. A daemon that tries to start during those few seconds of
+clearing may be refused once; a restart policy takes care of it.
+
+`rename destination` copies each dataset's `org.zfsbackup:anchor.<old>` to `anchor.<new>` before saving.
+If `anchor.<new>` already exists with a different value (left over from an earlier destination of that
+name), it is overwritten and both values are printed; the snapshot it used to name is no longer pinned
+by it. The daemon protects the snapshot named by *every* local or received anchor property, so keep the
+old anchor until the first send to the new name has succeeded, then clear it with the `zfs inherit`
+commands the CLI prints. Restart the daemon after a rename. Both renames support `--dry-run`.
+
 ## Usage
 
 ### Start the Daemon
