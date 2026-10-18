@@ -8539,3 +8539,367 @@ class TestLoadConfigSnapshot:
                 s.commit()
                 seen.append(load_config_snapshot(s).generation)
         assert seen == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Item 17.0 -- the store id (PRAGMA user_version), session level
+# ---------------------------------------------------------------------------
+#
+# The file-level behaviour (write_config / import_yaml / read_store_state) is in
+# `test_zfsbackup_store_access.py`; the survival across `upgrade_schema` in
+# `test_zfsbackup_store_upgrade.py`.
+
+from types import SimpleNamespace  # noqa: E402
+
+from zfsbackup.config.store import mapper as store_mapper_module  # noqa: E402
+from zfsbackup.config.store import StoreIdConflict  # noqa: E402
+from zfsbackup.config.store.mapper import read_store_id  # noqa: E402
+
+
+def _config_with_empty_retention() -> BackupConfig:
+    return _minimal_backup_config(name="tank/forever", retention_rules=[])
+
+
+@pytest.fixture
+def stamps(monkeypatch):
+    """Deterministic stamps 1001, 1002, ... and the list of `randbelow` bounds."""
+    bounds = []
+
+    def randbelow(n):
+        bounds.append(n)
+        return 999 + len(bounds)
+
+    monkeypatch.setattr(store_mapper_module, "secrets", SimpleNamespace(randbelow=randbelow))
+    return bounds
+
+
+@pytest.mark.unit
+class TestSaveConfigStoreId:
+    def test_a_fresh_database_reads_zero(self, session):
+        assert read_store_id(session) == 0
+
+    def test_the_first_save_stamps_a_non_zero_id_below_2_31_minus_1(self, session):
+        save_config(session, _minimal_backup_config())
+        session.commit()
+        value = read_store_id(session)
+        assert type(value) is int and 0 < value < 2**31 - 1
+
+    def test_the_stamp_is_in_the_header_not_just_in_the_session(self, session):
+        save_config(session, _minimal_backup_config())
+        session.commit()
+        raw = session.connection().exec_driver_sql("PRAGMA user_version").scalar()
+        assert raw == read_store_id(session) != 0
+
+    def test_later_saves_keep_the_id_and_draw_no_new_one(self, session, stamps):
+        for _ in range(3):
+            save_config(session, _minimal_backup_config())
+            session.commit()
+        assert read_store_id(session) == 1001
+        assert stamps == [2**31 - 2]
+
+    def test_a_non_zero_value_is_never_re_stamped(self, session, stamps):
+        session.connection().exec_driver_sql("PRAGMA user_version = 7")
+        session.commit()
+        save_config(session, _minimal_backup_config())
+        session.commit()
+        assert read_store_id(session) == 7
+        assert stamps == []
+
+    @pytest.mark.parametrize(
+        ("draw", "expected"), [(0, 1), (2**31 - 3, 2**31 - 2)], ids=["lowest", "highest"]
+    )
+    def test_the_stamp_range_is_1_to_2_31_minus_2(self, session, monkeypatch, draw, expected):
+        monkeypatch.setattr(
+            store_mapper_module, "secrets", SimpleNamespace(randbelow=lambda n: draw)
+        )
+        save_config(session, _minimal_backup_config())
+        session.commit()
+        assert read_store_id(session) == expected
+
+    def test_a_legacy_zero_database_is_stamped_by_the_next_save(self, session):
+        save_config(session, _minimal_backup_config())
+        session.commit()
+        session.connection().exec_driver_sql("PRAGMA user_version = 0")
+        session.commit()
+        assert read_store_id(session) == 0
+        save_config(session, _minimal_backup_config())
+        session.commit()
+        assert read_store_id(session) != 0
+
+
+@pytest.mark.unit
+class TestSaveConfigStoreIdRollback:
+    """Stamping is the last statement, in the data's transaction."""
+
+    def test_control_a_pragma_before_the_first_dml_is_autocommitted_in_legacy_mode(
+        self, engine
+    ):
+        """Why the stamp must come last: on this connection (in-memory
+        `StaticPool`, pysqlite's legacy transaction handling) `BEGIN` is only
+        emitted before the first DML, so a pragma issued first is not part of
+        the transaction and survives a rollback."""
+        with Session(engine) as s:
+            s.connection().exec_driver_sql("PRAGMA user_version = 9")
+            s.rollback()
+            assert read_store_id(s) == 9
+
+    def test_a_rolled_back_first_save_leaves_zero_on_an_in_memory_static_pool(self, engine):
+        assert isinstance(engine.pool, StaticPool)
+        with Session(engine) as s:
+            save_config(s, _minimal_backup_config())
+            assert read_store_id(s) != 0           # visible inside the transaction
+            s.rollback()
+            assert read_store_id(s) == 0
+            assert s.query(GlobalSettings).count() == 0
+
+    def test_a_rolled_back_save_over_a_legacy_database_leaves_zero_and_the_generation(
+        self, engine
+    ):
+        with Session(engine) as s:
+            save_config(s, _minimal_backup_config(name="tank/a"))
+            s.connection().exec_driver_sql("PRAGMA user_version = 0")
+            s.commit()
+            save_config(s, _minimal_backup_config(name="tank/b"))
+            s.rollback()
+            assert read_store_id(s) == 0
+            assert s.get(GlobalSettings, 1).generation == 0
+            assert _dataset_names(s) == ["tank/a"]
+
+    def test_a_failure_after_the_stamp_leaves_zero_on_an_in_memory_static_pool(self, engine):
+        with Session(engine) as s:
+            with pytest.raises(RuntimeError, match="injected"):
+                try:
+                    save_config(s, _minimal_backup_config())
+                    assert read_store_id(s) != 0
+                    raise RuntimeError("injected after the stamp")
+                except BaseException:
+                    s.rollback()
+                    raise
+            assert read_store_id(s) == 0
+
+    def test_a_rolled_back_save_leaves_zero_on_a_file_engine_too(self, file_engine):
+        with Session(file_engine) as s:
+            save_config(s, _minimal_backup_config())
+            s.rollback()
+            assert read_store_id(s) == 0
+        with Session(file_engine) as s:
+            save_config(s, _minimal_backup_config())
+            s.commit()
+            assert read_store_id(s) != 0
+
+
+@pytest.mark.unit
+class TestSaveConfigExpectedStoreId:
+    @pytest.fixture
+    def stored(self, session, stamps):
+        save_config(session, _minimal_backup_config(name="tank/a"))
+        session.commit()
+        assert read_store_id(session) == 1001
+        return session
+
+    def test_a_matching_id_writes(self, stored):
+        new = save_config(
+            stored, _minimal_backup_config(name="tank/b"),
+            expected_generation=0, expected_store_id=1001,
+        )
+        stored.commit()
+        assert new == 1 and _dataset_names(stored) == ["tank/b"]
+
+    def test_a_different_id_raises_store_id_conflict_with_both_ids(self, stored):
+        with pytest.raises(StoreIdConflict) as excinfo:
+            save_config(
+                stored, _minimal_backup_config(name="tank/b"),
+                expected_generation=0, expected_store_id=1000,
+            )
+        assert isinstance(excinfo.value, ConfigConflict)
+        assert (excinfo.value.expected_store_id, excinfo.value.actual_store_id) == (1000, 1001)
+
+    def test_expected_and_actual_are_generations_not_store_ids(self, stored):
+        save_config(stored, _minimal_backup_config(name="tank/a"))
+        stored.commit()  # generation 1
+        with pytest.raises(StoreIdConflict) as excinfo:
+            save_config(
+                stored, _minimal_backup_config(), expected_generation=5,
+                expected_store_id=1000,
+            )
+        assert (excinfo.value.expected, excinfo.value.actual) == (5, 1)
+        with pytest.raises(StoreIdConflict) as excinfo:
+            save_config(stored, _minimal_backup_config(), expected_store_id=1000)
+        assert (excinfo.value.expected, excinfo.value.actual) == (None, 1)
+
+    def test_f2_zero_expected_against_a_since_stamped_database_is_a_plain_generation_conflict(
+        self, session, stamps
+    ):
+        """Legacy read (0, g); another writer stamped it (X, g+1)."""
+        save_config(session, _minimal_backup_config())
+        session.connection().exec_driver_sql("PRAGMA user_version = 0")
+        session.commit()
+        save_config(session, _minimal_backup_config(name="tank/theirs"))  # stamps, g=1
+        session.commit()
+        assert read_store_id(session) != 0
+        with pytest.raises(ConfigConflict) as excinfo:
+            save_config(
+                session, _minimal_backup_config(name="tank/mine"),
+                expected_generation=0, expected_store_id=0,
+            )
+        assert type(excinfo.value) is ConfigConflict
+        assert (excinfo.value.expected, excinfo.value.actual) == (0, 1)
+        session.rollback()
+        assert _dataset_names(session) == ["tank/theirs"]
+
+    def test_a_stale_non_zero_id_with_no_global_settings_row_reports_actual_none(self, session):
+        with pytest.raises(StoreIdConflict) as excinfo:
+            save_config(session, _minimal_backup_config(), expected_store_id=1000)
+        assert (excinfo.value.expected, excinfo.value.actual) == (None, None)
+        assert (excinfo.value.expected_store_id, excinfo.value.actual_store_id) == (1000, 0)
+        assert _dataset_names(session) == []
+
+    def test_f2_zero_expected_without_an_expected_generation_writes(self, stored):
+        assert save_config(
+            stored, _minimal_backup_config(name="tank/b"), expected_store_id=0
+        ) == 1
+
+    def test_it_is_refused_before_any_delete(self, stored):
+        with pytest.raises(StoreIdConflict):
+            save_config(
+                stored, _minimal_backup_config(name="tank/b"), expected_store_id=5
+            )
+        assert not stored.deleted and not stored.new
+        assert _dataset_names(stored) == ["tank/a"]
+        assert stored.get(GlobalSettings, 1).generation == 0
+
+    def test_none_skips_the_compare(self, stored):
+        assert save_config(
+            stored, _minimal_backup_config(name="tank/b"), expected_store_id=None
+        ) == 1
+
+    def test_the_default_is_not_compared(self, stored):
+        assert save_config(stored, _minimal_backup_config(name="tank/b")) == 1
+
+    def test_the_store_id_check_wins_over_the_generation_check(self, stored):
+        with pytest.raises(ConfigConflict) as excinfo:
+            save_config(
+                stored, _minimal_backup_config(), expected_generation=99,
+                expected_store_id=1,
+            )
+        assert type(excinfo.value) is StoreIdConflict
+
+    def test_a_right_id_and_wrong_generation_is_a_plain_conflict(self, stored):
+        with pytest.raises(ConfigConflict) as excinfo:
+            save_config(
+                stored, _minimal_backup_config(), expected_generation=99,
+                expected_store_id=1001,
+            )
+        assert type(excinfo.value) is ConfigConflict
+
+    def test_validation_still_runs_before_the_compare(self, stored):
+        with pytest.raises(ValueError):
+            save_config(stored, BackupConfig(datasets=[]), expected_store_id=5)
+
+    def test_zero_expected_against_a_legacy_database_passes_and_stamps(self, session):
+        save_config(session, _minimal_backup_config())
+        session.connection().exec_driver_sql("PRAGMA user_version = 0")
+        session.commit()
+        save_config(session, _minimal_backup_config(), expected_generation=0, expected_store_id=0)
+        session.commit()
+        assert read_store_id(session) != 0
+
+    def test_store_id_conflict_is_a_retry_not_an_unusable_database(self):
+        exc = StoreIdConflict(1, 2)
+        assert not isinstance(exc, (store_paths.ConfigPathError, SchemaError, ConfigBusy))
+        assert "generation" not in str(exc)
+
+
+@pytest.mark.unit
+class TestLoadConfigSnapshotStoreId:
+    @pytest.fixture
+    def head_engine(self):
+        eng = make_engine("sqlite:///:memory:", foreign_keys=True)
+        with eng.begin() as conn:
+            ensure_schema(conn)
+        yield eng
+        eng.dispose()
+
+    def test_the_snapshot_carries_the_files_store_id(self, head_engine):
+        with Session(head_engine) as s:
+            save_config(s, _minimal_backup_config())
+            s.commit()
+            snap = load_config_snapshot(s)
+            assert snap.store_id == read_store_id(s) != 0
+
+    def test_a_legacy_database_snapshots_store_id_zero(self, head_engine):
+        with Session(head_engine) as s:
+            save_config(s, _minimal_backup_config())
+            s.connection().exec_driver_sql("PRAGMA user_version = 0")
+            s.commit()
+            assert load_config_snapshot(s).store_id == 0
+
+    def test_the_three_field_constructor_still_works(self):
+        snap = ConfigSnapshot(_minimal_backup_config(), 4, "rev")
+        assert (snap.generation, snap.schema_rev, snap.store_id) == (4, "rev", 0)
+
+    def test_the_snapshot_stays_frozen(self, head_engine):
+        with Session(head_engine) as s:
+            save_config(s, _minimal_backup_config())
+            s.commit()
+            snap = load_config_snapshot(s)
+        with pytest.raises(Exception):
+            snap.store_id = 5
+
+    def test_the_snapshot_read_is_a_pure_read(self, head_engine):
+        with Session(head_engine) as s:
+            save_config(s, _minimal_backup_config())
+            s.commit()
+            before = read_store_id(s)
+            load_config_snapshot(s)
+            load_config_snapshot(s)
+            assert read_store_id(s) == before
+
+
+@pytest.mark.unit
+class TestLoadConfigSnapshotWarnNeverPrune:
+    @pytest.fixture
+    def forever_session(self):
+        eng = make_engine("sqlite:///:memory:", foreign_keys=True)
+        with eng.begin() as conn:
+            ensure_schema(conn)
+        with Session(eng) as s:
+            save_config(s, _config_with_empty_retention())
+            s.commit()
+            yield s
+        eng.dispose()
+
+    @staticmethod
+    def _lines(caplog):
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "never be pruned" in r.getMessage()
+        ]
+
+    def test_the_default_still_logs_the_never_prune_line(self, forever_session, caplog):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.mapper"):
+            snap = load_config_snapshot(forever_session)
+        assert snap.config.datasets[0].retention_rules == []
+        lines = self._lines(caplog)
+        assert len(lines) == 1 and "tank/forever" in lines[0].getMessage()
+
+    def test_warn_never_prune_false_logs_no_never_prune_line(self, forever_session, caplog):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.mapper"):
+            snap = load_config_snapshot(forever_session, warn_never_prune=False)
+        assert snap.config.datasets[0].retention_rules == []
+        assert self._lines(caplog) == []
+
+    def test_the_flag_is_passed_through_to_load_config(self, forever_session, monkeypatch):
+        seen = []
+        real = store_mapper_module.load_config
+
+        def spy(session, **kwargs):
+            seen.append(kwargs)
+            return real(session, **kwargs)
+
+        monkeypatch.setattr(store_mapper_module, "load_config", spy)
+        load_config_snapshot(forever_session, warn_never_prune=False)
+        load_config_snapshot(forever_session)
+        assert seen == [{"warn_never_prune": False}, {"warn_never_prune": True}]

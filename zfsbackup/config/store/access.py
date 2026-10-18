@@ -66,6 +66,7 @@ from zfsbackup.config.store.errors import ConfigBusy
 from zfsbackup.config.store.mapper import (
     ConfigSnapshot,
     load_config_snapshot,
+    read_store_id,
     save_config,
     validate_config,
 )
@@ -80,10 +81,12 @@ from zfsbackup.config.store.paths import (
 )
 
 __all__ = [
+    "StoreState",
     "WriteResult",
     "check_config_schema",
     "read_config",
     "read_generation",
+    "read_store_state",
     "write_config",
 ]
 
@@ -113,9 +116,15 @@ def check_config_schema(resolved: ResolvedConfigPath) -> str:
         return check_schema(connection)
 
 
-def read_config(resolved: ResolvedConfigPath) -> ConfigSnapshot:
-    """Read the whole configuration, its generation and its schema revision
-    from one read snapshot. See this module's docstring.
+def read_config(
+    resolved: ResolvedConfigPath, *, warn_never_prune: bool = True
+) -> ConfigSnapshot:
+    """Read the whole configuration, its generation, its store id and its
+    schema revision from one read snapshot. See this module's docstring.
+
+    `warn_never_prune=False` suppresses `load_config`'s per-dataset "never be
+    pruned" log lines: a caller that reads repeatedly (a reload) logs them
+    once, at startup, and not again on every read.
 
     Read-only throughout (the `query_only` reader engine plus the
     `ReadOnlySessionError` guard), never creates or migrates anything, and
@@ -139,7 +148,9 @@ def read_config(resolved: ResolvedConfigPath) -> ConfigSnapshot:
         session.execute(text("BEGIN"))
         try:
             schema_rev = check_schema(session.connection())
-            snapshot = load_config_snapshot(session, schema_rev=schema_rev)
+            snapshot = load_config_snapshot(
+                session, schema_rev=schema_rev, warn_never_prune=warn_never_prune
+            )
         except BaseException:
             try:
                 session.execute(text("ROLLBACK"))
@@ -194,6 +205,59 @@ def read_generation(resolved: ResolvedConfigPath) -> int:
 
 
 @dataclass(frozen=True)
+class StoreState:
+    """The two cheap facts a periodic poll compares: the file's store id
+    (`PRAGMA user_version`; 0 = a legacy database no save has stamped yet) and
+    `GlobalSettings.generation`. `(store_id, generation)` is the reload key.
+    """
+
+    store_id: int
+    generation: int
+
+
+def read_store_state(resolved: ResolvedConfigPath) -> StoreState:
+    """`(store_id, generation)` from one read snapshot, and nothing else.
+
+    The poll's read: one read-only connection, `BEGIN`; `PRAGMA user_version`;
+    `SELECT generation`; `COMMIT`; close. The pragma is the FIRST statement
+    so it opens the read snapshot and the `SELECT` reads the same one -- the
+    pair cannot straddle a commit. NO schema check (the poll only asks "did
+    the key change"; a changed key is followed by a full `read_config`, which
+    checks), no config load, no ORM, and it does NOT dispose: like
+    `read_generation` it leaves the cached reader engine's pooled connection
+    in place (idle, in no transaction, so it holds no WAL read mark and
+    `PRAGMA wal_checkpoint` is not blocked by it) and the caller disposes --
+    the supervisor does so after every poll.
+
+    Raises what `read_generation` raises: `ConfigPathError` (preflight),
+    `ValueError` (no `GlobalSettings` row, i.e. uninitialised) and
+    `sqlalchemy.exc.OperationalError` / `DatabaseError` (storage failures; an
+    unmigrated database lacking the table is one). `read_generation` itself
+    is unchanged.
+    """
+    with open_config_connection(resolved, readonly=True) as connection:
+        connection.execute(text("BEGIN"))
+        try:
+            store_id = connection.exec_driver_sql("PRAGMA user_version").scalar()
+            row = connection.execute(
+                text("SELECT generation FROM global_settings WHERE id = 1")
+            ).fetchone()
+        except BaseException:
+            try:
+                connection.execute(text("ROLLBACK"))
+            except Exception:  # pragma: no cover - never mask the original
+                pass
+            raise
+        connection.execute(text("COMMIT"))
+    if row is None:
+        raise ValueError(
+            "config store is uninitialized: no GlobalSettings row (id=1) "
+            "-- was it created by import?"
+        )
+    return StoreState(store_id=int(store_id or 0), generation=int(row[0]))
+
+
+@dataclass(frozen=True)
 class WriteResult:
     """What a successful `write_config` reports.
 
@@ -203,11 +267,14 @@ class WriteResult:
     was written (never-prune, duplicate rules, ...): the store logs nothing,
     so showing them is the caller's job. A caller that wants them printed
     BEFORE the write can call `validate_config` itself first; they are the
-    same strings.
+    same strings. `store_id` is the file's store id after the write (stamped
+    by this write if the database was a legacy, never-stamped one): with
+    `generation` it is the reload key of the config just written.
     """
 
     generation: int
     warnings: Tuple[str, ...] = ()
+    store_id: int = 0
 
 
 def _is_locked(exc: OperationalError) -> bool:
@@ -220,6 +287,7 @@ def write_config(
     config: BackupConfig,
     *,
     expected_generation: Optional[int],
+    expected_store_id: Optional[int] = None,
     lock_timeout: float = DEFAULT_WRITER_LOCK_TIMEOUT,
     lock: Optional[Path] = None,
 ) -> WriteResult:
@@ -233,6 +301,17 @@ def write_config(
     Never creates a database: a missing or zero-byte file is refused by the
     preflight (`ConfigDbNotFound` / `ConfigDbNotADatabase`) before the writer
     lock file is even created. Never returns or holds a session.
+
+    `expected_store_id` (default `None` = not compared) is the
+    `ConfigSnapshot.store_id` / `StoreState.store_id` the edit started from.
+    It is compared inside the write transaction, before the generation, when
+    it is non-zero (0 = "read a legacy database"; if that has been stamped
+    since, the generation compare reports it): a
+    database file that was deleted and re-imported since (same generation
+    numbers, different file) is refused with `ConfigConflict` (a
+    `StoreIdConflict`) and nothing is written. A database never stamped
+    (id 0) is stamped by this write. `WriteResult.store_id` is the id after
+    the write.
 
     **Holding the lock across a multi-step operation.** By default this call
     takes `writer_lock(resolved)` itself, so the lock covers only the write.
@@ -266,7 +345,8 @@ def write_config(
 
     Raises `ValueError` (invalid `config`, or an invalid `lock=`; nothing
     written), `ConfigPathError` / `SchemaError` (unusable database),
-    `ConfigConflict` (the generation moved on; nothing written), `ConfigBusy`
+    `ConfigConflict` (the generation moved on, or the store id no longer
+    matches `expected_store_id`; nothing written), `ConfigBusy`
     (writer lock or SQLite lock not obtained in time; nothing written; safe to
     retry as is). A `ValueError` always means nothing was written. It does not
     mean nothing was opened: an invalid `config` is detected AFTER the schema
@@ -286,7 +366,10 @@ def write_config(
     the same call every fork point already makes.
     """
     try:
-        return _write_config(resolved, config, expected_generation, lock_timeout, lock)
+        return _write_config(
+            resolved, config, expected_generation, expected_store_id,
+            lock_timeout, lock,
+        )
     finally:
         dispose_all()
 
@@ -295,6 +378,7 @@ def _write_config(
     resolved: ResolvedConfigPath,
     config: BackupConfig,
     expected_generation: Optional[int],
+    expected_store_id: Optional[int],
     lock_timeout: float,
     held_lock: Optional[Path] = None,
 ) -> WriteResult:
@@ -322,8 +406,14 @@ def _write_config(
                 # and-reinsert all see one frozen state.
                 check_schema(session.connection())
                 generation = save_config(
-                    session, config, expected_generation=expected_generation
+                    session,
+                    config,
+                    expected_generation=expected_generation,
+                    expected_store_id=expected_store_id,
                 )
+                # Same transaction, after the stamp: the id this write
+                # commits.
+                store_id = read_store_id(session)
         except OperationalError as exc:
             if _is_locked(exc):
                 raise ConfigBusy(
@@ -332,4 +422,4 @@ def _write_config(
                     "written. Retry in a moment."
                 ) from exc
             raise
-    return WriteResult(generation=generation, warnings=warnings)
+    return WriteResult(generation=generation, warnings=warnings, store_id=store_id)

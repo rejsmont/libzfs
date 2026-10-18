@@ -151,7 +151,8 @@ calls; the daemon only ever uses `check_schema`, which decides from
 `EXPECTED_HEAD`/`KNOWN_REVISIONS` and reads no migration scripts.
 
 `access.py` (item 15.1) is the whole-configuration entry point for every tool:
-`read_config(resolved) -> ConfigSnapshot(config, generation, schema_rev)` reads
+`read_config(resolved) -> ConfigSnapshot(config, generation, schema_rev,
+store_id)` reads
 the schema check, the rows and the generation in ONE read snapshot (the daemon
 and the CLI's `export` / `migrate --check` / the read half of every edit), and
 `write_config(resolved, config, *, expected_generation) -> WriteResult` is the
@@ -172,14 +173,18 @@ Public API
 Tool-level surface -- what the daemon and `zfsbackup-config` are meant to call:
 
 - whole-configuration access (`access.py`): `read_config`, `write_config`,
-  `read_generation`, `check_config_schema`, `WriteResult`, `ConfigSnapshot`;
+  `read_generation`, `read_store_state` / `StoreState` (the poll's cheap
+  `(store_id, generation)` read), `check_config_schema`, `WriteResult`,
+  `ConfigSnapshot`;
   `import_yaml` (`importer.py`) and `upgrade_schema` / `check_schema`
   (`migrate.py`) for creating and migrating a database;
 - paths and the writer lock (`paths.py`): `resolve_config_path`,
   `ResolvedConfigPath`, `writer_lock` (to hold the lock across a multi-step
   edit, passing it on as `write_config(..., lock=held)`), the `ConfigPath*` /
   `ConfigDb*` errors;
-- errors: `ConfigConflict`, `ConfigBusy`, `SchemaError` and subclasses;
+- errors: `ConfigConflict`, `StoreIdConflict` (a `ConfigConflict` subclass:
+  the database file was replaced; `expected_store_id` / `actual_store_id`,
+  with `expected` / `actual` still the generations), `ConfigBusy`, `SchemaError` and subclasses;
 - messages: `config_error_message`, `describe_config_source`;
 - pure checks on dataclasses: `validate_config`, `destination_name_problem`.
 
@@ -217,6 +222,7 @@ from zfsbackup.config.store.mapper import (
     ConfigSnapshot,
     destination_name_problem,
     load_config,
+    StoreIdConflict,
     load_config_snapshot,
     save_config,
     validate_config,
@@ -279,10 +285,12 @@ from zfsbackup.config.store.importer import (
     import_yaml,
 )
 from zfsbackup.config.store.access import (
+    StoreState,
     WriteResult,
     check_config_schema,
     read_config,
     read_generation,
+    read_store_state,
     write_config,
 )
 
@@ -328,6 +336,8 @@ __all__ = [
     "SchemaSplitBrain",
     "SchemaUpgrade",
     "SchemaVersionMismatch",
+    "StoreIdConflict",
+    "StoreState",
     "WRITER_LOCK_SUFFIX",
     "WriteResult",
     "check_config_db",
@@ -352,6 +362,7 @@ __all__ = [
     "open_config_session",
     "read_config",
     "read_generation",
+    "read_store_state",
     "require_writer_lock_held",
     "resolve_config_path",
     "resolve_config_url",

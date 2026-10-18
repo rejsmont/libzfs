@@ -1947,6 +1947,22 @@ Two lanes run in parallel (disjoint owners); everything inside the daemon lane i
 
 ---
 
+### Gate results
+
+- **G1 (2026-10-18): passed.** The concurrency review found no defect: the stamp is transactional
+  (`BEGIN IMMEDIATE` via the begin hook; rollback leaves 0), `read_store_state` leaves no read mark (control
+  test: busy without it, `(0,0,0)` with it), and the pair is read from one snapshot. Follow-ups:
+  - F1 (MEDIUM): `StoreIdConflict` gets `expected_store_id`/`actual_store_id` and is exported; `expected`/`actual`
+    stay generations. **19.1:** `cli/errors.py` must check `StoreIdConflict` before `ConfigConflict`.
+  - F2 (LOW): an expected id of 0 (a legacy read) falls through to the generation CAS instead of reporting
+    "replaced".
+  - **21:** the operator docs say to re-import rather than restore a file copy (which keeps `user_version`)
+    while a daemon or an editor is running. This is a residual ABA.
+  - **G3 must check:**
+    1. `dispose_all()` runs in a `finally` around every poll, including one that raises.
+    2. Nothing is forked between a poll and its dispose.
+    3. The key recorded after a reload is the `read_config` snapshot's, not the poll's.
+
 ### Item 17.0 — Store id and cheap store state *(store)*
 
 - **Owner:** `zfsbackup-store-developer` · **Tag:** `needs-approval` (config load/write contract) · **Gate:** G1

@@ -1428,3 +1428,876 @@ class TestPublicSurface:
         assert ConfigConflict.__mro__[1] is Exception
         assert ConfigBusy.__mro__[1] is Exception
         assert not issubclass(ConfigConflict, ConfigBusy)
+
+
+# ===========================================================================
+# Item 17.0 -- store id (PRAGMA user_version) and read_store_state
+# ===========================================================================
+#
+# `(store_id, generation)` is the reload key. The store id is a random per-FILE
+# number, stamped by `save_config` as its LAST statement, so a delete + re-import
+# (generation 0 again) is still told apart from the file a stale reader saw.
+#
+# Mutation counts for this section (scratch copy of the tree, one revert at a
+# time, tests failing across the four 17.0 files) are in the hand-off report.
+
+import hashlib  # noqa: E402
+import logging  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from sqlalchemy import event  # noqa: E402
+from sqlalchemy.engine import Engine  # noqa: E402
+
+from zfsbackup.config.store import StoreState, read_store_state  # noqa: E402
+from zfsbackup.config.store import importer as store_importer  # noqa: E402
+from zfsbackup.config.store import mapper as store_mapper  # noqa: E402
+from zfsbackup.config.store import require_writer_lock_held  # noqa: E402
+from zfsbackup.config.store.importer import ImportResult  # noqa: E402
+from zfsbackup.config.store import StoreIdConflict  # noqa: E402
+
+STORE_ID_LIMIT = 2**31 - 1  # user_version is a signed 32-bit int; the stamp stays below
+
+
+def raw_user_version(db: Path) -> int:
+    con = sqlite3.connect(str(db))
+    try:
+        return con.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        con.close()
+
+
+def set_raw_user_version(db: Path, value: int) -> None:
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(f"PRAGMA user_version = {int(value)}")
+        con.commit()
+    finally:
+        con.close()
+
+
+def raw_generation(db: Path) -> int:
+    con = sqlite3.connect(str(db))
+    try:
+        return con.execute("SELECT generation FROM global_settings").fetchone()[0]
+    finally:
+        con.close()
+
+
+def file_state(db: Path):
+    """The bytes of the database and its WAL, without opening either."""
+    wal = db.with_name(db.name + "-wal")
+    return (
+        hashlib.sha256(db.read_bytes()).hexdigest(),
+        hashlib.sha256(wal.read_bytes()).hexdigest() if wal.exists() else None,
+    )
+
+
+def remove_database(db: Path) -> None:
+    dispose_all()
+    for suffix in ("", "-wal", "-shm"):
+        p = db.with_name(db.name + suffix)
+        if p.exists():
+            p.unlink()
+
+
+@pytest.fixture
+def fixed_ids(monkeypatch):
+    """Make the stamp deterministic: successive stamps are 1001, 1002, ...
+    (`secrets.randbelow(n) + 1`, so the fake returns 1000, 1001, ...)."""
+    calls = []
+
+    def randbelow(n):
+        calls.append(n)
+        return 999 + len(calls)
+
+    monkeypatch.setattr(store_mapper, "secrets", SimpleNamespace(randbelow=randbelow))
+    return calls
+
+
+@pytest.mark.integration
+class TestStoreIdStamping:
+    def test_the_first_import_stamps_a_non_zero_store_id_below_the_limit(self, db_path, resolved):
+        result = import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        raw = raw_user_version(db_path)
+        assert 0 < raw < STORE_ID_LIMIT
+        assert result.store_id == raw
+
+    def test_import_write_and_read_agree_on_the_store_id_and_later_saves_keep_it(
+        self, db_path, resolved
+    ):
+        imported = import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        snap0 = read_config(resolved)
+        first = write_config(resolved, cfg("tank/a"), expected_generation=0)
+        second = write_config(resolved, cfg("tank/b"), expected_generation=first.generation)
+        snap2 = read_config(resolved)
+        dispose_all()
+
+        ids = {imported.store_id, snap0.store_id, first.store_id, second.store_id, snap2.store_id}
+        assert len(ids) == 1
+        assert ids == {raw_user_version(db_path)}
+        assert 0 < ids.pop() < STORE_ID_LIMIT
+
+    def test_a_write_config_store_id_is_the_id_in_the_file_not_a_fresh_one(
+        self, db_path, resolved, fixed_ids
+    ):
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        assert raw_user_version(db_path) == 1000 + 1
+        for generation in range(3):
+            result = write_config(resolved, cfg(), expected_generation=generation)
+            assert result.store_id == 1001
+        assert fixed_ids == [2**31 - 2]  # drawn once, by the import
+
+    def test_a_legacy_database_is_stamped_by_its_next_write_config(self, db_path, resolved):
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        set_raw_user_version(db_path, 0)
+        assert read_config(resolved).store_id == 0
+        dispose_all()
+
+        result = write_config(resolved, cfg("tank/new"), expected_generation=0)
+        dispose_all()
+
+        assert 0 < result.store_id < STORE_ID_LIMIT
+        assert raw_user_version(db_path) == result.store_id
+        assert read_config(resolved).store_id == result.store_id
+
+    def test_a_reimport_over_an_existing_database_keeps_its_store_id(self, db_path, resolved):
+        first = import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        second = import_yaml(write_yaml(db_path.parent / "n.yaml", "tank/other"), resolved)
+        dispose_all()
+        assert first.created and not second.created
+        assert second.store_id == first.store_id == raw_user_version(db_path)
+        assert second.generation == 1
+
+    def test_a_reimport_over_a_legacy_database_stamps_it(self, db_path, resolved):
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        set_raw_user_version(db_path, 0)
+        result = import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        assert result.store_id != 0
+        assert raw_user_version(db_path) == result.store_id
+
+    def test_a_non_zero_store_id_is_never_re_stamped(self, db_path, resolved):
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        set_raw_user_version(db_path, 7)
+        result = write_config(resolved, cfg(), expected_generation=0)
+        dispose_all()
+        assert result.store_id == 7 == raw_user_version(db_path)
+
+
+@pytest.mark.integration
+class TestStoreIdRollback:
+    """The stamp is the same transaction as the data: a failure after it leaves
+    the legacy 0 and the previous generation."""
+
+    def test_a_write_config_that_fails_after_the_stamp_leaves_zero_and_the_old_data(
+        self, db_path, resolved, monkeypatch
+    ):
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        before_names = stored_names(resolved)
+        set_raw_user_version(db_path, 0)
+
+        def boom(session):
+            raise RuntimeError("injected after the stamp")
+
+        monkeypatch.setattr(store_access, "read_store_id", boom)
+        with pytest.raises(RuntimeError, match="injected"):
+            write_config(resolved, cfg("tank/new"), expected_generation=0)
+        dispose_all()
+
+        assert raw_user_version(db_path) == 0
+        assert raw_generation(db_path) == 0
+        assert stored_names(resolved) == before_names
+
+        # ... and the next, healthy write stamps.
+        monkeypatch.undo()
+        result = write_config(resolved, cfg("tank/new"), expected_generation=0)
+        assert result.store_id != 0
+
+    def test_an_import_that_fails_after_the_stamp_leaves_zero_and_the_old_data(
+        self, db_path, resolved, monkeypatch
+    ):
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        before_names = stored_names(resolved)
+        set_raw_user_version(db_path, 0)
+
+        def boom(session):
+            raise RuntimeError("injected after the stamp")
+
+        monkeypatch.setattr(store_importer, "read_store_id", boom)
+        with pytest.raises(RuntimeError, match="injected"):
+            import_yaml(write_yaml(db_path.parent / "n.yaml", "tank/other"), resolved)
+        dispose_all()
+
+        assert raw_user_version(db_path) == 0
+        assert raw_generation(db_path) == 0
+        assert stored_names(resolved) == before_names
+
+    def test_a_failed_first_import_does_not_leave_a_stamped_file(
+        self, db_path, resolved, monkeypatch
+    ):
+        def boom(session):
+            raise RuntimeError("injected after the stamp")
+
+        monkeypatch.setattr(store_importer, "read_store_id", boom)
+        with pytest.raises(RuntimeError, match="injected"):
+            import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        assert not db_path.exists() or raw_user_version(db_path) == 0
+
+
+@pytest.mark.integration
+class TestStoreIdCompare:
+    @pytest.fixture
+    def replaced(self, db_path, resolved, fixed_ids):
+        """An old snapshot (id 1001, generation 0) of a file that was then
+        deleted and re-imported (id 1002, generation 0 again)."""
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        old = read_config(resolved)
+        dispose_all()
+        remove_database(db_path)
+        new = import_yaml(write_yaml(db_path.parent / "n.yaml", "tank/replacement"), resolved)
+        dispose_all()
+        return SimpleNamespace(old=old, new=new)
+
+    def test_delete_and_reimport_gives_a_new_store_id_and_generation_zero(self, replaced):
+        assert replaced.old.generation == 0 and replaced.new.generation == 0
+        assert replaced.old.store_id == 1001
+        assert replaced.new.store_id == 1002
+
+    def test_a_stale_store_id_with_a_matching_generation_is_a_store_id_conflict(
+        self, db_path, resolved, replaced
+    ):
+        before = file_state(db_path)
+        with pytest.raises(ConfigConflict) as excinfo:
+            write_config(
+                resolved, cfg("tank/mine"),
+                expected_generation=replaced.old.generation,
+                expected_store_id=replaced.old.store_id,
+            )
+        assert isinstance(excinfo.value, StoreIdConflict)
+        assert (excinfo.value.expected_store_id, excinfo.value.actual_store_id) == (1001, 1002)
+        # The inherited attributes keep their ConfigConflict meaning: generations.
+        assert (excinfo.value.expected, excinfo.value.actual) == (0, 0)
+        assert "replaced" in str(excinfo.value) and "nothing was written" in str(excinfo.value)
+        assert file_state(db_path) == before
+        assert stored_names(resolved) == ["tank/replacement"]
+
+    def test_expected_store_id_none_skips_the_compare(self, resolved, replaced):
+        result = write_config(
+            resolved, cfg("tank/mine"), expected_generation=0, expected_store_id=None
+        )
+        assert result.generation == 1 and result.store_id == 1002
+        assert stored_names(resolved) == ["tank/mine"]
+
+    def test_expected_store_id_defaults_to_not_compared(self, resolved, replaced):
+        assert write_config(resolved, cfg(), expected_generation=0).store_id == 1002
+
+    def test_the_current_store_id_passes(self, resolved, replaced):
+        result = write_config(
+            resolved, cfg("tank/mine"), expected_generation=0,
+            expected_store_id=replaced.new.store_id,
+        )
+        assert result.generation == 1
+
+    def test_the_store_id_check_wins_when_both_it_and_the_generation_are_wrong(
+        self, db_path, resolved, replaced
+    ):
+        before = file_state(db_path)
+        with pytest.raises(ConfigConflict) as excinfo:
+            write_config(
+                resolved, cfg("tank/mine"), expected_generation=99, expected_store_id=1001
+            )
+        assert type(excinfo.value) is StoreIdConflict
+        assert (excinfo.value.expected_store_id, excinfo.value.actual_store_id) == (1001, 1002)
+        assert (excinfo.value.expected, excinfo.value.actual) == (99, 0)
+        assert file_state(db_path) == before
+
+    def test_store_id_conflict_expected_and_actual_are_generations(
+        self, db_path, resolved, fixed_ids
+    ):
+        """The old file got to generation 2; the replacement is at 1. A
+        generic `ConfigConflict` consumer that prints `expected`/`actual` as
+        generations must be told the truth, not two store ids."""
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        write_config(resolved, cfg("tank/a"), expected_generation=0)
+        write_config(resolved, cfg("tank/b"), expected_generation=1)
+        old = read_config(resolved)
+        dispose_all()
+        assert (old.store_id, old.generation) == (1001, 2)
+        remove_database(db_path)
+        import_yaml(EXAMPLE_YAML, resolved)
+        write_config(resolved, cfg("tank/c"), expected_generation=0)
+
+        with pytest.raises(StoreIdConflict) as excinfo:
+            write_config(
+                resolved, cfg("tank/mine"), expected_generation=old.generation,
+                expected_store_id=old.store_id,
+            )
+        exc = excinfo.value
+        assert (exc.expected, exc.actual) == (2, 1)
+        assert (exc.expected_store_id, exc.actual_store_id) == (1001, 1002)
+
+    def test_store_id_conflict_expected_is_none_when_no_generation_was_expected(
+        self, resolved, replaced
+    ):
+        with pytest.raises(StoreIdConflict) as excinfo:
+            write_config(
+                resolved, cfg("tank/mine"), expected_generation=None,
+                expected_store_id=replaced.old.store_id,
+            )
+        assert excinfo.value.expected is None
+        assert excinfo.value.actual == 0
+
+    def test_a_wrong_generation_alone_is_still_a_plain_conflict(self, resolved, replaced):
+        with pytest.raises(ConfigConflict) as excinfo:
+            write_config(
+                resolved, cfg("tank/mine"), expected_generation=99,
+                expected_store_id=replaced.new.store_id,
+            )
+        assert type(excinfo.value) is ConfigConflict
+        assert (excinfo.value.expected, excinfo.value.actual) == (99, 0)
+
+    def test_f2_a_legacy_snapshot_stamped_since_is_a_plain_generation_conflict(
+        self, db_path, resolved
+    ):
+        """The editor read a legacy, unstamped file (0, g); another writer
+        stamped it (X, g+1). That is a moved generation, not a replaced file:
+        a plain `ConfigConflict` carrying the generations, never a
+        `StoreIdConflict`."""
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        set_raw_user_version(db_path, 0)
+        legacy = read_config(resolved)
+        dispose_all()
+        assert (legacy.store_id, legacy.generation) == (0, 0)
+        theirs = write_config(resolved, cfg("tank/theirs"), expected_generation=0)
+        assert theirs.store_id != 0
+        before = file_state(db_path)
+        dispose_all()
+
+        with pytest.raises(ConfigConflict) as excinfo:
+            write_config(
+                resolved, cfg("tank/mine"), expected_generation=legacy.generation,
+                expected_store_id=legacy.store_id,
+            )
+        assert type(excinfo.value) is ConfigConflict
+        assert not isinstance(excinfo.value, StoreIdConflict)
+        assert (excinfo.value.expected, excinfo.value.actual) == (0, 1)
+        assert file_state(db_path) == before
+        assert stored_names(resolved) == ["tank/theirs"]
+
+    def test_f2_a_zero_expected_id_with_no_expected_generation_writes_unconditionally(
+        self, db_path, resolved
+    ):
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        stamped = raw_user_version(db_path)
+        result = write_config(
+            resolved, cfg("tank/mine"), expected_generation=None, expected_store_id=0
+        )
+        assert result.store_id == stamped != 0
+
+    def test_a_stale_non_zero_id_with_no_global_settings_row_reports_actual_none(
+        self, seeded, db_path
+    ):
+        con = sqlite3.connect(str(db_path))
+        con.execute("DELETE FROM global_settings")
+        con.commit()
+        con.close()
+        stored = raw_user_version(db_path)
+        with pytest.raises(StoreIdConflict) as excinfo:
+            write_config(
+                seeded, cfg(), expected_generation=0, expected_store_id=stored + 1
+            )
+        assert excinfo.value.actual is None
+        assert excinfo.value.expected == 0
+        assert (excinfo.value.expected_store_id, excinfo.value.actual_store_id) == (
+            stored + 1, stored,
+        )
+
+    def test_a_non_zero_expected_id_against_a_legacy_file_is_a_store_id_conflict(
+        self, db_path, resolved
+    ):
+        """Only a NON-ZERO expected id that differs means "another file"."""
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        set_raw_user_version(db_path, 0)
+        with pytest.raises(StoreIdConflict) as excinfo:
+            write_config(
+                resolved, cfg(), expected_generation=0, expected_store_id=1234
+            )
+        assert (excinfo.value.expected_store_id, excinfo.value.actual_store_id) == (1234, 0)
+
+    def test_a_legacy_snapshot_against_a_still_legacy_file_writes_and_stamps(
+        self, db_path, resolved
+    ):
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        set_raw_user_version(db_path, 0)
+        result = write_config(resolved, cfg(), expected_generation=0, expected_store_id=0)
+        assert result.store_id != 0
+
+
+@pytest.mark.integration
+class TestStoreIdWithAHeldWriterLock:
+    def test_a_write_under_a_held_lock_compares_and_reports_the_store_id(self, seeded):
+        snap = read_config(seeded)
+        with writer_lock(seeded) as held:
+            result = write_config(
+                seeded, cfg("tank/held"), expected_generation=snap.generation,
+                expected_store_id=snap.store_id, lock=held,
+            )
+        assert result.store_id == snap.store_id != 0
+        assert stored_names(seeded) == ["tank/held"]
+
+    def test_a_store_id_mismatch_leaves_the_callers_lock_held(self, seeded):
+        snap = read_config(seeded)
+        with writer_lock(seeded) as held:
+            with pytest.raises(StoreIdConflict):
+                write_config(
+                    seeded, cfg("tank/held"), expected_generation=snap.generation,
+                    expected_store_id=snap.store_id + 1, lock=held,
+                )
+            require_writer_lock_held(seeded, held)  # still the caller's
+            box = {}
+
+            def other():
+                try:
+                    with writer_lock(seeded, timeout=0.2):
+                        box["got"] = True
+                except BaseException as exc:  # noqa: BLE001
+                    box["exc"] = exc
+
+            thread = threading.Thread(target=other)
+            thread.start()
+            thread.join(10)
+            assert isinstance(box.get("exc"), ConfigBusy), box
+            # ... and the caller may still use it for the corrected write.
+            write_config(
+                seeded, cfg("tank/ok"), expected_generation=snap.generation,
+                expected_store_id=snap.store_id, lock=held,
+            )
+        assert stored_names(seeded) == ["tank/ok"]
+
+
+# ---------------------------------------------------------------------------
+# read_store_state
+# ---------------------------------------------------------------------------
+
+
+def _wal_checkpoint_passive(db: Path):
+    """(busy, wal frames, frames checkpointed) as a third connection sees them."""
+    con = sqlite3.connect(str(db), timeout=5, isolation_level=None)
+    try:
+        return con.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+    finally:
+        con.close()
+
+
+def _commit_a_generation(writer: sqlite3.Connection) -> None:
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("UPDATE global_settings SET generation = generation + 1")
+    writer.execute("COMMIT")
+
+
+@pytest.fixture
+def pending_writer(seeded, db_path):
+    """An open writer connection with auto-checkpointing off, so its commits
+    stay in the WAL ("a pending writer commit") until somebody checkpoints."""
+    writer = sqlite3.connect(str(db_path), timeout=5, isolation_level=None)
+    writer.execute("PRAGMA wal_autocheckpoint = 0")
+    yield writer
+    writer.close()
+
+
+@pytest.mark.integration
+class TestReadStoreState:
+    def test_it_returns_the_store_id_and_generation_pair(self, seeded, db_path):
+        state = read_store_state(seeded)
+        assert isinstance(state, StoreState)
+        assert state == StoreState(store_id=raw_user_version(db_path), generation=0)
+        assert type(state.store_id) is int and type(state.generation) is int
+        assert 0 < state.store_id < STORE_ID_LIMIT
+
+    def test_it_tracks_writes_and_replacements(self, db_path, resolved):
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        first = read_store_state(resolved)
+        write_config(resolved, cfg(), expected_generation=0)
+        second = read_store_state(resolved)
+        assert second == StoreState(first.store_id, 1)
+        remove_database(db_path)
+        import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        third = read_store_state(resolved)
+        assert third.generation == 0
+        assert third != first
+
+    def test_it_agrees_with_read_config(self, seeded):
+        snap = read_config(seeded)
+        assert read_store_state(seeded) == StoreState(snap.store_id, snap.generation)
+
+    def test_a_legacy_database_reports_store_id_zero(self, seeded, db_path):
+        set_raw_user_version(db_path, 0)
+        assert read_store_state(seeded) == StoreState(0, 0)
+
+    def test_it_is_a_frozen_value(self):
+        state = StoreState(1, 2)
+        with pytest.raises(Exception):
+            state.generation = 3  # type: ignore[misc]
+        assert state == StoreState(store_id=1, generation=2)
+
+    def test_a_missing_file_is_config_db_not_found(self, resolved, db_path):
+        with pytest.raises(ConfigDbNotFound):
+            read_store_state(resolved)
+        assert not db_path.exists()
+
+    def test_a_zero_byte_file_is_config_db_not_a_database(self, resolved, db_path):
+        db_path.write_bytes(b"")
+        with pytest.raises(ConfigDbNotADatabase):
+            read_store_state(resolved)
+        assert db_path.stat().st_size == 0
+
+    def test_a_database_without_a_global_settings_table_is_an_operational_error(
+        self, resolved, db_path
+    ):
+        con = sqlite3.connect(str(db_path))
+        con.execute("CREATE TABLE unrelated (x)")
+        con.commit()
+        con.close()
+        with pytest.raises(OperationalError, match="global_settings"):
+            read_store_state(resolved)
+
+    def test_a_table_with_no_row_is_a_value_error(self, seeded, db_path):
+        con = sqlite3.connect(str(db_path))
+        con.execute("DELETE FROM global_settings")
+        con.commit()
+        con.close()
+        with pytest.raises(ValueError, match="uninitialized"):
+            read_store_state(seeded)
+
+    def test_it_does_no_schema_check_on_a_newer_revision(self, seeded, db_path):
+        con = sqlite3.connect(str(db_path))
+        con.execute("UPDATE alembic_version SET version_num = 'ffffffffffff'")
+        con.commit()
+        con.close()
+        with pytest.raises(SchemaError):  # control: the full read does check
+            read_config(seeded)
+        dispose_all()
+        assert read_store_state(seeded).generation == 0
+
+    def test_it_does_no_schema_check_on_an_out_of_date_database(
+        self, seeded, monkeypatch
+    ):
+        """A known revision that is behind a (pretended) newer head."""
+        from zfsbackup.config.store import migrate as migrate_module
+
+        monkeypatch.setattr(migrate_module, "EXPECTED_HEAD", "bbbbbbbbbbbb")
+        monkeypatch.setattr(
+            migrate_module, "KNOWN_REVISIONS", frozenset((EXPECTED_HEAD, "bbbbbbbbbbbb"))
+        )
+        with pytest.raises(SchemaOutOfDate):  # control: the full read does check
+            read_config(seeded)
+        dispose_all()
+        assert read_store_state(seeded).generation == 0
+
+    def test_it_calls_neither_the_schema_check_nor_the_config_load(self, seeded, monkeypatch):
+        def forbidden(*a, **k):
+            raise AssertionError("read_store_state must read two facts and nothing else")
+
+        monkeypatch.setattr(store_access, "check_schema", forbidden)
+        monkeypatch.setattr(store_access, "load_config_snapshot", forbidden)
+        assert read_store_state(seeded).generation == 0
+
+    def test_it_leaves_its_engine_cached_until_dispose_all(self, seeded):
+        dispose_all()
+        assert _cached_engines() == {}
+        read_store_state(seeded)
+        assert len(_cached_engines()) >= 1
+        dispose_all()
+        assert _cached_engines() == {}
+
+    def test_it_opens_a_read_only_connection_and_changes_no_byte(self, seeded, db_path, monkeypatch):
+        seen = []
+        real = store_access.open_config_connection
+
+        def spy(resolved, **kwargs):
+            seen.append(kwargs)
+            return real(resolved, **kwargs)
+
+        monkeypatch.setattr(store_access, "open_config_connection", spy)
+        before = file_state(db_path)
+        read_store_state(seeded)
+        assert [kw.get("readonly") for kw in seen] == [True]
+        dispose_all()
+        assert file_state(db_path) == before
+
+    def test_the_connection_it_opens_refuses_writes(self, seeded):
+        """The reader engine is `query_only`: even the pragma cannot be set."""
+        from zfsbackup.config.store import open_config_connection
+        from sqlalchemy import text
+
+        with open_config_connection(seeded, readonly=True) as connection:
+            with pytest.raises(OperationalError):
+                connection.execute(text("UPDATE global_settings SET generation = 9"))
+
+    def test_the_pair_comes_from_one_snapshot_even_if_a_writer_commits_between_the_reads(
+        self, seeded, db_path
+    ):
+        """Deterministic: right after the pragma runs, a second connection
+        commits a new (id, generation). The SELECT must still see the old
+        pair -- which it does only if `BEGIN` came first and the pragma opened
+        the read snapshot."""
+        set_raw_user_version(db_path, 1000)
+        fired = []
+
+        def writer_commits(conn, cursor, statement, parameters, context, executemany):
+            if statement.strip().upper() == "PRAGMA USER_VERSION" and not fired:
+                fired.append(True)
+                con = sqlite3.connect(str(db_path), timeout=5, isolation_level=None)
+                try:
+                    con.execute("BEGIN IMMEDIATE")
+                    con.execute("PRAGMA user_version = 1001")
+                    con.execute("UPDATE global_settings SET generation = 1")
+                    con.execute("COMMIT")
+                finally:
+                    con.close()
+
+        event.listen(Engine, "after_cursor_execute", writer_commits)
+        try:
+            state = read_store_state(seeded)
+        finally:
+            event.remove(Engine, "after_cursor_execute", writer_commits)
+        assert fired
+        assert state == StoreState(1000, 0)
+        dispose_all()
+        assert read_store_state(seeded) == StoreState(1001, 1)
+
+    def test_a_writer_loop_against_a_reader_loop_never_yields_a_torn_pair(
+        self, seeded, db_path
+    ):
+        set_raw_user_version(db_path, 1000)
+        rounds = 400
+        stop = threading.Event()
+        errors = []
+
+        def writer():
+            con = sqlite3.connect(str(db_path), timeout=10, isolation_level=None)
+            try:
+                for i in range(1, rounds + 1):
+                    con.execute("BEGIN IMMEDIATE")
+                    con.execute(f"PRAGMA user_version = {1000 + i}")
+                    con.execute(f"UPDATE global_settings SET generation = {i}")
+                    con.execute("COMMIT")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                con.close()
+                stop.set()
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        torn, reads, last = [], 0, 0
+        try:
+            while not stop.is_set() or reads < 20:
+                state = read_store_state(seeded)
+                reads += 1
+                if state.store_id - 1000 != state.generation:
+                    torn.append(state)
+                assert state.generation >= last
+                last = state.generation
+        finally:
+            thread.join(30)
+        assert not errors, errors
+        assert not thread.is_alive()
+        assert torn == []
+        assert reads >= 20
+
+    def test_it_leaves_no_wal_read_mark(self, seeded, db_path, pending_writer):
+        """After `read_store_state` returns, a pending writer commit can be
+        checkpointed in full by a third connection: nothing of ours pins an
+        older snapshot (that would let the WAL grow without bound under a
+        polling supervisor)."""
+        read_store_state(seeded)                 # leaves its pooled connection open
+        assert _cached_engines()
+        _commit_a_generation(pending_writer)
+        _commit_a_generation(pending_writer)
+
+        busy, log, checkpointed = _wal_checkpoint_passive(db_path)
+        assert log > 0
+        assert checkpointed == log, (busy, log, checkpointed)
+
+    def test_it_leaves_no_wal_read_mark_after_repeated_polls_between_commits(
+        self, seeded, db_path, pending_writer
+    ):
+        for _ in range(3):
+            read_store_state(seeded)
+            _commit_a_generation(pending_writer)
+        busy, log, checkpointed = _wal_checkpoint_passive(db_path)
+        assert log > 0 and checkpointed == log, (busy, log, checkpointed)
+
+    def test_control_a_held_read_transaction_does_block_the_checkpoint(
+        self, seeded, db_path, pending_writer
+    ):
+        """Proves the check above can fail: with a reader that opened its
+        snapshot BEFORE the commit and has not finished, PASSIVE cannot
+        checkpoint everything."""
+        reader = sqlite3.connect(str(db_path), timeout=5, isolation_level=None)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT generation FROM global_settings").fetchall()
+            _commit_a_generation(pending_writer)
+            busy, log, checkpointed = _wal_checkpoint_passive(db_path)
+            assert log > 0
+            assert checkpointed < log, (busy, log, checkpointed)
+            reader.execute("COMMIT")
+            _, log2, checkpointed2 = _wal_checkpoint_passive(db_path)
+            assert checkpointed2 == log2
+        finally:
+            reader.close()
+
+    def test_a_failing_read_store_state_leaves_no_read_mark_either(
+        self, resolved, db_path, pending_writer
+    ):
+        """The documented errors (here: no row) are raised after the
+        transaction is closed."""
+        pending_writer.execute("BEGIN IMMEDIATE")
+        pending_writer.execute("DELETE FROM global_settings")
+        pending_writer.execute("COMMIT")
+        with pytest.raises(ValueError):
+            read_store_state(resolved)
+        pending_writer.execute("BEGIN IMMEDIATE")
+        pending_writer.execute("CREATE TABLE junk (x)")
+        pending_writer.execute("COMMIT")
+        busy, log, checkpointed = _wal_checkpoint_passive(db_path)
+        assert checkpointed == log, (busy, log, checkpointed)
+
+
+# ---------------------------------------------------------------------------
+# warn_never_prune, old constructors, public surface, error wording
+# ---------------------------------------------------------------------------
+
+
+def never_prune_cfg() -> BackupConfig:
+    return BackupConfig(
+        datasets=[DatasetConfig(name="tank/forever", frequency=Duration("1h"), retention_rules=[])]
+    )
+
+
+def never_prune_lines(caplog):
+    return [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "never be pruned" in r.getMessage()
+    ]
+
+
+@pytest.mark.integration
+class TestReadConfigWarnNeverPrune:
+    @pytest.fixture
+    def forever(self, seeded):
+        write_config(seeded, never_prune_cfg(), expected_generation=0)
+        return seeded
+
+    def test_the_default_still_logs_the_never_prune_line(self, forever, caplog):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.mapper"):
+            snap = read_config(forever)
+        assert snap.config.datasets[0].retention_rules == []
+        lines = never_prune_lines(caplog)
+        assert len(lines) == 1 and "tank/forever" in lines[0].getMessage()
+
+    def test_warn_never_prune_false_logs_no_never_prune_line(self, forever, caplog):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.mapper"):
+            snap = read_config(forever, warn_never_prune=False)
+        assert snap.config.datasets[0].retention_rules == []   # the data is the same
+        assert never_prune_lines(caplog) == []
+
+    def test_warn_never_prune_is_keyword_only(self, forever):
+        with pytest.raises(TypeError):
+            read_config(forever, False)  # type: ignore[misc]
+
+    def test_the_flag_changes_nothing_but_the_log(self, forever):
+        assert read_config(forever, warn_never_prune=False) == read_config(forever)
+
+
+@pytest.mark.unit
+class TestStoreIdOldConstructors:
+    def test_a_three_argument_config_snapshot_still_constructs(self):
+        snap = ConfigSnapshot(cfg(), 3, EXPECTED_HEAD)
+        assert (snap.generation, snap.schema_rev, snap.store_id) == (3, EXPECTED_HEAD, 0)
+
+    def test_a_one_argument_write_result_still_constructs(self):
+        result = WriteResult(1)
+        assert (result.generation, result.warnings, result.store_id) == (1, (), 0)
+
+    def test_an_import_result_without_a_store_id_still_constructs(self):
+        result = ImportResult(True, EXPECTED_HEAD, 0, 0)
+        assert result.store_id == 0 and result.generation is None
+
+    def test_store_id_is_carried_when_given(self):
+        assert ConfigSnapshot(cfg(), 0, "r", 5).store_id == 5
+        assert WriteResult(1, (), 5).store_id == 5
+        assert ImportResult(True, "r", 0, 0, store_id=5).store_id == 5
+
+
+@pytest.mark.unit
+class TestStoreIdPublicSurface:
+    @pytest.mark.parametrize("name", ["StoreState", "read_store_state"])
+    def test_the_new_names_are_exported(self, name):
+        import zfsbackup.config.store as store
+
+        assert name in store.__all__ and hasattr(store, name)
+        assert name in store_access.__all__
+
+    def test_the_package_docstring_lists_the_new_names(self):
+        import zfsbackup.config.store as store
+
+        assert "read_store_state" in store.__doc__ and "StoreState" in store.__doc__
+
+    def test_the_package_names_are_the_access_objects(self):
+        import zfsbackup.config.store as store
+
+        assert store.StoreState is store_access.StoreState
+        assert store.read_store_state is store_access.read_store_state
+
+    def test_store_id_conflict_is_exported_from_the_package(self):
+        import zfsbackup.config.store as store
+
+        assert "StoreIdConflict" in store.__all__
+        assert store.StoreIdConflict is StoreIdConflict is store_mapper.StoreIdConflict
+
+    def test_store_id_conflict_is_a_config_conflict_and_nothing_else_the_cli_special_cases(self):
+        exc = StoreIdConflict(3, 4)
+        assert isinstance(exc, ConfigConflict)
+        assert not isinstance(exc, (ConfigPathError, SchemaError, ConfigBusy))
+        assert (exc.expected_store_id, exc.actual_store_id) == (3, 4)
+        assert "replaced" in str(exc) and "nothing was written" in str(exc)
+        assert "generation" not in str(exc)
+
+    def test_store_id_conflict_expected_and_actual_are_the_generations_given(self):
+        exc = StoreIdConflict(3, 4, 7, 9)
+        assert (exc.expected, exc.actual) == (7, 9)
+        assert (exc.expected_store_id, exc.actual_store_id) == (3, 4)
+        none = StoreIdConflict(3, 4)
+        assert (none.expected, none.actual) == (None, None)
+
+
+@pytest.mark.unit
+class TestStoreIdConflictWording:
+    def test_config_error_message_passes_it_through_verbatim(self, tmp_path):
+        named = resolve_config_path(str(tmp_path / "named.db"))
+        exc = StoreIdConflict(3, 4)
+        assert config_error_message(named, exc) == str(exc)
+        assert config_error_message(None, exc) == str(exc)

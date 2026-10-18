@@ -2144,3 +2144,125 @@ class TestSchemaVersionMismatchWording:
             with pytest.raises(SchemaVersionMismatch, match="revision 'aaaa'"):
                 check_schema(c)
         dispose_all()
+
+
+# ===========================================================================
+# Item 17.0 -- the store id (PRAGMA user_version) across upgrade, and foreign DBs
+# ===========================================================================
+
+
+def raw_user_version(db: Path) -> int:
+    return sql(db, "PRAGMA user_version")[0][0]
+
+
+def set_raw_user_version(db: Path, value: int) -> None:
+    conn = sqlite3.connect(str(db))
+    conn.execute(f"PRAGMA user_version = {int(value)}")
+    conn.commit()
+    conn.close()
+
+
+class TestUpgradeSchemaKeepsTheStoreId:
+    def test_the_import_stamped_id_survives_a_table_rebuilding_migration(
+        self, imported, db_path, resolved, synthetic_revision
+    ):
+        """`BODY_GOOD` is an Alembic `batch_alter_table`: it rebuilds the
+        `datasets` table. `user_version` is a header field, not a table, so it
+        must come through untouched."""
+        before = raw_user_version(db_path)
+        assert before != 0
+        synthetic_revision(BODY_GOOD)
+
+        result = upgrade_schema(resolved)
+        dispose_all()
+
+        assert result.changed is True
+        assert raw_user_version(db_path) == before
+
+    def test_a_distinctive_id_survives_so_a_re_stamp_would_be_seen(
+        self, imported, db_path, resolved, synthetic_revision
+    ):
+        set_raw_user_version(db_path, 123456789)
+        synthetic_revision(BODY_GOOD)
+        upgrade_schema(resolved)
+        dispose_all()
+        assert raw_user_version(db_path) == 123456789
+
+    def test_a_legacy_zero_is_not_stamped_by_an_upgrade(
+        self, imported, db_path, resolved, synthetic_revision
+    ):
+        """Only `save_config` stamps; an upgrade neither stamps nor clears."""
+        set_raw_user_version(db_path, 0)
+        synthetic_revision(BODY_GOOD)
+        upgrade_schema(resolved)
+        dispose_all()
+        assert raw_user_version(db_path) == 0
+
+    def test_an_upgrade_that_changes_nothing_keeps_the_id(self, imported, db_path, resolved):
+        before = raw_user_version(db_path)
+        assert upgrade_schema(resolved).changed is False
+        dispose_all()
+        assert raw_user_version(db_path) == before
+
+    def test_the_upgraded_database_reports_the_same_store_state(
+        self, imported, db_path, resolved, synthetic_revision
+    ):
+        from zfsbackup.config.store import read_store_state
+
+        before = read_store_state(resolved)
+        dispose_all()
+        synthetic_revision(BODY_GOOD)
+        upgrade_schema(resolved)
+        dispose_all()
+        assert read_store_state(resolved) == before
+
+
+FOREIGN_BUILDERS = {
+    "foreign_tables": (lambda db: make_foreign(db), NotAConfigDatabase),
+    "foreign_alembic": (lambda db: make_alembic_foreign(db, "foreign_rev"), SchemaVersionMismatch),
+    "ours_without_stamp": (create_our_tables, SchemaSplitBrain),
+    "empty_valid_file": (valid_empty_sqlite_file, None),
+}
+
+
+class TestForeignDatabaseIgnoresUserVersion:
+    """Foreign-database detection never consults `user_version`: an unrelated
+    SQLite file that happens to carry a non-zero value is refused exactly as it
+    is with 0 -- not trusted because the field looks stamped."""
+
+    @pytest.mark.parametrize("kind", sorted(FOREIGN_BUILDERS))
+    def test_check_schema_raises_the_same_error_with_a_non_zero_user_version(
+        self, kind, db_path, resolved
+    ):
+        build, expected = FOREIGN_BUILDERS[kind]
+        build(db_path)
+
+        def outcome():
+            with open_config_connection(resolved, readonly=True) as conn:
+                try:
+                    return ("ok", check_schema(conn))
+                except SchemaError as exc:
+                    return (type(exc), str(exc))
+
+        zero = outcome()
+        set_raw_user_version(db_path, 424242)
+        stamped = outcome()
+        dispose_all()
+
+        assert zero == stamped
+        assert zero[0] != "ok"
+        if expected is not None:
+            assert zero[0] is expected
+
+    def test_a_foreign_file_with_a_non_zero_user_version_is_refused_by_import_and_migrate(
+        self, db_path, resolved
+    ):
+        make_foreign(db_path)
+        set_raw_user_version(db_path, 424242)
+        before = fingerprint(db_path)
+        for call in (upgrade_schema, lambda r: import_yaml(EXAMPLE_YAML, r)):
+            with pytest.raises(NotAConfigDatabase):
+                call(resolved)
+        dispose_all()
+        assert fingerprint(db_path) == before
+        assert raw_user_version(db_path) == 424242

@@ -67,6 +67,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import secrets
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -475,6 +476,74 @@ def load_config(session: Session, *, warn_never_prune: bool = True) -> BackupCon
     )
 
 
+# --- Store id (plan item 17.0, decision D8) ---------------------------------
+#
+# `GlobalSettings.generation` alone is not an identity: a fresh import is
+# generation 0, so deleting the database and importing again repeats keys a
+# running daemon or a stale editor already holds (the ABA hole). The store id
+# is a random per-FILE number kept in SQLite's `PRAGMA user_version` header
+# field, so `(store_id, generation)` is unique across file replacements.
+#
+# Why `user_version` and not a table column: it survives `upgrade_schema` and
+# every Alembic batch migration untouched (they rebuild tables, never the
+# header), it is readable in the same cheap snapshot as `generation`, and it
+# needs no migration. 0 means "never stamped" (a legacy database, or one a
+# rolled-back first save left alone). Foreign-database detection never
+# consults it -- an unrelated SQLite file with a non-zero value must still be
+# refused by the schema checks alone, not trusted or distrusted by this.
+
+_STORE_ID_BOUND = 2**31 - 2  # user_version is a signed 32-bit int; keep > 0
+
+
+def read_store_id(session: Session) -> int:
+    """The database's `PRAGMA user_version` (the store id; 0 = never stamped),
+    read on `session`'s connection and therefore inside whatever transaction
+    that session is in.
+    """
+    value = session.connection().exec_driver_sql("PRAGMA user_version").scalar()
+    return int(value or 0)
+
+
+class StoreIdConflict(ConfigConflict):
+    """A `ConfigConflict` for a replaced database file rather than a moved
+    generation: the store id the caller read at is not the one stored now.
+    Nothing was written. Re-reading finds the new file, so the right handling
+    is the same as for any `ConfigConflict` (exit code 75, retry).
+
+    Attributes:
+
+    - `expected_store_id` / `actual_store_id`: the two store ids.
+    - `expected` / `actual`: the INHERITED attributes keep their
+      `ConfigConflict` meaning, a generation -- `expected` is the caller's
+      `expected_generation` (`None` if it passed none) and `actual` the stored
+      generation (`None` if the store holds no `GlobalSettings` row) -- so a
+      generic `ConfigConflict` consumer that formats them as generations
+      stays truthful instead of printing store ids as generations. A consumer
+      that wants the real reason checks `isinstance(exc, StoreIdConflict)`
+      first, or uses `str(exc)`.
+    """
+
+    def __init__(
+        self,
+        expected_store_id: int,
+        actual_store_id: int,
+        expected_generation: Optional[int] = None,
+        actual_generation: Optional[int] = None,
+    ) -> None:
+        # Deliberately bypass `ConfigConflict.__init__`, whose message is
+        # about generations.
+        Exception.__init__(
+            self,
+            f"the configuration database was replaced since it was read "
+            f"(store id {expected_store_id}, now {actual_store_id}); "
+            f"nothing was written. Re-run.",
+        )
+        self.expected_store_id = expected_store_id
+        self.actual_store_id = actual_store_id
+        self.expected = expected_generation  # type: ignore[assignment]
+        self.actual = actual_generation
+
+
 @dataclass(frozen=True)
 class ConfigSnapshot:
     """A configuration together with the facts it was read at, all from ONE
@@ -487,15 +556,24 @@ class ConfigSnapshot:
     refused with a `SchemaError` before it exists). `config` is a fully
     detached `BackupConfig` (see `load_config`): safe to hold for the life of
     the process.
+
+    `store_id` is the file's `PRAGMA user_version` (0 = a legacy database no
+    save has stamped yet), read in the same transaction as everything else;
+    `(store_id, generation)` is the reload key. Defaulted so the three-field
+    positional constructor keeps working.
     """
 
     config: BackupConfig
     generation: int
     schema_rev: str
+    store_id: int = 0
 
 
 def load_config_snapshot(
-    session: Session, *, schema_rev: Optional[str] = None
+    session: Session,
+    *,
+    schema_rev: Optional[str] = None,
+    warn_never_prune: bool = True,
 ) -> ConfigSnapshot:
     """`load_config` plus the generation and schema revision, as one read.
 
@@ -514,15 +592,25 @@ def load_config_snapshot(
     `session.connection()`, i.e. inside the same transaction -- so a snapshot
     is never handed out for a schema this package cannot read. Raises
     whatever `check_schema` / `load_config` raise.
+
+    `warn_never_prune` is passed through to `load_config` (a periodic reader,
+    e.g. a reload, has already logged the per-dataset warning once and must
+    not repeat it on every read).
     """
     if schema_rev is None:
         schema_rev = check_schema(session.connection())
-    config = load_config(session)
+    config = load_config(session, warn_never_prune=warn_never_prune)
     # `load_config` raised if this row were absent, and it is already in the
     # session's identity map from that very read.
     gs = session.get(models.GlobalSettings, 1)
     assert gs is not None
-    return ConfigSnapshot(config=config, generation=gs.generation, schema_rev=schema_rev)
+    return ConfigSnapshot(
+        config=config,
+        generation=gs.generation,
+        schema_rev=schema_rev,
+        # Same transaction as the rows above (see read_store_id).
+        store_id=read_store_id(session),
+    )
 
 
 _MAX_PORT = 65535
@@ -923,9 +1011,23 @@ def save_config(
     config: BackupConfig,
     *,
     expected_generation: Optional[int] = None,
+    expected_store_id: Optional[int] = None,
 ) -> int:
     """Replace the entire config store with `config`'s contents and return the
     new `GlobalSettings.generation`.
+
+    **Store id (item 17.0).** Inside the caller's transaction this reads
+    `PRAGMA user_version` before the compare-and-swap. `expected_store_id`,
+    when not `None`, must equal it, else `StoreIdConflict` (a `ConfigConflict`;
+    "the configuration database was replaced since it was read") with nothing
+    written -- checked FIRST, so a replaced file reports the replacement and
+    not a coincidentally-equal generation. After all the rows are written, a
+    stored value of 0 is stamped with a random non-zero id
+    (`secrets.randbelow`); a non-zero value is never re-stamped. Stamping is
+    the last statement, in the same transaction as the data, so a rollback
+    (any failure above, a lost commit) leaves 0 and the next save stamps. The
+    id after this call is `read_store_id(session)`. Only `save_config` stamps:
+    `create_config_db_file` must not open SQLite, and readers never write.
 
     `expected_generation` makes this a compare-and-swap: when given, the
     stored generation is compared with it inside the caller's transaction,
@@ -1030,7 +1132,26 @@ def save_config(
     # no one can commit between the compare here and the `previous + 1` write
     # in step 6. Do not move this read onto a separate connection or a
     # read-only session.
+    stored_store_id = read_store_id(session)
     existing_gs = session.get(models.GlobalSettings, 1)
+    # `expected_store_id == 0` means the caller read a legacy, never-stamped
+    # database. If it has been stamped since, that is NOT a replacement: a
+    # stamp only ever happens inside a save, which bumps the generation, so the
+    # generation CAS below refuses with the true reason ("the config changed")
+    # -- and, with no expected generation, the write is unconditional anyway.
+    # Only a non-zero expected id that differs means "this is another file".
+    if (
+        expected_store_id is not None
+        and expected_store_id != 0
+        and expected_store_id != stored_store_id
+    ):
+        raise StoreIdConflict(
+            expected_store_id,
+            stored_store_id,
+            expected_generation,
+            None if existing_gs is None else existing_gs.generation,
+        )
+
     previous_generation = existing_gs.generation if existing_gs is not None else -1
     if expected_generation is not None and (
         existing_gs is None or existing_gs.generation != expected_generation
@@ -1162,4 +1283,13 @@ def save_config(
         ))
 
     session.flush()
+
+    # --- Stamp the store id (item 17.0). ---
+    # Last, after every row: the DELETEs above have opened the transaction
+    # even on a legacy-mode (in-memory) connection, so the pragma is part of
+    # it and a rollback restores 0. `PRAGMA user_version` takes no bound
+    # parameter; the value is an int WE generated, formatted in.
+    if stored_store_id == 0:
+        new_id = secrets.randbelow(_STORE_ID_BOUND) + 1
+        session.connection().exec_driver_sql(f"PRAGMA user_version = {new_id}")
     return previous_generation + 1

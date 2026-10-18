@@ -4207,6 +4207,61 @@ class TestConflictAndBusyExitCodes:
         assert "internal" not in result.stderr and "Traceback" not in result.stderr
 
 
+class TestStoreIdConflictExitCode:
+    """Item 17.0: a replaced database file (`StoreIdConflict`, a
+    `ConfigConflict`) is "look again and retry" like any other conflict: 75."""
+
+    def test_exit_code_is_75(self):
+        from zfsbackup.config.store import StoreIdConflict
+
+        assert cli_errors.exit_code_for(StoreIdConflict(3, 4)) == 75
+
+    def test_the_store_error_wording_passes_it_through(self):
+        from zfsbackup.config.store import StoreIdConflict
+
+        exc = StoreIdConflict(3, 4)
+        assert config_error_message(None, exc) == str(exc)
+
+    def test_a_store_id_conflict_through_the_cli_is_75_and_not_internal(
+        self, run, db, monkeypatch
+    ):
+        from zfsbackup.config.store import StoreIdConflict
+
+        import_ok(run, db)
+
+        def replaced(resolved):
+            raise StoreIdConflict(1001, 1002)
+
+        monkeypatch.setattr(cli_write, "read_config", replaced)
+        result = run("export", "-c", db)
+        assert result.exit_code == 75, result.stderr
+        assert result.stderr.startswith("error: ")
+        assert "internal" not in result.stderr and "Traceback" not in result.stderr
+        assert "Nothing was written" in result.stderr
+
+    def test_report_prints_error_not_internal_error(self):
+        from zfsbackup.config.store import StoreIdConflict
+
+        buf = io.StringIO()
+        assert cli_errors.report(StoreIdConflict(3, 4), None, stream=buf) == 75
+        assert buf.getvalue().startswith("error: ")
+        assert "internal error" not in buf.getvalue()
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="app bug (17.0): cli.errors.format_error renders every ConfigConflict "
+        "as 'generation N, now generation M'. For a StoreIdConflict (the ABA case: "
+        "same generation, different file) that prints 'generation 0, now generation 0' "
+        "-- or 'generation None' when none was expected. Remove this marker when "
+        "format_error special-cases StoreIdConflict.",
+    )
+    def test_the_message_says_the_database_was_replaced(self):
+        from zfsbackup.config.store import StoreIdConflict
+
+        lines = cli_errors.format_error(StoreIdConflict(1001, 1002, 0, 0), None)
+        assert "replaced" in lines[0]
+
+
 class TestReadSnapshot:
     def test_returns_the_config_and_generation_and_releases_the_database(
         self, run, db, monkeypatch

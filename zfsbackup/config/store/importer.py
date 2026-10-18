@@ -202,7 +202,12 @@ from sqlalchemy.exc import OperationalError
 
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store.db import dispose_all
-from zfsbackup.config.store.mapper import load_config, save_config, validate_config
+from zfsbackup.config.store.mapper import (
+    load_config,
+    read_store_id,
+    save_config,
+    validate_config,
+)
 from zfsbackup.config.store.access import check_config_schema
 from zfsbackup.config.store.migrate import SchemaOutOfDate, ensure_schema
 from zfsbackup.config.store.models import Dataset, Destination, GlobalSettings
@@ -246,7 +251,10 @@ class ImportResult:
     returned), so a caller can report it without a second read after the
     writer lock is released -- by which time another writer may have moved it
     on. `None` only for a result built by hand (the default keeps old
-    constructors working).
+    constructors working). `store_id` is the file's store id after the import
+    (`PRAGMA user_version`): unchanged for a re-import over an existing
+    database, freshly stamped for a new file or a legacy one. With
+    `generation` it is the reload key of what was committed.
     """
 
     created: bool
@@ -255,6 +263,7 @@ class ImportResult:
     replaced_destinations: int
     backup_path: Optional[Path] = None
     generation: Optional[int] = None
+    store_id: int = 0
 
 
 class OutgoingConfigUnreadable(ConfigPathError):
@@ -974,6 +983,8 @@ def _import_locked(
                     target, replaced_datasets, replaced_destinations, yaml_path,
                 )
             generation = save_config(session, config)
+            # Same transaction, after the stamp (item 17.0).
+            store_id = read_store_id(session)
     except BaseException as exc:
         if backup_path is not None:
             if isinstance(exc, Exception):
@@ -1001,4 +1012,5 @@ def _import_locked(
         replaced_destinations=replaced_destinations,
         backup_path=backup_path,
         generation=generation,
+        store_id=store_id,
     )
