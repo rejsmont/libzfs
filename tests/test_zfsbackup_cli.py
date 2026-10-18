@@ -5133,6 +5133,16 @@ class TestImportBesideARealDaemon:
                 time.sleep(0.1)
             else:
                 pytest.fail(f"daemon never recorded a generation: {info}\n{log_path.read_text(errors='replace')}")
+            # Holding the lock is not "ready": the SIGTERM handler is installed by
+            # `BackupDaemon.__init__`, which logs "ZFS Backup Daemon Starting" only
+            # afterwards. A test that signals the daemon the moment the lock shows
+            # up can kill it with the default disposition (-15) instead.
+            while "ZFS Backup Daemon Starting" not in log_path.read_text(errors="replace"):
+                if proc.poll() is not None:
+                    pytest.fail(f"daemon exited early ({proc.returncode}):\n{log_path.read_text(errors='replace')}")
+                if time.monotonic() > deadline:
+                    pytest.fail(f"daemon never finished starting:\n{log_path.read_text(errors='replace')}")
+                time.sleep(0.1)
             yield proc, log_path
         finally:
             log.close()

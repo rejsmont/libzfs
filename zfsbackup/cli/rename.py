@@ -53,9 +53,6 @@ change and does neither (it only reads).
 """
 
 import contextlib
-import errno
-import fcntl
-import os
 import shlex
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -216,42 +213,23 @@ class _DaemonPresent(Exception):
 
 @contextlib.contextmanager
 def _no_daemon(resolved: ResolvedConfigPath):
-    """Hold the daemon presence file's SHARED lock for the body, failing with
-    `_DaemonPresent` if a daemon holds it exclusively (or this cannot be told).
+    """Check ONCE, now, that no daemon is running, failing with
+    `_DaemonPresent` if `daemonlock.probe` finds one or cannot tell.
 
-    A daemon takes that file's exclusive lock BEFORE it reads the
-    configuration, and the caller has already committed the rename: so a
+    The caller has already committed the rename, and a daemon takes the
+    presence file's exclusive lock BEFORE it reads the configuration. So a
     daemon that holds the lock now may have loaded the old configuration (and
-    relies on the old dataset's anchors), while one that starts after this
-    point loads the new one and never looks at the old dataset. Holding the
-    shared lock through the `zfs inherit` also makes a daemon that starts in
-    the meantime wait (it retries for a second) and then refuse, rather than
-    start while its inputs are being removed. A missing file means no daemon
-    ever ran against this database.
+    relies on the old dataset's anchors), whereas one that starts after this
+    point reads the new configuration and never touches the old dataset: no
+    lock needs to be held while the properties are cleared. (A missing or
+    stale pid file means no daemon is running now -- a clean stop removes the
+    file, a crash leaves it unlocked.) Holding a lock here would only make a
+    daemon that starts meanwhile refuse with a misleading message.
     """
-    path = daemonlock.lock_path(resolved)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(str(path), flags)
-    except (FileNotFoundError, NotADirectoryError):
-        yield
-        return
-    except OSError as exc:
-        raise _DaemonPresent(
-            f"cannot tell whether a daemon is running ({path}: {exc.strerror or exc})"
-        ) from exc
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
-                raise _DaemonPresent(_daemon_running(resolved) or "a daemon is running") from exc
-            raise _DaemonPresent(
-                f"cannot tell whether a daemon is running ({exc.strerror or exc})"
-            ) from exc
-        yield
-    finally:
-        os.close(fd)  # releases the lock
+    busy = _daemon_running(resolved)
+    if busy is not None:
+        raise _DaemonPresent(busy)
+    yield
 
 
 def _inherit_commands(dataset: str, props: Sequence[str]) -> str:
@@ -332,6 +310,24 @@ def _anchor_message(
 
 def _inherit_commands_for(datasets: Sequence[str], prop: str) -> str:
     return "\n".join(f"  zfs inherit {prop} {shlex.quote(d)}" for d in datasets)
+
+
+def _interrupted_after_write(
+    exc: BaseException, applied: str, dataset: Optional[str], to_clear: Sequence[str]
+) -> None:
+    """An interrupt after the configuration write committed: say so (unless
+    `_clear_stale` already did), with the `zfs inherit` commands still due."""
+    if isinstance(exc, Exception):
+        return
+    if any("was renamed" in note for note in getattr(exc, "__notes__", ())):
+        return
+    note = f"{applied}; run `zfsbackup-config export` to see the configuration"
+    if dataset and to_clear:
+        note += (
+            f". The stale properties on {dataset!r} were not cleared (or not all); to clear "
+            "them once no daemon is running:\n" + _inherit_commands(dataset, sorted(to_clear))
+        )
+    exc.add_note(note)
 
 
 def _interrupted_write(exc: BaseException, resolved: ResolvedConfigPath, what: str) -> None:
@@ -459,18 +455,21 @@ def rename_dataset(
     except BaseException as exc:
         _interrupted_write(exc, resolved, "rename")
         raise
-    click.echo(f"Renamed dataset {old!r} -> {new!r} in the configuration.")
+    try:
+        click.echo(f"Renamed dataset {old!r} -> {new!r} in the configuration.")
 
-    if to_clear:
-        # The daemon check is made HERE, after the write, and held through the
-        # `zfs inherit`s (`_no_daemon`): see its docstring.
-        try:
-            cleared = _clear_stale(resolved, bm, old, to_clear)
-        except CliError:
-            notify_daemon(resolved, result.generation)
-            raise
-        click.echo(f"Cleared on {old!r}: {', '.join(cleared) or '(nothing set)'}")
-    notify_daemon(resolved, result.generation)
+        if to_clear:
+            # The daemon check is made HERE, after the write (`_no_daemon`).
+            try:
+                cleared = _clear_stale(resolved, bm, old, to_clear)
+            except CliError:
+                notify_daemon(resolved, result.generation)
+                raise
+            click.echo(f"Cleared on {old!r}: {', '.join(cleared) or '(nothing set)'}")
+        notify_daemon(resolved, result.generation)
+    except BaseException as exc:
+        _interrupted_after_write(exc, f"the rename of dataset {old!r} was applied", old, to_clear)
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -592,15 +591,19 @@ def rename_destination(
                 "rename is safe: it copies anchor.%s again, refreshing them." % old
             )
         raise
-    click.echo(f"Renamed destination {old!r} -> {new!r} in the configuration.")
-    stale = [n for n, o in outcomes.items() if o != "no-source"]
-    if stale:
-        commands = _inherit_commands_for(stale, f"{_PROP_ANCHOR}{old}")
-        click.echo(
-            f"Restart the daemon now so it uses the new name {new!r}. Until then, and after: "
-            f"the daemon protects every local or received org.zfsbackup:anchor.* property, so "
-            f"anchor.{old} keeps protecting its snapshot from pruning on "
-            f"{', '.join(repr(n) for n in stale)}. Once a send to {new!r} has succeeded, "
-            f"clear the old property (until then it pins that snapshot):\n{commands}"
-        )
-    notify_daemon(resolved, result.generation)
+    try:
+        click.echo(f"Renamed destination {old!r} -> {new!r} in the configuration.")
+        stale = [n for n, o in outcomes.items() if o != "no-source"]
+        if stale:
+            commands = _inherit_commands_for(stale, f"{_PROP_ANCHOR}{old}")
+            click.echo(
+                f"Restart the daemon now so it uses the new name {new!r}. Until then, and after: "
+                f"the daemon protects every local or received org.zfsbackup:anchor.* property, so "
+                f"anchor.{old} keeps protecting its snapshot from pruning on "
+                f"{', '.join(repr(n) for n in stale)}. Once a send to {new!r} has succeeded, "
+                f"clear the old property (until then it pins that snapshot):\n{commands}"
+            )
+        notify_daemon(resolved, result.generation)
+    except BaseException as exc:
+        _interrupted_after_write(exc, f"the rename of destination {old!r} was applied", None, [])
+        raise

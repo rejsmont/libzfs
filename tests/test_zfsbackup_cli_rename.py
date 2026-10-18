@@ -24,6 +24,13 @@ Sections:
                                  module; stdout stays free of libzfseasy's debug
                                  noise.
 
+Follow-up round (same method; failing tests across this file and the edit /
+signal files): daemon check dropped 8; lock held through the inherits again 6;
+probe error read as "no daemon" 5; probe repeated per property 4; after-write
+interrupt note dropped 8 / duplicated 4 / inherit commands omitted 4 / dataset
+rename not annotated 6 / destination rename not annotated 5 / ordinary
+failures annotated 5.
+
 Review-fix round (scratch copy, one revert at a time; failing tests across this
 file, `test_zfsbackup_cli_edit.py`, `..._edit_signals.py` and
 `test_zfsbackup_manager.py`): shared lock never blocks 5 / released before the
@@ -52,6 +59,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -381,6 +389,21 @@ class TestRenameDataset:
         assert [w for w in warnings_in(result) if "never be pruned" in w] == []
 
 
+def _try_exclusive_lock(path) -> str:
+    """'acquired' if a daemon-style exclusive lock on `path` can be taken right
+    now (and releases it), 'blocked' if something holds the file."""
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "blocked"
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return "acquired"
+    finally:
+        os.close(fd)
+
+
 class TestRenameDatasetClearStale:
     PROPS = {CONFIG_PROP: "cfg", ANCHOR + "offsite": "snap1", ANCHOR + "dc.two": "snap2", "compression": "lz4"}
     #: the order the properties are cleared in (sorted)
@@ -545,53 +568,94 @@ class TestRenameDatasetClearStale:
         assert "zfs inherit" in result.stderr
         assert stale.mutations == [] and "tank/vm.02" in names(rich)
 
-    def test_a_flock_error_other_than_contention_means_cannot_tell(self, run, rich, stale, monkeypatch):
-        rename.daemonlock.lock_path(rich).write_text("1\n")
+    def test_a_probe_that_raises_means_cannot_tell_so_nothing_is_cleared(self, run, rich, stale, monkeypatch):
+        def broken(resolved):
+            raise OSError(errno.EIO, "Input/output error")
 
-        real_flock = fcntl.flock
-
-        def broken(fd, op):
-            if op == fcntl.LOCK_SH | fcntl.LOCK_NB:  # only the presence check
-                raise OSError(errno.EIO, "Input/output error")
-            return real_flock(fd, op)
-
-        monkeypatch.setattr(rename.fcntl, "flock", broken)
+        monkeypatch.setattr(rename.daemonlock, "probe", broken)
         result = self.clear(run, rich)
         assert result.exit_code == 1
-        assert "cannot tell whether a daemon is running" in result.stderr and "Input/output" in result.stderr
-        assert stale.mutations == []
+        err = result.stderr
+        assert "NOT cleared: cannot tell whether a daemon is running (Input/output error)" in err
+        assert all(f"zfs inherit {p} tank/vm.01" in err for p in self.ORDER)
+        assert stale.mutations == [] and "tank/vm.02" in names(rich)
 
-    def test_the_shared_lock_is_held_through_every_inherit(self, run, rich, stale, monkeypatch):
-        """While the clears run, a daemon's exclusive lock attempt must fail;
-        afterwards the lock is released."""
-        lock_path = rename.daemonlock.lock_path(rich)
-        lock_path.write_text("")
+    def test_one_probe_after_the_write_and_no_lock_is_held_through_the_inherits(self, run, rich, stale, monkeypatch):
+        """The presence check is a single `daemonlock.probe` made after the
+        commit; nothing is locked while the properties are cleared, so a daemon
+        (or anything else) can take the exclusive lock mid-clear."""
         import zfsbackup.backup_manager as bm
 
-        attempts = []
-        real = bm.clear_zfsbackup_properties
+        probes = []
+        real_running = rename._daemon_running
 
-        def probing(*args, **kwargs):
-            fd = os.open(str(lock_path), os.O_RDONLY)
-            try:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    attempts.append("acquired")
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                except BlockingIOError:
-                    attempts.append("blocked")
-            finally:
-                os.close(fd)
-            return real(*args, **kwargs)
+        def counting(resolved):
+            probes.append(generation(rich))   # the generation the probe saw
+            return real_running(resolved)
 
-        monkeypatch.setattr(bm, "clear_zfsbackup_properties", probing)
+        monkeypatch.setattr(rename, "_daemon_running", counting)
+        gen = generation(rich)
+        lock_path = rename.daemonlock.lock_path(rich)
+        outcomes = []
+        real_clear = bm.clear_zfsbackup_properties
+
+        def taking_the_lock(*args, **kwargs):
+            # the lock is free in the middle of the clears
+            outcomes.append(_try_exclusive_lock(lock_path))
+            return real_clear(*args, **kwargs)
+
+        monkeypatch.setattr(bm, "clear_zfsbackup_properties", taking_the_lock)
+        lock_path.write_text("")
         assert self.clear(run, rich).exit_code == 0
-        assert attempts == ["blocked"] * 3
-        fd = os.open(str(lock_path), os.O_RDONLY)
+        assert probes == [gen + 1]            # exactly one, and after the write
+        assert outcomes == ["acquired"] * 3
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize("pid_file", ["missing", "stale"])
+    def test_a_daemon_can_start_while_the_inherits_run(self, run, rich, stale, tmp_path, pid_file):
+        """Across processes: a daemon's exclusive lock succeeds in the middle of a
+        slow `zfs inherit`, loads the NEW configuration, and the CLI still
+        finishes the clear (it already checked, once). A stale pid file left by
+        a crashed daemon is not a daemon."""
+        from zfsbackup import daemonlock
+
+        resolved = resolve_config_path(str(rich))
+        pid_path = daemonlock.lock_path(resolved)
+        if pid_file == "stale":
+            pid_path.write_text("99999\n0\n")
+            pid_path.chmod(0o660)
+        marker = tmp_path / "inherit.marker"
+        env = dict(
+            os.environ, PYTHONPATH=REPO, FAKEZFS_SLOW_INHERIT="1.5", FAKEZFS_MARKER=str(marker),
+        )
+        cli = subprocess.Popen(
+            [sys.executable, "-m", "zfsbackup.cli", "-c", str(rich), "rename", "dataset",
+             "tank/vm.01", "tank/vm.02", "--clear-stale-props"],
+            env=env, cwd=str(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released afterwards
+            deadline = time.monotonic() + 30
+            while not marker.exists():
+                assert cli.poll() is None, cli.communicate()
+                assert time.monotonic() < deadline, "the first inherit never started"
+                time.sleep(0.02)
+            lock = daemonlock.acquire(resolved)      # a daemon starting mid-clear
+            try:
+                loaded = read_config(resolved)
+                dispose_all()
+                assert [d.name for d in loaded.config.datasets].count("tank/vm.02") == 1
+                assert "tank/vm.01" not in [d.name for d in loaded.config.datasets]
+            finally:
+                lock.release()
+            out, err = cli.communicate(timeout=60)
         finally:
-            os.close(fd)
+            if cli.poll() is None:
+                cli.kill()
+                cli.communicate()
+        assert cli.returncode == 0, err
+        assert "Cleared on 'tank/vm.01':" in out
+        assert "supervisor" not in out + err and "refus" not in (out + err).lower()
+        assert stale.props("tank/vm.01") == {"compression": "lz4"}
 
     def test_dry_run_notes_a_running_daemon_and_still_does_nothing(self, run, rich, stale, daemon_lock_holder):
         daemon_lock_holder(rich, generation=0)
@@ -1424,3 +1488,101 @@ class TestInterruptDuringTheWrite:
         assert result.exit_code in (1, 75)
         assert "may or may not" not in result.stderr
         assert db_state(rich) == state
+
+
+class TestInterruptAfterTheWrite:
+    """An interrupt that lands AFTER `commit_config` returned: the rename was
+    applied; say so, with the `zfs inherit` commands still due for a dataset
+    rename, and never twice."""
+
+    PROPS = {CONFIG_PROP: "cfg", ANCHOR + "offsite": "snap1", ANCHOR + "dc.two": "snap2"}
+    ORDER = sorted(PROPS)
+
+    @pytest.fixture
+    def stale(self, fake_zfs):
+        fake_zfs.add("tank/vm.01", self.PROPS)
+        fake_zfs.add("tank/vm.02", {})
+        return fake_zfs
+
+    def interrupt(self, monkeypatch, name="notify_daemon"):
+        def boom(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(rename, name, boom)
+
+    def test_dataset_rename_without_properties(self, run, rich, monkeypatch):
+        self.interrupt(monkeypatch)
+        result = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich)
+        assert result.exit_code == 130
+        err = result.stderr
+        assert "the rename of dataset 'tank/vm.01' was applied; run `zfsbackup-config export` to see the configuration" in err
+        assert "may or may not" not in err and "zfs inherit" not in err
+        assert "tank/vm.02" in names(rich)  # it really was applied
+
+    def test_dataset_rename_with_properties_left_lists_the_commands(self, run, rich, stale, monkeypatch):
+        self.interrupt(monkeypatch, "_clear_stale")
+        result = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "--clear-stale-props", "-c", rich)
+        assert result.exit_code == 130
+        err = result.stderr
+        assert "the rename of dataset 'tank/vm.01' was applied" in err
+        assert "to clear them once no daemon is running:" in err
+        for prop in self.ORDER:
+            assert f"zfs inherit {prop} tank/vm.01" in err
+        assert stale.props("tank/vm.01") == self.PROPS and "tank/vm.02" in names(rich)
+
+    def test_no_inherit_commands_without_the_flag(self, run, rich, stale, monkeypatch):
+        self.interrupt(monkeypatch)
+        err = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich).stderr
+        assert "was applied" in err and "zfs inherit" not in err
+
+    def test_not_duplicated_when_the_clear_already_explained_itself(self, run, rich, stale, monkeypatch):
+        import zfsbackup.backup_manager as bm
+
+        real = bm.clear_zfsbackup_properties
+        calls = []
+
+        def second_interrupts(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(bm, "clear_zfsbackup_properties", second_interrupts)
+        result = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "--clear-stale-props", "-c", rich)
+        assert result.exit_code == 130
+        err = result.stderr
+        assert err.count("the configuration was renamed; cleared on 'tank/vm.01' before the interrupt") == 1
+        assert "was applied" not in err      # the first note already said it
+        assert err.count("Properties that may remain") == 1
+
+    def test_destination_rename_without_references(self, run, rich, monkeypatch):
+        self.interrupt(monkeypatch)
+        result = run("rename", "destination", "spare", "spare2", "-c", rich)
+        assert result.exit_code == 130
+        assert "the rename of destination 'spare' was applied; run `zfsbackup-config export`" in result.stderr
+        assert "zfs inherit" not in result.stderr
+        assert "spare2" in stored(rich).destinations
+
+    def test_destination_rename_with_copied_anchors(self, run, rich, fake_zfs, monkeypatch):
+        fake_zfs.add("tank/data", {ANCHOR + "offsite": "snapA"})
+        fake_zfs.add("tank/other", {ANCHOR + "offsite": "snapC"})
+        self.interrupt(monkeypatch)
+        result = run("rename", "destination", "offsite", "offsite2", "-c", rich)
+        assert result.exit_code == 130
+        assert "the rename of destination 'offsite' was applied" in result.stderr
+        assert "offsite2" in stored(rich).destinations
+
+    @pytest.mark.parametrize("kind, old, new", [("dataset", "tank/vm.01", "tank/vm.02"), ("destination", "spare", "spare2")])
+    def test_an_interrupt_before_the_write_returned_is_not_called_applied(self, run, rich, monkeypatch, kind, old, new):
+        def boom(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(rename, "commit_config", boom)
+        err = run("rename", kind, old, new, "-c", rich).stderr
+        assert "may or may not have been applied" in err and "was applied" not in err
+
+    def test_an_ordinary_failure_after_the_write_adds_no_note(self, run, rich, stale, daemon_lock_holder):
+        daemon_lock_holder(rich, generation=0)
+        result = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "--clear-stale-props", "-c", rich)
+        assert result.exit_code == 1
+        assert "was applied" not in result.stderr and "NOT cleared" in result.stderr

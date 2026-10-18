@@ -145,40 +145,55 @@ def _run_editor(argv: Sequence[str], buffer: Path) -> None:
     itself died of SIGINT is reported as an interrupt (exit 130).
     """
     release_database()  # nothing may stay open while a human types
-    try:
-        # No stdin/stdout/stderr arguments: the editor inherits ours. The
-        # editor is started BEFORE the signals are ignored: an ignored
-        # disposition would be inherited across exec.
-        child = subprocess.Popen([*argv, str(buffer)])
-    except FileNotFoundError:
-        raise CliError(
-            f"editor not found: {argv[0]!r} (set $VISUAL or $EDITOR, or use --editor)"
-        ) from None
-    except OSError as exc:
-        raise CliError(f"cannot run the editor {argv[0]!r}: {exc.strerror or exc}") from exc
 
+    child: Optional[subprocess.Popen] = None
     terminated_at: List[float] = []
 
     def forward_term(signum, frame):  # noqa: ARG001
+        # A SIGTERM that lands before the editor exists is remembered and
+        # forwarded as soon as it does.
         if not terminated_at:
             terminated_at.append(time.monotonic())
-        try:
-            child.send_signal(signal.SIGTERM)
-        except OSError:
-            pass
+        if child is not None:
+            try:
+                child.send_signal(signal.SIGTERM)
+            except OSError:
+                pass
 
+    def ignore(signum, frame):  # noqa: ARG001
+        pass
+
+    # The handlers go in BEFORE the editor is started, as Python functions
+    # rather than SIG_IGN: exec resets caught signals to their default, so the
+    # editor starts with default dispositions, whereas an ignored one would be
+    # inherited. Everything from here to the end of the wait is covered by one
+    # try/finally that restores them and never leaves the editor running.
     previous: Dict[int, Any] = {}
     try:
-        for signum, handler in (
-            (signal.SIGINT, signal.SIG_IGN),
-            (signal.SIGQUIT, signal.SIG_IGN),
-            (signal.SIGTERM, forward_term),
-        ):
-            previous[signum] = signal.signal(signum, handler)
-    except ValueError:
-        # Not the main thread: signals cannot be rearranged; wait plainly.
-        previous = {}
-    try:
+        try:
+            for signum, handler in (
+                (signal.SIGINT, ignore),
+                (signal.SIGQUIT, ignore),
+                (signal.SIGTERM, forward_term),
+            ):
+                previous[signum] = signal.signal(signum, handler)
+        except ValueError:
+            # Not the main thread: signals cannot be rearranged; wait plainly.
+            previous = {}
+        try:
+            # No stdin/stdout/stderr arguments: the editor inherits ours.
+            child = subprocess.Popen([*argv, str(buffer)])
+        except FileNotFoundError:
+            raise CliError(
+                f"editor not found: {argv[0]!r} (set $VISUAL or $EDITOR, or use --editor)"
+            ) from None
+        except OSError as exc:
+            raise CliError(f"cannot run the editor {argv[0]!r}: {exc.strerror or exc}") from exc
+        if terminated_at:
+            try:
+                child.send_signal(signal.SIGTERM)
+            except OSError:
+                pass
         while True:
             try:
                 code = child.wait(timeout=0.25)
@@ -187,10 +202,10 @@ def _run_editor(argv: Sequence[str], buffer: Path) -> None:
                 if terminated_at and time.monotonic() - terminated_at[0] > _TERMINATE_GRACE:
                     child.kill()
     except BaseException:
-        # Anything that still got through (a handler that could not be
-        # installed): never leave the editor running unattended.
-        child.kill()
-        child.wait()
+        # Anything that still got through: never leave the editor running.
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait()
         raise
     finally:
         for signum, handler in previous.items():
