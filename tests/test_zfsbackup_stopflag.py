@@ -48,7 +48,10 @@ import time
 
 import pytest
 
-from zfsbackup.stopflag import STOP_POLL, StopFlag
+from multiprocessing.reduction import ForkingPickler
+import pickle
+
+from zfsbackup.stopflag import STOP_POLL, ReloadEpoch, StopFlag
 
 #: Every start method actually available on this platform, pinned by name
 #: rather than relying on `multiprocessing.get_context()`'s default --
@@ -734,3 +737,152 @@ class TestStopFlagResourceTracker:
         flag = StopFlag()
         assert type(flag._flag) is ctypes.c_byte
         assert not hasattr(flag._flag, "get_lock")
+
+
+# ---------------------------------------------------------------------------
+# ReloadEpoch (item 18.1): the supervisor's shared, lock-free reload counter
+# ---------------------------------------------------------------------------
+
+
+def _child_report_epoch_when(epoch, ready_path, seen_path, want):
+    """Marks ready, then polls `epoch.get()` until it reads `want` (a parent's
+    LATER `set`) and records what it saw. Bounded, so a broken share fails an
+    assertion instead of hanging."""
+    with open(ready_path, "w") as fh:
+        fh.write("ready")
+    deadline = time.monotonic() + 15
+    while epoch.get() != want and time.monotonic() < deadline:
+        time.sleep(0.02)
+    with open(seen_path, "w") as fh:
+        fh.write(str(epoch.get()))
+
+
+def _child_set_epoch(epoch, value):
+    epoch.set(value)
+
+
+@pytest.mark.unit
+class TestReloadEpoch:
+    def test_starts_at_zero(self):
+        assert ReloadEpoch().get() == 0
+
+    @pytest.mark.parametrize("value", [0, 1, 7, 2**31 - 1, -1, -5, -(2**31)])
+    def test_get_set_round_trip_including_negative(self, value):
+        epoch = ReloadEpoch()
+        epoch.set(value)
+        assert epoch.get() == value
+
+    def test_get_returns_a_plain_int(self):
+        epoch = ReloadEpoch()
+        epoch.set(3)
+        assert type(epoch.get()) is int
+
+    def test_last_set_wins(self):
+        epoch = ReloadEpoch()
+        epoch.set(1)
+        epoch.set(2)
+        assert epoch.get() == 2
+
+    def test_two_epochs_are_independent(self):
+        a, b = ReloadEpoch(), ReloadEpoch()
+        a.set(4)
+        assert b.get() == 0
+
+    def test_backing_store_is_a_bare_ctypes_int_with_no_lock(self):
+        """Lock-free by construction: nothing a dying process can leave held,
+        and nothing `resource_tracker` could ever complain about."""
+        epoch = ReloadEpoch()
+        assert type(epoch._epoch) is ctypes.c_int
+        assert not hasattr(epoch._epoch, "get_lock")
+        assert ctypes.sizeof(epoch._epoch) == 4, "a single aligned 32-bit word: no torn reads"
+
+    def test_there_is_no_lock_or_condition_attribute(self):
+        epoch = ReloadEpoch()
+        for value in vars(epoch).values():
+            assert not hasattr(value, "acquire")
+            assert not hasattr(value, "get_lock")
+
+    def test_never_starts_the_resource_tracker(self):
+        script = textwrap.dedent(
+            """
+            import multiprocessing.resource_tracker as rt
+            from zfsbackup.stopflag import ReloadEpoch
+
+            xs = [ReloadEpoch() for _ in range(50)]
+            assert rt._resource_tracker._fd is None, rt._resource_tracker._fd
+            print("OK")
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=60
+        )
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
+
+    def test_pickled_state_is_a_dict_with_an_epoch_key(self):
+        epoch = ReloadEpoch()
+        state = epoch.__getstate__()
+        assert isinstance(state, dict)
+        assert "epoch" in state
+        assert state["epoch"] is epoch._epoch
+
+    def test_setstate_restores_the_shared_object_not_a_copy(self):
+        epoch = ReloadEpoch()
+        clone = ReloadEpoch.__new__(ReloadEpoch)
+        clone.__setstate__(epoch.__getstate__())
+        epoch.set(9)
+        assert clone.get() == 9
+
+    def test_plain_pickle_raises(self):
+        """Shared memory is only transferable by inheritance / the multiprocessing
+        pickler; a plain `pickle` round trip would silently give a private copy,
+        so it must refuse."""
+        with pytest.raises((TypeError, RuntimeError, pickle.PicklingError)):
+            pickle.dumps(ReloadEpoch())
+
+    def test_forking_pickler_refuses_outside_a_process_start(self):
+        """`ForkingPickler` only reduces the shared word while a child is being
+        started (`assert_spawning`); the cross-process proof is the spawn and
+        forkserver tests below."""
+        with pytest.raises(RuntimeError, match="through inheritance"):
+            ForkingPickler.dumps(ReloadEpoch())
+
+    @pytest.mark.parametrize("start_method", START_METHODS)
+    def test_a_child_sees_the_parents_later_set(self, start_method, tmp_path):
+        """The child is already running (and has read 0) when the parent sets
+        the epoch; it must observe the new value. Under spawn/forkserver the
+        argument crosses a `ForkingPickler` boundary, so this also proves that
+        boundary shares the memory rather than copying it."""
+        ctx = multiprocessing.get_context(start_method)
+        epoch = ReloadEpoch()
+        ready, seen = str(tmp_path / "ready"), str(tmp_path / "seen")
+        proc = ctx.Process(target=_child_report_epoch_when, args=(epoch, ready, seen, 7))
+        try:
+            proc.start()
+            assert _wait_for_files([ready], READY_TIMEOUT), "child never became ready"
+            assert epoch.get() == 0
+            epoch.set(7)
+            proc.join(timeout=20)
+            assert proc.exitcode == 0
+            assert open(seen).read() == "7"
+        finally:
+            _kill_and_reap(proc)
+
+    @pytest.mark.parametrize("start_method", START_METHODS)
+    def test_a_childs_set_is_visible_to_the_parent(self, start_method):
+        ctx = multiprocessing.get_context(start_method)
+        epoch = ReloadEpoch()
+        proc = ctx.Process(target=_child_set_epoch, args=(epoch, 42))
+        try:
+            proc.start()
+            proc.join(timeout=20)
+            assert proc.exitcode == 0
+            assert epoch.get() == 42
+        finally:
+            _kill_and_reap(proc)
+
+    def test_stopflag_and_epoch_are_separate_objects(self):
+        """The stop path stays exactly as small as it was: `StopFlag` carries no
+        epoch, and `ReloadEpoch` carries no flag."""
+        assert set(StopFlag().__getstate__()) == {"flag"}
+        assert set(ReloadEpoch().__getstate__()) == {"epoch"}

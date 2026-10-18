@@ -40,7 +40,7 @@ from zfsbackup import daemon as daemon_module
 from zfsbackup import daemonlock, workers
 from zfsbackup.config import BackupConfig, DatasetConfig
 from zfsbackup.stopflag import STOP_POLL
-from zfsbackup.workers import ApiWorker, PruningWorker, SnapshotWorker
+from zfsbackup.workers import ApiWorker, ExitReason, PruningWorker, SnapshotWorker
 
 REPO = Path(__file__).resolve().parent.parent
 SUPERVISOR = 4242       # a pid that is not ours: "the recorded supervisor"
@@ -311,9 +311,14 @@ class TestStartupHupInARealDaemon:
         time.sleep(0.3)
         assert process.poll() is None, f"the daemon died of the SIGHUP:\n{log_text(log)}"
         assert wait_until(lambda: "worker (pid=" in log_text(log), 60), log_text(log)
-        assert wait_until(
-            lambda: "Received SIGHUP: live reload not implemented" in log_text(log), 30
-        ), log_text(log)                                   # carried into the daemon, logged on its first poll
+        # Carried into the daemon and handled by its first tick -- a real reload now:
+        # the store has not changed, so "configuration unchanged" (or "accepted",
+        # had a write landed meanwhile) -- and before the first worker is forked.
+        text = log_text(log)
+        assert "live reload not implemented" not in text
+        outcome = [m for m in ("SIGHUP: configuration unchanged", "accepted") if m in text]
+        assert outcome, text
+        assert text.index(outcome[0]) < text.index("Started "), text
         os.kill(process.pid, signal.SIGTERM)
         assert process.wait(timeout=60) == 0, log_text(log)
 
@@ -356,6 +361,7 @@ def armed(monkeypatch, cls=SnapshotWorker, *, parent=SUPERVISOR, forkserver=Fals
     world = Parent(monkeypatch, parent=parent, supervisor_alive=alive)
     worker = cls(make_config(), multiprocessing.Event())
     worker.supervisor_pid = SUPERVISOR              # recorded by the constructor, in the supervisor
+    worker.supervisor_start = None             # no token: identity falls back to _pid_exists
     monkeypatch.setattr(
         workers.multiprocessing, "get_start_method",
         lambda allow_none=False: "forkserver" if forkserver else "spawn",
@@ -524,41 +530,41 @@ def sliced(monkeypatch):
 class TestWorkerWait:
     def test_it_waits_in_stop_poll_slices(self, sliced):
         worker, stop, clock = sliced
-        assert worker._wait(1.75) is False
+        assert worker._wait(1.75) is None
         assert [c.kwargs["timeout"] for c in stop.wait.call_args_list] == [
             STOP_POLL, STOP_POLL, STOP_POLL, pytest.approx(0.25),
         ]
 
     def test_a_short_timeout_is_one_short_slice(self, sliced):
         worker, stop, clock = sliced
-        assert worker._wait(0.1) is False
+        assert worker._wait(0.1) is None
         assert [c.kwargs["timeout"] for c in stop.wait.call_args_list] == [pytest.approx(0.1)]
 
     @pytest.mark.parametrize("timeout", [0, 0.0, -1, -5.5, float("nan")])
     def test_zero_negative_and_nan_return_the_state_without_sleeping(self, sliced, timeout):
         worker, stop, clock = sliced
-        assert worker._wait(timeout) is False
+        assert worker._wait(timeout) is None
         stop.wait.assert_not_called()
         stop.is_set.return_value = True
-        assert worker._wait(timeout) is True
+        assert worker._wait(timeout) is ExitReason.STOP
         stop.wait.assert_not_called()
 
     def test_infinity_is_not_special_cased_away(self, sliced):
         worker, stop, clock = sliced
         stop.is_set.side_effect = [False, False, True]      # raised on the third check
-        assert worker._wait(math.inf) is True
+        assert worker._wait(math.inf) is ExitReason.STOP
         assert stop.wait.call_count == 2
 
     def test_a_raised_flag_ends_it_at_the_next_slice(self, sliced):
         worker, stop, clock = sliced
         stop.is_set.side_effect = [False, False, True]
-        assert worker._wait(10) is True
+        assert worker._wait(10) is ExitReason.STOP
         assert stop.wait.call_count == 2                    # not 20 slices
 
     def test_a_raised_flag_returns_immediately_without_waiting(self, sliced):
         worker, stop, clock = sliced
         stop.is_set.return_value = True
-        assert worker._wait(10) is True
+        assert worker._wait(10) is ExitReason.STOP
         stop.wait.assert_not_called()
 
     def test_a_dead_supervisor_is_noticed_within_one_slice(self, monkeypatch):
@@ -579,9 +585,10 @@ class TestWorkerWait:
         stop.wait.side_effect = wait
         worker = SnapshotWorker(make_config(), stop)
         worker.supervisor_pid = SUPERVISOR
+        worker.supervisor_start = None             # no token: identity falls back to _pid_exists
         monkeypatch.setattr(workers.multiprocessing, "get_start_method", lambda allow_none=False: "spawn")
         worker._arm_supervisor_watch()
-        assert worker._wait(3600) is True                 # an hour-long interval
+        assert worker._wait(3600) is ExitReason.SUPERVISOR_GONE                 # an hour-long interval
         assert len(slices) == 3 and all(t == STOP_POLL for t in slices)
 
     def test_the_real_flag_is_polled_in_slices_end_to_end(self):
@@ -591,7 +598,7 @@ class TestWorkerWait:
         timer.start()
         started = time.monotonic()
         try:
-            assert worker._wait(10) is True
+            assert worker._wait(10) is ExitReason.STOP
         finally:
             timer.cancel()
         assert time.monotonic() - started < 5
@@ -610,6 +617,7 @@ class TestWorkersExitWithTheSupervisor:
         stop = multiprocessing.Event()
         worker = SnapshotWorker(make_config(), stop)
         worker.supervisor_pid = SUPERVISOR
+        worker.supervisor_start = None             # no token: identity falls back to _pid_exists
         mocker.patch.object(worker, "_get_interval", return_value=30)   # would sleep 30 s if ignored
         monkeypatch.setattr(workers.multiprocessing, "get_start_method", lambda allow_none=False: "spawn")
 
@@ -631,6 +639,7 @@ class TestWorkersExitWithTheSupervisor:
         config = BackupConfig(datasets=[DatasetConfig(name="pool/a"), DatasetConfig(name="pool/b")])
         worker = SnapshotWorker(config, multiprocessing.Event())
         worker.supervisor_pid = SUPERVISOR
+        worker.supervisor_start = None             # no token: identity falls back to _pid_exists
         monkeypatch.setattr(workers.multiprocessing, "get_start_method", lambda allow_none=False: "spawn")
         done = []
 
@@ -650,6 +659,7 @@ class TestWorkersExitWithTheSupervisor:
         Parent(monkeypatch, parent=1)                     # reparented before the first instruction
         worker = SnapshotWorker(make_config(), multiprocessing.Event())
         worker.supervisor_pid = SUPERVISOR
+        worker.supervisor_start = None             # no token: identity falls back to _pid_exists
         monkeypatch.setattr(workers.multiprocessing, "get_start_method", lambda allow_none=False: "spawn")
         process = mocker.patch.object(worker, "_process_dataset")
         with watchdog(worker.stop_event, 5):
@@ -759,6 +769,7 @@ class TestApiWorkerFailures:
         world = Parent(monkeypatch)
         worker = ApiWorker(make_config(), multiprocessing.Event())
         worker.supervisor_pid = SUPERVISOR
+        worker.supervisor_start = None             # no token: identity falls back to _pid_exists
         monkeypatch.setattr(workers.multiprocessing, "get_start_method", lambda allow_none=False: "spawn")
         server = MagicMock()
         server.serve_forever.side_effect = lambda: time.sleep(30)

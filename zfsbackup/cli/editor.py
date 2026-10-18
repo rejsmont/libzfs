@@ -70,7 +70,13 @@ from zfsbackup.cli.render import (
     render_destination_fragment,
     render_yaml,
 )
-from zfsbackup.cli.write import commit_config, notify_daemon, release_database, where_flag
+from zfsbackup.cli.write import (
+    begin_reload,
+    commit_config,
+    notify_daemon,
+    release_database,
+    where_flag,
+)
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
     ConfigBusy,
@@ -690,8 +696,11 @@ def _session(
         # the generation inside its write transaction, and closes it again.
         result = commit_config(resolved, snapshot, new, warn=warn, announce=False)
         keep = False
+        # Ask the daemon to reload BEFORE printing anything: a closed stdout
+        # must not cost the signal.
+        request = begin_reload(resolved, result.generation, result.store_id)
         click.echo(f"Configuration saved ({_summary(original, new)}).")
-        notify_daemon(resolved, result.generation)
+        notify_daemon(resolved, result.generation, result.store_id, request=request)
     except BaseException as exc:
         # The note is printed after the error itself (errors.report, and the
         # ^C handler, print `__notes__`).

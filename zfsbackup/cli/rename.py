@@ -70,14 +70,21 @@ import click
 from zfsbackup import daemonlock
 from zfsbackup.cli import dotpath
 from zfsbackup.cli.errors import CliError
-from zfsbackup.cli.write import commit_config, notify_daemon, release_database, where_flag
+from zfsbackup.cli.write import (
+    begin_reload,
+    commit_config,
+    notify_daemon,
+    release_database,
+    where_flag,
+)
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
     ConfigConflict,
     ConfigSnapshot,
     ResolvedConfigPath,
     destination_name_problem,
-    read_generation,
+    StoreIdConflict,
+    read_store_state,
     validate_config,
     writer_lock,
 )
@@ -323,15 +330,22 @@ def _inherit_commands_for(datasets: Sequence[str], prop: str) -> str:
 
 
 def _require_generation(resolved: ResolvedConfigPath, snapshot: ConfigSnapshot) -> None:
-    """Raise `ConfigConflict` (exit 75) unless the stored generation is still
-    the one `snapshot` was read at. Opens and closes a read connection; nothing
-    stays open for the zfs calls that follow."""
+    """Raise `StoreIdConflict` (the database file was replaced) or
+    `ConfigConflict` (the generation moved) -- both exit 75 -- unless the stored
+    `(store id, generation)` is still the one `snapshot` was read at. Opens and
+    closes a read connection; nothing stays open for the zfs calls that follow.
+    A snapshot of a never-stamped (legacy, id 0) database compares generations
+    only, like the store's own write check."""
     try:
-        current = read_generation(resolved)
+        current = read_store_state(resolved)
     finally:
         release_database()
-    if current != snapshot.generation:
-        raise ConfigConflict(snapshot.generation, current)
+    if snapshot.store_id != 0 and current.store_id != snapshot.store_id:
+        raise StoreIdConflict(
+            snapshot.store_id, current.store_id, snapshot.generation, current.generation
+        )
+    if current.generation != snapshot.generation:
+        raise ConfigConflict(snapshot.generation, current.generation)
 
 
 def _interrupted_after_write(
@@ -477,6 +491,9 @@ def rename_dataset(
     except BaseException as exc:
         _interrupted_write(exc, resolved, "rename")
         raise
+    # Ask the daemon to reload BEFORE printing anything: a closed stdout must
+    # not cost the signal.
+    request = begin_reload(resolved, result.generation, result.store_id)
     try:
         click.echo(f"Renamed dataset {old!r} -> {new!r} in the configuration.")
         if stale_props and not clear_stale_props and not about_to_zfs_rename:
@@ -492,10 +509,10 @@ def rename_dataset(
             try:
                 cleared = _clear_stale(resolved, bm, old, to_clear)
             except CliError:
-                notify_daemon(resolved, result.generation)
+                notify_daemon(resolved, result.generation, result.store_id, request=request)
                 raise
             click.echo(f"Cleared on {old!r}: {', '.join(cleared) or '(nothing set)'}")
-        notify_daemon(resolved, result.generation)
+        notify_daemon(resolved, result.generation, result.store_id, request=request)
     except BaseException as exc:
         _interrupted_after_write(
             exc, resolved, f"the rename of dataset {old!r} was applied", old, to_clear
@@ -684,19 +701,21 @@ def rename_destination(
             _require_generation(resolved, snapshot)
             copy_anchors()
             result = commit(held)
+    request = begin_reload(resolved, result.generation, result.store_id)
     try:
         click.echo(f"Renamed destination {old!r} -> {new!r} in the configuration.")
         stale = [n for n, o in outcomes.items() if o != "no-source"]
         if stale:
             commands = _inherit_commands_for(stale, old_prop)
             click.echo(
-                f"Restart the daemon now so it uses the new name {new!r}. Until then, and after: "
+                f"A running daemon reloads the configuration (see below) and then uses the "
+                f"new name {new!r}; until then, and after, "
                 f"the daemon protects every local or received org.zfsbackup:anchor.* property, so "
                 f"anchor.{old} keeps protecting its snapshot from pruning on "
                 f"{', '.join(repr(n) for n in stale)}. Once a send to {new!r} has succeeded, "
                 f"clear the old property (until then it pins that snapshot):\n{commands}"
             )
-        notify_daemon(resolved, result.generation)
+        notify_daemon(resolved, result.generation, result.store_id, request=request)
     except BaseException as exc:
         _interrupted_after_write(
             exc, resolved, f"the rename of destination {old!r} was applied", None, []

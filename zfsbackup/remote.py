@@ -1,5 +1,6 @@
 """Client-side remote backup: identity management and ZFS stream transfer."""
 
+import contextlib
 import json
 import logging
 import re
@@ -17,6 +18,42 @@ from zfsbackup.config import BackupConfig, Destination, RemoteDatasetConfig, _co
 
 
 logger = logging.getLogger(__name__)
+
+#: Websocket timeouts (seconds). Defined here and imported by `zfsbackup.api`
+#: (never the other way round). Live config reload defers a worker switch for as
+#: long as a transfer is in flight, so a peer that hangs forever would turn
+#: "deferred" into "never"; these bound every blocking socket operation.
+#:
+#: TCP connect plus the websocket handshake.
+WS_CONNECT_TIMEOUT = 30
+#: No progress on one socket operation (a `send_binary`, or the server's
+#: `receive` waiting for the next chunk).
+WS_IDLE_TIMEOUT = 600
+#: The client waiting for the server's status after `done`, while the
+#: server's `zfs receive` may still be committing a large stream.
+WS_FINAL_ACK_TIMEOUT = 3600
+
+
+class NegotiationFailed(Exception):
+    """`_negotiate` could not get an answer from the server. Distinct from a
+    successful negotiation that found no common snapshot (which returns
+    `None` and rightly leads to an initial full send): a failure must never
+    fall through to a send. `reloading` is True for the server's retryable
+    503 ("server is reloading; retry later")."""
+
+    def __init__(self, message: str, reloading: bool = False):
+        super().__init__(message)
+        self.reloading = reloading
+
+
+def _is_reloading(resp) -> bool:
+    """Is `resp` the API's retryable "reloading" 503?"""
+    if resp.status_code != 503:
+        return False
+    try:
+        return bool(resp.json().get('retry'))
+    except Exception:
+        return False
 
 
 class ClientIdentity:
@@ -87,9 +124,18 @@ class RemoteBackupManager:
             return True
 
         latest = snapshots[0]
-        common_snap_name = self._negotiate(
-            base_url, client_id, dsi, snapshots, remote_cfg.destination
-        )
+        try:
+            common_snap_name = self._negotiate(
+                base_url, client_id, dsi, snapshots, remote_cfg.destination
+            )
+        except NegotiationFailed as e:
+            # Never fall through to a send: with no answer we would treat
+            # "unknown" as "no common snapshot" and start a full send.
+            if e.reloading:
+                logger.info(
+                    f"server {base_url} is reloading; skipping {dsi.name} this cycle"
+                )
+            return False
 
         # Resolve the common snapshot object for incremental send
         common_snap = None
@@ -125,6 +171,9 @@ class RemoteBackupManager:
                 json={'client_id': client_id, 'hostname': socket.gethostname()},
                 timeout=30,
             )
+            if _is_reloading(resp):
+                logger.info(f"server {base_url} is reloading; registration skipped this cycle")
+                return False
             resp.raise_for_status()
             return True
         except Exception as e:
@@ -134,6 +183,10 @@ class RemoteBackupManager:
     def _negotiate(
         self, base_url: str, client_id: str, dsi: DatasetInfo, snapshots, destination: str
     ) -> Optional[str]:
+        """The newest snapshot present on both sides, or `None` when the
+        server answered that there is none. Raises `NegotiationFailed` when
+        there was no usable answer (logged at ERROR, except the server's
+        retryable "reloading" 503, which the caller logs at INFO)."""
         try:
             resp = requests.post(
                 f"{base_url}/backup/{client_id}/{dsi.name}/negotiate",
@@ -146,11 +199,15 @@ class RemoteBackupManager:
                 },
                 timeout=30,
             )
+            if _is_reloading(resp):
+                raise NegotiationFailed("server is reloading", reloading=True)
             resp.raise_for_status()
             return resp.json().get('common_snapshot')
+        except NegotiationFailed:
+            raise
         except Exception as e:
             logger.error(f"Negotiation failed for {dsi.name} at {base_url}: {e}")
-            return None
+            raise NegotiationFailed(str(e)) from e
 
     def _transfer(
         self,
@@ -183,33 +240,71 @@ class RemoteBackupManager:
             ws_url += f"?from={common_snap.name}"
 
         ws = websocket.WebSocket()
+        entered = False
+        failed = False
         try:
-            ws.connect(ws_url)
+            ws.connect(ws_url, timeout=WS_CONNECT_TIMEOUT)
+            ws.settimeout(WS_IDLE_TIMEOUT)
             chunk_size = 256 * 1024
             # `stream` is a StreamHandle wrapping the `zfs send` process's
-            # stdout. Its close()/__exit__ waits on the subprocess and raises
+            # stdout. Its close() waits on the subprocess and raises
             # if it exited non-zero, so drain it fully (the while loop below)
-            # *before* the `with` block exits -- closing early could either
+            # *before* closing it -- closing early could either
             # deadlock on a full pipe or reap the process before all data has
-            # been read.
-            with stream:
+            # been read. Closing on an error (a socket timeout in
+            # `send_binary`) is also safe: `close()` closes the read end of
+            # the pipe FIRST, so `zfs send` gets EPIPE/SIGPIPE on its next
+            # write and exits, and only then waits for it.
+            entered = True
+            try:
                 while True:
                     chunk = stream.read(chunk_size)
                     if not chunk:
                         break
                     ws.send_binary(chunk)
+            except BaseException:
+                # Close with a non-zero exit of `zfs send` (which closing its
+                # pipe just killed with SIGPIPE) suppressed, so the ORIGINAL
+                # error -- "timed out" -- is what is re-raised and logged, not
+                # the child's empty failure message that a `with` block's
+                # close() would raise in its place.
+                with contextlib.suppress(Exception):
+                    stream.close()
+                raise
+            # Normal end: closing waits for `zfs send` and raises if it
+            # exited non-zero, exactly as leaving a `with stream:` did.
+            stream.close()
             ws.send(json.dumps({'done': True}))
+            ws.settimeout(WS_FINAL_ACK_TIMEOUT)
             result = json.loads(ws.recv())
             if result.get('status') != 'ok':
                 logger.error(
                     f"Transfer failed for {dsi.name}: {result.get('error', 'unknown error')}"
                 )
+                failed = True
                 return False
         except Exception as e:
             logger.error(f"Transfer failed for {dsi.name} -> {base_url}: {e}")
+            failed = True
             return False
         finally:
-            ws.close()
+            try:
+                if failed:
+                    # A dead or hung peer: do not let the close handshake
+                    # wait out the idle timeout (default 3s inside close()
+                    # only covers the read; the socket timeout covers sends).
+                    ws.settimeout(5)
+                ws.close()
+            except Exception:
+                pass
+            if not entered:
+                # connect() failed or timed out before `with stream:`: the
+                # `zfs send` is already running and would block forever on a
+                # full pipe. Closing the handle EPIPEs it and reaps it.
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
         old_anchor = self.local_manager.get_anchor(dsi, destination)
         self.local_manager.set_anchor(dsi, destination, latest.name)
@@ -230,6 +325,11 @@ class RemoteBackupManager:
                 f"{base_url}/backup/{client_id}/{dsi.name}/resume_token",
                 timeout=10,
             )
+            if _is_reloading(resp):
+                logger.info(
+                    f"server {base_url} is reloading; skipping {dsi.name} this cycle"
+                )
+                return None
             if resp.ok:
                 token = resp.json().get('resume_token')
                 if token:

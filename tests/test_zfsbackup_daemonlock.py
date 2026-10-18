@@ -16,17 +16,19 @@ Mutation counts (scratch copy outside the repo, one change at a time) are
 recorded in the item-15.2(c) hand-off report.
 """
 
+import contextlib
 import errno
 import fcntl
 import logging
 import os
 import signal
 import stat
+import threading
 import time
 
 import pytest
 
-from zfsbackup import daemonlock
+from zfsbackup import daemonlock, procident
 from zfsbackup.config.store import resolve_config_path
 from zfsbackup.daemonlock import (
     DaemonAlreadyRunning,
@@ -79,6 +81,17 @@ def wait_until(predicate, timeout=10.0):
             return True
         time.sleep(0.05)
     return predicate()
+
+
+def assert_v2(raw: bytes, pid, generation):
+    """`raw` is pid-file v2: the unchanged `pid\\ngen\\n` prefix, then a `start=`
+    line (always written by a v2 daemon), and parses back to the same values."""
+    prefix = f"{pid}\n{'' if generation is None else generation}\n".encode()
+    assert raw.startswith(prefix), raw
+    assert raw[len(prefix):].startswith(b"start="), raw
+    parsed = daemonlock._parse(raw)
+    assert (parsed.pid, parsed.generation) == (pid, generation)
+    assert parsed.start is not None
 
 
 def hold_raw(path, content: bytes, mode=0o660):
@@ -287,11 +300,11 @@ class TestParser:
 class TestAcquire:
     def test_creates_the_file_with_pid_and_empty_generation(self, db, lockfile, held):
         held.append(acquire(db))
-        assert read(lockfile) == f"{os.getpid()}\n\n".encode()
+        assert_v2(read(lockfile), os.getpid(), None)
 
     def test_generation_argument_is_written(self, db, lockfile, held):
         held.append(acquire(db, generation=41))
-        assert read(lockfile) == f"{os.getpid()}\n41\n".encode()
+        assert_v2(read(lockfile), os.getpid(), 41)
 
     def test_returns_a_held_lock(self, db, lockfile, held):
         lock = acquire(db)
@@ -358,13 +371,13 @@ class TestAcquire:
     def test_stale_file_is_taken_over_and_overwritten(self, db, lockfile, held):
         lockfile.write_text("99999\n12\n")
         held.append(acquire(db, generation=30))
-        assert read(lockfile) == f"{os.getpid()}\n30\n".encode()
+        assert_v2(read(lockfile), os.getpid(), 30)
 
     def test_overwriting_a_longer_stale_file_leaves_no_tail(self, db, lockfile, held):
         """`pwrite` then `ftruncate`: the old, longer content must not survive."""
         lockfile.write_bytes(b"123456789\n987654321\n" + b"junk" * 200)
         held.append(acquire(db))
-        assert read(lockfile) == f"{os.getpid()}\n\n".encode()
+        assert_v2(read(lockfile), os.getpid(), None)
 
     def test_garbage_stale_file_is_taken_over(self, db, lockfile, held):
         lockfile.write_bytes(b"\xff\xfe\x00garbage")
@@ -374,7 +387,7 @@ class TestAcquire:
     def test_empty_stale_file_is_taken_over(self, db, lockfile, held):
         lockfile.write_bytes(b"")
         held.append(acquire(db))
-        assert read(lockfile) == f"{os.getpid()}\n\n".encode()
+        assert_v2(read(lockfile), os.getpid(), None)
 
     def test_reacquire_after_release_works(self, db, lockfile):
         acquire(db).release()
@@ -532,13 +545,13 @@ class TestAcquireAgainstAnotherProcess:
         assert exc.value.generation == 11
         assert f"pid {holder.pid}" in str(exc.value)
         # And it did not blank the holder's record.
-        assert read(lock_path(db)) == f"{holder.pid}\n11\n".encode()
+        assert_v2(read(lock_path(db)), holder.pid, 11)
 
     def test_kill_9_leaves_a_stale_file_that_probe_ignores(self, db, lockfile, daemon_lock_holder):
         holder = daemon_lock_holder(db, generation=2)
         holder.kill9()
         assert lockfile.exists(), "a kill -9'd daemon leaves its file behind"
-        assert read(lockfile) == f"{holder.pid}\n2\n".encode()
+        assert_v2(read(lockfile), holder.pid, 2)
         assert wait_until(lambda: probe(db) is None)
 
     def test_kill_9_stale_file_is_taken_over_by_the_next_daemon(
@@ -548,7 +561,7 @@ class TestAcquireAgainstAnotherProcess:
         holder.kill9()
         assert wait_until(lambda: probe(db) is None)
         held.append(acquire(db, generation=3))
-        assert read(lockfile) == f"{os.getpid()}\n3\n".encode()
+        assert_v2(read(lockfile), os.getpid(), 3)
 
     def test_a_clean_exit_of_the_holder_drops_the_lock(self, db, daemon_lock_holder):
         holder = daemon_lock_holder(db)
@@ -625,7 +638,7 @@ class TestSetGeneration:
         lock = acquire(db)
         held.append(lock)
         lock.set_generation(8)
-        assert read(lockfile) == f"{os.getpid()}\n8\n".encode()
+        assert_v2(read(lockfile), os.getpid(), 8)
         assert lock.generation == 8
 
     def test_probe_sees_the_new_generation(self, db, held):
@@ -640,13 +653,13 @@ class TestSetGeneration:
         lock = acquire(db, generation=123456789)
         held.append(lock)
         lock.set_generation(5)
-        assert read(lockfile) == f"{os.getpid()}\n5\n".encode()
+        assert_v2(read(lockfile), os.getpid(), 5)
 
     def test_none_clears_the_generation(self, db, lockfile, held):
         lock = acquire(db, generation=5)
         held.append(lock)
         lock.set_generation(None)
-        assert read(lockfile) == f"{os.getpid()}\n\n".encode()
+        assert_v2(read(lockfile), os.getpid(), None)
         assert probe(db).generation is None
 
     def test_zero_is_a_real_generation_not_unset(self, db, held):
@@ -773,7 +786,7 @@ class TestUnlinkRace:
         st_fd = os.fstat(lock._fd)
         st_path = real_stat(lockfile)
         assert (st_fd.st_dev, st_fd.st_ino) == (st_path.st_dev, st_path.st_ino)
-        assert read(lockfile) == f"{os.getpid()}\n6\n".encode()
+        assert_v2(read(lockfile), os.getpid(), 6)
         assert fd_count() == before + 1, "the abandoned descriptor must be closed"
         assert lock.held
 
@@ -1178,7 +1191,7 @@ class TestRelease:
         assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
         assert out == b"held=0", "the lock must not claim to be held in a child"
         assert lockfile.exists()
-        assert read(lockfile) == f"{os.getpid()}\n3\n".encode()
+        assert_v2(read(lockfile), os.getpid(), 3)
         assert lock.held
         assert probe(db) is not None
         # ...and the parent still can.
@@ -1215,7 +1228,7 @@ class TestContextManager:
             with acquire(db, generation=3):
                 raise RuntimeError("boom")
         assert lockfile.exists()
-        assert read(lockfile) == f"{os.getpid()}\n3\n".encode()
+        assert_v2(read(lockfile), os.getpid(), 3)
 
     def test_an_exception_still_drops_the_lock(self, db):
         with pytest.raises(RuntimeError):
@@ -1241,7 +1254,7 @@ class TestContextManager:
             with acquire(db):
                 raise RuntimeError("boom")
         with acquire(db, generation=1):
-            assert read(lockfile) == f"{os.getpid()}\n1\n".encode()
+            assert_v2(read(lockfile), os.getpid(), 1)
         assert not lockfile.exists()
 
     def test_release_inside_the_block_then_clean_exit_is_fine(self, db, lockfile):
@@ -1318,7 +1331,10 @@ class TestDaemonAlreadyRunning:
     def test_daemoninfo_has_no_pid_alive_field(self):
         import dataclasses
 
-        assert [f.name for f in dataclasses.fields(DaemonInfo)] == ["pid", "generation"]
+        assert [f.name for f in dataclasses.fields(DaemonInfo)] == [
+            "pid", "generation", "start", "applied", "target", "rejected", "stable",
+        ]
+        assert "pid_alive" not in {f.name for f in dataclasses.fields(DaemonInfo)}
         assert DaemonInfo(1, 2) == DaemonInfo(pid=1, generation=2)
 
 
@@ -1489,7 +1505,7 @@ class TestContentionWindow:
         assert 0.25 <= elapsed < 1.0, elapsed  # waited for the holder, not the whole window
         assert len(spy.calls) >= 5
         assert all(c == daemonlock._CONTENTION_POLL for c in spy.calls)
-        assert read(lockfile) == f"{os.getpid()}\n4\n".encode()
+        assert_v2(read(lockfile), os.getpid(), 4)
         assert probe(db) == DaemonInfo(os.getpid(), 4)
 
     def test_a_transient_exclusive_holder_released_mid_window_also_succeeds(
@@ -1798,3 +1814,2796 @@ class TestRealDaemonProcess:
         first.send_signal(signal.SIGINT)
         assert first.wait(timeout=SHUTDOWN_TIMEOUT) == 0, _log(first_log)
         assert not lock_path(real_daemon_env).exists()
+
+
+# ===========================================================================
+# Phase 3, item 17.1: pid file v2, the verified reload request, the workers
+# lock.  (Plan: docs/config_db_cli_plan.md, "Phase 3 -- Live config reload".)
+#
+# Platform notes. `request_reload` signals only a process the kernel's lock
+# table proves holds the lock (`procident.flock_write_holders`, Linux only).
+# The matrix below therefore runs the REAL proof on Linux, and on macOS patches
+# `procident.flock_write_holders` to what Linux would answer -- everything else
+# (a real helper process holding a real `LOCK_EX`, a real SIGHUP, a real start
+# token) is genuine on both. Every process signalled is a helper this module
+# started; each is SIGKILLed and reaped at teardown.
+# ===========================================================================
+
+IS_LINUX = sys.platform.startswith("linux")
+
+#: Teardown must kill helpers even while a test has `os.kill` patched.
+_REAL_KILL = os.kill
+
+
+def _hard_kill(proc):
+    try:
+        _REAL_KILL(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:  # pragma: no cover
+        pass
+
+
+def _real_lock_table():
+    """Does this host answer `flock_write_holders` (Linux with /proc/locks)?"""
+    return IS_LINUX and procident.flock_write_holders(0) is not None
+
+
+def _pidfd_works():
+    if not (hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")):
+        return False
+    try:
+        os.close(os.pidfd_open(os.getpid()))
+    except OSError:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Format and parse
+# ---------------------------------------------------------------------------
+
+
+class TestPidFileV2Format:
+    def test_two_line_prefix_is_unchanged_when_start_is_present(self):
+        raw = daemonlock._format(123, 45, "linux:99")
+        assert raw.split(b"\n")[:2] == [b"123", b"45"]
+        assert raw == b"123\n45\nstart=linux:99\n"
+
+    def test_start_none_writes_the_legacy_two_line_form(self):
+        assert daemonlock._format(123, 45) == b"123\n45\n"
+        assert daemonlock._format(123, None) == b"123\n\n"
+        # reload state is meaningless without a start line: never written
+        assert daemonlock._format(123, 45, None, (1, 2), (1, 3), (1, 4)) == b"123\n45\n"
+
+    def test_all_keys(self):
+        raw = daemonlock._format(7, 5, "tok", (1, 5), (1, 6), (2, 9))
+        assert raw == b"7\n5\nstart=tok\napplied=1:5\ntarget=1:6\nrejected=2:9\n"
+
+    def test_unset_keys_are_not_written(self):
+        assert daemonlock._format(7, 5, "tok", (1, 5)) == b"7\n5\nstart=tok\napplied=1:5\n"
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            (123, 45, "linux:99", (1, 2), (3, 4), (5, 6)),
+            (123, None, "linux:99", None, None, None),
+            (123, 0, "darwin:1700000000.000042", (0, 0), None, (4, 7)),
+            (123, 45, "", None, None, None),  # empty start= is present, not absent
+            (123, None, "", None, (1, 1), None),
+        ],
+    )
+    def test_round_trip(self, args):
+        pid, gen, start, applied, target, rejected = args
+        parsed = daemonlock._parse(daemonlock._format(*args))
+        assert tuple(parsed) == (pid, gen, start, applied, target, rejected)
+
+    def test_an_empty_start_value_is_present_and_empty(self):
+        parsed = daemonlock._parse(b"5\n3\nstart=\n")
+        assert parsed.start == ""
+        assert parsed.start is not None
+
+    def test_a_legacy_two_line_file_has_no_start(self):
+        parsed = daemonlock._parse(b"5\n3\n")
+        assert (parsed.pid, parsed.generation) == (5, 3)
+        assert parsed.start is None
+        assert parsed.applied is parsed.target is parsed.rejected is None
+
+    def test_reload_capable_follows_the_presence_of_start(self):
+        assert daemonlock._info(b"5\n3\n").reload_capable is False
+        assert daemonlock._info(b"5\n3\nstart=\n").reload_capable is True
+        assert daemonlock._info(b"5\n3\nstart=tok\n").reload_capable is True
+        assert DaemonInfo(5, 3).reload_capable is False
+        assert DaemonInfo(5, 3, start="").reload_capable is True
+
+    def test_unknown_keys_are_ignored(self):
+        parsed = daemonlock._parse(b"5\n3\nstart=tok\nfuture=whatever\nrejected=1:2\nx=y=z\n")
+        assert (parsed.start, parsed.rejected) == ("tok", (1, 2))
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            b"junk\n",
+            b"\n\n\n",
+            b"=\n",
+            b"=value\n",
+            b"   \n",
+            b"\xff\xfe\x00\n",
+            b"start\n",  # no '='
+        ],
+    )
+    def test_junk_lines_are_ignored_without_hiding_real_ones(self, tail):
+        parsed = daemonlock._parse(b"5\n3\n" + tail + b"start=tok\napplied=1:2\n")
+        assert (parsed.start, parsed.applied) == ("tok", (1, 2))
+
+    @pytest.mark.parametrize(
+        "value",
+        ["abc", "1", "1:", ":1", "a:b", "1:2:3", "-1:2", "1:-2", "1.5:2", "", " ", "1 : 2x"],
+    )
+    def test_malformed_pairs_are_none(self, value):
+        parsed = daemonlock._parse(f"5\n3\nstart=tok\napplied={value}\ntarget={value}\nrejected={value}\n".encode())
+        assert parsed.applied is parsed.target is parsed.rejected is None
+
+    def test_pairs_tolerate_surrounding_whitespace(self):
+        assert daemonlock._parse(b"5\n3\nstart=t\napplied= 1:2 \n").applied == (1, 2)
+
+    def test_the_first_duplicate_wins(self):
+        parsed = daemonlock._parse(b"5\n3\nstart=first\nstart=second\napplied=1:1\napplied=9:9\n")
+        assert parsed.start == "first"
+        assert parsed.applied == (1, 1)
+
+    def test_the_first_duplicate_wins_even_when_malformed(self):
+        parsed = daemonlock._parse(b"5\n3\nstart=tok\napplied=oops\napplied=1:1\n")
+        assert parsed.applied is None
+
+    def test_keys_are_read_from_line_three_on_only(self):
+        parsed = daemonlock._parse(b"start=evil\napplied=1:1\nstart=late\n")
+        assert parsed.pid is None and parsed.generation is None
+        assert parsed.start == "late"  # line 3; lines 1-2 are never key=value
+        assert parsed.applied is None
+
+    @pytest.mark.parametrize(
+        "value",
+        ["has space", "tab\there", "x" * 129, "x" * 4096, "bell\x07", "nul\x00x", "a\x7fb"],
+    )
+    def test_an_unusable_start_value_becomes_empty(self, value):
+        parsed = daemonlock._parse(f"5\n3\nstart={value}\n".encode("utf-8"))
+        assert parsed.start == ""
+
+    def test_non_ascii_in_start_cannot_match_a_real_token(self):
+        """Decoded with replacement characters: never raises, and the result
+        differs from anything `procident` could have produced."""
+        start = daemonlock._parse("5\n3\nstart=uni\u00e9\n".encode("utf-8")).start
+        assert start is not None and start != "uni\u00e9"
+        assert procident.identity(os.getpid(), start) in ("mismatch", "unknown")
+
+    def test_non_ascii_in_start_cannot_match_a_real_token(self):
+        """Decoded with replacement characters: never raises, and the result
+        differs from anything `procident` could have produced."""
+        start = daemonlock._parse(b"5\n3\nstart=uni\xc3\xa9\n").start
+        assert start is not None and start != "uni\u00e9"
+        assert procident.identity(os.getpid(), start) in ("mismatch", "unknown")
+
+    def test_a_start_of_exactly_128_characters_is_kept(self):
+        assert daemonlock._parse(f"5\n3\nstart={'x' * 128}\n".encode()).start == "x" * 128
+
+    def test_surrounding_whitespace_on_start_is_stripped(self):
+        assert daemonlock._parse(b"5\n3\nstart=  tok  \n").start == "tok"
+
+    def test_a_bad_start_makes_the_daemon_unsignallable_not_legacy(self):
+        info = daemonlock._info(b"5\n3\nstart=has space\n")
+        assert info.start == ""
+        assert info.reload_capable is True
+
+    def test_probe_reports_the_v2_fields(self, db, lockfile):
+        fd = hold_raw(lockfile, b"5\n3\nstart=tok\napplied=1:3\ntarget=1:4\nrejected=1:2\n")
+        try:
+            info = probe(db)
+        finally:
+            os.close(fd)
+        assert (info.pid, info.generation, info.start) == (5, 3, "tok")
+        assert (info.applied, info.target, info.rejected) == ((1, 3), (1, 4), (1, 2))
+        assert info.stable is True
+        assert info.reload_capable is True
+
+    def test_probe_reports_a_legacy_daemon_as_not_reload_capable(self, db, lockfile):
+        fd = hold_raw(lockfile, b"5\n3\n")
+        try:
+            info = probe(db)
+        finally:
+            os.close(fd)
+        assert info == DaemonInfo(5, 3)
+        assert info.reload_capable is False
+        assert info.start is None
+
+
+class TestDaemonLockRecordsV2:
+    def test_the_lock_records_its_own_start_token(self, db, held):
+        lock = acquire(db)
+        held.append(lock)
+        assert lock.start == (procident.start_token(os.getpid()) or "")
+        info = probe(db)
+        assert info.start == lock.start
+        assert info.reload_capable is True
+
+    @pytest.mark.skipif(not (IS_LINUX or sys.platform == "darwin"), reason="start tokens exist only on Linux/macOS")
+    def test_the_recorded_token_identifies_this_process(self, db, held):
+        lock = acquire(db)
+        held.append(lock)
+        assert lock.start
+        assert procident.identity(os.getpid(), probe(db).start) == "match"
+
+    def test_a_platform_without_tokens_writes_an_empty_start_line(self, db, lockfile, held, monkeypatch):
+        monkeypatch.setattr(procident, "start_token", lambda pid: None)
+        lock = acquire(db, generation=2)
+        held.append(lock)
+        assert lock.start == ""
+        assert read(lockfile) == f"{os.getpid()}\n2\nstart=\n".encode()
+        assert probe(db).reload_capable is True
+
+    def test_a_new_lock_has_no_reload_state(self, db, held):
+        lock = acquire(db)
+        held.append(lock)
+        assert (lock.applied, lock.target, lock.rejected) == (None, None, None)
+        info = probe(db)
+        assert (info.applied, info.target, info.rejected) == (None, None, None)
+
+    def test_set_generation_keeps_the_start_line(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_generation(12)
+        assert daemonlock._parse(read(lockfile)).start == lock.start
+        assert daemonlock._parse(read(lockfile)).generation == 12
+
+
+class TestSetState:
+    def test_applied_rewrites_the_generation_line(self, db, lockfile, held):
+        lock = acquire(db, generation=1)
+        held.append(lock)
+        lock.set_state(applied=(7, 42))
+        parsed = daemonlock._parse(read(lockfile))
+        assert parsed.generation == 42
+        assert parsed.applied == (7, 42)
+        assert lock.generation == 42
+        assert read(lockfile).split(b"\n")[:2] == [str(os.getpid()).encode(), b"42"]
+
+    def test_omitted_keys_keep_their_value(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(applied=(1, 5), target=(1, 6), rejected=(1, 4))
+        lock.set_state(target=(1, 7))
+        parsed = daemonlock._parse(read(lockfile))
+        assert (parsed.applied, parsed.target, parsed.rejected) == ((1, 5), (1, 7), (1, 4))
+        assert parsed.generation == 5
+
+    def test_none_clears_a_key(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(applied=(1, 5), target=(1, 6), rejected=(1, 4))
+        lock.set_state(target=None)
+        parsed = daemonlock._parse(read(lockfile))
+        assert parsed.target is None
+        assert (parsed.applied, parsed.rejected) == ((1, 5), (1, 4))
+        assert b"target" not in read(lockfile)
+
+    def test_clearing_applied_clears_the_generation_too(self, db, lockfile, held):
+        lock = acquire(db, generation=9)
+        held.append(lock)
+        lock.set_state(applied=(1, 9))
+        lock.set_state(applied=None)
+        parsed = daemonlock._parse(read(lockfile))
+        assert parsed.applied is None
+        assert parsed.generation is None
+        assert lock.generation is None
+
+    def test_shrinking_leaves_no_tail(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(applied=(1, 5), target=(1, 6), rejected=(1, 4))
+        long = read(lockfile)
+        lock.set_state(target=None, rejected=None)
+        short = read(lockfile)
+        assert len(short) < len(long)
+        assert short == daemonlock._format(
+            os.getpid(), 5, lock.start, (1, 5), None, None
+        )
+
+    def test_with_no_arguments_it_rewrites_the_same_content(self, db, lockfile, held):
+        lock = acquire(db, generation=3)
+        held.append(lock)
+        before = read(lockfile)
+        lock.set_state()
+        assert read(lockfile) == before
+
+    def test_the_start_line_survives_every_rewrite(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        for kwargs in ({"applied": (1, 1)}, {"target": (1, 2)}, {"rejected": (1, 3)}, {"target": None}):
+            lock.set_state(**kwargs)
+            assert daemonlock._parse(read(lockfile)).start == lock.start
+
+    def test_probe_sees_the_state(self, db, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(applied=(2, 8), target=(2, 9))
+        info = probe(db)
+        assert (info.generation, info.applied, info.target, info.rejected) == (8, (2, 8), (2, 9), None)
+
+    def test_a_write_failure_only_logs_a_warning(self, db, held, monkeypatch, caplog):
+        lock = acquire(db)
+        held.append(lock)
+
+        def full(fd, data, off):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(daemonlock.os, "pwrite", full)
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.daemonlock"):
+            lock.set_state(applied=(1, 5), target=(1, 6))  # must not raise
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "reload state" in warnings[0].getMessage()
+        assert not [r for r in caplog.records if r.levelno > logging.WARNING]
+        # the in-memory state still moved, so the next successful write is right
+        assert (lock.applied, lock.target, lock.generation) == ((1, 5), (1, 6), 5)
+
+    def test_a_failed_write_is_retried_by_the_next_one(self, db, lockfile, held, monkeypatch):
+        lock = acquire(db)
+        held.append(lock)
+        real = os.pwrite
+        monkeypatch.setattr(daemonlock.os, "pwrite", lambda *a: (_ for _ in ()).throw(OSError(errno.EIO, "io")))
+        lock.set_state(applied=(1, 5))
+        monkeypatch.setattr(daemonlock.os, "pwrite", real)
+        lock.set_state(rejected=(1, 4))
+        parsed = daemonlock._parse(read(lockfile))
+        assert (parsed.applied, parsed.rejected) == ((1, 5), (1, 4))
+
+    def test_an_fsync_failure_is_also_only_a_warning(self, db, held, monkeypatch, caplog):
+        lock = acquire(db)
+        held.append(lock)
+        monkeypatch.setattr(daemonlock.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError(errno.EIO, "io")))
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.daemonlock"):
+            lock.set_state(applied=(1, 5))
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_a_released_lock_ignores_set_state(self, db, lockfile, held):
+        lock = acquire(db)
+        lock.release()
+        lock.set_state(applied=(1, 5))  # no descriptor: nothing to write, nothing raised
+        assert not lockfile.exists()
+
+
+class TestDaemonInfoV2:
+    def test_equality_ignores_the_v2_fields(self):
+        assert DaemonInfo(1, 2, start="a", applied=(1, 2), target=(1, 3), rejected=(1, 4), stable=False) == DaemonInfo(1, 2)
+        assert DaemonInfo(1, 2, start="a") == DaemonInfo(1, 2, start="b")
+
+    def test_equality_still_distinguishes_pid_and_generation(self):
+        assert DaemonInfo(1, 2, start="a") != DaemonInfo(1, 3, start="a")
+        assert DaemonInfo(1, 2, start="a") != DaemonInfo(2, 2, start="a")
+
+    def test_hashing_follows_equality(self):
+        assert hash(DaemonInfo(1, 2, start="a")) == hash(DaemonInfo(1, 2, start="b"))
+
+    def test_defaults(self):
+        info = DaemonInfo(1, 2)
+        assert (info.start, info.applied, info.target, info.rejected, info.stable) == (None, None, None, None, True)
+
+    def test_is_frozen(self):
+        import dataclasses
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            DaemonInfo(1, 2).start = "x"
+
+
+class TestDaemonAlreadyRunningStart:
+    def test_start_defaults_to_none(self, db):
+        assert DaemonAlreadyRunning(lock_path(db), 1234).start is None
+
+    def test_start_is_carried_and_independent_of_the_message(self, db):
+        exc = DaemonAlreadyRunning(lock_path(db), os.getpid(), 3, "linux:1")
+        assert exc.start == "linux:1"
+        assert str(os.getpid()) in str(exc)
+        assert "linux:1" not in str(exc)
+
+    def test_acquire_reports_the_holders_start(self, db, lockfile):
+        fd = hold_raw(lockfile, b"4242\n9\nstart=linux:777\n")
+        try:
+            with pytest.raises(DaemonAlreadyRunning) as exc:
+                acquire(db)
+        finally:
+            os.close(fd)
+        assert (exc.value.pid, exc.value.generation, exc.value.start) == (4242, 9, "linux:777")
+
+    def test_acquire_against_a_legacy_holder_has_no_start(self, db, lockfile):
+        fd = hold_raw(lockfile, b"4242\n9\n")
+        try:
+            with pytest.raises(DaemonAlreadyRunning) as exc:
+                acquire(db)
+        finally:
+            os.close(fd)
+        assert exc.value.start is None
+        assert exc.value.generation == 9
+
+    def test_acquire_against_a_real_v2_holder(self, db, daemon_lock_holder):
+        holder = daemon_lock_holder(db, generation=5)
+        with pytest.raises(DaemonAlreadyRunning) as exc:
+            acquire(db)
+        assert exc.value.pid == holder.pid
+        assert exc.value.start == probe(db).start
+        assert exc.value.start is not None
+
+
+# ---------------------------------------------------------------------------
+# _read_stable: a torn read is never acted on
+# ---------------------------------------------------------------------------
+
+
+def _fake_pread(monkeypatch, torn):
+    """Make the first `len(torn)` whole-file reads return `torn[i]` (a complete
+    read each, ended by an empty chunk), then read for real."""
+    real = os.pread
+    state = {"reads": 0}
+
+    def pread(fd, n, off):
+        if off == 0:
+            state["reads"] += 1
+        index = state["reads"] - 1
+        if index < len(torn):
+            return torn[index] if off == 0 else b""
+        return real(fd, n, off)
+
+    monkeypatch.setattr(daemonlock.os, "pread", pread)
+    return state
+
+
+class TestReadStable:
+    @pytest.fixture
+    def fd(self, tmp_path):
+        path = tmp_path / "f"
+        path.write_bytes(b"hello\n")
+        fd = os.open(str(path), os.O_RDONLY)
+        yield fd
+        os.close(fd)
+
+    def test_a_stable_file_is_returned_stable(self, fd):
+        assert daemonlock._read_stable(fd) == (b"hello\n", True)
+
+    def test_an_empty_file_is_stable(self, tmp_path):
+        path = tmp_path / "empty"
+        path.write_bytes(b"")
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            assert daemonlock._read_stable(fd) == (b"", True)
+        finally:
+            os.close(fd)
+
+    def test_a_file_larger_than_the_read_chunk_is_read_whole(self, tmp_path):
+        path = tmp_path / "big"
+        path.write_bytes(b"x" * 9000)
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            assert daemonlock._read_stable(fd) == (b"x" * 9000, True)
+        finally:
+            os.close(fd)
+
+    def test_one_or_two_torn_reads_are_retried(self, fd, monkeypatch):
+        for torn in ([b"A\n"], [b"A\n", b"B\n"]):
+            _fake_pread(monkeypatch, torn)
+            assert daemonlock._read_stable(fd) == (b"hello\n", True)
+
+    def test_a_read_that_never_settles_is_unstable(self, fd, monkeypatch):
+        _fake_pread(monkeypatch, [b"A\n", b"B\n", b"A\n", b"B\n", b"A\n", b"B\n"])
+        content, stable = daemonlock._read_stable(fd)
+        assert stable is False
+        assert content in (b"A\n", b"B\n")  # returned for display only
+
+    def test_it_gives_up_after_a_bounded_number_of_reads(self, fd, monkeypatch):
+        state = _fake_pread(monkeypatch, [bytes([65 + i % 2]) for i in range(1000)])
+        daemonlock._read_stable(fd)
+        assert state["reads"] == daemonlock._STABLE_READS + 1
+
+    def test_probe_marks_a_torn_read_unstable(self, db, held, monkeypatch):
+        lock = acquire(db)
+        held.append(lock)
+        _fake_pread(monkeypatch, [b"1\n2\nstart=a\n", b"1\n3\nstart=b\n"] * 3)
+        assert probe(db).stable is False
+
+    def test_probe_of_a_stable_file_is_stable(self, db, held):
+        held.append(acquire(db))
+        assert probe(db).stable is True
+
+
+# ---------------------------------------------------------------------------
+# request_reload: helpers
+# ---------------------------------------------------------------------------
+
+_SUPERVISOR_HELPER = r'''
+import fcntl, os, signal, sys, time
+from zfsbackup import daemonlock, procident
+
+db, marker, spec, gen = sys.argv[1:5]
+
+
+def note(tag):
+    def handler(signum, frame):
+        with open(marker, "a") as fh:
+            fh.write(tag + "\n")
+    return handler
+
+
+signal.signal(signal.SIGHUP, note("HUP"))
+signal.signal(signal.SIGUSR1, note("SYNC"))
+
+if spec == "real":
+    lock = daemonlock.acquire(db, generation=int(gen) if gen else None)
+else:
+    content = spec.replace("{pid}", str(os.getpid())).replace("{start}", procident.start_token(os.getpid()) or "")
+    fd = os.open(str(daemonlock.lock_path(db)), os.O_RDWR | os.O_CREAT, 0o660)
+    os.write(fd, content.encode())
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("ready", os.getpid(), flush=True)
+for _ in range(600):  # bounded: never outlives a forgotten teardown
+    time.sleep(0.2)
+'''
+
+_WORKERS_HELPER = r'''
+import sys, time
+from zfsbackup import daemonlock
+
+fd = daemonlock.hold_workers_lock(sys.argv[1])
+print("ready" if fd is not None else "failed", flush=True)
+for _ in range(600):
+    time.sleep(0.2)
+'''
+
+
+class _Helper:
+    """A real process holding the daemon lock (or a forged copy of its file)."""
+
+    def __init__(self, proc, pid, marker):
+        self.proc = proc
+        self.pid = pid
+        self.marker = marker
+
+    def lines(self):
+        try:
+            return Path(self.marker).read_text().split()
+        except FileNotFoundError:
+            return []
+
+    def wait_for(self, tag, timeout=10):
+        return wait_until(lambda: tag in self.lines(), timeout)
+
+    def sync(self, timeout=10):
+        """Barrier: SIGUSR1 sorts after SIGHUP, so once it has been handled any
+        SIGHUP sent before this call has been too."""
+        _REAL_KILL(self.proc.pid, signal.SIGUSR1)
+        assert self.wait_for("SYNC", timeout), "helper never handled SIGUSR1"
+        return self.lines()
+
+    def got_hup(self):
+        return "HUP" in self.sync()
+
+
+@pytest.fixture
+def start_helper(tmp_path):
+    """`start_helper(db, spec="real", gen=3)` -> `_Helper`. `spec` is either
+    "real" (a genuine `acquire`) or the literal pid-file content to forge, with
+    `{pid}`/`{start}` standing for the helper's own pid/token."""
+    from _hermetic import hermetic_env
+
+    procs = []
+
+    def start(db, spec="real", gen=3):
+        marker = str(tmp_path / f"marker{len(procs)}")
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _SUPERVISOR_HELPER, str(db), marker, spec, "" if gen is None else str(gen)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=hermetic_env(),
+            cwd=str(REPO_ROOT),
+        )
+        procs.append(proc)
+        line = proc.stdout.readline().split()
+        assert line and line[0] == "ready", f"helper failed to start: {line!r}"
+        return _Helper(proc, int(line[1]), marker)
+
+    yield start
+    for proc in procs:
+        _hard_kill(proc)
+        proc.stdout.close()
+
+
+@pytest.fixture
+def plain_process():
+    """`plain_process()` -> a started, signal-free `python` sleeper (a decoy or
+    a pid to let die). Killed and reaped at teardown."""
+    from _hermetic import hermetic_env
+
+    procs = []
+
+    def start():
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time\nfor _ in range(600): time.sleep(0.2)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=hermetic_env(),
+            cwd=str(REPO_ROOT),
+        )
+        procs.append(proc)
+        return proc
+
+    yield start
+    for proc in procs:
+        _hard_kill(proc)
+
+
+@pytest.fixture
+def proof(monkeypatch):
+    """The lock-holder proof. Real on Linux; on other hosts patched to answer
+    what Linux would (`proof(pid, ...)` names the holders). Also records the
+    inode `request_reload` asked about, in `proof.inodes`."""
+    inodes = []
+    use_real = _real_lock_table()
+
+    def install(*pids):
+        if use_real:
+            return
+
+        def fake(fd):
+            inodes.append(os.fstat(fd).st_ino)
+            return set(pids)
+
+        monkeypatch.setattr(procident, "flock_write_holders", fake)
+
+    install.inodes = inodes
+    install.real = use_real
+    return install
+
+
+class SignalSpy:
+    """Records every way a signal could leave this process. With
+    `passthrough=False` nothing is delivered (use that whenever the target is
+    not a helper we started)."""
+
+    def __init__(self, monkeypatch, passthrough=True):
+        self.calls = []
+        self.passthrough = passthrough
+        spy = self
+
+        real_kill, real_killpg = os.kill, os.killpg
+        real_raise = signal.raise_signal
+        real_pidfd_send = getattr(signal, "pidfd_send_signal", None)
+
+        def kill(pid, sig):
+            spy.calls.append(("kill", pid, sig))
+            if spy.passthrough:
+                return real_kill(pid, sig)
+
+        def killpg(pgid, sig):
+            spy.calls.append(("killpg", pgid, sig))
+            if spy.passthrough:
+                return real_killpg(pgid, sig)
+
+        def raise_signal(sig):
+            spy.calls.append(("raise_signal", os.getpid(), sig))
+
+        monkeypatch.setattr(os, "kill", kill)
+        monkeypatch.setattr(os, "killpg", killpg)
+        monkeypatch.setattr(signal, "raise_signal", raise_signal)
+        if real_pidfd_send is not None:
+
+            def pidfd_send_signal(pidfd, sig, *a, **kw):
+                spy.calls.append(("pidfd_send_signal", pidfd, sig))
+                if spy.passthrough:
+                    return real_pidfd_send(pidfd, sig, *a, **kw)
+
+            monkeypatch.setattr(signal, "pidfd_send_signal", pidfd_send_signal)
+
+    def signals(self):
+        return [sig for _, _, sig in self.calls]
+
+
+@pytest.fixture
+def spy(monkeypatch):
+    return SignalSpy(monkeypatch)
+
+
+@pytest.fixture
+def no_signal(monkeypatch):
+    """A spy that delivers nothing, and no pidfd route: only `os.kill` exists."""
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+    return SignalSpy(monkeypatch, passthrough=False)
+
+
+@pytest.fixture
+def kill_path(monkeypatch):
+    """Force the `os.kill` route (no pidfd), delivering for real."""
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+
+
+def _as_reload(result):
+    assert isinstance(result, daemonlock.ReloadRequest)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# request_reload: the outcome matrix (real helper processes)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestRequestReloadOutcomes:
+    def test_a_genuine_supervisor_is_signalled(self, db, start_helper, proof, spy):
+        helper = start_helper(db, gen=3)
+        proof(helper.pid)
+        result = _as_reload(daemonlock.request_reload(db))
+        assert result.outcome == "signalled"
+        assert result.pid == helper.pid
+        assert isinstance(result.info, DaemonInfo)
+        assert (result.info.pid, result.info.generation) == (helper.pid, 3)
+        assert str(helper.pid) in result.detail
+        assert helper.wait_for("HUP"), "the supervisor never received SIGHUP"
+
+    def test_it_accepts_a_resolved_config_path(self, db, start_helper, proof, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        result = daemonlock.request_reload(resolve_config_path(str(db)))
+        assert result.outcome == "signalled"
+        assert helper.wait_for("HUP")
+
+    def test_signalling_twice_delivers_twice(self, db, start_helper, proof, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        assert helper.wait_for("HUP")
+
+    def test_a_wrong_start_token_is_supervisor_gone_and_nothing_is_sent(self, db, start_helper, proof, spy):
+        helper = start_helper(db, spec="{pid}\n3\nstart=bogus:1\n")
+        proof(helper.pid)  # the holder proof passes; only the identity check can stop it
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "supervisor-gone"
+        assert result.pid == helper.pid
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+    @pytest.mark.skipif(not (IS_LINUX or sys.platform == "darwin"), reason="needs start tokens")
+    def test_a_decoy_with_its_own_real_token_that_does_not_hold_the_lock_is_not_signalled(
+        self, db, start_helper, plain_process, proof, spy
+    ):
+        decoy = plain_process()
+        token = procident.start_token(decoy.pid)
+        assert token
+        # The lock is held by `holder`; the (group-writable) file names the decoy
+        # and the decoy's genuine token. Identity would match; only the proof stops it.
+        holder = start_helper(db, spec=f"{decoy.pid}\n3\nstart={token}\n")
+        proof(holder.pid)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "supervisor-gone"
+        assert result.pid == decoy.pid
+        assert spy.calls == []
+        assert decoy.poll() is None, "the decoy must still be alive"
+        assert not holder.got_hup()
+
+    def test_a_pid_that_is_gone_is_supervisor_gone(self, db, start_helper, plain_process, proof, spy):
+        victim = plain_process()
+        token = procident.start_token(victim.pid) or "linux:1"
+        dead = victim.pid
+        victim.kill()
+        victim.wait(timeout=10)
+        spy.calls.clear()  # the victim's own kill is not request_reload's
+        holder = start_helper(db, spec=f"{dead}\n3\nstart={token}\n")
+        proof(holder.pid)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "supervisor-gone"
+        assert result.pid == dead
+        assert spy.calls == []
+        assert not holder.got_hup()
+
+    def test_a_legacy_daemon_is_legacy_and_nothing_is_sent(self, db, start_helper, proof, spy):
+        helper = start_helper(db, spec="{pid}\n3\n")
+        proof(helper.pid)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "legacy"
+        assert result.pid == helper.pid
+        assert result.info.reload_capable is False
+        assert "restart" in result.detail
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+    def test_an_empty_start_is_unverified(self, db, start_helper, proof, spy):
+        helper = start_helper(db, spec="{pid}\n3\nstart=\n")
+        proof(helper.pid)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "unverified"
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+    def test_a_malformed_start_is_unverified_not_legacy(self, db, start_helper, proof, spy):
+        helper = start_helper(db, spec="{pid}\n3\nstart=has space\n")
+        proof(helper.pid)
+        assert daemonlock.request_reload(db).outcome == "unverified"
+        assert not helper.got_hup()
+
+    def test_a_lock_table_that_cannot_be_read_is_unverified(self, db, start_helper, monkeypatch, spy):
+        helper = start_helper(db)
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: None)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "unverified"
+        assert "Linux" in result.detail
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+    def test_an_empty_lock_table_means_the_pid_is_not_the_holder(self, db, start_helper, monkeypatch, spy):
+        helper = start_helper(db)
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: set())
+        assert daemonlock.request_reload(db).outcome == "supervisor-gone"
+        assert not helper.got_hup()
+
+    def test_the_proof_is_handed_the_open_pid_file_descriptor(self, db, lockfile, start_helper, proof, monkeypatch, spy):
+        """It takes an FD (so the device can be read from the mount), and the fd
+        is the pid file's own."""
+        helper = start_helper(db)
+        proof(helper.pid)  # (on Linux: the real table)
+        inner = procident.flock_write_holders
+        asked = []
+
+        def recording(fd):
+            assert isinstance(fd, int) and not isinstance(fd, bool)
+            st = os.fstat(fd)
+            asked.append((st.st_dev, st.st_ino, stat.S_ISREG(st.st_mode)))
+            return inner(fd)
+
+        monkeypatch.setattr(procident, "flock_write_holders", recording)
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        real = os.stat(lockfile)
+        assert asked == [(real.st_dev, real.st_ino, True)]
+
+    def test_identity_unknown_is_unverified_and_nothing_is_sent(self, db, start_helper, proof, monkeypatch, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        monkeypatch.setattr(procident, "identity", lambda pid, token: "unknown")
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "unverified"
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+    @pytest.mark.parametrize("ident", ["gone", "mismatch"])
+    def test_identity_gone_or_mismatch_is_supervisor_gone(self, db, start_helper, proof, monkeypatch, spy, kill_path, ident):
+        """No pidfd: 'gone' is trusted (`hidepid` is only ruled out by a pidfd)."""
+        helper = start_helper(db)
+        proof(helper.pid)
+        monkeypatch.setattr(procident, "identity", lambda pid, token: ident)
+        assert daemonlock.request_reload(db).outcome == "supervisor-gone"
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+    def test_skip_if_applied_equal_sends_nothing(self, db, lockfile, start_helper, proof, spy):
+        helper = start_helper(db, spec="{pid}\n3\nstart={start}\napplied=1:3\n")
+        proof(helper.pid)
+        result = daemonlock.request_reload(db, skip_if_applied=(1, 3))
+        assert result.outcome == "already-applied"
+        assert result.info.applied == (1, 3)
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+    def test_skip_if_applied_accepts_a_list(self, db, start_helper, proof, spy):
+        helper = start_helper(db, spec="{pid}\n3\nstart={start}\napplied=1:3\n")
+        proof(helper.pid)
+        assert daemonlock.request_reload(db, skip_if_applied=[1, 3]).outcome == "already-applied"
+
+    @pytest.mark.parametrize("skip", [(1, 4), (2, 3), (0, 0)])
+    def test_skip_if_applied_that_differs_still_signals(self, db, start_helper, proof, spy, skip):
+        helper = start_helper(db, spec="{pid}\n3\nstart={start}\napplied=1:3\n")
+        proof(helper.pid)
+        assert daemonlock.request_reload(db, skip_if_applied=skip).outcome == "signalled"
+        assert helper.wait_for("HUP")
+
+    def test_skip_if_applied_with_nothing_applied_still_signals(self, db, start_helper, proof, spy):
+        helper = start_helper(db)  # real daemon, no applied= yet
+        proof(helper.pid)
+        assert daemonlock.request_reload(db, skip_if_applied=(1, 3)).outcome == "signalled"
+
+    def test_skip_if_applied_never_beats_a_legacy_verdict(self, db, start_helper, proof, spy):
+        helper = start_helper(db, spec="{pid}\n3\n")
+        proof(helper.pid)
+        assert daemonlock.request_reload(db, skip_if_applied=(1, 3)).outcome == "legacy"
+
+    def test_a_real_daemons_set_state_is_honoured_by_skip_if_applied(self, db, start_helper, proof, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        # the helper is a separate process; mutate its file the way set_state would
+        raw = daemonlock._format(helper.pid, 8, probe(db).start, (1, 8))
+        fd = os.open(str(lock_path(db)), os.O_RDWR)
+        try:
+            os.pwrite(fd, raw, 0)
+            os.ftruncate(fd, len(raw))
+        finally:
+            os.close(fd)
+        assert daemonlock.request_reload(db, skip_if_applied=(1, 8)).outcome == "already-applied"
+
+    def test_no_lock_held_is_no_daemon(self, db, lockfile, spy):
+        lockfile.write_bytes(b"4242\n3\nstart=linux:1\n")  # a stale file
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "no-daemon"
+        assert result.pid is None
+        assert spy.calls == []
+
+    def test_no_lock_held_leaves_the_file_and_no_lock_behind(self, db, lockfile, held):
+        lockfile.write_bytes(b"4242\n3\nstart=linux:1\n")
+        before = read(lockfile)
+        daemonlock.request_reload(db)
+        assert read(lockfile) == before
+        held.append(acquire(db))  # the probe's shared lock was released
+
+    def test_a_missing_file_is_no_daemon(self, db, spy):
+        assert daemonlock.request_reload(db).outcome == "no-daemon"
+        assert spy.calls == []
+
+    def test_a_missing_directory_is_no_daemon(self, tmp_path, spy):
+        assert daemonlock.request_reload(tmp_path / "nodir" / "config.db").outcome == "no-daemon"
+
+    def test_a_path_component_that_is_a_file_is_no_daemon(self, tmp_path):
+        (tmp_path / "afile").write_text("x")
+        assert daemonlock.request_reload(tmp_path / "afile" / "config.db").outcome == "no-daemon"
+
+    def test_request_reload_creates_nothing(self, db, lockfile):
+        daemonlock.request_reload(db)
+        assert not lockfile.exists()
+
+    def test_eacces_on_open_is_error(self, db, lockfile, monkeypatch, spy):
+        lockfile.write_bytes(b"1\n\n")
+        real_open = os.open
+
+        def deny(path, flags, *a, **kw):
+            if str(path).endswith(".daemon.pid"):
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_open(path, flags, *a, **kw)
+
+        monkeypatch.setattr(daemonlock.os, "open", deny)
+        result = _as_reload(daemonlock.request_reload(db))
+        assert result.outcome == "error"
+        assert "Permission denied" in result.detail
+        assert spy.calls == []
+
+    @pytest.mark.skipif(IS_ROOT, reason="root opens any file")
+    def test_an_unreadable_real_file_is_error(self, db, lockfile):
+        lockfile.write_bytes(b"1\n\n")
+        lockfile.chmod(0)
+        try:
+            assert daemonlock.request_reload(db).outcome == "error"
+        finally:
+            lockfile.chmod(0o600)
+
+    def test_a_symlinked_pid_file_is_error_and_never_followed(self, db, lockfile, tmp_path, spy):
+        target = tmp_path / "elsewhere"
+        target.write_bytes(b"1\n\nstart=x\n")
+        os.symlink(target, lockfile)
+        assert daemonlock.request_reload(db).outcome == "error"
+        assert spy.calls == []
+
+    def test_a_flock_failure_other_than_contention_is_error(self, db, lockfile, monkeypatch, spy):
+        lockfile.write_bytes(b"1\n\n")
+
+        def eio(fd, op):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(daemonlock.fcntl, "flock", eio)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "error"
+        assert spy.calls == []
+
+    def test_an_unexpected_exception_is_still_a_reload_request(self, db, lockfile, monkeypatch):
+        lockfile.write_bytes(b"1\n\n")
+
+        def boom(path, flags, *a, **kw):
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(daemonlock.os, "open", boom)
+        result = _as_reload(daemonlock.request_reload(db))
+        assert result.outcome == "error"
+        assert "kaboom" in result.detail
+
+    def test_an_exception_in_the_proof_is_error_not_a_raise(self, db, start_helper, monkeypatch, spy):
+        helper = start_helper(db)
+
+        def boom(fd):
+            raise RuntimeError("proof exploded")
+
+        monkeypatch.setattr(procident, "flock_write_holders", boom)
+        result = _as_reload(daemonlock.request_reload(db))
+        assert result.outcome == "error"
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+    def test_every_documented_outcome_is_in_the_reload_request_docstring(self):
+        doc = daemonlock.ReloadRequest.__doc__
+        for outcome in (
+            "no-daemon", "already-applied", "signalled", "not-permitted",
+            "legacy", "supervisor-gone", "unverified", "error",
+        ):
+            assert f"`{outcome}`" in doc
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _real_lock_table(), reason="the real lock proof needs Linux /proc/locks")
+class TestRequestReloadRealLockProof:
+    """[L] No patching of the proof: the kernel's lock table decides."""
+
+    def test_a_genuine_supervisor_is_proven_and_signalled(self, db, start_helper, spy):
+        helper = start_helper(db)
+        assert helper.pid in procident.flock_write_holders(os.stat(lock_path(db)).st_ino)
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        assert helper.wait_for("HUP")
+
+    def test_a_forged_file_naming_another_process_is_refused_by_the_proof(self, db, start_helper, plain_process, spy):
+        decoy = plain_process()
+        token = procident.start_token(decoy.pid)
+        holder = start_helper(db, spec=f"{decoy.pid}\n3\nstart={token}\n")
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "supervisor-gone"
+        assert "does not hold the daemon lock" in result.detail
+        assert decoy.poll() is None
+        assert not holder.got_hup()
+
+
+# ---------------------------------------------------------------------------
+# request_reload: the pid guard, the signal contract, and the descriptor budget
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestRequestReloadNeverSignalsTheWrongThing:
+    @pytest.fixture
+    def force_everything_else_to_pass(self, monkeypatch):
+        """Make the holder proof and the identity check say yes to ANY pid, so
+        the pid guard is the only thing standing between the file and a signal."""
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: set(range(-5, 2**22)) | {os.getpid()})
+        monkeypatch.setattr(procident, "identity", lambda pid, token: "match")
+
+    @pytest.mark.parametrize("pid", [0, 1, -1, -2, -4242])
+    def test_pids_zero_one_and_negative_are_never_signalled(
+        self, db, lockfile, force_everything_else_to_pass, no_signal, pid
+    ):
+        fd = hold_raw(lockfile, f"{pid}\n3\nstart=tok\n".encode())
+        try:
+            result = daemonlock.request_reload(db)
+        finally:
+            os.close(fd)
+        assert result.outcome == "unverified"
+        assert f"refusing to signal pid {pid}" in result.detail
+        assert no_signal.calls == []
+
+    def test_our_own_pid_is_never_signalled(self, db, lockfile, force_everything_else_to_pass, no_signal):
+        fd = hold_raw(lockfile, f"{os.getpid()}\n3\nstart=tok\n".encode())
+        try:
+            result = daemonlock.request_reload(db)
+        finally:
+            os.close(fd)
+        assert result.outcome == "unverified"
+        assert f"refusing to signal pid {os.getpid()}" in result.detail
+        assert no_signal.calls == []
+
+    def test_our_own_lock_is_not_signalled_even_when_it_is_the_holder(self, db, held, force_everything_else_to_pass, no_signal):
+        held.append(acquire(db))
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "unverified"
+        assert no_signal.calls == []
+
+    def test_a_pid_beyond_the_pid_range_is_an_error_not_a_raise(self, db, lockfile, force_everything_else_to_pass, monkeypatch):
+        """`os.kill` would raise OverflowError; the contract is that nothing is."""
+        monkeypatch.delattr(os, "pidfd_open", raising=False)
+        fd = hold_raw(lockfile, f"{2**70}\n3\nstart=tok\n".encode())
+        try:
+            result = _as_reload(daemonlock.request_reload(db))
+        finally:
+            os.close(fd)
+        assert result.outcome in ("error", "supervisor-gone", "unverified")
+
+    def test_the_only_signal_sent_is_sighup_to_exactly_the_supervisor(self, db, start_helper, proof, kill_path, monkeypatch):
+        helper = start_helper(db)
+        proof(helper.pid)
+        spy = SignalSpy(monkeypatch)
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        calls = list(spy.calls)
+        assert calls == [("kill", helper.pid, signal.SIGHUP)]
+        assert helper.wait_for("HUP")
+
+    def test_never_a_process_group_nor_any_other_signal(self, db, start_helper, proof, monkeypatch):
+        helper = start_helper(db)
+        proof(helper.pid)
+        spy = SignalSpy(monkeypatch)
+        for _ in range(3):
+            daemonlock.request_reload(db)
+        assert spy.calls, "nothing was signalled at all"
+        assert {kind for kind, _, _ in spy.calls} <= {"kill", "pidfd_send_signal"}
+        assert not [c for c in spy.calls if c[0] == "killpg"]
+        assert set(spy.signals()) == {signal.SIGHUP}
+        assert all(pid > 1 for kind, pid, _ in spy.calls if kind == "kill")
+        assert all(pid == helper.pid for kind, pid, _ in spy.calls if kind == "kill")
+
+    def test_the_signal_is_not_sent_to_a_negative_pid(self, db, start_helper, proof, monkeypatch):
+        """`os.kill(-pid)` would be a process group; the pid is passed as read."""
+        helper = start_helper(db)
+        proof(helper.pid)
+        spy = SignalSpy(monkeypatch)
+        daemonlock.request_reload(db)
+        assert all(pid >= 0 for _, pid, _ in spy.calls)
+
+    def test_no_signal_is_sent_when_the_lock_is_not_held(self, db, lockfile, monkeypatch):
+        lockfile.write_bytes(f"{os.getpid()}\n3\nstart=tok\n".encode())
+        spy = SignalSpy(monkeypatch, passthrough=False)
+        daemonlock.request_reload(db)
+        assert spy.calls == []
+
+    def test_no_descriptor_is_leaked_in_any_outcome(self, db, lockfile, start_helper, plain_process, proof):
+        helper = start_helper(db)
+        proof(helper.pid)
+        before = fd_count()
+        for _ in range(5):
+            assert daemonlock.request_reload(db).outcome == "signalled"
+            assert daemonlock.request_reload(db, skip_if_applied=(9, 9)).outcome == "signalled"
+        assert fd_count() == before
+        # a missing file, a stale file, an unreadable one
+        other = db.parent / "other.db"
+        for _ in range(5):
+            daemonlock.request_reload(other)
+        lock_path(other).write_bytes(b"1\n\n")
+        for _ in range(5):
+            assert daemonlock.request_reload(other).outcome == "no-daemon"
+        assert fd_count() == before
+        helper.sync()
+
+    def test_no_descriptor_is_leaked_on_the_refusal_paths(self, db, start_helper, proof, monkeypatch):
+        helper = start_helper(db, spec="{pid}\n3\nstart=bogus:1\n")
+        proof(helper.pid)
+        before = fd_count()
+        for _ in range(5):
+            assert daemonlock.request_reload(db).outcome == "supervisor-gone"
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: None)
+        for _ in range(5):
+            assert daemonlock.request_reload(db).outcome == "unverified"
+        assert fd_count() == before
+
+    def test_no_descriptor_is_leaked_when_it_raises_internally(self, db, start_helper, monkeypatch):
+        start_helper(db)
+        before = fd_count()
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: 1 / 0)
+        for _ in range(5):
+            assert daemonlock.request_reload(db).outcome == "error"
+        assert fd_count() == before
+
+    def test_the_pid_file_is_opened_read_only_nofollow_and_cloexec(self, db, start_helper, proof, monkeypatch):
+        helper = start_helper(db)
+        proof(helper.pid)
+        seen = []
+        real_open = os.open
+
+        def spying(path, flags, *a, **kw):
+            seen.append(flags)
+            return real_open(path, flags, *a, **kw)
+
+        monkeypatch.setattr(daemonlock.os, "open", spying)
+        daemonlock.request_reload(db)
+        (flags,) = seen
+        assert flags & os.O_ACCMODE == os.O_RDONLY
+        assert flags & os.O_NOFOLLOW and flags & os.O_CLOEXEC
+        assert not flags & (os.O_CREAT | os.O_TRUNC)
+
+    def test_it_writes_nothing_to_the_pid_file(self, db, lockfile, start_helper, proof):
+        helper = start_helper(db)
+        proof(helper.pid)
+        before = (read(lockfile), lockfile.stat().st_mtime_ns)
+        daemonlock.request_reload(db)
+        assert (read(lockfile), lockfile.stat().st_mtime_ns) == before
+
+
+@pytest.mark.integration
+class TestRequestReloadTornReads:
+    def test_a_torn_read_is_unverified_and_nothing_is_sent(self, db, start_helper, proof, monkeypatch):
+        helper = start_helper(db)
+        proof(helper.pid)
+        good = read(lock_path(db))
+        spy = SignalSpy(monkeypatch)
+        # Two versions that each name the REAL, signallable helper: acting on
+        # either read would deliver a SIGHUP.
+        _fake_pread(monkeypatch, [good, good + b"applied=1:1\n"] * 4)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "unverified"
+        assert result.info.stable is False
+        assert "consistently" in result.detail
+        assert spy.calls == []
+        monkeypatch.undo()
+        assert not helper.got_hup()
+
+    @pytest.mark.parametrize("torn", [1, 2])
+    def test_a_transient_tear_is_retried_and_then_acted_on(self, db, start_helper, proof, monkeypatch, kill_path, torn):
+        helper = start_helper(db)
+        proof(helper.pid)
+        good = read(lock_path(db))
+        _fake_pread(monkeypatch, [b"99999999\n1\nstart=torn\n", good + b"applied=1:1\n"][:torn])
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "signalled"
+        assert result.info.stable is True
+
+    def test_a_torn_read_that_would_otherwise_say_legacy_is_still_unverified(self, db, start_helper, monkeypatch):
+        helper = start_helper(db)
+        _fake_pread(monkeypatch, [b"5\n3\n", b"5\n4\n"] * 4)
+        assert daemonlock.request_reload(db).outcome == "unverified"
+
+    def test_an_empty_file_with_the_lock_held_is_unverified(self, db, lockfile):
+        fd = hold_raw(lockfile, b"")
+        try:
+            result = daemonlock.request_reload(db)
+        finally:
+            os.close(fd)
+        assert result.outcome == "unverified"
+        assert result.pid is None
+
+    def test_garbage_with_the_lock_held_is_unverified(self, db, lockfile):
+        fd = hold_raw(lockfile, b"garbage\nmore\n")
+        try:
+            assert daemonlock.request_reload(db).outcome == "unverified"
+        finally:
+            os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# request_reload: signal delivery routes (os.kill vs pidfd)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestRequestReloadKillRoute:
+    """`os.pidfd_open` deleted: the portable path (macOS, old kernels)."""
+
+    def test_os_kill_delivers_sighup(self, db, start_helper, proof, kill_path):
+        helper = start_helper(db)
+        proof(helper.pid)
+        assert not hasattr(os, "pidfd_open")
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        assert helper.wait_for("HUP")
+
+    @pytest.mark.parametrize(
+        "exc, outcome",
+        [
+            (PermissionError(errno.EPERM, "Operation not permitted"), "not-permitted"),
+            (ProcessLookupError(errno.ESRCH, "No such process"), "supervisor-gone"),
+            (OSError(errno.EINVAL, "Invalid argument"), "error"),
+        ],
+    )
+    def test_kill_failures_map_to_outcomes(self, db, start_helper, proof, no_signal, monkeypatch, exc, outcome):
+        helper = start_helper(db)
+        proof(helper.pid)
+
+        def refuse(pid, sig):
+            no_signal.calls.append(("kill", pid, sig))
+            raise exc
+
+        monkeypatch.setattr(os, "kill", refuse)
+        result = _as_reload(daemonlock.request_reload(db))
+        assert result.outcome == outcome
+        assert result.pid == helper.pid
+        assert no_signal.calls == [("kill", helper.pid, signal.SIGHUP)]
+
+    def test_not_permitted_names_the_pid(self, db, start_helper, proof, no_signal, monkeypatch):
+        helper = start_helper(db)
+        proof(helper.pid)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: (_ for _ in ()).throw(PermissionError(errno.EPERM, "Operation not permitted")))
+        assert str(helper.pid) in daemonlock.request_reload(db).detail
+
+
+class _FakePidfd:
+    """`os.pidfd_open` / `signal.pidfd_send_signal` stand-ins that work on every
+    host: the 'pidfd' is a real descriptor (/dev/null) so leaks are observable,
+    and sending through it delivers to the helper it was opened for."""
+
+    def __init__(self, monkeypatch, order):
+        self.opened = []
+        self.sent = []
+        self.open_error = None
+        self.send_error = None
+        fake = self
+
+        def pidfd_open(pid, flags=0):
+            order.append("pidfd_open")
+            if fake.open_error is not None:
+                raise fake.open_error
+            fd = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+            fake.opened.append((fd, pid))
+            return fd
+
+        def pidfd_send_signal(pidfd, sig, *a, **kw):
+            fake.sent.append((pidfd, sig))
+            if fake.send_error is not None:
+                raise fake.send_error
+            (pid,) = [p for fd, p in fake.opened if fd == pidfd]
+            fake.real_kill(pid, sig)
+
+        self.real_kill = os.kill
+        monkeypatch.setattr(os, "pidfd_open", pidfd_open, raising=False)
+        monkeypatch.setattr(signal, "pidfd_send_signal", pidfd_send_signal, raising=False)
+
+    def fd_is_closed(self, fd):
+        try:
+            os.fstat(fd)
+        except OSError:
+            return True
+        return False
+
+
+@pytest.mark.integration
+class TestRequestReloadPidfdRoute:
+    @pytest.fixture
+    def order(self):
+        return []
+
+    @pytest.fixture
+    def pidfd(self, monkeypatch, order):
+        return _FakePidfd(monkeypatch, order)
+
+    @pytest.fixture
+    def ordered_proof(self, monkeypatch, order):
+        def install(*pids):
+            def fake(fd):
+                order.append("holders")
+                return set(pids)
+
+            monkeypatch.setattr(procident, "flock_write_holders", fake)
+
+        return install
+
+    def test_pidfd_is_opened_before_the_holder_proof_and_used_to_signal(self, db, start_helper, pidfd, ordered_proof, order, monkeypatch):
+        helper = start_helper(db)
+        ordered_proof(helper.pid)
+        kill_spy = SignalSpy(monkeypatch)
+        # SignalSpy replaced pidfd_send_signal with a wrapper around our fake
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        assert order == ["pidfd_open", "holders"]
+        assert [c[0] for c in kill_spy.calls] == ["pidfd_send_signal"], "must signal through the pidfd, not os.kill"
+        assert helper.wait_for("HUP")
+        (fd, pid) = pidfd.opened[0]
+        assert pid == helper.pid
+        assert pidfd.fd_is_closed(fd), "the pidfd must be closed again"
+
+    def test_a_vanished_pid_at_pidfd_open_is_supervisor_gone_without_consulting_the_proof(
+        self, db, start_helper, pidfd, ordered_proof, order, monkeypatch
+    ):
+        helper = start_helper(db)
+        ordered_proof(helper.pid)
+        pidfd.open_error = ProcessLookupError(errno.ESRCH, "No such process")
+        spy = SignalSpy(monkeypatch, passthrough=False)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "supervisor-gone"
+        assert order == ["pidfd_open"]
+        assert spy.calls == []
+
+    @pytest.mark.parametrize("err", [errno.EPERM, errno.ENOSYS, errno.EMFILE, errno.EINVAL])
+    def test_any_other_pidfd_open_failure_falls_back_to_os_kill(self, db, start_helper, pidfd, ordered_proof, monkeypatch, err):
+        helper = start_helper(db)
+        ordered_proof(helper.pid)
+        pidfd.open_error = OSError(err, os.strerror(err))
+        spy = SignalSpy(monkeypatch)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "signalled"
+        assert spy.calls == [("kill", helper.pid, signal.SIGHUP)]
+        assert pidfd.sent == []
+        assert helper.wait_for("HUP")
+
+    @pytest.mark.parametrize(
+        "exc, outcome",
+        [
+            (PermissionError(errno.EPERM, "Operation not permitted"), "not-permitted"),
+            (ProcessLookupError(errno.ESRCH, "No such process"), "supervisor-gone"),
+            (OSError(errno.EINVAL, "Invalid argument"), "error"),
+        ],
+    )
+    def test_pidfd_send_failures_map_to_outcomes_and_close_the_pidfd(self, db, start_helper, pidfd, ordered_proof, exc, outcome):
+        helper = start_helper(db)
+        ordered_proof(helper.pid)
+        pidfd.send_error = exc
+        before = fd_count()
+        result = daemonlock.request_reload(db)
+        assert result.outcome == outcome
+        assert fd_count() == before
+        assert all(pidfd.fd_is_closed(fd) for fd, _ in pidfd.opened)
+        assert not helper.got_hup()
+
+    @pytest.mark.parametrize("spec", ["{pid}\n3\nstart=bogus:1\n", "{pid}\n3\n", "{pid}\n3\nstart=\n"])
+    def test_the_pidfd_is_closed_on_every_refusal(self, db, start_helper, pidfd, ordered_proof, spec):
+        helper = start_helper(db, spec=spec)
+        ordered_proof(helper.pid)
+        before = fd_count()
+        daemonlock.request_reload(db)
+        assert fd_count() == before
+        assert all(pidfd.fd_is_closed(fd) for fd, _ in pidfd.opened)
+
+    def test_no_pidfd_is_opened_for_a_refused_pid(self, db, lockfile, pidfd, monkeypatch, order):
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: {1})
+        monkeypatch.setattr(procident, "identity", lambda pid, token: "match")
+        spy = SignalSpy(monkeypatch, passthrough=False)
+        fd = hold_raw(lockfile, b"1\n3\nstart=tok\n")
+        try:
+            assert daemonlock.request_reload(db).outcome == "unverified"
+        finally:
+            os.close(fd)
+        assert order == []
+        assert spy.calls == []
+
+    def test_the_pidfd_route_needs_both_halves(self, db, start_helper, proof, monkeypatch):
+        helper = start_helper(db)
+        proof(helper.pid)
+        monkeypatch.setattr(os, "pidfd_open", lambda *a, **kw: pytest.fail("pidfd_open used"), raising=False)
+        monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+        assert daemonlock.request_reload(db).outcome == "signalled"  # via os.kill
+        assert helper.wait_for("HUP")
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not (_pidfd_works() and _real_lock_table()), reason="needs Linux with pidfd_open and /proc/locks")
+class TestRequestReloadRealPidfd:
+    """[L] The kernel's own pidfd and lock table, nothing patched."""
+
+    def test_a_real_supervisor_is_signalled_through_a_pidfd_opened_before_the_proof(self, db, start_helper, monkeypatch):
+        helper = start_helper(db)
+        order = []
+        real_open, real_holders = os.pidfd_open, procident.flock_write_holders
+
+        def pidfd_open(pid, flags=0):
+            order.append("pidfd_open")
+            return real_open(pid, flags)
+
+        def holders(fd):
+            order.append("holders")
+            return real_holders(fd)
+
+        monkeypatch.setattr(os, "pidfd_open", pidfd_open)
+        monkeypatch.setattr(procident, "flock_write_holders", holders)
+        spy = SignalSpy(monkeypatch)
+        before = fd_count()
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        assert order == ["pidfd_open", "holders"]
+        assert [c[0] for c in spy.calls] == ["pidfd_send_signal"]
+        assert fd_count() == before
+        assert helper.wait_for("HUP")
+
+    def test_a_dead_pid_is_gone_at_pidfd_open(self, db, start_helper, plain_process):
+        victim = plain_process()
+        token = procident.start_token(victim.pid)
+        dead = victim.pid
+        victim.kill()
+        victim.wait(timeout=10)
+        holder = start_helper(db, spec=f"{dead}\n3\nstart={token}\n")
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "supervisor-gone"
+        assert "no longer exists" in result.detail
+        assert not holder.got_hup()
+
+
+# ---------------------------------------------------------------------------
+# The workers lock
+# ---------------------------------------------------------------------------
+
+
+class TestWorkersLockPaths:
+    def test_constants(self):
+        assert daemonlock.WORKERS_LOCK_SUFFIX == ".workers.lock"
+        assert daemonlock.RELOAD_POLL_SECONDS == 10
+
+    def test_path_is_the_database_path_plus_the_suffix(self, db):
+        assert daemonlock.workers_lock_path(db) == db.parent / "config.db.workers.lock"
+        assert daemonlock.workers_lock_path(str(db)) == db.parent / "config.db.workers.lock"
+
+    def test_accepts_a_resolved_config_path(self, db):
+        resolved = resolve_config_path(str(db))
+        assert daemonlock.workers_lock_path(resolved) == daemonlock.workers_lock_path(db)
+
+    def test_it_is_not_the_daemon_lock_file(self, db):
+        assert daemonlock.workers_lock_path(db) != lock_path(db)
+
+
+class TestEnsureWorkersLock:
+    def test_creates_the_file_with_mode_0660(self, db):
+        path = daemonlock.ensure_workers_lock(db)
+        assert path == daemonlock.workers_lock_path(db)
+        assert path.is_file()
+        assert mode_of(path) == 0o660
+        assert path.read_bytes() == b""
+
+    def test_the_mode_is_0660_whatever_the_umask(self, db):
+        old = os.umask(0o077)
+        try:
+            path = daemonlock.ensure_workers_lock(db)
+        finally:
+            os.umask(old)
+        assert mode_of(path) == 0o660
+
+    def test_is_idempotent(self, db):
+        first = daemonlock.ensure_workers_lock(db)
+        ino = first.stat().st_ino
+        second = daemonlock.ensure_workers_lock(db)
+        assert second == first
+        assert second.stat().st_ino == ino
+        assert mode_of(second) == 0o660
+
+    def test_an_existing_file_with_a_narrower_mode_is_fixed_when_we_own_it(self, db):
+        path = daemonlock.workers_lock_path(db)
+        path.write_bytes(b"")
+        path.chmod(0o600)
+        daemonlock.ensure_workers_lock(db)
+        assert mode_of(path) == 0o660
+
+    def test_existing_content_is_left_alone(self, db):
+        path = daemonlock.workers_lock_path(db)
+        path.write_bytes(b"keep me")
+        daemonlock.ensure_workers_lock(db)
+        assert path.read_bytes() == b"keep me"
+
+    def test_accepts_a_resolved_config_path(self, db):
+        path = daemonlock.ensure_workers_lock(resolve_config_path(str(db)))
+        assert path.name == "config.db.workers.lock"
+
+    def test_does_not_create_the_database_or_the_daemon_lock(self, db, lockfile):
+        daemonlock.ensure_workers_lock(db)
+        assert not db.exists()
+        assert not lockfile.exists()
+
+    def test_the_file_is_not_locked_afterwards_and_no_descriptor_leaks(self, db):
+        before = fd_count()
+        daemonlock.ensure_workers_lock(db)
+        daemonlock.ensure_workers_lock(db)
+        assert fd_count() == before
+        assert daemonlock.workers_present(db) is False
+
+    def test_a_symlink_is_refused_and_never_followed(self, db, tmp_path):
+        target = tmp_path / "victim"
+        target.write_bytes(b"precious")
+        target.chmod(0o600)
+        os.symlink(target, daemonlock.workers_lock_path(db))
+        before = fd_count()
+        with pytest.raises(DaemonLockError):
+            daemonlock.ensure_workers_lock(db)
+        assert target.read_bytes() == b"precious"
+        assert mode_of(target) == 0o600, "must not chmod through a symlink"
+        assert fd_count() == before
+
+    def test_a_dangling_symlink_is_refused_and_nothing_is_created(self, db, tmp_path):
+        target = tmp_path / "not-there"
+        os.symlink(target, daemonlock.workers_lock_path(db))
+        with pytest.raises(DaemonLockError):
+            daemonlock.ensure_workers_lock(db)
+        assert not target.exists()
+
+    def test_a_non_regular_file_is_refused(self, db):
+        daemonlock.workers_lock_path(db).mkdir()
+        before = fd_count()
+        with pytest.raises(DaemonLockError) as exc:
+            daemonlock.ensure_workers_lock(db)
+        assert exc.value.errno == errno.EINVAL
+        assert "not a regular file" in str(exc.value)
+        assert fd_count() == before
+
+    def test_a_missing_directory_is_a_daemonlockerror(self, tmp_path):
+        with pytest.raises(DaemonLockError):
+            daemonlock.ensure_workers_lock(tmp_path / "nodir" / "config.db")
+
+    @pytest.mark.skipif(IS_ROOT, reason="root creates files anywhere")
+    def test_a_read_only_directory_is_a_daemonlockerror(self, tmp_path):
+        ro = tmp_path / "ro"
+        ro.mkdir()
+        ro.chmod(0o500)
+        try:
+            with pytest.raises(DaemonLockError):
+                daemonlock.ensure_workers_lock(ro / "config.db")
+        finally:
+            ro.chmod(0o700)
+
+    def test_the_descriptor_is_opened_cloexec_and_nofollow(self, db, monkeypatch):
+        flags_seen = []
+        real_open = os.open
+
+        def spying(path, flags, *a, **kw):
+            flags_seen.append(flags)
+            return real_open(path, flags, *a, **kw)
+
+        monkeypatch.setattr(daemonlock.os, "open", spying)
+        daemonlock.ensure_workers_lock(db)
+        assert flags_seen
+        for flags in flags_seen:
+            assert flags & os.O_CLOEXEC and flags & os.O_NOFOLLOW
+
+
+class TestHoldWorkersLock:
+    def test_returns_a_descriptor_that_holds_a_shared_lock(self, db):
+        path = daemonlock.ensure_workers_lock(db)
+        fd = daemonlock.hold_workers_lock(path)
+        try:
+            assert isinstance(fd, int) and fd >= 0
+            assert daemonlock.workers_present(db) is True
+        finally:
+            os.close(fd)
+        assert daemonlock.workers_present(db) is False
+
+    def test_the_descriptor_is_close_on_exec(self, db):
+        fd = daemonlock.hold_workers_lock(daemonlock.ensure_workers_lock(db))
+        try:
+            assert fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+        finally:
+            os.close(fd)
+
+    @pytest.mark.skipif(not HAS_FORK, reason="needs fork")
+    def test_an_exec_child_does_not_inherit_the_lock(self, db):
+        fd = daemonlock.hold_workers_lock(daemonlock.ensure_workers_lock(db))
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - child
+            try:
+                os.close(r)
+                os.dup2(w, 1)
+                code = (
+                    "import os\n"
+                    "try:\n"
+                    f"    os.fstat({fd}); print('inherited')\n"
+                    "except OSError:\n"
+                    "    print('closed')\n"
+                )
+                os.execv(sys.executable, [sys.executable, "-I", "-c", code])
+            finally:
+                os._exit(127)
+        os.close(w)
+        data = b""
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            chunk = os.read(r, 100)
+            if not chunk:
+                break
+            data += chunk
+        os.close(r)
+        os.waitpid(pid, 0)
+        os.close(fd)
+        assert data.strip() == b"closed"
+
+    def test_the_descriptor_is_read_only(self, db):
+        fd = daemonlock.hold_workers_lock(daemonlock.ensure_workers_lock(db))
+        try:
+            assert fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+        finally:
+            os.close(fd)
+
+    def test_two_shared_holders_coexist(self, db):
+        path = daemonlock.ensure_workers_lock(db)
+        a = daemonlock.hold_workers_lock(path)
+        b = daemonlock.hold_workers_lock(path)
+        try:
+            assert a is not None and b is not None and a != b
+            assert daemonlock.workers_present(db) is True
+            os.close(a)
+            assert daemonlock.workers_present(db) is True, "the second holder still holds it"
+        finally:
+            os.close(b)
+        assert daemonlock.workers_present(db) is False
+
+    def test_it_accepts_a_string_path(self, db):
+        path = daemonlock.ensure_workers_lock(db)
+        fd = daemonlock.hold_workers_lock(str(path))
+        assert fd is not None
+        os.close(fd)
+
+    def test_a_missing_file_is_none_with_a_warning(self, db, caplog):
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.daemonlock"):
+            assert daemonlock.hold_workers_lock(daemonlock.workers_lock_path(db)) is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "cannot open workers lock" in warnings[0].getMessage()
+
+    def test_a_missing_file_is_not_created(self, db):
+        daemonlock.hold_workers_lock(daemonlock.workers_lock_path(db))
+        assert not daemonlock.workers_lock_path(db).exists()
+
+    def test_a_symlink_is_none_with_a_warning(self, db, tmp_path, caplog):
+        target = tmp_path / "t"
+        target.write_bytes(b"")
+        os.symlink(target, daemonlock.workers_lock_path(db))
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.daemonlock"):
+            assert daemonlock.hold_workers_lock(daemonlock.workers_lock_path(db)) is None
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_a_transient_exclusive_holder_is_retried(self, db, real_contention_window):
+        path = daemonlock.ensure_workers_lock(db)
+        thread, stop = _transient_holder(path, fcntl.LOCK_EX, 0.3)
+        started = time.monotonic()
+        fd = daemonlock.hold_workers_lock(path)
+        elapsed = time.monotonic() - started
+        thread.join(5)
+        try:
+            assert fd is not None, "a momentary LOCK_EX (workers_present) must not lose the worker its lock"
+            assert 0.2 <= elapsed < real_contention_window + 1
+            assert fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def test_a_persistent_exclusive_holder_gives_up_with_a_warning_and_no_leak(self, db, monkeypatch, caplog):
+        monkeypatch.setattr(daemonlock, "_CONTENTION_WINDOW", 0.15)
+        path = daemonlock.ensure_workers_lock(db)
+        thread, stop = _transient_holder(path, fcntl.LOCK_EX, 10)
+        before = fd_count()
+        try:
+            with caplog.at_level(logging.WARNING, logger="zfsbackup.daemonlock"):
+                started = time.monotonic()
+                assert daemonlock.hold_workers_lock(path) is None
+                elapsed = time.monotonic() - started
+            assert elapsed >= 0.1
+            assert any("cannot lock workers lock" in r.getMessage() for r in caplog.records)
+            assert fd_count() == before, "the failed attempt must close its descriptor"
+        finally:
+            stop.set()
+            thread.join(5)
+
+    def test_a_flock_error_other_than_contention_is_none_without_retry(self, db, monkeypatch, caplog):
+        path = daemonlock.ensure_workers_lock(db)
+        calls = []
+
+        def eio(fd, op):
+            calls.append(op)
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(daemonlock.fcntl, "flock", eio)
+        before = fd_count()
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.daemonlock"):
+            assert daemonlock.hold_workers_lock(path) is None
+        assert len(calls) == 1
+        assert fd_count() == before
+
+    def test_holding_does_not_modify_or_delete_the_file(self, db):
+        path = daemonlock.ensure_workers_lock(db)
+        before = (path.stat().st_ino, path.stat().st_mtime_ns, mode_of(path))
+        fd = daemonlock.hold_workers_lock(path)
+        os.close(fd)
+        assert path.exists()
+        assert (path.stat().st_ino, path.stat().st_mtime_ns, mode_of(path)) == before
+
+    def test_repeated_hold_and_close_leaks_nothing(self, db):
+        path = daemonlock.ensure_workers_lock(db)
+        before = fd_count()
+        for _ in range(20):
+            os.close(daemonlock.hold_workers_lock(path))
+        assert fd_count() == before
+
+
+class TestWorkersPresent:
+    def test_a_missing_file_is_false(self, db):
+        assert daemonlock.workers_present(db) is False
+
+    def test_a_missing_directory_is_false(self, tmp_path):
+        assert daemonlock.workers_present(tmp_path / "nodir" / "config.db") is False
+
+    def test_a_path_component_that_is_a_file_is_false(self, tmp_path):
+        (tmp_path / "afile").write_text("x")
+        assert daemonlock.workers_present(tmp_path / "afile" / "config.db") is False
+
+    def test_an_unlocked_file_is_false_and_stays_present(self, db):
+        path = daemonlock.ensure_workers_lock(db)
+        assert daemonlock.workers_present(db) is False
+        assert path.exists()
+
+    def test_it_creates_nothing(self, db):
+        daemonlock.workers_present(db)
+        assert not daemonlock.workers_lock_path(db).exists()
+
+    def test_true_while_held_false_after_release(self, db):
+        path = daemonlock.ensure_workers_lock(db)
+        fd = daemonlock.hold_workers_lock(path)
+        assert daemonlock.workers_present(db) is True
+        assert daemonlock.workers_present(db) is True
+        os.close(fd)
+        assert daemonlock.workers_present(db) is False
+
+    def test_an_exclusive_holder_counts_too(self, db):
+        path = daemonlock.ensure_workers_lock(db)
+        thread, stop = _transient_holder(path, fcntl.LOCK_EX, 10)
+        try:
+            assert daemonlock.workers_present(db) is True
+        finally:
+            stop.set()
+            thread.join(5)
+
+    def test_it_always_unlocks_and_closes(self, db):
+        path = daemonlock.ensure_workers_lock(db)
+        before = fd_count()
+        for _ in range(10):
+            assert daemonlock.workers_present(db) is False
+        assert fd_count() == before
+        # its momentary LOCK_EX is gone: a worker can take LOCK_SH at once
+        fd = daemonlock.hold_workers_lock(path)
+        assert fd is not None
+        os.close(fd)
+
+    def test_the_momentary_lock_does_not_disturb_a_holder(self, db):
+        path = daemonlock.ensure_workers_lock(db)
+        fd = daemonlock.hold_workers_lock(path)
+        try:
+            for _ in range(5):
+                assert daemonlock.workers_present(db) is True
+            assert fcntl.fcntl(fd, fcntl.F_GETFD) >= 0
+            other = daemonlock.hold_workers_lock(path)
+            assert other is not None
+            os.close(other)
+        finally:
+            os.close(fd)
+
+    def test_holders_in_a_real_process_are_seen_and_survive_sigkill(self, db):
+        from _hermetic import hermetic_env
+
+        path = daemonlock.ensure_workers_lock(db)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _WORKERS_HELPER, str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=hermetic_env(),
+            cwd=str(REPO_ROOT),
+        )
+        try:
+            assert proc.stdout.readline().strip() == "ready"
+            assert daemonlock.workers_present(db) is True
+            proc.send_signal(signal.SIGKILL)
+            proc.wait(timeout=10)
+            assert wait_until(lambda: daemonlock.workers_present(db) is False)
+            assert path.exists(), "the workers lock file is never deleted"
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+            proc.stdout.close()
+
+    def test_a_process_that_exits_cleanly_drops_it(self, db):
+        from _hermetic import hermetic_env
+
+        path = daemonlock.ensure_workers_lock(db)
+        code = (
+            "import sys\nfrom zfsbackup import daemonlock\n"
+            "fd = daemonlock.hold_workers_lock(sys.argv[1])\nprint('held' if fd is not None else 'failed')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(path)],
+            capture_output=True, text=True, timeout=60, env=hermetic_env(), cwd=str(REPO_ROOT),
+        )
+        assert result.stdout.strip() == "held"
+        assert daemonlock.workers_present(db) is False
+
+    def test_an_error_other_than_contention_raises_daemonlockerror(self, db, monkeypatch):
+        daemonlock.ensure_workers_lock(db)
+        real_flock = fcntl.flock
+
+        def eio(fd, op):
+            if op & fcntl.LOCK_EX:
+                raise OSError(errno.EIO, "Input/output error")
+            return real_flock(fd, op)
+
+        monkeypatch.setattr(daemonlock.fcntl, "flock", eio)
+        before = fd_count()
+        with pytest.raises(DaemonLockError) as exc:
+            daemonlock.workers_present(db)
+        assert exc.value.errno == errno.EIO
+        assert fd_count() == before
+
+    def test_an_unopenable_file_raises_daemonlockerror(self, db, monkeypatch):
+        daemonlock.ensure_workers_lock(db)
+        real_open = os.open
+
+        def deny(path, flags, *a, **kw):
+            if str(path).endswith(".workers.lock"):
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_open(path, flags, *a, **kw)
+
+        monkeypatch.setattr(daemonlock.os, "open", deny)
+        with pytest.raises(DaemonLockError) as exc:
+            daemonlock.workers_present(db)
+        assert exc.value.errno == errno.EACCES
+
+    def test_a_symlink_raises_daemonlockerror(self, db, tmp_path):
+        target = tmp_path / "t"
+        target.write_bytes(b"")
+        os.symlink(target, daemonlock.workers_lock_path(db))
+        with pytest.raises(DaemonLockError):
+            daemonlock.workers_present(db)
+
+    def test_accepts_a_resolved_config_path(self, db):
+        daemonlock.ensure_workers_lock(db)
+        assert daemonlock.workers_present(resolve_config_path(str(db))) is False
+
+    def test_it_is_independent_of_the_daemon_lock(self, db, held):
+        held.append(acquire(db))
+        daemonlock.ensure_workers_lock(db)
+        assert daemonlock.workers_present(db) is False
+        assert probe(db) is not None
+
+
+# ===========================================================================
+# G2 review fixes: device + inode proof, owner check, hidepid, padded writes,
+# O_NONBLOCK.
+# ===========================================================================
+
+
+def _table_proof(monkeypatch, tmp_path, pid, *, lock_device="08:01", mount_device=(8, 1)):
+    """A `flock_write_holders` that answers from a fixture lock table naming
+    `pid` as the holder of THIS file's inode on `lock_device` (hex, as
+    /proc/locks prints it) while the mount says `mount_device`. Runs the real
+    parser on any host."""
+    locks = tmp_path / "locks"
+
+    def holders(fd):
+        ino = os.fstat(fd).st_ino
+        locks.write_text(f"1: FLOCK  ADVISORY  WRITE {pid} {lock_device}:{ino} 0 EOF\n")
+        with monkeypatch.context() as m:
+            m.setattr(procident, "_PROC_ROOT", str(tmp_path))
+            return procident._linux_flock_write_holders(mount_device, ino)
+
+    monkeypatch.setattr(procident, "flock_write_holders", holders)
+
+
+@pytest.mark.integration
+class TestRequestReloadHolderDevice:
+    def test_the_same_device_and_inode_proves_the_holder(self, db, start_helper, monkeypatch, tmp_path, spy):
+        helper = start_helper(db)
+        _table_proof(monkeypatch, tmp_path, helper.pid)
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        assert helper.wait_for("HUP")
+
+    @pytest.mark.parametrize("lock_device", ["fe:09", "08:02", "09:01", "00:00"])
+    def test_the_same_inode_on_another_device_is_not_the_holder_and_nothing_is_sent(
+        self, db, start_helper, monkeypatch, tmp_path, spy, lock_device
+    ):
+        helper = start_helper(db)
+        _table_proof(monkeypatch, tmp_path, helper.pid, lock_device=lock_device)
+        result = daemonlock.request_reload(db)
+        assert result.outcome in ("supervisor-gone", "unverified")
+        assert result.outcome == "supervisor-gone"
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+    def test_a_device_that_cannot_be_established_is_unverified(self, db, start_helper, monkeypatch, spy):
+        helper = start_helper(db)
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: None)
+        assert daemonlock.request_reload(db).outcome == "unverified"
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+
+def _foreign_euid(monkeypatch):
+    """Make the pid file (owned by us) look like it belongs to a third party."""
+    monkeypatch.setattr(daemonlock.os, "geteuid", lambda: os.getuid() + 1)
+
+
+class _OwnerProxy:
+    def __init__(self, real, uid):
+        self._real, self.st_uid = real, uid
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(IS_ROOT, reason="root-owned files pass the owner check by definition")
+class TestRequestReloadOwnerCheck:
+    @pytest.fixture
+    def uid_spy(self, monkeypatch):
+        calls = []
+        answer = {"uid": None}
+
+        def process_uid(pid):
+            calls.append(pid)
+            return answer["uid"]
+
+        monkeypatch.setattr(procident, "process_uid", process_uid)
+        process_uid.calls, process_uid.answer = calls, answer
+        return process_uid
+
+    def test_a_third_party_owner_is_unverified_and_nothing_is_sent(self, db, start_helper, proof, monkeypatch, uid_spy, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        _foreign_euid(monkeypatch)
+        uid_spy.answer["uid"] = os.getuid() + 5          # the target is someone else too
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "unverified"
+        assert f"pid file owned by uid {os.getuid()}" in result.detail
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+    def test_process_uid_is_asked_about_the_target_pid(self, db, start_helper, proof, monkeypatch, uid_spy, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        _foreign_euid(monkeypatch)
+        daemonlock.request_reload(db)
+        assert uid_spy.calls == [helper.pid]
+
+    def test_a_file_owned_by_the_targets_uid_passes(self, db, start_helper, proof, monkeypatch, uid_spy, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        _foreign_euid(monkeypatch)
+        uid_spy.answer["uid"] = os.getuid()               # the daemon wrote its own pid file
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        assert helper.wait_for("HUP")
+
+    def test_an_unreadable_target_uid_with_a_foreign_owner_is_unverified(self, db, start_helper, proof, monkeypatch, uid_spy, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        _foreign_euid(monkeypatch)
+        uid_spy.answer["uid"] = None
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "unverified" and "owned by uid" in result.detail
+        assert not helper.got_hup()
+
+    def test_an_euid_owner_passes_even_when_the_target_uid_is_unreadable(self, db, start_helper, proof, uid_spy, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        uid_spy.answer["uid"] = None
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        assert uid_spy.calls == [], "no need to consult the target when we own the file"
+        assert helper.wait_for("HUP")
+
+    def test_a_root_owner_passes_even_when_the_target_uid_is_unreadable(self, db, start_helper, proof, monkeypatch, uid_spy, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        _foreign_euid(monkeypatch)
+        real_fstat = os.fstat
+        monkeypatch.setattr(daemonlock.os, "fstat", lambda fd: _OwnerProxy(real_fstat(fd), 0))
+        uid_spy.answer["uid"] = None
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        assert uid_spy.calls == []
+        assert helper.wait_for("HUP")
+
+    def test_the_owner_check_is_before_the_holder_proof(self, db, start_helper, monkeypatch, uid_spy, spy):
+        helper = start_helper(db)
+        asked = []
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: asked.append(1) or {helper.pid})
+        _foreign_euid(monkeypatch)
+        daemonlock.request_reload(db)
+        assert asked == [], "the proof must not even be consulted for a third-party file"
+
+    def test_a_pidfd_is_opened_before_the_owner_check(self, db, start_helper, monkeypatch, uid_spy, spy):
+        order = []
+        _FakePidfd(monkeypatch, order)
+        helper = start_helper(db)
+        monkeypatch.setattr(uid_spy, "calls", order, raising=False)
+        monkeypatch.setattr(procident, "process_uid", lambda pid: order.append("process_uid") or None)
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: order.append("holders") or {helper.pid})
+        _foreign_euid(monkeypatch)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "unverified"
+        assert order == ["pidfd_open", "process_uid"]
+
+    def test_the_whole_order_with_a_passing_owner(self, db, start_helper, monkeypatch, spy):
+        order = []
+        _FakePidfd(monkeypatch, order)
+        helper = start_helper(db)
+        monkeypatch.setattr(procident, "process_uid", lambda pid: order.append("process_uid") or os.getuid())
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: order.append("holders") or {helper.pid})
+        _foreign_euid(monkeypatch)
+        assert daemonlock.request_reload(db).outcome == "signalled"
+        assert order == ["pidfd_open", "process_uid", "holders"]
+
+
+@pytest.mark.integration
+class TestRequestReloadHidepid:
+    @pytest.fixture
+    def order(self):
+        return []
+
+    def _setup(self, db, start_helper, monkeypatch, ident):
+        helper = start_helper(db)
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: {helper.pid})
+        monkeypatch.setattr(procident, "identity", lambda pid, token: ident)
+        return helper
+
+    def test_gone_after_a_successful_pidfd_open_is_unverified_and_nothing_is_sent(
+        self, db, start_helper, monkeypatch, order
+    ):
+        pidfd = _FakePidfd(monkeypatch, order)
+        helper = self._setup(db, start_helper, monkeypatch, "gone")
+        spy = SignalSpy(monkeypatch, passthrough=False)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "unverified"
+        assert "/proc hidden" in result.detail
+        assert spy.calls == [] and pidfd.sent == []
+        assert order == ["pidfd_open"]
+        assert all(pidfd.fd_is_closed(fd) for fd, _ in pidfd.opened)
+
+    def test_gone_without_a_pidfd_is_supervisor_gone(self, db, start_helper, monkeypatch, kill_path):
+        helper = self._setup(db, start_helper, monkeypatch, "gone")
+        spy = SignalSpy(monkeypatch, passthrough=False)
+        assert daemonlock.request_reload(db).outcome == "supervisor-gone"
+        assert spy.calls == []
+
+    def test_gone_after_a_failed_pidfd_open_falls_back_to_supervisor_gone(self, db, start_helper, monkeypatch, order):
+        pidfd = _FakePidfd(monkeypatch, order)
+        pidfd.open_error = OSError(errno.EPERM, "Operation not permitted")
+        helper = self._setup(db, start_helper, monkeypatch, "gone")
+        spy = SignalSpy(monkeypatch, passthrough=False)
+        assert daemonlock.request_reload(db).outcome == "supervisor-gone"
+        assert spy.calls == []
+
+    def test_mismatch_is_supervisor_gone_with_a_pidfd(self, db, start_helper, monkeypatch, order):
+        pidfd = _FakePidfd(monkeypatch, order)
+        helper = self._setup(db, start_helper, monkeypatch, "mismatch")
+        spy = SignalSpy(monkeypatch, passthrough=False)
+        result = daemonlock.request_reload(db)
+        assert result.outcome == "supervisor-gone" and "mismatch" in result.detail
+        assert spy.calls == [] and pidfd.sent == []
+
+    def test_mismatch_is_supervisor_gone_without_a_pidfd(self, db, start_helper, monkeypatch, kill_path):
+        helper = self._setup(db, start_helper, monkeypatch, "mismatch")
+        spy = SignalSpy(monkeypatch, passthrough=False)
+        assert daemonlock.request_reload(db).outcome == "supervisor-gone"
+        assert spy.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The pid file is written padded, then truncated
+# ---------------------------------------------------------------------------
+
+
+class TestPaddedWrite:
+    def _long(self, lock):
+        lock.set_state(applied=(1, 5), target=(1, 6), rejected=(1, 4))
+        return read(lock.path)
+
+    def test_a_shorter_rewrite_without_ftruncate_leaves_only_blank_lines_after_the_new_content(
+        self, db, lockfile, held, monkeypatch
+    ):
+        lock = acquire(db)
+        held.append(lock)
+        old = self._long(lock)
+        monkeypatch.setattr(daemonlock.os, "ftruncate", lambda fd, n: None)
+        lock.set_state(target=None, rejected=None)
+        raw = read(lockfile)
+        new = daemonlock._format(os.getpid(), 5, lock.start, (1, 5), None, None)
+        assert len(new) < len(old)
+        assert raw.startswith(new)
+        assert raw[len(new):].strip(b"\n") == b"" and len(raw) == len(old)
+        assert b"target" not in raw and b"rejected" not in raw, "the old tail leaked"
+
+    def test_probe_parses_the_padded_file_as_the_new_state_and_stable(self, db, held, monkeypatch):
+        lock = acquire(db)
+        held.append(lock)
+        self._long(lock)
+        monkeypatch.setattr(daemonlock.os, "ftruncate", lambda fd, n: None)
+        lock.set_state(target=None, rejected=None)
+        info = probe(db)
+        assert info.stable is True
+        assert (info.applied, info.target, info.rejected) == ((1, 5), None, None)
+        assert info.generation == 5 and info.start == lock.start
+
+    def test_a_failing_ftruncate_is_only_a_warning_and_the_file_is_still_right(self, db, lockfile, held, monkeypatch, caplog):
+        lock = acquire(db)
+        held.append(lock)
+        self._long(lock)
+
+        def boom(fd, n):
+            raise OSError(errno.EIO, "io")
+
+        monkeypatch.setattr(daemonlock.os, "ftruncate", boom)
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.daemonlock"):
+            lock.set_state(target=None, rejected=None)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        info = probe(db)
+        assert (info.applied, info.target, info.rejected) == ((1, 5), None, None)
+        assert b"target" not in read(lockfile)
+
+    def test_a_reader_between_pwrite_and_ftruncate_never_sees_the_old_tail(self, db, lockfile, held, monkeypatch):
+        lock = acquire(db)
+        held.append(lock)
+        self._long(lock)
+        seen = []
+        real = os.ftruncate
+
+        def midway(fd, n):
+            rfd = os.open(str(lockfile), os.O_RDONLY)
+            try:
+                a = daemonlock._read_all(rfd)
+                b = daemonlock._read_all(rfd)
+            finally:
+                os.close(rfd)
+            seen.append((a, b))
+            real(fd, n)
+
+        monkeypatch.setattr(daemonlock.os, "ftruncate", midway)
+        lock.set_state(target=None, rejected=None)
+        (a, b), = seen
+        assert a == b, "the two consecutive reads agreed -- the stable-read check would accept them"
+        parsed = daemonlock._parse(a)
+        assert (parsed.applied, parsed.target, parsed.rejected) == ((1, 5), None, None)
+        assert b"target" not in a
+
+    @pytest.mark.parametrize("grow", [False, True])
+    def test_the_pwrite_length_is_the_larger_of_old_and_new(self, db, held, monkeypatch, grow):
+        lock = acquire(db)
+        held.append(lock)
+        if not grow:
+            self._long(lock)
+        lengths = []
+        real = os.pwrite
+
+        def spying(fd, data, off):
+            lengths.append((len(data), off))
+            return real(fd, data, off)
+
+        monkeypatch.setattr(daemonlock.os, "pwrite", spying)
+        old_len = os.fstat(lock._fd).st_size
+        if grow:
+            lock.set_state(applied=(1, 5), target=(1, 6), rejected=(1, 4))
+        else:
+            lock.set_state(target=None, rejected=None)
+        new_len = len(daemonlock._format(lock.pid, lock.generation, lock.start, lock.applied, lock.target, lock.rejected))
+        assert lengths == [(max(old_len, new_len), 0)]
+
+    def test_the_first_write_is_not_padded(self, db, lockfile, monkeypatch):
+        lengths = []
+        real = os.pwrite
+        monkeypatch.setattr(daemonlock.os, "pwrite", lambda fd, data, off: lengths.append(len(data)) or real(fd, data, off))
+        lock = acquire(db, generation=3)
+        try:
+            assert lengths == [len(read(lockfile))]
+        finally:
+            lock.release()
+
+    def test_after_a_real_ftruncate_the_file_is_exactly_the_new_bytes(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        self._long(lock)
+        lock.set_state(target=None, rejected=None)
+        assert read(lockfile) == daemonlock._format(os.getpid(), 5, lock.start, (1, 5), None, None)
+
+    def test_a_longer_rewrite_is_exact(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(applied=(1, 5), target=(1, 6), rejected=(1, 4))
+        assert read(lockfile) == daemonlock._format(os.getpid(), 5, lock.start, (1, 5), (1, 6), (1, 4))
+
+    def test_a_failing_fstat_means_no_padding_not_a_failed_write(self, db, lockfile, held, monkeypatch):
+        lock = acquire(db)
+        held.append(lock)
+        monkeypatch.setattr(daemonlock.os, "fstat", lambda fd: (_ for _ in ()).throw(OSError(errno.EIO, "io")))
+        lock.set_state(applied=(1, 9))
+        monkeypatch.undo()
+        assert daemonlock._parse(read(lockfile)).applied == (1, 9)
+
+
+# ---------------------------------------------------------------------------
+# O_NONBLOCK: a FIFO planted at a lock path cannot hang anything
+# ---------------------------------------------------------------------------
+
+
+class _Hang(BaseException):
+    """Not an `Exception` (let alone the `OSError` a `TimeoutError` is): the code
+    under test has `except OSError` / `except Exception` arms that would swallow
+    the alarm and carry on into the next blocking call."""
+
+
+@contextlib.contextmanager
+def _guard(seconds=5):
+    """A hang becomes a failure: SIGALRM raises `_Hang` in the main thread."""
+    def fire(signum, frame):
+        raise _Hang("blocked: a FIFO open hung")
+
+    old = signal.signal(signal.SIGALRM, fire)
+    signal.alarm(seconds)
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+    assert time.monotonic() - started < 1.5, "a FIFO took too long to refuse"
+
+
+fifo = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
+
+
+@fifo
+class TestFifoAtThePidFile:
+    def test_probe_refuses(self, db, lockfile):
+        os.mkfifo(lockfile)
+        with _guard(), pytest.raises(DaemonLockError) as exc:
+            probe(db)
+        assert "not a regular file" in str(exc.value)
+
+    def test_request_reload_is_error(self, db, lockfile, spy):
+        os.mkfifo(lockfile)
+        with _guard():
+            result = daemonlock.request_reload(db)
+        assert result.outcome == "error" and "not a regular file" in result.detail
+        assert spy.calls == []
+
+    def test_acquire_refuses_without_hanging(self, db, lockfile):
+        os.mkfifo(lockfile)
+        with _guard(), pytest.raises(DaemonLockError):
+            acquire(db)
+
+
+@fifo
+class TestFifoAtTheWorkersLock:
+    def test_workers_present_refuses(self, db):
+        os.mkfifo(daemonlock.workers_lock_path(db))
+        with _guard(), pytest.raises(DaemonLockError):
+            daemonlock.workers_present(db)
+
+    def test_hold_workers_lock_is_none_with_a_warning(self, db, caplog):
+        path = daemonlock.workers_lock_path(db)
+        os.mkfifo(path)
+        with _guard(), caplog.at_level(logging.WARNING, logger="zfsbackup.daemonlock"):
+            assert daemonlock.hold_workers_lock(path) is None
+        assert any(r.levelno == logging.WARNING and "not a regular file" in r.getMessage() for r in caplog.records)
+
+    def test_ensure_workers_lock_refuses(self, db):
+        os.mkfifo(daemonlock.workers_lock_path(db))
+        with _guard(), pytest.raises(DaemonLockError):
+            daemonlock.ensure_workers_lock(db)
+
+    def test_a_refused_hold_leaks_no_descriptor(self, db):
+        path = daemonlock.workers_lock_path(db)
+        os.mkfifo(path)
+        before = fd_count()
+        with _guard():
+            daemonlock.hold_workers_lock(path)
+            with pytest.raises(DaemonLockError):
+                daemonlock.workers_present(db)
+        assert fd_count() == before
+
+
+class TestOpenFlags:
+    WANT = os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
+
+    @pytest.fixture
+    def flags(self, monkeypatch):
+        seen = []
+        real = os.open
+
+        def spying(path, fl, *a, **kw):
+            if ".daemon.pid" in str(path) or ".workers.lock" in str(path):
+                seen.append(fl)
+            return real(path, fl, *a, **kw)
+
+        monkeypatch.setattr(daemonlock.os, "open", spying)
+        return seen
+
+    def check(self, flags):
+        assert flags, "no open was observed"
+        for fl in flags:
+            assert fl & self.WANT == self.WANT, f"flags {fl:#x} lack O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW"
+
+    def test_probe(self, db, held, flags):
+        held.append(acquire(db))
+        flags.clear()
+        probe(db)
+        self.check(flags)
+
+    def test_acquire(self, db, held, flags):
+        held.append(acquire(db))
+        self.check(flags)
+
+    def test_request_reload(self, db, held, flags):
+        held.append(acquire(db))
+        flags.clear()
+        daemonlock.request_reload(db)
+        self.check(flags)
+
+    def test_ensure_workers_lock_create_and_reopen(self, db, flags):
+        daemonlock.ensure_workers_lock(db)
+        daemonlock.ensure_workers_lock(db)
+        assert len(flags) == 3          # create; the failed O_EXCL retry; the reopen
+        self.check(flags)
+
+    def test_hold_workers_lock(self, db, flags):
+        path = daemonlock.ensure_workers_lock(db)
+        flags.clear()
+        os.close(daemonlock.hold_workers_lock(path))
+        self.check(flags)
+
+    def test_workers_present(self, db, flags):
+        daemonlock.ensure_workers_lock(db)
+        flags.clear()
+        daemonlock.workers_present(db)
+        self.check(flags)
+
+    def test_regular_files_still_lock_normally_with_nonblock(self, db, held):
+        lock = acquire(db)
+        held.append(lock)
+        assert probe(db) is not None
+        path = daemonlock.ensure_workers_lock(db)
+        fd = daemonlock.hold_workers_lock(path)
+        assert daemonlock.workers_present(db) is True
+        os.close(fd)
+        assert daemonlock.workers_present(db) is False
+
+
+# ===========================================================================
+# Zombies, supervisor_state, and the machine-readable reason_code
+# ===========================================================================
+
+import dataclasses  # noqa: E402
+import types  # noqa: E402
+
+HAS_TOKENS = IS_LINUX or sys.platform == "darwin"
+
+
+@pytest.fixture
+def zombie():
+    """`zombie()` -> `(popen, token)`: an exited child nobody has reaped (and the
+    start token it had while alive). Reaped at teardown."""
+    from _hermetic import hermetic_env
+
+    made = []
+
+    def make():
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=hermetic_env(), cwd=str(REPO_ROOT),
+        )
+        made.append(proc)
+        token = None
+        deadline = time.monotonic() + 30
+        while token is None and time.monotonic() < deadline:
+            token = procident.start_token(proc.pid)
+            time.sleep(0.02)
+        proc.stdin.close()
+        assert wait_until(lambda: procident.is_zombie(proc.pid) is True, 30), "child never became a zombie"
+        return proc, token
+
+    yield make
+    for proc in made:
+        try:
+            _REAL_KILL(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait(timeout=10)
+
+
+@pytest.mark.skipif(not HAS_TOKENS, reason="zombie detection needs /proc or sysctl")
+class TestZombieIsNotAlive:
+    def test_pid_is_alive_is_false_for_an_unreaped_child(self, zombie):
+        proc, _ = zombie()
+        assert os.kill(proc.pid, 0) is None          # the probe alone would say "alive"
+        assert daemonlock.pid_is_alive(proc.pid) is False
+
+    def test_it_is_true_for_a_live_process_and_false_once_reaped(self, zombie):
+        assert daemonlock.pid_is_alive(os.getpid()) is True
+        proc, _ = zombie()
+        proc.wait(timeout=10)
+        assert daemonlock.pid_is_alive(proc.pid) is False
+
+    def test_a_permission_error_still_means_alive_unless_a_zombie(self, monkeypatch):
+        monkeypatch.setattr(daemonlock.os, "kill", _raise(PermissionError()))
+        monkeypatch.setattr(procident, "is_zombie", lambda pid: False)
+        assert daemonlock.pid_is_alive(4321) is True
+        monkeypatch.setattr(procident, "is_zombie", lambda pid: True)
+        assert daemonlock.pid_is_alive(4321) is False
+
+    def test_an_undeterminable_zombie_state_does_not_change_the_answer(self, monkeypatch):
+        monkeypatch.setattr(daemonlock.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(procident, "is_zombie", lambda pid: None)
+        assert daemonlock.pid_is_alive(4321) is True
+
+    def test_a_missing_process_is_not_asked_about_zombies(self, monkeypatch):
+        monkeypatch.setattr(daemonlock.os, "kill", _raise(ProcessLookupError()))
+        monkeypatch.setattr(procident, "is_zombie", lambda pid: pytest.fail("consulted"))
+        assert daemonlock.pid_is_alive(4321) is False
+
+    def test_the_stale_supervisor_wording_follows(self, db, zombie):
+        proc, _ = zombie()
+        exc = DaemonAlreadyRunning(lock_path(db), proc.pid, 1)
+        assert exc.pid_alive is False
+        assert "is gone" in str(exc)
+
+
+class TestSupervisorState:
+    def info(self, pid, start):
+        return types.SimpleNamespace(pid=pid, start=start)
+
+    @pytest.fixture
+    def world(self, monkeypatch):
+        """Scriptable `identity` and `pid_is_alive`."""
+        state = {"identity": "unknown", "alive": None, "identity_calls": []}
+
+        def identity(pid, token):
+            state["identity_calls"].append((pid, token))
+            if isinstance(state["identity"], Exception):
+                raise state["identity"]
+            return state["identity"]
+
+        monkeypatch.setattr(procident, "identity", identity)
+        monkeypatch.setattr(daemonlock, "pid_is_alive", lambda pid: state["alive"])
+        return state
+
+    def test_a_matching_token_is_alive(self, world):
+        world["identity"] = "match"
+        world["alive"] = False                      # never consulted
+        assert daemonlock.supervisor_state(self.info(4242, "tok")) == "alive"
+        assert world["identity_calls"] == [(4242, "tok")]
+
+    def test_a_mismatched_token_on_a_live_pid_is_gone(self, world):
+        world["identity"], world["alive"] = "mismatch", True
+        assert daemonlock.supervisor_state(self.info(4242, "tok")) == "gone"
+
+    def test_a_zombie_is_gone(self, world):
+        world["identity"], world["alive"] = "gone", True
+        assert daemonlock.supervisor_state(self.info(4242, "tok")) == "gone"
+
+    def test_no_token_on_a_live_pid_is_alive(self, world):
+        world["alive"] = True
+        assert daemonlock.supervisor_state(self.info(4242, None)) == "alive"
+        assert world["identity_calls"] == [], "no token: identity is not asked"
+
+    def test_no_token_on_a_dead_pid_is_gone(self, world):
+        world["alive"] = False
+        assert daemonlock.supervisor_state(self.info(4242, None)) == "gone"
+
+    @pytest.mark.parametrize("pid", [None, 0, -1, -4242, True, False, "42", 4.0])
+    def test_an_unusable_pid_is_unknown_and_nothing_is_probed(self, world, pid):
+        world["alive"] = True
+        assert daemonlock.supervisor_state(self.info(pid, "tok")) == "unknown"
+        assert world["identity_calls"] == []
+
+    @pytest.mark.parametrize(
+        "alive, expected", [(True, "alive"), (False, "gone"), (None, "unknown")]
+    )
+    def test_identity_unknown_falls_back_to_pid_is_alive(self, world, alive, expected):
+        world["identity"], world["alive"] = "unknown", alive
+        assert daemonlock.supervisor_state(self.info(4242, "tok")) == expected
+
+    @pytest.mark.parametrize("alive, expected", [(True, "alive"), (False, "gone"), (None, "unknown")])
+    def test_an_empty_token_is_treated_like_no_token(self, world, alive, expected):
+        world["alive"] = alive
+        assert daemonlock.supervisor_state(self.info(4242, "")) == expected
+        assert world["identity_calls"] == []
+
+    def test_an_exception_is_unknown(self, world):
+        world["identity"] = RuntimeError("boom")
+        assert daemonlock.supervisor_state(self.info(4242, "tok")) == "unknown"
+
+    def test_an_object_without_the_attributes_is_unknown(self, world):
+        assert daemonlock.supervisor_state(object()) == "unknown"
+
+    def test_daemoninfo_delegates(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(daemonlock, "supervisor_state", lambda info: seen.append(info) or "sentinel")
+        info = DaemonInfo(1234, 5, start="tok")
+        assert info.supervisor_state == "sentinel"
+        assert seen == [info]
+
+    @pytest.mark.skipif(not HAS_TOKENS, reason="needs start tokens")
+    def test_for_real_this_process_is_alive_a_wrong_token_is_gone(self):
+        token = procident.start_token(os.getpid())
+        assert DaemonInfo(os.getpid(), 1, start=token).supervisor_state == "alive"
+        assert DaemonInfo(os.getpid(), 1, start="bogus:1").supervisor_state == "gone"
+        assert DaemonInfo(os.getpid(), 1).supervisor_state == "alive"            # legacy: pid_is_alive
+
+    @pytest.mark.skipif(not HAS_TOKENS, reason="zombie detection needs /proc or sysctl")
+    def test_for_real_a_zombie_is_gone_with_or_without_a_token(self, zombie):
+        proc, token = zombie()
+        assert DaemonInfo(proc.pid, 1, start=token).supervisor_state == "gone"
+        assert DaemonInfo(proc.pid, 1).supervisor_state == "gone"
+        assert DaemonInfo(proc.pid, 1, start="").supervisor_state == "gone"
+
+    def test_it_is_evaluated_at_call_time(self, world):
+        info = DaemonInfo(4242, 1, start="tok")
+        world["identity"] = "match"
+        assert info.supervisor_state == "alive"
+        world["identity"] = "gone"
+        assert info.supervisor_state == "gone"
+
+
+class TestReloadRequestReasonCode:
+    def test_it_defaults_to_empty_and_comes_last(self):
+        names = [f.name for f in dataclasses.fields(daemonlock.ReloadRequest)]
+        assert names == ["outcome", "pid", "info", "detail", "reason_code"]
+        assert daemonlock.ReloadRequest("x").reason_code == ""
+        assert daemonlock.ReloadRequest("x", 1, None, "d").reason_code == ""
+
+    def test_positional_construction_without_it_still_works(self):
+        r = daemonlock.ReloadRequest("unverified", 5, None, "why")
+        assert (r.outcome, r.pid, r.detail, r.reason_code) == ("unverified", 5, "why", "")
+
+    def test_it_is_frozen(self):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            daemonlock.ReloadRequest("x").reason_code = "y"
+
+    def test_every_documented_code_is_in_the_docstring(self):
+        doc = daemonlock.ReloadRequest.__doc__
+        for code in (
+            "torn-read", "no-identity", "refused-pid", "pid-file-owner", "not-linux", "locks-unreadable",
+            "mount-device", "lock-holders-unknown", "proc-hidden", "identity-unknown",
+            "no-such-process", "not-lock-holder", "zombie", "reused", "exited",
+        ):
+            assert f"`{code}`" in doc, code
+
+
+@pytest.mark.integration
+class TestRequestReloadReasonCodes:
+    """Every outcome carries a stable `reason_code`."""
+
+    def _check(self, result, outcome, code, detail=None):
+        assert result.outcome == outcome
+        assert result.reason_code == code, result
+        if detail:
+            assert detail in result.detail, result.detail
+
+    # -- no code -------------------------------------------------------------
+
+    def test_outcomes_with_nothing_to_add_have_an_empty_code(self, db, lockfile, start_helper, proof, spy):
+        self._check(daemonlock.request_reload(db), "no-daemon", "")
+        helper = start_helper(db, spec="{pid}\n3\nstart={start}\napplied=1:3\n")
+        proof(helper.pid)
+        self._check(daemonlock.request_reload(db, skip_if_applied=(1, 3)), "already-applied", "")
+        self._check(daemonlock.request_reload(db, skip_if_applied=(1, 4)), "signalled", "")
+
+    def test_legacy_has_an_empty_code(self, db, start_helper):
+        start_helper(db, spec="{pid}\n3\n")
+        self._check(daemonlock.request_reload(db), "legacy", "")
+
+    def test_error_has_an_empty_code(self, db, lockfile):
+        os.symlink(db.parent / "elsewhere", lockfile)
+        self._check(daemonlock.request_reload(db), "error", "")
+
+    def test_not_permitted_has_an_empty_code(self, db, start_helper, proof, no_signal, monkeypatch):
+        helper = start_helper(db)
+        proof(helper.pid)
+        monkeypatch.setattr(os, "kill", _raise(PermissionError(errno.EPERM, "Operation not permitted")))
+        self._check(daemonlock.request_reload(db), "not-permitted", "")
+
+    # -- unverified ----------------------------------------------------------
+
+    def test_torn_read(self, db, start_helper, proof, monkeypatch):
+        helper = start_helper(db)
+        proof(helper.pid)
+        good = read(lock_path(db))
+        _fake_pread(monkeypatch, [good, good + b"applied=1:1\n"] * 4)
+        self._check(daemonlock.request_reload(db), "unverified", "torn-read")
+
+    def test_no_identity(self, db, start_helper):
+        start_helper(db, spec="{pid}\n3\nstart=\n")
+        self._check(daemonlock.request_reload(db), "unverified", "no-identity")
+
+    @pytest.mark.parametrize("pid", [0, 1, -3])
+    def test_refused_pid(self, db, lockfile, pid):
+        fd = hold_raw(lockfile, f"{pid}\n3\nstart=tok\n".encode())
+        try:
+            self._check(daemonlock.request_reload(db), "unverified", "refused-pid", f"refusing to signal pid {pid}")
+        finally:
+            os.close(fd)
+
+    def test_our_own_pid_is_a_refused_pid(self, db, held):
+        held.append(acquire(db))
+        self._check(daemonlock.request_reload(db), "unverified", "refused-pid")
+
+    @pytest.mark.skipif(IS_ROOT, reason="root-owned files pass the owner check")
+    def test_pid_file_owner(self, db, start_helper, proof, monkeypatch):
+        helper = start_helper(db)
+        proof(helper.pid)
+        monkeypatch.setattr(daemonlock.os, "geteuid", lambda: os.getuid() + 1)
+        monkeypatch.setattr(procident, "process_uid", lambda pid: None)
+        self._check(daemonlock.request_reload(db), "unverified", "pid-file-owner", "pid file owned by uid")
+
+    @pytest.mark.parametrize(
+        "why, code, detail",
+        [
+            (procident.UNAVAILABLE_NOT_LINUX, "not-linux", "signals are verified only on Linux"),
+            (procident.UNAVAILABLE_LOCKS_UNREADABLE, "locks-unreadable", "/proc/locks is not readable"),
+            (procident.UNAVAILABLE_MOUNT_DEVICE, "mount-device", "cannot resolve the pid file's mount device"),
+            (procident.UNAVAILABLE_UNKNOWN, "lock-holders-unknown", "the daemon lock's holders could not be determined"),
+            ("something-new", "lock-holders-unknown", "the daemon lock's holders could not be determined"),
+            (None, "lock-holders-unknown", "the daemon lock's holders could not be determined"),
+        ],
+    )
+    def test_each_unavailable_reason_has_its_own_detail_and_code(self, db, start_helper, monkeypatch, spy, why, code, detail):
+        helper = start_helper(db)
+        asked = []
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: None)
+        monkeypatch.setattr(procident, "flock_holders_unavailable_reason", lambda fd: asked.append(fd) or why)
+        result = daemonlock.request_reload(db)
+        self._check(result, "unverified", code, detail)
+        assert len(asked) == 1 and isinstance(asked[0], int)
+        assert spy.calls == []
+        assert not helper.got_hup()
+
+    @pytest.mark.skipif(IS_LINUX, reason="Linux can read its lock table")
+    def test_on_this_platform_the_real_reason_is_not_linux(self, db, start_helper, spy):
+        helper = start_helper(db)
+        self._check(daemonlock.request_reload(db), "unverified", "not-linux", "signals are verified only on Linux")
+        assert not helper.got_hup()
+
+    def test_the_reason_is_not_asked_when_the_proof_answers(self, db, start_helper, proof, monkeypatch, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        monkeypatch.setattr(procident, "flock_holders_unavailable_reason", lambda fd: pytest.fail("asked"))
+        assert daemonlock.request_reload(db).outcome == "signalled"
+
+    def test_proc_hidden(self, db, start_helper, monkeypatch):
+        pidfd = _FakePidfd(monkeypatch, [])
+        helper = start_helper(db)
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: {helper.pid})
+        monkeypatch.setattr(procident, "identity", lambda pid, tok: "gone")
+        monkeypatch.setattr(procident, "is_zombie", lambda pid: False)
+        self._check(daemonlock.request_reload(db), "unverified", "proc-hidden", "/proc hidden")
+
+    def test_identity_unknown(self, db, start_helper, proof, monkeypatch, kill_path):
+        helper = start_helper(db)
+        proof(helper.pid)
+        monkeypatch.setattr(procident, "identity", lambda pid, tok: "unknown")
+        self._check(daemonlock.request_reload(db), "unverified", "identity-unknown")
+
+    # -- supervisor-gone -----------------------------------------------------
+
+    def test_no_such_process_at_pidfd_open(self, db, start_helper, monkeypatch):
+        pidfd = _FakePidfd(monkeypatch, [])
+        pidfd.open_error = ProcessLookupError(errno.ESRCH, "No such process")
+        start_helper(db)
+        self._check(daemonlock.request_reload(db), "supervisor-gone", "no-such-process")
+
+    def test_no_such_process_from_identity_without_a_pidfd(self, db, start_helper, proof, monkeypatch, kill_path):
+        helper = start_helper(db)
+        proof(helper.pid)
+        monkeypatch.setattr(procident, "identity", lambda pid, tok: "gone")
+        monkeypatch.setattr(procident, "is_zombie", lambda pid: None)
+        self._check(daemonlock.request_reload(db), "supervisor-gone", "no-such-process")
+
+    def test_not_lock_holder(self, db, start_helper, monkeypatch, kill_path):
+        start_helper(db)
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: set())
+        self._check(daemonlock.request_reload(db), "supervisor-gone", "not-lock-holder")
+
+    def test_reused(self, db, start_helper, proof, monkeypatch, kill_path):
+        helper = start_helper(db, spec="{pid}\n3\nstart=bogus:1\n")
+        proof(helper.pid)
+        monkeypatch.setattr(procident, "identity", lambda pid, tok: "mismatch")
+        self._check(daemonlock.request_reload(db), "supervisor-gone", "reused", "mismatch")
+
+    def test_exited(self, db, start_helper, proof, monkeypatch, no_signal):
+        helper = start_helper(db)
+        proof(helper.pid)
+        monkeypatch.setattr(os, "kill", _raise(ProcessLookupError(errno.ESRCH, "x")))
+        self._check(daemonlock.request_reload(db), "supervisor-gone", "exited")
+
+    @pytest.mark.skipif(not HAS_TOKENS, reason="zombie detection needs /proc or sysctl")
+    def test_a_zombie_still_listed_as_a_holder_is_supervisor_gone_and_nothing_is_signalled(
+        self, db, start_helper, zombie, monkeypatch, spy
+    ):
+        proc, token = zombie()
+        holder = start_helper(db, spec=f"{proc.pid}\n3\nstart={token}\n")
+        # the lock table still lists the dead locker (a forked worker holds the file)
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: {proc.pid, holder.pid})
+        spy.calls.clear()
+        result = daemonlock.request_reload(db)
+        self._check(result, "supervisor-gone", "zombie", "has exited (a zombie, not yet reaped)")
+        assert result.pid == proc.pid
+        assert spy.calls == []
+        assert not holder.got_hup()
+
+    @pytest.mark.skipif(not HAS_TOKENS, reason="zombie detection needs /proc or sysctl")
+    def test_the_zombie_verdict_beats_proc_hidden_even_with_a_pidfd(self, db, start_helper, zombie, monkeypatch):
+        order = []
+        pidfd = _FakePidfd(monkeypatch, order)
+        proc, token = zombie()
+        start_helper(db, spec=f"{proc.pid}\n3\nstart={token}\n")
+        monkeypatch.setattr(procident, "flock_write_holders", lambda fd: {proc.pid})
+        spy = SignalSpy(monkeypatch, passthrough=False)
+        pidfd.opened.clear()
+        result = daemonlock.request_reload(db)
+        self._check(result, "supervisor-gone", "zombie")
+        assert spy.calls == [] and pidfd.sent == []
+        assert order == ["pidfd_open"]                     # the pidfd opened fine on a zombie
+        assert all(pidfd.fd_is_closed(fd) for fd, _ in pidfd.opened)
+
+    # -- every code the matrix can produce is a documented one ----------------
+
+    def test_a_signalled_request_has_an_empty_code(self, db, start_helper, proof, spy):
+        helper = start_helper(db)
+        proof(helper.pid)
+        self._check(daemonlock.request_reload(db), "signalled", "")

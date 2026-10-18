@@ -355,3 +355,139 @@ def fake_zfs(tmp_path, monkeypatch) -> FakeZfs:
 
 ANCHOR = "org.zfsbackup:anchor."
 CONFIG_PROP = "org.zfsbackup:config"
+
+
+# --------------------------------------------------------------------------
+# A pretend daemon (live reload, items 19.1 / 19.2)
+# --------------------------------------------------------------------------
+
+import fcntl  # noqa: E402
+
+from zfsbackup import daemonlock  # noqa: E402
+
+_UNSET = object()
+
+
+class FakeDaemon:
+    """Holds the daemon lock for `db` IN THIS PROCESS and writes a chosen pid
+    file, so `daemonlock.probe` / `request_reload` see "a daemon" without a
+    subprocess.
+
+    The flock is taken on a separate open file description, which conflicts
+    with the CLI's own `LOCK_SH|LOCK_NB` exactly as a real holder's does. The
+    recorded pid is whatever the test says (default 4321): nothing ever
+    signals it, because every test that reaches `request_reload` for real
+    either gets a refusal before the signal step (`applied` already at the
+    key, `start=` absent or empty, an `unverified` platform) or patches
+    `request_reload`.
+
+    `start=None` writes the legacy two-line format; any string (including "")
+    writes the v2 format. `raw` writes arbitrary bytes instead.
+    """
+
+    def __init__(self, db: Path, *, pid=4321, generation=None, start="tok",
+                 applied=None, target=None, rejected=None, raw: bytes = None) -> None:
+        db.parent.mkdir(parents=True, exist_ok=True)
+        self.path = daemonlock.lock_path(db)
+        self._fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o660)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        self.set(pid=pid, generation=generation, start=start, applied=applied,
+                 target=target, rejected=rejected, raw=raw)
+
+    def set(self, *, pid=_UNSET, generation=_UNSET, start=_UNSET, applied=_UNSET,
+            target=_UNSET, rejected=_UNSET, raw=None) -> None:
+        """Rewrite the pid file. Omitted fields keep their previous value."""
+        if raw is None:
+            for name, value in (("pid", pid), ("generation", generation), ("start", start),
+                                ("applied", applied), ("target", target),
+                                ("rejected", rejected)):
+                if value is not _UNSET:
+                    setattr(self, name, value)
+            data = daemonlock._format(self.pid, self.generation, self.start,
+                                      self.applied, self.target, self.rejected)
+        else:
+            data = raw
+        os.pwrite(self._fd, data, 0)
+        os.ftruncate(self._fd, len(data))
+
+    def close(self) -> None:
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            os.close(fd)  # drops the flock
+
+    def __enter__(self) -> "FakeDaemon":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+@pytest.fixture
+def fake_daemon():
+    """Factory: `fake_daemon(db, pid=..., applied=(store, gen), ...)`. Every
+    daemon made is released at teardown."""
+    made = []
+
+    def start(db: Path, **kw) -> FakeDaemon:
+        daemon = FakeDaemon(db, **kw)
+        made.append(daemon)
+        return daemon
+
+    yield start
+    for daemon in made:
+        daemon.close()
+
+
+@pytest.fixture
+def live_daemon():
+    """Like `fake_daemon`, but the recorded pid defaults to a LIVE process (this
+    one), for tests of what the CLI reports about a supervisor that exists;
+    `fake_daemon`'s default 4321 is, on most machines, a pid nobody has."""
+    made = []
+
+    def start(db: Path, **kw) -> FakeDaemon:
+        from zfsbackup import procident
+
+        kw.setdefault("pid", os.getpid())
+        # This process's real start token: the status verdict checks the
+        # supervisor's identity, not just that the pid exists.
+        if kw["pid"] == os.getpid():
+            kw.setdefault("start", procident.start_token(os.getpid()) or "tok")
+        daemon = FakeDaemon(db, **kw)
+        made.append(daemon)
+        return daemon
+
+    yield start
+    for daemon in made:
+        daemon.close()
+
+
+def store_key(path: Path) -> tuple:
+    """`(store_id, generation)` of the database, read through the store."""
+    try:
+        snap = read_config(resolve_config_path(str(path)))
+        return snap.store_id, snap.generation
+    finally:
+        dispose_all()
+
+
+@pytest.fixture
+def unsignalable(monkeypatch):
+    """Whatever the host, `request_reload` cannot prove that anything is the
+    daemon (the lock table reads as unavailable, as on macOS), so it answers
+    `unverified` and the CLI never signals the helper processes a test starts:
+    on Linux a genuine lock holder IS signalled, and a SIGHUP kills a plain
+    `python` helper."""
+    monkeypatch.setattr(daemonlock.procident, "flock_write_holders", lambda fd: None)
+    # ...and say WHY, as macOS does, so the wording is the platform one on
+    # every host (on Linux the real reason would be "unknown").
+    monkeypatch.setattr(
+        daemonlock.procident, "flock_holders_unavailable_reason",
+        lambda fd: daemonlock.procident.UNAVAILABLE_NOT_LINUX,
+    )
+
+
+UNVERIFIED_LINUX_ONLY = (
+    "running daemon pid {pid} was not signalled (a daemon can be verified only on "
+    "Linux); it picks up the change within 10s"
+)

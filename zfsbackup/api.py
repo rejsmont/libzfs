@@ -1,7 +1,11 @@
 """Flask API for inspecting daemon configuration and dataset snapshots."""
 
 import contextlib
+import functools
 import json
+import threading
+import time
+from typing import Callable, Optional
 
 from flask import Flask, jsonify, request
 from flask_sock import Sock
@@ -15,10 +19,90 @@ from zfsbackup.backup_manager import (
     PROP_CONFIG, PROP_CLIENT_ID, PROP_SOURCE_DATASET,
 )
 from zfsbackup.config import BackupConfig
+from zfsbackup.remote import WS_IDLE_TIMEOUT
+
+#: Longest `StreamGate.wait_idle` sleeps before re-checking its abort callback.
+_GATE_POLL = 0.5
+
+#: The refusal body for `negotiate`/`stream` while the API worker is draining
+#: for a configuration reload (HTTP 503). `retry` tells a client this is
+#: transient: the replacement worker is up within moments of the drain ending.
+RELOADING_ERROR = {'error': 'server is reloading; retry later', 'retry': True}
+
+
+class StreamGate:
+    """Counts in-flight inbound streams and refuses new ones while draining.
+
+    The API worker hosts the server side of `zfs receive -s`; cycling it in the
+    middle of a receive would tear an inbound stream. On a reload the worker
+    calls `start_draining()` (new streams are refused with a retryable 503,
+    read-only endpoints keep serving) and then `wait_idle()`s for the streams
+    already running to finish before it exits.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._active = 0
+        self._draining = False
+
+    def begin(self) -> bool:
+        """Register a stream; `False` (nothing registered) while draining."""
+        with self._cond:
+            if self._draining:
+                return False
+            self._active += 1
+            return True
+
+    def end(self) -> None:
+        with self._cond:
+            if self._active > 0:
+                self._active -= 1
+            self._cond.notify_all()
+
+    def start_draining(self) -> None:
+        with self._cond:
+            self._draining = True
+            self._cond.notify_all()
+
+    @property
+    def draining(self) -> bool:
+        with self._cond:
+            return self._draining
+
+    @property
+    def active(self) -> int:
+        with self._cond:
+            return self._active
+
+    def wait_idle(
+        self, timeout: Optional[float], abort: Optional[Callable[[], bool]] = None
+    ) -> bool:
+        """Wait until no stream is active -> `True`; `False` on `timeout`
+        (`None` waits indefinitely) or when `abort()` (optional) turns true. Sleeps in
+        slices of at most 0.5s so `abort` is re-evaluated promptly (it is
+        called WITHOUT the gate's lock held)."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            with self._cond:
+                if self._active == 0:
+                    return True
+                remaining = _GATE_POLL if deadline is None else min(
+                    _GATE_POLL, deadline - time.monotonic()
+                )
+                if remaining > 0:
+                    self._cond.wait(timeout=remaining)
+                    if self._active == 0:
+                        return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            if abort is not None and abort():
+                return False
 
 
 def create_app(config: BackupConfig) -> Flask:
     app = Flask(__name__)
+    gate = StreamGate()
+    app.extensions['zfsbackup.stream_gate'] = gate
     app.config['PROPAGATE_EXCEPTIONS'] = True
     sock = Sock(app)
     manager = DatasetManager(config)
@@ -26,6 +110,26 @@ def create_app(config: BackupConfig) -> Flask:
     remote_backup = config.remote_backup
     enabled = bool(remote_backup and remote_backup.enabled)
     target = remote_backup.target_dataset if remote_backup else None
+
+    def _gated(view):
+        """Count `view` as an in-flight remote operation. While the worker
+        drains for a reload, new ones are refused with the retryable 503, and
+        a RELOAD drain waits for the ones running -- so negotiate/register/
+        resume_token (which run `zfs` and create datasets) are not cut off
+        mid-call, and a refused negotiate cannot be mistaken by the client
+        for "no common snapshot" (-> a needless full send)."""
+        @functools.wraps(view)
+        def wrapper(*args, **kwargs):
+            disabled = _require_enabled()  # a disabled server says so, always
+            if disabled is not None:
+                return disabled
+            if not gate.begin():
+                return jsonify(RELOADING_ERROR), 503
+            try:
+                return view(*args, **kwargs)
+            finally:
+                gate.end()
+        return wrapper
 
     def _require_enabled():
         if enabled and target:
@@ -88,6 +192,7 @@ def create_app(config: BackupConfig) -> Flask:
         ])
 
     @app.route('/backup/register', methods=['POST'])
+    @_gated
     def backup_register():
         disabled = _require_enabled()
         if disabled is not None:
@@ -106,6 +211,7 @@ def create_app(config: BackupConfig) -> Flask:
         return jsonify({'target_dataset': client_root})
 
     @app.route('/backup/<client_id>/<path:dataset>/negotiate', methods=['POST'])
+    @_gated
     def backup_negotiate(client_id: str, dataset: str):
         disabled = _require_enabled()
         if disabled is not None:
@@ -157,6 +263,18 @@ def create_app(config: BackupConfig) -> Flask:
             except Exception:
                 pass
             return
+        if not gate.begin():
+            try:
+                ws.send(json.dumps(RELOADING_ERROR))
+            except Exception:
+                pass
+            return
+        try:
+            _receive_stream(ws, client_id, dataset)
+        finally:
+            gate.end()
+
+    def _receive_stream(ws, client_id: str, dataset: str) -> None:
         server_dataset = _server_dataset(client_id, dataset)
         server_fs = Filesystem(server_dataset)
 
@@ -184,7 +302,11 @@ def create_app(config: BackupConfig) -> Flask:
 
         try:
             while True:
-                data = ws.receive()
+                data = ws.receive(timeout=WS_IDLE_TIMEOUT)
+                if data is None:
+                    raise TimeoutError(
+                        f"no data from the client for {WS_IDLE_TIMEOUT}s"
+                    )
                 if isinstance(data, str):
                     msg = json.loads(data)
                     if msg.get('done'):
@@ -212,6 +334,7 @@ def create_app(config: BackupConfig) -> Flask:
                 ws.send(json.dumps({'error': str(e)}))
 
     @app.route('/backup/<client_id>/<path:dataset>/resume_token')
+    @_gated
     def backup_resume_token(client_id: str, dataset: str):
         disabled = _require_enabled()
         if disabled is not None:

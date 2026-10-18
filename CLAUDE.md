@@ -123,18 +123,37 @@ and config objects outlive any session. YAML survives only as an import format a
 
 **[zfsbackup/runtime_config.py](zfsbackup/runtime_config.py)** — a thin daemon wrapper over the
 store's `read_config` that adds the daemon's own error wording. **Only the supervisor reads the config
-DB, once, at startup**; it then disposes every engine and hands its detached `BackupConfig` to every
-worker, including respawns (decision Q4) — workers never open the DB, so all workers always run the
-same generation. A running daemon does not pick up config edits until it is restarted (live reload is
-Phase 3).
+DB** — at startup and on every reload — and disposes every engine after each read; workers never open
+the DB. Each worker receives its config and its epoch together from one `Handoff`.
+
+**Live reload (Phase 3).** The supervisor reloads on SIGHUP and on a 10 s poll of `read_store_state()`
+(`(store_id, generation)`, the store id being `PRAGMA user_version`). Neither trigger kills work:
+- **Checks before a candidate is accepted:** it is read, run through `validate_config` and its dataset list
+  is built. A candidate that fails any of these is rejected; `rejected=` is recorded and the old workers
+  keep running.
+- **Switching an accepted candidate:** the supervisor bumps a shared `ReloadEpoch`. Each worker exits with
+  code 3 at its next safe point (between datasets or destinations, never mid-transfer) and is respawned on
+  the new config. The API worker first drains in-flight receives.
+- **Reporting:** progress is published in the pid file as `applied=`, `target=` and `rejected=`.
+`zfsbackup-config` sends the SIGHUP itself after every committed write, but only to a verified supervisor
+(see daemonlock). Otherwise the poll applies the change.
 
 **[zfsbackup/daemonlock.py](zfsbackup/daemonlock.py)** — the daemon presence lock: `flock` on
-`<db>.daemon.pid` (`pid` and config generation inside). A second daemon on the same DB refuses to
-start; the CLI `probe()`s it to report whether a running daemon is on an older generation. "Running"
-means the lock is held, never that a pid exists, so a file left after a crash is harmless.
+`<db>.daemon.pid`. Pid file v2: lines 1–2 are pid and generation, then `start=`, `applied=`, `target=` and
+`rejected=` lines, written padded so a reader never sees a torn tail. A second daemon on the same DB refuses
+to start, and waits instead if the holder is a verified-dead supervisor's orphans. "Running" means the lock
+is held, never that a pid exists. `request_reload()` is the only SIGHUP sender. It signals only after
+checking:
+- the pid is in `/proc/locks` as the FLOCK WRITE holder of that exact device+inode (Linux only);
+- the pid file is owned by root, by the CLI's own euid, or by the target's uid;
+- the pid + start-time identity matches, and the process is not a zombie.
+Anything it cannot verify is reported (`reason_code`) and left to the poll; macOS therefore never
+signals. [zfsbackup/procident.py](zfsbackup/procident.py) provides the start-time, zombie and lock-holder
+primitives (stdlib only).
 
 Files next to the config DB: `config.db` (+ `-wal`/`-shm` while open), `config.db.writer.lock` (CLI
-writer lock — empty, never deleted), `config.db.daemon.pid` (daemon presence lock), and
+writer lock — empty, never deleted), `config.db.daemon.pid` (daemon presence lock), `config.db.workers.lock`
+(held `LOCK_SH` by every worker, so a new daemon waits for a previous daemon's surviving workers), and
 `config.db.pre-import-<UTC>.yaml` backups written by `import`.
 
 **[zfsbackup/cli/](zfsbackup/cli/)** — the `zfsbackup-config` Click application (Phase 2):
@@ -179,7 +198,15 @@ It is the only writer of the config DB. Exit codes: 0 ok, 1 invalid/refused, 2 u
 | `tests/test_zfsbackup_config_audit.py` | Empty-value / type audit through `from_file` and import, `validate_config` |
 | `tests/test_zfsbackup_importer_cleanup.py` | Failed-first-import cleanup never deletes a DB another process uses; orphaned-sidecar refusal |
 | `tests/test_zfsbackup_store_permissions.py` | Group-operator permission model (mocked Linux ownership) |
-| `tests/test_zfsbackup_daemon_resilience.py` | Restart backoff, shutdown `finally`, abandoned workers, SIGHUP stopgap |
+| `tests/test_zfsbackup_daemon_resilience.py` | Restart backoff, shutdown `finally`, abandoned workers |
+| `tests/test_zfsbackup_reload.py` | Live reload state machine: triggers, rejection, turnover, deferral, real-daemon reloads |
+| `tests/test_zfsbackup_procident.py` | Process identity (start time, zombies) and `/proc/locks` lock-holder parsing |
+| `tests/test_zfsbackup_reload_workers.py` | Worker exit protocol (STOP > SUPERVISOR_GONE > RELOAD), safe points, workers lock — real workers under fork/spawn/forkserver |
+| `tests/test_zfsbackup_stream_gate.py` | API worker drain: `StreamGate`, 503 while draining, server receive timeout |
+| `tests/test_zfsbackup_remote_timeouts.py` | Client websocket timeouts; a failed connect never leaves `zfs send` running; 503 skips the cycle |
+| `tests/test_zfsbackup_startup_waits.py` | Startup waits for a previous daemon's survivors / dead supervisor |
+| `tests/test_zfsbackup_cli_reload.py` | CLI signals after every committed write: once-only matrix, ack loop, notice wording |
+| `tests/test_zfsbackup_cli_status.py` | `zfsbackup-config status`: verdicts, JSON, `--wait` exit codes |
 | `tests/test_zfsbackup_fork_shm.py` | Fork child must not let the parent delete `-wal`/`-shm` (runs in a timed subprocess) |
 | `tests/test_zfsbackup_store_upgrade.py` | Pinned schema head, `upgrade_schema` (transactional, FK check, concurrency), import backup hook |
 | `tests/test_zfsbackup_cli.py` | `zfsbackup-config` commands, path resolution, exit codes, import backups, conflict/busy, daemon notice |

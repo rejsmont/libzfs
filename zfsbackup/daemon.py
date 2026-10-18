@@ -8,7 +8,8 @@ import os
 import signal
 import sys
 import time
-from typing import Dict, List, Optional, Set
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Set, Tuple
 
 from sqlalchemy.exc import DatabaseError, OperationalError
 
@@ -21,7 +22,9 @@ from zfsbackup.config.store import (
     SchemaError,
     check_config_db,
     dispose_all,
+    read_store_state,
     resolve_config_path,
+    validate_config,
 )
 from zfsbackup.runtime_config import (
     config_error_message,
@@ -30,8 +33,15 @@ from zfsbackup.runtime_config import (
 )
 from zfsbackup import daemonlock
 from zfsbackup.backup_manager import DatasetManager
-from zfsbackup.stopflag import StopFlag
-from zfsbackup.workers import SnapshotWorker, PruningWorker, ApiWorker, RemoteBackupWorker
+from zfsbackup import procident
+from zfsbackup.stopflag import ReloadEpoch, StopFlag
+from zfsbackup.workers import (
+    WORKER_EXIT_RELOAD,
+    ApiWorker,
+    PruningWorker,
+    RemoteBackupWorker,
+    SnapshotWorker,
+)
 
 
 logging.basicConfig(
@@ -80,31 +90,149 @@ SUPERVISOR_POLL = 5
 #: `TimeoutStopSec=90s`. On the healthy path -- workers parked in
 #: `stop_event.wait()` -- the tail is one worker's `stopflag.STOP_POLL`
 #: slice, not this one; measured end-to-end shutdowns land at 0.265-0.554s.
+#:
+#: A fourth term since live reload (item 17.2): a SIGTERM that lands while
+#: the supervisor is inside `_reload_tick` waits for that tick to finish. A
+#: poll or reload read can block for up to SQLite's `busy_timeout` (5s), and
+#: an accepted reload then runs `dataset_report`/`verify_datasets`/
+#: `sync_all_config_properties` for the new config -- one `zfs` call per
+#: dataset, though the property sync breaks off at the next dataset once the
+#: flag is up. Nothing is forked after the flag is raised, so the term only
+#: delays the start of `_shutdown_workers`; size `TimeoutStopSec` with it.
 SUPERVISOR_SLEEP_SLICE = 0.25
+
+#: How often the supervisor checks the config database for a committed write
+#: it was not signalled about (decision D2). Shared with the CLI's wording.
+RELOAD_POLL_SECONDS = daemonlock.RELOAD_POLL_SECONDS
+#: A worker still finishing work begun under an older generation is reported
+#: at WARNING once this long after the reload was accepted (decision D5: it is
+#: never killed for a reload) ...
+RELOAD_DEFER_NOTICE = 60
+#: ... and again every this many seconds for as long as it keeps going.
+RELOAD_DEFER_REPEAT = 900
+
+
+@dataclass(frozen=True)
+class Handoff:
+    """What every worker is born with, as one object: the config it runs, the
+    reload epoch that config belongs to, and the `(store_id, generation)` key
+    it was read at (`None` when not known -- a daemon built without one, see
+    `BackupDaemon.__init__`).
+
+    The supervisor replaces the whole object on an accepted reload and only
+    then bumps the shared `ReloadEpoch`; `_new_worker` reads it exactly once,
+    so a worker can never be given one generation's config with another
+    generation's `born_epoch` -- the pairing that would make it either never
+    switch or switch forever.
+    """
+
+    config: BackupConfig
+    epoch: int
+    key: Optional[Tuple[int, int]]
+
+
+def _gen(key: Optional[Tuple[int, int]]) -> str:
+    """The generation half of a reload key, for log lines."""
+    return "unknown" if key is None else str(key[1])
+
+
+#: Config-load failures that are already diagnosed by `config_error_message`
+#: and are logged without a traceback. Anything else -- including a bare
+#: `RuntimeError` such as `MigrationPackagingError` -- is a bug and is logged
+#: with one. `OperationalError` is a `DatabaseError` subclass.
+_EXPECTED_CONFIG_ERRORS = (ConfigPathError, SchemaError, ValueError, DatabaseError)
+
+
+def _build_manager(config: BackupConfig) -> DatasetManager:
+    """Build the `DatasetManager` and its dataset list for `config` exactly as
+    every worker does first thing in `run()`, so a config no worker could
+    start with is refused by the supervisor -- before any worker gets it --
+    instead of crash-looping every worker. Pure: no `zfs` call. Raises what
+    the build raises (`ValueError` for a name `libzfseasy` refuses, e.g.
+    `pool/has space`)."""
+    manager = DatasetManager(config)
+    manager.datasets  # noqa: B018 -- the property builds and validates the list
+    return manager
+
+
+#: Top-level `BackupConfig` settings compared by a reload's summary line.
+_SETTINGS = (
+    'snapshot_prefix', 'check_interval', 'prune_interval', 'api_host',
+    'api_port', 'dry_run', 'destinations', 'remote_backup', 'client_id_file',
+)
+
+
+def _changed_settings(old: BackupConfig, new: BackupConfig) -> List[str]:
+    """Names of the top-level settings that differ between two configs."""
+    return [n for n in _SETTINGS if getattr(old, n, None) != getattr(new, n, None)]
+
+
+def _describe_dataset(ds) -> str:
+    return (
+        f"frequency {ds.frequency}, recursive {ds.recursive}, "
+        f"{len(ds.retention_rules)} retention rule(s), "
+        f"{len(getattr(ds, 'remote', None) or [])} remote(s)"
+    )
 
 
 class BackupDaemon:
-    """Supervisor process: starts and monitors the snapshot, pruning, API, and remote workers."""
+    """Supervisor process: starts, monitors and reconfigures the snapshot,
+    pruning, API and remote workers.
+
+    One main thread, single-threaded by design: the signal handlers only
+    store flags, and every decision -- restart, reload, shutdown -- is taken
+    by `run()`'s poll loop (`_supervisor_sleep` -> `_reload_tick` ->
+    `_check_workers`, with the stop flag re-checked between steps).
+
+    **Live reload (item 17.2).** Two triggers feed one code path: SIGHUP
+    (`zfsbackup-config` sends it after every committed write, once it has
+    verified this process) and a `RELOAD_POLL_SECONDS` poll of the store's
+    `(store_id, generation)` key. A changed key is read in full, validated
+    and, if accepted, becomes the new `Handoff`; the shared `ReloadEpoch` is
+    then bumped, and each worker leaves at its own next safe point with
+    `WORKER_EXIT_RELOAD` and is respawned on the new config by
+    `_check_workers` (a staggered turnover; in-flight work is never killed).
+    A rejected candidate leaves every worker running the old generation.
+    Progress is published in the presence lock's pid file
+    (`applied=`/`target=`/`rejected=`).
+    """
 
     def __init__(
         self,
         config: BackupConfig,
         resolved_config: ResolvedConfigPath,
         verbose: bool = False,
+        *,
+        key: Optional[Tuple[int, int]] = None,
+        presence_lock=None,
+        dry_run_override: bool = False,
+        workers_lock=None,
     ):
-        #: The supervisor's detached `BackupConfig`, read once from the
-        #: config database before the first fork, with `--dry-run` already
-        #: applied. This one object is handed to every worker at startup and
-        #: at every crash restart (see `_new_worker`), so all workers always
-        #: run the same generation; a restart does not re-read the database
-        #: (live reload is Phase 3).
-        self.config = config
-        #: The config *database* path, with its provenance. Kept for
-        #: diagnostics only: nothing here reads the database after startup
-        #: and no worker is given it. Renamed from `config_path` rather than
-        #: merely retyped, so a bare `Path` cannot sneak back in unnoticed.
+        """`key` is the `(store_id, generation)` that `config` was read at.
+        `_run_startup` always passes it. A daemon built without one (unit
+        tests, embedded use) cannot tell a changed store from its own, so
+        live reload is off for it: `_reload_tick` consumes a SIGHUP, logs
+        that it was ignored and never reads the database.
+
+        `presence_lock` is the held `daemonlock.DaemonLock` whose pid file
+        records reload progress (`None` = record nothing).
+        `dry_run_override` is `--dry-run`, re-applied to every config a
+        reload reads. `workers_lock` is the `<db>.workers.lock` path every
+        worker holds `LOCK_SH` on (default: derived from `resolved_config`).
+        """
+        #: Config, epoch and key, swapped as one object by `_try_reload` and
+        #: read once per spawn by `_new_worker`. See `Handoff`.
+        self._handoff = Handoff(config, 0, key)
+        #: The config *database* path, with its provenance. Read by the
+        #: supervisor only: at startup, by every poll and by every reload
+        #: (`_reload_tick`); no worker is given it. Renamed from
+        #: `config_path` rather than merely retyped, so a bare `Path` cannot
+        #: sneak back in unnoticed.
         self.resolved_config = resolved_config
         self.verbose = verbose
+        self._presence_lock = presence_lock
+        self._dry_run_override = dry_run_override
+        self._workers_lock = workers_lock
         #: Not a `multiprocessing.Event`. `Event.set()` blocks forever --
         #: holding the Condition's lock, which then also freezes every
         #: `is_set()` in every process sharing it -- once any worker has
@@ -113,7 +241,48 @@ class BackupDaemon:
         #: children die abruptly on SIGTERM/SIGINT). See
         #: `zfsbackup.stopflag` for the mechanism and the measurements.
         self._stop_event = StopFlag()
+        #: The reload epoch shared with every worker (`zfsbackup.stopflag`):
+        #: created once, never recreated, never touched from a signal
+        #: handler. Bumped by `_try_reload` only, always AFTER the matching
+        #: `Handoff` is in place; always equal to `self._handoff.epoch`
+        #: once that call returns. A supervisor-local counter, never the DB
+        #: generation.
+        self._reload_epoch = ReloadEpoch()
         self._workers: Dict[str, multiprocessing.Process] = {}
+        #: The epoch each live (or not yet classified) worker was born under,
+        #: and the generation of that epoch's config (for log lines only).
+        #: Set by `_spawn`, dropped with the rest of a worker's bookkeeping.
+        self._worker_epoch: Dict[str, int] = {}
+        self._worker_generation: Dict[str, str] = {}
+        #: The last key a reload refused; the poll does not retry it (a
+        #: SIGHUP does). `_rejection_logged` dedupes the ERROR line by
+        #: `(key, message)`.
+        self._rejected: Optional[Tuple[int, int]] = None
+        self._rejection_logged: Optional[tuple] = None
+        #: Poll-only marker: the stored key a poll saw when the full read it
+        #: triggered failed before its own key was known (a stale schema, a
+        #: damaged file, an unloadable row). The poll skips that key until it
+        #: changes, so a broken store is not fully re-read every
+        #: `RELOAD_POLL_SECONDS`. Never published as `rejected=`, never set
+        #: for a transient `OperationalError` (locked/busy) or a
+        #: `SchemaError` (stale schema: the check is cheap, and `migrate`
+        #: changes no key) -- the next poll retries those -- and a SIGHUP
+        #: still forces a read.
+        self._poll_skip: Optional[Tuple[int, int]] = None
+        #: The epoch every live worker has switched to; equal to the current
+        #: epoch when no turnover is in progress.
+        self._applied_epoch = 0
+        #: Wall-clock "HH:MM:SS" of the last accepted reload, for the D9
+        #: crash-loop message.
+        self._accepted_at: Optional[str] = None
+        self._next_poll_at = self._monotonic() + RELOAD_POLL_SECONDS
+        #: `_monotonic()` when the current reload was accepted; `None` before
+        #: the first one. Drives the deferral WARNINGs.
+        self._reload_started_at: Optional[float] = None
+        self._defer_logged_at: Dict[str, float] = {}
+        #: The operator message of the poll failure currently in effect, or
+        #: `None` when the last poll succeeded. See `_note_poll_problem`.
+        self._poll_problem: Optional[str] = None
         #: Workers that crashed `WORKER_MAX_CONSECUTIVE_FAILURES` times in a
         #: row and will never be respawned. Any entry stops the daemon.
         self._crash_looped: Set[str] = set()
@@ -131,7 +300,9 @@ class BackupDaemon:
         #: multiprocessing's atexit handler would otherwise `join()` them
         #: with no timeout.
         self.abandoned_workers: List[str] = []
-        #: Set by `_sighup_handler` (one plain store), consumed by `run()`.
+        #: Set by `_sighup_handler` (one plain store); makes
+        #: `_supervisor_sleep` return early and is consumed -- cleared before
+        #: the read it forces -- by `_reload_tick`.
         self._hup_requested = False
         #: Set by `_signal_handler` (one plain store), read and logged by
         #: `run()`. `None` means the flag was raised by `_check_workers`,
@@ -145,14 +316,17 @@ class BackupDaemon:
     def _sighup_handler(self, signum, frame):
         """Record that SIGHUP arrived and return -- nothing else.
 
-        SIGHUP's default action terminates the process, which would orphan
-        every worker. Live reload does not exist yet (Phase 3), so this is a
-        stopgap: one plain store, read and logged by `run()`'s poll loop
-        ("live reload not implemented; restart to apply"). Same rules as
+        SIGHUP means "the configuration database was written; apply it now"
+        (`zfsbackup-config` sends it after every committed write). The
+        handler is one plain store. `_supervisor_sleep` notices the flag
+        within one `SUPERVISOR_SLEEP_SLICE` and returns, and `_reload_tick`
+        clears it and forces a full read on the main thread. Same rules as
         `_signal_handler`: no logging, no lock, and above all **no database
         access** -- `db._ENGINES_LOCK` is an RLock, so a handler that
         interrupts the main thread while it holds the lock would not
-        deadlock; it would re-enter and see `_ENGINES` half-mutated.
+        deadlock; it would re-enter and see `_ENGINES` half-mutated. Its
+        default action (terminate) would orphan every worker, which is the
+        other reason it is handled at all.
         """
         self._hup_requested = True
 
@@ -226,6 +400,13 @@ class BackupDaemon:
         sig_name = 'SIGINT' if signum == signal.SIGINT else 'SIGTERM'
         logger.info(f"Received {sig_name}, shutting down gracefully...")
 
+    @property
+    def config(self) -> BackupConfig:
+        """The config new workers are given: the current `Handoff`'s.
+        Read-only -- a reload replaces the whole `Handoff`, never this alone
+        (see `_try_reload`)."""
+        return self._handoff.config
+
     def _new_worker(self, name: str) -> multiprocessing.Process:
         cls = {
             'snapshot': SnapshotWorker,
@@ -233,12 +414,35 @@ class BackupDaemon:
             'api': ApiWorker,
             'remote': RemoteBackupWorker,
         }[name]
-        # The same object for every worker and every respawn -- never a path
-        # to re-read. Under `fork` it is inherited; under `spawn` and
-        # `forkserver` it is pickled, and `Duration.__reduce__` carries the
-        # operator's literals across, so a respawned worker sees exactly the
-        # config its siblings run. `dry_run` is already applied to it.
-        return cls(self.config, self._stop_event, self.verbose)
+        # ONE read of the hand-over: config and `born_epoch` come from the
+        # same `Handoff`, never `self.config` plus a separate
+        # `self._reload_epoch.get()` (a reload between the two would pair a
+        # config with the wrong epoch). Never a path to re-read: under `fork`
+        # the config is inherited; under `spawn` and `forkserver` it is
+        # pickled, and `Duration.__reduce__` carries the operator's literals
+        # across, so a respawned worker sees exactly the config its siblings
+        # on the same epoch run. `dry_run` is already applied to it.
+        h = self._handoff
+        return cls(
+            h.config,
+            self._stop_event,
+            self.verbose,
+            reload_epoch=self._reload_epoch,
+            born_epoch=h.epoch,
+            workers_lock=self._workers_lock_path(),
+        )
+
+    def _workers_lock_path(self):
+        """Path of `<db>.workers.lock` for every worker to hold `LOCK_SH` on
+        (item 18.5): the one `_run_startup` passed, else derived from the
+        database path, else `None`. A path, never an open descriptor: the
+        supervisor keeps no `workers.lock` fd across a fork -- each worker
+        opens its own, `O_CLOEXEC`."""
+        if self._workers_lock is not None:
+            return self._workers_lock
+        if self.resolved_config is None:
+            return None
+        return daemonlock.workers_lock_path(self.resolved_config)
 
     def _active_worker_names(self) -> list:
         names = ['snapshot', 'pruning', 'api']
@@ -273,19 +477,43 @@ class BackupDaemon:
 
         The supervisor must be quiescent here: `dispose_all()` is
         pid-guarded and cannot help a connection that is *checked out*, so
-        no session may be open across this call.
+        no session may be open across this call. Every database read the
+        supervisor makes (`_run_startup`, `_reload_tick`, `_try_reload`)
+        disposes in a `finally` straight after it, so none is.
+
+        The worker's epoch is recorded from the same `Handoff` `_new_worker`
+        reads: only this (main) thread ever replaces `self._handoff`, and
+        not between these two lines.
         """
         dispose_all()
+        h = self._handoff
         worker = self._new_worker(name)
         worker.start()
         # Recorded straight after `start()`, before anything that can raise
         # (the log line): an untracked live child would never be joined or
         # terminated at shutdown.
         self._workers[name] = worker
+        self._worker_epoch[name] = h.epoch
+        self._worker_generation[name] = _gen(h.key)
         self._started_at[name] = self._monotonic()
-        logger.info(f"{verb} {name} worker (pid={worker.pid})")
+        on = f" on generation {_gen(h.key)}" if verb == 'Reloaded' else ""
+        logger.info(f"{verb} {name} worker (pid={worker.pid}){on}")
         self._restart_at.pop(name, None)
         return worker
+
+    def _forget_worker(self, name: str, *, keep_failures: bool = True) -> None:
+        """Drop the bookkeeping of a worker that is gone for good (a turnover
+        about to be respawned, or a worker the new config no longer needs).
+        `_failures` survives a turnover, so a worker that crash-loops across
+        a reload still reaches the A-5 limit (D9)."""
+        self._workers.pop(name, None)
+        self._restart_at.pop(name, None)
+        self._started_at.pop(name, None)
+        self._worker_epoch.pop(name, None)
+        self._worker_generation.pop(name, None)
+        self._defer_logged_at.pop(name, None)
+        if not keep_failures:
+            self._failures.pop(name, None)
 
     def _monotonic(self) -> float:
         """The supervisor's clock for restart deadlines: a named seam so
@@ -358,15 +586,26 @@ class BackupDaemon:
         many workers are down, and the stop flag is honoured at the next
         `_supervisor_sleep` slice.
 
-        A restart hands the replacement the supervisor's own `self.config`
-        (see `_new_worker`); it does not re-read the config database, so a
-        crash can never move one worker onto a different generation than its
-        siblings. There is no configuration failure left to classify here:
-        a worker never opens the database, so a bad one is refused by
-        `_run` before any worker exists, and the `EX_CONFIG` exit a worker
-        used to report for it is gone. A worker that dies is restarted with
-        exponential backoff and escalated to the fatal treatment below after
+        A crash restart hands the replacement the supervisor's current
+        `Handoff` (see `_new_worker`); it does not re-read the config
+        database, so a crash can never move one worker onto a different
+        generation than its siblings born on the same epoch. There is no
+        configuration failure left to classify here: a worker never opens
+        the database, so a bad one is refused by `_run_startup` before any worker
+        exists (or, on a reload, by `_try_reload` while the old workers keep
+        running). A worker that dies is restarted with exponential backoff
+        and escalated to the fatal treatment below after
         `WORKER_MAX_CONSECUTIVE_FAILURES` consecutive deaths.
+
+        **Turnover (item 17.2).** A worker that exits `WORKER_EXIT_RELOAD`
+        while its `born_epoch` is below the current epoch did exactly what a
+        reload asked: it is respawned at once on the current `Handoff`
+        ("Reloaded"), with no failure count and no backoff -- or retired, if
+        the current config no longer needs it. A code 3 from a worker born
+        on the current epoch cannot be a reload, so it takes the crash path;
+        during a shutdown any code 3 is just a normal exit. Respawning only
+        a worker that is already dead is also what keeps the API port free:
+        a replacement `ApiWorker` never exists beside the old one.
 
         **One crash-looping worker is fatal to the daemon, not just to that
         worker.** A daemon that keeps three of four workers alive after the
@@ -384,17 +623,66 @@ class BackupDaemon:
         # Workers already waiting out a backoff are skipped: they are still
         # in `_workers` (so `_shutdown_workers` reaps them) but have been
         # accounted for.
+        h = self._handoff
         dead = [
             (name, w) for name, w in self._workers.items()
             if name not in self._restart_at and not w.is_alive()
         ]
 
+        active: Optional[Set[str]] = None
+        turnovers: List[Tuple[str, multiprocessing.Process]] = []
         for name, worker in dead:
+            if worker.exitcode == WORKER_EXIT_RELOAD:
+                if self._stop_event.is_set():
+                    # It saw RELOAD just before STOP: a normal exit, left in
+                    # `_workers` for `_shutdown_workers` to reap.
+                    continue
+                if self._worker_epoch.get(name, h.epoch) < h.epoch:
+                    turnovers.append((name, worker))
+                    continue
+            if active is None:
+                active = set(self._active_worker_names())
+            if name not in active:
+                # Draining after a reload that no longer needs it, and it
+                # crashed instead of switching: nothing to restart.
+                logger.error(
+                    f"{name} worker (pid={worker.pid}) exited with code "
+                    f"{worker.exitcode}; not restarting it: not needed by "
+                    f"generation {_gen(h.key)}"
+                )
+                self._forget_worker(name, keep_failures=False)
+                continue
             if self._record_worker_death(name, worker):
                 self._crash_looped.add(name)
                 del self._workers[name]
 
         if not self._crash_looped:
+            if turnovers and active is None:
+                active = set(self._active_worker_names())
+            for i, (name, worker) in enumerate(turnovers):
+                # Forking into a shutdown is never right.
+                if self._stop_event.is_set():
+                    logger.info(
+                        "Shutdown requested; not respawning remaining "
+                        f"worker(s): {', '.join(n for n, _ in turnovers[i:])}"
+                    )
+                    return
+                retired = name not in active
+                # The same recovery rule a death applies
+                # (`_record_worker_death`): an incarnation that stayed up
+                # `WORKER_STABLE_UPTIME` has recovered, so a turnover must
+                # not carry its earlier crashes forward.
+                now = self._monotonic()
+                if now - self._started_at.get(name, now) >= WORKER_STABLE_UPTIME:
+                    self._failures[name] = 0
+                self._forget_worker(name, keep_failures=not retired)
+                if retired:
+                    logger.info(
+                        f"{name} worker retired: not needed by generation {_gen(h.key)}"
+                    )
+                else:
+                    self._spawn(name, verb='Reloaded')
+
             now = self._monotonic()
             due = [n for n, at in sorted(self._restart_at.items(), key=lambda kv: kv[1]) if at <= now]
             for i, name in enumerate(due):
@@ -408,12 +696,20 @@ class BackupDaemon:
                 self._spawn(name, verb='Restarted')
 
         if self._crash_looped:
+            # D9: no rollback. After a reload the operator needs to know
+            # which generation the crash loop happened on.
+            running = ""
+            if h.epoch > 0:
+                running = (
+                    f" The daemon is running configuration generation "
+                    f"{_gen(h.key)} (accepted at {self._accepted_at})."
+                )
             logger.error(
                 "Worker(s) crashed repeatedly and were not restarted: "
                 f"{', '.join(sorted(self._crash_looped))}. The daemon "
                 "cannot run degraded -- shutting down the remaining "
                 f"workers ({', '.join(sorted(self._workers)) or 'none'}) "
-                "and exiting non-zero. See the worker errors above."
+                f"and exiting non-zero.{running} See the worker errors above."
             )
             # A visible, non-zero exit instead of a spin: this is precisely
             # the "workers have died" case `StopFlag` (see
@@ -421,6 +717,55 @@ class BackupDaemon:
             # on a ghost sleeper the way `multiprocessing.Event` could. If
             # this is ever reverted to `Event`, that guarantee is lost.
             self._stop_event.set()
+
+        if self._stop_event.is_set():
+            return
+        self._log_deferred_switches()
+        self._maybe_complete()
+
+    def _log_deferred_switches(self) -> None:
+        """D5: a reload never kills in-flight work, so a worker busy with a
+        long transfer can stay on the old generation indefinitely. Say so:
+        WARNING per such worker once `RELOAD_DEFER_NOTICE` has passed since
+        the reload was accepted, then every `RELOAD_DEFER_REPEAT`."""
+        h = self._handoff
+        if self._reload_started_at is None or self._applied_epoch >= h.epoch:
+            return
+        now = self._monotonic()
+        if now - self._reload_started_at < RELOAD_DEFER_NOTICE:
+            return
+        for name, worker in self._workers.items():
+            if name in self._restart_at or self._worker_epoch.get(name, h.epoch) >= h.epoch:
+                continue
+            if not worker.is_alive():
+                continue  # classified by the next `_check_workers`
+            last = self._defer_logged_at.get(name)
+            if last is not None and now - last < RELOAD_DEFER_REPEAT:
+                continue
+            self._defer_logged_at[name] = now
+            logger.warning(
+                f"{name} worker (pid={worker.pid}) is still finishing work begun "
+                f"under generation {self._worker_generation.get(name, 'unknown')}; "
+                f"it switches to {_gen(h.key)} at its next safe point "
+                "(in-flight transfers are never interrupted)"
+            )
+
+    def _maybe_complete(self) -> None:
+        """Record a reload as applied once every live worker runs the
+        current epoch. A worker waiting out a crash backoff counts as
+        switched: it will be respawned on the current `Handoff`."""
+        h = self._handoff
+        if self._applied_epoch >= h.epoch:
+            return
+        for name in self._workers:
+            if name in self._restart_at:
+                continue
+            if self._worker_epoch.get(name, h.epoch) < h.epoch:
+                return
+        self._applied_epoch = h.epoch
+        if self._presence_lock is not None:
+            self._presence_lock.set_state(applied=h.key, target=None)
+        logger.info(f"generation {_gen(h.key)} applied by all workers")
 
     def _shutdown_workers(self, timeout: int = 30) -> None:
         """Join every worker, escalating to SIGTERM then SIGKILL.
@@ -476,7 +821,10 @@ class BackupDaemon:
                 self.abandoned_workers.append(name)
 
     def _supervisor_sleep(self, seconds: float) -> None:
-        """Sleep up to `seconds`, returning as soon as the stop flag is set.
+        """Sleep up to `seconds`, returning as soon as the stop flag is set
+        or a SIGHUP is pending (`_hup_requested`, one attribute read per
+        slice), so a reload request waits at most one
+        `SUPERVISOR_SLEEP_SLICE` before `_reload_tick` acts on it.
 
         Called exactly once per poll iteration, in place of a bare
         `time.sleep(SUPERVISOR_POLL)`.
@@ -515,6 +863,8 @@ class BackupDaemon:
         """
         deadline = time.monotonic() + seconds
         while not self._stop_event.is_set():
+            if self._hup_requested:
+                return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
@@ -534,10 +884,12 @@ class BackupDaemon:
 
         manager = DatasetManager(self.config)
         manager.dataset_report()
-        manager.verify_datasets()
+        # Stop-guarded per dataset, like a reload's: a SIGTERM here is not
+        # held up by one `zfs` call per remaining dataset.
+        manager.verify_datasets(should_stop=self._stop_event.is_set)
 
         logger.info("Syncing dataset configs to ZFS properties...")
-        manager.sync_all_config_properties()
+        manager.sync_all_config_properties(should_stop=self._stop_event.is_set)
 
         # Everything above this line shells out to `zfs` once per dataset
         # and takes tens of seconds on a large config, so a SIGTERM landing
@@ -560,6 +912,13 @@ class BackupDaemon:
         # runs the usual escalating join; the exception still propagates to
         # `_run`, which logs it and exits 1.
         try:
+            if not self._stop_event.is_set():
+                # Before the first spawn: a SIGHUP carried over from
+                # `_StartupHup`, or a write that landed while the sync above
+                # ran, is applied now -- onto workers that do not exist yet,
+                # so there is no turnover and no double cycle.
+                self._reload_tick(startup=True)
+
             if self._stop_event.is_set():
                 # Idempotent, and called here too only so the "Received SIGTERM"
                 # line precedes its consequence in the log.
@@ -574,9 +933,12 @@ class BackupDaemon:
 
                 while not self._stop_event.is_set():
                     self._supervisor_sleep(SUPERVISOR_POLL)
-                    self._report_hup()
-                    if not self._stop_event.is_set():
-                        self._check_workers()
+                    if self._stop_event.is_set():
+                        break
+                    self._reload_tick()
+                    if self._stop_event.is_set():
+                        break
+                    self._check_workers()
         finally:
             self._stop_event.set()
             # The line `_signal_handler` deliberately does not log itself. Here
@@ -588,11 +950,311 @@ class BackupDaemon:
         logger.info("Daemon stopped")
         return 1 if self._crash_looped else 0
 
-    def _report_hup(self) -> None:
-        """Log the SIGHUP stopgap message `_sighup_handler` must not log itself."""
-        if self._hup_requested:
+    # -- live reload (item 17.2) -------------------------------------------
+
+    def _reload_tick(self, startup: bool = False) -> None:
+        """Decide whether to read the configuration again, and do it.
+
+        Called from `run()`'s loop between `_supervisor_sleep` and
+        `_check_workers`, and once with `startup=True` before the first
+        spawn. Two triggers, one path (D1):
+
+        - **SIGHUP** (`_hup_requested`) forces a full read. The flag is
+          cleared BEFORE the read: a SIGHUP that lands later forces another
+          tick, and the write behind this one was committed before its
+          signal was sent, so the read below sees it.
+        - **The poll**, every `RELOAD_POLL_SECONDS` (and always at startup):
+          `read_store_state`, and a full read only when the stored key
+          differs from both the running key and the last rejected one.
+
+        Every database read is followed by `dispose_all()` in a `finally`,
+        including a read that raises, so no pooled connection exists at the
+        next fork. Stop beats everything: nothing is read once the flag is
+        up.
+        """
+        h = self._handoff
+        forced = self._hup_requested
+        if forced:
             self._hup_requested = False
-            logger.warning("Received SIGHUP: live reload not implemented; restart to apply")
+        if h.key is None:
+            if forced:
+                logger.warning(
+                    "Received SIGHUP, but this daemon was started without a "
+                    "configuration key, so live reload is off; restart it to "
+                    "apply configuration changes"
+                )
+            return
+        now = self._monotonic()
+        if not (forced or startup or now >= self._next_poll_at):
+            return
+        self._next_poll_at = now + RELOAD_POLL_SECONDS
+        if self._stop_event.is_set():
+            return
+        if not forced:
+            try:
+                try:
+                    state = read_store_state(self.resolved_config)
+                finally:
+                    dispose_all()
+            except Exception as e:
+                self._note_poll_problem(e)
+                return
+            self._note_poll_problem(None)
+            stored = (state.store_id, state.generation)
+            if stored in (h.key, self._rejected, self._poll_skip):
+                return
+            self._try_reload('poll', startup=startup, polled=stored)
+        else:
+            self._try_reload('SIGHUP', startup=startup)
+
+    def _describe_failure(self, exc: Exception) -> str:
+        """`config_error_message` with the reload wording, never raising."""
+        try:
+            return config_error_message(self.resolved_config, exc, reloading=True)
+        except Exception:  # pragma: no cover - the message must never kill the loop
+            return f"{type(exc).__name__}: {exc}"
+
+    def _note_poll_problem(self, exc: Optional[Exception]) -> None:
+        """Log a poll failure once per state change: WARNING when a problem
+        starts (or its message changes), INFO when it clears, DEBUG while it
+        persists. The daemon keeps running its current generation either
+        way."""
+        running = _gen(self._handoff.key)
+        if exc is None:
+            if self._poll_problem is not None:
+                self._poll_problem = None
+                logger.info(
+                    "the configuration database can be checked for changes "
+                    f"again; running generation {running}"
+                )
+            return
+        message = self._describe_failure(exc)
+        # The store's message goes LAST and verbatim: its last line may be a
+        # command meant to be pasted into a shell.
+        line = (
+            "cannot check the configuration database for changes; still "
+            f"running generation {running}:\n{message}"
+        )
+        if message != self._poll_problem:
+            self._poll_problem = message
+            # Diagnosed failures carry no traceback; anything else is a bug
+            # and is undiagnosable without one.
+            logger.warning(line, exc_info=not isinstance(exc, _EXPECTED_CONFIG_ERRORS))
+        else:
+            logger.debug(line)
+
+    def _reject(
+        self,
+        trigger: str,
+        key: Optional[Tuple[int, int]],
+        exc: Exception,
+        *,
+        polled: Optional[Tuple[int, int]] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        """A candidate that could not be read, failed `validate_config`, or
+        cannot be built (`_build_manager`): log it (deduplicated by
+        `(key, message)`), and when its key is known remember it so the poll
+        does not retry it, and publish it as `rejected=` in the pid file.
+        When the key is unknown but a poll triggered the read, `polled` is
+        remembered as the poll-only `_poll_skip` marker instead (not for a
+        transient `OperationalError`). The workers keep running the current
+        generation. `message` replaces `config_error_message`'s wording."""
+        if message is None:
+            message = self._describe_failure(exc)
+        # The clause first, the store's message LAST and verbatim: its last
+        # line may be a command meant to be pasted into a shell.
+        line = (
+            f"configuration generation {_gen(key)} rejected (trigger: {trigger}); "
+            f"still running generation {_gen(self._handoff.key)}:\n{message}"
+        )
+        if (key, message) != self._rejection_logged:
+            self._rejection_logged = (key, message)
+            # Diagnosed failures carry no traceback; anything else is a bug
+            # and is undiagnosable without one.
+            logger.error(line, exc_info=not isinstance(exc, _EXPECTED_CONFIG_ERRORS))
+        else:
+            logger.debug(line)
+        if key is not None:
+            if key != self._rejected:
+                self._rejected = key
+                if self._presence_lock is not None:
+                    self._presence_lock.set_state(rejected=key)
+        elif polled is not None and not isinstance(exc, (OperationalError, SchemaError)):
+            # Not for a transient storage failure, and not for a schema
+            # failure: `check_schema` runs first in `read_config`, before any
+            # row, so a retry costs one tiny read transaction, and `migrate`
+            # keeps the store id and generation -- only a retry picks the
+            # migrated store up without a SIGHUP. The ERROR above is logged
+            # once per `(key, message)`; each retry logs at DEBUG.
+            self._poll_skip = polled
+
+    def _try_reload(
+        self,
+        trigger: str,
+        *,
+        startup: bool = False,
+        polled: Optional[Tuple[int, int]] = None,
+    ) -> None:
+        """Read, validate, build and -- if it is a different, usable
+        configuration -- switch to it. The key recorded is the one
+        `read_config`'s snapshot returned, never the poll's (`polled` is only
+        a `_poll_skip` marker for a read that failed before its key was
+        known): a write between the poll and this read is simply part of
+        what is applied.
+
+        Refused, with the old workers left running, when the read fails,
+        `validate_config` raises, or the dataset list cannot be built
+        (`_build_manager`, the first thing every worker does): a config that
+        would crash-loop every worker is never accepted. Only the steps that
+        call `zfs` -- `verify_datasets` and the property sync -- are
+        advisory, logged and continued past. Stop beats all of it: nothing
+        is accepted, recorded or switched once the flag is up.
+
+        Order matters and is the contract workers rely on: the new `Handoff`
+        is stored BEFORE `ReloadEpoch.set()`, so any worker spawned after a
+        worker could observe the new epoch is born with the new config and
+        the new epoch together.
+
+        The catch is deliberately broad (`Exception`, bare `RuntimeError`
+        included, unlike startup's): a running daemon keeps its current
+        generation rather than dying over a candidate. Undiagnosed types are
+        logged with a traceback (`_EXPECTED_CONFIG_ERRORS`).
+        """
+        h = self._handoff
+        key: Optional[Tuple[int, int]] = None
+        try:
+            try:
+                snap = load_runtime_config(self.resolved_config)
+                key = (snap.store_id, snap.generation)
+                warnings = validate_config(snap.config)
+            finally:
+                dispose_all()
+        except Exception as e:
+            self._reject(trigger, key, e, polled=polled)
+            return
+
+        if key == h.key:
+            if trigger == 'SIGHUP':
+                logger.info(f"SIGHUP: configuration unchanged (generation {_gen(key)})")
+            return
+
+        config = snap.config
+        try:
+            manager = _build_manager(config)
+        except Exception as e:
+            self._reject(
+                trigger, key, e, message=f"its dataset list cannot be used: {e}"
+            )
+            return
+        if self._stop_event.is_set():
+            return
+
+        # `--dry-run` is a property of this run, never of the stored
+        # configuration: it survives every reload.
+        if self._dry_run_override:
+            config.dry_run = True
+        for warning in warnings:
+            logger.warning(f"configuration generation {_gen(key)}: {warning}")
+        logger.info(
+            f"configuration generation {_gen(key)} accepted "
+            f"(was {_gen(h.key)}; trigger: {trigger})"
+        )
+        if self._presence_lock is not None:
+            self._presence_lock.set_state(target=key, rejected=None)
+
+        old = {ds.name: ds for ds in h.config.datasets}
+        new = {ds.name: ds for ds in config.datasets}
+        added = sorted(new.keys() - old.keys())
+        removed = sorted(old.keys() - new.keys())
+        changed = sorted(n for n in new.keys() & old.keys() if new[n] != old[n])
+        settings = _changed_settings(h.config, config)
+        if logger.isEnabledFor(logging.DEBUG):
+            manager.dataset_report()
+
+        try:
+            manager.verify_datasets(should_stop=self._stop_event.is_set)
+            logger.info("Syncing dataset configs to ZFS properties...")
+            manager.sync_all_config_properties(should_stop=self._stop_event.is_set)
+        except Exception as e:
+            # The `zfs`-calling steps only (existence checks, property sync):
+            # advisory, and a failure here must not take a running daemon
+            # down. Everything that could stop a worker from starting was
+            # checked above.
+            logger.error(
+                f"checking or syncing the datasets of generation {_gen(key)} "
+                f"failed: {e}; continuing",
+                exc_info=True,
+            )
+        if self._stop_event.is_set():
+            # Shutdown proceeds; `target=` stays recorded, nothing switches.
+            return
+
+        epoch = h.epoch + 1
+        self._handoff = Handoff(config, epoch, key)
+        self._reload_epoch.set(epoch)
+        self._rejected = None
+        self._rejection_logged = None
+        self._poll_skip = None
+        self._reload_started_at = self._monotonic()
+        self._defer_logged_at.clear()
+        self._accepted_at = time.strftime("%H:%M:%S")
+
+        how = (
+            "no workers are running yet" if startup
+            else "workers switch over at their next safe point"
+        )
+        what = f"+{len(added)}, -{len(removed)}, ~{len(changed)} datasets"
+        if settings:
+            what += f"; settings changed: {', '.join(settings)}"
+        logger.info(
+            f"Reloading: generation {_gen(h.key)} -> {_gen(key)} ({what}); {how}"
+        )
+        # Logged only now, after the stop check above: a reload interrupted
+        # by a shutdown must not describe a switch that never happened. Only
+        # what changed at INFO; the full per-dataset block (which startup
+        # prints) only under --verbose, not on every `set`.
+        for name in added:
+            logger.info(f"  added dataset {name}: {_describe_dataset(new[name])}")
+        for name in changed:
+            logger.info(f"  changed dataset {name}: {_describe_dataset(new[name])}")
+        for name in removed:
+            logger.info(f"  removed dataset {name}")
+        if 'snapshot_prefix' in settings:
+            logger.warning(
+                f"snapshot_prefix changed from {h.config.snapshot_prefix} to "
+                f"{config.snapshot_prefix}: snapshots named "
+                f"{h.config.snapshot_prefix}_* are no longer managed or pruned"
+            )
+
+        if not startup:
+            self._adjust_worker_set()
+        self._maybe_complete()
+
+    def _adjust_worker_set(self) -> None:
+        """After a reload: retire workers in backoff that the new config no
+        longer needs, and start the ones it newly needs. A name still in
+        `_workers` -- live, draining, or dead and not yet classified -- is
+        left to `_check_workers`, which respawns it only once it has exited:
+        never a second instance beside the first (the API port)."""
+        if self._crash_looped:
+            return
+        h = self._handoff
+        active = self._active_worker_names()
+        for name in sorted(self._restart_at):
+            if name not in active:
+                self._forget_worker(name, keep_failures=False)
+                logger.info(f"{name} worker retired: not needed by generation {_gen(h.key)}")
+        missing = [n for n in active if n not in self._workers]
+        for i, name in enumerate(missing):
+            # Forking into a shutdown is never right.
+            if self._stop_event.is_set():
+                logger.info(
+                    "Shutdown requested; not starting worker(s): "
+                    f"{', '.join(missing[i:])}"
+                )
+                return
+            self._spawn(name)
 
 
 def main():
@@ -697,6 +1359,81 @@ def _hard_exit(code: int, abandoned: List[str]) -> None:  # pragma: no cover - e
     os._exit(code or 1)
 
 
+#: Seams for the startup waits: tests advance time without sleeping.
+_startup_sleep = time.sleep
+_startup_monotonic = time.monotonic
+
+#: Poll interval of the startup waits, and how often their WARNING repeats.
+_STARTUP_WAIT_POLL = 1.0
+_STARTUP_WARN_EVERY = 60.0
+
+
+def _acquire_presence_lock(resolved):
+    """`daemonlock.acquire(resolved)`, except that a lock held by the fork
+    orphans of a verifiably dead supervisor is waited out rather than refused.
+
+    `DaemonAlreadyRunning` is re-raised unless the recorded supervisor is
+    `'gone'` or `'mismatch'` by `procident.identity(e.pid, e.start)`: then the
+    holders are workers of a daemon that was `kill -9`'d, which exit at their
+    next safe point (a transfer in progress is never interrupted). Retried
+    every second, with a WARNING at the start and every 60s. `'match'` (a live
+    daemon) and `'unknown'` (legacy file, no token, unreadable) are refused as
+    before. SIGINT/SIGTERM keep their default dispositions here, so the wait
+    stays killable.
+    """
+    last_warned = None
+    while True:
+        try:
+            return daemonlock.acquire(resolved)
+        except daemonlock.DaemonAlreadyRunning as e:
+            if procident.identity(e.pid, e.start) not in ('gone', 'mismatch'):
+                raise
+            now = _startup_monotonic()
+            if last_warned is None or now - last_warned >= _STARTUP_WARN_EVERY:
+                last_warned = now
+                logger.warning(
+                    f"{daemonlock.stale_supervisor_message(e.path, e.pid)}; "
+                    "waiting for them to exit (they stop at their next safe "
+                    "point and a transfer in progress is never interrupted)"
+                )
+            _startup_sleep(_STARTUP_WAIT_POLL)
+
+
+def _wait_for_previous_workers(resolved) -> None:
+    """Block while workers of a previous daemon still hold
+    `<db>.workers.lock` (item 18.5). Under `spawn`/`forkserver` such survivors
+    hold no presence lock, so without this a restarted daemon could overlap
+    with a worker finishing its last dataset. Called right after the presence
+    lock is taken and before the config is read.
+
+    A detection aid, not a gate: if the lock file cannot be created or
+    inspected, log a WARNING and carry on. SIGINT/SIGTERM keep their default
+    dispositions during the wait (no workers exist yet; stay killable).
+    """
+    try:
+        path = daemonlock.ensure_workers_lock(resolved)
+        present = daemonlock.workers_present(resolved)
+    except (daemonlock.DaemonLockError, OSError) as e:
+        logger.warning(f"cannot check for workers of a previous daemon: {e}")
+        return
+    last_warned = None
+    while present:
+        now = _startup_monotonic()
+        if last_warned is None or now - last_warned >= _STARTUP_WARN_EVERY:
+            last_warned = now
+            logger.warning(
+                f"workers of a previous daemon still hold {path}; waiting for "
+                "them to finish -- they exit at their next safe point and a "
+                f"transfer in progress is never interrupted. Find them with `fuser {path}`"
+            )
+        _startup_sleep(_STARTUP_WAIT_POLL)
+        try:
+            present = daemonlock.workers_present(resolved)
+        except (daemonlock.DaemonLockError, OSError) as e:
+            logger.warning(f"cannot check for workers of a previous daemon: {e}")
+            return
+
+
 def _release_refused(lock) -> None:
     """A startup refusal after the presence lock was taken (the config failed
     to load): remove the pid file and drop the lock, so a refused start leaves
@@ -714,8 +1451,9 @@ class _StartupHup:
     real handler. In that window SIGHUP has its default action, terminate,
     so a config edit racing a daemon start killed the starting daemon
     (measured 8/8). This handler does one plain store and returns; `_run`
-    carries the result into the daemon's own `_hup_requested`, so the first
-    poll logs it exactly as it would a SIGHUP received later.
+    carries the result into the daemon's own `_hup_requested` (set-only), and
+    `run()`'s startup `_reload_tick` -- before the first spawn -- forces the
+    read, so a write that raced the start is applied with no worker turnover.
 
     Deliberately SIGHUP only. SIGINT/SIGTERM keep their default
     dispositions until `BackupDaemon.__init__`: before the first fork there
@@ -754,6 +1492,13 @@ def _run(args: argparse.Namespace, abandoned: Optional[List[str]] = None) -> int
     `_run_startup`. Installed before anything else -- in particular before the
     presence lock -- and left in place until `BackupDaemon` replaces it.
     """
+    # Every full read runs Alembic's schema check, which logs two routine
+    # INFO lines ("Context impl SQLiteImpl", "Will assume non-transactional
+    # DDL"). With live reload the supervisor reads on every accepted change,
+    # so keep them out of the log unless something is actually wrong --
+    # except under --verbose, which shows them as before.
+    if not getattr(args, 'verbose', False):
+        logging.getLogger('alembic').setLevel(logging.WARNING)
     early_hup = _StartupHup()
     if not args.test_config:  # `--test-config` takes no lock and is never probed
         early_hup.install()
@@ -779,9 +1524,10 @@ def _run_startup(
     `finally` rather than something each `return` has to remember.
 
     Startup order: resolve the path -> preflight (`check_config_db`, creates
-    nothing) -> take the presence lock -> read the config -> record its
-    generation in the lock -> `BackupDaemon.run`. `--test-config` skips the
-    lock. Any refusal after the lock was taken releases it.
+    nothing) -> take the presence lock -> wait out a predecessor's workers ->
+    read the config -> `validate_config` -> record its key as `applied=` in
+    the lock -> `BackupDaemon.run`. `--test-config` skips the lock but not
+    the validation. Any refusal after the lock was taken releases it.
     """
     resolved = None
     lock = None
@@ -812,41 +1558,73 @@ def _run_startup(
         if not args.test_config:
             check_config_db(resolved)
             try:
-                lock = daemonlock.acquire(resolved)
+                lock = _acquire_presence_lock(resolved)
             except daemonlock.DaemonAlreadyRunning as e:
                 logger.error(f"{e}. Refusing to start a second daemon.")
                 return 1
             except daemonlock.DaemonLockError as e:
                 logger.error(f"Cannot take the daemon lock: {e}")
                 return 1
+            # Survivors of a previous daemon (item 18.5), before the config
+            # is read and long before the first fork.
+            _wait_for_previous_workers(resolved)
 
-        # The daemon's ONE read of the config database: a single read
+        # The daemon's startup read of the config database: a single read
         # snapshot in which the schema check and the rows are the same
         # database state. The supervisor hands the resulting detached
         # `BackupConfig` to its workers, which never open the database
-        # (item 15.2(b)).
-        snapshot = load_runtime_config(resolved)
+        # (item 15.2(b)); later reads are the supervisor's reload polls.
+        # Disposed in a `finally`, so not even a failed read leaves a pooled
+        # reader connection to sit on through the long dataset verification
+        # below or to carry towards the first fork. `_spawn` repeats the
+        # dispose at every fork.
+        try:
+            snapshot = load_runtime_config(resolved)
+        finally:
+            dispose_all()
         config = snapshot.config
         generation = snapshot.generation
+        key = (snapshot.store_id, generation)
         logger.info(
             f"Configuration generation {generation}, "
             f"schema revision {snapshot.schema_rev}"
         )
-        # The generation recorded in the lock is the one the workers are
-        # about to run, which is what `zfsbackup-config` reports to an
-        # operator after an edit. Until this line the file's generation is
-        # empty ("not known yet").
+        # D10: the same check every reload applies, so a configuration this
+        # daemon would refuse on a reload is never run at startup either. A
+        # `ValueError` is an operator-grade message: no traceback.
+        try:
+            warnings = validate_config(config)
+        except ValueError as e:
+            logger.error(f"configuration generation {generation} is invalid: {e}")
+            _release_refused(lock)
+            return 1
+        for warning in warnings:
+            logger.warning(f"configuration generation {generation}: {warning}")
+        # And the build every worker does first (`_build_manager`): a
+        # dataset list no worker could start with -- an invalid ZFS name --
+        # is refused here, cleanly, rather than by six crash-loops per worker
+        # and a "Daemon failed" exit minutes later. Same refusal as above.
+        try:
+            _build_manager(config)
+        except Exception as e:
+            logger.error(
+                f"configuration generation {generation} cannot be used: "
+                f"its dataset list cannot be built: {e}",
+                exc_info=not isinstance(e, ValueError),
+            )
+            _release_refused(lock)
+            return 1
+        # The key recorded in the lock is the one the workers are about to
+        # run, which is what `zfsbackup-config` reports to an operator after
+        # an edit (`applied=` also rewrites line 2 with the generation).
+        # Until this line the file's generation is empty ("not known yet").
         if lock is not None:
-            lock.set_generation(generation)
-        # Nothing reads the database again for the life of this process
-        # (live reload is Phase 3), so do not sit on its pooled reader
-        # connection through the long dataset verification below, nor carry
-        # it towards the first fork. `_spawn` repeats this at every fork.
-        dispose_all()
+            lock.set_state(applied=key)
 
         # In memory only, and BEFORE the config is handed to any worker.
         # `--dry-run` is a property of this run, not of the stored
-        # configuration, and the daemon never writes to the database.
+        # configuration, and the daemon never writes to the database. Every
+        # config a reload reads gets it again (`dry_run_override`).
         if args.dry_run:
             config.dry_run = True
 
@@ -901,7 +1679,15 @@ def _run_startup(
     daemon = None
     clean = False
     try:
-        daemon = BackupDaemon(config, resolved, verbose=args.verbose)
+        daemon = BackupDaemon(
+            config,
+            resolved,
+            verbose=args.verbose,
+            key=key,
+            presence_lock=lock,
+            dry_run_override=bool(args.dry_run),
+            workers_lock=daemonlock.workers_lock_path(resolved),
+        )
         # `BackupDaemon.__init__` has replaced the startup handler; a SIGHUP
         # that landed before that is carried over. A SIGHUP landing between
         # the replacement and this line went to the daemon's own handler.

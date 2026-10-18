@@ -84,6 +84,7 @@ from _cli_support import (
     stderr_lines,
     stored,
     stub,
+    unsignalable,
     warnings_in,
     write_yaml,
 )
@@ -107,6 +108,12 @@ RENAME_YAML = RICH_YAML.replace(
     '  - name: "a"\n',
     '  - name: "tank/other"\n    remote:\n      - destination: "offsite"\n  - name: "a"\n',
 )
+
+
+#: The first words of the advice printed after a `rename destination` that left
+#: stale anchors (it used to begin "Restart the daemon now"; a running daemon
+#: now reloads, so only a legacy one is told to restart).
+ADVICE = "A running daemon reloads the configuration"
 
 
 @pytest.fixture(autouse=True)
@@ -560,7 +567,7 @@ class TestRenameDatasetClearStale:
     # -- the daemon check: AFTER the write, held through the clears ------
 
     def test_a_running_daemon_means_nothing_is_cleared_but_the_rename_happened(
-        self, run, rich, stale, daemon_lock_holder
+        self, run, rich, stale, daemon_lock_holder, unsignalable
     ):
         holder = daemon_lock_holder(rich, generation=0)
         result = self.clear(run, rich)
@@ -575,7 +582,9 @@ class TestRenameDatasetClearStale:
         assert stale.mutations == [] and stale.props("tank/vm.01") == self.PROPS
         assert "config updated" in result.stdout                 # the daemon notice still printed
 
-    def test_the_daemon_check_is_after_the_write_not_before(self, run, rich, stale, daemon_lock_holder, monkeypatch):
+    def test_the_daemon_check_is_after_the_write_not_before(
+        self, run, rich, stale, daemon_lock_holder, monkeypatch, unsignalable
+    ):
         daemon_lock_holder(rich, generation=0)
         order = []
         real = rename.commit_config
@@ -592,7 +601,9 @@ class TestRenameDatasetClearStale:
         self.clear(run, rich)
         assert order == ["write", "daemon check"]
 
-    def test_a_daemon_does_not_block_a_rename_without_the_flag(self, run, rich, stale, daemon_lock_holder):
+    def test_a_daemon_does_not_block_a_rename_without_the_flag(
+        self, run, rich, stale, daemon_lock_holder, unsignalable
+    ):
         daemon_lock_holder(rich, generation=0)
         result = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich)
         assert result.exit_code == 0, result.stderr
@@ -712,7 +723,9 @@ class TestRenameDatasetClearStale:
         assert "supervisor" not in out + err and "refus" not in (out + err).lower()
         assert stale.props("tank/vm.01") == {"compression": "lz4"}
 
-    def test_dry_run_notes_a_running_daemon_and_still_does_nothing(self, run, rich, stale, daemon_lock_holder):
+    def test_dry_run_notes_a_running_daemon_and_still_does_nothing(
+        self, run, rich, stale, daemon_lock_holder, unsignalable
+    ):
         daemon_lock_holder(rich, generation=0)
         state = db_state(rich)
         result = self.clear(run, rich, "-d")
@@ -910,8 +923,12 @@ class TestRenameDestination:
 
     def test_the_advice_after_a_rename(self, run, rich, anchors):
         out = self.rename(run, rich).stdout
-        assert "Restart the daemon now so it uses the new name 'offsite2'" in out
-        assert "the daemon protects every local or received org.zfsbackup:anchor.* property" in out
+        assert (
+            "A running daemon reloads the configuration (see below) and then uses the "
+            "new name 'offsite2'; until then, and after, the daemon protects every "
+            "local or received org.zfsbackup:anchor.* property"
+        ) in out
+        assert "Restart the daemon" not in out
         assert "anchor.offsite keeps protecting its snapshot from pruning" in out
         assert "Once a send to 'offsite2' has succeeded, clear the old property" in out
         assert f"zfs inherit {ANCHOR}offsite tank/data" in out
@@ -923,19 +940,19 @@ class TestRenameDestination:
         out = self.rename(run, rich).stdout
         hints = [l for l in out.splitlines() if l.strip().startswith("zfs inherit")]
         assert hints == [f"  zfs inherit {ANCHOR}offsite tank/other"]
-        assert "on 'tank/other'" in out and "'tank/data'" not in out.split("Restart the daemon")[1]
+        assert "on 'tank/other'" in out and "'tank/data'" not in out.split("A running daemon reloads")[1]
 
     def test_no_advice_when_no_anchor_was_involved(self, run, rich, fake_zfs):
         fake_zfs.add("tank/data", {})
         fake_zfs.add("tank/other", {})
-        assert "Restart the daemon" not in self.rename(run, rich).stdout
+        assert ADVICE not in self.rename(run, rich).stdout
 
     def test_a_destination_nobody_uses_needs_no_zfs(self, run, rich, fake_zfs, monkeypatch):
         monkeypatch.setattr(rename, "_load_backup_manager", lambda: (None, "no zfs"))
         result = run("rename", "destination", "spare", "spare2", "-c", rich)
         assert result.exit_code == 0, result.stderr
         assert "spare2" in stored(rich).destinations and fake_zfs.calls == []
-        assert "Restart the daemon" not in result.stdout
+        assert ADVICE not in result.stdout
 
     def test_a_dotted_destination(self, run, rich, anchors):
         result = self.rename(run, rich, old="dc.two", new="dc.three")
@@ -1183,7 +1200,7 @@ class TestRenameDestination:
             assert "[dry run] tank/data: anchor.offsite2 would be set to snapA (copied from anchor.offsite)" in result.stdout
             assert "[dry run] would rename destination 'offsite' -> 'offsite2'" in result.stdout
             assert "remote: lists of tank/data, tank/other" in result.stdout
-            assert "Restart the daemon" not in result.stdout
+            assert ADVICE not in result.stdout
             assert db_state(rich) == state and generation(rich) == gen
         assert anchors.mutations == []
 
@@ -1745,7 +1762,9 @@ class TestInterruptAfterTheWrite:
         err = run("rename", kind, old, new, "-c", rich).stderr
         assert "may or may not have been applied" in err and "was applied" not in err
 
-    def test_an_ordinary_failure_after_the_write_adds_no_note(self, run, rich, stale, daemon_lock_holder):
+    def test_an_ordinary_failure_after_the_write_adds_no_note(
+        self, run, rich, stale, daemon_lock_holder, unsignalable
+    ):
         daemon_lock_holder(rich, generation=0)
         result = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "--clear-stale-props", "-c", rich)
         assert result.exit_code == 1

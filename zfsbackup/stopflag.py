@@ -38,6 +38,15 @@ generation would either resurrect a stale byte or -- worse -- hand the
 children a block the parent has since reused for something else. Reuse the
 same flag and `clear()` it, or keep the old one referenced until every
 child holding it has been joined.
+
+`ReloadEpoch` is the second shared word, for live config reload: a
+supervisor-local counter (+1 per accepted reload, never the DB generation)
+that a worker compares with the epoch it was born under, exiting at its next
+safe point when they differ. It follows every rule above -- created once in
+`BackupDaemon.__init__`, never recreated, lock-free, and never touched from a
+signal handler (the handler only records "SIGHUP arrived"; the supervisor loop
+does the rest). It is a separate object, not a field of `StopFlag`, so the
+stop path stays exactly as small as it was.
 """
 
 import time
@@ -130,3 +139,34 @@ class StopFlag:
 
     def __setstate__(self, state: dict) -> None:
         self._flag = state['flag']
+
+
+class ReloadEpoch:
+    """A shared, lock-free integer: the supervisor's reload epoch.
+
+    `multiprocessing.Value('i', 0, lock=False)`: `'i'` keeps every store a
+    single aligned 32-bit write on all supported platforms, so a concurrent
+    reader can never see a torn value. Written only by the supervisor (never
+    from a signal handler); read by workers at their safe points. Like
+    `StopFlag`, it must be created once and outlive every process holding it;
+    never recreate it while children still hold the old one.
+    """
+
+    def __init__(self) -> None:
+        self._epoch = multiprocessing.Value('i', 0, lock=False)
+
+    def get(self) -> int:
+        return int(self._epoch.value)
+
+    def set(self, value: int) -> None:
+        self._epoch.value = value
+
+    def __getstate__(self) -> dict:
+        # A dict, for the reason given on `StopFlag.__getstate__`: the shared
+        # ctypes object only pickles through `ForkingPickler` (spawn and
+        # forkserver `Process` arguments), and a container keeps adding a
+        # field from silently working under fork only.
+        return {'epoch': self._epoch}
+
+    def __setstate__(self, state: dict) -> None:
+        self._epoch = state['epoch']

@@ -18,7 +18,9 @@ it, and the CLI imports nothing from the daemon.
 
 `ConfigConflict` and `ConfigBusy` (a compare-and-swap that lost, a writer lock
 that stayed held) are 75 and are checked FIRST: they are "retry", not "the
-database is unusable".
+database is unusable". `StoreIdConflict` is a `ConfigConflict` (so also 75)
+but its message differs -- the file was replaced, not edited -- so
+`format_error` checks it before the generic conflict text.
 
 Messages from `ConfigPathError` and `SchemaError` already are operator-grade
 (they name the file, the source of the path, and the next command to run) and
@@ -49,6 +51,7 @@ from zfsbackup.config.store import (
     OutgoingConfigUnreadable,
     ResolvedConfigPath,
     SchemaError,
+    StoreIdConflict,
     config_error_message,
 )
 
@@ -60,6 +63,7 @@ __all__ = [
     "EXIT_CONFIG",
     "CliError",
     "BackupFailed",
+    "ConfigUnusable",
     "is_database_unusable",
     "exit_code_for",
     "format_error",
@@ -84,6 +88,14 @@ class CliError(Exception):
 class BackupFailed(CliError):
     """The pre-import backup of the outgoing configuration could not be
     written. The import is rolled back; nothing was replaced."""
+
+
+class ConfigUnusable(CliError):
+    """The config database exists but holds no usable configuration (for
+    example no settings row at all): exit 78, like any other unusable database,
+    rather than 1 (the operator's input)."""
+
+    exit_code = EXIT_CONFIG
 
 
 def _is_locked(exc: OperationalError) -> bool:
@@ -158,6 +170,16 @@ def _is_internal_sqlalchemy(exc: BaseException) -> bool:
 
 def format_error(exc: BaseException, resolved: Optional[ResolvedConfigPath]) -> List[str]:
     """The lines to print for `exc`: its message, then its notes."""
+    # BEFORE the generic conflict text, which words `expected`/`actual` as
+    # generations: for a replaced file (same generation, different store id)
+    # that would print "generation 0, now generation 0".
+    if isinstance(exc, StoreIdConflict):
+        return [
+            "the configuration database was replaced since it was read "
+            f"(store id {exc.expected_store_id}, now {exc.actual_store_id})",
+            "Nothing was written. Re-run the command to start from the current configuration.",
+            *getattr(exc, "__notes__", ()),
+        ]
     if isinstance(exc, ConfigConflict):
         actual = "no configuration" if exc.actual is None else f"generation {exc.actual}"
         return [

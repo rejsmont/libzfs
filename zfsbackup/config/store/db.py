@@ -159,7 +159,7 @@ reversible by the very connection that set it (measured: yes), so it stops
 mistakes, not malice. It also governs changes to database *content* only: a
 "read-only" engine still opens the file read-write. Since item 10.4 it no
 longer switches the journal mode, though: it only QUERIES `PRAGMA
-journal_mode` and warns (once per engine) if the file is not in WAL, because
+journal_mode` and warns (once per process and database path) if the file is not in WAL, because
 a reader that issued `journal_mode=WAL` rewrote the header of any
 rollback-journal database it was pointed at -- including one that is not a
 zfsbackup database (measured with `-c other.db export`). The first WRITE by
@@ -378,9 +378,8 @@ def _install_pragmas(
     after a dispose** -- that would double-fire every pragma below.
     """
 
-    # Reader engines warn about a non-WAL database once per engine, not once
-    # per pooled connection. A list, so the closure can mutate it.
-    warned_not_wal: list = []
+    # The "not in WAL mode" warning is latched per (process, path) in
+    # `_NOT_WAL_WARNED`, not per engine or pooled connection.
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragmas(dbapi_connection, connection_record):  # noqa: ANN001
@@ -432,8 +431,12 @@ def _install_pragmas(
                 cursor.execute("PRAGMA journal_mode")
                 row = cursor.fetchone()
                 mode = None if row is None else str(row[0]).lower()
-                if mode != "wal" and not warned_not_wal:
-                    warned_not_wal.append(True)  # once per engine, not per connection
+                warn_key = (os.getpid(), str(engine.url.database))
+                if mode == "wal":
+                    # Back in WAL: forget the latch so a later switch away
+                    # from it is reported again (cheap flip-flop handling).
+                    _NOT_WAL_WARNED.pop(warn_key, None)
+                elif _first_not_wal_warning(warn_key):
                     logger.warning(
                         "%s is not in WAL mode (journal_mode=%s); readers and "
                         "writers will block each other. (A zfsbackup-config "
@@ -724,6 +727,23 @@ _ENGINES: Dict[Tuple[str, bool, bool], Tuple[int, Engine]] = {}
 _ENGINES_LOCK = threading.RLock()
 
 
+# "Not in WAL mode" is logged once per (process, database path), NOT once per
+# engine: the daemon disposes every engine after each poll (every 10 s), and a
+# per-engine latch re-warned on every new engine -- about 8,640 identical
+# WARNINGs a day for a database someone switched to `journal_mode=DELETE`.
+# Keyed by pid so a forked child (which inherits the dict) logs for itself
+# rather than inheriting the parent's "already said it"; the at-fork hook below
+# also clears it so the child does not carry the parent's keys around.
+_NOT_WAL_WARNED: Dict[Tuple[int, str], object] = {}
+
+
+def _first_not_wal_warning(key: Tuple[int, str]) -> bool:
+    """True exactly once per `key` until it is popped. `setdefault` is atomic
+    under the GIL, so two threads' first connections cannot both win."""
+    token = object()
+    return _NOT_WAL_WARNED.setdefault(key, token) is token
+
+
 def _reinit_lock_after_fork() -> None:
     """Replace `_ENGINES_LOCK` in a freshly forked child.
 
@@ -735,6 +755,7 @@ def _reinit_lock_after_fork() -> None:
     """
     global _ENGINES_LOCK
     _ENGINES_LOCK = threading.RLock()
+    _NOT_WAL_WARNED.clear()
 
 
 if hasattr(os, "register_at_fork"):  # POSIX only

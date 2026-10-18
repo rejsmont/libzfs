@@ -119,6 +119,7 @@ from click.testing import CliRunner
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError, SQLAlchemyError
 
+from _cli_support import FakeDaemon, UNVERIFIED_LINUX_ONLY, fake_daemon, store_key, unsignalable
 from zfsbackup import daemonlock
 from zfsbackup.cli import errors as cli_errors
 from zfsbackup.cli import main as cli_main
@@ -170,10 +171,12 @@ datasets:
 
 
 #: What `migrate` prints after a real upgrade (item 15.5 wording: the daemon
-#: reads the configuration too, so a restart is about both).
+#: reads the configuration too; since 19.1 only a daemon started BEFORE the
+#: upgrade needs a restart).
 RESTART_HINT = (
-    "Restart any running zfsbackup daemon now so it runs this schema and its "
-    "configuration."
+    "A daemon started before this upgrade must be restarted to run this schema (until "
+    "then it cannot apply any configuration change); one already running this version "
+    "picks it up within 10s."
 )
 
 
@@ -381,7 +384,9 @@ class TestSkeleton:
     #: The commands that exist (Phase 2 items 10-14); nothing else may appear
     #: unannounced. (`PLANNED` is for a command that has landed in the CLI
     #: before this list is updated.)
-    COMMANDS = ["edit", "export", "get", "import", "list", "migrate", "rename", "set", "unset"]
+    COMMANDS = [
+        "edit", "export", "get", "import", "list", "migrate", "rename", "set", "status", "unset",
+    ]
     PLANNED = set()
 
     def test_help_lists_exactly_the_commands(self, run):
@@ -4247,14 +4252,6 @@ class TestStoreIdConflictExitCode:
         assert buf.getvalue().startswith("error: ")
         assert "internal error" not in buf.getvalue()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="app bug (17.0): cli.errors.format_error renders every ConfigConflict "
-        "as 'generation N, now generation M'. For a StoreIdConflict (the ABA case: "
-        "same generation, different file) that prints 'generation 0, now generation 0' "
-        "-- or 'generation None' when none was expected. Remove this marker when "
-        "format_error special-cases StoreIdConflict.",
-    )
     def test_the_message_says_the_database_was_replaced(self):
         from zfsbackup.config.store import StoreIdConflict
 
@@ -4426,7 +4423,11 @@ class TestCommitConfig:
         monkeypatch.setattr(cli_write, "write_config", spy)
         cli_write.commit_config(resolved, snap, _tank_config(), announce=False)
         # `lock` is always passed (None = take the writer lock inside write_config)
-        assert seen == {"expected_generation": snap.generation, "lock": None}
+        assert seen == {
+            "expected_generation": snap.generation,
+            "expected_store_id": snap.store_id,
+            "lock": None,
+        }
 
     def test_a_stale_snapshot_is_a_conflict_with_both_generations_and_the_store_is_unchanged(
         self, run, db, seeded, capsys
@@ -4497,6 +4498,17 @@ class TestCommitConfig:
 
 
 class TestNotifyDaemon:
+    """`notify_daemon` against REAL lock files (a helper process, or a lock held
+    in this process by `FakeDaemon`). `request_reload` is the real one; what a
+    host cannot prove it does not signal, so the lock table is made unavailable
+    (`unsignalable`) and the outcome is `unverified` everywhere, never a SIGHUP
+    to a helper. Every wording row has its own test in
+    `test_zfsbackup_cli_reload.py`."""
+
+    @pytest.fixture(autouse=True)
+    def _never_signal(self, unsignalable):
+        pass
+
     @pytest.fixture
     def resolved(self, db):
         db.parent.mkdir(parents=True, exist_ok=True)
@@ -4516,37 +4528,37 @@ class TestNotifyDaemon:
             f"config updated; no running daemon detected for {resolved.resolved_path}\n"
         )
 
-    def test_a_running_daemon_is_named_with_its_pid_and_generation(
+    def test_a_running_daemon_is_named_with_its_pid(
         self, resolved, db, daemon_lock_holder, capsys
     ):
         holder = daemon_lock_holder(db, generation=2)
         cli_write.notify_daemon(resolved, 3)
         out = capsys.readouterr()
-        assert out.out == (
-            f"config updated (generation 3); running daemon pid {holder.pid} is on "
-            "generation 2 and will not apply this until restarted\n"
-        )
+        assert out.out == "config updated (generation 3); " + UNVERIFIED_LINUX_ONLY.format(pid=holder.pid) + "\n"
         assert out.err == ""
+        assert holder.proc.poll() is None  # not signalled
 
     def test_a_daemon_that_has_not_recorded_a_generation(
         self, resolved, db, daemon_lock_holder, capsys
     ):
         holder = daemon_lock_holder(db, generation=None)
         cli_write.notify_daemon(resolved, 3)
-        assert capsys.readouterr().out == (
-            f"config updated (generation 3); running daemon pid {holder.pid} is on "
-            "an unknown generation and will not apply this until restarted\n"
-        )
+        out = capsys.readouterr().out
+        assert out == "config updated (generation 3); " + UNVERIFIED_LINUX_ONLY.format(pid=holder.pid) + "\n"
+        assert "generation None" not in out
 
-    def test_a_daemon_whose_pid_is_not_yet_readable(self, resolved, capsys, monkeypatch):
-        monkeypatch.setattr(
-            daemonlock, "probe", lambda r: daemonlock.DaemonInfo(pid=None, generation=4)
-        )
+    def test_a_daemon_whose_pid_is_not_yet_readable(self, resolved, db, fake_daemon, capsys):
+        """The instant after the lock is taken and before the first write: an
+        empty file, the lock held."""
+        fake_daemon(db, raw=b"")
         cli_write.notify_daemon(resolved, 5)
-        assert capsys.readouterr().out == (
-            "config updated (generation 5); running daemon (pid unknown) is on "
-            "generation 4 and will not apply this until restarted\n"
+        out = capsys.readouterr()
+        assert out.out == (
+            "config updated (generation 5); could not verify that an unknown pid is the "
+            "daemon (the pid file could not be read consistently), so it was not "
+            "signalled; it picks up the change within 10s\n"
         )
+        assert out.err == ""
 
     def test_a_stale_file_left_by_kill_9_is_not_a_running_daemon(
         self, resolved, db, daemon_lock_holder, capsys
@@ -4559,13 +4571,15 @@ class TestNotifyDaemon:
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
     def test_an_orphaned_worker_holding_the_lock_says_the_supervisor_is_gone(
-        self, resolved, db, daemon_lock_holder, capsys
+        self, resolved, db, daemon_lock_holder, capsys, monkeypatch
     ):
         """The lock is still held (a forked child keeps it), so it is not
         "no running daemon" -- but the recorded pid is dead, so the notice
-        must not claim a daemon "is on generation N"."""
+        must not claim a daemon "is on generation N". (On Linux the lock table
+        still lists the dead locker; that is what is stood in for here.)"""
         holder = daemon_lock_holder(db, generation=2, fork=True)
         holder.kill9()  # the supervisor is gone; its forked child still holds the lock
+        monkeypatch.setattr(daemonlock.procident, "flock_write_holders", lambda fd: {holder.pid})
         cli_write.notify_daemon(resolved, 3)
         out = capsys.readouterr()
         assert out.out == (
@@ -4583,8 +4597,7 @@ class TestNotifyDaemon:
         holder = daemon_lock_holder(db, generation=2, fork=True)
         cli_write.notify_daemon(resolved, 3)
         assert capsys.readouterr().out == (
-            f"config updated (generation 3); running daemon pid {holder.pid} is on "
-            "generation 2 and will not apply this until restarted\n"
+            "config updated (generation 3); " + UNVERIFIED_LINUX_ONLY.format(pid=holder.pid) + "\n"
         )
 
     @pytest.mark.parametrize(
@@ -4595,20 +4608,35 @@ class TestNotifyDaemon:
         ],
         ids=["DaemonLockError", "OSError"],
     )
-    def test_a_probe_failure_is_a_warning_not_an_error(
+    def test_a_check_failure_is_a_warning_not_an_error(
         self, resolved, capsys, monkeypatch, error
     ):
-        def failing(r):
-            raise error
-
-        monkeypatch.setattr(daemonlock, "probe", failing)
+        detail = f"cannot open daemon lock file x: {error.strerror}"
+        monkeypatch.setattr(
+            daemonlock, "request_reload",
+            lambda r, **k: daemonlock.ReloadRequest("error", detail=detail),
+        )
         cli_write.notify_daemon(resolved, 3)  # must not raise
         out = capsys.readouterr()
         assert out.out == "config updated (generation 3)\n"
         assert out.err == (
             f"warning: could not check whether a daemon is running for "
-            f"{resolved.resolved_path}: {error.strerror}\n"
+            f"{resolved.resolved_path}: {detail}\n"
         )
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root can open an unreadable file")
+    def test_an_unreadable_lock_file_is_a_warning_not_no_daemon(self, resolved, capsys):
+        lock = daemonlock.lock_path(resolved)
+        lock.write_text("4321\n")
+        lock.chmod(0)
+        try:
+            cli_write.notify_daemon(resolved, 3)
+        finally:
+            lock.chmod(0o600)
+        out = capsys.readouterr()
+        assert out.out == "config updated (generation 3)\n"
+        assert out.err.startswith("warning: could not check whether a daemon is running for ")
+        assert "Permission denied" in out.err
 
     def test_it_never_signals_anything(
         self, resolved, db, daemon_lock_holder, monkeypatch
@@ -4622,6 +4650,8 @@ class TestNotifyDaemon:
         with monkeypatch.context() as scoped:
             scoped.setattr(os, "kill", forbidden)
             scoped.setattr(os, "killpg", forbidden)
+            if hasattr(signal, "pidfd_send_signal"):
+                scoped.setattr(signal, "pidfd_send_signal", forbidden)
             cli_write.notify_daemon(resolved, 3)
         assert holder.proc.poll() is None  # still running, untouched
 
@@ -4642,10 +4672,16 @@ class TestDaemonNoticeWording:
     this file, test_zfsbackup_store_access.py and the importer file); the old
     two-line ConfigBusy wording 7; the empty-text fallback removed 1.
 
-    `notify_daemon` is `_daemon_notice` (pure: probe -> text) plus a printing
-    wrapper (item 15.5). The generation comparison is three-way -- same, older,
-    UNKNOWN -- and an unknown one must never be mistaken for either of the
-    others."""
+    (19.1 rewrite: `notify_daemon` is `_daemon_notice` -- pure apart from
+    `request_reload`, which decides whether and how the daemon is reached --
+    plus a printing wrapper. The generation facts that remain are the LEGACY
+    daemon's: three-way -- known, UNKNOWN -- and an unknown one must never be
+    mistaken for a number; a daemon that already applied the key is
+    `already-applied`.)"""
+
+    @pytest.fixture(autouse=True)
+    def _never_signal(self, unsignalable):
+        pass
 
     @pytest.fixture
     def resolved(self, db):
@@ -4653,75 +4689,81 @@ class TestDaemonNoticeWording:
         return _resolved(db)
 
     @staticmethod
-    def _daemon(monkeypatch, pid=4321, generation=None, alive=True):
+    def _reload(monkeypatch, outcome, pid=4321, info=None, detail="", code=""):
         monkeypatch.setattr(
-            daemonlock, "probe",
-            lambda r: daemonlock.DaemonInfo(pid=pid, generation=generation),
+            daemonlock, "request_reload",
+            lambda r, **k: daemonlock.ReloadRequest(outcome, pid, info, detail, code),
         )
-        monkeypatch.setattr(daemonlock.os, "kill", (
-            (lambda p, s: None) if alive else _raising(ProcessLookupError(errno.ESRCH, "x"))
-        ))
 
     def test_a_daemon_already_on_the_written_generation_has_nothing_to_restart(
-        self, resolved, monkeypatch
+        self, resolved, db, fake_daemon
     ):
-        self._daemon(monkeypatch, generation=5)
-        line, warning = cli_write._daemon_notice(resolved, 5)
+        fake_daemon(db, generation=5, applied=(7, 5))
+        line, warning = cli_write._daemon_notice(resolved, 5, 7)
         assert line == "config updated (generation 5); running daemon pid 4321 is already on generation 5"
         assert warning is None
-        assert "restarted" not in line
+        assert "restart" not in line
 
-    def test_the_same_generation_through_notify_prints_it(self, resolved, monkeypatch, capsys):
-        self._daemon(monkeypatch, generation=5)
-        cli_write.notify_daemon(resolved, 5)
+    def test_the_same_generation_through_notify_prints_it(self, resolved, db, fake_daemon, capsys):
+        fake_daemon(db, generation=5, applied=(7, 5))
+        cli_write.notify_daemon(resolved, 5, 7)
         out = capsys.readouterr()
         assert out.out == (
             "config updated (generation 5); running daemon pid 4321 is already on generation 5\n"
         )
         assert out.err == ""
 
-    def test_an_older_daemon_will_not_apply_it_until_restarted(self, resolved, monkeypatch):
-        self._daemon(monkeypatch, generation=2)
+    def test_the_same_generation_of_another_store_is_not_already_applied(
+        self, resolved, db, fake_daemon
+    ):
+        fake_daemon(db, generation=5, applied=(8, 5))
+        line, _ = cli_write._daemon_notice(resolved, 5, 7)
+        assert "already on" not in line
+
+    def test_an_older_legacy_daemon_must_be_restarted(self, resolved, db, fake_daemon):
+        fake_daemon(db, generation=2, start=None)
         assert cli_write._daemon_notice(resolved, 5) == (
             "config updated (generation 5); running daemon pid 4321 is on generation 2 "
-            "and will not apply this until restarted",
+            "and predates live reload; restart it to apply this",
             None,
         )
 
-    def test_a_daemon_with_an_unknown_generation_is_neither_older_nor_same(
-        self, resolved, monkeypatch
+    def test_a_legacy_daemon_with_an_unknown_generation_is_neither_older_nor_same(
+        self, resolved, db, fake_daemon
     ):
         """The startup window: the lock is taken, the config not yet loaded."""
-        self._daemon(monkeypatch, generation=None)
+        fake_daemon(db, generation=None, start=None)
         line, _ = cli_write._daemon_notice(resolved, 5)
         assert line == (
             "config updated (generation 5); running daemon pid 4321 is on an unknown "
-            "generation and will not apply this until restarted"
+            "generation and predates live reload; restart it to apply this"
         )
         assert "generation None" not in line and "already on" not in line
 
     def test_an_unknown_written_generation_is_never_the_same_as_an_unknown_daemon_one(
-        self, resolved, monkeypatch
+        self, resolved, db, fake_daemon
     ):
         """None == None must not read as "already on generation"."""
-        self._daemon(monkeypatch, generation=None)
+        fake_daemon(db, generation=None, start=None)
         line, _ = cli_write._daemon_notice(resolved, None)
         assert line == (
             "config updated; running daemon pid 4321 is on an unknown generation "
-            "and will not apply this until restarted"
+            "and predates live reload; restart it to apply this"
         )
         assert "already on" not in line
 
-    def test_an_unknown_written_generation_with_a_known_daemon_one(self, resolved, monkeypatch):
-        self._daemon(monkeypatch, generation=3)
+    def test_an_unknown_written_generation_with_a_known_legacy_daemon_one(
+        self, resolved, db, fake_daemon
+    ):
+        fake_daemon(db, generation=3, start=None)
         line, _ = cli_write._daemon_notice(resolved, None)
         assert line == (
-            "config updated; running daemon pid 4321 is on generation 3 and will not "
-            "apply this until restarted"
+            "config updated; running daemon pid 4321 is on generation 3 and predates live "
+            "reload; restart it to apply this"
         )
 
     def test_a_dead_supervisor_still_holding_the_lock(self, resolved, monkeypatch, capsys):
-        self._daemon(monkeypatch, pid=4321, generation=2, alive=False)
+        self._reload(monkeypatch, "supervisor-gone", pid=4321, code="no-such-process")
         cli_write.notify_daemon(resolved, 3)
         out = capsys.readouterr()
         assert out.out == (
@@ -4732,46 +4774,45 @@ class TestDaemonNoticeWording:
         assert "find them with `fuser" in out.out
         assert "running daemon" not in out.out and "is on generation" not in out.out
 
-    def test_a_dead_supervisor_with_the_same_generation_is_still_reported_gone(
+    def test_a_dead_supervisor_is_worded_by_its_pid_alone_even_if_the_file_claims_the_key(
         self, resolved, monkeypatch
     ):
-        """Liveness is checked before the generation is compared: workers that
-        outlive the supervisor are not a daemon that "is already on" anything."""
-        self._daemon(monkeypatch, pid=4321, generation=5, alive=False)
-        line, _ = cli_write._daemon_notice(resolved, 5)
+        """Workers that outlive the supervisor are not a daemon that "is
+        already on" anything: whatever `request_reload` called gone is gone."""
+        info = daemonlock.DaemonInfo(pid=4321, generation=5, start="t", applied=(7, 5))
+        self._reload(monkeypatch, "supervisor-gone", pid=4321, info=info, code="zombie")
+        line, _ = cli_write._daemon_notice(resolved, 5, 7)
         assert "supervisor pid 4321 is gone" in line and "already on" not in line
 
     def test_a_live_but_unsignalable_pid_is_a_running_daemon(self, resolved, monkeypatch):
         """EPERM means the process exists (it is root's, we are not)."""
-        monkeypatch.setattr(
-            daemonlock, "probe", lambda r: daemonlock.DaemonInfo(pid=1, generation=2)
-        )
-        monkeypatch.setattr(
-            daemonlock.os, "kill", _raising(PermissionError(errno.EPERM, "nope"))
-        )
+        self._reload(monkeypatch, "not-permitted", pid=1)
         line, _ = cli_write._daemon_notice(resolved, 3)
-        assert "running daemon pid 1 is on generation 2" in line
-
-    def test_the_cli_does_not_signal_with_anything_but_signal_zero(self, resolved, monkeypatch):
-        sent = []
-        monkeypatch.setattr(
-            daemonlock, "probe", lambda r: daemonlock.DaemonInfo(pid=4321, generation=2)
+        assert line == (
+            "config updated (generation 3); daemon pid 1 runs as another user and was "
+            "not signalled; it picks up the change within 10s"
         )
-        monkeypatch.setattr(daemonlock.os, "kill", lambda pid, sig: sent.append((pid, sig)))
-        cli_write._daemon_notice(resolved, 3)
-        assert sent and all(sig == 0 for _, sig in sent)
 
-    @pytest.mark.parametrize("how", ["pid_zero", "kill_eio"])
-    def test_a_pid_that_cannot_be_judged_is_not_reported_as_a_dead_supervisor(
-        self, resolved, monkeypatch, how
+    def test_notify_itself_never_sends_a_signal(self, resolved, monkeypatch):
+        """Signalling is `request_reload`'s alone (it verifies first). The
+        notice, even for a `signalled` outcome with a wait, sends none."""
+        self._reload(monkeypatch, "signalled", pid=4321)
+        monkeypatch.setattr(daemonlock, "probe", lambda r: None)
+
+        def forbidden(*a, **k):
+            raise AssertionError("notify_daemon sent a signal")
+
+        monkeypatch.setattr(os, "kill", forbidden)
+        monkeypatch.setattr(os, "killpg", forbidden)
+        cli_write.notify_daemon(resolved, 3, 7)
+
+    @pytest.mark.parametrize("pid", [0, 1])
+    def test_a_pid_that_cannot_be_signalled_is_not_reported_as_a_dead_supervisor(
+        self, resolved, db, fake_daemon, pid
     ):
-        pid = 0 if how == "pid_zero" else 4321
-        monkeypatch.setattr(
-            daemonlock, "probe", lambda r: daemonlock.DaemonInfo(pid=pid, generation=2)
-        )
-        monkeypatch.setattr(daemonlock.os, "kill", _raising(OSError(errno.EIO, "io")))
+        fake_daemon(db, pid=pid, generation=2)
         line, _ = cli_write._daemon_notice(resolved, 3)
-        assert "is gone" not in line
+        assert "is gone" not in line and "was not signalled" in line
 
     def test_the_notice_asks_the_probe_result_not_a_private_shim(self):
         # the `_pid_alive` shim in cli.write is gone: liveness is DaemonInfo.pid_alive
@@ -4788,13 +4829,10 @@ class TestDaemonNoticeWording:
         monkeypatch.setattr(daemonlock.os, "kill", lambda p, s: None)
         assert info.pid_alive is True
 
-    def test_the_notice_uses_daemon_info_pid_alive(self, resolved, monkeypatch):
-        monkeypatch.setattr(
-            daemonlock, "probe", lambda r: daemonlock.DaemonInfo(pid=4321, generation=2)
-        )
-        monkeypatch.setattr(daemonlock, "pid_is_alive", lambda pid: False)
+    def test_a_dead_supervisor_without_a_pid_is_still_worded(self, resolved, monkeypatch):
+        self._reload(monkeypatch, "supervisor-gone", pid=None)
         line, _ = cli_write._daemon_notice(resolved, 3)
-        assert "supervisor pid 4321 is gone" in line
+        assert line == "config updated (generation 3); the daemon lock is held but its supervisor is gone"
 
     @pytest.mark.parametrize(
         "error",
@@ -4816,7 +4854,7 @@ class TestDaemonNoticeWording:
     ):
         monkeypatch.setattr(
             cli_write, "_daemon_notice",
-            lambda r, g: (_ for _ in ()).throw(RuntimeError("kaboom")),
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("kaboom")),
         )
         cli_write.notify_daemon(resolved, 3)
         out = capsys.readouterr()
@@ -4852,42 +4890,48 @@ def _raising(exc):
 
 class TestStartupWindowNotice:
     """Through the real CLI: a daemon that holds the lock but has not yet read
-    its configuration records no generation; the operator must be told the
-    daemon is on "an unknown generation", not "generation None" and not
-    "already on" the one just written."""
+    its configuration records no generation; the operator must be told about
+    the daemon without "generation None", and a daemon that already applied the
+    key just written is "already on" it."""
 
     def test_a_real_import_beside_a_lock_with_no_recorded_generation(
-        self, run, db, daemon_lock_holder
+        self, run, db, daemon_lock_holder, unsignalable
     ):
         import_ok(run, db)
         holder = daemon_lock_holder(db, generation=None)
         result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))
         assert result.stdout.splitlines()[-1] == (
-            f"config updated (generation 1); running daemon pid {holder.pid} is on an "
-            "unknown generation and will not apply this until restarted"
+            "config updated (generation 1); " + UNVERIFIED_LINUX_ONLY.format(pid=holder.pid)
         )
+        assert "generation None" not in result.stdout
 
     def test_an_import_over_a_daemon_on_the_previous_generation(
-        self, run, db, daemon_lock_holder
+        self, run, db, daemon_lock_holder, unsignalable
     ):
         import_ok(run, db)
         holder = daemon_lock_holder(db, generation=0)
         result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))  # writes generation 1
         assert result.stdout.splitlines()[-1] == (
-            f"config updated (generation 1); running daemon pid {holder.pid} is on "
-            "generation 0 and will not apply this until restarted"
+            "config updated (generation 1); " + UNVERIFIED_LINUX_ONLY.format(pid=holder.pid)
         )
 
-    def test_an_import_whose_generation_the_daemon_already_runs(
-        self, run, db, daemon_lock_holder
-    ):
+    def test_an_import_whose_key_the_daemon_already_runs(self, run, db, fake_daemon, monkeypatch):
+        """The daemon applied exactly the key the import wrote (it was quicker
+        than the CLI's own check): nothing to ask, and it says so."""
         import_ok(run, db)
-        holder = daemon_lock_holder(db, generation=1)
+        daemon = fake_daemon(db, generation=0)
+        real = daemonlock.request_reload
+
+        def after_the_daemon_caught_up(resolved, *, skip_if_applied=None):
+            daemon.set(applied=skip_if_applied, generation=skip_if_applied[1])
+            return real(resolved, skip_if_applied=skip_if_applied)
+
+        monkeypatch.setattr(daemonlock, "request_reload", after_the_daemon_caught_up)
         result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))  # writes generation 1
         assert result.stdout.splitlines()[-1] == (
-            f"config updated (generation 1); running daemon pid {holder.pid} is "
-            "already on generation 1"
+            "config updated (generation 1); running daemon pid 4321 is already on generation 1"
         )
+        assert store_key(db)[1] == 1
 
 
 class TestImportNotice:
@@ -4904,13 +4948,12 @@ class TestImportNotice:
         result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))
         assert "config updated (generation 1); no running daemon detected" in result.stdout
 
-    def test_a_running_daemon_is_told_about(self, run, db, daemon_lock_holder):
+    def test_a_running_daemon_is_told_about(self, run, db, daemon_lock_holder, unsignalable):
         import_ok(run, db)
         holder = daemon_lock_holder(db, generation=0)
         result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))
         assert result.stdout.splitlines()[-1] == (
-            f"config updated (generation 1); running daemon pid {holder.pid} is on "
-            "generation 0 and will not apply this until restarted"
+            "config updated (generation 1); " + UNVERIFIED_LINUX_ONLY.format(pid=holder.pid)
         )
         assert holder.proc.poll() is None
 
@@ -4936,22 +4979,29 @@ class TestImportNotice:
 
         monkeypatch.setattr(cli_main, "import_yaml", no_generation)
 
-    def test_an_unreadable_generation_does_not_fail_the_committed_import(
+    def test_a_result_without_a_generation_omits_the_clause_and_reads_nothing_back(
         self, run, db, monkeypatch
     ):
-        """The read-back is only a fallback for a result without a generation;
-        when that fails too the notice just omits the clause."""
+        """The CLI never reads the generation back after the lock is released
+        (it could be a concurrent write's): without one in the result there is
+        no key, so the notice omits the clause and `request_reload` is asked
+        to skip nothing."""
         self._import_without_generation(monkeypatch)
-
-        def broken(resolved):
-            raise OSError("disk went away")
-
-        monkeypatch.setattr(cli_main, "read_config", broken)
+        monkeypatch.setattr(
+            cli_main, "read_config", lambda resolved: pytest.fail("read_config reached")
+        )
+        asked = []
+        real = daemonlock.request_reload
+        monkeypatch.setattr(
+            daemonlock, "request_reload",
+            lambda r, **k: (asked.append(k.get("skip_if_applied")), real(r, **k))[1],
+        )
         result = run("import", EXAMPLE_YAML, "-c", db)
         assert result.exit_code == 0, result.stderr
         assert result.stdout.splitlines()[-1] == (
             f"config updated; no running daemon detected for {_resolved(db).resolved_path}"
         )
+        assert asked == [None]
 
     def test_the_import_result_generation_is_used_without_a_read_back(
         self, run, db, monkeypatch
@@ -4985,14 +5035,6 @@ class TestImportNotice:
         result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))
         assert "config updated (generation 41);" in result.stdout
 
-    def test_the_read_back_is_the_fallback_when_the_result_has_no_generation(
-        self, run, db, monkeypatch
-    ):
-        import_ok(run, db)
-        self._import_without_generation(monkeypatch)
-        result = import_ok(run, db, mini_yaml(db.parent / "m.yaml"))
-        assert "config updated (generation 1);" in result.stdout
-
     def test_a_broken_pipe_on_the_notice_does_not_fail_the_committed_import(
         self, run, db, monkeypatch
     ):
@@ -5012,13 +5054,13 @@ class TestImportNotice:
         dispose_all()
         assert snap.generation == 0 and snap.config.datasets
 
-    def test_a_probe_failure_after_an_import_is_a_warning_and_exit_0(
+    def test_a_check_failure_after_an_import_is_a_warning_and_exit_0(
         self, run, db, monkeypatch
     ):
-        def failing(r):
-            raise daemonlock.DaemonLockError(errno.EACCES, "Permission denied")
-
-        monkeypatch.setattr(daemonlock, "probe", failing)
+        monkeypatch.setattr(
+            daemonlock, "request_reload",
+            lambda r, **k: daemonlock.ReloadRequest("error", detail="Permission denied"),
+        )
         result = run("import", EXAMPLE_YAML, "-c", db)
         assert result.exit_code == 0, result.stderr
         assert result.stdout.splitlines()[-1] == "config updated (generation 0)"
@@ -5219,21 +5261,31 @@ class TestImportBesideARealDaemon:
             except subprocess.TimeoutExpired:
                 pass
 
-    def test_the_notice_names_the_running_daemon_and_nothing_is_signalled(
+    def test_the_notice_names_the_running_daemon(
         self, run, db, daemon, tmp_path
     ):
         proc, log_path = daemon
         result = run("import", mini_yaml(tmp_path / "new.yaml", names=("tank/new",)), "-c", db)
         assert result.exit_code == 0, result.stderr
-        assert result.stdout.splitlines()[-1] == (
-            f"config updated (generation 1); running daemon pid {proc.pid} is on "
-            "generation 0 and will not apply this until restarted"
+        last = result.stdout.splitlines()[-1]
+        if sys.platform.startswith("linux"):
+            # A host that can verify the lock holder signals it (19.1): the
+            # daemon is asked to reload, not stopped. What it does with the
+            # request is `test_zfsbackup_reload*.py`'s business.
+            assert last.startswith(
+                f"config updated (generation 1); reload requested from daemon pid {proc.pid}"
+            ), last
+            assert proc.poll() is None
+            return
+        assert last == (
+            "config updated (generation 1); " + UNVERIFIED_LINUX_ONLY.format(pid=proc.pid)
         )
-        # Not signalled, not stopped, not reloaded.
+        # Not signalled, not stopped. (It may still apply the change by
+        # itself: it polls the store every RELOAD_POLL_SECONDS, so "reload"
+        # in its log proves nothing about a signal.)
         time.sleep(0.5)
         assert proc.poll() is None
-        log = log_path.read_text(errors="replace")
-        assert "Received signal" not in log and "reload" not in log.lower()
+        assert "Received signal" not in log_path.read_text(errors="replace")
 
     def test_after_the_daemon_stops_the_notice_goes_back_to_none(
         self, run, db, daemon, tmp_path

@@ -30,6 +30,13 @@ The transfer *happy path* is verified working end-to-end over two real VMs — s
 - Default `api_host` is `127.0.0.1` (safe but useless for remote backup). The moment you
   bind `0.0.0.0` to make the feature work, it is wide open to anything routable.
 
+- Since live reload (Phase 3): **any peer can postpone the API worker's config switch
+  indefinitely.** On a reload the API worker waits for in-flight receives and never cuts them
+  (decision D5). The only per-stream bound is the 600 s websocket idle timeout. So an
+  unauthenticated peer that opens `/stream` and sends a frame every ~10 minutes keeps the old
+  configuration running on the server side. This is deliberately not capped. Authentication (this
+  item) is the fix, because it limits streams to trusted senders.
+
 Path traversal via `client_id`/`dataset` is *mitigated* (the `Validate` name regex rejects
 `..` and shell metacharacters) but handled by raising an uncaught `ValueError` → HTTP 500
 rather than a clean rejection.

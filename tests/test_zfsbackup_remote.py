@@ -1,6 +1,7 @@
 """Unit tests for RemoteBackupManager and ClientIdentity."""
 
 import logging
+import re
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -9,7 +10,7 @@ from zfsbackup.config import (
     BackupConfig, DatasetConfig, RemoteDatasetConfig, Destination, RetentionRule, Duration,
 )
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
-from zfsbackup.remote import ClientIdentity, RemoteBackupManager
+from zfsbackup.remote import ClientIdentity, NegotiationFailed, RemoteBackupManager
 
 
 def _make_config(**kwargs) -> BackupConfig:
@@ -146,8 +147,11 @@ class TestRemoteBackupManagerNegotiate:
             f'http://backup.example.com/backup/client1/{dsi.name}/negotiate',
             exc=requests.ConnectionError,
         )
-        result = rbm._negotiate('http://backup.example.com', 'client1', dsi, [], 'offsite')
-        assert result is None
+        # A failed negotiation is NOT "no common snapshot": it raises, so the
+        # caller can never fall through to a needless full send.
+        with pytest.raises(NegotiationFailed) as exc:
+            rbm._negotiate('http://backup.example.com', 'client1', dsi, [], 'offsite')
+        assert exc.value.reloading is False
 
     def test_negotiate_passes_destination_through_to_property(self, tmp_path, requests_mock):
         """The whole point of the 5th `destination` argument: `_negotiate` must
@@ -645,3 +649,198 @@ class TestClientSideRetentionCollisionWarning:
             with caplog.at_level(logging.WARNING):
                 rbm.backup_dataset(dsi, dsi.config.remote[0])
         assert [r for r in caplog.records if r.levelname == 'WARNING'] == []
+
+
+class TestNegotiationFailedAndReload:
+    """The server's retryable 503 ("reloading") and every other failure are
+    told apart; neither is ever read as "no common snapshot"."""
+
+    URL = 'http://backup.example.com'
+    RELOADING = {'error': 'server is reloading; retry later', 'retry': True}
+
+    def _make(self, tmp_path):
+        config = _make_config(client_id_file=tmp_path / 'client_id')
+        manager = DatasetManager(config)
+        rbm = RemoteBackupManager(config, manager)
+        dsi = manager.datasets[0]
+        return rbm, manager, dsi, dsi.config.remote[0]
+
+    def _post(self, requests_mock, dsi, **kw):
+        # any client id: `backup_dataset` uses the manager's own identity
+        requests_mock.post(re.compile(rf'{re.escape(self.URL)}/backup/[^/]+/{re.escape(dsi.name)}/negotiate$'), **kw)
+
+    # -- _negotiate ---------------------------------------------------------
+
+    def test_a_retryable_503_is_reloading(self, tmp_path, requests_mock):
+        rbm, _, dsi, _ = self._make(tmp_path)
+        self._post(requests_mock, dsi, status_code=503, json=self.RELOADING)
+        with pytest.raises(NegotiationFailed) as exc:
+            rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite')
+        assert exc.value.reloading is True
+
+    def test_a_reloading_503_is_not_logged_as_an_error(self, tmp_path, requests_mock, caplog):
+        rbm, _, dsi, _ = self._make(tmp_path)
+        self._post(requests_mock, dsi, status_code=503, json=self.RELOADING)
+        with caplog.at_level(logging.DEBUG), pytest.raises(NegotiationFailed):
+            rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite')
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.parametrize(
+        'kwargs',
+        [
+            {'status_code': 500, 'json': {'error': 'boom'}},
+            {'status_code': 503, 'json': {'error': 'remote_backup disabled'}},          # no retry flag
+            {'status_code': 503, 'json': {'error': 'x', 'retry': False}},
+            {'status_code': 503, 'text': 'Service Unavailable'},                         # not JSON
+            {'status_code': 404, 'json': {}},
+            {'status_code': 200, 'text': 'not json'},
+        ],
+    )
+    def test_any_other_failure_is_not_reloading(self, tmp_path, requests_mock, caplog, kwargs):
+        rbm, _, dsi, _ = self._make(tmp_path)
+        self._post(requests_mock, dsi, **kwargs)
+        with caplog.at_level(logging.ERROR), pytest.raises(NegotiationFailed) as exc:
+            rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite')
+        assert exc.value.reloading is False
+        assert 'Negotiation failed' in caplog.text
+
+    @pytest.mark.parametrize('exc_type', ['ConnectionError', 'Timeout'])
+    def test_a_connection_error_is_not_reloading(self, tmp_path, requests_mock, exc_type):
+        import requests
+        rbm, _, dsi, _ = self._make(tmp_path)
+        self._post(requests_mock, dsi, exc=getattr(requests, exc_type))
+        with pytest.raises(NegotiationFailed) as exc:
+            rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite')
+        assert exc.value.reloading is False
+
+    def test_a_null_common_snapshot_is_none_not_a_failure(self, tmp_path, requests_mock):
+        rbm, _, dsi, _ = self._make(tmp_path)
+        self._post(requests_mock, dsi, json={'common_snapshot': None, 'server_dataset': 'x'})
+        assert rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite') is None
+
+    def test_a_common_snapshot_is_returned(self, tmp_path, requests_mock):
+        rbm, _, dsi, _ = self._make(tmp_path)
+        self._post(requests_mock, dsi, json={'common_snapshot': 'autosnap_1'})
+        assert rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite') == 'autosnap_1'
+
+    # -- backup_dataset -----------------------------------------------------
+
+    @pytest.fixture
+    def wired(self, tmp_path, requests_mock, mocker):
+        rbm, manager, dsi, remote_cfg = self._make(tmp_path)
+        requests_mock.post(f'{self.URL}/backup/register', json={})
+        snap = MagicMock()
+        snap.name = 'autosnap_20240101120000'
+        mocker.patch.object(manager, 'list_snapshots', return_value=[snap])
+        sends = {
+            'transfer': mocker.spy(rbm, '_transfer'),
+            'resume': mocker.spy(rbm, '_get_resume_stream'),
+            'send_snapshot': mocker.patch('zfsbackup.remote.zfs.send.snapshot'),
+            'send_resume': mocker.patch('zfsbackup.remote.zfs.send.resume'),
+        }
+        return rbm, dsi, remote_cfg, sends
+
+    def assert_no_send(self, sends):
+        for name, mock in sends.items():
+            assert not mock.called, f'{name} was called after a failed negotiation'
+
+    def test_reloading_logs_info_returns_false_and_never_sends(self, wired, requests_mock, caplog):
+        rbm, dsi, remote_cfg, sends = wired
+        self._post(requests_mock, dsi, status_code=503, json=self.RELOADING)
+        with caplog.at_level(logging.INFO):
+            assert rbm.backup_dataset(dsi, remote_cfg) is False
+        infos = [r for r in caplog.records if r.levelno == logging.INFO
+                 and r.getMessage() == f'server {self.URL} is reloading; skipping {dsi.name} this cycle']
+        assert len(infos) == 1
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        self.assert_no_send(sends)
+
+    def test_another_failure_logs_an_error_returns_false_and_never_sends(self, wired, requests_mock, caplog):
+        rbm, dsi, remote_cfg, sends = wired
+        self._post(requests_mock, dsi, status_code=500, json={'error': 'boom'})
+        with caplog.at_level(logging.INFO):
+            assert rbm.backup_dataset(dsi, remote_cfg) is False
+        assert [r for r in caplog.records if r.levelno == logging.ERROR and 'Negotiation failed' in r.getMessage()]
+        assert 'is reloading' not in caplog.text
+        self.assert_no_send(sends)
+
+    def test_a_connection_error_never_sends(self, wired, requests_mock):
+        import requests
+        rbm, dsi, remote_cfg, sends = wired
+        self._post(requests_mock, dsi, exc=requests.ConnectionError)
+        assert rbm.backup_dataset(dsi, remote_cfg) is False
+        self.assert_no_send(sends)
+
+    def test_a_null_common_snapshot_still_does_the_full_initial_send(self, wired, requests_mock, mocker):
+        rbm, dsi, remote_cfg, sends = wired
+        self._post(requests_mock, dsi, json={'common_snapshot': None})
+        requests_mock.get(re.compile(r'.*/resume_token$'), json={'resume_token': None})
+        ws = MagicMock()
+        ws.recv.return_value = '{"status": "ok"}'
+        mocker.patch('zfsbackup.remote.websocket.WebSocket', return_value=ws)
+        stream = MagicMock()
+        stream.read.side_effect = [b'x', b'']
+        sends['send_snapshot'].return_value = stream
+        mocker.patch.object(rbm.local_manager, 'set_anchor')
+        assert rbm.backup_dataset(dsi, remote_cfg) is True
+        sends['transfer'].assert_called_once()
+        assert sends['transfer'].call_args.args[4] is None            # no common snapshot: full send
+        sends['send_snapshot'].assert_called_once()
+        assert 'since' not in sends['send_snapshot'].call_args.kwargs
+
+    def test_a_reloading_register_is_false_with_an_info_log_and_goes_no_further(self, wired, requests_mock, caplog):
+        rbm, dsi, remote_cfg, sends = wired
+        requests_mock.post(f'{self.URL}/backup/register', status_code=503, json=self.RELOADING)
+        negotiate = requests_mock.post(re.compile(r'.*/negotiate$'), json={})
+        with caplog.at_level(logging.INFO):
+            assert rbm.backup_dataset(dsi, remote_cfg) is False
+        assert 'is reloading; registration skipped this cycle' in caplog.text
+        assert 'Registration failed' not in caplog.text
+        assert negotiate.call_count == 0
+        self.assert_no_send(sends)
+
+    def test_a_non_retry_register_503_is_a_registration_failure(self, wired, requests_mock, caplog):
+        rbm, dsi, remote_cfg, sends = wired
+        requests_mock.post(f'{self.URL}/backup/register', status_code=503, json={'error': 'remote_backup disabled'})
+        with caplog.at_level(logging.INFO):
+            assert rbm.backup_dataset(dsi, remote_cfg) is False
+        assert 'Registration failed' in caplog.text
+
+    # -- resume_token -------------------------------------------------------
+
+    def test_a_reloading_resume_token_skips_the_dataset_without_a_fresh_send(self, tmp_path, requests_mock, mocker, caplog):
+        rbm, manager, dsi, _ = self._make(tmp_path)
+        send_snapshot = mocker.patch('zfsbackup.remote.zfs.send.snapshot')
+        send_resume = mocker.patch('zfsbackup.remote.zfs.send.resume')
+        requests_mock.get(
+            f'{self.URL}/backup/client1/{dsi.name}/resume_token', status_code=503, json=self.RELOADING
+        )
+        latest = MagicMock()
+        latest.name = 'autosnap_1'
+        with caplog.at_level(logging.INFO):
+            assert rbm._get_resume_stream(self.URL, 'client1', dsi, latest, None) is None
+        assert f'server {self.URL} is reloading; skipping {dsi.name} this cycle' in caplog.text
+        send_snapshot.assert_not_called()
+        send_resume.assert_not_called()
+
+    def test_a_reloading_resume_token_makes_transfer_false(self, tmp_path, requests_mock, mocker):
+        rbm, manager, dsi, _ = self._make(tmp_path)
+        send_snapshot = mocker.patch('zfsbackup.remote.zfs.send.snapshot')
+        ws_cls = mocker.patch('zfsbackup.remote.websocket.WebSocket')
+        requests_mock.get(
+            f'{self.URL}/backup/client1/{dsi.name}/resume_token', status_code=503, json=self.RELOADING
+        )
+        latest = MagicMock()
+        latest.name = 'autosnap_1'
+        assert rbm._transfer(self.URL, 'client1', dsi, latest, None, 'offsite') is False
+        send_snapshot.assert_not_called()
+        ws_cls.assert_not_called()
+
+    def test_an_ordinary_resume_token_failure_still_falls_back_to_a_fresh_send(self, tmp_path, requests_mock, mocker):
+        rbm, manager, dsi, _ = self._make(tmp_path)
+        send_snapshot = mocker.patch('zfsbackup.remote.zfs.send.snapshot', return_value='STREAM')
+        requests_mock.get(f'{self.URL}/backup/client1/{dsi.name}/resume_token', status_code=500)
+        latest = MagicMock()
+        latest.name = 'autosnap_1'
+        assert rbm._get_resume_stream(self.URL, 'client1', dsi, latest, None) == 'STREAM'
+        send_snapshot.assert_called_once()

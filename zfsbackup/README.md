@@ -58,16 +58,54 @@ The outgoing configuration is saved next to the database as `config.db.pre-impor
 (`--no-backup` skips it). `zfsbackup-config export` prints the stored configuration as YAML, and
 `zfsbackup-config migrate` upgrades the database schema after a package upgrade.
 
-**A running daemon does not pick up configuration changes.** It reads the database once at startup;
-restart it after an import. After every change `zfsbackup-config` tells you whether a daemon is
-running and which configuration generation it is on.
+**A running daemon picks up configuration changes on its own.** After every committed change,
+`zfsbackup-config` asks the daemon to reload. The daemon also checks the database every 10 seconds, so a
+change always arrives within about 10 s even when no signal is sent. What happens next:
+- **Reload is checked first.** The daemon reads the new configuration, validates it and builds its dataset
+  list before switching. If anything is wrong, it **rejects** that configuration, logs why, and keeps
+  running the previous one.
+- **Nothing is interrupted.** Each worker switches at its next safe point, between datasets or between
+  destinations. A transfer in progress always finishes first. The daemon logs a warning if a switch is
+  still waiting after a minute.
+- **`--dry-run` stays in force** across reloads.
 
-Besides the database (and its `-wal`/`-shm` files while it is open) you will see
-`config.db.writer.lock`, which serialises `zfsbackup-config` writers, and `config.db.daemon.pid`,
-which marks a running daemon. Both are empty or tiny, both are safe to leave in place, and neither is
-configuration state — a `daemon.pid` left behind by a crash is harmless. If `zfsbackup-config` exits
-with status **75**, another write was in progress or the configuration changed underneath it: just
-run the command again.
+After a change, `zfsbackup-config` reports what the daemon did. It waits up to 3 s for an answer, which
+you can change with the global option `--reload-wait SECONDS`; it goes before the subcommand, and 0
+means don't wait. The answer is one of:
+- the daemon is now on the new generation;
+- it accepted it and is switching its workers over;
+- it rejected it (a warning, with a pointer to the daemon log);
+- no daemon is running.
+
+`zfsbackup-config status` shows the stored generation and the generation the daemon runs, accepted or
+rejected. `status --wait SECONDS` exits 0 once the daemon is in sync, 1 if it rejected the stored
+configuration (or will never catch up), and 75 on timeout. Use it in scripts.
+
+**When the CLI does not signal.** It only signals a process it can prove is the daemon:
+- that process holds the daemon lock on that exact file;
+- it is the process that wrote the pid file, checked by pid and start time, and it is not a zombie;
+- the pid file is owned by root, by you, or by the daemon's own user.
+
+That proof needs Linux's `/proc/locks`, so on macOS and other systems the CLI never signals. It also skips
+the signal when you are not allowed to signal the daemon, for example a group operator and a daemon
+running as another user. In every one of these cases the 10 s check applies the change, and the CLI says
+so. You can still send `SIGHUP` yourself (`systemctl reload zfsbackup`, see below).
+
+**Restoring the database.** To go back to an earlier configuration while a daemon or an editor is running,
+use `zfsbackup-config import` (the `pre-import-*.yaml` backups are made for this). Don't copy an old
+database file into place: a restored copy can carry the same identity and generation as a later edit, and
+then the change can go unnoticed until the next write.
+
+Besides the database (and its `-wal`/`-shm` files while it is open) you will see three more files. All
+are tiny, all are safe to leave in place, and none is configuration state:
+- `config.db.writer.lock` serialises `zfsbackup-config` writers.
+- `config.db.daemon.pid` marks a running daemon and records the generation it has applied, is applying,
+  or rejected. One left behind by a crash is harmless.
+- `config.db.workers.lock` is held by every worker. A newly started daemon waits, with a warning, while
+  workers of a previous daemon are still finishing.
+
+If `zfsbackup-config` exits with status **75**, another write was in progress or the configuration
+changed (or the database was replaced) underneath it: just run the command again.
 
 ### Changing the configuration
 
@@ -112,7 +150,8 @@ If `anchor.<new>` already exists with a different value (left over from an earli
 name), it is overwritten and both values are printed; the snapshot it used to name is no longer pinned
 by it. The daemon protects the snapshot named by *every* local or received anchor property, so keep the
 old anchor until the first send to the new name has succeeded, then clear it with the `zfs inherit`
-commands the CLI prints. Restart the daemon after a rename. Both renames support `--dry-run`.
+commands the CLI prints. The running daemon reloads after a rename like after any other change. Both
+renames support `--dry-run`.
 
 ## Usage
 
@@ -262,6 +301,14 @@ After=zfs-import.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 -m zfsbackup.daemon -c /var/lib/zfsbackup/config.db
+ExecReload=/bin/kill -HUP $MAINPID
+# SIGTERM only the supervisor. It stops its workers at their next safe point and
+# never tears a transfer; the default (control-group) would SIGTERM every worker
+# directly and kill a `zfs send` mid-stream.
+KillMode=mixed
+# Long enough for workers to reach a safe point. The supervisor itself gives up
+# on a worker after about 70 s.
+TimeoutStopSec=90
 Restart=on-failure
 RestartSec=60
 
@@ -274,6 +321,7 @@ Enable and start:
 sudo systemctl enable zfsbackup
 sudo systemctl start zfsbackup
 sudo systemctl status zfsbackup
+sudo systemctl reload zfsbackup   # re-read the configuration now (it also does so every 10 s)
 ```
 
 ## Logging
@@ -290,9 +338,9 @@ Use `-v` flag for debug-level logging.
 
 - **Dry Run Mode**: Test configuration without making changes
 - **Prefix Filtering**: Only manages snapshots with the configured prefix
-- **Graceful Shutdown**: Handles SIGINT/SIGTERM signals
+- **Graceful Shutdown**: Handles SIGINT/SIGTERM signals; SIGHUP reloads the configuration
 - **Error Handling**: Continues operation even if individual datasets fail
-- **Validation**: Validates configuration on startup
+- **Validation**: Validates configuration on startup and before every reload (a rejected reload keeps the previous configuration)
 
 ## Troubleshooting
 

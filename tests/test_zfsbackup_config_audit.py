@@ -1312,3 +1312,438 @@ class TestImporterFailureHandling:
         import_yaml(config_yaml_path, resolved)
 
         assert (directory.stat().st_mode & 0o7777) == 0o755
+
+
+# ---------------------------------------------------------------------------
+# Dataset names the daemon cannot manage (G3 R2): `validate_config` reuses
+# libzfseasy's `Validate.dataset`. An ENABLED dataset (or remote_backup target)
+# with such a name would make every worker raise and crash-loop the daemon, so
+# it is refused at the write boundary; a DISABLED one only warns.
+# ---------------------------------------------------------------------------
+
+#: What every refusal/warning says about the name (stable substrings).
+CANNOT_MANAGE = "cannot be managed by zfsbackup"
+LIBRARY_ACCEPTS = "its ZFS library accepts pool[/component...]"
+REASON = (
+    "(its ZFS library accepts pool[/component...]: the pool name starts with a letter; "
+    "letters, digits and _ . : - only, no spaces; no leading, trailing or doubled '/'; "
+    "no '@' or '#')"
+)
+DISABLED_DATASET = "; the dataset is disabled so it is ignored, but enabling it will be refused"
+DISABLED_REMOTE = "; remote_backup is disabled so it is ignored, but enabling it will be refused"
+
+BAD_NAMES = [
+    ("space", "tank/a b"),
+    ("trailing-slash", "tank/rb/"),
+    ("double-slash", "tank//x"),
+    ("at-sign", "tank/a@s"),
+    ("hash", "tank/a#h"),
+    ("leading-slash", "/tank/x"),
+    ("digit-pool", "123"),
+]
+BAD = [pytest.param(name, id=ident) for ident, name in BAD_NAMES]
+GOOD = [
+    pytest.param("tank/ok", id="plain"),
+    pytest.param("tank/a.b:c_d-e", id="punctuation"),
+    pytest.param("null", id="yaml-keyword"),
+    # An accepted quirk: Validate.dataset's `$` matches before a trailing newline.
+    pytest.param("tank/x\n", id="trailing-newline"),
+]
+
+
+def named(name, *, enabled=True, **over) -> BackupConfig:
+    config = good_config(**over)
+    config.datasets[0].name = name
+    config.datasets[0].enabled = enabled
+    return config
+
+
+class TestDatasetNameValidation:
+    def test_the_full_refusal_text(self):
+        with pytest.raises(ValueError) as excinfo:
+            validate_config(named("tank/a b"))
+        assert str(excinfo.value) == (
+            "datasets[tank/a b]: dataset name 'tank/a b' cannot be managed by zfsbackup "
+            + REASON
+        )
+
+    @pytest.mark.parametrize("name", BAD)
+    def test_an_enabled_dataset_with_a_bad_name_is_refused_naming_it(self, name):
+        with pytest.raises(ValueError) as excinfo:
+            validate_config(named(name))
+        message = str(excinfo.value)
+        assert message.startswith(f"datasets[{name}]: dataset name {name!r} ")
+        assert CANNOT_MANAGE in message and LIBRARY_ACCEPTS in message
+        assert "is not a valid ZFS dataset name" not in message  # OpenZFS allows e.g. spaces
+
+    @pytest.mark.parametrize("name", GOOD)
+    def test_valid_names_pass_without_a_warning(self, name):
+        assert validate_config(named(name)) == []
+
+    @pytest.mark.parametrize("name", BAD)
+    def test_a_disabled_dataset_with_a_bad_name_only_warns(self, name):
+        warnings = validate_config(named(name, enabled=False))
+        assert warnings == [
+            f"datasets[{name}]: dataset name {name!r} {CANNOT_MANAGE} {REASON}" + DISABLED_DATASET
+        ]
+
+    @pytest.mark.parametrize("name", GOOD)
+    def test_a_disabled_dataset_with_a_good_name_does_not_warn(self, name):
+        assert validate_config(named(name, enabled=False)) == []
+
+    def test_only_the_bad_dataset_among_several_is_named(self):
+        config = good_config()
+        config.datasets.append(
+            DatasetConfig(
+                name="tank/two words", frequency=Duration("1h"),
+                retention_rules=[RetentionRule(Duration("1d"), Duration("30d"))],
+            )
+        )
+        with pytest.raises(ValueError, match=r"datasets\[tank/two words\]"):
+            validate_config(config)
+
+    def test_a_disabled_bad_name_does_not_hide_an_enabled_one(self):
+        config = named("tank/off line", enabled=False)
+        config.datasets.append(
+            DatasetConfig(
+                name="tank/on line", frequency=Duration("1h"),
+                retention_rules=[RetentionRule(Duration("1d"), Duration("30d"))],
+            )
+        )
+        with pytest.raises(ValueError, match=r"datasets\[tank/on line\]"):
+            validate_config(config)
+
+    def test_the_bad_name_is_reported_before_later_problems_in_the_same_dataset(self):
+        config = named("tank/a b")
+        config.datasets[0].frequency = Duration(seconds=0)  # also invalid, and checked later
+        config.datasets[0].retention_rules = []
+        with pytest.raises(ValueError) as excinfo:
+            validate_config(config)
+        assert CANNOT_MANAGE in str(excinfo.value)
+        assert "frequency" not in str(excinfo.value)
+
+    def test_the_bad_name_wins_over_the_dataset_s_own_type_errors_that_follow(self):
+        config = named("tank/a b")
+        config.datasets[0].frequency = 3600  # a type error, checked after the name
+        with pytest.raises(ValueError, match=CANNOT_MANAGE):
+            validate_config(config)
+
+    # -- remote_backup.target_dataset --------------------------------------
+
+    def test_an_enabled_remote_backup_with_a_bad_target_is_refused(self):
+        config = good_config(remote_backup=RemoteServerConfig("tank/rb/", enabled=True))
+        with pytest.raises(ValueError) as excinfo:
+            validate_config(config)
+        assert str(excinfo.value) == (
+            "remote_backup.target_dataset 'tank/rb/' " + CANNOT_MANAGE + " " + REASON
+        )
+
+    def test_a_disabled_remote_backup_with_a_bad_target_only_warns(self):
+        config = good_config(remote_backup=RemoteServerConfig("tank/rb/", enabled=False))
+        assert validate_config(config) == [
+            f"remote_backup.target_dataset 'tank/rb/' {CANNOT_MANAGE} {REASON}" + DISABLED_REMOTE
+        ]
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_a_good_target_is_fine(self, enabled):
+        config = good_config(remote_backup=RemoteServerConfig("tank/rb", enabled=enabled))
+        assert validate_config(config) == []
+
+    @pytest.mark.parametrize("name", BAD)
+    def test_every_bad_name_is_refused_as_a_target_too(self, name):
+        config = good_config(remote_backup=RemoteServerConfig(name, enabled=True))
+        with pytest.raises(ValueError, match=r"remote_backup\.target_dataset"):
+            validate_config(config)
+
+    def test_a_remote_backup_flag_is_checked_before_its_name(self):
+        config = good_config(remote_backup=RemoteServerConfig("tank/rb/", enabled=None))
+        with pytest.raises(ValueError, match="remote_backup.enabled"):
+            validate_config(config)
+
+    # -- the validator is libzfseasy's, taken without a zfs binary -----------
+
+    def test_the_rule_is_validate_dataset_of_libzfseasy(self):
+        from libzfseasy.types import Validate
+
+        for ident, name in BAD_NAMES + [("ok", "tank/ok"), ("nl", "tank/x\n")]:
+            try:
+                Validate.dataset(name)
+                accepted = True
+            except ValueError:
+                accepted = False
+            try:
+                validate_config(named(name))
+                managed = True
+            except ValueError:
+                managed = False
+            assert accepted == managed, name
+
+    def test_validate_config_works_with_libzfseasy_unimportable(self, tmp_path):
+        """A host that only manages configuration has no `zfs`: importing the
+        `libzfseasy` package raises there. The validator is then loaded from
+        its `types.py` by path, without running the package `__init__`, and
+        `libzfseasy` is never put in `sys.modules`."""
+        import shutil
+        import subprocess
+        import sys
+
+        repo = Path(__file__).resolve().parent.parent
+        interpreter_dir = str(Path(sys.executable).parent)
+        env = {
+            "PATH": interpreter_dir,  # NOT the hermetic stub dir: no `zfs` anywhere
+            "PYTHONPATH": str(repo),
+            "HOME": str(tmp_path),
+            "LANG": "C.UTF-8",
+        }
+        assert shutil.which("zfs", path=interpreter_dir) is None
+        assert shutil.which("zpool", path=interpreter_dir) is None
+        premise = subprocess.run(
+            [sys.executable, "-c", "import libzfseasy"],
+            env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=60,
+        )
+        assert premise.returncode != 0, "libzfseasy imported without a zfs binary: the premise is gone"
+
+        script = (
+            "import json, sys\n"
+            "from zfsbackup.config import BackupConfig, DatasetConfig, Duration, RetentionRule\n"
+            "from zfsbackup.config.store import validate_config\n"
+            "def cfg(name, enabled=True):\n"
+            "    return BackupConfig(snapshot_prefix='a', datasets=[DatasetConfig(name=name,\n"
+            "        enabled=enabled, frequency=Duration('1h'),\n"
+            "        retention_rules=[RetentionRule(Duration('1d'), Duration('30d'))])])\n"
+            "out = {'ok': validate_config(cfg('tank/ok'))}\n"
+            "try:\n"
+            "    validate_config(cfg('tank/a b'))\n"
+            "    out['bad'] = None\n"
+            "except ValueError as exc:\n"
+            "    out['bad'] = str(exc)\n"
+            "out['disabled'] = validate_config(cfg('tank/a b', False))\n"
+            "out['libzfseasy_loaded'] = any(m == 'libzfseasy' or m.startswith('libzfseasy.') for m in sys.modules)\n"
+            "print(json.dumps(out))\n"
+        )
+        import json
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+        assert out["ok"] == []
+        assert out["bad"].startswith("datasets[tank/a b]: dataset name 'tank/a b' " + CANNOT_MANAGE)
+        assert len(out["disabled"]) == 1 and out["disabled"][0].endswith(DISABLED_DATASET)
+        assert out["libzfseasy_loaded"] is False
+
+
+# -- the write paths -----------------------------------------------------------
+
+
+def _stored(tmp_path, name="store/config.db"):
+    """A database holding the `make()` configuration; -> (resolved, snapshot)."""
+    from zfsbackup.config.store import read_config
+
+    resolved = resolve_config_path(str(tmp_path / name))
+    import_yaml(write(tmp_path, make()), resolved)
+    dispose_all()
+    snapshot = read_config(resolved)
+    dispose_all()
+    return resolved, snapshot
+
+
+def _fingerprint(resolved):
+    import hashlib
+
+    dispose_all()
+    path = Path(str(resolved.resolved_path))
+    sidecars = sorted(
+        p.name for p in path.parent.iterdir()
+        if p.name.startswith(path.name + "-") or ".pre-import-" in p.name
+    )
+    return hashlib.sha256(path.read_bytes()).hexdigest(), sidecars
+
+
+class TestBadNamesNeverReachTheDatabase:
+    @pytest.mark.parametrize("name", [pytest.param("tank/a b", id="space"), pytest.param("tank/x/", id="slash")])
+    def test_write_config_refuses_and_leaves_the_database_unchanged(self, tmp_path, name):
+        from zfsbackup.config.store import read_config, write_config
+
+        resolved, snapshot = _stored(tmp_path)
+        before = _fingerprint(resolved)
+        with pytest.raises(ValueError, match=CANNOT_MANAGE):
+            write_config(
+                resolved, named(name), expected_generation=snapshot.generation,
+                expected_store_id=snapshot.store_id,
+            )
+        assert _fingerprint(resolved) == before
+        after = read_config(resolved)
+        dispose_all()
+        assert after.generation == snapshot.generation and after.config == snapshot.config
+
+    def test_write_config_accepts_the_same_name_disabled_and_warns_via_validate(self, tmp_path):
+        from zfsbackup.config.store import read_config, write_config
+
+        resolved, snapshot = _stored(tmp_path)
+        result = write_config(
+            resolved, named("tank/a b", enabled=False), expected_generation=snapshot.generation
+        )
+        assert result.generation == snapshot.generation + 1
+        stored = read_config(resolved).config
+        dispose_all()
+        assert stored.datasets[0].name == "tank/a b" and stored.datasets[0].enabled is False
+
+    def test_write_config_refuses_a_bad_remote_backup_target(self, tmp_path):
+        from zfsbackup.config.store import write_config
+
+        resolved, snapshot = _stored(tmp_path)
+        before = _fingerprint(resolved)
+        bad = good_config(remote_backup=RemoteServerConfig("tank/rb/", enabled=True))
+        bad.datasets[0].name = "pool/data"
+        with pytest.raises(ValueError, match=r"remote_backup\.target_dataset"):
+            write_config(resolved, bad, expected_generation=snapshot.generation)
+        assert _fingerprint(resolved) == before
+
+    def test_save_config_refuses_and_writes_nothing(self, tmp_path):
+        from zfsbackup.config.store import read_config
+
+        resolved, snapshot = _stored(tmp_path)
+        before = _fingerprint(resolved)
+        with pytest.raises(ValueError, match=CANNOT_MANAGE):
+            with open_config_session(resolved, readonly=False) as session:
+                save_config(session, named("tank/a b"))
+        assert _fingerprint(resolved) == before
+        after = read_config(resolved)
+        dispose_all()
+        assert after.config == snapshot.config and after.generation == snapshot.generation
+
+    def test_import_refuses_a_bad_enabled_name_and_leaves_the_database_unchanged(self, tmp_path):
+        resolved, snapshot = _stored(tmp_path)
+        before = _fingerprint(resolved)
+        called = []
+        bad = write(tmp_path, make(ds={"name": "tank/a b"}), "bad.yaml")
+        with pytest.raises(ValueError, match=CANNOT_MANAGE):
+            import_yaml(bad, resolved, backup=lambda outgoing: called.append(outgoing) or tmp_path / "x")
+        assert called == [], "a refused import must not even write the outgoing backup"
+        assert _fingerprint(resolved) == before
+
+    def test_import_accepts_the_same_name_when_it_is_disabled(self, tmp_path, caplog):
+        resolved, _ = _stored(tmp_path)
+        ok = write(tmp_path, make(ds={"name": "tank/a b", "enabled": False}), "ok.yaml")
+        with caplog.at_level(logging.WARNING):
+            import_yaml(ok, resolved)
+        assert any(CANNOT_MANAGE in m and "enabling it will be refused" in m for m in warnings_of(caplog))
+
+    def test_a_refused_first_import_leaves_nothing_behind(self, tmp_path):
+        target = tmp_path / "newdir" / "config.db"
+        bad = write(tmp_path, make(ds={"name": "tank/a b"}), "bad.yaml")
+        with pytest.raises(ValueError, match=CANNOT_MANAGE):
+            import_yaml(bad, resolve_config_path(str(target)))
+        assert not target.exists() and not target.parent.exists()
+        assert list(tmp_path.glob("newdir*")) == []
+
+    def test_a_refused_import_over_a_bad_remote_backup_target_leaves_nothing_behind(self, tmp_path):
+        target = tmp_path / "newdir" / "config.db"
+        data = make(remote_backup={"target_dataset": "tank/rb/", "enabled": True})
+        with pytest.raises(ValueError, match=r"remote_backup\.target_dataset"):
+            import_yaml(write(tmp_path, data, "bad.yaml"), resolve_config_path(str(target)))
+        assert not target.parent.exists()
+
+
+# -- through the CLI --------------------------------------------------------------
+
+
+class TestBadNamesThroughTheCli:
+    """`error: datasets[...]: ...` and exit 1, nothing written, nothing announced."""
+
+    OFF = make(ds={"name": "tank/a b", "enabled": False})
+
+    @pytest.fixture
+    def off(self, tmp_path):
+        """A database whose only dataset has a bad name but is DISABLED (the
+        import accepts it with a warning)."""
+        from click.testing import CliRunner
+
+        from zfsbackup.cli.main import cli
+
+        db = tmp_path / "cfg" / "config.db"
+        source = write(tmp_path, self.OFF)
+        result = CliRunner().invoke(cli, ["import", str(source), "-c", str(db)], prog_name="zfsbackup-config")
+        assert result.exit_code == 0, result.stderr
+        assert CANNOT_MANAGE in result.stderr and "enabling it will be refused" in result.stderr
+        dispose_all()
+        return db
+
+    @staticmethod
+    def invoke(*args, env=None, input=None):
+        from click.testing import CliRunner
+
+        from zfsbackup.cli.main import cli
+
+        return CliRunner().invoke(
+            cli, [str(a) for a in args], env=env, input=input, prog_name="zfsbackup-config"
+        )
+
+    @staticmethod
+    def digest(db):
+        import hashlib
+
+        dispose_all()
+        return hashlib.sha256(Path(db).read_bytes()).hexdigest()
+
+    def test_set_that_enables_a_bad_name_is_refused(self, off):
+        before = self.digest(off)
+        result = self.invoke("set", "datasets[tank/a b].enabled", "true", "-c", off)
+        assert result.exit_code == 1, result.stdout
+        assert result.stderr.startswith("error: datasets[tank/a b]: dataset name 'tank/a b' " + CANNOT_MANAGE)
+        assert "config updated" not in result.stdout
+        assert self.digest(off) == before
+
+    def test_set_of_something_else_is_not_blocked_by_a_standing_disabled_bad_name(self, off):
+        """The disabled dataset was accepted (with a warning) at import; an
+        unrelated edit neither refuses nor repeats that standing warning."""
+        result = self.invoke("set", "check_interval", "10m", "-c", off)
+        assert result.exit_code == 0, result.stderr
+        assert CANNOT_MANAGE not in result.stderr
+
+    def test_edit_that_enables_a_bad_name_is_refused(self, off, tmp_path):
+        from _cli_support import Stub
+
+        stub = Stub(tmp_path)
+        stub.plan([{"replace": ["enabled: false", "enabled: true"]}])
+        before = self.digest(off)
+        result = self.invoke("edit", "--no-prompt", "-c", off, env=stub.env(off))
+        assert result.exit_code == 1, result.stdout
+        assert "error: datasets[tank/a b]: dataset name 'tank/a b' " + CANNOT_MANAGE in result.stderr
+        assert self.digest(off) == before
+
+    def test_edit_that_adds_a_bad_dataset_is_refused(self, off, tmp_path):
+        from _cli_support import Stub
+
+        stub = Stub(tmp_path)
+        stub.plan([{"append": '  - name: "tank/new#x"\n    frequency: "1h"\n'}])
+        result = self.invoke("edit", "--no-prompt", "-c", off, env=stub.env(off))
+        assert result.exit_code == 1
+        assert "error: datasets[tank/new#x]: dataset name 'tank/new#x' " + CANNOT_MANAGE in result.stderr
+
+    def test_import_of_a_bad_enabled_name_is_refused(self, off, tmp_path):
+        before = self.digest(off)
+        bad = write(tmp_path, make(ds={"name": "tank/a b"}), "bad.yaml")
+        result = self.invoke("import", bad, "-c", off)
+        assert result.exit_code == 1, result.stdout
+        assert "error: datasets[tank/a b]: dataset name 'tank/a b' " + CANNOT_MANAGE in result.stderr
+        assert "config updated" not in result.stdout
+        assert self.digest(off) == before
+        assert list(Path(off).parent.glob("*.pre-import-*.yaml")) == []
+
+    def test_a_first_import_of_a_bad_enabled_name_creates_no_database(self, tmp_path):
+        target = tmp_path / "fresh" / "config.db"
+        bad = write(tmp_path, make(ds={"name": "tank/a b"}), "bad.yaml")
+        result = self.invoke("import", bad, "-c", target)
+        assert result.exit_code == 1
+        assert result.stderr.startswith("error: datasets[tank/a b]: ")
+        assert not target.parent.exists()
+
+    def test_the_target_dataset_of_an_enabled_remote_backup_is_refused_on_import(self, tmp_path):
+        data = make(remote_backup={"target_dataset": "tank/rb/", "enabled": True})
+        result = self.invoke("import", write(tmp_path, data, "bad.yaml"), "-c", tmp_path / "x" / "config.db")
+        assert result.exit_code == 1
+        assert result.stderr.startswith("error: remote_backup.target_dataset 'tank/rb/' " + CANNOT_MANAGE)

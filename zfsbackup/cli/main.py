@@ -6,8 +6,8 @@ only ever read it). It reaches the database exclusively through
 `write_config`, schema migration, `import_yaml`) -- never an ORM model, never
 a query -- so every schema invariant stays behind the mapper. It imports
 nothing of the daemon (`runtime_config`, `daemon`, `workers`, ...) at import
-time; the one daemon-lane module it uses is `daemonlock`, to tell the operator
-after a write whether a daemon is running. The single exception is `rename.py`,
+time; the one daemon-lane module it uses is `daemonlock`, to ask the running
+daemon to reload after a write and to report on it. The single exception is `rename.py`,
 which imports `zfsbackup.backup_manager` (and with it `libzfseasy`) LAZILY, only
 inside `rename dataset|destination`, because the ZFS user-property helpers live
 there; nothing else loads it, and a host without ZFS can still run every other
@@ -24,6 +24,11 @@ Commands:
 - `edit`         -- the whole configuration in `$EDITOR` (`editor.py`);
   `edit dataset|destination NAME` edits one entry.
 - `rename dataset|destination OLD NEW` (`rename.py`).
+- `status [--wait S] [--json]` -- is the running daemon on the stored
+  configuration? (`status.py`; read-only, never signals.)
+
+After every committed write the CLI asks the running daemon to reload
+(`write.notify_daemon`; global `--reload-wait SECONDS`).
 
 Path resolution is the daemon's: `-c/--config`, then `$ZFSBACKUP_CONFIG`, then
 the default path. Only `import` may create a database; every other command
@@ -52,11 +57,20 @@ from typing import Callable, List, Optional, Tuple
 import click
 import yaml
 
-from zfsbackup.cli import dotpath, editor, rename
+from zfsbackup import daemonlock
+from zfsbackup.cli import dotpath, editor, rename, status as status_view
 from zfsbackup.cli.errors import BackupFailed, CliError, is_database_unusable, report
 from zfsbackup.cli.listing import render_datasets, render_destinations
 from zfsbackup.cli.render import render_yaml
-from zfsbackup.cli.write import commit_config, notify_daemon, read_snapshot, where_flag
+from zfsbackup.cli.write import (
+    DEFAULT_RELOAD_WAIT,
+    COMMITTED_MARK,
+    begin_reload,
+    commit_config,
+    notify_daemon,
+    read_snapshot,
+    where_flag,
+)
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
     CONFIG_PATH_ENV,
@@ -138,6 +152,9 @@ class State:
     verbose: bool = False
     resolved: Optional[ResolvedConfigPath] = None
     handler: Optional[_LogHandler] = None
+    #: `--reload-wait`: seconds `notify_daemon` waits for the daemon's
+    #: acknowledgement after a SIGHUP (0 = do not wait).
+    reload_wait: float = DEFAULT_RELOAD_WAIT
     _restore_level: Optional[int] = field(default=None, repr=False)
 
     def install_logging(self) -> None:
@@ -239,7 +256,12 @@ class _Group(click.Group):
             terminated = isinstance(exc, _Terminated)
             word = "terminated" if terminated else "interrupted"
             notes = list(getattr(exc, "__notes__", ()))
-            if ctx.invoked_subcommand == "import":
+            if getattr(exc, COMMITTED_MARK, False):
+                # Interrupted while waiting for the daemon to acknowledge a
+                # write that is already durable (`write.notify_daemon`): the
+                # exit code (130/143) reflects the interrupt, not the write.
+                click.echo(f"{word} (the change is saved)", err=True)
+            elif ctx.invoked_subcommand == "import":
                 # ^C can land before, inside or just after the commit; the
                 # store's notes say what it knows, but only the database says
                 # which it was.
@@ -289,6 +311,17 @@ def _state(config_path: Optional[str], verbose: bool) -> State:
     return state
 
 
+def _check_seconds(ctx, param, value):
+    """`--reload-wait` / `--wait`: a finite number of seconds, 0 or more. (`nan`
+    would compare false against every deadline and wait forever.) `None` (not
+    given) passes through."""
+    if value is None:
+        return None
+    if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        raise click.BadParameter("must be a finite number of seconds, 0 or more")
+    return value
+
+
 # `type=str`, not `Path`: `str(Path("")) == "."` would turn `-c ""` into "the
 # current directory" and defeat `resolve_config_path`'s fallthrough to
 # $ZFSBACKUP_CONFIG (same reasoning as the daemon's `-c`).
@@ -298,7 +331,10 @@ def _state(config_path: Optional[str], verbose: bool) -> State:
     help=(
         "Manage the zfsbackup configuration database.\n\n"
         "Exit codes: 0 ok, 1 invalid input or refused, 2 usage error, "
-        "75 conflict or busy (retry), 78 config database unusable."
+        "75 conflict or busy (retry), 78 config database unusable.\n\n"
+        "After every committed write the running daemon is asked to reload. "
+        "--reload-wait is a global option and goes BEFORE the subcommand, "
+        "e.g. `zfsbackup-config --reload-wait 10 set check_interval 5m`."
     ),
 )
 @click.option(
@@ -309,9 +345,20 @@ def _state(config_path: Optional[str], verbose: bool) -> State:
     ),
 )
 @click.option("-v", "--verbose", is_flag=True, default=False, help="Verbose (debug) output.")
+@click.option(
+    "--reload-wait", "reload_wait", type=float, default=DEFAULT_RELOAD_WAIT,
+    show_default=True, callback=_check_seconds, metavar="SECONDS",
+    help=(
+        "Global option: goes before the subcommand. After a write that "
+        "signalled the running daemon to reload, wait up to SECONDS for it to "
+        "acknowledge (0 = do not wait). It never changes the exit code."
+    ),
+)
 @click.pass_context
-def cli(ctx: click.Context, config_path: Optional[str], verbose: bool) -> None:
-    state = State(config_path=config_path, verbose=verbose)
+def cli(
+    ctx: click.Context, config_path: Optional[str], verbose: bool, reload_wait: float
+) -> None:
+    state = State(config_path=config_path, verbose=verbose, reload_wait=reload_wait)
     ctx.obj = state
     state.install_logging()
     # Closing the group's context is the last thing every invocation does,
@@ -491,6 +538,9 @@ def import_cmd(yaml_file: Path, no_backup: bool, config_path: Optional[str], ver
             exc.add_note(_REPLACE_NOTE)
         raise
 
+    # The import is committed: ask the daemon to reload BEFORE printing
+    # anything, so a closed stdout cannot cost the signal.
+    request = begin_reload(resolved, result.generation, result.store_id)
     where = resolved.resolved_path
     if result.created:
         click.echo(f"Imported {yaml_file} into new database {where}.")
@@ -510,24 +560,7 @@ def import_cmd(yaml_file: Path, no_backup: bool, config_path: Optional[str], ver
         )
         click.echo(f"Imported {yaml_file} into {where}.")
     click.echo(f"Schema revision: {result.head_revision}")
-    _notify_after_import(resolved, result.generation)
-
-
-def _notify_after_import(resolved: ResolvedConfigPath, generation: Optional[int] = None) -> None:
-    """The post-write daemon notice for an import. `generation` is the one the
-    import itself committed (`ImportResult.generation`); reading it back after
-    the writer lock is released could report a concurrent write's generation as
-    the import's, so that read is only a fallback for a store that does not
-    report one. The import is already durable, so no failure here may fail the
-    command."""
-    if generation is None:
-        try:
-            generation = read_config(resolved).generation
-        except Exception:  # noqa: BLE001 - fallback only; the notice just omits it
-            generation = None
-        finally:
-            dispose_all()
-    notify_daemon(resolved, generation)
+    notify_daemon(resolved, result.generation, result.store_id, request=request)
 
 
 def _exists(path: Path) -> bool:
@@ -748,9 +781,93 @@ def migrate_cmd(check: bool, config_path: Optional[str], verbose: bool) -> None:
     before = ", ".join(upgrade.from_revs)
     click.echo(f"Migrated the schema of {resolved.resolved_path} from {before} to {upgrade.to_rev}.")
     click.echo(
-        "Restart any running zfsbackup daemon now so it runs this schema and "
-        "its configuration."
+        "A daemon started before this upgrade must be restarted to run this schema "
+        "(until then it cannot apply any configuration change); one already running "
+        f"this version picks it up within {daemonlock.RELOAD_POLL_SECONDS}s."
     )
+
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+
+
+_JSON_OPTION_STATUS = click.option(
+    "--json", "as_json", is_flag=True, default=False,
+    help="Machine-readable JSON (stable shape; see zfsbackup/cli/status.py).",
+)
+
+
+@cli.command(
+    "status",
+    help=(
+        "Is the running daemon on the stored configuration? Prints the stored "
+        "key (store id and generation), the daemon's pid, what it has applied, "
+        "is applying (target) or rejected, whether it supports live reload, "
+        "and a verdict. Read-only: it never signals the daemon. Exit 0; 1 if "
+        "the daemon's lock file cannot be read; 78 if the database is unusable "
+        "or its schema is out of date (the daemon state is printed first). With "
+        "--wait SECONDS, wait for the daemon to catch up: exit 0 once it is in "
+        "sync (or if no daemon is running), 1 if it rejected the stored "
+        "configuration or can never catch up (a daemon that predates live "
+        "reload, or whose supervisor is gone), 75 if the time ran out."
+    ),
+)
+@click.option(
+    "--wait", "wait", type=float, default=None, metavar="SECONDS",
+    callback=_check_seconds,
+    help="Wait up to SECONDS for the daemon to be in sync; the exit code reports the outcome.",
+)
+@_JSON_OPTION_STATUS
+@_common
+def status_cmd(
+    wait: Optional[float], as_json: bool, config_path: Optional[str], verbose: bool
+) -> None:
+    state = _state(config_path, verbose)
+    state.quiet()
+    resolved = state.resolve()
+    if wait is None:
+        current = status_view.collect(resolved)
+    else:
+        current = status_view.wait_for(resolved, wait)
+    if as_json:
+        click.echo(status_view.render_json(current), nl=False)
+    else:
+        click.echo(status_view.render_text(current), nl=False)
+    if current.schema_error is not None:
+        # What could be said has been; now fail like any unusable database
+        # (exit 78, the store's own wording).
+        raise current.schema_error
+    if wait is None:
+        return
+    code = status_view.wait_exit_code(current)
+    if code == 75:
+        extra = "" if "daemon log" in current.message else "; if it does not catch up, see the daemon log"
+        click.echo(
+            f"error: the daemon is not yet in sync after {wait:g}s: {current.message}{extra}",
+            err=True,
+        )
+    elif current.verdict == status_view.REJECTED:
+        click.echo(
+            "error: the daemon rejected the stored configuration and keeps "
+            "running an older one; see its log",
+            err=True,
+        )
+    elif current.will_not_catch_up:
+        if current.verdict == status_view.SUPERVISOR_GONE:
+            click.echo(
+                "error: the daemon's supervisor is gone, so nothing will pick up the "
+                "stored configuration until the daemon is restarted",
+                err=True,
+            )
+        else:
+            click.echo(
+                "error: the running daemon predates live reload and will not pick up "
+                "the stored configuration; restart it",
+                err=True,
+            )
+    if code:
+        click.get_current_context().exit(code)
 
 
 # --------------------------------------------------------------------------
@@ -911,11 +1028,14 @@ def _edit(
         return
 
     result = commit_config(resolved, snapshot, change.config, warn=state.warn, announce=False)
+    # Request the reload BEFORE printing anything: a closed stdout must not
+    # cost the signal.
+    request = begin_reload(resolved, result.generation, result.store_id)
     click.echo(
         f"{dotpath.format_path(shown)}: {dotpath.compact(config, shown)} -> "
         f"{dotpath.compact(change.config, shown)}"
     )
-    notify_daemon(resolved, result.generation)
+    notify_daemon(resolved, result.generation, result.store_id, request=request)
 
 
 @cli.command(

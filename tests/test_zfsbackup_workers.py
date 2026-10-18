@@ -418,12 +418,25 @@ class TestWorkerConstructors:
 
     @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
     def test_the_signature_is_exactly_config_stop_event_verbose(self, cls, name):
-        params = list(inspect.signature(cls.__init__).parameters)
-        assert params == ['self', 'config', 'stop_event', 'verbose']
+        sig = inspect.signature(cls.__init__)
+        assert list(sig.parameters) == [
+            'self', 'config', 'stop_event', 'verbose',
+            'reload_epoch', 'born_epoch', 'workers_lock',
+        ]
+        # The reload trio is keyword-only with inert defaults, so every old
+        # positional call keeps working.
+        for trio, default in (('reload_epoch', None), ('born_epoch', 0), ('workers_lock', None)):
+            assert sig.parameters[trio].kind is inspect.Parameter.KEYWORD_ONLY
+            assert sig.parameters[trio].default == default
 
     def test_base_worker_signature_takes_the_name_first(self):
-        params = list(inspect.signature(BaseWorker.__init__).parameters)
-        assert params == ['self', 'worker_name', 'config', 'stop_event', 'verbose']
+        sig = inspect.signature(BaseWorker.__init__)
+        assert list(sig.parameters) == [
+            'self', 'worker_name', 'config', 'stop_event', 'verbose',
+            'reload_epoch', 'born_epoch', 'workers_lock',
+        ]
+        assert [n for n, p in sig.parameters.items()
+                if p.kind is inspect.Parameter.KEYWORD_ONLY] == ['reload_epoch', 'born_epoch', 'workers_lock']
 
     @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
     def test_the_old_dry_run_and_path_parameters_are_gone(self, cls, name, worker_config):

@@ -1,5 +1,5 @@
 """A-5 and A-6.2 -- daemon restart backoff, failure classification, interval
-floor, graceful-shutdown hardening, and the SIGHUP stopgap.
+floor, graceful-shutdown hardening, and the SIGHUP handler contract.
 
 Time is driven through `BackupDaemon._monotonic`, the named seam: a restart
 is a per-worker `_restart_at[name]` deadline checked on each poll, never a
@@ -744,11 +744,12 @@ class TestRunFinally:
         assert seen == [True]
 
     def test_main_reports_a_crashed_run_as_exit_one(
-        self, sqlite_config_db, lock_spy, mocker, caplog
+        self, sqlite_config_db, sample_backup_config, lock_spy, mocker, caplog
     ):
+        # A real config: startup runs `validate_config` on it (item 17.2).
         mocker.patch(
             "zfsbackup.daemon.load_runtime_config",
-            return_value=ConfigSnapshot(MagicMock(dry_run=False), 3, "rev"),
+            return_value=ConfigSnapshot(sample_backup_config, 3, "rev"),
         )
         crashing = MagicMock()
         crashing.run.side_effect = RuntimeError("poll loop died")
@@ -838,14 +839,15 @@ class TestAbandonedWorkers:
         hard.assert_not_called()
 
     def test_run_collects_abandoned_workers_even_when_run_crashes(
-        self, sqlite_config_db, lock_spy, mocker
+        self, sqlite_config_db, sample_backup_config, lock_spy, mocker
     ):
         crashing = MagicMock()
         crashing.run.side_effect = RuntimeError("x")
         crashing.abandoned_workers = ["api"]
+        # A real config: startup runs `validate_config` on it (item 17.2).
         mocker.patch(
             "zfsbackup.daemon.load_runtime_config",
-            return_value=ConfigSnapshot(MagicMock(dry_run=False), 3, "rev"),
+            return_value=ConfigSnapshot(sample_backup_config, 3, "rev"),
         )
         mocker.patch("zfsbackup.daemon.BackupDaemon", return_value=crashing)
         collected = []
@@ -935,7 +937,13 @@ class TestAbandonedWorkers:
 # ---------------------------------------------------------------------------
 
 
-class TestSighupStopgap:
+class TestSighupHandler:
+    """A-6.2 originally pinned a stopgap ("live reload not implemented");
+    item 17.2 replaced it with a real reload. What survives from A-6.2 is the
+    handler contract: one plain store, no logging, and a real SIGHUP never
+    terminates the supervisor. The reload behaviour itself is in
+    `test_zfsbackup_reload.py`."""
+
     def test_handler_sets_only_the_flag_and_logs_nothing(self, daemon, caplog):
         with caplog.at_level(logging.DEBUG):
             daemon._sighup_handler(signal.SIGHUP, None)
@@ -944,21 +952,14 @@ class TestSighupStopgap:
         assert daemon._stop_signum is None
         assert caplog.records == []
 
-    def test_poll_loop_logs_the_stopgap_message_once(self, daemon, caplog):
-        daemon._sighup_handler(signal.SIGHUP, None)
-        with caplog.at_level(logging.WARNING):
-            daemon._report_hup()
-            daemon._report_hup()
-        messages = [r.getMessage() for r in caplog.records]
-        assert messages == ["Received SIGHUP: live reload not implemented; restart to apply"]
-        assert daemon._hup_requested is False
+    def test_the_stopgap_report_is_gone(self, daemon):
+        assert not hasattr(daemon, "_report_hup")
 
-    def test_silent_without_a_signal(self, daemon, caplog):
-        with caplog.at_level(logging.WARNING):
-            daemon._report_hup()
-        assert caplog.records == []
-
-    def test_run_reports_a_hup_and_keeps_running(self, daemon, mocker, caplog):
+    def test_run_with_a_hup_and_no_key_keeps_running_and_says_reload_is_off(
+        self, daemon, mocker, caplog
+    ):
+        """`daemon` is built without a `key`, so live reload is off: the HUP is
+        consumed with a WARNING and the loop carries on."""
         patch_manager(mocker)
         mocker.patch.object(daemon, "_start_workers")
         mocker.patch.object(daemon, "_check_workers")
@@ -976,7 +977,8 @@ class TestSighupStopgap:
         with caplog.at_level(logging.WARNING):
             assert daemon.run() == 0
 
-        assert "live reload not implemented" in caplog.text
+        assert "live reload is off" in caplog.text
+        assert daemon._hup_requested is False
         assert daemon._check_workers.call_count >= 1  # the daemon kept running past the HUP
 
     def test_a_real_sighup_does_not_terminate_the_supervisor(self, daemon):

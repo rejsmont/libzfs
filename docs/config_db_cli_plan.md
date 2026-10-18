@@ -1963,6 +1963,105 @@ Two lanes run in parallel (disjoint owners); everything inside the daemon lane i
     2. Nothing is forked between a poll and its dispose.
     3. The key recorded after a reload is the `read_config` snapshot's, not the poll's.
 
+- **G2 (2026-10-18): passed (concurrency + breadth), with fixes before 17.2.**
+  - Fixes before 17.2:
+    - **The lock-holder proof matches MAJ:MIN as well as the inode.** MAJ:MIN comes from the pid-file fd's
+      mount (`fdinfo` `mnt_id` → `mountinfo`), and the pid file must be owned by root or the CLI's own euid.
+      This closes a demonstrated confused-deputy attack: a forged pid file plus an inode collision on another
+      filesystem made a root CLI SIGHUP an unrelated process.
+    - **`hidepid=2`:** the CLI no longer reports a live daemon as gone.
+    - **Negotiate is gated by the drain, and the client never turns a failed or 503 negotiate into a full
+      send:** a 503 skips the cycle.
+    - **Pid-file writes are padded** before `ftruncate`, so there is no torn tail.
+    - **Smaller fixes:** pid bound, `ws.close()` timeout, original transfer error kept, `O_NONBLOCK` opens,
+      docstrings.
+  - Deferred:
+    - repairing the anchor when common == latest after a lost final ack;
+    - `_acquire_presence_lock` waiting on garbled pid-file content (killable, starts nothing).
+  - Accepted residual: an unauthenticated peer can hold the API worker's RELOAD drain open by trickling
+    data. It is not capped, per D5; recorded under the remote-backup auth blocker in
+    `production_readiness_report.md`.
+  - **G3 must check:**
+    1. Exit code 3 is a turnover only when `born_epoch` < the current epoch; a 3 during shutdown is a
+       normal exit.
+    2. The `Handoff` is swapped before `ReloadEpoch.set()`, and `_new_worker` reads both from one `Handoff`.
+    3. The padded pid-file write lands before anything reads `target`/`rejected`.
+    4. `workers_present` is never called after startup.
+    5. The replacement API worker is spawned only after the old one has exited.
+    6. The supervisor logs deferred switches periodically.
+  - **G4 must check:**
+    - the inode/device fix is in;
+    - a `signalled` sent to a zombie supervisor doesn't hang the acknowledgement wait, and that wait holds
+      no lock;
+    - a pid-1 daemon in a container is `unverified`, and the wording says so;
+    - `cli/errors.py` checks `StoreIdConflict` first.
+
+- **G3 (2026-10-18): not passed on the first review; fixes in progress.**
+  - Sound: no fork with a session open, Handoff-then-epoch ordering, the SIGHUP flag and the hand-over,
+    stop guards, turnover and crash-loop accounting, API port, pid-file transitions, poll cost.
+  - HIGH: a config the supervisor cannot build was accepted and applied anyway. An invalid ZFS dataset name
+    made every worker crash-loop, and the daemon exited 1 after about 200 s; the reviewer reproduced this end
+    to end. Fix:
+    - the reload builds the dataset list before it is accepted, and a failure rejects the candidate;
+    - startup does the same;
+    - `validate_config` rejects invalid ZFS names.
+  - MEDIUM: a turnover dropped the stable-uptime credit. A stable worker's `_failures` is now reset at
+    turnover.
+  - LOW:
+    - a stop during the reload read still accepted the candidate;
+    - the rejection message broke a pasteable last line;
+    - the poll hid unexpected exceptions;
+    - an unknown-key rejection triggered a full re-read, with alembic INFO lines, every 10 s;
+    - the summary didn't report changes to settings (with an extra warning for `snapshot_prefix`);
+    - the not-WAL warning was logged on every poll (the latch is now per path);
+    - stale docstrings.
+  - **Carry to G4:**
+    - the acknowledgement treats `target=` ≥ our key (same store id) as accepted;
+    - an unknown-key rejection is never published, so the wording points at the daemon log;
+    - `rejected=` is cleared on the next acceptance;
+    - with a poll every 10 s the importer's "remove nothing" branch is routine.
+
+- **G3 re-review (2026-10-18): passed (concurrency + breadth).**
+  - All five findings are fixed and were re-verified by running them:
+    - a bad dataset name is rejected while running (`rejected=` recorded, workers unchanged) and refused at a
+      cold start;
+    - `_build_manager` is the backstop;
+    - the turnover credit is reset;
+    - a stop during the read publishes no `target=`;
+    - the not-WAL warning is latched per (pid, path).
+  - The store's name check is fork-safe and import-safe: a CLI-only host never imports libzfseasy's
+    `__init__`.
+  - Follow-ups:
+    - R1: a schema error no longer sets `_poll_skip`, so `migrate` takes effect at the next poll;
+    - R2: the name message blames libzfseasy, not ZFS (OpenZFS allows spaces);
+    - R3: `-v` keeps alembic's INFO lines;
+    - R4: the per-dataset change lines are logged after the stop check.
+  - Residual (INFO): `_build_manager` covers only the dataset list. Other environment failures in a new
+    worker, such as the client-id file or a busy `api_port`, still go through D9 (crash loop → exit 1, naming
+    the generation).
+  - Item 21: the systemd unit gets `ExecReload=/bin/kill -HUP $MAINPID`.
+
+- **G4 (2026-10-18): passed (concurrency + breadth).**
+  - Stress runs: 8×6 and 12×8 concurrent `set`s against a live daemon.
+    - Contiguous generations and exactly one SIGHUP per commit.
+    - No lock or DB fd held at signal time (checked on 127 commits).
+    - The daemon converged within 5 s, with no crash and no orphans.
+  - Bounded waits: against a zombie, a FIFO and a torn pid file.
+  - Follow-ups, all LOW:
+    - ack/status ignore unstable reads;
+    - a broken stdout no longer skips the SIGHUP;
+    - an interrupt after commit says the change is saved;
+    - a daemon vanishing mid-wait gets its own wording;
+    - `rename destination` checks the store id before copying anchors;
+    - platform-correct "unverified" details;
+    - "picks up", never "applies";
+    - `supervisor-gone` wording only when the pid is really gone;
+    - a newer rejected key is reported;
+    - `status`: exits early when the daemon will never catch up, checks the schema (78), and has
+      zombie-aware liveness;
+    - a zombie supervisor counts as gone in `procident`;
+    - `migrate` wording.
+
 ### Item 17.0 — Store id and cheap store state *(store)*
 
 - **Owner:** `zfsbackup-store-developer` · **Tag:** `needs-approval` (config load/write contract) · **Gate:** G1

@@ -5731,12 +5731,193 @@ class TestJournalModeByEngineRole:
             eng.dispose()
         assert len(self._mode_warnings(caplog)) == 1
 
-    def test_each_reader_engine_warns_once_for_itself(self, tmp_path, caplog):
+    # -- the latch is per (process, database path), not per engine ----------
+
+    @pytest.fixture(autouse=True)
+    def _fresh_latch(self):
+        """The latch is module state; every test here starts and ends clean."""
+        store_db._NOT_WAL_WARNED.clear()
+        yield
+        store_db._NOT_WAL_WARNED.clear()
+
+    @staticmethod
+    def _set_mode(path, mode):
+        """Switch the file's journal mode with a plain sqlite3 connection (no
+        engine of ours is open on it)."""
+        conn = sqlite3.connect(str(path))
+        try:
+            assert conn.execute(f"PRAGMA journal_mode={mode}").fetchone()[0].lower() == mode.lower()
+        finally:
+            conn.close()
+
+    def _poll(self, path, times=1):
+        """What the daemon does every few seconds: a fresh reader engine, a
+        read, a dispose."""
+        for _ in range(times):
+            self._connect_and_close(f"sqlite:///{path}", readonly=True)
+
+    def test_successive_reader_engines_on_one_path_warn_once_in_total(self, tmp_path, caplog):
+        """The old latch lived in each engine: the daemon, which disposes every
+        engine after each poll, repeated the same WARNING on every poll."""
         path = self._sqlite_file(tmp_path / "rj.db", "CREATE TABLE t (x)")
         with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
-            self._connect_and_close(f"sqlite:///{path}", readonly=True)
-            self._connect_and_close(f"sqlite:///{path}", readonly=True)
+            self._poll(path, times=2)
+        assert len(self._mode_warnings(caplog)) == 1
+
+    def test_many_engines_created_and_disposed_on_one_path_warn_exactly_once(self, tmp_path, caplog):
+        path = self._sqlite_file(tmp_path / "rj.db", "CREATE TABLE t (x)")
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+            self._poll(path, times=25)
+        assert len(self._mode_warnings(caplog)) == 1
+
+    def test_engines_alive_at_the_same_time_share_the_one_warning(self, tmp_path, caplog):
+        path = self._sqlite_file(tmp_path / "rj.db", "CREATE TABLE t (x)")
+        engines = [make_engine(f"sqlite:///{path}", readonly=True) for _ in range(4)]
+        try:
+            with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+                for eng in engines:
+                    with eng.connect() as conn:
+                        conn.exec_driver_sql("SELECT 1").fetchall()
+        finally:
+            for eng in engines:
+                eng.dispose()
+        assert len(self._mode_warnings(caplog)) == 1
+
+    def test_two_paths_warn_once_each(self, tmp_path, caplog):
+        a = self._sqlite_file(tmp_path / "a.db", "CREATE TABLE t (x)")
+        b = self._sqlite_file(tmp_path / "b.db", "CREATE TABLE t (x)")
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+            self._poll(a, times=3)
+            self._poll(b, times=3)
+            self._poll(a)
+        messages = self._mode_warnings(caplog)
+        assert len(messages) == 2
+        assert sum(str(a) in m for m in messages) == 1 and sum(str(b) in m for m in messages) == 1
+
+    def test_the_latch_is_keyed_by_pid_and_database_path(self, tmp_path):
+        path = self._sqlite_file(tmp_path / "rj.db", "CREATE TABLE t (x)")
+        assert store_db._NOT_WAL_WARNED == {}
+        self._poll(path)
+        assert list(store_db._NOT_WAL_WARNED) == [(os.getpid(), str(path))]
+
+    def test_reader_and_writer_flavours_of_the_same_path_share_the_latch(self, tmp_path, caplog):
+        path = self._sqlite_file(tmp_path / "rj.db", "CREATE TABLE t (x)")
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+            self._poll(path)
+            eng = make_engine(f"sqlite:///{path}", readonly=True, foreign_keys=False)
+            try:
+                with eng.connect() as conn:
+                    conn.exec_driver_sql("SELECT 1").fetchall()
+            finally:
+                eng.dispose()
+        assert len(self._mode_warnings(caplog)) == 1
+
+    def test_switching_back_to_delete_warns_again_once_then_stays_quiet(self, tmp_path, caplog):
+        """WAL -> DELETE -> many polls: one warning for the new situation,
+        not one per poll."""
+        path = tmp_path / "wal.db"
+        self._connect_and_close(f"sqlite:///{path}")  # writer: WAL
+        assert _header_journal_bytes(path) == (2, 2)
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+            self._poll(path, times=3)
+            assert self._mode_warnings(caplog) == []
+            self._set_mode(path, "DELETE")
+            self._poll(path, times=6)
+        assert len(self._mode_warnings(caplog)) == 1
+
+    def test_a_reader_that_sees_wal_forgets_the_latch(self, tmp_path):
+        path = self._sqlite_file(tmp_path / "rj.db", "CREATE TABLE t (x)")
+        self._poll(path)
+        key = (os.getpid(), str(path))
+        assert key in store_db._NOT_WAL_WARNED
+        self._set_mode(path, "WAL")
+        self._poll(path)
+        assert key not in store_db._NOT_WAL_WARNED
+
+    def test_every_flip_flop_is_reported_once(self, tmp_path, caplog):
+        path = self._sqlite_file(tmp_path / "rj.db", "CREATE TABLE t (x)")
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+            self._poll(path, times=2)            # DELETE: warn #1
+            self._set_mode(path, "WAL")
+            self._poll(path, times=2)            # WAL: forget
+            self._set_mode(path, "DELETE")
+            self._poll(path, times=2)            # DELETE again: warn #2
+            self._set_mode(path, "WAL")
+            self._set_mode(path, "DELETE")       # flipped back without a poll in between
+            self._poll(path, times=2)            # the latch held: still quiet
         assert len(self._mode_warnings(caplog)) == 2
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+    def test_a_forked_child_warns_on_its_own_and_the_parent_stays_quiet(self, tmp_path, caplog):
+        path = self._sqlite_file(tmp_path / "rj.db", "CREATE TABLE t (x)")
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+            self._poll(path)                      # the parent has now said it
+            assert len(self._mode_warnings(caplog)) == 1
+            read_end, write_end = os.pipe()
+            pid = os.fork()
+            if pid == 0:  # pragma: no cover - the child
+                code = 1
+                try:
+                    os.close(read_end)
+                    records = []
+
+                    class Collect(logging.Handler):
+                        def emit(self, record):
+                            records.append(record.getMessage())
+
+                    handler = Collect(level=logging.WARNING)
+                    logging.getLogger("zfsbackup.config.store.db").addHandler(handler)
+                    inherited = dict(store_db._NOT_WAL_WARNED)
+                    self._poll(path, times=3)
+                    said = [m for m in records if "is not in WAL mode" in m]
+                    os.write(write_end, f"{len(inherited)} {len(said)}".encode())
+                    code = 0
+                finally:
+                    os._exit(code)
+            os.close(write_end)
+            try:
+                reported = b""
+                while True:
+                    chunk = os.read(read_end, 64)
+                    if not chunk:
+                        break
+                    reported += chunk
+            finally:
+                os.close(read_end)
+                _, status = os.waitpid(pid, 0)
+            assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+            inherited, said = (int(x) for x in reported.split())
+            assert inherited == 0, "the child kept the parent's latch entries"
+            assert said == 1, "the child did not warn exactly once for itself"
+            self._poll(path, times=2)             # and the parent's latch is intact
+        assert len(self._mode_warnings(caplog)) == 1
+
+    @pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs fork hooks")
+    def test_the_after_fork_hook_clears_the_latch(self, tmp_path):
+        path = self._sqlite_file(tmp_path / "rj.db", "CREATE TABLE t (x)")
+        self._poll(path)
+        assert store_db._NOT_WAL_WARNED
+        store_db._reinit_lock_after_fork()
+        assert store_db._NOT_WAL_WARNED == {}
+
+    def test_a_memory_url_never_warns(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+            for readonly in (True, False):
+                eng = make_engine("sqlite:///:memory:", readonly=readonly)
+                try:
+                    with eng.connect() as conn:
+                        conn.exec_driver_sql("SELECT 1").fetchall()
+                finally:
+                    eng.dispose()
+        assert self._mode_warnings(caplog) == []
+        assert store_db._NOT_WAL_WARNED == {}
+
+    def test_a_wal_file_never_enters_the_latch(self, tmp_path, caplog):
+        path = tmp_path / "wal.db"
+        self._connect_and_close(f"sqlite:///{path}")
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.config.store.db"):
+            self._poll(path, times=3)
+        assert self._mode_warnings(caplog) == [] and store_db._NOT_WAL_WARNED == {}
 
     def test_a_reader_on_a_wal_file_is_silent_and_leaves_it_wal(self, tmp_path, caplog):
         path = tmp_path / "wal.db"

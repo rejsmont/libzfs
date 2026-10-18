@@ -1,13 +1,22 @@
 """Worker processes for snapshot creation, pruning, API serving, and remote backup.
 
-Workers never open the config database. The supervisor reads it once, before
-the first fork (`zfsbackup.runtime_config.load_runtime_config`), applies
-`--dry-run` to the result in memory, and hands every worker -- at startup and
-at every crash restart -- that same detached `BackupConfig`. Under `fork` the
-child inherits the object; under `spawn`/`forkserver` it is pickled
+Workers never open the config database. The supervisor reads it
+(`zfsbackup.runtime_config.load_runtime_config`) at startup and on every
+reload, applies `--dry-run` to the result in memory, and hands every worker
+its detached `BackupConfig` together with the reload epoch that config belongs
+to (`born_epoch`), both from one `daemon.Handoff`. Under `fork` the child
+inherits the object; under `spawn`/`forkserver` it is pickled
 (`Duration.__reduce__` preserves the operator's literals), so a respawned
-worker sees exactly the configuration its siblings run: one generation for the
-whole daemon. A restart does not re-read the database; live reload is Phase 3.
+worker sees exactly the configuration its siblings on the same epoch run. A
+crash restart does not re-read the database; it gets the current hand-over.
+
+**Live reload.** When the supervisor accepts a new configuration it bumps the
+shared `ReloadEpoch`. A worker whose `born_epoch` no longer matches leaves at
+its next safe point -- loop top, between datasets, between remote
+destinations, each `_wait` slice; never inside `_process_dataset` or a
+stream -- and exits `WORKER_EXIT_RELOAD`; the supervisor then respawns it on
+the new configuration. Workers switch one by one (staggered), and in-flight
+work is never killed for a reload. A stop beats a reload.
 
 Nothing that owns a SQLite handle may cross the process boundary -- never a
 `Session`, an `Engine`, or an ORM instance -- and the supervisor calls
@@ -19,6 +28,7 @@ supervisor was `kill -9`'d" (nobody is left to raise it), so every worker
 watches for that itself and treats it as a stop; see `_SupervisorWatch`.
 """
 
+import enum
 import logging
 import multiprocessing
 import os
@@ -31,9 +41,10 @@ from multiprocessing import Process
 from multiprocessing.synchronize import Event
 from typing import List, Optional, Union
 
+from zfsbackup import procident
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
 from zfsbackup.config import BackupConfig
-from zfsbackup.stopflag import STOP_POLL, StopFlag
+from zfsbackup.stopflag import STOP_POLL, ReloadEpoch, StopFlag
 
 #: What a worker accepts as its stop signal.
 #:
@@ -53,6 +64,27 @@ StopEvent = Union[StopFlag, Event]
 #: `zfs` in a hot loop. `BaseWorker.run` floors the interval here.
 MIN_WORKER_INTERVAL = 1.0
 
+#: Exit status of a worker that stopped because the configuration changed
+#: (the supervisor's reload epoch moved past the one the worker was born
+#: under). Distinct from 0 (stop / supervisor gone) and 1 (crash). The
+#: supervisor counts it as a turnover only when the worker's `born_epoch` is
+#: older than the current epoch; otherwise it is a crash.
+WORKER_EXIT_RELOAD = 3
+
+#: How long the API worker waits for in-flight receives on a STOP or a gone
+#: supervisor, before abandoning them (the sender resumes: `zfs receive -s`).
+#: Inside `BackupDaemon._shutdown_workers`' shared 30s budget.
+API_STOP_DRAIN = 20
+
+
+class ExitReason(enum.Enum):
+    """Why a worker should leave its loop. Priority is the declaration order:
+    a stop beats a gone supervisor beats a reload."""
+
+    STOP = 'stop'
+    SUPERVISOR_GONE = 'supervisor-gone'
+    RELOAD = 'reload'
+
 
 def _setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(
@@ -66,10 +98,12 @@ def _init_child_process(verbose: bool = False) -> None:
     """First statement of **every** worker `run()`. Nothing may precede it.
 
     Resets the `SIGINT`/`SIGTERM` dispositions this child must not own,
-    ignores `SIGHUP` (the supervisor's own SIGHUP stopgap logs "live reload
-    not implemented"; a worker dying on a stray hangup, or on the terminal
-    closing, would just be a crash to restart), and only then configures
-    logging.
+    ignores `SIGHUP` (it is addressed to the supervisor, which reloads the
+    configuration and tells workers through the shared `ReloadEpoch`; a
+    worker dying on a SIGHUP sent to its process group, or on the terminal
+    closing, would just be a crash to restart -- and under `fork` it would
+    otherwise inherit the supervisor's flag-setting handler, which does
+    nothing in a worker), and only then configures logging.
 
     `BackupDaemon.__init__` installs the supervisor's handlers before any
     worker is created, and under the `fork` start method (CPython's default
@@ -107,9 +141,13 @@ def _init_child_process(verbose: bool = False) -> None:
     running ignores SIGTERM in exactly the way that escalation exists to
     punish (measured before this reset: `alive after terminate+join(5):
     True exitcode None`). Deadlock avoidance is no longer the reason; the
-    escalation is. The cost is that a worker interrupted mid-cycle does not
-    finish it; cooperative cancellation of a long `zfs send` is item 18's,
-    and it is not available today under any start method.
+    escalation is. The cost is that a worker *signalled directly* (a tty
+    Ctrl-C to the process group, `terminate()`) dies mid-cycle. The
+    cooperative path is the other one: the supervisor raises the stop flag
+    or bumps the reload epoch, and the worker leaves at its next safe point
+    (`_exit_reason`, item 18.2) -- after the dataset, and so the `zfs send`,
+    in hand -- on every start method; `terminate()` is only
+    `_shutdown_workers`' escalation once its budget is spent.
 
     That said, this reset alone made a plain Ctrl-C *less* survivable, not
     more, for as long as the stop signal was a `multiprocessing.Event`.
@@ -183,9 +221,15 @@ class _SupervisorWatch:
       supervisor, so this comparison is meaningless there and is skipped. The
       forkserver itself exits when the supervisor does (it watches a pipe the
       supervisor holds), which reparents its children and trips the first rule;
-    * `kill(supervisor_pid, 0)` says the pid no longer exists (covers the
-      forkserver-before-reparent race). A zombie supervisor still answers
-      this, which is why the reparent rule above is the primary one.
+    * `procident.identity(supervisor_pid, supervisor_start)` -- the
+      supervisor's start token, recorded in the constructor -- is `'gone'`
+      (no such process; covers the forkserver-before-reparent race) or
+      `'mismatch'` (the pid was reused by another process). Where no token is
+      available (`'unknown'`) it falls back to `kill(supervisor_pid, 0)`
+      saying the pid no longer exists. `identity` reports a zombie
+      supervisor (exited, not yet reaped) as `'gone'` too; only the
+      `'unknown'` fallback still answers "alive" for one, which is why the
+      reparent rule above is the primary one.
 
     In a process that is not a child of the constructing one -- a unit test
     calling `run()` inline, where `os.getpid() == supervisor_pid` -- the watch
@@ -205,11 +249,30 @@ class _SupervisorWatch:
     `stopflag.STOP_POLL` slice while idle.
     """
 
-    def _watch_init(self) -> None:
+    #: Class-level defaults: a worker built without them (or by a test that
+    #: bypasses `__init__`) behaves exactly as before live reload existed.
+    reload_epoch: Optional[ReloadEpoch] = None
+    born_epoch: int = 0
+    workers_lock: Optional[str] = None
+    supervisor_start: Optional[str] = None
+
+    def _watch_init(
+        self,
+        reload_epoch: Optional[ReloadEpoch] = None,
+        born_epoch: int = 0,
+        workers_lock=None,
+    ) -> None:
         #: Constructors run in the supervisor, so this is its pid. Not a
         #: constructor parameter: the worker signatures are pinned to
-        #: `(config, stop_event, verbose)`.
+        #: `(config, stop_event, verbose)` plus the keyword-only reload trio.
         self.supervisor_pid = os.getpid()
+        #: Its start token (`procident`): pid reuse after a `kill -9` is
+        #: detected by identity, not by "some process has that pid".
+        self.supervisor_start = procident.start_token(self.supervisor_pid)
+        self.reload_epoch = reload_epoch
+        self.born_epoch = born_epoch
+        self.workers_lock = workers_lock
+        self._workers_lock_fd: Optional[int] = None
         self._parent_at_start: Optional[int] = None
         self._direct_child = True
         self._supervisor_gone_logged = False
@@ -233,8 +296,21 @@ class _SupervisorWatch:
             reason = f"parent changed from {self._parent_at_start} to {ppid}"
         elif self._direct_child and ppid != self.supervisor_pid:
             reason = f"parent at start was {ppid}, not the supervisor"
-        elif not _pid_exists(self.supervisor_pid):
-            reason = "no such process"
+        else:
+            ident = procident.identity(self.supervisor_pid, self.supervisor_start)
+            if ident == 'gone':
+                # `identity` reports a zombie (exited, unreaped) as gone too.
+                reason = (
+                    "it has exited (a zombie, not yet reaped)"
+                    if procident.is_zombie(self.supervisor_pid) is True
+                    else "no such process"
+                )
+            elif ident == 'mismatch':
+                reason = f"pid {self.supervisor_pid} now belongs to another process"
+            elif ident != 'match' and not _pid_exists(self.supervisor_pid):
+                # 'unknown' (no token on this platform / unreadable): fall
+                # back to plain existence, which only errs towards "alive".
+                reason = "no such process"
         if reason is None:
             return False
         if not self._supervisor_gone_logged:
@@ -244,25 +320,56 @@ class _SupervisorWatch:
             )
         return True
 
-    def _should_stop(self) -> bool:
-        """The stop flag is raised, or the supervisor is gone."""
-        return self.stop_event.is_set() or self._supervisor_gone()
+    def _hold_workers_lock(self) -> None:
+        """Take `LOCK_SH` on `<db>.workers.lock` for the life of this process
+        (item 18.5): the presence lock that lets a restarted daemon see
+        survivors under every start method. The descriptor is opened HERE, in
+        the worker, never inherited from the supervisor, and is `O_CLOEXEC`.
+        A detection aid, not a gate: failure is a WARNING and the worker runs."""
+        if not self.workers_lock:
+            return
+        try:
+            from zfsbackup import daemonlock
+            self._workers_lock_fd = daemonlock.hold_workers_lock(self.workers_lock)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "cannot hold workers lock %s: %s", self.workers_lock, exc
+            )
 
-    def _wait(self, timeout: float) -> bool:
-        """Sleep up to `timeout` seconds in `STOP_POLL` slices; -> whether the
-        worker should stop. Each slice re-checks the supervisor, so a dead one
-        is noticed within one slice rather than after a whole cycle interval
+    def _exit_reason(self) -> Optional[ExitReason]:
+        """Why this worker should leave its loop, or `None`. Priority: STOP,
+        SUPERVISOR_GONE, RELOAD -- so a stop always beats a reload. Checked
+        only at safe points, never inside `_process_dataset`."""
+        if self.stop_event.is_set():
+            return ExitReason.STOP
+        if self._supervisor_gone():
+            return ExitReason.SUPERVISOR_GONE
+        epoch = self.reload_epoch
+        if epoch is not None and epoch.get() != self.born_epoch:
+            return ExitReason.RELOAD
+        return None
+
+    def _should_stop(self) -> bool:
+        """Any reason to leave the loop (stop flag, supervisor gone, reload)."""
+        return self._exit_reason() is not None
+
+    def _wait(self, timeout: float) -> Optional[ExitReason]:
+        """Sleep up to `timeout` seconds in `STOP_POLL` slices; -> the reason
+        that ended the wait, or `None` on timeout. Each slice re-checks the
+        supervisor and the reload epoch, so a dead supervisor or a reload is
+        noticed within one slice rather than after a whole cycle interval
         (minutes to hours). Like `StopFlag.wait`, a zero, negative or NaN
-        timeout returns the current state without sleeping."""
+        timeout returns the current reason without sleeping."""
         if not (timeout > 0):
-            return self._should_stop()
+            return self._exit_reason()
         deadline = time.monotonic() + timeout
         while True:
-            if self._should_stop():
-                return True
+            reason = self._exit_reason()
+            if reason is not None:
+                return reason
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return False
+                return None
             self.stop_event.wait(timeout=min(STOP_POLL, remaining))
 
 
@@ -275,16 +382,26 @@ class BaseWorker(_SupervisorWatch, Process):
         config: BackupConfig,
         stop_event: StopEvent,
         verbose: bool = False,
+        *,
+        reload_epoch: Optional[ReloadEpoch] = None,
+        born_epoch: int = 0,
+        workers_lock=None,
     ):
         """`config` is the supervisor's detached `BackupConfig`, with
         `--dry-run` already applied. It is used as is; the worker never
         reads the config database. The constructing process is the
-        supervisor, and its pid is recorded here (see `_SupervisorWatch`)."""
+        supervisor, and its pid is recorded here (see `_SupervisorWatch`).
+
+        `reload_epoch`/`born_epoch`: the worker leaves its loop with
+        `WORKER_EXIT_RELOAD` at its next safe point once the shared epoch
+        differs from `born_epoch` (`None` = never). `workers_lock`: path of
+        `<db>.workers.lock` to hold `LOCK_SH` on while running (`None` = none).
+        """
         super().__init__(name=worker_name, daemon=True)
         self.config = config
         self.stop_event = stop_event
         self.verbose = verbose
-        self._watch_init()
+        self._watch_init(reload_epoch, born_epoch, workers_lock)
 
     @abstractmethod
     def _get_interval(self, config: BackupConfig) -> float:
@@ -304,6 +421,7 @@ class BaseWorker(_SupervisorWatch, Process):
     def run(self) -> None:
         _init_child_process(self.verbose)
         self._arm_supervisor_watch()
+        self._hold_workers_lock()
         logger = logging.getLogger(__name__)
         logger.info(f"{self.name} started")
 
@@ -318,19 +436,34 @@ class BaseWorker(_SupervisorWatch, Process):
             interval = MIN_WORKER_INTERVAL
         self._before_loop(config, manager)
 
-        # `_should_stop` = stop flag raised OR supervisor gone, checked at
-        # every safe point: here, between datasets, and in each `_wait` slice.
-        while not self._should_stop():
+        # `_exit_reason` (stop flag > supervisor gone > reload) is checked at
+        # every safe point: loop top, between datasets, and each `_wait`
+        # slice -- never inside `_process_dataset`, so a reload (or a stop)
+        # lets the dataset in hand finish.
+        reason = self._exit_reason()
+        while reason is None:
             logger.debug(f"{self.name} cycle")
             for dsi in self._get_datasets(manager):
-                if self._should_stop():
+                reason = self._exit_reason()
+                if reason is not None:
                     break
                 try:
                     self._process_dataset(manager, dsi)
                 except Exception as e:
                     logger.error(f"{self.name} error on {dsi.name}: {e}", exc_info=True)
-            self._wait(interval)
+            if reason is None:
+                reason = self._wait(interval)
 
+        self._finish(reason, logger)
+
+    def _finish(self, reason: ExitReason, logger) -> None:
+        if reason is ExitReason.RELOAD:
+            logger.info(
+                f"{self.name} finished its current work; exiting to switch configuration"
+            )
+            sys.exit(WORKER_EXIT_RELOAD)
+        # STOP and SUPERVISOR_GONE both end here with exit status 0. The
+        # latter was already logged once, at ERROR, by the watch.
         logger.info(f"{self.name} stopped")
 
 
@@ -342,8 +475,15 @@ class SnapshotWorker(BaseWorker):
         config: BackupConfig,
         stop_event: StopEvent,
         verbose: bool = False,
+        *,
+        reload_epoch: Optional[ReloadEpoch] = None,
+        born_epoch: int = 0,
+        workers_lock=None,
     ):
-        super().__init__('snapshot-worker', config, stop_event, verbose)
+        super().__init__(
+            'snapshot-worker', config, stop_event, verbose,
+            reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
+        )
 
     def _get_interval(self, config: BackupConfig) -> float:
         return config.check_interval.total_seconds()
@@ -363,8 +503,15 @@ class PruningWorker(BaseWorker):
         config: BackupConfig,
         stop_event: StopEvent,
         verbose: bool = False,
+        *,
+        reload_epoch: Optional[ReloadEpoch] = None,
+        born_epoch: int = 0,
+        workers_lock=None,
     ):
-        super().__init__('pruning-worker', config, stop_event, verbose)
+        super().__init__(
+            'pruning-worker', config, stop_event, verbose,
+            reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
+        )
 
     def _get_interval(self, config: BackupConfig) -> float:
         return config.effective_prune_interval.total_seconds()
@@ -384,8 +531,15 @@ class RemoteBackupWorker(BaseWorker):
         config: BackupConfig,
         stop_event: StopEvent,
         verbose: bool = False,
+        *,
+        reload_epoch: Optional[ReloadEpoch] = None,
+        born_epoch: int = 0,
+        workers_lock=None,
     ):
-        super().__init__('remote-backup-worker', config, stop_event, verbose)
+        super().__init__(
+            'remote-backup-worker', config, stop_event, verbose,
+            reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
+        )
         self._remote_manager = None
 
     def _get_interval(self, config: BackupConfig) -> float:
@@ -404,7 +558,10 @@ class RemoteBackupWorker(BaseWorker):
         if not dsi.config.remote:
             return
         logger = logging.getLogger(__name__)
-        for remote_cfg in dsi.config.remote:
+        for index, remote_cfg in enumerate(dsi.config.remote):
+            if index and self._exit_reason() is not None:
+                # Between destinations no stream is open: a safe point.
+                return
             freq = (remote_cfg.frequency or dsi.config.frequency).total_seconds()
             anchor_name = manager.get_anchor(dsi, remote_cfg.destination)
             if anchor_name:
@@ -458,6 +615,10 @@ class ApiWorker(_SupervisorWatch, Process):
         config: BackupConfig,
         stop_event: StopEvent,
         verbose: bool = False,
+        *,
+        reload_epoch: Optional[ReloadEpoch] = None,
+        born_epoch: int = 0,
+        workers_lock=None,
     ):
         """`config` is the supervisor's detached `BackupConfig`, dry-run
         already applied; see `BaseWorker`."""
@@ -465,15 +626,27 @@ class ApiWorker(_SupervisorWatch, Process):
         self.config = config
         self.stop_event = stop_event
         self.verbose = verbose
-        self._watch_init()
+        self._watch_init(reload_epoch, born_epoch, workers_lock)
 
     def run(self) -> None:
-        """Serve until stopped. Exits with status 1 -- so the supervisor's
-        crash backoff and restart apply -- if the listening socket cannot be
-        bound or the server thread dies; a worker that is alive but serving
-        nothing is the one outcome that must not happen."""
+        """Serve until stopped or until the configuration changes. Exits with
+        status 1 -- so the supervisor's crash backoff and restart apply -- if
+        the listening socket cannot be bound or the server thread dies; a
+        worker that is alive but serving nothing is the one outcome that must
+        not happen.
+
+        This process hosts the server side of `zfs receive -s`, so leaving
+        for a reload must not tear an inbound stream: once the reason to
+        leave is known the stream gate (`zfsbackup.api.StreamGate`) refuses
+        new streams, read-only endpoints keep serving, and the worker waits
+        for the receives already running (on RELOAD: indefinitely, but a stop
+        or a gone supervisor aborts the wait; on STOP / SUPERVISOR_GONE: at
+        most `API_STOP_DRAIN` seconds). Then the server is shut down, its
+        socket closed (so the replacement worker can bind the port), and the
+        worker exits `WORKER_EXIT_RELOAD` or returns."""
         _init_child_process(self.verbose)
         self._arm_supervisor_watch()
+        self._hold_workers_lock()
         logger = logging.getLogger(__name__)
         logger.info("API worker started")
 
@@ -483,6 +656,7 @@ class ApiWorker(_SupervisorWatch, Process):
 
         from zfsbackup.api import create_app
         app = create_app(config)
+        gate = app.extensions['zfsbackup.stream_gate']
 
         try:
             server = _bind_api_server(app, config.api_host, config.api_port)
@@ -496,11 +670,60 @@ class ApiWorker(_SupervisorWatch, Process):
         thread.start()
         logger.info(f"API listening on {config.api_host}:{config.api_port}")
 
-        # Sliced wait: wakes every `STOP_POLL` to check the stop flag, the
-        # supervisor, and that the server thread is still alive.
-        while not self._should_stop():
-            if not thread.is_alive():
-                logger.error("API server thread exited unexpectedly; exiting")
-                sys.exit(1)
-            self.stop_event.wait(timeout=STOP_POLL)
+        died = False
+        reason: Optional[ExitReason] = None
+        try:
+            # Sliced wait: wakes every `STOP_POLL` to check the exit reasons
+            # and that the server thread is still alive.
+            while True:
+                reason = self._exit_reason()
+                if reason is not None:
+                    break
+                if not thread.is_alive():
+                    logger.error("API server thread exited unexpectedly; exiting")
+                    died = True
+                    break
+                self.stop_event.wait(timeout=STOP_POLL)
+
+            if not died:
+                gate.start_draining()
+                active = gate.active
+                if reason is ExitReason.RELOAD:
+                    if active:
+                        logger.info(
+                            f"waiting for {active} in-flight receive(s) to finish "
+                            "before reloading"
+                        )
+                        gate.wait_idle(None, abort=lambda: self._exit_reason() in (
+                            ExitReason.STOP, ExitReason.SUPERVISOR_GONE))
+                        # A stop that aborted the wait changes what we are doing.
+                        reason = self._exit_reason() or reason
+                if reason is not ExitReason.RELOAD:
+                    active = gate.active
+                    if active and not gate.wait_idle(API_STOP_DRAIN):
+                        logger.warning(
+                            f"abandoning {gate.active} in-flight receive(s); the "
+                            "sender resumes them (zfs receive -s)"
+                        )
+        finally:
+            # Every exit path past a successful bind: stop accepting, free
+            # the port, reap the thread.
+            try:
+                if thread.is_alive():
+                    server.shutdown()
+            except Exception:
+                logger.debug("server.shutdown() failed", exc_info=True)
+            try:
+                server.server_close()
+            except Exception:
+                logger.debug("server.server_close() failed", exc_info=True)
+            thread.join(timeout=5)
+
+        if died:
+            sys.exit(1)
+        if reason is ExitReason.RELOAD:
+            logger.info(
+                "API worker finished its current work; exiting to switch configuration"
+            )
+            sys.exit(WORKER_EXIT_RELOAD)
         logger.info("API worker stopped")

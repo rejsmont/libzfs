@@ -68,10 +68,11 @@ import logging
 import os
 import re
 import secrets
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -91,6 +92,67 @@ from zfsbackup.config.store.errors import ConfigConflict
 from zfsbackup.config.store.migrate import check_schema
 
 logger = logging.getLogger(__name__)
+
+
+# --- ZFS dataset-name syntax (one source: libzfseasy's `Validate.dataset`) ---
+#
+# A name `libzfseasy.Dataset(name)` rejects makes every worker raise
+# `ValueError` the moment it builds its `DatasetManager`, and the supervisor
+# then restarts it forever (a crash loop). Catching it at the write boundary
+# (`edit`, `set`, `import`) and at the daemon's own startup/reload check is
+# the point of `_dataset_name_problem` below. The regex is NOT copied: it is
+# `libzfseasy.types.Validate.dataset`.
+#
+# `libzfseasy/__init__` resolves the `zfs` binary at import time and raises
+# `RuntimeError` on a host without one, but `zfsbackup-config` is documented
+# to work on such a host (a box that only manages configuration). So the
+# validator is taken from `sys.modules` when libzfseasy is already loaded (the
+# daemon), and otherwise loaded straight from `libzfseasy/types.py` by path --
+# that file imports only `re`/`typing` -- WITHOUT executing the package
+# `__init__`. Nothing here ever runs a zfs command.
+
+_dataset_validator: Optional[Callable[[str], None]] = None
+
+
+def _get_dataset_validator() -> Callable[[str], None]:
+    global _dataset_validator
+    if _dataset_validator is None:
+        loaded = sys.modules.get("libzfseasy.types")
+        if loaded is None:
+            import importlib.util  # noqa: PLC0415
+
+            package = importlib.util.find_spec("libzfseasy")  # not executed
+            if package is None or not package.submodule_search_locations:
+                raise ImportError("libzfseasy is not importable")
+            types_path = Path(list(package.submodule_search_locations)[0]) / "types.py"
+            spec = importlib.util.spec_from_file_location(
+                "_zfsbackup_libzfseasy_types", types_path
+            )
+            assert spec is not None and spec.loader is not None
+            loaded = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(loaded)
+        _dataset_validator = loaded.Validate.dataset
+    return _dataset_validator
+
+
+def _dataset_name_problem(name: str) -> Optional[str]:
+    """None if `libzfseasy` accepts `name` as a dataset name, else a short
+    reason-bearing sentence fragment. Accepts exactly what
+    `Validate.dataset` accepts (so everything that works today stays
+    accepted). The wording is about what zfsbackup can manage, not about ZFS
+    itself: OpenZFS accepts e.g. spaces in component names, it is
+    libzfseasy's `Validate.dataset` that refuses them (and the daemon cannot
+    build such names)."""
+    try:
+        _get_dataset_validator()(name)
+    except ValueError:
+        return (
+            "cannot be managed by zfsbackup (its ZFS library accepts "
+            "pool[/component...]: the pool name starts with a letter; "
+            "letters, digits and _ . : - only, no spaces; no leading, "
+            "trailing or doubled '/'; no '@' or '#')"
+        )
+    return None
 
 
 def _duration_from_row(seconds: float, literal: Optional[str], key: str) -> Duration:
@@ -755,6 +817,12 @@ def validate_config(config: BackupConfig) -> List[str]:
     Raises (`ValueError`):
 
     - no datasets; duplicate dataset names (`datasets.name UNIQUE`);
+    - an ENABLED dataset whose name `libzfseasy`'s `Validate.dataset`
+      rejects (a space, a trailing `/`, ...), and an ENABLED
+      `remote_backup`'s `target_dataset` likewise -- either would raise in
+      every worker and crash-loop the daemon. The same names on a DISABLED
+      dataset / `remote_backup` only warn (they were never built, so they
+      loaded fine before);
     - wrong types: a bool field that is not exactly `bool`, a string field
       that is not a `str`, `api_port` not an `int` (`bool` excluded) in
       0..65535, a duration that is not a `timedelta`. A `None` here used to
@@ -929,12 +997,42 @@ def validate_config(config: BackupConfig) -> List[str]:
         _require_str(config.remote_backup.target_dataset, "remote_backup.target_dataset")
         # Exactly bool: an enabled flag that is `None` is DISABLED under YAML.
         _require_bool(config.remote_backup.enabled, "remote_backup.enabled")
+        # `received_datasets()` and the API build `Dataset(target_dataset)`
+        # when remote backup is enabled; a name libzfseasy rejects there
+        # fails every receive. A DISABLED remote_backup never builds it, so
+        # that stays accepted (it loaded fine before) with a warning.
+        problem = _dataset_name_problem(config.remote_backup.target_dataset)
+        if problem is not None:
+            message = (
+                f"remote_backup.target_dataset "
+                f"{config.remote_backup.target_dataset!r} {problem}"
+            )
+            if config.remote_backup.enabled:
+                raise ValueError(message)
+            warnings.append(
+                message + "; remote_backup is disabled so it is ignored, "
+                "but enabling it will be refused"
+            )
 
     # --- datasets ---
     for ds in config.datasets:
         key = f"datasets[{ds.name}]"
         _require_bool(ds.recursive, f"{key}.recursive")
         _require_bool(ds.enabled, f"{key}.enabled")
+        # Only ENABLED datasets are turned into `libzfseasy.Dataset` objects
+        # (`DatasetManager._get_datasets`), where an invalid name raises in
+        # every worker and crash-loops the daemon. A disabled dataset with
+        # such a name is never built, so it loaded fine before this check and
+        # stays accepted -- with a warning, since enabling it will be refused.
+        problem = _dataset_name_problem(ds.name)
+        if problem is not None:
+            message = f"{key}: dataset name {ds.name!r} {problem}"
+            if ds.enabled:
+                raise ValueError(message)
+            warnings.append(
+                message + "; the dataset is disabled so it is ignored, but "
+                "enabling it will be refused"
+            )
         _require_positive_duration(ds.frequency, f"{key}.frequency", "frequency")
 
         if not ds.retention_rules:

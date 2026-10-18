@@ -757,6 +757,9 @@ class TestMain:
             'zfsbackup.daemon.load_runtime_config',
             return_value=ConfigSnapshot(mock_config, 7, 'deadbeef'),
         )
+        # Startup now runs `validate_config` (the same check every reload
+        # applies); a MagicMock config is not a real one.
+        mocker.patch('zfsbackup.daemon.validate_config', return_value=[])
         return mock_config
 
     def test_test_config_returns_zero(self, tmp_path, mocker):
@@ -1094,7 +1097,12 @@ class TestDaemonLockInRun:
         _stub_daemon(mocker)
         _daemon_module._run(_args(sqlite_config_db.path))
 
-        assert _lock_file(sqlite_config_db).read_bytes() == f"{holder.pid}\n3\n".encode()
+        raw = _lock_file(sqlite_config_db).read_bytes()
+        # pid file v2: the holder's pid and generation (untouched), then its start= line.
+        assert raw.startswith(f"{holder.pid}\n3\n".encode())
+        assert raw.split(b"\n")[2].startswith(b"start=")
+        parsed = _daemonlock._parse(raw)
+        assert (parsed.pid, parsed.generation) == (holder.pid, 3)
         info = _daemonlock.probe(sqlite_config_db)
         assert info is not None and info.pid == holder.pid
 
@@ -1336,7 +1344,10 @@ class TestStartupWindow:
             assert entered.wait(30)
             info = _daemonlock.probe(sqlite_config_db)
             assert info == _daemonlock.DaemonInfo(pid=_os.getpid(), generation=None)
-            assert _lock_file(sqlite_config_db).read_bytes() == f"{_os.getpid()}\n\n".encode()
+            raw = _lock_file(sqlite_config_db).read_bytes()
+            assert raw.startswith(f"{_os.getpid()}\n\n".encode())
+            assert raw.split(b"\n")[2].startswith(b"start=")
+            assert _daemonlock._parse(raw).generation is None
         finally:
             release.set()
             thread.join(30)
@@ -1379,8 +1390,10 @@ class TestStartupWindow:
         assert result.exit_code == 0, result.output
         last = result.stdout.splitlines()[-1]
         assert last.startswith('config updated (generation ')
-        assert f'running daemon pid {_os.getpid()} is on an unknown generation' in last
-        assert 'will not apply this until restarted' in last
+        # The "daemon" is this very process, which the CLI refuses to signal
+        # (`request_reload`'s pid guard): it reports that it could not verify the
+        # pid rather than claiming the daemon will pick the change up unseen.
+        assert f'pid {_os.getpid()}' in last and 'was not signalled' in last
         assert 'no running daemon detected' not in result.stdout
         assert box == {'code': 0}
 
@@ -1727,21 +1740,27 @@ class TestRunReadsOnceAndReportsTheGeneration:
         _stub_daemon(mocker, run_effect=during_run)
         _daemon_module._run(_args(resolved.path))
 
-        assert seen['file'] == f"{_os.getpid()}\n{generation}\n".encode()
+        assert seen['file'].startswith(f"{_os.getpid()}\n{generation}\n".encode())
+        assert seen['file'].split(b"\n")[2].startswith(b"start=")
+        parsed = _daemonlock._parse(seen['file'])
+        assert (parsed.pid, parsed.generation) == (_os.getpid(), generation)
         assert seen['probe'] == _daemonlock.DaemonInfo(_os.getpid(), generation)
 
     def test_the_generation_is_recorded_after_the_lock_is_taken(self, bumped, mocker, lock_spy):
         """`acquire(resolved)` is called without a generation and
-        `set_generation` fills it in; both happen before the daemon is built."""
+        `set_state(applied=(store_id, generation))` fills it in (which also
+        rewrites line 2 with the generation); both happen before the daemon is
+        built."""
         resolved, generation = bumped
+        key = (read_config(resolved).store_id, generation)
         events = []
-        real_set = _daemonlock.DaemonLock.set_generation
+        real_set = _daemonlock.DaemonLock.set_state
 
-        def set_generation(self, value):
-            events.append(('set_generation', value, _lock_file(resolved).exists()))
-            return real_set(self, value)
+        def set_state(self, **kwargs):
+            events.append(('set_state', kwargs, _lock_file(resolved).exists()))
+            return real_set(self, **kwargs)
 
-        mocker.patch.object(_daemonlock.DaemonLock, 'set_generation', set_generation)
+        mocker.patch.object(_daemonlock.DaemonLock, 'set_state', set_state)
         stub = MagicMock(abandoned_workers=[])
         stub.run.return_value = 0
         mocker.patch(
@@ -1749,7 +1768,8 @@ class TestRunReadsOnceAndReportsTheGeneration:
             side_effect=lambda *a, **k: events.append(('build',)) or stub,
         )
         _daemon_module._run(_args(resolved.path))
-        assert events == [('set_generation', generation, True), ('build',)]
+        assert events == [('set_state', {'applied': key}, True), ('build',)]
+        assert _daemonlock.probe(resolved) is None            # released again after the clean run
 
     def test_pooled_reader_is_disposed_straight_after_the_read(self, bumped, mocker):
         """The read leaves the reader engine's pooled connection open; it is
@@ -1829,13 +1849,26 @@ class TestRunReadsOnceAndReportsTheGeneration:
         _daemon_module._run(_args(resolved.path, dry_run=True))
         assert seen == [True]
 
-    def test_the_daemon_is_given_verbose_and_the_resolved_database(self, bumped, mocker):
-        resolved, _ = bumped
+    def test_the_daemon_is_given_verbose_and_the_resolved_database(self, bumped, mocker, lock_spy):
+        resolved, generation = bumped
         factory, _ = _stub_daemon(mocker)
         _daemon_module._run(_args(resolved.path, verbose=True))
         (config, passed_resolved), kwargs = factory.call_args
         assert passed_resolved.resolved_path == resolved.resolved_path
-        assert kwargs == {'verbose': True}
+        assert kwargs == {
+            'verbose': True,
+            'key': (read_config(resolved).store_id, generation),
+            'presence_lock': lock_spy[0],
+            'dry_run_override': False,
+            'workers_lock': _daemonlock.workers_lock_path(resolved),
+        }
+
+    def test_dry_run_is_handed_on_so_a_reload_can_reapply_it(self, bumped, mocker, lock_spy):
+        resolved, _ = bumped
+        factory, _ = _stub_daemon(mocker)
+        _daemon_module._run(_args(resolved.path, dry_run=True))
+        assert factory.call_args.kwargs['dry_run_override'] is True
+        assert factory.call_args.args[0].dry_run is True
 
 
 @pytest.mark.unit
@@ -1942,7 +1975,14 @@ class TestWorkerConfigHandoff:
         daemon, snapshot = supervisor
         factory = mocker.patch(f'zfsbackup.daemon.{cls}')
         daemon._new_worker(name)
-        factory.assert_called_once_with(snapshot.config, daemon._stop_event, True)
+        # Positional (config, stop flag, verbose) as before, plus the
+        # keyword-only reload trio.
+        factory.assert_called_once_with(
+            snapshot.config, daemon._stop_event, True,
+            reload_epoch=daemon._reload_epoch,
+            born_epoch=daemon._reload_epoch.get(),
+            workers_lock=daemon._workers_lock_path(),
+        )
 
     def test_a_restart_is_constructed_from_the_same_config_object(self, supervisor, mocker):
         daemon, snapshot = supervisor
@@ -1952,9 +1992,9 @@ class TestWorkerConfigHandoff:
         configs = []
         real = _daemon_module.SnapshotWorker
 
-        def spy(config, stop, verbose):
+        def spy(config, stop, verbose, **kwargs):
             configs.append(config)
-            return real(config, stop, verbose)
+            return real(config, stop, verbose, **kwargs)
 
         mocker.patch('zfsbackup.daemon.SnapshotWorker', side_effect=spy)
         daemon._spawn('snapshot')
@@ -2061,8 +2101,8 @@ class TestWorkerConfigHandoff:
 def _bind_recording_worker(method, record_dir):
     """A `RecordingSnapshotWorker` factory with the `SnapshotWorker`
     constructor signature `BackupDaemon._new_worker` calls."""
-    def factory(config, stop_event, verbose):
-        worker = RecordingSnapshotWorker(config, stop_event, verbose)
+    def factory(config, stop_event, verbose, **kwargs):
+        worker = RecordingSnapshotWorker(config, stop_event, verbose, **kwargs)
         worker.start_method = method
         worker.record_dir = str(record_dir)
         return worker

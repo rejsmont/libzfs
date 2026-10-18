@@ -320,7 +320,9 @@ class TestLoadRuntimeConfigSnapshot:
         spy = mocker.patch.object(runtime_config, "read_config", return_value=sentinel)
 
         assert load_runtime_config(sqlite_config_db) is sentinel
-        spy.assert_called_once_with(sqlite_config_db)
+        # `warn_never_prune=False`: the supervisor logs `validate_config`'s
+        # never-prune warning once per accepted configuration instead.
+        spy.assert_called_once_with(sqlite_config_db, warn_never_prune=False)
 
     def test_generation_tracks_the_database(self, sqlite_config_db, config_yaml_path):
         first = load_runtime_config(sqlite_config_db).generation

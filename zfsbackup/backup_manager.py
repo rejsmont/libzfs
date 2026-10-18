@@ -1,7 +1,7 @@
 """Snapshot manager for creating and managing ZFS snapshots."""
 
 from datetime import datetime, timedelta, timezone
-from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple, Union
 import logging
 import shlex
 import sys
@@ -262,8 +262,13 @@ class DatasetManager:
             datasets.append(DatasetInfo(dataset, ds_config))
         return datasets
 
-    def verify_datasets(self) -> None:
+    def verify_datasets(self, should_stop: Optional[Callable[[], bool]] = None) -> None:
+        """Log an ERROR for each configured dataset that does not exist.
+        `should_stop`, as for `sync_all_config_properties`: checked before
+        each dataset, and the check ends there once it returns true."""
         for ds_info in self.datasets:
+            if should_stop is not None and should_stop():
+                return
             if not zfs.exists(ds_info.dataset):
                 logger.error(f"Dataset {ds_info.name} does not exist")
 
@@ -323,9 +328,18 @@ class DatasetManager:
             except Exception as e:
                 logger.warning(f"Failed to sync config property for {dsi.name}: {e}")
 
-    def sync_all_config_properties(self) -> None:
-        """Sync config properties for all locally configured datasets."""
+    def sync_all_config_properties(
+        self, should_stop: Optional[Callable[[], bool]] = None
+    ) -> None:
+        """Sync config properties for all locally configured datasets.
+
+        `should_stop`, when given, is checked before each dataset; once it
+        returns true the sync stops there (the supervisor passes its stop
+        flag, so a shutdown during a reload's sync is not held up by one
+        `zfs set` per remaining dataset)."""
         for dsi in self.datasets:
+            if should_stop is not None and should_stop():
+                return
             self.sync_config_property(dsi)
 
     def get_anchor(self, dsi: DatasetInfo, destination: str) -> Optional[str]:

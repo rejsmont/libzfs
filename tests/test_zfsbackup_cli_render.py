@@ -168,13 +168,19 @@ def synthetic() -> BackupConfig:
             ),
             DatasetConfig(name="null", frequency=D("45s"), retention_rules=[]),
             DatasetConfig(
+                # Not a valid ZFS name, so DISABLED: `validate_config` (every DB
+                # path runs it) refuses an enabled dataset libzfseasy would
+                # reject, and only warns about a disabled one. The point here is
+                # the YAML quoting of the string.
                 name="it's #1: x.y",
+                enabled=False,
                 frequency=D("1h"),
                 retention_rules=[RetentionRule(D("1d"), D("30d"))],
                 remote=[RemoteDatasetConfig("alpha", frequency=D("1d"))],
             ),
             DatasetConfig(
-                name="tank/ünï/ö",
+                name="tank/ünï/ö",  # not ASCII: disabled for the same reason
+                enabled=False,
                 recursive=True,
                 frequency=D("5m"),
                 retention_rules=[RetentionRule(D("30d"), D("30d"))],
@@ -292,7 +298,31 @@ _NAMES = [
 ]
 
 
+def _zfs_valid(name: str) -> bool:
+    """Would libzfseasy accept `name` as a dataset name? (Independent of the
+    store's own check: this is the validator the daemon builds datasets with.)"""
+    from libzfseasy.types import Validate
+
+    try:
+        Validate.dataset(name)
+    except ValueError:
+        return False
+    return True
+
+
+def _random_remote_backup(rng: random.Random):
+    if rng.random() < 0.5:
+        target = rng.choice(_NAMES)
+        enabled = rng.random() < 0.5 and _zfs_valid(target)
+        return RemoteServerConfig(target, enabled=enabled)
+    return None
+
+
 def random_config(rng: random.Random) -> BackupConfig:
+    """A random but VALID configuration: `validate_config` refuses an ENABLED
+    dataset (or `remote_backup`) whose name libzfseasy rejects, so the
+    YAML-hostile names in `_NAMES` are only ever used disabled. (The random
+    draws are unchanged: the flag is decided after them.)"""
     def rules(max_rules=4):
         count = rng.randint(1, max_rules)
         ages = rng.sample(_LITERALS, count)
@@ -311,10 +341,12 @@ def random_config(rng: random.Random) -> BackupConfig:
                 frequency=D(rng.choice(_LITERALS)) if rng.random() < 0.5 else None,
                 retention_rules=rules() if rng.random() < 0.5 else [],
             ))
+        recursive = rng.random() < 0.5
+        enabled = rng.random() < 0.7 and _zfs_valid(name)
         datasets.append(DatasetConfig(
             name=name,
-            recursive=rng.random() < 0.5,
-            enabled=rng.random() < 0.7,
+            recursive=recursive,
+            enabled=enabled,
             frequency=D(rng.choice(_LITERALS)),
             retention_rules=rules() if rng.random() < 0.8 else [],
             remote=remote,
@@ -328,10 +360,7 @@ def random_config(rng: random.Random) -> BackupConfig:
         api_port=rng.choice([1, 80, 8080, 65535]),
         dry_run=rng.random() < 0.5,
         destinations=destinations,
-        remote_backup=(
-            RemoteServerConfig(rng.choice(_NAMES), enabled=rng.random() < 0.5)
-            if rng.random() < 0.5 else None
-        ),
+        remote_backup=_random_remote_backup(rng),
         client_id_file=Path(rng.choice(["/tmp/cid", "rel/cid", "/a b/c#d"])) if rng.random() < 0.5 else None,
     )
 

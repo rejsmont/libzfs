@@ -290,14 +290,20 @@ def slow_popen(*args, **kwargs):
 
 
 editor.subprocess = types.SimpleNamespace(Popen=slow_popen, TimeoutExpired=subprocess.TimeoutExpired)
+# What this process started with. Python installs `default_int_handler` for
+# SIGINT unless the signal was inherited as ignored, and a pytest run started as
+# a background shell job (`cmd &`) inherits SIGINT / SIGQUIT as SIG_IGN: the
+# handlers must come back to whatever they were, not to a hard-coded default.
+initial_int = signal.getsignal(signal.SIGINT)
+initial_quit = signal.getsignal(signal.SIGQUIT)
 code = "none"
 try:
     main.main(sys.argv[1:])
 except SystemExit as exc:
     code = exc.code
 print("EXIT", code,
-      int(signal.getsignal(signal.SIGINT) is signal.default_int_handler),
-      int(signal.getsignal(signal.SIGQUIT) == signal.SIG_DFL), flush=True)
+      int(signal.getsignal(signal.SIGINT) == initial_int),
+      int(signal.getsignal(signal.SIGQUIT) == initial_quit), flush=True)
 """
 
 
