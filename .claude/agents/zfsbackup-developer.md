@@ -17,7 +17,8 @@ the source when any doc disagrees with it. Two facts worth stating up front:
 ## Your files — and what is no longer yours
 
 You own the daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`,
-`api.py`.
+`api.py`, and the supervisor's support modules `daemonlock.py`, `stopflag.py`, `runtime_config.py` and
+`procident.py`.
 
 Two sibling developers own the rest of the package, exclusively:
 

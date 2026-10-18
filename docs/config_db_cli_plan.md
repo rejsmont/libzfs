@@ -3,7 +3,7 @@
 **Status (2026-10-18):** Phases 0, 1 and 2 **implemented** on branch `config-db-cli` (Checkpoint A held
 2026-10-17 with fix-up A-1…A-21; Phase 2 items 10–16 landed 2026-10-17/18); mocked suite 3810 passed.
 **Checkpoint B review held 2026-10-18** (Phase 2 sound; close-out fixes landed). **Phase 3 (live
-reload) revised and awaiting the user's decisions D1–D11.** Sections below still read as the original proposal except where an item
+reload) decided 2026-10-18 (D1–D11; D4 changed to "the CLI SIGHUPs the daemon") and in implementation.** Sections below still read as the original proposal except where an item
 carries a status note or "as landed" text — where those disagree with the proposal, the note wins.
 **Scope:** `zfsbackup/` only. No `libzfseasy/` changes.
 **Author:** zfsbackup-implementation-planner
@@ -36,12 +36,12 @@ carries a status note or "as landed" text — where those disagree with the prop
 | Items 13, 11, 12, 14.2 | done | `list`, `get`/`set`/`unset`, `edit` (whole + per entry), `rename dataset|destination`; mocked suite 3787 |
 | Warnings consolidation | done | `validate_config` is the single source of semantic warnings; `from_file` keeps parse-boundary ones; `load_config(warn_never_prune=)` |
 | Checkpoint B | held 2026-10-18 | Phase 2 reviewed end to end (incl. a 5-minute concurrent stress test); close-out fixes landed with it |
-| **Phase 3 (live reload)** | **awaiting decisions D1–D11** | Revised design proposed at Checkpoint B |
+| **Phase 3 (live reload)** | **in progress** | Decisions D1–D11 recorded 2026-10-18; revised items 17.0–23 below |
 | 10–16 Config CLI | done | Landed in order 10 → 15 → 13 → 11 → 12 → 14 → 16; see the per-item "as landed" notes |
-| 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
+| 17–20 Live reload | in progress | Lanes: store 17.0 → G1; daemon 18.0 → 17.1 → 18.1–18.5 → G2 → 17.2 → G3; CLI 19.x → G4 |
 | 21–23 Docs, scenarios, final review | not started | |
 
-> *(Historical — written for Phases 0–2; Phase 3 decisions D1–D11 are open, see Progress.)* **All design questions are settled; no open decisions remain.** Items 2 (duration handling) and 5 (fork
+> *(Historical — written for Phases 0–2; the reload design described here is superseded by the revised Phase 3 section.)* **All design questions are settled; no open decisions remain.** Items 2 (duration handling) and 5 (fork
 > safety) were the gating pair: **item 2 = full `Duration` value type** subclassing `timedelta`, with
 > `__str__` left untouched and `.literal`/`.timedelta` as read-only accessors; **item 5 = pid-keyed,
 > created-after-fork engine cache**. Reload uses an event-based immediate wake (item 17) and the CLI
@@ -1846,9 +1846,6 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
   O_EXCL; refusal on an unreadable outgoing DB); the console script resolves (`-m slow`).
 - **Verify:** `pytest tests/test_zfsbackup_*.py`
 
-**Phase 3 text to revise later:** item 17 loses the respawn-backoff work (now A-5) and replaces A-6.2's
-SIGHUP stopgap; item 19 reuses 15.2's lock file as its pidfile.
-
 **Deferred:** the `snapshot_prefix`-with-`_` parser bug (`backup_manager.py:373-382`; needs
 `name[len(prefix)+1:]`, which is retention logic — warning only for now); never-prune at destination
 level; C3's getppid detection, `KillMode=mixed`, websocket timeouts; lenient `remote:`/`destinations:`
@@ -1887,230 +1884,752 @@ null (YAML never allowed it).
 
 ## Phase 3 — Live config reload
 
-Promoted from the deferral list at user request. **Structured as its own phase, after the CLI lands** —
-recommended, because it modifies `daemon.py` signal handling, the `workers.py` IPC contract, and the
-supervisor restart loop, none of which the CLI depends on. Keeping it separate means Phase 2 can ship and
-be reviewed while this is still in design, and a problem here cannot destabilise the CLI.
+*(Revised at Checkpoint B; decisions recorded 2026-10-18. Supersedes the original Phase 3 text — the
+event-based wake, per-worker `multiprocessing.Event` control events, the separate pidfile, and 15.3's
+"the CLI never signals". Line references are to `80604de`.)*
 
-### Item 17 — Reload trigger and supervisor state machine
+### Decisions (user, 2026-10-18)
 
-- **Owner:** `zfsbackup-developer`  *(run at **opus**; + `concurrency-reviewer`)* · **Tag:** `needs-approval` *(signals, multiprocessing, supervisor)*
-- **Files:** `zfsbackup/daemon.py`
-- **Basis:** `daemon.py:39-45` (existing `SIGINT`/`SIGTERM` handlers), `daemon.py:47-60`
-  (`_new_worker`/`_active_worker_names`), `daemon.py:69-80` (`_check_workers`), `daemon.py:108-111`
-  (poll loop).
-- **Recommended trigger: SIGHUP to the supervisor, with the generation counter as the correctness
-  check.** Rationale:
-  - The supervisor already installs signal handlers (`daemon.py:39-40`); SIGHUP-means-reload is the
-    conventional daemon idiom and costs one more `signal.signal` call.
-  - Polling the DB generation on every supervisor tick was considered and **rejected as the primary
-    trigger**: it makes the daemon open the config DB every 5 seconds forever, which is exactly the
-    steady-state read load item 5 was designed to avoid, and it introduces a DB dependency into the
-    liveness loop.
-  - The generation counter is still read *at reload time* to confirm something actually changed and to
-    log the transition — cheap, and it makes a spurious SIGHUP a no-op.
-- **Handler discipline:** the SIGHUP handler sets a flag only — `self._reload_requested = True` — exactly
-  mirroring the existing `_stop_event.set()` pattern at `daemon.py:45`. No work in the handler.
-- **⚠ SUPERSEDED BY ITEM 8x — read this before implementing the block below.** The wake-event design
-  recorded here was written pre-8x and **must not be implemented as written**. Two things changed:
+| # | Decision |
+|---|---|
+| D1 | Two triggers — **SIGHUP and a generation poll** — feeding one code path. |
+| D2 | Poll every **10 s** (`daemonlock.RELOAD_POLL_SECONDS`), no debounce; reloads coalesce. |
+| D3 | **`--no-reload` dropped.** Every committed write is applied; atomic multi-change goes through `edit` / `import`. |
+| D4 | After every committed write the CLI **SIGHUPs the running daemon**, only after verifying it (17.1). EPERM or "cannot verify" falls back to the poll — not an error, exit code unchanged. |
+| D5 | In-flight work is **never killed on reload**; the switch is deferred indefinitely, with logging. |
+| D6 | **Staggered** turnover: each worker switches at its own safe point. |
+| D7 | Websocket per-operation **timeouts land now** (18.4). |
+| D8 | Per-file **store id in `PRAGMA user_version`**; reload key and CAS use `(store_id, generation)`. |
+| D9 | A crash loop after a reload **exits 1** as today (no rollback); the message names the generation. |
+| D10 | `validate_config` runs at **startup**, `--test-config` and every reload. |
+| D11 | Start method stays the **platform default** (spawn on macOS, fork on Linux ≤3.13, forkserver on Linux ≥3.14). |
 
-  1. **`_supervisor_sleep` already delivers most of the stated motivation.** Item 8x made the poll
-     loop sleep in `SUPERVISOR_SLEEP_SLICE` (0.25s) slices with an early return on the flag, so the
-     "flag sits unseen for up to 5s" problem is gone. A reload flag checked in the same loop inherits
-     that latency for free.
-  2. **Setting a `threading.Event` from a signal handler is exactly the pattern 8x declared illegal.**
-     `threading.Event.__init__` is `Condition(Lock())` — a plain, non-reentrant lock. A handler runs at
-     an arbitrary instruction on the main thread, so if the interrupted code was anywhere inside that
-     same lock, the handler self-deadlocks. That is the rule `daemon.py`'s `_signal_handler` now
-     states, and the "Set the wake event from the existing `SIGINT`/`SIGTERM` handlers too" bullet
-     below would reintroduce the class of bug 8x removed.
+Fixed inputs: `--dry-run` survives every reload; the supervisor `dispose_all()`s after every poll and every
+reload read; a worker receives its config and its epoch together, from one `Handoff` object.
 
-  **Do instead:** set a plain flag (a `StopFlag`-style lock-free store, or a bare attribute) in the
-  handler and let the existing sliced poll loop transfer it. If sub-100ms reload latency is ever
-  genuinely needed, add a pipe *alongside* `StopFlag` rather than replacing it — and note the three
-  hazards item 8x measured when evaluating pipes: EOF-broadcast never wakes `fork` children (siblings
-  inherit each other's write ends and CLOEXEC does not apply to fork); `Connection.recv_bytes` expects
-  a 4-byte header, so an async-signal-safe `os.write(fd, b'\x01')` makes `poll()` return True and then
-  blocks forever; and writing to a dead worker's pipe raises `BrokenPipeError`, inside a handler.
+### Contracts (every item refers back to these)
 
-  The line citations in this section (`daemon.py:109`, `:39-45`, `:69-80`, `workers.py:66-67`) are all
-  stale post-8x and post-item-8; trust the source.
+1. **Reload key** — `(store_id, generation)`. The poll triggers when the stored key differs from both the
+   running key and the last rejected key; SIGHUP always forces a full read.
+2. **Epoch** — a supervisor-local `int`, +1 per accepted reload; never the DB generation. It is shared through
+   `stopflag.ReloadEpoch`. A worker whose `born_epoch` differs from the shared epoch exits at its next safe
+   point.
+3. **Worker exit codes** — `0` stop or supervisor gone; `1` crash or API bind failure; `3`
+   `WORKER_EXIT_RELOAD`. Code 3 counts as a turnover only when `born_epoch < current epoch`; otherwise it is a
+   crash.
+4. **Safe points** — loop top, between datasets, between remote destinations, and each `_wait` slice. Never
+   inside `_process_dataset`, never inside a stream.
+5. **Pid file v2** (`<db>.daemon.pid`) — lines 1–2 unchanged (pid, applied generation). From line 3 on,
+   `key=value` lines:
+   - `start=<token>` — always written by a v2 daemon; its presence means "supports live reload";
+   - `applied=<store>:<gen>`;
+   - `target=<store>:<gen>` — only while a reload is being applied;
+   - `rejected=<store>:<gen>`.
 
-- **Latency — event-based immediate wake** *(user decision, superseded — see above)*. The poll loop used
-  `time.sleep(SUPERVISOR_POLL)` (`daemon.py:109`). Under PEP 475, `time.sleep` is *retried* after `EINTR`
-  unless the handler raises, so a SIGHUP would **not** cut the sleep short — the flag would sit unseen for
-  up to 5s. The original proposal was to replace the sleep with a wait on a dedicated wake event:
+   Unknown keys are ignored, so older readers keep working.
+6. **New file** — `<db>.workers.lock` (0660, never deleted, like `.writer.lock`).
 
-  ```
-  def _handle_hup(self, signum, frame):
-      self._reload_requested = True
-      self._wake.set()          # flag + wake only; no work in the handler
+### Order and review gates
 
-  while not self._stop_event.is_set():
-      self._check_workers()
-      if self._reload_requested:
-          self._do_reload()
-      self._wake.wait(SUPERVISOR_POLL)
-      self._wake.clear()
-  ```
+Two lanes run in parallel (disjoint owners); everything inside the daemon lane is serial (one owner).
 
-  **This restructures the supervisor's main loop**, which also drives shutdown and worker restart — so it
-  is not a free change, and it is why this item is `needs-approval`. Points to get right:
-  - Use a `threading.Event` (the supervisor waits on it in its own process; workers are signalled via
-    their own control events in item 18) — a `multiprocessing.Event` is unnecessary here and its
-    semaphore-based `wait` has its own EINTR subtleties.
-  - **Set the wake event from the existing `SIGINT`/`SIGTERM` handlers too** (`daemon.py:39-45`), not just
-    SIGHUP. Otherwise shutdown gains up to 5s of latency it does not have today — a regression introduced
-    by the very change meant to reduce latency.
-  - Clear the event *after* waking and *before* acting, so a signal arriving mid-iteration is not lost.
-  - `SUPERVISOR_POLL` remains as the wait timeout, so the dead-worker check still runs on its old cadence
-    when nothing signals.
-- **Validate before disrupting anything.** On reload the supervisor **first** loads and validates the new
-  config in its own process. If loading fails, it logs the error, keeps the existing workers running
-  untouched, and clears the flag. This is essential: workers `return` on bad config
-  (`workers.py:66-67`), so cycling them into an invalid config would produce the respawn loop described
-  next.
-- **Fix the pre-existing infinite-respawn bug** (finding 3 above). `_check_workers` (`daemon.py:69-80`)
-  restarts any dead worker unconditionally with a fixed 5s delay. Add: a restart counter per worker,
-  exponential backoff, and escalation to a loud error (and supervisor exit) after N consecutive rapid
-  failures. Without this, Phase 3 makes a bad-config respawn storm much easier to trigger.
-- **Worker set may change across reload.** `_active_worker_names()` (`daemon.py:56-60`) derives the
-  worker list from config — specifically whether any enabled dataset has remotes. A reload must therefore
-  handle **adding** a `remote` worker that did not exist and **removing** one no longer needed, not just
-  cycling the existing set.
-- **Note:** `_check_workers` calls a blocking `time.sleep(WORKER_RESTART_DELAY)` at `daemon.py:76`, which
-  stalls the entire supervisor loop including reload handling. Worth converting to a non-blocking
-  deadline per worker as part of this item.
-- **Verification:** `pytest tests/test_zfsbackup_daemon.py -k reload`
+- **Store lane:** 17.0 → **G1**
+- **Daemon lane:** 18.0 → 17.1 → 18.1 → 18.2 → 18.3 → 18.4 → 18.5 → **G2** → 17.2 → **G3**
+- **CLI:** 19.2 may start after G1 and 17.1 (read-only). 19.1 is implemented after G2 and lands after G3 → **G4**.
+- **Tests (20):** written alongside every item. **21** after G3; **22** after G4; **23** last.
 
-### Item 18 — Cooperative worker cycling (the mid-stream safety problem)
+| Gate | After | Reviewers | Must clear before | Concurrency-reviewer focus |
+|---|---|---|---|---|
+| G1 | 17.0 | concurrency + zfs-code | 17.2, 19.1 | `user_version` stamp is transactional; `read_store_state` leaves no read mark (WAL growth) |
+| G2 | 18.0–18.5, 17.1 | concurrency + zfs-code (18.4: remote/security) | 17.2 | signal targeting (lock-holder proof, pidfd race, torn pid-file reads); `ReloadEpoch` shared memory; exit protocol vs. safe points; API gate threads and `server.shutdown()`; `workers.lock` fd inheritance (`O_CLOEXEC`, no supervisor fd across fork); startup waits run with default SIGTERM |
+| G3 | 17.2 | concurrency + zfs-code | 19.1 landing | handler stays one store; sleep wakes on the HUP flag; no fork with a session open; dispose after every read; `Handoff`-then-epoch ordering; stop beats reload everywhere; turnover vs. A-5 accounting |
+| G4 | 19.x | zfs-code + concurrency | 22 | `request_reload` used exactly once, post-commit; ack loop holds no lock |
 
-- **Owner:** `zfsbackup-developer`  *(run at **opus**; + `concurrency-reviewer`)* · **Tag:** `needs-approval` *(IPC contract change)*
-- **Files:** `zfsbackup/workers.py`, `zfsbackup/daemon.py`
-- **Basis:** `workers.py:32` (`stop_event` param), `workers.py:62`/`workers.py:196` (config loaded once),
-  `workers.py:70-71` (`interval` and `_before_loop` computed once), `workers.py:73-82` (the loop),
-  `workers.py:152-154` (`RemoteBackupManager` constructed in `_before_loop`), `daemon.py:37`/`daemon.py:54`
-  (single shared `_stop_event`).
-- **Mechanism: graceful worker restart, not in-place re-read.** Two designs were considered:
-  - **(a) Restart the worker process.** Reuses the existing `_new_worker` path (`daemon.py:47-54`) and
-    gets a fresh config, a fresh `DatasetManager`, a fresh `interval` (`workers.py:70`), and a fresh
-    `_before_loop` (`workers.py:71`, which constructs `RemoteBackupManager`) for free.
-  - **(b) Signal workers to re-read in place.** Requires restructuring the loop, rebuilding
-    `DatasetManager` mid-flight, and re-running both `_get_interval` and `_before_loop` — i.e.
-    reimplementing by hand everything a restart does for free.
+---
 
-  **Recommend (a).** The only thing (b) saves is process-spawn cost, which is irrelevant at config-change
-  frequency.
-- **IPC change — per-worker control events.** Today all workers share one `_stop_event`
-  (`daemon.py:37,54`), so there is no way to cycle one worker without stopping all. Add a per-worker
-  `control_event` alongside the shared `stop_event`:
-  - `BaseWorker.__init__` (`workers.py:27-39`) gains a `control_event` parameter.
-  - The loop's sleep at `workers.py:82` becomes `self.control_event.wait(timeout=interval)`.
-  - On wake, and at the top of each cycle (where `stop_event` is already checked at `workers.py:73` and
-    `workers.py:76`), the worker checks **both**: `stop_event` set → normal shutdown; `control_event` set
-    → clean exit with a **distinguished exit code** meaning "reload me".
-  - Global shutdown must set every `control_event` as well as `stop_event`, so workers wake promptly
-    rather than sitting out a long `interval` — a latent shutdown-latency improvement in its own right.
-  - `ApiWorker` (`workers.py:174-215`) blocks on `self.stop_event.wait()` at `workers.py:214` rather than
-    running the `BaseWorker` loop; it needs the same both-events treatment. Its Flask thread is a daemon
-    thread, so process exit tears it down cleanly.
-- **⚠ Mid-operation safety — the hard requirement.** `RemoteBackupWorker` may be inside a `send`/`receive`
-  stream (`workers.py:171` → `remote.py`). Tearing that down mid-stream risks a partial dataset on the
-  receiving server and an inconsistent anchor property (`workers.py:162`). Therefore:
-  - **Reload must never call `terminate()`.** It is strictly cooperative.
-  - The control check happens at **cycle boundaries and between datasets** (`workers.py:75-81`), never
-    inside `_process_dataset`. A worker mid-transfer finishes that dataset, then exits.
-  - **No hard grace-period kill.** A legitimate full send can take hours (and item 14 shows renames can
-    *cause* full sends). If a worker has not exited within a grace period, the supervisor logs
-    *"remote-backup-worker still finishing a transfer; reload deferred"* and **keeps waiting**, retrying
-    the check each poll. Reload is best-effort per worker: snapshot, pruning, and API workers turn over in
-    seconds; the remote worker turns over when its current transfer completes. This is the correct
-    trade-off — a stale config for one more cycle is vastly cheaper than a corrupt received stream.
-  - Consequence to state plainly: **reload is not atomic across workers.** For a period, some workers run
-    the new config and some the old. Given workers are independent per-dataset loops with no shared
-    in-memory state, this is safe; it is called out so nobody assumes otherwise.
-- **Distinguish reload-exit from crash.** `_check_workers` reads `worker.exitcode` (`daemon.py:74`) and
-  logs an error. A reload exit must use a distinguished code so it is logged as an expected transition,
-  does not incur `WORKER_RESTART_DELAY` (`daemon.py:76`), and does not count toward the item-17 crash
-  backoff counter.
-- **Verification:** `pytest tests/test_zfsbackup_workers.py -k "control or reload"` — including a test
-  that a worker with a simulated long-running `_process_dataset` is **not** killed mid-operation.
+### Item 17.0 — Store id and cheap store state *(store)*
 
-### Item 19 — CLI reload trigger
+- **Owner:** `zfsbackup-store-developer` · **Tag:** `needs-approval` (config load/write contract) · **Gate:** G1
+- **Files:** `config/store/mapper.py`, `access.py`, `importer.py`, `__init__.py`
+- **Basis:** D8. A fresh import is generation 0 (`mapper.py:977,1097`), so delete + re-import repeats keys. The
+  ABA residual is recorded under "Item 15 as landed". `read_generation` is at `access.py:~153-193`.
 
-- **Owner:** `zfsbackup-cli-developer` · **Tag:** `needs-approval` *(daemon interaction)*
-- **Files:** `zfsbackup/cli/main.py`, `zfsbackup/daemon.py`
-- **Basis:** item 15's stopgap notice; `daemon.py:90` (`run()` is where a pidfile would be written).
-- **Changes:**
-  - The supervisor writes a **pidfile** (default `/var/lib/zfsbackup/daemon.pid`, alongside the DB from
-    item 6) on startup and removes it on clean shutdown. Stale-pidfile detection: verify the pid exists
-    *and* is actually a zfsbackup daemon before signalling — never SIGHUP an arbitrary recycled pid.
-  - **Automatic reload by default, with `--no-reload` to suppress** *(user decision — settled)*. After any
-    successful write, if a running daemon is detected, the CLI sends SIGHUP and reports
-    *"signalled daemon (pid N) to reload"*. Rationale: the alternative default — config silently written
-    but not applied — is the surprising and dangerous behaviour, and it is the exact failure mode item 15
-    exists to paper over. `--no-reload` covers scripted batch edits where one reload at the end is wanted.
-  - An explicit `zfsbackup-config reload` subcommand for that batch case and for manual use.
-  - If no daemon is detected, say so plainly rather than silently doing nothing.
-  - If the CLI lacks permission to signal the daemon (non-root user, root daemon), report that clearly —
-    this is a realistic case given the item-6 group-based permissions, where a user can *write* the config
-    but not *signal* the daemon. Suggest `systemctl reload zfsbackup` as the alternative.
-- **Verification:** `pytest tests/test_zfsbackup_cli.py -k "reload or pidfile"`
+**Behaviour:**
+1. **Stamping (`save_config`).** Inside the caller's write transaction, read `PRAGMA user_version` before the
+   CAS.
+   - If `expected_store_id is not None` and it differs, raise `ConfigConflict`: "the configuration database was
+     replaced since it was read (store id A, now B); re-run".
+   - After the CAS, if the value is 0, set `PRAGMA user_version = <secrets.randbelow(2**31 - 2) + 1>` (an int we
+     generated, formatted into the statement).
+   - Never re-stamp a non-zero value. Only `save_config` stamps; `create_config_db_file` must not open SQLite.
+2. **Snapshot field.** `ConfigSnapshot.store_id: int = 0` (default keeps positional constructors working), read
+   in `load_config_snapshot`'s transaction.
+3. **Never-prune flag.** `read_config(resolved, *, warn_never_prune=True)` and
+   `load_config_snapshot(..., warn_never_prune=True)` pass it through to `load_config`.
+4. **Write path.** `write_config(..., expected_store_id: Optional[int] = None)`. `WriteResult.store_id: int = 0`
+   is the id after the write. `ImportResult.store_id` likewise.
+5. **Poll read.** New frozen `StoreState(store_id, generation)` and `read_store_state(resolved)`:
+   - one read-only connection: `BEGIN`; `PRAGMA user_version`; `SELECT generation FROM global_settings WHERE id = 1`;
+     `COMMIT`; close;
+   - no schema check; does not dispose (the caller does);
+   - raises the same errors as `read_generation`, which itself is unchanged.
+6. **Exports.** Add `StoreState` and `read_store_state` to `__all__` and to the "Public API" docstring.
+
+**Edge cases:**
+- A rollback after stamping leaves 0.
+- `upgrade_schema` and every migration preserve `user_version`.
+- Foreign-DB detection never consults it.
+
+**Tests** (`test_zfsbackup_store_access.py`, `_store.py`, `_store_upgrade.py`):
+- first save stamps a non-zero id; later saves keep it; a legacy DB (0) is stamped on its next write;
+- a failure after the stamp leaves 0; delete + re-import gives a new id;
+- a stale `expected_store_id` → `ConfigConflict` with the DB hash unchanged; `None` skips the compare;
+- `read_store_state` on missing, uninitialised and unmigrated DBs raises the documented errors, leaves nothing
+  checked out and no read mark (`PRAGMA wal_checkpoint(PASSIVE)` is not blocked afterwards);
+- `upgrade_schema` keeps the id;
+- `read_config(warn_never_prune=False)` logs no never-prune line;
+- `ConfigSnapshot(config, generation, schema_rev)` still constructs.
+
+**Verify:** `pytest tests/test_zfsbackup_store*.py -k "store_id or store_state or never_prune"`
+
+### Item 18.0 — `zfsbackup/procident.py`: process identity and flock holders *(new module, stdlib only)*
+
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` (signal targeting) · **Gate:** G2
+- **Basis:** Checkpoint B carry-over "key it on pid + start time"; D4(a). This module is shared by `daemonlock`
+  (17.1) and `workers` (18.2), and must not import `zfsbackup.config.store`.
+
+**API:**
+- `start_token(pid) -> Optional[str]`
+- `identity(pid, token) -> 'match' | 'mismatch' | 'gone' | 'unknown'` — never raises.
+- `flock_write_holders(inode) -> Optional[Set[int]]` — Linux only; `None` means unavailable.
+
+**Platforms:**
+- **Linux:**
+  - **Start token:** read `{_PROC_ROOT}/{pid}/stat` (`_PROC_ROOT = "/proc"`, patchable). Take the text after the
+    **last** `)`, split on whitespace; index 19 is field 22, `starttime`. Token: `linux:<starttime>`.
+    `FileNotFoundError`/`ProcessLookupError` → gone; `PermissionError` (`hidepid`), other `OSError` or a parse
+    error → unknown.
+  - **Lock holders:** parse `{_PROC_ROOT}/locks`. Keep only lines whose type is `FLOCK` and access is `WRITE`.
+    Skip blocked-waiter lines (`N: -> …`), `POSIX`/`OFDLCK`/`LEASE` and `READ`. Match on the decimal inode in
+    `MAJ:MIN:INODE` only: the device can legitimately differ from `st_dev` on btrfs subvolumes and overlayfs.
+    Return the set of pids (pid 0 means another namespace, so drop it).
+- **macOS:** start token via ctypes `sysctl([1 CTL_KERN, 14 KERN_PROC, 1 KERN_PROC_PID, pid])` into a 1024-byte
+  buffer.
+  - non-zero return code → unknown; returned size 0 → gone;
+  - `kinfo_proc.kp_proc.p_un.__p_starttime` sits at offset 0: `int64 tv_sec`, `int32 tv_usec` at offset 8;
+  - token: `darwin:<sec>.<usec:06d>`;
+  - `flock_write_holders` → `None`.
+- **Other platforms:** `start_token` → `None`; `identity` → `'unknown'`.
+
+`identity`:
+- pid `None`/≤1, empty token, or unreadable → `'unknown'`;
+- process absent → `'gone'`;
+- tokens equal → `'match'`, else `'mismatch'`.
+
+No boot id is needed: tokens are only compared while the presence lock is held, and no holder survives a reboot.
+
+**Tests** (new `tests/test_zfsbackup_procident.py`):
+- own token stable and non-`None` on Linux and macOS;
+- a reaped child → `'gone'`; a child's token differs from the parent's;
+- Linux parser fixtures in a temp `_PROC_ROOT`: `comm` containing `a) (b c` and spaces, a truncated file;
+- `/proc/locks` fixture with FLOCK/POSIX/OFDLCK, READ/WRITE and `->` lines; on Linux only, a child holding
+  `flock(LOCK_EX)` shows up for that inode;
+- macOS only: `start_token` seconds within 1 s of `LC_ALL=C ps -o lstart= -p <pid>`;
+- `sys.platform` patched to `freebsd` → `None`/`'unknown'`;
+- `identity(1, t)` and `identity(None, t)` → `'unknown'`.
+
+### Item 17.1 — Pid file v2, verified reload request, workers-lock helpers
+
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` (signals) · **Gate:** G2
+- **Files:** `zfsbackup/daemonlock.py`
+- **Basis:** `_format`/`_parse` (`:219-235`), `DaemonLock` (`:251-336`), `acquire` (`:395`), `probe` (`:483`);
+  D4; contract 5; Checkpoint B carry-over 2. The file is `0660` in a `2770` directory, which is why the
+  lock-holder proof is required.
+
+**Behaviour:**
+1. **Writing the file.**
+   - `DaemonLock.__init__` records `self.start = procident.start_token(os.getpid()) or ""`.
+   - `_write` emits both lines plus `start=` and whichever of `applied`/`target`/`rejected` are set.
+   - New `set_state(*, applied=_KEEP, target=_KEEP, rejected=_KEEP)`; each value is
+     `Optional[Tuple[int, int]]`. Setting `applied` also rewrites line 2 with its generation.
+   - `set_generation` is kept.
+   - Writes stay `pwrite` + `ftruncate` + `fsync`. Failures log a WARNING and never raise.
+2. **Parsing.**
+   - `_parse` returns `pid`, `generation`, `start` (`None` when the key is absent, i.e. a legacy daemon),
+     `applied`, `target`, `rejected`. Malformed values become `None`.
+   - `DaemonInfo` gains those fields plus a `reload_capable` property; `DaemonAlreadyRunning` gains `start`.
+3. **Stable reads.** `_read_stable(fd)` re-reads up to 3 times until two consecutive reads are byte-identical;
+   otherwise the read is flagged unstable. `probe` and `request_reload` both use it.
+4. **Shared constant.** `RELOAD_POLL_SECONDS = 10`. The daemon imports it; the CLI's wording uses it.
+5. **`request_reload(resolved, *, skip_if_applied=None) -> ReloadRequest(outcome, pid, info, detail)`.**
+   Never raises.
+   - **Outcomes:** `no-daemon`, `already-applied`, `signalled`, `not-permitted`, `legacy`, `supervisor-gone`,
+     `unverified`, `error`.
+   - **Steps:**
+     1. Open the file `O_RDONLY|O_CLOEXEC|O_NOFOLLOW`. Missing → `no-daemon`. Any other open error → `error`.
+     2. `LOCK_SH|LOCK_NB` succeeds → unlock → `no-daemon`.
+     3. Stable read. Unstable or pid `None` → `unverified`. No `start` key → `legacy`. Empty `start` →
+        `unverified` ("identity not recorded on this platform").
+     4. `applied == skip_if_applied` → `already-applied`, with no signal.
+     5. Never target pid ≤1 or `os.getpid()`.
+     6. If `os.pidfd_open` and `signal.pidfd_send_signal` exist (Linux ≥5.3), open the pidfd first.
+        `ProcessLookupError` → `supervisor-gone`.
+     7. **Lock-holder proof:** `procident.flock_write_holders(fstat(fd).st_ino)` must contain pid.
+        - `None` (macOS/other, or `/proc/locks` unreadable) → `unverified` ("signals are verified only on
+          Linux").
+        - pid not in the set → `supervisor-gone`. This covers fork orphans whose supervisor died and a forged
+          file; a forged file can only ever name the forger's own process.
+     8. **Identity:** `procident.identity(pid, start)`. `'gone'`/`'mismatch'` → `supervisor-gone`;
+        `'unknown'` → `unverified`.
+     9. **Send SIGHUP:** `pidfd_send_signal(pfd, SIGHUP)`, or `os.kill(pid, SIGHUP)` without pidfd (the
+        check-then-kill race of microseconds is documented).
+        - `PermissionError` → `not-permitted`.
+        - `ProcessLookupError` → `supervisor-gone`.
+        - success → `signalled`.
+   - Only SIGHUP is ever sent, never to a process group.
+6. **Workers lock helpers.**
+   - `workers_lock_path(resolved)` → `<db>.workers.lock`.
+   - `ensure_workers_lock(resolved)`: create-if-absent, mode 0660, using the same `_fix_permissions` rules,
+     `O_NOFOLLOW|O_CLOEXEC`, then close.
+   - `hold_workers_lock(path) -> Optional[int]`:
+     - opens `O_RDONLY|O_CLOEXEC|O_NOFOLLOW` and takes `LOCK_SH|LOCK_NB`, retrying for 1 s every 25 ms;
+     - returns the fd, or `None` plus a WARNING.
+   - `workers_present(resolved) -> bool`:
+     - takes `LOCK_EX|LOCK_NB` on a fresh read-only fd; EWOULDBLOCK → `True`;
+     - always unlocks and closes before returning;
+     - a missing file → `False`.
+7. **Module docstring.** "The CLI signals, after verifying" replaces "never signals". Add the start-method table
+   for `.workers.lock`.
+
+**Tests** (`test_zfsbackup_daemonlock.py`):
+- **Format and parsing:**
+  - the format round-trips, including empty `start=`;
+  - a two-line legacy file parses as `start=None`;
+  - unknown and malformed keys are ignored;
+  - `set_state` keeps keys it was not given; `applied` rewrites line 2;
+  - a torn read (patched `pread`) → `unverified`.
+- **`request_reload` matrix**, using a real helper process that holds `LOCK_EX`, writes v2 content and records
+  SIGHUP in a marker file:
+  - everything genuine → `signalled`, marker written;
+  - wrong `start` → `supervisor-gone`, helper not signalled and still alive;
+  - file pid set to a decoy `sleep` that does not hold the lock, with the decoy's real start token →
+    `supervisor-gone`, decoy alive (the forgery case);
+  - pid gone → `supervisor-gone`; no `start` key → `legacy`; empty `start` → `unverified`;
+  - `flock_write_holders` patched to `None` → `unverified`;
+  - kill / `pidfd_send_signal` patched to raise `PermissionError` → `not-permitted`;
+  - `skip_if_applied` equal to `applied` → `already-applied`, nothing signalled;
+  - lock free → `no-daemon`; missing file → `no-daemon`; `EACCES` on open → `error`;
+  - both the pidfd path and the `os.kill` path (patch `os.pidfd_open` away);
+  - pid 1 and the test's own pid are never signalled.
+- **Workers lock:** two `LOCK_SH` holders coexist; `workers_present` is `True` while one is held and `False`
+  after the holder exits, including after SIGKILL; mode 0660; no fd leaks.
+
+### Item 18.1 — `ReloadEpoch`
+
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` (IPC) · **Gate:** G2
+- **Files:** `zfsbackup/stopflag.py`
+- **Basis:** `stopflag.py:30-40` (never recreate a shared block: heap blocks are recycled), `:108-129` (the
+  pickling dict).
+
+**Behaviour:**
+- `class ReloadEpoch` wraps `multiprocessing.Value('i', 0, lock=False)`, with `get() -> int` and
+  `set(value: int)`.
+- `'i'` keeps every store a single aligned 32-bit write on all supported platforms, so reads cannot tear.
+- Picklable through the `__getstate__`/`__setstate__` dict, exactly like `StopFlag`.
+- Created once in `BackupDaemon.__init__` and never recreated. It is never touched from a signal handler.
+
+**Tests** (`test_zfsbackup_stopflag.py`):
+- a child started under fork, spawn and forkserver sees a value the parent sets after the child started;
+- `ForkingPickler` shares the memory rather than copying it; plain `pickle` raises;
+- no lock object exists.
+
+### Item 18.2 — Worker exit protocol, `_wait` reason, orphan identity
+
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` (multiprocessing) · **Gate:** G2
+- **Files:** `zfsbackup/workers.py`
+- **Basis:** `_SupervisorWatch` (`:157-266`), `BaseWorker.run` (`:304-334`), the destination loop (`:403-418`);
+  Checkpoint B carry-overs 1 and 4.
+
+**Behaviour:**
+1. `class ExitReason(enum.Enum): STOP, SUPERVISOR_GONE, RELOAD` and `WORKER_EXIT_RELOAD = 3`.
+2. **Constructors.**
+   - `SnapshotWorker`, `PruningWorker`, `RemoteBackupWorker` and `ApiWorker` take
+     `(config, stop_event, verbose=False, *, reload_epoch=None, born_epoch=0, workers_lock=None)`.
+   - `BaseWorker` takes `(worker_name, config, stop_event, verbose=False, *, …same)`.
+   - The defaults reproduce today's behaviour, so existing call sites and tests are unchanged.
+3. **`_exit_reason() -> Optional[ExitReason]`**, in priority order:
+   - STOP — the flag is set;
+   - SUPERVISOR_GONE — `_supervisor_gone()`;
+   - RELOAD — `reload_epoch is not None and reload_epoch.get() != born_epoch`.
+
+   `_should_stop()` is kept as `_exit_reason() is not None`.
+4. **`_wait(timeout) -> Optional[ExitReason]`.** Same slicing as today; it returns the reason that ended the
+   wait, or `None` on timeout. A zero, negative or NaN timeout returns the current reason.
+5. **Orphan identity.**
+   - `_watch_init` also records `self.supervisor_start = procident.start_token(os.getpid())`.
+   - `_supervisor_gone` keeps rules 1–2. Rule 3 becomes `procident.identity(supervisor_pid, supervisor_start)`:
+     - `'gone'` → gone ("no such process");
+     - `'mismatch'` → gone ("pid N now belongs to another process");
+     - `'unknown'` → fall back to `_pid_exists`.
+6. **`BaseWorker.run`.**
+   - After `_arm_supervisor_watch`, hold `daemonlock.hold_workers_lock(workers_lock)` when it is set (item 18.5).
+   - Loop: compute `reason = _exit_reason()` at the top and before each dataset; when a cycle completes,
+     `reason = _wait(interval)`.
+   - On exit:
+     - STOP → log "stopped", return (exit 0);
+     - SUPERVISOR_GONE → return (already logged once at ERROR);
+     - RELOAD → log INFO "`<name>` finished its current work; exiting to switch configuration", then
+       `sys.exit(WORKER_EXIT_RELOAD)`.
+7. **`RemoteBackupWorker._process_dataset`.** Before every destination after the first, return if
+   `_exit_reason()` is not `None`. No stream is open at that point, so it is a safe point.
+
+**Edge cases:**
+- A reload never interrupts `_process_dataset`.
+- Stop beats reload.
+- A failure in `_before_loop` is still a crash (exit 1).
+
+**Tests** (`test_zfsbackup_workers.py`; update `test_zfsbackup_daemon_closeout.py::TestSupervisorWatch`):
+- **Reasons:**
+  - the full priority table of `_exit_reason`;
+  - `_wait` returns each reason, returns `None` on timeout, and notices an epoch bump within one `STOP_POLL`.
+- **Real worker process** under each available start method, whose `_process_dataset` blocks on an `Event`:
+  - bump the epoch → it is not terminated, finishes that dataset, starts no other, exits 3;
+  - the same with the stop flag → exit 0.
+- **Remote and legacy paths:**
+  - remote worker with two destinations, epoch bumped during the first → the second never starts, exit 3;
+  - `reload_epoch=None` never yields RELOAD;
+  - the old positional constructors still work.
+- **Orphan identity:**
+  - `identity` → `'mismatch'` under the forkserver flag counts as gone, logged once at ERROR;
+  - `'unknown'` falls back to `_pid_exists`.
+
+### Item 18.3 — `ApiWorker`: stream gate, drain, `server.shutdown()`
+
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` (API) · **Gate:** G2
+- **Files:** `zfsbackup/api.py`, `zfsbackup/workers.py`
+- **Basis:** `api.py:108-212` — the API worker hosts the server-side `zfs receive -s`, so cycling it mid-receive
+  tears an inbound stream. Also `ApiWorker.run` (`workers.py:470-506`) and Checkpoint B carry-over 3.
+
+**`api.py`:**
+- **`class StreamGate`** (a `threading.Condition`):
+  - `begin() -> bool` — `False` while draining, otherwise count + 1;
+  - `end()`;
+  - `start_draining()`;
+  - `draining` and `active` properties;
+  - `wait_idle(timeout: Optional[float], abort: Callable[[], bool]) -> bool` — slices of ≤0.5 s; `True` when the
+    count is 0.
+- `create_app` stores one at `app.extensions['zfsbackup.stream_gate']`.
+- **`backup_negotiate`**, before any ZFS call: while draining, return
+  `503 {'error': 'server is reloading; retry later', 'retry': True}`.
+- **`backup_stream`**, right after the enabled check: if `not gate.begin()`, send that same JSON error and
+  return. Otherwise wrap the rest in `try/finally: gate.end()`.
+
+**`ApiWorker.run`, after the bind:**
+1. Loop `reason = self._wait(STOP_POLL)`. If the server thread dies → exit 1, as today.
+2. `gate.start_draining()`. Read-only endpoints keep serving throughout.
+3. On RELOAD with active streams: log INFO "waiting for N in-flight receive(s) to finish before reloading",
+   then `gate.wait_idle(None, abort=lambda: self._exit_reason() in (STOP, SUPERVISOR_GONE))`. If aborted,
+   reason becomes the new `_exit_reason()`.
+4. On STOP or SUPERVISOR_GONE with active streams: `gate.wait_idle(API_STOP_DRAIN)` with
+   `API_STOP_DRAIN = 20`, inside `_shutdown_workers`' shared 30 s budget. On timeout, WARNING "abandoning N
+   in-flight receive(s); the sender resumes them (zfs receive -s)".
+5. `if thread.is_alive(): server.shutdown()`, then `server.server_close()`, then `thread.join(timeout=5)`.
+6. RELOAD → `sys.exit(WORKER_EXIT_RELOAD)`; otherwise return.
+
+**Edge cases:**
+- The replacement API worker is spawned only after this process has exited, so the port is free.
+- A bind failure still exits 1 without `shutdown()`.
+
+**Tests** (`test_zfsbackup_api.py`, `test_zfsbackup_workers.py`):
+- gate accounting under threads;
+- `negotiate` returns 503 while draining;
+- `stream` refuses while draining and never starts `zfs receive` (mocked);
+- an in-flight stream (mocked, blocking receive) keeps the worker alive after an epoch bump, and it exits 3
+  once released;
+- a stop during a RELOAD drain switches to the bounded drain and exits 0;
+- a stop with an in-flight stream waits at most `API_STOP_DRAIN`, exits 0 and logs the abandon;
+- `shutdown()` and `server_close()` run on every exit path except a bind failure (fake server via the
+  `_bind_api_server` seam);
+- a dead server thread still exits 1.
+
+### Item 18.4 — Websocket timeouts (D7)
+
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` (remote/API security) · **Gate:** G2
+  (zfs-code-reviewer)
+- **Files:** `zfsbackup/remote.py`, `zfsbackup/api.py`
+- **Basis:** the client has no timeouts (`remote.py:185-202`); the server's `ws.receive()` has none either
+  (`api.py:~187`). A hung peer would otherwise turn D5's "deferred indefinitely" into "never".
+
+**Behaviour:**
+- **Constants**, defined in `remote.py` and imported by `api.py` (`remote` must not import `api`):
+  - `WS_CONNECT_TIMEOUT = 30`;
+  - `WS_IDLE_TIMEOUT = 600` — no progress on one socket operation;
+  - `WS_FINAL_ACK_TIMEOUT = 3600` — the client waiting for the server's status after `done`, while `zfs receive`
+    may still be committing.
+- **Client** (`_transfer`):
+  - `ws.connect(ws_url, timeout=WS_CONNECT_TIMEOUT)`, then `ws.settimeout(WS_IDLE_TIMEOUT)`;
+  - `ws.settimeout(WS_FINAL_ACK_TIMEOUT)` before the final `ws.recv()`;
+  - a timeout lands in the existing `except Exception`: "Transfer failed", returns `False`, no anchor update.
+  - Leaving `with stream:` closes the read end first, so `zfs send` dies with EPIPE and its non-zero close is
+    swallowed. Verify this cannot hang.
+- **Server:** `data = ws.receive(timeout=WS_IDLE_TIMEOUT)`. `None` → raise
+  `TimeoutError(f"no data from the client for {WS_IDLE_TIMEOUT}s")`. The existing handler closes the writer
+  (`-s` keeps resume state) and reports the error; `gate.end()` still runs.
+
+**Tests** (`test_zfsbackup_remote.py`, `test_zfsbackup_api.py`):
+- `connect` gets the timeout; `settimeout` values are applied in order;
+- a fake ws whose `send_binary` times out → `False`, anchor unchanged, stream closed;
+- server `receive` returns `None` → writer closed, error sent, gate released;
+- the normal path is unchanged.
+
+### Item 18.5 — Workers lock and predecessor survivors
+
+- **Owner:** `zfsbackup-developer` · **Tag:** `needs-approval` (multiprocessing/startup) · **Gate:** G2
+- **Files:** `zfsbackup/daemon.py` (`_run_startup`), `zfsbackup/workers.py`
+- **Basis:** Checkpoint B carry-over 2. Under spawn/forkserver, orphans hold no presence lock
+  (`daemonlock.py` docstring), so a restarted daemon can overlap with survivors finishing their last dataset.
+
+**Behaviour:**
+1. **Workers lock first.** Right after `daemonlock.acquire` succeeds (not under `--test-config`), call
+   `ensure_workers_lock(resolved)`.
+   - While `workers_present(resolved)`: sleep 1 s.
+   - Log a WARNING at the start and every 60 s: "workers of a previous daemon still hold
+     `<db>.workers.lock`; waiting for them to finish — they exit at their next safe point and a transfer in
+     progress is never interrupted. Find them with `fuser <path>`".
+   - Only then read the config.
+2. **Startup signals during the wait.** SIGINT/SIGTERM keep their default dispositions here (no workers exist, so
+   the process stays killable). SIGHUP goes to `_StartupHup`.
+3. **Dead supervisor still holding the lock.** If `acquire` raises `DaemonAlreadyRunning` and
+   `procident.identity(e.pid, e.start)` is `'gone'` or `'mismatch'`, fork orphans of a dead supervisor hold the
+   lock. Retry `acquire` every 1 s, with the same 60 s WARNING plus `stale_supervisor_message`, instead of
+   exiting. `'match'` or `'unknown'` → exit 1 as today.
+4. **Worker side.** Every worker holds `LOCK_SH` for life via 18.2 step 6. The supervisor passes
+   `workers_lock=path` to every worker. It never keeps a `workers.lock` fd open across a fork.
+
+**Edge cases:**
+- A missing or unopenable `workers.lock` produces a WARNING and the worker continues: the lock is a detection
+  aid, not a gate.
+- `zfs` children never inherit the fd (`O_CLOEXEC`).
+
+**Tests** (`test_zfsbackup_daemon_closeout.py`, `_workers.py`):
+- startup waits while a helper process holds `LOCK_SH`, and proceeds within about 1 s after it exits;
+- the WARNING cadence;
+- SIGTERM during the wait exits with no worker started;
+- a verified-dead supervisor makes the new daemon wait;
+- a live matching supervisor is still refused with exit 1;
+- workers hold `LOCK_SH` under each start method (checked with `workers_present`);
+- the fd's `FD_CLOEXEC` bit is set.
+
+### Item 17.2 — Supervisor reload state machine
+
+- **Owner:** `zfsbackup-developer` (run at opus) · **Tag:** `needs-approval` (signals/supervisor) · **Gate:** G3
+- **Files:** `zfsbackup/daemon.py`, `zfsbackup/runtime_config.py`, `zfsbackup/backup_manager.py` (only the
+  `should_stop` parameter)
+- **Basis:**
+  - `daemon.py`: `_sighup_handler` `:145-157`, `_new_worker` `:229-241`, `_spawn` `:249-288`,
+    `_check_workers` `:351-423`, `_supervisor_sleep` `:478-521`, `run` `:523-589`, `_report_hup` `:591-595`,
+    `_run_startup` `:772-933`;
+  - `backup_manager.py:326-329`; D1, D2, D5, D6, D9, D10.
+
+**State:**
+- `@dataclass(frozen=True) class Handoff: config; epoch: int; key: Tuple[int, int]`.
+- `BackupDaemon.__init__(config, resolved_config, verbose=False, *, key=(0, 0), presence_lock=None,
+  dry_run_override=False, workers_lock=None)` sets:
+  - `self._handoff = Handoff(config, 0, key)`; `self.config` becomes a read-only property returning
+    `self._handoff.config`;
+  - `self._reload_epoch = ReloadEpoch()`;
+  - `_worker_epoch: Dict[str, int]`, `_rejected = None`, `_applied_epoch = 0`;
+  - `_next_poll_at = monotonic + RELOAD_POLL_SECONDS`;
+  - `_reload_started_at`, `_defer_logged_at: Dict[str, float]`, `_poll_problem = None`.
+
+**Hand-over (config and epoch together):**
+- `_new_worker` reads `h = self._handoff` once and passes `h.config` and `born_epoch=h.epoch` together, plus
+  `reload_epoch` and `workers_lock`.
+- `_spawn` records `_worker_epoch[name] = h.epoch`.
+
+**Signals:**
+- `_sighup_handler` stays a single store.
+- `_supervisor_sleep` also returns early when `self._hup_requested` is set (one attribute read per slice), so
+  SIGHUP latency is at most `SUPERVISOR_SLEEP_SLICE`.
+- `_report_hup` and the stopgap message are deleted.
+
+**`run()`:**
+1. After the startup sync, call `self._reload_tick(startup=True)` once before `_start_workers`. A CLI SIGHUP
+   carried by `_StartupHup`, or a write that landed during the startup sync, is applied before any worker exists.
+2. Loop: `_supervisor_sleep` → `_reload_tick()` → `_check_workers()`. The stop flag is re-checked between steps.
+
+**`_reload_tick()`:**
+1. `forced = self._hup_requested`; if set, clear it **before** reading. A SIGHUP that lands later forces another
+   tick, and the write behind a SIGHUP was committed before that signal was sent, so the read below sees it.
+2. Unless forced or the poll is due, return. Set `_next_poll_at = now + RELOAD_POLL_SECONDS`.
+3. Unforced path:
+   - `read_store_state(resolved)` in `try/finally: dispose_all()`.
+   - Any `Exception` → `_note_poll_problem(e)`: WARNING "cannot check the configuration database for changes:
+     …; still running generation G" when the message changes, INFO when it clears, DEBUG otherwise. Then return.
+   - Return if the key equals `_handoff.key` or `_rejected`.
+4. Then `_try_reload(trigger)`, where `trigger` is `"SIGHUP"` or `"poll"`.
+
+**`_try_reload(trigger)`:**
+1. **Read and validate.**
+   - `snap = load_runtime_config(resolved)`, which becomes `read_config(resolved, warn_never_prune=False)` with
+     the schema check inside the snapshot.
+   - `key = (snap.store_id, snap.generation)`; `warnings = validate_config(snap.config)`.
+   - `dispose_all()` in a `finally`.
+2. **On any `Exception`:**
+   - log ERROR "configuration generation `<G' | unknown>` rejected (trigger: …):
+     `<config_error_message(resolved, e)>`; still running generation G" — only when `(key, message)` differs
+     from the last rejection logged;
+   - if the key is known, set `_rejected = key` and `presence_lock.set_state(rejected=key)`;
+   - return.
+3. If the key equals the running key: when forced, INFO "SIGHUP: configuration unchanged (generation G)".
+   Return.
+4. Re-apply `--dry-run` (`config.dry_run = True` when `dry_run_override`). Log the warnings.
+5. INFO "configuration generation G' accepted (was G; trigger: SIGHUP|poll)", then
+   `presence_lock.set_state(target=key)`.
+6. `m = DatasetManager(config)`; `m.dataset_report()`; `m.verify_datasets()`;
+   `m.sync_all_config_properties(should_stop=self._stop_event.is_set)`. If the stop flag is set, return:
+   shutdown proceeds and `target` stays recorded.
+7. `self._handoff = Handoff(config, epoch + 1, key)` **first**, then `self._reload_epoch.set(epoch + 1)`. Clear
+   `_rejected`. Set `_reload_started_at`. Clear `_defer_logged_at`.
+8. INFO "Reloading: generation G -> G' (+added, -removed, ~changed datasets); workers switch over at their next
+   safe point".
+9. Spawn newly active workers that are neither live nor in backoff (guarded by the stop flag). Drop the backoff
+   bookkeeping of workers that are no longer active.
+10. `_maybe_complete()`.
+
+**`_check_workers()` changes:**
+- **First pass:** a dead worker whose `exitcode == WORKER_EXIT_RELOAD` and whose `_worker_epoch[name]` is below
+  the current epoch is a **turnover**. It gets no failure count and no backoff. Everything else takes the A-5
+  crash path unchanged; that includes code 3 with a current epoch.
+- **Second pass** (skipped if anything crash-looped; stop-guarded): for each turnover, drop its bookkeeping, then
+  - if the name is still active → `_spawn(name, verb='Reloaded')` immediately, logging "Reloaded `<name>` worker
+    (pid=N) on generation G'";
+  - otherwise → INFO "`<name>` worker retired: not needed by generation G'".
+- **Deferral logging:** for each live worker whose epoch is below the current one, once 60 s
+  (`RELOAD_DEFER_NOTICE`) have passed since the reload, and then every 900 s (`RELOAD_DEFER_REPEAT`): WARNING
+  "`<name>` worker (pid=N) is still finishing work begun under generation G; it switches to G' at its next safe
+  point (in-flight transfers are never interrupted)".
+- **`_maybe_complete()`:** when every live worker is on the current epoch (dead-in-backoff workers will spawn on
+  it):
+  - set `_applied_epoch`;
+  - `presence_lock.set_state(applied=key, target=None)`;
+  - INFO "generation G' applied by all workers".
+- **D9:** the fatal crash-loop message adds "running configuration generation G' (accepted at HH:MM:SS)" once the
+  epoch is above 0.
+
+**Startup (`_run_startup`):**
+- After the read, run `validate_config`. Log its warnings. A `ValueError` → ERROR "configuration generation N is
+  invalid: …" (no traceback), `_release_refused`, exit 1. The same applies under `--test-config`.
+- Replace `set_generation` with `set_state(applied=key)`.
+- Construct `BackupDaemon(config, resolved, verbose, key=key, presence_lock=lock,
+  dry_run_override=args.dry_run, workers_lock=path)`.
+
+**`sync_all_config_properties(self, should_stop=None)`:** break between datasets when `should_stop()` is true.
+
+**Docstrings to correct:** `daemon.py:95-106`, `:145-157`; `workers.py:1-20` and `_init_child_process` (its
+SIGHUP wording); `runtime_config.py` ("once" → "at startup and on every reload"). Add to the
+`SUPERVISOR_SLEEP_SLICE` note: a reload tick can hold the loop for up to `busy_timeout` (5 s) plus the sync of a
+changed config.
+
+**Edge cases:**
+- Stop beats everything, and nothing is ever forked into a shutdown.
+- No session is open at any fork.
+- Two reloads during a drain coalesce: draining workers respawn straight onto the newest config.
+- A worker crash during a drain takes the crash path on the new config.
+- Nothing is respawned while `_crash_looped` is non-empty.
+
+**Tests** (`test_zfsbackup_daemon.py`, `_daemon_resilience.py`, `_daemon_closeout.py`):
+- **Signals and triggers:**
+  - the SIGHUP handler is one store; `_supervisor_sleep` returns within one slice of a HUP;
+  - forced read when unchanged → "unchanged", no worker touched;
+  - the poll triggers on a generation change and on a **store-id change at the same generation**;
+  - the poll is not re-triggered by a rejected key, but SIGHUP retries it.
+- **Rejection and failures:**
+  - an invalid candidate (`validate_config` `ValueError`, `SchemaOutOfDate`, missing file) leaves worker pids
+    unchanged and records `rejected=`;
+  - the log is deduplicated;
+  - a poll failure is logged once per state change, and the daemon keeps running.
+- **`--dry-run`:** it survives a reload.
+- **Workers:**
+  - hand-over: every spawn gets config and `born_epoch` from the same `Handoff`;
+  - growing and shrinking the worker set, including a backoff-pending worker that is no longer active;
+  - turnover bypasses backoff and the failure count; code 3 with a current epoch counts as a crash.
+- **Draining and completion:**
+  - deferral logging cadence (fake `_monotonic`);
+  - completion writes `applied` and clears `target`;
+  - coalescing two reloads;
+  - a stop during the sync, and during a drain.
+- **Startup:**
+  - a pending SIGHUP from `_StartupHup` is applied before the first spawn (no double cycle);
+  - startup `validate_config` refusal exits 1;
+  - the D9 message names the generation;
+  - `dispose_all` is called after every poll and every reload read.
+- **Old tests to replace:** the stopgap tests in `test_zfsbackup_daemon_resilience.py`, and the `_report_hup`
+  and `_wait`-bool tests in `test_zfsbackup_daemon_closeout.py`.
+
+### Item 19.1 — CLI: signal after every committed write, acknowledgement, notice
+
+- **Owner:** `zfsbackup-cli-developer` · **Tag:** `needs-approval` (config-writing CLI path) · **Gate:** G4;
+  lands after G3
+- **Files:** `cli/write.py`, `cli/main.py`, `cli/editor.py`, `cli/rename.py`
+- **Basis:** `write.py:88-179` (`commit_config`, `_daemon_notice`, `notify_daemon`); call sites at
+  `main.py:530,918`, `editor.py:694`, `rename.py:495,498,699`; D3, D4.
+
+**Behaviour:**
+1. `commit_config` passes `expected_store_id=snapshot.store_id`. A store-id `ConfigConflict` maps to exit 75,
+   like any other conflict.
+2. **`notify_daemon(resolved, generation, store_id=None)`.**
+   - Call sites pass `result.store_id`; `import` passes `ImportResult.store_id`.
+   - It calls `daemonlock.request_reload(resolved, skip_if_applied=(store_id, generation))` **exactly once**.
+   - It runs only after a commit. Every refusal path already raises before it, and `rename --dry-run` returns
+     before it.
+3. **Acknowledgement wait.** Only when the outcome is `signalled` and the wait is above 0: poll
+   `daemonlock.probe()` every 0.1 s until the wait elapses or the daemon answers.
+   - New global option `zfsbackup-config --reload-wait SECONDS` (float ≥ 0; default 3; 0 = don't wait).
+   - `notify_daemon` reads it from the current Click context, defaulting to 3.0 when there is none.
+4. **Wording.** Every line starts `config updated (generation N)`. stdout unless marked; the exit code never
+   changes.
+
+| Outcome | Rest of the line |
+|---|---|
+| `no-daemon` | `; no running daemon detected for <db>` (unchanged) |
+| `already-applied` | `; running daemon pid P is already on generation N` |
+| `signalled` + `applied == (S,N)` | `; reload requested from daemon pid P: it is now on generation N` |
+| `signalled` + `target == (S,N)` | `; reload requested from daemon pid P: it accepted generation N and is switching its workers over (in-flight transfers finish first)` |
+| `signalled` + `rejected == (S,N)` | `; reload requested from daemon pid P` + stderr `warning: daemon pid P rejected generation N and keeps running generation M; see its log` |
+| `signalled` + a newer key | `; reload requested from daemon pid P: it is already on (or applying) newer generation K` |
+| `signalled`, no answer | `; reload requested from daemon pid P (SIGHUP)`; when the wait was above 0, add `; not yet acknowledged; it applies the change at its next check (within 10s)` |
+| `not-permitted` | `; daemon pid P runs as another user and was not signalled; it picks up the change within 10s` |
+| `unverified` | `; could not verify that pid P is the daemon (<detail>), so it was not signalled; it picks up the change within 10s` |
+| `supervisor-gone` | `; ` + `stale_supervisor_message(...)` (existing) |
+| `legacy` | `; running daemon pid P is on generation M and predates live reload; restart it to apply this` |
+| `error` | stderr warning (existing wording) |
+
+   "10s" is `daemonlock.RELOAD_POLL_SECONDS`.
+5. **Other wording.** `rename destination`'s "Restart the daemon now so it uses the new name" (`rename.py:~689`)
+   becomes "The running daemon reloads the configuration (see below); until then and after, it protects every …".
+   The `write.py` module docstring states the new contract.
+
+**Tests** (`test_zfsbackup_cli.py`, `_cli_rename.py`, `_cli_edit.py`, `_cli_dotpath.py`):
+- every wording row, with `request_reload` and `probe` patched; exit 0 for every row;
+- `request_reload` is called exactly once after each successful `set`, `unset`, `edit` (whole, dataset,
+  destination), `rename dataset`/`rename destination` and `import`;
+- it is never called for `rename --dry-run`, a validation refusal, `ConfigConflict` (generation or store id),
+  `ConfigBusy`, `edit` abort or no-change, `migrate`, `export`, `list` or `get`;
+- the patched function sees the DB already at the new generation (post-commit);
+- the ack loop stops as soon as there is an answer; `--reload-wait 0` never probes after signalling;
+- the "until restarted" assertions are updated (`test_zfsbackup_cli.py:~4471,4482`,
+  `test_zfsbackup_daemon.py:~1383`); only the `legacy` row keeps "restart";
+- **Linux-only integration test:** a real helper process holding a genuine v2 lock records SIGHUP and writes
+  `target=`, and the CLI `set` reports "accepted". The same helper with a forged pid (a decoy `sleep`) leaves the
+  decoy alive.
+
+### Item 19.2 — `zfsbackup-config status [--wait SECONDS] [--json]`
+
+- **Owner:** `zfsbackup-cli-developer` · **Tag:** `low-risk` (read-only) · **Gate:** G4
+- **Files:** `cli/main.py`
+
+**Behaviour:**
+- Reads `read_store_state` (then disposes) and `daemonlock.probe()`.
+- Prints the stored store id and generation; the daemon pid; applied, target and rejected; whether the daemon is
+  reload-capable.
+- Verdict: `in sync` / `applying generation N` / `daemon rejected generation N` /
+  `daemon on M, stored N (it will pick it up)` / `no running daemon`.
+- Exit 0; 78 when the DB is unusable (existing mapping).
+- `--wait S`: exit 0 once applied equals stored (or when no daemon is running, with a message); 1 if the stored
+  key was rejected; 75 on timeout.
+- Never signals.
+
+**Tests:** every verdict; the JSON shape; every `--wait` outcome; no signal is ever sent (`os.kill` and
+`pidfd_send_signal` patched to fail the test).
 
 ### Item 20 — Tests for Phase 3
 
 - **Owner:** `pytest-test-author` · **Tag:** `low-risk`
-- **Files:** `tests/test_zfsbackup_daemon.py`, `tests/test_zfsbackup_workers.py`,
-  `tests/test_zfsbackup_cli.py`
-- **Basis:** items 17-19.
-- **Coverage required:** SIGHUP sets the flag and wake event without doing work in the handler; **reload
-  takes effect without waiting out a `SUPERVISOR_POLL` interval** (assert the loop wakes early, not after
-  the timeout); **`SIGINT`/`SIGTERM` also wake the loop immediately** — a shutdown-latency regression test,
-  since that is the failure mode the item-17 loop restructuring can introduce; a signal arriving
-  mid-iteration is not lost to the event `clear()`; invalid new config leaves
-  workers untouched and running; worker set grows/shrinks when `_active_worker_names()` changes across
-  reload; reload exit code is distinguished from crash and skips the restart delay and backoff counter;
-  crash backoff escalates and eventually exits rather than looping forever; **a worker
-  mid-`_process_dataset` is not terminated and reload waits for it**; global shutdown sets all control
-  events and workers exit promptly; pidfile lifecycle including stale-pid rejection; CLI auto-reload,
-  `--no-reload`, and the no-daemon and permission-denied paths.
-- **Verification:** `pytest tests/test_zfsbackup_*.py` fully green.
+- **Basis:** items 17.0–19.2. Per-item lists are above, each written alongside its item.
+- **Cross-cutting real-process tests** (patterned on `test_zfsbackup_stop_signals.py` / `_daemon_closeout.py`: a
+  real daemon subprocess, SQLite fixture, stub `zfs`; must pass the orphan safety net):
+  1. CLI `set` → the daemon logs "accepted … trigger: SIGHUP" within 2 s; worker pids change; the supervisor pid
+     does not; the pid file reads `applied=` the new key.
+  2. SIGHUP with an unchanged DB → "unchanged", and no worker pid changes.
+  3. A DB write with no signal → reload with "trigger: poll" within 15 s (`-m slow`).
+  4. A stored config `validate_config` rejects (raw `sqlite3` UPDATE that bumps the generation) → rejected, worker
+     pids unchanged, `rejected=` in the pid file.
+  5. A `--dry-run` daemon stays dry-run after a reload (API `/config` shows `dry_run: true`).
+  6. A CLI write inside the startup window → the daemon comes up on the new generation, with exactly one spawn per
+     worker.
+- **Verify:** `pytest tests/test_zfsbackup_*.py`, and `pytest -m slow -k reload`.
 
 ### Item 21 — Documentation
 
-- **Owner:** **owning developer per surface** — `zfsbackup-store-developer`, `zfsbackup-cli-developer`, `zfsbackup-developer`; main session updates `CLAUDE.md` · **Tag:** `low-risk`
-- **Files:** `zfsbackup/README.md`, `CLAUDE.md`, `zfsbackup/config.example.yaml`
-- **Basis + stale-doc flag:** `CLAUDE.md` documents `zfsbackup/test_basic.py`, which **does not exist**;
-  all zfsbackup tests live in `tests/test_zfsbackup_*.py`. Correct it.
-- **Changes:** document `zfsbackup/config/store/`, the CLI, YAML-or-SQLite config sources, the item-6 path
-  resolution order and the WAL write-permission trap, and the SIGHUP reload contract. Add a header comment
-  to `config.example.yaml` noting it can be imported with `zfsbackup-config import`.
-  **Do not otherwise alter `config.example.yaml` or `config.test.yaml`** — they are user-visible reference
-  files and `tests/test_zfsbackup_real.py:415` reads one.
-- **Verification:** review only.
+- **Owners:** each surface's developer; the main session for `CLAUDE.md` · **Tag:** `low-risk`
+- **`zfsbackup/README.md`:**
+  - the reload contract: two triggers, at most 10 s for unsignalled writes, staggered turnover, indefinite
+    deferral of in-flight transfers, rejection behaviour, `status`;
+  - CLI signalling: Linux-only verification, and the EPERM → poll fallback for group operators;
+  - the files next to the DB, now including `.workers.lock`;
+  - systemd guidance: `ExecReload=/bin/kill -HUP $MAINPID`, **`KillMode=mixed`** (the default `control-group`
+    sends SIGTERM straight to `SIG_DFL` workers and tears a `zfs send`), and how to size `TimeoutStopSec`.
+- **`CLAUDE.md`:** update lines 126-127 and the daemonlock paragraph.
+- **`.claude/agents/zfsbackup-developer.md`:** list `procident.py`, `daemonlock.py`, `stopflag.py` and
+  `runtime_config.py` as owned files.
+- `config.example.yaml` and `config.test.yaml` stay untouched.
 
 ### Item 22 — Shell scenario coverage
 
-- **Owner:** `real-zfs-scenario-dev` · **Tag:** `low-risk`
-- **Files:** new `scenarios/test_config_db.sh`
-- **Basis:** `scenarios/test_pool.sh` and `scenarios/test_two_vm_backup.sh` establish the pattern;
-  `config.example.yaml` targets the pool from `scenarios/create_test_pool.sh`.
-- **Scope:** import `config.example.yaml` into a DB; run
-  `python -m zfsbackup.daemon --test-config -c config.db` and assert it reports the same 5 datasets as the
-  YAML path; exercise `set`/`get`/`export`; **diff exported YAML against the original to prove round-trip
-  fidelity** — this is the end-to-end proof for item 2, and the one place `1M` staying `1M` is verified
-  against a real file rather than a unit test. Then start the daemon, `set` a value, SIGHUP, and assert
-  from the log that workers cycled and picked up the new value (item 18). Non-interactive `EDITOR=/bin/true`
-  plus a `sed`-based stub editor. **Must clean up `-wal`/`-shm` sidecars and the pidfile.**
-- **Verification:** manual run against a test pool; not part of default `pytest`.
+- **Owner:** `real-zfs-scenario-dev` · **Tag:** `low-risk` · **Starts:** after G4
+
+**22.1 — `scenarios/test_config_permissions.sh`, new group (f) "live reload"** (on the `zfsb-perm` VM; the daemon
+runs as `zfsbackup` under its transient unit):
+- **Setup:**
+  - record `multiprocessing.get_start_method()` on the VM;
+  - `reset_default_state` also removes `$DB.workers.lock`;
+  - the `worker_pid` regex accepts `Reloaded`.
+- **(f1) root writes:** root `set check_interval 2m` →
+  - stdout `reload requested from daemon pid $P` plus `accepted|now on`;
+  - log line "accepted … trigger: SIGHUP" within 5 s;
+  - the snapshot, pruning and api worker pids all change; the supervisor pid does not;
+  - the pid file shows `applied=…:$g1` and line 2 == `$g1`.
+- **(f2) group operator (EPERM):** alice `set …` →
+  - stdout `runs as another user and was not signalled; it picks up the change within 10s`, exit 0;
+  - log "accepted … trigger: poll" within 15 s; worker pids change.
+- **(f3) same uid:** user `zfsbackup` writes → signalled.
+- **(f4) forgery:** stop the daemon. A holder (alice) takes `LOCK_EX` on `$PIDFILE` and writes the pid **and
+  correct start token** of a decoy `sleep 600` that root owns and that does not hold the lock. Root `set …` →
+  - the notice says the supervisor is gone or the daemon was not signalled;
+  - the decoy is still alive (`kill -0`).
+- **(f5) rejected config:** a raw `sqlite3` UPDATE makes the stored config invalid and bumps the generation, then
+  `systemctl kill -s HUP --kill-whom=main $UNIT` →
+  - log "rejected";
+  - worker pids unchanged; `rejected=` in the pid file; the unit is still active.
+- **(f6) startup race:** a CLI write during daemon startup (the measured 8/8 case) → the daemon stays up and
+  applies the new generation.
+- **(b) update:** replace "keeps the startup generation after a re-import" and "will not apply this until
+  restarted" with the new outcomes.
+
+**22.2 — `scenarios/test_two_vm_backup.sh`:**
+- Reload the **client** during a large send (e.g. a 2 GiB random file): the transfer completes ("Backup
+  complete"), the remote worker's pid changes only after it, and the deferral WARNING appears if the send takes
+  ≥60 s.
+- Reload the **server** during an inbound receive: the receive completes, and the API worker's pid changes only
+  after it.
+- `kill -9` the client supervisor during a send and start a new daemon at once: the new daemon logs the
+  "waiting" line until the survivor finishes, then starts.
+
+- **Verify:** manual runs; record the pass counts in the Progress table.
 
 ### Item 23 — Final review
 
-- **Owner:** `zfs-code-reviewer` · **Tag:** `low-risk`
-- **Scope:** full diff, with specific attention to: the fork/engine lifecycle (item 5); `Duration`'s
-  reflected comparison and truthiness against every consumer in the item-2 table; transactional guarantees
-  in items 11/12/14; the cooperative-cycling guarantee that no worker is killed mid-stream (item 18); and
-  whether `DatasetConfig.to_property()` (`config/model.py:88-107`) output is genuinely byte-unchanged.
+- **Owner:** `zfs-code-reviewer` + `concurrency-reviewer` · **Tag:** `low-risk`
+- **Scope:** the full Phase 3 diff. In particular:
+  - no `terminate()`/`kill()` anywhere on the reload path;
+  - the CLI can never signal anything but a verified lock holder (forgery, recycled pid, fork orphans);
+  - no fork with a session open; dispose after every read;
+  - turnover vs. A-5 accounting; `--dry-run` persistence;
+  - API drain and `server.shutdown()`;
+  - websocket timeouts cannot hang `zfs send`/`receive`;
+  - the pid-file v2 stays compatible with two-line readers;
+  - the items carried over from the original item 23.
 
 ---
 
