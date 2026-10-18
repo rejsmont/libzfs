@@ -252,6 +252,7 @@ __all__ = [
     "open_config_session",
     "resolve_config_path",
     "resolve_config_url",
+    "require_writer_lock_held",
     "writer_lock",
     "writer_lock_path",
 ]
@@ -1966,6 +1967,49 @@ def writer_lock_path(resolved: ResolvedConfigPath) -> Path:
     """The lock file beside `resolved`'s database. Uses `resolved_path`, so
     two spellings of one database (a symlink, a relative path) share a lock."""
     return Path(str(resolved.resolved_path) + WRITER_LOCK_SUFFIX)
+
+
+def require_writer_lock_held(resolved: ResolvedConfigPath, lock: object) -> None:
+    """Raise `ValueError` unless `lock` is the object `writer_lock(resolved)`
+    yielded AND the calling thread still holds it.
+
+    This is what lets `write_config(..., lock=held)` skip re-acquiring without
+    trusting an arbitrary argument: a `lock=` that is a stale handle (the
+    `with` block already exited), belongs to another database, or was taken by
+    another thread would otherwise turn "I hold the lock" into a silent
+    unlocked write. Checks the lock file's (device, inode) against this
+    thread's held set -- the same key `writer_lock` uses for its re-entry
+    guard -- so two spellings of one database agree. Never blocks and takes
+    nothing.
+    """
+    expected = writer_lock_path(resolved)
+    not_ours = ValueError(
+        f"lock={lock!r} is not the writer lock of {resolved.path} "
+        f"(expected the object `writer_lock(resolved)` yielded, {expected})"
+    )
+    if not isinstance(lock, Path):
+        raise not_ours
+    try:
+        st = os.stat(str(expected))
+    except OSError as exc:
+        raise ValueError(f"the writer lock {expected} cannot be inspected: {exc}") from exc
+    if lock != expected:
+        # A different spelling of the same database (relative vs absolute,
+        # a symlinked directory...) names the same lock file: compare files,
+        # not strings.
+        try:
+            lst = os.stat(str(lock))
+        except OSError:
+            raise not_ours from None
+        if (lst.st_dev, lst.st_ino) != (st.st_dev, st.st_ino):
+            raise not_ours
+    held = getattr(_writer_locks_held, "keys", None) or set()
+    if (st.st_dev, st.st_ino) not in held:
+        raise ValueError(
+            f"this thread does not hold the writer lock {expected} (a handle "
+            "from a `with writer_lock(...)` block that has exited, or from "
+            "another thread); refusing to write unlocked"
+        )
 
 
 def _open_writer_lock_fd(lock: Path, *, default_db: bool) -> int:

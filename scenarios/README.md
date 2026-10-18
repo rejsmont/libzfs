@@ -22,7 +22,7 @@ The mocked/`real_zfs` **pytest** suites live under [`tests/`](../tests/), not he
 ```bash
 # From the repo root
 ./scenarios/setup_test_pool.sh
-pytest -m real_zfs
+ZFSB_REAL_ZFS=1 pytest -m real_zfs   # without the opt-in every real test is skipped
 ./scenarios/cleanup_test_pool.sh
 
 # Two-VM end-to-end harness (needs Multipass on the host)

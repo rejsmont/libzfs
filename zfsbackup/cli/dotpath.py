@@ -62,6 +62,7 @@ import yaml
 
 from zfsbackup.cli.errors import CliError
 from zfsbackup.cli.render import duration_literal, render_yaml
+from zfsbackup.config.store import destination_name_problem  # noqa: F401 - re-exported
 from zfsbackup.config import BackupConfig, DatasetConfig, Duration, RemoteDatasetConfig, RetentionRule
 
 __all__ = [
@@ -71,6 +72,7 @@ __all__ = [
     "compact",
     "destination_name_problem",
     "format_path",
+    "prefix_change_warnings",
     "get_lines",
     "kind_of",
     "parse_dict",
@@ -183,36 +185,6 @@ def _listed(names: Sequence[str]) -> str:
     if len(names) > _MAX_LISTED:
         shown += f", ... ({len(names) - _MAX_LISTED} more)"
     return shown or "(none)"
-
-
-_PROP_CHARS = re.compile(r"[A-Za-z0-9_.:-]+")
-_ANCHOR_PREFIX = "org.zfsbackup:anchor."
-_MAX_PROPERTY_NAME = 256  # ZAP_MAXNAMELEN
-
-
-def destination_name_problem(name: str) -> Optional[str]:
-    """Why `name` cannot be a destination name, or None.
-
-    A destination's name is part of a ZFS user-property name,
-    `org.zfsbackup:anchor.<name>`. OpenZFS accepts ASCII letters, digits and
-    `-` `_` `.` `:` in user-property names (`zprop_valid_char`; the manual
-    recommends lowercase) and at most 256 characters in all. This is the
-    conservative form of that rule; a name outside it cannot hold an anchor.
-    """
-    if not name:
-        return "it is empty"
-    if not _PROP_CHARS.fullmatch(name):
-        bad = sorted({c for c in name if not _PROP_CHARS.fullmatch(c)})
-        return (
-            f"it contains {' '.join(repr(c) for c in bad)}; the name becomes part of the ZFS "
-            f"property {_ANCHOR_PREFIX}<name>, which allows only letters, digits and - _ . :"
-        )
-    if len(_ANCHOR_PREFIX) + len(name) > _MAX_PROPERTY_NAME:
-        return (
-            f"it is too long: {_ANCHOR_PREFIX}<name> may be at most {_MAX_PROPERTY_NAME} "
-            "characters"
-        )
-    return None
 
 
 def _split_word(text: str) -> Tuple[str, str]:
@@ -720,6 +692,23 @@ def _put_rule(mapping: Dict[Any, Any], age: str, keep_for: Any, where: str) -> N
                 del mapping[key]
         except (ValueError, TypeError):
             continue
+    # One rule per keep_for: say which existing rule the new one duplicates,
+    # with both literals, rather than leaving it to the store's check.
+    try:
+        keep_seconds = Duration(keep_for).total_seconds() if isinstance(keep_for, str) else None
+    except ValueError:
+        keep_seconds = None
+    if keep_seconds is not None:
+        for key, value in mapping.items():
+            try:
+                if Duration(value).total_seconds() == keep_seconds:
+                    raise PathError(
+                        f"{where}: duplicate rule: keep_for {keep_for} ({age}: {keep_for}) is "
+                        f"the same duration as the existing rule {key}: {value}; "
+                        "a retention set has one rule per keep_for"
+                    )
+            except (ValueError, TypeError):
+                continue
     mapping[age] = keep_for
 
 
@@ -741,7 +730,20 @@ def _reparse(data: Dict[str, Any], path: str) -> BackupConfig:
     try:
         return parse_dict(data)
     except ValueError as exc:
-        raise PathError(f"{path}: {exc}") from exc
+        message = str(exc)
+        # The model's messages usually name their key already
+        # (`datasets[x].frequency must be ...`): do not say it twice.
+        raise PathError(message if message.startswith(path) else f"{path}: {message}") from exc
+
+
+def prefix_change_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
+    if old.snapshot_prefix == new.snapshot_prefix:
+        return []
+    return [
+        f"snapshot_prefix changes from {old.snapshot_prefix!r} to {new.snapshot_prefix!r}: "
+        f"existing {old.snapshot_prefix}_* snapshots will no longer be managed or pruned "
+        "(they stay until destroyed by hand)"
+    ]
 
 
 def _pruning_starts(old: BackupConfig, new: BackupConfig, segs: Segs) -> List[str]:
@@ -850,6 +852,7 @@ def set_value(config: BackupConfig, segs: Segs, text: str) -> Change:
 
     new = _reparse(data, path)
     warnings.extend(_pruning_starts(config, new, segs))
+    warnings.extend(prefix_change_warnings(config, new))
     if (
         kind == "server_field"
         and segs[1] == "enabled"

@@ -161,7 +161,7 @@ def format_error(exc: BaseException, resolved: Optional[ResolvedConfigPath]) -> 
     if isinstance(exc, ConfigConflict):
         actual = "no configuration" if exc.actual is None else f"generation {exc.actual}"
         return [
-            f"config changed underneath you (generation {exc.expected}, now {actual}); re-run",
+            f"config changed underneath you (generation {exc.expected}, now {actual})",
             "Nothing was written. Re-run the command to start from the current configuration.",
             *getattr(exc, "__notes__", ()),
         ]

@@ -29,7 +29,8 @@ This module reaches the database only through `zfsbackup.config.store`'s
 public API (and `zfsbackup.daemonlock`, which has no daemon imports).
 """
 
-import os
+import shlex
+from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 import click
@@ -52,6 +53,7 @@ __all__ = [
     "notify_daemon",
     "read_snapshot",
     "release_database",
+    "where_flag",
 ]
 
 
@@ -90,6 +92,7 @@ def commit_config(
     *,
     warn: Callable[[str], None] = _echo_warning,
     announce: bool = True,
+    lock: Optional[Path] = None,
 ) -> WriteResult:
     """Validate `config`, then replace the stored configuration with it iff the
     store is still at `snapshot.generation`; then tell the operator about the
@@ -104,8 +107,11 @@ def commit_config(
         warn(message)
     release_database()
     try:
+        # `lock` is a writer lock the caller already holds (`paths.writer_lock`);
+        # `write_config` then reuses it instead of taking it again (the flock
+        # is not re-entrant).
         result = write_config(
-            resolved, config, expected_generation=snapshot.generation
+            resolved, config, expected_generation=snapshot.generation, lock=lock
         )
     finally:
         # Whatever the write opened, nothing may stay pooled: the caller's
@@ -116,28 +122,12 @@ def commit_config(
     return result
 
 
-def _pid_alive(pid: int) -> Optional[bool]:
-    """Is `pid` a live process? `True`/`False`, or `None` when it cannot be
-    told (EPERM means it exists but is not ours: alive)."""
-    for name in ("pid_alive", "is_pid_alive", "pid_is_alive", "process_alive"):
-        helper = getattr(daemonlock, name, None)
-        if callable(helper):
-            try:
-                alive = helper(pid)
-                # Keep "cannot tell" (None) distinct from "gone" (False):
-                # only a definite False may produce the supervisor-gone notice.
-                return None if alive is None else bool(alive)
-            except Exception:  # noqa: BLE001 - fall through to the plain probe
-                break
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return None
-    return True
+def where_flag(resolved) -> str:
+    """` -c <db>` for a command hint, or "" when the database is the default
+    one. The one place that decides how a hint names the database."""
+    if resolved.source == "default":
+        return ""
+    return f" -c {shlex.quote(str(resolved.resolved_path))}"
 
 
 def _daemon_notice(
@@ -155,10 +145,10 @@ def _daemon_notice(
     if info is None:
         return f"{updated}; no running daemon detected for {resolved.resolved_path}", None
     who = f"pid {info.pid}" if info.pid is not None else "(pid unknown)"
-    if info.pid is not None and _pid_alive(info.pid) is False:
+    if info.pid is not None and info.pid_alive is False:
         return (
-            f"{updated}; the daemon's supervisor ({who}) is gone but processes "
-            "it forked still hold the lock; restart the daemon after they exit"
+            f"{updated}; "
+            + daemonlock.stale_supervisor_message(daemonlock.lock_path(resolved), info.pid)
         ), None
     if generation is not None and info.generation == generation:
         return f"{updated}; running daemon {who} is already on generation {generation}", None

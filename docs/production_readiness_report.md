@@ -77,6 +77,11 @@ closing the identical latent gap before it could bite.
   loads retention rules from a base64 property the client wrote (`backup_manager.py:168`),
   and there is no server-side anchor protection, so a misconfigured/malicious client can
   drive deletion of its own server-side history down to the newest snapshot.
+  *(Update 2026-10-18: the pruner now protects every local or received `org.zfsbackup:anchor.*`
+  snapshot. Conversely, because the receive path has no auth and `zfs receive` does not strip
+  user properties, a modified client could send a `-p` stream carrying `anchor.*` properties
+  that pin snapshots on the server indefinitely — no new exposure, since `retention: forever`
+  in the client-supplied config already does the same.)*
 
 ---
 
@@ -85,7 +90,7 @@ closing the identical latent gap before it could bite.
 - No systemd unit / daemonization / PID file; the daemon runs foreground only.
 - Worker auto-restart loops every 5s indefinitely with no backoff cap (`daemon.py`).
 - `--test-config` validates parsing only — not that datasets exist or destinations resolve.
-- Flask's dev server (`app.run`) is used in the `ApiWorker` — not a production WSGI server.
+- Werkzeug's development server (`make_server`) is used in the `ApiWorker` — not a production WSGI server.
 
 **Good:** graceful `SIGINT`/`SIGTERM` shutdown via a shared `StopFlag` (was a `multiprocessing.Event`, which wedged the supervisor whenever a worker died mid-`wait()` — see plan item 8x); anchor-aware retention
 math is correct under the real_zfs tests; dataset-name validation blocks injection.

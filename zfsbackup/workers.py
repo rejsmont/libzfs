@@ -13,20 +13,27 @@ Nothing that owns a SQLite handle may cross the process boundary -- never a
 `Session`, an `Engine`, or an ORM instance -- and the supervisor calls
 `dispose_all()` before each fork so that no inherited descriptor exists
 either. A `BackupConfig` is plain dataclasses, safe on both counts.
+
+A worker also never outlives its supervisor. The stop flag cannot say "the
+supervisor was `kill -9`'d" (nobody is left to raise it), so every worker
+watches for that itself and treats it as a stop; see `_SupervisorWatch`.
 """
 
 import logging
+import multiprocessing
+import os
 import signal
 import sys
 import threading
+import time
 from abc import abstractmethod
 from multiprocessing import Process
 from multiprocessing.synchronize import Event
-from typing import List, Union
+from typing import List, Optional, Union
 
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
 from zfsbackup.config import BackupConfig
-from zfsbackup.stopflag import StopFlag
+from zfsbackup.stopflag import STOP_POLL, StopFlag
 
 #: What a worker accepts as its stop signal.
 #:
@@ -134,7 +141,132 @@ def _init_child_process(verbose: bool = False) -> None:
     _setup_logging(verbose)
 
 
-class BaseWorker(Process):
+def _pid_exists(pid: int) -> bool:
+    """`kill(pid, 0)`. `EPERM` means the process exists; any other error is
+    taken as "cannot tell", i.e. alive -- this check may only ever err towards
+    *not* declaring the supervisor gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+class _SupervisorWatch:
+    """Lets a worker notice that its supervisor died, and treat that as a stop.
+
+    Without it a `kill -9`'d supervisor leaves its workers running forever on
+    a frozen config: under `fork` they still hold the inherited presence lock
+    (the daemon looks alive but nothing supervises it); under `spawn` and
+    `forkserver` they hold no lock, so a second daemon can start beside them
+    and the pair double-snapshot and double-prune. The stop flag cannot help:
+    only the (dead) supervisor ever raises it.
+
+    **What is compared, per start method.** The supervisor's pid is recorded
+    in the worker's constructor, which runs in the supervisor
+    (`self.supervisor_pid = os.getpid()`). Under `run()` the worker captures
+    `os.getppid()` as the first thing after `_init_child_process` and later
+    treats any of these as "supervisor gone":
+
+    * `os.getppid()` differs from the value captured at start. A child that
+      loses its parent is reparented (to init, or to a subreaper), on every
+      platform and start method, and that is detectable without any
+      cooperation from the dead process;
+    * the captured parent is not the recorded supervisor pid, *except* under
+      `forkserver`. Under `fork` and `spawn` the supervisor is the worker's
+      direct parent, so any other parent at start means the supervisor had
+      already died (and been reparented away) before the worker's first
+      instruction -- a state `getppid()` can never report as "changed". Under
+      `forkserver` the direct parent is the forkserver process, not the
+      supervisor, so this comparison is meaningless there and is skipped. The
+      forkserver itself exits when the supervisor does (it watches a pipe the
+      supervisor holds), which reparents its children and trips the first rule;
+    * `kill(supervisor_pid, 0)` says the pid no longer exists (covers the
+      forkserver-before-reparent race). A zombie supervisor still answers
+      this, which is why the reparent rule above is the primary one.
+
+    In a process that is not a child of the constructing one -- a unit test
+    calling `run()` inline, where `os.getpid() == supervisor_pid` -- the watch
+    is never armed and never fires.
+
+    **Checked only at safe points** (loop top, between datasets, inside the
+    sliced wait): never mid-transfer. A worker in the middle of a `zfs send`
+    finishes its current dataset first, exactly as for a stop request.
+    `prctl(PR_SET_PDEATHSIG)` was considered and deliberately not used: its
+    signal would be delivered at an arbitrary instruction -- with `SIG_DFL`,
+    tearing a stream in half, the one thing the stop protocol exists to avoid
+    -- it is Linux-only so the macOS behaviour would differ and could not be
+    exercised here, it fires on the death of the parent *thread* that forked
+    (not the process), and it still needs the `getppid()` re-check for the
+    window before it is armed. Polling gives one portable behaviour with
+    safe-point semantics; the cost is detection latency of up to one
+    `stopflag.STOP_POLL` slice while idle.
+    """
+
+    def _watch_init(self) -> None:
+        #: Constructors run in the supervisor, so this is its pid. Not a
+        #: constructor parameter: the worker signatures are pinned to
+        #: `(config, stop_event, verbose)`.
+        self.supervisor_pid = os.getpid()
+        self._parent_at_start: Optional[int] = None
+        self._direct_child = True
+        self._supervisor_gone_logged = False
+
+    def _arm_supervisor_watch(self) -> None:
+        """Call first in `run()`, straight after `_init_child_process`."""
+        parent = os.getppid()
+        if os.getpid() == self.supervisor_pid:
+            return  # inline in the constructing process: nothing to watch
+        self._parent_at_start = parent
+        self._direct_child = (
+            multiprocessing.get_start_method(allow_none=True) != 'forkserver'
+        )
+
+    def _supervisor_gone(self) -> bool:
+        if self._parent_at_start is None:
+            return False
+        reason = None
+        ppid = os.getppid()
+        if ppid != self._parent_at_start:
+            reason = f"parent changed from {self._parent_at_start} to {ppid}"
+        elif self._direct_child and ppid != self.supervisor_pid:
+            reason = f"parent at start was {ppid}, not the supervisor"
+        elif not _pid_exists(self.supervisor_pid):
+            reason = "no such process"
+        if reason is None:
+            return False
+        if not self._supervisor_gone_logged:
+            self._supervisor_gone_logged = True
+            logging.getLogger(__name__).error(
+                f"supervisor {self.supervisor_pid} is gone ({reason}); exiting"
+            )
+        return True
+
+    def _should_stop(self) -> bool:
+        """The stop flag is raised, or the supervisor is gone."""
+        return self.stop_event.is_set() or self._supervisor_gone()
+
+    def _wait(self, timeout: float) -> bool:
+        """Sleep up to `timeout` seconds in `STOP_POLL` slices; -> whether the
+        worker should stop. Each slice re-checks the supervisor, so a dead one
+        is noticed within one slice rather than after a whole cycle interval
+        (minutes to hours). Like `StopFlag.wait`, a zero, negative or NaN
+        timeout returns the current state without sleeping."""
+        if not (timeout > 0):
+            return self._should_stop()
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._should_stop():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.stop_event.wait(timeout=min(STOP_POLL, remaining))
+
+
+class BaseWorker(_SupervisorWatch, Process):
     """Base class for daemon worker processes with a shared polling loop."""
 
     def __init__(
@@ -146,11 +278,13 @@ class BaseWorker(Process):
     ):
         """`config` is the supervisor's detached `BackupConfig`, with
         `--dry-run` already applied. It is used as is; the worker never
-        reads the config database."""
+        reads the config database. The constructing process is the
+        supervisor, and its pid is recorded here (see `_SupervisorWatch`)."""
         super().__init__(name=worker_name, daemon=True)
         self.config = config
         self.stop_event = stop_event
         self.verbose = verbose
+        self._watch_init()
 
     @abstractmethod
     def _get_interval(self, config: BackupConfig) -> float:
@@ -169,6 +303,7 @@ class BaseWorker(Process):
 
     def run(self) -> None:
         _init_child_process(self.verbose)
+        self._arm_supervisor_watch()
         logger = logging.getLogger(__name__)
         logger.info(f"{self.name} started")
 
@@ -183,16 +318,18 @@ class BaseWorker(Process):
             interval = MIN_WORKER_INTERVAL
         self._before_loop(config, manager)
 
-        while not self.stop_event.is_set():
+        # `_should_stop` = stop flag raised OR supervisor gone, checked at
+        # every safe point: here, between datasets, and in each `_wait` slice.
+        while not self._should_stop():
             logger.debug(f"{self.name} cycle")
             for dsi in self._get_datasets(manager):
-                if self.stop_event.is_set():
+                if self._should_stop():
                     break
                 try:
                     self._process_dataset(manager, dsi)
                 except Exception as e:
                     logger.error(f"{self.name} error on {dsi.name}: {e}", exc_info=True)
-            self.stop_event.wait(timeout=interval)
+            self._wait(interval)
 
         logger.info(f"{self.name} stopped")
 
@@ -281,7 +418,39 @@ class RemoteBackupWorker(BaseWorker):
             self._remote_manager.backup_dataset(dsi, remote_cfg)
 
 
-class ApiWorker(Process):
+def _bind_api_server(app, host: str, port: int):
+    """Create the HTTP server **and bind its listening socket**, here, in the
+    caller's thread. Raises `OSError` (EADDRINUSE, EACCES, bad host...) if it
+    cannot. Werkzeug's `make_server` binds and listens in the constructor, so
+    a returned server is already accepting connections into its backlog.
+    Werkzeug itself turns EADDRINUSE/EADDRNOTAVAIL into a printed message plus
+    `sys.exit(1)`; that `SystemExit` is converted back into an `OSError` here
+    so the caller logs one clear "cannot listen" line for every bind failure.
+
+    This replaces `app.run()` in a thread, which bound inside the thread: a
+    failed bind killed only that thread, leaving a worker process that was
+    alive, logged "API listening", and served nothing -- so the supervisor's
+    restart/backoff never applied. It also skips `Flask.run`'s extras that a
+    daemon does not want (`.env` loading, the Werkzeug debugger under
+    `FLASK_DEBUG`). A seam so tests need not open real sockets.
+    """
+    from werkzeug.serving import make_server
+    try:
+        return make_server(host, port, app, threaded=True)
+    except SystemExit as exc:
+        raise OSError(f"cannot bind {host}:{port} (address in use or not available)") from exc
+
+
+def _serve(server, logger) -> None:
+    """Thread body: serve until the process exits. A crash is logged here and
+    is noticed by `ApiWorker.run`'s wait loop via `Thread.is_alive`."""
+    try:
+        server.serve_forever()
+    except Exception:
+        logger.error("API server thread died", exc_info=True)
+
+
+class ApiWorker(_SupervisorWatch, Process):
     """Worker that serves a read-only HTTP API for configuration and snapshot inspection."""
 
     def __init__(
@@ -296,9 +465,15 @@ class ApiWorker(Process):
         self.config = config
         self.stop_event = stop_event
         self.verbose = verbose
+        self._watch_init()
 
     def run(self) -> None:
+        """Serve until stopped. Exits with status 1 -- so the supervisor's
+        crash backoff and restart apply -- if the listening socket cannot be
+        bound or the server thread dies; a worker that is alive but serving
+        nothing is the one outcome that must not happen."""
         _init_child_process(self.verbose)
+        self._arm_supervisor_watch()
         logger = logging.getLogger(__name__)
         logger.info("API worker started")
 
@@ -309,13 +484,23 @@ class ApiWorker(Process):
         from zfsbackup.api import create_app
         app = create_app(config)
 
-        thread = threading.Thread(
-            target=app.run,
-            kwargs={'host': config.api_host, 'port': config.api_port, 'use_reloader': False},
-            daemon=True,
-        )
+        try:
+            server = _bind_api_server(app, config.api_host, config.api_port)
+        except OSError as e:
+            logger.error(
+                f"API worker cannot listen on {config.api_host}:{config.api_port}: {e}"
+            )
+            sys.exit(1)
+
+        thread = threading.Thread(target=_serve, args=(server, logger), daemon=True)
         thread.start()
         logger.info(f"API listening on {config.api_host}:{config.api_port}")
 
-        self.stop_event.wait()
+        # Sliced wait: wakes every `STOP_POLL` to check the stop flag, the
+        # supervisor, and that the server thread is still alive.
+        while not self._should_stop():
+            if not thread.is_alive():
+                logger.error("API server thread exited unexpectedly; exiting")
+                sys.exit(1)
+            self.stop_event.wait(timeout=STOP_POLL)
         logger.info("API worker stopped")

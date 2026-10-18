@@ -53,10 +53,12 @@ remote lists not renamed 13; libzfseasy debug not silenced 4; eager
 `backup_manager` import 8.
 """
 
+import contextlib
 import errno
 import fcntl
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -141,6 +143,27 @@ def race(monkeypatch, database, *, module=rename):
     return done
 
 
+def move_generation_before_the_lock(monkeypatch, database):
+    """Between "the snapshot was read" and "the writer lock is taken", another
+    writer commits (it takes and releases the lock itself)."""
+    real = rename.writer_lock
+    done = []
+
+    @contextlib.contextmanager
+    def racing(resolved, *args, **kwargs):
+        current = read_config(resolve_config_path(str(database)))
+        current.config.api_port = 9999
+        write_config(resolve_config_path(str(database)), current.config,
+                     expected_generation=current.generation)
+        dispose_all()
+        done.append(True)
+        with real(resolved, *args, **kwargs) as held:
+            yield held
+
+    monkeypatch.setattr(rename, "writer_lock", racing)
+    return done
+
+
 class TestRenameDataset:
     def test_a_dataset_without_remotes_is_renamed_without_force(self, run, rich, fake_zfs):
         gen = generation(rich)
@@ -220,11 +243,42 @@ class TestRenameDataset:
         assert len(stale) == 1
         assert CONFIG_PROP in stale[0] and ANCHOR + "offsite" in stale[0]
         assert "compression" not in stale[0]  # only our properties
-        assert "--clear-stale-props removes them when no daemon is running" in stale[0]
-        assert "zfs rename" not in stale[0]
+        assert "become stale" in stale[0] and "zfs rename" not in stale[0]
         # reported, not touched
         assert fake_zfs.mutations == []
         assert fake_zfs.props("tank/vm.01")[ANCHOR + "offsite"] == "snap1"
+
+    def test_the_commands_to_remove_them_are_printed_after_the_rename(self, run, rich, fake_zfs):
+        # re-running with --clear-stale-props is impossible (OLD is no longer a configured
+        # dataset), so the exact commands are given
+        fake_zfs.add("tank/vm.01", {CONFIG_PROP: "cfg", ANCHOR + "offsite": "snap1", "compression": "lz4"})
+        fake_zfs.add("tank/vm.02", {})
+        out = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich).stdout
+        assert "The stale properties on 'tank/vm.01' were left in place. To remove them, once no daemon is running:" in out
+        assert f"zfs inherit {ANCHOR}offsite tank/vm.01" in out and f"zfs inherit {CONFIG_PROP} tank/vm.01" in out
+        assert "compression" not in out
+
+    def test_no_commands_when_the_properties_will_follow_a_zfs_rename(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/vm.01", {CONFIG_PROP: "cfg"})          # NEW does not exist yet
+        out = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich).stdout
+        assert "zfs inherit" not in out and "left in place" not in out
+
+    def test_no_commands_when_the_properties_were_cleared(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/vm.01", {CONFIG_PROP: "cfg"})
+        fake_zfs.add("tank/vm.02", {})
+        out = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "--clear-stale-props", "-c", rich).stdout
+        assert "left in place" not in out and "Cleared on 'tank/vm.01'" in out
+
+    def test_no_commands_when_there_is_nothing_stale(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/vm.01", {"compression": "lz4"})
+        fake_zfs.add("tank/vm.02", {})
+        assert "zfs inherit" not in run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich).stdout
+
+    def test_no_commands_in_a_dry_run(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/vm.01", {CONFIG_PROP: "cfg"})
+        fake_zfs.add("tank/vm.02", {})
+        out = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-d", "-c", rich).stdout
+        assert "zfs inherit" not in out and fake_zfs.mutations == []
 
     def test_when_new_does_not_exist_the_warning_says_the_properties_follow_a_zfs_rename(
         self, run, rich, fake_zfs
@@ -612,6 +666,7 @@ class TestRenameDatasetClearStale:
 
     @pytest.mark.integration
     @pytest.mark.parametrize("pid_file", ["missing", "stale"])
+    @pytest.mark.slow
     def test_a_daemon_can_start_while_the_inherits_run(self, run, rich, stale, tmp_path, pid_file):
         """Across processes: a daemon's exclusive lock succeeds in the middle of a
         slow `zfs inherit`, loads the NEW configuration, and the CLI still
@@ -960,7 +1015,7 @@ class TestRenameDestination:
 
     # -- failures while copying -------------------------------------------
 
-    def test_a_partial_copy_failure_aborts_before_the_write(self, run, rich, anchors):
+    def test_a_partial_copy_failure_aborts_before_the_write_with_the_restore_commands(self, run, rich, anchors):
         anchors.fail("set", "tank/other")
         state = db_state(rich)
         result = self.rename(run, rich)
@@ -968,17 +1023,47 @@ class TestRenameDestination:
         err = result.stderr
         assert "on 'tank/other' failed" in err
         assert "Nothing was written to the configuration" in err
-        assert "Already copied (re-running refreshes them): tank/data" in err
+        # tank/data got a NEW anchor.offsite2 (it had none): putting it back = inherit
+        assert "To put the previous values back run:" in err
+        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err
+        assert "tank/other" not in err.split("To put the previous values back run:")[1]
+        assert "Already copied" not in err
         assert db_state(rich) == state
         assert anchors.props("tank/data")[ANCHOR + "offsite2"] == "snapA"   # the copy that landed
         assert ANCHOR + "offsite2" not in anchors.props("tank/other")
         assert "offsite" in stored(rich).destinations
 
-    def test_a_first_copy_failure_names_nothing_as_copied(self, run, rich, anchors):
+    def test_the_restore_command_for_an_overwritten_value_sets_the_old_one_back(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {ANCHOR + "offsite": "newer", ANCHOR + "offsite2": "older"})
+        fake_zfs.add("tank/other", {ANCHOR + "offsite": "snapC"})
+        fake_zfs.fail("set", "tank/other")
+        err = self.rename(run, rich).stderr
+        assert f"  zfs set {ANCHOR}offsite2=older tank/data" in err
+        assert "zfs inherit" not in err.split("To put the previous values back run:")[1]
+        assert fake_zfs.props("tank/data")[ANCHOR + "offsite2"] == "newer"   # the overwrite did land
+
+    def test_the_restore_commands_really_restore(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {ANCHOR + "offsite": "newer", ANCHOR + "offsite2": "older"})
+        fake_zfs.add("tank/other", {ANCHOR + "offsite": "snapC"})
+        fake_zfs.add("tank/third", {})
+        fake_zfs.fail("set", "tank/other")
+        err = self.rename(run, rich).stderr
+        commands = [
+            line.strip() for line in err.split("To put the previous values back run:")[1].splitlines()
+            if line.strip().startswith("zfs ")
+        ]
+        assert commands == [f"zfs set {ANCHOR}offsite2=older tank/data"]
+        # run them, as the operator would, against the fake
+        for command in commands:
+            subprocess.run([str(fake_zfs.wrapper), *shlex.split(command)[1:]], check=True, env=dict(os.environ))
+        assert fake_zfs.props("tank/data")[ANCHOR + "offsite2"] == "older"
+
+    def test_a_first_copy_failure_has_nothing_to_restore(self, run, rich, anchors):
         anchors.fail("set", "tank/data")
         result = self.rename(run, rich)
         assert result.exit_code == 1
-        assert "on 'tank/data' failed" in result.stderr and "Already copied" not in result.stderr
+        assert "on 'tank/data' failed" in result.stderr
+        assert "To put the previous values back" not in result.stderr and "zfs inherit" not in result.stderr
 
     def test_a_retry_after_a_partial_failure_completes_and_refreshes(self, run, rich, anchors, monkeypatch):
         anchors.fail("set", "tank/other")
@@ -989,7 +1074,7 @@ class TestRenameDestination:
         assert "tank/data: anchor.offsite2 is already current (snapA)" in result.stdout
         assert "tank/other: anchor.offsite2 set to snapC (copied from anchor.offsite)" in result.stdout
 
-    def test_an_interrupt_mid_copy_lists_the_copies_made(self, run, rich, anchors, monkeypatch):
+    def test_an_interrupt_mid_copy_lists_the_restore_commands(self, run, rich, anchors, monkeypatch):
         import zfsbackup.backup_manager as bm
 
         real = bm.copy_anchor_property
@@ -1007,13 +1092,14 @@ class TestRenameDestination:
         assert result.exit_code == 130
         err = result.stderr
         assert "interrupted" in err
-        assert "interrupted while copying org.zfsbackup:anchor.offsite to anchor.offsite2" in err
-        assert "already copied (re-running refreshes them): tank/data" in err
-        assert "the copy on 'tank/other' may or may not have completed" in err
+        assert "interrupted while copying org.zfsbackup:anchor.offsite to anchor.offsite2 on 'tank/other'" in err
         assert "Nothing was written to the configuration" in err
+        # the finished copy AND the one in flight (which may or may not have landed)
+        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err
+        assert f"  zfs inherit {ANCHOR}offsite2 tank/other" in err
         assert db_state(rich) == state
 
-    def test_an_interrupt_on_the_first_copy_says_none_were_copied(self, run, rich, anchors, monkeypatch):
+    def test_an_interrupt_on_the_first_copy_restores_only_the_one_in_flight(self, run, rich, anchors, monkeypatch):
         import zfsbackup.backup_manager as bm
 
         def interrupting(ds, *args, **kwargs):
@@ -1021,9 +1107,8 @@ class TestRenameDestination:
 
         monkeypatch.setattr(bm, "copy_anchor_property", interrupting)
         err = self.rename(run, rich).stderr
-        assert "already copied (re-running refreshes them): none" in err
-
-    # -- datasets that are not in ZFS -------------------------------------
+        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err
+        assert "tank/other" not in err.split("To put the previous values back run:")[1]
 
     def test_a_dataset_missing_from_zfs_aborts_before_anything_is_copied(self, run, rich, fake_zfs):
         fake_zfs.add("tank/data", {ANCHOR + "offsite": "snapA"})        # tank/other does not exist
@@ -1110,17 +1195,96 @@ class TestRenameDestination:
         assert "[dry run] tank/other: anchor.offsite2 is already current (same)" in result.stdout
         assert fake_zfs.mutations == []
 
-    def test_a_conflict_after_the_copy_is_75_with_a_note_that_rerunning_is_safe(self, run, rich, anchors, monkeypatch):
-        race(monkeypatch, rich)
+    def test_a_generation_that_moved_before_the_copy_is_75_and_zfs_is_untouched(
+        self, run, rich, anchors, monkeypatch
+    ):
+        done = move_generation_before_the_lock(monkeypatch, rich)
+        result = self.rename(run, rich)
+        assert done == [True]
+        assert result.exit_code == 75, result.stderr
+        assert "config changed underneath you" in result.stderr
+        assert anchors.mutations == []                   # no zfs set, no zfs inherit
+        assert ANCHOR + "offsite2" not in anchors.props("tank/data")
+        assert "offsite" in stored(rich).destinations and "offsite2" not in stored(rich).destinations
+        assert "To put the previous values back" not in result.stderr  # nothing to put back
+
+    def test_a_commit_that_fails_after_the_copy_is_75_with_the_exact_restore_commands(
+        self, run, rich, fake_zfs, monkeypatch
+    ):
+        fake_zfs.add("tank/data", {ANCHOR + "offsite": "newer", ANCHOR + "offsite2": "older"})
+        fake_zfs.add("tank/other", {ANCHOR + "offsite": "snapC"})
+
+        def busy(*args, **kwargs):
+            raise ConfigBusy("database is locked by another process")
+
+        monkeypatch.setattr(rename, "commit_config", busy)
         result = self.rename(run, rich)
         assert result.exit_code == 75
-        assert "The anchor.offsite2 values already written are harmless" in result.stderr
-        assert "Re-running the rename is safe: it copies anchor.offsite again, refreshing them." in result.stderr
-        assert "offsite" in stored(rich).destinations and "offsite2" not in stored(rich).destinations
+        err = result.stderr
+        assert "database is locked by another process" in err
+        assert "To put the previous values back run:" in err
+        assert f"  zfs set {ANCHOR}offsite2=older tank/data" in err        # was overwritten
+        assert f"  zfs inherit {ANCHOR}offsite2 tank/other" in err         # was absent
+        assert "offsite2" not in stored(rich).destinations
 
-    def test_rerunning_after_a_conflict_refreshes_the_copies(self, run, rich, anchors, monkeypatch):
+    def test_a_conflict_raised_by_the_commit_is_75_with_the_restore_commands(
+        self, run, rich, anchors, monkeypatch
+    ):
+        def conflict(*args, **kwargs):
+            raise ConfigConflict(0, 1)
+
+        monkeypatch.setattr(rename, "commit_config", conflict)
+        result = self.rename(run, rich)
+        assert result.exit_code == 75
+        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in result.stderr
+        assert f"  zfs inherit {ANCHOR}offsite2 tank/other" in result.stderr
+
+    def test_the_commit_gets_the_held_writer_lock(self, run, rich, anchors, monkeypatch):
+        seen = {}
+        real = rename.commit_config
+
+        def spy(resolved, snapshot, config, **kwargs):
+            seen["lock"] = kwargs.get("lock")
+            return real(resolved, snapshot, config, **kwargs)
+
+        monkeypatch.setattr(rename, "commit_config", spy)
+        assert self.rename(run, rich).exit_code == 0
+        from zfsbackup.config.store import writer_lock_path
+
+        assert seen["lock"] == writer_lock_path(resolve_config_path(str(rich)))
+
+    def test_a_destination_nobody_uses_commits_without_a_held_lock(self, run, rich, monkeypatch):
+        seen = {}
+        real = rename.commit_config
+
+        def spy(resolved, snapshot, config, **kwargs):
+            seen["lock"] = kwargs.get("lock")
+            return real(resolved, snapshot, config, **kwargs)
+
+        monkeypatch.setattr(rename, "commit_config", spy)
+        assert run("rename", "destination", "spare", "spare2", "-c", rich).exit_code == 0
+        assert seen["lock"] is None
+
+    def test_the_writer_lock_is_released_afterwards(self, run, rich, anchors):
+        assert self.rename(run, rich).exit_code == 0
+        assert run("set", "check_interval", "10m", "-c", rich).exit_code == 0
+
+    def test_the_writer_lock_is_released_after_a_failure(self, run, rich, anchors, monkeypatch):
+        def conflict(*args, **kwargs):
+            raise ConfigConflict(0, 1)
+
+        monkeypatch.setattr(rename, "commit_config", conflict)
+        assert self.rename(run, rich).exit_code == 75
+        monkeypatch.undo()
+        assert run("set", "check_interval", "10m", "-c", rich).exit_code == 0
+
+    def test_rerunning_after_a_refused_commit_refreshes_the_copies(self, run, rich, anchors, monkeypatch):
         real_commit = rename.commit_config
-        race(monkeypatch, rich)
+
+        def busy(*args, **kwargs):
+            raise ConfigBusy("busy")
+
+        monkeypatch.setattr(rename, "commit_config", busy)
         assert self.rename(run, rich).exit_code == 75
         monkeypatch.setattr(rename, "commit_config", real_commit)
         assert anchors.props("tank/data")[ANCHOR + "offsite2"] == "snapA"
@@ -1515,7 +1679,7 @@ class TestInterruptAfterTheWrite:
         result = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich)
         assert result.exit_code == 130
         err = result.stderr
-        assert "the rename of dataset 'tank/vm.01' was applied; run `zfsbackup-config export` to see the configuration" in err
+        assert f"the rename of dataset 'tank/vm.01' was applied; run `zfsbackup-config -c {rich} export` to see the configuration" in err
         assert "may or may not" not in err and "zfs inherit" not in err
         assert "tank/vm.02" in names(rich)  # it really was applied
 
@@ -1559,7 +1723,7 @@ class TestInterruptAfterTheWrite:
         self.interrupt(monkeypatch)
         result = run("rename", "destination", "spare", "spare2", "-c", rich)
         assert result.exit_code == 130
-        assert "the rename of destination 'spare' was applied; run `zfsbackup-config export`" in result.stderr
+        assert f"the rename of destination 'spare' was applied; run `zfsbackup-config -c {rich} export`" in result.stderr
         assert "zfs inherit" not in result.stderr
         assert "spare2" in stored(rich).destinations
 
@@ -1586,3 +1750,99 @@ class TestInterruptAfterTheWrite:
         result = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "--clear-stale-props", "-c", rich)
         assert result.exit_code == 1
         assert "was applied" not in result.stderr and "NOT cleared" in result.stderr
+
+
+class TestRenameDestinationHoldsTheWriterLock:
+    """`rename destination` takes the writer lock BEFORE it touches ZFS and holds
+    it until the write: nobody else can write in between, so a copy never runs
+    against a configuration that has since changed."""
+
+    @pytest.mark.integration
+    @pytest.mark.slow
+    def test_a_concurrent_set_is_blocked_for_the_whole_copy_and_then_conflicts(self, run, rich, fake_zfs, tmp_path):
+        fake_zfs.add("tank/data", {ANCHOR + "offsite": "snapA"})
+        fake_zfs.add("tank/other", {ANCHOR + "offsite": "snapC"})
+        marker = tmp_path / "set.marker"
+        env = dict(os.environ, PYTHONPATH=REPO, FAKEZFS_SLOW_SET="1.5", FAKEZFS_MARKER=str(marker))
+        renamer = subprocess.Popen(
+            [sys.executable, "-m", "zfsbackup.cli", "-c", str(rich), "rename", "destination", "offsite", "offsite2"],
+            env=env, cwd=str(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        other = None
+        try:
+            deadline = time.monotonic() + 30
+            while not marker.exists():                      # the first zfs set is running
+                assert renamer.poll() is None, renamer.communicate()
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+            started = time.monotonic()
+            other = subprocess.run(
+                [sys.executable, "-m", "zfsbackup.cli", "-c", str(rich), "set", "check_interval", "10m"],
+                env=dict(os.environ, PYTHONPATH=REPO), cwd=str(tmp_path),
+                capture_output=True, text=True, timeout=60,
+            )
+            waited = time.monotonic() - started
+            out, err = renamer.communicate(timeout=60)
+        finally:
+            if renamer.poll() is None:
+                renamer.kill()
+                renamer.communicate()
+        assert renamer.returncode == 0, err
+        # blocked for (most of) the rest of the two slow copies, then lost the compare-and-swap
+        assert other.returncode == 75, other.stdout + other.stderr
+        assert "config changed underneath you" in other.stderr
+        assert waited >= 1.0, waited
+        config = stored(rich)
+        assert "offsite2" in config.destinations and config.check_interval.literal == "5m"
+
+    def test_the_lock_is_taken_before_the_first_zfs_set(self, run, rich, fake_zfs, monkeypatch):
+        fake_zfs.add("tank/data", {ANCHOR + "offsite": "snapA"})
+        fake_zfs.add("tank/other", {ANCHOR + "offsite": "snapC"})
+        from zfsbackup.config.store import writer_lock_path
+
+        lock_path = writer_lock_path(resolve_config_path(str(rich)))
+        probes = []
+        import zfsbackup.backup_manager as bm
+
+        real = bm.copy_anchor_property
+
+        def probing(*args, **kwargs):
+            probes.append(_try_exclusive_lock(lock_path))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(bm, "copy_anchor_property", probing)
+        assert run("rename", "destination", "offsite", "offsite2", "-c", rich).exit_code == 0
+        assert probes == ["blocked", "blocked"]          # held during every copy
+        assert _try_exclusive_lock(lock_path) == "acquired"   # and released afterwards
+
+    def test_no_database_connection_is_open_during_the_zfs_calls(self, run, rich, fake_zfs, monkeypatch):
+        fake_zfs.add("tank/data", {ANCHOR + "offsite": "snapA"})
+        fake_zfs.add("tank/other", {ANCHOR + "offsite": "snapC"})
+        import zfsbackup.backup_manager as bm
+
+        real = bm.copy_anchor_property
+        sidecars = []
+
+        def probing(*args, **kwargs):
+            sidecars.append(sorted(p.name for p in rich.parent.iterdir() if p.name.endswith(("-wal", "-shm"))))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(bm, "copy_anchor_property", probing)
+        run("rename", "destination", "offsite", "offsite2", "-c", rich)
+        assert sidecars == [[], []]
+
+    def test_a_dry_run_takes_no_lock_and_no_generation_check(self, run, rich, fake_zfs, monkeypatch):
+        fake_zfs.add("tank/data", {ANCHOR + "offsite": "snapA"})
+        fake_zfs.add("tank/other", {})
+        monkeypatch.setattr(rename, "writer_lock", lambda *a, **k: pytest.fail("a dry run takes no lock"))
+        assert run("rename", "destination", "offsite", "offsite2", "-d", "-c", rich).exit_code == 0
+
+    def test_require_generation_reads_the_stored_generation(self, run, rich):
+        snapshot = read_config(resolve_config_path(str(rich)))
+        dispose_all()
+        resolved = resolve_config_path(str(rich))
+        rename._require_generation(resolved, snapshot)             # unchanged: fine
+        run("set", "check_interval", "10m", "-c", rich)
+        with pytest.raises(ConfigConflict) as excinfo:
+            rename._require_generation(resolved, snapshot)
+        assert (excinfo.value.expected, excinfo.value.actual) == (snapshot.generation, snapshot.generation + 1)

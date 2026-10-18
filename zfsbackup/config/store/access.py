@@ -43,11 +43,18 @@ produced `config` may be minutes old (an operator in `$EDITOR`) and a newer
 zfsbackup can have migrated the file since. "database is locked" after
 `busy_timeout`, and a writer lock that stays held, both surface as
 `ConfigBusy`; a stale `expected_generation` as `ConfigConflict`.
+
+A multi-step edit holds the writer lock across its side effects with
+`with writer_lock(resolved) as held: gen = read_generation(resolved); ...;
+write_config(resolved, cfg, expected_generation=gen, lock=held)`; see
+`write_config` for the exact contract.
 """
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 from sqlalchemy import text
@@ -68,10 +75,17 @@ from zfsbackup.config.store.paths import (
     ResolvedConfigPath,
     open_config_connection,
     open_config_session,
+    require_writer_lock_held,
     writer_lock,
 )
 
-__all__ = ["WriteResult", "check_config_schema", "read_config", "write_config"]
+__all__ = [
+    "WriteResult",
+    "check_config_schema",
+    "read_config",
+    "read_generation",
+    "write_config",
+]
 
 _LOCKED_MARKERS = ("database is locked", "database table is locked")
 
@@ -136,6 +150,49 @@ def read_config(resolved: ResolvedConfigPath) -> ConfigSnapshot:
         return snapshot
 
 
+def read_generation(resolved: ResolvedConfigPath) -> int:
+    """The stored `GlobalSettings.generation`, and nothing else.
+
+    One read-only connection: `BEGIN`, a single `SELECT generation`, `COMMIT`,
+    close -- no config load, NO schema check (a caller that needs one has
+    `read_config` / `check_config_schema`; `write_config` re-checks the schema
+    under its own lock anyway), nothing left open (no transaction, no WAL read
+    mark; the cached reader engine's pooled connection stays, as for
+    `read_config`, and `write_config`'s `dispose_all()` drops it).
+
+    Its job is the multi-step edit: under `writer_lock(resolved)` no other
+    zfsbackup-config writer can move the generation, so a value read here is
+    the one `write_config(..., lock=held)` will compare against. See
+    `write_config` for the full sequence.
+
+    Raises `ConfigPathError` (preflight), `ValueError` (the store holds no
+    `GlobalSettings` row, i.e. is uninitialised -- the same condition
+    `load_config` reports) and `sqlalchemy.exc.OperationalError` /
+    `DatabaseError` for storage failures (an unmigrated database lacking the
+    table is one of those; run `read_config` or `check_config_schema` first
+    when that distinction matters).
+    """
+    with open_config_connection(resolved, readonly=True) as connection:
+        connection.execute(text("BEGIN"))
+        try:
+            row = connection.execute(
+                text("SELECT generation FROM global_settings WHERE id = 1")
+            ).fetchone()
+        except BaseException:
+            try:
+                connection.execute(text("ROLLBACK"))
+            except Exception:  # pragma: no cover - never mask the original
+                pass
+            raise
+        connection.execute(text("COMMIT"))
+    if row is None:
+        raise ValueError(
+            "config store is uninitialized: no GlobalSettings row (id=1) "
+            "-- was it created by import?"
+        )
+    return int(row[0])
+
+
 @dataclass(frozen=True)
 class WriteResult:
     """What a successful `write_config` reports.
@@ -164,6 +221,7 @@ def write_config(
     *,
     expected_generation: Optional[int],
     lock_timeout: float = DEFAULT_WRITER_LOCK_TIMEOUT,
+    lock: Optional[Path] = None,
 ) -> WriteResult:
     """Replace the stored configuration with `config`, if the store is still
     at `expected_generation`. See this module's docstring for the sequence.
@@ -176,10 +234,46 @@ def write_config(
     preflight (`ConfigDbNotFound` / `ConfigDbNotADatabase`) before the writer
     lock file is even created. Never returns or holds a session.
 
-    Raises `ValueError` (invalid `config`; nothing opened), `ConfigPathError`
-    / `SchemaError` (unusable database), `ConfigConflict` (the generation moved
-    on; nothing written), `ConfigBusy` (writer lock or SQLite lock not
-    obtained in time; nothing written; safe to retry as is).
+    **Holding the lock across a multi-step operation.** By default this call
+    takes `writer_lock(resolved)` itself, so the lock covers only the write.
+    An edit with a side effect that must not outlive a refused write (e.g.
+    `rename destination` copying ZFS anchors first) takes the lock itself and
+    passes it in::
+
+        with writer_lock(resolved) as held:
+            gen = read_generation(resolved)   # stable: no other writer can move it
+            ...side effects that depend on `gen`...
+            write_config(resolved, cfg, expected_generation=gen, lock=held)
+
+    Contract for `lock=`:
+
+    - it must be exactly the object `writer_lock(resolved)` yielded, for the
+      SAME `resolved` database, and the calling thread must still be inside
+      that `with` block. Anything else (None aside) -- a stale handle, another
+      database's lock, another thread's -- raises `ValueError` before anything
+      is opened or written, rather than degrading to an unlocked write;
+    - `write_config` then does NOT re-acquire (a plain second `writer_lock`
+      in the same thread still raises `RuntimeError`, by design: that is the
+      unaware caller) and does NOT release; the caller's `with` block does;
+    - `lock_timeout` is ignored (nothing is waited for; the caller chose its
+      timeout when it took the lock);
+    - everything else is unchanged: preflight, `validate_config`, `BEGIN
+      IMMEDIATE`, the schema re-check, the compare-and-swap, `ConfigConflict`
+      / `ConfigBusy` semantics (`ConfigBusy` here can only be SQLite's
+      `busy_timeout`, e.g. a non-honouring process holding the database), and
+      the `dispose_all()` on every exit. A refusal leaves the lock held for the
+      caller to release (or to retry under).
+
+    Raises `ValueError` (invalid `config`, or an invalid `lock=`; nothing
+    written), `ConfigPathError` / `SchemaError` (unusable database),
+    `ConfigConflict` (the generation moved on; nothing written), `ConfigBusy`
+    (writer lock or SQLite lock not obtained in time; nothing written; safe to
+    retry as is). A `ValueError` always means nothing was written. It does not
+    mean nothing was opened: an invalid `config` is detected AFTER the schema
+    pre-check, which opens (and closes) one read-only connection, so a
+    `ConfigPathError` / `SchemaError` for an unusable database wins over a
+    `ValueError` for a bad `config`. An invalid `lock=` is detected before
+    anything is opened.
 
     **Leaves no engine behind.** Whatever the outcome (success, `ConfigConflict`,
     `ConfigBusy`, any other error) every pooled connection this call opened --
@@ -192,7 +286,7 @@ def write_config(
     the same call every fork point already makes.
     """
     try:
-        return _write_config(resolved, config, expected_generation, lock_timeout)
+        return _write_config(resolved, config, expected_generation, lock_timeout, lock)
     finally:
         dispose_all()
 
@@ -202,7 +296,12 @@ def _write_config(
     config: BackupConfig,
     expected_generation: Optional[int],
     lock_timeout: float,
+    held_lock: Optional[Path] = None,
 ) -> WriteResult:
+    # A claimed-held lock is verified first: cheap, and it must not degrade
+    # into an unlocked write.
+    if held_lock is not None:
+        require_writer_lock_held(resolved, held_lock)
     # Preflight AND schema check BEFORE the lock: a missing database, or one
     # that is not ours (item 10.4), must not get a `<db>.writer.lock` created
     # beside it, and this also guarantees the lock's directory exists. Every
@@ -213,7 +312,9 @@ def _write_config(
     check_config_schema(resolved)
     warnings = tuple(validate_config(config))
 
-    with writer_lock(resolved, timeout=lock_timeout):
+    with contextlib.nullcontext(held_lock) if held_lock is not None else writer_lock(
+        resolved, timeout=lock_timeout
+    ):
         try:
             with open_config_session(resolved, readonly=False) as session:
                 # First statement of the session: `BEGIN IMMEDIATE` (db.py),

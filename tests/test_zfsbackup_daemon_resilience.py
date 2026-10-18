@@ -429,6 +429,9 @@ class TestIntervalFloor:
         worker = SnapshotWorker(worker_config, stop)
         mocker.patch.object(worker, "_get_interval", return_value=interval)
         mocker.patch.object(worker, "_process_dataset")
+        # Workers wait in STOP_POLL slices through `worker._wait(interval)` (so a
+        # dead supervisor is noticed); the interval the loop asks for is its argument.
+        mocker.patch.object(worker, "_wait", return_value=False)
         return worker, stop
 
     @pytest.mark.parametrize("interval", [0.0, -5.0, 0.25, 0.999])
@@ -439,7 +442,7 @@ class TestIntervalFloor:
         with caplog.at_level(logging.WARNING):
             worker.run()
 
-        waits = [c.kwargs["timeout"] for c in stop.wait.call_args_list]
+        waits = [c.args[0] for c in worker._wait.call_args_list]
         assert waits and all(w == MIN_WORKER_INTERVAL == 1.0 for w in waits)
         warnings = [r for r in caplog.records if "below the 1s minimum" in r.getMessage()]
         assert len(warnings) == 1  # once, not once per cycle
@@ -452,7 +455,7 @@ class TestIntervalFloor:
         worker, stop = self._run(worker_config, mocker, interval)
         with caplog.at_level(logging.WARNING):
             worker.run()
-        waits = [c.kwargs["timeout"] for c in stop.wait.call_args_list]
+        waits = [c.args[0] for c in worker._wait.call_args_list]
         assert waits and all(w == interval for w in waits)
         assert not [r for r in caplog.records if "minimum" in r.getMessage()]
 

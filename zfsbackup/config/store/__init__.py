@@ -166,6 +166,31 @@ shared by the daemon and the CLI (`config_error_message`,
 zfsbackup-config writer, `import_yaml` included; it adds one more file next to
 the database (`<db>.writer.lock`, besides WAL's `-wal`/`-shm`) that is never
 deleted and should not be archived as state.
+
+Public API
+----------
+Tool-level surface -- what the daemon and `zfsbackup-config` are meant to call:
+
+- whole-configuration access (`access.py`): `read_config`, `write_config`,
+  `read_generation`, `check_config_schema`, `WriteResult`, `ConfigSnapshot`;
+  `import_yaml` (`importer.py`) and `upgrade_schema` / `check_schema`
+  (`migrate.py`) for creating and migrating a database;
+- paths and the writer lock (`paths.py`): `resolve_config_path`,
+  `ResolvedConfigPath`, `writer_lock` (to hold the lock across a multi-step
+  edit, passing it on as `write_config(..., lock=held)`), the `ConfigPath*` /
+  `ConfigDb*` errors;
+- errors: `ConfigConflict`, `ConfigBusy`, `SchemaError` and subclasses;
+- messages: `config_error_message`, `describe_config_source`;
+- pure checks on dataclasses: `validate_config`, `destination_name_problem`.
+
+Internal -- not for tools, even though they are importable: the ORM classes
+(`Base`, `Dataset`, `Destination`, ...), the engine and session factories
+(`get_engine`, `make_engine`, `session_scope`, `session_for_engine`,
+`dispose_all` outside a fork point), and the session-level `save_config`,
+`load_config`, `load_config_snapshot` and `ensure_schema`. The session-level
+functions bypass the writer lock, the schema re-check and (for
+`save_config` without `expected_generation`) the compare-and-swap; only
+`write_config` and `import_yaml` compose them safely.
 """
 
 from zfsbackup.config.store.models import (
@@ -190,6 +215,7 @@ from zfsbackup.config.store.db import (
 from zfsbackup.config.store.errors import ConfigBusy, ConfigConflict
 from zfsbackup.config.store.mapper import (
     ConfigSnapshot,
+    destination_name_problem,
     load_config,
     load_config_snapshot,
     save_config,
@@ -237,6 +263,7 @@ from zfsbackup.config.store.paths import (
     ensure_config_dir,
     open_config_connection,
     open_config_session,
+    require_writer_lock_held,
     resolve_config_path,
     resolve_config_url,
     writer_lock,
@@ -255,6 +282,7 @@ from zfsbackup.config.store.access import (
     WriteResult,
     check_config_schema,
     read_config,
+    read_generation,
     write_config,
 )
 
@@ -309,6 +337,7 @@ __all__ = [
     "config_error_message",
     "create_config_db_file",
     "describe_config_source",
+    "destination_name_problem",
     "diagnose_open_failure",
     "dispose_all",
     "ensure_config_db_mode",
@@ -322,6 +351,8 @@ __all__ = [
     "open_config_connection",
     "open_config_session",
     "read_config",
+    "read_generation",
+    "require_writer_lock_held",
     "resolve_config_path",
     "resolve_config_url",
     "save_config",

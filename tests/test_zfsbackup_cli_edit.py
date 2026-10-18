@@ -376,11 +376,45 @@ class TestEditorFailure:
         assert f"killed by {name}" in result.stderr
         self.check(run, plain, result, stub, scratch_tmp, state)
 
-    def test_a_missing_editor_binary(self, run, plain, stub, scratch_tmp):
+    def test_a_missing_editor_binary_leaves_no_buffer_behind(self, run, plain, stub, scratch_tmp):
+        # the editor never ran, so the buffer is exactly what was rendered: nothing to keep
         state = db_state(plain)
         result = run("edit", "--no-prompt", "--editor", "/nonexistent/zfsbackup-editor", "-c", plain)
+        assert result.exit_code == 1
         assert "editor not found" in result.stderr and "--editor" in result.stderr
-        self.check(run, plain, result, stub, scratch_tmp, state)
+        assert "your edit is kept" not in result.stderr
+        assert buffers_in(scratch_tmp) == []
+        assert db_state(plain) == state
+
+    def test_a_missing_editor_after_a_retry_keeps_the_operators_text(
+        self, run, plain, stub, scratch_tmp, tty, monkeypatch
+    ):
+        """First run edits the buffer into something invalid; on Retry the editor
+        cannot be started. The buffer now holds the operator's text, so it IS kept."""
+        real_popen = editor.subprocess.Popen
+        calls = []
+
+        def popen(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise FileNotFoundError(2, "No such file", "x")
+            return real_popen(*args, **kwargs)
+
+        import types
+
+        monkeypatch.setattr(
+            editor, "subprocess",
+            types.SimpleNamespace(Popen=popen, TimeoutExpired=editor.subprocess.TimeoutExpired),
+        )
+        stub.plan([replace('check_interval: "5m"', 'check_interval: "bogus"')])
+        state = db_state(plain)
+        result = edit(run, plain, stub, input="r\n")
+        assert result.exit_code == 1
+        assert "editor not found" in result.stderr
+        kept = buffers_in(scratch_tmp)
+        assert len(kept) == 1 and 'check_interval: "bogus"' in (kept[0] / "config.yaml").read_text()
+        assert f"your edit is kept in {kept[0] / 'config.yaml'}" in result.stderr
+        assert db_state(plain) == state
 
     def test_an_editor_that_cannot_be_executed(self, run, plain, tmp_path, scratch_tmp):
         state = db_state(plain)
@@ -390,6 +424,7 @@ class TestEditorFailure:
         result = run("edit", "--no-prompt", "--editor", str(script), "-c", plain)
         assert result.exit_code == 1
         assert "cannot run the editor" in result.stderr
+        assert buffers_in(scratch_tmp) == []  # it never ran either
         assert db_state(plain) == state
 
     def test_the_editor_removing_the_buffer(self, run, plain, stub, scratch_tmp):
@@ -1024,9 +1059,11 @@ class TestEditDestinationNames:
         stub.plan([{"replace": ["datasets:", 'destinations:\n  "bad name":\n    url: "http://b"\n\ndatasets:']}])
         result = edit(run, plain, stub, "--no-prompt")
         assert result.exit_code == 0, result.stderr
-        warned = [w for w in warnings_in(result) if "destination 'bad name'" in w]
+        # the warning comes from validate_config (the single source), once
+        warned = [w for w in warnings_in(result) if "destinations[bad name]" in w]
         assert len(warned) == 1
-        assert "it contains ' '" in warned[0] and "its anchor property cannot be set" in warned[0]
+        assert "the name cannot hold a ZFS anchor (it contains ' '" in warned[0]
+        assert "not protected from pruning" in warned[0]
         assert "bad name" in stored(plain).destinations
 
     def test_an_existing_unusable_name_is_not_warned_about_again(self, run, db, stub, scratch_tmp):

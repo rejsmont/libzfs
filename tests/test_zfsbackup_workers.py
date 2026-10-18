@@ -300,6 +300,7 @@ class TestApiWorkerThread:
         mocker.patch('zfsbackup.api.create_app', return_value=mock_app)
         mock_thread = MagicMock()
         mocker.patch('zfsbackup.workers.threading.Thread', return_value=mock_thread)
+        mocker.patch('zfsbackup.workers._bind_api_server', return_value=MagicMock())  # no real socket
 
         worker.run()
         mock_thread.start.assert_called_once()
@@ -370,6 +371,7 @@ class TestChildSignalDispositionWiring:
         mocker.patch('zfsbackup.api.create_app', return_value=mock_app)
         mock_thread = MagicMock()
         mocker.patch('zfsbackup.workers.threading.Thread', return_value=mock_thread)
+        mocker.patch('zfsbackup.workers._bind_api_server', return_value=MagicMock())  # no real socket
 
         worker.run()
 
@@ -565,6 +567,7 @@ class TestWorkersNeverOpenTheConfigDatabase:
         app = MagicMock()
         mocker.patch('zfsbackup.api.create_app', return_value=app)
         mocker.patch('zfsbackup.workers.threading.Thread', return_value=MagicMock())
+        mocker.patch('zfsbackup.workers._bind_api_server', return_value=MagicMock())  # no real socket
         ApiWorker(armed, stop).run()
         assert forbid_db == []
 
@@ -573,6 +576,7 @@ class TestWorkersNeverOpenTheConfigDatabase:
         stop.set()
         factory = mocker.patch('zfsbackup.api.create_app', return_value=MagicMock())
         mocker.patch('zfsbackup.workers.threading.Thread', return_value=MagicMock())
+        mocker.patch('zfsbackup.workers._bind_api_server', return_value=MagicMock())  # no real socket
         ApiWorker(armed, stop).run()
         factory.assert_called_once_with(armed)
 

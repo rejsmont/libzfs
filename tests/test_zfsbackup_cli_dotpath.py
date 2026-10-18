@@ -1395,10 +1395,15 @@ class TestDotpathBaseline:
     def test_a_changed_warning_text_is_new(self, run, warny):
         result = ok(run, warny, "set", "snapshot_prefix", "other_x")
         lines = warnings_in(result)
-        assert len(lines) == 1 and "'other_x' contains '_'" in lines[0]
+        # the `_` warning names the prefix, so it is new text; plus the prefix change itself
+        assert len(lines) == 2
+        assert sum("'other_x' contains '_'" in l for l in lines) == 1
+        assert sum("snapshot_prefix changes from 'my_snap' to 'other_x'" in l for l in lines) == 1
 
     def test_fixing_a_standing_condition_is_silent(self, run, warny):
-        assert warnings_in(ok(run, warny, "set", "snapshot_prefix", "clean")) == []
+        # only the prefix CHANGE is said; the standing `_` warning is not repeated
+        lines = warnings_in(ok(run, warny, "set", "snapshot_prefix", "clean"))
+        assert len(lines) == 1 and "snapshot_prefix changes from 'my_snap' to 'clean'" in lines[0]
         assert warnings_in(ok(run, warny, "set", "api_port", "8080")) == []
 
     def test_ending_a_standing_never_prune_warns_that_pruning_starts_not_that_it_stops(self, run, warny):
@@ -1616,8 +1621,10 @@ class TestSingleSourceOfWarnings:
         result = ok(run, db, "set", "api_port", "0")
         assert warnings_in(result) == [f"warning: {PORT_TEXT}"]
         result = ok(run, db, "set", "snapshot_prefix", "a_b")
-        assert len(warnings_in(result)) == 1 and "'a_b' contains '_'" in warnings_in(result)[0]
-
+        lines = warnings_in(result)
+        assert sum("'a_b' contains '_'" in l for l in lines) == 1
+        assert sum("snapshot_prefix changes from 'autosnap' to 'a_b'" in l for l in lines) == 1
+        assert len(lines) == 2
 
 class TestDotpathRefusalsNameTheSetting:
     """A value the model refuses is reported as `<path>: <reason>` (L3), the
@@ -1642,7 +1649,10 @@ class TestDotpathRefusalsNameTheSetting:
         before = db_state(rich)
         result = run(*args, "-c", rich)
         assert result.exit_code == 1, result.stdout
-        assert result.stderr.startswith(f"error: {printed}: "), result.stderr
+        # the setting is named once, first (the model's own message when it already
+        # starts with the path; otherwise `<path>: <reason>`)
+        assert result.stderr.startswith(f"error: {printed}"), result.stderr
+        assert result.stderr.splitlines()[0].count(printed) == 1
         assert "Traceback" not in result.stderr
         assert db_state(rich) == before
 
@@ -1712,3 +1722,38 @@ class TestDotpathPruningStarts:
     def test_the_edit_that_added_rules_is_stored(self, run, rich):
         ok(run, rich, "set", "datasets[tank/vm.01].retention", "{1d: 30d}")
         assert [(r.age.literal, r.keep_for.literal) for r in stored(rich).datasets[1].retention_rules] == [("1d", "30d")]
+
+
+class TestDotpathSnapshotPrefixChange:
+    """Changing snapshot_prefix leaves every existing `<old>_*` snapshot unmanaged
+    and never pruned: said once, only when the prefix really changes."""
+
+    def test_warns_with_both_prefixes(self, run, rich):
+        result = ok(run, rich, "set", "snapshot_prefix", "newsnap")
+        lines = warnings_in(result)
+        assert lines == [
+            "warning: snapshot_prefix changes from 'autosnap' to 'newsnap': existing "
+            "autosnap_* snapshots will no longer be managed or pruned "
+            "(they stay until destroyed by hand)"
+        ]
+
+    def test_no_warning_for_a_noop(self, run, rich):
+        result = ok(run, rich, "set", "snapshot_prefix", "autosnap")
+        assert result.stdout == "snapshot_prefix is already autosnap; nothing changed\n"
+        assert warnings_in(result) == []
+
+    @pytest.mark.parametrize(
+        "args",
+        [("set", "check_interval", "10m"), ("set", "api_port", "9000"), ("set", "dry_run", "true")],
+    )
+    def test_no_warning_for_other_settings(self, run, rich, args):
+        assert [w for w in warnings_in(ok(run, rich, *args)) if "snapshot_prefix" in w] == []
+
+    def test_it_is_a_warning_not_a_refusal(self, run, rich):
+        ok(run, rich, "set", "snapshot_prefix", "newsnap")
+        assert stored(rich).snapshot_prefix == "newsnap"
+
+    def test_each_change_warns_again_with_its_own_text(self, run, rich):
+        ok(run, rich, "set", "snapshot_prefix", "one")
+        lines = warnings_in(ok(run, rich, "set", "snapshot_prefix", "two"))
+        assert len(lines) == 1 and "from 'one' to 'two'" in lines[0]

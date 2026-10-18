@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -185,10 +186,13 @@ def _dataset_level_rules(
     ]
     rules.sort(key=lambda r: r.age)
     if not rules and warn_never_prune:
+        # Same wording as `validate_config`'s warning for the same condition,
+        # and no surrogate `ds.id` (an operator cannot act on a DB row id).
         logger.warning(
-            "dataset %r (id=%s) has no dataset-level retention rules; its "
-            "snapshots will never be pruned",
-            ds.name, ds.id,
+            "datasets[%s].retention is empty ('retention: forever'): this "
+            "dataset's snapshots will never be pruned and will accumulate "
+            "until the pool is full",
+            ds.name,
         )
     return rules
 
@@ -603,6 +607,43 @@ def _validate_rules(
         )
 
 
+_PROPERTY_NAME_CHARS = re.compile(r"[A-Za-z0-9_.:-]+")
+_ANCHOR_PROPERTY_PREFIX = "org.zfsbackup:anchor."
+_MAX_PROPERTY_NAME = 256  # ZAP_MAXNAMELEN
+
+
+def destination_name_problem(name: str) -> Optional[str]:
+    """Why `name` cannot hold a ZFS anchor, or None if it can. Pure.
+
+    A destination's name is part of a ZFS user-property name,
+    `org.zfsbackup:anchor.<name>`. OpenZFS accepts ASCII letters, digits and
+    `-` `_` `.` `:` in user-property names (`zprop_valid_char`; the manual
+    recommends lowercase) and at most 256 characters in all. This is the
+    conservative form of that rule. A name outside it can never have an
+    anchor stored, so the incremental base of every transfer to that
+    destination is unprotected from pruning.
+
+    Public: `validate_config` reports it as a WARNING (existing configs may
+    legitimately contain such names), and `zfsbackup-config rename
+    destination` uses it as a hard refusal for the NEW name.
+    """
+    if not name:
+        return "it is empty"
+    if not _PROPERTY_NAME_CHARS.fullmatch(name):
+        bad = sorted({c for c in name if not _PROPERTY_NAME_CHARS.fullmatch(c)})
+        return (
+            f"it contains {' '.join(repr(c) for c in bad)}; the name becomes part of the ZFS "
+            f"property {_ANCHOR_PROPERTY_PREFIX}<name>, which allows only letters, digits "
+            "and - _ . :"
+        )
+    if len(_ANCHOR_PROPERTY_PREFIX) + len(name) > _MAX_PROPERTY_NAME:
+        return (
+            f"it is too long: {_ANCHOR_PROPERTY_PREFIX}<name> may be at most "
+            f"{_MAX_PROPERTY_NAME} characters"
+        )
+    return None
+
+
 def validate_config(config: BackupConfig) -> List[str]:
     """Check that `config` is storable and means what it says; pure.
 
@@ -670,6 +711,9 @@ def validate_config(config: BackupConfig) -> List[str]:
     - an in-code `client_id_file` of `""`, which YAML treats as unset:
       `save_config` stores NULL (derive from `$HOME`) instead of a value
       that would reload as `Path(".")`;
+    - a destination name that cannot be a ZFS user-property suffix
+      (`destination_name_problem`): its `org.zfsbackup:anchor.<name>` anchor
+      can never be stored;
     - exact `(age, keep_for)` duplicates within a scope, naming both
       literals -- `save_config` drops the later one because the DB's
       unique indexes cannot hold them.
@@ -775,6 +819,19 @@ def validate_config(config: BackupConfig) -> List[str]:
         if not dest.url:
             raise ValueError(f"Destination {name!r} requires 'url'")
         _require_str(dest.url, f"destinations[{name}].url")
+        # WARNING, not an error: configs that predate this check may already
+        # carry such names, and refusing to load/import them would strand
+        # the operator. The cost of the name is real but silent -- no anchor
+        # can ever be written for it, so the snapshot an incremental send
+        # depends on is not protected from pruning.
+        problem = destination_name_problem(name)
+        if problem is not None:
+            warnings.append(
+                f"destinations[{name}]: the name cannot hold a ZFS anchor "
+                f"({problem}); anchors can never be stored for it, so the "
+                "incremental base for this destination is not protected "
+                "from pruning"
+            )
 
     # Mirrors `from_file`'s `remote_backup.target_dataset` requirement, same
     # reasoning as `url` above.

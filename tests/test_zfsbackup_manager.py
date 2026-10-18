@@ -1753,3 +1753,50 @@ class TestCopyAnchorPropertyOverwrite:
 # prunes blind 3 / uncaught 4; configured destination's anchor dropped 4;
 # `copy_anchor_property`: equal value not 'same' 7 / overwrite ignored 14 /
 # overwrite positional 5 / 'overwritten' reported as 'copied' 7 / dry run sets 7.
+
+
+class TestSyncConfigPropertyDryRun:
+    """`--dry-run` must not write to ZFS: no `zfs set org.zfsbackup:config`."""
+
+    def manager(self, dry_run):
+        return DatasetManager(_make_config(dry_run=dry_run))
+
+    def test_dry_run_makes_no_zfs_set_and_logs_what_it_would_do(self, mocker, caplog):
+        manager = self.manager(True)
+        dsi = manager.datasets[0]
+        mocker.patch.object(manager, '_get_prop', return_value='something-else')
+        zfs_set = mocker.patch('zfsbackup.backup_manager.zfs.set')
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.sync_config_property(dsi)
+        zfs_set.assert_not_called()
+        assert '[DRY RUN] Would set org.zfsbackup:config on pool/data' in caplog.text
+
+    def test_dry_run_with_a_missing_property_also_sets_nothing(self, mocker):
+        manager = self.manager(True)
+        mocker.patch.object(manager, '_get_prop', return_value=None)
+        zfs_set = mocker.patch('zfsbackup.backup_manager.zfs.set')
+        manager.sync_config_property(manager.datasets[0])
+        zfs_set.assert_not_called()
+
+    def test_dry_run_with_an_up_to_date_property_says_nothing(self, mocker, caplog):
+        manager = self.manager(True)
+        dsi = manager.datasets[0]
+        mocker.patch.object(manager, '_get_prop', return_value=dsi.config.to_property())
+        zfs_set = mocker.patch('zfsbackup.backup_manager.zfs.set')
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.sync_config_property(dsi)
+        zfs_set.assert_not_called()
+        assert 'Would set' not in caplog.text
+
+    def test_a_live_run_still_sets_it(self, mocker):
+        manager = self.manager(False)
+        mocker.patch.object(manager, '_get_prop', return_value='something-else')
+        zfs_set = mocker.patch('zfsbackup.backup_manager.zfs.set')
+        manager.sync_config_property(manager.datasets[0])
+        zfs_set.assert_called_once()
+
+    def test_dry_run_through_mock_subprocess_issues_no_set_command(self, mock_subprocess):
+        manager = self.manager(True)
+        mock_subprocess.setup(stdout=['pool/data\tfilesystem\tother\n'])
+        manager.sync_config_property(manager.datasets[0])
+        assert 'set' not in [c.args[0][1] for c in mock_subprocess.call_args_list]

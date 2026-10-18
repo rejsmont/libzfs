@@ -1,9 +1,9 @@
 # zfsbackup: SQLite Config Store + Config CLI + Live Reload
 
-**Status (2026-10-17):** Phase 0 and Phase 1 **implemented** on branch `config-db-cli` (items 1–8x,
-with item 9's tests landed alongside item 8); mocked suite green at 1071 passed. **Checkpoint A held
-2026-10-17; its fix-up cycle (A-1…A-9) and the revised Phase 2 are approved.**
-Phases 2 and 3 not started. Sections below still read as the original proposal except where an item
+**Status (2026-10-18):** Phases 0, 1 and 2 **implemented** on branch `config-db-cli` (Checkpoint A held
+2026-10-17 with fix-up A-1…A-21; Phase 2 items 10–16 landed 2026-10-17/18); mocked suite 3810 passed.
+**Checkpoint B review held 2026-10-18** (Phase 2 sound; close-out fixes landed). **Phase 3 (live
+reload) revised and awaiting the user's decisions D1–D11.** Sections below still read as the original proposal except where an item
 carries a status note or "as landed" text — where those disagree with the proposal, the note wins.
 **Scope:** `zfsbackup/` only. No `libzfseasy/` changes.
 **Author:** zfsbackup-implementation-planner
@@ -35,12 +35,13 @@ carries a status note or "as landed" text — where those disagree with the prop
 | Item 15 (15.1–15.5) + 14.1 | done | See the "As landed" note under item 15 |
 | Items 13, 11, 12, 14.2 | done | `list`, `get`/`set`/`unset`, `edit` (whole + per entry), `rename dataset|destination`; mocked suite 3787 |
 | Warnings consolidation | done | `validate_config` is the single source of semantic warnings; `from_file` keeps parse-boundary ones; `load_config(warn_never_prune=)` |
-| **Checkpoint B** | **next** | Review before Phase 3 |
-| 10–16 Config CLI | approved, not started | Revised after Checkpoint A; order 10 → 15 → 13 → 11 → 12 → 14 → 16 |
+| Checkpoint B | held 2026-10-18 | Phase 2 reviewed end to end (incl. a 5-minute concurrent stress test); close-out fixes landed with it |
+| **Phase 3 (live reload)** | **awaiting decisions D1–D11** | Revised design proposed at Checkpoint B |
+| 10–16 Config CLI | done | Landed in order 10 → 15 → 13 → 11 → 12 → 14 → 16; see the per-item "as landed" notes |
 | 17–20 Live reload | not started | Item 17 text predates 8x and A-5/A-6.2 — must be revised before implementation |
 | 21–23 Docs, scenarios, final review | not started | |
 
-> **All design questions are settled; no open decisions remain.** Items 2 (duration handling) and 5 (fork
+> *(Historical — written for Phases 0–2; Phase 3 decisions D1–D11 are open, see Progress.)* **All design questions are settled; no open decisions remain.** Items 2 (duration handling) and 5 (fork
 > safety) were the gating pair: **item 2 = full `Duration` value type** subclassing `timedelta`, with
 > `__str__` left untouched and `.literal`/`.timedelta` as read-only accessors; **item 5 = pid-keyed,
 > created-after-fork engine cache**. Reload uses an event-based immediate wake (item 17) and the CLI
@@ -1747,8 +1748,9 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
     restart the daemon; keep `anchor.OLD` until a send to NEW succeeded, then `zfs inherit` it. This
     supersedes the item-15 note that a renamed destination drops anchor protection.
   - `rename dataset --clear-stale-props`: refused up front when ZFS is unavailable or NEW is absent
-    while OLD exists; the daemon check runs AFTER the write under a shared `flock` on `<db>.daemon.pid`
-    held through every `zfs inherit` (replaces B5's probe-before-write); `rename destination
+    while OLD exists; the daemon check runs AFTER the write (originally a shared `flock` on
+    `<db>.daemon.pid` held through every `zfs inherit`; since 08e209e a single `daemonlock.probe()`,
+    no lock held — replaces B5's probe-before-write); `rename destination
     --skip-missing`; destination names validated as ZFS property names.
   - `edit`: unknown keys rejected at every level; rename-shaped and recreate-with-shared-destination
     detection; a removed destination's anchor "stays behind and keeps pinning its snapshot until cleared
@@ -1856,6 +1858,30 @@ null (YAML never allowed it).
 > The CLI is fully usable at this point, with the item-15 "restart required" notice as the honest
 > stopgap. Phase 3 is where multiprocessing risk concentrates; confirm the reload design below before
 > it starts.
+>
+> **Held 2026-10-18.** Phase 2 was found complete. The concurrency stress run used 3,294 CLI
+> invocations; generations were consecutive and nothing was corrupted. Close-out fixes:
+> - SIGHUP is caught during daemon startup, and the hand-over only ever sets the flag.
+> - Engines are disposed before the startup SIGHUP disposition is restored.
+> - Orphaned workers exit on their own.
+> - An API bind failure exits cleanly.
+> - Dry-run never writes properties.
+> - The anchor copies for `rename destination` run under the writer lock.
+> - Writer-lock identity is compared by inode.
+> - The console-script CLI ignores SIGINT/SIGTERM after `main()`.
+> - Tests are hermetic: a stub zfs, `ZFSB_REAL_ZFS=1` opt-in for the real tier, and the orphan
+>   safety net.
+>
+> **Carried into Phase 3's worker-lifecycle design (item 18):**
+> - **Forkserver orphan plus pid reuse.** An orphaned worker's parent-death check compares pids
+>   only. Key it on pid + start time.
+> - **The spawn/forkserver orphan overlap.** Under spawn/forkserver, workers don't inherit the
+>   presence lock. A `<db>.workers.lock` held `LOCK_SH` by every worker would let a restarted
+>   daemon see survivors of its predecessor.
+> - **`ApiWorker` shutdown.** It should call `server.shutdown()` on stop rather than rely on
+>   process exit.
+> - **`_wait` returns only a bool.** Reload needs to know *why* a wait ended (stop or reload), so
+>   it should return a reason.
 
 ---
 

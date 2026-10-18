@@ -313,6 +313,10 @@ class DatasetManager:
         encoded = dsi.config.to_property()
         current = self._get_prop(dsi.dataset, PROP_CONFIG)
         if current != encoded:
+            if self.config.dry_run:
+                # `--dry-run` must not write to ZFS: log what would be set.
+                logger.info(f"[DRY RUN] Would set {PROP_CONFIG} on {dsi.name}")
+                return
             try:
                 zfs.set(dsi.dataset, {PROP_CONFIG: encoded})
                 logger.debug(f"Synced config property for {dsi.name}")

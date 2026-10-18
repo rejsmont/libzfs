@@ -7,6 +7,7 @@ JSON file.
     $FAKEZFS_LOG     one JSON line (the argv after ``zfs``) appended per call
     $FAKEZFS_SLOW_INHERIT  seconds an `inherit` sleeps before acting, after appending a line
                      to $FAKEZFS_MARKER (lets a test act mid-inherit)
+    $FAKEZFS_SLOW_SET      the same for `set`
     $FAKEZFS_FAIL    optional JSON list of ``[subcommand, dataset]`` or
                      ``[subcommand, dataset, property]`` rules; a matching call fails with a message on stderr and exit 1
 
@@ -74,6 +75,17 @@ if command in ("list", "get"):
     sys.exit(0)
 
 if command == "set":
+    delay = os.environ.get("FAKEZFS_SLOW_SET")
+    if delay:
+        marker = os.environ.get("FAKEZFS_MARKER")
+        if marker:
+            with open(marker, "a", encoding="utf-8") as handle:
+                handle.write("set started\n")
+        import time
+
+        time.sleep(float(delay))
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
     prop, value = args[1].split("=", 1)
     state[name][prop] = value
     save()

@@ -48,16 +48,42 @@ we do not own is never chmod'd. When root creates the pidfile next to the
 *default* database, it is `fchown`ed to the `zfsbackup` group, like the
 database itself; elsewhere the setgid directory supplies the group.
 
-Fork versus spawn. Under `fork` the workers inherit the descriptor, and a
-`flock` belongs to the open file *description*, which fork shares -- so the lock
-stays held until the **last** holder exits. Consequences, both intended:
-orphaned workers of a `kill -9`'d supervisor still count as "running" (they
-are still snapshotting; a second daemon must not start beside them), and the
-workers must not unlink the file (`release()` is a no-op in any process but the
-one that acquired). Under `spawn`/`forkserver` the workers do **not** inherit
-the descriptor (it is `O_CLOEXEC`, and `multiprocessing` passes only explicit
-fds), so orphans do not hold the lock and an orphaned worker set is invisible
-to `probe()`. The descriptor is `O_CLOEXEC` in every case so the `zfs`
+Start methods, and what the lock does and does not cover. CPython's default
+start method is `spawn` on macOS (3.8+), `fork` on Linux up to 3.13 and
+`forkserver` on Linux from 3.14; the daemon uses the default, so all three
+occur in practice.
+
+* `fork`: workers inherit the descriptor, and a `flock` belongs to the open
+  file *description*, which fork shares -- so the lock stays held until the
+  **last** holder exits. Workers must not unlink the file (`release()` is a
+  no-op in any process but the one that acquired).
+* `spawn` / `forkserver`: workers do **not** inherit the descriptor (it is
+  `O_CLOEXEC`, and `multiprocessing` passes only explicit fds; the forkserver
+  process does not get it either), so the lock belongs to the supervisor alone.
+
+Orphans. A `kill -9`'d supervisor used to leave its workers running forever:
+under `fork` holding the lock on a frozen config, under `spawn`/`forkserver`
+holding nothing, so `probe()` said "not running" and a second daemon could
+start beside them. Workers now notice the death themselves
+(`zfsbackup.workers._SupervisorWatch`) and exit at their next safe point --
+within about one `stopflag.STOP_POLL` slice (0.5s) when idle, or after the
+dataset they are in the middle of (a `zfs send` is never torn). So an orphan
+is a short transient, not a standing state, and the lock covers it as follows:
+
+* `fork`: during that window the orphans still hold the lock, so `probe()`
+  still reports a daemon (with a dead supervisor pid, see
+  `stale_supervisor_message`) and a second daemon is refused until the last
+  orphan has exited -- exactly the guarantee wanted, no overlap possible.
+* `spawn` / `forkserver`: the orphans never held it, so for that same window
+  `probe()` says "not running" and a new daemon *can* start beside a worker
+  that is finishing its last dataset. This is a bounded overlap of one
+  in-flight dataset operation, not the unbounded double-daemon of before; the
+  lock cannot close it without the workers holding the descriptor (which
+  would need `pass_fds`, i.e. leaking it into every `spawn`ed worker's
+  lifetime), and the orphan exits as soon as it reaches a safe point.
+
+A worker's exit on supervisor death is logged at ERROR, once ("supervisor N
+is gone; exiting"). The descriptor is `O_CLOEXEC` in every case so the `zfs`
 children the workers `exec` never inherit it -- a long-lived `zfs send` must
 not keep a dead daemon's lock alive.
 
@@ -175,8 +201,9 @@ def pid_is_alive(pid: Optional[int]) -> Optional[bool]:
 
 def stale_supervisor_message(path, pid: int) -> str:
     """Wording for "the lock is held but the supervisor pid is gone": under
-    `fork` the workers inherit the lock descriptor and outlive a `kill -9`'d
-    supervisor, still snapshotting. Shared by the daemon and the CLI."""
+    `fork` the workers inherit the lock descriptor and briefly outlive a
+    `kill -9`'d supervisor (until their next safe point, see the module
+    docstring). Shared by the daemon and the CLI."""
     return (
         f"supervisor pid {pid} is gone, but processes it forked still hold the "
         f"daemon lock {path}; find them with `fuser {path}` or `lsof {path}`"

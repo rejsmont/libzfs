@@ -1632,8 +1632,13 @@ SHUTDOWN_TIMEOUT = 30.0
 
 
 def _killpg_quiet(pid, sig=signal.SIGKILL):
+    """Signal the whole process group of a daemon started with
+    `start_new_session=True`. Its pgid IS its pid, so no `getpgid()` lookup: that
+    raises `ProcessLookupError` once the leader has been reaped (`wait()`), which
+    is exactly when the workers still need killing -- they are orphans in a group
+    whose leader is gone, and `killpg` on the recorded pgid still reaches them."""
     try:
-        os.killpg(os.getpgid(pid), sig)
+        os.killpg(pid, sig)
     except (ProcessLookupError, PermissionError):
         pass
 
@@ -1645,11 +1650,12 @@ def real_daemon_env(tmp_path, monkeypatch):
     without any pool."""
     from zfsbackup.config.store import import_yaml
 
-    zfs = os.environ.get("ZFS_CMD") or shutil.which("zfs")
-    if not zfs:
-        zfs = shutil.which("true") or "/usr/bin/true"
-    monkeypatch.setenv("ZFS_CMD", zfs)
-    monkeypatch.setenv("ZPOOL_CMD", os.environ.get("ZPOOL_CMD") or zfs)
+    from _hermetic import hermetic_env
+
+    # a stub, never `which("zfs")`: a --dry-run daemon still runs `zfs set`
+    env = hermetic_env()
+    monkeypatch.setenv("ZFS_CMD", env["ZFS_CMD"])
+    monkeypatch.setenv("ZPOOL_CMD", env["ZPOOL_CMD"])
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -1677,7 +1683,9 @@ def spawn_daemon(tmp_path, real_daemon_env):
 
     def start(*extra, name=None):
         log_path = tmp_path / (name or f"daemon{len(started)}.log")
-        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        from _hermetic import hermetic_env
+
+        env = hermetic_env(PYTHONUNBUFFERED="1")
         log_fh = open(log_path, "wb")
         proc = subprocess.Popen(
             [sys.executable, "-m", "zfsbackup.daemon", "-c", str(real_daemon_env.path),

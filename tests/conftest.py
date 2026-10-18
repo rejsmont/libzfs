@@ -1,5 +1,41 @@
 """Pytest configuration and shared fixtures for libzfseasy tests."""
 
+import os
+import shutil
+
+# FIRST, before anything imports `libzfseasy` (it resolves $ZFS_CMD / $ZPOOL_CMD at
+# import time): a bare `pytest` on a host with ZFS installed must never end up
+# pointing the suite -- or the subprocesses it starts, which inherit this
+# environment -- at the real binaries. The REAL tier is opt-in (ZFSB_REAL_ZFS=1):
+# without it nothing real is reachable and every `real_zfs` test is skipped. See
+# tests/_hermetic.py.
+from _hermetic import (
+    REAL_TIER_REASON,
+    apply_stub_policy,
+    fork_record_dir,
+    find_orphans,
+    hermetic_env,
+    installed_zfs_binaries,
+    is_real_zfs,
+    real_tier_enabled,
+    register_fork_recorder,
+    session_marker,
+)
+
+apply_stub_policy()
+INSTALLED_ZFS = installed_zfs_binaries()    # from the ORIGINAL PATH, once
+
+#: Marks every process this pytest session starts (children inherit the
+#: environment); `pytest_sessionfinish` hunts for survivors by it. Always a fresh
+#: value, except in an xdist worker of the controller that minted it (one run = one
+#: marker): an inherited or exported value is never reused.
+SESSION_MARKER = session_marker(os.environ, os.getppid())
+#: Children forked WITHOUT exec carry the exec-time environment (no marker); their
+#: pids are recorded here by an at-fork hook so the net can still find them.
+FORK_DIR = fork_record_dir(SESSION_MARKER)
+os.makedirs(FORK_DIR, exist_ok=True)
+register_fork_recorder(FORK_DIR)
+
 import pytest
 from unittest.mock import Mock, MagicMock
 from libzfseasy.types import Dataset, Filesystem, Volume, Snapshot, Bookmark, Property
@@ -251,57 +287,36 @@ def _clean_db_engine_cache():
     dispose_all()
 
 
-_INSTALLED_ZFS = None
-
-
-def _installed_zfs_binaries():
-    """Real paths of any `zfs` / `zpool` found on `PATH` (cached)."""
-    global _INSTALLED_ZFS
-    if _INSTALLED_ZFS is None:
-        import os
-        import shutil
-
-        _INSTALLED_ZFS = frozenset(
-            os.path.realpath(found)
-            for found in (shutil.which("zfs"), shutil.which("zpool"))
-            if found
-        )
-    return _INSTALLED_ZFS
-
-
 @pytest.fixture(autouse=True)
 def _never_run_a_real_zfs(request, monkeypatch):
     """Fails any test (outside the `real_zfs` tier) whose code starts a process
-    that is a real `zfs` or `zpool`: a compiled program named `zfs` / `zpool`, or one that
-    resolves to the binary found on `PATH` under those names (fake scripts
-    named `zfs`, which start with `#!`, are fine).
+    that is a real `zfs` or `zpool`: a compiled program named `zfs` / `zpool`, or
+    one that resolves to the binary found on `PATH` under those names (fake
+    scripts named `zfs`, which start with `#!`, are fine).
 
-    The mocked tiers either patch `subprocess.Popen` wholesale (which this
-    guard never sees) or point `ZFS_CMD` / `ZPOOL_CMD` at a stub or a fake
-    script (`tests/_fake_zfs.py`); a code path that slips past both and reaches
-    a real binary would run against whatever pool the host happens to have.
-    Wraps `Popen.__init__` in place, so the class identity (and every
-    `isinstance` check) is unchanged.
+    **This covers only the pytest process.** It wraps `Popen.__init__` here, so it
+    sees what the code under test runs in-process; it cannot see what a
+    subprocess runs. Subprocess safety comes from the ENVIRONMENT: `ZFS_CMD` /
+    `ZPOOL_CMD` are set to a stub for the whole session when unset (top of this
+    file), and the tests that start real daemons or CLIs build their environment
+    with `_hermetic.hermetic_env()` (stubs, restricted `PATH`, never
+    `which("zfs")`).
+
+    The mocked tiers either patch `subprocess.Popen` wholesale (which this guard
+    never sees) or point `ZFS_CMD` at a stub or a fake script
+    (`tests/_fake_zfs.py`); a code path that slips past both and reaches a real
+    binary would run against whatever pool the host happens to have. Wraps
+    `Popen.__init__` in place, so the class identity (and every `isinstance`
+    check) is unchanged.
     """
     if request.node.get_closest_marker("real_zfs"):
         yield
         return
-    import os
     import shlex
-    import shutil
     import subprocess
 
     real_init = subprocess.Popen.__init__
-    installed = _installed_zfs_binaries()
-
-    def _is_compiled(path):
-        """A file named zfs/zpool that is not a `#!` script is a real binary
-        (the fake scripts the suite writes under those names start with `#!`)."""
-        try:
-            with open(path, "rb") as handle:
-                return handle.read(2) != b"#!"
-        except OSError:
-            return False
+    installed = INSTALLED_ZFS
 
     def guarded(self, args, *a, **kw):
         if isinstance(args, bytes):
@@ -315,20 +330,55 @@ def _never_run_a_real_zfs(request, monkeypatch):
             program = os.fspath(args)
         else:
             program = os.fsdecode(args[0]) if args else ""
-        if program:
-            base = os.path.basename(program)
-            resolved = shutil.which(program) or program
-            if os.path.realpath(resolved) in installed or (
-                base in ("zfs", "zpool") and _is_compiled(resolved)
-            ):
-                raise AssertionError(
-                    f"this test started a real {base!r} ({program}); use mock_subprocess "
-                    "or a fake script (tests/_fake_zfs.py) -- see _never_run_a_real_zfs"
-                )
+        if program and is_real_zfs(program, installed):
+            raise AssertionError(
+                f"this test started a real {os.path.basename(program)!r} ({program}); use "
+                "mock_subprocess or a fake script (tests/_fake_zfs.py) -- see _never_run_a_real_zfs"
+            )
         return real_init(self, args, *a, **kw)
 
     monkeypatch.setattr(subprocess.Popen, "__init__", guarded)
     yield
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Safety net against leaked processes: after the last test, hunt for
+    processes this session started -- carrying its `ZFSB_TEST_SESSION` marker (exec'd
+    children inherit it), or recorded by the at-fork hook (children forked without
+    exec) -- that are not live descendants of this process, i.e. left running after
+    their test ended (reparented to init or a subreaper), such as a daemon's workers
+    once the supervisor was SIGKILLed. They are killed, a loud warning is printed, and the
+    session FAILS (set `ZFSB_ALLOW_ORPHANS=1` to downgrade that to the warning).
+    Runs once, in the pytest-xdist controller or the plain process."""
+    if hasattr(session.config, "workerinput"):
+        return
+    import signal
+
+    try:
+        leftover = find_orphans(SESSION_MARKER, fork_dir=FORK_DIR)
+    finally:
+        shutil.rmtree(FORK_DIR, ignore_errors=True)
+    if not leftover:
+        return
+    for pid, _ppid, _state, _text in leftover:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    lines = ["", "!" * 70, f"LEAKED PROCESSES: {len(leftover)} process(es) started by this test session were left running (now killed):"]
+    for pid, ppid, state, text in leftover:
+        command = text.split(" ZFSB_TEST_SESSION=")[0][:150]
+        lines.append(f"  pid {pid} (ppid {ppid}, {state}): {command}")
+    lines += ["A test must kill its whole process group (os.killpg(pid, SIGKILL), pgid == pid under",
+              "start_new_session=True) independently of reaping the leader.", "!" * 70]
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    for line in lines:
+        if reporter is not None:
+            reporter.write_line(line, red=True, bold=True)
+        else:
+            print(line)
+    if not os.environ.get("ZFSB_ALLOW_ORPHANS") and session.exitstatus == 0:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture(autouse=True)
@@ -669,9 +719,13 @@ def pytest_collection_modifyitems(config, items):
     `tryfirst` matters: pytest's own `-m` deselection runs in the same hook,
     and a marker added after it would be invisible to `-m unit`.
     """
+    skip_real = None if real_tier_enabled() else pytest.mark.skip(reason=REAL_TIER_REASON)
     for item in items:
         if not any(item.get_closest_marker(name) for name in _TIER_MARKERS):
             item.add_marker(pytest.mark.unit)
+        if skip_real is not None and item.get_closest_marker("real_zfs"):
+            # opt-in tier: never run (and never set up its pool fixture) by accident
+            item.add_marker(skip_real)
 
 
 # ---------------------------------------------------------------------------
@@ -770,9 +824,7 @@ def daemon_lock_holder():
     holders = []
 
     def start(db_path, generation=None, fork=False):
-        env = dict(os.environ)
-        env.setdefault("ZFS_CMD", shutil.which("true") or "/usr/bin/true")
-        env.setdefault("ZPOOL_CMD", env["ZFS_CMD"])
+        env = hermetic_env()
         proc = subprocess.Popen(
             [
                 sys.executable, "-c", _LOCK_HOLDER_SCRIPT,

@@ -4138,12 +4138,12 @@ class TestConflictAndBusyExitCodes:
 
     def test_the_conflict_message_names_both_generations(self):
         lines = cli_errors.format_error(ConfigConflict(3, 4), None)
-        assert lines[0] == "config changed underneath you (generation 3, now generation 4); re-run"
+        assert lines[0] == "config changed underneath you (generation 3, now generation 4)"
         assert any("Nothing was written" in line for line in lines[1:])
 
     def test_a_conflict_with_no_configuration_says_so(self):
         lines = cli_errors.format_error(ConfigConflict(3, None), None)
-        assert lines[0] == "config changed underneath you (generation 3, now no configuration); re-run"
+        assert lines[0] == "config changed underneath you (generation 3, now no configuration)"
 
     def test_the_busy_message_is_the_stores_text_as_one_line(self):
         """15.5: the store's text already says what is busy and to retry, so
@@ -4189,7 +4189,7 @@ class TestConflictAndBusyExitCodes:
         result = run("export", "-c", db)
         assert result.exit_code == 75, result.stderr
         assert result.stderr.splitlines()[0] == (
-            "error: config changed underneath you (generation 0, now generation 1); re-run"
+            "error: config changed underneath you (generation 0, now generation 1)"
         )
 
     def test_busy_through_the_cli_is_75_and_not_labelled_internal(self, run, db, monkeypatch):
@@ -4370,7 +4370,8 @@ class TestCommitConfig:
 
         monkeypatch.setattr(cli_write, "write_config", spy)
         cli_write.commit_config(resolved, snap, _tank_config(), announce=False)
-        assert seen == {"expected_generation": snap.generation}
+        # `lock` is always passed (None = take the writer lock inside write_config)
+        assert seen == {"expected_generation": snap.generation, "lock": None}
 
     def test_a_stale_snapshot_is_a_conflict_with_both_generations_and_the_store_is_unchanged(
         self, run, db, seeded, capsys
@@ -4389,7 +4390,7 @@ class TestCommitConfig:
         buf = io.StringIO()
         assert cli_errors.report(excinfo.value, resolved, stream=buf) == 75
         assert buf.getvalue().splitlines()[0] == (
-            "error: config changed underneath you (generation 0, now generation 1); re-run"
+            "error: config changed underneath you (generation 0, now generation 1)"
         )
         dispose_all()
         assert exported(run, db) == before
@@ -4513,9 +4514,9 @@ class TestNotifyDaemon:
         cli_write.notify_daemon(resolved, 3)
         out = capsys.readouterr()
         assert out.out == (
-            f"config updated (generation 3); the daemon's supervisor (pid {holder.pid}) "
-            "is gone but processes it forked still hold the lock; restart the daemon "
-            "after they exit\n"
+            "config updated (generation 3); "
+            + daemonlock.stale_supervisor_message(daemonlock.lock_path(resolved), holder.pid)
+            + "\n"
         )
         assert "no running daemon" not in out.out and "will not apply" not in out.out
         assert out.err == ""
@@ -4669,9 +4670,11 @@ class TestDaemonNoticeWording:
         cli_write.notify_daemon(resolved, 3)
         out = capsys.readouterr()
         assert out.out == (
-            "config updated (generation 3); the daemon's supervisor (pid 4321) is gone "
-            "but processes it forked still hold the lock; restart the daemon after they exit\n"
+            "config updated (generation 3); "
+            + daemonlock.stale_supervisor_message(daemonlock.lock_path(resolved), 4321)
+            + "\n"
         )
+        assert "find them with `fuser" in out.out
         assert "running daemon" not in out.out and "is on generation" not in out.out
 
     def test_a_dead_supervisor_with_the_same_generation_is_still_reported_gone(
@@ -4681,7 +4684,7 @@ class TestDaemonNoticeWording:
         outlive the supervisor are not a daemon that "is already on" anything."""
         self._daemon(monkeypatch, pid=4321, generation=5, alive=False)
         line, _ = cli_write._daemon_notice(resolved, 5)
-        assert "supervisor (pid 4321) is gone" in line and "already on" not in line
+        assert "supervisor pid 4321 is gone" in line and "already on" not in line
 
     def test_a_live_but_unsignalable_pid_is_a_running_daemon(self, resolved, monkeypatch):
         """EPERM means the process exists (it is root's, we are not)."""
@@ -4715,26 +4718,28 @@ class TestDaemonNoticeWording:
         line, _ = cli_write._daemon_notice(resolved, 3)
         assert "is gone" not in line
 
-    def test_pid_alive_falls_back_to_kill_zero_without_the_daemonlock_helper(
-        self, monkeypatch
-    ):
-        for name in ("pid_alive", "is_pid_alive", "pid_is_alive", "process_alive"):
-            monkeypatch.delattr(daemonlock, name, raising=False)
-        monkeypatch.setattr(os, "kill", _raising(ProcessLookupError(errno.ESRCH, "x")))
-        assert cli_write._pid_alive(4321) is False
-        monkeypatch.setattr(os, "kill", _raising(PermissionError(errno.EPERM, "x")))
-        assert cli_write._pid_alive(4321) is True
-        monkeypatch.setattr(os, "kill", _raising(OSError(errno.EIO, "x")))
-        assert cli_write._pid_alive(4321) is None
-        monkeypatch.setattr(os, "kill", lambda p, s: None)
-        assert cli_write._pid_alive(4321) is True
+    def test_the_notice_asks_the_probe_result_not_a_private_shim(self):
+        # the `_pid_alive` shim in cli.write is gone: liveness is DaemonInfo.pid_alive
+        assert not hasattr(cli_write, "_pid_alive")
 
-    def test_pid_alive_uses_the_daemonlock_helper_when_it_exists(self, monkeypatch):
+    def test_daemon_info_pid_alive_is_kill_zero(self, monkeypatch):
+        info = daemonlock.DaemonInfo(pid=4321, generation=1)
+        monkeypatch.setattr(daemonlock.os, "kill", _raising(ProcessLookupError(errno.ESRCH, "x")))
+        assert info.pid_alive is False
+        monkeypatch.setattr(daemonlock.os, "kill", _raising(PermissionError(errno.EPERM, "x")))
+        assert info.pid_alive is True            # someone else's process: it exists
+        monkeypatch.setattr(daemonlock.os, "kill", _raising(OSError(errno.EIO, "x")))
+        assert info.pid_alive is None            # cannot tell
+        monkeypatch.setattr(daemonlock.os, "kill", lambda p, s: None)
+        assert info.pid_alive is True
+
+    def test_the_notice_uses_daemon_info_pid_alive(self, resolved, monkeypatch):
         monkeypatch.setattr(
-            os, "kill", lambda *a: pytest.fail("the helper should have been used")
+            daemonlock, "probe", lambda r: daemonlock.DaemonInfo(pid=4321, generation=2)
         )
         monkeypatch.setattr(daemonlock, "pid_is_alive", lambda pid: False)
-        assert cli_write._pid_alive(4321) is False
+        line, _ = cli_write._daemon_notice(resolved, 3)
+        assert "supervisor pid 4321 is gone" in line
 
     @pytest.mark.parametrize(
         "error",
@@ -5095,9 +5100,11 @@ class TestImportBesideARealDaemon:
 
     @pytest.fixture
     def daemon(self, db, tmp_path, run, monkeypatch):
-        zfs = os.environ.get("ZFS_CMD") or shutil.which("zfs") or shutil.which("true") or "/usr/bin/true"
-        monkeypatch.setenv("ZFS_CMD", zfs)
-        monkeypatch.setenv("ZPOOL_CMD", os.environ.get("ZPOOL_CMD") or zfs)
+        from _hermetic import hermetic_env
+
+        stubs = hermetic_env()  # a stub, never `which("zfs")`
+        monkeypatch.setenv("ZFS_CMD", stubs["ZFS_CMD"])
+        monkeypatch.setenv("ZPOOL_CMD", stubs["ZPOOL_CMD"])
         import socket
         import uuid
 
@@ -5118,7 +5125,7 @@ class TestImportBesideARealDaemon:
         proc = subprocess.Popen(
             [sys.executable, "-m", "zfsbackup.daemon", "-c", str(db), "--dry-run"],
             stdout=log, stderr=subprocess.STDOUT, cwd=str(REPO),
-            env=dict(os.environ, PYTHONUNBUFFERED="1"), start_new_session=True,
+            env=hermetic_env(PYTHONUNBUFFERED="1"), start_new_session=True,
         )
         try:
             deadline = time.monotonic() + self.STARTUP
@@ -5147,7 +5154,9 @@ class TestImportBesideARealDaemon:
         finally:
             log.close()
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                # pgid == pid (start_new_session); no getpgid(): the leader may
+                # already be reaped, with its workers still running
+                os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
             try:

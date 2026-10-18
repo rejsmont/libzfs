@@ -14,18 +14,16 @@ poetry install --with dev
 pytest
 ```
 
-`libzfseasy/zfs.py` resolves the `zfs`/`zpool` binaries at **import** time and raises `RuntimeError`
-if it finds neither `$ZFS_CMD`/`$ZPOOL_CMD` nor a binary on `PATH` — so the suite cannot even be
-*collected* without them, despite never executing them (`conftest.py` patches `subprocess.Popen`).
-On a machine with no ZFS installed, point them at stubs:
+`libzfseasy/zfs.py` resolves the `zfs`/`zpool` binaries at **import** time. `tests/conftest.py`
+therefore points `ZFS_CMD`/`ZPOOL_CMD` at a harmless stub before importing it whenever they are unset,
+so a bare `pytest` never runs a real `zfs` (the developer's Mac has one), and every test subprocess gets
+a hermetic environment (`tests/_hermetic.py::hermetic_env()`: a private PATH with stub `zfs`/`zpool`
+and no `/usr/bin`). The mocked suite must never touch real ZFS; the `real_zfs` tier is the opt-in
+exception (below). `.github/workflows/tests.yml` sets explicit stubs.
 
-```bash
-printf '#!/bin/sh\nexit 0\n' > /tmp/zfs && chmod +x /tmp/zfs
-ZFS_CMD=/tmp/zfs ZPOOL_CMD=/tmp/zfs pytest
-```
-
-This is what `.github/workflows/tests.yml` does. Making the resolution lazy would be the better fix
-and is an open item against `libzfseasy`.
+The suite also fails loudly if any process it started outlives it (a `ZFSB_TEST_SESSION` marker plus an
+orphan check at session end that also tracks fork-without-exec children; `ZFSB_ALLOW_ORPHANS=1`
+downgrades that to a warning).
 
 **Run a single test file or test:**
 ```bash
@@ -42,9 +40,13 @@ pytest -m integration
 **Run real ZFS integration tests (requires a test pool):**
 ```bash
 ./scenarios/setup_test_pool.sh        # create file-backed pool
-pytest -m real_zfs
+ZFSB_REAL_ZFS=1 pytest -m real_zfs
 ./scenarios/cleanup_test_pool.sh      # destroy pool when done
 ```
+
+The real tier is **opt-in**: without `ZFSB_REAL_ZFS=1`, `pytest -m real_zfs` skips every real test
+(and an unset `ZFS_CMD`/`ZPOOL_CMD` is stubbed for the whole session). Set it per command; never export
+it in a shared shell profile.
 
 **Run the backup daemon:**
 
@@ -96,7 +98,7 @@ Properties are stored internally as integer-indexed lists (using `_prop_names` c
 
 **[zfsbackup/daemon.py](zfsbackup/daemon.py)** — `BackupDaemon` is a **multiprocessing supervisor**, not a single-process loop: it owns a shared **`zfsbackup.stopflag.StopFlag`** (a lock-free shared byte — **not** a `multiprocessing.Event`; see below), installs `SIGINT`/`SIGTERM` handlers, spawns the worker processes, then polls and restarts any that die. Entry point: `python -m zfsbackup.daemon` (flags `-c/--config`, `-d/--dry-run`, `-v/--verbose`, `--test-config`).
 
-**[zfsbackup/workers.py](zfsbackup/workers.py)** — the per-dataset work runs here. `BaseWorker.run` builds a `DatasetManager`, iterates its datasets calling an abstract `_process_dataset`, and sleeps via `stop_event.wait(timeout=interval)`. Subclasses: `SnapshotWorker`, `PruningWorker`, `RemoteBackupWorker` (lazy-imports `RemoteBackupManager`), `ApiWorker` (runs the Flask app in a thread).
+**[zfsbackup/workers.py](zfsbackup/workers.py)** — the per-dataset work runs here. `BaseWorker.run` builds a `DatasetManager`, iterates its datasets calling an abstract `_process_dataset`, and sleeps in short slices (`_wait`), checking at every safe point (loop top, between datasets, each slice) whether to stop or whether its supervisor has died (`_SupervisorWatch` — an orphaned worker exits on its own, never mid-transfer). Workers receive the supervisor's config object and never open the config DB. Subclasses: `SnapshotWorker`, `PruningWorker`, `RemoteBackupWorker` (lazy-imports `RemoteBackupManager`), `ApiWorker` (binds the HTTP server in its main thread and exits 1 if it cannot, so the supervisor's backoff applies).
 
 **[zfsbackup/remote.py](zfsbackup/remote.py)** / **[zfsbackup/api.py](zfsbackup/api.py)** — remote send/receive transfer (`RemoteBackupManager`) and the HTTP control API (`create_app`). Remote backup is **not deployment-ready** (no auth/TLS) — see [docs/production_readiness_report.md](docs/production_readiness_report.md).
 
@@ -135,7 +137,7 @@ Files next to the config DB: `config.db` (+ `-wal`/`-shm` while open), `config.d
 writer lock — empty, never deleted), `config.db.daemon.pid` (daemon presence lock), and
 `config.db.pre-import-<UTC>.yaml` backups written by `import`.
 
-**[zfsbackup/cli/](zfsbackup/cli/)** — the `zfsbackup-config` Click application (Phase 2, in progress):
+**[zfsbackup/cli/](zfsbackup/cli/)** — the `zfsbackup-config` Click application (Phase 2):
 `import`, `export`, `migrate`, `list`, `get`/`set`/`unset` (dot paths, `dotpath.py`), `edit`
 (whole config or one dataset/destination in `$EDITOR`, `editor.py`) and `rename dataset|destination`
 (`rename.py`, which also handles the ZFS anchor/property side effects); `render.py` turns a `BackupConfig` back into YAML that
@@ -184,8 +186,13 @@ It is the only writer of the config DB. Exit codes: 0 ok, 1 invalid/refused, 2 u
 | `tests/test_zfsbackup_cli_render.py` | YAML renderer round trip (values and duration literals) |
 | `tests/test_zfsbackup_cli_list.py` | `list datasets|destinations`, text and `--json` |
 | `tests/test_zfsbackup_cli_dotpath.py` | `get`/`set`/`unset` dot paths, coercion, warnings |
-| `tests/test_zfsbackup_cli_edit.py` | `edit` in `$EDITOR`: buffers, retry/abort, rename detection, signals |
+| `tests/test_zfsbackup_cli_edit.py` | `edit` in `$EDITOR`: buffers, retry/abort, rename detection |
+| `tests/test_zfsbackup_cli_edit_signals.py` | Signal handling around the `$EDITOR` child (subprocess tests) |
 | `tests/test_zfsbackup_cli_rename.py` | `rename dataset|destination` and their ZFS anchor/property effects (fake `zfs`) |
+| `tests/test_zfsbackup_cli_closeout.py` | `-c`/`-v` on `list`/`rename` groups, `where_flag`, console-script signal disposition, whole-config prefix-change warning |
+| `tests/test_zfsbackup_daemon_closeout.py` | Startup SIGHUP handler, supervisor-death watch and sliced waits, ApiWorker failures, real `kill -9` of the supervisor under fork/spawn/forkserver |
+| `tests/test_zfsbackup_store_heldlock.py` | `read_generation`, `write_config(lock=held)`/`require_writer_lock_held`, destination-name and never-prune warnings |
+| `tests/test_orphan_safety_net.py` | The orphan net and test hygiene: fork-without-exec, subreapers, fresh session marker, real-tier opt-in skip, hermetic env, guard PATH |
 | `tests/test_no_real_zfs_guard.py` | The conftest guard that fails any test reaching a real `zfs`/`zpool` |
 | `tests/test_marker_tiers.py` | `unit` and `integration` partition the mocked suite |
 | `tests/test_zfsbackup_real.py` | Daemon against a real pool, marked `real_zfs` |

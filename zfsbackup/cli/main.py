@@ -5,9 +5,13 @@ only ever read it). It reaches the database exclusively through
 `zfsbackup.config.store`'s public API (path resolution, `read_config`,
 `write_config`, schema migration, `import_yaml`) -- never an ORM model, never
 a query -- so every schema invariant stays behind the mapper. It imports
-nothing of the daemon (`runtime_config`, `daemon`, `workers`, ...); the one
-daemon-lane module it uses is `daemonlock`, to tell the operator after a write
-whether a daemon is running. Every write follows `write.py`'s discipline.
+nothing of the daemon (`runtime_config`, `daemon`, `workers`, ...) at import
+time; the one daemon-lane module it uses is `daemonlock`, to tell the operator
+after a write whether a daemon is running. The single exception is `rename.py`,
+which imports `zfsbackup.backup_manager` (and with it `libzfseasy`) LAZILY, only
+inside `rename dataset|destination`, because the ZFS user-property helpers live
+there; nothing else loads it, and a host without ZFS can still run every other
+command. Every write follows `write.py`'s discipline.
 
 Commands:
 
@@ -37,7 +41,6 @@ conflict/busy, 78 config database unusable).
 import errno
 import logging
 import os
-import shlex
 import signal
 import stat
 import tempfile
@@ -53,7 +56,7 @@ from zfsbackup.cli import dotpath, editor, rename
 from zfsbackup.cli.errors import BackupFailed, CliError, is_database_unusable, report
 from zfsbackup.cli.listing import render_datasets, render_destinations
 from zfsbackup.cli.render import render_yaml
-from zfsbackup.cli.write import commit_config, notify_daemon, read_snapshot
+from zfsbackup.cli.write import commit_config, notify_daemon, read_snapshot, where_flag
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
     CONFIG_PATH_ENV,
@@ -240,9 +243,7 @@ class _Group(click.Group):
                 # ^C can land before, inside or just after the commit; the
                 # store's notes say what it knows, but only the database says
                 # which it was.
-                where = ""
-                if state is not None and state.resolved is not None and state.resolved.source != "default":
-                    where = f" -c {shlex.quote(str(state.resolved.resolved_path))}"
+                where = where_flag(state.resolved) if state is not None and state.resolved is not None else ""
                 click.echo(
                     f"{word} -- the import may or may not have been applied; "
                     f"run `zfsbackup-config{where} export` to check",
@@ -509,7 +510,7 @@ def import_cmd(yaml_file: Path, no_backup: bool, config_path: Optional[str], ver
         )
         click.echo(f"Imported {yaml_file} into {where}.")
     click.echo(f"Schema revision: {result.head_revision}")
-    _notify_after_import(resolved, getattr(result, "generation", None))
+    _notify_after_import(resolved, result.generation)
 
 
 def _notify_after_import(resolved: ResolvedConfigPath, generation: Optional[int] = None) -> None:
@@ -732,7 +733,7 @@ def migrate_cmd(check: bool, config_path: Optional[str], verbose: bool) -> None:
     try:
         check_config_schema(resolved)
     except SchemaOutOfDate as exc:
-        if not getattr(exc, "recorded_revisions", None):
+        if not exc.recorded_revisions:
             raise
 
     # Serialise with `import` and every other write: the same writer lock they
@@ -761,8 +762,9 @@ def migrate_cmd(check: bool, config_path: Optional[str], verbose: bool) -> None:
     "list",
     help="Show the stored datasets or destinations (read-only).",
 )
-def list_group() -> None:
-    pass
+@_common
+def list_group(config_path: Optional[str], verbose: bool) -> None:
+    _state(config_path, verbose)
 
 
 _JSON_OPTION = click.option(
@@ -1080,8 +1082,9 @@ def edit_destination_cmd(
 
 
 @cli.group("rename", help="Rename a dataset or a destination in the configuration.")
-def rename_group() -> None:
-    pass
+@_common
+def rename_group(config_path: Optional[str], verbose: bool) -> None:
+    _state(config_path, verbose)
 
 
 _DRY_RUN = click.option(
@@ -1197,7 +1200,17 @@ def main(argv: Optional[List[str]] = None) -> None:
             raise
     finally:
         if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+            if argv is None:
+                # The console script: the process is about to exit. Keep SIGTERM
+                # handled (ignored) rather than back at its default, which
+                # would kill a command that has already committed while it
+                # flushes and exits. SIGINT likewise: a Ctrl-C here would
+                # raise KeyboardInterrupt mid-flush and print a traceback over
+                # a result that is already saved.
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+            else:
+                signal.signal(signal.SIGTERM, previous)  # embedded (tests)
 
 
 if __name__ == "__main__":  # pragma: no cover

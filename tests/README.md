@@ -60,6 +60,31 @@ pytest -m subprocess
 
 **WARNING: These tests run actual ZFS commands and require a test pool.**
 
+**The real tier is opt-in: export `ZFSB_REAL_ZFS=1`.** Without it, `pytest -m real_zfs`
+SKIPS every real test (with that reason) and sets up no pool -- the pool fixture would
+otherwise run `sudo -n zpool create` -- and, in every run, an unset `ZFS_CMD` / `ZPOOL_CMD`
+is pointed at a stub so that nothing in the mocked tiers (including the real
+daemons and CLIs they start in subprocesses) can resolve the host's `zfs`/`zpool`:
+
+```bash
+pytest                              # mocked tiers; real_zfs tests are deselected
+pytest -m real_zfs                  # all real_zfs tests SKIPPED (no ZFSB_REAL_ZFS)
+ZFSB_REAL_ZFS=1 pytest -m real_zfs  # the real tier: nothing is stubbed, real zfs/zpool run
+```
+
+With `ZFSB_REAL_ZFS=1` the real binaries must be resolvable (`ZFS_CMD`/`ZPOOL_CMD` or `PATH`).
+The mocked tests in the same session are still guarded: the in-process guard
+(`_never_run_a_real_zfs` in `conftest.py`) fails any non-`real_zfs` test that starts a
+real `zfs`/`zpool` itself, and test helpers that start subprocesses build their environment
+with `tests/_hermetic.py::hermetic_env()` (stub binaries, a private `PATH`).
+The guard covers only the pytest process; subprocess safety comes from that environment.
+
+Leaked processes: every session gets a fresh `ZFSB_TEST_SESSION` marker, and
+`conftest.pytest_sessionfinish` kills -- and FAILS the run for -- any process of the session
+(exec'd children are found by the marker in their environment, children forked without exec by
+an at-fork record) that outlives its tests and is no longer a descendant of pytest. Set
+`ZFSB_ALLOW_ORPHANS=1` to downgrade that failure to a warning.
+
 #### Setup Test Pool
 
 Create a file-backed test pool (safe for testing):

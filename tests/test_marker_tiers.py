@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from _hermetic import nested_env
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -28,7 +30,7 @@ def _collected(expression: str) -> int:
             "--no-cov", "-p", "no:cacheprovider", "-o", "addopts=",
             "-m", expression,
         ],
-        cwd=ROOT, env=dict(os.environ), capture_output=True, text=True, timeout=120,
+        cwd=ROOT, env=nested_env(), capture_output=True, text=True, timeout=120,
     )
     assert proc.returncode in (0, 5), proc.stdout + proc.stderr
     # "982/1108 tests collected (126 deselected)" or "1108 tests collected"

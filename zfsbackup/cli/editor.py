@@ -70,7 +70,7 @@ from zfsbackup.cli.render import (
     render_destination_fragment,
     render_yaml,
 )
-from zfsbackup.cli.write import commit_config, notify_daemon, release_database
+from zfsbackup.cli.write import commit_config, notify_daemon, release_database, where_flag
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
     ConfigBusy,
@@ -89,6 +89,14 @@ _HEADER = """\
 # you delete deletes one. To rename, quit and use `zfsbackup-config rename`.
 # (Comments are not stored.)
 """
+
+
+def _not_started(message: str) -> CliError:
+    """A `CliError` marked as "the editor program never ran": the buffer is
+    exactly what was rendered, so there is nothing of the operator's to keep."""
+    error = CliError(message)
+    error.editor_not_started = True  # type: ignore[attr-defined]
+    return error
 
 
 class EditAborted(CliError):
@@ -184,11 +192,13 @@ def _run_editor(argv: Sequence[str], buffer: Path) -> None:
             # No stdin/stdout/stderr arguments: the editor inherits ours.
             child = subprocess.Popen([*argv, str(buffer)])
         except FileNotFoundError:
-            raise CliError(
+            raise _not_started(
                 f"editor not found: {argv[0]!r} (set $VISUAL or $EDITOR, or use --editor)"
             ) from None
         except OSError as exc:
-            raise CliError(f"cannot run the editor {argv[0]!r}: {exc.strerror or exc}") from exc
+            raise _not_started(
+                f"cannot run the editor {argv[0]!r}: {exc.strerror or exc}"
+            ) from exc
         if terminated_at:
             try:
                 child.send_signal(signal.SIGTERM)
@@ -329,13 +339,6 @@ def _anchor_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
     return messages
 
 
-def _where(resolved: ResolvedConfigPath) -> str:
-    """` -c <db>` unless the database is the default one."""
-    if getattr(resolved, "source", "default") == "default":
-        return ""
-    return f" -c {shlex.quote(str(resolved.resolved_path))}"
-
-
 def _recreate_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
     """A deleted dataset plus a created one that send to a common destination
     is probably a rename the exact-match detector missed (something else
@@ -362,20 +365,6 @@ def _recreate_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
                     "leaves the old dataset's org.zfsbackup:* properties stale and makes "
                     "the next backup a full send"
                 )
-    return messages
-
-
-def _destination_name_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
-    """A destination created by this edit whose name cannot be part of a ZFS
-    property name. Only a warning: configurations that already have such a
-    name keep working (their anchors just cannot be stored)."""
-    messages: List[str] = []
-    for name in sorted(set(new.destinations) - set(old.destinations)):
-        problem = dotpath.destination_name_problem(name)
-        if problem:
-            messages.append(
-                f"destination {name!r}: {problem}; its anchor property cannot be set"
-            )
     return messages
 
 
@@ -411,6 +400,17 @@ def _write_buffer(directory: Path, text: str) -> Path:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
     return path
+
+
+def _buffer_untouched(path: Path, initial: str) -> bool:
+    """Is the buffer exactly what was written for the operator (or never
+    written at all)? Then there is nothing to keep."""
+    try:
+        return path.read_text(encoding="utf-8") == initial
+    except FileNotFoundError:
+        return True
+    except (OSError, UnicodeDecodeError):
+        return False
 
 
 def _ask_retry() -> bool:
@@ -628,9 +628,9 @@ def _session(
     directory = Path(tempfile.mkdtemp(prefix="zfsbackup-config-edit-"))
     keep = True
     committing = False
+    initial = header + initial_body
     try:
         os.chmod(directory, 0o700)
-        initial = header + initial_body
         buffer = _write_buffer(directory, initial)
 
         while True:
@@ -682,7 +682,7 @@ def _session(
         for message in (
             _anchor_warnings(original, canon)
             + _recreate_warnings(original, canon)
-            + _destination_name_warnings(original, canon)
+            + dotpath.prefix_change_warnings(original, canon)
         ):
             warn(message)
         committing = True
@@ -695,13 +695,19 @@ def _session(
     except BaseException as exc:
         # The note is printed after the error itself (errors.report, and the
         # ^C handler, print `__notes__`).
+        if (
+            keep
+            and getattr(exc, "editor_not_started", False)
+            and _buffer_untouched(directory / "config.yaml", initial)
+        ):
+            keep = False  # the editor never ran: nothing of the operator's to keep
         if keep:
             if committing and not isinstance(exc, Exception):
                 # Interrupted while the write was in flight (it may even have
                 # committed): do not claim either way.
                 exc.add_note(
                     "the edit may or may not have been applied; run "
-                    f"`zfsbackup-config{_where(resolved)} export` to check. Your edit is "
+                    f"`zfsbackup-config{where_flag(resolved)} export` to check. Your edit is "
                     f"kept in {directory / 'config.yaml'}"
                 )
             else:

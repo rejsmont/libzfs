@@ -95,8 +95,17 @@ from the name, so the next send is likely a full one. `--clear-stale-props` remo
 `org.zfsbackup:*` properties. It is refused up front when the new dataset doesn't exist in ZFS yet (if
 you are about to `zfs rename`, those properties follow it). If a daemon is running, the rename itself is
 still saved but the properties are left alone: the command prints the `zfs inherit` commands to run
-after stopping the daemon and exits 1. A daemon that tries to start during those few seconds of
-clearing may be refused once; a restart policy takes care of it.
+after stopping the daemon and exits 1.
+
+`rename destination` and `--clear-stale-props` change ZFS user properties, so they need ZFS write
+rights on the datasets involved: run them as root, or grant them with
+`zfs allow <user> userprop <dataset>`. Without those rights:
+- `rename dataset --clear-stale-props` still saves the rename (the configuration is written first),
+  then reports that clearing the old properties failed and prints the `zfs inherit` commands to run
+  with the right privileges;
+- `rename destination` fails on the first dataset it cannot write and saves nothing; anchors already
+  copied to earlier datasets stay, and the exact `zfs set`/`zfs inherit` commands to undo them are
+  printed.
 
 `rename destination` copies each dataset's `org.zfsbackup:anchor.<old>` to `anchor.<new>` before saving.
 If `anchor.<new>` already exists with a different value (left over from an earlier destination of that

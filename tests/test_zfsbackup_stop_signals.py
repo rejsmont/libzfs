@@ -124,6 +124,8 @@ from pathlib import Path
 
 import pytest
 
+from _hermetic import is_real_zfs
+
 pytestmark = pytest.mark.integration
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -163,17 +165,18 @@ _STUB_ZFS_SCRIPT = "#!/bin/sh\n# stub zfs: always succeeds, empty stdout\nexit 0
 def _resolve_zfs_cmd(tmp_path: Path) -> str:
     """Return the `zfs` binary this module's daemon subprocess should use.
 
-    Prefers whatever is already resolvable -- an explicit `$ZFS_CMD` or a
-    real `zfs` on `PATH` -- unchanged, so a dev machine with ZFS installed
-    exercises the genuine binary exactly as before. Only when NEITHER is
-    present does it fall back to a freshly written stub script, which is
+    Uses an explicit `$ZFS_CMD` (the suite sets it to a stub; see
+    `tests/_hermetic.py`) unless it names a REAL `zfs`; otherwise -- and
+    NEVER by looking for `zfs` on `PATH`, which on a dev machine with ZFS
+    installed would run the real binary (a `--dry-run` daemon still issues
+    `zfs set`) -- it falls back to a freshly written stub script, which is
     what keeps this module out of CI's blind spot (see module docstring):
     the stub's `verify_datasets()`/`needs_snapshot()`/`prune_snapshots()`
     calls all succeed as no-ops against it in `--dry-run` mode, which is
     all this module's `--dry-run` daemon ever needs from `zfs`.
     """
-    existing = os.environ.get('ZFS_CMD') or shutil.which('zfs')
-    if existing:
+    existing = os.environ.get('ZFS_CMD')
+    if existing and not is_real_zfs(existing):
         return existing
     stub_path = tmp_path / 'zfs'
     stub_path.write_text(_STUB_ZFS_SCRIPT)
@@ -268,12 +271,11 @@ def _killpg_quiet(pid: int, sig: int = signal.SIGKILL) -> None:
     `finally`, possibly after the target has already exited cleanly (in
     which case its pid, and any pgid lookup on it, may already be gone).
     """
+    # `pid` led its own session (`start_new_session=True`), so pgid == pid. NOT
+    # `getpgid(pid)`: after the leader is reaped that raises and the workers --
+    # orphans in a group with no leader -- would never be signalled.
     try:
-        pgid = os.getpgid(pid)
-    except (ProcessLookupError, PermissionError):
-        return
-    try:
-        os.killpg(pgid, sig)
+        os.killpg(pid, sig)
     except (ProcessLookupError, PermissionError):
         pass
 
@@ -284,10 +286,10 @@ def _killpg_quiet(pid: int, sig: int = signal.SIGKILL) -> None:
 class TestResolveZfsCmd:
     """`_resolve_zfs_cmd` is the seam that keeps this module's headline
     regression (and its own sensitivity control) out of CI's blind spot --
-    see the module docstring. A dev machine with ZFS installed must see
-    NO change in behaviour (the real binary), and a machine with neither
-    `$ZFS_CMD` nor `zfs` on `PATH` must get a working stub instead of a
-    skip. Covered directly here, not only through the effect of
+    see the module docstring. A dev machine with ZFS installed must NOT
+    get its real binary (it is never taken from `PATH`, and a `$ZFS_CMD`
+    naming one is replaced), and a machine with no usable `$ZFS_CMD` must get
+    a working stub instead of a skip. Covered directly here, not only through the effect of
     `TestDaemonRealSignalShutdown` always running.
     """
 
@@ -297,13 +299,19 @@ class TestResolveZfsCmd:
         # And it must not have written a stub nobody asked for.
         assert not (tmp_path / 'zfs').exists()
 
-    def test_prefers_path_zfs_when_zfs_cmd_unset(self, tmp_path, monkeypatch):
+    def test_never_uses_a_zfs_found_on_path(self, tmp_path, monkeypatch):
         monkeypatch.delenv('ZFS_CMD', raising=False)
         monkeypatch.setattr(
             shutil, 'which', lambda name: '/usr/bin/zfs' if name == 'zfs' else None
         )
-        assert _resolve_zfs_cmd(tmp_path) == '/usr/bin/zfs'
-        assert not (tmp_path / 'zfs').exists()
+        assert _resolve_zfs_cmd(tmp_path) == str(tmp_path / 'zfs')  # the stub
+
+    def test_replaces_a_zfs_cmd_that_names_a_real_binary(self, tmp_path, monkeypatch):
+        real = tmp_path / 'bin' / 'zfs'
+        real.parent.mkdir()
+        shutil.copy(shutil.which('echo') or '/bin/echo', real)  # a compiled file named zfs
+        monkeypatch.setenv('ZFS_CMD', str(real))
+        assert _resolve_zfs_cmd(tmp_path) == str(tmp_path / 'zfs')
 
     def test_writes_a_working_executable_stub_when_neither_is_present(
         self, tmp_path, monkeypatch
@@ -350,7 +358,9 @@ def _spawn_daemon(db_path: Path, log_path: Path):
     `PIPE`, see module docstring) and returns the `Popen` handle. The
     caller is responsible for tearing it down via `_killpg_quiet`.
     """
-    env = dict(os.environ)
+    from _hermetic import hermetic_env
+
+    env = hermetic_env()
     # Logging module handlers flush per record, but the underlying file
     # object Python opens for a non-tty stdout is still block-buffered by
     # default -- without this, `_wait_for_worker_parked` can spin for a

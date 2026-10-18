@@ -705,7 +705,75 @@ def _release_refused(lock) -> None:
         lock.release()
 
 
+class _StartupHup:
+    """A flag-only SIGHUP handler for the window before `BackupDaemon` exists.
+
+    The presence lock is taken at the top of `_run`, i.e. the daemon is
+    already visible to `probe()` -- and so to `zfsbackup-config`'s
+    auto-reload SIGHUP -- long before `BackupDaemon.__init__` installs the
+    real handler. In that window SIGHUP has its default action, terminate,
+    so a config edit racing a daemon start killed the starting daemon
+    (measured 8/8). This handler does one plain store and returns; `_run`
+    carries the result into the daemon's own `_hup_requested`, so the first
+    poll logs it exactly as it would a SIGHUP received later.
+
+    Deliberately SIGHUP only. SIGINT/SIGTERM keep their default
+    dispositions until `BackupDaemon.__init__`: before the first fork there
+    are no workers to orphan, the kernel drops the lock, a stale pid file is
+    harmless, and a startup stuck in slow I/O must stay killable. After the
+    daemon exists the three signals are all handled by `BackupDaemon`.
+    """
+
+    def __init__(self) -> None:
+        self.pending = False
+        #: Set once `BackupDaemon` owns the signals; `restore` is then a no-op.
+        self.handed_over = False
+        self._previous = None
+        self._installed = False
+
+    def _handler(self, signum, frame) -> None:
+        self.pending = True
+
+    def install(self) -> None:
+        try:
+            self._previous = signal.signal(signal.SIGHUP, self._handler)
+            self._installed = True
+        except ValueError:  # not the main thread (embedded/test use)
+            pass
+
+    def restore(self) -> None:
+        """Put back the previous disposition on a path that never created a
+        daemon (refusal, `--test-config`); never after hand-over."""
+        if self._installed and not self.handed_over:
+            self._installed = False
+            signal.signal(signal.SIGHUP, self._previous)
+
+
 def _run(args: argparse.Namespace, abandoned: Optional[List[str]] = None) -> int:
+    """Install the startup SIGHUP handler (see `_StartupHup`), then
+    `_run_startup`. Installed before anything else -- in particular before the
+    presence lock -- and left in place until `BackupDaemon` replaces it.
+    """
+    early_hup = _StartupHup()
+    if not args.test_config:  # `--test-config` takes no lock and is never probed
+        early_hup.install()
+    try:
+        return _run_startup(args, abandoned, early_hup)
+    finally:
+        # Drop the engines BEFORE SIGHUP gets its default action (terminate)
+        # back: a refusal path still holds a pooled connection here, and an
+        # auto-reload SIGHUP landing between a restore and `main()`'s own
+        # `dispose_all()` would kill the process with it open. Idempotent,
+        # so `main()` repeating it is harmless.
+        dispose_all()
+        early_hup.restore()
+
+
+def _run_startup(
+    args: argparse.Namespace,
+    abandoned: Optional[List[str]],
+    early_hup: _StartupHup,
+) -> int:
     """`main()`'s body, minus argument parsing and the `dispose_all()` that
     must run on every return path. Split out so that cleanup is a single
     `finally` rather than something each `return` has to remember.
@@ -834,6 +902,15 @@ def _run(args: argparse.Namespace, abandoned: Optional[List[str]] = None) -> int
     clean = False
     try:
         daemon = BackupDaemon(config, resolved, verbose=args.verbose)
+        # `BackupDaemon.__init__` has replaced the startup handler; a SIGHUP
+        # that landed before that is carried over. A SIGHUP landing between
+        # the replacement and this line went to the daemon's own handler.
+        early_hup.handed_over = True
+        # Only ever SET the flag: a read-modify-write here could overwrite a
+        # SIGHUP that the daemon's handler recorded between the read and the
+        # store.
+        if early_hup.pending:
+            daemon._hup_requested = True
         code = daemon.run()
         clean = True
         return code

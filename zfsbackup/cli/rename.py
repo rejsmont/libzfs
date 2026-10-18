@@ -28,11 +28,14 @@ written.
 - `--clear-stale-props` removes `org.zfsbackup:config` and every
   `org.zfsbackup:anchor.*` from the old dataset. It is refused up front when
   the new ZFS dataset does not exist yet (the operator may be about to
-  `zfs rename`, and the properties follow the dataset). The daemon check is made
-  AFTER the configuration write and held through the `zfs inherit`s
-  (`_no_daemon`): a daemon that is running then is not trusted with the old
-  dataset's properties removed, so they are left and the exact commands to run
-  once it stops are printed (exit 1; the rename itself was done).
+  `zfs rename`, and the properties follow the dataset). The daemon check is a
+  single `daemonlock.probe()` made AFTER the configuration write
+  (`_no_daemon`), not a held lock: a daemon that starts later reads the NEW
+  configuration and never touches the old dataset, while one running now may
+  have loaded the old one. If one is running (or the probe cannot tell), the
+  properties are left and the exact commands to run once it stops are printed
+  (exit 1; the rename itself was done). Without `--clear-stale-props` the same
+  commands are printed after the rename.
 
 **rename destination OLD NEW**
 - refused if NEW already exists;
@@ -41,10 +44,15 @@ written.
   printed; the snapshot the overwritten value named is no longer pinned by
   it) -- never moved: the daemon protects every local or received `anchor.*`,
   so the old property keeps protecting its snapshot until the operator clears
-  it. A failed copy aborts before the write and names the datasets already
-  copied (re-running refreshes them); a referencing dataset that does not exist
-  in ZFS aborts too, before anything is copied, unless `--skip-missing`;
-  the new name must be usable in a ZFS property name;
+  it. Because the overwrite is a ZFS change only a successful rename
+  justifies, the order is: take the writer lock (just the flock -- no database
+  connection is open during the zfs calls), re-check that the stored
+  generation is still the snapshot's (else exit 75 before ZFS is touched),
+  copy, then write with the lock handed to `write_config(lock=...)`. If
+  anything fails after a copy, the exact commands that put each previous
+  value back (`zfs set` / `zfs inherit`) are printed. A referencing dataset
+  that does not exist in ZFS aborts before anything is copied, unless
+  `--skip-missing`; the new name must be usable in a ZFS property name.
 - the stale `anchor.OLD` properties are listed afterwards and left in place;
 - no `--force`: the server path does not depend on the destination's name.
 
@@ -62,9 +70,17 @@ import click
 from zfsbackup import daemonlock
 from zfsbackup.cli import dotpath
 from zfsbackup.cli.errors import CliError
-from zfsbackup.cli.write import commit_config, notify_daemon
+from zfsbackup.cli.write import commit_config, notify_daemon, release_database, where_flag
 from zfsbackup.config import BackupConfig
-from zfsbackup.config.store import ConfigSnapshot, ResolvedConfigPath
+from zfsbackup.config.store import (
+    ConfigConflict,
+    ConfigSnapshot,
+    ResolvedConfigPath,
+    destination_name_problem,
+    read_generation,
+    validate_config,
+    writer_lock,
+)
 
 __all__ = ["rename_dataset", "rename_destination"]
 
@@ -236,12 +252,6 @@ def _inherit_commands(dataset: str, props: Sequence[str]) -> str:
     return "\n".join(f"  zfs inherit {p} {shlex.quote(dataset)}" for p in props)
 
 
-def _where(resolved: ResolvedConfigPath) -> str:
-    if getattr(resolved, "source", "default") == "default":
-        return ""
-    return f" -c {shlex.quote(str(resolved.resolved_path))}"
-
-
 def _clear_stale(
     resolved: ResolvedConfigPath, bm: Any, old: str, props: Sequence[str]
 ) -> List[str]:
@@ -312,8 +322,21 @@ def _inherit_commands_for(datasets: Sequence[str], prop: str) -> str:
     return "\n".join(f"  zfs inherit {prop} {shlex.quote(d)}" for d in datasets)
 
 
+def _require_generation(resolved: ResolvedConfigPath, snapshot: ConfigSnapshot) -> None:
+    """Raise `ConfigConflict` (exit 75) unless the stored generation is still
+    the one `snapshot` was read at. Opens and closes a read connection; nothing
+    stays open for the zfs calls that follow."""
+    try:
+        current = read_generation(resolved)
+    finally:
+        release_database()
+    if current != snapshot.generation:
+        raise ConfigConflict(snapshot.generation, current)
+
+
 def _interrupted_after_write(
-    exc: BaseException, applied: str, dataset: Optional[str], to_clear: Sequence[str]
+    exc: BaseException, resolved: ResolvedConfigPath, applied: str,
+    dataset: Optional[str], to_clear: Sequence[str],
 ) -> None:
     """An interrupt after the configuration write committed: say so (unless
     `_clear_stale` already did), with the `zfs inherit` commands still due."""
@@ -321,7 +344,7 @@ def _interrupted_after_write(
         return
     if any("was renamed" in note for note in getattr(exc, "__notes__", ())):
         return
-    note = f"{applied}; run `zfsbackup-config export` to see the configuration"
+    note = f"{applied}; run `zfsbackup-config{where_flag(resolved)} export` to see the configuration"
     if dataset and to_clear:
         note += (
             f". The stale properties on {dataset!r} were not cleared (or not all); to clear "
@@ -336,7 +359,7 @@ def _interrupted_write(exc: BaseException, resolved: ResolvedConfigPath, what: s
     if not isinstance(exc, Exception):
         exc.add_note(
             f"the {what} may or may not have been applied; run "
-            f"`zfsbackup-config{_where(resolved)} export` to check"
+            f"`zfsbackup-config{where_flag(resolved)} export` to check"
         )
 
 
@@ -424,10 +447,8 @@ def rename_dataset(
                 f". If you are about to `zfs rename {old} {new}`, these properties will "
                 "follow it -- don't clear them"
             )
-        elif clear_stale_props:
-            suffix = ""
         else:
-            suffix = " (--clear-stale-props removes them when no daemon is running)"
+            suffix = ""  # the commands to remove them are printed after the rename
         warn(
             f"the ZFS dataset {old!r} keeps its org.zfsbackup:* properties ({names}); they "
             f"do not follow the configuration rename and become stale{suffix}"
@@ -435,9 +456,10 @@ def rename_dataset(
     if remotes:
         warn(f"--force: {_server_note(config, old, new, zfs_renamed)}")
 
-    to_clear = sorted(
+    stale_props = sorted(
         p for p in old_props if p == _PROP_CONFIG or p.startswith(_PROP_ANCHOR)
-    ) if (old_exists and clear_stale_props) else []
+    ) if old_exists else []
+    to_clear = stale_props if clear_stale_props else []
     if dry_run:
         click.echo(f"{prefix}would rename dataset {old!r} -> {new!r} in the configuration")
         if to_clear:
@@ -457,6 +479,13 @@ def rename_dataset(
         raise
     try:
         click.echo(f"Renamed dataset {old!r} -> {new!r} in the configuration.")
+        if stale_props and not clear_stale_props and not about_to_zfs_rename:
+            # Re-running with --clear-stale-props is not possible (OLD is no
+            # longer a configured dataset), so give the commands themselves.
+            click.echo(
+                f"The stale properties on {old!r} were left in place. To remove them, once "
+                f"no daemon is running:\n{_inherit_commands(old, stale_props)}"
+            )
 
         if to_clear:
             # The daemon check is made HERE, after the write (`_no_daemon`).
@@ -468,7 +497,9 @@ def rename_dataset(
             click.echo(f"Cleared on {old!r}: {', '.join(cleared) or '(nothing set)'}")
         notify_daemon(resolved, result.generation)
     except BaseException as exc:
-        _interrupted_after_write(exc, f"the rename of dataset {old!r} was applied", old, to_clear)
+        _interrupted_after_write(
+            exc, resolved, f"the rename of dataset {old!r} was applied", old, to_clear
+        )
         raise
 
 
@@ -487,7 +518,7 @@ def rename_destination(
     skip_missing: bool = False,
     warn: Callable[[str], None],
 ) -> None:
-    problem = dotpath.destination_name_problem(new)
+    problem = destination_name_problem(new)
     if problem:
         raise CliError(
             f"{new!r} cannot be used as a destination name: {problem}. Nothing was changed."
@@ -503,9 +534,16 @@ def rename_destination(
         d.name for d in config.datasets if any(r.destination == old for r in d.remote)
     ]
     new_config = _renamed_destination_config(config, old, new)
+    # Pure and cheap: a configuration the store would refuse must be found
+    # BEFORE any anchor is copied, so that the only failures left after a copy
+    # are I/O ones (`commit_config` repeats the call; warnings print once).
+    for message in validate_config(new_config):
+        warn(message)
     prefix = "[dry run] " if dry_run else ""
 
     outcomes: Dict[str, str] = {}
+    to_copy: List[str] = []
+    bm: Any = None
     if referencing:
         bm, unavailable = _load_backup_manager()
         if bm is None:
@@ -539,35 +577,75 @@ def rename_destination(
                 f"dataset {name!r} does not exist in ZFS: no anchor.{new} was copied for it "
                 "(--skip-missing)"
             )
-        old_prop, new_prop = f"{_PROP_ANCHOR}{old}", f"{_PROP_ANCHOR}{new}"
-        done: List[str] = []
-        values: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-        for name in referencing:
-            if name in missing:
-                continue
+        to_copy = [n for n in referencing if n not in missing]
+
+    old_prop, new_prop = f"{_PROP_ANCHOR}{old}", f"{_PROP_ANCHOR}{new}"
+    values: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    # dataset -> the value anchor.<new> had BEFORE this command changed it
+    # (None = it was absent): what puts it back.
+    restore: Dict[str, Optional[str]] = {}
+
+    def restore_text(extra: Optional[Dict[str, Optional[str]]] = None) -> str:
+        pending = dict(restore)
+        pending.update(extra or {})
+        if not pending:
+            return ""
+        lines = []
+        for name, previous in pending.items():
+            if previous is None:
+                lines.append(f"  zfs inherit {new_prop} {shlex.quote(name)}")
+            else:
+                lines.append(f"  zfs set {shlex.quote(f'{new_prop}={previous}')} {shlex.quote(name)}")
+        replaced = {n: v for n, v in pending.items() if v is not None}
+        added = [n for n, v in pending.items() if v is None]
+        facts = []
+        if replaced:
+            facts.append(
+                f"{new_prop} was overwritten on {', '.join(map(repr, replaced))}, which unpins "
+                "the snapshot its previous value protected"
+            )
+        if added:
+            facts.append(
+                f"{new_prop} was newly set on {', '.join(map(repr, added))} (it did not exist "
+                "before)"
+            )
+        return (
+            "; ".join(facts)
+            + ". To put the previous values back run:\n"
+            + "\n".join(lines)
+            + f"\n(or re-run the rename, which copies anchor.{old} again)"
+        )
+
+    def copy_anchors() -> None:
+        for name in to_copy:
+            ds = bm.Dataset(name)
             try:
-                ds = bm.Dataset(name)
                 before = bm.read_zfsbackup_properties(ds)
                 values[name] = (before.get(old_prop), before.get(new_prop))
                 outcomes[name] = bm.copy_anchor_property(
                     ds, old, new, dry_run=dry_run, overwrite=True
                 )
             except Exception as exc:  # noqa: BLE001
-                already = f" Already copied (re-running refreshes them): {', '.join(done)}." if done else ""
+                tail = restore_text()
                 raise CliError(
-                    f"copying org.zfsbackup:anchor.{old} to anchor.{new} on {name!r} "
-                    f"failed: {str(exc).strip() or type(exc).__name__}. Nothing was "
-                    f"written to the configuration.{already}"
+                    f"copying {old_prop} to anchor.{new} on {name!r} failed: "
+                    f"{str(exc).strip() or type(exc).__name__}. Nothing was written to the "
+                    "configuration." + (f"\n{tail}" if tail else "")
                 ) from exc
             except BaseException as exc:
+                # The copy in flight may or may not have landed.
+                inflight = {name: values[name][1]} if name in values and not dry_run else {}
+                tail = restore_text(inflight)
                 exc.add_note(
-                    f"interrupted while copying org.zfsbackup:anchor.{old} to anchor.{new}: "
-                    f"already copied (re-running refreshes them): {', '.join(done) or 'none'}; the copy on "
-                    f"{name!r} may or may not have completed. Nothing was written to the "
-                    "configuration."
+                    f"interrupted while copying {old_prop} to anchor.{new} on {name!r}. "
+                    "Nothing was written to the configuration."
+                    + (f"\n{tail}" if tail else "")
                 )
                 raise
-            done.append(name)
+            if outcomes[name] == "copied":
+                restore[name] = None
+            elif outcomes[name] == "overwritten":
+                restore[name] = values[name][1]
         for name, outcome in outcomes.items():
             click.echo(
                 f"{prefix}{name}: "
@@ -575,27 +653,42 @@ def rename_destination(
             )
 
     if dry_run:
+        if to_copy:
+            copy_anchors()
         click.echo(
             f"{prefix}would rename destination {old!r} -> {new!r} in the configuration"
             + (f" and in the remote: lists of {', '.join(referencing)}" if referencing else "")
         )
         return
 
-    try:
-        result = commit_config(resolved, snapshot, new_config, warn=warn, announce=False)
-    except BaseException as exc:
-        _interrupted_write(exc, resolved, "rename")
-        if any(o in ("copied", "overwritten") for o in outcomes.values()):
-            exc.add_note(
-                f"The anchor.{new} values already written are harmless. Re-running the "
-                "rename is safe: it copies anchor.%s again, refreshing them." % old
+    def commit(lock: Any = None):
+        try:
+            return commit_config(
+                resolved, snapshot, new_config, warn=warn, announce=False, lock=lock
             )
-        raise
+        except BaseException as exc:
+            _interrupted_write(exc, resolved, "rename")
+            tail = restore_text()
+            if tail:
+                exc.add_note(tail)
+            raise
+
+    if not to_copy:
+        result = commit()
+    else:
+        # The copies change ZFS state that only a successful rename justifies,
+        # so nobody else may write between "the configuration is still as I
+        # read it" and the write: hold the writer lock (just the flock -- no
+        # database connection is open during the zfs calls) across all three.
+        with writer_lock(resolved) as held:
+            _require_generation(resolved, snapshot)
+            copy_anchors()
+            result = commit(held)
     try:
         click.echo(f"Renamed destination {old!r} -> {new!r} in the configuration.")
         stale = [n for n, o in outcomes.items() if o != "no-source"]
         if stale:
-            commands = _inherit_commands_for(stale, f"{_PROP_ANCHOR}{old}")
+            commands = _inherit_commands_for(stale, old_prop)
             click.echo(
                 f"Restart the daemon now so it uses the new name {new!r}. Until then, and after: "
                 f"the daemon protects every local or received org.zfsbackup:anchor.* property, so "
@@ -605,5 +698,7 @@ def rename_destination(
             )
         notify_daemon(resolved, result.generation)
     except BaseException as exc:
-        _interrupted_after_write(exc, f"the rename of destination {old!r} was applied", None, [])
+        _interrupted_after_write(
+            exc, resolved, f"the rename of destination {old!r} was applied", None, []
+        )
         raise
