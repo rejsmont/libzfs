@@ -1463,6 +1463,177 @@ class TestAckLoop:
         assert cli_write.ACK_POLL_SECONDS == 0.1
 
 
+class TestAwaitApplied:
+    """`write.await_applied`: the ack loop that settles only on `applied`.
+    `accepted` ("it is switching over") and a newer `target` alone keep it
+    polling -- `rename --clear-stale-props` may touch ZFS only once every
+    worker runs the rename."""
+
+    KEY = (7, 5)
+
+    def wait(self, resolved, wait=3.0):
+        return cli_write.await_applied(resolved, self.KEY, wait)
+
+    def test_it_is_public(self):
+        assert "await_applied" in cli_write.__all__
+
+    def test_applied_returns_at_once(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        calls = probes(monkeypatch, info(applied=self.KEY))
+        answer, seen = self.wait(resolved)
+        assert answer == "applied" and seen.applied == self.KEY
+        assert len(calls) == 1 and clock.sleeps == []
+
+    def test_accepted_keeps_polling_until_the_deadline(self, resolved, monkeypatch):
+        """Where `_await_answer` stops on `accepted`, this does not."""
+        clock = Clock().install(monkeypatch)
+        calls = probes(monkeypatch, info(applied=(7, 4), target=self.KEY))
+        answer, last = self.wait(resolved, wait=1.0)
+        assert answer is None
+        assert last.target == self.KEY and last.applied == (7, 4)
+        assert len(calls) > 5 and sum(clock.sleeps) == pytest.approx(1.0)
+
+    def test_accepted_then_applied_returns_applied(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        calls = probes(
+            monkeypatch,
+            info(applied=(7, 4), target=self.KEY), info(applied=(7, 4), target=self.KEY),
+            info(applied=self.KEY),
+        )
+        answer, seen = self.wait(resolved)
+        assert answer == "applied" and len(calls) == 3 and clock.sleeps == [0.1, 0.1]
+
+    def test_the_same_state_is_an_answer_for_the_plain_loop(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, info(applied=(7, 4), target=self.KEY))
+        assert cli_write._await_answer(resolved, self.KEY, 3.0)[0] == "accepted"
+
+    @pytest.mark.parametrize("applied", [(7, 6), (7, 99)], ids=["next", "far"])
+    def test_a_newer_applied_generation_is_newer(self, resolved, monkeypatch, applied):
+        clock = Clock().install(monkeypatch)
+        calls = probes(monkeypatch, info(applied=applied))
+        answer, seen = self.wait(resolved)
+        assert answer == "newer" and seen.applied == applied
+        assert len(calls) == 1 and clock.sleeps == []
+
+    @pytest.mark.parametrize(
+        "daemon",
+        [dict(applied=(7, 4), target=(7, 6)), dict(applied=(7, 4), target=(7, 99))],
+        ids=["next", "far"],
+    )
+    def test_a_newer_target_alone_is_not_newer(self, resolved, monkeypatch, daemon):
+        """It is only switching to a later generation: our key is not applied."""
+        clock = Clock().install(monkeypatch)
+        calls = probes(monkeypatch, info(**daemon))
+        answer, last = self.wait(resolved, wait=1.0)
+        assert answer is None and last.target == daemon["target"]
+        assert len(calls) > 5 and sum(clock.sleeps) == pytest.approx(1.0)
+
+    def test_a_newer_target_then_a_newer_applied_is_newer(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, info(applied=(7, 4), target=(7, 6)), info(applied=(7, 6)))
+        assert self.wait(resolved)[0] == "newer"
+
+    def test_rejected_returns_at_once(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        calls = probes(monkeypatch, info(applied=(7, 4), rejected=self.KEY))
+        answer, seen = self.wait(resolved)
+        assert answer == "rejected" and seen.rejected == self.KEY
+        assert len(calls) == 1 and clock.sleeps == []
+
+    def test_a_later_rejected_generation_returns_superseded_at_once(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        calls = probes(monkeypatch, info(applied=(7, 4), rejected=(7, 6)))
+        assert self.wait(resolved)[0] == "superseded"
+        assert len(calls) == 1 and clock.sleeps == []
+
+    def test_gone_and_unreadable_end_the_wait(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, info(applied=(7, 4)), None)
+        answer, last = self.wait(resolved)
+        assert answer == "gone" and last.applied == (7, 4)
+        probes(monkeypatch, OSError(errno.EIO, "io"))
+        assert self.wait(resolved) == ("unreadable", None)
+
+    @pytest.mark.parametrize(
+        "daemon",
+        [
+            dict(applied=(8, 5)), dict(applied=(8, 99)), dict(applied=(0, 99)),
+            dict(applied=(7, 4), target=(8, 5)), dict(applied=(7, 4), target=(8, 99)),
+            dict(applied=(7, 4), rejected=(8, 5)), dict(applied=(7, 4), rejected=(8, 99)),
+            dict(applied=(8, 5), target=(8, 5)), dict(),
+        ],
+        ids=[
+            "other-store-same-gen", "other-store-newer-gen", "unstamped-store",
+            "other-target", "other-newer-target", "other-rejected", "other-newer-rejected",
+            "other-applied-and-target", "nothing",
+        ],
+    )
+    def test_a_different_store_id_never_answers(self, resolved, monkeypatch, daemon):
+        """A re-import picks a random store id: keys of different stores are
+        not ordered, so none of them is applied, newer, rejected or superseded."""
+        clock = Clock().install(monkeypatch)
+        calls = probes(monkeypatch, info(**daemon))
+        answer, last = self.wait(resolved, wait=1.0)
+        assert answer is None and last is not None
+        assert len(calls) > 5 and sum(clock.sleeps) == pytest.approx(1.0)
+
+    def test_a_torn_read_answers_nothing(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        torn = daemonlock.DaemonInfo(pid=4321, generation=None, start="t", applied=self.KEY, stable=False)
+        calls = probes(monkeypatch, torn, torn, info(applied=self.KEY))
+        answer, seen = self.wait(resolved)
+        assert answer == "applied" and len(calls) == 3
+
+    def test_a_zero_wait_looks_once(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        calls = probes(monkeypatch, info(applied=(7, 4), target=self.KEY))
+        assert self.wait(resolved, wait=0)[0] is None
+        assert len(calls) == 1 and clock.sleeps == []
+
+    def test_the_default_wait_is_reload_wait(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        probes(monkeypatch, info(applied=(7, 4)))
+        assert cli_write.await_applied(resolved, self.KEY)[0] is None
+        assert sum(clock.sleeps) == pytest.approx(cli_write.DEFAULT_RELOAD_WAIT)
+
+    def test_the_default_wait_follows_the_group_option(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        probes(monkeypatch, info(applied=(7, 4)))
+        with click.Context(click.Command("x")) as ctx:
+            ctx.obj = types.SimpleNamespace(reload_wait=0.5)
+            assert cli_write.await_applied(resolved, self.KEY)[0] is None
+        assert sum(clock.sleeps) == pytest.approx(0.5)
+
+    def test_an_explicit_wait_beats_the_option(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        probes(monkeypatch, info(applied=(7, 4)))
+        with click.Context(click.Command("x")) as ctx:
+            ctx.obj = types.SimpleNamespace(reload_wait=9.0)
+            assert cli_write.await_applied(resolved, self.KEY, 0.25)[0] is None
+        assert sum(clock.sleeps) == pytest.approx(0.25)
+
+    def test_it_asks_for_applied_only(self, resolved, monkeypatch):
+        seen = []
+
+        def spy(resolved, key, wait, **kwargs):
+            seen.append((key, wait, kwargs))
+            return "applied", None
+
+        monkeypatch.setattr(cli_write, "_await_answer", spy)
+        assert cli_write.await_applied(resolved, self.KEY, 2.0) == ("applied", None)
+        assert seen == [(self.KEY, 2.0, {"applied_only": True})]
+
+    def test_it_reads_the_pid_file_of_a_real_daemon(self, resolved, db, fake_daemon):
+        """No patching: a real pid file, a real held lock, the real clock."""
+        daemon = fake_daemon(db, applied=(7, 4), target=self.KEY)
+        started = time.monotonic()
+        assert cli_write.await_applied(resolved, self.KEY, 0.3)[0] is None
+        assert time.monotonic() - started >= 0.25
+        daemon.set(applied=self.KEY)
+        assert cli_write.await_applied(resolved, self.KEY, 0.3)[0] == "applied"
+
+
 # --------------------------------------------------------------------------
 # 6. --reload-wait
 # --------------------------------------------------------------------------

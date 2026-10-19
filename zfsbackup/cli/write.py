@@ -62,6 +62,7 @@ from zfsbackup.config.store import (
 __all__ = [
     "commit_config",
     "begin_reload",
+    "await_applied",
     "notify_daemon",
     "COMMITTED_MARK",
     "read_snapshot",
@@ -205,7 +206,8 @@ def _answer(info: daemonlock.DaemonInfo, key: Tuple[int, int]) -> Optional[str]:
 
 
 def _await_answer(
-    resolved: ResolvedConfigPath, key: Tuple[int, int], wait: float
+    resolved: ResolvedConfigPath, key: Tuple[int, int], wait: float, *,
+    applied_only: bool = False,
 ) -> Tuple[Optional[str], Optional[daemonlock.DaemonInfo]]:
     """Poll the daemon's pid file every `ACK_POLL_SECONDS` until it names `key`
     (or a newer one) in `applied`, `target` or `rejected`, or `wait` seconds
@@ -220,6 +222,11 @@ def _await_answer(
     `probe` does on a fresh descriptor under a non-blocking shared flock. Always
     bounded by the deadline, so a signalled supervisor that never answers (a
     zombie, a wedged process) costs at most `wait` seconds.
+
+    `applied_only=True` keeps polling through `accepted` (and through a newer
+    `target` alone): it settles only on `applied` / a newer `applied` (answered
+    as `newer`), on `rejected` / `superseded` (the key will never be applied),
+    or on `gone` / `unreadable`. `await_applied` is its public spelling.
     """
     deadline = time.monotonic() + wait
     last: Optional[daemonlock.DaemonInfo] = None
@@ -233,12 +240,32 @@ def _await_answer(
         if info.stable:
             last = info
         answer = _answer(info, key)
+        if (
+            applied_only
+            and answer in ("accepted", "newer")
+            and not (info.applied == key or _newer(info.applied, key))
+        ):
+            answer = None
         if answer is not None:
             return answer, info
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None, last
         time.sleep(min(ACK_POLL_SECONDS, remaining))
+
+
+def await_applied(
+    resolved: ResolvedConfigPath, key: Tuple[int, int], wait: Optional[float] = None
+) -> Tuple[Optional[str], Optional[daemonlock.DaemonInfo]]:
+    """Wait up to `wait` seconds (default: `--reload-wait`) until the daemon's
+    pid file says it has APPLIED `key` -- every worker runs it -- or a later
+    generation of the same store. -> `(answer, last stable info)`: `applied`,
+    `newer` (applied is later than `key`), `rejected`, `superseded`, `gone`,
+    `unreadable`, or `None` (not applied in time, including "accepted but still
+    switching"). Reads the pid file only; holds no lock."""
+    return _await_answer(
+        resolved, key, _reload_wait() if wait is None else wait, applied_only=True
+    )
 
 
 def _unverified_line(updated: str, req: daemonlock.ReloadRequest) -> str:

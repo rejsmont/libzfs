@@ -30,12 +30,35 @@ written.
   the new ZFS dataset does not exist yet (the operator may be about to
   `zfs rename`, and the properties follow the dataset). The daemon check is a
   single `daemonlock.probe()` made AFTER the configuration write
-  (`_no_daemon`), not a held lock: a daemon that starts later reads the NEW
+  (`_clear_gate`), not a held lock: a daemon that starts later reads the NEW
   configuration and never touches the old dataset, while one running now may
   have loaded the old one. If one is running (or the probe cannot tell), the
   properties are left and the exact commands to run once it stops are printed
-  (exit 1; the rename itself was done). Without `--clear-stale-props` the same
-  commands are printed after the rename.
+  (exit 1; the rename itself was done) -- with ONE exception (`_clear_gate`):
+  when this very write's reload request SIGNALLED a verified daemon (outcome
+  `signalled` only, so never on a host that cannot prove the daemon's identity,
+  such as macOS; `already-applied` is decided before those proofs and is
+  refused like the rest), the command waits up to `--reload-wait` for the
+  daemon to report the rename's `(store id, generation)` as `applied=` (every
+  worker is on the new configuration, so nothing uses OLD any more), then takes
+  the writer lock, re-reads the store and requires that the stored key is the
+  daemon's applied key and that OLD is not a configured dataset again, and
+  clears the properties with the lock held (a concurrent writer gets exit 75,
+  and the lock is dropped after). Anything less (not applied in time,
+  rejected, unverified, the store moved on) is the refusal above. Without
+  `--clear-stale-props` the same commands are printed after the rename.
+
+  Trust model: verification proves WHICH process the daemon is, not the
+  group-writable `applied=` line it reports. That is acceptable: a member of
+  the group that can write that file can already change the configuration
+  itself. The "verified daemon only" rule is a platform rule (no identity proof
+  on macOS, so no clearing there), not an anti-forgery measure.
+
+  When no daemon is found (or the one that was exited during the wait), the
+  clear still requires that no worker holds the workers lock (workers of a
+  SIGKILLed supervisor outlive it under spawn/forkserver and may still use OLD;
+  a lock that cannot be examined counts as held), then takes the writer lock
+  and re-checks that OLD is not configured again.
 
 **rename destination OLD NEW**
 - refused if NEW already exists;
@@ -69,16 +92,25 @@ import click
 
 from zfsbackup import daemonlock
 from zfsbackup.cli import dotpath
-from zfsbackup.cli.errors import CliError
+from zfsbackup.cli.errors import (
+    EXIT_CONFIG,
+    CliError,
+    ConfigUnusable,
+    exit_code_for,
+    format_error,
+)
 from zfsbackup.cli.write import (
+    await_applied,
     begin_reload,
     commit_config,
     notify_daemon,
+    read_snapshot,
     release_database,
     where_flag,
 )
 from zfsbackup.config import BackupConfig
 from zfsbackup.config.store import (
+    ConfigBusy,
     ConfigConflict,
     ConfigSnapshot,
     ResolvedConfigPath,
@@ -230,29 +262,117 @@ def _daemon_running(resolved: ResolvedConfigPath) -> Optional[str]:
     return f"a daemon is running (pid {info.pid if info.pid is not None else 'unknown'})"
 
 
+def _workers_running(resolved: ResolvedConfigPath) -> Optional[str]:
+    """None if no process holds the workers lock; otherwise a description. A
+    lock that cannot be examined is reported too ("cannot tell" is not "no"):
+    under spawn/forkserver the workers of a SIGKILLed supervisor outlive it, do
+    not hold the presence lock, and may still be sending on the old dataset."""
+    try:
+        present = daemonlock.workers_present(resolved)
+    except OSError as exc:  # includes DaemonLockError
+        return f"cannot tell whether daemon workers are still running ({exc.strerror or exc})"
+    return "daemon workers are still running" if present else None
+
+
 class _DaemonPresent(Exception):
-    """A daemon is (or may be) running: the stale properties stay."""
+    """A daemon (or its workers) is, or may be, running: the stale properties stay."""
+
+
+#: `ReloadRequest.outcome`s from which "the daemon applied the rename" may be
+#: waited for: only `signalled`, the one outcome reached after every proof in
+#: `request_reload` (lock holder, pid-file owner, identity, pidfd). Everything
+#: else keeps the plain refusal -- including `already-applied`, which
+#: `request_reload` decides from the (group-writable) `applied=` line BEFORE
+#: those proofs, so it also holds on macOS and for a forged line; right after
+#: our own commit it practically never occurs anyway. (`unverified`, as on
+#: every non-Linux host; `not-permitted`; `supervisor-gone`; `legacy`; `error`.)
+_VERIFIED_OUTCOMES = ("signalled",)
 
 
 @contextlib.contextmanager
-def _no_daemon(resolved: ResolvedConfigPath):
-    """Check ONCE, now, that no daemon is running, failing with
-    `_DaemonPresent` if `daemonlock.probe` finds one or cannot tell.
+def _clear_gate(
+    resolved: ResolvedConfigPath,
+    old: str,
+    *,
+    request: Optional[daemonlock.ReloadRequest] = None,
+    key: Optional[Tuple[int, int]] = None,
+    progress: Optional[Dict[str, Any]] = None,
+):
+    """Let the caller clear stale properties iff that is safe, else raise
+    `_DaemonPresent` (or let `ConfigBusy` through: exit 75).
 
-    The caller has already committed the rename, and a daemon takes the
-    presence file's exclusive lock BEFORE it reads the configuration. So a
-    daemon that holds the lock now may have loaded the old configuration (and
-    relies on the old dataset's anchors), whereas one that starts after this
-    point reads the new configuration and never touches the old dataset: no
-    lock needs to be held while the properties are cleared. (A missing or
+    No daemon (`daemonlock.probe` finds nobody): the caller has already
+    committed the rename, and a daemon takes the presence file's exclusive lock
+    BEFORE it reads the configuration, so one that starts after this point
+    reads the new configuration and never touches the old dataset. (A missing or
     stale pid file means no daemon is running now -- a clean stop removes the
-    file, a crash leaves it unlocked.) Holding a lock here would only make a
-    daemon that starts meanwhile refuse with a misleading message.
+    file, a crash leaves it unlocked.) What can still use the old dataset is
+    (a) workers orphaned by a dead supervisor, which hold the workers lock but
+    not the presence lock: any holder, or a lock that cannot be examined, is a
+    refusal; and (b) a rename back committed since: so the writer lock is taken
+    (`ConfigBusy` -> exit 75, nothing cleared), the store re-read, and the old
+    dataset must not be configured again. The lock is held for the whole clear.
+
+    A daemon is there (or the probe cannot tell): refuse, unless `request` is
+    this write's reload request, it was verified (`_VERIFIED_OUTCOMES`) and the
+    daemon reports `key` -- the rename's `(store id, generation)` -- as
+    `applied` within `--reload-wait`. Then, holding the writer lock for the
+    whole clear, the stored key must equal the daemon's `applied` (nobody wrote
+    since, so nothing newer waits to be loaded) and the old dataset must not be
+    configured again (a concurrent rename back would make the properties live).
+    If the daemon exited during the wait it is the no-daemon case above,
+    re-examined from scratch (workers, writer lock, old dataset).
+    `progress["waited"]` is set when the wait ran out, so the caller does not
+    wait for the same acknowledgement a second time.
     """
     busy = _daemon_running(resolved)
     if busy is not None:
-        raise _DaemonPresent(busy)
-    yield
+        if request is None or request.outcome not in _VERIFIED_OUTCOMES or key is None:
+            raise _DaemonPresent(busy)
+        answer, _info = await_applied(resolved, key)
+        if answer == "gone":
+            # Exited while we waited: same as finding nobody (re-checked, not assumed).
+            again = _daemon_running(resolved)
+            if again is not None:
+                raise _DaemonPresent(again)
+            busy = None
+        elif answer not in ("applied", "newer"):
+            if answer is None and progress is not None:
+                progress["waited"] = True
+            why = {
+                None: "it has not applied the rename within --reload-wait",
+                "rejected": "it rejected the new configuration and keeps running the old one",
+                "superseded": "it rejected a later configuration and keeps running the old one",
+                "unreadable": "its state file could not be read while waiting",
+            }.get(answer, f"it answered {answer!r}")
+            raise _DaemonPresent(f"{busy}; {why}")
+    if busy is None:
+        orphans = _workers_running(resolved)
+        if orphans is not None:
+            raise _DaemonPresent(orphans)
+    lead = f"{busy}; " if busy is not None else ""
+    with writer_lock(resolved):  # ConfigBusy -> exit 75, nothing cleared
+        # A store that cannot be read is NOT "cannot tell whether a daemon is
+        # running": only the probe gets that wording; the read error surfaces.
+        snap = read_snapshot(resolved)
+        try:
+            fresh = daemonlock.probe(resolved)
+        except OSError as exc:
+            raise _DaemonPresent(
+                f"cannot tell whether a daemon is running ({exc.strerror or exc})"
+            ) from None
+        if fresh is not None:
+            stored = (snap.store_id, snap.generation)
+            if not fresh.stable or fresh.applied != stored:
+                raise _DaemonPresent(
+                    f"{lead or 'a daemon has started; '}the configuration was changed "
+                    "again since the rename (or the daemon has not applied it)"
+                )
+        if any(d.name == old for d in snap.config.datasets):
+            raise _DaemonPresent(
+                f"{lead}{old!r} is a configured dataset again, so its properties are in use"
+            )
+        yield
 
 
 def _inherit_commands(dataset: str, props: Sequence[str]) -> str:
@@ -260,15 +380,21 @@ def _inherit_commands(dataset: str, props: Sequence[str]) -> str:
 
 
 def _clear_stale(
-    resolved: ResolvedConfigPath, bm: Any, old: str, props: Sequence[str]
+    resolved: ResolvedConfigPath, bm: Any, old: str, props: Sequence[str],
+    *,
+    request: Optional[daemonlock.ReloadRequest] = None,
+    key: Optional[Tuple[int, int]] = None,
+    progress: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Clear `props` (`org.zfsbackup:config` / `anchor.*`) on the old dataset,
-    one `zfs inherit` at a time, under `_no_daemon`. Raises `CliError`, always
-    saying which were cleared and which `zfs inherit` commands are left."""
+    one `zfs inherit` at a time, behind `_clear_gate`. Raises `CliError`, always
+    saying which were cleared and which `zfs inherit` commands are left
+    (`ConfigBusy`, exit 75, when the writer lock is held by another writer:
+    it carries the same commands as a note)."""
     ordered = sorted(props)
     cleared: List[str] = []
     try:
-        with _no_daemon(resolved):
+        with _clear_gate(resolved, old, request=request, key=key, progress=progress):
             ds = bm.Dataset(old)
             for prop in ordered:
                 if prop == _PROP_CONFIG:
@@ -284,11 +410,29 @@ def _clear_stale(
             f"{old!r} were NOT cleared: {exc}. Once it is stopped, run:\n"
             + _inherit_commands(old, ordered)
         ) from None
+    except ConfigBusy as exc:
+        left = [p for p in ordered if p not in cleared]
+        exc.add_note(
+            f"the configuration was renamed, but the stale properties on {old!r} were NOT "
+            "cleared (the writer lock was not free). Re-running the rename "
+            f"cannot help ({old!r} is no longer configured); no daemon was using {old!r} "
+            "when this was checked, so unless the configuration has been changed to use it "
+            "again, run:\n"
+            + _inherit_commands(old, left)
+        )
+        raise
     except Exception as exc:  # noqa: BLE001
         left = [p for p in ordered if p not in cleared]
-        raise CliError(
+        # An unusable config database (path/schema/damaged file, read by the
+        # gate) keeps its own wording and its exit code (78).
+        unusable = exit_code_for(exc) == EXIT_CONFIG
+        reason = (
+            format_error(exc, resolved)[0] if unusable
+            else str(exc).strip() or type(exc).__name__
+        )
+        raise (ConfigUnusable if unusable else CliError)(
             "the configuration was renamed, but clearing the stale properties on "
-            f"{old!r} failed: {str(exc).strip() or type(exc).__name__}. "
+            f"{old!r} failed: {reason}. "
             f"Cleared so far: {', '.join(cleared) or 'none'}. Still set, to clear by hand:\n"
             + _inherit_commands(old, left)
         ) from exc
@@ -481,8 +625,9 @@ def rename_dataset(
             busy = _daemon_running(resolved)
             if busy is not None:
                 click.echo(
-                    f"{prefix}note: {busy}; after the write the clear would be skipped "
-                    "and the zfs inherit commands printed instead"
+                    f"{prefix}note: {busy}; after the write the clear happens only if the "
+                    "daemon is verified and applies the rename within --reload-wait, "
+                    "else it is skipped and the zfs inherit commands printed instead"
                 )
         return
 
@@ -505,11 +650,19 @@ def rename_dataset(
             )
 
         if to_clear:
-            # The daemon check is made HERE, after the write (`_no_daemon`).
+            # The daemon check is made HERE, after the write (`_clear_gate`).
+            progress: Dict[str, Any] = {}
             try:
-                cleared = _clear_stale(resolved, bm, old, to_clear)
-            except CliError:
-                notify_daemon(resolved, result.generation, result.store_id, request=request)
+                cleared = _clear_stale(
+                    resolved, bm, old, to_clear, request=request,
+                    key=(result.store_id, result.generation), progress=progress,
+                )
+            except (CliError, ConfigBusy):
+                # Do not wait a second time for an acknowledgement that did not come.
+                notify_daemon(
+                    resolved, result.generation, result.store_id, request=request,
+                    reload_wait=0 if progress.get("waited") else None,
+                )
                 raise
             click.echo(f"Cleared on {old!r}: {', '.join(cleared) or '(nothing set)'}")
         notify_daemon(resolved, result.generation, result.store_id, request=request)

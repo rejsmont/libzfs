@@ -61,6 +61,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -75,27 +76,36 @@ from _cli_support import (
     count_containing,
     db,
     db_state,
+    fake_daemon,
     fake_zfs,
     generation,
     isolated,
+    live_daemon,
     make_db,
     run,
     scratch_tmp,
     stderr_lines,
+    store_key,
     stored,
     stub,
     unsignalable,
     warnings_in,
     write_yaml,
 )
+from zfsbackup import daemonlock
 from zfsbackup.cli import dotpath, editor, rename
+from zfsbackup.cli import write as cli_write
 from zfsbackup.config.store import (
     ConfigBusy,
     ConfigConflict,
+    ConfigPathError,
+    SchemaError,
     dispose_all,
     read_config,
     resolve_config_path,
     write_config,
+    writer_lock,
+    writer_lock_path,
 )
 
 # No module-level tier marker: conftest marks every test that declares none as
@@ -591,13 +601,13 @@ class TestRenameDatasetClearStale:
         monkeypatch.setattr(
             rename, "commit_config", lambda *a, **k: (order.append("write"), real(*a, **k))[1]
         )
-        real_no_daemon = rename._no_daemon
+        real_gate = rename._clear_gate
 
-        def spying(resolved):
+        def spying(resolved, *args, **kwargs):
             order.append("daemon check")
-            return real_no_daemon(resolved)
+            return real_gate(resolved, *args, **kwargs)
 
-        monkeypatch.setattr(rename, "_no_daemon", spying)
+        monkeypatch.setattr(rename, "_clear_gate", spying)
         self.clear(run, rich)
         assert order == ["write", "daemon check"]
 
@@ -731,7 +741,12 @@ class TestRenameDatasetClearStale:
         result = self.clear(run, rich, "-d")
         assert result.exit_code == 0, result.stderr
         assert "would clear on 'tank/vm.01'" in result.stdout
-        assert "a daemon is running" in result.stdout and "zfs inherit commands printed" in result.stdout
+        assert "a daemon is running" in result.stdout
+        assert (
+            "after the write the clear happens only if the daemon is verified and applies the "
+            "rename within --reload-wait, else it is skipped and the zfs inherit commands "
+            "printed instead"
+        ) in result.stdout
         assert db_state(rich) == state and stale.mutations == []
 
     # -- failures while clearing ----------------------------------------
@@ -779,6 +794,744 @@ class TestRenameDatasetClearStale:
         assert ANCHOR + "dc.two" in result.stderr.split("before the interrupt:")[1].split("Properties that may remain")[0]
         assert f"Properties that may remain: {ANCHOR}offsite, {CONFIG_PROP}" in result.stderr
         assert "tank/vm.02" in names(rich)
+
+
+class TestRenameDatasetClearWithAVerifiedDaemon:
+    """`--clear-stale-props` while a daemon runs: the properties are cleared only
+    if `request_reload` VERIFIED the daemon (`signalled` -- and nothing else:
+    `already-applied` is decided before its proofs, so it refuses like
+    `unverified`) and it reports the rename's `(store id, generation)` as
+    `applied` within `--reload-wait`; then, under the writer lock, nothing may
+    have been written since and OLD must not be configured again. Everything
+    else keeps today's refusal. Without a daemon (or when it exits during the
+    wait) the gate also refuses while daemon workers survive, and always takes
+    the writer lock and re-reads the store.
+
+    `request_reload` cannot return `signalled` on macOS (no lock table), so the
+    tests replace `rename.begin_reload` with a fake that returns the outcome
+    they want and lets the fake daemon "apply" the key as a side effect. The
+    daemon is a `FakeDaemon` (pid file + held lock, no process); the zfs is the
+    fake one (`fake_zfs`).
+    """
+
+    PROPS = TestRenameDatasetClearStale.PROPS
+    ORDER = TestRenameDatasetClearStale.ORDER
+    WAIT = "0.5"
+    REFUSED = "the configuration was renamed, but the stale properties on 'tank/vm.01' were NOT cleared"
+
+    @pytest.fixture
+    def stale(self, fake_zfs):
+        fake_zfs.add("tank/vm.01", self.PROPS)
+        fake_zfs.add("tank/vm.02", {})
+        return fake_zfs
+
+    @pytest.fixture
+    def daemon(self, rich, db, fake_daemon):
+        """A daemon that is on the pre-rename generation."""
+        return fake_daemon(db, applied=store_key(db))
+
+    @pytest.fixture
+    def requests(self):
+        return []
+
+    @pytest.fixture
+    def verify(self, monkeypatch, requests):
+        """`verify(d, outcome, on_request)`: `rename.begin_reload` answers
+        `outcome` for daemon `d`; `on_request(key)` runs first (the daemon
+        applying the rename, a concurrent writer, ...). Records each key."""
+
+        def install(d, outcome="signalled", on_request=None):
+            def fake(resolved, generation, store_id=None):
+                key = (store_id, generation)
+                requests.append(key)
+                if on_request is not None:
+                    on_request(key)
+                return daemonlock.ReloadRequest(outcome, pid=d.pid)
+
+            monkeypatch.setattr(rename, "begin_reload", fake)
+
+        return install
+
+    @pytest.fixture
+    def answers(self, monkeypatch):
+        """Every `_await_answer` call (the wait for the daemon), as `(wait, applied_only)`."""
+        seen = []
+        real = cli_write._await_answer
+
+        def spy(resolved, key, wait, **kwargs):
+            seen.append((wait, kwargs.get("applied_only", False)))
+            return real(resolved, key, wait, **kwargs)
+
+        monkeypatch.setattr(cli_write, "_await_answer", spy)
+        return seen
+
+    def clear(self, run, rich, *extra, wait=None):
+        return run(
+            "-c", rich, "--reload-wait", wait or self.WAIT,
+            "rename", "dataset", "tank/vm.01", "tank/vm.02", "--clear-stale-props", *extra,
+        )
+
+    def inherits(self, fake):
+        return [c for c in fake.calls if c[0] == "inherit"]
+
+    def assert_refused(self, result, stale, rich, why, renamed=True):
+        assert result.exit_code == 1, (result.stdout, result.stderr)
+        err = result.stderr
+        assert self.REFUSED in err and why in err
+        assert "Once it is stopped, run:" in err
+        for prop in self.ORDER:
+            assert f"zfs inherit {prop} tank/vm.01" in err
+        assert stale.mutations == [] and stale.props("tank/vm.01") == self.PROPS
+        if renamed:
+            assert "tank/vm.02" in names(rich)                   # the rename itself stands
+
+    def assert_cleared(self, result, stale, rich):
+        assert result.exit_code == 0, (result.stdout, result.stderr)
+        assert "Cleared on 'tank/vm.01':" in result.stdout
+        assert stale.props("tank/vm.01") == {"compression": "lz4"}
+        assert [c[1] for c in self.inherits(stale)] == self.ORDER
+        assert "tank/vm.02" in names(rich)
+
+    # -- 1, 2: the daemon applied the rename -----------------------------
+
+    def test_signalled_and_applied_in_time_clears_the_properties(
+        self, run, rich, stale, daemon, verify, requests
+    ):
+        verify(daemon, "signalled", lambda key: daemon.set(applied=key))
+        result = self.clear(run, rich)
+        self.assert_cleared(result, stale, rich)
+        out = result.stdout
+        assert out.index("Renamed dataset") < out.index("Cleared on 'tank/vm.01':")
+        assert f"reload requested from daemon pid {daemon.pid}: it is now on generation {requests[0][1]}" in out
+        assert "not yet acknowledged" not in out
+
+    def test_a_daemon_that_applies_while_we_wait_is_waited_for(
+        self, run, rich, stale, daemon, verify, requests
+    ):
+        """The signal is sent, but the apply lands a little later: the gate polls."""
+        timer = []
+
+        def later(key):
+            timer.append(threading.Timer(0.25, daemon.set, kwargs={"applied": key}))
+            timer[0].start()
+
+        verify(daemon, "signalled", later)
+        try:
+            result = self.clear(run, rich, wait="5")
+        finally:
+            timer[0].cancel()
+            timer[0].join()
+        self.assert_cleared(result, stale, rich)
+
+    def test_a_pre_applied_daemon_through_the_real_request_reload_is_refused(
+        self, run, rich, db, stale, live_daemon, unsignalable, answers
+    ):
+        """No patching: the daemon (a live pid with its real start token) already
+        reports the rename's key, so `request_reload` answers `already-applied`
+        -- decided before any lock-holder proof, so on a host that cannot verify
+        lock holders (and for a forged `applied=` line) it must not clear."""
+        sid, gen = store_key(db)
+        d = live_daemon(db, applied=(sid, gen + 1))
+        result = self.clear(run, rich)
+        assert f"is already on generation {gen + 1}" in result.stdout     # it WAS already-applied
+        assert result.exit_code == 1
+        assert (
+            f"{self.REFUSED}: a daemon is running (pid {d.pid}). Once it is stopped, run:\n"
+        ) in result.stderr
+        for prop in self.ORDER:
+            assert f"zfs inherit {prop} tank/vm.01" in result.stderr
+        assert stale.mutations == [] and stale.props("tank/vm.01") == self.PROPS
+        assert "tank/vm.02" in names(rich)
+        assert answers == []                      # and it did not wait for anything
+
+    def test_a_daemon_on_a_later_stored_generation_is_enough(
+        self, run, rich, db, stale, daemon, verify
+    ):
+        """Someone wrote again right after the rename and the daemon is on THAT
+        generation (`newer`): it has the rename in it, and the stored key equals
+        its applied key, so nothing newer waits to be loaded."""
+
+        def write_again_and_apply(key):
+            current = read_config(resolve_config_path(str(db)))
+            current.config.api_port = 9999
+            write_config(
+                resolve_config_path(str(db)), current.config, expected_generation=current.generation
+            )
+            dispose_all()
+            daemon.set(applied=store_key(db))
+
+        verify(daemon, "signalled", write_again_and_apply)
+        self.assert_cleared(self.clear(run, rich), stale, rich)
+
+    def test_a_daemon_claiming_an_unstored_generation_is_refused(
+        self, run, rich, db, stale, daemon, verify
+    ):
+        """`applied` is later than the rename but is not what is stored: the
+        stored-key comparison, not the wait's answer, decides."""
+        verify(daemon, "signalled", lambda key: daemon.set(applied=(key[0], key[1] + 5)))
+        result = self.clear(run, rich)
+        self.assert_refused(result, stale, rich, "changed again")
+
+    # -- 3, 4: not applied ---------------------------------------------------
+
+    @pytest.mark.parametrize("state", ["nothing", "accepted"])
+    def test_not_applied_in_time_refuses_with_the_inherit_commands(
+        self, run, rich, stale, daemon, verify, answers, state
+    ):
+        def on_request(key):
+            if state == "accepted":
+                daemon.set(target=key)             # accepted, still switching over
+
+        verify(daemon, "signalled", on_request)
+        started = time.monotonic()
+        result = self.clear(run, rich)
+        elapsed = time.monotonic() - started
+        self.assert_refused(
+            result, stale, rich,
+            f"a daemon is running (pid {daemon.pid}); it has not applied the rename within --reload-wait",
+        )
+        assert elapsed >= 0.45                      # it waited the whole --reload-wait
+        assert "config updated" in result.stdout    # the daemon notice is still printed
+
+    def test_the_wait_is_not_repeated_by_the_notice(
+        self, run, rich, stale, daemon, verify, answers
+    ):
+        """One wait only: the gate's (applied-only, `--reload-wait`); the notice
+        that follows a failed gate does not wait for the same answer again."""
+        verify(daemon, "signalled")
+        result = self.clear(run, rich)
+        assert result.exit_code == 1
+        assert answers == [(0.5, True)]          # one wait, however long the subprocesses take
+        assert "not yet acknowledged" not in result.stdout
+        assert "reload requested from daemon" in result.stdout
+
+    def test_a_cleared_rename_waits_only_once_too(self, run, rich, stale, daemon, verify, answers):
+        """After a successful gate the notice reads the answer it already
+        waits for (instantly: the daemon is on the key)."""
+        verify(daemon, "signalled", lambda key: daemon.set(applied=key))
+        assert self.clear(run, rich).exit_code == 0
+        assert answers[0] == (0.5, True)
+        assert all(applied_only is False for _w, applied_only in answers[1:])
+
+    def test_a_rejected_rename_is_refused_at_once(self, run, rich, stale, daemon, verify, answers):
+        verify(daemon, "signalled", lambda key: daemon.set(rejected=key))
+        started = time.monotonic()
+        result = self.clear(run, rich, wait="5")
+        assert time.monotonic() - started < 2.5     # did not sit out the 5 s
+        self.assert_refused(
+            result, stale, rich,
+            "it rejected the new configuration and keeps running the old one",
+        )
+        assert "rejected generation" in result.stderr or "rejected" in result.stderr
+
+    def test_a_later_rejected_generation_is_refused_as_superseded(
+        self, run, rich, stale, daemon, verify
+    ):
+        verify(daemon, "signalled", lambda key: daemon.set(rejected=(key[0], key[1] + 1)))
+        result = self.clear(run, rich, wait="5")
+        self.assert_refused(
+            result, stale, rich, "it rejected a later configuration and keeps running the old one"
+        )
+
+    def test_a_newer_target_alone_is_not_applied(self, run, rich, stale, daemon, verify):
+        verify(daemon, "signalled", lambda key: daemon.set(target=(key[0], key[1] + 1)))
+        result = self.clear(run, rich)
+        self.assert_refused(result, stale, rich, "it has not applied the rename within --reload-wait")
+
+    def test_an_unreadable_pid_file_while_waiting_is_refused(
+        self, run, rich, stale, daemon, verify, monkeypatch
+    ):
+        verify(daemon, "signalled")
+        real = daemonlock.probe
+        calls = []
+
+        def flaky(resolved):
+            calls.append(1)
+            if len(calls) >= 2:                      # the first look is the gate's own
+                raise OSError(errno.EIO, "Input/output error")
+            return real(resolved)
+
+        monkeypatch.setattr(daemonlock, "probe", flaky)
+        result = self.clear(run, rich)
+        self.assert_refused(result, stale, rich, "its state file could not be read while waiting")
+
+    # -- 5: not verified -----------------------------------------------------
+
+    def test_an_unverified_daemon_keeps_the_plain_refusal(
+        self, run, rich, stale, daemon_lock_holder, unsignalable, answers
+    ):
+        holder = daemon_lock_holder(rich, generation=0)
+        result = self.clear(run, rich)
+        assert result.exit_code == 1
+        assert result.stderr.count(self.REFUSED) == 1
+        assert (
+            f"{self.REFUSED}: a daemon is running (pid {holder.pid}). Once it is stopped, run:\n"
+        ) in result.stderr
+        assert stale.mutations == [] and answers == []   # and it did not wait
+
+    @pytest.mark.parametrize(
+        "outcome",
+        ["already-applied", "unverified", "not-permitted", "supervisor-gone", "legacy", "error"],
+    )
+    def test_no_other_outcome_trusts_the_pid_file_even_when_it_says_applied(
+        self, run, rich, stale, daemon, verify, answers, outcome
+    ):
+        """The daemon's own file says `applied` -- but nothing proves the file
+        belongs to the daemon, so only a verified outcome can clear."""
+        verify(daemon, outcome, lambda key: daemon.set(applied=key))
+        result = self.clear(run, rich)
+        assert result.exit_code == 1
+        assert (
+            f"{self.REFUSED}: a daemon is running (pid {daemon.pid}). Once it is stopped, run:\n"
+        ) in result.stderr
+        for prop in self.ORDER:
+            assert f"zfs inherit {prop} tank/vm.01" in result.stderr
+        assert stale.mutations == [] and stale.props("tank/vm.01") == self.PROPS
+        assert "tank/vm.02" in names(rich)
+        assert [w for w in answers if w[1]] == []         # never waited for `applied`
+
+    # -- 6, 7: the world moved on after the daemon answered ----------------
+
+    def test_a_write_after_the_daemon_applied_is_refused(
+        self, run, rich, db, stale, daemon, verify, monkeypatch
+    ):
+        """The daemon applied the rename; a moment later someone wrote again, so
+        the daemon has not loaded the newest configuration: not safe to clear."""
+        verify(daemon, "signalled", lambda key: daemon.set(applied=key))
+        real = rename.await_applied
+
+        def then_a_write(resolved, key, wait=None):
+            answer = real(resolved, key, wait)
+            current = read_config(resolve_config_path(str(db)))
+            current.config.api_port = 9999
+            write_config(
+                resolve_config_path(str(db)), current.config, expected_generation=current.generation
+            )
+            dispose_all()
+            return answer
+
+        monkeypatch.setattr(rename, "await_applied", then_a_write)
+        result = self.clear(run, rich)
+        self.assert_refused(result, stale, rich, "the configuration was changed again since the rename")
+        assert stored(db).api_port == 9999
+
+    def test_a_dataset_configured_again_is_refused_even_if_the_daemon_has_it(
+        self, run, rich, db, stale, daemon, verify, monkeypatch
+    ):
+        """A concurrent rename back, which the daemon already applied too: the
+        old dataset's properties are live again."""
+        verify(daemon, "signalled", lambda key: daemon.set(applied=key))
+        real = rename.await_applied
+
+        def then_a_rename_back(resolved, key, wait=None):
+            answer = real(resolved, key, wait)
+            current = read_config(resolve_config_path(str(db)))
+            for entry in current.config.datasets:
+                if entry.name == "tank/vm.02":
+                    entry.name = "tank/vm.01"
+            write_config(
+                resolve_config_path(str(db)), current.config, expected_generation=current.generation
+            )
+            dispose_all()
+            daemon.set(applied=store_key(db))
+            return answer
+
+        monkeypatch.setattr(rename, "await_applied", then_a_rename_back)
+        result = self.clear(run, rich)
+        self.assert_refused(
+            result, stale, rich, "'tank/vm.01' is a configured dataset again", renamed=False
+        )
+        assert "tank/vm.02" not in names(rich) and "tank/vm.01" in names(rich)
+
+    def test_the_stored_key_is_read_under_the_writer_lock(
+        self, run, rich, db, stale, daemon, verify, monkeypatch
+    ):
+        lock_path = writer_lock_path(resolve_config_path(str(db)))
+        verify(daemon, "signalled", lambda key: daemon.set(applied=key))
+        seen = []
+        real = rename.read_snapshot
+
+        def spying(resolved):
+            seen.append(_try_exclusive_lock(lock_path))
+            return real(resolved)
+
+        monkeypatch.setattr(rename, "read_snapshot", spying)
+        assert self.clear(run, rich).exit_code == 0
+        assert seen == ["blocked"]
+
+    # -- 8, 9: the writer lock -----------------------------------------------
+
+    def test_a_busy_writer_lock_is_exit_75_with_the_inherit_commands(
+        self, run, rich, stale, daemon, verify, monkeypatch
+    ):
+        verify(daemon, "signalled", lambda key: daemon.set(applied=key))
+
+        def busy(*args, **kwargs):
+            raise ConfigBusy("the config writer lock is busy")
+
+        monkeypatch.setattr(rename, "writer_lock", busy)
+        result = self.clear(run, rich)
+        assert result.exit_code == 75, (result.stdout, result.stderr)
+        err = result.stderr
+        assert "the configuration was renamed, but the stale properties on 'tank/vm.01' were NOT cleared" in err
+        assert "the writer lock was not free" in err
+        assert "Re-running the rename cannot help" in err and "run this again" not in err
+        for prop in self.ORDER:
+            assert f"zfs inherit {prop} tank/vm.01" in err
+        assert stale.mutations == [] and "tank/vm.02" in names(rich)
+
+    def test_a_real_holder_of_the_writer_lock_is_exit_75(
+        self, run, rich, db, stale, daemon, verify, monkeypatch
+    ):
+        """Another writer (a thread here: the lock is per open file) holds the
+        lock between the rename and the gate; the gate gives up after its own
+        short timeout instead of waiting 10 s."""
+        resolved = resolve_config_path(str(db))
+        held, release, done = threading.Event(), threading.Event(), threading.Event()
+
+        def holder():
+            with writer_lock(resolved):
+                held.set()
+                release.wait(30)
+            done.set()
+
+        thread = threading.Thread(target=holder, daemon=True)
+
+        def on_request(key):
+            daemon.set(applied=key)
+            thread.start()
+            assert held.wait(10)
+
+        verify(daemon, "signalled", on_request)
+        real = rename.writer_lock
+        monkeypatch.setattr(rename, "writer_lock", lambda r, **k: real(r, timeout=0.2))
+        try:
+            result = self.clear(run, rich)
+        finally:
+            release.set()
+            thread.join(10)
+        assert result.exit_code == 75, (result.stdout, result.stderr)
+        assert "the writer lock was not free" in result.stderr
+        assert f"zfs inherit {ANCHOR}offsite tank/vm.01" in result.stderr
+        assert stale.mutations == [] and "tank/vm.02" in names(rich)
+        assert done.is_set()
+
+    def test_a_second_writer_gets_config_busy_while_the_properties_are_cleared(
+        self, run, rich, db, stale, daemon, verify, monkeypatch
+    ):
+        import zfsbackup.backup_manager as bm
+
+        resolved = resolve_config_path(str(db))
+        verify(daemon, "signalled", lambda key: daemon.set(applied=key))
+        outcomes = []
+        real = bm.clear_zfsbackup_properties
+
+        def probing(*args, **kwargs):
+            def second_writer():
+                try:
+                    with writer_lock(resolved, timeout=0.05):
+                        outcomes.append("acquired")
+                except ConfigBusy:
+                    outcomes.append("busy")
+
+            thread = threading.Thread(target=second_writer)
+            thread.start()
+            thread.join(10)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(bm, "clear_zfsbackup_properties", probing)
+        result = self.clear(run, rich)
+        self.assert_cleared(result, stale, rich)
+        assert outcomes == ["busy"] * 3
+        assert _try_exclusive_lock(writer_lock_path(resolved)) == "acquired"   # released after
+
+    def test_the_writer_lock_is_released_after_a_failed_clear(
+        self, run, rich, db, stale, daemon, verify
+    ):
+        verify(daemon, "signalled", lambda key: daemon.set(applied=key))
+        stale.fail("inherit", "tank/vm.01", ANCHOR + "offsite")
+        result = self.clear(run, rich)
+        assert result.exit_code == 1 and "Cleared so far" in result.stderr
+        assert _try_exclusive_lock(writer_lock_path(resolve_config_path(str(db)))) == "acquired"
+
+    def test_the_no_daemon_clear_holds_the_writer_lock_throughout(self, run, rich, db, stale, monkeypatch):
+        """No daemon is the same gate as a gone one: the writer lock is taken
+        (so a concurrent rename back cannot slip in) and held through every clear."""
+        import zfsbackup.backup_manager as bm
+
+        lock_path = writer_lock_path(resolve_config_path(str(db)))
+        states = []
+        real = bm.clear_zfsbackup_properties
+
+        def probing(*args, **kwargs):
+            states.append(_try_exclusive_lock(lock_path))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(bm, "clear_zfsbackup_properties", probing)
+        self.assert_cleared(self.clear(run, rich), stale, rich)
+        assert states == ["blocked"] * 3
+        assert _try_exclusive_lock(lock_path) == "acquired"
+
+    # -- 10: the daemon goes away ------------------------------------------
+
+    def test_a_daemon_that_exits_while_we_wait_is_the_no_daemon_case(
+        self, run, rich, stale, daemon, verify, monkeypatch
+    ):
+        verify(daemon, "signalled")                # never applies: it exits instead
+        real = daemonlock.probe
+        calls = []
+
+        def exiting(resolved):
+            calls.append(1)
+            if len(calls) == 3:                    # gate, first wait look, second wait look
+                daemon.close()
+            return real(resolved)
+
+        monkeypatch.setattr(daemonlock, "probe", exiting)
+        started = time.monotonic()
+        result = self.clear(run, rich, wait="5")
+        assert time.monotonic() - started < 2.5
+        self.assert_cleared(result, stale, rich)
+        assert "the daemon exited before acknowledging" in result.stdout
+
+    def test_a_daemon_that_exits_and_is_replaced_is_still_a_daemon(
+        self, run, rich, db, stale, daemon, verify, monkeypatch, fake_daemon
+    ):
+        verify(daemon, "signalled")
+        real = daemonlock.probe
+        calls = []
+        replacement = []
+
+        def exiting(resolved):
+            calls.append(1)
+            if len(calls) == 3:                    # the wait sees nobody: "gone"
+                daemon.close()
+            elif len(calls) == 4:                  # ...and a new one starts before the re-check
+                replacement.append(fake_daemon(db, pid=5678, applied=(store_key(db)[0], 0)))
+            return real(resolved)
+
+        monkeypatch.setattr(daemonlock, "probe", exiting)
+        result = self.clear(run, rich, wait="5")
+        self.assert_refused(result, stale, rich, "a daemon is running (pid 5678)")
+
+    # -- the daemon is gone: workers, writer lock, the store re-read ------------
+
+    def exit_during_the_wait(self, daemon, monkeypatch, *, also=None):
+        """The daemon's lock disappears on the third probe (the wait's second
+        look); `also()` runs at that moment (a concurrent writer, ...)."""
+        real = daemonlock.probe
+        calls = []
+
+        def exiting(resolved):
+            calls.append(1)
+            if len(calls) == 3:
+                daemon.close()
+                if also is not None:
+                    also()
+            return real(resolved)
+
+        monkeypatch.setattr(daemonlock, "probe", exiting)
+
+    def rename_back(self, db):
+        current = read_config(resolve_config_path(str(db)))
+        for entry in current.config.datasets:
+            if entry.name == "tank/vm.02":
+                entry.name = "tank/vm.01"
+        write_config(
+            resolve_config_path(str(db)), current.config, expected_generation=current.generation
+        )
+        dispose_all()
+
+    def test_gone_with_surviving_workers_is_refused(
+        self, run, rich, stale, daemon, verify, monkeypatch
+    ):
+        verify(daemon, "signalled")
+        self.exit_during_the_wait(daemon, monkeypatch)
+        monkeypatch.setattr(daemonlock, "workers_present", lambda resolved: True)
+        result = self.clear(run, rich, wait="5")
+        self.assert_refused(result, stale, rich, "NOT cleared: daemon workers are still running")
+
+    def test_gone_with_an_unexaminable_workers_lock_is_refused(
+        self, run, rich, stale, daemon, verify, monkeypatch
+    ):
+        verify(daemon, "signalled")
+        self.exit_during_the_wait(daemon, monkeypatch)
+
+        def broken(resolved):
+            raise daemonlock.DaemonLockError(errno.EACCES, "denied", "workers.lock")
+
+        monkeypatch.setattr(daemonlock, "workers_present", broken)
+        result = self.clear(run, rich, wait="5")
+        self.assert_refused(
+            result, stale, rich, "NOT cleared: cannot tell whether daemon workers are still running"
+        )
+
+    def test_gone_and_the_old_dataset_configured_again_is_refused(
+        self, run, rich, db, stale, daemon, verify, monkeypatch
+    ):
+        verify(daemon, "signalled")
+        self.exit_during_the_wait(daemon, monkeypatch, also=lambda: self.rename_back(db))
+        result = self.clear(run, rich, wait="5")
+        self.assert_refused(
+            result, stale, rich, "'tank/vm.01' is a configured dataset again", renamed=False
+        )
+        assert "tank/vm.01" in names(rich) and "tank/vm.02" not in names(rich)
+
+    def test_gone_and_clean_clears_with_the_writer_lock_held(
+        self, run, rich, db, stale, daemon, verify, monkeypatch
+    ):
+        import zfsbackup.backup_manager as bm
+
+        verify(daemon, "signalled")
+        self.exit_during_the_wait(daemon, monkeypatch)
+        lock_path = writer_lock_path(resolve_config_path(str(db)))
+        states = []
+        real = bm.clear_zfsbackup_properties
+
+        def probing(*args, **kwargs):
+            states.append(_try_exclusive_lock(lock_path))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(bm, "clear_zfsbackup_properties", probing)
+        self.assert_cleared(self.clear(run, rich, wait="5"), stale, rich)
+        assert states == ["blocked"] * 3
+
+    # -- no daemon at all: the same gate ----------------------------------------
+
+    def test_orphaned_workers_without_a_daemon_are_refused(self, run, rich, db, stale):
+        """A killed supervisor's spawn/forkserver workers hold the workers lock
+        (shared) but not the presence lock: a real `LOCK_SH`, a real probe."""
+        path = daemonlock.workers_lock_path(resolve_config_path(str(db)))
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o660)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            result = self.clear(run, rich)
+        finally:
+            os.close(fd)
+        self.assert_refused(result, stale, rich, "NOT cleared: daemon workers are still running")
+        assert "Once it is stopped, run:" in result.stderr
+
+    def test_no_workers_lock_file_is_no_workers(self, run, rich, db, stale):
+        assert not daemonlock.workers_lock_path(resolve_config_path(str(db))).exists()
+        self.assert_cleared(self.clear(run, rich), stale, rich)
+
+    def test_an_unexaminable_workers_lock_without_a_daemon_is_refused(
+        self, run, rich, stale, monkeypatch
+    ):
+        def broken(resolved):
+            raise daemonlock.DaemonLockError(errno.EACCES, "denied", "workers.lock")
+
+        monkeypatch.setattr(daemonlock, "workers_present", broken)
+        result = self.clear(run, rich)
+        self.assert_refused(
+            result, stale, rich, "NOT cleared: cannot tell whether daemon workers are still running"
+        )
+
+    def test_a_plain_oserror_from_the_workers_lock_is_refused_too(self, run, rich, stale, monkeypatch):
+        def broken(resolved):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(daemonlock, "workers_present", broken)
+        result = self.clear(run, rich)
+        self.assert_refused(
+            result, stale, rich,
+            "cannot tell whether daemon workers are still running (Input/output error)",
+        )
+
+    def test_no_daemon_and_the_old_dataset_configured_again_is_refused(
+        self, run, rich, db, stale, monkeypatch
+    ):
+        """A rename back committed between our write and the gate."""
+
+        def back(resolved, generation, store_id=None):
+            self.rename_back(db)
+            return daemonlock.ReloadRequest("no-daemon")
+
+        monkeypatch.setattr(rename, "begin_reload", back)
+        result = self.clear(run, rich)
+        self.assert_refused(
+            result, stale, rich, "NOT cleared: 'tank/vm.01' is a configured dataset again",
+            renamed=False,
+        )
+
+    def test_no_daemon_and_a_busy_writer_lock_is_exit_75_with_the_note(
+        self, run, rich, stale, monkeypatch
+    ):
+        def busy(*args, **kwargs):
+            raise ConfigBusy("the config writer lock is busy")
+
+        monkeypatch.setattr(rename, "writer_lock", busy)
+        result = self.clear(run, rich)
+        assert result.exit_code == 75, (result.stdout, result.stderr)
+        err = result.stderr
+        assert "the writer lock was not free" in err
+        assert "Re-running the rename cannot help" in err
+        assert "run this again" not in err
+        for prop in self.ORDER:
+            assert f"zfs inherit {prop} tank/vm.01" in err
+        assert stale.mutations == [] and "tank/vm.02" in names(rich)
+
+    # -- errors from the gate itself ---------------------------------------------
+
+    @pytest.mark.parametrize(
+        "error, code",
+        [
+            (OSError(errno.EIO, "Input/output error"), 1),
+            (ConfigPathError("the config database is gone"), 78),
+            (SchemaError("the config schema is out of date"), 78),
+        ],
+        ids=["oserror", "config-path", "schema"],
+    )
+    def test_a_store_error_in_the_gate_is_not_reported_as_a_daemon_probe(
+        self, run, rich, stale, monkeypatch, error, code
+    ):
+        def unreadable(resolved):
+            raise error
+
+        monkeypatch.setattr(rename, "read_snapshot", unreadable)
+        result = self.clear(run, rich)
+        assert result.exit_code == code, (result.stdout, result.stderr)
+        err = result.stderr
+        assert "cannot tell whether a daemon is running" not in err
+        assert "the configuration was renamed, but clearing the stale properties on 'tank/vm.01' failed" in err
+        assert "Cleared so far: none" in err
+        for prop in self.ORDER:
+            assert f"zfs inherit {prop} tank/vm.01" in err
+        assert stale.mutations == [] and "tank/vm.02" in names(rich)
+
+    def test_a_probe_error_after_the_writer_lock_is_still_cannot_tell(
+        self, run, rich, stale, monkeypatch
+    ):
+        real = daemonlock.probe
+        calls = []
+
+        def second_fails(resolved):
+            calls.append(1)
+            if len(calls) == 2:                  # the gate's re-probe under the lock
+                raise OSError(errno.EIO, "Input/output error")
+            return real(resolved)
+
+        monkeypatch.setattr(daemonlock, "probe", second_fails)
+        result = self.clear(run, rich)
+        self.assert_refused(
+            result, stale, rich,
+            "NOT cleared: cannot tell whether a daemon is running (Input/output error)",
+        )
+        assert len(calls) == 2
+
+    # -- 11: dry run ---------------------------------------------------------
+
+    def test_a_dry_run_says_when_the_clear_would_happen(self, run, rich, db, stale, daemon):
+        state = db_state(db)
+        result = self.clear(run, rich, "-d")
+        assert result.exit_code == 0, result.stderr
+        assert "would clear on 'tank/vm.01'" in result.stdout
+        assert (
+            f"a daemon is running (pid {daemon.pid}); after the write the clear happens only if the "
+            "daemon is verified and applies the rename within --reload-wait, else it is skipped "
+            "and the zfs inherit commands printed instead"
+        ) in result.stdout
+        assert db_state(db) == state and stale.mutations == []
 
 
 class TestRenameDatasetWithoutZfs:
