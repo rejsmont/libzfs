@@ -49,24 +49,31 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
+        id: py
         with:
           python-version: ${{ matrix.python }}
 
       - name: Install poetry
         # Pinned: a poetry minor bump changing resolution is not something
-        # we want to discover as a red build on an unrelated PR.
-        run: pipx install poetry==2.1.1
+        # we want to discover as a red build on an unrelated PR. Run poetry
+        # on the matrix interpreter: pipx otherwise uses the runner's own
+        # Python (3.15 on macos-latest), and the venv silently followed it.
+        run: pipx install --python "${{ steps.py.outputs.python-path }}" poetry==2.1.1
 
       - name: Cache the project virtualenv
         uses: actions/cache@v4
         with:
           path: .venv
-          key: venv-${{ runner.os }}-py${{ matrix.python }}-${{ hashFiles('poetry.lock') }}
+          key: venv-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('poetry.lock') }}
 
       - name: Install dependencies
         run: |
           poetry config virtualenvs.in-project true
+          poetry env use "${{ steps.py.outputs.python-path }}"
           poetry install --with dev
+
+      - name: Check the venv runs the matrix Python
+        run: poetry run python -c "import sys; v='%d.%d' % sys.version_info[:2]; print(sys.version); assert v == '${{ matrix.python }}', v"
 
       # libzfseasy/zfs.py resolves the zfs/zpool binaries at IMPORT time and
       # raises RuntimeError if neither $ZFS_CMD nor a binary on PATH is found
@@ -115,18 +122,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
+        id: py
         with:
           python-version: ${{ matrix.python }}
 
       - name: Install poetry
-        run: pipx install poetry==2.1.1
+        run: pipx install --python "${{ steps.py.outputs.python-path }}" poetry==2.1.1
 
       # No virtualenv cache here: it is keyed on poetry.lock, which pins
       # 2.0.x, and must never be shared with the 2.0 jobs.
       - name: Install dependencies, then SQLAlchemy 2.1
         run: |
           poetry config virtualenvs.in-project true
+          poetry env use "${{ steps.py.outputs.python-path }}"
           poetry install --with dev
+          poetry run python -c "import sys; v='%d.%d' % sys.version_info[:2]; print(sys.version); assert v == '${{ matrix.python }}', v"
           poetry run pip install "sqlalchemy>=2.1,<2.2" alembic
           poetry run python -c "import sqlalchemy as s; assert s.__version__.startswith('2.1'), s.__version__; print('SQLAlchemy', s.__version__)"
 
