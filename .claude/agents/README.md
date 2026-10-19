@@ -35,7 +35,7 @@ into another's directory to save a handoff.
 | Path | Owner |
 |---|---|
 | `libzfseasy/**` | `libzfseasy-developer` |
-| `zfsbackup/{config,backup_manager,daemon,workers,remote,api}.py` | `zfsbackup-developer` |
+| `zfsbackup/{config,backup_manager,daemon,workers,remote,api}.py`, and the supervisor support modules `zfsbackup/{daemonlock,stopflag,runtime_config,procident,sdnotify}.py` | `zfsbackup-developer` |
 | `zfsbackup/config/store/**` (incl. `store/migrations/`), `alembic.ini` | `zfsbackup-store-developer` |
 | `zfsbackup/cli/**` | `zfsbackup-cli-developer` |
 | `tests/**`, `conftest.py` | `pytest-test-author` |

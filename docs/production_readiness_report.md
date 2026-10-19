@@ -94,14 +94,19 @@ closing the identical latent gap before it could bite.
 
 ## Operations
 
-- *(Updated 2026-10-18.)* A documented systemd unit ships in `zfsbackup/README.md`, with `ExecReload`,
-  `KillMode=mixed` and `TimeoutStopSec`. The daemon holds a presence lock and pid file
-  (`<db>.daemon.pid`), and reloads its configuration live on SIGHUP and on a 10 s poll.
+- *(Updated 2026-10-19.)* A documented systemd unit ships in `zfsbackup/README.md`: `Type=notify-reload`
+  (systemd ≥ 253; `Type=notify` + `ExecReload` for older), `NotifyAccess=main`, `KillMode=mixed` and
+  `TimeoutStopSec`. The daemon sends `READY`/`RELOADING`/`STOPPING`/`STATUS` via `sd_notify`, holds a
+  presence lock and pid file (`<db>.daemon.pid`), and reloads its configuration live on SIGHUP and on a
+  10 s poll.
 - Worker restarts use exponential backoff (5 s to 80 s). After 6 consecutive short-lived crashes the
-  daemon exits 1 and names the configuration generation (A-5, D9).
-- **Open:** a reload is checked by validating the config and building its dataset list, but its API bind
-  is not tested. A new `api_port` that is in use (or a low port for a non-root daemon) is accepted, and
-  the API worker then crash-loops into D9. Follow-up: test-bind on reload when the port changes.
+  daemon exits 1 and names the configuration generation (A-5, D9). Workers orphaned by a dead forkserver
+  are not counted.
+- *(Resolved 2026-10-19.)* A reload bind-probes a changed API address; one that cannot be bound is
+  *deferred* (re-checked every poll) instead of crash-looping the API worker into D9. Residual: a port
+  taken between the probe and the bind, or a third party already on `new_host:port` after a host-only
+  change, still ends in D9. The supervisor makes no `zfs` call, so a hung pool no longer stalls reloads,
+  signals or restarts.
 - `--test-config` validates the config and builds the dataset list. It does not check that datasets
   exist or that destinations resolve.
 - Werkzeug's development server (`make_server`) is used in the `ApiWorker` — not a production WSGI server.

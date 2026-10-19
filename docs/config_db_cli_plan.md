@@ -41,6 +41,7 @@ carries a status note or "as landed" text — where those disagree with the prop
 | 10–16 Config CLI | done | Landed in order 10 → 15 → 13 → 11 → 12 → 14 → 16; see the per-item "as landed" notes |
 | 17–20 Live reload | done | 17.0 → G1; 18.0, 17.1, 18.1–18.5 → G2; 17.2 → G3; 19.1, 19.2 → G4; tests (20) alongside each |
 | 21–23 Docs, scenarios, final review | **done 2026-10-18** | 22: Linux mocked suite on zfsb-perm 5835 passed / 0 failed (all [L] tests as user and root); `test_config_permissions.sh` 239/0 incl. live reload (f) and recycled-pid forgery (f4c); `test_two_vm_backup.sh` 50/0. 23: both final reviews passed after the must-fixes (early-SIGHUP ignore, file-open proof, stop before reload read, SQLAlchemy 2.1 float map, `mode=rw` readers). Deferred follow-ups listed under Gate results. |
+| Follow-ups round | **done 2026-10-19** (VM pass pending) | Every Phase 3 deferral plus older ones (`_` prefix, recursive pruning) and libzfseasy name/send fixes; see "Follow-ups round (2026-10-19)" under Gate results |
 
 > *(Historical — written for Phases 0–2; the reload design described here is superseded by the revised Phase 3 section.)* **All design questions are settled; no open decisions remain.** Items 2 (duration handling) and 5 (fork
 > safety) were the gating pair: **item 2 = full `Duration` value type** subclassing `timedelta`, with
@@ -1638,7 +1639,7 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
     restart — restart it now.
   - **Daemon:** `runtime_config.py:45-49` no longer claims `check_schema` raises the multi-head
     `RuntimeError`; the daemon's out-of-date message appends its own restart sentence.
-  - **Deferred:** a single source for semantic config warnings (`validate_config`; `from_file` keeps only
+  - **Deferred (done in 72f2251):** a single source for semantic config warnings (`validate_config`; `from_file` keeps only
     parse-boundary warnings) — needs a model/store contract change, do it with items 11/12 (the CLI
     currently prints e.g. the `forever` warning twice in different words); a raw `.db` copy when the
     outgoing config is unreadable; a first import's transient "uninitialized" window mapped as a refusal.
@@ -1757,7 +1758,7 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
     detection; a removed destination's anchor "stays behind and keeps pinning its snapshot until cleared
     with `zfs inherit`"; editor signal handling like git (SIGINT/SIGQUIT ignored, SIGTERM forwarded,
     10 s grace).
-  - **Deferred:** recursive pruning destroys `@snap` on child datasets without consulting the children's
+  - **Deferred (done 2026-10-19, F2):** recursive pruning destroys `@snap` on child datasets without consulting the children's
     anchors (pre-existing); a modified client could send a `-p` stream with `anchor.*` properties that
     pin snapshots on the server (no new exposure — `retention: forever` already does; note it in the
     readiness report); the no-real-zfs test guard covers only the pytest process.
@@ -1847,7 +1848,7 @@ CLI 10.2 → 15.3 → 13 → 11 → 12 → 14.2 (critical path). Item 16 follows
   O_EXCL; refusal on an unreadable outgoing DB); the console script resolves (`-m slow`).
 - **Verify:** `pytest tests/test_zfsbackup_*.py`
 
-**Deferred:** the `snapshot_prefix`-with-`_` parser bug (`backup_manager.py:373-382`; needs
+**Deferred (done 2026-10-19, F1):** the `snapshot_prefix`-with-`_` parser bug (`backup_manager.py:373-382`; needs
 `name[len(prefix)+1:]`, which is retention logic — warning only for now); never-prune at destination
 level; C3's getppid detection, `KillMode=mixed`, websocket timeouts; lenient `remote:`/`destinations:`
 null (YAML never allowed it).
@@ -2090,7 +2091,7 @@ Two lanes run in parallel (disjoint owners); everything inside the daemon lane i
       as the alternative;
     - stop budget (90 s is right, about 35 s realistic);
     - CLAUDE.md, readiness report and agent prompts refreshed.
-  - Deferred (follow-ups):
+  - Deferred (follow-ups) — **all addressed 2026-10-19** (see "Follow-ups round 2026-10-19" below):
     - a test bind of a changed `api_host`/`api_port` and a `ClientIdentity` check on reload (otherwise a
       busy port crash-loops into D9);
     - a supervisor `zfs` call on reload can block the loop on a hung pool;
@@ -2100,6 +2101,25 @@ Two lanes run in parallel (disjoint owners); everything inside the daemon lane i
     - a drain 503 on `/stream` logs ERROR;
     - VM-timer-sensitive tests (`TestContentionWindow`, the torn-read control);
     - the `TestRealLockHolderOnLinux` marker.
+
+- **Follow-ups round (2026-10-19).** Planned by both planners, every recommendation approved by the user,
+  implemented, tested and reviewed (zfs-code-reviewer + concurrency-reviewer, each to a clean verdict).
+  - **zfsbackup:** A1 a drain refusal is INFO, not ERROR; A2 deterministic timer tests; A4 bounded
+    WAL-switch busy retry (~5 s wall clock); B1 the supervisor makes no `zfs` call (dataset check and
+    property sync moved to `SnapshotWorker`); B2 an identical candidate (`same_as`, duration literals
+    count) is adopted without a turnover; B3 a changed API address is bind-probed and, if busy, **deferred**
+    (`deferred=` in the pid file, re-checked every poll; `status --wait` exits 75, never 1); a client-id
+    problem only warns (user decisions); C forkserver death: lost/orphaned workers are not counted toward
+    D9 and are replaced only after the orphan exits, signals are identity-checked (pidfd on Linux); D
+    `sd_notify` (`Type=notify-reload`, READY on the reload decision, EXTEND_TIMEOUT capped at 1 h per
+    startup wait); E `rename --clear-stale-props` clears once a *signalled* daemon has applied the rename
+    (never on macOS), or with no daemon and no surviving workers; F1 `snapshot_prefix` may contain `_`;
+    F2 recursive pruning honours descendants' anchors and configured retention, and received datasets are
+    pruned non-recursively (fixes a server-side loss of received children's history found in review).
+  - **libzfseasy:** strict ASCII name validation (fullmatch), spaces allowed inside names, `.`/`..` and
+    >255-character names refused, the binary send EOF spin fixed and pipes closed on failure. The 2026-07
+    exec-path list had already been fixed in `a8a3d88`.
+  - Still to run: the Linux VM pass (forkserver default, pidfd, abstract sockets, `Type=notify-reload`).
 
 ### Item 17.0 — Store id and cheap store state *(store)*
 
