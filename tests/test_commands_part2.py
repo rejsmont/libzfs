@@ -1,10 +1,13 @@
 """Additional unit tests for libzfseasy.zfs — AllowCommand through MountCommand."""
 
 import pytest
+import contextlib
+import gc
 import io
 import os
 import subprocess
 import sys
+import warnings
 from unittest.mock import MagicMock
 from libzfseasy.zfs import (
     AllowCommand, UnAllowCommand, CloneCommand, GetCommand, SetCommand,
@@ -748,18 +751,34 @@ class TestSendFailureClosesPipes:
         return subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     @staticmethod
-    def _resource_warnings(caught):
-        return [w for w in caught if issubclass(w.category, ResourceWarning)]
+    @contextlib.contextmanager
+    def _leak_watch(fds):
+        """Fail if a ResourceWarning attributable to *this test's* pipes (or a still-running child) is emitted.
+
+        Garbage left behind by earlier tests (e.g. an unclosed text-mode file) is collected, and its warnings discarded,
+        before the action; afterwards only warnings naming one of ``fds`` (the caller appends the pipe descriptors it
+        spawns) or an unreaped subprocess count.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            gc.collect()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            yield
+            gc.collect()
+        ours = [str(w.message) for w in caught
+                if issubclass(w.category, ResourceWarning)
+                and (any('name=%d>' % fd in str(w.message) for fd in fds) or 'subprocess' in str(w.message))]
+        assert not ours, ours
 
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_nonzero_exit_without_stdout_closes_pipes(self):
-        import gc
-        import warnings
         code = "import sys; sys.stderr.write('pool is busy\\n'); sys.exit(1)"
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter('always')
+        fds = []
+        with self._leak_watch(fds):
             proc = self._spawn(code)
+            fds += [proc.stdout.fileno(), proc.stderr.fileno()]
             proc.wait()  # exited before the capture: poll() deterministically sees rc != 0 (the rc branch)
             errors = []
             raised = None
@@ -774,21 +793,19 @@ class TestSendFailureClosesPipes:
             assert proc.returncode == 1
             del raised, proc
             gc.collect()
-        assert not self._resource_warnings(caught)
 
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_stdout_eof_then_nonzero_exit_closes_pipes(self):
-        import gc
-        import warnings
         code = ("import os, sys, time\n"
                 "os.close(1)\n"
                 "time.sleep(0.2)\n"
                 "sys.stderr.write('stream broke\\n'); sys.stderr.flush()\n"
                 "sys.exit(3)\n")
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter('always')
+        fds = []
+        with self._leak_watch(fds):
             proc = self._spawn(code)
+            fds += [proc.stdout.fileno(), proc.stderr.fileno()]
             raised = None
             try:
                 SendCommand._exec_capture_bin(proc, [])
@@ -806,25 +823,23 @@ class TestSendFailureClosesPipes:
                     proc.wait()
             del raised, proc
             gc.collect()
-        assert not self._resource_warnings(caught)
 
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_exec_stream_failure_leaves_no_open_pipes(self, monkeypatch):
-        import gc
-        import warnings
         procs = []
+        fds = []
         real_popen = subprocess.Popen
 
         def spying_popen(*a, **kw):
             p = real_popen(*a, **kw)
             procs.append(p)
+            fds.extend([p.stdout.fileno(), p.stderr.fileno()])  # recorded now: the pipes are closed by the failure
             return p
 
         monkeypatch.setattr(subprocess, 'Popen', spying_popen)
         code = "import sys; sys.stderr.write('nope\\n'); sys.exit(2)"
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter('always')
+        with self._leak_watch(fds):
             with pytest.raises(Exception, match='Nope'):
                 SendCommand._exec_stream([sys.executable, '-c', code])
             (proc,) = procs
@@ -833,7 +848,6 @@ class TestSendFailureClosesPipes:
             procs.clear()
             del proc
             gc.collect()
-        assert not self._resource_warnings(caught)
 
     @pytest.mark.unit
     @pytest.mark.subprocess
