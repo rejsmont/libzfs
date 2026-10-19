@@ -2327,6 +2327,359 @@ class TestRenameDestination:
         assert fake_zfs.calls == []
 
 
+INFLIGHT = "org.zfsbackup:inflight."
+
+
+class TestRenameDestinationInflight:
+    """`rename destination` moves `inflight.OLD` (the pin on the two snapshots of
+    a send that may still be resumed, `<from>,<to>`) exactly like `anchor.OLD`:
+    copied to `inflight.NEW` before the write, a differing value overwritten,
+    the old one kept and listed for the operator to clear."""
+
+    @pytest.fixture
+    def pins(self, fake_zfs):
+        fake_zfs.add("tank/data", {
+            ANCHOR + "offsite": "snapA", INFLIGHT + "offsite": "snapA,snapB",
+            INFLIGHT + "dc.two": "x,y",
+        })
+        fake_zfs.add("tank/other", {INFLIGHT + "offsite": "s1,s2"})      # a pin, no anchor
+        return fake_zfs
+
+    def rename(self, run, rich, *extra, new="offsite2", old="offsite"):
+        return run("rename", "destination", old, new, *extra, "-c", rich)
+
+    def test_the_pin_is_copied_before_the_write_and_the_old_one_kept(self, run, rich, pins, monkeypatch):
+        seen = {}
+        real = rename.commit_config
+
+        def commit(*args, **kwargs):
+            seen["sets"] = [c for c in pins.calls if c[0] == "set"]
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(rename, "commit_config", commit)
+        result = self.rename(run, rich)
+        assert result.exit_code == 0, result.stderr
+        assert sorted(seen["sets"]) == sorted([
+            ["set", f"{ANCHOR}offsite2=snapA", "tank/data"],
+            ["set", f"{INFLIGHT}offsite2=snapA,snapB", "tank/data"],
+            ["set", f"{INFLIGHT}offsite2=s1,s2", "tank/other"],
+        ])
+        assert pins.props("tank/data")[INFLIGHT + "offsite"] == "snapA,snapB"   # copied, not moved
+        assert pins.props("tank/data")[INFLIGHT + "offsite2"] == "snapA,snapB"
+        assert pins.props("tank/other")[INFLIGHT + "offsite2"] == "s1,s2"
+        assert INFLIGHT + "dc.two2" not in pins.props("tank/data")        # the other destination's pin
+        assert pins.calls_of("inherit") == []
+
+    def test_the_output_names_each_pin_copy(self, run, rich, pins):
+        out = self.rename(run, rich).stdout
+        assert "tank/data: inflight.offsite2 set to snapA,snapB (copied from inflight.offsite)" in out
+        assert "tank/other: inflight.offsite2 set to s1,s2 (copied from inflight.offsite)" in out
+        assert "tank/data: anchor.offsite2 set to snapA (copied from anchor.offsite)" in out
+        assert "tank/other: has no anchor.offsite to copy" in out
+
+    def test_no_source_pin_says_nothing_about_inflight(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {ANCHOR + "offsite": "snapA"})
+        fake_zfs.add("tank/other", {ANCHOR + "offsite": "snapC"})
+        result = self.rename(run, rich)
+        assert result.exit_code == 0, result.stderr
+        assert "inflight" not in result.stdout
+        assert not any(INFLIGHT in " ".join(c) for c in fake_zfs.mutations)
+
+    def test_a_stray_new_pin_without_a_source_is_left_alone(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {INFLIGHT + "offsite2": "keep,me"})
+        fake_zfs.add("tank/other", {})
+        result = self.rename(run, rich)
+        assert result.exit_code == 0, result.stderr
+        assert "inflight" not in result.stdout
+        assert fake_zfs.mutations == []
+        assert fake_zfs.props("tank/data")[INFLIGHT + "offsite2"] == "keep,me"
+
+    def test_a_differing_new_pin_is_overwritten_and_both_values_are_shown(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {INFLIGHT + "offsite": "n1,n2", INFLIGHT + "offsite2": "o1,o2"})
+        fake_zfs.add("tank/other", {})
+        result = self.rename(run, rich)
+        assert result.exit_code == 0, result.stderr
+        assert (
+            "tank/data: inflight.offsite2 was o1,o2, now n1,n2 (copied from inflight.offsite); "
+            "snapshot o1,o2 is no longer pinned by inflight.offsite2"
+        ) in result.stdout
+        assert fake_zfs.props("tank/data")[INFLIGHT + "offsite2"] == "n1,n2"
+        assert fake_zfs.props("tank/data")[INFLIGHT + "offsite"] == "n1,n2"
+
+    def test_an_equal_new_pin_is_already_current_and_not_set_again(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {INFLIGHT + "offsite": "a,b", INFLIGHT + "offsite2": "a,b"})
+        fake_zfs.add("tank/other", {})
+        result = self.rename(run, rich)
+        assert "tank/data: inflight.offsite2 is already current (a,b)" in result.stdout
+        assert fake_zfs.mutations == []
+
+    def test_dry_run_says_what_would_happen_and_changes_nothing(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {INFLIGHT + "offsite": "n1,n2", INFLIGHT + "offsite2": "o1,o2"})
+        fake_zfs.add("tank/other", {INFLIGHT + "offsite": "s1,s2"})
+        state = db_state(rich)
+        result = self.rename(run, rich, "-d")
+        assert result.exit_code == 0, result.stderr
+        out = result.stdout
+        assert (
+            "[dry run] tank/data: inflight.offsite2 would be overwritten: was o1,o2, would "
+            "become n1,n2 (copied from inflight.offsite)"
+        ) in out
+        assert "[dry run] tank/other: inflight.offsite2 would be set to s1,s2 (copied from inflight.offsite)" in out
+        assert fake_zfs.mutations == [] and db_state(rich) == state
+
+    def test_dry_run_with_an_equal_pin_is_already_current(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {INFLIGHT + "offsite": "a,b", INFLIGHT + "offsite2": "a,b"})
+        fake_zfs.add("tank/other", {})
+        out = self.rename(run, rich, "-d").stdout
+        assert "[dry run] tank/data: inflight.offsite2 is already current (a,b)" in out
+
+    def test_the_stale_commands_include_the_inflight_inherit(self, run, rich, pins):
+        out = self.rename(run, rich).stdout
+        assert f"zfs inherit {INFLIGHT}offsite tank/data" in out
+        assert f"zfs inherit {INFLIGHT}offsite tank/other" in out
+        assert f"zfs inherit {ANCHOR}offsite tank/data" in out
+        assert f"zfs inherit {ANCHOR}offsite tank/other" not in out        # no anchor there
+        assert "inflight.offsite (the pin on the snapshots of a send to 'offsite'" in out
+        assert f"zfs inherit {INFLIGHT}dc.two" not in out                   # not this destination's
+
+    def test_only_a_pin_alone_still_gets_the_inherit_hint(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {})
+        fake_zfs.add("tank/other", {INFLIGHT + "offsite": "s1,s2"})
+        out = self.rename(run, rich).stdout
+        hints = [l.strip() for l in out.splitlines() if l.strip().startswith("zfs inherit")]
+        assert hints == [f"zfs inherit {INFLIGHT}offsite tank/other"]
+
+    def test_a_dotted_destination_pin(self, run, rich, pins):
+        result = self.rename(run, rich, old="dc.two", new="dc.three")
+        assert result.exit_code == 0, result.stderr
+        assert pins.props("tank/data")[INFLIGHT + "dc.three"] == "x,y"
+
+    # -- failures ---------------------------------------------------------------
+
+    def test_a_commit_failure_after_the_copy_prints_the_pin_rollback_too(
+        self, run, rich, fake_zfs, monkeypatch
+    ):
+        fake_zfs.add("tank/data", {
+            ANCHOR + "offsite": "snapA", INFLIGHT + "offsite": "n1,n2", INFLIGHT + "offsite2": "o1,o2",
+        })
+        fake_zfs.add("tank/other", {INFLIGHT + "offsite": "s1,s2"})
+
+        def busy(*args, **kwargs):
+            raise ConfigBusy("database is locked by another process")
+
+        monkeypatch.setattr(rename, "commit_config", busy)
+        result = self.rename(run, rich)
+        assert result.exit_code == 75
+        err = result.stderr
+        assert "To put the previous values back run:" in err
+        assert f"  zfs set {INFLIGHT}offsite2=o1,o2 tank/data" in err        # was overwritten
+        assert f"  zfs inherit {INFLIGHT}offsite2 tank/other" in err          # was absent
+        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err             # the anchor, as before
+        assert f"{INFLIGHT}offsite2 was overwritten on 'tank/data'" in err
+        assert f"{INFLIGHT}offsite2 was newly set on 'tank/other'" in err
+        assert "which copies anchor.offsite and inflight.offsite again" in err
+        assert "offsite2" not in stored(rich).destinations
+
+    def test_the_restore_note_without_pins_is_unchanged(self, run, rich, fake_zfs, monkeypatch):
+        fake_zfs.add("tank/data", {ANCHOR + "offsite": "snapA"})
+        fake_zfs.add("tank/other", {})
+
+        def busy(*args, **kwargs):
+            raise ConfigBusy("locked")
+
+        monkeypatch.setattr(rename, "commit_config", busy)
+        err = self.rename(run, rich).stderr
+        assert "which copies anchor.offsite again" in err and "inflight" not in err
+
+    def test_the_pin_restore_commands_really_restore(self, run, rich, fake_zfs, monkeypatch):
+        fake_zfs.add("tank/data", {INFLIGHT + "offsite": "n1,n2", INFLIGHT + "offsite2": "o1,o2"})
+        fake_zfs.add("tank/other", {INFLIGHT + "offsite": "s1,s2"})
+
+        def busy(*args, **kwargs):
+            raise ConfigBusy("locked")
+
+        monkeypatch.setattr(rename, "commit_config", busy)
+        err = self.rename(run, rich).stderr
+        commands = [
+            l.strip() for l in err.split("To put the previous values back run:")[1].splitlines()
+            if l.strip().startswith("zfs ")
+        ]
+        assert sorted(commands) == sorted([
+            f"zfs set {INFLIGHT}offsite2=o1,o2 tank/data",
+            f"zfs inherit {INFLIGHT}offsite2 tank/other",
+        ])
+        for command in commands:
+            subprocess.run([str(fake_zfs.wrapper), *shlex.split(command)[1:]], check=True, env=dict(os.environ))
+        assert fake_zfs.props("tank/data")[INFLIGHT + "offsite2"] == "o1,o2"
+        assert INFLIGHT + "offsite2" not in fake_zfs.props("tank/other")
+
+    def test_a_failing_pin_copy_aborts_before_the_write_and_rolls_back_the_anchor(self, run, rich, pins):
+        pins.fail("set", "tank/data", INFLIGHT + "offsite2")
+        state = db_state(rich)
+        result = self.rename(run, rich)
+        assert result.exit_code == 1
+        err = result.stderr
+        assert f"copying {INFLIGHT}offsite to inflight.offsite2 on 'tank/data' failed" in err
+        assert "Nothing was written to the configuration" in err
+        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err           # the anchor that landed
+        assert f"zfs inherit {INFLIGHT}offsite2 tank/data" not in err      # the pin that did not
+        assert db_state(rich) == state
+
+    def test_an_interrupt_during_a_pin_copy_covers_it_in_the_note(self, run, rich, pins, monkeypatch):
+        def interrupting(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(rename, "_copy_inflight_property", interrupting)
+        state = db_state(rich)
+        result = self.rename(run, rich)
+        assert result.exit_code == 130
+        err = result.stderr
+        assert f"interrupted while copying {INFLIGHT}offsite to inflight.offsite2 on 'tank/data'" in err
+        assert "Nothing was written to the configuration" in err
+        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err           # finished anchor copy
+        assert f"  zfs inherit {INFLIGHT}offsite2 tank/data" in err         # the one in flight
+        assert db_state(rich) == state
+
+    # -- --skip-missing ---------------------------------------------------------
+
+    def test_skip_missing_datasets_get_no_pin_copy(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {INFLIGHT + "offsite": "a,b"})          # tank/other does not exist
+        result = self.rename(run, rich, "--skip-missing")
+        assert result.exit_code == 0, result.stderr
+        assert fake_zfs.props("tank/data")[INFLIGHT + "offsite2"] == "a,b"
+        assert all(c[-1] != "tank/other" for c in fake_zfs.mutations)
+        assert "tank/other:" not in result.stdout
+        assert f"zfs inherit {INFLIGHT}offsite tank/other" not in result.stdout
+
+
+class TestRenameDatasetInflight:
+    """`rename dataset`: `inflight.*` are stale properties of the old dataset,
+    cleared (sorted, one `zfs inherit` each) with `anchor.*` and the config."""
+
+    PROPS = {
+        CONFIG_PROP: "cfg", ANCHOR + "offsite": "snap1", ANCHOR + "dc.two": "snap2",
+        INFLIGHT + "offsite": "a,b", INFLIGHT + "dc.two": "c,d", "compression": "lz4",
+    }
+    ORDER = [
+        ANCHOR + "dc.two", ANCHOR + "offsite", CONFIG_PROP,
+        INFLIGHT + "dc.two", INFLIGHT + "offsite",
+    ]
+
+    @pytest.fixture
+    def stale(self, fake_zfs):
+        fake_zfs.add("tank/vm.01", self.PROPS)
+        fake_zfs.add("tank/vm.02", {})
+        return fake_zfs
+
+    def clear(self, run, rich, *extra):
+        return run("rename", "dataset", "tank/vm.01", "tank/vm.02", "--clear-stale-props", *extra, "-c", rich)
+
+    def inherits(self, fake):
+        return [c for c in fake.calls if c[0] == "inherit"]
+
+    def test_clear_stale_props_inherits_the_pins_in_sorted_order(self, run, rich, stale):
+        result = self.clear(run, rich)
+        assert result.exit_code == 0, result.stderr
+        assert [c[1] for c in self.inherits(stale)] == self.ORDER
+        assert all(c[-1] == "tank/vm.01" for c in self.inherits(stale))
+        assert stale.props("tank/vm.01") == {"compression": "lz4"}
+        assert "tank/vm.02" in names(rich)
+        cleared = [l for l in result.stdout.splitlines() if l.startswith("Cleared on 'tank/vm.01':")]
+        assert cleared == ["Cleared on 'tank/vm.01': " + ", ".join(self.ORDER)]
+
+    def test_a_pin_inherit_is_a_plain_one_property_inherit(self, run, rich, stale):
+        self.clear(run, rich)
+        pin_calls = [c for c in self.inherits(stale) if c[1].startswith(INFLIGHT)]
+        assert pin_calls == [["inherit", INFLIGHT + "dc.two", "tank/vm.01"],
+                             ["inherit", INFLIGHT + "offsite", "tank/vm.01"]]
+
+    def test_a_failing_pin_inherit_reports_cleared_so_far_and_what_is_left(self, run, rich, stale):
+        stale.fail("inherit", "tank/vm.01", INFLIGHT + "offsite")
+        result = self.clear(run, rich)
+        assert result.exit_code == 1
+        err = result.stderr
+        assert "clearing the stale properties on 'tank/vm.01' failed" in err
+        assert "Cleared so far: " + ", ".join(self.ORDER[:4]) in err
+        left = err.split("Still set, to clear by hand:")[1]
+        assert f"zfs inherit {INFLIGHT}offsite tank/vm.01" in left
+        for prop in self.ORDER[:4]:
+            assert f"zfs inherit {prop} " not in left
+        assert stale.props("tank/vm.01") == {
+            INFLIGHT + "offsite": "a,b", "compression": "lz4",
+        }
+        assert [c[1] for c in self.inherits(stale)] == self.ORDER       # it stopped at the failure
+
+    def test_a_failing_first_pin_leaves_both_pins(self, run, rich, stale):
+        stale.fail("inherit", "tank/vm.01", INFLIGHT + "dc.two")
+        err = self.clear(run, rich).stderr
+        assert "Cleared so far: " + ", ".join(self.ORDER[:3]) + "." in err
+        left = err.split("Still set, to clear by hand:")[1]
+        assert f"zfs inherit {INFLIGHT}dc.two tank/vm.01" in left
+        assert f"zfs inherit {INFLIGHT}offsite tank/vm.01" in left
+        assert stale.props("tank/vm.01")[INFLIGHT + "offsite"] == "a,b"
+
+    def test_an_interrupt_before_a_pin_lists_the_pins_that_may_remain(self, run, rich, stale, monkeypatch):
+        import zfsbackup.backup_manager as bm
+
+        real = bm.zfs.inherit
+
+        def interrupting(ds, prop, *args, **kwargs):
+            if prop == INFLIGHT + "dc.two":
+                raise KeyboardInterrupt
+            return real(ds, prop, *args, **kwargs)
+
+        monkeypatch.setattr(bm.zfs, "inherit", interrupting)
+        result = self.clear(run, rich)
+        assert result.exit_code == 130
+        assert (
+            f"Properties that may remain: {INFLIGHT}dc.two, {INFLIGHT}offsite"
+        ) in result.stderr
+
+    def test_the_plain_hint_prints_the_pin_inherit_commands(self, run, rich, stale):
+        result = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        out = result.stdout
+        assert "The stale properties on 'tank/vm.01' were left in place" in out
+        for prop in self.ORDER:
+            assert f"zfs inherit {prop} tank/vm.01" in out
+        assert stale.mutations == []
+
+    def test_the_warning_names_the_pins_among_the_stale_properties(self, run, rich, stale):
+        err = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich).stderr
+        assert INFLIGHT + "offsite" in err and INFLIGHT + "dc.two" in err
+
+    def test_a_dry_run_lists_the_pins_under_would_clear(self, run, rich, stale):
+        state = db_state(rich)
+        result = self.clear(run, rich, "-d")
+        assert result.exit_code == 0, result.stderr
+        assert f"would clear on 'tank/vm.01': {', '.join(self.ORDER)}" in result.stdout
+        assert db_state(rich) == state and stale.mutations == []
+
+    def test_a_dataset_with_only_a_pin_is_cleared(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/vm.01", {INFLIGHT + "offsite": "a,b"})
+        fake_zfs.add("tank/vm.02", {})
+        result = self.clear(run, rich)
+        assert result.exit_code == 0, result.stderr
+        assert fake_zfs.props("tank/vm.01") == {}
+        assert "Cleared on 'tank/vm.01': " + INFLIGHT + "offsite" in result.stdout
+
+    def test_a_pin_on_the_old_dataset_alone_is_not_cleared_without_the_flag(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/vm.01", {INFLIGHT + "offsite": "a,b"})
+        fake_zfs.add("tank/vm.02", {})
+        assert run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich).exit_code == 0
+        assert fake_zfs.props("tank/vm.01") == {INFLIGHT + "offsite": "a,b"}
+
+    def test_a_running_daemon_still_means_the_pins_stay(
+        self, run, rich, stale, daemon_lock_holder, unsignalable
+    ):
+        daemon_lock_holder(rich, generation=0)
+        result = self.clear(run, rich)
+        assert result.exit_code == 1
+        for prop in self.ORDER:
+            assert f"zfs inherit {prop} tank/vm.01" in result.stderr
+        assert stale.mutations == [] and stale.props("tank/vm.01") == self.PROPS
+
+
 class TestEditEntry:
     """`edit dataset NAME` / `edit destination NAME` and the group's flags."""
 
