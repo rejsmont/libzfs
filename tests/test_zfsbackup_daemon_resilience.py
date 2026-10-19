@@ -40,6 +40,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from _fake_pids import fake_pid
 from sqlalchemy.exc import OperationalError
 
 import zfsbackup.daemon as daemon_module
@@ -78,7 +79,7 @@ FORK_AVAILABLE = "fork" in multiprocessing.get_all_start_methods()
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def dead_worker(exitcode=1, pid=100):
+def dead_worker(exitcode=1, pid=fake_pid(100)):
     worker = MagicMock()
     worker.is_alive.return_value = False
     worker.pid = pid
@@ -121,7 +122,7 @@ class TestRestartBackoff:
         spawned = []
 
         def make(name):
-            worker = dead_worker(pid=200 + len(spawned))
+            worker = dead_worker(pid=fake_pid(200 + len(spawned)))
             spawned.append(worker)
             return worker
 
@@ -273,7 +274,7 @@ class TestRestartBackoff:
         inline, once per dead worker, holding up shutdown. Now: a deadline."""
         clock = fake_clock(daemon, mocker)
         sleeper = mocker.patch("zfsbackup.daemon.time.sleep")
-        mocker.patch.object(daemon, "_new_worker", return_value=MagicMock(pid=1))
+        mocker.patch.object(daemon, "_new_worker", return_value=MagicMock(pid=fake_pid(1)))
         daemon._workers = {n: dead_worker() for n in ("snapshot", "pruning", "api")}
 
         started = time.monotonic()
@@ -287,7 +288,7 @@ class TestRestartBackoff:
 
     def test_spawn_records_start_time_and_clears_the_deadline(self, daemon, mocker):
         clock = fake_clock(daemon, mocker)
-        mocker.patch.object(daemon, "_new_worker", return_value=MagicMock(pid=1))
+        mocker.patch.object(daemon, "_new_worker", return_value=MagicMock(pid=fake_pid(1)))
         daemon._restart_at["snapshot"] = 5.0
 
         daemon._spawn("snapshot", verb="Restarted")
@@ -300,7 +301,7 @@ class TestRestartBackoff:
         runs; if that raises, the child must already be tracked or it would
         never be joined or terminated at shutdown."""
         clock = fake_clock(daemon, mocker)
-        worker = MagicMock(pid=4242)
+        worker = MagicMock(pid=fake_pid(4242))
         mocker.patch.object(daemon, "_new_worker", return_value=worker)
         mocker.patch.object(daemon_module.logger, "info", side_effect=RuntimeError("log sink broke"))
 
@@ -335,7 +336,7 @@ class TestRestartBackoff:
         left. Mutation-checked (scratch copy): treating exit code 78 as
         fatal again in `_check_workers` fails this test (1)."""
         clock = fake_clock(daemon, mocker)
-        mocker.patch.object(daemon, "_new_worker", return_value=MagicMock(pid=2))
+        mocker.patch.object(daemon, "_new_worker", return_value=MagicMock(pid=fake_pid(2)))
         daemon._workers = {"snapshot": dead_worker(exitcode=78)}
         daemon._check_workers()
         assert not hasattr(daemon, "_config_failed")
@@ -371,7 +372,7 @@ class TestBackoffNeverDelaysShutdown:
 
         def spawn_then_stop(name):
             daemon._stop_event.set()
-            return MagicMock(pid=1)
+            return MagicMock(pid=fake_pid(1))
 
         mocker.patch.object(daemon, "_new_worker", side_effect=spawn_then_stop)
         daemon._check_workers()
@@ -803,7 +804,7 @@ class TestStartWorkersHonoursTheStopFlag:
 class TestAbandonedWorkers:
     def test_a_worker_surviving_sigkill_is_recorded(self, daemon):
         worker = MagicMock()
-        worker.pid = 4242
+        worker.pid = fake_pid(4242)
         worker.is_alive.return_value = True
         daemon._workers = {"snapshot": worker}
         daemon._shutdown_workers(timeout=0)

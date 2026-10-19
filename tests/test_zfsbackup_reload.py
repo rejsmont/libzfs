@@ -55,6 +55,8 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy.exc import OperationalError
 
+from _fake_pids import FAKE_PID_BASE, assert_unresolvable
+
 import zfsbackup.daemon as daemon_module
 from zfsbackup import daemonlock
 from zfsbackup.backup_manager import DatasetManager
@@ -136,7 +138,7 @@ class FakeWorker:
     real ones, so `config`, `born_epoch` and `reload_epoch` are what a real
     worker would have been born with."""
 
-    _pids = itertools.count(5000)
+    _pids = itertools.count(FAKE_PID_BASE)
 
     def __init__(self, name, world, config, stop_event, verbose=False, *,
                  reload_epoch=None, born_epoch=0, workers_lock=None):
@@ -155,6 +157,7 @@ class FakeWorker:
 
     def start(self):
         self.pid = next(self._pids)
+        assert_unresolvable(self.pid)       # never alias a real process (forkserver)
         self._alive = True
         self.world.events.append(f"fork:{self.name}")
 
@@ -272,6 +275,29 @@ class World:
 
     def workers_made(self, name):
         return [w for w in self.made if w.name == name]
+
+
+@pytest.mark.unit
+class TestFakePidsNeverAliasARealProcess:
+    """Under `forkserver` the supervisor asks the OS about a worker's pid; a
+    fake pid that a real process owns turns a dead fake worker into a "live
+    orphan" (a CI-only flake). Fake pids live above every `pid_max`."""
+
+    def test_the_harness_pids_are_unresolvable(self, world):
+        workers = world.start_workers()
+        assert workers and all(w.pid >= FAKE_PID_BASE for w in workers.values())
+        for w in workers.values():
+            with pytest.raises(ProcessLookupError):
+                os.kill(w.pid, 0)
+
+    def test_the_guard_trips_on_a_live_pid(self):
+        with pytest.raises(AssertionError, match="live process|real process"):
+            assert_unresolvable(os.getpid())
+        with pytest.raises(AssertionError):
+            assert_unresolvable(1)                     # init: EPERM still means it exists
+
+    def test_the_base_is_above_every_platform_pid_max_and_a_valid_pid_t(self):
+        assert 4_194_304 < FAKE_PID_BASE < 2 ** 31
 
 
 @pytest.fixture(autouse=True)

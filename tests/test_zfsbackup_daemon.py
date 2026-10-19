@@ -5,6 +5,7 @@ import signal
 import sqlite3
 import time
 import pytest
+from _fake_pids import fake_pid
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -262,7 +263,7 @@ class TestStartWorkers:
     def test_starts_all_active_workers(self, sqlite_config_db, sample_backup_config, mocker):
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
         mock_worker = MagicMock()
-        mock_worker.pid = 1234
+        mock_worker.pid = fake_pid(1234)
         mocker.patch.object(daemon, '_new_worker', return_value=mock_worker)
         mocker.patch('zfsbackup.daemon.dispose_all')
         daemon._start_workers()
@@ -275,12 +276,12 @@ class TestCheckWorkers:
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
         dead_worker = MagicMock()
         dead_worker.is_alive.return_value = False
-        dead_worker.pid = 100
+        dead_worker.pid = fake_pid(100)
         dead_worker.exitcode = 1
         daemon._workers = {'snapshot': dead_worker}
 
         new_worker = MagicMock()
-        new_worker.pid = 200
+        new_worker.pid = fake_pid(200)
         mocker.patch.object(daemon, '_new_worker', return_value=new_worker)
         mocker.patch('zfsbackup.daemon.dispose_all')
         clock = _fake_clock(daemon, mocker)
@@ -335,7 +336,7 @@ class TestCrashLoopGuard:
     """
 
     @staticmethod
-    def _dead(exitcode=1, pid=100):
+    def _dead(exitcode=1, pid=fake_pid(100)):
         w = MagicMock()
         w.is_alive.return_value = False
         w.pid = pid
@@ -348,7 +349,7 @@ class TestCrashLoopGuard:
         mocker.patch('zfsbackup.backup_manager.zfs.set')
         mocker.patch('zfsbackup.daemon.dispose_all')
         # A broken guard must loop in pure Python, never fork real children.
-        mocker.patch.object(daemon, '_new_worker', return_value=MagicMock(pid=999))
+        mocker.patch.object(daemon, '_new_worker', return_value=MagicMock(pid=fake_pid(999)))
         mocker.patch.object(
             daemon, '_start_workers',
             side_effect=lambda: daemon._workers.update(workers),
@@ -389,9 +390,9 @@ class TestCrashLoopGuard:
         stopped again) and the whole daemon stops with exit code 1."""
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
         daemon._failures['snapshot'] = WORKER_MAX_CONSECUTIVE_FAILURES - 1
-        waiting = self._dead(pid=200)
+        waiting = self._dead(pid=fake_pid(200))
         sleeps = self._arm_run(
-            daemon, mocker, {'snapshot': self._dead(pid=100), 'pruning': waiting}
+            daemon, mocker, {'snapshot': self._dead(pid=fake_pid(100)), 'pruning': waiting}
         )
         daemon._failures['pruning'] = 1
         daemon._restart_at['pruning'] = 900.0  # due: the fake clock reads 1000
@@ -464,7 +465,7 @@ class TestSpawnOrdering:
         def fake_new_worker(name):
             call_order.append(f'new_worker:{name}')
             worker = MagicMock()
-            worker.pid = 4242
+            worker.pid = fake_pid(4242)
             worker.start.side_effect = lambda: call_order.append('start')
             return worker
 
@@ -487,7 +488,7 @@ class TestSpawnOrdering:
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
         dead_worker = MagicMock()
         dead_worker.is_alive.return_value = False
-        dead_worker.pid = 100
+        dead_worker.pid = fake_pid(100)
         dead_worker.exitcode = 1
         daemon._workers = {'pruning': dead_worker}
         clock = _fake_clock(daemon, mocker)
@@ -538,7 +539,7 @@ class TestShutdownWorkers:
         """
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
         worker = MagicMock()
-        worker.pid = 4242
+        worker.pid = fake_pid(4242)
         worker.is_alive.side_effect = [True, True, False]
         daemon._workers = {'snapshot': worker}
 
@@ -560,7 +561,7 @@ class TestShutdownWorkers:
         """
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
         worker = MagicMock()
-        worker.pid = 4242
+        worker.pid = fake_pid(4242)
         worker.is_alive.side_effect = [True, True, True]
         daemon._workers = {'snapshot': worker}
 
@@ -569,7 +570,7 @@ class TestShutdownWorkers:
 
         worker.kill.assert_called_once()
         assert 'survived SIGKILL' in caplog.text
-        assert '4242' in caplog.text
+        assert str(worker.pid) in caplog.text
 
     def test_shutdown_budget_is_a_single_shared_deadline_not_per_worker(
         self, sqlite_config_db, sample_backup_config, mocker
