@@ -16,7 +16,10 @@ class PropertyNames:
     filesystem = ['aclmode', 'aclinherit', 'acltype', 'atime', 'canmount', 'casesensitivity', 'devices', 'dnodesize',
                   'exec', 'filesystem_count', 'filesystem_limit', 'mounted', 'mountpoint', 'nbmand', 'normalization',
                   'overlay', 'prefetch', 'quota', 'recordsize', 'refquota', 'relatime', 'setuid', 'sharenfs', 'sharesmb',
-                  'snapdir', 'special_small_blocks', 'utf8only', 'version', 'vscan', 'xattr', 'zoned']
+                  'snapdir', 'special_small_blocks', 'utf8only', 'version', 'vscan', 'xattr', 'zoned',
+                  # OpenZFS 2.4 default per-entity quotas
+                  'defaultuserquota', 'defaultgroupquota', 'defaultprojectquota', 'defaultuserobjquota',
+                  'defaultgroupobjquota', 'defaultprojectobjquota']
 
     volume = ['volblocksize', 'volsize']
 
@@ -36,7 +39,8 @@ class PropertyNames:
                'devices', 'exec', 'filesystem_limit', 'mountpoint', 'nbmand', 'normalization', 'primarycache',
                'quota', 'readonly', 'recordsize', 'refquota', 'refreservation', 'reservation', 'secondarycache',
                'setuid', 'sharenfs', 'sharesmb', 'snapdir', 'snapshot_limit', 'utf8only', 'version', 'volblocksize',
-               'volsize', 'vscan', 'xattr', 'zoned']
+               'volsize', 'vscan', 'xattr', 'zoned', 'defaultuserquota', 'defaultgroupquota', 'defaultprojectquota',
+               'defaultuserobjquota', 'defaultgroupobjquota', 'defaultprojectobjquota']
 
     mount_opts = ['atime', 'noatime', 'auto', 'noauto' , 'dev', 'nodev', 'exec', 'noexec', 'ro', 'rw', 'relatime',
                   'norelatime', 'suid', 'nosuid', 'xattr', 'noxattr', 'mand', 'nomand']
@@ -56,6 +60,9 @@ class Validate:
     pool = r'([a-zA-Z][\w\._\-]*)'
     ds = r'(/[\w](?:[\w\.:_\- ]*[\w\.:_\-])?)'
     name = r'[\w\.:_\-]+'
+    # A native (non user-defined) property name as `zfs get` prints it: a lowercase identifier, optionally under the
+    # macOS `com.apple.` prefix. Used only for names that zfs itself returned; see `Validate.native_attribute`.
+    native = r'(?:com\.apple\.)?[a-z][a-z0-9_]*'
     short = r'(?:[\w\.:_\-](?:[\w\.:_\- ]*[\w\.:_\-])?)'
     # One comma-separated item is either a single short name, a range `a%b` / `a%` (open end) / `%b` (open start),
     # i.e. at most one `%`, and never empty or a bare `%` (which `zfs destroy` treats as "all snapshots").
@@ -104,6 +111,17 @@ class Validate:
             raise ValueError(s + ' is not a valid ZFS property name')
         if (':' not in s) and (s not in PropertyNames.all):
             raise ValueError(s + ' is not a valid ZFS property name')
+
+    @staticmethod
+    def native_attribute(s: str) -> None:
+        """Lenient variant of `attribute` for names zfs itself returned (never for caller-supplied names).
+
+        Accepts everything `attribute` accepts, plus any well-formed native property name that is not (yet) in
+        `PropertyNames`, so a newer OpenZFS adding a property does not break parsing of `zfs get all`.
+        """
+        if re.fullmatch(Validate.native, s, re.ASCII):
+            return
+        Validate.attribute(s)
 
     @staticmethod
     def property(s: str) -> None:
@@ -184,6 +202,9 @@ class ZFS:
         self._name = name
         self._props = {}
         self._user_props = {}
+        # Native properties reported by zfs that are not in `_prop_names` (e.g. added by a newer OpenZFS), keyed by
+        # name. Only populated by `update(..., lenient=True)`, i.e. from parsed zfs output, never from caller input.
+        self._extra_props = {}
         if properties is not None:
             self.update(properties)
 
@@ -195,14 +216,48 @@ class ZFS:
     def properties(self) -> Iterable[PropertyItem]:
         yield from ((self._prop_names[k], v) for (k, v) in self._props.items())
         yield from self._user_props.items()
+        yield from self._extras().items()
 
     def reset(self):
         self._props = {}
         self._user_props = {}
+        self._extra_props = {}
 
-    def update(self, properties: Properties):
+    def _extras(self) -> Dict[str, Property]:
+        # Per-instance, created on demand so objects unpickled from before `_extra_props` existed keep working.
+        try:
+            return self.__dict__['_extra_props']
+        except KeyError:
+            extra = self.__dict__['_extra_props'] = {}
+            return extra
+
+    def _check_name(self, k: str) -> None:
+        # Names already stored as extras came from zfs and may not pass the strict validator.
+        if k in self._extras():
+            return
+        Validate.attribute(k)
+
+    def check_property(self, k: str) -> None:
+        """Strictly validate a caller-supplied property name for this object, without modifying it.
+
+        Raises the same ValueError `update()` (strict) would, so commands can reject a name before running zfs.
+        """
+        Validate.attribute(k)
+        if ':' not in k and k not in self._prop_names:
+            raise ValueError(k + ' is not a valid ' + self.__class__.__name__ + ' property')
+
+    def update(self, properties: Properties, lenient: bool = False):
+        """Set (or, with a None value, delete) properties.
+
+        Keyword arguments:
+            lenient: bool -- accept well-formed native property names unknown to this class and keep them as extra
+                properties. Meant for parsing zfs output only; caller-supplied names must use the default (strict).
+        """
         for k, v in properties.items():
-            Validate.attribute(k)
+            if lenient:
+                Validate.native_attribute(k)
+            else:
+                Validate.attribute(k)
             if v is not None and not isinstance(v, Property):
                 v = Property(v)
             try:
@@ -217,22 +272,32 @@ class ZFS:
                         self._user_props[k] = v
                     elif k in self._user_props:
                         del self._user_props[k]
+                elif lenient:
+                    if v is not None:
+                        self._extras()[k] = v
+                    else:
+                        self._extras().pop(k, None)
                 else:
                     raise ValueError(k + ' is not a valid ' + self.__class__.__name__ + ' property')
 
     def __getitem__(self, k: str) -> Optional[Property]:
-        Validate.attribute(k)
+        self._check_name(k)
         try:
             i = self._prop_names.index(k)
             return self._props.get(i, None)
         except ValueError:
             if ':' in k:
                 return self._user_props.get(k, None)
+            elif k in self._extras():
+                return self._extras()[k]
             else:
                 raise ValueError(k + ' is not a valid ' + self.__class__.__name__ + ' property')
 
     def __getattr__(self, k: str) -> Optional[Property]:
         try:
+            extra = self._extras()
+            if k in extra:
+                return extra[k]
             Validate.attribute(k)
             i = self._prop_names.index(k)
             return self._props.get(i, None)
@@ -240,13 +305,15 @@ class ZFS:
             raise AttributeError(k + ' is not a valid ' + self.__class__.__name__ + ' property')
 
     def __contains__(self, k: str) -> bool:
-        Validate.attribute(k)
+        self._check_name(k)
         try:
             i = self._prop_names.index(k)
             return i in self._props
         except ValueError:
             if ':' in k:
                 return k in self._user_props
+            elif k in self._extras():
+                return True
             else:
                 raise ValueError(k + ' is not a valid ' + self.__class__.__name__ + ' property')
 

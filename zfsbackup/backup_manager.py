@@ -68,11 +68,17 @@ def read_zfsbackup_properties(ds: Dataset) -> Dict[str, str]:
     inherited value belongs to an ancestor, and acting on it would be acting
     on the wrong dataset). Raises whatever `zfs get` raises.
 
-    Reads the raw `zfs get` lines and keeps only `org.zfsbackup:` names
-    BEFORE anything is turned into a libzfseasy object. `zfs.get(...)` builds
-    `ZFS` objects whose `update()` raises `ValueError` for any local/received
-    built-in property libzfseasy does not know (zvol `volthreading`, FreeBSD
-    `jailed`, ...), which would make rename/edit fail on such datasets.
+    Reads the raw `zfs get` lines and keeps only `org.zfsbackup:` names, so
+    no libzfseasy object is built for the dataset's other properties. Not
+    because libzfseasy rejects unknown native properties (it now keeps
+    well-formed native names `zfs` returns in an extras store), but because
+    the object path is the wrong tool here: this needs only the user
+    properties under our prefix, with their exact values (a value may
+    contain tabs, which the line parser below recovers from the fixed
+    trailing `received`/`source` columns) and only the `local` and `received`
+    sources, and building and updating objects for every property of every
+    dataset is wasted work and a place for an unrelated property to fail
+    this read.
     """
     cmd = [
         _zfs_cmd(), 'get', '-H', '-o', 'name,property,value,received,source',
