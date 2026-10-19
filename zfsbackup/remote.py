@@ -8,6 +8,7 @@ import socket
 import uuid
 from pathlib import Path
 from typing import Optional, Set, Tuple
+from urllib.parse import quote
 
 import requests
 import websocket
@@ -54,6 +55,37 @@ def _is_reloading(resp) -> bool:
         return bool(resp.json().get('retry'))
     except Exception:
         return False
+
+
+def _is_reloading_refusal(result) -> bool:
+    """Is `result` (a decoded websocket text message) the server's retryable
+    "reloading" refusal (`api.RELOADING_ERROR`, `retry: True`)? A real error
+    status carries no `retry`."""
+    return (
+        isinstance(result, dict)
+        and result.get('status') != 'ok'
+        and bool(result.get('retry'))
+    )
+
+
+def _peer_sent_reloading_refusal(ws) -> bool:
+    """After a failed send: did the server leave its "reloading" refusal in
+    the socket before closing? One bounded read (2 s), every error swallowed.
+
+    While draining, the API worker sends the refusal as a text message and
+    returns without reading, so the client's first `send_binary` may hit the
+    closed socket (BrokenPipe / connection closed) and never see the reason."""
+    try:
+        ws.settimeout(2)
+        return _is_reloading_refusal(json.loads(ws.recv()))
+    except Exception:
+        return False
+
+
+def _path(component: str) -> str:
+    """Percent-encode a client id / dataset name for use in a URL path
+    (the API's routes decode it; `/` and `:` stay literal)."""
+    return quote(component, safe='/:')
 
 
 class ClientIdentity:
@@ -189,7 +221,7 @@ class RemoteBackupManager:
         retryable "reloading" 503, which the caller logs at INFO)."""
         try:
             resp = requests.post(
-                f"{base_url}/backup/{client_id}/{dsi.name}/negotiate",
+                f"{base_url}/backup/{_path(client_id)}/{_path(dsi.name)}/negotiate",
                 json={
                     'snapshots': [s.name for s in snapshots],
                     # Effective config for this destination -- a per-destination
@@ -235,13 +267,14 @@ class RemoteBackupManager:
             return False
 
         ws_base = base_url.replace('https://', 'wss://', 1).replace('http://', 'ws://', 1)
-        ws_url = f"{ws_base}/backup/{client_id}/{dsi.name}/stream"
+        ws_url = f"{ws_base}/backup/{_path(client_id)}/{_path(dsi.name)}/stream"
         if common_snap:
-            ws_url += f"?from={common_snap.name}"
+            ws_url += f"?from={quote(common_snap.name, safe='')}"
 
         ws = websocket.WebSocket()
         entered = False
         failed = False
+        sending = False
         try:
             ws.connect(ws_url, timeout=WS_CONNECT_TIMEOUT)
             ws.settimeout(WS_IDLE_TIMEOUT)
@@ -256,6 +289,7 @@ class RemoteBackupManager:
             # the pipe FIRST, so `zfs send` gets EPIPE/SIGPIPE on its next
             # write and exits, and only then waits for it.
             entered = True
+            sending = True
             try:
                 while True:
                     chunk = stream.read(chunk_size)
@@ -273,19 +307,42 @@ class RemoteBackupManager:
                 raise
             # Normal end: closing waits for `zfs send` and raises if it
             # exited non-zero, exactly as leaving a `with stream:` did.
+            sending = False
             stream.close()
+            # The `done` message is still part of the send phase: on a quiet
+            # dataset the whole stream fits in the kernel buffer, and a server
+            # refusal (its close/RST) first surfaces as a failure of this
+            # send. A failing `stream.close()` above stays probe-free.
+            sending = True
             ws.send(json.dumps({'done': True}))
+            sending = False
             ws.settimeout(WS_FINAL_ACK_TIMEOUT)
             result = json.loads(ws.recv())
             if result.get('status') != 'ok':
+                failed = True
+                if _is_reloading_refusal(result):
+                    # Draining for a reload: the refusal arrives where the
+                    # final ack is expected. Not an error; the anchor is not
+                    # advanced and the next cycle retries.
+                    logger.info(
+                        f"server {base_url} is reloading; skipping {dsi.name} this cycle"
+                    )
+                    return False
                 logger.error(
                     f"Transfer failed for {dsi.name}: {result.get('error', 'unknown error')}"
                 )
-                failed = True
                 return False
         except Exception as e:
-            logger.error(f"Transfer failed for {dsi.name} -> {base_url}: {e}")
             failed = True
+            # A timeout means a silent peer, which cannot have left a refusal
+            # behind (a refusal closes the socket): do not wait on it again.
+            timed_out = isinstance(e, (TimeoutError, websocket.WebSocketTimeoutException))
+            if sending and not timed_out and _peer_sent_reloading_refusal(ws):
+                logger.info(
+                    f"server {base_url} is reloading; skipping {dsi.name} this cycle"
+                )
+            else:
+                logger.error(f"Transfer failed for {dsi.name} -> {base_url}: {e}")
             return False
         finally:
             if failed:
@@ -322,7 +379,7 @@ class RemoteBackupManager:
         """Try to resume an interrupted transfer; fall back to a fresh send."""
         try:
             resp = requests.get(
-                f"{base_url}/backup/{client_id}/{dsi.name}/resume_token",
+                f"{base_url}/backup/{_path(client_id)}/{_path(dsi.name)}/resume_token",
                 timeout=10,
             )
             if _is_reloading(resp):

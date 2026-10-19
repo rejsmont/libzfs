@@ -26,6 +26,13 @@ def _make_config(**kwargs) -> BackupConfig:
     return BackupConfig(**defaults)
 
 
+def _finite_stream():
+    """A `zfs send` stand-in that ends at once (never an endless MagicMock read)."""
+    stream = MagicMock()
+    stream.read.return_value = b''
+    return stream
+
+
 class TestClientIdentity:
     def test_generates_new_id_when_no_file(self, tmp_path):
         id_file = tmp_path / 'client_id'
@@ -735,8 +742,10 @@ class TestNegotiationFailedAndReload:
         sends = {
             'transfer': mocker.spy(rbm, '_transfer'),
             'resume': mocker.spy(rbm, '_get_resume_stream'),
-            'send_snapshot': mocker.patch('zfsbackup.remote.zfs.send.snapshot'),
-            'send_resume': mocker.patch('zfsbackup.remote.zfs.send.resume'),
+            # A bare MagicMock stream's `.read()` is always truthy: a URL
+            # mismatch that fell through to a real send would loop forever.
+            'send_snapshot': mocker.patch('zfsbackup.remote.zfs.send.snapshot', return_value=_finite_stream()),
+            'send_resume': mocker.patch('zfsbackup.remote.zfs.send.resume', return_value=_finite_stream()),
         }
         return rbm, dsi, remote_cfg, sends
 
@@ -825,7 +834,7 @@ class TestNegotiationFailedAndReload:
 
     def test_a_reloading_resume_token_makes_transfer_false(self, tmp_path, requests_mock, mocker):
         rbm, manager, dsi, _ = self._make(tmp_path)
-        send_snapshot = mocker.patch('zfsbackup.remote.zfs.send.snapshot')
+        send_snapshot = mocker.patch('zfsbackup.remote.zfs.send.snapshot', return_value=_finite_stream())
         ws_cls = mocker.patch('zfsbackup.remote.websocket.WebSocket')
         requests_mock.get(
             f'{self.URL}/backup/client1/{dsi.name}/resume_token', status_code=503, json=self.RELOADING
@@ -844,3 +853,153 @@ class TestNegotiationFailedAndReload:
         latest.name = 'autosnap_1'
         assert rbm._get_resume_stream(self.URL, 'client1', dsi, latest, None) == 'STREAM'
         send_snapshot.assert_called_once()
+
+
+class TestUrlPathEncoding:
+    """Item 3a: client ids and dataset names are percent-encoded in URL paths
+    (`/` and `:` stay literal in a path; `?from=` encodes everything).
+
+    `requests` itself would turn a raw space into `%20`, so these tests capture
+    the URL handed to `requests`/`websocket` instead of going through a real
+    request, where an unencoded `%`/`#`/`?` would otherwise pass unnoticed."""
+
+    BASE = 'http://backup.example.com'
+
+    def _rbm(self, tmp_path, name='pool/my data'):
+        config = _make_config(
+            datasets=[DatasetConfig(name=name, remote=[RemoteDatasetConfig(destination='offsite')])],
+            client_id_file=tmp_path / 'client_id',
+        )
+        manager = DatasetManager(config)
+        return RemoteBackupManager(config, manager), manager.datasets[0]
+
+    @pytest.mark.parametrize('name, client, quoted', [
+        ('pool/my data', 'client 1', 'client%201/pool/my%20data'),
+        ('pool/data', 'client1', 'client1/pool/data'),
+        ('pool/a:b', 'host-abc12345', 'host-abc12345/pool/a:b'),
+        ('pool/data', 'c#d?e%f', 'c%23d%3Fe%25f/pool/data'),
+        ('pool/dot.ted-and_under', 'my.host-1', 'my.host-1/pool/dot.ted-and_under'),
+        ('pool/data', 'hôst-1', 'h%C3%B4st-1/pool/data'),
+    ])
+    def test_negotiate_url(self, tmp_path, mocker, name, client, quoted):
+        rbm, dsi = self._rbm(tmp_path, name)
+        post = mocker.patch('zfsbackup.remote.requests.post')
+        post.return_value.json.return_value = {'common_snapshot': None}
+        post.return_value.status_code = 200
+        rbm._negotiate(self.BASE, client, dsi, [], 'offsite')
+        assert post.call_args.args[0] == f'{self.BASE}/backup/{quoted}/negotiate'
+
+    @pytest.mark.parametrize('name, client, quoted', [
+        ('pool/my data', 'client 1', 'client%201/pool/my%20data'),
+        ('pool/data', 'client1', 'client1/pool/data'),
+        ('pool/a:b', 'c', 'c/pool/a:b'),
+    ])
+    def test_resume_token_url(self, tmp_path, mocker, name, client, quoted):
+        rbm, dsi = self._rbm(tmp_path, name)
+        get = mocker.patch('zfsbackup.remote.requests.get')
+        get.return_value.ok = True
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = {'resume_token': None}
+        mocker.patch('zfsbackup.remote.zfs.send.snapshot')
+        rbm._get_resume_stream(self.BASE, client, dsi, MagicMock(), None)
+        assert get.call_args.args[0] == f'{self.BASE}/backup/{quoted}/resume_token'
+
+    def _stream_url(self, tmp_path, mocker, name, client, common, base=None):
+        rbm, dsi = self._rbm(tmp_path, name)
+        mocker.patch.object(rbm, '_get_resume_stream', return_value=MagicMock(read=MagicMock(return_value=b'')))
+        mocker.patch.object(rbm.local_manager, 'get_anchor', return_value=None)
+        mocker.patch.object(rbm.local_manager, 'set_anchor')
+        ws = MagicMock()
+        ws.recv.return_value = '{"status": "ok"}'
+        mocker.patch('zfsbackup.remote.websocket.WebSocket', return_value=ws)
+        common_snap = None
+        if common is not None:
+            common_snap = MagicMock()
+            common_snap.name = common
+        assert rbm._transfer(base or self.BASE, client, dsi, MagicMock(), common_snap, 'offsite') is True
+        return ws.connect.call_args.args[0]
+
+    def test_stream_url_full_send(self, tmp_path, mocker):
+        url = self._stream_url(tmp_path, mocker, 'pool/my data', 'client 1', None)
+        assert url == 'ws://backup.example.com/backup/client%201/pool/my%20data/stream'
+        assert '?' not in url
+
+    def test_stream_url_incremental_encodes_the_snapshot_name_fully(self, tmp_path, mocker):
+        url = self._stream_url(tmp_path, mocker, 'pool/my data', 'client 1', 'snap:one two/x')
+        assert url == (
+            'ws://backup.example.com/backup/client%201/pool/my%20data/stream'
+            '?from=snap%3Aone%20two%2Fx'
+        )
+
+    def test_a_plain_snapshot_name_is_unchanged(self, tmp_path, mocker):
+        url = self._stream_url(tmp_path, mocker, 'pool/data', 'client1', 'autosnap_20240101120000')
+        assert url == (
+            'ws://backup.example.com/backup/client1/pool/data/stream'
+            '?from=autosnap_20240101120000'
+        )
+
+    def test_https_becomes_wss_and_the_path_is_still_quoted(self, tmp_path, mocker):
+        url = self._stream_url(tmp_path, mocker, 'pool/my data', 'c', None, base='https://backup.example.com')
+        assert url == 'wss://backup.example.com/backup/c/pool/my%20data/stream'
+
+    def test_the_query_value_round_trips(self, tmp_path, mocker):
+        from urllib.parse import parse_qs, urlsplit
+        url = self._stream_url(tmp_path, mocker, 'pool/data', 'c', 'a b:c&d=e#f')
+        assert parse_qs(urlsplit(url).query) == {'from': ['a b:c&d=e#f']}
+
+    def test_path_helper_keeps_slash_and_colon_only(self):
+        from zfsbackup.remote import _path
+        assert _path('pool/a:b c') == 'pool/a:b%20c'
+        assert _path('a#b?c%d&e') == 'a%23b%3Fc%25d%26e'
+        assert _path('plain-name_1.x') == 'plain-name_1.x'
+
+
+class TestUrlRoundTripThroughTheServer:
+    """The quoted negotiate URL the client builds is decoded by the API's
+    routes back to the original client id and dataset name."""
+
+    def test_the_client_quoted_negotiate_url_reaches_the_server_decoded(self, tmp_path, mocker):
+        from urllib.parse import urlsplit
+        from zfsbackup.api import create_app
+        from zfsbackup.config import RemoteServerConfig
+
+        server_config = _make_config(
+            datasets=[DatasetConfig(name='pool/srv')],
+            remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
+            client_id_file=tmp_path / 'server_client_id',
+        )
+        app = create_app(server_config)
+        app.testing = True
+        web = app.test_client()
+        exists = mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
+        zset = mocker.patch('zfsbackup.api.zfs.set')
+        mocker.patch('zfsbackup.api.zfs.list', return_value=[])
+
+        config = _make_config(
+            datasets=[DatasetConfig(name='pool/my data', remote=[RemoteDatasetConfig(destination='offsite')])],
+            client_id_file=tmp_path / 'client_id',
+        )
+        manager = DatasetManager(config)
+        rbm = RemoteBackupManager(config, manager)
+        dsi = manager.datasets[0]
+
+        def deliver(url, json=None, timeout=None):
+            path = urlsplit(url).path
+            assert path == '/backup/client%201/pool/my%20data/negotiate'
+            resp = web.post(path, json=json)       # the server decodes the percent-escapes
+            fake = MagicMock()
+            fake.status_code = resp.status_code
+            fake.ok = resp.status_code < 400
+            fake.json.return_value = resp.get_json()
+            return fake
+
+        mocker.patch('zfsbackup.remote.requests.post', side_effect=deliver)
+        snaps = [MagicMock()]
+        snaps[0].name = 'autosnap_20240101120000'
+        assert rbm._negotiate('http://backup.example.com', 'client 1', dsi, snaps, 'offsite') is None
+
+        server_fs = exists.call_args.args[0]
+        assert server_fs.name == 'pool/backups/client 1/my data'
+        props = zset.call_args.args[1]
+        assert props['org.zfsbackup:client_id'] == 'client 1'
+        assert props['org.zfsbackup:source_dataset'] == 'pool/my data'

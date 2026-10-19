@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple, Union
+import dataclasses
 import logging
 import shlex
 import sys
@@ -32,6 +33,34 @@ PROP_PREFIX = 'org.zfsbackup:'
 # that a property copy failed. All take `dry_run` and then touch nothing.
 
 
+def _parse_zfsbackup_get(lines: Iterable[str], accept) -> Dict[str, Dict[str, str]]:
+    """Parse `zfs get -H -o name,property,value,received,source` lines into
+    `{dataset name: {org.zfsbackup:* property: value}}` (local/received only),
+    keeping the rows whose dataset name `accept` approves."""
+    result: Dict[str, Dict[str, str]] = {}
+    for line in lines:
+        parts = line.rstrip('\n').split('\t')
+        if len(parts) < 5:
+            continue
+        name, prop, source = parts[0], parts[1], parts[-1]
+        if not prop.startswith(PROP_PREFIX) or not accept(name):
+            continue
+        if source not in ('local', 'received'):
+            continue
+        # A value may itself contain a tab. For a `local` property the
+        # `received` column is a single '-', so the value is everything
+        # between `property` and the last two columns. For a `received`
+        # property the `received` column repeats the value, so the value
+        # spans exactly half of the columns between `property` and `source`.
+        if source == 'received':
+            span = (len(parts) - 3) // 2
+            value = '\t'.join(parts[2:2 + span])
+        else:
+            value = '\t'.join(parts[2:-2])
+        result.setdefault(name, {})[prop] = value
+    return result
+
+
 def read_zfsbackup_properties(ds: Dataset) -> Dict[str, str]:
     """Return every `org.zfsbackup:*` user property set on `ds`, name -> value.
 
@@ -49,27 +78,27 @@ def read_zfsbackup_properties(ds: Dataset) -> Dict[str, str]:
         _zfs_cmd(), 'get', '-H', '-o', 'name,property,value,received,source',
         '-s', 'local,received', 'all', ds.name,
     ]
-    result: Dict[str, str] = {}
-    for line in zfs.get._exec_out(cmd):
-        parts = line.rstrip('\n').split('\t')
-        if len(parts) < 5:
-            continue
-        name, prop, source = parts[0], parts[1], parts[-1]
-        if name != ds.name or not prop.startswith(PROP_PREFIX):
-            continue
-        if source not in ('local', 'received'):
-            continue
-        # A value may itself contain a tab. For a `local` property the
-        # `received` column is a single '-', so the value is everything
-        # between `property` and the last two columns. For a `received`
-        # property the `received` column repeats the value, so the value
-        # spans exactly half of the columns between `property` and `source`.
-        if source == 'received':
-            span = (len(parts) - 3) // 2
-            result[prop] = '\t'.join(parts[2:2 + span])
-        else:
-            result[prop] = '\t'.join(parts[2:-2])
-    return result
+    parsed = _parse_zfsbackup_get(zfs.get._exec_out(cmd), lambda n: n == ds.name)
+    return parsed.get(ds.name, {})
+
+
+def read_descendant_zfsbackup_properties(ds: Dataset) -> Dict[str, Dict[str, str]]:
+    """`read_zfsbackup_properties` for every DESCENDANT of `ds` (not `ds`
+    itself), in one `zfs get -r`: `{descendant name: {property: value}}`,
+    only descendants that have at least one local/received `org.zfsbackup:*`
+    property appear. Snapshots and bookmarks are excluded (`-t`). Raises
+    whatever `zfs get` raises -- the pruner must not prune on an unknown
+    protect-set."""
+    cmd = [
+        _zfs_cmd(), 'get', '-r', '-t', 'filesystem,volume', '-H',
+        '-o', 'name,property,value,received,source',
+        '-s', 'local,received', 'all', ds.name,
+    ]
+    prefix = ds.name + '/'
+    return _parse_zfsbackup_get(
+        zfs.get._exec_out(cmd),
+        lambda n: n.startswith(prefix) and '@' not in n and '#' not in n,
+    )
 
 
 def copy_anchor_property(
@@ -244,6 +273,12 @@ class DatasetManager:
         # destination that were already announced at INFO (once each; the
         # per-cycle repeat is DEBUG).
         self._orphan_anchor_noted: Set[Tuple[str, str]] = set()
+        # (dataset name, snapshot name) pairs kept out of a recursive destroy
+        # because a descendant protects them (announced once at INFO).
+        self._descendant_protect_noted: Set[Tuple[str, str]] = set()
+        # Datasets whose descendant evaluation failed and was announced at
+        # ERROR (once while it persists; the per-cycle repeat is DEBUG).
+        self._descendant_error_noted: Set[str] = set()
 
     @property
     def datasets(self) -> List[DatasetInfo]:
@@ -436,6 +471,19 @@ class DatasetManager:
                     continue
                 try:
                     ds_config = DatasetConfig.from_property(str(config_prop))
+                    # Received datasets are never pruned recursively. The
+                    # client does not send with `-R`: every received child is
+                    # its own configured client dataset with its own received
+                    # config and retention, so a parent's `zfs destroy -r`
+                    # would apply the parent's retention to the children's
+                    # history (and could remove a child's incremental base).
+                    # The client's `recursive` describes how the CLIENT
+                    # snapshots; it has no meaning for the copy on this
+                    # server. Forced here, on a copy of the config, because
+                    # the only consumer of these objects is the pruner
+                    # (`PruningWorker`); sends, negotiation and the API use
+                    # the manager's own configured `datasets`.
+                    ds_config = dataclasses.replace(ds_config, recursive=False)
                     result.append(DatasetInfo(ds, ds_config))
                 except Exception as e:
                     logger.warning(f"Failed to load config for received dataset {ds.name}: {e}")
@@ -516,23 +564,27 @@ class DatasetManager:
             logger.debug(f"Snapshot {sni.full_name} marked for pruning")
         return to_prune
 
+    def _list_snapshots_strict(self, dsi: DatasetInfo, recursive: bool = False) -> List['SnapshotInfo']:
+        """`list_snapshots` that lets a `zfs list` failure propagate."""
+        snapshots = zfs.list(
+            roots=dsi.dataset,
+            types='snapshot',
+            recursive=recursive,
+            properties=['creation'],
+        )
+        result: List[SnapshotInfo] = []
+        for snap in snapshots:
+            if isinstance(snap, ZFSSnapshot):
+                info = SnapshotInfo(snap, self.prefix)
+                if info.is_managed:
+                    result.append(info)
+        dsi.snapshots = sorted(result, key=lambda s: s.timestamp, reverse=True)
+        return dsi.snapshots
+
     def list_snapshots(self, dsi: DatasetInfo, recursive: bool = False) -> List['SnapshotInfo']:
         """List all managed snapshots for a dataset."""
         try:
-            snapshots = zfs.list(
-                roots=dsi.dataset,
-                types='snapshot',
-                recursive=recursive,
-                properties=['creation'],
-            )
-            result: List[SnapshotInfo] = []
-            for snap in snapshots:
-                if isinstance(snap, ZFSSnapshot):
-                    info = SnapshotInfo(snap, self.prefix)
-                    if info.is_managed:
-                        result.append(info)
-            dsi.snapshots = sorted(result, key=lambda s: s.timestamp, reverse=True)
-            return dsi.snapshots
+            return self._list_snapshots_strict(dsi, recursive)
         except Exception as e:
             logger.error(f"Failed to list snapshots for {dsi.name}: {e}")
             return []
@@ -563,6 +615,47 @@ class DatasetManager:
             logger.error(f"Failed to create snapshot {full_name}: {e}")
             return None
 
+    def _descendant_anchor_protection(self, dsi: DatasetInfo) -> Dict[str, str]:
+        """For a RECURSIVE dataset: `{snapshot name: reason}` pinned by any
+        `org.zfsbackup:anchor.*` (local or received) on a descendant, read in
+        one `zfs get -r`. The parent's recursive destroy would otherwise take
+        `@snap` off every descendant, including one a descendant's destination
+        still needs as its incremental base. Raises if the read fails."""
+        protected: Dict[str, str] = {}
+        by_child = read_descendant_zfsbackup_properties(dsi.dataset)
+        for child in sorted(by_child):
+            for prop, value in sorted(by_child[child].items()):
+                if not prop.startswith(PROP_ANCHOR_PREFIX) or not value or value == '-':
+                    continue
+                protected.setdefault(value, f"{prop} on {child}")
+        return protected
+
+    def _descendant_retention_protection(self, dsi: DatasetInfo) -> Dict[str, str]:
+        """For a RECURSIVE dataset: `{snapshot name: reason}` that the
+        retention of an enabled, configured descendant (another dataset of
+        this manager below `dsi`) keeps. A disabled descendant is not in
+        `self.datasets`, so only its anchors count. Raises if a descendant's
+        snapshots cannot be listed."""
+        protected: Dict[str, str] = {}
+        prefix = dsi.name + '/'
+        for child in self.datasets:
+            if child is dsi or not child.name.startswith(prefix):
+                continue
+            # A scratch DatasetInfo: listing must not replace the snapshot
+            # list of the manager's own object for `child`.
+            scratch = DatasetInfo(child.dataset, child.config)
+            if not zfs.exists(child.dataset):
+                # A configured but nonexistent descendant has no snapshots to
+                # lose; a real list error on an existing one still raises.
+                logger.debug(f"Descendant {child.name} of {dsi.name} does not exist; ignoring")
+                continue
+            snaps = self._list_snapshots_strict(scratch)
+            pruned = {id(sni) for sni in self.needs_prunning(scratch)}
+            for sni in snaps:
+                if id(sni) not in pruned:
+                    protected.setdefault(sni.name, f"retention of {child.name} keeps it")
+        return protected
+
     def prune_snapshots(self, dsi: DatasetInfo) -> None:
         """Prune snapshots according to retention policy, skipping anchored snapshots."""
         snapshots = self.list_snapshots(dsi, recursive=False)
@@ -572,11 +665,58 @@ class DatasetManager:
 
         try:
             anchors = self.get_anchors(dsi)
+            desc_protected = (
+                self._descendant_anchor_protection(dsi) if dsi.recursive else {}
+            )
         except Exception as e:
             # Unknown protect-set: pruning blind could destroy an incremental base.
             logger.error(f"Cannot read anchors for {dsi.name}; skipping pruning this cycle: {e}")
             return
         to_prune = self.needs_prunning(dsi, anchors=anchors)
+        if dsi.recursive and to_prune:
+            # `zfs destroy -r ds@snap` also destroys `@snap` on every
+            # descendant, so a name a descendant protects must not be
+            # destroyed at all.
+            try:
+                for name, reason in self._descendant_retention_protection(dsi).items():
+                    desc_protected.setdefault(name, reason)
+            except Exception as e:
+                msg = f"Cannot evaluate descendants of {dsi.name}; skipping pruning this cycle: {e}"
+                if dsi.name in self._descendant_error_noted:
+                    logger.debug(msg)
+                else:
+                    self._descendant_error_noted.add(dsi.name)
+                    logger.error(msg)
+                return
+            self._descendant_error_noted.discard(dsi.name)
+            all_candidates = to_prune
+            kept = []
+            for sni in to_prune:
+                reason = desc_protected.get(sni.name)
+                if reason is None:
+                    kept.append(sni)
+                    continue
+                if (dsi.name, sni.name) not in self._descendant_protect_noted:
+                    self._descendant_protect_noted.add((dsi.name, sni.name))
+                    logger.info(
+                        f"Dataset {dsi.name}: keeping {sni.full_name} (recursive prune): "
+                        f"{reason}"
+                    )
+            to_prune = kept
+            # Forget names no longer held back (released, pruned or gone) so
+            # the set stays bounded; a name held again is announced again.
+            held_now = {(dsi.name, sni.name) for sni in all_candidates
+                        if sni.name in desc_protected}
+            self._descendant_protect_noted = {
+                key for key in self._descendant_protect_noted
+                if key[0] != dsi.name or key in held_now
+            }
+        else:
+            # Nothing is (or can be) held back: drop this dataset's entries.
+            self._descendant_protect_noted = {
+                key for key in self._descendant_protect_noted if key[0] != dsi.name
+            }
+            self._descendant_error_noted.discard(dsi.name)
         logger.info(f"Dataset {dsi.name} has {len(to_prune)} snapshots to prune")
 
         batch_size = 20
@@ -605,16 +745,20 @@ class SnapshotInfo:
         self.timestamp = self._parse_timestamp()
 
     def _parse_timestamp(self) -> Optional[datetime]:
-        try:
-            parts = self.name.split('_')
-            if len(parts) < 2:
-                return None
-            date_str = parts[1][:8]
-            time_str = parts[1][8:]
-            dt = datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M%S")
-            return dt.replace(tzinfo=timezone.utc)
-        except (ValueError, IndexError):
+        """`{prefix}_{YYYYMMDDHHMMSS}[_anything]` -> UTC datetime, else None.
+        The prefix may itself contain `_`; the timestamp is the token right
+        after `{prefix}_` and must be exactly 14 ASCII digits."""
+        head = self.prefix + '_'
+        if not self.name.startswith(head):
             return None
+        token = self.name[len(head):].split('_', 1)[0]
+        if len(token) != 14 or not (token.isascii() and token.isdigit()):
+            return None
+        try:
+            dt = datetime.strptime(token, "%Y%m%d%H%M%S")
+        except ValueError:
+            return None
+        return dt.replace(tzinfo=timezone.utc)
 
     @property
     def age(self) -> timedelta:
