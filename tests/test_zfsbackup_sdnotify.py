@@ -336,11 +336,26 @@ class TestSend:
         server.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
         n = Notifier(server.address)
         payload = "X" * 1500
+        # What bounds a datagram queue is platform dependent: SO_RCVBUF on
+        # macOS, but the packet count (`net.unix.max_dgram_qlen`, 512 by
+        # default) on Linux, where SO_RCVBUF is irrelevant to small
+        # datagrams. So send until the first failed send rather than a fixed
+        # count, with room for a queue several times the Linux default.
+        limit = 4000
+        results = []
         started = time.monotonic()
-        results = [n.send(f"STATUS={payload}") for _ in range(400)]
+        for _ in range(limit):
+            results.append(n.send(f"STATUS={payload}"))
+            if results[-1] is False:
+                break
+        # A few more sends into the full queue: each must still return a
+        # bool within the timeout and never raise.
+        results += [n.send(f"STATUS={payload}") for _ in range(3)]
         elapsed = time.monotonic() - started
         assert all(isinstance(r, bool) for r in results)
-        assert False in results, "the queue never filled; the test proved nothing"
+        assert False in results, (
+            f"the queue never filled after {limit} datagrams; the test proved nothing"
+        )
         assert elapsed < 60
         assert open_fd_count() < 200
 

@@ -6605,6 +6605,10 @@ class TestDbChmodReadOnlyDatabase:
         finally:
             os.chmod(db_path, 0o644)  # so tmp_path cleanup can remove it
 
+    @pytest.mark.skipif(
+        not hasattr(os, "geteuid") or os.geteuid() == 0,
+        reason="root ignores file permissions, so the 0o444 file stays writable",
+    )
     def test_chmod_444_before_first_wal_open_still_fails_for_a_writer(self, tmp_path):
         """The writer half of the old claim is unchanged: a WRITER engine does
         switch the file to WAL, which rewrites the header and so cannot work

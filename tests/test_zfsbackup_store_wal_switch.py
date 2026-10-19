@@ -464,6 +464,26 @@ class TestAgainstARealLockHolder:
         assert _header(path) == (2, 2)
 
 
+def _timer_stretch(samples: int = 20, nominal: float = 0.01) -> float:
+    """How many times longer than asked this host's short sleeps really take.
+
+    SQLite's busy handler adds up the *nominal* delay of each step (1, 2, 5,
+    10, 15, ... ms) and gives up when that sum reaches `busy_timeout`, however
+    long each sleep really took. On a host whose timer is coarse (a small VM
+    where `sleep(0.01)` takes ~65 ms) a wait therefore stretches by about this
+    factor, and a real-clock bound on one statement stops meaning anything.
+    """
+    started = time.monotonic()
+    for _ in range(samples):
+        time.sleep(nominal)
+    return (time.monotonic() - started) / (samples * nominal)
+
+
+# Above this the 2x-budget bound below cannot be told apart from a stretched
+# timer: (budget + 0.2) * stretch would reach twice the budget.
+_MAX_TIMER_STRETCH = 1.6
+
+
 class TestRealWaits:
     """Real clock, real sleeps, reduced constants (each test well under 2 s)."""
 
@@ -568,7 +588,18 @@ class TestRealWaits:
         left. Here the writer gives up its COMMIT after 0.45 s; with the full
         remaining second as `busy_timeout` the statement would take
         ~0.35 + 1.0 s, with half of it ~0.85 s, then the loop retries once
-        more inside the budget."""
+        more inside the budget.
+
+        The upper bound is scaled by the host's measured sleep granularity,
+        and the test is skipped when that is too coarse to distinguish "twice
+        the budget" from a stretched timer (see `_timer_stretch`)."""
+        stretch = _timer_stretch()
+        if stretch > _MAX_TIMER_STRETCH:
+            pytest.skip(
+                f"timer too coarse for a real-clock bound: sleep(0.01) takes "
+                f"{stretch:.1f}x as long as asked, and SQLite's busy handler "
+                f"counts nominal rather than real sleep time"
+            )
         budget = 1.0
         monkeypatch.setattr(store_db, "_WAL_SWITCH_BUDGET_S", budget)
         monkeypatch.setattr(store_db, "_BUSY_TIMEOUT_MS", 1000)
@@ -614,7 +645,9 @@ class TestRealWaits:
             foreign.close()
         assert store_db._is_busy_error(excinfo.value)
         assert outcome and outcome[0] == LOCKED  # the foreign COMMIT did give up first
-        assert budget - 0.05 <= elapsed < budget + 0.2, elapsed
+        upper = (budget + 0.2) * max(1.0, stretch)
+        assert upper < 2 * budget  # guaranteed by the skip above; this is the point
+        assert budget - 0.05 <= elapsed < upper, (elapsed, stretch)
         assert _header(path) == (1, 1)
 
 

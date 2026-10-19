@@ -489,12 +489,24 @@ class TestSensitivityControlDaemonWithRawEvent:
     what the daemon does.
     """
 
-    def test_harness_wedges_with_raw_event(self, tmp_path, stop_signal_config_db):
-        log_path = tmp_path / 'sensitivity.log'
+    #: Attempts before the control is declared failed. The wedge needs the
+    #: SIGKILL to land while the worker is a registered sleeper inside the raw
+    #: Event's `wait()`; the worker sleeps in short slices, and on a loaded or
+    #: small host a fixed `KILL_SETTLE` cannot guarantee it is inside one at
+    #: that instant (there is no external signal for "is a sleeper"). A miss
+    #: shows up as the harness exiting promptly -- indistinguishable from
+    #: insensitivity -- so a miss is retried on a fresh harness; only a
+    #: control that never wedges across every attempt is a real failure.
+    ATTEMPTS = 3
+
+    def _attempt(self, tmp_path, config_db, attempt):
+        """One run of the control. Returns `(wedged, log_text)`; always
+        tears the harness's whole process group down."""
+        log_path = tmp_path / f'sensitivity-{attempt}.log'
         ctx = multiprocessing.get_context('spawn')
         harness = ctx.Process(
             target=_mp_event_daemon_harness,
-            args=(stop_signal_config_db, str(log_path)),
+            args=(config_db, str(log_path)),
         )
         try:
             harness.start()
@@ -510,21 +522,30 @@ class TestSensitivityControlDaemonWithRawEvent:
             os.kill(harness.pid, signal.SIGTERM)
 
             harness.join(timeout=SENSITIVITY_TIMEOUT)
-
-            # THE CONTROL: the harness must still be running -- a raw
-            # Event's set() really is wedged inside this daemon's own
-            # `_check_workers`/`run()` loop, proving this harness can tell
-            # "returns promptly" (the StopFlag-backed fix) apart from
-            # "never returns" (the pre-8x defect) rather than passing
-            # vacuously.
-            assert harness.is_alive(), (
-                "sensitivity control failed: the raw-Event harness exited -- "
-                "this test methodology cannot detect the item-8x defect at all, "
-                "so every pass in TestDaemonRealSignalShutdown proves nothing"
-            )
+            return harness.is_alive(), _read_log(log_path)
         finally:
             _killpg_quiet(harness.pid)
             harness.join(timeout=5)
             if harness.is_alive():
                 harness.terminate()
                 harness.join(timeout=5)
+
+    def test_harness_wedges_with_raw_event(self, tmp_path, stop_signal_config_db):
+        logs = []
+        for attempt in range(self.ATTEMPTS):
+            wedged, log_text = self._attempt(tmp_path, stop_signal_config_db, attempt)
+            if wedged:
+                # THE CONTROL: the harness is still running -- a raw
+                # Event's set() really is wedged inside this daemon's own
+                # `_check_workers`/`run()` loop, proving this harness can tell
+                # "returns promptly" (the StopFlag-backed fix) apart from
+                # "never returns" (the pre-8x defect) rather than passing
+                # vacuously.
+                return
+            logs.append(log_text)
+        pytest.fail(
+            f"sensitivity control failed: the raw-Event harness exited in all "
+            f"{self.ATTEMPTS} attempts -- this test methodology cannot detect the "
+            "item-8x defect at all, so every pass in TestDaemonRealSignalShutdown "
+            f"proves nothing -- last log:\n{logs[-1]}"
+        )

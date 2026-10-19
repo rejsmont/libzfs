@@ -510,6 +510,9 @@ class TestRootChgrp:
         assert default_db.exists()  # creation itself still succeeds
 
     def test_non_root_never_chgrps(self, default_db, monkeypatch):
+        # Independent of who runs the suite: the point is "a non-root euid",
+        # so say so rather than inherit the real one (root would chgrp).
+        monkeypatch.setattr(os, "geteuid", lambda: 12345)
         monkeypatch.setattr(
             grp, "getgrnam", lambda name: pytest.fail("looked up the group as non-root")
         )

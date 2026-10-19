@@ -3011,6 +3011,11 @@ class TestExportOntoAFifo:
         assert stat.S_ISFIFO(os.stat(fifo).st_mode)
         assert _temp_files(tmp_path) == []
 
+    @pytest.mark.skipif(
+        not hasattr(os, "geteuid") or os.geteuid() == 0,
+        reason="root can open a 0o444 FIFO for writing, so the open blocks "
+        "forever waiting for a reader instead of failing",
+    )
     def test_an_unwritable_special_file_is_a_clean_error(self, run, populated, fifo, tmp_path):
         os.chmod(fifo, 0o444)
         result = run("export", "-c", populated, "-o", fifo, "--force")

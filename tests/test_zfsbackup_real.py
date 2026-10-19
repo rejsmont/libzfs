@@ -178,9 +178,10 @@ def server_config_db(tmp_path, server_cfg_path):
     """Import `server_cfg_path` into a fresh SQLite config store under
     `tmp_path` and return the `ResolvedConfigPath` addressing it.
 
-    `running_server` builds a real `ApiWorker` (and every other worker
-    now, item 8) from a `ResolvedConfigPath`, never a YAML `Path` --
-    `server_cfg_path` remains this fixture's YAML input, unchanged.
+    `running_server` reads the server config from this store with
+    `read_config` and hands the resulting `BackupConfig` to a real
+    `ApiWorker` (workers never open the DB) -- `server_cfg_path` remains
+    this fixture's YAML input, unchanged.
     """
     from zfsbackup.config.store import import_yaml, resolve_config_path
 
@@ -193,12 +194,16 @@ def server_config_db(tmp_path, server_cfg_path):
 @pytest.fixture
 def running_server(server_config_db):
     """Start a real ApiWorker on port 18082; wait until ready; tear down after the test."""
-    import multiprocessing
     import requests
+    from zfsbackup.config.store import read_config
+    from zfsbackup.stopflag import StopFlag
     from zfsbackup.workers import ApiWorker
 
-    stop = multiprocessing.Event()
-    worker = ApiWorker(server_config_db, stop, verbose=False)
+    # `ApiWorker` takes the supervisor's detached `BackupConfig` and a
+    # `StopFlag`, never the config DB path: workers do not open the DB.
+    snapshot = read_config(server_config_db)
+    stop = StopFlag()
+    worker = ApiWorker(snapshot.config, stop, verbose=False)
     worker.start()
 
     deadline = time.time() + 15
