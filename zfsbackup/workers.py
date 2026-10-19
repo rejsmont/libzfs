@@ -618,10 +618,43 @@ class RemoteBackupWorker(BaseWorker):
             self._remote_manager.backup_dataset(dsi, remote_cfg)
 
 
+_API_SERVER_CLASS = None
+
+
+def _api_server_class():
+    """Werkzeug's `ThreadedWSGIServer` (what `make_server(..., threaded=True)`
+    builds) minus the reverse DNS lookup in its bind.
+
+    `http.server.HTTPServer.server_bind` -- inherited by every werkzeug server
+    -- sets `server_name = socket.getfqdn(host)`, a reverse lookup that stalls
+    for ~30 s on a host with a slow or broken resolver (measured on macOS CI
+    runners) and delayed every API worker start by that long. Nothing here
+    uses `server_name` (werkzeug builds `SERVER_NAME` and `Host` handling from
+    `server_address` and the request), so `server_bind` is
+    `socketserver.TCPServer.server_bind` (which does the `SO_REUSEADDR` and
+    the bind) plus the host/port bookkeeping, with `server_name` set to the
+    configured host. Built lazily so importing this module does not import
+    werkzeug."""
+    global _API_SERVER_CLASS
+    if _API_SERVER_CLASS is None:
+        import socketserver
+        from werkzeug.serving import ThreadedWSGIServer
+
+        class ApiServer(ThreadedWSGIServer):
+            def server_bind(self):
+                socketserver.TCPServer.server_bind(self)
+                self.server_name = str(self.host)
+                if not isinstance(self.server_address, str):  # not AF_UNIX
+                    self.server_port = self.server_address[1]
+
+        _API_SERVER_CLASS = ApiServer
+    return _API_SERVER_CLASS
+
+
 def _bind_api_server(app, host: str, port: int):
     """Create the HTTP server **and bind its listening socket**, here, in the
     caller's thread. Raises `OSError` (EADDRINUSE, EACCES, bad host...) if it
-    cannot. Werkzeug's `make_server` binds and listens in the constructor, so
+    cannot. Werkzeug's server (`_api_server_class`) binds and listens in its constructor, so
     a returned server is already accepting connections into its backlog.
     Werkzeug itself turns EADDRINUSE/EADDRNOTAVAIL into a printed message plus
     `sys.exit(1)`; that `SystemExit` is converted back into an `OSError` here
@@ -634,9 +667,8 @@ def _bind_api_server(app, host: str, port: int):
     daemon does not want (`.env` loading, the Werkzeug debugger under
     `FLASK_DEBUG`). A seam so tests need not open real sockets.
     """
-    from werkzeug.serving import make_server
     try:
-        return make_server(host, port, app, threaded=True)
+        return _api_server_class()(host, port, app, None, False, None)
     except SystemExit as exc:
         raise OSError(f"cannot bind {host}:{port} (address in use or not available)") from exc
 
