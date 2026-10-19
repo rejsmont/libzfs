@@ -240,6 +240,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_daemon_closeout.py` | Startup SIGHUP handler, supervisor-death watch and sliced waits, ApiWorker failures, real `kill -9` of the supervisor under fork/spawn/forkserver |
 | `tests/test_zfsbackup_forkserver_death.py` | Forkserver death: lost/orphaned workers, no restart-limit count, no overlap, identity-checked (pidfd) shutdown signals — real forkserver processes |
 | `tests/test_zfsbackup_sdnotify.py` | systemd `sd_notify`: `NOTIFY_SOCKET` handling, READY/RELOADING/STOPPING/STATUS/EXTEND_TIMEOUT sequence, real daemon |
+| `tests/test_zfsbackup_store_sqla_compat.py` | SQLAlchemy 2.0/2.1 differences: failed-connect close probe, `%` in DB paths (CI also runs a 2.1 job) |
 | `tests/test_zfsbackup_store_wal_switch.py` | WAL-switch busy retry: wall-clock budget, per-attempt busy_timeout, real lock holders |
 | `tests/test_zfsbackup_store_heldlock.py` | `read_generation`, `write_config(lock=held)`/`require_writer_lock_held`, destination-name and never-prune warnings |
 | `tests/test_orphan_safety_net.py` | The orphan net and test hygiene: fork-without-exec, subreapers, fresh session marker, real-tier opt-in skip, hermetic env, guard PATH |

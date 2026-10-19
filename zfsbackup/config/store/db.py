@@ -202,6 +202,7 @@ rule (at most one live writer connection per file per process).
 
 from __future__ import annotations
 
+import functools
 import gc
 import logging
 import math
@@ -313,20 +314,36 @@ def url_for_path(path: Union[str, Path]) -> str:
     of the same path would again be two cache entries for one file).
     """
     resolved = Path(path).resolve()
-    url = f"sqlite:///{resolved}"
+    wanted = str(resolved)
+    # SQLAlchemy 2.1 percent-DECODES the database part of a URL string
+    # (2.0 takes it verbatim): `make_url("sqlite:////d/pct%41/x.db").database`
+    # is `/d/pctA/x.db` on 2.1 and `/d/pct%41/x.db` on 2.0. A directory that is
+    # literally called `pct%41` would silently address the file under `pctA`.
+    # So: the plain spelling wherever it round-trips (always on 2.0, and on 2.1
+    # for every path whose `%` is not a valid escape), else the `%` escaped as
+    # `%25`, which 2.1 decodes back. One path has exactly one URL on a given
+    # SQLAlchemy -- never two spellings of one file (`get_engine`'s cache key
+    # is the raw string). Both spellings still go through the round trip, so a
+    # `?` (a delimiter on both versions; escaping only `%` does not help it) is
+    # still refused rather than re-encoded.
+    candidates = [f"sqlite:///{wanted}"]
+    if "%" in wanted:
+        candidates.append(f"sqlite:///{wanted.replace('%', '%25')}")
+    for url in candidates:
+        if make_url(url).database == wanted:
+            return url
+    url = candidates[0]
     parsed = make_url(url)
-    if parsed.database != str(resolved):
-        raise ValueError(
-            f"path {str(path)!r} cannot be represented as a SQLite URL "
-            f"without ambiguity: building {url!r} and re-parsing it with "
-            f"make_url() yields database={parsed.database!r}, not "
-            f"{str(resolved)!r}. This means the path contains a character "
-            "-- most likely '?' -- that SQLAlchemy's URL grammar treats as "
-            "a delimiter, so the resulting URL silently addresses a "
-            "different file. Rename the file; this function deliberately "
-            "does not percent-encode paths to work around it."
-        )
-    return url
+    raise ValueError(
+        f"path {str(path)!r} cannot be represented as a SQLite URL "
+        f"without ambiguity: building {url!r} and re-parsing it with "
+        f"make_url() yields database={parsed.database!r}, not "
+        f"{wanted!r}. This means the path contains a character "
+        "-- most likely '?' -- that SQLAlchemy's URL grammar treats as "
+        "a delimiter, so the resulting URL silently addresses a "
+        "different file. Rename the file; this function deliberately "
+        "does not percent-encode paths to work around it."
+    )
 
 
 # The busy timeout every store connection runs with, set first in the connect
@@ -510,6 +527,47 @@ def _switch_to_wal(cursor, engine: Engine) -> None:  # noqa: ANN001
         )
 
 
+@functools.lru_cache(maxsize=None)
+def _pool_closes_failed_connects() -> bool:
+    """True when this SQLAlchemy closes a DBAPI connection itself after a
+    `connect` listener raised on it (a 2.1.x fix; 2.0.x leaves it open).
+
+    Measured, not inferred from `sqlalchemy.__version__`: the behaviour is
+    absent from 2.0.x and from 2.1.0, so any version cut-off is a guess that
+    breaks on the next patch release. The probe drives a bare `StaticPool`
+    over a stub with no file descriptor, so it costs microseconds, opens
+    nothing and is safe before a fork. Cached per process (the answer is a
+    property of the installed library, not of any engine).
+    """
+    # Runs inside the connect hook's `except BaseException`: if it raised, it
+    # would REPLACE the original error and, on 2.0, skip the close below -- a
+    # leaked fd. So any failure answers False ("the pool will not close it,
+    # close it ourselves"), the safe direction: a double close is harmless for
+    # sqlite3, a missed close leaks.
+    try:
+        closes: list = []
+
+        class _Raw:
+            def close(self) -> None:
+                closes.append(True)
+
+        pool = StaticPool(_Raw)
+
+        @event.listens_for(pool, "connect")
+        def _fail(dbapi_connection, connection_record):  # noqa: ANN001
+            raise RuntimeError("probe")
+
+        try:
+            pool.connect()
+        except RuntimeError:
+            pass
+        finally:
+            pool.dispose()
+        return bool(closes)
+    except Exception:
+        return False
+
+
 def _install_pragmas(
     engine: Engine, *, readonly: bool, foreign_keys: bool, memory: bool
 ) -> None:
@@ -530,19 +588,27 @@ def _install_pragmas(
     def _set_sqlite_pragmas(dbapi_connection, connection_record):  # noqa: ANN001
         # SQLAlchemy 2.0's `_ConnectionRecord.__connect` never closes the
         # DBAPI connection when a `connect` listener raises (measured on
-        # 2.0.51, pool/base.py): the connection is left open inside a
-        # reference cycle that neither the pool nor `dispose_all()` can see,
+        # 2.0.51 and 2.0.55, pool/base.py): the connection is left open inside
+        # a reference cycle that neither the pool nor `dispose_all()` can see,
         # one leaked fd per failed connect until the cyclic GC happens to run.
         # A valid-header/corrupt-body file makes the pragmas below raise
         # ("database disk image is malformed"), so close it ourselves. This
         # matters most for a process that loads config and then forks.
+        #
+        # Later SQLAlchemy (a 2.1.x release after 2.1.0) terminates the
+        # connection itself once a `connect` listener has raised. Closing it
+        # here too is harmless for sqlite3 but a double close, so ask the pool
+        # (`_pool_closes_failed_connects`, a behavioural probe: the fix landed
+        # mid-series, so a version compare would be wrong for 2.1.0) and leave
+        # the close to it when it will do it. Exactly one close either way.
         try:
             _apply_sqlite_pragmas(dbapi_connection)
         except BaseException:
-            try:
-                dbapi_connection.close()
-            except Exception:
-                pass
+            if not _pool_closes_failed_connects():
+                try:
+                    dbapi_connection.close()
+                except Exception:
+                    pass
             raise
 
     def _apply_sqlite_pragmas(dbapi_connection):  # noqa: ANN001

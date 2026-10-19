@@ -19,8 +19,9 @@ jobs:
   test:
     name: py${{ matrix.python }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # A wedged fork test must not burn an hour. The suite takes ~5s.
-    timeout-minutes: 10
+    # A wedged fork test must not burn hours. The suite takes ~14 min on a
+    # laptop (real-daemon, forkserver and sd_notify tests), so allow headroom.
+    timeout-minutes: 30
 
     strategy:
       # When one version breaks, we need to know whether it is that
@@ -96,3 +97,50 @@ jobs:
           name: coverage-${{ runner.os }}-py${{ matrix.python }}
           path: coverage.xml
           if-no-files-found: ignore
+
+  # poetry.lock pins SQLAlchemy 2.0.x (covered by the matrix above), but
+  # pyproject allows ^2.0, so a fresh install gets 2.1. The store supports
+  # both; this job keeps 2.1 honest and turns SQLAlchemy deprecations and
+  # warnings into failures so the next drift is loud.
+  test-sqlalchemy-21:
+    name: py${{ matrix.python }} / SQLAlchemy 2.1
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install poetry
+        run: pipx install poetry==2.1.1
+
+      # No virtualenv cache here: it is keyed on poetry.lock, which pins
+      # 2.0.x, and must never be shared with the 2.0 jobs.
+      - name: Install dependencies, then SQLAlchemy 2.1
+        run: |
+          poetry config virtualenvs.in-project true
+          poetry install --with dev
+          poetry run pip install "sqlalchemy>=2.1,<2.2" alembic
+          poetry run python -c "import sqlalchemy as s; assert s.__version__.startswith('2.1'), s.__version__; print('SQLAlchemy', s.__version__)"
+
+      - name: Provide stub zfs/zpool binaries
+        run: |
+          mkdir -p "$RUNNER_TEMP/zfsstub"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zfs"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zpool"
+          chmod +x "$RUNNER_TEMP/zfsstub/zfs" "$RUNNER_TEMP/zfsstub/zpool"
+          echo "ZFS_CMD=$RUNNER_TEMP/zfsstub/zfs" >> "$GITHUB_ENV"
+          echo "ZPOOL_CMD=$RUNNER_TEMP/zfsstub/zpool" >> "$GITHUB_ENV"
+
+      - name: Run the mocked test suite
+        run: >
+          poetry run pytest
+          -W error::sqlalchemy.exc.SADeprecationWarning
+          -W error::sqlalchemy.exc.SAWarning
