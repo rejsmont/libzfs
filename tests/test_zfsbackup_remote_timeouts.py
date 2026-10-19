@@ -9,6 +9,7 @@ a peer that hangs forever would turn "deferred" into "never".
 
 import ast
 import json
+from datetime import datetime, timezone
 import socket
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from zfsbackup.remote import (
     WS_FINAL_ACK_TIMEOUT,
     WS_IDLE_TIMEOUT,
     RemoteBackupManager,
+    _SendStream,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -68,16 +70,45 @@ def rbm(tmp_path):
 def snapshot(name="autosnap_20240101120000"):
     snap = MagicMock()
     snap.name = name
+    snap.timestamp = datetime.strptime(name.split("_", 1)[1][:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     return snap
 
 
-def transfer(rbm_dsi, mocker, stream, ws):
+class Outcome(tuple):
+    """`(result, set_anchor)` -- what most tests unpack -- plus the other
+    mocked `local_manager` calls and the `_get_resume_stream` stand-in."""
+
+    def __new__(cls, result, set_anchor, **extra):
+        self = super().__new__(cls, (result, set_anchor))
+        self.__dict__.update(extra)
+        return self
+
+
+def started(stream, mode="fresh", inflight=False, sent=None, base=None):
+    """What `_get_resume_stream` returns after starting `stream`."""
+    return _SendStream(stream, mode, inflight, sent, base)
+
+
+def transfer(rbm_dsi, mocker, stream, ws, mode="fresh", inflight=False, sent=None, base=None, latest=None,
+             common=None, **kwargs):
+    """`_transfer` with the send already started (`_get_resume_stream`
+    patched out: it is exercised on its own in test_zfsbackup_remote.py and
+    in TestRealResumeStreamUnderTimeouts below)."""
     manager, dsi = rbm_dsi
-    mocker.patch.object(manager, "_get_resume_stream", return_value=stream)
+    latest = latest or snapshot()
+    mocker.patch.object(
+        manager, "_get_resume_stream",
+        return_value=stream if stream is None else started(stream, mode, inflight, sent, base),
+    )
     mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
-    set_anchor = mocker.patch.object(manager.local_manager, "set_anchor")
-    result = manager._transfer(URL, "client1", dsi, snapshot(), None, "offsite")
-    return result, set_anchor
+    lm = manager.local_manager
+    set_anchor = mocker.patch.object(lm, "set_anchor", return_value=True)
+    get_anchor = mocker.patch.object(lm, "get_anchor", return_value=None)
+    clear_inflight = mocker.patch.object(lm, "clear_inflight", return_value=True)
+    set_inflight = mocker.patch.object(lm, "set_inflight", return_value=True)
+    result = manager._transfer(URL, "client1", dsi, latest, common, "offsite", snapshots=[latest], **kwargs)
+    return Outcome(result, set_anchor, get_anchor=get_anchor, clear_inflight=clear_inflight,
+                   set_inflight=set_inflight)
 
 
 def ok_ws():
@@ -112,7 +143,7 @@ class TestTimeouts:
     def test_the_connect_url_is_unchanged(self, rbm, mocker):
         ws = ok_ws()
         transfer(rbm, mocker, FakeStream(), ws)
-        assert ws.connect.call_args.args == ("ws://backup.example.com/backup/client1/pool/data/stream",)
+        assert ws.connect.call_args.args == ("ws://backup.example.com/backup/client1/pool/data/stream?mode=fresh",)
 
 
 class TestSendTimeout:
@@ -225,7 +256,7 @@ class TestNormalPath:
         manager, dsi = rbm
         manager.config.dry_run = True
         ws_cls = mocker.patch("zfsbackup.remote.websocket.WebSocket")
-        assert manager._transfer(URL, "c", dsi, snapshot(), None, "offsite") is True
+        assert manager._transfer(URL, "c", dsi, snapshot(), None, "offsite", snapshots=[snapshot()]) is True
         ws_cls.assert_not_called()
 
 
@@ -428,11 +459,11 @@ class TestCloseHandshakeAndStreamClose:
         stream = FakeStream()
         stream.read = MagicMock(side_effect=KeyboardInterrupt)
         ws = ok_ws()
-        mocker.patch.object(manager, "_get_resume_stream", return_value=stream)
+        mocker.patch.object(manager, "_get_resume_stream", return_value=started(stream))
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
         set_anchor = mocker.patch.object(manager.local_manager, "set_anchor")
         with pytest.raises(KeyboardInterrupt):
-            manager._transfer(URL, "client1", dsi, snapshot(), None, "offsite")
+            manager._transfer(URL, "client1", dsi, snapshot(), None, "offsite", snapshots=[snapshot()])
         assert stream.closes == 1
         ws.close.assert_called()
         set_anchor.assert_not_called()
@@ -443,10 +474,10 @@ class TestCloseHandshakeAndStreamClose:
         stream = FakeStream()
         stream.read = MagicMock(side_effect=KeyboardInterrupt)
         stream.close = MagicMock(side_effect=Exception("killed by SIGPIPE"))
-        mocker.patch.object(manager, "_get_resume_stream", return_value=stream)
+        mocker.patch.object(manager, "_get_resume_stream", return_value=started(stream))
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
         with pytest.raises(KeyboardInterrupt):
-            manager._transfer(URL, "client1", dsi, snapshot(), None, "offsite")
+            manager._transfer(URL, "client1", dsi, snapshot(), None, "offsite", snapshots=[snapshot()])
 
     def test_a_failing_ws_close_in_the_failed_path_still_closes_nothing_twice(self, rbm, mocker):
         stream = FakeStream()
@@ -522,7 +553,9 @@ class TestCleanupNeverEscapesOrSkips:
 
 import logging  # noqa: E402
 
-from zfsbackup.remote import _is_reloading_refusal, _peer_sent_reloading_refusal  # noqa: E402
+from zfsbackup.remote import (  # noqa: E402
+    _is_reloading_refusal, _log_refusal, _peer_refusal, _peer_sent_reloading_refusal,
+)
 
 REFUSAL = {"error": "server is reloading; retry later", "retry": True}
 REFUSAL_JSON = json.dumps(REFUSAL)
@@ -612,6 +645,102 @@ class TestPeerSentReloadingRefusal:
         ws.recv.assert_not_called()
 
 
+class TestPeerRefusal:
+    """`_peer_refusal(ws)`: the refusal the server left in the socket, any JSON object that
+    is not an ok status and carries an `error` or `retry`; otherwise None."""
+
+    @staticmethod
+    def probe(reply=None, **attrs):
+        ws = MagicMock()
+        if reply is not None:
+            ws.recv.return_value = reply if isinstance(reply, str) else json.dumps(reply)
+        for k, v in attrs.items():
+            getattr(ws, k).side_effect = v
+        return ws
+
+    @pytest.mark.parametrize("reply", [
+        {"error": "server is reloading; retry later", "retry": True},
+        {"error": "busy", "retry": True},
+        {"error": "pool/backups/c1/data is held for pool/other"},                # D7, no status
+        {"status": "error", "error": "disk full"},
+        {"status": "error", "error": "unknown mode", "retry": False},
+        {"retry": True},
+        {"error": "x", "extra": 1},
+    ])
+    def test_a_refusal_is_returned_whole(self, reply):
+        ws = self.probe(reply)
+        assert _peer_refusal(ws) == reply
+        assert [c[0] for c in ws.method_calls] == ["settimeout", "recv"]
+        ws.settimeout.assert_called_once_with(2)
+
+    @pytest.mark.parametrize("reply", [
+        {"status": "ok"}, {"status": "ok", "error": "x"}, {"status": "ok", "retry": True},
+        {}, {"status": "error"}, {"error": ""}, {"error": None, "retry": False}, {"retry": 0},
+        [], ["error"], "error", 7, None,
+    ])
+    def test_anything_else_is_none(self, reply):
+        assert _peer_refusal(self.probe(json.dumps(reply))) is None
+
+    @pytest.mark.parametrize("raw", ["", "not json", "{", b"", None])
+    def test_unreadable_replies_are_none(self, raw):
+        ws = MagicMock()
+        ws.recv.return_value = raw
+        assert _peer_refusal(ws) is None
+
+    @pytest.mark.parametrize("exc", [
+        websocket.WebSocketTimeoutException("t"), websocket.WebSocketConnectionClosedException("c"),
+        OSError("reset"), RuntimeError("x"), ValueError("y"),
+    ])
+    def test_a_recv_error_is_swallowed(self, exc):
+        assert _peer_refusal(self.probe(recv=exc)) is None
+
+    def test_a_failing_settimeout_is_swallowed_and_recv_is_not_attempted(self):
+        ws = self.probe({"error": "x"}, settimeout=OSError("closed"))
+        assert _peer_refusal(ws) is None
+        ws.recv.assert_not_called()
+
+    def test_the_boolean_wrapper_is_true_only_for_retryable_refusals(self):
+        assert _peer_sent_reloading_refusal(self.probe({"error": "busy", "retry": True})) is True
+        assert _peer_sent_reloading_refusal(self.probe({"error": "x", "retry": True})) is True
+        assert _peer_sent_reloading_refusal(self.probe({"error": "held elsewhere"})) is False
+        assert _peer_sent_reloading_refusal(self.probe({"status": "ok"})) is False
+        assert _peer_sent_reloading_refusal(self.probe("garbage")) is False
+
+
+class TestLogRefusal:
+    URL_ = "http://backup.example.com"
+
+    def logged(self, caplog, result):
+        with caplog.at_level(logging.DEBUG):
+            _log_refusal(self.URL_, "pool/data", result)
+        return [(r.levelname, r.getMessage()) for r in caplog.records]
+
+    def test_busy_is_info_with_its_own_wording(self, caplog):
+        assert self.logged(caplog, {"error": "busy", "retry": True}) == [
+            ("INFO", f"server {self.URL_} is busy with another stream of pool/data; skipping this cycle")]
+
+    def test_the_reload_refusal_is_info(self, caplog):
+        assert self.logged(caplog, {"error": "server is reloading; retry later", "retry": True}) == [
+            ("INFO", f"server {self.URL_} is reloading; skipping pool/data this cycle")]
+
+    @pytest.mark.parametrize("result", [{"retry": True}, {"error": "something else", "retry": True},
+                                        {"status": "error", "error": "x", "retry": True}])
+    def test_any_other_retryable_reply_uses_the_reloading_wording(self, caplog, result):
+        assert self.logged(caplog, result) == [
+            ("INFO", f"server {self.URL_} is reloading; skipping pool/data this cycle")]
+
+    def test_a_non_retryable_refusal_is_an_error_with_the_servers_text(self, caplog):
+        assert self.logged(caplog, {"error": "pool/backups/c1/data is held for pool/other"}) == [
+            ("ERROR", "server refused pool/data: pool/backups/c1/data is held for pool/other")]
+
+    def test_busy_without_retry_is_not_retryable(self, caplog):
+        assert self.logged(caplog, {"error": "busy"}) == [("ERROR", "server refused pool/data: busy")]
+
+    @pytest.mark.parametrize("result", [{"status": "error"}, {"error": ""}, {"error": None}, {"retry": False}])
+    def test_no_text_is_unknown_error(self, caplog, result):
+        assert self.logged(caplog, result) == [("ERROR", "server refused pool/data: unknown error")]
+
+
 class TestRefusalAsTheFinalAck:
     def test_a_retryable_refusal_is_info_not_error_and_leaves_the_anchor(self, rbm, mocker, caplog):
         stream = FakeStream()
@@ -639,6 +768,24 @@ class TestRefusalAsTheFinalAck:
         assert result is False
         set_anchor.assert_not_called()
         assert "ERROR" not in levels(caplog)
+
+    def test_a_busy_final_ack_is_info_busy(self, rbm, mocker, caplog):
+        ws = ok_ws()
+        ws.recv.return_value = json.dumps({"error": "busy", "retry": True})
+        with caplog.at_level(logging.DEBUG):
+            result, set_anchor = transfer(rbm, mocker, FakeStream(), ws)
+        assert result is False
+        set_anchor.assert_not_called()
+        assert "ERROR" not in levels(caplog)
+        assert f"server {URL} is busy with another stream of pool/data; skipping this cycle" in caplog.text
+
+    def test_a_non_retryable_final_ack_keeps_the_transfer_failed_wording(self, rbm, mocker, caplog):
+        ws = ok_ws()
+        ws.recv.return_value = json.dumps({"status": "error", "error": "disk full"})
+        with caplog.at_level(logging.DEBUG):
+            transfer(rbm, mocker, FakeStream(), ws)
+        assert levels(caplog, "pool/data") == ["ERROR"]
+        assert "Transfer failed for pool/data: disk full" in caplog.text and "server refused" not in caplog.text
 
     @pytest.mark.parametrize(
         "reply",
@@ -722,11 +869,13 @@ class TestRefusalDiscoveredAfterASendFailure:
             {"return_value": ""},
             {"return_value": "not json"},
             {"return_value": json.dumps({"status": "ok"})},
-            {"return_value": json.dumps({"status": "error", "error": "disk full"})},
-            {"return_value": json.dumps({"error": "x", "retry": False})},
+            {"return_value": json.dumps({"status": "ok", "error": "ignored"})},
+            {"return_value": json.dumps({"status": "error"})},          # neither `error` nor `retry`
+            {"return_value": json.dumps({"error": ""})},
+            {"return_value": json.dumps(["error"])},
         ],
-        ids=["probe-timeout", "probe-closed", "probe-oserror", "empty", "non-json", "ok-json", "error-json",
-             "retry-false"],
+        ids=["probe-timeout", "probe-closed", "probe-oserror", "empty", "non-json", "ok-json", "ok-with-error",
+             "status-only", "empty-error", "list"],
     )
     def test_no_refusal_behind_the_failure_keeps_the_original_error(self, rbm, mocker, caplog, probe):
         stream = FakeStream()
@@ -782,9 +931,9 @@ class TestRefusalDiscoveredAfterASendFailure:
             {"side_effect": OSError("reset")},
             {"return_value": ""},
             {"return_value": "not json"},
-            {"return_value": json.dumps({"status": "error", "error": "disk full"})},
+            {"return_value": json.dumps({"status": "error"})},
         ],
-        ids=["probe-timeout", "probe-oserror", "empty", "non-json", "error-json"],
+        ids=["probe-timeout", "probe-oserror", "empty", "non-json", "status-only"],
     )
     def test_a_failed_done_send_without_a_refusal_is_an_error(self, rbm, mocker, caplog, probe):
         ws = ok_ws()
@@ -807,6 +956,79 @@ class TestRefusalDiscoveredAfterASendFailure:
         assert result is False
         assert levels(caplog, "Transfer failed for pool/data") == ["ERROR"]
         ws.recv.assert_not_called()
+
+    def test_busy_behind_a_failed_send_is_info_busy(self, rbm, mocker, caplog):
+        stream = FakeStream()
+        ws = ok_ws()
+        ws.send_binary.side_effect = BrokenPipeError("Broken pipe")
+        ws.recv.return_value = json.dumps({"error": "busy", "retry": True})
+        with caplog.at_level(logging.DEBUG):
+            result, set_anchor = transfer(rbm, mocker, stream, ws)
+        assert result is False
+        set_anchor.assert_not_called()
+        assert levels(caplog, "pool/data") == ["INFO"]
+        assert f"server {URL} is busy with another stream of pool/data; skipping this cycle" in caplog.text
+        assert "Transfer failed" not in caplog.text and "Broken pipe" not in caplog.text
+        assert stream.closes == 1
+        ws.recv.assert_called_once()
+
+    def test_a_server_error_behind_a_failed_send_is_the_servers_text_not_the_pipe(self, rbm, mocker, caplog):
+        """D7 and friends: the server explains itself and closes; the client's
+        BrokenPipe is only the symptom."""
+        stream = FakeStream()
+        ws = ok_ws()
+        ws.send_binary.side_effect = BrokenPipeError("Broken pipe")
+        ws.recv.return_value = json.dumps({"error": "pool/backups/c1/data is held for pool/other"})
+        with caplog.at_level(logging.DEBUG):
+            result, set_anchor = transfer(rbm, mocker, stream, ws, inflight=True)
+        assert result is False
+        set_anchor.assert_not_called()
+        assert levels(caplog, "pool/data") == ["ERROR"]
+        assert "server refused pool/data: pool/backups/c1/data is held for pool/other" in caplog.text
+        assert "Broken pipe" not in caplog.text and "Transfer failed" not in caplog.text
+        assert stream.closes == 1
+        assert settimeouts(ws) == [WS_IDLE_TIMEOUT, 2, 5]
+
+    def test_a_status_error_body_behind_a_failed_send_is_the_servers_text(self, rbm, mocker, caplog):
+        ws = ok_ws()
+        ws.send_binary.side_effect = ConnectionResetError("reset")
+        ws.recv.return_value = json.dumps({"status": "error", "error": "unknown mode"})
+        with caplog.at_level(logging.DEBUG):
+            result, _ = transfer(rbm, mocker, FakeStream(), ws)
+        assert result is False
+        assert [(r.levelname, r.getMessage()) for r in caplog.records if r.name == "zfsbackup.remote"] == [
+            ("ERROR", "server refused pool/data: unknown mode")]
+
+    @pytest.mark.parametrize("body", [
+        "garbage", "", json.dumps({"status": "ok"}), json.dumps({}), json.dumps({"status": "error"}),
+    ], ids=["garbage", "empty", "ok", "empty-object", "status-only"])
+    def test_an_unhelpful_reply_keeps_the_original_exception(self, rbm, mocker, caplog, body):
+        ws = ok_ws()
+        ws.send_binary.side_effect = BrokenPipeError("Broken pipe")
+        ws.recv.return_value = body
+        with caplog.at_level(logging.DEBUG):
+            result, _ = transfer(rbm, mocker, FakeStream(), ws)
+        assert result is False
+        assert levels(caplog, "Transfer failed for pool/data") == ["ERROR"]
+        assert "Broken pipe" in caplog.text and "server refused" not in caplog.text
+
+    def test_a_server_error_behind_a_failed_done_send_is_the_servers_text(self, rbm, mocker, caplog):
+        ws = ok_ws()
+        ws.send.side_effect = BrokenPipeError("Broken pipe")
+        ws.recv.return_value = json.dumps({"error": "held elsewhere"})
+        with caplog.at_level(logging.DEBUG):
+            result, _ = transfer(rbm, mocker, FakeStream(), ws)
+        assert result is False
+        assert "server refused pool/data: held elsewhere" in caplog.text and "Broken pipe" not in caplog.text
+
+    def test_a_timeout_never_probes_so_a_waiting_error_is_not_read(self, rbm, mocker, caplog):
+        ws = ok_ws()
+        ws.send_binary.side_effect = websocket.WebSocketTimeoutException("timed out")
+        ws.recv.return_value = json.dumps({"error": "held elsewhere"})
+        with caplog.at_level(logging.DEBUG):
+            transfer(rbm, mocker, FakeStream(), ws)
+        ws.recv.assert_not_called()
+        assert "Transfer failed for pool/data" in caplog.text and "server refused" not in caplog.text
 
     def test_a_stream_close_that_raises_does_not_hide_the_refusal(self, rbm, mocker, caplog):
         stream = FakeStream()
@@ -920,8 +1142,351 @@ class TestNoProbeWhenThePeerCannotHaveLeftARefusal:
         stream.read = MagicMock(side_effect=KeyboardInterrupt)
         ws = ok_ws()
         ws.recv.return_value = REFUSAL_JSON
-        mocker.patch.object(manager, "_get_resume_stream", return_value=stream)
+        mocker.patch.object(manager, "_get_resume_stream", return_value=started(stream))
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
         with pytest.raises(KeyboardInterrupt):
-            manager._transfer(URL, "client1", dsi, snapshot(), None, "offsite")
+            manager._transfer(URL, "client1", dsi, snapshot(), None, "offsite", snapshots=[snapshot()])
         ws.recv.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Resume protocol, transfer level: `/stream?mode=fresh|resume[&from=...]`, the
+# in-flight pin and the anchor. (The decision table for WHICH stream starts is
+# in test_zfsbackup_remote.py; here `_get_resume_stream`'s result is given.)
+# ---------------------------------------------------------------------------
+
+from urllib.parse import parse_qs, urlsplit  # noqa: E402
+
+from libzfseasy.zfs import ResumeToken  # noqa: E402
+
+OLD = "autosnap_20240101120000"
+MID = "autosnap_20240102120000"
+NEW = "autosnap_20240103120000"
+
+
+def connect_url(ws):
+    return ws.connect.call_args.args[0]
+
+
+def query(ws):
+    return parse_qs(urlsplit(connect_url(ws)).query)
+
+
+class TestStreamUrlModes:
+    def test_a_full_fresh_send_says_mode_fresh_and_has_no_from(self, rbm, mocker):
+        ws = ok_ws()
+        transfer(rbm, mocker, FakeStream(), ws)
+        assert connect_url(ws) == "ws://backup.example.com/backup/client1/pool/data/stream?mode=fresh"
+        assert query(ws) == {"mode": ["fresh"]}
+
+    def test_an_incremental_fresh_send_carries_from(self, rbm, mocker):
+        ws = ok_ws()
+        transfer(rbm, mocker, FakeStream(), ws, base=snapshot(OLD), sent=snapshot(NEW), latest=snapshot(NEW))
+        assert connect_url(ws).endswith(f"/stream?mode=fresh&from={OLD}")
+
+    def test_a_resume_says_mode_resume_and_carries_from(self, rbm, mocker):
+        ws = ok_ws()
+        transfer(rbm, mocker, FakeStream(), ws, mode="resume", base=snapshot(OLD), sent=snapshot(MID),
+                 latest=snapshot(NEW), followup=False)
+        assert query(ws) == {"mode": ["resume"], "from": [OLD]}
+
+    def test_a_resumed_full_stream_has_no_from(self, rbm, mocker):
+        ws = ok_ws()
+        transfer(rbm, mocker, FakeStream(), ws, mode="resume", sent=snapshot(OLD), latest=snapshot(OLD))
+        assert query(ws) == {"mode": ["resume"]}
+
+    def test_from_is_the_base_not_the_common_snapshot_argument(self, rbm, mocker):
+        """A resume's base comes from the token's GUIDs; `common` (negotiated for a
+        different, newer target) must not leak into the URL."""
+        ws = ok_ws()
+        transfer(rbm, mocker, FakeStream(), ws, mode="resume", base=snapshot(OLD), sent=snapshot(MID),
+                 latest=snapshot(NEW), common=snapshot(MID), followup=False)
+        assert query(ws)["from"] == [OLD]
+
+    def test_the_mode_is_always_present(self, rbm, mocker):
+        for mode in ("fresh", "resume"):
+            ws = ok_ws()
+            transfer(rbm, mocker, FakeStream(), ws, mode=mode, sent=snapshot(NEW), latest=snapshot(NEW))
+            assert query(ws)["mode"] == [mode]
+
+    def test_from_is_percent_encoded(self, rbm, mocker):
+        ws = ok_ws()
+        transfer(rbm, mocker, FakeStream(), ws, base=snapshot("autosnap_20240101120000_a b:c"),
+                 sent=snapshot(NEW), latest=snapshot(NEW))
+        assert connect_url(ws).endswith("&from=autosnap_20240101120000_a%20b%3Ac")
+
+
+class TestPinAndAnchorAfterTheTransfer:
+    def test_a_fresh_success_anchors_the_sent_snapshot_and_clears_the_pin(self, rbm, mocker, caplog):
+        with caplog.at_level(logging.INFO):
+            out = transfer(rbm, mocker, FakeStream(), ok_ws(), inflight=True, sent=snapshot(NEW),
+                           latest=snapshot(NEW), base=snapshot(OLD))
+        assert out[0] is True
+        out[1].assert_called_once()
+        assert out[1].call_args.args[1:] == ("offsite", NEW)
+        out.clear_inflight.assert_called_once()
+        assert out.clear_inflight.call_args.args[1] == "offsite"
+        assert f"Backup complete: pool/data@{NEW} (incremental from {OLD}) -> {URL}" in caplog.text
+        assert "Resumed" not in caplog.text
+
+    def test_a_full_fresh_success_says_full(self, rbm, mocker, caplog):
+        with caplog.at_level(logging.INFO):
+            transfer(rbm, mocker, FakeStream(), ok_ws(), sent=snapshot(NEW), latest=snapshot(NEW))
+        assert f"Backup complete: pool/data@{NEW} (full) -> {URL}" in caplog.text
+
+    def test_the_pin_is_cleared_whenever_the_anchor_write_succeeded_even_if_this_pin_was_not_written(self, rbm, mocker):
+        """S3: an older stale pin goes too; `inflight_set` only says THIS attempt's write worked."""
+        out = transfer(rbm, mocker, FakeStream(), ok_ws(), inflight=False)
+        assert out[0] is True
+        out.clear_inflight.assert_called_once()
+
+    def test_a_failed_anchor_write_keeps_the_pin(self, rbm, mocker):
+        manager, _ = rbm
+        stream, ws = FakeStream(), ok_ws()
+        mocker.patch.object(manager, "_get_resume_stream", return_value=started(stream, inflight=True))
+        mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
+        mocker.patch.object(manager.local_manager, "get_anchor", return_value=None)
+        mocker.patch.object(manager.local_manager, "set_anchor", return_value=False)
+        clear = mocker.patch.object(manager.local_manager, "clear_inflight")
+        dsi = rbm[1]
+        latest = snapshot(NEW)
+        assert manager._transfer(URL, "client1", dsi, latest, None, "offsite", snapshots=[latest]) is True
+        clear.assert_not_called()
+
+    @pytest.mark.parametrize("scenario", ["send-timeout", "server-error", "refusal", "connect", "done-fails"])
+    def test_a_failed_transfer_neither_anchors_nor_clears_the_pin(self, rbm, mocker, scenario):
+        ws = ok_ws()
+        if scenario == "send-timeout":
+            ws.send_binary.side_effect = websocket.WebSocketTimeoutException("t")
+        elif scenario == "server-error":
+            ws.recv.return_value = json.dumps({"status": "error", "error": "no"})
+        elif scenario == "refusal":
+            ws.recv.return_value = REFUSAL_JSON
+        elif scenario == "connect":
+            ws.connect.side_effect = ConnectionRefusedError("refused")
+        else:
+            ws.send.side_effect = BrokenPipeError("x")
+        out = transfer(rbm, mocker, FakeStream(), ws, inflight=True)
+        assert out[0] is False
+        out[1].assert_not_called()
+        out.clear_inflight.assert_not_called()
+
+
+class TestResumeAnchorRules:
+    def anchored(self, rbm, mocker, existing, sent, caplog=None, **kw):
+        ws = ok_ws()
+        manager, dsi = rbm
+        stream = FakeStream()
+        mocker.patch.object(manager, "_get_resume_stream",
+                            return_value=started(stream, "resume", True, snapshot(sent), snapshot(OLD)))
+        mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
+        lm = manager.local_manager
+        set_anchor = mocker.patch.object(lm, "set_anchor", return_value=True)
+        mocker.patch.object(lm, "get_anchor", return_value=existing)
+        clear = mocker.patch.object(lm, "clear_inflight", return_value=True)
+        snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
+        ok = manager._transfer(URL, "client1", dsi, snaps[0], None, "offsite", snapshots=snaps,
+                               followup=False, **kw)
+        return ok, set_anchor, clear
+
+    def test_the_resumed_snapshot_becomes_the_anchor(self, rbm, mocker, caplog):
+        with caplog.at_level(logging.INFO):
+            ok, set_anchor, clear = self.anchored(rbm, mocker, existing=OLD, sent=MID)
+        assert ok is True
+        assert set_anchor.call_args.args[1:] == ("offsite", MID)
+        clear.assert_called_once()
+        assert f"Resumed pool/data@{MID} (from {OLD}) to offsite" in caplog.text
+        assert "Backup complete" not in caplog.text
+
+    def test_no_anchor_yet_gets_the_resumed_snapshot(self, rbm, mocker):
+        ok, set_anchor, clear = self.anchored(rbm, mocker, existing=None, sent=MID)
+        assert set_anchor.call_args.args[1:] == ("offsite", MID)
+        clear.assert_called_once()
+
+    def test_a_newer_anchor_is_never_moved_backwards_and_the_pin_stays(self, rbm, mocker, caplog):
+        """S2: nothing was written, so the pin keeps protecting the resumed pair until the
+        follow-up (or the next send) writes its own."""
+        with caplog.at_level(logging.DEBUG):
+            ok, set_anchor, clear = self.anchored(rbm, mocker, existing=NEW, sent=MID)
+        assert ok is True
+        set_anchor.assert_not_called()
+        clear.assert_not_called()
+        assert f"Keeping anchor {NEW}" in caplog.text
+
+    def test_the_same_anchor_is_rewritten_not_skipped(self, rbm, mocker):
+        ok, set_anchor, clear = self.anchored(rbm, mocker, existing=MID, sent=MID)
+        set_anchor.assert_called_once()
+        clear.assert_called_once()
+
+    def test_an_anchor_that_is_not_a_local_managed_snapshot_is_replaced(self, rbm, mocker):
+        ok, set_anchor, clear = self.anchored(rbm, mocker, existing="autosnap_20990101000000", sent=MID)
+        assert set_anchor.call_args.args[1:] == ("offsite", MID)
+
+    def test_a_fresh_send_always_moves_the_anchor_even_to_an_older_snapshot_than_the_current_one(self, rbm, mocker):
+        """The never-backwards rule is for resumes only: a fresh send of `latest`
+        is, by construction, the newest snapshot."""
+        manager, dsi = rbm
+        ws = ok_ws()
+        mocker.patch.object(manager, "_get_resume_stream",
+                            return_value=started(FakeStream(), "fresh", True, snapshot(MID), None))
+        mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
+        set_anchor = mocker.patch.object(manager.local_manager, "set_anchor", return_value=True)
+        mocker.patch.object(manager.local_manager, "get_anchor", return_value=NEW)
+        mocker.patch.object(manager.local_manager, "clear_inflight")
+        snaps = [snapshot(NEW), snapshot(MID)]
+        manager._transfer(URL, "client1", dsi, snaps[1], None, "offsite", snapshots=snaps)
+        assert set_anchor.call_args.args[1:] == ("offsite", MID)
+
+    def test_a_failed_anchor_write_keeps_the_pin_on_a_resume(self, rbm, mocker):
+        manager, dsi = rbm
+        mocker.patch.object(manager, "_get_resume_stream",
+                            return_value=started(FakeStream(), "resume", True, snapshot(MID), snapshot(OLD)))
+        mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
+        mocker.patch.object(manager.local_manager, "get_anchor", return_value=OLD)
+        mocker.patch.object(manager.local_manager, "set_anchor", return_value=False)
+        clear = mocker.patch.object(manager.local_manager, "clear_inflight")
+        snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
+        manager._transfer(URL, "client1", dsi, snaps[0], None, "offsite", snapshots=snaps, followup=False)
+        clear.assert_not_called()
+
+
+class TestShouldStop:
+    def test_a_pending_stop_starts_no_send_at_all(self, rbm, mocker, caplog):
+        manager, dsi = rbm
+        get_stream = mocker.patch.object(manager, "_get_resume_stream")
+        ws_cls = mocker.patch("zfsbackup.remote.websocket.WebSocket")
+        latest = snapshot(NEW)
+        with caplog.at_level(logging.INFO):
+            assert manager._transfer(URL, "c", dsi, latest, None, "offsite", snapshots=[latest],
+                                     should_stop=lambda: True) is False
+        get_stream.assert_not_called()
+        ws_cls.assert_not_called()
+        assert "stop requested; not starting a send of pool/data" in caplog.text
+
+    def test_no_pending_stop_sends(self, rbm, mocker):
+        out = transfer(rbm, mocker, FakeStream(), ok_ws(), should_stop=lambda: False)
+        assert out[0] is True
+
+    def test_dry_run_is_decided_before_the_stop_check_and_the_send(self, rbm, mocker):
+        manager, dsi = rbm
+        manager.config.dry_run = True
+        stop = MagicMock(return_value=True)
+        get_stream = mocker.patch.object(manager, "_get_resume_stream")
+        get_info = mocker.patch("zfsbackup.remote.zfs.send.resume_info")
+        get_resume = mocker.patch("zfsbackup.remote.zfs.send.resume")
+        get_req = mocker.patch("zfsbackup.remote.requests.get")
+        latest = snapshot(NEW)
+        assert manager._transfer(URL, "c", dsi, latest, None, "offsite", snapshots=[latest],
+                                 should_stop=stop) is True
+        stop.assert_not_called()
+        for m in (get_stream, get_info, get_resume, get_req):
+            m.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# `_get_resume_stream` NOT patched out: the real resume decision feeding the
+# real transfer under websocket failures. Only the edges are mocked: the
+# resume-token GET, the token decoder, the GUID listing, `zfs send`, the
+# local property writes and the websocket.
+# ---------------------------------------------------------------------------
+
+TOK = "1-a292306e5-b8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a7968064cae0f26c48f2499525a9c520f1d00aacfa4bf2d34b33531818f238834cbe7b33276a20c97382e5f312735319188a4a0af48b53f352f4131d8a0da16e0100ed3915db"
+
+
+class TestRealResumeStreamUnderTimeouts:
+    def build(self, rbm, mocker, token=None, ws=None):
+        manager, dsi = rbm
+        self.order = []
+        resp = MagicMock()
+        resp.ok = True
+        resp.status_code = 200
+        resp.json.return_value = {"resume_token": token}
+        mocker.patch("zfsbackup.remote.requests.get", return_value=resp)
+        self.snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
+        self.stream = FakeStream([b"x", b"y"])
+        self.send_snapshot = mocker.patch(
+            "zfsbackup.remote.zfs.send.snapshot",
+            side_effect=lambda *a, **k: (self.order.append("send"), self.stream)[1],
+        )
+        self.send_resume = mocker.patch(
+            "zfsbackup.remote.zfs.send.resume",
+            side_effect=lambda *a, **k: (self.order.append("send-t"), self.stream)[1],
+        )
+        mocker.patch(
+            "zfsbackup.remote.zfs.send.resume_info",
+            return_value=ResumeToken(toname=f"pool/data@{MID}", toguid=222, fromguid=111, flags=frozenset()),
+        )
+        mocker.patch.object(manager, "_snapshot_guids", return_value={111: OLD, 222: MID, 333: NEW})
+        lm = manager.local_manager
+        self.set_inflight = mocker.patch.object(
+            lm, "set_inflight", side_effect=lambda *a, **k: (self.order.append("pin"), True)[1]
+        )
+        self.clear_inflight = mocker.patch.object(lm, "clear_inflight", return_value=True)
+        self.set_anchor = mocker.patch.object(lm, "set_anchor", return_value=True)
+        mocker.patch.object(lm, "get_anchor", return_value=None)
+        self.ws = ws or ok_ws()
+        mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=self.ws)
+
+    def run(self, rbm, common=None, **kw):
+        manager, dsi = rbm
+        return manager._transfer(URL, "client1", dsi, self.snaps[0], common, "offsite",
+                                 snapshots=self.snaps, **kw)
+
+    def test_a_fresh_send_that_times_out_leaves_the_pin_and_the_anchor(self, rbm, mocker):
+        ws = ok_ws()
+        ws.send_binary.side_effect = websocket.WebSocketTimeoutException("timed out")
+        self.build(rbm, mocker, token=None, ws=ws)
+        assert self.run(rbm) is False
+        assert self.order == ["pin", "send"]               # pinned BEFORE zfs send started
+        self.set_inflight.assert_called_once()
+        self.clear_inflight.assert_not_called()
+        self.set_anchor.assert_not_called()
+        assert self.stream.closes == 1
+        assert query(ws) == {"mode": ["fresh"]}
+
+    def test_a_resumed_send_that_times_out_leaves_the_pin_and_the_anchor(self, rbm, mocker):
+        ws = ok_ws()
+        ws.send_binary.side_effect = websocket.WebSocketTimeoutException("timed out")
+        self.build(rbm, mocker, token=TOK, ws=ws)
+        assert self.run(rbm) is False
+        assert self.order == ["pin", "send-t"]
+        pin = self.set_inflight.call_args.args
+        assert pin[1:] == ("offsite", OLD, MID)            # from the GUID match, not the token's name
+        self.clear_inflight.assert_not_called()
+        self.set_anchor.assert_not_called()
+        assert self.stream.closes == 1
+        assert query(ws) == {"mode": ["resume"], "from": [OLD]}
+        self.send_snapshot.assert_not_called()
+
+    def test_a_connect_failure_of_a_resume_closes_the_zfs_send_and_keeps_the_pin(self, rbm, mocker):
+        ws = ok_ws()
+        ws.connect.side_effect = ConnectionRefusedError("refused")
+        self.build(rbm, mocker, token=TOK, ws=ws)
+        assert self.run(rbm) is False
+        assert self.stream.closes == 1
+        self.clear_inflight.assert_not_called()
+        self.set_anchor.assert_not_called()
+        ws.send_binary.assert_not_called()
+
+    def test_a_refusal_after_a_resume_is_info_and_changes_nothing(self, rbm, mocker, caplog):
+        ws = ok_ws()
+        ws.recv.return_value = REFUSAL_JSON
+        self.build(rbm, mocker, token=TOK, ws=ws)
+        with caplog.at_level(logging.INFO):
+            assert self.run(rbm) is False
+        assert "ERROR" not in levels(caplog)
+        assert "is reloading; skipping pool/data this cycle" in caplog.text
+        self.set_anchor.assert_not_called()
+        self.clear_inflight.assert_not_called()
+
+    def test_a_resume_that_completes_anchors_and_clears_without_a_follow_up_at_latest(self, rbm, mocker, caplog):
+        self.build(rbm, mocker, token=TOK)
+        # the token's target IS the latest snapshot: nothing left to follow up
+        mocker.patch("zfsbackup.remote.zfs.send.resume_info",
+                     return_value=ResumeToken(toguid=333, fromguid=222, flags=frozenset()))
+        with caplog.at_level(logging.INFO):
+            assert self.run(rbm) is True
+        assert self.set_anchor.call_args.args[1:] == ("offsite", NEW)
+        self.clear_inflight.assert_called_once()
+        assert f"Resumed pool/data@{NEW} (from {MID}) to offsite" in caplog.text
+        assert self.order == ["pin", "send-t"]

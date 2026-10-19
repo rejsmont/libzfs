@@ -18,6 +18,7 @@ from libzfseasy.types import Dataset, Filesystem
 from zfsbackup.backup_manager import (
     DatasetManager,
     PROP_CONFIG, PROP_CLIENT_ID, PROP_SOURCE_DATASET,
+    read_zfsbackup_properties,
 )
 from zfsbackup.config import BackupConfig
 from zfsbackup.remote import WS_IDLE_TIMEOUT
@@ -31,6 +32,31 @@ _GATE_POLL = 0.5
 #: for a configuration reload (HTTP 503). `retry` tells a client this is
 #: transient: the replacement worker is up within moments of the drain ending.
 RELOADING_ERROR = {'error': 'server is reloading; retry later', 'retry': True}
+
+#: The values of `/stream`'s required `?mode=` query parameter. `fresh`: the
+#: client is sending a new stream and any partial receive state on the server
+#: dataset is discarded first. `resume`: the client is continuing the transfer
+#: the server's resume token describes; nothing is discarded.
+STREAM_MODES = ('fresh', 'resume')
+
+#: The refusal body for `stream` while another stream (or its abort) for the
+#: SAME server dataset is running in this API worker. `retry` marks it as a
+#: transient skip for the client, exactly like `RELOADING_ERROR`: never a
+#: reason to fall back to a fresh send.
+BUSY_ERROR = {'error': 'busy', 'retry': True}
+
+#: Substrings of `zfs receive -A`'s stderr that mean "nothing to abort": rc 1
+#: "'<ds>' does not have any resumable receive state to abort"; rc 2 "cannot
+#: open '<ds>': dataset does not exist". In this flow the server dataset
+#: always exists first (negotiate or `_receive_stream` creates it), so `-A`
+#: destroys only the saved `<ds>/%recv` state and rc 1 is the normal "already
+#: clean". rc 2 only arises for a dataset that a FULL receive created
+#: outside this flow (a legacy or manual one), which the abort itself
+#: destroys.
+_ABORT_ALREADY_CLEAN = (
+    'does not have any resumable receive state',
+    'dataset does not exist',
+)
 
 
 class StreamGate:
@@ -109,6 +135,25 @@ def create_app(config: BackupConfig) -> Flask:
     app.config['PROPAGATE_EXCEPTIONS'] = True
     sock = Sock(app)
     manager = DatasetManager(config)
+    #: The server datasets a `/stream` is working on right now, claimed
+    #: non-blocking around its whole check -> abort -> create -> receive
+    #: sequence: two streams for the same dataset (a client retry after a
+    #: timeout, say) must not race one client's abort against the other's
+    #: receive. A name is in the set exactly while its stream runs, so the
+    #: set never grows beyond the number of concurrent streams.
+    streams_in_progress: set = set()
+    streams_guard = threading.Lock()
+
+    def _claim_dataset(name: str) -> bool:
+        with streams_guard:
+            if name in streams_in_progress:
+                return False
+            streams_in_progress.add(name)
+            return True
+
+    def _release_dataset(name: str) -> None:
+        with streams_guard:
+            streams_in_progress.discard(name)
 
     remote_backup = config.remote_backup
     enabled = bool(remote_backup and remote_backup.enabled)
@@ -144,6 +189,40 @@ def create_app(config: BackupConfig) -> Flask:
         parts = client_dataset.split('/', 1)
         relative = parts[1] if len(parts) > 1 else ''
         return f"{target}/{client_id}/{relative}" if relative else f"{target}/{client_id}"
+
+    def _resume_token(server_dataset: str) -> Optional[str]:
+        """The `receive_resume_token` of the server dataset -- a filesystem
+        or a volume, found by name alone -- or `None` (no dataset, or no
+        token). Raises on any other failure: callers must not guess."""
+        ds = Dataset(server_dataset)
+        if not zfs.exists(ds):
+            return None
+        results = zfs.list(roots=ds, properties=['receive_resume_token'])
+        if not results:
+            return None
+        prop = results[0]['receive_resume_token']
+        if prop is None:
+            return None
+        val = str(prop)
+        return val if val != 'none' else None
+
+    def _source_conflict(server_dataset: str, dataset: str) -> Optional[str]:
+        """An error message when `server_dataset` exists and records a
+        different client dataset as its source, else `None`. `_server_dataset`
+        drops the pool, so `tank/data` and `backup/data` map to the same
+        server dataset and would otherwise silently share (and overwrite) it.
+        A dataset without the property (never negotiated) is not a conflict.
+        Raises if the dataset's properties cannot be read."""
+        ds = Dataset(server_dataset)
+        if not zfs.exists(ds):
+            return None
+        recorded = read_zfsbackup_properties(ds).get(PROP_SOURCE_DATASET)
+        if recorded and recorded != dataset:
+            return (
+                f"server dataset {server_dataset} already holds backups of "
+                f"{recorded!r}; refusing to mix in {dataset!r}"
+            )
+        return None
 
     @app.route('/health')
     def health():
@@ -227,6 +306,16 @@ def create_app(config: BackupConfig) -> Flask:
         server_fs = Filesystem(server_dataset)
         server_fs_exists = zfs.exists(server_fs)
 
+        # D7: another client dataset already owns this server dataset. Checked
+        # before anything is written, so its recorded source is not overwritten.
+        if server_fs_exists:
+            try:
+                conflict = _source_conflict(server_dataset, dataset)
+            except Exception as e:
+                return jsonify({'error': f'Failed to check {server_dataset}: {e}'}), 500
+            if conflict is not None:
+                return jsonify({'error': conflict}), 409
+
         # Store client config on server dataset (create dataset if needed)
         if ds_config_encoded:
             if not server_fs_exists:
@@ -266,6 +355,17 @@ def create_app(config: BackupConfig) -> Flask:
             except Exception:
                 pass
             return
+        mode = request.args.get('mode')
+        if mode not in STREAM_MODES:
+            problem = (
+                "stream mode required: use ?mode=fresh or ?mode=resume" if mode is None
+                else f"unknown stream mode {mode!r}: use ?mode=fresh or ?mode=resume"
+            )
+            try:
+                ws.send(json.dumps({'error': problem}))
+            except Exception:
+                pass
+            return
         if not gate.begin():
             try:
                 ws.send(json.dumps(RELOADING_ERROR))
@@ -273,21 +373,110 @@ def create_app(config: BackupConfig) -> Flask:
                 pass
             return
         try:
-            _receive_stream(ws, client_id, dataset)
+            # `?from=` (the incremental base the client negotiated) is
+            # informational only: `zfs receive` takes the base from the stream.
+            logger.debug(
+                "stream for %s/%s: mode=%s from=%s",
+                client_id, dataset, mode, request.args.get('from'),
+            )
+            _receive_stream(ws, client_id, dataset, mode)
         finally:
             gate.end()
 
-    def _receive_stream(ws, client_id: str, dataset: str) -> None:
+    def _receive_stream(ws, client_id: str, dataset: str, mode: str) -> None:
+        server_dataset = _server_dataset(client_id, dataset)
+        # Validate the name before it becomes a key of anything.
+        try:
+            Filesystem(server_dataset)
+        except Exception as e:
+            try:
+                ws.send(json.dumps({'error': f'Invalid dataset name {server_dataset!r}: {e}'}))
+            except Exception:
+                pass
+            return
+        if not _claim_dataset(server_dataset):
+            try:
+                ws.send(json.dumps(BUSY_ERROR))
+            except Exception:
+                pass
+            return
+        try:
+            _receive_stream_locked(ws, client_id, dataset, mode)
+        finally:
+            _release_dataset(server_dataset)
+
+    def _receive_stream_locked(ws, client_id: str, dataset: str, mode: str) -> None:
         server_dataset = _server_dataset(client_id, dataset)
         server_fs = Filesystem(server_dataset)
 
-        if not zfs.exists(server_fs):
-            if not config.dry_run:
-                zfs.create(server_fs, parents=True)
+        # D7: refuse to receive into a server dataset another client dataset
+        # owns (read-only, so also in a dry run).
+        try:
+            conflict = _source_conflict(server_dataset, dataset)
+        except Exception as e:
+            ws.send(json.dumps({'error': f'Failed to check {server_dataset}: {e}'}))
+            return
+        if conflict is not None:
+            ws.send(json.dumps({'error': conflict}))
+            return
 
         if config.dry_run:
             ws.send(json.dumps({'status': 'ok', 'dry_run': True}))
             return
+
+        if mode == 'fresh':
+            # D3: a fresh stream cannot continue a partial receive. Discard
+            # its saved state first, or `zfs receive` refuses with "contains
+            # partially-complete state". Here the dataset always exists (the
+            # D7 check above and negotiate see to that), so `receive -A`
+            # destroys only its `%recv` state; the recreate below is for a
+            # dataset a FULL receive created outside this flow, which the
+            # abort destroys whole -- nothing before it may assume the
+            # dataset still exists. `resume` never reaches this.
+            try:
+                token = _resume_token(server_dataset)
+            except Exception as e:
+                ws.send(json.dumps({
+                    'error': f'Failed to check {server_dataset} for partial receive state: {e}'
+                }))
+                return
+            if token:
+                logger.warning(
+                    "discarding the partial receive state of %s: the client "
+                    "is sending a fresh stream", server_dataset,
+                )
+                try:
+                    zfs.receive.abort(Dataset(server_dataset))
+                except Exception as e:
+                    # Idempotent: already clean is fine, anything else refuses.
+                    if not any(m in str(e).lower() for m in _ABORT_ALREADY_CLEAN):
+                        logger.error(
+                            "cannot discard the partial receive state of %s: %s",
+                            server_dataset, e,
+                        )
+                        ws.send(json.dumps({
+                            'error': (
+                                f'Failed to discard the partial receive state of '
+                                f'{server_dataset}: {e}'
+                            )
+                        }))
+                        return
+
+        if not zfs.exists(server_fs):
+            # Recreated (or created here): stamp the ownership properties
+            # again, or a dataset without `source_dataset` loses the D7 check
+            # and one without `client_id` is not found as this client's.
+            try:
+                zfs.create(server_fs, parents=True)
+                zfs.set(server_fs, {
+                    PROP_CLIENT_ID: client_id,
+                    PROP_SOURCE_DATASET: dataset,
+                })
+            except Exception as e:
+                ws.send(json.dumps({
+                    'error': f'Failed to create {server_dataset}: {e}'
+                }))
+                return
 
         # zfs.receive.filesystem() returns a StreamHandle wrapping the `zfs
         # receive` process's stdin. A startup failure raises here; it never
@@ -364,18 +553,8 @@ def create_app(config: BackupConfig) -> Flask:
         if disabled is not None:
             return disabled
         server_dataset = _server_dataset(client_id, dataset)
-        server_fs = Filesystem(server_dataset)
-        if not zfs.exists(server_fs):
-            return jsonify({'resume_token': None})
         try:
-            results = zfs.list(roots=server_fs, properties=['receive_resume_token'])
-            token = None
-            if results:
-                prop = results[0]['receive_resume_token']
-                if prop is not None:
-                    val = str(prop)
-                    token = val if val != 'none' else None
-            return jsonify({'resume_token': token})
+            return jsonify({'resume_token': _resume_token(server_dataset)})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 

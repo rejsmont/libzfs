@@ -608,16 +608,33 @@ class TestRemoteWorkerBetweenDestinations:
     def destinations(rbm):
         return [c.args[1].destination for c in rbm.backup_dataset.call_args_list]
 
+    @staticmethod
+    def raising(action, seen):
+        """A `backup_dataset` stub that performs `action()` (the stop or the
+        reload arriving mid-transfer) and records what the `should_stop`
+        keyword the worker passed answers right afterwards."""
+
+        def backup_dataset(dsi, remote_cfg, should_stop=None):
+            action()
+            seen.append(should_stop() if should_stop is not None else "not passed")
+
+        return backup_dataset
+
     def test_both_destinations_run_when_nothing_changes(self, remote):
         worker, rbm, manager, dsi, _, _ = remote
         worker._process_dataset(manager, dsi)
         assert self.destinations(rbm) == ["one", "two"]
+        for call in rbm.backup_dataset.call_args_list:     # C3: always handed over
+            assert set(call.kwargs) == {"should_stop"}
+            assert call.kwargs["should_stop"]() is False
 
     def test_a_reload_during_the_first_destination_skips_the_second(self, remote):
         worker, rbm, manager, dsi, _, rel = remote
-        rbm.backup_dataset.side_effect = lambda *a: rel.set(1)
+        seen = []
+        rbm.backup_dataset.side_effect = self.raising(lambda: rel.set(1), seen)
         worker._process_dataset(manager, dsi)
         assert self.destinations(rbm) == ["one"]
+        assert seen == [True]                    # the callable reflects the reload
 
     def test_there_is_no_check_before_the_first_destination(self, remote):
         worker, rbm, manager, dsi, _, rel = remote
@@ -627,19 +644,23 @@ class TestRemoteWorkerBetweenDestinations:
 
     def test_a_stop_also_skips_the_second_destination(self, remote):
         worker, rbm, manager, dsi, stop, _ = remote
-        rbm.backup_dataset.side_effect = lambda *a: stop.set()
+        seen = []
+        rbm.backup_dataset.side_effect = self.raising(stop.set, seen)
         worker._process_dataset(manager, dsi)
         assert self.destinations(rbm) == ["one"]
+        assert seen == [True]                    # ...and the stop
 
     def test_the_run_exits_3_without_starting_the_second_destination(self, remote, mocker):
         worker, rbm, manager, dsi, stop, rel = remote
-        rbm.backup_dataset.side_effect = lambda *a: rel.set(1)
+        seen = []
+        rbm.backup_dataset.side_effect = self.raising(lambda: rel.set(1), seen)
         mocker.patch("zfsbackup.remote.RemoteBackupManager", return_value=rbm)
         mocker.patch.object(worker, "_get_interval", return_value=30)
         with watchdog(stop), pytest.raises(SystemExit) as info:
             worker.run()
         assert info.value.code == 3
         assert self.destinations(rbm) == ["one"]
+        assert seen == [True]
 
     def test_a_single_destination_dataset_is_unaffected(self, remote):
         worker, rbm, manager, dsi, _, rel = remote

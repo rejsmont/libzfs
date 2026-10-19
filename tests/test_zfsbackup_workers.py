@@ -466,7 +466,81 @@ class TestRemoteBackupWorker:
         worker.name = 'remote-backup-worker'
         worker._remote_manager = MagicMock()
         worker._process_dataset(manager, dsi)
-        worker._remote_manager.backup_dataset.assert_called_once_with(dsi, remote_cfg)
+        worker._remote_manager.backup_dataset.assert_called_once()
+        args, kwargs = worker._remote_manager.backup_dataset.call_args
+        assert args == (dsi, remote_cfg)
+        assert set(kwargs) == {'should_stop'} and callable(kwargs['should_stop'])
+
+
+class TestRemoteWorkerPassesShouldStop:
+    """C3: `backup_dataset(dsi, remote_cfg, should_stop=...)` -- the callable is
+    "an exit reason is pending" (stop, supervisor gone, or reload), evaluated
+    when the remote manager calls it, not when the worker builds it."""
+
+    def _worker(self, epoch=None, born=0):
+        stop = StopFlag()
+        worker = RemoteBackupWorker(
+            BackupConfig(datasets=[DatasetConfig(name='pool/data')]), stop,
+            reload_epoch=epoch, born_epoch=born,
+        )
+        worker._remote_manager = MagicMock()
+        return worker, stop
+
+    def _run(self, worker):
+        remote_cfg = MagicMock()
+        remote_cfg.destination = 'offsite'
+        remote_cfg.frequency = timedelta(hours=1)
+        dsi = MagicMock()
+        dsi.config.remote = [remote_cfg]
+        dsi.config.frequency = timedelta(hours=1)
+        manager = MagicMock()
+        manager.get_anchor.return_value = None
+        worker._process_dataset(manager, dsi)
+        (args, kwargs), = worker._remote_manager.backup_dataset.call_args_list
+        return args, kwargs['should_stop']
+
+    def test_it_is_false_while_nothing_is_pending(self):
+        worker, _ = self._worker()
+        args, should_stop = self._run(worker)
+        assert should_stop() is False
+
+    def test_it_turns_true_when_the_stop_flag_is_raised_after_the_call_was_made(self):
+        worker, stop = self._worker()
+        _, should_stop = self._run(worker)
+        assert should_stop() is False
+        stop.set()
+        assert should_stop() is True
+
+    def test_it_turns_true_when_a_reload_epoch_moves(self):
+        epoch = ReloadEpoch()
+        worker, _ = self._worker(epoch=epoch, born=0)
+        _, should_stop = self._run(worker)
+        assert should_stop() is False
+        epoch.set(1)
+        assert should_stop() is True
+
+    def test_it_follows_the_exit_reason_exactly(self, mocker):
+        worker, _ = self._worker()
+        _, should_stop = self._run(worker)
+        reason = mocker.patch.object(worker, '_exit_reason', return_value=None)
+        assert should_stop() is False
+        reason.return_value = workers_module.ExitReason.SUPERVISOR_GONE
+        assert should_stop() is True
+        assert reason.call_count == 2
+
+    def test_a_stop_already_pending_is_true_at_once(self):
+        worker, stop = self._worker()
+        stop.set()
+        remote_cfg = MagicMock()
+        remote_cfg.destination = 'offsite'
+        remote_cfg.frequency = timedelta(hours=1)
+        dsi = MagicMock()
+        dsi.config.remote = [remote_cfg]
+        manager = MagicMock()
+        manager.get_anchor.return_value = None
+        worker._process_dataset(manager, dsi)
+        _, kwargs = worker._remote_manager.backup_dataset.call_args
+        assert kwargs['should_stop']() is True
 
 
 class TestApiWorker:

@@ -22,6 +22,13 @@ PROP_CONFIG = 'org.zfsbackup:config'
 PROP_CLIENT_ID = 'org.zfsbackup:client_id'
 PROP_SOURCE_DATASET = 'org.zfsbackup:source_dataset'
 PROP_ANCHOR_PREFIX = 'org.zfsbackup:anchor.'
+#: `inflight.<destination>` = `<from>,<to>` (snapshot SHORT names): the pair a
+#: fresh `zfs send` to that destination is moving. Set before the send starts
+#: and cleared once the new anchor is recorded, so the pruner never destroys
+#: either end of a transfer that is still running or can still be resumed. The
+#: comma separates the two names (it cannot appear in a ZFS snapshot name);
+#: `<from>` is empty for a full send.
+PROP_INFLIGHT_PREFIX = 'org.zfsbackup:inflight.'
 PROP_PREFIX = 'org.zfsbackup:'
 
 
@@ -178,6 +185,14 @@ def copy_anchor_property(
     return 'copied'
 
 
+def _inflight_names(value: Optional[str]) -> List[str]:
+    """The snapshot short names an `inflight.*` value (`<from>,<to>`) pins:
+    both, empty parts (a full send has no `<from>`) and `-` dropped."""
+    if not value or value == '-':
+        return []
+    return [n for n in (part.strip() for part in value.split(',')) if n and n != '-']
+
+
 def clear_zfsbackup_properties(
     ds: Dataset,
     *,
@@ -189,7 +204,9 @@ def clear_zfsbackup_properties(
 
     `config=True` clears `org.zfsbackup:config`. `anchors` is an iterable of
     destination names (clears `anchor.<name>` for each), or `True` for every
-    `org.zfsbackup:anchor.*` currently set on `ds`, or `False`/empty for none.
+    `org.zfsbackup:anchor.*` AND `org.zfsbackup:inflight.*` currently set on
+    `ds` (the in-flight pins go with the anchors they stand in for), or
+    `False`/empty for none.
     Only properties that are actually set (local/received) are inherited, so
     a clear is idempotent. Returns the property names cleared (or, under
     `dry_run`, that would have been). Raises whatever `zfs` raises.
@@ -209,7 +226,10 @@ def clear_zfsbackup_properties(
     if config and PROP_CONFIG in present:
         wanted.append(PROP_CONFIG)
     if anchors is True:
-        wanted.extend(sorted(n for n in present if n.startswith(PROP_ANCHOR_PREFIX)))
+        wanted.extend(sorted(
+            n for n in present
+            if n.startswith(PROP_ANCHOR_PREFIX) or n.startswith(PROP_INFLIGHT_PREFIX)
+        ))
     elif anchors:
         for dest in anchors:
             name = f"{PROP_ANCHOR_PREFIX}{dest}"
@@ -388,14 +408,17 @@ class DatasetManager:
         prop = f"{PROP_ANCHOR_PREFIX}{destination}"
         return self._get_prop(dsi.dataset, prop)
 
-    def set_anchor(self, dsi: DatasetInfo, destination: str, snapshot_name: str) -> None:
-        """Record the anchor snapshot for a destination."""
+    def set_anchor(self, dsi: DatasetInfo, destination: str, snapshot_name: str) -> bool:
+        """Record the anchor snapshot for a destination. `True` if the
+        property was written, `False` (after a WARNING) if not."""
         prop = f"{PROP_ANCHOR_PREFIX}{destination}"
         try:
             zfs.set(dsi.dataset, {prop: snapshot_name})
             logger.debug(f"Set anchor for {dsi.name} -> {destination}: {snapshot_name}")
+            return True
         except Exception as e:
             logger.warning(f"Failed to set anchor property for {dsi.name}: {e}")
+            return False
 
     def clear_anchor(self, dsi: DatasetInfo, destination: str) -> None:
         """Clear the anchor snapshot for a destination (inherit removes user property)."""
@@ -405,6 +428,48 @@ class DatasetManager:
             logger.debug(f"Cleared anchor for {dsi.name} -> {destination}")
         except Exception as e:
             logger.warning(f"Failed to clear anchor property for {dsi.name}: {e}")
+
+    def get_inflight(self, dsi: DatasetInfo, destination: str) -> Optional[Tuple[str, str]]:
+        """The `(from, to)` pair recorded in `inflight.<destination>`
+        (`from` is `''` for a full send), or `None` when unset or malformed."""
+        value = self._get_prop(dsi.dataset, f"{PROP_INFLIGHT_PREFIX}{destination}")
+        if not value or value == '-' or ',' not in value:
+            return None
+        src, _, dst = value.partition(',')
+        return (src, dst) if dst else None
+
+    def set_inflight(
+        self, dsi: DatasetInfo, destination: str, from_name: Optional[str], to_name: str
+    ) -> bool:
+        """Pin `from_name` (None/'' for a full send) and `to_name` for
+        `destination` while a fresh send runs: `inflight.<dest>=<from>,<to>`.
+        Must be written BEFORE the `zfs send` starts. `True` if written,
+        `False` (after a WARNING) if not -- the send then runs unpinned, as
+        it did before this property existed."""
+        prop = f"{PROP_INFLIGHT_PREFIX}{destination}"
+        try:
+            zfs.set(dsi.dataset, {prop: f"{from_name or ''},{to_name}"})
+            logger.debug(
+                f"Set in-flight pin for {dsi.name} -> {destination}: "
+                f"{from_name or '(full)'} -> {to_name}"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to set in-flight property for {dsi.name}: {e}")
+            return False
+
+    def clear_inflight(self, dsi: DatasetInfo, destination: str) -> bool:
+        """Remove `inflight.<destination>` (inherit removes a user property).
+        `True` if cleared, `False` (after a WARNING) if not: a stale pin only
+        over-protects two snapshots until the next send overwrites it."""
+        prop = f"{PROP_INFLIGHT_PREFIX}{destination}"
+        try:
+            zfs.inherit(dsi.dataset, prop)
+            logger.debug(f"Cleared in-flight pin for {dsi.name} -> {destination}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to clear in-flight property for {dsi.name}: {e}")
+            return False
 
     def get_anchors(self, dsi: DatasetInfo) -> Set[str]:
         """Return the snapshot names pinned by ANY `org.zfsbackup:anchor.*`
@@ -423,6 +488,10 @@ class DatasetManager:
           anchor only appears on a dataset replicated with `-p` from another
           host, where it names that origin's incremental base -- protecting it
           errs toward keeping a snapshot.
+        * both snapshot names of every `inflight.*` property
+          (`<from>,<to>`, see `PROP_INFLIGHT_PREFIX`), local or received: a
+          send that is running, or was interrupted and can be resumed, needs
+          its base and its target to survive pruning.
         * plus, as before, the per-configured-destination `get_anchor` value
           (which also sees inherited values), so the result is a superset of
           the old behaviour.
@@ -433,13 +502,21 @@ class DatasetManager:
         anchors: Set[str] = set()
         configured = {r.destination for r in (dsi.config.remote or [])}
         for prop, value in read_zfsbackup_properties(dsi.dataset).items():
-            if not prop.startswith(PROP_ANCHOR_PREFIX) or not value or value == '-':
+            if prop.startswith(PROP_ANCHOR_PREFIX):
+                prefix = PROP_ANCHOR_PREFIX
+                pinned = [value] if value and value != '-' else []
+            elif prop.startswith(PROP_INFLIGHT_PREFIX):
+                prefix = PROP_INFLIGHT_PREFIX
+                pinned = _inflight_names(value)
+            else:
                 continue
-            anchors.add(value)
-            dest = prop[len(PROP_ANCHOR_PREFIX):]
+            if not pinned:
+                continue
+            anchors.update(pinned)
+            dest = prop[len(prefix):]
             if dest not in configured:
                 logger.debug(
-                    f"Anchor {prop}={value} on {dsi.name} belongs to no configured "
+                    f"{prop}={value} on {dsi.name} belongs to no configured "
                     "destination; still protecting it from pruning"
                 )
                 key = (dsi.name, prop)
@@ -447,8 +524,9 @@ class DatasetManager:
                     self._orphan_anchor_noted.add(key)
                     logger.info(
                         f"Dataset {dsi.name}: {prop} is not a configured destination but "
-                        f"still pins snapshot {value} against pruning. If it is stale, "
-                        f"release it with: zfs inherit {prop} {shlex.quote(dsi.name)}"
+                        f"still pins snapshot(s) {', '.join(pinned)} against pruning. "
+                        f"If it is stale, release it with: zfs inherit {prop} "
+                        f"{shlex.quote(dsi.name)}"
                     )
         for name in sorted(configured):
             anchor = self.get_anchor(dsi, name)
@@ -623,7 +701,7 @@ class DatasetManager:
 
     def _descendant_anchor_protection(self, dsi: DatasetInfo) -> Dict[str, str]:
         """For a RECURSIVE dataset: `{snapshot name: reason}` pinned by any
-        `org.zfsbackup:anchor.*` (local or received) on a descendant, read in
+        `org.zfsbackup:anchor.*` or `inflight.*` (local or received) on a descendant, read in
         one `zfs get -r`. The parent's recursive destroy would otherwise take
         `@snap` off every descendant, including one a descendant's destination
         still needs as its incremental base. Raises if the read fails."""
@@ -631,9 +709,14 @@ class DatasetManager:
         by_child = read_descendant_zfsbackup_properties(dsi.dataset)
         for child in sorted(by_child):
             for prop, value in sorted(by_child[child].items()):
-                if not prop.startswith(PROP_ANCHOR_PREFIX) or not value or value == '-':
+                if prop.startswith(PROP_ANCHOR_PREFIX):
+                    names = [value] if value and value != '-' else []
+                elif prop.startswith(PROP_INFLIGHT_PREFIX):
+                    names = _inflight_names(value)
+                else:
                     continue
-                protected.setdefault(value, f"{prop} on {child}")
+                for name in names:
+                    protected.setdefault(name, f"{prop} on {child}")
         return protected
 
     def _descendant_retention_protection(self, dsi: DatasetInfo) -> Dict[str, str]:

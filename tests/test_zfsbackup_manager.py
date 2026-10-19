@@ -1821,3 +1821,419 @@ class TestSyncConfigPropertyDryRun:
         mock_subprocess.setup(stdout=['pool/data\tfilesystem\tother\n'])
         manager.sync_config_property(manager.datasets[0])
         assert 'set' not in [c.args[0][1] for c in mock_subprocess.call_args_list]
+
+
+# ---------------------------------------------------------------------------
+# C1: `org.zfsbackup:inflight.<destination>` = `<from>,<to>`
+# ---------------------------------------------------------------------------
+
+from zfsbackup.backup_manager import PROP_INFLIGHT_PREFIX, _inflight_names  # noqa: E402
+
+IF = PROP_INFLIGHT_PREFIX
+
+
+class TestInflightNamesHelper:
+    @pytest.mark.parametrize('value, names', [
+        ('a,b', ['a', 'b']),
+        (',b', ['b']),                       # a full send has no <from>
+        ('a,', ['a']),
+        (' a , b ', ['a', 'b']),
+        ('a,b,c', ['a', 'b', 'c']),
+        ('-', []),
+        ('', []),
+        (None, []),
+        ('a,-', ['a']),
+        ('-,b', ['b']),
+        (',', []),
+        ('solo', ['solo']),                  # malformed, but still protects what it names
+    ])
+    def test_names(self, value, names):
+        assert _inflight_names(value) == names
+
+    def test_the_prefix(self):
+        assert PROP_INFLIGHT_PREFIX == 'org.zfsbackup:inflight.'
+        assert PROP_INFLIGHT_PREFIX.startswith(PROP_PREFIX)
+
+
+class TestInflightProperty:
+    def _store(self, mocker):
+        """A dict standing in for the dataset's properties."""
+        store = {}
+
+        def fake_set(ds, props):
+            store.update(props)
+
+        def fake_inherit(ds, prop):
+            store.pop(prop, None)
+
+        mocker.patch('zfsbackup.backup_manager.zfs.set', side_effect=fake_set)
+        mocker.patch('zfsbackup.backup_manager.zfs.inherit', side_effect=fake_inherit)
+        manager = DatasetManager(_make_config())
+        mocker.patch.object(manager, '_get_prop', side_effect=lambda ds, prop: store.get(prop))
+        return manager, manager.datasets[0], store
+
+    def test_round_trip(self, mocker):
+        manager, dsi, store = self._store(mocker)
+        assert manager.set_inflight(dsi, 'offsite', 'autosnap_1', 'autosnap_2') is True
+        assert store == {IF + 'offsite': 'autosnap_1,autosnap_2'}
+        assert manager.get_inflight(dsi, 'offsite') == ('autosnap_1', 'autosnap_2')
+
+    @pytest.mark.parametrize('empty', [None, ''])
+    def test_a_full_send_has_an_empty_from(self, mocker, empty):
+        manager, dsi, store = self._store(mocker)
+        assert manager.set_inflight(dsi, 'offsite', empty, 'autosnap_2') is True
+        assert store == {IF + 'offsite': ',autosnap_2'}
+        assert manager.get_inflight(dsi, 'offsite') == ('', 'autosnap_2')
+
+    def test_an_unset_property_is_none(self, mocker):
+        manager, dsi, _ = self._store(mocker)
+        assert manager.get_inflight(dsi, 'offsite') is None
+
+    @pytest.mark.parametrize('value', ['-', '', 'nocomma', 'a,', ','])
+    def test_a_malformed_value_is_none(self, mocker, value):
+        manager, dsi, store = self._store(mocker)
+        store[IF + 'offsite'] = value
+        assert manager.get_inflight(dsi, 'offsite') is None
+
+    def test_destinations_are_independent(self, mocker):
+        manager, dsi, store = self._store(mocker)
+        manager.set_inflight(dsi, 'one', 'a', 'b')
+        manager.set_inflight(dsi, 'two.dotted', None, 'c')
+        assert manager.get_inflight(dsi, 'one') == ('a', 'b')
+        assert manager.get_inflight(dsi, 'two.dotted') == ('', 'c')
+
+    def test_set_writes_exactly_one_property_with_the_documented_name(self, mocker):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        zfs_set = mocker.patch('zfsbackup.backup_manager.zfs.set')
+        manager.set_inflight(dsi, 'offsite', 'f', 't')
+        zfs_set.assert_called_once_with(dsi.dataset, {'org.zfsbackup:inflight.offsite': 'f,t'})
+
+    def test_clear_inherits_the_property_and_returns_true(self, mocker):
+        manager, dsi, store = self._store(mocker)
+        manager.set_inflight(dsi, 'offsite', 'f', 't')
+        assert manager.clear_inflight(dsi, 'offsite') is True
+        assert store == {} and manager.get_inflight(dsi, 'offsite') is None
+
+    def test_a_failed_set_is_false_with_a_warning_and_never_raises(self, mocker, caplog):
+        mocker.patch('zfsbackup.backup_manager.zfs.set', side_effect=Exception('read-only'))
+        manager = DatasetManager(_make_config())
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            assert manager.set_inflight(manager.datasets[0], 'offsite', 'f', 't') is False
+        assert 'Failed to set in-flight property' in caplog.text and 'read-only' in caplog.text
+
+    def test_a_failed_clear_is_false_with_a_warning_and_never_raises(self, mocker, caplog):
+        mocker.patch('zfsbackup.backup_manager.zfs.inherit', side_effect=Exception('busy'))
+        manager = DatasetManager(_make_config())
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            assert manager.clear_inflight(manager.datasets[0], 'offsite') is False
+        assert 'Failed to clear in-flight property' in caplog.text
+
+    def test_a_failed_read_is_none(self, mocker):
+        manager = DatasetManager(_make_config())
+        mocker.patch('zfsbackup.backup_manager.zfs.list', side_effect=Exception('err'))
+        assert manager.get_inflight(manager.datasets[0], 'offsite') is None
+
+
+class TestSetAnchorReturnsBool:
+    def test_true_when_written(self, mocker):
+        manager = DatasetManager(_make_config())
+        mocker.patch('zfsbackup.backup_manager.zfs.set')
+        assert manager.set_anchor(manager.datasets[0], 'offsite', 'autosnap_1') is True
+
+    def test_false_with_a_warning_when_the_write_fails(self, mocker, caplog):
+        manager = DatasetManager(_make_config())
+        mocker.patch('zfsbackup.backup_manager.zfs.set', side_effect=Exception('nope'))
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            assert manager.set_anchor(manager.datasets[0], 'offsite', 'autosnap_1') is False
+        assert 'Failed to set anchor property' in caplog.text
+
+
+class TestGetAnchorsWithInflight:
+    def _manager(self, destinations=('offsite',)):
+        config = _make_config(datasets=[
+            DatasetConfig(
+                name='pool/data',
+                remote=[RemoteDatasetConfig(destination=d) for d in destinations],
+            ),
+        ])
+        return DatasetManager(config)
+
+    def test_the_union_of_the_anchor_and_both_inflight_names(self, mock_subprocess, mocker):
+        manager = self._manager()
+        dsi = manager.datasets[0]
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (PROP_ANCHOR_PREFIX + 'offsite', 'autosnap_1', 'local'),
+            (IF + 'offsite', 'autosnap_1,autosnap_2', 'local'),
+        ]))
+        mocker.patch.object(manager, 'get_anchor', return_value='autosnap_1')
+        assert manager.get_anchors(dsi) == {'autosnap_1', 'autosnap_2'}
+
+    def test_the_from_side_alone_protects_an_older_base(self, mock_subprocess, mocker):
+        manager = self._manager()
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (PROP_ANCHOR_PREFIX + 'offsite', 'autosnap_3', 'local'),
+            (IF + 'offsite', 'autosnap_1,autosnap_2', 'local'),
+        ]))
+        mocker.patch.object(manager, 'get_anchor', return_value='autosnap_3')
+        assert manager.get_anchors(manager.datasets[0]) == {
+            'autosnap_1', 'autosnap_2', 'autosnap_3',
+        }
+
+    def test_a_full_send_pin_protects_only_the_target(self, mock_subprocess, mocker):
+        manager = self._manager()
+        mock_subprocess.setup(stdout=_zget('pool/data', [(IF + 'offsite', ',autosnap_2', 'local')]))
+        mocker.patch.object(manager, 'get_anchor', return_value=None)
+        assert manager.get_anchors(manager.datasets[0]) == {'autosnap_2'}
+
+    def test_a_received_inflight_pin_counts(self, mock_subprocess, mocker):
+        manager = self._manager()
+        mock_subprocess.setup(stdout=_zget('pool/data', [(IF + 'offsite', 'a,b', 'received')]))
+        mocker.patch.object(manager, 'get_anchor', return_value=None)
+        assert manager.get_anchors(manager.datasets[0]) == {'a', 'b'}
+
+    def test_an_inherited_inflight_pin_does_not_count(self, mock_subprocess, mocker):
+        manager = self._manager()
+        mock_subprocess.setup(stdout=_zget('pool/data', [(IF + 'offsite', 'a,b', 'inherited from pool')]))
+        mocker.patch.object(manager, 'get_anchor', return_value=None)
+        assert manager.get_anchors(manager.datasets[0]) == set()
+
+    @pytest.mark.parametrize('value', ['-', ''])
+    def test_a_dash_or_empty_value_pins_nothing_and_says_nothing(
+        self, mock_subprocess, mocker, caplog, value
+    ):
+        manager = self._manager(destinations=())
+        mock_subprocess.setup(stdout=_zget('pool/data', [(IF + 'gone', value, 'local')]))
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            assert manager.get_anchors(manager.datasets[0]) == set()
+        assert 'gone' not in caplog.text
+
+    def test_an_unconfigured_destination_still_protects_and_is_announced_once(
+        self, mock_subprocess, mocker, caplog
+    ):
+        manager = self._manager(destinations=())
+        dsi = manager.datasets[0]
+        props = [(IF + 'old-site', 'autosnap_1,autosnap_2', 'local')]
+        mock_subprocess.setup_multi((_zget('pool/data', props),), (_zget('pool/data', props),))
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            assert manager.get_anchors(dsi) == {'autosnap_1', 'autosnap_2'}
+            assert manager.get_anchors(dsi) == {'autosnap_1', 'autosnap_2'}
+        infos = [r.getMessage() for r in caplog.records
+                 if r.levelno == logging.INFO and 'old-site' in r.getMessage()]
+        assert len(infos) == 1                              # once per (dataset, property)
+        assert IF + 'old-site' in infos[0]
+        assert 'autosnap_1, autosnap_2' in infos[0]
+        assert 'not a configured destination' in infos[0]
+        assert f'zfs inherit {IF}old-site pool/data' in infos[0]
+
+    def test_a_configured_destination_is_not_announced(self, mock_subprocess, mocker, caplog):
+        manager = self._manager()
+        mock_subprocess.setup(stdout=_zget('pool/data', [(IF + 'offsite', 'a,b', 'local')]))
+        mocker.patch.object(manager, 'get_anchor', return_value=None)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.get_anchors(manager.datasets[0])
+        assert 'not a configured destination' not in caplog.text
+
+    def test_an_anchor_and_an_inflight_of_the_same_unconfigured_name_are_announced_separately(
+        self, mock_subprocess, caplog
+    ):
+        manager = self._manager(destinations=())
+        mock_subprocess.setup(stdout=_zget('pool/data', [
+            (PROP_ANCHOR_PREFIX + 'x', 's1', 'local'),
+            (IF + 'x', 's2,s3', 'local'),
+        ]))
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            assert manager.get_anchors(manager.datasets[0]) == {'s1', 's2', 's3'}
+        text = caplog.text
+        assert text.count('not a configured destination') == 2
+        assert f'{PROP_ANCHOR_PREFIX}x' in text and f'{IF}x' in text
+
+    def test_an_unreadable_property_set_still_raises(self, mock_subprocess):
+        """The pruner must not prune on an unknown protect-set."""
+        manager = self._manager()
+        proc = mock_subprocess.setup(stdout=[], stderr='cannot open', returncode=1)
+        proc.poll.side_effect = None
+        proc.poll.return_value = 1
+        with pytest.raises(Exception):
+            manager.get_anchors(manager.datasets[0])
+
+
+class TestClearZfsbackupPropertiesWithInflight:
+    DS = staticmethod(lambda: Filesystem('pool/data'))
+
+    PROPS = [
+        (PROP_CONFIG, 'cfg', 'local'),
+        (A + 'alpha', 's1', 'local'),
+        (A + 'zeta', 's2', 'local'),
+        (IF + 'alpha', 'f1,t1', 'local'),
+        (IF + 'mid', ',t2', 'received'),
+        ('org.other:inflight.alpha', 'foreign', 'local'),
+        ('compression', 'lz4', 'local'),
+    ]
+
+    def _arrange(self, mock_subprocess):
+        mock_subprocess.setup_multi((_zget('pool/data', self.PROPS),), *[('',)] * 8)
+
+    def _inherited(self, mock_subprocess):
+        return [cmd[2] for cmd in _cmds(mock_subprocess) if cmd[1] == 'inherit']
+
+    def test_anchors_true_clears_the_inflight_pins_with_the_anchors_sorted(self, mock_subprocess):
+        self._arrange(mock_subprocess)
+        result = clear_zfsbackup_properties(self.DS(), config=False, anchors=True)
+        assert result == sorted([A + 'alpha', A + 'zeta', IF + 'alpha', IF + 'mid'])
+        assert self._inherited(mock_subprocess) == result
+        assert 'org.other:inflight.alpha' not in result and PROP_CONFIG not in result
+
+    def test_the_iterable_form_clears_only_the_named_anchors_not_the_inflight_pins(
+        self, mock_subprocess
+    ):
+        self._arrange(mock_subprocess)
+        result = clear_zfsbackup_properties(self.DS(), config=False, anchors=['alpha', 'mid'])
+        assert result == [A + 'alpha']              # `mid` has an inflight pin, no anchor
+        assert self._inherited(mock_subprocess) == [A + 'alpha']
+        assert IF + 'alpha' not in result
+
+    def test_anchors_true_dry_run_names_them_and_inherits_nothing(self, mock_subprocess, caplog):
+        self._arrange(mock_subprocess)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            result = clear_zfsbackup_properties(
+                self.DS(), config=False, anchors=True, dry_run=True)
+        assert IF + 'alpha' in result and IF + 'mid' in result
+        assert self._inherited(mock_subprocess) == []
+        assert f'Would inherit {IF}alpha' in caplog.text
+
+    def test_a_dataset_with_only_inflight_pins_is_cleared_by_anchors_true(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', [(IF + 'x', 'a,b', 'local')]),), ('',),
+        )
+        assert clear_zfsbackup_properties(self.DS(), config=False, anchors=True) == [IF + 'x']
+
+
+# ---------------------------------------------------------------------------
+# libzfseasy skips (and warns about, once per name) rows it cannot represent;
+# the zfsbackup layer, driven through the REAL ListCommand, must carry on.
+# ---------------------------------------------------------------------------
+
+class TestUnrepresentableNamesInZfsOutput:
+    @pytest.fixture(autouse=True)
+    def _fresh_warning_registry(self):
+        import libzfseasy.zfs as lz
+
+        lz._warned_names.clear()
+        yield
+        lz._warned_names.clear()
+
+    @staticmethod
+    def _snap_name(hours_old):
+        dt = datetime.now(timezone.utc) - timedelta(hours=hours_old)
+        return f"autosnap_{dt.strftime('%Y%m%d%H%M%S')}"
+
+    @staticmethod
+    def _skip_warnings(caplog):
+        return [
+            r.getMessage() for r in caplog.records
+            if r.name == 'libzfseasy' and r.levelno == logging.WARNING
+            and 'cannot represent' in r.getMessage()
+        ]
+
+    def _manager(self):
+        config = _make_config(datasets=[DatasetConfig(
+            name='pool/data',
+            retention_rules=[RetentionRule(timedelta(hours=1), timedelta(hours=2))],
+        )])
+        return DatasetManager(config)
+
+    def _rows(self):
+        """Newest first as `zfs list` sorts them; the two oddly named ones are
+        what a VM actually showed (`zfs snapshot 'pool/fs@ manual'`)."""
+        return {
+            'newest': self._snap_name(0.2),
+            'old1': self._snap_name(3),
+            'old2': self._snap_name(4),
+            'lines': [
+                f'pool/data@{self._snap_name(4)}\tsnapshot\t-\n',
+                'pool/data@ manual\tsnapshot\t-\n',
+                f'pool/data@{self._snap_name(3)}\tsnapshot\t-\n',
+                'pool/data@manual \tsnapshot\t-\n',
+                f'pool/data@{self._snap_name(0.2)}\tsnapshot\t-\n',
+            ],
+        }
+
+    def test_list_snapshots_returns_the_managed_ones_and_warns_once_per_name(
+        self, mock_subprocess, caplog
+    ):
+        rows = self._rows()
+        mock_subprocess.setup(stdout=rows['lines'])
+        manager = self._manager()
+        dsi = manager.datasets[0]
+        with caplog.at_level(logging.WARNING):
+            snaps = manager.list_snapshots(dsi)
+        assert [s.name for s in snaps] == [rows['newest'], rows['old1'], rows['old2']]
+        assert all(isinstance(s, SnapshotInfo) for s in snaps)
+        warnings = self._skip_warnings(caplog)
+        assert len(warnings) == 2
+        assert any("'pool/data@ manual'" in w for w in warnings)
+        assert any("'pool/data@manual '" in w for w in warnings)
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_the_warning_is_not_repeated_by_the_next_listing(self, mock_subprocess, caplog):
+        rows = self._rows()
+        mock_subprocess.setup_multi((rows['lines'],), (rows['lines'],))
+        manager = self._manager()
+        dsi = manager.datasets[0]
+        with caplog.at_level(logging.WARNING):
+            manager.list_snapshots(dsi)
+            first = len(self._skip_warnings(caplog))
+            manager.list_snapshots(dsi)
+        assert first == 2 and len(self._skip_warnings(caplog)) == 2
+
+    def test_a_listing_of_only_unrepresentable_rows_is_empty_not_an_error(
+        self, mock_subprocess, caplog
+    ):
+        mock_subprocess.setup(stdout=['pool/data@ manual\tsnapshot\t-\n'])
+        manager = self._manager()
+        with caplog.at_level(logging.WARNING):
+            assert manager.list_snapshots(manager.datasets[0]) == []
+        assert len(self._skip_warnings(caplog)) == 1
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_pruning_still_destroys_only_the_valid_candidates(
+        self, mock_subprocess, mocker, caplog
+    ):
+        rows = self._rows()
+        # list (with the odd rows), then the anchor-property read for the protect-set
+        mock_subprocess.setup_multi(
+            (rows['lines'],),
+            (['pool/data\tname\tpool/data\t-\t-\n', 'pool/data\ttype\tfilesystem\t-\t-\n'],),
+        )
+        destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
+        manager = self._manager()
+        with caplog.at_level(logging.WARNING):
+            manager.prune_snapshots(manager.datasets[0])
+        destroy.assert_called_once()
+        destroyed = sorted(s.short for s in destroy.call_args.args[0])
+        assert destroyed == sorted([rows['old1'], rows['old2']])      # never the newest, never the odd ones
+        assert len(self._skip_warnings(caplog)) == 2
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_received_datasets_skips_an_unrepresentable_child(self, mock_subprocess, caplog):
+        good = DatasetConfig(name='pool/backups/cid/data').to_property()
+        other = DatasetConfig(name='pool/backups/cid/other').to_property()
+        mock_subprocess.setup(stdout=[
+            'pool/backups\tfilesystem\t-\t-\n',
+            'pool/backups/cid\tfilesystem\t-\t-\n',
+            f'pool/backups/cid/data\tfilesystem\tcid\t{good}\n',
+            f'pool/backups/cid/.system\tfilesystem\tcid\t{good}\n',
+            f'pool/backups/cid/other\tfilesystem\tcid\t{other}\n',
+        ])
+        config = _make_config(
+            remote_backup=RemoteServerConfig(target_dataset='pool/backups'),
+        )
+        manager = DatasetManager(config)
+        with caplog.at_level(logging.WARNING):
+            received = manager.received_datasets()
+        assert [d.name for d in received] == ['pool/backups/cid/data', 'pool/backups/cid/other']
+        assert all(d.config.recursive is False for d in received)
+        warnings = self._skip_warnings(caplog)
+        assert len(warnings) == 1 and "'pool/backups/cid/.system'" in warnings[0]
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]

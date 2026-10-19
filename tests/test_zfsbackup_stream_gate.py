@@ -266,6 +266,12 @@ def app(mocker):
     return app
 
 
+@pytest.fixture(autouse=True)
+def source_props(mocker):
+    """No recorded `org.zfsbackup:source_dataset` anywhere, and never a real `zfs get`."""
+    return mocker.patch("zfsbackup.api.read_zfsbackup_properties", return_value={})
+
+
 class TestGateInTheApp:
     def test_the_gate_is_published_on_the_app(self, app):
         gate = app.extensions["zfsbackup.stream_gate"]
@@ -328,7 +334,7 @@ class TestGateInTheApp:
         gate.start_draining()
         ws = MagicMock()
         ws.receive.side_effect = ConnectionClosed(None, None)       # a regression must fail, not spin
-        with app.test_request_context():
+        with app.test_request_context(query_string={"mode": "resume"}):
             self._handler(app)(ws, "client1", "pool/data")
         assert json.loads(ws.send.call_args[0][0]) == RELOADING_ERROR
         ws.receive.assert_not_called()
@@ -342,7 +348,7 @@ class TestGateInTheApp:
         ws = MagicMock()
         ws.send.side_effect = Exception("closed")
         ws.receive.side_effect = ConnectionClosed(None, None)
-        with app.test_request_context():
+        with app.test_request_context(query_string={"mode": "resume"}):
             self._handler(app)(ws, "client1", "pool/data")       # must not raise
 
     def test_a_stream_is_counted_while_it_runs(self, app, mocker):
@@ -358,7 +364,7 @@ class TestGateInTheApp:
             return json.dumps({"done": True})
 
         ws.receive.side_effect = receive
-        with app.test_request_context():
+        with app.test_request_context(query_string={"mode": "resume"}):
             self._handler(app)(ws, "client1", "pool/data")
         assert seen == [1]
         assert gate.active == 0
@@ -375,37 +381,49 @@ class TestGateInTheApp:
             return json.dumps({"done": True})
 
         ws.receive.side_effect = receive
-        with app.test_request_context():
+        with app.test_request_context(query_string={"mode": "resume"}):
             self._handler(app)(ws, "client1", "pool/data")
         writer.close.assert_called_once()
         assert json.loads(ws.send.call_args[0][0]) == {"status": "ok"}
 
     @pytest.mark.parametrize(
         "arrange",
-        ["exists-raises", "receive-raises", "receive-none", "connection-closed", "write-error", "ok"],
+        ["exists-raises", "create-fails", "set-fails", "receive-raises", "send-raises",
+         "connection-closed", "write-error", "ok"],
     )
-    def test_the_gate_is_released_on_every_path(self, app, mocker, arrange):
+    def test_the_gate_is_released_on_every_path(self, app, mocker, source_props, arrange):
         gate = app.extensions["zfsbackup.stream_gate"]
         ws = MagicMock()
+        ws.receive.side_effect = ConnectionClosed(None, None)    # a regression must fail, not spin
         writer = MagicMock()
         exists = mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         expect_raise = False
         if arrange == "exists-raises":
+            # The D7 source check reads `exists` first and reports a failure to the client.
             exists.side_effect = RuntimeError("zfs exploded")
+        elif arrange == "create-fails":
+            exists.return_value = False
+            mocker.patch("zfsbackup.api.zfs.create", side_effect=RuntimeError("cannot create"))
+        elif arrange == "set-fails":
+            exists.return_value = False
+            mocker.patch("zfsbackup.api.zfs.create")
+            mocker.patch("zfsbackup.api.zfs.set", side_effect=RuntimeError("cannot set"))
+        elif arrange == "send-raises":
+            # A refusal that cannot be sent escapes the handler; the gate still releases.
+            source_props.return_value = {"org.zfsbackup:source_dataset": "tank/data"}
+            ws.send.side_effect = RuntimeError("socket gone")
             expect_raise = True
         elif arrange == "receive-raises":
             mocker.patch("zfsbackup.api.zfs.receive.filesystem", side_effect=RuntimeError("no"))
-        elif arrange == "receive-none":
-            mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=None)
         elif arrange == "connection-closed":
             ws.receive.side_effect = ConnectionClosed(None, None)
         elif arrange == "write-error":
             writer.write.side_effect = IOError("disk full")
-            ws.receive.return_value = b"chunk"
+            ws.receive.side_effect = [b"chunk"]
         else:
             ws.receive.side_effect = [b"x", json.dumps({"done": True})]
-        with app.test_request_context():
+        with app.test_request_context(query_string={"mode": "resume"}):
             if expect_raise:
                 with pytest.raises(RuntimeError):
                     self._handler(app)(ws, "client1", "pool/data")
@@ -418,10 +436,111 @@ class TestGateInTheApp:
         app = create_app(_config(dry_run=True))
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         ws = MagicMock()
-        with app.test_request_context():
+        with app.test_request_context(query_string={"mode": "resume"}):
             app.view_functions["backup_stream"].__wrapped__(ws, "c", "pool/data")
         assert app.extensions["zfsbackup.stream_gate"].active == 0
         assert json.loads(ws.send.call_args[0][0])["dry_run"] is True
+
+
+class TestGateOnProtocolRefusals:
+    """Every way the stream/negotiate protocol refuses a request leaves the
+    gate balanced (a leaked registration would hang a reload's drain)."""
+
+    SERVER_DS = "pool/backups/client1/data"
+
+    def _run(self, app, ws, mode):
+        qs = {} if mode is None else {"mode": mode}
+        with app.test_request_context(query_string=qs):
+            app.view_functions["backup_stream"].__wrapped__(ws, "client1", "pool/data")
+
+    @pytest.mark.parametrize(
+        "arrange, mode, expect",
+        [
+            ("none", None, "stream mode required"),
+            ("none", "bogus", "unknown stream mode 'bogus'"),
+            ("mismatch", "fresh", "refusing to mix in"),
+            ("mismatch", "resume", "refusing to mix in"),
+            ("source-read-fails", "fresh", "Failed to check pool/backups/client1/data: "),
+            ("token-lookup-fails", "fresh", "for partial receive state"),
+            ("abort-fails", "fresh", "Failed to discard the partial receive state"),
+            ("receive-start-fails", "resume", "Failed to start zfs receive"),
+        ],
+    )
+    def test_the_gate_is_balanced_and_nothing_is_received(
+        self, app, mocker, source_props, arrange, mode, expect
+    ):
+        gate = app.extensions["zfsbackup.stream_gate"]
+        mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
+        mocker.patch("zfsbackup.api.zfs.create")
+        abort = mocker.patch("zfsbackup.api.zfs.receive.abort")
+        writer = MagicMock()
+        receive = mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
+        row = MagicMock()
+        row.__getitem__ = MagicMock(return_value="1-token")
+        lister = mocker.patch("zfsbackup.api.zfs.list", return_value=[row])
+        if arrange == "mismatch":
+            source_props.return_value = {"org.zfsbackup:source_dataset": "tank/data"}
+        elif arrange == "source-read-fails":
+            source_props.side_effect = RuntimeError("zfs get failed")
+        elif arrange == "token-lookup-fails":
+            lister.side_effect = RuntimeError("zfs list failed")
+        elif arrange == "abort-fails":
+            abort.side_effect = Exception("pool I/O is currently suspended")
+        elif arrange == "receive-start-fails":
+            receive.side_effect = Exception("cannot start")
+        ws = MagicMock()
+        ws.receive.side_effect = ConnectionClosed(None, None)     # a regression must fail, not spin
+        seen = []
+        real_send = ws.send
+        ws.send.side_effect = lambda m: seen.append(gate.active)
+        self._run(app, ws, mode)
+        sent = json.loads(real_send.call_args[0][0])
+        assert expect in sent["error"]
+        assert gate.active == 0
+        if arrange not in ("receive-start-fails",):
+            receive.assert_not_called()
+            ws.receive.assert_not_called()
+        # Mode errors are refused before the gate; every later refusal holds it while answering.
+        assert seen == ([0] if arrange == "none" else [1])
+
+    def test_an_invalid_server_dataset_name_is_refused_and_balances_the_gate(self, app, mocker):
+        gate = app.extensions["zfsbackup.stream_gate"]
+        exists = mocker.patch("zfsbackup.api.zfs.exists")
+        receive = mocker.patch("zfsbackup.api.zfs.receive.filesystem")
+        ws = MagicMock()
+        ws.receive.side_effect = ConnectionClosed(None, None)
+        with app.test_request_context(query_string={"mode": "fresh"}):
+            app.view_functions["backup_stream"].__wrapped__(ws, "client1", "pool//x")
+        assert "Invalid dataset name" in json.loads(ws.send.call_args[0][0])["error"]
+        exists.assert_not_called()
+        receive.assert_not_called()
+        ws.receive.assert_not_called()
+        assert gate.active == 0
+
+    def test_a_dry_run_reply_leaves_the_gate_balanced(self, mocker):
+        mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
+        app = create_app(_config(dry_run=True))
+        mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
+        ws = MagicMock()
+        self._run(app, ws, "fresh")
+        assert json.loads(ws.send.call_args[0][0]) == {"status": "ok", "dry_run": True}
+        assert app.extensions["zfsbackup.stream_gate"].active == 0
+
+    @pytest.mark.parametrize("arrange, status", [("mismatch", 409), ("read-fails", 500)])
+    def test_negotiate_refusals_balance_the_gate(self, app, mocker, source_props, arrange, status):
+        gate = app.extensions["zfsbackup.stream_gate"]
+        mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
+        mock_set = mocker.patch("zfsbackup.api.zfs.set")
+        if arrange == "mismatch":
+            source_props.return_value = {"org.zfsbackup:source_dataset": "tank/data"}
+        else:
+            source_props.side_effect = RuntimeError("zfs get failed")
+        resp = app.test_client().post(
+            "/backup/client1/pool/data/negotiate", json={"snapshots": [], "config": "cfg"}
+        )
+        assert resp.status_code == status
+        mock_set.assert_not_called()
+        assert gate.active == 0
 
 
 class TestServerReceiveTimeout:
@@ -436,7 +555,7 @@ class TestServerReceiveTimeout:
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=MagicMock())
         ws = MagicMock()
         ws.receive.side_effect = [b"a", json.dumps({"done": True})]
-        with app.test_request_context():
+        with app.test_request_context(query_string={"mode": "resume"}):
             self._handler(app)(ws, "client1", "pool/data")
         assert ws.receive.call_count == 2
         for call in ws.receive.call_args_list:
@@ -449,7 +568,7 @@ class TestServerReceiveTimeout:
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
         ws.receive.side_effect = [b"chunk", None]
-        with app.test_request_context():
+        with app.test_request_context(query_string={"mode": "resume"}):
             self._handler(app)(ws, "client1", "pool/data")
         writer.write.assert_called_once_with(b"chunk")
         writer.close.assert_called_once()
@@ -465,7 +584,7 @@ class TestServerReceiveTimeout:
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
         ws.receive.return_value = None
-        with app.test_request_context():
+        with app.test_request_context(query_string={"mode": "resume"}):
             self._handler(app)(ws, "client1", "pool/data")
         writer.write.assert_not_called()
         writer.close.assert_called_once()
@@ -477,7 +596,7 @@ class TestServerReceiveTimeout:
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
         ws.receive.return_value = None
-        with app.test_request_context():
+        with app.test_request_context(query_string={"mode": "resume"}):
             self._handler(app)(ws, "client1", "pool/data")       # must not raise
         assert "no data from the client" in json.loads(ws.send.call_args[0][0])["error"]
 
@@ -921,8 +1040,13 @@ class TestGatedEndpoints:
     @pytest.mark.parametrize("name, method, url, body", GATED, ids=[g[0] for g in GATED])
     def test_an_exception_releases_the_gate(self, app, mocker, name, method, url, body):
         mocker.patch("zfsbackup.api.zfs.exists", side_effect=RuntimeError("zfs exploded"))
-        with pytest.raises(RuntimeError):
-            _call(app.test_client(), method, url, body)
+        if name == "resume_token":
+            # The token lookup reports any failure as a 500 rather than raising.
+            resp = _call(app.test_client(), method, url, body)
+            assert resp.status_code == 500 and resp.get_json() == {"error": "zfs exploded"}
+        else:
+            with pytest.raises(RuntimeError):
+                _call(app.test_client(), method, url, body)
         assert app.extensions["zfsbackup.stream_gate"].active == 0
 
     @pytest.mark.parametrize("name, method, url, body", GATED, ids=[g[0] for g in GATED])
