@@ -3,6 +3,7 @@
 import contextlib
 import functools
 import json
+import logging
 import threading
 import time
 from typing import Callable, Optional
@@ -20,6 +21,8 @@ from zfsbackup.backup_manager import (
 )
 from zfsbackup.config import BackupConfig
 from zfsbackup.remote import WS_IDLE_TIMEOUT
+
+logger = logging.getLogger(__name__)
 
 #: Longest `StreamGate.wait_idle` sleeps before re-checking its abort callback.
 _GATE_POLL = 0.5
@@ -287,19 +290,15 @@ def create_app(config: BackupConfig) -> Flask:
             return
 
         # zfs.receive.filesystem() returns a StreamHandle wrapping the `zfs
-        # receive` process's stdin. Startup failures now raise immediately
-        # instead of returning None; the `is None` check below is kept for
-        # defensive/backwards compatibility but real callers should expect
-        # an exception here.
+        # receive` process's stdin. A startup failure raises here; it never
+        # returns None.
         try:
             writer = zfs.receive.filesystem(server_fs, force=True, save=True, mount=False)
         except Exception as e:
             ws.send(json.dumps({'error': f'Failed to start zfs receive: {e}'}))
             return
-        if writer is None:
-            ws.send(json.dumps({'error': 'Failed to start zfs receive'}))
-            return
 
+        reaped = False  # `writer.close()` already called on the write-error path
         try:
             while True:
                 data = ws.receive(timeout=WS_IDLE_TIMEOUT)
@@ -312,24 +311,49 @@ def create_app(config: BackupConfig) -> Flask:
                     if msg.get('done'):
                         break
                 else:
-                    writer.write(data)
+                    try:
+                        writer.write(data)
+                    except OSError as pipe_error:
+                        # `zfs receive` stopped reading (typically it has
+                        # already exited, e.g. a checksum mismatch): the pipe
+                        # error is only the symptom. `close()` reaps the
+                        # process and raises zfs's own diagnostic; report
+                        # that to the client and the log. If it raises
+                        # nothing, the pipe error is all there is.
+                        reaped = True
+                        try:
+                            writer.close()
+                        except Exception as receive_error:
+                            logger.error(
+                                "zfs receive for %s failed: %s (stream write: %s)",
+                                server_dataset, receive_error, pipe_error,
+                            )
+                            raise receive_error from pipe_error
+                        logger.error(
+                            "writing to zfs receive for %s failed: %s",
+                            server_dataset, pipe_error,
+                        )
+                        raise
             # writer.close() (StreamHandle.__exit__/close()) waits on the
             # `zfs receive` subprocess and raises if it exited non-zero. That
             # must happen only after all chunks have been written above (done
             # here); if it raises, we fall through to the `except Exception`
             # branch below, which reports the error to the client instead of
             # sending 'status: ok'.
+            reaped = True  # the handler below must not close a second time
             writer.close()
             ws.send(json.dumps({'status': 'ok'}))
         except ConnectionClosed:
             # Client already disconnected; best-effort reap the `zfs
             # receive` process. Any error it raises here can't be reported
             # back (the socket is gone) so it's intentionally suppressed.
-            with contextlib.suppress(Exception):
-                writer.close()
+            if not reaped:
+                with contextlib.suppress(Exception):
+                    writer.close()
         except Exception as e:
-            with contextlib.suppress(Exception):
-                writer.close()
+            if not reaped:
+                with contextlib.suppress(Exception):
+                    writer.close()
             with contextlib.suppress(Exception):
                 ws.send(json.dumps({'error': str(e)}))
 

@@ -1,6 +1,7 @@
 """Unit tests for the Flask API (zfsbackup.api)."""
 
 import json
+import logging
 import pytest
 from unittest.mock import MagicMock, PropertyMock, patch
 from datetime import datetime, timedelta, timezone
@@ -361,18 +362,27 @@ class TestBackupStream:
             handler(ws, 'client1', 'pool/data')
         mock_create.assert_called_once()
 
-    def test_stream_writer_none_sends_error(self, mocker):
+    def test_stream_receive_startup_failure_sends_error_and_releases_the_gate(self, mocker):
+        """`zfs.receive.filesystem` raises when `zfs receive` cannot start (it
+        never returns None)."""
         config = _make_config(
             remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
         )
         handler, app = self._get_handler(config, mocker)
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
-        mocker.patch('zfsbackup.api.zfs.receive.filesystem', return_value=None)
+        mocker.patch(
+            'zfsbackup.api.zfs.receive.filesystem',
+            side_effect=RuntimeError('cannot receive: dataset is busy'),
+        )
         ws = MagicMock()
         with app.test_request_context():
             handler(ws, 'client1', 'pool/data')
-        sent = json.loads(ws.send.call_args[0][0])
-        assert 'error' in sent
+        ws.send.assert_called_once()
+        assert json.loads(ws.send.call_args[0][0]) == {
+            'error': 'Failed to start zfs receive: cannot receive: dataset is busy'
+        }
+        ws.receive.assert_not_called()
+        assert app.extensions['zfsbackup.stream_gate'].active == 0
 
     def test_stream_dry_run_sends_ok(self, mocker):
         config = _make_config(
@@ -448,3 +458,172 @@ class TestBackupStream:
         mock_writer.close.assert_called_once()
         error_sent = json.loads(ws.send.call_args[0][0])
         assert 'error' in error_sent
+
+
+class TestBackupStreamWriteFailure:
+    """A write into `zfs receive` fails: the pipe error is the symptom, the
+    diagnostic is whatever `writer.close()` raises (it reaps the process)."""
+
+    def _setup(self, mocker, writer):
+        config = _make_config(
+            remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
+        )
+        mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[])
+        app = create_app(config)
+        handler = app.view_functions['backup_stream'].__wrapped__
+        mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
+        mocker.patch('zfsbackup.api.zfs.receive.filesystem', return_value=writer)
+        return handler, app
+
+    def _run(self, handler, app, ws):
+        with app.test_request_context():
+            handler(ws, 'client1', 'pool/data')
+
+    def test_the_receive_diagnostic_replaces_the_pipe_error_and_both_are_logged(
+        self, mocker, caplog
+    ):
+        writer = MagicMock()
+        writer.write.side_effect = BrokenPipeError(32, 'Broken pipe')
+        writer.close.side_effect = RuntimeError('cannot receive: checksum mismatch')
+        handler, app = self._setup(mocker, writer)
+        ws = MagicMock()
+        ws.receive.return_value = b'chunk'
+        with caplog.at_level(logging.ERROR, logger='zfsbackup.api'):
+            self._run(handler, app, ws)
+
+        assert json.loads(ws.send.call_args[0][0]) == {
+            'error': 'cannot receive: checksum mismatch'
+        }
+        ws.send.assert_called_once()
+        writer.write.assert_called_once_with(b'chunk')
+        writer.close.assert_called_once()
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert 'cannot receive: checksum mismatch' in errors[0]
+        assert 'Broken pipe' in errors[0]
+        assert 'client1' in errors[0]            # the server dataset is named
+
+    def test_a_pipe_error_with_a_clean_close_is_reported_as_the_pipe_error(self, mocker, caplog):
+        writer = MagicMock()
+        writer.write.side_effect = OSError(32, 'Broken pipe')
+        handler, app = self._setup(mocker, writer)       # close() raises nothing
+        ws = MagicMock()
+        ws.receive.return_value = b'chunk'
+        with caplog.at_level(logging.ERROR, logger='zfsbackup.api'):
+            self._run(handler, app, ws)
+
+        assert json.loads(ws.send.call_args[0][0]) == {'error': '[Errno 32] Broken pipe'}
+        ws.send.assert_called_once()
+        writer.close.assert_called_once()
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1 and 'Broken pipe' in errors[0]
+
+    def test_a_failure_after_some_good_chunks_still_closes_exactly_once(self, mocker):
+        writer = MagicMock()
+        writer.write.side_effect = [None, None, BrokenPipeError(32, 'Broken pipe')]
+        writer.close.side_effect = RuntimeError('cannot receive: out of space')
+        handler, app = self._setup(mocker, writer)
+        ws = MagicMock()
+        ws.receive.side_effect = [b'a', b'b', b'c', b'never read']
+        self._run(handler, app, ws)
+        assert writer.write.call_count == 3
+        writer.close.assert_called_once()
+        assert json.loads(ws.send.call_args[0][0]) == {'error': 'cannot receive: out of space'}
+        assert ws.receive.call_count == 3                # nothing read after the failure
+
+    def test_a_non_oserror_write_failure_closes_once_via_the_general_path(self, mocker):
+        writer = MagicMock()
+        writer.write.side_effect = ValueError('bad chunk')
+        handler, app = self._setup(mocker, writer)
+        ws = MagicMock()
+        ws.receive.return_value = b'chunk'
+        self._run(handler, app, ws)
+        writer.close.assert_called_once()
+        assert json.loads(ws.send.call_args[0][0]) == {'error': 'bad chunk'}
+
+    def test_the_success_path_closes_then_says_ok_unchanged(self, mocker):
+        order = []
+        writer = MagicMock()
+        writer.write.side_effect = lambda d: order.append(('write', d))
+        writer.close.side_effect = lambda: order.append(('close',))
+        handler, app = self._setup(mocker, writer)
+        ws = MagicMock()
+        ws.send.side_effect = lambda m: order.append(('send', json.loads(m)))
+        ws.receive.side_effect = [b'x', json.dumps({'done': True})]
+        self._run(handler, app, ws)
+        assert order == [('write', b'x'), ('close',), ('send', {'status': 'ok'})]
+
+    def test_a_failing_close_after_done_reports_the_error_not_ok(self, mocker):
+        writer = MagicMock()
+        writer.close.side_effect = RuntimeError('cannot receive: bad stream')
+        handler, app = self._setup(mocker, writer)
+        ws = MagicMock()
+        ws.receive.side_effect = [b'x', json.dumps({'done': True})]
+        self._run(handler, app, ws)
+        assert json.loads(ws.send.call_args[0][0]) == {'error': 'cannot receive: bad stream'}
+        ws.send.assert_called_once()
+        writer.close.assert_called_once()                # reaped before the close: no second close
+
+    @pytest.mark.parametrize(
+        'close_error',
+        [RuntimeError('cannot receive: checksum mismatch'), None],
+        ids=['close-raises', 'close-clean'],
+    )
+    def test_the_stream_gate_is_balanced_on_both_write_failure_paths(self, mocker, close_error):
+        writer = MagicMock()
+        writer.write.side_effect = BrokenPipeError(32, 'Broken pipe')
+        writer.close.side_effect = close_error
+        handler, app = self._setup(mocker, writer)
+        gate = app.extensions['zfsbackup.stream_gate']
+        during = []
+        ws = MagicMock()
+
+        def receive(timeout=None):
+            during.append(gate.active)
+            return b'chunk'
+
+        ws.receive.side_effect = receive
+        assert gate.active == 0
+        self._run(handler, app, ws)
+        assert during == [1]                 # registered while the stream ran...
+        assert gate.active == 0              # ...and released afterwards
+
+    def test_the_gate_is_balanced_after_several_failing_streams(self, mocker):
+        writer = MagicMock()
+        writer.write.side_effect = BrokenPipeError(32, 'Broken pipe')
+        writer.close.side_effect = RuntimeError('cannot receive: x')
+        handler, app = self._setup(mocker, writer)
+        gate = app.extensions['zfsbackup.stream_gate']
+        for _ in range(5):
+            ws = MagicMock()
+            ws.receive.return_value = b'chunk'
+            self._run(handler, app, ws)
+        assert gate.active == 0
+        assert gate.begin() is True           # not wedged
+        gate.end()
+
+    def test_the_gate_is_released_even_when_the_handler_itself_raises(self, mocker):
+        """`zfs.exists` failing escapes `_receive_stream`; the gate's `finally`
+        must still release the registration."""
+        handler, app = self._setup(mocker, MagicMock())
+        mocker.patch('zfsbackup.api.zfs.exists', side_effect=RuntimeError('pool unavailable'))
+        gate = app.extensions['zfsbackup.stream_gate']
+        with pytest.raises(RuntimeError, match='pool unavailable'):
+            self._run(handler, app, MagicMock())
+        assert gate.active == 0
+
+    def test_a_client_that_vanishes_before_the_ok_does_not_cause_a_second_close(self, mocker):
+        """The stream was written and `close()` succeeded; only the final
+        `{'status': 'ok'}` hits a closed socket."""
+        writer = MagicMock()
+        handler, app = self._setup(mocker, writer)
+        gate = app.extensions['zfsbackup.stream_gate']
+        ws = MagicMock()
+        ws.receive.side_effect = [b'x', json.dumps({'done': True})]
+        ws.send.side_effect = ConnectionClosed(None, None)
+        self._run(handler, app, ws)                      # must not raise
+        writer.write.assert_called_once_with(b'x')
+        writer.close.assert_called_once()
+        ws.send.assert_called_once()
+        assert json.loads(ws.send.call_args[0][0]) == {'status': 'ok'}
+        assert gate.active == 0
