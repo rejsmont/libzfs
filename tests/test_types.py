@@ -1410,22 +1410,37 @@ class TestPropertyNamesAdditions:
         Validate.attribute(name)
 
     @pytest.mark.unit
-    def test_receive_resume_token_is_a_read_only_filesystem_property(self):
+    def test_receive_resume_token_is_a_read_only_filesystem_and_volume_property(self):
         assert PropertyNames.filesystem[-1] == 'receive_resume_token'
+        assert PropertyNames.volume[-1] == 'receive_resume_token'
         assert 'receive_resume_token' not in PropertyNames.mutable
-        for table in (PropertyNames.volume, PropertyNames.snapshot, PropertyNames.fs_snap, PropertyNames.vol_snap,
+        for table in (PropertyNames.snapshot, PropertyNames.fs_snap, PropertyNames.vol_snap,
                       PropertyNames.bookmark, PropertyNames.dataset):
             assert 'receive_resume_token' not in table
-        fs = Filesystem('pool/fs', {'receive_resume_token': Property('1-c0858fc6f-c0-789c')})
-        assert fs['receive_resume_token'].value == '1-c0858fc6f-c0-789c'
-        assert 'receive_resume_token' in self._names(fs)
-        fs.check_property('receive_resume_token')
+        assert PropertyNames.all.count('receive_resume_token') == 2
 
     @pytest.mark.unit
-    def test_receive_resume_token_is_not_a_volume_snapshot_or_bookmark_property(self):
-        for obj in (Volume('pool/v'), Snapshot(Filesystem('pool/fs'), 's'), Snapshot(Volume('pool/v'), 's')):
+    @pytest.mark.parametrize('cls', [Filesystem, Volume])
+    def test_filesystem_and_volume_accept_receive_resume_token(self, cls):
+        token = '1-c0858fc6f-c0-789c'
+        obj = cls('pool/x', {'receive_resume_token': Property(token)})
+        assert obj['receive_resume_token'].value == token
+        assert 'receive_resume_token' in self._names(obj)
+        assert 'receive_resume_token' not in obj._extra_props
+        obj.check_property('receive_resume_token')
+        assert cls('pool/y', {'receive_resume_token': token})['receive_resume_token'].value == token
+
+    @pytest.mark.unit
+    def test_receive_resume_token_is_not_a_snapshot_or_bookmark_property(self):
+        for obj in (Snapshot(Filesystem('pool/fs'), 's'), Snapshot(Volume('pool/v'), 's'),
+                    Bookmark(Filesystem('pool/fs'), 'b'), Dataset('pool/d')):
             with pytest.raises(ValueError):
                 obj.check_property('receive_resume_token')
+
+    @pytest.mark.unit
+    def test_receive_resume_token_is_never_settable_by_name_in_the_mutable_table(self):
+        assert 'receive_resume_token' not in PropertyNames.mutable
+        assert PropertyNames.mutable[-1] == 'volthreading'
 
     @pytest.mark.unit
     @pytest.mark.parametrize('name', VOLUME_NAMES)

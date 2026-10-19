@@ -18,7 +18,7 @@ from libzfseasy.zfs import (
     InheritCommand, SendCommand, ReceiveCommand, MountCommand, UnMountCommand,
     AllowCommand, UnAllowCommand, LoadKeyCommand, UnLoadKeyCommand, ChangeKeyCommand,
     PropertyCommand, StringListArgument, DatasetListArgument, ZFSListArgument,
-    Command, _TERMINATE_TIMEOUT,
+    Command, _TERMINATE_TIMEOUT, ResumeToken, ResumeTokenError, _redact, _log_command,
 )
 from libzfseasy.types import (
     Dataset, Filesystem, Volume, Snapshot, SnapshotRange, Bookmark, ZFS, Validate, PropertyNames, InvalidNameError,
@@ -2755,3 +2755,920 @@ class TestListNewNativeProperties:
         (snap,) = ListCommand()(types='snapshot', properties=['encryptionroot', 'keystatus'])
         assert snap['encryptionroot'].value == 'pool/enc'
         assert snap['keystatus'].value == 'available'
+
+
+# Real tokens and `zfs send -nv -t` output captured on a zfs-2.4.1 VM.
+TOKEN_FULL = '1-a292306e5-b8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a7968064cae0f26c48f2499525a9c520f1d00aacfa4bf2d34b33531818f238834cbe7b33276a20c97382e5f312735319188a4a0af48b53f352f4131d8a0da16e0100ed3915db'
+TOKEN_INCR = '1-e06a8f740-e0-789c636064000310a501c49c50360710a715e5e7a69766a63040c121db7a11f66796fe0a40363b92bafca4acd4e412060666a83a0cf9b4b4e2d412904c195c9e0d493ea9b224b518c40eaec0aabf241fe20acdab06df0f7931276a20c97382e5f312735319188a4a0af48b53f352f4931c8a8da06e0100e3ab1d54'
+TOKEN_FULL_GONE = '1-aa54030d2-b8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a7968064cae0f26c48f2499525a9c520f1d00aacfa4bf2d34b33531818e66ddfb57f2abff03d0d24794eb07c5e626e2a03435149817e716a5e8a7eb243b121d42d004428179d'
+TOKEN_INCR_GONE = '1-bf7b7f36f-e0-789c636064000310a501c49c50360710a715e5e7a69766a6304001c7fd390e4c91df5914806c762475f94959a9c9250c0c0d507518f26969c5a925209932b83c1b927c5265496a31902e48aac0aabf241fe20ab143ef244f0898a46820c97382e5f312735319188a4a0af48b53f352f4531c8a8da06e0100518f1e16'
+TOKEN_RENAMED = '1-b183e6b6c-b8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a7968064cae0f26c48f2499525a9c520f1d00aacfa4bf2d34b33531818befa87715c5f36e59a06923c27583e2f31379581a1a8a440bf38352f453fd5a1d810ea1600488217c5'
+TOKEN_SOURCE_GONE = '1-f87d8e914-e0-789c636064000310a501c49c50360710a715e5e7a69766a6304081abc3eacd47ce9e8d5300b2d991d4e52765a5269730303043d561c8a7a515a7968064cae0f26c48f2499525a9c52076700556fd25f910572c7c3e5df3ebdda3573490e439c1f27989b9a90c0c452505fac5a97929fa690ec54650b700005e8b210e'
+
+FULL_CONTENTS = [
+    'resume token contents:', 'nvlist version: 0', '\tobject = 0x2', '\toffset = 0x760000', '\tbytes = 0x785520',
+    '\ttoguid = 0x61034bf73452096e', '\ttoname = rtp/send/a@s1',
+]
+INCR_CONTENTS = [
+    'resume token contents:', 'nvlist version: 0', '\tfromguid = 0x4f39e607147f3dc2', '\tobject = 0x3',
+    '\toffset = 0x760000', '\tbytes = 0x785308', '\ttoguid = 0x61034ac2f730d529', '\ttoname = rtp/send/b@s2',
+]
+ESTIMATES = ['full send of rtp/send/a@s1 estimated size is 21.2M', 'total estimated size is 21.2M']
+
+
+def _lines(*blocks):
+    return [line + '\n' for block in blocks for line in block]
+
+
+class TestResumeInfo:
+    """`zfs send -nv -t <token>` decoded into a ResumeToken (never sends anything)."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_argv_is_exactly_send_nv_t_token(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS, ESTIMATES))
+        SendCommand.resume_info(TOKEN_FULL)
+        assert mock_subprocess.call_count == 1
+        assert list(mock_subprocess.call_args[0][0])[1:] == ['send', '-nv', '-t', TOKEN_FULL]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_reachable_through_the_public_send_singleton(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS, ESTIMATES))
+        assert SendCommand().resume_info(TOKEN_FULL).toname == 'rtp/send/a@s1'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_valid_full_token(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS, ESTIMATES))
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info == ResumeToken(toname='rtp/send/a@s1', toguid=0x61034bf73452096e, fromguid=None, object=2,
+                                   offset=0x760000, bytes=0x785520, flags=frozenset(), error=None)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_valid_incremental_token(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(INCR_CONTENTS, ['send from rtp/send/b@s1 to rtp/send/b@s2 estimated '
+                                                            'size is 21.2M', 'total estimated size is 21.2M']))
+        info = SendCommand.resume_info(TOKEN_INCR)
+        assert info.fromguid == 0x4f39e607147f3dc2 == 5708846920751857090
+        assert info.toguid == 0x61034ac2f730d529 == 6990513247840425257
+        assert (info.object, info.offset, info.bytes) == (3, 7733248, 7885576)
+        assert info.toname == 'rtp/send/b@s2'
+        assert info.error is None
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_hex_values_become_ints(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS))
+        info = SendCommand.resume_info(TOKEN_FULL)
+        for value in (info.toguid, info.object, info.offset, info.bytes):
+            assert type(value) is int
+        assert info.offset == 7733248 and info.bytes == 7886112
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_flags_with_one_are_counted_and_zero_are_not(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS, ['\tembedok = 1', '\tcompressok = 1', '\trawok = 0',
+                                                             '\tlargeblockok = 0', '\tsavedok = 1'], ESTIMATES))
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info.flags == frozenset({'embedok', 'compressok', 'savedok'})
+        assert isinstance(info.flags, frozenset)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_raw_encrypted_send_flags(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS, ['\tcompressok = 1', '\trawok = 1'], ESTIMATES))
+        assert SendCommand.resume_info(TOKEN_FULL).flags == frozenset({'compressok', 'rawok'})
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_unknown_keys_estimates_and_junk_are_ignored(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(
+            ['resume token contents:', 'nvlist version: 0', '\tfuturekey = 0x5', '\tfuturenum = 1', '\tnoequals',
+             '\tbytes = notanumber', '\tobject = 0x2'], FULL_CONTENTS[5:], ESTIMATES))
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info == ResumeToken(toname='rtp/send/a@s1', toguid=0x61034bf73452096e, object=2)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_output_before_the_contents_header_is_skipped(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(['some banner'], FULL_CONTENTS, ESTIMATES))
+        assert SendCommand.resume_info(TOKEN_FULL).toguid == 0x61034bf73452096e
+
+    @pytest.mark.unit
+    def test_resume_token_is_frozen(self):
+        info = ResumeToken(toname='a@b')
+        with pytest.raises(Exception):
+            info.toname = 'x'
+        assert info.flags == frozenset() and info.error is None and info.toguid is None
+
+    @pytest.mark.unit
+    def test_resume_token_error_is_a_value_error(self):
+        assert issubclass(ResumeTokenError, ValueError)
+
+    # Failures ------------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stale_full_target_returns_the_contents_with_an_error(self, mock_subprocess):
+        mock_subprocess.setup(
+            stdout=_lines(['resume token contents:', 'nvlist version: 0', '\tobject = 0x2', '\toffset = 0x760000',
+                           '\tbytes = 0x785520', '\ttoguid = 0xde130f95bfbab79e', '\ttoname = rtp/send/c@s1']),
+            stderr=["cannot resume send: 'rtp/send/c@s1' used in the initial send no longer exists"],
+            returncode=255)
+        info = SendCommand.resume_info(TOKEN_FULL_GONE)
+        assert info.toguid == 0xde130f95bfbab79e
+        assert info.toname == 'rtp/send/c@s1'
+        assert info.error is not None and 'no longer exists' in info.error
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stale_incremental_target_returns_with_an_error(self, mock_subprocess):
+        mock_subprocess.setup(
+            stdout=_lines(['resume token contents:', 'nvlist version: 0', '\tfromguid = 0x4f75902409cdf08',
+                           '\tobject = 0x80', '\toffset = 0x760000', '\tbytes = 0x786270',
+                           '\ttoguid = 0x643410c819eec216', '\ttoname = rtp/send/d@s2']),
+            stderr=["cannot resume send: 'rtp/send/d@s2' used in the initial send no longer exists"], returncode=255)
+        info = SendCommand.resume_info(TOKEN_INCR_GONE)
+        assert info.fromguid == 0x4f75902409cdf08 and info.object == 0x80
+        assert 'no longer exists' in info.error
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_invalid_cross_device_link_returns_with_an_error(self, mock_subprocess):
+        mock_subprocess.setup(
+            stdout=_lines(['resume token contents:', 'nvlist version: 0', '\tfromguid = 0x5ecdcdc4b3ab4045',
+                           '\tobject = 0x3', '\toffset = 0x760000', '\tbytes = 0x785308',
+                           '\ttoguid = 0xd4c5ddf52997e7a1', '\ttoname = rtp/send/f@s2']),
+            stderr=['cannot resume send: Invalid cross-device link'], returncode=255)
+        info = SendCommand.resume_info(TOKEN_SOURCE_GONE)
+        assert info.toname == 'rtp/send/f@s2'
+        assert 'Invalid cross-device link' in info.error
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_nonzero_with_contents_and_no_stderr_still_reports_an_error(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS), returncode=255)
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info.toguid is not None
+        assert info.error == 'Command failed with exit code 255'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_corrupt_token_raises_with_zfs_text(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=['cannot resume send: resume token is corrupt (incorrect checksum)'],
+                              returncode=255)
+        with pytest.raises(ResumeTokenError) as info:
+            SendCommand.resume_info('1-abc-def-123')
+        assert 'resume token is corrupt (incorrect checksum)' in str(info.value)
+        assert isinstance(info.value, ValueError)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_other_failure_is_a_bare_exception(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=['some other failure'], returncode=1)
+        with pytest.raises(Exception, match='Some other failure') as info:
+            SendCommand.resume_info(TOKEN_FULL)
+        assert type(info.value) is Exception
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_other_failure_without_stderr_names_the_exit_code(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], returncode=2)
+        with pytest.raises(Exception, match='exit code 2') as info:
+            SendCommand.resume_info(TOKEN_FULL)
+        assert type(info.value) is Exception
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_success_without_contents_raises(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(ESTIMATES), returncode=0)
+        with pytest.raises(ResumeTokenError):
+            SendCommand.resume_info(TOKEN_FULL)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_child_is_reaped_on_every_outcome(self, mock_subprocess):
+        process = mock_subprocess.setup(stdout=_lines(FULL_CONTENTS), stderr=['cannot resume send: x'],
+                                        returncode=255)
+        assert SendCommand.resume_info(TOKEN_FULL).error
+        process.wait.assert_called_once()
+
+        process = mock_subprocess.setup(stdout=[], stderr=['cannot resume send: resume token is corrupt'],
+                                        returncode=255)
+        with pytest.raises(ResumeTokenError):
+            SendCommand.resume_info(TOKEN_FULL)
+        process.wait.assert_called_once()
+
+    # Token shape ---------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('token', [
+        None, 5, b'1-abc', ['1-abc'], '', '-x', '--help', '-t', ' ', ' 1-abc', '1-abc ', 'a b', 'a\nb', '1-abc\n',
+        '1-abc\r', 'a\tb', 'tok\x00', 'tok\x1b[0m', 'tok\x7f', 'tök', '1-аbc', 'x' * 16385,
+    ])
+    def test_malformed_tokens_are_rejected_before_any_exec(self, mock_subprocess, token):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS))
+        with pytest.raises(ResumeTokenError, match='Not a valid ZFS resume token'):
+            SendCommand.resume_info(token)
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('token', ['1-abc-def-123', 'x' * 16384, '1-' + 'a' * 100, 'a-b', '!~'])
+    def test_well_formed_tokens_reach_zfs(self, mock_subprocess, token):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS))
+        SendCommand.resume_info(token)
+        assert list(mock_subprocess.call_args[0][0])[-1] == token
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_command_is_logged_once(self, mock_subprocess, caplog):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS))
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            SendCommand.resume_info(TOKEN_FULL)
+        messages = [r.getMessage() for r in caplog.records if r.name == 'libzfseasy']
+        assert len(messages) == 1 and messages[0].endswith('send -nv -t ' + TOKEN_FULL)
+
+
+class TestExecCollect:
+    """`Command._exec_collect` returns (stdout_lines, error_lines, rc) and never raises on a non-zero exit."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_collects_lines_errors_and_rc(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['first\n', '\tindented = 1\n', '\n', 'last'], stderr=['boom happened', 'again'],
+                              returncode=0)
+        lines, errors, rc = Command._exec_collect(['zfs', 'x'])
+        assert lines == ['first', '\tindented = 1', '', 'last']
+        assert errors == ['Boom happened', 'Again']
+        assert rc == 0
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_nonzero_exit_after_output_does_not_raise(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['out\n'], stderr=['cannot do it'], returncode=255)
+        assert Command._exec_collect(['zfs', 'x']) == (['out'], ['Cannot do it'], 255)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_nonzero_exit_without_output(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], returncode=3)
+        assert Command._exec_collect(['zfs', 'x']) == ([], [], 3)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_child_is_reaped(self, mock_subprocess):
+        process = mock_subprocess.setup(stdout=['a\n'], returncode=1)
+        Command._exec_collect(['zfs', 'x'])
+        process.wait.assert_called_once()
+        process.kill.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_interrupt_kills_the_child_and_joins_the_reader(self, mock_subprocess):
+        release = threading.Event()
+        process = MagicMock()
+        process.stdout.readline.side_effect = ['partial\n', KeyboardInterrupt()]
+
+        def blocked_stderr_read():
+            release.wait(timeout=10)       # bounded: a regression fails the join check instead of hanging
+            return ''
+
+        process.stderr.readline.side_effect = blocked_stderr_read
+        process.poll.return_value = None
+        process.kill.side_effect = release.set
+        process.wait.return_value = -9
+        mock_subprocess.return_value = process
+        before = threading.active_count()
+
+        with pytest.raises(KeyboardInterrupt):
+            Command._exec_collect(['zfs', 'x'])
+
+        process.kill.assert_called_once()
+        process.wait.assert_called()
+        assert release.is_set()
+        assert threading.active_count() == before     # the stderr reader was joined, not abandoned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_interrupt_after_the_child_exited_does_not_kill(self, mock_subprocess):
+        process = MagicMock()
+        process.stdout.readline.side_effect = KeyboardInterrupt()
+        process.stderr.readline.return_value = ''
+        process.poll.return_value = 0
+        mock_subprocess.return_value = process
+        with pytest.raises(KeyboardInterrupt):
+            Command._exec_collect(['zfs', 'x'])
+        process.kill.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_still_raises_on_nonzero(self, mock_subprocess):
+        mock_subprocess.setup(stdout='', stderr=['cannot mount'], returncode=1)
+        with pytest.raises(Exception, match='Cannot mount'):
+            Command._exec(['zfs', 'mount'])
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_out_still_yields_then_raises_on_nonzero(self, mock_subprocess):
+        process = mock_subprocess.setup(stdout=['line\n'], stderr=['cannot list'], returncode=1)
+        process.poll.side_effect = None
+        process.poll.return_value = 1       # the generator's cleanup polls once more after the failure
+        out = Command._exec_out(['zfs', 'list'])
+        assert next(out) == 'line'
+        with pytest.raises(Exception, match='Cannot list'):
+            next(out)
+
+
+class TestCommandLogRedaction:
+    """URL credentials never reach the log, and nothing is formatted unless DEBUG is enabled."""
+
+    SECRET = 'hunter2'
+
+    @staticmethod
+    def _messages(caplog):
+        return [r.getMessage() for r in caplog.records if r.name == 'libzfseasy' and r.levelno == logging.DEBUG]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('arg, expected', [
+        ('https://user:hunter2@host/key', 'https://***@host/key'),
+        ('https://user@host/key', 'https://***@host/key'),
+        ('keylocation=https://user:hunter2@host:8443/key', 'keylocation=https://***@host:8443/key'),
+        ('x=http://u:p@h1/a,y=https://v:w@h2/b', 'x=http://***@h1/a,y=https://***@h2/b'),
+        ('svn+ssh://u:p@h/x', 'svn+ssh://***@h/x'),
+        ('ssh://h/x', 'ssh://h/x'),
+        ('https://host/path@thing', 'https://host/path@thing'),
+        ('plain@name', 'plain@name'),
+        ('pool/fs@snap', 'pool/fs@snap'),
+        ('user@host:path', 'user@host:path'),
+        ('file:///etc/key', 'file:///etc/key'),
+        ('-o', '-o'),
+        ('', ''),
+    ])
+    def test_redact_table(self, arg, expected):
+        assert _redact(arg) == expected
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_plain_element(self, mock_subprocess, caplog):
+        mock_subprocess.setup(stdout='')
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            Command._exec(['zfs', 'send', 'https://user:hunter2@host/key'])
+        (message,) = self._messages(caplog)
+        assert message == "Executing command: zfs send 'https://***@host/key'"
+        assert self.SECRET not in caplog.text
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_keylocation_element_and_nested_dash_o(self, mock_subprocess, caplog):
+        mock_subprocess.setup(stdout='')
+        cmd = ['zfs', 'receive', '-o', 'keylocation=https://user:hunter2@host/key', '-o', 'compression=lz4',
+               '-o', 'user:note=https://a:hunter2@b/c', 'pool/fs']
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            Command._exec(cmd)
+        (message,) = self._messages(caplog)
+        assert 'keylocation=https://***@host/key' in message
+        assert 'user:note=https://***@b/c' in message
+        assert 'compression=lz4' in message and message.endswith('pool/fs')
+        assert self.SECRET not in caplog.text
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_real_argv_still_carries_the_credentials(self, mock_subprocess):
+        mock_subprocess.setup(stdout='')
+        cmd = ['zfs', 'create', '-o', 'keylocation=https://user:hunter2@host/key', 'pool/fs']
+        Command._exec(cmd)
+        assert list(mock_subprocess.call_args[0][0]) == cmd
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_unrelated_arguments_are_unchanged_and_still_quoted(self, mock_subprocess, caplog):
+        mock_subprocess.setup(stdout='')
+        cmd = ['zfs', 'rename', 'pool/my fs@snap', 'ssh://h/x', 'plain@name']
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            Command._exec(cmd)
+        (message,) = self._messages(caplog)
+        assert message == 'Executing command: ' + shlex.join(cmd)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_log_command_formats_nothing_when_debug_is_off(self, mock_subprocess, caplog, monkeypatch):
+        zfs_module = importlib.import_module('libzfseasy.zfs')
+        join = MagicMock(side_effect=AssertionError('formatted with DEBUG off'))
+        redact = MagicMock(side_effect=AssertionError('redacted with DEBUG off'))
+        monkeypatch.setattr(zfs_module, 'shlex', MagicMock(join=join))
+        monkeypatch.setattr(zfs_module, '_redact', redact)
+        mock_subprocess.setup(stdout='')
+        with caplog.at_level(logging.INFO, logger='libzfseasy'):
+            Command._exec(['zfs', 'mount', '-a'])
+            _log_command(['zfs', 'mount', '-a'])
+        join.assert_not_called()
+        redact.assert_not_called()
+
+    @pytest.mark.unit
+    def test_log_command_formats_when_debug_is_on(self, caplog, monkeypatch):
+        zfs_module = importlib.import_module('libzfseasy.zfs')
+        join = MagicMock(return_value='JOINED')
+        monkeypatch.setattr(zfs_module, 'shlex', MagicMock(join=join))
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            _log_command(['zfs', 'mount', '-a'])
+        join.assert_called_once_with(['zfs', 'mount', '-a'])
+        assert self._messages(caplog) == ['Executing command: JOINED']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('path', ['_exec', '_exec_out', '_exec_collect', '_exec_stream', '_exec_stream_in'])
+    def test_every_exec_path_logs_redacted(self, mock_subprocess, caplog, path):
+        cmd = ['zfs', 'receive', '-o', 'keylocation=https://user:hunter2@host/key', 'pool/fs']
+        if path in ('_exec_stream', '_exec_stream_in'):
+            process = MagicMock()
+            process.stdout.peek.return_value = b'ZFS_DATA'
+            process.poll.return_value = None
+            process.stdin = io.BufferedWriter(io.BytesIO())
+            mock_subprocess.return_value = process
+        else:
+            mock_subprocess.setup(stdout='')
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            owner = {'_exec_stream': SendCommand, '_exec_stream_in': ReceiveCommand}.get(path, Command)
+            result = getattr(owner, path)(cmd)
+            if path == '_exec_out':
+                list(result)
+        (message,) = self._messages(caplog)
+        assert 'keylocation=https://***@host/key' in message
+        assert self.SECRET not in caplog.text
+        assert list(mock_subprocess.call_args[0][0]) == cmd
+
+
+class TestListVolumeResumeToken:
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_volume_row_with_a_token(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['pool/v\tvolume\t' + TOKEN_FULL + '\n', 'pool/w\tvolume\t-\n',
+                                      'pool/fs\tfilesystem\t-\n'])
+        v, w, fs = ListCommand()(properties='receive_resume_token')
+        assert v['receive_resume_token'].value == TOKEN_FULL
+        assert w['receive_resume_token'] is None and 'receive_resume_token' not in w
+        assert fs['receive_resume_token'] is None
+        assert 'receive_resume_token' in v._prop_names and 'receive_resume_token' not in v._extra_props
+
+
+class TestResumeInfoBlockOnStderr:
+    """Which stream carries the `resume token contents:` block varies by OpenZFS version: stdout first, then stderr."""
+
+    CANNOT = "cannot resume send: 'rtp/send/a@s1' used in the initial send no longer exists"
+
+    @staticmethod
+    def _nl(lines):
+        return [line + '\n' for line in lines]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_block_and_estimates_on_stderr_rc0(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=_lines(FULL_CONTENTS, ESTIMATES), returncode=0)
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info == ResumeToken(toname='rtp/send/a@s1', toguid=0x61034bf73452096e, object=2, offset=0x760000,
+                                   bytes=0x785520)
+        assert info.error is None
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_block_only_on_stderr_rc0(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=_lines(INCR_CONTENTS), returncode=0)
+        info = SendCommand.resume_info(TOKEN_INCR)
+        assert info.fromguid == 0x4f39e607147f3dc2 and info.toname == 'rtp/send/b@s2'
+        assert info.error is None
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_flags_on_stderr_are_parsed(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=_lines(FULL_CONTENTS, ['\tembedok = 1', '\trawok = 0']), returncode=0)
+        assert SendCommand.resume_info(TOKEN_FULL).flags == frozenset({'embedok'})
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('with_estimates', [False, True])
+    @pytest.mark.parametrize('where', ['before', 'after'])
+    def test_block_on_stderr_rc255_error_is_only_the_capitalised_zfs_line(self, mock_subprocess, with_estimates,
+                                                                          where):
+        around = ESTIMATES + ['send from rtp/send/b@s1 to rtp/send/b@s2 estimated size is 21.2M'] \
+            if with_estimates else []
+        stderr = FULL_CONTENTS + around + [self.CANNOT] if where == 'before' \
+            else [self.CANNOT] + FULL_CONTENTS + around
+        mock_subprocess.setup(stdout=[], stderr=_lines(stderr), returncode=255)
+        info = SendCommand.resume_info(TOKEN_FULL_GONE)
+        assert info.toguid == 0x61034bf73452096e
+        assert info.error == 'Cannot resume send: \'rtp/send/a@s1\' used in the initial send no longer exists'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_estimate_lines_never_leak_into_the_error(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=_lines(FULL_CONTENTS, [
+            'full send of rtp/send/a@s1 estimated size is 21.2M',
+            'send from rtp/send/b@s1 to rtp/send/b@s2 estimated size is 1M',
+            'total estimated size is 22M', 'cannot resume send: Invalid cross-device link']), returncode=255)
+        error = SendCommand.resume_info(TOKEN_SOURCE_GONE).error
+        assert error == 'Cannot resume send: Invalid cross-device link'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_multi_line_error_keeps_every_remaining_line(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=_lines(FULL_CONTENTS, ['cannot resume send: one', '  second line']),
+                              returncode=255)
+        assert SendCommand.resume_info(TOKEN_FULL).error == 'Cannot resume send: one\nSecond line'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_block_on_stderr_rc255_with_nothing_else_reports_the_exit_code(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=_lines(FULL_CONTENTS, ESTIMATES), returncode=255)
+        assert SendCommand.resume_info(TOKEN_FULL).error == 'Command failed with exit code 255'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_only_estimate_lines_on_stderr_rc0_raises(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=_lines(ESTIMATES), returncode=0)
+        with pytest.raises(ResumeTokenError, match='zfs printed no resume token contents'):
+            SendCommand.resume_info(TOKEN_FULL)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_estimate_lines_on_stdout_and_nothing_on_stderr_rc0_raises(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(ESTIMATES), stderr=[], returncode=0)
+        with pytest.raises(ResumeTokenError, match='zfs printed no resume token contents'):
+            SendCommand.resume_info(TOKEN_FULL)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stdout_wins_when_both_streams_carry_a_block(self, mock_subprocess):
+        other = ['resume token contents:', 'nvlist version: 0', '\ttoguid = 0x1', '\ttoname = other/x@y']
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS, ESTIMATES), stderr=_lines(other), returncode=0)
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info.toname == 'rtp/send/a@s1' and info.toguid == 0x61034bf73452096e
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stdout_wins_and_stderr_text_is_the_error_at_rc255(self, mock_subprocess):
+        other = ['resume token contents:', 'nvlist version: 0', '\ttoguid = 0x1']
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS), stderr=_lines([self.CANNOT]), returncode=255)
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info.toname == 'rtp/send/a@s1'
+        assert info.error.startswith('Cannot resume send')
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS), stderr=_lines(other), returncode=0)
+        assert SendCommand.resume_info(TOKEN_FULL).toguid == 0x61034bf73452096e
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_header_on_stdout_with_keys_on_stderr_uses_the_stdout_block_as_is(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(['resume token contents:', 'nvlist version: 0']),
+                              stderr=_lines(['\ttoguid = 0x61034bf73452096e', '\ttoname = rtp/send/a@s1']),
+                              returncode=0)
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info == ResumeToken()          # found on stdout; the stray stderr keys are not merged in
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stderr_block_with_blank_and_noise_lines(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=_lines(['', 'warning: something'], FULL_CONTENTS, ['']),
+                              returncode=255)
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info.toguid == 0x61034bf73452096e
+        assert info.error == 'Warning: something'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_corrupt_token_with_no_block_still_raises_with_zfs_text(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=_lines(['cannot resume send: resume token is corrupt']),
+                              returncode=255)
+        with pytest.raises(ResumeTokenError, match='Cannot resume send: resume token is corrupt'):
+            SendCommand.resume_info(TOKEN_FULL)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_child_is_reaped_with_the_block_on_stderr(self, mock_subprocess):
+        process = mock_subprocess.setup(stdout=[], stderr=_lines(FULL_CONTENTS, [self.CANNOT]), returncode=255)
+        SendCommand.resume_info(TOKEN_FULL)
+        process.wait.assert_called_once()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_find_resume_block_span(self):
+        from libzfseasy.zfs import _find_resume_block
+        lines = ['x', 'resume token contents:', 'nvlist version: 0', '\ta = 1', '\tb = 2', 'full send of x', '\tz = 3']
+        assert _find_resume_block(lines) == (1, 5)
+        assert _find_resume_block(['resume token contents:']) == (0, 1)
+        assert _find_resume_block(['resume token contents:', '\ta = 1']) == (0, 2)
+        assert _find_resume_block(['nothing', 'here']) is None
+        assert _find_resume_block([]) is None
+
+
+class TestExecCollectRawStderr:
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_raw_stderr_keeps_tabs_blank_lines_and_case(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['out\n'], stderr=['\tindented = 1\n', '\n', '  spaced  \n', 'lower case\n'],
+                              returncode=255)
+        lines, errors, rc = Command._exec_collect(['zfs', 'x'], raw_stderr=True)
+        assert lines == ['out']
+        assert errors == ['\tindented = 1', '', '  spaced  ', 'lower case']
+        assert rc == 255
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_default_mode_still_strips_drops_and_capitalises(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['out\n'], stderr=['\tindented = 1\n', '\n', '  spaced  \n', 'lower case\n'],
+                              returncode=255)
+        _, errors, _ = Command._exec_collect(['zfs', 'x'])
+        assert errors == ['Indented = 1', 'Spaced', 'Lower case']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_raw_mode_default_is_off(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=['  x\n'], returncode=0)
+        assert Command._exec_collect(['zfs', 'x'])[1] == ['X']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_raw_mode_strips_only_the_line_ending(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], stderr=['a\r\n', 'b\n', 'c'], returncode=0)
+        assert Command._exec_collect(['zfs', 'x'], raw_stderr=True)[1] == ['a', 'b', 'c']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_raw_mode_interrupt_kills_and_joins_the_reader(self, mock_subprocess):
+        release = threading.Event()
+        process = MagicMock()
+        process.stdout.readline.side_effect = ['partial\n', KeyboardInterrupt()]
+
+        def blocked_stderr_read():
+            release.wait(timeout=10)
+            return ''
+
+        process.stderr.readline.side_effect = blocked_stderr_read
+        process.poll.return_value = None
+        process.kill.side_effect = release.set
+        process.wait.return_value = -9
+        mock_subprocess.return_value = process
+        before = threading.active_count()
+        with pytest.raises(KeyboardInterrupt):
+            Command._exec_collect(['zfs', 'x'], raw_stderr=True)
+        process.kill.assert_called_once()
+        assert threading.active_count() == before
+
+
+_FAKE_RESUME_ZFS = r'''#!{python}
+import os, sys
+sys.stdout.write("resume token contents:\nnvlist version: 0\n\ttoguid = 0x1\n\ttoname = p/a@s\n")
+sys.stdout.flush()
+sys.stderr.buffer.write(b"locale=" + os.environ.get("LC_ALL", "").encode() + b"/" + os.environ.get("LANG", "").encode()
+                        + b" bad \xff\xfe bytes\n")
+sys.stderr.buffer.write(b"x" * 300000 + b"\n")
+sys.stderr.flush()
+sys.exit(255)
+'''
+
+_GRANDCHILD_HOLDS_STDERR = '''
+import subprocess, sys
+g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)   # inherits stderr
+sys.stdout.write("%d\\n" % g.pid)
+sys.stdout.flush()
+'''
+
+
+class TestResumeInfoEnvironment:
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_resume_info_runs_zfs_in_the_c_locale(self, mock_subprocess, monkeypatch):
+        monkeypatch.setenv('LC_ALL', 'de_DE.UTF-8')
+        monkeypatch.setenv('LANG', 'de_DE.UTF-8')
+        monkeypatch.setenv('LIBZFSEASY_TEST_KEEP', 'kept')
+        before = dict(os.environ)
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS))
+        SendCommand.resume_info(TOKEN_FULL)
+        env = mock_subprocess.call_args.kwargs['env']
+        assert env['LC_ALL'] == 'C' and env['LANG'] == 'C'
+        assert env['LIBZFSEASY_TEST_KEEP'] == 'kept'
+        assert {k: v for k, v in env.items() if k not in ('LC_ALL', 'LANG')} == \
+            {k: v for k, v in before.items() if k not in ('LC_ALL', 'LANG')}
+        assert env is not os.environ
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_parent_environment_is_untouched(self, mock_subprocess, monkeypatch):
+        monkeypatch.setenv('LC_ALL', 'de_DE.UTF-8')
+        monkeypatch.delenv('LANG', raising=False)
+        before = dict(os.environ)
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS))
+        SendCommand.resume_info(TOKEN_FULL)
+        assert dict(os.environ) == before
+        assert 'LANG' not in os.environ and os.environ['LC_ALL'] == 'de_DE.UTF-8'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_c_locale_is_set_even_when_the_parent_has_none(self, mock_subprocess, monkeypatch):
+        monkeypatch.delenv('LC_ALL', raising=False)
+        monkeypatch.delenv('LANG', raising=False)
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS))
+        SendCommand.resume_info(TOKEN_FULL)
+        env = mock_subprocess.call_args.kwargs['env']
+        assert env['LC_ALL'] == 'C' and env['LANG'] == 'C'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_collect_decodes_utf8_with_replacement(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], returncode=0)
+        Command._exec_collect(['zfs', 'x'])
+        kwargs = mock_subprocess.call_args.kwargs
+        assert kwargs['encoding'] == 'utf-8' and kwargs['errors'] == 'replace'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_collect_without_env_passes_none(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], returncode=0)
+        Command._exec_collect(['zfs', 'x'])
+        assert mock_subprocess.call_args.kwargs.get('env') is None
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_collect_passes_a_given_env_through(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], returncode=0)
+        env = {'A': '1'}
+        Command._exec_collect(['zfs', 'x'], env=env)
+        assert mock_subprocess.call_args.kwargs['env'] == {'A': '1'}
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('path', ['_exec', '_exec_out', '_exec_stream', '_exec_stream_in'])
+    def test_other_exec_paths_pass_no_env(self, mock_subprocess, path):
+        cmd = ['zfs', 'x']
+        if path in ('_exec_stream', '_exec_stream_in'):
+            process = MagicMock()
+            process.stdout.peek.return_value = b'ZFS_DATA'
+            process.poll.return_value = None
+            process.stdin = io.BufferedWriter(io.BytesIO())
+            mock_subprocess.return_value = process
+        else:
+            mock_subprocess.setup(stdout='')
+        owner = {'_exec_stream': SendCommand, '_exec_stream_in': ReceiveCommand}.get(path, Command)
+        result = getattr(owner, path)(cmd)
+        if path == '_exec_out':
+            list(result)
+        assert mock_subprocess.call_args.kwargs.get('env') is None
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_ordinary_commands_do_not_get_the_c_locale(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        ListCommand()()
+        assert mock_subprocess.call_args.kwargs.get('env') is None
+
+
+class TestExecCollectRobustness:
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('error', [OSError('broken pipe'), ValueError('I/O operation on closed file')])
+    def test_raw_reader_survives_a_failing_readline(self, mock_subprocess, monkeypatch, error):
+        crashed = []
+        monkeypatch.setattr(threading, 'excepthook', lambda args: crashed.append(args))
+        process = MagicMock()
+        process.stdout.readline.side_effect = ['a\n', '']
+        process.stderr.readline.side_effect = ['first\n', error]
+        process.wait.return_value = 0
+        mock_subprocess.return_value = process
+        lines, errors, rc = Command._exec_collect(['zfs', 'x'], raw_stderr=True)
+        assert (lines, errors, rc) == (['a'], ['first'], 0)
+        assert crashed == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_failing_reader_still_lets_the_call_finish_with_no_stderr(self, mock_subprocess):
+        process = MagicMock()
+        process.stdout.readline.side_effect = ['']
+        process.stderr.readline.side_effect = OSError('gone')
+        process.wait.return_value = 7
+        mock_subprocess.return_value = process
+        assert Command._exec_collect(['zfs', 'x'], raw_stderr=True) == ([], [], 7)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('raw', [False, True])
+    def test_non_utf8_bytes_are_replaced_not_raised(self, real_child, raw):
+        script = ('import sys\n'
+                  'sys.stdout.buffer.write(b"out \\xff\\xfe ok\\n"); sys.stdout.flush()\n'
+                  'sys.stderr.buffer.write(b"err \\xc3\\x28 bad\\n"); sys.stderr.flush()\n'
+                  'sys.exit(3)\n')
+        result, exc = real_child.run(lambda: Command._exec_collect(real_child.cmd(script), raw_stderr=raw))
+        assert exc is None
+        lines, errors, rc = result
+        assert rc == 3
+        assert lines == ['out \ufffd\ufffd ok']
+        assert len(errors) == 1 and '\ufffd' in errors[0] and errors[0].lower().startswith('err ')
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('raw', [False, True])
+    def test_hundreds_of_kb_of_stderr_do_not_block_the_child(self, real_child, raw):
+        script = ('import sys\n'
+                  'for i in range(400): sys.stderr.write("warn %d " % i + "e" * 1000 + "\\n")\n'
+                  'sys.stderr.write("z" * 300000 + "\\n"); sys.stderr.flush()\n'
+                  'sys.stdout.write("done\\n"); sys.exit(2)\n')
+        result, exc = real_child.run(lambda: Command._exec_collect(real_child.cmd(script), raw_stderr=raw))
+        assert exc is None
+        lines, errors, rc = result
+        assert lines == ['done'] and rc == 2
+        assert len(errors) == 401
+        assert len(errors[-1]) == 300000
+        assert real_child.procs[0].returncode == 2
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('raw', [False, True])
+    def test_a_grandchild_holding_stderr_cannot_hang_the_caller(self, real_child, monkeypatch, raw):
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.5)
+        started = time.monotonic()
+        result, exc = real_child.run(
+            lambda: Command._exec_collect(real_child.cmd(_GRANDCHILD_HOLDS_STDERR), raw_stderr=raw), timeout=20)
+        elapsed = time.monotonic() - started
+        grandchild = None
+        try:
+            assert exc is None
+            lines, errors, rc = result
+            grandchild = int(lines[0])
+            assert rc == 0 and errors == []
+            assert 0.4 <= elapsed < 10          # about the patched bound, not the grandchild's 60 s
+        finally:
+            if grandchild:
+                try:
+                    os.kill(grandchild, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    @pytest.mark.unit
+    def test_join_stderr_reader_waits_only_once(self, monkeypatch):
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.3)
+        release = threading.Event()
+        thread = threading.Thread(target=lambda: release.wait(10), daemon=True)
+        thread.start()
+        try:
+            started = time.monotonic()
+            Command._join_stderr_reader(thread)
+            first = time.monotonic() - started
+            started = time.monotonic()
+            Command._join_stderr_reader(thread)
+            second = time.monotonic() - started
+            assert 0.25 <= first < 5
+            assert second < 0.2
+        finally:
+            release.set()
+            thread.join(5)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('raw', [False, True])
+    def test_the_reader_is_joined_once_on_a_normal_run(self, mock_subprocess, monkeypatch, raw):
+        joined = []
+        real = Command._join_stderr_reader
+        monkeypatch.setattr(Command, '_join_stderr_reader', staticmethod(lambda t: (joined.append(t), real(t))))
+        mock_subprocess.setup(stdout=['a\n'], stderr=['b'], returncode=0)
+        Command._exec_collect(['zfs', 'x'], raw_stderr=raw)
+        assert len(joined) == 1 and not joined[0].is_alive()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_reader_is_joined_once_on_an_interrupt(self, mock_subprocess, monkeypatch):
+        joined = []
+        real = Command._join_stderr_reader
+        monkeypatch.setattr(Command, '_join_stderr_reader', staticmethod(lambda t: (joined.append(t), real(t))))
+        process = MagicMock()
+        process.stdout.readline.side_effect = KeyboardInterrupt()
+        process.stderr.readline.return_value = ''
+        process.poll.return_value = None
+        process.wait.return_value = -9
+        mock_subprocess.return_value = process
+        with pytest.raises(KeyboardInterrupt):
+            Command._exec_collect(['zfs', 'x'])
+        assert len(joined) == 1
+        process.kill.assert_called_once()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_resume_info_end_to_end_with_a_real_child(self, real_child, monkeypatch, tmp_path):
+        script = tmp_path / 'fake_resume_zfs'
+        script.write_text(_FAKE_RESUME_ZFS.format(python=sys.executable))
+        script.chmod(0o755)
+        monkeypatch.setenv('ZFS_CMD', str(script))
+        monkeypatch.setenv('LC_ALL', 'de_DE.UTF-8')
+        monkeypatch.setenv('LANG', 'de_DE.UTF-8')
+        info, exc = real_child.run(lambda: SendCommand.resume_info(TOKEN_FULL))
+        assert exc is None
+        assert info.toguid == 1 and info.toname == 'p/a@s'
+        # the child saw the C locale, its invalid bytes were replaced, and 300 KB of stderr did not block it
+        assert info.error.startswith('Locale=C/C bad \ufffd\ufffd bytes')
+        assert ('X' + 'x' * 299999) in info.error.splitlines()
+        assert os.environ['LC_ALL'] == 'de_DE.UTF-8'

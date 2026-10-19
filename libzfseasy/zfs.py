@@ -2,9 +2,11 @@ from libzfseasy.types import InvalidNameError, Validate, ZFS, Dataset, Filesyste
      SnapshotRange, Property, Properties
 from typing import Optional, Union, Dict, Iterable, Callable
 
+import dataclasses
 import io
 import logging
 import os
+import re
 import shlex
 import subprocess
 import shutil
@@ -82,6 +84,22 @@ _STDERR_KEEP_LINES = 200
 _STDERR_MAX_LINE = 64 * 1024
 
 
+_URL_USERINFO = re.compile(r'([A-Za-z][A-Za-z0-9+.\-]*://)[^/\s]*@')
+
+
+def _redact(arg) -> str:
+    """Hide URL credentials (`scheme://user:pass@host` -> `scheme://***@host`) wherever they occur in an argument,
+    e.g. inside `-o keylocation=https://user:pass@host/key`."""
+    return _URL_USERINFO.sub(r'\1***@', str(arg))
+
+
+def _log_command(cmd) -> None:
+    """Log the command about to run at DEBUG, with URL credentials redacted. Nothing is formatted unless DEBUG is
+    enabled on the 'libzfseasy' logger."""
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug('Executing command: %s', shlex.join([_redact(a) for a in cmd]))
+
+
 class _BoundedErrors(list):
     """A list of error lines that keeps the first and the last `_STDERR_KEEP_LINES` entries and collapses the
     middle into a single `... N lines omitted ...` marker, so a pathological stderr cannot grow memory without
@@ -108,7 +126,7 @@ class Command:
 
     @classmethod
     def _exec(cls, cmd):
-        logger.debug('Executing command: %s', shlex.join(cmd))
+        _log_command(cmd)
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         errors = []
         stderr_thread = cls._start_stderr_reader(process, errors)
@@ -119,7 +137,7 @@ class Command:
 
     @classmethod
     def _exec_out(cls, cmd):
-        logger.debug('Executing command: %s', shlex.join(cmd))
+        _log_command(cmd)
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         errors = []
         stderr_thread = cls._start_stderr_reader(process, errors)
@@ -152,6 +170,54 @@ class Command:
                         process.wait()
                 stderr_thread.join()
                 process.wait()
+
+    @classmethod
+    def _exec_collect(cls, cmd, raw_stderr: bool = False, env=None):
+        """Run `cmd` to completion and return `(stdout_lines, error_lines, returncode)` without raising on a
+        non-zero exit, for commands that print something useful and then fail (e.g. `zfs send -nv -t`). Stdout
+        lines are right-stripped of the newline only. By default stderr lines are stripped, empty ones dropped and
+        the first letter capitalised, like the other helpers; with `raw_stderr` they are returned exactly as
+        printed (newline removed, indentation kept) for callers that parse structured stderr. The child is always
+        reaped and the stderr thread joined (bounded, see `_join_stderr_reader`), even if the caller is interrupted.
+        `env` replaces the child's environment when given. Output is decoded as UTF-8 with replacement, so odd
+        bytes can neither raise nor kill the stderr reader (which would leave the child blocked on a full pipe)."""
+        _log_command(cmd)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                                   encoding='utf-8', errors='replace', env=env)
+        errors = _BoundedErrors()
+        if raw_stderr:
+            def reader():
+                try:
+                    while True:
+                        line = process.stderr.readline()
+                        if line == '':
+                            break
+                        errors.append(line.rstrip('\r\n'))
+                except (OSError, ValueError):
+                    # The pipe broke or was closed under us; whatever was read so far stands.
+                    pass
+            stderr_thread = threading.Thread(target=reader, daemon=True)
+            stderr_thread.start()
+        else:
+            stderr_thread = cls._start_stderr_reader(process, errors)
+        lines = []
+        completed = False
+        try:
+            while True:
+                line = process.stdout.readline()
+                if line == '':
+                    break
+                lines.append(line.rstrip('\n'))
+            rc = process.wait()
+            cls._join_stderr_reader(stderr_thread)
+            completed = True
+        finally:
+            if not completed:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                cls._join_stderr_reader(stderr_thread)
+        return lines, list(errors), rc
 
     @staticmethod
     def _start_stderr_reader(process, errors):
@@ -1076,6 +1142,81 @@ class InheritCommand(Command):
         return cmd
 
 
+class ResumeTokenError(ValueError):
+    """A `receive_resume_token` that `zfs send -t` refuses outright (corrupt, or malformed before it was run)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ResumeToken:
+    """What a `receive_resume_token` says about the interrupted receive, as printed by `zfs send -nv -t <token>`.
+
+    Fields (None when the token does not carry them):
+        toname: str -- the snapshot being received, as recorded when the receive started. This can be STALE: if the
+            sender renamed the dataset since, zfs still prints the old name here; match the stream by `toguid`.
+        toguid: int -- GUID of the target snapshot (the reliable identity).
+        fromguid: int -- GUID of the incremental source snapshot; None for a full stream.
+        object, offset, bytes: int -- where the receive stopped (object number, offset within it, bytes received).
+        flags: frozenset -- names of the `*ok` stream features recorded in the token (embedok, compressok, rawok,
+            largeblockok, savedok, ...).
+        error: str -- zfs's reason when the token can no longer be resumed from this pool (target or source
+            snapshot destroyed, ...); None when `zfs send -t` would work. The contents are still reported.
+    """
+    toname: Optional[str] = None
+    toguid: Optional[int] = None
+    fromguid: Optional[int] = None
+    object: Optional[int] = None
+    offset: Optional[int] = None
+    bytes: Optional[int] = None
+    flags: frozenset = frozenset()
+    error: Optional[str] = None
+
+
+# Resume tokens look like `1-<hex>-<hex>-<hex>` and run to a few hundred bytes (more with redaction lists).
+_RESUME_TOKEN_MAX_LEN = 16384
+_RESUME_TOKEN_RE = re.compile(r'[\x21-\x7e]+')
+_RESUME_INT_FIELDS = ('toguid', 'fromguid', 'object', 'offset', 'bytes')
+
+
+def _find_resume_block(lines):
+    """Return `(first, end)` such that `lines[first:end]` is the `resume token contents:` header, the
+    `nvlist version` line and the tab-indented `key = value` lines of `zfs send -nv -t`, or None if absent."""
+    try:
+        start = lines.index('resume token contents:')
+    except ValueError:
+        return None
+    end = start + 1
+    if end < len(lines) and lines[end].startswith('nvlist version'):
+        end += 1
+    while end < len(lines) and lines[end].startswith('\t'):
+        end += 1
+    return start, end
+
+
+def _parse_resume_contents(lines) -> Optional[ResumeToken]:
+    """Parse the `resume token contents:` / `nvlist version: 0` block of `zfs send -nv -t`, or None if absent."""
+    span = _find_resume_block(lines)
+    if span is None:
+        return None
+    fields, flags = {}, set()
+    for line in lines[span[0] + 1:span[1]]:
+        if not line.startswith('\t'):
+            continue
+        key, sep, value = line.strip().partition(' = ')
+        if not sep:
+            continue
+        value = value.strip()
+        if key == 'toname':
+            fields[key] = value
+        elif key in _RESUME_INT_FIELDS:
+            try:
+                fields[key] = int(value, 0)
+            except ValueError:
+                continue
+        elif key.endswith('ok') and value == '1':
+            flags.add(key)
+    return ResumeToken(flags=frozenset(flags), **fields)
+
+
 class SendCommand(Command):
 
     def __call__(self, *args, **kwargs):
@@ -1190,6 +1331,58 @@ class SendCommand(Command):
         return cls._exec_stream(cmd)
 
     @classmethod
+    def resume_info(cls, token: str) -> ResumeToken:
+        """Decode a resume token (`zfs send -nv -t <token>`) without sending anything
+
+        Keyword arguments:
+            token: str -- resume token generated by the receiving side (`receive_resume_token`)
+
+        Returns:
+            ResumeToken -- the decoded contents. When zfs decodes the token but cannot resume it on this pool
+                (the target or incremental source snapshot no longer exists, ...), the contents are still
+                returned and `error` carries zfs's reason; nothing is raised. `toname` may be stale after a
+                sender-side rename, so identify the stream by `toguid`.
+
+        Raises:
+            ResumeTokenError: the token is malformed, or zfs rejects it (for example a corrupt token)
+        """
+        if not isinstance(token, str) or not token or len(token) > _RESUME_TOKEN_MAX_LEN \
+                or not _RESUME_TOKEN_RE.fullmatch(token) or token.startswith('-'):
+            raise ResumeTokenError('Not a valid ZFS resume token')
+
+        # Which stream carries the contents block can vary by OpenZFS version (stdout on 2.4.1): look in stdout
+        # first, then in stderr (read raw, so the tab indentation survives).
+        # Run in the C locale so zfs's messages are the English ones callers match on (staleness, corruption).
+        env = dict(os.environ, LC_ALL='C', LANG='C')
+        lines, stderr_lines, rc = cls._exec_collect([_zfs_cmd(), 'send', '-nv', '-t', token], raw_stderr=True,
+                                                    env=env)
+        info = _parse_resume_contents(lines)
+        span = None
+        if info is None:
+            info = _parse_resume_contents(stderr_lines)
+            span = _find_resume_block(stderr_lines)
+        if span is not None:
+            # The block, and the size estimate printed around it, are not the error.
+            stderr_lines = [l for i, l in enumerate(stderr_lines)
+                            if not span[0] <= i < span[1]
+                            and not l.startswith(('full send of', 'send from', 'total estimated size'))]
+        errors = []
+        for line in stderr_lines:
+            line = line.strip()
+            if line:
+                errors.append(line[0].upper() + line[1:])
+        text = '\n'.join(errors)
+        if info is None:
+            if rc == 0:
+                raise ResumeTokenError('zfs printed no resume token contents')
+            if 'resume' in text.lower():
+                raise ResumeTokenError(text)
+            raise Exception(text or f'Command failed with exit code {rc}')
+        if rc != 0:
+            info = dataclasses.replace(info, error=text or f'Command failed with exit code {rc}')
+        return info
+
+    @classmethod
     def partial(cls, ds: Dataset, since: Optional[Snapshot] = None) -> 'StreamHandle':
         """Generate a send stream from a dataset that has been partially received
 
@@ -1243,7 +1436,7 @@ class SendCommand(Command):
 
     @classmethod
     def _exec_stream(cls, cmd) -> 'StreamHandle':
-        logger.debug('Executing command: %s', shlex.join(cmd))
+        _log_command(cmd)
         errors = _BoundedErrors()
         stderr_thread = None
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1425,7 +1618,7 @@ class ReceiveCommand(Command, StringListArgument):
 
     @classmethod
     def _exec_stream_in(cls, cmd) -> 'StreamHandle':
-        logger.debug('Executing command: %s', shlex.join(cmd))
+        _log_command(cmd)
         # Only stdin (the stream we write to) and stderr (for error
         # reporting) are ever read from; stdout is intentionally discarded
         # (not piped) since nothing drains it and a chatty child could

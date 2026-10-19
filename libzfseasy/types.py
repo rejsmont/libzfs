@@ -1,3 +1,10 @@
+"""Types for libzfseasy: ZFS objects, their properties and the validators for names.
+
+Pickling note: instances store native properties by their integer index into the class's property-name list
+(`_prop_names`). That layout changes whenever property names are added (for example for a newer OpenZFS), so pickles
+of libzfseasy objects are NOT stable across versions of this library -- do not persist them; rebuild objects from
+`zfs list` / `zfs get` output instead.
+"""
 import re
 from typing import Optional, Dict, Iterable, Tuple, Union
 
@@ -25,7 +32,9 @@ class PropertyNames:
 
     volume = ['volblocksize', 'volsize',
               # OpenZFS 2.4 (volthreading) and the properties volumes share with filesystems
-              'prefetch', 'special_small_blocks', 'volthreading']
+              'prefetch', 'special_small_blocks', 'volthreading',
+              # read-only; only present while a `zfs receive -s` is partial (`-` otherwise)
+              'receive_resume_token']
 
     snapshot = ['clones', 'compressratio', 'context', 'createtxg', 'creation', 'defcontext', 'defer_destroy',
                 'encryption', 'fscontext', 'guid', 'logicalreferenced', 'mlslabel', 'objsetid', 'primarycache',
@@ -209,6 +218,8 @@ PropertyItem = Tuple[str, Optional[Property]]
 
 
 class ZFS:
+    """Base of all ZFS objects. Pickles are not stable across library versions (property index layout); see the
+    module docstring."""
 
     _prop_names = []
 
