@@ -174,14 +174,36 @@ def server_cfg_path(tmp_path, source_fs, target_root):
 
 
 @pytest.fixture
-def running_server(server_cfg_path):
+def server_config_db(tmp_path, server_cfg_path):
+    """Import `server_cfg_path` into a fresh SQLite config store under
+    `tmp_path` and return the `ResolvedConfigPath` addressing it.
+
+    `running_server` reads the server config from this store with
+    `read_config` and hands the resulting `BackupConfig` to a real
+    `ApiWorker` (workers never open the DB) -- `server_cfg_path` remains
+    this fixture's YAML input, unchanged.
+    """
+    from zfsbackup.config.store import import_yaml, resolve_config_path
+
+    db_path = tmp_path / 'server_config.db'
+    resolved = resolve_config_path(str(db_path))
+    import_yaml(server_cfg_path, resolved)
+    return resolved
+
+
+@pytest.fixture
+def running_server(server_config_db):
     """Start a real ApiWorker on port 18082; wait until ready; tear down after the test."""
-    import multiprocessing
     import requests
+    from zfsbackup.config.store import read_config
+    from zfsbackup.stopflag import StopFlag
     from zfsbackup.workers import ApiWorker
 
-    stop = multiprocessing.Event()
-    worker = ApiWorker(server_cfg_path, stop, verbose=False)
+    # `ApiWorker` takes the supervisor's detached `BackupConfig` and a
+    # `StopFlag`, never the config DB path: workers do not open the DB.
+    snapshot = read_config(server_config_db)
+    stop = StopFlag()
+    worker = ApiWorker(snapshot.config, stop, verbose=False)
     worker.start()
 
     deadline = time.time() + 15
@@ -420,7 +442,7 @@ class TestRealSendReceive:
 
     def _server_snap_names(self, target_root, source_fs, config):
         """Return short snapshot names present on the server-side target dataset."""
-        client_id = ClientIdentity(config.client_id_file).client_id
+        client_id = ClientIdentity(config.effective_client_id_file).client_id
         relative = source_fs.name.split('/', 1)[1]
         server_ds = f'{target_root}/{client_id}/{relative}'
         return list_real_snapshot_names(server_ds)
@@ -508,7 +530,7 @@ class TestRealSendReceive:
         snaps = manager.list_snapshots(dsi)
         remote_mgr.backup_dataset(dsi, dsi.config.remote[0])
 
-        client_id = ClientIdentity(config.client_id_file).client_id
+        client_id = ClientIdentity(config.effective_client_id_file).client_id
         url = f'{running_server}/backup/{client_id}/{source_fs.name}/negotiate'
         resp = req.post(url, json={
             'snapshots': [s.name for s in snaps],

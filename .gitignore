@@ -162,3 +162,11 @@ ipython_config.py
 
 notebooks
 .DS_Store
+
+# zfsbackup config store (SQLite + WAL sidecars)
+# The store runs in WAL mode, so a DB is three files. Copying or committing
+# config.db alone while a -wal is pending silently loses the most recent
+# commits -- use VACUUM INTO or take all three.
+*.db
+*.db-wal
+*.db-shm

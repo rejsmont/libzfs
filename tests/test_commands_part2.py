@@ -1,9 +1,13 @@
 """Additional unit tests for libzfseasy.zfs — AllowCommand through MountCommand."""
 
 import pytest
+import contextlib
+import gc
 import io
 import os
 import subprocess
+import sys
+import warnings
 from unittest.mock import MagicMock
 from libzfseasy.zfs import (
     AllowCommand, UnAllowCommand, CloneCommand, GetCommand, SetCommand,
@@ -518,6 +522,377 @@ class TestSendCommandExtended:
     def test_send_options_since_incremental(self, sample_snapshot):
         opts = SendCommand._get_options(since=sample_snapshot)
         assert '-i' in opts
+
+
+class TestSendStdoutEof:
+    """`SendCommand._exec_capture_bin` when stdout hits EOF.
+
+    EOF with the child still running must not spin on peek()/poll(): stderr is drained to its end first (a bare
+    wait() can deadlock on a full stderr pipe), then the child is reaped and its exit status decides the outcome.
+    """
+
+    @staticmethod
+    def _eof_process(order, rc, stderr_bytes=b''):
+        process = MagicMock()
+        process.stdout.peek.return_value = b''
+        process.poll.return_value = None  # still running when stdout hits EOF
+
+        def _read():
+            order.append('stderr.read')
+            return stderr_bytes
+
+        def _wait():
+            order.append('wait')
+            return rc
+
+        process.stderr.read.side_effect = _read
+        process.wait.side_effect = _wait
+        return process
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_eof_then_rc_zero_returns_empty_handle_and_reads_stderr_before_wait(self, mock_subprocess):
+        order = []
+        process = self._eof_process(order, rc=0, stderr_bytes=b'warning: nothing to send\n')
+        mock_subprocess.return_value = process
+
+        handle = SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
+
+        assert isinstance(handle, StreamHandle)
+        assert order == ['stderr.read', 'wait']
+        process.wait.assert_called_once()
+        process.stderr.read.assert_called_once()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_eof_then_nonzero_rc_raises_capitalised_stderr(self, mock_subprocess):
+        order = []
+        process = self._eof_process(
+            order, rc=1, stderr_bytes=b'cannot open dataset: does not exist\n  second problem\n\n')
+        mock_subprocess.return_value = process
+
+        with pytest.raises(Exception) as exc_info:
+            SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
+
+        assert str(exc_info.value) == 'Cannot open dataset: does not exist\nSecond problem'
+        assert order == ['stderr.read', 'wait']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_eof_nonzero_rc_with_empty_stderr_raises(self, mock_subprocess):
+        order = []
+        process = self._eof_process(order, rc=2, stderr_bytes=b'')
+        mock_subprocess.return_value = process
+
+        with pytest.raises(Exception):
+            SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
+        process.wait.assert_called_once()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_eof_does_not_spin_on_peek(self, mock_subprocess):
+        """The old behaviour looped on peek()/poll() until the child exited; now EOF is handled in one pass."""
+        order = []
+        process = self._eof_process(order, rc=0)
+        mock_subprocess.return_value = process
+
+        SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
+
+        assert process.stdout.peek.call_count == 1
+        assert process.poll.call_count == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_peek_data_returns_stream_without_touching_stderr_or_wait(self, mock_subprocess):
+        process = MagicMock()
+        process.stdout.peek.return_value = b'ZFS_DATA'
+        process.poll.return_value = None
+        mock_subprocess.return_value = process
+
+        handle = SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
+
+        assert isinstance(handle, StreamHandle)
+        process.stderr.read.assert_not_called()
+        process.wait.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_rc_already_set_zero_returns_empty_handle_without_wait(self, mock_subprocess):
+        process = MagicMock()
+        process.stdout.peek.return_value = b''
+        process.poll.return_value = 0
+        mock_subprocess.return_value = process
+
+        handle = SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
+
+        assert isinstance(handle, StreamHandle)
+        process.wait.assert_not_called()
+        process.stderr.read.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_rc_already_set_nonzero_raises_without_wait(self, mock_subprocess):
+        stderr_r, stderr_w = os.pipe()
+        os.write(stderr_w, b'cannot send: permission denied\n')
+        os.close(stderr_w)
+        stderr = os.fdopen(stderr_r, 'rb')
+        try:
+            process = MagicMock()
+            process.stdout.peek.return_value = b''
+            process.stderr = stderr
+            process.poll.return_value = 1
+            mock_subprocess.return_value = process
+
+            with pytest.raises(Exception) as exc_info:
+                SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
+
+            assert 'Cannot send: permission denied' in str(exc_info.value)
+            process.wait.assert_not_called()
+        finally:
+            stderr.close()
+
+
+class TestSendStdoutEofRealChild:
+    """Real `sys.executable -c` children (never a real zfs): closed stdout plus a stderr flood larger than the pipe."""
+
+    TIMEOUT = 20
+
+    # Close fd 1 (stdout EOF for the parent) while staying alive, flood stderr past any pipe buffer (> 64 KB), exit.
+    CHILD = (
+        "import os, sys\n"
+        "os.close(1)\n"
+        "for i in range(3000):\n"
+        "    sys.stderr.write('noise line %d xxxxxxxxxxxxxxxxxxxxxxxx\\n' % i)\n"
+        "sys.stderr.write('disk exploded\\n')\n"
+        "sys.stderr.flush()\n"
+        "sys.exit({rc})\n"
+    )
+
+    def _run(self, monkeypatch, rc):
+        import threading
+        real_popen = subprocess.Popen
+        procs = []
+
+        polls = []
+
+        def spying_popen(*a, **kw):
+            p = real_popen(*a, **kw)
+            real_poll = p.poll
+
+            def counting_poll():
+                polls.append(1)
+                return real_poll()
+
+            p.poll = counting_poll
+            procs.append(p)
+            return p
+
+        monkeypatch.setattr(subprocess, 'Popen', spying_popen)
+        outcome = {'polls': polls, 'procs': procs}
+
+        def target():
+            try:
+                outcome['result'] = SendCommand._exec_stream([sys.executable, '-c', self.CHILD.format(rc=rc)])
+            except BaseException as e:  # noqa: BLE001 - reported to the test
+                outcome['error'] = e
+
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        t.join(self.TIMEOUT)
+        try:
+            assert not t.is_alive(), 'send EOF handling deadlocked or spun'
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+        return outcome
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stderr_flood_nonzero_exit_raises_without_deadlock(self, monkeypatch):
+        outcome = self._run(monkeypatch, rc=1)
+
+        assert 'result' not in outcome
+        assert isinstance(outcome.get('error'), Exception)
+        assert 'Disk exploded' in str(outcome['error'])
+        # A regression to the old spin (peek()/poll() in a tight loop until the child exits) would poll thousands of
+        # times while the child floods stderr; the fixed code polls once per capture and then blocks in wait().
+        assert len(outcome['polls']) <= 3, 'send EOF handling spun: %d poll() calls' % len(outcome['polls'])
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stderr_flood_nonzero_exit_closes_pipes_and_reaps(self, monkeypatch):
+        outcome = self._run(monkeypatch, rc=1)
+
+        assert isinstance(outcome.get('error'), Exception)
+        (proc,) = outcome['procs']
+        assert proc.stdout.closed
+        assert proc.stderr.closed
+        assert proc.returncode is not None
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stderr_flood_zero_exit_returns_empty_handle(self, monkeypatch):
+        outcome = self._run(monkeypatch, rc=0)
+
+        assert 'error' not in outcome
+        handle = outcome['result']
+        assert isinstance(handle, StreamHandle)
+        handle.close()
+        assert len(outcome['polls']) <= 3, 'send EOF handling spun: %d poll() calls' % len(outcome['polls'])
+
+
+class TestSendFailureClosesPipes:
+    """A failed send closes process.stdout / process.stderr before raising (no leaked pipe, no ResourceWarning)."""
+
+    @staticmethod
+    def _spawn(code):
+        return subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _leak_watch(fds):
+        """Fail if a ResourceWarning attributable to *this test's* pipes (or a still-running child) is emitted.
+
+        Garbage left behind by earlier tests (e.g. an unclosed text-mode file) is collected, and its warnings discarded,
+        before the action; afterwards only warnings naming one of ``fds`` (the caller appends the pipe descriptors it
+        spawns) or an unreaped subprocess count.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            gc.collect()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            yield
+            gc.collect()
+        ours = [str(w.message) for w in caught
+                if issubclass(w.category, ResourceWarning)
+                and (any('name=%d>' % fd in str(w.message) for fd in fds) or 'subprocess' in str(w.message))]
+        assert not ours, ours
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_nonzero_exit_without_stdout_closes_pipes(self):
+        code = "import sys; sys.stderr.write('pool is busy\\n'); sys.exit(1)"
+        fds = []
+        with self._leak_watch(fds):
+            proc = self._spawn(code)
+            fds += [proc.stdout.fileno(), proc.stderr.fileno()]
+            proc.wait()  # exited before the capture: poll() deterministically sees rc != 0 (the rc branch)
+            errors = []
+            raised = None
+            try:
+                SendCommand._exec_capture_bin(proc, errors)
+            except Exception as e:  # noqa: BLE001
+                raised = e
+            assert raised is not None
+            assert 'Pool is busy' in str(raised)
+            assert proc.stdout.closed
+            assert proc.stderr.closed
+            assert proc.returncode == 1
+            del raised, proc
+            gc.collect()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stdout_eof_then_nonzero_exit_closes_pipes(self):
+        code = ("import os, sys, time\n"
+                "os.close(1)\n"
+                "time.sleep(0.2)\n"
+                "sys.stderr.write('stream broke\\n'); sys.stderr.flush()\n"
+                "sys.exit(3)\n")
+        fds = []
+        with self._leak_watch(fds):
+            proc = self._spawn(code)
+            fds += [proc.stdout.fileno(), proc.stderr.fileno()]
+            raised = None
+            try:
+                SendCommand._exec_capture_bin(proc, [])
+            except Exception as e:  # noqa: BLE001
+                raised = e
+            try:
+                assert raised is not None
+                assert 'Stream broke' in str(raised)
+                assert proc.stdout.closed
+                assert proc.stderr.closed
+                assert proc.returncode == 3
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            del raised, proc
+            gc.collect()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_stream_failure_leaves_no_open_pipes(self, monkeypatch):
+        procs = []
+        fds = []
+        real_popen = subprocess.Popen
+
+        def spying_popen(*a, **kw):
+            p = real_popen(*a, **kw)
+            procs.append(p)
+            fds.extend([p.stdout.fileno(), p.stderr.fileno()])  # recorded now: the pipes are closed by the failure
+            return p
+
+        monkeypatch.setattr(subprocess, 'Popen', spying_popen)
+        code = "import sys; sys.stderr.write('nope\\n'); sys.exit(2)"
+        with self._leak_watch(fds):
+            with pytest.raises(Exception, match='Nope'):
+                SendCommand._exec_stream([sys.executable, '-c', code])
+            (proc,) = procs
+            assert proc.stdout.closed and proc.stderr.closed
+            assert proc.returncode == 2
+            procs.clear()
+            del proc
+            gc.collect()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('poll_value', [1, None])
+    def test_mocked_process_without_pipes_still_raises_send_error(self, poll_value):
+        process = MagicMock()
+        process.stdout = None
+        process.stderr = None
+        process.poll.return_value = poll_value
+        process.wait.return_value = 1
+        with pytest.raises(Exception) as exc:
+            SendCommand._exec_capture_bin(process, ['Earlier error'])
+        assert 'Earlier error' in str(exc.value)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('poll_value', [1, None])
+    def test_mock_pipes_are_closed_and_close_errors_are_swallowed(self, poll_value):
+        process = MagicMock()
+        process.stdout.peek.return_value = b''
+        process.stdout.closed = False
+        process.stdout.close.side_effect = OSError('boom')
+        process.stderr.closed = False
+        process.stderr.read.return_value = b''
+        process.poll.return_value = poll_value
+        process.wait.return_value = 1
+        with pytest.raises(Exception) as exc:
+            SendCommand._exec_capture_bin(process, ['send failed'])
+        assert not isinstance(exc.value, OSError)
+        assert 'send failed' in str(exc.value)
+        process.stdout.close.assert_called_once_with()
+        process.stderr.close.assert_called_once_with()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_already_closed_pipes_are_not_closed_again(self):
+        process = MagicMock()
+        process.stdout.peek.return_value = b''
+        process.stdout.closed = True
+        process.stderr.closed = True
+        process.poll.return_value = 1
+        with pytest.raises(Exception):
+            SendCommand._exec_capture_bin(process, ['x'])
+        process.stdout.close.assert_not_called()
+        process.stderr.close.assert_not_called()
 
 
 class TestReceiveCommandExtended:

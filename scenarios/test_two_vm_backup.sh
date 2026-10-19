@@ -16,11 +16,30 @@
 #   client: check_interval 15s, snapshot frequency 30s, remote push 30s, prune 1m
 #   server: check_interval 1m, prune 5m
 #
+# Scenarios: A full initial transfer, B incremental, C server-down resilience + catch-up, D client
+# restart persistence, and (Phase 3, live config reload; skip with --no-big):
+#   E  reload the CLIENT daemon during a large (2 GiB, throttled) send: the transfer completes, the
+#      remote worker is only replaced after it, and the 60s deferral WARNING appears
+#   F  reload the SERVER daemon during an inbound receive: the receive completes, the API worker is
+#      only replaced after it
+#   G  `kill -9` the client supervisor mid-send and start a new daemon at once: the new daemon waits
+#      ("waiting for them to ...") for the surviving worker to finish, then starts
+#   H  `rename dataset OLD NEW --clear-stale-props` while the client daemon RUNS (Linux, verified daemon): the
+#      CLI signals it, waits for it to apply the rename, then clears OLD's org.zfsbackup:* properties
+#   I  received datasets are pruned NON-recursively: the client dataset is `recursive: true`, the server's copy
+#      has a child with its own long retention, and the server's pruner removes the parent's old snapshots
+#      without ever taking the child's same-named ones (a recursive destroy would)
+# H and I need a real pool but little space; they run after E-G, and also with --no-big.
+# E-G throttle the client's egress with `tc` (tbf) so a send lasts long enough to act on; the
+# throttle is always removed again (also on error). They write ~3 GiB per VM: the VMs need ~10G disk
+# (`multipass set local.<vm>.disk=10G` while stopped; VM_DISK=10G for a new VM).
+#
 # Usage:
 #   ./scenarios/test_two_vm_backup.sh            # run all scenarios; reuse VMs; recreate pools
 #   ./scenarios/test_two_vm_backup.sh --keep     # leave daemons + pools running for inspection
 #   ./scenarios/test_two_vm_backup.sh --keep-pools
-#   ./scenarios/test_two_vm_backup.sh --purge    # delete the VMs entirely at the end
+#   ./scenarios/test_two_vm_backup.sh --no-big   # scenarios A-D only (skip the slow E-G)
+#   ./scenarios/test_two_vm_backup.sh --purge    # delete the two VMs (and only those) at the end
 #
 # Requires: multipass on the host (macOS/Linux). No sudo needed on the host.
 #
@@ -49,25 +68,28 @@ SRC_DIR="/opt/zfsbackup-src"             # extracted repo inside each VM
 VENV="/opt/zfsbvenv"
 PY="${VENV}/bin/python"
 PIP="${VENV}/bin/pip"
-CFG="/etc/zfsbackup/config.yaml"
+CFG="/etc/zfsbackup/config.yaml"         # YAML import input (the daemon no longer reads YAML)
+DB="/var/lib/zfsbackup/config.db"        # SQLite config DB the daemon actually reads
 CLIENT_ID_FILE="/var/lib/zfsbackup/client_id"
 LOG="/var/log/zfsbackup.log"
-DISK_SIZE="512m"
+IMG_DIR="${IMG_DIR:-/var/tmp}"            # pool backing files; NOT /tmp (a tmpfs, i.e. RAM, on these VMs)
+DISK_SIZE="${DISK_SIZE:-5g}"                # sparse backing files; E-G write up to ~3 GiB
 
 VM_CPUS="${VM_CPUS:-1}"
 VM_MEM="${VM_MEM:-1G}"
-VM_DISK="${VM_DISK:-5G}"
+VM_DISK="${VM_DISK:-10G}"
 
 # Timeouts (seconds)
 HEALTH_TIMEOUT=60
 SNAP_TIMEOUT=120         # ~4 snapshot periods
 
 # Flags
-PURGE=0; KEEP_POOLS=0; KEEP=0
+PURGE=0; KEEP_POOLS=0; KEEP=0; BIG=1
 for arg in "$@"; do
     case "$arg" in
         --purge)      PURGE=1 ;;
         --keep-pools) KEEP_POOLS=1 ;;
+        --no-big)     BIG=0 ;;
         --keep)       KEEP=1; KEEP_POOLS=1 ;;
         -h|--help)    grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; exit 2 ;;
@@ -134,6 +156,7 @@ install_stack() {
         need=""
         command -v zfs   >/dev/null 2>&1 || need="$need zfsutils-linux"
         command -v curl  >/dev/null 2>&1 || need="$need curl"
+        command -v tc    >/dev/null 2>&1 || need="$need iproute2"
         dpkg -s python3-venv >/dev/null 2>&1 || need="$need python3-venv"
         dpkg -s python3-pip  >/dev/null 2>&1 || need="$need python3-pip"
         if [ -n "$need" ]; then apt-get update -qq && apt-get install -y -qq $need; fi
@@ -143,7 +166,10 @@ install_stack() {
     # a host temp file first, then transfer the file (avoids proxying host stdin through exec).
     step "Copying source into $vm:$SRC_DIR"
     local tar; tar="$(mktemp)"
-    ( cd "$(dirname "$0")" && git archive --format=tar HEAD ) > "$tar" || die "git archive failed"
+    # `git archive` run inside scenarios/ would archive ONLY that subtree, so anchor it at the
+    # repo top level.
+    local top; top="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)" || die "not in a git repo"
+    git -C "$top" archive --format=tar HEAD > "$tar" || die "git archive failed"
     multipass transfer "$tar" "$vm:/tmp/zfsbackup-src.tar" || die "source transfer failed for $vm"
     rm -f "$tar"
     msh "$vm" "rm -rf '$SRC_DIR' && mkdir -p '$SRC_DIR' && tar -xf /tmp/zfsbackup-src.tar -C '$SRC_DIR' && rm -f /tmp/zfsbackup-src.tar"
@@ -154,7 +180,8 @@ install_stack() {
         set -e
         test -x '$PY' || python3 -m venv '$VENV'
         '$PIP' install -q --upgrade pip
-        '$PIP' install -q pyyaml 'flask>=3' flask-sock websocket-client requests
+        '$PIP' install -q pyyaml 'flask>=3' flask-sock websocket-client requests \
+            'sqlalchemy>=2.0' 'alembic>=1.13' 'click>=8.1'
     " || die "pip install failed on $vm"
 
     msh "$vm" "mkdir -p /etc/zfsbackup /var/lib/zfsbackup"
@@ -167,8 +194,8 @@ recreate_pool() {
     msh "$vm" "
         set -e
         if zpool list '$pool' >/dev/null 2>&1; then zpool destroy -f '$pool'; fi
-        img=/tmp/${pool}.img
-        rm -f \$img
+        img=${IMG_DIR}/${pool}.img
+        rm -f \$img /tmp/${pool}.img          # (older runs kept the image in /tmp, which is a tmpfs = RAM)
         truncate -s '$DISK_SIZE' \$img
         zpool create '$pool' \$img
     " || die "pool creation failed on $vm ($pool)"
@@ -177,28 +204,32 @@ recreate_pool() {
 destroy_pool() {
     local vm="$1" pool="$2"
     # Suppress output in the guest (never redirect exec's host stdout to /dev/null).
-    msh "$vm" "{ zpool destroy -f '$pool'; rm -f /tmp/${pool}.img; } >/dev/null 2>&1; true" || true
+    msh "$vm" "{ zpool destroy -f '$pool'; rm -f '${IMG_DIR}/${pool}.img' /tmp/${pool}.img; } >/dev/null 2>&1; true" || true
 }
 
 # ─────────────────────────────── Daemon control ─────────────────────────────
 # The daemon is launched as a transient systemd unit: systemd-run returns immediately
 # (so the exec call completes) and reparents the daemon to systemd. Its "Running as
 # unit" message goes to stderr; stdout is empty, so no host redirect is needed.
+# start_daemon <vm> [unit] [KillMode]  — the optional KillMode is for E-G: `process` leaves a worker
+# running after its supervisor dies (the default `control-group` would kill it with the unit), and
+# `mixed` is what zfsbackup/README.md recommends for a production unit.
 start_daemon() {
-    local vm="$1"
-    step "Starting daemon on $vm"
+    local vm="$1" unit="${2:-zfsbackup}" killmode="${3:-}" kmprop=""
+    [ -n "$killmode" ] && kmprop="-p KillMode=$killmode"
+    step "Starting daemon on $vm (unit $unit${killmode:+, KillMode=$killmode})"
     msh "$vm" "
-        systemctl reset-failed zfsbackup 2>/dev/null || true
-        systemd-run --unit=zfsbackup --collect \
+        systemctl reset-failed $unit 2>/dev/null || true
+        systemd-run --unit=$unit --collect $kmprop \
             -p StandardOutput=append:'$LOG' -p StandardError=append:'$LOG' \
-            env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.daemon -c '$CFG' -v
+            env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.daemon -c '$DB' -v
     " || die "could not start daemon on $vm"
 }
 
 stop_daemon() {
     local vm="$1"
     # All suppression happens in the guest; host stdout is never sent to /dev/null.
-    msh "$vm" "{ systemctl stop zfsbackup; systemctl reset-failed zfsbackup; pkill -f 'zfsbackup.daemon'; } >/dev/null 2>&1; true" || true
+    msh "$vm" "{ systemctl stop zfsbackup zfsbackup-victim; systemctl reset-failed zfsbackup zfsbackup-victim; pkill -f 'zfsbackup.daemon'; } >/dev/null 2>&1; true" || true
 }
 
 daemon_running() { msh "$1" "pgrep -f 'zfsbackup.daemon' >/dev/null" 2>/dev/null; }
@@ -206,7 +237,13 @@ daemon_running() { msh "$1" "pgrep -f 'zfsbackup.daemon' >/dev/null" 2>/dev/null
 # ─────────────────────────────── Config writers ─────────────────────────────
 # NOTE: config is delivered via `multipass transfer` (reliable) rather than piping a
 # heredoc into `multipass exec ... tee` — the latter hangs/spins on host stdin.
-put_config() { # put_config <vm> ; reads config text on stdin, installs it to $CFG
+# The daemon reads only the SQLite DB, so the YAML is imported (destructive FULL REPLACE;
+# creates the DB if missing) and the daemon must be (re)started afterwards — no live reload.
+# Import goes through the config CLI (`python -m zfsbackup.cli`: the venv does not pip-install the
+# repo, so the `zfsbackup-config` console script does not exist; the module form is identical).
+# --no-backup: the harness re-seeds the same VMs over and over and wants a plain full replace,
+# not a pile of <db>.pre-import-<UTC>.yaml files next to the DB.
+put_config() { # put_config <vm> ; reads config text on stdin, installs it to $CFG, imports into $DB
     local vm="$1" tmp
     tmp="$(mktemp)"
     cat > "$tmp"
@@ -214,6 +251,18 @@ put_config() { # put_config <vm> ; reads config text on stdin, installs it to $C
     msh "$vm" "install -D -m600 /tmp/zfsbackup-config.yaml '$CFG' && rm -f /tmp/zfsbackup-config.yaml" \
         || die "config install failed on $vm"
     rm -f "$tmp"
+    msh "$vm" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$DB' import --no-backup '$CFG'" \
+        || die "config import failed on $vm"
+}
+
+# Remove the YAML, the config DB with its WAL sidecars (a stale -wal beside a fresh DB is a
+# confusing failure), and the lock files next to it: <db>.daemon.pid (daemon presence lock; a leftover
+# one from a crash would name a dead supervisor and a stale generation), <db>.writer.lock (CLI writer
+# lock) and <db>.workers.lock (held by workers; waited on by a restarted daemon). Daemons must be
+# stopped first. Output suppressed in the guest.
+remove_config() {
+    local vm="$1"
+    msh "$vm" "{ rm -f '$CFG' '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock' '$DB.workers.lock'; } >/dev/null 2>&1; true" || true
 }
 
 write_server_config() {
@@ -238,8 +287,8 @@ datasets:
 EOF
 }
 
-write_client_config() {
-    local server_ip="$1"
+write_client_config() { # write_client_config <server-ip> [extra datasets-list YAML items, 2-space indented]
+    local server_ip="$1" extra="${2:-}"
     step "Writing client config on $CLIENT_VM (server=${server_ip}:${API_PORT})"
     put_config "$CLIENT_VM" <<EOF
 # zfsbackup CLIENT config (auto-generated by test_two_vm_backup.sh)
@@ -261,6 +310,7 @@ datasets:
     remote:
       - destination: ${DEST_NAME}
         frequency: "30s"
+${extra}
 EOF
 }
 
@@ -331,6 +381,65 @@ guid_match_anchor() { # guid_match_anchor "<description>"
     fi
 }
 
+
+# ─────────────────────── Live-reload helpers (scenarios E-G) ─────────────────
+# The zfsbackup-config CLI on <vm>, against that VM's DB. The daemon runs as root there, so root's CLI
+# is verified (kernel lock table + start token) and SIGHUPs it. stderr is merged: the notice is on stdout.
+cli_vm() { local vm="$1"; shift; msh "$vm" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$DB' $* 2>&1"; }
+# Last logged pid of worker <name> (a live reload logs "Reloaded <name> worker (pid=N) on generation G").
+wpid() { # wpid <vm> <snapshot|pruning|remote|api>
+    msh "$1" "grep -oE '(Started|Restarted|Reloaded) $2 worker \\(pid=[0-9]+\\)' '$LOG' | tail -n1 | grep -oE '[0-9]+'" | tr -d '[:space:]'
+}
+loglines()   { msh "$1" "wc -l < '$LOG'" | tr -d '[:space:]'; }
+log_since_vm() { msh "$1" "tail -n +$(( $2 + 1 )) '$LOG'"; }
+# line number (relative to the mark) of the first line matching an ERE; empty if none
+log_lineno() { msh "$1" "tail -n +$(( $2 + 1 )) '$LOG' | grep -nE '$3' | head -n1 | cut -d: -f1" | tr -d '[:space:]'; }
+wait_log_vm() { # wait_log_vm <vm> <mark> <ERE> <timeout>
+    local waited=0
+    while :; do
+        log_since_vm "$1" "$2" | grep -qE -- "$3" && return 0
+        [ "$waited" -ge "$4" ] && return 1
+        sleep 2; waited=$((waited+2))
+    done
+}
+# NB: the bracket trick keeps pgrep from matching its own `bash -c` command line.
+send_running() { msh "$CLIENT_VM" "pgrep -f '[z]fs send' >/dev/null" 2>/dev/null; }
+recv_running() { msh "$SERVER_VM" "pgrep -f '[z]fs (receive|recv)' >/dev/null" 2>/dev/null; }
+wait_for_proc() { # wait_for_proc <send_running|recv_running> <timeout>
+    local waited=0
+    until "$1"; do [ "$waited" -ge "$2" ] && return 1; sleep 2; waited=$((waited+2)); done
+}
+append_random() { # append_random <MiB> <name>  — new incompressible file in the client dataset
+    msh "$CLIENT_VM" "dd if=/dev/urandom of=\$(zfs get -H -o value mountpoint '$SOURCE_DS')/$2 bs=1M count=$1 status=none"
+}
+# Rate-limit the CLIENT's egress to the server (token bucket) so a send lasts long enough to act on.
+# Always undone: scenarios call throttle_off, and an EXIT trap covers an early abort.
+THROTTLE_DEV=""
+throttle_on() { # throttle_on <rate e.g. 200mbit>
+    THROTTLE_DEV="$(msh "$CLIENT_VM" "ip -o route get '$SERVER_IP' | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p' | head -n1" | tr -d '[:space:]')"
+    [ -n "$THROTTLE_DEV" ] || die "could not find the client's interface towards $SERVER_IP"
+    msh "$CLIENT_VM" "tc qdisc del dev $THROTTLE_DEV root >/dev/null 2>&1; tc qdisc add dev $THROTTLE_DEV root tbf rate $1 burst 256kb latency 400ms" \
+        || die "tc qdisc add failed on $CLIENT_VM (is iproute2 installed?)"
+    info "client egress on $THROTTLE_DEV limited to $1"
+}
+throttle_off() {
+    [ -n "$THROTTLE_DEV" ] || return 0
+    msh "$CLIENT_VM" "tc qdisc del dev $THROTTLE_DEV root >/dev/null 2>&1; true" || true
+    THROTTLE_DEV=""
+}
+trap throttle_off EXIT
+# Enough room for the E-G data (about 3 GiB per VM plus ZFS overhead)?
+big_space_ok() {
+    local vm kb
+    for vm in "$SERVER_VM" "$CLIENT_VM"; do
+        kb="$(msh "$vm" "df -Pk '$IMG_DIR' | awk 'NR==2{print \$4}'" | tr -d '[:space:]')"
+        if [ -z "$kb" ] || [ "$kb" -lt 4500000 ]; then
+            warn "$vm has $((${kb:-0}/1024)) MiB free on $IMG_DIR (< 4.4 GiB): skipping scenarios E-G (grow it: multipass set local.$vm.disk=10G while stopped)"
+            return 1
+        fi
+    done
+}
+
 # ═════════════════════════════════ Main ═════════════════════════════════════
 command -v multipass >/dev/null 2>&1 || die "multipass not found on host — install it first"
 command -v git >/dev/null 2>&1 || die "git not found on host"
@@ -347,6 +456,7 @@ install_stack "$CLIENT_VM"
 
 # ── Phase 2: fresh pools ──
 stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
+remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"   # fresh DB (and no stale -wal/-shm)
 recreate_pool "$SERVER_VM" "$SERVER_POOL"
 recreate_pool "$CLIENT_VM" "$CLIENT_POOL"
 msh "$SERVER_VM" "zfs create -p '$TARGET_DS'" || die "failed to create $TARGET_DS"
@@ -463,6 +573,232 @@ else
     fail "no transfer after client restart within ${SNAP_TIMEOUT}s"
 fi
 
+
+# ═════════════════════ Phase 3: live reload under transfer load ═════════════════════
+if [ "$BIG" -eq 1 ] && big_space_ok; then
+
+echo
+step "SCENARIO E — reload the CLIENT daemon during a large send (2 GiB, throttled to 200 Mbit)"
+stop_daemon "$CLIENT_VM"
+info "writing 2 GiB of random data on the client while its daemon is stopped"
+append_random 2048 big_e.bin || fail "could not write the 2 GiB file"
+throttle_on 200mbit
+start_daemon "$CLIENT_VM"
+if wait_for_proc send_running 240; then
+    pass "a zfs send is running on the client"
+    mark_e="$(loglines "$CLIENT_VM")"
+    rpid_e="$(wpid "$CLIENT_VM" remote)"; spid_e="$(wpid "$CLIENT_VM" snapshot)"
+    sup_e="$(msh "$CLIENT_VM" "systemctl show -p MainPID --value zfsbackup" | tr -d '[:space:]')"
+    info "client supervisor=$sup_e remote worker=$rpid_e snapshot worker=$spid_e"
+    out="$(cli_vm "$CLIENT_VM" set check_interval 20s)"; t_rel="$(date +%s)"
+    g_e="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+    echo "    CLI: $(printf '%s' "$out" | grep 'config updated' | tail -n1)"
+    case "$out" in *"reload requested from daemon pid $sup_e"*) pass "CLI SIGHUPed the client daemon (pid $sup_e)" ;; *) fail "CLI did not report a reload request: $out" ;; esac
+    if wait_log_vm "$CLIENT_VM" "$mark_e" "configuration generation $g_e accepted .*trigger: SIGHUP" 8; then
+        pass "client daemon accepted generation $g_e (trigger: SIGHUP)"
+    else fail "no 'accepted' line for generation $g_e"; fi
+    # the snapshot worker turns over at once, while the send is still running
+    waited=0; until [ "$(wpid "$CLIENT_VM" snapshot)" != "$spid_e" ] || [ "$waited" -ge 40 ]; do sleep 2; waited=$((waited+2)); done
+    if [ "$(wpid "$CLIENT_VM" snapshot)" != "$spid_e" ]; then pass "the snapshot worker switched to the new generation"; else fail "snapshot worker never switched"; fi
+    # while the send runs the remote worker must stay put
+    mid_switch=0; saw_mid=0
+    while send_running; do
+        saw_mid=1
+        if [ "$(wpid "$CLIENT_VM" remote)" != "$rpid_e" ] && send_running; then mid_switch=1; fi
+        sleep 4
+    done
+    t_done="$(date +%s)"; dur=$((t_done - t_rel))
+    if [ "$saw_mid" -eq 1 ]; then pass "the send was still running after the reload was accepted"; else fail "the send finished before it could be observed (too fast?)"; fi
+    check "the remote worker was NOT replaced while its send was running" "0" "$mid_switch"
+    if wait_log_vm "$CLIENT_VM" "$mark_e" "Backup complete: ${SOURCE_DS}@" 90; then pass "the transfer completed ('Backup complete')"; else fail "no 'Backup complete' after the reload"; fi
+    waited=0; until [ "$(wpid "$CLIENT_VM" remote)" != "$rpid_e" ] || [ "$waited" -ge 90 ]; do sleep 2; waited=$((waited+2)); done
+    if [ "$(wpid "$CLIENT_VM" remote)" != "$rpid_e" ]; then pass "the remote worker was replaced after the transfer (pid $rpid_e -> $(wpid "$CLIENT_VM" remote))"; else fail "remote worker never switched"; fi
+    l_done="$(log_lineno "$CLIENT_VM" "$mark_e" 'Backup complete')"; l_swap="$(log_lineno "$CLIENT_VM" "$mark_e" 'Reloaded remote worker')"
+    if [ -n "$l_done" ] && [ -n "$l_swap" ] && [ "$l_done" -lt "$l_swap" ]; then pass "log order: 'Backup complete' (line $l_done) comes before 'Reloaded remote worker' (line $l_swap)"; else
+        fail "log order wrong: Backup complete at '$l_done', Reloaded remote worker at '$l_swap'"; fi
+    if [ "$dur" -ge 65 ]; then
+        if log_since_vm "$CLIENT_VM" "$mark_e" | grep -qE "remote worker \(pid=$rpid_e\) is still finishing work begun under generation"; then
+            pass "send outlived the reload by ${dur}s: the deferral WARNING was logged"
+        else fail "send outlived the reload by ${dur}s but no deferral WARNING was logged"; fi
+    else
+        info "the send finished ${dur}s after the reload (< 60s): the deferral WARNING is not expected"
+    fi
+    check "no transfer failure, crash or traceback logged around the reload" "0" \
+        "$(log_since_vm "$CLIENT_VM" "$mark_e" | grep -cE 'Transfer failed|crash|Traceback')"
+    guid_match_anchor "reloaded-during-send: anchor snapshot byte-identical on the server"
+    anchor_on_server "reloaded-during-send: anchor confirmed on the server"
+else
+    fail "no zfs send observed on the client within 240s"
+fi
+throttle_off
+
+echo
+step "SCENARIO F — reload the SERVER daemon during an inbound receive (512 MiB, throttled to 100 Mbit)"
+cnt_f="$(server_snaps | count)"
+append_random 512 big_f.bin || fail "could not write the 512 MiB file"
+throttle_on 100mbit
+if wait_for_proc recv_running 240; then
+    pass "a zfs receive is running on the server"
+    mark_f="$(loglines "$SERVER_VM")"; mark_fc="$(loglines "$CLIENT_VM")"
+    api_f="$(wpid "$SERVER_VM" api)"
+    sup_f="$(msh "$SERVER_VM" "systemctl show -p MainPID --value zfsbackup" | tr -d '[:space:]')"
+    out="$(cli_vm "$SERVER_VM" set check_interval 2m)"
+    g_f="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+    echo "    CLI: $(printf '%s' "$out" | grep 'config updated' | tail -n1)"
+    case "$out" in *"reload requested from daemon pid $sup_f"*) pass "CLI SIGHUPed the server daemon (pid $sup_f)" ;; *) fail "CLI did not report a reload request: $out" ;; esac
+    if wait_log_vm "$SERVER_VM" "$mark_f" "configuration generation $g_f accepted .*trigger: SIGHUP" 8; then pass "server daemon accepted generation $g_f"; else fail "server never accepted generation $g_f"; fi
+    mid_switch=0; saw_mid=0
+    while recv_running; do
+        saw_mid=1
+        if [ "$(wpid "$SERVER_VM" api)" != "$api_f" ] && recv_running; then mid_switch=1; fi
+        sleep 3
+    done
+    if [ "$saw_mid" -eq 1 ]; then pass "the receive was still running after the reload was accepted"; else fail "the receive finished before it could be observed"; fi
+    check "the API worker was NOT replaced while the receive was running" "0" "$mid_switch"
+    if wait_for_server_count "$((cnt_f+1))" 90; then pass "the receive completed: a new snapshot is on the server"; else fail "no new snapshot reached the server"; fi
+    if wait_log_vm "$CLIENT_VM" "$mark_fc" "Backup complete: ${SOURCE_DS}@" 90; then pass "the client logged 'Backup complete' for the transfer that outlived the server reload"; else fail "client never logged 'Backup complete'"; fi
+    waited=0; until [ "$(wpid "$SERVER_VM" api)" != "$api_f" ] || [ "$waited" -ge 90 ]; do sleep 2; waited=$((waited+2)); done
+    if [ "$(wpid "$SERVER_VM" api)" != "$api_f" ]; then pass "the API worker was replaced after the receive (pid $api_f -> $(wpid "$SERVER_VM" api))"; else fail "API worker never switched"; fi
+    check "no 'Transfer failed' on the client around the server reload" "0" "$(log_since_vm "$CLIENT_VM" "$mark_fc" | grep -c 'Transfer failed')"
+    guid_match_anchor "server-reloaded-during-receive: anchor snapshot byte-identical on the server"
+    anchor_on_server "server-reloaded-during-receive: anchor confirmed on the server"
+else
+    fail "no zfs receive observed on the server within 240s"
+fi
+throttle_off
+
+echo
+step "SCENARIO G — kill -9 the client supervisor mid-send, start a new daemon at once (512 MiB, 100 Mbit)"
+stop_daemon "$CLIENT_VM"
+append_random 512 big_g.bin || fail "could not write the 512 MiB file"
+throttle_on 100mbit
+cnt_g="$(server_snaps | count)"
+start_daemon "$CLIENT_VM" zfsbackup-victim process      # KillMode=process: a worker outlives its supervisor
+if wait_for_proc send_running 240; then
+    pass "a zfs send is running on the client"
+    sup_g="$(msh "$CLIENT_VM" "systemctl show -p MainPID --value zfsbackup-victim" | tr -d '[:space:]')"
+    rpid_g="$(wpid "$CLIENT_VM" remote)"
+    mark_g="$(loglines "$CLIENT_VM")"
+    info "killing supervisor $sup_g (remote worker $rpid_g is mid-send)"
+    msh "$CLIENT_VM" "kill -9 $sup_g" || true
+    start_daemon "$CLIENT_VM" zfsbackup mixed
+    if wait_log_vm "$CLIENT_VM" "$mark_g" "waiting for them to (exit|finish)" 40; then
+        pass "the new daemon logs that it is waiting for the survivor(s) of the killed daemon"
+        echo "    $(log_since_vm "$CLIENT_VM" "$mark_g" | grep -E 'waiting for them to' | head -n1 | cut -c1-220)"
+    else
+        fail "no 'waiting for them to ...' line from the new daemon: $(log_since_vm "$CLIENT_VM" "$mark_g" | tail -n 6 | tr '\n' '|')"
+    fi
+    if msh "$CLIENT_VM" "kill -0 $rpid_g"; then pass "the surviving remote worker (pid $rpid_g) is still alive"; else fail "the surviving worker died with its supervisor"; fi
+    if send_running; then pass "its zfs send is still running"; else warn "the send had already finished"; fi
+    # until the survivor is done, the new daemon must not have started any worker
+    started_early=0
+    while send_running; do
+        [ "$(log_since_vm "$CLIENT_VM" "$mark_g" | grep -cE 'Started .* worker')" -gt 0 ] && started_early=1
+        sleep 3
+    done
+    check "the new daemon started no worker while the survivor was still sending" "0" "$started_early"
+    if wait_log_vm "$CLIENT_VM" "$mark_g" "Backup complete: ${SOURCE_DS}@" 60; then pass "the survivor completed the transfer ('Backup complete')"; else fail "the survivor never completed the transfer"; fi
+    if wait_log_vm "$CLIENT_VM" "$mark_g" "Started remote worker" 120; then pass "the new daemon started its workers after the survivor finished"; else
+        fail "the new daemon never started its workers: $(log_since_vm "$CLIENT_VM" "$mark_g" | tail -n 6 | tr '\n' '|')"; fi
+    l_done="$(log_lineno "$CLIENT_VM" "$mark_g" 'Backup complete')"; l_start="$(log_lineno "$CLIENT_VM" "$mark_g" 'Started .* worker')"
+    if [ -n "$l_done" ] && [ -n "$l_start" ] && [ "$l_done" -lt "$l_start" ]; then pass "log order: 'Backup complete' (line $l_done) precedes the new daemon's first 'Started ... worker' (line $l_start)"; else
+        fail "log order wrong: Backup complete at '$l_done', first Started at '$l_start'"; fi
+    if daemon_running "$CLIENT_VM"; then pass "the new client daemon is running"; else fail "the new client daemon is not running"; fi
+    if wait_for_server_count "$((cnt_g+1))" 60; then pass "the killed daemon's transfer reached the server"; else fail "no new snapshot on the server"; fi
+    guid_match_anchor "kill -9 mid-send: anchor snapshot byte-identical on the server"
+else
+    fail "no zfs send observed on the client within 240s"
+fi
+throttle_off
+fi
+
+
+# ═════════════ Follow-ups round 2026-10-19: rename --clear-stale-props, non-recursive pruning ═════════════
+# Value of a ZFS user property on <vm>:<dataset> when set locally or received; empty if unset/inherited.
+zprop() { msh "$1" "zfs get -H -o value -s local,received '$3' '$2' 2>/dev/null" | tr -d '[:space:]'; }
+# cfgprop.py: decode/rewrite an org.zfsbackup:config value (base64 JSON) inside a VM.
+put_guest_file() { # put_guest_file <vm> <guest-path>   (content on stdin; via multipass transfer, never piped exec)
+    local vm="$1" dst="$2" tmp; tmp="$(mktemp)"; cat > "$tmp"
+    multipass transfer "$tmp" "$vm:/tmp/zfsb-xfer.$$" || die "transfer to $vm:$dst failed"
+    msh "$vm" "install -D -m644 /tmp/zfsb-xfer.$$ '$dst' && rm -f /tmp/zfsb-xfer.$$" || die "install of $dst failed on $vm"
+    rm -f "$tmp"
+}
+CFGPROP_PY="/opt/zfsb-cfgprop.py"
+put_guest_file "$SERVER_VM" "$CFGPROP_PY" <<'PYEOF'
+import base64, json, sys
+# cfgprop.py recursive <value>        -> prints true/false (the "recursive" field)
+# cfgprop.py longret <value> <name>   -> prints a copy renamed <name>, non-recursive, one rule keeping hourly for 10y
+mode, value = sys.argv[1], sys.argv[2]
+data = json.loads(base64.b64decode(value))
+if mode == "recursive":
+    print(str(data["recursive"]).lower())
+else:
+    data["name"] = sys.argv[3]
+    data["recursive"] = False
+    data["retention_rules"] = [{"age": 3600.0, "keep_for": 10 * 365 * 86400.0}]
+    print(base64.b64encode(json.dumps(data, separators=(",", ":")).encode()).decode())
+PYEOF
+
+echo
+step "SCENARIO H — rename dataset --clear-stale-props while the client daemon is RUNNING (verified daemon, Linux)"
+REN_OLD="${CLIENT_POOL}/ren_old"; REN_NEW="${CLIENT_POOL}/ren_new"
+msh "$CLIENT_VM" "zfs create '$REN_OLD' && zfs create '$REN_NEW'" || fail "could not create $REN_OLD / $REN_NEW"
+# Configure ren_old next to the real dataset (import = full replace; the CLI signals the running daemon).
+write_client_config "$SERVER_IP" "  - name: \"${REN_OLD}\"
+    enabled: true
+    frequency: \"30s\"
+    recursive: false
+    retention:
+      \"1m\": \"10m\""
+waited=0; until [ -n "$(zprop "$CLIENT_VM" "$REN_OLD" org.zfsbackup:config)" ] || [ "$waited" -ge 120 ]; do sleep 3; waited=$((waited+3)); done
+if [ -n "$(zprop "$CLIENT_VM" "$REN_OLD" org.zfsbackup:config)" ]; then pass "the running daemon stamped org.zfsbackup:config on $REN_OLD"; else
+    fail "the daemon never set org.zfsbackup:config on $REN_OLD"; fi
+msh "$CLIENT_VM" "zfs set org.zfsbackup:anchor.stale=autosnap_19990101000000 '$REN_OLD'" || fail "could not set a stale anchor"
+sup_h="$(msh "$CLIENT_VM" "systemctl show -p MainPID --value zfsbackup" | tr -d '[:space:]')"
+mark_h="$(loglines "$CLIENT_VM")"
+out="$(cli_vm "$CLIENT_VM" --reload-wait 40 rename dataset "$REN_OLD" "$REN_NEW" --clear-stale-props)"; rc=$?
+echo "$out" | sed 's/^/    CLI: /'
+check "(H) rename --clear-stale-props with a running daemon exits 0" "0" "$rc"
+case "$out" in *"reload requested from daemon pid $sup_h"*) pass "(H) the CLI verified and signalled the running client daemon (pid $sup_h)" ;; *) fail "(H) no reload request reported for pid $sup_h" ;; esac
+case "$out" in *"Cleared on '$REN_OLD': "*) pass "(H) the CLI reports it cleared the stale properties" ;; *) fail "(H) no 'Cleared on' line" ;; esac
+if printf '%s' "$out" | grep -q "Cleared on" && ! printf '%s' "$out" | grep -qE "inherit "; then pass "(H) no 'zfs inherit' fallback commands were printed"; else fail "(H) the CLI fell back to printing zfs inherit commands"; fi
+check "(H) no org.zfsbackup:* property is left on $REN_OLD" "0" \
+    "$(msh "$CLIENT_VM" "zfs get -H -o property -s local,received all '$REN_OLD' | grep -c '^org.zfsbackup:'" | tr -d '[:space:]')"
+wait_log_vm "$CLIENT_VM" "$mark_h" "accepted .*trigger: SIGHUP" 10 && pass "(H) the daemon accepted the rename by SIGHUP" || fail "(H) no 'accepted ... SIGHUP' line for the rename"
+waited=0; until [ -n "$(zprop "$CLIENT_VM" "$REN_NEW" org.zfsbackup:config)" ] || [ "$waited" -ge 120 ]; do sleep 3; waited=$((waited+3)); done
+if [ -n "$(zprop "$CLIENT_VM" "$REN_NEW" org.zfsbackup:config)" ]; then pass "(H) the daemon now manages $REN_NEW (org.zfsbackup:config set there)"; else fail "(H) $REN_NEW never got org.zfsbackup:config"; fi
+sleep 40   # a worker still on the OLD name would re-stamp it within a snapshot cycle
+check "(H) $REN_OLD was not re-stamped by a lingering worker" "" "$(zprop "$CLIENT_VM" "$REN_OLD" org.zfsbackup:config)"
+msh "$CLIENT_VM" "zfs list -H -o name '$REN_OLD' >/dev/null 2>&1" && pass "(H) the old ZFS dataset itself is untouched" || fail "(H) $REN_OLD vanished"
+
+echo
+step "SCENARIO I — received datasets are pruned NON-recursively (a received parent never takes its child's history)"
+# 1. the client dataset becomes recursive: true, which the server's copy receives with the next transfer
+cli_vm "$CLIENT_VM" set "datasets[${SOURCE_DS}].recursive" true | sed 's/^/    CLI: /'
+cnt_i="$(server_snaps | count)"
+if wait_for_server_count "$((cnt_i+1))" "$SNAP_TIMEOUT"; then pass "(I) a transfer ran after the client dataset became recursive"; else fail "(I) no transfer after the recursive change"; fi
+RCV="$(server_ds)"; RCV_CHILD="${RCV}/child"
+rec_prop="$(msh "$SERVER_VM" "'$PY' '$CFGPROP_PY' recursive \"\$(zfs get -H -o value org.zfsbackup:config '$RCV')\"" | tr -d '[:space:]')"
+check "(I) the server's received copy of the dataset carries recursive=true (the client's setting)" "true" "$rec_prop"
+# 2. quiesce the client (no transfer may meet the planted snapshots), then give the received parent a child with
+#    its OWN long retention, and plant old same-named snapshots on both. A recursive destroy of the parent's
+#    old snapshots would also take the child's; retention for the child says keep them (hourly, 10y).
+stop_daemon "$CLIENT_VM"
+msh "$SERVER_VM" "
+    set -e
+    zfs create '$RCV_CHILD'
+    zfs set org.zfsbackup:config=\"\$('$PY' '$CFGPROP_PY' longret \"\$(zfs get -H -o value org.zfsbackup:config '$RCV')\" '$RCV_CHILD')\" '$RCV_CHILD'
+    for d in '$RCV' '$RCV_CHILD'; do zfs snapshot \$d@autosnap_20200101000000; zfs snapshot \$d@autosnap_20210101000000; done
+" || fail "(I) could not set up the child and the planted snapshots on the server"
+planted() { msh "$SERVER_VM" "zfs list -H -t snapshot -o name '$1' 2>/dev/null | grep -c 'autosnap_202[01]0101000000'" | tr -d '[:space:]'; }
+check "(I) precondition: 2 planted snapshots on the parent and 2 on the child" "2 2" "$(planted "$RCV") $(planted "$RCV_CHILD")"
+# 3. speed the server's pruner up (live reload through the CLI), then wait for the parent's old snapshots to go
+cli_vm "$SERVER_VM" set prune_interval 20s | sed 's/^/    CLI: /'
+waited=0; until [ "$(planted "$RCV")" = "0" ] || [ "$waited" -ge 150 ]; do sleep 5; waited=$((waited+5)); done
+check "(I) the server pruned the parent's old snapshots" "0" "$(planted "$RCV")"
+check "(I) the child's same-named snapshots survived (pruning the parent is not recursive)" "2" "$(planted "$RCV_CHILD")"
+check "(I) the child dataset still exists" "yes" "$(msh "$SERVER_VM" "zfs list -H -o name '$RCV_CHILD' >/dev/null 2>&1 && echo yes || echo no" | tr -d '[:space:]')"
+check "(I) no 'Failed' / traceback in the server log around the prune" "0" "$(msh "$SERVER_VM" "tail -n 200 '$LOG' | grep -cE 'Traceback|Failed to'" | tr -d '[:space:]')"
 echo
 echo "${YELLOW}NOTE:${NC} snapshot-resume (interrupted transfer) is NOT tested — the server never"
 echo "      reads the client's ?from= token (dead code) and the feature is unfinished."
@@ -485,6 +821,7 @@ if [ "$KEEP" -eq 1 ]; then
 else
     step "Tearing down"
     stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
+    remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"
     if [ "$KEEP_POOLS" -eq 0 ]; then
         destroy_pool "$SERVER_VM" "$SERVER_POOL"
         destroy_pool "$CLIENT_VM" "$CLIENT_POOL"
@@ -493,8 +830,8 @@ else
         info "pools left in place (--keep-pools)"
     fi
     if [ "$PURGE" -eq 1 ]; then
-        info "deleting VMs (--purge)"
-        multipass delete "$SERVER_VM" "$CLIENT_VM" && multipass purge
+        info "deleting VMs (--purge; these two only, never a global purge)"
+        multipass delete --purge "$SERVER_VM" && multipass delete --purge "$CLIENT_VM"
     else
         info "VMs left running for reuse (use --purge to delete them)"
     fi

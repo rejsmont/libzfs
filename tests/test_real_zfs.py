@@ -418,6 +418,41 @@ class TestRealExecOutThreadCleanup:
             zfs.destroy(parent, destroy=True, recursive=True)
 
 
+class TestRealGetLargeOutput:
+    """`zfs get all -r` over enough datasets that stdout exceeds 64 KB (the OS pipe buffer).
+
+    The mocked suite and tests/test_commands.py::TestExecRealPipes prove the exec path with a
+    stand-in child; this proves the same non-blocking, complete read against real `zfs` output.
+    """
+
+    DATASETS = 25  # ~80+ properties per dataset: comfortably past 64 KB
+
+    def test_get_all_recursive_exceeds_pipe_buffer(self, test_pool):
+        parent_name = f'{test_pool}/test_get_large'
+        parent = zfs.create.filesystem(parent_name)
+        try:
+            names = [parent_name]
+            for i in range(self.DATASETS):
+                zfs.create.filesystem(f'{parent_name}/child{i}')
+                names.append(f'{parent_name}/child{i}')
+
+            # Sanity: the raw output really is larger than a pipe buffer.
+            raw = subprocess.run(
+                [_zfs_cmd(), 'get', '-H', '-r', '-o', 'name,property,value,received,source',
+                 'all', parent_name],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            assert len(raw.encode()) > 64 * 1024, 'not enough output to exercise the pipe buffer'
+
+            result = zfs.get(parent, properties='all', recursive=True)
+
+            assert sorted(o.name for o in result) == sorted(names)
+            assert all(isinstance(o, Filesystem) for o in result)
+            assert all(o['compression'].value for o in result)
+        finally:
+            zfs.destroy(parent, destroy=True, recursive=True)
+
+
 class TestRealSendReceiveStreamHandle:
     """Regression tests for the StreamHandle fix: zfs.send/zfs.receive now
     return a context-manager wrapper whose close()/__exit__ waits for the

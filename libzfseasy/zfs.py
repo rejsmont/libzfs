@@ -602,7 +602,8 @@ class RenameCommand(Command):
     def filesystem(cls, dataset: Filesystem, name: str, mount: bool = True, force: bool = False,
                    parents: bool = False) -> Filesystem:
 
-        new = Filesystem(name, dict(dataset.properties))
+        new = Filesystem(name)
+        new.update(dict(dataset.properties), lenient=True)
         cmd = cls._base(force, parents)
         if not mount:
             cmd += ['-u']
@@ -614,7 +615,8 @@ class RenameCommand(Command):
     @classmethod
     def volume(cls, dataset: Volume, name: str, force: bool = False, parents: bool = False) -> Volume:
 
-        new = Volume(name, dict(dataset.properties))
+        new = Volume(name)
+        new.update(dict(dataset.properties), lenient=True)
         cmd = cls._base(force, parents)
         cmd += [str(dataset), str(new)]
         cls._exec(cmd)
@@ -628,7 +630,8 @@ class RenameCommand(Command):
             name = new_snap.short
             if str(new_snap.dataset) != str(snapshot.dataset):
                 raise ValueError('Snapshots can only be renamed within the parent dataset')
-        new = Snapshot(snapshot.dataset, name, dict(snapshot.properties))
+        new = Snapshot(snapshot.dataset, name)
+        new.update(dict(snapshot.properties), lenient=True)
         cmd = cls._base(force, parents)
         cmd += [str(snapshot), str(new)]
         cls._exec(cmd)
@@ -808,16 +811,26 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
                 properties.pop('name', None)
                 dstype = properties.pop('type', None)
                 if name and dstype:
-                    yield ZFS.from_name(dsname, dstype, properties)
+                    yield GetCommand._build(dsname, dstype, properties)
                 dsname, properties = '', {}
             if prop == 'type':
                 properties[prop] = value
-            elif 'all' in sources or source in sources:
+            elif 'all' in sources or source in sources or \
+                    ('inherited' in sources and source.startswith('inherited from ')):
                 properties[prop] = Property(value, source, received)
         properties.pop('name', None)
         dstype = properties.pop('type', None)
         if name and dstype:
-            yield ZFS.from_name(dsname, dstype, properties)
+            yield GetCommand._build(dsname, dstype, properties)
+
+    @staticmethod
+    def _build(name: str, dstype: str, properties: Properties) -> ZFS:
+        # The property names come from zfs itself (the caller's own names were validated strictly before the command
+        # ran), so accept well-formed native names this library does not know yet (a newer OpenZFS adding a property
+        # must not break `zfs get all`).
+        obj = ZFS.from_name(name, dstype)
+        obj.update(properties, lenient=True)
+        return obj
 
 
 class SetCommand(Command):
@@ -828,6 +841,9 @@ class SetCommand(Command):
     @classmethod
     def _set(cls, ds: Datasets, properties: Properties) -> Datasets:
 
+        # Reject invalid caller-supplied names before anything reaches zfs.
+        for k in properties:
+            ds.check_property(k)
         cmd = [_zfs_cmd(), 'set'] + cls._get_props(properties) + [str(ds)]
         cls._exec(cmd)
         ds.update(properties)
@@ -855,6 +871,10 @@ class InheritCommand(Command):
 
         if isinstance(props, str):
             props = [props]
+
+        # Reject invalid caller-supplied names before anything reaches zfs.
+        for prop in props:
+            ds.check_property(prop)
 
         for prop in props:
             cmd = [_zfs_cmd(), 'inherit', prop] + cls._get_options(recursive=recursive, received=received) + [str(ds)]
@@ -1077,10 +1097,29 @@ class SendCommand(Command):
             return process.stdout
         elif rc is not None:
             if rc != 0:
+                StreamHandle._close_pipe(getattr(process, 'stdout', None))
+                StreamHandle._close_pipe(getattr(process, 'stderr', None))
                 raise Exception('\n'.join(errors))
             return False
         else:
-            return None
+            # stdout hit EOF while the child is still running. Returning None would make the caller's
+            # `while True` loop spin on peek()/poll() until it exits (cf. _exec_capture). Drain stderr to its end
+            # *first* (a bare wait() could deadlock on a full stderr pipe), then block until the child exits.
+            if getattr(process, 'stderr', None):
+                try:
+                    remainder = process.stderr.read().decode('utf-8', errors='replace')
+                    for line in remainder.splitlines():
+                        error = line.strip()
+                        if error:
+                            errors.append(error[0].upper() + error[1:])
+                except Exception:
+                    pass
+            rc = process.wait()
+            if rc != 0:
+                StreamHandle._close_pipe(getattr(process, 'stdout', None))
+                StreamHandle._close_pipe(getattr(process, 'stderr', None))
+                raise Exception('\n'.join(errors))
+            return False
 
 
 class ReceiveCommand(Command, StringListArgument):

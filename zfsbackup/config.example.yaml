@@ -10,11 +10,17 @@
 snapshot_prefix: "autosnap"   # Prefix for all managed snapshots
 check_interval: "5m"          # How often the snapshot worker checks for due snapshots
 prune_interval: "1h"          # How often the pruning worker applies retention policy
+                              # (omit this key to follow check_interval instead)
 api_host: "127.0.0.1"         # Address the API worker binds to
 api_port: 8080                # Port the API worker listens on
 dry_run: false                # Set to true to test without creating/destroying snapshots
 
-# Client identity file (auto-generated as <hostname>-<uuid8> on first run)
+# Client identity file (auto-generated as <hostname>-<uuid8> on first run).
+# If omitted, defaults to ~/.config/zfsbackup/client_id, resolved against
+# $HOME in the *daemon's* process at run time -- not the user who imports
+# or edits this config. Set an explicit absolute path here if the daemon
+# runs as a different user (e.g. under sudo/systemd) than whoever manages
+# the config, to avoid silently generating a new client identity.
 # client_id_file: "/var/lib/zfsbackup/client_id"
 
 # Remote backup destinations (client side)

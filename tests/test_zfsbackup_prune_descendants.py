@@ -1,0 +1,875 @@
+"""F2: a recursive dataset's prune must not destroy a snapshot a descendant needs.
+
+`zfs destroy -r pool/d@snap` also destroys `@snap` on every descendant. So
+`DatasetManager.prune_snapshots` for a recursive dataset first reads, in one
+`zfs get -r`, every `org.zfsbackup:anchor.*` set on a descendant, and asks the
+retention of every enabled, configured descendant which snapshots it keeps;
+those names are dropped from the candidates BEFORE batching. Anything it cannot
+establish makes it skip the dataset for the cycle.
+
+Fixture: parent `pool/d` (recursive) has snapshots A (newest), B and C (oldest).
+Its retention (interval 1h, keep 2h) keeps only A, so B and C are the
+candidates. Descendants are described by the fake `zfs` layer below.
+"""
+
+import logging
+from unittest.mock import MagicMock
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+import libzfseasy as zfs
+from libzfseasy.types import Filesystem, Snapshot as ZFSSnapshot
+from zfsbackup.backup_manager import (
+    PROP_ANCHOR_PREFIX as ANCHOR,
+    PROP_CLIENT_ID,
+    PROP_CONFIG,
+    DatasetInfo,
+    DatasetManager,
+    SnapshotInfo,
+    _parse_zfsbackup_get,
+    read_descendant_zfsbackup_properties,
+    read_zfsbackup_properties,
+)
+from libzfseasy.types import Dataset
+from zfsbackup.config import BackupConfig, DatasetConfig, RetentionRule
+
+PARENT = 'pool/d'
+CHILD = 'pool/d/c'
+PREFIX = 'autosnap'
+
+
+def snap_name(hours_old, minutes_old=0):
+    dt = datetime.now(timezone.utc) - timedelta(hours=hours_old, minutes=minutes_old)
+    return f"{PREFIX}_{dt.strftime('%Y%m%d%H%M%S')}"
+
+
+# Distinct names, newest first. A is 10 minutes old; B and C are older than the
+# parent's 2 h keep, so the parent's retention prunes exactly B and C.
+A = snap_name(0, 10)
+B = snap_name(3)
+C = snap_name(4)
+D = snap_name(0, 5)          # a snapshot only a child has, newer than all of A, B, C
+
+
+def retention(keep_hours, interval_hours=1):
+    return [RetentionRule(timedelta(hours=interval_hours), timedelta(hours=keep_hours))]
+
+
+def zget(name, props, ptype='filesystem'):
+    """`zfs get -H -o name,property,value,received,source all <name>` lines."""
+    lines = [f'{name}\tname\t{name}\t-\t-\n', f'{name}\ttype\t{ptype}\t-\t-\n']
+    for prop, value, source in props:
+        received = value if source == 'received' else '-'
+        lines.append(f'{name}\t{prop}\t{value}\t{received}\t{source}\n')
+    return lines
+
+
+class FakeZfs:
+    """Replaces `zfs.get._exec_out`, `zfs.list` and `zfs.destroy` as the
+    prune sees them, and records what was asked."""
+
+    def __init__(self, mocker):
+        self.snaps = {PARENT: [A, B, C]}
+        self.props = {}                      # dataset -> [(property, value, source)]
+        self.extra_rows = []                 # raw lines appended to a `-r` listing
+        self.recursive_get_error = None
+        self.plain_get_error = None
+        self.list_errors = set()
+        self.missing = set()                 # datasets `zfs.exists` reports absent
+        self.exists_errors = {}              # dataset -> message `zfs.exists` raises
+        self.exists_calls = []
+        self.get_cmds = []
+        self.list_roots = []
+        self.list_recursive = []             # (root, recursive) of each snapshot listing
+        self.received = []                   # datasets `received_datasets()` finds
+        self.destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
+        mocker.patch.object(zfs.get, '_exec_out', side_effect=self._get)
+        mocker.patch('zfsbackup.backup_manager.zfs.list', side_effect=self._list)
+
+    # -- zfs get -------------------------------------------------------------
+    def _get(self, cmd):
+        self.get_cmds.append(list(cmd))
+        root = cmd[-1]
+        if '-r' in cmd:
+            if self.recursive_get_error:
+                raise RuntimeError(self.recursive_get_error)
+            lines = []
+            for name in sorted(self.props):
+                if name == root or name.startswith(root + '/'):
+                    lines += zget(name, self.props[name])
+            # the parent's snapshot and bookmark rows must never count
+            lines += self.extra_rows
+            return iter(lines)
+        if self.plain_get_error:
+            raise RuntimeError(self.plain_get_error)
+        return iter(zget(root, self.props.get(root, [])))
+
+    # -- zfs list ------------------------------------------------------------
+    def _list(self, roots=None, types=None, recursive=False, properties=None, **kw):
+        if types is None:
+            # `zfs.exists(ds)` -> module-level `list(roots=ds)`
+            self.exists_calls.append(roots.name)
+            if roots.name in self.exists_errors:
+                raise RuntimeError(self.exists_errors[roots.name])
+            if roots.name in self.missing:
+                raise RuntimeError(f"cannot open '{roots.name}': dataset does not exist")
+            return [Filesystem(roots.name)]
+        if types == 'filesystem':            # DatasetManager.received_datasets()
+            return list(self.received)
+        assert types == 'snapshot', f'unexpected zfs.list(types={types!r})'
+        self.list_roots.append(roots.name)
+        self.list_recursive.append((roots.name, recursive))
+        if roots.name in self.list_errors:
+            raise RuntimeError(f'cannot open {roots.name}')
+        fs = Filesystem(roots.name)
+        return [ZFSSnapshot(fs, n) for n in self.snaps.get(roots.name, [])]
+
+    # -- results -------------------------------------------------------------
+    @property
+    def recursive_gets(self):
+        return [c for c in self.get_cmds if '-r' in c]
+
+    @property
+    def destroyed(self):
+        """Short names of every snapshot given to `zfs.destroy`, in order."""
+        return [s.short for call in self.destroy.call_args_list for s in call.args[0]]
+
+    @property
+    def destroy_batches(self):
+        return [[s.short for s in call.args[0]] for call in self.destroy.call_args_list]
+
+
+@pytest.fixture
+def fz(mocker):
+    return FakeZfs(mocker)
+
+
+def make_manager(*children, recursive=True, dry_run=False, parent_rules=None):
+    """A manager with the recursive parent plus `children` (DatasetConfigs)."""
+    parent = DatasetConfig(
+        name=PARENT, recursive=recursive,
+        retention_rules=retention(2) if parent_rules is None else parent_rules,
+    )
+    config = BackupConfig(
+        datasets=[parent, *children], snapshot_prefix=PREFIX, dry_run=dry_run,
+    )
+    manager = DatasetManager(config)
+    parent_dsi = next(d for d in manager.datasets if d.name == PARENT)
+    return manager, parent_dsi
+
+
+def child_cfg(name=CHILD, keep_hours=2, enabled=True):
+    return DatasetConfig(name=name, retention_rules=retention(keep_hours), enabled=enabled)
+
+
+def prune(manager, dsi):
+    manager.prune_snapshots(dsi)
+
+
+class TestUnconfiguredDescendants:
+    def test_a_child_without_anchors_protects_nothing(self, fz):
+        fz.props[CHILD] = []
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+        call = fz.destroy.call_args
+        assert call.kwargs == {'destroy': True, 'recursive': True}
+        assert len(fz.recursive_gets) == 1
+
+    def test_a_local_child_anchor_keeps_that_snapshot_and_only_that(self, fz, caplog):
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        manager, dsi = make_manager()
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+        assert fz.destroyed == [B]
+        assert f'{PARENT}@{C}' in caplog.text
+        assert f'{ANCHOR}x on {CHILD}' in caplog.text
+        assert '(recursive prune)' in caplog.text
+        assert 'has 1 snapshots to prune' in caplog.text
+
+    def test_a_received_child_anchor_keeps_it_too(self, fz):
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'received')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.destroyed == [B]
+
+    def test_a_grandchild_anchor_counts(self, fz):
+        fz.props[CHILD + '/g'] = [(ANCHOR + 'x', B, 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.destroyed == [C]
+
+    def test_anchors_of_several_children_protect_the_union(self, fz):
+        fz.props['pool/d/c1'] = [(ANCHOR + 'x', B, 'local')]
+        fz.props['pool/d/c2'] = [(ANCHOR + 'y', C, 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()
+
+    def test_a_child_anchor_naming_a_non_candidate_protects_nothing_here(self, fz):
+        fz.props[CHILD] = [(ANCHOR + 'x', A, 'local'), (ANCHOR + 'y', 'ghost', 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+
+    @pytest.mark.parametrize('value', ['-', ''])
+    def test_a_blank_child_anchor_protects_nothing(self, fz, value):
+        fz.props[CHILD] = [(ANCHOR + 'x', value, 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+
+    def test_a_non_anchor_child_property_protects_nothing(self, fz):
+        fz.props[CHILD] = [(PROP_CONFIG, C, 'local'), ('org.zfsbackup:client_id', C, 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+
+    def test_an_unconfigured_child_is_never_listed(self, fz):
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert CHILD not in fz.list_roots
+
+    def test_a_child_anchor_released_next_cycle_lets_the_snapshot_go(self, fz):
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.destroyed == [B]
+        fz.props[CHILD] = []
+        fz.destroy.reset_mock()
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+
+
+class TestConfiguredDescendants:
+    def test_a_child_whose_retention_keeps_c_keeps_it_for_the_parent(self, fz, caplog):
+        # The child's own snapshots: D (newest, always kept) and C (4h old, inside 10h).
+        fz.snaps[CHILD] = [D, C]
+        manager, dsi = make_manager(child_cfg(keep_hours=10))
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+        assert fz.destroyed == [B]
+        assert f'retention of {CHILD} keeps it' in caplog.text
+        assert CHILD in fz.list_roots
+
+    def test_a_generous_child_protects_everything_so_nothing_is_destroyed(self, fz):
+        fz.snaps[CHILD] = [A, B, C]
+        manager, dsi = make_manager(child_cfg(keep_hours=100))
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()
+
+    def test_the_childs_own_newest_snapshot_is_kept_even_if_its_retention_would_prune_it(self, fz):
+        # B is the child's only snapshot, so its newest: always kept, whatever the rules say.
+        fz.snaps[CHILD] = [B]
+        manager, dsi = make_manager(child_cfg(keep_hours=1))
+        prune(manager, dsi)
+        assert fz.destroyed == [C]
+
+    def test_a_child_whose_retention_prunes_c_does_not_protect_it(self, fz):
+        fz.snaps[CHILD] = [A, B, C]
+        manager, dsi = make_manager(child_cfg(keep_hours=2))
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+
+    def test_a_child_anchor_still_protects_what_its_retention_would_prune(self, fz):
+        fz.snaps[CHILD] = [A, B, C]
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        manager, dsi = make_manager(child_cfg(keep_hours=2))
+        prune(manager, dsi)
+        assert fz.destroyed == [B]
+
+    def test_listing_a_child_does_not_replace_the_managers_own_snapshot_list(self, fz):
+        fz.snaps[CHILD] = [D, C]
+        manager, dsi = make_manager(child_cfg(keep_hours=10))
+        child_dsi = next(d for d in manager.datasets if d.name == CHILD)
+        sentinel = []
+        child_dsi.snapshots = sentinel
+        prune(manager, dsi)
+        assert child_dsi.snapshots is sentinel and sentinel == []
+
+    def test_a_configured_sibling_with_a_shared_name_prefix_is_not_a_descendant(self, fz):
+        fz.snaps['pool/dx'] = [C]
+        manager, dsi = make_manager(child_cfg(name='pool/dx', keep_hours=100))
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+        assert 'pool/dx' not in fz.list_roots
+
+    def test_the_parent_itself_is_not_its_own_descendant(self, fz):
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.list_roots.count(PARENT) == 1      # only the parent's own snapshot listing
+
+    def test_nothing_to_prune_means_no_descendant_evaluation(self, fz):
+        fz.snaps = {PARENT: [A]}
+        fz.list_errors.add(CHILD)
+        manager, dsi = make_manager(child_cfg())
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()
+        assert CHILD not in fz.list_roots
+
+
+class TestDisabledDescendants:
+    def test_a_disabled_child_with_an_anchor_still_protects(self, fz):
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        manager, dsi = make_manager(child_cfg(enabled=False))
+        assert CHILD not in [d.name for d in manager.datasets]
+        prune(manager, dsi)
+        assert fz.destroyed == [B]
+
+    def test_a_disabled_child_without_an_anchor_protects_nothing_by_retention(self, fz):
+        # Its retention would keep everything, but a disabled dataset is not evaluated.
+        fz.snaps[CHILD] = [A, B, C]
+        manager, dsi = make_manager(child_cfg(keep_hours=100, enabled=False))
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+        assert CHILD not in fz.list_roots
+
+
+class TestParentAnchorsUnchanged:
+    def test_a_parent_anchor_keeps_its_snapshot(self, fz, caplog):
+        fz.props[PARENT] = [(ANCHOR + 'offsite', C, 'local')]
+        manager, dsi = make_manager()
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+        assert fz.destroyed == [B]
+        assert '(recursive prune)' not in caplog.text       # existing path, not the descendant filter
+
+    def test_a_parent_anchor_is_not_misread_as_a_descendant_one(self, fz):
+        fz.props[PARENT] = [(ANCHOR + 'offsite', C, 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        # the recursive read does return the parent's rows; only the parent path may use them
+        assert fz.destroyed == [B]
+        assert len(fz.recursive_gets) == 1
+
+    def test_parent_and_child_anchors_combine(self, fz):
+        fz.props[PARENT] = [(ANCHOR + 'offsite', B, 'local')]
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()
+
+    def test_a_parent_snapshot_or_bookmark_row_in_the_recursive_listing_is_ignored(self, fz):
+        fz.extra_rows = [
+            f'{PARENT}@{A}\t{ANCHOR}x\t{C}\t-\tlocal\n',
+            f'{PARENT}#bm\t{ANCHOR}x\t{C}\t-\tlocal\n',
+        ]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+
+
+class TestDryRun:
+    def test_dry_run_logs_only_unprotected_names_and_destroys_nothing(self, fz, caplog):
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        manager, dsi = make_manager(dry_run=True)
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+        fz.destroy.assert_not_called()
+        would = [r.getMessage() for r in caplog.records if 'Would prune snapshots' in r.getMessage()]
+        assert len(would) == 1
+        assert f'{PARENT}@{B}' in would[0]
+        assert f'{PARENT}@{C}' not in would[0]
+
+    def test_dry_run_with_everything_protected_logs_no_would_prune(self, fz, caplog):
+        fz.props[CHILD] = [(ANCHOR + 'x', B, 'local'), (ANCHOR + 'y', C, 'local')]
+        manager, dsi = make_manager(dry_run=True)
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+        assert 'Would prune' not in caplog.text
+        assert 'has 0 snapshots to prune' in caplog.text
+
+
+class TestNonRecursiveParent:
+    def test_no_recursive_get_and_children_are_not_listed(self, fz):
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        fz.snaps[CHILD] = [A, B, C]
+        manager, dsi = make_manager(child_cfg(keep_hours=100), recursive=False)
+        prune(manager, dsi)
+        assert fz.recursive_gets == []
+        assert CHILD not in fz.list_roots
+        assert fz.destroyed == [B, C]
+        assert fz.destroy.call_args.kwargs == {'destroy': True, 'recursive': False}
+
+    def test_the_single_get_is_for_the_dataset_alone(self, fz):
+        manager, dsi = make_manager(recursive=False)
+        prune(manager, dsi)
+        assert [c[-1] for c in fz.get_cmds] == [PARENT]
+
+
+class TestUnknownProtectSetSkipsThePrune:
+    def test_a_failing_recursive_get_skips_pruning_with_an_error(self, fz, caplog):
+        fz.recursive_get_error = "cannot open 'pool/d': dataset does not exist"
+        manager, dsi = make_manager()
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+        fz.destroy.assert_not_called()
+        errors = [r for r in caplog.records if r.levelname == 'ERROR']
+        assert len(errors) == 1
+        assert f'Cannot read anchors for {PARENT}; skipping pruning this cycle' in errors[0].getMessage()
+        assert 'dataset does not exist' in errors[0].getMessage()
+
+    def test_a_failing_plain_get_skips_pruning_too(self, fz, caplog):
+        fz.plain_get_error = 'boom'
+        manager, dsi = make_manager()
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+        fz.destroy.assert_not_called()
+        assert 'Cannot read anchors' in caplog.text and fz.recursive_gets == []
+
+    def test_a_failing_child_listing_skips_pruning_with_an_error(self, fz, caplog):
+        fz.list_errors.add(CHILD)
+        manager, dsi = make_manager(child_cfg())
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+        fz.destroy.assert_not_called()
+        errors = [r for r in caplog.records if r.levelname == 'ERROR']
+        assert len(errors) == 1
+        assert f'Cannot evaluate descendants of {PARENT}; skipping pruning this cycle' in errors[0].getMessage()
+        assert f'cannot open {CHILD}' in errors[0].getMessage()
+
+    def test_a_failing_child_listing_does_not_skip_a_non_recursive_parent(self, fz):
+        fz.list_errors.add(CHILD)
+        manager, dsi = make_manager(child_cfg(), recursive=False)
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+
+    def test_a_good_cycle_after_a_failed_one_prunes(self, fz):
+        fz.recursive_get_error = 'transient'
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()
+        fz.recursive_get_error = None
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+
+
+class TestAnnouncedOncePerDatasetAndName:
+    def info_lines(self, caplog, snap):
+        return [r for r in caplog.records
+                if r.levelname == 'INFO' and f'keeping {PARENT}@{snap}' in r.getMessage()]
+
+    def test_repeated_cycles_log_the_hold_once(self, fz, caplog):
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        manager, dsi = make_manager()
+        with caplog.at_level(logging.INFO):
+            for _ in range(4):
+                prune(manager, dsi)
+        assert len(self.info_lines(caplog, C)) == 1
+        assert manager._descendant_protect_noted == {(PARENT, C)}
+
+    def test_each_name_is_announced_once_when_it_first_appears(self, fz, caplog):
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        manager, dsi = make_manager()
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+            prune(manager, dsi)
+            fz.props[CHILD] = [(ANCHOR + 'x', C, 'local'), (ANCHOR + 'y', B, 'local')]
+            prune(manager, dsi)
+            prune(manager, dsi)
+        assert len(self.info_lines(caplog, C)) == 1
+        assert len(self.info_lines(caplog, B)) == 1
+
+    def test_a_new_manager_announces_again(self, fz, caplog):
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        with caplog.at_level(logging.INFO):
+            for _ in range(2):
+                manager, dsi = make_manager()
+                prune(manager, dsi)
+        assert len(self.info_lines(caplog, C)) == 2
+
+    def test_the_same_name_on_another_dataset_is_a_separate_announcement(self, fz, caplog):
+        other = 'pool/e'
+        fz.snaps[other] = [A, B, C]
+        fz.props['pool/e/c'] = [(ANCHOR + 'x', C, 'local')]
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        parent2 = DatasetConfig(name=other, recursive=True, retention_rules=retention(2))
+        manager, dsi = make_manager(parent2)
+        dsi2 = next(d for d in manager.datasets if d.name == other)
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+            prune(manager, dsi2)
+        assert manager._descendant_protect_noted == {(PARENT, C), (other, C)}
+
+
+class TestBatching:
+    def test_protected_names_are_dropped_before_batching(self, fz):
+        names = [snap_name(3 + i) for i in range(45)]
+        fz.snaps[PARENT] = [A, *names]
+        protected = names[5:10]
+        fz.props[CHILD] = [(ANCHOR + f'p{i}', n, 'local') for i, n in enumerate(protected)]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert [len(b) for b in fz.destroy_batches] == [20, 20]
+        assert not set(protected) & set(fz.destroyed)
+        assert set(fz.destroyed) == set(names) - set(protected)
+
+
+# ---------------------------------------------------------------------------
+# The reader on its own
+# ---------------------------------------------------------------------------
+
+def _cmds(mock_subprocess):
+    return [c.args[0] for c in mock_subprocess.call_args_list]
+
+
+def _fail_get(mock_subprocess, stderr):
+    proc = mock_subprocess.setup(stdout=[], stderr=stderr, returncode=1)
+    proc.poll.side_effect = None
+    proc.poll.return_value = 1
+    return proc
+
+
+class TestReadDescendantZfsbackupProperties:
+    def test_the_command_is_one_recursive_filesystem_and_volume_get_of_local_and_received(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        read_descendant_zfsbackup_properties(Filesystem(PARENT))
+        (cmd,) = _cmds(mock_subprocess)
+        assert cmd[1:] == [
+            'get', '-r', '-t', 'filesystem,volume', '-H',
+            '-o', 'name,property,value,received,source',
+            '-s', 'local,received', 'all', PARENT,
+        ]
+
+    def test_the_parent_is_excluded_and_only_strict_descendants_count(self, mock_subprocess):
+        mock_subprocess.setup(stdout=(
+            zget(PARENT, [(ANCHOR + 'p', 'parent-snap', 'local')])
+            + zget(CHILD, [(ANCHOR + 'x', 'child-snap', 'local')])
+            + zget(CHILD + '/g', [(PROP_CONFIG, 'cfg', 'local')])
+            + zget('pool/dx', [(ANCHOR + 'z', 'sibling', 'local')])
+            + zget('pool/dx/c', [(ANCHOR + 'z', 'sibling', 'local')])
+            + zget('pool', [(ANCHOR + 'z', 'ancestor', 'local')])
+        ))
+        assert read_descendant_zfsbackup_properties(Filesystem(PARENT)) == {
+            CHILD: {ANCHOR + 'x': 'child-snap'},
+            CHILD + '/g': {PROP_CONFIG: 'cfg'},
+        }
+
+    def test_snapshot_and_bookmark_rows_are_excluded(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[
+            f'{CHILD}@s\t{ANCHOR}x\tv\t-\tlocal\n',
+            f'{PARENT}@s\t{ANCHOR}x\tv\t-\tlocal\n',
+            f'{CHILD}#bm\t{ANCHOR}x\tv\t-\tlocal\n',
+            *zget(CHILD, [(ANCHOR + 'y', 'kept', 'local')]),
+        ])
+        assert read_descendant_zfsbackup_properties(Filesystem(PARENT)) == {
+            CHILD: {ANCHOR + 'y': 'kept'},
+        }
+
+    @pytest.mark.parametrize('source', ['inherited from pool/d', 'default', 'temporary', '-'])
+    def test_inherited_default_and_temporary_rows_are_ignored(self, mock_subprocess, source):
+        mock_subprocess.setup(stdout=zget(CHILD, [(ANCHOR + 'x', 'v', source), (PROP_CONFIG, 'c', source)]))
+        assert read_descendant_zfsbackup_properties(Filesystem(PARENT)) == {}
+
+    def test_a_received_row_is_read_with_its_value(self, mock_subprocess):
+        mock_subprocess.setup(stdout=zget(CHILD, [(ANCHOR + 'x', 'snap-1', 'received')]))
+        assert read_descendant_zfsbackup_properties(Filesystem(PARENT)) == {
+            CHILD: {ANCHOR + 'x': 'snap-1'},
+        }
+
+    def test_a_tab_inside_a_value_is_preserved(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[
+            f'{CHILD}\t{ANCHOR}tab\tva\tlue\t-\tlocal\n',
+            f'{CHILD}\t{ANCHOR}rtab\tre\tceived\tre\tceived\treceived\n',
+        ])
+        assert read_descendant_zfsbackup_properties(Filesystem(PARENT)) == {
+            CHILD: {ANCHOR + 'tab': 'va\tlue', ANCHOR + 'rtab': 're\tceived'},
+        }
+
+    def test_non_zfsbackup_properties_and_short_lines_are_ignored(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[
+            f'{CHILD}\tcompression\tlz4\t-\tlocal\n',
+            f'{CHILD}\torg.other:anchor.x\tv\t-\tlocal\n',
+            'garbage\n',
+            f'{CHILD}\t{ANCHOR}x\n',
+            '\n',
+        ])
+        assert read_descendant_zfsbackup_properties(Filesystem(PARENT)) == {}
+
+    def test_empty_output_is_empty(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        assert read_descendant_zfsbackup_properties(Filesystem(PARENT)) == {}
+
+    def test_works_on_a_plain_dataset_object(self, mock_subprocess):
+        mock_subprocess.setup(stdout=zget(CHILD, [(ANCHOR + 'x', 'v', 'local')]))
+        assert read_descendant_zfsbackup_properties(Dataset(PARENT)) == {CHILD: {ANCHOR + 'x': 'v'}}
+
+    def test_a_zfs_get_failure_raises(self, mock_subprocess):
+        _fail_get(mock_subprocess, "cannot open 'pool/d': dataset does not exist")
+        with pytest.raises(Exception, match='dataset does not exist'):
+            read_descendant_zfsbackup_properties(Filesystem(PARENT))
+
+
+class TestSingleDatasetReaderIsUnchanged:
+    def test_the_command_has_no_recursion_and_no_type_filter(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        read_zfsbackup_properties(Filesystem('pool/data'))
+        (cmd,) = _cmds(mock_subprocess)
+        assert cmd[1:] == [
+            'get', '-H', '-o', 'name,property,value,received,source',
+            '-s', 'local,received', 'all', 'pool/data',
+        ]
+        assert '-r' not in cmd and '-t' not in cmd
+
+    def test_descendant_rows_are_still_excluded(self, mock_subprocess):
+        mock_subprocess.setup(stdout=(
+            zget('pool/data', [(PROP_CONFIG, 'parent', 'local')])
+            + zget('pool/data/child', [(ANCHOR + 'x', 'child', 'local')])
+        ))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {PROP_CONFIG: 'parent'}
+
+
+class TestParseZfsbackupGet:
+    def test_accept_filters_by_dataset_name(self):
+        lines = zget('a', [(ANCHOR + 'x', '1', 'local')]) + zget('b', [(ANCHOR + 'x', '2', 'local')])
+        assert _parse_zfsbackup_get(lines, lambda n: n == 'b') == {'b': {ANCHOR + 'x': '2'}}
+        assert _parse_zfsbackup_get(lines, lambda n: False) == {}
+        assert set(_parse_zfsbackup_get(lines, lambda n: True)) == {'a', 'b'}
+
+    def test_accepts_any_iterable_of_lines(self):
+        gen = (line for line in zget('a', [(ANCHOR + 'x', '1', 'local')]))
+        assert _parse_zfsbackup_get(gen, lambda n: True) == {'a': {ANCHOR + 'x': '1'}}
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups
+# ---------------------------------------------------------------------------
+
+def levels_of(caplog, text):
+    return [r.levelname for r in caplog.records if text in r.getMessage()]
+
+
+class TestReceivedDatasetsArePrunedNonRecursively:
+    """The client's `recursive` describes how the CLIENT snapshots. Every
+    received child is its own client dataset with its own retention, so a
+    server-side `zfs destroy -r` of the parent's retention would eat the
+    children's history."""
+
+    RECEIVED = 'pool/backups/c1'
+    RECEIVED_CHILD = 'pool/backups/c1/sub'
+
+    def received_ds(self, fz, recursive=True, name=None):
+        name = name or self.RECEIVED
+        cfg = DatasetConfig(name='pool/src', recursive=recursive, retention_rules=retention(2))
+        ds = MagicMock()
+        ds.name = name
+        ds.__getitem__ = MagicMock(side_effect=lambda k: {
+            PROP_CLIENT_ID: 'c1', PROP_CONFIG: cfg.to_property(),
+        }.get(k))
+        fz.received.append(ds)
+        return cfg
+
+    def manager(self):
+        from zfsbackup.config import RemoteServerConfig
+        config = BackupConfig(
+            datasets=[], snapshot_prefix=PREFIX,
+            remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
+        )
+        return DatasetManager(config)
+
+    def test_a_recursive_client_config_gives_a_non_recursive_dataset_info(self, fz):
+        cfg = self.received_ds(fz, recursive=True)
+        (dsi,) = self.manager().received_datasets()
+        assert cfg.recursive is True                  # the decoded source config is not the object kept
+        assert dsi.recursive is False and dsi.config.recursive is False
+        assert dsi.name == self.RECEIVED
+        assert dsi.config.retention_rules[0].keep_for == timedelta(hours=2)   # nothing else changed
+
+    def test_a_non_recursive_client_config_stays_non_recursive(self, fz):
+        self.received_ds(fz, recursive=False)
+        (dsi,) = self.manager().received_datasets()
+        assert dsi.recursive is False
+
+    def test_pruning_one_destroys_non_recursively_and_leaves_received_children_alone(self, fz):
+        self.received_ds(fz, recursive=True)
+        fz.snaps[self.RECEIVED] = [A, B, C]
+        fz.snaps[self.RECEIVED_CHILD] = [A, B, C]
+        fz.props[self.RECEIVED_CHILD] = [(ANCHOR + 'x', C, 'received')]
+        manager = self.manager()
+        (dsi,) = manager.received_datasets()
+        manager.prune_snapshots(dsi)
+        assert fz.destroyed == [B, C]                  # no descendant protection was consulted
+        assert [str(sn) for call in fz.destroy.call_args_list for sn in call.args[0]] == [
+            f'{self.RECEIVED}@{B}', f'{self.RECEIVED}@{C}',
+        ]
+        assert fz.destroy.call_args.kwargs == {'destroy': True, 'recursive': False}
+        assert fz.recursive_gets == []
+        assert self.RECEIVED_CHILD not in fz.list_roots
+        assert fz.list_recursive == [(self.RECEIVED, False)]
+
+
+class TestRecursiveConfiguredDescendant:
+    def test_a_recursive_child_protects_through_its_own_retention(self, fz):
+        fz.snaps[CHILD] = [D, C]
+        child = DatasetConfig(name=CHILD, recursive=True, retention_rules=retention(10))
+        manager, dsi = make_manager(child)
+        prune(manager, dsi)
+        assert fz.destroyed == [B]
+        # the child's snapshots are listed for the child alone, not for its subtree
+        assert (CHILD, False) in fz.list_recursive
+
+    def test_a_grandchild_below_a_recursive_child_is_evaluated_too(self, fz):
+        grand = CHILD + '/g'
+        fz.snaps[CHILD] = [D, C]
+        fz.snaps[grand] = [D, B]
+        manager, dsi = make_manager(
+            DatasetConfig(name=CHILD, recursive=True, retention_rules=retention(10)),
+            DatasetConfig(name=grand, retention_rules=retention(10)),
+        )
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()                 # B held by the grandchild, C by the child
+
+    def test_only_the_grandchild_holds_when_the_child_prunes(self, fz):
+        grand = CHILD + '/g'
+        fz.snaps[CHILD] = [A, B, C]
+        fz.snaps[grand] = [D, C]
+        manager, dsi = make_manager(
+            DatasetConfig(name=CHILD, recursive=True, retention_rules=retention(2)),
+            DatasetConfig(name=grand, retention_rules=retention(10)),
+        )
+        prune(manager, dsi)
+        assert fz.destroyed == [B]
+
+
+class TestNotedSetBookkeeping:
+    def held(self, manager):
+        return manager._descendant_protect_noted
+
+    def test_hold_release_shrinks_and_a_new_hold_is_announced_again(self, fz, caplog):
+        manager, dsi = make_manager()
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+            assert self.held(manager) == {(PARENT, C)}
+            fz.props[CHILD] = []
+            prune(manager, dsi)
+            assert self.held(manager) == set()
+            fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+            prune(manager, dsi)
+        assert len(levels_of(caplog, f'keeping {PARENT}@{C}')) == 2
+
+    def test_releasing_one_of_two_names_keeps_only_the_other(self, fz):
+        manager, dsi = make_manager()
+        fz.props[CHILD] = [(ANCHOR + 'x', B, 'local'), (ANCHOR + 'y', C, 'local')]
+        prune(manager, dsi)
+        assert self.held(manager) == {(PARENT, B), (PARENT, C)}
+        fz.props[CHILD] = [(ANCHOR + 'x', B, 'local')]
+        prune(manager, dsi)
+        assert self.held(manager) == {(PARENT, B)}
+
+    def test_a_name_that_is_no_longer_a_candidate_is_forgotten(self, fz):
+        manager, dsi = make_manager()
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        prune(manager, dsi)
+        fz.snaps[PARENT] = [A, B]                      # C is gone from the parent
+        prune(manager, dsi)
+        assert self.held(manager) == set()
+
+    def test_nothing_to_prune_empties_the_set(self, fz):
+        manager, dsi = make_manager()
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        prune(manager, dsi)
+        assert self.held(manager)
+        fz.snaps[PARENT] = [A]
+        prune(manager, dsi)
+        assert self.held(manager) == set()
+
+    def test_a_dataset_that_stopped_being_recursive_empties_its_entries(self, fz):
+        manager, dsi = make_manager()
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        prune(manager, dsi)
+        assert self.held(manager)
+        dsi.config.recursive = False
+        prune(manager, dsi)
+        assert self.held(manager) == set()
+
+    def test_another_datasets_entries_are_left_alone(self, fz):
+        manager, dsi = make_manager()
+        manager._descendant_protect_noted.add(('pool/other', 'autosnap_1'))
+        fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
+        prune(manager, dsi)
+        fz.props[CHILD] = []
+        prune(manager, dsi)
+        assert self.held(manager) == {('pool/other', 'autosnap_1')}
+
+
+class TestMissingAndFailingDescendants:
+    def test_a_missing_configured_child_is_skipped_and_the_parent_prunes(self, fz, caplog):
+        fz.missing.add(CHILD)
+        fz.snaps[CHILD] = [A, B, C]                    # would protect everything if it were listed
+        manager, dsi = make_manager(child_cfg(keep_hours=100))
+        with caplog.at_level(logging.DEBUG):
+            prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+        assert CHILD in fz.exists_calls and CHILD not in fz.list_roots
+        assert 'ERROR' not in [r.levelname for r in caplog.records]
+        assert levels_of(caplog, f'Descendant {CHILD} of {PARENT} does not exist') == ['DEBUG']
+
+    def test_a_missing_child_does_not_hide_an_existing_one(self, fz):
+        other = 'pool/d/e'
+        fz.missing.add(CHILD)
+        fz.snaps[other] = [D, C]
+        manager, dsi = make_manager(child_cfg(keep_hours=100), child_cfg(name=other, keep_hours=10))
+        prune(manager, dsi)
+        assert fz.destroyed == [B]
+
+    def test_an_existing_child_whose_listing_fails_skips_the_parent(self, fz, caplog):
+        fz.list_errors.add(CHILD)
+        manager, dsi = make_manager(child_cfg())
+        with caplog.at_level(logging.DEBUG):
+            prune(manager, dsi)
+        fz.destroy.assert_not_called()
+        assert levels_of(caplog, 'Cannot evaluate descendants') == ['ERROR']
+
+    def test_the_error_is_logged_once_while_it_persists_then_debug(self, fz, caplog):
+        fz.list_errors.add(CHILD)
+        manager, dsi = make_manager(child_cfg())
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(4):
+                prune(manager, dsi)
+        assert levels_of(caplog, 'Cannot evaluate descendants') == ['ERROR', 'DEBUG', 'DEBUG', 'DEBUG']
+        fz.destroy.assert_not_called()
+        assert manager._descendant_error_noted == {PARENT}
+
+    def test_the_error_is_logged_again_after_an_intervening_success(self, fz, caplog):
+        manager, dsi = make_manager(child_cfg())
+        with caplog.at_level(logging.DEBUG):
+            fz.list_errors.add(CHILD)
+            prune(manager, dsi)
+            prune(manager, dsi)
+            fz.list_errors.clear()
+            prune(manager, dsi)                        # succeeds: clears the note
+            assert manager._descendant_error_noted == set()
+            fz.list_errors.add(CHILD)
+            prune(manager, dsi)
+        assert levels_of(caplog, 'Cannot evaluate descendants') == ['ERROR', 'DEBUG', 'ERROR']
+
+    def test_nothing_to_prune_also_clears_the_error_note(self, fz, caplog):
+        manager, dsi = make_manager(child_cfg())
+        fz.list_errors.add(CHILD)
+        prune(manager, dsi)
+        assert manager._descendant_error_noted == {PARENT}
+        fz.snaps[PARENT] = [A]
+        prune(manager, dsi)
+        assert manager._descendant_error_noted == set()
+
+    def test_an_exists_error_that_is_not_does_not_exist_skips_the_parent(self, fz, caplog):
+        fz.exists_errors[CHILD] = "cannot open 'pool/d/c': permission denied"
+        manager, dsi = make_manager(child_cfg())
+        with caplog.at_level(logging.DEBUG):
+            prune(manager, dsi)
+        fz.destroy.assert_not_called()
+        errors = [r for r in caplog.records if r.levelname == 'ERROR']
+        assert len(errors) == 1
+        assert 'Cannot evaluate descendants' in errors[0].getMessage()
+        assert 'permission denied' in errors[0].getMessage()
+        assert CHILD not in fz.list_roots
+
+    def test_a_failing_child_does_not_affect_a_non_recursive_parent(self, fz):
+        fz.exists_errors[CHILD] = 'permission denied'
+        manager, dsi = make_manager(child_cfg(), recursive=False)
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+        assert fz.exists_calls == []

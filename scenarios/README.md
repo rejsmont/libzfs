@@ -10,18 +10,19 @@ The mocked/`real_zfs` **pytest** suites live under [`tests/`](../tests/), not he
 
 | Script | What it does |
 |---|---|
-| [`setup_test_pool.sh`](setup_test_pool.sh) | Create a file-backed test pool and delegate `zfs`/`zpool` permissions to the current user (env: `TEST_ZFS_POOL`, `ZFS_TEST_DISK`, `ZFS_TEST_SIZE`). |
+| [`setup_test_pool.sh`](setup_test_pool.sh) | Create a file-backed test pool and delegate `zfs`/`zpool` permissions to the current user, one permission at a time (a permission the installed ZFS does not know, e.g. `inherit` on OpenZFS 2.4, is skipped with a warning instead of aborting). Env: `TEST_ZFS_POOL`, `ZFS_TEST_DISK`, `ZFS_TEST_SIZE`. |
 | [`cleanup_test_pool.sh`](cleanup_test_pool.sh) | Destroy the pool created by `setup_test_pool.sh` and remove its backing image. |
 | [`create_test_pool.sh`](create_test_pool.sh) | Create a temp-file pool with nested datasets (`mountpoint=none`) matching [`../zfsbackup/config.example.yaml`](../zfsbackup/config.example.yaml). |
 | [`test_pool.sh`](test_pool.sh) | Ad-hoc scratch pool with a nested layout for manual experimentation. |
-| [`test_two_vm_backup.sh`](test_two_vm_backup.sh) | End-to-end two-VM (Multipass) harness exercising the real network transfer path — scenarios A (full) / B (incremental) / C (server-down resilience) / D (client-restart persistence). Flags: `--keep`, `--keep-pools`, `--purge`. |
+| [`test_two_vm_backup.sh`](test_two_vm_backup.sh) | End-to-end two-VM (Multipass) harness exercising the real network transfer path — scenarios A (full) / B (incremental) / C (server-down resilience) / D (client-restart persistence), plus the Phase 3 live-reload scenarios E (reload the client daemon during a throttled 2 GiB send: the transfer completes, the remote worker is replaced only after it, the 60s deferral WARNING appears) / F (reload the server daemon during an inbound receive: the API worker is replaced only after it) / G (`kill -9` the client supervisor mid-send and start a new daemon at once: it logs "waiting for them to ..." until the survivor finishes) / H (`rename dataset OLD NEW --clear-stale-props` with the client daemon running: the verified daemon applies the rename, then OLD's `org.zfsbackup:*` properties are cleared) / I (a received dataset is pruned non-recursively: the client dataset is `recursive: true`, the server's copy has a child with its own long retention, and the pruner removes the parent's old snapshots without taking the child's same-named ones). H and I need no extra space and also run with `--no-big`. E-G throttle the client with `tc`, write ~3 GiB per VM (VMs need ~10G disk; pool images live in `/var/tmp`, because `/tmp` is a tmpfs) and always remove the throttle. Flags: `--keep`, `--keep-pools`, `--no-big` (skip E-G), `--purge` (deletes only the two `zfsb-*` VMs). |
+| [`test_config_permissions.sh`](test_config_permissions.sh) | One Multipass VM, users `zfsbackup` (daemon) + `alice`/`bob` (group operators): proves the SQLite config store's group-operator permission model on real Linux — root's first import (dir `2770 root:zfsbackup`, DB `0660`), operator re-imports while the daemon runs as `zfsbackup`, SIGHUP-killed first opener leaving sidecars in the service group, non-default `0600` `-c` staying `0600`, and the clear preflight error when the setgid bit is missing. Also covers item 15.2: the supervisor loads the config once (logs `Configuration generation N`, writes the pid file v2 `<db>.daemon.pid`), workers/respawns hold no `config.db` fd and are handed the supervisor's current config, a second daemon exits 1 naming the first pid, and `.daemon.pid`/`.writer.lock`/`.workers.lock` are `0660` group `zfsbackup`. Group (f) covers Phase 3 live reload: root and the service user `set` -> verified SIGHUP ("accepted ... trigger: SIGHUP", workers turn over, supervisor pid unchanged, `applied=` in the pid file, `status` / `status --wait`); a group operator's write is "not signalled; it picks up the change within 10s" and is accepted by the 10s poll; a raw `sqlite3` UPDATE that invalidates the config is rejected (`rejected=`, pids unchanged, unit active) and a good re-import clears it; a forged pid file naming a root-owned decoy process never gets the decoy signalled; a CLI write during daemon startup (deterministic via a stand-in `.workers.lock` holder, and raced) leaves the daemon up and on the new generation. `ZFSB_SRC=worktree` ships the uncommitted working tree to the VM instead of `git archive HEAD`. Group (g) covers the busy API port: a reload to an `api_port` another process holds is DEFERRED, not rejected (`deferred=` and `deferred_reason=` in the pid file, WARNING once in the log, `status` verdict `deferred`, `status --wait` exits 75, the old port keeps answering), and releasing the port makes the 10 s poll apply it with no new write. Group (h) runs the daemon as a real systemd `Type=notify-reload` unit (the documented `Type=notify` + `ExecReload` variant on systemd < 253): `systemctl start` returns after READY, `systemctl reload` returns after the reload decision (also for a rejected config), `systemctl show -p StatusText` follows `generation N` (and names a rejected one), `systemctl stop` is clean (`Result=success`, no leftover process). Uses a stub `zfs`/`zpool` and `--dry-run` (the point is DB access, not ZFS ops). Flags: `--keep`, `--purge`. |
 
 ## Usage
 
 ```bash
 # From the repo root
 ./scenarios/setup_test_pool.sh
-pytest -m real_zfs
+ZFSB_REAL_ZFS=1 pytest -m real_zfs   # without the opt-in every real test is skipped
 ./scenarios/cleanup_test_pool.sh
 
 # Two-VM end-to-end harness (needs Multipass on the host)
@@ -38,3 +39,9 @@ editing these scripts:
   `sh -c '... >/dev/null 2>&1'`).
 - **Deliver config via `multipass transfer`, not heredoc-piped stdin** (`multipass exec ... tee`) —
   piping on host stdin hangs/spins.
+- **A guest command that exits with status 4 hangs `multipass exec` forever** (verified: `exit 4`
+  wedges, 2/3/104 do not). It bites `systemctl is-active` on a unit that no longer exists (exit 4 on
+  current systemd). `test_config_permissions.sh` runs every guest command in an inner shell that remaps
+  4 to 104; do the same in any new Multipass code that probes unit state.
+- `multipass purge` is global (it destroys every deleted VM, not just yours); prefer
+  `multipass delete --purge <vm>` for a single VM.

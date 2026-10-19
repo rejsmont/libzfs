@@ -1,0 +1,156 @@
+name: tests
+
+# The mocked suite needs no ZFS, so it runs anywhere. The 30 `real_zfs`
+# tests are excluded by pytest.ini's addopts and are NOT run here -- they
+# need a real pool, and whether ZFS loads on a hosted runner kernel is an
+# open question. See scenarios/ for the real-pool and two-VM harnesses.
+
+on:
+  push:
+    branches: [master, config-db-cli]
+  pull_request:
+
+# A superseded run tells you nothing; cancel it rather than pay for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: py${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # A wedged fork test must not burn hours. The suite takes ~14 min on a
+    # laptop (real-daemon, forkserver and sd_notify tests), so allow headroom.
+    timeout-minutes: 30
+
+    strategy:
+      # When one version breaks, we need to know whether it is that
+      # version or all of them -- so never cancel the siblings.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        # 3.11 is the floor declared in pyproject.toml. Every version in
+        # between is listed deliberately: Path.resolve() changed its
+        # symlink-loop behaviour at 3.13, and that boundary hid a real
+        # bug in zfsbackup/config/store/paths.py until it was found by
+        # accident. Boundaries between versions are where things hide.
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          # Development happens on macOS, where the multiprocessing
+          # default start method is `spawn` rather than Linux's `fork`
+          # (or `forkserver` on 3.14). The fork-safety tests pin
+          # get_context("fork") explicitly, but their negative controls
+          # were written on a spawn-default machine -- so keep one darwin
+          # job to stop the dev platform silently diverging.
+          - os: macos-latest
+            python: "3.14"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install poetry
+        # Pinned: a poetry minor bump changing resolution is not something
+        # we want to discover as a red build on an unrelated PR. Run poetry
+        # on the matrix interpreter: pipx otherwise uses the runner's own
+        # Python (3.15 on macos-latest), and the venv silently followed it.
+        run: pipx install --python "${{ steps.py.outputs.python-path }}" poetry==2.1.1
+
+      - name: Cache the project virtualenv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: |
+          poetry config virtualenvs.in-project true
+          poetry env use "${{ steps.py.outputs.python-path }}"
+          poetry install --with dev
+
+      - name: Check the venv runs the matrix Python
+        run: poetry run python -c "import sys; v='%d.%d' % sys.version_info[:2]; print(sys.version); assert v == '${{ matrix.python }}', v"
+
+      # libzfseasy/zfs.py resolves the zfs/zpool binaries at IMPORT time and
+      # raises RuntimeError if neither $ZFS_CMD nor a binary on PATH is found
+      # -- so without this the suite cannot even be collected, let alone run,
+      # and every job fails identically at import. Hosted runners ship no
+      # zfsutils. The mocked suite never executes these (conftest patches
+      # subprocess.Popen), it only needs the names to resolve; the real_zfs
+      # tests are excluded by pytest.ini's addopts and are not run here.
+      - name: Provide stub zfs/zpool binaries
+        run: |
+          mkdir -p "$RUNNER_TEMP/zfsstub"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zfs"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zpool"
+          chmod +x "$RUNNER_TEMP/zfsstub/zfs" "$RUNNER_TEMP/zfsstub/zpool"
+          echo "ZFS_CMD=$RUNNER_TEMP/zfsstub/zfs" >> "$GITHUB_ENV"
+          echo "ZPOOL_CMD=$RUNNER_TEMP/zfsstub/zpool" >> "$GITHUB_ENV"
+
+      - name: Run the mocked test suite
+        run: poetry run pytest
+
+      - name: Upload coverage
+        # Coverage is informational for now -- no threshold is enforced.
+        # zfsbackup was only added to --cov in the same change that added
+        # this workflow, so the first real number is not yet known.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ runner.os }}-py${{ matrix.python }}
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  # poetry.lock pins SQLAlchemy 2.0.x (covered by the matrix above), but
+  # pyproject allows ^2.0, so a fresh install gets 2.1. The store supports
+  # both; this job keeps 2.1 honest and turns SQLAlchemy deprecations and
+  # warnings into failures so the next drift is loud.
+  test-sqlalchemy-21:
+    name: py${{ matrix.python }} / SQLAlchemy 2.1
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install poetry
+        run: pipx install --python "${{ steps.py.outputs.python-path }}" poetry==2.1.1
+
+      # No virtualenv cache here: it is keyed on poetry.lock, which pins
+      # 2.0.x, and must never be shared with the 2.0 jobs.
+      - name: Install dependencies, then SQLAlchemy 2.1
+        run: |
+          poetry config virtualenvs.in-project true
+          poetry env use "${{ steps.py.outputs.python-path }}"
+          poetry install --with dev
+          poetry run python -c "import sys; v='%d.%d' % sys.version_info[:2]; print(sys.version); assert v == '${{ matrix.python }}', v"
+          poetry run pip install "sqlalchemy>=2.1,<2.2" alembic
+          poetry run python -c "import sqlalchemy as s; assert s.__version__.startswith('2.1'), s.__version__; print('SQLAlchemy', s.__version__)"
+
+      - name: Provide stub zfs/zpool binaries
+        run: |
+          mkdir -p "$RUNNER_TEMP/zfsstub"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zfs"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zpool"
+          chmod +x "$RUNNER_TEMP/zfsstub/zfs" "$RUNNER_TEMP/zfsstub/zpool"
+          echo "ZFS_CMD=$RUNNER_TEMP/zfsstub/zfs" >> "$GITHUB_ENV"
+          echo "ZPOOL_CMD=$RUNNER_TEMP/zfsstub/zpool" >> "$GITHUB_ENV"
+
+      - name: Run the mocked test suite
+        run: >
+          poetry run pytest
+          -W error::sqlalchemy.exc.SADeprecationWarning
+          -W error::sqlalchemy.exc.SAWarning

@@ -1,5 +1,7 @@
 """Unit tests for zfsbackup.config module."""
 
+import base64
+import json
 import pytest
 from datetime import timedelta
 from pathlib import Path
@@ -12,6 +14,8 @@ from zfsbackup.config import (
     RemoteServerConfig,
     Destination,
     BackupConfig,
+    Duration,
+    validate_retention_uniqueness,
 )
 
 
@@ -83,6 +87,80 @@ class TestRetentionRule:
         assert "RetentionRule" in r
         assert "age=" in r
         assert "keep_for=" in r
+
+
+class TestValidateRetentionUniqueness:
+    """Item 2b: the strict validator for future write paths (CLI `set`/`edit`,
+    `import`). Deliberately NOT wired into `from_dict`/`from_file` -- a
+    colliding config must still *load*, see `TestValidateRetentionUniquenessNotCalledFromLoad`.
+    """
+
+    def test_same_keep_for_raises_naming_key_and_both_literals(self):
+        rules = [
+            RetentionRule(age=Duration('1h'), keep_for=Duration('7d')),
+            RetentionRule(age=Duration('1d'), keep_for=Duration('1w')),
+        ]
+        with pytest.raises(ValueError) as exc_info:
+            validate_retention_uniqueness(rules, 'datasets[pool/data].retention')
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].retention' in msg
+        assert '7d' in msg
+        assert '1w' in msg
+        assert 'keep_for' in msg
+
+    def test_same_age_raises_naming_key_and_both_literals(self):
+        rules = [
+            RetentionRule(age=Duration('1d'), keep_for=Duration('1w')),
+            RetentionRule(age=Duration('24h'), keep_for=Duration('1M')),
+        ]
+        with pytest.raises(ValueError) as exc_info:
+            validate_retention_uniqueness(rules, 'datasets[pool/data].retention')
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].retention' in msg
+        assert '1d' in msg
+        assert '24h' in msg
+        assert 'age' in msg
+
+    def test_exact_duplicates_are_silent(self):
+        rules = [
+            RetentionRule(age=Duration('1d'), keep_for=Duration('30d')),
+            RetentionRule(age=Duration('1d'), keep_for=Duration('30d')),
+        ]
+        validate_retention_uniqueness(rules, 'datasets[pool/data].retention')  # must not raise
+
+    def test_non_colliding_rules_pass(self):
+        rules = [
+            RetentionRule(age=Duration('1h'), keep_for=Duration('1d')),
+            RetentionRule(age=Duration('1d'), keep_for=Duration('1w')),
+        ]
+        validate_retention_uniqueness(rules, 'datasets[pool/data].retention')  # must not raise
+
+
+class TestValidateRetentionUniquenessNotCalledFromLoad:
+    """The read path (`from_dict`/`from_file`) must stay permissive -- a
+    colliding config loads successfully, per item 2b's "load never
+    hard-fails" decision. Wiring `validate_retention_uniqueness` into load
+    would break upgrades for already-deployed configs."""
+
+    def test_from_dict_loads_colliding_retention(self):
+        data = {
+            'name': 'pool/data',
+            'retention': {'1h': '7d', '1d': '1w'},  # same keep_for (604800s)
+        }
+        cfg = DatasetConfig.from_dict(data)  # must not raise
+        assert len(cfg.retention_rules) == 2
+
+    def test_from_file_loads_colliding_retention(self, tmp_path):
+        f = tmp_path / 'colliding.yaml'
+        f.write_text(
+            "datasets:\n"
+            "  - name: pool/data\n"
+            "    retention:\n"
+            "      1h: 7d\n"
+            "      1d: 1w\n"
+        )
+        config = BackupConfig.from_file(f)  # must not raise
+        assert len(config.datasets[0].retention_rules) == 2
 
 
 class TestDatasetConfig:
@@ -193,6 +271,326 @@ class TestDatasetConfig:
         assert len(encoded) > 0
 
 
+class TestDatasetConfigPerDestinationRetention:
+    """Item 3b: `to_property(destination)` emits the *effective* rules for
+    that destination -- override, not merge."""
+
+    def _cfg(self, remote_retention=None):
+        return DatasetConfig(
+            name='pool/data',
+            frequency=timedelta(hours=1),
+            retention_rules=[RetentionRule(timedelta(hours=1), timedelta(days=1))],
+            remote=[RemoteDatasetConfig(
+                destination='offsite',
+                retention_rules=remote_retention or [],
+            )],
+        )
+
+    def _decode(self, encoded: str) -> dict:
+        return json.loads(base64.b64decode(encoded).decode())
+
+    def test_override_replaces_not_merges(self):
+        # Dataset-level: 1h->1d. Destination override: 1d->5y. A merge would
+        # emit BOTH rules; override emits ONLY the destination's own rule.
+        cfg = self._cfg(remote_retention=[RetentionRule(timedelta(days=1), timedelta(days=1825))])
+        data = self._decode(cfg.to_property('offsite'))
+        ages = [r['age'] for r in data['retention_rules']]
+        assert ages == [86400.0]  # only the override -- not [3600.0, 86400.0]
+
+    def test_no_destination_retention_inherits_dataset_level(self):
+        cfg = self._cfg(remote_retention=[])  # destination declares no rules
+        data = self._decode(cfg.to_property('offsite'))
+        assert data['retention_rules'] == [{'age': 3600.0, 'keep_for': 86400.0}]
+        # Identical to the dataset-level (no-argument) output.
+        assert cfg.to_property('offsite') == cfg.to_property()
+
+    def test_no_argument_returns_dataset_level_rules(self):
+        cfg = self._cfg(remote_retention=[RetentionRule(timedelta(days=1), timedelta(days=1825))])
+        data = self._decode(cfg.to_property())
+        assert data['retention_rules'] == [{'age': 3600.0, 'keep_for': 86400.0}]
+
+    def test_wire_compatibility_no_per_destination_rules_byte_identical(self):
+        """Required: for a config with no per-destination rules, `to_property()`
+        must be byte-identical to a pre-item-3b build's output, because
+        already-deployed servers parse it verbatim. Value independently
+        verified before pinning (see docs/config_db_cli_plan.md item 3b)."""
+        cfg = DatasetConfig.from_dict({
+            'name': 'tank/d',
+            'frequency': '1h',
+            'retention': {'1d': '30d'},
+            'remote': [{'destination': 'offsite'}],
+        })
+        encoded = cfg.to_property()
+        expected = (
+            'eyJuYW1lIjoidGFuay9kIiwicmVjdXJzaXZlIjpmYWxzZSwiZnJlcXVlbmN5IjozNjAwLjAsImVuYWJsZWQiOnRydWUs'
+            'InJldGVudGlvbl9ydWxlcyI6W3siYWdlIjo4NjQwMC4wLCJrZWVwX2ZvciI6MjU5MjAwMC4wfV0sInJlbW90ZSI6W3si'
+            'ZGVzdGluYXRpb24iOiJvZmZzaXRlIiwiZnJlcXVlbmN5IjpudWxsfV19'
+        )
+        assert encoded == expected
+
+    def test_from_property_round_trip_with_destination_argument(self):
+        cfg = self._cfg(remote_retention=[RetentionRule(timedelta(days=1), timedelta(days=1825))])
+        encoded = cfg.to_property('offsite')
+        restored = DatasetConfig.from_property(encoded)
+        assert restored.name == 'pool/data'
+        assert len(restored.retention_rules) == 1
+        assert restored.retention_rules[0].age == timedelta(days=1)
+        assert restored.retention_rules[0].keep_for == timedelta(days=1825)
+
+    def test_unknown_destination_falls_back_to_dataset_level(self):
+        cfg = self._cfg(remote_retention=[RetentionRule(timedelta(days=1), timedelta(days=1825))])
+        data = self._decode(cfg.to_property('nonexistent'))
+        assert data['retention_rules'] == [{'age': 3600.0, 'keep_for': 86400.0}]
+
+    def test_from_property_is_not_an_orm_round_trip_inverse(self):
+        """`from_property` is a *wire decoder*, not the inverse of
+        `to_property`, and must not be reused as one (see item 4's config-DB
+        mapper). `to_property(destination)` intentionally emits only the
+        single *effective* `retention_rules` list for that destination --
+        the per-destination overrides living in `self.remote` are never put
+        on the wire at all. Round-tripping a decoded value back through
+        `from_property` therefore always yields `remote[*].retention_rules
+        == []` for every entry, silently dropping the original's
+        per-destination rules. Pin the lossiness explicitly so a future
+        "just reuse to_property/from_property for the DB mapper" shortcut
+        fails loudly instead of silently losing data."""
+        original = self._cfg(
+            remote_retention=[RetentionRule(timedelta(days=1), timedelta(days=1825))]
+        )
+        assert original.remote[0].retention_rules != []  # sanity: original HAS rules
+
+        # Even the dataset-level (no-destination) encoding carries `remote`
+        # entries (destination + frequency), but never their retention_rules.
+        restored = DatasetConfig.from_property(original.to_property())
+        assert len(restored.remote) == 1
+        assert restored.remote[0].destination == 'offsite'
+        assert restored.remote[0].retention_rules == []
+
+        # Also true for the destination-scoped encoding: it substitutes the
+        # override into the top-level (dataset-level) retention_rules slot,
+        # but `remote[*].retention_rules` is still lost.
+        restored_for_dest = DatasetConfig.from_property(original.to_property('offsite'))
+        assert len(restored_for_dest.remote) == 1
+        assert restored_for_dest.remote[0].retention_rules == []
+
+
+class TestDatasetConfigRetentionShapeAndBounds:
+    """Dataset-level `retention:` shape/emptiness/bounds checks.
+
+    The shape check (`_mapping_from_config`) runs BEFORE the emptiness
+    check, so a malformed shape (list, string, int, ...) always raises a
+    named ValueError naming the `datasets[name].retention` key path,
+    rather than silently falling through to the documented default the
+    way `if not retention_dict:` used to.
+    """
+
+    def test_retention_list_raises_named_error(self):
+        data = {'name': 'pool/data', 'retention': []}
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].retention' in msg
+        assert 'list' in msg
+
+    def test_retention_empty_string_raises_named_error(self):
+        data = {'name': 'pool/data', 'retention': ''}
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].retention' in msg
+        assert 'str' in msg
+
+    def test_retention_zero_raises_named_error(self):
+        data = {'name': 'pool/data', 'retention': 0}
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].retention' in msg
+        assert 'int' in msg
+
+    def test_retention_empty_mapping_defaults_to_1d_30d(self):
+        """Deliberate asymmetry with the destination-level override, where
+        `{}` has no meaning and is rejected (see
+        TestDatasetConfigRemoteRetentionRejections.test_empty_retention_dict_on_destination_raises).
+        `config.example.yaml` and long-standing behaviour rely on the
+        dataset-level default; a future "consistency" cleanup that makes
+        this raise instead would break real configs."""
+        cfg = DatasetConfig.from_dict({'name': 'pool/data', 'retention': {}})
+        assert len(cfg.retention_rules) == 1
+        assert cfg.retention_rules[0].age == timedelta(days=1)
+        assert cfg.retention_rules[0].keep_for == timedelta(days=30)
+
+    def test_retention_absent_defaults_to_1d_30d(self):
+        cfg = DatasetConfig.from_dict({'name': 'pool/data'})
+        assert len(cfg.retention_rules) == 1
+        assert cfg.retention_rules[0].age == timedelta(days=1)
+        assert cfg.retention_rules[0].keep_for == timedelta(days=30)
+
+    def test_retention_none_defaults_to_1d_30d(self):
+        cfg = DatasetConfig.from_dict({'name': 'pool/data', 'retention': None})
+        assert len(cfg.retention_rules) == 1
+        assert cfg.retention_rules[0].age == timedelta(days=1)
+        assert cfg.retention_rules[0].keep_for == timedelta(days=30)
+
+    def test_retention_zero_age_raises(self):
+        data = {'name': 'pool/data', 'retention': {'0s': '1d'}}
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].retention' in msg
+        assert 'positive' in msg
+
+    def test_retention_zero_keep_for_raises(self):
+        data = {'name': 'pool/data', 'retention': {'1h': '0s'}}
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].retention' in msg
+        assert 'positive' in msg
+
+    def test_retention_negative_age_raises(self):
+        data = {'name': 'pool/data', 'retention': {'-1h': '1d'}}
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].retention' in msg
+        assert 'positive' in msg
+
+    def test_retention_negative_keep_for_raises(self):
+        data = {'name': 'pool/data', 'retention': {'1h': '-1d'}}
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].retention' in msg
+        assert 'positive' in msg
+
+
+class TestDatasetConfigDestinationRetentionBounds:
+    """Non-positive durations rejected on the destination-level override too."""
+
+    def test_destination_retention_zero_age_raises(self):
+        data = {
+            'name': 'pool/data',
+            'remote': [{'destination': 'offsite', 'retention': {'0s': '1d'}}],
+        }
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].remote[offsite].retention' in msg
+        assert 'positive' in msg
+
+    def test_destination_retention_zero_keep_for_raises(self):
+        data = {
+            'name': 'pool/data',
+            'remote': [{'destination': 'offsite', 'retention': {'1h': '0s'}}],
+        }
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].remote[offsite].retention' in msg
+        assert 'positive' in msg
+
+    def test_destination_retention_negative_age_raises(self):
+        data = {
+            'name': 'pool/data',
+            'remote': [{'destination': 'offsite', 'retention': {'-1h': '1d'}}],
+        }
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'positive' in str(exc_info.value)
+
+    def test_destination_retention_negative_keep_for_raises(self):
+        data = {
+            'name': 'pool/data',
+            'remote': [{'destination': 'offsite', 'retention': {'1h': '-1d'}}],
+        }
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'positive' in str(exc_info.value)
+
+
+class TestDatasetConfigRemoteRetentionRejections:
+    """Item 3b edge cases in `DatasetConfig.from_dict`."""
+
+    def test_empty_retention_dict_on_destination_raises(self):
+        data = {
+            'name': 'pool/data',
+            'remote': [{'destination': 'offsite', 'retention': {}}],
+        }
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].remote[offsite].retention' in msg
+        # Message must state both alternatives.
+        assert 'omit' in msg
+        assert 'declare' in msg
+
+    def test_retention_as_list_under_remote_entry_raises(self):
+        data = {
+            'name': 'pool/data',
+            'remote': [{'destination': 'offsite', 'retention': ['1d', '30d']}],
+        }
+        with pytest.raises(ValueError) as exc_info:
+            DatasetConfig.from_dict(data)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].remote[offsite].retention' in msg
+        assert 'list' in msg
+
+    def test_destination_retention_sorted_by_age(self):
+        data = {
+            'name': 'pool/data',
+            'remote': [{
+                'destination': 'offsite',
+                'retention': {'1w': '1M', '1d': '1w', '1h': '1d'},
+            }],
+        }
+        cfg = DatasetConfig.from_dict(data)
+        ages = [r.age for r in cfg.remote[0].retention_rules]
+        assert ages == sorted(ages)
+
+
+class TestEffectiveRetentionRules:
+    """`DatasetConfig.effective_retention_rules(destination)` -- the method
+    `to_property` delegates to. Tested directly (not just through the
+    base64/JSON wire format) so a break here is diagnosed at the right
+    layer."""
+
+    def _cfg(self, remote_retention=None):
+        return DatasetConfig(
+            name='pool/data',
+            frequency=timedelta(hours=1),
+            retention_rules=[RetentionRule(timedelta(hours=1), timedelta(days=1))],
+            remote=[RemoteDatasetConfig(
+                destination='offsite',
+                retention_rules=remote_retention or [],
+            )],
+        )
+
+    def test_no_destination_returns_dataset_level_rules(self):
+        cfg = self._cfg(remote_retention=[RetentionRule(timedelta(days=1), timedelta(days=1825))])
+        rules = cfg.effective_retention_rules()
+        assert rules == cfg.retention_rules
+
+    def test_destination_with_override_returns_override(self):
+        override = [RetentionRule(timedelta(days=1), timedelta(days=1825))]
+        cfg = self._cfg(remote_retention=override)
+        rules = cfg.effective_retention_rules('offsite')
+        assert rules == override
+        assert rules != cfg.retention_rules
+
+    def test_destination_without_override_inherits_dataset_level(self):
+        cfg = self._cfg(remote_retention=[])
+        rules = cfg.effective_retention_rules('offsite')
+        assert rules == cfg.retention_rules
+
+    def test_unknown_destination_falls_back_to_dataset_level(self):
+        cfg = self._cfg(remote_retention=[RetentionRule(timedelta(days=1), timedelta(days=1825))])
+        rules = cfg.effective_retention_rules('nonexistent')
+        assert rules == cfg.retention_rules
+
+
 class TestBackupConfig:
     def test_from_file_not_found_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
@@ -297,7 +695,8 @@ class TestBackupConfig:
         f = tmp_path / 'cfg.yaml'
         f.write_text("datasets:\n  - name: pool/data\ncheck_interval: 30m\n")
         cfg = BackupConfig.from_file(f)
-        assert cfg.prune_interval == cfg.check_interval
+        assert cfg.prune_interval is None
+        assert cfg.effective_prune_interval == cfg.check_interval
 
     def test_from_file_remote_backup_disabled(self, tmp_path):
         f = tmp_path / 'cfg.yaml'
@@ -311,3 +710,419 @@ class TestBackupConfig:
         cfg = BackupConfig.from_file(f)
         assert cfg.remote_backup is not None
         assert cfg.remote_backup.enabled is False
+
+    def test_from_file_destination_retention_undeclared_destination_raises(self, tmp_path):
+        """Item 3b: a remote entry declaring `retention` for a destination not
+        present in the top-level `destinations:` mapping must fail
+        validation. `DatasetConfig.from_dict` alone cannot catch this -- it
+        has no visibility into `destinations:` -- so this is enforced in
+        `BackupConfig.from_file` after both are parsed. The check is no
+        longer retention-specific (see
+        test_from_file_remote_undeclared_destination_raises_even_without_retention),
+        so the message names the reference generically rather than the
+        `.retention` key path."""
+        f = tmp_path / 'cfg.yaml'
+        f.write_text(
+            "datasets:\n"
+            "  - name: pool/data\n"
+            "    remote:\n"
+            "      - destination: offsite\n"
+            "        retention:\n"
+            "          1d: 5y\n"
+        )
+        with pytest.raises(ValueError) as exc_info:
+            BackupConfig.from_file(f)
+        msg = str(exc_info.value)
+        assert 'datasets[pool/data].remote[offsite]' in msg
+        assert 'offsite' in msg
+        assert 'destinations' in msg
+
+    def test_from_file_destination_retention_declared_destination_ok(self, tmp_path):
+        f = tmp_path / 'cfg.yaml'
+        f.write_text(
+            "datasets:\n"
+            "  - name: pool/data\n"
+            "    remote:\n"
+            "      - destination: offsite\n"
+            "        retention:\n"
+            "          1d: 5y\n"
+            "destinations:\n"
+            "  offsite:\n"
+            "    url: http://backup.example.com\n"
+        )
+        cfg = BackupConfig.from_file(f)  # must not raise
+        assert len(cfg.datasets[0].remote[0].retention_rules) == 1
+
+    def test_from_file_remote_undeclared_destination_raises_even_without_retention(self, tmp_path):
+        # A remote entry with NO retention override still references a
+        # destination that must exist in `destinations:` -- an undeclared
+        # destination can never be backed up to (RemoteBackupManager.
+        # backup_dataset looks it up the same way and would error every
+        # cycle forever), so this now fails at load regardless of whether
+        # the entry also carries a retention override. This supersedes the
+        # old behaviour (previously named
+        # test_from_file_remote_without_retention_needs_no_destination_declaration)
+        # where only a retention override triggered the check, letting a
+        # typo'd destination load clean and then log "Unknown destination"
+        # forever.
+        f = tmp_path / 'cfg.yaml'
+        f.write_text(
+            "datasets:\n"
+            "  - name: pool/data\n"
+            "    remote:\n"
+            "      - destination: offsite\n"
+        )
+        with pytest.raises(ValueError) as exc_info:
+            BackupConfig.from_file(f)
+        msg = str(exc_info.value)
+        assert 'offsite' in msg
+        assert 'destinations' in msg
+
+    def test_from_file_remote_without_retention_declared_destination_ok(self, tmp_path):
+        # The positive counterpart: once the destination IS declared, a
+        # remote entry with no retention override loads cleanly and inherits
+        # the dataset-level retention rules.
+        f = tmp_path / 'cfg.yaml'
+        f.write_text(
+            "datasets:\n"
+            "  - name: pool/data\n"
+            "    remote:\n"
+            "      - destination: offsite\n"
+            "destinations:\n"
+            "  offsite:\n"
+            "    url: http://backup.example.com\n"
+        )
+        cfg = BackupConfig.from_file(f)  # must not raise
+        assert cfg.datasets[0].remote[0].destination == 'offsite'
+        assert cfg.datasets[0].remote[0].retention_rules == []
+
+
+# ---------------------------------------------------------------------------
+# B2: BackupConfig.same_as -- exact structural equality
+# ---------------------------------------------------------------------------
+
+
+def _rich_config(**over) -> BackupConfig:
+    """A config touching every nested type `same_as` walks: a dataset with
+    retention rules, a remote entry with its own frequency and retention
+    override, a destination, and the remote-server block."""
+    data = dict(
+        snapshot_prefix='zb',
+        check_interval=Duration('5m'),
+        prune_interval=Duration('1h'),
+        datasets=[
+            DatasetConfig(
+                name='pool/a',
+                frequency=Duration('1h'),
+                retention_rules=[
+                    RetentionRule(age=Duration('1d'), keep_for=Duration('4w')),
+                    RetentionRule(age=Duration('1w'), keep_for=Duration('1M')),
+                ],
+                remote=[
+                    RemoteDatasetConfig(
+                        destination='offsite',
+                        frequency=Duration('30m'),
+                        retention_rules=[
+                            RetentionRule(age=Duration('2d'), keep_for=Duration('8w')),
+                        ],
+                    )
+                ],
+            ),
+            DatasetConfig(name='pool/b', recursive=True),
+        ],
+        destinations={'offsite': Destination(url='ssh://h/pool')},
+        remote_backup=RemoteServerConfig(target_dataset='pool/recv'),
+        client_id_file=Path('/x/id'),
+    )
+    data.update(over)
+    return BackupConfig(**data)
+
+
+@pytest.mark.unit
+class TestSameAs:
+    def test_two_independently_built_identical_configs_are_the_same(self):
+        assert _rich_config().same_as(_rich_config())
+
+    def test_a_config_is_the_same_as_itself_and_a_deepcopy(self):
+        import copy
+
+        c = _rich_config()
+        assert c.same_as(c)
+        assert c.same_as(copy.deepcopy(c))
+        assert copy.deepcopy(c).same_as(c)
+
+    def test_a_pickle_round_trip_is_the_same(self):
+        import pickle
+
+        c = _rich_config()
+        assert c.same_as(pickle.loads(pickle.dumps(c)))
+
+    def test_a_literal_only_difference_is_not_the_same_though_equal(self):
+        """`1h` and `60m` are `==` (Duration inherits timedelta's `__eq__`),
+        but are different operator-visible text: the whole point of `same_as`."""
+        a = _rich_config(check_interval=Duration('1h'))
+        b = _rich_config(check_interval=Duration('60m'))
+        assert a.check_interval == b.check_interval
+        assert a == b                       # dataclass == cannot see the literal
+        assert not a.same_as(b) and not b.same_as(a)
+
+    @pytest.mark.parametrize(
+        "path",
+        ['dataset_freq', 'retention_age', 'retention_keep', 'remote_freq',
+         'remote_retention_age', 'remote_retention_keep'],
+    )
+    def test_a_literal_only_difference_deep_in_the_tree_is_seen(self, path):
+        b = _rich_config()
+        ds = b.datasets[0]
+        if path == 'dataset_freq':
+            ds.frequency = Duration('60m')
+        elif path == 'retention_age':
+            ds.retention_rules[0] = RetentionRule(Duration('24h'), ds.retention_rules[0].keep_for)
+        elif path == 'retention_keep':
+            ds.retention_rules[0] = RetentionRule(ds.retention_rules[0].age, Duration('28d'))
+        elif path == 'remote_freq':
+            ds.remote[0].frequency = Duration('1800s')
+        elif path == 'remote_retention_age':
+            rr = ds.remote[0].retention_rules[0]
+            ds.remote[0].retention_rules[0] = RetentionRule(Duration('48h'), rr.keep_for)
+        elif path == 'remote_retention_keep':
+            rr = ds.remote[0].retention_rules[0]
+            ds.remote[0].retention_rules[0] = RetentionRule(rr.age, Duration('56d'))
+        a = _rich_config()
+        assert a == b                        # equal by value...
+        assert not a.same_as(b)              # ...different by literal
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda c: setattr(c, 'snapshot_prefix', 'other'),
+            lambda c: setattr(c, 'check_interval', Duration('6m')),
+            lambda c: setattr(c, 'api_port', 9999),
+            lambda c: setattr(c, 'api_host', '0.0.0.0'),
+            lambda c: setattr(c, 'dry_run', True),
+            lambda c: setattr(c, 'client_id_file', Path('/x/y')),
+            lambda c: setattr(c.datasets[0], 'recursive', True),
+            lambda c: setattr(c.datasets[0], 'enabled', False),
+            lambda c: setattr(c.datasets[1], 'name', 'pool/c'),
+            lambda c: c.datasets[0].remote[0].__setattr__('destination', 'elsewhere'),
+            lambda c: c.destinations['offsite'].__setattr__('url', 'ssh://other/pool'),
+            lambda c: c.destinations.update(extra=Destination(url='ssh://x/y')),
+            lambda c: setattr(c.remote_backup, 'enabled', False),
+            lambda c: setattr(c, 'remote_backup', None),
+            lambda c: c.datasets.append(DatasetConfig(name='pool/c')),
+            lambda c: c.datasets[0].retention_rules.pop(),
+            lambda c: setattr(c, 'prune_interval', None),
+            lambda c: setattr(c, 'prune_interval', Duration('2h')),
+            lambda c: setattr(c.remote_backup, 'target_dataset', 'pool/other'),
+            lambda c: setattr(c.datasets[0].remote[0], 'frequency', None),
+            lambda c: setattr(c.datasets[0].remote[0], 'frequency', Duration('31m')),
+            lambda c: c.datasets[0].remote[0].retention_rules.clear(),
+            lambda c: setattr(c.datasets[0], 'frequency', Duration('2h')),
+        ],
+        ids=[
+            'prefix', 'check_interval_value', 'api_port', 'api_host', 'dry_run',
+            'client_id_file', 'recursive', 'enabled', 'dataset_name',
+            'remote_destination', 'destination_url', 'extra_destination',
+            'remote_backup_flag', 'remote_backup_none', 'dataset_added',
+            'retention_rule_dropped', 'prune_interval_to_none', 'prune_interval_value',
+            'target_dataset', 'remote_freq_to_none', 'remote_freq_value',
+            'remote_override_emptied', 'dataset_freq_value',
+        ],
+    )
+    def test_any_value_difference_is_not_the_same(self, mutate):
+        b = _rich_config()
+        mutate(b)
+        assert not _rich_config().same_as(b)
+        assert not b.same_as(_rich_config())
+
+    def test_dataset_order_is_a_difference(self):
+        a = _rich_config()
+        b = _rich_config()
+        b.datasets.reverse()
+        assert not a.same_as(b)
+
+    def test_retention_rule_order_is_a_difference(self):
+        a = _rich_config()
+        b = _rich_config()
+        b.datasets[0].retention_rules.reverse()
+        assert not a.same_as(b)
+
+    def test_destination_dict_order_is_not_a_difference(self):
+        a = _rich_config(destinations={
+            'one': Destination(url='ssh://1/p'), 'two': Destination(url='ssh://2/p'),
+        })
+        b = _rich_config(destinations={
+            'two': Destination(url='ssh://2/p'), 'one': Destination(url='ssh://1/p'),
+        })
+        assert a.same_as(b)
+
+    def test_a_bare_timedelta_against_a_duration_compares_values_only(self):
+        """A bare `timedelta` has no literal to compare."""
+        a = _rich_config(check_interval=timedelta(minutes=5))
+        b = _rich_config(check_interval=Duration('5m'))
+        assert a.same_as(b) and b.same_as(a)
+        c = _rich_config(check_interval=Duration('6m'))
+        assert not a.same_as(c)
+
+    def test_a_timedelta_never_equals_a_non_timedelta(self):
+        a = _rich_config(check_interval=Duration('5m'))
+        b = _rich_config(check_interval=300)
+        assert not a.same_as(b) and not b.same_as(a)
+
+    def test_none_against_a_value_is_a_difference_both_ways(self):
+        a = _rich_config(prune_interval=None)
+        b = _rich_config(prune_interval=Duration('1h'))
+        assert not a.same_as(b) and not b.same_as(a)
+        assert a.same_as(_rich_config(prune_interval=None))
+        c = _rich_config()
+        c.datasets[0].remote[0].frequency = None
+        assert not c.same_as(_rich_config()) and not _rich_config().same_as(c)
+
+    @pytest.mark.parametrize("other", [None, 'x', 42, {}, object()])
+    def test_a_wrong_type_is_not_the_same(self, other):
+        assert not _rich_config().same_as(other)
+
+    def test_a_subclass_is_not_the_same(self):
+        class Sub(BackupConfig):
+            pass
+
+        base = _rich_config()
+        sub = Sub(**{f: getattr(base, f) for f in base.__dataclass_fields__})
+        assert not base.same_as(sub)
+
+    def test_a_bool_is_not_an_int(self):
+        a = _rich_config(api_port=1)
+        b = _rich_config(api_port=True)
+        assert not a.same_as(b)
+
+    def test_a_config_loaded_twice_from_the_same_yaml_is_the_same(self, tmp_path):
+        f = tmp_path / 'c.yaml'
+        f.write_text(
+            "check_interval: 600s\nprune_interval: 90m\n"
+            "datasets:\n  - name: pool/data\n    frequency: 60m\n"
+            "    retention:\n      1d: 4w\n      1w: 1M\n"
+        )
+        assert BackupConfig.from_file(f).same_as(BackupConfig.from_file(f))
+
+    def test_the_same_yaml_with_one_literal_changed_is_not_the_same(self, tmp_path):
+        body = (
+            "check_interval: {ci}\n"
+            "datasets:\n  - name: pool/data\n    frequency: 1h\n"
+        )
+        a, b = tmp_path / 'a.yaml', tmp_path / 'b.yaml'
+        a.write_text(body.format(ci='1h'))
+        b.write_text(body.format(ci='60m'))
+        ca, cb = BackupConfig.from_file(a), BackupConfig.from_file(b)
+        assert ca == cb and not ca.same_as(cb)
+
+
+def _walk_dataclasses(obj, found=None):
+    """Every dataclass instance reachable from `obj` (lists, dicts, fields)."""
+    import dataclasses
+
+    found = [] if found is None else found
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        found.append(obj)
+        for f in dataclasses.fields(obj):
+            _walk_dataclasses(getattr(obj, f.name), found)
+    elif isinstance(obj, (list, tuple)):
+        for x in obj:
+            _walk_dataclasses(x, found)
+    elif isinstance(obj, dict):
+        for x in obj.values():
+            _walk_dataclasses(x, found)
+    return found
+
+
+def _changed(value):
+    """A value of the same kind that differs from `value` in VALUE."""
+    from datetime import timedelta as _td
+
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int):
+        return value + 1
+    if isinstance(value, float):
+        return value + 1.0
+    if isinstance(value, str):
+        return value + 'x'
+    if isinstance(value, Path):
+        return value / 'changed'
+    if isinstance(value, _td):
+        return Duration(value + _td(seconds=7))
+    if isinstance(value, list):
+        return value[:-1] if value else [object()]
+    if isinstance(value, dict):
+        new = dict(value)
+        new['__added__'] = next(iter(value.values())) if value else None
+        return new
+    raise AssertionError(f"extend _changed() for {type(value).__name__}")
+
+
+@pytest.mark.unit
+class TestSameAsCoversEveryField:
+    """A guard, not a sample: every field of every config dataclass must move
+    `same_as`. A new field, or a `field(compare=False)`, cannot slip through."""
+
+    def _classes_in_model(self):
+        import dataclasses
+
+        import zfsbackup.config.model as model
+
+        return {
+            obj for obj in vars(model).values()
+            if isinstance(obj, type) and dataclasses.is_dataclass(obj)
+            and obj.__module__ == model.__name__
+        }
+
+    def test_the_sample_config_reaches_every_config_dataclass(self):
+        reached = {type(o) for o in _walk_dataclasses(_rich_config())}
+        missing = self._classes_in_model() - reached
+        assert not missing, (
+            f"add {sorted(c.__name__ for c in missing)} to _rich_config so the "
+            "field guard below covers them"
+        )
+
+    def test_every_field_of_every_instance_is_detected(self):
+        import copy
+        import dataclasses
+
+        base = _rich_config()
+        instances = _walk_dataclasses(base)
+        checked = 0
+        for index, inst in enumerate(instances):
+            for f in dataclasses.fields(inst):
+                variant = copy.deepcopy(base)
+                target = _walk_dataclasses(variant)[index]
+                current = getattr(target, f.name)
+                if dataclasses.is_dataclass(current):
+                    continue                  # walked as an instance in its own right
+                assert current is not None, (
+                    f"{type(inst).__name__}.{f.name} is None in the sample config; "
+                    "give _rich_config a value"
+                )
+                setattr(target, f.name, _changed(current))
+                assert not base.same_as(variant), f"{type(inst).__name__}.{f.name}"
+                assert not variant.same_as(base), f"{type(inst).__name__}.{f.name}"
+                checked += 1
+        assert checked >= 25
+
+    def test_no_dataclass_carries_state_outside_its_fields(self):
+        """A plain attribute (not a field) is invisible to `fields()`, hence to
+        `same_as`."""
+        import dataclasses
+
+        for inst in _walk_dataclasses(_rich_config()):
+            names = {f.name for f in dataclasses.fields(inst)}
+            assert set(vars(inst)) <= names, type(inst).__name__
+
+    def test_no_field_opts_out_of_comparison(self):
+        import dataclasses
+
+        for cls in self._classes_in_model():
+            for f in dataclasses.fields(cls):
+                assert f.compare, f"{cls.__name__}.{f.name} is compare=False"
+
+    def test_duration_state_is_value_plus_literal_only(self):
+        d = Duration('1h')
+        assert set(vars(d)) <= {'_literal'}

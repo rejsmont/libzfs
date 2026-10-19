@@ -30,16 +30,27 @@ The transfer *happy path* is verified working end-to-end over two real VMs — s
 - Default `api_host` is `127.0.0.1` (safe but useless for remote backup). The moment you
   bind `0.0.0.0` to make the feature work, it is wide open to anything routable.
 
+- Since live reload (Phase 3): **any peer can postpone the API worker's config switch
+  indefinitely.** On a reload the API worker waits for in-flight receives and never cuts them
+  (decision D5). The only per-stream bound is the 600 s websocket idle timeout. So an
+  unauthenticated peer that opens `/stream` and sends a frame every ~10 minutes keeps the old
+  configuration running on the server side. This is deliberately not capped. Authentication (this
+  item) is the fix, because it limits streams to trusted senders.
+
 Path traversal via `client_id`/`dataset` is *mitigated* (the `Validate` name regex rejects
 `..` and shell metacharacters) but handled by raising an uncaught `ValueError` → HTTP 500
 rather than a clean rejection.
 
-### B2 — `requests` is imported but is not a declared dependency
-`zfsbackup/remote.py:11` does `import requests`, but `pyproject.toml` declares only
-`pyyaml`, `flask`, `flask-sock`, `websocket-client`. `requests` is present only transitively
-via the **dev**-only `requests-mock`. A clean `poetry install --without dev` yields an
-environment where the entire client-side remote-backup path dies with `ModuleNotFoundError`
-on first use. (The two-VM harness works around this by `pip install requests` explicitly.)
+### ~~B2 — `requests` is imported but is not a declared dependency~~ — **RESOLVED**
+`zfsbackup/remote.py:11` does `import requests`, but `pyproject.toml` declared only
+`pyyaml`, `flask`, `flask-sock`, `websocket-client`. `requests` was present only transitively
+via the **dev**-only `requests-mock`. A clean `poetry install --without dev` yielded an
+environment where the entire client-side remote-backup path died with `ModuleNotFoundError`
+on first use. (The two-VM harness worked around this by `pip install requests` explicitly.)
+
+**Resolved** by item 1 of [config_db_cli_plan.md](config_db_cli_plan.md): `requests = "^2.31"` is now a
+declared direct dependency. `click` was promoted from transitive-via-Flask to direct in the same change,
+closing the identical latent gap before it could bite.
 
 ---
 
@@ -73,17 +84,34 @@ on first use. (The two-VM harness works around this by `pip install requests` ex
   loads retention rules from a base64 property the client wrote (`backup_manager.py:168`),
   and there is no server-side anchor protection, so a misconfigured/malicious client can
   drive deletion of its own server-side history down to the newest snapshot.
+  *(Update 2026-10-18: the pruner now protects every local or received `org.zfsbackup:anchor.*`
+  snapshot. Conversely, because the receive path has no auth and `zfs receive` does not strip
+  user properties, a modified client could send a `-p` stream carrying `anchor.*` properties
+  that pin snapshots on the server indefinitely — no new exposure, since `retention: forever`
+  in the client-supplied config already does the same.)*
 
 ---
 
 ## Operations
 
-- No systemd unit / daemonization / PID file; the daemon runs foreground only.
-- Worker auto-restart loops every 5s indefinitely with no backoff cap (`daemon.py`).
-- `--test-config` validates parsing only — not that datasets exist or destinations resolve.
-- Flask's dev server (`app.run`) is used in the `ApiWorker` — not a production WSGI server.
+- *(Updated 2026-10-19.)* A documented systemd unit ships in `zfsbackup/README.md`: `Type=notify-reload`
+  (systemd ≥ 253; `Type=notify` + `ExecReload` for older), `NotifyAccess=main`, `KillMode=mixed` and
+  `TimeoutStopSec`. The daemon sends `READY`/`RELOADING`/`STOPPING`/`STATUS` via `sd_notify`, holds a
+  presence lock and pid file (`<db>.daemon.pid`), and reloads its configuration live on SIGHUP and on a
+  10 s poll.
+- Worker restarts use exponential backoff (5 s to 80 s). After 6 consecutive short-lived crashes the
+  daemon exits 1 and names the configuration generation (A-5, D9). Workers orphaned by a dead forkserver
+  are not counted.
+- *(Resolved 2026-10-19.)* A reload bind-probes a changed API address; one that cannot be bound is
+  *deferred* (re-checked every poll) instead of crash-looping the API worker into D9. Residual: a port
+  taken between the probe and the bind, or a third party already on `new_host:port` after a host-only
+  change, still ends in D9. The supervisor makes no `zfs` call, so a hung pool no longer stalls reloads,
+  signals or restarts.
+- `--test-config` validates the config and builds the dataset list. It does not check that datasets
+  exist or that destinations resolve.
+- Werkzeug's development server (`make_server`) is used in the `ApiWorker` — not a production WSGI server.
 
-**Good:** graceful `SIGINT`/`SIGTERM` shutdown via a shared `Event`; anchor-aware retention
+**Good:** graceful `SIGINT`/`SIGTERM` shutdown via a shared `StopFlag` (was a `multiprocessing.Event`, which wedged the supervisor whenever a worker died mid-`wait()` — see plan item 8x); anchor-aware retention
 math is correct under the real_zfs tests; dataset-name validation blocks injection.
 
 ---
@@ -98,8 +126,9 @@ unfinished areas are the security layer and resume.
 
 ## Suggested remediation order
 
-1. B2 (declare `requests`) — trivial, unblocks clean installs.
+1. ~~B2 (declare `requests`)~~ — done.
 2. B1 (auth + TLS on the API; validate/authorize `client_id`) — the real deployment gate.
 3. H5 (`-i` → `-I`) and H4 (finish or remove resume) — correctness/completeness.
 4. M6 (surface backup failures) and M7/M8 (pruning safety) — reliability hardening.
-5. Ops (systemd unit, production WSGI, restart backoff).
+5. Ops: production WSGI, and the reload-time API bind check (the systemd unit and restart backoff are
+   done).
