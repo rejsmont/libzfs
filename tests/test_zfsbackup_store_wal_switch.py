@@ -484,6 +484,13 @@ def _timer_stretch(samples: int = 20, nominal: float = 0.01) -> float:
 _MAX_TIMER_STRETCH = 1.6
 
 
+# The shared/exclusive-holder test's bound is (budget + busy_timeout) * stretch
+# + slack. The regression it guards against ("5 s" stretching to ~25x) is a
+# wait of ~25 * budget; past this stretch the scaled bound approaches that
+# and no longer separates the two.
+_MAX_TIMER_STRETCH_HOLDERS = 4.0
+
+
 class TestRealWaits:
     """Real clock, real sleeps, reduced constants (each test well under 2 s)."""
 
@@ -530,8 +537,22 @@ class TestRealWaits:
         """Attempts wait inside SQLite's busy handler as well as between
         sleeps; a budget counted only in sleeps let a SHARED holder stretch "5 s"
         to ~25x that. The deadline is wall clock and each attempt's
-        `busy_timeout` is clipped to what is left."""
+        `busy_timeout` is clipped to what is left.
+
+        The upper bound is scaled by the host's measured sleep granularity
+        (see `_timer_stretch`: SQLite counts nominal, not real, busy-handler
+        sleep time), and the test is skipped when that is too coarse to tell
+        a stretched timer from the ~25x regression."""
+        stretch = _timer_stretch()
+        if stretch > _MAX_TIMER_STRETCH_HOLDERS:
+            pytest.skip(
+                f"timer too coarse for a real-clock bound: sleep(0.01) takes "
+                f"{stretch:.1f}x as long as asked, and SQLite's busy handler "
+                f"counts nominal rather than real sleep time"
+            )
         budget, busy_ms = 0.4, 400
+        upper = (budget + busy_ms / 1000) * max(1.0, stretch) + 0.5
+        assert upper < 25 * budget
         monkeypatch.setattr(store_db, "_WAL_SWITCH_BUDGET_S", budget)
         monkeypatch.setattr(store_db, "_BUSY_TIMEOUT_MS", busy_ms)
 
@@ -557,7 +578,7 @@ class TestRealWaits:
             reader_cursor.close()
             reader.close()
         assert store_db._is_busy_error(excinfo.value)
-        assert budget - 0.05 <= shared_elapsed < budget + busy_ms / 1000 + 0.5
+        assert budget - 0.05 <= shared_elapsed < upper, (shared_elapsed, stretch)
         assert _header(path) == (1, 1)
 
         # (b) a foreign BEGIN EXCLUSIVE: even acquiring SHARED waits
@@ -576,7 +597,7 @@ class TestRealWaits:
             holder.execute("ROLLBACK")
             holder.close()
         assert store_db._is_busy_error(excinfo.value)
-        assert budget - 0.05 <= exclusive_elapsed < budget + busy_ms / 1000 + 0.5
+        assert budget - 0.05 <= exclusive_elapsed < upper, (exclusive_elapsed, stretch)
         assert _header(path) == (1, 1)
 
 

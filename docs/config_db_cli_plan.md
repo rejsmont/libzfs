@@ -41,7 +41,7 @@ carries a status note or "as landed" text — where those disagree with the prop
 | 10–16 Config CLI | done | Landed in order 10 → 15 → 13 → 11 → 12 → 14 → 16; see the per-item "as landed" notes |
 | 17–20 Live reload | done | 17.0 → G1; 18.0, 17.1, 18.1–18.5 → G2; 17.2 → G3; 19.1, 19.2 → G4; tests (20) alongside each |
 | 21–23 Docs, scenarios, final review | **done 2026-10-18** | 22: Linux mocked suite on zfsb-perm 5835 passed / 0 failed (all [L] tests as user and root); `test_config_permissions.sh` 239/0 incl. live reload (f) and recycled-pid forgery (f4c); `test_two_vm_backup.sh` 50/0. 23: both final reviews passed after the must-fixes (early-SIGHUP ignore, file-open proof, stop before reload read, SQLAlchemy 2.1 float map, `mode=rw` readers). Deferred follow-ups listed under Gate results. |
-| Follow-ups round | **done 2026-10-19** (VM pass pending) | Every Phase 3 deferral plus older ones (`_` prefix, recursive pruning) and libzfseasy name/send fixes; see "Follow-ups round (2026-10-19)" under Gate results |
+| Follow-ups round | **done 2026-10-19**, VM pass green | Every Phase 3 deferral plus older ones (`_` prefix, recursive pruning) and libzfseasy name/send fixes; see "Follow-ups round (2026-10-19)" under Gate results |
 
 > *(Historical — written for Phases 0–2; the reload design described here is superseded by the revised Phase 3 section.)* **All design questions are settled; no open decisions remain.** Items 2 (duration handling) and 5 (fork
 > safety) were the gating pair: **item 2 = full `Duration` value type** subclassing `timedelta`, with
@@ -2119,7 +2119,15 @@ Two lanes run in parallel (disjoint owners); everything inside the daemon lane i
   - **libzfseasy:** strict ASCII name validation (fullmatch), spaces allowed inside names, `.`/`..` and
     >255-character names refused, the binary send EOF spin fixed and pipes closed on failure. The 2026-07
     exec-path list had already been fixed in `a8a3d88`.
-  - Still to run: the Linux VM pass (forkserver default, pidfd, abstract sockets, `Type=notify-reload`).
+  - **Linux VM pass (2026-10-19, Python 3.14.4 forkserver default, OpenZFS 2.4.1, systemd 259).** The first
+    pass found two pre-existing problems — SQLAlchemy 2.1 incompatibility (a fresh install of `^2.0` gets
+    2.1) and OpenZFS 2.4's new `default*quota` properties breaking libzfseasy `get all` — plus test-only
+    issues (stale real fixture, root assumptions, Linux datagram queue limit, coarse VM timers). All fixed
+    (user decisions: port to 2.1 and test both, CI job added; accept property names zfs returns). Re-run on
+    669450a: mocked suite 7213 passed as user and 7149 as root (0 failed), real_zfs 31/0,
+    `test_config_permissions.sh` 304/0 (new groups: deferred busy port, `Type=notify-reload` unit),
+    `test_two_vm_backup.sh` 67/0 (new: rename clear with a running daemon, received datasets pruned
+    non-recursively). Only a coarse-timer bound flaked once, then got timer scaling.
 
 ### Item 17.0 — Store id and cheap store state *(store)*
 
