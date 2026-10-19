@@ -60,11 +60,36 @@ closing the identical latent gap before it could bite.
   the real end-to-end tests are `-m "not real_zfs"` by default, so the WebSocket `/stream`
   receive path has no coverage in a normal run. Any quoted coverage number describes
   `libzfseasy` only.
-- **H4 — Resume is half-built and untested.** The client sends `?from=<snap>`
-  (`remote.py:141`) but the server never reads that query parameter (`api.py`, `/stream`
-  handler) — dead code. No interrupt-then-resume test exists; the resume probe swallows all
-  exceptions.
-- **H5 — Incremental sends use `-i`, not `-I`.** `remote.py:198` emits a single increment,
+- **H4 — Resume.** *(Resolved 2026-10-19 on branch `libzfseasy-fixes`.)* Before this, the server's
+  `/resume_token` always returned 500 (libzfseasy refused the `receive_resume_token` property), so resume
+  never ran, and nothing ever called `zfs receive -A`: one interrupted transfer could block a dataset until
+  an operator cleared it. Now:
+  - **The client checks the token before using it:** `zfs send -nv -t` decodes it; the target must match a
+    managed local snapshot of the same dataset by GUID (a token's `toname` goes stale after a rename); the
+    source must be older; no send flags are allowed (our plain send records none).
+  - **Only definitive staleness leads to a fresh send.** Anything uncertain skips the cycle rather than
+    discard the server's partial progress.
+  - **`/stream?mode=fresh|resume`:** on `fresh`, the server discards stale partial state with an
+    idempotent `zfs receive -A`.
+  - **Recording and catch-up:** the anchor records the snapshot actually sent, never backwards. A resume
+    of an older snapshot continues to `latest` in the same cycle.
+  - **In-flight pin:** `org.zfsbackup:inflight.<dest>` protects snapshots being sent from pruning.
+  - **Collisions:** two client datasets that map to the same server dataset are refused with 409.
+  - **Per-dataset lock:** a second stream for the same server dataset gets a retryable "busy".
+  - **Covered by:** two-VM scenario J (interrupt, resume, stale token, pin, collision).
+  - **Remaining caveats:**
+    - Client and server must be upgraded together. A new client treats an old server's `/resume_token`
+      500 as uncertain and skips every cycle; an old client's `/stream` without `?mode=` is refused by a
+      new server.
+    - The "definitively stale" check matches zfs's English messages. `resume_info` runs with
+      `LC_ALL=C` so localized hosts still match, but any token problem that isn't on the definitive list
+      (an unfamiliar wording from another OpenZFS version, EIO) skips the cycle until the server operator
+      runs `zfs receive -A`. That favours keeping partial progress over making progress.
+    - With no auth or TLS (B1), token checks happen only on the client.
+    - Sending an encrypted dataset in plaintext is still possible on a *fresh* send. That isn't a resume
+      issue; it needs a `raw` option and server-side key handling.
+    - Resume with H5's `-I` is untested.
+- **H5 — Incremental sends use `-i`, not `-I`.** `RemoteBackupManager._transfer` (`remote.py`) emits a single increment,
   so snapshots created *between* two backups are never replicated; the server's history
   diverges from the client's. **Live-confirmed** in the two-VM run: the server was missing
   intermediate snapshots the client had.
@@ -120,7 +145,7 @@ math is correct under the real_zfs tests; dataset-name validation blocks injecti
 
 `CLAUDE.md`'s "SnapshotManager partially wired in / daemon loop in progress" is **stale** —
 the daemon loop, workers, and pruning are implemented and functioning. The genuinely
-unfinished areas are the security layer and resume.
+unfinished area is the security layer (resume was finished 2026-10-19).
 
 ---
 
@@ -128,7 +153,7 @@ unfinished areas are the security layer and resume.
 
 1. ~~B2 (declare `requests`)~~ — done.
 2. B1 (auth + TLS on the API; validate/authorize `client_id`) — the real deployment gate.
-3. H5 (`-i` → `-I`) and H4 (finish or remove resume) — correctness/completeness.
+3. H5 (`-i` → `-I`) — correctness/completeness. (H4, resume, is done.)
 4. M6 (surface backup failures) and M7/M8 (pruning safety) — reliability hardening.
 5. Ops: production WSGI, and the reload-time API bind check (the systemd unit and restart backoff are
    done).
