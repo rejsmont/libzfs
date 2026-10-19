@@ -978,9 +978,11 @@ class TestReadZfsbackupPropertiesRawParse:
 
     Item 15.5: `read_zfsbackup_properties` reads the raw `zfs get` lines and
     filters BEFORE anything becomes a libzfseasy object. `zfs.get(...)` builds
-    `ZFS` objects whose `update()` raises `ValueError` for a local/received
-    built-in property libzfseasy does not know (zvol `volthreading`, FreeBSD
-    `jailed`), so the old shape made rename/edit fail on such datasets."""
+    `ZFS` objects for every property of the dataset. libzfseasy used to raise
+    `ValueError` there for a local/received built-in it does not know (zvol
+    `volthreading`, FreeBSD `jailed`); it now keeps such names as extras, so the
+    raw parse is about doing only the work needed (our names, exact values,
+    local/received sources), not about avoiding that failure."""
 
     #: Real-shaped `-o name,property,value,received,source` output with
     #: built-in properties libzfseasy has no class for.
@@ -999,14 +1001,29 @@ class TestReadZfsbackupPropertiesRawParse:
         mock_subprocess.setup(stdout=_zget('pool/zv', [(prop, value, 'local')], ptype='volume'))
         assert read_zfsbackup_properties(Dataset('pool/zv')) == {}
 
-    def test_the_same_output_would_have_broken_the_object_path(self, mock_subprocess):
-        """Control: this is the failure the raw parse avoids. Building ZFS
-        objects from the identical output raises for the unknown property."""
+    def test_the_object_path_now_accepts_the_same_output_as_extras(self, mock_subprocess):
+        """Control: building ZFS objects from the identical output no longer raises (libzfseasy keeps well-formed
+        native names it does not know in an extras store), so the raw parse is not needed to avoid a failure. It is
+        kept for what the object path would still not give: only our user properties, exact tab-containing values,
+        and local/received sources only."""
         import libzfseasy as zfs
 
         mock_subprocess.setup(stdout=_zget('pool/zv', self.UNKNOWN_BUILTINS, ptype='volume'))
-        with pytest.raises(ValueError):
-            list(zfs.get(Dataset('pool/zv'), properties=['all'], sources=['local', 'received']))
+        (obj,) = list(zfs.get(Dataset('pool/zv'), properties=['all'], sources=['local', 'received']))
+        assert obj['volthreading'].value == 'off'
+        assert obj['jailed'].value == 'on'
+        assert sorted(obj._extra_props) == ['jailed', 'volthreading']
+        assert obj[PROP_CONFIG].value == 'cfg'
+
+    def test_the_raw_parse_still_returns_only_our_names_with_exact_values(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_zget('pool/zv', self.UNKNOWN_BUILTINS + [
+            (A + 'tabbed', 'left\tright', 'local'),
+            (A + 'recv', 'x\ty', 'received'),
+            (A + 'inh', 'nope', 'inherited from pool'),
+        ], ptype='volume'))
+        assert read_zfsbackup_properties(Dataset('pool/zv')) == {
+            PROP_CONFIG: 'cfg', A + 'tabbed': 'left\tright', A + 'recv': 'x\ty',
+        }
 
     def test_the_exact_command_line(self, mock_subprocess, monkeypatch):
         monkeypatch.setenv('ZFS_CMD', '/usr/bin/true')
