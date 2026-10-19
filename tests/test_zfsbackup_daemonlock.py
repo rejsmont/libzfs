@@ -1583,15 +1583,32 @@ class TestContentionWindow:
         assert len(virtual_time.sleeps) == self._polls_in_a_window(0.2, daemonlock._CONTENTION_POLL)
 
     def test_a_real_transient_holder_still_works_against_the_real_clock(
-        self, db, lockfile, held, real_contention_window
+        self, db, lockfile, held, real_contention_window, monkeypatch
     ):
-        """One smoke test on real time, with only a loose bound: the holder lets
-        go after ~0.3 s and `acquire` succeeds well inside the window."""
-        lockfile.write_text("")
-        thread, stop = _transient_holder(lockfile, fcntl.LOCK_EX, 0.3)
-        held.append(acquire(db))
+        """One smoke test on the real clock and real `flock`, with no timing assumption: the
+        holder lets go the moment `acquire` first sleeps (a spy on the real `time.sleep`), so the
+        release can neither come late (a loaded VM) nor early (before `acquire` first contends).
+        `acquire` must then succeed on its next attempt, after exactly one real poll."""
+        lockfile.write_text("")  # contention needs the file to exist
+        fd = os.open(str(lockfile), os.O_RDONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        sleeps = []
+        real_sleep = time.sleep
+
+        def release_on_first_sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 1:
+                os.close(fd)
+            real_sleep(seconds)
+
+        monkeypatch.setattr(daemonlock.time, "sleep", release_on_first_sleep)
+        try:
+            held.append(acquire(db))
+        finally:
+            if len(sleeps) == 0:  # acquire never contended: do not leak the descriptor
+                os.close(fd)
         assert held[-1].held
-        thread.join(5)
+        assert sleeps == [daemonlock._CONTENTION_POLL]
 
     def test_an_uncontended_acquire_never_sleeps(self, db, held, monkeypatch):
         spy = _SleepSpy(monkeypatch)
@@ -3595,20 +3612,34 @@ class TestHoldWorkersLock:
             assert daemonlock.hold_workers_lock(daemonlock.workers_lock_path(db)) is None
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
-    def test_a_transient_exclusive_holder_is_retried(self, db, real_contention_window):
+    def test_a_transient_exclusive_holder_is_retried(self, db, real_contention_window, monkeypatch):
+        """The holder (a momentary `workers_present` LOCK_EX) lets go the moment
+        `hold_workers_lock` first sleeps -- a spy on the real `time.sleep` -- so the
+        release can be neither late nor early, and no wall-clock duration is asserted."""
         path = daemonlock.ensure_workers_lock(db)
-        thread, stop = _transient_holder(path, fcntl.LOCK_EX, 0.3)
-        started = time.monotonic()
-        fd = daemonlock.hold_workers_lock(path)
-        elapsed = time.monotonic() - started
-        thread.join(5)
+        holder = os.open(str(path), os.O_RDONLY)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        sleeps = []
+        real_sleep = time.sleep
+
+        def release_on_first_sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 1:
+                os.close(holder)
+            real_sleep(seconds)
+
+        monkeypatch.setattr(daemonlock.time, "sleep", release_on_first_sleep)
+        fd = None
         try:
+            fd = daemonlock.hold_workers_lock(path)
             assert fd is not None, "a momentary LOCK_EX (workers_present) must not lose the worker its lock"
-            assert 0.2 <= elapsed < real_contention_window + 1
+            assert sleeps == [daemonlock._CONTENTION_POLL]  # one real poll, then the lock was free
             assert fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
         finally:
             if fd is not None:
                 os.close(fd)
+            if not sleeps:  # never contended: do not leak the holder descriptor
+                os.close(holder)
 
     def test_a_persistent_exclusive_holder_gives_up_with_a_warning_and_no_leak(self, db, monkeypatch, caplog):
         monkeypatch.setattr(daemonlock, "_CONTENTION_WINDOW", 0.15)

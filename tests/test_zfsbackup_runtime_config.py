@@ -84,9 +84,17 @@ _EXPECTED = {
     "tank/scratch": [("1:00:00", "2:00:00")],
 }
 
-# Real-time window each writer/reader pair runs for. Short on purpose --
-# see module docstring.
-_SOAK_SECONDS = 1.5
+# The soaks are COUNT-based, not time-based: they run until the writer has
+# committed `_SOAK_MIN_COMMITS` imports AND the reader has completed
+# `_SOAK_MIN_READS` reads (the control additionally until it has seen a torn
+# read), bounded only by a generous `_SOAK_DEADLINE`. A fixed wall-clock window
+# measures how fast the host is, not whether the code is right: a loaded CI box
+# used to finish few enough commits to fail `commits > 20` with correct code.
+# The deterministic interleaving test below proves the fix and the harness's
+# sensitivity without any race at all; the soaks only add real concurrency.
+_SOAK_MIN_COMMITS = 60
+_SOAK_MIN_READS = 200
+_SOAK_DEADLINE = 90
 _JOIN_TIMEOUT = 20
 
 
@@ -141,7 +149,7 @@ def _load_runtime_config_no_snapshot(resolved):
         return load_config(session)
 
 
-def _reader_loop(db_path: str, stop, out, use_snapshot: bool) -> None:
+def _reader_loop(db_path: str, stop, out, use_snapshot: bool, read_count, torn_count) -> None:
     """Runs in its own process. Loops the given reader shape until `stop`
     is set (set either by the caller's timer or by this function itself
     once its own window has run out), tallying `ok`/`torn`/`exc` against
@@ -162,6 +170,8 @@ def _reader_loop(db_path: str, stop, out, use_snapshot: bool) -> None:
             exc += 1
             if len(samples) < 3:
                 samples.append(f"EXC {type(e).__name__}: {e}")
+            with read_count.get_lock():
+                read_count.value = ok + torn + exc
             continue
         seen = _seen(config)
         if seen == _EXPECTED:
@@ -170,14 +180,35 @@ def _reader_loop(db_path: str, stop, out, use_snapshot: bool) -> None:
             torn += 1
             if len(samples) < 3:
                 samples.append(f"TORN {seen}")
+        # shared tallies, so the parent can stop the soak on COUNTS
+        with read_count.get_lock():
+            read_count.value = ok + torn + exc
+        with torn_count.get_lock():
+            torn_count.value = torn
     dispose_all()
     out.put((ok, torn, exc, samples))
 
 
-def _run_soak(tmp_path: Path, *, use_snapshot: bool, seconds: float = _SOAK_SECONDS):
+def _run_soak(
+    tmp_path: Path,
+    *,
+    use_snapshot: bool,
+    min_commits: int = _SOAK_MIN_COMMITS,
+    min_reads: int = _SOAK_MIN_READS,
+    until_torn: bool = False,
+    deadline: float = _SOAK_DEADLINE,
+):
     """Seeds a fresh config DB, runs one writer + one reader process
-    concurrently for `seconds` of real wall-clock time, and returns
+    concurrently until the writer has committed `min_commits` imports and the
+    reader has completed `min_reads` reads (and, with `until_torn`, has seen at
+    least one torn read), or `deadline` seconds have passed -- whichever is
+    first; then returns
     `(ok, torn, exc, samples, writer_exitcode, commits)`.
+
+    The stop condition is on counts, never on elapsed time, so a slow host
+    just takes longer instead of failing; the deadline is only a hang guard,
+    and the callers' count assertions turn a deadline stop into a clear
+    failure. A writer or reader that dies early ends the wait at once.
 
     `writer_exitcode`/`commits` exist so a caller can tell "the writer
     ran healthily and actually wrote N times" from "the writer died on
@@ -198,15 +229,30 @@ def _run_soak(tmp_path: Path, *, use_snapshot: bool, seconds: float = _SOAK_SECO
     stop = ctx.Event()
     out = ctx.Queue()
     commit_count = ctx.Value("l", 0)
+    read_count = ctx.Value("l", 0)
+    torn_count = ctx.Value("l", 0)
     writer = ctx.Process(target=_writer_loop, args=(db_path, stop, commit_count))
-    reader = ctx.Process(target=_reader_loop, args=(db_path, stop, out, use_snapshot))
+    reader = ctx.Process(
+        target=_reader_loop, args=(db_path, stop, out, use_snapshot, read_count, torn_count)
+    )
     writer.start()
     reader.start()
-    time.sleep(seconds)
-    stop.set()
     try:
+        give_up = time.monotonic() + deadline
+        while time.monotonic() < give_up:
+            if not (writer.is_alive() and reader.is_alive()):
+                break  # one died: stop waiting, the caller's assertions report it
+            if (
+                commit_count.value >= min_commits
+                and read_count.value >= min_reads
+                and (torn_count.value > 0 or not until_torn)
+            ):
+                break
+            time.sleep(0.05)
+        stop.set()
         ok, torn, exc, samples = out.get(timeout=_JOIN_TIMEOUT)
     finally:
+        stop.set()
         writer.join(_JOIN_TIMEOUT)
         reader.join(_JOIN_TIMEOUT)
         for proc in (writer, reader):
@@ -214,6 +260,98 @@ def _run_soak(tmp_path: Path, *, use_snapshot: bool, seconds: float = _SOAK_SECO
                 proc.terminate()
                 proc.join(5)
     return ok, torn, exc, samples, writer.exitcode, commit_count.value
+
+
+class _CommitAfterDatasetsSelect:
+    """Deterministic interleaving, no processes and no timing: a SQLAlchemy
+    `after_cursor_execute` hook that, right after the reader's SELECT on the
+    `datasets` table (the first statement that returns row identity; the
+    retention rules are fetched per dataset AFTER it), runs `import_yaml` to
+    completion on the calling thread. That is the exact interleaving the
+    soaks only hit by chance: a writer commit landing between a read's
+    statements.
+
+    The hook fires once (the writer's own statements pass through it too, so
+    it disarms itself before importing).
+    """
+
+    def __init__(self, yaml_path, resolved):
+        self.yaml_path, self.resolved = yaml_path, resolved
+        self.fired = 0
+        self._armed = True
+
+    def __enter__(self):
+        from sqlalchemy import event
+        from sqlalchemy.engine import Engine
+
+        def after(conn, cursor, statement, parameters, context, executemany):
+            if self._armed and "FROM datasets" in statement:
+                self._armed = False
+                self.fired += 1
+                import_yaml(self.yaml_path, self.resolved)
+
+        self._listener = after
+        self._event, self._engine = event, Engine
+        event.listen(Engine, "after_cursor_execute", after)
+        return self
+
+    def __exit__(self, *exc_info):
+        self._event.remove(self._engine, "after_cursor_execute", self._listener)
+        return False
+
+
+@pytest.mark.integration
+class TestTornReadDeterministicInterleaving:
+    """The torn-read fix and the harness's sensitivity, proven WITHOUT a race.
+
+    `_CommitAfterDatasetsSelect` commits an import (A -> B, which swaps which
+    dataset owns which row id) between the reader's `datasets` SELECT and its
+    per-dataset retention loads. The unscoped (pre-fix) read must splice the
+    two states; `load_runtime_config` must return one consistent snapshot.
+    Every run is the same, so the assertions are exact -- unlike the soaks
+    below, which can only ever say "no tear seen in N tries".
+
+    Mutation-checked (scratch copy): replacing `read_config`'s `BEGIN`/`COMMIT`
+    with a bare `load_config` fails
+    `test_load_runtime_config_is_one_snapshot_across_a_commit` (1 test).
+    """
+
+    @pytest.fixture
+    def seeded(self, tmp_path):
+        (tmp_path / "a.yaml").write_text(_YAML_A)
+        (tmp_path / "b.yaml").write_text(_YAML_B)
+        resolved = resolve_config_path(str(tmp_path / "config.db"))
+        import_yaml(tmp_path / "a.yaml", resolved)
+        dispose_all()
+        yield tmp_path, resolved
+        dispose_all()
+
+    def test_the_unscoped_read_splices_two_states(self, seeded):
+        tmp_path, resolved = seeded
+        with _CommitAfterDatasetsSelect(tmp_path / "b.yaml", resolved) as hook:
+            config = _load_runtime_config_no_snapshot(resolved)
+
+        assert hook.fired == 1, "the interleaving never happened: the hook did not fire"
+        assert _seen(config) != _EXPECTED, (
+            "the control did not tear under a commit placed between its statements: "
+            "the harness is insensitive"
+        )
+
+    def test_load_runtime_config_is_one_snapshot_across_a_commit(self, seeded):
+        tmp_path, resolved = seeded
+        before = load_runtime_config(resolved).generation
+        with _CommitAfterDatasetsSelect(tmp_path / "b.yaml", resolved) as hook:
+            snapshot = load_runtime_config(resolved)
+
+        assert hook.fired == 1, "the interleaving never happened: the hook did not fire"
+        assert _seen(snapshot.config) == _EXPECTED          # never a splice
+        assert snapshot.generation == before                # ... and wholly the OLD state
+        assert [d.name for d in snapshot.config.datasets] == ["tank/archive", "tank/scratch"]
+        # the commit really landed: the next read is the NEW state, also consistent
+        after = load_runtime_config(resolved)
+        assert after.generation > before
+        assert [d.name for d in after.config.datasets] == ["tank/scratch", "tank/archive"]
+        assert _seen(after.config) == _EXPECTED
 
 
 @pytest.mark.integration
@@ -243,13 +381,13 @@ class TestLoadRuntimeConfigTornReadFix:
         # process) and would not catch this: a dead writer here says
         # nothing about whether the control's writer ran either.
         assert writer_exitcode == 0, "writer process crashed during the soak"
-        assert commits > 20, "writer performed too few imports to be a meaningful soak"
+        assert commits >= _SOAK_MIN_COMMITS, "writer performed too few imports to be a meaningful soak"
         assert exc == 0, samples
         assert torn == 0, samples
         # A weak sanity check that the soak actually ran enough reads to
         # be meaningful -- not the load-bearing assertion, but a torn==0
         # result over zero reads would prove nothing at all.
-        assert ok > 20, "soak produced too few reads to be a meaningful check"
+        assert ok >= _SOAK_MIN_READS, "soak produced too few reads to be a meaningful check"
 
 
 @pytest.mark.integration
@@ -264,10 +402,10 @@ class TestLoadRuntimeConfigTornReadControl:
 
     def test_unscoped_read_does_tear(self, tmp_path):
         ok, torn, exc, samples, writer_exitcode, commits = _run_soak(
-            tmp_path, use_snapshot=False
+            tmp_path, use_snapshot=False, until_torn=True
         )
         assert writer_exitcode == 0, "writer process crashed during the soak"
-        assert commits > 20, "writer performed too few imports to be a meaningful soak"
+        assert commits >= _SOAK_MIN_COMMITS, "writer performed too few imports to be a meaningful soak"
         assert exc == 0, samples
         assert torn > 0, (
             "control did not detect any torn read -- the harness is "
