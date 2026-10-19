@@ -46,14 +46,39 @@ class PropertyNames:
 
 
 class Validate:
+    # All patterns are ASCII-only (matched with re.ASCII) and applied with re.fullmatch, so a trailing newline or a
+    # non-ASCII word character can never slip through.
+    #
+    # `name` is the space-free character run used for property names (and, via `zfsname`, the sort/attribute
+    # validators). `short` is the snapshot / bookmark short name: it additionally allows spaces, but only *inside*
+    # (never leading or trailing). Dataset components follow the same rule but additionally may not start with `.`
+    # or `-`. Pool names stay space-free and must start with a letter.
     pool = r'([a-zA-Z][\w\._\-]*)'
-    ds = r'(/[\w][\w\.:_\-]*)'
+    ds = r'(/[\w](?:[\w\.:_\- ]*[\w\.:_\-])?)'
     name = r'[\w\.:_\-]+'
-    snaps = r'[\w\.:_\-]*([\w\.:_\-]|%)*[\w\.:_\-]*(,[\w\.:_\-]*([\w\.:_\-]|%)*[\w\.:_\-]*)*'
+    short = r'(?:[\w\.:_\-](?:[\w\.:_\- ]*[\w\.:_\-])?)'
+    # One comma-separated item is either a single short name, a range `a%b` / `a%` (open end) / `%b` (open start),
+    # i.e. at most one `%`, and never empty or a bare `%` (which `zfs destroy` treats as "all snapshots").
+    _snaps_item = r'(?:' + short + r'(?:%(?:' + short + r')?)?|%' + short + r')'
+    snaps = _snaps_item + r'(?:,' + _snaps_item + r')*'
+    # OpenZFS ZFS_MAX_DATASET_NAME_LEN is 256 including the NUL, so a full name is at most 255 bytes (all patterns
+    # are ASCII-only, so characters == bytes).
+    max_name_len = 255
+
+    @staticmethod
+    def _length(s: str, what: str) -> None:
+        if len(s) > Validate.max_name_len:
+            raise ValueError(s + ' is not a valid ZFS ' + what + ' name')
+
+    @staticmethod
+    def _dots(shorts, s: str, what: str) -> None:
+        # OpenZFS rejects `.` and `..` as snapshot / bookmark short names.
+        if any(x in ('.', '..') for x in shorts):
+            raise ValueError(s + ' is not a valid ZFS ' + what + ' name')
 
     @staticmethod
     def zfsname(s: str) -> None:
-        if not bool(re.match('^' + Validate.name + '$', s)):
+        if not bool(re.fullmatch(Validate.name, s, re.ASCII)):
             raise ValueError(s + ' is not a valid ZFS name')
 
     @staticmethod
@@ -86,23 +111,34 @@ class Validate:
 
     @staticmethod
     def dataset(s: str) -> None:
-        if not bool(re.match('^' + Validate.pool + Validate.ds + '*$', s)):
+        Validate._length(s, 'dataset')
+        if not bool(re.fullmatch(Validate.pool + Validate.ds + '*', s, re.ASCII)):
             raise ValueError(s + ' is not a valid ZFS dataset name')
 
     @staticmethod
     def snapshot(s: str) -> None:
-        if not bool(re.match('^' + Validate.pool + Validate.ds + '*@' + Validate.name + '$', s)):
+        Validate._length(s, 'snapshot')
+        if not bool(re.fullmatch(Validate.pool + Validate.ds + '*@' + Validate.short, s, re.ASCII)):
             raise ValueError(s + ' is not a valid ZFS snapshot name')
+        Validate._dots([s.partition('@')[2]], s, 'snapshot')
 
     @staticmethod
     def snapshots(s: str) -> None:
-        if not bool(re.match('^' + Validate.pool + Validate.ds + '*@' + Validate.snaps + '$', s)):
+        # The list as a whole may be long; the length limit applies to each `dataset@short` it expands to.
+        if not bool(re.fullmatch(Validate.pool + Validate.ds + '*@' + Validate.snaps, s, re.ASCII)):
             raise ValueError(s + ' is not a valid ZFS snapshot name')
+        ds, _, rest = s.partition('@')
+        shorts = [p for item in rest.split(',') for p in item.split('%') if p]
+        if any(len(ds) + 1 + len(p) > Validate.max_name_len for p in shorts):
+            raise ValueError(s + ' is not a valid ZFS snapshot name')
+        Validate._dots(shorts, s, 'snapshot')
 
     @staticmethod
     def bookmark(s: str) -> None:
-        if not bool(re.match('^' + Validate.pool + Validate.ds + '*#' + Validate.name + '$', s)):
+        Validate._length(s, 'bookmark')
+        if not bool(re.fullmatch(Validate.pool + Validate.ds + '*#' + Validate.short, s, re.ASCII)):
             raise ValueError(s + ' is not a valid ZFS bookmark name')
+        Validate._dots([s.partition('#')[2]], s, 'bookmark')
 
 
 class Property:

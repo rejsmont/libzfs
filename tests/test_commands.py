@@ -2,8 +2,12 @@
 
 import pytest
 import io
+import os
+import signal
 import subprocess
+import sys
 import threading
+import time
 from unittest.mock import MagicMock, call
 from libzfseasy.zfs import (
     ListCommand, CreateCommand, SnapshotCommand, BookmarkCommand,
@@ -1272,3 +1276,417 @@ class TestExecCaptureRegressions:
         process.terminate.assert_called_once()
         process.kill.assert_called_once()
         assert process.wait.call_count == 3
+
+
+class _RealChildHarness:
+    """Drives `Command._exec_out` / `_exec` against a REAL child (`sys.executable -c ...`), not
+    the `mock_subprocess` fixture.
+
+    The MagicMock tests above cannot reproduce OS pipe back-pressure or a real EOF/exit race, so
+    these use real pipes. They run in the default tier: the child is the test interpreter, never
+    `zfs`. A watchdog thread bounds every run, so a deadlock regression fails the test (and kills
+    the child) instead of hanging the suite.
+    """
+
+    def __init__(self, monkeypatch):
+        self.procs = []
+        self.polls = {}
+        self.stderr_threads = []
+        harness = self
+        real_popen = subprocess.Popen  # the (guarded) class; subclassing keeps the guard
+
+        class RecordingPopen(real_popen):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                harness.procs.append(self)
+                harness.polls[self.pid] = 0
+
+            def poll(self):
+                harness.polls[self.pid] += 1
+                return super().poll()
+
+        monkeypatch.setattr(subprocess, 'Popen', RecordingPopen)
+        real_start = Command._start_stderr_reader
+
+        def recording_start(process, errors):
+            thread = real_start(process, errors)
+            harness.stderr_threads.append(thread)
+            return thread
+
+        monkeypatch.setattr(Command, '_start_stderr_reader', staticmethod(recording_start))
+
+    @staticmethod
+    def cmd(script):
+        return [sys.executable, '-c', script]
+
+    def run(self, fn, timeout=30):
+        """Call `fn()` on a watchdog thread; return (result, exception)."""
+        box = {}
+
+        def target():
+            try:
+                box['result'] = fn()
+            except BaseException as exc:  # noqa: BLE001 - reported to the test
+                box['exc'] = exc
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            self.kill_all()
+            thread.join(10)
+            pytest.fail(f'Command did not finish within {timeout}s: pipe deadlock or spin regression')
+        return box.get('result'), box.get('exc')
+
+    def kill_all(self):
+        for proc in self.procs:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+
+
+@pytest.fixture
+def real_child(monkeypatch):
+    harness = _RealChildHarness(monkeypatch)
+    yield harness
+    harness.kill_all()  # never leave a child behind, whatever the test did
+
+
+_INTERLEAVED_CHILD = '''
+import sys
+for i in range(300):
+    sys.stderr.write("warn %d " % i + "e" * 300 + "\\n"); sys.stderr.flush()
+    sys.stdout.write("row %d " % i + "o" * 300 + "\\n"); sys.stdout.flush()
+sys.exit({rc})
+'''
+
+
+class TestExecRealPipes:
+    """The deadlock/spin fixes in `Command._exec_out` / `_exec_capture` (commit a8a3d88), proven
+    with real OS pipes. Each test fails against the pre-fix code: (a) deadlocks without the
+    stderr drain thread, (b) leaks the child and thread without the generator `finally`, (c)
+    spins on readline()/poll() without the `wait()` at EOF."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_interleaved_large_stdout_and_stderr_returns_all_rows(self, real_child):
+        """(a) >64 KB on BOTH pipes, interleaved: nothing blocks, every row comes back."""
+        script = _INTERLEAVED_CHILD.format(rc=0)
+        rows, exc = real_child.run(lambda: list(Command._exec_out(real_child.cmd(script))))
+
+        assert exc is None
+        assert len(rows) == 300
+        assert rows[0].startswith('row 0 ooo') and rows[-1].startswith('row 299 ooo')
+        assert sum(len(r) for r in rows) > 64 * 1024
+        # fully consumed run: child reaped, stderr reader joined
+        assert real_child.procs[0].returncode == 0
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_interleaved_large_output_with_failure_raises_collected_stderr(self, real_child):
+        """(a) Same volume, rc != 0: every row is yielded first, then the exception carries ALL
+        stderr lines (>64 KB of them), capitalised and in order."""
+        script = _INTERLEAVED_CHILD.format(rc=3)
+        seen = []
+
+        def consume():
+            for row in Command._exec_out(real_child.cmd(script)):
+                seen.append(row)
+
+        _, exc = real_child.run(consume)
+
+        assert isinstance(exc, Exception)
+        assert len(seen) == 300
+        lines = str(exc).split('\n')
+        assert len(lines) == 300
+        assert lines[0].startswith('Warn 0 eee') and lines[-1].startswith('Warn 299 eee')
+        assert sum(len(l) for l in lines) > 64 * 1024
+        assert real_child.procs[0].returncode == 3
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_interleaved_large_output_failure_raises(self, real_child):
+        """(a) `Command._exec` (the no-output variant) shares the machinery."""
+        script = _INTERLEAVED_CHILD.format(rc=1)
+        _, exc = real_child.run(lambda: Command._exec(real_child.cmd(script)))
+        assert isinstance(exc, Exception)
+        assert len(str(exc).split('\n')) == 300
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_abandoned_generator_reaps_running_child(self, real_child):
+        """(b) A long-running child, generator closed after one row: the child is terminated and
+        reaped (no zombie, no orphan), and the stderr reader thread has ended."""
+        script = (
+            'import sys, time\n'
+            'sys.stdout.write("first\\n"); sys.stdout.flush()\n'
+            'sys.stderr.write("noise\\n"); sys.stderr.flush()\n'
+            'time.sleep(120)\n'
+        )
+        gen = Command._exec_out(real_child.cmd(script))
+        assert next(gen) == 'first'
+        proc = real_child.procs[0]
+        assert proc.returncode is None  # genuinely still running
+
+        gen.close()
+
+        assert proc.returncode == -signal.SIGTERM
+        assert real_child.stderr_threads and not any(t.is_alive() for t in real_child.stderr_threads)
+        with pytest.raises(ProcessLookupError):  # reaped: the pid is gone, not a zombie
+            os.kill(proc.pid, 0)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_abandoned_generator_kills_child_that_ignores_sigterm(self, real_child, monkeypatch):
+        """(b) The SIGTERM-ignoring child is escalated to SIGKILL after _TERMINATE_TIMEOUT."""
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.3)
+        script = (
+            'import signal, sys, time\n'
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+            'sys.stdout.write("ready\\n"); sys.stdout.flush()\n'
+            'time.sleep(120)\n'
+        )
+        gen = Command._exec_out(real_child.cmd(script))
+        assert next(gen) == 'ready'
+        proc = real_child.procs[0]
+
+        _, exc = real_child.run(gen.close, timeout=30)
+
+        assert exc is None
+        assert proc.returncode == -signal.SIGKILL
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_abandoned_generator_leaves_no_session_orphan(self, real_child):
+        """(b) The suite's own orphan check finds nothing for the abandoned child's pid."""
+        from tests._hermetic import find_orphans
+
+        script = 'import sys, time\nprint("first", flush=True)\ntime.sleep(120)\n'
+        gen = Command._exec_out(real_child.cmd(script))
+        assert next(gen) == 'first'
+        pid = real_child.procs[0].pid
+        gen.close()
+
+        marker = os.environ.get('ZFSB_TEST_SESSION')
+        if not marker:
+            pytest.skip('no test-session marker in this run')
+        orphans = find_orphans(marker, grace=1.0, fork_dir=None)
+        assert pid not in [o[0] for o in orphans]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stdout_eof_before_exit_does_not_spin(self, real_child):
+        """(c) The child closes stdout, lingers 0.3 s, then exits 0. `_exec_capture` must block in
+        wait() rather than looping readline()/poll(): the poll count stays tiny (a spinning
+        regression makes thousands of calls in that window)."""
+        script = (
+            'import os, time\n'
+            'os.close(1)\n'
+            'time.sleep(0.3)\n'
+            'os._exit(0)\n'
+        )
+        start = time.monotonic()
+        rows, exc = real_child.run(lambda: list(Command._exec_out(real_child.cmd(script))))
+        elapsed = time.monotonic() - start
+
+        assert exc is None
+        assert rows == []
+        assert elapsed >= 0.25  # it really did wait for the exit
+        proc = real_child.procs[0]
+        assert proc.returncode == 0
+        assert real_child.polls[proc.pid] <= 5, f'poll() called {real_child.polls[proc.pid]} times: spin'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stdout_eof_before_failing_exit_raises_without_spinning(self, real_child):
+        """(c) Same window, non-zero exit: the stderr text is raised, still no spin."""
+        script = (
+            'import os, sys, time\n'
+            'sys.stderr.write("cannot open dataset\\n"); sys.stderr.flush()\n'
+            'os.close(1)\n'
+            'time.sleep(0.3)\n'
+            'os._exit(1)\n'
+        )
+        _, exc = real_child.run(lambda: list(Command._exec_out(real_child.cmd(script))))
+
+        assert isinstance(exc, Exception) and str(exc) == 'Cannot open dataset'
+        proc = real_child.procs[0]
+        assert real_child.polls[proc.pid] <= 5
+
+
+class TestSpacesInsideNames:
+    """Dataset components and snapshot/bookmark short names may contain spaces INSIDE (never
+    leading/trailing); names are matched with fullmatch + ASCII. The command layer must keep such a
+    name as ONE argv element (Popen gets a list, no shell) and must refuse a trailing newline or
+    non-ASCII name before any process is started."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_returns_a_snapshot_with_a_spaced_short_name(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['tank/data@before upgrade\tsnapshot\n'])
+
+        result = ListCommand()()
+
+        assert len(result) == 1
+        assert isinstance(result[0], Snapshot)
+        assert result[0].short == 'before upgrade'
+        assert result[0].name == 'tank/data@before upgrade'
+        assert result[0].dataset.name == 'tank/data'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_returns_a_filesystem_with_a_spaced_component(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['tank/my data\tfilesystem\n', 'tank/my data/sub dir\tfilesystem\n'])
+
+        result = ListCommand()()
+
+        assert [type(o) for o in result] == [Filesystem, Filesystem]
+        assert [o.name for o in result] == ['tank/my data', 'tank/my data/sub dir']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_with_properties_keeps_a_spaced_snapshot_row_whole(self, mock_subprocess):
+        """The columns ListCommand requests (name,type,<props>) are tab-separated, so a space in the
+        name must not shift the property columns."""
+        mock_subprocess.setup(stdout=['tank/data@before upgrade\tsnapshot\t1024\n'])
+
+        result = ListCommand()(properties=['used'])
+
+        assert len(result) == 1 and isinstance(result[0], Snapshot)
+        assert result[0].short == 'before upgrade'
+        assert result[0]['used'].value == '1024'
+        argv = mock_subprocess.call_args[0][0]
+        assert argv[argv.index('-o') + 1] == 'name,type,used'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_roots_with_a_spaced_name_is_one_argv_element(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['tank/my data\tfilesystem\n'])
+
+        ListCommand()(roots=Filesystem('tank/my data'))
+
+        argv = mock_subprocess.call_args[0][0]
+        assert argv.count('tank/my data') == 1
+        assert 'tank/my' not in argv and 'data' not in argv
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_snapshot_with_a_spaced_name_is_one_argv_element(self, mock_subprocess):
+        mock_subprocess.setup()
+        fs = Filesystem('tank/my data')
+
+        result = SnapshotCommand()(fs, 'before upgrade')
+
+        assert isinstance(result, Snapshot) and result.short == 'before upgrade'
+        argv = mock_subprocess.call_args[0][0]
+        assert isinstance(argv, list)
+        assert argv[-1] == 'tank/my data@before upgrade'
+        assert argv.count('tank/my data@before upgrade') == 1
+        assert not any(a in ('tank/my', 'data@before', 'upgrade') for a in argv)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_dataset_with_a_spaced_name_is_one_argv_element(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['destroy\ttank/my data\n'])
+
+        result = DestroyCommand().dataset(Filesystem('tank/my data'), destroy=True)
+
+        assert result == ['tank/my data']
+        argv = mock_subprocess.call_args[0][0]
+        assert argv[-1] == 'tank/my data' and argv.count('tank/my data') == 1
+        assert 'tank/my' not in argv and 'data' not in argv
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_snapshots_with_spaced_names_is_one_argv_element(self, mock_subprocess):
+        """Several snapshots of one dataset are joined with ',' into a single argument; a space
+        inside a short name does not split it."""
+        mock_subprocess.setup(stdout=['destroy\ttank/data@before upgrade\n'])
+        fs = Filesystem('tank/data')
+        snaps = [Snapshot(fs, 'before upgrade'), Snapshot(fs, 'after upgrade')]
+
+        DestroyCommand().snapshots(snaps, destroy=True)
+
+        argv = mock_subprocess.call_args[0][0]
+        assert argv[-1] == 'tank/data@before upgrade,after upgrade'
+        assert argv.count('tank/data@before upgrade,after upgrade') == 1
+        assert not any(a in ('upgrade', 'before', 'after') or a.startswith('after') for a in argv)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_bookmark_with_a_spaced_name_is_one_argv_element(self, mock_subprocess):
+        mock_subprocess.setup()
+        bookmark = Bookmark(Filesystem('tank/my data'), 'my mark')
+
+        DestroyCommand().bookmark(bookmark, destroy=True)
+
+        argv = mock_subprocess.call_args[0][0]
+        assert argv[-1] == 'tank/my data#my mark' and argv.count('tank/my data#my mark') == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_rename_filesystem_with_spaced_names_is_two_argv_elements(self, mock_subprocess):
+        mock_subprocess.setup()
+
+        RenameCommand().filesystem(Filesystem('tank/old name'), 'tank/new name')
+
+        argv = mock_subprocess.call_args[0][0]
+        assert argv[-2:] == ['tank/old name', 'tank/new name']
+        assert argv.count('tank/old name') == 1 and argv.count('tank/new name') == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_rename_snapshot_with_spaced_names_is_two_argv_elements(self, mock_subprocess):
+        mock_subprocess.setup()
+        snap = Snapshot(Filesystem('tank/data'), 'old snap')
+
+        result = RenameCommand().snapshot(snap, 'new snap')
+
+        assert result.short == 'new snap'
+        argv = mock_subprocess.call_args[0][0]
+        assert argv[-2:] == ['tank/data@old snap', 'tank/data@new snap']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('bad', ['tank/bad\n', 'tank/bad name\n', 'tank/däta', 'tank/٣x'],
+                             ids=['newline', 'space-newline', 'non-ascii', 'arabic-digit'])
+    def test_a_bad_dataset_name_is_refused_before_any_popen(self, mock_subprocess, bad):
+        mock_subprocess.setup()
+        with pytest.raises(ValueError):
+            CreateCommand().filesystem(bad)
+        with pytest.raises(ValueError):
+            Filesystem(bad)
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('bad', ['snap\n', 'my snap\n', 'snäp', ' lead', 'trail '],
+                             ids=['newline', 'space-newline', 'non-ascii', 'leading-space', 'trailing-space'])
+    def test_a_bad_snapshot_name_is_refused_before_any_popen(self, mock_subprocess, bad):
+        mock_subprocess.setup()
+        fs = Filesystem('tank/data')
+        with pytest.raises(ValueError):
+            SnapshotCommand()(fs, bad)
+        with pytest.raises(ValueError):
+            Bookmark(fs, bad)
+        with pytest.raises(ValueError):
+            RenameCommand().snapshot(Snapshot(fs, 'ok'), bad)
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('bad', ['tank/new\n', 'tank/näw'], ids=['newline', 'non-ascii'])
+    def test_a_bad_rename_target_is_refused_before_any_popen(self, mock_subprocess, bad):
+        mock_subprocess.setup()
+        with pytest.raises(ValueError):
+            RenameCommand().filesystem(Filesystem('tank/old'), bad)
+        mock_subprocess.assert_not_called()

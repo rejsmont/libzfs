@@ -598,3 +598,324 @@ class TestGetAttrAttributeErrorRegression:
         assert fs_copy is not fs
         assert fs_copy.name == fs.name
         assert fs_copy['compression'].value == 'lz4'
+
+
+class TestValidateAcceptRejectTables:
+    """Table-driven accept/reject coverage for the ASCII-only, fullmatch, space-aware validators.
+
+    Every pattern is applied with ``re.fullmatch(..., re.ASCII)``: a trailing newline or a non-ASCII word character
+    must be rejected. Spaces are allowed only *inside* dataset components and snapshot/bookmark short names.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', [
+        'pool/ds', 'pool/my data', 'pool/a b/c d', 'pool/a  b',
+    ])
+    def test_dataset_accepts(self, name):
+        Validate.dataset(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', [
+        'pool/ds\n', 'pool/dś', '-pool', 'pool/-x', 'pool/.x', 'pool/..', 'pool/a/../b',
+        'pool/ my', 'pool/my ', 'my pool/x',
+    ])
+    def test_dataset_rejects(self, name):
+        with pytest.raises(ValueError):
+            Validate.dataset(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', [
+        'pool/ds@s', 'pool/ds@before upgrade', 'pool/ds@-x',
+    ])
+    def test_snapshot_accepts(self, name):
+        Validate.snapshot(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', [
+        'pool/ds@s\n', 'pool/ds@ lead', 'pool/ds@trail ', 'pool/ds@ś',
+    ])
+    def test_snapshot_rejects(self, name):
+        with pytest.raises(ValueError):
+            Validate.snapshot(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', [
+        'ds@a%b', 'ds@a%b c', 'ds@a b%c d', 'ds@%b', 'ds@a%', 'ds@a,b%c',
+    ])
+    def test_snapshots_accepts(self, name):
+        Validate.snapshots(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', [
+        'ds@a %b', 'ds@a% b', 'ds@a%b\n',
+    ])
+    def test_snapshots_rejects(self, name):
+        with pytest.raises(ValueError):
+            Validate.snapshots(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', [
+        'pool/ds#b', 'pool/ds#my mark',
+    ])
+    def test_bookmark_accepts(self, name):
+        Validate.bookmark(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', [
+        'pool/ds# x', 'pool/ds#x ', 'pool/ds#x\n',
+    ])
+    def test_bookmark_rejects(self, name):
+        with pytest.raises(ValueError):
+            Validate.bookmark(name)
+
+    @pytest.mark.unit
+    def test_attribute_and_zfsname_accept_plain_property(self):
+        Validate.attribute('compression')
+        Validate.zfsname('compression')
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', ['my prop:x', 'a b', 'com.apple.mimic\n'])
+    def test_attribute_rejects(self, name):
+        with pytest.raises(ValueError):
+            Validate.attribute(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', ['my prop:x', 'a b', 'com.apple.mimic\n'])
+    def test_zfsname_rejects(self, name):
+        with pytest.raises(ValueError):
+            Validate.zfsname(name)
+
+    @pytest.mark.unit
+    def test_pool_name_stays_space_free(self):
+        with pytest.raises(ValueError):
+            Validate.dataset('my pool')
+        with pytest.raises(ValueError):
+            Validate.snapshot('my pool@s')
+
+
+class TestSpacedNamesConstruct:
+    """Objects built from names containing inner spaces keep them in name/short."""
+
+    @pytest.mark.unit
+    def test_snapshot_from_name_with_space(self):
+        snap = ZFS.from_name('tank/data@before upgrade', 'snapshot')
+        assert isinstance(snap, Snapshot)
+        assert snap.name == 'tank/data@before upgrade'
+        assert snap.short == 'before upgrade'
+
+    @pytest.mark.unit
+    def test_bookmark_from_name_with_space(self):
+        bm = ZFS.from_name('tank/data#my mark', 'bookmark')
+        assert isinstance(bm, Bookmark)
+        assert bm.name == 'tank/data#my mark'
+        assert bm.short == 'my mark'
+
+    @pytest.mark.unit
+    def test_dataset_with_inner_spaces(self):
+        fs = Filesystem('tank/my data/sub dir')
+        assert fs.name == 'tank/my data/sub dir'
+
+    @pytest.mark.unit
+    def test_snapshot_range_from_name_with_spaces(self):
+        rng = SnapshotRange.from_name('pool/ds@a b%c d')
+        assert rng.first.short == 'a b'
+        assert rng.last.short == 'c d'
+        assert rng.short == 'a b%c d'
+        assert rng.name == 'pool/ds@a b%c d'
+
+    @pytest.mark.unit
+    def test_snapshot_constructor_rejects_edge_spaces(self):
+        ds = Filesystem('pool/ds')
+        with pytest.raises(ValueError):
+            Snapshot(ds, ' lead')
+        with pytest.raises(ValueError):
+            Snapshot(ds, 'trail ')
+
+    @pytest.mark.unit
+    def test_bookmark_constructor_rejects_edge_spaces(self):
+        ds = Filesystem('pool/ds')
+        with pytest.raises(ValueError):
+            Bookmark(ds, ' lead')
+        with pytest.raises(ValueError):
+            Bookmark(ds, 'trail ')
+
+
+class TestValidateDotsSnapshotsLength:
+    """Review fixes: `.`/`..` short names, the `snapshots` list grammar, and the 255-character name cap."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('fn,sep', [(Validate.snapshot, '@'), (Validate.bookmark, '#')])
+    @pytest.mark.parametrize('short', ['.', '..'])
+    def test_dot_short_names_rejected(self, fn, sep, short):
+        with pytest.raises(ValueError):
+            fn('pool/ds' + sep + short)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('fn,sep', [(Validate.snapshot, '@'), (Validate.bookmark, '#')])
+    @pytest.mark.parametrize('short', ['a.b', '.x', '...', 'x.'])
+    def test_dotted_short_names_accepted(self, fn, sep, short):
+        fn('pool/ds' + sep + short)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', [
+        'pool@', 'pool@%', 'pool@,,', 'pool@a,', 'pool@,a', 'pool@a%b%c', 'pool@..', 'pool@a%..', 'pool@..%b',
+        'pool@.', 'pool@.%b', 'pool@a,..', 'pool@a%b,%',
+    ])
+    def test_snapshots_list_rejects(self, name):
+        with pytest.raises(ValueError):
+            Validate.snapshots(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', [
+        'pool@a', 'pool@a%', 'pool@%b', 'pool@a%b', 'pool@a,b', 'pool@a,%b,c%d', 'pool@a.b,...',
+    ])
+    def test_snapshots_list_accepts(self, name):
+        Validate.snapshots(name)
+
+    @pytest.mark.unit
+    def test_max_name_len_is_255(self):
+        assert Validate.max_name_len == 255
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('fn,sep', [(Validate.snapshot, '@'), (Validate.bookmark, '#')])
+    def test_snapshot_and_bookmark_length_boundary(self, fn, sep):
+        fn('t' * 253 + sep + 'a')  # exactly 255
+        with pytest.raises(ValueError):
+            fn('t' * 254 + sep + 'a')  # 256
+
+    @pytest.mark.unit
+    def test_dataset_length_boundary(self):
+        Validate.dataset('t' * 255)
+        with pytest.raises(ValueError):
+            Validate.dataset('t' * 256)
+        Validate.dataset('t/' + 'a' * 253)
+        with pytest.raises(ValueError):
+            Validate.dataset('t/' + 'a' * 254)
+
+    @pytest.mark.unit
+    def test_snapshots_length_is_per_expanded_name(self):
+        # The list as a whole is far over 255 characters, but every `t@short` is short.
+        Validate.snapshots('t@' + ','.join(['a' * 200] * 5))
+        # `t`*254 + '@' + 'a' is 256 characters once expanded.
+        with pytest.raises(ValueError):
+            Validate.snapshots('t' * 254 + '@a%bb')
+        with pytest.raises(ValueError):
+            Validate.snapshots('t' * 254 + '@a')
+        Validate.snapshots('t' * 253 + '@a')
+        Validate.snapshots('t' * 253 + '@a%')
+        with pytest.raises(ValueError):
+            Validate.snapshots('t' * 253 + '@a,bb')
+
+    @pytest.mark.unit
+    def test_from_name_and_constructors_enforce_length_and_dots(self):
+        assert ZFS.from_name('t' * 253 + '@a', 'snapshot').short == 'a'
+        assert ZFS.from_name('t' * 253 + '#a', 'bookmark').short == 'a'
+        assert Filesystem('t' * 255).name == 't' * 255
+        for name, kind in (('t' * 254 + '@a', 'snapshot'), ('t' * 254 + '#a', 'bookmark'),
+                           ('t' * 256, 'filesystem'), ('t' * 256, 'volume'), ('pool@..', 'snapshot'),
+                           ('pool#.', 'bookmark')):
+            with pytest.raises(ValueError):
+                ZFS.from_name(name, kind)
+        with pytest.raises(ValueError):
+            ZFS.from_name('t' * 254 + '@a')  # guessed type: nothing matches
+        ds = Filesystem('t' * 253)
+        assert Snapshot(ds, 'a').name == 't' * 253 + '@a'
+        assert Bookmark(ds, 'a').name == 't' * 253 + '#a'
+        with pytest.raises(ValueError):
+            Snapshot(ds, 'bb')
+        with pytest.raises(ValueError):
+            Bookmark(ds, 'bb')
+        with pytest.raises(ValueError):
+            Snapshot(Filesystem('pool/ds'), '..')
+        with pytest.raises(ValueError):
+            Bookmark(Filesystem('pool/ds'), '.')
+
+    @pytest.mark.unit
+    def test_snapshot_range_enforces_list_grammar(self):
+        with pytest.raises(ValueError):
+            SnapshotRange.from_name('pool/ds@a%b%c')
+        with pytest.raises(ValueError):
+            SnapshotRange.from_name('pool/ds@..%b')
+
+
+class TestValidatorsAreLinearTime:
+    """ReDoS guard: a very long input that fails only at the very end must be rejected quickly by every validator."""
+
+    N = 50_000
+    LIMIT = 1.0
+
+    @staticmethod
+    def _time_reject(fn, s):
+        import time
+        start = time.perf_counter()
+        with pytest.raises(ValueError):
+            fn(s)
+        return time.perf_counter() - start
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('filler', [' ', '-', 'a', 'a b-', '. :_'])
+    def test_long_failing_inputs_reject_fast(self, filler):
+        body = (filler * (self.N // len(filler) + 1))[:self.N]
+        # Each candidate starts validly and fails only at the end (trailing '!' or '\n').
+        for end in ('!', '\n', ' '):
+            cases = [
+                (Validate.dataset, 'pool/a' + body + end),
+                (Validate.snapshot, 'pool/ds@a' + body + end),
+                (Validate.snapshots, 'pool/ds@a' + body + '%a' + body + end),
+                (Validate.bookmark, 'pool/ds#a' + body + end),
+                (Validate.zfsname, 'a' + body + end),
+                (Validate.attribute, 'a' + body + end),
+            ]
+            for fn, s in cases:
+                elapsed = self._time_reject(fn, s)
+                assert elapsed < self.LIMIT, '%s took %.2fs for filler %r end %r' % (fn.__name__, elapsed, filler, end)
+
+    # The length cap now rejects inputs this long before any regex runs, so the tests below lift the cap
+    # (monkeypatch Validate.max_name_len) and, in addition, call the compiled patterns directly. The regex itself is
+    # therefore what is being timed.
+    SEPARATOR_N = 20_000
+
+    @staticmethod
+    def _pattern_cases(n):
+        yield 'snaps', Validate.pool + Validate.ds + '*@' + Validate.snaps, 'p@' + 'a%' * n + '!'
+        yield 'snaps', Validate.pool + Validate.ds + '*@' + Validate.snaps, 'p@' + 'a,' * n + '!'
+        yield 'snaps', Validate.pool + Validate.ds + '*@' + Validate.snaps, 'p@' + 'a b%' * n
+        yield 'snaps', Validate.pool + Validate.ds + '*@' + Validate.snaps, 'p@' + 'a b,' * n + '!'
+        yield 'snapshot', Validate.pool + Validate.ds + '*@' + Validate.short, 'p@' + 'a b' * n + ' '
+        yield 'bookmark', Validate.pool + Validate.ds + '*#' + Validate.short, 'p#' + 'a b' * n + ' '
+        yield 'dataset', Validate.pool + Validate.ds + '*', 'p' + '/a b' * n + ' '
+        yield 'dataset', Validate.pool + Validate.ds + '*', 'p' + '/a b' * n + '!'
+
+    @pytest.mark.unit
+    def test_compiled_patterns_reject_separator_repeats_fast(self):
+        import re
+        import time
+        for label, pattern, s in self._pattern_cases(self.SEPARATOR_N):
+            start = time.perf_counter()
+            assert re.fullmatch(pattern, s, re.ASCII) is None
+            elapsed = time.perf_counter() - start
+            assert elapsed < self.LIMIT, '%s took %.2fs for %r...' % (label, elapsed, s[:12])
+
+    @pytest.mark.unit
+    def test_validators_reject_separator_repeats_fast_with_cap_lifted(self, monkeypatch):
+        monkeypatch.setattr(Validate, 'max_name_len', 10 ** 9)
+        n = self.SEPARATOR_N
+        cases = [
+            (Validate.snapshots, 'p@' + 'a%' * n + '!'),
+            (Validate.snapshots, 'p@' + 'a,' * n + '!'),
+            (Validate.snapshots, 'p@' + 'a b%' * n),
+            (Validate.snapshot, 'p@' + 'a b' * n + ' '),
+            (Validate.bookmark, 'p#' + 'a b' * n + ' '),
+            (Validate.dataset, 'p' + '/a b' * n + ' '),
+        ]
+        for fn, s in cases:
+            elapsed = self._time_reject(fn, s)
+            assert elapsed < self.LIMIT, '%s took %.2fs for %r...' % (fn.__name__, elapsed, s[:12])
+
+    @pytest.mark.unit
+    def test_separator_repeats_rejected_by_default_cap_too(self):
+        # With the real cap the length check (or the regex, for `snapshots`, which has no whole-string cap) answers.
+        n = self.SEPARATOR_N
+        for fn, s in [(Validate.snapshots, 'p@' + 'a%' * n + '!'), (Validate.snapshots, 'p@' + 'a b%' * n),
+                      (Validate.dataset, 'p' + '/a b' * n + ' ')]:
+            assert self._time_reject(fn, s) < self.LIMIT

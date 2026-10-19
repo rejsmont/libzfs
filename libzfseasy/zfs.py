@@ -1077,10 +1077,29 @@ class SendCommand(Command):
             return process.stdout
         elif rc is not None:
             if rc != 0:
+                StreamHandle._close_pipe(getattr(process, 'stdout', None))
+                StreamHandle._close_pipe(getattr(process, 'stderr', None))
                 raise Exception('\n'.join(errors))
             return False
         else:
-            return None
+            # stdout hit EOF while the child is still running. Returning None would make the caller's
+            # `while True` loop spin on peek()/poll() until it exits (cf. _exec_capture). Drain stderr to its end
+            # *first* (a bare wait() could deadlock on a full stderr pipe), then block until the child exits.
+            if getattr(process, 'stderr', None):
+                try:
+                    remainder = process.stderr.read().decode('utf-8', errors='replace')
+                    for line in remainder.splitlines():
+                        error = line.strip()
+                        if error:
+                            errors.append(error[0].upper() + error[1:])
+                except Exception:
+                    pass
+            rc = process.wait()
+            if rc != 0:
+                StreamHandle._close_pipe(getattr(process, 'stdout', None))
+                StreamHandle._close_pipe(getattr(process, 'stderr', None))
+                raise Exception('\n'.join(errors))
+            return False
 
 
 class ReceiveCommand(Command, StringListArgument):
