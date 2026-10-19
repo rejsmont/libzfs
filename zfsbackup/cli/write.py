@@ -182,7 +182,10 @@ def _newer(found: Optional[Tuple[int, int]], key: Tuple[int, int]) -> bool:
 def _answer(info: daemonlock.DaemonInfo, key: Tuple[int, int]) -> Optional[str]:
     """How the daemon's pid file answers our write, or `None` for "not yet":
     `applied` (it is on our generation), `accepted` (it is switching to it),
-    `rejected`, `newer` (it is on, or applying, a later generation of this
+    `rejected`, `deferred` (refused for now for a reason that can pass later;
+    NOT final, the daemon re-checks it every poll), `superseded-deferred` (a
+    LATER generation of this store is deferred, so ours is folded into it; also
+    not final), `newer` (it is on, or applying, a later generation of this
     store: `target` can sit on an older key indefinitely while in-flight work
     finishes, and a later write replaces it, so our key may never appear) or
     `superseded` (it REJECTED a later generation of this store, so ours was
@@ -202,7 +205,15 @@ def _answer(info: daemonlock.DaemonInfo, key: Tuple[int, int]) -> Optional[str]:
         return "rejected"
     if _newer(info.rejected, key):
         return "superseded"
+    if info.deferred == key:
+        return "deferred"
+    if _newer(info.deferred, key):
+        return "superseded-deferred"
     return None
+
+
+#: Answers that mean "refused for now, re-checked every poll": never final.
+_DEFERRED_ANSWERS = ("deferred", "superseded-deferred")
 
 
 def _await_answer(
@@ -213,7 +224,14 @@ def _await_answer(
     (or a newer one) in `applied`, `target` or `rejected`, or `wait` seconds
     pass. -> `(answer, last stable info read)`.
 
-    `answer` is one of `_answer`'s words, `"gone"` (`probe` finds nobody
+    `deferred` is not final: polling goes on (the daemon re-checks it every poll
+    and may apply it), and only if the deadline passes while the last stable
+    read still said `deferred` (or `superseded-deferred`, the same for a later
+    generation) is that word returned (with that info, whose
+    `deferred_reason` the caller can show) instead of `None`.
+
+    `answer` is one of `_answer`'s words (except that `deferred` only comes at
+    the deadline), `"gone"` (`probe` finds nobody
     holding the lock any more: the daemon exited), `"unreadable"` (`probe`
     raised `OSError`), or `None` (the deadline passed). A torn read is "no
     answer yet" and polling continues.
@@ -230,6 +248,8 @@ def _await_answer(
     """
     deadline = time.monotonic() + wait
     last: Optional[daemonlock.DaemonInfo] = None
+    deferred: Optional[daemonlock.DaemonInfo] = None
+    deferred_answer: Optional[str] = None
     while True:
         try:
             info = daemonlock.probe(resolved)
@@ -237,9 +257,13 @@ def _await_answer(
             return "unreadable", last
         if info is None:
             return "gone", last
+        answer = _answer(info, key)
         if info.stable:
             last = info
-        answer = _answer(info, key)
+            deferred = info if answer in _DEFERRED_ANSWERS else None
+            deferred_answer = answer if deferred is not None else None
+        if answer in _DEFERRED_ANSWERS:
+            answer = None  # not final: keep waiting within the deadline
         if (
             applied_only
             and answer in ("accepted", "newer")
@@ -250,6 +274,8 @@ def _await_answer(
             return answer, info
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if deferred is not None:
+                return deferred_answer, deferred
             return None, last
         time.sleep(min(ACK_POLL_SECONDS, remaining))
 
@@ -261,8 +287,10 @@ def await_applied(
     pid file says it has APPLIED `key` -- every worker runs it -- or a later
     generation of the same store. -> `(answer, last stable info)`: `applied`,
     `newer` (applied is later than `key`), `rejected`, `superseded`, `gone`,
-    `unreadable`, or `None` (not applied in time, including "accepted but still
-    switching"). Reads the pid file only; holds no lock."""
+    `unreadable`, `superseded-deferred` (as `deferred`, for a later generation),
+    `deferred` (still deferred -- refused for now, re-checked every
+    poll -- when the wait ran out; not final), or `None` (not applied in time,
+    including "accepted but still switching"). Reads the pid file only; holds no lock."""
     return _await_answer(
         resolved, key, _reload_wait() if wait is None else wait, applied_only=True
     )
@@ -443,6 +471,18 @@ def _signalled_notice(
         return (
             f"{requested}; superseded by generation {info.rejected[1]}, which daemon "
             f"{who} rejected; see its log"
+        ), None
+    if answer == "deferred":
+        reason = (info.deferred_reason if info is not None else None) or "see the daemon log"
+        return (
+            f"{requested}; the daemon has not applied generation {key[1]} yet: {reason}; "
+            f"it re-checks every poll ({poll} s)"
+        ), None
+    if answer == "superseded-deferred":
+        reason = (info.deferred_reason if info is not None else None) or "see the daemon log"
+        return (
+            f"{requested}; superseded by generation {info.deferred[1]}, which the daemon "
+            f"has not applied yet: {reason}; it re-checks every poll ({poll} s)"
         ), None
     if answer == "gone":
         return (

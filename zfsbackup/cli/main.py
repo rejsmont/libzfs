@@ -803,14 +803,16 @@ _JSON_OPTION_STATUS = click.option(
     help=(
         "Is the running daemon on the stored configuration? Prints the stored "
         "key (store id and generation), the daemon's pid, what it has applied, "
-        "is applying (target) or rejected, whether it supports live reload, "
+        "is applying (target), rejected or deferred (refused for now, re-checked "
+        "every poll), whether it supports live reload, "
         "and a verdict. Read-only: it never signals the daemon. Exit 0; 1 if "
         "the daemon's lock file cannot be read; 78 if the database is unusable "
         "or its schema is out of date (the daemon state is printed first). With "
         "--wait SECONDS, wait for the daemon to catch up: exit 0 once it is in "
         "sync (or if no daemon is running), 1 if it rejected the stored "
         "configuration or can never catch up (a daemon that predates live "
-        "reload, or whose supervisor is gone), 75 if the time ran out."
+        "reload, or whose supervisor is gone), 75 if the time ran out (also while "
+        "the daemon is still deferred)."
     ),
 )
 @click.option(

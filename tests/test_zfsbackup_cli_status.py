@@ -352,6 +352,8 @@ class TestJsonShape:
                 "applied": {"store_id": sid, "generation": gen - 1},
                 "target": {"store_id": sid, "generation": gen},
                 "rejected": {"store_id": sid, "generation": 0},
+                "deferred": None,
+                "deferred_reason": None,
             },
             "schema_error": None,
             "verdict": "applying",
@@ -393,6 +395,7 @@ class TestJsonShape:
         ]
         assert list(as_json(status(run, db, "--json"))["daemon"]) == [
             "pid", "reload_capable", "supervisor_alive", "generation", "applied", "target", "rejected",
+            "deferred", "deferred_reason",
         ]
 
     def test_json_is_the_only_thing_on_stdout(self, run, plain, db):
@@ -404,7 +407,8 @@ class TestJsonShape:
         assert {
             status_view.IN_SYNC, status_view.APPLYING, status_view.REJECTED,
             status_view.BEHIND, status_view.SUPERVISOR_GONE, status_view.NO_DAEMON,
-        } == {"in-sync", "applying", "rejected", "behind", "supervisor-gone", "no-daemon"}
+            status_view.DEFERRED,
+        } == {"in-sync", "applying", "rejected", "behind", "supervisor-gone", "no-daemon", "deferred"}
 
 
 # --------------------------------------------------------------------------
@@ -699,6 +703,7 @@ class TestExitCodes:
         assert code("supervisor-gone", modern) == 1
         assert code("behind", legacy) == 1
         assert code("behind", modern) == 75 and code("applying", modern) == 75
+        assert code("deferred", modern) == 75          # never 1: it re-checks every poll
         assert code("unreadable", modern) == 75
 
 
@@ -962,6 +967,229 @@ class TestWaitFor:
         monkeypatch.setattr(daemonlock, "probe", probe)
         with pytest.raises(cli_errors.CliError, match="could not check whether a daemon"):
             status_view.wait_for(_resolved(db), 5, sleep=lambda s: None, clock=Clock().monotonic)
+
+
+# --------------------------------------------------------------------------
+# deferred: a retryable refusal (`deferred=` / `deferred_reason=`)
+# --------------------------------------------------------------------------
+
+REASON = "the dataset 'tank/new' does not exist"
+POLL = daemonlock.RELOAD_POLL_SECONDS
+
+
+def deferred_text(gen, reason=REASON):
+    return (
+        f"daemon has not applied generation {gen} yet: {reason or 'see the daemon log'}; "
+        f"it re-checks every poll ({POLL} s)"
+    )
+
+
+class TestDeferred:
+    def test_the_poll_interval_in_the_text_is_ten_seconds(self):
+        assert POLL == 10
+
+    def test_the_verdict_text_with_a_reason(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen), deferred_reason=REASON)
+        assert verdict(run, db) == "deferred"
+        assert message(run, db) == (
+            f"daemon has not applied generation {gen} yet: {REASON}; it re-checks every poll (10 s)"
+        )
+
+    def test_the_verdict_text_without_a_reason(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen))
+        assert verdict(run, db) == "deferred"
+        assert message(run, db) == (
+            f"daemon has not applied generation {gen} yet: see the daemon log; "
+            "it re-checks every poll (10 s)"
+        )
+
+    def test_it_is_a_verdict_in_its_own_right_not_behind_or_rejected(
+        self, run, plain, db, live_daemon
+    ):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen), deferred_reason=REASON)
+        assert verdict(run, db) not in ("behind", "rejected", "applying")
+
+    # -- precedence: applied, target, rejected beat it; another key is behind
+
+    def test_applied_beats_deferred(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen), deferred=(sid, gen), deferred_reason=REASON)
+        assert verdict(run, db) == "in-sync"
+
+    def test_target_beats_deferred(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), target=(sid, gen), deferred=(sid, gen))
+        assert verdict(run, db) == "applying"
+
+    def test_rejected_beats_deferred(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), rejected=(sid, gen), deferred=(sid, gen))
+        assert verdict(run, db) == "rejected"
+
+    @pytest.mark.parametrize(
+        "key",
+        [lambda sid, gen: (sid, gen - 1), lambda sid, gen: (sid, gen + 1),
+         lambda sid, gen: (sid + 1, gen)],
+        ids=["older-generation", "newer-generation", "other-store"],
+    )
+    def test_deferred_for_another_key_is_behind(self, run, plain, db, live_daemon, key):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=key(sid, gen), deferred_reason=REASON)
+        assert verdict(run, db) == "behind"
+        assert "has not applied" not in message(run, db)
+
+    # -- rows -------------------------------------------------------------
+
+    def test_the_text_rows_appear_only_when_set(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        daemon = live_daemon(db, applied=(sid, gen - 1))
+        result = status(run, db)
+        out = result.stdout
+        assert result.exit_code == 0 and "rejected: -" in out.splitlines()
+        assert "deferred:" not in out and "reason:" not in out
+        daemon.set(deferred=(sid, gen))                      # no reason
+        result = status(run, db)
+        out = result.stdout
+        assert result.exit_code == 0
+        assert f"deferred: store {sid}, generation {gen}" in out.splitlines()
+        assert "reason:" not in out
+        daemon.set(deferred_reason=REASON)
+        assert status(run, db).stdout == (
+            f"database: {_resolved(db).resolved_path}\n"
+            f"stored:   store {sid}, generation {gen}\n"
+            f"daemon:   pid {os.getpid()} (reload-capable: yes)\n"
+            f"applied:  store {sid}, generation {gen - 1}\n"
+            "target:   -\n"
+            "rejected: -\n"
+            f"deferred: store {sid}, generation {gen}\n"
+            f"reason:   {REASON}\n"
+            f"status:   {deferred_text(gen)}\n"
+        )
+
+    def test_clearing_deferred_removes_its_reason_row_too(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        daemon = live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen), deferred_reason=REASON)
+        daemon.set(deferred=None, deferred_reason=None)
+        result = status(run, db)
+        out = result.stdout
+        assert result.exit_code == 0 and "rejected: -" in out.splitlines()
+        assert "deferred:" not in out and "reason:" not in out
+
+    def test_a_legacy_daemon_has_no_deferred_rows(self, run, plain, db, live_daemon):
+        live_daemon(db, generation=store_key(db)[1], start=None)
+        result = status(run, db)
+        out = result.stdout
+        assert result.exit_code == 0 and "applied:  generation" in out
+        assert "deferred:" not in out and "reason:" not in out
+
+    # -- JSON ---------------------------------------------------------------
+
+    def test_json_carries_the_key_and_the_reason(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen), deferred_reason=REASON)
+        doc = as_json(status(run, db, "--json"))
+        assert doc["daemon"]["deferred"] == {"store_id": sid, "generation": gen}
+        assert doc["daemon"]["deferred_reason"] == REASON
+        assert doc["verdict"] == "deferred" and doc["message"] == deferred_text(gen)
+
+    def test_json_without_a_reason_has_a_null_reason(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen))
+        daemon = as_json(status(run, db, "--json"))["daemon"]
+        assert daemon["deferred"] == {"store_id": sid, "generation": gen}
+        assert daemon["deferred_reason"] is None
+
+    def test_json_without_deferred_has_nulls(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db))
+        daemon = as_json(status(run, db, "--json"))["daemon"]
+        assert daemon["deferred"] is None and daemon["deferred_reason"] is None
+
+    # -- --wait ---------------------------------------------------------------
+
+    def test_wait_while_deferred_is_75_at_the_deadline_never_1(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen), deferred_reason=REASON)
+        started = time.monotonic()
+        result = status(run, db, "--wait", "0.6")
+        assert result.exit_code == 75, (result.stdout, result.stderr)
+        assert time.monotonic() - started >= 0.5            # it kept polling
+        assert result.stderr.startswith(
+            f"error: the daemon is not yet in sync after 0.6s: {deferred_text(gen)}"
+        )
+        assert result.stdout.splitlines()[-1] == f"status:   {deferred_text(gen)}"
+
+    def test_wait_while_deferred_with_json_is_75_too(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen))
+        result = status(run, db, "--wait", "0.3", "--json")
+        assert result.exit_code == 75 and as_json(result)["verdict"] == "deferred"
+
+    def test_wait_applied_mid_wait_is_0(self, run, plain, db, live_daemon):
+        import threading
+
+        sid, gen = bump(run, db)
+        daemon = live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen), deferred_reason=REASON)
+        timer = threading.Timer(0.5, lambda: daemon.set(applied=(sid, gen), deferred=None))
+        timer.start()
+        try:
+            started = time.monotonic()
+            result = status(run, db, "--wait", "30")
+        finally:
+            timer.cancel()
+            timer.join()
+        assert result.exit_code == 0, (result.stdout, result.stderr)
+        assert 0.3 < time.monotonic() - started < 15
+        assert result.stdout.splitlines()[-1] == "status:   in sync"
+
+    def test_wait_later_rejected_is_1(self, run, plain, db, live_daemon):
+        import threading
+
+        sid, gen = bump(run, db)
+        daemon = live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen), deferred_reason=REASON)
+        timer = threading.Timer(0.5, lambda: daemon.set(rejected=(sid, gen), deferred=None))
+        timer.start()
+        try:
+            result = status(run, db, "--wait", "30")
+        finally:
+            timer.cancel()
+            timer.join()
+        assert result.exit_code == 1, (result.stdout, result.stderr)
+        assert "rejected the stored configuration" in result.stderr
+
+    def test_wait_for_keeps_polling_through_deferred_and_returns_the_last_status(
+        self, run, plain, db, live_daemon
+    ):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen), deferred_reason=REASON)
+        clock = Clock()
+        got = status_view.wait_for(_resolved(db), 1.0, sleep=clock.sleep, clock=clock.monotonic)
+        assert got.verdict == "deferred" and got.message == deferred_text(gen)
+        assert sum(clock.sleeps) == pytest.approx(1.0)
+        assert not got.will_not_catch_up
+
+    def test_wait_for_sees_deferred_become_in_sync(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        daemon = live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen), deferred_reason=REASON)
+        clock = Clock()
+        steps = []
+
+        def sleep(seconds):
+            clock.sleep(seconds)
+            steps.append(1)
+            if len(steps) == 2:
+                daemon.set(applied=(sid, gen), deferred=None)
+
+        got = status_view.wait_for(_resolved(db), 10, sleep=sleep, clock=clock.monotonic)
+        assert got.verdict == "in-sync" and len(steps) == 2   # noticed on the next look
+
+    def test_without_wait_deferred_is_exit_0(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen))
+        assert status(run, db).exit_code == 0
+        assert status(run, db, "--json").exit_code == 0
 
 
 # --------------------------------------------------------------------------

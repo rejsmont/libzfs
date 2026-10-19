@@ -95,10 +95,12 @@ def resolved(db):
     return _resolved(db)
 
 
-def info(*, pid=4321, generation=None, start="tok", applied=None, target=None, rejected=None):
+def info(*, pid=4321, generation=None, start="tok", applied=None, target=None, rejected=None,
+         deferred=None, deferred_reason=None):
     return daemonlock.DaemonInfo(
         pid=pid, generation=generation, start=start,
         applied=applied, target=target, rejected=rejected,
+        deferred=deferred, deferred_reason=deferred_reason,
     )
 
 
@@ -1461,6 +1463,378 @@ class TestAckLoop:
 
     def test_the_real_poll_interval_is_a_tenth_of_a_second(self):
         assert cli_write.ACK_POLL_SECONDS == 0.1
+
+
+class TestDeferredAnswers:
+    """`deferred=` / `deferred_reason=`: the daemon refused the key for a reason
+    that can pass (it re-checks every poll). Not final, unlike `rejected`: the
+    loops keep waiting, and only at the deadline report `deferred`."""
+
+    KEY = (7, 5)
+    REASON = "the dataset 'tank/new' does not exist"
+
+    def deferred(self, **kw):
+        kw.setdefault("applied", (7, 4))
+        return info(deferred=self.KEY, deferred_reason=self.REASON, **kw)
+
+    # -- _answer ----------------------------------------------------------
+
+    def test_answer_is_deferred_for_this_key(self):
+        assert cli_write._answer(self.deferred(), self.KEY) == "deferred"
+        assert cli_write._answer(info(applied=(7, 4), deferred=self.KEY), self.KEY) == "deferred"
+
+    @pytest.mark.parametrize(
+        "daemon, expected",
+        [
+            (dict(applied=(7, 5)), "applied"),
+            (dict(applied=(7, 6)), "newer"),
+            (dict(applied=(7, 4), target=(7, 6)), "newer"),
+            (dict(applied=(7, 4), target=(7, 5)), "accepted"),
+            (dict(applied=(7, 4), rejected=(7, 5)), "rejected"),
+            (dict(applied=(7, 4), rejected=(7, 6)), "superseded"),
+        ],
+        ids=["applied", "newer-applied", "newer-target", "target", "rejected", "superseded"],
+    )
+    def test_every_other_answer_beats_deferred(self, daemon, expected):
+        both = info(deferred=self.KEY, deferred_reason=self.REASON, **daemon)
+        assert cli_write._answer(both, self.KEY) == expected
+
+    @pytest.mark.parametrize("key", [(7, 4), (8, 5), (8, 9), (0, 5)], ids=["older", "other-store", "other-store-newer", "unstamped"])
+    def test_deferred_for_another_key_answers_nothing(self, key):
+        assert cli_write._answer(info(applied=(7, 4), deferred=key), self.KEY) is None
+
+    def test_a_torn_read_never_answers_deferred(self):
+        torn = daemonlock.DaemonInfo(
+            pid=1, generation=None, start="t", deferred=self.KEY, stable=False
+        )
+        assert cli_write._answer(torn, self.KEY) is None
+
+    # -- _await_answer ------------------------------------------------------
+
+    def wait(self, resolved, wait=3.0, **kw):
+        return cli_write._await_answer(resolved, self.KEY, wait, **kw)
+
+    def test_deferred_then_applied_is_applied(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        calls = probes(
+            monkeypatch, self.deferred(), self.deferred(), info(applied=self.KEY)
+        )
+        answer, seen = self.wait(resolved)
+        assert answer == "applied" and len(calls) == 3 and clock.sleeps == [0.1, 0.1]
+        assert seen.deferred is None
+
+    def test_deferred_at_the_deadline_is_returned_with_its_reason(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        calls = probes(monkeypatch, self.deferred())
+        answer, seen = self.wait(resolved, wait=1.0)
+        assert answer == "deferred"
+        assert seen.deferred == self.KEY and seen.deferred_reason == self.REASON
+        assert len(calls) > 5 and sum(clock.sleeps) == pytest.approx(1.0)   # it did keep waiting
+
+    def test_deferred_without_a_reason_at_the_deadline(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, info(applied=(7, 4), deferred=self.KEY))
+        answer, seen = self.wait(resolved, wait=0.5)
+        assert answer == "deferred" and seen.deferred_reason is None
+
+    def test_deferred_then_not_deferred_is_no_answer(self, resolved, monkeypatch):
+        """The daemon dropped the deferral (a newer write replaced the key, say)
+        without applying: nothing is "deferred" at the deadline any more."""
+        Clock().install(monkeypatch)
+        probes(monkeypatch, self.deferred(), self.deferred(), info(applied=(7, 4)))
+        answer, last = self.wait(resolved, wait=0.5)
+        assert answer is None and last.deferred is None
+
+    def test_a_torn_read_claiming_deferred_leaves_no_flag(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        torn = daemonlock.DaemonInfo(
+            pid=4321, generation=None, start="t", deferred=self.KEY, stable=False
+        )
+        probes(monkeypatch, info(applied=(7, 4)), torn, torn)
+        answer, last = self.wait(resolved, wait=0.3)
+        assert answer is None and last.deferred is None
+
+    def test_a_torn_read_does_not_erase_the_last_stable_deferred(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        torn = daemonlock.DaemonInfo(pid=4321, generation=None, start="t", stable=False)
+        probes(monkeypatch, self.deferred(), torn, torn)
+        answer, seen = self.wait(resolved, wait=0.3)
+        assert answer == "deferred" and seen.deferred_reason == self.REASON
+
+    def test_deferred_then_rejected_is_rejected(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        probes(monkeypatch, self.deferred(), info(applied=(7, 4), rejected=self.KEY))
+        assert self.wait(resolved)[0] == "rejected" and clock.sleeps == [0.1]
+
+    def test_deferred_then_accepted_is_accepted_for_the_plain_loop(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, self.deferred(), info(applied=(7, 4), target=self.KEY))
+        assert self.wait(resolved)[0] == "accepted"
+
+    def test_deferred_then_gone_is_gone(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, self.deferred(), None)
+        assert self.wait(resolved)[0] == "gone"
+
+    # -- await_applied ------------------------------------------------------
+
+    def test_await_applied_deferred_then_applied(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, self.deferred(), info(applied=self.KEY))
+        assert cli_write.await_applied(resolved, self.KEY, 3.0)[0] == "applied"
+
+    def test_await_applied_deferred_at_the_deadline(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        probes(monkeypatch, self.deferred())
+        answer, seen = cli_write.await_applied(resolved, self.KEY, 1.0)
+        assert answer == "deferred" and seen.deferred_reason == self.REASON
+        assert sum(clock.sleeps) == pytest.approx(1.0)
+
+    def test_await_applied_deferred_then_accepted_ends_as_none(self, resolved, monkeypatch):
+        """`accepted` is not applied: at the deadline the last read was not
+        deferred any more, so the answer is the plain "not applied in time"."""
+        Clock().install(monkeypatch)
+        probes(monkeypatch, self.deferred(), info(applied=(7, 4), target=self.KEY))
+        answer, last = cli_write.await_applied(resolved, self.KEY, 0.5)
+        assert answer is None and last.target == self.KEY
+
+    def test_await_applied_deferred_then_rejected(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, self.deferred(), info(applied=(7, 4), rejected=self.KEY))
+        assert cli_write.await_applied(resolved, self.KEY, 3.0)[0] == "rejected"
+
+    @pytest.mark.parametrize("other", [(7, 4), (8, 6), (0, 6)], ids=["older", "other-store", "unstamped"])
+    def test_await_applied_ignores_a_deferral_of_another_key(self, resolved, monkeypatch, other):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, info(applied=(7, 4), deferred=other))
+        assert cli_write.await_applied(resolved, self.KEY, 0.5)[0] is None
+
+    # -- the notice ---------------------------------------------------------
+
+    def notice(self, resolved, monkeypatch, daemon, wait=3.0):
+        reloaded(monkeypatch, "signalled")
+        Clock().install(monkeypatch)
+        probes(monkeypatch, daemon)
+        return cli_write._daemon_notice(resolved, 5, 7, wait)
+
+    def test_the_notice_with_a_reason(self, resolved, monkeypatch):
+        line, warning = self.notice(
+            resolved, monkeypatch,
+            info(applied=(7, 4), deferred=(7, 5), deferred_reason=self.REASON),
+        )
+        assert line == (
+            "config updated (generation 5); reload requested from daemon pid 4321; the daemon "
+            f"has not applied generation 5 yet: {self.REASON}; it re-checks every poll (10 s)"
+        )
+        assert warning is None
+
+    def test_the_notice_without_a_reason(self, resolved, monkeypatch):
+        line, warning = self.notice(resolved, monkeypatch, info(applied=(7, 4), deferred=(7, 5)))
+        assert line == (
+            "config updated (generation 5); reload requested from daemon pid 4321; the daemon "
+            "has not applied generation 5 yet: see the daemon log; it re-checks every poll (10 s)"
+        )
+        assert warning is None
+
+    def test_the_notice_after_a_deferral_that_cleared_is_the_unacknowledged_line(
+        self, resolved, monkeypatch
+    ):
+        reloaded(monkeypatch, "signalled")
+        Clock().install(monkeypatch)
+        probes(monkeypatch, info(applied=(7, 4), deferred=(7, 5)), info(applied=(7, 4)))
+        line, warning = cli_write._daemon_notice(resolved, 5, 7, 0.3)
+        assert "not yet acknowledged" in line and "has not applied" not in line and warning is None
+
+    def test_a_deferred_write_is_exit_0_with_stdout_only(self, run, rich, db, monkeypatch):
+        reloaded(monkeypatch, "signalled")
+        Clock().install(monkeypatch)
+        sid, gen = store_key(db)
+        probes(
+            monkeypatch,
+            info(applied=(sid, gen), deferred=(sid, gen + 1), deferred_reason=self.REASON),
+        )
+        result = run("set", "check_interval", "10m", "-c", db)
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.splitlines()[-1] == (
+            f"config updated (generation {gen + 1}); reload requested from daemon pid 4321; "
+            f"the daemon has not applied generation {gen + 1} yet: {self.REASON}; "
+            "it re-checks every poll (10 s)"
+        )
+        assert "warning" not in result.stderr and "rejected" not in result.stderr
+
+    def test_a_rejection_still_warns_on_stderr(self, run, rich, db, monkeypatch):
+        """Unchanged: only `rejected` is final and warned about."""
+        reloaded(monkeypatch, "signalled")
+        Clock().install(monkeypatch)
+        sid, gen = store_key(db)
+        probes(monkeypatch, info(applied=(sid, gen), rejected=(sid, gen + 1)))
+        result = run("set", "check_interval", "10m", "-c", db)
+        assert result.exit_code == 0
+        assert f"rejected generation {gen + 1}" in result.stderr
+
+
+class TestSupersededDeferred:
+    """A LATER generation of this store is deferred: ours was folded into it.
+    Not final either -- the daemon re-checks every poll -- so the loops keep
+    waiting and only at the deadline report `superseded-deferred`."""
+
+    KEY = (7, 5)
+    LATER = (7, 6)
+    REASON = "the dataset 'tank/new' does not exist"
+
+    def later(self, **kw):
+        kw.setdefault("applied", (7, 4))
+        kw.setdefault("deferred", self.LATER)
+        kw.setdefault("deferred_reason", self.REASON)
+        return info(**kw)
+
+    # -- _answer ----------------------------------------------------------
+
+    @pytest.mark.parametrize("later", [(7, 6), (7, 99)], ids=["next", "far"])
+    def test_answer_for_a_later_deferred_key_of_this_store(self, later):
+        assert cli_write._answer(self.later(deferred=later), self.KEY) == "superseded-deferred"
+
+    @pytest.mark.parametrize("other", [(7, 4), (8, 6), (8, 5), (0, 99)], ids=["older", "other-store", "other-store-same", "unstamped"])
+    def test_older_or_other_store_deferrals_answer_nothing(self, other):
+        assert cli_write._answer(self.later(deferred=other), self.KEY) is None
+
+    def test_a_deferral_of_this_exact_key_is_deferred_not_superseded(self):
+        assert cli_write._answer(self.later(deferred=self.KEY), self.KEY) == "deferred"
+
+    @pytest.mark.parametrize(
+        "daemon, expected",
+        [
+            (dict(applied=(7, 5)), "applied"),
+            (dict(applied=(7, 6)), "newer"),
+            (dict(applied=(7, 4), target=(7, 5)), "accepted"),
+            (dict(applied=(7, 4), target=(7, 6)), "newer"),
+            (dict(applied=(7, 4), rejected=(7, 5)), "rejected"),
+            (dict(applied=(7, 4), rejected=(7, 7)), "superseded"),
+        ],
+        ids=["applied", "applied-later", "target", "target-later", "rejected", "rejected-later"],
+    )
+    def test_every_other_answer_beats_it(self, daemon, expected):
+        assert cli_write._answer(self.later(**daemon), self.KEY) == expected
+
+    def test_a_torn_read_never_answers_it(self):
+        torn = daemonlock.DaemonInfo(
+            pid=1, generation=None, start="t", deferred=self.LATER, stable=False
+        )
+        assert cli_write._answer(torn, self.KEY) is None
+
+    # -- _await_answer --------------------------------------------------------
+
+    def wait(self, resolved, wait=3.0):
+        return cli_write._await_answer(resolved, self.KEY, wait)
+
+    def test_the_deadline_returns_it_with_the_reason(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        calls = probes(monkeypatch, self.later())
+        answer, seen = self.wait(resolved, wait=1.0)
+        assert answer == "superseded-deferred"
+        assert seen.deferred == self.LATER and seen.deferred_reason == self.REASON
+        assert len(calls) > 5 and sum(clock.sleeps) == pytest.approx(1.0)   # it kept waiting
+
+    def test_it_resolves_to_applied_mid_wait(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        probes(monkeypatch, self.later(), self.later(), info(applied=self.KEY))
+        assert self.wait(resolved)[0] == "applied" and clock.sleeps == [0.1, 0.1]
+
+    def test_it_resolves_to_newer_mid_wait(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, self.later(), info(applied=self.LATER))
+        assert self.wait(resolved)[0] == "newer"
+
+    def test_it_resolves_to_rejected_mid_wait(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, self.later(), info(applied=(7, 4), rejected=self.LATER))
+        assert self.wait(resolved)[0] == "superseded"
+
+    @pytest.mark.parametrize(
+        "sequence, expected",
+        [
+            (("later", "own"), "deferred"),
+            (("own", "later"), "superseded-deferred"),
+            (("later", "own", "later"), "superseded-deferred"),
+        ],
+        ids=["to-own", "to-later", "there-and-back"],
+    )
+    def test_flipping_between_deferred_and_superseded_returns_the_last_word(
+        self, resolved, monkeypatch, sequence, expected
+    ):
+        Clock().install(monkeypatch)
+        states = {"own": self.later(deferred=self.KEY), "later": self.later()}
+        probes(monkeypatch, *[states[name] for name in sequence])
+        assert self.wait(resolved, wait=0.5)[0] == expected
+
+    def test_a_deferral_that_goes_away_is_no_answer(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, self.later(), info(applied=(7, 4)))
+        answer, last = self.wait(resolved, wait=0.5)
+        assert answer is None and last.deferred is None
+
+    def test_a_torn_read_leaves_no_flag(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        torn = daemonlock.DaemonInfo(
+            pid=4321, generation=None, start="t", deferred=self.LATER, stable=False
+        )
+        probes(monkeypatch, info(applied=(7, 4)), torn, torn)
+        assert self.wait(resolved, wait=0.3)[0] is None
+
+    def test_await_applied_keeps_waiting_and_reports_it_at_the_deadline(self, resolved, monkeypatch):
+        clock = Clock().install(monkeypatch)
+        probes(monkeypatch, self.later())
+        answer, seen = cli_write.await_applied(resolved, self.KEY, 1.0)
+        assert answer == "superseded-deferred" and seen.deferred_reason == self.REASON
+        assert sum(clock.sleeps) == pytest.approx(1.0)
+
+    def test_await_applied_resolves_to_applied(self, resolved, monkeypatch):
+        Clock().install(monkeypatch)
+        probes(monkeypatch, self.later(), info(applied=self.KEY))
+        assert cli_write.await_applied(resolved, self.KEY, 3.0)[0] == "applied"
+
+    # -- the notice -----------------------------------------------------------
+
+    def notice(self, resolved, monkeypatch, daemon):
+        reloaded(monkeypatch, "signalled")
+        Clock().install(monkeypatch)
+        probes(monkeypatch, daemon)
+        return cli_write._daemon_notice(resolved, 5, 7, 3.0)
+
+    def test_the_notice_with_a_reason(self, resolved, monkeypatch):
+        line, warning = self.notice(resolved, monkeypatch, self.later())
+        assert line == (
+            "config updated (generation 5); reload requested from daemon pid 4321; superseded "
+            f"by generation 6, which the daemon has not applied yet: {self.REASON}; "
+            "it re-checks every poll (10 s)"
+        )
+        assert warning is None
+
+    def test_the_notice_without_a_reason(self, resolved, monkeypatch):
+        line, warning = self.notice(resolved, monkeypatch, self.later(deferred_reason=None))
+        assert line == (
+            "config updated (generation 5); reload requested from daemon pid 4321; superseded "
+            "by generation 6, which the daemon has not applied yet: see the daemon log; "
+            "it re-checks every poll (10 s)"
+        )
+        assert warning is None
+
+    def test_a_superseded_deferred_write_is_exit_0_with_stdout_only(self, run, rich, db, monkeypatch):
+        reloaded(monkeypatch, "signalled")
+        Clock().install(monkeypatch)
+        sid, gen = store_key(db)
+        probes(
+            monkeypatch,
+            info(applied=(sid, gen), deferred=(sid, gen + 2), deferred_reason=self.REASON),
+        )
+        result = run("set", "check_interval", "10m", "-c", db)
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.splitlines()[-1] == (
+            f"config updated (generation {gen + 1}); reload requested from daemon pid 4321; "
+            f"superseded by generation {gen + 2}, which the daemon has not applied yet: "
+            f"{self.REASON}; it re-checks every poll (10 s)"
+        )
+        assert "warning" not in result.stderr and "rejected" not in result.stderr
 
 
 class TestAwaitApplied:

@@ -330,7 +330,7 @@ def _clear_gate(
     if busy is not None:
         if request is None or request.outcome not in _VERIFIED_OUTCOMES or key is None:
             raise _DaemonPresent(busy)
-        answer, _info = await_applied(resolved, key)
+        answer, info = await_applied(resolved, key)
         if answer == "gone":
             # Exited while we waited: same as finding nobody (re-checked, not assumed).
             again = _daemon_running(resolved)
@@ -338,10 +338,22 @@ def _clear_gate(
                 raise _DaemonPresent(again)
             busy = None
         elif answer not in ("applied", "newer"):
-            if answer is None and progress is not None:
+            if answer in (None, "deferred", "superseded-deferred") and progress is not None:
                 progress["waited"] = True
             why = {
                 None: "it has not applied the rename within --reload-wait",
+                "superseded-deferred": (
+                    "it has not applied a later configuration yet (generation "
+                    f"{info.deferred[1] if info is not None and info.deferred else '?'} is "
+                    "deferred: "
+                    f"{(info.deferred_reason if info is not None else None) or 'see the daemon log'}"
+                    f"; it re-checks every poll, {daemonlock.RELOAD_POLL_SECONDS} s)"
+                ),
+                "deferred": (
+                    "it has not applied the rename within --reload-wait (it deferred it: "
+                    f"{(info.deferred_reason if info is not None else None) or 'see the daemon log'}"
+                    f"; it re-checks every poll, {daemonlock.RELOAD_POLL_SECONDS} s)"
+                ),
                 "rejected": "it rejected the new configuration and keeps running the old one",
                 "superseded": "it rejected a later configuration and keeps running the old one",
                 "unreadable": "its state file could not be read while waiting",

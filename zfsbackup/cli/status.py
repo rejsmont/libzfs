@@ -14,6 +14,10 @@ Verdicts (``verdict`` in the JSON, the last line in text):
                    its workers over (in-flight transfers finish first)
 ``rejected``       the daemon refused the stored key and keeps running an
                    older one (its log says why)
+``deferred``       the daemon refused the stored key for a reason that can
+                   pass later with nothing written (today: the API address
+                   cannot be bound) and re-checks it at every poll; NOT
+                   final, unlike ``rejected``
 ``behind``         the daemon is on another key; it picks the stored one
                    up at its next check (a daemon that predates live
                    reload must be restarted instead)
@@ -36,7 +40,9 @@ JSON shape (stable; keys may be added, none renamed or removed)::
         "generation": int | null,       # the pid file's line 2
         "applied":  {"store_id": int, "generation": int} | null,
         "target":   {...} | null,       # only while a reload is being applied
-        "rejected": {...} | null
+        "rejected": {...} | null,
+        "deferred": {...} | null,       # retryable refusal; re-checked each poll
+        "deferred_reason": str | null   # one line, as the daemon published it
       },
       "schema_error": str | null,       # the schema problem behind exit 78
       "verdict": str,                   # one of the above
@@ -50,7 +56,7 @@ first, then the error). With `--wait SECONDS`: 0 once the daemon is in sync
 (or when no daemon is running -- there is nothing to wait for), 1 if the
 daemon rejected the stored key or can never catch up (a daemon that predates
 live reload and is behind, or a supervisor that is gone), 75 if the wait ran
-out.
+out (including while the daemon is still `deferred`: that is never exit 1).
 """
 
 import json
@@ -73,6 +79,7 @@ __all__ = [
     "IN_SYNC",
     "APPLYING",
     "REJECTED",
+    "DEFERRED",
     "BEHIND",
     "SUPERVISOR_GONE",
     "NO_DAEMON",
@@ -89,6 +96,7 @@ __all__ = [
 IN_SYNC = "in-sync"
 APPLYING = "applying"
 REJECTED = "rejected"
+DEFERRED = "deferred"
 BEHIND = "behind"
 SUPERVISOR_GONE = "supervisor-gone"
 NO_DAEMON = "no-daemon"
@@ -166,6 +174,13 @@ def _verdict(stored: StoreState, info: Optional[daemonlock.DaemonInfo]) -> Tuple
         return APPLYING, f"applying generation {stored.generation}"
     if info.rejected == key:
         return REJECTED, f"daemon rejected generation {stored.generation}"
+    if info.deferred == key:
+        # Retryable: not final, and never the rejection verdict.
+        return DEFERRED, (
+            f"daemon has not applied generation {stored.generation} yet: "
+            f"{info.deferred_reason or 'see the daemon log'}; it re-checks every poll "
+            f"({daemonlock.RELOAD_POLL_SECONDS} s)"
+        )
     applied = info.applied
     if applied is not None and applied[0] != key[0]:
         on = _key_text(applied)
@@ -248,6 +263,8 @@ def render_json(status: Status) -> str:
             "applied": _pair_json(info.applied),
             "target": _pair_json(info.target),
             "rejected": _pair_json(info.rejected),
+            "deferred": _pair_json(info.deferred),
+            "deferred_reason": info.deferred_reason,
         }
     return json.dumps(
         {
@@ -279,6 +296,10 @@ def render_text(status: Status) -> str:
         if info.reload_capable:
             for name, pair in (("applied", info.applied), ("target", info.target), ("rejected", info.rejected)):
                 rows.append((name, "-" if pair is None else _key_text(pair)))
+            if info.deferred is not None:
+                rows.append(("deferred", _key_text(info.deferred)))
+                if info.deferred_reason:
+                    rows.append(("reason", info.deferred_reason))
         else:
             gen = "unknown" if info.generation is None else f"generation {info.generation}"
             rows.append(("applied", gen))
@@ -296,7 +317,8 @@ def wait_for(
     clock: Callable[[], float] = time.monotonic,
 ) -> Status:
     """Re-read until the daemon is in sync, has rejected the stored key, no
-    daemon is running, or `seconds` pass; -> the last `Status`. The stored key is
+    daemon is running, or `seconds` pass; -> the last `Status`. A `deferred`
+    daemon is waited on like `applying` (the next poll may resolve it). The stored key is
     re-read every time (a write may land meanwhile). Reads only; no lock is held
     between readings."""
     deadline = clock() + seconds
@@ -317,7 +339,7 @@ def wait_for(
 def wait_exit_code(status: Status) -> int:
     """Exit code of `status --wait`: 0 in sync or no daemon, 1 rejected or
     never going to catch up (`will_not_catch_up`), 75 anything else (the wait
-    ran out). A schema error is the caller's 78."""
+    ran out, including a daemon still `deferred`). A schema error is the caller's 78."""
     if status.verdict in (IN_SYNC, NO_DAEMON):
         return 0
     if status.verdict == REJECTED or status.will_not_catch_up:

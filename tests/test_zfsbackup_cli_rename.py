@@ -1024,6 +1024,119 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
         assert answers[0] == (0.5, True)
         assert all(applied_only is False for _w, applied_only in answers[1:])
 
+    DEFERRED_REASON = "the dataset 'tank/vm.02' does not exist"
+
+    @pytest.mark.parametrize("reason", [DEFERRED_REASON, None], ids=["reason", "no-reason"])
+    def test_a_deferred_rename_at_the_deadline_is_refused_with_the_reason(
+        self, run, rich, stale, daemon, verify, answers, reason
+    ):
+        verify(
+            daemon, "signalled",
+            lambda key: daemon.set(deferred=key, deferred_reason=reason),
+        )
+        result = self.clear(run, rich)
+        self.assert_refused(
+            result, stale, rich,
+            f"a daemon is running (pid {daemon.pid}); it has not applied the rename within "
+            f"--reload-wait (it deferred it: {reason or 'see the daemon log'}; it re-checks "
+            "every poll, 10 s)",
+        )
+        assert answers == [(0.5, True)]               # waited once; the notice does not wait again
+        assert "not yet acknowledged" not in result.stdout
+        assert "it rejected" not in result.stderr
+
+    def test_a_deferred_rename_that_is_then_applied_clears(
+        self, run, rich, stale, daemon, verify, answers
+    ):
+        timer = []
+
+        def deferred_then_applied(key):
+            daemon.set(deferred=key, deferred_reason=self.DEFERRED_REASON)
+            timer.append(threading.Timer(0.3, daemon.set, kwargs={"applied": key, "deferred": None}))
+            timer[0].start()
+
+        verify(daemon, "signalled", deferred_then_applied)
+        try:
+            result = self.clear(run, rich, wait="5")
+        finally:
+            timer[0].cancel()
+            timer[0].join()
+        self.assert_cleared(result, stale, rich)
+
+    def test_a_deferred_rename_that_is_then_rejected_is_refused_as_rejected(
+        self, run, rich, stale, daemon, verify
+    ):
+        timer = []
+
+        def deferred_then_rejected(key):
+            daemon.set(deferred=key, deferred_reason=self.DEFERRED_REASON)
+            timer.append(threading.Timer(0.3, daemon.set, kwargs={"rejected": key, "deferred": None}))
+            timer[0].start()
+
+        verify(daemon, "signalled", deferred_then_rejected)
+        try:
+            started = time.monotonic()
+            result = self.clear(run, rich, wait="10")
+        finally:
+            timer[0].cancel()
+            timer[0].join()
+        assert time.monotonic() - started < 6        # rejection ended the wait
+        self.assert_refused(
+            result, stale, rich, "it rejected the new configuration and keeps running the old one"
+        )
+
+    @pytest.mark.parametrize(
+        "other",
+        [lambda key: (key[0], key[1] - 1), lambda key: (key[0] + 1, key[1] + 1)],
+        ids=["older", "other-store"],
+    )
+    def test_a_deferral_of_an_unrelated_key_is_just_not_applied(
+        self, run, rich, stale, daemon, verify, other
+    ):
+        verify(daemon, "signalled", lambda key: daemon.set(deferred=other(key)))
+        result = self.clear(run, rich)
+        self.assert_refused(result, stale, rich, "it has not applied the rename within --reload-wait")
+        assert "deferred it" not in result.stderr and "later configuration" not in result.stderr
+
+    @pytest.mark.parametrize("reason", [DEFERRED_REASON, None], ids=["reason", "no-reason"])
+    def test_a_later_deferred_generation_is_refused_with_its_number_and_reason(
+        self, run, rich, stale, daemon, verify, answers, reason
+    ):
+        seen = []
+
+        def later_deferred(key):
+            seen.append(key)
+            daemon.set(deferred=(key[0], key[1] + 1), deferred_reason=reason)
+
+        verify(daemon, "signalled", later_deferred)
+        result = self.clear(run, rich)
+        self.assert_refused(
+            result, stale, rich,
+            f"a daemon is running (pid {daemon.pid}); it has not applied a later configuration "
+            f"yet (generation {seen[0][1] + 1} is deferred: {reason or 'see the daemon log'}; "
+            "it re-checks every poll, 10 s)",
+        )
+        assert answers == [(0.5, True)]                 # waited once, not twice
+        assert "it rejected" not in result.stderr
+
+    def test_a_later_deferred_generation_that_resolves_to_applied_clears(
+        self, run, rich, stale, daemon, verify
+    ):
+        timer = []
+
+        def later_then_applied(key):
+            daemon.set(deferred=(key[0], key[1] + 1), deferred_reason=self.DEFERRED_REASON)
+            timer.append(threading.Timer(0.3, daemon.set, kwargs={"applied": key, "deferred": None}))
+            timer[0].start()
+
+        verify(daemon, "signalled", later_then_applied)
+        try:
+            result = self.clear(run, rich, wait="5")
+        finally:
+            timer[0].cancel()
+            timer[0].join()
+        self.assert_cleared(result, stale, rich)
+
     def test_a_rejected_rename_is_refused_at_once(self, run, rich, stale, daemon, verify, answers):
         verify(daemon, "signalled", lambda key: daemon.set(rejected=key))
         started = time.monotonic()
