@@ -51,6 +51,17 @@
 #          SIGHUPs it), then three times racing the CLI against a cold start. The daemon stays up and
 #          ends up on the new generation.
 #       The start method on the VM is recorded (forkserver on Python >= 3.14).
+#   (g) a reload to a BUSY api_port (another process listens there) is DEFERRED, not rejected: the CLI says the
+#       daemon "has not applied generation N yet ... re-checks every poll", the log carries one WARNING,
+#       `deferred=`/`deferred_reason=` appear in the pid file (never `rejected=`), `status` reports the
+#       verdict `deferred` (`--json` too), `status --wait` exits 75, the workers and the old port are
+#       untouched; releasing the port makes the 10s poll apply the SAME stored generation (trigger: poll, no new
+#       write), `deferred=` clears, the new port answers and the old one does not.
+#   (h) the daemon as a real systemd unit, `Type=notify-reload` (systemd >= 253; `Type=notify` + `ExecReload=` below that),
+#       as documented in zfsbackup/README.md: `systemctl start` returns after READY (workers already forked),
+#       `systemctl reload` returns after the reload DECISION (unchanged / accepted / even rejected), logs exactly one
+#       SIGHUP decision, `systemctl show -p StatusText` follows "generation N" (and names a rejected generation),
+#       `systemctl stop` is clean (Result=success, no process left, pid file removed).
 #
 # Daemon choice: the point is DB ACCESS, not ZFS operations, so the daemon runs `--dry-run`
 # against a STUB `zfs`/`zpool` (the same trick .github/workflows/tests.yml uses) — no pool, no
@@ -409,6 +420,45 @@ print("generation", con.execute("SELECT generation FROM global_settings").fetcho
 con.close()
 EOF
     put_file "$t/breakconfig.py" "$FIX_DIR/breakconfig.py" 644
+    # httpget.py: group (g). GET http://127.0.0.1:<port>/health and print the status code, or "ERR" (refused/timeout).
+    cat > "$t/httpget.py" <<'EOF'
+import sys, urllib.request
+try:
+    print(urllib.request.urlopen("http://127.0.0.1:%s/health" % sys.argv[1], timeout=3).status)
+except Exception:
+    print("ERR")
+EOF
+    put_file "$t/httpget.py" "$FIX_DIR/httpget.py" 644
+    # portholder.py: group (g). Listen on 127.0.0.1:<port> until killed, so a bind there fails with EADDRINUSE.
+    cat > "$t/portholder.py" <<'EOF'
+import socket, sys, time
+s = socket.socket()
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(1)
+print("READY", flush=True)
+time.sleep(3600)
+EOF
+    put_file "$t/portholder.py" "$FIX_DIR/portholder.py" 644
+    # The Type=notify-reload unit for group (h), as zfsbackup/README.md documents it (systemd >= 253; the
+    # variant for older systemd is written by the scenario). Runs the daemon --dry-run against the stub zfs.
+    cat > "$t/zfsperm-notify.service" <<EOF
+[Unit]
+Description=zfsbackup scenario unit (Type=notify-reload)
+
+[Service]
+Type=__SDTYPE__
+NotifyAccess=main
+User=$SVC_USER
+Group=$SVC_GROUP
+Environment=PYTHONPATH=$SRC_DIR PYTHONDONTWRITEBYTECODE=1 ZFS_CMD=$FIX_DIR/zfs ZPOOL_CMD=$FIX_DIR/zfs
+ExecStart=$PY -m zfsbackup.daemon --dry-run -v
+__EXECRELOAD__
+KillMode=mixed
+TimeoutStopSec=90
+StandardOutput=append:$LOG
+StandardError=append:$LOG
+EOF
+    put_file "$t/zfsperm-notify.service" "$FIX_DIR/zfsperm-notify.service.in" 644
     rm -rf "$t"
 
     # fixtures from the committed example
@@ -429,7 +479,7 @@ exists()   { msh "test -e '$1'" 2>/dev/null; }
 
 stop_daemon() {
     # All suppression happens in the guest; host stdout is never sent to /dev/null.
-    msh "{ systemctl stop $UNIT; systemctl reset-failed $UNIT; systemctl stop $HOLD_UNIT; systemctl reset-failed $HOLD_UNIT; systemctl stop $FORGE_UNIT $DECOY_UNIT $WLOCK_UNIT; systemctl reset-failed $FORGE_UNIT $DECOY_UNIT $WLOCK_UNIT; } >/dev/null 2>&1; true" || true
+    msh "{ systemctl stop $UNIT; systemctl reset-failed $UNIT; systemctl stop $HOLD_UNIT; systemctl reset-failed $HOLD_UNIT; systemctl stop $FORGE_UNIT $DECOY_UNIT $WLOCK_UNIT $PORT_UNIT $NOTIFY_UNIT; systemctl reset-failed $FORGE_UNIT $DECOY_UNIT $WLOCK_UNIT $PORT_UNIT $NOTIFY_UNIT; } >/dev/null 2>&1; true" || true
 }
 
 # Wipe the default config state: units, DB + WAL sidecars (all three — a stale -wal next to a
@@ -474,6 +524,8 @@ mode_group() { stat_of "$1" | awk '{print $1, $3}'; }
 PIDFILE="${DB}.daemon.pid"
 WLOCK="${DB}.writer.lock"
 WORKERS_LOCK="${DB}.workers.lock"
+NOTIFY_UNIT="zfsperm-notify"
+PORT_UNIT="zfsperm-portholder"
 FORGE_UNIT="zfsperm-forger"
 WLOCK_UNIT="zfsperm-wlock"
 DECOY_UNIT="zfsperm-decoy"
@@ -1173,6 +1225,167 @@ for trial in 1 2 3; do
 done
 
 stop_daemon
+# ───────────────────────────────── (g) ──────────────────────────────────────
+# Follow-ups round 2026-10-19 (B3): a candidate whose api_host:api_port is merely IN USE is DEFERRED, not rejected:
+# `deferred=` in the pid file, status verdict `deferred`, `status --wait` exits 75 (never 1), the old API keeps
+# answering, and the poll applies it once the port is free - with no new write.
+echo
+step "CHECK (g) — a reload to a BUSY api_port is deferred; releasing the port applies it by poll"
+BUSY_PORT=18099; OLD_PORT=8080
+reset_default_state
+out="$(msh "'$ENV_WRAP' '$PY' -m zfsbackup.cli import '$FIX_DIR/root.yaml' 2>&1")"; rc=$?
+check "(g) seed: root imports the 5-dataset fixture" "0" "$rc"
+start_daemon
+wait_workers_started || warn "(g) workers did not all start"
+daemon_active && pass "(g) daemon started as $SVC_USER" || fail "(g) daemon not active: $(msh "tail -n 15 '$LOG'")"
+sup_g="$(daemon_pid)"
+good_applied="$(pf_val applied)"
+check "(g) the API answers /health on the configured port $OLD_PORT" "200" "$(asu alice "'$PY' '$FIX_DIR/httpget.py' $OLD_PORT")"
+msh "
+    systemctl reset-failed $PORT_UNIT 2>/dev/null || true
+    : > /tmp/portholder.out; chmod 666 /tmp/portholder.out
+    systemd-run --unit=$PORT_UNIT --collect -p User=alice -p StandardOutput=append:/tmp/portholder.out \
+        -p StandardError=append:/tmp/portholder.out '$ENV_WRAP' '$PY' '$FIX_DIR/portholder.py' $BUSY_PORT
+" || warn "(g) could not start the port holder"
+waited=0; until msh "grep -q READY /tmp/portholder.out" 2>/dev/null; do [ "$waited" -ge 30 ] && break; sleep 1; waited=$((waited+1)); done
+check_re "(g) alice's process holds 127.0.0.1:$BUSY_PORT" "READY" "$(msh 'cat /tmp/portholder.out')"
+w_before="snapshot=$(worker_pid snapshot) pruning=$(worker_pid pruning) api=$(worker_pid api)"
+mark="$(log_lines)"
+out="$(cli_as root set api_port $BUSY_PORT)"; rc=$?
+check "(g) root 'set api_port $BUSY_PORT' exits 0 (the write is durable)" "0" "$rc"
+gD="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+info "(g) CLI said: $(printf '%s' "$out" | tr '\n' '|' | cut -c1-400)"
+check_re "(g) CLI: the daemon has not applied generation $gD yet (api_port in use), re-checks every poll" \
+    "has not applied generation $gD yet: .*$BUSY_PORT is in use.*re-checks every poll" "$out"
+check_no_re "(g) CLI does not call it a rejection" "rejected generation" "$out"
+if wait_log "$mark" "configuration generation $gD deferred \\(trigger: SIGHUP\\)" 8; then
+    pass "(g) daemon logs 'generation $gD deferred (trigger: SIGHUP)'"
+else
+    fail "(g) no 'deferred' line for generation $gD: $(log_since "$mark" | tail -n 8 | tr '\n' '|')"
+fi
+check_re "(g) the deferral is a WARNING, not an ERROR, and names the busy address" "WARNING.*generation $gD deferred.*127\\.0\\.0\\.1:$BUSY_PORT is in use" "$(log_since "$mark")"
+check_no_re "(g) nothing was logged as rejected or accepted for generation $gD" "generation $gD (rejected|accepted)" "$(log_since "$mark")"
+sleep 12                                 # two polls: a deferred key is re-evaluated, but logged once
+check_re "(g) pid file has deferred=<store>:$gD" "^[0-9]+:$gD\$" "$(pf_val deferred)"
+check "(g) pid file has NO rejected= (deferral is not a rejection)" "" "$(pf_val rejected)"
+check "(g) pid file applied= is still the running generation" "$good_applied" "$(pf_val applied)"
+check_re "(g) pid file names the reason (deferred_reason=)" "$BUSY_PORT" "$(msh "sed -n 's/^deferred_reason=//p' '$PIDFILE'")"
+# (-v logs the repeats at DEBUG, so count only the WARNING/ERROR level line)
+check "(g) the deferral is WARNING-logged once across the polls (repeats are DEBUG)" "1" "$(log_since "$mark" | grep -cE "(WARNING|ERROR).*generation $gD deferred" | tr -d '[:space:]')"
+check "(g) worker pids unchanged while deferred" "$w_before" "snapshot=$(worker_pid snapshot) pruning=$(worker_pid pruning) api=$(worker_pid api)"
+check "(g) the OLD port $OLD_PORT still answers /health" "200" "$(asu alice "'$PY' '$FIX_DIR/httpget.py' $OLD_PORT")"
+out="$(cli_as root status --json)"
+check_re "(g) status --json: verdict 'deferred'" "\"verdict\": *\"deferred\"" "$out"
+check_re "(g) status --json: deferred key is generation $gD" "\"deferred\": *\\{[^}]*\"generation\": *$gD" "$(printf '%s' "$out" | tr -d '\n')"
+out="$(cli_as root status)"; rc=$?
+check_re "(g) status text: 'has not applied generation $gD yet'" "has not applied generation $gD yet" "$out"
+check_re "(g) status text shows the deferred row" "^deferred: +store [0-9]+, generation $gD" "$out"
+out="$(cli_as root status --wait 4)"; rc=$?
+check "(g) 'status --wait 4' exits 75 while deferred (never 1)" "75" "$rc"
+daemon_active && pass "(g) daemon still running (the old API keeps serving)" || fail "(g) daemon died"
+check "(g) supervisor pid unchanged" "$sup_g" "$(daemon_pid)"
+# release the port: NO new write; the poll must apply the stored generation by itself
+db_gen_before="$(asu "$SVC_USER" "'$PY' '$FIX_DIR/dbgen.py' 2>&1" | tr -d '[:space:]')"
+msh "systemctl stop $PORT_UNIT" >/dev/null 2>&1 || true
+mark="$(log_lines)"
+if wait_log "$mark" "configuration generation $gD accepted \\(was [0-9]+; trigger: poll\\)" 20; then
+    pass "(g) the port was released: the poll accepts generation $gD within 20s (no new write)"
+else
+    fail "(g) generation $gD not accepted by poll after the release: $(log_since "$mark" | tail -n 8 | tr '\n' '|')"
+fi
+wait_pf_re applied "^[0-9]+:$gD\$" 45 && pass "(g) pid file shows applied=<store>:$gD" || fail "(g) pid file applied='$(pf_val applied)'"
+check "(g) deferred= cleared by the acceptance" "" "$(pf_val deferred)"
+check "(g) no write happened meanwhile: the stored generation is still $db_gen_before" "$db_gen_before" "$(asu "$SVC_USER" "'$PY' '$FIX_DIR/dbgen.py' 2>&1" | tr -d '[:space:]')"
+waited=0; until [ "$(asu alice "'$PY' '$FIX_DIR/httpget.py' $BUSY_PORT")" = "200" ] || [ "$waited" -ge 30 ]; do sleep 2; waited=$((waited+2)); done
+check "(g) the API now answers /health on the new port $BUSY_PORT" "200" "$(asu alice "'$PY' '$FIX_DIR/httpget.py' $BUSY_PORT")"
+check "(g) the old port $OLD_PORT no longer answers (API worker replaced)" "ERR" "$(asu alice "'$PY' '$FIX_DIR/httpget.py' $OLD_PORT")"
+out="$(cli_as root status --wait 20)"; rc=$?
+check "(g) 'status --wait 20' exits 0" "0" "$rc"
+check_re "(g) status: 'in sync'" "in sync" "$out"
+check "(g) supervisor pid unchanged through the whole deferral" "$sup_g" "$(daemon_pid)"
+stop_daemon
+
+# ───────────────────────────────── (h) ──────────────────────────────────────
+# Follow-ups round 2026-10-19 (D): sd_notify. `systemctl start` returns after READY (workers forked),
+# `systemctl reload` returns after the reload DECISION, StatusText carries "generation N", stop is clean.
+echo
+step "CHECK (h) — a systemd Type=notify-reload unit (documented in zfsbackup/README.md)"
+SD_VER="$(msh "systemctl --version | head -n1 | awk '{print \$2}'" | tr -d '[:space:]')"
+info "systemd $SD_VER on $PERM_VM"
+if [ "${SD_VER:-0}" -ge 253 ] 2>/dev/null; then
+    SD_TYPE="notify-reload"; SD_EXECRELOAD=""
+else
+    SD_TYPE="notify"; SD_EXECRELOAD='ExecReload=/bin/kill -HUP $MAINPID'    # the documented < 253 variant
+fi
+msh "sed -e 's|__SDTYPE__|$SD_TYPE|' -e 's|__EXECRELOAD__|$SD_EXECRELOAD|' '$FIX_DIR/zfsperm-notify.service.in' > /etc/systemd/system/$NOTIFY_UNIT.service && systemctl daemon-reload" \
+    || die "could not install the $NOTIFY_UNIT unit"
+sd_prop() { msh "systemctl show -p $1 --value $NOTIFY_UNIT" | tr -d '\r'; }
+reset_default_state
+out="$(msh "'$ENV_WRAP' '$PY' -m zfsbackup.cli import '$FIX_DIR/root.yaml' 2>&1")"; rc=$?
+check "(h) seed: root imports the 5-dataset fixture" "0" "$rc"
+check "(h) the unit's Type is $SD_TYPE" "$SD_TYPE" "$(sd_prop Type)"
+msh "systemctl start $NOTIFY_UNIT"; rc=$?
+check "(h) 'systemctl start' returns 0 (after READY=1)" "0" "$rc"
+check "(h) the unit is active (not 'activating')" "active" "$(sd_prop ActiveState)"
+check_re "(h) the workers had already been forked when start returned" "Started api worker" "$(msh "cat '$LOG'")"
+sup_h="$(sd_prop MainPID)"
+gh0="$(pf_val applied | cut -d: -f2)"
+check "(h) StatusText says 'generation $gh0'" "generation $gh0" "$(sd_prop StatusText)"
+check "(h) daemon runs as $SVC_USER" "$SVC_USER" "$(msh "ps -o user= -p $sup_h" | tr -d '[:space:]')"
+# reload with nothing changed: one SIGHUP (systemd's own; no ExecReload= double signal), decided, READY
+mark="$(log_lines)"
+msh "systemctl reload $NOTIFY_UNIT"; rc=$?
+check "(h) 'systemctl reload' (nothing changed) returns 0" "0" "$rc"
+check "(h) the SIGHUP was decided before reload returned: 'configuration unchanged (generation $gh0)' logged once" "1" \
+    "$(log_since "$mark" | grep -c "SIGHUP: configuration unchanged (generation $gh0)" | tr -d '[:space:]')"
+check "(h) StatusText unchanged" "generation $gh0" "$(sd_prop StatusText)"
+check "(h) unit still active, same supervisor" "active $sup_h" "$(sd_prop ActiveState) $(sd_prop MainPID)"
+# an operator write the daemon was NOT signalled about (alice is another uid): `systemctl reload` picks it up
+mark="$(log_lines)"
+out="$(cli_as alice set check_interval 3m)"; rc=$?
+check "(h) alice 'set check_interval 3m' exits 0" "0" "$rc"
+gh1="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+msh "systemctl reload $NOTIFY_UNIT"; rc=$?
+check "(h) 'systemctl reload' returns 0" "0" "$rc"
+check_re "(h) the decision was logged before reload returned: generation $gh1 accepted (SIGHUP, or the poll won the race)" \
+    "configuration generation $gh1 accepted \\(was $gh0; trigger: (SIGHUP|poll)\\)" "$(log_since "$mark")"
+check "(h) StatusText says 'generation $gh1' as soon as reload returned" "generation $gh1" "$(sd_prop StatusText)"
+wait_pf_re applied "^[0-9]+:$gh1\$" 45 && pass "(h) pid file shows applied=<store>:$gh1" || fail "(h) pid file applied='$(pf_val applied)'"
+# a root write: the CLI signals the daemon; systemd's StatusText follows
+out="$(cli_as root set check_interval 4m)"; rc=$?
+check "(h) root 'set check_interval 4m' exits 0" "0" "$rc"
+gh2="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+check_re "(h) the CLI SIGHUPed the unit's supervisor (pid $sup_h)" "reload requested from daemon pid $sup_h" "$out"
+waited=0; until [ "$(sd_prop StatusText)" = "generation $gh2" ] || [ "$waited" -ge 20 ]; do sleep 2; waited=$((waited+2)); done
+check "(h) StatusText follows to 'generation $gh2'" "generation $gh2" "$(sd_prop StatusText)"
+# a stored config the daemon refuses: reload still SUCCEEDS (READY on every outcome) and StatusText names it
+wait_pf_re applied "^[0-9]+:$gh2\$" 45 || warn "(h) generation $gh2 not applied yet"
+out="$(asu "$SVC_USER" "'$PY' '$FIX_DIR/breakconfig.py' '$DB' 2>&1")"
+gh3="$(printf '%s' "$out" | sed -n 's/^generation \([0-9]*\).*/\1/p' | head -n1)"
+mark="$(log_lines)"
+msh "systemctl reload $NOTIFY_UNIT"; rc=$?
+check "(h) 'systemctl reload' returns 0 even though the stored config is rejected" "0" "$rc"
+check_re "(h) the rejection was logged" "configuration generation $gh3 rejected" "$(log_since "$mark")"
+check "(h) StatusText names the rejected generation" "generation $gh2; generation $gh3 rejected" "$(sd_prop StatusText)"
+check "(h) the unit is still active" "active" "$(sd_prop ActiveState)"
+out="$(cli_as root import --no-backup "$FIX_DIR/root.yaml")"; rc=$?
+check "(h) root re-imports a good config (exit 0)" "0" "$rc"
+gh4="$(printf '%s' "$out" | sed -n 's/.*config updated (generation \([0-9]*\)).*/\1/p' | head -n1)"
+waited=0; until [ "$(sd_prop StatusText)" = "generation $gh4" ] || [ "$waited" -ge 20 ]; do sleep 2; waited=$((waited+2)); done
+check "(h) StatusText back to 'generation $gh4' once the repaired config is applied" "generation $gh4" "$(sd_prop StatusText)"
+# clean stop
+t0="$(date +%s)"
+msh "systemctl stop $NOTIFY_UNIT"; rc=$?
+t1="$(date +%s)"
+check "(h) 'systemctl stop' returns 0" "0" "$rc"
+if [ $((t1 - t0)) -lt 40 ]; then pass "(h) the stop took $((t1 - t0))s (well inside TimeoutStopSec=90)"; else fail "(h) the stop took $((t1 - t0))s"; fi
+check "(h) the unit is inactive" "inactive" "$(sd_prop ActiveState)"
+check "(h) the unit ended with Result=success (no SIGKILL, no timeout)" "success" "$(sd_prop Result)"
+check "(h) no daemon or worker process is left" "0" "$(msh "pgrep -fc '[z]fsbackup\\.daemon' || true" | tr -d '[:space:]')"
+check "(h) a clean stop removed the pid file" "gone" "$(exists "$PIDFILE" && echo present || echo gone)"
+check_no_re "(h) no traceback or crash in the log" "Traceback|crash loop" "$(msh "cat '$LOG'")"
+msh "{ rm -f /etc/systemd/system/$NOTIFY_UNIT.service; systemctl daemon-reload; } >/dev/null 2>&1; true" || true
+
 
 # ─────────────────────────────── Report ─────────────────────────────────────
 echo

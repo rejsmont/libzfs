@@ -82,7 +82,16 @@ sudo zpool create "$POOL_NAME" "$DISK_IMAGE"
 
 echo ""
 echo "Granting ZFS permissions to $CURRENT_USER..."
-sudo zfs allow -u "$CURRENT_USER" "$ZFS_PERMISSIONS" "$POOL_NAME"
+# One permission at a time: a permission this ZFS does not know (OpenZFS 2.4 rejects "inherit" with
+# "operation not applicable to datasets of this type") must not abort the setup and leave an
+# undelegated pool behind. Unknown ones are skipped with a warning; `zfs inherit` of a user property
+# is covered by "userprop".
+IFS=',' read -r -a _perms <<< "$ZFS_PERMISSIONS"
+for _perm in "${_perms[@]}"; do
+    if ! _err="$(sudo zfs allow -u "$CURRENT_USER" "$_perm" "$POOL_NAME" 2>&1)"; then
+        echo "WARNING: could not delegate '$_perm' on $POOL_NAME: $_err"
+    fi
+done
 
 echo ""
 echo "=========================================="
