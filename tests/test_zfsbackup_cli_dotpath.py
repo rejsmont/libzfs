@@ -13,7 +13,7 @@ Sections:
   ``TestDotpathConflict`` (a racing write -> exit 75), ``TestDotpathBaseline``
   (warnings already true of the stored configuration are not repeated),
   ``TestDotpathTempFiles``.
-- ``TestSingleSourceOfWarnings``: `from_file` is silent about the three semantic
+- ``TestSingleSourceOfWarnings``: `from_file` is silent about the semantic
   conditions, `validate_config` is their one source (exact texts), every one
   appears exactly once on `import` stderr, `load_config(warn_never_prune=False)`
   and a re-import over a never-prune configuration.
@@ -58,7 +58,6 @@ from _cli_support import (
     NO_AUTH_TEXT,
     PLAIN_YAML,
     PORT_TEXT,
-    PREFIX_TEXT,
     RICH_YAML,
     WARNY_YAML,
     Cli,
@@ -1353,7 +1352,7 @@ class TestDotpathBaseline:
         make_db(run, db, WARNY_YAML)
         return db
 
-    def test_the_fixture_has_all_three_standing_warnings(self, run, db):
+    def test_the_fixture_has_both_standing_warnings(self, run, db):
         # Import is the one command that shows them (and each exactly once).
         make_db(run, db, WARNY_YAML)
         result = run("export", "-c", db)
@@ -1392,16 +1391,27 @@ class TestDotpathBaseline:
         lines = warnings_in(result)
         assert len(lines) == 1 and "tank/ok].retention is empty" in lines[0]
 
-    def test_a_changed_warning_text_is_new(self, run, warny):
-        result = ok(run, warny, "set", "snapshot_prefix", "other_x")
+    def test_a_changed_warning_text_is_new(self, run, db):
+        # A duplicate-rule warning names both literals, so changing them gives
+        # the same CONDITION a different TEXT: that text is new and prints
+        # (the baseline compares texts, not conditions).
+        make_db(run, db, 'datasets:\n  - name: "tank/a"\n    frequency: "1h"\n'
+                         '    retention:\n      "1d": "30d"\n      "24h": "1M"\n')
+        result = ok(run, db, "set", "datasets[tank/a].retention", "{2d: 10d, 48h: 10d}")
         lines = warnings_in(result)
-        # the `_` warning names the prefix, so it is new text; plus the prefix change itself
-        assert len(lines) == 2
-        assert sum("'other_x' contains '_'" in l for l in lines) == 1
-        assert sum("snapshot_prefix changes from 'my_snap' to 'other_x'" in l for l in lines) == 1
+        assert len(lines) == 1, lines
+        assert "2d:10d" in lines[0] and "48h:10d" in lines[0]
+        assert "1d:30d" not in lines[0] and "24h:1M" not in lines[0]
+
+    def test_a_prefix_with_an_underscore_is_not_a_warning_only_the_change_is_said(self, run, warny):
+        # F1.2: the old `_` warning is gone; the CHANGE warning is the only line.
+        lines = warnings_in(ok(run, warny, "set", "snapshot_prefix", "other_x"))
+        assert len(lines) == 1, lines
+        assert "snapshot_prefix changes from 'my_snap' to 'other_x'" in lines[0]
+        assert not any("contains '_'" in l for l in lines)
 
     def test_fixing_a_standing_condition_is_silent(self, run, warny):
-        # only the prefix CHANGE is said; the standing `_` warning is not repeated
+        # only the prefix CHANGE is said; the standing never-prune/api_port warnings are not repeated
         lines = warnings_in(ok(run, warny, "set", "snapshot_prefix", "clean"))
         assert len(lines) == 1 and "snapshot_prefix changes from 'my_snap' to 'clean'" in lines[0]
         assert warnings_in(ok(run, warny, "set", "api_port", "8080")) == []
@@ -1491,11 +1501,31 @@ class TestDotpathTempFiles:
             os.umask(old)
         assert all(d == 0o700 and f == 0o600 for _, d, f in spy)
 
-    def test_non_ascii_names_round_trip(self, run, db):
-        make_db(run, db, 'datasets:\n  - name: "tank/caf\u00e9"\n    frequency: "1h"\n')
-        result = ok(run, db, "set", "datasets[tank/caf\u00e9].frequency", "30m")
-        assert result.stdout.splitlines()[0] == "datasets[tank/caf\u00e9].frequency: 1h -> 30m"
-        assert stored(db).datasets[0].name == "tank/caf\u00e9"
+    def test_non_ascii_dataset_names_are_refused_not_stored(self, run, db):
+        # libzfseasy's validators are ASCII-only now (re.ASCII), so a dataset
+        # the daemon could not build never gets into the store.
+        result = run("import", write_yaml(db.parent.parent, 'datasets:\n  - name: "tank/caf\u00e9"\n    frequency: "1h"\n'),
+                     "-c", db)
+        assert result.exit_code == 1
+        assert result.stderr.startswith("error: datasets[tank/caf\u00e9]: dataset name 'tank/caf\u00e9' cannot be managed by zfsbackup")
+        assert "in ASCII only" in result.stderr
+        assert not db.exists()
+
+    def test_non_ascii_values_other_than_dataset_names_round_trip(self, run, db):
+        # Only dataset names reach `zfs`; a destination (name and URL) is free text.
+        make_db(run, db, 'destinations:\n  "d\u00e9p\u00f4t":\n    url: "http://127.0.0.1:9/caf\u00e9"\n'
+                         'datasets:\n  - name: "tank/cafe"\n    frequency: "1h"\n')
+        result = ok(run, db, "set", "datasets[tank/cafe].frequency", "30m")
+        assert result.stdout.splitlines()[0] == "datasets[tank/cafe].frequency: 1h -> 30m"
+        config = stored(db)
+        assert config.datasets[0].name == "tank/cafe"
+        assert config.destinations["d\u00e9p\u00f4t"].url == "http://127.0.0.1:9/caf\u00e9"
+
+    def test_a_dataset_name_with_an_inner_space_round_trips_through_set(self, run, db):
+        make_db(run, db, 'datasets:\n  - name: "tank/my data"\n    frequency: "1h"\n')
+        result = ok(run, db, "set", "datasets[tank/my data].frequency", "30m")
+        assert result.stdout.splitlines()[0] == "datasets[tank/my data].frequency: 1h -> 30m"
+        assert stored(db).datasets[0].name == "tank/my data"
 
 
 # ---------------------------------------------------------------------------
@@ -1513,7 +1543,7 @@ def warny_file(tmp_path):
 
 
 class TestSingleSourceOfWarnings:
-    def test_from_file_is_silent_about_the_three_semantic_conditions(self, warny_file, caplog):
+    def test_from_file_is_silent_about_the_semantic_conditions(self, warny_file, caplog):
         with caplog.at_level(logging.DEBUG):
             BackupConfig.from_file(warny_file)
         assert warning_texts(caplog) == []
@@ -1521,12 +1551,9 @@ class TestSingleSourceOfWarnings:
     def test_validate_config_is_the_source_with_these_exact_texts(self, warny_file):
         config = BackupConfig.from_file(warny_file)
         texts = validate_config(config)
-        assert texts == [
-            PORT_TEXT,
-            PREFIX_TEXT,
-            f"datasets[tank/forever].{NEVER_PRUNE_TEXT}",
-        ] or sorted(texts) == sorted([
-            PORT_TEXT, PREFIX_TEXT, f"datasets[tank/forever].{NEVER_PRUNE_TEXT}",
+        # F1.2: the prefix `my_snap` contains '_' and no longer warns.
+        assert sorted(texts) == sorted([
+            PORT_TEXT, f"datasets[tank/forever].{NEVER_PRUNE_TEXT}",
         ])
 
     def test_import_prints_each_exactly_once(self, run, db, tmp_path):
@@ -1535,7 +1562,7 @@ class TestSingleSourceOfWarnings:
         assert result.exit_code == 0, result.stderr
         lines = stderr_lines(result)
         assert count_containing(lines, f"datasets[tank/forever].{NEVER_PRUNE_TEXT}") == 1
-        assert count_containing(lines, PREFIX_TEXT) == 1
+        assert count_containing(lines, "contains '_'") == 0
         assert count_containing(lines, PORT_TEXT) == 1
         # ...and the old parse-time wordings are gone
         assert count_containing(lines, "retention is 'forever'") == 0
@@ -1545,7 +1572,8 @@ class TestSingleSourceOfWarnings:
         "yaml_text, fragment",
         [
             ('datasets:\n  - name: "t/a"\n    retention: forever\n', "datasets[t/a].retention is empty"),
-            ('snapshot_prefix: "a_b"\ndatasets:\n  - name: "t/a"\n', "snapshot_prefix 'a_b' contains '_'"),
+            ('datasets:\n  - name: "t/a"\n    frequency: "1h"\n    retention:\n      "1d": "30d"\n      "24h": "1M"\n',
+             "are the same rule"),
             ('api_port: 0\ndatasets:\n  - name: "t/a"\n', "api_port is 0"),
         ],
     )
@@ -1554,7 +1582,16 @@ class TestSingleSourceOfWarnings:
         assert result.exit_code == 0
         assert count_containing(stderr_lines(result), fragment) == 1
 
-    def test_a_plain_import_is_silent_about_all_three(self, run, db, tmp_path):
+    @pytest.mark.parametrize("prefix", ["a_b", "_x_", "a__b"])
+    def test_an_underscore_prefix_is_silent_on_import(self, run, db, tmp_path, prefix):
+        # F1.2: not a validate_config condition any more.
+        yaml_text = f'snapshot_prefix: "{prefix}"\ndatasets:\n  - name: "t/a"\n    frequency: "1h"\n'
+        result = run("import", write_yaml(tmp_path, yaml_text), "-c", db)
+        assert result.exit_code == 0, result.stderr
+        assert warnings_in(result) == []
+        assert stored(db).snapshot_prefix == prefix
+
+    def test_a_plain_import_is_silent_about_all_of_them(self, run, db, tmp_path):
         result = run("import", write_yaml(tmp_path, PLAIN_YAML), "-c", db)
         assert warnings_in(result) == []
 
@@ -1622,9 +1659,10 @@ class TestSingleSourceOfWarnings:
         assert warnings_in(result) == [f"warning: {PORT_TEXT}"]
         result = ok(run, db, "set", "snapshot_prefix", "a_b")
         lines = warnings_in(result)
-        assert sum("'a_b' contains '_'" in l for l in lines) == 1
+        # F1.2: no `_` warning; only the prefix change is said.
+        assert sum("contains '_'" in l for l in lines) == 0
         assert sum("snapshot_prefix changes from 'autosnap' to 'a_b'" in l for l in lines) == 1
-        assert len(lines) == 2
+        assert len(lines) == 1
 
 class TestDotpathRefusalsNameTheSetting:
     """A value the model refuses is reported as `<path>: <reason>` (L3), the

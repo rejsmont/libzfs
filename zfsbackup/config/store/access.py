@@ -418,7 +418,7 @@ def _write_config(
             if _is_locked(exc):
                 raise ConfigBusy(
                     f"the config database {resolved.path} is locked by another "
-                    "process (SQLite busy_timeout expired); nothing was "
+                    "process (the database stayed locked); nothing was "
                     "written. Retry in a moment."
                 ) from exc
             raise

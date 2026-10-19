@@ -91,8 +91,10 @@ datasets:
       "1d": "30d"
 """
 
-#: Every semantic warning at once: a never-prune dataset, a `_` in the prefix,
-#: and api_port 0.
+#: Every semantic warning at once: a never-prune dataset and api_port 0. (A `_`
+#: in the prefix used to be a third; it no longer warns -- the snapshot-name
+#: parser accepts it -- but "my_snap" stays so the prefix-CHANGE warning has an
+#: old value to name.)
 WARNY_YAML = """\
 snapshot_prefix: "my_snap"
 check_interval: "5m"
@@ -106,11 +108,6 @@ datasets:
 """
 
 NEVER_PRUNE_TEXT = "retention is empty ('retention: forever'): this dataset's snapshots will never be pruned and will accumulate until the pool is full"
-PREFIX_TEXT = (
-    "snapshot_prefix 'my_snap' contains '_': the snapshot timestamp is read from the "
-    "second '_'-separated field of the name, so no snapshot with this prefix will be "
-    "recognised as managed or ever pruned; use a prefix without '_'"
-)
 PORT_TEXT = "api_port is 0: the API will bind an ephemeral port that changes on every start"
 NO_AUTH_TEXT = "that API has no authentication"
 

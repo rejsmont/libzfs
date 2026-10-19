@@ -4100,6 +4100,15 @@ def short_writer_lock(monkeypatch):
     )
 
 
+def _risky_tank_config() -> BackupConfig:
+    """A config `validate_config` warns about twice: `api_port` 0 and a
+    never-prune dataset. (A `_` in the prefix used to be a warning; it is not.)"""
+    config = _tank_config()
+    config.api_port = 0
+    config.datasets[0].retention_rules = []
+    return config
+
+
 def _tank_config(name="tank/x", prefix="auto") -> BackupConfig:
     from zfsbackup.config import DatasetConfig, Duration, RetentionRule
 
@@ -4338,9 +4347,9 @@ class TestCommitConfig:
         self, seeded, monkeypatch
     ):
         resolved, snap = seeded
-        risky = _tank_config(prefix="a_b")
+        risky = _risky_tank_config()
         expected = validate_config(risky)
-        assert expected
+        assert len(expected) == 2  # api_port 0 and a never-prune dataset
         events = []
         real_write = cli_write.write_config
         monkeypatch.setattr(
@@ -4354,8 +4363,9 @@ class TestCommitConfig:
 
     def test_the_default_warn_prints_prefixed_lines_to_stderr_once(self, seeded, capsys):
         resolved, snap = seeded
-        risky = _tank_config(prefix="a_b")
+        risky = _risky_tank_config()
         expected = validate_config(risky)
+        assert expected
         cli_write.commit_config(resolved, snap, risky)
         err = capsys.readouterr().err
         assert err.splitlines() == [f"warning: {m}" for m in expected]

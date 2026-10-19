@@ -188,8 +188,8 @@ NORMALIZE = [
     ),
     pytest.param(
         make(snapshot_prefix="my_snap"),
-        lambda c: c.snapshot_prefix, "my_snap", "'_'",
-        id="snapshot-prefix-with-underscore-warns",
+        lambda c: c.snapshot_prefix, "my_snap", None,
+        id="snapshot-prefix-with-underscore-is-silent",
     ),
     pytest.param(
         make(prune_interval=None),
@@ -229,7 +229,7 @@ NORMALIZE = [
 #: the single source of those: `from_file` is silent for them and the import
 #: path (which validates) warns exactly once. The others are parse-boundary
 #: warnings and still come from `from_file`.
-SEMANTIC_WARNINGS = {"forever", "'_'", "api_port"}
+SEMANTIC_WARNINGS = {"forever", "api_port"}
 
 
 class TestNormalizeRows:
@@ -1033,9 +1033,12 @@ class TestValidateConfigDirect:
         assert len(warnings) == 1
         assert "pool/data" in warnings[0] and "never be pruned" in warnings[0]
 
-    def test_warning_prefix_with_underscore(self):
-        warnings = validate_config(good_config(snapshot_prefix="a_b"))
-        assert len(warnings) == 1 and "'a_b'" in warnings[0]
+    def test_prefix_with_underscore_gives_no_warning(self):
+        # F1.2: the parser bug the old "contains '_'" warning described is
+        # fixed in backup_manager (the prefix may now contain '_'), so the
+        # warning is gone. Nothing else about the prefix warns either.
+        assert validate_config(good_config(snapshot_prefix="a_b")) == []
+        assert validate_config(good_config(snapshot_prefix="_a__b_")) == []
 
     def test_warning_api_port_zero(self):
         warnings = validate_config(good_config(api_port=0))
@@ -1070,9 +1073,15 @@ class TestValidateConfigDirect:
         assert "2d:10d" in warnings[0] and "48h:10d" in warnings[0]
 
     def test_warnings_accumulate(self):
+        # The underscore prefix contributes nothing (F1.2); the other two
+        # conditions still each warn once.
         config = good_config(snapshot_prefix="a_b", api_port=0)
         config.datasets[0].retention_rules = []
-        assert len(validate_config(config)) == 3
+        found = validate_config(config)
+        assert len(found) == 2
+        assert any("api_port is 0" in m for m in found)
+        assert any("never be pruned" in m for m in found)
+        assert not any("a_b" in m for m in found)
 
     def test_save_config_validates_before_it_wipes(self, engine=None):
         # `save_config` takes validate_config's place as step 1 (A-2): a bad
@@ -1215,10 +1224,17 @@ class TestImporterFailureHandling:
     def test_validate_warnings_are_logged_before_anything_is_written(
         self, tmp_path, caplog
     ):
-        path = write(tmp_path, make(snapshot_prefix="a_b"))
+        path = write(tmp_path, make(api_port=0))
         with caplog.at_level(logging.WARNING):
             via_import(tmp_path, path)
-        assert any("a_b" in m for m in warnings_of(caplog))
+        assert any("api_port is 0" in m for m in warnings_of(caplog))
+
+    def test_an_underscore_prefix_imports_without_any_warning(self, tmp_path, caplog):
+        path = write(tmp_path, make(snapshot_prefix="a_b"))
+        with caplog.at_level(logging.WARNING):
+            loaded = via_import(tmp_path, path)
+        assert loaded.snapshot_prefix == "a_b"
+        assert not any("a_b" in m or "'_'" in m for m in warnings_of(caplog))
 
     def _failing_save(self, monkeypatch, target, observed):
         real = importer_module.save_config
@@ -1323,17 +1339,34 @@ class TestImporterFailureHandling:
 
 #: What every refusal/warning says about the name (stable substrings).
 CANNOT_MANAGE = "cannot be managed by zfsbackup"
-LIBRARY_ACCEPTS = "its ZFS library accepts pool[/component...]"
+LIBRARY_ACCEPTS = "its ZFS library accepts pool[/component...] in ASCII only, at most 255 characters"
 REASON = (
-    "(its ZFS library accepts pool[/component...]: the pool name starts with a letter; "
-    "letters, digits and _ . : - only, no spaces; no leading, trailing or doubled '/'; "
-    "no '@' or '#')"
+    "(its ZFS library accepts pool[/component...] in ASCII only, at most 255 characters: "
+    "the pool name starts with a letter and uses letters, digits and _ . - only, with no "
+    "':' or spaces; each component starts with a letter, digit or _ (so '.hidden', '-x' "
+    "and ':x' are refused) and may contain ':' and inner spaces but not end with a space; "
+    "no leading, trailing or doubled '/'; no '@' or '#'; no newlines or other control "
+    "characters)"
 )
 DISABLED_DATASET = "; the dataset is disabled so it is ignored, but enabling it will be refused"
 DISABLED_REMOTE = "; remote_backup is disabled so it is ignored, but enabling it will be refused"
 
 BAD_NAMES = [
-    ("space", "tank/a b"),
+    ("leading-space", "tank/ a"),
+    ("trailing-space", "tank/a "),
+    ("space-in-pool", "my pool/x"),
+    ("space-only-component", "tank/ "),
+    ("non-ascii", "tank/d\u015b"),
+    ("non-ascii-pool", "t\u00e4nk/x"),
+    ("trailing-newline", "tank/x\n"),
+    ("embedded-newline", "tank/a\nb"),
+    ("tab", "tank/a\tb"),
+    ("leading-dot", "tank/.hidden"),
+    ("leading-dash", "tank/-x"),
+    ("leading-colon", "tank/:x"),
+    ("colon-in-pool", "tank:x/y"),
+    ("colon-in-bare-pool", "tank:x"),
+    ("256-characters", "t" + "a" * 255),
     ("trailing-slash", "tank/rb/"),
     ("double-slash", "tank//x"),
     ("at-sign", "tank/a@s"),
@@ -1346,8 +1379,15 @@ GOOD = [
     pytest.param("tank/ok", id="plain"),
     pytest.param("tank/a.b:c_d-e", id="punctuation"),
     pytest.param("null", id="yaml-keyword"),
-    # An accepted quirk: Validate.dataset's `$` matches before a trailing newline.
-    pytest.param("tank/x\n", id="trailing-newline"),
+    # A space is fine INSIDE a component (just not at its start or end).
+    pytest.param("tank/a b", id="inner-space"),
+    pytest.param("tank/two  spaces/x y", id="inner-spaces-in-several-components"),
+    pytest.param("tank/a b/c d e", id="inner-space-nested"),
+    pytest.param("tank/x:y", id="colon-inside-a-component"),
+    pytest.param("tank/a b/c", id="inner-space-then-plain"),
+    pytest.param("tank/_x", id="leading-underscore"),
+    pytest.param("tank/9", id="leading-digit"),
+    pytest.param("t" + "a" * 254, id="255-characters"),
 ]
 
 
@@ -1361,9 +1401,9 @@ def named(name, *, enabled=True, **over) -> BackupConfig:
 class TestDatasetNameValidation:
     def test_the_full_refusal_text(self):
         with pytest.raises(ValueError) as excinfo:
-            validate_config(named("tank/a b"))
+            validate_config(named("tank/ a"))
         assert str(excinfo.value) == (
-            "datasets[tank/a b]: dataset name 'tank/a b' cannot be managed by zfsbackup "
+            "datasets[tank/ a]: dataset name 'tank/ a' cannot be managed by zfsbackup "
             + REASON
         )
 
@@ -1374,7 +1414,7 @@ class TestDatasetNameValidation:
         message = str(excinfo.value)
         assert message.startswith(f"datasets[{name}]: dataset name {name!r} ")
         assert CANNOT_MANAGE in message and LIBRARY_ACCEPTS in message
-        assert "is not a valid ZFS dataset name" not in message  # OpenZFS allows e.g. spaces
+        assert "is not a valid ZFS dataset name" not in message  # OpenZFS allows e.g. non-ASCII
 
     @pytest.mark.parametrize("name", GOOD)
     def test_valid_names_pass_without_a_warning(self, name):
@@ -1395,26 +1435,26 @@ class TestDatasetNameValidation:
         config = good_config()
         config.datasets.append(
             DatasetConfig(
-                name="tank/two words", frequency=Duration("1h"),
+                name="tank/ two", frequency=Duration("1h"),
                 retention_rules=[RetentionRule(Duration("1d"), Duration("30d"))],
             )
         )
-        with pytest.raises(ValueError, match=r"datasets\[tank/two words\]"):
+        with pytest.raises(ValueError, match=r"datasets\[tank/ two\]"):
             validate_config(config)
 
     def test_a_disabled_bad_name_does_not_hide_an_enabled_one(self):
-        config = named("tank/off line", enabled=False)
+        config = named("tank/ off", enabled=False)
         config.datasets.append(
             DatasetConfig(
-                name="tank/on line", frequency=Duration("1h"),
+                name="tank/ on", frequency=Duration("1h"),
                 retention_rules=[RetentionRule(Duration("1d"), Duration("30d"))],
             )
         )
-        with pytest.raises(ValueError, match=r"datasets\[tank/on line\]"):
+        with pytest.raises(ValueError, match=r"datasets\[tank/ on\]"):
             validate_config(config)
 
     def test_the_bad_name_is_reported_before_later_problems_in_the_same_dataset(self):
-        config = named("tank/a b")
+        config = named("tank/ a")
         config.datasets[0].frequency = Duration(seconds=0)  # also invalid, and checked later
         config.datasets[0].retention_rules = []
         with pytest.raises(ValueError) as excinfo:
@@ -1423,7 +1463,7 @@ class TestDatasetNameValidation:
         assert "frequency" not in str(excinfo.value)
 
     def test_the_bad_name_wins_over_the_dataset_s_own_type_errors_that_follow(self):
-        config = named("tank/a b")
+        config = named("tank/ a")
         config.datasets[0].frequency = 3600  # a type error, checked after the name
         with pytest.raises(ValueError, match=CANNOT_MANAGE):
             validate_config(config)
@@ -1465,7 +1505,7 @@ class TestDatasetNameValidation:
     def test_the_rule_is_validate_dataset_of_libzfseasy(self):
         from libzfseasy.types import Validate
 
-        for ident, name in BAD_NAMES + [("ok", "tank/ok"), ("nl", "tank/x\n")]:
+        for ident, name in BAD_NAMES + [("ok", "tank/ok"), ("inner", "tank/a b")]:
             try:
                 Validate.dataset(name)
                 accepted = True
@@ -1513,11 +1553,11 @@ class TestDatasetNameValidation:
             "        retention_rules=[RetentionRule(Duration('1d'), Duration('30d'))])])\n"
             "out = {'ok': validate_config(cfg('tank/ok'))}\n"
             "try:\n"
-            "    validate_config(cfg('tank/a b'))\n"
+            "    validate_config(cfg('tank/ a'))\n"
             "    out['bad'] = None\n"
             "except ValueError as exc:\n"
             "    out['bad'] = str(exc)\n"
-            "out['disabled'] = validate_config(cfg('tank/a b', False))\n"
+            "out['disabled'] = validate_config(cfg('tank/ a', False))\n"
             "out['libzfseasy_loaded'] = any(m == 'libzfseasy' or m.startswith('libzfseasy.') for m in sys.modules)\n"
             "print(json.dumps(out))\n"
         )
@@ -1530,7 +1570,7 @@ class TestDatasetNameValidation:
         assert result.returncode == 0, result.stderr
         out = json.loads(result.stdout.strip().splitlines()[-1])
         assert out["ok"] == []
-        assert out["bad"].startswith("datasets[tank/a b]: dataset name 'tank/a b' " + CANNOT_MANAGE)
+        assert out["bad"].startswith("datasets[tank/ a]: dataset name 'tank/ a' " + CANNOT_MANAGE)
         assert len(out["disabled"]) == 1 and out["disabled"][0].endswith(DISABLED_DATASET)
         assert out["libzfseasy_loaded"] is False
 
@@ -1563,7 +1603,7 @@ def _fingerprint(resolved):
 
 
 class TestBadNamesNeverReachTheDatabase:
-    @pytest.mark.parametrize("name", [pytest.param("tank/a b", id="space"), pytest.param("tank/x/", id="slash")])
+    @pytest.mark.parametrize("name", [pytest.param("tank/ a", id="leading-space"), pytest.param("tank/x/", id="slash")])
     def test_write_config_refuses_and_leaves_the_database_unchanged(self, tmp_path, name):
         from zfsbackup.config.store import read_config, write_config
 
@@ -1584,12 +1624,12 @@ class TestBadNamesNeverReachTheDatabase:
 
         resolved, snapshot = _stored(tmp_path)
         result = write_config(
-            resolved, named("tank/a b", enabled=False), expected_generation=snapshot.generation
+            resolved, named("tank/ a", enabled=False), expected_generation=snapshot.generation
         )
         assert result.generation == snapshot.generation + 1
         stored = read_config(resolved).config
         dispose_all()
-        assert stored.datasets[0].name == "tank/a b" and stored.datasets[0].enabled is False
+        assert stored.datasets[0].name == "tank/ a" and stored.datasets[0].enabled is False
 
     def test_write_config_refuses_a_bad_remote_backup_target(self, tmp_path):
         from zfsbackup.config.store import write_config
@@ -1609,7 +1649,7 @@ class TestBadNamesNeverReachTheDatabase:
         before = _fingerprint(resolved)
         with pytest.raises(ValueError, match=CANNOT_MANAGE):
             with open_config_session(resolved, readonly=False) as session:
-                save_config(session, named("tank/a b"))
+                save_config(session, named("tank/ a"))
         assert _fingerprint(resolved) == before
         after = read_config(resolved)
         dispose_all()
@@ -1619,7 +1659,7 @@ class TestBadNamesNeverReachTheDatabase:
         resolved, snapshot = _stored(tmp_path)
         before = _fingerprint(resolved)
         called = []
-        bad = write(tmp_path, make(ds={"name": "tank/a b"}), "bad.yaml")
+        bad = write(tmp_path, make(ds={"name": "tank/ a"}), "bad.yaml")
         with pytest.raises(ValueError, match=CANNOT_MANAGE):
             import_yaml(bad, resolved, backup=lambda outgoing: called.append(outgoing) or tmp_path / "x")
         assert called == [], "a refused import must not even write the outgoing backup"
@@ -1627,14 +1667,14 @@ class TestBadNamesNeverReachTheDatabase:
 
     def test_import_accepts_the_same_name_when_it_is_disabled(self, tmp_path, caplog):
         resolved, _ = _stored(tmp_path)
-        ok = write(tmp_path, make(ds={"name": "tank/a b", "enabled": False}), "ok.yaml")
+        ok = write(tmp_path, make(ds={"name": "tank/ a", "enabled": False}), "ok.yaml")
         with caplog.at_level(logging.WARNING):
             import_yaml(ok, resolved)
         assert any(CANNOT_MANAGE in m and "enabling it will be refused" in m for m in warnings_of(caplog))
 
     def test_a_refused_first_import_leaves_nothing_behind(self, tmp_path):
         target = tmp_path / "newdir" / "config.db"
-        bad = write(tmp_path, make(ds={"name": "tank/a b"}), "bad.yaml")
+        bad = write(tmp_path, make(ds={"name": "tank/ a"}), "bad.yaml")
         with pytest.raises(ValueError, match=CANNOT_MANAGE):
             import_yaml(bad, resolve_config_path(str(target)))
         assert not target.exists() and not target.parent.exists()
@@ -1648,13 +1688,76 @@ class TestBadNamesNeverReachTheDatabase:
         assert not target.parent.exists()
 
 
+class TestSpaceInsideAComponentEndToEnd:
+    """3c: libzfseasy now accepts a space INSIDE a dataset component, so the
+    store does too -- import -> load -> validate -> write, nothing refused and
+    nothing warned about. (Edge spaces are refused: see the BAD list above.)"""
+
+    NAME = "tank/my data/two  words"
+
+    def test_import_load_validate(self, tmp_path, caplog):
+        path = write(tmp_path, make(ds={"name": self.NAME}))
+        assert BackupConfig.from_file(path).datasets[0].name == self.NAME
+        with caplog.at_level(logging.WARNING):
+            loaded = via_import(tmp_path, path)
+        assert loaded.datasets[0].name == self.NAME
+        assert loaded.datasets[0].enabled is True
+        assert validate_config(loaded) == []
+        assert [m for m in warnings_of(caplog) if CANNOT_MANAGE in m] == []
+
+    def test_write_config_round_trips_it(self, tmp_path):
+        from zfsbackup.config.store import read_config, write_config
+
+        resolved, snapshot = _stored(tmp_path)
+        write_config(resolved, named(self.NAME), expected_generation=snapshot.generation)
+        stored = read_config(resolved).config
+        dispose_all()
+        assert stored.datasets[0].name == self.NAME and stored.datasets[0].enabled is True
+
+    def test_a_remote_backup_target_with_an_inner_space_is_accepted(self):
+        config = good_config(remote_backup=RemoteServerConfig("tank/rb dir", enabled=True))
+        assert validate_config(config) == []
+
+    @pytest.mark.parametrize("name", ["tank/a ", "tank/ a", "tank/a /b", "tank/a/ b"])
+    def test_a_space_at_either_edge_of_any_component_is_refused(self, name):
+        with pytest.raises(ValueError, match=CANNOT_MANAGE):
+            validate_config(named(name))
+
+    def test_the_refusal_names_the_new_rule(self):
+        with pytest.raises(ValueError) as excinfo:
+            validate_config(named("my pool/x"))
+        message = str(excinfo.value)
+        assert "in ASCII only" in message
+        assert "may contain ':' and inner spaces but not end with a space" in message
+        assert "with no ':' or spaces" in message  # the pool name
+        assert "at most 255 characters" in message
+        assert "no newlines or other control characters" in message
+        # The old wording said "no spaces" for every name; only the pool name
+        # still has none.
+        assert "only, no spaces" not in message
+
+    def test_a_trailing_newline_is_no_longer_an_accepted_quirk(self, tmp_path):
+        # YAML `"tank/x\n"`: Validate.dataset used `$`, which matched before
+        # a trailing newline; `re.fullmatch` does not.
+        path = write(tmp_path, make(ds={"name": "tank/x\n"}))
+        with pytest.raises(ValueError, match=CANNOT_MANAGE):
+            via_import(tmp_path, path)
+
+    def test_non_ascii_other_values_are_still_fine(self, tmp_path):
+        # Only dataset NAMES are ASCII-bound (they reach `zfs`); a destination
+        # name and URL are free text and still round-trip.
+        data = make(destinations={"d\u00e9p\u00f4t": {"url": "http://127.0.0.1:9/caf\u00e9"}})
+        loaded = via_import(tmp_path, write(tmp_path, data))
+        assert loaded.destinations["d\u00e9p\u00f4t"].url == "http://127.0.0.1:9/caf\u00e9"
+
+
 # -- through the CLI --------------------------------------------------------------
 
 
 class TestBadNamesThroughTheCli:
     """`error: datasets[...]: ...` and exit 1, nothing written, nothing announced."""
 
-    OFF = make(ds={"name": "tank/a b", "enabled": False})
+    OFF = make(ds={"name": "tank/ a", "enabled": False})
 
     @pytest.fixture
     def off(self, tmp_path):
@@ -1691,9 +1794,9 @@ class TestBadNamesThroughTheCli:
 
     def test_set_that_enables_a_bad_name_is_refused(self, off):
         before = self.digest(off)
-        result = self.invoke("set", "datasets[tank/a b].enabled", "true", "-c", off)
+        result = self.invoke("set", "datasets[tank/ a].enabled", "true", "-c", off)
         assert result.exit_code == 1, result.stdout
-        assert result.stderr.startswith("error: datasets[tank/a b]: dataset name 'tank/a b' " + CANNOT_MANAGE)
+        assert result.stderr.startswith("error: datasets[tank/ a]: dataset name 'tank/ a' " + CANNOT_MANAGE)
         assert "config updated" not in result.stdout
         assert self.digest(off) == before
 
@@ -1712,7 +1815,7 @@ class TestBadNamesThroughTheCli:
         before = self.digest(off)
         result = self.invoke("edit", "--no-prompt", "-c", off, env=stub.env(off))
         assert result.exit_code == 1, result.stdout
-        assert "error: datasets[tank/a b]: dataset name 'tank/a b' " + CANNOT_MANAGE in result.stderr
+        assert "error: datasets[tank/ a]: dataset name 'tank/ a' " + CANNOT_MANAGE in result.stderr
         assert self.digest(off) == before
 
     def test_edit_that_adds_a_bad_dataset_is_refused(self, off, tmp_path):
@@ -1726,20 +1829,20 @@ class TestBadNamesThroughTheCli:
 
     def test_import_of_a_bad_enabled_name_is_refused(self, off, tmp_path):
         before = self.digest(off)
-        bad = write(tmp_path, make(ds={"name": "tank/a b"}), "bad.yaml")
+        bad = write(tmp_path, make(ds={"name": "tank/ a"}), "bad.yaml")
         result = self.invoke("import", bad, "-c", off)
         assert result.exit_code == 1, result.stdout
-        assert "error: datasets[tank/a b]: dataset name 'tank/a b' " + CANNOT_MANAGE in result.stderr
+        assert "error: datasets[tank/ a]: dataset name 'tank/ a' " + CANNOT_MANAGE in result.stderr
         assert "config updated" not in result.stdout
         assert self.digest(off) == before
         assert list(Path(off).parent.glob("*.pre-import-*.yaml")) == []
 
     def test_a_first_import_of_a_bad_enabled_name_creates_no_database(self, tmp_path):
         target = tmp_path / "fresh" / "config.db"
-        bad = write(tmp_path, make(ds={"name": "tank/a b"}), "bad.yaml")
+        bad = write(tmp_path, make(ds={"name": "tank/ a"}), "bad.yaml")
         result = self.invoke("import", bad, "-c", target)
         assert result.exit_code == 1
-        assert result.stderr.startswith("error: datasets[tank/a b]: ")
+        assert result.stderr.startswith("error: datasets[tank/ a]: ")
         assert not target.parent.exists()
 
     def test_the_target_dataset_of_an_enabled_remote_backup_is_refused_on_import(self, tmp_path):
@@ -1747,3 +1850,130 @@ class TestBadNamesThroughTheCli:
         result = self.invoke("import", write(tmp_path, data, "bad.yaml"), "-c", tmp_path / "x" / "config.db")
         assert result.exit_code == 1
         assert result.stderr.startswith("error: remote_backup.target_dataset 'tank/rb/' " + CANNOT_MANAGE)
+
+
+# ---------------------------------------------------------------------------
+# L3: a database written BEFORE the stricter validator
+# ---------------------------------------------------------------------------
+
+
+class TestPreexistingBadNamesInTheStore:
+    """Dataset names the old validator accepted (non-ASCII, a trailing
+    newline) can already sit in a store as ENABLED rows. Nothing rewrites
+    them: reading works, but every consumer that validates refuses with the
+    clean message, until the operator disables (or renames) the dataset.
+    The row is written straight into SQLite, bypassing every write-path check,
+    exactly as an older version of the tool would have left it."""
+
+    NAMES = [
+        pytest.param("tank/café", id="non-ascii"),
+        pytest.param("tank/x\n", id="trailing-newline"),
+    ]
+
+    @pytest.fixture
+    def old_db(self, tmp_path, request):
+        import sqlite3
+
+        name = request.getfixturevalue("name")
+        db = tmp_path / "cfg" / "config.db"
+        source = write(tmp_path, make(ds={"name": "tank/seed"}))
+        resolved = resolve_config_path(str(db))
+        import_yaml(source, resolved)
+        dispose_all()
+        conn = sqlite3.connect(str(db))
+        try:
+            changed = conn.execute(
+                "UPDATE datasets SET name = ? WHERE name = ?", (name, "tank/seed")
+            ).rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        assert changed == 1
+        return db
+
+    @staticmethod
+    def invoke(*args):
+        from click.testing import CliRunner
+
+        from zfsbackup.cli.main import cli
+
+        return CliRunner().invoke(
+            cli, [str(a) for a in args], prog_name="zfsbackup-config"
+        )
+
+    @staticmethod
+    def digest(db):
+        import hashlib
+
+        dispose_all()
+        return hashlib.sha256(Path(db).read_bytes()).hexdigest()
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_load_config_succeeds_and_keeps_the_name(self, old_db, name):
+        resolved = resolve_config_path(str(old_db))
+        with open_config_session(resolved, readonly=True) as session:
+            loaded = load_config(session)
+        assert [d.name for d in loaded.datasets] == [name]
+        assert loaded.datasets[0].enabled is True
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_validate_config_refuses_with_the_clean_message(self, old_db, name):
+        resolved = resolve_config_path(str(old_db))
+        with open_config_session(resolved, readonly=True) as session:
+            loaded = load_config(session)
+        with pytest.raises(ValueError) as excinfo:
+            validate_config(loaded)
+        message = str(excinfo.value)
+        # The name is repr()ed in the sentence: a newline shows as `\n`.
+        assert f"dataset name {name!r} {CANNOT_MANAGE} {REASON}" in message
+        if "\n" in name:
+            assert "'tank/x\\n'" in message
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_every_cli_write_is_refused_and_changes_nothing(self, old_db, name):
+        before = self.digest(old_db)
+        result = self.invoke("set", "check_interval", "10m", "-c", old_db)
+        assert result.exit_code == 1, result.stdout
+        assert result.stderr.startswith("error: datasets[")
+        assert CANNOT_MANAGE in result.stderr
+        assert "config updated" not in result.stdout
+        assert self.digest(old_db) == before
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_disabling_the_dataset_unblocks_writes_and_the_name_only_warns(
+        self, old_db, name
+    ):
+        result = self.invoke("set", f"datasets[{name}].enabled", "false", "-c", old_db)
+        assert result.exit_code == 0, result.stderr
+        assert result.stderr.count("enabling it will be refused") == 1, result.stderr
+
+        # ...now an unrelated write goes through...
+        result = self.invoke("set", "check_interval", "10m", "-c", old_db)
+        assert result.exit_code == 0, result.stderr
+        assert CANNOT_MANAGE not in result.stderr  # the standing warning is not repeated
+
+        # ...and the stored row is the disabled bad name, which only warns.
+        resolved = resolve_config_path(str(old_db))
+        with open_config_session(resolved, readonly=True) as session:
+            loaded = load_config(session)
+        assert loaded.datasets[0].name == name and loaded.datasets[0].enabled is False
+        warnings = validate_config(loaded)
+        assert len(warnings) == 1
+        assert CANNOT_MANAGE in warnings[0] and warnings[0].endswith(DISABLED_DATASET)
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_the_daemon_refuses_the_config_with_the_message(self, old_db, name, tmp_path):
+        import subprocess
+        import sys
+
+        from _hermetic import hermetic_env
+
+        repo = Path(__file__).resolve().parent.parent
+        env = hermetic_env(PYTHONPATH=str(repo))
+        result = subprocess.run(
+            [sys.executable, "-m", "zfsbackup.daemon", "--test-config", "-c", str(old_db)],
+            env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        output = result.stdout + result.stderr
+        assert CANNOT_MANAGE in output and "in ASCII only" in output

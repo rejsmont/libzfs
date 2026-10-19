@@ -580,12 +580,21 @@ class TestWriteConfigPreconditions:
             write_config(seeded, cfg(), expected_generation=12345)
 
     def test_warnings_are_the_validate_config_findings(self, seeded):
-        risky = cfg(prefix="a_b")  # '_' in the prefix: snapshots would never be managed
+        risky = cfg()
+        risky.api_port = 0  # the API would bind an ephemeral port
+        risky.datasets[0].retention_rules = []  # never prune
         expected = tuple(validate_config(risky))
-        assert expected
+        assert len(expected) == 2
         result = write_config(seeded, risky, expected_generation=0)
         assert result.warnings == expected
-        assert any("contains '_'" in w for w in result.warnings)
+        assert any("api_port is 0" in w for w in result.warnings)
+        assert any("never be pruned" in w for w in result.warnings)
+
+    def test_an_underscore_prefix_is_not_a_warning(self, seeded):
+        # F1.2: the snapshot-name parser accepts '_' in the prefix now.
+        result = write_config(seeded, cfg(prefix="a_b"), expected_generation=0)
+        assert result.warnings == ()
+        assert read_config(seeded).config.snapshot_prefix == "a_b"
 
     def test_a_clean_config_has_no_warnings(self, seeded):
         result = write_config(seeded, cfg(), expected_generation=0)
@@ -812,6 +821,8 @@ class TestWriteConfigBusy:
             write_config(seeded, cfg(), expected_generation=0)
         assert isinstance(excinfo.value.__cause__, OperationalError)
         assert "nothing was written" in str(excinfo.value)
+        assert "(the database stayed locked)" in str(excinfo.value)
+        assert "busy_timeout" not in str(excinfo.value)
 
     def test_other_operational_errors_are_not_mapped(self, seeded, monkeypatch):
         def broken(*_a, **_k):
@@ -837,6 +848,8 @@ class TestWriteConfigBusy:
                 write_config(seeded, cfg("tank/mine"), expected_generation=0)
             assert time.monotonic() - started >= 4  # the busy_timeout really ran
             assert isinstance(excinfo.value.__cause__, OperationalError)
+            assert "(the database stayed locked)" in str(excinfo.value)
+            assert "busy_timeout" not in str(excinfo.value)
         finally:
             external.execute("ROLLBACK")
             external.close()

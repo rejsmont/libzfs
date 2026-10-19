@@ -4201,12 +4201,18 @@ class TestDbPragmaConnectListenerInternals:
             for record in caplog.records
         )
 
-    def test_busy_timeout_is_the_first_pragma_issued(self):
+    def test_busy_timeout_is_the_first_pragma_issued(self, monkeypatch):
         # "FIRST, before any statement that can contend for a lock" --
         # `_install_pragmas`'s own comment. Filter out the pysqlite
         # dialect's own connect-time housekeeping (e.g. `PRAGMA
         # read_uncommitted`), which runs through a separate cursor before
         # our listener fires and is not part of the sequence under test.
+        #
+        # The WAL switch brackets `journal_mode=WAL` with its own
+        # `busy_timeout` statements (lowered to the time left on the retry
+        # deadline, restored in a `finally`); a frozen clock makes the lowered
+        # value exactly the constant, so the sequence is exact.
+        monkeypatch.setattr(store_db, "_wal_switch_clock", lambda: 1000.0)
         eng, calls = self._build_stub_engine(journal_mode_row=("wal",))
         try:
             with eng.connect():
@@ -4225,13 +4231,20 @@ class TestDbPragmaConnectListenerInternals:
                 )
             )
         ]
-        assert pragma_order[0] == "PRAGMA busy_timeout=5000"
+        ms = store_db._BUSY_TIMEOUT_MS
+        assert ms == 5000
+        assert pragma_order[0] == f"PRAGMA busy_timeout={ms}"
         assert pragma_order == [
-            "PRAGMA busy_timeout=5000",
+            f"PRAGMA busy_timeout={ms}",   # the hook's own, first
+            f"PRAGMA busy_timeout={ms // 2}",   # the switch: half the time left on the deadline
             "PRAGMA journal_mode=WAL",
+            f"PRAGMA busy_timeout={ms}",   # restored
             "PRAGMA synchronous=FULL",
             "PRAGMA foreign_keys=ON",
         ]
+
+    def test_the_wal_switch_budget_is_the_busy_timeout(self):
+        assert store_db._WAL_SWITCH_BUDGET_S == store_db._BUSY_TIMEOUT_MS / 1000
 
 
 @pytest.mark.unit

@@ -138,19 +138,35 @@ def _get_dataset_validator() -> Callable[[str], None]:
 def _dataset_name_problem(name: str) -> Optional[str]:
     """None if `libzfseasy` accepts `name` as a dataset name, else a short
     reason-bearing sentence fragment. Accepts exactly what
-    `Validate.dataset` accepts (so everything that works today stays
-    accepted). The wording is about what zfsbackup can manage, not about ZFS
-    itself: OpenZFS accepts e.g. spaces in component names, it is
-    libzfseasy's `Validate.dataset` that refuses them (and the daemon cannot
-    build such names)."""
+    `Validate.dataset` accepts, which is STRICTER than what this code
+    accepted before: non-ASCII names, names with a trailing newline and names
+    longer than 255 characters used to pass and are now refused.
+
+    The wording is about what zfsbackup can manage, not about ZFS itself:
+    `Validate.dataset` is narrower than OpenZFS (whose valid characters are
+    ASCII `[a-zA-Z0-9-_.: ]`), so it refuses some names ZFS would take, for
+    example a leading or trailing space in a component, a space or ':' in the
+    pool name, or a component starting with '.', '-' or ':'; the daemon
+    cannot build such names.
+
+    The rule it enforces, and the text below describes: ASCII only; the pool
+    name starts with a letter and uses letters, digits and `_ . -` only (no
+    ':' or spaces); every `/`-separated component starts with a letter, digit
+    or '_', may contain ':' and inner spaces, and does not end with a space;
+    no leading, trailing or doubled '/'; no '@' or '#'; no newline or other
+    control character; at most 255 characters in all."""
     try:
         _get_dataset_validator()(name)
     except ValueError:
         return (
             "cannot be managed by zfsbackup (its ZFS library accepts "
-            "pool[/component...]: the pool name starts with a letter; "
-            "letters, digits and _ . : - only, no spaces; no leading, "
-            "trailing or doubled '/'; no '@' or '#')"
+            "pool[/component...] in ASCII only, at most 255 characters: the "
+            "pool name starts with a letter and uses letters, digits and "
+            "_ . - only, with no ':' or spaces; each component starts with a "
+            "letter, digit or _ (so '.hidden', '-x' and ':x' are refused) "
+            "and may contain ':' and inner spaces but not end with a space; "
+            "no leading, trailing or doubled '/'; no '@' or '#'; no newlines "
+            "or other control characters)"
         )
     return None
 
@@ -818,7 +834,7 @@ def validate_config(config: BackupConfig) -> List[str]:
 
     - no datasets; duplicate dataset names (`datasets.name UNIQUE`);
     - an ENABLED dataset whose name `libzfseasy`'s `Validate.dataset`
-      rejects (a space, a trailing `/`, ...), and an ENABLED
+      rejects (a leading/trailing space in a component, a trailing `/`, ...), and an ENABLED
       `remote_backup`'s `target_dataset` likewise -- either would raise in
       every worker and crash-loop the daemon. The same names on a DISABLED
       dataset / `remote_backup` only warn (they were never built, so they
@@ -858,10 +874,6 @@ def validate_config(config: BackupConfig) -> List[str]:
     - a dataset with no dataset-level retention rules (`retention: forever`):
       `[]` means NEVER PRUNE, so its snapshots accumulate until the pool is
       full;
-    - a `snapshot_prefix` containing `_` (the timestamp is read from the
-      second `_`-separated field of a snapshot name, so nothing under such a
-      prefix is ever recognised as managed or pruned -- a pre-existing
-      parser limitation);
     - `api_port` 0 (the API binds an ephemeral port that changes on every
       start);
     - an in-code `client_id_file` of `""`, which YAML treats as unset:
@@ -905,13 +917,6 @@ def validate_config(config: BackupConfig) -> List[str]:
             "string \"None\" explicitly.)"
         )
     _require_str(config.snapshot_prefix, "snapshot_prefix")
-    if "_" in config.snapshot_prefix:
-        warnings.append(
-            f"snapshot_prefix {config.snapshot_prefix!r} contains '_': "
-            "the snapshot timestamp is read from the second '_'-separated "
-            "field of the name, so no snapshot with this prefix will be "
-            "recognised as managed or ever pruned; use a prefix without '_'"
-        )
 
     _require_positive_duration(config.check_interval, "check_interval", "interval")
     if config.prune_interval is not None:

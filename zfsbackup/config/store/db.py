@@ -204,9 +204,11 @@ from __future__ import annotations
 
 import gc
 import logging
+import math
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterator, Optional, Tuple, Union
@@ -327,14 +329,156 @@ def url_for_path(path: Union[str, Path]) -> str:
     return url
 
 
+# The busy timeout every store connection runs with, set first in the connect
+# hook. One constant, shared with `_WAL_SWITCH_BUDGET_S` below, so the two
+# cannot drift apart.
+_BUSY_TIMEOUT_MS = 5000
+
+# Wall-clock budget for the whole of `_switch_to_wal`'s retrying (attempts AND
+# sleeps). It is a real deadline, not a sum of requested sleeps: an earlier
+# version counted only the sleeps, and since attempts themselves wait in the
+# busy handler (see `_execute_wal_pragma`) a "5 s" budget lasted ~135 s against
+# a foreign SHARED holder -- long enough to hold `<db>.writer.lock` past every
+# other writer's 10 s wait and to stall supervisor polls behind our PENDING lock.
+_WAL_SWITCH_BUDGET_S = _BUSY_TIMEOUT_MS / 1000
+_WAL_SWITCH_FIRST_DELAY_S = 0.01
+_WAL_SWITCH_MAX_DELAY_S = 0.25
+
+# The clock and the sleep of the retry loop: module-level so a test can drive
+# the deadline deterministically (a fake clock advanced by the fake sleep and
+# by a slow fake `execute`) without real waiting.
+_wal_switch_clock = time.monotonic
+
+
+def _wal_switch_sleep(seconds: float) -> None:
+    """The only sleep in the WAL-switch retry loop. A module-level function so
+    a test can patch it (to release a lock holder on the first retry, or to
+    make the budget run out without real waiting) deterministically."""
+    time.sleep(seconds)
+
+
+def _is_busy_error(exc: BaseException) -> bool:
+    """True for SQLite's busy/locked failures (SQLITE_BUSY, SQLITE_LOCKED,
+    including their extended codes) and for nothing else -- any other error
+    must raise at once.
+
+    Classified by `sqlite_errorcode` (Python 3.11+, the supported floor); the
+    primary code is the low byte, because extended codes such as
+    SQLITE_BUSY_SNAPSHOT carry it there. Only when the attribute is missing or
+    None does it fall back to matching the message text."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def _set_busy_timeout(cursor, ms: int) -> None:  # noqa: ANN001
+    # Like the connect hook's own busy_timeout line, the row is not fetched: it
+    # holds no lock and the next execute on the cursor discards it.
+    cursor.execute(f"PRAGMA busy_timeout={ms}")
+
+
+def _restore_busy_timeout(cursor, *, strict: bool) -> None:  # noqa: ANN001
+    """Put `busy_timeout` back to the connect-hook value.
+
+    `strict=False` (error paths): a failure is logged and swallowed, so it can
+    never replace the busy error the caller is about to re-raise.
+    `strict=True` (success path): a failure propagates. The switch to WAL is
+    already on disk, but pooling a connection that silently keeps a 1 ms
+    `busy_timeout` would turn every later lock wait into an instant `database
+    is locked`; raising makes the connect hook close the connection instead.
+    """
+    try:
+        _set_busy_timeout(cursor, _BUSY_TIMEOUT_MS)
+    except Exception:  # noqa: BLE001 - see docstring
+        if strict:
+            raise
+        logger.warning(
+            "could not restore busy_timeout=%d after a failed WAL switch "
+            "attempt; the connection is about to be discarded or the original "
+            "error raised",
+            _BUSY_TIMEOUT_MS,
+            exc_info=True,
+        )
+
+
+def _execute_wal_pragma(cursor) -> tuple:  # noqa: ANN001
+    """`PRAGMA journal_mode=WAL`, retried for a bounded wall-clock time while a
+    foreign process holds the database busy.
+
+    **Who this helps.** Every zfsbackup writer is serialised by
+    `<db>.writer.lock` before it connects, so two of *our* writers never reach
+    this statement together. The retry only matters against a holder outside
+    that lock: a foreign tool (`sqlite3` shell, a backup job, another
+    application) that has a write transaction open, or a reader that has not
+    finished its statement.
+
+    **Why a retry loop and not just `busy_timeout`.** Switching a
+    rollback-journal file to WAL needs the write lock, taken as an UPGRADE
+    (SHARED -> RESERVED) while this connection already holds SHARED. SQLite's
+    busy handler is deliberately not invoked for that step -- waiting could
+    deadlock against a holder that is itself waiting to upgrade -- so it fails
+    at once with `database is locked` while another connection holds RESERVED
+    (e.g. inside `BEGIN IMMEDIATE`), whatever `busy_timeout` says. The other
+    steps do use the busy handler: acquiring SHARED while another connection
+    is PENDING/EXCLUSIVE, and the final RESERVED -> EXCLUSIVE wait for
+    readers to drain. Each of those fails with the same `database is locked`
+    once `busy_timeout` elapses. A failed attempt releases the SHARED lock, so
+    nothing is held across the sleeps and retrying cannot deadlock.
+
+    **The budget is wall clock.** Because an attempt can itself wait in the
+    busy handler, the loop works to a deadline (`_WAL_SWITCH_BUDGET_S` from
+    entry). One `journal_mode=WAL` statement can wait for SHARED and then,
+    with a fresh busy count, for EXCLUSIVE -- up to 2x `busy_timeout` in total
+    (measured: 1.94 s with a 1.0 s timeout). So before each attempt
+    `busy_timeout` is set to HALF the time remaining (rounded up, at least
+    1 ms, at most `_BUSY_TIMEOUT_MS`), which keeps an attempt within the
+    remaining time up to SQLite's own sleep granularity and the 1 ms floor;
+    sleeps are clipped to the time remaining. Worst case is therefore about
+    the budget, not a multiple of it. `busy_timeout` is restored after every
+    attempt: on an error path a failed restore is only logged (the original
+    error is re-raised); on success a failed restore is raised, so the connect
+    hook discards the connection rather than pooling one stuck on a tiny
+    timeout.
+
+    Only busy errors are retried; anything else raises at once. When the
+    deadline passes, the last busy error is re-raised unchanged.
+    """
+    deadline = _wal_switch_clock() + _WAL_SWITCH_BUDGET_S
+    delay = _WAL_SWITCH_FIRST_DELAY_S
+    while True:
+        remaining = deadline - _wal_switch_clock()
+        ms = max(1, min(_BUSY_TIMEOUT_MS, math.ceil(remaining * 1000 / 2)))
+        try:
+            _set_busy_timeout(cursor, ms)
+            cursor.execute("PRAGMA journal_mode=WAL")
+            # `journal_mode` RETURNS A ROW; leaving it unfetched leaves the
+            # cursor in an odd state, so fetch it.
+            row = cursor.fetchone()
+        except BaseException as exc:
+            _restore_busy_timeout(cursor, strict=False)
+            remaining = deadline - _wal_switch_clock()
+            if (
+                not isinstance(exc, sqlite3.OperationalError)
+                or not _is_busy_error(exc)
+                or remaining <= 0
+            ):
+                raise
+            _wal_switch_sleep(min(delay, remaining))
+            delay = min(delay * 2, _WAL_SWITCH_MAX_DELAY_S)
+            continue
+        _restore_busy_timeout(cursor, strict=True)
+        return row
+
+
 def _switch_to_wal(cursor, engine: Engine) -> None:  # noqa: ANN001
     """Writer engines only: `PRAGMA journal_mode=WAL`, and complain loudly if
     SQLite leaves the mode unchanged."""
     # Persistent DB-file state, so this is a no-op after the first time.
-    # `journal_mode` RETURNS A ROW; leaving it unfetched leaves the cursor in
-    # an odd state, so fetch it.
-    cursor.execute("PRAGMA journal_mode=WAL")
-    row = cursor.fetchone()
+    row = _execute_wal_pragma(cursor)
     # ...and CHECK it. For SOME ways WAL can fail to engage, SQLite does not
     # raise -- it returns the UNCHANGED mode (measured: a filesystem without
     # the shared-memory primitives WAL needs, e.g. some network mounts). This
@@ -416,7 +560,7 @@ def _install_pragmas(
             # stops defaulting it, every statement issued before this one
             # would run with a zero busy timeout and fail instantly with
             # `database is locked` instead of waiting.
-            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
             if not memory and readonly:
                 # Readers OBSERVE the journal mode; they never set it. A
                 # read-only engine that issued `journal_mode=WAL` rewrote the
