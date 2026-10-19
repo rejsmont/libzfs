@@ -1,8 +1,11 @@
 """Unit tests for libzfseasy.zfs command classes."""
 
 import pytest
+import importlib
 import io
+import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -17,7 +20,9 @@ from libzfseasy.zfs import (
     PropertyCommand, StringListArgument, DatasetListArgument, ZFSListArgument,
     Command, _TERMINATE_TIMEOUT,
 )
-from libzfseasy.types import Dataset, Filesystem, Volume, Snapshot, SnapshotRange, Bookmark
+from libzfseasy.types import (
+    Dataset, Filesystem, Volume, Snapshot, SnapshotRange, Bookmark, ZFS, Validate, PropertyNames, InvalidNameError,
+)
 
 
 class TestListCommand:
@@ -838,8 +843,9 @@ class TestListCommandOptions:
         cmd = ListCommand()
         cmd(sort='creation', asc=False)
         call_args = mock_subprocess.call_args[0][0]
-        assert 'S' in call_args
-        assert 'creation' in call_args
+        assert '-S' in call_args
+        assert '-s' not in call_args
+        assert call_args[call_args.index('-S') + 1] == 'creation'
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -853,12 +859,15 @@ class TestListCommandOptions:
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_list_sort_dict(self, mock_subprocess):
-        # dict is Iterable, so the iterable branch fires and keys are used as sort fields
+        # the dict branch is checked before the generic Iterable one: True -> -s, False -> -S
         mock_subprocess.setup(stdout=['testpool/fs\tfilesystem\n'])
         cmd = ListCommand()
         cmd(sort={'creation': True, 'compression': False})
         call_args = mock_subprocess.call_args[0][0]
-        assert call_args.count('-s') >= 2
+        assert call_args.count('-s') == 1
+        assert call_args.count('-S') == 1
+        assert call_args[call_args.index('-s') + 1] == 'creation'
+        assert call_args[call_args.index('-S') + 1] == 'compression'
 
 
 class TestCreateCommandExtended:
@@ -2035,3 +2044,714 @@ class TestRenameKeepsExtraProperties:
         mock_subprocess.setup(returncode=1, stderr='cannot rename')
         with pytest.raises(Exception):
             RenameCommand().filesystem(fs, 'testpool/new')
+
+
+def _argv(mock_subprocess, n=0):
+    """The argv of the n-th Popen call, without the leading zfs binary."""
+    return list(mock_subprocess.call_args_list[n][0][0])[1:]
+
+
+class TestListSortDirection:
+    """`-s` sorts ascending and `-S` descending; the dict branch is reachable and keeps its order."""
+
+    LINE = ['testpool/fs\tfilesystem\n']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_string_ascending_is_dash_s(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.LINE)
+        ListCommand()(sort='creation', asc=True)
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-s') + 1] == 'creation'
+        assert '-S' not in argv
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_string_descending_is_dash_capital_s(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.LINE)
+        ListCommand()(sort='creation', asc=False)
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-S') + 1] == 'creation'
+        assert '-s' not in argv
+        assert 'S' not in argv      # the old bug emitted a bare 'S'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_dict_true_is_s_and_false_is_capital_s(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.LINE)
+        ListCommand()(sort={'creation': True, 'compression': False})
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-s') + 1] == 'creation'
+        assert argv[argv.index('-S') + 1] == 'compression'
+        assert argv.count('-s') == 1 and argv.count('-S') == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_dict_order_is_preserved(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.LINE)
+        ListCommand()(sort={'used': False, 'creation': True, 'compression': False})
+        argv = _argv(mock_subprocess)
+        start = argv.index('-S')
+        assert argv[start:start + 6] == ['-S', 'used', '-s', 'creation', '-S', 'compression']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_dict_ignores_asc(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.LINE)
+        ListCommand()(sort={'creation': True}, asc=False)
+        argv = _argv(mock_subprocess)
+        assert '-s' in argv and '-S' not in argv
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('kind', [list, tuple])
+    def test_plain_iterable_defaults_to_ascending(self, mock_subprocess, kind):
+        mock_subprocess.setup(stdout=self.LINE)
+        ListCommand()(sort=kind(['creation', 'compression']))
+        argv = _argv(mock_subprocess)
+        start = argv.index('-s')
+        assert argv[start:start + 4] == ['-s', 'creation', '-s', 'compression']
+        assert '-S' not in argv
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('kind', [list, tuple])
+    def test_plain_iterable_with_asc_false_is_all_descending(self, mock_subprocess, kind):
+        mock_subprocess.setup(stdout=self.LINE)
+        ListCommand()(sort=kind(['creation', 'compression']), asc=False)
+        argv = _argv(mock_subprocess)
+        start = argv.index('-S')
+        assert argv[start:start + 4] == ['-S', 'creation', '-S', 'compression']
+        assert '-s' not in argv
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('sort', ['name', ['name'], {'name': True}])
+    def test_name_is_an_accepted_sort_key(self, mock_subprocess, sort):
+        mock_subprocess.setup(stdout=self.LINE)
+        ListCommand()(sort=sort)
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-s') + 1] == 'name'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_name_descending(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.LINE)
+        ListCommand()(sort={'name': False, 'creation': True})
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-S') + 1] == 'name'
+        assert argv[argv.index('-s') + 1] == 'creation'
+
+    @pytest.mark.unit
+    def test_name_is_accepted_only_as_a_sort_key(self):
+        ListCommand._check_sort_key('name')
+        ListCommand._check_sort_key('creation')
+        ListCommand._check_sort_key('user:x')
+        assert 'name' not in PropertyNames.all
+        with pytest.raises(ValueError):
+            Validate.attribute('name')
+        with pytest.raises(ValueError):
+            ListCommand._check_sort_key('bogus')
+        with pytest.raises(ValueError):
+            ListCommand._check_sort_key('names')
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('sort', [
+        'not_a_property', ['creation', 'not_a_property'], ['name', 'not_a_property'], {'creation': True, 'not_a_property': False},
+    ])
+    def test_invalid_sort_key_raises_before_exec(self, mock_subprocess, sort):
+        mock_subprocess.setup(stdout=self.LINE)
+        with pytest.raises(ValueError):
+            ListCommand()(sort=sort)
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_user_property_is_a_valid_sort_key(self, mock_subprocess):
+        mock_subprocess.setup(stdout=self.LINE)
+        ListCommand()(sort={'user:rank': False})
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-S') + 1] == 'user:rank'
+
+
+class TestMultipleRootsAreSeparateArgs:
+    """Each root is its own argv element (zfs list/get take a space-separated dataset list), never comma-joined."""
+
+    ROOTS = [Filesystem('testpool/a'), Filesystem('testpool/b'), Snapshot(Filesystem('testpool/c'), 'snap')]
+    NAMES = ['testpool/a', 'testpool/b', 'testpool/c@snap']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_roots_each_their_own_element(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        ListCommand()(self.ROOTS)
+        argv = _argv(mock_subprocess)
+        assert argv[-3:] == self.NAMES
+        assert not any(',' in a and '/' in a for a in argv)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_single_root(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        ListCommand()(Filesystem('testpool/a'))
+        assert _argv(mock_subprocess)[-1] == 'testpool/a'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_no_roots_adds_no_positional(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        ListCommand()()
+        assert _argv(mock_subprocess) == ['list', '-H', '-o', 'name,type']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_get_roots_each_their_own_element(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        GetCommand()(self.ROOTS, properties='compression')
+        argv = _argv(mock_subprocess)
+        assert argv[-3:] == self.NAMES
+        assert argv[-4] == 'name,type,compression'
+        assert not any(',' in a and '/' in a for a in argv)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_get_single_root(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        GetCommand()(Filesystem('testpool/a'), properties='compression')
+        argv = _argv(mock_subprocess)
+        assert argv[-2:] == ['name,type,compression', 'testpool/a']
+
+    @pytest.mark.unit
+    def test_get_options_accepts_a_string(self):
+        assert GetCommand._get_options(properties=['all'], datasets='testpool/a') == ['all', 'testpool/a']
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('kind', [list, tuple])
+    def test_get_options_accepts_a_list(self, kind):
+        argv = GetCommand._get_options(properties=['all'], datasets=kind(['testpool/a', 'testpool/b']))
+        assert argv == ['all', 'testpool/a', 'testpool/b']
+
+    @pytest.mark.unit
+    def test_get_options_empty_list_adds_nothing(self):
+        assert GetCommand._get_options(properties=['all'], datasets=[]) == ['all']
+
+
+class TestExecLogging:
+    """Commands are logged at DEBUG on the 'libzfseasy' logger; nothing is ever printed."""
+
+    @staticmethod
+    def _records(caplog):
+        return [r for r in caplog.records if r.name == 'libzfseasy' and r.levelno == logging.DEBUG]
+
+    @staticmethod
+    def _stream_process():
+        process = MagicMock()
+        process.stdout.peek.return_value = b'ZFS_DATA'
+        process.poll.return_value = None
+        process.stdin = io.BufferedWriter(io.BytesIO())
+        return process
+
+    @pytest.mark.unit
+    def test_the_module_logger_is_named_libzfseasy(self):
+        zfs_module = importlib.import_module('libzfseasy.zfs')
+        assert isinstance(zfs_module.logger, logging.Logger)
+        assert zfs_module.logger.name == 'libzfseasy'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_logs_at_debug(self, mock_subprocess, caplog, capsys):
+        mock_subprocess.setup(stdout='')
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            Command._exec(['zfs', 'mount', '-a'])
+        assert [r.getMessage() for r in self._records(caplog)] == ['Executing command: zfs mount -a']
+        assert capsys.readouterr().out == ''
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_out_logs_at_debug(self, mock_subprocess, caplog, capsys):
+        mock_subprocess.setup(stdout=['x\n'])
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            assert list(Command._exec_out(['zfs', 'list', '-H'])) == ['x']
+        assert [r.getMessage() for r in self._records(caplog)] == ['Executing command: zfs list -H']
+        assert capsys.readouterr().out == ''
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_stream_logs_at_debug(self, mock_subprocess, caplog, capsys):
+        mock_subprocess.return_value = self._stream_process()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
+        assert [r.getMessage() for r in self._records(caplog)] == ['Executing command: zfs send testpool/fs@snap']
+        assert capsys.readouterr().out == ''
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_stream_in_logs_at_debug(self, mock_subprocess, caplog, capsys):
+        mock_subprocess.return_value = self._stream_process()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            ReceiveCommand._exec_stream_in(['zfs', 'receive', 'testpool/ds'])
+        assert [r.getMessage() for r in self._records(caplog)] == ['Executing command: zfs receive testpool/ds']
+        assert capsys.readouterr().out == ''
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_arguments_with_spaces_are_shell_quoted(self, mock_subprocess, caplog):
+        mock_subprocess.setup(stdout='')
+        cmd = ['zfs', 'rename', 'testpool/my fs', "testpool/it's"]
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            Command._exec(cmd)
+        (record,) = self._records(caplog)
+        message = record.getMessage()
+        assert message == 'Executing command: ' + shlex.join(cmd)
+        assert "'testpool/my fs'" in message
+        assert shlex.split(message[len('Executing command: '):]) == cmd
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_high_level_command_logs_its_argv_once(self, mock_subprocess, caplog, capsys, sample_filesystem):
+        mock_subprocess.setup(stdout=[])
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            ListCommand()(sample_filesystem)
+        messages = [r.getMessage() for r in self._records(caplog)]
+        assert len(messages) == 1
+        assert messages[0].endswith('list -H -o name,type ' + sample_filesystem.name)
+        assert capsys.readouterr().out == ''
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_nothing_is_logged_above_the_debug_level(self, mock_subprocess, caplog):
+        mock_subprocess.setup(stdout='')
+        with caplog.at_level(logging.INFO, logger='libzfseasy'):
+            Command._exec(['zfs', 'mount', '-a'])
+        assert self._records(caplog) == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('debug', [True, False])
+    def test_the_debug_flag_is_accepted_but_ignored(self, mock_subprocess, caplog, capsys, monkeypatch, debug):
+        zfs_module = importlib.import_module('libzfseasy.zfs')
+        monkeypatch.setattr(zfs_module, 'debug', debug)
+        mock_subprocess.setup(stdout='')
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            Command._exec(['zfs', 'mount', '-a'])
+        assert len(self._records(caplog)) == 1
+        assert capsys.readouterr().out == ''
+
+
+class TestGetLinesToObjectsNameChange:
+    """A change of dataset name resets the accumulator to the *new* name (it used to reset to '')."""
+
+    @staticmethod
+    def _row(name, prop, value, source='local'):
+        return '%s\t%s\t%s\t-\t%s' % (name, prop, value, source)
+
+    @pytest.mark.unit
+    def test_single_row_datasets_all_yield(self):
+        lines = [
+            self._row('testpool/a', 'type', 'filesystem', '-'),
+            self._row('testpool/b', 'type', 'volume', '-'),
+            self._row('testpool/c', 'type', 'filesystem', '-'),
+        ]
+        result = list(GetCommand._lines_to_objects(iter(lines), ['all']))
+        assert [r.name for r in result] == ['testpool/a', 'testpool/b', 'testpool/c']
+        assert [type(r) for r in result] == [Filesystem, Volume, Filesystem]
+
+    @pytest.mark.unit
+    def test_interleaved_datasets_keep_their_own_properties(self):
+        lines = [
+            self._row('testpool/a', 'type', 'filesystem', '-'),
+            self._row('testpool/a', 'compression', 'lz4'),
+            self._row('testpool/b', 'type', 'filesystem', '-'),
+            self._row('testpool/b', 'compression', 'gzip'),
+            self._row('testpool/b', 'atime', 'off'),
+            self._row('testpool/c', 'type', 'filesystem', '-'),
+            self._row('testpool/c', 'quota', '1G'),
+        ]
+        a, b, c = GetCommand._lines_to_objects(iter(lines), ['all'])
+        assert (a.name, b.name, c.name) == ('testpool/a', 'testpool/b', 'testpool/c')
+        assert a['compression'].value == 'lz4' and a['atime'] is None and a['quota'] is None
+        assert b['compression'].value == 'gzip' and b['atime'].value == 'off' and b['quota'] is None
+        assert c['quota'].value == '1G' and c['compression'] is None and c['atime'] is None
+
+    @pytest.mark.unit
+    def test_the_last_dataset_is_yielded(self):
+        lines = [
+            self._row('testpool/a', 'type', 'filesystem', '-'),
+            self._row('testpool/b', 'type', 'filesystem', '-'),
+            self._row('testpool/b', 'compression', 'zstd'),
+        ]
+        result = list(GetCommand._lines_to_objects(iter(lines), ['all']))
+        assert len(result) == 2
+        assert result[-1].name == 'testpool/b'
+        assert result[-1]['compression'].value == 'zstd'
+
+    @pytest.mark.unit
+    def test_a_dataset_after_a_typeless_one_is_not_lost(self):
+        lines = [
+            self._row('testpool/a', 'compression', 'lz4'),
+            self._row('testpool/b', 'type', 'filesystem', '-'),
+            self._row('testpool/b', 'compression', 'gzip'),
+        ]
+        result = list(GetCommand._lines_to_objects(iter(lines), ['all']))
+        assert [r.name for r in result] == ['testpool/b']
+        assert result[0]['compression'].value == 'gzip'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_end_to_end_through_get(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[
+            'testpool/a\ttype\tfilesystem\t-\t-\n',
+            'testpool/b\ttype\tvolume\t-\t-\n',
+            'testpool/b\tcompression\tgzip\t-\tlocal\n',
+        ])
+        result = GetCommand()(Filesystem('testpool/a'), properties='compression', recursive=True)
+        assert [r.name for r in result] == ['testpool/a', 'testpool/b']
+        assert result[0]['compression'] is None
+        assert result[1]['compression'].value == 'gzip'
+
+
+class TestRecursiveSnapshotChildListing:
+    """The recursive child listing asks for filesystems and volumes only, never snapshots or bookmarks."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_child_listing_uses_filesystem_and_volume_types(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup_multi(
+            (['testpool/filesystem\tfilesystem', 'testpool/filesystem/vol\tvolume'],),
+            ('',),
+        )
+        result = SnapshotCommand()(sample_filesystem, 'snap1', recursive=True)
+
+        assert mock_subprocess.call_count == 2
+        listing = _argv(mock_subprocess, 0)
+        assert listing[0] == 'list'
+        assert listing[listing.index('-t') + 1] == 'filesystem,volume'
+        assert '-r' in listing
+        assert listing[-1] == 'testpool/filesystem'
+        assert [str(s) for s in result] == ['testpool/filesystem@snap1', 'testpool/filesystem/vol@snap1']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_snapshot_argv_is_unchanged(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup_multi(
+            (['testpool/filesystem\tfilesystem'],),
+            ('',),
+        )
+        SnapshotCommand()(sample_filesystem, 'snap1', recursive=True)
+        assert _argv(mock_subprocess, 1) == ['snapshot', '-r', 'testpool/filesystem@snap1']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_non_recursive_does_not_list(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup(stdout='')
+        SnapshotCommand()(sample_filesystem, 'snap1')
+        assert mock_subprocess.call_count == 1
+        assert _argv(mock_subprocess) == ['snapshot', 'testpool/filesystem@snap1']
+
+
+INVALID_DATASETS = ['pool/.system', 'pool/-x', 'pool/:x', 'pool/a ', 'pool/ a']
+INVALID_SNAPSHOTS = ['pool/fs@ manual', 'pool/fs@manual ', 'pool/.system@snap']
+INVALID_BOOKMARKS = ['pool/-x#bm', 'pool/fs# bm']
+
+
+@pytest.fixture
+def warned_names(monkeypatch):
+    """A clean once-per-name registry (the real one is process-global) for the skip-and-warn tests."""
+    zfs_module = importlib.import_module('libzfseasy.zfs')
+    monkeypatch.setattr(zfs_module, '_warned_names', set())
+    return zfs_module
+
+
+def _skip_warnings(caplog):
+    return [r.getMessage() for r in caplog.records if r.name == 'libzfseasy' and r.levelno == logging.WARNING]
+
+
+class TestListSkipsInvalidNames:
+    """`zfs list` rows whose names zfs allows but libzfseasy refuses are skipped; everything else is untouched."""
+
+    GOOD = ['pool/a\tfilesystem\n', 'pool/b\tvolume\n', 'pool/c\tfilesystem\n']
+
+    @staticmethod
+    def _row(name):
+        dstype = 'snapshot' if '@' in name else 'bookmark' if '#' in name else 'filesystem'
+        return name + '\t' + dstype + '\n'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('name', INVALID_DATASETS + INVALID_SNAPSHOTS + INVALID_BOOKMARKS)
+    @pytest.mark.parametrize('position', [0, 1, 3])
+    def test_invalid_row_is_skipped_wherever_it_sits(self, mock_subprocess, warned_names, name, position):
+        lines = list(self.GOOD)
+        lines.insert(position, self._row(name))
+        mock_subprocess.setup(stdout=lines)
+        result = ListCommand()()
+        assert [r.name for r in result] == ['pool/a', 'pool/b', 'pool/c']
+        assert [type(r) for r in result] == [Filesystem, Volume, Filesystem]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_lazy_listing_skips_too(self, mock_subprocess, warned_names):
+        mock_subprocess.setup(stdout=[self._row('pool/.system'), self.GOOD[0], self._row('pool/-x'), self.GOOD[1]])
+        result = ListCommand()(lazy=True)
+        assert hasattr(result, '__next__')
+        assert [r.name for r in result] == ['pool/a', 'pool/b']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_only_invalid_rows_gives_an_empty_list(self, mock_subprocess, warned_names):
+        mock_subprocess.setup(stdout=[self._row(n) for n in INVALID_DATASETS])
+        assert ListCommand()() == []
+
+    @pytest.mark.unit
+    def test_line_to_object_returns_none_for_an_invalid_name(self, warned_names):
+        assert ListCommand._line_to_object('pool/.system\tfilesystem', ['name', 'type']) is None
+        assert isinstance(ListCommand._line_to_object('pool/a\tfilesystem', ['name', 'type']), Filesystem)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_properties_of_a_skipped_row_do_not_reach_neighbours(self, mock_subprocess, warned_names):
+        mock_subprocess.setup(stdout=[
+            'pool/a\tfilesystem\tlz4\n',
+            'pool/.system\tfilesystem\tgzip\n',
+            'pool/c\tfilesystem\t-\n',
+        ])
+        a, c = ListCommand()(properties='compression')
+        assert a['compression'].value == 'lz4'
+        assert c['compression'] is None
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_other_errors_still_propagate(self, mock_subprocess, warned_names, caplog):
+        mock_subprocess.setup(stdout=['pool/a\tbogus\n'])
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            with pytest.raises(ValueError, match='not a valid ZFS type') as info:
+                ListCommand()()
+        assert not isinstance(info.value, InvalidNameError)
+        assert _skip_warnings(caplog) == []
+
+
+class TestListLenientColumns:
+    """Columns that are `-` on some rows (a volsize on a filesystem) must not break the listing."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_volsize_dash_on_a_filesystem_row(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['pool/fs\tfilesystem\t-\n', 'pool/vol\tvolume\t1G\n'])
+        fs, vol = ListCommand()(properties='volsize')
+        assert isinstance(fs, Filesystem) and isinstance(vol, Volume)
+        assert vol['volsize'].value == '1G'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_filesystem_row_never_gets_a_volsize(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['pool/fs\tfilesystem\t-\n'])
+        (fs,) = ListCommand()(properties='volsize')
+        assert not any(k == 'volsize' for k, _ in fs.properties)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_user_property_dash_gives_no_entry(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['pool/fs\tfilesystem\t-\tmine\n'])
+        (fs,) = ListCommand()(properties=['user:unset', 'user:set'])
+        assert 'user:unset' not in fs
+        assert fs['user:unset'] is None
+        assert fs['user:set'].value == 'mine'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_ordinary_values_still_apply(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['pool/fs\tfilesystem\tlz4\ton\n'])
+        (fs,) = ListCommand()(properties=['compression', 'atime'])
+        assert fs['compression'].value == 'lz4'
+        assert fs['atime'].value == 'on'
+
+
+class TestGetSkipsInvalidNames:
+
+    @staticmethod
+    def _rows(name, dstype='filesystem', compression=None):
+        rows = ['%s\ttype\t%s\t-\t-' % (name, dstype)]
+        if compression:
+            rows.append('%s\tcompression\t%s\t-\tlocal' % (name, compression))
+        return rows
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('bad', [
+        ('pool/.system', 'filesystem'), ('pool/-x', 'volume'), ('pool/:x', 'filesystem'), ('pool/a ', 'filesystem'),
+        ('pool/ a', 'filesystem'), ('pool/fs@ manual', 'snapshot'), ('pool/fs@manual ', 'snapshot'),
+        ('pool/.system@snap', 'snapshot'), ('pool/-x#bm', 'bookmark'),
+    ])
+    @pytest.mark.parametrize('position', ['first', 'middle', 'last'])
+    def test_invalid_dataset_is_skipped_without_property_bleed(self, warned_names, bad, position):
+        a = self._rows('pool/a', compression='lz4')
+        b = self._rows(bad[0], bad[1], compression='gzip')
+        c = self._rows('pool/c', compression='zstd')
+        order = {'first': [b, a, c], 'middle': [a, b, c], 'last': [a, c, b]}[position]
+        lines = [line for block in order for line in block]
+        result = list(GetCommand._lines_to_objects(iter(lines), ['all']))
+        assert all(isinstance(r, ZFS) for r in result)
+        assert sorted(r.name for r in result) == ['pool/a', 'pool/c']
+        by_name = {r.name: r for r in result}
+        assert by_name['pool/a']['compression'].value == 'lz4'
+        assert by_name['pool/c']['compression'].value == 'zstd'
+
+    @pytest.mark.unit
+    def test_an_invalid_dataset_with_only_a_type_row(self, warned_names):
+        lines = self._rows('pool/a') + self._rows('pool/.system') + self._rows('pool/c')
+        result = list(GetCommand._lines_to_objects(iter(lines), ['all']))
+        assert [r.name for r in result] == ['pool/a', 'pool/c']
+
+    @pytest.mark.unit
+    def test_an_invalid_last_dataset_with_only_a_type_row(self, warned_names):
+        lines = self._rows('pool/a') + self._rows('pool/-x')
+        assert [r.name for r in GetCommand._lines_to_objects(iter(lines), ['all'])] == ['pool/a']
+
+    @pytest.mark.unit
+    def test_build_returns_none_for_an_invalid_name(self, warned_names):
+        assert GetCommand._build('pool/.system', 'filesystem', {}) is None
+        assert GetCommand._build('pool/fs@ manual', 'snapshot', {}) is None
+        assert isinstance(GetCommand._build('pool/a', 'filesystem', {}), Filesystem)
+
+    @pytest.mark.unit
+    def test_other_errors_still_propagate(self, warned_names, caplog):
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            with pytest.raises(ValueError, match='not a valid ZFS type') as info:
+                GetCommand._build('pool/a', 'bogus', {})
+        assert not isinstance(info.value, InvalidNameError)
+        assert _skip_warnings(caplog) == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_end_to_end_through_get(self, mock_subprocess, warned_names):
+        lines = [line + '\n' for line in
+                 self._rows('pool/a', compression='lz4') + self._rows('pool/.system', compression='off') +
+                 self._rows('pool/c', 'volume', compression='zstd')]
+        mock_subprocess.setup(stdout=lines)
+        result = GetCommand()(Filesystem('pool/a'), properties='compression', recursive=True)
+        assert [r.name for r in result] == ['pool/a', 'pool/c']
+        assert [r['compression'].value for r in result] == ['lz4', 'zstd']
+        lazy_lines = [line + '\n' for line in
+                      self._rows('pool/.system') + self._rows('pool/c', 'volume')]
+        mock_subprocess.setup(stdout=lazy_lines)
+        lazy = GetCommand()(Filesystem('pool/a'), properties='compression', lazy=True)
+        assert [r.name for r in lazy] == ['pool/c']
+
+
+class TestSkipInvalidNameWarning:
+    """One WARNING per distinct name per process on the 'libzfseasy' logger, bounded by _MAX_WARNED_NAMES."""
+
+    @staticmethod
+    def _list(mock_subprocess, *names):
+        mock_subprocess.setup(stdout=[n + '\tfilesystem\n' for n in names] + ['pool/ok\tfilesystem\n'])
+        return ListCommand()()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_message_names_the_row_and_the_reason(self, mock_subprocess, warned_names, caplog):
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            self._list(mock_subprocess, 'pool/.system')
+        (message,) = _skip_warnings(caplog)
+        assert 'skipping' in message
+        assert 'pool/.system' in message
+        assert 'cannot represent' in message
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_repeated_name_warns_once(self, mock_subprocess, warned_names, caplog):
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            self._list(mock_subprocess, 'pool/.system')
+            self._list(mock_subprocess, 'pool/.system')
+            self._list(mock_subprocess, 'pool/.system')
+        assert len(_skip_warnings(caplog)) == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_distinct_names_each_warn(self, mock_subprocess, warned_names, caplog):
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            self._list(mock_subprocess, 'pool/.system', 'pool/-x', 'pool/a ')
+        messages = _skip_warnings(caplog)
+        assert len(messages) == 3
+        for name in ('pool/.system', 'pool/-x', 'pool/a '):
+            assert sum(name in m for m in messages) == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_and_get_share_the_registry(self, mock_subprocess, warned_names, caplog):
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            self._list(mock_subprocess, 'pool/.system')
+            list(GetCommand._lines_to_objects(iter(['pool/.system\ttype\tfilesystem\t-\t-']), ['all']))
+        assert len(_skip_warnings(caplog)) == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_valid_rows_never_warn(self, mock_subprocess, warned_names, caplog):
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            self._list(mock_subprocess)
+        assert _skip_warnings(caplog) == []
+        assert warned_names._warned_names == set()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_registry_is_bounded(self, mock_subprocess, warned_names, caplog, monkeypatch):
+        monkeypatch.setattr(warned_names, '_MAX_WARNED_NAMES', 2)
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            self._list(mock_subprocess, 'pool/.a', 'pool/.b', 'pool/.c', 'pool/.d')
+            self._list(mock_subprocess, 'pool/.e', 'pool/.a')
+        messages = _skip_warnings(caplog)
+        assert sum('pool/.a' in m for m in messages) == 1
+        assert sum('pool/.b' in m for m in messages) == 1
+        assert not any(n in m for m in messages for n in ('pool/.c', 'pool/.d', 'pool/.e'))
+        assert sum('further ones are skipped silently' in m for m in messages) == 1
+        assert len(messages) == 3
+        assert len(warned_names._warned_names) <= 3      # two names plus the one overflow sentinel
+
+
+class TestListNewNativeProperties:
+    """`receive_resume_token` and the volume properties added to the per-type tables can be listed."""
+
+    TOKEN = '1-c0858fc6f-c0-789c636064000310a501c49c50360710a715e5e7a69766a63040c1eabb735735ce8f8d5883e4b6dd'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_receive_resume_token_argv(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        ListCommand()(roots=Filesystem('pool/fs'), properties=['receive_resume_token'])
+        assert _argv(mock_subprocess) == ['list', '-H', '-o', 'name,type,receive_resume_token', 'pool/fs']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_token_row_and_dash_row(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[
+            'pool/partial\tfilesystem\t' + self.TOKEN + '\n',
+            'pool/complete\tfilesystem\t-\n',
+        ])
+        partial, complete = ListCommand()(properties='receive_resume_token')
+        assert isinstance(partial, Filesystem) and isinstance(complete, Filesystem)
+        assert partial['receive_resume_token'].value == self.TOKEN
+        assert complete['receive_resume_token'] is None
+        assert 'receive_resume_token' not in complete
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_token_dash_on_a_volume_row_does_not_break_the_listing(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['pool/v\tvolume\t-\n'])
+        (vol,) = ListCommand()(properties='receive_resume_token')
+        assert isinstance(vol, Volume)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_volume_properties(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['pool/v\tvolume\tall\t0\toff\n'])
+        (vol,) = ListCommand()(properties=['prefetch', 'special_small_blocks', 'volthreading'])
+        assert vol['prefetch'].value == 'all'
+        assert vol['special_small_blocks'].value == '0'
+        assert vol['volthreading'].value == 'off'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_snapshot_encryption_properties(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['pool/fs@s\tsnapshot\tpool/enc\tavailable\n'])
+        (snap,) = ListCommand()(types='snapshot', properties=['encryptionroot', 'keystatus'])
+        assert snap['encryptionroot'].value == 'pool/enc'
+        assert snap['keystatus'].value == 'available'

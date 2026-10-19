@@ -1008,11 +1008,15 @@ class TestReadZfsbackupPropertiesRawParse:
         and local/received sources only."""
         import libzfseasy as zfs
 
-        mock_subprocess.setup(stdout=_zget('pool/zv', self.UNKNOWN_BUILTINS, ptype='volume'))
+        mock_subprocess.setup(stdout=_zget('pool/zv', [
+            ('futurething', 'off', 'local'),      # an invented native name no libzfseasy class knows
+            ('jailed', 'on', 'local'),
+            (PROP_CONFIG, 'cfg', 'local'),
+        ], ptype='volume'))
         (obj,) = list(zfs.get(Dataset('pool/zv'), properties=['all'], sources=['local', 'received']))
-        assert obj['volthreading'].value == 'off'
+        assert obj['futurething'].value == 'off'
         assert obj['jailed'].value == 'on'
-        assert sorted(obj._extra_props) == ['jailed', 'volthreading']
+        assert sorted(obj._extra_props) == ['futurething', 'jailed']
         assert obj[PROP_CONFIG].value == 'cfg'
 
     def test_the_raw_parse_still_returns_only_our_names_with_exact_values(self, mock_subprocess):

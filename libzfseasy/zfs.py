@@ -1,10 +1,11 @@
-from libzfseasy.types import Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as Snapshot, Bookmark, \
+from libzfseasy.types import InvalidNameError, Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as Snapshot, Bookmark, \
      SnapshotRange, Property, Properties
 from typing import Optional, Union, Dict, Iterable, Callable
 
 import io
+import logging
 import os
-import select
+import shlex
 import subprocess
 import shutil
 import threading
@@ -44,19 +45,70 @@ ZFSList = Union[ZFS, Iterable[ZFS]]
 StringList = Union[str, Iterable[str]]
 Sort = Union[str, Iterable[str], Dict[str, bool]]
 
+# Retained for backward compatibility: accepted but ignored. Commands are logged at DEBUG on the
+# 'libzfseasy' logger instead (configure logging to see them).
 debug = True
+
+logger = logging.getLogger('libzfseasy')
+
+# Names already reported by _skip_invalid_name (bounded, once per distinct name per process).
+_MAX_WARNED_NAMES = 1000
+_warned_names = set()
+_warned_lock = threading.Lock()
+
+
+def _skip_invalid_name(name: str, error: Exception) -> None:
+    """Log (once per distinct name per process) that a row of zfs output was skipped because its name is one
+    zfs allows but libzfseasy cannot represent."""
+    with _warned_lock:
+        if name in _warned_names:
+            return
+        if len(_warned_names) >= _MAX_WARNED_NAMES:
+            if len(_warned_names) == _MAX_WARNED_NAMES:
+                _warned_names.add(None)
+                logger.warning('skipping names from zfs output: more than %d distinct names libzfseasy cannot '
+                               'represent; further ones are skipped silently', _MAX_WARNED_NAMES)
+            return
+        _warned_names.add(name)
+    logger.warning("skipping '%s' from zfs output: libzfseasy cannot represent this name (%s)", name, error)
 
 # How long to give an abandoned child process to honor SIGTERM before
 # escalating to SIGKILL when reaping it in Command._exec_out's finally block.
 _TERMINATE_TIMEOUT = 5
+
+# Limits on the stderr a streaming child can make us keep: at most this many lines from the start and from the end
+# (the middle is replaced by one marker line), each at most this many bytes.
+_STDERR_KEEP_LINES = 200
+_STDERR_MAX_LINE = 64 * 1024
+
+
+class _BoundedErrors(list):
+    """A list of error lines that keeps the first and the last `_STDERR_KEEP_LINES` entries and collapses the
+    middle into a single `... N lines omitted ...` marker, so a pathological stderr cannot grow memory without
+    bound. Appended to by the stderr reader thread and read only after the thread was joined."""
+
+    def __init__(self):
+        super().__init__()
+        self._omitted = 0
+
+    def append(self, line):
+        keep = _STDERR_KEEP_LINES
+        if self._omitted == 0 and len(self) < 2 * keep:
+            super().append(line)
+            return
+        if self._omitted == 0:
+            self.insert(keep, '')  # the marker slot, between the head and the tail
+        super().append(line)
+        del self[keep + 1]  # drop the oldest line of the tail
+        self._omitted += 1
+        self[keep] = '... %d lines omitted ...' % self._omitted
 
 
 class Command:
 
     @classmethod
     def _exec(cls, cmd):
-        if debug:
-            print('Executing command: ' + ' '.join(cmd))
+        logger.debug('Executing command: %s', shlex.join(cmd))
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         errors = []
         stderr_thread = cls._start_stderr_reader(process, errors)
@@ -67,8 +119,7 @@ class Command:
 
     @classmethod
     def _exec_out(cls, cmd):
-        if debug:
-            print('Executing command: ' + ' '.join(cmd))
+        logger.debug('Executing command: %s', shlex.join(cmd))
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         errors = []
         stderr_thread = cls._start_stderr_reader(process, errors)
@@ -119,6 +170,86 @@ class Command:
         return thread
 
     @staticmethod
+    def _start_stderr_reader_bin(process, errors):
+        """Drain a binary stderr pipe on a daemon thread, appending each non-empty line (decoded leniently, first
+        letter capitalised) to `errors`. Used by the streaming commands, whose stdout/stdin the caller owns, so a
+        child that writes a lot of stderr can never block on a full pipe. Returns the thread, or None when the
+        process has no stderr pipe. Anything that is not a bytes line (a mocked pipe) ends the thread quietly."""
+        stderr = getattr(process, 'stderr', None)
+        if not stderr:
+            return None
+
+        def reader():
+            try:
+                while True:
+                    line = stderr.readline(_STDERR_MAX_LINE)
+                    if not isinstance(line, (bytes, bytearray)) or not line:
+                        break
+                    truncated = False
+                    if len(line) >= _STDERR_MAX_LINE and not line.endswith(b'\n'):
+                        # Over-long line: keep its head, consume (and discard) the rest of it.
+                        truncated = True
+                        while True:
+                            rest = stderr.readline(_STDERR_MAX_LINE)
+                            if not isinstance(rest, (bytes, bytearray)) or not rest or rest.endswith(b'\n'):
+                                break
+                    error = bytes(line).decode('utf-8', errors='replace').strip()
+                    if error:
+                        errors.append(error[0].upper() + error[1:] + (' [truncated]' if truncated else ''))
+            except (OSError, ValueError):
+                # The pipe was closed under us (abort/reap); whatever was read so far stands.
+                pass
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        return thread
+
+    @staticmethod
+    def _join_stderr_reader(thread):
+        # Bounded: a stray grandchild holding the pipe open must not hang the caller (the thread is a daemon).
+        # Joined at most once per thread: a second caller (e.g. the abort path after a failed start) must not
+        # wait out the timeout again for a reader that already timed out.
+        if thread is None or getattr(thread, '_libzfseasy_joined', False) is True:
+            return
+        thread.join(timeout=_TERMINATE_TIMEOUT)
+        thread._libzfseasy_joined = True
+
+    @classmethod
+    def _abort_stream(cls, process, thread):
+        """Reap a streaming child after a failed start (or an interrupt while starting): terminate it if it is
+        still running, wait for it, join the stderr reader and close the pipes. Exceptions are swallowed, but the
+        pipes are closed (and the child killed) even if a further interrupt arrives mid-cleanup; that interrupt
+        then propagates."""
+        reaped = False
+        try:
+            try:
+                # A returncode means the child was already reaped (the failure came from its own exit status).
+                if getattr(process, 'returncode', None) is None:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=_TERMINATE_TIMEOUT)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                    else:
+                        process.wait()
+                reaped = True
+                cls._join_stderr_reader(thread)
+            except Exception:
+                pass
+        finally:
+            # Reached on a second interrupt too: do not leave the child running or the pipes open.
+            try:
+                if not reaped and getattr(process, 'returncode', None) is None and process.poll() is None:
+                    process.kill()
+            except Exception:
+                pass
+            for name in ('stdin', 'stdout', 'stderr'):
+                pipe = getattr(process, name, None)
+                if pipe is not None and not (thread is not None and thread.is_alive() and name == 'stderr'):
+                    StreamHandle._close_pipe(pipe)
+
+    @staticmethod
     def _exec_capture(process, errors, stderr_thread=None):
         stdout = process.stdout.readline()
         rc = process.poll()
@@ -156,15 +287,18 @@ class StreamHandle:
         process: subprocess.Popen -- the running zfs send/receive process
         stream: io.BufferedReader | io.BufferedWriter -- process.stdout or process.stdin
         errors: list -- stderr lines captured so far (mutated in place, default [])
+        stderr_thread: threading.Thread -- the thread appending the child's stderr lines to `errors`; joined by
+            `close()` (default None: stderr is read directly in `close()` instead)
 
     Returns:
         None
     """
 
-    def __init__(self, process, stream, errors: Optional[list] = None):
+    def __init__(self, process, stream, errors: Optional[list] = None, stderr_thread=None):
         self._process = process
         self._stream = stream
         self._errors = errors if errors is not None else []
+        self._stderr_thread = stderr_thread
         self._closed = False
 
     def __enter__(self):
@@ -180,12 +314,27 @@ class StreamHandle:
     def close(self):
         if self._closed:
             return
-        self._closed = True
+        # Closing a receive-side stream flushes buffered bytes; if zfs has already exited that raises
+        # BrokenPipeError. Remember it, but still reap the process and collect its stderr: the real diagnostic is
+        # what the caller needs, and skipping the wait would leave a zombie.
+        stream_error = None
         if not getattr(self._stream, 'closed', False):
-            self._stream.close()
+            try:
+                self._stream.close()
+            except (OSError, ValueError) as e:
+                stream_error = e
         rc = self._process.wait()
+        # Only now is the handle done: an interrupt inside wait() leaves it open so a later close() can finish.
+        self._closed = True
+        reader = self._stderr_thread
         stderr = getattr(self._process, 'stderr', None)
-        if stderr is not None:
+        if reader is not None:
+            # The reader ends at stderr EOF, i.e. once the child is gone; join it so `errors` is complete before
+            # it is raised. Never close a pipe a (stuck) reader is still blocked on.
+            Command._join_stderr_reader(reader)
+            if stderr is not None and not reader.is_alive():
+                self._close_pipe(stderr)
+        elif stderr is not None:
             try:
                 remainder = stderr.read()
             except Exception:
@@ -203,7 +352,9 @@ class StreamHandle:
         if stdout is not None and stdout is not self._stream:
             self._close_pipe(stdout)
         if rc != 0:
-            raise Exception('\n'.join(self._errors))
+            raise Exception('\n'.join(self._errors)) from stream_error
+        if stream_error is not None:
+            raise stream_error
 
     @staticmethod
     def _close_pipe(pipe):
@@ -323,16 +474,16 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
             cmd += ['-t', cls._slist_to_str(types, validator=Validate.type)]
 
         if isinstance(sort, str):
-            Validate.attribute(sort)
-            cmd += ['-s' if asc else 'S', sort]
-        elif isinstance(sort, Iterable):
-            for s in sort:
-                Validate.attribute(s)
-                cmd += ['-s', s]
+            cls._check_sort_key(sort)
+            cmd += ['-s' if asc else '-S', sort]
         elif isinstance(sort, dict):
             for k, s in sort.items():
-                Validate.attribute(k)
-                cmd += ['-s' if s else 'S', k]
+                cls._check_sort_key(k)
+                cmd += ['-s' if s else '-S', k]
+        elif isinstance(sort, Iterable):
+            for s in sort:
+                cls._check_sort_key(s)
+                cmd += ['-s' if asc else '-S', s]
 
         if properties is None:
             properties = ['name', 'type']
@@ -342,7 +493,7 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
         cmd += ['-o', ','.join(properties)]
 
         if roots:
-            cmd += [cls._dslist_to_str(roots)]
+            cmd += [str(r) for r in cls._dslist_to_list(roots)]
 
         result = (cls._line_to_object(line, properties) for line in cls._exec_out(cmd))
 
@@ -352,15 +503,26 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
             return [o for o in result if o is not None]
 
     @staticmethod
+    def _check_sort_key(key: str) -> None:
+        # `name` is a valid zfs sort key but not a property this library knows; accept it here only.
+        if key != 'name':
+            Validate.attribute(key)
+
+    @staticmethod
     def _line_to_object(line: str, properties: Iterable):
         zfs_info = line.split('\t')
         zfs_info = [i if not i == '-' else None for i in zfs_info]
         name, dstype = zfs_info[0:2]
+        # The property names were validated strictly when the -o list was built, and a column such as `volsize` is
+        # `-` on rows whose type lacks it, so apply the values leniently (as GetCommand._build does).
+        try:
+            obj = ZFS.from_name(name, dstype)
+        except InvalidNameError as e:
+            _skip_invalid_name(name, e)
+            return None
         if len(zfs_info) > 2:
-            props = dict(zip(properties[2:], zfs_info[2:]))
-        else:
-            props = None
-        return ZFS.from_name(name, dstype, props)
+            obj.update(dict(zip(properties[2:], zfs_info[2:])), lenient=True)
+        return obj
 
 
 class CreateCommand(Command):
@@ -458,7 +620,7 @@ class SnapshotCommand(Command):
         cmd = [_zfs_cmd(), 'snapshot']
         if recursive:
             cmd += ['-r']
-            datasets = ListCommand() (ds, recursive=recursive)
+            datasets = ListCommand()(ds, types='filesystem,volume', recursive=recursive)
             result = [Snapshot(cds, name, properties) for cds in datasets]
         else:
             result = snapshot
@@ -515,6 +677,16 @@ class DestroyCommand(Command):
             raise ValueError('Clones can only be set to True if recursive is also set to True')
         return cmd
 
+    @staticmethod
+    def _destroy_lines(lines: Iterable[str]) -> Iterable[str]:
+        # `zfs destroy -v -p` prints `destroy\t<name>` per object and a final `reclaim\t<bytes>` summary line; only
+        # the former are returned.
+        for line in lines:
+            line = line.strip()
+            if line.startswith('reclaim\t'):
+                continue
+            yield line.replace('destroy\t', '')
+
     @classmethod
     def dataset(cls, dataset: Dataset, destroy: bool = False, recursive: bool = False, clones: bool = False,
                 force: bool = False, lazy: bool = False) -> Iterable[str]:
@@ -526,7 +698,7 @@ class DestroyCommand(Command):
         if force:
             cmd += ['-f']
         cmd += [str(dataset)]
-        result = (line.strip().replace('destroy\t', '') for line in cls._exec_out(cmd))
+        result = cls._destroy_lines(cls._exec_out(cmd))
 
         if lazy:
             return (o for o in result)
@@ -554,7 +726,7 @@ class DestroyCommand(Command):
         if force:
             cmd += ['-d']
         cmd += [snaps]
-        result = (line.strip().replace('destroy\t', '') for line in cls._exec_out(cmd))
+        result = cls._destroy_lines(cls._exec_out(cmd))
 
         if lazy:
             return (o for o in result)
@@ -730,13 +902,14 @@ class CloneCommand(Command):
     @classmethod
     def _clone(cls, snapshot: Snapshot, ds: str, properties: Optional[Properties] = None, parents=False) -> Dataset:
 
-        dataset = Dataset(ds, properties)
+        dataset = Dataset(ds)
         cmd = [_zfs_cmd(), 'clone']
         if parents:
             cmd += ['-p']
         if properties:
-            for k, v in dataset.properties:
-                cmd += ['-o', k + '=' + str(v)]
+            for k, v in properties.items():
+                Validate.attribute(k)
+                cmd += ['-o', k + '=' + str(v.value if isinstance(v, Property) else v)]
         cmd += [str(snapshot), str(dataset)]
         cls._exec(cmd)
 
@@ -761,7 +934,7 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         sources = cls._slist_to_list(sources, validator=Validate.source)
         types = cls._slist_to_str(types, validator=Validate.type)
         properties = cls._slist_to_list(properties, validator=Validate.attribute)
-        datasets = cls._zlist_to_str(ds)
+        datasets = [str(d) for d in cls._zlist_to_list(ds)]
         # Enforce column order: name, property, value, received, source
         cmd = [_zfs_cmd(), 'get', '-H', '-o', 'name,property,value,received,source'] + \
             cls._get_options(recursive=recursive, depth=depth, types=types, properties=properties, datasets=datasets)
@@ -794,7 +967,7 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
 
         datasets = kwargs.get('datasets', False)
         if datasets:
-            cmd += [datasets]
+            cmd += [datasets] if isinstance(datasets, str) else list(datasets)
 
         return cmd
 
@@ -811,8 +984,10 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
                 properties.pop('name', None)
                 dstype = properties.pop('type', None)
                 if name and dstype:
-                    yield GetCommand._build(dsname, dstype, properties)
-                dsname, properties = '', {}
+                    obj = GetCommand._build(dsname, dstype, properties)
+                    if obj is not None:
+                        yield obj
+                dsname, properties = name, {}
             if prop == 'type':
                 properties[prop] = value
             elif 'all' in sources or source in sources or \
@@ -821,14 +996,22 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         properties.pop('name', None)
         dstype = properties.pop('type', None)
         if name and dstype:
-            yield GetCommand._build(dsname, dstype, properties)
+            obj = GetCommand._build(dsname, dstype, properties)
+            if obj is not None:
+                yield obj
 
     @staticmethod
-    def _build(name: str, dstype: str, properties: Properties) -> ZFS:
+    def _build(name: str, dstype: str, properties: Properties) -> Optional[ZFS]:
         # The property names come from zfs itself (the caller's own names were validated strictly before the command
         # ran), so accept well-formed native names this library does not know yet (a newer OpenZFS adding a property
         # must not break `zfs get all`).
-        obj = ZFS.from_name(name, dstype)
+        # A name zfs allows but libzfseasy refuses is skipped (None) with a warning; the caller's properties for that
+        # dataset are dropped with it, never merged into a neighbour.
+        try:
+            obj = ZFS.from_name(name, dstype)
+        except InvalidNameError as e:
+            _skip_invalid_name(name, e)
+            return None
         obj.update(properties, lenient=True)
         return obj
 
@@ -1060,66 +1243,58 @@ class SendCommand(Command):
 
     @classmethod
     def _exec_stream(cls, cmd) -> 'StreamHandle':
+        logger.debug('Executing command: %s', shlex.join(cmd))
+        errors = _BoundedErrors()
+        stderr_thread = None
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        errors = []
-        while True:
-            output = cls._exec_capture_bin(process, errors)
-            if output is False:
-                # Process exited successfully without ever producing output
-                # (e.g. an empty stream); still hand back a StreamHandle so
-                # callers have a uniform close()/context-manager API.
-                return StreamHandle(process, process.stdout, errors)
-            elif output is not None:
-                return StreamHandle(process, output, errors)
-
-    @staticmethod
-    def _exec_capture_bin(process, errors) -> Union[bool, io.BufferedReader, None]:
-        # Guard against mocked processes without real stderr/stdout
-        stdout = process.stdout.peek(8) if getattr(process, 'stdout', None) else b''
-        # Non-blocking stderr check: only read if data is already available
         try:
-            if getattr(process, 'stderr', None):
-                ready, _, _ = select.select([process.stderr], [], [], 0)
-                if ready:
-                    stderr = process.stderr.read1().decode('utf-8', errors='replace')
-                else:
-                    stderr = ''
-            else:
-                stderr = ''
-        except Exception:
-            stderr = ''
-        rc = process.poll()
-        if stderr:
-            error = stderr.strip()
-            if error:
-                errors.append(error[0].upper() + error[1:])
+            # stderr is drained on its own thread from the start, so a child writing more than a pipe buffer of
+            # diagnostics can neither block itself nor stall the stdout peek below.
+            stderr_thread = cls._start_stderr_reader_bin(process, errors)
+            while True:
+                output = cls._exec_capture_bin(process, errors, stderr_thread)
+                if output is False:
+                    # Process exited successfully without ever producing output
+                    # (e.g. an empty stream); still hand back a StreamHandle so
+                    # callers have a uniform close()/context-manager API.
+                    return StreamHandle(process, process.stdout, errors, stderr_thread)
+                elif output is not None:
+                    return StreamHandle(process, output, errors, stderr_thread)
+        except BaseException:
+            # Startup failed (or was interrupted): leave no child, pipe or reader thread behind.
+            cls._abort_stream(process, stderr_thread)
+            raise
+
+    @classmethod
+    def _exec_capture_bin(cls, process, errors, stderr_thread=None) -> Union[bool, io.BufferedReader, None]:
+        # Guard against mocked processes without real stdout. peek() blocks until the first byte or EOF; stderr is
+        # drained concurrently by `stderr_thread`, so that cannot deadlock on a chatty child.
+        stdout = process.stdout.peek(8) if getattr(process, 'stdout', None) else b''
         if len(stdout):
             return process.stdout
-        elif rc is not None:
-            if rc != 0:
-                StreamHandle._close_pipe(getattr(process, 'stdout', None))
-                StreamHandle._close_pipe(getattr(process, 'stderr', None))
-                raise Exception('\n'.join(errors))
-            return False
-        else:
-            # stdout hit EOF while the child is still running. Returning None would make the caller's
-            # `while True` loop spin on peek()/poll() until it exits (cf. _exec_capture). Drain stderr to its end
-            # *first* (a bare wait() could deadlock on a full stderr pipe), then block until the child exits.
-            if getattr(process, 'stderr', None):
-                try:
-                    remainder = process.stderr.read().decode('utf-8', errors='replace')
-                    for line in remainder.splitlines():
-                        error = line.strip()
-                        if error:
-                            errors.append(error[0].upper() + error[1:])
-                except Exception:
-                    pass
+        # stdout hit EOF (or there is none): the child is finished or about to be. Block until it exits (never spin
+        # on peek()/poll()), then let the reader finish so `errors` holds the complete stderr.
+        if stderr_thread is None and getattr(process, 'stderr', None):
+            # No reader thread (called directly rather than via _exec_stream): drain stderr to its end *before*
+            # waiting, since a bare wait() could deadlock on a full stderr pipe.
+            try:
+                remainder = process.stderr.read().decode('utf-8', errors='replace')
+                for line in remainder.splitlines():
+                    error = line.strip()
+                    if error:
+                        errors.append(error[0].upper() + error[1:])
+            except Exception:
+                pass
+        rc = process.poll()
+        if rc is None:
             rc = process.wait()
-            if rc != 0:
-                StreamHandle._close_pipe(getattr(process, 'stdout', None))
+        cls._join_stderr_reader(stderr_thread)
+        if rc != 0:
+            StreamHandle._close_pipe(getattr(process, 'stdout', None))
+            if stderr_thread is None or not stderr_thread.is_alive():
                 StreamHandle._close_pipe(getattr(process, 'stderr', None))
-                raise Exception('\n'.join(errors))
-            return False
+            raise Exception('\n'.join(errors))
+        return False
 
 
 class ReceiveCommand(Command, StringListArgument):
@@ -1250,18 +1425,28 @@ class ReceiveCommand(Command, StringListArgument):
 
     @classmethod
     def _exec_stream_in(cls, cmd) -> 'StreamHandle':
+        logger.debug('Executing command: %s', shlex.join(cmd))
         # Only stdin (the stream we write to) and stderr (for error
         # reporting) are ever read from; stdout is intentionally discarded
         # (not piped) since nothing drains it and a chatty child could
         # otherwise fill the pipe and block on write(), deadlocking close()'s
         # process.wait().
+        errors = _BoundedErrors()
+        stderr_thread = None
         process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        # Poll once to catch immediate startup failures; zfs receive emits no stderr while waiting for data
-        rc = process.poll()
-        if rc is not None and rc != 0:
-            errors = process.stderr.read().decode('utf-8', errors='replace').strip()
-            raise Exception(errors or f'Command failed with exit code {rc}')
-        return StreamHandle(process, process.stdin)
+        try:
+            # stderr is drained on a thread from the start (a receive writing a lot of diagnostics must not block
+            # on a full pipe while the caller is still writing the stream); close() joins it before raising.
+            stderr_thread = cls._start_stderr_reader_bin(process, errors)
+            # Poll once to catch immediate startup failures; zfs receive emits no stderr while waiting for data
+            rc = process.poll()
+            if rc is not None and rc != 0:
+                cls._join_stderr_reader(stderr_thread)
+                raise Exception('\n'.join(errors) or f'Command failed with exit code {rc}')
+        except BaseException:
+            cls._abort_stream(process, stderr_thread)
+            raise
+        return StreamHandle(process, process.stdin, errors, stderr_thread)
 
 
 class LoadKeyCommand(Command):
@@ -1413,7 +1598,8 @@ class MountCommand(Command, PropertyCommand):
         return self._mount(*args, **kwargs)
 
     @classmethod
-    def _mount(cls, ds: Optional[Filesystem], flags: Optional[StringList], properties: Optional[Properties],
+    def _mount(cls, ds: Optional[Filesystem] = None, flags: Optional[StringList] = None,
+               properties: Optional[Properties] = None,
                overlay: bool = False, load_keys: bool = False, force: bool = False) -> None:
         if ds is not None:
             cmd = [_zfs_cmd(), 'mount'] + cls._get_options(overlay=overlay, load_keys=load_keys, force=force) + \
