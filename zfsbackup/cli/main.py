@@ -52,7 +52,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import click
 import yaml
@@ -95,6 +95,11 @@ from zfsbackup.config.store import (
 BACKUP_MODE = 0o660
 
 _LOGGER_NAME = "zfsbackup"
+#: `libzfseasy` logs the `zfs` commands it runs at DEBUG. Under `-v` they are
+#: shown like the other debug records (on stderr, via `_LogHandler`); without
+#: `-v` they are dropped. Nothing from it ever reaches stdout.
+_ZFS_LOGGER_NAME = "libzfseasy"
+_LOGGER_NAMES = (_LOGGER_NAME, _ZFS_LOGGER_NAME)
 
 _REPLACE_NOTE = (
     "`import` always replaces the whole stored configuration with the YAML; "
@@ -155,29 +160,33 @@ class State:
     #: `--reload-wait`: seconds `notify_daemon` waits for the daemon's
     #: acknowledgement after a SIGHUP (0 = do not wait).
     reload_wait: float = DEFAULT_RELOAD_WAIT
-    _restore_level: Optional[int] = field(default=None, repr=False)
+    _restore_levels: Dict[str, int] = field(default_factory=dict, repr=False)
 
     def install_logging(self) -> None:
-        logger = logging.getLogger(_LOGGER_NAME)
-        self._restore_level = logger.level
+        self._restore_levels = {}
         self.handler = _LogHandler(logging.WARNING)
-        logger.addHandler(self.handler)
+        for name in _LOGGER_NAMES:
+            logger = logging.getLogger(name)
+            self._restore_levels[name] = logger.level
+            logger.addHandler(self.handler)
         if self.verbose:
             self.set_verbose()
 
     def remove_logging(self) -> None:
-        logger = logging.getLogger(_LOGGER_NAME)
-        if self.handler is not None:
-            logger.removeHandler(self.handler)
-            self.handler = None
-        if self._restore_level is not None:
-            logger.setLevel(self._restore_level)
+        for name in _LOGGER_NAMES:
+            logger = logging.getLogger(name)
+            if self.handler is not None:
+                logger.removeHandler(self.handler)
+            if name in self._restore_levels:
+                logger.setLevel(self._restore_levels[name])
+        self.handler = None
 
     def set_verbose(self) -> None:
         self.verbose = True
         if self.handler is not None:
             self.handler.setLevel(logging.DEBUG)
-            logging.getLogger(_LOGGER_NAME).setLevel(logging.DEBUG)
+            for name in _LOGGER_NAMES:
+                logging.getLogger(name).setLevel(logging.DEBUG)
 
     def quiet(self) -> None:
         """Read-only command: show no warnings about the stored configuration

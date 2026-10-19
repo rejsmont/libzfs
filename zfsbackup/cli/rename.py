@@ -142,14 +142,6 @@ def _load_backup_manager() -> Tuple[Any, Optional[str]]:
         from zfsbackup import backup_manager  # noqa: PLC0415 - lazy by design
     except (ImportError, RuntimeError) as exc:
         return None, str(exc) or type(exc).__name__
-    # libzfseasy ships with `zfs.debug = True`, which prints every command it
-    # runs on STDOUT; this tool's stdout is for its own results.
-    try:
-        import libzfseasy.zfs as _zfs_module  # noqa: PLC0415
-
-        _zfs_module.debug = False
-    except (ImportError, AttributeError):
-        pass
     return backup_manager, None
 
 

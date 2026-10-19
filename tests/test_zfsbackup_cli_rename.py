@@ -2601,15 +2601,147 @@ class TestLazyImports:
         assert done.returncode == 0, done.stderr
         assert "LOADED []" in done.stdout, done.stdout + done.stderr
 
-    def test_a_loaded_libzfseasy_is_silenced_for_stdout(self, run, db, fake_zfs):
+    def test_a_loaded_libzfseasy_never_prints_commands_to_stdout(self, run, db, fake_zfs):
+        """libzfseasy logs the commands it runs (DEBUG, `libzfseasy` logger); the
+        old `zfs.debug` flag is kept but ignored, so setting it prints nothing."""
         make_db(run, db, RENAME_YAML)
         import libzfseasy.zfs as zfs_module
 
+        before = zfs_module.debug
         zfs_module.debug = True
-        fake_zfs.add("tank/vm.01", {CONFIG_PROP: "x"})
-        out = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", db)
-        assert zfs_module.debug is False
+        try:
+            fake_zfs.add("tank/vm.01", {CONFIG_PROP: "x"})
+            out = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", db)
+        finally:
+            zfs_module.debug = before
+        assert out.exit_code == 0, out.stderr
         assert "Executing command" not in out.stdout
+        assert "Executing command" not in out.stderr          # and not without -v
+
+    def test_the_cli_does_not_touch_the_zfs_debug_flag(self, run, db, fake_zfs):
+        make_db(run, db, RENAME_YAML)
+        import libzfseasy.zfs as zfs_module
+
+        before = zfs_module.debug
+        zfs_module.debug = True
+        try:
+            fake_zfs.add("tank/vm.01", {CONFIG_PROP: "x"})
+            run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", db)
+            assert zfs_module.debug is True                    # the old workaround flipped it
+        finally:
+            zfs_module.debug = before
+
+
+class TestZfsCommandsAreLogged:
+    """`libzfseasy` logs `Executing command: <shlex.join(cmd)>` at DEBUG; the CLI
+    shows it as a `debug:` line on stderr under `-v` and drops it otherwise."""
+
+    @pytest.fixture
+    def stale(self, rich, fake_zfs):
+        fake_zfs.add("tank/vm.01", {CONFIG_PROP: "x", ANCHOR + "offsite": "snap1"})
+        fake_zfs.add("tank/vm.02", {})
+        return fake_zfs
+
+    def rename(self, run, rich, *flags, clear=False):
+        args = ["-c", rich, *flags, "rename", "dataset", "tank/vm.01", "tank/vm.02"]
+        if clear:
+            args.append("--clear-stale-props")
+        return run(*args)
+
+    def test_with_v_the_commands_are_debug_lines_on_stderr_only(self, run, rich, stale):
+        result = self.rename(run, rich, "-v")
+        assert result.exit_code == 0, result.stderr
+        lines = [l for l in result.stderr.splitlines() if "Executing command:" in l]
+        assert lines and all(l.startswith("debug: Executing command: ") for l in lines)
+        assert any(str(stale.wrapper) in l and " list " in l for l in lines)   # the real argv
+        assert "Executing command" not in result.stdout
+
+    def test_with_v_the_clear_commands_are_logged_too(self, run, rich, stale):
+        result = self.rename(run, rich, "-v", clear=True)
+        assert result.exit_code == 0, result.stderr
+        assert sum(
+            1 for l in result.stderr.splitlines()
+            if l.startswith("debug: Executing command: ") and " inherit " in l
+        ) == 2
+        assert "Executing command" not in result.stdout
+
+    def test_without_v_neither_stream_has_them(self, run, rich, stale):
+        result = self.rename(run, rich, clear=True)
+        assert result.exit_code == 0, result.stderr
+        assert "Executing command" not in result.stdout + result.stderr
+        assert "debug:" not in result.stderr
+        assert stale.calls                                       # (commands did run)
+
+    def test_the_subcommand_level_v_works_too(self, run, rich, stale):
+        result = run("-c", rich, "rename", "dataset", "tank/vm.01", "tank/vm.02", "-v")
+        assert result.exit_code == 0, result.stderr
+        assert "debug: Executing command: " in result.stderr
+        assert "Executing command" not in result.stdout
+
+    def test_remove_logging_leaves_the_libzfseasy_logger_as_it_was(self, run, rich, stale):
+        import logging
+
+        loggers = [logging.getLogger(n) for n in ("libzfseasy", "zfsbackup")]
+        saved = [l.level for l in loggers]
+        for logger in loggers:
+            logger.setLevel(logging.WARNING)          # a known level, whatever ran before
+        try:
+            self.check_no_leak(run, rich, stale, loggers)
+        finally:
+            for logger, level in zip(loggers, saved):
+                logger.setLevel(level)
+
+    def check_no_leak(self, run, rich, stale, loggers):
+        before = [(list(l.handlers), l.level) for l in loggers]
+        first = self.rename(run, rich, "-v")
+        assert first.exit_code == 0 and "debug: Executing command" in first.stderr
+        assert [(list(l.handlers), l.level) for l in loggers] == before
+
+        stale.add("tank/vm.02", {})
+        second = run("-c", rich, "rename", "dataset", "tank/vm.02", "tank/vm.03")
+        assert second.exit_code == 0, second.stderr
+        assert "Executing command" not in second.stdout + second.stderr     # no leak from -v
+        assert [(list(l.handlers), l.level) for l in loggers] == before
+
+    def test_the_handler_is_on_both_loggers_while_running_and_removed_after(self, run, rich, stale, monkeypatch):
+        import logging
+
+        seen = {}
+        real = rename.commit_config
+
+        def commit(*args, **kwargs):
+            for name in ("libzfseasy", "zfsbackup"):
+                logger = logging.getLogger(name)
+                seen[name] = ([type(h).__name__ for h in logger.handlers], logger.level)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(rename, "commit_config", commit)
+        assert self.rename(run, rich, "-v").exit_code == 0
+        for name in ("libzfseasy", "zfsbackup"):
+            assert "_LogHandler" in seen[name][0], name
+            assert seen[name][1] == 10, name                     # DEBUG under -v
+            assert not any(
+                type(h).__name__ == "_LogHandler" for h in logging.getLogger(name).handlers
+            )
+
+    def test_state_remove_logging_restores_the_levels(self):
+        import logging
+
+        from zfsbackup.cli import main as cli_main
+
+        zfs_logger = logging.getLogger("libzfseasy")
+        original = zfs_logger.level
+        zfs_logger.setLevel(logging.ERROR)
+        try:
+            state = cli_main.State(verbose=True)
+            state.install_logging()
+            assert zfs_logger.level == logging.DEBUG and state.handler in zfs_logger.handlers
+            state.remove_logging()
+            assert zfs_logger.level == logging.ERROR
+            assert not any(isinstance(h, cli_main._LogHandler) for h in zfs_logger.handlers)
+            assert state.handler is None
+        finally:
+            zfs_logger.setLevel(original)
 
 
 class TestInterruptDuringTheWrite:
