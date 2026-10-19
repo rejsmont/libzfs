@@ -968,9 +968,20 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
     ):
         """`applied` is later than the rename but is not what is stored: the
         stored-key comparison, not the wait's answer, decides."""
-        verify(daemon, "signalled", lambda key: daemon.set(applied=(key[0], key[1] + 5)))
+        seen = []
+
+        def claim(key):
+            seen.append(key)
+            daemon.set(applied=(key[0], key[1] + 5))
+
+        verify(daemon, "signalled", claim)
         result = self.clear(run, rich)
-        self.assert_refused(result, stale, rich, "changed again")
+        gen = seen[0][1]
+        self.assert_refused(
+            result, stale, rich,
+            f"it reports generation {gen + 5} as applied, which is not the stored generation {gen}",
+        )
+        assert "changed again" not in result.stderr
 
     # -- 3, 4: not applied ---------------------------------------------------
 
@@ -1518,6 +1529,127 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
             "NOT cleared: cannot tell whether a daemon is running (Input/output error)",
         )
         assert len(calls) == 2
+
+    # -- the fresh probe under the writer lock: per-case wording --------------
+
+    def start_a_daemon_after_the_store_is_read(self, monkeypatch, db, fake_daemon, **state):
+        """No daemon at the first look; one takes the presence lock after the
+        gate has taken the writer lock and read the store."""
+        real = rename.read_snapshot
+        started = []
+
+        def reading(resolved):
+            snap = real(resolved)
+            started.append(fake_daemon(db, pid=5678, **state))
+            return snap
+
+        monkeypatch.setattr(rename, "read_snapshot", reading)
+        return started
+
+    def test_a_daemon_that_started_without_publishing_applied_is_refused(
+        self, run, rich, db, stale, fake_daemon, monkeypatch
+    ):
+        self.start_a_daemon_after_the_store_is_read(monkeypatch, db, fake_daemon, applied=None)
+        gen = store_key(db)[1] + 1                 # the rename's generation
+        result = self.clear(run, rich)
+        self.assert_refused(
+            result, stale, rich,
+            "NOT cleared: a daemon has started; it has not published which configuration it "
+            f"applied yet (the stored one is generation {gen})",
+        )
+
+    def test_a_daemon_that_started_on_another_store_is_refused(
+        self, run, rich, db, stale, fake_daemon, monkeypatch
+    ):
+        sid, gen = store_key(db)
+        gen += 1                                   # the rename's generation
+        self.start_a_daemon_after_the_store_is_read(
+            monkeypatch, db, fake_daemon, applied=(sid + 1000, 3)
+        )
+        result = self.clear(run, rich)
+        self.assert_refused(
+            result, stale, rich,
+            f"a daemon has started; the stored configuration (store {sid}, generation {gen}) is "
+            f"not the one it applied (store {sid + 1000}, generation 3)",
+        )
+
+    def test_an_unstable_state_file_under_the_lock_is_refused(
+        self, run, rich, stale, monkeypatch
+    ):
+        real = daemonlock.probe
+        calls = []
+
+        def torn(resolved):
+            calls.append(1)
+            if len(calls) == 2:                  # the gate's probe under the writer lock
+                return daemonlock.DaemonInfo(
+                    pid=5678, generation=None, start="t", applied=(1, 1), stable=False
+                )
+            return real(resolved)
+
+        monkeypatch.setattr(daemonlock, "probe", torn)
+        result = self.clear(run, rich)
+        self.assert_refused(
+            result, stale, rich,
+            "NOT cleared: a daemon has started; its state file could not be read consistently, "
+            "so what it applied is unknown",
+        )
+
+    def test_a_verified_daemon_that_goes_unstable_keeps_its_lead(
+        self, run, rich, stale, daemon, verify, monkeypatch
+    ):
+        verify(daemon, "signalled", lambda key: daemon.set(applied=key))
+        real = daemonlock.probe
+
+        def torn_after_the_wait(resolved):
+            info = real(resolved)
+            if torn_after_the_wait.armed and info is not None:
+                return daemonlock.DaemonInfo(
+                    pid=info.pid, generation=None, start="t", applied=info.applied, stable=False
+                )
+            return info
+
+        torn_after_the_wait.armed = False
+        real_read = rename.read_snapshot
+
+        def arm(resolved):
+            snap = real_read(resolved)
+            torn_after_the_wait.armed = True      # only the probe that follows is torn
+            return snap
+
+        monkeypatch.setattr(rename, "read_snapshot", arm)
+        monkeypatch.setattr(daemonlock, "probe", torn_after_the_wait)
+        result = self.clear(run, rich)
+        self.assert_refused(
+            result, stale, rich,
+            f"a daemon is running (pid {daemon.pid}); its state file could not be read "
+            "consistently",
+        )
+
+    def test_a_store_error_that_is_a_locked_database_is_exit_75(
+        self, run, rich, stale, monkeypatch
+    ):
+        from sqlalchemy.exc import OperationalError
+
+        def locked(resolved):
+            raise OperationalError("SELECT 1", {}, Exception("database is locked"))
+
+        monkeypatch.setattr(rename, "read_snapshot", locked)
+        result = self.clear(run, rich)
+        assert result.exit_code == 75, (result.stdout, result.stderr)
+        err = result.stderr
+        assert "clearing the stale properties on 'tank/vm.01' failed" in err
+        assert "Cleared so far: none" in err
+        for prop in self.ORDER:
+            assert f"zfs inherit {prop} tank/vm.01" in err
+        assert stale.mutations == [] and "tank/vm.02" in names(rich)
+
+    def test_an_existing_but_unheld_workers_lock_is_no_workers(self, run, rich, db, stale):
+        """A host where a daemon once ran: the file stays, nobody holds it."""
+        path = daemonlock.workers_lock_path(resolve_config_path(str(db)))
+        path.write_text("")
+        assert path.exists() and not daemonlock.workers_present(resolve_config_path(str(db)))
+        self.assert_cleared(self.clear(run, rich), stale, rich)
 
     # -- 11: dry run ---------------------------------------------------------
 

@@ -93,6 +93,7 @@ import click
 from zfsbackup import daemonlock
 from zfsbackup.cli import dotpath
 from zfsbackup.cli.errors import (
+    EXIT_BUSY,
     EXIT_CONFIG,
     CliError,
     ConfigUnusable,
@@ -362,17 +363,43 @@ def _clear_gate(
                 f"cannot tell whether a daemon is running ({exc.strerror or exc})"
             ) from None
         if fresh is not None:
-            stored = (snap.store_id, snap.generation)
-            if not fresh.stable or fresh.applied != stored:
-                raise _DaemonPresent(
-                    f"{lead or 'a daemon has started; '}the configuration was changed "
-                    "again since the rename (or the daemon has not applied it)"
-                )
+            problem = _applied_problem(fresh, (snap.store_id, snap.generation))
+            if problem is not None:
+                raise _DaemonPresent(f"{lead or 'a daemon has started; '}{problem}")
         if any(d.name == old for d in snap.config.datasets):
             raise _DaemonPresent(
                 f"{lead}{old!r} is a configured dataset again, so its properties are in use"
             )
         yield
+
+
+def _applied_problem(info: daemonlock.DaemonInfo, stored: Tuple[int, int]) -> Optional[str]:
+    """Why the daemon in `info` cannot be taken to run the `stored`
+    `(store id, generation)`, or None if it reports exactly that as applied."""
+    if not info.stable:
+        return "its state file could not be read consistently, so what it applied is unknown"
+    applied = info.applied
+    if applied == stored:
+        return None
+    if applied is None:
+        return (
+            f"it has not published which configuration it applied yet (the stored one is "
+            f"generation {stored[1]})"
+        )
+    if applied[0] == stored[0] and applied[1] < stored[1]:
+        return (
+            f"the configuration was changed again since the rename (stored generation "
+            f"{stored[1]}, the daemon applied generation {applied[1]})"
+        )
+    if applied[0] == stored[0]:
+        return (
+            f"it reports generation {applied[1]} as applied, which is not the stored "
+            f"generation {stored[1]}"
+        )
+    return (
+        f"the stored configuration (store {stored[0]}, generation {stored[1]}) is not the one "
+        f"it applied (store {applied[0]}, generation {applied[1]})"
+    )
 
 
 def _inherit_commands(dataset: str, props: Sequence[str]) -> str:
@@ -425,12 +452,14 @@ def _clear_stale(
         left = [p for p in ordered if p not in cleared]
         # An unusable config database (path/schema/damaged file, read by the
         # gate) keeps its own wording and its exit code (78).
-        unusable = exit_code_for(exc) == EXIT_CONFIG
+        code = exit_code_for(exc)
+        unusable = code == EXIT_CONFIG
+        busy_store = code == EXIT_BUSY  # a locked database: retry (75), like ConfigBusy
         reason = (
-            format_error(exc, resolved)[0] if unusable
+            format_error(exc, resolved)[0] if unusable or busy_store
             else str(exc).strip() or type(exc).__name__
         )
-        raise (ConfigUnusable if unusable else CliError)(
+        raise (ConfigUnusable if unusable else ConfigBusy if busy_store else CliError)(
             "the configuration was renamed, but clearing the stale properties on "
             f"{old!r} failed: {reason}. "
             f"Cleared so far: {', '.join(cleared) or 'none'}. Still set, to clear by hand:\n"
