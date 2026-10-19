@@ -429,6 +429,10 @@ class TestIntervalFloor:
         worker = SnapshotWorker(worker_config, stop)
         mocker.patch.object(worker, "_get_interval", return_value=interval)
         mocker.patch.object(worker, "_process_dataset")
+        # `_before_loop` (verify + property sync, B1) polls the stop flag per
+        # dataset and would consume the scripted `is_set` answers meant for
+        # the loop's safe points; this test is about the interval floor.
+        mocker.patch.object(worker, "_before_loop")
         # Workers wait in STOP_POLL slices through `worker._wait(interval)` (so a
         # dead supervisor is noticed); the interval the loop asks for is its argument.
         mocker.patch.object(worker, "_wait", return_value=False)

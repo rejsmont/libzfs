@@ -995,9 +995,28 @@ class TestEarlySighupInARealDaemon:
     before the first line, which Python cannot close), so the earliest delay
     tested is 50 ms -- never 0."""
 
+    @pytest.fixture
+    def import_trace(self, monkeypatch):
+        """`PYTHONPROFILEIMPORTTIME=1` makes the child print an `import time:`
+        line per import, to the log. Seeing the first line for SQLAlchemy
+        proves the child is past `signal.signal(SIGHUP, SIG_IGN)` (the first
+        statement of `daemon.py`), so a test can aim its SIGHUP at the import
+        window instead of at the interpreter's own start-up -- which the
+        module documents as an accepted residue, and which under host load
+        outlasts a fixed 50 ms delay (the SIGHUP then killed the child and the
+        test waited 90 s for a "Started" line that never came)."""
+        monkeypatch.setenv("PYTHONPROFILEIMPORTTIME", "1")
+
+    @staticmethod
+    def _past_the_sighup_guard(log):
+        assert wait_until(lambda: "sqlalchemy" in log_text(log), 60), log_text(log)
+
     @pytest.mark.parametrize("delay", [0.05, 0.1, 0.2])
-    def test_the_daemon_survives_and_a_later_sigterm_exits_zero(self, real_daemon_env, spawn_daemon, delay):
+    def test_the_daemon_survives_and_a_later_sigterm_exits_zero(
+        self, import_trace, real_daemon_env, spawn_daemon, delay
+    ):
         proc, log = spawn_daemon()
+        self._past_the_sighup_guard(log)
         time.sleep(delay)
         os.kill(proc.pid, signal.SIGHUP)
         # alive well past the import window, and still alive when the workers start
@@ -1006,8 +1025,11 @@ class TestEarlySighupInARealDaemon:
         os.kill(proc.pid, signal.SIGTERM)
         assert proc.wait(timeout=60) == 0, log_text(log)
 
-    def test_a_hup_burst_during_startup_is_survived(self, real_daemon_env, spawn_daemon):
+    def test_a_hup_burst_during_startup_is_survived(
+        self, import_trace, real_daemon_env, spawn_daemon
+    ):
         proc, log = spawn_daemon()
+        self._past_the_sighup_guard(log)
         for _ in range(5):
             time.sleep(0.08)
             os.kill(proc.pid, signal.SIGHUP)

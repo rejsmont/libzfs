@@ -1,10 +1,14 @@
 """Client-side remote backup: identity management and ZFS stream transfer."""
 
 import contextlib
+import errno
 import json
+import locale
 import logging
+import os
 import re
 import socket
+import stat
 import uuid
 from pathlib import Path
 from typing import Optional, Set, Tuple
@@ -88,6 +92,50 @@ def _path(component: str) -> str:
     return quote(component, safe='/:')
 
 
+#: A client id is ~40 bytes; anything bigger is not one. Kept in step with
+#: `daemon._ID_FILE_MAX`.
+_ID_FILE_MAX = 4096
+
+
+def _read_id_file(path) -> Optional[str]:
+    """The text of the client id file, `None` if it does not exist; raises
+    `OSError` for anything that is not a plain, small file. Opened
+    `O_NONBLOCK` and `fstat`ed before any read, so a FIFO, a device
+    (`/dev/zero`) or a directory is refused instead of hanging or filling
+    memory, and the read is capped at `_ID_FILE_MAX`. Symlinks are followed
+    (as always); a loop or dangling link counts as missing. Decoded with the
+    locale encoding, as `Path.read_text()` was. The twin of
+    `daemon._read_id_file`."""
+    # `stat` (following links) BEFORE `open`: opening some devices has side
+    # effects (`/dev/watchdog` arms the watchdog, a rewinding tape rewinds on
+    # close). The `fstat` below re-checks what was actually opened, for a path
+    # swapped in between.
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            raise OSError(errno.EINVAL, f"{path} is not a regular file")
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            return None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, f"{path} is not a regular file")
+        data = b''
+        while len(data) <= _ID_FILE_MAX:
+            chunk = os.read(fd, _ID_FILE_MAX + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > _ID_FILE_MAX:
+            raise OSError(errno.EFBIG, f"{path} is larger than {_ID_FILE_MAX} bytes")
+    finally:
+        os.close(fd)
+    return data.decode(locale.getpreferredencoding(False))
+
+
 class ClientIdentity:
     """Persistent client identity in the form <hostname>-<uuid8>."""
 
@@ -102,8 +150,9 @@ class ClientIdentity:
         return self._client_id
 
     def _load_or_generate(self) -> str:
-        if self.id_file.exists():
-            value = self.id_file.read_text().strip()
+        text = _read_id_file(self.id_file)
+        if text is not None:
+            value = text.strip()
             if value:
                 return value
         client_id = self._generate()

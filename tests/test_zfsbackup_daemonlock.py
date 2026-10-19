@@ -1332,7 +1332,8 @@ class TestDaemonAlreadyRunning:
         import dataclasses
 
         assert [f.name for f in dataclasses.fields(DaemonInfo)] == [
-            "pid", "generation", "start", "applied", "target", "rejected", "stable",
+            "pid", "generation", "start", "applied", "target", "rejected",
+            "deferred", "deferred_reason", "stable",
         ]
         assert "pid_alive" not in {f.name for f in dataclasses.fields(DaemonInfo)}
         assert DaemonInfo(1, 2) == DaemonInfo(pid=1, generation=2)
@@ -1981,12 +1982,17 @@ class TestPidFileV2Format:
             (123, 0, "darwin:1700000000.000042", (0, 0), None, (4, 7)),
             (123, 45, "", None, None, None),  # empty start= is present, not absent
             (123, None, "", None, (1, 1), None),
+            (123, 45, "linux:99", (1, 2), None, None, (1, 3), "port 9100 is busy"),
+            (123, 45, "linux:99", (1, 2), (1, 3), None, (1, 4), None),  # no reason
         ],
     )
     def test_round_trip(self, args):
-        pid, gen, start, applied, target, rejected = args
+        pid, gen, start, applied, target, rejected, *rest = args
+        deferred, reason = (rest + [None, None])[:2]
         parsed = daemonlock._parse(daemonlock._format(*args))
-        assert tuple(parsed) == (pid, gen, start, applied, target, rejected)
+        assert tuple(parsed) == (
+            pid, gen, start, applied, target, rejected, deferred, reason
+        )
 
     def test_an_empty_start_value_is_present_and_empty(self):
         parsed = daemonlock._parse(b"5\n3\nstart=\n")
@@ -2283,6 +2289,175 @@ class TestDaemonInfoV2:
 
         with pytest.raises(dataclasses.FrozenInstanceError):
             DaemonInfo(1, 2).start = "x"
+
+
+class TestDeferredState:
+    """`deferred=` / `deferred_reason=`: a refusal that is re-checked at every
+    poll. Unlike `rejected=` it is not final."""
+
+    def test_a_new_lock_has_none(self, db, held):
+        lock = acquire(db)
+        held.append(lock)
+        assert (lock.deferred, lock.deferred_reason) == (None, None)
+        info = probe(db)
+        assert (info.deferred, info.deferred_reason) == (None, None)
+
+    def test_it_round_trips_through_the_file_and_probe(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(applied=(1, 5), deferred=(1, 6), deferred_reason="port 9100 is busy")
+        raw = read(lockfile)
+        assert b"deferred=1:6\n" in raw and b"deferred_reason=port 9100 is busy\n" in raw
+        info = probe(db)
+        assert info.deferred == (1, 6) and info.deferred_reason == "port 9100 is busy"
+        assert info.applied == (1, 5) and info.rejected is None and info.stable is True
+
+    def test_a_reason_may_be_set_in_a_later_call(self, db, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(deferred=(1, 6))
+        assert probe(db).deferred_reason is None
+        lock.set_state(deferred_reason="later")
+        assert probe(db).deferred_reason == "later"
+
+    def test_clearing_deferred_clears_the_reason_too(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(deferred=(1, 6), deferred_reason="busy")
+        lock.set_state(deferred=None)
+        assert (lock.deferred, lock.deferred_reason) == (None, None)
+        assert b"deferred" not in read(lockfile)
+        info = probe(db)
+        assert (info.deferred, info.deferred_reason) == (None, None)
+
+    def test_a_reason_without_a_deferred_key_is_dropped(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(deferred_reason="orphan text")
+        assert lock.deferred_reason is None
+        assert b"deferred" not in read(lockfile)
+
+    def test_deferred_and_rejected_are_independent_keys_of_the_file(self, db, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(rejected=(1, 4), deferred=(1, 6), deferred_reason="busy")
+        lock.set_state(rejected=None)
+        info = probe(db)
+        assert info.rejected is None and info.deferred == (1, 6)
+
+    def test_shrinking_leaves_no_deferred_tail(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(applied=(1, 5), deferred=(1, 6), deferred_reason="x" * 150)
+        long = read(lockfile)
+        lock.set_state(deferred=None)
+        short = read(lockfile)
+        assert len(short) < len(long)
+        assert short == daemonlock._format(os.getpid(), 5, lock.start, (1, 5))
+
+    def test_a_padded_rewrite_without_ftruncate_is_parsed_as_the_new_state(
+        self, db, held, monkeypatch
+    ):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(applied=(1, 5), deferred=(1, 6), deferred_reason="a long reason " * 5)
+        monkeypatch.setattr(daemonlock.os, "ftruncate", lambda fd, n: None)
+        lock.set_state(deferred=None)
+        info = probe(db)
+        assert info.stable is True
+        assert (info.applied, info.deferred, info.deferred_reason) == ((1, 5), None, None)
+
+    def test_the_pwrite_covers_the_old_length_when_the_reason_goes(
+        self, db, held, monkeypatch
+    ):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(deferred=(1, 6), deferred_reason="y" * 100)
+        lengths = []
+        real = os.pwrite
+        monkeypatch.setattr(
+            daemonlock.os, "pwrite",
+            lambda fd, data, off: (lengths.append(len(data)), real(fd, data, off))[1],
+        )
+        old_len = os.fstat(lock._fd).st_size
+        lock.set_state(deferred=None)
+        assert lengths == [old_len]
+
+    def test_an_older_style_parser_ignores_both_keys(self):
+        """A reader that knows only `applied`/`target`/`rejected` looks keys up by
+        name in a `key=value` dict and skips the rest; the first two lines are
+        unchanged."""
+        raw = daemonlock._format(
+            9, 5, "tok", (1, 5), (1, 6), None, (1, 7), "port busy"
+        )
+        lines = raw.decode().split("\n")
+        assert lines[0] == "9" and lines[1] == "5" and lines[2] == "start=tok"
+        old_reader = {
+            k: v for k, _, v in (l.partition("=") for l in lines[2:] if "=" in l)
+            if k in ("start", "applied", "target", "rejected")
+        }
+        assert old_reader == {"start": "tok", "applied": "1:5", "target": "1:6"}
+
+    def test_the_two_line_legacy_reader_is_unaffected(self):
+        raw = daemonlock._format(9, 5, "tok", None, None, None, (1, 7), "busy")
+        assert raw.split(b"\n")[:2] == [b"9", b"5"]
+
+    @pytest.mark.parametrize(
+        "line", ["deferred=garbage", "deferred=1", "deferred=a:b", "deferred=1:2:3", "deferred=", "deferred=-1:2"]
+    )
+    def test_a_malformed_deferred_value_parses_as_none(self, line):
+        parsed = daemonlock._parse(f"5\n3\nstart=t\n{line}\ndeferred_reason=why\n".encode())
+        assert parsed.deferred is None
+        assert parsed.pid == 5 and parsed.generation == 3
+
+    def test_a_reason_without_a_deferred_key_still_parses_without_error(self):
+        parsed = daemonlock._parse(b"5\n3\nstart=t\ndeferred_reason=why\n")
+        assert parsed.deferred is None
+        assert parsed.deferred_reason == "why"
+
+    def test_deferred_fields_do_not_take_part_in_equality(self):
+        assert DaemonInfo(1, 2, deferred=(1, 3), deferred_reason="x") == DaemonInfo(1, 2)
+
+
+class TestCleanReason:
+    def test_plain_text_is_unchanged(self):
+        assert daemonlock._clean_reason("port 9100 is busy") == "port 9100 is busy"
+
+    @pytest.mark.parametrize("empty", [None, "", "   \n\t "])
+    def test_nothing_in_nothing_out(self, empty):
+        assert daemonlock._clean_reason(empty) == ""
+
+    def test_whitespace_and_newlines_collapse_to_single_spaces(self):
+        assert daemonlock._clean_reason("a\nb\t\tc   d\r\ne") == "a b c d e"
+
+    def test_a_newline_cannot_start_a_forged_key(self):
+        cleaned = daemonlock._clean_reason("busy\napplied=1:99")
+        assert "\n" not in cleaned
+        raw = daemonlock._format(9, 5, "t", (1, 5), None, None, (1, 6), "busy\napplied=1:99")
+        parsed = daemonlock._parse(raw)
+        assert parsed.applied == (1, 5)
+        assert parsed.deferred_reason == "busy applied=1:99"
+
+    def test_non_ascii_and_control_characters_become_spaces(self):
+        assert daemonlock._clean_reason("caf\u00e9 \x00bell\x07 \x1b[31mred") == "caf bell [31mred"
+        assert daemonlock._clean_reason("\u2603 snow").strip() == "snow"
+
+    def test_it_is_capped_at_200_characters(self):
+        assert len(daemonlock._clean_reason("x" * 5000)) == 200
+        assert daemonlock._clean_reason("x" * 200) == "x" * 200
+        assert len(daemonlock._clean_reason("x" * 201)) == 200
+
+    def test_the_cap_applies_after_collapsing(self):
+        assert daemonlock._clean_reason(("a " * 300)).count("a") == 100
+
+    def test_a_long_reason_in_a_file_is_capped_on_read_too(self):
+        raw = b"5\n3\nstart=t\ndeferred=1:2\ndeferred_reason=" + b"z" * 500 + b"\n"
+        assert len(daemonlock._parse(raw).deferred_reason) == 200
+
+    def test_a_hostile_reason_in_a_file_is_sanitised_on_read(self):
+        raw = b"5\n3\nstart=t\ndeferred=1:2\ndeferred_reason=a\x00b\x07c\xff\n"
+        reason = daemonlock._parse(raw).deferred_reason
+        assert reason is None or reason.isascii() and reason.isprintable()
 
 
 class TestDaemonAlreadyRunningStart:

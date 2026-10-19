@@ -33,6 +33,296 @@ def _finite_stream():
     return stream
 
 
+def _within(seconds, fn, *args):
+    """Run `fn(*args)` in a thread; fail the test if it blocks longer than `seconds`
+    (a blocking `open` of a FIFO would never return)."""
+    import threading
+
+    box = {}
+
+    def run():
+        try:
+            box["result"] = fn(*args)
+        except BaseException as e:  # noqa: BLE001
+            box["error"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        pytest.fail(f"{getattr(fn, '__name__', fn)} blocked for more than {seconds}s")
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
+def _readers():
+    import zfsbackup.daemon as daemon_module
+    import zfsbackup.remote as remote_module
+
+    return [daemon_module._read_id_file, remote_module._read_id_file]
+
+
+@pytest.fixture(params=[0, 1], ids=["daemon", "remote"])
+def read_id_file(request):
+    """Both twins (`daemon._read_id_file`, `remote._read_id_file`) run every test."""
+    return _readers()[request.param]
+
+
+class TestReadIdFile:
+    def test_the_cap_is_the_same_in_both_modules(self):
+        import zfsbackup.daemon as daemon_module
+        import zfsbackup.remote as remote_module
+
+        assert daemon_module._ID_FILE_MAX == remote_module._ID_FILE_MAX == 4096
+
+    def test_a_regular_file_is_read(self, read_id_file, tmp_path):
+        f = tmp_path / 'id'
+        f.write_text('host-abc12345\n')
+        assert read_id_file(f) == 'host-abc12345\n'
+
+    def test_an_empty_file_is_an_empty_string_not_missing(self, read_id_file, tmp_path):
+        f = tmp_path / 'id'
+        f.write_text('')
+        assert read_id_file(f) == ''
+
+    def test_a_missing_file_is_none(self, read_id_file, tmp_path):
+        assert read_id_file(tmp_path / 'absent') is None
+
+    def test_a_path_below_a_regular_file_is_missing(self, read_id_file, tmp_path):
+        f = tmp_path / 'file'
+        f.write_text('x')
+        assert read_id_file(f / 'id') is None
+
+    def test_a_dangling_symlink_is_missing(self, read_id_file, tmp_path):
+        link = tmp_path / 'id'
+        link.symlink_to(tmp_path / 'nowhere')
+        assert read_id_file(link) is None
+
+    def test_a_symlink_loop_is_missing(self, read_id_file, tmp_path):
+        link = tmp_path / 'id'
+        link.symlink_to(link)
+        assert read_id_file(link) is None
+
+    def test_a_symlink_to_a_regular_file_is_followed(self, read_id_file, tmp_path):
+        real = tmp_path / 'real'
+        real.write_text('abc')
+        link = tmp_path / 'id'
+        link.symlink_to(real)
+        assert read_id_file(link) == 'abc'
+
+    def test_a_fifo_is_refused_without_blocking(self, read_id_file, tmp_path):
+        import errno
+        import os
+
+        fifo = tmp_path / 'id'
+        os.mkfifo(fifo)
+        with pytest.raises(OSError) as exc:
+            _within(5, read_id_file, fifo)
+        assert exc.value.errno == errno.EINVAL and 'not a regular file' in str(exc.value)
+
+    def test_a_symlink_to_a_fifo_is_refused_without_blocking(self, read_id_file, tmp_path):
+        import os
+
+        fifo = tmp_path / 'fifo'
+        os.mkfifo(fifo)
+        link = tmp_path / 'id'
+        link.symlink_to(fifo)
+        with pytest.raises(OSError, match='not a regular file'):
+            _within(5, read_id_file, link)
+
+    def test_a_directory_is_refused(self, read_id_file, tmp_path):
+        d = tmp_path / 'id'
+        d.mkdir()
+        with pytest.raises(OSError, match='not a regular file'):
+            read_id_file(d)
+
+    def test_a_device_is_refused_not_read_for_ever(self, read_id_file):
+        import os
+
+        if not os.path.exists('/dev/zero'):
+            pytest.skip('no /dev/zero')
+        with pytest.raises(OSError, match='not a regular file'):
+            _within(5, read_id_file, Path('/dev/zero'))
+
+    def test_a_file_over_the_cap_is_refused(self, read_id_file, tmp_path):
+        import errno
+
+        f = tmp_path / 'id'
+        f.write_bytes(b'x' * 4097)
+        with pytest.raises(OSError) as exc:
+            read_id_file(f)
+        assert exc.value.errno == errno.EFBIG and '4096' in str(exc.value)
+
+    def test_a_file_exactly_at_the_cap_is_read(self, read_id_file, tmp_path):
+        f = tmp_path / 'id'
+        f.write_bytes(b'x' * 4096)
+        assert len(read_id_file(f)) == 4096
+
+    def test_an_undecodable_file_raises_a_unicode_error(self, read_id_file, tmp_path, monkeypatch):
+        import locale
+
+        monkeypatch.setattr(locale, 'getpreferredencoding', lambda do_setlocale=True: 'ascii')
+        f = tmp_path / 'id'
+        f.write_bytes(b'\xff\xfe\x80')
+        with pytest.raises(UnicodeError):
+            read_id_file(f)
+
+    def test_a_non_regular_path_is_refused_before_it_is_ever_opened(
+        self, read_id_file, tmp_path, monkeypatch
+    ):
+        """Opening some devices has side effects (`/dev/watchdog` arms the
+        watchdog): `stat` first, and `os.open` is never called on the path."""
+        import os
+
+        fifo = tmp_path / 'id'
+        os.mkfifo(fifo)
+        opened = []
+        real_open = os.open
+        monkeypatch.setattr(
+            os, 'open', lambda p, *a, **k: (opened.append(p), real_open(p, *a, **k))[1]
+        )
+        for target in (fifo, tmp_path):                  # a FIFO and a directory
+            with pytest.raises(OSError, match='not a regular file'):
+                read_id_file(target)
+        assert opened == []
+
+    def test_a_regular_file_is_opened_once_nonblocking_and_cloexec(
+        self, read_id_file, tmp_path, monkeypatch
+    ):
+        import os
+
+        f = tmp_path / 'id'
+        f.write_text('abc')
+        calls = []
+        real_open = os.open
+        monkeypatch.setattr(
+            os, 'open', lambda p, flags, *a, **k: (calls.append((p, flags)), real_open(p, flags, *a, **k))[1]
+        )
+        assert read_id_file(f) == 'abc'
+        assert len(calls) == 1
+        flags = calls[0][1]
+        assert flags & os.O_NONBLOCK and not flags & (os.O_WRONLY | os.O_RDWR)
+        assert flags & getattr(os, 'O_CLOEXEC', 0) == getattr(os, 'O_CLOEXEC', 0)
+
+    def test_a_path_swapped_for_a_fifo_between_stat_and_open_is_refused_by_fstat(
+        self, read_id_file, tmp_path, monkeypatch
+    ):
+        """The swap race: `stat` says regular, the file opened is a FIFO. The
+        open is non-blocking, so it succeeds, and the post-open `fstat` refuses."""
+        import os
+
+        real = tmp_path / 'real'
+        real.write_text('abc')
+        fifo = tmp_path / 'fifo'
+        os.mkfifo(fifo)
+        real_stat = os.stat
+        real_open = os.open
+        monkeypatch.setattr(os, 'stat', lambda p, *a, **k: real_stat(real))
+        monkeypatch.setattr(os, 'open', lambda p, *a, **k: real_open(fifo, *a, **k))
+        with pytest.raises(OSError, match='not a regular file'):
+            _within(5, read_id_file, tmp_path / 'id')
+
+    def test_the_descriptor_is_closed_on_every_path(self, read_id_file, tmp_path, monkeypatch):
+        import os
+
+        closed, opened = [], []
+        real_open, real_close = os.open, os.close
+
+        def spy_open(*a, **k):
+            fd = real_open(*a, **k)
+            opened.append(fd)
+            return fd
+
+        monkeypatch.setattr(os, 'open', spy_open)
+        monkeypatch.setattr(os, 'close', lambda fd: (closed.append(fd), real_close(fd))[1])
+        big = tmp_path / 'big'
+        big.write_bytes(b'x' * 5000)
+        ok = tmp_path / 'ok'
+        ok.write_text('abc')
+        with pytest.raises(OSError):
+            read_id_file(big)
+        read_id_file(ok)
+        assert opened and sorted(opened) == sorted(closed)
+
+
+class TestClientIdentityOnOddFiles:
+    def test_a_fifo_raises_and_is_left_alone(self, tmp_path):
+        import os
+        import stat
+
+        fifo = tmp_path / 'client_id'
+        os.mkfifo(fifo)
+        with pytest.raises(OSError, match='not a regular file'):
+            _within(5, lambda: ClientIdentity(fifo).client_id)
+        assert stat.S_ISFIFO(os.stat(fifo).st_mode)
+
+    def test_a_directory_raises_and_is_left_alone(self, tmp_path):
+        d = tmp_path / 'client_id'
+        d.mkdir()
+        with pytest.raises(OSError):
+            ClientIdentity(d).client_id
+        assert d.is_dir() and list(d.iterdir()) == []
+
+    def test_an_oversized_file_raises_and_is_never_overwritten(self, tmp_path):
+        f = tmp_path / 'client_id'
+        f.write_bytes(b'important ' * 600)
+        before = f.read_bytes()
+        with pytest.raises(OSError, match='larger than'):
+            ClientIdentity(f).client_id
+        assert f.read_bytes() == before
+
+    def test_an_undecodable_file_raises_and_is_never_overwritten(self, tmp_path, monkeypatch):
+        import locale
+
+        monkeypatch.setattr(locale, 'getpreferredencoding', lambda do_setlocale=True: 'ascii')
+        f = tmp_path / 'client_id'
+        f.write_bytes(b'\xff\xfe')
+        with pytest.raises(UnicodeError):
+            ClientIdentity(f).client_id
+        assert f.read_bytes() == b'\xff\xfe'
+
+    def test_a_blank_file_is_rewritten(self, tmp_path):
+        f = tmp_path / 'client_id'
+        f.write_text('  \n')
+        cid = ClientIdentity(f).client_id
+        assert cid and f.read_text() == cid
+
+    def test_a_missing_file_and_directory_are_created(self, tmp_path):
+        f = tmp_path / 'a' / 'b' / 'client_id'
+        cid = ClientIdentity(f).client_id
+        assert f.read_text() == cid
+
+    def test_an_existing_id_is_stripped_and_returned(self, tmp_path):
+        f = tmp_path / 'client_id'
+        f.write_text('host-abc  \n')
+        assert ClientIdentity(f).client_id == 'host-abc'
+        assert f.read_text() == 'host-abc  \n'
+
+    def test_a_symlink_to_a_regular_file_is_followed(self, tmp_path):
+        real = tmp_path / 'real'
+        real.write_text('host-xyz')
+        link = tmp_path / 'client_id'
+        link.symlink_to(real)
+        assert ClientIdentity(link).client_id == 'host-xyz'
+
+    def test_a_dangling_symlink_is_treated_as_missing_and_written_through(self, tmp_path):
+        target = tmp_path / 'target'
+        link = tmp_path / 'client_id'
+        link.symlink_to(target)
+        cid = ClientIdentity(link).client_id
+        assert target.read_text() == cid                # written through the link
+
+    def test_the_failure_is_not_cached_so_the_next_call_retries(self, tmp_path):
+        f = tmp_path / 'client_id'
+        f.write_bytes(b'x' * 5000)
+        identity = ClientIdentity(f)
+        with pytest.raises(OSError):
+            identity.client_id
+        f.write_text('host-ok')
+        assert identity.client_id == 'host-ok'
+
+
 class TestClientIdentity:
     def test_generates_new_id_when_no_file(self, tmp_path):
         id_file = tmp_path / 'client_id'

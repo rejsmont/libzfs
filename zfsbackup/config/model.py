@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -784,6 +784,42 @@ class DatasetConfig:
         )
 
 
+def _same(a, b) -> bool:
+    """Exact structural equality for `BackupConfig.same_as`.
+
+    Unlike `==`, a `Duration` is compared as `(timedelta, literal)`:
+    `Duration.__eq__` is `timedelta`'s and ignores the literal, so `1h` and
+    `60m` are `==` yet a different operator-visible configuration. A bare
+    `timedelta` on either side has no literal to compare, so only values are
+    compared then. Dataclasses are compared field by field and must be of
+    the same type; lists in order (order is behaviour: the dataset list is
+    iterated in order); dicts by key set and value.
+    """
+    if isinstance(a, timedelta) or isinstance(b, timedelta):
+        if not (isinstance(a, timedelta) and isinstance(b, timedelta)):
+            return False
+        if timedelta.__ne__(a, b):
+            return False
+        if isinstance(a, Duration) and isinstance(b, Duration):
+            return a.literal == b.literal
+        return True
+    if is_dataclass(a) and not isinstance(a, type):
+        if type(a) is not type(b):
+            return False
+        return all(_same(getattr(a, f.name), getattr(b, f.name)) for f in fields(a))
+    if isinstance(a, (list, tuple)):
+        return (
+            type(a) is type(b) and len(a) == len(b)
+            and all(_same(x, y) for x, y in zip(a, b))
+        )
+    if isinstance(a, dict):
+        return (
+            isinstance(b, dict) and a.keys() == b.keys()
+            and all(_same(v, b[k]) for k, v in a.items())
+        )
+    return type(a) is type(b) and a == b
+
+
 @dataclass
 class BackupConfig:
     """Main backup daemon configuration."""
@@ -943,6 +979,16 @@ class BackupConfig:
             remote_backup=remote_backup,
             client_id_file=client_id_file,
         )
+
+    def same_as(self, other: 'BackupConfig') -> bool:
+        """True when `other` is the same configuration down to every field.
+
+        Stricter than `==`: a `Duration` is compared as `(timedelta, literal)`
+        (`Duration.__eq__` ignores the literal), so editing only a literal
+        (`1h` -> `60m`) is a difference. The daemon uses this to skip a
+        worker turnover for a rewrite that changed nothing (the same rule as
+        the CLI editor's "No changes", cli/editor.py)."""
+        return _same(self, other)
 
     @property
     def effective_prune_interval(self) -> timedelta:

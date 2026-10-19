@@ -258,6 +258,36 @@ def config_yaml_path(tmp_path):
     return cfg_file
 
 
+@pytest.fixture
+def real_api_probe():
+    """Opt-out marker fixture for `_default_api_port_is_not_probed`: a test
+    (or class, via `usefixtures`) that exercises `daemon._probe_api_bind`
+    itself requests this to get the real function even for port 8080."""
+
+
+@pytest.fixture(autouse=True)
+def _default_api_port_is_not_probed(request, monkeypatch):
+    """Startup binds the API address once to refuse a port nobody can use
+    (`daemon._probe_api_bind`, B3). Many tests import configs with the default
+    `api_port` (8080) and go through startup, and would fail on any host where
+    something listens on 127.0.0.1:8080. For the in-process `zfsbackup.daemon`
+    only, port 8080 answers "bindable"; every other port is probed for real
+    (or by the test's own patch). Narrow on purpose: request `real_api_probe`
+    to keep the real function for 8080 too. Subprocess daemons are unaffected
+    (the tests that start one pick a free port)."""
+    if "real_api_probe" in request.fixturenames:
+        return
+    # Imported here, not looked up in `sys.modules`: a test that imports the
+    # daemon lazily would otherwise probe 127.0.0.1:8080 for real.
+    import zfsbackup.daemon as daemon
+
+    real = daemon._probe_api_bind
+    monkeypatch.setattr(
+        daemon, "_probe_api_bind",
+        lambda host, port: None if port == 8080 else real(host, port),
+    )
+
+
 @pytest.fixture(autouse=True)
 def _clean_db_engine_cache():
     """Disposes every engine `zfsbackup.config.store.get_engine()` has

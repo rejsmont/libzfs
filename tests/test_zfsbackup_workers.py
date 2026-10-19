@@ -2,6 +2,7 @@
 
 import copy
 import inspect
+import logging
 import multiprocessing
 import pickle
 import signal
@@ -15,9 +16,9 @@ from zfsbackup.config import BackupConfig, DatasetConfig, Duration, RemoteDatase
 from zfsbackup.config.store import dispose_all
 from zfsbackup.runtime_config import load_runtime_config
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
-from zfsbackup.stopflag import StopFlag
+from zfsbackup.stopflag import ReloadEpoch, StopFlag
 from zfsbackup.workers import (
-    BaseWorker, SnapshotWorker, PruningWorker, RemoteBackupWorker, ApiWorker,
+    WORKER_EXIT_RELOAD, BaseWorker, SnapshotWorker, PruningWorker, RemoteBackupWorker, ApiWorker,
 )
 
 #: The union `workers.StopEvent` actually accepts (see `workers.py`'s own
@@ -72,6 +73,264 @@ class TestSnapshotWorker:
         mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
         mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
         worker.run()
+
+
+def _three_datasets(dry_run=False) -> BackupConfig:
+    return BackupConfig(
+        datasets=[DatasetConfig(name=f'pool/{n}') for n in 'abc'], dry_run=dry_run,
+    )
+
+
+class TestSnapshotWorkerBeforeLoop:
+    """B1: the dataset existence check and the `org.zfsbackup:config` sync are
+    the snapshot worker's first act -- the supervisor makes no `zfs` call.
+    Driven inline with the real `DatasetManager` over a mocked `zfs`."""
+
+    @pytest.fixture(autouse=True)
+    def _grab_mocker(self, mocker):
+        self._mocker = mocker
+
+    @pytest.fixture
+    def zfs_mock(self, mocker):
+        m = mocker.MagicMock()
+        m.exists.return_value = True
+        m.list.return_value = []
+        mocker.patch('zfsbackup.backup_manager.zfs', m)
+        return m
+
+    def _worker(self, config=None, *, epoch=None, born=0):
+        stop = StopFlag()
+        worker = SnapshotWorker(
+            config or _three_datasets(), stop, reload_epoch=epoch, born_epoch=born,
+        )
+        # Bounds every run to one cycle, so a regression fails an assertion
+        # instead of sleeping a whole check interval.
+        self._mocker.patch.object(
+            worker, '_wait', return_value=workers_module.ExitReason.STOP
+        )
+        return worker, stop
+
+    def _record(self, mocker, worker, order):
+        verify = mocker.patch.object(
+            DatasetManager, 'verify_datasets', autospec=True,
+            side_effect=lambda self, should_stop=None: order.append('verify'),
+        )
+        sync = mocker.patch.object(
+            DatasetManager, 'sync_all_config_properties', autospec=True,
+            side_effect=lambda self, should_stop=None: order.append('sync'),
+        )
+        return verify, sync
+
+    def test_it_verifies_then_syncs_once_before_the_first_cycle(self, mocker, zfs_mock):
+        worker, stop = self._worker()
+        order = []
+        verify, sync = self._record(mocker, worker, order)
+
+        def process(manager, dsi):
+            order.append(f'process:{dsi.name}')
+            stop.set()
+
+        mocker.patch.object(worker, '_process_dataset', side_effect=process)
+        worker.run()
+        assert order == ['verify', 'sync', 'process:pool/a']
+        verify.assert_called_once()
+        sync.assert_called_once()
+        # Both are given the worker's own safe-point check, not the stop flag
+        # alone: a reload ends the pre-loop work too.
+        for call in (verify, sync):
+            assert call.call_args.kwargs['should_stop'] == worker._should_stop
+
+    def test_it_runs_once_per_incarnation_not_once_per_cycle(self, mocker, zfs_mock):
+        worker, stop = self._worker()
+        order = []
+        verify, sync = self._record(mocker, worker, order)
+        cycles = []
+
+        def process(manager, dsi):
+            cycles.append(dsi.name)
+            if len(cycles) == 9:        # three full cycles over three datasets
+                stop.set()
+
+        mocker.patch.object(worker, '_process_dataset', side_effect=process)
+        mocker.patch.object(worker, '_wait', return_value=None)
+        worker.run()
+        assert len(cycles) == 9
+        assert verify.call_count == 1 and sync.call_count == 1
+
+    def test_only_the_snapshot_worker_does_it(self, mocker, zfs_mock):
+        assert PruningWorker._before_loop is BaseWorker._before_loop
+        assert RemoteBackupWorker._before_loop is not SnapshotWorker._before_loop
+        pruning = PruningWorker(_three_datasets(), StopFlag())
+        pruning._before_loop(pruning.config, DatasetManager(pruning.config))
+        zfs_mock.exists.assert_not_called()
+        zfs_mock.set.assert_not_called()
+
+    def test_a_stop_already_set_checks_and_syncs_nothing(self, mocker, zfs_mock):
+        worker, stop = self._worker()
+        stop.set()
+        sync_one = mocker.patch.object(DatasetManager, 'sync_config_property')
+        mocker.patch.object(worker, '_process_dataset')
+        worker.run()
+        zfs_mock.exists.assert_not_called()
+        zfs_mock.list.assert_not_called()
+        zfs_mock.set.assert_not_called()
+        sync_one.assert_not_called()
+        worker._process_dataset.assert_not_called()
+
+    def test_a_reload_already_signalled_checks_and_syncs_nothing_and_exits_for_it(
+        self, mocker, zfs_mock
+    ):
+        epoch = ReloadEpoch()
+        worker, stop = self._worker(epoch=epoch, born=0)
+        epoch.set(1)                    # the epoch moved before the worker got going
+        sync_one = mocker.patch.object(DatasetManager, 'sync_config_property')
+        mocker.patch.object(worker, '_process_dataset')
+        with pytest.raises(SystemExit) as exc:
+            worker.run()
+        assert exc.value.code == WORKER_EXIT_RELOAD == 3
+        zfs_mock.exists.assert_not_called()
+        zfs_mock.set.assert_not_called()
+        sync_one.assert_not_called()
+        worker._process_dataset.assert_not_called()
+
+    def test_a_stop_after_the_first_dataset_breaks_the_sync(self, mocker, zfs_mock):
+        worker, stop = self._worker()
+        calls = []
+
+        def sync_one(self_, dsi):
+            calls.append(dsi.name)
+            stop.set()
+
+        mocker.patch.object(DatasetManager, 'sync_config_property', autospec=True,
+                            side_effect=sync_one)
+        mocker.patch.object(worker, '_process_dataset')
+        worker.run()
+        assert calls == ['pool/a']                      # b and c never synced
+        assert zfs_mock.exists.call_count == 3          # the verify pass completed
+        worker._process_dataset.assert_not_called()     # and no cycle followed
+
+    def test_a_stop_during_the_verify_pass_skips_the_sync_altogether(self, mocker, zfs_mock):
+        worker, stop = self._worker()
+
+        def exists(ds):
+            stop.set()
+            return True
+
+        zfs_mock.exists.side_effect = exists
+        sync_one = mocker.patch.object(DatasetManager, 'sync_config_property')
+        mocker.patch.object(worker, '_process_dataset')
+        worker.run()
+        assert zfs_mock.exists.call_count == 1          # broke after the first dataset
+        sync_one.assert_not_called()
+
+    def test_a_reload_during_the_sync_breaks_it_and_the_worker_exits_three(
+        self, mocker, zfs_mock
+    ):
+        epoch = ReloadEpoch()
+        worker, stop = self._worker(epoch=epoch, born=0)
+        calls = []
+
+        def sync_one(self_, dsi):
+            calls.append(dsi.name)
+            epoch.set(1)                                # the supervisor accepts a reload
+
+        mocker.patch.object(DatasetManager, 'sync_config_property', autospec=True,
+                            side_effect=sync_one)
+        mocker.patch.object(worker, '_process_dataset')
+        with pytest.raises(SystemExit) as exc:
+            worker.run()
+        assert exc.value.code == WORKER_EXIT_RELOAD
+        assert calls == ['pool/a']
+        worker._process_dataset.assert_not_called()
+
+    def test_an_exception_in_the_verify_is_logged_and_the_worker_still_cycles(
+        self, mocker, zfs_mock, caplog
+    ):
+        worker, stop = self._worker()
+        zfs_mock.exists.side_effect = OSError('pool hung up')
+        cycles = []
+        mocker.patch.object(
+            worker, '_process_dataset',
+            side_effect=lambda m, d: (cycles.append(d.name), stop.set()),
+        )
+        with caplog.at_level(logging.ERROR, logger='zfsbackup.workers'):
+            worker.run()
+        records = [r for r in caplog.records if 'could not check or sync' in r.getMessage()]
+        assert len(records) == 1 and 'pool hung up' in records[0].getMessage()
+        assert records[0].exc_info is not None
+        assert cycles == ['pool/a']
+
+    def test_an_exception_in_the_sync_is_logged_and_the_worker_still_cycles(
+        self, mocker, zfs_mock, caplog
+    ):
+        worker, stop = self._worker()
+        mocker.patch.object(
+            DatasetManager, 'sync_all_config_properties',
+            side_effect=RuntimeError('zfs exploded'),
+        )
+        cycles = []
+        mocker.patch.object(
+            worker, '_process_dataset',
+            side_effect=lambda m, d: (cycles.append(d.name), stop.set()),
+        )
+        with caplog.at_level(logging.ERROR, logger='zfsbackup.workers'):
+            worker.run()
+        records = [r for r in caplog.records if 'could not check or sync' in r.getMessage()]
+        assert len(records) == 1 and 'zfs exploded' in records[0].getMessage()
+        assert cycles == ['pool/a']
+
+    def test_a_failing_zfs_set_is_a_warning_inside_the_sync_not_an_error(
+        self, mocker, zfs_mock, caplog
+    ):
+        """`sync_config_property` already swallows a `zfs set` failure, so the
+        sync runs through every dataset."""
+        worker, stop = self._worker()
+        zfs_mock.set.side_effect = OSError('read-only pool')
+        mocker.patch.object(
+            worker, '_process_dataset', side_effect=lambda m, d: stop.set(),
+        )
+        with caplog.at_level(logging.WARNING):
+            worker.run()
+        assert zfs_mock.set.call_count == 3
+        assert not [r for r in caplog.records if 'could not check or sync' in r.getMessage()]
+
+    def test_a_dry_run_writes_nothing_and_says_what_it_would_do(
+        self, mocker, zfs_mock, caplog
+    ):
+        worker, stop = self._worker(_three_datasets(dry_run=True))
+        mocker.patch.object(
+            worker, '_process_dataset', side_effect=lambda m, d: stop.set(),
+        )
+        with caplog.at_level(logging.INFO):
+            worker.run()
+        zfs_mock.set.assert_not_called()
+        assert zfs_mock.exists.call_count == 3          # existence checks are reads
+        dry = [r.getMessage() for r in caplog.records if '[DRY RUN] Would set' in r.getMessage()]
+        assert len(dry) == 3
+
+    def test_without_dry_run_each_dataset_gets_its_config_property(self, mocker, zfs_mock):
+        """The positive control for the dry-run test above."""
+        worker, stop = self._worker()
+        mocker.patch.object(
+            worker, '_process_dataset', side_effect=lambda m, d: stop.set(),
+        )
+        worker.run()
+        assert [c.args[0].name for c in zfs_mock.set.call_args_list] == [
+            'pool/a', 'pool/b', 'pool/c',
+        ]
+
+    def test_a_missing_dataset_is_logged_and_does_not_stop_the_worker(
+        self, mocker, zfs_mock, caplog
+    ):
+        worker, stop = self._worker()
+        zfs_mock.exists.side_effect = lambda ds: ds.name != 'pool/b'
+        mocker.patch.object(
+            worker, '_process_dataset', side_effect=lambda m, d: stop.set(),
+        )
+        with caplog.at_level(logging.ERROR):
+            worker.run()
+        assert [r.getMessage() for r in caplog.records
+                if 'does not exist' in r.getMessage()] == ['Dataset pool/b does not exist']
 
 
 class TestPruningWorker:

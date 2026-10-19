@@ -37,7 +37,17 @@ File format (ASCII; "pid file v2")::
     start=<token>\\n      # procident.start_token of the supervisor; may be empty
     applied=<store>:<gen>\\n
     target=<store>:<gen>\\n    # only while a reload is being applied
-    rejected=<store>:<gen>\\n
+    rejected=<store>:<gen>\\n    # final: this key will not be retried
+    deferred=<store>:<gen>\\n    # refused for now, re-checked every poll
+    deferred_reason=<text>\\n    # one line, printable ASCII, at most 200 chars
+
+`rejected=` is final (the poll never retries that key; only a new write or a
+SIGHUP does). `deferred=` is the other kind of refusal: the stored
+configuration is fine but cannot be applied *yet* (its API address is busy),
+and the daemon re-checks it at every poll, applying it as soon as it passes.
+The two are never published for the same key. `deferred` is cleared when the
+key is accepted (it becomes `target=`/`applied=`), when a newer key supersedes
+it, or when it turns into a `rejected=`. Older readers ignore both new keys.
 
 Lines 1-2 are the original format and are unchanged, so a reader that parses
 only two lines keeps working. From line 3 on, `key=value` lines; unknown keys
@@ -239,6 +249,10 @@ class DaemonInfo:
     applied: Optional[Tuple[int, int]] = field(default=None, compare=False)
     target: Optional[Tuple[int, int]] = field(default=None, compare=False)
     rejected: Optional[Tuple[int, int]] = field(default=None, compare=False)
+    #: A refusal that is re-checked at every poll (not final, unlike
+    #: `rejected`), and the daemon's one-line reason (`None` when absent).
+    deferred: Optional[Tuple[int, int]] = field(default=None, compare=False)
+    deferred_reason: Optional[str] = field(default=None, compare=False)
     #: `False` when two consecutive reads never agreed (a torn read).
     stable: bool = field(default=True, compare=False)
 
@@ -355,6 +369,8 @@ def _format(
     applied: Optional[Tuple[int, int]] = None,
     target: Optional[Tuple[int, int]] = None,
     rejected: Optional[Tuple[int, int]] = None,
+    deferred: Optional[Tuple[int, int]] = None,
+    deferred_reason: Optional[str] = None,
 ) -> bytes:
     """Pid file content. `start=None` writes the legacy two-line form; any
     string (including "") writes the v2 form."""
@@ -364,7 +380,27 @@ def _format(
         for key, pair in (("applied", applied), ("target", target), ("rejected", rejected)):
             if pair is not None:
                 text += f"{key}={pair[0]}:{pair[1]}\n"
+        if deferred is not None:
+            text += f"deferred={deferred[0]}:{deferred[1]}\n"
+            reason = _clean_reason(deferred_reason)
+            if reason:
+                text += f"deferred_reason={reason}\n"
     return text.encode("ascii", errors="replace")
+
+
+#: Longest `deferred_reason=` written or accepted.
+_MAX_REASON = 200
+
+
+def _clean_reason(text: Optional[str]) -> str:
+    """One printable-ASCII line of at most `_MAX_REASON` characters: the
+    file is group-writable and read by the CLI, so nothing else goes in or
+    comes out."""
+    if not text:
+        return ""
+    out = "".join(c if (c.isascii() and c.isprintable()) else " " for c in text)
+    out = " ".join(out.split())
+    return out[:_MAX_REASON]
 
 
 class _Parsed(NamedTuple):
@@ -374,6 +410,8 @@ class _Parsed(NamedTuple):
     applied: Optional[Tuple[int, int]]
     target: Optional[Tuple[int, int]]
     rejected: Optional[Tuple[int, int]]
+    deferred: Optional[Tuple[int, int]] = None
+    deferred_reason: Optional[str] = None
 
 
 def _pair(value: str) -> Optional[Tuple[int, int]]:
@@ -416,6 +454,8 @@ def _parse(raw: bytes) -> _Parsed:
         _pair(kv["applied"]) if "applied" in kv else None,
         _pair(kv["target"]) if "target" in kv else None,
         _pair(kv["rejected"]) if "rejected" in kv else None,
+        _pair(kv["deferred"]) if "deferred" in kv else None,
+        (_clean_reason(kv["deferred_reason"]) or None) if "deferred_reason" in kv else None,
     )
 
 
@@ -457,6 +497,8 @@ def _info(raw: bytes, stable: bool = True) -> DaemonInfo:
         applied=p.applied,
         target=p.target,
         rejected=p.rejected,
+        deferred=p.deferred,
+        deferred_reason=p.deferred_reason,
         stable=stable,
     )
 
@@ -485,6 +527,8 @@ class DaemonLock:
         self.applied: Optional[Tuple[int, int]] = None
         self.target: Optional[Tuple[int, int]] = None
         self.rejected: Optional[Tuple[int, int]] = None
+        self.deferred: Optional[Tuple[int, int]] = None
+        self.deferred_reason: Optional[str] = None
 
     @property
     def held(self) -> bool:
@@ -495,7 +539,8 @@ class DaemonLock:
         if fd is None or os.getpid() != self._owner_pid:
             return
         data = _format(
-            self.pid, self.generation, self.start, self.applied, self.target, self.rejected
+            self.pid, self.generation, self.start, self.applied, self.target,
+            self.rejected, self.deferred, self.deferred_reason,
         )
         # Overwrite first, trim second: never an empty window for a reader.
         # The overwrite is padded with newlines up to the old length, so a
@@ -519,11 +564,16 @@ class DaemonLock:
             # Informational data; never take the daemon down for it.
             logger.warning("could not record generation in %s: %s", self.path, exc)
 
-    def set_state(self, *, applied=_KEEP, target=_KEEP, rejected=_KEEP) -> None:
+    def set_state(
+        self, *, applied=_KEEP, target=_KEEP, rejected=_KEEP,
+        deferred=_KEEP, deferred_reason=_KEEP,
+    ) -> None:
         """Record reload state. Each value is `Optional[Tuple[store_id, generation]]`
         (`None` clears the key); omitted keys keep their value. Setting
-        `applied` also rewrites line 2 with its generation. One write; failures
-        are logged at WARNING and never raised."""
+        `applied` also rewrites line 2 with its generation. `deferred` (a
+        refusal that is re-checked at every poll) takes an optional one-line
+        `deferred_reason`; clearing `deferred` clears its reason too. One
+        write; failures are logged at WARNING and never raised."""
         if applied is not _KEEP:
             self.applied = applied
             self.generation = None if applied is None else applied[1]
@@ -531,6 +581,14 @@ class DaemonLock:
             self.target = target
         if rejected is not _KEEP:
             self.rejected = rejected
+        if deferred is not _KEEP:
+            self.deferred = deferred
+            if deferred is None:
+                self.deferred_reason = None
+        if deferred_reason is not _KEEP:
+            self.deferred_reason = (
+                _clean_reason(deferred_reason) or None if self.deferred is not None else None
+            )
         try:
             self._write()
         except OSError as exc:

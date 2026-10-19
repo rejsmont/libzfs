@@ -629,9 +629,10 @@ class TestDaemonRun:
     def test_run_does_not_start_workers_when_stop_flag_pre_set(
         self, sqlite_config_db, sample_backup_config, mocker, caplog
     ):
-        """A SIGTERM landing during `verify_datasets()`/
-        `sync_all_config_properties()` -- both of which run before the
-        `_start_workers()` guard -- must not fork any worker at all: each
+        """A SIGTERM landing during startup (the dataset report and the first
+        reload tick, both before the `_start_workers()` guard; the supervisor
+        makes no `zfs` call since B1 -- the existence check and property sync
+        are the snapshot worker's) must not fork any worker at all: each
         one would do `dispose_all()`, a schema check and a full config
         load only to die at the loop guard's first evaluation a moment
         later. With the flag pre-set (mirroring that startup SIGTERM),
@@ -649,9 +650,9 @@ class TestDaemonRun:
         """
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
 
-        mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
-        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
-        mocker.patch('zfsbackup.backup_manager.zfs.set')
+        exists = mocker.patch('zfsbackup.backup_manager.zfs.exists', return_value=True)
+        zlist = mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
+        zset = mocker.patch('zfsbackup.backup_manager.zfs.set')
 
         mocker.patch.object(daemon, '_start_workers')
         mocker.patch.object(daemon, '_check_workers')
@@ -660,6 +661,9 @@ class TestDaemonRun:
         daemon._stop_event.set()
         with caplog.at_level('INFO'):
             result = daemon.run()
+
+        for call in (exists, zlist, zset):          # B1: not one zfs call
+            call.assert_not_called()
 
         daemon._start_workers.assert_not_called()
         daemon._shutdown_workers.assert_called_once()
@@ -701,6 +705,48 @@ class TestDaemonRun:
         daemon._start_workers.assert_called_once()
         daemon._shutdown_workers.assert_called_once()
         assert result == 0
+
+    def test_run_makes_no_zfs_call_at_all(
+        self, sqlite_config_db, sample_backup_config, mocker
+    ):
+        """B1: a hung pool inside a supervisor `zfs` call would stall SIGTERM,
+        SIGHUP and every worker restart (PEP 475 retries `Popen.wait` after a
+        signal). The whole of `run()` -- report, startup tick, worker start,
+        loop, shutdown -- must therefore never reach `libzfseasy`. Nothing
+        is mocked below `run()` except the entry points and `Popen` itself."""
+        import sqlite3
+
+        snap = read_config(sqlite_config_db)
+        key = (snap.store_id, snap.generation)
+        # A committed write the startup tick will find and apply: with a real
+        # key the reload path (read, validate, build, candidate checks, swap)
+        # runs too, not just the dataset report.
+        con = sqlite3.connect(str(sqlite_config_db.path))
+        con.execute(
+            "UPDATE global_settings SET snapshot_prefix = 'landed', generation = generation + 1"
+        )
+        con.commit()
+        con.close()
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db, key=key)
+
+        def boom(*a, **k):
+            raise AssertionError(f"the supervisor made a zfs call: {a!r}")
+
+        for name in ('exists', 'list', 'set', 'get', 'snapshot', 'destroy'):
+            mocker.patch(f'zfsbackup.backup_manager.zfs.{name}', side_effect=boom)
+        mocker.patch('subprocess.Popen', side_effect=boom)
+
+        mocker.patch.object(daemon, '_start_workers')
+        mocker.patch.object(daemon, '_check_workers')
+        mocker.patch.object(daemon, '_shutdown_workers')
+        mocker.patch.object(
+            daemon, '_supervisor_sleep',
+            side_effect=lambda _: daemon._stop_event.set(),
+        )
+        assert daemon.run() == 0
+        daemon._start_workers.assert_called_once()
+        assert daemon._handoff.key == (key[0], key[1] + 1)      # the reload really ran
+        assert daemon.config.snapshot_prefix == 'landed'
 
     def test_run_supervisor_loop_checks_workers(self, sqlite_config_db, sample_backup_config, mocker):
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
@@ -1855,6 +1901,10 @@ class TestRunReadsOnceAndReportsTheGeneration:
         _daemon_module._run(_args(resolved.path, verbose=True))
         (config, passed_resolved), kwargs = factory.call_args
         assert passed_resolved.resolved_path == resolved.resolved_path
+        from zfsbackup.sdnotify import Notifier
+
+        notifier = kwargs.pop('notifier')
+        assert isinstance(notifier, Notifier)       # a no-op one without $NOTIFY_SOCKET
         assert kwargs == {
             'verbose': True,
             'key': (read_config(resolved).store_id, generation),

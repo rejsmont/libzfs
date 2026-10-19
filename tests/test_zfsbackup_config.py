@@ -795,3 +795,334 @@ class TestBackupConfig:
         cfg = BackupConfig.from_file(f)  # must not raise
         assert cfg.datasets[0].remote[0].destination == 'offsite'
         assert cfg.datasets[0].remote[0].retention_rules == []
+
+
+# ---------------------------------------------------------------------------
+# B2: BackupConfig.same_as -- exact structural equality
+# ---------------------------------------------------------------------------
+
+
+def _rich_config(**over) -> BackupConfig:
+    """A config touching every nested type `same_as` walks: a dataset with
+    retention rules, a remote entry with its own frequency and retention
+    override, a destination, and the remote-server block."""
+    data = dict(
+        snapshot_prefix='zb',
+        check_interval=Duration('5m'),
+        prune_interval=Duration('1h'),
+        datasets=[
+            DatasetConfig(
+                name='pool/a',
+                frequency=Duration('1h'),
+                retention_rules=[
+                    RetentionRule(age=Duration('1d'), keep_for=Duration('4w')),
+                    RetentionRule(age=Duration('1w'), keep_for=Duration('1M')),
+                ],
+                remote=[
+                    RemoteDatasetConfig(
+                        destination='offsite',
+                        frequency=Duration('30m'),
+                        retention_rules=[
+                            RetentionRule(age=Duration('2d'), keep_for=Duration('8w')),
+                        ],
+                    )
+                ],
+            ),
+            DatasetConfig(name='pool/b', recursive=True),
+        ],
+        destinations={'offsite': Destination(url='ssh://h/pool')},
+        remote_backup=RemoteServerConfig(target_dataset='pool/recv'),
+        client_id_file=Path('/x/id'),
+    )
+    data.update(over)
+    return BackupConfig(**data)
+
+
+@pytest.mark.unit
+class TestSameAs:
+    def test_two_independently_built_identical_configs_are_the_same(self):
+        assert _rich_config().same_as(_rich_config())
+
+    def test_a_config_is_the_same_as_itself_and_a_deepcopy(self):
+        import copy
+
+        c = _rich_config()
+        assert c.same_as(c)
+        assert c.same_as(copy.deepcopy(c))
+        assert copy.deepcopy(c).same_as(c)
+
+    def test_a_pickle_round_trip_is_the_same(self):
+        import pickle
+
+        c = _rich_config()
+        assert c.same_as(pickle.loads(pickle.dumps(c)))
+
+    def test_a_literal_only_difference_is_not_the_same_though_equal(self):
+        """`1h` and `60m` are `==` (Duration inherits timedelta's `__eq__`),
+        but are different operator-visible text: the whole point of `same_as`."""
+        a = _rich_config(check_interval=Duration('1h'))
+        b = _rich_config(check_interval=Duration('60m'))
+        assert a.check_interval == b.check_interval
+        assert a == b                       # dataclass == cannot see the literal
+        assert not a.same_as(b) and not b.same_as(a)
+
+    @pytest.mark.parametrize(
+        "path",
+        ['dataset_freq', 'retention_age', 'retention_keep', 'remote_freq',
+         'remote_retention_age', 'remote_retention_keep'],
+    )
+    def test_a_literal_only_difference_deep_in_the_tree_is_seen(self, path):
+        b = _rich_config()
+        ds = b.datasets[0]
+        if path == 'dataset_freq':
+            ds.frequency = Duration('60m')
+        elif path == 'retention_age':
+            ds.retention_rules[0] = RetentionRule(Duration('24h'), ds.retention_rules[0].keep_for)
+        elif path == 'retention_keep':
+            ds.retention_rules[0] = RetentionRule(ds.retention_rules[0].age, Duration('28d'))
+        elif path == 'remote_freq':
+            ds.remote[0].frequency = Duration('1800s')
+        elif path == 'remote_retention_age':
+            rr = ds.remote[0].retention_rules[0]
+            ds.remote[0].retention_rules[0] = RetentionRule(Duration('48h'), rr.keep_for)
+        elif path == 'remote_retention_keep':
+            rr = ds.remote[0].retention_rules[0]
+            ds.remote[0].retention_rules[0] = RetentionRule(rr.age, Duration('56d'))
+        a = _rich_config()
+        assert a == b                        # equal by value...
+        assert not a.same_as(b)              # ...different by literal
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda c: setattr(c, 'snapshot_prefix', 'other'),
+            lambda c: setattr(c, 'check_interval', Duration('6m')),
+            lambda c: setattr(c, 'api_port', 9999),
+            lambda c: setattr(c, 'api_host', '0.0.0.0'),
+            lambda c: setattr(c, 'dry_run', True),
+            lambda c: setattr(c, 'client_id_file', Path('/x/y')),
+            lambda c: setattr(c.datasets[0], 'recursive', True),
+            lambda c: setattr(c.datasets[0], 'enabled', False),
+            lambda c: setattr(c.datasets[1], 'name', 'pool/c'),
+            lambda c: c.datasets[0].remote[0].__setattr__('destination', 'elsewhere'),
+            lambda c: c.destinations['offsite'].__setattr__('url', 'ssh://other/pool'),
+            lambda c: c.destinations.update(extra=Destination(url='ssh://x/y')),
+            lambda c: setattr(c.remote_backup, 'enabled', False),
+            lambda c: setattr(c, 'remote_backup', None),
+            lambda c: c.datasets.append(DatasetConfig(name='pool/c')),
+            lambda c: c.datasets[0].retention_rules.pop(),
+            lambda c: setattr(c, 'prune_interval', None),
+            lambda c: setattr(c, 'prune_interval', Duration('2h')),
+            lambda c: setattr(c.remote_backup, 'target_dataset', 'pool/other'),
+            lambda c: setattr(c.datasets[0].remote[0], 'frequency', None),
+            lambda c: setattr(c.datasets[0].remote[0], 'frequency', Duration('31m')),
+            lambda c: c.datasets[0].remote[0].retention_rules.clear(),
+            lambda c: setattr(c.datasets[0], 'frequency', Duration('2h')),
+        ],
+        ids=[
+            'prefix', 'check_interval_value', 'api_port', 'api_host', 'dry_run',
+            'client_id_file', 'recursive', 'enabled', 'dataset_name',
+            'remote_destination', 'destination_url', 'extra_destination',
+            'remote_backup_flag', 'remote_backup_none', 'dataset_added',
+            'retention_rule_dropped', 'prune_interval_to_none', 'prune_interval_value',
+            'target_dataset', 'remote_freq_to_none', 'remote_freq_value',
+            'remote_override_emptied', 'dataset_freq_value',
+        ],
+    )
+    def test_any_value_difference_is_not_the_same(self, mutate):
+        b = _rich_config()
+        mutate(b)
+        assert not _rich_config().same_as(b)
+        assert not b.same_as(_rich_config())
+
+    def test_dataset_order_is_a_difference(self):
+        a = _rich_config()
+        b = _rich_config()
+        b.datasets.reverse()
+        assert not a.same_as(b)
+
+    def test_retention_rule_order_is_a_difference(self):
+        a = _rich_config()
+        b = _rich_config()
+        b.datasets[0].retention_rules.reverse()
+        assert not a.same_as(b)
+
+    def test_destination_dict_order_is_not_a_difference(self):
+        a = _rich_config(destinations={
+            'one': Destination(url='ssh://1/p'), 'two': Destination(url='ssh://2/p'),
+        })
+        b = _rich_config(destinations={
+            'two': Destination(url='ssh://2/p'), 'one': Destination(url='ssh://1/p'),
+        })
+        assert a.same_as(b)
+
+    def test_a_bare_timedelta_against_a_duration_compares_values_only(self):
+        """A bare `timedelta` has no literal to compare."""
+        a = _rich_config(check_interval=timedelta(minutes=5))
+        b = _rich_config(check_interval=Duration('5m'))
+        assert a.same_as(b) and b.same_as(a)
+        c = _rich_config(check_interval=Duration('6m'))
+        assert not a.same_as(c)
+
+    def test_a_timedelta_never_equals_a_non_timedelta(self):
+        a = _rich_config(check_interval=Duration('5m'))
+        b = _rich_config(check_interval=300)
+        assert not a.same_as(b) and not b.same_as(a)
+
+    def test_none_against_a_value_is_a_difference_both_ways(self):
+        a = _rich_config(prune_interval=None)
+        b = _rich_config(prune_interval=Duration('1h'))
+        assert not a.same_as(b) and not b.same_as(a)
+        assert a.same_as(_rich_config(prune_interval=None))
+        c = _rich_config()
+        c.datasets[0].remote[0].frequency = None
+        assert not c.same_as(_rich_config()) and not _rich_config().same_as(c)
+
+    @pytest.mark.parametrize("other", [None, 'x', 42, {}, object()])
+    def test_a_wrong_type_is_not_the_same(self, other):
+        assert not _rich_config().same_as(other)
+
+    def test_a_subclass_is_not_the_same(self):
+        class Sub(BackupConfig):
+            pass
+
+        base = _rich_config()
+        sub = Sub(**{f: getattr(base, f) for f in base.__dataclass_fields__})
+        assert not base.same_as(sub)
+
+    def test_a_bool_is_not_an_int(self):
+        a = _rich_config(api_port=1)
+        b = _rich_config(api_port=True)
+        assert not a.same_as(b)
+
+    def test_a_config_loaded_twice_from_the_same_yaml_is_the_same(self, tmp_path):
+        f = tmp_path / 'c.yaml'
+        f.write_text(
+            "check_interval: 600s\nprune_interval: 90m\n"
+            "datasets:\n  - name: pool/data\n    frequency: 60m\n"
+            "    retention:\n      1d: 4w\n      1w: 1M\n"
+        )
+        assert BackupConfig.from_file(f).same_as(BackupConfig.from_file(f))
+
+    def test_the_same_yaml_with_one_literal_changed_is_not_the_same(self, tmp_path):
+        body = (
+            "check_interval: {ci}\n"
+            "datasets:\n  - name: pool/data\n    frequency: 1h\n"
+        )
+        a, b = tmp_path / 'a.yaml', tmp_path / 'b.yaml'
+        a.write_text(body.format(ci='1h'))
+        b.write_text(body.format(ci='60m'))
+        ca, cb = BackupConfig.from_file(a), BackupConfig.from_file(b)
+        assert ca == cb and not ca.same_as(cb)
+
+
+def _walk_dataclasses(obj, found=None):
+    """Every dataclass instance reachable from `obj` (lists, dicts, fields)."""
+    import dataclasses
+
+    found = [] if found is None else found
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        found.append(obj)
+        for f in dataclasses.fields(obj):
+            _walk_dataclasses(getattr(obj, f.name), found)
+    elif isinstance(obj, (list, tuple)):
+        for x in obj:
+            _walk_dataclasses(x, found)
+    elif isinstance(obj, dict):
+        for x in obj.values():
+            _walk_dataclasses(x, found)
+    return found
+
+
+def _changed(value):
+    """A value of the same kind that differs from `value` in VALUE."""
+    from datetime import timedelta as _td
+
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int):
+        return value + 1
+    if isinstance(value, float):
+        return value + 1.0
+    if isinstance(value, str):
+        return value + 'x'
+    if isinstance(value, Path):
+        return value / 'changed'
+    if isinstance(value, _td):
+        return Duration(value + _td(seconds=7))
+    if isinstance(value, list):
+        return value[:-1] if value else [object()]
+    if isinstance(value, dict):
+        new = dict(value)
+        new['__added__'] = next(iter(value.values())) if value else None
+        return new
+    raise AssertionError(f"extend _changed() for {type(value).__name__}")
+
+
+@pytest.mark.unit
+class TestSameAsCoversEveryField:
+    """A guard, not a sample: every field of every config dataclass must move
+    `same_as`. A new field, or a `field(compare=False)`, cannot slip through."""
+
+    def _classes_in_model(self):
+        import dataclasses
+
+        import zfsbackup.config.model as model
+
+        return {
+            obj for obj in vars(model).values()
+            if isinstance(obj, type) and dataclasses.is_dataclass(obj)
+            and obj.__module__ == model.__name__
+        }
+
+    def test_the_sample_config_reaches_every_config_dataclass(self):
+        reached = {type(o) for o in _walk_dataclasses(_rich_config())}
+        missing = self._classes_in_model() - reached
+        assert not missing, (
+            f"add {sorted(c.__name__ for c in missing)} to _rich_config so the "
+            "field guard below covers them"
+        )
+
+    def test_every_field_of_every_instance_is_detected(self):
+        import copy
+        import dataclasses
+
+        base = _rich_config()
+        instances = _walk_dataclasses(base)
+        checked = 0
+        for index, inst in enumerate(instances):
+            for f in dataclasses.fields(inst):
+                variant = copy.deepcopy(base)
+                target = _walk_dataclasses(variant)[index]
+                current = getattr(target, f.name)
+                if dataclasses.is_dataclass(current):
+                    continue                  # walked as an instance in its own right
+                assert current is not None, (
+                    f"{type(inst).__name__}.{f.name} is None in the sample config; "
+                    "give _rich_config a value"
+                )
+                setattr(target, f.name, _changed(current))
+                assert not base.same_as(variant), f"{type(inst).__name__}.{f.name}"
+                assert not variant.same_as(base), f"{type(inst).__name__}.{f.name}"
+                checked += 1
+        assert checked >= 25
+
+    def test_no_dataclass_carries_state_outside_its_fields(self):
+        """A plain attribute (not a field) is invisible to `fields()`, hence to
+        `same_as`."""
+        import dataclasses
+
+        for inst in _walk_dataclasses(_rich_config()):
+            names = {f.name for f in dataclasses.fields(inst)}
+            assert set(vars(inst)) <= names, type(inst).__name__
+
+    def test_no_field_opts_out_of_comparison(self):
+        import dataclasses
+
+        for cls in self._classes_in_model():
+            for f in dataclasses.fields(cls):
+                assert f.compare, f"{cls.__name__}.{f.name} is compare=False"
+
+    def test_duration_state_is_value_plus_literal_only(self):
+        d = Duration('1h')
+        assert set(vars(d)) <= {'_literal'}

@@ -315,9 +315,26 @@ class _SupervisorWatch:
             return False
         if not self._supervisor_gone_logged:
             self._supervisor_gone_logged = True
-            logging.getLogger(__name__).error(
-                f"supervisor {self.supervisor_pid} is gone ({reason}); exiting"
-            )
+            if (
+                not self._direct_child
+                and ppid != self._parent_at_start
+                and procident.identity(self.supervisor_pid, self.supervisor_start) == 'match'
+            ):
+                # Under `forkserver` the parent is the forkserver, not the
+                # supervisor. It died but the supervisor is alive and
+                # verified: this worker is an orphan the supervisor will
+                # replace once it has exited. Leaving is still right (the
+                # supervisor can no longer stop or reload it, and its
+                # replacement must not run beside it) -- but the supervisor
+                # is not gone.
+                logging.getLogger(__name__).error(
+                    f"forkserver exited ({reason}); supervisor "
+                    f"{self.supervisor_pid} is alive; leaving at this safe point"
+                )
+            else:
+                logging.getLogger(__name__).error(
+                    f"supervisor {self.supervisor_pid} is gone ({reason}); exiting"
+                )
         return True
 
     def _hold_workers_lock(self) -> None:
@@ -487,6 +504,32 @@ class SnapshotWorker(BaseWorker):
 
     def _get_interval(self, config: BackupConfig) -> float:
         return config.check_interval.total_seconds()
+
+    def _before_loop(self, config: BackupConfig, manager: DatasetManager) -> None:
+        """Verify that the configured datasets exist and sync their
+        `org.zfsbackup:config` properties, once per worker incarnation.
+
+        This is the supervisor's old startup/reload step, moved here so that
+        the supervisor makes no `zfs` call: a hung pool then stalls this
+        worker only, never SIGTERM, SIGHUP or the restart of the others. The
+        snapshot worker is respawned once per accepted generation, which
+        keeps "sync once per generation"; a crash-restarted one syncs again,
+        and the sync only writes differences. Both steps are advisory: a
+        failure is logged and the worker carries on. `self._should_stop`
+        (stop, supervisor gone, reload) ends either step at the next
+        dataset, and `run()` then leaves at its first safe-point check.
+        `--dry-run` writes nothing (`sync_config_property`)."""
+        logger = logging.getLogger(__name__)
+        try:
+            manager.verify_datasets(should_stop=self._should_stop)
+            if not self._should_stop():
+                logger.info("Syncing dataset configs to ZFS properties...")
+                manager.sync_all_config_properties(should_stop=self._should_stop)
+        except Exception as e:
+            logger.error(
+                f"{self.name} could not check or sync the datasets: {e}; continuing",
+                exc_info=True,
+            )
 
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
         logger = logging.getLogger(__name__)
