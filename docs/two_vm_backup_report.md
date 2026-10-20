@@ -71,7 +71,9 @@ A green harness run confirms the **happy path**, not production-readiness. Open 
   `pyproject.toml`): a clean `poetry install --without dev` cannot run the client. The
   harness works around this by `pip install requests` explicitly.
 - **High — resume is dead code**: client sends `?from=<snap>`; server never reads it
-  (`zfsbackup/api.py`). Not tested by the harness for that reason.
+  (`zfsbackup/api.py`). Not tested by the harness for that reason. *(Superseded 2026-10-19: resume was
+  finished on branch `libzfseasy-fixes` and is covered by scenario J — interrupt/resume, stale token,
+  in-flight pin, dataset collision.)*
 - **High — incrementals use `-i`, not `-I`** (`zfsbackup/remote.py:198`): snapshots created
   *between* two backups are never replicated. **Live-confirmed** in this run — the server
   was missing intermediate snapshots (e.g. `…114800`, `…114900`) that the client had.

@@ -1,3 +1,10 @@
+"""Types for libzfseasy: ZFS objects, their properties and the validators for names.
+
+Pickling note: instances store native properties by their integer index into the class's property-name list
+(`_prop_names`). That layout changes whenever property names are added (for example for a newer OpenZFS), so pickles
+of libzfseasy objects are NOT stable across versions of this library -- do not persist them; rebuild objects from
+`zfs list` / `zfs get` output instead.
+"""
 import re
 from typing import Optional, Dict, Iterable, Tuple, Union
 
@@ -19,19 +26,29 @@ class PropertyNames:
                   'snapdir', 'special_small_blocks', 'utf8only', 'version', 'vscan', 'xattr', 'zoned',
                   # OpenZFS 2.4 default per-entity quotas
                   'defaultuserquota', 'defaultgroupquota', 'defaultprojectquota', 'defaultuserobjquota',
-                  'defaultgroupobjquota', 'defaultprojectobjquota']
+                  'defaultgroupobjquota', 'defaultprojectobjquota',
+                  # read-only; only present while a `zfs receive -s` is partial (`-` otherwise)
+                  'receive_resume_token']
 
-    volume = ['volblocksize', 'volsize']
+    volume = ['volblocksize', 'volsize',
+              # OpenZFS 2.4 (volthreading) and the properties volumes share with filesystems
+              'prefetch', 'special_small_blocks', 'volthreading',
+              # read-only; only present while a `zfs receive -s` is partial (`-` otherwise)
+              'receive_resume_token']
 
     snapshot = ['clones', 'compressratio', 'context', 'createtxg', 'creation', 'defcontext', 'defer_destroy',
                 'encryption', 'fscontext', 'guid', 'logicalreferenced', 'mlslabel', 'objsetid', 'primarycache',
                 'refcompressratio', 'referenced', 'rootcontext', 'secondarycache', 'type', 'used', 'userrefs',
-                'written']
+                'written',
+                # present on encrypted snapshots
+                'encryptionroot', 'keystatus']
 
     fs_snap = ['acltype', 'casesensitivity', 'devices', 'exec', 'nbmand', 'normalization', 'setuid', 'utf8only',
-               'version', 'xattr', 'prefetch']
+               'version', 'xattr', 'prefetch',
+               'defaultuserquota', 'defaultgroupquota', 'defaultprojectquota', 'defaultuserobjquota',
+               'defaultgroupobjquota', 'defaultprojectobjquota']
 
-    vol_snap = ['volsize']
+    vol_snap = ['volsize', 'prefetch']
 
     bookmark = ['createtxg', 'creation', 'guid', 'logicalreferenced', 'referenced', 'type']
 
@@ -40,13 +57,19 @@ class PropertyNames:
                'quota', 'readonly', 'recordsize', 'refquota', 'refreservation', 'reservation', 'secondarycache',
                'setuid', 'sharenfs', 'sharesmb', 'snapdir', 'snapshot_limit', 'utf8only', 'version', 'volblocksize',
                'volsize', 'vscan', 'xattr', 'zoned', 'defaultuserquota', 'defaultgroupquota', 'defaultprojectquota',
-               'defaultuserobjquota', 'defaultgroupobjquota', 'defaultprojectobjquota']
+               'defaultuserobjquota', 'defaultgroupobjquota', 'defaultprojectobjquota', 'volthreading']
 
     mount_opts = ['atime', 'noatime', 'auto', 'noauto' , 'dev', 'nodev', 'exec', 'noexec', 'ro', 'rw', 'relatime',
                   'norelatime', 'suid', 'nosuid', 'xattr', 'noxattr', 'mand', 'nomand']
     mount_props = ['context', 'fscontext', 'defcontext', 'rootcontext']
 
     all = apple + dataset + filesystem + volume + snapshot + fs_snap + vol_snap + bookmark + ['all']
+
+
+class InvalidNameError(ValueError):
+    """A dataset, snapshot or bookmark name that this library refuses (a `ValueError`, so existing handlers keep
+    working). Raised only for name-shape failures; parsers of zfs output catch exactly this to skip a row that zfs
+    allows but libzfseasy cannot represent."""
 
 
 class Validate:
@@ -75,13 +98,13 @@ class Validate:
     @staticmethod
     def _length(s: str, what: str) -> None:
         if len(s) > Validate.max_name_len:
-            raise ValueError(s + ' is not a valid ZFS ' + what + ' name')
+            raise InvalidNameError(s + ' is not a valid ZFS ' + what + ' name')
 
     @staticmethod
     def _dots(shorts, s: str, what: str) -> None:
         # OpenZFS rejects `.` and `..` as snapshot / bookmark short names.
         if any(x in ('.', '..') for x in shorts):
-            raise ValueError(s + ' is not a valid ZFS ' + what + ' name')
+            raise InvalidNameError(s + ' is not a valid ZFS ' + what + ' name')
 
     @staticmethod
     def zfsname(s: str) -> None:
@@ -131,31 +154,31 @@ class Validate:
     def dataset(s: str) -> None:
         Validate._length(s, 'dataset')
         if not bool(re.fullmatch(Validate.pool + Validate.ds + '*', s, re.ASCII)):
-            raise ValueError(s + ' is not a valid ZFS dataset name')
+            raise InvalidNameError(s + ' is not a valid ZFS dataset name')
 
     @staticmethod
     def snapshot(s: str) -> None:
         Validate._length(s, 'snapshot')
         if not bool(re.fullmatch(Validate.pool + Validate.ds + '*@' + Validate.short, s, re.ASCII)):
-            raise ValueError(s + ' is not a valid ZFS snapshot name')
+            raise InvalidNameError(s + ' is not a valid ZFS snapshot name')
         Validate._dots([s.partition('@')[2]], s, 'snapshot')
 
     @staticmethod
     def snapshots(s: str) -> None:
         # The list as a whole may be long; the length limit applies to each `dataset@short` it expands to.
         if not bool(re.fullmatch(Validate.pool + Validate.ds + '*@' + Validate.snaps, s, re.ASCII)):
-            raise ValueError(s + ' is not a valid ZFS snapshot name')
+            raise InvalidNameError(s + ' is not a valid ZFS snapshot name')
         ds, _, rest = s.partition('@')
         shorts = [p for item in rest.split(',') for p in item.split('%') if p]
         if any(len(ds) + 1 + len(p) > Validate.max_name_len for p in shorts):
-            raise ValueError(s + ' is not a valid ZFS snapshot name')
+            raise InvalidNameError(s + ' is not a valid ZFS snapshot name')
         Validate._dots(shorts, s, 'snapshot')
 
     @staticmethod
     def bookmark(s: str) -> None:
         Validate._length(s, 'bookmark')
         if not bool(re.fullmatch(Validate.pool + Validate.ds + '*#' + Validate.short, s, re.ASCII)):
-            raise ValueError(s + ' is not a valid ZFS bookmark name')
+            raise InvalidNameError(s + ' is not a valid ZFS bookmark name')
         Validate._dots([s.partition('#')[2]], s, 'bookmark')
 
 
@@ -183,10 +206,10 @@ class Property:
         return self._received
 
     def __str__(self):
-        return self._value
+        return str(self._value)
 
     def __repr__(self):
-        return self._value
+        return str(self._value)
 
 
 PropertyValue = Union[Property, str, None]
@@ -195,6 +218,8 @@ PropertyItem = Tuple[str, Optional[Property]]
 
 
 class ZFS:
+    """Base of all ZFS objects. Pickles are not stable across library versions (property index layout); see the
+    module docstring."""
 
     _prop_names = []
 

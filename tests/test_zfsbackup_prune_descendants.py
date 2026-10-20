@@ -873,3 +873,147 @@ class TestMissingAndFailingDescendants:
         prune(manager, dsi)
         assert fz.destroyed == [B, C]
         assert fz.exists_calls == []
+
+
+# ---------------------------------------------------------------------------
+# C1: `org.zfsbackup:inflight.<dest>` = `<from>,<to>` pins both ends of a send
+# ---------------------------------------------------------------------------
+
+from zfsbackup.backup_manager import PROP_INFLIGHT_PREFIX as INFLIGHT  # noqa: E402
+
+
+class TestInflightPinsProtectFromPruning:
+    """The parent's retention prunes B and C (A is newest and kept). A pin that
+    names either end of a running or resumable send keeps it."""
+
+    # -- the dataset's own pin ----------------------------------------------
+
+    @pytest.mark.parametrize('recursive', [False, True], ids=['plain', 'recursive'])
+    def test_a_pin_naming_both_ends_keeps_both(self, fz, recursive):
+        fz.props[PARENT] = [(INFLIGHT + 'offsite', f'{B},{C}', 'local')]
+        manager, dsi = make_manager(recursive=recursive)
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()
+
+    @pytest.mark.parametrize('recursive', [False, True], ids=['plain', 'recursive'])
+    def test_the_from_side_alone_is_kept(self, fz, recursive):
+        fz.props[PARENT] = [(INFLIGHT + 'offsite', f'{B},{A}', 'local')]
+        manager, dsi = make_manager(recursive=recursive)
+        prune(manager, dsi)
+        assert fz.destroyed == [C]                      # B is the `from` end: kept
+
+    @pytest.mark.parametrize('recursive', [False, True], ids=['plain', 'recursive'])
+    def test_the_to_side_alone_is_kept(self, fz, recursive):
+        fz.props[PARENT] = [(INFLIGHT + 'offsite', f'{A},{C}', 'local')]
+        manager, dsi = make_manager(recursive=recursive)
+        prune(manager, dsi)
+        assert fz.destroyed == [B]
+
+    def test_a_full_send_pin_with_an_empty_from_keeps_the_target(self, fz):
+        fz.props[PARENT] = [(INFLIGHT + 'offsite', f',{B}', 'local')]
+        manager, dsi = make_manager(recursive=False)
+        prune(manager, dsi)
+        assert fz.destroyed == [C]
+
+    def test_a_received_pin_counts(self, fz):
+        fz.props[PARENT] = [(INFLIGHT + 'offsite', f'{B},{C}', 'received')]
+        manager, dsi = make_manager(recursive=False)
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()
+
+    def test_a_pin_of_a_destination_that_is_not_configured_still_protects(self, fz):
+        fz.props[PARENT] = [(INFLIGHT + 'long-gone', f'{B},{C}', 'local')]
+        manager, dsi = make_manager(recursive=False)
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()
+
+    def test_a_pin_and_an_anchor_combine(self, fz):
+        fz.props[PARENT] = [
+            (ANCHOR + 'offsite', B, 'local'),
+            (INFLIGHT + 'offsite', f'{B},{C}', 'local'),
+        ]
+        manager, dsi = make_manager(recursive=False)
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()
+
+    def test_a_malformed_pin_still_keeps_the_name_it_carries(self, fz):
+        fz.props[PARENT] = [(INFLIGHT + 'offsite', B, 'local')]       # no comma
+        manager, dsi = make_manager(recursive=False)
+        prune(manager, dsi)
+        assert fz.destroyed == [C]
+
+    def test_a_dash_pin_protects_nothing(self, fz):
+        fz.props[PARENT] = [(INFLIGHT + 'offsite', '-', 'local')]
+        manager, dsi = make_manager(recursive=False)
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+
+    def test_without_a_pin_both_are_pruned(self, fz):
+        """The control for every test above."""
+        fz.props[PARENT] = []
+        manager, dsi = make_manager(recursive=False)
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]
+
+    def test_dry_run_destroys_nothing_either_way(self, fz):
+        fz.props[PARENT] = [(INFLIGHT + 'offsite', f'{B},{A}', 'local')]
+        manager, dsi = make_manager(recursive=False, dry_run=True)
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()
+
+    # -- a descendant's pin (the parent's recursive destroy would take it) ----
+
+    def test_a_child_pin_keeps_both_names_on_a_recursive_parent(self, fz, caplog):
+        fz.props[CHILD] = [(INFLIGHT + 'offsite', f'{B},{C}', 'local')]
+        manager, dsi = make_manager()
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+        fz.destroy.assert_not_called()
+        assert f'{INFLIGHT}offsite on {CHILD}' in caplog.text
+
+    def test_a_child_pin_from_side_is_kept(self, fz):
+        fz.props[CHILD] = [(INFLIGHT + 'offsite', f'{B},{A}', 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.destroyed == [C]
+
+    def test_a_child_pin_with_an_empty_from_keeps_only_the_target(self, fz):
+        fz.props[CHILD] = [(INFLIGHT + 'offsite', f',{C}', 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.destroyed == [B]
+
+    def test_a_grandchild_pin_counts(self, fz):
+        fz.props[CHILD + '/g'] = [(INFLIGHT + 'x', f'{B},{A}', 'received')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        assert fz.destroyed == [C]
+
+    def test_a_pin_on_the_parent_and_one_on_a_child_combine_on_a_recursive_parent(self, fz):
+        fz.props[PARENT] = [(INFLIGHT + 'offsite', f'{A},{B}', 'local')]
+        fz.props[CHILD] = [(INFLIGHT + 'other', f',{C}', 'local')]
+        manager, dsi = make_manager()
+        prune(manager, dsi)
+        fz.destroy.assert_not_called()
+
+    def test_a_non_recursive_parent_ignores_a_childs_pin(self, fz):
+        fz.props[CHILD] = [(INFLIGHT + 'offsite', f'{B},{C}', 'local')]
+        manager, dsi = make_manager(recursive=False)
+        prune(manager, dsi)
+        assert fz.destroyed == [B, C]                      # the child is its own dataset
+
+    def test_the_descendant_protection_reports_pin_names_and_reasons(self, fz):
+        fz.props[CHILD] = [
+            (INFLIGHT + 'offsite', f'{B},{C}', 'local'),
+            (ANCHOR + 'x', A, 'local'),
+        ]
+        manager, dsi = make_manager()
+        protected = manager._descendant_anchor_protection(dsi)
+        assert set(protected) == {A, B, C}
+        assert protected[B] == f'{INFLIGHT}offsite on {CHILD}'
+        assert protected[A] == f'{ANCHOR}x on {CHILD}'
+
+    def test_a_descendant_pin_with_a_dash_or_nothing_adds_no_names(self, fz):
+        fz.props[CHILD] = [(INFLIGHT + 'a', '-', 'local'), (INFLIGHT + 'b', ',', 'local')]
+        manager, dsi = make_manager()
+        assert manager._descendant_anchor_protection(dsi) == {}

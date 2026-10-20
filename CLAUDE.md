@@ -101,6 +101,16 @@ Properties are stored internally as integer-indexed lists (using `_prop_names` c
 **[zfsbackup/workers.py](zfsbackup/workers.py)** — the per-dataset work runs here. `BaseWorker.run` builds a `DatasetManager`, iterates its datasets calling an abstract `_process_dataset`, and sleeps in short slices (`_wait`), checking at every safe point (loop top, between datasets and remote destinations, each slice) for an `ExitReason`: STOP, then SUPERVISOR_GONE, then RELOAD. RELOAD means the shared `ReloadEpoch` moved past the worker's `born_epoch`, and the worker exits with code 3 (`WORKER_EXIT_RELOAD`) to be respawned on the new config (`_SupervisorWatch` — an orphaned worker exits on its own, never mid-transfer). Workers receive the supervisor's config object and never open the config DB. Subclasses: `SnapshotWorker` (first, once per incarnation, checks the datasets exist and syncs their `org.zfsbackup:config` property — work the supervisor used to do), `PruningWorker`, `RemoteBackupWorker` (lazy-imports `RemoteBackupManager`), `ApiWorker` (binds the HTTP server in its main thread and exits 1 if it cannot, so the supervisor's backoff applies; on reload it drains in-flight receives through `api.StreamGate`, answering 503 + retry meanwhile, then calls `server.shutdown()`). Every worker holds `<db>.workers.lock` `LOCK_SH` for life.
 
 **[zfsbackup/remote.py](zfsbackup/remote.py)** / **[zfsbackup/api.py](zfsbackup/api.py)** — remote send/receive transfer (`RemoteBackupManager`) and the HTTP control API (`create_app`). Remote backup is **not deployment-ready** (no auth/TLS) — see [docs/production_readiness_report.md](docs/production_readiness_report.md).
+Resume: the client fetches the server's `receive_resume_token`, decodes it with `zfs.send.resume_info`
+(`zfs send -nv -t`) and resumes only a managed local snapshot of the same dataset matched **by guid**
+with no send flags; definitive staleness → a fresh send, anything uncertain → skip the cycle. `/stream`
+takes `?mode=fresh|resume`; on `fresh` the server aborts stale partial state (`zfs receive -A`). The anchor
+records the snapshot actually sent (never backwards) and a resumed older snapshot is followed by a send to
+`latest` in the same cycle. `org.zfsbackup:inflight.<dest>` = `<from>,<to>` pins snapshots while they are
+sent (the pruner protects them like anchors; `rename` copies/clears them like anchors). Two client
+datasets mapping to one server dataset are refused (409); a concurrent stream for the same server dataset
+gets a retryable `busy`. Client and server must be upgraded together (an old server's `/resume_token` 500 makes a
+new client skip; an old client's `/stream` without `mode` is refused).
 
 **[zfsbackup/config/](zfsbackup/config/)** — the configuration package. `model.py` holds the runtime
 value types (`BackupConfig`, `DatasetConfig`, `Duration`, …) and `__init__.py` re-exports them, so
@@ -210,7 +220,8 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_signals.py` | Fork-pinned SIGINT/SIGTERM reset in worker children |
 | `tests/test_zfsbackup_stopflag.py` | `StopFlag` semantics |
 | `tests/test_zfsbackup_stop_signals.py` | Real daemon: kill a worker, then signal the supervisor — must exit, not wedge |
-| `tests/test_zfsbackup_api.py` | HTTP control API |
+| `tests/test_zfsbackup_api.py` | HTTP control API (stream modes, abort, 409 collision, busy lock, receive error reporting) |
+| `tests/test_zfsbackup_api_bind.py` | API server binds without a reverse DNS lookup |
 | `tests/test_zfsbackup_remote.py` | `RemoteBackupManager`, `ClientIdentity` |
 | `tests/test_zfsbackup_config.py` | Config loading, retention collapse, per-destination rules |
 | `tests/test_zfsbackup_duration.py` | The `Duration` type and its literal preservation |

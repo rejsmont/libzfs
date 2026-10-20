@@ -5,7 +5,7 @@ import pickle
 import pytest
 from libzfseasy.types import (
     Validate, Property, PropertyNames, ZFS, Dataset, Filesystem, 
-    Volume, Snapshot, SnapshotRange, Bookmark
+    Volume, Snapshot, SnapshotRange, Bookmark, InvalidNameError
 )
 
 
@@ -169,6 +169,18 @@ class TestProperty:
         assert str(prop) == 'lz4'
         assert repr(prop) == 'lz4'
     
+    @pytest.mark.unit
+    @pytest.mark.parametrize('value, text', [(5, '5'), (0, '0'), (1.5, '1.5'), (True, 'True'), ('lz4', 'lz4')])
+    def test_property_str_repr_of_non_string_value(self, value, text):
+        """__str__/__repr__ always return a str (a non-str return raises TypeError); `.value` stays as given."""
+        prop = Property(value)
+        assert str(prop) == text
+        assert repr(prop) == text
+        assert isinstance(str(prop), str) and isinstance(repr(prop), str)
+        assert prop.value == value
+        assert '%s' % prop == text
+        assert ','.join(str(p) for p in [prop, prop]) == text + ',' + text
+
     @pytest.mark.unit
     def test_property_value_setter(self):
         """Test setting property value."""
@@ -946,7 +958,9 @@ class TestOpenZFS24DefaultQuotas:
         assert PropertyNames.mutable.index('quota') == 15
         assert PropertyNames.mutable.index('volsize') == 30
         assert PropertyNames.mutable.index('xattr') == 32
-        assert len(PropertyNames.filesystem) == 37 and len(PropertyNames.mutable) == 40
+        assert PropertyNames.filesystem.index('zoned') == 30
+        assert PropertyNames.mutable.index('zoned') == 33
+        assert PropertyNames.mutable.index('defaultprojectobjquota') == 39
 
     @pytest.mark.unit
     @pytest.mark.parametrize('name', DEFAULT_QUOTA_NAMES)
@@ -1253,3 +1267,240 @@ class TestObjectsWithoutExtraPropsAttribute:
         assert list(obj.properties) == []
         obj.update({'futureprop': 'x'}, lenient=True)
         assert obj['futureprop'].value == 'x'
+
+
+class TestInvalidNameError:
+    """Name-shape failures raise InvalidNameError (a ValueError); other validators keep raising plain ValueError."""
+
+    BAD_DATASETS = ['pool/.system', 'pool/-x', 'pool/:x', 'pool/a ', 'pool/ a', '', '1pool/fs', 'pool//fs']
+    BAD_SNAPSHOTS = ['pool/fs@ manual', 'pool/fs@manual ', 'pool/.system@snap', 'pool/fs@', 'pool/fs@.', 'pool/fs@..',
+                     'pool/fs']
+    BAD_BOOKMARKS = ['pool/-x#bm', 'pool/fs# bm', 'pool/fs#bm ', 'pool/fs#.', 'pool/fs#..', 'pool/fs']
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', BAD_DATASETS)
+    def test_dataset(self, name):
+        with pytest.raises(InvalidNameError):
+            Validate.dataset(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', BAD_SNAPSHOTS)
+    def test_snapshot(self, name):
+        with pytest.raises(InvalidNameError):
+            Validate.snapshot(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', ['pool/fs@ manual', 'pool/.system@snap', 'pool/fs@.', 'pool/fs@a,..', 'pool/fs@%',
+                                      'pool/fs@a%b%c', 'pool/fs@'])
+    def test_snapshots(self, name):
+        with pytest.raises(InvalidNameError):
+            Validate.snapshots(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', BAD_BOOKMARKS)
+    def test_bookmark(self, name):
+        with pytest.raises(InvalidNameError):
+            Validate.bookmark(name)
+
+    @pytest.mark.unit
+    def test_length_over_255(self):
+        long_ds = 'pool/' + 'a' * 251                      # 256 characters
+        assert len(long_ds) == 256
+        with pytest.raises(InvalidNameError):
+            Validate.dataset(long_ds)
+        with pytest.raises(InvalidNameError):
+            Validate.snapshot('pool/fs@' + 'a' * 250)
+        with pytest.raises(InvalidNameError):
+            Validate.bookmark('pool/fs#' + 'a' * 250)
+        with pytest.raises(InvalidNameError):
+            Validate.snapshots('pool/fs@' + 'a' * 250)
+        Validate.dataset('pool/' + 'a' * 250)             # exactly 255 is fine
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('validator, name', [
+        (Validate.snapshot, 'pool/fs@.'), (Validate.snapshot, 'pool/fs@..'),
+        (Validate.snapshots, 'pool/fs@a,.'), (Validate.snapshots, 'pool/fs@a%..'),
+        (Validate.bookmark, 'pool/fs#.'), (Validate.bookmark, 'pool/fs#..'),
+    ])
+    def test_dots_checks(self, validator, name):
+        with pytest.raises(InvalidNameError):
+            validator(name)
+
+    @pytest.mark.unit
+    def test_is_a_value_error(self):
+        assert issubclass(InvalidNameError, ValueError)
+        with pytest.raises(ValueError):
+            Validate.dataset('pool/.system')
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('validator, value', [
+        (Validate.attribute, 'not_a_property'), (Validate.attribute, 'bad name!'),
+        (Validate.type, 'bogus'), (Validate.source, 'bogus'), (Validate.zfsname, 'bad name!'),
+        (Validate.propfield, 'bogus'),
+    ])
+    def test_other_validators_are_plain_value_errors(self, validator, value):
+        with pytest.raises(ValueError) as info:
+            validator(value)
+        assert not isinstance(info.value, InvalidNameError)
+
+    @pytest.mark.unit
+    def test_valid_names_do_not_raise(self):
+        Validate.dataset('pool/fs')
+        Validate.dataset('pool/a b')
+        Validate.snapshot('pool/fs@snap')
+        Validate.snapshot('pool/fs@a b')
+        Validate.snapshots('pool/fs@a,b%c')
+        Validate.bookmark('pool/fs#bm')
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('cls', [Dataset, Filesystem, Volume])
+    @pytest.mark.parametrize('name', ['tank/.system', 'pool/-x', 'pool/:x', 'pool/a ', 'pool/ a'])
+    def test_constructors_raise_it(self, cls, name):
+        with pytest.raises(InvalidNameError):
+            cls(name)
+
+    @pytest.mark.unit
+    def test_snapshot_and_bookmark_constructors_raise_it(self):
+        fs = Filesystem('pool/fs')
+        with pytest.raises(InvalidNameError):
+            Snapshot(fs, ' manual')
+        with pytest.raises(InvalidNameError):
+            Snapshot(fs, 'manual ')
+        with pytest.raises(InvalidNameError):
+            Bookmark(fs, '..')
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name, dstype', [
+        ('tank/.system', 'filesystem'), ('tank/.system', 'volume'), ('tank/.system', 'dataset'),
+        ('pool/-x', 'filesystem'), ('pool/:x', 'filesystem'), ('pool/a ', 'filesystem'), ('pool/ a', 'filesystem'),
+        ('pool/fs@ manual', 'snapshot'), ('pool/fs@manual ', 'snapshot'), ('pool/.system@snap', 'snapshot'),
+        ('pool/-x#bm', 'bookmark'), ('pool/fs# bm', 'bookmark'),
+    ])
+    def test_from_name_raises_it(self, name, dstype):
+        with pytest.raises(InvalidNameError):
+            ZFS.from_name(name, dstype)
+
+    @pytest.mark.unit
+    def test_from_name_with_a_bad_type_is_not_an_invalid_name(self):
+        with pytest.raises(ValueError, match='not a valid ZFS type') as info:
+            ZFS.from_name('pool/fs', 'bogus')
+        assert not isinstance(info.value, InvalidNameError)
+
+    @pytest.mark.unit
+    def test_from_name_valid(self):
+        assert isinstance(ZFS.from_name('pool/fs', 'filesystem'), Filesystem)
+        assert isinstance(ZFS.from_name('pool/fs@snap', 'snapshot'), Snapshot)
+        assert isinstance(ZFS.from_name('pool/fs#bm', 'bookmark'), Bookmark)
+
+
+class TestPropertyNamesAdditions:
+    """Native properties added to the per-type tables; each table only ever grows at its end."""
+
+    VOLUME_NAMES = ['prefetch', 'special_small_blocks', 'volthreading']
+    SNAPSHOT_NAMES = ['encryptionroot', 'keystatus']
+
+    @staticmethod
+    def _names(obj):
+        return list(obj._prop_names)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', ['receive_resume_token'] + VOLUME_NAMES + SNAPSHOT_NAMES + DEFAULT_QUOTA_NAMES)
+    def test_new_names_are_known(self, name):
+        assert name in PropertyNames.all
+        Validate.attribute(name)
+
+    @pytest.mark.unit
+    def test_receive_resume_token_is_a_read_only_filesystem_and_volume_property(self):
+        assert PropertyNames.filesystem[-1] == 'receive_resume_token'
+        assert PropertyNames.volume[-1] == 'receive_resume_token'
+        assert 'receive_resume_token' not in PropertyNames.mutable
+        for table in (PropertyNames.snapshot, PropertyNames.fs_snap, PropertyNames.vol_snap,
+                      PropertyNames.bookmark, PropertyNames.dataset):
+            assert 'receive_resume_token' not in table
+        assert PropertyNames.all.count('receive_resume_token') == 2
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('cls', [Filesystem, Volume])
+    def test_filesystem_and_volume_accept_receive_resume_token(self, cls):
+        token = '1-c0858fc6f-c0-789c'
+        obj = cls('pool/x', {'receive_resume_token': Property(token)})
+        assert obj['receive_resume_token'].value == token
+        assert 'receive_resume_token' in self._names(obj)
+        assert 'receive_resume_token' not in obj._extra_props
+        obj.check_property('receive_resume_token')
+        assert cls('pool/y', {'receive_resume_token': token})['receive_resume_token'].value == token
+
+    @pytest.mark.unit
+    def test_receive_resume_token_is_not_a_snapshot_or_bookmark_property(self):
+        for obj in (Snapshot(Filesystem('pool/fs'), 's'), Snapshot(Volume('pool/v'), 's'),
+                    Bookmark(Filesystem('pool/fs'), 'b'), Dataset('pool/d')):
+            with pytest.raises(ValueError):
+                obj.check_property('receive_resume_token')
+
+    @pytest.mark.unit
+    def test_receive_resume_token_is_never_settable_by_name_in_the_mutable_table(self):
+        assert 'receive_resume_token' not in PropertyNames.mutable
+        assert PropertyNames.mutable[-1] == 'volthreading'
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', VOLUME_NAMES)
+    def test_volume_accepts_the_new_names(self, name):
+        assert name in PropertyNames.volume
+        vol = Volume('pool/v', {name: Property('x', 'local')})
+        assert vol[name].value == 'x'
+        assert name in self._names(vol)
+        assert name not in vol._extra_props
+        vol.check_property(name)
+
+    @pytest.mark.unit
+    def test_only_volthreading_is_newly_mutable(self):
+        assert PropertyNames.mutable[-1] == 'volthreading'
+        assert PropertyNames.mutable.count('volthreading') == 1
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', SNAPSHOT_NAMES)
+    @pytest.mark.parametrize('ds', [Filesystem('pool/fs'), Volume('pool/v'), Dataset('pool/d')])
+    def test_every_snapshot_accepts_encryptionroot_and_keystatus(self, name, ds):
+        assert name in PropertyNames.snapshot
+        snap = Snapshot(ds, 's', {name: Property('pool/enc')})
+        assert snap[name].value == 'pool/enc'
+        assert name in self._names(snap)
+        snap.check_property(name)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', DEFAULT_QUOTA_NAMES)
+    def test_filesystem_snapshot_accepts_the_default_quotas(self, name):
+        assert name in PropertyNames.fs_snap
+        snap = Snapshot(Filesystem('pool/fs'), 's', {name: Property('5G')})
+        assert snap[name].value == '5G'
+        assert name in self._names(snap)
+        assert name in self._names(Snapshot(Dataset('pool/d'), 's'))
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('name', DEFAULT_QUOTA_NAMES)
+    def test_volume_snapshot_rejects_the_default_quotas(self, name):
+        assert name not in self._names(Snapshot(Volume('pool/v'), 's'))
+        with pytest.raises(ValueError):
+            Snapshot(Volume('pool/v'), 's').check_property(name)
+
+    @pytest.mark.unit
+    def test_vol_snap_table(self):
+        assert PropertyNames.vol_snap == ['volsize', 'prefetch']
+
+    @pytest.mark.unit
+    def test_volume_snapshot_accepts_volsize_and_prefetch(self):
+        snap = Snapshot(Volume('pool/v'), 's', {'volsize': Property('1G'), 'prefetch': Property('all')})
+        assert snap['volsize'].value == '1G'
+        assert snap['prefetch'].value == 'all'
+
+    @pytest.mark.unit
+    def test_prefetch_is_also_a_filesystem_snapshot_property(self):
+        assert 'prefetch' in PropertyNames.fs_snap
+        assert Snapshot(Filesystem('pool/fs'), 's', {'prefetch': 'all'})['prefetch'].value == 'all'
+
+    @pytest.mark.unit
+    def test_snapshots_still_reject_unrelated_names(self):
+        with pytest.raises(ValueError):
+            Snapshot(Volume('pool/v'), 's').check_property('xattr')
+        with pytest.raises(ValueError):
+            Snapshot(Filesystem('pool/fs'), 's').check_property('volsize')

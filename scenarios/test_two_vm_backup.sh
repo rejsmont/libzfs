@@ -29,7 +29,20 @@
 #   I  received datasets are pruned NON-recursively: the client dataset is `recursive: true`, the server's copy
 #      has a child with its own long retention, and the server's pruner removes the parent's old snapshots
 #      without ever taking the child's same-named ones (a recursive destroy would)
-# H and I need a real pool but little space; they run after E-G, and also with --no-big.
+#   J  interrupted-transfer RESUME (needs a tree that has `zfs.send.resume_info` and `/stream?mode=`; skipped with
+#      a warning otherwise). Runs on fresh pools after I; the client's snapshot frequency is 1d so every snapshot
+#      is one the scenario takes itself:
+#        J1  a throttled 400 MiB send is killed mid-stream (kill -9 of the client unit): the server keeps a
+#            receive_resume_token and the client its `inflight.<dest>` pin; after a newer snapshot and a restart the
+#            log shows "Resumed <ds>@<token's snap> (from ...)" and then a follow-up send to the latest snapshot in
+#            the same cycle; token cleared, anchor == latest, no pin left
+#        J2  stale token: interrupt again, destroy the token's TARGET snapshot, restart: WARNING "Not resuming ...
+#            sending fresh", the server discards the partial state (`zfs receive -A`), the incremental succeeds
+#        J3  the in-flight pin protects: with the server down and the pin set, the client's pruner (20s) takes an
+#            expired control snapshot but never the pinned one; after the server returns the resume completes
+#        J4  D7: a second client dataset (own pool) whose server path collides is refused with 409 at negotiate;
+#            the first dataset's server copy is untouched
+# H, I and J need a real pool but little space (J: ~1.2 GiB per VM); they run after E-G, and also with --no-big.
 # E-G throttle the client's egress with `tc` (tbf) so a send lasts long enough to act on; the
 # throttle is always removed again (also on error). They write ~3 GiB per VM: the VMs need ~10G disk
 # (`multipass set local.<vm>.disk=10G` while stopped; VM_DISK=10G for a new VM).
@@ -39,7 +52,11 @@
 #   ./scenarios/test_two_vm_backup.sh --keep     # leave daemons + pools running for inspection
 #   ./scenarios/test_two_vm_backup.sh --keep-pools
 #   ./scenarios/test_two_vm_backup.sh --no-big   # scenarios A-D only (skip the slow E-G)
+#   ./scenarios/test_two_vm_backup.sh --only-j   # provision, then only scenario J (fresh pools of its own)
 #   ./scenarios/test_two_vm_backup.sh --purge    # delete the two VMs (and only those) at the end
+#   SRC_REF=<commit-ish> ./scenarios/test_two_vm_backup.sh   # ship that tree instead of HEAD; for uncommitted work use
+#                                                # SRC_REF=$(git stash create) (a commit of the working tree; the tree
+#                                                # and the stash list are untouched; empty when the tree is clean)
 #
 # Requires: multipass on the host (macOS/Linux). No sudo needed on the host.
 #
@@ -47,7 +64,7 @@
 # run at all — it (1) installs `requests` explicitly (it is imported by the client but
 # missing from pyproject dependencies) and (2) binds the server API to 0.0.0.0 despite
 # there being NO authentication/TLS on that API. Do not treat a green run here as a
-# security sign-off. Snapshot resume is NOT tested because it is unfinished server-side.
+# security sign-off.
 
 set -uo pipefail
 
@@ -75,6 +92,14 @@ LOG="/var/log/zfsbackup.log"
 IMG_DIR="${IMG_DIR:-/var/tmp}"            # pool backing files; NOT /tmp (a tmpfs, i.e. RAM, on these VMs)
 DISK_SIZE="${DISK_SIZE:-5g}"                # sparse backing files; E-G write up to ~3 GiB
 
+SRC_REF="${SRC_REF:-HEAD}"                # git ref (commit-ish) whose tree is shipped to the VMs
+
+# Knobs the J scenarios turn (the defaults reproduce the A-I configs exactly)
+SERVER_PRUNE="5m"                          # server prune_interval
+CLIENT_SNAP_FREQ="30s"                     # dataset-level frequency of $SOURCE_DS (snapshot worker)
+CLIENT_PRUNE="1m"                          # client prune_interval
+CLIENT_RETENTION_YAML=$'      "1m": "10m"\n      "5m": "1h"'   # retention items of $SOURCE_DS (6-space indented)
+
 VM_CPUS="${VM_CPUS:-1}"
 VM_MEM="${VM_MEM:-1G}"
 VM_DISK="${VM_DISK:-10G}"
@@ -84,12 +109,13 @@ HEALTH_TIMEOUT=60
 SNAP_TIMEOUT=120         # ~4 snapshot periods
 
 # Flags
-PURGE=0; KEEP_POOLS=0; KEEP=0; BIG=1
+PURGE=0; KEEP_POOLS=0; KEEP=0; BIG=1; ONLY_J=0
 for arg in "$@"; do
     case "$arg" in
         --purge)      PURGE=1 ;;
         --keep-pools) KEEP_POOLS=1 ;;
         --no-big)     BIG=0 ;;
+        --only-j)     ONLY_J=1 ;;     # provision + scenario J only (A-I skipped): for iterating on J
         --keep)       KEEP=1; KEEP_POOLS=1 ;;
         -h|--help)    grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; exit 2 ;;
@@ -162,14 +188,14 @@ install_stack() {
         if [ -n "$need" ]; then apt-get update -qq && apt-get install -y -qq $need; fi
     ' || die "package install failed on $vm"
 
-    # Ship the current repo (committed HEAD) into the VM and extract. Write the archive to
+    # Ship the tree of $SRC_REF (default: committed HEAD) into the VM and extract. Write the archive to
     # a host temp file first, then transfer the file (avoids proxying host stdin through exec).
     step "Copying source into $vm:$SRC_DIR"
     local tar; tar="$(mktemp)"
     # `git archive` run inside scenarios/ would archive ONLY that subtree, so anchor it at the
     # repo top level.
     local top; top="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)" || die "not in a git repo"
-    git -C "$top" archive --format=tar HEAD > "$tar" || die "git archive failed"
+    git -C "$top" archive --format=tar "$SRC_REF" > "$tar" || die "git archive of '$SRC_REF' failed"
     multipass transfer "$tar" "$vm:/tmp/zfsbackup-src.tar" || die "source transfer failed for $vm"
     rm -f "$tar"
     msh "$vm" "rm -rf '$SRC_DIR' && mkdir -p '$SRC_DIR' && tar -xf /tmp/zfsbackup-src.tar -C '$SRC_DIR' && rm -f /tmp/zfsbackup-src.tar"
@@ -271,7 +297,7 @@ write_server_config() {
 # zfsbackup SERVER config (auto-generated by test_two_vm_backup.sh)
 snapshot_prefix: "autosnap"
 check_interval: "1m"
-prune_interval: "5m"
+prune_interval: "${SERVER_PRUNE}"
 api_host: "0.0.0.0"          # required so the client VM can reach it (no auth on this API!)
 api_port: ${API_PORT}
 remote_backup:
@@ -294,7 +320,7 @@ write_client_config() { # write_client_config <server-ip> [extra datasets-list Y
 # zfsbackup CLIENT config (auto-generated by test_two_vm_backup.sh)
 snapshot_prefix: "autosnap"
 check_interval: "15s"
-prune_interval: "1m"
+prune_interval: "${CLIENT_PRUNE}"
 client_id_file: "${CLIENT_ID_FILE}"
 destinations:
   ${DEST_NAME}:
@@ -302,11 +328,10 @@ destinations:
 datasets:
   - name: "${SOURCE_DS}"
     enabled: true
-    frequency: "30s"
+    frequency: "${CLIENT_SNAP_FREQ}"
     recursive: false
     retention:
-      "1m": "10m"
-      "5m": "1h"
+${CLIENT_RETENTION_YAML}
     remote:
       - destination: ${DEST_NAME}
         frequency: "30s"
@@ -440,6 +465,9 @@ big_space_ok() {
     done
 }
 
+# Value of a ZFS user property on <vm>:<dataset> when set locally or received; empty if unset/inherited.
+zprop() { msh "$1" "zfs get -H -o value -s local,received '$3' '$2' 2>/dev/null" | tr -d '[:space:]'; }
+
 # ═════════════════════════════════ Main ═════════════════════════════════════
 command -v multipass >/dev/null 2>&1 || die "multipass not found on host — install it first"
 command -v git >/dev/null 2>&1 || die "git not found on host"
@@ -454,6 +482,21 @@ ensure_vm "$CLIENT_VM"
 install_stack "$SERVER_VM"
 install_stack "$CLIENT_VM"
 
+# Which tree did the VMs get, and does it carry the resume support scenario J needs?
+step "Shipped source: ref '$SRC_REF' ($(git -C "$(dirname "$0")" rev-parse --short "$SRC_REF" 2>/dev/null || echo '?'))"
+J_READY=1
+for vm in "$SERVER_VM" "$CLIENT_VM"; do
+    if msh "$vm" "grep -q 'resume_info' '$SRC_DIR/libzfseasy/zfs.py' && grep -q 'mode=' '$SRC_DIR/zfsbackup/api.py'"; then
+        info "$vm: shipped tree has zfs.send.resume_info (libzfseasy/zfs.py) and /stream mode= (zfsbackup/api.py)"
+    else
+        warn "$vm: shipped tree ($SRC_REF) lacks resume support: scenario J will be skipped"
+        J_READY=0
+    fi
+done
+
+SERVER_IP="$(vm_ip "$SERVER_VM")"; [ -n "$SERVER_IP" ] || die "could not determine $SERVER_VM IP"
+
+if [ "$ONLY_J" -eq 0 ]; then    # (--only-j skips everything up to the Scenario J banner)
 # ── Phase 2: fresh pools ──
 stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
 remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"   # fresh DB (and no stale -wal/-shm)
@@ -470,7 +513,6 @@ SEED_MD5="$(msh "$CLIENT_VM" "md5sum \$(zfs get -H -o value mountpoint '$SOURCE_
 info "seed md5=$SEED_MD5"
 
 # ── Phase 3: configs + daemons ──
-SERVER_IP="$(vm_ip "$SERVER_VM")"; [ -n "$SERVER_IP" ] || die "could not determine $SERVER_VM IP"
 write_server_config
 write_client_config "$SERVER_IP"
 start_daemon "$SERVER_VM"
@@ -714,8 +756,6 @@ fi
 
 
 # ═════════════ Follow-ups round 2026-10-19: rename --clear-stale-props, non-recursive pruning ═════════════
-# Value of a ZFS user property on <vm>:<dataset> when set locally or received; empty if unset/inherited.
-zprop() { msh "$1" "zfs get -H -o value -s local,received '$3' '$2' 2>/dev/null" | tr -d '[:space:]'; }
 # cfgprop.py: decode/rewrite an org.zfsbackup:config value (base64 JSON) inside a VM.
 put_guest_file() { # put_guest_file <vm> <guest-path>   (content on stdin; via multipass transfer, never piped exec)
     local vm="$1" dst="$2" tmp; tmp="$(mktemp)"; cat > "$tmp"
@@ -799,9 +839,263 @@ check "(I) the server pruned the parent's old snapshots" "0" "$(planted "$RCV")"
 check "(I) the child's same-named snapshots survived (pruning the parent is not recursive)" "2" "$(planted "$RCV_CHILD")"
 check "(I) the child dataset still exists" "yes" "$(msh "$SERVER_VM" "zfs list -H -o name '$RCV_CHILD' >/dev/null 2>&1 && echo yes || echo no" | tr -d '[:space:]')"
 check "(I) no 'Failed' / traceback in the server log around the prune" "0" "$(msh "$SERVER_VM" "tail -n 200 '$LOG' | grep -cE 'Traceback|Failed to'" | tr -d '[:space:]')"
+fi    # ONLY_J == 0
+
+# ═════════════ Scenario J: resuming an interrupted transfer (resume token, in-flight pin, D7) ═════════════
+# Needs a tree with the resume work (J_READY, see the source check after install_stack). Starts from FRESH pools
+# (E-I leave several GiB, a recursive dataset, a child and a 20s server pruner behind) and a config in which the
+# snapshot worker never fires (dataset frequency 1d): every snapshot is one this scenario takes, so "latest" is
+# exactly what it says. Server pruner 1h (it would take T once N exists), client pruner 20s.
+J_FILE_MIB="${J_FILE_MIB:-400}"       # per interrupted send; ~1.2 GiB per VM over J1-J3
+J_RATE="${J_RATE:-80mbit}"            # 400 MiB at 80 Mbit is ~42s: long enough to kill it ~10s in
+J_PIN="org.zfsbackup:inflight.${DEST_NAME}"
+J_SNAP=""                             # the snapshot j_interrupt sent (and killed)
+
+# 'receive_resume_token' of the server's copy: '-' when there is none
+server_token() {
+    local t; t="$(msh "$SERVER_VM" "zfs get -H -o value receive_resume_token '$(server_ds)' 2>/dev/null" | tr -d '[:space:]')"
+    echo "${t:--}"
+}
+client_has_snap() { client_snaps | grep -qx "$1"; }
+wait_server_snap() { # wait_server_snap <short name> <timeout>
+    local waited=0
+    until server_snaps | grep -qx "$1"; do [ "$waited" -ge "$2" ] && return 1; sleep 3; waited=$((waited+3)); done
+}
+# New snapshot <SOURCE_DS>@autosnap_<UTC now> on the client (the 2s sleep keeps names unique); prints the short name.
+snap_now() {
+    sleep 2
+    msh "$CLIENT_VM" "n=autosnap_\$(date -u +%Y%m%d%H%M%S); zfs snapshot '${SOURCE_DS}'@\$n && echo \$n" | tr -d '[:space:]'
+}
+# SIGKILL the whole client unit: supervisor, workers and their `zfs send`, at the same instant. (A graceful stop
+# would let the worker finish its transfer first.) The brackets keep pkill from matching this shell's own command line.
+kill_client_hard() {
+    msh "$CLIENT_VM" "{ systemctl kill -s SIGKILL zfsbackup; pkill -9 -f '[z]fsbackup.daemon'; pkill -9 -f '[z]fs send'; sleep 1; systemctl stop zfsbackup; systemctl reset-failed zfsbackup; } >/dev/null 2>&1; true" || true
+}
+# j_interrupt <file> <MiB>: with the client daemon stopped, append <MiB> of random data, take the snapshot J_SNAP, start
+# the daemon under a throttle and kill -9 the client unit ~10s into the send. Returns 0 only if a send was running when
+# it was killed and the server then held a resume token. The client's expected pin afterwards is "<anchor>,<J_SNAP>".
+j_interrupt() {
+    local waited=0
+    stop_daemon "$CLIENT_VM"
+    append_random "$2" "$1" || { fail "could not write the $2 MiB file"; return 1; }
+    J_SNAP="$(snap_now)"
+    throttle_on "$J_RATE"
+    start_daemon "$CLIENT_VM"
+    if ! wait_for_proc send_running 120; then
+        fail "no zfs send observed on the client within 120s"; throttle_off; return 1
+    fi
+    sleep 10
+    if ! send_running; then
+        fail "the send of $J_SNAP finished before it could be interrupted (raise J_FILE_MIB or lower J_RATE)"; throttle_off; return 1
+    fi
+    kill_client_hard
+    throttle_off
+    while [ "$(server_token)" = "-" ]; do
+        [ "$waited" -ge 60 ] && { fail "the server holds no receive_resume_token 60s after the client was killed"; return 1; }
+        sleep 2; waited=$((waited+2))
+    done
+    pass "a send of $J_SNAP was killed mid-stream; the server holds a resume token"
+}
+show_log() { # show_log <vm> <mark> <ERE>: the matching log lines since <mark>, indented, truncated
+    log_since_vm "$1" "$2" | grep -E -- "$3" | cut -c1-230 | sed 's/^/    log: /'
+}
+# j_synced <label> <snapshot>: the end state of a successful transfer of <snapshot>
+j_synced() {
+    check "($1) the server's resume token is cleared" "-" "$(server_token)"
+    check "($1) the client's anchor is $2" "$2" "$(anchor)"
+    check "($1) no org.zfsbackup:inflight.* property is left on the client" "" "$(zprop "$CLIENT_VM" "$SOURCE_DS" "$J_PIN")"
+    local cg sg; cg="$(guid "$CLIENT_VM" "${SOURCE_DS}@$2")"; sg="$(guid "$SERVER_VM" "$(server_ds)@$2")"
+    if [ -n "$cg" ] && [ "$cg" = "$sg" ]; then pass "($1) $2 is byte-identical on the server (guid $cg)"; else fail "($1) guid of $2: client='$cg' server='$sg'"; fi
+}
+
+# NB: when the newest snapshot is already on the server (latest == common) the client still starts `zfs send -i X X`, which
+# zfs refuses ("not an earlier snapshot"); that logs "Transfer failed" every remote cycle and leaves an `inflight` pin
+# X,X behind. Scenario J therefore stops the client daemon as soon as a transfer has completed (the anchor, the pin and
+# the log line are final by then) and asserts afterwards.
+
 echo
-echo "${YELLOW}NOTE:${NC} snapshot-resume (interrupted transfer) is NOT tested — the server never"
-echo "      reads the client's ?from= token (dead code) and the feature is unfinished."
+step "SCENARIO J — resume of an interrupted transfer (token validation, in-flight pin, fresh fallback, D7)"
+if [ "$J_READY" -ne 1 ]; then
+    warn "scenario J skipped: the shipped tree has no resume support"
+else
+    # fresh pools, fresh DBs, J's config knobs
+    stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
+    remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"
+    recreate_pool "$SERVER_VM" "$SERVER_POOL"; recreate_pool "$CLIENT_VM" "$CLIENT_POOL"
+    msh "$SERVER_VM" "zfs create -p '$TARGET_DS'" || die "failed to create $TARGET_DS"
+    msh "$CLIENT_VM" "zfs create '$SOURCE_DS'"    || die "failed to create $SOURCE_DS"
+    msh "$CLIENT_VM" "head -c 2000000 /dev/urandom > \$(zfs get -H -o value mountpoint '$SOURCE_DS')/file1.bin"
+    SERVER_PRUNE="1h"; CLIENT_SNAP_FREQ="1d"; CLIENT_PRUNE="20s"
+    CLIENT_RETENTION_YAML=$'      "1h": "1d"'
+    write_server_config
+    write_client_config "$SERVER_IP"
+    start_daemon "$SERVER_VM"
+    waited=0
+    until mexec "$CLIENT_VM" sh -c "curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null 'http://${SERVER_IP}:${API_PORT}/health' >/dev/null 2>&1"; do
+        [ "$waited" -ge "$HEALTH_TIMEOUT" ] && die "(J) server API never became healthy"
+        sleep 2; waited=$((waited+2))
+    done
+
+    # J0: a baseline both sides agree on (and a full send through the new pin/mode=fresh path)
+    S0="$(snap_now)"
+    mark_c="$(loglines "$CLIENT_VM")"
+    start_daemon "$CLIENT_VM"
+    wait_for_file "$CLIENT_VM" "$CLIENT_ID_FILE" 40 || die "(J) client_id file never created"
+    CLIENT_ID="$(msh "$CLIENT_VM" "cat '$CLIENT_ID_FILE'" | tr -d '[:space:]')"
+    wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${S0} \(full\)" 150 || fail "(J0) no 'Backup complete: ${SOURCE_DS}@${S0} (full)'"
+    stop_daemon "$CLIENT_VM"
+    if wait_server_snap "$S0" 30; then pass "(J0) baseline snapshot $S0 reached the server (full send, mode=fresh)"; else fail "(J0) $S0 never reached the server"; fi
+    check "(J0) anchor is the baseline snapshot" "$S0" "$(anchor)"
+    check "(J0) the in-flight pin is gone after a normal send" "" "$(zprop "$CLIENT_VM" "$SOURCE_DS" "$J_PIN")"
+
+    echo
+    step "SCENARIO J1 — kill a send mid-stream, take a newer snapshot, restart: the token is resumed, then the cycle continues to latest"
+    if j_interrupt big_j1.bin "$J_FILE_MIB"; then
+        T="$J_SNAP"
+        check "(J1) the in-flight pin survived the kill: <anchor>,<token's snapshot>" "${S0},${T}" "$(zprop "$CLIENT_VM" "$SOURCE_DS" "$J_PIN")"
+        check "(J1) the anchor did not move while the send was incomplete" "$S0" "$(anchor)"
+        msh "$CLIENT_VM" "head -c 1000000 /dev/urandom >> \$(zfs get -H -o value mountpoint '$SOURCE_DS')/file1.bin"
+        N="$(snap_now)"
+        info "token snapshot T=$T, newer snapshot N=$N, base S0=$S0"
+        mark_c="$(loglines "$CLIENT_VM")"; mark_s="$(loglines "$SERVER_VM")"
+        start_daemon "$CLIENT_VM"
+        if wait_log_vm "$CLIENT_VM" "$mark_c" "Resumed ${SOURCE_DS}@${T} \(from ${S0}\) to ${DEST_NAME}" 120; then
+            pass "(J1) log: \"Resumed ${SOURCE_DS}@${T} (from ${S0})\""
+        else fail "(J1) no 'Resumed ${SOURCE_DS}@${T} (from ${S0})' line"; fi
+        if wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${N} \(incremental from ${T}\)" 90; then
+            pass "(J1) the same cycle continued with an incremental ${T} -> ${N} (latest)"
+        else fail "(J1) no follow-up 'Backup complete: ${SOURCE_DS}@${N} (incremental from ${T})'"; fi
+        stop_daemon "$CLIENT_VM"
+        show_log "$CLIENT_VM" "$mark_c" 'Resum|Not resuming|Sending (incremental|full)|Backup complete|Transfer failed'
+        l_res="$(log_lineno "$CLIENT_VM" "$mark_c" "Resumed ${SOURCE_DS}@${T}")"
+        l_fol="$(log_lineno "$CLIENT_VM" "$mark_c" "Sending incremental ${SOURCE_DS}: ${T} -> ${N}")"
+        l_fin="$(log_lineno "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${N}")"
+        if [ -n "$l_res" ] && [ -n "$l_fol" ] && [ -n "$l_fin" ] && [ "$l_res" -lt "$l_fol" ] && [ "$l_fol" -lt "$l_fin" ]; then
+            pass "(J1) log order: Resumed (line $l_res) < follow-up send (line $l_fol) < Backup complete (line $l_fin)"
+        else fail "(J1) log order wrong: resumed='$l_res' follow-up='$l_fol' complete='$l_fin'"; fi
+        if wait_server_snap "$N" 30 && server_snaps | grep -qx "$T"; then pass "(J1) the server has both the resumed $T and the follow-up $N"; else
+            fail "(J1) server snapshots: [$(server_snaps | tr '\n' ' ')] (wanted $T and $N)"; fi
+        j_synced "J1" "$N"
+        check "(J1) the resumed snapshot $T is byte-identical too" "$(guid "$CLIENT_VM" "${SOURCE_DS}@${T}")" "$(guid "$SERVER_VM" "$(server_ds)@${T}")"
+        log_since_vm "$SERVER_VM" "$mark_s" | grep -q 'mode=resume' && pass "(J1) server log: the first stream was mode=resume" || fail "(J1) no 'mode=resume' in the server log"
+        check "(J1) the server discarded no partial state (resume keeps it)" "0" "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -c 'discarding the partial receive state')"
+        check "(J1) no traceback in the client log" "0" "$(log_since_vm "$CLIENT_VM" "$mark_c" | grep -c Traceback)"
+    fi
+
+    echo
+    step "SCENARIO J2 — stale token: the token's target snapshot is destroyed; the client sends fresh and the server discards the partial state"
+    base_j2="$(anchor)"
+    if j_interrupt big_j2.bin "$J_FILE_MIB"; then
+        T2="$J_SNAP"
+        check "(J2) the in-flight pin is <anchor>,<token's snapshot>" "${base_j2},${T2}" "$(zprop "$CLIENT_VM" "$SOURCE_DS" "$J_PIN")"
+        msh "$CLIENT_VM" "zfs destroy '${SOURCE_DS}@${T2}'" && info "destroyed the token's target ${SOURCE_DS}@${T2}" || fail "(J2) could not destroy ${SOURCE_DS}@${T2}"
+        msh "$CLIENT_VM" "head -c 1000000 /dev/urandom >> \$(zfs get -H -o value mountpoint '$SOURCE_DS')/file1.bin"
+        T3="$(snap_now)"
+        mark_c="$(loglines "$CLIENT_VM")"; mark_s="$(loglines "$SERVER_VM")"
+        start_daemon "$CLIENT_VM"
+        if wait_log_vm "$CLIENT_VM" "$mark_c" "WARNING.*Not resuming ${SOURCE_DS}: .*sending fresh" 120; then
+            pass "(J2) WARNING \"Not resuming ... sending fresh\""
+        else fail "(J2) no 'Not resuming ... sending fresh' WARNING"; fi
+        if wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${T3} \(incremental from ${base_j2}\)" 120; then
+            pass "(J2) the fresh incremental ${base_j2} -> ${T3} succeeded"
+        else fail "(J2) no 'Backup complete: ${SOURCE_DS}@${T3} (incremental from ${base_j2})'"; fi
+        stop_daemon "$CLIENT_VM"
+        show_log "$CLIENT_VM" "$mark_c" 'Resum|Not resuming|Sending (incremental|full)|Backup complete|Transfer failed'
+        show_log "$SERVER_VM" "$mark_s" 'discarding the partial|stream\?mode='
+        log_since_vm "$SERVER_VM" "$mark_s" | grep -q 'mode=fresh' && pass "(J2) server log: the stream was mode=fresh" || fail "(J2) no 'mode=fresh' in the server log"
+        log_since_vm "$SERVER_VM" "$mark_s" | grep -qE 'WARNING.*discarding the partial receive state of' && pass "(J2) server log: it discarded the partial receive state" || fail "(J2) no 'discarding the partial receive state' WARNING on the server"
+        check "(J2) the client did not log a resume" "0" "$(log_since_vm "$CLIENT_VM" "$mark_c" | grep -c 'Resumed ')"
+        j_synced "J2" "$T3"
+        if server_snaps | grep -qx "$T2"; then fail "(J2) the destroyed snapshot $T2 exists on the server"; else pass "(J2) the destroyed snapshot $T2 never reached the server"; fi
+    fi
+
+    echo
+    step "SCENARIO J3 — the in-flight pin protects the interrupted pair from the pruner (client pruner 20s, retention 10s:30s)"
+    stop_daemon "$CLIENT_VM"
+    CLIENT_RETENTION_YAML=$'      "10s": "30s"'
+    write_client_config "$SERVER_IP"
+    base_j3="$(anchor)"
+    if j_interrupt big_j3.bin "$J_FILE_MIB"; then
+        X1="$J_SNAP"
+        check "(J3) the in-flight pin is <anchor>,<token's snapshot>" "${base_j3},${X1}" "$(zprop "$CLIENT_VM" "$SOURCE_DS" "$J_PIN")"
+        # Keep the client from resuming: take the server down (its token stays on disk), then add two newer snapshots so that
+        # X1 is neither the newest nor the anchor. Retention keeps nothing older than 30s apart from those, and X2 (not pinned
+        # by anything) is the control that shows the pruner really runs.
+        stop_daemon "$SERVER_VM"
+        X2="$(snap_now)"; X3="$(snap_now)"
+        info "pinned X1=$X1, control X2=$X2, newest X3=$X3, anchor=$base_j3"
+        start_daemon "$CLIENT_VM"
+        x1_lost=0; waited=0
+        while client_has_snap "$X2" && [ "$waited" -lt 150 ]; do
+            client_has_snap "$X1" || x1_lost=1
+            sleep 5; waited=$((waited+5))
+        done
+        client_has_snap "$X1" || x1_lost=1
+        if client_has_snap "$X2"; then fail "(J3) the pruner never took the control snapshot $X2 within 150s (inconclusive)"; else pass "(J3) the pruner ran and took the unpinned control snapshot $X2 after ${waited}s"; fi
+        check "(J3) the pinned snapshot $X1 survived (it is neither newest nor anchored, and long expired)" "0" "$x1_lost"
+        check "(J3) the pin is still set" "${base_j3},${X1}" "$(zprop "$CLIENT_VM" "$SOURCE_DS" "$J_PIN")"
+        client_has_snap "$base_j3" && pass "(J3) the anchor $base_j3 survived" || fail "(J3) the anchor $base_j3 is gone"
+        client_has_snap "$X3" && pass "(J3) the newest snapshot $X3 survived" || fail "(J3) the newest snapshot $X3 is gone"
+        mark_c="$(loglines "$CLIENT_VM")"
+        start_daemon "$SERVER_VM"
+        if wait_log_vm "$CLIENT_VM" "$mark_c" "Resumed ${SOURCE_DS}@${X1} \(from ${base_j3}\)" 150; then
+            pass "(J3) with the server back, the interrupted $X1 was resumed (its pinned base and target had survived)"
+        else fail "(J3) no 'Resumed ${SOURCE_DS}@${X1} (from ${base_j3})' after the server returned"; fi
+        if wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${X3} \(incremental from ${X1}\)" 90; then pass "(J3) and continued to the latest snapshot $X3"; else fail "(J3) no follow-up to $X3"; fi
+        stop_daemon "$CLIENT_VM"
+        j_synced "J3" "$X3"
+        start_daemon "$CLIENT_VM"      # the pruner's first pass runs at start
+        waited=0; while client_has_snap "$X1" && [ "$waited" -lt 90 ]; do sleep 5; waited=$((waited+5)); done
+        stop_daemon "$CLIENT_VM"
+        if client_has_snap "$X1"; then fail "(J3) once the pin was released the pruner still has not taken $X1 (90s)"; else pass "(J3) with the pin released, the pruner took $X1 (the pin was the only thing keeping it)"; fi
+    fi
+
+    echo
+    step "SCENARIO J4 — D7: a second client dataset mapping to the same server dataset is refused (409)"
+    stop_daemon "$CLIENT_VM"
+    CLIENT2_POOL="zbclient2"; CLIENT2_DS="${CLIENT2_POOL}/data"
+    msh "$CLIENT_VM" "
+        set -e
+        if zpool list '$CLIENT2_POOL' >/dev/null 2>&1; then zpool destroy -f '$CLIENT2_POOL'; fi
+        rm -f '${IMG_DIR}/${CLIENT2_POOL}.img'; truncate -s 300M '${IMG_DIR}/${CLIENT2_POOL}.img'
+        zpool create '$CLIENT2_POOL' '${IMG_DIR}/${CLIENT2_POOL}.img'
+        zfs create '$CLIENT2_DS'
+        head -c 1000000 /dev/urandom > \$(zfs get -H -o value mountpoint '$CLIENT2_DS')/f.bin
+    " || fail "(J4) could not create the second client pool $CLIENT2_POOL"
+    CLIENT_RETENTION_YAML=$'      "1m": "10m"'
+    write_client_config "$SERVER_IP" "  - name: \"${CLIENT2_DS}\"
+    enabled: true
+    frequency: \"30s\"
+    recursive: false
+    retention:
+      \"1m\": \"10m\"
+    remote:
+      - destination: ${DEST_NAME}
+        frequency: \"30s\""
+    server_before="$(msh "$SERVER_VM" "zfs list -H -t snapshot -o name,guid -r '$(server_ds)' | sort" | tr '\n' ' ')"
+    src_before="$(zprop "$SERVER_VM" "$(server_ds)" org.zfsbackup:source_dataset)"
+    check "(J4) precondition: the server's copy records ${SOURCE_DS} as its source" "$SOURCE_DS" "$src_before"
+    mark_s="$(loglines "$SERVER_VM")"; mark_c="$(loglines "$CLIENT_VM")"
+    start_daemon "$CLIENT_VM"
+    wait_log_vm "$SERVER_VM" "$mark_s" "POST /backup/[^ ]*${CLIENT2_DS}/negotiate HTTP/1\.1[^\"]*\" 409" 150
+    if log_since_vm "$SERVER_VM" "$mark_s" | grep -qE "POST /backup/[^ ]*${CLIENT2_DS}/negotiate HTTP/1\.1[^\"]*\" 409"; then
+        pass "(J4) server log: negotiate for ${CLIENT2_DS} was refused with 409"
+    else fail "(J4) no 409 for the negotiate of ${CLIENT2_DS} in the server log within 150s"; fi
+    show_log "$SERVER_VM" "$mark_s" "negotiate HTTP/1\.1[^\"]*\" 409"
+    show_log "$CLIENT_VM" "$mark_c" "${CLIENT2_DS}.*(Negotiation|refus|409|Transfer failed|Backup complete)"
+    check "(J4) the refused dataset has no anchor (nothing was transferred)" "" "$(zprop "$CLIENT_VM" "$CLIENT2_DS" "org.zfsbackup:anchor.${DEST_NAME}")"
+    check "(J4) no stream for ${CLIENT2_DS} reached the server" "0" "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -cE "${CLIENT2_DS}/stream")"
+    check "(J4) the server's copy still records ${SOURCE_DS} as its source" "$SOURCE_DS" "$(zprop "$SERVER_VM" "$(server_ds)" org.zfsbackup:source_dataset)"
+    check "(J4) the first dataset's server snapshots (names and guids) are untouched" "$server_before" \
+        "$(msh "$SERVER_VM" "zfs list -H -t snapshot -o name,guid -r '$(server_ds)' | sort" | tr '\n' ' ')"
+    code="$(msh "$CLIENT_VM" "curl -s -o /tmp/zfsb-409.json -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data '{\"snapshots\": []}' 'http://${SERVER_IP}:${API_PORT}/backup/${CLIENT_ID}/${CLIENT2_DS}/negotiate'" | tr -d '[:space:]')"
+    check "(J4) a direct negotiate for ${CLIENT2_DS} answers HTTP 409" "409" "$code"
+    msh "$CLIENT_VM" "grep -q 'refusing to mix in' /tmp/zfsb-409.json" && pass "(J4) the 409 body names the conflict: $(msh "$CLIENT_VM" "cut -c1-200 /tmp/zfsb-409.json" | tr -d '\n')" || fail "(J4) the 409 body does not say 'refusing to mix in'"
+    msh "$CLIENT_VM" "rm -f /tmp/zfsb-409.json" || true
+    daemon_running "$CLIENT_VM" && pass "(J4) the client daemon is alive (the refusal skips the dataset, not the daemon)" || fail "(J4) the client daemon died"
+    stop_daemon "$CLIENT_VM"
+    destroy_pool "$CLIENT_VM" "$CLIENT2_POOL"
+fi
 
 # ─────────────────────────────── Report ─────────────────────────────────────
 echo
@@ -825,6 +1119,7 @@ else
     if [ "$KEEP_POOLS" -eq 0 ]; then
         destroy_pool "$SERVER_VM" "$SERVER_POOL"
         destroy_pool "$CLIENT_VM" "$CLIENT_POOL"
+        destroy_pool "$CLIENT_VM" "zbclient2"      # scenario J4's extra pool (already gone unless J4 aborted)
         info "pools destroyed"
     else
         info "pools left in place (--keep-pools)"

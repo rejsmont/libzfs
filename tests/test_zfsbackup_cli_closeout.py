@@ -85,6 +85,16 @@ class TestCommonOptionsOnTheGroups:
         result = run("rename", "-v", "-c", rich, "destination", "spare", "spare2")
         assert result.exit_code == 0, result.stderr
 
+    def test_rename_group_v_shows_the_zfs_commands_on_stderr(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/vm.01", {})
+        fake_zfs.add("tank/vm.02", {})
+        result = run("rename", "-v", "-c", rich, "dataset", "tank/vm.01", "tank/vm.02")
+        assert result.exit_code == 0, result.stderr
+        assert "debug: Executing command: " in result.stderr
+        assert "Executing command" not in result.stdout
+        quiet = run("rename", "-c", rich, "dataset", "tank/vm.02", "tank/vm.01")
+        assert "Executing command" not in quiet.stdout + quiet.stderr
+
     def test_the_help_of_both_groups_documents_the_options(self, run):
         for group in ("list", "rename"):
             out = run(group, "--help").stdout

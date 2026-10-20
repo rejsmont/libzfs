@@ -13,7 +13,7 @@ from libzfseasy.zfs import (
     AllowCommand, UnAllowCommand, CloneCommand, GetCommand, SetCommand,
     InheritCommand, SendCommand, ReceiveCommand, StreamHandle,
     LoadKeyCommand, UnLoadKeyCommand, ChangeKeyCommand,
-    MountCommand, UnMountCommand,
+    MountCommand, UnMountCommand, DestroyCommand, Command,
 )
 from libzfseasy.types import Dataset, Filesystem, Volume, Snapshot, Bookmark, Property
 
@@ -176,6 +176,72 @@ class TestCloneCommandExtended:
         CloneCommand()(sample_snapshot, 'testpool/clone', properties={'compression': 'lz4'})
         call_args = mock_subprocess.call_args_list[0][0][0]
         assert '-o' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_clone_with_mountpoint_argv(self, mock_subprocess, sample_snapshot):
+        mock_subprocess.setup_multi(([''],), (['testpool/clone\tfilesystem\t/mnt/clone'],))
+        result = CloneCommand()(sample_snapshot, 'testpool/clone', properties={'mountpoint': '/mnt/clone'})
+        assert list(mock_subprocess.call_args_list[0][0][0])[1:] == [
+            'clone', '-o', 'mountpoint=/mnt/clone', 'testpool/filesystem@snap1', 'testpool/clone']
+        assert isinstance(result, Dataset) and result.name == 'testpool/clone'
+        listing = list(mock_subprocess.call_args_list[1][0][0])
+        assert listing[listing.index('-o') + 1] == 'name,type,mountpoint'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_clone_with_user_property(self, mock_subprocess, sample_snapshot):
+        mock_subprocess.setup_multi(([''],), (['testpool/clone\tfilesystem\tvalue'],))
+        CloneCommand()(sample_snapshot, 'testpool/clone', properties={'user:note': 'hello world'})
+        argv = list(mock_subprocess.call_args_list[0][0][0])
+        assert argv[argv.index('-o') + 1] == 'user:note=hello world'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('prop, text', [
+        (Property('lz4', 'local'), 'compression=lz4'),
+        (Property('lz4'), 'compression=lz4'),
+        (Property(5), 'compression=5'),
+    ])
+    def test_clone_property_object_emits_its_raw_value(self, mock_subprocess, sample_snapshot, prop, text):
+        mock_subprocess.setup_multi(([''],), (['testpool/clone\tfilesystem\tlz4'],))
+        CloneCommand()(sample_snapshot, 'testpool/clone', properties={'compression': prop})
+        argv = list(mock_subprocess.call_args_list[0][0][0])
+        assert argv[argv.index('-o') + 1] == text
+        assert not any('Property' in a or 'object at' in a for a in argv)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_clone_several_properties_keep_their_order(self, mock_subprocess, sample_snapshot):
+        mock_subprocess.setup_multi(([''],), (['testpool/clone\tfilesystem\t1\t2'],))
+        CloneCommand()(sample_snapshot, 'testpool/clone', properties={'atime': 'off', 'compression': Property('lz4')})
+        argv = list(mock_subprocess.call_args_list[0][0][0])[1:]
+        assert argv == ['clone', '-o', 'atime=off', '-o', 'compression=lz4',
+                        'testpool/filesystem@snap1', 'testpool/clone']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('properties', [{'not_a_property': 'x'}, {'compression': 'lz4', 'bad key!': 'x'}])
+    def test_clone_invalid_key_raises_before_exec(self, mock_subprocess, sample_snapshot, properties):
+        mock_subprocess.setup_multi(([''],), (['testpool/clone\tfilesystem'],))
+        with pytest.raises(ValueError):
+            CloneCommand()(sample_snapshot, 'testpool/clone', properties=properties)
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_clone_parents_emits_dash_p_before_the_names(self, mock_subprocess, sample_snapshot):
+        mock_subprocess.setup_multi(([''],), (['testpool/a/b\tfilesystem'],))
+        CloneCommand()(sample_snapshot, 'testpool/a/b', parents=True)
+        assert list(mock_subprocess.call_args_list[0][0][0])[1:] == [
+            'clone', '-p', 'testpool/filesystem@snap1', 'testpool/a/b']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_clone_without_properties_has_no_dash_o(self, mock_subprocess, sample_snapshot):
+        mock_subprocess.setup_multi(([''],), (['testpool/clone\tfilesystem'],))
+        CloneCommand()(sample_snapshot, 'testpool/clone')
+        assert '-o' not in list(mock_subprocess.call_args_list[0][0][0])
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -533,25 +599,31 @@ class TestSendStdoutEof:
 
     @staticmethod
     def _eof_process(order, rc, stderr_bytes=b''):
+        """A mocked child whose stdout is at EOF while it is still running. stderr is served line by line from
+        readline() (as the reader thread consumes it) and ends with b'' (EOF); nothing here can spin."""
         process = MagicMock()
         process.stdout.peek.return_value = b''
         process.poll.return_value = None  # still running when stdout hits EOF
+        lines = stderr_bytes.splitlines(keepends=True)
 
-        def _read():
-            order.append('stderr.read')
-            return stderr_bytes
+        def _readline(*args):
+            if lines:
+                order.append('stderr.readline')
+                return lines.pop(0)
+            order.append('stderr.eof')
+            return b''
 
-        def _wait():
+        def _wait(*a, **kw):
             order.append('wait')
             return rc
 
-        process.stderr.read.side_effect = _read
+        process.stderr.readline.side_effect = _readline
         process.wait.side_effect = _wait
         return process
 
     @pytest.mark.unit
     @pytest.mark.subprocess
-    def test_eof_then_rc_zero_returns_empty_handle_and_reads_stderr_before_wait(self, mock_subprocess):
+    def test_eof_then_rc_zero_returns_empty_handle_and_collects_stderr_via_the_reader(self, mock_subprocess):
         order = []
         process = self._eof_process(order, rc=0, stderr_bytes=b'warning: nothing to send\n')
         mock_subprocess.return_value = process
@@ -559,9 +631,12 @@ class TestSendStdoutEof:
         handle = SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
 
         assert isinstance(handle, StreamHandle)
-        assert order == ['stderr.read', 'wait']
+        # The reader thread (not a blocking read() before wait()) consumed stderr; it was joined before returning.
+        assert handle._errors == ['Warning: nothing to send']
+        assert handle._stderr_thread is not None and not handle._stderr_thread.is_alive()
+        assert order.count('wait') == 1 and 'stderr.eof' in order
         process.wait.assert_called_once()
-        process.stderr.read.assert_called_once()
+        process.stderr.read.assert_not_called()
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -575,7 +650,9 @@ class TestSendStdoutEof:
             SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
 
         assert str(exc_info.value) == 'Cannot open dataset: does not exist\nSecond problem'
-        assert order == ['stderr.read', 'wait']
+        assert order.count('wait') == 1
+        assert 'stderr.eof' in order  # the reader reached EOF before the message was raised
+        process.stderr.read.assert_not_called()
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -893,6 +970,1171 @@ class TestSendFailureClosesPipes:
             SendCommand._exec_capture_bin(process, ['x'])
         process.stdout.close.assert_not_called()
         process.stderr.close.assert_not_called()
+
+
+class _StreamGuard:
+    """Run a test body on a thread under a watchdog so a regression (a deadlock or a spin) fails instead of hanging.
+
+    Real `sys.executable -c` children only (never a real zfs). `Popen` is spied so every child is killed at the end,
+    and after the body no new thread (the stderr readers in particular) may still be alive.
+    """
+
+    TIMEOUT = 30
+
+    def __init__(self, monkeypatch):
+        self.procs = []
+        real_popen = subprocess.Popen
+
+        def spying_popen(*a, **kw):
+            p = real_popen(*a, **kw)
+            self.procs.append(p)
+            return p
+
+        monkeypatch.setattr(subprocess, 'Popen', spying_popen)
+        self._real_popen = real_popen
+        self._monkeypatch = monkeypatch
+
+    def run(self, body):
+        import threading
+        import time
+        before = set(threading.enumerate())
+        outcome = {}
+
+        def target():
+            try:
+                outcome['value'] = body()
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    stray = [t for t in threading.enumerate()
+                             if t not in before and t is not threading.current_thread() and t.is_alive()]
+                    if not stray:
+                        break
+                    time.sleep(0.05)
+                outcome['stray'] = stray
+            except BaseException as e:  # noqa: BLE001 - re-raised in the test thread
+                outcome['error'] = e
+
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        t.join(self.TIMEOUT)
+        hung = t.is_alive()
+        for p in self.procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+        if hung:
+            t.join(5)
+            pytest.fail('stream handling hung for %ds (deadlock or spin)' % self.TIMEOUT)
+        if 'error' in outcome:
+            raise outcome['error']
+        assert not outcome['stray'], 'stderr reader thread(s) left running: %r' % outcome['stray']
+        return outcome['value']
+
+
+def _script(*lines):
+    return '\n'.join(lines) + '\n'
+
+
+class TestStreamStderrReaderRealChild:
+    """The send/receive stderr reader thread against real children (R5)."""
+
+    # ~240 KB of stderr, written before any stdout: without a concurrent reader the child would block on a full pipe.
+    SEND_FLOOD_THEN_DATA = _script(
+        "import sys",
+        "for i in range(4000):",
+        "    sys.stderr.write('stderr line %d ' % i + 'x' * 40 + '\\n')",
+        "sys.stderr.flush()",
+        "sys.stdout.buffer.write(bytes(range(256)) * 4096)",
+        "sys.stdout.buffer.flush()",
+    )
+
+    @pytest.fixture
+    def guard(self, monkeypatch):
+        return _StreamGuard(monkeypatch)
+
+    @staticmethod
+    def _child(code):
+        return [sys.executable, '-c', code]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_send_200kb_stderr_then_1mb_stdout_reads_everything_and_closes_clean(self, guard):
+        def body():
+            handle = SendCommand._exec_stream(self._child(self.SEND_FLOOD_THEN_DATA))
+            data = handle.read()
+            assert len(data) == 1024 * 1024
+            assert data == bytes(range(256)) * 4096
+            handle.close()  # exit 0: must not raise
+            assert handle._stderr_thread is not None and not handle._stderr_thread.is_alive()
+            # 4000 stderr lines are bounded: 200 first + one marker + 200 last
+            assert len(handle._errors) == 401
+            assert handle._errors[0].startswith('Stderr line 0')
+            assert handle._errors[199].startswith('Stderr line 199')
+            assert handle._errors[200] == '... 3600 lines omitted ...'
+            assert handle._errors[201].startswith('Stderr line 3800')
+            assert handle._errors[-1].startswith('Stderr line 3999')
+            return handle
+
+        guard.run(body)
+        (proc,) = guard.procs
+        assert proc.returncode == 0
+        assert proc.stdout.closed and proc.stderr.closed
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_send_startup_failure_raises_with_all_lines_up_to_the_last(self, guard):
+        code = _script(
+            "import sys",
+            "for i in range(400):",
+            "    sys.stderr.write('noise line %d ' % i + 'y' * 40 + '\\n')",
+            "sys.stderr.write('fatal: it broke\\n')",
+            "sys.exit(1)",
+        )  # ~20 KB
+
+        def body():
+            with pytest.raises(Exception) as exc:
+                SendCommand._exec_stream(self._child(code))
+            return str(exc.value)
+
+        message = guard.run(body)
+        lines = message.split('\n')
+        assert lines[0].startswith('Noise line 0')
+        assert lines[-1] == 'Fatal: it broke'
+        assert len(lines) == 401
+        (proc,) = guard.procs
+        assert proc.returncode == 1
+        assert proc.stdout.closed and proc.stderr.closed
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_receive_200kb_stderr_then_exit_1_close_raises_first_and_last_lines(self, guard):
+        # Hold the child until stdin reaches EOF so the startup poll sees it running; close() then closes stdin.
+        code = _script(
+            "import sys",
+            "sys.stdin.buffer.read()",
+            "for i in range(4000):",
+            "    sys.stderr.write('recv line %d ' % i + 'z' * 40 + '\\n')",
+            "sys.stderr.write('cannot receive: stream is bad\\n')",
+            "sys.exit(1)",
+        )
+
+        def body():
+            handle = ReceiveCommand._exec_stream_in(self._child(code))
+            assert isinstance(handle, StreamHandle)
+            handle.write(b'some stream bytes')
+            with pytest.raises(Exception) as exc:
+                handle.close()
+            return str(exc.value), handle
+
+        message, handle = guard.run(body)
+        lines = message.split('\n')
+        assert lines[0].startswith('Recv line 0')
+        assert lines[-1] == 'Cannot receive: stream is bad'
+        assert len(lines) == 401                       # bounded: 200 first + marker + 200 last
+        assert lines[200] == '... 3601 lines omitted ...'
+        assert lines[199].startswith('Recv line 199')
+        assert not handle._stderr_thread.is_alive()
+        (proc,) = guard.procs
+        assert proc.returncode == 1 and proc.stdin.closed and proc.stderr.closed
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_receive_startup_failure_raises_immediately(self, guard, monkeypatch):
+        code = _script("import sys", "sys.stderr.write('cannot receive: no such pool\\n')", "sys.exit(1)")
+        real_popen = subprocess.Popen  # the guard's spy
+
+        def popen_then_wait(*a, **kw):
+            p = real_popen(*a, **kw)
+            p.wait()  # the child is gone before the startup poll, deterministically
+            return p
+
+        monkeypatch.setattr(subprocess, 'Popen', popen_then_wait)
+
+        def body():
+            with pytest.raises(Exception) as exc:
+                ReceiveCommand._exec_stream_in(self._child(code))
+            return str(exc.value)
+
+        assert guard.run(body) == 'Cannot receive: no such pool'
+        (proc,) = guard.procs
+        assert proc.returncode == 1 and proc.stdin.closed and proc.stderr.closed
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_receive_startup_failure_without_stderr_reports_the_exit_code(self, guard, monkeypatch):
+        real_popen = subprocess.Popen
+
+        def popen_then_wait(*a, **kw):
+            p = real_popen(*a, **kw)
+            p.wait()
+            return p
+
+        monkeypatch.setattr(subprocess, 'Popen', popen_then_wait)
+
+        def body():
+            with pytest.raises(Exception) as exc:
+                ReceiveCommand._exec_stream_in(self._child('import sys; sys.exit(4)'))
+            return str(exc.value)
+
+        assert 'exit code 4' in guard.run(body)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_empty_send_stream_returns_a_handle_that_reads_nothing_and_closes_clean(self, guard):
+        def body():
+            handle = SendCommand._exec_stream(self._child('pass'))
+            assert isinstance(handle, StreamHandle)
+            assert handle.read() == b''
+            handle.close()
+            handle.close()
+            return handle
+
+        guard.run(body)
+        (proc,) = guard.procs
+        assert proc.returncode == 0 and proc.stdout.closed and proc.stderr.closed
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_send_output_then_nonzero_exit_close_raises_exactly_the_stderr(self, guard):
+        code = _script("import sys",
+                       "sys.stdout.buffer.write(b'DATA'); sys.stdout.buffer.flush()",
+                       "sys.stderr.write('boom\\n'); sys.stderr.flush()",
+                       "sys.exit(3)")
+
+        def body():
+            handle = SendCommand._exec_stream(self._child(code))
+            assert handle.read() == b'DATA'
+            with pytest.raises(Exception) as exc:
+                handle.close()
+            return str(exc.value)
+
+        assert guard.run(body) == 'Boom'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_send_failing_after_partial_stdout_close_raises_first_and_last_lines(self, guard):
+        code = _script(
+            "import sys",
+            "sys.stdout.buffer.write(b'p' * (300 * 1024)); sys.stdout.buffer.flush()",
+            "for i in range(1000):",
+            "    sys.stderr.write('late line %d ' % i + 'q' * 40 + '\\n')",
+            "sys.stderr.write('send failed: i/o error\\n')",
+            "sys.exit(1)",
+        )
+
+        def body():
+            handle = SendCommand._exec_stream(self._child(code))
+            assert len(handle.read()) == 300 * 1024
+            with pytest.raises(Exception) as exc:
+                handle.close()
+            return str(exc.value)
+
+        lines = guard.run(body).split('\n')
+        assert lines[0].startswith('Late line 0')
+        assert lines[-1] == 'Send failed: i/o error'
+        assert len(lines) == 401
+        assert lines[200] == '... 601 lines omitted ...'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_close_is_idempotent_after_success_and_after_failure(self, guard):
+        failing = _script("import sys",
+                          "sys.stdout.buffer.write(b'D'); sys.stdout.buffer.flush()",
+                          "sys.stderr.write('nope\\n'); sys.exit(2)")
+
+        def body():
+            ok = SendCommand._exec_stream(self._child('import sys; sys.stdout.buffer.write(b"x")'))
+            assert ok.read() == b'x'
+            ok.close()
+            ok.close()
+            bad = SendCommand._exec_stream(self._child(failing))
+            bad.read()
+            with pytest.raises(Exception, match='Nope'):
+                bad.close()
+            bad.close()  # already closed: no second raise, no second wait
+            with bad:    # context-manager exit after close is also harmless
+                pass
+
+        guard.run(body)
+        assert len(guard.procs) == 2 and all(p.returncode is not None for p in guard.procs)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_context_manager_exit_raises_on_failure(self, guard):
+        code = _script("import sys",
+                       "sys.stdout.buffer.write(b'D'); sys.stdout.buffer.flush()",
+                       "sys.stderr.write('ctx failure\\n'); sys.exit(1)")
+
+        def body():
+            with pytest.raises(Exception, match='Ctx failure'):
+                with SendCommand._exec_stream(self._child(code)) as stream:
+                    stream.read()
+
+        guard.run(body)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_no_reader_thread_remains_after_close_or_startup_failure(self, guard):
+        import threading
+
+        def body():
+            before = set(threading.enumerate())
+            ok = SendCommand._exec_stream(self._child(self.SEND_FLOOD_THEN_DATA))
+            ok.read()
+            ok.close()
+            with pytest.raises(Exception):
+                SendCommand._exec_stream(self._child("import sys; sys.stderr.write('x\\n'); sys.exit(1)"))
+            rx = ReceiveCommand._exec_stream_in(self._child("import sys; sys.stdin.buffer.read()"))
+            rx.close()
+            return [t for t in threading.enumerate() if t not in before and t is not threading.current_thread()]
+
+        assert guard.run(body) == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_keyboard_interrupt_during_startup_terminates_child_and_leaks_nothing(self, guard, monkeypatch):
+        """An interrupt while blocked in the startup peek() must not leave the child, a reader thread or an fd."""
+        spy_popen = subprocess.Popen
+
+        class InterruptingStdout:
+            def __init__(self, real):
+                self._real = real
+
+            def peek(self, n=1):
+                raise KeyboardInterrupt
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        def popen_with_interrupting_stdout(*a, **kw):
+            p = spy_popen(*a, **kw)
+            p.stdout = InterruptingStdout(p.stdout)
+            return p
+
+        monkeypatch.setattr(subprocess, 'Popen', popen_with_interrupting_stdout)
+        sleeper = _script("import time", "time.sleep(60)")
+
+        def body():
+            gc.collect()
+            fds_before = len(os.listdir('/dev/fd'))
+            with pytest.raises(KeyboardInterrupt):
+                SendCommand._exec_stream(self._child(sleeper))
+            gc.collect()
+            return fds_before, len(os.listdir('/dev/fd'))
+
+        before, after = guard.run(body)
+        (proc,) = guard.procs
+        assert proc.returncode is not None and proc.returncode != 0      # terminated, reaped
+        assert proc.stderr.closed and proc.stdout.closed
+        assert after <= before
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_non_utf8_stderr_is_decoded_with_replacement(self, guard):
+        code = _script("import sys",
+                       "sys.stderr.buffer.write(b'bad \\xff\\xfe byte\\n'); sys.stderr.buffer.flush()",
+                       "sys.exit(1)")
+
+        def body():
+            with pytest.raises(Exception) as exc:
+                SendCommand._exec_stream(self._child(code))
+            return str(exc.value)
+
+        message = guard.run(body)
+        assert message.startswith('Bad ')
+        assert '�' in message and message.endswith(' byte')
+
+
+def _open_pipes(process):
+    """MagicMock attributes are truthy, so `pipe.closed` must be set False for `_close_pipe` to act."""
+    for name in ('stdin', 'stdout', 'stderr'):
+        getattr(process, name).closed = False
+    return process
+
+
+class TestStreamStderrReaderMocked:
+    """The reader thread, `_abort_stream`, `_exec_capture_bin` and `StreamHandle.close` with mocks that cannot spin."""
+
+    @pytest.mark.unit
+    def test_magicmock_stderr_ends_the_reader_without_spinning(self):
+        process = MagicMock()  # readline() returns a MagicMock, never bytes
+        errors = []
+        thread = Command._start_stderr_reader_bin(process, errors)
+        thread.join(5)
+        assert not thread.is_alive()
+        assert process.stderr.readline.call_count == 1
+        assert errors == []
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('bad', ['text line\n', '', None, 42])
+    def test_non_bytes_lines_end_the_reader_quietly(self, bad):
+        process = MagicMock()
+        process.stderr.readline.return_value = bad
+        errors = []
+        thread = Command._start_stderr_reader_bin(process, errors)
+        thread.join(5)
+        assert not thread.is_alive()
+        assert process.stderr.readline.call_count == 1
+        assert errors == []
+
+    @pytest.mark.unit
+    def test_no_stderr_pipe_means_no_thread(self):
+        process = MagicMock()
+        process.stderr = None
+        assert Command._start_stderr_reader_bin(process, []) is None
+
+    @pytest.mark.unit
+    def test_reader_decodes_leniently_capitalises_and_skips_blank_lines(self):
+        process = MagicMock()
+        process.stderr.readline.side_effect = [b'  first \xff problem\n', b'\n', b'   \n', b'second\n', b'']
+        errors = []
+        Command._start_stderr_reader_bin(process, errors).join(5)
+        assert errors == ['First � problem', 'Second']
+
+    @pytest.mark.unit
+    def test_reader_survives_a_pipe_closed_under_it(self):
+        process = MagicMock()
+        process.stderr.readline.side_effect = [b'one\n', ValueError('I/O operation on closed file')]
+        errors = []
+        thread = Command._start_stderr_reader_bin(process, errors)
+        thread.join(5)
+        assert not thread.is_alive()
+        assert errors == ['One']
+
+    @pytest.mark.unit
+    def test_join_is_bounded_and_tolerates_none(self, monkeypatch):
+        import threading
+        import time
+        import libzfseasy.zfs as zfs_mod
+        Command._join_stderr_reader(None)
+        monkeypatch.setattr(zfs_mod, '_TERMINATE_TIMEOUT', 0.2)
+        release = threading.Event()
+        stuck = threading.Thread(target=release.wait, daemon=True)
+        stuck.start()
+        try:
+            start = time.monotonic()
+            Command._join_stderr_reader(stuck)
+            assert time.monotonic() - start < 3
+            assert stuck.is_alive()
+        finally:
+            release.set()
+            stuck.join(5)
+
+    @pytest.mark.unit
+    def test_abort_stream_terminates_a_running_child_and_joins_the_reader(self):
+        process = _open_pipes(MagicMock())
+        process.returncode = None
+        process.poll.return_value = None
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+        Command._abort_stream(process, thread)
+        process.terminate.assert_called_once()
+        process.wait.assert_called()
+        thread.join.assert_called()
+        process.stdin.close.assert_called()
+        process.stdout.close.assert_called()
+        process.stderr.close.assert_called()
+
+    @pytest.mark.unit
+    def test_abort_stream_escalates_to_kill_and_never_raises(self):
+        process = MagicMock()
+        process.returncode = None
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired('zfs', 1), 0]
+        Command._abort_stream(process, None)
+        process.kill.assert_called_once()
+
+        broken = MagicMock()
+        broken.returncode = None
+        broken.poll.side_effect = OSError('gone')
+        Command._abort_stream(broken, None)  # must not raise
+
+    @pytest.mark.unit
+    def test_abort_stream_does_not_close_stderr_under_a_stuck_reader(self):
+        process = _open_pipes(MagicMock())
+        process.returncode = 1
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+        Command._abort_stream(process, thread)
+        process.stderr.close.assert_not_called()
+        process.stdout.close.assert_called()
+
+    @pytest.mark.unit
+    def test_capture_bin_without_a_reader_drains_stderr_before_waiting(self):
+        order = []
+        process = MagicMock()
+        process.stdout.peek.return_value = b''
+        process.poll.return_value = None
+        process.stderr.read.side_effect = lambda: order.append('read') or b'legacy problem\n'
+        process.wait.side_effect = lambda *a, **k: order.append('wait') or 1
+        errors = []
+        with pytest.raises(Exception, match='Legacy problem'):
+            SendCommand._exec_capture_bin(process, errors)
+        assert order == ['read', 'wait']
+        assert errors == ['Legacy problem']
+
+    @pytest.mark.unit
+    def test_capture_bin_with_a_reader_never_reads_stderr_itself(self):
+        process = MagicMock()
+        process.stdout.peek.return_value = b''
+        process.poll.return_value = 0
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+        assert SendCommand._exec_capture_bin(process, [], thread) is False
+        process.stderr.read.assert_not_called()
+        thread.join.assert_called_once()
+
+    @pytest.mark.unit
+    def test_capture_bin_data_returns_stdout_without_waiting_or_joining(self):
+        process = MagicMock()
+        process.stdout.peek.return_value = b'ZFS'
+        thread = MagicMock()
+        assert SendCommand._exec_capture_bin(process, [], thread) is process.stdout
+        process.wait.assert_not_called()
+        thread.join.assert_not_called()
+
+    @pytest.mark.unit
+    def test_handle_with_a_thread_joins_before_raising(self):
+        order = []
+        errors = []
+        process = MagicMock()
+        process.wait.side_effect = lambda *a, **k: order.append('wait') or 1
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+
+        def join(*a, **k):
+            order.append('join')
+            errors.append('Late diagnostic')  # the reader finishing while we join
+
+        thread.join.side_effect = join
+        stream = MagicMock()
+        stream.closed = False
+        handle = StreamHandle(process, stream, errors, thread)
+        with pytest.raises(Exception) as exc:
+            handle.close()
+        assert str(exc.value) == 'Late diagnostic'
+        assert order == ['wait', 'join']
+        process.stderr.read.assert_not_called()
+        stream.close.assert_called_once()
+
+    @pytest.mark.unit
+    def test_handle_with_a_stuck_thread_still_raises_and_leaves_stderr_open(self):
+        process = MagicMock()
+        process.wait.return_value = 1
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+        stream = MagicMock()
+        stream.closed = False
+        handle = StreamHandle(process, stream, ['Seen so far'], thread)
+        with pytest.raises(Exception, match='Seen so far'):
+            handle.close()
+        process.stderr.close.assert_not_called()
+
+    @pytest.mark.unit
+    def test_handle_without_a_thread_falls_back_to_reading_stderr(self):
+        process = _open_pipes(MagicMock())
+        process.wait.return_value = 1
+        process.stderr.read.return_value = b'oops: failed\n  and more\n'
+        stream = MagicMock()
+        stream.closed = False
+        handle = StreamHandle(process, stream)
+        with pytest.raises(Exception) as exc:
+            handle.close()
+        assert str(exc.value) == 'Oops: failed\nAnd more'
+        process.stderr.read.assert_called_once()
+        process.stderr.close.assert_called_once()
+
+    @pytest.mark.unit
+    def test_handle_success_does_not_raise_and_is_idempotent(self):
+        process = MagicMock()
+        process.wait.return_value = 0
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+        stream = MagicMock()
+        stream.closed = False
+        handle = StreamHandle(process, stream, [], thread)
+        handle.close()
+        handle.close()
+        process.wait.assert_called_once()
+        stream.close.assert_called_once()
+
+
+class TestStreamHandleCloseAndAbortRealChild:
+    """Pipe errors at close, interrupts during startup and grandchildren holding stderr (R5 follow-up)."""
+
+    @pytest.fixture
+    def guard(self, monkeypatch):
+        return _StreamGuard(monkeypatch)
+
+    @staticmethod
+    def _child(code):
+        return [sys.executable, '-c', code]
+
+    @staticmethod
+    def _receive_child(exit_code, message=None):
+        """Reads one byte of the stream, then (optionally) reports on stderr and exits without reading any more."""
+        lines = ["import sys", "sys.stdin.buffer.read(1)"]
+        if message:
+            lines.append("sys.stderr.write(%r + '\\n'); sys.stderr.flush()" % message)
+        lines.append("sys.exit(%d)" % exit_code)
+        return _script(*lines)
+
+    @staticmethod
+    def _released_and_gone(handle, proc):
+        handle.write(b'a')
+        handle.flush()  # the child reads this byte, reports, exits
+        proc.wait(timeout=20)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_receive_exit_nonzero_with_pending_bytes_raises_stderr_text_caused_by_the_pipe_error(self, guard):
+        def body():
+            handle = ReceiveCommand._exec_stream_in(self._child(self._receive_child(1, 'receive aborted: bad stream')))
+            (proc,) = guard.procs
+            self._released_and_gone(handle, proc)
+            handle.write(b'bytes still buffered when the child is long gone')
+            with pytest.raises(Exception) as exc:
+                handle.close()
+            assert not handle._stderr_thread.is_alive()
+            handle.close()  # second close is a no-op
+            return exc.value
+
+        error = guard.run(body)
+        assert str(error) == 'Receive aborted: bad stream'
+        assert isinstance(error.__cause__, BrokenPipeError)
+        (proc,) = guard.procs
+        assert proc.returncode == 1
+        assert proc.stdin.closed and proc.stderr.closed
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_receive_exit_zero_with_pending_bytes_reraises_the_pipe_error(self, guard):
+        def body():
+            handle = ReceiveCommand._exec_stream_in(self._child(self._receive_child(0)))
+            (proc,) = guard.procs
+            self._released_and_gone(handle, proc)
+            handle.write(b'bytes still buffered when the child is long gone')
+            with pytest.raises(BrokenPipeError):
+                handle.close()
+            assert not handle._stderr_thread.is_alive()
+            handle.close()
+
+        guard.run(body)
+        (proc,) = guard.procs
+        assert proc.returncode == 0 and proc.stdin.closed and proc.stderr.closed
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_grandchild_holding_stderr_costs_one_bounded_join_on_startup_failure(self, guard, monkeypatch):
+        import signal
+        import time
+        import libzfseasy.zfs as zfs_mod
+        monkeypatch.setattr(zfs_mod, '_TERMINATE_TIMEOUT', 1.0)
+        code = _script(
+            "import subprocess, sys",
+            "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],",
+            "                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)",  # inherits stderr
+            "sys.stderr.write('grandchild %d\\n' % g.pid); sys.stderr.flush()",
+            "sys.exit(1)",
+        )
+
+        def body():
+            start = time.monotonic()
+            with pytest.raises(Exception) as exc:
+                SendCommand._exec_stream(self._child(code))
+            elapsed = time.monotonic() - start
+            pid = int(str(exc.value).split()[-1])
+            try:
+                (proc,) = guard.procs
+                assert proc.returncode == 1
+                return elapsed
+            finally:
+                os.kill(pid, signal.SIGKILL)  # releases stderr, so the (daemon) reader ends
+                time.sleep(0.2)
+                guard.procs[0].stderr.close()
+
+        elapsed = guard.run(body)
+        # One join of ~1 s (the reader never sees EOF); the abort path must not wait it out a second time.
+        assert 0.8 <= elapsed < 1.9, elapsed
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_keyboard_interrupt_from_thread_start_kills_the_child_and_closes_pipes(self, guard, monkeypatch):
+        import threading
+        sleeper = _script("import time", "time.sleep(60)")
+        original_start = threading.Thread.start
+        state = {'armed': False}
+
+        def start(self_thread):
+            if state['armed']:
+                raise KeyboardInterrupt
+            return original_start(self_thread)
+
+        def body():
+            monkeypatch.setattr(threading.Thread, 'start', start)
+            state['armed'] = True
+            try:
+                with pytest.raises(KeyboardInterrupt):
+                    SendCommand._exec_stream(self._child(sleeper))
+            finally:
+                state['armed'] = False
+
+        guard.run(body)
+        (proc,) = guard.procs
+        assert proc.returncode is not None and proc.returncode != 0
+        assert proc.stdout.closed and proc.stderr.closed
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_keyboard_interrupt_from_thread_start_on_receive_kills_the_child(self, guard, monkeypatch):
+        import threading
+        original_start = threading.Thread.start
+        state = {'armed': False}
+
+        def start(self_thread):
+            if state['armed']:
+                raise KeyboardInterrupt
+            return original_start(self_thread)
+
+        def body():
+            monkeypatch.setattr(threading.Thread, 'start', start)
+            state['armed'] = True
+            try:
+                with pytest.raises(KeyboardInterrupt):
+                    ReceiveCommand._exec_stream_in(self._child("import sys; sys.stdin.buffer.read()"))
+            finally:
+                state['armed'] = False
+
+        guard.run(body)
+        (proc,) = guard.procs
+        assert proc.returncode is not None
+        assert proc.stdin.closed and proc.stderr.closed
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_second_interrupt_inside_abort_still_kills_a_sigterm_ignoring_child(self, guard, monkeypatch):
+        """First interrupt: the startup peek (after the child announced it is ready). Second interrupt: the wait()
+        that `_abort_stream` does after SIGTERM. The child ignores SIGTERM, so only the kill in the `finally` can
+        reap it; the interrupt must still propagate and the pipes must be closed."""
+        spy_popen = subprocess.Popen
+
+        class InterruptingStdout:
+            def __init__(self, real):
+                self._real = real
+
+            def peek(self, n=1):
+                self._real.peek(1)  # the child is ready (it has installed its SIGTERM handler)
+                raise KeyboardInterrupt
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        def popen_with_interrupts(*a, **kw):
+            p = spy_popen(*a, **kw)
+            p.stdout = InterruptingStdout(p.stdout)
+            real_wait = p.wait
+
+            def wait(*args, **kwargs):
+                if not state['interrupted']:
+                    state['interrupted'] = True
+                    raise KeyboardInterrupt  # the second interrupt, mid-cleanup
+                return real_wait(*args, **kwargs)
+
+            p.wait = wait
+            return p
+
+        state = {'interrupted': False}
+        monkeypatch.setattr(subprocess, 'Popen', popen_with_interrupts)
+        stubborn = _script("import signal, sys, time",
+                           "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+                           "sys.stdout.buffer.write(b'r'); sys.stdout.buffer.flush()",
+                           "time.sleep(60)")
+
+        def body():
+            with pytest.raises(KeyboardInterrupt):
+                SendCommand._exec_stream(self._child(stubborn))
+            (proc,) = guard.procs
+            # Only the kill in `_abort_stream`'s finally can end this child (it ignores SIGTERM).
+            assert proc.wait(timeout=15) == -9
+            return proc
+
+        guard.run(body)
+        (proc,) = guard.procs
+        # stdout is closed; stderr is deliberately left to the (still running) reader, which the guard saw end.
+        assert proc.stdout.closed
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_real_child_with_huge_stderr_completes_with_a_bounded_message(self, guard):
+        code = _script(
+            "import sys",
+            "w = sys.stderr.write",
+            "for i in range(100000):",
+            "    w('line %d ' % i + 'p' * 50 + '\\n')",
+            "w('L' * (1024 * 1024) + '\\n')",
+            "w('final line\\n')",
+            "sys.exit(1)",
+        )  # ~7 MB of stderr, one 1 MiB line
+
+        def body():
+            with pytest.raises(Exception) as exc:
+                SendCommand._exec_stream(self._child(code))
+            return str(exc.value)
+
+        message = guard.run(body)
+        lines = message.split('\n')
+        assert len(lines) <= 401
+        assert lines[0].startswith('Line 0 ')
+        assert lines[-1] == 'Final line'
+        assert any(l.startswith('... ') and l.endswith(' lines omitted ...') for l in lines)
+        assert len(message) < 200_000
+
+
+class TestStreamHandleCloseMocked:
+
+    @staticmethod
+    def _handle(rc, stream_error=None, errors=None):
+        process = _open_pipes(MagicMock())
+        process.wait.return_value = rc
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+        stream = MagicMock()
+        stream.closed = False
+        if stream_error is not None:
+            stream.close.side_effect = stream_error
+        return StreamHandle(process, stream, errors if errors is not None else [], thread), process, thread
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('pipe_error', [BrokenPipeError('pipe'), OSError('io'), ValueError('closed file')])
+    def test_pipe_error_with_nonzero_exit_raises_stderr_chained_from_it(self, pipe_error):
+        handle, process, thread = self._handle(1, pipe_error, ['Real diagnostic'])
+        with pytest.raises(Exception) as exc:
+            handle.close()
+        assert str(exc.value) == 'Real diagnostic'
+        assert exc.value.__cause__ is pipe_error
+        # the reap, the reader join and the stderr close all still happened
+        process.wait.assert_called_once()
+        thread.join.assert_called()
+        process.stderr.close.assert_called_once()
+        assert handle._closed is True
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('pipe_error', [BrokenPipeError('pipe'), OSError('io'), ValueError('closed file')])
+    def test_pipe_error_with_exit_zero_is_reraised(self, pipe_error):
+        handle, process, thread = self._handle(0, pipe_error)
+        with pytest.raises(type(pipe_error)) as exc:
+            handle.close()
+        assert exc.value is pipe_error
+        process.wait.assert_called_once()
+        process.stderr.close.assert_called_once()
+        handle.close()  # no second raise
+        process.wait.assert_called_once()
+
+    @pytest.mark.unit
+    def test_non_pipe_errors_from_the_stream_close_are_not_swallowed(self):
+        handle, process, _ = self._handle(0, RuntimeError('unexpected'))
+        with pytest.raises(RuntimeError):
+            handle.close()
+
+    @pytest.mark.unit
+    def test_interrupt_in_wait_leaves_the_handle_open_so_a_later_close_completes(self):
+        handle, process, thread = self._handle(0)
+        process.wait.side_effect = [KeyboardInterrupt, 0]
+        with pytest.raises(KeyboardInterrupt):
+            handle.close()
+        assert handle._closed is False
+        thread.join.assert_not_called()
+        handle.close()
+        assert handle._closed is True
+        assert process.wait.call_count == 2
+        thread.join.assert_called()
+        process.stderr.close.assert_called_once()
+        handle.close()
+        assert process.wait.call_count == 2
+
+
+class TestJoinAndAbortMocked:
+
+    @pytest.mark.unit
+    def test_join_stderr_reader_joins_each_thread_at_most_once(self):
+        thread = MagicMock()
+        Command._join_stderr_reader(thread)
+        Command._join_stderr_reader(thread)
+        Command._join_stderr_reader(thread)
+        thread.join.assert_called_once()
+
+    @pytest.mark.unit
+    def test_join_stderr_reader_second_call_does_not_wait_out_a_stuck_thread_again(self, monkeypatch):
+        import threading
+        import time
+        import libzfseasy.zfs as zfs_mod
+        monkeypatch.setattr(zfs_mod, '_TERMINATE_TIMEOUT', 0.4)
+        release = threading.Event()
+        stuck = threading.Thread(target=release.wait, daemon=True)
+        stuck.start()
+        try:
+            start = time.monotonic()
+            Command._join_stderr_reader(stuck)
+            first = time.monotonic() - start
+            start = time.monotonic()
+            Command._join_stderr_reader(stuck)
+            second = time.monotonic() - start
+            assert first >= 0.3 and second < 0.2
+        finally:
+            release.set()
+            stuck.join(5)
+
+    @pytest.mark.unit
+    def test_abort_after_a_normal_reap_does_not_kill(self):
+        process = _open_pipes(MagicMock())
+        process.returncode = None
+        process.poll.return_value = None
+        process.wait.return_value = 0          # SIGTERM honoured
+        Command._abort_stream(process, None)
+        process.terminate.assert_called_once()
+        process.kill.assert_not_called()
+
+        done = _open_pipes(MagicMock())
+        done.returncode = 1                    # already reaped by its own failure
+        Command._abort_stream(done, None)
+        done.terminate.assert_not_called()
+        done.kill.assert_not_called()
+
+    @pytest.mark.unit
+    def test_abort_after_sigterm_timeout_kills_exactly_once(self):
+        process = _open_pipes(MagicMock())
+        process.returncode = None
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired('zfs', 1), 0]
+        Command._abort_stream(process, None)
+        process.kill.assert_called_once()
+
+    @pytest.mark.unit
+    def test_second_interrupt_in_abort_wait_kills_closes_pipes_and_propagates(self):
+        process = _open_pipes(MagicMock())
+        process.returncode = None
+        process.poll.return_value = None
+        process.wait.side_effect = KeyboardInterrupt
+        with pytest.raises(KeyboardInterrupt):
+            Command._abort_stream(process, None)
+        process.kill.assert_called_once()
+        process.stdin.close.assert_called_once()
+        process.stdout.close.assert_called_once()
+        process.stderr.close.assert_called_once()
+
+    @pytest.mark.unit
+    def test_interrupt_in_the_reader_join_still_closes_pipes(self):
+        process = _open_pipes(MagicMock())
+        process.returncode = 1
+        thread = MagicMock()
+        thread.join.side_effect = KeyboardInterrupt
+        thread.is_alive.return_value = False
+        with pytest.raises(KeyboardInterrupt):
+            Command._abort_stream(process, thread)
+        process.stdout.close.assert_called_once()
+        process.stderr.close.assert_called_once()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_keyboard_interrupt_from_peek_on_a_mocked_send_aborts(self, mock_subprocess):
+        process = _open_pipes(MagicMock())
+        process.returncode = None
+        process.poll.return_value = None
+        process.wait.return_value = -15
+        process.stdout.peek.side_effect = KeyboardInterrupt
+        process.stderr.readline.return_value = b''   # the reader ends at once; nothing can spin
+        mock_subprocess.return_value = process
+        with pytest.raises(KeyboardInterrupt):
+            SendCommand._exec_stream(['zfs', 'send', 'pool/fs@s'])
+        process.terminate.assert_called_once()
+        process.stdout.close.assert_called_once()
+        process.stderr.close.assert_called_once()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_keyboard_interrupt_from_thread_start_on_a_mocked_receive_aborts(self, mock_subprocess, mocker):
+        process = _open_pipes(MagicMock())
+        process.returncode = None
+        process.poll.return_value = None
+        process.wait.return_value = -15
+        mock_subprocess.return_value = process
+        mocker.patch('threading.Thread.start', side_effect=KeyboardInterrupt)
+        with pytest.raises(KeyboardInterrupt):
+            ReceiveCommand._exec_stream_in(['zfs', 'receive', 'pool/fs'])
+        process.terminate.assert_called_once()
+        process.stdin.close.assert_called_once()
+        process.stderr.close.assert_called_once()
+
+
+class TestBoundedErrors:
+    """`_BoundedErrors`: first 200 + `... N lines omitted ...` + last 200 (at most 401 entries)."""
+
+    @staticmethod
+    def _filled(n):
+        from libzfseasy.zfs import _BoundedErrors
+        errors = _BoundedErrors()
+        for i in range(n):
+            errors.append('e%d' % i)
+        return errors
+
+    @pytest.mark.unit
+    def test_behaves_as_a_list_of_strings(self):
+        errors = self._filled(3)
+        assert isinstance(errors, list)
+        assert errors == ['e0', 'e1', 'e2']
+        assert '\n'.join(errors) == 'e0\ne1\ne2'
+        assert list(self._filled(0)) == []
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('n', [1, 399, 400])
+    def test_up_to_400_lines_are_kept_without_a_marker(self, n):
+        errors = self._filled(n)
+        assert list(errors) == ['e%d' % i for i in range(n)]
+
+    @pytest.mark.unit
+    def test_401_lines_omit_exactly_one(self):
+        errors = self._filled(401)
+        assert len(errors) == 401
+        assert errors[:200] == ['e%d' % i for i in range(200)]
+        assert errors[200] == '... 1 lines omitted ...'
+        assert errors[201:] == ['e%d' % i for i in range(201, 401)]
+
+    @pytest.mark.unit
+    def test_many_lines_keep_head_marker_tail_in_order(self):
+        errors = self._filled(1000)
+        assert len(errors) == 401
+        assert errors[:200] == ['e%d' % i for i in range(200)]
+        assert errors[200] == '... 600 lines omitted ...'
+        assert errors[201:] == ['e%d' % i for i in range(800, 1000)]
+
+    @pytest.mark.unit
+    def test_size_stays_bounded_and_the_count_is_exact(self):
+        errors = self._filled(20000)
+        assert len(errors) == 401
+        assert errors[200] == '... 19600 lines omitted ...'
+        assert errors[0] == 'e0' and errors[-1] == 'e19999'
+        assert sum(1 for e in errors if e.startswith('... ')) == 1
+
+    @pytest.mark.unit
+    def test_each_stream_gets_its_own_instance(self):
+        from libzfseasy.zfs import _BoundedErrors
+        a, b = _BoundedErrors(), _BoundedErrors()
+        for i in range(500):
+            a.append('x%d' % i)
+        assert len(b) == 0
+        b.append('y')
+        assert b == ['y']
+
+
+class TestStderrLineTruncation:
+    """The reader reads at most 64 KiB per readline; an over-long line is cut and the rest of it discarded."""
+
+    @staticmethod
+    def _read(data):
+        from libzfseasy.zfs import _BoundedErrors
+        process = MagicMock()
+        process.stderr = io.BytesIO(data)
+        errors = _BoundedErrors()
+        Command._start_stderr_reader_bin(process, errors).join(10)
+        return list(errors)
+
+    @pytest.mark.unit
+    def test_overlong_line_is_truncated_and_following_lines_are_unaffected(self):
+        data = b'a' * 200_000 + b'\nnext line\nlast\n'
+        errors = self._read(data)
+        assert len(errors) == 3
+        assert errors[0] == 'A' + 'a' * (64 * 1024 - 1) + ' [truncated]'
+        assert errors[1:] == ['Next line', 'Last']
+
+    @pytest.mark.unit
+    def test_a_line_that_just_fits_is_not_truncated(self):
+        body = b'b' * (64 * 1024 - 2)                      # + '\n' = exactly the read limit - 1
+        assert self._read(body + b'\nafter\n') == ['B' + 'b' * (64 * 1024 - 3), 'After']
+        exact = b'c' * (64 * 1024 - 1)                      # + '\n' = exactly the read limit, ends with a newline
+        assert self._read(exact + b'\nafter\n') == ['C' + 'c' * (64 * 1024 - 2), 'After']
+
+    @pytest.mark.unit
+    def test_line_one_byte_over_the_limit_is_truncated(self):
+        errors = self._read(b'd' * (64 * 1024) + b'\nafter\n')
+        assert errors[0].endswith(' [truncated]') and errors[1:] == ['After']
+
+    @pytest.mark.unit
+    def test_overlong_unterminated_final_line_ends_the_reader(self):
+        errors = self._read(b'first\n' + b'e' * 300_000)
+        assert errors[0] == 'First'
+        assert len(errors) == 2 and errors[1].endswith(' [truncated]')
+
+    @pytest.mark.unit
+    def test_several_overlong_lines_in_a_row(self):
+        data = (b'x' * 150_000 + b'\n') * 3 + b'done\n'
+        errors = self._read(data)
+        assert [e.endswith(' [truncated]') for e in errors] == [True, True, True, False]
+        assert errors[-1] == 'Done'
+
+    @pytest.mark.unit
+    def test_readline_is_always_called_with_the_limit(self):
+        process = MagicMock()
+        process.stderr.readline.side_effect = [b'one\n', b'']
+        Command._start_stderr_reader_bin(process, []).join(5)
+        assert all(c.args == (64 * 1024,) for c in process.stderr.readline.call_args_list)
+
+
+class TestDestroyDropsReclaimLines:
+    """`zfs destroy -v -p` prints `destroy\\t<name>` per object plus a final `reclaim\\t<bytes>` summary (R7)."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_dataset_omits_the_reclaim_line(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['destroy\tpool/fs\n', 'reclaim\t0\n'])
+        assert DestroyCommand().dataset(Filesystem('pool/fs'), destroy=False) == ['pool/fs']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_snapshots_list_omits_the_reclaim_line(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['destroy\tpool/fs@a\n', 'destroy\tpool/fs@b\n', 'reclaim\t12345\n'])
+        snaps = [Snapshot(Filesystem('pool/fs'), 'a'), Snapshot(Filesystem('pool/fs'), 'b')]
+        assert DestroyCommand().snapshots(snaps, destroy=False) == ['pool/fs@a', 'pool/fs@b']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_lazy_variants_omit_the_reclaim_line(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['destroy\tpool/fs\n', 'reclaim\t0\n'])
+        result = DestroyCommand().dataset(Filesystem('pool/fs'), destroy=False, lazy=True)
+        assert hasattr(result, '__next__')
+        assert list(result) == ['pool/fs']
+
+        mock_subprocess.setup(stdout=['destroy\tpool/fs@a\n', 'reclaim\t0\n'])
+        result = DestroyCommand().snapshots(Snapshot(Filesystem('pool/fs'), 'a'), destroy=False, lazy=True)
+        assert hasattr(result, '__next__')
+        assert list(result) == ['pool/fs@a']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_name_merely_containing_reclaim_is_kept(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['destroy\tpool/reclaim\n', 'destroy\tpool/reclaim@reclaim\n',
+                                      'destroy\treclaimpool/x\n', 'reclaim\t0\n'])
+        result = DestroyCommand().dataset(Filesystem('pool/reclaim'), destroy=False)
+        assert result == ['pool/reclaim', 'pool/reclaim@reclaim', 'reclaimpool/x']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_only_reclaim_output_is_empty(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['reclaim\t0\n'])
+        assert DestroyCommand().dataset(Filesystem('pool/fs'), destroy=False) == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_recursive_output_lists_all_child_snapshots(self, mock_subprocess):
+        mock_subprocess.setup(stdout=['destroy\tpool/fs@a\n', 'destroy\tpool/fs/child@a\n', 'reclaim\t0\n'])
+        result = DestroyCommand().snapshots(Snapshot(Filesystem('pool/fs'), 'a'), destroy=False, recursive=True)
+        assert result == ['pool/fs@a', 'pool/fs/child@a']
+        assert '-r' in mock_subprocess.call_args[0][0]
+
+    @pytest.mark.unit
+    def test_destroy_lines_helper_directly(self):
+        lines = ['destroy\ta\n', '  reclaim\t7  ', 'destroy\tb', 'reclaim\t0']
+        assert list(DestroyCommand._destroy_lines(lines)) == ['a', 'b']
+        assert list(DestroyCommand._destroy_lines([])) == []
 
 
 class TestReceiveCommandExtended:
@@ -1297,6 +2539,38 @@ class TestMountCommandExtended:
         MountCommand()(sample_filesystem, ['ro', 'nodev'], None)
         call_args = mock_subprocess.call_args[0][0]
         assert '-o' in call_args
+
+
+class TestMountCommandDefaults:
+    """`ds`, `flags` and `properties` are optional."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_no_arguments_mounts_everything(self, mock_subprocess):
+        mock_subprocess.setup()
+        MountCommand()()
+        assert list(mock_subprocess.call_args[0][0])[1:] == ['mount', '-a']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_only_a_filesystem(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup()
+        MountCommand()(sample_filesystem)
+        assert list(mock_subprocess.call_args[0][0])[1:] == ['mount', sample_filesystem.name]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_options_without_flags_or_properties(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup()
+        MountCommand()(sample_filesystem, overlay=True, force=True)
+        assert list(mock_subprocess.call_args[0][0])[1:] == ['mount', '-O', '-f', sample_filesystem.name]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_private_entry_point_defaults(self, mock_subprocess):
+        mock_subprocess.setup()
+        MountCommand._mount()
+        assert list(mock_subprocess.call_args[0][0])[1:] == ['mount', '-a']
 
 
 class TestUnMountCommandExtended:

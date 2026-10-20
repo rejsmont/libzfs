@@ -26,7 +26,9 @@ written.
   the next backup is likely a full send and the old server copy is orphaned.
   This tool never touches a server;
 - `--clear-stale-props` removes `org.zfsbackup:config` and every
-  `org.zfsbackup:anchor.*` from the old dataset. It is refused up front when
+  `org.zfsbackup:anchor.*` and `org.zfsbackup:inflight.*` from the old dataset
+  (an `inflight.*` pin is an anchor-like pin on the two snapshots of a send in
+  progress; it is moved and cleared exactly like an anchor). It is refused up front when
   the new ZFS dataset does not exist yet (the operator may be about to
   `zfs rename`, and the properties follow the dataset). The daemon check is a
   single `daemonlock.probe()` made AFTER the configuration write
@@ -73,10 +75,14 @@ written.
   generation is still the snapshot's (else exit 75 before ZFS is touched),
   copy, then write with the lock handed to `write_config(lock=...)`. If
   anything fails after a copy, the exact commands that put each previous
-  value back (`zfs set` / `zfs inherit`) are printed. A referencing dataset
+  value back (`zfs set` / `zfs inherit`) are printed. `inflight.OLD` (the pin on
+  the two snapshots of a send to OLD that may still be resumed) is treated the
+  same way: copied to `inflight.NEW`, overwriting a differing value, the old one
+  left for the operator to clear. A referencing dataset
   that does not exist in ZFS aborts before anything is copied, unless
   `--skip-missing`; the new name must be usable in a ZFS property name.
-- the stale `anchor.OLD` properties are listed afterwards and left in place;
+- the stale `anchor.OLD` and `inflight.OLD` properties are listed afterwards and
+  left in place;
 - no `--force`: the server path does not depend on the destination's name.
 
 `--dry-run` for both prints the ZFS property actions and the configuration
@@ -127,6 +133,7 @@ __all__ = ["rename_dataset", "rename_destination"]
 _PROP_PREFIX = "org.zfsbackup:"
 _PROP_CONFIG = "org.zfsbackup:config"
 _PROP_ANCHOR = "org.zfsbackup:anchor."
+_PROP_INFLIGHT = "org.zfsbackup:inflight."
 
 
 # --------------------------------------------------------------------------
@@ -142,14 +149,6 @@ def _load_backup_manager() -> Tuple[Any, Optional[str]]:
         from zfsbackup import backup_manager  # noqa: PLC0415 - lazy by design
     except (ImportError, RuntimeError) as exc:
         return None, str(exc) or type(exc).__name__
-    # libzfseasy ships with `zfs.debug = True`, which prints every command it
-    # runs on STDOUT; this tool's stdout is for its own results.
-    try:
-        import libzfseasy.zfs as _zfs_module  # noqa: PLC0415
-
-        _zfs_module.debug = False
-    except (ImportError, AttributeError):
-        pass
     return backup_manager, None
 
 
@@ -159,6 +158,28 @@ def _inspect(bm: Any, name: str) -> Tuple[bool, Dict[str, str]]:
     if not bm.zfs.exists(ds):
         return False, {}
     return True, bm.read_zfsbackup_properties(ds)
+
+
+def _copy_inflight_property(
+    bm: Any, ds: Any, old: str, new: str, *, dry_run: bool = False
+) -> str:
+    """`bm.copy_anchor_property` for `inflight.<old>` -> `inflight.<new>` on
+    `ds`: the same outcomes (`'no-source'`, `'same'`, `'dry-run'`,
+    `'overwritten'`, `'copied'`), always overwriting a differing value, never
+    deleting the old property. `backup_manager` has no copier for `inflight.*`
+    (only for anchors), so this repeats that logic over the CLI's own prefix."""
+    old_prop, new_prop = f"{_PROP_INFLIGHT}{old}", f"{_PROP_INFLIGHT}{new}"
+    props = bm.read_zfsbackup_properties(ds)
+    if old_prop not in props:
+        return "no-source"
+    value = props[old_prop]
+    exists = new_prop in props
+    if exists and props[new_prop] == value:
+        return "same"
+    if dry_run:
+        return "dry-run"
+    bm.zfs.set(ds, {new_prop: value})
+    return "overwritten" if exists else "copied"
 
 
 # --------------------------------------------------------------------------
@@ -425,7 +446,7 @@ def _clear_stale(
     key: Optional[Tuple[int, int]] = None,
     progress: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
-    """Clear `props` (`org.zfsbackup:config` / `anchor.*`) on the old dataset,
+    """Clear `props` (`org.zfsbackup:config` / `anchor.*` / `inflight.*`) on the old dataset,
     one `zfs inherit` at a time, behind `_clear_gate`. Raises `CliError`, always
     saying which were cleared and which `zfs inherit` commands are left
     (`ConfigBusy`, exit 75, when the writer lock is held by another writer:
@@ -438,6 +459,10 @@ def _clear_stale(
             for prop in ordered:
                 if prop == _PROP_CONFIG:
                     bm.clear_zfsbackup_properties(ds, config=True, anchors=False)
+                elif prop.startswith(_PROP_INFLIGHT):
+                    # `clear_zfsbackup_properties` clears `inflight.*` only as
+                    # part of "every anchor"; one at a time it is a plain inherit.
+                    bm.zfs.inherit(ds, prop)
                 else:
                     bm.clear_zfsbackup_properties(
                         ds, config=False, anchors=[prop[len(_PROP_ANCHOR):]]
@@ -489,25 +514,25 @@ def _clear_stale(
 
 def _anchor_message(
     old: str, new: str, outcome: str, old_value: Optional[str], new_value: Optional[str],
-    dry_run: bool,
+    dry_run: bool, kind: str = "anchor",
 ) -> str:
-    """One line on what happened (or would happen) to `anchor.<new>`."""
-    src = f"copied from anchor.{old}"
+    """One line on what happened (or would happen) to `<kind>.<new>`."""
+    src = f"copied from {kind}.{old}"
     if outcome == "no-source":
-        return f"has no anchor.{old} to copy"
+        return f"has no {kind}.{old} to copy"
     if outcome == "same" or (
         outcome == "dry-run" and new_value is not None and new_value == old_value
     ):
-        return f"anchor.{new} is already current ({new_value})"
+        return f"{kind}.{new} is already current ({new_value})"
     if outcome == "exists":  # not reachable with overwrite=True; kept for safety
-        return f"anchor.{new} is {new_value} and was left alone"
+        return f"{kind}.{new} is {new_value} and was left alone"
     if outcome == "overwritten" or (outcome == "dry-run" and new_value is not None):
         verb = "would be overwritten: was" if dry_run else "was"
         tail = "would become" if dry_run else "now"
-        unpinned = "" if dry_run else f"; snapshot {new_value} is no longer pinned by anchor.{new}"
-        return f"anchor.{new} {verb} {new_value}, {tail} {old_value} ({src}){unpinned}"
+        unpinned = "" if dry_run else f"; snapshot {new_value} is no longer pinned by {kind}.{new}"
+        return f"{kind}.{new} {verb} {new_value}, {tail} {old_value} ({src}){unpinned}"
     # "copied", or a dry run where anchor.<new> is absent
-    return f"anchor.{new} {'would be set to' if dry_run else 'set to'} {old_value} ({src})"
+    return f"{kind}.{new} {'would be set to' if dry_run else 'set to'} {old_value} ({src})"
 
 
 def _inherit_commands_for(datasets: Sequence[str], prop: str) -> str:
@@ -656,7 +681,8 @@ def rename_dataset(
         warn(f"--force: {_server_note(config, old, new, zfs_renamed)}")
 
     stale_props = sorted(
-        p for p in old_props if p == _PROP_CONFIG or p.startswith(_PROP_ANCHOR)
+        p for p in old_props
+        if p == _PROP_CONFIG or p.startswith((_PROP_ANCHOR, _PROP_INFLIGHT))
     ) if old_exists else []
     to_clear = stale_props if clear_stale_props else []
     if dry_run:
@@ -791,77 +817,113 @@ def rename_destination(
         to_copy = [n for n in referencing if n not in missing]
 
     old_prop, new_prop = f"{_PROP_ANCHOR}{old}", f"{_PROP_ANCHOR}{new}"
-    values: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-    # dataset -> the value anchor.<new> had BEFORE this command changed it
-    # (None = it was absent): what puts it back.
-    restore: Dict[str, Optional[str]] = {}
+    # Properties copied, anchors first: (kind, old name, new name). `inflight.*`
+    # is the pin on the two snapshots of a send that may still be resumed; it is
+    # moved exactly like an anchor (copied, a differing value overwritten, the
+    # old one left alone).
+    kinds = (
+        ("anchor", old_prop, new_prop),
+        ("inflight", f"{_PROP_INFLIGHT}{old}", f"{_PROP_INFLIGHT}{new}"),
+    )
+    inflight_outcomes: Dict[str, str] = {}
+    results = {"anchor": outcomes, "inflight": inflight_outcomes}
+    # (dataset, kind) -> (the old property's value, the new property's value)
+    values: Dict[Tuple[str, str], Tuple[Optional[str], Optional[str]]] = {}
+    # (dataset, kind) -> the value the new property had BEFORE this command
+    # changed it (None = it was absent): what puts it back.
+    restore: Dict[Tuple[str, str], Optional[str]] = {}
 
-    def restore_text(extra: Optional[Dict[str, Optional[str]]] = None) -> str:
+    def copy_property(kind: str, ds: Any) -> str:
+        if kind == "anchor":
+            return bm.copy_anchor_property(ds, old, new, dry_run=dry_run, overwrite=True)
+        return _copy_inflight_property(bm, ds, old, new, dry_run=dry_run)
+
+    def restore_text(extra: Optional[Dict[Tuple[str, str], Optional[str]]] = None) -> str:
         pending = dict(restore)
         pending.update(extra or {})
         if not pending:
             return ""
         lines = []
-        for name, previous in pending.items():
-            if previous is None:
-                lines.append(f"  zfs inherit {new_prop} {shlex.quote(name)}")
-            else:
-                lines.append(f"  zfs set {shlex.quote(f'{new_prop}={previous}')} {shlex.quote(name)}")
-        replaced = {n: v for n, v in pending.items() if v is not None}
-        added = [n for n, v in pending.items() if v is None]
         facts = []
-        if replaced:
-            facts.append(
-                f"{new_prop} was overwritten on {', '.join(map(repr, replaced))}, which unpins "
-                "the snapshot its previous value protected"
-            )
-        if added:
-            facts.append(
-                f"{new_prop} was newly set on {', '.join(map(repr, added))} (it did not exist "
-                "before)"
-            )
+        for kind, _old_p, new_p in kinds:
+            mine = {n: v for (n, k), v in pending.items() if k == kind}
+            for name, previous in mine.items():
+                if previous is None:
+                    lines.append(f"  zfs inherit {new_p} {shlex.quote(name)}")
+                else:
+                    lines.append(f"  zfs set {shlex.quote(f'{new_p}={previous}')} {shlex.quote(name)}")
+            replaced = {n: v for n, v in mine.items() if v is not None}
+            added = [n for n, v in mine.items() if v is None]
+            if replaced:
+                facts.append(
+                    f"{new_p} was overwritten on {', '.join(map(repr, replaced))}, which unpins "
+                    "the snapshot its previous value protected"
+                )
+            if added:
+                facts.append(
+                    f"{new_p} was newly set on {', '.join(map(repr, added))} (it did not exist "
+                    "before)"
+                )
+        again = f"anchor.{old}" + (
+            f" and inflight.{old}" if any(k == "inflight" for _n, k in pending) else ""
+        )
         return (
             "; ".join(facts)
             + ". To put the previous values back run:\n"
             + "\n".join(lines)
-            + f"\n(or re-run the rename, which copies anchor.{old} again)"
+            + f"\n(or re-run the rename, which copies {again} again)"
         )
 
     def copy_anchors() -> None:
         for name in to_copy:
             ds = bm.Dataset(name)
-            try:
-                before = bm.read_zfsbackup_properties(ds)
-                values[name] = (before.get(old_prop), before.get(new_prop))
-                outcomes[name] = bm.copy_anchor_property(
-                    ds, old, new, dry_run=dry_run, overwrite=True
-                )
-            except Exception as exc:  # noqa: BLE001
-                tail = restore_text()
-                raise CliError(
-                    f"copying {old_prop} to anchor.{new} on {name!r} failed: "
-                    f"{str(exc).strip() or type(exc).__name__}. Nothing was written to the "
-                    "configuration." + (f"\n{tail}" if tail else "")
-                ) from exc
-            except BaseException as exc:
-                # The copy in flight may or may not have landed.
-                inflight = {name: values[name][1]} if name in values and not dry_run else {}
-                tail = restore_text(inflight)
-                exc.add_note(
-                    f"interrupted while copying {old_prop} to anchor.{new} on {name!r}. "
-                    "Nothing was written to the configuration."
-                    + (f"\n{tail}" if tail else "")
-                )
-                raise
-            if outcomes[name] == "copied":
-                restore[name] = None
-            elif outcomes[name] == "overwritten":
-                restore[name] = values[name][1]
+            for kind, old_p, new_p in kinds:
+                try:
+                    before = bm.read_zfsbackup_properties(ds)
+                    values[(name, kind)] = (before.get(old_p), before.get(new_p))
+                    results[kind][name] = copy_property(kind, ds)
+                except Exception as exc:  # noqa: BLE001
+                    tail = restore_text()
+                    raise CliError(
+                        f"copying {old_p} to {kind}.{new} on {name!r} failed: "
+                        f"{str(exc).strip() or type(exc).__name__}. Nothing was written to the "
+                        "configuration." + (f"\n{tail}" if tail else "")
+                    ) from exc
+                except BaseException as exc:
+                    # The copy in flight may or may not have landed.
+                    pending = (
+                        {(name, kind): values[(name, kind)][1]}
+                        if (name, kind) in values and not dry_run else {}
+                    )
+                    tail = restore_text(pending)
+                    exc.add_note(
+                        f"interrupted while copying {old_p} to {kind}.{new} on {name!r}. "
+                        "Nothing was written to the configuration."
+                        + (f"\n{tail}" if tail else "")
+                    )
+                    raise
+                outcome = results[kind][name]
+                if outcome == "copied":
+                    restore[(name, kind)] = None
+                elif outcome == "overwritten":
+                    restore[(name, kind)] = values[(name, kind)][1]
         for name, outcome in outcomes.items():
             click.echo(
                 f"{prefix}{name}: "
-                + _anchor_message(old, new, outcome, *values.get(name, (None, None)), dry_run)
+                + _anchor_message(
+                    old, new, outcome, *values.get((name, "anchor"), (None, None)), dry_run
+                )
             )
+            # Most datasets have no pin; say nothing about those.
+            pin = inflight_outcomes.get(name, "no-source")
+            if pin != "no-source":
+                click.echo(
+                    f"{prefix}{name}: "
+                    + _anchor_message(
+                        old, new, pin, *values.get((name, "inflight"), (None, None)),
+                        dry_run, "inflight",
+                    )
+                )
 
     if dry_run:
         if to_copy:
@@ -908,6 +970,16 @@ def rename_destination(
                 f"anchor.{old} keeps protecting its snapshot from pruning on "
                 f"{', '.join(repr(n) for n in stale)}. Once a send to {new!r} has succeeded, "
                 f"clear the old property (until then it pins that snapshot):\n{commands}"
+            )
+        stale_pins = [n for n, o in inflight_outcomes.items() if o != "no-source"]
+        if stale_pins:
+            click.echo(
+                f"inflight.{old} (the pin on the snapshots of a send to {old!r} that may be "
+                f"resumed) was copied to inflight.{new} on "
+                f"{', '.join(repr(n) for n in stale_pins)}; the daemon protects every local or "
+                f"received org.zfsbackup:inflight.* property too, so the old one keeps pinning "
+                f"its two snapshots until it is cleared. Once no send to {old!r} is running, "
+                f"clear it:\n{_inherit_commands_for(stale_pins, kinds[1][1])}"
             )
         notify_daemon(resolved, result.generation, result.store_id, request=request)
     except BaseException as exc:

@@ -615,7 +615,12 @@ class RemoteBackupWorker(BaseWorker):
                         f"Backup of {dsi.name} to {remote_cfg.destination} not due yet"
                     )
                     continue
-            self._remote_manager.backup_dataset(dsi, remote_cfg)
+            # `should_stop` is polled before any send starts and between a
+            # resumed send and its follow-up: no new stream during a stop or
+            # a reload (C3).
+            self._remote_manager.backup_dataset(
+                dsi, remote_cfg, should_stop=lambda: self._exit_reason() is not None
+            )
 
 
 _API_SERVER_CLASS = None
