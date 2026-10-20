@@ -57,7 +57,7 @@ the client VM):**
 | K3 — unscoped token, known id | B claiming A's id: exit 1, "already knows a client with id", the `--client-id` hint, "token was not used and is still valid"; token state stays `active`; the SAME token then enrolls B under its own id |
 | K4 — certificate isolation | B's cert on A's URL: 403 `client_id mismatch` naming B's id; A's cert on B's URL: 403; no cert: 401; `/backup/register`: 404; A's server data (names and guids) unchanged; no dataset for B |
 | K5 — revoke mid-flight | `trust revoke <A's fingerprint>` while a throttled 400 MiB stream runs: the stream still completes and is byte-identical; the next cycle logs one ERROR "does not trust this client", sends nothing, the anchor stays |
-| K6 — re-enroll | `trust token create --client-id A --replace` + a new certificate: same client id, one pin (the new one), the pending snapshot goes out as `incremental from <anchor>`, same server dataset guid, same old-snapshot guid |
+| K6 — re-enroll | `trust token create --client-id A --replace` + `enroll --new-key` (a new certificate): same client id, one pin (the new one), the pending snapshot goes out as `incremental from <anchor>`, same server dataset guid, same old-snapshot guid |
 | K7 — rotate | `identity rotate`: two pins, the successor naming its predecessor; the next cycle succeeds incrementally and retires the old pin (one pin, no predecessor) |
 | K8 — import | `import` of a YAML leaves `identity show --json` byte-identical; the destination keeps working |
 | K9 — set-client-id | refused while a destination is enrolled; the id is unchanged |
@@ -69,9 +69,46 @@ not `server.key`; root-created client identity files keep the DB's group.
 
 ### Results of the TLS run
 
-_Pending: filled in after the first real run of the milestone-3 harness (`./scenarios/test_two_vm_backup.sh`
-and `./scenarios/test_config_permissions.sh`) on the committed tree. Record here: date, commit, pass/fail
-counts per scenario (A-K), anything that was flaky, and any code defect the run found._
+**Run:** 2026-10-21, `915642a` plus the final drain fix (`zfsbackup/workers.py` suppresses werkzeug's post-websocket
+200; `zfsbackup/api.py` `backup_stream` waits for the websocket reader thread before returning), shipped as the
+uncommitted tree `SRC_REF=d32ab94e3bc6a304a36267880ffa89fd1ed58769` (`git stash create`); `zfsb-server` +
+`zfsb-client` (and `zfsb-perm` for the permissions script). Harness: **231 passed, 0 failed**;
+`test_config_permissions.sh`: **321 passed, 0 failed** (run on `915642a`, before the fix; it does not touch the
+changed code path).
+
+Server log, counted from this run's start only (27 `stream?mode=` requests in that window): **0**
+ERROR/CRITICAL/Traceback lines. The client log has 11, all caused by scenarios: 4 "supervisor ... is gone"
+(scenario G's `kill -9`), 3 "cannot reach" (scenario C's server outage), and 1 each of J4's 409 "refusing to
+mix in", K5's "does not trust this client", K1a's "no client id", K1b's "not enrolled".
+
+History: an earlier run on plain `915642a` was 230 passed, 1 failed: scenario I's "no Failed/traceback in the
+server log" check caught two `werkzeug - ERROR - Error on request` tracebacks (`ssl.SSLError:
+RECORD_LAYER_FAILURE` from werkzeug's post-handler `rfile.read(10_000_000)` through `workers.py
+_DeadlineReader.readinto`) right after successful streams. A first fix gave 231/0; the final fix above is 231/0
+as well.
+
+| Scenario | Pass / fail |
+|---|---|
+| provisioning + enrollment (TLS identity created, one pin) | 2 / 0 |
+| A full, B incremental | 3 / 0, 3 / 0 |
+| C server-down + catch-up (incl. server certificate/pin survives the restart) | 8 / 0 |
+| D client restart (client id and certificate stable via `identity show`) | 4 / 0 |
+| E reload client during a 2 GiB send, F reload server during a receive, G `kill -9` supervisor | 13 / 0, 11 / 0, 11 / 0 |
+| H `rename --clear-stale-props` | 10 / 0 |
+| I non-recursive pruning of received datasets (incl. the server-log traceback check, which failed before the fix) | 7 / 0 |
+| J resume (J0 3, J1 15, J2 12, J3 14, J4 9; J4's 409 probe is an authenticated curl) | 53 / 0 |
+| K TLS enrollment and trust (K1-K10) | 106 / 0 |
+| `test_config_permissions.sh`, groups (a)-(h) unchanged, (g) over HTTPS, new group (i) | 321 / 0 |
+
+Notes:
+- Every K case passed first time on the real VMs, including the ones that depend on server behaviour
+  (revoke while a throttled 400 MiB stream is in flight: the stream completes and is byte-identical, the next
+  cycle logs one ERROR "does not trust this client ... (TLS alert ...)" and sends nothing; `enroll --new-key`
+  with a `--client-id A --replace` token: same client id, same server dataset guid, the pending snapshot goes
+  out incrementally; `identity rotate`: two pins, then one after the first authenticated request).
+- Script fixes made while running (harness only): `cryptography` is now `pip install`ed in the guests (the
+  source tree runs from `/opt/zfsbackup-src`, not a pip install), `tar -m` on extraction (the VMs' clocks lag the
+  host), K6 uses `enroll --new-key`.
 
 ---
 
@@ -103,17 +140,19 @@ and host stdin proxying is unreliable (so configs/source are delivered via
 
 ---
 
-## Deployment readiness: NOT ready
+## Deployment readiness
 
-A green harness run confirms the **happy path**, not production-readiness. Open blockers
-(see also memory `readiness_zfsbackup.md`):
+A green harness run confirms the **happy path** and the trust model, not production-readiness. Status of the
+original 2026-07 findings:
 
-- **Blocker — no auth/authz/TLS on the server API** (`zfsbackup/api.py`): any host that can
-  reach the port can `POST /backup/register` and stream into `zfs receive` (`force=True`).
-  Binding `0.0.0.0` (required for remote backup) exposes it to anything routable.
-- **Blocker — `requests` imported but undeclared** (`zfsbackup/remote.py:11` vs
-  `pyproject.toml`): a clean `poetry install --without dev` cannot run the client. The
-  harness works around this by `pip install requests` explicitly.
+- ~~**Blocker — no auth/authz/TLS on the server API**~~ **Resolved by milestone 3** (commit `915642a`): the API
+  is HTTPS only (TLS 1.3), every endpoint except `/health` and `/enroll` needs a pinned client certificate, the
+  client id is bound to the verified fingerprint (a mismatch is 403), `/backup/register` is gone, admission is by
+  one-time token, and revocation and rotation are covered by scenario K. See
+  [`production_readiness_report.md`](production_readiness_report.md) for the residuals (werkzeug's development
+  server, no rate limiting on `/enroll`, no revocation of a stream already running).
+- ~~**Blocker — `requests` imported but undeclared**~~ **Resolved:** `requests` (and `cryptography`) are declared
+  in `pyproject.toml`; the harness still installs them explicitly because the guests run from a source tree.
 - **High — resume is dead code**: client sends `?from=<snap>`; server never reads it
   (`zfsbackup/api.py`). Not tested by the harness for that reason. *(Superseded 2026-10-19: resume was
   finished on branch `libzfseasy-fixes` and is covered by scenario J — interrupt/resume, stale token,

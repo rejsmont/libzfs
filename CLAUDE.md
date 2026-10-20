@@ -285,6 +285,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_api.py` | HTTP control API behind a stubbed trust gateway (stream modes, abort, 409 collision, busy lock, receive error reporting) |
 | `tests/test_zfsbackup_api_auth.py` | Authentication and authorization: 401/403, the client-id binding (cert B cannot touch A's data), `/whoami`, the `/enroll` and `/rotate` matrices against a real trust store, predecessor retirement, `TrustGateway` |
 | `tests/test_zfsbackup_api_tls.py` | API worker TLS: per-connection handshake, TLS 1.3 only, connection caps and deadlines, revocation/addition with no restart, real `ApiWorker` under fork/spawn/forkserver, dry-run throwaway identity |
+| `tests/test_zfsbackup_api_drain.py` | Post-response drain: client teardown after a response or websocket session is quiet (DEBUG, no traceback), bounded drain deadline, post-websocket 200 never written, websocket reader joined before `/stream` returns |
 | `tests/test_zfsbackup_api_bind.py` | API server binds without a reverse DNS lookup |
 | `tests/test_zfsbackup_remote.py` | `RemoteBackupManager`: negotiation, resume protocol, transfer (the pinned transport is faked) |
 | `tests/test_zfsbackup_config.py` | Config loading, retention collapse, per-destination rules |

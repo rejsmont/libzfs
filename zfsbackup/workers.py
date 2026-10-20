@@ -674,6 +674,16 @@ API_HANDSHAKE_TIMEOUT = 30.0
 #: `/enroll` and refusals are quick).
 API_REQUEST_IDLE_TIMEOUT = 30.0
 
+#: ABSOLUTE deadline for werkzeug's drain of an unread request body after
+#: the response (seconds from the drain's first read), for every connection,
+#: pinned or not. A peer that vanishes mid-drain (a lost RST, a partition)
+#: would otherwise hold its handler thread and slot until TCP gives up --
+#: for a pinned connection, with no keepalive, possibly never. Expiry is a
+#: quiet end of the drain (EOF, DEBUG) and the connection is closed. Never
+#: applies to a websocket (its socket is not drained) or to anything before
+#: the response's status line.
+API_DRAIN_TIMEOUT = 5.0
+
 #: At most this many of the `API_MAX_CONNECTIONS` may be connections whose
 #: handshake completed WITHOUT a pinned client certificate (`/health`,
 #: `/enroll`, refusals). Decided after the handshake; over the cap the
@@ -712,7 +722,12 @@ def _api_server_class():
     ABSOLUTE deadline (`API_REQUEST_IDLE_TIMEOUT`, enforced before every read
     by the handler's `rfile`), so a peer dribbling bytes cannot keep a slot;
     it is lifted when the app starts for a pinned connection and renewed for
-    the whole request otherwise. The slots are released in a `finally`.
+    the whole request otherwise. After the response, werkzeug's drain of an
+    unread body runs under its own short deadline (`API_DRAIN_TIMEOUT`, every
+    connection), and its expiry or a peer tearing the connection down is a
+    quiet EOF (DEBUG); a websocket's socket is not drained at all
+    (`_DeadlineReader`).
+    The slots are released in a `finally`.
     `self.ssl_context` is
     assigned after construction purely so werkzeug's environ reports `https`,
     fills `SSL_CLIENT_CERT` and treats SSL errors as dropped connections; it
@@ -736,6 +751,7 @@ def _api_server_class():
     import werkzeug."""
     global _API_SERVER_CLASS
     if _API_SERVER_CLASS is None:
+        import errno
         import hashlib
         import io
         import socketserver
@@ -744,12 +760,48 @@ def _api_server_class():
 
         log = logging.getLogger(__name__)
 
+        def _is_teardown(exc: BaseException) -> bool:
+            """Whether `exc`, raised by a read after the response went out,
+            is the peer tearing the connection down: any TLS error (a reset
+            mid-record surfaces as a record-layer failure, a bad record MAC
+            or, on some OpenSSL builds, a bare "failure in the SSL library";
+            `SSLEOFError` / `SSLZeroReturnError` are subclasses), a reset or
+            broken pipe, the read deadline, or a socket already closed or
+            disconnected (`EBADF`, `ENOTCONN`, e.g. from `settimeout`)."""
+            if isinstance(exc, (ssl.SSLError, ConnectionError, TimeoutError)):
+                return True
+            return isinstance(exc, OSError) and exc.errno in (errno.EBADF, errno.ENOTCONN)
+
         class _DeadlineReader(io.RawIOBase):
             """The handler's raw `rfile`: before each read, the socket's
             timeout is set to what is left of the handler's deadline (none
             set: the read is untouched), and a read past it raises
             `TimeoutError` -- which `http.server` treats as "Request timed
-            out" and closes the connection."""
+            out" and closes the connection.
+
+            **After the response has gone out** the only reader is
+            werkzeug's drain of an unread request body (`run_wsgi`'s
+            `execute`, which always closes the connection afterwards), and a
+            connection teardown there is a quiet end of the drain (EOF,
+            logged at DEBUG), not an "Error on request" traceback: the
+            request itself was served. The drain is bounded by an ABSOLUTE
+            deadline (`API_DRAIN_TIMEOUT` from its first read, or the
+            request's own deadline if that is earlier), whose expiry ends it
+            the same way -- pinned connections included. For a websocket
+            request the socket is not read at all then -- it belongs to the
+            websocket session, whose reader thread (simple-websocket) may
+            still be inside `recv` on it, and one `SSLSocket` must not be
+            read from two threads at once; the session had no request body
+            anyway. Before the response, reads and their errors are
+            unchanged.
+
+            **Constraint on routes:** "after the response" starts at the
+            status line (`send_response`), so EVERY `rfile` read from then on
+            is treated as the drain. A route that streams its response while
+            still reading the request body would see a teardown as a silent
+            EOF (a truncated body, not an error) and its reads capped at
+            `API_DRAIN_TIMEOUT`. No route does that today; one that needs it
+            must read its body before it starts the response."""
 
             def __init__(self, raw, handler):
                 super().__init__()
@@ -760,19 +812,87 @@ def _api_server_class():
                 return True
 
             def readinto(self, buffer):
-                deadline = self._handler.read_deadline
+                handler = self._handler
+                if handler.response_started:
+                    return self._drain_into(buffer)
+                deadline = handler.read_deadline
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("request not received in time")
-                    self._handler.connection.settimeout(remaining)
+                    handler.connection.settimeout(remaining)
                 return self._raw.readinto(buffer)
+
+            def _drain_into(self, buffer):
+                handler = self._handler
+                if handler.drain_ended or handler.is_websocket_request():
+                    return 0
+                try:
+                    if handler.drain_deadline is None:
+                        handler.drain_deadline = handler.start_drain_deadline()
+                    deadline = handler.drain_deadline
+                    if handler.read_deadline is not None:
+                        deadline = (
+                            handler.read_deadline if deadline is None
+                            else min(deadline, handler.read_deadline)
+                        )
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("drain deadline passed")
+                        handler.connection.settimeout(remaining)
+                    return self._raw.readinto(buffer)
+                except Exception as exc:
+                    if not _is_teardown(exc):
+                        raise
+                    # EOF from now on (one DEBUG line, no read of a dead
+                    # socket), and the connection is not reused.
+                    handler.drain_ended = True
+                    handler.close_connection = True
+                    log.debug(
+                        "API: connection from %s ended after the response (%s: %s)",
+                        handler.client_address, type(exc).__name__, exc,
+                    )
+                    return 0
 
             def close(self):
                 try:
                     self._raw.close()
                 finally:
                     super().close()
+
+        class _ResponseWriter(io.BufferedIOBase):
+            """The handler's `wfile`: passes writes through, except while the
+            handler's `discard_response` is set, when every write and flush
+            is dropped (reported as written). Set for the response werkzeug
+            writes after a websocket session (`send_response`)."""
+
+            def __init__(self, inner, handler):
+                super().__init__()
+                self._inner = inner
+                self._handler = handler
+
+            def writable(self):
+                return True
+
+            def write(self, data):
+                if self._handler.discard_response:
+                    return memoryview(data).nbytes
+                return self._inner.write(data)
+
+            def flush(self):
+                if not self._handler.discard_response and not self._inner.closed:
+                    self._inner.flush()
+
+            def close(self):
+                # `IOBase.close` flushes first, so the inner writer must
+                # still be open then; it is closed even if that flush fails
+                # (`finish()` must reach `rfile.close()`, which releases the
+                # socket's last io-ref so the connection's fd is closed).
+                try:
+                    super().close()
+                finally:
+                    self._inner.close()
 
         class ApiRequestHandler(WSGIRequestHandler):
             """Bounds the wait for a request's line and headers by an
@@ -783,6 +903,17 @@ def _api_server_class():
             the whole request."""
 
             read_deadline: Optional[float] = None
+            #: The status line of this request's response is being or has
+            #: been sent (`send_response`): from here on, `rfile` reads are
+            #: werkzeug's post-response drain (see `_DeadlineReader`).
+            response_started: bool = False
+            #: The peer tore the connection down during that drain (or its
+            #: deadline passed).
+            drain_ended: bool = False
+            #: The drain's own absolute deadline, set at its first read.
+            drain_deadline: Optional[float] = None
+            #: Drop everything written to `wfile` (see `send_response`).
+            discard_response: bool = False
 
             def setup(self):
                 super().setup()
@@ -790,14 +921,54 @@ def _api_server_class():
                 self.rfile = io.BufferedReader(
                     _DeadlineReader(self.rfile.detach(), self), io.DEFAULT_BUFFER_SIZE
                 )
+                self.wfile = _ResponseWriter(self.wfile, self)
 
             def _arm(self) -> None:
                 timeout = getattr(self.server, 'request_idle_timeout', None)
                 self.read_deadline = (time.monotonic() + timeout) if timeout else None
 
             def handle_one_request(self):
+                self.response_started = False
+                self.drain_ended = False
+                self.drain_deadline = None
+                self.discard_response = False
                 self._arm()
                 return super().handle_one_request()
+
+            def send_response(self, code, message=None):
+                self.response_started = True
+                if code == 200 and self.is_websocket_request():
+                    # flask-sock's response to werkzeug once a websocket
+                    # session has ended (its `101` went out on the socket
+                    # directly; refusals before the upgrade are 4xx/5xx and
+                    # are written). After a `101` it is protocol garbage, and
+                    # writing it raced simple-websocket's reader thread on the
+                    # same `SSLSocket`: once a client reset had failed the
+                    # reader's `SSL_read`, the write raised `ssl.SSLError`
+                    # ("Error on request"). It is logged as usual, never sent.
+                    self.discard_response = True
+                super().send_response(code, message)
+
+            def start_drain_deadline(self) -> Optional[float]:
+                timeout = getattr(self.server, 'drain_timeout', None)
+                return (time.monotonic() + timeout) if timeout else None
+
+            def is_websocket_request(self) -> bool:
+                """A websocket upgrade request by werkzeug's own rule
+                (`Map.bind_to_environ`): `Upgrade: websocket` and an
+                `upgrade` token in `Connection`. Only such a request can
+                match a websocket route; any other gets a plain response."""
+                headers = getattr(self, 'headers', None)
+                if headers is None:
+                    return False
+
+                def field(name):  # as `make_environ` builds HTTP_<NAME>
+                    values = headers.get_all(name) or ()
+                    return ','.join(v.replace('\r\n', '') for v in values).lower()
+
+                if field('Upgrade') != 'websocket':
+                    return False
+                return any(token.strip() == 'upgrade' for token in field('Connection').split(','))
 
             def run_wsgi(self):
                 if getattr(self.server.connection_state, 'pinned', True):
@@ -824,6 +995,7 @@ def _api_server_class():
                 max_connections: int = API_MAX_CONNECTIONS,
                 handshake_timeout: float = API_HANDSHAKE_TIMEOUT,
                 request_idle_timeout: float = API_REQUEST_IDLE_TIMEOUT,
+                drain_timeout: float = API_DRAIN_TIMEOUT,
                 max_anonymous: int = API_MAX_ANONYMOUS_CONNECTIONS,
             ):
                 current = getattr(gateway, 'current_context', None)
@@ -836,6 +1008,7 @@ def _api_server_class():
                 self.gateway = gateway
                 self.handshake_timeout = handshake_timeout
                 self.request_idle_timeout = request_idle_timeout
+                self.drain_timeout = drain_timeout
                 self.max_connections = max_connections
                 self._slots = threading.BoundedSemaphore(max_connections)
                 self.max_anonymous = max_anonymous

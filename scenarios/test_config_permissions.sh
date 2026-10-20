@@ -245,7 +245,7 @@ install_stack() {
         set -e
         test -x '$PY' || python3 -m venv '$VENV'
         '$PIP' install -q --upgrade pip
-        '$PIP' install -q pyyaml 'flask>=3' flask-sock websocket-client requests \
+        '$PIP' install -q pyyaml 'flask>=3' flask-sock websocket-client requests 'cryptography>=43' \
             'sqlalchemy>=2.0' 'alembic>=1.13' 'click>=8.1'
     " || die "pip install failed"
 }

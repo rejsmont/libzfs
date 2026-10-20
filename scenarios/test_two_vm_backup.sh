@@ -235,7 +235,7 @@ install_stack() {
     git -C "$top" archive --format=tar "$SRC_REF" > "$tar" || die "git archive of '$SRC_REF' failed"
     multipass transfer "$tar" "$vm:/tmp/zfsbackup-src.tar" || die "source transfer failed for $vm"
     rm -f "$tar"
-    msh "$vm" "rm -rf '$SRC_DIR' && mkdir -p '$SRC_DIR' && tar -xf /tmp/zfsbackup-src.tar -C '$SRC_DIR' && rm -f /tmp/zfsbackup-src.tar"
+    msh "$vm" "rm -rf '$SRC_DIR' && mkdir -p '$SRC_DIR' && tar -m -xf /tmp/zfsbackup-src.tar -C '$SRC_DIR' && rm -f /tmp/zfsbackup-src.tar"
 
     # venv with runtime deps. We run from source via PYTHONPATH (pyproject only packages
     # libzfseasy, not zfsbackup), and install `requests` explicitly — see readiness note.
@@ -243,7 +243,7 @@ install_stack() {
         set -e
         test -x '$PY' || python3 -m venv '$VENV'
         '$PIP' install -q --upgrade pip
-        '$PIP' install -q pyyaml 'flask>=3' flask-sock websocket-client requests \
+        '$PIP' install -q pyyaml 'flask>=3' flask-sock websocket-client requests 'cryptography>=43' \
             'sqlalchemy>=2.0' 'alembic>=1.13' 'click>=8.1'
     " || die "pip install failed on $vm"
 
@@ -1460,14 +1460,14 @@ else
     stop_daemon "$CLIENT_VM"
     mint_token --client-id "$K_ID" --replace || die "(K6) could not create a scoped token"
     put_token "$CLIENT_VM" /tmp/zfsb-token-t3 || die "(K6) could not deliver the token file"
-    # a new certificate: move the revoked pair away so `enroll` generates a fresh one (the daemon is stopped, so it
-    # never sees the files missing)
-    msh "$CLIENT_VM" "mkdir -p /root/zfsb-k-revoked && mv '$TLS_DIR/client.key' '$TLS_DIR/client.crt' /root/zfsb-k-revoked/" || fail "(K6) could not move the old client certificate away"
-    out="$(cli_vm "$CLIENT_VM" enroll "$DEST_NAME" --token-file /tmp/zfsb-token-t3)"; rc=$?
+    # a new certificate: `enroll --new-key` generates client.next, enrolls it with the token, then promotes it
+    # (the revoked old key is not enrolled again; the daemon is stopped, so it never sees files missing)
+    out="$(cli_vm "$CLIENT_VM" enroll "$DEST_NAME" --new-key --token-file /tmp/zfsb-token-t3)"; rc=$?
     printf '%s\n' "$out" | sed 's/^/    CLI: /'
-    check "(K6) enroll with the scoped --replace token exits 0 (no --url: the destination exists)" "0" "$rc"
+    check "(K6) enroll --new-key with the scoped --replace token exits 0 (no --url: the destination exists)" "0" "$rc"
     check_has "(K6) the CLI reports the enrollment as $K_ID" "enrolled destination '${DEST_NAME}'.*as client id ${K_ID}" "$out"
     K6_FP="$(client_fp)"
+    check "(K6) the new key was promoted: no client.next is left behind" "0" "$(msh "$CLIENT_VM" "ls '$TLS_DIR' | grep -c '^client\\.next'" | tr -d '[:space:]')"
     check "(K6) the client has a NEW certificate" "different" "$([ -n "$K6_FP" ] && [ "$K6_FP" != "$A_FP" ] && echo different || echo same)"
     check "(K6) the client id is unchanged" "$K_ID" "$(client_id_now)"
     check "(K6) the server pins exactly the new certificate under $K_ID" "$K6_FP -" "$(trust_pins "$K_ID")"

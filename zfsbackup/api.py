@@ -22,6 +22,7 @@ import functools
 import json
 import logging
 import os
+import socket
 import ssl
 import threading
 import time
@@ -143,6 +144,45 @@ MAX_TRUST_REQUEST_BYTES = 64 * 1024
 
 #: Longest `/enroll` `label` accepted (characters).
 LABEL_MAX_CHARS = 128
+
+#: How long the end of a `/stream` session waits for simple-websocket's reader
+#: thread to leave after our close frame (normally at once: it leaves on the
+#: client's close reply, EOF or reset), and again after a forced
+#: `shutdown(SHUT_RDWR)` of a silent peer (`_end_websocket`).
+WS_READER_JOIN_TIMEOUT = 2.0
+
+
+def _end_websocket(ws) -> None:
+    """End a `/stream` session so that simple-websocket's reader thread has
+    left the socket before the route returns. Werkzeug closes the connection
+    right after the route (`shutdown_request`); a reader still inside
+    `SSL_read` then would be reading a closed -- possibly already reused --
+    file descriptor, and a silent peer would keep it there indefinitely.
+
+    Sends our close frame (`ws.close()`; flask-sock's own later `close()`
+    then finds the session closed and does nothing), waits up to
+    `WS_READER_JOIN_TIMEOUT` for the reader, and if it is still blocked shuts
+    the socket down at the OS level (a plain `socket.shutdown`: the
+    `SSLSocket` is left as it is, so its TLS object is not pulled from under
+    the reader) and waits once more. Bounded and quiet: never raises, and a
+    reader that still does not leave is left to the connection's close."""
+    with contextlib.suppress(Exception):
+        ws.close()
+    thread = getattr(ws, 'thread', None)
+    if not isinstance(thread, threading.Thread) or thread is threading.current_thread():
+        return
+    with contextlib.suppress(RuntimeError):  # never started
+        thread.join(WS_READER_JOIN_TIMEOUT)
+    if not thread.is_alive():
+        return
+    sock = getattr(ws, 'sock', None)
+    if isinstance(sock, socket.socket):
+        logger.debug("stream: the websocket reader is still waiting on a silent peer; "
+                     "shutting the socket down")
+        with contextlib.suppress(OSError):
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        with contextlib.suppress(RuntimeError):
+            thread.join(WS_READER_JOIN_TIMEOUT)
 
 
 class _BadDatasetName(ValueError):
@@ -1228,9 +1268,10 @@ def create_app(
         **Otherwise right after the response is sent:** if it could not run
         in time (another refresh holds the locks) or failed, the same
         bounded refresh is retried from `call_on_close`, which werkzeug runs
-        as soon as the whole response has been written and flushed -- not
-        on the next poll. Either way no request waits without limit for
-        another thread, so a client that got a committed write's answer
+        after the whole response has been written and flushed and its drain
+        of any unread request body has ended (at most `API_DRAIN_TIMEOUT`,
+        `workers.py`) -- not on the next poll. Either way no request waits
+        without limit for another thread, so a client that got a committed write's answer
         never times out waiting for a refresh (the CLI's read timeout is
         30 s). A refresh that fails or does not run also marks the gateway
         dirty (`TrustGateway.refresh`), so the next trust poll re-reads
@@ -1712,41 +1753,47 @@ def create_app(
 
     @sock.route('/backup/<client_id>/<path:dataset>/stream')
     def backup_stream(ws, client_id: str, dataset: str):
-        # Authenticated at the upgrade (`_authenticate`); the bound id only.
-        client_id = g.client_id
-        if not (enabled and target):
-            try:
-                ws.send(json.dumps({'error': 'remote_backup disabled'}))
-            except Exception:
-                pass
-            return
-        mode = request.args.get('mode')
-        if mode not in STREAM_MODES:
-            problem = (
-                "stream mode required: use ?mode=fresh or ?mode=resume" if mode is None
-                else f"unknown stream mode {mode!r}: use ?mode=fresh or ?mode=resume"
-            )
-            try:
-                ws.send(json.dumps({'error': problem}))
-            except Exception:
-                pass
-            return
-        if not gate.begin():
-            try:
-                ws.send(json.dumps(RELOADING_ERROR))
-            except Exception:
-                pass
-            return
         try:
-            # `?from=` (the incremental base the client negotiated) is
-            # informational only: `zfs receive` takes the base from the stream.
-            logger.debug(
-                "stream for %s/%s: mode=%s from=%s",
-                client_id, dataset, mode, request.args.get('from'),
-            )
-            _receive_stream(ws, client_id, dataset, mode)
+            # Authenticated at the upgrade (`_authenticate`); the bound id only.
+            client_id = g.client_id
+            if not (enabled and target):
+                try:
+                    ws.send(json.dumps({'error': 'remote_backup disabled'}))
+                except Exception:
+                    pass
+                return
+            mode = request.args.get('mode')
+            if mode not in STREAM_MODES:
+                problem = (
+                    "stream mode required: use ?mode=fresh or ?mode=resume" if mode is None
+                    else f"unknown stream mode {mode!r}: use ?mode=fresh or ?mode=resume"
+                )
+                try:
+                    ws.send(json.dumps({'error': problem}))
+                except Exception:
+                    pass
+                return
+            if not gate.begin():
+                try:
+                    ws.send(json.dumps(RELOADING_ERROR))
+                except Exception:
+                    pass
+                return
+            try:
+                # `?from=` (the incremental base the client negotiated) is
+                # informational only: `zfs receive` takes the base from the
+                # stream.
+                logger.debug(
+                    "stream for %s/%s: mode=%s from=%s",
+                    client_id, dataset, mode, request.args.get('from'),
+                )
+                _receive_stream(ws, client_id, dataset, mode)
+            finally:
+                gate.end()
         finally:
-            gate.end()
+            # After the session's `gate.end()`: a reload's drain does not
+            # wait for this.
+            _end_websocket(ws)
 
     def _receive_stream(ws, client_id: str, dataset: str, mode: str) -> None:
         # Validate the name before it becomes a key of anything. The key is
