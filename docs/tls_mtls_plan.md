@@ -716,3 +716,31 @@ Key files:
 - `/Users/rejsmont/src/libzfs/CLAUDE.md`
 - `/Users/rejsmont/src/libzfs/.claude/agents/README.md`
 - `/Users/rejsmont/src/libzfs/pyproject.toml`
+
+---
+
+## M2 results (2026-10-20): all spikes S0–S10 pass, no fallback needed
+
+Recorded in `tests/test_zfsbackup_tls_platform.py` (45 tests, `integration`). Facts later items depend on:
+
+- **M9 server hook:** wrap each connection in `process_request_thread` (runs on the connection's thread,
+  before `finish_request`; owns `shutdown_request` in its `finally`). `get_request`/`process_request` run on
+  the accept thread and would reintroduce the stall. Construct werkzeug without `ssl_context`, then assign
+  `self.ssl_context` so the environ reports `https` and sets `SSL_CLIENT_CERT`. Stock werkzeug
+  `ssl_context` + one silent peer stalls the next client (confirmed).
+- **M11 `requests` pinning (S7):** an `HTTPAdapter` whose `init_poolmanager` passes
+  `ssl_context=<CERT_NONE, check_hostname=False, client cert>` and `assert_fingerprint=<sha256 hex>` **must
+  also override `cert_verify` to force `verify=False`**: urllib3 re-applies `cert_reqs` from requests'
+  `verify` on every connection, so the default `verify=True` turns the context back into CERT_REQUIRED +
+  certifi. With the override, session/request `verify` and `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE` change
+  nothing. A wrong fingerprint raises `requests.exceptions.SSLError` before any HTTP request is sent.
+- **M11 websocket (S8):** `WebSocket().connect("wss://…", socket=<SSLSocket>)` reuses the socket as-is; the
+  URL host and `sslopt` are ignored.
+- **M11 error mapping (S10):** under TLS 1.3 a rejected client certificate surfaces after the handshake, on
+  first read or write: raw `ssl` → plain `ssl.SSLError` (reason `TLS_ALERT_*` on OpenSSL 4.0,
+  `TLSV1_ALERT_*`/`SSLV3_ALERT_*` on older builds — match both); `requests` → `requests.exceptions.SSLError`
+  (alert in `str(exc)`); websocket-client → the raw `ssl.SSLError` escapes `connect()` (not a
+  `WebSocketException`). A `before_request` 401/403 on a `flask_sock` route → `WebSocketBadStatusException`
+  with that `.status_code` (S9).
+- **S6:** duplex wss on one `SSLSocket` is clean (64 MiB, hashes match). `simple_websocket` uses
+  `sock.send`, not `sendall`; no partial-write problem was observed.
