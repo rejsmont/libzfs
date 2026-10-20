@@ -17,7 +17,8 @@ the source when any doc disagrees with it. Two facts worth stating up front:
 ## Your files — and what is no longer yours
 
 You own the daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`,
-`api.py`, and the supervisor's support modules `daemonlock.py`, `stopflag.py`, `runtime_config.py`,
+`api.py`, the shared TLS/identity module `identity.py` (the CLI imports it too, so it must never import
+the daemon), and the supervisor's support modules `daemonlock.py`, `stopflag.py`, `runtime_config.py`,
 `procident.py` and `sdnotify.py`.
 
 Two sibling developers own the rest of the package, exclusively:
@@ -32,21 +33,26 @@ what the other side must do. Do not edit their files to save a handoff. You stil
 
 When you load config from the store, go through `zfsbackup.config.store.mapper.load_config` — never import
 ORM models into daemon code. Config objects outlive any session, and a detached ORM instance raises
-`DetachedInstanceError` lazily, deep inside a worker loop, long after the session closed.
+`DetachedInstanceError` lazily, deep inside a worker loop, long after the session closed. Only the
+supervisor reads configuration and the client id (one snapshot, handed to workers in the `Handoff`); the one
+other DB access is the API worker's, which reaches the trust tables only through `zfsbackup.config.store.trust`
+(per-call engine). The client id is never part of `BackupConfig`.
 
 ## Config — `zfsbackup/config/model.py`
 
 - `parse_time_duration(str) -> timedelta`: units `s/m/h/d/w/M/y`, with `M`≈30d and `y`≈365d. The
   last char is the unit; there is a special branch so a leading `m` means **minutes** unless the
   token starts with `mi`… vs `M` meaning **months** — mind this `m`/`M` disambiguation when editing.
-- Dataclasses: `RetentionRule(age, keep_for)`, `Destination(url)`, `RemoteDatasetConfig`,
+- Dataclasses: `RetentionRule(age, keep_for)`, `Destination(url, server_fingerprint)`, `RemoteDatasetConfig`,
   `RemoteServerConfig(target_dataset, enabled=True)`, `DatasetConfig`, `BackupConfig`.
 - `DatasetConfig` round-trips through a ZFS **user property**: `to_property()` →
   base64(JSON, durations as `total_seconds()`); `from_property()` is the inverse; `from_dict()`
   parses a YAML dict (defaults retention to `{'1d':'30d'}`, sorts rules by age).
 - `BackupConfig.from_file()` uses `yaml.safe_load`, validates a non-empty datasets list, and builds
   `snapshot_prefix`, `check_interval`, `prune_interval`, `api_host`/`api_port`, `dry_run`,
-  `destinations`, `remote_backup`, `client_id_file`. `enabled_datasets` filters enabled ones.
+  `destinations` (https only), `remote_backup`, `client_cert_file`/`client_key_file`. `enabled_datasets` filters
+  enabled ones. The client id is not configuration: it lives in the `host_identity` table (`from_file` refuses
+  the removed `client_id_file` key).
 
 ## Core logic — `zfsbackup/backup_manager.py`
 
@@ -101,7 +107,7 @@ ORM models into daemon code. Config objects outlive any session, and a detached 
 
 - Retention/timeslot design follows a znapzend-style algorithm — the reference is captured in the
   `ref_znapzend_time` memory.
-- Remote backup is **not deployment-ready**: no auth/TLS (see the readiness memory). Flag, don't silently rely on, these when touching remote/API code.
+- Remote backup now has TLS 1.3 + pinned mutual authentication (B1 resolved). Residual caveats remain (werkzeug's development server, no mid-stream revocation, no rate limiting on `/enroll`; see the readiness memory and `docs/production_readiness_report.md`). Flag, don't silently rely on, these when touching remote/API code.
 
 ## Workflow
 

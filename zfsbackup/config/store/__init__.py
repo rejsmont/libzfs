@@ -28,12 +28,12 @@ write-side check (warnings returned, `ValueError` raised) that `save_config`
 runs first and the importer runs before it touches the target;
 `load_config(session) -> BackupConfig` builds a fully detached
 `BackupConfig` (replicating `BackupConfig.from_file`'s defaulting exactly,
-except `prune_interval`'s fallback to `check_interval` and the
-`client_id_file` default -- `GlobalSettings.prune_interval_seconds` and
-`.client_id_file` are nullable precisely so "derive this elsewhere" is
-representable as `NULL` rather than flattened into a stored value by
-whichever process writes it, and `load_config` passes a `NULL` row through
-as `None` rather than resolving it), and `save_config(session, config)` does
+except `prune_interval`'s fallback to `check_interval` --
+`GlobalSettings.prune_interval_seconds` is nullable precisely so "derive this
+elsewhere" is representable as `NULL` rather than flattened into a stored
+value by whichever process writes it, and `load_config` passes a `NULL` row
+through as `None` rather than resolving it; the client id is not a
+`BackupConfig` field at all, see below), and `save_config(session, config)` does
 a full wipe-and-reinsert of the store from a `BackupConfig` (no
 diff-and-merge, no internal `commit()`/`begin()` -- the caller owns the
 transaction).
@@ -89,8 +89,10 @@ writer transaction. Nesting the two self-deadlocks even in a single thread
 deterministically). That wrapper now exists as `importer.py`'s
 `import_yaml`. The daemon's supervisor reads this package exactly once, at
 startup, through `zfsbackup/runtime_config.py` -- a thin wrapper over
-`access.read_config` (read-only). Worker processes never open the database:
-they are handed the already-loaded config.
+`access.read_config` (read-only). Worker processes never open the database
+for configuration: they are handed the already-loaded config (and the client
+id). The one exception is the API worker's access to the TRUST tables, which
+goes only through `trust.py` on per-call engines (see below).
 
 `mapper.py` is a new, deliberately one-directional coupling: it imports
 `zfsbackup.config`, so `store` now depends on `config`, but `config/model.py`
@@ -128,11 +130,12 @@ database's first connection. Its only sanctioned ways to reach a live
 storable `Engine`: `db.py`'s pid-keyed fork-safety cache depends on
 nothing capturing a long-lived handle outside a `with` block, and an
 `Engine` returned by value from this module would be exactly such a
-handle. Only the daemon supervisor reads the store: at startup, on every
-10 s generation poll (`access.read_store_state`) and on every reload, each
-through `zfsbackup/runtime_config.py` -> `access.read_config` (which uses
-these two functions) and disposing its engines after each read;
-`workers.py` never opens it. Neither module
+handle. Only the daemon supervisor reads the configuration: at startup, on
+every 10 s generation poll (`access.read_store_state`) and on every reload,
+each through `zfsbackup/runtime_config.py` -> `access.read_config` (which
+uses these two functions) and disposing its engines after each read;
+`workers.py` never opens it for configuration (the API worker reaches the
+trust tables only through `trust.py`, with `ephemeral=True`). Neither module
 builds an engine, opens a connection, or touches an ORM class directly;
 `BackupConfig.from_file` is gone from both.
 
@@ -154,25 +157,75 @@ calls; the daemon only ever uses `check_schema`, which decides from
 
 `access.py` (item 15.1) is the whole-configuration entry point for every tool:
 `read_config(resolved) -> ConfigSnapshot(config, generation, schema_rev,
-store_id)` reads
+store_id, client_id)` reads
 the schema check, the rows and the generation in ONE read snapshot (the daemon
 and the CLI's `export` / `migrate --check` / the read half of every edit), and
 `write_config(resolved, config, *, expected_generation) -> WriteResult` is the
 single compare-and-swap write: preflight, `validate_config`, the writer lock, a
 `BEGIN IMMEDIATE` session, the schema check again, the generation compare, then
-`save_config`. A stale generation is `ConfigConflict`; a lock that stays held
+`save_config`. `ConfigSnapshot.client_id` is this host's client id
+(`host_identity`; `None` until one is generated), read in that same snapshot;
+it is not part of `BackupConfig`, and `save_config` / `write_config` /
+`import_yaml` wipe only the six config tables (`mapper.CONFIG_TABLES`) and
+leave `host_identity` and the trust tables untouched. A stale generation is
+`ConfigConflict`; a lock that stays held
 (the `<db>.writer.lock` flock, or SQLite's `busy_timeout`) is `ConfigBusy`.
 Both live in `errors.py`, deliberately outside `SchemaError`/`ConfigPathError`
 (retry, not "unusable database"). `messages.py` holds the operator wording
 shared by the daemon and the CLI (`config_error_message`,
 `describe_config_source`). `paths.writer_lock` (item 15.4) serialises every
-zfsbackup-config writer, `import_yaml` included; it adds one more file next to
+zfsbackup-config (CLI) writer, `import_yaml` included -- NOT the API worker's
+trust writers, see below; it adds one more file next to
 the database (`<db>.writer.lock`, besides WAL's `-wal`/`-shm`) that is never
 deleted and should not be archived as state.
+
+`trust.py` (TLS/mTLS plan M7) is the only code that touches the six
+non-config tables (`mapper.PRESERVED_TABLES`), apart from
+`load_config_snapshot` reading `host_identity.client_id` into the config
+snapshot. **Who writes what:** the CLI is the only writer of configuration
+**and of `host_identity`** (`ensure_client_id` / `set_client_id`, under the
+writer lock; any change to the stored id bumps `GlobalSettings.generation` in
+the same transaction, so the daemon reloads). **The trust tables have exactly
+two writers, both going through `store.trust`:** the CLI (`create_token`,
+`revoke_token`, `revoke_pin`, `revoke_client`, under the writer lock) and the
+API worker (`enroll_client`, `rotate_client`, `retire_predecessor`, no flock:
+they serialise against the CLI on SQLite's write lock alone, and against each
+other on an in-process lock in `trust.py`; each first decides read-only, so a
+refused or no-op call -- every unauthenticated wrong `/enroll` -- never takes
+the write lock). A request thread must never call one of them while it holds
+any other writer session or connection (`db.session_for_engine`: at most one
+writer connection per file per process). Trust writes bump only
+`trust_state.generation`, and only when the set of pins changes (or an
+enrollment returns `ENROLLED`); they never touch the config generation and
+never cause a reload. **Revocation is permanent:** every path that unpins a
+certificate (`revoke_pin`, which also unpins the rotation successors the revoked
+key authorised and returns them as `PinRevocation.cascaded` -- for a key already
+retired by rotation it follows `RevokedPin.superseded_by` to the live successor
+and returns a `SupersededRevocation`; `revoke_client`, a
+`--replace` enrollment, and `retire_predecessor`) records its fingerprint in `revoked_fingerprints` in
+the same transaction, `enroll_client` / `rotate_client` refuse a recorded
+fingerprint (`REFUSED`, token untouched, decided read-only where possible),
+and `read_trust` never returns one. Every `trust.py` call
+runs on its own fresh, unpooled engine (`db.ephemeral_engine`) that is
+disposed before it returns: nothing is cached or shared between threads, so
+the API worker may call it from any request thread, and the supervisor's
+`dispose_all()` never interacts with it.
 
 Public API
 ----------
 Tool-level surface -- what the daemon and `zfsbackup-config` are meant to call:
+
+- trust and host identity (`trust.py`): `read_client_id`, `ensure_client_id`,
+  `set_client_id` / `ClientIdUpdate`; `read_trust_key` / `TrustKey`,
+  `read_trust` / `TrustSnapshot` / `TrustedPin`, `list_clients` /
+  `ClientRecord`, `list_revoked` / `RevokedPin`, `token_status` /
+  `TokenStatus` / `TokenState`;
+  `token_precheck` (read-only enrollment filter: the API calls it first in
+  `/enroll`, before any `zfs` call; `enroll_client` re-checks everything);
+  `create_token`, `revoke_token`, `revoke_pin` / `PinRevocation` /
+  `SupersededRevocation`, `revoke_client`;
+  `enroll_client` / `EnrollOutcome` / `NewPin`, `rotate_client` /
+  `RotateOutcome`, `retire_predecessor`; `TOKEN_MAX_TTL_SECONDS`;
 
 - whole-configuration access (`access.py`): `read_config`, `write_config`,
   `read_generation`, `read_store_state` / `StoreState` (the poll's cheap
@@ -209,6 +262,7 @@ from zfsbackup.config.store.models import (
     NAMING_CONVENTION,
     RemoteServer,
     RetentionRule,
+    RevokedFingerprint,
 )
 from zfsbackup.config.store.db import (
     ReadOnlySessionError,
@@ -295,11 +349,50 @@ from zfsbackup.config.store.access import (
     read_store_state,
     write_config,
 )
+from zfsbackup.config.store.trust import (
+    TOKEN_MAX_TTL_SECONDS,
+    ClientIdUpdate,
+    ClientRecord,
+    EnrollOutcome,
+    NewPin,
+    PinRevocation,
+    RevokedPin,
+    RotateOutcome,
+    SupersededRevocation,
+    TokenState,
+    TokenStatus,
+    TrustKey,
+    TrustSnapshot,
+    TrustedPin,
+    create_token,
+    enroll_client,
+    ensure_client_id,
+    list_clients,
+    list_revoked,
+    read_client_id,
+    read_trust,
+    read_trust_key,
+    retire_predecessor,
+    revoke_client,
+    revoke_pin,
+    revoke_token,
+    rotate_client,
+    set_client_id,
+    token_precheck,
+    token_status,
+)
 
 __all__ = [
     "Base",
+    "check_config_db",
+    "check_config_db_suffix",
+    "check_config_schema",
+    "check_schema",
+    "ClientIdUpdate",
+    "ClientRecord",
     "CONFIG_DB_MODE",
     "CONFIG_DIR_MODE",
+    "config_error_message",
     "CONFIG_OWNER",
     "CONFIG_PATH_ENV",
     "ConfigBusy",
@@ -315,66 +408,90 @@ __all__ = [
     "ConfigPathEnvError",
     "ConfigPathError",
     "ConfigSnapshot",
+    "create_config_db_file",
+    "create_token",
     "Dataset",
     "DatasetRemote",
     "DEFAULT_CONFIG_DB",
     "DEFAULT_WRITER_LOCK_TIMEOUT",
+    "describe_config_source",
     "Destination",
+    "destination_name_problem",
+    "diagnose_open_failure",
+    "dispose_all",
+    "enroll_client",
+    "EnrollOutcome",
+    "ensure_client_id",
+    "ensure_config_db_mode",
+    "ensure_config_dir",
+    "ensure_schema",
     "EXPECTED_HEAD",
+    "get_engine",
     "GlobalSettings",
+    "import_yaml",
     "ImportResult",
     "KNOWN_REVISIONS",
+    "list_clients",
+    "list_revoked",
+    "load_config",
+    "load_config_snapshot",
+    "make_engine",
     "MigrationPackagingError",
     "NAMING_CONVENTION",
+    "NewPin",
+    "PinRevocation",
+    "SupersededRevocation",
     "NotAConfigDatabase",
+    "open_config_connection",
+    "open_config_session",
     "OutgoingConfigUnreadable",
+    "read_client_id",
+    "read_config",
+    "read_generation",
+    "read_store_state",
+    "read_trust",
+    "read_trust_key",
     "ReadOnlySessionError",
     "RemoteServer",
+    "require_writer_lock_held",
+    "resolve_config_path",
+    "resolve_config_url",
     "ResolvedConfigPath",
     "RetentionRule",
+    "retire_predecessor",
+    "RevokedFingerprint",
+    "RevokedPin",
+    "revoke_client",
+    "revoke_pin",
+    "revoke_token",
+    "rotate_client",
+    "RotateOutcome",
+    "save_config",
     "SchemaError",
     "SchemaIntegrityError",
     "SchemaOutOfDate",
     "SchemaSplitBrain",
     "SchemaUpgrade",
     "SchemaVersionMismatch",
-    "StoreIdConflict",
-    "StoreState",
-    "WRITER_LOCK_SUFFIX",
-    "WriteResult",
-    "check_config_db",
-    "check_config_db_suffix",
-    "check_config_schema",
-    "check_schema",
-    "config_error_message",
-    "create_config_db_file",
-    "describe_config_source",
-    "destination_name_problem",
-    "diagnose_open_failure",
-    "dispose_all",
-    "ensure_config_db_mode",
-    "ensure_config_dir",
-    "ensure_schema",
-    "get_engine",
-    "import_yaml",
-    "load_config",
-    "load_config_snapshot",
-    "make_engine",
-    "open_config_connection",
-    "open_config_session",
-    "read_config",
-    "read_generation",
-    "read_store_state",
-    "require_writer_lock_held",
-    "resolve_config_path",
-    "resolve_config_url",
-    "save_config",
     "session_for_engine",
     "session_scope",
+    "set_client_id",
+    "StoreIdConflict",
+    "StoreState",
+    "TOKEN_MAX_TTL_SECONDS",
+    "token_precheck",
+    "token_status",
+    "TokenState",
+    "TokenStatus",
+    "TrustedPin",
+    "TrustKey",
+    "TrustSnapshot",
     "upgrade_schema",
     "url_for_path",
     "validate_config",
     "write_config",
     "writer_lock",
     "writer_lock_path",
+    "WRITER_LOCK_SUFFIX",
+    "WriteResult",
 ]

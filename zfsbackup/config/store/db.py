@@ -175,6 +175,19 @@ the daemon: such a file is a provisioning mistake (the daemon would run on a
 rollback-journal database, where it and the CLI writer block each other),
 and refusing early is cheaper than diagnosing it later.
 
+Ephemeral engines (TLS/mTLS plan M7)
+------------------------------------
+`ephemeral_engine` is the second, deliberately separate way to reach the
+database: a fresh `NullPool` engine per `with` block, never cached, disposed
+on exit. It exists for the API worker, which reads and writes the trust
+tables from many request threads of one long-lived process (`store/trust.py`
+is its only user). The cached engines are wrong there twice over: a pooled
+connection would sit in the worker between calls (an open fd and `-shm`
+mapping), and the cache is shared process state that `dispose_all()` empties
+-- a thread calling it would yank connections other threads are using. An
+ephemeral engine shares nothing with the cache or with other threads, so
+neither problem exists. Same pragmas, same `BEGIN IMMEDIATE` for writers.
+
 Note for item 8's `ensure_schema` wrapper
 -----------------------------------------
 When a URL-taking wrapper around `migrate.ensure_schema()` is written, it
@@ -218,7 +231,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine, URL, make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session
-from sqlalchemy.pool import SingletonThreadPool, StaticPool
+from sqlalchemy.pool import NullPool, SingletonThreadPool, StaticPool
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +245,7 @@ _SHARED_CONNECTION_POOLS = (StaticPool, SingletonThreadPool)
 __all__ = [
     "ReadOnlySessionError",
     "dispose_all",
+    "ephemeral_engine",
     "get_engine",
     "make_engine",
     "session_for_engine",
@@ -426,12 +440,19 @@ def _execute_wal_pragma(cursor) -> tuple:  # noqa: ANN001
     """`PRAGMA journal_mode=WAL`, retried for a bounded wall-clock time while a
     foreign process holds the database busy.
 
-    **Who this helps.** Every zfsbackup writer is serialised by
-    `<db>.writer.lock` before it connects, so two of *our* writers never reach
-    this statement together. The retry only matters against a holder outside
-    that lock: a foreign tool (`sqlite3` shell, a backup job, another
-    application) that has a write transaction open, or a reader that has not
-    finished its statement.
+    **Who this helps.** Every zfsbackup-config (CLI) writer is serialised by
+    `<db>.writer.lock` before it connects, so two CLI writers never reach
+    this statement together. The API worker's trust writers
+    (`trust.enroll_client`, `rotate_client`, `retire_predecessor`) are NOT
+    under that flock: they serialise against the CLI on SQLite's write lock
+    only (and against each other on an in-process lock in `trust.py`), so one
+    of them can be inside `BEGIN IMMEDIATE` while a CLI writer connects. In
+    practice that does not reach this retry: they only ever open a database
+    that `import` has already switched to WAL, and on a WAL file this
+    statement is a no-op that needs no write lock. The retry matters against
+    a holder outside all of that: a foreign tool (`sqlite3` shell, a backup
+    job, another application) that has a write transaction open on a
+    not-yet-WAL file, or a reader that has not finished its statement.
 
     **Why a retry loop and not just `busy_timeout`.** Switching a
     rollback-journal file to WAL needs the write lock, taken as an UPGRADE
@@ -802,9 +823,17 @@ def _reader_creator(database: Optional[str]):
 
 
 def make_engine(
-    url: str, *, readonly: bool = False, foreign_keys: bool = True
+    url: str,
+    *,
+    readonly: bool = False,
+    foreign_keys: bool = True,
+    ephemeral: bool = False,
 ) -> Engine:
     """Build a new, **uncached** SQLite `Engine` with the store's pragmas.
+
+    `ephemeral=True` builds it on a `NullPool` (no connection outlives its
+    checkout) and refuses in-memory URLs; use it only through
+    `ephemeral_engine`, which owns the engine's lifetime -- see there.
 
     For a config database resolved from `-c`/`ZFSBACKUP_CONFIG`/the
     default path, prefer `config/store/paths.py`'s `open_config_session`
@@ -897,6 +926,23 @@ def make_engine(
             "involved."
         )
 
+    if memory and ephemeral:
+        # A NullPool closes the connection at check-in, and closing the last
+        # connection to a private in-memory database destroys it: every call
+        # would see an empty database. Ephemeral engines exist for a real
+        # file shared with other processes; an in-memory one has neither.
+        raise ValueError(
+            f"refusing an ephemeral engine for in-memory SQLite URL {url!r}: "
+            "each call would open a new, empty database. Use a real file "
+            "(url_for_path)."
+        )
+
+    # Ephemeral engines: no pool at all. Every checkout opens a fresh DBAPI
+    # connection and check-in closes it, so the engine never holds an idle
+    # connection (no fd, no WAL read mark, no `-shm` mapping) between or after
+    # uses. Readers keep the `mode=rw` creator below.
+    pool_kwargs = {"poolclass": NullPool} if ephemeral else {}
+
     if memory:
         # Without StaticPool a second pooled connection to `:memory:` sees
         # an *empty* database rather than the one `create_all` populated.
@@ -928,9 +974,11 @@ def make_engine(
             # `PRAGMA query_only` (+ the ORM guard). The `creator` (rather
             # than a `file:` URL) keeps `engine.url.database` the plain path
             # for the cache key, messages and the not-WAL warning latch.
-            engine = create_engine(url, creator=_reader_creator(parsed.database))
+            engine = create_engine(
+                url, creator=_reader_creator(parsed.database), **pool_kwargs
+            )
         else:
-            engine = create_engine(url)
+            engine = create_engine(url, **pool_kwargs)
 
     _install_pragmas(
         engine, readonly=readonly, foreign_keys=foreign_keys, memory=memory
@@ -973,6 +1021,19 @@ _ENGINES: Dict[Tuple[str, bool, bool], Tuple[int, Engine]] = {}
 # `_ENGINES` consistent before they collect, so re-entry is safe.)
 _ENGINES_LOCK = threading.RLock()
 
+# Serialises the CONSTRUCTION of ephemeral engines (`ephemeral_engine`) and
+# nothing else: `create_engine` plus the listener registration in
+# `_install_pragmas`/`_install_begin_immediate`, which opens no file and takes
+# microseconds. SQLAlchemy keeps its event-listener bookkeeping in
+# process-global registries and does not document concurrent `event.listen`
+# calls as thread-safe; the API worker builds these engines from many request
+# threads at once, so the question is removed rather than argued. Deliberately
+# NOT `_ENGINES_LOCK`: ephemeral engines must never contend with, or be
+# reachable from, the cache that `dispose_all()` manages. Connecting, querying
+# and disposing all happen outside it. Replaced in a forked child like
+# `_ENGINES_LOCK`.
+_EPHEMERAL_BUILD_LOCK = threading.Lock()
+
 
 # "Not in WAL mode" is logged once per (process, database path), NOT once per
 # engine: the daemon disposes every engine after each poll (every 10 s), and a
@@ -1000,8 +1061,9 @@ def _reinit_lock_after_fork() -> None:
     engine from a fork handler would run connection teardown at an
     arbitrary point. The pid check in `get_engine()` owns the engines.
     """
-    global _ENGINES_LOCK
+    global _ENGINES_LOCK, _EPHEMERAL_BUILD_LOCK
     _ENGINES_LOCK = threading.RLock()
+    _EPHEMERAL_BUILD_LOCK = threading.Lock()
     _NOT_WAL_WARNED.clear()
 
 
@@ -1198,6 +1260,58 @@ def dispose_all() -> None:
             gc.collect()
 
 
+@contextmanager
+def ephemeral_engine(
+    url: str, *, readonly: bool = False, foreign_keys: bool = True
+) -> Iterator[Engine]:
+    """A brand-new, **uncached, unpooled** `Engine` for the `with` block only.
+
+    For callers that open the database from several threads of a long-lived
+    process that must hold nothing open between calls -- the API worker's
+    request threads and its trust poll (`store/trust.py`, TLS/mTLS plan M7).
+
+    What makes it safe there:
+
+    - **Fresh per call, shared with nobody.** Every call builds its own
+      `Engine` and `NullPool`; nothing is stored in module state, and the
+      engine is never placed in `_ENGINES`. No two threads ever touch the
+      same engine, pool or DBAPI connection, and `get_engine`'s cache and
+      `dispose_all()` (the supervisor's fork-point call) can neither see nor
+      dispose it -- so a `dispose_all()` in another thread cannot pull a
+      connection out from under a request, and a request cannot leave
+      anything for `dispose_all()` to miss.
+    - **Nothing outlives the block.** `NullPool` closes each DBAPI
+      connection when it is checked in (the `Session`/`Connection` closing),
+      so after the block the process holds no fd on the database, no WAL read
+      mark and no `-shm` mapping; `dispose()` in the `finally` is then a
+      formality that also drops the pool object. A caller that forks after
+      the block has nothing to leak into the child.
+    - **Same connection setup as every other engine.** The one `connect`
+      listener (`_install_pragmas`: `busy_timeout`, the reader's journal-mode
+      observation or the writer's guarded WAL switch, `synchronous`,
+      `foreign_keys`, and `query_only` for readers) and, for writers,
+      `_install_begin_immediate` (`BEGIN IMMEDIATE` at the first statement)
+      are installed exactly as `make_engine` installs them for cached
+      engines. Readers open `mode=rw` (never create).
+    - **Construction is serialised** (`_EPHEMERAL_BUILD_LOCK`, see there);
+      connecting and querying are not.
+
+    Not for forking: the engine must not cross a `fork` while a connection
+    from it is open (no caller here forks). In-memory URLs are refused
+    (`make_engine`). Callers inside the store reach this through
+    `paths.open_config_session(..., ephemeral=True)` /
+    `open_config_connection(..., ephemeral=True)`, which preflight first.
+    """
+    with _EPHEMERAL_BUILD_LOCK:
+        engine = make_engine(
+            url, readonly=readonly, foreign_keys=foreign_keys, ephemeral=True
+        )
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
 def _install_readonly_guard(session: Session) -> None:
     """Attach layer 2 of read-only enforcement to one `Session` instance.
 
@@ -1277,6 +1391,17 @@ def session_for_engine(engine: Engine, *, readonly: bool = False) -> Iterator[Se
     on a fresh database. Keep writer blocks short for the same family of
     reasons, and do not wrap a long ZFS operation in one.
 
+    **The same rule binds the API worker's request threads.** Its trust
+    writers (`trust.enroll_client`, `rotate_client`, `retire_predecessor`)
+    each open their own ephemeral writer connection, so a request thread
+    must never call one while it holds any writer session or connection of
+    its own -- that nesting is the 5 s stall-then-`ConfigBusy` above, every
+    time. Those writers take no `<db>.writer.lock`: against the CLI they
+    serialise on SQLite's write lock (`BEGIN IMMEDIATE` + `busy_timeout`)
+    alone, and against each other on `trust._API_WRITE_LOCK`, an in-process
+    lock that keeps concurrent request threads out of SQLite's sleeping
+    busy handler.
+
     That single commit is the
     whole durability story for `mapper.save_config`, which is a
     wipe-and-reinsert that owns no transaction policy of its own: because
@@ -1314,8 +1439,15 @@ def session_for_engine(engine: Engine, *, readonly: bool = False) -> Iterator[Se
 
 
 @contextmanager
-def session_scope(url: str, *, readonly: bool = False) -> Iterator[Session]:
+def session_scope(
+    url: str, *, readonly: bool = False, ephemeral: bool = False
+) -> Iterator[Session]:
     """Context-managed `Session` for a URL, resolving the engine per call.
+
+    `ephemeral=True` uses a fresh `ephemeral_engine` for this one block
+    instead of the pid-keyed cache (no pool, nothing cached, disposed on
+    exit; see `ephemeral_engine`). Commit/rollback/close behaviour and the
+    read-only guard are identical.
 
     The engine is looked up through `get_engine()` **on every call**, inside
     the context manager. There is deliberately no module-level
@@ -1350,6 +1482,11 @@ def session_scope(url: str, *, readonly: bool = False) -> Iterator[Session]:
     behaviour change introduced together with `BEGIN IMMEDIATE`; before it,
     a `SELECT` on a writer engine took no lock at all.
     """
+    if ephemeral:
+        with ephemeral_engine(url, readonly=readonly) as engine:
+            with session_for_engine(engine, readonly=readonly) as session:
+                yield session
+        return
     engine = get_engine(url, readonly=readonly)
     with session_for_engine(engine, readonly=readonly) as session:
         yield session

@@ -87,13 +87,12 @@ retention rules. Never reuse it as the DB→dataclass path either.
 `snapshot_prefix` default `"autosnap"`, retention defaulting to `{'1d': '30d'}` when empty, retention
 sorted by age, and the "No datasets configured" error.
 
-**Two settings are deliberately not on that list.** `prune_interval_seconds` and `client_id_file` are
-nullable, and NULL means "derive at read time" — the mapper passes NULL straight through as `None`
-and `BackupConfig.effective_prune_interval` / `effective_client_id_file` derive it in the process
-that consumes the value. This is not a nicety: `client_id_file` resolves `$HOME`, so freezing it at
-write time meant a DB imported under `sudo` pointed the daemon at `/root/.config/...`, and because
-`ClientIdentity` generates an ID on a miss, that silently orphaned the whole server-side dataset
-tree. Never re-materialise a derived value on the write path. The target property is
+**One setting is deliberately not on that list.** `prune_interval_seconds` is nullable, and NULL means
+"derive at read time" — the mapper passes NULL straight through as `None` and
+`BackupConfig.effective_prune_interval` derives it in the process that consumes the value. Never
+re-materialise a derived value on the write path. (`client_id_file` used to be the second such setting; it was
+removed: the client id now lives in the one-row `host_identity` table, outside the six config tables, so
+`save_config` never touches it and a change to it bumps the config generation.) The target property is
 `load_config(session_from(yaml_imported(P))) == BackupConfig.from_file(P)` for every YAML in the repo.
 
 ## Engine and session rules (item 5) — the highest-risk item in the plan
@@ -110,8 +109,11 @@ database; they do not merely error.**
   the engine disposed before workers start.
 - Pragmas via a `connect` event listener: `journal_mode=WAL`, `synchronous=NORMAL`,
   `busy_timeout=5000`, `foreign_keys=ON`.
-- **Workers are read-only** — enforce it with a read-only session factory, not a convention. Under
-  WAL, readers never block and are never blocked by the single CLI writer.
+- **Workers do not write configuration** — config reads use a read-only session factory, not a convention.
+  Under WAL, readers never block and are never blocked by the single CLI writer. The trust tables are the
+  exception: they have two writers, the CLI and the API worker, both through `store.trust`, which opens a
+  fresh, unpooled (`ephemeral`) engine per call and writes under `BEGIN IMMEDIATE`; trust writes never bump
+  the config generation.
 - `sqlite:///:memory:` must keep working for tests (`StaticPool`, `check_same_thread=False`); WAL
   needs a real file, so the pragma listener skips WAL for in-memory URLs.
 - WAL creates `-wal`/`-shm` sidecars next to the DB — they matter for permissions, packaging, and

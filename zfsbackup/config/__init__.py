@@ -36,6 +36,11 @@ from zfsbackup.config.model import (
     RemoteDatasetConfig,
     RemoteServerConfig,
     RetentionRule,
+    client_id_problem,
+    client_tls_files_problem,
+    destination_url_problem,
+    generate_client_id,
+    normalize_fingerprint,
     parse_time_duration,
     validate_retention_uniqueness,
     # Not public, but imported across module boundaries by backup_manager
@@ -52,6 +57,11 @@ __all__ = [
     "RemoteDatasetConfig",
     "RemoteServerConfig",
     "RetentionRule",
+    "client_id_problem",
+    "client_tls_files_problem",
+    "destination_url_problem",
+    "generate_client_id",
+    "normalize_fingerprint",
     "parse_time_duration",
     "validate_retention_uniqueness",
 ]

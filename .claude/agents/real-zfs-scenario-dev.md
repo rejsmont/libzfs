@@ -53,9 +53,11 @@ memories.)
 
 ## Known daemon limitations these scenarios work around
 
-Remote backup is not deployment-ready: the API binds `0.0.0.0` without auth/TLS. (`requests` is now
-declared in `pyproject.toml`; the harness still installs it explicitly in the guests.) Keep working around these
-rather than assuming they're fixed.
+The API is HTTPS-only with mutual TLS (milestone 3): a client must be enrolled (`trust token create` on the server,
+`enroll --token-file` on the client, as root) before it can back up, and health probes need `curl -k https://`.
+The residual caveats (werkzeug development server, no `/enroll` rate limiting) are in
+`docs/production_readiness_report.md`. (`requests` is declared in `pyproject.toml`; the harness still installs it
+explicitly in the guests.)
 
 ## The SQLite config store — what scenarios must account for
 

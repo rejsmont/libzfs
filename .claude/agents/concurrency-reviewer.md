@@ -38,8 +38,9 @@ Check, concretely:
   rebuild** rather than merely warn? Does anything hold a reference that survives the discard?
 - Does a module-level import, a default argument, a class attribute, a decorator, or a test fixture
   create an engine as a side effect of import?
-- Are worker sessions genuinely read-only *by construction* (a read-only session factory), or only
-  by convention? A convention is not a finding-free answer.
+- Workers never open the DB, except the API worker, which reaches only the trust tables through
+  `zfsbackup.config.store.trust` (per-call engines, never cached). Is that true *by construction*, not just by
+  convention? A convention is not a finding-free answer.
 
 ## Hazard 2 — SQLite/WAL correctness
 
@@ -49,7 +50,9 @@ Check, concretely:
   FK that keeps retention scoping honest.
 - WAL requires a real file — is the in-memory URL path skipped correctly, and does `StaticPool` +
   `check_same_thread=False` still hold for tests?
-- Single-writer assumption: is the CLI genuinely the only writer? Does any daemon path write?
+- Writer set: the CLI is the only writer of configuration and `host_identity`; the trust tables have exactly two
+  writers (the CLI and the API worker's `/enroll`, `/rotate` and predecessor retirement). Does any other daemon
+  path write, and does every API-worker write go through `store.trust`?
 - `-wal`/`-shm` sidecars: permissions, cleanup, and whether a crash mid-write leaves a state the
   daemon reads as valid config.
 - Is the generation counter checked and committed inside the same transaction as the write it

@@ -1,5 +1,90 @@
 # Milestone 3 plan (final): TLS and mutual-TLS client authentication for the remote-backup API (closes B1)
 
+## Status / implementation notes (2026-10-20)
+
+**Implemented**: M1–M16 and M18 on branch `tls-mtls`, uncommitted at the time of writing. M17 (the two-VM
+harness over TLS, scenario K) is written; its first real run is still to be recorded in
+[two_vm_backup_report.md](two_vm_backup_report.md). B1 is marked resolved in
+[production_readiness_report.md](production_readiness_report.md). The body below is the plan as approved;
+where it differs from the code, **the code and this section win**. The wire contract is at the end of the
+file, and the user-facing procedures are in `zfsbackup/README.md` ("TLS and enrollment").
+
+### Decisions taken during implementation (final)
+
+- **Revocation is permanent.**
+  - A new table, `revoked_fingerprints`, records every fingerprint that was unpinned, with a reason:
+    `revoked`, `successor_revoked`, `client_revoked`, `replaced` or `retired`. A `retired` row also records
+    the successor that retired it (`superseded_by`).
+  - Enroll and rotate refuse a recorded fingerprint for ever, before the token is looked at, so a stolen
+    key cannot be re-enrolled with a fresh token.
+  - `trust revoke FP` revokes every live descendant of FP, transitively, reaching it through pending
+    rotation links and through the `superseded_by` of retired records (reason `successor_revoked`). If FP
+    was already retired by rotation, the live successor chain is still revoked ("was already retired by its
+    successor C; revoked C ..."). Revoking a stolen key A therefore also removes a thief's C, even after C
+    has been used. A retired rotation predecessor is refused on enroll and rotate too.
+  - A `/rotate` authenticated with C retires C's still-pinned predecessor in the same transaction, so
+    rotating twice (A to C to D) always leaves a recorded chain.
+  - `import` does not clear the table (it is one of the preserved tables).
+- **`enroll --new-key [--cert --key]`** is the recovery path for a lost, stolen or revoked key.
+  - It generates a fresh key as `client.next`, enrolls it, and promotes it once the server accepted it.
+  - A pending `client.next` is reused only if the server at this destination already trusts it; otherwise a
+    new one is made. A pin mismatch during that probe aborts without discarding anything.
+  - With several destinations, run `--new-key` once, then plain `enroll` for each other server, each with
+    a `trust token create --client-id ID --replace` token.
+- **A `--replace` token** presented with an already-pinned certificate performs the replace (the id's
+  other pins are dropped and recorded as `replaced`). The plan answered `already_trusted` here.
+- **Client-id grammar** is `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` (A7 was tightened; a leading `.` or `-` is out).
+- **Destination URLs** must be `https://`; port 0 or an empty port is refused (no port means 443).
+- **`client_id` lives in the `host_identity` table**, not in a file. `client_id_file` and
+  `effective_client_id_file` are gone, and `from_file` refuses the key.
+- **API server:**
+  - TLS 1.3 only, with a per-connection handshake (30 s);
+  - at most 64 connections in all and 16 anonymous ones (no pinned client certificate);
+  - an absolute 30 s deadline for the request line and headers;
+  - a trust poll every 2 s in a dedicated thread;
+  - every `store.trust` call in the API worker serialised in-process;
+  - the API worker restarts (drain, exit 1) only for a confirmed on-disk server-identity change
+    (`identity.IdentityChanged`).
+- **`/enroll`** runs a read-only token pre-check (`token_precheck`) before any `zfs` call.
+- **Dry-run** creates no TLS files and serves with a throwaway identity.
+
+### Deviations from the plan
+
+- **Revoked-fingerprint table** (above); the plan only had a `clients.revoked_at` tombstone and deleted pins.
+  `store.trust` also exports `list_revoked`, and the tables outside the config set are named
+  `mapper.PRESERVED_TABLES` (a module-level assertion classifies every table).
+- **Cascade on revoke** (every live descendant, through pending links and `superseded_by`), retirement of a
+  successor's predecessor at `/rotate`, and permanent refusal of retired predecessors (M7 said only "delete pins").
+- **`enroll --new-key`** and the `--replace`-with-a-pinned-certificate rule (not in M7, M13).
+- **Refresh after a trust write:** the plan said `refresh()` then respond. The code first tries a bounded
+  refresh (up to 2 s) before the response; if that cannot run in time, it is retried right after the
+  response is sent (`call_on_close`). The trust poll is the backstop, and a client connecting in that
+  window may see one refusal and should retry.
+- **Anonymous connection cap (16)** and the **absolute header deadline** (the plan had only the total cap of
+  64 and the handshake timeout).
+- **`IdentityChanged`:** a failed gateway rebuild fails closed for removals; only a confirmed change of the
+  server certificate on disk restarts the API worker (the plan had no restart path).
+- **`identity.py` additions:** `peek_identity`, `promote_identity`/`complete_promotion` (a crash between
+  the two renames is rolled forward, never reported as damage), redacting `SecretStr`/`SecretBytes`,
+  `is_pin_mismatch`/`is_tls_alert_rejection`.
+- **`token_precheck`, `list_revoked`** in the store API; the store's API writers take no flock and queue on
+  an in-process lock, and a locked database becomes `ConfigBusy`.
+- **Client rejection detection:** `/whoami` is retried once after a reset straight after the handshake
+  (see "M11 rejection detection" below).
+- **`PROP_CLIENT_ID` and `_server_dataset`:** a validation failure answers 400 as planned; a dataset whose
+  recorded id differs from the binding answers 409.
+
+### Deferred (beyond the plan's own list)
+
+- The plan's deferred items stand (`require_ca`, `zfs receive -x`, `trust add`/`trust forget`, re-keying
+  the server certificate, a production WSGI server, raw sends, reporting the applied trust generation).
+- No mid-stream revocation, and no rate limiting on `/enroll`.
+- `TestRealSendReceive` (`tests/test_zfsbackup_real.py`, `real_zfs` tier) is skipped pending a rewrite around
+  an enrolled client.
+- The M17 run record (see above).
+
+---
+
 This is the final proposal. It includes your answers on the revised plan and replaces `/Users/rejsmont/src/libzfs/docs/tls_mtls_plan.md` in full. Implementation starts only after you sign off.
 
 ## Changes since the previous revision
@@ -76,7 +161,7 @@ Two design choices follow from D2. Both are spelled out in M6, M7 and M9, and yo
   - Creating files in the TLS directory is guarded by an flock on `<db>.tls/identity.lock`.
 - **A5. Tokens are entered with `--token-file`, `--token -` (stdin) or a hidden prompt.** They travel only in the request body and are never logged.
 - **A6. `/whoami` returns `{client_id, fingerprint}`.** The remote worker calls it once per cycle per destination, in place of `/register`. `enroll` uses it to be idempotent.
-- **A7. Client id grammar: `[A-Za-z0-9._-]{1,64}`, not starting with `.`.**
+- **A7. Client id grammar: `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`** (first character a letter or digit; tightened after review because `libzfseasy` rejects a leading `-`).
   - Generated ids are `<sanitised hostname, truncated to 55>-<uuid8>`.
   - The grammar is enforced by the model helper, store CHECK constraints, the server and the CLI.
 
@@ -744,3 +829,33 @@ Recorded in `tests/test_zfsbackup_tls_platform.py` (45 tests, `integration`). Fa
   with that `.status_code` (S9).
 - **S6:** duplex wss on one `SSLSocket` is clean (64 MiB, hashes match). `simple_websocket` uses
   `sock.send`, not `sendall`; no partial-write problem was observed.
+- **M11 rejection detection (from `test_zfsbackup_identity.py`):** with `pinned_session`, a client
+  certificate the server rejects usually surfaces as `requests.SSLError` carrying the TLS alert, but in about
+  1 run in 30 requests has already written its request and gets `requests.ConnectionError(BrokenPipeError)`
+  or a reset instead. M11 must not treat "got an alert" as the only sign of rejection: a reset straight after
+  a completed handshake on a destination that used to work should be reported as a possible rejection, and
+  `/whoami` should be retried once before concluding.
+
+## M10/M14b wire contract (as implemented, 2026-10-20)
+
+Every endpoint except `/health` and `/enroll` needs a pinned client certificate. No certificate → 401
+`{"error":"client certificate required"}` (also for unknown URLs); unpinned → normally a TLS alert
+(`*_ALERT_UNKNOWN_CA`), 403 `{"error":"client not trusted"}` if it reaches the app; URL `<client_id>` ≠ binding →
+403 `{"error":"client_id mismatch","bound":"<id>"}` (websocket upgrade too). `/enroll` and `/rotate` error bodies
+carry a stable `reason`.
+
+- `GET /whoami` → 200 `{"client_id": <bound id>, "fingerprint": <this cert, 64 hex>}`.
+- `POST /enroll` (no client cert), JSON ≤ 64 KiB:
+  `{"version":1, "client_id", "label"? (≤128, no control chars), "token_secret": <the WHOLE token zfsb1.<fp>.<secret>>,
+  "cert_pem", "signature": base64(sign(cert key, enrollment_payload(server_fp, client_id, cert_fp, secret_hash(secret))))}`.
+  Order: shape 400 → grammar 400 → label 400 → token parse 400 → token fp ≠ own 403 refused → `check_client_cert`
+  422 → signature 403 `bad_signature` → token pre-check 403 `refused` (read-only `token_precheck`, same body as a
+  store refusal; never reaches `zfs`) → `zfs.exists(target/<id>)` 503 → store (`enroll_client`, the authority).
+  200 `enrolled` | 200 `already_trusted` (live token only, not spent) | 403 `refused` (identical for every token
+  problem) | 409 `client_id_taken` (+`hint`; token not spent) | 409 `cert_bound_elsewhere` | 413 | 422
+  `bad_certificate` | 503 `retry:true` (`busy`, `zfs`, draining) | 503 no retry (`remote_backup disabled`, `dry_run`,
+  `unavailable`). Idempotency for a client that is already enrolled comes from `/whoami`, not `/enroll`.
+- `POST /rotate` (current cert), JSON ≤ 64 KiB: `{"version":1, "successor_cert_pem", "signature":
+  base64(sign(SUCCESSOR key, rotation_payload(server_fp, bound_id, current_fp, new_fp)))}` → 200
+  `{"status":"rotated"|"already","client_id","fingerprint":<new>}`; 403 `bad_signature` / `refused`; 400/413/422/503
+  as above. The old pin is retired on the successor's first authenticated request.

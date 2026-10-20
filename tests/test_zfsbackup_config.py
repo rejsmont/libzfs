@@ -633,7 +633,7 @@ class TestBackupConfig:
             "  - name: pool/data\n"
             "destinations:\n"
             "  offsite:\n"
-            "    url: http://backup.example.com\n"
+            "    url: https://backup.example.com\n"
             "remote_backup:\n"
             "  target_dataset: pool/backups\n"
             "  enabled: true\n"
@@ -646,7 +646,7 @@ class TestBackupConfig:
         assert cfg.api_port == 9090
         assert cfg.dry_run is True
         assert 'offsite' in cfg.destinations
-        assert cfg.destinations['offsite'].url == 'http://backup.example.com'
+        assert cfg.destinations['offsite'].url == 'https://backup.example.com'
         assert cfg.remote_backup is not None
         assert cfg.remote_backup.target_dataset == 'pool/backups'
         assert cfg.remote_backup.enabled is True
@@ -674,12 +674,60 @@ class TestBackupConfig:
         with pytest.raises(ValueError, match="target_dataset"):
             BackupConfig.from_file(f)
 
-    def test_from_file_custom_client_id_file(self, tmp_path):
-        id_file = tmp_path / 'my_id'
+    @pytest.mark.parametrize('line', [
+        'client_id_file: /var/lib/zfsbackup/my_id',
+        'client_id_file:',
+        'client_id_file: ""',
+        'client_id_file: .',
+    ], ids=['path', 'null', 'empty-string', 'dot'])
+    def test_from_file_rejects_client_id_file(self, tmp_path, line):
+        """M15/D2: the key is refused whatever its value."""
         f = tmp_path / 'cfg.yaml'
-        f.write_text(f"datasets:\n  - name: pool/data\nclient_id_file: {id_file}\n")
+        f.write_text(f"datasets:\n  - name: pool/data\n{line}\n")
+        with pytest.raises(ValueError, match='client_id_file was removed') as excinfo:
+            BackupConfig.from_file(f)
+        assert 'zfsbackup-config identity' in str(excinfo.value)
+
+    def test_client_id_file_rejection_fires_before_dataset_errors(self, tmp_path):
+        f = tmp_path / 'cfg.yaml'
+        f.write_text(
+            "client_id_file: /x/id\n"
+            "datasets:\n  - name: pool/data\n    frequency: not-a-duration\n"
+            "  - frequency: 5m\n"
+        )
+        with pytest.raises(ValueError, match='client_id_file was removed'):
+            BackupConfig.from_file(f)
+        # The same file without the key reports the dataset problem instead.
+        f.write_text(
+            "datasets:\n  - name: pool/data\n    frequency: not-a-duration\n"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            BackupConfig.from_file(f)
+        assert 'client_id_file' not in str(excinfo.value)
+
+    def test_backup_config_has_no_client_id_file(self):
+        import dataclasses
+
+        cfg = BackupConfig(datasets=[])
+        assert not hasattr(cfg, 'client_id_file')
+        assert not hasattr(cfg, 'effective_client_id_file')
+        assert not hasattr(BackupConfig, 'effective_client_id_file')
+        assert 'client_id_file' not in {f.name for f in dataclasses.fields(BackupConfig)}
+        with pytest.raises(TypeError):
+            BackupConfig(datasets=[], client_id_file=Path('/x/id'))
+
+    def test_loading_a_config_never_resolves_home(self, tmp_path, monkeypatch):
+        """The only live idea of the removed `effective_client_id_file` tests:
+        a config's load and use must not freeze or read `$HOME` (the client id
+        now lives in the database, so there is nothing to derive from it)."""
+        def boom(*_a, **_k):
+            raise AssertionError("config touched Path.home()")
+
+        monkeypatch.setattr(Path, 'home', boom)
+        f = tmp_path / 'cfg.yaml'
+        f.write_text("datasets:\n  - name: pool/data\n")
         cfg = BackupConfig.from_file(f)
-        assert cfg.client_id_file == id_file
+        assert cfg.same_as(BackupConfig.from_file(f))
 
     def test_enabled_datasets(self):
         cfg = BackupConfig(datasets=[
@@ -748,7 +796,7 @@ class TestBackupConfig:
             "          1d: 5y\n"
             "destinations:\n"
             "  offsite:\n"
-            "    url: http://backup.example.com\n"
+            "    url: https://backup.example.com\n"
         )
         cfg = BackupConfig.from_file(f)  # must not raise
         assert len(cfg.datasets[0].remote[0].retention_rules) == 1
@@ -790,7 +838,7 @@ class TestBackupConfig:
             "      - destination: offsite\n"
             "destinations:\n"
             "  offsite:\n"
-            "    url: http://backup.example.com\n"
+            "    url: https://backup.example.com\n"
         )
         cfg = BackupConfig.from_file(f)  # must not raise
         assert cfg.datasets[0].remote[0].destination == 'offsite'
@@ -830,9 +878,11 @@ def _rich_config(**over) -> BackupConfig:
             ),
             DatasetConfig(name='pool/b', recursive=True),
         ],
-        destinations={'offsite': Destination(url='ssh://h/pool')},
+        destinations={'offsite': Destination(
+            url='https://h/pool', server_fingerprint='ab' * 32)},
         remote_backup=RemoteServerConfig(target_dataset='pool/recv'),
-        client_id_file=Path('/x/id'),
+        client_cert_file=Path('/x/cert.pem'),
+        client_key_file=Path('/x/key.pem'),
     )
     data.update(over)
     return BackupConfig(**data)
@@ -900,13 +950,14 @@ class TestSameAs:
             lambda c: setattr(c, 'api_port', 9999),
             lambda c: setattr(c, 'api_host', '0.0.0.0'),
             lambda c: setattr(c, 'dry_run', True),
-            lambda c: setattr(c, 'client_id_file', Path('/x/y')),
+            lambda c: setattr(c, 'client_cert_file', Path('/x/other.pem')),
+            lambda c: setattr(c, 'client_key_file', Path('/x/other-key.pem')),
             lambda c: setattr(c.datasets[0], 'recursive', True),
             lambda c: setattr(c.datasets[0], 'enabled', False),
             lambda c: setattr(c.datasets[1], 'name', 'pool/c'),
             lambda c: c.datasets[0].remote[0].__setattr__('destination', 'elsewhere'),
-            lambda c: c.destinations['offsite'].__setattr__('url', 'ssh://other/pool'),
-            lambda c: c.destinations.update(extra=Destination(url='ssh://x/y')),
+            lambda c: c.destinations['offsite'].__setattr__('url', 'https://other/pool'),
+            lambda c: c.destinations.update(extra=Destination(url='https://x/y')),
             lambda c: setattr(c.remote_backup, 'enabled', False),
             lambda c: setattr(c, 'remote_backup', None),
             lambda c: c.datasets.append(DatasetConfig(name='pool/c')),
@@ -921,7 +972,7 @@ class TestSameAs:
         ],
         ids=[
             'prefix', 'check_interval_value', 'api_port', 'api_host', 'dry_run',
-            'client_id_file', 'recursive', 'enabled', 'dataset_name',
+            'client_cert_file', 'client_key_file', 'recursive', 'enabled', 'dataset_name',
             'remote_destination', 'destination_url', 'extra_destination',
             'remote_backup_flag', 'remote_backup_none', 'dataset_added',
             'retention_rule_dropped', 'prune_interval_to_none', 'prune_interval_value',
@@ -949,10 +1000,10 @@ class TestSameAs:
 
     def test_destination_dict_order_is_not_a_difference(self):
         a = _rich_config(destinations={
-            'one': Destination(url='ssh://1/p'), 'two': Destination(url='ssh://2/p'),
+            'one': Destination(url='https://1/p'), 'two': Destination(url='https://2/p'),
         })
         b = _rich_config(destinations={
-            'two': Destination(url='ssh://2/p'), 'one': Destination(url='ssh://1/p'),
+            'two': Destination(url='https://2/p'), 'one': Destination(url='https://1/p'),
         })
         assert a.same_as(b)
 
@@ -1126,3 +1177,524 @@ class TestSameAsCoversEveryField:
     def test_duration_state_is_value_plus_literal_only(self):
         d = Duration('1h')
         assert set(vars(d)) <= {'_literal'}
+
+
+# ---------------------------------------------------------------------------
+# TLS/mTLS M4: fingerprints, https-only destinations, client id grammar,
+# client certificate/key paths
+# ---------------------------------------------------------------------------
+
+import re  # noqa: E402
+
+from zfsbackup.config import (  # noqa: E402
+    client_id_problem,
+    client_tls_files_problem,
+    destination_url_problem,
+    generate_client_id,
+    normalize_fingerprint,
+)
+
+HEX64 = '0123456789abcdef' * 4
+HEX64_COLON = ':'.join(HEX64[i:i + 2] for i in range(0, 64, 2))
+
+
+@pytest.mark.unit
+class TestNormalizeFingerprint:
+    def test_canonical_form_is_returned_unchanged(self):
+        assert normalize_fingerprint(HEX64) == HEX64
+
+    @pytest.mark.parametrize('value', [HEX64.upper(), HEX64[:32].upper() + HEX64[32:]])
+    def test_case_is_folded_to_lower(self, value):
+        assert normalize_fingerprint(value) == HEX64
+
+    @pytest.mark.parametrize(
+        'value', [HEX64_COLON, HEX64_COLON.upper()], ids=['lower-colon', 'upper-colon'],
+    )
+    def test_colon_form_openssl_prints_is_accepted(self, value):
+        assert normalize_fingerprint(value) == HEX64
+
+    @pytest.mark.parametrize('pad', ['  {}', '{}\n', '\t{} \n'])
+    def test_surrounding_whitespace_is_ignored(self, pad):
+        assert normalize_fingerprint(pad.format(HEX64)) == HEX64
+        assert normalize_fingerprint(pad.format(HEX64_COLON)) == HEX64
+
+    @pytest.mark.parametrize(
+        'value',
+        [
+            '', ' ', HEX64[:63], HEX64 + '0', HEX64[:32], '0x' + HEX64[:62],
+            HEX64[:-1] + 'g',                                   # non-hex digit
+            HEX64[:10] + ' ' + HEX64[10:],                      # inner space
+            '\uff10' * 64,                                      # full-width digits
+            '\u0660' * 64,                                      # Arabic-indic digits
+            HEX64_COLON[:-3],                                   # 31 pairs
+            HEX64_COLON + ':00',                                # 33 pairs
+            HEX64_COLON.replace(':', '-'),                      # wrong separator
+            HEX64_COLON.replace(':', '', 1),                    # one colon missing
+            'a' + HEX64_COLON[1:].replace(':', '', 1),
+            ':' + HEX64_COLON, HEX64_COLON + ':',               # leading/trailing colon
+            HEX64[:60] + ':' + HEX64[60:],                      # colon in the 64-hex form
+            HEX64_COLON.replace(':', '::', 1),
+        ],
+    )
+    def test_malformed_values_are_rejected(self, value):
+        with pytest.raises(ValueError):
+            normalize_fingerprint(value)
+
+    @pytest.mark.parametrize('value', [None, 5, b'ab' * 32, 1.5, ['ab'], True])
+    def test_a_non_string_is_rejected_naming_its_type(self, value):
+        with pytest.raises(ValueError, match=type(value).__name__):
+            normalize_fingerprint(value)
+
+    def test_the_result_is_always_64_lowercase_hex(self):
+        for value in (HEX64.upper(), HEX64_COLON.upper(), f' {HEX64} '):
+            out = normalize_fingerprint(value)
+            assert re.fullmatch(r'[0-9a-f]{64}', out)
+
+    def test_it_is_idempotent(self):
+        once = normalize_fingerprint(HEX64_COLON.upper())
+        assert normalize_fingerprint(once) == once
+
+
+@pytest.mark.unit
+class TestDestinationUrlProblem:
+    @pytest.mark.parametrize(
+        'url',
+        ['https://h', 'https://h.example.com:8443', 'https://h:8443/pool/x',
+         'https://[::1]:8443', 'https://10.0.0.2', '  https://h  ',
+         'HTTPS://H', 'Https://h:443', 'https://user@h'],
+    )
+    def test_https_urls_with_a_host_are_fine(self, url):
+        assert destination_url_problem(url) is None
+
+    @pytest.mark.parametrize('url', ['http://h', 'HTTP://h:80', 'Http://h/x', ' http://h '])
+    def test_plaintext_http_is_refused_with_the_https_hint(self, url):
+        problem = destination_url_problem(url)
+        assert problem is not None
+        assert 'plaintext http is not supported' in problem and 'use https://' in problem
+
+    @pytest.mark.parametrize(
+        'url, scheme',
+        [('ssh://h/pool', 'ssh'), ('ftp://h', 'ftp'), ('ws://h', 'ws'),
+         ('wss://h', 'wss'), ('h:8080/x', 'h')],
+    )
+    def test_any_other_scheme_is_refused_naming_it(self, url, scheme):
+        problem = destination_url_problem(url)
+        assert problem is not None and repr(scheme) in problem
+
+    @pytest.mark.parametrize('url', ['backup.example.com', '//h', '/path/only', 'localhost'])
+    def test_no_scheme_is_refused(self, url):
+        problem = destination_url_problem(url)
+        assert problem is not None and 'no scheme' in problem
+
+    @pytest.mark.parametrize('url', ['https://', 'https:///path', 'https://:443', 'https://?q=1'])
+    def test_no_host_is_refused(self, url):
+        problem = destination_url_problem(url)
+        assert problem is not None and 'no host' in problem
+
+    @pytest.mark.parametrize(
+        'url',
+        ['https://h:99999', 'https://h:abc', 'https://h:-1', 'https://h:65536',
+         'https://[::1', 'https://h:8o80'],
+    )
+    def test_a_bad_port_or_malformed_authority_is_refused(self, url):
+        problem = destination_url_problem(url)
+        assert problem is not None and 'not a valid URL' in problem
+
+    @pytest.mark.parametrize(
+        'url',
+        ['https://h:0', 'https://h:00', 'https://h:0/path', 'https://[::1]:0',
+         'https://user@h:0', ' https://h:0 '],
+    )
+    def test_port_zero_is_refused_naming_the_url(self, url):
+        problem = destination_url_problem(url)
+        assert problem is not None and 'port 0' in problem and 'leave the port out' in problem
+
+    @pytest.mark.parametrize(
+        'url',
+        ['https://h:', 'https://h:/path', 'https://[::1]:', 'https://u@h:', 'https://u:p@h:',
+         'https://h.example.com:?q=1', ' https://h: '],
+    )
+    def test_an_empty_port_is_refused_rather_than_read_as_443(self, url):
+        problem = destination_url_problem(url)
+        assert problem is not None and 'empty port' in problem
+
+    @pytest.mark.parametrize(
+        'url', ['https://h:1', 'https://h:443', 'https://h:65535', 'https://[::1]:8443',
+                'https://u@h:8443', 'https://u:p@h:8443/x', 'https://h/a:b', 'https://h/x:',
+                'https://h?x=:', 'https://h#:'],
+    )
+    def test_a_real_port_and_a_colon_outside_the_authority_are_fine(self, url):
+        assert destination_url_problem(url) is None
+
+    @pytest.mark.parametrize('url', ['', '   ', '\n', None, 5, b'https://h', ['https://h']])
+    def test_empty_or_non_string_is_refused(self, url):
+        assert destination_url_problem(url) == 'url must be a non-empty string'
+
+    def test_it_never_raises(self):
+        for url in ['https://h:\u0663', 'https://\x00', 'https://h\n', '\x00', 'https://[x]']:
+            result = destination_url_problem(url)
+            assert result is None or isinstance(result, str)
+
+
+@pytest.mark.unit
+class TestClientIdProblem:
+    @pytest.mark.parametrize(
+        'value',
+        ['a', 'A', '0', '9z', 'host-1234abcd', 'a.b', 'a_b', 'a-b',
+         'a.', 'a-', 'a_', 'a..b', 'a' * 64, 'Z' * 63 + '9', 'My-Host.example.com-0a1b2c3d'],
+    )
+    def test_valid_ids(self, value):
+        assert client_id_problem(value) is None
+
+    def test_empty_is_refused(self):
+        assert 'empty' in client_id_problem('')
+
+    @pytest.mark.parametrize('n', [65, 66, 100, 1000])
+    def test_over_64_characters_is_refused_naming_the_length(self, n):
+        problem = client_id_problem('a' * n)
+        assert problem is not None and str(n) in problem and '64' in problem
+
+    def test_exactly_64_characters_is_fine_and_65_is_not(self):
+        assert client_id_problem('a' * 64) is None
+        assert client_id_problem('a' * 65) is not None
+
+    @pytest.mark.parametrize('value', ['.', '..', '.a', '.hidden', '...', '.-', '._'])
+    def test_a_leading_dot_is_refused(self, value):
+        problem = client_id_problem(value)
+        assert problem == "client id must start with an ASCII letter or digit, not '.'"
+        assert "must not start with" not in problem        # the old wording is gone
+
+    @pytest.mark.parametrize('value, first', [
+        ('-', '-'), ('-a', '-'), ('--', '-'), ('-x-y', '-'), ('-.', '-'),
+        ('_', '_'), ('_a', '_'), ('__', '_'), ('_x_y', '_'),
+    ])
+    def test_a_leading_hyphen_or_underscore_is_refused_naming_the_character(self, value, first):
+        problem = client_id_problem(value)
+        assert problem == (
+            f"client id must start with an ASCII letter or digit, not {first!r}")
+
+    @pytest.mark.parametrize('first', list('abzAZ059'))
+    def test_every_letter_or_digit_may_start_an_id(self, first):
+        assert client_id_problem(first) is None
+        assert client_id_problem(first + '-._') is None
+
+    @pytest.mark.parametrize('value', ['-\x00', '-a b', '-\u00e9', '-\n'])
+    def test_a_bad_character_is_reported_before_a_bad_first_character(self, value):
+        # Both rules are broken; the character-set message wins (it is the more basic one).
+        assert 'ASCII letters, digits' in client_id_problem(value)
+
+    @pytest.mark.parametrize(
+        'value',
+        ['a b', ' a', 'a ', 'a/b', '/a', 'a\\b', 'a@b', 'a#b', 'a:b', 'a=b', 'a%41',
+         'a\nb', 'abc\n', '\nabc', 'a\tb', 'a\x00b', '\x00', 'a*b', 'a?b', 'a[b', 'a,b',
+         '\u00e9', 'caf\u00e9', '\u65e5\u672c', 'a\u200bb', '\uff21', 'a\u0301'],
+    )
+    def test_characters_outside_the_grammar_are_refused(self, value):
+        problem = client_id_problem(value)
+        assert problem is not None and 'ASCII letters, digits' in problem
+
+    @pytest.mark.parametrize('value', [None, 5, b'abc', ['a'], 1.5])
+    def test_non_strings_are_refused(self, value):
+        assert 'must be a string' in client_id_problem(value)
+
+    def test_the_id_is_safe_as_a_path_component_and_a_zfs_name_part(self):
+        # The point of the grammar: nothing that can climb or split a path or a
+        # ZFS name (`/`, `@`, `#`, `%`, whitespace, `..`) is ever valid.
+        for bad in ['..', '../x', 'a/../b', 'a@snap', 'a#bm', 'a%b', 'a b', '.']:
+            assert client_id_problem(bad) is not None
+
+
+@pytest.mark.unit
+class TestGenerateClientId:
+    @staticmethod
+    def _host(monkeypatch, name):
+        import zfsbackup.config.model as model
+
+        monkeypatch.setattr(model.socket, 'gethostname', lambda: name)
+
+    def test_shape_is_hostname_dash_eight_hex(self, monkeypatch):
+        self._host(monkeypatch, 'backup01')
+        assert re.fullmatch(r'backup01-[0-9a-f]{8}', generate_client_id())
+
+    def test_two_calls_differ(self, monkeypatch):
+        self._host(monkeypatch, 'h')
+        assert generate_client_id() != generate_client_id()
+
+    def test_a_long_hostname_is_truncated_to_55_so_the_id_is_64(self, monkeypatch):
+        self._host(monkeypatch, 'a' * 200)
+        cid = generate_client_id()
+        assert len(cid) == 64 and cid.startswith('a' * 55 + '-')
+        assert client_id_problem(cid) is None
+
+    def test_a_55_character_hostname_fits_exactly(self, monkeypatch):
+        self._host(monkeypatch, 'b' * 55)
+        cid = generate_client_id()
+        assert len(cid) == 64 and cid.startswith('b' * 55 + '-')
+
+    def test_a_54_character_hostname_is_kept_whole(self, monkeypatch):
+        self._host(monkeypatch, 'c' * 54)
+        assert generate_client_id().startswith('c' * 54 + '-')
+
+    def test_non_ascii_characters_become_dashes(self, monkeypatch):
+        self._host(monkeypatch, 'caf\u00e9')
+        cid = generate_client_id()
+        assert cid.startswith('caf--') and client_id_problem(cid) is None
+
+    def test_an_all_non_ascii_hostname_is_still_valid(self, monkeypatch):
+        self._host(monkeypatch, '\u65e5\u672c\u8a9e')
+        cid = generate_client_id()
+        assert re.fullmatch(r'host-[0-9a-f]{8}', cid)
+        assert client_id_problem(cid) is None
+
+    @pytest.mark.parametrize('name', ['', None])
+    def test_an_empty_hostname_becomes_host(self, monkeypatch, name):
+        self._host(monkeypatch, name)
+        assert re.fullmatch(r'host-[0-9a-f]{8}', generate_client_id())
+
+    @pytest.mark.parametrize(
+        'name, prefix',
+        [('.local', 'local-'), ('...x', 'x-'), ('.a.b', 'a.b-'), ('.-x', 'x-'),
+         ('-x', 'x-'), ('_x', 'x-'), ('-_.-x', 'x-'), ('_.x_', 'x_-')],
+    )
+    def test_leading_dots_are_dropped(self, monkeypatch, name, prefix):
+        self._host(monkeypatch, name)
+        cid = generate_client_id()
+        assert cid.startswith(prefix) and client_id_problem(cid) is None
+
+    @pytest.mark.parametrize('name', ['....', '-', '_', '-_.', '---', '__', '.-_.-_'])
+    def test_a_hostname_of_only_dots_hyphens_and_underscores_becomes_host(self, monkeypatch, name):
+        self._host(monkeypatch, name)
+        assert re.fullmatch(r'host-[0-9a-f]{8}', generate_client_id())
+
+    @pytest.mark.parametrize('name', ['\u65e5\u672c\u8a9e', '\u00e9', '\u00e9\u00e8', ' ', '/', '@@'])
+    def test_a_hostname_with_nothing_ascii_left_becomes_host(self, monkeypatch, name):
+        # Every character turns into '-', and leading '-' is dropped: nothing remains.
+        self._host(monkeypatch, name)
+        assert re.fullmatch(r'host-[0-9a-f]{8}', generate_client_id())
+
+    def test_a_non_ascii_prefix_does_not_leave_a_leading_hyphen(self, monkeypatch):
+        self._host(monkeypatch, '\u00e9host')
+        cid = generate_client_id()
+        assert cid.startswith('host-') and client_id_problem(cid) is None
+
+    def test_the_generator_never_produces_an_invalid_id_over_random_hostnames(self, monkeypatch):
+        """Property test (seeded, no hypothesis in this environment): hostnames drawn from an
+        alphabet heavy in the troublesome characters, any length, never give an invalid id --
+        the generator's own assert is not what makes this pass."""
+        import random
+
+        alphabet = list('.-_ab09AZ /@:%\n\x00') + ['\u00e9', '\u65e5', '\u200b', '\U0001f600']
+        rng = random.Random(20261020)
+        for _ in range(600):
+            name = ''.join(rng.choice(alphabet) for _ in range(rng.randint(0, 90)))
+            self._host(monkeypatch, name)
+            cid = generate_client_id()
+            assert client_id_problem(cid) is None, (name, cid)
+            assert cid[0].isascii() and cid[0].isalnum(), (name, cid)
+
+    def test_a_long_leading_dot_run_is_dropped_before_truncating(self, monkeypatch):
+        self._host(monkeypatch, '.' * 100 + 'z' * 100)
+        cid = generate_client_id()
+        assert cid.startswith('z' * 55 + '-') and len(cid) == 64
+
+    def test_gethostname_raising_oserror_falls_back_to_host(self, monkeypatch):
+        import zfsbackup.config.model as model
+
+        def boom():
+            raise OSError('no hostname')
+
+        monkeypatch.setattr(model.socket, 'gethostname', boom)
+        assert re.fullmatch(r'host-[0-9a-f]{8}', generate_client_id())
+
+    @pytest.mark.parametrize(
+        'name',
+        ['a b', 'a/b', 'a@b', 'x\ny', 'a\x00b', 'h%41', 'UPPER', 'under_score', 'a..b',
+         '\u00e9' * 80, ' ' * 70, 'ok.example.com', '-', '.-.', 'a' * 55, 'a' * 56],
+    )
+    def test_the_result_always_satisfies_the_grammar(self, monkeypatch, name):
+        self._host(monkeypatch, name)
+        for _ in range(3):
+            assert client_id_problem(generate_client_id()) is None
+
+
+@pytest.mark.unit
+class TestClientTlsFilesProblem:
+    @pytest.mark.parametrize(
+        'cert, key',
+        [(None, None), ('/etc/c.pem', '/etc/k.pem'), (Path('/etc/c.pem'), Path('/etc/k.pem')),
+         (Path('/c'), '/k')],
+    )
+    def test_neither_or_both_absolute_is_fine(self, cert, key):
+        assert client_tls_files_problem(cert, key) is None
+
+    @pytest.mark.parametrize('cert, key', [('/etc/c.pem', None), (None, Path('/etc/k.pem'))])
+    def test_exactly_one_is_refused(self, cert, key):
+        assert 'must be set together' in client_tls_files_problem(cert, key)
+
+    @pytest.mark.parametrize(
+        'cert, key, which',
+        [('c.pem', '/k', 'client_cert_file'), ('/c', 'k.pem', 'client_key_file'),
+         (Path('rel/c.pem'), Path('/k'), 'client_cert_file'),
+         ('./c.pem', '/k', 'client_cert_file'), ('~/c.pem', '/k', 'client_cert_file')],
+    )
+    def test_a_relative_path_is_refused_naming_the_field(self, cert, key, which):
+        problem = client_tls_files_problem(cert, key)
+        assert which in problem and 'absolute' in problem
+
+    def test_the_pairing_rule_wins_over_the_absolute_rule(self):
+        assert 'together' in client_tls_files_problem('relative.pem', None)
+
+    def test_a_relative_cert_is_reported_before_a_relative_key(self):
+        assert 'client_cert_file' in client_tls_files_problem('c', 'k')
+
+
+@pytest.mark.unit
+class TestDestinationFingerprint:
+    def test_default_is_not_enrolled(self):
+        assert Destination(url='https://h').server_fingerprint is None
+
+    @pytest.mark.parametrize('value', [HEX64, HEX64.upper(), HEX64_COLON, f' {HEX64_COLON.upper()} '])
+    def test_it_is_normalised_on_construction(self, value):
+        assert Destination(url='https://h', server_fingerprint=value).server_fingerprint == HEX64
+
+    @pytest.mark.parametrize('value', ['', 'abc', HEX64[:-1], 5, b'x' * 64])
+    def test_an_invalid_value_raises_at_construction(self, value):
+        with pytest.raises(ValueError):
+            Destination(url='https://h', server_fingerprint=value)
+
+    def test_the_url_scheme_is_not_checked_by_the_dataclass(self):
+        # A config-boundary policy (from_file / validate_config), so a legacy
+        # row can still be loaded and repaired.
+        assert Destination(url='http://legacy').url == 'http://legacy'
+
+    def test_positional_construction_still_works(self):
+        d = Destination('https://h')
+        assert d.url == 'https://h' and d.server_fingerprint is None
+
+    def test_equality_covers_the_fingerprint(self):
+        assert Destination('https://h', HEX64) == Destination('https://h', HEX64.upper())
+        assert Destination('https://h', HEX64) != Destination('https://h')
+
+
+@pytest.mark.unit
+class TestFromFileTlsKeys:
+    BASE = "datasets:\n  - name: pool/data\n"
+
+    def _load(self, tmp_path, text, name='c.yaml'):
+        f = tmp_path / name
+        f.write_text(self.BASE + text)
+        return BackupConfig.from_file(f)
+
+    def _dest(self, fp_line, url='https://backup.example.com'):
+        return f"destinations:\n  offsite:\n    url: {url}\n{fp_line}"
+
+    def test_a_quoted_fingerprint_is_loaded_and_normalised(self, tmp_path):
+        cfg = self._load(tmp_path, self._dest(f'    server_fingerprint: "{HEX64.upper()}"\n'))
+        assert cfg.destinations['offsite'].server_fingerprint == HEX64
+
+    def test_a_quoted_colon_fingerprint_is_loaded_and_normalised(self, tmp_path):
+        cfg = self._load(tmp_path, self._dest(f'    server_fingerprint: "{HEX64_COLON.upper()}"\n'))
+        assert cfg.destinations['offsite'].server_fingerprint == HEX64
+
+    def test_an_unquoted_letter_containing_fingerprint_is_a_string(self, tmp_path):
+        cfg = self._load(tmp_path, self._dest(f'    server_fingerprint: {HEX64}\n'))
+        assert cfg.destinations['offsite'].server_fingerprint == HEX64
+
+    def test_an_unquoted_all_digit_fingerprint_is_an_int_and_refused(self, tmp_path):
+        # YAML types `111...1` (64 digits) as an int; that must fail loudly
+        # rather than be stringified (leading zeros would already be lost).
+        with pytest.raises(ValueError, match=r"destinations\[offsite\]\.server_fingerprint must be a string, got int"):
+            self._load(tmp_path, self._dest('    server_fingerprint: ' + '1' * 64 + '\n'))
+
+    def test_an_unquoted_colon_fingerprint_of_small_decimal_pairs_is_a_sexagesimal_int(self, tmp_path):
+        # PyYAML reads `12:34:12:34...` as a base-60 integer.
+        value = ':'.join(['12', '34'] * 16)
+        with pytest.raises(ValueError, match='must be a string, got int'):
+            self._load(tmp_path, self._dest(f'    server_fingerprint: {value}\n'))
+
+    @pytest.mark.parametrize('line', ['    server_fingerprint:\n', '    server_fingerprint: ""\n',
+                                      '    server_fingerprint: "   "\n', '    server_fingerprint: null\n'])
+    def test_null_and_blank_mean_not_enrolled(self, tmp_path, line):
+        cfg = self._load(tmp_path, self._dest(line))
+        assert cfg.destinations['offsite'].server_fingerprint is None
+
+    def test_an_absent_key_means_not_enrolled(self, tmp_path):
+        cfg = self._load(tmp_path, self._dest(''))
+        assert cfg.destinations['offsite'].server_fingerprint is None
+
+    @pytest.mark.parametrize('bad', [HEX64[:-1], 'z' * 64, HEX64 + '00', 'not-a-fingerprint'])
+    def test_a_malformed_fingerprint_names_its_destination(self, tmp_path, bad):
+        with pytest.raises(ValueError, match=r'destinations\[offsite\]\.server_fingerprint'):
+            self._load(tmp_path, self._dest(f'    server_fingerprint: "{bad}"\n'))
+
+    @pytest.mark.parametrize('value', ['[1, 2]', '{a: b}', 'true', '1.5'])
+    def test_a_non_string_fingerprint_is_refused(self, tmp_path, value):
+        with pytest.raises(ValueError, match='must be a string'):
+            self._load(tmp_path, self._dest(f'    server_fingerprint: {value}\n'))
+
+    @pytest.mark.parametrize('url', ['http://h:8080', 'HTTP://h', 'ssh://h/pool', 'h:8080',
+                                     'https://', 'https://h:99999'])
+    def test_a_non_https_destination_url_is_refused(self, tmp_path, url):
+        with pytest.raises(ValueError, match=r'destinations\[offsite\]: '):
+            self._load(tmp_path, self._dest('', url=f'"{url}"'))
+
+    @pytest.mark.parametrize('url, text', [
+        ('https://h:0', 'port 0'), ('https://h:', 'empty port'),
+        ('https://[::1]:', 'empty port'), ('https://u@h:', 'empty port'),
+        ('https://[::1]:0', 'port 0'),
+    ])
+    def test_port_zero_and_an_empty_port_are_refused_when_loading_yaml(self, tmp_path, url, text):
+        with pytest.raises(ValueError, match=r'destinations\[offsite\]: ') as excinfo:
+            self._load(tmp_path, self._dest('', url=f'"{url}"'))
+        assert text in str(excinfo.value)
+
+    def test_the_http_message_says_to_use_https(self, tmp_path):
+        with pytest.raises(ValueError, match='plaintext http is not supported; use https://'):
+            self._load(tmp_path, self._dest('', url='http://h'))
+
+    def test_the_url_is_stripped(self, tmp_path):
+        cfg = self._load(tmp_path, self._dest('', url='"  https://h:8443  "'))
+        assert cfg.destinations['offsite'].url == 'https://h:8443'
+
+    def test_an_uppercase_scheme_is_accepted(self, tmp_path):
+        cfg = self._load(tmp_path, self._dest('', url='"HTTPS://H"'))
+        assert cfg.destinations['offsite'].url == 'HTTPS://H'
+
+    def test_cert_and_key_are_loaded_as_paths(self, tmp_path):
+        cfg = self._load(tmp_path, "client_cert_file: /etc/zb/c.pem\nclient_key_file: /etc/zb/k.pem\n")
+        assert cfg.client_cert_file == Path('/etc/zb/c.pem')
+        assert cfg.client_key_file == Path('/etc/zb/k.pem')
+
+    def test_cert_and_key_default_to_none(self, tmp_path):
+        cfg = self._load(tmp_path, "")
+        assert cfg.client_cert_file is None and cfg.client_key_file is None
+
+    @pytest.mark.parametrize('text', ['client_cert_file: ""\nclient_key_file: ""\n',
+                                      'client_cert_file:\nclient_key_file:\n'])
+    def test_empty_or_null_cert_and_key_are_unset(self, tmp_path, text):
+        cfg = self._load(tmp_path, text)
+        assert cfg.client_cert_file is None and cfg.client_key_file is None
+
+    @pytest.mark.parametrize('text', ['client_cert_file: /etc/c.pem\n', 'client_key_file: /etc/k.pem\n',
+                                      'client_cert_file: /etc/c.pem\nclient_key_file: ""\n'])
+    def test_only_one_of_cert_and_key_is_refused(self, tmp_path, text):
+        with pytest.raises(ValueError, match='must be set together'):
+            self._load(tmp_path, text)
+
+    @pytest.mark.parametrize('text, field', [
+        ('client_cert_file: c.pem\nclient_key_file: /k\n', 'client_cert_file'),
+        ('client_cert_file: /c\nclient_key_file: rel/k.pem\n', 'client_key_file'),
+    ])
+    def test_a_relative_path_is_refused(self, tmp_path, text, field):
+        with pytest.raises(ValueError, match=f'{field}.*absolute'):
+            self._load(tmp_path, text)
+
+    def test_a_non_string_path_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match='client_cert_file must be a string'):
+            self._load(tmp_path, "client_cert_file: 5\nclient_key_file: /k\n")
+
+    def test_the_shipped_example_yaml_loads(self):
+        example = Path(__file__).resolve().parent.parent / 'zfsbackup' / 'config.example.yaml'
+        cfg = BackupConfig.from_file(example)
+        assert not hasattr(cfg, 'client_id_file')
+        assert all(d.url.lower().startswith('https://') for d in cfg.destinations.values())

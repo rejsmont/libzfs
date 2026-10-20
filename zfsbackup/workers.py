@@ -1,10 +1,14 @@
 """Worker processes for snapshot creation, pruning, API serving, and remote backup.
 
-Workers never open the config database. The supervisor reads it
-(`zfsbackup.runtime_config.load_runtime_config`) at startup and on every
+Workers never read the configuration from the database. The supervisor reads
+it (`zfsbackup.runtime_config.load_runtime_config`) at startup and on every
 reload, applies `--dry-run` to the result in memory, and hands every worker
 its detached `BackupConfig` together with the reload epoch that config belongs
-to (`born_epoch`), both from one `daemon.Handoff`. Under `fork` the child
+to (`born_epoch`) and this host's client id, all from one `daemon.Handoff`.
+The one exception to "never opens the database" is the API worker's trust
+view: it reads the pinned client certificates (and, from M10, writes
+enrollments) only through `zfsbackup.config.store.trust`, on a fresh unpooled
+engine per call, never the configuration tables. Under `fork` the child
 inherits the object; under `spawn`/`forkserver` it is pickled
 (`Duration.__reduce__` preserves the operator's literals), so a respawned
 worker sees exactly the configuration its siblings on the same epoch run. A
@@ -578,11 +582,24 @@ class RemoteBackupWorker(BaseWorker):
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
+        tls_dir=None,
+        client_id: Optional[str] = None,
     ):
+        """`tls_dir` is `<db>.tls` (the default client TLS identity lives
+        there unless `client_cert_file`/`client_key_file` override it);
+        `client_id` is this host's client id from the supervisor's config
+        snapshot (`daemon.Handoff.client_id`), `None` while none has been
+        generated (`zfsbackup-config enroll` does that). Both come from the
+        same hand-over as `config`; a changed id is a reload, so a worker
+        never runs with one generation's config and another's id. Both are
+        passed to `RemoteBackupManager(config, manager, client_id=,
+        tls_dir=)`."""
         super().__init__(
             'remote-backup-worker', config, stop_event, verbose,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
         )
+        self.tls_dir = tls_dir
+        self.client_id = client_id
         self._remote_manager = None
 
     def _get_interval(self, config: BackupConfig) -> float:
@@ -595,7 +612,17 @@ class RemoteBackupWorker(BaseWorker):
 
     def _before_loop(self, config: BackupConfig, manager: DatasetManager) -> None:
         from zfsbackup.remote import RemoteBackupManager
-        self._remote_manager = RemoteBackupManager(config, manager)
+        self._remote_manager = RemoteBackupManager(
+            config, manager, client_id=self.client_id, tls_dir=self.tls_dir
+        )
+
+    def _get_datasets(self, manager: DatasetManager) -> List[DatasetInfo]:
+        # Called once at the top of every cycle: each destination's `/whoami`
+        # check then runs once per cycle, and a client TLS identity that
+        # failed to load is retried.
+        if self._remote_manager is not None:
+            self._remote_manager.begin_cycle()
+        return super()._get_datasets(manager)
 
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
         if not dsi.config.remote:
@@ -623,47 +650,320 @@ class RemoteBackupWorker(BaseWorker):
             )
 
 
+#: At most this many connections are served (handshaking or in a request) at
+#: once. Over the cap a new connection is closed straight away, on the accept
+#: thread, before any TLS byte: unauthenticated peers can tie up at most this
+#: many threads (plan "Threads before authentication").
+API_MAX_CONNECTIONS = 64
+
+#: Timeout of a connection's TLS handshake (seconds; CPython applies a
+#: socket timeout to `do_handshake` as one deadline for the whole handshake,
+#: not per read). A peer that connects and goes silent is dropped after this
+#: long, on its own thread; it never stalls the accept loop or
+#: `server.shutdown()` (plan D6).
+API_HANDSHAKE_TIMEOUT = 30.0
+
+#: ABSOLUTE deadline for a request's line and headers (seconds from the
+#: moment the server starts waiting for them), and so how long an idle
+#: keep-alive connection may hold one of the `API_MAX_CONNECTIONS` slots. A
+#: deadline, not a per-read timeout: a peer dribbling one byte every few
+#: seconds is cut off all the same. For a connection with a pinned client
+#: certificate it is cleared when the app starts (a request body or a
+#: websocket stream is not limited by it); a connection without one gets a
+#: fresh deadline of the same length for the whole request (`/health`,
+#: `/enroll` and refusals are quick).
+API_REQUEST_IDLE_TIMEOUT = 30.0
+
+#: At most this many of the `API_MAX_CONNECTIONS` may be connections whose
+#: handshake completed WITHOUT a pinned client certificate (`/health`,
+#: `/enroll`, refusals). Decided after the handshake; over the cap the
+#: connection is closed. Anonymous peers cannot starve pinned clients of
+#: slots past the handshake.
+API_MAX_ANONYMOUS_CONNECTIONS = 16
+
+#: The capacity WARNING is logged at most once per this many seconds.
+_API_FULL_WARN_EVERY = 60.0
+
 _API_SERVER_CLASS = None
 
 
 def _api_server_class():
-    """Werkzeug's `ThreadedWSGIServer` (what `make_server(..., threaded=True)`
-    builds) minus the reverse DNS lookup in its bind.
+    """The API server class: werkzeug's `ThreadedWSGIServer` (what
+    `make_server(..., threaded=True)` builds), HTTPS only, with the TLS
+    handshake done per connection on that connection's own thread, and
+    without the reverse DNS lookup in its bind.
 
-    `http.server.HTTPServer.server_bind` -- inherited by every werkzeug server
-    -- sets `server_name = socket.getfqdn(host)`, a reverse lookup that stalls
-    for ~30 s on a host with a slow or broken resolver (measured on macOS CI
-    runners) and delayed every API worker start by that long. Nothing here
-    uses `server_name` (werkzeug builds `SERVER_NAME` and `Host` handling from
-    `server_address` and the request), so `server_bind` is
-    `socketserver.TCPServer.server_bind` (which does the `SO_REUSEADDR` and
-    the bind) plus the host/port bookkeeping, with `server_name` set to the
-    configured host. Built lazily so importing this module does not import
-    werkzeug."""
+    **TLS (plan D6, verified by spike S2/S3).** Werkzeug's own `ssl_context`
+    wraps the *listening* socket, so every handshake runs inside `accept()`
+    on the serving thread, with no timeout: one silent peer stalls every
+    later client and `server.shutdown()` (and with it the reload drain).
+    Here the listening socket is never wrapped. `process_request` (accept
+    thread) only takes a slot -- non-blocking, `API_MAX_CONNECTIONS`, over
+    the cap the connection is closed at once -- and starts the thread;
+    `process_request_thread` (the connection's thread) wraps the socket with
+    `TrustGateway.current_context()` *as of that connection*, runs the
+    handshake with `API_HANDSHAKE_TIMEOUT`, clears the timeout and hands the
+    `SSLSocket` to werkzeug. A failed handshake (unpinned or expired client
+    certificate, TLS < 1.3, timeout, a port scan) is logged at DEBUG and
+    closed. After the handshake a connection without a pinned client
+    certificate (no certificate: `/health`, `/enroll`) must also take one of
+    `API_MAX_ANONYMOUS_CONNECTIONS` slots, or is closed, so anonymous peers
+    cannot hold every slot. The request line and headers are read under an
+    ABSOLUTE deadline (`API_REQUEST_IDLE_TIMEOUT`, enforced before every read
+    by the handler's `rfile`), so a peer dribbling bytes cannot keep a slot;
+    it is lifted when the app starts for a pinned connection and renewed for
+    the whole request otherwise. The slots are released in a `finally`.
+    `self.ssl_context` is
+    assigned after construction purely so werkzeug's environ reports `https`,
+    fills `SSL_CLIENT_CERT` and treats SSL errors as dropped connections; it
+    is never used to wrap anything. Handler threads are daemon threads that
+    `server_close()` does not join, so `shutdown()` returns promptly with
+    stalled handshakes pending (they end at their timeout, or with the
+    process).
+
+    There is no plaintext mode: the constructor refuses a gateway that does
+    not yield an `ssl.SSLContext`.
+
+    **Bind.** `http.server.HTTPServer.server_bind` -- inherited by every
+    werkzeug server -- sets `server_name = socket.getfqdn(host)`, a reverse
+    lookup that stalls for ~30 s on a host with a slow or broken resolver
+    (measured on macOS CI runners) and delayed every API worker start by that
+    long. Nothing here uses `server_name` (werkzeug builds `SERVER_NAME` and
+    `Host` handling from `server_address` and the request), so `server_bind`
+    is `socketserver.TCPServer.server_bind` (which does the `SO_REUSEADDR`
+    and the bind) plus the host/port bookkeeping, with `server_name` set to
+    the configured host. Built lazily so importing this module does not
+    import werkzeug."""
     global _API_SERVER_CLASS
     if _API_SERVER_CLASS is None:
+        import hashlib
+        import io
         import socketserver
-        from werkzeug.serving import ThreadedWSGIServer
+        import ssl
+        from werkzeug.serving import ThreadedWSGIServer, WSGIRequestHandler
+
+        log = logging.getLogger(__name__)
+
+        class _DeadlineReader(io.RawIOBase):
+            """The handler's raw `rfile`: before each read, the socket's
+            timeout is set to what is left of the handler's deadline (none
+            set: the read is untouched), and a read past it raises
+            `TimeoutError` -- which `http.server` treats as "Request timed
+            out" and closes the connection."""
+
+            def __init__(self, raw, handler):
+                super().__init__()
+                self._raw = raw
+                self._handler = handler
+
+            def readable(self):
+                return True
+
+            def readinto(self, buffer):
+                deadline = self._handler.read_deadline
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("request not received in time")
+                    self._handler.connection.settimeout(remaining)
+                return self._raw.readinto(buffer)
+
+            def close(self):
+                try:
+                    self._raw.close()
+                finally:
+                    super().close()
+
+        class ApiRequestHandler(WSGIRequestHandler):
+            """Bounds the wait for a request's line and headers by an
+            ABSOLUTE deadline (`API_REQUEST_IDLE_TIMEOUT`), so an idle or
+            dribbling (keep-alive or post-handshake) connection gives its
+            slot back. For a connection with a pinned client certificate the
+            bound is lifted before the app runs; otherwise a fresh one covers
+            the whole request."""
+
+            read_deadline: Optional[float] = None
+
+            def setup(self):
+                super().setup()
+                # `detach` hands over the socket reader without closing it.
+                self.rfile = io.BufferedReader(
+                    _DeadlineReader(self.rfile.detach(), self), io.DEFAULT_BUFFER_SIZE
+                )
+
+            def _arm(self) -> None:
+                timeout = getattr(self.server, 'request_idle_timeout', None)
+                self.read_deadline = (time.monotonic() + timeout) if timeout else None
+
+            def handle_one_request(self):
+                self._arm()
+                return super().handle_one_request()
+
+            def run_wsgi(self):
+                if getattr(self.server.connection_state, 'pinned', True):
+                    self.read_deadline = None
+                    try:
+                        self.connection.settimeout(None)
+                    except OSError:
+                        pass
+                else:
+                    self._arm()
+                return super().run_wsgi()
+
+            def log_error(self, format, *args):
+                # An idle keep-alive connection reaching its timeout is
+                # routine, not an error (`http.server` reports it this way).
+                if format.startswith('Request timed out'):
+                    log.debug("API: closing idle connection from %s", self.client_address)
+                    return
+                super().log_error(format, *args)
 
         class ApiServer(ThreadedWSGIServer):
+            def __init__(
+                self, host, port, app, gateway, *,
+                max_connections: int = API_MAX_CONNECTIONS,
+                handshake_timeout: float = API_HANDSHAKE_TIMEOUT,
+                request_idle_timeout: float = API_REQUEST_IDLE_TIMEOUT,
+                max_anonymous: int = API_MAX_ANONYMOUS_CONNECTIONS,
+            ):
+                current = getattr(gateway, 'current_context', None)
+                context = current() if callable(current) else None
+                if not isinstance(context, ssl.SSLContext):
+                    raise TypeError(
+                        "the API server is HTTPS only: it needs a trust gateway "
+                        "whose current_context() returns an ssl.SSLContext"
+                    )
+                self.gateway = gateway
+                self.handshake_timeout = handshake_timeout
+                self.request_idle_timeout = request_idle_timeout
+                self.max_connections = max_connections
+                self._slots = threading.BoundedSemaphore(max_connections)
+                self.max_anonymous = max_anonymous
+                self._anonymous_slots = threading.BoundedSemaphore(max_anonymous)
+                #: Per connection thread: `pinned` (the handler reads it).
+                self.connection_state = threading.local()
+                self._full_warned_at: Optional[float] = None
+                self._anonymous_full_warned_at: Optional[float] = None
+                # No `ssl_context` here: werkzeug would wrap the listening
+                # socket (handshake on the accept thread).
+                super().__init__(host, port, app, ApiRequestHandler, False, None)
+                # Only for werkzeug's environ (`https`, `SSL_CLIENT_CERT`)
+                # and error classification; never used to wrap a socket.
+                self.ssl_context = context
+
             def server_bind(self):
                 socketserver.TCPServer.server_bind(self)
                 self.server_name = str(self.host)
                 if not isinstance(self.server_address, str):  # not AF_UNIX
                     self.server_port = self.server_address[1]
 
+            def process_request(self, request, client_address):
+                # Accept thread: never block, never handshake here.
+                if not self._slots.acquire(blocking=False):
+                    now = time.monotonic()
+                    if (
+                        self._full_warned_at is None
+                        or now - self._full_warned_at >= _API_FULL_WARN_EVERY
+                    ):
+                        self._full_warned_at = now
+                        log.warning(
+                            "API server: %d connections already open; refusing "
+                            "new ones until some close", self.max_connections,
+                        )
+                    self.shutdown_request(request)
+                    return
+                try:
+                    super().process_request(request, client_address)
+                except BaseException:
+                    # The thread never started: nobody else releases the slot.
+                    self._slots.release()
+                    raise
+
+            def process_request_thread(self, request, client_address):
+                try:
+                    try:
+                        context = self.gateway.current_context()
+                        tls = context.wrap_socket(
+                            request, server_side=True, do_handshake_on_connect=False
+                        )
+                    except Exception as exc:
+                        log.debug("API: cannot set up TLS for %s: %s", client_address, exc)
+                        self.shutdown_request(request)
+                        return
+                    try:
+                        # One deadline for the whole handshake: CPython's
+                        # `do_handshake` honours a socket timeout as a deadline.
+                        tls.settimeout(self.handshake_timeout)
+                        tls.do_handshake()
+                        tls.settimeout(None)
+                    except Exception as exc:  # SSLError, TimeoutError, OSError
+                        log.debug("API: TLS handshake with %s failed: %s", client_address, exc)
+                        self._close_tls(tls)
+                        return
+                    pinned = self._is_pinned(tls)
+                    if not pinned and not self._anonymous_slots.acquire(blocking=False):
+                        now = time.monotonic()
+                        if (
+                            self._anonymous_full_warned_at is None
+                            or now - self._anonymous_full_warned_at >= _API_FULL_WARN_EVERY
+                        ):
+                            self._anonymous_full_warned_at = now
+                            log.warning(
+                                "API server: %d connections without a pinned client "
+                                "certificate already open; refusing more until some "
+                                "close", self.max_anonymous,
+                            )
+                        self._close_tls(tls)
+                        return
+                    self.connection_state.pinned = pinned
+                    try:
+                        super().process_request_thread(tls, client_address)
+                    finally:
+                        self.connection_state.pinned = True
+                        if not pinned:
+                            self._anonymous_slots.release()
+                finally:
+                    self._slots.release()
+
+            def _is_pinned(self, tls) -> bool:
+                """Whether the peer presented a certificate the gateway has
+                pinned (route authentication decides everything else)."""
+                try:
+                    der = tls.getpeercert(binary_form=True)
+                except Exception:
+                    return False
+                if not der:
+                    return False
+                lookup = getattr(self.gateway, 'lookup', None)
+                if not callable(lookup):
+                    return False
+                try:
+                    return lookup(hashlib.sha256(der).hexdigest()) is not None
+                except Exception:
+                    return False
+
+            @staticmethod
+            def _close_tls(tls) -> None:
+                try:
+                    tls.close()
+                except OSError:
+                    pass
+
         _API_SERVER_CLASS = ApiServer
     return _API_SERVER_CLASS
 
 
-def _bind_api_server(app, host: str, port: int):
-    """Create the HTTP server **and bind its listening socket**, here, in the
-    caller's thread. Raises `OSError` (EADDRINUSE, EACCES, bad host...) if it
-    cannot. Werkzeug's server (`_api_server_class`) binds and listens in its constructor, so
-    a returned server is already accepting connections into its backlog.
-    Werkzeug itself turns EADDRINUSE/EADDRNOTAVAIL into a printed message plus
-    `sys.exit(1)`; that `SystemExit` is converted back into an `OSError` here
-    so the caller logs one clear "cannot listen" line for every bind failure.
+def _bind_api_server(app, host: str, port: int, gateway):
+    """Create the HTTPS server **and bind its listening socket**, here, in the
+    caller's thread. `gateway` supplies each connection's TLS context
+    (`api.TrustGateway`; see `_api_server_class`); there is no plaintext
+    server. Raises `OSError` (EADDRINUSE, EACCES, bad host...) if it cannot
+    bind, `TypeError` without a usable gateway. Werkzeug's server binds and
+    listens in its constructor, so a returned server is already accepting
+    connections into its backlog. Werkzeug itself turns
+    EADDRINUSE/EADDRNOTAVAIL into a printed message plus `sys.exit(1)`; that
+    `SystemExit` is converted back into an `OSError` here so the caller logs
+    one clear "cannot listen" line for every bind failure.
 
     This replaces `app.run()` in a thread, which bound inside the thread: a
     failed bind killed only that thread, leaving a worker process that was
@@ -673,7 +973,7 @@ def _bind_api_server(app, host: str, port: int):
     `FLASK_DEBUG`). A seam so tests need not open real sockets.
     """
     try:
-        return _api_server_class()(host, port, app, None, False, None)
+        return _api_server_class()(host, port, app, gateway)
     except SystemExit as exc:
         raise OSError(f"cannot bind {host}:{port} (address in use or not available)") from exc
 
@@ -687,8 +987,105 @@ def _serve(server, logger) -> None:
         logger.error("API server thread died", exc_info=True)
 
 
+def _server_identity(config_db, dry_run: bool, logger):
+    """The API server's TLS identity for config database `config_db`;
+    -> `(identity, scratch_dir)`. Raises `IdentityError`.
+
+    Normally `<db>.tls/server.{crt,key}`, which the supervisor created at
+    startup (`daemon._ensure_server_identity`); an expired server certificate
+    is used with a warning (clients ignore its expiry, A1).
+
+    **`--dry-run` with no (or a half-written) server identity:** the
+    supervisor does not create one in a dry run (a key is a persistent
+    change; `daemon._ensure_server_identity`), so this worker
+    makes a throwaway identity in a private temporary directory, removed when
+    the worker exits (`scratch_dir`). A worker killed by a signal (SIG_DFL:
+    `terminate()`, `kill -9`) cannot remove it; the directory name carries
+    the worker's pid, and the next throwaway removes those whose process is
+    gone (`_sweep_dry_run_dirs`, run at every API worker start). Its key is pinned by nobody either way. No client can have pinned it, and a dry-run server
+    refuses enrollment (D7), so it only lets the API run over TLS as it
+    would for real. Never outside a dry run: a missing identity is then an
+    error (exit 1, so the supervisor's backoff applies)."""
+    from zfsbackup import identity as ident
+
+    directory = ident.tls_dir(getattr(config_db, 'resolved_path', config_db))
+    cert, key = ident.identity_paths(directory, ident.SERVER_NAME)
+    if dry_run and not (os.path.lexists(cert) and os.path.lexists(key)):
+        import tempfile
+        scratch = tempfile.mkdtemp(
+            prefix=f'{_DRY_RUN_PREFIX}{_pid_namespace()}-{os.getpid()}-'
+        )
+        try:
+            identity = ident.ensure_identity(
+                os.path.join(scratch, 'server.tls'), ident.ROLE_SERVER, group_of=scratch
+            )
+        except BaseException:
+            _remove_tree(scratch)
+            raise
+        logger.warning(
+            f"dry run: there is no server TLS identity in {directory} and a dry "
+            "run does not create one; serving with a throwaway identity "
+            f"(fingerprint {identity.fingerprint}) that no client has pinned"
+        )
+        return identity, scratch
+    return ident.load_identity(cert, key, ident.ROLE_SERVER, allow_expired=True), None
+
+
+_DRY_RUN_PREFIX = 'zfsbackup-dry-run-'
+
+
+def _pid_namespace() -> str:
+    """An id of this process's PID namespace: the inode of
+    `/proc/self/ns/pid` on Linux, `0` where there is none (macOS). A pid
+    means something only within its namespace."""
+    try:
+        return str(os.stat('/proc/self/ns/pid').st_ino)
+    except OSError:
+        return '0'
+
+
+def _sweep_dry_run_dirs(tmp: str) -> None:
+    """Remove the throwaway identity directories of dry-run API workers that
+    died without cleaning up: `<prefix><pid namespace>-<pid>-<random>`, the
+    namespace this process's own and the pid no longer running. A directory
+    of another PID namespace (a container sharing `/tmp`) is never touched:
+    its pid cannot be checked from here. Only this user's (`mkdtemp` makes
+    them 0700); best effort, never raises."""
+    try:
+        names = os.listdir(tmp)
+    except OSError:
+        return
+    uid = os.geteuid()
+    namespace = _pid_namespace()
+    for name in names:
+        if not name.startswith(_DRY_RUN_PREFIX):
+            continue
+        fields = name[len(_DRY_RUN_PREFIX):].split('-', 2)
+        if len(fields) != 3 or fields[0] != namespace:
+            continue
+        pid_text = fields[1]
+        if not pid_text.isdigit() or _pid_exists(int(pid_text)):
+            continue
+        path = os.path.join(tmp, name)
+        try:
+            if os.lstat(path).st_uid != uid:
+                continue
+        except OSError:
+            continue
+        _remove_tree(path)
+
+
+def _remove_tree(path) -> None:
+    import shutil
+    shutil.rmtree(path, ignore_errors=True)
+
+
 class ApiWorker(_SupervisorWatch, Process):
-    """Worker that serves a read-only HTTP API for configuration and snapshot inspection."""
+    """Worker that serves the HTTPS API (inspection and remote-backup receive)."""
+
+    #: Class-level default, so a worker built by a test that bypasses
+    #: `__init__` refuses to serve rather than serving without trust.
+    config_db = None
 
     def __init__(
         self,
@@ -699,21 +1096,81 @@ class ApiWorker(_SupervisorWatch, Process):
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
+        config_db=None,
     ):
         """`config` is the supervisor's detached `BackupConfig`, dry-run
-        already applied; see `BaseWorker`."""
+        already applied; see `BaseWorker`.
+
+        `config_db` is the config database's `ResolvedConfigPath`. It is used
+        for TLS only: the server identity in `<db>.tls/` and the pinned
+        client certificates, read through `zfsbackup.config.store.trust`
+        (`api.TrustGateway`). The configuration itself is never read here.
+        Without it the worker cannot serve (there is no plaintext mode) and
+        exits 1."""
         super().__init__(name='api-worker', daemon=True)
         self.config = config
         self.stop_event = stop_event
         self.verbose = verbose
+        self.config_db = config_db
         self._watch_init(reload_epoch, born_epoch, workers_lock)
+        self._trust = None
+
+    def _start_trust_poll(self, logger):
+        """Start the trust-poll thread: `TrustGateway.poll()` every
+        `api.TRUST_POLL_SECONDS` until the returned event is set. A thread of
+        its own, so a slow trust read (a busy database: seconds; a hung
+        filesystem: unbounded) never delays the main loop's reaction to a
+        stop, a reload or a gone supervisor, and revocations keep reaching
+        new connections during the drains. A daemon thread: a poll stuck in
+        the kernel does not keep the process alive. The event is a
+        `threading.Event` set by ordinary code on the main thread, never
+        from a signal handler."""
+        from zfsbackup.api import TRUST_POLL_SECONDS
+        gateway = self._trust
+        stopped = threading.Event()
+
+        def loop():
+            while not stopped.wait(TRUST_POLL_SECONDS):
+                try:
+                    gateway.poll()
+                except Exception:  # poll() never raises; belt and braces
+                    logger.debug("trust poll failed", exc_info=True)
+
+        thread = threading.Thread(target=loop, name='trust-poll', daemon=True)
+        thread.start()
+        return stopped
+
+    def _reload_drain_abort(self) -> bool:
+        """`StreamGate.wait_idle`'s abort callback while draining for a
+        reload or a restart: a stop or a gone supervisor ends the wait."""
+        return self._exit_reason() in (ExitReason.STOP, ExitReason.SUPERVISOR_GONE)
 
     def run(self) -> None:
         """Serve until stopped or until the configuration changes. Exits with
         status 1 -- so the supervisor's crash backoff and restart apply -- if
-        the listening socket cannot be bound or the server thread dies; a
-        worker that is alive but serving nothing is the one outcome that must
-        not happen.
+        the server's TLS identity cannot be loaded, the listening socket
+        cannot be bound or the server thread dies; a worker that is alive but
+        serving nothing is the one outcome that must not happen.
+
+        HTTPS only. Before binding, the server identity is loaded
+        (`_server_identity`), a `TrustGateway` is built and read once, so a
+        pinned client works from the first connection. A failed first read
+        is logged and the server starts trusting nobody (fail closed) until a
+        later poll succeeds. A thread of its own (`_start_trust_poll`) polls
+        the gateway every `api.TRUST_POLL_SECONDS`, also during the drains,
+        so a revocation or a new pin reaches new connections without a
+        restart and a slow trust read never delays the main loop.
+
+        If the server identity on disk changes under the worker (the
+        gateway's `restart_reason`, set only for `identity.IdentityChanged`
+        and only once the certificate on disk is confirmed to carry another
+        fingerprint), it drains like for a reload and exits 1, so the
+        supervisor restarts it with the new identity (a stop during that
+        drain turns it into a stop). Any other failure to rebuild the TLS
+        context -- the identity lock held by the CLI, EMFILE, an unreadable
+        file -- leaves the gateway degraded and the trust poll retrying; it
+        never restarts the worker, because each exit 1 counts toward the
+        supervisor's restart limit.
 
         This process hosts the server side of `zfs receive -s`, so leaving
         for a reload must not tear an inbound stream: once the reason to
@@ -730,16 +1187,63 @@ class ApiWorker(_SupervisorWatch, Process):
         logger = logging.getLogger(__name__)
         logger.info("API worker started")
 
-        # The supervisor's detached `BackupConfig`: the server thread never
-        # touches a Session or an Engine, because this process has none.
+        # The supervisor's detached `BackupConfig`. This process opens the
+        # config database only through `store.trust` (trust tables, a fresh
+        # unpooled engine per call), never for the configuration.
         config = self.config
 
-        from zfsbackup.api import create_app
-        app = create_app(config)
+        from zfsbackup.api import TrustGateway, create_app, dedupe_store_warnings
+        from zfsbackup.identity import IdentityError
+
+        if self.config_db is None:
+            logger.error(
+                "API worker has no config database path, so it has no TLS identity "
+                "or client trust; refusing to serve (there is no plaintext mode)"
+            )
+            sys.exit(1)
+        # The trust poll opens the database every few seconds; the store's
+        # preflight would otherwise repeat the same WARNING each time.
+        dedupe_store_warnings()
+        # Throwaway identities of dry-run API workers that died uncleanly.
+        try:
+            import tempfile
+            _sweep_dry_run_dirs(tempfile.gettempdir())
+        except Exception:
+            logger.debug("sweeping stale dry-run identities failed", exc_info=True)
+        scratch = None
+        try:
+            identity, scratch = _server_identity(self.config_db, config.dry_run, logger)
+            self._trust = TrustGateway(identity, self.config_db)
+        except Exception as e:
+            if scratch is not None:
+                _remove_tree(scratch)
+            if isinstance(e, IdentityError):
+                logger.error(f"API worker cannot load the server TLS identity: {e}")
+            else:
+                logger.error(
+                    f"API worker cannot set up its TLS identity and client trust: "
+                    f"{type(e).__name__}: {e}"
+                )
+            sys.exit(1)
+        try:
+            self._serve(config, logger, create_app, identity)
+        finally:
+            if scratch is not None:
+                _remove_tree(scratch)
+
+    def _serve(self, config: BackupConfig, logger, create_app, identity) -> None:
+        """`run()` once the server identity and the trust gateway exist."""
+        gateway = self._trust
+        # First read before the bind: pinned clients work from the first
+        # connection. A failure is logged by the gateway; nobody is trusted
+        # until a poll succeeds.
+        gateway.refresh()
+
+        app = create_app(config, gateway, identity.fingerprint)
         gate = app.extensions['zfsbackup.stream_gate']
 
         try:
-            server = _bind_api_server(app, config.api_host, config.api_port)
+            server = _bind_api_server(app, config.api_host, config.api_port, gateway)
         except OSError as e:
             logger.error(
                 f"API worker cannot listen on {config.api_host}:{config.api_port}: {e}"
@@ -748,13 +1252,21 @@ class ApiWorker(_SupervisorWatch, Process):
 
         thread = threading.Thread(target=_serve, args=(server, logger), daemon=True)
         thread.start()
-        logger.info(f"API listening on {config.api_host}:{config.api_port}")
+        logger.info(
+            f"API listening on {config.api_host}:{getattr(server, 'port', config.api_port)} "
+            f"(HTTPS; server certificate fingerprint {identity.fingerprint})"
+        )
 
         died = False
         reason: Optional[ExitReason] = None
+        #: Set when the gateway asks for a restart (`TrustGateway.
+        #: restart_reason`: the server identity on disk changed, confirmed).
+        restart: Optional[str] = None
+        poll_stopped = self._start_trust_poll(logger)
         try:
-            # Sliced wait: wakes every `STOP_POLL` to check the exit reasons
-            # and that the server thread is still alive.
+            # Sliced wait: wakes every `STOP_POLL` to check the exit reasons,
+            # that the server thread is still alive and whether the trust
+            # gateway wants a restart. Trust is polled by its own thread.
             while True:
                 reason = self._exit_reason()
                 if reason is not None:
@@ -763,22 +1275,29 @@ class ApiWorker(_SupervisorWatch, Process):
                     logger.error("API server thread exited unexpectedly; exiting")
                     died = True
                     break
+                restart = gateway.restart_reason
+                if restart is not None:
+                    logger.error(
+                        f"API worker restarting: {restart}. It finishes its "
+                        "in-flight receives first, then exits 1 and the supervisor "
+                        "starts it again with the identity now on disk"
+                    )
+                    break
                 self.stop_event.wait(timeout=STOP_POLL)
 
             if not died:
                 gate.start_draining()
                 active = gate.active
-                if reason is ExitReason.RELOAD:
+                if reason is ExitReason.RELOAD or (reason is None and restart):
                     if active:
                         logger.info(
                             f"waiting for {active} in-flight receive(s) to finish "
-                            "before reloading"
+                            f"before {'reloading' if reason else 'restarting'}"
                         )
-                        gate.wait_idle(None, abort=lambda: self._exit_reason() in (
-                            ExitReason.STOP, ExitReason.SUPERVISOR_GONE))
+                        gate.wait_idle(None, abort=self._reload_drain_abort)
                         # A stop that aborted the wait changes what we are doing.
                         reason = self._exit_reason() or reason
-                if reason is not ExitReason.RELOAD:
+                if reason in (ExitReason.STOP, ExitReason.SUPERVISOR_GONE):
                     active = gate.active
                     if active and not gate.wait_idle(API_STOP_DRAIN):
                         logger.warning(
@@ -786,6 +1305,7 @@ class ApiWorker(_SupervisorWatch, Process):
                             "sender resumes them (zfs receive -s)"
                         )
         finally:
+            poll_stopped.set()
             # Every exit path past a successful bind: stop accepting, free
             # the port, reap the thread.
             try:
@@ -799,7 +1319,7 @@ class ApiWorker(_SupervisorWatch, Process):
                 logger.debug("server.server_close() failed", exc_info=True)
             thread.join(timeout=5)
 
-        if died:
+        if died or (reason is None and restart):
             sys.exit(1)
         if reason is ExitReason.RELOAD:
             logger.info(

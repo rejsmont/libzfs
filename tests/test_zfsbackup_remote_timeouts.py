@@ -11,6 +11,7 @@ import ast
 import json
 from datetime import datetime, timezone
 import socket
+import ssl
 import subprocess
 import sys
 from pathlib import Path
@@ -19,20 +20,26 @@ from unittest.mock import MagicMock
 import pytest
 import websocket
 
+from _remote_support import (  # noqa: F401  (fixtures)
+    OTHER_SERVER_FP, SERVER_FP, fake_connect_pinned, make_transport,
+)
 from libzfseasy.zfs import StreamHandle
 from zfsbackup import remote
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup.config import BackupConfig, DatasetConfig, Destination, RemoteDatasetConfig
+from zfsbackup.identity import PinMismatch
 from zfsbackup.remote import (
     WS_CONNECT_TIMEOUT,
     WS_FINAL_ACK_TIMEOUT,
     WS_IDLE_TIMEOUT,
+    HTTP_TIMEOUT,
+    RESUME_TOKEN_TIMEOUT,
     RemoteBackupManager,
     _SendStream,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-URL = "http://backup.example.com"
+URL = "https://backup.example.com"
 
 
 class FakeStream:
@@ -56,15 +63,26 @@ class FakeStream:
         return False
 
 
+@pytest.fixture(autouse=True)
+def _tls_connect_is_faked(fake_connect_pinned):
+    """No test here opens a socket: the websocket's pinned TLS connect is a recorder
+    (`fake_connect_pinned`) that hands out `MagicMock` sockets."""
+    return fake_connect_pinned
+
+
 @pytest.fixture
 def rbm(tmp_path):
     config = BackupConfig(
         datasets=[DatasetConfig(name="pool/data", remote=[RemoteDatasetConfig(destination="offsite")])],
-        destinations={"offsite": Destination(url=URL)},
-        client_id_file=tmp_path / "client_id",
+        destinations={"offsite": Destination(url=URL, server_fingerprint=SERVER_FP)},
     )
     manager = DatasetManager(config)
-    return RemoteBackupManager(config, manager), manager.datasets[0]
+    return RemoteBackupManager(config, manager, client_id="client1"), manager.datasets[0]
+
+
+def tr():
+    """The fake transport (see `_remote_support.make_transport`) for `URL`."""
+    return make_transport(URL)
 
 
 def snapshot(name="autosnap_20240101120000"):
@@ -106,7 +124,7 @@ def transfer(rbm_dsi, mocker, stream, ws, mode="fresh", inflight=False, sent=Non
     get_anchor = mocker.patch.object(lm, "get_anchor", return_value=None)
     clear_inflight = mocker.patch.object(lm, "clear_inflight", return_value=True)
     set_inflight = mocker.patch.object(lm, "set_inflight", return_value=True)
-    result = manager._transfer(URL, "client1", dsi, latest, common, "offsite", snapshots=[latest], **kwargs)
+    result = manager._transfer(tr(), "client1", dsi, latest, common, "offsite", snapshots=[latest], **kwargs)
     return Outcome(result, set_anchor, get_anchor=get_anchor, clear_inflight=clear_inflight,
                    set_inflight=set_inflight)
 
@@ -121,14 +139,56 @@ class TestTimeouts:
     def test_the_constants(self):
         assert (WS_CONNECT_TIMEOUT, WS_IDLE_TIMEOUT, WS_FINAL_ACK_TIMEOUT) == (30, 600, 3600)
         assert WS_CONNECT_TIMEOUT < WS_IDLE_TIMEOUT < WS_FINAL_ACK_TIMEOUT
+        assert (HTTP_TIMEOUT, RESUME_TOKEN_TIMEOUT) == (30, 10)
 
-    def test_connect_then_idle_then_final_ack_in_that_order(self, rbm, mocker):
+    def test_the_pinned_tls_connect_is_bounded_by_the_websocket_connect_timeout(
+        self, rbm, mocker, fake_connect_pinned
+    ):
+        """TCP connect + TLS handshake + fingerprint check run under `WS_CONNECT_TIMEOUT`, with the
+        destination's host and port, the transport's SSL context and the PINNED server fingerprint."""
+        transfer(rbm, mocker, FakeStream(), ok_ws())
+        ((host, port, ctx, fp, timeout),) = fake_connect_pinned.calls
+        assert (host, port, fp, timeout) == ("backup.example.com", 443, SERVER_FP, WS_CONNECT_TIMEOUT)
+        assert ctx is not None
+
+    def test_the_tls_connect_happens_before_the_websocket_connect_and_hands_it_the_socket(
+        self, rbm, mocker, fake_connect_pinned
+    ):
+        ws = ok_ws()
+        order = []
+        fake_connect_pinned.side_effect = lambda *a: (order.append("tls"), MagicMock(name="sock"))[1]
+        ws.connect.side_effect = lambda *a, **k: order.append("ws")
+        transfer(rbm, mocker, FakeStream(), ws)
+        assert order == ["tls", "ws"]
+        assert ws.connect.call_args.kwargs["socket"] is not None
+
+    def test_the_http_calls_are_bounded(self, rbm):
+        """`/whoami` and `/negotiate` use `HTTP_TIMEOUT`, `/resume_token` the shorter
+        `RESUME_TOKEN_TIMEOUT`: the supervisor defers a worker switch for as long as a call blocks."""
+        manager, dsi = rbm
+        session = MagicMock()
+        session.get.return_value.status_code = 200
+        session.get.return_value.json.return_value = {"client_id": "client1", "resume_token": None}
+        session.get.return_value.ok = True
+        session.post.return_value.status_code = 200
+        session.post.return_value.json.return_value = {"common_snapshot": None}
+        transport = make_transport(URL, session=session)
+        manager._whoami("offsite", transport)
+        assert session.get.call_args.kwargs["timeout"] == HTTP_TIMEOUT
+        manager._negotiate(transport, "client1", dsi, [], "offsite")
+        assert session.post.call_args.kwargs["timeout"] == HTTP_TIMEOUT
+        manager._fetch_resume_token(transport, "client1", dsi, "offsite")
+        assert session.get.call_args.kwargs["timeout"] == RESUME_TOKEN_TIMEOUT
+
+    def test_connect_then_idle_then_final_ack_in_that_order(self, rbm, mocker, fake_connect_pinned):
         ws = ok_ws()
         result, _ = transfer(rbm, mocker, FakeStream([b"a", b"b"]), ws)
         assert result is True
         names = [c[0] for c in ws.method_calls if c[0] in ("connect", "settimeout", "send_binary", "send", "recv")]
         assert names == ["connect", "settimeout", "send_binary", "send_binary", "send", "settimeout", "recv"]
-        assert ws.connect.call_args.kwargs == {"timeout": WS_CONNECT_TIMEOUT}
+        assert ws.connect.call_args.kwargs == {
+            "socket": fake_connect_pinned.socks[0], "timeout": WS_CONNECT_TIMEOUT,
+        }
         timeouts = [c.args[0] for c in ws.settimeout.call_args_list]
         assert timeouts == [WS_IDLE_TIMEOUT, WS_FINAL_ACK_TIMEOUT]
 
@@ -143,7 +203,7 @@ class TestTimeouts:
     def test_the_connect_url_is_unchanged(self, rbm, mocker):
         ws = ok_ws()
         transfer(rbm, mocker, FakeStream(), ws)
-        assert ws.connect.call_args.args == ("ws://backup.example.com/backup/client1/pool/data/stream?mode=fresh",)
+        assert ws.connect.call_args.args == ("wss://backup.example.com/backup/client1/pool/data/stream?mode=fresh",)
 
 
 class TestSendTimeout:
@@ -230,6 +290,94 @@ class TestConnectFailure:
         assert stream.closes == 1, "settimeout is before `with stream:`, so the finally closes it"
 
 
+class TestPinnedConnectFailure:
+    """The pinned TLS connect (`connect_pinned`) runs after `zfs send` has started and before
+    `entered`: any failure of it reaps the send, exactly like a failed websocket connect."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            ConnectionRefusedError("refused"), TimeoutError("timed out"), socket.timeout("timed out"),
+            ssl.SSLError("handshake failure"), OSError("net down"),
+            PinMismatch(SERVER_FP, OTHER_SERVER_FP),
+        ],
+        ids=["refused", "timeout", "socket-timeout", "ssl", "oserror", "pin-mismatch"],
+    )
+    def test_a_failed_tls_connect_is_false_with_the_stream_closed_exactly_once(
+        self, rbm, mocker, fake_connect_pinned, exc
+    ):
+        stream = FakeStream()
+        ws = ok_ws()
+        fake_connect_pinned.side_effect = exc
+        result, set_anchor = transfer(rbm, mocker, stream, ws)
+        assert result is False
+        assert stream.closes == 1
+        ws.connect.assert_not_called()               # no websocket byte without a pinned socket
+        ws.send_binary.assert_not_called()
+        ws.send.assert_not_called()
+        ws.close.assert_called()
+        set_anchor.assert_not_called()
+
+    def test_a_failed_tls_connect_keeps_the_pin_and_is_never_probed_for_a_refusal(
+        self, rbm, mocker, fake_connect_pinned
+    ):
+        ws = ok_ws()
+        ws.recv.return_value = REFUSAL_JSON
+        fake_connect_pinned.side_effect = ConnectionRefusedError("refused")
+        out = transfer(rbm, mocker, FakeStream(), ws, inflight=True)
+        assert out[0] is False
+        out.clear_inflight.assert_not_called()
+        ws.recv.assert_not_called()
+
+    def test_a_failing_stream_close_after_a_failed_tls_connect_is_swallowed(
+        self, rbm, mocker, fake_connect_pinned
+    ):
+        stream = FakeStream()
+        stream.close = MagicMock(side_effect=Exception("zfs send exited 1"))
+        fake_connect_pinned.side_effect = ConnectionRefusedError("refused")
+        result, _ = transfer(rbm, mocker, stream, ok_ws())
+        assert result is False
+        stream.close.assert_called_once()
+
+    def test_the_tls_socket_is_closed_after_a_success(self, rbm, mocker, fake_connect_pinned):
+        result, _ = transfer(rbm, mocker, FakeStream(), ok_ws())
+        assert result is True
+        fake_connect_pinned.socks[0].close.assert_called()
+
+    @pytest.mark.parametrize("scenario", ["connect", "send-timeout", "server-error", "settimeout"])
+    def test_the_tls_socket_is_closed_after_every_failure_past_the_tls_connect(
+        self, rbm, mocker, fake_connect_pinned, scenario
+    ):
+        """A failed websocket upgrade can leave the raw TLS socket open: `finally` closes it."""
+        ws = ok_ws()
+        if scenario == "connect":
+            ws.connect.side_effect = websocket.WebSocketBadStatusException("Handshake status %d", 500)
+        elif scenario == "send-timeout":
+            ws.send_binary.side_effect = websocket.WebSocketTimeoutException("t")
+        elif scenario == "server-error":
+            ws.recv.return_value = json.dumps({"status": "error", "error": "no"})
+        else:
+            ws.settimeout.side_effect = OSError("bad socket")
+        result, _ = transfer(rbm, mocker, FakeStream(), ws)
+        assert result is False
+        fake_connect_pinned.socks[0].close.assert_called()
+
+    def test_a_failing_tls_socket_close_is_swallowed(self, rbm, mocker, fake_connect_pinned):
+        stream = FakeStream()
+        ws = ok_ws()
+        ws.connect.side_effect = OSError("upgrade failed")
+
+        def connect(*args):
+            sock = MagicMock(name="sock")
+            sock.close.side_effect = OSError("already closed")
+            return sock
+
+        fake_connect_pinned.side_effect = connect
+        result, _ = transfer(rbm, mocker, stream, ws)
+        assert result is False
+        assert stream.closes == 1
+
+
 class TestNormalPath:
     def test_success_closes_the_stream_once_via_the_with_block(self, rbm, mocker):
         stream = FakeStream([b"a", b"b"])
@@ -256,7 +404,7 @@ class TestNormalPath:
         manager, dsi = rbm
         manager.config.dry_run = True
         ws_cls = mocker.patch("zfsbackup.remote.websocket.WebSocket")
-        assert manager._transfer(URL, "c", dsi, snapshot(), None, "offsite", snapshots=[snapshot()]) is True
+        assert manager._transfer(tr(), "c", dsi, snapshot(), None, "offsite", snapshots=[snapshot()]) is True
         ws_cls.assert_not_called()
 
 
@@ -298,6 +446,30 @@ class TestRealStreamHandle:
             result, _ = transfer(rbm, mocker, handle, ws)
             assert result is False
             assert proc.poll() is not None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(10)
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+
+    @pytest.mark.parametrize(
+        "exc", [ConnectionRefusedError("refused"), PinMismatch(SERVER_FP, OTHER_SERVER_FP), ssl.SSLError("alert")],
+        ids=["refused", "pin-mismatch", "ssl-alert"],
+    )
+    def test_a_failed_pinned_tls_connect_reaps_the_endless_writer(self, rbm, mocker, fake_connect_pinned, exc):
+        """The TLS connect is where an impostor server or a rejected client certificate shows up:
+        the already started `zfs send` must not be left blocked on a full pipe."""
+        proc, handle = self._endless()
+        fake_connect_pinned.side_effect = exc
+        try:
+            result, set_anchor = transfer(rbm, mocker, handle, ok_ws())
+            assert result is False
+            assert proc.poll() is not None, "the zfs send stand-in is still running"
+            set_anchor.assert_not_called()
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -463,7 +635,7 @@ class TestCloseHandshakeAndStreamClose:
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
         set_anchor = mocker.patch.object(manager.local_manager, "set_anchor")
         with pytest.raises(KeyboardInterrupt):
-            manager._transfer(URL, "client1", dsi, snapshot(), None, "offsite", snapshots=[snapshot()])
+            manager._transfer(tr(), "client1", dsi, snapshot(), None, "offsite", snapshots=[snapshot()])
         assert stream.closes == 1
         ws.close.assert_called()
         set_anchor.assert_not_called()
@@ -477,7 +649,7 @@ class TestCloseHandshakeAndStreamClose:
         mocker.patch.object(manager, "_get_resume_stream", return_value=started(stream))
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
         with pytest.raises(KeyboardInterrupt):
-            manager._transfer(URL, "client1", dsi, snapshot(), None, "offsite", snapshots=[snapshot()])
+            manager._transfer(tr(), "client1", dsi, snapshot(), None, "offsite", snapshots=[snapshot()])
 
     def test_a_failing_ws_close_in_the_failed_path_still_closes_nothing_twice(self, rbm, mocker):
         stream = FakeStream()
@@ -708,7 +880,7 @@ class TestPeerRefusal:
 
 
 class TestLogRefusal:
-    URL_ = "http://backup.example.com"
+    URL_ = "https://backup.example.com"
 
     def logged(self, caplog, result):
         with caplog.at_level(logging.DEBUG):
@@ -1145,7 +1317,7 @@ class TestNoProbeWhenThePeerCannotHaveLeftARefusal:
         mocker.patch.object(manager, "_get_resume_stream", return_value=started(stream))
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
         with pytest.raises(KeyboardInterrupt):
-            manager._transfer(URL, "client1", dsi, snapshot(), None, "offsite", snapshots=[snapshot()])
+            manager._transfer(tr(), "client1", dsi, snapshot(), None, "offsite", snapshots=[snapshot()])
         ws.recv.assert_not_called()
 
 
@@ -1176,7 +1348,7 @@ class TestStreamUrlModes:
     def test_a_full_fresh_send_says_mode_fresh_and_has_no_from(self, rbm, mocker):
         ws = ok_ws()
         transfer(rbm, mocker, FakeStream(), ws)
-        assert connect_url(ws) == "ws://backup.example.com/backup/client1/pool/data/stream?mode=fresh"
+        assert connect_url(ws) == "wss://backup.example.com/backup/client1/pool/data/stream?mode=fresh"
         assert query(ws) == {"mode": ["fresh"]}
 
     def test_an_incremental_fresh_send_carries_from(self, rbm, mocker):
@@ -1250,7 +1422,7 @@ class TestPinAndAnchorAfterTheTransfer:
         clear = mocker.patch.object(manager.local_manager, "clear_inflight")
         dsi = rbm[1]
         latest = snapshot(NEW)
-        assert manager._transfer(URL, "client1", dsi, latest, None, "offsite", snapshots=[latest]) is True
+        assert manager._transfer(tr(), "client1", dsi, latest, None, "offsite", snapshots=[latest]) is True
         clear.assert_not_called()
 
     @pytest.mark.parametrize("scenario", ["send-timeout", "server-error", "refusal", "connect", "done-fails"])
@@ -1285,7 +1457,7 @@ class TestResumeAnchorRules:
         mocker.patch.object(lm, "get_anchor", return_value=existing)
         clear = mocker.patch.object(lm, "clear_inflight", return_value=True)
         snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
-        ok = manager._transfer(URL, "client1", dsi, snaps[0], None, "offsite", snapshots=snaps,
+        ok = manager._transfer(tr(), "client1", dsi, snaps[0], None, "offsite", snapshots=snaps,
                                followup=False, **kw)
         return ok, set_anchor, clear
 
@@ -1334,7 +1506,7 @@ class TestResumeAnchorRules:
         mocker.patch.object(manager.local_manager, "get_anchor", return_value=NEW)
         mocker.patch.object(manager.local_manager, "clear_inflight")
         snaps = [snapshot(NEW), snapshot(MID)]
-        manager._transfer(URL, "client1", dsi, snaps[1], None, "offsite", snapshots=snaps)
+        manager._transfer(tr(), "client1", dsi, snaps[1], None, "offsite", snapshots=snaps)
         assert set_anchor.call_args.args[1:] == ("offsite", MID)
 
     def test_a_failed_anchor_write_keeps_the_pin_on_a_resume(self, rbm, mocker):
@@ -1346,7 +1518,7 @@ class TestResumeAnchorRules:
         mocker.patch.object(manager.local_manager, "set_anchor", return_value=False)
         clear = mocker.patch.object(manager.local_manager, "clear_inflight")
         snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
-        manager._transfer(URL, "client1", dsi, snaps[0], None, "offsite", snapshots=snaps, followup=False)
+        manager._transfer(tr(), "client1", dsi, snaps[0], None, "offsite", snapshots=snaps, followup=False)
         clear.assert_not_called()
 
 
@@ -1357,7 +1529,7 @@ class TestShouldStop:
         ws_cls = mocker.patch("zfsbackup.remote.websocket.WebSocket")
         latest = snapshot(NEW)
         with caplog.at_level(logging.INFO):
-            assert manager._transfer(URL, "c", dsi, latest, None, "offsite", snapshots=[latest],
+            assert manager._transfer(tr(), "c", dsi, latest, None, "offsite", snapshots=[latest],
                                      should_stop=lambda: True) is False
         get_stream.assert_not_called()
         ws_cls.assert_not_called()
@@ -1374,12 +1546,12 @@ class TestShouldStop:
         get_stream = mocker.patch.object(manager, "_get_resume_stream")
         get_info = mocker.patch("zfsbackup.remote.zfs.send.resume_info")
         get_resume = mocker.patch("zfsbackup.remote.zfs.send.resume")
-        get_req = mocker.patch("zfsbackup.remote.requests.get")
+        session = MagicMock()
         latest = snapshot(NEW)
-        assert manager._transfer(URL, "c", dsi, latest, None, "offsite", snapshots=[latest],
-                                 should_stop=stop) is True
+        assert manager._transfer(make_transport(URL, session=session), "c", dsi, latest, None, "offsite",
+                                 snapshots=[latest], should_stop=stop) is True
         stop.assert_not_called()
-        for m in (get_stream, get_info, get_resume, get_req):
+        for m in (get_stream, get_info, get_resume, session.get, session.post):
             m.assert_not_called()
 
 
@@ -1401,7 +1573,9 @@ class TestRealResumeStreamUnderTimeouts:
         resp.ok = True
         resp.status_code = 200
         resp.json.return_value = {"resume_token": token}
-        mocker.patch("zfsbackup.remote.requests.get", return_value=resp)
+        self.session = MagicMock()
+        self.session.get.return_value = resp
+        self.transport = make_transport(URL, session=self.session)
         self.snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
         self.stream = FakeStream([b"x", b"y"])
         self.send_snapshot = mocker.patch(
@@ -1429,7 +1603,7 @@ class TestRealResumeStreamUnderTimeouts:
 
     def run(self, rbm, common=None, **kw):
         manager, dsi = rbm
-        return manager._transfer(URL, "client1", dsi, self.snaps[0], common, "offsite",
+        return manager._transfer(self.transport, "client1", dsi, self.snaps[0], common, "offsite",
                                  snapshots=self.snaps, **kw)
 
     def test_a_fresh_send_that_times_out_leaves_the_pin_and_the_anchor(self, rbm, mocker):

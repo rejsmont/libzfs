@@ -68,7 +68,7 @@ form. **Never guess.**
 Coercion is by schema field type: `str` verbatim; `int` with a range check for `api_port`; `bool`
 accepting `true/false/yes/no/on/off/1/0` case-insensitively; durations via `Duration(...)` **storing
 the literal as typed** (an operator who wrote `7d` must not read back `1w`); `Path` for
-`client_id_file`. An unknown path exits non-zero and lists valid siblings.
+`client_cert_file`/`client_key_file`. An unknown path exits non-zero and lists valid siblings.
 
 `datasets.<n>.name` is **not addressable** — renaming is the `rename` command only.
 

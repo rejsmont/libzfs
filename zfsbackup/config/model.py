@@ -5,10 +5,13 @@ import json
 import logging
 import os
 import re
+import socket
+import uuid
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -512,10 +515,161 @@ def _collapse_retention_rules(
     return plan, warnings
 
 
+_FINGERPRINT_RE = re.compile(r'[0-9a-f]{64}')
+_FINGERPRINT_COLON_RE = re.compile(r'[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){31}')
+
+
+def normalize_fingerprint(value: str) -> str:
+    """Return a SHA-256 certificate fingerprint as 64 lowercase hex digits.
+
+    Accepts upper or lower case hex, optionally in the colon-separated form
+    `openssl x509 -fingerprint` prints (32 two-digit groups), with
+    surrounding whitespace ignored. Anything else raises `ValueError`.
+    This is the one canonical implementation; `zfsbackup.identity` and the
+    store/CLI import it from here.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"fingerprint must be a string, got {type(value).__name__} {value!r}"
+        )
+    text = value.strip()
+    if ':' in text:
+        if not _FINGERPRINT_COLON_RE.fullmatch(text):
+            raise ValueError(
+                f"fingerprint {value!r} is not 32 colon-separated hex pairs"
+            )
+        text = text.replace(':', '')
+    text = text.lower()
+    if not _FINGERPRINT_RE.fullmatch(text):
+        raise ValueError(
+            f"fingerprint {value!r} is not a SHA-256 fingerprint "
+            "(64 hex digits, colons optional)"
+        )
+    return text
+
+
+def destination_url_problem(url) -> Optional[str]:
+    """Return why `url` is not an acceptable destination URL, or `None`.
+
+    Destinations are TLS-only: the URL must be `https://` with a host.
+    Plaintext `http://` is refused (there is no downgrade path). A port, if
+    written, must be 1-65535: port 0 and an empty port (`https://host:`) are
+    refused rather than read as 443. Pure string handling, no I/O.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return "url must be a non-empty string"
+    try:
+        parts = urlsplit(url.strip())
+        host = parts.hostname
+        port = parts.port  # raises ValueError for a malformed port
+    except ValueError as e:
+        return f"url {url!r} is not a valid URL ({e})"
+    scheme = parts.scheme.lower()
+    if scheme == 'http':
+        return (
+            f"url {url!r}: plaintext http is not supported; use https:// and "
+            "enroll the destination with `zfsbackup-config enroll`"
+        )
+    if scheme != 'https':
+        what = f"scheme {scheme!r}" if scheme else "no scheme"
+        return f"url {url!r} has {what}; destinations must be https:// URLs"
+    if not host:
+        return f"url {url!r} has no host"
+    if port == 0:
+        return (
+            f"url {url!r} has port 0; use a port from 1 to 65535, or leave the "
+            "port out for 443"
+        )
+    if port is None and parts.netloc.rpartition('@')[2].endswith(':'):
+        return (
+            f"url {url!r} has an empty port after ':'; write the port (1-65535) "
+            "or leave out the ':' for 443"
+        )
+    return None
+
+
 @dataclass
 class Destination:
-    """A remote server that accepts backup streams."""
+    """A remote server that accepts backup streams.
+
+    `server_fingerprint` is the pinned SHA-256 fingerprint of the server's
+    certificate (64 lowercase hex), set by enrollment; `None` means the
+    destination is not enrolled yet. It is normalised and validated on
+    construction. The URL scheme rule (https only) is a config-boundary
+    policy enforced by `BackupConfig.from_file` and `destination_url_problem`
+    (also used by the store's `validate_config`), not here, so a legacy row
+    can still be loaded and fixed.
+    """
     url: str
+    server_fingerprint: Optional[str] = None
+
+    def __post_init__(self):
+        if self.server_fingerprint is not None:
+            self.server_fingerprint = normalize_fingerprint(self.server_fingerprint)
+
+
+_CLIENT_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
+_CLIENT_ID_CHARS_RE = re.compile(r'[A-Za-z0-9._-]+')
+_CLIENT_ID_HOST_MAX = 55   # 55 + "-" + 8 hex digits == 64
+
+
+def client_id_problem(text) -> Optional[str]:
+    """Return why `text` is not a valid client id, or `None` (grammar A7).
+
+    A client id is `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`: 1-64 ASCII letters,
+    digits, `.`, `_` and `-`, starting with a letter or digit. It ends up in
+    URLs, ZFS dataset and user-property names and file names, so the
+    grammar is deliberately narrow and ASCII-only; a leading `-` (or `.`,
+    `_`) is refused because `<target>/<client id>` must be a valid dataset
+    name.
+    """
+    if not isinstance(text, str):
+        return f"client id must be a string, got {type(text).__name__}"
+    if not text:
+        return "client id must not be empty"
+    if len(text) > 64:
+        return f"client id is {len(text)} characters long; the maximum is 64"
+    if not _CLIENT_ID_CHARS_RE.fullmatch(text):
+        return (
+            "client id may contain only ASCII letters, digits, '.', '_' and '-'"
+        )
+    if not _CLIENT_ID_RE.fullmatch(text):
+        return (
+            f"client id must start with an ASCII letter or digit, not {text[0]!r}"
+        )
+    return None
+
+
+def generate_client_id() -> str:
+    """Return a fresh client id: `<sanitised hostname, max 55>-<uuid8>`.
+
+    Characters outside `[A-Za-z0-9._-]` (including any non-ASCII) become
+    `-`; leading `.`, `-` and `_` are dropped; an empty result becomes
+    `host`. The result always satisfies `client_id_problem`. Same shape as the id
+    the retired client-id file held.
+    """
+    try:
+        hostname = socket.gethostname()
+    except OSError:
+        hostname = ''
+    sanitized = re.sub(r'[^A-Za-z0-9._-]', '-', hostname or '').lstrip('.-_')
+    sanitized = sanitized[:_CLIENT_ID_HOST_MAX] or 'host'
+    client_id = f"{sanitized}-{uuid.uuid4().hex[:8]}"
+    assert client_id_problem(client_id) is None, client_id
+    return client_id
+
+
+def client_tls_files_problem(cert, key) -> Optional[str]:
+    """Return why `client_cert_file`/`client_key_file` are unusable, or `None`.
+
+    Each is an optional absolute path; both or neither must be set.
+    """
+    if (cert is None) != (key is None):
+        return "client_cert_file and client_key_file must be set together (or both omitted)"
+    for name, value in (("client_cert_file", cert), ("client_key_file", key)):
+        if value is not None and not os.path.isabs(str(value)):
+            return f"{name} {str(value)!r} must be an absolute path"
+    return None
 
 
 @dataclass
@@ -833,9 +987,10 @@ class BackupConfig:
     dry_run: bool = False
     destinations: Dict[str, Destination] = field(default_factory=dict)
     remote_backup: Optional[RemoteServerConfig] = None
-    # None means "derive from $HOME in the resolving process" -- see
-    # `effective_client_id_file`.
-    client_id_file: Optional[Path] = None
+    # Optional overrides of the TLS client identity otherwise kept in
+    # `<db>.tls/`. Absolute paths, both or neither.
+    client_cert_file: Optional[Path] = None
+    client_key_file: Optional[Path] = None
 
     @classmethod
     def from_file(cls, config_path: Path) -> 'BackupConfig':
@@ -849,6 +1004,16 @@ class BackupConfig:
         if not data:
             raise ValueError("Config file is empty")
         data = _mapping_from_config(data, "config", "a top-level mapping")
+
+        # Rejected for any value, null and "" included: the key itself is gone.
+        # (A silent ignore would let an operator believe the old identity file
+        # is still honoured when the daemon uses the database's client id.)
+        if 'client_id_file' in data:
+            raise ValueError(
+                "client_id_file was removed; the client id is stored in the "
+                "database (`zfsbackup-config identity show` / "
+                "`identity set-client-id`)"
+            )
 
         datasets_data = _list_from_config(
             data.get('datasets', []), "datasets", "a list of dataset mappings"
@@ -912,9 +1077,21 @@ class BackupConfig:
             url = dest_data.get('url')
             if not url:
                 raise ValueError(f"Destination '{dest_name}' requires 'url'")
-            destinations[dest_name] = Destination(
-                url=_str_from_config(url, f"destinations[{dest_name}].url")
-            )
+            url = _str_from_config(url, f"destinations[{dest_name}].url").strip()
+            problem = destination_url_problem(url)
+            if problem:
+                raise ValueError(f"destinations[{dest_name}]: {problem}")
+            fp = dest_data.get('server_fingerprint')
+            # null and "" both mean "not enrolled".
+            if fp is not None:
+                fp = _str_from_config(fp, f"destinations[{dest_name}].server_fingerprint")
+            try:
+                fp = normalize_fingerprint(fp) if fp and fp.strip() else None
+            except ValueError as e:
+                raise ValueError(
+                    f"destinations[{dest_name}].server_fingerprint: {e}"
+                ) from None
+            destinations[dest_name] = Destination(url=url, server_fingerprint=fp)
 
         for ds in datasets:
             for r in ds.remote:
@@ -951,21 +1128,17 @@ class BackupConfig:
                 ),
             )
 
-        cid = data.get('client_id_file')
-        if cid is not None:
-            cid = _str_from_config(cid, "client_id_file")
-        # "" (like null) means unset; check it first because
-        # `os.path.normpath("")` is ".". Any other spelling of the current
-        # directory ("." "./" "././" "a/..") names a directory, never a file,
-        # so the client id could not be read or written there: refuse it
-        # rather than load a value that never worked. Same normalised rule as
-        # the store's `validate_config`. Pure string handling: no I/O.
-        if cid and os.path.normpath(cid) == ".":
-            raise ValueError(
-                f"client_id_file {cid!r} names a directory, not a file; "
-                "omit it (or set it to \"\") to derive the default from $HOME"
-            )
-        client_id_file = Path(cid) if cid else None
+        tls_paths = {}
+        for key in ('client_cert_file', 'client_key_file'):
+            raw = data.get(key)
+            if raw is not None:
+                raw = _str_from_config(raw, key)
+            tls_paths[key] = Path(raw) if raw else None   # null / "" = unset
+        problem = client_tls_files_problem(
+            tls_paths['client_cert_file'], tls_paths['client_key_file']
+        )
+        if problem:
+            raise ValueError(problem)
 
         return cls(
             datasets=datasets,
@@ -977,7 +1150,8 @@ class BackupConfig:
             dry_run=dry_run,
             destinations=destinations,
             remote_backup=remote_backup,
-            client_id_file=client_id_file,
+            client_cert_file=tls_paths['client_cert_file'],
+            client_key_file=tls_paths['client_key_file'],
         )
 
     def same_as(self, other: 'BackupConfig') -> bool:
@@ -1006,22 +1180,6 @@ class BackupConfig:
         if self.prune_interval is None:
             return self.check_interval
         return self.prune_interval
-
-    @property
-    def effective_client_id_file(self) -> Path:
-        """Return the client ID file path that actually governs identity.
-
-        When `client_id_file` is `None` ("derive from `$HOME`"), returns
-        ``Path.home() / '.config' / 'zfsbackup' / 'client_id'``, computed
-        fresh on every call -- deliberately NOT memoized or cached on the
-        instance. The entire point is that `$HOME` is resolved in whichever
-        process calls this property (e.g. inside a forked worker, post-fork),
-        not frozen at config-load time in a possibly different process (e.g.
-        under `sudo` at import time).
-        """
-        if self.client_id_file is None:
-            return Path.home() / '.config' / 'zfsbackup' / 'client_id'
-        return self.client_id_file
 
     @property
     def enabled_datasets(self) -> List[DatasetConfig]:

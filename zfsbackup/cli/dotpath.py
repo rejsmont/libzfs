@@ -21,12 +21,12 @@ that asks for the bracket form (``datasets[a.retention]`` vs
 always accepted, with the same grammar::
 
     snapshot_prefix | check_interval | prune_interval | api_host | api_port
-    | dry_run | client_id_file
+    | dry_run | client_cert_file | client_key_file
     datasets . NAME . (enabled | recursive | frequency)
     datasets . NAME . retention [ . AGE ]
     datasets . NAME . remote . DEST . frequency
     datasets . NAME . remote . DEST . retention [ . AGE ]
-    destinations . NAME . url
+    destinations . NAME . (url | server_fingerprint)
     remote_backup . (target_dataset | enabled)
 
 (``NAME`` may be written ``[NAME]`` instead of ``.NAME``; so may ``DEST`` and
@@ -40,10 +40,27 @@ value is parsed with ``yaml.safe_load`` (so ``true``, ``yes``, ``1``, ``5m``,
 YAML *dict* of the rendered configuration, which is then parsed back through
 `BackupConfig.from_file` -- the very guards `import` applies: the audit's
 rejections, the integer 0/1 acceptance with a warning, ``0m`` as "inherit",
-``client_id_file ""`` as unset, durations stored as typed. `BackupConfig` has no
+``client_cert_file ""`` as unset, durations stored as typed. `BackupConfig` has no
 public from-dict constructor, so the dict is written to a private (0700
 directory, 0600 file) temporary YAML and read with `from_file`; the file is
 removed before returning.
+
+Two settings are *paired* or *pinned*, and deliberately awkward to change:
+
+- ``client_cert_file`` and ``client_key_file`` are both-or-neither (the model's
+  rule). A path-at-a-time `set` cannot pass through the invalid half-set state,
+  so `set` of one while the other is unset is **refused** (an error, exit 1,
+  nothing written) and points at `edit`, which sets both in one buffer; `set`
+  of one while the other is already set replaces just that path. `unset` of
+  either clears **both**, with a warning saying so.
+- ``destinations.N.server_fingerprint`` is the pin written by enrollment. `set`
+  takes the text verbatim (NOT read as YAML: an all-digit hex string would
+  become an integer), normalises it (case, colons) and validates it; an empty
+  value is the same as `unset`. Removing or changing a pin warns, because the
+  destination stops being trusted until it is enrolled again.
+
+``set destinations.N.url`` refuses ``http://`` (and any non-https URL) with the
+model's own wording (`destination_url_problem`).
 
 Retention rules are matched by their length in seconds (``retention.7d`` finds
 a rule written ``1w``) and stored with the literal as typed. Removing a
@@ -53,6 +70,7 @@ destination override's last rule removed leaves it inheriting.
 
 import os
 import re
+import shlex
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -63,7 +81,10 @@ import yaml
 from zfsbackup.cli.errors import CliError
 from zfsbackup.cli.render import duration_literal, render_yaml
 from zfsbackup.config.store import destination_name_problem  # noqa: F401 - re-exported
-from zfsbackup.config import BackupConfig, DatasetConfig, Duration, RemoteDatasetConfig, RetentionRule
+from zfsbackup.config import (
+    BackupConfig, DatasetConfig, Duration, RemoteDatasetConfig, RetentionRule,
+    destination_url_problem,
+)
 
 __all__ = [
     "Change",
@@ -74,6 +95,7 @@ __all__ = [
     "format_path",
     "prefix_change_warnings",
     "get_lines",
+    "pin_change_warnings",
     "kind_of",
     "parse_dict",
     "resolve",
@@ -86,7 +108,7 @@ Segs = Tuple[str, ...]
 
 GLOBAL_SETTINGS: Tuple[str, ...] = (
     "snapshot_prefix", "check_interval", "prune_interval",
-    "api_host", "api_port", "dry_run", "client_id_file",
+    "api_host", "api_port", "dry_run", "client_cert_file", "client_key_file",
 )
 _DATASET_FIELDS = ("enabled", "recursive", "frequency")
 _SERVER_FIELDS = ("target_dataset", "enabled")
@@ -94,8 +116,11 @@ _ROOTS: Tuple[str, ...] = GLOBAL_SETTINGS + ("datasets", "destinations", "remote
 _MAX_LISTED = 12
 
 #: The tri-states (plan item 3c): `unset` means "derive it at run time".
-_TRI_STATE = ("prune_interval", "client_id_file")
-_TEXT_SETTINGS = ("snapshot_prefix", "api_host", "client_id_file")
+_TRI_STATE = ("prune_interval",)
+#: Both-or-neither: set together, unset together (see the module docstring).
+_TLS_FILES = ("client_cert_file", "client_key_file")
+_TEXT_SETTINGS = ("snapshot_prefix", "api_host") + _TLS_FILES
+_DESTINATION_FIELDS = ("url", "server_fingerprint")
 
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -169,7 +194,9 @@ def kind_of(segs: Segs) -> str:
             return "destinations"
         if n == 2:
             return "destination"
-        return "destination_name" if segs[2] == "name" else "destination_url"
+        if segs[2] == "name":
+            return "destination_name"
+        return "destination_fingerprint" if segs[2] == "server_fingerprint" else "destination_url"
     if head == "remote_backup":
         return "server" if n == 1 else "server_field"
     raise AssertionError(f"unclassified path {segs!r}")  # pragma: no cover
@@ -236,14 +263,15 @@ class _Resolver:
                     yield ("destinations", name)
                 else:
                     sub, subtail = _split_word(rest)
-                    if sub in ("url", "name") and not subtail:
+                    if sub in _DESTINATION_FIELDS + ("name",) and not subtail:
                         yield ("destinations", name, sub)
-                    elif sub in ("url", "name"):
+                    elif sub in _DESTINATION_FIELDS + ("name",):
                         self.fail(2, f"{format_path(('destinations', name))}.{sub} has no sub-settings")
                     else:
                         self.fail(
                             2,
-                            f"{format_path(('destinations', name))} has no setting {rest!r}; valid: url",
+                            f"{format_path(('destinations', name))} has no setting {rest!r}; "
+                            f"valid: {', '.join(_DESTINATION_FIELDS)}",
                         )
         elif word == "remote_backup":
             if not tail:
@@ -490,9 +518,9 @@ def get_lines(config: BackupConfig, segs: Segs) -> List[str]:
             return [_lit(value, key)]
         if key == "check_interval":
             return [_lit(value, key)]
-        if key == "client_id_file":
+        if key in _TLS_FILES:
             if value is None:
-                return ["derived ($HOME/.config/zfsbackup/client_id)"]
+                return ["derived (the generated client identity in <db>.tls/)"]
             return [str(value)]
         if key == "dry_run":
             return [_bool(value)]
@@ -510,7 +538,7 @@ def get_lines(config: BackupConfig, segs: Segs) -> List[str]:
         )
         return _dump(entry)
     if kind == "destination":
-        return _dump({"url": config.destinations[segs[1]].url})
+        return _dump(to_dict(config)["destinations"][segs[1]])
     if kind == "dataset_field":
         ds = _dataset(config, segs[1])
         field_name = segs[2]
@@ -559,6 +587,8 @@ def get_lines(config: BackupConfig, segs: Segs) -> List[str]:
         return [_lit(rule.keep_for, path)]
     if kind == "destination_url":
         return [config.destinations[segs[1]].url]
+    if kind == "destination_fingerprint":
+        return [config.destinations[segs[1]].server_fingerprint or NOT_ENROLLED]
     if kind in ("server", "server_field"):
         server = config.remote_backup
         if server is None:
@@ -579,6 +609,7 @@ def _dataset_entry(config: BackupConfig, name: str) -> Dict[str, Any]:
 
 
 NOT_SET = "(not set)"
+NOT_ENROLLED = "not enrolled"
 
 
 def compact(config: BackupConfig, segs: Segs) -> str:
@@ -725,6 +756,21 @@ def _drop_rule(mapping: Dict[Any, Any], age: str, where: str) -> None:
     raise PathError(f"{where}: no retention rule with age {age}; rules: {have}")
 
 
+def _clear_tls_files(data: Dict[str, Any], key: str) -> List[str]:
+    """Remove `client_cert_file` AND `client_key_file` from `data` (they are
+    both-or-neither); a warning when that also removed the one not asked for."""
+    other = _TLS_FILES[1 - _TLS_FILES.index(key)]
+    dropped_other = data.get(other) is not None
+    data.pop(key, None)
+    data.pop(other, None)
+    if not dropped_other:
+        return []
+    return [
+        f"client_cert_file and client_key_file are set together or not at all: {other} was "
+        f"unset as well, and this host goes back to the generated client identity in <db>.tls/"
+    ]
+
+
 def _reparse(data: Dict[str, Any], path: str) -> BackupConfig:
     """`parse_dict`, with a refusal naming the setting that was being changed."""
     try:
@@ -744,6 +790,32 @@ def prefix_change_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
         f"existing {old.snapshot_prefix}_* snapshots will no longer be managed or pruned "
         "(they stay until destroyed by hand)"
     ]
+
+
+def pin_change_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
+    """A warning for each destination present in both whose pinned server
+    fingerprint was removed or replaced: the destination stops being trusted
+    (and backups to it stop) until it is enrolled again. A pin set where there
+    was none, and a destination deleted outright, are not warned about."""
+    messages: List[str] = []
+    for name in sorted(old.destinations):
+        before = old.destinations[name].server_fingerprint
+        after = new.destinations[name].server_fingerprint if name in new.destinations else before
+        if before is None or after == before:
+            continue
+        where = format_path(("destinations", name, "server_fingerprint"))
+        if after is None:
+            messages.append(
+                f"{where} removed: destination {name!r} is no longer enrolled, so remote "
+                f"backups to it cannot run until `zfsbackup-config enroll {shlex.quote(name)}` "
+                "pins its server again"
+            )
+        else:
+            messages.append(
+                f"{where} changed: destination {name!r} is now trusted only if its server "
+                "presents the new fingerprint; the old pin no longer applies"
+            )
+    return messages
 
 
 def _pruning_starts(old: BackupConfig, new: BackupConfig, segs: Segs) -> List[str]:
@@ -788,7 +860,21 @@ def set_value(config: BackupConfig, segs: Segs, text: str) -> Change:
         key = segs[0]
         if key in _TEXT_SETTINGS:
             _require_text(value, path, text)
-        if key in _TRI_STATE and (value is None or value == ""):
+        if key in _TLS_FILES:
+            if value is None or value == "":
+                # "" and null both mean unset; the pair goes together.
+                warnings.extend(_clear_tls_files(data, key))
+            else:
+                other = _TLS_FILES[1 - _TLS_FILES.index(key)]
+                if data.get(other) is None:
+                    raise PathError(
+                        f"{path}: client_cert_file and client_key_file must be set together "
+                        f"(both or neither), and {other} is not set; a one-path `set` cannot "
+                        "set both, so use `zfsbackup-config edit` and add both keys in one "
+                        "buffer. Nothing was changed."
+                    )
+                data[key] = value
+        elif key in _TRI_STATE and (value is None or value == ""):
             data.pop(key, None)  # "" and null both mean unset (A-14.1)
         else:
             data[key] = value
@@ -828,7 +914,28 @@ def set_value(config: BackupConfig, segs: Segs, text: str) -> Change:
         scope = segs[:5]
     elif kind == "destination_url":
         _require_text(value, path, text)
+        if isinstance(value, str):
+            problem = destination_url_problem(value.strip())
+            if problem:
+                raise PathError(f"destinations[{segs[1]}]: {problem}")
         data["destinations"][segs[1]]["url"] = value
+        if config.destinations[segs[1]].server_fingerprint is not None and (
+            not isinstance(value, str) or value.strip() != config.destinations[segs[1]].url
+        ):
+            warnings.append(
+                f"destinations[{segs[1]}] is enrolled: its pinned server fingerprint is kept, "
+                "so if the new url is a different server the connection is refused until you "
+                "re-enroll (or `unset` the fingerprint)"
+            )
+    elif kind == "destination_fingerprint":
+        # Verbatim text, not YAML: an all-digit hex string would read as an int.
+        fingerprint = text.strip()
+        if len(fingerprint) >= 2 and fingerprint[0] == fingerprint[-1] and fingerprint[0] in "'\"":
+            fingerprint = fingerprint[1:-1].strip()
+        if fingerprint:
+            data["destinations"][segs[1]]["server_fingerprint"] = fingerprint
+        else:
+            data["destinations"][segs[1]].pop("server_fingerprint", None)
     elif kind == "server_field":
         server = data.get("remote_backup")
         if segs[1] == "target_dataset":
@@ -852,6 +959,8 @@ def set_value(config: BackupConfig, segs: Segs, text: str) -> Change:
 
     new = _reparse(data, path)
     warnings.extend(_pruning_starts(config, new, segs))
+    if kind == "destination_fingerprint":
+        warnings.extend(pin_change_warnings(config, new))
     warnings.extend(prefix_change_warnings(config, new))
     if (
         kind == "server_field"
@@ -876,12 +985,19 @@ def unset_value(config: BackupConfig, segs: Segs) -> Change:
     data = to_dict(config)
     scope: Optional[Segs] = None
 
+    warnings: List[str] = []
+
     if kind == "global":
-        if segs[0] not in _TRI_STATE:
+        if segs[0] in _TLS_FILES:
+            warnings.extend(_clear_tls_files(data, segs[0]))
+        elif segs[0] not in _TRI_STATE:
             raise _unsettable(path)
-        data.pop(segs[0], None)
+        else:
+            data.pop(segs[0], None)
     elif kind in ("dataset_field", "destination_url"):
         raise _unsettable(path)
+    elif kind == "destination_fingerprint":
+        data["destinations"][segs[1]].pop("server_fingerprint", None)
     elif kind == "retention":
         _entry(data, segs[1]).pop("retention", None)  # the 1d -> 30d default
     elif kind == "rule":
@@ -919,4 +1035,7 @@ def unset_value(config: BackupConfig, segs: Segs) -> Change:
         raise AssertionError(kind)
 
     new = _reparse(data, path)
-    return Change(new, _pruning_starts(config, new, segs), scope)
+    warnings.extend(_pruning_starts(config, new, segs))
+    if kind == "destination_fingerprint":
+        warnings.extend(pin_change_warnings(config, new))
+    return Change(new, warnings, scope)

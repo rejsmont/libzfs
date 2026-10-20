@@ -1,4 +1,11 @@
-"""Unit tests for the Flask API (zfsbackup.api)."""
+"""Unit tests for the Flask API (zfsbackup.api).
+
+Every endpoint but `/health` and `/enroll` needs a pinned client certificate (plan M10), so
+these tests drive the app through `_api_support.Authed`: a `FakeGateway` that pins one
+certificate under the client id `client1` (`CLIENT_ID`), presented in `SSL_CLIENT_CERT` as the
+TLS layer would. The server dataset of a request is `<target>/<BOUND id>/...`. Authentication,
+authorization, `/enroll`, `/rotate` and `/whoami` are in `test_zfsbackup_api_auth.py`.
+"""
 
 import json
 import logging
@@ -8,9 +15,11 @@ from unittest.mock import MagicMock, PropertyMock, patch
 from datetime import datetime, timedelta, timezone
 from simple_websocket import ConnectionClosed
 
+from _api_support import Authed, CLIENT_ID
 from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
-from zfsbackup.api import create_app
-from zfsbackup.backup_manager import DatasetInfo, DatasetManager, SnapshotInfo
+from zfsbackup.backup_manager import (
+    DatasetInfo, DatasetManager, SnapshotInfo, PROP_CLIENT_ID, PROP_SOURCE_DATASET,
+)
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, RetentionRule, RemoteServerConfig,
 )
@@ -29,6 +38,10 @@ def _make_config(**kwargs) -> BackupConfig:
     return BackupConfig(**defaults)
 
 
+#: The websocket route of `client1`'s `pool/data`.
+STREAM_PATH = f'/backup/{CLIENT_ID}/pool/data/stream'
+
+
 def _make_dsi(name='pool/data') -> DatasetInfo:
     ds = Dataset(name)
     cfg = DatasetConfig(name=name, frequency=timedelta(hours=1))
@@ -37,25 +50,41 @@ def _make_dsi(name='pool/data') -> DatasetInfo:
 
 
 @pytest.fixture
-def client(mocker):
-    config = _make_config()
-    dsi = _make_dsi()
-    mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[dsi])
-    app = create_app(config)
-    app.testing = True
-    return app.test_client()
+def authed(mocker):
+    mocker.patch.object(
+        DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[_make_dsi()]
+    )
+    return Authed(_make_config())
 
 
 @pytest.fixture
-def client_with_remote(mocker):
+def client(authed):
+    """A test client presenting the certificate pinned under `client1`."""
+    return authed.client()
+
+
+@pytest.fixture
+def authed_with_remote(mocker):
     config = _make_config(
         remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
     )
-    dsi = _make_dsi()
-    mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[dsi])
-    app = create_app(config)
-    app.testing = True
-    return app.test_client()
+    mocker.patch.object(
+        DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[_make_dsi()]
+    )
+    return Authed(config)
+
+
+@pytest.fixture
+def client_with_remote(authed_with_remote):
+    return authed_with_remote.client()
+
+
+def _authed_client(mocker, config, **kwargs):
+    """An authenticated test client for `config` (the pinned id is `client1`)."""
+    mocker.patch.object(
+        DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[_make_dsi()]
+    )
+    return Authed(config, **kwargs).client()
 
 
 class TestHealthEndpoint:
@@ -86,13 +115,7 @@ class TestConfigEndpoint:
         # never have to special-case a missing prune interval.
         config = _make_config()
         assert config.prune_interval is None
-        dsi = _make_dsi()
-        mocker.patch.object(
-            DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[dsi]
-        )
-        app = create_app(config)
-        app.testing = True
-        resp = app.test_client().get('/config')
+        resp = _authed_client(mocker, config).get('/config')
         data = resp.get_json()
         assert data['prune_interval_seconds'] is not None
         assert isinstance(data['prune_interval_seconds'], (int, float))
@@ -100,11 +123,7 @@ class TestConfigEndpoint:
 
     def test_config_values_match(self, mocker):
         config = _make_config(snapshot_prefix='testsnap', dry_run=True)
-        dsi = _make_dsi()
-        mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[dsi])
-        app = create_app(config)
-        app.testing = True
-        resp = app.test_client().get('/config')
+        resp = _authed_client(mocker, config).get('/config')
         data = resp.get_json()
         assert data['snapshot_prefix'] == 'testsnap'
         assert data['dry_run'] is True
@@ -133,13 +152,8 @@ class TestDatasetsEndpoint:
 
 class TestSnapshotsEndpoint:
     def test_snapshots_returns_empty_list(self, mocker):
-        config = _make_config()
-        dsi = _make_dsi()
-        mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[dsi])
         mocker.patch.object(DatasetManager, 'list_snapshots', return_value=[])
-        app = create_app(config)
-        app.testing = True
-        resp = app.test_client().get('/datasets/pool/data/snapshots')
+        resp = _authed_client(mocker, _make_config()).get('/datasets/pool/data/snapshots')
         assert resp.status_code == 200
         assert resp.get_json() == []
 
@@ -148,18 +162,12 @@ class TestSnapshotsEndpoint:
         assert resp.status_code == 404
 
     def test_snapshots_returns_snapshot_info(self, mocker):
-        config = _make_config()
-        dsi = _make_dsi()
-        mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[dsi])
-
         fs = Filesystem('pool/data')
         snap = ZFSSnapshot(fs, 'autosnap_20240101120000')
         snap_info = SnapshotInfo(snap, 'autosnap')
 
         mocker.patch.object(DatasetManager, 'list_snapshots', return_value=[snap_info])
-        app = create_app(config)
-        app.testing = True
-        resp = app.test_client().get('/datasets/pool/data/snapshots')
+        resp = _authed_client(mocker, _make_config()).get('/datasets/pool/data/snapshots')
         assert resp.status_code == 200
         data = resp.get_json()
         assert len(data) == 1
@@ -168,51 +176,28 @@ class TestSnapshotsEndpoint:
         assert 'age_seconds' in data[0]
 
 
-class TestBackupRegister:
-    def test_register_disabled_when_no_remote_config(self, client):
-        resp = client.post('/backup/register', json={'client_id': 'testclient'})
-        assert resp.status_code == 503
+class TestBackupRegisterIsGone:
+    """`/backup/register` was removed (plan M10): `/whoami` says who the server takes the
+    caller for, and the first `negotiate` creates the server dataset."""
 
-    def test_register_returns_400_without_client_id(self, client_with_remote, mocker):
-        mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
-        resp = client_with_remote.post('/backup/register', json={})
-        assert resp.status_code == 400
-        assert 'client_id' in resp.get_json()['error']
-
-    def test_register_creates_filesystem_when_not_exists(self, client_with_remote, mocker):
-        mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
+    @pytest.mark.parametrize('method', ['post', 'get'])
+    def test_an_authenticated_caller_gets_404(self, client_with_remote, mocker, method):
+        mock_exists = mocker.patch('zfsbackup.api.zfs.exists')
         mock_create = mocker.patch('zfsbackup.api.zfs.create')
-        resp = client_with_remote.post('/backup/register', json={'client_id': 'testclient'})
-        assert resp.status_code == 200
-        mock_create.assert_called_once()
-
-    def test_register_skips_create_when_exists(self, client_with_remote, mocker):
-        mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
-        mock_create = mocker.patch('zfsbackup.api.zfs.create')
-        resp = client_with_remote.post('/backup/register', json={'client_id': 'testclient'})
-        assert resp.status_code == 200
+        resp = getattr(client_with_remote, method)('/backup/register', json={'client_id': 'testclient'})
+        assert resp.status_code == 404
+        mock_exists.assert_not_called()
         mock_create.assert_not_called()
 
-    def test_register_dry_run_returns_dry_run_flag(self, mocker):
-        config = _make_config(
-            dry_run=True,
-            remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
-        )
-        dsi = _make_dsi()
-        mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[dsi])
-        mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
-        app = create_app(config)
-        app.testing = True
-        resp = app.test_client().post('/backup/register', json={'client_id': 'testclient'})
-        assert resp.status_code == 200
-        assert resp.get_json().get('dry_run') is True
+    def test_the_route_and_the_view_are_not_registered(self, authed_with_remote):
+        app = authed_with_remote.app
+        assert 'backup_register' not in app.view_functions
+        assert '/backup/register' not in {r.rule for r in app.url_map.iter_rules()}
 
-    def test_register_returns_target_dataset(self, client_with_remote, mocker):
-        mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
-        resp = client_with_remote.post('/backup/register', json={'client_id': 'testclient'})
-        data = resp.get_json()
-        assert 'target_dataset' in data
-        assert 'testclient' in data['target_dataset']
+    def test_whoami_replaced_it(self, client_with_remote):
+        resp = client_with_remote.get('/whoami')
+        assert resp.status_code == 200
+        assert resp.get_json()['client_id'] == CLIENT_ID
 
 
 class TestBackupNegotiate:
@@ -326,31 +311,31 @@ class TestBackupStream:
 
     def _get_handler(self, config, mocker):
         mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[])
-        app = create_app(config)
-        return app.view_functions['backup_stream'].__wrapped__, app
+        authed = Authed(config)
+        return authed.app.view_functions['backup_stream'].__wrapped__, authed
 
     def test_stream_disabled_sends_error(self, mocker):
         config = _make_config()  # no remote_backup
-        handler, app = self._get_handler(config, mocker)
+        handler, authed = self._get_handler(config, mocker)
         ws = MagicMock()
-        with app.test_request_context(query_string={'mode': 'resume'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
         sent = json.loads(ws.send.call_args[0][0])
         assert 'error' in sent
 
     def test_stream_disabled_ws_send_exception_suppressed(self, mocker):
         config = _make_config()  # no remote_backup
-        handler, app = self._get_handler(config, mocker)
+        handler, authed = self._get_handler(config, mocker)
         ws = MagicMock()
         ws.send.side_effect = Exception('ws already closed')
-        with app.test_request_context(query_string={'mode': 'resume'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')  # must not raise
 
     def test_stream_creates_filesystem_when_not_exists(self, mocker):
         config = _make_config(
             remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
         )
-        handler, app = self._get_handler(config, mocker)
+        handler, authed = self._get_handler(config, mocker)
         mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
         mock_create = mocker.patch('zfsbackup.api.zfs.create')
         mocker.patch('zfsbackup.api.zfs.set')
@@ -360,7 +345,7 @@ class TestBackupStream:
         ws = MagicMock()
         ws.receive.side_effect = [json.dumps({'done': True})]
 
-        with app.test_request_context(query_string={'mode': 'resume'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
         mock_create.assert_called_once()
 
@@ -370,31 +355,31 @@ class TestBackupStream:
         config = _make_config(
             remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
         )
-        handler, app = self._get_handler(config, mocker)
+        handler, authed = self._get_handler(config, mocker)
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         mocker.patch(
             'zfsbackup.api.zfs.receive.filesystem',
             side_effect=RuntimeError('cannot receive: dataset is busy'),
         )
         ws = MagicMock()
-        with app.test_request_context(query_string={'mode': 'resume'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
         ws.send.assert_called_once()
         assert json.loads(ws.send.call_args[0][0]) == {
             'error': 'Failed to start zfs receive: cannot receive: dataset is busy'
         }
         ws.receive.assert_not_called()
-        assert app.extensions['zfsbackup.stream_gate'].active == 0
+        assert authed.gate.active == 0
 
     def test_stream_dry_run_sends_ok(self, mocker):
         config = _make_config(
             dry_run=True,
             remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
         )
-        handler, app = self._get_handler(config, mocker)
+        handler, authed = self._get_handler(config, mocker)
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         ws = MagicMock()
-        with app.test_request_context(query_string={'mode': 'resume'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
         sent = json.loads(ws.send.call_args[0][0])
         assert sent.get('status') == 'ok'
@@ -404,7 +389,7 @@ class TestBackupStream:
         config = _make_config(
             remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
         )
-        handler, app = self._get_handler(config, mocker)
+        handler, authed = self._get_handler(config, mocker)
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
 
         mock_writer = MagicMock()
@@ -413,7 +398,7 @@ class TestBackupStream:
         ws = MagicMock()
         ws.receive.side_effect = [b'chunk1', b'chunk2', json.dumps({'done': True})]
 
-        with app.test_request_context(query_string={'mode': 'resume'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
 
         mock_writer.write.assert_any_call(b'chunk1')
@@ -426,7 +411,7 @@ class TestBackupStream:
         config = _make_config(
             remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
         )
-        handler, app = self._get_handler(config, mocker)
+        handler, authed = self._get_handler(config, mocker)
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
 
         mock_writer = MagicMock()
@@ -435,7 +420,7 @@ class TestBackupStream:
         ws = MagicMock()
         ws.receive.side_effect = ConnectionClosed(None, None)
 
-        with app.test_request_context(query_string={'mode': 'resume'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
 
         mock_writer.close.assert_called_once()
@@ -444,7 +429,7 @@ class TestBackupStream:
         config = _make_config(
             remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
         )
-        handler, app = self._get_handler(config, mocker)
+        handler, authed = self._get_handler(config, mocker)
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
 
         mock_writer = MagicMock()
@@ -454,7 +439,7 @@ class TestBackupStream:
         ws = MagicMock()
         ws.receive.return_value = b'chunk'
 
-        with app.test_request_context(query_string={'mode': 'resume'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
 
         mock_writer.close.assert_called_once()
@@ -471,14 +456,14 @@ class TestBackupStreamWriteFailure:
             remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
         )
         mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[])
-        app = create_app(config)
-        handler = app.view_functions['backup_stream'].__wrapped__
+        authed = Authed(config)
+        handler = authed.app.view_functions['backup_stream'].__wrapped__
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         mocker.patch('zfsbackup.api.zfs.receive.filesystem', return_value=writer)
-        return handler, app
+        return handler, authed
 
-    def _run(self, handler, app, ws):
-        with app.test_request_context(query_string={'mode': 'resume'}):
+    def _run(self, handler, authed, ws):
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
 
     def test_the_receive_diagnostic_replaces_the_pipe_error_and_both_are_logged(
@@ -487,11 +472,11 @@ class TestBackupStreamWriteFailure:
         writer = MagicMock()
         writer.write.side_effect = BrokenPipeError(32, 'Broken pipe')
         writer.close.side_effect = RuntimeError('cannot receive: checksum mismatch')
-        handler, app = self._setup(mocker, writer)
+        handler, authed = self._setup(mocker, writer)
         ws = MagicMock()
         ws.receive.return_value = b'chunk'
         with caplog.at_level(logging.ERROR, logger='zfsbackup.api'):
-            self._run(handler, app, ws)
+            self._run(handler, authed, ws)
 
         assert json.loads(ws.send.call_args[0][0]) == {
             'error': 'cannot receive: checksum mismatch'
@@ -508,11 +493,11 @@ class TestBackupStreamWriteFailure:
     def test_a_pipe_error_with_a_clean_close_is_reported_as_the_pipe_error(self, mocker, caplog):
         writer = MagicMock()
         writer.write.side_effect = OSError(32, 'Broken pipe')
-        handler, app = self._setup(mocker, writer)       # close() raises nothing
+        handler, authed = self._setup(mocker, writer)       # close() raises nothing
         ws = MagicMock()
         ws.receive.return_value = b'chunk'
         with caplog.at_level(logging.ERROR, logger='zfsbackup.api'):
-            self._run(handler, app, ws)
+            self._run(handler, authed, ws)
 
         assert json.loads(ws.send.call_args[0][0]) == {'error': '[Errno 32] Broken pipe'}
         ws.send.assert_called_once()
@@ -524,10 +509,10 @@ class TestBackupStreamWriteFailure:
         writer = MagicMock()
         writer.write.side_effect = [None, None, BrokenPipeError(32, 'Broken pipe')]
         writer.close.side_effect = RuntimeError('cannot receive: out of space')
-        handler, app = self._setup(mocker, writer)
+        handler, authed = self._setup(mocker, writer)
         ws = MagicMock()
         ws.receive.side_effect = [b'a', b'b', b'c', b'never read']
-        self._run(handler, app, ws)
+        self._run(handler, authed, ws)
         assert writer.write.call_count == 3
         writer.close.assert_called_once()
         assert json.loads(ws.send.call_args[0][0]) == {'error': 'cannot receive: out of space'}
@@ -536,10 +521,10 @@ class TestBackupStreamWriteFailure:
     def test_a_non_oserror_write_failure_closes_once_via_the_general_path(self, mocker):
         writer = MagicMock()
         writer.write.side_effect = ValueError('bad chunk')
-        handler, app = self._setup(mocker, writer)
+        handler, authed = self._setup(mocker, writer)
         ws = MagicMock()
         ws.receive.return_value = b'chunk'
-        self._run(handler, app, ws)
+        self._run(handler, authed, ws)
         writer.close.assert_called_once()
         assert json.loads(ws.send.call_args[0][0]) == {'error': 'bad chunk'}
 
@@ -548,20 +533,20 @@ class TestBackupStreamWriteFailure:
         writer = MagicMock()
         writer.write.side_effect = lambda d: order.append(('write', d))
         writer.close.side_effect = lambda: order.append(('close',))
-        handler, app = self._setup(mocker, writer)
+        handler, authed = self._setup(mocker, writer)
         ws = MagicMock()
         ws.send.side_effect = lambda m: order.append(('send', json.loads(m)))
         ws.receive.side_effect = [b'x', json.dumps({'done': True})]
-        self._run(handler, app, ws)
+        self._run(handler, authed, ws)
         assert order == [('write', b'x'), ('close',), ('send', {'status': 'ok'})]
 
     def test_a_failing_close_after_done_reports_the_error_not_ok(self, mocker):
         writer = MagicMock()
         writer.close.side_effect = RuntimeError('cannot receive: bad stream')
-        handler, app = self._setup(mocker, writer)
+        handler, authed = self._setup(mocker, writer)
         ws = MagicMock()
         ws.receive.side_effect = [b'x', json.dumps({'done': True})]
-        self._run(handler, app, ws)
+        self._run(handler, authed, ws)
         assert json.loads(ws.send.call_args[0][0]) == {'error': 'cannot receive: bad stream'}
         ws.send.assert_called_once()
         writer.close.assert_called_once()                # reaped before the close: no second close
@@ -575,8 +560,8 @@ class TestBackupStreamWriteFailure:
         writer = MagicMock()
         writer.write.side_effect = BrokenPipeError(32, 'Broken pipe')
         writer.close.side_effect = close_error
-        handler, app = self._setup(mocker, writer)
-        gate = app.extensions['zfsbackup.stream_gate']
+        handler, authed = self._setup(mocker, writer)
+        gate = authed.gate
         during = []
         ws = MagicMock()
 
@@ -586,7 +571,7 @@ class TestBackupStreamWriteFailure:
 
         ws.receive.side_effect = receive
         assert gate.active == 0
-        self._run(handler, app, ws)
+        self._run(handler, authed, ws)
         assert during == [1]                 # registered while the stream ran...
         assert gate.active == 0              # ...and released afterwards
 
@@ -594,12 +579,12 @@ class TestBackupStreamWriteFailure:
         writer = MagicMock()
         writer.write.side_effect = BrokenPipeError(32, 'Broken pipe')
         writer.close.side_effect = RuntimeError('cannot receive: x')
-        handler, app = self._setup(mocker, writer)
-        gate = app.extensions['zfsbackup.stream_gate']
+        handler, authed = self._setup(mocker, writer)
+        gate = authed.gate
         for _ in range(5):
             ws = MagicMock()
             ws.receive.return_value = b'chunk'
-            self._run(handler, app, ws)
+            self._run(handler, authed, ws)
         assert gate.active == 0
         assert gate.begin() is True           # not wedged
         gate.end()
@@ -609,31 +594,31 @@ class TestBackupStreamWriteFailure:
         `_receive_stream_locked`; the dataset lock and the gate's `finally`
         must still release."""
         source_props.return_value = {'org.zfsbackup:source_dataset': 'tank/data'}
-        handler, app = self._setup(mocker, MagicMock())
-        gate = app.extensions['zfsbackup.stream_gate']
+        handler, authed = self._setup(mocker, MagicMock())
+        gate = authed.gate
         ws = MagicMock()
         ws.receive.side_effect = ConnectionClosed(None, None)    # a regression must fail, not spin
         ws.send.side_effect = RuntimeError('socket gone')
         with pytest.raises(RuntimeError, match='socket gone'):
-            self._run(handler, app, ws)
+            self._run(handler, authed, ws)
         assert gate.active == 0
         # ...and the per-dataset lock: the next stream for it is not 'busy'.
         source_props.return_value = {}
         ws2 = MagicMock()
         ws2.receive.side_effect = [json.dumps({'done': True})]
-        self._run(handler, app, ws2)
+        self._run(handler, authed, ws2)
         assert json.loads(ws2.send.call_args[0][0]) == {'status': 'ok'}
 
     def test_a_client_that_vanishes_before_the_ok_does_not_cause_a_second_close(self, mocker):
         """The stream was written and `close()` succeeded; only the final
         `{'status': 'ok'}` hits a closed socket."""
         writer = MagicMock()
-        handler, app = self._setup(mocker, writer)
-        gate = app.extensions['zfsbackup.stream_gate']
+        handler, authed = self._setup(mocker, writer)
+        gate = authed.gate
         ws = MagicMock()
         ws.receive.side_effect = [b'x', json.dumps({'done': True})]
         ws.send.side_effect = ConnectionClosed(None, None)
-        self._run(handler, app, ws)                      # must not raise
+        self._run(handler, authed, ws)                      # must not raise
         writer.write.assert_called_once_with(b'x')
         writer.close.assert_called_once()
         ws.send.assert_called_once()
@@ -678,11 +663,15 @@ def _streams_in_progress(app):
 
 
 class Stream:
-    """The `stream` handler of one app, driven directly with a mock websocket."""
+    """The `stream` handler of one app, driven directly with a mock websocket.
+
+    `run(client=X)` is a request authenticated as the certificate pinned under id X (the
+    handler takes the id from the binding, never from its argument)."""
 
     def __init__(self, mocker, **config_kwargs):
         mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[])
-        self.app = create_app(_remote_config(**config_kwargs))
+        self.authed = Authed(_remote_config(**config_kwargs))
+        self.app = self.authed.app
         self.handler = self.app.view_functions['backup_stream'].__wrapped__
         self.gate = self.app.extensions['zfsbackup.stream_gate']
         self.ws = MagicMock()
@@ -716,7 +705,8 @@ class Stream:
         qs = dict(query)
         if mode is not None:
             qs['mode'] = mode
-        with self.app.test_request_context(query_string=qs):
+        who = self.authed.cert_for(client)
+        with self.authed.context(f'/backup/{client}/{dataset}/stream', who=who, query_string=qs):
             self.handler(ws if ws is not None else self.ws, client, dataset)
 
     @property
@@ -773,10 +763,10 @@ class TestStreamModeIsRequired:
 
     def test_a_disabled_server_still_says_disabled_first(self, mocker):
         mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[])
-        app = create_app(_make_config())
+        authed = Authed(_make_config(), client_id='c')
         ws = MagicMock()
-        with app.test_request_context(query_string={'mode': 'bogus'}):
-            app.view_functions['backup_stream'].__wrapped__(ws, 'c', 'pool/data')
+        with authed.context('/backup/c/pool/data/stream', query_string={'mode': 'bogus'}):
+            authed.app.view_functions['backup_stream'].__wrapped__(ws, 'c', 'pool/data')
         assert json.loads(ws.send.call_args[0][0]) == {'error': 'remote_backup disabled'}
 
     @pytest.mark.parametrize('mode', ['fresh', 'resume'])
@@ -1041,10 +1031,10 @@ class TestSourceDatasetCheck:
         gate = client_with_remote.application.extensions['zfsbackup.stream_gate']
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         source_props.return_value = {'org.zfsbackup:source_dataset': 'tank/data'}
-        assert client_with_remote.post('/backup/c/pool/data/negotiate', json={}).status_code == 409
+        assert client_with_remote.post('/backup/client1/pool/data/negotiate', json={}).status_code == 409
         assert gate.active == 0
         source_props.side_effect = RuntimeError('x')
-        assert client_with_remote.post('/backup/c/pool/data/negotiate', json={}).status_code == 500
+        assert client_with_remote.post('/backup/client1/pool/data/negotiate', json={}).status_code == 500
         assert gate.active == 0
 
     def test_the_server_dataset_drops_the_pool_so_two_pools_collide(self, stream, source_props):
@@ -1161,12 +1151,12 @@ class TestFreshWithTokenThroughRealCommands:
         mocker.patch('zfsbackup.api.read_zfsbackup_properties', return_value={})
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         mocker.patch('zfsbackup.api.zfs.create')
-        app = create_app(_remote_config())
-        handler = app.view_functions['backup_stream'].__wrapped__
+        authed = Authed(_remote_config())
+        handler = authed.app.view_functions['backup_stream'].__wrapped__
         self.setup_popen(mock_subprocess, [f'{SERVER_DS}\tfilesystem\t{TOKEN}\n'])
         ws = MagicMock()
         ws.receive.side_effect = [b'chunk', json.dumps({'done': True})]
-        with app.test_request_context(query_string={'mode': 'fresh'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'fresh'}):
             handler(ws, 'client1', 'pool/data')
         argvs = [c[0][0][1:] for c in mock_subprocess.call_args_list]
         assert len(argvs) == 3, argvs
@@ -1180,12 +1170,12 @@ class TestFreshWithTokenThroughRealCommands:
         mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[])
         mocker.patch('zfsbackup.api.read_zfsbackup_properties', return_value={})
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
-        app = create_app(_remote_config())
-        handler = app.view_functions['backup_stream'].__wrapped__
+        authed = Authed(_remote_config())
+        handler = authed.app.view_functions['backup_stream'].__wrapped__
         mock_subprocess.setup_multi(('',))
         ws = MagicMock()
         ws.receive.side_effect = [json.dumps({'done': True})]
-        with app.test_request_context(query_string={'mode': 'resume'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
         argvs = [c[0][0][1:] for c in mock_subprocess.call_args_list]
         assert len(argvs) == 1 and argvs[0][0] == 'receive' and '-A' not in argvs[0]
@@ -1202,14 +1192,14 @@ class TestFreshWithTokenThroughRealCommands:
         mocker.patch('zfsbackup.api.read_zfsbackup_properties', return_value={})
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         mocker.patch('zfsbackup.api.zfs.create')
-        app = create_app(_remote_config())
-        handler = app.view_functions['backup_stream'].__wrapped__
+        authed = Authed(_remote_config())
+        handler = authed.app.view_functions['backup_stream'].__wrapped__
         self.setup_popen(
             mock_subprocess, [f'{SERVER_DS}\tfilesystem\t{TOKEN}\n'], abort=('', stderr, rc)
         )
         ws = MagicMock()
         ws.receive.side_effect = [json.dumps({'done': True})]
-        with app.test_request_context(query_string={'mode': 'fresh'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'fresh'}):
             handler(ws, 'client1', 'pool/data')
         sent = json.loads(ws.send.call_args[0][0])
         if clean:
@@ -1671,7 +1661,7 @@ class TestStreamsInProgressSet:
         bad = 'pool/backups/client1//x'
         stream.run('fresh', dataset='pool//x')
         assert stream.sent == [{
-            'error': f'Invalid dataset name {bad!r}: {bad} is not a valid ZFS dataset name'
+            'error': f'invalid dataset name {bad!r}: {bad} is not a valid ZFS dataset name'
         }]
         stream.untouched()                               # no exists/list/create/set/abort/receive
         stream.ws.receive.assert_not_called()
@@ -1683,7 +1673,7 @@ class TestStreamsInProgressSet:
         for _ in range(3):
             ws = _ws()
             stream.run('resume', ws=ws, dataset='pool//x')
-            assert 'Invalid dataset name' in _sent_by(ws)[0]['error']
+            assert 'invalid dataset name' in _sent_by(ws)[0]['error']
             assert stream.claimed == set()
 
     def test_an_invalid_name_refusal_survives_a_dead_socket(self, stream):
@@ -1696,7 +1686,7 @@ class TestStreamsInProgressSet:
         with HeldStream(stream) as held:
             ws = _ws()
             stream.run('resume', ws=ws, dataset='pool//x')
-            assert 'Invalid dataset name' in _sent_by(ws)[0]['error']
+            assert 'invalid dataset name' in _sent_by(ws)[0]['error']
             assert stream.claimed == {SERVER_DS}
             held.release()
         assert stream.claimed == set()
@@ -1732,3 +1722,181 @@ class TestStreamsInProgressSet:
         a, b = Stream(mocker), Stream(mocker)
         with HeldStream(a):
             assert a.claimed == {SERVER_DS} and b.claimed == set()
+
+
+# ---------------------------------------------------------------------------
+# The bound id owns the server namespace (plan M10, D5)
+# ---------------------------------------------------------------------------
+
+
+class TestServerPathsUseTheBoundId:
+    def test_negotiate_answers_with_a_server_dataset_under_the_bound_id(
+        self, client_with_remote, mocker
+    ):
+        mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
+        mocker.patch('zfsbackup.api.zfs.list', return_value=[])
+        resp = client_with_remote.post('/backup/client1/pool/data/negotiate', json={'snapshots': []})
+        assert resp.status_code == 200
+        assert resp.get_json()['server_dataset'] == SERVER_DS
+
+    def test_negotiate_stamps_the_bound_id_and_the_source_dataset(
+        self, client_with_remote, mocker
+    ):
+        mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
+        mock_create = mocker.patch('zfsbackup.api.zfs.create')
+        mock_set = mocker.patch('zfsbackup.api.zfs.set')
+        mocker.patch('zfsbackup.api.zfs.list', return_value=[])
+        encoded = DatasetConfig(name='pool/data').to_property()
+        resp = client_with_remote.post(
+            '/backup/client1/pool/data/negotiate', json={'snapshots': [], 'config': encoded}
+        )
+        assert resp.status_code == 200
+        assert str(mock_create.call_args[0][0]) == SERVER_DS
+        assert str(mock_set.call_args[0][0]) == SERVER_DS
+        props = mock_set.call_args[0][1]
+        assert props[PROP_CLIENT_ID] == 'client1'
+        assert props[PROP_SOURCE_DATASET] == 'pool/data'
+        assert props['org.zfsbackup:config'] == encoded
+
+    def test_each_certificate_gets_its_own_namespace(self, authed_with_remote, mocker):
+        """Two clients negotiating the same client dataset name get disjoint server datasets."""
+        mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
+        mocker.patch('zfsbackup.api.zfs.list', return_value=[])
+        other = authed_with_remote.cert_for('client2')
+        a = authed_with_remote.client().post('/backup/client1/pool/data/negotiate', json={})
+        b = authed_with_remote.client(other).post('/backup/client2/pool/data/negotiate', json={})
+        assert a.get_json()['server_dataset'] == 'pool/backups/client1/data'
+        assert b.get_json()['server_dataset'] == 'pool/backups/client2/data'
+
+    def test_the_stream_handler_ignores_the_client_id_it_is_called_with(self, stream):
+        """The view's `client_id` argument is the URL's; the binding (`g.client_id`) is what
+        names the server dataset, the claim and the stamped properties."""
+        stream.exists.return_value = False
+        with stream.authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
+            stream.handler(stream.ws, 'someone-else', 'pool/data')
+        assert str(stream.create.call_args[0][0]) == SERVER_DS
+        assert stream.set.call_args[0][1][PROP_CLIENT_ID] == 'client1'
+
+    def test_resume_token_looks_under_the_bound_id(self, authed_with_remote, mocker):
+        exists = mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
+        resp = authed_with_remote.client().get('/backup/client1/pool/data/resume_token')
+        assert resp.status_code == 200
+        assert str(exists.call_args[0][0]) == SERVER_DS
+
+
+class TestBadDatasetNamesAre400:
+    """A client dataset that makes `<target>/<id>/<rest>` an invalid filesystem name is a 400
+    (or a websocket error), never a 500, and no `zfs` command sees it."""
+
+    BAD = 'pool/a%25b'          # the URL decodes to `pool/a%b`
+
+    @pytest.fixture
+    def zfs(self, mocker):
+        return {n: mocker.patch(f'zfsbackup.api.zfs.{n}') for n in ('exists', 'list', 'create', 'set')}
+
+    def test_negotiate(self, client_with_remote, zfs):
+        resp = client_with_remote.post(f'/backup/client1/{self.BAD}/negotiate', json={'snapshots': []})
+        assert resp.status_code == 400
+        assert 'invalid dataset name' in resp.get_json()['error']
+        for name, mock in zfs.items():
+            assert not mock.called, name
+
+    def test_resume_token(self, client_with_remote, zfs):
+        resp = client_with_remote.get(f'/backup/client1/{self.BAD}/resume_token')
+        assert resp.status_code == 400
+        assert 'invalid dataset name' in resp.get_json()['error']
+        for name, mock in zfs.items():
+            assert not mock.called, name
+
+    def test_the_gate_is_balanced(self, authed_with_remote, zfs):
+        client = authed_with_remote.client()
+        client.post(f'/backup/client1/{self.BAD}/negotiate', json={})
+        client.get(f'/backup/client1/{self.BAD}/resume_token')
+        assert authed_with_remote.gate.active == 0
+
+    def test_stream_sends_an_error_and_takes_no_claim(self, stream):
+        stream.run('fresh', dataset='pool/a%b')
+        assert len(stream.sent) == 1 and 'invalid dataset name' in stream.sent[0]['error']
+        stream.untouched()
+        assert stream.claimed == set()
+
+
+class TestOwnershipOrderInResumeToken:
+    """`resume_token` reads the dataset's properties before it lists it (the ownership check
+    comes first, so another client's token is never read)."""
+
+    URL = '/backup/client1/pool/data/resume_token'
+
+    def test_a_conflict_is_409_and_nothing_is_listed(
+        self, client_with_remote, mocker, source_props
+    ):
+        source_props.return_value = {PROP_CLIENT_ID: 'someone-else'}
+        mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
+        lister = mocker.patch('zfsbackup.api.zfs.list')
+        resp = client_with_remote.get(self.URL)
+        assert resp.status_code == 409
+        assert 'someone-else' not in resp.get_data(as_text=True)
+        lister.assert_not_called()
+
+    def test_a_source_dataset_mismatch_is_409_too(self, client_with_remote, mocker, source_props):
+        source_props.return_value = {PROP_SOURCE_DATASET: 'tank/data'}
+        mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
+        lister = mocker.patch('zfsbackup.api.zfs.list')
+        resp = client_with_remote.get(self.URL)
+        assert resp.status_code == 409
+        assert 'tank/data' in resp.get_json()['error']
+        lister.assert_not_called()
+
+    def test_a_property_read_failure_is_500_and_nothing_is_listed(
+        self, client_with_remote, mocker, source_props
+    ):
+        source_props.side_effect = RuntimeError('zfs get failed')
+        mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
+        lister = mocker.patch('zfsbackup.api.zfs.list')
+        resp = client_with_remote.get(self.URL)
+        assert resp.status_code == 500
+        assert resp.get_json() == {'error': 'zfs get failed'}
+        lister.assert_not_called()
+
+    def test_properties_are_read_before_the_list(self, client_with_remote, mocker, source_props):
+        events = []
+        source_props.side_effect = lambda ds: events.append('properties') or {}
+        mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
+        mocker.patch('zfsbackup.api.zfs.list', side_effect=lambda **k: events.append('list') or [])
+        assert client_with_remote.get(self.URL).status_code == 200
+        assert events == ['properties', 'list']
+
+    def test_the_gate_is_balanced_after_a_conflict(
+        self, authed_with_remote, mocker, source_props
+    ):
+        source_props.return_value = {PROP_CLIENT_ID: 'someone-else'}
+        mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
+        authed_with_remote.client().get(self.URL)
+        assert authed_with_remote.gate.active == 0
+
+
+class TestRequestSizeLimit:
+    def test_the_limit_is_one_mebibyte(self, authed_with_remote):
+        assert authed_with_remote.app.config['MAX_CONTENT_LENGTH'] == 1024 * 1024
+
+    def test_an_oversized_negotiate_body_is_a_json_413(self, authed_with_remote, mocker):
+        zfs_exists = mocker.patch('zfsbackup.api.zfs.exists')
+        resp = authed_with_remote.client().post(
+            '/backup/client1/pool/data/negotiate',
+            data=b'{"config": "' + b'x' * (1024 * 1024) + b'"}',
+            content_type='application/json',
+        )
+        assert resp.status_code == 413
+        assert resp.is_json and 'too large' in resp.get_json()['error']
+        zfs_exists.assert_not_called()
+        assert authed_with_remote.gate.active == 0
+
+    def test_a_body_under_the_limit_is_served(self, authed_with_remote, mocker):
+        mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
+        mocker.patch('zfsbackup.api.zfs.list', return_value=[])
+        resp = authed_with_remote.client().post(
+            '/backup/client1/pool/data/negotiate',
+            data=b'{"snapshots": [], "pad": "' + b'x' * (512 * 1024) + b'"}',
+            content_type='application/json',
+        )
+        assert resp.status_code == 200

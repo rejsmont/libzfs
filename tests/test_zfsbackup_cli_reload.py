@@ -18,6 +18,10 @@ Sections:
                                   is not (Linux only: the lock table is `/proc/locks`).
 - ``TestRealDaemonEndToEnd``      a real `python -m zfsbackup.daemon`: `set`, then
                                   `status --wait`.
+- ``TestEnrollReloadMatrix`` / ``TestRotateReloadMatrix``
+                                  `enroll` and `identity rotate` (TLS plan M13/M14c): the
+                                  once-only rule across their TWO possible commits, against
+                                  real API servers (`tests/_enroll_support.py`).
 
 Everything here runs against a real SQLite database through the real CLI; only
 `request_reload`/`probe` (the daemon side) are replaced, by in-process fakes or by
@@ -46,6 +50,9 @@ import pytest
 
 from _cli_support import (
     ANCHOR,
+    host_client_id,
+    seed_client_id,
+    stored,
     RICH_YAML,
     UNVERIFIED_LINUX_ONLY,
     db,
@@ -63,7 +70,19 @@ from _cli_support import (
     unsignalable,
     write_yaml,
 )
-from zfsbackup import daemonlock
+from _enroll_support import (
+    CID,
+    Reply,
+    client,
+    closed_port,
+    do_enroll,
+    make_foreign_token,
+    make_server,
+    reloads,
+    zfs_stub,
+)
+from zfsbackup import daemonlock, identity
+from zfsbackup.cli import enroll as enroll_cli
 from zfsbackup.cli import errors as cli_errors
 from zfsbackup.cli import main as cli_main
 from zfsbackup.cli import write as cli_write
@@ -795,7 +814,7 @@ WRITES = [
     ("unset", 0, lambda c: c.run("unset", "datasets[tank/data].retention.1w", "-c", c.db)),
     ("edit-whole", 0, lambda c: c.edit("--no-prompt", plan=[_replace('check_interval: "5m"', 'check_interval: "10m"')])),
     ("edit-dataset", 0, lambda c: c.edit("dataset", "tank/vm.01", "--no-prompt", plan=[_replace('frequency: "15m"', 'frequency: "20m"')])),
-    ("edit-destination", 0, lambda c: c.edit("destination", "spare", "--no-prompt", plan=[_replace("http://spare:8080", "http://spare:9090")])),
+    ("edit-destination", 0, lambda c: c.edit("destination", "spare", "--no-prompt", plan=[_replace("https://spare:8080", "https://spare:9090")])),
     ("rename-dataset", 0, lambda c: c.run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", c.db)),
     ("rename-destination", 0, lambda c: c.run("rename", "destination", "spare", "spare2", "-c", c.db)),
     ("rename-destination-with-anchor-copies", 0, _rename_destination_with_copies),
@@ -2576,3 +2595,309 @@ class TestRealDaemonEndToEnd:
         assert status.stdout.rstrip().endswith("in sync")
         assert daemonlock.probe(_resolved(db)).applied == store_key(db)
         assert proc.poll() is None
+
+
+# --------------------------------------------------------------------------
+# enroll / identity rotate: the once-only rule (TLS/mTLS plan M13, M14c)
+#
+# `enroll` can commit twice (the generated client id, then the destination), and must ask
+# the daemon to reload exactly ONCE, after the last commit that happened -- including on a
+# failure path where only the first one did. `identity rotate` commits only for configured
+# certificate paths. `reloads` records `(skip_if_applied, key the database held at the call)`.
+# --------------------------------------------------------------------------
+
+
+def _unreachable():
+    return f"https://127.0.0.1:{closed_port()}"
+
+
+def _token_for(fp="ab" * 32):
+    return str(identity.make_token(fp)[0])
+
+
+@pytest.mark.integration
+class TestEnrollReloadMatrix:
+    @pytest.fixture
+    def fresh(self, run, db, reloads):
+        """No client id stored: a command that gets past step 3 commits one."""
+        make_db(run, db, "datasets:\n  - name: tank/a\n    frequency: 1h\n")
+        reloads.clear()
+        return db
+
+    # -- nothing committed -> no request
+    @pytest.mark.parametrize("how", [
+        "usage-no-url", "bad-token", "http-url", "unreachable", "refused", "pin-mismatch",
+        "server-400", "server-503",
+    ])
+    def test_nothing_committed_means_no_request(self, run, client, reloads, make_server, how):
+        srv = make_server()
+        url, token, extra = srv.url, srv.token(), ()
+        if how == "usage-no-url":
+            result = do_enroll(run, client, srv, token, url=False)
+        else:
+            if how == "bad-token":
+                token = "nonsense"
+            elif how == "http-url":
+                url = "http://127.0.0.1:1"
+            elif how == "unreachable":
+                url = _unreachable()
+            elif how == "refused":
+                token = make_foreign_token(srv)
+            elif how == "pin-mismatch":
+                token = _token_for("ee" * 32)
+            elif how == "server-400":
+                srv.on("/enroll", Reply(400, {"error": "x"}))
+            elif how == "server-503":
+                srv.on("/enroll", Reply(503, {"retry": True}))
+            result = do_enroll(run, client, url, token)
+        assert result.exit_code != 0
+        assert reloads == []
+        assert "generated this host's client id" not in result.stdout
+
+    # -- only the generated client id committed, then a failure -> exactly one
+    @pytest.mark.parametrize("how", ["unreachable", "refused", "pin-mismatch", "server-500", "bad-label"])
+    def test_only_the_client_id_committed_then_failure_is_one_request(
+        self, run, fresh, reloads, make_server, monkeypatch, how
+    ):
+        srv = make_server()
+        url, token, extra = srv.url, srv.token(), ()
+        if how == "unreachable":
+            url = _unreachable()
+        elif how == "refused":
+            token = make_foreign_token(srv)
+        elif how == "pin-mismatch":
+            token = _token_for("ee" * 32)
+        elif how == "server-500":
+            srv.on("/enroll", Reply(500, "x"))
+        elif how == "bad-label":
+            extra = ("--label", "x" * 200)          # rejected BEFORE step 3: nothing committed
+        notified = []
+        real = enroll_cli.notify_daemon
+        monkeypatch.setattr(
+            enroll_cli, "notify_daemon",
+            lambda *a, **k: (notified.append(k), real(*a, **k))[1],
+        )
+        gen = generation(fresh)
+        result = do_enroll(run, fresh, url, token, *extra)
+        assert result.exit_code != 0
+        if how == "bad-label":
+            assert reloads == [] and generation(fresh) == gen and notified == []
+            return
+        generated = host_client_id(fresh)
+        assert generated and generation(fresh) == gen + 1
+        assert len(reloads) == 1
+        skip, held = reloads[0]
+        assert skip == held == store_key(fresh)
+        assert f"generated this host's client id: {generated}" in result.stdout
+        assert result.stdout.count("config updated (generation") == 1
+        (kw,) = notified
+        assert kw["reload_wait"] == 0 and kw["request"] is not None      # reported, not waited for
+
+    # -- both committed -> one
+    def test_both_commits_are_announced_once_at_the_last_key(self, run, fresh, reloads, make_server):
+        srv = make_server()
+        gen = generation(fresh)
+        result = do_enroll(run, fresh, srv, srv.token())
+        assert result.exit_code == 0, result.stderr
+        assert generation(fresh) == gen + 2
+        assert len(reloads) == 1
+        skip, held = reloads[0]
+        assert skip == held == store_key(fresh) == (skip[0], gen + 2)
+        assert result.stdout.count("config updated (generation") == 1
+        assert f"config updated (generation {gen + 2})" in result.stdout
+
+    # -- only step 6 committed (the id was already there) -> one
+    def test_only_the_destination_committed_is_one_request(self, run, client, reloads, make_server):
+        srv = make_server()
+        gen = generation(client)
+        assert do_enroll(run, client, srv, srv.token()).exit_code == 0
+        assert generation(client) == gen + 1 and len(reloads) == 1
+        assert reloads[0][0] == reloads[0][1] == store_key(client)
+
+    def test_a_rerun_that_changes_nothing_is_no_request(self, run, client, reloads, make_server):
+        srv = make_server()
+        token = srv.token()
+        assert do_enroll(run, client, srv, token).exit_code == 0
+        reloads.clear()
+        assert do_enroll(run, client, srv, token).exit_code == 0
+        assert reloads == []
+
+    def test_a_rerun_that_records_a_second_name_is_one_request(self, run, client, reloads, make_server):
+        srv = make_server()
+        token = srv.token()
+        assert do_enroll(run, client, srv, token).exit_code == 0
+        reloads.clear()
+        assert do_enroll(run, client, srv, token, name="mirror").exit_code == 0
+        assert len(reloads) == 1
+
+    # -- a conflict at step 6 after the id was committed -> the id's one request
+    def test_a_conflict_at_the_destination_commit_still_announces_the_id(
+        self, run, fresh, reloads, make_server, monkeypatch
+    ):
+        srv = make_server()
+        real = enroll_cli._enroll_with_token
+        state = {"armed": True}
+
+        def wrapper(*args, **kwargs):
+            real(*args, **kwargs)
+            if state["armed"]:
+                state["armed"] = False
+                assert run("set", "check_interval", "10m", "-c", fresh).exit_code == 0
+                reloads.pop()                    # the competing `set`'s own request
+
+        monkeypatch.setattr(enroll_cli, "_enroll_with_token", wrapper)
+        gen = generation(fresh)
+        result = do_enroll(run, fresh, srv, srv.token())
+        assert result.exit_code == 75, result.stderr
+        # what remains is enroll's one request: for the generated id's commit, made when the
+        # failure surfaced (the database had moved on by then)
+        assert len(reloads) == 1
+        skip, held = reloads[0]
+        assert skip == (held[0], gen + 1) and held == (held[0], gen + 2)
+        generated = host_client_id(fresh)
+        assert f"generated this host's client id: {generated}" in result.stdout
+
+    # -- enroll --new-key
+    def test_new_key_on_generated_paths_with_nothing_to_record_requests_nothing(
+        self, run, client, reloads, make_server
+    ):
+        """Same url and pin: no commit, so no request (the daemon follows the file's mtime)."""
+        srv = make_server()
+        assert do_enroll(run, client, srv, srv.token()).exit_code == 0
+        reloads.clear()
+        scoped = srv.token(client_id=CID, replace=True)
+        before = db_state(client)
+        result = do_enroll(run, client, srv, scoped, "--new-key", fname="s")
+        assert result.exit_code == 0, result.stderr
+        assert reloads == [] and db_state(client) == before
+
+    def test_new_key_for_a_new_destination_name_requests_once(self, run, client, reloads, make_server):
+        srv = make_server()
+        assert do_enroll(run, client, srv, srv.token()).exit_code == 0
+        reloads.clear()
+        scoped = srv.token(client_id=CID, replace=True)
+        result = do_enroll(run, client, srv, scoped, "--new-key", name="mirror", fname="s")
+        assert result.exit_code == 0, result.stderr
+        assert len(reloads) == 1 and reloads[0][0] == reloads[0][1] == store_key(client)
+
+    # -- ordering
+    def test_the_request_comes_before_any_output_on_success(self, run, fresh, make_server, monkeypatch):
+        import click
+
+        srv = make_server()
+        events = []
+        real_echo = click.echo
+
+        def echo(message=None, *args, **kwargs):
+            events.append(("err" if kwargs.get("err") else "out", str(message)))
+            return real_echo(message, *args, **kwargs)
+
+        def recorder(resolved, *, skip_if_applied=None):
+            events.append(("reload", skip_if_applied))
+            return daemonlock.ReloadRequest("no-daemon")
+
+        monkeypatch.setattr(click, "echo", echo)
+        monkeypatch.setattr(daemonlock, "request_reload", recorder)
+        assert do_enroll(run, fresh, srv, srv.token()).exit_code == 0
+        kinds = [k for k, _ in events]
+        assert kinds.count("reload") == 1
+        assert kinds.index("reload") < kinds.index("out")
+
+    def test_a_closed_stdout_does_not_cost_the_request(self, run, fresh, reloads, make_server, monkeypatch):
+        import click
+
+        srv = make_server()
+        real_echo = click.echo
+
+        def echo(message=None, *args, **kwargs):
+            if not kwargs.get("err"):
+                raise BrokenPipeError(32, "Broken pipe")
+            return real_echo(message, *args, **kwargs)
+
+        monkeypatch.setattr(click, "echo", echo)
+        result = do_enroll(run, fresh, srv, srv.token())
+        assert result.exit_code == 0, result.stderr
+        assert len(reloads) == 1
+        assert stored(fresh).destinations["offsite"].server_fingerprint == srv.fp
+
+    def test_a_signalled_daemon_is_asked_once_and_the_failure_path_does_not_wait(
+        self, run, fresh, db, monkeypatch
+    ):
+        """On the failure path the ack wait is skipped (`reload_wait=0`): a probe of the pid
+        file would be a second look at the daemon."""
+        probed = []
+        monkeypatch.setattr(cli_write.daemonlock, "probe", lambda r: probed.append(1))
+        monkeypatch.setattr(
+            daemonlock, "request_reload",
+            lambda r, **k: daemonlock.ReloadRequest("signalled", 4242),
+        )
+        result = do_enroll(run, fresh, _unreachable(), _token_for())
+        assert result.exit_code == 75
+        assert "reload requested from daemon pid 4242" in result.stdout
+        assert probed == []
+
+
+@pytest.mark.integration
+class TestRotateReloadMatrix:
+    @pytest.fixture
+    def enrolled(self, run, client, make_server, reloads):
+        srv = make_server()
+        assert do_enroll(run, client, srv, srv.token()).exit_code == 0
+        reloads.clear()
+        return types.SimpleNamespace(db=client, srv=srv, reloads=reloads)
+
+    def test_default_paths_never_request_a_reload(self, run, enrolled):
+        before = db_state(enrolled.db)
+        result = run("identity", "rotate", "-c", enrolled.db)
+        assert result.exit_code == 0, result.stderr
+        assert enrolled.reloads == []
+        assert "config updated" not in result.stdout
+        assert db_state(enrolled.db) == before
+
+    def test_default_paths_failure_requests_nothing(self, run, enrolled):
+        enrolled.srv.on("/rotate", Reply(403, {"reason": "refused"}))
+        assert run("identity", "rotate", "-c", enrolled.db).exit_code == 1
+        assert enrolled.reloads == []
+
+    @pytest.fixture
+    def configured(self, run, db, reloads, make_server, tmp_path):
+        srv = make_server()
+        old = identity.ensure_identity(tmp_path / "mine", identity.ROLE_CLIENT)
+        new = identity.ensure_identity(tmp_path / "next", identity.ROLE_CLIENT)
+        make_db(run, db, "datasets:\n  - name: tank/a\n    frequency: 1h\n"
+                         f'client_cert_file: "{old.cert_path}"\nclient_key_file: "{old.key_path}"\n')
+        seed_client_id(db, CID)
+        assert do_enroll(run, db, srv, srv.token()).exit_code == 0
+        reloads.clear()
+        args = ("--cert", str(new.cert_path), "--key", str(new.key_path))
+        return types.SimpleNamespace(db=db, srv=srv, reloads=reloads, args=args)
+
+    def test_configured_paths_request_exactly_one_reload_for_the_one_commit(self, run, configured):
+        gen = generation(configured.db)
+        result = run("identity", "rotate", *configured.args, "-c", configured.db)
+        assert result.exit_code == 0, result.stderr
+        assert generation(configured.db) == gen + 1
+        assert len(configured.reloads) == 1
+        skip, held = configured.reloads[0]
+        assert skip == held == store_key(configured.db)
+        assert result.stdout.count("config updated (generation") == 1
+
+    def test_configured_paths_failure_requests_nothing(self, run, configured):
+        configured.srv.on("/rotate", Reply(503, {"retry": True}))
+        before = db_state(configured.db)
+        assert run("identity", "rotate", *configured.args, "-c", configured.db).exit_code == 75
+        assert configured.reloads == [] and db_state(configured.db) == before
+
+    def test_a_conflict_at_the_commit_requests_nothing_for_rotate(self, run, configured, monkeypatch):
+        real = enroll_cli.commit_config
+
+        def racing(*args, **kwargs):
+            monkeypatch.setattr(enroll_cli, "commit_config", real)
+            assert run("set", "check_interval", "10m", "-c", configured.db).exit_code == 0
+            configured.reloads.clear()               # the competing `set`'s own request
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(enroll_cli, "commit_config", racing)
+        result = run("identity", "rotate", *configured.args, "-c", configured.db)
+        assert result.exit_code == 75, result.stderr
+        assert configured.reloads == []

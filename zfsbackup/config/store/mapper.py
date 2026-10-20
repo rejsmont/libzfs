@@ -45,21 +45,32 @@ Three invariants hold across every function here:
 `load_config` replicates `BackupConfig.from_file`'s defaulting behaviour
 exactly for everything the schema cannot itself default (see the table in
 the docstring of `load_config` below) -- but NOT for `prune_interval`
-falling back to `check_interval`, and NOT for the `client_id_file` default.
-Both `GlobalSettings.prune_interval_seconds` and `.client_id_file` are
-nullable specifically so that "derive this at load time" is representable
-in the DB as `NULL` rather than flattened into a stored value by whichever
-process happens to write it (a `zfsbackup-config import` run under `sudo`
-freezing `/root/.config/...` into the DB was the motivating bug -- see
-`models.py`'s module docstring and `GlobalSettings`). This module therefore
-passes a `NULL` row straight through as `None` on both `BackupConfig`
-fields rather than deriving a value here: `BackupConfig.effective_prune_interval`
-and `.effective_client_id_file` (`config/model.py`) own the actual
-`check_interval`/`$HOME` derivation, resolved lazily on each access in
-whatever process calls them, not this mapper. `load_config` must not
-reimplement that derivation itself: doing so would re-flatten the very
-value this item made representable, one layer earlier than the accessor
-that now owns it.
+falling back to `check_interval`.
+`GlobalSettings.prune_interval_seconds` is nullable specifically so that
+"derive this at load time" is representable in the DB as `NULL` rather than
+flattened into a stored value by whichever process happens to write it. This
+module therefore passes a `NULL` row straight through as `None` rather than
+deriving a value here: `BackupConfig.effective_prune_interval`
+(`config/model.py`) owns the `check_interval` derivation, resolved lazily on
+each access in whatever process calls it, not this mapper.
+
+**The client id is not configuration** (TLS/mTLS plan D2). It lives in the
+`host_identity` table, is written only by `zfsbackup-config identity ...`
+(`store/trust.py`), and is NOT a `BackupConfig` field -- so YAML, `render` and
+`BackupConfig.same_as` stay config-only. `load_config_snapshot` reads it in
+the same read transaction as the config (`ConfigSnapshot.client_id`).
+The pre-D2 `client_id_file` setting is gone: `BackupConfig.from_file` refuses
+the key and the column was dropped in revision `7c3e9d51b2a8`. (The old design stored it nullable, "NULL = derive `$HOME` at read
+time", because a `sudo` import freezing `/root/.config/...` orphaned the
+whole server-side dataset tree; keeping the id in the DB removes the
+`$HOME`-dependent path altogether.)
+
+**`save_config` only ever deletes the six config tables** (`CONFIG_TABLES`).
+`host_identity` and the trust tables (`PRESERVED_TABLES`) are not config:
+an `import` or any other config write must keep the client id and every
+pinned client certificate. A module-level assertion classifies every table in
+`Base.metadata` as exactly one of the two, so a new table cannot be added
+without deciding which side of that line it is on.
 """
 
 from __future__ import annotations
@@ -85,6 +96,9 @@ from zfsbackup.config import (
     RemoteDatasetConfig,
     RemoteServerConfig,
     RetentionRule,
+    client_tls_files_problem,
+    destination_url_problem,
+    normalize_fingerprint,
     validate_retention_uniqueness,
 )
 from zfsbackup.config.store import models
@@ -92,6 +106,55 @@ from zfsbackup.config.store.errors import ConfigConflict
 from zfsbackup.config.store.migrate import check_schema
 
 logger = logging.getLogger(__name__)
+
+
+# --- Which tables `save_config` may wipe (TLS/mTLS plan M6) ------------------
+#
+# `save_config` is a wipe-and-reinsert of the CONFIG, and `import` calls it.
+# It must never delete the PRESERVED tables: `host_identity` holds this host's
+# client id (wiping it on an `import` would mint a new id later and silently
+# orphan the whole server-side dataset tree -- the failure the old
+# `client_id_file` design existed to dodge), and the trust tables hold every
+# enrolled client's pinned certificate, every revoked fingerprint and the
+# outstanding enrollment token (wiping them would lock every client out at
+# once, and un-revoke every revoked key). Both lists are spelled
+# out as plain strings, not derived from the models, so adding a table forces
+# a decision here instead of a silent default.
+
+# In FK-safe delete order (children first); see `save_config` step 4.
+CONFIG_TABLES: Tuple[str, ...] = (
+    "retention_rules",
+    "dataset_remotes",
+    "datasets",
+    "destinations",
+    "global_settings",
+    "remote_server",
+)
+PRESERVED_TABLES: frozenset = frozenset({
+    "host_identity",
+    "clients",
+    "trusted_clients",
+    # Revoked/retired client fingerprints: wiping them on an `import` would
+    # let every revoked key be re-enrolled again (see models.RevokedFingerprint).
+    "revoked_fingerprints",
+    "enrollment_token",
+    "trust_state",
+})
+assert set(CONFIG_TABLES).isdisjoint(PRESERVED_TABLES)
+assert set(CONFIG_TABLES) | PRESERVED_TABLES == set(models.Base.metadata.tables), (
+    "a table was added to or removed from models.py without classifying it in "
+    "mapper.CONFIG_TABLES / PRESERVED_TABLES: "
+    f"{sorted(set(models.Base.metadata.tables) ^ (set(CONFIG_TABLES) | PRESERVED_TABLES))}"
+)
+# The models `save_config` deletes from, in `CONFIG_TABLES` order.
+_CONFIG_MODELS_BY_TABLE = {
+    m.__table__.name: m for m in (
+        models.RetentionRule, models.DatasetRemote, models.Dataset,
+        models.Destination, models.GlobalSettings, models.RemoteServer,
+    )
+}
+_CONFIG_MODELS = tuple(_CONFIG_MODELS_BY_TABLE[name] for name in CONFIG_TABLES)
+assert tuple(m.__table__.name for m in _CONFIG_MODELS) == CONFIG_TABLES
 
 
 # --- ZFS dataset-name syntax (one source: libzfseasy's `Validate.dataset`) ---
@@ -439,12 +502,12 @@ def load_config(session: Session, *, warn_never_prune: bool = True) -> BackupCon
 
     Replicates `BackupConfig.from_file`'s defaulting behaviour exactly for
     everything the schema itself cannot default -- see the module
-    docstring for the two fields (`prune_interval`, `client_id_file`) that
-    are deliberately NOT defaulted/derived here even though `from_file`
-    would: `GlobalSettings` makes both columns nullable specifically so a
-    DB row can represent "derive this elsewhere", and this function passes
-    that `NULL` through as `BackupConfig.prune_interval is None` /
-    `.client_id_file is None` rather than resolving it.
+    docstring for `prune_interval`, which is deliberately NOT derived here
+    even though `from_file` would: `GlobalSettings` makes the column nullable
+    specifically so a DB row can represent "derive this elsewhere", and this
+    function passes that `NULL` through as `BackupConfig.prune_interval is
+    None` rather than resolving it. The client id is not part of the result
+    at all (`ConfigSnapshot.client_id`, module docstring).
 
     | `from_file` default/behaviour | Who owns it on the DB path |
     |---|---|
@@ -454,7 +517,8 @@ def load_config(session: Session, *, warn_never_prune: bool = True) -> BackupCon
     | `api_host`/`api_port`/`dry_run` | Writer (`NOT NULL`, no schema default); this function reads |
     | `destinations={}` | Emergent -- empty table yields `{}` |
     | `remote_backup=None` | This function -- absent `RemoteServer` row |
-    | `client_id_file` default | NOT reimplemented; NULL row yields `None` |
+    | `client_cert_file`/`client_key_file` | Read as given (`None` = unset; the CHECK keeps the pair together) |
+    | `Destination.server_fingerprint` | Read as given (`None` = not enrolled), through `normalize_fingerprint` |
     | "No datasets configured" | This function |
     | retention `{'1d': '30d'}` default | NOT reimplemented -- YAML boundary only; zero rows load as `[]` (never prune) + WARNING, `_dataset_level_rules` |
     | retention sorted by age | `_dataset_level_rules`/`_scoped_rules` |
@@ -498,7 +562,11 @@ def load_config(session: Session, *, warn_never_prune: bool = True) -> BackupCon
     # `BackupConfig.destinations` is every declared destination
     # (`config/model.py:705-713`), so an unreferenced one must still round-trip.
     destinations: Dict[str, Destination] = {
-        row.name: Destination(url=row.url) for row in destination_rows
+        # `Destination.__post_init__` routes the pin through
+        # `normalize_fingerprint`; the column CHECK already guarantees the
+        # canonical form, so this never rewrites a stored value.
+        row.name: Destination(url=row.url, server_fingerprint=row.server_fingerprint)
+        for row in destination_rows
     }
 
     dataset_rows = session.scalars(
@@ -545,11 +613,11 @@ def load_config(session: Session, *, warn_never_prune: bool = True) -> BackupCon
         dry_run=bool(gs.dry_run),
         destinations=destinations,
         remote_backup=remote_backup,
-        # NULL means "resolve $HOME's default in the process that uses the
-        # file" -- see models.py's GlobalSettings docstring. Pass None
-        # through rather than resolving it here.
-        client_id_file=(
-            None if gs.client_id_file is None else Path(gs.client_id_file)
+        client_cert_file=(
+            None if gs.client_cert_file is None else Path(gs.client_cert_file)
+        ),
+        client_key_file=(
+            None if gs.client_key_file is None else Path(gs.client_key_file)
         ),
     )
 
@@ -639,12 +707,22 @@ class ConfigSnapshot:
     save has stamped yet), read in the same transaction as everything else;
     `(store_id, generation)` is the reload key. Defaulted so the three-field
     positional constructor keeps working.
+
+    `client_id` is `host_identity.client_id`, read in the SAME transaction as
+    the config (plan D2), or `None` when no id has been generated yet (a
+    fresh store: an expected state, not corruption). It is deliberately NOT a
+    `BackupConfig` field: YAML, `render` and `BackupConfig.same_as` stay
+    config-only. Anything that stores the id writes it with a generation bump
+    (`store/trust.py`), so a consumer that compares snapshots must compare
+    `client_id` as well as the config -- an identical config with a changed id
+    is a different snapshot.
     """
 
     config: BackupConfig
     generation: int
     schema_rev: str
     store_id: int = 0
+    client_id: Optional[str] = None
 
 
 def load_config_snapshot(
@@ -682,12 +760,18 @@ def load_config_snapshot(
     # session's identity map from that very read.
     gs = session.get(models.GlobalSettings, 1)
     assert gs is not None
+    # Column select (no ORM instance), same transaction as the rows above, so
+    # the id and the config come from one commit. No row = no id yet.
+    client_id = session.scalar(
+        select(models.HostIdentity.client_id).where(models.HostIdentity.id == 1)
+    )
     return ConfigSnapshot(
         config=config,
         generation=gs.generation,
         schema_rev=schema_rev,
         # Same transaction as the rows above (see read_store_id).
         store_id=read_store_id(session),
+        client_id=client_id,
     )
 
 
@@ -814,8 +898,7 @@ def validate_config(config: BackupConfig) -> List[str]:
     """Check that `config` is storable and means what it says; pure.
 
     Session-free and side-effect-free: no DB, no filesystem, and in
-    particular it never evaluates `BackupConfig.effective_client_id_file`
-    (which reads `$HOME`) or `effective_prune_interval`. Returns a list of
+    particular it never evaluates `effective_prune_interval`. Returns a list of
     human-readable WARNINGS (adverse-but-accepted behaviour -- see below);
     raises `ValueError` naming the offending key for anything that cannot
     or must not be stored. Callers decide what to do with the warnings
@@ -858,9 +941,12 @@ def validate_config(config: BackupConfig) -> List[str]:
       (`dataset_remotes`' composite unique constraint; `from_dict` rejects
       the same thing at the YAML boundary, so this is the backstop for
       configs built in code);
-    - a `client_id_file` that normalises to the current directory
-      (`os.path.normpath(...) == "."`: `Path("")`, `Path(".")`, `"."`,
-      `"./"`, `"a/.."` -- a directory, never a file; `""` alone is "unset");
+    - a destination `url` that is not `https://` with a host
+      (`destination_url_problem`: plaintext `http://` has no downgrade
+      path) or that has leading/trailing whitespace (`from_file` strips it;
+      the store does not rewrite values), a `server_fingerprint` that is not canonical (64 lowercase
+      hex), a `client_cert_file`/`client_key_file` that is not an absolute
+      path or is set without the other (`client_tls_files_problem`);
     - any retention rule with a non-positive `age`/`keep_for`, and any
       `validate_retention_uniqueness` collision, per scope.
 
@@ -876,9 +962,6 @@ def validate_config(config: BackupConfig) -> List[str]:
       full;
     - `api_port` 0 (the API binds an ephemeral port that changes on every
       start);
-    - an in-code `client_id_file` of `""`, which YAML treats as unset:
-      `save_config` stores NULL (derive from `$HOME`) instead of a value
-      that would reload as `Path(".")`;
     - a destination name that cannot be a ZFS user-property suffix
       (`destination_name_problem`): its `org.zfsbackup:anchor.<name>` anchor
       can never be stored;
@@ -936,39 +1019,17 @@ def validate_config(config: BackupConfig) -> List[str]:
             "changes on every start"
         )
     _require_bool(config.dry_run, "dry_run")
-    # Type only. NEVER evaluate `effective_client_id_file` here (reads $HOME).
-    if config.client_id_file is not None and not isinstance(
-        config.client_id_file, (str, os.PathLike)
-    ):
-        raise ValueError(
-            f"client_id_file must be a path, got {_describe(config.client_id_file)}"
-        )
-    if config.client_id_file is not None:
-        # `os.fspath`, not `str`, so `Path("")` (which IS `Path(".")`) is
-        # seen as the "." it really is. Pure string handling: no I/O.
-        raw_client_id_file = os.fspath(config.client_id_file)
-        if raw_client_id_file == "":
-            # YAML treats "" as unset (`from_file`: `Path(cid) if cid else
-            # None`). An in-code "" used to be stored verbatim and reload as
-            # `Path(".")` -- a different, unusable value. `save_config`
-            # stores NULL for it. Decided BEFORE the normalised check below:
-            # `normpath("")` is also ".", but "" alone means unset.
-            warnings.append(
-                'client_id_file "" means derive from $HOME; stored unset'
-            )
-        elif os.path.normpath(raw_client_id_file) == ".":
-            # `Path("")`, `Path(".")`, ".", "./" and "a/.." all name the
-            # current directory, never a file: a client-id file there could
-            # not be read or written, so this never worked -- and YAML
-            # `client_id_file: "./"` is refused here at import phase 0.
-            # Normalised, not compared to the literal ".", so the spellings
-            # `from_file` also refuses (same rule, `config/model.py`) cannot
-            # slip through a config built in code.
-            raise ValueError(
-                f"client_id_file {raw_client_id_file!r} names a directory, not a "
-                "file; omit it (or set it to \"\") to "
-                "derive the default from $HOME"
-            )
+
+    # Optional absolute client certificate/key paths, both or neither. Type
+    # first so `client_tls_files_problem` (pure string handling) never sees a
+    # non-path; `global_settings.client_cert_key_together` is the DB backstop.
+    for key in ("client_cert_file", "client_key_file"):
+        value = getattr(config, key)
+        if value is not None and not isinstance(value, (str, os.PathLike)):
+            raise ValueError(f"{key} must be a path, got {_describe(value)}")
+    problem = client_tls_files_problem(config.client_cert_file, config.client_key_file)
+    if problem is not None:
+        raise ValueError(problem)
 
     # Mirrors `from_file`'s per-destination url requirement
     # (`"Destination '{name}' requires 'url'"`). `destinations.url` is NOT NULL
@@ -980,6 +1041,40 @@ def validate_config(config: BackupConfig) -> List[str]:
         if not dest.url:
             raise ValueError(f"Destination {name!r} requires 'url'")
         _require_str(dest.url, f"destinations[{name}].url")
+        # TLS only: `http://` (and any other scheme) is refused. This is NOT
+        # in `Destination.__post_init__` so a legacy plaintext row can still
+        # be LOADED and fixed with the CLI; the daemon (which runs this on
+        # every start and reload) refuses to run it.
+        problem = destination_url_problem(dest.url)
+        if problem is not None:
+            raise ValueError(f"destinations[{name}]: {problem}")
+        # `destination_url_problem` judges the STRIPPED url, so it accepted
+        # "  https://h " -- which `save_config` then stored verbatim, while
+        # `from_file` strips. Refused rather than stripped, for the same
+        # reason as a non-canonical `server_fingerprint` below: the store
+        # never rewrites a value, so `load_config(save_config(c)) == c`.
+        if dest.url != dest.url.strip():
+            raise ValueError(
+                f"destinations[{name}].url {dest.url!r} has leading or "
+                f"trailing whitespace; expected {dest.url.strip()!r}"
+            )
+        # A pin must already be canonical (64 lowercase hex): `save_config`
+        # writes it verbatim, and the DB CHECK would reject anything else
+        # only mid-insert, after the wipe. Rewriting it silently here would
+        # make `load_config(save_config(c)) != c`.
+        if dest.server_fingerprint is not None:
+            try:
+                canonical = normalize_fingerprint(dest.server_fingerprint)
+            except ValueError as e:
+                raise ValueError(
+                    f"destinations[{name}].server_fingerprint: {e}"
+                ) from None
+            if canonical != dest.server_fingerprint:
+                raise ValueError(
+                    f"destinations[{name}].server_fingerprint "
+                    f"{dest.server_fingerprint!r} is not canonical; "
+                    f"expected {canonical!r} (64 lowercase hex digits)"
+                )
         # WARNING, not an error: configs that predate this check may already
         # carry such names, and refusing to load/import them would strand
         # the operator. The cost of the name is real but silent -- no anchor
@@ -1178,8 +1273,9 @@ def save_config(
        save. If `expected_generation` was given, compare it to this value
        now, before anything is deleted (`ConfigConflict`).
     4. Delete in order **retention_rules -> dataset_remotes -> datasets ->
-       destinations -> global_settings -> remote_server**, flushing between
-       each. This is a superset of the FK-implied order and does NOT rely
+       destinations -> global_settings -> remote_server** (`CONFIG_TABLES`;
+       `host_identity` and the trust tables are deliberately left alone --
+       see the module docstring), flushing between each. This is a superset of the FK-implied order and does NOT rely
        on `ON DELETE CASCADE` at all: an ORM-enabled bulk `delete()` never
        applies relationship cascades (only the DB's `ON DELETE CASCADE`
        does that, and only when `PRAGMA foreign_keys=ON`, which is
@@ -1279,22 +1375,22 @@ def save_config(
     # dataset's reused rowid -- silently re-adopting stale retention tiers
     # and remote overrides into an unrelated dataset on the very next
     # `save_config` call. See this function's docstring, step 4.
-    session.execute(delete(models.RetentionRule))
-    session.flush()
-    session.execute(delete(models.DatasetRemote))
-    session.flush()
-    session.execute(delete(models.Dataset))
-    session.flush()
-    session.execute(delete(models.Destination))
-    session.flush()
-    session.execute(delete(models.GlobalSettings))
-    session.flush()
-    session.execute(delete(models.RemoteServer))
-    session.flush()
+    # Order: retention_rules -> dataset_remotes -> datasets -> destinations ->
+    # global_settings -> remote_server (`CONFIG_TABLES`). NEVER widen this to
+    # `host_identity` or a trust table: those are not config, and an import
+    # must keep the client id and every pinned certificate (see the comment on
+    # `CONFIG_TABLES`).
+    for model in _CONFIG_MODELS:
+        session.execute(delete(model))
+        session.flush()
 
     # --- 5. Insert destinations, then datasets (with their rules/remotes). ---
     for name, dest in config.destinations.items():
-        session.add(models.Destination(name=name, url=dest.url))
+        session.add(models.Destination(
+            name=name,
+            url=dest.url,
+            server_fingerprint=dest.server_fingerprint,
+        ))
     session.flush()
 
     for ds in config.datasets:
@@ -1365,15 +1461,13 @@ def save_config(
         api_host=config.api_host,
         api_port=config.api_port,
         dry_run=config.dry_run,
-        # None means "resolve $HOME's default in the process that uses the
-        # file" -- write NULL rather than materialising this process's
-        # $HOME into the DB.
-        # "" is stored as NULL too (`validate_config` warned): YAML treats
-        # it as unset, and a stored "" would reload as `Path(".")`.
-        client_id_file=(
-            None
-            if config.client_id_file is None or os.fspath(config.client_id_file) == ""
-            else str(config.client_id_file)
+        # The client id lives in `host_identity`, which this function never
+        # touches (plan D2).
+        client_cert_file=(
+            None if config.client_cert_file is None else str(config.client_cert_file)
+        ),
+        client_key_file=(
+            None if config.client_key_file is None else str(config.client_key_file)
         ),
         generation=previous_generation + 1,
     ))

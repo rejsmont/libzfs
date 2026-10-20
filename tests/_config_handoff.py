@@ -21,7 +21,7 @@ from datetime import timedelta
 from pathlib import PurePath
 
 from zfsbackup.config.model import Duration
-from zfsbackup.workers import ApiWorker, PruningWorker, SnapshotWorker
+from zfsbackup.workers import ApiWorker, PruningWorker, RemoteBackupWorker, SnapshotWorker
 
 
 def config_signature(obj):
@@ -84,6 +84,10 @@ class _SelectableStartMethod:
                     "config_id": id(self.config),
                     "signature": config_signature(self.config),
                     "type": type(self.config).__name__,
+                    # M9: what only some workers are handed next to the config.
+                    "client_id": getattr(self, "client_id", None),
+                    "tls_dir": str(getattr(self, "tls_dir", None)),
+                    "config_db": str(getattr(getattr(self, "config_db", None), "resolved_path", None)),
                 },
                 fh,
             )
@@ -104,6 +108,13 @@ class RecordingPruningWorker(_SelectableStartMethod, PruningWorker):
 
 
 class RecordingApiWorker(_SelectableStartMethod, ApiWorker):
+    record_dir = None
+
+    def run(self):
+        self._record()
+
+
+class RecordingRemoteWorker(_SelectableStartMethod, RemoteBackupWorker):
     record_dir = None
 
     def run(self):

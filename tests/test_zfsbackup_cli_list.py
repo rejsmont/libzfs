@@ -5,9 +5,11 @@ Both views are read-only functions of the stored configuration. Covered:
 - ``TestListDatasets``       columns, stored order, `never` / rule count, the
                              `inherit (X)` remote frequency, durations as typed,
                              `--enabled-only`, `--json` shape and types.
-- ``TestListDestinations``   name order, URL, referencing datasets,
-                             `--enabled-only` (counts only enabled senders and
-                             hides unused destinations), `--json`.
+- ``TestListDestinations``   name order, URL, ENROLLED (the first 16 hex of the
+                             pinned server fingerprint, or `not enrolled`),
+                             referencing datasets, `--enabled-only` (counts only
+                             enabled senders and hides unused destinations),
+                             `--json` (adds the full `server_fingerprint`).
 - ``TestListIsReadOnly``     no write, no generation bump, no sidecars left, a
                              missing database is not created.
 - ``TestListQuiet``          `list` and `get` print no warnings about the stored
@@ -43,6 +45,11 @@ from zfsbackup.cli import main as cli_main
 # No module-level tier marker: conftest marks every test that declares none as
 # `unit`, and the few that spawn a process are marked `integration` individually
 # (a test carrying both would be double-counted; see test_marker_tiers.py).
+
+
+FP = "ab" * 32
+#: 64 hex digits that are all decimal (YAML would read an unquoted one as an int).
+DIGITS_FP = "1234567890" * 6 + "1234"
 
 
 def table(result):
@@ -179,7 +186,7 @@ class TestListDatasets:
 
     def test_remote_order_is_the_configured_order(self, run, db):
         text = (
-            'destinations:\n  b:\n    url: "http://b"\n  a:\n    url: "http://a"\n'
+            'destinations:\n  b:\n    url: "https://b"\n  a:\n    url: "https://a"\n'
             'datasets:\n  - name: "tank/x"\n    remote:\n'
             '      - destination: "b"\n      - destination: "a"\n'
         )
@@ -201,16 +208,16 @@ class TestListDestinations:
     def test_rows_sorted_by_name(self, run, rich):
         result = run("list", "destinations", "-c", rich)
         assert result.exit_code == 0, result.stderr
-        assert result.stdout.splitlines()[0].split() == ["NAME", "URL", "DATASETS"]
+        assert result.stdout.splitlines()[0].split() == ["NAME", "URL", "ENROLLED", "DATASETS"]
         assert table(result)[1:] == [
-            ["dc.two", "http://dc2:8080", "tank/data"],
-            ["offsite", "http://offsite:8080", "tank/data"],
-            ["spare", "http://spare:8080", "-"],
+            ["dc.two", "https://dc2:8080", "not enrolled", "tank/data"],
+            ["offsite", "https://offsite:8080", "not enrolled", "tank/data"],
+            ["spare", "https://spare:8080", "not enrolled", "-"],
         ]
 
     def test_sorted_by_name_not_by_file_order(self, run, db):
         text = (
-            'destinations:\n  zeta:\n    url: "http://z"\n  alpha:\n    url: "http://a"\n'
+            'destinations:\n  zeta:\n    url: "https://z"\n  alpha:\n    url: "https://a"\n'
             'datasets:\n  - name: "tank/x"\n'
         )
         make_db(run, db, text)
@@ -218,18 +225,18 @@ class TestListDestinations:
 
     def test_several_datasets_listed_in_stored_order(self, run, db):
         text = (
-            'destinations:\n  d:\n    url: "http://d"\n'
+            'destinations:\n  d:\n    url: "https://d"\n'
             'datasets:\n'
             '  - name: "tank/z"\n    remote:\n      - destination: "d"\n'
             '  - name: "tank/a"\n    remote:\n      - destination: "d"\n'
         )
         make_db(run, db, text)
-        assert table(run("list", "destinations", "-c", db))[1] == ["d", "http://d", "tank/z, tank/a"]
+        assert table(run("list", "destinations", "-c", db))[1] == ["d", "https://d", "not enrolled", "tank/z, tank/a"]
 
     def test_enabled_only_counts_only_enabled_senders_and_hides_unused(self, run, db):
         text = (
-            'destinations:\n  both:\n    url: "http://both"\n'
-            '  only_off:\n    url: "http://off"\n  unused:\n    url: "http://unused"\n'
+            'destinations:\n  both:\n    url: "https://both"\n'
+            '  only_off:\n    url: "https://off"\n  unused:\n    url: "https://unused"\n'
             'datasets:\n'
             '  - name: "tank/on"\n    remote:\n      - destination: "both"\n'
             '  - name: "tank/off"\n    enabled: false\n    remote:\n'
@@ -238,12 +245,12 @@ class TestListDestinations:
         make_db(run, db, text)
         everything = table(run("list", "destinations", "-c", db))[1:]
         assert [r[0] for r in everything] == ["both", "only_off", "unused"]
-        assert everything[0][2] == "tank/on, tank/off"
+        assert everything[0][3] == "tank/on, tank/off"
 
         enabled = table(run("list", "destinations", "--enabled-only", "-c", db))[1:]
         # `both` now lists the enabled sender only; the destinations nothing
         # enabled sends to are hidden.
-        assert enabled == [["both", "http://both", "tank/on"]]
+        assert enabled == [["both", "https://both", "not enrolled", "tank/on"]]
 
     def test_enabled_only_json(self, run, rich):
         data = json.loads(run("list", "destinations", "--enabled-only", "--json", "-c", rich).stdout)
@@ -253,11 +260,61 @@ class TestListDestinations:
         result = run("list", "destinations", "--json", "-c", rich)
         data = json.loads(result.stdout)
         assert data == [
-            {"name": "dc.two", "url": "http://dc2:8080", "datasets": ["tank/data"]},
-            {"name": "offsite", "url": "http://offsite:8080", "datasets": ["tank/data"]},
-            {"name": "spare", "url": "http://spare:8080", "datasets": []},
+            {"name": "dc.two", "url": "https://dc2:8080", "server_fingerprint": None, "datasets": ["tank/data"]},
+            {"name": "offsite", "url": "https://offsite:8080", "server_fingerprint": None,
+             "datasets": ["tank/data"]},
+            {"name": "spare", "url": "https://spare:8080", "server_fingerprint": None, "datasets": []},
         ]
         assert result.stderr == ""
+
+    PINNED_YAML = RICH_YAML.replace(
+        '    url: "https://offsite:8080"\n',
+        f'    url: "https://offsite:8080"\n    server_fingerprint: "{FP}"\n',
+    ).replace(
+        '    url: "https://dc2:8080"\n',
+        f'    url: "https://dc2:8080"\n    server_fingerprint: "{DIGITS_FP}"\n',
+    )
+
+    def test_the_enrolled_column_shows_the_first_16_hex_of_the_pin(self, run, db):
+        make_db(run, db, self.PINNED_YAML)
+        rows = table(run("list", "destinations", "-c", db))
+        assert rows[1:] == [
+            ["dc.two", "https://dc2:8080", DIGITS_FP[:16], "tank/data"],
+            ["offsite", "https://offsite:8080", FP[:16], "tank/data"],
+            ["spare", "https://spare:8080", "not enrolled", "-"],
+        ]
+        assert len(rows[1][2]) == 16 and len(rows[2][2]) == 16
+
+    def test_the_text_view_never_shows_the_whole_pin(self, run, db):
+        make_db(run, db, self.PINNED_YAML)
+        out = run("list", "destinations", "-c", db).stdout
+        assert FP not in out and DIGITS_FP not in out
+
+    def test_json_carries_the_full_pin_or_null(self, run, db):
+        make_db(run, db, self.PINNED_YAML)
+        data = json.loads(run("list", "destinations", "--json", "-c", db).stdout)
+        assert [(d["name"], d["server_fingerprint"]) for d in data] == [
+            ("dc.two", DIGITS_FP), ("offsite", FP), ("spare", None),
+        ]
+        assert isinstance(data[0]["server_fingerprint"], str)
+        assert list(data[0]) == ["name", "url", "server_fingerprint", "datasets"]
+
+    def test_enabled_only_keeps_the_enrolled_column(self, run, db):
+        make_db(run, db, self.PINNED_YAML)
+        rows = table(run("list", "destinations", "--enabled-only", "-c", db))
+        assert rows[0] == ["NAME", "URL", "ENROLLED", "DATASETS"]
+        assert [r[:3] for r in rows[1:]] == [
+            ["dc.two", "https://dc2:8080", DIGITS_FP[:16]],
+            ["offsite", "https://offsite:8080", FP[:16]],
+        ]
+
+    def test_a_colon_upper_case_pin_is_listed_normalised(self, run, db):
+        make_db(run, db, RICH_YAML.replace(
+            '    url: "https://spare:8080"\n',
+            f'    url: "https://spare:8080"\n    server_fingerprint: "{":".join(["AB"] * 32)}"\n',
+        ))
+        data = json.loads(run("list", "destinations", "--json", "-c", db).stdout)
+        assert data[2]["server_fingerprint"] == "ab" * 32
 
     def test_no_destinations(self, run, db):
         make_db(run, db, PLAIN_YAML)

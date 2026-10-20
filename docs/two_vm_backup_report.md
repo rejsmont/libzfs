@@ -31,6 +31,50 @@ it does not flake under the aggressive test schedule.
 
 ---
 
+## Milestone 3: the harness over TLS / mutual TLS (plan item M17)
+
+The API is now HTTPS only and every endpoint except `/health` and `/enroll` needs a pinned client
+certificate, so the harness no longer starts a client against an open server. It enrolls the client the
+way an operator would, and a new scenario K exercises the trust model itself.
+
+**Enrollment in the harness.** After the server daemon is up (it creates `<db>.tls/server.{key,crt}` at
+startup) the harness runs `zfsbackup-config trust token create --json` on the server, moves the token to
+the client as a root-owned `0600` **file** (`multipass transfer`; never a command line, never piped
+stdin), and runs `zfsbackup-config enroll server1 --url https://<server-ip>:8080 --token-file ...` as root
+on the client. `CLIENT_ID` is read from `identity show --json` (the id lives in the client's config DB;
+`client_id_file` is gone). Health checks and the J4 409 probe use `curl -k` (the J4 probe also presents the
+client certificate); `-k` is acceptable because the pin is verified by zfsbackup's own client, not by curl.
+Every `import` the harness makes carries the destination's `server_fingerprint` (an import is a full
+replace and would otherwise un-enroll the destination); `identity` and trust data are outside it.
+
+**Scenario K (fresh pools, client snapshot frequency 1d, a second client identity "B" with its own DB on
+the client VM):**
+
+| Case | Checks |
+|---|---|
+| K1 — not enrolled | no client id: one ERROR "remote backup skipped: no client id"; an id but no pinned server: one ERROR "destination server1 is not enrolled"; in both: no `zfs send`, no HTTP request in the server log, nothing under the target dataset, trust list empty |
+| K2 — token consumed | enroll with the running daemon (it sends the baseline, full, byte-identical); the same, now spent, token for B: exit 1 "refused the token", still one trusted client |
+| K3 — unscoped token, known id | B claiming A's id: exit 1, "already knows a client with id", the `--client-id` hint, "token was not used and is still valid"; token state stays `active`; the SAME token then enrolls B under its own id |
+| K4 — certificate isolation | B's cert on A's URL: 403 `client_id mismatch` naming B's id; A's cert on B's URL: 403; no cert: 401; `/backup/register`: 404; A's server data (names and guids) unchanged; no dataset for B |
+| K5 — revoke mid-flight | `trust revoke <A's fingerprint>` while a throttled 400 MiB stream runs: the stream still completes and is byte-identical; the next cycle logs one ERROR "does not trust this client", sends nothing, the anchor stays |
+| K6 — re-enroll | `trust token create --client-id A --replace` + a new certificate: same client id, one pin (the new one), the pending snapshot goes out as `incremental from <anchor>`, same server dataset guid, same old-snapshot guid |
+| K7 — rotate | `identity rotate`: two pins, the successor naming its predecessor; the next cycle succeeds incrementally and retires the old pin (one pin, no predecessor) |
+| K8 — import | `import` of a YAML leaves `identity show --json` byte-identical; the destination keeps working |
+| K9 — set-client-id | refused while a destination is enrolled; the id is unchanged |
+| K10 — http:// | import of a config with an `http://` destination: exit 1 "plaintext http is not supported"; the stored config (`export`) is unchanged |
+
+`test_config_permissions.sh` gained group (i): `<db>.tls` is `0750` in the DB file's group, keys `0600`,
+certificates `0640`, `identity.lock` `0640`; a group operator can read `server.crt` (and issue a token) but
+not `server.key`; root-created client identity files keep the DB's group.
+
+### Results of the TLS run
+
+_Pending: filled in after the first real run of the milestone-3 harness (`./scenarios/test_two_vm_backup.sh`
+and `./scenarios/test_config_permissions.sh`) on the committed tree. Record here: date, commit, pass/fail
+counts per scenario (A-K), anything that was flaky, and any code defect the run found._
+
+---
+
 ## Environment gotcha: `multipass exec` `/dev/null` wedge (macOS)
 
 Most of the debugging time went to a **Multipass-on-macOS** bug, reproduced

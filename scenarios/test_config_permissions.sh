@@ -62,6 +62,11 @@
 #       `systemctl reload` returns after the reload DECISION (unchanged / accepted / even rejected), logs exactly one
 #       SIGHUP decision, `systemctl show -p StatusText` follows "generation N" (and names a rejected generation),
 #       `systemctl stop` is clean (Result=success, no process left, pid file removed).
+#   (i) the TLS identity directory <db>.tls (milestone 3): created 0750 in the DB file's group; keys 0600, certificates 0640,
+#       identity.lock 0640 (all in the DB file's group). i1: the service user creates the server identity (`trust token
+#       create`, as the daemon does at startup -- this scenario's daemon runs --dry-run, which creates nothing); the group
+#       operator alice can read server.crt (so she can issue tokens) but not server.key. i2: root creates the client
+#       identity (what `enroll` does): the directory is root-owned, the files still carry the DB's group.
 #
 # Daemon choice: the point is DB ACCESS, not ZFS operations, so the daemon runs `--dry-run`
 # against a STUB `zfs`/`zpool` (the same trick .github/workflows/tests.yml uses) — no pool, no
@@ -403,6 +408,14 @@ print("READY", flush=True)
 time.sleep(600)
 EOF
     put_file "$t/wlock.py" "$FIX_DIR/wlock.py" 644
+    # ensure_client.py: group (i2). What `enroll` does first: create this host's client TLS identity in <db>.tls (default path).
+    cat > "$t/ensure_client.py" <<'EOF'
+from zfsbackup import identity
+from zfsbackup.config.store import resolve_config_path
+r = resolve_config_path(None)
+print(identity.ensure_identity(identity.tls_dir(getattr(r, "resolved_path", r)), identity.ROLE_CLIENT).fingerprint)
+EOF
+    put_file "$t/ensure_client.py" "$FIX_DIR/ensure_client.py" 644
     # startmethod.py: the multiprocessing start method the daemon gets on this VM.
     cat > "$t/startmethod.py" <<'EOF'
 import multiprocessing as m
@@ -420,11 +433,15 @@ print("generation", con.execute("SELECT generation FROM global_settings").fetcho
 con.close()
 EOF
     put_file "$t/breakconfig.py" "$FIX_DIR/breakconfig.py" 644
-    # httpget.py: group (g). GET http://127.0.0.1:<port>/health and print the status code, or "ERR" (refused/timeout).
+    # httpget.py: group (g). GET https://127.0.0.1:<port>/health (the API is HTTPS only; /health needs no client certificate
+    # and the certificate is not verified here -- this probe is about the PORT) and print the status code, or "ERR".
     cat > "$t/httpget.py" <<'EOF'
-import sys, urllib.request
+import ssl, sys, urllib.request
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
 try:
-    print(urllib.request.urlopen("http://127.0.0.1:%s/health" % sys.argv[1], timeout=3).status)
+    print(urllib.request.urlopen("https://127.0.0.1:%s/health" % sys.argv[1], timeout=3, context=ctx).status)
 except Exception:
     print("ERR")
 EOF
@@ -487,7 +504,7 @@ stop_daemon() {
 reset_default_state() { # reset_default_state [keep-dir]
     stop_daemon
     local rmdir="rm -rf '$CFG_DIR'"; [ -n "${1:-}" ] && rmdir=":"
-    msh "{ rm -f '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock' '$DB.workers.lock'; $rmdir; } >/dev/null 2>&1; : >'$LOG'; chown '$SVC_USER' '$LOG'; true" || true
+    msh "{ rm -f '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock' '$DB.workers.lock'; rm -rf '$DB.tls'; $rmdir; } >/dev/null 2>&1; : >'$LOG'; chown '$SVC_USER' '$LOG'; true" || true
 }
 
 start_daemon() { # start_daemon [extra daemon args...]  — runs as $SVC_USER on the default DB
@@ -1385,6 +1402,44 @@ check "(h) no daemon or worker process is left" "0" "$(msh "pgrep -fc '[z]fsback
 check "(h) a clean stop removed the pid file" "gone" "$(exists "$PIDFILE" && echo present || echo gone)"
 check_no_re "(h) no traceback or crash in the log" "Traceback|crash loop" "$(msh "cat '$LOG'")"
 msh "{ rm -f /etc/systemd/system/$NOTIFY_UNIT.service; systemctl daemon-reload; } >/dev/null 2>&1; true" || true
+
+# ───────────────────────────────── (i) ──────────────────────────────────────
+# Milestone 3 (TLS/mTLS): <db>.tls/ holds the server and client identities. Directory 0750, keys 0600, certificates 0640,
+# identity.lock 0640, all in the DB file's group (a group operator can read the certificate -- enough to issue a token --
+# but never the key). The scenario's daemon is --dry-run, which creates no server identity, so the identity is created the
+# way the CLI does it (the daemon's own startup uses the same function).
+echo
+step "CHECK (i) — the TLS identity directory <db>.tls: modes and group"
+TLS="${DB}.tls"
+reset_default_state
+out="$(msh "'$ENV_WRAP' '$PY' -m zfsbackup.cli import '$FIX_DIR/root.yaml' 2>&1")"; rc=$?
+check "(i) seed: root imports the fixture" "0" "$rc"
+# i1: the service user creates the server identity
+out="$(cli_as "$SVC_USER" trust token create --json)"; rc=$?
+check "(i1) $SVC_USER's 'trust token create' exits 0 (it creates the server identity)" "0" "$rc"
+check "(i1) $TLS is 750 and in the DB file's group $SVC_GROUP" "750 $SVC_GROUP" "$(mode_group "$TLS")"
+check "(i1) server.key is 600 in group $SVC_GROUP" "600 $SVC_GROUP" "$(mode_group "$TLS/server.key")"
+check "(i1) server.crt is 640 in group $SVC_GROUP" "640 $SVC_GROUP" "$(mode_group "$TLS/server.crt")"
+check "(i1) identity.lock is 640 in group $SVC_GROUP" "640 $SVC_GROUP" "$(mode_group "$TLS/identity.lock")"
+check "(i1) nothing else is in the directory (no stale temporaries)" "identity.lock server.crt server.key" "$(msh "ls -A '$TLS' | tr '\n' ' '" | sed 's/ *$//')"
+asu alice "cat '$TLS/server.crt' >/dev/null"; rc=$?
+check "(i1) group operator alice can read server.crt" "0" "$rc"
+asu alice "cat '$TLS/server.key' >/dev/null 2>&1"; rc=$?
+if [ "$rc" -ne 0 ]; then pass "(i1) alice cannot read server.key (exit $rc)"; else fail "(i1) alice can read the server's private key"; fi
+out="$(cli_as alice trust token create --json)"; rc=$?
+check "(i1) alice can still issue a token (it needs only the certificate)" "0" "$rc"
+check_no_re "(i1) alice's token command did not try to generate a new identity" "generated a new server TLS identity" "$out"
+# i2: root creates the client identity in a fresh state (what `enroll` does first)
+reset_default_state
+out="$(msh "'$ENV_WRAP' '$PY' -m zfsbackup.cli import '$FIX_DIR/root.yaml' 2>&1")"; rc=$?
+check "(i2) seed: root imports the fixture" "0" "$rc"
+out="$(msh "'$ENV_WRAP' '$PY' '$FIX_DIR/ensure_client.py' 2>&1")"; rc=$?
+check "(i2) root creates the client identity (exit 0)" "0" "$rc"
+check "(i2) $TLS is 750, owned by root, in the DB file's group" "750 root $SVC_GROUP" "$(stat_of "$TLS")"
+check "(i2) client.key is 600 in group $SVC_GROUP" "600 $SVC_GROUP" "$(mode_group "$TLS/client.key")"
+check "(i2) client.crt is 640 in group $SVC_GROUP" "640 $SVC_GROUP" "$(mode_group "$TLS/client.crt")"
+check "(i2) identity.lock is 640 in group $SVC_GROUP" "640 $SVC_GROUP" "$(mode_group "$TLS/identity.lock")"
+stop_daemon
 
 
 # ─────────────────────────────── Report ─────────────────────────────────────

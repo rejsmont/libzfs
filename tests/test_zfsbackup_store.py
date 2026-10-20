@@ -298,7 +298,7 @@ def make_dataset(session, name="tank/data", **kwargs):
     return ds
 
 
-def make_destination(session, name="offsite", url="ssh://offsite/pool"):
+def make_destination(session, name="offsite", url="https://offsite/pool"):
     dest = Destination(name=name, url=url)
     session.add(dest)
     session.commit()
@@ -344,7 +344,8 @@ def make_global_settings(**overrides):
         check_interval_literal="1m",
         prune_interval_seconds=3600,
         prune_interval_literal="1h",
-        client_id_file="/var/lib/zfsbackup/client_id",
+        client_cert_file="/etc/zfsbackup/client.crt",
+        client_key_file="/etc/zfsbackup/client.key",
         # No Python `default=` on these any more (A-2 step 3): supply them.
         snapshot_prefix="autosnap",
         api_host="127.0.0.1",
@@ -366,6 +367,8 @@ class TestSchemaCreation:
         # The fixture already ran create_all(); just confirm it produced
         # exactly the tables item 3 specifies -- no more, no fewer.
         inspector = inspect(engine)
+        # The six config tables plus the six TLS identity/trust tables
+        # (M5); `mapper.CONFIG_TABLES` / `PRESERVED_TABLES` classify them.
         assert set(inspector.get_table_names()) == {
             "global_settings",
             "datasets",
@@ -373,6 +376,12 @@ class TestSchemaCreation:
             "dataset_remotes",
             "retention_rules",
             "remote_server",
+            "host_identity",
+            "clients",
+            "trusted_clients",
+            "revoked_fingerprints",
+            "enrollment_token",
+            "trust_state",
         }
 
     def test_create_all_is_idempotent(self, engine):
@@ -411,7 +420,7 @@ class TestDatasetsAndDestinations:
 
     def test_duplicate_destination_name_rejected(self, session):
         make_destination(session, name="offsite")
-        session.add(Destination(name="offsite", url="ssh://other/pool"))
+        session.add(Destination(name="offsite", url="https://other/pool"))
         with pytest.raises(IntegrityError):
             session.commit()
 
@@ -1486,13 +1495,13 @@ class TestMapperLoadConfigQ7:
 
     def test_unreferenced_destination_still_appears(self, session):
         session.add(make_global_settings(id=1))
-        make_destination(session, name="unused", url="ssh://unused/pool")
+        make_destination(session, name="unused", url="https://unused/pool")
         ds = make_dataset(session)
         session.add(make_rule(ds.id, None))
         session.commit()
 
         config = load_config(session)
-        assert config.destinations["unused"] == ConfigDestination(url="ssh://unused/pool")
+        assert config.destinations["unused"] == ConfigDestination(url="https://unused/pool")
 
     def test_scoped_rule_dataset_id_mismatch_raises_with_fk_off(self, session_no_fk):
         # The composite FK normally makes this state impossible, but only
@@ -1500,7 +1509,7 @@ class TestMapperLoadConfigQ7:
         # anywhere. Build it directly with FK off to exercise the mapper's
         # own belt-and-braces check.
         session = session_no_fk
-        session.add(Destination(name="offsite", url="ssh://offsite/pool"))
+        session.add(Destination(name="offsite", url="https://offsite/pool"))
         ds1 = orm_dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
         ds2 = orm_dataset(name="tank/b", frequency_seconds=3600, frequency_literal="1h")
         session.add_all([ds1, ds2])
@@ -1550,15 +1559,14 @@ class TestMapperLoadConfigQ7:
 
 
 @pytest.mark.unit
-class TestMapperPruneIntervalClientIdFileUnset:
-    """Item 3c.3: `GlobalSettings.prune_interval_seconds`/`_literal` and
-    `.client_id_file` are nullable specifically so `BackupConfig`'s "derive
-    this elsewhere" state (`prune_interval is None` /
-    `client_id_file is None`) is representable in the DB, rather than
-    flattened into a concrete value by whichever process happens to write
-    it (see models.py's module docstring for the `sudo`/`$HOME` bug this
-    fixes). `load_config`/`save_config` must pass `NULL` through as `None`
-    on both sides without ever deriving a value themselves.
+class TestMapperPruneIntervalUnset:
+    """Item 3c.3: `GlobalSettings.prune_interval_seconds`/`_literal` (and the
+    optional `client_cert_file`/`client_key_file`; `client_id_file` was dropped
+    in M5) are nullable specifically so `BackupConfig`'s "derive this
+    elsewhere" state (`prune_interval is None`) is representable in the DB,
+    rather than flattened into a concrete value by whichever process happens
+    to write it. `load_config`/`save_config` must pass `NULL` through as
+    `None` on both sides without ever deriving a value themselves.
     """
 
     def test_save_then_load_both_none_round_trips_as_null(self, session, mocker):
@@ -1571,7 +1579,7 @@ class TestMapperPruneIntervalClientIdFileUnset:
 
         config = _minimal_backup_config()
         assert config.prune_interval is None
-        assert config.client_id_file is None
+        assert config.client_cert_file is None and config.client_key_file is None
 
         save_config(session, config)
         session.commit()
@@ -1582,12 +1590,13 @@ class TestMapperPruneIntervalClientIdFileUnset:
         row = session.get(GlobalSettings, 1)
         assert row.prune_interval_seconds is None
         assert row.prune_interval_literal is None
-        assert row.client_id_file is None
+        assert row.client_cert_file is None and row.client_key_file is None
 
         spy.reset_mock()
         loaded = load_config(session)
         assert loaded.prune_interval is None
-        assert loaded.client_id_file is None
+        assert loaded.client_cert_file is None and loaded.client_key_file is None
+        assert not hasattr(loaded, "client_id_file")   # never persisted any more
 
         # _duration_from_row must never be reached for prune_interval --
         # reaching it with seconds=None would raise, and reaching it at all
@@ -1606,7 +1615,8 @@ class TestMapperPruneIntervalClientIdFileUnset:
         # NULL -- only the deliberate None/derive state does.
         config = _minimal_backup_config()
         config.prune_interval = Duration("2h")
-        config.client_id_file = tmp_path / "client_id"
+        config.client_cert_file = tmp_path / "client.crt"
+        config.client_key_file = tmp_path / "client.key"
 
         save_config(session, config)
         session.commit()
@@ -1615,11 +1625,13 @@ class TestMapperPruneIntervalClientIdFileUnset:
         row = session.get(GlobalSettings, 1)
         assert row.prune_interval_seconds == 7200
         assert row.prune_interval_literal == "2h"
-        assert row.client_id_file == str(tmp_path / "client_id")
+        assert row.client_cert_file == str(tmp_path / "client.crt")
+        assert row.client_key_file == str(tmp_path / "client.key")
 
         loaded = load_config(session)
         assert loaded.prune_interval == Duration("2h")
-        assert loaded.client_id_file == tmp_path / "client_id"
+        assert loaded.client_cert_file == tmp_path / "client.crt"
+        assert loaded.client_key_file == tmp_path / "client.key"
 
     def test_save_then_load_set_prune_interval_is_not_treated_as_unset(self, session):
         # A configured prune_interval is a real, present value, distinct
@@ -1687,7 +1699,7 @@ class TestMapperSaveConfig:
                     remote=[RemoteDatasetConfig(destination="offsite")],
                 ),
             ],
-            destinations={"offsite": ConfigDestination(url="ssh://offsite/pool")},
+            destinations={"offsite": ConfigDestination(url="https://offsite/pool")},
         )
 
     def test_repeat_save_does_not_raise_on_delete_order(self, session):
@@ -1704,7 +1716,7 @@ class TestMapperSaveConfig:
         session.commit()
 
         loaded = load_config(session)
-        assert loaded.destinations["offsite"] == ConfigDestination(url="ssh://offsite/pool")
+        assert loaded.destinations["offsite"] == ConfigDestination(url="https://offsite/pool")
 
     def test_exact_duplicate_retention_rules_are_deduped(self, session):
         config = _minimal_backup_config(
@@ -1834,8 +1846,8 @@ class TestMapperListOrdering:
                 ),
             ],
             destinations={
-                "zzz": ConfigDestination(url="ssh://zzz/pool"),
-                "aaa": ConfigDestination(url="ssh://aaa/pool"),
+                "zzz": ConfigDestination(url="https://zzz/pool"),
+                "aaa": ConfigDestination(url="https://aaa/pool"),
             },
         )
         save_config(session, config)
@@ -1879,13 +1891,15 @@ prune_interval: "30d"
 api_host: "0.0.0.0"
 api_port: 9090
 dry_run: true
-client_id_file: "/var/lib/zfsbackup/client_id"
+client_cert_file: "/etc/zfsbackup/client.crt"
+client_key_file: "/etc/zfsbackup/client.key"
 
 destinations:
   offsite:
-    url: "http://offsite.example.com:8080"
+    url: "https://offsite.example.com:8080"
+    server_fingerprint: "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89"
   dc2:
-    url: "http://dc2.example.com:8080"
+    url: "https://dc2.example.com:8080"
 
 datasets:
   - name: "tank/apps"
@@ -2020,7 +2034,7 @@ class TestMapperWipeReinsertRegression:
                     ],
                 ),
             ],
-            destinations={"offsite": ConfigDestination(url="ssh://offsite/pool")},
+            destinations={"offsite": ConfigDestination(url="https://offsite/pool")},
         )
         save_config(session, cfg1)
         session.commit()
@@ -2079,7 +2093,7 @@ class TestMapperScopedRulesForeignDatasetRegression:
     ):
         session = session_no_fk
         session.add(make_global_settings(id=1))
-        session.add(Destination(name="offsite", url="ssh://offsite/pool"))
+        session.add(Destination(name="offsite", url="https://offsite/pool"))
         ds = orm_dataset(name="tank/a", frequency_seconds=3600, frequency_literal="1h")
         session.add(ds)
         session.commit()
@@ -2193,7 +2207,7 @@ class TestMapperSaveConfigStep1ValidationRegression:
                     ],
                 ),
             ],
-            destinations={"offsite": ConfigDestination(url="ssh://offsite/pool")},
+            destinations={"offsite": ConfigDestination(url="https://offsite/pool")},
         )
         with pytest.raises(ValueError, match="duplicate"):
             save_config(session, bad)
@@ -2237,7 +2251,7 @@ class TestMapperSaveConfigStep1ValidationRegression:
                     ],
                 ),
             ],
-            destinations={"offsite": ConfigDestination(url="ssh://offsite/pool")},
+            destinations={"offsite": ConfigDestination(url="https://offsite/pool")},
         )
         with pytest.raises(ValueError, match="must be positive"):
             save_config(session, bad)
@@ -2343,7 +2357,7 @@ class TestMapperDetachedSafety:
                     ],
                 ),
             ],
-            destinations={"offsite": ConfigDestination(url="ssh://offsite/pool")},
+            destinations={"offsite": ConfigDestination(url="https://offsite/pool")},
             remote_backup=RemoteServerConfig(target_dataset="tank/received"),
         )
 
@@ -2365,7 +2379,7 @@ class TestMapperDetachedSafety:
             ConfigRetentionRule(age=Duration("1h"), keep_for=Duration("7d"))
         ]
         assert loaded.destinations["offsite"] == ConfigDestination(
-            url="ssh://offsite/pool"
+            url="https://offsite/pool"
         )
         assert loaded.remote_backup == RemoteServerConfig(target_dataset="tank/received")
 
@@ -2964,31 +2978,88 @@ class TestMigrations:
 
         assert code_head in str(excinfo.value)
 
-    def test_ensure_schema_raises_schema_split_brain_via_rollback(
+    def test_ensure_schema_raises_schema_split_brain_when_the_stamp_is_lost_after_commit(
         self, empty_memory_engine
     ):
-        """A second, more "realistic" way to reach the same split-brain
-        state as the test above -- not by bypassing Alembic, but by
-        hitting the documented transaction hazard directly (see
-        `test_ensure_schema_first_call_on_clean_connection_leaves_split_
-        brain_on_rollback` below, which this setup is shared with): a
-        clean-connection `ensure_schema` call followed by a rollback
-        leaves the six application tables committed but `alembic_version`
-        empty. A second `ensure_schema` call against that same database
-        must then raise `SchemaSplitBrain`, naming the code's head
+        """A "realistic" way to reach the split-brain state: the whole schema
+        was migrated and COMMITTED, then `alembic_version` was lost (the
+        tables created some other way, or the stamp row deleted). A later
+        `ensure_schema` must raise `SchemaSplitBrain` naming the code's head
         revision, rather than attempting `command.upgrade` again.
+
+        This replaced a rollback-based reproduction when the head moved to a
+        second revision (TLS/mTLS M5): see
+        `test_ensure_schema_rollback_with_two_revisions_leaves_only_the_first`.
         """
         code_head = _code_head(empty_memory_engine)
 
         with empty_memory_engine.connect() as conn:
             ensure_schema(conn)
-            conn.rollback()
+            conn.commit()
+        with empty_memory_engine.connect() as conn:
+            conn.execute(text("DELETE FROM alembic_version"))
+            conn.commit()
+        assert set(inspect(empty_memory_engine).get_table_names()) == (
+            set(Base.metadata.tables) | {"alembic_version"}
+        )
 
         with empty_memory_engine.connect() as conn:
             with pytest.raises(SchemaSplitBrain) as excinfo:
                 ensure_schema(conn)
 
         assert code_head in str(excinfo.value)
+
+    def test_ensure_schema_rollback_with_two_revisions_leaves_only_the_first(
+        self, empty_memory_engine
+    ):
+        """What an uncommitted `ensure_schema` leaves behind now that there
+        are two revisions (characterization; see the next test's pysqlite
+        notes). The baseline's six `CREATE TABLE`s autocommit, its
+        `INSERT INTO alembic_version` opens a transaction, and the SECOND
+        revision's DDL then runs INSIDE that transaction, so a rollback
+        discards it together with the stamp: the six baseline tables stay,
+        with the OLD column shape and no recorded revision.
+
+        A later `ensure_schema` therefore sees EXACTLY the baseline's table
+        set with no recorded revision. That is ours, so it is
+        `SchemaSplitBrain` (not `NotAConfigDatabase`) and the message says how
+        to recover: stamp the baseline, then `zfsbackup-config migrate`.
+        Nothing is changed by the refusal, and following the advice works.
+        """
+        with empty_memory_engine.connect() as conn:
+            ensure_schema(conn)
+            conn.rollback()
+
+        baseline_tables = {
+            "datasets", "destinations", "global_settings", "remote_server",
+            "dataset_remotes", "retention_rules",
+        }
+        before = set(inspect(empty_memory_engine).get_table_names())
+        assert before == baseline_tables | {"alembic_version"}
+        cols = {c["name"] for c in inspect(empty_memory_engine).get_columns("global_settings")}
+        assert "client_id_file" in cols and "client_cert_file" not in cols
+
+        with empty_memory_engine.connect() as conn:
+            with pytest.raises(SchemaSplitBrain) as excinfo:
+                ensure_schema(conn)
+        message = str(excinfo.value)
+        assert not isinstance(excinfo.value, NotAConfigDatabase)
+        assert "`alembic stamp a1c28e1b3f34`" in message
+        assert "`zfsbackup-config migrate`" in message
+        assert message.index("alembic stamp a1c28e1b3f34") < message.index("zfsbackup-config migrate")
+        assert "'a1c28e1b3f34'" in message and "Nothing was changed" in message
+        assert set(inspect(empty_memory_engine).get_table_names()) == before
+
+        # The advice works: stamp the baseline, and the migration reaches head.
+        with empty_memory_engine.connect() as conn:
+            conn.execute(text("INSERT INTO alembic_version (version_num) VALUES ('a1c28e1b3f34')"))
+            conn.commit()
+        with empty_memory_engine.connect() as conn:
+            ensure_schema(conn)
+            conn.commit()
+        assert set(inspect(empty_memory_engine).get_table_names()) == (
+            set(Base.metadata.tables) | {"alembic_version"}
+        )
 
     # -- the transaction-boundary hazard (migrate.py's module docstring) --
     #
@@ -3049,9 +3120,12 @@ class TestMigrations:
         work` already pins as still open when `ensure_schema` returns. A
         rollback -- or simply never calling `commit()` at all, which is
         what an operator's `^C` between `ensure_schema` and the caller's
-        own commit produces -- discards only that one `INSERT`, leaving
-        exactly the split-brain state `SchemaSplitBrain` exists to detect
-        on any subsequent call: full schema, empty `alembic_version`.
+        own commit produces -- discards that `INSERT` and, since the head
+        moved to a second revision (M5), that revision's DDL too (it ran in
+        the open transaction): the baseline tables survive with an empty
+        `alembic_version`. (The `SchemaSplitBrain` state proper, the FULL
+        table set with no stamp, is reached in `test_ensure_schema_raises_
+        schema_split_brain_when_the_stamp_is_lost_after_commit`.)
         """
         with empty_memory_engine.connect() as conn:
             ensure_schema(conn)
@@ -3312,9 +3386,9 @@ class TestMigrationsOverDbWriterConnection:
     collapses into "case 1" (an already-open transaction, where NOTHING
     autocommits and the whole migration lives or dies with one commit).
     Concretely: over a db.py writer connection, `ensure_schema` +
-    `rollback()` must leave ZERO tables -- not `TestMigrations`'
-    `SchemaSplitBrain` state (full schema, empty `alembic_version`), which
-    is specific to the bare-connection "case 2" mechanics. This is the one
+    `rollback()` must leave ZERO tables -- not `TestMigrations`' partial
+    state (the baseline tables, empty `alembic_version`), which is specific
+    to the bare-connection "case 2" mechanics. This is the one
     thing nothing in `TestMigrations` (deliberately built on a bare engine
     to characterise the *platform* mechanics independent of this store's
     own pragmas) can pin.
@@ -3345,11 +3419,11 @@ class TestMigrationsOverDbWriterConnection:
         self, writer_engine
     ):
         # The direct behavioural contrast with `TestMigrations.test_
-        # ensure_schema_raises_schema_split_brain_via_rollback`: over a
-        # writer connection, a rolled-back first call leaves a genuinely
-        # clean database, so a SECOND `ensure_schema` call on the same
-        # engine must succeed normally rather than raising
-        # `SchemaSplitBrain`.
+        # ensure_schema_rollback_with_two_revisions_leaves_only_the_first`:
+        # over a writer connection, a rolled-back first call leaves a
+        # genuinely clean database, so a SECOND `ensure_schema` call on the
+        # same engine must succeed normally rather than raising
+        # `NotAConfigDatabase` / `SchemaSplitBrain`.
         with writer_engine.connect() as conn:
             ensure_schema(conn)
             conn.rollback()
@@ -3372,10 +3446,7 @@ class TestMigrationsOverDbWriterConnection:
             conn.commit()
 
         insp = inspect(writer_engine)
-        assert {
-            "datasets", "destinations", "global_settings", "remote_server",
-            "dataset_remotes", "retention_rules", "alembic_version",
-        } <= set(insp.get_table_names())
+        assert set(Base.metadata.tables) | {"alembic_version"} <= set(insp.get_table_names())
 
         with writer_engine.connect() as conn:
             rows = conn.execute(
@@ -8422,6 +8493,9 @@ class TestNoPythonColumnDefaults:
 
 
 _BASELINE_REVISION = "a1c28e1b3f34"
+# TLS/mTLS M5: trust + host-identity tables, destination pins, client cert/key
+# paths, `client_id_file` dropped. Revises the baseline; it is the head.
+_TLS_REVISION = "7c3e9d51b2a8"
 _SUPERSEDED_REVISION = "2e8aa45e2667"
 
 
@@ -8531,22 +8605,36 @@ class TestBaselinePositivityChecks:
 
 @pytest.mark.unit
 class TestBaselineRevision:
-    def test_head_revision_is_the_regenerated_baseline(self, migrated_db):
-        assert _code_head(migrated_db) == _BASELINE_REVISION
+    def test_head_revision_is_the_tls_revision(self, migrated_db):
+        assert _code_head(migrated_db) == _TLS_REVISION
         with migrated_db.connect() as conn:
             assert (
                 conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-                == _BASELINE_REVISION
+                == _TLS_REVISION
             )
 
-    def test_there_is_exactly_one_baseline_script(self):
+    def test_there_are_exactly_two_scripts_baseline_then_tls(self):
         scripts = sorted(
             p.name for p in (_MIGRATIONS_DIR / "versions").glob("*.py")
             if not p.name.startswith("__")
         )
-        assert len(scripts) == 1, scripts
-        assert _BASELINE_REVISION in scripts[0]
-        assert _SUPERSEDED_REVISION not in scripts[0]
+        assert len(scripts) == 2, scripts
+        assert _BASELINE_REVISION in scripts[0] and _TLS_REVISION in scripts[1]
+        assert not any(_SUPERSEDED_REVISION in name for name in scripts)
+
+    def test_the_revisions_form_one_linear_chain(self, migrated_db):
+        with migrated_db.connect() as conn:
+            script = ScriptDirectory.from_config(_build_config(conn))
+        assert script.get_bases() == [_BASELINE_REVISION]
+        assert script.get_heads() == [_TLS_REVISION]
+        assert script.get_revision(_TLS_REVISION).down_revision == _BASELINE_REVISION
+        assert script.get_revision(_BASELINE_REVISION).down_revision is None
+
+    def test_the_known_revisions_are_both_revisions_and_the_expected_head_is_the_tls_one(self):
+        from zfsbackup.config.store import migrate
+
+        assert migrate.EXPECTED_HEAD == _TLS_REVISION
+        assert migrate.KNOWN_REVISIONS == frozenset({_BASELINE_REVISION, _TLS_REVISION})
 
     def test_a_database_stamped_with_the_superseded_id_is_refused_loudly(self, migrated_db):
         _exec(migrated_db, "UPDATE alembic_version SET version_num = :v", v=_SUPERSEDED_REVISION)

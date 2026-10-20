@@ -19,16 +19,30 @@ needs:
 
 Who may read the database
 -------------------------
-**The supervisor, at startup and on every reload** -- never a worker. Workers
-never open the config database (item 15.2(b), decision Q4): they are handed
-the supervisor's detached `BackupConfig` -- by inheritance under `fork`, by
-pickling under `spawn`/`forkserver` -- together with the reload epoch it
-belongs to (`daemon.Handoff`). A crash restart reuses the current object; it
-does not re-read the database. The supervisor reads again only for a reload
-(item 17.2): a cheap `read_store_state` poll every `RELOAD_POLL_SECONDS`, and
-this module's full read when the poll sees a changed `(store_id, generation)`
-key or a SIGHUP forces one. Every one of those reads is followed by
-`dispose_all()` in a `finally`, before anything can fork.
+**The configuration and the client id: the supervisor, at startup and on
+every reload** -- never a worker. Both come from one read snapshot
+(`ConfigSnapshot.config` and `ConfigSnapshot.client_id`, the latter from
+`host_identity`), so a worker can never get one generation's config with
+another's id. Workers never read either from the database (item 15.2(b),
+decision Q4): they are handed the supervisor's detached `BackupConfig` and the
+client id -- by inheritance under `fork`, by pickling under
+`spawn`/`forkserver` -- together with the reload epoch they belong to
+(`daemon.Handoff`). A crash restart reuses the current object; it does not
+re-read the database. The supervisor reads again only for a reload (item
+17.2): a cheap `read_store_state` poll every `RELOAD_POLL_SECONDS`, and this
+module's full read when the poll sees a changed `(store_id, generation)` key
+or a SIGHUP forces one. A changed client id bumps the config generation (the
+CLI writes it), so it arrives through the same poll/SIGHUP path. Every one of
+those reads is followed by `dispose_all()` in a `finally`, before anything can
+fork.
+
+**The trust tables: the API worker, only through `zfsbackup.config.store.
+trust`** (TLS/mTLS plan D1). It polls `read_trust_key` every
+`api.TRUST_POLL_SECONDS` and reads `read_trust` when the key moved (from M10
+it also writes enrollments and rotations there). Every such call builds its
+own unpooled engine and closes it before returning, so nothing is shared with
+the supervisor's engines or across threads; it never reads the configuration
+tables. No other worker opens the database at all.
 
 The rules this wrapper still obeys
 ----------------------------------

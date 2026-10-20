@@ -119,7 +119,16 @@ from click.testing import CliRunner
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError, SQLAlchemyError
 
-from _cli_support import FakeDaemon, UNVERIFIED_LINUX_ONLY, fake_daemon, live_daemon, store_key, unsignalable
+from _cli_support import (
+    FakeDaemon,
+    UNVERIFIED_LINUX_ONLY,
+    fake_daemon,
+    host_client_id,
+    live_daemon,
+    seed_client_id,
+    store_key,
+    unsignalable,
+)
 from zfsbackup import daemonlock
 from zfsbackup.cli import errors as cli_errors
 from zfsbackup.cli import main as cli_main
@@ -385,7 +394,8 @@ class TestSkeleton:
     #: unannounced. (`PLANNED` is for a command that has landed in the CLI
     #: before this list is updated.)
     COMMANDS = [
-        "edit", "export", "get", "import", "list", "migrate", "rename", "set", "status", "unset",
+        "edit", "enroll", "export", "get", "identity", "import", "list", "migrate", "rename", "set",
+        "status", "trust", "unset",
     ]
     PLANNED = set()
 
@@ -1170,7 +1180,7 @@ class TestImport:
     def test_replace_warning_counts_destinations(self, run, db, tmp_path):
         with_dest = tmp_path / "dest.yaml"
         with_dest.write_text(
-            'destinations:\n  nas:\n    url: "http://nas:8080"\n  cloud:\n    url: "http://c"\n'
+            'destinations:\n  nas:\n    url: "https://nas:8080"\n  cloud:\n    url: "https://c"\n'
             'datasets:\n  - name: "tank/a"\n    frequency: "1h"\n    retention:\n      "1d": "30d"\n'
             '    remote:\n      - destination: "nas"\n'
         )
@@ -1509,6 +1519,127 @@ class TestImportOntoOrphanedSidecars:
         assert "fuser" in result.stderr and "lsof" in result.stderr
         assert sidecars(db) == ["config.db-shm", "config.db-wal"]
         assert backups(db) == []
+
+
+class TestImportExportHostIdentity:
+    """The client id lives in the config database's `host_identity` table, not in
+    the configuration: `import` (a full replace of the six config tables) leaves
+    it alone and `export` never emits it (plan M6/M8)."""
+
+    CID = "backup-host-1a2b3c4d"
+
+    def test_a_fresh_import_stores_no_id(self, run, db):
+        import_ok(run, db)
+        assert host_client_id(db) is None
+
+    def test_import_over_a_database_preserves_the_stored_id(self, run, db):
+        import_ok(run, db)
+        seed_client_id(db, self.CID)
+        import_ok(run, db, TEST_YAML)
+        assert host_client_id(db) == self.CID
+        assert "libzfs_test/ROOT/macos" in exported(run, db)  # and it really did replace the config
+
+    def test_import_twice_still_preserves_the_stored_id(self, run, db):
+        import_ok(run, db)
+        seed_client_id(db, self.CID)
+        for source in (TEST_YAML, EXAMPLE_YAML, TEST_YAML):
+            import_ok(run, db, source)
+            assert host_client_id(db) == self.CID
+
+    def test_the_snapshot_reads_the_id_alongside_the_config(self, run, db):
+        import_ok(run, db)
+        seed_client_id(db, self.CID)
+        import_ok(run, db, TEST_YAML)
+        try:
+            snapshot = read_config(store_paths.resolve_config_path(str(db)))
+        finally:
+            dispose_all()
+        assert snapshot.client_id == self.CID
+
+    def test_export_never_emits_the_id(self, run, db):
+        import_ok(run, db)
+        seed_client_id(db, self.CID)
+        text = exported(run, db)
+        assert self.CID not in text
+        parsed = yaml.safe_load(text)
+        assert not any("client_id" in key for key in parsed)
+
+    def test_export_to_a_file_never_emits_the_id(self, run, db, tmp_path):
+        import_ok(run, db)
+        seed_client_id(db, self.CID)
+        out = tmp_path / "out.yaml"
+        assert run("export", "-c", db, "-o", out).exit_code == 0
+        assert self.CID not in out.read_text() and "client_id" not in out.read_text()
+
+    def test_the_pre_import_backup_does_not_contain_the_id(self, run, db):
+        import_ok(run, db)
+        seed_client_id(db, self.CID)
+        import_ok(run, db, TEST_YAML)
+        (backup,) = backups(db)
+        assert self.CID not in backup.read_text() and "client_id" not in backup.read_text()
+
+    def test_export_then_import_into_another_database_carries_no_id(self, run, db, tmp_path):
+        import_ok(run, db)
+        seed_client_id(db, self.CID)
+        out = tmp_path / "out.yaml"
+        assert run("export", "-c", db, "-o", out).exit_code == 0
+        other = tmp_path / "other" / "c.db"
+        import_ok(run, other, out)
+        assert host_client_id(other) is None
+        assert host_client_id(db) == self.CID
+
+    def test_a_yaml_still_naming_client_id_file_is_refused_and_writes_nothing(self, run, db, tmp_path):
+        import_ok(run, db)
+        seed_client_id(db, self.CID)
+        before = digest(db)
+        legacy = tmp_path / "legacy.yaml"
+        legacy.write_text(
+            'client_id_file: "/var/lib/zfsbackup/client_id"\n'
+            'datasets:\n  - name: "tank/a"\n    frequency: "1h"\n    retention:\n      "1d": "30d"\n'
+        )
+        result = run("import", legacy, "-c", db)
+        assert result.exit_code == 1
+        assert "client_id_file was removed" in result.stderr
+        assert "Traceback" not in result.stderr
+        assert digest(db) == before and host_client_id(db) == self.CID
+
+    def test_a_yaml_with_an_http_destination_is_refused_and_writes_nothing(self, run, db, tmp_path):
+        import_ok(run, db)
+        before = digest(db)
+        plain = tmp_path / "plain.yaml"
+        plain.write_text(
+            'destinations:\n  nas:\n    url: "http://nas:8080"\n'
+            'datasets:\n  - name: "tank/a"\n    frequency: "1h"\n    retention:\n      "1d": "30d"\n'
+            '    remote:\n      - destination: "nas"\n'
+        )
+        result = run("import", plain, "-c", db)
+        assert result.exit_code == 1
+        assert "plaintext http is not supported; use https://" in result.stderr
+        assert digest(db) == before
+
+    def test_a_pin_and_the_tls_paths_import_and_export(self, run, db, tmp_path):
+        source = tmp_path / "tls.yaml"
+        source.write_text(
+            'client_cert_file: "/etc/zfsbackup/c.pem"\nclient_key_file: "/etc/zfsbackup/c.key"\n'
+            f'destinations:\n  nas:\n    url: "https://nas:8080"\n    server_fingerprint: "{":".join(["AB"] * 32)}"\n'
+            'datasets:\n  - name: "tank/a"\n    frequency: "1h"\n    retention:\n      "1d": "30d"\n'
+            '    remote:\n      - destination: "nas"\n'
+        )
+        import_ok(run, db, source)
+        parsed = yaml.safe_load(exported(run, db))
+        assert parsed["client_cert_file"] == "/etc/zfsbackup/c.pem"
+        assert parsed["client_key_file"] == "/etc/zfsbackup/c.key"
+        assert parsed["destinations"]["nas"]["server_fingerprint"] == "ab" * 32
+
+    def test_one_tls_path_alone_is_refused(self, run, db, tmp_path):
+        source = tmp_path / "half.yaml"
+        source.write_text(
+            'client_cert_file: "/etc/zfsbackup/c.pem"\n'
+            'datasets:\n  - name: "tank/a"\n    frequency: "1h"\n    retention:\n      "1d": "30d"\n'
+        )
+        result = run("import", source, "-c", db)
+        assert result.exit_code == 1 and "set together" in result.stderr
+        assert not db.exists()
 
 
 class TestExport:

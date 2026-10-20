@@ -96,6 +96,38 @@ NAMING_CONVENTION = {
     "pk": "pk_%(table_name)s",
 }
 
+# SQL fragments shared by the identity/trust tables. SQLite `GLOB` is case
+# sensitive and has no repetition operator, so "64 lowercase hex" is a length
+# test plus "no character outside [0-9a-f]".
+#
+# Both `length()` and `GLOB` stop at the first NUL of a TEXT value, so
+# without `_NO_NUL` the store accepted `'a\x00b'` as a client id and
+# `<64 hex>\x00junk` as a fingerprint -- values the Python grammar rejects,
+# and which compare unequal to the canonical string everywhere else. The
+# BLOB length counts every byte, NULs included; the TEXT length counts
+# characters up to the first NUL. They are equal only for a NUL-free value
+# whose characters are all single-byte, which both grammars below require
+# anyway.
+_NO_NUL = "length(CAST({col} AS BLOB)) = length({col})"
+_HEX64 = (
+    "(length({col}) = 64 AND {col} NOT GLOB '*[^0-9a-f]*' AND "
+    + _NO_NUL
+    + ")"
+)
+# The client-id grammar (TLS/mTLS plan A7), identical for `host_identity` and
+# `clients`: 1-64 characters from [A-Za-z0-9._-], the FIRST of which must be
+# [A-Za-z0-9]. The id becomes a ZFS dataset-name component on the server
+# (`<target>/<client_id>/...`), so '/', '@', '#', spaces, '..' and a leading
+# '.' (a hidden/relative path component) must never be storable. A leading '-'
+# or '_' is rejected too: it passes a "not '.'" rule but libzfseasy refuses it
+# as a ZFS dataset name, so `/enroll` would 400 for an id the store accepted.
+_CLIENT_ID_OK = (
+    "(length({col}) BETWEEN 1 AND 64 "
+    "AND {col} NOT GLOB '*[^A-Za-z0-9._-]*' "
+    "AND substr({col}, 1, 1) GLOB '[A-Za-z0-9]' "
+    "AND " + _NO_NUL + ")"
+)
+
 
 class Base(DeclarativeBase):
     """Declarative base for every table in the config store."""
@@ -158,6 +190,13 @@ class GlobalSettings(Base):
             "prune_interval_seconds IS NULL OR prune_interval_seconds > 0",
             name="prune_interval_positive",
         ),
+        # A client certificate without its key (or the reverse) cannot
+        # complete a handshake; reject the half-configured pair at the DB so
+        # a hand-edited row fails loudly instead of at the first backup cycle.
+        CheckConstraint(
+            "(client_cert_file IS NULL) = (client_key_file IS NULL)",
+            name="client_cert_key_together",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
@@ -184,14 +223,18 @@ class GlobalSettings(Base):
     api_host: Mapped[str]
     api_port: Mapped[int]
     dry_run: Mapped[bool]
-    # Nullable: NULL means "resolve $HOME's default in the process that
-    # uses the file" (config/model.py's `Path.home() / '.config' / 'zfsbackup' /
-    # 'client_id'`), not "no value stored". A stored, materialised path
-    # here would freeze whichever process ran `zfsbackup-config import`'s
-    # $HOME into the DB -- see the item-3c.1 plan item for why that is a
-    # real bug (ClientIdentity._load_or_generate silently generates a new
-    # client ID on a wrong-$HOME miss).
-    client_id_file: Mapped[Optional[str]] = mapped_column(nullable=True)
+    # Optional operator-supplied client TLS credential paths (TLS/mTLS plan
+    # M5). Both NULL = no client certificate configured; the CHECK in
+    # __table_args__ makes "one of the two" unrepresentable, so a mapper never
+    # has to guess which half of an mTLS pair was meant.
+    #
+    # This replaced `client_id_file`: the client id now lives in the
+    # `host_identity` table, in the same database as the config, so there is
+    # no per-process `$HOME`-dependent path to freeze (that was the bug the
+    # old nullable column existed to dodge: a DB imported under `sudo`
+    # pointing the daemon at `/root/.config/...`).
+    client_cert_file: Mapped[Optional[str]] = mapped_column(nullable=True)
+    client_key_file: Mapped[Optional[str]] = mapped_column(nullable=True)
     # Bumped by exactly 1 on every `mapper.save_config` -- `import` included,
     # so an import that lands between a CLI read and its write is a conflict
     # like any other write.
@@ -288,9 +331,22 @@ class Destination(Base):
     """
 
     __tablename__ = "destinations"
+    __table_args__ = (
+        CheckConstraint(
+            "server_fingerprint IS NULL OR "
+            + _HEX64.format(col="server_fingerprint"),
+            name="server_fingerprint_hex",
+        ),
+    )
 
     name: Mapped[str] = mapped_column(primary_key=True)
     url: Mapped[str] = mapped_column(nullable=False)
+    # Pinned SHA-256 of the server's certificate (TLS/mTLS plan M5): 64
+    # lowercase hex, or NULL = not pinned. The CHECK keeps a malformed pin
+    # (wrong length, uppercase, stray characters) from ever being stored: a
+    # pin that can never match would look like a TLS failure at connect time
+    # instead of a config error at write time.
+    server_fingerprint: Mapped[Optional[str]] = mapped_column(nullable=True)
 
     # No ON DELETE clause on dataset_remotes.destination_name (see
     # DatasetRemote) -- a destination still referenced by a dataset's
@@ -547,3 +603,252 @@ class RemoteServer(Base):
 
     def __repr__(self) -> str:
         return f"RemoteServer(target_dataset={self.target_dataset!r}, enabled={self.enabled})"
+
+
+# --- TLS trust and host identity (TLS/mTLS plan M5) -------------------------
+#
+# These tables are NOT config: `mapper.save_config` wipes and re-inserts only
+# the six config tables above and must never touch these. All access goes
+# through `store/trust.py`. `host_identity` is written only by the CLI, and
+# every change to it bumps `GlobalSettings.generation` (so the daemon reloads).
+# The trust tables (`clients`, `trusted_clients`, `revoked_fingerprints`,
+# `enrollment_token`, `trust_state`) have two writers -- the CLI (`trust ...`)
+# and the API worker (enroll/rotate/retire) -- and never bump the config
+# generation.
+
+
+class HostIdentity(Base):
+    """This host's own client id (client side). One row, `CHECK id = 1`.
+
+    No row means "no id generated yet" -- an expected state on a fresh DB, so
+    unlike `GlobalSettings` an absent row is not corruption. The id is
+    grammar-checked here because it becomes a path component on the server.
+    """
+
+    __tablename__ = "host_identity"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="singleton"),
+        CheckConstraint(_CLIENT_ID_OK.format(col="client_id"), name="client_id_grammar"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    client_id: Mapped[str] = mapped_column(nullable=False)
+    created_at: Mapped[float] = mapped_column(nullable=False)
+    updated_at: Mapped[Optional[float]] = mapped_column(nullable=True)
+
+    def __repr__(self) -> str:
+        return f"HostIdentity(client_id={self.client_id!r})"
+
+
+class Client(Base):
+    """A client id known to this server (server side).
+
+    `revoked_at` is a tombstone: a revoked id keeps its row so it cannot be
+    silently re-enrolled by anyone who merely knows the name, and so the
+    `trusted_clients` rows that reference it never dangle.
+    """
+
+    __tablename__ = "clients"
+    __table_args__ = (
+        CheckConstraint(_CLIENT_ID_OK.format(col="client_id"), name="client_id_grammar"),
+    )
+
+    client_id: Mapped[str] = mapped_column(primary_key=True)
+    label: Mapped[Optional[str]] = mapped_column(nullable=True)
+    created_at: Mapped[float] = mapped_column(nullable=False)
+    revoked_at: Mapped[Optional[float]] = mapped_column(nullable=True)
+
+    def __repr__(self) -> str:
+        return f"Client(client_id={self.client_id!r}, revoked_at={self.revoked_at!r})"
+
+
+class TrustedClient(Base):
+    """One pinned client certificate (server side), keyed by its fingerprint.
+
+    A fingerprint belongs to exactly one client id (it is the primary key),
+    but one client id may hold several fingerprints (plan D3), so
+    `client_id` is indexed and deliberately NOT unique: during a rotation the
+    old and the successor certificate are both trusted until the successor's
+    first authenticated request retires the predecessor (D4).
+    """
+
+    __tablename__ = "trusted_clients"
+    __table_args__ = (
+        CheckConstraint(_HEX64.format(col="fingerprint"), name="fingerprint_hex"),
+        CheckConstraint(
+            "enrolled_via IN ('token', 'rotate')", name="enrolled_via_known"
+        ),
+        # NULL = not a rotation successor; otherwise it must be a well-formed
+        # fingerprint (it is compared against `fingerprint` values).
+        CheckConstraint(
+            "predecessor_fingerprint IS NULL OR "
+            + _HEX64.format(col="predecessor_fingerprint"),
+            name="predecessor_fingerprint_hex",
+        ),
+    )
+
+    fingerprint: Mapped[str] = mapped_column(primary_key=True)
+    client_id: Mapped[str] = mapped_column(
+        ForeignKey("clients.client_id"), nullable=False, index=True
+    )
+    cert_pem: Mapped[str] = mapped_column(nullable=False)
+    not_after: Mapped[float] = mapped_column(nullable=False)
+    enrolled_at: Mapped[float] = mapped_column(nullable=False)
+    enrolled_via: Mapped[str] = mapped_column(nullable=False)
+    predecessor_fingerprint: Mapped[Optional[str]] = mapped_column(nullable=True)
+
+    def __repr__(self) -> str:
+        return f"TrustedClient(fingerprint={self.fingerprint[:12]!r}, client_id={self.client_id!r})"
+
+
+#: Why a fingerprint stopped being trusted (`RevokedFingerprint.reason`).
+#: `revoked`: `trust revoke FP`; `successor_revoked`: a rotation successor
+#: unpinned along with its revoked predecessor (its trust came only from
+#: proof of possession of that key; without the cascade a thief who rotated
+#: a stolen key A to their own C kept C after `trust revoke A`);
+#: `client_revoked`: `trust revoke --client`; `replaced`: deleted by a
+#: `--replace` token's enrollment; `retired`: a rotation predecessor retired
+#: on its successor's first request.
+REVOCATION_REASONS = (
+    "revoked", "successor_revoked", "client_revoked", "replaced", "retired",
+)
+
+
+class RevokedFingerprint(Base):
+    """A client certificate that was once pinned and never may be again
+    (server side), keyed by its fingerprint.
+
+    Before this table, revoking DELETED the pin and kept no record, and
+    `enroll_client` only asked whether a fingerprint was pinned *now*: after
+    `trust revoke F` (a stolen key) the host -- or the thief -- could redeem
+    any fresh token with F, under any id, and the stolen key was trusted
+    again. Every path that unpins a certificate (revoke, revoke --client, a
+    `--replace` enrollment, rotation retirement) now records it here in the
+    same transaction, and enroll/rotate refuse a recorded fingerprint. Rows
+    are never deleted (an `import` keeps them: `mapper.PRESERVED_TABLES`).
+
+    A separate table rather than a `revoked_at` column on `trusted_clients`,
+    so `trusted_clients` stays "the live pins" -- a reader that forgets a
+    filter cannot trust a revoked key -- and a fingerprint can never be live
+    and revoked through one row's state. The two sets are kept disjoint by
+    `store/trust.py`; `read_trust` additionally filters this table out of
+    the pin set as the backstop.
+
+    `client_id` is the client the pin belonged to, for display (`trust
+    list`); `clients` rows are never deleted, so the FK only rejects a bogus
+    id.
+
+    `superseded_by` is set only on a `retired` row: the rotation successor
+    whose first request retired this pin. Retiring deletes the predecessor's
+    pin and so clears the successor's `predecessor_fingerprint`; without
+    this column nothing linked the successor to the retired key any more,
+    and `trust revoke A` after a thief's `/rotate` A -> C AND one request
+    with C found A merely "already revoked" and left C trusted -- the
+    revoke cascade did not survive the successor's first request. `revoke_
+    pin` follows this link (transitively, through retired intermediates) to
+    the live successor and unpins it. Deliberately NOT a foreign key: the
+    successor's `trusted_clients` row may later be deleted, and this record
+    is never deleted.
+    """
+
+    __tablename__ = "revoked_fingerprints"
+    __table_args__ = (
+        # NUL-safe like every other fingerprint column: a `<64 hex>\x00junk`
+        # value would never match the canonical fingerprint it pretends to
+        # revoke, so the revocation would silently not apply.
+        CheckConstraint(_HEX64.format(col="fingerprint"), name="fingerprint_hex"),
+        CheckConstraint(
+            "reason IN (" + ", ".join(f"'{r}'" for r in REVOCATION_REASONS) + ")",
+            name="reason_known",
+        ),
+        # NUL-safe for the same reason as `fingerprint`: a malformed link
+        # would never match the successor's pin, so revoking the retired key
+        # would silently not reach it.
+        CheckConstraint(
+            "superseded_by IS NULL OR " + _HEX64.format(col="superseded_by"),
+            name="superseded_by_hex",
+        ),
+    )
+
+    fingerprint: Mapped[str] = mapped_column(primary_key=True)
+    client_id: Mapped[str] = mapped_column(
+        ForeignKey("clients.client_id"), nullable=False, index=True
+    )
+    revoked_at: Mapped[float] = mapped_column(nullable=False)
+    reason: Mapped[str] = mapped_column(nullable=False)
+    superseded_by: Mapped[Optional[str]] = mapped_column(nullable=True)
+
+    def __repr__(self) -> str:
+        return (
+            f"RevokedFingerprint(fingerprint={self.fingerprint[:12]!r}, "
+            f"client_id={self.client_id!r}, reason={self.reason!r})"
+        )
+
+
+class EnrollmentToken(Base):
+    """The one outstanding enrollment token (server side). One row.
+
+    Only the SHA-256 of the secret is stored, never the secret. The `consumed_*`
+    columns record the redemption so a retried enroll from the same client is
+    idempotent while a second client cannot redeem it.
+    """
+
+    __tablename__ = "enrollment_token"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="singleton"),
+        CheckConstraint(_HEX64.format(col="secret_sha256"), name="secret_sha256_hex"),
+        CheckConstraint(
+            _HEX64.format(col="server_fingerprint"), name="server_fingerprint_hex"
+        ),
+        CheckConstraint("expires_at > created_at", name="expiry_after_creation"),
+        # `--replace` only makes sense for a named client id (it replaces that
+        # id's existing pins); a replace token with no id would be ambiguous
+        # about whose trust it wipes. replace -> client_id IS NOT NULL.
+        CheckConstraint(
+            "replace = 0 OR client_id IS NOT NULL", name="replace_requires_client_id"
+        ),
+        CheckConstraint(
+            "consumed_fingerprint IS NULL OR "
+            + _HEX64.format(col="consumed_fingerprint"),
+            name="consumed_fingerprint_hex",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    secret_sha256: Mapped[str] = mapped_column(nullable=False)
+    server_fingerprint: Mapped[str] = mapped_column(nullable=False)
+    created_at: Mapped[float] = mapped_column(nullable=False)
+    expires_at: Mapped[float] = mapped_column(nullable=False)
+    client_id: Mapped[Optional[str]] = mapped_column(nullable=True)
+    # server_default (DDL-visible), not a Python `default=`: see the
+    # GlobalSettings note on why a Python default silently rewrites a None.
+    replace: Mapped[bool] = mapped_column(nullable=False, server_default=text("0"))
+    consumed_at: Mapped[Optional[float]] = mapped_column(nullable=True)
+    consumed_fingerprint: Mapped[Optional[str]] = mapped_column(nullable=True)
+    consumed_client_id: Mapped[Optional[str]] = mapped_column(nullable=True)
+
+    def __repr__(self) -> str:
+        return f"EnrollmentToken(client_id={self.client_id!r}, consumed_at={self.consumed_at!r})"
+
+
+class TrustState(Base):
+    """Monotonic trust generation (server side). One row.
+
+    Bumped by every trust write that changes the set of pins (`store/trust.py`
+    is the only writer; token-only writes do not bump it) so the API worker can
+    poll one integer to notice that another process changed trust. No row
+    means generation 0. Distinct from
+    `GlobalSettings.generation` on purpose: a trust change must not look like
+    a config change and cause a reload (plan D1-A1).
+    """
+
+    __tablename__ = "trust_state"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="singleton"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    generation: Mapped[int] = mapped_column(nullable=False)
+
+    def __repr__(self) -> str:
+        return f"TrustState(generation={self.generation})"

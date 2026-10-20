@@ -595,7 +595,7 @@ class TestRemoteWorkerBetweenDestinations:
                     remote=[RemoteDatasetConfig(destination="one"), RemoteDatasetConfig(destination="two")],
                 )
             ],
-            destinations={"one": Destination(url="http://one"), "two": Destination(url="http://two")},
+            destinations={"one": Destination(url="https://one"), "two": Destination(url="https://two")},
         )
         worker = RemoteBackupWorker(config, stop, reload_epoch=rel, born_epoch=0)
         rbm = MagicMock()
@@ -727,15 +727,15 @@ class TestHoldWorkersLockInWorker:
         )
         process.assert_called_once()
 
-    def test_the_api_worker_takes_the_lock_too(self, tmp_path, mocker):
-        db = tmp_path / "config.db"
+    def test_the_api_worker_takes_the_lock_too(self, tls_config_db, mocker):
+        db = tls_config_db.path
         path = daemonlock.ensure_workers_lock(db)
         mocker.patch("zfsbackup.api.create_app", return_value=MagicMock())
         server = MagicMock()
         server.serve_forever.side_effect = lambda: time.sleep(30)
         mocker.patch("zfsbackup.workers._bind_api_server", return_value=server)
         stop = StopFlag()
-        worker = ApiWorker(make_config(), stop, workers_lock=path)
+        worker = ApiWorker(make_config(), stop, workers_lock=path, config_db=tls_config_db)
         seen = {}
         real_start = threading.Thread.start
 
