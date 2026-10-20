@@ -24,6 +24,7 @@ sqlalchemy = "^2.0"
 alembic = "^1.13"
 click = "^8.1"
 requests = "^2.31"
+cryptography = ">=43"
 
 [tool.poetry.group.dev.dependencies]
 jupyter = "^1.0.0"
