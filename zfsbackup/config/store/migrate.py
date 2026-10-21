@@ -37,7 +37,8 @@ test suite (`TestExpectedHeadConstants`), never silently at daemon start.
 **Never modify a database that is not ours (item 10.4).** A file with no
 recorded revision but with tables in it is not something this package may
 migrate: `check_schema`/`upgrade_schema` raise `NotAConfigDatabase` (or
-`SchemaSplitBrain` when every table is one of ours) and write nothing.
+`SchemaSplitBrain` when the tables are exactly those of one of our
+revisions) and write nothing.
 `migrate` only upgrades a *recorded, known* older revision; creating a
 database is `zfsbackup-config import`'s job alone. The writer engine
 cooperates by not switching such a file to WAL on connect (`db.py`).
@@ -129,6 +130,20 @@ from sqlalchemy.engine import Connection
 from zfsbackup.config.store.models import Base
 from zfsbackup.config.store.paths import ResolvedConfigPath, open_config_connection
 
+# Alembic's per-call INFO lines are silenced for `check_schema` only, by a
+# per-thread flag and one permanent filter on `alembic.runtime.migration`.
+# The filter is DEFINED in `_alembic_quiet.py`, not here, on purpose: a
+# filter defined in this module pinned this module's globals from the
+# process-lifetime logger, and through them every cached engine, so pooled
+# connections survived interpreter exit and a clean `import` left `-wal`/
+# `-shm` behind. See that module's docstring before moving it back.
+from zfsbackup.config.store._alembic_quiet import (  # noqa: F401 (re-exported)
+    QuietWhileChecking as _QuietWhileChecking,
+    quiet as _quiet,
+    quiet_alembic as _quiet_alembic,
+)
+
+
 # zfsbackup/config/store/migrations/, not alembic.ini's script_location -- this
 # path is fixed at install time and does not depend on `alembic.ini`
 # existing at all (see `_build_config`'s docstring).
@@ -139,8 +154,29 @@ _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 # B1) -- see the module docstring. They MUST be edited together with any new
 # revision file; `_assert_scripts_match_constants` (run first on every upgrade
 # path, and by the test suite) fails loudly if they drift.
-EXPECTED_HEAD = "a1c28e1b3f34"
-KNOWN_REVISIONS = frozenset({"a1c28e1b3f34"})
+EXPECTED_HEAD = "7c3e9d51b2a8"
+KNOWN_REVISIONS = frozenset({"a1c28e1b3f34", "7c3e9d51b2a8"})
+
+# The tables (`alembic_version` excluded) that a database AT each known
+# revision holds, newest first. Only used to diagnose a database whose stamp
+# was lost: with no recorded revision, a table set equal to one of these is
+# ours (`SchemaSplitBrain`, which offers recovery), anything else is
+# `NotAConfigDatabase`. The baseline entry matters because an interrupted
+# FIRST `ensure_schema` over a connection with pysqlite's implicit DDL
+# autocommit (anything not from `db.py`'s writer engine) leaves exactly the
+# baseline's six tables: their `CREATE TABLE`s autocommit, the baseline's
+# `alembic_version` INSERT opens a transaction, and every later revision's
+# DDL runs inside it and is rolled back with the stamp. Matching only the
+# head's set misreported that state as someone else's database. Add an entry
+# whenever a revision changes the table set (the head's is `Base.metadata`).
+_TABLES_AT_REVISION: Tuple[Tuple[str, frozenset], ...] = (
+    (EXPECTED_HEAD, frozenset(Base.metadata.tables)),
+    ("a1c28e1b3f34", frozenset({
+        "global_settings", "datasets", "destinations", "dataset_remotes",
+        "retention_rules", "remote_server",
+    })),
+)
+_OUR_TABLE_NAMES = frozenset().union(*(t for _, t in _TABLES_AT_REVISION))
 
 
 def _unknown_revisions(revisions) -> list:
@@ -359,6 +395,13 @@ class SchemaSplitBrain(SchemaError):
     tables are in fact already at head, or dropping/renaming the database
     and starting over if they are not), so this raises rather than
     guessing.
+
+    "This package's tables" means the exact table set of ANY known revision
+    (`_TABLES_AT_REVISION`), not only the head's. Since the second revision,
+    case 2 above interrupted on a fresh file leaves the BASELINE's six tables
+    (the later revision's DDL ran inside the stamp's transaction and was
+    rolled back with it); that state is ours too, and the message names the
+    revision to stamp before `zfsbackup-config migrate`.
     """
 
 
@@ -414,32 +457,55 @@ def _refuse_unrecorded_tables(connection: Connection) -> None:
     """With NO recorded revision, a database that already holds tables is not
     ours to migrate: raise instead of grafting the schema in (item 10.4).
 
-    - The tables are EXACTLY `Base.metadata`'s -> `SchemaSplitBrain` (our
-      tables, the stamp lost; the message says how to recover). Exactly, not
-      "a subset" (item 10.5): a foreign file whose only table is called
-      `datasets` must not be told to `alembic stamp head` a schema it does
-      not have.
-    - Anything else -- a strict subset of ours, alone or alongside foreign
-      tables -> `NotAConfigDatabase`.
+    - The tables are EXACTLY the set some known revision leaves
+      (`_TABLES_AT_REVISION`: the head's, or the baseline's six) ->
+      `SchemaSplitBrain` (our tables, the stamp lost; the message names the
+      revision they match and how to recover). Exactly, not "a subset"
+      (item 10.5): a foreign file whose only table is called `datasets` must
+      not be told to `alembic stamp` a schema it does not have.
+    - Anything else -- a set no revision leaves, alone or alongside foreign
+      tables -> `NotAConfigDatabase`. Its message lists the tables that are
+      NOT ours first: with eleven tables of ours, a sorted list truncated at
+      six could summarise the one foreign table away ("and N more").
     - No tables (empty or brand-new file) -> return; that is the legitimate
       state a first `import` migrates.
     """
     tables = _unrecorded_tables(connection)
     if not tables:
         return
-    if set(tables) == set(Base.metadata.tables.keys()):
+    found = set(tables)
+    matches = [rev for rev, names in _TABLES_AT_REVISION if found == names]
+    if matches:
+        revision = matches[0]
+        if revision == EXPECTED_HEAD:
+            what = "all of this package's tables already exist"
+            remedy = (
+                f"If the existing tables are already at revision "
+                f"{EXPECTED_HEAD!r}, fix this by stamping them (`alembic "
+                f"stamp head`)"
+            )
+        else:
+            what = (
+                f"its tables are exactly those of this package's older "
+                f"schema revision {revision!r} (typically a first import "
+                f"interrupted before it committed)"
+            )
+            remedy = (
+                f"If the existing tables are at revision {revision!r}, fix "
+                f"this by stamping them (`alembic stamp {revision}`) and then "
+                f"running `zfsbackup-config migrate` (head {EXPECTED_HEAD!r})"
+            )
         raise SchemaSplitBrain(
             f"{_db_label(connection)} has no recorded Alembic revision "
-            f"(alembic_version missing or empty) but all of this "
-            f"package's tables already exist. Refusing to attempt the "
-            f"initial migration, which would fail with 'table already "
-            f"exists'. If the existing tables are already at revision "
-            f"{EXPECTED_HEAD!r}, fix this by stamping them (`alembic stamp "
-            f"head`); otherwise restore the database from a backup or start "
-            f"over with a fresh file. Nothing was changed."
+            f"(alembic_version missing or empty) but {what}. Refusing to "
+            f"attempt the initial migration, which would fail with 'table "
+            f"already exists'. {remedy}; otherwise restore the database from "
+            f"a backup or start over with a fresh file. Nothing was changed."
         )
-    shown = ", ".join(tables[:6])
-    more = f" and {len(tables) - 6} more" if len(tables) > 6 else ""
+    foreign = sorted(t for t in tables if t not in _OUR_TABLE_NAMES)
+    listed = foreign + sorted(t for t in tables if t in _OUR_TABLE_NAMES)
+    shown = ", ".join(listed[:6])
+    more = f" and {len(listed) - 6} more" if len(listed) > 6 else ""
     raise NotAConfigDatabase(
         f"{_db_label(connection)} is an SQLite database but not a zfsbackup "
         f"config database (tables: {shown}{more}); nothing was changed. "
@@ -587,12 +653,14 @@ def check_schema(connection: Connection) -> str:
     Raises, in order:
 
     - `NotAConfigDatabase` if the database records no revision but holds
-      tables that are not (only) this package's -- someone else's SQLite
-      database. Nothing is written, here or by any caller that gets this far.
-    - `SchemaSplitBrain` if it records no revision but every table in it is
-      one of this package's -- `alembic_version` lost to an uncommitted
-      `ensure_schema` call, or the tables created some other way. See that
-      exception's docstring.
+      tables that are not exactly the set some known revision leaves --
+      someone else's SQLite database. Nothing is written, here or by any
+      caller that gets this far.
+    - `SchemaSplitBrain` if it records no revision and its tables are
+      exactly the set of a known revision (the head's, or the baseline's
+      six: `_TABLES_AT_REVISION`) -- `alembic_version` lost to an
+      uncommitted `ensure_schema` call, or the tables created some other
+      way. See that exception's docstring.
     - `SchemaVersionMismatch` if the database records a revision not in
       `KNOWN_REVISIONS` -- written by a *newer* zfsbackup package. See that
       exception's docstring.
@@ -606,7 +674,8 @@ def check_schema(connection: Connection) -> str:
     Returns `EXPECTED_HEAD` with no exception only when the database's
     recorded heads are exactly `{EXPECTED_HEAD}`.
     """
-    db_heads = MigrationContext.configure(connection).get_current_heads()
+    with _quiet_alembic():
+        db_heads = MigrationContext.configure(connection).get_current_heads()
     if not db_heads:
         _refuse_unrecorded_tables(connection)
 

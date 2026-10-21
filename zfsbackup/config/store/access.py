@@ -119,8 +119,10 @@ def check_config_schema(resolved: ResolvedConfigPath) -> str:
 def read_config(
     resolved: ResolvedConfigPath, *, warn_never_prune: bool = True
 ) -> ConfigSnapshot:
-    """Read the whole configuration, its generation, its store id and its
-    schema revision from one read snapshot. See this module's docstring.
+    """Read the whole configuration, its generation, its store id, its
+    schema revision and this host's client id (`ConfigSnapshot.client_id`,
+    `None` until one exists) from one read snapshot. See this module's
+    docstring.
 
     `warn_never_prune=False` suppresses `load_config`'s per-dataset "never be
     pruned" log lines: a caller that reads repeatedly (a reload) logs them

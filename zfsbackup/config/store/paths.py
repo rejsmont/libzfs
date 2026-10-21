@@ -216,7 +216,14 @@ from typing import Iterator, List, Literal, Mapping, Optional, Set, Tuple, Union
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
-from zfsbackup.config.store.db import get_engine, session_scope, url_for_path
+from zfsbackup.config.store.db import (
+    close_db_fd,
+    ephemeral_engine,
+    get_engine,
+    read_db_header,
+    session_scope,
+    url_for_path,
+)
 from zfsbackup.config.store.errors import ConfigBusy
 
 logger = logging.getLogger(__name__)
@@ -1483,8 +1490,12 @@ def check_config_db(
 
     header: Optional[bytes]
     try:
-        with open(real, "rb") as fh:
-            header = fh.read(100)
+        # NEVER a plain `open()`/`close()` here: closing any fd on config.db
+        # releases every POSIX lock this process holds on it, including the
+        # SHARED lock a live (pooled, or another thread's) WAL connection
+        # relies on -- measured to corrupt the database on SQLite 3.45. See
+        # `_liveconn`; `read_db_header` defers that close while one exists.
+        header = read_db_header(real, 100)
     except FileNotFoundError:
         # TOCTOU: existed for the os.stat() above, gone by the time this
         # opened it. Reported the same way an ordinary "missing" is.
@@ -1639,11 +1650,18 @@ def open_config_session(
     readonly: bool,
     require_writable: bool = True,
     allow_new: bool = False,
+    ephemeral: bool = False,
 ) -> Iterator[Session]:
     """`check_config_db(resolved)`, then a `Session` from `db.py`'s
     `session_scope(resolved.url(), readonly=readonly)`, scoped to this
     `with` block. The primary sanctioned entrypoint for item 8's
     `load_config`/`save_config` use of `mapper.py`.
+
+    `ephemeral=True` (TLS/mTLS plan M7, `store/trust.py`): the session runs
+    on a fresh, unpooled, uncached engine that is disposed when the block
+    exits (`db.ephemeral_engine`) instead of the pid-keyed cache. Safe to
+    use from any thread of a long-lived process; leaves no connection
+    behind. Same preflight, pragmas and `BEGIN IMMEDIATE` for writers.
 
     **Deliberately a context manager, not a function returning an
     `Engine`.** An earlier version of this module exposed
@@ -1677,7 +1695,9 @@ def open_config_session(
     default here in practice.
     """
     check_config_db(resolved, require_writable=require_writable, allow_new=allow_new)
-    with session_scope(resolved.url(), readonly=readonly) as session:
+    with session_scope(
+        resolved.url(), readonly=readonly, ephemeral=ephemeral
+    ) as session:
         yield session
 
 
@@ -1689,6 +1709,7 @@ def open_config_connection(
     foreign_keys: bool = True,
     require_writable: bool = True,
     allow_new: bool = False,
+    ephemeral: bool = False,
 ) -> Iterator[Connection]:
     """`check_config_db(resolved)`, then a raw `Connection` from
     `get_engine(resolved.url(), readonly=readonly, foreign_keys=
@@ -1713,8 +1734,18 @@ def open_config_connection(
     schema phase opens the connection that runs `ensure_schema` against a
     file `create_config_db_file` just created, which is exactly zero bytes
     until Alembic's first `CREATE TABLE`.
+
+    `ephemeral=True`: as for `open_config_session` -- a fresh, unpooled
+    engine for this block only (`db.ephemeral_engine`), never cached.
     """
     check_config_db(resolved, require_writable=require_writable, allow_new=allow_new)
+    if ephemeral:
+        with ephemeral_engine(
+            resolved.url(), readonly=readonly, foreign_keys=foreign_keys
+        ) as engine:
+            with engine.connect() as connection:
+                yield connection
+        return
     engine = get_engine(
         resolved.url(), readonly=readonly, foreign_keys=foreign_keys
     )
@@ -1843,7 +1874,10 @@ def create_config_db_file(path: Union[str, Path]) -> None:
         _unlink_if_same_file(fd, target)
         raise
     finally:
-        os.close(fd)
+        # An fd on the database itself: never a bare `os.close` (see
+        # `db.close_db_fd`). O_EXCL means no connection to this inode can
+        # predate it, but one opened meanwhile by another thread could.
+        close_db_fd(fd)
 
 
 def _unlink_if_same_file(fd: int, path: Path) -> None:

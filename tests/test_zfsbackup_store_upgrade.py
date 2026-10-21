@@ -49,12 +49,15 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
 import pytest
+from _hermetic import hermetic_env
+from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.pool import StaticPool
 
@@ -240,8 +243,10 @@ def synthetic_scripts(tmp_path, monkeypatch):
     return scripts
 
 
-def activate(monkeypatch, head=SYNTH, known=(EXPECTED_HEAD, SYNTH)):
-    """Patch `EXPECTED_HEAD` and `KNOWN_REVISIONS` together."""
+def activate(monkeypatch, head=SYNTH, known=(*sorted(KNOWN_REVISIONS), SYNTH)):
+    """Patch `EXPECTED_HEAD` and `KNOWN_REVISIONS` together. `known` is EVERY real
+    revision (the baseline and the TLS one, not only the head) plus the synthetic
+    one: `_assert_scripts_match_constants` compares it with the scripts on disk."""
     monkeypatch.setattr(migrate_module, "EXPECTED_HEAD", head)
     monkeypatch.setattr(migrate_module, "KNOWN_REVISIONS", frozenset(known))
 
@@ -862,7 +867,7 @@ CHILD = textwrap.dedent(
     import zfsbackup.config.store.migrate as M
     M._MIGRATIONS_DIR = Path({scripts!r})
     M.EXPECTED_HEAD = {synth!r}
-    M.KNOWN_REVISIONS = frozenset({{{head!r}, {synth!r}}})
+    M.KNOWN_REVISIONS = frozenset({{*{known!r}, {synth!r}}})
     from zfsbackup.config.store import resolve_config_path, upgrade_schema
 
     name, db, workdir = sys.argv[1], sys.argv[2], Path(sys.argv[3])
@@ -917,7 +922,7 @@ class TestUpgradeSchemaConcurrency:
         script.write_text(
             CHILD.format(
                 root=str(ROOT), scripts=str(synthetic_scripts),
-                synth=SYNTH, head=EXPECTED_HEAD,
+                synth=SYNTH, known=sorted(KNOWN_REVISIONS),
             )
         )
         env = dict(os.environ, PYTHONPATH=str(ROOT))
@@ -1543,18 +1548,77 @@ class TestForeignDatabaseRefusal:
         assert fingerprint(db_path) == before
 
     def test_ours_mixed_with_a_foreign_table_is_not_a_config_database(self, db_path, resolved):
-        make_foreign(db_path, "orders")
+        # The refusal lists the first six table names in SORTED order and
+        # summarises the rest ("and N more"). The schema now has eleven tables
+        # of ours (M5), so a foreign table named `orders` would sort past the
+        # sixth and be hidden; `aa_orders` sorts first and keeps this test
+        # about "the foreign table is named". The truncation itself is pinned
+        # by `test_the_refusal_lists_six_sorted_names_and_counts_the_rest`.
+        make_foreign(db_path, "aa_orders")
         create_our_tables(db_path)
         before = fingerprint(db_path)
         with open_config_connection(resolved, readonly=True) as conn:
             with pytest.raises(NotAConfigDatabase) as excinfo:
                 check_schema(conn)
-        assert "orders" in str(excinfo.value)
+        assert "aa_orders" in str(excinfo.value)
+        assert f"and {len(Base.metadata.tables) + 1 - 6} more" in str(excinfo.value)
         for call in (upgrade_schema, lambda r: import_yaml(EXAMPLE_YAML, r)):
             with pytest.raises(NotAConfigDatabase):
                 call(resolved)
         dispose_all()
         assert fingerprint(db_path) == before
+
+    def test_the_refusal_lists_foreign_tables_first_then_ours_and_counts_the_rest(
+        self, db_path, resolved
+    ):
+        # Foreign tables first, then ours, each group sorted, six shown. A
+        # foreign name that sorts LAST overall (`zz_orders`) is therefore
+        # still named: it used to be summarised away into "and N more".
+        make_foreign(db_path, "zz_orders")
+        create_our_tables(db_path)
+        ours = sorted(Base.metadata.tables)
+        listed = ["zz_orders", *ours]
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(NotAConfigDatabase) as excinfo:
+                check_schema(conn)
+        message = str(excinfo.value)
+        assert f"(tables: {', '.join(listed[:6])} and {len(listed) - 6} more)" in message
+        assert "(tables: zz_orders, " in message
+        assert ours[5] not in message.split("(tables:")[1].split(")")[0]  # ours truncated first
+
+    def test_every_foreign_table_is_listed_before_any_of_ours_each_group_sorted(
+        self, db_path, resolved
+    ):
+        foreign = ["zz_b", "aa_a", "mm_c"]
+        make_foreign(db_path, *foreign)
+        create_our_tables(db_path)
+        ours = sorted(Base.metadata.tables)
+        listed = sorted(foreign) + ours
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(NotAConfigDatabase) as excinfo:
+                check_schema(conn)
+        assert (
+            f"(tables: {', '.join(listed[:6])} and {len(listed) - 6} more)"
+            in str(excinfo.value)
+        )
+
+    def test_more_than_six_foreign_tables_are_truncated_at_six_without_ours(
+        self, db_path, resolved
+    ):
+        foreign = [f"t{i}" for i in range(8)]
+        make_foreign(db_path, *foreign)
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(NotAConfigDatabase) as excinfo:
+                check_schema(conn)
+        assert "(tables: t0, t1, t2, t3, t4, t5 and 2 more)" in str(excinfo.value)
+
+    def test_a_short_listing_has_no_more_suffix(self, db_path, resolved):
+        make_foreign(db_path, "b_t", "a_t")
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(NotAConfigDatabase) as excinfo:
+                check_schema(conn)
+        assert "(tables: a_t, b_t)" in str(excinfo.value)
+        assert "more" not in str(excinfo.value)
 
     def test_only_our_tables_and_no_revision_is_split_brain_not_foreign(self, db_path, resolved):
         """Kept deliberately: nothing of someone else's is at stake, and the
@@ -1571,6 +1635,17 @@ class TestForeignDatabaseRefusal:
             import_yaml(EXAMPLE_YAML, resolved)
         dispose_all()
         assert fingerprint(db_path) == before
+
+    def test_the_head_set_split_brain_message_says_to_stamp_head(self, db_path, resolved):
+        db_path.write_bytes(b"")
+        create_our_tables(db_path)
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(SchemaSplitBrain) as excinfo:
+                check_schema(conn)
+        message = str(excinfo.value)
+        assert "all of this package's tables already exist" in message
+        assert f"`alembic stamp head`" in message
+        assert "alembic stamp a1c28e1b3f34" not in message
 
     def test_an_empty_alembic_version_table_does_not_count_as_a_table_of_ours_or_theirs(
         self, db_path, resolved
@@ -1838,7 +1913,8 @@ class TestReimportWithoutExpungeAll:
         snapshot_prefix: dest
         destinations:
           offsite:
-            url: http://backup.example:8080
+            url: https://backup.example:8080
+            server_fingerprint: "abababababababababababababababababababababababababababababababab"
         datasets:
           - name: tank/a
             frequency: 1h
@@ -2266,3 +2342,418 @@ class TestForeignDatabaseIgnoresUserVersion:
         dispose_all()
         assert fingerprint(db_path) == before
         assert raw_user_version(db_path) == 424242
+
+
+BASELINE_REVISION = "a1c28e1b3f34"
+BASELINE_TABLES = frozenset({
+    "global_settings", "datasets", "destinations", "dataset_remotes",
+    "retention_rules", "remote_server",
+})
+
+
+def make_interrupted_first_ensure_schema(db: Path) -> None:
+    """The real way to get the baseline's six tables and no stamp: a FIRST
+    `ensure_schema` on a plain pysqlite connection (implicit DDL autocommit,
+    so not `db.py`'s writer engine) that is rolled back. The baseline's
+    `CREATE TABLE`s autocommit; its stamp INSERT and the later revision's DDL
+    share the transaction the rollback discards."""
+    db.write_bytes(b"")
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        with engine.connect() as conn:
+            ensure_schema(conn)
+            conn.rollback()
+    finally:
+        engine.dispose()
+
+
+class TestBaselineOnlyTableSetIsSplitBrain:
+    """Item 4 of the review fixes: the table set of ANY known revision, with no
+    revision recorded, is ours (`SchemaSplitBrain`, with the revision to
+    stamp), matched EXACTLY."""
+
+    @pytest.fixture
+    def interrupted(self, db_path):
+        make_interrupted_first_ensure_schema(db_path)
+        names = {r[0] for r in sqlite3.connect(str(db_path)).execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        # Guard the fixture itself: the state is exactly what the issue describes.
+        assert names == BASELINE_TABLES | {"alembic_version"}
+        return db_path
+
+    def test_the_known_table_sets_are_pinned(self):
+        sets = dict(migrate_module._TABLES_AT_REVISION)
+        assert sets[EXPECTED_HEAD] == frozenset(Base.metadata.tables)
+        assert sets[BASELINE_REVISION] == BASELINE_TABLES
+        assert set(sets) == KNOWN_REVISIONS
+
+    def test_check_schema_raises_split_brain_with_the_stamp_wording(self, interrupted, resolved):
+        before = fingerprint(interrupted)
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(SchemaSplitBrain) as excinfo:
+                check_schema(conn)
+        dispose_all()
+        message = str(excinfo.value)
+        assert not isinstance(excinfo.value, NotAConfigDatabase)
+        assert "`alembic stamp a1c28e1b3f34`" in message
+        assert "`zfsbackup-config migrate`" in message
+        assert message.index("alembic stamp a1c28e1b3f34") < message.index("zfsbackup-config migrate")
+        assert f"head {EXPECTED_HEAD!r}" in message
+        assert "older schema revision 'a1c28e1b3f34'" in message
+        assert "Nothing was changed" in message
+        assert "`alembic stamp head`" not in message
+        assert fingerprint(interrupted) == before
+
+    def test_every_write_path_refuses_it_and_changes_nothing(self, interrupted, resolved):
+        before = fingerprint(interrupted)
+        with pytest.raises(SchemaSplitBrain):
+            upgrade_schema(resolved)
+        with pytest.raises(SchemaSplitBrain):
+            import_yaml(EXAMPLE_YAML, resolved)
+        dispose_all()
+        assert fingerprint(interrupted) == before
+
+    def test_stamping_the_baseline_then_migrating_recovers(self, interrupted, resolved):
+        conn = sqlite3.connect(str(interrupted))
+        conn.execute("INSERT INTO alembic_version (version_num) VALUES (?)", (BASELINE_REVISION,))
+        conn.commit()
+        conn.close()
+        result = upgrade_schema(resolved)
+        dispose_all()
+        assert result.from_revs == (BASELINE_REVISION,)
+        assert result.to_rev == EXPECTED_HEAD and result.changed
+        with open_config_connection(resolved, readonly=True) as c:
+            assert check_schema(c) == EXPECTED_HEAD
+
+    def test_the_baseline_set_plus_a_foreign_table_is_not_ours(self, interrupted, resolved):
+        conn = sqlite3.connect(str(interrupted))
+        conn.execute("CREATE TABLE orders (id INTEGER)")
+        conn.commit()
+        conn.close()
+        with open_config_connection(resolved, readonly=True) as c:
+            with pytest.raises(NotAConfigDatabase) as excinfo:
+                check_schema(c)
+        # The foreign table is the first name listed, never summarised away.
+        assert "(tables: orders, " in str(excinfo.value)
+
+    def test_a_strict_subset_of_the_baseline_is_not_ours(self, interrupted, resolved):
+        conn = sqlite3.connect(str(interrupted))
+        conn.execute("DROP TABLE remote_server")
+        conn.commit()
+        conn.close()
+        with open_config_connection(resolved, readonly=True) as c:
+            with pytest.raises(NotAConfigDatabase):
+                check_schema(c)
+
+    def test_a_set_between_the_baseline_and_the_head_is_not_ours(self, db_path, resolved):
+        # Baseline plus ONE of the new tables: neither revision's set.
+        create_our_tables(db_path)
+        conn = sqlite3.connect(str(db_path))
+        for table in ("host_identity", "trusted_clients", "enrollment_token", "trust_state"):
+            conn.execute(f"DROP TABLE {table}")
+        conn.execute("DROP TABLE clients")
+        conn.execute("CREATE TABLE clients (client_id TEXT)")
+        conn.commit()
+        conn.close()
+        with open_config_connection(resolved, readonly=True) as c:
+            with pytest.raises(NotAConfigDatabase):
+                check_schema(c)
+
+    def test_a_lone_foreign_table_named_datasets_is_still_foreign(self, db_path, resolved):
+        make_foreign(db_path, "datasets")
+        with open_config_connection(resolved, readonly=True) as c:
+            with pytest.raises(NotAConfigDatabase) as excinfo:
+                check_schema(c)
+        assert "alembic stamp" not in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# `check_schema` is quiet; `migrate` is not
+# ---------------------------------------------------------------------------
+
+ALEMBIC_LOGGER = "alembic.runtime.migration"
+
+
+def alembic_records(caplog):
+    return [r for r in caplog.records if r.name == ALEMBIC_LOGGER]
+
+
+class TestAlembicIsQuietWhileChecking:
+    """`MigrationContext.configure` logs INFO lines on every call, and `check_schema` runs on
+    every trust read (the API worker polls from several threads), which flooded the daemon log.
+    They are dropped for the calling thread inside `check_schema` only: `ensure_schema` and
+    `upgrade_schema` keep theirs, and another thread's records are never swallowed."""
+
+    @pytest.fixture
+    def at_head(self, imported, resolved):
+        return resolved
+
+    @pytest.fixture
+    def info(self, caplog):
+        with caplog.at_level(logging.INFO, logger=ALEMBIC_LOGGER):
+            caplog.clear()
+            yield caplog
+
+    def test_the_control_alembic_does_log_at_info_here(self, info, at_head):
+        """If this fails the tests below pass vacuously."""
+        with open_config_connection(at_head, readonly=True) as conn:
+            MigrationContext.configure(conn)
+        assert alembic_records(info), "alembic logged nothing: the quiet tests prove nothing"
+
+    def test_check_schema_emits_no_alembic_record(self, info, at_head):
+        for _ in range(3):
+            with open_config_connection(at_head, readonly=True) as conn:
+                assert check_schema(conn) == EXPECTED_HEAD
+        assert alembic_records(info) == []
+
+    def test_check_schema_is_quiet_when_it_raises_too(self, info, db_path, resolved):
+        make_foreign(db_path)
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(NotAConfigDatabase):
+                check_schema(conn)
+        assert alembic_records(info) == []
+
+    def test_read_trust_key_emits_no_alembic_record(self, info, at_head):
+        from zfsbackup.config.store.trust import read_trust_key
+
+        for _ in range(3):
+            read_trust_key(at_head)
+        assert alembic_records(info) == []
+
+    def test_token_precheck_emits_no_alembic_record(self, info, at_head):
+        from zfsbackup.config.store.trust import token_precheck
+
+        for _ in range(3):
+            token_precheck(at_head, secret_sha256="a" * 64, server_fingerprint="b" * 64, now=1.0)
+        assert alembic_records(info) == []
+
+    def test_ensure_schema_still_logs(self, info, db_path, resolved):
+        valid_empty_sqlite_file(db_path)
+        with open_config_connection(resolved, readonly=False, foreign_keys=False) as conn:
+            trans = conn.begin()
+            ensure_schema(conn)
+            trans.commit()
+        dispose_all()
+        assert alembic_records(info)
+
+    def test_upgrade_schema_still_logs(self, info, at_head):
+        upgrade_schema(at_head)
+        dispose_all()
+        assert alembic_records(info)
+
+    def test_the_depth_counter_is_balanced_after_an_exception(self, info, db_path, resolved):
+        make_foreign(db_path)
+        with open_config_connection(resolved, readonly=True) as conn:
+            with pytest.raises(NotAConfigDatabase):
+                check_schema(conn)
+        assert getattr(migrate_module._quiet, "depth", 0) == 0
+        # ... so this thread's own later records are NOT suppressed.
+        logging.getLogger(ALEMBIC_LOGGER).info("after the check")
+        assert [r.getMessage() for r in alembic_records(info)] == ["after the check"]
+
+    def test_the_quiet_block_is_reentrant(self, info):
+        logger = logging.getLogger(ALEMBIC_LOGGER)
+        with migrate_module._quiet_alembic():
+            with migrate_module._quiet_alembic():
+                logger.info("inner")
+            logger.info("outer")
+        logger.info("after")
+        assert [r.getMessage() for r in alembic_records(info)] == ["after"]
+
+    def test_another_threads_records_still_come_through_while_one_is_inside_check_schema(
+        self, info, at_head, monkeypatch
+    ):
+        inside, release = threading.Event(), threading.Event()
+        real_configure = MigrationContext.configure
+
+        def slow_configure(*args, **kwargs):
+            if threading.current_thread().name == "thread-a":
+                inside.set()
+                assert release.wait(30)
+            return real_configure(*args, **kwargs)
+
+        monkeypatch.setattr(
+            migrate_module, "MigrationContext", mock.Mock(configure=slow_configure))
+        errors = []
+
+        def thread_a():
+            try:
+                with open_config_connection(at_head, readonly=True) as conn:
+                    check_schema(conn)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        a = threading.Thread(target=thread_a, name="thread-a")
+        a.start()
+        try:
+            assert inside.wait(30), "thread A never reached check_schema"
+            # A is now inside the quiet block. B (this thread) logs and must be heard.
+            logging.getLogger(ALEMBIC_LOGGER).info("from thread B")
+            with open_config_connection(at_head, readonly=True) as conn:
+                real_configure(conn)                      # alembic's own record, from B
+            heard = [r for r in alembic_records(info) if r.threadName != "thread-a"]
+            assert "from thread B" in [r.getMessage() for r in heard]
+            assert len(heard) >= 2
+        finally:
+            release.set()
+            a.join(30)
+        assert errors == [] and not a.is_alive()
+        # ... and A's own records were dropped.
+        assert [r for r in alembic_records(info) if r.threadName == "thread-a"] == []
+
+    def test_the_logger_level_is_untouched_by_concurrent_checks(self, at_head):
+        logger = logging.getLogger(ALEMBIC_LOGGER)
+        before = (logger.level, logger.disabled, logger.propagate, list(logger.filters))
+        errors = []
+
+        def worker():
+            try:
+                for _ in range(20):
+                    with open_config_connection(at_head, readonly=True) as conn:
+                        check_schema(conn)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        assert errors == [] and not any(t.is_alive() for t in threads)
+        assert (logger.level, logger.disabled, logger.propagate, list(logger.filters)) == before
+        assert getattr(migrate_module._quiet, "depth", 0) == 0
+
+    RELOAD_SCRIPT = textwrap.dedent('''
+        import importlib, logging, sys
+        from zfsbackup.config.store import migrate
+        logger = logging.getLogger("alembic.runtime.migration")
+
+        def ours():
+            return [f for f in logger.filters if type(f).__name__ == "_QuietWhileChecking"]
+
+        reloads = int(sys.argv[1])
+        assert len(ours()) == 1, ("before any reload", ours())
+        for n in range(reloads):
+            importlib.reload(migrate)
+            assert len(ours()) == 1, ("after reload", n + 1, ours())
+        assert isinstance(ours()[0], migrate._QuietWhileChecking)
+        print("ok")
+    ''')
+
+    def run_reload_script(self, tmp_path, reloads):
+        # Reloaded in a CHILD interpreter: reloading `migrate` in this process would rebind
+        # `SchemaError` & co. and break every `except`/`isinstance` elsewhere in the suite.
+        script = tmp_path / "reload_check.py"
+        script.write_text(self.RELOAD_SCRIPT)
+        return subprocess.run(
+            [sys.executable, str(script), str(reloads)], cwd=ROOT, text=True,
+            capture_output=True, timeout=120, env=dict(os.environ, PYTHONPATH=str(ROOT)),
+        )
+
+    def test_the_filter_is_installed_exactly_once_on_a_plain_import(self, tmp_path):
+        result = self.run_reload_script(tmp_path, 0)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "ok"
+
+    def test_the_filter_is_installed_exactly_once_after_a_reload(self, tmp_path):
+        result = self.run_reload_script(tmp_path, 1)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "ok"
+
+    def test_the_filter_stays_single_over_repeated_reloads(self, tmp_path):
+        """The marker attribute (not an `isinstance` against the freshly rebound class) is what
+        finds the previous module's filter, so N reloads still leave exactly one."""
+        result = self.run_reload_script(tmp_path, 4)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "ok"
+
+
+class TestTheQuietFilterPinsNoEngine:
+    """The Alembic quiet filter is installed on a logger that lives as long as the interpreter,
+    and a filter instance keeps its class's methods, hence the DEFINING module's globals,
+    alive. Defined in `migrate.py` those globals reached `paths` -> `db._ENGINES` -> the pooled
+    SQLite connections, which then outlived interpreter finalization: a process that exited
+    without `dispose_all()` never ran `sqlite3_close` and left `-wal`/`-shm` behind (which the
+    failed-first-import cleanup reads as "another process has this database open"). The filter
+    lives in `_alembic_quiet.py`, which imports nothing from the store."""
+
+    EXIT_SCRIPT = textwrap.dedent('''
+        import sys
+        from zfsbackup.config.store import import_yaml, resolve_config_path
+        resolved = resolve_config_path(sys.argv[2])
+        import_yaml(sys.argv[1], resolved)
+        if sys.argv[3] == "checked":
+            # Installs nothing new, but USES the quiet filter on every record the check logs.
+            from zfsbackup.config.store.migrate import check_schema
+            from zfsbackup.config.store.paths import open_config_connection
+            with open_config_connection(resolved, readonly=True) as conn:
+                check_schema(conn)
+        # Falls off the end: no dispose_all(), no engine.dispose(), no os._exit().
+        print("done")
+    ''')
+
+    # Also pins `_liveconn`'s "no `__del__`" rule (TrackedConnection must not finalise pooled connections).
+    @pytest.mark.parametrize("mode", ["imported_only", "checked"])
+    def test_a_process_that_exits_without_dispose_all_leaves_no_sidecars(self, tmp_path, mode):
+        yaml_path = tmp_path / "in.yaml"
+        yaml_path.write_text(NEW_YAML)
+        db = tmp_path / "store" / "config.db"
+        script = tmp_path / "exit_check.py"
+        script.write_text(self.EXIT_SCRIPT)
+        result = subprocess.run(
+            [sys.executable, str(script), str(yaml_path), str(db), mode], cwd=ROOT, text=True,
+            capture_output=True, timeout=120, env=hermetic_env(PYTHONPATH=str(ROOT)),
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "done"
+        assert db.exists()
+        left = sorted(f.name for f in db.parent.iterdir())
+        assert not [n for n in left if n.endswith(("-wal", "-shm", "-journal"))], left
+        # The row really was committed to the main file (nothing is waiting in a WAL).
+        conn = sqlite3.connect(str(db))
+        try:
+            assert conn.execute("SELECT count(*) FROM datasets").fetchone() == (1,)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def installed_filters():
+        from zfsbackup.config.store import _alembic_quiet
+
+        return _alembic_quiet, [
+            f for f in logging.getLogger("alembic.runtime.migration").filters
+            if getattr(f, _alembic_quiet.QUIET_FILTER_MARKER, False) is True]
+
+    def test_the_installed_filter_is_defined_in_the_leaf_module(self):
+        quiet_module, filters = self.installed_filters()
+        assert len(filters) == 1
+        (installed,) = filters
+        assert type(installed).__name__ == "_QuietWhileChecking"
+        assert type(installed).filter.__globals__ is quiet_module.__dict__
+        assert type(installed).__module__ == quiet_module.__name__
+        # migrate re-exports the names callers and tests use; they are the same objects
+        assert migrate_module._QuietWhileChecking is quiet_module.QuietWhileChecking
+        assert migrate_module._quiet is quiet_module.quiet
+        assert migrate_module._quiet_alembic is quiet_module.quiet_alembic
+
+    def test_the_filters_globals_reach_no_store_module_and_no_engine(self):
+        import types
+
+        from zfsbackup.config.store import db as store_db
+        from sqlalchemy.engine import Connection, Engine
+
+        quiet_module, (installed,) = self.installed_filters()
+        namespace = type(installed).filter.__globals__
+        assert namespace is quiet_module.__dict__
+        # The pin the bug made: store modules (and so `db._ENGINES`) in the filter's globals.
+        modules = {k: v.__name__ for k, v in namespace.items() if isinstance(v, types.ModuleType)}
+        assert not [n for n in modules.values() if n.startswith("zfsbackup")], modules
+        assert "_ENGINES" not in namespace and "get_engine" not in namespace
+        for name, value in namespace.items():
+            assert not isinstance(value, (Engine, Connection)), name
+            assert value is not store_db._ENGINES, name
+            owner = getattr(value, "__module__", None) or ""
+            assert not owner.startswith("zfsbackup") or owner == quiet_module.__name__, (name, value)
+        # nor does the instance itself hold anything but its own (empty) state
+        assert not [k for k, v in vars(installed).items() if isinstance(v, (Engine, Connection))]
+

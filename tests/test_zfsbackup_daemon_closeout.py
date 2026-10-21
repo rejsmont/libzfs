@@ -34,6 +34,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from _hermetic import hermetic_env
+from _tls_support import make_gateway
 from test_zfsbackup_daemon import _args, _stub_daemon, no_hard_exit  # noqa: F401
 from test_zfsbackup_daemonlock import real_daemon_env, spawn_daemon  # noqa: F401  (fixtures)
 from zfsbackup import daemon as daemon_module
@@ -687,12 +688,22 @@ class TestWorkersExitWithTheSupervisor:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def gateway(tmp_path):
+    """A real `TrustGateway` over a generated server identity and an empty
+    scripted trust (`_bind_api_server` needs one: the API is HTTPS only)."""
+    gw, _, _ = make_gateway(tmp_path / "gw.tls")
+    return gw
+
+
 class TestApiWorkerFailures:
     @pytest.fixture
-    def api(self, mocker):
+    def api(self, mocker, tls_config_db):
+        """A real `ApiWorker` (server identity on disk, `config_db=` given: it
+        exits 1 without them) with `create_app` and the bind mocked."""
         mocker.patch("zfsbackup.api.create_app", return_value=MagicMock())
         stop = multiprocessing.Event()
-        return ApiWorker(make_config(), stop), stop
+        return ApiWorker(make_config(), stop, config_db=tls_config_db), stop
 
     def test_a_bind_failure_exits_one_and_never_says_listening(self, api, mocker, caplog):
         worker, stop = api
@@ -721,8 +732,9 @@ class TestApiWorkerFailures:
         mocker.patch("zfsbackup.workers.threading.Thread", return_value=MagicMock())
         stop.set()
         worker.run()
-        app, host, port = bind.call_args.args
+        app, host, port, gate = bind.call_args.args
         assert (host, port) == (worker.config.api_host, worker.config.api_port)
+        assert gate is worker._trust                    # the connections' TLS contexts come from it
 
     def test_a_dead_server_thread_exits_one(self, api, mocker, caplog):
         worker, stop = api
@@ -747,7 +759,7 @@ class TestApiWorkerFailures:
         stop.set()
         with caplog.at_level(logging.INFO):
             worker.run()
-        assert order == ["bind", "thread"]
+        assert order[:2] == ["bind", "thread"]      # (a later helper thread may follow)
         assert caplog.text.index("API listening") > 0
 
     def test_a_stop_ends_a_healthy_worker_cleanly(self, api, mocker, caplog):
@@ -764,10 +776,10 @@ class TestApiWorkerFailures:
             timer.cancel()
         assert "API listening" in caplog.text and "API worker stopped" in caplog.text
 
-    def test_a_gone_supervisor_ends_it(self, monkeypatch, mocker, caplog):
+    def test_a_gone_supervisor_ends_it(self, monkeypatch, mocker, caplog, tls_config_db):
         mocker.patch("zfsbackup.api.create_app", return_value=MagicMock())
         world = Parent(monkeypatch)
-        worker = ApiWorker(make_config(), multiprocessing.Event())
+        worker = ApiWorker(make_config(), multiprocessing.Event(), config_db=tls_config_db)
         worker.supervisor_pid = SUPERVISOR
         worker.supervisor_start = None             # no token: identity falls back to _pid_exists
         monkeypatch.setattr(workers.multiprocessing, "get_start_method", lambda allow_none=False: "spawn")
@@ -785,27 +797,27 @@ class TestApiWorkerFailures:
 
 
 class TestBindApiServer:
-    def test_it_binds_in_the_callers_thread(self):
-        server = workers._bind_api_server(MagicMock(), "127.0.0.1", 0)
+    def test_it_binds_in_the_callers_thread(self, gateway):
+        server = workers._bind_api_server(MagicMock(), "127.0.0.1", 0, gateway)
         try:
             assert server.server_port > 0                 # already listening: nothing deferred to a thread
         finally:
             server.server_close()
 
-    def test_an_occupied_port_fails_to_bind(self, capsys):
-        first = workers._bind_api_server(MagicMock(), "127.0.0.1", 0)
+    def test_an_occupied_port_fails_to_bind(self, capsys, gateway):
+        first = workers._bind_api_server(MagicMock(), "127.0.0.1", 0, gateway)
         try:
             # werkzeug turns EADDRINUSE into print + sys.exit(1) rather than an OSError
             with pytest.raises((OSError, SystemExit)) as info:
-                workers._bind_api_server(MagicMock(), "127.0.0.1", first.server_port)
+                workers._bind_api_server(MagicMock(), "127.0.0.1", first.server_port, gateway)
             if info.type is SystemExit:
                 assert info.value.code == 1
         finally:
             first.server_close()
 
-    def test_an_unusable_address_fails_to_bind(self):
+    def test_an_unusable_address_fails_to_bind(self, gateway):
         with pytest.raises((OSError, SystemExit)) as info:
-            workers._bind_api_server(MagicMock(), "203.0.113.77", 0)    # TEST-NET-3: not ours
+            workers._bind_api_server(MagicMock(), "203.0.113.77", 0, gateway)    # TEST-NET-3: not ours
         if info.type is SystemExit:
             assert info.value.code == 1
 
@@ -892,15 +904,17 @@ class TestApiWorkerWithARealOccupiedPort:
     """The worker's observable contract when it cannot listen: it exits with
     status 1 (so the supervisor's backoff applies) and never claims to listen."""
 
-    def test_it_exits_one_and_never_says_listening(self, mocker, caplog, capsys):
+    def test_it_exits_one_and_never_says_listening(
+        self, mocker, caplog, capsys, tls_config_db, gateway
+    ):
         mocker.patch("zfsbackup.api.create_app", return_value=MagicMock())
-        blocker = workers._bind_api_server(MagicMock(), "127.0.0.1", 0)
+        blocker = workers._bind_api_server(MagicMock(), "127.0.0.1", 0, gateway)
         try:
             config = BackupConfig(
                 datasets=[DatasetConfig(name="pool/data")], api_host="127.0.0.1",
                 api_port=blocker.server_port,
             )
-            worker = ApiWorker(config, multiprocessing.Event())
+            worker = ApiWorker(config, multiprocessing.Event(), config_db=tls_config_db)
             with caplog.at_level(logging.INFO), pytest.raises(SystemExit) as info:
                 worker.run()
             assert info.value.code == 1

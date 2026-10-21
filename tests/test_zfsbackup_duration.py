@@ -600,7 +600,7 @@ class TestConfigProducesDurationsWithLiterals:
             "        frequency: 30d\n"
             "destinations:\n"
             "  offsite:\n"
-            "    url: http://backup.example.com\n"
+            "    url: https://backup.example.com\n"
         )
         return BackupConfig.from_file(f)
 
@@ -739,46 +739,3 @@ class TestBackupConfigDurationDefaults:
         cfg = BackupConfig(datasets=[DatasetConfig(name="pool/data")])
         assert cfg.prune_interval is None
         assert cfg.effective_prune_interval is cfg.check_interval
-
-
-class TestEffectiveClientIdFile:
-    """`effective_client_id_file` derives from `Path.home()` and must be
-    recomputed on every call, never memoized on the instance -- the whole
-    point is that `$HOME` is resolved in whichever process calls this
-    property (e.g. a forked worker), not frozen at config-load time in a
-    possibly different process (e.g. under `sudo` at import time). A wrong
-    `$HOME` here would silently generate a brand-new client identity and
-    orphan the entire server-side dataset tree for the previous one.
-    """
-
-    def test_default_derives_from_home(self, monkeypatch, tmp_path):
-        home = tmp_path / "home1"
-        monkeypatch.setattr("pathlib.Path.home", lambda: home)
-        cfg = BackupConfig(datasets=[DatasetConfig(name="pool/data")])
-        assert cfg.client_id_file is None
-        assert cfg.effective_client_id_file == home / ".config" / "zfsbackup" / "client_id"
-
-    def test_not_cached_across_calls_on_same_instance(self, monkeypatch, tmp_path):
-        cfg = BackupConfig(datasets=[DatasetConfig(name="pool/data")])
-        assert cfg.client_id_file is None
-
-        home1 = tmp_path / "home1"
-        monkeypatch.setattr("pathlib.Path.home", lambda: home1)
-        first = cfg.effective_client_id_file
-        assert first == home1 / ".config" / "zfsbackup" / "client_id"
-
-        home2 = tmp_path / "home2"
-        monkeypatch.setattr("pathlib.Path.home", lambda: home2)
-        second = cfg.effective_client_id_file
-        assert second == home2 / ".config" / "zfsbackup" / "client_id"
-        assert first != second
-
-    def test_explicit_value_is_returned_unchanged_regardless_of_home(
-        self, monkeypatch, tmp_path
-    ):
-        explicit = tmp_path / "explicit_id"
-        cfg = BackupConfig(
-            datasets=[DatasetConfig(name="pool/data")], client_id_file=explicit
-        )
-        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "unused_home")
-        assert cfg.effective_client_id_file == explicit

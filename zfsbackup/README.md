@@ -164,6 +164,143 @@ old anchor until the first send to the new name has succeeded, then clear it wit
 commands the CLI prints. The running daemon reloads after a rename like after any other change. Both
 renames support `--dry-run`.
 
+## TLS and enrollment
+
+Remote backup is HTTPS only, with mutual authentication. Both sides pin each other's certificate by its
+SHA-256 fingerprint; there is no certificate authority, no host name check and no plaintext mode. The
+server accepts TLS 1.3 only, and every endpoint except `/health` and `/enroll` requires a client
+certificate the server has pinned. A client is known to the server by its **client id**, and the server
+binds the id to the fingerprints of the certificates enrolled for it; it never takes the id from a
+request. A request for another id's datasets is refused with 403.
+
+**Where the identities live.** `<db>.tls/` (next to the config database; mode 0750, the database file's
+group) holds `server.crt`/`server.key`, `client.crt`/`client.key`, a pending `client.next.crt`/
+`client.next.key` during a rotation or `enroll --new-key`, and `identity.lock`. Keys are mode 0600 and
+never stored in the database; certificates are 0640. The certificates are generated (ECDSA P-256, valid ten
+years). Run `enroll`, `identity rotate` and `trust token create` as root, or as the user that owns the
+directory, and run the daemon as the same user so it can read the keys. A group operator cannot read a
+key. Back up `<db>.tls/` with the database: replacing the database file keeps the TLS identity but loses
+the pins **and the client id**, so servers would see a new client and do a full send (restore the id with
+`identity set-client-id` before enrolling again).
+
+### Server: create a token
+
+The server needs `remote_backup` enabled (with its `target_dataset`) and an `api_host` its clients can
+reach. The daemon creates the server identity at startup if there is none; `trust token create` creates it
+too, so you can enroll a client before the first start. `--dry-run` creates no TLS files: the API serves
+with a throwaway identity that no client can pin.
+
+```bash
+zfsbackup-config trust token create                 # prints a token on stdout
+zfsbackup-config trust token create --ttl 30m       # default 1h, at most 7d
+```
+
+The token is single use, contains the server's certificate fingerprint (which is how the client learns
+what to pin) and is shown only once; only its hash is stored. A new token replaces the previous one.
+`trust token show` reports its state (never the secret) and `trust token revoke` deletes it. Hand the token
+to the client's operator over a channel you trust: until it is used or expires, whoever holds it can
+enroll one client.
+
+### Client: enroll
+
+On the client host, write the token to a file readable only by root, enroll, and delete the file:
+
+```bash
+umask 077; printf '%s\n' 'zfsb1.…' > /root/offsite.token
+zfsbackup-config enroll offsite --url https://backup.example.com:8080 --token-file /root/offsite.token
+rm /root/offsite.token
+```
+
+`--token -` reads the token from stdin and a hidden prompt is the fallback; it is never accepted on the
+command line. `--url` is required for a new destination and must be `https://`; a destination URL with `http://`, port 0 or an empty port is refused when the configuration is validated (on `import` as well). `enroll`
+generates this host's client id and client certificate if it has none, connects with the server
+fingerprint from the token pinned (a different server presents a different fingerprint and the token is
+never sent), proves possession of the client key, and stores the destination's `url` and
+`server_fingerprint` in the configuration. Running it again for an enrolled destination is safe: the
+server is asked first and the token is not used. A destination without a `server_fingerprint` is not
+enrolled and is skipped.
+
+If the server answers `409 client_id_taken` (it already knows this id, or already holds a dataset for it),
+the token is not spent: ask the server's operator for one made with `trust token create --client-id ID`
+(see below).
+
+### Verify
+
+```bash
+zfsbackup-config identity show          # client: the id, fingerprints, expiry; and the server certificate
+zfsbackup-config list destinations      # the ENROLLED column; "not enrolled" until enroll succeeds
+zfsbackup-config trust list             # on the server: client ids, label, active/revoked, fingerprints
+```
+
+`identity show` is read-only and generates nothing. Compare the client fingerprint on both sides.
+
+### Revocation
+
+```bash
+zfsbackup-config trust revoke FINGERPRINT   # one certificate; a unique prefix of 8+ hex characters works
+zfsbackup-config trust revoke --client ID   # every certificate of that client id
+```
+
+- **Permanent.** A revoked fingerprint is recorded and refused for ever on enroll and rotate, so a stolen
+  key cannot be enrolled again with a fresh token. Revoking a fingerprint also revokes every certificate
+  that descends from it by rotation, including successors that have already been used and retired their
+  predecessor; if the fingerprint was itself retired by a rotation, `trust revoke` says so and revokes the
+  successor chain. A rotation predecessor that has been retired is refused too.
+- **New connections only.** The API picks a trust change up within about 2 s, with no restart or reload.
+  A stream already in flight finishes; the client's data on the server is left in place.
+- Trust changes never signal the daemon or bump the configuration generation.
+
+### Rotation
+
+`zfsbackup-config identity rotate` replaces this host's client certificate without re-enrolling: it
+creates `client.next.*`, registers it with every enrolled destination (authenticated with the current
+certificate), and swaps the files only if every destination accepted it. A failure on any destination
+swaps nothing; fix or remove that destination and re-run (servers that already accepted answer
+`already`). A server retires the old certificate on the successor's first use (or when the successor itself
+rotates), and a retired certificate is refused for ever. If a destination refuses the successor, the advice
+names the servers that already accepted it. With `client_cert_file`/`client_key_file` configured, give the new pair with
+`--cert`/`--key`. The daemon picks up new generated files by itself. Exit status 75 means a destination
+was unreachable or busy: re-run.
+
+### A lost, stolen or revoked key
+
+1. On the server: `zfsbackup-config trust revoke FINGERPRINT` (or `--client ID`; take the id from
+   `trust list`).
+2. On the server: `zfsbackup-config trust token create --client-id ID --replace`. A token scoped to a known
+   id can only enroll that id; `--replace` makes the new certificate the only one for it.
+3. On the client: `zfsbackup-config enroll offsite --new-key --token-file FILE`. The revoked certificate
+   can never be enrolled again, so `--new-key` generates a fresh key as `client.next`, enrolls it, and once
+   the server accepted it makes it this host's client certificate. A pending `client.next` is reused only
+   if the server at this destination already trusts it; otherwise it is replaced (a pin mismatch while
+   asking aborts and discards nothing). (With `client_cert_file`/`client_key_file`
+   configured, supply the new pair with `--cert`/`--key`.)
+
+With **several destinations**, run `--new-key` **once**, against the first server. Every other server
+still trusts only the old certificate and refuses this host (its destination is skipped before any send)
+until it is enrolled again: its operator creates a `trust token create --client-id ID --replace` token, and
+you run a plain `enroll DESTINATION --token-file FILE` for it. A `--replace` token redeemed with a
+certificate the server already pins for that id also performs the replace, so a host whose key might be
+stolen can drop the other certificates without waiting for a revocation.
+
+### Changing the client id
+
+`zfsbackup-config identity set-client-id ID` (letters, digits, `.`, `_`, `-`; at most 64; starting with a
+letter or digit) changes it. Every server then sees a new client and the next remote backup is a full
+send. It is refused while any destination is enrolled, because each server has this host's certificate
+bound to the old id; `--force` overrides that. The better way to move to a new id is to re-enroll with a
+`--client-id NEW` token. A change to the id bumps the configuration generation, so a running daemon
+reloads and hands the new id to its remote worker.
+
+### Firewall and the port
+
+The API listens on `api_host:api_port` (default `127.0.0.1:8080`; set `api_host` to an address clients can
+reach). Allow inbound TCP to that port from your clients' addresses only: `/health` and `/enroll` answer
+anyone who can connect, and `/enroll` has no rate limiting, although a wrong token is refused and nothing
+is enrolled without a valid one. Clients pin the server's own certificate and the server reads the client
+certificate in the TLS handshake, so a TLS-terminating proxy in front of the API will not work. The server
+is werkzeug's development server; see
+[docs/production_readiness_report.md](../docs/production_readiness_report.md) for the remaining caveats.
+
 ## Usage
 
 ### Start the Daemon
@@ -204,11 +341,12 @@ python -m zfsbackup.daemon --test-config -c /path/to/config.db
 - `prune_interval`: How often the pruning worker applies retention policy. **Omit to follow
   `check_interval`** — the value is derived when the daemon reads its config, not frozen when the
   config is written, so a later change to `check_interval` carries over.
-- `client_id_file`: Where this client's generated identity is stored. **Omit to derive**
-  `~/.config/zfsbackup/client_id` — resolved in the daemon's own `$HOME`, not that of whoever wrote
-  the config. Set it explicitly whenever the daemon and the config-managing user differ (systemd
-  units, `sudo`), because a wrong path makes the daemon generate a *new* identity and lose track of
-  its existing server-side backups.
+- `client_cert_file`, `client_key_file`: optional absolute paths to your own client certificate and key,
+  used instead of the generated pair in `<db>.tls/` (see [TLS and enrollment](#tls-and-enrollment)). Give
+  both or neither.
+- The **client id** is not a setting. It lives in the config database, is generated by
+  `zfsbackup-config enroll`, and is shown by `zfsbackup-config identity show`. `import` and `export` never
+  touch it, and the old `client_id_file` key is refused.
 - `dry_run`: Set to `true` to test without making changes (default: false)
 
 ### Dataset Configuration
@@ -404,7 +542,7 @@ Use `-v` flag for debug-level logging.
 - **Prefix Filtering**: Only manages snapshots with the configured prefix
 - **Graceful Shutdown**: Handles SIGINT/SIGTERM signals; SIGHUP reloads the configuration
 - **Error Handling**: Continues operation even if individual datasets fail
-- **Validation**: Validates configuration on startup and before every reload (a rejected reload keeps the previous configuration). An API address that is *in use* at reload (`EADDRINUSE`) is *deferred*, not rejected: the daemon keeps running the previous configuration, publishes `deferred=` and `deferred_reason=` in the pid file (`zfsbackup-config status` says `deferred`), re-checks it at every 10 s poll and applies it as soon as it passes, without a new write. An address that cannot be bound for any other reason (not an address of this host, a privileged port, a name that does not resolve, a malformed host) is rejected for good, because retrying would only repeat the failure (and re-resolve a dead name on every poll). A client id problem is only a warning (the file is read with a size cap, and a FIFO, device or directory is reported as unusable, never read); local snapshots and pruning keep running. At startup, however, an unbindable API address is still a hard refusal (exit 1), so restarting the daemon while the port is held keeps it down until the port is free
+- **Validation**: Validates configuration on startup and before every reload (a rejected reload keeps the previous configuration). An API address that is *in use* at reload (`EADDRINUSE`) is *deferred*, not rejected: the daemon keeps running the previous configuration, publishes `deferred=` and `deferred_reason=` in the pid file (`zfsbackup-config status` says `deferred`), re-checks it at every 10 s poll and applies it as soon as it passes, without a new write. An address that cannot be bound for any other reason (not an address of this host, a privileged port, a name that does not resolve, a malformed host) is rejected for good, because retrying would only repeat the failure (and re-resolve a dead name on every poll). Client TLS problems (no client id yet, an unreadable, expired or soon-to-expire client certificate, a destination that is not enrolled) are only warnings; local snapshots and pruning keep running and the remote worker skips what it cannot use. At startup, however, an unbindable API address is still a hard refusal (exit 1), so restarting the daemon while the port is held keeps it down until the port is free
 
 ## Troubleshooting
 

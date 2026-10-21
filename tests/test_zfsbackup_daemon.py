@@ -818,7 +818,7 @@ class TestMain:
     def test_test_config_with_destinations(self, tmp_path, mocker):
         self._patch_config(
             mocker,
-            destinations={'offsite': Destination(url='http://backup.example.com')},
+            destinations={'offsite': Destination(url='https://backup.example.com')},
             remote_backup=MagicMock(target_dataset='pool/backups'),
         )
         with patch('sys.argv', ['daemon', '--test-config', '-c', str(tmp_path / 'cfg.db')]):
@@ -1595,6 +1595,7 @@ from zfsbackup.config.store import (
     db as _store_db,
     read_config,
 )
+from zfsbackup.daemon import Handoff
 from zfsbackup.runtime_config import load_runtime_config
 
 _START_METHODS = [
@@ -1912,6 +1913,7 @@ class TestRunReadsOnceAndReportsTheGeneration:
             'presence_lock': lock_spy[0],
             'dry_run_override': False,
             'workers_lock': _daemonlock.workers_lock_path(resolved),
+            'client_id': None,          # `host_identity` holds none yet (the snapshot's own)
         }
 
     def test_dry_run_is_handed_on_so_a_reload_can_reapply_it(self, bumped, mocker, lock_spy):
@@ -2027,12 +2029,22 @@ class TestWorkerConfigHandoff:
         factory = mocker.patch(f'zfsbackup.daemon.{cls}')
         daemon._new_worker(name)
         # Positional (config, stop flag, verbose) as before, plus the
-        # keyword-only reload trio.
+        # keyword-only reload trio, plus (M9) what only that worker gets: the
+        # API worker the config database (TLS identity and trust only), the
+        # remote worker the TLS directory and the Handoff's client id.
+        extra = {
+            'api': {'config_db': daemon.resolved_config},
+            'remote': {
+                'tls_dir': _daemon_module.identity.tls_dir(daemon.resolved_config.resolved_path),
+                'client_id': None,
+            },
+        }.get(name, {})
         factory.assert_called_once_with(
             snapshot.config, daemon._stop_event, True,
             reload_epoch=daemon._reload_epoch,
             born_epoch=daemon._reload_epoch.get(),
             workers_lock=daemon._workers_lock_path(),
+            **extra,
         )
 
     def test_a_restart_is_constructed_from_the_same_config_object(self, supervisor, mocker):
@@ -2249,6 +2261,113 @@ class TestWorkerConfigHandoffToRealChildren:
         assert records_seen[0]['pid'] != records_seen[1]['pid']
         names = [d['name'] for d in records_seen[1]['signature']['datasets']]
         assert names == ['pool/data', 'pool/other']  # not 'pool/replaced'
+
+
+def _bind_recording(cls, method, record_dir):
+    """As `_bind_recording_worker`, for any recording double: the factory
+    passes through the keyword-only arguments `_new_worker` adds for that
+    worker (`config_db`; `tls_dir` and `client_id`)."""
+    def factory(config, stop_event, verbose, **kwargs):
+        worker = cls(config, stop_event, verbose, **kwargs)
+        worker.start_method = method
+        worker.record_dir = str(record_dir)
+        return worker
+    return factory
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.filterwarnings(
+    "ignore:This process \\(pid=.*\\) is multi-threaded, use of fork\\(\\) "
+    "may lead to deadlocks in the child:DeprecationWarning"
+)
+class TestClientIdAndTlsHandoffToRealChildren:
+    """M9: the `Handoff` carries the client id; the remote worker is born with it
+    and the TLS directory, the API worker with the config database, through a
+    real OS process under each start method (pickled under spawn and forkserver,
+    inherited under fork)."""
+
+    @pytest.fixture
+    def supervisor(self, literal_config_db):
+        snapshot = load_runtime_config(literal_config_db)
+        dispose_all()
+        snapshot.config.dry_run = True
+        daemon = BackupDaemon(snapshot.config, literal_config_db, client_id='host-7.example')
+        return daemon, snapshot
+
+    @pytest.mark.parametrize('method', _START_METHODS)
+    def test_the_remote_worker_is_born_with_the_client_id_and_the_tls_directory(
+        self, supervisor, literal_config_db, tmp_path, mocker, method
+    ):
+        from _config_handoff import RecordingRemoteWorker
+
+        daemon, _ = supervisor
+        records = tmp_path / 'rec'
+        records.mkdir()
+        mocker.patch(
+            'zfsbackup.daemon.RemoteBackupWorker',
+            side_effect=_bind_recording(RecordingRemoteWorker, method, records),
+        )
+        worker = daemon._spawn('remote')
+        worker.join(120)
+        assert worker.exitcode == 0, f'{method} child failed'
+        assert type(worker._popen).__module__.endswith(_POPEN_MODULE[method])
+        (record,) = read_records(records)
+        assert record['client_id'] == 'host-7.example'
+        assert record['tls_dir'] == str(literal_config_db.resolved_path) + '.tls'
+
+    @pytest.mark.parametrize('method', _START_METHODS)
+    def test_the_api_worker_is_born_with_the_config_database(
+        self, supervisor, literal_config_db, tmp_path, mocker, method
+    ):
+        from _config_handoff import RecordingApiWorker
+
+        daemon, _ = supervisor
+        records = tmp_path / 'rec'
+        records.mkdir()
+        mocker.patch(
+            'zfsbackup.daemon.ApiWorker',
+            side_effect=_bind_recording(RecordingApiWorker, method, records),
+        )
+        worker = daemon._spawn('api')
+        worker.join(120)
+        assert worker.exitcode == 0, f'{method} child failed'
+        (record,) = read_records(records)
+        assert record['config_db'] == str(literal_config_db.resolved_path)
+        assert record['client_id'] is None            # only the remote worker gets the id
+
+    @pytest.mark.parametrize('method', _START_METHODS)
+    def test_the_other_workers_are_given_neither(self, supervisor, tmp_path, mocker, method):
+        daemon, _ = supervisor
+        records = tmp_path / 'rec'
+        records.mkdir()
+        mocker.patch(
+            'zfsbackup.daemon.SnapshotWorker',
+            side_effect=_bind_recording_worker(method, records),
+        )
+        worker = daemon._spawn('snapshot')
+        worker.join(120)
+        assert worker.exitcode == 0
+        (record,) = read_records(records)
+        assert record['client_id'] is None and record['tls_dir'] == 'None'
+
+    @pytest.mark.parametrize('method', _START_METHODS)
+    def test_a_handoff_with_a_client_id_pickles_under_every_method(self, supervisor, method):
+        """The object itself: frozen, picklable, the id and key survive."""
+        import pickle
+
+        daemon, snapshot = supervisor
+        handoff = Handoff(snapshot.config, 3, (7, 9), 'host-7.example')
+        clone = pickle.loads(pickle.dumps(handoff))
+        assert clone.client_id == 'host-7.example'
+        assert (clone.epoch, clone.key) == (3, (7, 9))
+        assert config_signature(clone.config) == config_signature(snapshot.config)
+        with pytest.raises(Exception):
+            handoff.client_id = 'other'              # frozen
+
+    def test_a_handoff_without_an_id_defaults_to_none(self, supervisor):
+        _, snapshot = supervisor
+        assert Handoff(snapshot.config, 0, None).client_id is None
 
 
 class TestReloadTickStopDuringThePoll:

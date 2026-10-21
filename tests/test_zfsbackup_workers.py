@@ -608,14 +608,17 @@ class TestRemoteBackupWorkerBeforeLoop:
                 name='pool/data',
                 remote=[RemoteDatasetConfig(destination='offsite')],
             )],
-            destinations={'offsite': Destination(url='http://backup.example.com')},
-            client_id_file=tmp_path / 'client_id',
+            destinations={'offsite': Destination(url='https://backup.example.com')},
         )
         manager = MagicMock()
         worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
         worker._remote_manager = None
+        worker.client_id = 'host-1'                      # from the Handoff
+        worker.tls_dir = tmp_path / 'db.tls'
         worker._before_loop(config, manager)
         assert isinstance(worker._remote_manager, RemoteBackupManager)
+        assert worker._remote_manager.client_id == 'host-1'
+        assert worker._remote_manager.tls_dir == tmp_path / 'db.tls'
 
 
 class TestApiWorkerThread:
@@ -623,20 +626,25 @@ class TestApiWorkerThread:
         'stop_event_factory', STOP_EVENT_FACTORIES, ids=STOP_EVENT_IDS
     )
     def test_run_starts_thread_and_stops_on_event(
-        self, worker_config, mocker, stop_event_factory
+        self, worker_config, sqlite_config_db, mocker, stop_event_factory
     ):
         stop_event = stop_event_factory()
         stop_event.set()  # stop_event.wait() returns immediately
-        worker = ApiWorker(worker_config, stop_event)  # dry_run covers line 198
+        # dry_run: no server identity on disk -> a throwaway one in a temp dir
+        worker = ApiWorker(worker_config, stop_event, config_db=sqlite_config_db)
 
         mock_app = MagicMock()
         mocker.patch('zfsbackup.api.create_app', return_value=mock_app)
         mock_thread = MagicMock()
-        mocker.patch('zfsbackup.workers.threading.Thread', return_value=mock_thread)
+        thread_cls = mocker.patch('zfsbackup.workers.threading.Thread', return_value=mock_thread)
         mocker.patch('zfsbackup.workers._bind_api_server', return_value=MagicMock())  # no real socket
 
         worker.run()
-        mock_thread.start.assert_called_once()
+        # The server thread is started (the worker may run helper threads too,
+        # e.g. the trust poll -- so look for the server's, not "exactly one").
+        targets = [c.kwargs.get('target') for c in thread_cls.call_args_list]
+        assert workers_module._serve in targets
+        mock_thread.start.assert_called()
 
 
 class TestChildSignalDispositionWiring:
@@ -693,12 +701,12 @@ class TestChildSignalDispositionWiring:
         'stop_event_factory', STOP_EVENT_FACTORIES, ids=STOP_EVENT_IDS
     )
     def test_api_worker_run_resets_signal_disposition_first(
-        self, worker_config, mocker, stop_event_factory
+        self, worker_config, sqlite_config_db, mocker, stop_event_factory
     ):
         self._install_non_default_handlers()
         stop_event = stop_event_factory()
         stop_event.set()  # stop_event.wait() returns immediately
-        worker = ApiWorker(worker_config, stop_event)
+        worker = ApiWorker(worker_config, stop_event, config_db=sqlite_config_db)
 
         mock_app = MagicMock()
         mocker.patch('zfsbackup.api.create_app', return_value=mock_app)
@@ -723,6 +731,13 @@ WORKER_CLASSES = [
     pytest.param(RemoteBackupWorker, 'remote-backup-worker', id='remote'),
     pytest.param(ApiWorker, 'api-worker', id='api'),
 ]
+
+
+#: The keyword-only parameters a class takes after the shared trio (M9).
+EXTRA_KEYWORDS = {
+    ApiWorker: ['config_db'],
+    RemoteBackupWorker: ['tls_dir', 'client_id'],
+}
 
 
 class TestWorkerConstructors:
@@ -752,15 +767,21 @@ class TestWorkerConstructors:
     @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
     def test_the_signature_is_exactly_config_stop_event_verbose(self, cls, name):
         sig = inspect.signature(cls.__init__)
+        extra = EXTRA_KEYWORDS.get(cls, [])
         assert list(sig.parameters) == [
             'self', 'config', 'stop_event', 'verbose',
-            'reload_epoch', 'born_epoch', 'workers_lock',
+            'reload_epoch', 'born_epoch', 'workers_lock', *extra,
         ]
         # The reload trio is keyword-only with inert defaults, so every old
-        # positional call keeps working.
+        # positional call keeps working; so are the class-specific extras (M9:
+        # the API worker's `config_db`, the remote worker's `tls_dir` and
+        # `client_id`), all defaulting to `None`.
         for trio, default in (('reload_epoch', None), ('born_epoch', 0), ('workers_lock', None)):
             assert sig.parameters[trio].kind is inspect.Parameter.KEYWORD_ONLY
             assert sig.parameters[trio].default == default
+        for name_ in extra:
+            assert sig.parameters[name_].kind is inspect.Parameter.KEYWORD_ONLY
+            assert sig.parameters[name_].default is None
 
     def test_base_worker_signature_takes_the_name_first(self):
         sig = inspect.signature(BaseWorker.__init__)
@@ -805,6 +826,38 @@ class TestWorkerConstructors:
             ))
         ]
         assert offenders == []
+
+
+class TestM9WorkerArguments:
+    """The keyword-only arguments only some workers take (TLS/mTLS plan M9):
+    stored as given, `None` otherwise, and never taken by the other classes."""
+
+    def test_the_remote_worker_keeps_the_tls_directory_and_the_client_id(self, worker_config, tmp_path):
+        worker = RemoteBackupWorker(
+            worker_config, multiprocessing.Event(), tls_dir=tmp_path / 'db.tls', client_id='host-1'
+        )
+        assert worker.tls_dir == tmp_path / 'db.tls' and worker.client_id == 'host-1'
+
+    def test_they_default_to_none(self, worker_config):
+        worker = RemoteBackupWorker(worker_config, multiprocessing.Event())
+        assert worker.tls_dir is None and worker.client_id is None
+        assert ApiWorker(worker_config, multiprocessing.Event()).config_db is None
+
+    def test_the_api_worker_keeps_the_config_database(self, worker_config, sqlite_config_db):
+        worker = ApiWorker(worker_config, multiprocessing.Event(), config_db=sqlite_config_db)
+        assert worker.config_db is sqlite_config_db
+
+    @pytest.mark.parametrize('cls', [SnapshotWorker, PruningWorker])
+    @pytest.mark.parametrize('kwarg', ['config_db', 'tls_dir', 'client_id'])
+    def test_the_local_workers_take_none_of_them(self, cls, kwarg, worker_config):
+        with pytest.raises(TypeError):
+            cls(worker_config, multiprocessing.Event(), **{kwarg: 'x'})
+
+    def test_the_other_classes_do_not_take_each_others(self, worker_config):
+        with pytest.raises(TypeError):
+            ApiWorker(worker_config, multiprocessing.Event(), client_id='x')
+        with pytest.raises(TypeError):
+            RemoteBackupWorker(worker_config, multiprocessing.Event(), config_db=object())
 
 
 class TestConfigSurvivesPickling:
@@ -879,12 +932,21 @@ class TestWorkersNeverOpenTheConfigDatabase:
     def armed(self, literal_config_db, tmp_path, request, mocker):
         """-> the config. Read first, then the database is deleted and every
         way of opening it is armed (`forbid_db`, resolved here so it cannot
-        be armed before the read)."""
+        be armed before the read). The one door left is the API worker's
+        trust view (`zfsbackup.config.store.trust`, never the configuration):
+        `store.trust`'s two reads are answered by an empty in-memory trust, so
+        a worker that opened the configuration -- or anything else -- would
+        still trip `forbid_db`."""
+        from _tls_support import StubTrust
+        from zfsbackup.config.store import trust as store_trust
+
+        stub = StubTrust()
+        mocker.patch.object(store_trust, 'read_trust_key', stub.read_trust_key)
+        mocker.patch.object(store_trust, 'read_trust', stub.read_trust)
         snapshot = load_runtime_config(literal_config_db)
         dispose_all()
         config = snapshot.config
         config.dry_run = True
-        config.client_id_file = tmp_path / 'client_id'
         for path in tmp_path.glob('literal.db*'):
             path.unlink()
         assert not list(tmp_path.glob('literal.db*'))
@@ -906,7 +968,7 @@ class TestWorkersNeverOpenTheConfigDatabase:
 
     @pytest.mark.parametrize('stop_factory', STOP_EVENT_FACTORIES, ids=STOP_EVENT_IDS)
     def test_api_worker_run_completes_without_touching_the_database(
-        self, stop_factory, armed, forbid_db, mocker
+        self, stop_factory, armed, forbid_db, literal_config_db, mocker
     ):
         stop = stop_factory()
         stop.set()
@@ -914,17 +976,26 @@ class TestWorkersNeverOpenTheConfigDatabase:
         mocker.patch('zfsbackup.api.create_app', return_value=app)
         mocker.patch('zfsbackup.workers.threading.Thread', return_value=MagicMock())
         mocker.patch('zfsbackup.workers._bind_api_server', return_value=MagicMock())  # no real socket
-        ApiWorker(armed, stop).run()
+        # `armed.dry_run`: the missing server identity is a throwaway one.
+        ApiWorker(armed, stop, config_db=literal_config_db).run()
         assert forbid_db == []
 
-    def test_the_api_app_is_built_from_the_handed_config(self, armed, mocker):
+    def test_the_api_app_is_built_from_the_handed_config(
+        self, armed, literal_config_db, mocker
+    ):
+        from zfsbackup.api import TrustGateway
+
         stop = multiprocessing.Event()
         stop.set()
         factory = mocker.patch('zfsbackup.api.create_app', return_value=MagicMock())
         mocker.patch('zfsbackup.workers.threading.Thread', return_value=MagicMock())
         mocker.patch('zfsbackup.workers._bind_api_server', return_value=MagicMock())  # no real socket
-        ApiWorker(armed, stop).run()
-        factory.assert_called_once_with(armed)
+        ApiWorker(armed, stop, config_db=literal_config_db).run()
+        factory.assert_called_once()
+        args = factory.call_args.args
+        assert args[0] is armed                              # the handed config, not a re-read one
+        assert isinstance(args[1], TrustGateway)             # trust
+        assert args[1].server_fingerprint == args[2]         # and the identity it presents
 
     def test_the_worker_loop_runs_on_the_handed_config_not_a_reloaded_one(self, armed, mocker):
         """A cycle processes the datasets of the config it was handed; there

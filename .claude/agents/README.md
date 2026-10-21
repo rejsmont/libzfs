@@ -18,7 +18,7 @@ domain knowledge; the cross-agent workflow lives here (and is summarized in
 | `libzfseasy-implementation-planner` | opus / high | read-only | Findings → ordered plan for `libzfseasy/` |
 | `zfsbackup-implementation-planner` | opus / high | read-only | Findings → ordered plan for `zfsbackup/` (incl. `store/`, `cli/`) |
 | `libzfseasy-developer` | sonnet / high | edit | `libzfseasy/types.py`, `zfs.py` |
-| `zfsbackup-developer` | sonnet / high | edit | Daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py` |
+| `zfsbackup-developer` | sonnet / high | edit | Daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py`; the shared TLS/identity module `identity.py` |
 | `zfsbackup-store-developer` | sonnet / high | edit | `zfsbackup/config/store/**` (incl. `migrations/`), `alembic.ini` — models, mapper, engine/session, migrations |
 | `zfsbackup-cli-developer` | sonnet / high | edit | `zfsbackup/cli/**` — the `zfsbackup-config` Click application |
 | `pytest-test-author` | sonnet / high | edit | Owns **all** pytest tests + `conftest.py` fixtures (both packages) |
@@ -35,7 +35,7 @@ into another's directory to save a handoff.
 | Path | Owner |
 |---|---|
 | `libzfseasy/**` | `libzfseasy-developer` |
-| `zfsbackup/{config,backup_manager,daemon,workers,remote,api}.py`, and the supervisor support modules `zfsbackup/{daemonlock,stopflag,runtime_config,procident,sdnotify}.py` | `zfsbackup-developer` |
+| `zfsbackup/{config,backup_manager,daemon,workers,remote,api}.py`, and the supervisor support modules `zfsbackup/{daemonlock,stopflag,runtime_config,procident,sdnotify}.py`, and the shared TLS/identity module `zfsbackup/identity.py` (also used by the CLI) | `zfsbackup-developer` |
 | `zfsbackup/config/store/**` (incl. `store/migrations/`), `alembic.ini` | `zfsbackup-store-developer` |
 | `zfsbackup/cli/**` | `zfsbackup-cli-developer` |
 | `tests/**`, `conftest.py` | `pytest-test-author` |
@@ -49,11 +49,17 @@ effect).
 
 Two architectural boundaries the reviewers enforce:
 
-- **Daemon and CLI reach the database only through `zfsbackup.config.store.mapper`** — never through ORM
-  models. Config objects outlive any session; a detached instance raises `DetachedInstanceError`
+- **Daemon and CLI reach the database only through the public API of `zfsbackup.config.store`** (`mapper`,
+  `access`, `trust`) — never through ORM models. Config objects outlive any session; a detached instance raises `DetachedInstanceError`
   lazily, deep inside a worker loop. The mapper is also what keeps a later Postgres move possible.
-- **The CLI is the only writer.** Workers open the store read-only, by construction rather than by
-  convention.
+- **The CLI is the only writer of configuration and of the host identity** (`host_identity.client_id`,
+  outside the six config tables: `import`/`export` never touch it, and a change bumps the config
+  generation). **The trust tables** (`clients`, `trusted_clients`, `revoked_fingerprints`,
+  `enrollment_token`, `trust_state`) **have two writers, both through `zfsbackup.config.store.trust`:** the
+  CLI (`trust …`) and the API worker (`/enroll`, `/rotate`, retiring superseded pins). Trust writes never
+  bump the config generation and never cause a reload. **Only the supervisor reads configuration and the
+  client id**, in one snapshot handed to the workers in the `Handoff`; the API worker opens the DB only
+  through `store.trust`, on a per-call engine, and no other worker opens it.
 
 ## The cycle
 

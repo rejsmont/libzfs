@@ -7,13 +7,15 @@ that stalled every API worker start for ~30 s. `ApiServer` replaces it with
 
 * in-process: no name lookup is ever made, the bookkeeping attributes are right,
   a real request through the bound server sees the right WSGI environ, the
-  failure wording is unchanged, the class is cached and werkzeug stays lazy;
+  failure wording is unchanged, the class is cached and werkzeug stays lazy.
+  The server is HTTPS only (plan M9): every bind takes a `TrustGateway`
+  (`make_gateway`: a real one over a generated server identity, reading a scripted
+  in-memory trust) and requests are TLS 1.3 with certificate verification off;
 * one real daemon whose `getfqdn` / `gethostbyaddr` / `getnameinfo` sleep for 20 s
   (patched at module level of a driver script, so forked, forkserver and spawned
   children get the patch too) still reaches "API listening" in seconds.
 """
 
-import http.client
 import multiprocessing
 import os
 import shutil
@@ -29,6 +31,7 @@ from unittest.mock import PropertyMock
 import pytest
 
 from _hermetic import hermetic_env
+from _tls_support import https_get, make_gateway
 from test_zfsbackup_reload import ROOT, RealDaemon
 from zfsbackup import workers
 from zfsbackup.api import create_app
@@ -57,16 +60,27 @@ def no_lookups(monkeypatch):
 
 
 @pytest.fixture
-def real_app(mocker):
+def gateway(tmp_path):
+    """A real `TrustGateway` (server identity generated under `tmp_path`) over an
+    empty scripted trust: what `_bind_api_server` needs for its TLS contexts."""
+    gw, _, _ = make_gateway(tmp_path / "srv.tls")
+    return gw
+
+
+@pytest.fixture
+def real_app(mocker, gateway):
     mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
-    return create_app(BackupConfig(datasets=[DatasetConfig(name="pool/data")]))
+    return create_app(
+        BackupConfig(datasets=[DatasetConfig(name="pool/data")]),
+        gateway, gateway.server_fingerprint,
+    )
 
 
 class Serving:
     """A bound server served from a thread and shut down on exit."""
 
-    def __init__(self, app, host="127.0.0.1", port=0):
-        self.server = workers._bind_api_server(app, host, port)
+    def __init__(self, app, gateway, host="127.0.0.1", port=0):
+        self.server = workers._bind_api_server(app, host, port, gateway)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def __enter__(self):
@@ -80,19 +94,13 @@ class Serving:
         assert not self.thread.is_alive()
 
     def get(self, path, headers=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
-        try:
-            conn.request("GET", path, headers=headers or {})
-            resp = conn.getresponse()
-            return resp.status, resp.read()
-        finally:
-            conn.close()
+        return https_get(self.server.server_port, path, headers=headers)
 
 
 @pytest.mark.unit
 class TestBindDoesNoNameLookup:
-    def test_it_binds_and_sets_the_bookkeeping_without_any_lookup(self, no_lookups):
-        server = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0)
+    def test_it_binds_and_sets_the_bookkeeping_without_any_lookup(self, no_lookups, gateway):
+        server = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0, gateway)
         try:
             port = server.socket.getsockname()[1]
             assert port > 0
@@ -102,19 +110,19 @@ class TestBindDoesNoNameLookup:
         finally:
             server.server_close()
 
-    def test_a_fixed_port_is_kept(self, no_lookups):
+    def test_a_fixed_port_is_kept(self, no_lookups, gateway):
         probe = socket.socket()
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
         probe.close()
-        server = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", port)
+        server = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", port, gateway)
         try:
             assert server.server_port == port and server.server_name == "127.0.0.1"
         finally:
             server.server_close()
 
-    def test_a_hostname_is_kept_as_the_server_name_without_being_resolved_back(self, no_lookups):
-        server = workers._bind_api_server(lambda e, s: iter(()), "localhost", 0)
+    def test_a_hostname_is_kept_as_the_server_name_without_being_resolved_back(self, no_lookups, gateway):
+        server = workers._bind_api_server(lambda e, s: iter(()), "localhost", 0, gateway)
         try:
             assert server.server_name == "localhost"
             assert server.server_port == server.socket.getsockname()[1]
@@ -122,11 +130,11 @@ class TestBindDoesNoNameLookup:
             server.server_close()
 
     @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="no AF_UNIX")
-    def test_a_unix_socket_address_sets_a_name_and_no_port(self, no_lookups):
+    def test_a_unix_socket_address_sets_a_name_and_no_port(self, no_lookups, gateway):
         path_dir = tempfile.mkdtemp(prefix="zsn", dir="/tmp")
         path = os.path.join(path_dir, "api.sock")
         try:
-            server = workers._bind_api_server(lambda e, s: iter(()), f"unix://{path}", 0)
+            server = workers._bind_api_server(lambda e, s: iter(()), f"unix://{path}", 0, gateway)
             try:
                 assert server.address_family == socket.AF_UNIX
                 assert server.server_name == f"unix://{path}"
@@ -136,10 +144,10 @@ class TestBindDoesNoNameLookup:
         finally:
             shutil.rmtree(path_dir, ignore_errors=True)
 
-    def test_the_server_is_a_werkzeug_threaded_server(self):
+    def test_the_server_is_a_werkzeug_threaded_server(self, gateway):
         from werkzeug.serving import ThreadedWSGIServer
 
-        server = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0)
+        server = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0, gateway)
         try:
             assert isinstance(server, ThreadedWSGIServer)
             assert isinstance(server, workers._api_server_class())
@@ -151,34 +159,46 @@ class TestBindDoesNoNameLookup:
 @pytest.mark.unit
 @pytest.mark.subprocess
 class TestARealRequest:
-    def test_health_is_200_and_the_environ_and_host_header_are_right(self, no_lookups, real_app):
+    def test_health_is_200_and_the_environ_and_host_header_are_right(
+        self, no_lookups, real_app, gateway
+    ):
         seen = []
 
         def wrapper(environ, start_response):
             seen.append(dict(environ))
             return real_app(environ, start_response)
 
-        with Serving(wrapper) as s:
+        with Serving(wrapper, gateway) as s:
             port = s.server.server_port
             status, body = s.get("/health", {"Host": "custom.example:1234"})
             assert (status, body.strip()) == (200, b'{"status":"ok"}')
             status, _ = s.get("/health")
             assert status == 200
         first, second = seen
+        assert first["wsgi.url_scheme"] == "https"
         assert first["SERVER_NAME"] == "127.0.0.1"
         assert first["SERVER_PORT"] == str(port)
         assert first["HTTP_HOST"] == "custom.example:1234"        # the client's Host is preserved
         assert second["HTTP_HOST"] == f"127.0.0.1:{port}"
         assert first["REMOTE_ADDR"] == "127.0.0.1"
 
-    def test_the_real_app_answers_other_routes_through_it(self, no_lookups, real_app):
-        with Serving(real_app) as s:
-            status, body = s.get("/config")
-            assert status == 200 and b"snapshot_prefix" in body
-            assert s.get("/nope")[0] == 404
+    def test_any_path_reaches_the_app_through_it(self, no_lookups, gateway):
+        """Routing and authentication are the app's (M10), not the server's: a
+        stand-in WSGI app sees every path, and the environ says HTTPS."""
+        seen = []
 
-    def test_concurrent_requests_are_served(self, no_lookups, real_app):
-        with Serving(real_app) as s:
+        def app(environ, start_response):
+            seen.append((environ["PATH_INFO"], environ["wsgi.url_scheme"]))
+            start_response("200 OK", [("Content-Type", "text/plain")])
+            return [b"hi"]
+
+        with Serving(app, gateway) as s:
+            assert s.get("/config") == (200, b"hi")
+            assert s.get("/nope/at/all") == (200, b"hi")
+        assert seen == [("/config", "https"), ("/nope/at/all", "https")]
+
+    def test_concurrent_requests_are_served(self, no_lookups, real_app, gateway):
+        with Serving(real_app, gateway) as s:
             results = []
             threads = [
                 threading.Thread(target=lambda: results.append(s.get("/health")[0]))
@@ -193,12 +213,12 @@ class TestARealRequest:
 
 @pytest.mark.unit
 class TestBindFailures:
-    def test_an_occupied_port_raises_oserror_with_the_existing_wording(self, capsys):
-        first = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0)
+    def test_an_occupied_port_raises_oserror_with_the_existing_wording(self, capsys, gateway):
+        first = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0, gateway)
         try:
             port = first.server_port
             with pytest.raises(OSError) as info:
-                workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", port)
+                workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", port, gateway)
             assert str(info.value) == (
                 f"cannot bind 127.0.0.1:{port} (address in use or not available)"
             )
@@ -206,17 +226,17 @@ class TestBindFailures:
         finally:
             first.server_close()
 
-    def test_an_address_that_is_not_ours_raises_oserror(self):
+    def test_an_address_that_is_not_ours_raises_oserror(self, gateway):
         with pytest.raises(OSError, match=r"cannot bind 203\.0\.113\.77:0 "):
-            workers._bind_api_server(lambda e, s: iter(()), "203.0.113.77", 0)
+            workers._bind_api_server(lambda e, s: iter(()), "203.0.113.77", 0, gateway)
 
-    def test_a_failed_bind_leaves_the_port_usable_by_the_next_attempt(self):
-        first = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0)
+    def test_a_failed_bind_leaves_the_port_usable_by_the_next_attempt(self, gateway):
+        first = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0, gateway)
         port = first.server_port
         with pytest.raises(OSError):
-            workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", port)
+            workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", port, gateway)
         first.server_close()
-        again = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", port)
+        again = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", port, gateway)
         try:
             assert again.server_port == port
         finally:
@@ -225,10 +245,10 @@ class TestBindFailures:
 
 @pytest.mark.unit
 class TestClassCaching:
-    def test_one_class_object_for_every_call(self):
+    def test_one_class_object_for_every_call(self, gateway):
         assert workers._api_server_class() is workers._api_server_class()
-        a = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0)
-        b = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0)
+        a = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0, gateway)
+        b = workers._bind_api_server(lambda e, s: iter(()), "127.0.0.1", 0, gateway)
         try:
             assert type(a) is type(b) is workers._api_server_class()
         finally:

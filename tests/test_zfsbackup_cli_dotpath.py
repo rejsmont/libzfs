@@ -42,6 +42,17 @@ port text reverted 6 / forever text reverted 4; name editable 3; sibling list
 uncut 1; `derived` without the interval 8; `prune_interval` not a tri-state 4;
 empty value not "unset" 1; names always dotted 62; snapshot re-read after the
 edit (CAS defeated) 4.
+
+TLS round (M8/M16; scratch copy, one revert at a time; failing tests across this
+file, the edit, list, render and rename files): `render` fingerprint unquoted 4 /
+always written 43 / `client_cert_file` dropped 53; pin warning also on the first
+pin 3 / not on removal 8 / also on a deleted destination 4 / not emitted by `edit` 4;
+one-path `set` allowed 2; `unset` of one TLS path clearing only that path 7;
+fingerprint read as YAML 1 (the octal-looking one; an all-digit one alone
+survives it); `get` of an unset pin blank 10; `list` shows 8 hex 2 / drops the JSON
+`server_fingerprint` 10; `edit destination` drops the pin 10; `rename` `_client_id`
+always the placeholder 5. The dot-path `http://` guard is redundant with
+`BackupConfig.from_file`'s own (reverting it fails 0 tests: same refusal, same exit).
 """
 
 import logging
@@ -119,7 +130,8 @@ RESOLVES = [
     ("api_host", ("api_host",)),
     ("api_port", ("api_port",)),
     ("dry_run", ("dry_run",)),
-    ("client_id_file", ("client_id_file",)),
+    ("client_cert_file", ("client_cert_file",)),
+    ("client_key_file", ("client_key_file",)),
     ("datasets", ("datasets",)),
     ("destinations", ("destinations",)),
     ("remote_backup", ("remote_backup",)),
@@ -162,6 +174,9 @@ RESOLVES = [
     # destinations, including a dotted one
     ("destinations.offsite", ("destinations", "offsite")),
     ("destinations.offsite.url", ("destinations", "offsite", "url")),
+    ("destinations.offsite.server_fingerprint", ("destinations", "offsite", "server_fingerprint")),
+    ("destinations.dc.two.server_fingerprint", ("destinations", "dc.two", "server_fingerprint")),
+    ("destinations[dc.two].server_fingerprint", ("destinations", "dc.two", "server_fingerprint")),
     ("destinations.dc.two", ("destinations", "dc.two")),
     ("destinations.dc.two.url", ("destinations", "dc.two", "url")),
     ("destinations[dc.two].url", ("destinations", "dc.two", "url")),
@@ -200,7 +215,7 @@ class TestDotpathResolve:
 
     def test_a_name_that_is_a_prefix_of_another_is_not_mistaken_for_it(self, tmp_path):
         text = (
-            'destinations:\n  dc:\n    url: "http://dc"\n  dc.two:\n    url: "http://two"\n'
+            'destinations:\n  dc:\n    url: "https://dc"\n  dc.two:\n    url: "https://two"\n'
             'datasets:\n  - name: "tank/x"\n    remote:\n'
             '      - destination: "dc"\n      - destination: "dc.two"\n'
         )
@@ -270,7 +285,7 @@ class TestDotpathAmbiguity:
 
     def test_ambiguous_destinations_collection(self, tmp_path):
         text = (
-            'destinations:\n  d:\n    url: "http://d"\n  d.url:\n    url: "http://x"\n'
+            'destinations:\n  d:\n    url: "https://d"\n  d.url:\n    url: "https://x"\n'
             'datasets:\n  - name: "tank/x"\n'
         )
         config = BackupConfig.from_file(write_yaml(tmp_path, text))
@@ -328,7 +343,8 @@ class TestDotpathUnknownPaths:
         message = self.fails(rich_config, "bogus")
         for name in (
             "snapshot_prefix", "check_interval", "prune_interval", "api_host", "api_port",
-            "dry_run", "client_id_file", "datasets", "destinations", "remote_backup",
+            "dry_run", "client_cert_file", "client_key_file", "datasets", "destinations",
+            "remote_backup",
         ):
             assert name in message
 
@@ -559,6 +575,37 @@ def rich(run, db):
     return make_db(run, db)
 
 
+#: What `get` prints for a TLS path nobody set (the daemon generates its own).
+DERIVED_TLS = "derived (the generated client identity in <db>.tls/)"
+
+CERT = "/etc/zfsbackup/client.pem"
+KEY = "/etc/zfsbackup/client.key"
+
+#: 64 hex digits, all of them decimal: YAML reads an unquoted one as an integer.
+DIGITS_FP = "1234567890" * 6 + "1234"
+FP = "ab" * 32
+FP2 = "cd" * 32
+COLON_FP = ":".join(["AB"] * 32)
+
+
+@pytest.fixture
+def tls_db(run, db):
+    """A database whose configuration sets both TLS paths."""
+    return make_db(run, db, RICH_YAML.replace(
+        'check_interval: "5m"\n',
+        f'check_interval: "5m"\nclient_cert_file: "{CERT}"\nclient_key_file: "{KEY}"\n',
+    ))
+
+
+@pytest.fixture
+def pinned_db(run, db):
+    """A database whose `offsite` destination is enrolled (pinned to `FP`)."""
+    return make_db(run, db, RICH_YAML.replace(
+        '    url: "https://offsite:8080"\n',
+        f'    url: "https://offsite:8080"\n    server_fingerprint: "{FP}"\n',
+    ))
+
+
 def ok(run, database, *args):
     result = run(*args, "-c", database)
     assert result.exit_code == 0, f"{args}: {result.stderr}"
@@ -579,7 +626,8 @@ class TestDotpathGet:
             ("api_host", ["127.0.0.1"]),
             ("api_port", ["8080"]),
             ("dry_run", ["false"]),
-            ("client_id_file", ["derived ($HOME/.config/zfsbackup/client_id)"]),
+            ("client_cert_file", [DERIVED_TLS]),
+            ("client_key_file", [DERIVED_TLS]),
             ("datasets.tank/data.enabled", ["true"]),
             ("datasets.tank/vm.01.enabled", ["false"]),
             ("datasets.tank/data.recursive", ["true"]),
@@ -594,8 +642,10 @@ class TestDotpathGet:
             ("datasets.tank/data.remote.offsite.retention", ["inherit (1d: 30d, 1w: 3M)"]),
             ("datasets.tank/data.remote.dc.two.retention", ["1d: 7d"]),
             ("datasets.tank/data.remote.dc.two.retention.1d", ["7d"]),
-            ("destinations.offsite.url", ["http://offsite:8080"]),
-            ("destinations.dc.two.url", ["http://dc2:8080"]),
+            ("destinations.offsite.url", ["https://offsite:8080"]),
+            ("destinations.dc.two.url", ["https://dc2:8080"]),
+            ("destinations.offsite.server_fingerprint", ["not enrolled"]),
+            ("destinations.dc.two.server_fingerprint", ["not enrolled"]),
         ],
     )
     def test_get(self, run, rich, path, expected):
@@ -616,7 +666,7 @@ class TestDotpathGet:
             "destination": "dc.two", "frequency": "4h", "retention": {"1d": "7d"},
         }
         assert yaml.safe_load(run("get", "destinations[dc.two]", "-c", rich).stdout) == {
-            "url": "http://dc2:8080"
+            "url": "https://dc2:8080"
         }
 
     def test_the_retention_rule_is_matched_by_seconds(self, run, rich):
@@ -652,13 +702,15 @@ class TestDotpathGet:
             "enabled": True, "target_dataset": "tank/recv",
         }
 
-    def test_prune_interval_and_client_id_file_when_set(self, run, db):
+    def test_prune_interval_and_tls_paths_when_set(self, run, db):
         make_db(run, db, RICH_YAML.replace(
             'check_interval: "5m"\n',
-            'check_interval: "5m"\nprune_interval: "2h"\nclient_id_file: "/var/lib/zfsbackup/client_id"\n',
+            'check_interval: "5m"\nprune_interval: "2h"\n'
+            'client_cert_file: "/etc/zfsbackup/client.pem"\nclient_key_file: "/etc/zfsbackup/client.key"\n',
         ))
         assert got(run, db, "prune_interval") == ["2h"]
-        assert got(run, db, "client_id_file") == ["/var/lib/zfsbackup/client_id"]
+        assert got(run, db, "client_cert_file") == ["/etc/zfsbackup/client.pem"]
+        assert got(run, db, "client_key_file") == ["/etc/zfsbackup/client.key"]
 
     def test_durations_are_shown_as_typed(self, run, db):
         make_db(run, db, PLAIN_YAML.replace('"5m"', '"300s"').replace('"1h"', '"60m"'))
@@ -687,9 +739,6 @@ SETS = [
     ("api_host", "0.0.0.0", "api_host: 127.0.0.1 -> 0.0.0.0", ["0.0.0.0"]),
     ("api_port", "9090", "api_port: 8080 -> 9090", ["9090"]),
     ("dry_run", "true", "dry_run: false -> true", ["true"]),
-    ("client_id_file", "/var/lib/zfsbackup/client_id",
-     "client_id_file: derived ($HOME/.config/zfsbackup/client_id) -> /var/lib/zfsbackup/client_id",
-     ["/var/lib/zfsbackup/client_id"]),
     ("datasets.tank/data.enabled", "false", "datasets[tank/data].enabled: true -> false", ["false"]),
     ("datasets.tank/vm.01.enabled", "true", "datasets[tank/vm.01].enabled: false -> true", ["true"]),
     ("datasets.tank/data.recursive", "false", "datasets[tank/data].recursive: true -> false", ["false"]),
@@ -710,10 +759,10 @@ SETS = [
      "datasets[tank/data].remote[dc.two].retention: 1d: 7d -> 1d: 9d", ["1d: 9d"]),
     ("datasets.tank/data.remote.dc.two.retention", "{1h: 1d, 1w: 1M}",
      "datasets[tank/data].remote[dc.two].retention: 1d: 7d -> 1h: 1d, 1w: 1M", ["1h: 1d", "1w: 1M"]),
-    ("destinations.offsite.url", "http://new:1", "destinations[offsite].url: http://offsite:8080 -> http://new:1",
-     ["http://new:1"]),
-    ("destinations.dc.two.url", "http://new:2", "destinations[dc.two].url: http://dc2:8080 -> http://new:2",
-     ["http://new:2"]),
+    ("destinations.offsite.url", "https://new:1", "destinations[offsite].url: https://offsite:8080 -> https://new:1",
+     ["https://new:1"]),
+    ("destinations.dc.two.url", "https://new:2", "destinations[dc.two].url: https://dc2:8080 -> https://new:2",
+     ["https://new:2"]),
 ]
 
 
@@ -788,22 +837,17 @@ class TestDotpathUnset:
         ok(run, rich, "set", "check_interval", "10m")
         assert got(run, rich, "prune_interval") == ["derived (10m)"]
 
-    def test_client_id_file_tri_state(self, run, rich):
-        ok(run, rich, "set", "client_id_file", "/x/id")
-        result = ok(run, rich, "unset", "client_id_file")
-        assert result.stdout.splitlines()[0] == (
-            "client_id_file: /x/id -> derived ($HOME/.config/zfsbackup/client_id)"
-        )
-        assert stored(rich).client_id_file is None
-
     @pytest.mark.parametrize("empty", ["null", "''", "~"])
     def test_setting_an_empty_value_on_a_tri_state_unsets_it(self, run, rich, empty):
         ok(run, rich, "set", "prune_interval", "2h")
         result = ok(run, rich, "set", "prune_interval", empty)
         assert result.stdout.splitlines()[0] == "prune_interval: 2h -> derived (5m)"
-        ok(run, rich, "set", "client_id_file", "/x/id")
-        ok(run, rich, "set", "client_id_file", empty)
-        assert stored(rich).client_id_file is None
+
+    @pytest.mark.parametrize("empty", ["null", "''", "~"])
+    def test_setting_an_empty_tls_path_unsets_the_pair(self, run, tls_db, empty):
+        result = ok(run, tls_db, "set", "client_cert_file", empty)
+        assert stored(tls_db).client_cert_file is None and stored(tls_db).client_key_file is None
+        assert result.stdout.splitlines()[0].startswith("client_cert_file: /etc/zfsbackup/client.pem -> derived")
 
     def test_dataset_retention_returns_to_the_default(self, run, rich):
         result = ok(run, rich, "unset", "datasets[tank/data].retention")
@@ -888,14 +932,17 @@ class TestDotpathNoOp:
              "datasets[tank/vm.01].retention is already forever; nothing changed"),
             (("set", "datasets.tank/data.remote.dc.two.frequency", "4h"),
              "datasets[tank/data].remote[dc.two].frequency is already 4h; nothing changed"),
-            (("set", "destinations.offsite.url", "http://offsite:8080"),
-             "destinations[offsite].url is already http://offsite:8080; nothing changed"),
+            (("set", "destinations.offsite.url", "https://offsite:8080"),
+             "destinations[offsite].url is already https://offsite:8080; nothing changed"),
             (("unset", "prune_interval"),
              "prune_interval is already derived (5m); nothing changed"),
-            (("unset", "client_id_file"),
-             "client_id_file is already derived ($HOME/.config/zfsbackup/client_id); nothing changed"),
-            (("set", "client_id_file", "null"),
-             "client_id_file is already derived ($HOME/.config/zfsbackup/client_id); nothing changed"),
+            (("unset", "client_cert_file"), f"client_cert_file is already {DERIVED_TLS}; nothing changed"),
+            (("unset", "client_key_file"), f"client_key_file is already {DERIVED_TLS}; nothing changed"),
+            (("set", "client_cert_file", "null"), f"client_cert_file is already {DERIVED_TLS}; nothing changed"),
+            (("unset", "destinations.offsite.server_fingerprint"),
+             "destinations[offsite].server_fingerprint is already not enrolled; nothing changed"),
+            (("set", "destinations.offsite.server_fingerprint", "''"),
+             "destinations[offsite].server_fingerprint is already not enrolled; nothing changed"),
             (("unset", "datasets.tank/data.remote.offsite.frequency"),
              "datasets[tank/data].remote[offsite].frequency is already inherit (1h); nothing changed"),
             (("unset", "datasets.tank/data.remote.offsite.retention"),
@@ -1131,7 +1178,7 @@ class TestDotpathRemoteBackup:
 class TestDotpathValues:
     @pytest.mark.parametrize(
         "path",
-        ["snapshot_prefix", "api_host", "client_id_file", "destinations[offsite].url"],
+        ["snapshot_prefix", "api_host", "client_cert_file", "destinations[offsite].url"],
     )
     def test_string_settings_reject_non_string_yaml_with_a_quoting_hint(self, run, rich, path):
         before = db_state(rich)
@@ -1217,7 +1264,7 @@ class TestDotpathRefusals:
         (("unset", "bogus"), 1, "unknown path"),
         (("set", "datasets.nosuch.frequency", "1h"), 1, "no dataset matches"),
         (("set", "datasets[tank/data].remote[nosuch].frequency", "1h"), 1, "no attached destination"),
-        (("set", "destinations.nosuch.url", "http://x"), 1, "no destination matches"),
+        (("set", "destinations.nosuch.url", "https://x"), 1, "no destination matches"),
         (("set", "check_interval", "not-a-duration"), 1, "Invalid duration"),
         (("set", "api_port", "99999"), 1, "api_port"),
         (("set", "datasets[tank/data].frequency", "0m"), 1, "frequency"),
@@ -1513,13 +1560,13 @@ class TestDotpathTempFiles:
 
     def test_non_ascii_values_other_than_dataset_names_round_trip(self, run, db):
         # Only dataset names reach `zfs`; a destination (name and URL) is free text.
-        make_db(run, db, 'destinations:\n  "d\u00e9p\u00f4t":\n    url: "http://127.0.0.1:9/caf\u00e9"\n'
+        make_db(run, db, 'destinations:\n  "d\u00e9p\u00f4t":\n    url: "https://127.0.0.1:9/caf\u00e9"\n'
                          'datasets:\n  - name: "tank/cafe"\n    frequency: "1h"\n')
         result = ok(run, db, "set", "datasets[tank/cafe].frequency", "30m")
         assert result.stdout.splitlines()[0] == "datasets[tank/cafe].frequency: 1h -> 30m"
         config = stored(db)
         assert config.datasets[0].name == "tank/cafe"
-        assert config.destinations["d\u00e9p\u00f4t"].url == "http://127.0.0.1:9/caf\u00e9"
+        assert config.destinations["d\u00e9p\u00f4t"].url == "https://127.0.0.1:9/caf\u00e9"
 
     def test_a_dataset_name_with_an_inner_space_round_trips_through_set(self, run, db):
         make_db(run, db, 'datasets:\n  - name: "tank/my data"\n    frequency: "1h"\n')
@@ -1795,3 +1842,306 @@ class TestDotpathSnapshotPrefixChange:
         ok(run, rich, "set", "snapshot_prefix", "one")
         lines = warnings_in(ok(run, rich, "set", "snapshot_prefix", "two"))
         assert len(lines) == 1 and "from 'one' to 'two'" in lines[0]
+
+
+# ---------------------------------------------------------------------------
+# TLS (milestone 3, M8): destination pins, client certificate paths, https only
+# ---------------------------------------------------------------------------
+
+FP_PATH = "destinations.offsite.server_fingerprint"
+
+
+class TestDotpathFingerprint:
+    """`destinations.N.server_fingerprint`: verbatim text, normalised, validated."""
+
+    def test_set_pins_and_get_prints_it(self, run, rich):
+        result = ok(run, rich, "set", FP_PATH, FP)
+        assert result.stdout.splitlines()[0] == f"destinations[offsite].server_fingerprint: not enrolled -> {FP}"
+        assert got(run, rich, FP_PATH) == [FP]
+        assert stored(rich).destinations["offsite"].server_fingerprint == FP
+        assert stored(rich).destinations["dc.two"].server_fingerprint is None
+
+    def test_the_first_pin_does_not_warn(self, run, rich):
+        assert warnings_in(ok(run, rich, "set", FP_PATH, FP)) == []
+
+    def test_an_all_digit_fingerprint_stays_a_string(self, run, rich):
+        # Read as YAML this would be an integer; the value is taken verbatim.
+        ok(run, rich, "set", FP_PATH, DIGITS_FP)
+        assert stored(rich).destinations["offsite"].server_fingerprint == DIGITS_FP
+        assert got(run, rich, FP_PATH) == [DIGITS_FP]
+
+    def test_an_octal_looking_fingerprint_is_not_read_as_yaml(self, run, rich):
+        # Read as YAML this is an octal integer that loses its leading zero.
+        octal = "01234567" * 8
+        ok(run, rich, "set", FP_PATH, octal)
+        assert stored(rich).destinations["offsite"].server_fingerprint == octal
+
+    @pytest.mark.parametrize("quoted", [f'"{FP}"', f"'{FP}'", f'  "{FP}" '])
+    def test_surrounding_quotes_are_stripped(self, run, rich, quoted):
+        ok(run, rich, "set", FP_PATH, quoted)
+        assert stored(rich).destinations["offsite"].server_fingerprint == FP
+
+    def test_upper_case_colon_form_is_normalised(self, run, rich):
+        result = ok(run, rich, "set", FP_PATH, COLON_FP)
+        assert result.stdout.splitlines()[0].endswith(f"-> {'ab' * 32}")
+        assert stored(rich).destinations["offsite"].server_fingerprint == "ab" * 32
+
+    def test_upper_case_without_colons_is_normalised(self, run, rich):
+        ok(run, rich, "set", FP_PATH, FP.upper())
+        assert stored(rich).destinations["offsite"].server_fingerprint == FP
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["abc", "zz" * 32, "ab" * 31, "ab" * 33, ":".join(["ab"] * 31), "12", "0x" + "ab" * 31],
+    )
+    def test_a_malformed_fingerprint_is_refused_and_nothing_is_written(self, run, rich, bad):
+        before, gen = db_state(rich), generation(rich)
+        result = run("set", FP_PATH, bad, "-c", rich)
+        assert result.exit_code == 1
+        assert "server_fingerprint" in result.stderr and "Traceback" not in result.stderr
+        assert db_state(rich) == before and generation(rich) == gen
+
+    def test_set_the_same_pin_is_a_noop(self, run, pinned_db):
+        before, gen = db_state(pinned_db), generation(pinned_db)
+        result = ok(run, pinned_db, "set", FP_PATH, COLON_FP)  # same value, other spelling
+        assert result.stdout == (
+            f"destinations[offsite].server_fingerprint is already {FP}; nothing changed\n"
+        )
+        assert warnings_in(result) == []
+        assert db_state(pinned_db) == before and generation(pinned_db) == gen
+
+    def test_changing_a_pin_warns(self, run, pinned_db):
+        result = ok(run, pinned_db, "set", FP_PATH, FP2)
+        lines = warnings_in(result)
+        assert len(lines) == 1
+        assert "destinations[offsite].server_fingerprint changed" in lines[0]
+        assert "'offsite'" in lines[0]
+        assert stored(pinned_db).destinations["offsite"].server_fingerprint == FP2
+
+    @pytest.mark.parametrize("empty", ["", "''", '""'])
+    def test_an_empty_value_unsets_the_pin_and_warns(self, run, pinned_db, empty):
+        result = ok(run, pinned_db, "set", FP_PATH, empty)
+        assert stored(pinned_db).destinations["offsite"].server_fingerprint is None
+        lines = warnings_in(result)
+        assert len(lines) == 1 and "removed" in lines[0] and "enroll offsite" in lines[0]
+        assert got(run, pinned_db, FP_PATH) == ["not enrolled"]
+
+    def test_unset_removes_the_pin_and_warns(self, run, pinned_db):
+        result = ok(run, pinned_db, "unset", FP_PATH)
+        assert result.stdout.splitlines()[0] == f"destinations[offsite].server_fingerprint: {FP} -> not enrolled"
+        lines = warnings_in(result)
+        assert len(lines) == 1 and "destinations[offsite].server_fingerprint removed" in lines[0]
+        assert stored(pinned_db).destinations["offsite"].server_fingerprint is None
+
+    def test_the_removal_warning_quotes_a_hostile_name_for_the_shell(self, run, db):
+        make_db(run, db, RICH_YAML.replace(
+            '  spare:\n    url: "https://spare:8080"\n',
+            f'  "my dest":\n    url: "https://spare:8080"\n    server_fingerprint: "{FP}"\n',
+        ))
+        result = ok(run, db, "unset", 'destinations[my dest].server_fingerprint')
+        assert "enroll 'my dest'" in warnings_in(result)[0]
+
+    def test_unset_when_not_enrolled_is_a_noop(self, run, rich):
+        result = ok(run, rich, "unset", FP_PATH)
+        assert result.stdout == "destinations[offsite].server_fingerprint is already not enrolled; nothing changed\n"
+        assert warnings_in(result) == []
+
+    def test_a_dotted_destination_name_works(self, run, rich):
+        ok(run, rich, "set", "destinations.dc.two.server_fingerprint", FP)
+        assert stored(rich).destinations["dc.two"].server_fingerprint == FP
+        assert got(run, rich, "destinations[dc.two].server_fingerprint") == [FP]
+
+    def test_a_pin_shows_in_the_destination_block(self, run, pinned_db):
+        out = yaml.safe_load(run("get", "destinations.offsite", "-c", pinned_db).stdout)
+        assert out == {"url": "https://offsite:8080", "server_fingerprint": FP}
+        plain = yaml.safe_load(run("get", "destinations.spare", "-c", pinned_db).stdout)
+        assert plain == {"url": "https://spare:8080"}
+
+    def test_fingerprint_has_no_sub_settings(self, run, rich):
+        result = run("get", FP_PATH + ".x", "-c", rich)
+        assert result.exit_code == 1 and "no sub-settings" in result.stderr
+
+    def test_an_unknown_destination_setting_lists_the_valid_ones(self, run, rich):
+        result = run("get", "destinations.offsite.bogus", "-c", rich)
+        assert result.exit_code == 1
+        assert "url" in result.stderr and "server_fingerprint" in result.stderr
+
+    def test_changing_the_url_of_an_enrolled_destination_warns_the_pin_is_kept(self, run, pinned_db):
+        result = ok(run, pinned_db, "set", "destinations.offsite.url", "https://other:1")
+        assert any("is enrolled" in w and "pinned" in w for w in warnings_in(result))
+        stored_dest = stored(pinned_db).destinations["offsite"]
+        assert stored_dest.url == "https://other:1" and stored_dest.server_fingerprint == FP
+
+    def test_changing_the_url_of_an_unenrolled_destination_does_not_warn(self, run, rich):
+        assert warnings_in(ok(run, rich, "set", "destinations.offsite.url", "https://other:1")) == []
+
+
+class TestDotpathTlsPaths:
+    """`client_cert_file` / `client_key_file`: both or neither, absolute."""
+
+    @pytest.mark.parametrize("path", ["client_cert_file", "client_key_file"])
+    def test_get_unset_says_derived(self, run, rich, path):
+        assert got(run, rich, path) == [DERIVED_TLS]
+
+    def test_get_set(self, run, tls_db):
+        assert got(run, tls_db, "client_cert_file") == [CERT]
+        assert got(run, tls_db, "client_key_file") == [KEY]
+
+    @pytest.mark.parametrize("path", ["client_cert_file", "client_key_file"])
+    def test_setting_one_while_the_other_is_unset_is_refused(self, run, rich, path):
+        before, gen = db_state(rich), generation(rich)
+        result = run("set", path, "/etc/zfsbackup/x", "-c", rich)
+        assert result.exit_code == 1
+        assert "together" in result.stderr and "edit" in result.stderr
+        assert "Traceback" not in result.stderr and "config updated" not in result.stdout
+        assert db_state(rich) == before and generation(rich) == gen
+
+    @pytest.mark.parametrize(
+        "path, other_path, other",
+        [("client_cert_file", "client_key_file", KEY), ("client_key_file", "client_cert_file", CERT)],
+    )
+    def test_replacing_one_path_while_both_are_set_works(self, run, tls_db, path, other_path, other):
+        result = ok(run, tls_db, "set", path, "/srv/new/file")
+        assert result.stdout.splitlines()[0].startswith(f"{path}: ")
+        assert result.stdout.splitlines()[0].endswith("-> /srv/new/file")
+        assert warnings_in(result) == []
+        config = stored(tls_db)
+        assert str(getattr(config, path)) == "/srv/new/file"
+        assert str(getattr(config, other_path)) == other
+
+    @pytest.mark.parametrize("path", ["client_cert_file", "client_key_file"])
+    def test_a_relative_path_is_refused(self, run, tls_db, path):
+        before, gen = db_state(tls_db), generation(tls_db)
+        result = run("set", path, "certs/client.pem", "-c", tls_db)
+        assert result.exit_code == 1 and "absolute" in result.stderr
+        assert db_state(tls_db) == before and generation(tls_db) == gen
+
+    @pytest.mark.parametrize("path", ["client_cert_file", "client_key_file"])
+    def test_a_non_string_path_is_refused_with_a_quoting_hint(self, run, tls_db, path):
+        result = run("set", path, "123", "-c", tls_db)
+        assert result.exit_code == 1 and "must be a string" in result.stderr
+
+    @pytest.mark.parametrize("path, other_path", [
+        ("client_cert_file", "client_key_file"), ("client_key_file", "client_cert_file"),
+    ])
+    def test_unsetting_either_clears_both_with_a_warning(self, run, tls_db, path, other_path):
+        result = ok(run, tls_db, "unset", path)
+        config = stored(tls_db)
+        assert config.client_cert_file is None and config.client_key_file is None
+        lines = warnings_in(result)
+        assert len(lines) == 1
+        assert f"{other_path} was unset as well" in lines[0] and "<db>.tls/" in lines[0]
+        assert got(run, tls_db, path) == [DERIVED_TLS]
+        assert got(run, tls_db, other_path) == [DERIVED_TLS]
+
+    @pytest.mark.parametrize("path", ["client_cert_file", "client_key_file"])
+    def test_an_empty_value_clears_both_with_a_warning(self, run, tls_db, path):
+        result = ok(run, tls_db, "set", path, "")
+        assert stored(tls_db).client_cert_file is None and stored(tls_db).client_key_file is None
+        assert len(warnings_in(result)) == 1
+
+    def test_unset_when_neither_is_set_is_a_quiet_noop(self, run, rich):
+        before = db_state(rich)
+        result = ok(run, rich, "unset", "client_cert_file")
+        assert "nothing changed" in result.stdout and warnings_in(result) == []
+        assert db_state(rich) == before
+
+    def test_the_pair_survives_other_edits(self, run, tls_db):
+        ok(run, tls_db, "set", "api_port", "9001")
+        config = stored(tls_db)
+        assert str(config.client_cert_file) == CERT and str(config.client_key_file) == KEY
+
+    def test_client_id_file_is_no_longer_a_setting(self, run, rich):
+        for args in (("get", "client_id_file"), ("set", "client_id_file", "/x/id"), ("unset", "client_id_file")):
+            result = run(*args, "-c", rich)
+            assert result.exit_code == 1 and "unknown path" in result.stderr, args
+
+
+class TestDotpathHelp:
+    def test_get_set_unset_help_name_the_fingerprint_path(self, run):
+        for command in ("get", "set", "unset"):
+            assert "server_fingerprint" in run(command, "--help").stdout, command
+
+    def test_unset_help_describes_the_tls_pair_and_the_pin(self, run):
+        out = " ".join(run("unset", "--help").stdout.split())
+        assert "client_cert_file and client_key_file (unset together)" in out
+        assert "client_id_file" not in out
+
+
+class TestDotpathHttpsOnly:
+    @pytest.mark.parametrize("url", ["http://offsite:8080", "HTTP://offsite", "ftp://offsite", "offsite:8080", "https://"])
+    def test_a_non_https_url_is_refused_and_nothing_is_written(self, run, rich, url):
+        before, gen = db_state(rich), generation(rich)
+        result = run("set", "destinations.offsite.url", url, "-c", rich)
+        assert result.exit_code == 1
+        assert "destinations[offsite]" in result.stderr and "Traceback" not in result.stderr
+        assert db_state(rich) == before and generation(rich) == gen
+
+    def test_the_http_refusal_wording(self, run, rich):
+        result = run("set", "destinations.offsite.url", "http://offsite:8080", "-c", rich)
+        assert "plaintext http is not supported; use https://" in result.stderr
+        assert stored(rich).destinations["offsite"].url == "https://offsite:8080"
+
+    def test_an_https_url_is_accepted(self, run, rich):
+        ok(run, rich, "set", "destinations.offsite.url", "https://offsite.example:8443/x")
+        assert stored(rich).destinations["offsite"].url == "https://offsite.example:8443/x"
+
+
+def _config(tmp_path, destinations: dict) -> BackupConfig:
+    body = "".join(
+        f'  "{name}":\n    url: "https://{name}:1"\n'
+        + (f'    server_fingerprint: "{fp}"\n' if fp else "")
+        for name, fp in destinations.items()
+    )
+    return BackupConfig.from_file(
+        write_yaml(tmp_path, "datasets:\n  - name: \"tank/a\"\n" + ("destinations:\n" + body if body else ""), "pins.yaml")
+    )
+
+
+class TestPinChangeWarnings:
+    """`dotpath.pin_change_warnings(old, new)`: pure, per destination in both."""
+
+    def test_a_changed_pin_warns(self, tmp_path):
+        old, new = _config(tmp_path, {"d": FP}), _config(tmp_path, {"d": FP2})
+        (message,) = dotpath.pin_change_warnings(old, new)
+        assert "destinations[d].server_fingerprint changed" in message
+        assert "new fingerprint" in message
+
+    def test_a_removed_pin_warns(self, tmp_path):
+        old, new = _config(tmp_path, {"d": FP}), _config(tmp_path, {"d": None})
+        (message,) = dotpath.pin_change_warnings(old, new)
+        assert "destinations[d].server_fingerprint removed" in message
+        assert "enroll d" in message
+
+    def test_a_first_pin_does_not_warn(self, tmp_path):
+        old, new = _config(tmp_path, {"d": None}), _config(tmp_path, {"d": FP})
+        assert dotpath.pin_change_warnings(old, new) == []
+
+    def test_a_deleted_destination_does_not_warn(self, tmp_path):
+        old, new = _config(tmp_path, {"d": FP, "e": FP2}), _config(tmp_path, {"e": FP2})
+        assert dotpath.pin_change_warnings(old, new) == []
+
+    def test_deleting_every_destination_does_not_warn(self, tmp_path):
+        old, new = _config(tmp_path, {"d": FP}), _config(tmp_path, {})
+        assert dotpath.pin_change_warnings(old, new) == []
+
+    def test_an_unchanged_pin_does_not_warn(self, tmp_path):
+        old, new = _config(tmp_path, {"d": FP}), _config(tmp_path, {"d": FP})
+        assert dotpath.pin_change_warnings(old, new) == []
+
+    def test_a_new_pinned_destination_does_not_warn(self, tmp_path):
+        old, new = _config(tmp_path, {}), _config(tmp_path, {"d": FP})
+        assert dotpath.pin_change_warnings(old, new) == []
+
+    def test_one_message_per_affected_destination_in_name_order(self, tmp_path):
+        old = _config(tmp_path, {"zed": FP, "alpha": FP, "same": FP, "gone": FP})
+        new = _config(tmp_path, {"zed": None, "alpha": FP2, "same": FP})
+        messages = dotpath.pin_change_warnings(old, new)
+        assert len(messages) == 2
+        assert "destinations[alpha]" in messages[0] and "changed" in messages[0]
+        assert "destinations[zed]" in messages[1] and "removed" in messages[1]
+
+    def test_the_old_object_is_not_modified(self, tmp_path):
+        old, new = _config(tmp_path, {"d": FP}), _config(tmp_path, {"d": None})
+        dotpath.pin_change_warnings(old, new)
+        assert old.destinations["d"].server_fingerprint == FP

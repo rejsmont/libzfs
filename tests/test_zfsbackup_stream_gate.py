@@ -7,8 +7,13 @@ in-flight receives before it leaves for a reload.
 * `TestServerReceiveTimeout`  `ws.receive(timeout=WS_IDLE_TIMEOUT)` returning `None`.
 * `TestApiWorkerDrain`        `ApiWorker.run` against the `_bind_api_server` seam with
                               a fake server and the REAL app and gate.
+* `TestGatedEndpoints` /      the gated endpoints (`negotiate`, `resume_token`, and the trust
+  `TestGatedTrustEndpoints`   writers `/enroll` and `/rotate`) and the drain that waits for them.
 
-Nothing here touches ZFS or opens a socket.
+The app is authenticated (plan M10): the route tests use `_api_support.Authed` (a stub trust
+gateway pinning a certificate under `client1`); the `ApiWorker` tests run a REAL `ApiWorker`
+over a real config database and server identity (`tls_config_db`), with that certificate pinned
+through the real trust store. Nothing here touches ZFS or opens a network socket.
 """
 
 import errno
@@ -22,10 +27,12 @@ from unittest.mock import MagicMock, PropertyMock
 import pytest
 from simple_websocket import ConnectionClosed
 
+from _api_support import Authed, CLIENT_ID, buffered_client, enroll_body, make_client_cert, rotate_body
+from _tls_support import pin_client
 from test_zfsbackup_daemon_closeout import SUPERVISOR, Parent
 from zfsbackup import api as api_module
 from zfsbackup import workers
-from zfsbackup.api import RELOADING_ERROR, StreamGate, create_app
+from zfsbackup.api import RELOADING_ERROR, StreamGate
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup.config import BackupConfig, DatasetConfig, RemoteServerConfig
 from zfsbackup.remote import WS_IDLE_TIMEOUT
@@ -259,11 +266,23 @@ def _config(remote=True, **kw):
 
 
 @pytest.fixture
-def app(mocker):
+def authed(mocker):
+    """An authenticated app: `authed.client()` presents the certificate pinned under `client1`."""
     mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
-    app = create_app(_config())
-    app.testing = True
-    return app
+    return Authed(_config())
+
+
+@pytest.fixture
+def app(authed):
+    return authed.app
+
+
+def _authed(mocker, config, **kwargs):
+    mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
+    return Authed(config, **kwargs)
+
+
+STREAM_PATH = f"/backup/{CLIENT_ID}/pool/data/stream"
 
 
 @pytest.fixture(autouse=True)
@@ -273,27 +292,25 @@ def source_props(mocker):
 
 
 class TestGateInTheApp:
-    def test_the_gate_is_published_on_the_app(self, app):
-        gate = app.extensions["zfsbackup.stream_gate"]
+    def test_the_gate_is_published_on_the_app(self, authed):
+        gate = authed.gate
         assert isinstance(gate, StreamGate)
         assert gate.active == 0 and gate.draining is False
 
     def test_each_app_has_its_own_gate(self, mocker):
-        mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
-        a, b = create_app(_config()), create_app(_config())
-        assert a.extensions["zfsbackup.stream_gate"] is not b.extensions["zfsbackup.stream_gate"]
+        a, b = _authed(mocker, _config()), _authed(mocker, _config())
+        assert a.gate is not b.gate
 
     def test_the_gate_exists_even_without_remote_backup(self, mocker):
-        mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
-        assert isinstance(create_app(_config(remote=False)).extensions["zfsbackup.stream_gate"], StreamGate)
+        assert isinstance(_authed(mocker, _config(remote=False)).gate, StreamGate)
 
     def test_the_reloading_error_is_retryable(self):
         assert RELOADING_ERROR == {"error": "server is reloading; retry later", "retry": True}
 
-    def test_negotiate_is_503_retry_true_while_draining_and_calls_no_zfs(self, app, mocker):
+    def test_negotiate_is_503_retry_true_while_draining_and_calls_no_zfs(self, authed, mocker):
         zfs = {n: mocker.patch(f"zfsbackup.api.zfs.{n}") for n in ("exists", "list", "create", "set")}
-        app.extensions["zfsbackup.stream_gate"].start_draining()
-        resp = app.test_client().post(
+        authed.gate.start_draining()
+        resp = authed.client().post(
             "/backup/client1/pool/data/negotiate", json={"snapshots": ["a"], "config": "x"}
         )
         assert resp.status_code == 503
@@ -302,40 +319,39 @@ class TestGateInTheApp:
         for name, mock in zfs.items():
             assert not mock.called, f"zfs.{name} was called while draining"
 
-    def test_negotiate_works_before_draining(self, app, mocker):
+    def test_negotiate_works_before_draining(self, authed, mocker):
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         mocker.patch("zfsbackup.api.zfs.list", return_value=[])
-        resp = app.test_client().post("/backup/client1/pool/data/negotiate", json={"snapshots": []})
+        resp = authed.client().post("/backup/client1/pool/data/negotiate", json={"snapshots": []})
         assert resp.status_code == 200
 
-    def test_read_only_endpoints_keep_serving_while_draining(self, app):
-        app.extensions["zfsbackup.stream_gate"].start_draining()
-        client = app.test_client()
+    def test_read_only_endpoints_keep_serving_while_draining(self, authed):
+        authed.gate.start_draining()
+        client = authed.client()
         assert client.get("/health").status_code == 200
         assert client.get("/config").status_code == 200
         assert client.get("/datasets").status_code == 200
 
     def test_a_disabled_server_still_answers_disabled_not_reloading(self, mocker):
-        mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
-        app = create_app(_config(remote=False))
-        app.extensions["zfsbackup.stream_gate"].start_draining()
-        resp = app.test_client().post("/backup/c/pool/data/negotiate", json={})
+        authed = _authed(mocker, _config(remote=False))
+        authed.gate.start_draining()
+        resp = authed.client().post("/backup/client1/pool/data/negotiate", json={})
         assert resp.status_code == 503
         assert resp.get_json() == {"error": "remote_backup disabled"}
 
-    def _handler(self, app):
-        return app.view_functions["backup_stream"].__wrapped__
+    def _handler(self, authed):
+        return authed.app.view_functions["backup_stream"].__wrapped__
 
-    def test_stream_refuses_while_draining_and_never_starts_receive(self, app, mocker):
+    def test_stream_refuses_while_draining_and_never_starts_receive(self, authed, mocker):
         exists = mocker.patch("zfsbackup.api.zfs.exists")
         create = mocker.patch("zfsbackup.api.zfs.create")
         receive = mocker.patch("zfsbackup.api.zfs.receive.filesystem")
-        gate = app.extensions["zfsbackup.stream_gate"]
+        gate = authed.gate
         gate.start_draining()
         ws = MagicMock()
         ws.receive.side_effect = ConnectionClosed(None, None)       # a regression must fail, not spin
-        with app.test_request_context(query_string={"mode": "resume"}):
-            self._handler(app)(ws, "client1", "pool/data")
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+            self._handler(authed)(ws, "client1", "pool/data")
         assert json.loads(ws.send.call_args[0][0]) == RELOADING_ERROR
         ws.receive.assert_not_called()
         receive.assert_not_called()
@@ -343,16 +359,16 @@ class TestGateInTheApp:
         create.assert_not_called()
         assert gate.active == 0
 
-    def test_a_refused_stream_survives_a_dead_socket(self, app):
-        app.extensions["zfsbackup.stream_gate"].start_draining()
+    def test_a_refused_stream_survives_a_dead_socket(self, authed):
+        authed.gate.start_draining()
         ws = MagicMock()
         ws.send.side_effect = Exception("closed")
         ws.receive.side_effect = ConnectionClosed(None, None)
-        with app.test_request_context(query_string={"mode": "resume"}):
-            self._handler(app)(ws, "client1", "pool/data")       # must not raise
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+            self._handler(authed)(ws, "client1", "pool/data")       # must not raise
 
-    def test_a_stream_is_counted_while_it_runs(self, app, mocker):
-        gate = app.extensions["zfsbackup.stream_gate"]
+    def test_a_stream_is_counted_while_it_runs(self, authed, mocker):
+        gate = authed.gate
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         writer = MagicMock()
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
@@ -364,13 +380,13 @@ class TestGateInTheApp:
             return json.dumps({"done": True})
 
         ws.receive.side_effect = receive
-        with app.test_request_context(query_string={"mode": "resume"}):
-            self._handler(app)(ws, "client1", "pool/data")
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+            self._handler(authed)(ws, "client1", "pool/data")
         assert seen == [1]
         assert gate.active == 0
 
-    def test_a_stream_begun_before_draining_runs_to_completion(self, app, mocker):
-        gate = app.extensions["zfsbackup.stream_gate"]
+    def test_a_stream_begun_before_draining_runs_to_completion(self, authed, mocker):
+        gate = authed.gate
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         writer = MagicMock()
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
@@ -381,8 +397,8 @@ class TestGateInTheApp:
             return json.dumps({"done": True})
 
         ws.receive.side_effect = receive
-        with app.test_request_context(query_string={"mode": "resume"}):
-            self._handler(app)(ws, "client1", "pool/data")
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+            self._handler(authed)(ws, "client1", "pool/data")
         writer.close.assert_called_once()
         assert json.loads(ws.send.call_args[0][0]) == {"status": "ok"}
 
@@ -391,8 +407,8 @@ class TestGateInTheApp:
         ["exists-raises", "create-fails", "set-fails", "receive-raises", "send-raises",
          "connection-closed", "write-error", "ok"],
     )
-    def test_the_gate_is_released_on_every_path(self, app, mocker, source_props, arrange):
-        gate = app.extensions["zfsbackup.stream_gate"]
+    def test_the_gate_is_released_on_every_path(self, authed, mocker, source_props, arrange):
+        gate = authed.gate
         ws = MagicMock()
         ws.receive.side_effect = ConnectionClosed(None, None)    # a regression must fail, not spin
         writer = MagicMock()
@@ -423,22 +439,21 @@ class TestGateInTheApp:
             ws.receive.side_effect = [b"chunk"]
         else:
             ws.receive.side_effect = [b"x", json.dumps({"done": True})]
-        with app.test_request_context(query_string={"mode": "resume"}):
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             if expect_raise:
                 with pytest.raises(RuntimeError):
-                    self._handler(app)(ws, "client1", "pool/data")
+                    self._handler(authed)(ws, "client1", "pool/data")
             else:
-                self._handler(app)(ws, "client1", "pool/data")
+                self._handler(authed)(ws, "client1", "pool/data")
         assert gate.active == 0, f"gate leaked on path {arrange}"
 
     def test_the_gate_is_released_in_dry_run(self, mocker):
-        mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
-        app = create_app(_config(dry_run=True))
+        authed = _authed(mocker, _config(dry_run=True))
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         ws = MagicMock()
-        with app.test_request_context(query_string={"mode": "resume"}):
-            app.view_functions["backup_stream"].__wrapped__(ws, "c", "pool/data")
-        assert app.extensions["zfsbackup.stream_gate"].active == 0
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+            authed.app.view_functions["backup_stream"].__wrapped__(ws, "client1", "pool/data")
+        assert authed.gate.active == 0
         assert json.loads(ws.send.call_args[0][0])["dry_run"] is True
 
 
@@ -448,10 +463,10 @@ class TestGateOnProtocolRefusals:
 
     SERVER_DS = "pool/backups/client1/data"
 
-    def _run(self, app, ws, mode):
+    def _run(self, authed, ws, mode):
         qs = {} if mode is None else {"mode": mode}
-        with app.test_request_context(query_string=qs):
-            app.view_functions["backup_stream"].__wrapped__(ws, "client1", "pool/data")
+        with authed.context(STREAM_PATH, query_string=qs):
+            authed.app.view_functions["backup_stream"].__wrapped__(ws, "client1", "pool/data")
 
     @pytest.mark.parametrize(
         "arrange, mode, expect",
@@ -467,9 +482,9 @@ class TestGateOnProtocolRefusals:
         ],
     )
     def test_the_gate_is_balanced_and_nothing_is_received(
-        self, app, mocker, source_props, arrange, mode, expect
+        self, authed, mocker, source_props, arrange, mode, expect
     ):
-        gate = app.extensions["zfsbackup.stream_gate"]
+        gate = authed.gate
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         mocker.patch("zfsbackup.api.zfs.create")
         abort = mocker.patch("zfsbackup.api.zfs.receive.abort")
@@ -493,7 +508,7 @@ class TestGateOnProtocolRefusals:
         seen = []
         real_send = ws.send
         ws.send.side_effect = lambda m: seen.append(gate.active)
-        self._run(app, ws, mode)
+        self._run(authed, ws, mode)
         sent = json.loads(real_send.call_args[0][0])
         assert expect in sent["error"]
         assert gate.active == 0
@@ -503,39 +518,38 @@ class TestGateOnProtocolRefusals:
         # Mode errors are refused before the gate; every later refusal holds it while answering.
         assert seen == ([0] if arrange == "none" else [1])
 
-    def test_an_invalid_server_dataset_name_is_refused_and_balances_the_gate(self, app, mocker):
-        gate = app.extensions["zfsbackup.stream_gate"]
+    def test_an_invalid_server_dataset_name_is_refused_and_balances_the_gate(self, authed, mocker):
+        gate = authed.gate
         exists = mocker.patch("zfsbackup.api.zfs.exists")
         receive = mocker.patch("zfsbackup.api.zfs.receive.filesystem")
         ws = MagicMock()
         ws.receive.side_effect = ConnectionClosed(None, None)
-        with app.test_request_context(query_string={"mode": "fresh"}):
-            app.view_functions["backup_stream"].__wrapped__(ws, "client1", "pool//x")
-        assert "Invalid dataset name" in json.loads(ws.send.call_args[0][0])["error"]
+        with authed.context(STREAM_PATH, query_string={"mode": "fresh"}):
+            authed.app.view_functions["backup_stream"].__wrapped__(ws, "client1", "pool//x")
+        assert "invalid dataset name" in json.loads(ws.send.call_args[0][0])["error"]
         exists.assert_not_called()
         receive.assert_not_called()
         ws.receive.assert_not_called()
         assert gate.active == 0
 
     def test_a_dry_run_reply_leaves_the_gate_balanced(self, mocker):
-        mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
-        app = create_app(_config(dry_run=True))
+        authed = _authed(mocker, _config(dry_run=True))
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         ws = MagicMock()
-        self._run(app, ws, "fresh")
+        self._run(authed, ws, "fresh")
         assert json.loads(ws.send.call_args[0][0]) == {"status": "ok", "dry_run": True}
-        assert app.extensions["zfsbackup.stream_gate"].active == 0
+        assert authed.gate.active == 0
 
     @pytest.mark.parametrize("arrange, status", [("mismatch", 409), ("read-fails", 500)])
-    def test_negotiate_refusals_balance_the_gate(self, app, mocker, source_props, arrange, status):
-        gate = app.extensions["zfsbackup.stream_gate"]
+    def test_negotiate_refusals_balance_the_gate(self, authed, mocker, source_props, arrange, status):
+        gate = authed.gate
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         mock_set = mocker.patch("zfsbackup.api.zfs.set")
         if arrange == "mismatch":
             source_props.return_value = {"org.zfsbackup:source_dataset": "tank/data"}
         else:
             source_props.side_effect = RuntimeError("zfs get failed")
-        resp = app.test_client().post(
+        resp = authed.client().post(
             "/backup/client1/pool/data/negotiate", json={"snapshots": [], "config": "cfg"}
         )
         assert resp.status_code == status
@@ -547,29 +561,29 @@ class TestServerReceiveTimeout:
     """18.4: a client that stops sending must not hold the receive (and, through
     the gate, the reload) forever."""
 
-    def _handler(self, app):
-        return app.view_functions["backup_stream"].__wrapped__
+    def _handler(self, authed):
+        return authed.app.view_functions["backup_stream"].__wrapped__
 
-    def test_receive_is_called_with_the_idle_timeout(self, app, mocker):
+    def test_receive_is_called_with_the_idle_timeout(self, authed, mocker):
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=MagicMock())
         ws = MagicMock()
         ws.receive.side_effect = [b"a", json.dumps({"done": True})]
-        with app.test_request_context(query_string={"mode": "resume"}):
-            self._handler(app)(ws, "client1", "pool/data")
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+            self._handler(authed)(ws, "client1", "pool/data")
         assert ws.receive.call_count == 2
         for call in ws.receive.call_args_list:
             assert call.kwargs == {"timeout": WS_IDLE_TIMEOUT}
 
-    def test_none_closes_the_writer_sends_a_timeout_error_and_releases_the_gate(self, app, mocker):
-        gate = app.extensions["zfsbackup.stream_gate"]
+    def test_none_closes_the_writer_sends_a_timeout_error_and_releases_the_gate(self, authed, mocker):
+        gate = authed.gate
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         writer = MagicMock()
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
         ws.receive.side_effect = [b"chunk", None]
-        with app.test_request_context(query_string={"mode": "resume"}):
-            self._handler(app)(ws, "client1", "pool/data")
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+            self._handler(authed)(ws, "client1", "pool/data")
         writer.write.assert_called_once_with(b"chunk")
         writer.close.assert_called_once()
         sent = json.loads(ws.send.call_args[0][0])
@@ -578,26 +592,26 @@ class TestServerReceiveTimeout:
         assert "status" not in sent
         assert gate.active == 0
 
-    def test_a_timeout_on_the_first_receive_also_closes_the_writer(self, app, mocker):
+    def test_a_timeout_on_the_first_receive_also_closes_the_writer(self, authed, mocker):
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         writer = MagicMock()
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
         ws.receive.return_value = None
-        with app.test_request_context(query_string={"mode": "resume"}):
-            self._handler(app)(ws, "client1", "pool/data")
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+            self._handler(authed)(ws, "client1", "pool/data")
         writer.write.assert_not_called()
         writer.close.assert_called_once()
 
-    def test_a_writer_close_failure_during_a_timeout_is_suppressed_and_still_reported(self, app, mocker):
+    def test_a_writer_close_failure_during_a_timeout_is_suppressed_and_still_reported(self, authed, mocker):
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         writer = MagicMock()
         writer.close.side_effect = Exception("receive exited 1")
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
         ws.receive.return_value = None
-        with app.test_request_context(query_string={"mode": "resume"}):
-            self._handler(app)(ws, "client1", "pool/data")       # must not raise
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+            self._handler(authed)(ws, "client1", "pool/data")       # must not raise
         assert "no data from the client" in json.loads(ws.send.call_args[0][0])["error"]
 
 
@@ -644,10 +658,16 @@ class ApiEnv:
         self.epoch = ReloadEpoch()
         self.worker = None
         self.log = []
+        #: The client certificate pinned under `client1` in the worker's config database.
+        self.cert = None
 
     @property
     def gate(self):
         return self.app.extensions["zfsbackup.stream_gate"]
+
+    def client(self):
+        """A test client of the worker's real app, presenting the pinned certificate."""
+        return buffered_client(self.app, self.cert)
 
     def wait_listening(self):
         assert self.listening.wait(30), "the API worker never started listening"
@@ -655,21 +675,29 @@ class ApiEnv:
 
 
 @pytest.fixture
-def env(mocker, monkeypatch):
+def env(mocker, monkeypatch, tls_config_db):
+    """A REAL `ApiWorker` over a real config database and server identity (HTTPS only: it
+    exits 1 without them), with the app real too and only the listening server faked. The
+    certificate `env.cert` is pinned under `client1` through the real trust store, so the
+    worker's gateway authenticates `env.client()`."""
     env = ApiEnv()
     env.config = _config()
+    env.cert = make_client_cert(cn="client1")
+    pin_client(tls_config_db, env.cert, CLIENT_ID)
     mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
     real_create = api_module.create_app
 
-    def create(config):
-        env.app = real_create(config)
+    def create(config, trust, server_fingerprint, **kwargs):
+        env.gateway = trust
+        env.app = real_create(config, trust, server_fingerprint, **kwargs)
         env.app.testing = True
         return env.app
 
     mocker.patch("zfsbackup.api.create_app", side_effect=create)
     env.server_kwargs = {}
 
-    def bind(app, host, port):
+    def bind(app, host, port, gateway):
+        assert gateway is env.gateway, "the connections' TLS contexts come from the app's gateway"
         env.server = FakeServer(env.events, **env.server_kwargs)
         env.listening_after_thread = True
         return env.server
@@ -683,7 +711,9 @@ def env(mocker, monkeypatch):
             env.listening.set()
 
     monkeypatch.setattr(threading.Thread, "start", start)
-    env.worker = ApiWorker(env.config, env.stop, reload_epoch=env.epoch, born_epoch=0)
+    env.worker = ApiWorker(
+        env.config, env.stop, reload_epoch=env.epoch, born_epoch=0, config_db=tls_config_db
+    )
     return env
 
 
@@ -752,8 +782,8 @@ class TestApiWorkerDrain:
             time.sleep(1.5)                            # three poll slices later:
             seen["events_while_waiting"] = list(e.events)
             seen["refused"] = e.gate.begin()
-            client = e.app.test_client()
-            seen["negotiate"] = client.post("/backup/c1/pool/data/negotiate", json={"snapshots": []})
+            client = e.client()
+            seen["negotiate"] = client.post("/backup/client1/pool/data/negotiate", json={"snapshots": []})
             seen["health"] = client.get("/health").status_code
             seen["ended_at"] = time.monotonic()
             e.gate.end()
@@ -971,13 +1001,12 @@ class TestApiWorkerDrain:
 
 
 # ---------------------------------------------------------------------------
-# register / negotiate / resume_token are gated too (`_gated`)
+# negotiate / resume_token (and the trust writers) are gated too (`_gated`)
 # ---------------------------------------------------------------------------
 
 GATED = [
-    ("register", "post", "/backup/register", {"client_id": "c1"}),
-    ("negotiate", "post", "/backup/c1/pool/data/negotiate", {"snapshots": []}),
-    ("resume_token", "get", "/backup/c1/pool/data/resume_token", None),
+    ("negotiate", "post", "/backup/client1/pool/data/negotiate", {"snapshots": []}),
+    ("resume_token", "get", "/backup/client1/pool/data/resume_token", None),
 ]
 
 
@@ -991,19 +1020,21 @@ class TestGatedEndpoints:
         return {n: mocker.patch(f"zfsbackup.api.zfs.{n}", return_value=True if n == "exists" else []) for n in
                 ("exists", "list", "create", "set")}
 
-    def test_endpoint_names_are_preserved(self, app):
-        for name in ("backup_register", "backup_negotiate", "backup_resume_token", "backup_stream"):
-            assert name in app.view_functions
-            assert app.view_functions[name].__name__ == name
-        rules = {r.rule for r in app.url_map.iter_rules()}
-        assert {"/backup/register", "/backup/<client_id>/<path:dataset>/negotiate",
+    def test_endpoint_names_are_preserved(self, authed):
+        for name in ("backup_negotiate", "backup_resume_token", "backup_stream", "enroll", "rotate"):
+            assert name in authed.app.view_functions
+            assert authed.app.view_functions[name].__name__ == name
+        rules = {r.rule for r in authed.app.url_map.iter_rules()}
+        assert {"/enroll", "/rotate", "/backup/<client_id>/<path:dataset>/negotiate",
                 "/backup/<client_id>/<path:dataset>/resume_token"} <= rules
+        assert "backup_register" not in authed.app.view_functions
+        assert "/backup/register" not in rules
 
     @pytest.mark.parametrize("name, method, url, body", GATED, ids=[g[0] for g in GATED])
-    def test_while_draining_it_is_503_reloading_and_calls_no_zfs(self, app, zfs, name, method, url, body):
-        gate = app.extensions["zfsbackup.stream_gate"]
+    def test_while_draining_it_is_503_reloading_and_calls_no_zfs(self, authed, zfs, name, method, url, body):
+        gate = authed.gate
         gate.start_draining()
-        resp = _call(app.test_client(), method, url, body)
+        resp = _call(authed.client(), method, url, body)
         assert resp.status_code == 503
         assert resp.get_json() == RELOADING_ERROR
         for fn, mock in zfs.items():
@@ -1012,46 +1043,44 @@ class TestGatedEndpoints:
 
     @pytest.mark.parametrize("name, method, url, body", GATED, ids=[g[0] for g in GATED])
     def test_a_disabled_server_says_disabled_not_reloading(self, mocker, name, method, url, body):
-        mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
-        app = create_app(_config(remote=False))
-        app.testing = True
-        app.extensions["zfsbackup.stream_gate"].start_draining()
-        resp = _call(app.test_client(), method, url, body)
+        authed = _authed(mocker, _config(remote=False))
+        authed.gate.start_draining()
+        resp = _call(authed.client(), method, url, body)
         assert resp.status_code == 503
         assert resp.get_json() == {"error": "remote_backup disabled"}
-        assert app.extensions["zfsbackup.stream_gate"].active == 0
+        assert authed.gate.active == 0
 
     @pytest.mark.parametrize("name, method, url, body", GATED, ids=[g[0] for g in GATED])
-    def test_before_draining_it_works(self, app, zfs, name, method, url, body):
-        resp = _call(app.test_client(), method, url, body)
+    def test_before_draining_it_works(self, authed, zfs, name, method, url, body):
+        resp = _call(authed.client(), method, url, body)
         assert resp.status_code == 200
         assert resp.get_json() != RELOADING_ERROR
 
     @pytest.mark.parametrize("name, method, url, body", GATED, ids=[g[0] for g in GATED])
-    def test_the_gate_is_released_after_a_normal_answer(self, app, zfs, name, method, url, body):
-        _call(app.test_client(), method, url, body)
-        assert app.extensions["zfsbackup.stream_gate"].active == 0
+    def test_the_gate_is_released_after_a_normal_answer(self, authed, zfs, name, method, url, body):
+        _call(authed.client(), method, url, body)
+        assert authed.gate.active == 0
 
-    def test_a_400_answer_releases_the_gate(self, app, zfs):
-        resp = app.test_client().post("/backup/register", json={})
+    def test_a_400_answer_releases_the_gate(self, authed, zfs):
+        resp = authed.client().post("/backup/client1/pool/a%25b/negotiate", json={})
         assert resp.status_code == 400
-        assert app.extensions["zfsbackup.stream_gate"].active == 0
+        assert authed.gate.active == 0
 
     @pytest.mark.parametrize("name, method, url, body", GATED, ids=[g[0] for g in GATED])
-    def test_an_exception_releases_the_gate(self, app, mocker, name, method, url, body):
+    def test_an_exception_releases_the_gate(self, authed, mocker, name, method, url, body):
         mocker.patch("zfsbackup.api.zfs.exists", side_effect=RuntimeError("zfs exploded"))
         if name == "resume_token":
             # The token lookup reports any failure as a 500 rather than raising.
-            resp = _call(app.test_client(), method, url, body)
+            resp = _call(authed.client(), method, url, body)
             assert resp.status_code == 500 and resp.get_json() == {"error": "zfs exploded"}
         else:
             with pytest.raises(RuntimeError):
-                _call(app.test_client(), method, url, body)
-        assert app.extensions["zfsbackup.stream_gate"].active == 0
+                _call(authed.client(), method, url, body)
+        assert authed.gate.active == 0
 
     @pytest.mark.parametrize("name, method, url, body", GATED, ids=[g[0] for g in GATED])
-    def test_a_running_call_is_counted_and_finishes_after_draining_begins(self, app, mocker, name, method, url, body):
-        gate = app.extensions["zfsbackup.stream_gate"]
+    def test_a_running_call_is_counted_and_finishes_after_draining_begins(self, authed, mocker, name, method, url, body):
+        gate = authed.gate
         entered, release = threading.Event(), threading.Event()
 
         def blocking_exists(*a, **kw):
@@ -1064,7 +1093,7 @@ class TestGatedEndpoints:
         mocker.patch("zfsbackup.api.zfs.create")
         result = {}
         thread = threading.Thread(
-            target=lambda: result.update(resp=_call(app.test_client(), method, url, body)), daemon=True
+            target=lambda: result.update(resp=_call(authed.client(), method, url, body)), daemon=True
         )
         thread.start()
         try:
@@ -1072,7 +1101,7 @@ class TestGatedEndpoints:
             assert gate.active == 1, "an in-flight call must be counted"
             gate.start_draining()
             assert gate.wait_idle(0.2) is False, "a drain must wait for it"
-            late = _call(app.test_client(), method, url, body)
+            late = _call(authed.client(), method, url, body)
             assert late.status_code == 503             # new ones are refused meanwhile
         finally:
             release.set()
@@ -1080,12 +1109,12 @@ class TestGatedEndpoints:
         assert result["resp"].status_code == 200, "the call begun before the drain completes"
         assert gate.wait_idle(5) is True and gate.active == 0
 
-    def test_read_only_endpoints_are_not_counted(self, app, mocker):
-        gate = app.extensions["zfsbackup.stream_gate"]
+    def test_read_only_endpoints_are_not_counted(self, authed, mocker):
+        gate = authed.gate
         seen = []
         mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock,
                             side_effect=lambda: seen.append(gate.active) or [])
-        app.test_client().get("/datasets")
+        authed.client().get("/datasets")
         assert seen and set(seen) == {0}
 
 
@@ -1107,7 +1136,7 @@ class TestApiWorkerDrainsGatedCalls:
             result = {}
             t = threading.Thread(
                 target=lambda: result.update(
-                    resp=e.app.test_client().post("/backup/c1/pool/data/negotiate", json={"snapshots": []})
+                    resp=e.client().post("/backup/client1/pool/data/negotiate", json={"snapshots": []})
                 ),
                 daemon=True,
             )
@@ -1127,5 +1156,187 @@ class TestApiWorkerDrainsGatedCalls:
         assert (outcome, code) == ("exit", 3)
         assert seen["active"] == 1 and seen["events"] == []
         assert seen["status"] == 200, "the negotiate begun before the reload was not cut off"
+        assert env.finished_at >= seen["ended"]
+        assert env.events == ["shutdown", "server_close"]
+
+
+# ---------------------------------------------------------------------------
+# /enroll and /rotate write trust, so they are gated too; /whoami and /health are not
+# ---------------------------------------------------------------------------
+
+
+def _enroll_request(authed, *, client_id="host-z"):
+    """-> `(url, body)` of a well-formed `/enroll` for `authed` (token for its server)."""
+    from zfsbackup import identity
+
+    token, _ = identity.make_token(authed.server_fp)
+    return "/enroll", enroll_body(authed.server_fp, client_id, make_client_cert(), str(token))
+
+
+def _rotate_request(authed):
+    return "/rotate", rotate_body(
+        authed.server_fp, CLIENT_ID, authed.who.fingerprint, make_client_cert()
+    )
+
+
+TRUST_REQUESTS = {"enroll": _enroll_request, "rotate": _rotate_request}
+
+
+class TestGatedTrustEndpoints:
+    @pytest.fixture(autouse=True)
+    def _no_zfs(self, mocker):
+        mocker.patch("zfsbackup.api.zfs.exists", return_value=False)
+
+    @staticmethod
+    def _post(authed, name):
+        url, body = TRUST_REQUESTS[name](authed)
+        client = authed.client(None) if name == "enroll" else authed.client()
+        return client.post(url, json=body)
+
+    @staticmethod
+    def _writer_calls(authed, name):
+        gw = authed.gateway
+        return gw.enroll_calls if name == "enroll" else gw.rotate_calls
+
+    @pytest.mark.parametrize("name", sorted(TRUST_REQUESTS))
+    def test_while_draining_it_is_503_reloading_and_writes_nothing(self, authed, name):
+        authed.gate.start_draining()
+        resp = self._post(authed, name)
+        assert resp.status_code == 503
+        assert resp.get_json() == RELOADING_ERROR
+        assert self._writer_calls(authed, name) == []
+        assert authed.gateway.refresh_calls == 0
+        assert authed.gate.active == 0
+
+    @pytest.mark.parametrize("name", sorted(TRUST_REQUESTS))
+    def test_a_disabled_server_says_disabled_not_reloading(self, mocker, name):
+        authed = _authed(mocker, _config(remote=False))
+        authed.gate.start_draining()
+        resp = self._post(authed, name)
+        assert resp.status_code == 503
+        assert resp.get_json() == {"error": "remote_backup disabled"}
+        assert self._writer_calls(authed, name) == []
+
+    @pytest.mark.parametrize("name", sorted(TRUST_REQUESTS))
+    def test_before_draining_it_works(self, authed, name):
+        resp = self._post(authed, name)
+        assert resp.status_code == 200, resp.get_json()
+        assert len(self._writer_calls(authed, name)) == 1
+        assert authed.gate.active == 0
+
+    @pytest.mark.parametrize("name", sorted(TRUST_REQUESTS))
+    @pytest.mark.parametrize("answer", ["bad-json", "bad-version", "store-raises"])
+    def test_every_way_out_releases_the_gate(self, authed, name, answer):
+        url, body = TRUST_REQUESTS[name](authed)
+        client = authed.client(None) if name == "enroll" else authed.client()
+        if answer == "bad-json":
+            resp = client.post(url, data=b"[1", content_type="application/json")
+            assert resp.status_code == 400
+        elif answer == "bad-version":
+            resp = client.post(url, json={**body, "version": 2})
+            assert resp.status_code == 400
+        else:
+            authed.gateway.enroll_effect = RuntimeError("database exploded")
+            authed.gateway.rotate_effect = RuntimeError("database exploded")
+            resp = client.post(url, json=body)
+            assert resp.status_code == 503
+        assert authed.gate.active == 0
+
+    @pytest.mark.parametrize("name", sorted(TRUST_REQUESTS))
+    def test_a_running_call_is_counted_and_finishes_after_draining_begins(self, authed, name):
+        entered, release = threading.Event(), threading.Event()
+
+        def block(**kwargs):
+            entered.set()
+            assert release.wait(30)
+            from zfsbackup.config.store.trust import EnrollOutcome, RotateOutcome
+
+            return EnrollOutcome.ENROLLED if name == "enroll" else RotateOutcome.ROTATED
+
+        authed.gateway.enroll_effect = block
+        authed.gateway.rotate_effect = block
+        result = {}
+        thread = threading.Thread(
+            target=lambda: result.update(resp=self._post(authed, name)), daemon=True
+        )
+        thread.start()
+        try:
+            assert entered.wait(30)
+            assert authed.gate.active == 1, "an in-flight trust write must be counted"
+            authed.gate.start_draining()
+            assert authed.gate.wait_idle(0.2) is False, "a drain must wait for it"
+            assert self._post(authed, name).status_code == 503      # new ones are refused meanwhile
+        finally:
+            release.set()
+            thread.join(30)
+        assert result["resp"].status_code == 200
+        assert authed.gate.wait_idle(5) is True
+
+    def test_whoami_and_health_are_not_counted_and_answer_while_draining(self, authed):
+        seen = []
+        real_lookup = authed.gateway.lookup
+
+        def lookup(fp):
+            seen.append(authed.gate.active)
+            return real_lookup(fp)
+
+        authed.gateway.lookup = lookup
+        authed.gate.start_draining()
+        client = authed.client()
+        assert client.get("/whoami").get_json()["client_id"] == CLIENT_ID
+        assert client.get("/health").status_code == 200
+        assert seen == [0]
+        assert authed.gate.active == 0
+
+    def test_whoami_answers_when_remote_backup_is_disabled(self, mocker):
+        authed = _authed(mocker, _config(remote=False))
+        assert authed.client().get("/whoami").status_code == 200
+
+
+class TestApiWorkerDrainsTrustWrites:
+    def test_a_reload_waits_for_a_running_enroll_then_exits_3(self, env, mocker):
+        from zfsbackup import identity
+
+        entered, release = threading.Event(), threading.Event()
+        mocker.patch("zfsbackup.api.zfs.exists", return_value=False)
+
+        def blocking_enroll(self, **kwargs):
+            entered.set()
+            release.wait(30)
+            from zfsbackup.config.store.trust import EnrollOutcome
+
+            return EnrollOutcome.ENROLLED
+
+        mocker.patch.object(api_module.TrustGateway, "enroll_client", blocking_enroll)
+        mocker.patch.object(api_module.TrustGateway, "token_precheck", lambda self, **kw: True)
+        seen = {}
+
+        def driver(e):
+            e.wait_listening()
+            token, _ = identity.make_token(e.gateway.server_fingerprint)
+            body = enroll_body(e.gateway.server_fingerprint, "host-z", make_client_cert(), str(token))
+            result = {}
+            t = threading.Thread(
+                target=lambda: result.update(
+                    resp=buffered_client(e.app).post("/enroll", json=body)
+                ),
+                daemon=True,
+            )
+            t.start()
+            assert entered.wait(30)
+            e.epoch.set(1)
+            assert wait_until(lambda: e.gate.draining)
+            time.sleep(1.2)
+            seen["events"] = list(e.events)
+            seen["active"] = e.gate.active
+            seen["ended"] = time.monotonic()
+            release.set()
+            t.join(30)
+            seen["status"] = result["resp"].status_code
+
+        outcome, code = run_worker(env, driver)
+        assert (outcome, code) == ("exit", 3)
+        assert seen["active"] == 1 and seen["events"] == []
+        assert seen["status"] == 200, "the enrollment begun before the reload was not cut off"
         assert env.finished_at >= seen["ended"]
         assert env.events == ["shutdown", "server_close"]

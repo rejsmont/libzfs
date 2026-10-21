@@ -48,6 +48,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -107,7 +108,7 @@ def cfg(*names, remote=False, prefix="autosnap", **kwargs) -> BackupConfig:
         if remote and i == 0:
             extra["remote"] = [RemoteDatasetConfig(destination="offsite")]
         datasets.append(DatasetConfig(name=name, **extra))
-    kwargs.setdefault("destinations", {"offsite": Destination(url="ssh://h/pool")} if remote else {})
+    kwargs.setdefault("destinations", {"offsite": Destination(url="https://h/pool")} if remote else {})
     return BackupConfig(datasets=datasets, snapshot_prefix=prefix, **kwargs)
 
 
@@ -141,7 +142,8 @@ class FakeWorker:
     _pids = itertools.count(FAKE_PID_BASE)
 
     def __init__(self, name, world, config, stop_event, verbose=False, *,
-                 reload_epoch=None, born_epoch=0, workers_lock=None):
+                 reload_epoch=None, born_epoch=0, workers_lock=None,
+                 config_db=None, tls_dir=None, client_id=None):
         self.name = name
         self.world = world
         self.config = config
@@ -150,6 +152,11 @@ class FakeWorker:
         self.reload_epoch = reload_epoch
         self.born_epoch = born_epoch
         self.workers_lock = workers_lock
+        # M9: the API worker gets `config_db`, the remote worker `tls_dir` and
+        # `client_id` (None when `_new_worker` did not pass them).
+        self.config_db = config_db
+        self.tls_dir = tls_dir
+        self.client_id = client_id
         self.pid = None
         self._alive = False
         self.exitcode = None
@@ -183,12 +190,16 @@ class World:
     """The scripted environment around one `BackupDaemon`."""
 
     def __init__(self, mocker, tmp_path, *, config=None, key=(STORE, 0),
-                 dry_run=False, with_lock=True, daemon_key="same"):
+                 dry_run=False, with_lock=True, daemon_key="same", client_id=None):
         self.events = []
         self.made = []
         self.clock = [1000.0]
         self.db_key = key
         self.db_config = config if config is not None else cfg()
+        #: `host_identity.client_id` as the scripted read returns it
+        #: (`ConfigSnapshot.client_id`); the running daemon starts with
+        #: `client_id`.
+        self.db_client_id = client_id
         self.load_error = None
         self.poll_error = None
         self.on_load = None     # called inside the scripted read, before it returns
@@ -212,7 +223,8 @@ class World:
             if world.load_error is not None:
                 raise world.load_error
             return ConfigSnapshot(
-                copy.deepcopy(world.db_config), world.db_key[1], "rev", world.db_key[0]
+                copy.deepcopy(world.db_config), world.db_key[1], "rev", world.db_key[0],
+                world.db_client_id,
             )
 
         mocker.patch("zfsbackup.daemon.read_store_state", side_effect=read_store_state)
@@ -243,6 +255,7 @@ class World:
             key=key if daemon_key == "same" else daemon_key,
             presence_lock=self.lock,
             dry_run_override=dry_run,
+            client_id=client_id,
         )
 
     # -- driving -----------------------------------------------------------
@@ -315,9 +328,10 @@ def _debug_logging(caplog):
 
 @pytest.fixture(autouse=True)
 def _private_home(monkeypatch, tmp_path_factory):
-    """The default client id file lives under `$HOME`; the pre-acceptance
-    check of a newly needed remote worker (B3) reads it. Point `HOME` at a
-    private writable directory so no test depends on the developer's own."""
+    """The legacy `remote.ClientIdentity` (until M11) writes
+    `~/.config/zfsbackup/client_id`; nothing in the supervisor does any more
+    (the id is in the database), but point `HOME` at a private writable
+    directory so no test can ever touch the developer's own."""
     monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
 
 
@@ -2634,6 +2648,180 @@ class TestIdenticalCandidate:
         assert world.daemon._rejected == (STORE, 1)
 
 
+@pytest.mark.unit
+class TestClientIdReload:
+    """M9 / D2: the client id (`host_identity`, read with the config in one
+    snapshot) is compared by a reload next to `same_as`. A changed id with an
+    otherwise identical config is a real switch -- epoch bump, the remote worker
+    turns over and is born with the new id; the same id moves only the key."""
+
+    def _world(self, mocker, tmp_path, *, old_id="host-a", config=None):
+        config = config if config is not None else cfg(remote=True)
+        return World(mocker, tmp_path, config=config, client_id=old_id)
+
+    def test_the_remote_worker_is_first_born_with_the_startup_id(self, mocker, tmp_path):
+        w = self._world(mocker, tmp_path)
+        w.start_workers()
+        (remote,) = w.workers_made("remote")
+        assert remote.client_id == "host-a"
+        assert remote.tls_dir is not None and str(remote.tls_dir).endswith("config.db.tls")
+
+    def test_only_the_remote_worker_gets_the_id_and_only_the_api_worker_the_database(
+        self, mocker, tmp_path
+    ):
+        w = self._world(mocker, tmp_path)
+        w.start_workers()
+        for made in w.made:
+            if made.name == "remote":
+                assert (made.client_id, made.config_db) == ("host-a", None)
+            elif made.name == "api":
+                assert (made.client_id, made.tls_dir, made.config_db) == (None, None, w.resolved)
+            else:
+                assert (made.client_id, made.tls_dir, made.config_db) == (None, None, None)
+
+    def test_a_changed_id_with_an_identical_config_is_a_switch_not_identical(
+        self, mocker, tmp_path, caplog
+    ):
+        w = self._world(mocker, tmp_path)
+        old = w.start_workers()
+        w.db_client_id = "host-b"
+        w.write((STORE, 1))                                  # same config, same content
+        w.hup()
+        assert w.daemon._handoff.epoch == 1 and w.daemon._reload_epoch.get() == 1
+        assert w.daemon._handoff.client_id == "host-b"
+        assert w.daemon._handoff.key == (STORE, 1)
+        assert not messages(caplog, logging.INFO, "identical")
+        assert messages(caplog, logging.INFO, "accepted")
+        assert w.lock.state["target"] == (STORE, 1)
+        assert all(x.is_alive() for x in old.values())       # nothing is killed: they drain
+        exited_for_reload(old)
+        w.daemon._check_workers()
+        assert {x.born_epoch for x in w.workers_made("remote")} == {0, 1}
+        by_epoch = {x.born_epoch: x.client_id for x in w.workers_made("remote")}
+        assert by_epoch == {0: "host-a", 1: "host-b"}        # the new worker has the new id
+        assert w.lock.state["applied"] == (STORE, 1)
+
+    def test_the_summary_lists_client_id_as_a_changed_setting_and_logs_the_change(
+        self, mocker, tmp_path, caplog
+    ):
+        w = self._world(mocker, tmp_path)
+        w.start_workers()
+        w.db_client_id = "host-b"
+        w.write((STORE, 1))
+        w.hup()
+        assert messages(caplog, logging.INFO, "settings changed: client_id")
+        assert messages(caplog, logging.INFO, "client id: host-a -> host-b")
+
+    def test_a_first_id_replaces_none(self, mocker, tmp_path, caplog):
+        w = self._world(mocker, tmp_path, old_id=None)
+        w.start_workers()
+        w.db_client_id = "host-new"
+        w.write((STORE, 1))
+        w.hup()
+        assert w.daemon._handoff.epoch == 1 and w.daemon._handoff.client_id == "host-new"
+        assert messages(caplog, logging.INFO, "client id: (none) -> host-new")
+
+    def test_a_removed_id_is_a_switch_too(self, mocker, tmp_path, caplog):
+        w = self._world(mocker, tmp_path)
+        w.start_workers()
+        w.db_client_id = None
+        w.write((STORE, 1))
+        w.hup()
+        assert w.daemon._handoff.epoch == 1 and w.daemon._handoff.client_id is None
+        assert messages(caplog, logging.INFO, "client id: host-a -> (none)")
+
+    def test_the_same_id_with_an_identical_config_is_adopted_with_no_turnover(
+        self, mocker, tmp_path, caplog
+    ):
+        w = self._world(mocker, tmp_path)
+        before = w.start_workers()
+        made = len(w.made)
+        w.write((STORE, 1))                                  # re-import: new key, same content
+        w.hup()
+        assert w.daemon._workers == before and len(w.made) == made
+        assert w.daemon._reload_epoch.get() == 0
+        h = w.daemon._handoff
+        assert h.epoch == 0 and h.key == (STORE, 1) and h.client_id == "host-a"
+        assert messages(caplog, logging.INFO, "is identical to running generation 0")
+        assert not messages(caplog, logging.INFO, "client id:")
+
+    def test_a_changed_id_and_a_changed_config_are_one_switch(self, mocker, tmp_path, caplog):
+        w = self._world(mocker, tmp_path)
+        w.start_workers()
+        w.db_client_id = "host-b"
+        w.write((STORE, 1), config=cfg(remote=True, prefix="other"))
+        w.hup()
+        assert w.daemon._handoff.epoch == 1 and w.daemon._reload_epoch.get() == 1
+        assert messages(caplog, logging.INFO, "settings changed: snapshot_prefix, client_id")
+
+    def test_the_pid_file_state_is_the_normal_switch_state(self, mocker, tmp_path):
+        w = self._world(mocker, tmp_path)
+        w.start_workers()
+        w.db_client_id = "host-b"
+        w.write((STORE, 1))
+        w.hup()
+        assert w.lock.state["target"] == (STORE, 1) and w.lock.state["rejected"] is None
+
+    def test_the_poll_picks_up_a_changed_id_like_any_generation_bump(self, mocker, tmp_path):
+        w = self._world(mocker, tmp_path)
+        w.start_workers()
+        w.db_client_id = "host-b"
+        w.write((STORE, 1))                                  # `identity set-client-id` bumps the key
+        w.poll()
+        assert w.daemon._handoff.epoch == 1 and w.daemon._handoff.client_id == "host-b"
+
+    def test_a_crash_restart_keeps_the_id_of_its_epoch(self, mocker, tmp_path):
+        """A worker restarted after a crash is built from the current Handoff:
+        the id and the config always travel together."""
+        w = self._world(mocker, tmp_path)
+        first = w.start_workers()
+        w.db_client_id = "host-b"
+        w.write((STORE, 1))
+        w.hup()
+        exited_for_reload(first)
+        w.daemon._check_workers()
+        remote = w.daemon._workers["remote"]
+        remote.die(1)                                        # crash on the new epoch
+        w.daemon._check_workers()
+        w.advance(3600)
+        w.daemon._check_workers()
+        again = w.daemon._workers["remote"]
+        assert again is not remote and again.born_epoch == 1 and again.client_id == "host-b"
+
+    def test_a_changed_id_arriving_mid_turnover_follows_the_normal_epoch_rules(
+        self, mocker, tmp_path
+    ):
+        w = self._world(mocker, tmp_path)
+        w.start_workers()
+        w.db_client_id = "host-b"
+        w.write((STORE, 1))
+        w.hup()                                              # epoch 1, workers still draining
+        w.db_client_id = "host-c"
+        w.write((STORE, 2))
+        w.hup()                                              # epoch 2
+        assert w.daemon._handoff.epoch == 2 and w.daemon._handoff.client_id == "host-c"
+        assert w.daemon._reload_epoch.get() == 2
+        assert w.lock.state["target"] == (STORE, 2)
+
+    def test_an_id_only_change_with_no_remote_dataset_still_switches(self, mocker, tmp_path):
+        """The id is part of the snapshot even if no remote worker runs: a
+        later reload that adds one must not find a stale id."""
+        w = self._world(mocker, tmp_path, config=cfg())
+        w.start_workers()
+        w.db_client_id = "host-b"
+        w.write((STORE, 1))
+        w.hup()
+        assert w.daemon._handoff.epoch == 1 and w.daemon._handoff.client_id == "host-b"
+
+    def test_a_dry_run_override_does_not_hide_an_id_change(self, mocker, tmp_path):
+        w = World(mocker, tmp_path, config=cfg(remote=True), dry_run=True, client_id="host-a")
+        w.start_workers()
+        w.db_client_id = "host-b"
+        w.write((STORE, 1))
+        w.hup()
+        assert w.daemon._handoff.epoch == 1 and w.daemon._handoff.config.dry_run is True
+
+
 # ===========================================================================
 # B3: refuse what no worker could start with
 # ===========================================================================
@@ -2682,8 +2870,22 @@ def _busy(message="busy"):
     return daemon_module._BindProblem(message, busy=True)
 
 
-def _client_cfg(path, **kwargs) -> BackupConfig:
-    return cfg(remote=True, client_id_file=path, **kwargs)
+def _remote_cfg(**kwargs) -> BackupConfig:
+    """A config that needs the remote worker, its one destination enrolled."""
+    kwargs.setdefault("destinations", {"offsite": Destination(url="https://h/pool", server_fingerprint=FP)})
+    return cfg(remote=True, **kwargs)
+
+
+FP = "ab" * 32
+FP2 = "cd" * 32
+
+
+def _tls_identity(directory: Path, role: str = "client"):
+    """A real generated identity (`identity.ensure_identity`); the directory
+    is created 0750 with the group of `directory.parent`."""
+    from zfsbackup import identity
+
+    return identity.ensure_identity(directory, role, group_of=directory.parent)
 
 
 @pytest.mark.unit
@@ -2830,183 +3032,278 @@ class TestProbeApiBind:
 
 
 @pytest.mark.unit
-class TestClientIdProblem:
-    def _problem(self, path):
-        return daemon_module._client_id_problem(_client_cfg(path))
+class TestClientTlsProblem:
+    """`daemon._client_tls_problem`: why remote backups may not work for this
+    config and client id -- advisory only, nothing created. Replaces the
+    client-id-file checks (M9: the id is in the DB, the identity is TLS)."""
+
+    def _problems(self, config, client_id="host-1", tls=None, **kw):
+        return daemon_module._client_tls_problem(config, client_id, tls, **kw)
 
     def _snapshot(self, root):
         return sorted(str(p) for p in Path(root).rglob("*"))
 
-    def test_a_readable_nonempty_file_passes(self, tmp_path):
-        f = tmp_path / "client_id"
-        f.write_text("abc123\n")
-        before = self._snapshot(tmp_path)
-        assert self._problem(f) is None
-        assert self._snapshot(tmp_path) == before and f.read_text() == "abc123\n"
+    def _tls(self, tmp_path):
+        return tmp_path / "config.db.tls"
 
-    def test_a_missing_file_under_a_writable_directory_passes_and_creates_nothing(
-        self, tmp_path
-    ):
-        assert self._problem(tmp_path / "client_id") is None
+    # -- when it does not apply -------------------------------------------
+
+    def test_nothing_is_checked_when_no_remote_worker_is_needed(self, tmp_path):
+        assert self._problems(cfg(), None, self._tls(tmp_path)) == ([], None)
+        off = _remote_cfg()
+        off.datasets[0].enabled = False
+        assert self._problems(off, None, self._tls(tmp_path)) == ([], None)
         assert list(tmp_path.iterdir()) == []
 
-    def test_a_deep_missing_path_under_a_writable_ancestor_passes_and_creates_nothing(
-        self, tmp_path
-    ):
-        assert self._problem(tmp_path / "a" / "b" / "c" / "client_id") is None
-        assert list(tmp_path.iterdir()) == []
+    # -- the client id ----------------------------------------------------
 
-    def test_a_blank_writable_file_passes(self, tmp_path):
-        f = tmp_path / "client_id"
-        f.write_text("  \n")
-        assert self._problem(f) is None
-        assert f.read_text() == "  \n"
+    def test_no_client_id_is_a_problem_that_names_enroll(self, tmp_path):
+        tls = self._tls(tmp_path)
+        _tls_identity(tls)
+        problems, loaded = self._problems(_remote_cfg(), None, tls)
+        assert len(problems) == 1 and "no client id yet" in problems[0]
+        assert "zfsbackup-config enroll" in problems[0]
+        assert loaded is not None                  # the identity itself is fine
 
-    def test_the_default_path_that_cannot_be_derived_is_a_problem(self, mocker):
-        mocker.patch("pathlib.Path.home", side_effect=RuntimeError("no home"))
-        problem = daemon_module._client_id_problem(cfg(remote=True))
-        assert problem is not None and "cannot be derived" in problem
-        assert "no home" in problem and "client_id_file" in problem
+    # -- a good identity --------------------------------------------------
 
-    def test_the_default_path_is_derived_from_home(self, tmp_path, monkeypatch):
-        home = tmp_path / "h"
-        home.mkdir()
-        monkeypatch.setenv("HOME", str(home))
-        assert daemon_module._client_id_problem(cfg(remote=True)) is None
-        assert list(home.iterdir()) == []
+    def test_a_good_identity_an_id_and_an_enrolled_destination_is_clean(self, tmp_path):
+        tls = self._tls(tmp_path)
+        ident = _tls_identity(tls)
+        problems, loaded = self._problems(_remote_cfg(), "host-1", tls)
+        assert problems == []
+        assert loaded is not None and loaded.fingerprint == ident.fingerprint
+        assert loaded.role == "client"
 
-    @needs_non_root
-    def test_an_unreadable_file_is_a_problem(self, tmp_path):
-        f = tmp_path / "client_id"
-        f.write_text("abc")
-        f.chmod(0)
-        try:
-            problem = self._problem(f)
-        finally:
-            f.chmod(0o600)
-        assert problem is not None and "cannot be read" in problem and str(f) in problem
+    def test_the_default_identity_is_in_the_tls_directory_next_to_the_database(self, tmp_path):
+        tls = self._tls(tmp_path)
+        _tls_identity(tls)
+        cert, key, configured = daemon_module._client_identity_paths(_remote_cfg(), tls)
+        assert (cert, key, configured) == (tls / "client.crt", tls / "client.key", False)
 
-    @needs_non_root
-    def test_a_missing_file_with_an_unwritable_nearest_parent_is_a_problem(self, tmp_path):
-        d = tmp_path / "ro"
-        d.mkdir()
-        d.chmod(0o500)
-        try:
-            problem = self._problem(d / "client_id")
-            deep = self._problem(d / "x" / "y" / "client_id")
-        finally:
-            d.chmod(0o700)
-        assert problem is not None and "not writable" in problem and str(d) in problem
-        assert deep is not None and "not writable" in deep
-        assert list(d.iterdir()) == []
-
-    @needs_non_root
-    def test_a_blank_unwritable_file_is_a_problem(self, tmp_path):
-        f = tmp_path / "client_id"
-        f.write_text("")
-        f.chmod(0o400)
-        try:
-            problem = self._problem(f)
-        finally:
-            f.chmod(0o600)
-        assert problem is not None and "empty and cannot be written" in problem
-
-    def test_an_ancestor_that_is_a_file_is_a_problem(self, tmp_path):
-        blocker = tmp_path / "file"
-        blocker.write_text("x")
-        problem = self._problem(blocker / "sub" / "client_id")
-        assert problem is not None and "not a directory" in problem
-
-    def test_a_directory_in_place_of_the_file_is_a_problem(self, tmp_path):
-        d = tmp_path / "client_id"
-        d.mkdir()
-        problem = self._problem(d)
-        assert problem is not None and "cannot be read" in problem
-
-    def test_an_undecodable_file_is_reported_as_unreadable(self, tmp_path, mocker):
-        """Read the way `ClientIdentity` reads it (`Path.read_text()`): a file the
-        locale cannot decode is a problem here exactly when it is one there."""
-        f = tmp_path / "client_id"
-        f.write_bytes(b"\xff\xfe\x80 not text")
-        mocker.patch(
-            "pathlib.Path.read_text",
-            side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    def test_configured_files_override_the_default_and_are_reported_as_configured(self, tmp_path):
+        other = tmp_path / "elsewhere"
+        ident = _tls_identity(other)
+        config = _remote_cfg(
+            client_cert_file=other / "client.crt", client_key_file=other / "client.key"
         )
-        problem = self._problem(f)
-        assert problem is not None and "cannot be read" in problem and "utf-8" in problem
+        assert daemon_module._client_identity_paths(config, self._tls(tmp_path)) == (
+            other / "client.crt", other / "client.key", True,
+        )
+        problems, loaded = self._problems(config, "host-1", self._tls(tmp_path))
+        assert problems == [] and loaded.fingerprint == ident.fingerprint
 
-    def test_real_undecodable_bytes_are_reported_under_a_utf8_locale(self, tmp_path):
-        import locale
+    def test_a_configured_pair_is_used_even_with_a_good_default_identity_beside_it(self, tmp_path):
+        tls = self._tls(tmp_path)
+        _tls_identity(tls)
+        config = _remote_cfg(
+            client_cert_file=tmp_path / "none.crt", client_key_file=tmp_path / "none.key"
+        )
+        problems, loaded = self._problems(config, "host-1", tls)
+        assert loaded is None and len(problems) == 1
+        assert "cannot be used" in problems[0]
 
-        if locale.getpreferredencoding(False).lower().replace("-", "") != "utf8":
-            pytest.skip("the locale's encoding is not UTF-8")
-        f = tmp_path / "client_id"
-        f.write_bytes(b"\xff\xfe\x80")
-        problem = self._problem(f)
-        assert problem is not None and "cannot be read" in problem
+    # -- missing / unusable -----------------------------------------------
 
-    def test_it_reads_the_file_through_the_bounded_reader(self, tmp_path, mocker):
-        f = tmp_path / "client_id"
-        f.write_text("abc")
-        reader = mocker.spy(daemon_module, "_read_id_file")
-        assert self._problem(f) is None
-        reader.assert_called_once_with(f)
+    def test_no_identity_yet_says_enroll_creates_it(self, tmp_path):
+        tls = self._tls(tmp_path)
+        problems, loaded = self._problems(_remote_cfg(), "host-1", tls)
+        assert loaded is None and len(problems) == 1
+        assert f"no client TLS identity in {tls} yet" in problems[0]
+        assert "enroll" in problems[0]
+
+    def test_no_database_path_means_the_identity_cannot_be_located(self):
+        problems, loaded = self._problems(_remote_cfg(), "host-1", None)
+        assert loaded is None
+        assert any("cannot be located" in p for p in problems)
+
+    def test_an_expired_certificate_is_a_problem(self, tmp_path):
+        tls = self._tls(tmp_path)
+        _tls_identity(tls)
+        later = datetime.now(timezone.utc) + timedelta(days=3651)
+        problems, loaded = self._problems(_remote_cfg(), "host-1", tls, now=later)
+        assert loaded is None
+        assert len(problems) == 1 and "cannot be used" in problems[0]
+        assert "expired" in problems[0]
+
+    def test_a_certificate_expiring_within_30_days_warns_but_still_loads(self, tmp_path):
+        tls = self._tls(tmp_path)
+        ident = _tls_identity(tls)
+        soon = ident.not_after - timedelta(days=10)
+        problems, loaded = self._problems(_remote_cfg(), "host-1", tls, now=soon)
+        assert loaded is not None
+        assert len(problems) == 1
+        assert "expires on" in problems[0] and "identity rotate" in problems[0]
+        assert re.search(r"in (9|10) day\(s\)", problems[0])
+
+    def test_a_certificate_more_than_30_days_from_expiry_is_clean(self, tmp_path):
+        tls = self._tls(tmp_path)
+        ident = _tls_identity(tls)
+        far = ident.not_after - timedelta(days=daemon_module.CLIENT_CERT_EXPIRY_WARN_DAYS + 1)
+        assert self._problems(_remote_cfg(), "host-1", tls, now=far)[0] == []
+
+    def test_the_wrong_role_certificate_is_a_problem(self, tmp_path):
+        server = _tls_identity(tmp_path / "srv", "server")
+        config = _remote_cfg(
+            client_cert_file=server.cert_path, client_key_file=server.key_path
+        )
+        problems, loaded = self._problems(config, "host-1", self._tls(tmp_path))
+        assert loaded is None and len(problems) == 1
+        assert "clientAuth" in problems[0]
+
+    def test_a_key_that_does_not_match_the_certificate_is_a_problem(self, tmp_path):
+        a = _tls_identity(tmp_path / "a")
+        b = _tls_identity(tmp_path / "b")
+        config = _remote_cfg(client_cert_file=a.cert_path, client_key_file=b.key_path)
+        problems, loaded = self._problems(config, "host-1", self._tls(tmp_path))
+        assert loaded is None and len(problems) == 1
+        assert "does not match" in problems[0]
+
+    def test_a_world_readable_key_is_a_problem(self, tmp_path):
+        tls = self._tls(tmp_path)
+        ident = _tls_identity(tls)
+        ident.key_path.chmod(0o644)
+        problems, loaded = self._problems(_remote_cfg(), "host-1", tls)
+        assert loaded is None and len(problems) == 1 and "cannot be used" in problems[0]
+
+    @needs_non_root
+    def test_an_unreadable_key_is_a_problem(self, tmp_path):
+        tls = self._tls(tmp_path)
+        ident = _tls_identity(tls)
+        ident.key_path.chmod(0)
+        try:
+            problems, loaded = self._problems(_remote_cfg(), "host-1", tls)
+        finally:
+            ident.key_path.chmod(0o600)
+        assert loaded is None and len(problems) == 1 and "cannot be used" in problems[0]
+
+    def test_a_certificate_file_that_is_not_pem_is_a_problem(self, tmp_path):
+        tls = self._tls(tmp_path)
+        ident = _tls_identity(tls)
+        ident.cert_path.write_text("this is not a certificate\n")
+        problems, loaded = self._problems(_remote_cfg(), "host-1", tls)
+        assert loaded is None and len(problems) == 1 and "cannot be used" in problems[0]
+
+    # -- files that are not regular (the hang guard) ----------------------
 
     def test_a_fifo_is_a_problem_and_never_blocks(self, tmp_path):
-        fifo = tmp_path / "client_id"
+        good = _tls_identity(tmp_path / "good")
+        fifo = tmp_path / "client.crt"
         os.mkfifo(fifo)
-        problem = _within(5, self._problem, fifo)
-        assert problem is not None and "not a regular file" in problem
+        config = _remote_cfg(client_cert_file=fifo, client_key_file=good.key_path)
+        problems, loaded = _within(5, self._problems, config, "host-1", self._tls(tmp_path))
+        assert loaded is None and len(problems) == 1
+        assert "not a regular file" in problems[0] and str(fifo) in problems[0]
 
-    def test_an_oversized_file_is_a_problem(self, tmp_path):
-        f = tmp_path / "client_id"
-        f.write_bytes(b"x" * (daemon_module._ID_FILE_MAX + 1))
-        problem = self._problem(f)
-        assert problem is not None and "cannot be read" in problem and "4096" in problem
+    def test_a_fifo_key_is_a_problem_and_never_blocks(self, tmp_path):
+        good = _tls_identity(tmp_path / "good")
+        fifo = tmp_path / "client.key"
+        os.mkfifo(fifo)
+        config = _remote_cfg(client_cert_file=good.cert_path, client_key_file=fifo)
+        problems, loaded = _within(5, self._problems, config, "host-1", self._tls(tmp_path))
+        assert loaded is None and "not a regular file" in problems[0]
+
+    def test_a_symlink_to_a_fifo_is_a_problem_and_never_blocks(self, tmp_path):
+        good = _tls_identity(tmp_path / "good")
+        fifo = tmp_path / "fifo"
+        os.mkfifo(fifo)
+        link = tmp_path / "client.crt"
+        link.symlink_to(fifo)
+        config = _remote_cfg(client_cert_file=link, client_key_file=good.key_path)
+        problems, loaded = _within(5, self._problems, config, "host-1", self._tls(tmp_path))
+        assert loaded is None and "not a regular file" in problems[0]
 
     @pytest.mark.skipif(not os.path.exists("/dev/zero"), reason="no /dev/zero")
     def test_a_device_is_a_problem_not_an_endless_read(self, tmp_path):
-        link = tmp_path / "client_id"
+        good = _tls_identity(tmp_path / "good")
+        link = tmp_path / "client.crt"
         link.symlink_to("/dev/zero")
-        problem = _within(5, self._problem, link)
-        assert problem is not None and "not a regular file" in problem
+        config = _remote_cfg(client_cert_file=link, client_key_file=good.key_path)
+        problems, loaded = _within(5, self._problems, config, "host-1", self._tls(tmp_path))
+        assert loaded is None and "not a regular file" in problems[0]
+
+    def test_a_directory_in_place_of_the_file_is_a_problem(self, tmp_path):
+        good = _tls_identity(tmp_path / "good")
+        d = tmp_path / "client.crt"
+        d.mkdir()
+        config = _remote_cfg(client_cert_file=d, client_key_file=good.key_path)
+        problems, loaded = self._problems(config, "host-1", self._tls(tmp_path))
+        assert loaded is None and "not a regular file" in problems[0]
 
     def test_a_symlink_to_a_regular_file_is_followed(self, tmp_path):
-        real = tmp_path / "real"
-        real.write_text("abc")
-        link = tmp_path / "client_id"
-        link.symlink_to(real)
-        assert self._problem(link) is None
+        good = _tls_identity(tmp_path / "good")
+        link_c, link_k = tmp_path / "c.crt", tmp_path / "c.key"
+        link_c.symlink_to(good.cert_path)
+        link_k.symlink_to(good.key_path)
+        config = _remote_cfg(client_cert_file=link_c, client_key_file=link_k)
+        problems, loaded = self._problems(config, "host-1", self._tls(tmp_path))
+        assert problems == [] and loaded is not None
 
-    def test_a_symlink_to_a_fifo_is_a_problem_and_never_blocks(self, tmp_path):
-        fifo = tmp_path / "fifo"
-        os.mkfifo(fifo)
-        link = tmp_path / "client_id"
-        link.symlink_to(fifo)
-        problem = _within(5, self._problem, link)
-        assert problem is not None and "not a regular file" in problem
+    def test_not_regular_ignores_missing_files_and_regular_ones(self, tmp_path):
+        f = tmp_path / "f"
+        f.write_text("x")
+        assert daemon_module._not_regular(f, tmp_path / "missing") is None
+        assert daemon_module._not_regular() is None
 
-    def test_a_dangling_symlink_counts_as_missing_in_a_writable_directory(self, tmp_path):
-        link = tmp_path / "client_id"
-        link.symlink_to(tmp_path / "nowhere")
-        assert self._problem(link) is None
+    def test_not_regular_names_the_first_odd_path(self, tmp_path):
+        d = tmp_path / "d"
+        d.mkdir()
+        message = daemon_module._not_regular(tmp_path / "missing", d)
+        assert message == f"{d} is not a regular file"
 
-    def test_a_symlink_loop_counts_as_missing(self, tmp_path):
-        link = tmp_path / "client_id"
-        link.symlink_to(link)
-        assert self._problem(link) is None
+    # -- enrollment -------------------------------------------------------
 
-    def test_exactly_the_cap_is_accepted(self, tmp_path):
-        f = tmp_path / "client_id"
-        f.write_bytes(b"x" * daemon_module._ID_FILE_MAX)
-        assert self._problem(f) is None
+    def test_an_unenrolled_destination_is_named(self, tmp_path):
+        tls = self._tls(tmp_path)
+        _tls_identity(tls)
+        config = _remote_cfg(destinations={"offsite": Destination(url="https://h/pool")})
+        problems, _ = self._problems(config, "host-1", tls)
+        assert len(problems) == 1
+        assert "offsite" in problems[0] and "not enrolled" in problems[0]
+        assert "server_fingerprint" in problems[0]
 
-    def test_the_check_does_not_take_a_lock_or_change_a_mode(self, tmp_path):
-        f = tmp_path / "client_id"
-        f.write_text("abc")
-        f.chmod(0o640)
-        self._problem(f)
-        assert f.stat().st_mode & 0o777 == 0o640
+    def test_only_destinations_in_use_are_checked_and_they_are_sorted(self, tmp_path):
+        tls = self._tls(tmp_path)
+        _tls_identity(tls)
+        config = _remote_cfg(destinations={
+            "offsite": Destination(url="https://h/pool"),
+            "unused": Destination(url="https://u/pool"),
+            "zeta": Destination(url="https://z/pool"),
+        })
+        config.datasets[0].remote.append(RemoteDatasetConfig(destination="zeta"))
+        problems, _ = self._problems(config, "host-1", tls)
+        assert len(problems) == 1
+        assert "offsite, zeta" in problems[0] and "unused" not in problems[0]
+
+    def test_an_enrolled_destination_is_not_named(self, tmp_path):
+        tls = self._tls(tmp_path)
+        _tls_identity(tls)
+        config = _remote_cfg(destinations={
+            "offsite": Destination(url="https://h/pool", server_fingerprint=FP2)
+        })
+        assert self._problems(config, "host-1", tls)[0] == []
+
+    def test_every_finding_is_reported_not_just_the_first(self, tmp_path):
+        config = _remote_cfg(destinations={"offsite": Destination(url="https://h/pool")})
+        problems, loaded = self._problems(config, None, self._tls(tmp_path))
+        assert loaded is None and len(problems) == 3     # id, identity, enrollment
+
+    # -- it only reads ----------------------------------------------------
+
+    def test_it_creates_nothing(self, tmp_path):
+        tls = self._tls(tmp_path)
+        before = self._snapshot(tmp_path)
+        self._problems(_remote_cfg(), None, tls)
+        assert self._snapshot(tmp_path) == before and not tls.exists()
+
+    def test_it_does_not_take_a_lock_or_change_a_mode(self, tmp_path):
+        tls = self._tls(tmp_path)
+        ident = _tls_identity(tls)
+        before = self._snapshot(tmp_path)
+        modes = {p: p.stat().st_mode for p in (tls, ident.cert_path, ident.key_path)}
+        self._problems(_remote_cfg(), "host-1", tls)
+        assert {p: p.stat().st_mode for p in modes} == modes
+        assert self._snapshot(tmp_path) == before          # no temp or lock file appeared
 
 
 @pytest.mark.unit
@@ -3023,11 +3320,9 @@ class TestCandidateRefusal:
         w = cfg(remote=True)
         assert daemon_module._remote_worker_needed(w)
 
-    def test_nothing_is_refused_when_nothing_is_wrong(self, probe, tmp_path):
+    def test_nothing_is_refused_when_nothing_is_wrong(self, probe):
         assert daemon_module._candidate_refusal(cfg(api_port=0)) is None
-        assert daemon_module._candidate_refusal(
-            _client_cfg(tmp_path / "client_id", api_port=9100)
-        ) is None
+        assert daemon_module._candidate_refusal(_remote_cfg(api_port=9100)) is None
 
     def test_startup_probes_the_port_with_no_old_address_tail(self, probe):
         probe.return_value = "Address already in use"
@@ -3120,17 +3415,17 @@ class TestCandidateRefusal:
         daemon_module._candidate_refusal(cfg(api_port=9100), probe_api=False)
         probe.assert_not_called()
 
-    def test_the_client_id_is_no_longer_a_refusal_reason(self, mocker, probe, tmp_path):
+    def test_the_remote_backup_findings_are_no_refusal_reason(self, mocker, probe):
         import inspect
 
         assert "check_client_id" not in inspect.signature(
             daemon_module._candidate_refusal
         ).parameters
-        check = mocker.patch("zfsbackup.daemon._client_id_problem", return_value="no way")
-        assert daemon_module._candidate_refusal(_client_cfg(tmp_path / "id")) is None
-        assert daemon_module._candidate_refusal(
-            _client_cfg(tmp_path / "id"), cfg()
-        ) is None
+        check = mocker.patch(
+            "zfsbackup.daemon._client_tls_problem", return_value=(["no way"], None)
+        )
+        assert daemon_module._candidate_refusal(_remote_cfg()) is None
+        assert daemon_module._candidate_refusal(_remote_cfg(), cfg()) is None
         check.assert_not_called()
 
     def test_only_the_api_bind_can_be_a_problem_so_there_is_one_line(self, probe):
@@ -3141,65 +3436,105 @@ class TestCandidateRefusal:
 
 @pytest.mark.unit
 class TestCandidateWarnings:
-    """The client id is advisory: it breaks remote backup only, so it warns."""
+    """Remote-backup findings (client id, client certificate, enrollment) are
+    advisory: they break remote backup only, so they warn."""
 
-    def test_no_warning_when_the_remote_worker_is_not_needed(self, mocker):
-        check = mocker.patch("zfsbackup.daemon._client_id_problem", return_value="bad")
+    @pytest.fixture
+    def check(self, mocker):
+        return mocker.patch(
+            "zfsbackup.daemon._client_tls_problem", return_value=(["no way"], None)
+        )
+
+    def test_the_real_check_is_silent_when_no_remote_worker_is_needed(self):
         assert daemon_module._candidate_warnings(cfg()) == []
         assert daemon_module._candidate_warnings(cfg(), cfg(remote=True)) == []
-        check.assert_not_called()
 
-    def test_no_check_when_the_path_is_unchanged(self, mocker, tmp_path):
-        check = mocker.patch("zfsbackup.daemon._client_id_problem", return_value="bad")
-        path = tmp_path / "id"
-        new = _client_cfg(path, prefix="changed")
-        assert daemon_module._candidate_warnings(new, _client_cfg(path)) == []
-        check.assert_not_called()
-
-    def test_the_default_path_counts_as_unchanged_when_both_derive_it(self, mocker):
-        check = mocker.patch("zfsbackup.daemon._client_id_problem", return_value="bad")
+    def test_no_check_when_nothing_it_depends_on_changed(self, check):
+        new = _remote_cfg(prefix="changed")
         assert daemon_module._candidate_warnings(
-            cfg(remote=True, prefix="b"), cfg(remote=True)
+            new, _remote_cfg(), client_id="a", previous_client_id="a"
         ) == []
         check.assert_not_called()
 
-    def test_a_newly_needed_remote_worker_is_checked_and_warned_about(self, mocker, tmp_path):
-        check = mocker.patch("zfsbackup.daemon._client_id_problem", return_value="no way")
-        new = _client_cfg(tmp_path / "id")
-        warnings = daemon_module._candidate_warnings(new, cfg())
-        check.assert_called_once_with(new)
+    def test_a_newly_needed_remote_worker_is_checked_and_warned_about(self, check, tmp_path):
+        new = _remote_cfg()
+        warnings = daemon_module._candidate_warnings(
+            new, cfg(), client_id="a", previous_client_id="a", tls=tmp_path
+        )
+        check.assert_called_once_with(new, "a", tmp_path)
         assert warnings == [
-            "the remote backup worker may not be able to start remote backups: no way"
-            "; local snapshots and pruning are unaffected"
+            "remote backup: no way; local snapshots and pruning are unaffected"
         ]
 
-    def test_a_changed_client_id_path_is_checked(self, mocker, tmp_path):
-        check = mocker.patch("zfsbackup.daemon._client_id_problem", return_value="no way")
+    def test_one_warning_per_finding(self, mocker):
+        mocker.patch(
+            "zfsbackup.daemon._client_tls_problem", return_value=(["one", "two"], None)
+        )
+        warnings = daemon_module._candidate_warnings(_remote_cfg(), cfg())
+        assert warnings == [
+            "remote backup: one; local snapshots and pruning are unaffected",
+            "remote backup: two; local snapshots and pruning are unaffected",
+        ]
+
+    @pytest.mark.parametrize("change", [
+        pytest.param(dict(client_cert_file=Path("/x/c.crt"), client_key_file=Path("/x/c.key")),
+                     id="client-files"),
+        pytest.param(dict(destinations={"offsite": Destination(url="https://h/pool")}),
+                     id="fingerprint-removed"),
+        pytest.param(dict(destinations={"offsite": Destination(url="https://h/pool",
+                                                               server_fingerprint=FP2)}),
+                     id="fingerprint-changed"),
+    ])
+    def test_a_changed_input_is_checked(self, check, change):
         warnings = daemon_module._candidate_warnings(
-            _client_cfg(tmp_path / "new"), _client_cfg(tmp_path / "old")
+            _remote_cfg(**change), _remote_cfg(), client_id="a", previous_client_id="a"
         )
         check.assert_called_once()
-        assert len(warnings) == 1 and "no way" in warnings[0]
+        assert len(warnings) == 1
 
-    def test_startup_checks_unconditionally(self, mocker, tmp_path):
-        check = mocker.patch("zfsbackup.daemon._client_id_problem", return_value="no way")
-        assert daemon_module._candidate_warnings(_client_cfg(tmp_path / "id"))
+    def test_a_changed_client_id_is_checked(self, check):
+        warnings = daemon_module._candidate_warnings(
+            _remote_cfg(), _remote_cfg(), client_id="b", previous_client_id="a"
+        )
+        check.assert_called_once()
+        assert len(warnings) == 1
+
+    def test_a_client_id_appearing_is_checked(self, check):
+        daemon_module._candidate_warnings(
+            _remote_cfg(), _remote_cfg(), client_id="a", previous_client_id=None
+        )
         check.assert_called_once()
 
-    def test_a_clean_client_id_gives_no_warning(self, mocker, tmp_path):
-        mocker.patch("zfsbackup.daemon._client_id_problem", return_value=None)
-        assert daemon_module._candidate_warnings(_client_cfg(tmp_path / "id")) == []
-
-    def test_an_underivable_previous_path_counts_as_changed(self, mocker):
-        check = mocker.patch("zfsbackup.daemon._client_id_problem", return_value=None)
-        mocker.patch("pathlib.Path.home", side_effect=RuntimeError("no home"))
-        daemon_module._candidate_warnings(cfg(remote=True), cfg(remote=True))
+    def test_a_dataset_gaining_a_new_destination_is_checked(self, check):
+        old = _remote_cfg()
+        new = _remote_cfg(destinations={
+            "offsite": Destination(url="https://h/pool", server_fingerprint=FP),
+            "second": Destination(url="https://s/pool"),
+        })
+        new.datasets[0].remote.append(RemoteDatasetConfig(destination="second"))
+        daemon_module._candidate_warnings(new, old, client_id="a", previous_client_id="a")
         check.assert_called_once()
+
+    def test_startup_checks_unconditionally(self, check):
+        assert daemon_module._candidate_warnings(_remote_cfg(), client_id="a")
+        check.assert_called_once()
+
+    def test_a_clean_result_gives_no_warning(self, mocker):
+        mocker.patch("zfsbackup.daemon._client_tls_problem", return_value=([], None))
+        assert daemon_module._candidate_warnings(_remote_cfg(), client_id="a") == []
+
+    def test_the_tls_inputs_ignore_unrelated_settings(self):
+        a = daemon_module._tls_inputs(_remote_cfg(), "a")
+        b = daemon_module._tls_inputs(_remote_cfg(prefix="other", api_port=9999), "a")
+        assert a == b
 
     def test_it_creates_nothing(self, tmp_path):
-        target = tmp_path / "not" / "yet" / "client_id"
-        daemon_module._candidate_warnings(_client_cfg(target))
-        assert list(tmp_path.iterdir()) == []
+        before = sorted(tmp_path.rglob("*"))
+        warnings = daemon_module._candidate_warnings(
+            _remote_cfg(), client_id=None, tls=tmp_path / "x.db.tls"
+        )
+        assert warnings                                   # no id, no identity
+        assert sorted(tmp_path.rglob("*")) == before
 
 
 @pytest.mark.unit
@@ -3436,32 +3771,32 @@ class TestReloadHandlesWhatNoWorkerCouldStartWith:
         world.poll()
         assert world.events.count("load") == loads
 
-    # -- the client id only warns --------------------------------------------
+    # -- remote backup findings only warn -------------------------------------
 
-    def test_a_newly_needed_remote_worker_with_a_bad_client_id_is_accepted_with_a_warning(
-        self, world, mocker, caplog
-    ):
-        mocker.patch(
-            "zfsbackup.daemon._client_id_problem", return_value="no writable directory"
+    @pytest.fixture
+    def bad(self, mocker):
+        return mocker.patch(
+            "zfsbackup.daemon._client_tls_problem",
+            return_value=(["no client identity"], None),
         )
+
+    def test_a_newly_needed_remote_worker_with_a_problem_is_accepted_with_a_warning(
+        self, world, bad, caplog
+    ):
         world.start_workers()
         world.write((STORE, 1), config=cfg(remote=True))
         world.hup()
         assert world.daemon._handoff.key == (STORE, 1) and world.daemon._reload_epoch.get() == 1
         assert world.daemon._rejected is None and world.daemon._deferred is None
         assert world.lock.state["target"] == (STORE, 1)
-        warns = messages(caplog, logging.WARNING, "remote backup worker")
+        warns = messages(caplog, logging.WARNING, "remote backup:")
         assert warns == [
-            "configuration generation 1: the remote backup worker may not be able to "
-            "start remote backups: no writable directory; "
+            "configuration generation 1: remote backup: no client identity; "
             "local snapshots and pruning are unaffected"
         ]
         assert not messages(caplog, logging.ERROR)
 
-    def test_the_local_workers_still_run_and_the_remote_one_is_started(
-        self, world, mocker
-    ):
-        mocker.patch("zfsbackup.daemon._client_id_problem", return_value="bad")
+    def test_the_local_workers_still_run_and_the_remote_one_is_started(self, world, bad):
         old = world.start_workers()
         world.write((STORE, 1), config=cfg(remote=True))
         world.hup()
@@ -3471,12 +3806,11 @@ class TestReloadHandlesWhatNoWorkerCouldStartWith:
         assert all(w.is_alive() for w in world.daemon._workers.values())
 
     def test_the_same_warning_is_logged_once_across_repeated_attempts_at_a_key(
-        self, world, mocker, caplog
+        self, world, bad, caplog
     ):
         """A stop that lands after the checks leaves the key un-swapped, so the
         next attempt re-runs them; `_warned` keeps the WARNING to one line per
         `(key, message)`."""
-        mocker.patch("zfsbackup.daemon._client_id_problem", return_value="bad")
         world.start_workers()
         world.write((STORE, 1), config=cfg(remote=True))
         world.manager.dataset_report.side_effect = world.daemon._stop_event.set
@@ -3486,29 +3820,38 @@ class TestReloadHandlesWhatNoWorkerCouldStartWith:
         world.manager.dataset_report.side_effect = None
         world.hup()                                     # second attempt: accepted
         assert world.daemon._handoff.key == (STORE, 1)
-        assert len(messages(caplog, logging.WARNING, "remote backup worker")) == 1
+        assert len(messages(caplog, logging.WARNING, "remote backup:")) == 1
 
-    def test_a_different_key_with_the_same_problem_warns_again(self, world, mocker, caplog):
-        mocker.patch("zfsbackup.daemon._client_id_problem", return_value="bad")
+    def test_a_different_key_with_the_same_problem_warns_again(self, world, bad, caplog):
         world.start_workers()
-        world.write((STORE, 1), config=cfg(remote=True, client_id_file=Path("/x/one")))
+        world.write((STORE, 1), config=cfg(remote=True, client_cert_file=Path("/x/one.crt"),
+                                           client_key_file=Path("/x/one.key")))
         world.hup()
-        world.write((STORE, 2), config=cfg(remote=True, client_id_file=Path("/x/two")))
+        world.write((STORE, 2), config=cfg(remote=True, client_cert_file=Path("/x/two.crt"),
+                                           client_key_file=Path("/x/two.key")))
         world.hup()
-        assert len(messages(caplog, logging.WARNING, "remote backup worker")) == 2
+        assert len(messages(caplog, logging.WARNING, "remote backup:")) == 2
 
-    def test_warned_is_forgotten_by_a_reload_with_nothing_to_warn_about(self, world, mocker):
-        problem = mocker.patch("zfsbackup.daemon._client_id_problem", return_value="bad")
+    def test_warned_is_forgotten_by_a_reload_with_nothing_to_warn_about(self, world, bad):
         world.start_workers()
         world.write((STORE, 1), config=cfg(remote=True))
         world.hup()
-        assert world.daemon._warned is not None
-        problem.return_value = None
-        world.write((STORE, 2), config=cfg(remote=True, client_id_file=Path("/x/two")))
+        assert world.daemon._warned
+        bad.return_value = ([], None)
+        world.write((STORE, 2), config=cfg(remote=True, client_cert_file=Path("/x/two.crt"),
+                                           client_key_file=Path("/x/two.key")))
         world.hup()
-        assert world.daemon._warned is None
+        assert world.daemon._warned == set()
 
-    def test_an_exception_in_the_client_id_check_is_a_warning_not_a_rejection(
+    def test_every_finding_of_a_candidate_is_logged_once(self, world, mocker, caplog):
+        mocker.patch("zfsbackup.daemon._client_tls_problem",
+                     return_value=(["first", "second"], None))
+        world.write((STORE, 1), config=cfg(remote=True))
+        world.hup()
+        warns = messages(caplog, logging.WARNING, "remote backup:")
+        assert [w.split("remote backup: ")[1].split(";")[0] for w in warns] == ["first", "second"]
+
+    def test_an_exception_in_the_remote_backup_check_is_a_warning_not_a_rejection(
         self, world, mocker, caplog
     ):
         mocker.patch("zfsbackup.daemon._candidate_warnings", side_effect=RuntimeError("bug"))
@@ -3517,50 +3860,38 @@ class TestReloadHandlesWhatNoWorkerCouldStartWith:
         world.hup()
         assert world.daemon._handoff.key == (STORE, 1)
         assert messages(
-            caplog, logging.WARNING, "the client id check failed to run: RuntimeError: bug"
+            caplog, logging.WARNING,
+            "the remote backup check failed to run: RuntimeError: bug",
         )
 
-    def test_nothing_is_created_for_a_client_id_that_cannot_be_written(self, world, tmp_path):
-        target = tmp_path / "not" / "yet" / "client_id"
-        world.write((STORE, 1), config=cfg(remote=True, client_id_file=target))
+    def test_nothing_is_created_for_a_missing_client_identity(self, world, tmp_path):
+        world.write((STORE, 1), config=cfg(remote=True))
         world.hup()
         assert world.daemon._handoff.key == (STORE, 1)
-        assert not (tmp_path / "not").exists()
+        assert not (tmp_path / "w").exists()        # no <db>.tls, no directory at all
 
-    @needs_non_root
-    def test_an_unwritable_client_id_location_warns_for_real_and_is_accepted(
-        self, world, tmp_path, caplog
-    ):
-        ro = tmp_path / "ro"
-        ro.mkdir()
-        ro.chmod(0o500)
-        try:
-            world.write((STORE, 1), config=cfg(remote=True, client_id_file=ro / "client_id"))
-            world.hup()
-        finally:
-            ro.chmod(0o700)
+    def test_a_missing_identity_warns_for_real_and_is_accepted(self, world, caplog):
+        world.write((STORE, 1), config=cfg(remote=True))
+        world.hup()
         assert world.daemon._handoff.key == (STORE, 1) and world.daemon._rejected is None
-        assert "not writable" in messages(caplog, logging.WARNING, "remote backup")[0]
-        assert list(ro.iterdir()) == []
+        joined = " ".join(messages(caplog, logging.WARNING, "remote backup:"))
+        assert "no client id yet" in joined and "no client TLS identity" in joined
 
-    def test_an_unchanged_client_id_path_runs_no_check_on_a_later_reload(
-        self, world, mocker, tmp_path
-    ):
-        path = tmp_path / "id"
+    def test_unchanged_tls_inputs_run_no_check_on_a_later_reload(self, world, mocker):
         w = world
-        w.daemon._handoff = Handoff(_client_cfg(path), 0, (STORE, 0))
-        w.db_config = _client_cfg(path)
-        check = mocker.patch("zfsbackup.daemon._client_id_problem", return_value="bad")
-        w.write((STORE, 1), config=_client_cfg(path, prefix="changed"))
+        w.daemon._handoff = Handoff(_remote_cfg(), 0, (STORE, 0), "host-1")
+        w.db_config = _remote_cfg()
+        w.db_client_id = "host-1"
+        check = mocker.patch("zfsbackup.daemon._client_tls_problem", return_value=(["bad"], None))
+        w.write((STORE, 1), config=_remote_cfg(prefix="changed"))
         w.hup()
         check.assert_not_called()
         assert w.daemon._handoff.key == (STORE, 1)
 
-    def test_no_remote_worker_needed_means_no_client_id_check(self, world, mocker):
-        check = mocker.patch("zfsbackup.daemon._client_id_problem", return_value="bad")
+    def test_no_remote_worker_needed_means_no_finding(self, world, caplog):
         world.write((STORE, 1), prefix="changed")
         world.hup()
-        check.assert_not_called()
+        assert not messages(caplog, logging.WARNING, "remote backup:")
 
     def test_a_deferral_leaves_the_old_config_running_across_a_poll(self, world, probe):
         old = world.start_workers()
@@ -3948,12 +4279,13 @@ class TestStartupChecksWhatNoWorkerCouldStartWith:
             assert main() == 1                          # refused for the port, not the lock
         assert len(lock_spy) == 2
 
-    def test_a_client_id_that_cannot_exist_only_warns_at_startup_and_the_daemon_runs(
+    def test_a_remote_backup_problem_only_warns_at_startup_and_the_daemon_runs(
         self, sqlite_config_db, lock_spy, mocker, caplog
     ):
         mocker.patch("zfsbackup.daemon._probe_api_bind", return_value=None)
-        mocker.patch("zfsbackup.daemon._remote_worker_needed", return_value=True)
-        mocker.patch("zfsbackup.daemon._client_id_problem", return_value="no way")
+        mocker.patch(
+            "zfsbackup.daemon._client_tls_problem", return_value=(["no way"], None)
+        )
         run = mocker.patch.object(BackupDaemon, "run", return_value=0)
         with self._argv(sqlite_config_db.path):
             with caplog.at_level(logging.INFO):
@@ -3961,21 +4293,21 @@ class TestStartupChecksWhatNoWorkerCouldStartWith:
         run.assert_called_once()
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any(
-            "the remote backup worker may not be able to start remote backups: no way"
-            in w for w in warnings
+            "configuration generation 0: remote backup: no way; "
+            "local snapshots and pruning are unaffected" == w for w in warnings
         )
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
-    def test_an_exception_in_the_client_id_check_at_startup_is_a_warning(
+    def test_an_exception_in_the_remote_backup_check_at_startup_is_a_warning(
         self, sqlite_config_db, mocker, caplog
     ):
         mocker.patch("zfsbackup.daemon._probe_api_bind", return_value=None)
-        mocker.patch("zfsbackup.daemon._candidate_warnings", side_effect=RuntimeError("bug"))
+        mocker.patch("zfsbackup.daemon._client_tls_problem", side_effect=RuntimeError("bug"))
         mocker.patch.object(BackupDaemon, "run", return_value=0)
         with self._argv(sqlite_config_db.path):
             with caplog.at_level(logging.INFO):
                 assert main() == 0
-        assert "the client id check failed to run: RuntimeError: bug" in caplog.text
+        assert "the remote backup check failed to run: RuntimeError: bug" in caplog.text
 
     def test_a_bug_in_the_api_bind_check_refuses_the_start_with_exit_one(
         self, sqlite_config_db, lock_spy, mocker, caplog
@@ -4006,12 +4338,17 @@ class TestStartupChecksWhatNoWorkerCouldStartWith:
         assert "Configuration is valid!" in caplog.text
         assert lock_spy == []
 
-    def test_test_config_does_not_check_the_client_id(self, sqlite_config_db, mocker, caplog):
-        mocker.patch("zfsbackup.daemon._remote_worker_needed", return_value=True)
-        check = mocker.patch("zfsbackup.daemon._client_id_problem", return_value="no way")
+    def test_test_config_reports_the_remote_backup_findings_without_acting_on_them(
+        self, sqlite_config_db, mocker, caplog
+    ):
+        check = mocker.patch(
+            "zfsbackup.daemon._client_tls_problem", return_value=(["no way"], None)
+        )
         with self._argv(sqlite_config_db.path, "--test-config"):
-            assert main() == 0
-        check.assert_not_called()
+            with caplog.at_level(logging.INFO):
+                assert main() == 0
+        check.assert_called_once()
+        assert "remote backup: no way" in caplog.text
 
     def test_a_valid_start_still_goes_ahead_when_the_port_is_free(
         self, sqlite_config_db, lock_spy, mocker

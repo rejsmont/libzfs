@@ -25,7 +25,6 @@ if __name__ == '__main__':  # pragma: no cover - the real process only
 
 import argparse  # noqa: E402
 import errno  # noqa: E402
-import locale  # noqa: E402
 import logging  # noqa: E402
 import multiprocessing  # noqa: E402
 import os  # noqa: E402
@@ -34,6 +33,8 @@ import stat  # noqa: E402
 import sys  # noqa: E402
 import time  # noqa: E402
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy.exc import DatabaseError, OperationalError
@@ -58,6 +59,7 @@ from zfsbackup.runtime_config import (
     load_runtime_config,
 )
 from zfsbackup import daemonlock
+from zfsbackup import identity
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup import procident
 from zfsbackup import sdnotify
@@ -127,9 +129,9 @@ _FORKSERVER_LOST_EXITCODE = 255
 #: the supervisor is inside `_reload_tick` waits for that tick to finish. That
 #: tick is not only a SQLite read (up to `busy_timeout`, 5s): a candidate is
 #: also run through the B3 checks -- `getaddrinfo` for an `api_host` given by
-#: name (resolver timeout x retries; why it should be an address) and client-id
-#: file I/O -- on every reload, and on every poll while a deferred reload is
-#: pending; and `notify.stopping()` may block up to its 1s send timeout. None
+#: name (resolver timeout x retries; why it should be an address) and the
+#: client TLS identity files the remote-backup advisory reads -- on every
+#: reload, and on every poll while a deferred reload is pending; and `notify.stopping()` may block up to its 1s send timeout. None
 #: of it is bounded by `busy_timeout` alone, so the term is the sum, with no
 #: hard cap. The supervisor itself makes **no `zfs` call**
 #: (B1): the existence check and the property sync run in
@@ -153,20 +155,26 @@ RELOAD_DEFER_REPEAT = 900
 @dataclass(frozen=True)
 class Handoff:
     """What every worker is born with, as one object: the config it runs, the
-    reload epoch that config belongs to, and the `(store_id, generation)` key
+    reload epoch that config belongs to, the `(store_id, generation)` key
     it was read at (`None` when not known -- a daemon built without one, see
-    `BackupDaemon.__init__`).
+    `BackupDaemon.__init__`), and this host's client id (`ConfigSnapshot.
+    client_id`, read in the same snapshot as the config; `None` until
+    `zfsbackup-config enroll` generates one).
 
     The supervisor replaces the whole object on an accepted reload and only
     then bumps the shared `ReloadEpoch`; `_new_worker` reads it exactly once,
     so a worker can never be given one generation's config with another
     generation's `born_epoch` -- the pairing that would make it either never
-    switch or switch forever.
+    switch or switch forever -- nor one generation's config with another's
+    client id. The client id is not part of `BackupConfig` (it is host
+    identity, not configuration: never imported or exported), so a reload
+    compares it separately (`_try_reload`); a changed id is a real switch.
     """
 
     config: BackupConfig
     epoch: int
     key: Optional[Tuple[int, int]]
+    client_id: Optional[str] = None
 
 
 def _gen(key: Optional[Tuple[int, int]]) -> str:
@@ -283,100 +291,156 @@ def _probe_api_bind(host: str, port: int) -> Optional[str]:
     return None
 
 
-#: A client id is ~40 bytes; anything bigger is not one. Bounds every read of
-#: the id file (`/dev/zero`, a log symlinked into place). Kept in step with
-#: `remote._ID_FILE_MAX`.
-_ID_FILE_MAX = 4096
+#: A client certificate expiring within this many days is warned about
+#: (`_client_tls_problem`).
+CLIENT_CERT_EXPIRY_WARN_DAYS = 30
 
 
-def _read_id_file(path) -> Optional[str]:
-    """The text of the client id file, `None` if it does not exist; raises
-    `OSError` (not a regular file, larger than `_ID_FILE_MAX`, unreadable) or
-    `UnicodeError`. The twin of `remote._read_id_file`, for the supervisor.
-
-    Opened `O_NONBLOCK` and checked with `fstat` BEFORE any read, so a FIFO
-    (whose blocking `open` would hang the single-threaded supervisor, with
-    SIGTERM unanswered -- PEP 475 retries the interrupted call), a device or a
-    directory is refused, not read; the read is capped. Symlinks ARE followed,
-    as `ClientIdentity` always did (`O_NOFOLLOW` would make the check refuse a
-    config that works); a link that leads to a FIFO is caught by the `fstat`.
-    A symlink loop or dangling link counts as missing, as `Path.exists()`
-    says. Decoded with the locale encoding, as `Path.read_text()` was.
-
-    Residual: `open`/`stat` on a hung network filesystem can still block.
-    """
-    # `stat` (following links) BEFORE `open`: opening some devices has side
-    # effects (`/dev/watchdog` arms the watchdog, a rewinding tape rewinds on
-    # close). The `fstat` below re-checks what was actually opened, for a path
-    # swapped in between.
-    try:
-        if not stat.S_ISREG(os.stat(path).st_mode):
-            raise OSError(errno.EINVAL, "not a regular file")
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
-    except (FileNotFoundError, NotADirectoryError):
+def _tls_dir(resolved) -> Optional[Path]:
+    """`<db>.tls` for a `ResolvedConfigPath` (or a plain path); `None` for
+    `None`. Derived from the *resolved* database path, like
+    `daemonlock.workers_lock_path`, so a symlinked `-c` and its target name
+    the same directory."""
+    if resolved is None:
         return None
-    except OSError as e:
-        if e.errno == errno.ELOOP:
-            return None
-        raise
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError(errno.EINVAL, "not a regular file")
-        data = b''
-        while len(data) <= _ID_FILE_MAX:
-            chunk = os.read(fd, _ID_FILE_MAX + 1 - len(data))
-            if not chunk:
-                break
-            data += chunk
-        if len(data) > _ID_FILE_MAX:
-            raise OSError(errno.EFBIG, f"larger than {_ID_FILE_MAX} bytes")
-    finally:
-        os.close(fd)
-    return data.decode(locale.getpreferredencoding(False))
+    return identity.tls_dir(getattr(resolved, 'resolved_path', resolved))
 
 
-def _client_id_problem(config: BackupConfig) -> Optional[str]:
-    """Why the remote worker may not be able to obtain its client id, or
-    `None`. Mirrors `remote.ClientIdentity._load_or_generate` without
-    creating anything, reading the file the same way (`_read_id_file`: bounded,
-    regular files only, decoded in the locale's encoding, so a file that is
-    not decodable is a problem here exactly when it is one there):
-    `effective_client_id_file` must resolve (it raises when `$HOME` cannot be
-    determined); an existing non-empty file must be readable and decodable; a
-    missing (or blank, i.e. to be rewritten) file needs a writable place to
-    be created -- its nearest existing ancestor must be a writable
-    directory.
+def _client_identity_paths(config: BackupConfig, tls: Optional[Path]):
+    """`(cert, key, configured)`: the client TLS identity the remote worker
+    presents -- `client_cert_file`/`client_key_file` when set (both or
+    neither, `validate_config`), else `<db>.tls/client.{crt,key}`."""
+    cert = getattr(config, 'client_cert_file', None)
+    key = getattr(config, 'client_key_file', None)
+    if cert is not None and key is not None:
+        return Path(cert), Path(key), True
+    if tls is None:
+        return None, None, False
+    cert, key = identity.identity_paths(tls, identity.CLIENT_NAME)
+    return cert, key, False
 
-    Advisory only: the id is loaded lazily, on the first remote backup, and a
-    failure there is caught and logged per dataset by the worker loop -- it
-    breaks remote backup, not the daemon -- so callers WARN and carry on
-    (local snapshots and pruning must keep running)."""
-    try:
-        path = config.effective_client_id_file
-    except Exception as e:
-        return (
-            f"the default client id file cannot be derived ($HOME unresolved: {e}); "
-            "set client_id_file or HOME"
-        )
-    try:
-        text = _read_id_file(path)
-    except (OSError, UnicodeError) as e:
-        return f"client id file {path} exists but cannot be read: {e}"
-    if text is not None:
-        if text.strip():
-            return None
-        # blank: `ClientIdentity` would rewrite it
-        if not os.access(path, os.W_OK):
-            return f"client id file {path} is empty and cannot be written"
-        return None
-    ancestor = path.parent
-    while not os.path.lexists(ancestor) and ancestor != ancestor.parent:
-        ancestor = ancestor.parent
-    if not os.path.isdir(ancestor):
-        return f"client id file {path} cannot be created: {ancestor} is not a directory"
-    if not os.access(ancestor, os.W_OK | os.X_OK):
-        return f"client id file {path} cannot be created: {ancestor} is not writable"
+
+def _not_regular(*paths) -> Optional[str]:
+    """A message if one of `paths` exists but is not a regular file (after
+    following symlinks), else `None`. Checked BEFORE `identity` opens them:
+    its reads use a blocking `open`, and a FIFO there (an operator-supplied
+    `client_cert_file`, say) would hang the single-threaded supervisor with
+    SIGTERM unanswered (PEP 475 retries the interrupted `open`) -- the hazard
+    the old client-id-file reader guarded against. A path swapped between
+    this `stat` and the `open` is not covered; nor is a hung network
+    filesystem."""
+    for path in paths:
+        try:
+            mode = os.stat(path).st_mode
+        except OSError:
+            continue  # missing or unreadable: the loader says which
+        if not stat.S_ISREG(mode):
+            return f"{path} is not a regular file"
     return None
+
+
+#: How long `_client_tls_problem` waits for `<db>.tls/identity.lock` (held by
+#: a CLI creating or promoting an identity) before reporting the identity as
+#: unusable for now. Advisory only, so it must not stall the supervisor.
+ADVISORY_IDENTITY_LOCK_TIMEOUT = 0.5
+
+
+def _remote_destinations(config: BackupConfig) -> List[str]:
+    """The destination names the enabled datasets send to, sorted."""
+    return sorted({
+        r.destination for ds in config.enabled_datasets for r in (ds.remote or [])
+    })
+
+
+def _client_tls_problem(
+    config: BackupConfig,
+    client_id: Optional[str],
+    tls: Optional[Path],
+    *,
+    now: Optional[datetime] = None,
+) -> Tuple[List[str], Optional['identity.Identity']]:
+    """Why remote backups may not work for `config` and this host's client
+    id, as advisory messages, plus the client identity when it loaded.
+    Never a refusal, never creates anything: remote backup is the only thing
+    affected -- the remote worker skips a destination it cannot use (M11) --
+    so callers WARN and accept the configuration. `([], None)` when no
+    enabled dataset has a remote destination.
+
+    Checked: a client id exists (`enroll` generates it); the client
+    certificate and key (`_client_identity_paths`) load as a `clientAuth`
+    identity -- readable, matching, unexpired, usable EKU -- and do not
+    expire within `CLIENT_CERT_EXPIRY_WARN_DAYS`; every destination in use
+    is enrolled (has a `server_fingerprint`). The daemon runs as root, so
+    the key is read with `load_identity`; a non-root `--test-config` may
+    report it unreadable."""
+    if not _remote_worker_needed(config):
+        return [], None
+    problems: List[str] = []
+    if client_id is None:
+        problems.append(
+            "this host has no client id yet; run `zfsbackup-config enroll "
+            "DESTINATION --url https://... --token-file FILE` (it generates the "
+            "id and the client certificate)"
+        )
+    loaded = None
+    cert, key, configured = _client_identity_paths(config, tls)
+    if cert is None:
+        problems.append("the client TLS identity cannot be located (no config database path)")
+    elif not configured and not os.path.lexists(cert) and not os.path.lexists(key):
+        problems.append(
+            f"there is no client TLS identity in {cert.parent} yet; "
+            "`zfsbackup-config enroll` creates it"
+        )
+    elif (odd := _not_regular(cert, key)) is not None:
+        problems.append(f"the client TLS identity cannot be used: {odd}")
+    else:
+        try:
+            # Advisory, and run in the supervisor's loop: never wait out a
+            # CLI `identity rotate` holding `identity.lock` (up to 30 s).
+            loaded = identity.load_identity(
+                cert, key, identity.ROLE_CLIENT, now=now,
+                lock_timeout=ADVISORY_IDENTITY_LOCK_TIMEOUT,
+            )
+        except identity.IdentityError as e:
+            problems.append(f"the client TLS identity cannot be used: {e}")
+        else:
+            moment = now or datetime.now(timezone.utc)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            left = loaded.not_after - moment
+            if left < timedelta(days=CLIENT_CERT_EXPIRY_WARN_DAYS):
+                problems.append(
+                    f"the client certificate {cert} expires on "
+                    f"{loaded.not_after:%Y-%m-%d %H:%M} UTC (in {max(left.days, 0)} "
+                    "day(s)); rotate it: `zfsbackup-config identity rotate`"
+                )
+    unenrolled = [
+        name for name in _remote_destinations(config)
+        if (dest := config.destinations.get(name)) is not None
+        and getattr(dest, 'server_fingerprint', None) is None
+    ]
+    if unenrolled:
+        problems.append(
+            f"destination(s) {', '.join(unenrolled)} not enrolled (no "
+            "server_fingerprint), so backups to them are skipped; run "
+            "`zfsbackup-config enroll DESTINATION ...` for each"
+        )
+    return problems, loaded
+
+
+def _tls_inputs(config: BackupConfig, client_id: Optional[str]) -> tuple:
+    """What `_client_tls_problem`'s verdict depends on in the configuration,
+    so a reload re-checks only when one of these changed."""
+    return (
+        _remote_worker_needed(config),
+        client_id,
+        getattr(config, 'client_cert_file', None),
+        getattr(config, 'client_key_file', None),
+        tuple(
+            (name, getattr(config.destinations.get(name), 'server_fingerprint', None))
+            for name in _remote_destinations(config)
+        ),
+    )
 
 
 def _candidate_refusal(
@@ -388,7 +452,7 @@ def _candidate_refusal(
 ) -> Optional[str]:
     """Why the API worker could not start with `config`, or `None`: it binds
     its address first and would otherwise crash-loop on it (D9). The only
-    refusal left; a client id problem is advisory (`_candidate_warnings`).
+    refusal left; a remote-backup problem is advisory (`_candidate_warnings`).
     The result is a `_Refusal`: `.deferrable` is true only when the address
     is merely IN USE (`EADDRINUSE`, which can clear by itself); an address
     that cannot exist here, a privileged port or a name that does not resolve
@@ -445,39 +509,39 @@ def _candidate_refusal(
 
 
 def _candidate_warnings(
-    config: BackupConfig, previous: Optional[BackupConfig] = None
+    config: BackupConfig,
+    previous: Optional[BackupConfig] = None,
+    *,
+    client_id: Optional[str] = None,
+    previous_client_id: Optional[str] = None,
+    tls: Optional[Path] = None,
 ) -> List[str]:
-    """Advisory findings about `config`: never a refusal. Today one: the
-    remote worker may not be able to get its client id (`_client_id_problem`),
-    checked when the remote worker is needed and the effective path changed
-    or the worker is newly needed (`previous=None`, startup: always). That
-    breaks remote backup only -- the worker loop catches and logs it per
-    dataset -- so the candidate is accepted, with a WARNING."""
-    if not _remote_worker_needed(config):
+    """Advisory findings about `config` and the client id read with it:
+    never a refusal. Today: whether remote backups can work
+    (`_client_tls_problem` -- client id, client certificate, enrolled
+    destinations). Evaluated at startup (`previous=None`) and on a reload
+    only when one of its inputs changed (`_tls_inputs`), so an unchanged
+    problem is not repeated on every `set`. That breaks remote backup only
+    -- the remote worker skips what it cannot use -- so the candidate is
+    accepted, with a WARNING."""
+    if previous is not None and (
+        _tls_inputs(config, client_id) == _tls_inputs(previous, previous_client_id)
+    ):
         return []
-    changed = True
-    if previous is not None and _remote_worker_needed(previous):
-        try:
-            changed = (
-                config.effective_client_id_file != previous.effective_client_id_file
-            )
-        except Exception:
-            changed = True
-    if not changed:
-        return []
-    err = _client_id_problem(config)
-    if err is None:
-        return []
+    problems, _ = _client_tls_problem(config, client_id, tls)
     return [
-        f"the remote backup worker may not be able to start remote backups: {err}"
-        "; local snapshots and pruning are unaffected"
+        f"remote backup: {problem}; local snapshots and pruning are unaffected"
+        for problem in problems
     ]
 
 
-#: Top-level `BackupConfig` settings compared by a reload's summary line.
+#: Top-level `BackupConfig` settings compared by a reload's summary line. The
+#: client id is not a `BackupConfig` setting; `_try_reload` adds `client_id`
+#: to the summary itself when it changed.
 _SETTINGS = (
     'snapshot_prefix', 'check_interval', 'prune_interval', 'api_host',
-    'api_port', 'dry_run', 'destinations', 'remote_backup', 'client_id_file',
+    'api_port', 'dry_run', 'destinations', 'remote_backup',
+    'client_cert_file', 'client_key_file',
 )
 
 
@@ -577,8 +641,11 @@ class BackupDaemon:
         dry_run_override: bool = False,
         workers_lock=None,
         notifier: Optional[sdnotify.Notifier] = None,
+        client_id: Optional[str] = None,
     ):
-        """`key` is the `(store_id, generation)` that `config` was read at.
+        """`key` is the `(store_id, generation)` that `config` was read at,
+        and `client_id` this host's client id from the same snapshot
+        (`ConfigSnapshot.client_id`; handed to the remote worker).
         `_run_startup` always passes it. A daemon built without one (unit
         tests, embedded use) cannot tell a changed store from its own, so
         live reload is off for it: `_reload_tick` consumes a SIGHUP, logs
@@ -594,12 +661,14 @@ class BackupDaemon:
         `$NOTIFY_SOCKET`. Only `run()` and `_reload_tick` use it -- never a
         signal handler.
         """
-        #: Config, epoch and key, swapped as one object by `_try_reload` and
-        #: read once per spawn by `_new_worker`. See `Handoff`.
-        self._handoff = Handoff(config, 0, key)
+        #: Config, epoch, key and client id, swapped as one object by
+        #: `_try_reload` and read once per spawn by `_new_worker`. See
+        #: `Handoff`.
+        self._handoff = Handoff(config, 0, key, client_id)
         #: The config *database* path, with its provenance. Read by the
-        #: supervisor only: at startup, by every poll and by every reload
-        #: (`_reload_tick`); no worker is given it. Renamed from
+        #: supervisor: at startup, by every poll and by every reload
+        #: (`_reload_tick`). The API worker is given it for TLS only (the
+        #: trust tables, through `store.trust`; never the configuration). Renamed from
         #: `config_path` rather than merely retyped, so a bare `Path` cannot
         #: sneak back in unnoticed.
         self.resolved_config = resolved_config
@@ -645,9 +714,10 @@ class BackupDaemon:
         #: newer key supersedes it, or when it becomes a final rejection.
         self._deferred: Optional[Tuple[int, int]] = None
         self._deferred_reason: Optional[str] = None
-        #: `(key, message)` of the last client id WARNING, so a candidate
-        #: that is re-evaluated warns once.
-        self._warned: Optional[tuple] = None
+        #: `(key, message)` of every advisory WARNING (`_candidate_warnings`)
+        #: logged for the candidate being evaluated, so a candidate that is
+        #: re-evaluated (a deferred key, at every poll) warns once.
+        self._warned: Set[tuple] = set()
         self._rejection_logged: Optional[tuple] = None
         #: Poll-only marker: the stored key a poll saw when the full read it
         #: triggered failed before its own key was known (a stale schema, a
@@ -837,7 +907,18 @@ class BackupDaemon:
         # pickled, and `Duration.__reduce__` carries the operator's literals
         # across, so a respawned worker sees exactly the config its siblings
         # on the same epoch run. `dry_run` is already applied to it.
+        #
+        # The client id rides the same `Handoff` (a changed id is a reload,
+        # never a separate value read here). The API worker gets the database
+        # path for its TLS identity and trust view only; the remote worker
+        # gets the TLS directory (its default client identity) and the id.
         h = self._handoff
+        extra = {}
+        if name == 'api':
+            extra['config_db'] = self.resolved_config
+        elif name == 'remote':
+            extra['tls_dir'] = _tls_dir(self.resolved_config)
+            extra['client_id'] = h.client_id
         return cls(
             h.config,
             self._stop_event,
@@ -845,6 +926,7 @@ class BackupDaemon:
             reload_epoch=self._reload_epoch,
             born_epoch=h.epoch,
             workers_lock=self._workers_lock_path(),
+            **extra,
         )
 
     def _workers_lock_path(self):
@@ -1840,10 +1922,12 @@ class BackupDaemon:
         `deferred=`. Any other bind failure (not our address, privileged
         port, unresolvable name) is a final rejection: re-probing it would
         only repeat the failure and re-resolve the name on the supervisor
-        loop at every poll. A client id problem only warns
-        (`_candidate_warnings`). A candidate
-        identical to the running config (`BackupConfig.same_as`, after the
-        `--dry-run` override) only moves the key (`_accept_identical`, B2).
+        loop at every poll. A remote-backup problem (client id, client
+        certificate, un-enrolled destinations) only warns
+        (`_candidate_warnings`). A candidate identical to the running config
+        (`BackupConfig.same_as`, after the `--dry-run` override) *with the
+        same client id* only moves the key (`_accept_identical`, B2); a
+        changed client id is a real switch (epoch bump).
         The supervisor makes
         no `zfs` call (B1): `verify_datasets` and the property sync are the
         respawned snapshot worker's job. Stop beats all of it: nothing is
@@ -1898,8 +1982,14 @@ class BackupDaemon:
         # B2: a rewrite that changed nothing (a re-import, an `edit` that
         # saved the same text) bumps the generation but must not turn every
         # worker over. `same_as` is exact: a literal-only edit (`1h` ->
-        # `60m`) is a difference and does turn workers over.
-        if config.same_as(h.config):
+        # `60m`) is a difference and does turn workers over. The client id
+        # is compared too: `same_as` ignores it (it is not configuration),
+        # but `identity set-client-id` / `enroll` change it with an
+        # otherwise identical config, and the remote worker must turn over
+        # to pick it up -- an id read here and then dropped would leave it
+        # sending under the old one.
+        client_id = snap.client_id
+        if config.same_as(h.config) and client_id == h.client_id:
             self._accept_identical(key)
             return
 
@@ -1928,18 +2018,21 @@ class BackupDaemon:
 
         for warning in warnings:
             logger.warning(f"configuration generation {_gen(key)}: {warning}")
-        # Advisory (client id): never a refusal. Broad catch, a bug in a
+        # Advisory (remote backup: client id, client certificate,
+        # enrollment): never a refusal. Broad catch, a bug in a
         # check must not take the supervisor down; once per `(key, message)`.
         try:
-            advice = _candidate_warnings(config, h.config)
+            advice = _candidate_warnings(
+                config, h.config, client_id=client_id,
+                previous_client_id=h.client_id, tls=_tls_dir(self.resolved_config),
+            )
         except Exception as e:
-            advice = [f"the client id check failed to run: {type(e).__name__}: {e}"]
+            advice = [f"the remote backup check failed to run: {type(e).__name__}: {e}"]
+        self._warned = {w for w in self._warned if w[0] == key}
         for warning in advice:
-            if (key, warning) != self._warned:
-                self._warned = (key, warning)
+            if (key, warning) not in self._warned:
+                self._warned.add((key, warning))
                 logger.warning(f"configuration generation {_gen(key)}: {warning}")
-        if not advice:
-            self._warned = None
         logger.info(
             f"configuration generation {_gen(key)} accepted "
             f"(was {_gen(h.key)}; trigger: {trigger})"
@@ -1956,6 +2049,8 @@ class BackupDaemon:
         removed = sorted(old.keys() - new.keys())
         changed = sorted(n for n in new.keys() & old.keys() if not _same(new[n], old[n]))
         settings = _changed_settings(h.config, config)
+        if client_id != h.client_id:
+            settings.append('client_id')
         if logger.isEnabledFor(logging.DEBUG):
             manager.dataset_report()
 
@@ -1966,7 +2061,7 @@ class BackupDaemon:
             return
 
         epoch = h.epoch + 1
-        self._handoff = Handoff(config, epoch, key)
+        self._handoff = Handoff(config, epoch, key, client_id)
         self._reload_epoch.set(epoch)
         self._rejected = None
         self._deferred = None
@@ -1997,6 +2092,10 @@ class BackupDaemon:
             logger.info(f"  changed dataset {name}: {_describe_dataset(new[name])}")
         for name in removed:
             logger.info(f"  removed dataset {name}")
+        if 'client_id' in settings:
+            logger.info(
+                f"  client id: {h.client_id or '(none)'} -> {client_id or '(none)'}"
+            )
         if 'snapshot_prefix' in settings:
             logger.warning(
                 f"snapshot_prefix changed from {h.config.snapshot_prefix} to "
@@ -2019,7 +2118,7 @@ class BackupDaemon:
         the turnover finishes (it reads `h.key`)."""
         h = self._handoff
         clear = {'deferred': None} if self._deferred is not None else {}
-        self._handoff = Handoff(h.config, h.epoch, key)
+        self._handoff = Handoff(h.config, h.epoch, key, h.client_id)
         self._rejected = None
         self._deferred = None
         self._deferred_reason = None
@@ -2302,6 +2401,115 @@ def _wait_for_previous_workers(resolved) -> None:
             return
 
 
+def _ensure_server_identity(resolved, dry_run: bool) -> bool:
+    """Make sure the API server's TLS identity (`<db>.tls/server.{crt,key}`)
+    exists and is usable, before the first fork; -> `False` to refuse the
+    start (the reason is logged). Plan A4: the supervisor creates it at
+    startup (or `zfsbackup-config trust token create` did earlier); the API
+    worker only loads it.
+
+    `--dry-run` (the flag, `dry_run`) creates nothing: a key is a persistent
+    change. An existing identity is still validated exactly as the API worker
+    will load it, so a dry run refuses what a real start would; a missing
+    (or half-written) one is left missing and the API worker serves with a
+    throwaway identity for that run (`workers._server_identity`). A stored
+    `dry_run: true` is configuration, not this run's flag: the identity is
+    created then, so a later reload to `dry_run: false` finds it."""
+    tls = _tls_dir(resolved)
+    cert, key = identity.identity_paths(tls, identity.SERVER_NAME)
+    odd = _not_regular(cert, key)
+    if odd is not None:
+        logger.error(
+            f"cannot set up the API server's TLS identity: {odd}; remove it "
+            "(the daemon then generates a new identity, and every client must "
+            "re-enroll) or put the right file in its place"
+        )
+        return False
+    try:
+        if dry_run:
+            if not (os.path.lexists(cert) and os.path.lexists(key)):
+                logger.warning(
+                    f"dry run: there is no server TLS identity in {tls}, and a dry "
+                    "run does not create one; the API worker serves with a "
+                    "throwaway identity for this run (no client can use it)"
+                )
+                return True
+            server = identity.load_identity(
+                cert, key, identity.ROLE_SERVER, allow_expired=True
+            )
+        else:
+            server = identity.ensure_identity(tls, identity.ROLE_SERVER)
+    except identity.IdentityError as e:
+        logger.error(
+            f"cannot set up the API server's TLS identity: {e}. The API serves "
+            "HTTPS only and cannot start without it; fix this and start the "
+            "daemon again"
+        )
+        return False
+    except Exception as e:
+        logger.error(
+            f"cannot set up the API server's TLS identity in {tls}: "
+            f"{type(e).__name__}: {e}",
+            exc_info=True,
+        )
+        return False
+    logger.info(
+        f"server TLS identity {server.cert_path} (fingerprint {server.fingerprint})"
+    )
+    return True
+
+
+def _report_client_tls(
+    config: BackupConfig, client_id: Optional[str], tls: Optional[Path], generation
+) -> None:
+    """Startup (and `--test-config`): log this host's client id and client
+    certificate fingerprint at INFO, and every `_client_tls_problem` at
+    WARNING. Advisory only; never raises."""
+    if client_id is not None:
+        logger.info(f"client id: {client_id}")
+    else:
+        logger.info("client id: not set yet (`zfsbackup-config enroll` generates it)")
+    try:
+        problems, client = _client_tls_problem(config, client_id, tls)
+    except Exception as e:
+        logger.warning(
+            f"configuration generation {generation}: the remote backup check "
+            f"failed to run: {type(e).__name__}: {e}"
+        )
+        return
+    if client is not None:
+        logger.info(
+            f"client TLS identity {client.cert_path} (fingerprint {client.fingerprint})"
+        )
+    for problem in problems:
+        logger.warning(
+            f"configuration generation {generation}: remote backup: {problem}; "
+            "local snapshots and pruning are unaffected"
+        )
+
+
+def _report_tls_state(resolved, config: BackupConfig, client_id: Optional[str]) -> None:
+    """`--test-config`: the TLS state, read-only -- nothing is created, no
+    key is needed for the server's fingerprint (`peek_identity`)."""
+    tls = _tls_dir(resolved)
+    try:
+        server = identity.peek_identity(tls, identity.SERVER_NAME)
+    except identity.IdentityError as e:
+        logger.warning(f"Server TLS identity: unusable: {e}")
+    else:
+        if server is None:
+            logger.info(
+                f"Server TLS identity: none yet in {tls} (the daemon creates it "
+                "when it starts)"
+            )
+        else:
+            logger.info(
+                f"Server TLS identity: fingerprint {server.fingerprint}, expires "
+                f"{server.not_after:%Y-%m-%d}"
+            )
+    _report_client_tls(config, client_id, tls, "under test")
+
+
 def _release_refused(lock) -> None:
     """A startup refusal after the presence lock was taken (the config failed
     to load): remove the pid file and drop the lock, so a refused start leaves
@@ -2403,9 +2611,13 @@ def _run_startup(
 
     Startup order: resolve the path -> preflight (`check_config_db`, creates
     nothing) -> take the presence lock -> wait out a predecessor's workers ->
-    read the config -> `validate_config` -> record its key as `applied=` in
-    the lock -> `BackupDaemon.run`. `--test-config` skips the lock but not
-    the validation. Any refusal after the lock was taken releases it.
+    read the config (and the client id, one snapshot) -> `validate_config`
+    -> the API bind probe -> the server TLS identity (`_ensure_server_identity`;
+    nothing is created under `--dry-run`) -> the remote-backup advisory ->
+    record its key as `applied=` in the lock -> `BackupDaemon.run`.
+    `--test-config` skips the lock, the probe and the identity creation but
+    not the validation, and reports the TLS state read-only. Any refusal
+    after the lock was taken releases it.
     """
     resolved = None
     lock = None
@@ -2494,9 +2706,10 @@ def _run_startup(
             return 1
         # B3, D10: nor may a config be run at startup that a reload would
         # refuse for what the API worker does first -- the bind (a D9 crash
-        # loop). A client id problem only warns: it breaks remote backup, not
-        # the daemon. Not for `--test-config`: it must work beside a running
-        # daemon (which holds the API port) and under any user.
+        # loop). A remote-backup problem (client id, client certificate,
+        # enrollment) only warns: it breaks remote backup, not the daemon.
+        # Not for `--test-config`: it must work beside a running daemon
+        # (which holds the API port) and under any user.
         if not args.test_config:
             try:
                 refusal = _candidate_refusal(config)
@@ -2516,14 +2729,15 @@ def _run_startup(
                 )
                 _release_refused(lock)
                 return 1
-            try:
-                for advice in _candidate_warnings(config):
-                    logger.warning(f"configuration generation {generation}: {advice}")
-            except Exception as e:
-                logger.warning(
-                    f"configuration generation {generation}: the client id "
-                    f"check failed to run: {type(e).__name__}: {e}"
-                )
+            # The API server's TLS identity (plan A4), after the presence
+            # lock and before the first fork: the API worker only loads it.
+            # A failure refuses the start (HTTPS only; it would crash-loop).
+            if not _ensure_server_identity(resolved, bool(args.dry_run)):
+                _release_refused(lock)
+                return 1
+            _report_client_tls(
+                config, snapshot.client_id, _tls_dir(resolved), generation
+            )
         # The key recorded in the lock is the one the workers are about to
         # run, which is what `zfsbackup-config` reports to an operator after
         # an edit (`applied=` also rewrites line 2 with the generation).
@@ -2551,6 +2765,7 @@ def _run_startup(
                 logger.info(f"Destinations: {list(config.destinations)}")
             if config.remote_backup:
                 logger.info(f"Remote backup target: {config.remote_backup.target_dataset}")
+            _report_tls_state(resolved, config, snapshot.client_id)
             return 0
 
     except (ConfigPathError, SchemaError) as e:
@@ -2598,6 +2813,7 @@ def _run_startup(
             dry_run_override=bool(args.dry_run),
             workers_lock=daemonlock.workers_lock_path(resolved),
             notifier=notifier,
+            client_id=snapshot.client_id,
         )
         # `BackupDaemon.__init__` has replaced the startup handler; a SIGHUP
         # that landed before that is carried over. A SIGHUP landing between

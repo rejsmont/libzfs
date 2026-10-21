@@ -35,7 +35,8 @@ integer WARNING 17, accepting any int 17, accepting `1.0` 8, accepting `"1"` 8,
 without the unauthenticated-receive-endpoint note 1; the duplicate-remote check
 in `DatasetConfig.from_dict` removed 6; `validate_config` not rejecting a
 `client_id_file` of `.` 5, `save_config` not storing `""` as NULL 1, no
-`""` warning 1.
+`""` warning 1. (Both rules, and A-21 below, were superseded by TLS/mTLS
+M15/D2: `from_file` refuses the `client_id_file` key outright.)
 
 A-21 (the normalised current-directory rule, in `validate_config` and
 `from_file`), same method: `validate_config` comparing to the literal `"."` 7;
@@ -88,7 +89,7 @@ def make(ds=None, remote_destinations=False, **top):
     dataset.update(ds or {})
     data = {"datasets": [dataset]}
     if remote_destinations:
-        data["destinations"] = {"srv": {"url": "http://127.0.0.1:18082"}}
+        data["destinations"] = {"srv": {"url": "https://127.0.0.1:18082"}}
     data.update(top)
     for container in (data, dataset):
         for key in [k for k, v in container.items() if v is ABSENT]:
@@ -453,10 +454,9 @@ REJECT = [
     pytest.param(make(api_port=""), "api_port", id="api-port-empty-string"),
     # --- other typed scalars ---
     pytest.param(make(api_host=123), "api_host", id="api-host-int"),
-    pytest.param(make(client_id_file=123), "client_id_file", id="client-id-file-int"),
     pytest.param(make(ds={"name": 123}), "name", id="dataset-name-int"),
     pytest.param(
-        make(destinations={1: {"url": "http://x"}}), "destinations key",
+        make(destinations={1: {"url": "https://x"}}), "destinations key",
         id="destination-key-int",
     ),
     pytest.param(
@@ -494,8 +494,8 @@ REJECT = [
                 {"destination": "srv"}, {"destination": "other"}, {"destination": "srv"},
             ]},
             destinations={
-                "srv": {"url": "http://127.0.0.1:18082"},
-                "other": {"url": "http://127.0.0.1:18083"},
+                "srv": {"url": "https://127.0.0.1:18082"},
+                "other": {"url": "https://127.0.0.1:18083"},
             },
         ),
         "duplicate destination 'srv'", id="non-adjacent-duplicate-remote-destination",
@@ -588,7 +588,7 @@ class TestDuplicateRemoteDestinations:
         assert "already used by datasets[pool/data].remote[0]" in message
 
     def test_from_file_wording_matches_validate_configs(self, tmp_path):
-        config = good_config(destinations={"srv": Destination("http://x")})
+        config = good_config(destinations={"srv": Destination("https://x")})
         config.datasets[0].remote = [RemoteDatasetConfig("srv"), RemoteDatasetConfig("srv")]
         with pytest.raises(ValueError) as in_code:
             validate_config(config)
@@ -630,7 +630,7 @@ class TestDuplicateRemoteDestinations:
                 {"name": "pool/a", "remote": [{"destination": "srv"}]},
                 {"name": "pool/b", "remote": [{"destination": "srv"}]},
             ],
-            "destinations": {"srv": {"url": "http://127.0.0.1:18082"}},
+            "destinations": {"srv": {"url": "https://127.0.0.1:18082"}},
         }
         path = write(tmp_path, data)
         assert [d.remote[0].destination for d in BackupConfig.from_file(path).datasets] == [
@@ -643,8 +643,8 @@ class TestDuplicateRemoteDestinations:
         data = make(
             ds={"remote": [{"destination": "srv"}, {"destination": "other"}]},
             destinations={
-                "srv": {"url": "http://127.0.0.1:18082"},
-                "other": {"url": "http://127.0.0.1:18083"},
+                "srv": {"url": "https://127.0.0.1:18082"},
+                "other": {"url": "https://127.0.0.1:18083"},
             },
         )
         config = BackupConfig.from_file(write(tmp_path, data))
@@ -652,178 +652,93 @@ class TestDuplicateRemoteDestinations:
 
 
 # ---------------------------------------------------------------------------
-# A-14.1: client_id_file -- "" is unset, "." names a directory
+# A-14.1 / A-21 (reworked by TLS/mTLS M15/D2): `client_id_file` is gone.
+# `BackupConfig.from_file` refuses the key outright, whatever its value (a
+# path, null, "", or any spelling of the current directory); the field and its
+# column no longer exist, so there is nothing to validate, store or derive.
+# The old per-spelling messages ("names a directory, not a file") are gone with
+# the rule: every value gets the one removal message.
 # ---------------------------------------------------------------------------
 
+REMOVED_MESSAGE = "client_id_file was removed"
 
-class TestClientIdFileEmptyAndDot:
-    @pytest.fixture
-    def session_for(self, tmp_path):
-        """A writable store at a fresh path; returns (resolved, save-and-load)."""
-        resolved = resolve_config_path(str(tmp_path / "cid" / "config.db"))
-        return resolved
-
-    def _save(self, resolved, config):
-        """`save_config` through the real engine factory, then reload."""
-        from zfsbackup.config.store import paths as store_paths
-        from zfsbackup.config.store.migrate import ensure_schema
-
-        store_paths.ensure_config_dir(resolved.resolved_path.parent)
-        store_paths.create_config_db_file(resolved.resolved_path)
-        with store_paths.open_config_connection(
-            resolved, readonly=False, foreign_keys=False, allow_new=True
-        ) as conn:
-            ensure_schema(conn)
-            conn.commit()
-        with open_config_session(resolved, readonly=False) as session:
-            save_config(session, config)
-        with open_config_session(resolved, readonly=True) as session:
-            row = session.get(GlobalSettings, 1).client_id_file
-            return row, load_config(session)
-
-    def test_in_code_empty_string_warns_that_it_means_unset(self):
-        warnings = validate_config(good_config(client_id_file=""))
-        assert len(warnings) == 1
-        assert "client_id_file" in warnings[0]
-        assert "derive from $HOME" in warnings[0] and "stored unset" in warnings[0]
-
-    def test_in_code_empty_string_is_stored_as_null_and_reloads_as_none(self, session_for):
-        raw, loaded = self._save(session_for, good_config(client_id_file=""))
-        assert raw is None  # NOT "", which would reload as Path(".")
-        assert loaded.client_id_file is None
-
-    def test_an_explicit_path_is_still_stored_verbatim(self, session_for):
-        raw, loaded = self._save(session_for, good_config(client_id_file=Path("/x/client_id")))
-        assert raw == "/x/client_id"
-        assert loaded.client_id_file == Path("/x/client_id")
-
-    @pytest.mark.parametrize(
-        "value", [Path(""), Path("."), "."], ids=["Path('')", "Path('.')", "'.'"],
-    )
-    def test_dot_in_any_spelling_is_rejected(self, value):
-        with pytest.raises(ValueError, match="client_id_file") as excinfo:
-            validate_config(good_config(client_id_file=value))
-        assert "names a directory" in str(excinfo.value)
-
-    def test_dot_rejection_happens_before_anything_is_written(self, session_for):
-        with pytest.raises(ValueError, match="client_id_file"):
-            self._save(session_for, good_config(client_id_file=Path("")))
-
-    @pytest.mark.parametrize(
-        "value", ["./client_id", "client_id", "a/.", "/", ".hidden", ".."],
-    )
-    def test_other_relative_and_odd_paths_are_not_the_dot_rule(self, value):
-        # Only a value whose `os.fspath` is exactly "." is a directory name
-        # here; the rest are the operator's business.
-        assert os.fspath(Path(value)) != "."
-        assert validate_config(good_config(client_id_file=Path(value))) == []
-
-    def test_yaml_dot_is_refused_at_import_with_nothing_created(self, tmp_path):
-        target = tmp_path / "brandnew" / "config.db"
-        with pytest.raises(ValueError, match="client_id_file"):
-            import_yaml(
-                write(tmp_path, make(client_id_file=".")), resolve_config_path(str(target))
-            )
-        assert not target.exists() and not target.parent.exists()
-
-    def test_yaml_empty_string_is_unset_not_dot(self, tmp_path):
-        path = write(tmp_path, make(client_id_file=""))
-        assert BackupConfig.from_file(path).client_id_file is None
-        assert via_import(tmp_path, path).client_id_file is None
+#: Every value the key can carry in YAML: ordinary paths, the unset
+#: spellings (null, ""), and every spelling of the current directory.
+ANY_YAML_VALUE = [
+    pytest.param(v, id=repr(v))
+    for v in [
+        "/x/client_id", "x/id", "client_id", "..", "./a", "a/.", "/", ".hidden", "../x",
+        ".", "./", "././", "a/..", "a/b/../..",
+        "", None, 123, True, ["a"],
+    ]
+]
 
 
-# ---------------------------------------------------------------------------
-# A-21.4 / daemon: every spelling of the current directory is refused, in BOTH
-# `from_file` and `validate_config` (the same `os.path.normpath(...) == "."` rule)
-# ---------------------------------------------------------------------------
-
-#: Spellings that normalise to "." (and are not the empty string, which is unset).
-DIRECTORY_SPELLINGS = [".", "./", "././", "a/..", "a/b/../.."]
-#: Neither the current directory nor empty: the operator's business.
-ACCEPTED_SPELLINGS = ["x/id", "..", "./a", "a/.", "client_id", "/", ".hidden", "../x"]
-
-
-class TestClientIdFileNormalisedDirectory:
-    @pytest.mark.parametrize("value", DIRECTORY_SPELLINGS)
-    def test_from_file_refuses_every_spelling_of_the_current_directory(self, tmp_path, value):
+class TestClientIdFileRemoved:
+    @pytest.mark.parametrize("value", ANY_YAML_VALUE)
+    def test_from_file_refuses_the_key_whatever_its_value(self, tmp_path, value):
         path = write(tmp_path, make(client_id_file=value))
-        with pytest.raises(ValueError, match="client_id_file") as excinfo:
-            BackupConfig.from_file(path)  # directly: no import involved
+        with pytest.raises(ValueError, match=REMOVED_MESSAGE) as excinfo:
+            BackupConfig.from_file(path)
         message = str(excinfo.value)
-        assert "names a directory, not a file" in message
-        assert repr(value) in message
-        assert "omit it" in message
+        assert "identity show" in message and "identity set-client-id" in message
+        # The old directory rule's wording is gone with the rule.
+        assert "names a directory" not in message
 
-    @pytest.mark.parametrize("value", ["", None], ids=["empty-string", "null"])
-    def test_from_file_still_treats_empty_and_null_as_unset(self, tmp_path, value):
-        # `normpath("")` is "." too: "" must be decided BEFORE the directory rule.
-        assert os.path.normpath("") == "."
-        config = BackupConfig.from_file(write(tmp_path, make(client_id_file=value)))
-        assert config.client_id_file is None
-
-    def test_from_file_absent_key_is_unset(self, tmp_path):
+    def test_from_file_without_the_key_loads(self, tmp_path):
         config = BackupConfig.from_file(write(tmp_path, make()))
-        assert config.client_id_file is None
+        assert not hasattr(config, "client_id_file")
 
-    @pytest.mark.parametrize("value", ACCEPTED_SPELLINGS)
-    def test_from_file_accepts_everything_else(self, tmp_path, value):
-        config = BackupConfig.from_file(write(tmp_path, make(client_id_file=value)))
-        assert config.client_id_file == Path(value)
+    def test_the_key_is_refused_before_dataset_errors(self, tmp_path):
+        # A config with both problems reports the client_id_file one: the check
+        # runs right after the top-level mapping is validated.
+        data = make(client_id_file="/x/id", ds={"frequency": "not-a-duration"})
+        with pytest.raises(ValueError, match=REMOVED_MESSAGE):
+            BackupConfig.from_file(write(tmp_path, data))
+        # Without the key the same file reports the dataset problem.
+        del data["client_id_file"]
+        with pytest.raises(ValueError) as excinfo:
+            BackupConfig.from_file(write(tmp_path, data, name="b.yaml"))
+        assert "client_id_file" not in str(excinfo.value)
 
-    @pytest.mark.parametrize("value", ["./", "././", "a/..", "a/b/../.."])
-    def test_validate_config_refuses_the_same_spellings_as_strings(self, value):
-        with pytest.raises(ValueError, match="client_id_file") as excinfo:
-            validate_config(good_config(client_id_file=value))
-        message = str(excinfo.value)
-        assert "names a directory, not a file" in message
-        assert repr(value) in message
+    def test_backup_config_has_no_client_id_file(self):
+        config = good_config()
+        assert not hasattr(config, "client_id_file")
+        assert not hasattr(config, "effective_client_id_file")
+        with pytest.raises(TypeError):
+            BackupConfig(datasets=[], client_id_file=Path("/x/id"))
 
-    @pytest.mark.parametrize("value", ["a/..", "a/b/../.."])
-    def test_validate_config_refuses_path_objects_that_normalise_to_dot(self, value):
-        # `Path("a/..")` keeps its ".." (pathlib does not collapse it), so only
-        # the normalised comparison sees the directory.
-        assert os.fspath(Path(value)) != "."
-        with pytest.raises(ValueError, match="names a directory"):
-            validate_config(good_config(client_id_file=Path(value)))
+    def test_validate_config_has_no_client_id_file_rule(self):
+        # The store check that read the field is gone: an attribute stuck onto
+        # a config object by hand is simply not looked at.
+        config = good_config()
+        config.client_id_file = "/x/client_id"
+        assert validate_config(config) == []
 
-    def test_validate_config_empty_string_still_warns_and_is_not_refused(self):
-        warnings = validate_config(good_config(client_id_file=""))
-        assert len(warnings) == 1
-        assert "derive from $HOME" in warnings[0] and "stored unset" in warnings[0]
+    def test_the_column_is_gone_from_the_table(self):
+        assert not hasattr(GlobalSettings, "client_id_file")
+        assert "client_id_file" not in GlobalSettings.__table__.columns
 
-    @pytest.mark.parametrize("value", ACCEPTED_SPELLINGS)
-    def test_validate_config_accepts_everything_else(self, value):
-        assert validate_config(good_config(client_id_file=Path(value))) == []
-
-    def test_the_two_doors_agree_on_every_spelling(self, tmp_path):
-        for value in DIRECTORY_SPELLINGS + ACCEPTED_SPELLINGS:
-            yaml_rejects = validate_rejects = False
-            try:
-                BackupConfig.from_file(write(tmp_path, make(client_id_file=value)))
-            except ValueError:
-                yaml_rejects = True
-            try:
-                validate_config(good_config(client_id_file=Path(value)))
-            except ValueError:
-                validate_rejects = True
-            assert yaml_rejects == validate_rejects == (value in DIRECTORY_SPELLINGS), value
-
-    @pytest.mark.parametrize("value", ["./", "a/.."])
-    def test_yaml_spelling_is_refused_at_import_with_nothing_created(self, tmp_path, value):
+    @pytest.mark.parametrize(
+        "value", ["/x/client_id", ".", "", None, "./", "a/.."],
+        ids=["path", "dot", "empty-string", "null", "dot-slash", "a-dotdot"],
+    )
+    def test_yaml_with_the_key_is_refused_at_import_with_nothing_created(
+        self, tmp_path, value
+    ):
         target = tmp_path / "brandnew" / "config.db"
-        with pytest.raises(ValueError, match="client_id_file"):
+        with pytest.raises(ValueError, match=REMOVED_MESSAGE):
             import_yaml(
                 write(tmp_path, make(client_id_file=value)),
                 resolve_config_path(str(target)),
             )
         assert not target.exists() and not target.parent.exists()
 
-    def test_empty_string_is_still_stored_as_null(self, tmp_path):
-        resolved = resolve_config_path(str(tmp_path / "cid" / "config.db"))
-        helper = TestClientIdFileEmptyAndDot()
-        raw, loaded = helper._save(resolved, good_config(client_id_file=""))
-        assert raw is None
-        assert loaded.client_id_file is None
+    def test_yaml_without_the_key_imports_and_round_trips(self, tmp_path):
+        path = write(tmp_path, make())
+        loaded = via_import(tmp_path, path)
+        assert not hasattr(loaded, "client_id_file")
+        assert loaded == BackupConfig.from_file(path)
 
 
 # ---------------------------------------------------------------------------
@@ -899,13 +814,14 @@ class TestValidateConfigDirect:
     def test_clean_config_has_no_warnings(self):
         assert validate_config(good_config()) == []
 
-    def test_does_not_evaluate_effective_client_id_file(self, monkeypatch):
-        # `effective_client_id_file` reads $HOME; validation must stay pure.
+    def test_stays_pure_and_never_reads_home(self, monkeypatch):
+        # Validation must not touch $HOME (the client id no longer derives
+        # from a file at all).
         def boom(*_a, **_k):
             raise AssertionError("validate_config touched $HOME")
 
         monkeypatch.setattr(Path, "home", boom)
-        assert validate_config(good_config(client_id_file=None)) == []
+        assert validate_config(good_config()) == []
 
     @pytest.mark.parametrize(
         "mutate, key",
@@ -943,7 +859,6 @@ class TestValidateConfigDirect:
             (lambda c: setattr(c, "api_port", -1), "api_port"),
             (lambda c: setattr(c, "check_interval", 300), "check_interval"),
             (lambda c: setattr(c, "prune_interval", "1h"), "prune_interval"),
-            (lambda c: setattr(c, "client_id_file", 12), "client_id_file"),
             (lambda c: setattr(c.datasets[0], "name", 12), "name"),
             (lambda c: setattr(c.datasets[0], "frequency", 3600), "frequency"),
         ],
@@ -951,7 +866,7 @@ class TestValidateConfigDirect:
             "enabled-int", "enabled-str", "dry-run-int", "prefix-int", "api-host-none",
             "api-port-bool", "api-port-float", "api-port-str", "api-port-high",
             "api-port-negative", "check-interval-int", "prune-interval-str",
-            "client-id-file-int", "name-int", "frequency-int",
+            "name-int", "frequency-int",
         ],
     )
     def test_type_checks(self, mutate, key):
@@ -980,7 +895,7 @@ class TestValidateConfigDirect:
         with pytest.raises(ValueError, match="frequency"):
             validate_config(config)
 
-        config = good_config(destinations={"srv": Destination("http://x")})
+        config = good_config(destinations={"srv": Destination("https://x")})
         config.datasets[0].remote = [
             RemoteDatasetConfig("srv", frequency=timedelta(seconds=seconds))
         ]
@@ -988,7 +903,7 @@ class TestValidateConfigDirect:
             validate_config(config)
 
     def test_remote_frequency_none_means_inherit_and_is_valid(self):
-        config = good_config(destinations={"srv": Destination("http://x")})
+        config = good_config(destinations={"srv": Destination("https://x")})
         config.datasets[0].remote = [RemoteDatasetConfig("srv", frequency=None)]
         assert validate_config(config) == []
 
@@ -1012,7 +927,7 @@ class TestValidateConfigDirect:
         with pytest.raises(ValueError, match="ghost"):
             validate_config(config)
 
-        config = good_config(destinations={"srv": Destination("http://x")})
+        config = good_config(destinations={"srv": Destination("https://x")})
         config.datasets[0].remote = [RemoteDatasetConfig("srv"), RemoteDatasetConfig("srv")]
         with pytest.raises(ValueError, match="duplicate destination"):
             validate_config(config)
@@ -1059,7 +974,7 @@ class TestValidateConfigDirect:
         assert "keeping 1d:30d" in message
 
     def test_duplicates_in_a_destination_scope_warn_with_that_scope_key(self):
-        config = good_config(destinations={"srv": Destination("http://x")})
+        config = good_config(destinations={"srv": Destination("https://x")})
         config.datasets[0].remote = [RemoteDatasetConfig(
             "srv",
             retention_rules=[
@@ -1112,9 +1027,9 @@ class TestDestinationOrder:
         # "No changes" detection in the editor compares renders, so the
         # order must not depend on the planner or on rowid.
         path = write(tmp_path, make(destinations={
-            "zeta": {"url": "http://z"},
-            "mid": {"url": "http://m"},
-            "alpha": {"url": "http://a"},
+            "zeta": {"url": "https://z"},
+            "mid": {"url": "https://m"},
+            "alpha": {"url": "https://a"},
         }))
         loaded = via_import(tmp_path, path)
         assert list(loaded.destinations) == ["alpha", "mid", "zeta"]
@@ -1154,7 +1069,7 @@ class TestNeverPruneRoundTrip:
 
         eng = make_engine("sqlite:///:memory:", foreign_keys=True)
         Base.metadata.create_all(eng)
-        config = good_config(destinations={"srv": Destination("http://x")})
+        config = good_config(destinations={"srv": Destination("https://x")})
         config.datasets[0].remote = [RemoteDatasetConfig("srv")]
         with Session(eng) as session:
             save_config(session, config)
@@ -1746,9 +1661,9 @@ class TestSpaceInsideAComponentEndToEnd:
     def test_non_ascii_other_values_are_still_fine(self, tmp_path):
         # Only dataset NAMES are ASCII-bound (they reach `zfs`); a destination
         # name and URL are free text and still round-trip.
-        data = make(destinations={"d\u00e9p\u00f4t": {"url": "http://127.0.0.1:9/caf\u00e9"}})
+        data = make(destinations={"d\u00e9p\u00f4t": {"url": "https://127.0.0.1:9/caf\u00e9"}})
         loaded = via_import(tmp_path, write(tmp_path, data))
-        assert loaded.destinations["d\u00e9p\u00f4t"].url == "http://127.0.0.1:9/caf\u00e9"
+        assert loaded.destinations["d\u00e9p\u00f4t"].url == "https://127.0.0.1:9/caf\u00e9"
 
 
 # -- through the CLI --------------------------------------------------------------

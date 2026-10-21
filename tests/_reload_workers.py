@@ -23,7 +23,7 @@ import os
 import time
 
 from _config_handoff import _SelectableStartMethod
-from zfsbackup.workers import SnapshotWorker
+from zfsbackup.workers import ApiWorker, SnapshotWorker
 
 
 class FakeDataset:
@@ -103,3 +103,9 @@ class FdProbeWorker(_ForcedMethodWatch, SnapshotWorker):
         after = descriptors_on(self.lock_file)
         with open(os.path.join(self.record_dir, f"probe.{os.getpid()}.json"), "w") as fh:
             json.dump({"before": before, "after": after, "pid": os.getpid()}, fh)
+
+
+class SelectableApiWorker(_ForcedMethodWatch, ApiWorker):
+    """A real, unmodified `ApiWorker.run` in a child started with `start_method`
+    (`fork`, `spawn` or `forkserver`): the API worker's TLS tests run the real
+    thing, not a double."""

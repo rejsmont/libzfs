@@ -26,6 +26,15 @@ Commands:
 - `rename dataset|destination OLD NEW` (`rename.py`).
 - `status [--wait S] [--json]` -- is the running daemon on the stored
   configuration? (`status.py`; read-only, never signals.)
+- `trust token|list|revoke` and `identity show|set-client-id` -- enrollment
+  tokens and pinned client certificates (server side) and this host's client
+  id and certificates (`trust.py`; only `identity set-client-id` is a config
+  write and signals the daemon).
+- `enroll DESTINATION` and `identity rotate` -- the client side of trust
+  (`enroll.py`): enroll with a token, and replace the client certificate on
+  every enrolled server. `enroll` commits up to two config writes (the client
+  id, then the destination's url and pin) and signals the daemon once, after
+  the last; `identity rotate` signals only when it updates configured paths.
 
 After every committed write the CLI asks the running daemon to reload
 (`write.notify_daemon`; global `--reload-wait SECONDS`).
@@ -58,7 +67,7 @@ import click
 import yaml
 
 from zfsbackup import daemonlock
-from zfsbackup.cli import dotpath, editor, rename, status as status_view
+from zfsbackup.cli import dotpath, editor, enroll, rename, status as status_view, trust
 from zfsbackup.cli.errors import BackupFailed, CliError, is_database_unusable, report
 from zfsbackup.cli.listing import render_datasets, render_destinations
 from zfsbackup.cli.render import render_yaml
@@ -951,7 +960,7 @@ def list_destinations_cmd(
 _PATH_HELP = (
     "PATH is a setting such as `check_interval`, `datasets.tank/data.frequency`, "
     "`datasets.tank/data.retention.1d`, `datasets.tank/data.remote.offsite.frequency`, "
-    "`destinations.offsite.url` or `remote_backup.enabled`. A name containing dots "
+    "`destinations.offsite.url`, `destinations.offsite.server_fingerprint` or `remote_backup.enabled`. A name containing dots "
     "is matched against the names that exist; the bracket form "
     "`datasets[tank/vm.01].frequency` is always accepted (quote it in the shell) and "
     "is the form this tool prints. An ambiguous path is an error."
@@ -1070,8 +1079,10 @@ def set_cmd(path: str, value: str, config_path: Optional[str], verbose: bool) ->
 @cli.command(
     "unset",
     help=(
-        "Revert one setting: prune_interval and client_id_file go back to "
-        "deriving their value; datasets.N.retention to the default 1d->30d; "
+        "Revert one setting: prune_interval goes back to deriving its value; "
+        "client_cert_file and client_key_file (unset together) go back to the generated "
+        "client identity; a destination's server_fingerprint is removed (it is no longer "
+        "enrolled); datasets.N.retention to the default 1d->30d; "
         "retention.AGE removes that rule (the last one leaves the dataset "
         "never pruned); a destination's remote frequency or retention goes "
         "back to inheriting the dataset's; `remote_backup` removes the receive "
@@ -1292,6 +1303,15 @@ def rename_destination_cmd(
         resolved, snapshot, old, new,
         dry_run=dry_run, skip_missing=skip_missing, warn=state.warn,
     )
+
+
+# --------------------------------------------------------------------------
+# trust / identity (TLS enrollment; the commands live in trust.py)
+# --------------------------------------------------------------------------
+
+trust.register(cli, _common, _state)
+# After trust.register: `identity rotate` is added to its `identity` group.
+enroll.register(cli, _common, _state)
 
 
 _sigterm_seen = False

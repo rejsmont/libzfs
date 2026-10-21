@@ -20,7 +20,8 @@ Mutation counts (scratch copy, one revert at a time; failing tests across this
 file and `test_zfsbackup_cli.py`): no `retention: forever` 46; `enabled`
 omitted 48; `dry_run` omitted when false 1; destinations unsorted 10; remote
 order sorted 28; `prune_interval` filled in from `check_interval` 2;
-`client_id_file` always written 33; `remote_backup` omitted 33; canonical
+`client_id_file` always written 33 (pre-TLS; now `client_cert_file`/`client_key_file`, see
+the TLS mutation counts below); `remote_backup` omitted 33; canonical
 literal instead of the original one 62; durations unquoted 1; names unquoted 1
 / destination keys unquoted 1; retention not sorted by age 1; destination
 retention always written 59 / destination frequency always written 70;
@@ -55,6 +56,9 @@ REPO = Path(__file__).resolve().parent.parent
 REPO_YAMLS = [REPO / "zfsbackup" / "config.example.yaml", REPO / "zfsbackup" / "config.test.yaml"]
 
 D = Duration
+
+#: 64 hex digits that are all decimal: YAML reads an unquoted one as an int.
+DIGIT_FINGERPRINT = "1234567890" * 6 + "1234"
 
 
 @pytest.fixture(autouse=True)
@@ -130,11 +134,14 @@ def synthetic() -> BackupConfig:
         api_host="::1",
         api_port=9090,
         dry_run=True,
-        client_id_file=Path("/var/lib/zfsbackup/client id.json"),
+        client_cert_file=Path("/var/lib/zfsbackup/client cert.pem"),
+        client_key_file=Path("/var/lib/zfsbackup/client#key.pem"),
         destinations={
-            "zeta": Destination("http://zeta.example:8080/a?b=c#frag"),
+            # a pin (given in the colon / upper-case form: the model normalises it)
+            "zeta": Destination("https://zeta.example:8080/a?b=c#frag", ":".join(["AB"] * 32)),
             "alpha": Destination("https://alpha.example"),
-            "123": Destination("http://numeric"),
+            # an all-digit pin: unquoted YAML would read it back as an integer
+            "123": Destination("https://numeric", DIGIT_FINGERPRINT),
         },
         remote_backup=RemoteServerConfig(target_dataset="tank/received", enabled=False),
         datasets=[
@@ -248,7 +255,7 @@ class TestRoundTrip:
                     retention_rules=[RetentionRule(D("1d"), D("30d"))],
                 )],
             )],
-            destinations={"nas": Destination("http://nas")},
+            destinations={"nas": Destination("https://nas")},
         )
         again = reload(render_yaml(same), tmp_path)
         assert again.datasets[0].remote[0].retention_rules
@@ -273,7 +280,7 @@ class TestRoundTrip:
                 )
                 for n in names
             ],
-            destinations={n: Destination(f"http://{i}") for i, n in enumerate(names)},
+            destinations={n: Destination(f"https://{i}") for i, n in enumerate(names)},
             snapshot_prefix="true",
             api_host="0",
         )
@@ -318,6 +325,10 @@ def _random_remote_backup(rng: random.Random):
     return None
 
 
+#: A pin, or `None` (not enrolled); includes an all-digit and an all-letter one.
+_FINGERPRINTS = [None, None, "ab" * 32, DIGIT_FINGERPRINT, "0123456789abcdef" * 4, "e" * 64, "9" * 64]
+
+
 def random_config(rng: random.Random) -> BackupConfig:
     """A random but VALID configuration: `validate_config` refuses an ENABLED
     dataset (or `remote_backup`) whose name libzfseasy rejects, so the
@@ -331,7 +342,11 @@ def random_config(rng: random.Random) -> BackupConfig:
         return sorted(out, key=lambda r: r.age)
 
     dest_names = rng.sample(_NAMES, rng.randint(0, 4))
-    destinations = {n: Destination(f"http://h{i}:{8000 + i}") for i, n in enumerate(dest_names)}
+    destinations = {
+        n: Destination(f"https://h{i}:{8000 + i}", rng.choice(_FINGERPRINTS))
+        for i, n in enumerate(dest_names)
+    }
+    tls = rng.random() < 0.5
     datasets = []
     for name in rng.sample(_NAMES, rng.randint(1, 6)):
         remote = []
@@ -361,7 +376,8 @@ def random_config(rng: random.Random) -> BackupConfig:
         dry_run=rng.random() < 0.5,
         destinations=destinations,
         remote_backup=_random_remote_backup(rng),
-        client_id_file=Path(rng.choice(["/tmp/cid", "rel/cid", "/a b/c#d"])) if rng.random() < 0.5 else None,
+        client_cert_file=Path(rng.choice(["/tmp/c.pem", "/a b/c#d.pem"])) if tls else None,
+        client_key_file=Path(rng.choice(["/tmp/k.key", "/a b/k:1.key"])) if tls else None,
     )
 
 
@@ -375,7 +391,8 @@ class TestLayout:
         doc = yaml.safe_load(render_yaml(synthetic()))
         assert list(doc) == [
             "snapshot_prefix", "check_interval", "prune_interval", "api_host", "api_port",
-            "dry_run", "client_id_file", "destinations", "remote_backup", "datasets",
+            "dry_run", "client_cert_file", "client_key_file", "destinations", "remote_backup",
+            "datasets",
         ]
 
     def test_dataset_key_order(self):
@@ -385,18 +402,97 @@ class TestLayout:
         ]
         assert list(doc["datasets"][0]["remote"][1]) == ["destination", "frequency", "retention"]
 
-    def test_prune_interval_and_client_id_file_omitted_when_none(self):
+    def test_prune_interval_and_tls_paths_omitted_when_none(self):
         config = BackupConfig(datasets=[DatasetConfig(name="tank/a")])
         text = render_yaml(config)
-        assert "prune_interval" not in text
-        assert "client_id_file" not in text
+        for key in ("prune_interval", "client_cert_file", "client_key_file", "server_fingerprint"):
+            assert key not in text
         doc = yaml.safe_load(text)
-        assert "prune_interval" not in doc and "client_id_file" not in doc
+        assert "prune_interval" not in doc and "client_cert_file" not in doc and "client_key_file" not in doc
 
-    def test_prune_interval_and_client_id_file_written_when_set(self):
+    def test_prune_interval_and_tls_paths_written_when_set(self):
         doc = yaml.safe_load(render_yaml(synthetic()))
         assert doc["prune_interval"] == "30d"
-        assert doc["client_id_file"] == "/var/lib/zfsbackup/client id.json"
+        assert doc["client_cert_file"] == "/var/lib/zfsbackup/client cert.pem"
+        assert doc["client_key_file"] == "/var/lib/zfsbackup/client#key.pem"
+
+    def test_client_id_file_is_gone(self):
+        # Retired (plan M15): the client id lives in the config database, not the YAML, and
+        # the model no longer has the field at all.
+        assert "client_id_file" not in render_yaml(synthetic())
+        config = BackupConfig(datasets=[DatasetConfig(name="tank/a")])
+        assert not hasattr(config, "client_id_file")
+        with pytest.raises(TypeError, match="client_id_file"):
+            BackupConfig(datasets=[DatasetConfig(name="tank/a")], client_id_file=Path("/x/id"))
+        assert "client_id" not in render_yaml(config)
+
+    def test_tls_paths_are_double_quoted_strings(self):
+        text = render_yaml(synthetic())
+        assert 'client_cert_file: "/var/lib/zfsbackup/client cert.pem"' in text
+        assert 'client_key_file: "/var/lib/zfsbackup/client#key.pem"' in text
+
+    def test_server_fingerprint_is_double_quoted(self):
+        config = BackupConfig(
+            datasets=[DatasetConfig(name="tank/a")],
+            destinations={"nas": Destination("https://nas", "ab" * 32)},
+        )
+        text = render_yaml(config)
+        assert f'    server_fingerprint: "{"ab" * 32}"\n' in text
+        assert list(yaml.safe_load(text)["destinations"]["nas"]) == ["url", "server_fingerprint"]
+
+    def test_an_all_digit_fingerprint_is_quoted_so_it_stays_a_string(self, tmp_path):
+        config = BackupConfig(
+            datasets=[DatasetConfig(name="tank/a")],
+            destinations={"nas": Destination("https://nas", DIGIT_FINGERPRINT)},
+        )
+        text = render_yaml(config)
+        assert f'server_fingerprint: "{DIGIT_FINGERPRINT}"' in text
+        assert yaml.safe_load(text)["destinations"]["nas"]["server_fingerprint"] == DIGIT_FINGERPRINT
+        # An unquoted all-digit scalar would be an int: prove the quoting matters.
+        assert isinstance(yaml.safe_load(f"fp: {DIGIT_FINGERPRINT}\n")["fp"], int)
+        assert assert_round_trip(config, tmp_path)
+
+    def test_server_fingerprint_is_omitted_when_not_enrolled(self):
+        config = BackupConfig(
+            datasets=[DatasetConfig(name="tank/a")], destinations={"nas": Destination("https://nas")},
+        )
+        text = render_yaml(config)
+        assert "server_fingerprint" not in text
+        assert yaml.safe_load(text)["destinations"]["nas"] == {"url": "https://nas"}
+
+    def test_a_colon_upper_case_fingerprint_renders_normalised(self):
+        config = BackupConfig(
+            datasets=[DatasetConfig(name="tank/a")],
+            destinations={"nas": Destination("https://nas", ":".join(["AB"] * 32))},
+        )
+        assert yaml.safe_load(render_yaml(config))["destinations"]["nas"]["server_fingerprint"] == "ab" * 32
+
+    def test_only_enrolled_destinations_carry_a_fingerprint(self):
+        doc = yaml.safe_load(render_yaml(synthetic()))["destinations"]
+        assert set(doc["123"]) == {"url", "server_fingerprint"}
+        assert doc["123"]["server_fingerprint"] == DIGIT_FINGERPRINT
+        assert doc["zeta"]["server_fingerprint"] == "ab" * 32
+        assert set(doc["alpha"]) == {"url"}
+
+    def test_destination_fragment_carries_the_fingerprint_only_when_set(self):
+        from zfsbackup.cli.render import render_destination_fragment
+
+        assert render_destination_fragment(Destination("https://nas")) == 'url: "https://nas"\n'
+        assert render_destination_fragment(Destination("https://nas", "ab" * 32)) == (
+            f'url: "https://nas"\nserver_fingerprint: "{"ab" * 32}"\n'
+        )
+
+    def test_tls_paths_are_written_as_a_pair_and_only_when_set(self):
+        none = yaml.safe_load(render_yaml(BackupConfig(datasets=[DatasetConfig(name="tank/a")])))
+        assert "client_cert_file" not in none and "client_key_file" not in none
+        both = yaml.safe_load(render_yaml(BackupConfig(
+            datasets=[DatasetConfig(name="tank/a")],
+            client_cert_file=Path("/c.pem"), client_key_file=Path("/k.pem"),
+        )))
+        assert (both["client_cert_file"], both["client_key_file"]) == ("/c.pem", "/k.pem")
+        # They sit right after dry_run (prune_interval is unset, hence omitted).
+        keys = list(both)
+        assert keys[keys.index("dry_run"):][:3] == ["dry_run", "client_cert_file", "client_key_file"]
 
     def test_optional_sections_omitted_when_empty(self):
         doc = yaml.safe_load(render_yaml(BackupConfig(datasets=[DatasetConfig(name="tank/a")])))
@@ -435,7 +531,7 @@ class TestLayout:
         names = ["zeta", "alpha", "Mid", "123", "beta"]
         config = BackupConfig(
             datasets=[DatasetConfig(name="tank/a")],
-            destinations={n: Destination(f"http://{n}") for n in names},
+            destinations={n: Destination(f"https://{n}") for n in names},
         )
         assert list(yaml.safe_load(render_yaml(config))["destinations"]) == sorted(names)
 
@@ -448,7 +544,7 @@ class TestLayout:
                 )
                 for n in ("tank/z", "tank/a", "tank/m")
             ],
-            destinations={d: Destination("http://x") for d in ("alpha", "beta", "zeta")},
+            destinations={d: Destination("https://x") for d in ("alpha", "beta", "zeta")},
         )
         doc = yaml.safe_load(render_yaml(config))
         assert [d["name"] for d in doc["datasets"]] == ["tank/z", "tank/a", "tank/m"]
@@ -473,7 +569,7 @@ class TestLayout:
                     RemoteDatasetConfig("override", retention_rules=[RetentionRule(D("2d"), D("60d"))]),
                 ],
             )],
-            destinations={"inherit": Destination("http://i"), "override": Destination("http://o")},
+            destinations={"inherit": Destination("https://i"), "override": Destination("https://o")},
         )
         remotes = yaml.safe_load(render_yaml(config))["datasets"][0]["remote"]
         assert remotes[0] == {"destination": "inherit"}
@@ -584,7 +680,7 @@ class TestRefusals:
             render_yaml(BackupConfig(datasets=[DatasetConfig(
                 name="tank/a",
                 remote=[RemoteDatasetConfig("nas", frequency=timedelta(milliseconds=5))],
-            )], destinations={"nas": Destination("http://n")}))
+            )], destinations={"nas": Destination("https://n")}))
 
     def test_sub_second_prune_interval_is_refused(self):
         config = BackupConfig(
@@ -692,6 +788,48 @@ class TestThroughTheDatabase:
         db = tmp_path / "cfg" / "c.db"
         run("import", source, "-c", db)
         assert run("export", "-c", db).stdout == rendered
+
+    def test_the_pins_and_tls_paths_survive_the_database(self, tmp_path, run):
+        source = tmp_path / "s.yaml"
+        source.write_text(render_yaml(synthetic()))
+        db = tmp_path / "cfg" / "c.db"
+        run("import", source, "-c", db)
+        back = reload(run("export", "-c", db).stdout, tmp_path)
+        assert back.destinations["123"].server_fingerprint == DIGIT_FINGERPRINT
+        assert back.destinations["zeta"].server_fingerprint == "ab" * 32
+        assert back.destinations["alpha"].server_fingerprint is None
+        assert back.client_cert_file == Path("/var/lib/zfsbackup/client cert.pem")
+        assert back.client_key_file == Path("/var/lib/zfsbackup/client#key.pem")
+
+    def test_a_colon_upper_case_fingerprint_is_normalised_on_import(self, tmp_path, run):
+        source = tmp_path / "s.yaml"
+        source.write_text(
+            'datasets:\n  - name: "tank/a"\n'
+            'destinations:\n  nas:\n    url: "https://nas"\n'
+            f'    server_fingerprint: "{":".join(["AB"] * 32)}"\n'
+            '  bare:\n    url: "https://bare"\n'
+            f'    server_fingerprint: "{"AB" * 32}"\n'
+        )
+        db = tmp_path / "cfg" / "c.db"
+        run("import", source, "-c", db)
+        doc = yaml.safe_load(run("export", "-c", db).stdout)["destinations"]
+        assert doc["nas"]["server_fingerprint"] == "ab" * 32
+        assert doc["bare"]["server_fingerprint"] == "ab" * 32
+
+    def test_an_all_digit_fingerprint_imports_exports_and_reimports(self, tmp_path, run):
+        source = tmp_path / "s.yaml"
+        source.write_text(
+            'datasets:\n  - name: "tank/a"\n'
+            f'destinations:\n  nas:\n    url: "https://nas"\n    server_fingerprint: "{DIGIT_FINGERPRINT}"\n'
+        )
+        db = tmp_path / "cfg" / "c.db"
+        run("import", source, "-c", db)
+        exported = run("export", "-c", db).stdout
+        assert f'server_fingerprint: "{DIGIT_FINGERPRINT}"' in exported
+        second = tmp_path / "s2.yaml"
+        second.write_text(exported)
+        run("import", second, "-c", tmp_path / "cfg2" / "c.db")
+        assert run("export", "-c", tmp_path / "cfg2" / "c.db").stdout == exported
 
     def test_the_pre_import_backup_uses_the_same_renderer(self, tmp_path, run):
         db = tmp_path / "cfg" / "c.db"

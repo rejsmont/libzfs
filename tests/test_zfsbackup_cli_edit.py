@@ -732,7 +732,7 @@ class TestEditAnchorWarnings:
         # stale since the pruner protects every local anchor; deliberately not pinned)
 
     def test_deleting_a_destination_warns_about_its_anchor(self, run, rich, stub, scratch_tmp):
-        stub.plan([{"replace": ['  "spare":\n    url: "http://spare:8080"\n', ""]}])
+        stub.plan([{"replace": ['  "spare":\n    url: "https://spare:8080"\n', ""]}])
         result = edit(run, rich, stub, "--no-prompt")
         assert result.exit_code == 0, result.stderr
         assert count_containing(warnings_in(result), "destination 'spare' is deleted") == 1
@@ -741,7 +741,7 @@ class TestEditAnchorWarnings:
     def test_a_destination_dropped_from_a_dataset_and_deleted_warns_once(self, run, rich, stub, scratch_tmp):
         stub.plan([
             {"replace": ['      - destination: "offsite"\n', ""]},
-            {"replace": ['  "offsite":\n    url: "http://offsite:8080"\n', ""]},
+            {"replace": ['  "offsite":\n    url: "https://offsite:8080"\n', ""]},
         ])
         result = edit(run, rich, stub, "--no-prompt")
         assert result.exit_code == 0, result.stderr
@@ -755,7 +755,7 @@ class TestEditAnchorWarnings:
 
     def test_deleting_a_destination_that_is_still_used_names_every_user(self, run, db, stub, scratch_tmp):
         text = (
-            'destinations:\n  shared:\n    url: "http://s"\n'
+            'destinations:\n  shared:\n    url: "https://s"\n'
             'datasets:\n'
             '  - name: "tank/one"\n    remote:\n      - destination: "shared"\n'
             '  - name: "tank/two"\n    remote:\n      - destination: "shared"\n'
@@ -764,7 +764,7 @@ class TestEditAnchorWarnings:
         )
         make_db(run, db, text)
         state = db_state(db)
-        stub.plan([{"replace": ['  "shared":\n    url: "http://s"\n', ""]}])
+        stub.plan([{"replace": ['  "shared":\n    url: "https://s"\n', ""]}])
         result = edit(run, db, stub, "--no-prompt")
         assert result.exit_code == 1
         assert "destination 'shared' is not declared" in result.stderr
@@ -775,14 +775,235 @@ class TestEditAnchorWarnings:
 
     def test_two_undeclared_destinations_are_both_reported(self, run, db, stub, scratch_tmp):
         text = (
-            'destinations:\n  d1:\n    url: "http://1"\n  d2:\n    url: "http://2"\n'
+            'destinations:\n  d1:\n    url: "https://1"\n  d2:\n    url: "https://2"\n'
             'datasets:\n  - name: "tank/x"\n    remote:\n      - destination: "d1"\n      - destination: "d2"\n'
         )
         make_db(run, db, text)
-        stub.plan([{"replace": ['destinations:\n  "d1":\n    url: "http://1"\n  "d2":\n    url: "http://2"\n', ""]}])
+        stub.plan([{"replace": ['destinations:\n  "d1":\n    url: "https://1"\n  "d2":\n    url: "https://2"\n', ""]}])
         result = edit(run, db, stub, "--no-prompt")
         assert result.exit_code == 1
         assert "'d1'" in result.stderr and "'d2'" in result.stderr
+
+
+FP = "ab" * 32
+FP2 = "cd" * 32
+DIGITS_FP = "1234567890" * 6 + "1234"
+PIN_LINE = f'    url: "https://offsite:8080"\n    server_fingerprint: "{FP}"\n'
+
+
+class TestEditTls:
+    """TLS (M8): destination pins, https only, and the client certificate paths
+    in the edit buffers, through the retry / abort flow."""
+
+    @pytest.fixture
+    def pinned(self, run, db):
+        return make_db(run, db, RICH_YAML.replace('    url: "https://offsite:8080"\n', PIN_LINE))
+
+    def pin_warnings(self, result):
+        return [w for w in warnings_in(result) if "server_fingerprint" in w]
+
+    # -- https only ----------------------------------------------------------
+
+    def test_an_http_url_in_the_whole_config_buffer_is_refused(self, run, rich, stub, scratch_tmp):
+        state = db_state(rich)
+        stub.plan([replace('"https://offsite:8080"', '"http://offsite:8080"')])
+        result = edit(run, rich, stub, "--no-prompt")
+        assert result.exit_code == 1
+        assert "plaintext http is not supported; use https://" in result.stderr
+        assert "destinations[offsite]" in result.stderr
+        assert db_state(rich) == state
+        assert len(buffers_in(scratch_tmp)) == 1  # kept for the operator
+
+    def test_an_http_url_in_a_destination_buffer_is_refused(self, run, rich, stub, scratch_tmp):
+        state = db_state(rich)
+        stub.plan([replace("https://dc2:8080", "http://dc2:8080")])
+        result = edit(run, rich, stub, "destination", "dc.two", "--no-prompt")
+        assert result.exit_code == 1
+        assert "plaintext http is not supported" in result.stderr
+        assert db_state(rich) == state
+
+    def test_http_then_fixed_on_retry_saves(self, run, rich, stub, scratch_tmp, tty):
+        stub.plan(
+            [replace("https://dc2:8080", "http://dc2:8080")],
+            [replace("http://dc2:8080", "https://dc3:9090")],
+        )
+        result = edit(run, rich, stub, "destination", "dc.two", input="r\n")
+        assert result.exit_code == 0, result.stderr
+        assert "plaintext http is not supported" in result.stderr
+        assert stub.runs == 2 and stored(rich).destinations["dc.two"].url == "https://dc3:9090"
+
+    # -- the fingerprint -----------------------------------------------------
+
+    def test_the_destination_buffer_shows_the_pin_only_when_set(self, run, pinned, stub):
+        stub.plan([])
+        edit(run, pinned, stub, "destination", "offsite", "--no-prompt")
+        edit(run, pinned, stub, "destination", "dc.two", "--no-prompt")
+        pinned_body, plain_body = (
+            [l for l in entry["before"].splitlines() if l.strip() and not l.startswith("#")]
+            for entry in stub.log
+        )
+        assert pinned_body == ['url: "https://offsite:8080"', f'server_fingerprint: "{FP}"']
+        assert plain_body == ['url: "https://dc2:8080"']
+
+    def test_the_destination_buffer_explains_the_pin(self, run, rich, stub):
+        stub.plan([])
+        edit(run, rich, stub, "destination", "dc.two", "--no-prompt")
+        assert "server_fingerprint" in stub.log[0]["before"]
+
+    def test_the_whole_config_buffer_carries_the_pin(self, run, pinned, stub):
+        stub.plan([])
+        edit(run, pinned, stub, "--no-prompt")
+        assert f'server_fingerprint: "{FP}"' in stub.log[0]["before"]
+
+    def test_adding_a_pin_in_the_destination_buffer_saves_without_a_warning(self, run, rich, stub, scratch_tmp):
+        stub.plan([{"append": f'server_fingerprint: "{FP}"\n'}])
+        result = edit(run, rich, stub, "destination", "dc.two", "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert stored(rich).destinations["dc.two"].server_fingerprint == FP
+        assert self.pin_warnings(result) == []
+
+    def test_a_colon_upper_case_pin_is_normalised(self, run, rich, stub, scratch_tmp):
+        stub.plan([{"append": f'server_fingerprint: "{":".join(["AB"] * 32)}"\n'}])
+        assert edit(run, rich, stub, "destination", "dc.two", "--no-prompt").exit_code == 0
+        assert stored(rich).destinations["dc.two"].server_fingerprint == FP
+
+    def test_an_all_digit_pin_must_be_quoted_or_is_refused_not_misread(self, run, rich, stub, scratch_tmp):
+        # Unquoted, YAML reads the digits as an integer: a type error, not a pin.
+        state = db_state(rich)
+        stub.plan([{"append": f"server_fingerprint: {DIGITS_FP}\n"}])
+        result = edit(run, rich, stub, "destination", "dc.two", "--no-prompt")
+        assert result.exit_code == 1 and "server_fingerprint" in result.stderr
+        assert db_state(rich) == state
+        stub.plan([{"append": f'server_fingerprint: "{DIGITS_FP}"\n'}])
+        assert edit(run, rich, stub, "destination", "dc.two", "--no-prompt").exit_code == 0
+        assert stored(rich).destinations["dc.two"].server_fingerprint == DIGITS_FP
+
+    def test_changing_a_pin_warns(self, run, pinned, stub, scratch_tmp):
+        stub.plan([replace(FP, FP2)])
+        result = edit(run, pinned, stub, "destination", "offsite", "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        (message,) = self.pin_warnings(result)
+        assert "destinations[offsite].server_fingerprint changed" in message
+        assert stored(pinned).destinations["offsite"].server_fingerprint == FP2
+
+    def test_removing_a_pin_warns(self, run, pinned, stub, scratch_tmp):
+        stub.plan([replace(f'server_fingerprint: "{FP}"\n', "")])
+        result = edit(run, pinned, stub, "destination", "offsite", "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        (message,) = self.pin_warnings(result)
+        assert "server_fingerprint removed" in message and "enroll offsite" in message
+        assert stored(pinned).destinations["offsite"].server_fingerprint is None
+
+    def test_an_empty_pin_means_not_enrolled(self, run, pinned, stub, scratch_tmp):
+        stub.plan([replace(f'server_fingerprint: "{FP}"', 'server_fingerprint: ""')])
+        result = edit(run, pinned, stub, "destination", "offsite", "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert stored(pinned).destinations["offsite"].server_fingerprint is None
+        assert len(self.pin_warnings(result)) == 1
+
+    def test_removing_a_pin_in_the_whole_config_buffer_warns(self, run, pinned, stub, scratch_tmp):
+        stub.plan([replace(f'    server_fingerprint: "{FP}"\n', "")])
+        result = edit(run, pinned, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert len(self.pin_warnings(result)) == 1
+        assert stored(pinned).destinations["offsite"].server_fingerprint is None
+
+    def test_deleting_a_pinned_destination_gives_no_pin_warning(self, run, db, stub, scratch_tmp):
+        make_db(run, db, RICH_YAML.replace(
+            '  spare:\n    url: "https://spare:8080"\n',
+            f'  spare:\n    url: "https://spare:8080"\n    server_fingerprint: "{FP}"\n',
+        ))
+        stub.plan([replace(f'  "spare":\n    url: "https://spare:8080"\n    server_fingerprint: "{FP}"\n', "")])
+        result = edit(run, db, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert self.pin_warnings(result) == []
+        assert count_containing(warnings_in(result), "destination 'spare' is deleted") == 1
+
+    def test_an_unrelated_edit_does_not_repeat_a_pin_warning(self, run, pinned, stub, scratch_tmp):
+        stub.plan([replace(*FREQ_1H)])
+        result = edit(run, pinned, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert self.pin_warnings(result) == []
+
+    # -- retry / abort on a bad fingerprint ----------------------------------
+
+    @pytest.mark.parametrize("bad", ["abc", "zz" * 32, "ab" * 31, ":".join(["ab"] * 31)])
+    def test_a_bad_fingerprint_aborts_under_no_prompt_and_writes_nothing(self, run, rich, stub, scratch_tmp, bad):
+        state = db_state(rich)
+        stub.plan([{"append": f'server_fingerprint: "{bad}"\n'}])
+        result = edit(run, rich, stub, "destination", "dc.two", "--no-prompt")
+        assert result.exit_code == 1
+        assert "server_fingerprint" in result.stderr and "fingerprint" in result.stderr
+        assert db_state(rich) == state
+        assert len(buffers_in(scratch_tmp)) == 1
+
+    def test_a_bad_fingerprint_then_a_good_one_on_retry_saves(self, run, rich, stub, scratch_tmp, tty):
+        gen = generation(rich)
+        stub.plan(
+            [{"append": 'server_fingerprint: "not-hex"\n'}],
+            [replace("not-hex", FP)],
+        )
+        result = edit(run, rich, stub, "destination", "dc.two", input="r\n")
+        assert result.exit_code == 0, result.stderr
+        assert "[r]etry editing or [a]bort" in result.stderr
+        assert stub.runs == 2
+        assert 'server_fingerprint: "not-hex"' in stub.log[1]["before"]  # the operator's text, kept
+        assert stored(rich).destinations["dc.two"].server_fingerprint == FP
+        assert generation(rich) == gen + 1
+        assert buffers_in(scratch_tmp) == []
+
+    def test_a_bad_fingerprint_then_abort_keeps_the_buffer_and_writes_nothing(self, run, rich, stub, scratch_tmp, tty):
+        state = db_state(rich)
+        stub.plan([{"append": 'server_fingerprint: "not-hex"\n'}])
+        result = edit(run, rich, stub, "destination", "dc.two", input="a\n")
+        assert result.exit_code == 1
+        assert "edit abandoned; nothing was written" in result.stderr
+        assert stub.runs == 1 and db_state(rich) == state
+        assert len(buffers_in(scratch_tmp)) == 1
+
+    def test_the_whole_config_buffer_names_the_bad_destination(self, run, rich, stub, scratch_tmp):
+        stub.plan([replace('"https://spare:8080"', f'"https://spare:8080"\n    server_fingerprint: "xyz"')])
+        result = edit(run, rich, stub, "--no-prompt")
+        assert result.exit_code == 1
+        assert "destinations[spare].server_fingerprint" in result.stderr
+
+    # -- the client certificate paths ----------------------------------------
+
+    TLS_BOTH = 'client_cert_file: "/etc/zfsbackup/c.pem"\nclient_key_file: "/etc/zfsbackup/c.key"\n'
+
+    def test_both_paths_can_be_added_in_one_buffer(self, run, rich, stub, scratch_tmp):
+        stub.plan([replace('check_interval: "5m"\n', 'check_interval: "5m"\n' + self.TLS_BOTH)])
+        result = edit(run, rich, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        config = stored(rich)
+        assert str(config.client_cert_file) == "/etc/zfsbackup/c.pem"
+        assert str(config.client_key_file) == "/etc/zfsbackup/c.key"
+
+    def test_one_path_alone_is_refused(self, run, rich, stub, scratch_tmp):
+        state = db_state(rich)
+        stub.plan([replace('check_interval: "5m"\n', 'check_interval: "5m"\nclient_cert_file: "/etc/zfsbackup/c.pem"\n')])
+        result = edit(run, rich, stub, "--no-prompt")
+        assert result.exit_code == 1
+        assert "must be set together" in result.stderr
+        assert db_state(rich) == state
+
+    def test_a_relative_path_is_refused_then_fixed_on_retry(self, run, rich, stub, scratch_tmp, tty):
+        stub.plan(
+            [replace('check_interval: "5m"\n', 'check_interval: "5m"\nclient_cert_file: "c.pem"\nclient_key_file: "/k"\n')],
+            [replace('"c.pem"', '"/c.pem"')],
+        )
+        result = edit(run, rich, stub, input="r\n")
+        assert result.exit_code == 0, result.stderr
+        assert "must be an absolute path" in result.stderr
+        assert str(stored(rich).client_cert_file) == "/c.pem"
+
+    def test_removing_both_paths_returns_to_the_generated_identity(self, run, db, stub, scratch_tmp):
+        make_db(run, db, RICH_YAML.replace(
+            'check_interval: "5m"\n', 'check_interval: "5m"\n' + self.TLS_BOTH))
+        stub.plan([replace(self.TLS_BOTH, "")])
+        assert edit(run, db, stub, "--no-prompt").exit_code == 0
+        config = stored(db)
+        assert config.client_cert_file is None and config.client_key_file is None
 
 
 class TestEditConflict:
@@ -878,7 +1099,7 @@ class TestEditUnknownKeys:
         assert "datasets[tank/data].remote[dc.two]: unknown key 'frequncy' (did you mean 'frequency'?)" in err
 
     def test_destination(self, attempt):
-        err = attempt(replace('    url: "http://dc2:8080"', '    urll: "http://dc2:8080"'))
+        err = attempt(replace('    url: "https://dc2:8080"', '    urll: "https://dc2:8080"'))
         assert "destinations[dc.two]: unknown key 'urll' (did you mean 'url'?)" in err
 
     def test_remote_backup(self, attempt):
@@ -901,16 +1122,22 @@ class TestEditUnknownKeys:
         )
         assert "datasets[tank/vm.01].remote[offsite]: unknown key 'frequncy'" in err
 
-    def test_edit_destination_stays_url_only(self, attempt):
+    def test_edit_destination_has_only_url_and_server_fingerprint(self, attempt):
         err = attempt({"append": 'frequency: "1h"\n'}, "destination", "dc.two")
-        assert "unknown key(s) 'frequency'; a destination has only a url:" in err
+        assert "unknown key(s) 'frequency'; valid keys: url, server_fingerprint" in err
+
+    def test_the_retired_client_id_file_is_an_unknown_top_level_key(self, attempt):
+        err = attempt({"append": 'client_id_file: "/x/id"\n'})
+        assert "top level: unknown key 'client_id_file'" in err
+        assert "client_cert_file, client_key_file" in err
 
     def test_all_the_valid_keys_are_accepted(self, run, rich, stub, scratch_tmp):
         stub.plan([{"append": ""}, ])
         full = (
             'snapshot_prefix: "autosnap"\ncheck_interval: "5m"\nprune_interval: "1h"\n'
-            'api_host: "127.0.0.1"\napi_port: 8080\ndry_run: false\nclient_id_file: "/x/id"\n'
-            'destinations:\n  "d":\n    url: "http://d"\n'
+            'api_host: "127.0.0.1"\napi_port: 8080\ndry_run: false\n'
+            'client_cert_file: "/etc/zfsbackup/c.pem"\nclient_key_file: "/etc/zfsbackup/c.key"\n'
+            f'destinations:\n  "d":\n    url: "https://d"\n    server_fingerprint: "{"ab" * 32}"\n'
             'remote_backup:\n  enabled: false\n  target_dataset: "tank/r"\n'
             'datasets:\n  - name: "tank/a"\n    enabled: true\n    frequency: "1h"\n    recursive: false\n'
             '    retention:\n      "1d": "30d"\n    remote:\n      - destination: "d"\n'
@@ -965,7 +1192,7 @@ class TestEditInterruptDuringTheWrite:
         [
             ((), replace('check_interval: "5m"', 'check_interval: "6m"')),
             (("dataset", "a"), replace("recursive: false", "recursive: true")),
-            (("destination", "dc.two"), replace("http://dc2:8080", "http://dc3:1")),
+            (("destination", "dc.two"), replace("https://dc2:8080", "https://dc3:1")),
         ],
     )
     def test_the_entry_commands_too(self, run, db, stub, scratch_tmp, monkeypatch, sub, change):
@@ -1056,7 +1283,7 @@ class TestEditRecreateWarning:
 
 class TestEditDestinationNames:
     def test_creating_an_unusable_destination_name_only_warns(self, run, plain, stub, scratch_tmp):
-        stub.plan([{"replace": ["datasets:", 'destinations:\n  "bad name":\n    url: "http://b"\n\ndatasets:']}])
+        stub.plan([{"replace": ["datasets:", 'destinations:\n  "bad name":\n    url: "https://b"\n\ndatasets:']}])
         result = edit(run, plain, stub, "--no-prompt")
         assert result.exit_code == 0, result.stderr
         # the warning comes from validate_config (the single source), once
@@ -1067,13 +1294,13 @@ class TestEditDestinationNames:
         assert "bad name" in stored(plain).destinations
 
     def test_an_existing_unusable_name_is_not_warned_about_again(self, run, db, stub, scratch_tmp):
-        make_db(run, db, 'destinations:\n  "bad name":\n    url: "http://b"\ndatasets:\n  - name: "tank/a"\n')
+        make_db(run, db, 'destinations:\n  "bad name":\n    url: "https://b"\ndatasets:\n  - name: "tank/a"\n')
         stub.plan([replace('frequency: "1h"', 'frequency: "2h"')])
         result = edit(run, db, stub, "--no-prompt")
         assert result.exit_code == 0, result.stderr
         assert [w for w in warnings_in(result) if "bad name" in w] == []
 
     def test_usable_names_are_not_warned_about(self, run, plain, stub, scratch_tmp):
-        stub.plan([{"replace": ["datasets:", 'destinations:\n  "ok-1_x.y:z":\n    url: "http://b"\n\ndatasets:']}])
+        stub.plan([{"replace": ["datasets:", 'destinations:\n  "ok-1_x.y:z":\n    url: "https://b"\n\ndatasets:']}])
         result = edit(run, plain, stub, "--no-prompt")
         assert result.exit_code == 0 and warnings_in(result) == []

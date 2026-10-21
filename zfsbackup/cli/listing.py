@@ -40,8 +40,12 @@ Durations are shown as typed (`30d` stays `30d`, never `1M`).
     ]
 
     list destinations --json  ->  [
-      {"name": str, "url": str, "datasets": [str, ...]}, ...
-    ]            # "datasets": the datasets that send to it, in stored order
+      {"name": str, "url": str, "server_fingerprint": str | null, "datasets": [str, ...]}, ...
+    ]            # "server_fingerprint": the full pinned SHA-256 (64 lowercase hex), null =
+                 #   not enrolled; "datasets": the datasets that send to it, in stored order
+
+The text view's ENROLLED column shows the first 16 hex characters of the pinned
+fingerprint, or `not enrolled`.
 
 `--enabled-only` keeps enabled datasets; for destinations it counts only enabled
 datasets as referrers and so drops a destination that no enabled dataset sends
@@ -55,6 +59,9 @@ from zfsbackup.cli.render import duration_literal
 from zfsbackup.config import BackupConfig, DatasetConfig, RetentionRule
 
 __all__ = ["render_datasets", "render_destinations"]
+
+#: Hex characters of a pinned fingerprint shown in the text view.
+_FINGERPRINT_SHOWN = 16
 
 
 def _rules(rules: List[RetentionRule], key: str) -> List[Dict[str, str]]:
@@ -157,7 +164,12 @@ def render_destinations(config: BackupConfig, *, enabled_only: bool = False, as_
             referrers.setdefault(r.destination, []).append(ds.name)
 
     entries = [
-        {"name": name, "url": dest.url, "datasets": referrers.get(name, [])}
+        {
+            "name": name,
+            "url": dest.url,
+            "server_fingerprint": dest.server_fingerprint,
+            "datasets": referrers.get(name, []),
+        }
         for name, dest in sorted(config.destinations.items())
         if referrers.get(name) or not enabled_only
     ]
@@ -166,7 +178,12 @@ def render_destinations(config: BackupConfig, *, enabled_only: bool = False, as_
     if not entries:
         return "(no destinations)\n"
     rows = [
-        [e["name"], e["url"], ", ".join(e["datasets"]) if e["datasets"] else "-"]
+        [
+            e["name"],
+            e["url"],
+            e["server_fingerprint"][:_FINGERPRINT_SHOWN] if e["server_fingerprint"] else "not enrolled",
+            ", ".join(e["datasets"]) if e["datasets"] else "-",
+        ]
         for e in entries
     ]
-    return _table(["NAME", "URL", "DATASETS"], rows)
+    return _table(["NAME", "URL", "ENROLLED", "DATASETS"], rows)

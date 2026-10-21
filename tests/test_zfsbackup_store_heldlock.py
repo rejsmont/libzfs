@@ -417,7 +417,7 @@ class TestDestinationNameWarning:
         return BackupConfig(
             datasets=[DatasetConfig(name="tank/x", frequency=Duration("1h"),
                                     remote=[RemoteDatasetConfig(destination=destination)])],
-            destinations={destination: Destination("http://h")},
+            destinations={destination: Destination("https://h")},
         )
 
     @pytest.mark.parametrize("name", PROBLEM_NAMES)
@@ -441,8 +441,8 @@ class TestDestinationNameWarning:
     def test_each_bad_destination_warns_once(self):
         config = BackupConfig(
             datasets=[DatasetConfig(name="tank/x", frequency=Duration("1h"))],
-            destinations={"bad one": Destination("http://a"), "bad/two": Destination("http://b"),
-                          "good": Destination("http://c")},
+            destinations={"bad one": Destination("https://a"), "bad/two": Destination("https://b"),
+                          "good": Destination("https://c")},
         )
         warned = [w for w in validate_config(config) if "ZFS anchor" in w]
         assert len(warned) == 2
@@ -458,7 +458,7 @@ class TestDestinationNameWarning:
     def test_import_logs_it_once(self, tmp_path, caplog):
         source = tmp_path / "in.yaml"
         source.write_text(
-            'destinations:\n  "bad name":\n    url: "http://b"\n'
+            'destinations:\n  "bad name":\n    url: "https://b"\n'
             'datasets:\n  - name: "tank/x"\n    remote:\n      - destination: "bad name"\n'
         )
         resolved = resolve_config_path(str(tmp_path / "store" / "config.db"))

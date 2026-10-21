@@ -16,7 +16,12 @@ reaches a rendered config.
 Choices that make the contract hold:
 
 - Fields whose "unset" state means "derive it at run time" (`prune_interval`,
-  `client_id_file`; plan item 3c) are omitted when `None`, never filled in.
+  `client_cert_file` / `client_key_file`; plan item 3c) and a destination's
+  `server_fingerprint` ("not enrolled") are omitted when `None`, never filled
+  in. The fingerprint, like every string, is double-quoted: an all-digit hex
+  string would otherwise be read back by YAML as an integer.
+- The client id is not configuration (it lives in the config database) and is
+  never rendered; neither is the retired `client_id_file`.
 - `enabled`, `recursive` and `dry_run` are always written as explicit booleans:
   under YAML an empty value means falsy, so leaving a flag out of a rendering
   would make its meaning depend on the reader's defaults.
@@ -144,6 +149,13 @@ def _dataset_entry(ds: DatasetConfig) -> dict:
     return entry
 
 
+def _destination_entry(dest: Destination) -> dict:
+    entry: dict = {"url": _Quoted(dest.url)}
+    if dest.server_fingerprint is not None:
+        entry["server_fingerprint"] = _Quoted(dest.server_fingerprint)
+    return entry
+
+
 def render_yaml(config: BackupConfig) -> str:
     """Render `config` as YAML in the layout of `zfsbackup/config.example.yaml`
     (no comments). See the module docstring for the round-trip contract."""
@@ -158,15 +170,17 @@ def render_yaml(config: BackupConfig) -> str:
     top["api_host"] = _Quoted(config.api_host)
     top["api_port"] = int(config.api_port)
     top["dry_run"] = bool(config.dry_run)
-    if config.client_id_file is not None:
-        top["client_id_file"] = _Quoted(str(config.client_id_file))
+    if config.client_cert_file is not None:
+        top["client_cert_file"] = _Quoted(str(config.client_cert_file))
+    if config.client_key_file is not None:
+        top["client_key_file"] = _Quoted(str(config.client_key_file))
 
     chunks = [_dump(top)]
 
     if config.destinations:
         chunks.append(_dump({
             "destinations": {
-                _Quoted(name): {"url": _Quoted(dest.url)}
+                _Quoted(name): _destination_entry(dest)
                 for name, dest in sorted(config.destinations.items())
             }
         }))
@@ -201,5 +215,6 @@ def render_dataset_fragment(ds: DatasetConfig) -> str:
 
 
 def render_destination_fragment(dest: Destination) -> str:
-    """One destination's settings (`url`) as a YAML mapping, without its name."""
-    return _dump({"url": _Quoted(dest.url)})
+    """One destination's settings (`url`, and `server_fingerprint` once enrolled)
+    as a YAML mapping, without its name."""
+    return _dump(_destination_entry(dest))

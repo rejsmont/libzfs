@@ -79,11 +79,13 @@ from _cli_support import (
     fake_daemon,
     fake_zfs,
     generation,
+    host_client_id,
     isolated,
     live_daemon,
     make_db,
     run,
     scratch_tmp,
+    seed_client_id,
     stderr_lines,
     store_key,
     stored,
@@ -460,6 +462,110 @@ class TestRenameDataset:
         assert [w for w in warnings_in(result) if "never be pruned" in w] == []
 
 
+class TestRenameServerNoteClientId:
+    """The server-side path in the `--force` notes uses this host's client id from
+    the config database (`ConfigSnapshot.client_id`, read in the same snapshot as
+    the config), or the placeholder `<client-id>` when none exists yet. Nothing
+    reads a file any more (`client_id_file` was retired)."""
+
+    CID = "backup-host-1a2b3c4d"
+
+    def test_without_a_stored_id_the_placeholder_is_used(self, run, rich):
+        assert host_client_id(rich) is None
+        result = run("rename", "dataset", "tank/data", "pool2/other", "-c", rich)
+        assert result.exit_code == 1
+        assert "<server target>/<client-id>/data" in result.stderr
+        assert "<server target>/<client-id>/other" in result.stderr
+
+    def test_a_stored_id_replaces_the_placeholder_in_the_refusal(self, run, rich):
+        seed_client_id(rich, self.CID)
+        state = db_state(rich)
+        result = run("rename", "dataset", "tank/data", "pool2/other", "-c", rich)
+        assert result.exit_code == 1
+        assert f"<server target>/{self.CID}/data" in result.stderr
+        assert f"<server target>/{self.CID}/other" in result.stderr
+        assert "<client-id>" not in result.stderr
+        assert db_state(rich) == state
+
+    def test_a_stored_id_is_used_in_the_force_warning(self, run, rich):
+        seed_client_id(rich, self.CID)
+        result = run("rename", "dataset", "tank/data", "pool2/other", "--force", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        (warned,) = [w for w in warnings_in(result) if w.startswith("warning: --force:")]
+        assert f"<server target>/{self.CID}/data" in warned
+        assert f"<server target>/{self.CID}/other" in warned
+        assert "<client-id>" not in warned
+
+    def test_a_pool_only_rename_uses_the_stored_id(self, run, rich):
+        seed_client_id(rich, self.CID)
+        result = run("rename", "dataset", "tank/data", "pool2/data", "-c", rich)
+        assert result.exit_code == 1
+        assert f"<server target>/{self.CID}/data" in result.stderr
+        assert "does not change" in result.stderr and "<client-id>" not in result.stderr
+
+    def test_a_dataset_that_sends_nowhere_needs_no_note(self, run, rich):
+        seed_client_id(rich, self.CID)
+        result = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        assert "<server target>" not in result.stderr + result.stdout
+
+    def test_the_stored_id_survives_the_rename_write(self, run, rich):
+        seed_client_id(rich, self.CID)
+        gen = generation(rich)
+        assert run("rename", "dataset", "tank/data", "pool2/other", "--force", "-c", rich).exit_code == 0
+        assert generation(rich) == gen + 1
+        assert host_client_id(rich) == self.CID
+        assert "pool2/other" in names(rich)
+
+    def test_a_destination_rename_does_not_touch_the_stored_id(self, run, rich):
+        seed_client_id(rich, self.CID)
+        result = run("rename", "destination", "offsite", "offsite2", "--skip-missing", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        assert "offsite2" in stored(rich).destinations
+        assert host_client_id(rich) == self.CID
+
+    def test_a_destination_rename_carries_the_pin_along(self, run, db):
+        fp = "ab" * 32
+        make_db(run, db, RENAME_YAML.replace(
+            '    url: "https://offsite:8080"\n',
+            f'    url: "https://offsite:8080"\n    server_fingerprint: "{fp}"\n',
+        ))
+        result = run("rename", "destination", "offsite", "offsite2", "--skip-missing", "-c", db)
+        assert result.exit_code == 0, result.stderr
+        config = stored(db)
+        assert "offsite" not in config.destinations
+        assert config.destinations["offsite2"].server_fingerprint == fp
+        assert [w for w in warnings_in(result) if "server_fingerprint" in w] == []
+
+    @pytest.mark.parametrize("stored_id, expected", [(CID, CID), (None, "<client-id>"), ("", "<client-id>")])
+    def test_client_id_prefers_the_snapshot_and_falls_back_to_the_placeholder(self, stored_id, expected):
+        from types import SimpleNamespace
+
+        assert rename._client_id(SimpleNamespace(client_id=stored_id)) == expected
+
+    def test_client_id_reads_no_file(self, monkeypatch):
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        def boom(*args, **kwargs):
+            raise AssertionError("rename must not read a client id file")
+
+        monkeypatch.setattr(Path, "read_text", boom)
+        monkeypatch.setattr(Path, "open", boom)
+        assert rename._client_id(SimpleNamespace(client_id=None)) == "<client-id>"
+
+    def test_server_note_takes_the_snapshot_not_the_config(self):
+        from types import SimpleNamespace
+
+        snapshot = SimpleNamespace(client_id=self.CID)
+        moved = rename._server_note(snapshot, "tank/data", "pool2/other", False)
+        assert f"<server target>/{self.CID}/data" in moved and f"<server target>/{self.CID}/other" in moved
+        pooled = rename._server_note(snapshot, "tank/data", "pool2/data", True)
+        assert f"<server target>/{self.CID}/data" in pooled and "came along" in pooled
+        bare = rename._server_note(SimpleNamespace(client_id=None), "tank/data", "pool2/other", False)
+        assert "<server target>/<client-id>/data" in bare
+
+
 def _try_exclusive_lock(path) -> str:
     """'acquired' if a daemon-style exclusive lock on `path` can be taken right
     now (and releases it), 'blocked' if something holds the file."""
@@ -794,6 +900,17 @@ class TestRenameDatasetClearStale:
         assert ANCHOR + "dc.two" in result.stderr.split("before the interrupt:")[1].split("Properties that may remain")[0]
         assert f"Properties that may remain: {ANCHOR}offsite, {CONFIG_PROP}" in result.stderr
         assert "tank/vm.02" in names(rich)
+
+
+@pytest.fixture
+def slept(monkeypatch):
+    """Every `time.sleep` the CLI's ack loop makes (still really slept). Tests of "it did not
+    sit out `--reload-wait`" assert on the SUM of these rather than on wall-clock time, which
+    flaked under load (imports, SQLite and the fake `zfs` count against a clock)."""
+    seen = []
+    real = cli_write.time.sleep
+    monkeypatch.setattr(cli_write.time, "sleep", lambda s: (seen.append(s), real(s))[1])
+    return seen
 
 
 class TestRenameDatasetClearWithAVerifiedDaemon:
@@ -1137,11 +1254,16 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
             timer[0].join()
         self.assert_cleared(result, stale, rich)
 
-    def test_a_rejected_rename_is_refused_at_once(self, run, rich, stale, daemon, verify, answers):
+    def test_a_rejected_rename_is_refused_at_once(
+        self, run, rich, stale, daemon, verify, answers, slept
+    ):
+        """Hardened (a wall-clock `< 2.5 s` bound on the whole in-process run flaked under load:
+        imports, SQLite and the fake `zfs` processes all count against it). What must not
+        happen is SITTING OUT the 5 s `--reload-wait`, so the time the ack loop actually
+        sleeps is measured instead -- it is zero (or one poll) however slow the machine."""
         verify(daemon, "signalled", lambda key: daemon.set(rejected=key))
-        started = time.monotonic()
         result = self.clear(run, rich, wait="5")
-        assert time.monotonic() - started < 2.5     # did not sit out the 5 s
+        assert sum(slept) < 1.0, slept              # did not sit out the 5 s
         self.assert_refused(
             result, stale, rich,
             "it rejected the new configuration and keeps running the old one",
@@ -1399,7 +1521,7 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
     # -- 10: the daemon goes away ------------------------------------------
 
     def test_a_daemon_that_exits_while_we_wait_is_the_no_daemon_case(
-        self, run, rich, stale, daemon, verify, monkeypatch
+        self, run, rich, stale, daemon, verify, monkeypatch, slept
     ):
         verify(daemon, "signalled")                # never applies: it exits instead
         real = daemonlock.probe
@@ -1412,9 +1534,8 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
             return real(resolved)
 
         monkeypatch.setattr(daemonlock, "probe", exiting)
-        started = time.monotonic()
         result = self.clear(run, rich, wait="5")
-        assert time.monotonic() - started < 2.5
+        assert sum(slept) < 1.0, slept             # it did not sit out the 5 s
         self.assert_cleared(result, stale, rich)
         assert "the daemon exited before acknowledging" in result.stdout
 
@@ -1814,28 +1935,45 @@ class TestRenameDatasetWithoutZfs:
 
     @pytest.mark.integration
     def test_in_a_process_with_no_zfs_at_all(self, tmp_path, run, db):
+        """Three real CLI processes with NO `zfs` anywhere (`ZFS_CMD` unset, a `PATH` of the
+        interpreter's directory only).
+
+        Hardened after a one-off failure in a full run that never reproduced alone or under CPU
+        load: the processes import the live source tree, so a module another session is
+        mid-way through saving fails them for reasons that have nothing to do with ZFS. Every
+        failure now carries the child's stdout and stderr (the traceback names the module);
+        the child writes no `.pyc` and has its own `HOME`; and the test first proves that its
+        environment really cannot reach a `zfs` (it must never touch a real one).
+        """
+        import shutil
+
         make_db(run, db, RENAME_YAML)
+        home = tmp_path / "home"
+        home.mkdir()
         env = {k: v for k, v in os.environ.items() if k not in ("ZFS_CMD", "ZPOOL_CMD")}
         env["PATH"] = os.path.dirname(sys.executable)  # no zfs / zpool anywhere
         env["PYTHONPATH"] = REPO
-        done = subprocess.run(
-            [sys.executable, "-m", "zfsbackup.cli", "rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", str(db)],
-            capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120,
-        )
-        assert done.returncode == 0, done.stderr
-        assert "ZFS was not consulted" in done.stderr
+        env["HOME"] = str(home)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        assert shutil.which("zfs", path=env["PATH"]) is None, "a zfs is on the interpreter's PATH"
+        assert shutil.which("zpool", path=env["PATH"]) is None
+
+        def cli(*args):
+            done = subprocess.run(
+                [sys.executable, "-m", "zfsbackup.cli", *args, "-c", str(db)],
+                capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120,
+            )
+            done.report = f"exit {done.returncode}\n--- stdout ---\n{done.stdout}\n--- stderr ---\n{done.stderr}"
+            return done
+
+        done = cli("rename", "dataset", "tank/vm.01", "tank/vm.02")
+        assert done.returncode == 0, done.report
+        assert "ZFS was not consulted" in done.stderr, done.report
         assert "tank/vm.02" in names(db)
-        refused = subprocess.run(
-            [sys.executable, "-m", "zfsbackup.cli", "rename", "dataset", "tank/vm.02", "tank/vm.03",
-             "--clear-stale-props", "-c", str(db)],
-            capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120,
-        )
-        assert refused.returncode == 1 and "needs ZFS" in refused.stderr
-        no_anchors = subprocess.run(
-            [sys.executable, "-m", "zfsbackup.cli", "rename", "destination", "offsite", "offsite2", "-c", str(db)],
-            capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120,
-        )
-        assert no_anchors.returncode == 1 and "cannot be used here" in no_anchors.stderr
+        refused = cli("rename", "dataset", "tank/vm.02", "tank/vm.03", "--clear-stale-props")
+        assert refused.returncode == 1 and "needs ZFS" in refused.stderr, refused.report
+        no_anchors = cli("rename", "destination", "offsite", "offsite2")
+        assert no_anchors.returncode == 1 and "cannot be used here" in no_anchors.stderr, no_anchors.report
 
 
 class TestRenameDestination:
@@ -1855,7 +1993,7 @@ class TestRenameDestination:
         assert generation(rich) == gen + 1
         config = stored(rich)
         assert sorted(config.destinations) == ["dc.two", "offsite2", "spare"]
-        assert config.destinations["offsite2"].url == "http://offsite:8080"
+        assert config.destinations["offsite2"].url == "https://offsite:8080"
         by_name = {d.name: d for d in config.datasets}
         assert [r.destination for r in by_name["tank/data"].remote] == ["offsite2", "dc.two"]
         assert [r.destination for r in by_name["tank/other"].remote] == ["offsite2"]
@@ -2798,15 +2936,15 @@ class TestEditEntry:
         stub.plan([])
         self.edit(run, stub, ready, "destination", "dc.two", "--no-prompt")
         body = [l for l in stub.log[0]["before"].splitlines() if l.strip() and not l.startswith("#")]
-        assert body == ['url: "http://dc2:8080"']
+        assert body == ['url: "https://dc2:8080"']
         assert "rename destination <old> <new>" in stub.log[0]["before"]
 
     def test_a_destination_url_edit_saves(self, run, ready, stub):
-        stub.plan([{"replace": ["http://dc2:8080", "http://dc3:9090"]}])
+        stub.plan([{"replace": ["https://dc2:8080", "https://dc3:9090"]}])
         result = self.edit(run, stub, ready, "destination", "dc.two", "--no-prompt")
         assert result.exit_code == 0, result.stderr
         assert "destinations changed: dc.two" in result.stdout
-        assert stored(ready).destinations["dc.two"].url == "http://dc3:9090"
+        assert stored(ready).destinations["dc.two"].url == "https://dc3:9090"
 
     @pytest.mark.parametrize(
         "extra, fragment",

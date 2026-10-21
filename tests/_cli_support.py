@@ -58,11 +58,11 @@ datasets:
   - name: "a.retention"
 destinations:
   offsite:
-    url: "http://offsite:8080"
+    url: "https://offsite:8080"
   dc.two:
-    url: "http://dc2:8080"
+    url: "https://dc2:8080"
   spare:
-    url: "http://spare:8080"
+    url: "https://spare:8080"
 """
 
 #: Dotted names that make destination paths ambiguous too.
@@ -75,9 +75,9 @@ datasets:
   - name: "a.retention"
 destinations:
   dc:
-    url: "http://dc:1"
+    url: "https://dc:1"
   dc.retention:
-    url: "http://dcr:1"
+    url: "https://dcr:1"
 """
 
 #: A plain configuration with nothing that warns.
@@ -174,6 +174,40 @@ def generation(path: Path) -> int:
 def stored(path: Path) -> BackupConfig:
     try:
         return read_config(resolve_config_path(str(path))).config
+    finally:
+        dispose_all()
+
+
+def seed_client_id(database: Path, client_id: str = "host-1") -> str:
+    """Insert (or replace) the `host_identity` row of an existing database,
+    through the ORM model and the store's own engine factory (so foreign keys
+    and the CHECK constraints are the real ones). The row is the client id the
+    CLI reads into `ConfigSnapshot.client_id`; `import` never writes it. A direct
+    insert on purpose: it does not bump the generation, so a test's
+    compare-and-swap expectations are unaffected."""
+    from zfsbackup.config.store import db as store_db
+    from zfsbackup.config.store import models
+
+    url = store_db.url_for_path(database)
+    try:
+        with store_db.session_scope(url) as session:
+            session.query(models.HostIdentity).delete()
+            session.add(models.HostIdentity(id=1, client_id=client_id, created_at=1.0))
+    finally:
+        dispose_all()
+    return client_id
+
+
+def host_client_id(database: Path):
+    """The stored `host_identity.client_id`, or `None` when there is no row."""
+    from zfsbackup.config.store import db as store_db
+    from zfsbackup.config.store import models
+
+    url = store_db.url_for_path(database)
+    try:
+        with store_db.session_scope(url, readonly=True) as session:
+            row = session.query(models.HostIdentity).one_or_none()
+            return None if row is None else row.client_id
     finally:
         dispose_all()
 

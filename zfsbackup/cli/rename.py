@@ -91,7 +91,6 @@ change and does neither (it only reads).
 
 import contextlib
 import shlex
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import click
@@ -209,26 +208,19 @@ def _server_relative(name: str) -> str:
     return name.split("/", 1)[1] if "/" in name else ""
 
 
-def _client_id(config: BackupConfig) -> str:
-    """The client id if the configuration names its file explicitly and it is
-    readable; otherwise a placeholder (the default file is resolved in the
-    daemon's process, not here)."""
-    if config.client_id_file is not None:
-        try:
-            text = Path(config.client_id_file).read_text(encoding="utf-8").strip()
-        except OSError:
-            text = ""
-        if text:
-            return text
-    return "<client-id>"
+def _client_id(snapshot: ConfigSnapshot) -> str:
+    """This host's client id as stored in the config database (read in the same
+    snapshot as the config), or the placeholder `<client-id>` when none has been
+    generated yet (`enroll` generates it). Reads no file."""
+    return snapshot.client_id or "<client-id>"
 
 
 def _server_path(client_id: str, relative: str) -> str:
     return f"<server target>/{client_id}" + (f"/{relative}" if relative else "")
 
 
-def _server_note(config: BackupConfig, old: str, new: str, carried: bool) -> str:
-    cid = _client_id(config)
+def _server_note(snapshot: ConfigSnapshot, old: str, new: str, carried: bool) -> str:
+    cid = _client_id(snapshot)
     old_rel, new_rel = _server_relative(old), _server_relative(new)
     if old_rel != new_rel:
         return (
@@ -647,7 +639,7 @@ def rename_dataset(
     if remotes and not force:
         raise CliError(
             f"{old!r} sends to {', '.join(remotes)}. Renaming it affects its remote "
-            f"backups: {_server_note(config, old, new, zfs_renamed)}. "
+            f"backups: {_server_note(snapshot, old, new, zfs_renamed)}. "
             "Re-run with --force to rename anyway. Nothing was changed."
         )
 
@@ -678,7 +670,7 @@ def rename_dataset(
             f"do not follow the configuration rename and become stale{suffix}"
         )
     if remotes:
-        warn(f"--force: {_server_note(config, old, new, zfs_renamed)}")
+        warn(f"--force: {_server_note(snapshot, old, new, zfs_renamed)}")
 
     stale_props = sorted(
         p for p in old_props

@@ -1,17 +1,34 @@
-"""Unit tests for RemoteBackupManager and ClientIdentity."""
+"""Unit tests for `RemoteBackupManager`: negotiation, the resume protocol and the transfer.
+
+The pinned-mTLS transport is faked here. `_negotiate`, `_fetch_resume_token`, `_get_resume_stream`
+and `_transfer` take a `remote._Transport` (`make_transport`: a plain `requests.Session` that the
+`requests_mock` fixture answers, and a stand-in SSL context), and the websocket's TLS connect is
+`fake_connect_pinned`. The TLS behaviour itself -- the checks that run before any send, the error
+mapping, the identity reload and real handshakes -- is `test_zfsbackup_remote_tls.py`.
+"""
 
 import json
 import logging
 import re
 import pytest
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from _remote_support import (  # noqa: F401  (fixtures)
+    HTTPS_BASE, SERVER_FP, client_tls_dir, fake_connect_pinned, make_transport, whoami_json,
+    _client_tls_template,
+)
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, RemoteDatasetConfig, Destination, RetentionRule, Duration,
 )
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
-from zfsbackup.remote import ClientIdentity, NegotiationFailed, RemoteBackupManager, _SendStream
+from zfsbackup.remote import NegotiationFailed, RemoteBackupManager, _SendStream
+
+BASE = HTTPS_BASE
+
+
+def tr(base=BASE):
+    """The fake transport for `base` (see `_remote_support.make_transport`)."""
+    return make_transport(base)
 
 
 def _make_config(**kwargs) -> BackupConfig:
@@ -20,11 +37,14 @@ def _make_config(**kwargs) -> BackupConfig:
             name='pool/data',
             remote=[RemoteDatasetConfig(destination='offsite')],
         )],
-        destinations={'offsite': Destination(url='http://backup.example.com')},
-        client_id_file=Path('/tmp/test_client_id'),
+        destinations={'offsite': Destination(url=BASE, server_fingerprint=SERVER_FP)},
     )
     defaults.update(kwargs)
     return BackupConfig(**defaults)
+
+
+def _rbm(config, manager, tls_dir=None, client_id='client1'):
+    return RemoteBackupManager(config, manager, client_id=client_id, tls_dir=tls_dir)
 
 
 def _finite_stream():
@@ -34,421 +54,98 @@ def _finite_stream():
     return stream
 
 
-def _within(seconds, fn, *args):
-    """Run `fn(*args)` in a thread; fail the test if it blocks longer than `seconds`
-    (a blocking `open` of a FIFO would never return)."""
-    import threading
-
-    box = {}
-
-    def run():
-        try:
-            box["result"] = fn(*args)
-        except BaseException as e:  # noqa: BLE001
-            box["error"] = e
-
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    t.join(seconds)
-    if t.is_alive():
-        pytest.fail(f"{getattr(fn, '__name__', fn)} blocked for more than {seconds}s")
-    if "error" in box:
-        raise box["error"]
-    return box["result"]
-
-
-def _readers():
-    import zfsbackup.daemon as daemon_module
-    import zfsbackup.remote as remote_module
-
-    return [daemon_module._read_id_file, remote_module._read_id_file]
-
-
-@pytest.fixture(params=[0, 1], ids=["daemon", "remote"])
-def read_id_file(request):
-    """Both twins (`daemon._read_id_file`, `remote._read_id_file`) run every test."""
-    return _readers()[request.param]
-
-
-class TestReadIdFile:
-    def test_the_cap_is_the_same_in_both_modules(self):
-        import zfsbackup.daemon as daemon_module
-        import zfsbackup.remote as remote_module
-
-        assert daemon_module._ID_FILE_MAX == remote_module._ID_FILE_MAX == 4096
-
-    def test_a_regular_file_is_read(self, read_id_file, tmp_path):
-        f = tmp_path / 'id'
-        f.write_text('host-abc12345\n')
-        assert read_id_file(f) == 'host-abc12345\n'
-
-    def test_an_empty_file_is_an_empty_string_not_missing(self, read_id_file, tmp_path):
-        f = tmp_path / 'id'
-        f.write_text('')
-        assert read_id_file(f) == ''
-
-    def test_a_missing_file_is_none(self, read_id_file, tmp_path):
-        assert read_id_file(tmp_path / 'absent') is None
-
-    def test_a_path_below_a_regular_file_is_missing(self, read_id_file, tmp_path):
-        f = tmp_path / 'file'
-        f.write_text('x')
-        assert read_id_file(f / 'id') is None
-
-    def test_a_dangling_symlink_is_missing(self, read_id_file, tmp_path):
-        link = tmp_path / 'id'
-        link.symlink_to(tmp_path / 'nowhere')
-        assert read_id_file(link) is None
-
-    def test_a_symlink_loop_is_missing(self, read_id_file, tmp_path):
-        link = tmp_path / 'id'
-        link.symlink_to(link)
-        assert read_id_file(link) is None
-
-    def test_a_symlink_to_a_regular_file_is_followed(self, read_id_file, tmp_path):
-        real = tmp_path / 'real'
-        real.write_text('abc')
-        link = tmp_path / 'id'
-        link.symlink_to(real)
-        assert read_id_file(link) == 'abc'
-
-    def test_a_fifo_is_refused_without_blocking(self, read_id_file, tmp_path):
-        import errno
-        import os
-
-        fifo = tmp_path / 'id'
-        os.mkfifo(fifo)
-        with pytest.raises(OSError) as exc:
-            _within(5, read_id_file, fifo)
-        assert exc.value.errno == errno.EINVAL and 'not a regular file' in str(exc.value)
-
-    def test_a_symlink_to_a_fifo_is_refused_without_blocking(self, read_id_file, tmp_path):
-        import os
-
-        fifo = tmp_path / 'fifo'
-        os.mkfifo(fifo)
-        link = tmp_path / 'id'
-        link.symlink_to(fifo)
-        with pytest.raises(OSError, match='not a regular file'):
-            _within(5, read_id_file, link)
-
-    def test_a_directory_is_refused(self, read_id_file, tmp_path):
-        d = tmp_path / 'id'
-        d.mkdir()
-        with pytest.raises(OSError, match='not a regular file'):
-            read_id_file(d)
-
-    def test_a_device_is_refused_not_read_for_ever(self, read_id_file):
-        import os
-
-        if not os.path.exists('/dev/zero'):
-            pytest.skip('no /dev/zero')
-        with pytest.raises(OSError, match='not a regular file'):
-            _within(5, read_id_file, Path('/dev/zero'))
-
-    def test_a_file_over_the_cap_is_refused(self, read_id_file, tmp_path):
-        import errno
-
-        f = tmp_path / 'id'
-        f.write_bytes(b'x' * 4097)
-        with pytest.raises(OSError) as exc:
-            read_id_file(f)
-        assert exc.value.errno == errno.EFBIG and '4096' in str(exc.value)
-
-    def test_a_file_exactly_at_the_cap_is_read(self, read_id_file, tmp_path):
-        f = tmp_path / 'id'
-        f.write_bytes(b'x' * 4096)
-        assert len(read_id_file(f)) == 4096
-
-    def test_an_undecodable_file_raises_a_unicode_error(self, read_id_file, tmp_path, monkeypatch):
-        import locale
-
-        monkeypatch.setattr(locale, 'getpreferredencoding', lambda do_setlocale=True: 'ascii')
-        f = tmp_path / 'id'
-        f.write_bytes(b'\xff\xfe\x80')
-        with pytest.raises(UnicodeError):
-            read_id_file(f)
-
-    def test_a_non_regular_path_is_refused_before_it_is_ever_opened(
-        self, read_id_file, tmp_path, monkeypatch
-    ):
-        """Opening some devices has side effects (`/dev/watchdog` arms the
-        watchdog): `stat` first, and `os.open` is never called on the path."""
-        import os
-
-        fifo = tmp_path / 'id'
-        os.mkfifo(fifo)
-        opened = []
-        real_open = os.open
-        monkeypatch.setattr(
-            os, 'open', lambda p, *a, **k: (opened.append(p), real_open(p, *a, **k))[1]
-        )
-        for target in (fifo, tmp_path):                  # a FIFO and a directory
-            with pytest.raises(OSError, match='not a regular file'):
-                read_id_file(target)
-        assert opened == []
-
-    def test_a_regular_file_is_opened_once_nonblocking_and_cloexec(
-        self, read_id_file, tmp_path, monkeypatch
-    ):
-        import os
-
-        f = tmp_path / 'id'
-        f.write_text('abc')
-        calls = []
-        real_open = os.open
-        monkeypatch.setattr(
-            os, 'open', lambda p, flags, *a, **k: (calls.append((p, flags)), real_open(p, flags, *a, **k))[1]
-        )
-        assert read_id_file(f) == 'abc'
-        assert len(calls) == 1
-        flags = calls[0][1]
-        assert flags & os.O_NONBLOCK and not flags & (os.O_WRONLY | os.O_RDWR)
-        assert flags & getattr(os, 'O_CLOEXEC', 0) == getattr(os, 'O_CLOEXEC', 0)
-
-    def test_a_path_swapped_for_a_fifo_between_stat_and_open_is_refused_by_fstat(
-        self, read_id_file, tmp_path, monkeypatch
-    ):
-        """The swap race: `stat` says regular, the file opened is a FIFO. The
-        open is non-blocking, so it succeeds, and the post-open `fstat` refuses."""
-        import os
-
-        real = tmp_path / 'real'
-        real.write_text('abc')
-        fifo = tmp_path / 'fifo'
-        os.mkfifo(fifo)
-        real_stat = os.stat
-        real_open = os.open
-        monkeypatch.setattr(os, 'stat', lambda p, *a, **k: real_stat(real))
-        monkeypatch.setattr(os, 'open', lambda p, *a, **k: real_open(fifo, *a, **k))
-        with pytest.raises(OSError, match='not a regular file'):
-            _within(5, read_id_file, tmp_path / 'id')
-
-    def test_the_descriptor_is_closed_on_every_path(self, read_id_file, tmp_path, monkeypatch):
-        import os
-
-        closed, opened = [], []
-        real_open, real_close = os.open, os.close
-
-        def spy_open(*a, **k):
-            fd = real_open(*a, **k)
-            opened.append(fd)
-            return fd
-
-        monkeypatch.setattr(os, 'open', spy_open)
-        monkeypatch.setattr(os, 'close', lambda fd: (closed.append(fd), real_close(fd))[1])
-        big = tmp_path / 'big'
-        big.write_bytes(b'x' * 5000)
-        ok = tmp_path / 'ok'
-        ok.write_text('abc')
-        with pytest.raises(OSError):
-            read_id_file(big)
-        read_id_file(ok)
-        assert opened and sorted(opened) == sorted(closed)
-
-
-class TestClientIdentityOnOddFiles:
-    def test_a_fifo_raises_and_is_left_alone(self, tmp_path):
-        import os
-        import stat
-
-        fifo = tmp_path / 'client_id'
-        os.mkfifo(fifo)
-        with pytest.raises(OSError, match='not a regular file'):
-            _within(5, lambda: ClientIdentity(fifo).client_id)
-        assert stat.S_ISFIFO(os.stat(fifo).st_mode)
-
-    def test_a_directory_raises_and_is_left_alone(self, tmp_path):
-        d = tmp_path / 'client_id'
-        d.mkdir()
-        with pytest.raises(OSError):
-            ClientIdentity(d).client_id
-        assert d.is_dir() and list(d.iterdir()) == []
-
-    def test_an_oversized_file_raises_and_is_never_overwritten(self, tmp_path):
-        f = tmp_path / 'client_id'
-        f.write_bytes(b'important ' * 600)
-        before = f.read_bytes()
-        with pytest.raises(OSError, match='larger than'):
-            ClientIdentity(f).client_id
-        assert f.read_bytes() == before
-
-    def test_an_undecodable_file_raises_and_is_never_overwritten(self, tmp_path, monkeypatch):
-        import locale
-
-        monkeypatch.setattr(locale, 'getpreferredencoding', lambda do_setlocale=True: 'ascii')
-        f = tmp_path / 'client_id'
-        f.write_bytes(b'\xff\xfe')
-        with pytest.raises(UnicodeError):
-            ClientIdentity(f).client_id
-        assert f.read_bytes() == b'\xff\xfe'
-
-    def test_a_blank_file_is_rewritten(self, tmp_path):
-        f = tmp_path / 'client_id'
-        f.write_text('  \n')
-        cid = ClientIdentity(f).client_id
-        assert cid and f.read_text() == cid
-
-    def test_a_missing_file_and_directory_are_created(self, tmp_path):
-        f = tmp_path / 'a' / 'b' / 'client_id'
-        cid = ClientIdentity(f).client_id
-        assert f.read_text() == cid
-
-    def test_an_existing_id_is_stripped_and_returned(self, tmp_path):
-        f = tmp_path / 'client_id'
-        f.write_text('host-abc  \n')
-        assert ClientIdentity(f).client_id == 'host-abc'
-        assert f.read_text() == 'host-abc  \n'
-
-    def test_a_symlink_to_a_regular_file_is_followed(self, tmp_path):
-        real = tmp_path / 'real'
-        real.write_text('host-xyz')
-        link = tmp_path / 'client_id'
-        link.symlink_to(real)
-        assert ClientIdentity(link).client_id == 'host-xyz'
-
-    def test_a_dangling_symlink_is_treated_as_missing_and_written_through(self, tmp_path):
-        target = tmp_path / 'target'
-        link = tmp_path / 'client_id'
-        link.symlink_to(target)
-        cid = ClientIdentity(link).client_id
-        assert target.read_text() == cid                # written through the link
-
-    def test_the_failure_is_not_cached_so_the_next_call_retries(self, tmp_path):
-        f = tmp_path / 'client_id'
-        f.write_bytes(b'x' * 5000)
-        identity = ClientIdentity(f)
-        with pytest.raises(OSError):
-            identity.client_id
-        f.write_text('host-ok')
-        assert identity.client_id == 'host-ok'
-
-
-class TestClientIdentity:
-    def test_generates_new_id_when_no_file(self, tmp_path):
-        id_file = tmp_path / 'client_id'
-        identity = ClientIdentity(id_file)
-        cid = identity.client_id
-        assert '-' in cid
-        assert len(cid) > 5
-        assert id_file.exists()
-
-    def test_loads_existing_id(self, tmp_path):
-        id_file = tmp_path / 'client_id'
-        id_file.write_text('myhost-abc12345')
-        identity = ClientIdentity(id_file)
-        assert identity.client_id == 'myhost-abc12345'
-
-    def test_generates_and_saves_id(self, tmp_path):
-        id_file = tmp_path / 'client_id'
-        identity = ClientIdentity(id_file)
-        cid = identity.client_id
-        assert id_file.read_text().strip() == cid
-
-    def test_id_format_contains_hostname_and_uuid(self, tmp_path):
-        id_file = tmp_path / 'client_id'
-        identity = ClientIdentity(id_file)
-        cid = identity.client_id
-        parts = cid.rsplit('-', 1)
-        assert len(parts) == 2
-        assert len(parts[1]) == 8
-
-    def test_caches_client_id(self, tmp_path):
-        id_file = tmp_path / 'client_id'
-        identity = ClientIdentity(id_file)
-        cid1 = identity.client_id
-        cid2 = identity.client_id
-        assert cid1 == cid2
-
-    def test_empty_file_generates_new_id(self, tmp_path):
-        id_file = tmp_path / 'client_id'
-        id_file.write_text('')
-        identity = ClientIdentity(id_file)
-        cid = identity.client_id
-        assert len(cid) > 0
-
-    def test_sanitizes_hostname(self, tmp_path, mocker):
-        mocker.patch('socket.gethostname', return_value='my host!.local')
-        id_file = tmp_path / 'client_id'
-        identity = ClientIdentity(id_file)
-        cid = identity.client_id
-        assert '!' not in cid
-        assert ' ' not in cid
-
-
-class TestRemoteBackupManagerRegister:
-    def test_register_success(self, tmp_path, requests_mock):
-        config = _make_config(client_id_file=tmp_path / 'client_id')
-        manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
-        requests_mock.post(
-            'http://backup.example.com/backup/register',
-            json={'target_dataset': 'pool/backups/client1'},
-        )
-        result = rbm._register('http://backup.example.com', 'client1')
-        assert result is True
-
-    def test_register_failure(self, tmp_path, requests_mock):
-        config = _make_config(client_id_file=tmp_path / 'client_id')
-        manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
-        requests_mock.post(
-            'http://backup.example.com/backup/register',
-            status_code=500,
-        )
-        result = rbm._register('http://backup.example.com', 'client1')
-        assert result is False
-
-    def test_register_connection_error(self, tmp_path, requests_mock):
+@pytest.fixture(autouse=True)
+def _tls_connect_is_faked(fake_connect_pinned):
+    """No test here opens a socket: the websocket's pinned TLS connect is a recorder."""
+    return fake_connect_pinned
+
+
+@pytest.fixture(autouse=True)
+def _no_local_zfs_property_writes(mocker):
+    """The anchor / in-flight pin properties are `zfs get|set|inherit` calls on the LOCAL dataset:
+    harmless defaults here, so a test that does not care never reaches even the stub `zfs`.
+    Tests that assert on them patch the instance (which wins over these class patches)."""
+    mocker.patch.object(DatasetManager, 'get_anchor', return_value=None)
+    mocker.patch.object(DatasetManager, 'set_anchor', return_value=True)
+    mocker.patch.object(DatasetManager, 'get_inflight', return_value=None)
+    mocker.patch.object(DatasetManager, 'set_inflight', return_value=True)
+    mocker.patch.object(DatasetManager, 'clear_inflight', return_value=True)
+
+
+class TestRemoteBackupManagerWhoami:
+    """`GET /whoami` replaced `POST /backup/register`: who the server takes this client for
+    (the checks around it are in test_zfsbackup_remote_tls.py)."""
+
+    def _rbm(self):
+        config = _make_config()
+        return _rbm(config, DatasetManager(config))
+
+    def test_whoami_success(self, requests_mock):
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
+        assert self._rbm()._whoami('offsite', tr()) is True
+
+    def test_whoami_is_one_get_with_the_http_timeout(self, requests_mock):
+        from zfsbackup.remote import HTTP_TIMEOUT
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
+        self._rbm()._whoami('offsite', tr())
+        assert requests_mock.call_count == 1
+        assert requests_mock.last_request.method == 'GET'
+        assert requests_mock.last_request.timeout == HTTP_TIMEOUT
+
+    def test_whoami_failure(self, requests_mock):
+        requests_mock.get(f'{BASE}/whoami', status_code=500)
+        assert self._rbm()._whoami('offsite', tr()) is False
+
+    def test_whoami_connection_error(self, requests_mock):
         import requests
-        config = _make_config(client_id_file=tmp_path / 'client_id')
-        manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
-        requests_mock.post(
-            'http://backup.example.com/backup/register',
-            exc=requests.ConnectionError,
-        )
-        result = rbm._register('http://backup.example.com', 'client1')
-        assert result is False
+        requests_mock.get(f'{BASE}/whoami', exc=requests.ConnectionError)
+        assert self._rbm()._whoami('offsite', tr()) is False
+
+    def test_whoami_for_a_different_client_id_is_refused(self, requests_mock):
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('somebody-else'))
+        assert self._rbm()._whoami('offsite', tr()) is False
+
+    def test_there_is_no_register_any_more(self):
+        assert not hasattr(RemoteBackupManager, '_register')
 
 
 class TestRemoteBackupManagerNegotiate:
     def _make_rbm(self, tmp_path):
-        config = _make_config(client_id_file=tmp_path / 'client_id')
+        config = _make_config()
         manager = DatasetManager(config)
-        return RemoteBackupManager(config, manager), manager.datasets[0]
+        return _rbm(config, manager), manager.datasets[0]
 
     def test_negotiate_returns_common_snapshot(self, tmp_path, requests_mock):
         rbm, dsi = self._make_rbm(tmp_path)
         requests_mock.post(
-            f'http://backup.example.com/backup/client1/{dsi.name}/negotiate',
+            f'https://backup.example.com/backup/client1/{dsi.name}/negotiate',
             json={'common_snapshot': 'autosnap_20240101120000', 'server_dataset': 'pool/b/c1'},
         )
         snaps = [MagicMock(name='autosnap_20240101120000')]
         snaps[0].name = 'autosnap_20240101120000'
-        result = rbm._negotiate('http://backup.example.com', 'client1', dsi, snaps, 'offsite')
+        result = rbm._negotiate(tr(), 'client1', dsi, snaps, 'offsite')
         assert result == 'autosnap_20240101120000'
 
     def test_negotiate_returns_none_when_no_common(self, tmp_path, requests_mock):
         rbm, dsi = self._make_rbm(tmp_path)
         requests_mock.post(
-            f'http://backup.example.com/backup/client1/{dsi.name}/negotiate',
+            f'https://backup.example.com/backup/client1/{dsi.name}/negotiate',
             json={'common_snapshot': None, 'server_dataset': 'pool/b/c1'},
         )
-        result = rbm._negotiate('http://backup.example.com', 'client1', dsi, [], 'offsite')
+        result = rbm._negotiate(tr(), 'client1', dsi, [], 'offsite')
         assert result is None
 
     def test_negotiate_returns_none_on_error(self, tmp_path, requests_mock):
         import requests
         rbm, dsi = self._make_rbm(tmp_path)
         requests_mock.post(
-            f'http://backup.example.com/backup/client1/{dsi.name}/negotiate',
+            f'https://backup.example.com/backup/client1/{dsi.name}/negotiate',
             exc=requests.ConnectionError,
         )
         # A failed negotiation is NOT "no common snapshot": it raises, so the
         # caller can never fall through to a needless full send.
         with pytest.raises(NegotiationFailed) as exc:
-            rbm._negotiate('http://backup.example.com', 'client1', dsi, [], 'offsite')
+            rbm._negotiate(tr(), 'client1', dsi, [], 'offsite')
         assert exc.value.reloading is False
 
     def test_negotiate_passes_destination_through_to_property(self, tmp_path, requests_mock):
@@ -456,7 +153,6 @@ class TestRemoteBackupManagerNegotiate:
         call `to_property(destination)` with the destination it is negotiating
         for, not the dataset-level rules unconditionally (item 3b)."""
         config = _make_config(
-            client_id_file=tmp_path / 'client_id',
             datasets=[DatasetConfig(
                 name='pool/data',
                 retention_rules=[RetentionRule(Duration('1h'), Duration('1d'))],
@@ -467,14 +163,14 @@ class TestRemoteBackupManagerNegotiate:
             )],
         )
         manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
+        rbm = _rbm(config, manager)
         dsi = manager.datasets[0]
 
         requests_mock.post(
-            f'http://backup.example.com/backup/client1/{dsi.name}/negotiate',
+            f'https://backup.example.com/backup/client1/{dsi.name}/negotiate',
             json={'common_snapshot': None, 'server_dataset': 'pool/b/c1'},
         )
-        rbm._negotiate('http://backup.example.com', 'client1', dsi, [], 'offsite')
+        rbm._negotiate(tr(), 'client1', dsi, [], 'offsite')
 
         sent_config = requests_mock.last_request.json()['config']
         # The destination declared its own retention, so the negotiated config
@@ -502,7 +198,6 @@ from libzfseasy.types import Filesystem, Snapshot as ZFSSnapshot  # noqa: E402
 from libzfseasy.zfs import ResumeToken, ResumeTokenError  # noqa: E402
 from zfsbackup.backup_manager import SnapshotInfo  # noqa: E402
 
-BASE = 'http://backup.example.com'
 OLD = 'autosnap_20240101120000'
 MID = 'autosnap_20240102120000'
 NEW = 'autosnap_20240103120000'
@@ -546,14 +241,17 @@ class Harness:
     (via requests_mock), the token decoder, the local snapshot GUID listing,
     `zfs send` and the property writes. `order` records the interleaving."""
 
-    def __init__(self, tmp_path, requests_mock, mocker, decode=True, guids=True):
+    def __init__(self, tmp_path, requests_mock, mocker, decode=True, guids=True, tls_dir=None):
         self.rm = requests_mock
         self.mocker = mocker
-        (tmp_path / 'client_id').write_text('client1')
-        config = _make_config(client_id_file=tmp_path / 'client_id')
+        config = _make_config()
         self.manager = DatasetManager(config)
-        self.rbm = RemoteBackupManager(config, self.manager)
+        self.rbm = _rbm(config, self.manager, tls_dir)
         self.dsi = self.manager.datasets[0]
+        # the fake transport the unit tests hand to the transport-level methods; `backup_dataset`
+        # builds its own (real, pinned) one from `tls_dir`'s identity and answers /whoami below
+        self.transport = tr()
+        self.rm.get(f'{BASE}/whoami', json=whoami_json('client1'))
         self.snaps = [sinfo(NEW), sinfo(MID), sinfo(OLD)]
         self.latest = self.snaps[0]
         self.order = []
@@ -600,6 +298,11 @@ class Harness:
     def token(self, token=TOKEN_FULL):
         self.rm.get(self.url, json={'resume_token': token})
 
+    def token_gets(self):
+        """The resume-token GETs so far (`/whoami` is also a GET)."""
+        return [r for r in self.rm.request_history
+                if r.method == 'GET' and r.path.endswith('/resume_token')]
+
     def decodes_to(self, **fields):
         fields.setdefault('flags', frozenset())
         self.resume_info.return_value = ResumeToken(**fields)
@@ -607,7 +310,7 @@ class Harness:
     # -- act --------------------------------------------------------------------
     def start(self, common=None, snaps=None, should_stop=None):
         return self.rbm._get_resume_stream(
-            BASE, 'client1', self.dsi, self.latest, common, 'offsite',
+            self.transport, 'client1', self.dsi, self.latest, common, 'offsite',
             self.snaps if snaps is None else snaps, should_stop=should_stop,
         )
 
@@ -618,8 +321,8 @@ class Harness:
 
 
 @pytest.fixture
-def make_h(tmp_path, requests_mock, mocker):
-    return lambda **kw: Harness(tmp_path, requests_mock, mocker, **kw)
+def make_h(tmp_path, requests_mock, mocker, client_tls_dir):
+    return lambda **kw: Harness(tmp_path, requests_mock, mocker, tls_dir=client_tls_dir, **kw)
 
 
 @pytest.fixture
@@ -631,7 +334,7 @@ class TestFetchResumeToken:
     """`_fetch_resume_token` -> ('skip'|'none'|'token', token)."""
 
     def fetch(self, h):
-        return h.rbm._fetch_resume_token(BASE, 'client1', h.dsi)
+        return h.rbm._fetch_resume_token(h.transport, 'client1', h.dsi, 'offsite')
 
     def test_a_token_is_returned(self, h):
         h.token('1-abc')
@@ -654,8 +357,6 @@ class TestFetchResumeToken:
         (500, {'error': 'boom'}),
         (404, {}),
         (400, {'error': 'bad'}),
-        (401, {}),
-        (403, {}),
         (502, {}),
     ])
     def test_any_other_http_error_is_a_warning_skip(self, h, caplog, status, body):
@@ -666,6 +367,27 @@ class TestFetchResumeToken:
         assert rec.levelname == 'WARNING'
         assert 'skipping this cycle' in rec.getMessage() and 'pool/data' in rec.getMessage()
         assert 'is reloading' not in caplog.text
+
+    @pytest.mark.parametrize('status, body, text', [
+        (401, {}, 'did not receive this client\'s certificate'),
+        (403, {'error': 'client not trusted'}, 'does not trust this client'),
+        (403, {'error': 'client_id mismatch', 'bound': 'other'}, 'binds this client\'s certificate'),
+        (403, {}, 'refused this client (HTTP 403)'),
+    ], ids=['401', '403-not-trusted', '403-mismatch', '403-other'])
+    def test_an_auth_refusal_is_a_skip_logged_once_at_error_not_a_resume_warning(
+        self, h, caplog, status, body, text
+    ):
+        """401/403 are destination-level refusals (the server will not talk to this client): an
+        ERROR once, DEBUG after, and the destination is skipped for the rest of the cycle."""
+        h.rm.get(h.url, status_code=status, json=body)
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            assert self.fetch(h) == ('skip', None)
+            assert self.fetch(h) == ('skip', None)
+        own = [r for r in caplog.records if r.name == 'zfsbackup.remote']
+        assert [r.levelname for r in own] == ['ERROR', 'DEBUG']
+        assert text in own[0].getMessage() and 'destination offsite' in own[0].getMessage()
+        assert not [r for r in own if r.levelname == 'WARNING']
+        assert h.rbm._checked['offsite'][1] is False                 # skipped for the cycle
 
     @pytest.mark.parametrize('exc', [
         _requests.ConnectionError('refused'), _requests.Timeout('slow'), _requests.exceptions.ChunkedEncodingError('x'),
@@ -723,7 +445,7 @@ class TestBusyServer:
     def test_a_busy_negotiate_is_a_reloading_style_failure(self, h):
         h.rm.post(re.compile(r'.*/negotiate$'), status_code=503, json=self.BUSY)
         with pytest.raises(NegotiationFailed) as exc:
-            h.rbm._negotiate(BASE, 'client1', h.dsi, [], 'offsite')
+            h.rbm._negotiate(h.transport, 'client1', h.dsi, [], 'offsite')
         assert exc.value.reloading is True
 
     def test_a_busy_final_ack_is_info_not_error(self, h, mocker, caplog):
@@ -779,7 +501,7 @@ class TestNoUsableAnswerSkipsTheCycle:
     def test_transfer_is_false_with_no_websocket_and_no_anchor_change(self, h, mocker, answer):
         ws_cls = mocker.patch('zfsbackup.remote.websocket.WebSocket')
         h.rm.get(h.url, **answer)
-        ok = h.rbm._transfer(BASE, 'client1', h.dsi, h.latest, None, 'offsite', snapshots=h.snaps)
+        ok = h.rbm._transfer(h.transport, 'client1', h.dsi, h.latest, None, 'offsite', snapshots=h.snaps)
         assert ok is False
         ws_cls.assert_not_called()
         h.nothing_started()
@@ -1002,7 +724,7 @@ class TestUndecidableTokenSkipsTheCycle:
         h.token()
         h.resume_info.side_effect = Exception('zfs binary missing')
         ws_cls = mocker.patch('zfsbackup.remote.websocket.WebSocket')
-        assert h.rbm._transfer(BASE, 'client1', h.dsi, h.latest, None, 'offsite', snapshots=h.snaps) is False
+        assert h.rbm._transfer(h.transport, 'client1', h.dsi, h.latest, None, 'offsite', snapshots=h.snaps) is False
         ws_cls.assert_not_called()
         h.set_anchor.assert_not_called()
         h.clear_inflight.assert_not_called()
@@ -1028,7 +750,7 @@ class TestSnapshotGuidFailure:
         h.token()
         h.guids.side_effect = Exception('boom')
         ws_cls = mocker.patch('zfsbackup.remote.websocket.WebSocket')
-        assert h.rbm._transfer(BASE, 'client1', h.dsi, h.latest, None, 'offsite', snapshots=h.snaps) is False
+        assert h.rbm._transfer(h.transport, 'client1', h.dsi, h.latest, None, 'offsite', snapshots=h.snaps) is False
         ws_cls.assert_not_called()
         h.nothing_started()
 
@@ -1200,7 +922,7 @@ class Chain:
 
     def run(self, **kw):
         h = self.h
-        return h.rbm._transfer(BASE, 'client1', h.dsi, h.latest, None, 'offsite', snapshots=h.snaps, **kw)
+        return h.rbm._transfer(h.transport, 'client1', h.dsi, h.latest, None, 'offsite', snapshots=h.snaps, **kw)
 
     def urls(self):
         return [s.connect.call_args.args[0].split('/stream', 1)[1] for s in self.sessions
@@ -1238,7 +960,7 @@ class TestResumeThenFollowUp:
     def test_the_follow_up_renegotiates_with_the_current_listing(self, h, chain):
         chain.run()
         args = chain.negotiate.call_args.args
-        assert args == (BASE, 'client1', h.dsi, h.snaps, 'offsite')
+        assert args == (h.transport, 'client1', h.dsi, h.snaps, 'offsite')
 
     def test_there_is_never_a_second_follow_up(self, h, mocker):
         """The follow-up may itself resume a token (mode=resume, not at latest):
@@ -1403,14 +1125,14 @@ class TestAlreadyOnTheServer:
 
     def run(self, h, latest=None, **kw):
         latest = latest or h.latest
-        return h.rbm._transfer(BASE, 'client1', h.dsi, latest, latest, 'offsite', snapshots=h.snaps, **kw)
+        return h.rbm._transfer(h.transport, 'client1', h.dsi, latest, latest, 'offsite', snapshots=h.snaps, **kw)
 
     def assert_nothing_started(self, h, mocker_ws=None):
         h.nothing_started()
         h.resume_info.assert_not_called()
         h.guids.assert_not_called()
         h.send_snapshot.assert_not_called()
-        assert not [r for r in h.rm.request_history if r.method == 'GET']      # no resume-token fetch
+        assert not h.token_gets()      # no resume-token fetch
 
     def test_nothing_is_sent_fetched_pinned_or_decoded(self, h, mocker, caplog):
         ws_cls = mocker.patch('zfsbackup.remote.websocket.WebSocket')
@@ -1429,7 +1151,7 @@ class TestAlreadyOnTheServer:
         mocker.patch('zfsbackup.remote.websocket.WebSocket')
         again = sinfo(NEW)
         assert again is not h.latest
-        assert h.rbm._transfer(BASE, 'client1', h.dsi, h.latest, again, 'offsite', snapshots=h.snaps) is True
+        assert h.rbm._transfer(h.transport, 'client1', h.dsi, h.latest, again, 'offsite', snapshots=h.snaps) is True
         self.assert_nothing_started(h)
 
     def test_a_stale_server_token_is_not_even_looked_at(self, h, mocker):
@@ -1445,13 +1167,13 @@ class TestAlreadyOnTheServer:
 
     def test_a_different_common_snapshot_still_sends(self, h, mocker):
         chain = Chain(h, mocker, sessions=1)
-        assert h.rbm._transfer(BASE, 'client1', h.dsi, h.latest, h.snaps[1], 'offsite', snapshots=h.snaps) is True
+        assert h.rbm._transfer(h.transport, 'client1', h.dsi, h.latest, h.snaps[1], 'offsite', snapshots=h.snaps) is True
         assert chain.ws_cls.call_count == 1
         h.send_snapshot.assert_called_once()
 
     def test_no_common_snapshot_still_sends_in_full(self, h, mocker):
         chain = Chain(h, mocker, sessions=1)
-        assert h.rbm._transfer(BASE, 'client1', h.dsi, h.latest, None, 'offsite', snapshots=h.snaps) is True
+        assert h.rbm._transfer(h.transport, 'client1', h.dsi, h.latest, None, 'offsite', snapshots=h.snaps) is True
         assert chain.urls() == ['?mode=fresh']
 
     # -- the anchor ---------------------------------------------------------------
@@ -1539,7 +1261,7 @@ class TestAlreadyOnTheServer:
 
     def test_a_dry_run_with_something_to_send_still_announces_it(self, h):
         h.rbm.config.dry_run = True
-        ok = h.rbm._transfer(BASE, 'client1', h.dsi, h.latest, h.snaps[1], 'offsite', snapshots=h.snaps)
+        ok = h.rbm._transfer(h.transport, 'client1', h.dsi, h.latest, h.snaps[1], 'offsite', snapshots=h.snaps)
         assert ok is True
         h.nothing_started()
 
@@ -1551,13 +1273,12 @@ class TestAlreadyOnTheServer:
         chain = Chain(h, mocker, negotiate=NEW)                   # the server now holds even NEW
         assert chain.run() is True
         assert chain.ws_cls.call_count == 1 and chain.urls() == [f'?mode=resume&from={OLD}']
-        assert len([r for r in h.rm.request_history if r.method == 'GET']) == 1       # no second token fetch
+        assert len(h.token_gets()) == 1       # no second token fetch
         assert h.order == [('pin', OLD, MID), 'send-t']                                # no second pin or send
         assert [c.args[1:] for c in h.set_anchor.call_args_list] == [('offsite', MID), ('offsite', NEW)]
         h.send_snapshot.assert_not_called()
 
     def test_backup_dataset_with_the_newest_snapshot_already_on_the_server(self, h, mocker):
-        h.rm.post(f'{BASE}/backup/register', json={})
         mocker.patch.object(h.manager, 'list_snapshots', return_value=h.snaps)
         mocker.patch.object(h.rbm, '_negotiate', return_value=NEW)
         ws_cls = mocker.patch('zfsbackup.remote.websocket.WebSocket')
@@ -1573,7 +1294,6 @@ class TestBackupDatasetPlumbing:
 
     @pytest.fixture
     def wired(self, h, mocker):
-        h.rm.post(f'{BASE}/backup/register', json={})
         h.rm.post(re.compile(r'.*/negotiate$'), json={'common_snapshot': OLD})
         mocker.patch.object(h.manager, 'list_snapshots', return_value=h.snaps)
         chain = Chain(h, mocker, sessions=2, negotiate=OLD)
@@ -1588,7 +1308,7 @@ class TestBackupDatasetPlumbing:
     def test_should_stop_is_checked_before_any_send_or_token_request(self, wired):
         h, chain, cfg = wired
         assert h.rbm.backup_dataset(h.dsi, cfg, should_stop=lambda: True) is False
-        assert not [r for r in h.rm.request_history if r.method == 'GET']
+        assert not h.token_gets()
         chain.ws_cls.assert_not_called()
         h.nothing_started()
 
@@ -1617,9 +1337,9 @@ class TestTransfer:
         mocker.patch.object(DatasetManager, 'clear_inflight', return_value=True)
 
     def _make_rbm(self, tmp_path):
-        config = _make_config(client_id_file=tmp_path / 'client_id')
+        config = _make_config()
         manager = DatasetManager(config)
-        return RemoteBackupManager(config, manager), manager.datasets[0]
+        return _rbm(config, manager), manager.datasets[0]
 
     def _make_snap(self, name='autosnap_20240101120000'):
         snap = MagicMock()
@@ -1631,13 +1351,13 @@ class TestTransfer:
         rbm, dsi = self._make_rbm(tmp_path)
         mocker.patch.object(rbm, '_get_resume_stream', return_value=None)
         latest = self._make_snap()
-        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
+        result = rbm._transfer(tr(), 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
         assert result is False
 
     def test_dry_run_returns_true_without_websocket(self, tmp_path, mocker):
-        config = _make_config(client_id_file=tmp_path / 'client_id', dry_run=True)
+        config = _make_config(dry_run=True)
         manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
+        rbm = _rbm(config, manager)
         dsi = manager.datasets[0]
 
         mock_stream = MagicMock()
@@ -1645,7 +1365,7 @@ class TestTransfer:
         mock_ws_cls = mocker.patch('zfsbackup.remote.websocket.WebSocket')
 
         latest = self._make_snap()
-        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
+        result = rbm._transfer(tr(), 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
         assert result is True
         mock_ws_cls.assert_not_called()
 
@@ -1659,7 +1379,7 @@ class TestTransfer:
         mocker.patch('zfsbackup.remote.websocket.WebSocket', return_value=mock_ws)
 
         latest = self._make_snap()
-        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
+        result = rbm._transfer(tr(), 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
         assert result is False
         mock_ws.close.assert_called()
 
@@ -1676,7 +1396,7 @@ class TestTransfer:
         mocker.patch('zfsbackup.remote.websocket.WebSocket', return_value=mock_ws)
 
         latest = self._make_snap()
-        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
+        result = rbm._transfer(tr(), 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
         assert result is False
 
     def test_successful_transfer_sets_anchor(self, tmp_path, mocker):
@@ -1694,7 +1414,7 @@ class TestTransfer:
         mock_set_anchor = mocker.patch.object(rbm.local_manager, 'set_anchor')
 
         latest = self._make_snap('autosnap_20240202120000')
-        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
+        result = rbm._transfer(tr(), 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
         assert result is True
         mock_set_anchor.assert_called_once_with(dsi, 'offsite', 'autosnap_20240202120000')
 
@@ -1714,7 +1434,7 @@ class TestTransfer:
         mocker.patch.object(rbm.local_manager, 'set_anchor')
 
         latest = self._make_snap('autosnap_20240202120000')
-        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
+        result = rbm._transfer(tr(), 'client1', dsi, latest, None, 'offsite', snapshots=[latest])
         assert result is True
 
     def test_incremental_transfer_uses_ws_url(self, tmp_path, mocker):
@@ -1734,7 +1454,7 @@ class TestTransfer:
 
         latest = self._make_snap('autosnap_20240202120000')
 
-        result = rbm._transfer('http://backup.example.com', 'client1', dsi, latest, common, 'offsite', snapshots=[latest, common])
+        result = rbm._transfer(tr(), 'client1', dsi, latest, common, 'offsite', snapshots=[latest, common])
         assert result is True
         connect_url = mock_ws.connect.call_args[0][0]
         assert connect_url.endswith('/stream?mode=fresh&from=autosnap_20240101120000')
@@ -1743,51 +1463,52 @@ class TestTransfer:
 class TestBackupDataset:
     def test_returns_false_when_destination_unknown(self, tmp_path):
         config = _make_config(
-            client_id_file=tmp_path / 'client_id',
             destinations={},
         )
         manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
+        rbm = _rbm(config, manager)
         dsi = manager.datasets[0]
         remote_cfg = dsi.config.remote[0]
         result = rbm.backup_dataset(dsi, remote_cfg)
         assert result is False
 
-    def test_returns_true_when_no_snapshots(self, tmp_path, requests_mock, mocker):
-        config = _make_config(client_id_file=tmp_path / 'client_id')
+    def test_returns_true_when_no_snapshots(self, client_tls_dir, requests_mock, mocker):
+        config = _make_config()
         manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
+        rbm = _rbm(config, manager, client_tls_dir)
         dsi = manager.datasets[0]
         remote_cfg = dsi.config.remote[0]
 
-        requests_mock.post('http://backup.example.com/backup/register', json={})
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
         mocker.patch.object(manager, 'list_snapshots', return_value=[])
 
         result = rbm.backup_dataset(dsi, remote_cfg)
         assert result is True
 
-    def test_returns_false_when_register_fails(self, tmp_path, requests_mock, mocker):
-        config = _make_config(client_id_file=tmp_path / 'client_id')
+    def test_returns_false_when_whoami_fails(self, client_tls_dir, requests_mock, mocker):
+        config = _make_config()
         manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
+        rbm = _rbm(config, manager, client_tls_dir)
         dsi = manager.datasets[0]
         remote_cfg = dsi.config.remote[0]
 
-        requests_mock.post('http://backup.example.com/backup/register', status_code=500)
+        requests_mock.get(f'{BASE}/whoami', status_code=500)
+        negotiate = requests_mock.post(re.compile(r'.*/negotiate$'), json={})
 
         result = rbm.backup_dataset(dsi, remote_cfg)
         assert result is False
+        assert negotiate.call_count == 0            # nothing is negotiated for a destination that failed /whoami
 
-    def test_resolves_common_snap_from_negotiate_result(self, tmp_path, requests_mock, mocker):
-        config = _make_config(client_id_file=tmp_path / 'client_id')
+    def test_resolves_common_snap_from_negotiate_result(self, client_tls_dir, requests_mock, mocker):
+        config = _make_config()
         manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
+        rbm = _rbm(config, manager, client_tls_dir)
         dsi = manager.datasets[0]
         remote_cfg = dsi.config.remote[0]
 
-        requests_mock.post('http://backup.example.com/backup/register', json={})
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
 
-        client_id = rbm.identity.client_id
+        client_id = 'client1'
         old_snap_name = 'autosnap_20240101120000'
         new_snap_name = 'autosnap_20240202120000'
 
@@ -1803,7 +1524,7 @@ class TestBackupDataset:
         mocker.patch.object(manager, 'list_snapshots', return_value=[new_info, old_info])
 
         requests_mock.post(
-            f'http://backup.example.com/backup/{client_id}/{dsi.name}/negotiate',
+            f'https://backup.example.com/backup/{client_id}/{dsi.name}/negotiate',
             json={'common_snapshot': old_snap_name, 'server_dataset': 'pool/backups/c/pool/data'},
         )
 
@@ -1811,7 +1532,9 @@ class TestBackupDataset:
         # common_snap resolution logic in backup_dataset (line 85).
         captured = {}
 
-        def capture_transfer(base_url, cid, d, latest, common_snap, destination, **kwargs):
+        def capture_transfer(transport, cid, d, latest, common_snap, destination, **kwargs):
+            captured['transport'] = transport
+            captured['cid'] = cid
             captured['common_snap'] = common_snap
             captured['kwargs'] = kwargs
             return True
@@ -1824,24 +1547,27 @@ class TestBackupDataset:
         # the listing and the stop callback are handed on, not re-read
         assert captured['kwargs']['snapshots'] == [new_info, old_info]
         assert captured['kwargs']['should_stop'] is None
+        # the transport is the destination's: its URL, its pinned fingerprint, this host's id in the URLs
+        assert captured['transport'].base_url == BASE
+        assert captured['transport'].server_fp == SERVER_FP
+        assert captured['cid'] == 'client1'
 
-    def test_dry_run_returns_true_without_transfer(self, tmp_path, requests_mock, mocker):
+    def test_dry_run_returns_true_without_transfer(self, client_tls_dir, requests_mock, mocker):
         config = _make_config(
-            client_id_file=tmp_path / 'client_id',
             dry_run=True,
         )
         manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
+        rbm = _rbm(config, manager, client_tls_dir)
         dsi = manager.datasets[0]
         remote_cfg = dsi.config.remote[0]
 
-        requests_mock.post('http://backup.example.com/backup/register', json={})
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
         requests_mock.post(
-            f'http://backup.example.com/backup/{rbm.identity.client_id}/{dsi.name}/negotiate',
+            f'https://backup.example.com/backup/client1/{dsi.name}/negotiate',
             json={'common_snapshot': None, 'server_dataset': 'pool/b'},
         )
         requests_mock.get(
-            f'http://backup.example.com/backup/{rbm.identity.client_id}/{dsi.name}/resume_token',
+            f'https://backup.example.com/backup/client1/{dsi.name}/resume_token',
             json={'resume_token': None},
         )
 
@@ -1871,28 +1597,27 @@ class TestBackupDatasetNegotiateWiring:
     `remote_cfg.destination`) would send the wrong destination's rules."""
 
     def test_backup_dataset_calls_negotiate_with_remote_cfg_destination(
-        self, tmp_path, requests_mock, mocker
+        self, client_tls_dir, requests_mock, mocker
     ):
         # Deliberately use a destination name distinct from dsi.name (and
         # from other declared destinations) so a swap -- e.g. passing
         # dsi.name, or the first destination in the mapping -- is caught.
         config = _make_config(
-            client_id_file=tmp_path / 'client_id',
             datasets=[DatasetConfig(
                 name='pool/data',
                 remote=[RemoteDatasetConfig(destination='dc2')],
             )],
             destinations={
-                'offsite': Destination(url='http://backup.example.com'),
-                'dc2': Destination(url='http://dc2.example.com'),
+                'offsite': Destination(url='https://backup.example.com', server_fingerprint=SERVER_FP),
+                'dc2': Destination(url='https://dc2.example.com', server_fingerprint=SERVER_FP),
             },
         )
         manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
+        rbm = _rbm(config, manager, client_tls_dir)
         dsi = manager.datasets[0]
         remote_cfg = dsi.config.remote[0]
 
-        requests_mock.post('http://dc2.example.com/backup/register', json={})
+        requests_mock.get('https://dc2.example.com/whoami', json=whoami_json('client1'))
         snap = MagicMock()
         snap.name = 'autosnap_20240101120000'
         mocker.patch.object(manager, 'list_snapshots', return_value=[snap])
@@ -1902,8 +1627,9 @@ class TestBackupDatasetNegotiateWiring:
         result = rbm.backup_dataset(dsi, remote_cfg)
         assert result is True
         mock_negotiate.assert_called_once()
-        # Positional signature: (base_url, client_id, dsi, snapshots, destination)
+        # Positional signature: (transport, client_id, dsi, snapshots, destination)
         assert mock_negotiate.call_args.args[-1] == 'dc2'
+        assert mock_negotiate.call_args.args[0].base_url == 'https://dc2.example.com'     # dc2's transport, not offsite's
 
 
 class TestClientSideRetentionCollisionWarning:
@@ -1914,9 +1640,8 @@ class TestClientSideRetentionCollisionWarning:
     backup_dataset` now warns locally too, once per `(dataset, destination)`,
     naming the operator's own literals."""
 
-    def _make_rbm(self, tmp_path, retention_rules=None, destination='offsite'):
+    def _make_rbm(self, tls_dir, retention_rules=None, destination='offsite'):
         config = _make_config(
-            client_id_file=tmp_path / 'client_id',
             datasets=[DatasetConfig(
                 name='pool/data',
                 remote=[RemoteDatasetConfig(
@@ -1926,7 +1651,7 @@ class TestClientSideRetentionCollisionWarning:
             )],
         )
         manager = DatasetManager(config)
-        return RemoteBackupManager(config, manager), manager.datasets[0]
+        return _rbm(config, manager, tls_dir), manager.datasets[0]
 
     def _colliding_rules(self):
         # 1h:7d and 1d:1w collide on keep_for -- both are 604800s.
@@ -1935,9 +1660,9 @@ class TestClientSideRetentionCollisionWarning:
             RetentionRule(Duration('1d'), Duration('1w')),
         ]
 
-    def test_warns_once_for_colliding_destination_ruleset(self, tmp_path, requests_mock, caplog):
-        rbm, dsi = self._make_rbm(tmp_path, retention_rules=self._colliding_rules())
-        requests_mock.post('http://backup.example.com/backup/register', json={})
+    def test_warns_once_for_colliding_destination_ruleset(self, client_tls_dir, requests_mock, caplog):
+        rbm, dsi = self._make_rbm(client_tls_dir, retention_rules=self._colliding_rules())
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
         with patch.object(rbm.local_manager, 'list_snapshots', return_value=[]):
             with caplog.at_level(logging.WARNING):
                 rbm.backup_dataset(dsi, dsi.config.remote[0])
@@ -1945,14 +1670,14 @@ class TestClientSideRetentionCollisionWarning:
         assert len(warnings) == 1
         assert warnings[0].message.startswith('Dataset pool/data -> offsite:')
 
-    def test_warning_names_operator_literal_not_canonicalized(self, tmp_path, requests_mock, caplog):
+    def test_warning_names_operator_literal_not_canonicalized(self, client_tls_dir, requests_mock, caplog):
         # The message must contain "7d" -- the text the operator wrote --
         # not the numerically-equal-but-different canonicalized "1w". That
         # distinction is the entire point of warning client-side: the
         # server-side message names its own (canonicalized) literals, which
         # this client operator never sees and does not administer.
-        rbm, dsi = self._make_rbm(tmp_path, retention_rules=self._colliding_rules())
-        requests_mock.post('http://backup.example.com/backup/register', json={})
+        rbm, dsi = self._make_rbm(client_tls_dir, retention_rules=self._colliding_rules())
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
         with patch.object(rbm.local_manager, 'list_snapshots', return_value=[]):
             with caplog.at_level(logging.WARNING):
                 rbm.backup_dataset(dsi, dsi.config.remote[0])
@@ -1960,9 +1685,9 @@ class TestClientSideRetentionCollisionWarning:
         assert len(warnings) == 1
         assert '7d' in warnings[0].message
 
-    def test_does_not_rewarn_same_ruleset(self, tmp_path, requests_mock, caplog):
-        rbm, dsi = self._make_rbm(tmp_path, retention_rules=self._colliding_rules())
-        requests_mock.post('http://backup.example.com/backup/register', json={})
+    def test_does_not_rewarn_same_ruleset(self, client_tls_dir, requests_mock, caplog):
+        rbm, dsi = self._make_rbm(client_tls_dir, retention_rules=self._colliding_rules())
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
         with patch.object(rbm.local_manager, 'list_snapshots', return_value=[]):
             with caplog.at_level(logging.WARNING):
                 rbm.backup_dataset(dsi, dsi.config.remote[0])
@@ -1971,10 +1696,9 @@ class TestClientSideRetentionCollisionWarning:
         warnings = [r for r in caplog.records if r.levelname == 'WARNING']
         assert len(warnings) == 1
 
-    def test_warns_separately_for_two_different_destinations(self, tmp_path, requests_mock, caplog):
+    def test_warns_separately_for_two_different_destinations(self, client_tls_dir, requests_mock, caplog):
         rules = self._colliding_rules()
         config = _make_config(
-            client_id_file=tmp_path / 'client_id',
             datasets=[DatasetConfig(
                 name='pool/data',
                 remote=[
@@ -1983,16 +1707,16 @@ class TestClientSideRetentionCollisionWarning:
                 ],
             )],
             destinations={
-                'offsite': Destination(url='http://backup.example.com'),
-                'dc2': Destination(url='http://dc2.example.com'),
+                'offsite': Destination(url='https://backup.example.com', server_fingerprint=SERVER_FP),
+                'dc2': Destination(url='https://dc2.example.com', server_fingerprint=SERVER_FP),
             },
         )
         manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
+        rbm = _rbm(config, manager, client_tls_dir)
         dsi = manager.datasets[0]
 
-        requests_mock.post('http://backup.example.com/backup/register', json={})
-        requests_mock.post('http://dc2.example.com/backup/register', json={})
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
+        requests_mock.get('https://dc2.example.com/whoami', json=whoami_json('client1'))
         with patch.object(manager, 'list_snapshots', return_value=[]):
             with caplog.at_level(logging.WARNING):
                 rbm.backup_dataset(dsi, dsi.config.remote[0])
@@ -2002,10 +1726,10 @@ class TestClientSideRetentionCollisionWarning:
         assert any(w.message.startswith('Dataset pool/data -> offsite:') for w in warnings)
         assert any(w.message.startswith('Dataset pool/data -> dc2:') for w in warnings)
 
-    def test_no_collision_produces_no_warning(self, tmp_path, requests_mock, caplog):
+    def test_no_collision_produces_no_warning(self, client_tls_dir, requests_mock, caplog):
         rules = [RetentionRule(Duration('1h'), Duration('1d'))]
-        rbm, dsi = self._make_rbm(tmp_path, retention_rules=rules)
-        requests_mock.post('http://backup.example.com/backup/register', json={})
+        rbm, dsi = self._make_rbm(client_tls_dir, retention_rules=rules)
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
         with patch.object(rbm.local_manager, 'list_snapshots', return_value=[]):
             with caplog.at_level(logging.WARNING):
                 rbm.backup_dataset(dsi, dsi.config.remote[0])
@@ -2016,13 +1740,13 @@ class TestNegotiationFailedAndReload:
     """The server's retryable 503 ("reloading") and every other failure are
     told apart; neither is ever read as "no common snapshot"."""
 
-    URL = 'http://backup.example.com'
+    URL = 'https://backup.example.com'
     RELOADING = {'error': 'server is reloading; retry later', 'retry': True}
 
-    def _make(self, tmp_path):
-        config = _make_config(client_id_file=tmp_path / 'client_id')
+    def _make(self, tmp_path, tls_dir=None):
+        config = _make_config()
         manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
+        rbm = _rbm(config, manager, tls_dir)
         dsi = manager.datasets[0]
         return rbm, manager, dsi, dsi.config.remote[0]
 
@@ -2036,14 +1760,14 @@ class TestNegotiationFailedAndReload:
         rbm, _, dsi, _ = self._make(tmp_path)
         self._post(requests_mock, dsi, status_code=503, json=self.RELOADING)
         with pytest.raises(NegotiationFailed) as exc:
-            rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite')
+            rbm._negotiate(tr(), 'client1', dsi, [], 'offsite')
         assert exc.value.reloading is True
 
     def test_a_reloading_503_is_not_logged_as_an_error(self, tmp_path, requests_mock, caplog):
         rbm, _, dsi, _ = self._make(tmp_path)
         self._post(requests_mock, dsi, status_code=503, json=self.RELOADING)
         with caplog.at_level(logging.DEBUG), pytest.raises(NegotiationFailed):
-            rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite')
+            rbm._negotiate(tr(), 'client1', dsi, [], 'offsite')
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
     @pytest.mark.parametrize(
@@ -2061,7 +1785,7 @@ class TestNegotiationFailedAndReload:
         rbm, _, dsi, _ = self._make(tmp_path)
         self._post(requests_mock, dsi, **kwargs)
         with caplog.at_level(logging.ERROR), pytest.raises(NegotiationFailed) as exc:
-            rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite')
+            rbm._negotiate(tr(), 'client1', dsi, [], 'offsite')
         assert exc.value.reloading is False
         assert 'Negotiation failed' in caplog.text
 
@@ -2071,25 +1795,25 @@ class TestNegotiationFailedAndReload:
         rbm, _, dsi, _ = self._make(tmp_path)
         self._post(requests_mock, dsi, exc=getattr(requests, exc_type))
         with pytest.raises(NegotiationFailed) as exc:
-            rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite')
+            rbm._negotiate(tr(), 'client1', dsi, [], 'offsite')
         assert exc.value.reloading is False
 
     def test_a_null_common_snapshot_is_none_not_a_failure(self, tmp_path, requests_mock):
         rbm, _, dsi, _ = self._make(tmp_path)
         self._post(requests_mock, dsi, json={'common_snapshot': None, 'server_dataset': 'x'})
-        assert rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite') is None
+        assert rbm._negotiate(tr(), 'client1', dsi, [], 'offsite') is None
 
     def test_a_common_snapshot_is_returned(self, tmp_path, requests_mock):
         rbm, _, dsi, _ = self._make(tmp_path)
         self._post(requests_mock, dsi, json={'common_snapshot': 'autosnap_1'})
-        assert rbm._negotiate(self.URL, 'client1', dsi, [], 'offsite') == 'autosnap_1'
+        assert rbm._negotiate(tr(), 'client1', dsi, [], 'offsite') == 'autosnap_1'
 
     # -- backup_dataset -----------------------------------------------------
 
     @pytest.fixture
-    def wired(self, tmp_path, requests_mock, mocker):
-        rbm, manager, dsi, remote_cfg = self._make(tmp_path)
-        requests_mock.post(f'{self.URL}/backup/register', json={})
+    def wired(self, tmp_path, requests_mock, mocker, client_tls_dir):
+        rbm, manager, dsi, remote_cfg = self._make(tmp_path, client_tls_dir)
+        requests_mock.get(f'{self.URL}/whoami', json=whoami_json('client1'))
         snap = MagicMock()
         snap.name = 'autosnap_20240101120000'
         mocker.patch.object(manager, 'list_snapshots', return_value=[snap])
@@ -2151,23 +1875,29 @@ class TestNegotiationFailedAndReload:
         sends['send_snapshot'].assert_called_once()
         assert 'since' not in sends['send_snapshot'].call_args.kwargs
 
-    def test_a_reloading_register_is_false_with_an_info_log_and_goes_no_further(self, wired, requests_mock, caplog):
+    def test_a_reloading_whoami_is_false_with_an_info_log_and_goes_no_further(self, wired, requests_mock, caplog):
         rbm, dsi, remote_cfg, sends = wired
-        requests_mock.post(f'{self.URL}/backup/register', status_code=503, json=self.RELOADING)
+        requests_mock.get(f'{self.URL}/whoami', status_code=503, json=self.RELOADING)
         negotiate = requests_mock.post(re.compile(r'.*/negotiate$'), json={})
         with caplog.at_level(logging.INFO):
             assert rbm.backup_dataset(dsi, remote_cfg) is False
-        assert 'is reloading; registration skipped this cycle' in caplog.text
-        assert 'Registration failed' not in caplog.text
+        assert [r.levelname for r in caplog.records if r.getMessage() == (
+            f'server {self.URL} is reloading; destination offsite skipped this cycle')] == ['INFO']
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert negotiate.call_count == 0
         self.assert_no_send(sends)
 
-    def test_a_non_retry_register_503_is_a_registration_failure(self, wired, requests_mock, caplog):
+    def test_a_non_retry_whoami_503_is_an_error_not_a_reload(self, wired, requests_mock, caplog):
         rbm, dsi, remote_cfg, sends = wired
-        requests_mock.post(f'{self.URL}/backup/register', status_code=503, json={'error': 'remote_backup disabled'})
+        requests_mock.get(f'{self.URL}/whoami', status_code=503, json={'error': 'remote_backup disabled'})
+        negotiate = requests_mock.post(re.compile(r'.*/negotiate$'), json={})
         with caplog.at_level(logging.INFO):
             assert rbm.backup_dataset(dsi, remote_cfg) is False
-        assert 'Registration failed' in caplog.text
+        assert 'is reloading' not in caplog.text
+        assert [r.levelname for r in caplog.records if 'unexpected /whoami answer' in r.getMessage()
+                and 'HTTP 503' in r.getMessage()] == ['ERROR']
+        assert negotiate.call_count == 0
+        self.assert_no_send(sends)
 
     # -- resume_token -------------------------------------------------------
 
@@ -2181,7 +1911,7 @@ class TestNegotiationFailedAndReload:
         latest = MagicMock()
         latest.name = 'autosnap_1'
         with caplog.at_level(logging.INFO):
-            assert rbm._get_resume_stream(self.URL, 'client1', dsi, latest, None, 'offsite', [latest]) is None
+            assert rbm._get_resume_stream(tr(), 'client1', dsi, latest, None, 'offsite', [latest]) is None
         assert f'server {self.URL} is reloading; skipping {dsi.name} this cycle' in caplog.text
         send_snapshot.assert_not_called()
         send_resume.assert_not_called()
@@ -2195,7 +1925,7 @@ class TestNegotiationFailedAndReload:
         )
         latest = MagicMock()
         latest.name = 'autosnap_1'
-        assert rbm._transfer(self.URL, 'client1', dsi, latest, None, 'offsite', snapshots=[latest]) is False
+        assert rbm._transfer(tr(), 'client1', dsi, latest, None, 'offsite', snapshots=[latest]) is False
         send_snapshot.assert_not_called()
         ws_cls.assert_not_called()
 
@@ -2210,7 +1940,7 @@ class TestNegotiationFailedAndReload:
         latest = MagicMock()
         latest.name = 'autosnap_1'
         with caplog.at_level(logging.INFO):
-            assert rbm._get_resume_stream(self.URL, 'client1', dsi, latest, None, 'offsite', [latest]) is None
+            assert rbm._get_resume_stream(tr(), 'client1', dsi, latest, None, 'offsite', [latest]) is None
         send_snapshot.assert_not_called()
         assert [r.levelname for r in caplog.records if 'HTTP 500' in r.getMessage()] == ['WARNING']
 
@@ -2223,15 +1953,14 @@ class TestUrlPathEncoding:
     the URL handed to `requests`/`websocket` instead of going through a real
     request, where an unencoded `%`/`#`/`?` would otherwise pass unnoticed."""
 
-    BASE = 'http://backup.example.com'
+    BASE = 'https://backup.example.com'
 
     def _rbm(self, tmp_path, name='pool/my data'):
         config = _make_config(
             datasets=[DatasetConfig(name=name, remote=[RemoteDatasetConfig(destination='offsite')])],
-            client_id_file=tmp_path / 'client_id',
-        )
+            )
         manager = DatasetManager(config)
-        return RemoteBackupManager(config, manager), manager.datasets[0]
+        return _rbm(config, manager), manager.datasets[0]
 
     @pytest.mark.parametrize('name, client, quoted', [
         ('pool/my data', 'client 1', 'client%201/pool/my%20data'),
@@ -2243,11 +1972,11 @@ class TestUrlPathEncoding:
     ])
     def test_negotiate_url(self, tmp_path, mocker, name, client, quoted):
         rbm, dsi = self._rbm(tmp_path, name)
-        post = mocker.patch('zfsbackup.remote.requests.post')
-        post.return_value.json.return_value = {'common_snapshot': None}
-        post.return_value.status_code = 200
-        rbm._negotiate(self.BASE, client, dsi, [], 'offsite')
-        assert post.call_args.args[0] == f'{self.BASE}/backup/{quoted}/negotiate'
+        session = MagicMock()
+        session.post.return_value.json.return_value = {'common_snapshot': None}
+        session.post.return_value.status_code = 200
+        rbm._negotiate(make_transport(self.BASE, session=session), client, dsi, [], 'offsite')
+        assert session.post.call_args.args[0] == f'{self.BASE}/backup/{quoted}/negotiate'
 
     @pytest.mark.parametrize('name, client, quoted', [
         ('pool/my data', 'client 1', 'client%201/pool/my%20data'),
@@ -2256,15 +1985,17 @@ class TestUrlPathEncoding:
     ])
     def test_resume_token_url(self, tmp_path, mocker, name, client, quoted):
         rbm, dsi = self._rbm(tmp_path, name)
-        get = mocker.patch('zfsbackup.remote.requests.get')
-        get.return_value.ok = True
-        get.return_value.status_code = 200
-        get.return_value.json.return_value = {'resume_token': None}
+        session = MagicMock()
+        session.get.return_value.ok = True
+        session.get.return_value.status_code = 200
+        session.get.return_value.json.return_value = {'resume_token': None}
         mocker.patch('zfsbackup.remote.zfs.send.snapshot', return_value=_finite_stream())
         mocker.patch.object(rbm.local_manager, 'set_inflight', return_value=True)
-        started = rbm._get_resume_stream(self.BASE, client, dsi, MagicMock(), None, 'offsite', [])
+        started = rbm._get_resume_stream(
+            make_transport(self.BASE, session=session), client, dsi, MagicMock(), None, 'offsite', []
+        )
         assert started is not None and started.mode == 'fresh'
-        assert get.call_args.args[0] == f'{self.BASE}/backup/{quoted}/resume_token'
+        assert session.get.call_args.args[0] == f'{self.BASE}/backup/{quoted}/resume_token'
 
     def _stream_url(self, tmp_path, mocker, name, client, common, base=None, mode='fresh'):
         rbm, dsi = self._rbm(tmp_path, name)
@@ -2280,31 +2011,34 @@ class TestUrlPathEncoding:
         ws.recv.return_value = '{"status": "ok"}'
         mocker.patch('zfsbackup.remote.websocket.WebSocket', return_value=ws)
         latest = MagicMock()
-        assert rbm._transfer(base or self.BASE, client, dsi, latest, common_snap, 'offsite',
+        assert rbm._transfer(make_transport(base or self.BASE), client, dsi, latest, common_snap, 'offsite',
                              snapshots=[latest], followup=False) is True
         return ws.connect.call_args.args[0]
 
     def test_stream_url_full_send(self, tmp_path, mocker):
         url = self._stream_url(tmp_path, mocker, 'pool/my data', 'client 1', None)
-        assert url == 'ws://backup.example.com/backup/client%201/pool/my%20data/stream?mode=fresh'
+        assert url == 'wss://backup.example.com/backup/client%201/pool/my%20data/stream?mode=fresh'
 
     def test_stream_url_incremental_encodes_the_snapshot_name_fully(self, tmp_path, mocker):
         url = self._stream_url(tmp_path, mocker, 'pool/my data', 'client 1', 'snap:one two/x')
         assert url == (
-            'ws://backup.example.com/backup/client%201/pool/my%20data/stream'
+            'wss://backup.example.com/backup/client%201/pool/my%20data/stream'
             '?mode=fresh&from=snap%3Aone%20two%2Fx'
         )
 
     def test_a_plain_snapshot_name_is_unchanged(self, tmp_path, mocker):
         url = self._stream_url(tmp_path, mocker, 'pool/data', 'client1', 'autosnap_20240101120000')
         assert url == (
-            'ws://backup.example.com/backup/client1/pool/data/stream'
+            'wss://backup.example.com/backup/client1/pool/data/stream'
             '?mode=fresh&from=autosnap_20240101120000'
         )
 
-    def test_https_becomes_wss_and_the_path_is_still_quoted(self, tmp_path, mocker):
-        url = self._stream_url(tmp_path, mocker, 'pool/my data', 'c', None, base='https://backup.example.com')
-        assert url == 'wss://backup.example.com/backup/c/pool/my%20data/stream?mode=fresh'
+    def test_the_websocket_is_always_wss_the_scheme_is_never_rewritten_from_the_url_text(self, tmp_path, mocker):
+        """There is no plaintext path: a destination under a sub-path and a non-default port stays
+        `wss://` with its path and port, and the websocket connects over the pinned socket."""
+        url = self._stream_url(tmp_path, mocker, 'pool/my data', 'c', None,
+                               base='https://backup.example.com:8443/zb')
+        assert url == 'wss://backup.example.com:8443/zb/backup/c/pool/my%20data/stream?mode=fresh'
 
     def test_the_query_value_round_trips(self, tmp_path, mocker):
         from urllib.parse import parse_qs, urlsplit
@@ -2315,7 +2049,7 @@ class TestUrlPathEncoding:
         url = self._stream_url(tmp_path, mocker, 'pool/my data', 'client 1', 'autosnap_20240101120000',
                                mode='resume')
         assert url == (
-            'ws://backup.example.com/backup/client%201/pool/my%20data/stream'
+            'wss://backup.example.com/backup/client%201/pool/my%20data/stream'
             '?mode=resume&from=autosnap_20240101120000'
         )
 
@@ -2332,32 +2066,30 @@ class TestUrlRoundTripThroughTheServer:
 
     def test_the_client_quoted_negotiate_url_reaches_the_server_decoded(self, tmp_path, mocker):
         from urllib.parse import urlsplit
-        from zfsbackup.api import create_app
+        from _api_support import Authed
         from zfsbackup.config import RemoteServerConfig
 
         server_config = _make_config(
             datasets=[DatasetConfig(name='pool/srv')],
             remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
-            client_id_file=tmp_path / 'server_client_id',
-        )
-        app = create_app(server_config)
-        app.testing = True
-        web = app.test_client()
+            )
+        # the server binds this client's certificate to the id in the URL (plan D5)
+        web = Authed(server_config, client_id='client-1').client()
         exists = mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         zset = mocker.patch('zfsbackup.api.zfs.set')
         mocker.patch('zfsbackup.api.zfs.list', return_value=[])
+        mocker.patch('zfsbackup.api.read_zfsbackup_properties', return_value={})
 
         config = _make_config(
             datasets=[DatasetConfig(name='pool/my data', remote=[RemoteDatasetConfig(destination='offsite')])],
-            client_id_file=tmp_path / 'client_id',
-        )
+            )
         manager = DatasetManager(config)
-        rbm = RemoteBackupManager(config, manager)
+        rbm = _rbm(config, manager)
         dsi = manager.datasets[0]
 
         def deliver(url, json=None, timeout=None):
             path = urlsplit(url).path
-            assert path == '/backup/client%201/pool/my%20data/negotiate'
+            assert path == '/backup/client-1/pool/my%20data/negotiate'
             resp = web.post(path, json=json)       # the server decodes the percent-escapes
             fake = MagicMock()
             fake.status_code = resp.status_code
@@ -2365,15 +2097,18 @@ class TestUrlRoundTripThroughTheServer:
             fake.json.return_value = resp.get_json()
             return fake
 
-        mocker.patch('zfsbackup.remote.requests.post', side_effect=deliver)
+        session = MagicMock()
+        session.post.side_effect = deliver
         snaps = [MagicMock()]
         snaps[0].name = 'autosnap_20240101120000'
-        assert rbm._negotiate('http://backup.example.com', 'client 1', dsi, snaps, 'offsite') is None
+        assert rbm._negotiate(
+            make_transport(BASE, session=session), 'client-1', dsi, snaps, 'offsite'
+        ) is None
 
         server_fs = exists.call_args.args[0]
-        assert server_fs.name == 'pool/backups/client 1/my data'
+        assert server_fs.name == 'pool/backups/client-1/my data'
         props = zset.call_args.args[1]
-        assert props['org.zfsbackup:client_id'] == 'client 1'
+        assert props['org.zfsbackup:client_id'] == 'client-1'
         assert props['org.zfsbackup:source_dataset'] == 'pool/my data'
 
 
@@ -2382,10 +2117,10 @@ class TestNegotiateConflict:
 
     URL_RE = re.compile(r'.*/negotiate$')
 
-    def rbm_dsi(self, tmp_path):
-        config = _make_config(client_id_file=tmp_path / 'client_id')
+    def rbm_dsi(self, tmp_path, tls_dir=None):
+        config = _make_config()
         manager = DatasetManager(config)
-        return RemoteBackupManager(config, manager), manager.datasets[0]
+        return _rbm(config, manager, tls_dir), manager.datasets[0]
 
     @staticmethod
     def own(caplog):
@@ -2394,7 +2129,7 @@ class TestNegotiateConflict:
 
     def refused(self, rbm, dsi):
         with pytest.raises(NegotiationFailed) as exc:
-            rbm._negotiate(BASE, 'client1', dsi, [], 'offsite')
+            rbm._negotiate(tr(), 'client1', dsi, [], 'offsite')
         assert exc.value.reloading is False
         return exc.value
 
@@ -2413,9 +2148,9 @@ class TestNegotiateConflict:
         assert [(r.levelname, r.getMessage()) for r in self.own(caplog)] == [
             ('ERROR', 'server refused pool/data: conflict!')]
 
-    def test_a_409_never_leads_to_a_send(self, tmp_path, requests_mock, mocker):
-        rbm, dsi = self.rbm_dsi(tmp_path)
-        requests_mock.post(f'{BASE}/backup/register', json={})
+    def test_a_409_never_leads_to_a_send(self, tmp_path, client_tls_dir, requests_mock, mocker):
+        rbm, dsi = self.rbm_dsi(tmp_path, client_tls_dir)
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
         requests_mock.post(self.URL_RE, status_code=409, json={'error': 'no'})
         mocker.patch.object(rbm.local_manager, 'list_snapshots', return_value=[sinfo(NEW)])
         started = mocker.patch.object(rbm, '_get_resume_stream')
@@ -2455,7 +2190,7 @@ class TestNegotiateConflict:
             requests_mock.post(self.URL_RE, status_code=409, json={'error': 'held elsewhere'})
             self.refused(rbm, dsi)
             requests_mock.post(self.URL_RE, json={'common_snapshot': None})
-            assert rbm._negotiate(BASE, 'client1', dsi, [], 'offsite') is None
+            assert rbm._negotiate(tr(), 'client1', dsi, [], 'offsite') is None
             requests_mock.post(self.URL_RE, status_code=409, json={'error': 'held elsewhere'})
             self.refused(rbm, dsi)
         assert [r.levelname for r in self.own(caplog)] == ['ERROR', 'ERROR']
@@ -2467,7 +2202,7 @@ class TestNegotiateConflict:
             self.refused(rbm, dsi)
             requests_mock.post(self.URL_RE, status_code=503, json={'error': 'x', 'retry': True})
             with pytest.raises(NegotiationFailed):
-                rbm._negotiate(BASE, 'client1', dsi, [], 'offsite')
+                rbm._negotiate(tr(), 'client1', dsi, [], 'offsite')
             requests_mock.post(self.URL_RE, status_code=409, json={'error': 'held elsewhere'})
             self.refused(rbm, dsi)
         assert [r.levelname for r in messages(caplog, 'server refused')] == ['ERROR', 'DEBUG']
@@ -2478,12 +2213,12 @@ class TestNegotiateConflict:
         with caplog.at_level(logging.DEBUG):
             self.refused(rbm, dsi)
             with pytest.raises(NegotiationFailed):
-                rbm._negotiate(BASE, 'client1', dsi, [], 'second-destination')
+                rbm._negotiate(tr(), 'client1', dsi, [], 'second-destination')
         assert [r.levelname for r in self.own(caplog)] == ['ERROR', 'ERROR']
 
-    def test_backup_dataset_cycles_log_the_refusal_once(self, tmp_path, requests_mock, mocker, caplog):
-        rbm, dsi = self.rbm_dsi(tmp_path)
-        requests_mock.post(f'{BASE}/backup/register', json={})
+    def test_backup_dataset_cycles_log_the_refusal_once(self, tmp_path, client_tls_dir, requests_mock, mocker, caplog):
+        rbm, dsi = self.rbm_dsi(tmp_path, client_tls_dir)
+        requests_mock.get(f'{BASE}/whoami', json=whoami_json('client1'))
         requests_mock.post(self.URL_RE, status_code=409, json={'error': 'held elsewhere'})
         mocker.patch.object(rbm.local_manager, 'list_snapshots', return_value=[sinfo(NEW)])
         started = mocker.patch.object(rbm, '_get_resume_stream')

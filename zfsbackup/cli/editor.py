@@ -435,11 +435,11 @@ def _ask_retry() -> bool:
 
 _TOP_KEYS = (
     "snapshot_prefix", "check_interval", "prune_interval", "api_host", "api_port",
-    "dry_run", "client_id_file", "destinations", "remote_backup", "datasets",
+    "dry_run", "client_cert_file", "client_key_file", "destinations", "remote_backup", "datasets",
 )
 _DATASET_KEYS = ("name", "enabled", "frequency", "recursive", "retention", "remote")
 _REMOTE_KEYS = ("destination", "frequency", "retention")
-_DESTINATION_KEYS = ("url",)
+_DESTINATION_KEYS = ("url", "server_fingerprint")
 _SERVER_KEYS = ("target_dataset", "enabled")
 
 
@@ -593,13 +593,17 @@ def _dataset_parser(config: BackupConfig, name: str) -> Callable[[str], BackupCo
 def _destination_parser(config: BackupConfig, name: str) -> Callable[[str], BackupConfig]:
     def parse(text: str) -> BackupConfig:
         fragment = _fragment(text, "destination")
-        unknown = sorted(set(fragment) - {"url"})
+        unknown = sorted(set(fragment) - set(_DESTINATION_KEYS))
         if unknown:
             raise ValueError(
-                f"unknown key(s) {', '.join(map(repr, unknown))}; a destination has only a url:"
+                f"unknown key(s) {', '.join(map(repr, unknown))}; valid keys: "
+                f"{', '.join(_DESTINATION_KEYS)}"
             )
         data = dotpath.to_dict(config)
-        data["destinations"][name] = {"url": fragment.get("url")}
+        body = {"url": fragment.get("url")}
+        if fragment.get("server_fingerprint") not in (None, ""):
+            body["server_fingerprint"] = fragment["server_fingerprint"]
+        data["destinations"][name] = body
         return dotpath.parse_dict(data)
 
     return parse
@@ -688,6 +692,7 @@ def _session(
         for message in (
             _anchor_warnings(original, canon)
             + _recreate_warnings(original, canon)
+            + dotpath.pin_change_warnings(original, canon)
             + dotpath.prefix_change_warnings(original, canon)
         ):
             warn(message)
@@ -798,7 +803,8 @@ def edit_destination(
     editor: Optional[str] = None,
     prompt: bool = True,
 ) -> None:
-    """Edit one destination's `url` (never its name) in `$EDITOR`."""
+    """Edit one destination's `url` and `server_fingerprint` (never its name) in
+    `$EDITOR`."""
     config = snapshot.config
     dest = config.destinations.get(name)
     if dest is None:
@@ -806,7 +812,11 @@ def edit_destination(
         raise CliError(f"no destination named {name!r}; destinations: {names}")
     _session(
         resolved, snapshot,
-        header=_entry_header("destination", name, "A destination has only a url:."),
+        header=_entry_header(
+            "destination", name,
+            "A destination has a url: and, once enrolled, a server_fingerprint: (the pin; "
+            "leaving it out un-enrolls the destination).",
+        ),
         initial_body=render_destination_fragment(dest), parse=_destination_parser(config, name),
         check_rename=False, warn=warn, editor=editor, allow_recreate=True, prompt=prompt,
     )

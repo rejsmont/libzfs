@@ -201,7 +201,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
 from zfsbackup.config import BackupConfig
-from zfsbackup.config.store.db import dispose_all
+from zfsbackup.config.store.db import connect_tracked, dispose_all
 from zfsbackup.config.store.mapper import (
     load_config,
     read_store_id,
@@ -460,8 +460,12 @@ def _probe_config_empty(target: Path) -> bool:
     function does not change the fingerprint: it only reads and rolls back,
     and the caller has already established that no WAL exists.
     """
-    conn = sqlite3.connect(
-        target.as_uri() + "?mode=rw", uri=True, timeout=1, isolation_level=None
+    # Through `db.connect_tracked`, like every store connection: serialised
+    # with the raw-fd guard, so no raw fd on the file is closed between this
+    # connect and its first lock.
+    conn = connect_tracked(
+        target.as_uri() + "?mode=rw", uri=True, timeout=1,
+        isolation_level=None, check_same_thread=False,
     )
     try:
         conn.execute("BEGIN IMMEDIATE")
