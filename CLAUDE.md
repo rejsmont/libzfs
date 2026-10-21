@@ -81,6 +81,12 @@ Wraps the `zfs` and `zpool` CLI utilities (or optionally TrueNAS `libzfs` bindin
 Properties are stored internally as integer-indexed lists (using `_prop_names` class attrs) for efficiency; user-defined properties (containing `:`) are stored separately in `_user_props`.
 
 **[libzfseasy/zfs.py](libzfseasy/zfs.py)** defines command classes (`ListCommand`, `CreateCommand`, `SnapshotCommand`, etc.), each wrapping a `zfs` subcommand. `Command._exec` / `_exec_out` drive `subprocess.Popen` and stream stdout line-by-line. `SendCommand` and `ReceiveCommand` use binary streaming variants (`_exec_stream` / `_exec_stream_in`) that return `BufferedReader`/`BufferedWriter`.
+`-H` output framing is a trust boundary: every write refuses values containing `\n`, `\r`, `\t` or `\0`
+(`Validate.value`, `InvalidValueError`) before running; `list`/`get` read bytes (`_exec_lines`, surrogateescape,
+split on `\n` only) and fail closed per row and per object (wrong column count, out-of-scope or duplicate names,
+non-contiguous groups, and the "lead rule": an object's `get` rows must start with `type` for `all`, or
+`name`,`type` for an explicit list, so `GetCommand` must never pass `-s`). `zfs.get.value(ds, prop, sources=…)`
+reads one value exactly.
 
 **[libzfseasy/\_\_init\_\_.py](libzfseasy/__init__.py)** instantiates one singleton per command class and exports them as module-level names (`zfs.list`, `zfs.create`, `zfs.snapshot`, etc.). This is the public API.
 
@@ -94,7 +100,7 @@ Properties are stored internally as integer-indexed lists (using `_prop_names` c
 - `DatasetManager` — owns the list of `DatasetInfo` objects, checks whether a snapshot is due (`needs_snapshot`), creates snapshots via `libzfseasy`, and lists existing ones
 - `DatasetInfo` — pairs a `libzfseasy.Dataset` with its `DatasetConfig`; computes the aligned reference time for period boundaries
 - `SnapshotInfo` — wraps a `libzfseasy.Snapshot`; parses the `{prefix}_{YYYYMMDDHHMMSS}` name to get a timestamp and calculates age
-- Retention/destruction lives on `DatasetManager` too — the tiered slot-based `needs_prunning` (keeps the newest snapshot per time slot, always keeps `snapshots[0]`, skips anchored snapshots) and `prune_snapshots` (destroys in batches, honors `dry_run`). Anchor state is stored in the `org.zfsbackup:anchor.*` user properties. A recursive prune (`zfs destroy -r`) never destroys a name a descendant protects — its local/received anchors (one `zfs get -r`) or an enabled configured descendant's own retention — and skips the dataset if those cannot be read. Received datasets (server side) are always pruned non-recursively: the client never sends `-R`, so each received child is its own client dataset with its own retention.
+- Retention/destruction lives on `DatasetManager` too — the tiered slot-based `needs_prunning` (keeps the oldest snapshot per time slot, always keeps `snapshots[0]`, skips anchored snapshots) and `prune_snapshots` (destroys in batches, honors `dry_run`). Anchor state is stored in the `org.zfsbackup:anchor.*` user properties. A recursive prune (`zfs destroy -r`) never destroys a name a descendant protects — its local/received anchors (one `zfs get -r`) or an enabled configured descendant's own retention — and skips the dataset if those cannot be read. Received datasets (server side) are always pruned non-recursively: the client never sends `-R`, so each received child is its own client dataset with its own retention.
 
 **[zfsbackup/daemon.py](zfsbackup/daemon.py)** — `BackupDaemon` is a **multiprocessing supervisor**, not a single-process loop: it owns a shared **`zfsbackup.stopflag.StopFlag`** (a lock-free shared byte — **not** a `multiprocessing.Event`; see below), installs `SIGINT`/`SIGTERM`/`SIGHUP` handlers, spawns the worker processes, then polls and restarts any that die. It also runs the live-reload state machine: a SIGHUP or the 10 s poll leads to read, validate, build and the pre-start checks; then the `Handoff` swap and a `ReloadEpoch` bump; then a staggered turnover (see Live reload below). The supervisor itself makes **no `zfs` call** (a hung pool must not stall signals or restarts). Under the `forkserver` start method (the Linux default from Python 3.14) a dead forkserver makes `poll()` report every worker as exit 255 while they live: such workers are classified *lost* by process identity (start token), counted toward no restart limit, and replaced only once the orphan has exited. Entry point: `python -m zfsbackup.daemon` (flags `-c/--config`, `-d/--dry-run`, `-v/--verbose`, `--test-config`).
 
@@ -109,8 +115,18 @@ records the snapshot actually sent (never backwards) and a resumed older snapsho
 `latest` in the same cycle. `org.zfsbackup:inflight.<dest>` = `<from>,<to>` pins snapshots while they are
 sent (the pruner protects them like anchors; `rename` copies/clears them like anchors). Two client
 datasets mapping to one server dataset are refused (409); a concurrent stream for the same server dataset
-gets a retryable `busy`. Client and server must be upgraded together (an old server's `/resume_token` 500 makes a
-new client skip; an old client's `/stream` without `mode` is refused).
+gets a retryable `busy`.
+Wire protocol (`zfsbackup/protocol.py`): every request carries `X-Zfsbackup-Protocol: 1`; anything else gets
+426 (after authentication, so an untrusted caller still sees 401/403 first) on every endpoint except `/health`, and `/whoami`, `/enroll` and `/rotate` report `protocol`. Client and
+server must be upgraded together.
+Trust boundary on the server (one client's values must never reach another client's data): negotiate stores
+only a canonical re-encoding of the client's config; every receive passes `client_id` (from the certificate
+binding), `source_dataset` and that stored `config` as `-o` (`-x` does not protect local values on a full `-F`
+receive of a `-p` stream), and a stream with no stored local config is refused. `received_datasets()` lists
+names only, then reads each dataset's `client_id`/`config` with `zfs.get.value(sources='local')` and skips (one
+WARNING) anything outside `<target>/<client_id>/`, with an invalid id, or with a config that is missing,
+undecodable or only received. The client's sent values survive as hidden `received` values under the server's
+locals, so never `zfs inherit -S` them. `/config`, `/datasets` and `/datasets/<n>/snapshots` no longer exist.
 
 **TLS, authentication and enrollment** (plan: [docs/tls_mtls_plan.md](docs/tls_mtls_plan.md); wire contract at its end).
 - **[zfsbackup/identity.py](zfsbackup/identity.py)** is the one implementation of the crypto plumbing shared by the
@@ -267,12 +283,15 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 |---|---|
 | `tests/test_types.py` | `Validate`, `Property`, type classes |
 | `tests/test_commands.py` | Each command class, mocked subprocess |
+| `tests/test_framing.py` | `-H` output framing: unframeable values refused on write, fail-closed `list`/`get` row parsing (forged/duplicate/out-of-scope rows), `get.value`, `_exec_lines` |
+| `tests/test_libzfseasy_argv_hygiene.py` | Property names starting with `-` or over 255 characters refused, `receive` name validation, `_redact` clipping |
 | `tests/test_integration.py` | End-to-end workflows, mocked subprocess |
 | `tests/test_real_zfs.py` | Real ZFS commands, marked `real_zfs` |
 | `tests/test_commands_part2.py` | Command classes `AllowCommand` through `MountCommand` |
 | `tests/test_zfsbackup_basic.py` | Package smoke tests |
 | `tests/test_zfsbackup_manager.py` | `DatasetManager`, retention/pruning |
 | `tests/test_zfsbackup_prune_descendants.py` | Recursive prune honours descendants' anchors and configured retention; received datasets pruned non-recursively |
+| `tests/test_zfsbackup_prune_forged_bytes.py` | B-1 end to end: forged `zfs -H` bytes through the real libzfseasy parsers into `received_datasets()`/`prune_snapshots()`; another client's snapshots are never destroyed (`bk/A` vs `bk/Ax`) |
 | `tests/test_zfsbackup_snapshot_info.py` | `SnapshotInfo` / `DatasetInfo` time computation |
 | `tests/test_zfsbackup_daemon.py` | `BackupDaemon` supervisor: single config read, handoff to workers, presence lock |
 | `tests/test_zfsbackup_workers.py` | Worker loop and interval behaviour; config pickling across start methods |
@@ -283,6 +302,9 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_stopflag.py` | `StopFlag` semantics |
 | `tests/test_zfsbackup_stop_signals.py` | Real daemon: kill a worker, then signal the supervisor — must exit, not wedge |
 | `tests/test_zfsbackup_api.py` | HTTP control API behind a stubbed trust gateway (stream modes, abort, 409 collision, busy lock, receive error reporting) |
+| `tests/test_zfsbackup_api_negotiate.py` | `/negotiate` input validation: body shape, canonical config (positive durations), client dataset names, 400 before any write |
+| `tests/test_zfsbackup_api_protocol.py` | Wire protocol header: 426 matrix (`/health` exempt, `/enroll` first), `protocol` in `/whoami`/`/enroll`/`/rotate`, per-peer refusal log cap |
+| `tests/test_zfsbackup_api_receive.py` | Receive ownership: `-o` of `config`/`client_id`/`source_dataset` on fresh and resume, refusal without a stored config, recreate-after-abort stamps |
 | `tests/test_zfsbackup_api_auth.py` | Authentication and authorization: 401/403, the client-id binding (cert B cannot touch A's data), `/whoami`, the `/enroll` and `/rotate` matrices against a real trust store, predecessor retirement, `TrustGateway` |
 | `tests/test_zfsbackup_api_tls.py` | API worker TLS: per-connection handshake, TLS 1.3 only, connection caps and deadlines, revocation/addition with no restart, real `ApiWorker` under fork/spawn/forkserver, dry-run throwaway identity |
 | `tests/test_zfsbackup_api_wssession.py` | Websocket `_SessionSocket`: fd never closed while a reader is inside it, serialised writes, `end()`/hand-over close, no response after the upgrade, `ws_end_timeout` validation |
