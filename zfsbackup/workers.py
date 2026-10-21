@@ -691,6 +691,17 @@ API_DRAIN_TIMEOUT = 5.0
 #: slots past the handshake.
 API_MAX_ANONYMOUS_CONNECTIONS = 16
 
+#: After a failed TLS handshake, how long (seconds, at most) the connection is
+#: half-closed and what the peer still sends is read and discarded before the
+#: close (`_close_after_failed_handshake`). Ends early when the peer closes.
+API_REJECT_LINGER = 1.0
+
+#: At the end of a websocket session, how long (seconds) the connection's
+#: thread waits for simple-websocket's reader thread to leave the socket on
+#: its own (the peer's close reply, EOF or reset) before it shuts the socket
+#: down at the OS level, and again after that (`_SessionSocket.end`).
+API_WS_END_TIMEOUT = 2.0
+
 #: The capacity WARNING is logged at most once per this many seconds.
 _API_FULL_WARN_EVERY = 60.0
 
@@ -715,7 +726,9 @@ def _api_server_class():
     handshake with `API_HANDSHAKE_TIMEOUT`, clears the timeout and hands the
     `SSLSocket` to werkzeug. A failed handshake (unpinned or expired client
     certificate, TLS < 1.3, timeout, a port scan) is logged at DEBUG and
-    closed. After the handshake a connection without a pinned client
+    closed -- half-closed first, for at most `API_REJECT_LINGER`, so a TLS 1.3
+    client reads the rejection alert rather than a reset
+    (`_close_after_failed_handshake`). After the handshake a connection without a pinned client
     certificate (no certificate: `/health`, `/enroll`) must also take one of
     `API_MAX_ANONYMOUS_CONNECTIONS` slots, or is closed, so anonymous peers
     cannot hold every slot. The request line and headers are read under an
@@ -726,7 +739,9 @@ def _api_server_class():
     unread body runs under its own short deadline (`API_DRAIN_TIMEOUT`, every
     connection), and its expiry or a peer tearing the connection down is a
     quiet EOF (DEBUG); a websocket's socket is not drained at all
-    (`_DeadlineReader`).
+    (`_DeadlineReader`). A websocket session gets a `_SessionSocket` that
+    serialises its writes and lets the connection be closed only once
+    simple-websocket's reader thread has left it (`API_WS_END_TIMEOUT`).
     The slots are released in a `finally`.
     `self.ssl_context` is
     assigned after construction purely so werkzeug's environ reports `https`,
@@ -754,6 +769,8 @@ def _api_server_class():
         import errno
         import hashlib
         import io
+        import math
+        import socket
         import socketserver
         import ssl
         from werkzeug.serving import ThreadedWSGIServer, WSGIRequestHandler
@@ -782,8 +799,9 @@ def _api_server_class():
             **After the response has gone out** the only reader is
             werkzeug's drain of an unread request body (`run_wsgi`'s
             `execute`, which always closes the connection afterwards), and a
-            connection teardown there is a quiet end of the drain (EOF,
-            logged at DEBUG), not an "Error on request" traceback: the
+            connection teardown there -- or an EOF after some of the unread
+            body was discarded -- is a quiet end of the drain (EOF from then
+            on, one DEBUG line), not an "Error on request" traceback: the
             request itself was served. The drain is bounded by an ABSOLUTE
             deadline (`API_DRAIN_TIMEOUT` from its first read, or the
             request's own deadline if that is earlier), whose expiry ends it
@@ -841,25 +859,183 @@ def _api_server_class():
                         if remaining <= 0:
                             raise TimeoutError("drain deadline passed")
                         handler.connection.settimeout(remaining)
-                    return self._raw.readinto(buffer)
+                    n = self._raw.readinto(buffer)
                 except Exception as exc:
                     if not _is_teardown(exc):
                         raise
-                    # EOF from now on (one DEBUG line, no read of a dead
-                    # socket), and the connection is not reused.
-                    handler.drain_ended = True
-                    handler.close_connection = True
-                    log.debug(
-                        "API: connection from %s ended after the response (%s: %s)",
-                        handler.client_address, type(exc).__name__, exc,
-                    )
-                    return 0
+                    return self._end_drain(f"{type(exc).__name__}: {exc}")
+                if n == 0 and handler.drained_bytes:
+                    # The peer closed while its unread body was being
+                    # discarded. A reset can arrive this way too, not only as
+                    # an exception: CPython 3.11/3.12 with OpenSSL 3.0 report
+                    # a TCP reset during `SSL_read` as a ragged EOF, which
+                    # `SSLSocket` (`suppress_ragged_eofs`) returns as 0 bytes.
+                    # Same end, same one DEBUG line. An EOF with nothing
+                    # drained is a normal close (nothing was left unread).
+                    return self._end_drain("EOF")
+                handler.drained_bytes += n
+                return n
+
+            def _end_drain(self, why):
+                # EOF from now on (one DEBUG line, no read of a dead
+                # socket), and the connection is not reused.
+                handler = self._handler
+                handler.drain_ended = True
+                handler.close_connection = True
+                log.debug(
+                    "API: connection from %s ended after the response (%s)",
+                    handler.client_address, why,
+                )
+                return 0
 
             def close(self):
                 try:
                     self._raw.close()
                 finally:
                     super().close()
+
+        class _SessionSocket:
+            """The socket a websocket session gets (`werkzeug.socket` in its
+            environ, which simple-websocket's `Server` takes), in place of
+            the connection's `SSLSocket`. Two threads use it: the route's
+            (sends, and the close frame) and simple-websocket's reader thread
+            (blocked in `recv`; it also answers ping and close frames).
+
+            **Why.** When the route returns, werkzeug closes the connection
+            on this thread while the reader may still be inside `SSL_read`
+            on it (observed: about every second session). The descriptor
+            number is then free, the next accepted connection gets it, and
+            OpenSSL's next `read()` on that number -- the body of a record
+            whose header it already read, or the next `recv` -- consumes the
+            NEW connection's bytes, and the alert it sends when they fail to
+            decrypt goes to the new peer: that client's handshake or first
+            read fails (`UNEXPECTED_MESSAGE`, `DECRYPTION_FAILED_OR_BAD_
+            RECORD_MAC`) and the server logs `WRONG_VERSION_NUMBER`.
+
+            So `end()` (the connection's thread, after the route, before the
+            connection is closed) refuses new I/O and waits until no call is
+            inside the `SSLSocket`. `close()` is a no-op: the connection
+            belongs to the server, which closes it after `end()`. If a call
+            is still inside after that (a reader stalled past both waits: a
+            frozen cgroup, a paused VM, SIGSTOP), the descriptor must still
+            not be closed under it: `end()` hands the connection over to
+            this object, the server skips its close
+            (`ApiServer.shutdown_request`), and the last call to leave closes
+            it (`_leave`). The worst case is a descriptor held for as long as
+            the stall lasts, never a reused one.
+
+            `upgraded` is set at the first write (the `101`): from then on
+            the connection carries the websocket stream, and no HTTP response
+            may be written on it (`ApiRequestHandler.send_response`).
+
+            Writes are serialised by one lock (`SSL_write` must never run on
+            one SSL object from two threads; the reader's control-frame
+            replies and the route's sends would otherwise be able to
+            overlap) and are always complete (`sendall`: simple-websocket
+            ignores `send`'s count). Reads are not locked: the reader blocks
+            in `recv` for the whole session, and it is the only reader --
+            the post-response drain never reads a websocket request
+            (`_DeadlineReader._drain_into`).
+
+            Only what simple-websocket and `api._end_websocket` use is
+            offered; anything else fails loudly rather than bypassing the
+            write lock or the descriptor accounting."""
+
+            def __init__(self, tls):
+                self._tls = tls
+                self._write_lock = threading.Lock()
+                self._state = threading.Condition(threading.Lock())
+                #: Calls currently inside `self._tls` (reads and writes).
+                self._busy = 0
+                self._ended = False
+                #: `end()` failed: the last call to leave closes `self._tls`.
+                self._close_when_idle = False
+                #: Something was written (the `101`): the session is upgraded.
+                self.upgraded = False
+
+            def _enter(self) -> bool:
+                with self._state:
+                    if self._ended:
+                        return False
+                    self._busy += 1
+                    return True
+
+            def _leave(self) -> None:
+                with self._state:
+                    self._busy -= 1
+                    if self._busy:
+                        return
+                    self._state.notify_all()
+                    close, self._close_when_idle = self._close_when_idle, False
+                if close:
+                    # The connection was handed over by a failed `end()`.
+                    try:
+                        self._tls.close()
+                    except OSError:
+                        pass
+
+            def recv(self, bufsize, flags=0):
+                if not self._enter():
+                    return b''                 # EOF: the session is over
+                try:
+                    return self._tls.recv(bufsize, flags)
+                finally:
+                    self._leave()
+
+            def sendall(self, data, flags=0) -> None:
+                with self._write_lock:
+                    if not self._enter():
+                        raise BrokenPipeError(errno.EPIPE, "the websocket session has ended")
+                    # Before the write: even a failed one may have put bytes
+                    # of the `101` on the wire.
+                    self.upgraded = True
+                    try:
+                        self._tls.sendall(data, flags)
+                    finally:
+                        self._leave()
+
+            def send(self, data, flags=0) -> int:
+                self.sendall(data, flags)
+                return memoryview(data).nbytes
+
+            def fileno(self) -> int:
+                return self._tls.fileno()      # simple-websocket's ping selector
+
+            def close(self) -> None:
+                """simple-websocket's reader closes the socket as it leaves;
+                the connection is the server's to close (after `end()`)."""
+
+            def force_eof(self) -> None:
+                """Shut the connection down at the OS level, so a `recv` or
+                `sendall` blocked on a silent peer returns at once. A plain
+                `socket.shutdown` (a kernel call, no TLS record written, and
+                the descriptor stays open): `SSLSocket.shutdown` would drop
+                the TLS object from under a thread inside it. Never raises."""
+                try:
+                    socket.socket.shutdown(self._tls, socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+            def end(self, timeout: float) -> bool:
+                """Refuse new I/O (a `recv` is EOF, a write `EPIPE`), then
+                wait up to `timeout` for the calls in progress to leave on
+                their own, then `force_eof()` and wait up to `timeout` again.
+                -> True: nothing is inside the socket any more, the caller
+                closes the connection. False: a call is still inside; the
+                connection now belongs to this object, which closes it when
+                the last call leaves, and the caller must NOT close it."""
+                with self._state:
+                    self._ended = True
+                    if self._state.wait_for(lambda: not self._busy, timeout):
+                        return True
+                log.debug("API: the websocket reader is still waiting on a silent "
+                          "peer; shutting the connection down")
+                self.force_eof()
+                with self._state:
+                    if self._state.wait_for(lambda: not self._busy, timeout):
+                        return True
+                    self._close_when_idle = True
+                    return False
 
         class _ResponseWriter(io.BufferedIOBase):
             """The handler's `wfile`: passes writes through, except while the
@@ -912,8 +1088,12 @@ def _api_server_class():
             drain_ended: bool = False
             #: The drain's own absolute deadline, set at its first read.
             drain_deadline: Optional[float] = None
+            #: Bytes of an unread request body the drain has discarded.
+            drained_bytes: int = 0
             #: Drop everything written to `wfile` (see `send_response`).
             discard_response: bool = False
+            #: A websocket request's `_SessionSocket` (`make_environ`).
+            session_socket: Optional[_SessionSocket] = None
 
             def setup(self):
                 super().setup()
@@ -931,21 +1111,38 @@ def _api_server_class():
                 self.response_started = False
                 self.drain_ended = False
                 self.drain_deadline = None
+                self.drained_bytes = 0
                 self.discard_response = False
+                self.session_socket = None
                 self._arm()
                 return super().handle_one_request()
 
+            def make_environ(self):
+                environ = super().make_environ()
+                if self.is_websocket_request():
+                    # See `_SessionSocket`; ended in `run_wsgi`.
+                    self.session_socket = _SessionSocket(self.connection)
+                    environ['werkzeug.socket'] = self.session_socket
+                return environ
+
             def send_response(self, code, message=None):
                 self.response_started = True
-                if code == 200 and self.is_websocket_request():
+                session = self.session_socket
+                if (code == 200 and self.is_websocket_request()) or (
+                    session is not None and session.upgraded
+                ):
                     # flask-sock's response to werkzeug once a websocket
                     # session has ended (its `101` went out on the socket
                     # directly; refusals before the upgrade are 4xx/5xx and
-                    # are written). After a `101` it is protocol garbage, and
-                    # writing it raced simple-websocket's reader thread on the
-                    # same `SSLSocket`: once a client reset had failed the
-                    # reader's `SSL_read`, the write raised `ssl.SSLError`
-                    # ("Error on request"). It is logged as usual, never sent.
+                    # are written) -- or ANY response after the `101`, such
+                    # as werkzeug's 500 for a websocket route that raised.
+                    # After a `101` it is protocol garbage inside the
+                    # websocket stream, and `wfile` is the raw `SSLSocket`,
+                    # outside the session's write lock: it would race
+                    # simple-websocket's reader thread (once a client reset
+                    # had failed the reader's `SSL_read`, the write raised
+                    # `ssl.SSLError`, "Error on request"). It is logged as
+                    # usual, never sent.
                     self.discard_response = True
                 super().send_response(code, message)
 
@@ -979,7 +1176,25 @@ def _api_server_class():
                         pass
                 else:
                     self._arm()
-                return super().run_wsgi()
+                try:
+                    return super().run_wsgi()
+                finally:
+                    session = self.session_socket
+                    if session is not None:
+                        # Before the connection is closed (`finish`,
+                        # `shutdown_request`): no thread may still be inside
+                        # its `SSLSocket` then (`_SessionSocket`).
+                        self.close_connection = True
+                        timeout = getattr(self.server, 'ws_end_timeout', API_WS_END_TIMEOUT)
+                        if not session.end(timeout):
+                            # The session now owns the connection and closes
+                            # it when the reader leaves; the server must not.
+                            self.server.connection_state.handed_over = self.connection
+                            log.warning(
+                                "API: a websocket reader thread from %s did not leave "
+                                "its connection; it will be closed when the reader "
+                                "returns", self.client_address,
+                            )
 
             def log_error(self, format, *args):
                 # An idle keep-alive connection reaching its timeout is
@@ -997,7 +1212,19 @@ def _api_server_class():
                 request_idle_timeout: float = API_REQUEST_IDLE_TIMEOUT,
                 drain_timeout: float = API_DRAIN_TIMEOUT,
                 max_anonymous: int = API_MAX_ANONYMOUS_CONNECTIONS,
+                reject_linger: float = API_REJECT_LINGER,
+                ws_end_timeout: float = API_WS_END_TIMEOUT,
             ):
+                if (
+                    isinstance(ws_end_timeout, bool)
+                    or not isinstance(ws_end_timeout, (int, float))
+                    or not math.isfinite(ws_end_timeout)
+                    or ws_end_timeout <= 0
+                ):
+                    raise ValueError(
+                        f"ws_end_timeout must be a finite number of seconds > 0, "
+                        f"not {ws_end_timeout!r}"
+                    )
                 current = getattr(gateway, 'current_context', None)
                 context = current() if callable(current) else None
                 if not isinstance(context, ssl.SSLContext):
@@ -1009,6 +1236,8 @@ def _api_server_class():
                 self.handshake_timeout = handshake_timeout
                 self.request_idle_timeout = request_idle_timeout
                 self.drain_timeout = drain_timeout
+                self.reject_linger = reject_linger
+                self.ws_end_timeout = ws_end_timeout
                 self.max_connections = max_connections
                 self._slots = threading.BoundedSemaphore(max_connections)
                 self.max_anonymous = max_anonymous
@@ -1071,7 +1300,7 @@ def _api_server_class():
                         tls.settimeout(None)
                     except Exception as exc:  # SSLError, TimeoutError, OSError
                         log.debug("API: TLS handshake with %s failed: %s", client_address, exc)
-                        self._close_tls(tls)
+                        self._close_after_failed_handshake(tls)
                         return
                     pinned = self._is_pinned(tls)
                     if not pinned and not self._anonymous_slots.acquire(blocking=False):
@@ -1089,14 +1318,24 @@ def _api_server_class():
                         self._close_tls(tls)
                         return
                     self.connection_state.pinned = pinned
+                    self.connection_state.handed_over = None
                     try:
                         super().process_request_thread(tls, client_address)
                     finally:
                         self.connection_state.pinned = True
+                        self.connection_state.handed_over = None
                         if not pinned:
                             self._anonymous_slots.release()
                 finally:
                     self._slots.release()
+
+            def shutdown_request(self, request):
+                # A connection a websocket session took over (its reader was
+                # still inside it, `_SessionSocket.end`) is closed by the
+                # session when the reader leaves -- never here, under it.
+                if request is getattr(self.connection_state, 'handed_over', None):
+                    return
+                super().shutdown_request(request)
 
             def _is_pinned(self, tls) -> bool:
                 """Whether the peer presented a certificate the gateway has
@@ -1121,6 +1360,42 @@ def _api_server_class():
                     tls.close()
                 except OSError:
                     pass
+
+            def _close_after_failed_handshake(self, tls) -> None:
+                """Close a connection whose handshake failed so that the TLS
+                alert OpenSSL sent reaches the peer.
+
+                Under TLS 1.3 a client's handshake is complete before the
+                server has checked its certificate, so the client sends its
+                request right away. A rejection (an unpinned or expired
+                certificate) arrives as an alert, and an immediate `close()`
+                answers every byte the client sends after that with a TCP
+                reset, which can discard the alert unread. The client then
+                sees a reset, or, on CPython 3.11/3.12 with OpenSSL 3.0, an
+                `SSLEOFError` ("EOF occurred in violation of protocol"),
+                instead of the rejection. So: half-close (a FIN after the
+                alert), read and discard what the peer still sends until it
+                closes or `reject_linger` seconds pass, then close."""
+                linger = getattr(self, 'reject_linger', None)
+                if not linger:
+                    self._close_tls(tls)
+                    return
+                try:
+                    # `SSLSocket.shutdown` drops the TLS layer: from here on
+                    # `recv` is the plain socket's.
+                    tls.shutdown(socket.SHUT_WR)
+                    deadline = time.monotonic() + linger
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        tls.settimeout(remaining)
+                        if not tls.recv(65536):
+                            break
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    self._close_tls(tls)
 
         _API_SERVER_CLASS = ApiServer
     return _API_SERVER_CLASS

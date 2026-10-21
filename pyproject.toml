@@ -19,6 +19,9 @@ pyyaml = "^6.0"
 # libzfs = {git = "https://gitlab.vibfolks.eu/rejsmont/py-libzfs.git"}
 flask = "^3.1.3"
 flask-sock = "^0.7.0"
+# zfsbackup.workers._SessionSocket stands in for the socket simple-websocket
+# 1.1 uses (send/recv/close/fileno): re-check it before widening this.
+simple-websocket = ">=1.1,<1.2"
 websocket-client = "^1.9.0"
 sqlalchemy = "^2.0"
 alembic = "^1.13"

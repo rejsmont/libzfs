@@ -2692,6 +2692,7 @@ class TestTheQuietFilterPinsNoEngine:
         print("done")
     ''')
 
+    # Also pins `_liveconn`'s "no `__del__`" rule (TrackedConnection must not finalise pooled connections).
     @pytest.mark.parametrize("mode", ["imported_only", "checked"])
     def test_a_process_that_exits_without_dispose_all_leaves_no_sidecars(self, tmp_path, mode):
         yaml_path = tmp_path / "in.yaml"

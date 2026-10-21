@@ -17,6 +17,9 @@ is never reached (`zfs.exists` is an in-memory stub).
                                 NEVER sent
 - ``TestServerAnswers``         every answer mapped to an exit code and a message
 - ``TestTransport``             unreachable, timeout, a plaintext peer, resets
+- ``TestSslEof``               a close with no TLS alert (`ssl.SSLEOFError`) is a reset, never a
+                                local verification failure: `_classify` / `_is_reset`, and `enroll`
+                                against a server that closes that way
 - ``TestSecrecy``               the token appears only in the request body
 - ``TestPermissions``           an identity problem exits 1 with no database write
 - ``TestFailureAfterTheClientId`` the generated id is committed first: one reload on failure
@@ -36,6 +39,7 @@ file plus `test_zfsbackup_cli_reload.py`'s enroll/rotate cases): see the hand-of
 import json
 import os
 import re
+import ssl
 import stat
 import subprocess
 import sys
@@ -43,6 +47,8 @@ import types
 from pathlib import Path
 
 import pytest
+import requests
+import urllib3
 
 from _cli_support import (
     PLAIN_YAML,
@@ -908,6 +914,271 @@ class TestTransport:
         before = db_state(client)
         result = do_enroll(run, client, "http://127.0.0.1:1", token)
         assert result.exit_code == 1 and "plaintext http" in result.stderr
+        untouched(client, before, reloads)
+
+
+# --------------------------------------------------------------------------
+# A close without a TLS alert is a reset, not a TLS failure
+# --------------------------------------------------------------------------
+
+
+def _eof() -> ssl.SSLEOFError:
+    return ssl.SSLEOFError(8, "EOF occurred in violation of protocol (_ssl.c:1016)")
+
+
+def _verify_failure() -> ssl.SSLCertVerificationError:
+    return ssl.SSLCertVerificationError(1, "certificate verify failed: self-signed certificate")
+
+
+def _alert(name: str) -> ssl.SSLError:
+    err = ssl.SSLError(1, f"[SSL: {name}] ssl/tls alert")
+    err.reason = name
+    return err
+
+
+def _max_retry(reason) -> urllib3.exceptions.MaxRetryError:
+    return urllib3.exceptions.MaxRetryError(None, "/whoami", reason=reason)
+
+
+def _requests_ssl_error(inner) -> requests.exceptions.SSLError:
+    return requests.exceptions.SSLError(inner)
+
+
+def _caused_by(outer: BaseException, cause: BaseException) -> BaseException:
+    outer.__cause__ = cause
+    return outer
+
+
+def _in_context(outer: BaseException, inner: BaseException) -> BaseException:
+    """`outer`, raised while `inner` was being handled (so `inner` is its `__context__`)."""
+    try:
+        try:
+            raise inner
+        except ssl.SSLError:
+            raise outer
+    except BaseException as exc:  # noqa: BLE001 - the chain is the point
+        return exc
+
+
+#: The same SSLEOFError, reached the ways requests / urllib3 / the stdlib carry it.
+EOF_CHAINS = {
+    "bare": lambda: _eof(),
+    "requests-args": lambda: _requests_ssl_error(_eof()),
+    "requests-maxretry-reason-urllib3-args": lambda: _requests_ssl_error(
+        _max_retry(urllib3.exceptions.SSLError(_eof()))
+    ),
+    "maxretry-reason-is-the-eof": lambda: _requests_ssl_error(_max_retry(_eof())),
+    "urllib3-ssl-error-args": lambda: _requests_ssl_error(urllib3.exceptions.SSLError(_eof())),
+    "cause": lambda: _caused_by(requests.exceptions.SSLError("wrapped"), _eof()),
+    "context": lambda: _in_context(requests.exceptions.SSLError("wrapped"), _eof()),
+    "oserror-with-cause": lambda: _caused_by(OSError("connection problem"), _eof()),
+}
+
+
+class TestSslEof:
+    @pytest.mark.parametrize("name", list(EOF_CHAINS))
+    def test_classify_reads_an_ssl_eof_as_a_reset(self, name):
+        failure = enroll_cli._classify(EOF_CHAINS[name]())
+        assert (failure.kind, failure.reset) == ("unreachable", True)
+
+    @pytest.mark.parametrize("name", list(EOF_CHAINS))
+    def test_is_ssl_eof_and_is_reset_both_see_it(self, name):
+        exc = EOF_CHAINS[name]()
+        assert enroll_cli._is_ssl_eof(exc) is True
+        assert enroll_cli._is_reset(exc) is True
+
+    def test_the_eof_is_checked_before_the_generic_tls_branch(self):
+        exc = _requests_ssl_error(_max_retry(urllib3.exceptions.SSLError(_eof())))
+        assert isinstance(exc, requests.exceptions.SSLError)        # it WOULD have been "tls"
+        assert enroll_cli._classify(exc).kind == "unreachable"
+
+    def test_the_reason_text_is_kept_for_the_message(self):
+        failure = enroll_cli._classify(_requests_ssl_error(_eof()))
+        assert "EOF occurred in violation of protocol" in failure.detail
+
+    @pytest.mark.parametrize("build", [
+        lambda: _requests_ssl_error(_max_retry(urllib3.exceptions.SSLError(_verify_failure()))),
+        lambda: _requests_ssl_error(_verify_failure()),
+        lambda: _verify_failure(),
+        # an eof is somewhere in the chain as well: the local verification failure wins
+        lambda: _caused_by(_requests_ssl_error(_verify_failure()), _eof()),
+        lambda: _caused_by(_requests_ssl_error(_eof()), _verify_failure()),
+        lambda: _caused_by(_requests_ssl_error(_max_retry(urllib3.exceptions.SSLError(_eof()))),
+                           _verify_failure()),
+    ], ids=["maxretry-verify", "args-verify", "bare-verify", "verify-over-eof-cause",
+            "eof-over-verify-cause", "maxretry-eof-over-verify-cause"])
+    def test_a_local_verification_failure_is_never_a_reset(self, build):
+        exc = build()
+        assert enroll_cli._is_ssl_eof(exc) is False
+        assert enroll_cli._is_reset(exc) is False
+        failure = enroll_cli._classify(exc)
+        assert failure.reset is False
+        if isinstance(exc, requests.exceptions.SSLError):
+            assert failure.kind == "tls"
+
+    def test_a_plain_ssl_error_without_an_eof_is_still_tls(self):
+        exc = _requests_ssl_error(ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number"))
+        failure = enroll_cli._classify(exc)
+        assert (failure.kind, failure.reset) == ("tls", False)
+        assert enroll_cli._is_ssl_eof(exc) is False and enroll_cli._is_reset(exc) is False
+
+    def test_a_pin_mismatch_keeps_its_classification(self):
+        exc = _requests_ssl_error(_max_retry(urllib3.exceptions.SSLError(
+            "Fingerprints did not match. Expected 'aa', got \"" + "ab" * 32 + "\""
+        )))
+        failure = enroll_cli._classify(exc)
+        assert failure.kind == "pin" and failure.actual == "ab" * 32
+
+    def test_a_pin_mismatch_wins_over_an_eof_in_the_same_chain(self):
+        exc = _caused_by(identity.PinMismatch("aa" * 32, "bb" * 32), _eof())
+        assert enroll_cli._classify(exc).kind == "pin"
+
+    @pytest.mark.parametrize("alert", [
+        "TLSV1_ALERT_UNKNOWN_CA", "TLS_ALERT_UNKNOWN_CA", "SSLV3_ALERT_BAD_CERTIFICATE",
+        "TLSV1_ALERT_CERTIFICATE_EXPIRED", "TLSV1_ALERT_UNSUPPORTED_CERTIFICATE",
+    ])
+    def test_a_tls_alert_rejection_keeps_its_classification(self, alert):
+        failure = enroll_cli._classify(_requests_ssl_error(_max_retry(_alert(alert))))
+        assert (failure.kind, failure.reset) == ("rejected", False)
+
+    def test_a_tls_alert_wins_over_an_eof_in_the_same_chain(self):
+        exc = _caused_by(_requests_ssl_error(_alert("TLSV1_ALERT_UNKNOWN_CA")), _eof())
+        assert enroll_cli._classify(exc).kind == "rejected"
+
+    @pytest.mark.parametrize("exc", [
+        ConnectionResetError(104, "Connection reset by peer"),
+        BrokenPipeError(32, "Broken pipe"),
+        _requests_ssl_error(_max_retry(urllib3.exceptions.ProtocolError(
+            "Connection aborted.", ConnectionResetError(104, "reset")))),
+    ], ids=["reset", "pipe", "wrapped-reset"])
+    def test_the_old_resets_are_still_resets(self, exc):
+        assert enroll_cli._is_reset(exc) is True
+        assert enroll_cli._is_ssl_eof(exc) is False
+
+    def test_other_errors_are_not_resets(self):
+        assert enroll_cli._is_reset(requests.exceptions.ConnectTimeout("slow")) is False
+        assert enroll_cli._is_reset(ConnectionRefusedError(111, "refused")) is False
+
+    # -- the whole command, with the transport failing the way CI saw it. A real server cannot
+    #    be made to fail like this on demand: whether the rejection arrives as an alert, a reset
+    #    or an SSLEOFError is a race inside OpenSSL, so the adapter raises what requests raised.
+
+    @pytest.fixture
+    def eof_on(self, monkeypatch):
+        """`eof_on(path, times)`: the first `times` requests for `path` fail with the exception
+        requests raised on CI (SSLError > MaxRetryError > urllib3 SSLError > SSLEOFError) before
+        any byte is sent. Returns the list of paths it failed."""
+        import requests.adapters
+
+        real = requests.adapters.HTTPAdapter.send
+        plan = {}
+        failed = []
+
+        def send(self, request, *args, **kwargs):
+            path = request.path_url
+            if plan.get(path, 0) > 0:
+                plan[path] -= 1
+                failed.append(path)
+                raise requests.exceptions.SSLError(
+                    _max_retry(urllib3.exceptions.SSLError(_eof())), request=request
+                )
+            return real(self, request, *args, **kwargs)
+
+        monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+
+        def arm(path, times):
+            plan[path] = times
+            return failed
+
+        return arm
+
+    def test_a_first_enroll_whose_whoami_ends_in_ssl_eof_goes_on_as_untrusted(
+        self, run, client, reloads, make_server, eof_on
+    ):
+        """The CI failure: the server turns the unpinned certificate away, the client sees
+        SSLEOFError instead of an alert, and `enroll` used to exit 1."""
+        srv = make_server()
+        failed = eof_on("/whoami", 99)
+        token = srv.token()
+        gen = generation(client)
+        result = do_enroll(run, client, srv, token)
+        assert result.exit_code == 0, result.stderr
+        assert failed == ["/whoami", "/whoami"]                       # one retry, then untrusted
+        assert srv.paths() == ["/enroll"]
+        assert dest(client).server_fingerprint == srv.fp
+        assert generation(client) == gen + 1 and len(reloads) == 1
+        assert secret_of(token) not in everything(result)
+
+    def test_one_ssl_eof_on_whoami_is_retried_and_the_second_answer_counts(
+        self, run, client, reloads, make_server, eof_on
+    ):
+        srv = make_server()
+        assert do_enroll(run, client, srv, srv.token()).exit_code == 0
+        reloads.clear()
+        srv.log.clear()
+        failed = eof_on("/whoami", 1)
+        fresh = srv.token()
+        before = db_state(client)
+        result = do_enroll(run, client, srv, fresh, fname="fresh")
+        assert result.exit_code == 0, result.stderr
+        assert failed == ["/whoami"] and srv.paths() == ["/whoami"]   # the retry saw "trusted"
+        assert "the token was not used" in result.stdout
+        untouched(client, before, reloads)
+
+    def test_two_ssl_eofs_with_a_trusting_server_end_in_already_trusted_not_in_a_spent_token(
+        self, run, client, reloads, make_server, eof_on
+    ):
+        srv = make_server()
+        assert do_enroll(run, client, srv, srv.token()).exit_code == 0
+        reloads.clear()
+        srv.log.clear()
+        failed = eof_on("/whoami", 2)
+        fresh = srv.token()
+        before = db_state(client)
+        result = do_enroll(run, client, srv, fresh, fname="fresh")
+        assert result.exit_code == 0, result.stderr
+        assert failed == ["/whoami", "/whoami"] and srv.paths() == ["/enroll"]
+        assert srv.token_state() == "active"                          # already_trusted: not spent
+        untouched(client, before, reloads)
+
+    def test_ssl_eof_everywhere_is_retryable_with_the_token_unspent(
+        self, run, client, reloads, make_server, eof_on
+    ):
+        srv = make_server()
+        failed = eof_on("/whoami", 99)
+        eof_on("/enroll", 99)
+        before = db_state(client)
+        result = do_enroll(run, client, srv, srv.token())
+        assert result.exit_code == 75, result.stderr
+        assert failed.count("/whoami") == 2 and failed.count("/enroll") == 1   # POST: no retry
+        assert srv.log == [] and srv.token_state() == "active"
+        untouched(client, before, reloads)
+
+    def test_a_local_verification_failure_on_whoami_is_neither_retried_nor_ignored(
+        self, run, client, reloads, make_server, monkeypatch
+    ):
+        import requests.adapters
+
+        srv = make_server()
+        real = requests.adapters.HTTPAdapter.send
+        calls = []
+
+        def send(self, request, *args, **kwargs):
+            if request.path_url == "/whoami":
+                calls.append(1)
+                raise requests.exceptions.SSLError(
+                    _max_retry(urllib3.exceptions.SSLError(_caused_by(_verify_failure(), _eof()))),
+                    request=request,
+                )
+            return real(self, request, *args, **kwargs)
+
+        monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+        before = db_state(client)
+        result = do_enroll(run, client, srv, srv.token())
+        assert result.exit_code == 1, result.stderr
+        assert "TLS failure" in result.stderr
+        assert calls == [1]                                           # no retry
+        assert srv.paths() == []                                      # and the token was not sent
         untouched(client, before, reloads)
 
 

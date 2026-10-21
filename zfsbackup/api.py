@@ -165,7 +165,12 @@ def _end_websocket(ws) -> None:
     the socket down at the OS level (a plain `socket.shutdown`: the
     `SSLSocket` is left as it is, so its TLS object is not pulled from under
     the reader) and waits once more. Bounded and quiet: never raises, and a
-    reader that still does not leave is left to the connection's close."""
+    reader that still does not leave is left to the connection's close.
+
+    Under the API worker's server `ws.sock` is not the `SSLSocket` but its
+    `workers._SessionSocket` wrapper (serialised writes; the server itself
+    waits for the reader before it closes the connection), whose
+    `force_eof()` is the same plain `socket.shutdown`."""
     with contextlib.suppress(Exception):
         ws.close()
     thread = getattr(ws, 'thread', None)
@@ -176,13 +181,17 @@ def _end_websocket(ws) -> None:
     if not thread.is_alive():
         return
     sock = getattr(ws, 'sock', None)
-    if isinstance(sock, socket.socket):
-        logger.debug("stream: the websocket reader is still waiting on a silent peer; "
-                     "shutting the socket down")
-        with contextlib.suppress(OSError):
-            socket.socket.shutdown(sock, socket.SHUT_RDWR)
-        with contextlib.suppress(RuntimeError):
-            thread.join(WS_READER_JOIN_TIMEOUT)
+    force_eof = getattr(sock, 'force_eof', None)
+    if not callable(force_eof):
+        if not isinstance(sock, socket.socket):
+            return
+        force_eof = functools.partial(socket.socket.shutdown, sock, socket.SHUT_RDWR)
+    logger.debug("stream: the websocket reader is still waiting on a silent peer; "
+                 "shutting the socket down")
+    with contextlib.suppress(OSError):
+        force_eof()
+    with contextlib.suppress(RuntimeError):
+        thread.join(WS_READER_JOIN_TIMEOUT)
 
 
 class _BadDatasetName(ValueError):

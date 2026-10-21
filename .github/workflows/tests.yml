@@ -21,7 +21,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     # A wedged fork test must not burn hours. The suite takes ~14 min on a
     # laptop (real-daemon, forkserver and sd_notify tests), so allow headroom.
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     strategy:
       # When one version breaks, we need to know whether it is that
@@ -112,7 +112,7 @@ jobs:
   test-sqlalchemy-21:
     name: py${{ matrix.python }} / SQLAlchemy 2.1
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

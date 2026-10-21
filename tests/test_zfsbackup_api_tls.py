@@ -18,6 +18,10 @@ Layout
   `store.trust` call is serialised (and the lock is fresh after a fork).
 * `TestConnectionLimits` -- the total cap, the anonymous cap, the absolute request
   deadline (a dribbling peer is cut off), pinned versus anonymous after the app starts.
+* `TestRejectLinger` -- after a failed handshake the connection is half-closed and the peer's
+  bytes are discarded until it closes or `reject_linger` passes, so a TLS 1.3 client that
+  finished its handshake first reads the rejection alert instead of an EOF or a reset; 0 closes
+  at once; slots come back; a successful handshake never lingers.
 * `TestTrustPollThread` / `TestApiWorkerRestartOnIdentityChange` /
   `TestApiStartSweepAndSetupFailures` -- the API worker's own threads and exits.
 * `TestRealApiWorker` -- a real `ApiWorker` process under fork, spawn and forkserver
@@ -1751,6 +1755,373 @@ class TestConnectionLimits:
         with Serving(self._body_length_app, pki.gateway, request_idle_timeout=1.0) as s:
             data = self._slow_post(s.port, None)
         assert not data.endswith(b"10")                      # cut off before the body completed
+
+
+# ===========================================================================
+# Failed handshakes: the reject linger
+# ===========================================================================
+
+
+def _unpinned_request(port, ctx, delay=0.0):
+    """What an unpinned client sees: it finishes its (TLS 1.3) handshake, waits `delay`, sends a
+    GET and reads. -> the exception it got, or the bytes it read. The delay is what makes a lost
+    alert deterministic: the server has rejected the certificate by the time the client writes,
+    and a server that closed outright answers that write with a reset."""
+    raw = socket.create_connection((LOOPBACK, port), timeout=IO_TIMEOUT)
+    tls = ctx.wrap_socket(raw)
+    try:
+        if delay:
+            time.sleep(delay)
+        tls.sendall(b"GET /whoami HTTP/1.1\r\nHost: x\r\n\r\n")
+        return tls.recv(4096)
+    except Exception as exc:                  # SSLError, OSError
+        return exc
+    finally:
+        tls.close()
+
+
+def _slots(server):
+    return server._slots._value, server._anonymous_slots._value
+
+
+def _all_slots_free(server):
+    return _slots(server) == (server.max_connections, server.max_anonymous)
+
+
+def _time_until_free(server, started, limit):
+    """Seconds from `started` until every slot of `server` is back, or None within `limit`."""
+    deadline = started + limit
+    while time.monotonic() < deadline:
+        if _all_slots_free(server):
+            return time.monotonic() - started
+        time.sleep(0.01)
+    return time.monotonic() - started if _all_slots_free(server) else None
+
+
+def _handshaken_unpinned(port, ctx):
+    """An unpinned client with its handshake done and nothing sent. -> the TLS socket."""
+    raw = socket.create_connection((LOOPBACK, port), timeout=IO_TIMEOUT)
+    return ctx.wrap_socket(raw)
+
+
+@pytest.mark.integration
+class TestRejectLinger:
+    DELAYS = [0.0, 0.01, 0.05, 0.1, 0.2]
+
+    # -- the constant and the keyword ----------------------------------------
+
+    def test_the_default_is_one_second(self):
+        assert workers.API_REJECT_LINGER == 1.0
+
+    def test_the_keyword_is_keyword_only_and_defaults_to_the_constant(self):
+        import inspect
+
+        param = inspect.signature(workers._api_server_class().__init__).parameters["reject_linger"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default == workers.API_REJECT_LINGER
+
+    @pytest.mark.parametrize("kwargs, expected", [({}, 1.0), ({"reject_linger": 0.25}, 0.25),
+                                                  ({"reject_linger": 0}, 0)])
+    def test_a_server_stores_the_value(self, pki, kwargs, expected):
+        server = workers._api_server_class()(LOOPBACK, 0, echo_app, pki.gateway, **kwargs)
+        try:
+            assert server.reject_linger == expected
+        finally:
+            server.server_close()
+
+    def test_the_bound_api_server_uses_the_default(self, pki):
+        server = workers._bind_api_server(echo_app, LOOPBACK, 0, pki.gateway)
+        try:
+            assert server.reject_linger == workers.API_REJECT_LINGER
+        finally:
+            server.server_close()
+
+    # -- the alert reaches a client that writes late -------------------------
+
+    @pytest.mark.parametrize("delay", DELAYS)
+    def test_an_unpinned_client_that_writes_after_a_delay_reads_the_alert(self, pki, delay):
+        """The point of the linger. Without it the server's `close()` answers the client's
+        write with a reset, which can discard the alert unread: the client then sees a
+        `BrokenPipeError`, `ConnectionResetError` or `SSLEOFError`."""
+        pki.pin_alice()
+        ctx = insecure_client_context(pki.mallory)
+        with Serving(echo_app, pki.gateway) as s:
+            results = [_unpinned_request(s.port, ctx, delay) for _ in range(6)]
+        for result in results:
+            assert isinstance(result, Exception), result
+            assert identity.is_tls_alert_rejection(result), repr(result)
+
+    def test_the_alert_is_read_by_clients_that_write_at_different_times_at_once(self, pki):
+        pki.pin_alice()
+        ctx = insecure_client_context(pki.mallory)
+        results = []
+        lock = threading.Lock()
+
+        def one(delay):
+            result = _unpinned_request(s.port, ctx, delay)
+            with lock:
+                results.append(result)
+
+        with Serving(echo_app, pki.gateway) as s:
+            threads = [threading.Thread(target=one, args=(d,)) for d in self.DELAYS * 3]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+        assert len(results) == len(threads)
+        assert all(isinstance(r, Exception) and identity.is_tls_alert_rejection(r)
+                   for r in results), [repr(r) for r in results]
+
+    def test_the_server_is_still_fine_afterwards(self, pki):
+        pki.pin_alice()
+        with Serving(echo_app, pki.gateway) as s:
+            for _ in range(3):
+                assert isinstance(_unpinned_request(s.port, insecure_client_context(pki.mallory),
+                                                    0.05), Exception)
+            assert https_get(s.port, "/", insecure_client_context(pki.alice))[0] == 200
+            assert https_get(s.port, "/")[0] == 200
+
+    # -- how long the linger lasts -------------------------------------------
+
+    def test_the_linger_ends_when_the_client_closes(self, pki):
+        """A long bound, a client that closes at once: the server does not wait for the bound."""
+        pki.pin_alice()
+        ctx = insecure_client_context(pki.mallory)
+        with Serving(echo_app, pki.gateway, reject_linger=30.0) as s:
+            started = time.monotonic()
+            result = _unpinned_request(s.port, ctx, 0.05)          # closes when it has the alert
+            assert identity.is_tls_alert_rejection(result), repr(result)
+            freed = _time_until_free(s.server, started, 5.0)
+        assert freed is not None and freed < 3.0, freed
+
+    def test_a_silent_client_is_held_for_the_linger_and_no_longer(self, pki):
+        """It is a linger, not an immediate close, and not an unbounded one: a client that
+        does not write and does not close is released at `reject_linger`."""
+        pki.pin_alice()
+        linger = 1.0
+        with Serving(echo_app, pki.gateway, reject_linger=linger) as s:
+            sock = _handshaken_unpinned(s.port, insecure_client_context(pki.mallory))
+            try:
+                started = time.monotonic()
+                time.sleep(0.2)                                   # the server has rejected it
+                assert not _all_slots_free(s.server), "closed at once: no linger"
+                freed = _time_until_free(s.server, started, linger + 3.0)
+            finally:
+                sock.close()
+        assert freed is not None, "a silent client was held beyond the linger"
+        assert linger * 0.8 <= freed <= linger + 1.5, freed
+
+    def test_a_client_that_keeps_writing_is_still_cut_off_at_the_linger(self, pki):
+        """The bound is absolute, not 'since the last byte'."""
+        pki.pin_alice()
+        linger = 0.8
+        with Serving(echo_app, pki.gateway, reject_linger=linger) as s:
+            tls = _handshaken_unpinned(s.port, insecure_client_context(pki.mallory))
+            raw = socket.socket(fileno=tls.detach())
+            try:
+                started = time.monotonic()
+                freed = None
+                while time.monotonic() - started < linger + 3.0:
+                    try:
+                        raw.sendall(b"x" * 64)
+                    except OSError:
+                        pass                                      # the server has closed
+                    if _all_slots_free(s.server):
+                        freed = time.monotonic() - started
+                        break
+                    time.sleep(0.05)
+            finally:
+                raw.close()
+        assert freed is not None, "a dribbling client held the connection beyond the linger"
+        assert linger * 0.8 <= freed <= linger + 1.5, freed
+
+    def test_a_client_that_closes_mid_linger_frees_the_slot_at_once(self, pki):
+        pki.pin_alice()
+        with Serving(echo_app, pki.gateway, reject_linger=30.0) as s:
+            sock = _handshaken_unpinned(s.port, insecure_client_context(pki.mallory))
+            time.sleep(0.2)
+            assert not _all_slots_free(s.server)
+            started = time.monotonic()
+            sock.close()
+            freed = _time_until_free(s.server, started, 5.0)
+        assert freed is not None and freed < 3.0, freed
+
+    def test_a_reset_by_the_client_mid_linger_frees_the_slot(self, pki):
+        import struct
+
+        pki.pin_alice()
+        with Serving(echo_app, pki.gateway, reject_linger=30.0) as s:
+            sock = _handshaken_unpinned(s.port, insecure_client_context(pki.mallory))
+            time.sleep(0.2)
+            started = time.monotonic()
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            sock.close()
+            freed = _time_until_free(s.server, started, 5.0)
+        assert freed is not None and freed < 3.0, freed
+
+    # -- reject_linger=0 -----------------------------------------------------
+
+    def test_zero_closes_immediately(self, pki):
+        pki.pin_alice()
+        with Serving(echo_app, pki.gateway, reject_linger=0) as s:
+            sock = _handshaken_unpinned(s.port, insecure_client_context(pki.mallory))
+            try:
+                started = time.monotonic()
+                freed = _time_until_free(s.server, started, 5.0)
+                assert freed is not None and freed < 1.0, "a silent client was held with no linger"
+                # the connection is gone for the client too: EOF, a reset or the alert
+                assert _closed_by_peer_or_alert(sock)
+            finally:
+                sock.close()
+
+    # -- slots ---------------------------------------------------------------
+
+    def test_slots_are_released_after_many_rejections(self, pki):
+        pki.pin_alice()
+        ctx = insecure_client_context(pki.mallory)
+        with Serving(echo_app, pki.gateway, max_connections=4, reject_linger=0.3) as s:
+            for i in range(24):                                   # six times the cap
+                assert isinstance(_unpinned_request(s.port, ctx, 0.02 if i % 2 else 0.0), Exception)
+            assert _eventually(lambda: _all_slots_free(s.server), 10.0), _slots(s.server)
+            assert https_get(s.port, "/", insecure_client_context(pki.alice))[0] == 200
+
+    def test_lingering_connections_hold_a_total_slot_but_never_an_anonymous_one(self, pki):
+        pki.pin_alice()
+        ctx = insecure_client_context(pki.mallory)
+        with Serving(echo_app, pki.gateway, max_connections=8, max_anonymous=2,
+                     reject_linger=1.0) as s:
+            socks = [_handshaken_unpinned(s.port, ctx) for _ in range(5)]
+            try:
+                assert _eventually(lambda: _slots(s.server)[0] == 3, 5.0), _slots(s.server)
+                assert _slots(s.server)[1] == 2               # no anonymous slot is taken
+                # and a pinned client is served while they linger
+                assert https_get(s.port, "/", insecure_client_context(pki.alice))[0] == 200
+            finally:
+                for sock in socks:
+                    sock.close()
+            assert _eventually(lambda: _all_slots_free(s.server), 10.0), _slots(s.server)
+
+    def test_a_linger_does_not_block_other_clients(self, pki):
+        """Each connection has its own thread: a slow-to-close rejected peer holds nobody up."""
+        pki.pin_alice()
+        with Serving(echo_app, pki.gateway, reject_linger=5.0) as s:
+            socks = [_handshaken_unpinned(s.port, insecure_client_context(pki.mallory))
+                     for _ in range(5)]
+            try:
+                time.sleep(0.2)
+                started = time.monotonic()
+                assert https_get(s.port, "/", insecure_client_context(pki.alice))[0] == 200
+                assert time.monotonic() - started < 3.0
+            finally:
+                for sock in socks:
+                    sock.close()
+
+    def test_shutdown_returns_promptly_with_lingering_connections(self, pki):
+        pki.pin_alice()
+        s = Serving(echo_app, pki.gateway, reject_linger=10.0)
+        s.thread.start()
+        socks = []
+        try:
+            for _ in range(10):
+                socks.append(_handshaken_unpinned(s.port, insecure_client_context(pki.mallory)))
+            time.sleep(0.3)
+            started = time.monotonic()
+            s.server.shutdown()
+            assert time.monotonic() - started < 3.0
+            s.thread.join(5)
+            assert not s.thread.is_alive()
+        finally:
+            for sock in socks:
+                sock.close()
+            s.server.server_close()
+
+    # -- other failed handshakes ---------------------------------------------
+
+    def test_a_handshake_that_never_completes_lingers_after_its_timeout(self, pki):
+        """The linger covers every failed handshake, a port scan included: dropped at the
+        handshake timeout (half-closed: the peer reads EOF), released at timeout + linger."""
+        with Serving(echo_app, pki.gateway, handshake_timeout=0.4, reject_linger=0.6) as s:
+            with raw_connect(s.port) as sock:
+                started = time.monotonic()
+                sock.settimeout(IO_TIMEOUT)
+                assert sock.recv(10) == b""                       # the half-close, at ~0.4 s
+                assert 0.25 < time.monotonic() - started < 3.0
+                freed = _time_until_free(s.server, started, 5.0)
+        assert freed is not None and 0.8 <= freed <= 2.5, freed
+
+    def test_a_tls_12_client_is_refused_and_released(self, pki):
+        ctx = insecure_client_context(maximum_version=ssl.TLSVersion.TLSv1_2)
+        with Serving(echo_app, pki.gateway, reject_linger=0.3) as s:
+            with pytest.raises(ssl.SSLError):
+                https_get(s.port, "/", ctx)
+            assert _eventually(lambda: _all_slots_free(s.server), 10.0), _slots(s.server)
+            assert https_get(s.port, "/")[0] == 200
+
+    # -- never on a success --------------------------------------------------
+
+    @pytest.mark.parametrize("who", ["pinned", "anonymous"])
+    def test_a_successful_handshake_never_lingers(self, pki, mocker, who):
+        pki.pin_alice()
+        ctx = insecure_client_context(pki.alice if who == "pinned" else None)
+        with Serving(echo_app, pki.gateway, reject_linger=30.0) as s:
+            spy = mocker.spy(s.server, "_close_after_failed_handshake")
+            started = time.monotonic()
+            assert https_get(s.port, "/", ctx)[0] == 200
+            assert _eventually(lambda: _all_slots_free(s.server), 5.0), _slots(s.server)
+            assert time.monotonic() - started < 5.0                   # not held for the linger
+        assert spy.call_count == 0
+
+    def test_a_refused_anonymous_connection_closes_at_once_with_no_linger(self, pki, mocker):
+        """The anonymous cap closes AFTER a successful handshake: not a failed handshake."""
+        with Serving(echo_app, pki.gateway, max_anonymous=0, reject_linger=30.0) as s:
+            spy = mocker.spy(s.server, "_close_after_failed_handshake")
+            sock = _anonymous_tls(s.port)
+            try:
+                started = time.monotonic()
+                assert _closed_by_peer(sock, 5.0)
+                assert time.monotonic() - started < 3.0
+                assert _eventually(lambda: _all_slots_free(s.server), 5.0), _slots(s.server)
+            finally:
+                sock.close()
+        assert spy.call_count == 0
+
+    def test_a_rejected_certificate_does_linger(self, pki, mocker):
+        """The other side of the two tests above: a rejection is routed through the linger."""
+        pki.pin_alice()
+        with Serving(echo_app, pki.gateway, reject_linger=0.3) as s:
+            spy = mocker.spy(s.server, "_close_after_failed_handshake")
+            assert isinstance(_unpinned_request(s.port, insecure_client_context(pki.mallory)),
+                              Exception)
+            assert _eventually(lambda: spy.call_count == 1, 5.0)
+
+    # -- robustness of the close ---------------------------------------------
+
+    def test_a_peer_that_vanishes_during_the_linger_does_not_leak_the_slot_or_log_errors(
+        self, pki, caplog
+    ):
+        import struct
+
+        pki.pin_alice()
+        with caplog.at_level(logging.DEBUG):
+            with Serving(echo_app, pki.gateway, reject_linger=2.0) as s:
+                for _ in range(5):
+                    sock = _handshaken_unpinned(s.port, insecure_client_context(pki.mallory))
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    sock.close()
+                assert _eventually(lambda: _all_slots_free(s.server), 10.0), _slots(s.server)
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def _closed_by_peer_or_alert(sock) -> bool:
+    """Whether reading `sock` ends (EOF, an alert or a reset) rather than timing out."""
+    sock.settimeout(3.0)
+    try:
+        sock.recv(1)
+        return True
+    except socket.timeout:
+        return False
+    except OSError:
+        return True
 
 
 # ===========================================================================

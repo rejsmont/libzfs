@@ -188,6 +188,20 @@ mapping), and the cache is shared process state that `dispose_all()` empties
 ephemeral engine shares nothing with the cache or with other threads, so
 neither problem exists. Same pragmas, same `BEGIN IMMEDIATE` for writers.
 
+Raw file descriptors on the database
+------------------------------------
+The preflight's header read (`read_db_header`) and any other raw fd on the
+file (`close_db_fd`) are never closed while another descriptor of this process
+refers to the same inode -- i.e. while any SQLite connection here, including
+a zombie left by `close()` with a live statement, may hold a lock on it: a raw
+`close()` releases the WAL SHARED lock of every such connection, and was
+measured to corrupt the database on SQLite 3.45 (see `_liveconn`). Every DBAPI
+connection a file engine opens is made by `_liveconn.connect_tracked`
+(readers via `_reader_creator`, writers via a `do_connect` listener), which
+serialises the connect with that check and sweeps parked fds on close. Never
+`open()`/`close()` the database file directly, and never `sqlite3.connect()`
+it outside `connect_tracked`.
+
 Note for item 8's `ensure_schema` wrapper
 -----------------------------------------
 When a URL-taking wrapper around `migrate.ensure_schema()` is written, it
@@ -233,6 +247,14 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool, SingletonThreadPool, StaticPool
 
+# Re-exported: `paths.py` reads the header and closes db fds through these.
+# The registry lives in a leaf module on purpose -- see its docstring.
+from zfsbackup.config.store._liveconn import (
+    close_db_fd,
+    connect_tracked,
+    read_db_header,
+)
+
 logger = logging.getLogger(__name__)
 
 # Pools that hand the SAME DBAPI connection to every concurrent checkout in
@@ -244,10 +266,13 @@ _SHARED_CONNECTION_POOLS = (StaticPool, SingletonThreadPool)
 
 __all__ = [
     "ReadOnlySessionError",
+    "close_db_fd",
+    "connect_tracked",
     "dispose_all",
     "ephemeral_engine",
     "get_engine",
     "make_engine",
+    "read_db_header",
     "session_for_engine",
     "session_scope",
     "url_for_path",
@@ -817,9 +842,25 @@ def _reader_creator(database: Optional[str]):
     uri = "file:" + quote(database, safe="/") + "?mode=rw"
 
     def creator():  # noqa: ANN202
-        return sqlite3.connect(uri, uri=True, check_same_thread=False)
+        return connect_tracked(uri, uri=True, check_same_thread=False)
 
     return creator
+
+
+def _install_tracked_connect(engine: Engine) -> None:
+    """Open a writer engine's DBAPI connections through
+    `_liveconn.connect_tracked`, so no raw fd on the database is closed between
+    a connect and that connection's first lock (see `_liveconn`; a raw close
+    drops the WAL SHARED lock and was measured to corrupt the database).
+
+    `do_connect` keeps the dialect's own connect arguments (the URL handling
+    stays SQLAlchemy's) and only adds the factory plus the serialisation
+    (`connect_tracked`). Readers need no listener: their `creator` calls
+    `connect_tracked` itself (a `creator` bypasses `do_connect`)."""
+
+    @event.listens_for(engine, "do_connect")
+    def _connect(dialect, conn_rec, cargs, cparams):  # noqa: ANN001, ANN202
+        return connect_tracked(*cargs, _connect=dialect.connect, **cparams)
 
 
 def make_engine(
@@ -979,6 +1020,8 @@ def make_engine(
             )
         else:
             engine = create_engine(url, **pool_kwargs)
+            # Readers are tracked by their `creator`; see `_liveconn`.
+            _install_tracked_connect(engine)
 
     _install_pragmas(
         engine, readonly=readonly, foreign_keys=foreign_keys, memory=memory
@@ -1060,6 +1103,7 @@ def _reinit_lock_after_fork() -> None:
     lock; it deliberately does not touch `_ENGINES`, because disposing an
     engine from a fork handler would run connection teardown at an
     arbitrary point. The pid check in `get_engine()` owns the engines.
+    (`_liveconn` replaces its own lock, and closes its parked fds, at fork.)
     """
     global _ENGINES_LOCK, _EPHEMERAL_BUILD_LOCK
     _ENGINES_LOCK = threading.RLock()

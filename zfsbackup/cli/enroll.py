@@ -198,7 +198,21 @@ def _is_reset(exc: BaseException) -> bool:
 
     kinds = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError,
              http.client.RemoteDisconnected)
-    return any(isinstance(e, kinds) for e in _walk(exc))
+    return any(isinstance(e, kinds) for e in _walk(exc)) or _is_ssl_eof(exc)
+
+
+def _is_ssl_eof(exc: BaseException) -> bool:
+    """Did the peer just close the connection, as seen through TLS?
+
+    Under TLS 1.3 a server that rejects our client certificate sends an alert
+    and closes; depending on the Python/OpenSSL version and on who wins the
+    race, the client sees the alert, a `ConnectionResetError`, or
+    `ssl.SSLEOFError` ("EOF occurred in violation of protocol"). The last is a
+    reset like the second. A local verification failure is never one."""
+    chain = list(_walk(exc))
+    if any(isinstance(e, ssl.SSLCertVerificationError) for e in chain):
+        return False
+    return any(isinstance(e, ssl.SSLEOFError) for e in chain)
 
 
 def _probe_presented(host: str, port: int) -> Optional[str]:
@@ -244,6 +258,8 @@ def _classify(exc: BaseException) -> _TransportError:
         return _TransportError("pin", actual=_presented_fingerprint(exc))
     if identity.is_tls_alert_rejection(exc):
         return _TransportError("rejected")
+    if _is_ssl_eof(exc):
+        return _TransportError("unreachable", _reason(exc), reset=True)
     if isinstance(exc, requests.exceptions.SSLError):
         return _TransportError("tls", _reason(exc))
     if isinstance(exc, (requests.exceptions.InvalidURL, requests.exceptions.MissingSchema,

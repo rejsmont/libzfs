@@ -246,6 +246,8 @@ def _await_answer(
     as `newer`), on `rejected` / `superseded` (the key will never be applied),
     or on `gone` / `unreadable`. `await_applied` is its public spelling.
     """
+    # Nothing pooled may stay open across the wait, whichever command got here.
+    release_database()
     deadline = time.monotonic() + wait
     last: Optional[daemonlock.DaemonInfo] = None
     deferred: Optional[daemonlock.DaemonInfo] = None
@@ -530,6 +532,10 @@ def notify_daemon(
     request is then NOT made again.
     """
     wait = _reload_wait() if reload_wait is None else reload_wait
+    try:
+        release_database()  # defence in depth: no pooled connection across the wait
+    except Exception:  # noqa: BLE001 - never fail a committed write
+        pass
     try:
         line, warning = _daemon_notice(resolved, generation, store_id, wait, request)
     except Exception as exc:  # noqa: BLE001 - never fail a committed write

@@ -217,8 +217,10 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
 from zfsbackup.config.store.db import (
+    close_db_fd,
     ephemeral_engine,
     get_engine,
+    read_db_header,
     session_scope,
     url_for_path,
 )
@@ -1488,8 +1490,12 @@ def check_config_db(
 
     header: Optional[bytes]
     try:
-        with open(real, "rb") as fh:
-            header = fh.read(100)
+        # NEVER a plain `open()`/`close()` here: closing any fd on config.db
+        # releases every POSIX lock this process holds on it, including the
+        # SHARED lock a live (pooled, or another thread's) WAL connection
+        # relies on -- measured to corrupt the database on SQLite 3.45. See
+        # `_liveconn`; `read_db_header` defers that close while one exists.
+        header = read_db_header(real, 100)
     except FileNotFoundError:
         # TOCTOU: existed for the os.stat() above, gone by the time this
         # opened it. Reported the same way an ordinary "missing" is.
@@ -1868,7 +1874,10 @@ def create_config_db_file(path: Union[str, Path]) -> None:
         _unlink_if_same_file(fd, target)
         raise
     finally:
-        os.close(fd)
+        # An fd on the database itself: never a bare `os.close` (see
+        # `db.close_db_fd`). O_EXCL means no connection to this inode can
+        # predate it, but one opened meanwhile by another thread could.
+        close_db_fd(fd)
 
 
 def _unlink_if_same_file(fd: int, path: Path) -> None:

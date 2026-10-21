@@ -23,6 +23,13 @@ Layout
 * `TestDeadlineReaderAfterResponse` / `TestDeadlineReaderBeforeResponse` /
   `TestDrainDeadlineUnit` / `TestPerRequestReset` -- `_DeadlineReader` and the handler on a
   fake raw reader and a fake connection (no network).
+* `TestDrainEof` / `TestDrainedBytesPerRequest` -- an EOF (a 0-byte read) after the drain has
+  discarded some of the unread body is a teardown (one DEBUG line ending `(EOF)`, sticky,
+  `close_connection`): CPython 3.11/3.12 with OpenSSL 3.0 report a client RST during the
+  drain as a ragged EOF, not as an exception. An EOF with nothing drained stays a silent
+  normal close. `handler.drained_bytes` is reset for every request.
+* `TestDrainEofOnTheWire` -- the same on a real connection (an unread body, then a FIN with no
+  `close_notify`).
 * `TestWebsocketTeardown` -- a real `/stream` websocket (flask-sock) through `ApiServer`.
 * `TestUnreadBodyTeardown` -- an unread POST body followed by a reset, pinned and anonymous.
 * `TestDrainDeadlineOverTls` -- a peer that goes silent during the drain, and a response that
@@ -1598,3 +1605,199 @@ class TestBackupStreamEndsTheWebsocket:
         except RuntimeError:
             pass
         assert rig.gate.active == 0
+
+
+# ---------------------------------------------------------------------------
+# An EOF during the drain
+# ---------------------------------------------------------------------------
+
+EOF_LINE = "API: connection from ('127.0.0.1', 4242) ended after the response (EOF)"
+
+
+@pytest.mark.unit
+class TestDrainEof:
+    """A 0-byte read is a teardown only once the drain has discarded body bytes."""
+
+    def test_body_bytes_then_eof_is_one_debug_line_ending_in_eof(self, make_handler, caplog):
+        h = make_handler(b"abc", b"de", b"")
+        buf = bytearray(16)
+        with caplog.at_level(logging.DEBUG, logger=DRAIN_LOGGER):
+            assert h.rfile.raw.readinto(buf) == 3
+            assert h.rfile.raw.readinto(buf) == 2
+            assert h.drained_bytes == 5
+            assert ended_lines(caplog) == []                 # data alone logs nothing
+            assert h.rfile.raw.readinto(buf) == 0
+        (line,) = ended_lines(caplog)
+        assert line.getMessage() == EOF_LINE
+        assert line.getMessage().endswith("(EOF)")
+        assert h.drain_ended is True and h.close_connection is True
+
+    def test_the_eof_is_sticky_and_the_dead_socket_is_not_read_again(self, make_handler, caplog):
+        # the script holds more data after the EOF: a reader that read on would return it
+        h = make_handler(b"abc", b"", b"never read", b"never read")
+        with caplog.at_level(logging.DEBUG, logger=DRAIN_LOGGER):
+            assert read(h) == 3
+            assert read(h) == 0
+            assert read(h) == 0
+            assert read(h) == 0
+        assert h.fake_raw.calls == 2
+        assert len(ended_lines(caplog)) == 1                  # one line, however often it is read
+
+    def test_the_eof_line_is_the_same_one_line_as_for_an_exception(self, make_handler, caplog):
+        """A reset that arrives as an exception and one that arrives as an EOF are logged
+        alike: one DEBUG line at the same place, only the reason differs."""
+        with caplog.at_level(logging.DEBUG, logger=DRAIN_LOGGER):
+            reset_exc = ConnectionResetError(errno.ECONNRESET, "reset")
+            for script in ((b"abc", reset_exc), (b"abc", b"")):
+                h = make_handler(*script)
+                assert read(h) == 3 and read(h) == 0 and read(h) == 0
+                assert h.drain_ended is True and h.close_connection is True
+        lines = [r.getMessage() for r in ended_lines(caplog)]
+        assert len(lines) == 2
+        assert lines[0] == (
+            f"API: connection from ('127.0.0.1', 4242) ended after the response "
+            f"(ConnectionResetError: {reset_exc})"
+        )
+        assert lines[1] == EOF_LINE
+
+    def test_an_eof_with_nothing_drained_is_a_silent_normal_close(self, make_handler, caplog):
+        h = make_handler(b"")
+        with caplog.at_level(logging.DEBUG, logger=DRAIN_LOGGER):
+            assert read(h) == 0
+        assert ended_lines(caplog) == []
+        assert h.drain_ended is False
+        assert getattr(h, "close_connection", None) is not True
+        assert h.drained_bytes == 0
+
+    def test_an_eof_with_nothing_drained_is_not_sticky(self, make_handler, caplog):
+        """No teardown was decided, so the next read still goes to the reader (as before)."""
+        h = make_handler(b"", b"late")
+        with caplog.at_level(logging.DEBUG, logger=DRAIN_LOGGER):
+            assert read(h) == 0
+            assert read(h) == 4
+        assert h.fake_raw.calls == 2
+        assert ended_lines(caplog) == []
+
+    def test_a_drain_that_ended_at_the_deadline_is_not_logged_a_second_time(
+        self, make_handler, caplog
+    ):
+        h = make_handler(b"abc", b"", drain_timeout=5.0)
+        with caplog.at_level(logging.DEBUG, logger=DRAIN_LOGGER):
+            assert read(h) == 3
+            h.drain_deadline = time.monotonic() - 0.01
+            assert read(h) == 0 and read(h) == 0
+        (line,) = ended_lines(caplog)
+        assert "TimeoutError: drain deadline passed" in line.getMessage()
+        assert h.fake_raw.calls == 1                           # the EOF was never even read
+
+    def test_bytes_read_before_the_response_are_not_drained_bytes(self, make_handler, caplog):
+        """The request body the app read (before the status line) is not a discarded body: an
+        EOF after the response with nothing left to discard is still a normal close."""
+        h = make_handler(b"request-body", b"", response_started=False)
+        with caplog.at_level(logging.DEBUG, logger=DRAIN_LOGGER):
+            assert read(h) == len(b"request-body")
+            assert h.drained_bytes == 0
+            h.response_started = True
+            assert read(h) == 0
+        assert ended_lines(caplog) == []
+        assert h.drain_ended is False
+
+    def test_a_websocket_never_reads_so_it_never_logs_an_eof(self, make_handler, caplog):
+        h = make_handler(b"x", b"", upgrade="websocket")
+        h.drained_bytes = 7                                   # even with bytes on the books
+        with caplog.at_level(logging.DEBUG, logger=DRAIN_LOGGER):
+            assert read(h) == 0
+        assert h.fake_raw.calls == 0
+        assert ended_lines(caplog) == []
+        assert h.drain_ended is False
+
+
+@pytest.mark.unit
+class TestDrainedBytesPerRequest:
+    def test_the_class_default(self, handler_cls):
+        assert handler_cls.drained_bytes == 0
+
+    def test_it_counts_every_drained_byte(self, make_handler):
+        h = make_handler(b"a" * 10, b"b" * 7, b"c")
+        assert h.drained_bytes == 0
+        read(h)
+        read(h)
+        read(h)
+        assert h.drained_bytes == 18
+
+    def test_a_new_request_starts_from_zero(self, make_handler, caplog):
+        h = make_handler(b"abc")
+        assert read(h) == 3
+        assert h.drained_bytes == 3
+        h.peer.close()                    # the next request line reads EOF (the script is empty)
+        h.handle_one_request()
+        assert h.drained_bytes == 0
+        assert h.response_started is False
+
+    def test_an_eof_in_the_next_request_is_judged_on_its_own_drain(self, make_handler, caplog):
+        """The previous request drained bytes; this one drained none. An EOF here is a normal
+        close and must not be logged because of the last request's bytes."""
+        h = make_handler(b"abc", b"x")
+        assert read(h) == 3 and h.drained_bytes == 3
+        h.fake_raw.script = []             # EOF for the request line of the next request
+        h.handle_one_request()
+        assert h.drained_bytes == 0
+        h.response_started = True          # (the next request got as far as its response)
+        with caplog.at_level(logging.DEBUG, logger=DRAIN_LOGGER):
+            assert read(h) == 0
+        assert ended_lines(caplog) == []
+        assert h.drain_ended is False
+
+@pytest.mark.integration
+class TestDrainEofOnTheWire:
+    @staticmethod
+    def _fin_without_close_notify(port, ctx, *, declared=50_000_000, chunks=2, linger=0.3):
+        """POST with an unread body, read the response head, then close the TCP connection
+        with a plain FIN and no TLS `close_notify` (a ragged EOF at the server)."""
+        tls = tls_connect(port, ctx)
+        tls.sendall(b"POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % declared)
+        for _ in range(chunks):
+            tls.sendall(b"y" * 65536)
+        got = b""
+        tls.settimeout(IO_TIMEOUT)
+        while b"\r\n\r\n" not in got:
+            data = tls.recv(4096)
+            if not data:
+                break
+            got += data
+        time.sleep(linger)                    # the server's drain has read everything, and waits
+        raw = socket.socket(fileno=tls.detach())
+        raw.close()
+        return got.split(b"\r\n", 1)[0]
+
+    @pytest.mark.parametrize("who", ["pinned", "anonymous"])
+    def test_a_ragged_eof_during_the_drain_is_one_debug_line_and_no_error(self, pki, caplog, who):
+        ctx = pki.ctx_pinned if who == "pinned" else pki.ctx_anon
+        with caplog.at_level(logging.DEBUG):
+            with Serving(make_app(), pki.gateway).spy() as s:
+                statuses = {self._fin_without_close_notify(s.port, ctx) for _ in range(3)}
+                assert s.wait_slots_free(10.0), s.slot_state()
+                assert statuses == {b"HTTP/1.1 200 OK"}
+                assert s.reads_after_response(), "the drain never ran: this test proves nothing"
+        assert errors(caplog) == [], [r.getMessage() for r in errors(caplog)]
+        assert "Error on request" not in caplog.text
+        assert len(ended_lines(caplog)) == 3                  # exactly one per connection
+
+    def test_a_request_with_no_body_to_discard_logs_nothing(self, pki, caplog):
+        """The mirror case: nothing is left unread, so the client's close is a normal end."""
+        with caplog.at_level(logging.DEBUG):
+            with Serving(make_app(), pki.gateway) as s:
+                tls = tls_connect(s.port, pki.ctx_pinned)
+                tls.sendall(b"GET /plain HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                tls.settimeout(IO_TIMEOUT)
+                got = b""
+                while True:
+                    data = tls.recv(4096)
+                    if not data:
+                        break
+                    got += data
+                tls.close()
+                assert got.startswith(b"HTTP/1.1 200")
+                assert s.wait_slots_free(10.0), s.slot_state()
+        assert errors(caplog) == []
+        assert ended_lines(caplog) == []

@@ -61,8 +61,10 @@ constructed at import time -- importing this package creates no engine, no
 connection, and no file. One import-time side effect does exist and is
 deliberate: `db.py` calls `os.register_at_fork(after_in_child=...)` to
 replace its cache lock in a forked child (a fork taken while another thread
-held that lock would leave the child deadlocked). It is process-global and
-cannot be unregistered; it touches no engine and no connection.
+held that lock would leave the child deadlocked), and `_liveconn.py` does the
+same for its raw-fd guard (fresh lock, inherited parked header fds
+closed). Both are process-global and cannot be
+unregistered; neither touches an engine or a connection.
 
 `zfsbackup/config/store/migrations/env.py`'s `run_migrations_online()` does have an
 `engine_from_config` fallback (for the bare `alembic` CLI, used by

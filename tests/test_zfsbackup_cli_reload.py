@@ -12,6 +12,9 @@ Sections:
                                   committed write, with the written key and the DB
                                   already at it; and never after anything else.
 - ``TestWriterLockIsReleasedDuringTheWait``  nothing waits under the writer lock.
+- ``TestNothingPooledAcrossTheWait``  `_await_answer` / `notify_daemon` close every pooled
+                                  connection first, on every command's path; a failing
+                                  release never fails the write.
 - ``TestAckLoop``                 `_await_answer`: what stops it and what does not.
 - ``TestReloadWaitOption``        the global `--reload-wait`.
 - ``TestRealLockHolderOnLinux``   a genuine v2 lock holder is signalled, a forged pid
@@ -1126,6 +1129,257 @@ class TestWriterLockIsReleasedDuringTheWait:
     def test_the_same_through_notify_daemon_directly(self, rich, db, watched):
         cli_write.notify_daemon(_resolved(db), 3, 7)
         assert watched and all(watched)
+
+
+# --------------------------------------------------------------------------
+# 4b. nothing pooled stays open across the post-commit wait
+# --------------------------------------------------------------------------
+
+
+class Leak:
+    """Instruments one test so it can say what was still open when the post-commit notice
+    began (`_daemon_notice`) and at every look at the pid file (`probe`).
+
+    `install()` replaces `request_reload` with a fake that LEAKS a pooled engine (as if
+    something after the commit had touched the database) and answers `signalled`, so the
+    notice waits; `probe` answers nothing final on a fake clock, so the wait runs to its
+    deadline. Call it after the test's database is built: building it must not be
+    instrumented."""
+
+    def __init__(self, monkeypatch, answer="signalled") -> None:
+        self.monkeypatch = monkeypatch
+        self.answer = answer
+        self.events = []             # "reload" / "dispose" / "notice" / "probe", in order
+        self.open_at_notice = []     # cached engines when the notice started
+        self.open_at_probe = []      # cached engines at each look at the pid file
+        self.wait_seen = []          # the `wait` the notice was given
+        self.armed = False           # a request was made: the commit is behind us
+        self.dispose_fails = None    # an exception to raise from `dispose_all` once armed
+
+    @staticmethod
+    def engines() -> int:
+        from zfsbackup.config.store import db as store_db
+
+        return len(store_db._ENGINES)
+
+    def install(self) -> "Leak":
+        from zfsbackup.config.store import db as store_db
+
+        mp = self.monkeypatch
+
+        def request_reload(resolved, *, skip_if_applied=None):
+            self.events.append("reload")
+            self.armed = True
+            url = store_db.url_for_path(resolved.resolved_path)
+            store_db.get_engine(url).connect().close()      # a pooled connection, left cached
+            return daemonlock.ReloadRequest(self.answer, 4321, None, "")
+
+        real_dispose = cli_write.dispose_all
+
+        def dispose_all():
+            self.events.append("dispose")
+            if self.armed and self.dispose_fails is not None:
+                raise self.dispose_fails
+            real_dispose()
+
+        real_notice = cli_write._daemon_notice
+
+        def daemon_notice(resolved, generation, store_id=None, wait=3.0, request=None):
+            self.events.append("notice")
+            self.open_at_notice.append(self.engines())
+            self.wait_seen.append(wait)
+            return real_notice(resolved, generation, store_id, wait, request)
+
+        def probe(resolved):
+            self.events.append("probe")
+            self.open_at_probe.append(self.engines())
+            return info(applied=(1, 0))
+
+        mp.setattr(daemonlock, "request_reload", request_reload)
+        mp.setattr(daemonlock, "probe", probe)
+        mp.setattr(cli_write, "dispose_all", dispose_all)
+        mp.setattr(cli_write, "_daemon_notice", daemon_notice)
+        Clock().install(mp)
+        return self
+
+    def leak_now(self, database: Path) -> None:
+        """Leave a pooled engine cached, as a caller that forgot to release it would."""
+        from zfsbackup.config.store import db as store_db
+
+        store_db.get_engine(store_db.url_for_path(_resolved(database).resolved_path)).connect().close()
+        assert self.engines() == 1
+
+
+@pytest.fixture
+def leak(monkeypatch):
+    dispose_all()
+    yield Leak(monkeypatch)
+    dispose_all()
+
+
+class TestNothingPooledAcrossTheWait:
+    """`_await_answer` and `notify_daemon` close every pooled connection first. The commit
+    paths already do (`commit_config`), but `enroll`, `import` and `identity` reach the notice
+    through their own `begin_reload`, and a pooled WAL reader would pin the checkpoint for
+    as long as the daemon takes to answer."""
+
+    # -- the two functions, called directly
+
+    def test_the_ack_loop_releases_before_its_first_look(self, rich, db, resolved, leak):
+        leak.install()
+        leak.leak_now(db)
+        answer, _ = cli_write._await_answer(resolved, KEY, 1.0)
+        assert leak.events[:2] == ["dispose", "probe"]
+        assert leak.open_at_probe and set(leak.open_at_probe) == {0}
+        assert answer is None                                  # nothing in the file named KEY
+
+    def test_every_look_of_a_long_wait_is_after_the_release(self, rich, db, resolved, leak):
+        leak.install()
+        leak.leak_now(db)
+        cli_write._await_answer(resolved, KEY, 5.0)
+        assert leak.events.count("probe") > 3                  # it really did poll
+        assert leak.events.index("dispose") < leak.events.index("probe")
+        assert set(leak.open_at_probe) == {0}
+
+    def test_await_applied_releases_too(self, rich, db, resolved, leak):
+        leak.install()
+        leak.leak_now(db)
+        cli_write.await_applied(resolved, KEY, 1.0)
+        assert leak.events[:2] == ["dispose", "probe"] and set(leak.open_at_probe) == {0}
+
+    def test_the_ack_loop_releases_even_when_the_wait_is_zero(self, rich, db, resolved, leak):
+        leak.install()
+        leak.leak_now(db)
+        cli_write._await_answer(resolved, KEY, 0)
+        assert leak.events[:2] == ["dispose", "probe"] and set(leak.open_at_probe) == {0}
+
+    @pytest.mark.parametrize("wait", [0, 3.0])
+    def test_notify_daemon_releases_before_it_computes_the_notice(
+        self, rich, db, resolved, leak, wait
+    ):
+        leak.install()
+        leak.leak_now(db)
+        request = daemonlock.ReloadRequest("no-daemon")
+        cli_write.notify_daemon(resolved, 3, 7, reload_wait=wait, request=request)
+        assert leak.events == ["dispose", "notice"]
+        assert leak.open_at_notice == [0] and leak.wait_seen == [wait]
+
+    def test_notify_daemon_without_a_request_releases_before_asking_the_daemon(
+        self, rich, db, resolved, leak
+    ):
+        leak.install()
+        cli_write.notify_daemon(resolved, 3, 7, reload_wait=0)
+        assert leak.events[:3] == ["dispose", "notice", "reload"]
+
+    # -- a release that fails never fails a committed write
+
+    def test_a_failing_release_in_notify_daemon_is_swallowed_and_the_notice_still_prints(
+        self, rich, db, resolved, leak, capsys
+    ):
+        leak.install()
+        leak.armed = True
+        leak.dispose_fails = OSError("engine is wedged")
+        request = daemonlock.ReloadRequest("no-daemon")
+        cli_write.notify_daemon(resolved, 3, 7, reload_wait=0, request=request)    # no raise
+        out = capsys.readouterr()
+        assert "config updated (generation 3); no running daemon detected" in out.out
+        assert leak.events == ["dispose", "notice"]
+
+    def test_a_failing_release_before_the_wait_is_a_warning_not_an_error(
+        self, rich, db, resolved, leak, capsys
+    ):
+        leak.install()
+        leak.armed = True
+        leak.dispose_fails = RuntimeError("engine is wedged")
+        request = daemonlock.ReloadRequest("signalled", 4321, None, "")
+        cli_write.notify_daemon(resolved, 3, 7, reload_wait=1.0, request=request)  # no raise
+        out = capsys.readouterr()
+        assert out.out == "config updated\n"       # the plain line: the check itself failed
+        assert "could not check for a running daemon: engine is wedged" in out.err
+
+    def test_an_interrupt_in_the_release_is_not_swallowed(self, rich, db, resolved, leak):
+        leak.install()
+        leak.armed = True
+        leak.dispose_fails = KeyboardInterrupt()
+        with pytest.raises(KeyboardInterrupt):
+            cli_write.notify_daemon(
+                resolved, 3, 7, reload_wait=0, request=daemonlock.ReloadRequest("no-daemon")
+            )
+
+    # -- the commands
+
+    def _assert_clean_wait(self, leak, *, waited=True):
+        assert leak.events.count("reload") == 1
+        assert leak.open_at_notice == [0], "a pooled connection was open when the notice began"
+        if waited:
+            assert leak.open_at_probe and set(leak.open_at_probe) == {0}
+        last = len(leak.events) - 1 - leak.events[::-1].index("dispose")
+        assert last > leak.events.index("reload"), "nothing was released after the commit"
+
+    def test_set_releases_before_the_wait(self, run, rich, db, leak):
+        leak.install()
+        result = run("set", "check_interval", "10m", "-c", db)
+        assert result.exit_code == 0, result.stderr
+        assert "config updated" in result.stdout
+        self._assert_clean_wait(leak)
+
+    def test_identity_set_client_id_releases_before_the_wait(self, run, rich, db, leak):
+        leak.install()
+        result = run("identity", "set-client-id", "-c", db, "--", "host-9")
+        assert result.exit_code == 0, result.stderr
+        assert host_client_id(db) == "host-9"
+        self._assert_clean_wait(leak)
+
+    def test_import_releases_before_the_wait(self, run, rich, db, leak, tmp_path):
+        src = write_yaml(tmp_path, "datasets:\n  - name: tank/new\n    frequency: 1h\n", "new.yaml")
+        leak.install()
+        result = run("import", src, "-c", db)
+        assert result.exit_code == 0, result.stderr
+        self._assert_clean_wait(leak)
+
+    def test_enroll_releases_before_the_wait(self, run, client, db, leak, make_server):
+        srv = make_server()
+        leak.install()
+        result = do_enroll(run, client, srv, srv.token())
+        assert result.exit_code == 0, result.stderr
+        assert "config updated" in result.stdout
+        self._assert_clean_wait(leak)
+
+    def test_enroll_releases_on_the_failure_path_that_does_not_wait(
+        self, run, db, leak, make_server
+    ):
+        """The generated client id is committed, then the server is unreachable: the notice
+        is made with `reload_wait=0`, and the release comes before it all the same."""
+        make_db(run, db, "datasets:\n  - name: tank/a\n    frequency: 1h\n")
+        srv = make_server()
+        token = srv.token()
+        leak.install()
+        result = do_enroll(run, db, _unreachable(), token)
+        assert result.exit_code == 75, result.stderr
+        assert host_client_id(db)                               # the id was committed
+        assert leak.wait_seen == [0] and leak.open_at_probe == []
+        self._assert_clean_wait(leak, waited=False)
+
+    @pytest.mark.parametrize("command", ["set", "identity", "enroll"])
+    def test_a_failing_release_never_fails_the_command(
+        self, run, rich, db, leak, make_server, command
+    ):
+        srv = make_server()
+        token = srv.token()
+        leak.install()
+        leak.dispose_fails = OSError("engine is wedged")        # raised once a request was made
+        gen = generation(db)
+        if command == "set":
+            result = run("set", "check_interval", "10m", "-c", db)
+        elif command == "identity":
+            result = run("identity", "set-client-id", "-c", db, "--", "host-9")
+        else:
+            result = do_enroll(run, db, srv, token)
+        leak.dispose_fails = None
+        assert result.exit_code == 0, result.stderr
+        assert generation(db) > gen                             # the write is durable
+        assert "config updated" in result.stdout
+        assert leak.armed and leak.events.count("reload") == 1
 
 
 # --------------------------------------------------------------------------

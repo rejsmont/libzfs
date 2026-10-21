@@ -285,12 +285,14 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_api.py` | HTTP control API behind a stubbed trust gateway (stream modes, abort, 409 collision, busy lock, receive error reporting) |
 | `tests/test_zfsbackup_api_auth.py` | Authentication and authorization: 401/403, the client-id binding (cert B cannot touch A's data), `/whoami`, the `/enroll` and `/rotate` matrices against a real trust store, predecessor retirement, `TrustGateway` |
 | `tests/test_zfsbackup_api_tls.py` | API worker TLS: per-connection handshake, TLS 1.3 only, connection caps and deadlines, revocation/addition with no restart, real `ApiWorker` under fork/spawn/forkserver, dry-run throwaway identity |
+| `tests/test_zfsbackup_api_wssession.py` | Websocket `_SessionSocket`: fd never closed while a reader is inside it, serialised writes, `end()`/hand-over close, no response after the upgrade, `ws_end_timeout` validation |
 | `tests/test_zfsbackup_api_drain.py` | Post-response drain: client teardown after a response or websocket session is quiet (DEBUG, no traceback), bounded drain deadline, post-websocket 200 never written, websocket reader joined before `/stream` returns |
 | `tests/test_zfsbackup_api_bind.py` | API server binds without a reverse DNS lookup |
 | `tests/test_zfsbackup_remote.py` | `RemoteBackupManager`: negotiation, resume protocol, transfer (the pinned transport is faked) |
 | `tests/test_zfsbackup_config.py` | Config loading, retention collapse, per-destination rules |
 | `tests/test_zfsbackup_duration.py` | The `Duration` type and its literal preservation |
 | `tests/test_zfsbackup_store_tls_schema.py` | Trust/identity schema and migration `7c3e9d51b2a8`, new `validate_config` rules, `ConfigSnapshot.client_id`, `import` keeps the id and the trust tables |
+| `tests/test_zfsbackup_store_liveconn.py` | Raw DB fds never drop a live connection's POSIX locks (`_liveconn` fd-table guard): lock survives preflight, zombie connections, fail-closed listings, fork, tracking coverage |
 | `tests/test_zfsbackup_store_trust.py` | `store.trust`: host identity, tokens, `enroll_client` outcomes, revocation (permanent), rotation, trust generation, ephemeral engines |
 | `tests/test_zfsbackup_identity.py` | `zfsbackup.identity`: fingerprints, tokens, proof of possession, `check_client_cert`, `ensure_identity` races and modes, pinned connections |
 | `tests/test_zfsbackup_tls_platform.py` | Characterization spikes S0–S10 (ssl, werkzeug, flask-sock, websocket-client, requests) the TLS design rests on |
