@@ -291,13 +291,17 @@ class TestGetCommandExtended:
     @pytest.mark.subprocess
     def test_get_multi_dataset_output(self, mock_subprocess, sample_filesystem):
         mock_subprocess.setup(stdout=[
-            'testpool/fs1\ttype\tfilesystem\t-\t-\n',
-            'testpool/fs1\tcompression\tlz4\t-\tlocal\n',
-            'testpool/fs2\ttype\tfilesystem\t-\t-\n',
-            'testpool/fs2\tcompression\tgzip\t-\tlocal\n',
+            'testpool/filesystem\tname\ttestpool/filesystem\t-\t-\n',
+            'testpool/filesystem\ttype\tfilesystem\t-\t-\n',
+            'testpool/filesystem\tcompression\tlz4\t-\tlocal\n',
+            'testpool/filesystem/fs2\tname\ttestpool/filesystem/fs2\t-\t-\n',
+            'testpool/filesystem/fs2\ttype\tfilesystem\t-\t-\n',
+            'testpool/filesystem/fs2\tcompression\tgzip\t-\tlocal\n',
         ])
-        result = GetCommand()(ds=sample_filesystem, properties='compression')
-        assert len(result) == 2
+        # (the names must be in scope of the requested root and depth, or B2 drops them)
+        result = GetCommand()(ds=sample_filesystem, properties='compression', recursive=True)
+        assert [r.name for r in result] == ['testpool/filesystem', 'testpool/filesystem/fs2']
+        assert [r['compression'].value for r in result] == ['lz4', 'gzip']
 
     @pytest.mark.unit
     def test_get_options_types_none_omits_dash_t(self):

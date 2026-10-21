@@ -426,9 +426,8 @@ class TestGetCommand:
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_get_all_properties(self, mock_subprocess, sample_filesystem):
-        """Test getting all properties."""
+        """Test getting all properties. `zfs get all` prints `type` first and no `name` row."""
         mock_subprocess.setup(stdout=[
-            'testpool/filesystem\tname\ttestpool/filesystem\t-\t-\n',
             'testpool/filesystem\ttype\tfilesystem\t-\t-\n',
             'testpool/filesystem\tcompression\tlz4\t-\tlocal\n',
         ])
@@ -436,7 +435,9 @@ class TestGetCommand:
         cmd = GetCommand()
         result = cmd(ds=sample_filesystem, properties='all')
         
-        assert len(result) >= 1
+        assert len(result) == 1
+        assert isinstance(result[0], Filesystem)
+        assert result[0]['compression'].value == 'lz4'
 
 
 class TestSetCommand:
@@ -1711,7 +1712,6 @@ class TestGetCommandLenientProperties:
     def _output(cls):
         fs = 'testpool/filesystem'
         lines = [
-            fs + '\tname\t' + fs + '\t-\t-\n',
             fs + '\ttype\tfilesystem\t-\t-\n',
             fs + '\tcompression\tlz4\t-\tlocal\n',
         ]
@@ -1721,7 +1721,6 @@ class TestGetCommandLenientProperties:
             fs + '\tfutureprop\tfuture-value\trecv-value\tinherited from testpool\n',
             fs + '\torg.example:note\thello\t-\tlocal\n',
             fs + '\tvolsize\t1G\t-\tdefault\n',
-            fs + '@snap\tname\t' + fs + '@snap\t-\t-\n',
             fs + '@snap\ttype\tsnapshot\t-\t-\n',
             fs + '@snap\tfutureprop\tsnapval\t-\t-\n',
         ]
@@ -1790,7 +1789,6 @@ class TestGetCommandLenientProperties:
     def test_sources_filter_inherited_matches_known_properties(self, mock_subprocess):
         fs = 'testpool/filesystem'
         mock_subprocess.setup(stdout=[
-            fs + '\tname\t' + fs + '\t-\t-\n',
             fs + '\ttype\tfilesystem\t-\t-\n',
             fs + '\tcompression\tlz4\t-\tinherited from testpool\n',
             fs + '\tatime\ton\t-\tlocal\n',
@@ -1825,15 +1823,22 @@ class TestGetCommandLenientProperties:
 
     @pytest.mark.unit
     @pytest.mark.subprocess
-    def test_malformed_native_name_from_zfs_is_still_refused(self, mock_subprocess):
+    def test_malformed_native_name_from_zfs_is_skipped_per_row(self, mock_subprocess, caplog):
+        # B2: a row with an invalid property name is skipped (WARNING); the object itself is still returned and
+        # keeps its other properties.
         fs = 'testpool/filesystem'
         mock_subprocess.setup(stdout=[
-            fs + '\tname\t' + fs + '\t-\t-\n',
             fs + '\ttype\tfilesystem\t-\t-\n',
             fs + '\tBad-Prop\tv\t-\tlocal\n',
+            fs + '\tcompression\tlz4\t-\tlocal\n',
         ])
-        with pytest.raises(ValueError):
-            GetCommand()(properties='all')
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            result = GetCommand()(properties='all')
+        assert [r.name for r in result] == [fs]
+        assert isinstance(result[0], Filesystem)
+        assert result[0]['compression'].value == 'lz4'
+        assert 'Bad-Prop' not in result[0]._extra_props
+        assert any('invalid property name' in m for m in _skip_warnings(caplog))
 
     @pytest.mark.unit
     def test_build_uses_lenient_update(self):
@@ -2400,13 +2405,18 @@ class TestGetLinesToObjectsNameChange:
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_end_to_end_through_get(self, mock_subprocess):
+        # (names must be in scope of the requested root: B2 drops rows zfs's own iteration cannot have printed)
+        # (an explicit property list: zfs opens every object with its `name` and `type` rows; `a` has no
+        # `compression` row here, which is all the test needs to see the properties stay with their own object)
         mock_subprocess.setup(stdout=[
+            'testpool/a\tname\ttestpool/a\t-\t-\n',
             'testpool/a\ttype\tfilesystem\t-\t-\n',
-            'testpool/b\ttype\tvolume\t-\t-\n',
-            'testpool/b\tcompression\tgzip\t-\tlocal\n',
+            'testpool/a/b\tname\ttestpool/a/b\t-\t-\n',
+            'testpool/a/b\ttype\tvolume\t-\t-\n',
+            'testpool/a/b\tcompression\tgzip\t-\tlocal\n',
         ])
         result = GetCommand()(Filesystem('testpool/a'), properties='compression', recursive=True)
-        assert [r.name for r in result] == ['testpool/a', 'testpool/b']
+        assert [r.name for r in result] == ['testpool/a', 'testpool/a/b']
         assert result[0]['compression'] is None
         assert result[1]['compression'].value == 'gzip'
 
@@ -2522,13 +2532,16 @@ class TestListSkipsInvalidNames:
 
     @pytest.mark.unit
     @pytest.mark.subprocess
-    def test_other_errors_still_propagate(self, mock_subprocess, warned_names, caplog):
+    def test_an_unknown_type_is_skipped_not_raised(self, mock_subprocess, warned_names, caplog):
+        # B2: a row whose type is not filesystem/volume/snapshot/bookmark cannot be trusted (it is what a forged
+        # row looks like), so it is skipped with a WARNING instead of aborting the listing.
         mock_subprocess.setup(stdout=['pool/a\tbogus\n'])
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
-            with pytest.raises(ValueError, match='not a valid ZFS type') as info:
-                ListCommand()()
-        assert not isinstance(info.value, InvalidNameError)
-        assert _skip_warnings(caplog) == []
+            result = ListCommand()()
+        assert result == []
+        warnings = _skip_warnings(caplog)
+        assert len(warnings) == 1
+        assert "unknown type 'bogus'" in warnings[0]
 
 
 class TestListLenientColumns:
@@ -2570,8 +2583,10 @@ class TestListLenientColumns:
 class TestGetSkipsInvalidNames:
 
     @staticmethod
-    def _rows(name, dstype='filesystem', compression=None):
-        rows = ['%s\ttype\t%s\t-\t-' % (name, dstype)]
+    def _rows(name, dstype='filesystem', compression=None, explicit=False):
+        # `explicit`: the rows of an explicit property list (`name`, `type`, ...); otherwise those of `all` (`type`, ...)
+        rows = ['%s\tname\t%s\t-\t-' % (name, name)] if explicit else []
+        rows.append('%s\ttype\t%s\t-\t-' % (name, dstype))
         if compression:
             rows.append('%s\tcompression\t%s\t-\tlocal' % (name, compression))
         return rows
@@ -2625,17 +2640,18 @@ class TestGetSkipsInvalidNames:
     @pytest.mark.subprocess
     def test_end_to_end_through_get(self, mock_subprocess, warned_names):
         lines = [line + '\n' for line in
-                 self._rows('pool/a', compression='lz4') + self._rows('pool/.system', compression='off') +
-                 self._rows('pool/c', 'volume', compression='zstd')]
+                 self._rows('pool/a', compression='lz4', explicit=True) +
+                 self._rows('pool/a/.system', compression='off', explicit=True) +
+                 self._rows('pool/a/c', 'volume', compression='zstd', explicit=True)]
         mock_subprocess.setup(stdout=lines)
         result = GetCommand()(Filesystem('pool/a'), properties='compression', recursive=True)
-        assert [r.name for r in result] == ['pool/a', 'pool/c']
+        assert [r.name for r in result] == ['pool/a', 'pool/a/c']
         assert [r['compression'].value for r in result] == ['lz4', 'zstd']
         lazy_lines = [line + '\n' for line in
-                      self._rows('pool/.system') + self._rows('pool/c', 'volume')]
+                      self._rows('pool/a/.system', explicit=True) + self._rows('pool/a/c', 'volume', explicit=True)]
         mock_subprocess.setup(stdout=lazy_lines)
-        lazy = GetCommand()(Filesystem('pool/a'), properties='compression', lazy=True)
-        assert [r.name for r in lazy] == ['pool/c']
+        lazy = GetCommand()(Filesystem('pool/a'), properties='compression', recursive=True, lazy=True)
+        assert [r.name for r in lazy] == ['pool/a/c']
 
 
 class TestSkipInvalidNameWarning:

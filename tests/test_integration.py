@@ -405,3 +405,60 @@ class TestErrorHandling:
         
         with pytest.raises(Exception):
             zfs.destroy.dataset(fs, destroy=True)
+
+
+class TestFramingWorkflow:
+    """B1-B3 end to end (mocked): the config-property round trip zfsbackup relies on, with a hostile neighbour."""
+
+    @pytest.mark.integration
+    @pytest.mark.subprocess
+    def test_refused_write_then_good_write_then_exact_read_back(self, mock_subprocess, sample_pool):
+        fs = Filesystem(f'{sample_pool}/data')
+        mock_subprocess.setup()
+        mock_subprocess.reset_mock()
+
+        # a value that cannot be framed never reaches zfs, and does not touch the object
+        with pytest.raises(ValueError):
+            zfs.set(fs, {'org.t:config': 'a: 1\nb: 2'})
+        assert mock_subprocess.call_count == 0
+        assert fs['org.t:config'] is None
+
+        # the same value, framed safely, goes through and reads back exactly
+        zfs.set(fs, {'org.t:config': '{"a": 1, "b": 2}'})
+        assert mock_subprocess.call_count == 1
+        mock_subprocess.setup(stdout=['{"a": 1, "b": 2}\n'])
+        assert zfs.get.value(fs, 'org.t:config', sources='local') == '{"a": 1, "b": 2}'
+        assert list(mock_subprocess.call_args[0][0][1:]) == \
+            ['get', '-H', '-o', 'value', '-s', 'local', 'org.t:config', f'{sample_pool}/data']
+
+    @pytest.mark.integration
+    @pytest.mark.subprocess
+    def test_a_forged_row_in_a_listing_never_becomes_an_object_that_get_value_then_trusts(self, mock_subprocess,
+                                                                                         sample_pool):
+        """The attack shape: a client-controlled value forges the row of another client's dataset. The listing drops
+        it, so the dataset is never trusted, and the single-property read of the real one stays exact."""
+        root = Filesystem(f'{sample_pool}/server')
+        mock_subprocess.setup(stdout=[
+            f'{sample_pool}/server/mallory\tfilesystem\tX\n',
+            f'{sample_pool}/server/alice\tfilesystem\tFORGED\n',          # inside the value of mallory's property
+            f'{sample_pool}/server/alice\tfilesystem\tcfg-alice\n',
+        ])
+        listed = zfs.list(roots=root, recursive=True, properties=['org.t:config'])
+        assert [o.name for o in listed] == [f'{sample_pool}/server/mallory']
+
+        mock_subprocess.setup(stdout=['cfg-alice\n'])
+        assert zfs.get.value(f'{sample_pool}/server/alice', 'org.t:config', sources='local') == 'cfg-alice'
+        mock_subprocess.setup(stdout=['X\n', f'{sample_pool}/server/alice\tfilesystem\tFORGED\n'])
+        assert zfs.get.value(f'{sample_pool}/server/mallory', 'org.t:config') == \
+            f'X\n{sample_pool}/server/alice\tfilesystem\tFORGED'
+
+    @pytest.mark.integration
+    @pytest.mark.subprocess
+    def test_a_bad_listing_does_not_stop_the_good_rows(self, mock_subprocess, sample_pool):
+        mock_subprocess.setup(stdout=[
+            f'{sample_pool}/a\tfilesystem\n', 'garbage\n', f'{sample_pool}/b\tfilesystem\n',
+            f'{sample_pool}/c\tfilesystem\n', f'{sample_pool}/c\tfilesystem\n', f'{sample_pool}/d\tfilesystem\n',
+        ])
+        result = zfs.list(roots=Filesystem(sample_pool), recursive=True)
+        # "garbage" is a one-column fragment (it also takes the row before it); c is duplicated
+        assert [o.name for o in result] == [f'{sample_pool}/b', f'{sample_pool}/d']

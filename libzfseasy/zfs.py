@@ -1,7 +1,8 @@
-from libzfseasy.types import InvalidNameError, Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as Snapshot, Bookmark, \
+from libzfseasy.types import InvalidNameError, InvalidValueError, Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as Snapshot, Bookmark, \
      SnapshotRange, Property, Properties
 from typing import Optional, Union, Dict, Iterable, Callable
 
+import collections
 import dataclasses
 import io
 import logging
@@ -11,6 +12,7 @@ import shlex
 import subprocess
 import shutil
 import threading
+import time
 
 # Allow configuring zfs and zpool commands via environment variables
 ZFS_BIN = os.environ.get('ZFS_CMD') or shutil.which('zfs')
@@ -53,16 +55,27 @@ debug = True
 
 logger = logging.getLogger('libzfseasy')
 
-# Names already reported by _skip_invalid_name (bounded, once per distinct name per process).
+# Names already reported by _skip_invalid_name (bounded, once per distinct name per `_WARNED_NAMES_TTL` seconds).
 _MAX_WARNED_NAMES = 1000
 _warned_names = set()
 _warned_lock = threading.Lock()
+# The registry is emptied this often, so a name that keeps being skipped is reported again (about once an hour)
+# instead of going quiet for the rest of a long-lived process.
+_WARNED_NAMES_TTL = 3600.0
+_warned_names_since = None
 
 
 def _skip_invalid_name(name: str, error: Exception) -> None:
-    """Log (once per distinct name per process) that a row of zfs output was skipped because its name is one
-    zfs allows but libzfseasy cannot represent."""
+    """Log (once per distinct name per `_WARNED_NAMES_TTL`) that a row of zfs output was skipped because its name is
+    one zfs allows but libzfseasy cannot represent."""
+    global _warned_names_since
     with _warned_lock:
+        now = time.monotonic()
+        if _warned_names_since is None:
+            _warned_names_since = now
+        elif now - _warned_names_since >= _WARNED_NAMES_TTL:
+            _warned_names.clear()
+            _warned_names_since = now
         if name in _warned_names:
             return
         if len(_warned_names) >= _MAX_WARNED_NAMES:
@@ -72,7 +85,118 @@ def _skip_invalid_name(name: str, error: Exception) -> None:
                                'represent; further ones are skipped silently', _MAX_WARNED_NAMES)
             return
         _warned_names.add(name)
-    logger.warning("skipping '%s' from zfs output: libzfseasy cannot represent this name (%s)", name, error)
+    logger.warning('skipping %r from zfs output: libzfseasy cannot represent this name (%s)', _clip(name), error)
+
+
+# How much of a skipped row (or name) a warning quotes, and how many skipped rows one listing reports one by one before
+# it falls back to a count. zfs output can carry user-property values of several KiB, chosen by whoever set them.
+_MAX_QUOTED = 160
+_MAX_ROW_WARNINGS = 5
+
+
+def _clip(text) -> str:
+    text = str(text)
+    return text if len(text) <= _MAX_QUOTED else text[:_MAX_QUOTED] + '...'
+
+
+class _SkippedRows:
+    """The malformed rows one `zfs list` / `zfs get` parse skipped. The first `_MAX_ROW_WARNINGS` are logged one by
+    one, then `done()` adds a single summary line with the total. Kept per listing (never per process), so a row that
+    keeps being malformed is reported on every listing that meets it."""
+
+    def __init__(self, command: str):
+        self.command = command
+        self.count = 0
+
+    def skip(self, reason: str, row=None) -> None:
+        self.count += 1
+        if self.count <= _MAX_ROW_WARNINGS:
+            if row is None:
+                logger.warning('skipping a row of zfs %s output: %s', self.command, reason)
+            else:
+                logger.warning('skipping a row of zfs %s output: %s: %r', self.command, reason, _clip(_redact(row)))
+
+    def done(self) -> None:
+        if self.count > _MAX_ROW_WARNINGS:
+            logger.warning('skipped %d malformed rows of zfs %s output in total (the first %d are logged above)',
+                           self.count, self.command, _MAX_ROW_WARNINGS)
+
+
+# The object types a row of `zfs list` / `zfs get` output can have.
+_ROW_TYPES = ('filesystem', 'volume', 'snapshot', 'bookmark')
+
+
+def _wanted_types(types) -> Optional[set]:
+    """The set of row types a `-t` argument (str or list, already validated) admits, or None for any."""
+    if not types:
+        return None
+    if isinstance(types, str):
+        types = types.split(',')
+    wanted = {str(t).lower() for t in types}
+    return None if 'all' in wanted else wanted
+
+
+def _type_problem(name: str, dstype: str, wanted: Optional[set]) -> Optional[str]:
+    """Why a row's type cannot be right (unknown, not requested, or not what the name's shape says), or None."""
+    if dstype not in _ROW_TYPES:
+        return 'unknown type ' + repr(_clip(dstype))
+    if wanted is not None and dstype not in wanted:
+        return 'type ' + dstype + ' was not requested'
+    shape = 'snapshot' if '@' in name else 'bookmark' if '#' in name else None
+    if (shape or 'dataset') != ('dataset' if dstype in ('filesystem', 'volume') else dstype):
+        return 'name does not match type ' + dstype
+    return None
+
+
+class _Scope:
+    """The names a `zfs list` / `zfs get` run over `roots` (with `-r` / `-d depth`) can print. A row naming anything
+    else did not come from zfs's own iteration (a value that contains a newline forged it) and is skipped.
+
+    Deliberately a little wider than zfs (never narrower): without `-r`/`-d`, the snapshots and bookmarks directly
+    under a root dataset are in scope too, because `zfs list -t snapshot <dataset>` lists them."""
+
+    def __init__(self, roots: Iterable[str], recursive: bool = False, depth: int = 0):
+        self.roots = [str(r) for r in roots]
+        self.recursive = bool(recursive)
+        self.depth = depth if depth and depth > 0 else 0
+
+    @staticmethod
+    def _split(name: str):
+        for sep in ('@', '#'):
+            if sep in name:
+                ds, _, short = name.partition(sep)
+                return ds, sep, short
+        return name, '', ''
+
+    def _within(self, level: int) -> bool:
+        return self.recursive or (self.depth > 0 and level <= self.depth)
+
+    def __call__(self, name: str) -> bool:
+        ds, sep, short = self._split(name)
+        extra = 1 if sep else 0
+        if not self.roots:
+            # zfs iterates every pool: only `-d` limits the depth (counted from the pool).
+            return self.depth == 0 or self.recursive or ds.count('/') + extra <= self.depth
+        for root in self.roots:
+            if name == root:
+                return True
+            rds, rsep, rshort = self._split(root)
+            if ds == rds:
+                level = 0
+            elif ds.startswith(rds + '/'):
+                level = ds[len(rds) + 1:].count('/') + 1
+            else:
+                continue
+            if rsep:
+                # A snapshot / bookmark root: the same short name on a descendant, with -r / -d only.
+                if sep == rsep and short == rshort and level > 0 and self._within(level):
+                    return True
+                continue
+            level += extra
+            if self._within(level) or (level == 1 and sep and ds == rds):
+                return True
+        return False
+
 
 # How long to give an abandoned child process to honor SIGTERM before
 # escalating to SIGKILL when reaping it in Command._exec_out's finally block.
@@ -85,12 +209,28 @@ _STDERR_MAX_LINE = 64 * 1024
 
 
 _URL_USERINFO = re.compile(r'([A-Za-z][A-Za-z0-9+.\-]*://)[^/\s]*@')
+# A `scheme://userinfo` cut off by the clip below, before its `@` could be seen.
+_URL_USERINFO_CUT = re.compile(r'([A-Za-z][A-Za-z0-9+.\-]*://)[^/\s]*\Z')
+
+# `_redact` looks at no more than this many characters (the userinfo pattern is quadratic in the length of a run of
+# scheme characters). Far above any real argument or logged row, so those come out unchanged.
+_MAX_REDACT = 2048
 
 
 def _redact(arg) -> str:
     """Hide URL credentials (`scheme://user:pass@host` -> `scheme://***@host`) wherever they occur in an argument,
-    e.g. inside `-o keylocation=https://user:pass@host/key`."""
-    return _URL_USERINFO.sub(r'\1***@', str(arg))
+    e.g. inside `-o keylocation=https://user:pass@host/key`.
+
+    An argument longer than `_MAX_REDACT` characters is clipped to that many (plus a `...` marker) before it is
+    scanned, so a huge input cannot burn CPU; a credential cut by the clip is hidden as well."""
+    text = str(arg)
+    clipped = len(text) > _MAX_REDACT
+    if clipped:
+        text = text[:_MAX_REDACT]
+    text = _URL_USERINFO.sub(r'\1***@', text)
+    if clipped:
+        text = _URL_USERINFO_CUT.sub(r'\1***', text) + '...'
+    return text
 
 
 def _log_command(cmd) -> None:
@@ -98,6 +238,17 @@ def _log_command(cmd) -> None:
     enabled on the 'libzfseasy' logger."""
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug('Executing command: %s', shlex.join([_redact(a) for a in cmd]))
+
+
+def _check_values(properties) -> None:
+    """Refuse (`Validate.value`) any value in a `{name: value}` mapping or `(name, value)` iterable that zfs output
+    could not frame, before the command that would pass it to zfs is built. Values are checked as `str(value)`, the
+    form every command puts into argv."""
+    if not properties:
+        return
+    items = properties.items() if isinstance(properties, dict) else properties
+    for k, v in items:
+        Validate.value(str(v), k)
 
 
 class _BoundedErrors(list):
@@ -170,6 +321,71 @@ class Command:
                         process.wait()
                 stderr_thread.join()
                 process.wait()
+
+    @classmethod
+    def _exec_lines(cls, cmd):
+        """Run `cmd` and yield its stdout lines exactly as printed, for parsers that must frame `-H` output: only the
+        line's `\\n` is removed (a trailing empty column and trailing spaces in a value survive, `\\r` is not a line
+        break) and blank lines are yielded too. Stdout is read as bytes and decoded as UTF-8 with `surrogateescape`, so
+        an invalid byte in a value can neither raise nor be lost. Raises the bare subprocess-error Exception (stderr
+        lines) on a non-zero exit, after the last line. An abandoned generator reaps the child like `_exec_out`.
+
+        Unlike `_exec_out` (kept as it is: zfsbackup calls it directly) nothing is stripped or dropped."""
+        _log_command(cmd)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        errors = _BoundedErrors()
+        stderr_thread = cls._start_stderr_reader_lines(process, errors)
+        completed = False
+        try:
+            while True:
+                line = process.stdout.readline()
+                rc = process.poll()
+                if isinstance(line, (bytes, bytearray)):
+                    line = bytes(line).decode('utf-8', errors='surrogateescape')
+                if not isinstance(line, str) or line == '':
+                    break
+                yield line[:-1] if line.endswith('\n') else line
+            # stdout hit EOF: block until the child exits (never spin), then collect the whole of stderr.
+            if rc is None:
+                rc = process.wait()
+            cls._join_stderr_reader(stderr_thread)
+            completed = True
+        finally:
+            if not completed:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=_TERMINATE_TIMEOUT)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                cls._join_stderr_reader(stderr_thread)
+                process.wait()
+        if rc != 0:
+            raise Exception('\n'.join(errors))
+
+    @staticmethod
+    def _start_stderr_reader_lines(process, errors):
+        """`_start_stderr_reader` for a pipe that may be binary (decoded as UTF-8 with replacement, so an odd byte
+        cannot kill the reader and leave the child blocked on a full pipe) or text (a mocked process). Lines are
+        read at most `_STDERR_MAX_LINE` at a time; anything that is neither ends the thread quietly."""
+        def reader():
+            try:
+                while True:
+                    line = process.stderr.readline(_STDERR_MAX_LINE)
+                    if isinstance(line, (bytes, bytearray)):
+                        line = bytes(line).decode('utf-8', errors='replace')
+                    if not isinstance(line, str) or line == '':
+                        break
+                    error = line.strip()
+                    if error:
+                        errors.append(error[0].upper() + error[1:])
+            except (OSError, ValueError):
+                # The pipe was closed under us (reaped); whatever was read so far stands.
+                pass
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        return thread
 
     @classmethod
     def _exec_collect(cls, cmd, raw_stderr: bool = False, env=None):
@@ -520,6 +736,13 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
 
         Returns:
             An Iterable containing ZFS datasets -- a Generator if lazy is True, List otherwise
+
+        Rows of zfs output that cannot be trusted are skipped with a WARNING on the 'libzfseasy' logger (the first
+        few per listing one by one, then a count), never raised: a wrong column count (a value containing a tab or
+        newline), a type that is unknown, not requested or does not match the name, a name outside the requested
+        roots / depth, a name libzfseasy cannot parse, and -- in the default (list) mode only -- a name that appears
+        more than once, which drops every row with that name. A lazy listing applies the per-row checks only: it
+        cannot take back an object it has already yielded when the same name appears again later.
         """
 
         return self._list(*args, **kwargs)
@@ -558,15 +781,51 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
             properties = ['name', 'type'] + properties
         cmd += ['-o', ','.join(properties)]
 
-        if roots:
-            cmd += [str(r) for r in cls._dslist_to_list(roots)]
+        roots = cls._dslist_to_list(roots) if roots else []
+        cmd += [str(r) for r in roots]
 
-        result = (cls._line_to_object(line, properties) for line in cls._exec_out(cmd))
+        scope = _Scope(roots, recursive=recursive, depth=depth)
+        wanted = _wanted_types(cls._slist_to_list(types) if types else None)
 
         if lazy:
-            return (o for o in result if o is not None)
-        else:
-            return [o for o in result if o is not None]
+            return cls._lazy_objects(cmd, properties, scope, wanted)
+
+        skips = _SkippedRows('list')
+        names = collections.Counter()
+        result = list(cls._rows_to_objects(cls._exec_lines(cmd), properties, skips, scope, wanted, names))
+        # zfs prints every object once. A name seen twice means one of the rows was forged (by a value with a newline
+        # in it) and nothing says which: drop them all.
+        twice = {n for n, c in names.items() if c > 1}
+        for n in sorted(twice):
+            skips.skip('name appears %d times' % names[n], n)
+        skips.done()
+        return [o for o in result if o.name not in twice]
+
+    @classmethod
+    def _lazy_objects(cls, cmd, properties, scope, wanted):
+        skips = _SkippedRows('list')
+        try:
+            yield from cls._rows_to_objects(cls._exec_lines(cmd), properties, skips, scope, wanted)
+        finally:
+            skips.done()
+
+    @classmethod
+    def _rows_to_objects(cls, lines, properties, skips, scope, types, names=None):
+        """Yield the objects of the trusted rows. A row zfs's iteration cannot have printed (too short or long, a
+        foreign type, out of scope, an unparsable name, or empty) is the rest of a value that contained a newline,
+        so the object of the row right before it (whose last value was cut short there) is dropped too. Objects are
+        therefore yielded one row late."""
+        pending = None
+        for line in lines:
+            obj, foreign = cls._row_to_object(line, properties, skips, scope, types, names)
+            if foreign and pending is not None:
+                skips.skip('its last value continues on the next line', pending[1])
+                pending = None
+            if pending is not None:
+                yield pending[0]
+            pending = (obj, line) if obj is not None else None
+        if pending is not None:
+            yield pending[0]
 
     @staticmethod
     def _check_sort_key(key: str) -> None:
@@ -574,21 +833,57 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
         if key != 'name':
             Validate.attribute(key)
 
+    @classmethod
+    def _line_to_object(cls, line: str, properties: Iterable, skips: Optional[_SkippedRows] = None,
+                        scope: Optional[Callable[[str], bool]] = None, types: Optional[set] = None) -> Optional[ZFS]:
+        """Build the object one `zfs list -H` row describes, or return None (with a warning) for a row that cannot
+        be trusted (see `_row_to_object`)."""
+        return cls._row_to_object(line, properties, skips if skips is not None else _SkippedRows('list'), scope,
+                                  types)[0]
+
     @staticmethod
-    def _line_to_object(line: str, properties: Iterable):
+    def _row_to_object(line: str, properties, skips: _SkippedRows, scope: Optional[Callable[[str], bool]] = None,
+                       types: Optional[set] = None, names: Optional[collections.Counter] = None):
+        """Return `(object or None, foreign)` for one `zfs list -H` row. `properties` are the `-o` columns (`name`,
+        `type`, ...); `scope` and `types` (see `_Scope` and `_wanted_types`) say which names and types the command
+        could print; `names` counts the name of every row with the right column count, for the caller's duplicate
+        check. `foreign` is True for a row zfs's own iteration cannot have printed (the tail of a value that
+        contained a newline), False for a trusted row and for one skipped only because libzfseasy cannot represent
+        its name."""
+        if line == '':
+            skips.skip('empty line')
+            return None, True
         zfs_info = line.split('\t')
-        zfs_info = [i if not i == '-' else None for i in zfs_info]
+        if len(zfs_info) != len(properties):
+            skips.skip('expected %d columns, got %d' % (len(properties), len(zfs_info)), line)
+            return None, True
         name, dstype = zfs_info[0:2]
+        if names is not None:
+            names[name] += 1
+        problem = _type_problem(name, dstype, types)
+        if problem is None and scope is not None and not scope(name):
+            problem = 'name outside the requested roots'
+        if problem is not None:
+            skips.skip(problem, line)
+            return None, True
+        zfs_info = [i if not i == '-' else None for i in zfs_info]
         # The property names were validated strictly when the -o list was built, and a column such as `volsize` is
         # `-` on rows whose type lacks it, so apply the values leniently (as GetCommand._build does).
         try:
             obj = ZFS.from_name(name, dstype)
         except InvalidNameError as e:
             _skip_invalid_name(name, e)
-            return None
+            return None, False
+        except ValueError as e:
+            skips.skip('cannot parse the name (%s)' % _clip(e), line)
+            return None, True
         if len(zfs_info) > 2:
-            obj.update(dict(zip(properties[2:], zfs_info[2:])), lenient=True)
-        return obj
+            try:
+                obj.update(dict(zip(properties[2:], zfs_info[2:])), lenient=True)
+            except ValueError as e:
+                skips.skip('cannot apply the properties (%s)' % _clip(e), line)
+                return None, True
+        return obj, False
 
 
 class CreateCommand(Command):
@@ -628,6 +923,7 @@ class CreateCommand(Command):
         """
 
         filesystem = Filesystem(str(ds), properties)
+        _check_values(filesystem.properties)
         cmd = [_zfs_cmd(), 'create']
         if parents:
             cmd += ['-p']
@@ -659,6 +955,8 @@ class CreateCommand(Command):
         """
 
         volume = Volume(ds, properties)
+        Validate.value(str(size), 'volsize')
+        _check_values(volume.properties)
         cmd = [_zfs_cmd(), 'create', '-V', size]
         if parents:
             cmd += ['-p']
@@ -683,6 +981,8 @@ class SnapshotCommand(Command):
                   properties: Optional[Properties] = None) -> Snapshot:
 
         snapshot = Snapshot(ds, name, properties)
+        # Before the recursive listing below, which already runs zfs.
+        _check_values(snapshot.properties)
         cmd = [_zfs_cmd(), 'snapshot']
         if recursive:
             cmd += ['-r']
@@ -975,7 +1275,9 @@ class CloneCommand(Command):
         if properties:
             for k, v in properties.items():
                 Validate.attribute(k)
-                cmd += ['-o', k + '=' + str(v.value if isinstance(v, Property) else v)]
+                v = str(v.value if isinstance(v, Property) else v)
+                Validate.value(v, k)
+                cmd += ['-o', k + '=' + v]
         cmd += [str(snapshot), str(dataset)]
         cls._exec(cmd)
 
@@ -987,9 +1289,41 @@ class CloneCommand(Command):
         return result
 
 
+# The rows `zfs get` prints first for every object: `name`, `type` for an explicit property list (`GetCommand` sends
+# them first), `type` for `all` (the first entry of OpenZFS's property table; the leading `name` is a placeholder
+# zfs skips). `GetCommand` never passes `-s` to zfs (it filters sources itself), which would drop these rows.
+_LEAD_LIST = ('name', 'type')
+_LEAD_ALL = ('type',)
+
+
 class GetCommand(Command, StringListArgument, ZFSListArgument):
 
     def __call__(self, *args, **kwargs):
+        """Get ZFS properties as objects (`zfs get -H -o name,property,value,received,source`).
+
+        Keyword arguments:
+            ds: ZFS | [ZFS] -- objects to read (default None: every dataset)
+            properties: str | [str] -- properties to read (default 'all')
+            types: str | [str] -- object types to read (default 'all')
+            sources: str | [str] -- keep only properties from these sources (default 'all'); `type` is always kept
+            recursive: bool -- also read the descendants (default False)
+            depth: int -- descendant depth to read (default 0)
+            lazy: bool -- whether to return a generator instead of a list (default False)
+
+        Returns:
+            An Iterable of ZFS objects -- a Generator if lazy is True, List otherwise
+
+        A value containing a tab is recovered when the row is unambiguous (the `received` column is `-`, or the
+        source is `received` and the two halves agree). Anything else that cannot be trusted is skipped with a
+        WARNING (the first few per call one by one, then a count), never raised: a row that is too short or
+        ambiguous, an invalid property name, a property twice for one object, a name outside the requested objects /
+        depth, an object without a valid `type` row, an object whose rows do not start with the rows zfs prints first
+        (`name`, `type` for a property list, `type` for `all`: rows forged for the next object would merge into its
+        group, but not without repeating them) and -- in the default (list) mode only -- every object whose rows
+        are not contiguous (zfs prints each object's rows together, so a name that comes back was forged). A lazy
+        call drops a name that comes back too, but cannot take back the object it already yielded under that name.
+        For one value read safely whatever it contains, use `value()`.
+        """
         return self._get(*args, **kwargs)
 
     @classmethod
@@ -998,18 +1332,85 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
              depth: int = 0, lazy=False) -> Iterable[ZFS]:
 
         sources = cls._slist_to_list(sources, validator=Validate.source)
+        wanted = _wanted_types(cls._slist_to_list(types, validator=Validate.type))
         types = cls._slist_to_str(types, validator=Validate.type)
         properties = cls._slist_to_list(properties, validator=Validate.attribute)
         datasets = [str(d) for d in cls._zlist_to_list(ds)]
         # Enforce column order: name, property, value, received, source
         cmd = [_zfs_cmd(), 'get', '-H', '-o', 'name,property,value,received,source'] + \
             cls._get_options(recursive=recursive, depth=depth, types=types, properties=properties, datasets=datasets)
-        result = cls._lines_to_objects((line for line in cls._exec_out(cmd)), sources)
+        scope = _Scope(datasets, recursive=recursive, depth=depth)
+        lead = cls._lead_properties(properties)
 
         if lazy:
-            return (o for o in result if o is not None)
-        else:
-            return [o for o in result if o is not None]
+            return cls._lazy_objects(cmd, sources, scope, wanted, lead)
+
+        skips = _SkippedRows('get')
+        twice = set()
+        result = list(cls._lines_to_objects(cls._exec_lines(cmd), sources, skips=skips, scope=scope, types=wanted,
+                                            twice=twice, lead=lead))
+        skips.done()
+        return [o for o in result if o is not None and o.name not in twice]
+
+    @classmethod
+    def _lazy_objects(cls, cmd, sources, scope, wanted, lead=_LEAD_ALL):
+        skips = _SkippedRows('get')
+        try:
+            for obj in cls._lines_to_objects(cls._exec_lines(cmd), sources, skips=skips, scope=scope, types=wanted,
+                                             lead=lead):
+                if obj is not None:
+                    yield obj
+        finally:
+            skips.done()
+
+    @classmethod
+    def value(cls, ds: Union[ZFS, str], prop: str, sources: Optional[StringList] = None,
+              raw: bool = False) -> Optional[str]:
+        """Read one property of one object, framing-safe whatever the value contains
+        (`zfs get -H -o value [-s sources] <prop> <name>`: all of stdout is the value).
+
+        Keyword arguments:
+            ds: ZFS | str -- the filesystem, volume, snapshot or bookmark (a name is parsed with `ZFS.from_name`)
+            prop: str -- one property name, validated strictly: a known native property (of the object's type,
+                unless `ds` is a plain Dataset or a name) or a user property (with a `:`); `all`, lists and names
+                starting with `-` are refused
+            sources: str | [str] -- only report the value if its source is one of these (`local`, `default`,
+                `inherited`, `temporary`, `received`; `all` or None for any) (default None)
+            raw: bool -- return zfs's `-` (unset / not applicable) as the string '-' instead of None (default False)
+
+        Returns:
+            The value, its lines joined with `\\n` exactly as zfs printed them (tabs, carriage returns, leading and
+            trailing spaces and empty lines kept; invalid UTF-8 decoded with `surrogateescape`). None when zfs prints
+            `-` (unless `raw`), or prints nothing because the value's source is not in `sources`. A literal value of
+            `-` is indistinguishable from unset and also reads as None unless `raw`.
+
+        Raises:
+            ValueError -- an invalid object, property name or source, before zfs runs
+            Exception -- zfs failed (for example the object does not exist), with zfs's stderr as the message
+        """
+        if isinstance(ds, str):
+            ds = ZFS.from_name(ds)
+        elif not isinstance(ds, ZFS):
+            raise ValueError('Expected Filesystem, Volume, Dataset, Snapshot or Bookmark, got '
+                             + type(ds).__name__ + ' instead')
+        if not isinstance(prop, str) or prop == 'all' or prop.startswith('-'):
+            raise ValueError(_clip(prop) + ' is not a valid ZFS property name')
+        Validate.attribute(prop)
+        if type(ds) is not Dataset:
+            # A plain Dataset (e.g. parsed from a name) does not know whether it is a filesystem or a volume.
+            ds.check_property(prop)
+        sources = cls._slist_to_list(sources, validator=Validate.source)
+        cmd = [_zfs_cmd(), 'get', '-H', '-o', 'value']
+        if sources and 'all' not in [s.lower() for s in sources]:
+            cmd += ['-s', ','.join(sources)]
+        cmd += [prop, str(ds)]
+        lines = list(cls._exec_lines(cmd))
+        if not lines:
+            return None
+        value = '\n'.join(lines)
+        if value == '-' and not raw:
+            return None
+        return value
 
     @staticmethod
     def _get_options(**kwargs):
@@ -1028,7 +1429,9 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         if 'all' in properties:
             properties = ['all']
         else:
-            properties = ['name', 'type'] + properties
+            # `name,type` lead every object's rows (see `_lead_properties`); drop the caller's own copies (and any
+            # other repeat, which zfs would print twice) so that no property appears twice for one object.
+            properties = list(dict.fromkeys(['name', 'type'] + properties))
         cmd += [','.join(properties)]
 
         datasets = kwargs.get('datasets', False)
@@ -1038,33 +1441,122 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         return cmd
 
     @staticmethod
-    def _lines_to_objects(lines, sources) -> Iterable[Datasets]:
-        name, dsname, properties = '', '', {}
+    def _lead_properties(properties) -> tuple:
+        """The rows zfs prints first for every object, for the property list `_get_options` sends: `name`, `type`
+        for an explicit list (the two properties it puts first), `type` alone for `all` (zfs expands `all` in
+        property-table order, whose first entry is `type`; the leading `name` placeholder is never printed)."""
+        return _LEAD_ALL if 'all' in properties else _LEAD_LIST
+
+    @staticmethod
+    def _split_row(line: str, skips: _SkippedRows):
+        """Split one `name,property,value,received,source` row, recovering a value that contains tabs when that is
+        unambiguous; None (with a warning) otherwise."""
+        cols = line.split('\t')
+        if len(cols) < 5:
+            skips.skip('expected 5 columns, got %d' % len(cols), line)
+            return None
+        name, prop, source, middle = cols[0], cols[1], cols[-1], cols[2:-1]
+        if len(middle) == 2:
+            return name, prop, middle[0], middle[1], source
+        # `middle` is value + tab + received, and the value and/or the received value contain tabs. The split is
+        # trusted only where exactly one split gives a `-` received column or a received column equal to the value
+        # (and, for a `received` source, only the latter).
+        candidates = []
+        for i in range(1, len(middle)):
+            value, received = '\t'.join(middle[:i]), '\t'.join(middle[i:])
+            if received == value or (received == '-' and source != 'received'):
+                candidates.append((value, received))
+        if len(candidates) != 1:
+            skips.skip('cannot tell the value from the received column', line)
+            return None
+        return (name, prop) + candidates[0] + (source,)
+
+    @staticmethod
+    def _lines_to_objects(lines, sources, skips: Optional[_SkippedRows] = None,
+                          scope: Optional[Callable[[str], bool]] = None, types: Optional[set] = None,
+                          twice: Optional[set] = None, lead: tuple = _LEAD_ALL) -> Iterable[Optional[ZFS]]:
+        """Group `zfs get -H -o name,property,value,received,source` rows into objects. Rows that cannot be trusted
+        are skipped (see `GetCommand.__call__`). An object whose rows are not contiguous is never yielded again,
+        and its name is added to `twice` so a caller holding the whole result can drop the earlier one as well.
+
+        `lead` is the property sequence zfs prints first for every object (`GetCommand._lead_properties`). A group
+        whose first rows differ is dropped whole: rows forged (through a value containing newlines) for the object
+        zfs prints next would otherwise merge into its real group, but any forged prefix either does not start with
+        the lead rows or repeats them, and the real group's own lead rows then repeat or follow it."""
+        if skips is None:
+            skips = _SkippedRows('get')
+        seen = set()
+        dsname, properties, props_seen, bad = None, {}, set(), False
+        nrows = 0
         for line in lines:
             if not line:
                 continue
-            name, prop, value, received, source = line.split('\t')
-            if not dsname:
-                dsname = name
-            elif name != dsname:
-                properties.pop('name', None)
-                dstype = properties.pop('type', None)
-                if name and dstype:
-                    obj = GetCommand._build(dsname, dstype, properties)
+            row = GetCommand._split_row(line, skips)
+            if row is None:
+                continue
+            name, prop, value, received, source = row
+            if scope is not None and not scope(name):
+                skips.skip('name outside the requested objects', line)
+                continue
+            try:
+                Validate.native_attribute(prop)
+            except ValueError:
+                skips.skip('invalid property name', line)
+                continue
+            if name != dsname:
+                if dsname is not None:
+                    obj = GetCommand._finish(dsname, properties, bad, skips, types)
                     if obj is not None:
                         yield obj
-                dsname, properties = name, {}
+                    seen.add(dsname)
+                dsname, properties, props_seen, bad = name, {}, set(), False
+                nrows = 0
+                if name in seen:
+                    # zfs prints all of an object's rows together: a name that comes back was forged.
+                    if twice is not None:
+                        twice.add(name)
+                    skips.skip('the rows of %r are not contiguous' % _clip(name))
+                    bad = True
+            if nrows < len(lead) and prop != lead[nrows]:
+                if not bad:
+                    skips.skip('the rows of %r do not start with the %r row zfs prints first (got %r)'
+                               % (_clip(name), lead[nrows], _clip(prop)))
+                bad = True
+            nrows += 1
+            if prop in props_seen:
+                if not bad:
+                    skips.skip('property %r appears twice for %r' % (_clip(prop), _clip(name)))
+                bad = True
+            props_seen.add(prop)
             if prop == 'type':
                 properties[prop] = value
             elif 'all' in sources or source in sources or \
                     ('inherited' in sources and source.startswith('inherited from ')):
                 properties[prop] = Property(value, source, received)
-        properties.pop('name', None)
-        dstype = properties.pop('type', None)
-        if name and dstype:
-            obj = GetCommand._build(dsname, dstype, properties)
+        if dsname is not None:
+            obj = GetCommand._finish(dsname, properties, bad, skips, types)
             if obj is not None:
                 yield obj
+
+    @staticmethod
+    def _finish(name: str, properties: dict, bad: bool, skips: _SkippedRows, types: Optional[set]) -> Optional[ZFS]:
+        """Build the object for one complete group of rows, or None (already warned when `bad`)."""
+        if bad:
+            return None
+        properties.pop('name', None)
+        dstype = properties.pop('type', None)
+        if dstype is None:
+            skips.skip('no type row for %r' % _clip(name))
+            return None
+        problem = _type_problem(name, dstype, types)
+        if problem is not None:
+            skips.skip('%s (%r)' % (problem, _clip(name)))
+            return None
+        try:
+            return GetCommand._build(name, dstype, properties)
+        except ValueError as e:
+            skips.skip('cannot build %r (%s)' % (_clip(name), _clip(e)))
+            return None
 
     @staticmethod
     def _build(name: str, dstype: str, properties: Properties) -> Optional[ZFS]:
@@ -1072,7 +1564,8 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         # ran), so accept well-formed native names this library does not know yet (a newer OpenZFS adding a property
         # must not break `zfs get all`).
         # A name zfs allows but libzfseasy refuses is skipped (None) with a warning; the caller's properties for that
-        # dataset are dropped with it, never merged into a neighbour.
+        # dataset are dropped with it, never merged into a neighbour. Any other ValueError (an unknown type) is raised:
+        # `_finish` checks the type first and skips the rest.
         try:
             obj = ZFS.from_name(name, dstype)
         except InvalidNameError as e:
@@ -1093,6 +1586,7 @@ class SetCommand(Command):
         # Reject invalid caller-supplied names before anything reaches zfs.
         for k in properties:
             ds.check_property(k)
+        _check_values(properties)
         cmd = [_zfs_cmd(), 'set'] + cls._get_props(properties) + [str(ds)]
         cls._exec(cmd)
         ds.update(properties)
@@ -1584,10 +2078,14 @@ class ReceiveCommand(Command, StringListArgument):
             cmd += ['-o', 'origin=' + str(origin)]
         props = kwargs.get('props', None)
         if props:
+            # Reject invalid caller-supplied names (and unframeable values) before anything reaches zfs.
+            for k in props:
+                Validate.attribute(k)
+            _check_values(props)
             cmd += cls._get_props(props, True)
         reset = kwargs.get('reset', None)
         if reset:
-            for s in cls._slist_to_list(reset):
+            for s in cls._slist_to_list(reset, validator=Validate.attribute):
                 cmd += ['-x', s]
         if kwargs.get('force', False):
             cmd += ['-F']
@@ -1763,8 +2261,10 @@ class ChangeKeyCommand(Command):
         if kwargs.get('load', None):
             cmd += ['-l']
         if location:
+            Validate.value(location, 'keylocation')
             cmd += ['-o', 'keylocation=' + location]
         if fmt:
+            Validate.value(fmt, 'keyformat')
             cmd += ['-o', 'keyformat=' + fmt]
         if iterations:
             cmd += ['-o', 'pbkdf2iters=' + str(iterations)]
@@ -1816,6 +2316,7 @@ class MountCommand(Command, PropertyCommand):
 
     @classmethod
     def _get_properties(cls, flags: Optional[StringList], properties: Optional[Properties]):
+        _check_values(properties)
         return cls._get_flags(flags) + cls._get_props(properties, True)
 
     @staticmethod
@@ -1826,7 +2327,9 @@ class MountCommand(Command, PropertyCommand):
             flags = flags.split(',')
         result = []
         for f in flags:
-            result += ['-o', str(f).strip()]
+            f = str(f).strip()
+            Validate.value(f, 'mount option')
+            result += ['-o', f]
         return result
 
 
