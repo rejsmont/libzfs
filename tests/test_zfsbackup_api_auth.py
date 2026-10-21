@@ -44,6 +44,7 @@ from unittest.mock import MagicMock, PropertyMock
 import pytest
 
 from _api_support import (
+    plain_client,
     CLIENT_ID,
     SERVER_FP,
     Authed,
@@ -72,6 +73,7 @@ from zfsbackup.api import (
     UNAUTHENTICATED_ENDPOINTS,
     PinInfo,
     TrustGateway,
+    canonical_dataset_config,
     create_app,
 )
 from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_SOURCE_DATASET, DatasetManager
@@ -79,6 +81,7 @@ from zfsbackup.config import BackupConfig, DatasetConfig, RemoteServerConfig
 from zfsbackup.config.store import trust as store_trust
 from zfsbackup.config.store.errors import ConfigBusy
 from zfsbackup.config.store.trust import EnrollOutcome, RotateOutcome, TokenState
+from zfsbackup.protocol import PROTOCOL_HEADER, PROTOCOL_VERSION
 
 TARGET = "pool/backups"
 HOUR = 3600.0
@@ -114,11 +117,16 @@ def zfs(mocker):
         abort=mocker.patch("zfsbackup.api.zfs.receive.abort"),
         receive=mocker.patch("zfsbackup.api.zfs.receive.filesystem"),
         props=mocker.patch("zfsbackup.api.read_zfsbackup_properties", return_value={}),
+        # the local `org.zfsbackup:config` negotiate stored (plan B-1b); a stream is refused without
+        value=mocker.patch(
+            "zfsbackup.api.zfs.get.value",
+            return_value=canonical_dataset_config(DatasetConfig(name="pool/data").to_property()),
+        ),
     )
 
 
 def _untouched(zfs):
-    for name in ("exists", "list", "create", "set", "abort", "receive", "props"):
+    for name in ("exists", "list", "create", "set", "abort", "receive", "props", "value"):
         assert not getattr(zfs, name).called, f"zfs.{name} was called"
 
 
@@ -210,10 +218,9 @@ class TestAuthentication:
                 resp = client.open(url, method=method)
                 assert resp.status_code == 401, (rule.endpoint, method, url, resp.status_code)
                 seen.add(rule.endpoint)
-        assert seen >= {
-            "whoami", "rotate", "get_config", "get_datasets", "get_snapshots",
-            "backup_negotiate", "backup_stream", "backup_resume_token",
-        }
+        assert seen == {
+            "whoami", "rotate", "backup_negotiate", "backup_stream", "backup_resume_token",
+        }, "a route was added or removed: authenticated, the cross-client info routes stay gone (S-4)"
 
     def test_health_is_open_without_a_certificate_and_with_an_unpinned_one(self, authed):
         assert authed.client(None).get("/health").get_json() == {"status": "ok"}
@@ -221,7 +228,7 @@ class TestAuthentication:
         assert authed.gateway.refresh_calls == 0
 
     def test_health_is_open_even_with_a_garbage_certificate_variable(self, authed):
-        client = authed.app.test_client()
+        client = plain_client(authed.app)
         client.environ_base["SSL_CLIENT_CERT"] = "not a certificate"
         assert client.get("/health").status_code == 200
 
@@ -233,7 +240,7 @@ class TestAuthentication:
         assert resp.status_code == 400
 
     def test_an_empty_certificate_variable_is_no_certificate(self, authed):
-        client = authed.app.test_client()
+        client = plain_client(authed.app)
         client.environ_base["SSL_CLIENT_CERT"] = ""
         assert client.get("/whoami").status_code == 401
 
@@ -243,7 +250,7 @@ class TestAuthentication:
         "-----BEGIN CERTIFICATE-----\n",
     ])
     def test_an_unreadable_certificate_is_not_trusted(self, authed, pem):
-        client = authed.app.test_client()
+        client = plain_client(authed.app)
         client.environ_base["SSL_CLIENT_CERT"] = pem
         resp = client.get("/whoami")
         assert resp.status_code == 403
@@ -254,13 +261,13 @@ class TestAuthentication:
         liar = make_client_cert(cn="client2")
         authed.gateway.pin(liar, "client9")
         resp = authed.client(liar).get("/whoami")
-        assert resp.get_json() == {"client_id": "client9", "fingerprint": liar.fingerprint}
+        assert resp.get_json() == {"client_id": "client9", "fingerprint": liar.fingerprint, "protocol": PROTOCOL_VERSION}
 
     def test_the_fingerprint_is_the_sha256_of_the_der_not_of_the_text(self, authed):
         """The same certificate with different PEM framing is the same pin."""
         who = authed.who
         framed = who.cert_pem.replace("\n", "\r\n")
-        client = authed.app.test_client()
+        client = plain_client(authed.app)
         client.environ_base["SSL_CLIENT_CERT"] = framed
         assert client.get("/whoami").get_json()["fingerprint"] == who.fingerprint
 
@@ -421,8 +428,12 @@ class TestClientIdMismatch:
         assert "client2" in caplog.text and CLIENT_ID in caplog.text and authed.who.fingerprint in caplog.text
 
     def test_routes_without_a_client_id_are_not_subject_to_the_check(self, authed):
-        for url in ("/whoami", "/config", "/datasets"):
-            assert authed.client().get(url).status_code == 200
+        rules = [r for r in authed.app.url_map.iter_rules()
+                 if r.endpoint not in UNAUTHENTICATED_ENDPOINTS and r.endpoint != "static"
+                 and "client_id" not in r.arguments and "GET" in r.methods]
+        assert [r.rule for r in rules] == ["/whoami"]
+        for rule in rules:
+            assert authed.client().get(rule.rule).status_code == 200
 
     def test_the_mismatch_does_not_run_a_predecessor_retirement(self, authed, zfs):
         """A request that is refused has not 'used' the successor."""
@@ -536,29 +547,37 @@ class TestAuthorization:
         zfs.exists.return_value = True
         zfs.props.side_effect = RuntimeError("zfs get failed")
         resp = two.client(two.b).post(
-            "/backup/host-b/pool/data/negotiate", json={"config": "x"}
+            "/backup/host-b/pool/data/negotiate",
+            json={"snapshots": [], "config": DatasetConfig(name="pool/data").to_property()},
         )
         assert resp.status_code == 500
         zfs.set.assert_not_called()
 
     def test_each_client_streams_into_its_own_tree(self, two, zfs):
-        zfs.exists.return_value = False
+        # per stream: the ownership check and the config read find the dataset, then it is gone
+        zfs.exists.side_effect = [True, True, False] * 2
         for cert, owner in ((two.a, "host-a"), (two.b, "host-b")):
             _stream(two, cert, owner)
         created = [str(c[0][0]) for c in zfs.create.call_args_list]
         assert created == [self.A_DATA, self.B_DATA]
+        # stamped by the recreate and received with `-o` (plan B-1b), always with the bound id
         stamped = [c[0][1][PROP_CLIENT_ID] for c in zfs.set.call_args_list]
         assert stamped == ["host-a", "host-b"]
+        received = [(str(c.args[0]), c.kwargs["props"][PROP_CLIENT_ID]) for c in zfs.receive.call_args_list]
+        assert received == [(self.A_DATA, "host-a"), (self.B_DATA, "host-b")]
+        assert [str(c.args[0]) for c in zfs.value.call_args_list] == [self.A_DATA, self.B_DATA]
 
     def test_b_cannot_reach_a_through_the_handler_argument_either(self, two, zfs):
         """The websocket view is handed the URL's id, but uses the binding."""
-        zfs.exists.return_value = False
+        zfs.exists.side_effect = [True, True, False]
         ws = MagicMock()
         ws.receive.side_effect = [json.dumps({"done": True})]
         handler = two.app.view_functions["backup_stream"].__wrapped__
         with two.context("/backup/host-b/pool/data/stream", who=two.b, query_string={"mode": "resume"}):
             handler(ws, "host-a", "pool/data")
         assert str(zfs.create.call_args[0][0]) == self.B_DATA
+        assert str(zfs.value.call_args.args[0]) == self.B_DATA            # the config is B's, not A's
+        assert zfs.receive.call_args.kwargs["props"][PROP_CLIENT_ID] == "host-b"
 
 
 class TestBadDatasetNames:
@@ -598,7 +617,9 @@ class TestWhoami:
     def test_it_reports_the_bound_id_and_the_certificates_fingerprint(self, authed):
         resp = authed.client().get("/whoami")
         assert resp.status_code == 200
-        assert resp.get_json() == {"client_id": CLIENT_ID, "fingerprint": authed.who.fingerprint}
+        assert resp.get_json() == {
+            "client_id": CLIENT_ID, "fingerprint": authed.who.fingerprint, "protocol": PROTOCOL_VERSION,
+        }
 
     def test_the_fingerprint_is_64_lowercase_hex_of_the_der(self, authed):
         fp = authed.client().get("/whoami").get_json()["fingerprint"]
@@ -608,7 +629,7 @@ class TestWhoami:
     def test_each_certificate_is_told_its_own_id_and_fingerprint(self, authed):
         other = authed.cert_for("client2")
         assert authed.client(other).get("/whoami").get_json() == {
-            "client_id": "client2", "fingerprint": other.fingerprint,
+            "client_id": "client2", "fingerprint": other.fingerprint, "protocol": PROTOCOL_VERSION,
         }
 
     def test_requires_a_pinned_certificate(self, authed):
@@ -656,6 +677,7 @@ class TestEnroll:
         assert resp.status_code == 200
         assert resp.get_json() == {
             "status": "enrolled", "client_id": "host-a", "fingerprint": cert.fingerprint,
+            "protocol": PROTOCOL_VERSION,
         }
         assert real.trust.token_state() is TokenState.CONSUMED
         pin = real.trust.pins()[cert.fingerprint]
@@ -668,6 +690,7 @@ class TestEnroll:
         assert _enroll(real, "host-a", cert, real.trust.token()).status_code == 200
         assert real.client(cert).get("/whoami").get_json() == {
             "client_id": "host-a", "fingerprint": cert.fingerprint,
+            "protocol": PROTOCOL_VERSION,
         }
 
     def test_the_trust_view_is_refreshed_before_the_response_is_sent(self, real, zfs):
@@ -675,7 +698,7 @@ class TestEnroll:
         view when the client sees it, whether or not the response has been closed."""
         cert = make_client_cert()
         body = enroll_body(real.server_fp, "host-a", cert, real.trust.token())
-        client = real.app.test_client()
+        client = plain_client(real.app)
         resp = client.post("/enroll", json=body)              # unbuffered: not closed
         assert resp.status_code == 200
         assert real.gateway.lookup(cert.fingerprint) is not None
@@ -690,7 +713,7 @@ class TestEnroll:
         monkeypatch.setattr(api_module, "REQUEST_REFRESH_WAIT", 0.05)
         cert = make_client_cert()
         body = enroll_body(real.server_fp, "host-a", cert, real.trust.token())
-        client = real.app.test_client()
+        client = plain_client(real.app)
         real.gateway._lock.acquire()
         try:
             resp = client.post("/enroll", json=body)
@@ -1278,6 +1301,7 @@ class TestEnrollOutcomesAgainstTheStore:
         assert resp.status_code == 200
         assert resp.get_json() == {
             "status": "enrolled", "client_id": "host-a", "fingerprint": keep.fingerprint,
+            "protocol": PROTOCOL_VERSION,
         }
         assert real.trust.token_state() is TokenState.CONSUMED
         assert set(real.trust.pins()) == {keep.fingerprint}
@@ -1320,6 +1344,7 @@ class TestEnrollOutcomesAgainstTheStore:
         assert resp.status_code == 200
         assert resp.get_json() == {
             "status": "already_trusted", "client_id": "host-a", "fingerprint": cert.fingerprint,
+            "protocol": PROTOCOL_VERSION,
         }
         assert real.trust.token_state() is TokenState.ACTIVE
         assert real.trust.trust_key() == before            # nothing was written
@@ -1441,6 +1466,7 @@ class TestEnrollOutcomeMapping:
         assert resp.status_code == 200
         assert resp.get_json() == {
             "status": "enrolled", "client_id": "host-z", "fingerprint": cert.fingerprint,
+            "protocol": PROTOCOL_VERSION,
         }
         assert authed.gateway.refresh_calls == 1
 
@@ -1546,7 +1572,7 @@ class TestEnrollOutcomeMapping:
         self, authed, caplog
     ):
         authed.gateway.refresh_result = False
-        client = authed.app.test_client()                 # unbuffered: closed by hand
+        client = plain_client(authed.app)                 # unbuffered: closed by hand
         cert = make_client_cert()
         token = str(identity.make_token(authed.server_fp)[0])
         body = enroll_body(authed.server_fp, "host-z", cert, token)
@@ -1561,7 +1587,7 @@ class TestEnrollOutcomeMapping:
         assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
     def test_an_inline_refresh_that_succeeds_is_not_repeated_or_warned_about(self, authed, caplog):
-        client = authed.app.test_client()
+        client = plain_client(authed.app)
         token = str(identity.make_token(authed.server_fp)[0])
         body = enroll_body(authed.server_fp, "host-z", make_client_cert(), token)
         with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
@@ -1782,6 +1808,7 @@ class TestRotate:
         assert resp.status_code == 200
         assert resp.get_json() == {
             "status": "rotated", "client_id": "host-a", "fingerprint": successor.fingerprint,
+            "protocol": PROTOCOL_VERSION,
         }
         pins = enrolled.trust.pins()
         assert set(pins) == {enrolled.old.fingerprint, successor.fingerprint}
@@ -1815,6 +1842,7 @@ class TestRotate:
         assert resp.status_code == 200
         assert resp.get_json() == {
             "status": "already", "client_id": "host-a", "fingerprint": successor.fingerprint,
+            "protocol": PROTOCOL_VERSION,
         }
         assert enrolled.trust.trust_key() == before
 
@@ -2008,6 +2036,7 @@ class TestRotateOutcomeMapping:
             assert resp.status_code == 200
             assert resp.get_json() == {
                 "status": str(outcome), "client_id": CLIENT_ID, "fingerprint": successor.fingerprint,
+                "protocol": PROTOCOL_VERSION,
             }
             assert authed.gateway.refresh_calls == before + 1
 
@@ -2087,8 +2116,9 @@ class TestPredecessorRetirement:
         assert pair.client().get("/whoami").status_code == 200
         assert pair.gateway.retire_calls == [] and pair.gateway.refresh_calls == 0
 
-    def test_it_happens_on_any_authenticated_route(self, pair, zfs):
-        assert pair.client(pair.successor).get("/config").status_code == 200
+    @pytest.mark.parametrize("url", ["/whoami", "/backup/client1/pool/data/resume_token"])
+    def test_it_happens_on_any_authenticated_route(self, pair, zfs, url):
+        assert pair.client(pair.successor).get(url).status_code == 200
         assert pair.gateway.retire_calls == [pair.successor.fingerprint]
 
     def test_the_store_call_precedes_the_refresh_and_the_refresh_precedes_the_view(self, pair):
@@ -2102,7 +2132,7 @@ class TestPredecessorRetirement:
         assert order == ["retire", "refresh", "view"]
 
     def test_the_refresh_runs_inline_with_the_request_budget_and_is_not_repeated(self, pair):
-        client = pair.app.test_client()
+        client = plain_client(pair.app)
         client.environ_base["SSL_CLIENT_CERT"] = pair.successor.cert_pem
         resp = client.get("/whoami")                         # not buffered: not closed yet
         assert resp.status_code == 200 and pair.gateway.retire_calls == [pair.successor.fingerprint]
@@ -2113,7 +2143,7 @@ class TestPredecessorRetirement:
 
     def test_a_refresh_that_fails_inline_is_retried_once_the_response_is_closed(self, pair, caplog):
         pair.gateway.refresh_result = False
-        client = pair.app.test_client()
+        client = plain_client(pair.app)
         client.environ_base["SSL_CLIENT_CERT"] = pair.successor.cert_pem
         with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
             resp = client.get("/whoami")
@@ -2211,7 +2241,9 @@ class TestRotationEndToEnd:
         assert enrolled.client(old).get("/whoami").status_code == 200          # still pinned
         with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
             resp = enrolled.client(successor).get("/whoami")                    # first use
-        assert resp.get_json() == {"client_id": "host-a", "fingerprint": successor.fingerprint}
+        assert resp.get_json() == {
+            "client_id": "host-a", "fingerprint": successor.fingerprint, "protocol": PROTOCOL_VERSION,
+        }
         pins = enrolled.trust.pins()
         assert set(pins) == {successor.fingerprint} and pins[successor.fingerprint].predecessor is None
         assert enrolled.client(old).get("/whoami").status_code == 403          # gone, at once

@@ -18,8 +18,10 @@ from simple_websocket import ConnectionClosed
 from _api_support import Authed, CLIENT_ID
 from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
 from zfsbackup.backup_manager import (
-    DatasetInfo, DatasetManager, SnapshotInfo, PROP_CLIENT_ID, PROP_SOURCE_DATASET,
+    DatasetInfo, DatasetManager, SnapshotInfo, PROP_CLIENT_ID, PROP_CONFIG,
+    PROP_SOURCE_DATASET,
 )
+from zfsbackup.api import canonical_dataset_config
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, RetentionRule, RemoteServerConfig,
 )
@@ -40,6 +42,14 @@ def _make_config(**kwargs) -> BackupConfig:
 
 #: The websocket route of `client1`'s `pool/data`.
 STREAM_PATH = f'/backup/{CLIENT_ID}/pool/data/stream'
+
+#: A negotiate `config` the server accepts (plan B-1a: it is required and decoded), and a body.
+GOOD_CONFIG = DatasetConfig(name='pool/data').to_property()
+
+
+def _body(snapshots=(), **extra):
+    """A valid negotiate body for `pool/data`."""
+    return {'snapshots': list(snapshots), 'config': GOOD_CONFIG, **extra}
 
 
 def _make_dsi(name='pool/data') -> DatasetInfo:
@@ -95,85 +105,47 @@ class TestHealthEndpoint:
         assert data['status'] == 'ok'
 
 
-class TestConfigEndpoint:
-    def test_config_returns_fields(self, client):
-        resp = client.get('/config')
-        assert resp.status_code == 200
-        data = resp.get_json()
-        assert 'snapshot_prefix' in data
-        assert 'check_interval_seconds' in data
-        assert 'prune_interval_seconds' in data
-        assert 'api_host' in data
-        assert 'api_port' in data
-        assert 'dry_run' in data
+class TestInfoEndpointsAreGone:
+    """`/config`, `/datasets` and `/datasets/<name>/snapshots` were removed (plan S-4): they told
+    every enrolled client about the server's own configuration, datasets and snapshots, and
+    nothing in the client uses them."""
 
-    def test_prune_interval_seconds_is_a_number_when_unset(self, mocker):
-        # config/model.py item 3c.3: BackupConfig.prune_interval defaults to None
-        # ("derive from check_interval"). The /config endpoint uses
-        # effective_prune_interval, so it must still emit a JSON number
-        # here, not null/None -- a client parsing this response should
-        # never have to special-case a missing prune interval.
-        config = _make_config()
-        assert config.prune_interval is None
-        resp = _authed_client(mocker, config).get('/config')
-        data = resp.get_json()
-        assert data['prune_interval_seconds'] is not None
-        assert isinstance(data['prune_interval_seconds'], (int, float))
-        assert data['prune_interval_seconds'] == config.check_interval.total_seconds()
+    PATHS = [
+        '/config',
+        '/datasets',
+        '/datasets/pool/data/snapshots',
+        '/datasets/pool/unknown/snapshots',
+    ]
 
-    def test_config_values_match(self, mocker):
-        config = _make_config(snapshot_prefix='testsnap', dry_run=True)
-        resp = _authed_client(mocker, config).get('/config')
-        data = resp.get_json()
-        assert data['snapshot_prefix'] == 'testsnap'
-        assert data['dry_run'] is True
-
-
-class TestDatasetsEndpoint:
-    def test_datasets_returns_list(self, client):
-        resp = client.get('/datasets')
-        assert resp.status_code == 200
-        data = resp.get_json()
-        assert isinstance(data, list)
-        assert len(data) == 1
-
-    def test_dataset_entry_has_required_fields(self, client):
-        resp = client.get('/datasets')
-        entry = resp.get_json()[0]
-        assert 'name' in entry
-        assert 'frequency_seconds' in entry
-        assert 'recursive' in entry
-        assert 'retention_rules' in entry
-
-    def test_dataset_name_matches(self, client):
-        resp = client.get('/datasets')
-        assert resp.get_json()[0]['name'] == 'pool/data'
-
-
-class TestSnapshotsEndpoint:
-    def test_snapshots_returns_empty_list(self, mocker):
-        mocker.patch.object(DatasetManager, 'list_snapshots', return_value=[])
-        resp = _authed_client(mocker, _make_config()).get('/datasets/pool/data/snapshots')
-        assert resp.status_code == 200
-        assert resp.get_json() == []
-
-    def test_snapshots_returns_404_for_unknown_dataset(self, client):
-        resp = client.get('/datasets/pool/unknown/snapshots')
+    @pytest.mark.parametrize('path', PATHS)
+    @pytest.mark.parametrize('method', ['get', 'post'])
+    def test_an_authenticated_caller_gets_404(self, client, path, method):
+        resp = getattr(client, method)(path)
         assert resp.status_code == 404
 
-    def test_snapshots_returns_snapshot_info(self, mocker):
-        fs = Filesystem('pool/data')
-        snap = ZFSSnapshot(fs, 'autosnap_20240101120000')
-        snap_info = SnapshotInfo(snap, 'autosnap')
+    @pytest.mark.parametrize('path', PATHS)
+    def test_the_404_discloses_nothing_about_the_server(self, client, path):
+        body = client.get(path).get_data(as_text=True)
+        for needle in ('snapshot_prefix', 'check_interval', 'api_port', 'dry_run',
+                       'retention', 'frequency', 'autosnap', 'pool/data'):
+            assert needle not in body.replace(path, '')
 
-        mocker.patch.object(DatasetManager, 'list_snapshots', return_value=[snap_info])
-        resp = _authed_client(mocker, _make_config()).get('/datasets/pool/data/snapshots')
-        assert resp.status_code == 200
-        data = resp.get_json()
-        assert len(data) == 1
-        assert data[0]['name'] == 'autosnap_20240101120000'
-        assert 'timestamp' in data[0]
-        assert 'age_seconds' in data[0]
+    @pytest.mark.parametrize('path', PATHS)
+    def test_an_unauthenticated_caller_is_not_told_the_route_is_missing(self, authed, path):
+        # routing errors are answered only to authenticated clients: 401, not 404
+        assert authed.client(None).get(path).status_code == 401
+
+    def test_the_routes_and_views_are_not_registered(self, authed):
+        app = authed.app
+        for view in ('get_config', 'get_datasets', 'get_snapshots'):
+            assert view not in app.view_functions
+        rules = {r.rule for r in app.url_map.iter_rules()}
+        assert not {r for r in rules if r.startswith(('/config', '/datasets'))}
+
+    def test_the_server_keeps_no_dataset_manager(self):
+        # the removed routes were the only users of the `DatasetManager` the app built
+        import zfsbackup.api as api
+        assert not hasattr(api, 'DatasetManager')
 
 
 class TestBackupRegisterIsGone:
@@ -207,13 +179,14 @@ class TestBackupNegotiate:
 
     def test_negotiate_finds_common_snapshot(self, client_with_remote, mocker):
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
+        mocker.patch('zfsbackup.api.zfs.set')
         mock_snap = MagicMock()
         mock_snap.short = 'autosnap_20240101120000'
         mocker.patch('zfsbackup.api.zfs.list', return_value=[mock_snap])
 
         resp = client_with_remote.post(
             '/backup/client1/pool/data/negotiate',
-            json={'snapshots': ['autosnap_20240101120000', 'autosnap_20240102120000']},
+            json=_body(['autosnap_20240101120000', 'autosnap_20240102120000']),
         )
         assert resp.status_code == 200
         data = resp.get_json()
@@ -222,23 +195,25 @@ class TestBackupNegotiate:
 
     def test_negotiate_returns_none_common_when_no_overlap(self, client_with_remote, mocker):
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
+        mocker.patch('zfsbackup.api.zfs.set')
         mock_snap = MagicMock()
         mock_snap.short = 'autosnap_99990101120000'
         mocker.patch('zfsbackup.api.zfs.list', return_value=[mock_snap])
 
         resp = client_with_remote.post(
             '/backup/client1/pool/data/negotiate',
-            json={'snapshots': ['autosnap_20240101120000']},
+            json=_body(['autosnap_20240101120000']),
         )
         assert resp.status_code == 200
         assert resp.get_json()['common_snapshot'] is None
 
     def test_negotiate_returns_500_on_snapshot_list_error(self, client_with_remote, mocker):
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
+        mocker.patch('zfsbackup.api.zfs.set')
         mocker.patch('zfsbackup.api.zfs.list', side_effect=Exception('zfs error'))
         resp = client_with_remote.post(
             '/backup/client1/pool/data/negotiate',
-            json={'snapshots': ['autosnap_20240101120000']},
+            json=_body(['autosnap_20240101120000']),
         )
         assert resp.status_code == 500
         assert 'error' in resp.get_json()
@@ -331,12 +306,15 @@ class TestBackupStream:
         with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')  # must not raise
 
-    def test_stream_creates_filesystem_when_not_exists(self, mocker):
+    def test_stream_recreates_a_filesystem_that_vanished_before_the_receive(self, mocker):
+        """The dataset existed for the ownership and configuration reads and is gone at the
+        last check (a stream is refused outright when it never existed: see
+        `TestStreamNeedsANegotiatedConfig`)."""
         config = _make_config(
             remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
         )
         handler, authed = self._get_handler(config, mocker)
-        mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
+        mocker.patch('zfsbackup.api.zfs.exists', side_effect=[True, True, False])
         mock_create = mocker.patch('zfsbackup.api.zfs.create')
         mocker.patch('zfsbackup.api.zfs.set')
 
@@ -460,6 +438,7 @@ class TestBackupStreamWriteFailure:
         handler = authed.app.view_functions['backup_stream'].__wrapped__
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         mocker.patch('zfsbackup.api.zfs.receive.filesystem', return_value=writer)
+        self.set = mocker.patch('zfsbackup.api.zfs.set')       # only the recreate branch stamps
         return handler, authed
 
     def _run(self, handler, authed, ws):
@@ -539,6 +518,7 @@ class TestBackupStreamWriteFailure:
         ws.receive.side_effect = [b'x', json.dumps({'done': True})]
         self._run(handler, authed, ws)
         assert order == [('write', b'x'), ('close',), ('send', {'status': 'ok'})]
+        self.set.assert_not_called()                     # no post-receive re-stamp: `-o` did it
 
     def test_a_failing_close_after_done_reports_the_error_not_ok(self, mocker):
         writer = MagicMock()
@@ -631,6 +611,9 @@ class TestBackupStreamWriteFailure:
 # ---------------------------------------------------------------------------
 
 SERVER_DS = 'pool/backups/client1/data'     # target / client id / the client dataset minus its pool
+NOT_NEGOTIATED = {
+    'error': f'no configuration is recorded for {SERVER_DS}; negotiate before streaming'
+}
 TOKEN = (
     '1-a292306e5-b8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a7968'
     '064cae0f26c48f2499525a9c520f1d00aacfa4bf2d34b33531818f238834cbe7b33276a20c97382e5f31'
@@ -644,6 +627,17 @@ def source_props(mocker):
     """No recorded `org.zfsbackup:source_dataset` unless a test says so, and
     never a real `zfs get`. Tests that need one set `.return_value`."""
     return mocker.patch('zfsbackup.api.read_zfsbackup_properties', return_value={})
+
+
+@pytest.fixture(autouse=True)
+def stored_config(mocker):
+    """What negotiate stored as the dataset's local `org.zfsbackup:config`
+    (plan B-1b): a stream reads it with `zfs.get.value` and refuses without
+    it. `Stream` re-patches it to record ordering; tests that need another
+    value (or none) set `.return_value`."""
+    return mocker.patch(
+        'zfsbackup.api.zfs.get.value', return_value=canonical_dataset_config(GOOD_CONFIG)
+    )
 
 
 def _remote_config(**kwargs):
@@ -682,11 +676,16 @@ class Stream:
         self.create = mocker.patch('zfsbackup.api.zfs.create')
         self.set = mocker.patch('zfsbackup.api.zfs.set')
         self.abort = mocker.patch('zfsbackup.api.zfs.receive.abort')
+        # What negotiate stored on the server dataset (plan B-1b): the stream
+        # reads it (local source) and puts it in effect with `-o`.
+        self.stored = canonical_dataset_config(GOOD_CONFIG)
+        self.get_value = mocker.patch('zfsbackup.api.zfs.get.value', return_value=self.stored)
         self.writer = MagicMock()
         self.receive = mocker.patch('zfsbackup.api.zfs.receive.filesystem', return_value=self.writer)
         self.create.side_effect = lambda *a, **k: self.order.append('create')
         self.set.side_effect = lambda *a, **k: self.order.append('set')
         self.abort.side_effect = lambda *a, **k: self.order.append('abort')
+        self.get_value.side_effect = lambda *a, **k: (self.order.append('get'), self.stored)[1]
         self.receive.side_effect = lambda *a, **k: (self.order.append('receive'), self.writer)[1]
 
     @property
@@ -714,7 +713,8 @@ class Stream:
         return [json.loads(c[0][0]) for c in self.ws.send.call_args_list]
 
     def untouched(self):
-        for m in (self.exists, self.list, self.create, self.set, self.abort, self.receive):
+        for m in (self.exists, self.list, self.create, self.set, self.abort, self.receive,
+                  self.get_value):
             m.assert_not_called()
         self.ws.receive.assert_not_called()
 
@@ -798,10 +798,12 @@ class TestFreshStreamDiscardsPartialState:
         self, stream, caplog
     ):
         stream.token(TOKEN)
-        stream.exists.side_effect = [True, True, False]      # source check, token lookup, after the abort
+        # ownership check, config read, token lookup, after the abort
+        stream.exists.side_effect = [True, True, True, False]
         with caplog.at_level(logging.INFO, logger='zfsbackup.api'):
             stream.run('fresh')
-        assert stream.order == ['abort', 'create', 'set', 'receive']
+        # the config is read BEFORE the abort (which can destroy the dataset)
+        assert stream.order == ['get', 'abort', 'create', 'set', 'receive']
         stream.abort.assert_called_once()
         assert str(stream.abort.call_args[0][0]) == SERVER_DS
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
@@ -814,7 +816,7 @@ class TestFreshStreamDiscardsPartialState:
     def test_fresh_with_a_token_and_a_surviving_dataset_does_not_recreate_it(self, stream):
         stream.token(TOKEN)
         stream.run('fresh')                                  # an incremental's dataset survives the abort
-        assert stream.order == ['abort', 'receive']
+        assert stream.order == ['get', 'abort', 'receive']
         stream.create.assert_not_called()
 
     def test_fresh_without_a_token_neither_warns_nor_aborts(self, stream, caplog):
@@ -823,14 +825,15 @@ class TestFreshStreamDiscardsPartialState:
             stream.run('fresh')
         stream.abort.assert_not_called()
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert stream.order == ['receive']
+        assert stream.order == ['get', 'receive']
 
-    def test_fresh_with_no_dataset_creates_it_and_never_looks_for_a_token(self, stream):
+    def test_fresh_with_no_dataset_is_refused_and_never_looks_for_a_token(self, stream):
         stream.exists.return_value = False
         stream.run('fresh')
+        assert stream.sent == [NOT_NEGOTIATED]
         stream.list.assert_not_called()
-        stream.abort.assert_not_called()
-        assert stream.order == ['create', 'set', 'receive']
+        for m in (stream.abort, stream.create, stream.set, stream.receive):
+            m.assert_not_called()
 
     def test_the_token_none_string_means_no_state(self, stream):
         stream.token('none')
@@ -850,7 +853,7 @@ class TestFreshStreamDiscardsPartialState:
         stream.run('resume')
         stream.abort.assert_not_called()
         stream.list.assert_not_called()
-        assert stream.order == ['receive']
+        assert stream.order == ['get', 'receive']
         assert stream.sent == [{'status': 'ok'}]
 
     @pytest.mark.parametrize('text', [
@@ -861,7 +864,7 @@ class TestFreshStreamDiscardsPartialState:
     def test_an_abort_that_finds_nothing_to_abort_is_a_clean_success(self, stream, text, caplog):
         stream.token(TOKEN)
         stream.abort.side_effect = Exception(text)
-        stream.exists.side_effect = [True, True, False]
+        stream.exists.side_effect = [True, True, True, False]
         with caplog.at_level(logging.INFO, logger='zfsbackup.api'):
             stream.run('fresh')
         assert stream.sent == [{'status': 'ok'}]
@@ -897,7 +900,7 @@ class TestFreshStreamDiscardsPartialState:
         assert stream.gate.active == 0
 
     def test_an_exists_failure_during_the_token_lookup_is_reported_the_same_way(self, stream):
-        stream.exists.side_effect = [True, RuntimeError('exists failed')]
+        stream.exists.side_effect = [True, True, RuntimeError('exists failed')]
         stream.run('fresh')
         assert stream.sent == [{
             'error': f'Failed to check {SERVER_DS} for partial receive state: exists failed'
@@ -931,11 +934,12 @@ class TestDryRunAndOrder:
                      "refusing to mix in 'pool/data'"
         }]
 
-    def test_the_order_is_source_check_then_token_lookup_then_abort_then_create_then_receive(
+    def test_the_order_is_source_check_config_read_token_lookup_abort_create_receive(
         self, stream, source_props
     ):
         events = []
         source_props.side_effect = lambda ds: events.append('source') or {}
+        stream.get_value.side_effect = lambda *a, **k: (events.append('config'), stream.stored)[1]
         stream.token(TOKEN)
         stream.list.side_effect = lambda **k: events.append('token') or [
             MagicMock(__getitem__=MagicMock(return_value=TOKEN))
@@ -944,9 +948,9 @@ class TestDryRunAndOrder:
         stream.create.side_effect = lambda *a, **k: events.append('create')
         stream.set.side_effect = lambda *a, **k: events.append('set')
         stream.receive.side_effect = lambda *a, **k: (events.append('receive'), stream.writer)[1]
-        stream.exists.side_effect = [True, True, False]
+        stream.exists.side_effect = [True, True, True, False]
         stream.run('fresh')
-        assert events == ['source', 'token', 'abort', 'create', 'set', 'receive']
+        assert events == ['source', 'config', 'token', 'abort', 'create', 'set', 'receive']
 
 
 class TestSourceDatasetCheck:
@@ -994,7 +998,7 @@ class TestSourceDatasetCheck:
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         mocker.patch('zfsbackup.api.zfs.set')
         mocker.patch('zfsbackup.api.zfs.list', return_value=[])
-        resp = client_with_remote.post('/backup/client1/pool/data/negotiate', json={'snapshots': []})
+        resp = client_with_remote.post('/backup/client1/pool/data/negotiate', json=_body())
         assert resp.status_code == 200
 
     def test_negotiate_on_a_missing_dataset_reads_no_properties(
@@ -1031,10 +1035,10 @@ class TestSourceDatasetCheck:
         gate = client_with_remote.application.extensions['zfsbackup.stream_gate']
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         source_props.return_value = {'org.zfsbackup:source_dataset': 'tank/data'}
-        assert client_with_remote.post('/backup/client1/pool/data/negotiate', json={}).status_code == 409
+        assert client_with_remote.post('/backup/client1/pool/data/negotiate', json=_body()).status_code == 409
         assert gate.active == 0
         source_props.side_effect = RuntimeError('x')
-        assert client_with_remote.post('/backup/client1/pool/data/negotiate', json={}).status_code == 500
+        assert client_with_remote.post('/backup/client1/pool/data/negotiate', json=_body()).status_code == 500
         assert gate.active == 0
 
     def test_the_server_dataset_drops_the_pool_so_two_pools_collide(self, stream, source_props):
@@ -1077,7 +1081,7 @@ class TestSourceDatasetCheck:
         stream.exists.return_value = False
         stream.run('resume')
         source_props.assert_not_called()
-        assert stream.sent == [{'status': 'ok'}]
+        assert stream.sent == [NOT_NEGOTIATED]            # and nothing else runs
 
     def test_the_property_is_read_for_the_server_dataset(self, stream, source_props):
         stream.run('resume')
@@ -1143,7 +1147,7 @@ class TestFreshWithTokenThroughRealCommands:
         mock_subprocess.setup_multi(
             (token_row,),               # zfs list -o name,type,receive_resume_token
             abort,                      # zfs receive -A
-            ('',),                      # zfs receive (the stream)
+            ('',),                      # zfs receive (the stream); no `zfs set` after it
         )
 
     def test_the_abort_argv_runs_before_the_receive_argv(self, mocker, mock_subprocess):
@@ -1164,6 +1168,7 @@ class TestFreshWithTokenThroughRealCommands:
         assert argvs[1] == ['receive', '-A', SERVER_DS]
         assert argvs[2][0] == 'receive' and '-A' not in argvs[2]
         assert '-s' in argvs[2] and argvs[2][-1] == SERVER_DS
+        assert argvs[2].count('-o') == 3 and '-x' not in argvs[2]      # the owned values, in the receive
         assert json.loads(ws.send.call_args[0][0]) == {'status': 'ok'}
 
     def test_resume_runs_no_list_and_no_abort(self, mocker, mock_subprocess):
@@ -1178,7 +1183,7 @@ class TestFreshWithTokenThroughRealCommands:
         with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
         argvs = [c[0][0][1:] for c in mock_subprocess.call_args_list]
-        assert len(argvs) == 1 and argvs[0][0] == 'receive' and '-A' not in argvs[0]
+        assert [a[0] for a in argvs] == ['receive'] and '-A' not in argvs[0]
 
     @pytest.mark.parametrize('stderr, rc, clean', [
         (f"cannot receive: '{SERVER_DS}' does not have any resumable receive state to abort", 1, True),
@@ -1442,21 +1447,28 @@ class TestDatasetLockIsReleased:
             return revert
 
         def create_fails(s, props):
-            s.exists.return_value = False
+            # the abort destroys the dataset, so the recreate branch runs
+            s.token('1-t')
+            s.exists.side_effect = [True, True, True, False]
             s.create.side_effect = RuntimeError('x')
 
             def revert():
+                s.exists.side_effect = None
                 s.exists.return_value = True
                 s.create.side_effect = None
+                s.token(None)
             return revert
 
         def set_fails(s, props):
-            s.exists.return_value = False
+            s.token('1-t')
+            s.exists.side_effect = [True, True, True, False]
             s.set.side_effect = RuntimeError('x')
 
             def revert():
+                s.exists.side_effect = None
                 s.exists.return_value = True
                 s.set.side_effect = None
+                s.token(None)
             return revert
 
         def receive_fails(s, props):
@@ -1534,41 +1546,65 @@ class TestDatasetLockIsReleased:
 
 
 class TestCreateRestampsOwnership:
-    def test_a_created_dataset_gets_client_id_and_source_dataset_after_create_before_receive(
-        self, stream
-    ):
-        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_SOURCE_DATASET
+    """The recreate branch: the dataset existed when the configuration was read and is gone
+    when the receive is about to start (a FULL receive created it outside the negotiate flow
+    and the fresh-mode abort destroyed it whole). All three owned properties are stamped by
+    `zfs.set`, with the values read BEFORE the abort. The receive then carries them as `-o`
+    too (`TestStreamOwnsTheServerProperties` in test_zfsbackup_api_receive.py);
+    there is no stamp after it."""
 
-        stream.exists.return_value = False
-        stream.run('resume')
+    def owned(self, stream, client='client1', dataset='pool/data'):
+        return {
+            PROP_CONFIG: stream.stored,
+            PROP_CLIENT_ID: client,
+            PROP_SOURCE_DATASET: dataset,
+        }
+
+    def test_a_dataset_the_abort_destroyed_is_recreated_and_stamped_with_all_three(self, stream):
+        stream.token(TOKEN)
+        stream.exists.side_effect = [True, True, True, False]
+        stream.run('fresh')
+        assert stream.order == ['get', 'abort', 'create', 'set', 'receive']
         stream.create.assert_called_once()
         assert str(stream.create.call_args[0][0]) == SERVER_DS
-        stream.set.assert_called_once()
+        assert stream.set.call_count == 1
         assert str(stream.set.call_args[0][0]) == SERVER_DS
-        assert stream.set.call_args[0][1] == {
-            PROP_CLIENT_ID: 'client1', PROP_SOURCE_DATASET: 'pool/data',
-        }
-        assert stream.order == ['create', 'set', 'receive']
+        assert stream.set.call_args[0][1] == self.owned(stream)
+        assert stream.sent == [{'status': 'ok'}]
 
-    def test_a_dataset_the_abort_destroyed_is_recreated_and_restamped(self, stream):
-        stream.token(TOKEN)
+    def test_a_vanished_dataset_is_stamped_after_the_create_and_before_the_receive(self, stream):
         stream.exists.side_effect = [True, True, False]
-        stream.run('fresh')
-        assert stream.order == ['abort', 'create', 'set', 'receive']
+        stream.run('resume')
+        assert stream.order == ['get', 'create', 'set', 'receive']
+        assert stream.set.call_args[0][1] == self.owned(stream)
 
-    def test_an_existing_dataset_is_not_restamped(self, stream):
+    def test_the_stamped_config_is_the_one_read_before_the_abort(self, stream):
+        """Not whatever a later read would return: the dataset is gone by then."""
+        stream.token(TOKEN)
+        stream.exists.side_effect = [True, True, True, False]
+        stream.get_value.side_effect = [stream.stored, None, None]
+        stream.run('fresh')
+        assert stream.get_value.call_count == 1
+        assert stream.set.call_args[0][1][PROP_CONFIG] == stream.stored
+
+    def test_an_existing_dataset_is_never_stamped(self, stream):
+        """Only the receive's own `-o` writes to it; nothing is written before or after."""
         stream.run('resume')
         stream.create.assert_not_called()
         stream.set.assert_not_called()
+        assert stream.order == ['get', 'receive']
 
-    def test_the_restamp_uses_the_requesting_clients_names(self, stream):
-        stream.exists.return_value = False
+    def test_the_stamp_uses_the_requesting_clients_names(self, stream):
+        stream.exists.side_effect = [True, True, False]
         stream.run('resume', client='other', dataset='tank/vol')
-        assert stream.set.call_args[0][1]['org.zfsbackup:client_id'] == 'other'
-        assert stream.set.call_args[0][1]['org.zfsbackup:source_dataset'] == 'tank/vol'
+        assert stream.set.call_count == 1
+        stamped = stream.set.call_args[0][1]
+        assert stamped[PROP_CLIENT_ID] == 'other'
+        assert stamped[PROP_SOURCE_DATASET] == 'tank/vol'
+        assert stream.receive.call_args.kwargs['props'] == stamped
 
     def test_a_create_failure_replies_an_error_and_receives_nothing(self, stream):
-        stream.exists.return_value = False
+        stream.exists.side_effect = [True, True, False]
         stream.create.side_effect = RuntimeError('pool is full')
         stream.run('resume')
         assert stream.sent == [{'error': f'Failed to create {SERVER_DS}: pool is full'}]
@@ -1578,7 +1614,7 @@ class TestCreateRestampsOwnership:
         assert stream.gate.active == 0
 
     def test_a_set_failure_replies_an_error_and_receives_nothing(self, stream):
-        stream.exists.return_value = False
+        stream.exists.side_effect = [True, True, False]
         stream.set.side_effect = RuntimeError('permission denied')
         stream.run('resume')
         assert stream.sent == [{'error': f'Failed to create {SERVER_DS}: permission denied'}]
@@ -1734,8 +1770,10 @@ class TestServerPathsUseTheBoundId:
         self, client_with_remote, mocker
     ):
         mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
+        mocker.patch('zfsbackup.api.zfs.create')
+        mocker.patch('zfsbackup.api.zfs.set')
         mocker.patch('zfsbackup.api.zfs.list', return_value=[])
-        resp = client_with_remote.post('/backup/client1/pool/data/negotiate', json={'snapshots': []})
+        resp = client_with_remote.post('/backup/client1/pool/data/negotiate', json=_body())
         assert resp.status_code == 200
         assert resp.get_json()['server_dataset'] == SERVER_DS
 
@@ -1761,21 +1799,24 @@ class TestServerPathsUseTheBoundId:
     def test_each_certificate_gets_its_own_namespace(self, authed_with_remote, mocker):
         """Two clients negotiating the same client dataset name get disjoint server datasets."""
         mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
+        mocker.patch('zfsbackup.api.zfs.create')
+        mocker.patch('zfsbackup.api.zfs.set')
         mocker.patch('zfsbackup.api.zfs.list', return_value=[])
         other = authed_with_remote.cert_for('client2')
-        a = authed_with_remote.client().post('/backup/client1/pool/data/negotiate', json={})
-        b = authed_with_remote.client(other).post('/backup/client2/pool/data/negotiate', json={})
+        a = authed_with_remote.client().post('/backup/client1/pool/data/negotiate', json=_body())
+        b = authed_with_remote.client(other).post('/backup/client2/pool/data/negotiate', json=_body())
         assert a.get_json()['server_dataset'] == 'pool/backups/client1/data'
         assert b.get_json()['server_dataset'] == 'pool/backups/client2/data'
 
     def test_the_stream_handler_ignores_the_client_id_it_is_called_with(self, stream):
         """The view's `client_id` argument is the URL's; the binding (`g.client_id`) is what
         names the server dataset, the claim and the stamped properties."""
-        stream.exists.return_value = False
+        stream.exists.side_effect = [True, True, False]
         with stream.authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             stream.handler(stream.ws, 'someone-else', 'pool/data')
         assert str(stream.create.call_args[0][0]) == SERVER_DS
-        assert stream.set.call_args[0][1][PROP_CLIENT_ID] == 'client1'
+        assert {c[0][1][PROP_CLIENT_ID] for c in stream.set.call_args_list} == {'client1'}
+        assert stream.receive.call_args.kwargs['props'][PROP_CLIENT_ID] == 'client1'
 
     def test_resume_token_looks_under_the_bound_id(self, authed_with_remote, mocker):
         exists = mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
@@ -1893,10 +1934,12 @@ class TestRequestSizeLimit:
 
     def test_a_body_under_the_limit_is_served(self, authed_with_remote, mocker):
         mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
+        mocker.patch('zfsbackup.api.zfs.create')
+        mocker.patch('zfsbackup.api.zfs.set')
         mocker.patch('zfsbackup.api.zfs.list', return_value=[])
         resp = authed_with_remote.client().post(
             '/backup/client1/pool/data/negotiate',
-            data=b'{"snapshots": [], "pad": "' + b'x' * (512 * 1024) + b'"}',
+            data=json.dumps(_body(pad='x' * (512 * 1024))).encode(),
             content_type='application/json',
         )
         assert resp.status_code == 200

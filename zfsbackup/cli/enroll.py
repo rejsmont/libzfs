@@ -47,6 +47,12 @@ configured paths, `client_cert_file`/`client_key_file` are updated with one
 `commit_config`). A partial success swaps nothing: re-running reuses the same
 successor and the servers that already accepted answer `already`.
 
+Wire protocol (plan S-5). A 200 from `/enroll` or `/rotate` whose `protocol` is
+missing or unsupported means an old or incompatible server that has ALREADY
+changed state. The local success path runs unchanged (destination recorded,
+client key promoted, certificate swapped) and the command then exits 1 with a
+message saying the server accepted but will refuse backups.
+
 Exit codes: 0 ok; 1 refused, pin mismatch, bad token, `client_id_taken`,
 `cert_bound_elsewhere`, other 4xx; 2 usage; 75 unreachable, timeout, 503 with
 `retry`, conflict or busy; 78 unusable database.
@@ -87,6 +93,12 @@ from zfsbackup.config.store import (
     ConfigConflict,
     ensure_client_id,
     validate_config,
+)
+from zfsbackup.protocol import (
+    PROTOCOL_REFUSAL_REASON,
+    PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOLS,
+    protocol_headers,
 )
 
 __all__ = ["register", "enroll", "identity_rotate"]
@@ -280,6 +292,9 @@ class _Server:
         self.host = parts.hostname or ""
         self.port = parts.port or 443
         self.session = identity.pinned_session(ident, pin, _TIMEOUT[1])
+        # The wire protocol version (plan S-5) rides on every request: the
+        # server answers 426 to one without it, `/health` aside.
+        self.session.headers.update(protocol_headers())
 
     def close(self) -> None:
         self.session.close()
@@ -344,6 +359,38 @@ def _error_text(reply: _Reply, *secrets: str) -> str:
     return _clean(reply.body.get("error", ""), *secrets)
 
 
+def _protocol_mismatch(url: str, server_protocol: Any) -> CliError:
+    """The refusal for a server speaking another wire protocol (exit 1)."""
+    if isinstance(server_protocol, int) and not isinstance(server_protocol, bool):
+        theirs = f"protocol {server_protocol}"
+    else:
+        theirs = "no wire protocol version (it predates the protocol check)"
+    return CliError(
+        f"{url} speaks {theirs}, but this client speaks protocol {PROTOCOL_VERSION}. "
+        "The client and the server must be upgraded together"
+    )
+
+
+def _supported_protocol(value: Any) -> bool:
+    """Is `value` (a body's `protocol`) a version this client speaks?"""
+    return (
+        isinstance(value, int) and not isinstance(value, bool) and value in SUPPORTED_PROTOCOLS
+    )
+
+
+def _protocol_after_success(url: str, server_protocol: Any, what: str) -> CliError:
+    """The failure (exit 1) for a server that ACCEPTED `what` (an enrollment, a
+    rotation) but answered with no wire protocol version or an unsupported
+    one. The server-side change has happened, so the message says so and the
+    caller completes its local success path before raising this."""
+    return CliError(
+        f"the server accepted {what}, but it speaks an unsupported wire protocol "
+        "(or none): backups to it will be refused until client and server run matching "
+        "versions. The server-side change was NOT undone.\n"
+        + str(_protocol_mismatch(url, server_protocol))
+    )
+
+
 def _generic_failure(reply: _Reply, url: str, what: str, *secrets: str) -> CliError:
     """The `CliError` for a response that is not the expected success and was
     not handled specifically by the caller."""
@@ -351,6 +398,8 @@ def _generic_failure(reply: _Reply, url: str, what: str, *secrets: str) -> CliEr
     text = _error_text(reply, *secrets)
     reason = _clean(reply.body.get("reason", ""))
     suffix = f": {text}" if text else ""
+    if status == 426 and reason == PROTOCOL_REFUSAL_REASON:
+        return _protocol_mismatch(url, reply.body.get("protocol"))
     if status == 503:
         if reply.body.get("retry"):
             return _Retry(f"{url} is busy (HTTP 503){suffix}; retry in a moment", "busy")
@@ -410,6 +459,9 @@ def _whoami(
         fingerprint = reply.body.get("fingerprint")
         if not isinstance(client_id, str) or not isinstance(fingerprint, str):
             raise CliError(f"{server.base} answered /whoami with an unexpected body")
+        protocol = reply.body.get("protocol")
+        if not _supported_protocol(protocol):
+            raise _protocol_mismatch(server.base, protocol)
         if fingerprint != ours.fingerprint:
             raise CliError(
                 f"{server.base} reports certificate {fingerprint} for this connection, "
@@ -470,6 +522,10 @@ class _Commits:
         self.generation: Optional[int] = None
         self.store_id: Optional[int] = None
         self.generated_client_id: Optional[str] = None
+        # Failures to raise only AFTER the local success path has run and been
+        # reported: the server already changed state (a server speaking no
+        # supported protocol that nevertheless accepted the enrollment).
+        self.late_errors: List[CliError] = []
 
     def record(self, generation: Optional[int], store_id: Optional[int]) -> None:
         self.committed = True
@@ -709,6 +765,8 @@ def enroll(
         _echo(line)
     if commits.committed:
         notify_daemon(resolved, commits.generation, commits.store_id, request=request)
+    if commits.late_errors:
+        raise commits.late_errors[0]
 
 
 def _discard_successor(directory: Path, fingerprint: str) -> None:
@@ -984,6 +1042,7 @@ def _enroll(
         status = _enroll_with_token(
             url, token_fp, ours, client_id, label, token, secret, secrets, new_key, name,
             configured=marker is not None and marker.new_cert is not None,
+            late=commits.late_errors,
         )
         sent_token = True
         spent = status == "enrolled"
@@ -1150,10 +1209,16 @@ def _enroll_with_token(
     new_key: bool = False,
     name: str = "<destination>",
     configured: bool = False,
+    late: Optional[List[CliError]] = None,
 ) -> str:
     """`POST /enroll`, on a connection pinned to the token's fingerprint and
     carrying NO client certificate. Returns the server's status: `enrolled`
-    (the token was spent) or `already_trusted` (it was not)."""
+    (the token was spent) or `already_trusted` (it was not).
+
+    A 200 whose `protocol` is missing or unsupported is still a success on the
+    server (the token may be spent, the certificate is pinned there), so the
+    status is returned and the failure is appended to `late` for the caller to
+    raise once it has recorded the destination and reported."""
     payload = identity.enrollment_payload(
         token_fp, client_id, ours.fingerprint, identity.secret_hash(bytes(secret))
     )
@@ -1186,6 +1251,11 @@ def _enroll_with_token(
                 f"{url} answered /enroll with a client id or fingerprint that is not this "
                 "host's; nothing was recorded"
             )
+        if late is not None and not _supported_protocol(reply.body.get("protocol")):
+            late.append(_protocol_after_success(
+                url, reply.body.get("protocol"),
+                "the enrollment" if status == "enrolled" else "this host's certificate",
+            ))
         return str(status)
     raise _enroll_failure(reply, url, secrets, new_key, name, ours, configured)
 
@@ -1201,6 +1271,9 @@ class _RotateResult:
     url: str
     result: str  # rotated | already | refused | unreachable | busy
     detail: str = ""
+    #: The server accepted the successor but speaks no supported protocol.
+    protocol_problem: bool = False
+    server_protocol: Any = None
 
     @property
     def ok(self) -> bool:
@@ -1257,6 +1330,14 @@ def _rotate_one(
         if reply.body.get("fingerprint") != successor.fingerprint:
             return _RotateResult(
                 name, url, "refused", "the server pinned a different certificate than sent"
+            )
+        if not _supported_protocol(reply.body.get("protocol")):
+            return _RotateResult(
+                name, url, str(status),
+                "accepted, but the server speaks an unsupported wire protocol (or none): "
+                "backups to it will be refused until client and server run matching versions",
+                protocol_problem=True,
+                server_protocol=reply.body.get("protocol"),
             )
         return _RotateResult(name, url, str(status))
     reason = reply.body.get("reason")
@@ -1433,10 +1514,29 @@ def identity_rotate(state: Any, cert: Optional[str], key: Optional[str]) -> None
             raise CliError(message)
         raise _Retry(message)
 
+    # A server that accepted the successor but speaks no supported protocol
+    # still holds it as pending (the server-side change cannot be undone from
+    # here) and cannot take backups either way, so the swap goes ahead exactly
+    # as on success: holding back would leave a possibly stolen current key in
+    # use at every destination that works. The exit status reports the problem.
+    mismatched = [r for r in results if r.protocol_problem]
     if not files.configured:
         _swap_generated(files, current, successor, where)
-        return
-    _swap_configured(state, resolved, snapshot, new_cert, new_key, current, successor, results)
+    else:
+        _swap_configured(
+            state, resolved, snapshot, new_cert, new_key, current, successor, results
+        )
+    if mismatched:
+        names = ", ".join(repr(r.name) for r in mismatched)
+        raise CliError(
+            f"the client certificate WAS rotated, but destination(s) {names} accepted the "
+            "successor while speaking an unsupported wire protocol (or none): backups to "
+            "them will be refused until client and server run matching versions. The "
+            "server-side change was NOT undone.\n"
+            + "\n".join(
+                str(_protocol_mismatch(r.url, r.server_protocol)) for r in mismatched
+            )
+        )
 
 
 def _swap_generated(

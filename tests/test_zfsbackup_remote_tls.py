@@ -47,7 +47,8 @@ import websocket
 
 from _remote_support import (  # noqa: F401  (fixtures: _client_tls_template, client_tls_dir, ...)
     CLIENT_FP, HTTPS_BASE, OTHER_SERVER_FP, SERVER_FP, _client_tls_template, client_tls_dir,
-    fake_connect_pinned, new_client_identity, snapshot_info, whoami_json, write_identity_files,
+    fake_connect_pinned, new_client_identity, protocol_refusal_json, snapshot_info, whoami_json,
+    write_identity_files,
 )
 from libzfseasy.types import Filesystem
 from libzfseasy.zfs import StreamHandle
@@ -58,6 +59,7 @@ from zfsbackup.config import (
     BackupConfig, DatasetConfig, Destination, RemoteDatasetConfig, RemoteServerConfig,
 )
 from zfsbackup.identity import PinMismatch
+from zfsbackup.protocol import protocol_headers
 from zfsbackup.remote import (
     HTTP_TIMEOUT, NO_CLIENT_ID_MESSAGE, RemoteBackupManager, _alert_reason,
     _endpoint, _exc_chain, _is_reset, _json_body, _presented_fingerprint,
@@ -1473,6 +1475,283 @@ class TestWhoamiAnswers:
         assert request.url == "https://backup.example.com/whoami"
 
 
+class TestProtocolVersion:
+    """Plan S-5, client side. Every request names the wire protocol (`X-Zfsbackup-Protocol`): the
+    session's default header for HTTP and `header=` on the websocket upgrade. A server that answers
+    426, or whose `/whoami` lacks a supported `protocol`, is a destination-level refusal like an
+    auth one: ONE deduplicated ERROR, the destination is skipped for the cycle, no `zfs send` is
+    started (the websocket stage reaps the send it had already begun), and a good `/whoami`
+    later logs the recovery."""
+
+    HEADER = {"X-Zfsbackup-Protocol": "1"}
+    UPGRADE = ("Upgrade the client and the server to the same zfsbackup release; "
+               "the destination is skipped until then")
+
+    @staticmethod
+    def refused_text(theirs):
+        return (f"{WHERE} refuses this client's zfsbackup protocol 1 (HTTP 426); it speaks {theirs}. "
+                f"{TestProtocolVersion.UPGRADE}")
+
+    @staticmethod
+    def whoami_text(theirs):
+        return (f"{WHERE} speaks {theirs}; this client speaks zfsbackup protocol 1. "
+                f"{TestProtocolVersion.UPGRADE}")
+
+    NO_VERSION = "no protocol version (an older zfsbackup release)"
+
+    # -- the header is sent ---------------------------------------------------------------------
+    def test_every_http_request_names_the_protocol(self, rig):
+        assert rig.cycle() is True
+        assert [r.path for r in rig.rm.request_history] == [
+            "/whoami", "/backup/client1/pool/data/negotiate", "/backup/client1/pool/data/resume_token"]
+        for request in rig.rm.request_history:
+            assert request.headers.get("X-Zfsbackup-Protocol") == "1", request.path
+
+    def test_every_destination_session_sends_it(self, make_rig):
+        rig = make_rig(destinations={
+            "offsite": Destination(url=BASE, server_fingerprint=SERVER_FP),
+            "dc2": Destination(url="https://dc2.example.com", server_fingerprint=SERVER_FP),
+        })
+        rig.mgr.begin_cycle()
+        assert rig.run(dest="offsite") is True and rig.run(dest="dc2") is True
+        hosts = {r.hostname for r in rig.rm.request_history}
+        assert hosts == {"backup.example.com", "dc2.example.com"}
+        assert all(r.headers.get("X-Zfsbackup-Protocol") == "1" for r in rig.rm.request_history)
+
+    def test_the_websocket_upgrade_names_the_protocol(self, rig):
+        assert rig.cycle() is True
+        assert rig.ws.connect.call_args.kwargs["header"] == self.HEADER
+
+    def test_a_rebuilt_transport_sends_it_too(self, rig):
+        rig.cycle()
+        rig.mgr.close()
+        rig.rm.reset_mock()
+        assert rig.cycle() is True
+        assert rig.rm.request_history
+        assert all(r.headers.get("X-Zfsbackup-Protocol") == "1" for r in rig.rm.request_history)
+
+    def test_the_session_header_is_the_protocol_headers_dict(self, rig):
+        rig.cycle()
+        assert protocol_headers() == self.HEADER
+        assert rig.transport.session.headers["X-Zfsbackup-Protocol"] == "1"
+
+    # -- a 426 ----------------------------------------------------------------------------------
+    @pytest.mark.parametrize("stage", HTTP_STAGES)
+    @pytest.mark.parametrize("body, theirs", [
+        (protocol_refusal_json(2), "protocol 2"),
+        (protocol_refusal_json(7), "protocol 7"),
+        ({"error": "x", "reason": "protocol"}, NO_VERSION),
+        ({"error": "x", "reason": "protocol", "protocol": "2"}, NO_VERSION),
+        ({"error": "x", "reason": "protocol", "protocol": True}, NO_VERSION),
+        ({"error": "x", "reason": "protocol", "protocol": 2.0}, NO_VERSION),
+        ({"error": "x", "reason": "protocol", "protocol": None}, NO_VERSION),
+        ({}, NO_VERSION),
+        ({"error": "something else", "reason": "other", "protocol": 3}, "protocol 3"),
+        ("<html>426 Upgrade Required</html>", NO_VERSION),
+        (b"", NO_VERSION),
+    ], ids=["v2", "v7", "no-protocol", "string", "bool", "float", "null", "empty-json",
+            "other-reason", "html", "empty-body"])
+    def test_a_426_is_one_deduplicated_error_and_nothing_is_sent(
+        self, make_rig, caplog, stage, body, theirs
+    ):
+        rig = make_rig(datasets=("pool/a", "pool/b"))
+        response = {"content": body} if isinstance(body, bytes) else (
+            {"text": body} if isinstance(body, str) else {"json": body})
+        rig.refuse(stages=(stage,), status_code=426, **response)
+        assert rig.cycle(0) is False
+        assert errors(caplog) == [self.refused_text(theirs)]
+        # skipped for the rest of the cycle: the next dataset makes no request and logs nothing
+        count, logged = rig.http_count, len(own(caplog))
+        assert rig.run(1) is False
+        assert rig.http_count == count and len(own(caplog)) == logged
+        assert rig.sends == [] and rig.fake_connect.calls == []
+        rig.ws_cls.assert_not_called()
+        rig.set_inflight.assert_not_called()
+        rig.set_anchor.assert_not_called()
+        if stage == "whoami":
+            assert rig.requests("/negotiate") == [] and rig.requests("/resume_token") == []
+
+    def test_a_standing_426_is_error_once_then_debug(self, make_rig, caplog):
+        """A server that speaks another protocol answers every endpoint with 426: the `/whoami`
+        refusal is the one logged, and it keeps the later cycles quiet."""
+        rig = make_rig()
+        rig.refuse(status_code=426, json=protocol_refusal_json(2))
+        for _ in range(4):
+            assert rig.cycle() is False
+        assert levels(caplog, "refuses this client's zfsbackup protocol") == ["ERROR", "DEBUG", "DEBUG", "DEBUG"]
+        assert rig.requests("/negotiate") == [] and rig.sends == []
+
+    def test_the_message_names_both_versions_and_the_remedy(self, make_rig, caplog):
+        rig = make_rig()
+        rig.refuse(stages=("whoami",), status_code=426, json=protocol_refusal_json(2))
+        rig.cycle()
+        (message,) = errors(caplog)
+        assert "protocol 1" in message and "protocol 2" in message and "HTTP 426" in message
+        assert "Upgrade the client and the server" in message and "skipped until then" in message
+
+    def test_a_426_is_not_an_auth_refusal_message(self, make_rig, caplog):
+        rig = make_rig()
+        rig.refuse(stages=("whoami",), status_code=426, json=protocol_refusal_json(2))
+        rig.cycle()
+        (message,) = errors(caplog)
+        assert "re-enroll" not in message and "does not trust" not in message
+
+    def test_a_426_after_a_good_whoami_still_sends_nothing(self, make_rig, caplog):
+        """A server that answered `/whoami` and then refuses the next request (it was downgraded in
+        between): the same refusal at that stage, no resume-token request, no send."""
+        rig = make_rig()
+        rig.rm.post(NEGOTIATE, status_code=426, json=protocol_refusal_json(2))
+        assert rig.cycle() is False
+        assert len(rig.requests("/whoami")) == 1 and rig.requests("/resume_token") == []
+        assert len(errors(caplog)) == 1 and rig.sends == []
+
+    # -- a 426 on the websocket upgrade -----------------------------------------------------------
+    @pytest.mark.parametrize("body, theirs", [
+        ({"error": "x", "reason": "protocol", "protocol": 2, "supported": [2]}, "protocol 2"),
+        ({"error": "x", "reason": "protocol"}, NO_VERSION),
+        (None, NO_VERSION),
+    ], ids=["v2", "no-protocol", "no-body"])
+    def test_a_426_on_the_upgrade_reaps_the_started_send_and_skips_the_destination(
+        self, make_rig, caplog, body, theirs
+    ):
+        rig = make_rig(datasets=("pool/a", "pool/b"))
+        if body is None:
+            rig.ws.connect.side_effect = websocket.WebSocketBadStatusException(
+                "Handshake status 426", 426, "Upgrade Required", {}, b"")
+        else:
+            rig.ws.connect.side_effect = bad_status(426, **body)
+        assert rig.cycle(0) is False
+        assert errors(caplog) == [self.refused_text(theirs)]
+        assert len(rig.sends) == 1 and rig.streams[0].closes == 1          # started, then reaped
+        rig.ws.send_binary.assert_not_called()
+        rig.set_anchor.assert_not_called()
+        rig.clear_inflight.assert_not_called()
+        # the destination is skipped for the rest of the cycle: no second whoami / send
+        count, sends = rig.http_count, len(rig.send_snapshot.call_args_list)
+        assert rig.run(1) is False
+        assert rig.http_count == count and len(rig.send_snapshot.call_args_list) == sends
+        assert [lv for lv, _ in own(caplog) if lv == "ERROR"] == ["ERROR"]
+
+    def test_a_426_on_the_upgrade_is_not_a_transfer_failure(self, rig, caplog):
+        rig.ws.connect.side_effect = bad_status(426, "x", reason="protocol", protocol=2, supported=[2])
+        rig.cycle()
+        assert not [m for m in errors(caplog) if m.startswith("Transfer failed")]
+        assert (None, "offsite") in rig.mgr._refusal_logged
+
+    # -- /whoami without a supported protocol -------------------------------------------------------
+    @pytest.mark.parametrize("protocol, theirs", [
+        (None, NO_VERSION),               # the key is absent: a server that predates the check
+        (2, "protocol 2"), (0, "protocol 0"), (-1, "protocol -1"), (99, "protocol 99"),
+        ("1", NO_VERSION), (True, NO_VERSION), (False, NO_VERSION), (1.0, NO_VERSION),
+        ([1], NO_VERSION), ({"v": 1}, NO_VERSION),
+    ], ids=["missing", "two", "zero", "minus-one", "ninety-nine", "string-one", "true", "false",
+            "float-one", "list", "dict"])
+    def test_a_whoami_without_a_supported_protocol_is_refused(self, make_rig, caplog, protocol, theirs):
+        rig = make_rig(datasets=("pool/a", "pool/b"))
+        body = whoami_json("client1", rig.client_fp, protocol=None)
+        if protocol is not None:
+            body["protocol"] = protocol
+        rig.route_whoami(json=body)
+        assert rig.cycle(0) is False
+        assert errors(caplog) == [self.whoami_text(theirs)]
+        count = rig.http_count
+        assert rig.run(1) is False and rig.http_count == count          # skipped for the cycle
+        assert rig.sends == [] and rig.requests("/negotiate") == []
+        rig.ws_cls.assert_not_called()
+
+    def test_a_json_null_protocol_is_refused_like_a_missing_one(self, rig, caplog):
+        body = whoami_json("client1", rig.client_fp, protocol=None)
+        body["protocol"] = None
+        rig.route_whoami(json=body)
+        assert rig.cycle() is False
+        assert errors(caplog) == [self.whoami_text(self.NO_VERSION)]
+
+    def test_a_whoami_refusal_is_deduplicated(self, rig, caplog):
+        rig.route_whoami(json=whoami_json("client1", rig.client_fp, protocol=2))
+        for _ in range(3):
+            rig.cycle()
+        assert levels(caplog, "this client speaks zfsbackup protocol") == ["ERROR", "DEBUG", "DEBUG"]
+
+    def test_the_protocol_is_judged_before_the_bound_id(self, rig, caplog):
+        """An unsupported server is not asked who it thinks we are: that answer cannot be trusted."""
+        rig.route_whoami(json=whoami_json("B-host", rig.client_fp, protocol=2))
+        rig.cycle()
+        assert errors(caplog) == [self.whoami_text("protocol 2")]
+
+    def test_an_answer_without_a_client_id_is_still_the_unexpected_answer(self, rig, caplog):
+        rig.route_whoami(json={"fingerprint": rig.client_fp, "protocol": 2})
+        rig.cycle()
+        (message,) = errors(caplog)
+        assert message.startswith("unexpected /whoami answer from")
+        assert "protocol" not in message
+
+    def test_a_supported_protocol_with_an_ignored_fingerprint_passes(self, rig):
+        rig.route_whoami(json=whoami_json("client1", "00" * 32, protocol=1))
+        assert rig.cycle() is True
+
+    def test_a_refusal_is_an_error_even_on_the_very_first_cycle_of_a_new_manager(self, make_rig, caplog):
+        for _ in range(2):
+            rig = make_rig()
+            rig.route_whoami(json=whoami_json("client1", rig.client_fp, protocol=2))
+            rig.cycle()
+        assert len(errors(caplog)) == 2
+
+    # -- recovery -------------------------------------------------------------------------------
+    @pytest.mark.parametrize("how", ["426-whoami", "426-negotiate", "whoami-v2", "whoami-missing"])
+    def test_an_upgraded_server_logs_the_recovery_and_re_arms_the_error(self, make_rig, caplog, how):
+        rig = make_rig()
+
+        def break_it():
+            if how == "426-whoami":
+                rig.refuse(stages=("whoami",), status_code=426, json=protocol_refusal_json(2))
+            elif how == "426-negotiate":
+                rig.refuse(stages=("negotiate",), status_code=426, json=protocol_refusal_json(2))
+            elif how == "whoami-v2":
+                rig.route_whoami(json=whoami_json("client1", rig.client_fp, protocol=2))
+            else:
+                rig.route_whoami(json=whoami_json("client1", rig.client_fp, protocol=None))
+
+        break_it()
+        assert rig.cycle() is False
+        rig.heal()                                  # the server is upgraded
+        assert rig.cycle() is True
+        assert levels(caplog, "accepts this client again as 'client1'") == ["INFO"]
+        assert rig.mgr._refusal_logged == {}
+        assert len(rig.sends) == 1                  # and it sends again
+        break_it()
+        assert rig.cycle() is False
+        assert len(errors(caplog)) == 2 and errors(caplog)[0] == errors(caplog)[1]
+
+    def test_a_server_that_changes_its_version_is_a_new_error(self, rig, caplog):
+        rig.refuse(stages=("whoami",), status_code=426, json=protocol_refusal_json(2))
+        rig.cycle()
+        rig.cycle()
+        rig.refuse(stages=("whoami",), status_code=426, json=protocol_refusal_json(3))
+        rig.cycle()
+        assert [lv for lv, m in own(caplog) if "refuses this client's zfsbackup protocol" in m] == [
+            "ERROR", "DEBUG", "ERROR"]
+
+    def test_a_protocol_refusal_then_an_auth_refusal_are_separate_errors(self, rig, caplog):
+        rig.refuse(stages=("whoami",), status_code=426, json=protocol_refusal_json(2))
+        rig.cycle()
+        rig.refuse(stages=("whoami",), status_code=403, json={"error": "client not trusted"})
+        rig.cycle()
+        assert len(errors(caplog)) == 2
+        assert "protocol" in errors(caplog)[0] and "does not trust" in errors(caplog)[1]
+
+    def test_destinations_refuse_independently(self, make_rig, caplog):
+        rig = make_rig(destinations={
+            "offsite": Destination(url=BASE, server_fingerprint=SERVER_FP),
+            "dc2": Destination(url="https://dc2.example.com", server_fingerprint=SERVER_FP),
+        })
+        rig.rm.get(WHOAMI, status_code=426, json=protocol_refusal_json(2))
+        rig.mgr.begin_cycle()
+        assert rig.run(dest="offsite") is False
+        assert rig.run(dest="dc2") is True                      # the other destination is unaffected
+        assert len(errors(caplog)) == 1 and "destination offsite" in errors(caplog)[0]
+        assert len(rig.sends) == 1
+
+
 class TestResetHeuristics:
     """Row 9/10: under TLS 1.3 a server that rejects our certificate sometimes shows up as a reset or
     broken pipe after the handshake instead of an alert: retry `/whoami` once, then report it."""
@@ -2030,17 +2309,50 @@ class _Writer:
             fh.write(f"{self.n}\n")
 
 
+class FakeServerZfs(types.SimpleNamespace):
+    """Everything `zfsbackup.api` asks of libzfseasy for a receive, in memory, and stateful like
+    the real thing: negotiate creates the dataset and stores the config (`set`), a stream reads it
+    back (`get.value`) and is refused without it, and the receive's `-o` lands in the same store.
+    The state lives in the (forked) API worker's copy; the properties the receive was given are
+    appended to the `received_props` file next to the received bytes, for the client side to read."""
+
+    def __init__(self, received_path):
+        self.store = {}                    # dataset name -> {property: value}
+        self.received_props_path = received_path + ".props"
+        super().__init__(
+            exists=lambda ds: str(ds) in self.store,
+            create=self._create,
+            set=self._set,
+            list=lambda *a, **k: [],
+            get=types.SimpleNamespace(value=self._value),
+            receive=types.SimpleNamespace(
+                filesystem=lambda ds, props=None, **k: self._receive(received_path, ds, props),
+                abort=lambda *a, **k: None,
+            ),
+        )
+
+    def _create(self, ds, *a, **k):
+        self.store.setdefault(str(ds), {})
+
+    def _set(self, ds, props, *a, **k):
+        self.store.setdefault(str(ds), {}).update(props)
+
+    def _value(self, ds, prop, sources=None, raw=False):
+        return self.store.get(str(ds), {}).get(prop)
+
+    def _receive(self, received_path, ds, props):
+        self.store.setdefault(str(ds), {}).update(props or {})
+        with open(self.received_props_path, "a") as fh:
+            fh.write(json.dumps({"dataset": str(ds), "props": props}) + "\n")
+        return _Writer(received_path)
+
+    def properties_of(self, name):
+        """What `zfsbackup.api.read_zfsbackup_properties` shows for `name`."""
+        return dict(self.store.get(name, {}))
+
+
 def fake_server_zfs(received_path):
-    """Everything `zfsbackup.api` asks of libzfseasy for a first-time receive, in memory."""
-    return types.SimpleNamespace(
-        exists=lambda ds: False,
-        create=lambda *a, **k: None,
-        set=lambda *a, **k: None,
-        list=lambda *a, **k: [],
-        receive=types.SimpleNamespace(
-            filesystem=lambda *a, **k: _Writer(received_path), abort=lambda *a, **k: None,
-        ),
-    )
+    return FakeServerZfs(received_path)
 
 
 class _Snap:
@@ -2164,7 +2476,11 @@ class World:
         caplog.set_level(logging.DEBUG, logger="zfsbackup.remote")
         self.caplog = caplog
         # the server's zfs, in memory: the forked worker inherits the patched module
-        mocker.patch("zfsbackup.api.zfs", fake_server_zfs(str(self.received_path)))
+        self.server_zfs = fake_server_zfs(str(self.received_path))
+        mocker.patch("zfsbackup.api.zfs", self.server_zfs)
+        mocker.patch(
+            "zfsbackup.api.read_zfsbackup_properties", lambda ds: self.server_zfs.properties_of(ds.name)
+        )
         config = BackupConfig(
             datasets=[DatasetConfig(name="testpool/srv")], api_host="127.0.0.1", api_port=self.port,
             remote_backup=RemoteServerConfig(target_dataset="testpool/backups", enabled=True),
@@ -2227,6 +2543,7 @@ class World:
             "signature": base64.b64encode(ident.sign_payload(who.key_path, payload)).decode(),
         }
         session = ident.pinned_session(None, self.server_fp, timeout=10)
+        session.headers.update(protocol_headers())
         try:
             response = session.post(f"{self.base}/enroll", json=body)
         finally:
@@ -2296,6 +2613,13 @@ class World:
             return []
         return [int(x) for x in self.received_path.read_text().split()]
 
+    def received_props(self):
+        """The `props` (`-o`) each fake `zfs receive` was started with, in order."""
+        path = Path(str(self.received_path) + ".props")
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
     def new_sends(self, since):
         return self.sends[since:]
 
@@ -2356,12 +2680,18 @@ class TestRealTls:
         assert world.errors_since(mark) == []
         assert world.local.pins == [("offsite", None, "autosnap_20261020120000")]
         assert any("client TLS identity" in m for _, m in own(caplog)[mark:])
+        # negotiate stored the config; the receive put it in effect with `-o`, with the BOUND id
+        (received,) = world.received_props()
+        assert received["dataset"] == "testpool/backups/client-a/data"
+        assert received["props"]["org.zfsbackup:client_id"] == "client-a"
+        assert received["props"]["org.zfsbackup:source_dataset"] == "testpool/data"
+        assert received["props"]["org.zfsbackup:config"]
 
     def test_1b_the_second_cycle_is_incremental_or_nothing_to_send(self, world):
         world.enroll()
         mgr, dsi = world.manager()
         assert world.cycle(mgr, dsi) is True
-        # the fake server holds no snapshot (exists -> False), so it is a full send again, but the
+        # the fake server holds no snapshot (list -> []), so it is a full send again, but the
         # whole path -- whoami, negotiate, resume_token, wss -- works a second time on the live sessions
         assert world.cycle(mgr, dsi) is True
         assert _eventually(lambda: len(world.received()) == 2, 10)
@@ -2508,6 +2838,7 @@ class TestRealTls:
         body = {"version": 1, "successor_cert_pem": nxt.cert_pem,
                 "signature": base64.b64encode(ident.sign_payload(nxt.key_path, payload)).decode()}
         session = ident.pinned_session(world.client, world.server_fp, timeout=10)
+        session.headers.update(protocol_headers())
         try:
             response = session.post(f"{world.base}/rotate", json=body)
         finally:

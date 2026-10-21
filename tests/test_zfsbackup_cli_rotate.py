@@ -62,6 +62,7 @@ from _enroll_support import (
 from zfsbackup import daemonlock, identity
 from zfsbackup.cli import enroll as enroll_cli
 from zfsbackup.config.store import dispose_all, revoke_pin
+from zfsbackup.protocol import PROTOCOL_HEADER, PROTOCOL_VERSION
 
 
 #: Every test here talks TLS to a real API server on 127.0.0.1.
@@ -423,7 +424,8 @@ class TestServerAnswers:
         assert "NOTHING was swapped" in result.stderr
 
     def test_a_server_that_knows_the_certificate_under_another_id(self, run, one):
-        one.srv.on("/whoami", Reply(200, {"client_id": "someone-else", "fingerprint": one.old.fingerprint}))
+        one.srv.on("/whoami", Reply(200, {"client_id": "someone-else", "fingerprint": one.old.fingerprint,
+                                     "protocol": PROTOCOL_VERSION}))
         result = rotate(run, one.db)
         assert result.exit_code == 1
         assert table_rows(result) == {"offsite": "refused"}
@@ -818,3 +820,304 @@ class TestUsage:
         assert result.exit_code == 0
         assert "-c, --config" in result.stdout and "-v, --verbose" in result.stdout
         assert "--cert" in result.stdout and "--key" in result.stdout
+
+
+# --------------------------------------------------------------------------
+# The wire protocol version (plan S-5)
+# --------------------------------------------------------------------------
+
+PROTOCOL_KEY = "HTTP_" + PROTOCOL_HEADER.upper().replace("-", "_")
+UPGRADE = "client and the server must be upgraded together"
+NO_VERSION = "no wire protocol version (it predates the protocol check)"
+
+
+class TestProtocolVersion:
+    """`identity rotate` names its protocol in `/whoami` and `/rotate`; a 426 with reason `protocol`
+    from either, or a `/whoami` with a missing / non-int / bool / unsupported `protocol`, is a
+    `refused` row (exit 1) with the upgrade advice, and nothing is swapped."""
+
+    @staticmethod
+    def refusal(protocol=2, **extra):
+        body = {"error": "unsupported zfsbackup protocol", "reason": "protocol"}
+        if protocol is not None:
+            body["protocol"] = protocol
+            body["supported"] = [protocol]
+        return Reply(426, {**body, **extra})
+
+    def assert_nothing_swapped(self, one, result, before):
+        assert pair_bytes(one.db) == before and len(next_files(one.db)) == 2
+        assert "NOTHING was swapped" in result.stderr
+
+    # -- the header ----------------------------------------------------------------------------------
+    def test_whoami_and_rotate_carry_it(self, run, one):
+        assert rotate(run, one.db).exit_code == 0
+        assert [e.path for e in one.srv.log] == ["/whoami", "/rotate"]
+        for request in one.srv.log:
+            assert request.headers[PROTOCOL_KEY] == str(PROTOCOL_VERSION) == "1", request
+
+    def test_every_destination_gets_it(self, run, two):
+        assert rotate(run, two.db).exit_code == 0
+        for srv in (two.srv, two.b):
+            assert srv.log and all(e.headers.get(PROTOCOL_KEY) == "1" for e in srv.log)
+
+    # -- a real server that speaks another protocol ----------------------------------------------------
+    def test_a_real_server_with_another_protocol_is_a_refused_row_and_nothing_is_swapped(
+        self, run, one, monkeypatch
+    ):
+        from zfsbackup import api
+        monkeypatch.setattr(api, "PROTOCOL_VERSION", 2)
+        monkeypatch.setattr(api, "SUPPORTED_PROTOCOLS", frozenset({2}))
+        before = pair_bytes(one.db)
+        result = rotate(run, one.db)
+        assert result.exit_code == 1, result.stderr
+        assert table_rows(result) == {"offsite": "refused"}
+        assert f"{one.srv.url} speaks protocol 2, but this client speaks protocol 1" in result.stdout
+        assert UPGRADE in result.stdout
+        assert [e.path for e in one.srv.log] == ["/whoami"]          # /rotate was never sent
+        self.assert_nothing_swapped(one, result, before)
+
+    # -- a scripted 426 -------------------------------------------------------------------------------------
+    @pytest.mark.parametrize("path", ["/whoami", "/rotate"])
+    @pytest.mark.parametrize("reply, theirs", [
+        (refusal.__func__(2), "protocol 2"),
+        (refusal.__func__(5), "protocol 5"),
+        (refusal.__func__(None), NO_VERSION),
+        (Reply(426, {"reason": "protocol", "protocol": "2"}), NO_VERSION),
+        (Reply(426, {"reason": "protocol", "protocol": True}), NO_VERSION),
+        (Reply(426, {"reason": "protocol", "protocol": None}), NO_VERSION),
+        (Reply(426, {"reason": "protocol"}), NO_VERSION),
+    ], ids=["v2", "v5", "no-protocol", "string", "bool", "null", "bare"])
+    def test_a_426_with_reason_protocol_is_a_refused_row(self, run, one, path, reply, theirs):
+        one.srv.on(path, reply)
+        before = pair_bytes(one.db)
+        result = rotate(run, one.db)
+        assert result.exit_code == 1, result.stderr
+        assert table_rows(result) == {"offsite": "refused"}
+        assert f"{one.srv.url} speaks {theirs}, but this client speaks protocol 1" in result.stdout
+        assert f"The {UPGRADE}" in result.stdout
+        self.assert_nothing_swapped(one, result, before)
+
+    @pytest.mark.parametrize("path", ["/whoami", "/rotate"])
+    @pytest.mark.parametrize("reply", [
+        Reply(426, {"error": "boom"}),
+        Reply(426, {"error": "boom", "reason": "other", "protocol": 2}),
+        Reply(426, {}),
+        Reply(426, "<html>upgrade required</html>"),
+    ], ids=["no-reason", "other-reason", "empty", "html"])
+    def test_a_426_with_another_reason_is_the_generic_refused_row(self, run, one, path, reply):
+        one.srv.on(path, reply)
+        before = pair_bytes(one.db)
+        result = rotate(run, one.db)
+        assert result.exit_code == 1, result.stderr
+        assert table_rows(result) == {"offsite": "refused"}
+        assert f"answered HTTP 426 to {path}" in result.stdout
+        assert UPGRADE not in result.stdout
+        self.assert_nothing_swapped(one, result, before)
+
+    # -- a /whoami without a supported protocol -------------------------------------------------------------
+    @pytest.mark.parametrize("field, theirs", [
+        (None, NO_VERSION), (2, "protocol 2"), (0, "protocol 0"),
+        ("1", NO_VERSION), (True, NO_VERSION), (False, NO_VERSION), (1.0, NO_VERSION),
+        ([1], NO_VERSION),
+    ], ids=["missing", "two", "zero", "string-one", "true", "false", "float-one", "list"])
+    def test_a_whoami_without_a_supported_protocol_is_a_refused_row(self, run, one, field, theirs):
+        body = {"client_id": CID, "fingerprint": one.old.fingerprint}
+        if field is not None:
+            body["protocol"] = field
+        one.srv.on("/whoami", Reply(200, body))
+        before = pair_bytes(one.db)
+        result = rotate(run, one.db)
+        assert result.exit_code == 1, result.stderr
+        assert table_rows(result) == {"offsite": "refused"}
+        assert f"speaks {theirs}, but this client speaks protocol 1" in result.stdout
+        assert one.srv.seen("/rotate") == []
+        self.assert_nothing_swapped(one, result, before)
+
+    def test_a_json_null_protocol_is_refused(self, run, one):
+        one.srv.on("/whoami", Reply(200, {"client_id": CID, "fingerprint": one.old.fingerprint,
+                                         "protocol": None}))
+        result = rotate(run, one.db)
+        assert table_rows(result) == {"offsite": "refused"} and NO_VERSION in result.stdout
+
+    # -- order of the checks on a 200 /whoami ---------------------------------------------------------------
+    @pytest.mark.parametrize("body", [
+        {"client_id": 7, "fingerprint": "ab" * 32, "protocol": 99},
+        {"client_id": CID, "fingerprint": None, "protocol": 99},
+        {"client_id": CID, "protocol": 99},
+        {"fingerprint": "ab" * 32, "protocol": 99},
+        {"protocol": 99},
+    ], ids=["id-int", "fingerprint-null", "no-fingerprint", "no-id", "protocol-only"])
+    def test_a_malformed_body_is_the_body_error_not_the_protocol_one(self, run, one, body):
+        one.srv.on("/whoami", Reply(200, body))
+        result = rotate(run, one.db)
+        assert result.exit_code == 1
+        assert table_rows(result) == {"offsite": "refused"}
+        assert "unexpected body" in result.stdout and UPGRADE not in result.stdout
+
+    def test_the_protocol_is_judged_before_the_fingerprint_and_the_client_id(self, run, one):
+        one.srv.on("/whoami", Reply(200, {"client_id": "someone-else", "fingerprint": "ee" * 32,
+                                         "protocol": 2}))
+        result = rotate(run, one.db)
+        assert UPGRADE in result.stdout
+        assert "knows this certificate as client id" not in result.stdout
+
+    def test_a_supported_protocol_gets_the_client_id_check(self, run, one):
+        one.srv.on("/whoami", Reply(200, {"client_id": "someone-else", "fingerprint": one.old.fingerprint,
+                                         "protocol": 1}))
+        result = rotate(run, one.db)
+        assert "knows this certificate as client id 'someone-else'" in result.stdout
+        assert UPGRADE not in result.stdout
+
+
+# --------------------------------------------------------------------------
+# A 200 from /rotate whose `protocol` is missing or unsupported: the swap still happens, then
+# the command exits 1
+# --------------------------------------------------------------------------
+
+def set_protocol(value):
+    def edit(body):
+        if value == "missing":
+            body.pop("protocol", None)
+        else:
+            body["protocol"] = value
+    return edit
+
+
+LATE = [
+    pytest.param("missing", NO_VERSION, id="missing"),
+    pytest.param(99, "protocol 99", id="99"),
+    pytest.param("1", NO_VERSION, id="string-one"),
+    pytest.param(True, NO_VERSION, id="true"),
+]
+
+
+class TestProtocolAfterAcceptedRotation:
+    """One destination ACCEPTED the successor (a real 200 from the real app, with `protocol` edited
+    out) but names no supported protocol; the others are fine. The server-side change cannot be undone
+    and every other destination has the successor too, so the swap goes ahead; the exit status 1
+    reports the problem."""
+
+    ROW = "accepted, but the server speaks an unsupported wire protocol"
+
+    @pytest.mark.parametrize("value, theirs", LATE)
+    @pytest.mark.parametrize("status", ["rotated", "already"])
+    def test_default_paths(self, run, two, value, theirs, status):
+        if status == "already":
+            # a first run in which the second server fails leaves the successor pending on the first
+            two.b.on("/rotate", Reply(500, {"error": "boom"}), then=None)
+            assert rotate(run, two.db).exit_code == 1
+            assert len(next_files(two.db)) == 2
+        old = two.old
+        two.srv.edit_body("/rotate", set_protocol(value))
+        result = rotate(run, two.db)
+        assert result.exit_code == 1, result.stderr
+        rows = table_rows(result)
+        assert rows["offsite"] == status and rows["second"] in ("rotated", "already")
+        assert self.ROW in result.stdout                                  # the warning is in the table row
+        # the swap happened: client.next became client.*
+        new = client_cert(two.db)
+        assert new.fingerprint != old.fingerprint and next_files(two.db) == []
+        assert f"client certificate rotated: {old.fingerprint} -> {new.fingerprint}" in result.stdout
+        assert "the client certificate WAS rotated" in result.stderr
+        assert "'offsite'" in result.stderr and "'second'" not in result.stderr.split("\n")[0]
+        assert f"{two.srv.url} speaks {theirs}, but this client speaks protocol 1" in result.stderr
+        assert f"The {UPGRADE}" in result.stderr
+        assert "NOT undone" in result.stderr
+        assert "NOTHING was swapped" not in result.stderr
+
+    def test_both_bad_names_both(self, run, two):
+        for srv in (two.srv, two.b):
+            srv.edit_body("/rotate", set_protocol("missing"))
+        result = rotate(run, two.db)
+        assert result.exit_code == 1
+        assert "'offsite', 'second'" in result.stderr
+        assert result.stderr.count(UPGRADE) == 2
+
+    def test_a_good_protocol_everywhere_is_exit_zero(self, run, two):
+        two.srv.edit_body("/rotate", set_protocol(PROTOCOL_VERSION))
+        result = rotate(run, two.db)
+        assert result.exit_code == 0, result.stderr
+        assert self.ROW not in result.stdout
+
+    # -- configured paths ----------------------------------------------------------------------------
+    @pytest.fixture
+    def conf(self, run, db, reloads, make_server, tmp_path):
+        srv = make_server("a")
+        old = identity.ensure_identity(tmp_path / "mine", identity.ROLE_CLIENT)
+        new = identity.ensure_identity(tmp_path / "next", identity.ROLE_CLIENT)
+        make_db(run, db, PLAIN_YAML + f'client_cert_file: "{old.cert_path}"\n'
+                                      f'client_key_file: "{old.key_path}"\n')
+        seed_client_id(db, CID)
+        assert do_enroll(run, db, srv, srv.token()).exit_code == 0
+        reloads.clear()
+        srv.log.clear()
+        return types.SimpleNamespace(db=db, srv=srv, old=old, new=new, reloads=reloads)
+
+    @pytest.mark.parametrize("value, theirs", LATE[:2])
+    def test_configured_paths_commit_and_signal_once_then_fail(self, run, conf, value, theirs):
+        gen = generation(conf.db)
+        conf.srv.edit_body("/rotate", set_protocol(value))
+        result = rotate(run, conf.db, "--cert", str(conf.new.cert_path), "--key", str(conf.new.key_path))
+        assert result.exit_code == 1, result.stderr
+        config = stored(conf.db)
+        assert config.client_cert_file == conf.new.cert_path and config.client_key_file == conf.new.key_path
+        assert generation(conf.db) == gen + 1
+        assert len(conf.reloads) == 1
+        assert self.ROW in result.stdout and "the client certificate WAS rotated" in result.stderr
+        assert f"{conf.srv.url} speaks {theirs}, but this client speaks protocol 1" in result.stderr
+        assert conf.old.cert_path.exists()                                # the old files are left
+
+    # -- precedence -----------------------------------------------------------------------------------
+    def test_a_refused_destination_beats_the_protocol_one(self, run, two):
+        two.srv.edit_body("/rotate", set_protocol("missing"))
+        two.b.on("/rotate", Reply(403, {"error": "x", "reason": "refused"}))
+        before = pair_bytes(two.db)
+        result = rotate(run, two.db)
+        assert result.exit_code == 1
+        rows = table_rows(result)
+        assert rows == {"offsite": "rotated", "second": "refused"}
+        assert pair_bytes(two.db) == before and len(next_files(two.db)) == 2          # no swap
+        assert "NOTHING was swapped" in result.stderr
+        assert "WAS rotated" not in result.stderr
+
+    def test_an_unreachable_destination_beats_the_protocol_one(self, run, two):
+        two.srv.edit_body("/rotate", set_protocol("missing"))
+        two.b.on("/rotate", Reply(502, ""))
+        before = pair_bytes(two.db)
+        result = rotate(run, two.db)
+        assert result.exit_code == 75, result.stderr
+        assert table_rows(result) == {"offsite": "rotated", "second": "unreachable"}
+        assert pair_bytes(two.db) == before and len(next_files(two.db)) == 2
+        assert "NOTHING was swapped" in result.stderr and "WAS rotated" not in result.stderr
+
+    def test_a_busy_destination_beats_the_protocol_one(self, run, two):
+        two.srv.edit_body("/rotate", set_protocol(99))
+        two.b.on("/rotate", Reply(503, {"retry": True, "error": "busy"}))
+        before = pair_bytes(two.db)
+        result = rotate(run, two.db)
+        assert result.exit_code == 75
+        assert pair_bytes(two.db) == before and "NOTHING was swapped" in result.stderr
+
+    def test_the_rerun_after_fixing_the_failing_one_swaps_and_reports_the_protocol(self, run, two):
+        two.srv.edit_body("/rotate", set_protocol("missing"))
+        two.b.on("/rotate", Reply(502, ""), then=None)
+        assert rotate(run, two.db).exit_code == 75
+        result = rotate(run, two.db)
+        assert result.exit_code == 1
+        assert table_rows(result) == {"offsite": "already", "second": "rotated"}
+        assert "WAS rotated" in result.stderr and next_files(two.db) == []
+
+    # -- a server whose /rotate omits it but whose /whoami has it is the only way to get here -------------
+    def test_whoami_good_and_rotate_without_it_is_what_reaches_the_branch(self, run, one):
+        one.srv.edit_body("/rotate", set_protocol("missing"))
+        result = rotate(run, one.db)
+        assert result.exit_code == 1
+        assert [e.path for e in one.srv.log] == ["/whoami", "/rotate"]
+        assert one.srv.seen("/whoami")[0].headers.get(PROTOCOL_KEY) == "1"
+
+    def test_the_message_has_no_secrets(self, run, one):
+        one.srv.edit_body("/rotate", lambda b: b.update(protocol="S3CR3T-" * 10))
+        result = rotate(run, one.db)
+        assert result.exit_code == 1
+        assert "S3CR3T" not in everything(result)
+        assert "PRIVATE KEY" not in everything(result)

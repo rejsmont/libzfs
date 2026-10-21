@@ -8,6 +8,11 @@ handed to `websocket.WebSocket().connect(..., socket=)`. There is no plaintext
 path. The client id is the one the supervisor read from the config database
 (`daemon.Handoff.client_id`); the server binds it to our certificate and
 `/whoami` reports the binding.
+
+Every request (HTTP and the websocket upgrade) carries the wire protocol
+version (`zfsbackup.protocol`, plan S-5). A server that answers 426, or whose
+`/whoami` names no supported version, is refused like an auth problem: one
+ERROR, then the destination is skipped before any send.
 """
 
 import contextlib
@@ -34,6 +39,9 @@ from zfsbackup.config import (
 from zfsbackup.identity import (
     CLIENT_NAME, Identity, IdentityError, PinMismatch, client_context, connect_pinned,
     is_pin_mismatch, is_tls_alert_rejection, load_identity, pinned_session,
+)
+from zfsbackup.protocol import (
+    PROTOCOL_VERSION, SUPPORTED_PROTOCOLS, protocol_headers,
 )
 
 
@@ -155,6 +163,34 @@ def _log_refusal(base_url: str, ds_name: str, result: dict) -> None:
             logger.info(f"server {base_url} is reloading; skipping {ds_name} this cycle")
     else:
         logger.error(f"server refused {ds_name}: {result.get('error') or 'unknown error'}")
+
+
+def _protocol_mismatch(where: str, server_protocol, *, refused: bool) -> str:
+    """The (deduplicated) ERROR for a server that speaks another wire
+    protocol: it refused ours with 426 (`refused`), or its `/whoami` named an
+    unsupported version or none."""
+    ours = PROTOCOL_VERSION
+    if type(server_protocol) is int:
+        theirs = f"protocol {server_protocol}"
+    else:
+        theirs = "no protocol version (an older zfsbackup release)"
+    if refused:
+        what = f"refuses this client's zfsbackup protocol {ours} (HTTP 426); it speaks {theirs}"
+    else:
+        what = f"speaks {theirs}; this client speaks zfsbackup protocol {ours}"
+    return (
+        f"{where} {what}. Upgrade the client and the server to the same zfsbackup "
+        "release; the destination is skipped until then"
+    )
+
+
+def _whoami_protocol_problem(where: str, body: dict) -> Optional[str]:
+    """`None` if `/whoami`'s `protocol` is one this client supports, else the
+    refusal message."""
+    version = body.get('protocol')
+    if type(version) is int and version in SUPPORTED_PROTOCOLS:
+        return None
+    return _protocol_mismatch(where, version, refused=False)
 
 
 def _path(component: str) -> str:
@@ -596,6 +632,8 @@ class RemoteBackupManager:
             # The files changed since the identity was loaded: reload next time.
             self._identity_failed(None, e)
             return None
+        # Every HTTP request on this session names our protocol version.
+        session.headers.update(protocol_headers())
         transport = _Transport(endpoint, server_fp, identity.fingerprint, session, ctx)
         self._transports[destination] = transport
         return transport
@@ -654,9 +692,12 @@ class RemoteBackupManager:
     def _status_refusal(
         self, destination: str, transport: _Transport, status, body: dict
     ) -> Optional[str]:
-        """The message for an HTTP 401/403 auth refusal, else `None`."""
+        """The message for an HTTP 401/403 auth refusal or a 426 protocol
+        refusal, else `None`."""
         where = f"server {transport.base_url} (destination {destination})"
         enroll = f"`zfsbackup-config enroll {destination} --token-file …`"
+        if status == 426:
+            return _protocol_mismatch(where, body.get('protocol'), refused=True)
         if status == 401:
             return (
                 f"{where} did not receive this client's certificate "
@@ -692,7 +733,8 @@ class RemoteBackupManager:
     def _whoami(self, destination: str, transport: _Transport) -> bool:
         """Ask the server who it takes this client for (plan A6); -> whether
         the destination may be used this cycle. Every "no" is logged: auth
-        refusals and a pin mismatch once (ERROR, deduplicated), a transient
+        refusals, a pin mismatch and a protocol mismatch (a 426, or an answer
+        without a supported `protocol`) once (ERROR, deduplicated), a transient
         failure at ERROR each cycle, the server's retryable 503 at INFO. A
         reset or broken pipe is retried once: under TLS 1.3 it can be the
         server rejecting our certificate after the handshake."""
@@ -741,6 +783,12 @@ class RemoteBackupManager:
                 f"unexpected /whoami answer from {transport.base_url} (destination "
                 f"{destination}): HTTP {resp.status_code}; skipping it this cycle"
             )
+            return False
+        problem = _whoami_protocol_problem(
+            f"server {transport.base_url} (destination {destination})", body
+        )
+        if problem is not None:
+            self._refuse_destination(destination, transport, problem)
             return False
         bound = body['client_id']
         if bound != self.client_id:
@@ -909,7 +957,10 @@ class RemoteBackupManager:
                 transport.endpoint.host, transport.endpoint.port, transport.ctx,
                 transport.server_fp, WS_CONNECT_TIMEOUT,
             )
-            ws.connect(ws_url, socket=tls_sock, timeout=WS_CONNECT_TIMEOUT)
+            ws.connect(
+                ws_url, socket=tls_sock, timeout=WS_CONNECT_TIMEOUT,
+                header=protocol_headers(),
+            )
             ws.settimeout(WS_IDLE_TIMEOUT)
             chunk_size = 256 * 1024
             # `stream` is a StreamHandle wrapping the `zfs send` process's

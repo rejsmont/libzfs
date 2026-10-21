@@ -769,8 +769,14 @@ class DatasetConfig:
         had. Do not reuse this pair as an ORM <-> dataclass round-trip (e.g.
         for the config DB mapper); read the per-destination overrides from
         their own source instead.
+
+        The base64 is decoded strictly (`validate=True`): a character outside
+        the standard alphabet -- a newline, a tab, a non-ASCII character --
+        raises instead of being silently skipped, so a value carrying an
+        embedded row or control character never decodes as if it were clean.
+        `to_property()` output (standard alphabet, padded) always decodes.
         """
-        data = json.loads(base64.b64decode(encoded).decode())
+        data = json.loads(base64.b64decode(encoded, validate=True).decode())
         return cls(
             name=data['name'],
             recursive=data.get('recursive', False),

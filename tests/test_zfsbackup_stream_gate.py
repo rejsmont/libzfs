@@ -32,12 +32,20 @@ from _tls_support import pin_client
 from test_zfsbackup_daemon_closeout import SUPERVISOR, Parent
 from zfsbackup import api as api_module
 from zfsbackup import workers
-from zfsbackup.api import RELOADING_ERROR, StreamGate
+from zfsbackup.api import RELOADING_ERROR, StreamGate, canonical_dataset_config
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup.config import BackupConfig, DatasetConfig, RemoteServerConfig
 from zfsbackup.remote import WS_IDLE_TIMEOUT
 from zfsbackup.stopflag import ReloadEpoch, StopFlag
 from zfsbackup.workers import API_STOP_DRAIN, ApiWorker
+
+
+#: A negotiate `config` the server accepts (plan B-1a), and a body carrying it.
+GOOD_CONFIG = DatasetConfig(name="pool/data").to_property()
+
+
+def _negotiate_body(snapshots=()):
+    return {"snapshots": list(snapshots), "config": GOOD_CONFIG}
 
 
 def wait_until(predicate, timeout=20.0, step=0.02):
@@ -291,6 +299,16 @@ def source_props(mocker):
     return mocker.patch("zfsbackup.api.read_zfsbackup_properties", return_value={})
 
 
+@pytest.fixture(autouse=True)
+def stored_config(mocker):
+    """The local `org.zfsbackup:config` negotiate stored on the server dataset: a stream reads it
+    (plan B-1b) and is refused without one. Never a real `zfs get`."""
+    return mocker.patch(
+        "zfsbackup.api.zfs.get.value",
+        return_value=canonical_dataset_config(DatasetConfig(name="pool/data").to_property()),
+    )
+
+
 class TestGateInTheApp:
     def test_the_gate_is_published_on_the_app(self, authed):
         gate = authed.gate
@@ -321,16 +339,16 @@ class TestGateInTheApp:
 
     def test_negotiate_works_before_draining(self, authed, mocker):
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
+        mocker.patch("zfsbackup.api.zfs.set")
         mocker.patch("zfsbackup.api.zfs.list", return_value=[])
-        resp = authed.client().post("/backup/client1/pool/data/negotiate", json={"snapshots": []})
+        resp = authed.client().post("/backup/client1/pool/data/negotiate", json=_negotiate_body())
         assert resp.status_code == 200
 
     def test_read_only_endpoints_keep_serving_while_draining(self, authed):
         authed.gate.start_draining()
         client = authed.client()
         assert client.get("/health").status_code == 200
-        assert client.get("/config").status_code == 200
-        assert client.get("/datasets").status_code == 200
+        assert client.get("/whoami").status_code == 200
 
     def test_a_disabled_server_still_answers_disabled_not_reloading(self, mocker):
         authed = _authed(mocker, _config(remote=False))
@@ -390,6 +408,7 @@ class TestGateInTheApp:
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         writer = MagicMock()
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
+        mocker.patch("zfsbackup.api.zfs.set")
         ws = MagicMock()
 
         def receive(timeout=None):
@@ -419,10 +438,10 @@ class TestGateInTheApp:
             # The D7 source check reads `exists` first and reports a failure to the client.
             exists.side_effect = RuntimeError("zfs exploded")
         elif arrange == "create-fails":
-            exists.return_value = False
+            exists.side_effect = [True, True, False]       # ownership, config read, then gone
             mocker.patch("zfsbackup.api.zfs.create", side_effect=RuntimeError("cannot create"))
         elif arrange == "set-fails":
-            exists.return_value = False
+            exists.side_effect = [True, True, False]
             mocker.patch("zfsbackup.api.zfs.create")
             mocker.patch("zfsbackup.api.zfs.set", side_effect=RuntimeError("cannot set"))
         elif arrange == "send-raises":
@@ -549,9 +568,7 @@ class TestGateOnProtocolRefusals:
             source_props.return_value = {"org.zfsbackup:source_dataset": "tank/data"}
         else:
             source_props.side_effect = RuntimeError("zfs get failed")
-        resp = authed.client().post(
-            "/backup/client1/pool/data/negotiate", json={"snapshots": [], "config": "cfg"}
-        )
+        resp = authed.client().post("/backup/client1/pool/data/negotiate", json=_negotiate_body())
         assert resp.status_code == status
         mock_set.assert_not_called()
         assert gate.active == 0
@@ -783,7 +800,7 @@ class TestApiWorkerDrain:
             seen["events_while_waiting"] = list(e.events)
             seen["refused"] = e.gate.begin()
             client = e.client()
-            seen["negotiate"] = client.post("/backup/client1/pool/data/negotiate", json={"snapshots": []})
+            seen["negotiate"] = client.post("/backup/client1/pool/data/negotiate", json=_negotiate_body())
             seen["health"] = client.get("/health").status_code
             seen["ended_at"] = time.monotonic()
             e.gate.end()
@@ -1005,7 +1022,7 @@ class TestApiWorkerDrain:
 # ---------------------------------------------------------------------------
 
 GATED = [
-    ("negotiate", "post", "/backup/client1/pool/data/negotiate", {"snapshots": []}),
+    ("negotiate", "post", "/backup/client1/pool/data/negotiate", _negotiate_body()),
     ("resume_token", "get", "/backup/client1/pool/data/resume_token", None),
 ]
 
@@ -1091,6 +1108,7 @@ class TestGatedEndpoints:
         mocker.patch("zfsbackup.api.zfs.exists", side_effect=blocking_exists)
         mocker.patch("zfsbackup.api.zfs.list", return_value=[])
         mocker.patch("zfsbackup.api.zfs.create")
+        mocker.patch("zfsbackup.api.zfs.set")
         result = {}
         thread = threading.Thread(
             target=lambda: result.update(resp=_call(authed.client(), method, url, body)), daemon=True
@@ -1109,13 +1127,13 @@ class TestGatedEndpoints:
         assert result["resp"].status_code == 200, "the call begun before the drain completes"
         assert gate.wait_idle(5) is True and gate.active == 0
 
-    def test_read_only_endpoints_are_not_counted(self, authed, mocker):
+    def test_read_only_endpoints_are_not_counted(self, authed):
         gate = authed.gate
         seen = []
-        mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock,
-                            side_effect=lambda: seen.append(gate.active) or [])
-        authed.client().get("/datasets")
-        assert seen and set(seen) == {0}
+        whoami = authed.app.view_functions["whoami"]
+        authed.app.view_functions["whoami"] = lambda: seen.append(gate.active) or whoami()
+        assert authed.client().get("/whoami").status_code == 200
+        assert seen == [0]
 
 
 class TestApiWorkerDrainsGatedCalls:
@@ -1129,6 +1147,7 @@ class TestApiWorkerDrainsGatedCalls:
 
         mocker.patch("zfsbackup.api.zfs.exists", side_effect=blocking_exists)
         mocker.patch("zfsbackup.api.zfs.list", return_value=[])
+        mocker.patch("zfsbackup.api.zfs.set")
         seen = {}
 
         def driver(e):
@@ -1136,7 +1155,7 @@ class TestApiWorkerDrainsGatedCalls:
             result = {}
             t = threading.Thread(
                 target=lambda: result.update(
-                    resp=e.client().post("/backup/client1/pool/data/negotiate", json={"snapshots": []})
+                    resp=e.client().post("/backup/client1/pool/data/negotiate", json=_negotiate_body())
                 ),
                 daemon=True,
             )

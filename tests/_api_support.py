@@ -8,6 +8,8 @@ Nothing here talks to ZFS and no socket is opened.
 * `FakeGateway` -- a stub of everything `api.create_app` asks of a `TrustGateway`:
   `lookup`, `refresh`, `restart_reason`, `current_context` and the three store writers
   (`token_precheck`, `enroll_client`, `rotate_client`, `retire_predecessor`), each scriptable and counted.
+* `plain_client` / `buffered_client` -- test clients that send the wire protocol header
+  (plan S-5, `protocol=None` for none) and the second of them a certificate.
 * `Authed` -- a Flask app built over a gateway, with a test client / request context that
   presents a client certificate in `environ["SSL_CLIENT_CERT"]`, exactly where the TLS
   layer puts it. `client_id` pins one certificate under that id (`Authed.who`).
@@ -31,6 +33,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from zfsbackup import identity
 from zfsbackup.api import PinInfo, TrustGateway, create_app
 from zfsbackup.config.store import trust as store_trust
+from zfsbackup.protocol import PROTOCOL_HEADER, PROTOCOL_VERSION
 
 #: The client id of the default pinned certificate: the id the pre-TLS tests used in URLs.
 CLIENT_ID = "client1"
@@ -38,6 +41,8 @@ CLIENT_ID = "client1"
 SERVER_FP = "ab" * 32
 
 _DEFAULT = object()
+#: The WSGI environ key of the protocol header (plan S-5).
+PROTOCOL_ENVIRON = "HTTP_" + PROTOCOL_HEADER.upper().replace("-", "_")
 _DAY = dt.timedelta(days=1)
 
 
@@ -199,14 +204,36 @@ class FakeGateway:
 # ---------------------------------------------------------------------------
 
 
-def buffered_client(app, who=None):
+def protocol_environ(protocol=_DEFAULT) -> Dict[str, str]:
+    """The WSGI environ entry carrying the protocol header (plan S-5): this code's own version
+    by default, `str(protocol)` for anything else, nothing at all for `None` (a client that
+    sends no header)."""
+    if protocol is None:
+        return {}
+    return {PROTOCOL_ENVIRON: str(PROTOCOL_VERSION if protocol is _DEFAULT else protocol)}
+
+
+def plain_client(app, *, protocol=_DEFAULT):
+    """An UNBUFFERED test client (a response is closed only by the test) that sends the
+    protocol header (`protocol_environ`) and presents no certificate; set
+    `client.environ_base["SSL_CLIENT_CERT"]` for one."""
+    client = app.test_client()
+    client.environ_base.update(protocol_environ(protocol))
+    return client
+
+
+def buffered_client(app, who=None, *, protocol=_DEFAULT):
     """A test client that presents `who`'s certificate (none if `None`) and BUFFERS every
     response, i.e. closes it before returning. That matters: the API refreshes its trust view
     once a response has been sent (`response.call_on_close`), and an unbuffered test response
-    is only closed when it is garbage-collected."""
+    is only closed when it is garbage-collected.
+
+    Every request carries `X-Zfsbackup-Protocol: <this code's version>` (plan S-5) unless
+    `protocol` says otherwise (`protocol_environ`); a header passed to one request wins."""
     client = app.test_client()
     if who is not None:
         client.environ_base["SSL_CLIENT_CERT"] = who.cert_pem
+    client.environ_base.update(protocol_environ(protocol))
     open_ = client.open
     client.open = lambda *args, **kwargs: open_(*args, **{"buffered": True, **kwargs})
     return client
@@ -242,19 +269,21 @@ class Authed:
             self.gateway.pin(cert, client_id)
         return cert
 
-    def client(self, who=_DEFAULT):
+    def client(self, who=_DEFAULT, *, protocol=_DEFAULT):
         """A Flask test client that presents `who`'s certificate (default: `self.who`;
-        `None`: no certificate)."""
+        `None`: no certificate) and the protocol header (`protocol=None`: none, another
+        value: that one)."""
         who = self.who if who is _DEFAULT else who
-        return buffered_client(self.app, who)
+        return buffered_client(self.app, who, protocol=protocol)
 
     @contextlib.contextmanager
-    def context(self, path: str, who=_DEFAULT, **kwargs):
+    def context(self, path: str, who=_DEFAULT, *, protocol=_DEFAULT, **kwargs):
         """A request context for `path` as `who`, with the before-request hooks (authentication)
         already run: for calling a view function directly, e.g. the websocket handler. Asserts
         that authentication let the request through."""
         who = self.who if who is _DEFAULT else who
         environ = {} if who is None else {"SSL_CLIENT_CERT": who.cert_pem}
+        environ.update(protocol_environ(protocol))
         with self.app.test_request_context(path, environ_base=environ, **kwargs):
             refusal = self.app.preprocess_request()
             assert refusal is None, f"the request was refused: {refusal!r}"

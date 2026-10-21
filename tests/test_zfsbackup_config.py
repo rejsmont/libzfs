@@ -1698,3 +1698,88 @@ class TestFromFileTlsKeys:
         cfg = BackupConfig.from_file(example)
         assert not hasattr(cfg, 'client_id_file')
         assert all(d.url.lower().startswith('https://') for d in cfg.destinations.values())
+
+
+class TestFromPropertyIsStrict:
+    """`DatasetConfig.from_property` decodes base64 with `validate=True` (plan B-1c): a character
+    outside the standard alphabet -- a newline, a tab, a non-ASCII character -- raises instead of
+    being skipped, so a value carrying an embedded row or control character never decodes as if it
+    were clean. `to_property()` output always decodes."""
+
+    @staticmethod
+    def good():
+        from zfsbackup.config import DatasetConfig
+        return DatasetConfig(name="pool/data").to_property()
+
+    @pytest.mark.parametrize("where", [0, 1, 8, 20, -1])
+    @pytest.mark.parametrize("char", ["\n", "\t", "\r", " ", "\x00"])
+    def test_a_stray_whitespace_or_control_character_is_refused(self, where, char):
+        from zfsbackup.config import DatasetConfig
+        value = self.good()
+        at = where if where >= 0 else len(value)
+        with pytest.raises(Exception):
+            DatasetConfig.from_property(value[:at] + char + value[at:])
+
+    def test_lax_decoding_would_have_accepted_these(self):
+        """The control: the stdlib's default decoder skips them, so this is the change."""
+        value = self.good()
+        assert base64.b64decode(value[:10] + "\n" + value[10:]) == base64.b64decode(value)
+
+    @pytest.mark.parametrize("junk", ["é", "é", "日本", " ", "\ud800", "\udfff", "\U0001f600"])
+    def test_non_ascii_and_lone_surrogates_are_refused(self, junk):
+        from zfsbackup.config import DatasetConfig
+        for value in (junk + self.good(), self.good()[:10] + junk + self.good()[10:], self.good() + junk):
+            with pytest.raises(Exception):
+                DatasetConfig.from_property(value)
+
+    def test_unpadded_base64_is_refused(self):
+        from zfsbackup.config import DatasetConfig
+        # names of 1..3 extra characters give every padding length; each must be refused unpadded
+        for extra in ("", "x", "xy"):
+            value = DatasetConfig(name="pool/data" + extra).to_property()
+            stripped = value.rstrip("=")
+            if stripped == value:
+                continue
+            with pytest.raises(Exception):
+                DatasetConfig.from_property(stripped)
+        value = DatasetConfig(name="pool/datax").to_property()
+        stripped = value.rstrip("=")
+        assert stripped != value, "the fixture must need padding"
+        with pytest.raises(Exception):
+            DatasetConfig.from_property(stripped)
+
+    @pytest.mark.parametrize("value", ["", "=", "====", "!!!!", "e30"])
+    def test_garbage_is_refused(self, value):
+        from zfsbackup.config import DatasetConfig
+        with pytest.raises(Exception):
+            DatasetConfig.from_property(value)
+
+    def test_the_urlsafe_alphabet_is_refused(self):
+        from zfsbackup.config import DatasetConfig
+        payload = json.dumps({"name": "a?b>c", "frequency": 5}).encode()
+        urlsafe = base64.urlsafe_b64encode(payload).decode()
+        standard = base64.b64encode(payload).decode()
+        assert urlsafe != standard
+        DatasetConfig.from_property(standard)
+        with pytest.raises(Exception):
+            DatasetConfig.from_property(urlsafe)
+
+    @pytest.mark.parametrize("make", [
+        lambda D, R, Rr, T: D(name="pool/data"),
+        lambda D, R, Rr, T: D(name="pool/with space/x", recursive=True),
+        lambda D, R, Rr, T: D(name="tank/é", frequency=T(minutes=7)),
+        lambda D, R, Rr, T: D(name="p/a", enabled=False, retention_rules=[R(T(hours=1), T(days=2))]),
+        lambda D, R, Rr, T: D(name="p/b", remote=[Rr(destination="offsite"), Rr(destination="dc2")]),
+        lambda D, R, Rr, T: D(name="p/c" * 40),
+        lambda D, R, Rr, T: D(name="p/\n\t\x00weird"),
+    ], ids=["plain", "space", "non-ascii-name", "rules", "remote", "long", "control-characters-in-name"])
+    def test_to_property_output_round_trips(self, make):
+        from zfsbackup.config import DatasetConfig, RemoteDatasetConfig, RetentionRule
+        cfg = make(DatasetConfig, RetentionRule, RemoteDatasetConfig, lambda **k: timedelta(**k))
+        encoded = cfg.to_property()
+        assert re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", encoded)
+        restored = DatasetConfig.from_property(encoded)
+        assert restored.name == cfg.name
+        assert restored.recursive == cfg.recursive and restored.enabled == cfg.enabled
+        assert restored.frequency == cfg.frequency
+        assert restored.to_property() == encoded

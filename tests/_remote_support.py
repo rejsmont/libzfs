@@ -12,7 +12,8 @@ talks to ZFS and no socket is opened.
   identity generated once per session (key generation is the slow part). Pair it with
   `RemoteBackupManager(..., tls_dir=client_tls_dir)` and a destination that has a
   `server_fingerprint` to take the real `backup_dataset` path (identity, pinned session).
-* `whoami_json` -- the `/whoami` answer of a server that binds this client to `client_id`.
+* `whoami_json` -- the `/whoami` answer of a server that binds this client to `client_id` (and
+  speaks the current wire protocol); `protocol_refusal_json` -- the server's 426 body.
 * `snapshot_info` -- a managed `SnapshotInfo` of `pool/data` (timestamp parsed from its name).
 * `write_identity_files` -- lay an in-memory `_api_support.ClientCert` out as `client.{crt,key}`
   (to build identities `ensure_identity` would never generate: expired, not yet valid).
@@ -29,6 +30,7 @@ import requests
 from libzfseasy.types import Filesystem, Snapshot as ZFSSnapshot
 from zfsbackup import identity as ident
 from zfsbackup.backup_manager import SnapshotInfo
+from zfsbackup.protocol import PROTOCOL_VERSION
 from zfsbackup.remote import _endpoint, _Transport
 
 #: A pinned server fingerprint and a client fingerprint that are not any real certificate's.
@@ -50,9 +52,21 @@ def make_transport(base=HTTPS_BASE, *, session=None, server_fp=SERVER_FP, identi
     )
 
 
-def whoami_json(client_id="client1", fingerprint=CLIENT_FP):
-    """The body of `GET /whoami` for a client the server binds to `client_id`."""
-    return {"client_id": client_id, "fingerprint": fingerprint}
+def whoami_json(client_id="client1", fingerprint=CLIENT_FP, protocol=PROTOCOL_VERSION):
+    """The body of `GET /whoami` for a client the server binds to `client_id`, from a server
+    speaking `protocol` (plan S-5; `None` leaves the key out, as an older server does)."""
+    body = {"client_id": client_id, "fingerprint": fingerprint}
+    if protocol is not None:
+        body["protocol"] = protocol
+    return body
+
+
+def protocol_refusal_json(protocol=PROTOCOL_VERSION):
+    """The body of the server's 426 (`api._protocol_refusal`)."""
+    return {
+        "error": "unsupported zfsbackup protocol", "reason": "protocol",
+        "protocol": protocol, "supported": [protocol],
+    }
 
 
 class FakeConnect:

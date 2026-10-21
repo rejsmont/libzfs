@@ -1,4 +1,6 @@
-"""Flask API for inspecting daemon configuration and dataset snapshots.
+"""The server side of remote backup: the HTTPS API clients enroll, negotiate
+and stream through. It exposes nothing about the server's own configuration,
+datasets or snapshots (plan S-4).
 
 Served over HTTPS only (TLS/mTLS plan M9): `workers.ApiWorker` runs the app
 behind `workers._api_server_class()`, which does every TLS handshake on the
@@ -13,10 +15,15 @@ a request acts as is the one that certificate is *bound* to (`PinInfo.
 client_id`, `flask.g.client_id`) and nothing else: the `<client_id>` in a
 `/backup/<client_id>/...` URL is compared with the binding (403 on a
 mismatch), never used. See `create_app`.
+
+**Protocol version (plan S-5).** Every endpoint except `/health` needs the
+`X-Zfsbackup-Protocol` header naming a supported version (426 otherwise);
+see `zfsbackup.protocol`.
 """
 
 import base64
 import binascii
+import collections
 import contextlib
 import functools
 import json
@@ -29,7 +36,7 @@ import time
 import types
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping, NamedTuple, Optional
 
@@ -42,11 +49,12 @@ import libzfseasy as zfs
 from libzfseasy.types import Dataset, Filesystem
 
 from zfsbackup.backup_manager import (
-    DatasetManager,
     PROP_CONFIG, PROP_CLIENT_ID, PROP_SOURCE_DATASET,
     read_zfsbackup_properties,
 )
-from zfsbackup.config import BackupConfig, client_id_problem, normalize_fingerprint
+from zfsbackup.config import (
+    BackupConfig, DatasetConfig, client_id_problem, normalize_fingerprint,
+)
 from zfsbackup.identity import (
     IdentityChanged,
     IdentityError,
@@ -57,6 +65,10 @@ from zfsbackup.identity import (
     rotation_payload,
     secret_hash,
     verify_payload,
+)
+from zfsbackup.protocol import (
+    PROTOCOL_HEADER, PROTOCOL_REFUSAL_REASON, PROTOCOL_VERSION, SUPPORTED_PROTOCOLS,
+    parse_protocol_header,
 )
 from zfsbackup.remote import WS_IDLE_TIMEOUT
 
@@ -100,6 +112,45 @@ _ABORT_ALREADY_CLEAN = (
 #: `/enroll` is reached WITHOUT a client certificate: the TLS layer refuses
 #: an unpinned one at the handshake (`identity.server_context`).
 UNAUTHENTICATED_ENDPOINTS = frozenset({'health', 'enroll'})
+
+#: The endpoints that need no `X-Zfsbackup-Protocol` header (plan S-5): only
+#: the liveness probe, so a monitor needs no knowledge of the protocol.
+#: `/enroll` is NOT exempt: an enrollment by a CLI that speaks another
+#: protocol would pin a client its daemon then cannot use.
+PROTOCOL_EXEMPT_ENDPOINTS = frozenset({'health'})
+
+#: The ZFS user properties the SERVER owns on a received dataset (plan B-1b):
+#: it writes them itself, as LOCAL values, from the authenticated binding
+#: (`client_id`), the URL (`source_dataset`) and the validated negotiate body
+#: (`config`, stored by negotiate). A `zfs send -p` stream carries the
+#: client's own copies, so the receive is given the server's values with
+#: `-o` (`_receive_stream_locked`). `-x` is NOT enough: verified on OpenZFS
+#: 2.1.5, 2.2.2 and 2.4.1, a full (`-F`) receive of a `-p` stream into the
+#: dataset negotiate pre-created replaces the local values with the stream's
+#: (source `received`) whatever `-x` says; `-x` only helps for an
+#: incremental or resumed receive. `-o` and `-x` of one name are mutually
+#: exclusive ("specified multiple times"), so `-o` alone is used.
+#: The dynamic `anchor.*`/`inflight.*` names cannot be listed; they can only
+#: pin snapshots on the server, never cause one to be destroyed.
+RECEIVE_EXCLUDED_PROPERTIES = (PROP_CONFIG, PROP_CLIENT_ID, PROP_SOURCE_DATASET)
+
+#: ERROR lines a protocol-refused peer (`who`: its address, or its client id
+#: and address) can cause before the rest are DEBUG, and how many peers the
+#: de-duplication remembers (the oldest is evicted).
+PROTOCOL_ERROR_LINES_PER_PEER = 3
+PROTOCOL_LOGGED_PEERS = 1024
+
+#: 400 for a negotiate `config` that cannot be decoded or has the wrong shape.
+#: Deliberately unspecific: decoder details stay in the server's log.
+BAD_CONFIG_ERROR = 'config: not a valid encoded dataset configuration'
+
+#: 400 when a value zfsbackup would store as a ZFS property is refused by
+#: libzfseasy (`ValueError`, e.g. a control character zfs cannot frame).
+BAD_PROPERTY_ERROR = 'a value in this request cannot be stored as a ZFS property'
+
+#: Characters refused in a client dataset name before it reaches any `zfs`
+#: argument or property value (`zfs list -H` frames rows with them).
+_UNFRAMEABLE = frozenset('\n\r\t\0')
 
 #: 401: the connection presented no client certificate.
 CERT_REQUIRED_ERROR = {'error': 'client certificate required'}
@@ -899,6 +950,74 @@ def dedupe_store_warnings() -> None:
             lg.addFilter(_RepeatFilter())
 
 
+def _duration_ok(value) -> bool:
+    """A finite, strictly positive duration -- the client's own rule
+    (`_interval_from_config` for a frequency, `_positive_duration_from_config`
+    for a retention `age`/`keep_for`). Zero is refused: an `age` of 0 is a
+    zero-width slot, a division by zero in `DatasetManager.needs_prunning`
+    on every server pruning cycle."""
+    return isinstance(value, timedelta) and value > timedelta(0)
+
+
+def canonical_dataset_config(encoded) -> str:
+    """The canonical `org.zfsbackup:config` value for a client's negotiate
+    `config` (plan B-1a): decoded with `DatasetConfig.from_property`, checked
+    for the shape the pruner relies on, and re-encoded with `to_property()`.
+    Only this re-encoding is ever stored, so whatever the client sent -- odd
+    base64, extra keys, control characters inside JSON strings -- the stored
+    value is plain base64 that `zfs list -H` frames correctly and that
+    decodes again.
+
+    Raises `ValueError` (its message names the problem, never the input) when
+    `encoded` is not a non-empty string, does not decode, or decodes to the
+    wrong types: `name` a string, `recursive`/`enabled` booleans, durations
+    finite and greater than zero, exactly as the client's own configuration
+    requires (the decoder already refuses NaN and infinity),
+    `remote[].destination` strings. A decoded remote `frequency` of 0 is
+    already `None` (inherit), so only a negative one reaches the check."""
+    if not isinstance(encoded, str) or not encoded:
+        raise ValueError("missing or empty")
+    try:
+        cfg = DatasetConfig.from_property(encoded)
+    except Exception as e:  # any decoder failure is the client's input
+        raise ValueError(f"does not decode ({type(e).__name__})") from None
+    if not isinstance(cfg.name, str):
+        raise ValueError("name is not a string")
+    if type(cfg.recursive) is not bool or type(cfg.enabled) is not bool:
+        raise ValueError("recursive and enabled must be booleans")
+    if not _duration_ok(cfg.frequency):
+        raise ValueError("frequency is not positive")
+    for rule in cfg.retention_rules:
+        if not (_duration_ok(rule.age) and _duration_ok(rule.keep_for)):
+            raise ValueError("a retention rule has a duration that is not positive")
+    for remote in cfg.remote:
+        if not isinstance(remote.destination, str):
+            raise ValueError("a remote destination is not a string")
+        if remote.frequency is not None and not _duration_ok(remote.frequency):
+            raise ValueError("a remote frequency is not positive")
+    canonical = cfg.to_property()
+    DatasetConfig.from_property(canonical)  # must decode again (never fails)
+    return canonical
+
+
+def client_dataset_problem(dataset) -> Optional[str]:
+    """Why the client dataset name in a `/backup/<id>/<dataset>/...` URL is
+    unusable, or `None`. It becomes `org.zfsbackup:source_dataset` verbatim,
+    so a character that `zfs list -H` uses as a row or column separator is
+    refused before any `zfs` call, and the whole name must be a valid
+    filesystem name (`_server_dataset` drops its pool component, so checking
+    only the derived server name would not cover it)."""
+    if not isinstance(dataset, str) or not dataset:
+        return "empty client dataset name"
+    if any(c in _UNFRAMEABLE for c in dataset):
+        return "client dataset name contains a control character"
+    try:
+        Filesystem(dataset)
+    except Exception:
+        return "invalid client dataset name"
+    return None
+
+
 def create_app(
     config: BackupConfig,
     trust: TrustGateway,
@@ -924,11 +1043,19 @@ def create_app(
     STARTS -- a stream already running finishes even if its pin is revoked):
 
     1. `/health` and `/enroll` are exempt (`UNAUTHENTICATED_ENDPOINTS`).
+       `/health` is also exempt from the protocol check; `/enroll` is not
+       (426 as in 3a).
     2. No client certificate (`SSL_CLIENT_CERT` absent) -> 401
        `{"error": "client certificate required"}`. Also for an unknown URL:
        routing errors are answered only to authenticated clients.
     3. The certificate's SHA-256 (DER) fingerprint is not pinned, or the pin's
        `not_after` has passed -> 403 `{"error": "client not trusted"}`.
+    3a. No `X-Zfsbackup-Protocol` header, or a version not in
+       `SUPPORTED_PROTOCOLS` -> 426 `{"error", "reason": "protocol",
+       "protocol": <this server's version>, "supported": [...]}`, with the
+       header on the response (plan S-5; `zfsbackup.protocol`). No
+       `Upgrade` header: the protocol is not an HTTP upgrade, and the
+       request may itself be a websocket upgrade.
     4. Otherwise `g.client_id` is the id the pin is BOUND to and
        `g.fingerprint` the certificate's fingerprint. Routes take the client
        id from `g` only.
@@ -962,7 +1089,6 @@ def create_app(
     app.config['PROPAGATE_EXCEPTIONS'] = True
     app.config['MAX_CONTENT_LENGTH'] = MAX_REQUEST_BYTES
     sock = Sock(app)
-    manager = DatasetManager(config)
     #: The server datasets a `/stream` is working on right now, claimed
     #: non-blocking around its whole check -> abort -> create -> receive
     #: sequence: two streams for the same dataset (a client retry after a
@@ -1017,8 +1143,9 @@ def create_app(
         """Derive the server-side dataset path from the client's dataset
         name: `<target>/<client_id>/<client dataset without its pool>`.
         `client_id` is always the BOUND id (`g.client_id`). Raises
-        `_BadDatasetName` (the routes answer 400) when the result is not a
-        valid filesystem name, so no `zfs` command ever sees it."""
+        `_BadDatasetName` (the routes answer 400) when the client dataset
+        name (`client_dataset_problem`) or the result is not a valid
+        filesystem name, so no `zfs` command ever sees it."""
         parts = client_dataset.split('/', 1)
         relative = parts[1] if len(parts) > 1 else ''
         name = f"{target}/{client_id}/{relative}" if relative else f"{target}/{client_id}"
@@ -1026,6 +1153,10 @@ def create_app(
             Filesystem(name)
         except Exception as e:
             raise _BadDatasetName(f"invalid dataset name {name!r}: {e}") from None
+        problem = client_dataset_problem(client_dataset)
+        if problem is not None:
+            # `!r`: the name may hold the very control character refused.
+            raise _BadDatasetName(f"invalid dataset name {client_dataset!r}: {problem}")
         return name
 
     def _resume_token(server_dataset: str) -> Optional[str]:
@@ -1133,12 +1264,67 @@ def create_app(
             )
             _refresh_after_commit(f"retirement of pin {predecessor}")
 
+    #: Per peer (`who`), the protocol versions whose refusal was already
+    #: logged at ERROR. At most `PROTOCOL_ERROR_LINES_PER_PEER` lines per peer
+    #: (a legitimate client upgrading through a couple of versions still gets
+    #: told), later ones are DEBUG: the key is the peer, never the header
+    #: value, which an unauthenticated peer (`/enroll`) chooses freely. The
+    #: table is bounded by evicting the OLDEST peer, so a flood of new
+    #: addresses can only make the server forget one peer at a time, never
+    #: reset them all at once.
+    protocol_logged: 'collections.OrderedDict[str, set]' = collections.OrderedDict()
+    protocol_guard = threading.Lock()
+
+    def _protocol_refusal(who: str):
+        """None if the request names a supported protocol version
+        (`X-Zfsbackup-Protocol`), else the 426 response (plan S-5). Logged
+        at ERROR for the first `PROTOCOL_ERROR_LINES_PER_PEER` distinct
+        versions a peer sends, then at DEBUG."""
+        raw = request.headers.get(PROTOCOL_HEADER)
+        version = parse_protocol_header(raw)
+        if version in SUPPORTED_PROTOCOLS:
+            return None
+        sent = 'no protocol version' if raw is None else f'protocol version {raw[:16]!r}'
+        version_key = None if raw is None else raw[:16]
+        with protocol_guard:
+            seen = protocol_logged.get(who)
+            if seen is None:
+                if len(protocol_logged) >= PROTOCOL_LOGGED_PEERS:
+                    protocol_logged.popitem(last=False)
+                seen = protocol_logged[who] = set()
+            first = (version_key not in seen
+                     and len(seen) < PROTOCOL_ERROR_LINES_PER_PEER)
+            if first:
+                seen.add(version_key)
+        (logger.error if first else logger.debug)(
+            "API: refusing %s %s from %s: it sent %s, this server speaks protocol %s "
+            "(426); upgrade the client and the server together",
+            request.method, request.path, who, sent,
+            ', '.join(str(v) for v in sorted(SUPPORTED_PROTOCOLS)),
+        )
+        response = jsonify({
+            'error': (
+                f'unsupported zfsbackup protocol: the request sent {sent}; this server '
+                f'speaks protocol {PROTOCOL_VERSION}. Upgrade the client and the server '
+                'to the same zfsbackup release'
+            ),
+            'reason': PROTOCOL_REFUSAL_REASON,
+            'protocol': PROTOCOL_VERSION,
+            'supported': sorted(SUPPORTED_PROTOCOLS),
+        })
+        response.status_code = 426
+        response.headers[PROTOCOL_HEADER] = str(PROTOCOL_VERSION)
+        return response
+
     @app.before_request
     def _authenticate():
-        """Route authentication; see `create_app`. Returning a response
-        refuses the request (for `/stream`: the websocket upgrade)."""
-        if request.endpoint in UNAUTHENTICATED_ENDPOINTS:
+        """Route authentication and the protocol check; see `create_app`.
+        Returning a response refuses the request (for `/stream`: the
+        websocket upgrade)."""
+        if request.endpoint in PROTOCOL_EXEMPT_ENDPOINTS:
             return None
+        if request.endpoint in UNAUTHENTICATED_ENDPOINTS:
+            return _protocol_refusal(request.remote_addr or '?')
         pem = request.environ.get('SSL_CLIENT_CERT')
         if not pem:
             logger.debug(
@@ -1159,6 +1345,12 @@ def create_app(
                 'not pinned' if pin is None else 'expired',
             )
             return jsonify(NOT_TRUSTED_ERROR), 403
+        # After authentication, so an unauthenticated caller learns nothing
+        # but 401/403; before anything with a side effect (the predecessor
+        # retirement below, the route).
+        refused = _protocol_refusal(f"client {pin.client_id} ({request.remote_addr})")
+        if refused is not None:
+            return refused
         g.client_id = pin.client_id
         g.fingerprint = fingerprint
         url_id = (request.view_args or {}).get('client_id')
@@ -1321,10 +1513,16 @@ def create_app(
         certificate for.
 
         200 `{"client_id": <bound id>, "fingerprint": <this certificate's
-        SHA-256, 64 lowercase hex>}`. 401/403 as for every authenticated
-        endpoint. Not gated: it answers while the worker drains, and with
-        remote backup disabled."""
-        return jsonify({'client_id': g.client_id, 'fingerprint': g.fingerprint})
+        SHA-256, 64 lowercase hex>, "protocol": <this server's protocol
+        version>}`. A client refuses a server whose answer lacks `protocol`
+        or names one it does not support. 401/403/426 as for every
+        authenticated endpoint. Not gated: it answers while the worker
+        drains, and with remote backup disabled."""
+        return jsonify({
+            'client_id': g.client_id,
+            'fingerprint': g.fingerprint,
+            'protocol': PROTOCOL_VERSION,
+        })
 
     @app.route('/enroll', methods=['POST'])
     @_gated
@@ -1356,7 +1554,9 @@ def create_app(
 
         Responses (`reason` is a stable code; `error` is for humans):
 
-        - 200 `{"status": "enrolled", "client_id", "fingerprint"}`: pinned
+        - 200 `{"status": "enrolled", "client_id", "fingerprint", "protocol"}`
+          (`protocol`: this server's wire protocol version, so the enrolling
+          CLI can detect an incompatible server before its first backup): pinned
           now; the token is spent. The certificate works on the next
           connection (the trust view is refreshed, bounded, before this
           response; if that cannot run in time, right after it is sent --
@@ -1365,7 +1565,8 @@ def create_app(
           A `--replace` token scoped to this id also answers `enrolled` for
           a certificate that was already pinned to it: the token is spent
           and the client's OTHER pins are dropped.
-        - 200 `{"status": "already_trusted", "client_id", "fingerprint"}`:
+        - 200 `{"status": "already_trusted", "client_id", "fingerprint",
+          "protocol"}`:
           this certificate is already pinned to this id (and the token is
           not a `--replace` token for it); the token was NOT spent.
         - 400 `{"error"}`: a malformed body -- not a JSON object, `version`
@@ -1379,6 +1580,9 @@ def create_app(
           never pinned again, whatever the token.
         - 403 `{"error", "reason": "bad_signature"}`: the signature does not
           verify against `cert_pem`.
+        - 426 `{"error", "reason": "protocol", "protocol", "supported"}`:
+          no `X-Zfsbackup-Protocol` header or an unsupported version; checked
+          before everything else, the body is not read.
         - Check order: shape 400 -> grammar 400 -> label 400 -> token parse
           400 -> token for another server 403 refused -> certificate 422 ->
           signature 403 -> token pre-check 403 refused (read-only, before any
@@ -1520,7 +1724,10 @@ def create_app(
                 client_id, cert_fp, label, remote,
             )
             _refresh_after_commit(f"enrollment of client {client_id}")
-            return jsonify({'status': 'enrolled', 'client_id': client_id, 'fingerprint': cert_fp})
+            return jsonify({
+                'status': 'enrolled', 'client_id': client_id, 'fingerprint': cert_fp,
+                'protocol': PROTOCOL_VERSION,
+            })
         if outcome == EnrollOutcome.ALREADY_TRUSTED:
             logger.info(
                 "enrollment from %s: certificate %s is already pinned to client %s "
@@ -1528,6 +1735,7 @@ def create_app(
             )
             return jsonify({
                 'status': 'already_trusted', 'client_id': client_id, 'fingerprint': cert_fp,
+                'protocol': PROTOCOL_VERSION,
             })
         if outcome == EnrollOutcome.CLIENT_ID_TAKEN:
             return failed(f'client id {client_id!r} taken', (jsonify({
@@ -1573,8 +1781,9 @@ def create_app(
         Responses:
 
         - 200 `{"status": "rotated" | "already", "client_id", "fingerprint":
-          <new_fp>}`: the successor is pinned (`already`: it was, by an
-          earlier identical rotation). Both certificates work until the
+          <new_fp>, "protocol": <this server's protocol version>}`: the
+          successor is pinned (`already`: it was, by an earlier identical
+          rotation). Both certificates work until the
           successor's first authenticated request, which retires the old pin.
         - 400 `{"error"}`: malformed body (as for `/enroll`).
         - 401 / 403 `client not trusted` / `client_id mismatch`: the usual
@@ -1650,71 +1859,68 @@ def create_app(
             _refresh_after_commit(f"rotation for client {client_id}")
             return jsonify({
                 'status': str(outcome), 'client_id': client_id, 'fingerprint': new_fp,
+                'protocol': PROTOCOL_VERSION,
             })
         return failed('refused by the trust store', (jsonify(ROTATE_REFUSED_ERROR), 403))
-
-    @app.route('/config')
-    def get_config():
-        return jsonify({
-            'snapshot_prefix': config.snapshot_prefix,
-            'check_interval_seconds': config.check_interval.total_seconds(),
-            'prune_interval_seconds': config.effective_prune_interval.total_seconds(),
-            'api_host': config.api_host,
-            'api_port': config.api_port,
-            'dry_run': config.dry_run,
-        })
-
-    @app.route('/datasets')
-    def get_datasets():
-        return jsonify([
-            {
-                'name': dsi.name,
-                'frequency_seconds': dsi.frequency.total_seconds(),
-                'recursive': dsi.recursive,
-                'retention_rules': [
-                    {
-                        'age_seconds': r.age.total_seconds(),
-                        'keep_for_seconds': r.keep_for.total_seconds(),
-                    }
-                    for r in dsi.config.retention_rules
-                ],
-            }
-            for dsi in manager.datasets
-        ])
-
-    @app.route('/datasets/<path:name>/snapshots')
-    def get_snapshots(name: str):
-        dsi = next((d for d in manager.datasets if d.name == name), None)
-        if dsi is None:
-            return jsonify({'error': f'Dataset {name!r} not configured'}), 404
-        snapshots = manager.list_snapshots(dsi)
-        return jsonify([
-            {
-                'name': s.name,
-                'full_name': s.full_name,
-                'timestamp': s.timestamp.isoformat() if s.timestamp else None,
-                'age_seconds': s.age.total_seconds(),
-            }
-            for s in snapshots
-        ])
 
     @app.route('/backup/<client_id>/<path:dataset>/negotiate', methods=['POST'])
     @_gated
     def backup_negotiate(client_id: str, dataset: str):
+        """`POST /backup/<client_id>/<dataset>/negotiate` (authenticated):
+        record the client dataset's configuration on its server dataset
+        (creating it) and answer the newest snapshot both sides hold.
+
+        Request body (JSON object, `Content-Type` not required)::
+
+            {
+              "snapshots": ["<short snapshot name>", ...],   # newest first
+              "config": "<DatasetConfig.to_property(destination)>"
+            }
+
+        Both fields are required. `config` must decode with
+        `DatasetConfig.from_property` and have the expected types
+        (`canonical_dataset_config`); only its canonical re-encoding is
+        stored as `org.zfsbackup:config` (plan B-1a), never the client's
+        string.
+
+        Responses: 200 `{"common_snapshot": <name or null>,
+        "server_dataset"}`; 400 `{"error"}` for a body that is not a JSON
+        object, a missing or mistyped field, an undecodable or empty
+        `config` (`BAD_CONFIG_ERROR`), an invalid dataset name, or a value
+        libzfseasy refuses to store (`BAD_PROPERTY_ERROR`); 409 when the
+        server dataset belongs to another client id or client dataset; 500
+        when `zfs` fails; 401/403/426/503 as for every gated endpoint. A
+        400 is decided before anything is written."""
         disabled = _require_enabled()
         if disabled is not None:
             return disabled
         # The bound id (`_authenticate`), never the URL's: they are equal
         # here, but only the binding is trusted.
         client_id = g.client_id
-        data = request.get_json(force=True)
-        client_snapshots: list = data.get('snapshots', [])
-        ds_config_encoded: str = data.get('config', '')
-
         try:
             server_dataset = _server_dataset(client_id, dataset)
         except _BadDatasetName as e:
             return jsonify({'error': str(e)}), 400
+        try:
+            data = json.loads(request.get_data(cache=False))
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            data = None
+        if not isinstance(data, dict):
+            return _bad('request body must be a JSON object')
+        client_snapshots = data.get('snapshots')
+        if not isinstance(client_snapshots, list) or not all(
+            isinstance(s, str) for s in client_snapshots
+        ):
+            return _bad('snapshots: must be a list of snapshot names')
+        try:
+            ds_config_canonical = canonical_dataset_config(data.get('config'))
+        except ValueError as e:
+            logger.warning(
+                "negotiate from client %s for %r: refusing its config: %s",
+                client_id, dataset, e,
+            )
+            return _bad(BAD_CONFIG_ERROR)
+
         server_fs = Filesystem(server_dataset)
         server_fs_exists = zfs.exists(server_fs)
 
@@ -1729,18 +1935,37 @@ def create_app(
             if conflict is not None:
                 return jsonify({'error': conflict}), 409
 
-        # Store client config on server dataset (create dataset if needed)
-        if ds_config_encoded:
-            if not server_fs_exists:
-                if not config.dry_run:
+        # Store the canonical client config on the server dataset (created if
+        # needed). Always: an empty config is refused above. The stream
+        # handler reads it back (local source) and hands it to `zfs receive
+        # -o`, so a copy of the property inside a `-p` stream is never the
+        # one in effect.
+        if not config.dry_run:
+            try:
+                if not server_fs_exists:
                     zfs.create(server_fs, parents=True)
                     server_fs_exists = True
-            if not config.dry_run:
                 zfs.set(server_fs, {
-                    PROP_CONFIG: ds_config_encoded,
+                    PROP_CONFIG: ds_config_canonical,
                     PROP_CLIENT_ID: client_id,
                     PROP_SOURCE_DATASET: dataset,
                 })
+            except ValueError as e:
+                # libzfseasy refused a value before running zfs (B1: a control
+                # character zfs could not frame). The values are the canonical
+                # config, the A7 client id and a checked name, so this is a
+                # safety net; the details stay in the log.
+                logger.warning(
+                    "negotiate from client %s for %r: libzfseasy refused a property "
+                    "value: %r", client_id, dataset, str(e),
+                )
+                return _bad(BAD_PROPERTY_ERROR)
+            except Exception as e:
+                logger.error(
+                    "negotiate from client %s: cannot record %s: %s",
+                    client_id, server_dataset, e,
+                )
+                return jsonify({'error': f'Failed to record the configuration of {server_dataset}'}), 500
 
         # Find the most recent snapshot present on both sides
         common_snapshot = None
@@ -1848,6 +2073,47 @@ def create_app(
             ws.send(json.dumps({'status': 'ok', 'dry_run': True}))
             return
 
+        # The values the server owns, read BEFORE anything is destroyed
+        # (the fresh-mode abort below can take the whole dataset with it): the
+        # canonical config negotiate stored (local source only; re-encoded, so
+        # it is plain base64 whatever the dataset holds), the bound id and the
+        # URL's dataset name. They go to the receive itself (`-o`), so they
+        # are the values in effect the moment it finishes -- see
+        # `RECEIVE_EXCLUDED_PROPERTIES`.
+        try:
+            stored_config = (
+                zfs.get.value(Dataset(server_dataset), PROP_CONFIG, sources='local')
+                if zfs.exists(server_fs) else None
+            )
+        except Exception as e:
+            logger.error("cannot read the configuration of %s: %s", server_dataset, e)
+            ws.send(json.dumps({
+                'error': f'Failed to read the configuration of {server_dataset}'
+            }))
+            return
+        try:
+            owned = {
+                PROP_CONFIG: canonical_dataset_config(stored_config),
+                PROP_CLIENT_ID: client_id,
+                PROP_SOURCE_DATASET: dataset,
+            }
+        except ValueError as e:
+            # Never negotiated (or the property was removed or damaged): the
+            # server has no config of its own to put in effect, and without
+            # one a stream's copy could become the one in effect.
+            logger.warning(
+                "stream from client %s for %r refused: no usable configuration "
+                "is recorded on %s (%s); the client must negotiate first",
+                client_id, dataset, server_dataset, e,
+            )
+            ws.send(json.dumps({
+                'error': (
+                    f'no configuration is recorded for {server_dataset}; '
+                    'negotiate before streaming'
+                )
+            }))
+            return
+
         if mode == 'fresh':
             # D3: a fresh stream cannot continue a partial receive. Discard
             # its saved state first, or `zfs receive` refuses with "contains
@@ -1887,15 +2153,15 @@ def create_app(
                         return
 
         if not zfs.exists(server_fs):
-            # Recreated (or created here): stamp the ownership properties
+            # Recreated (the abort above destroyed a dataset a FULL receive
+            # had created outside this flow): stamp the owned properties
             # again, or a dataset without `source_dataset` loses the D7 check
-            # and one without `client_id` is not found as this client's.
+            # and one without `client_id` or `config` is not a client dataset
+            # to the pruner. (The receive's `-o` sets them as well; this
+            # keeps the dataset right if the stream never completes.)
             try:
                 zfs.create(server_fs, parents=True)
-                zfs.set(server_fs, {
-                    PROP_CLIENT_ID: client_id,
-                    PROP_SOURCE_DATASET: dataset,
-                })
+                zfs.set(server_fs, owned)
             except Exception as e:
                 ws.send(json.dumps({
                     'error': f'Failed to create {server_dataset}: {e}'
@@ -1905,8 +2171,21 @@ def create_app(
         # zfs.receive.filesystem() returns a StreamHandle wrapping the `zfs
         # receive` process's stdin. A startup failure raises here; it never
         # returns None.
+        #
+        # `props` (`-o`, plan B-1b): a copy of the zfsbackup properties that
+        # arrives IN the stream (a `zfs send -p`/`-R` the client is not
+        # supposed to make) never takes effect; the server's own values are
+        # set as LOCAL values by the receive itself, so there is no moment
+        # at which the stream's copy is in effect. Verified on OpenZFS 2.1.5,
+        # 2.2.2 and 2.4.1 for a full, an incremental, a resumed full and a
+        # resumed incremental receive (`-F -s -u` throughout). One call for
+        # both modes, so a resumed receive (`mode=resume`) gets exactly the
+        # same flags as the fresh one it continues.
         try:
-            writer = zfs.receive.filesystem(server_fs, force=True, save=True, mount=False)
+            writer = zfs.receive.filesystem(
+                server_fs, props=owned,
+                force=True, save=True, mount=False,
+            )
         except Exception as e:
             ws.send(json.dumps({'error': f'Failed to start zfs receive: {e}'}))
             return
