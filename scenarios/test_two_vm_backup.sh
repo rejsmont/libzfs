@@ -67,6 +67,22 @@
 #        K8  `import` of a YAML leaves `identity show` unchanged (and the destination still works)
 #        K9  `identity set-client-id` is refused while enrolled
 #        K10 importing a config with an http:// destination is refused and changes nothing
+#   L1 trust boundary (plan B-1, S-4, S-5; needs a tree with them, else skipped with a warning). Fresh pools. A is the real,
+#      enrolled victim client (four snapshots on the server); B is an enrolled ATTACKER whose daemon is modified (a
+#      sitecustomize in /opt/zfsb-evil makes it `zfs send -p` and stop re-syncing its config property). B (and the
+#      harness, for what a client cannot do) plants `\n`/`\t` forged `zfs list -H` rows in org.zfsbackup:* values, trying to
+#      make the server's pruner apply a keep-only-the-newest retention to A's dataset and to datasets outside the target:
+#        L1a   end to end over mTLS: raw `zfs set` on B's dataset (libzfseasy refuses the same values), a full and an
+#              incremental -p stream; the server holds its own LOCAL canonical values, no received config/client_id/
+#              source_dataset survives (`receive -x`), the pruner runs >= 4 cycles, A and the outside datasets are
+#              identical by name and guid
+#        L1b   hostile /negotiate bodies with B's certificate are 400 and write nothing; S-5: 426 without or with a wrong
+#              X-Zfsbackup-Protocol; S-4: /config, /datasets, /datasets/<n>/snapshots are 404
+#        L1c   forged LOCAL values planted on the server (row-forging config and client id, A's id on a dataset in B's tree,
+#              B's id in A's tree, a received-only config, datasets outside the target, a sibling sharing the target's name
+#              prefix) and >= 5 prune cycles: none is pruned, each is reported by ONE WARNING; a CONTROL dataset with the
+#              same config legitimately in B's tree IS pruned, and the pre-fix tree (L1_BASELINE_REF, default HEAD) is shown
+#              to select A's dataset with the attacker's retention in the same state
 # H, I and J need a real pool but little space (J: ~1.2 GiB per VM); they run after E-G, and also with --no-big.
 # E-G throttle the client's egress with `tc` (tbf) so a send lasts long enough to act on; the
 # throttle is always removed again (also on error). They write ~3 GiB per VM: the VMs need ~10G disk
@@ -80,10 +96,13 @@
 #   ./scenarios/test_two_vm_backup.sh --only-j   # provision, then only scenario J (fresh pools of its own)
 #   ./scenarios/test_two_vm_backup.sh --only-k   # provision, then only scenario K (fresh pools of its own)
 #   ./scenarios/test_two_vm_backup.sh --no-k     # everything except scenario K
+#   ./scenarios/test_two_vm_backup.sh --only-l1  # provision, then only scenario L1 (fresh pools of its own)
+#   ./scenarios/test_two_vm_backup.sh --no-l1    # everything except scenario L1
 #   ./scenarios/test_two_vm_backup.sh --purge    # delete the two VMs (and only those) at the end
-#   SRC_REF=<commit-ish> ./scenarios/test_two_vm_backup.sh   # ship that tree instead of HEAD; for uncommitted work use
-#                                                # SRC_REF=$(git stash create) (a commit of the working tree; the tree
-#                                                # and the stash list are untouched; empty when the tree is clean)
+#   SRC_REF=<commit-ish> ./scenarios/test_two_vm_backup.sh   # ship that tree instead of HEAD; SRC_REF=WORKTREE ships the
+#                                                # working tree as it is, untracked files included (built from a throwaway
+#                                                # index: the repo's index, stash list and refs are untouched)
+#   L1_BASELINE_REF=<commit-ish>                 # the pre-fix tree scenario L1 asks "what would you prune?" (default HEAD)
 #
 # Requires: multipass on the host (macOS/Linux). No sudo needed on the host.
 #
@@ -144,7 +163,7 @@ HEALTH_TIMEOUT=60
 SNAP_TIMEOUT=120         # ~4 snapshot periods
 
 # Flags
-PURGE=0; KEEP_POOLS=0; KEEP=0; BIG=1; ONLY_J=0; ONLY_K=0; NO_K=0
+PURGE=0; KEEP_POOLS=0; KEEP=0; BIG=1; ONLY_J=0; ONLY_K=0; NO_K=0; ONLY_L1=0; NO_L1=0
 for arg in "$@"; do
     case "$arg" in
         --purge)      PURGE=1 ;;
@@ -153,6 +172,8 @@ for arg in "$@"; do
         --only-j)     ONLY_J=1 ;;     # provision + scenario J only (A-I skipped): for iterating on J
         --only-k)     ONLY_K=1 ;;     # provision + scenario K only (A-J skipped): for iterating on K
         --no-k)       NO_K=1 ;;       # everything except scenario K
+        --only-l1)    ONLY_L1=1 ;;    # provision + scenario L1 only (A-K skipped): for iterating on L1
+        --no-l1)      NO_L1=1 ;;      # everything except scenario L1
         --keep)       KEEP=1; KEEP_POOLS=1 ;;
         -h|--help)    grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; exit 2 ;;
@@ -292,7 +313,7 @@ start_daemon() {
 stop_daemon() {
     local vm="$1"
     # All suppression happens in the guest; host stdout is never sent to /dev/null.
-    msh "$vm" "{ systemctl stop zfsbackup zfsbackup-victim; systemctl reset-failed zfsbackup zfsbackup-victim; pkill -f 'zfsbackup.daemon'; } >/dev/null 2>&1; true" || true
+    msh "$vm" "{ systemctl stop zfsbackup zfsbackup-victim zfsbackup-b; systemctl reset-failed zfsbackup zfsbackup-victim zfsbackup-b; pkill -f 'zfsbackup.daemon'; } >/dev/null 2>&1; true" || true
 }
 
 daemon_running() { msh "$1" "pgrep -f 'zfsbackup.daemon' >/dev/null" 2>/dev/null; }
@@ -597,7 +618,8 @@ probe() {
     local cert="$1" method="$2" path="$3" body="${4:-}" certargs="" dataargs=""
     [ "$cert" != none ] && certargs="--cert '${cert}.crt' --key '${cert}.key'"
     [ -n "$body" ] && dataargs="-H 'Content-Type: application/json' --data '$body'"
-    msh "$CLIENT_VM" "rm -f /tmp/zfsb-probe.json; curl -sk --connect-timeout 5 --max-time 20 $certargs -X $method $dataargs -o /tmp/zfsb-probe.json -w '%{http_code}' 'https://${SERVER_IP}:${API_PORT}${path}'" | tr -d '[:space:]'
+    # X-Zfsbackup-Protocol: every request names the wire protocol (plan S-5); without it an authenticated request is 426.
+    msh "$CLIENT_VM" "rm -f /tmp/zfsb-probe.json; curl -sk --connect-timeout 5 --max-time 20 -H 'X-Zfsbackup-Protocol: 1' $certargs -X $method $dataargs -o /tmp/zfsb-probe.json -w '%{http_code}' 'https://${SERVER_IP}:${API_PORT}${path}'" | tr -d '[:space:]'
 }
 probe_body() { msh "$CLIENT_VM" "cat /tmp/zfsb-probe.json 2>/dev/null"; }
 
@@ -616,6 +638,18 @@ check_lacks() {
 # ═════════════════════════════════ Main ═════════════════════════════════════
 command -v multipass >/dev/null 2>&1 || die "multipass not found on host — install it first"
 command -v git >/dev/null 2>&1 || die "git not found on host"
+
+# SRC_REF=WORKTREE ships the working tree as it is (tracked changes AND untracked files): a commit object is built from a
+# throwaway index, so the repository's index, stash list and refs are untouched (`git stash create` would leave untracked files out).
+if [ "$SRC_REF" = "WORKTREE" ]; then
+    wt_top="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)" || die "not in a git repo"
+    wt_idx="$(mktemp -u "${TMPDIR:-/tmp}/zfsb-wt-index.XXXXXX")"
+    wt_tree="$(cd "$wt_top" && GIT_INDEX_FILE="$wt_idx" git read-tree HEAD && GIT_INDEX_FILE="$wt_idx" git add -A && GIT_INDEX_FILE="$wt_idx" git write-tree)" \
+        || { rm -f "$wt_idx"; die "could not snapshot the working tree"; }
+    rm -f "$wt_idx"
+    SRC_REF="$(git -C "$wt_top" commit-tree "$wt_tree" -p HEAD -m 'zfsbackup harness: working-tree snapshot')" || die "could not snapshot the working tree"
+    info "SRC_REF=WORKTREE -> $SRC_REF (an unreferenced commit of the working tree)"
+fi
 
 echo "${BOLD}=================================================================${NC}"
 echo "${BOLD} zfsbackup two-VM transfer reliability harness${NC}"
@@ -639,10 +673,21 @@ for vm in "$SERVER_VM" "$CLIENT_VM"; do
     fi
 done
 
+# Does it carry the trust-boundary work scenario L1 needs (plan B-1 negotiate validation, S-5 protocol header)?
+L1_READY=1
+for vm in "$SERVER_VM" "$CLIENT_VM"; do
+    if msh "$vm" "test -f '$SRC_DIR/zfsbackup/protocol.py' && grep -q 'canonical_dataset_config' '$SRC_DIR/zfsbackup/api.py' && grep -q 'client_id_problem' '$SRC_DIR/zfsbackup/backup_manager.py'"; then
+        info "$vm: shipped tree has the B-1 canonical config / received-dataset guard and the S-5 protocol header"
+    else
+        warn "$vm: shipped tree ($SRC_REF) lacks the B-1/S-5 trust-boundary work: scenario L1 will be skipped"
+        L1_READY=0
+    fi
+done
+
 SERVER_IP="$(vm_ip "$SERVER_VM")"; [ -n "$SERVER_IP" ] || die "could not determine $SERVER_VM IP"
 put_jget "$SERVER_VM"; put_jget "$CLIENT_VM"
 
-if [ "$ONLY_J" -eq 0 ] && [ "$ONLY_K" -eq 0 ]; then    # (--only-j / --only-k skip everything up to their scenario banner)
+if [ "$ONLY_J" -eq 0 ] && [ "$ONLY_K" -eq 0 ] && [ "$ONLY_L1" -eq 0 ]; then    # (--only-j / --only-k / --only-l1 skip everything up to their scenario banner)
 # ── Phase 2: fresh pools ──
 stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
 remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"   # fresh DB (and no stale -wal/-shm)
@@ -1051,8 +1096,8 @@ j_synced() {
 
 echo
 step "SCENARIO J — resume of an interrupted transfer (token validation, in-flight pin, fresh fallback, D7)"
-if [ "$ONLY_K" -eq 1 ]; then
-    info "scenario J skipped (--only-k)"
+if [ "$ONLY_K" -eq 1 ] || [ "$ONLY_L1" -eq 1 ]; then
+    info "scenario J skipped (--only-k / --only-l1)"
 elif [ "$J_READY" -ne 1 ]; then
     warn "scenario J skipped: the shipped tree has no resume support"
 else
@@ -1223,7 +1268,10 @@ else
     check "(J4) the first dataset's server snapshots (names and guids) are untouched" "$server_before" \
         "$(msh "$SERVER_VM" "zfs list -H -t snapshot -o name,guid -r '$(server_ds)' | sort" | tr '\n' ' ')"
     # authenticated with this client's own certificate (-k: the pin is checked by zfsbackup, not curl)
-    code="$(probe "${TLS_DIR}/client" POST "/backup/${CLIENT_ID}/${CLIENT2_DS}/negotiate" '{"snapshots": []}')"
+    # (a negotiate now needs a valid `config`, plan B-1a: without one the answer is 400 before the ownership check)
+    j4_cfg="$(printf '%s' '{"name":"'"${CLIENT2_DS}"'","recursive":false,"frequency":86400.0,"enabled":true,"retention_rules":[{"age":3600.0,"keep_for":86400.0}],"remote":[]}' | base64 | tr -d '\n')"
+    j4_body="{\"snapshots\": [], \"config\": \"${j4_cfg}\"}"      # (built outside $(...): bash 3.2 mis-parses a nested \" there)
+    code="$(probe "${TLS_DIR}/client" POST "/backup/${CLIENT_ID}/${CLIENT2_DS}/negotiate" "$j4_body")"
     check "(J4) a direct, authenticated negotiate for ${CLIENT2_DS} answers HTTP 409" "409" "$code"
     msh "$CLIENT_VM" "grep -q 'refusing to mix in' /tmp/zfsb-probe.json" && pass "(J4) the 409 body names the conflict: $(msh "$CLIENT_VM" "cut -c1-200 /tmp/zfsb-probe.json" | tr -d '\n')" || fail "(J4) the 409 body does not say 'refusing to mix in'"
     msh "$CLIENT_VM" "rm -f /tmp/zfsb-probe.json" || true
@@ -1273,8 +1321,8 @@ k_nothing_sent() { # k_nothing_sent <label> <client log mark> <server log mark>
 
 echo
 step "SCENARIO K — TLS enrollment and trust (not enrolled, token reuse, id squatting, cert isolation, revoke, re-enroll, rotate)"
-if [ "$NO_K" -eq 1 ] || [ "$ONLY_J" -eq 1 ]; then
-    info "scenario K skipped (--no-k / --only-j)"
+if [ "$NO_K" -eq 1 ] || [ "$ONLY_J" -eq 1 ] || [ "$ONLY_L1" -eq 1 ]; then
+    info "scenario K skipped (--no-k / --only-j / --only-l1)"
 else
     stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
     remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"        # fresh DBs, fresh TLS dirs, no B
@@ -1571,6 +1619,430 @@ EOF
     stop_daemon "$CLIENT_VM"
 fi
 
+# ═════════════ Scenario L1: a hostile enrolled client cannot make the server prune someone else's data ═════════════
+# Plan B-1 (cross-tenant property injection), S-4 (no cross-client info endpoints) and S-5 (protocol header).
+# Two enrolled clients on one server: A (the victim, a real daemon) and B (the attacker: an enrolled client whose
+# daemon has been MODIFIED, see the sitecustomize below). B tries to get the server's pruner to apply an attacker-chosen
+# retention (1s/1s: "keep only the newest snapshot") to A's received dataset, and to datasets outside the backup
+# target, by getting a forged `zfs list -H` row (a newline or tab inside an `org.zfsbackup:*` value) onto the server.
+# Four layers are exercised, each against real daemons, real mTLS and real OpenZFS:
+#   L1a  end to end: B's raw `zfs set` plants forged values on ITS dataset (the client daemon refuses to write them: see
+#        the Validate.value check), the modified daemon sends `zfs send -p`, so they arrive as RECEIVED properties; the
+#        server's `receive -x` and its negotiate-written LOCAL canonical values must make them inert
+#   L1b  hostile /negotiate bodies over B's own certificate (wrong shape, undecodable or empty config, a control
+#        character in the dataset name), then the protocol header (S-5) and the removed info endpoints (S-4)
+#   L1c  defence in depth: a client cannot write LOCAL properties on the server, so a forged LOCAL value is planted on the
+#        server with raw `zfs set` (a row-forging config, a row-forging client id, A's id on a dataset in B's tree
+#        (the `zfsb-l1-a` / `zfsb-l1-ax` prefix trick), B's id planted in A's tree, a config that is only RECEIVED
+#        through a `send -p` stream, datasets outside the target, a sibling that merely shares the target's name prefix)
+#        and the pruner is left to run for several cycles. A CONTROL dataset in B's own tree carries the same attacker
+#        config legitimately: it MUST be pruned (the pruner works and the config is destructive), the rest MUST NOT.
+#        The pre-fix tree (L1_BASELINE_REF, default HEAD) is asked what it would prune in the same state: it is fooled.
+# Survival is judged on dataset and snapshot NAMES AND GUIDS, and on the server's own log (no `Pruning snapshots` line
+# may name a protected dataset; every refusal is a WARNING; no traceback).
+L1_A_ID="zfsb-l1-a"; L1_B_ID="zfsb-l1-ax"          # B's id starts with A's: the prefix trick
+L1_B_SRC="${CLIENT_POOL}/bdata"
+L1_B_LOG="/var/log/zfsbackup-b.log"
+L1_DIR="/opt/zfsb-l1"; L1_EVIL_DIR="/opt/zfsb-evil"; L1_OLD_DIR="/opt/zfsb-old"
+L1_BASELINE_REF="${L1_BASELINE_REF:-HEAD}"
+L1_OUT="${SERVER_POOL}/outside"                    # not under the target
+L1_SIB="${SERVER_POOL}/backupsx"                   # shares the TARGET's name prefix ("${TARGET_DS}x" is not a child of it)
+L1_RECVSRC="${SERVER_POOL}/l1recvsrc"              # the stream source of the received-only dataset (outside the target)
+L1_A_DS="${TARGET_DS}/${L1_A_ID}/${SOURCE_REL}"
+L1_B_DS="${TARGET_DS}/${L1_B_ID}/bdata"
+# the attacker's config: keep only the newest snapshot (retention 1s/1s). Same wire format as DatasetConfig.to_property().
+L1_EVIL_JSON='{"name":"evil","recursive":false,"frequency":1.0,"enabled":true,"retention_rules":[{"age":1.0,"keep_for":1.0}],"remote":[]}'
+L1_EVIL="$(printf '%s' "$L1_EVIL_JSON" | base64 | tr -d '\n')"
+
+blog_mark()  { msh "$CLIENT_VM" "wc -l < '$L1_B_LOG' 2>/dev/null || echo 0" | tr -d '[:space:]'; }
+blog_since() { msh "$CLIENT_VM" "tail -n +$(( $1 + 1 )) '$L1_B_LOG' 2>/dev/null"; }
+start_b_daemon() {
+    step "Starting B's (modified) daemon on $CLIENT_VM (unit zfsbackup-b, db $K_DB_B)"
+    msh "$CLIENT_VM" "
+        systemctl reset-failed zfsbackup-b 2>/dev/null || true
+        systemd-run --unit=zfsbackup-b --collect \
+            -p StandardOutput=append:'$L1_B_LOG' -p StandardError=append:'$L1_B_LOG' \
+            env PYTHONPATH='$L1_EVIL_DIR:$SRC_DIR' '$PY' -m zfsbackup.daemon -c '$K_DB_B' -v
+    " || die "could not start B's daemon"
+}
+stop_b_daemon() { msh "$CLIENT_VM" "{ systemctl stop zfsbackup-b; systemctl reset-failed zfsbackup-b; } >/dev/null 2>&1; true" || true; }
+l1_snap_b() { sleep 2; msh "$CLIENT_VM" "n=autosnap_\$(date -u +%Y%m%d%H%M%S); zfs snapshot '${L1_B_SRC}'@\$n && echo \$n" | tr -d '[:space:]'; }
+l1_server_snaps() { msh "$SERVER_VM" "zfs list -H -t snapshot -r -o name '$1' 2>/dev/null" | sed 's/.*@//' | grep -v '^$' || true; }
+# names and guids of everything at or below the given datasets, sorted (the survival fingerprint)
+l1_fp() { msh "$SERVER_VM" "zfs list -H -t all -o name,guid -r $* 2>/dev/null | sort" | tr '\t\n' ' |'; }
+# prune cycles seen since <server log mark>: the pruner logs one line per received dataset it evaluates, A's every cycle
+l1_cycles() { log_since_vm "$SERVER_VM" "$1" | grep -cE "Dataset ${L1_A_DS} has [0-9]+ snapshots to prune"; }
+l1_wait_cycles() { # l1_wait_cycles <mark> <n> <timeout>
+    local waited=0
+    until [ "$(l1_cycles "$1")" -ge "$2" ]; do [ "$waited" -ge "$3" ] && return 1; sleep 3; waited=$((waited+3)); done
+}
+# a server property's value as stored, line count of it (a forged value has more than one) and the part of it ZFS got from a stream
+l1_sprop()     { msh "$SERVER_VM" "zfs get -H -o value -s $3 '$2' '$1' 2>/dev/null" | head -c 4000; }
+l1_sprop_ln()  { msh "$SERVER_VM" "zfs get -H -o value -s $3 '$2' '$1' 2>/dev/null | wc -l" | tr -d '[:space:]'; }
+# decode a server dataset's local org.zfsbackup:config to a python expression over the JSON (d)
+l1_cfg_expr()  { msh "$SERVER_VM" "zfs get -H -o value -s local org.zfsbackup:config '$1' | base64 -d 2>/dev/null | '$PY' '$JGET_PY' '$2'" | tr -d '\r'; }
+# raw probe: l1_probe <cert-base|none> <METHOD> <path> <proto-header-value|-> [json body]  (probe() always sends protocol 1)
+l1_probe() {
+    local cert="$1" method="$2" path="$3" proto="$4" body="${5:-}" certargs="" dataargs="" hdr=""
+    [ "$cert" != none ] && certargs="--cert '${cert}.crt' --key '${cert}.key'"
+    [ -n "$body" ] && dataargs="-H 'Content-Type: application/json' --data '$body'"
+    [ "$proto" != "-" ] && hdr="-H 'X-Zfsbackup-Protocol: ${proto}'"
+    msh "$CLIENT_VM" "rm -f /tmp/zfsb-probe.json; curl -sk --connect-timeout 5 --max-time 20 $hdr $certargs -X $method $dataargs -o /tmp/zfsb-probe.json -w '%{http_code}' 'https://${SERVER_IP}:${API_PORT}${path}'" | tr -d '[:space:]'
+}
+
+echo
+step "SCENARIO L1 — a hostile enrolled client (B) cannot make the server prune A's data (forged property rows, send -p, prefix tricks)"
+if [ "$NO_L1" -eq 1 ] || [ "$ONLY_J" -eq 1 ] || [ "$ONLY_K" -eq 1 ]; then
+    info "scenario L1 skipped (--no-l1 / --only-j / --only-k)"
+elif [ "$L1_READY" -ne 1 ]; then
+    warn "scenario L1 skipped: the shipped tree has no B-1/S-5 support (api.py: canonical_dataset_config, protocol.py)"
+else
+    stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
+    remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"
+    msh "$CLIENT_VM" "rm -f '$L1_B_LOG'" || true
+    recreate_pool "$SERVER_VM" "$SERVER_POOL"; recreate_pool "$CLIENT_VM" "$CLIENT_POOL"
+    msh "$SERVER_VM" "zfs create -p '$TARGET_DS'" || die "failed to create $TARGET_DS"
+    msh "$CLIENT_VM" "zfs create '$SOURCE_DS' && zfs create '$L1_B_SRC'" || die "failed to create the client datasets"
+    msh "$CLIENT_VM" "head -c 300000 /dev/urandom > \$(zfs get -H -o value mountpoint '$SOURCE_DS')/file0.bin; head -c 300000 /dev/urandom > \$(zfs get -H -o value mountpoint '$L1_B_SRC')/b0.bin"
+    SERVER_PRUNE="15s"; CLIENT_SNAP_FREQ="1d"; CLIENT_PRUNE="5m"
+    CLIENT_RETENTION_YAML=$'      "1s": "1d"'     # one snapshot per 1s slot: A's snapshots (snap_now spaces them >= 2s) are ALL kept
+    PIN_FP=""; CLIENT_ID=""
+
+    # ── guest-side helpers (shipped as files: never piped through exec) ──
+    # the modified client: always `zfs send -p`, and never re-syncs org.zfsbackup:config on its dataset (so what B planted
+    # stays). It is the OPPOSITE of a bug fix: it is what a malicious operator of B's host would run.
+    put_guest_file "$CLIENT_VM" "$L1_EVIL_DIR/sitecustomize.py" <<'PYEOF'
+import os, sys
+try:
+    import libzfseasy.zfs as _z
+    from zfsbackup.backup_manager import DatasetManager as _DM
+    _orig = _z.SendCommand.snapshot
+    def _snapshot(ds, since=None, **kw):
+        kw['properties'] = True            # zfs send -p: the dataset's properties travel with the stream
+        return _orig(ds, since=since, **kw)
+    _z.SendCommand.snapshot = staticmethod(_snapshot)
+    _DM.sync_config_property = lambda self, dsi: None
+    print('zfsb-evil: send -p and no config sync active (pid %d)' % os.getpid(), file=sys.stderr)
+except Exception as exc:
+    print('zfsb-evil: PATCH FAILED: %r' % (exc,), file=sys.stderr)
+PYEOF
+    # what the daemon's own library does with a hostile value: every one must be refused before any zfs command runs
+    put_guest_file "$CLIENT_VM" "$L1_DIR/validate_probe.py" <<'PYEOF'
+import sys
+import libzfseasy as zfs
+from libzfseasy.types import Filesystem
+ds = Filesystem(sys.argv[1])
+cases = {'newline': 'a\nb', 'tab': 'a\tb', 'forged-row': 'x\nsome/ds\tfilesystem\tid\tcfg', 'cr': 'a\rb', 'plain': 'fine-value'}
+for name, value in cases.items():
+    try:
+        zfs.set(ds, {'org.zfsbackup:anchor.l1probe': value})
+        print(name, 'ACCEPTED')
+    except ValueError:
+        print(name, 'REFUSED')
+    except Exception as exc:
+        print(name, 'OTHER', type(exc).__name__)
+PYEOF
+    # B plants its forged values on ITS dataset with the raw zfs CLI (phase 1: forged rows; phase 2: a clean-looking copy of A's id)
+    put_guest_file "$CLIENT_VM" "$L1_DIR/plant_client.sh" <<'SHEOF'
+set -u
+EVIL="$1"; BS="$2"; T="$3"; A="$4"; OUT="$5"; PH="$6"
+TAB=$'\t'; NL=$'\n'
+setp() { zfs set "$2=$3" "$1" || { echo "SETFAIL $2"; exit 12; }; }
+case "$PH" in
+  1) cfg="$EVIL${NL}$T/$A/data${TAB}filesystem${TAB}$A${TAB}$EVIL${NL}$OUT${TAB}filesystem${TAB}$A${TAB}$EVIL"
+     cid="$A${NL}$T/$A/data${TAB}filesystem${TAB}$A${TAB}$EVIL"
+     src="zbclient/data"
+     anc="autosnap_20200101000001${NL}$T/$A/data${TAB}org.zfsbackup:anchor.server1${TAB}autosnap_20200101000009${TAB}-${TAB}local" ;;
+  2) cfg="$EVIL"; cid="$A"; src="zbclient/data"; anc="autosnap_20200101000002" ;;
+esac
+setp "$BS" org.zfsbackup:config "$cfg"
+setp "$BS" org.zfsbackup:client_id "$cid"
+setp "$BS" org.zfsbackup:source_dataset "$src"
+setp "$BS" org.zfsbackup:anchor.l1evil "$anc"
+echo PLANTED
+SHEOF
+    # the server-side plants (L1c): see the scenario header
+    put_guest_file "$SERVER_VM" "$L1_DIR/plant_server.sh" <<'SHEOF'
+set -u
+EVIL="$1"; T="$2"; A="$3"; B="$4"; OUT="$5"; SIB="$6"; RSRC="$7"
+TAB=$'\t'; NL=$'\n'
+mk() { zfs create -p "$1" || exit 10; for i in 1 2 3; do zfs snapshot "$1@autosnap_2020010100000$i" || exit 11; done; }
+setp() { zfs set "$2=$3" "$1" || { echo "SETFAIL $1 $2"; exit 12; }; }
+row() { printf '%s' "$1${TAB}filesystem${TAB}$2${TAB}$EVIL"; }          # a forged "zfs list -H" row
+# P1 rowforge: B's config value carries two forged rows, one for A's dataset, one for a dataset outside the target
+mk "$T/$B/rowforge"; setp "$T/$B/rowforge" org.zfsbackup:client_id "$B"
+setp "$T/$B/rowforge" org.zfsbackup:config "$EVIL${NL}$(row "$T/$A/data" "$A")${NL}$(row "$OUT" "$B")"
+# P2 idforge: the forged row is in the client id column instead
+mk "$T/$B/idforge"; setp "$T/$B/idforge" org.zfsbackup:client_id "$B${NL}$(row "$T/$A/data" "$A")"
+setp "$T/$B/idforge" org.zfsbackup:config "$EVIL"
+# P3 prefixtrick: A's id on a dataset in B's tree; "T/zfsb-l1-ax/..." starts with "T/zfsb-l1-a" (a bare prefix test accepts it)
+mk "$T/$B/prefixtrick"; setp "$T/$B/prefixtrick" org.zfsbackup:client_id "$A"; setp "$T/$B/prefixtrick" org.zfsbackup:config "$EVIL"
+# P4 planted: B's id (and the attacker's config) on a dataset inside A's tree
+mk "$T/$A/planted"; setp "$T/$A/planted" org.zfsbackup:client_id "$B"; setp "$T/$A/planted" org.zfsbackup:config "$EVIL"
+# P5 recvonly: a config that exists only as a RECEIVED property (a `zfs send -p/-R` stream), none set locally
+mk "$RSRC"; setp "$RSRC" org.zfsbackup:client_id "$A"; setp "$RSRC" org.zfsbackup:config "$EVIL"
+zfs send -R "$RSRC@autosnap_20200101000003" | zfs receive "$T/$B/recvonly" || { echo "RECVFAIL"; exit 13; }
+# P6 ctl: the CONTROL. Same attacker config, but legitimately on a dataset in B's own tree under B's own id: must be pruned
+mk "$T/$B/ctl"; setp "$T/$B/ctl" org.zfsbackup:client_id "$B"; setp "$T/$B/ctl" org.zfsbackup:config "$EVIL"
+# P7 outside the target (created, with their snapshots, by the harness): under no client at all, and a sibling that merely shares the target's name prefix
+for d in "$OUT" "$OUT/child"; do setp "$d" org.zfsbackup:client_id "$A"; setp "$d" org.zfsbackup:config "$EVIL"; done
+setp "$SIB" org.zfsbackup:client_id "$B"; setp "$SIB" org.zfsbackup:config "$EVIL"
+echo PLANTED
+SHEOF
+    # what a pre-fix tree thinks it should prune (names + the retention it would apply). Read-only: it only enumerates.
+    put_guest_file "$SERVER_VM" "$L1_DIR/received.py" <<'PYEOF'
+import sys
+from pathlib import Path
+tree, cfgfile = sys.argv[1], sys.argv[2]
+sys.path.insert(0, tree)
+from zfsbackup.config import BackupConfig
+from zfsbackup.backup_manager import DatasetManager
+m = DatasetManager(BackupConfig.from_file(Path(cfgfile)))
+for d in m.received_datasets():
+    rules = ','.join('%gs/%gs' % (r.age.total_seconds(), r.keep_for.total_seconds()) for r in d.config.retention_rules)
+    print('RECEIVED', d.name, rules)
+PYEOF
+    L1_TOP="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+    if git -C "$L1_TOP" rev-parse --verify -q "${L1_BASELINE_REF}^{commit}" >/dev/null 2>&1; then
+        btar="$(mktemp)"
+        git -C "$L1_TOP" archive --format=tar "$L1_BASELINE_REF" > "$btar" \
+            && multipass transfer "$btar" "$SERVER_VM:/tmp/zfsb-old.tar" \
+            && msh "$SERVER_VM" "rm -rf '$L1_OLD_DIR' && mkdir -p '$L1_OLD_DIR' && tar -m -xf /tmp/zfsb-old.tar -C '$L1_OLD_DIR' && rm -f /tmp/zfsb-old.tar" \
+            || warn "could not ship the baseline tree ($L1_BASELINE_REF)"
+        rm -f "$btar"
+    fi
+    # the baseline is only meaningful if that ref lacks the B-1c guard
+    L1_BASELINE_OK=0
+    msh "$SERVER_VM" "test -f '$L1_OLD_DIR/zfsbackup/backup_manager.py' && ! grep -q client_id_problem '$L1_OLD_DIR/zfsbackup/backup_manager.py'" && L1_BASELINE_OK=1
+
+    # ── setup: server, victim A (real daemon, enrolled), four snapshots on the server ──
+    write_server_config
+    msh "$SERVER_VM" "zfs create -p '$L1_OUT/child' && zfs create '$L1_SIB' && for d in '$L1_OUT' '$L1_OUT/child' '$L1_SIB'; do for i in 1 2 3; do zfs snapshot \"\$d@autosnap_2020010100000\$i\"; done; done" \
+        || die "(L1) could not create the outside datasets"
+    start_daemon "$SERVER_VM"
+    wait_health || die "(L1) server API never became healthy"
+    kmark_c="$(loglines "$CLIENT_VM")"; kmark_s="$(loglines "$SERVER_VM")"
+    write_client_config "$SERVER_IP"            # A's destination is not pinned yet: enroll_client pins it (do not re-import afterwards)
+    out="$(cli_vm "$CLIENT_VM" identity set-client-id "$L1_A_ID")"; rc=$?
+    check "(L1) A takes client id $L1_A_ID" "0" "$rc"
+    enroll_client
+    check "(L1) A is enrolled as $L1_A_ID" "$L1_A_ID" "$CLIENT_ID"
+    A_FP="$(client_fp)"
+    L1_A_SNAPS=()
+    for i in 0 1 2 3; do
+        [ "$i" -gt 0 ] && msh "$CLIENT_VM" "head -c 200000 /dev/urandom >> \$(zfs get -H -o value mountpoint '$SOURCE_DS')/file$i.bin"
+        s="$(snap_now)"; L1_A_SNAPS+=("$s")
+        [ "$i" -eq 0 ] && start_daemon "$CLIENT_VM"
+        if ! wait_server_snap "$s" 150; then fail "(L1) A's snapshot $s never reached the server"; fi
+    done
+    stop_daemon "$CLIENT_VM"
+    check "(L1) A's four snapshots are on the server" "4" "$(l1_server_snaps "$L1_A_DS" | count)"
+    check "(L1) A's last snapshot is byte-identical on the server" "$(guid "$CLIENT_VM" "${SOURCE_DS}@${L1_A_SNAPS[3]}")" "$(guid "$SERVER_VM" "${L1_A_DS}@${L1_A_SNAPS[3]}")"
+    check "(L1) A's server dataset carries A's id as a LOCAL property" "$L1_A_ID" "$(l1_sprop "$L1_A_DS" org.zfsbackup:client_id local | tr -d '[:space:]')"
+    A_BEFORE="$(l1_fp "$L1_A_DS")"
+    OUT_BEFORE="$(l1_fp "$L1_OUT" "$L1_SIB")"
+    check "(L1) the outside datasets hold their 3 snapshots each (and the child)" "9" "$(msh "$SERVER_VM" "zfs list -H -t snapshot -r -o name '$L1_OUT' '$L1_SIB' | wc -l" | tr -d '[:space:]')"
+
+    # ── B: its own DB, certificate and id; a daemon that is MODIFIED ──
+    echo
+    step "L1a — B enrolls (a normal enrollment); its daemon is modified to send -p and to keep what B plants"
+    msh "$CLIENT_VM" "mkdir -p /var/lib/zfsbackup-b" || die "could not create /var/lib/zfsbackup-b"
+    put_guest_file "$CLIENT_VM" /var/lib/zfsbackup-b/config.yaml <<EOF
+snapshot_prefix: "autosnap"
+check_interval: "15s"
+prune_interval: "5m"
+destinations:
+  ${DEST_NAME}:
+    url: "https://${SERVER_IP}:${API_PORT}"
+datasets:
+  - name: "${L1_B_SRC}"
+    enabled: true
+    frequency: "1d"
+    retention:
+      "1s": "1d"
+    remote:
+      - destination: ${DEST_NAME}
+        frequency: "30s"
+EOF
+    cli_b import --no-backup /var/lib/zfsbackup-b/config.yaml | sed 's/^/    CLI(B): /'
+    out="$(cli_b identity set-client-id "$L1_B_ID")"; rc=$?
+    check "(L1) B takes client id $L1_B_ID" "0" "$rc"
+    mint_token || die "(L1) could not create a token for B"
+    put_token "$CLIENT_VM" /tmp/zfsb-token-l1b || die "(L1) could not deliver B's token file"
+    out="$(cli_b enroll "$DEST_NAME" --url "https://${SERVER_IP}:${API_PORT}" --token-file /tmp/zfsb-token-l1b)"; rc=$?
+    printf '%s\n' "$out" | sed 's/^/    CLI(B): /'
+    msh "$CLIENT_VM" "rm -f /tmp/zfsb-token-l1b" || true
+    check "(L1) B enrolls: exit 0" "0" "$rc"
+    B_FP="$(cli_jget_db "$CLIENT_VM" "$K_DB_B" 'd["client_certificate"]["fingerprint"]' identity show --json | tr -d '[:space:]')"
+    check "(L1) the server pins B's certificate under $L1_B_ID, and A's under $L1_A_ID" "$B_FP - $A_FP -" "$(trust_pins "$L1_B_ID") $(trust_pins "$L1_A_ID")"
+
+    # The daemon's own library refuses hostile values (a cooperative client cannot be talked into writing them).
+    out="$(msh "$CLIENT_VM" "env PYTHONPATH='$SRC_DIR' '$PY' '$L1_DIR/validate_probe.py' '$L1_B_SRC' 2>&1")"
+    for c in newline tab forged-row cr; do check_has "(L1a) libzfseasy refuses a $c in a property value (Validate.value)" "^${c} REFUSED" "$out"; done
+    check_has "(L1a) ... and still accepts an ordinary value (control)" "^plain ACCEPTED" "$out"
+    check "(L1a) nothing hostile was written: only the control value exists" "fine-value" "$(zprop "$CLIENT_VM" "$L1_B_SRC" org.zfsbackup:anchor.l1probe)"
+    msh "$CLIENT_VM" "zfs inherit org.zfsbackup:anchor.l1probe '$L1_B_SRC'" || true
+
+    # Server prune cycles from here on (15s each); A's and the outside fingerprints must survive every one of them.
+    mark_s="$(loglines "$SERVER_VM")"
+    step "L1a phase 1 — forged ROWS planted with the raw zfs CLI, then the first (full, -p) stream"
+    out="$(msh "$CLIENT_VM" "bash '$L1_DIR/plant_client.sh' '$L1_EVIL' '$L1_B_SRC' '$TARGET_DS' '$L1_A_ID' '$L1_OUT' 1 2>&1")"
+    check_has "(L1a) the raw zfs CLI planted the forged values on B's dataset" "^PLANTED" "$out"
+    check_lacks "(L1a) ... planting did not fail" "SETFAIL" "$out"
+    check_has "(L1a) B's local config really is a multi-line forged value (control)" "^3$" "$(msh "$CLIENT_VM" "zfs get -H -o value org.zfsbackup:config '$L1_B_SRC' | wc -l" | tr -d '[:space:]')"
+    B_S1="$(l1_snap_b)"
+    mark_b="$(blog_mark)"
+    start_b_daemon
+    check_has "(L1a) B's daemon runs the modified client (send -p, no config sync)" "zfsb-evil: send -p and no config sync active" "$(sleep 5; blog_since "$mark_b")"
+    check_lacks "(L1a) ... the patch applied" "PATCH FAILED" "$(blog_since "$mark_b")"
+    waited=0; until l1_server_snaps "$L1_B_DS" | grep -qx "$B_S1" || [ "$waited" -ge 150 ]; do sleep 3; waited=$((waited+3)); done
+    stop_b_daemon
+    if l1_server_snaps "$L1_B_DS" | grep -qx "$B_S1"; then pass "(L1a) B's first snapshot $B_S1 reached the server (full stream with -p)"; else fail "(L1a) $B_S1 never reached the server: $(blog_since "$mark_b" | tail -n 5 | tr '\n' '|')"; fi
+    check_has "(L1a) B's log: Backup complete (full)" "Backup complete: ${L1_B_SRC}@${B_S1} \(full\)" "$(blog_since "$mark_b")"
+    l1_check_b_dataset() { # l1_check_b_dataset <label>: B's server dataset holds the SERVER's values, the forged ones are inert
+        check "($1) B's server dataset: local client_id is B's bound id" "$L1_B_ID" "$(l1_sprop "$L1_B_DS" org.zfsbackup:client_id local | tr -d '[:space:]')"
+        check "($1) B's local config is ONE line (the canonical re-encoding)" "1" "$(l1_sprop_ln "$L1_B_DS" org.zfsbackup:config local)"
+        check "($1) ... it decodes to B's real dataset name, not the attacker's" "$L1_B_SRC" "$(l1_cfg_expr "$L1_B_DS" 'd["name"]' | tr -d '[:space:]')"
+        check "($1) ... with B's real retention (1s/86400s), not the attacker's 1s/1s" "[{'age': 1.0, 'keep_for': 86400.0}]" "$(l1_cfg_expr "$L1_B_DS" 'd["retention_rules"]')"
+        check "($1) B's local source_dataset is the URL's, not the planted one" "$L1_B_SRC" "$(l1_sprop "$L1_B_DS" org.zfsbackup:source_dataset local | tr -d '[:space:]')"
+        for p in config client_id source_dataset; do
+            check "($1) no RECEIVED org.zfsbackup:$p survived the stream (receive -x)" "0" "$(l1_sprop_ln "$L1_B_DS" org.zfsbackup:$p received)"
+        done
+    }
+    l1_check_b_dataset "L1a-1"
+    check_has "(L1a-1) control: the -p stream really carried B's properties (the dynamic anchor.l1evil arrived as RECEIVED)" "autosnap_20200101000001" "$(l1_sprop "$L1_B_DS" org.zfsbackup:anchor.l1evil received)"
+
+    step "L1a phase 2 — a clean-looking, VALID forged config and A's id as plain values, then an incremental -p stream"
+    out="$(msh "$CLIENT_VM" "bash '$L1_DIR/plant_client.sh' '$L1_EVIL' '$L1_B_SRC' '$TARGET_DS' '$L1_A_ID' '$L1_OUT' 2 2>&1")"
+    check_has "(L1a) phase 2 values planted" "^PLANTED" "$out"
+    msh "$CLIENT_VM" "head -c 200000 /dev/urandom >> \$(zfs get -H -o value mountpoint '$L1_B_SRC')/b1.bin"
+    B_S2="$(l1_snap_b)"
+    mark_b="$(blog_mark)"
+    start_b_daemon
+    waited=0; until l1_server_snaps "$L1_B_DS" | grep -qx "$B_S2" || [ "$waited" -ge 150 ]; do sleep 3; waited=$((waited+3)); done
+    stop_b_daemon
+    if l1_server_snaps "$L1_B_DS" | grep -qx "$B_S2"; then pass "(L1a) B's second snapshot $B_S2 reached the server (incremental, with -p)"; else fail "(L1a) $B_S2 never reached the server: $(blog_since "$mark_b" | tail -n 5 | tr '\n' '|')"; fi
+    check_has "(L1a) B's log: Backup complete (incremental from $B_S1)" "Backup complete: ${L1_B_SRC}@${B_S2} \(incremental from ${B_S1}\)" "$(blog_since "$mark_b")"
+    l1_check_b_dataset "L1a-2"
+    check "(L1a-2) B's guids match the client's (the data itself is intact)" "$(guid "$CLIENT_VM" "${L1_B_SRC}@${B_S2}")" "$(guid "$SERVER_VM" "${L1_B_DS}@${B_S2}")"
+
+    step "L1a — the server's pruner runs several cycles over the forged state"
+    if l1_wait_cycles "$mark_s" 4 200; then pass "(L1a) the server's pruner completed $(l1_cycles "$mark_s") cycles since B's first stream"; else fail "(L1a) fewer than 4 prune cycles in 200s ($(l1_cycles "$mark_s"))"; fi
+    check "(L1a) A's received dataset: names and guids unchanged" "$A_BEFORE" "$(l1_fp "$L1_A_DS")"
+    check "(L1a) the datasets outside the target: names and guids unchanged" "$OUT_BEFORE" "$(l1_fp "$L1_OUT" "$L1_SIB")"
+    check "(L1a) A still has its 4 snapshots" "4" "$(l1_server_snaps "$L1_A_DS" | count)"
+    slog="$(log_since_vm "$SERVER_VM" "$mark_s")"
+    check_lacks "(L1a) no 'Pruning snapshots' line names A's dataset" "Pruning snapshots.*${L1_A_DS}@" "$slog"
+    check_lacks "(L1a) no log line since B's first stream mentions the outside datasets" "${L1_OUT}|${L1_SIB}" "$slog"
+    check "(L1a) B's own two snapshots are still there (nothing destructive was applied to B either)" "2" "$(l1_server_snaps "$L1_B_DS" | count)"
+    check_lacks "(L1a) no traceback on the server" "Traceback" "$slog"
+    check_lacks "(L1a) no traceback in B's log" "Traceback" "$(blog_since 0)"
+
+    # ── L1b: hostile negotiates with B's own certificate ──
+    echo
+    step "L1b — hostile /negotiate bodies over B's certificate (400 each, nothing written), then S-5 and S-4"
+    B_BASE="${K_TLS_B}/client"
+    l1chk() { local before="$FAIL_COUNT"; check "$@"; [ "$FAIL_COUNT" -gt "$before" ] && echo "    last response body: $(probe_body | cut -c1-240)"; return 0; }
+    l1_refused() { case "$1" in 400|404) echo refused ;; *) echo "$1" ;; esac; }
+    b_before="$(l1_fp "$TARGET_DS/$L1_B_ID")"; b_cfg_before="$(l1_sprop "$L1_B_DS" org.zfsbackup:config local)"
+    mark_s="$(loglines "$SERVER_VM")"
+    neg() { echo "/backup/${L1_B_ID}/${CLIENT_POOL}/$1/negotiate"; }
+    b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+    # (bash 3.2, the macOS default, mis-parses a nested \"...\" inside $(...): build bodies in a function)
+    mkbody() { printf '{"snapshots": %s, "config": "%s"}' "$1" "$(b64 "$2")"; }
+    GOODBODY='{"name":"zbclient/ok","recursive":false,"frequency":1.0,"enabled":true,"retention_rules":[{"age":1.0,"keep_for":86400.0}],"remote":[]}'
+    l1chk "(L1b) control: a well-formed negotiate for a new dataset answers 200" "200" "$(l1_probe "$B_BASE" POST "$(neg okctl)" 1 "$(mkbody '[]' "$GOODBODY")")"
+    l1chk "(L1b) ... and it created B's dataset for it" "1" "$(msh "$SERVER_VM" "zfs list -H -o name '$TARGET_DS/$L1_B_ID/okctl' 2>/dev/null | wc -l" | tr -d '[:space:]')"
+    l1chk "(L1b) a body that is not a JSON object: 400" "400" "$(l1_probe "$B_BASE" POST "$(neg h1)" 1 '[1]')"
+    l1chk "(L1b) no config: 400" "400" "$(l1_probe "$B_BASE" POST "$(neg h2)" 1 '{"snapshots": []}')"
+    l1chk "(L1b) an empty config (the old 'keep the received one' path): 400" "400" "$(l1_probe "$B_BASE" POST "$(neg h3)" 1 '{"snapshots": [], "config": ""}')"
+    l1chk "(L1b) a config with a newline inside the base64: 400" "400" "$(l1_probe "$B_BASE" POST "$(neg h4)" 1 '{"snapshots": [], "config": "Zm9v\nYmFy"}')"
+    l1chk "(L1b) a config that is not base64 at all: 400" "400" "$(l1_probe "$B_BASE" POST "$(neg h5)" 1 '{"snapshots": [], "config": "not base64 at all"}')"
+    l1chk "(L1b) a config whose name is not a string: 400" "400" "$(l1_probe "$B_BASE" POST "$(neg h6)" 1 "$(mkbody '[]' '{"name":5,"recursive":false,"frequency":1.0,"enabled":true,"retention_rules":[],"remote":[]}')")"
+    l1chk "(L1b) a config with a negative retention: 400" "400" "$(l1_probe "$B_BASE" POST "$(neg h7)" 1 "$(mkbody '[]' '{"name":"x","recursive":false,"frequency":1.0,"enabled":true,"retention_rules":[{"age":-1.0,"keep_for":5.0}],"remote":[]}')")"
+    l1chk "(L1b) a snapshot list that is not a list of strings: 400" "400" "$(l1_probe "$B_BASE" POST "$(neg h8)" 1 "$(mkbody '[1]' "$GOODBODY")")"
+    l1chk "(L1b) a newline in the client dataset name (%0A): refused (the router itself answers 404)" "refused" "$(l1_refused "$(l1_probe "$B_BASE" POST "/backup/${L1_B_ID}/${CLIENT_POOL}/ev%0Ail/negotiate" 1 "$(mkbody '[]' "$GOODBODY")")")"
+    l1chk "(L1b) a tab in the client dataset name (%09): 400" "400" "$(l1_probe "$B_BASE" POST "/backup/${L1_B_ID}/${CLIENT_POOL}/ev%09il/negotiate" 1 "$(mkbody '[]' "$GOODBODY")")"
+    # a config whose JSON strings carry a forged row: valid JSON, so it is accepted -- but only its canonical base64 is stored
+    EVILNAME='{"name":"x\nzbserver/outside\tfilesystem\tzfsb-l1-a\tAAAA","recursive":false,"frequency":1.0,"enabled":true,"retention_rules":[{"age":1.0,"keep_for":1.0}],"remote":[]}'
+    l1chk "(L1b) a config with a forged row INSIDE its JSON name: 200 (valid JSON), stored canonically" "200" "$(l1_probe "$B_BASE" POST "$(neg rowname)" 1 "$(mkbody '[]' "$EVILNAME")")"
+    l1chk "(L1b) ... its stored local config is one line" "1" "$(l1_sprop_ln "$TARGET_DS/$L1_B_ID/rowname" org.zfsbackup:config local)"
+    l1chk "(L1b) ... and the client id on it is B's" "$L1_B_ID" "$(l1_sprop "$TARGET_DS/$L1_B_ID/rowname" org.zfsbackup:client_id local | tr -d '[:space:]')"
+    l1chk "(L1b) none of the refused requests created a dataset: B's tree holds exactly bdata, okctl and rowname" "bdata okctl rowname" \
+        "$(msh "$SERVER_VM" "zfs list -H -d 1 -o name '$TARGET_DS/$L1_B_ID' | sed 1d | sed 's#.*/##' | sort | tr '\n' ' '" | sed 's/ *$//')"
+    l1chk "(L1b) ... and A's tree still holds exactly its dataset" "data" \
+        "$(msh "$SERVER_VM" "zfs list -H -d 1 -o name '$TARGET_DS/$L1_A_ID' | sed 1d | sed 's#.*/##' | sort | tr '\n' ' '" | sed 's/ *$//')"
+    l1chk "(L1b) B's real dataset and its config property are unchanged by the hostile requests" "$b_cfg_before" "$(l1_sprop "$L1_B_DS" org.zfsbackup:config local)"
+    check_has "(L1b) the server logged the refused configs at WARNING (undecodable / wrong shape)" "WARNING.*negotiate from client ${L1_B_ID} for .*refusing its config" "$(log_since_vm "$SERVER_VM" "$mark_s")"
+    l1chk "(L1b) ... one per refused config (h3 h4 h5 h6 h7: five; h2 reports the missing field)" "true" "$([ "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -c 'refusing its config')" -ge 5 ] && echo true || echo false)"
+    # S-5: the protocol header
+    l1chk "(L1b/S-5) no X-Zfsbackup-Protocol header on an authenticated endpoint: 426" "426" "$(l1_probe "$B_BASE" GET /whoami -)"
+    check_has "(L1b/S-5) ... the 426 body names the protocol reason" '"reason": *"protocol"' "$(probe_body)"
+    l1chk "(L1b/S-5) an unsupported version (99): 426" "426" "$(l1_probe "$B_BASE" GET /whoami 99)"
+    l1chk "(L1b/S-5) a non-numeric version: 426" "426" "$(l1_probe "$B_BASE" GET /whoami abc)"
+    l1chk "(L1b/S-5) /health needs no header: 200" "200" "$(l1_probe none GET /health -)"
+    l1chk "(L1b/S-5) with version 1 /whoami answers 200" "200" "$(l1_probe "$B_BASE" GET /whoami 1)"
+    check_has "(L1b/S-5) ... and names the server's protocol" '"protocol": *1' "$(probe_body)"
+    check_has "(L1b/S-5) the server logged the refusal" "(426)|protocol" "$(log_since_vm "$SERVER_VM" "$mark_s")"
+    # S-4: the cross-client info endpoints are gone
+    l1chk "(L1b/S-4) GET /config is gone: 404" "404" "$(l1_probe "$B_BASE" GET /config 1)"
+    l1chk "(L1b/S-4) GET /datasets is gone: 404" "404" "$(l1_probe "$B_BASE" GET /datasets 1)"
+    l1chk "(L1b/S-4) GET /datasets/<name>/snapshots is gone: 404" "404" "$(l1_probe "$B_BASE" GET "/datasets/${L1_A_DS}/snapshots" 1)"
+    l1chk "(L1b) A's received dataset and the outside datasets are still unchanged" "$A_BEFORE $OUT_BEFORE" "$(l1_fp "$L1_A_DS") $(l1_fp "$L1_OUT" "$L1_SIB")"
+    msh "$CLIENT_VM" "rm -f /tmp/zfsb-probe.json" || true
+
+    # ── L1c: forged LOCAL values planted on the server itself ──
+    echo
+    step "L1c — forged LOCAL properties planted on the server with the raw zfs CLI; the pruner runs several cycles"
+    mark_s="$(loglines "$SERVER_VM")"
+    out="$(msh "$SERVER_VM" "bash '$L1_DIR/plant_server.sh' '$L1_EVIL' '$TARGET_DS' '$L1_A_ID' '$L1_B_ID' '$L1_OUT' '$L1_SIB' '$L1_RECVSRC' 2>&1")"
+    check_has "(L1c) the server-side plants are in place" "^PLANTED" "$out"
+    check_lacks "(L1c) ... no plant failed" "SETFAIL|RECVFAIL" "$out"
+    # the attack surface is real on this OpenZFS: the forged row is in the raw `zfs list -H` output
+    raw="$(msh "$SERVER_VM" "zfs list -H -o name,type,org.zfsbackup:client_id,org.zfsbackup:config -r -t filesystem '$TARGET_DS' | grep -cP '^${TARGET_DS}/${L1_A_ID}/data\\tfilesystem\\t${L1_A_ID}\\t${L1_EVIL}\$'" | tr -d '[:space:]')"
+    check "(L1c) control: a raw 'zfs list -H' of the target shows a FORGED row for A's dataset with the attacker's config" "1" "$raw"
+    check "(L1c) control: P5 holds its config only as a RECEIVED property (none local)" "0 1" "$(l1_sprop_ln "$TARGET_DS/$L1_B_ID/recvonly" org.zfsbackup:config local) $(l1_sprop_ln "$TARGET_DS/$L1_B_ID/recvonly" org.zfsbackup:config received)"
+    if [ "$L1_BASELINE_OK" -eq 1 ]; then
+        base="$(msh "$SERVER_VM" "env PYTHONPATH='$L1_OLD_DIR' '$PY' '$L1_DIR/received.py' '$L1_OLD_DIR' '$CFG' 2>&1")"
+        printf '%s\n' "$base" | sed 's/^/    pre-fix: /'
+        check_has "(L1c) BASELINE: the pre-fix tree ($L1_BASELINE_REF) would prune A's dataset with the attacker's retention" "RECEIVED ${L1_A_DS} 1s/1s" "$base"
+        check_has "(L1c) BASELINE: ... and the dataset outside the target" "RECEIVED ${L1_OUT} 1s/1s" "$base"
+    else
+        info "(L1c) no pre-fix baseline: '$L1_BASELINE_REF' already contains the B-1c guard (or could not be shipped); use L1_BASELINE_REF=<older ref>"
+    fi
+    l1_planted() { echo "$TARGET_DS/$L1_B_ID/rowforge $TARGET_DS/$L1_B_ID/idforge $TARGET_DS/$L1_B_ID/prefixtrick $TARGET_DS/$L1_A_ID/planted $TARGET_DS/$L1_B_ID/recvonly"; }
+    PLANT_BEFORE="$(l1_fp $(l1_planted))"
+    A_BEFORE_C="$(l1_fp "$L1_A_DS")"
+    check "(L1c) the five refused datasets hold 3 snapshots each before the cycles" "15" "$(msh "$SERVER_VM" "zfs list -H -t snapshot -r -o name $(l1_planted) | wc -l" | tr -d '[:space:]')"
+    if l1_wait_cycles "$mark_s" 5 240; then pass "(L1c) the server's pruner completed $(l1_cycles "$mark_s") cycles over the planted state"; else fail "(L1c) fewer than 5 prune cycles in 240s ($(l1_cycles "$mark_s"))"; fi
+    slog="$(log_since_vm "$SERVER_VM" "$mark_s")"
+    check "(L1c) A's received dataset: names and guids unchanged" "$A_BEFORE" "$(l1_fp "$L1_A_DS")"
+    check "(L1c) the datasets outside the target (and the target-prefix sibling): unchanged" "$OUT_BEFORE" "$(l1_fp "$L1_OUT" "$L1_SIB")"
+    check "(L1c) the five refused datasets: names and guids unchanged (not pruned)" "$PLANT_BEFORE" "$(l1_fp $(l1_planted))"
+    check "(L1c) CONTROL: the attacker's retention IS destructive when it is legitimate: $TARGET_DS/$L1_B_ID/ctl was pruned down to its newest snapshot" "autosnap_20200101000003" "$(l1_server_snaps "$TARGET_DS/$L1_B_ID/ctl" | tr '\n' ' ' | sed 's/ *$//')"
+    check_has "(L1c) CONTROL: the log shows that prune" "Pruning snapshots.*${TARGET_DS}/${L1_B_ID}/ctl@autosnap_20200101000001" "$slog"
+    check_lacks "(L1c) no 'Pruning snapshots' line names A's dataset, a planted one or an outside one" "Pruning snapshots.*(${L1_A_DS}@|${TARGET_DS}/${L1_B_ID}/(rowforge|idforge|prefixtrick|recvonly)@|${TARGET_DS}/${L1_A_ID}/planted@|${L1_OUT}|${L1_SIB})" "$slog"
+    check_lacks "(L1c) the outside datasets are never mentioned in the server log" "${L1_OUT}|${L1_SIB}" "$slog"
+    for pair in "rowforge:does not decode" "idforge:is invalid" "prefixtrick:outside its client's tree" "recvonly:only received"; do
+        n="${pair%%:*}"; why="${pair#*:}"
+        check_has "(L1c) WARNING: ${n} is skipped ('$why')" "WARNING.*Skipping received dataset '${TARGET_DS}/${L1_B_ID}/${n}': .*${why}" "$slog"
+        check "(L1c) ... and warned once, not once per cycle" "1" "$(printf '%s\n' "$slog" | grep -c "WARNING.*Skipping received dataset '${TARGET_DS}/${L1_B_ID}/${n}'")"
+    done
+    check_has "(L1c) WARNING: B's id planted in A's tree is skipped ('outside its client's tree')" "WARNING.*Skipping received dataset '${TARGET_DS}/${L1_A_ID}/planted': .*outside its client's tree" "$slog"
+    check "(L1c) ... and warned once" "1" "$(printf '%s\n' "$slog" | grep -c "WARNING.*Skipping received dataset '${TARGET_DS}/${L1_A_ID}/planted'")"
+    check_lacks "(L1c) the control and A's dataset are NOT reported as skipped" "Skipping received dataset '(${TARGET_DS}/${L1_B_ID}/ctl|${L1_A_DS}|${L1_B_DS})'" "$slog"
+    check_lacks "(L1c) no traceback on the server" "Traceback" "$slog"
+    check "(L1c) one bad dataset did not stop the others: the pruner kept evaluating A's dataset every cycle" "true" "$([ "$(l1_cycles "$mark_s")" -ge 5 ] && echo true || echo false)"
+    check "(L1c) the server daemon is still up" "up" "$(daemon_running "$SERVER_VM" && echo up || echo down)"
+
+    check_lacks "(L1) no traceback in the client log (A)" "Traceback" "$(log_since_vm "$CLIENT_VM" "$kmark_c")"
+    check_lacks "(L1) no traceback in the server log" "Traceback" "$(log_since_vm "$SERVER_VM" "$kmark_s")"
+    check_lacks "(L1) no traceback in B's log" "Traceback" "$(blog_since 0)"
+    stop_daemon "$CLIENT_VM"; stop_b_daemon
+    msh "$CLIENT_VM" "rm -rf '$L1_EVIL_DIR' '$L1_DIR' '$L1_B_LOG'" || true
+    msh "$SERVER_VM" "rm -rf '$L1_DIR' '$L1_OLD_DIR'" || true
+fi
+
 # ─────────────────────────────── Report ─────────────────────────────────────
 echo
 echo "${BOLD}=================================================================${NC}"
@@ -1590,6 +2062,9 @@ else
     step "Tearing down"
     stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
     remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"
+    # scenario L1's helper files, the pre-fix baseline tree and B's log (all under /opt and /var/log, never in the repo)
+    msh "$CLIENT_VM" "rm -rf /opt/zfsb-evil /opt/zfsb-l1 /var/log/zfsbackup-b.log" || true
+    msh "$SERVER_VM" "rm -rf /opt/zfsb-l1 /opt/zfsb-old" || true
     if [ "$KEEP_POOLS" -eq 0 ]; then
         destroy_pool "$SERVER_VM" "$SERVER_POOL"
         destroy_pool "$CLIENT_VM" "$CLIENT_POOL"
