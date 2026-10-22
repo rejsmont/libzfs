@@ -304,6 +304,7 @@ from zfsbackup.config.store.migrate import (
 from zfsbackup.config.store.paths import (
     CONFIG_DB_MODE,
     CONFIG_DIR_MODE,
+    CONFIG_GROUP,
     CONFIG_OWNER,
     CONFIG_PATH_ENV,
     DEFAULT_CONFIG_DB,
@@ -352,6 +353,7 @@ from zfsbackup.config.store.access import (
     read_store_state,
     write_config,
 )
+from zfsbackup.config.store.backup import BackupError, BackupInfo, backup_database
 from zfsbackup.config.store.trust import (
     TOKEN_MAX_TTL_SECONDS,
     ClientIdUpdate,
@@ -386,6 +388,9 @@ from zfsbackup.config.store.trust import (
 )
 
 __all__ = [
+    "backup_database",
+    "BackupError",
+    "BackupInfo",
     "Base",
     "check_config_db",
     "check_config_db_suffix",
@@ -396,6 +401,7 @@ __all__ = [
     "CONFIG_DB_MODE",
     "CONFIG_DIR_MODE",
     "config_error_message",
+    "CONFIG_GROUP",
     "CONFIG_OWNER",
     "CONFIG_PATH_ENV",
     "ConfigBusy",

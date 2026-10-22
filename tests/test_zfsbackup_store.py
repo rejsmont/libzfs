@@ -122,6 +122,7 @@ from zfsbackup.config.store.importer import ImportResult, import_yaml
 from zfsbackup.config.store.paths import (
     CONFIG_DB_MODE,
     CONFIG_DIR_MODE,
+    CONFIG_GROUP,
     CONFIG_OWNER,
     CONFIG_PATH_ENV,
     DEFAULT_CONFIG_DB,
@@ -7431,9 +7432,10 @@ class TestPathsCheckConfigDbUnreadable:
                 check_config_db(resolved)
 
             message = str(excinfo.value)
-            assert "zfsbackup" in message  # target group, from CONFIG_OWNER
+            assert CONFIG_GROUP in message  # the target group (C9: group only)
             assert f"{CONFIG_DB_MODE:04o}" in message
-            assert CONFIG_OWNER in message
+            assert "zfsbackup:zfsbackup" not in message  # no `chown user:group` advice
+            assert CONFIG_OWNER not in message
             assert "mode=0000" in message  # the file's actual mode
         finally:
             os.chmod(db_path, 0o644)
@@ -7461,7 +7463,9 @@ class TestPathsCheckConfigDbDirectoryNotWritable:
             assert "-wal" in message
             assert "-shm" in message
             assert f"{CONFIG_DIR_MODE:04o}" in message
-            assert CONFIG_OWNER in message
+            assert CONFIG_GROUP in message  # the target group (C9: group only)
+            assert "zfsbackup:zfsbackup" not in message  # no `chown user:group` advice
+            assert CONFIG_OWNER not in message
         finally:
             os.chmod(subdir, 0o755)
 
