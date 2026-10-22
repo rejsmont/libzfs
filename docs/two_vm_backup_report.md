@@ -159,7 +159,9 @@ original 2026-07 findings:
   in-flight pin, dataset collision.)*
 - **High — incrementals use `-i`, not `-I`** (`zfsbackup/remote.py:198`): snapshots created
   *between* two backups are never replicated. **Live-confirmed** in this run — the server
-  was missing intermediate snapshots (e.g. `…114800`, `…114900`) that the client had.
+  was missing intermediate snapshots (e.g. `…114800`, `…114900`) that the client had. *(Resolved in production-readiness
+  milestone B, 2026-10-22: every managed snapshot is sent as a chain of `-i` steps, oldest first by `createtxg`;
+  scenario B2 asserts a six-snapshot backlog arrives with matching GUIDs and no unmanaged snapshot is sent.)*
 
 The local snapshot + retention core is solid and anchor-aware; the gaps are the remote
 (server) feature's security and completeness.

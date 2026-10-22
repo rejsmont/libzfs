@@ -35,10 +35,10 @@ into another's directory to save a handoff.
 | Path | Owner |
 |---|---|
 | `libzfseasy/**` | `libzfseasy-developer` |
-| `zfsbackup/{config,backup_manager,daemon,workers,remote,api}.py`, and the supervisor support modules `zfsbackup/{daemonlock,stopflag,runtime_config,procident,sdnotify}.py`, and the shared TLS/identity module `zfsbackup/identity.py` (also used by the CLI) | `zfsbackup-developer` |
+| `zfsbackup/{config,backup_manager,daemon,workers,remote,api}.py`, the supervisor support modules `zfsbackup/{daemonlock,stopflag,runtime_config,procident,sdnotify}.py`, the shared TLS/identity module `zfsbackup/identity.py` (also used by the CLI), the stdlib-only shared modules `zfsbackup/{protocol,version,logsetup,health,health_collect,daemon_entry}.py`, and `packaging/**`, `pyproject.toml`, `poetry.lock` | `zfsbackup-developer` |
 | `zfsbackup/config/store/**` (incl. `store/migrations/`), `alembic.ini` | `zfsbackup-store-developer` |
 | `zfsbackup/cli/**` | `zfsbackup-cli-developer` |
-| `tests/**`, `conftest.py` | `pytest-test-author` |
+| `tests/**`, `conftest.py`, `.github/workflows/**` | `pytest-test-author` |
 | `scenarios/**` | `real-zfs-scenario-dev` |
 
 **A plan item that spans two owners is split by the planner** into sequenced sub-items, one per

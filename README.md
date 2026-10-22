@@ -1,8 +1,10 @@
 # libZFSeasy
 Python interface to the ZFS utilities
 
-This library provides a Python interface to ZFS functions using either `zfs` and `zpool` command line utilities
-or `libzfs` bindings from TrueNAS.
+This library provides a Python interface to ZFS functions by wrapping the `zfs` and `zpool` command line
+utilities (OpenZFS 2.1, 2.2 and 2.4 are tested; Linux only for production use). The repository also ships
+`zfsbackup`, an automated snapshot, retention and remote-backup daemon built on it: see
+[zfsbackup/README.md](zfsbackup/README.md).
 
 ## Testing
 

@@ -177,6 +177,13 @@ concurrency reviewer also reviews the item.
    - C23: two-VM scenario R (restore), after B-5 (and S-6);
    - C24: release checklist and report rewrites.
 
+**Carried into C7's restore runbook (from the C8 concurrency review):** restoring a config-DB backup brings back
+consumed enrollment tokens and revoked or retired fingerprints, which breaks "revocation is permanent": after a
+restore, re-apply every revocation made since the backup (`trust list` on the live DB first, then `trust revoke`),
+or restore only on a host whose trust state has not changed. API-worker trust writes (`/enroll`, `/rotate`) can
+also land between a pre-migration backup and the upgrade. `zfsbackup-config backup` is a writer-or-root
+operation.
+
 Appendix C1 has the full items; Appendix C2 has the changes made after the milestone D input (restore that
 holds before and after B-2a, the S-8 contract, B-6 first without status files, C0).
 
@@ -214,8 +221,9 @@ holds before and after B-2a, the S-8 contract, B-6 first without status files, C
      because `-F` rolls that server-only snapshot back. With "`-F` only onto a dataset with no snapshots" that
      becomes a permanent "does not match incremental source" stall, so B-2b needs a rule for it (e.g. allow `-F`
      when the server's newest snapshot is newer than the incremental's base and was never anchored by the client).
-     Likewise, a full send when no common snapshot exists still runs `-F` onto an existing server copy, which can
-     wipe its history on an unencrypted target (carried from milestone A).
+     A full send when no common snapshot exists still passes `-F` onto an existing server copy, but zfs refuses it
+     ("destination has snapshots … must destroy them to overwrite it", checked on OpenZFS 2.4.1, 2026-10-22), so
+     history is never wiped; the client is refused each cycle until the operator renames the copy aside.
    - **S-3: the R0 pending map is evicted globally** (LRU, 4096 entries): an enrolled client negotiating thousands
      of names can evict other clients' entries (their next stream is refused with "negotiate again", retryable).
      Out of scope under Q1, but cap it per client id when S-3 adds per-client limits.

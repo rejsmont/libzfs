@@ -2,6 +2,10 @@
 
 ## Status / implementation notes (2026-10-20)
 
+**Status 2026-10-22:** merged to master as PR #4 (`609df66`); scenario K passed in the two-VM harness. Later
+changes to the wire contract (the `X-Zfsbackup-Protocol` header and 426, `protocol` in `/whoami`/`/enroll`/`/rotate`,
+the removed info endpoints) are in [production_readiness_plan.md](production_readiness_plan.md) milestone A.
+
 **Implemented**: M1–M16 and M18 on branch `tls-mtls`, uncommitted at the time of writing. M17 (the two-VM
 harness over TLS, scenario K) is written; its first real run is still to be recorded in
 [two_vm_backup_report.md](two_vm_backup_report.md). B1 is marked resolved in
