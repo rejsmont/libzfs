@@ -6,17 +6,22 @@ value on a full `-F` receive of a `zfs send -p` stream: the stream's copy replac
 `received`). So the server puts its own values in effect with `-o` ON the receive:
 
 * before anything is destroyed (before the fresh-mode `receive -A`) it reads the dataset's LOCAL
-  `org.zfsbackup:config` (stored by negotiate, canonicalised) -- a dataset that does not exist, or
-  has no usable config, is REFUSED ("negotiate before streaming");
+  `org.zfsbackup:config` (stored by negotiate, canonicalised) -- or, for a dataset that does not
+  exist yet (R0), the pending entry negotiate kept in memory for THIS client dataset. Neither: the
+  stream is REFUSED ("negotiate again before streaming");
 * `props = {config, client_id (the bound id), source_dataset (the URL)}` goes to
-  `zfs.receive.filesystem(..., force=True, save=True, mount=False)` for `fresh` and `resume` alike,
-  with no `reset` (`-x` and `-o` of one name are mutually exclusive);
-* there is no `zfs set` after the receive; `zfs set` of all three happens only in the recreate
-  branch (the abort destroyed the dataset a full receive had created).
+  `zfs.receive.filesystem(..., force=<the dataset exists>, save=True, mount=False)` for `fresh` and
+  `resume` alike, with no `reset` (`-x` and `-o` of one name are mutually exclusive). A full stream
+  into a dataset that does not exist creates it (zfs refuses `-F` with a raw stream onto an existing
+  dataset), so no `-F` there;
+* there is no `zfs create` or `zfs set` anywhere on the stream path: not after the receive, and not
+  after a fresh-mode abort that destroyed a new dataset whole (Z3), which the full stream recreates.
 
 Layout: `TestReceiveFlags` (the call), `TestReceiveArgv` (the real argv), `TestStreamOwnsTheServerProperties`
 (what is read, from where, and whose names), `TestStreamNeedsANegotiatedConfig` (the refusals),
-`TestNoStampAfterTheReceive`, `TestNoStampAfterAFailedReceive`.
+`TestPendingConfigStream` (R0: the config of a dataset that does not exist yet),
+`TestForceFollowsExistence`, `TestPlaceholderOverwriteMessage`, `TestNoStampAfterTheReceive`,
+`TestNoStampAfterAFailedReceive`.
 """
 
 import base64
@@ -31,9 +36,9 @@ from test_zfsbackup_api import (  # noqa: F401  (Stream: a harness, not a test; 
     GOOD_CONFIG, NOT_NEGOTIATED, SERVER_DS, STREAM_PATH, TOKEN, Stream, _remote_config,
     source_props, stored_config,
 )
-from _api_support import Authed
+from _api_support import Authed, pending_configs
 from libzfseasy.types import Dataset
-from zfsbackup.api import RECEIVE_EXCLUDED_PROPERTIES, canonical_dataset_config
+from zfsbackup.api import SERVER_OWNED_PROPERTIES, canonical_dataset_config
 from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG, PROP_SOURCE_DATASET
 
 OWNED = [PROP_CONFIG, PROP_CLIENT_ID, PROP_SOURCE_DATASET]
@@ -48,6 +53,21 @@ EXPECTED_PROPS = {
 @pytest.fixture
 def stream(mocker):
     return Stream(mocker)
+
+
+def negotiate(stream, *, client="client1", dataset="pool/data", config=None):
+    """A real negotiate against `stream`'s app (the zfs calls are the harness's mocks). With
+    `stream.exists` False it makes the pending entry; the parent `create` is not counted."""
+    who = stream.authed.cert_for(client)
+    resp = stream.authed.client(who).post(
+        f"/backup/{client}/{dataset}/negotiate",
+        json={"snapshots": [], "config": GOOD_CONFIG if config is None else config},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    stream.create.reset_mock()
+    stream.set.reset_mock()
+    stream.order.clear()
+    return resp
 
 
 def owned_in(argv):
@@ -74,7 +94,7 @@ def non_canonical_config():
 
 class TestReceiveFlags:
     def test_the_constant_names_the_three_properties(self):
-        assert list(RECEIVE_EXCLUDED_PROPERTIES) == OWNED
+        assert list(SERVER_OWNED_PROPERTIES) == OWNED
         assert OWNED == ["org.zfsbackup:config", "org.zfsbackup:client_id",
                          "org.zfsbackup:source_dataset"]
 
@@ -119,7 +139,7 @@ class TestReceiveFlags:
             props = s.receive.call_args.kwargs["props"]
             assert props == EXPECTED_PROPS
             props.clear()
-        assert list(RECEIVE_EXCLUDED_PROPERTIES) == OWNED
+        assert list(SERVER_OWNED_PROPERTIES) == OWNED
 
 
 class TestReceiveArgv:
@@ -337,6 +357,14 @@ class TestStreamNeedsANegotiatedConfig:
         stream.run("resume")
         assert stream.sent == [NOT_NEGOTIATED, {"status": "ok"}]
 
+    @pytest.mark.parametrize("mode", ["fresh", "resume"])
+    def test_the_refusal_is_retryable_so_the_client_negotiates_again(self, stream, mode):
+        """The refusal carries `retry: true`: nothing was wrong with the stream, the server only forgot."""
+        stream.exists.return_value = False
+        stream.run(mode)
+        assert stream.sent[0]["retry"] is True
+        assert "negotiate again" in stream.sent[0]["error"]
+
     def test_a_negotiated_config_is_accepted(self, stream):
         stream.run("resume")
         assert stream.sent == [{"status": "ok"}]
@@ -419,3 +447,307 @@ class TestNoStampAfterAFailedReceive:
         stream.run("resume")
         stream.set.assert_not_called()
         stream.receive.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# R0: the config of a dataset that does not exist yet
+# ---------------------------------------------------------------------------
+
+
+class TestPendingConfigStream:
+    """A dataset that negotiate accepted and nothing has received is not on disk (zfs refuses a raw
+    full onto a pre-created dataset): the stream takes its config from the pending entry that THIS
+    client dataset's negotiate made, and the receive creates the dataset."""
+
+    @pytest.fixture
+    def fresh(self, stream):
+        stream.exists.return_value = False
+        negotiate(stream)
+        return stream
+
+    @pytest.mark.parametrize("mode", ["fresh", "resume"])
+    def test_the_values_come_from_the_pending_entry(self, fresh, mode):
+        fresh.run(mode)
+        assert fresh.sent == [{"status": "ok"}]
+        (call,) = fresh.receive.call_args_list
+        assert str(call.args[0]) == SERVER_DS
+        assert call.kwargs["props"] == EXPECTED_PROPS
+        fresh.get_value.assert_not_called()                 # no dataset to read a local property from
+
+    @pytest.mark.parametrize("mode", ["fresh", "resume"])
+    def test_the_receive_has_no_force_and_nothing_is_created_or_set(self, fresh, mode):
+        fresh.run(mode)
+        kwargs = fresh.receive.call_args.kwargs
+        assert (kwargs["force"], kwargs["save"], kwargs["mount"]) == (False, True, False)
+        fresh.create.assert_not_called()
+        fresh.set.assert_not_called()
+        assert fresh.order == ["receive"]
+
+    def test_the_value_is_canonical_whatever_the_client_sent(self, stream):
+        stream.exists.return_value = False
+        negotiate(stream, config=non_canonical_config())
+        stream.run("fresh")
+        assert stream.receive.call_args.kwargs["props"][PROP_CONFIG] == STORED
+
+    def test_the_entry_is_dropped_after_a_successful_receive(self, fresh):
+        fresh.run("fresh")
+        assert dict(pending_configs(fresh.app)) == {}
+
+    def test_a_second_stream_is_refused_without_a_negotiate(self, fresh):
+        """After the first receive the dataset exists (and holds its own config); a stream that
+        finds neither is told to negotiate again, and receives nothing."""
+        fresh.run("fresh")
+        fresh.ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        fresh.run("fresh")
+        assert fresh.sent == [{"status": "ok"}, NOT_NEGOTIATED]
+        assert fresh.receive.call_count == 1
+        assert fresh.claimed == set() and fresh.gate.active == 0
+
+    def test_a_failed_receive_keeps_the_entry(self, fresh):
+        """The retry of an interrupted first receive needs no negotiate while nothing was created."""
+        fresh.writer.close.side_effect = RuntimeError("cannot receive: checksum mismatch")
+        fresh.run("fresh")
+        assert fresh.sent == [{"error": "cannot receive: checksum mismatch"}]
+        assert list(pending_configs(fresh.app)) == [SERVER_DS]
+        fresh.writer.close.side_effect = None
+        fresh.ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        fresh.run("fresh")
+        assert fresh.sent[-1] == {"status": "ok"}
+        assert dict(pending_configs(fresh.app)) == {}
+
+    def test_a_refused_stream_keeps_the_entry(self, fresh, source_props):
+        source_props.return_value = {PROP_SOURCE_DATASET: "tank/other"}
+        # (the dataset "exists" for the ownership check only)
+        fresh.exists.side_effect = [True]
+        fresh.run("fresh")
+        assert "refusing to mix in" in fresh.sent[0]["error"]
+        assert list(pending_configs(fresh.app)) == [SERVER_DS]
+
+    def test_nothing_negotiated_is_refused_and_receives_nothing(self, stream):
+        stream.exists.return_value = False
+        stream.run("fresh")
+        assert stream.sent == [NOT_NEGOTIATED]
+        stream.receive.assert_not_called()
+        stream.list.assert_not_called()
+
+    def test_a_restart_forgets_the_entry(self, fresh, mocker):
+        restarted = Stream(mocker)
+        restarted.exists.return_value = False
+        restarted.run("fresh")
+        assert restarted.sent == [NOT_NEGOTIATED]
+        assert "negotiate again" in restarted.sent[0]["error"]
+        restarted.receive.assert_not_called()
+
+    def test_another_client_datasets_entry_is_never_used(self, stream):
+        """`tank/data` negotiated first; `pool/data` maps to the same server dataset."""
+        stream.exists.return_value = False
+        negotiate(stream, dataset="tank/data")
+        stream.run("fresh", dataset="pool/data")
+        assert stream.sent == [NOT_NEGOTIATED]
+        stream.receive.assert_not_called()
+        assert list(pending_configs(stream.app)) == [SERVER_DS]       # theirs is untouched
+        stream.ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        stream.run("fresh", dataset="tank/data")
+        assert stream.sent[-1] == {"status": "ok"}
+        props = stream.receive.call_args.kwargs["props"]
+        assert props[PROP_SOURCE_DATASET] == "tank/data"
+
+    def test_another_clients_entry_is_never_used(self, stream):
+        stream.exists.return_value = False
+        negotiate(stream, client="client2")
+        stream.run("fresh", client="client1")
+        assert stream.sent == [NOT_NEGOTIATED]
+        stream.receive.assert_not_called()
+        assert list(pending_configs(stream.app)) == ["pool/backups/client2/data"]
+
+    def test_an_existing_dataset_uses_its_local_config_and_keeps_force(self, stream):
+        """The dataset exists by stream time: the local property wins, the stale entry is dropped."""
+        from datetime import timedelta
+        from zfsbackup.config import DatasetConfig
+        stale = DatasetConfig(name="pool/data", frequency=timedelta(minutes=5)).to_property()
+        assert canonical_dataset_config(stale) != STORED
+        stream.exists.return_value = False
+        negotiate(stream, config=stale)
+        stream.exists.return_value = True
+        stream.run("fresh")
+        (call,) = stream.receive.call_args_list
+        assert call.kwargs["force"] is True
+        assert call.kwargs["props"][PROP_CONFIG] == STORED          # the dataset's, not the entry's
+        assert dict(pending_configs(stream.app)) == {}
+        stream.create.assert_not_called()
+        stream.set.assert_not_called()
+
+    @pytest.mark.parametrize("damaged", ["", "not base64 at all!", "bm90IGpzb24="],
+                             ids=["empty", "garbage", "not-json"])
+    def test_a_damaged_local_config_is_refused_and_the_entry_is_not_used(self, fresh, damaged):
+        fresh.exists.return_value = True
+        fresh.get_value.side_effect = None
+        fresh.get_value.return_value = damaged
+        fresh.run("fresh")
+        assert fresh.sent == [NOT_NEGOTIATED]
+        fresh.receive.assert_not_called()
+        fresh.abort.assert_not_called()
+        fresh.list.assert_not_called()
+
+    def test_an_unreadable_local_config_is_its_own_error_and_the_entry_is_not_used(self, fresh):
+        fresh.exists.return_value = True
+        fresh.get_value.side_effect = RuntimeError("cannot open: boom")
+        fresh.run("fresh")
+        assert fresh.sent == [{"error": f"Failed to read the configuration of {SERVER_DS}"}]
+        fresh.receive.assert_not_called()
+
+    def test_the_bound_id_names_the_stamped_values_not_the_entry(self, fresh):
+        """The entry holds the config and the client dataset only; the id is the request's."""
+        entry = pending_configs(fresh.app)[SERVER_DS]
+        assert entry == (STORED, "pool/data")
+        fresh.run("resume")
+        assert fresh.receive.call_args.kwargs["props"][PROP_CLIENT_ID] == "client1"
+
+    def test_a_dry_run_does_not_consume_the_entry(self, mocker):
+        s = Stream(mocker, dry_run=True)
+        s.exists.return_value = False
+        s.run("fresh")
+        assert s.sent == [{"status": "ok", "dry_run": True}]
+        s.receive.assert_not_called()
+
+    def test_the_real_argv_has_no_dash_f_and_all_three_o_values(self, mocker, mock_subprocess):
+        """Only `Popen` is mocked. A new dataset: `zfs receive -s -u -o ... <dataset>`, no `-F`."""
+        mocker.patch("zfsbackup.api.read_zfsbackup_properties", return_value={})
+        mocker.patch("zfsbackup.api.zfs.exists", return_value=False)
+        mocker.patch("zfsbackup.api.zfs.create")
+        mocker.patch("zfsbackup.api.zfs.set")           # negotiate's own writes are not under test here
+        authed = Authed(_remote_config())
+        resp = authed.client().post(
+            "/backup/client1/pool/data/negotiate", json={"snapshots": [], "config": GOOD_CONFIG})
+        assert resp.status_code == 200
+        mock_subprocess.setup_multi(("",))
+        handler = authed.app.view_functions["backup_stream"].__wrapped__
+        ws = MagicMock()
+        ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        with authed.context(STREAM_PATH, query_string={"mode": "fresh"}):
+            handler(ws, "client1", "pool/data")
+        assert json.loads(ws.send.call_args[0][0]) == {"status": "ok"}
+        (argv,) = [c[0][0][1:] for c in mock_subprocess.call_args_list]
+        assert argv[0] == "receive" and argv[-1] == SERVER_DS
+        assert "-F" not in argv and "-x" not in argv
+        for flag in ("-s", "-u"):
+            assert flag in argv
+        assert owned_in(argv) == [
+            f"{PROP_CONFIG}={STORED}", f"{PROP_CLIENT_ID}=client1", f"{PROP_SOURCE_DATASET}=pool/data"]
+
+
+class TestForceFollowsExistence:
+    """`-F` is for a dataset that exists (an incremental, a resume, a full over an existing one);
+    a full into a dataset that does not exist creates it without."""
+
+    @pytest.mark.parametrize("mode", ["fresh", "resume"])
+    def test_an_existing_dataset_is_received_with_force(self, stream, mode):
+        stream.run(mode)
+        assert stream.receive.call_args.kwargs["force"] is True
+
+    def test_the_decision_is_made_after_the_abort(self, stream):
+        """A new dataset's cut first receive: the abort destroys it whole (Z3), so the full stream
+        that follows must not use `-F`; the owned values are the ones read before the abort."""
+        stream.token(TOKEN)
+        stream.exists.side_effect = [True, True, True, False]
+        stream.run("fresh")
+        assert stream.order == ["get", "abort", "receive"]
+        assert stream.receive.call_args.kwargs["force"] is False
+        assert stream.receive.call_args.kwargs["props"] == EXPECTED_PROPS
+
+    def test_an_abort_that_leaves_the_dataset_keeps_force(self, stream):
+        """An incremental's `%recv` state is discarded; the dataset and its snapshots stay (Z3)."""
+        stream.token(TOKEN)
+        stream.exists.side_effect = [True, True, True, True]
+        stream.run("fresh")
+        assert stream.order == ["get", "abort", "receive"]
+        assert stream.receive.call_args.kwargs["force"] is True
+
+    def test_the_values_read_before_the_abort_are_used_after_it(self, stream):
+        stream.token(TOKEN)
+        stream.exists.side_effect = [True, True, True, False]
+        stream.get_value.side_effect = [STORED, None, "junk"]
+        stream.run("fresh")
+        assert stream.receive.call_args.kwargs["props"][PROP_CONFIG] == STORED
+        assert stream.get_value.call_count == 1
+
+    def test_the_existence_is_asked_once_for_the_receive_and_by_name(self, stream):
+        stream.run("resume")
+        # the ownership check, the config read, and the receive's `force`
+        assert [str(c.args[0]) for c in stream.exists.call_args_list] == [SERVER_DS] * 3
+
+    def test_a_failing_existence_check_refuses_the_stream(self, stream):
+        stream.exists.side_effect = [True, True, RuntimeError("exists failed")]
+        stream.run("resume")
+        assert stream.sent == [{"error": "Failed to start zfs receive: exists failed"}]
+        stream.receive.assert_not_called()
+        assert stream.gate.active == 0 and stream.claimed == set()
+
+
+# ---------------------------------------------------------------------------
+# The "overwrite an unencrypted one with an encrypted one" refusal
+# ---------------------------------------------------------------------------
+
+OVERWRITE = (
+    "cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an encrypted "
+    "filesystem or overwrite an unencrypted one with an encrypted one"
+)
+
+
+class TestPlaceholderOverwriteMessage:
+    """zfs refuses an encrypted full over an existing dataset. Two causes the operator can act on: a
+    parent created as a placeholder (a child was backed up before it), or a plain/raw copy mismatch."""
+
+    def run_close_raises(self, stream, text=OVERWRITE):
+        stream.writer.close.side_effect = RuntimeError(text)
+        stream.run("fresh")
+        return stream.sent[-1]["error"]
+
+    def test_the_client_gets_a_clear_message_with_the_original_text(self, stream):
+        error = self.run_close_raises(stream)
+        assert len(stream.sent) == 1
+        assert error.startswith(f"{SERVER_DS} already exists on the server and cannot receive a full encrypted stream")
+        assert "placeholder" in error
+        assert "back the parent up before its children" in error
+        assert "zfs rename" in error and "plain vs raw" in error
+        assert "children" in error                       # a rename moves their server copies too
+        assert error.endswith(OVERWRITE)               # zfs's own words are kept
+
+    def test_other_errors_are_sent_verbatim(self, stream):
+        assert self.run_close_raises(stream, "cannot receive: checksum mismatch") == (
+            "cannot receive: checksum mismatch")
+        assert "placeholder" not in stream.sent[-1]["error"]
+
+    def test_it_is_logged_with_the_original_text(self, stream, caplog):
+        with caplog.at_level(logging.ERROR, logger="zfsbackup.api"):
+            self.run_close_raises(stream)
+        records = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(records) == 1 and SERVER_DS in records[0] and OVERWRITE in records[0]
+
+    def test_it_applies_on_the_write_error_path_too(self, stream):
+        """`zfs receive` died on the first chunk: the diagnostic `close()` raises is the one sent."""
+        stream.writer.write.side_effect = BrokenPipeError(32, "Broken pipe")
+        stream.writer.close.side_effect = RuntimeError(OVERWRITE)
+        stream.run("fresh")
+        assert "placeholder" in stream.sent[-1]["error"] and OVERWRITE in stream.sent[-1]["error"]
+        stream.writer.close.assert_called_once()
+
+    def test_the_claim_is_released_once_before_the_reply(self, stream):
+        from test_zfsbackup_api import _spy_releases
+        with _spy_releases(stream) as releases:
+            self.run_close_raises(stream)
+        assert releases == [(SERVER_DS, 0)]              # once, with no reply sent yet
+        assert stream.claimed == set() and stream.gate.active == 0
+
+    def test_the_next_stream_is_served(self, stream):
+        self.run_close_raises(stream)
+        stream.writer.close.side_effect = None
+        stream.ws.receive.side_effect = [json.dumps({"done": True})]
+        stream.run("resume")
+        assert stream.sent[-1] == {"status": "ok"}
+
+    def test_a_disconnected_client_gets_nothing(self, stream):
+        stream.writer.close.side_effect = RuntimeError(OVERWRITE)
+        stream.ws.send.side_effect = ConnectionClosed(None, None)
+        stream.run("fresh")                               # must not raise
+        assert stream.claimed == set()

@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from _snapshot_support import list_row
 from zfsbackup.backup_manager import DatasetManager, PROP_CLIENT_ID, PROP_CONFIG
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, RemoteServerConfig, RetentionRule,
@@ -88,7 +89,7 @@ class FakeZfs:
             if types == 'filesystem':
                 return self._proc(self.listing)
             assert types == 'snapshot', argv
-            rows = [_b(f'{root}@{s}\tsnapshot\t-\n') for s in self.snapshots.get(root, [])]
+            rows = [_b(list_row(s, root)) for s in self.snapshots.get(root, [])]
             return self._proc(rows)
         if verb == 'get':
             if '-r' in argv:

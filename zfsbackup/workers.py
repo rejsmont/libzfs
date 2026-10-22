@@ -629,7 +629,13 @@ class RemoteBackupWorker(BaseWorker):
         # failed to load is retried.
         if self._remote_manager is not None:
             self._remote_manager.begin_cycle()
-        return super()._get_datasets(manager)
+        # Ancestors before descendants (by path depth; config order within a
+        # depth, `sorted` is stable). A child sent first would make its
+        # server parent an unowned placeholder with `create -p`, which a raw
+        # (or encrypted-target) full stream of the parent can never replace.
+        # Only this worker needs the order: snapshots and pruning do not
+        # create anything on the server.
+        return sorted(super()._get_datasets(manager), key=lambda d: d.name.count('/'))
 
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
         if not dsi.config.remote:
@@ -644,14 +650,22 @@ class RemoteBackupWorker(BaseWorker):
             if anchor_name:
                 snapshots = manager.list_snapshots(dsi)
                 anchor = next((s for s in snapshots if s.name == anchor_name), None)
-                if anchor and anchor.age.total_seconds() < freq:
+                # An anchor dated beyond the clock tolerance in the future
+                # means the clock is behind it: its age says nothing, so the
+                # destination is due (`clock_behind` logs the ERROR once).
+                if (
+                    anchor
+                    and not manager.clock_behind(
+                        dsi, anchor, f"anchor for {remote_cfg.destination}"
+                    )
+                    and anchor.age.total_seconds() < freq
+                ):
                     logger.debug(
                         f"Backup of {dsi.name} to {remote_cfg.destination} not due yet"
                     )
                     continue
-            # `should_stop` is polled before any send starts and between a
-            # resumed send and its follow-up: no new stream during a stop or
-            # a reload (C3).
+            # `should_stop` is polled before every stream of the chain (never
+            # during one): no new stream during a stop or a reload (C3).
             self._remote_manager.backup_dataset(
                 dsi, remote_cfg, should_stop=lambda: self._exit_reason() is not None
             )

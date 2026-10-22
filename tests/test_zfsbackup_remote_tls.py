@@ -47,8 +47,8 @@ import websocket
 
 from _remote_support import (  # noqa: F401  (fixtures: _client_tls_template, client_tls_dir, ...)
     CLIENT_FP, HTTPS_BASE, OTHER_SERVER_FP, SERVER_FP, _client_tls_template, client_tls_dir,
-    fake_connect_pinned, new_client_identity, protocol_refusal_json, snapshot_info, whoami_json,
-    write_identity_files,
+    fake_connect_pinned, new_client_identity, protocol_refusal_json, snapshot_info, snapshot_presence,
+    whoami_json, write_identity_files,
 )
 from libzfseasy.types import Filesystem
 from libzfseasy.zfs import StreamHandle
@@ -81,6 +81,14 @@ ENROLL_HINT = (" (`--new-key` if this certificate was revoked there; plain `enro
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _snapshots_are_present(snapshot_presence):
+    """After an acknowledged step the client asks `zfs get guid` whether the snapshot it sent still
+    exists; every listed snapshot does, and no `zfs` runs. (The real-TLS tests below use real
+    `SnapshotInfo`s for the same reason.)"""
+    return snapshot_presence
 
 
 @pytest.fixture(autouse=True)
@@ -254,8 +262,8 @@ class Rig:
         self.rm.get(RESUME_TOKEN, json={"resume_token": None})
 
     # -- act ----------------------------------------------------------------------------------
-    def rcfg(self, dest="offsite"):
-        return types.SimpleNamespace(destination=dest, frequency=None)
+    def rcfg(self, dest="offsite", **kw):
+        return RemoteDatasetConfig(destination=dest, **kw)
 
     def run(self, index=0, dest="offsite", **kw):
         """`backup_dataset` for dataset `index` -> `dest`, within the current cycle."""
@@ -540,8 +548,8 @@ class TestContract:
 
         worker = RemoteBackupWorker(BackupConfig(datasets=[], destinations={}), StopFlag(), client_id="c")
         worker._remote_manager = MagicMock()
-        manager = MagicMock(datasets=["a", "b"])
-        assert worker._get_datasets(manager) == ["a", "b"]
+        manager = MagicMock(datasets=[types.SimpleNamespace(name="pool/a"), types.SimpleNamespace(name="pool/b")])
+        assert [d.name for d in worker._get_datasets(manager)] == ["pool/a", "pool/b"]
         worker._remote_manager.begin_cycle.assert_called_once_with()
         worker._get_datasets(manager)
         assert worker._remote_manager.begin_cycle.call_count == 2
@@ -2309,6 +2317,9 @@ class _Writer:
             fh.write(f"{self.n}\n")
 
 
+_NS = types.SimpleNamespace      # (`_list` has a parameter called `types`)
+
+
 class FakeServerZfs(types.SimpleNamespace):
     """Everything `zfsbackup.api` asks of libzfseasy for a receive, in memory, and stateful like
     the real thing: negotiate creates the dataset and stores the config (`set`), a stream reads it
@@ -2316,20 +2327,30 @@ class FakeServerZfs(types.SimpleNamespace):
     The state lives in the (forked) API worker's copy; the properties the receive was given are
     appended to the `received_props` file next to the received bytes, for the client side to read."""
 
-    def __init__(self, received_path):
+    def __init__(self, received_path, snapshots=None):
         self.store = {}                    # dataset name -> {property: value}
         self.received_props_path = received_path + ".props"
+        #: dataset name -> the short snapshot names it already holds (what `negotiate` lists).
+        #: Seed it BEFORE the API worker starts: the forked worker has its own copy.
+        self.snapshots = dict(snapshots or {})
+        for name in self.snapshots:
+            self.store.setdefault(name, {})
         super().__init__(
             exists=lambda ds: str(ds) in self.store,
             create=self._create,
             set=self._set,
-            list=lambda *a, **k: [],
+            list=self._list,
             get=types.SimpleNamespace(value=self._value),
             receive=types.SimpleNamespace(
                 filesystem=lambda ds, props=None, **k: self._receive(received_path, ds, props),
                 abort=lambda *a, **k: None,
             ),
         )
+
+    def _list(self, roots=None, types=None, properties=None, **k):
+        if types == "snapshot":
+            return [_NS(short=n) for n in self.snapshots.get(str(roots), [])]
+        return []
 
     def _create(self, ds, *a, **k):
         self.store.setdefault(str(ds), {})
@@ -2351,13 +2372,15 @@ class FakeServerZfs(types.SimpleNamespace):
         return dict(self.store.get(name, {}))
 
 
-def fake_server_zfs(received_path):
-    return FakeServerZfs(received_path)
+def fake_server_zfs(received_path, snapshots=None):
+    return FakeServerZfs(received_path, snapshots)
 
 
-class _Snap:
-    def __init__(self, name, ts):
-        self.name, self.timestamp, self.snapshot = name, ts, f"testpool/data@{name}"
+def _snap(name):
+    """A managed local snapshot of testpool/data as the manager's listing delivers it."""
+    from _snapshot_support import listed_info
+
+    return listed_info(name, "autosnap", "testpool/data")
 
 
 class _LocalManager:
@@ -2365,7 +2388,7 @@ class _LocalManager:
 
     def __init__(self):
         self.anchors, self.pins = {}, []
-        self.snaps = [_Snap("autosnap_20261020120000", 2), _Snap("autosnap_20261020110000", 1)]
+        self.snaps = [_snap("autosnap_20261020120000"), _snap("autosnap_20261020110000")]
 
     def list_snapshots(self, dsi):
         return list(self.snaps)
@@ -2458,7 +2481,7 @@ class World:
     `RemoteBackupManager` against it. Cleans up after itself: the worker, the impostor and every
     fake `zfs send` child."""
 
-    def __init__(self, tls_config_db, tmp_path, mocker, monkeypatch, caplog):
+    def __init__(self, tls_config_db, tmp_path, mocker, monkeypatch, caplog, server_snapshots=None):
         from _reload_workers import SelectableApiWorker
         from zfsbackup.stopflag import StopFlag
 
@@ -2471,12 +2494,13 @@ class World:
         self.server_fp = ident.peek_identity(ident.tls_dir(tls_config_db.resolved_path), "server").fingerprint
         self.port = _free_port()
         self.sends = []
+        self.send_calls = []          # (snapshot, since, flags) of every fake `zfs send`
         self.impostor_ = None
         self.endless = False
         caplog.set_level(logging.DEBUG, logger="zfsbackup.remote")
         self.caplog = caplog
         # the server's zfs, in memory: the forked worker inherits the patched module
-        self.server_zfs = fake_server_zfs(str(self.received_path))
+        self.server_zfs = fake_server_zfs(str(self.received_path), server_snapshots)
         mocker.patch("zfsbackup.api.zfs", self.server_zfs)
         mocker.patch(
             "zfsbackup.api.read_zfsbackup_properties", lambda ds: self.server_zfs.properties_of(ds.name)
@@ -2508,9 +2532,10 @@ class World:
         mocker.patch.object(remote.zfs.send, "snapshot", side_effect=self._fake_send)
 
     # -- the fake `zfs send`: a python byte writer in a hermetic subprocess --------------------------
-    def _fake_send(self, snapshot, since=None):
+    def _fake_send(self, snapshot, since=None, **flags):
         from _hermetic import hermetic_env
 
+        self.send_calls.append((snapshot, since, flags))
         body = "while True:\n    w(b)\n" if self.endless else "for _ in range(64):\n    w(b)\n"
         code = "import sys\nb = b'z' * 65536\nw = sys.stdout.buffer.write\n" + body
         proc = subprocess.Popen(
@@ -2601,7 +2626,7 @@ class World:
 
     def cycle(self, mgr, dsi, dest="offsite"):
         mgr.begin_cycle()
-        return mgr.backup_dataset(dsi, types.SimpleNamespace(destination=dest, frequency=None))
+        return mgr.backup_dataset(dsi, RemoteDatasetConfig(destination=dest))
 
     def impostor(self):
         if self.impostor_ is None:
@@ -2648,8 +2673,9 @@ class World:
 
 
 @pytest.fixture
-def world(tls_config_db, tmp_path, mocker, monkeypatch, caplog):
-    w = World(tls_config_db, tmp_path, mocker, monkeypatch, caplog)
+def world(tls_config_db, tmp_path, mocker, monkeypatch, caplog, request):
+    w = World(tls_config_db, tmp_path, mocker, monkeypatch, caplog,
+              server_snapshots=getattr(request, "param", None))
     w._managers = []
     try:
         yield w
@@ -2736,7 +2762,7 @@ class TestRealTls:
         assert world.local.anchors == {}                              # nothing was recorded as sent
         # the destination is skipped for the rest of the cycle: no second send
         before = len(world.sends)
-        assert mgr.backup_dataset(dsi, types.SimpleNamespace(destination="offsite", frequency=None)) is False
+        assert mgr.backup_dataset(dsi, RemoteDatasetConfig(destination="offsite")) is False
         assert len(world.sends) == before
 
     def test_2c_a_url_id_the_server_does_not_bind_is_refused_at_each_stage(self, world, caplog):
@@ -2848,7 +2874,7 @@ class TestRealTls:
         # (this first authenticated request is also the one that retires the old pin)
         assert _eventually(lambda: world.server_accepts(nxt), 30), "the successor's pin never took effect"
         assert ident.promote_identity(world.ctls).fingerprint == nxt.fingerprint
-        world.local.snaps.insert(0, _Snap("autosnap_20261020130000", 3))
+        world.local.snaps.insert(0, _snap("autosnap_20261020130000"))
         before, mark = len(world.sends), len(own(caplog))
         received = len(world.received())
         assert world.cycle(mgr, dsi) is True                         # same manager, new certificate
@@ -2863,3 +2889,57 @@ class TestRealTls:
         assert _eventually(lambda: world.pinned() == {nxt.fingerprint}, 20)
         assert _eventually(lambda: not world.server_accepts(old), 20)    # the old certificate no longer works
         assert world.server_accepts(world.client)                       # (the files now hold the successor)
+
+
+CHAIN_SNAPS = [f"autosnap_202610201{h}0000" for h in ("20", "10", "00")] + ["autosnap_20261020090000"]
+CHAIN_SERVER = {"testpool/backups/client-a/data": ["autosnap_20261020090000"]}
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.skipif(START_METHOD not in multiprocessing.get_all_start_methods(), reason="needs fork")
+@pytest.mark.filterwarnings(
+    "ignore:This process \\(pid=.*\\) is multi-threaded, use of fork\\(\\) "
+    "may lead to deadlocks in the child:DeprecationWarning"
+)
+class TestRealTlsChain:
+    """B5-b over a real socket: the server already holds the oldest snapshot, the client holds three
+    newer ones, and one cycle sends all three as back-to-back `-i` streams. The server's per-dataset
+    claim is released before it answers each stream, so the next one never meets `busy`."""
+
+    @pytest.mark.parametrize("world", [CHAIN_SERVER], indirect=True)
+    def test_a_three_step_chain_goes_through_back_to_back(self, world, caplog):
+        world.enroll()
+        world.local.snaps = [_snap(n) for n in CHAIN_SNAPS]
+        mgr, dsi = world.manager()
+        mark = len(own(caplog))
+        assert world.cycle(mgr, dsi) is True
+        s3, s2, s1, base = CHAIN_SNAPS
+        assert len(world.sends) == 3 and all(p.returncode is not None for p in world.sends)   # all reaped
+        assert _eventually(lambda: world.received() == [64 * 65536] * 3, 20)      # every byte of all three arrived
+        # the chain, oldest first, each step incremental from the one before, with the frozen plain flags
+        assert [(since.short, snap.short, flags) for snap, since, flags in world.send_calls] == [
+            (base, s1, {"large_blocks": True, "compressed": True}),
+            (s1, s2, {"large_blocks": True, "compressed": True}),
+            (s2, s3, {"large_blocks": True, "compressed": True}),
+        ]
+        assert world.local.pins == [("offsite", base, s1), ("offsite", s1, s2), ("offsite", s2, s3)]
+        assert world.local.anchors["offsite"] == s3
+        assert world.errors_since(mark) == []
+        assert not [m for _, m in own(caplog)[mark:] if "busy" in m.lower()]
+        # every receive was started with the server's own properties, and the bound id
+        props = world.received_props()
+        assert len(props) == 3
+        assert {p["dataset"] for p in props} == {"testpool/backups/client-a/data"}
+        assert {p["props"]["org.zfsbackup:client_id"] for p in props} == {"client-a"}
+
+    @pytest.mark.parametrize("world", [CHAIN_SERVER], indirect=True)
+    def test_a_second_cycle_runs_the_same_chain_again_unblocked(self, world):
+        """The fake server's list is fixed (it does not grow with the receives), so the second cycle
+        sends the same three again; the point is that nothing is left in a state that blocks it."""
+        world.enroll()
+        world.local.snaps = [_snap(n) for n in CHAIN_SNAPS]
+        mgr, dsi = world.manager()
+        assert world.cycle(mgr, dsi) is True
+        assert world.cycle(mgr, dsi) is True
+        assert _eventually(lambda: len(world.received()) == 6, 20)

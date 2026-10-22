@@ -20,6 +20,10 @@ import pytest
 
 import libzfseasy as zfs
 from libzfseasy.types import Filesystem, Snapshot as ZFSSnapshot
+from _snapshot_support import listed_snapshot
+from _prune_support import (  # noqa: F401
+    VERSIONS, PrunePool, hourly_name, prune_manager, prune_pool, records,
+)
 from zfsbackup.backup_manager import (
     PROP_ANCHOR_PREFIX as ANCHOR,
     PROP_CLIENT_ID,
@@ -130,8 +134,7 @@ class FakeZfs:
         self.list_recursive.append((roots.name, recursive))
         if roots.name in self.list_errors:
             raise RuntimeError(f'cannot open {roots.name}')
-        fs = Filesystem(roots.name)
-        return [ZFSSnapshot(fs, n) for n in self.snaps.get(roots.name, [])]
+        return [listed_snapshot(n, roots.name) for n in self.snaps.get(roots.name, [])]
 
     # -- results -------------------------------------------------------------
     @property
@@ -183,7 +186,8 @@ class TestUnconfiguredDescendants:
         assert fz.destroyed == [B, C]
         call = fz.destroy.call_args
         assert call.kwargs == {'destroy': True, 'recursive': True}
-        assert len(fz.recursive_gets) == 1
+        # one `zfs get -r` for the pass and one immediately before the single destroy call
+        assert len(fz.recursive_gets) == 1 + len(fz.destroy.call_args_list)
 
     def test_a_local_child_anchor_keeps_that_snapshot_and_only_that(self, fz, caplog):
         fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
@@ -350,7 +354,7 @@ class TestParentAnchorsUnchanged:
         prune(manager, dsi)
         # the recursive read does return the parent's rows; only the parent path may use them
         assert fz.destroyed == [B]
-        assert len(fz.recursive_gets) == 1
+        assert len(fz.recursive_gets) == 1 + len(fz.destroy.call_args_list)     # the pass + the re-read
 
     def test_parent_and_child_anchors_combine(self, fz):
         fz.props[PARENT] = [(ANCHOR + 'offsite', B, 'local')]
@@ -404,7 +408,9 @@ class TestNonRecursiveParent:
     def test_the_single_get_is_for_the_dataset_alone(self, fz):
         manager, dsi = make_manager(recursive=False)
         prune(manager, dsi)
-        assert [c[-1] for c in fz.get_cmds] == [PARENT]
+        # the dataset alone: the pass's read, then the re-read before the one destroy call
+        assert [c[-1] for c in fz.get_cmds] == [PARENT] * (1 + len(fz.destroy.call_args_list))
+        assert not fz.recursive_gets
 
 
 class TestUnknownProtectSetSkipsThePrune:
@@ -1023,3 +1029,121 @@ class TestInflightPinsProtectFromPruning:
         fz.props[CHILD] = [(INFLIGHT + 'a', '-', 'local'), (INFLIGHT + 'b', ',', 'local')]
         manager, dsi = make_manager()
         assert manager._descendant_anchor_protection(dsi) == {}
+
+
+# ---------------------------------------------------------------------------
+# B-4: a held or cloned DESCENDANT copy fails the whole recursive destroy
+# ---------------------------------------------------------------------------
+
+class TestRecursiveBatchFallback:
+    """`zfs destroy -r pool/d@a,b,c` is atomic across the names AND the descendants. A child's hold or
+    clone is invisible in the parent's listing (`userrefs` 0), so only the fallback finds the name."""
+
+    P = 'pool/d'
+    C = 'pool/d/c'
+
+    def build(self, pool, old=6, dry_run=False):
+        manager, dsi = prune_manager(self.P, recursive=True, dry_run=dry_run)
+        fresh, olds = pool.populate(self.P, old=old)
+        pool.snaps[self.C] = list(pool.snaps[self.P])          # the child has every name too
+        return manager, dsi, fresh, olds
+
+    @pytest.mark.parametrize('version', VERSIONS)
+    def test_a_child_snapshot_hold_keeps_only_that_name_and_the_reason_mentions_descendants(
+            self, mocker, caplog, version):
+        pool = PrunePool(mocker, version)
+        manager, dsi, fresh, olds = self.build(pool)
+        held = olds[2]
+        pool.hold(self.C, held)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert pool.sizes == [6] + [1] * 6
+        assert not pool.calls[0].ok
+        assert all(c.recursive for c in pool.calls)
+        assert pool.names_of(self.P) == {fresh, held}
+        assert pool.names_of(self.C) == {fresh, held}           # the child's other copies went with the parent's
+        (warning,) = records(caplog, logging.WARNING)
+        assert held in warning and 'descendant' in warning
+        assert len(records(caplog, logging.ERROR, 'Failed to prune snapshot batch')) == 1
+        assert records(caplog, logging.INFO, 'Successfully pruned 5 snapshots')
+
+    def test_it_is_retried_alone_and_recursively_with_no_second_warning_and_goes_once_released(
+            self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool)
+        held = olds[2]
+        prune_pool.hold(self.C, held)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+            prune_pool.calls.clear()
+            manager.prune_snapshots(dsi)
+            assert prune_pool.batches == [[held]] and prune_pool.calls[0].recursive
+            prune_pool.release(self.C, held)
+            prune_pool.calls.clear()
+            manager.prune_snapshots(dsi)
+        assert prune_pool.batches == [[held]]
+        assert prune_pool.names_of(self.P) == {fresh} == prune_pool.names_of(self.C)
+        assert len(records(caplog, logging.WARNING)) == 1
+        assert len(records(caplog, logging.INFO, 'which could not be destroyed earlier')) == 1
+        assert manager._prune_stuck == {}
+
+    def test_a_child_snapshot_clone_is_found_the_same_way(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=4)
+        prune_pool.clone(self.C, olds[0], 'pool/elsewhere')
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.names_of(self.P) == {fresh, olds[0]}
+        (warning,) = records(caplog, logging.WARNING)
+        assert 'descendant' in warning
+
+    def test_a_parent_snapshot_hold_or_clone_is_pre_skipped_without_a_failed_batch(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=5)
+        prune_pool.hold(self.P, olds[0])
+        prune_pool.clone(self.P, olds[1])
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.sizes == [3] and prune_pool.ok_calls == prune_pool.calls
+        assert len(records(caplog, logging.WARNING)) == 2
+        assert records(caplog, logging.ERROR) == []
+
+    def test_a_recursive_dry_run_makes_no_destroy_calls_even_with_a_cloned_name(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=4, dry_run=True)
+        prune_pool.clone(self.P, olds[0])
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.calls == []
+        assert len(records(caplog, logging.WARNING)) == 1
+
+    def test_the_success_count_is_not_doubled_by_the_descendants_destroy_lines(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=4)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.sizes == [4]
+        assert records(caplog, logging.INFO, 'Successfully pruned 4 snapshots')
+
+    def test_a_stuck_name_a_descendant_later_protects_is_forgotten_not_retried(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=3)
+        prune_pool.hold(self.C, olds[0])
+        manager.prune_snapshots(dsi)
+        assert ('pool/d', olds[0]) in manager._prune_stuck
+        prune_pool.props[self.C] = [(ANCHOR + 'x', olds[0], 'local')]      # a child's anchor now pins it
+        prune_pool.calls.clear()
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.calls == []
+        assert manager._prune_stuck == {}
+        assert records(caplog, logging.INFO, 'which could not be destroyed earlier') == []
+
+    def test_45_candidates_make_recursive_calls_of_20_20_and_5(self, prune_pool):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=45)
+        manager.prune_snapshots(dsi)
+        assert prune_pool.sizes == [20, 20, 5]
+        assert all(c.kwargs['recursive'] is True for c in prune_pool.calls)
+
+    def test_a_non_recursive_destroy_ignores_a_childs_hold(self, prune_pool):
+        manager, dsi = prune_manager(self.P, recursive=False)
+        fresh, olds = prune_pool.populate(self.P, old=3)
+        prune_pool.snaps[self.C] = list(prune_pool.snaps[self.P])
+        prune_pool.hold(self.C, olds[0])
+        manager.prune_snapshots(dsi)
+        assert prune_pool.sizes == [3] and prune_pool.calls[0].ok
+        assert prune_pool.names_of(self.C) == set(olds) | {fresh}

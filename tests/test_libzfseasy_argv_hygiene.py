@@ -283,20 +283,20 @@ class TestReceiveNamesAreValidated:
 
     def test_every_name_zfsbackup_excludes_passes(self):
         """The server's receive passes these on every stream: validation must never reject them."""
-        from zfsbackup.api import RECEIVE_EXCLUDED_PROPERTIES
+        from zfsbackup.api import SERVER_OWNED_PROPERTIES
         from libzfseasy.zfs import ReceiveCommand
-        assert len(RECEIVE_EXCLUDED_PROPERTIES) == 3
-        for name in RECEIVE_EXCLUDED_PROPERTIES:
+        assert len(SERVER_OWNED_PROPERTIES) == 3
+        for name in SERVER_OWNED_PROPERTIES:
             Validate.attribute(name)
-        cmd = ReceiveCommand._get_options(reset=list(RECEIVE_EXCLUDED_PROPERTIES), force=True, save=True,
+        cmd = ReceiveCommand._get_options(reset=list(SERVER_OWNED_PROPERTIES), force=True, save=True,
                                           mount=False)
         assert cmd == ["-x", "org.zfsbackup:config", "-x", "org.zfsbackup:client_id",
                        "-x", "org.zfsbackup:source_dataset", "-F", "-s", "-u"]
 
     def test_the_servers_receive_call_does_not_raise(self, mock_subprocess):
-        from zfsbackup.api import RECEIVE_EXCLUDED_PROPERTIES
+        from zfsbackup.api import SERVER_OWNED_PROPERTIES
         mock_subprocess.setup(stdout="")
-        handle = zfs.receive.filesystem(Filesystem("pool/backups/c1/data"), reset=list(RECEIVE_EXCLUDED_PROPERTIES),
+        handle = zfs.receive.filesystem(Filesystem("pool/backups/c1/data"), reset=list(SERVER_OWNED_PROPERTIES),
                                         force=True, save=True, mount=False)
         handle.close()
         assert mock_subprocess.call_count == 1

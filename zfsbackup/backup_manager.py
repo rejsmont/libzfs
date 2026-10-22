@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple, Union
 import dataclasses
 import logging
+import re
 import shlex
 import sys
 import os
@@ -15,6 +16,7 @@ from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
 from libzfseasy.zfs import _zfs_cmd
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, _collapse_retention_rules, client_id_problem,
+    wire_config_problem,
 )
 
 
@@ -32,6 +34,18 @@ PROP_ANCHOR_PREFIX = 'org.zfsbackup:anchor.'
 #: `<from>` is empty for a full send.
 PROP_INFLIGHT_PREFIX = 'org.zfsbackup:inflight.'
 PROP_PREFIX = 'org.zfsbackup:'
+
+#: Columns of the one snapshot listing (`DatasetManager._list_snapshots_strict`).
+#: `createtxg` orders snapshots (the name timestamp is only a label, and a
+#: wrong clock or a hand-made name makes it disagree with creation order);
+#: `guid` identifies a snapshot across hosts; `userrefs` (holds) and `clones`
+#: say whether a destroy can succeed; `encryption` and `keystatus` pick the
+#: send mode.
+SNAPSHOT_LIST_PROPERTIES = ['createtxg', 'guid', 'userrefs', 'clones', 'encryption', 'keystatus']
+
+#: A clock this far (or `check_interval`, if longer) behind the newest
+#: snapshot's name is treated as wrong rather than as jitter.
+CLOCK_TOLERANCE = timedelta(minutes=5)
 
 
 # ── Module-level property helpers (item 14.1) ─────────────────────────────────
@@ -254,6 +268,10 @@ class DatasetInfo:
         self.name = dataset.name
         self.config = config
         self.snapshots: List[SnapshotInfo] = []
+        # Short names of every managed snapshot in the last listing,
+        # including ones dropped from `snapshots` for a missing `createtxg`:
+        # a generated name that is already taken must not be created again.
+        self.listed_names: Set[str] = set()
 
     @property
     def reference_time(self) -> datetime:
@@ -312,6 +330,20 @@ class DatasetManager:
         # problem persists (the per-cycle repeat is DEBUG); forgotten once the
         # dataset is accepted again or disappears, so a later problem warns.
         self._received_skip_noted: Dict[str, str] = {}
+        # (dataset name, snapshot name) pairs dropped from the managed list
+        # for having no `createtxg`, announced at WARNING once each.
+        self._no_txg_noted: Set[Tuple[str, str]] = set()
+        # (dataset name, what, snapshot name) of future-dated snapshots/anchors
+        # announced at ERROR once each (`clock_behind`).
+        self._clock_noted: Set[Tuple[str, str, str]] = set()
+        # (dataset name, snapshot name) of generated names that already
+        # exist (a clock that went backwards), announced at WARNING once.
+        self._name_taken_noted: Set[Tuple[str, str]] = set()
+        # (dataset name, snapshot name) -> why a destroy of it cannot go
+        # through right now (held, cloned, or a failed single destroy). Such a
+        # name is never put back into a batch; it is tried alone each cycle
+        # until it goes or stops being a candidate.
+        self._prune_stuck: Dict[Tuple[str, str], str] = {}
 
     @property
     def datasets(self) -> List[DatasetInfo]:
@@ -480,7 +512,7 @@ class DatasetManager:
             logger.warning(f"Failed to clear in-flight property for {dsi.name}: {e}")
             return False
 
-    def get_anchors(self, dsi: DatasetInfo) -> Set[str]:
+    def get_anchors(self, dsi: DatasetInfo, own_properties_last: bool = False) -> Set[str]:
         """Return the snapshot names pinned by ANY `org.zfsbackup:anchor.*`
         property on the dataset, whether or not its destination is configured.
 
@@ -505,11 +537,22 @@ class DatasetManager:
           (which also sees inherited values), so the result is a superset of
           the old behaviour.
 
+        `own_properties_last` puts the read of the dataset's own `anchor.*`
+        and `inflight.*` properties (the one that sees an in-flight pin)
+        AFTER the per-destination reads, so it is the last `zfs` call made
+        here: used right before a destroy (`_still_prunable`), to leave as
+        little time as possible between reading the protection and acting on it.
+
         Raises if the property read fails: the caller must not prune on an
         unknown protect-set (`prune_snapshots` skips the dataset instead).
         """
         anchors: Set[str] = set()
         configured = {r.destination for r in (dsi.config.remote or [])}
+        if own_properties_last:
+            for name in sorted(configured):
+                anchor = self.get_anchor(dsi, name)
+                if anchor:
+                    anchors.add(anchor)
         for prop, value in read_zfsbackup_properties(dsi.dataset).items():
             if prop.startswith(PROP_ANCHOR_PREFIX):
                 prefix = PROP_ANCHOR_PREFIX
@@ -537,10 +580,11 @@ class DatasetManager:
                         f"If it is stale, release it with: zfs inherit {prop} "
                         f"{shlex.quote(dsi.name)}"
                     )
-        for name in sorted(configured):
-            anchor = self.get_anchor(dsi, name)
-            if anchor:
-                anchors.add(anchor)
+        if not own_properties_last:
+            for name in sorted(configured):
+                anchor = self.get_anchor(dsi, name)
+                if anchor:
+                    anchors.add(anchor)
         return anchors
 
     def received_datasets(
@@ -687,6 +731,12 @@ class DatasetManager:
         # because the only consumer of these objects is the pruner
         # (`PruningWorker`); sends, negotiation and the API use the manager's
         # own configured `datasets`.
+        # The decoder checks types loosely and the property may predate the
+        # API's positive-duration check (or have been set by hand): a zero
+        # `age` is a division by zero in `needs_prunning`.
+        shape_problem = wire_config_problem(ds_config)
+        if shape_problem is not None:
+            return None, f"{PROP_CONFIG} is unusable ({shape_problem})"
         try:
             ds_config = dataclasses.replace(ds_config, recursive=False)
             return DatasetInfo(ds, ds_config), None
@@ -695,16 +745,68 @@ class DatasetManager:
 
     # ── Snapshot operations ───────────────────────────────────────────────────
 
+    def clock_tolerance(self) -> timedelta:
+        """How far ahead of now a snapshot name may be before it is taken to
+        mean the clock is wrong: `max(5 minutes, check_interval)`."""
+        return max(CLOCK_TOLERANCE, self.config.check_interval)
+
+    def clock_behind(self, dsi: DatasetInfo, snap: 'SnapshotInfo', what: str = 'snapshot') -> bool:
+        """True if `snap` is dated beyond `clock_tolerance()` in the future,
+        i.e. the system clock is behind it. Logs an ERROR once per
+        (dataset, `what`, snapshot) while that persists; `what` tells the
+        callers' checks apart (the newest snapshot, or one anchor)."""
+        if snap.timestamp is None:
+            return False
+        ahead = snap.timestamp - datetime.now(timezone.utc)
+        if ahead <= self.clock_tolerance():
+            self._clock_noted = {
+                k for k in self._clock_noted if k[0] != dsi.name or k[1] != what
+            }
+            return False
+        key = (dsi.name, what, snap.name)
+        if key not in self._clock_noted:
+            self._clock_noted.add(key)
+            logger.error(
+                f"Dataset {dsi.name}: {what} {snap.full_name} is dated {ahead} in the future: "
+                "system clock is behind the newest snapshot; check NTP"
+            )
+        else:
+            logger.debug(f"Dataset {dsi.name}: {what} {snap.full_name} is still dated in the future")
+        return True
+
     def needs_snapshot(self, dsi: DatasetInfo) -> bool:
         snapshots = self.list_snapshots(dsi, recursive=False)
         if not snapshots:
             logger.debug(f"Dataset {dsi.name} needs snapshot: True (no existing snapshots)")
             return True
-        latest = snapshots[0]
+        latest = snapshots[0]  # newest by createtxg
         age = latest.age
-        needs = age >= dsi.frequency
+        if self.clock_behind(dsi, latest):
+            # The newest snapshot's name is in the future: its age says
+            # nothing, and waiting would leave the dataset unprotected until
+            # the clock catches up. A snapshot taken now is the newest by
+            # txg, which ends the condition.
+            needs = True
+        else:
+            needs = age >= dsi.frequency
         logger.debug(f"Latest snapshot for {dsi.name} is {latest.full_name} (age={age})")
         logger.debug(f"Dataset {dsi.name} needs snapshot: {needs} (age={age}, frequency={dsi.frequency})")
+        if needs:
+            name = self._generate_snapshot_name(dsi)
+            if name in dsi.listed_names or any(s.name == name for s in snapshots):
+                # A clock that went backwards regenerates a name that exists:
+                # `zfs snapshot` would fail on every cycle. Do nothing.
+                key = (dsi.name, name)
+                if key not in self._name_taken_noted:
+                    self._name_taken_noted.add(key)
+                    logger.warning(
+                        f"Dataset {dsi.name}: the snapshot {name} is due but already exists "
+                        "(the system clock went backwards?); not creating it"
+                    )
+                else:
+                    logger.debug(f"Dataset {dsi.name}: snapshot {name} already exists; not creating it")
+                return False
+            self._name_taken_noted = {k for k in self._name_taken_noted if k[0] != dsi.name}
         return needs
 
     def _retention_plan(self, dsi: DatasetInfo) -> Dict[float, float]:
@@ -739,11 +841,16 @@ class DatasetManager:
 
         now = datetime.now(timezone.utc)
         claimed: dict = {}
-        keep: set = {id(snapshots[0])}
+        # The newest snapshot (by createtxg) is always kept.
+        keep: set = {id(max(snapshots, key=snapshot_order_key))}
 
-        for sni in reversed(snapshots):
-            if sni.timestamp is None:
-                continue
+        # Slots and ages are by name timestamp, walked oldest first (then by
+        # createtxg), so the OLDEST snapshot of a slot claims it.
+        walk = sorted(
+            (s for s in snapshots if s.timestamp is not None),
+            key=lambda s: (s.timestamp, s.createtxg if s.createtxg is not None else -1, s.name),
+        )
+        for sni in walk:
             age_secs = (now - sni.timestamp).total_seconds()
             applicable_expiry = None
             for key in sorted_expiries:
@@ -766,20 +873,45 @@ class DatasetManager:
         return to_prune
 
     def _list_snapshots_strict(self, dsi: DatasetInfo, recursive: bool = False) -> List['SnapshotInfo']:
-        """`list_snapshots` that lets a `zfs list` failure propagate."""
+        """`list_snapshots` that lets a `zfs list` failure propagate.
+
+        One `zfs list` call carries everything a decision needs
+        (`SNAPSHOT_LIST_PROPERTIES`). The result is newest first by
+        `createtxg`, then by name timestamp, then by name (two snapshots
+        taken in one `zfs snapshot a b` share a txg). A managed snapshot with
+        no `createtxg` cannot be ordered, so it is left out of the list --
+        never pruned, never "newest" -- with a WARNING once."""
         snapshots = zfs.list(
             roots=dsi.dataset,
             types='snapshot',
             recursive=recursive,
-            properties=['creation'],
+            properties=list(SNAPSHOT_LIST_PROPERTIES),
         )
         result: List[SnapshotInfo] = []
+        names: Set[str] = set()
+        no_txg: List[SnapshotInfo] = []
         for snap in snapshots:
             if isinstance(snap, ZFSSnapshot):
                 info = SnapshotInfo(snap, self.prefix)
-                if info.is_managed:
+                if not info.is_managed:
+                    continue
+                names.add(info.name)
+                if info.createtxg is None:
+                    no_txg.append(info)
+                else:
                     result.append(info)
-        dsi.snapshots = sorted(result, key=lambda s: s.timestamp, reverse=True)
+        fresh = [i for i in no_txg if (dsi.name, i.full_name) not in self._no_txg_noted]
+        if fresh:
+            logger.warning(
+                f"Dataset {dsi.name}: {len(fresh)} managed snapshot(s) have no createtxg and are "
+                f"ignored (never sent, pruned or treated as newest): "
+                f"{', '.join(i.full_name for i in fresh[:5])}{' ...' if len(fresh) > 5 else ''}"
+            )
+        self._no_txg_noted = {k for k in self._no_txg_noted if k[0] != dsi.name}
+        self._no_txg_noted.update((dsi.name, i.full_name) for i in no_txg)
+        result.sort(key=snapshot_order_key, reverse=True)
+        dsi.snapshots = result
+        dsi.listed_names = names
         return dsi.snapshots
 
     def list_snapshots(self, dsi: DatasetInfo, recursive: bool = False) -> List['SnapshotInfo']:
@@ -809,12 +941,21 @@ class DatasetManager:
                 return None
             result = zfs.snapshot(dsi.dataset, snap_name, recursive=dsi.recursive)
             snapshot = result[0] if isinstance(result, list) else result
-            dsi.snapshots.insert(0, SnapshotInfo(snapshot, self.prefix))
             logger.info(f"Successfully created snapshot: {full_name}")
-            return SnapshotInfo(snapshot, self.prefix)
         except Exception as e:
             logger.error(f"Failed to create snapshot {full_name}: {e}")
             return None
+        # The object `zfs snapshot` returns carries no `createtxg`, so it
+        # cannot be ordered. Re-list (one `zfs list`) and return the listed
+        # one. A failed re-list leaves `dsi.snapshots` as it was (the next
+        # cycle lists again) and returns the bare object: the snapshot exists.
+        try:
+            for info in self._list_snapshots_strict(dsi):
+                if info.name == snap_name:
+                    return info
+        except Exception as e:
+            logger.warning(f"Created {full_name} but could not re-list {dsi.name}: {e}")
+        return SnapshotInfo(snapshot, self.prefix)
 
     def _descendant_anchor_protection(self, dsi: DatasetInfo) -> Dict[str, str]:
         """For a RECURSIVE dataset: `{snapshot name: reason}` pinned by any
@@ -867,6 +1008,7 @@ class DatasetManager:
         snapshots = self.list_snapshots(dsi, recursive=False)
         if not snapshots:
             logger.debug(f"No snapshots to prune for {dsi.name}")
+            self._forget_stuck(dsi, set())
             return
 
         try:
@@ -923,9 +1065,16 @@ class DatasetManager:
                 key for key in self._descendant_protect_noted if key[0] != dsi.name
             }
             self._descendant_error_noted.discard(dsi.name)
-        logger.info(f"Dataset {dsi.name} has {len(to_prune)} snapshots to prune")
+        # A name that is no longer a candidate (destroyed, gone, now kept)
+        # leaves the stuck memory.
+        self._forget_stuck(dsi, {sni.name for sni in to_prune})
+        to_prune, retry_alone = self._split_stuck(dsi, to_prune)
+        logger.info(
+            f"Dataset {dsi.name} has {len(to_prune) + len(retry_alone)} snapshots to prune"
+        )
 
         batch_size = 20
+        pruned = 0
         for i in range(0, len(to_prune), batch_size):
             batch = to_prune[i:i + batch_size]
             names = ', '.join(s.full_name for s in batch)
@@ -933,15 +1082,229 @@ class DatasetManager:
             if self.config.dry_run:
                 logger.info(f"[DRY RUN] Would prune snapshots: {names}")
                 continue
+            batch = self._still_prunable(dsi, batch)
+            if not batch:
+                continue
             try:
                 zfs.destroy([s.snapshot for s in batch], destroy=True, recursive=dsi.recursive)
-                logger.info(f"Successfully pruned {len(batch)} snapshots")
+                pruned += len(batch)
             except Exception as e:
-                logger.error(f"Failed to prune snapshot batch: {e}")
+                # One bad member fails the whole call and destroys none of
+                # them. Retry each alone so the others still go.
+                logger.error(f"Failed to prune snapshot batch: {e}; retrying its snapshots one at a time")
+                retry_alone = retry_alone + batch
+        # Stuck names (and the members of a failed batch) are tried alone.
+        failed: List['SnapshotInfo'] = []
+        for sni in retry_alone:
+            if self.config.dry_run:
+                logger.info(f"[DRY RUN] Would retry pruning {sni.full_name} on its own")
+                continue
+            if not self._still_prunable(dsi, [sni]):
+                continue
+            try:
+                zfs.destroy([sni.snapshot], destroy=True, recursive=dsi.recursive)
+            except Exception as e:
+                logger.debug(f"Could not prune {sni.full_name}: {e}")
+                failed.append(sni)
+                continue
+            pruned += 1
+            if self._prune_stuck.pop((dsi.name, sni.name), None) is not None:
+                logger.info(f"Pruned {sni.full_name}, which could not be destroyed earlier")
+        if failed:
+            self._mark_stuck_after_failure(dsi, failed)
+        if pruned:
+            logger.info(f"Successfully pruned {pruned} snapshots")
+
+    # ── Prune fallback and stuck-snapshot memory (B4) ─────────────────────────
+
+    def _still_prunable(self, dsi: DatasetInfo, group: List['SnapshotInfo']) -> List['SnapshotInfo']:
+        """`group` minus every snapshot that has become protected since the
+        pass began, read IMMEDIATELY before a destroy call (a batch, or one
+        snapshot of the fallback): the anchors and in-flight pins
+        (`get_anchors`, local and received) and, for a recursive dataset, the
+        descendants' anchors and pins. The pass's first read goes stale: the
+        remote worker pins a pair, sends, writes the anchor and re-pins the
+        next pair while this pass retries a failed batch (a send in progress
+        makes a destroy fail with EBUSY, which is exactly the fallback's
+        case), and a destroy using the old protect-set would take the snapshot
+        just sent -- the next incremental base. The remote side is gap-free
+        (pin before the send, anchor before the pin is cleared), so a fresh
+        read always sees a snapshot in use; one destroyed before its step
+        starts is a vanished chain member, which the sender rebuilds around.
+        Costs one `zfs get` per destroy call plus one per configured
+        destination (`get_anchor`), no listing. If the read fails nothing is
+        destroyed (-> `[]`). (A `zfs hold` on the in-flight pair would be the
+        airtight alternative; it is deferred because holds left by a crash
+        would need cleaning up.)"""
+        if not group:
+            return []
+        try:
+            # Order matters: the descendants' read first, then the
+            # per-destination anchors, and the dataset's own properties (where
+            # an in-flight pin shows) LAST, so that a whole chain step cannot
+            # fit between the read and the destroy but for the destroy's own
+            # start-up. The sender additionally keeps its pin between steps.
+            protected = set(self._descendant_anchor_protection(dsi)) if dsi.recursive else set()
+            protected |= set(self.get_anchors(dsi, own_properties_last=True))
+        except Exception as e:
+            logger.error(
+                f"Cannot re-read the anchors of {dsi.name}; not destroying "
+                f"{', '.join(s.full_name for s in group)} now: {e}"
+            )
+            return []
+        kept = [s for s in group if s.name not in protected]
+        for sni in group:
+            if sni.name in protected:
+                logger.info(
+                    f"Dataset {dsi.name}: not pruning {sni.full_name}: it became an "
+                    "anchor or in-flight snapshot during this pass"
+                )
+        return kept
+
+    @staticmethod
+    def _busy_reason(sni: 'SnapshotInfo') -> Optional[str]:
+        """Why a destroy of `sni` cannot succeed, from its listed `userrefs`
+        and `clones` (never from stderr: "busy" is ambiguous), or `None`."""
+        if sni.userrefs:
+            return (
+                f"it has {sni.userrefs} user hold(s) (see: zfs holds {shlex.quote(sni.full_name)})"
+            )
+        if sni.clones:
+            return (
+                f"it has clone(s) {', '.join(sni.clones)} "
+                "(destroy or promote them first)"
+            )
+        return None
+
+    def _note_stuck(self, dsi: DatasetInfo, sni: 'SnapshotInfo', reason: str) -> None:
+        """Record `sni` as unprunable: WARNING once per stuck episode, DEBUG
+        on repeats."""
+        key = (dsi.name, sni.name)
+        new = key not in self._prune_stuck
+        self._prune_stuck[key] = reason
+        if new:
+            logger.warning(
+                f"Dataset {dsi.name}: not pruning {sni.full_name}: {reason}; "
+                "it is tried again alone every cycle"
+            )
+        else:
+            logger.debug(f"Dataset {dsi.name}: still not pruning {sni.full_name}: {reason}")
+
+    def _forget_stuck(self, dsi: DatasetInfo, candidates: Set[str]) -> None:
+        """Drop this dataset's stuck entries whose snapshot is not among
+        `candidates` (names): destroyed, gone, or no longer due for pruning."""
+        for key in [k for k in self._prune_stuck if k[0] == dsi.name and k[1] not in candidates]:
+            del self._prune_stuck[key]
+            logger.debug(f"Dataset {dsi.name}: {key[1]} is no longer a pruning candidate")
+
+    def _split_stuck(
+        self, dsi: DatasetInfo, to_prune: List['SnapshotInfo']
+    ) -> Tuple[List['SnapshotInfo'], List['SnapshotInfo']]:
+        """-> `(batchable, retry_alone)`. Held and cloned candidates are
+        removed up front (also in a dry run: a cloned snapshot fails even
+        `destroy -n`); candidates already stuck are tried alone and never go
+        back into a batch."""
+        batchable: List[SnapshotInfo] = []
+        alone: List[SnapshotInfo] = []
+        for sni in to_prune:
+            reason = self._busy_reason(sni)
+            if reason is not None:
+                self._note_stuck(dsi, sni, reason)
+            elif (dsi.name, sni.name) in self._prune_stuck:
+                alone.append(sni)
+            else:
+                batchable.append(sni)
+        return batchable, alone
+
+    def _mark_stuck_after_failure(self, dsi: DatasetInfo, failed: List['SnapshotInfo']) -> None:
+        """Single-snapshot destroys failed. Re-list once for the reason (a hold
+        or clone that appeared after the first listing) and remember each
+        name as stuck. A snapshot no longer listed is just gone."""
+        fresh: Dict[str, 'SnapshotInfo'] = {}
+        listed = False
+        try:
+            scratch = DatasetInfo(dsi.dataset, dsi.config)
+            fresh = {s.name: s for s in self._list_snapshots_strict(scratch)}
+            listed = True
+        except Exception as e:
+            logger.debug(f"Could not re-list {dsi.name} to explain a failed destroy: {e}")
+        for sni in failed:
+            current = fresh.get(sni.name)
+            if listed and current is None:
+                self._prune_stuck.pop((dsi.name, sni.name), None)
+                logger.debug(f"{sni.full_name} disappeared while pruning")
+                continue
+            reason = self._busy_reason(current) if current is not None else None
+            if reason is None:
+                reason = (
+                    "zfs would not destroy it (a recursive destroy also needs every descendant's "
+                    "copy free of holds and clones; a send in progress also blocks it)"
+                    if dsi.recursive else
+                    "zfs would not destroy it (a send in progress also blocks it)"
+                )
+            self._note_stuck(dsi, sni, reason)
+
+
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def snapshot_order_key(sni: 'SnapshotInfo'):
+    """Total order of a dataset's managed snapshots, oldest smallest: by
+    `createtxg`, then by name timestamp, then by name. A snapshot without a
+    txg (never in a listed result; only a hand-built object) sorts as the
+    oldest."""
+    return (
+        sni.createtxg if sni.createtxg is not None else -1,
+        sni.timestamp if sni.timestamp is not None else _EPOCH,
+        sni.name,
+    )
+
+
+def snapshot_newer(a: Optional['SnapshotInfo'], b: Optional['SnapshotInfo']) -> bool:
+    """`a` is strictly newer than `b` by `snapshot_order_key` (`createtxg`
+    first). False when either is missing or has no `createtxg`: an unknown
+    order is never taken for "newer"."""
+    return (
+        a is not None and b is not None
+        and a.createtxg is not None and b.createtxg is not None
+        and snapshot_order_key(a) > snapshot_order_key(b)
+    )
+
+
+def _property_text(snapshot, name: str) -> Optional[str]:
+    """The text of one property of a listed libzfseasy object, or `None` if
+    it is absent, `-` or empty. Never raises."""
+    try:
+        prop = snapshot[name]
+        if prop is None:
+            return None
+        value = getattr(prop, 'value', prop)
+        if value is None:
+            return None
+        text = str(value)
+    except Exception:
+        return None
+    return None if text in ('', '-') else text
+
+
+def _property_int(snapshot, name: str) -> Optional[int]:
+    text = _property_text(snapshot, name)
+    if text is None:
+        return None
+    try:
+        return int(text, 0)
+    except ValueError:
+        return None
 
 
 class SnapshotInfo:
-    """Information about a snapshot with parsed metadata."""
+    """Information about a snapshot with parsed metadata.
+
+    `createtxg`, `guid`, `userrefs`, `clones`, `encrypted` and `key_loaded`
+    come from the one listing (`SNAPSHOT_LIST_PROPERTIES`) and are `None` (or
+    empty) when the object was not listed with them. `createtxg` is what
+    orders snapshots; `timestamp` (from the name) only places a snapshot in a
+    retention slot and gives its age."""
 
     def __init__(self, snapshot: ZFSSnapshot, prefix: str):
         self.snapshot = snapshot
@@ -949,19 +1312,26 @@ class SnapshotInfo:
         self.full_name = str(snapshot)
         self.prefix = prefix
         self.timestamp = self._parse_timestamp()
+        self.createtxg: Optional[int] = _property_int(snapshot, 'createtxg')
+        self.guid: Optional[int] = _property_int(snapshot, 'guid')
+        self.userrefs: Optional[int] = _property_int(snapshot, 'userrefs')
+        clones = _property_text(snapshot, 'clones')
+        self.clones: Tuple[str, ...] = tuple(c for c in clones.split(',') if c) if clones else ()
+        encryption = _property_text(snapshot, 'encryption')
+        self.encrypted: Optional[bool] = None if encryption is None else encryption != 'off'
+        keystatus = _property_text(snapshot, 'keystatus')
+        self.key_loaded: Optional[bool] = None if keystatus is None else keystatus == 'available'
 
     def _parse_timestamp(self) -> Optional[datetime]:
-        """`{prefix}_{YYYYMMDDHHMMSS}[_anything]` -> UTC datetime, else None.
-        The prefix may itself contain `_`; the timestamp is the token right
-        after `{prefix}_` and must be exactly 14 ASCII digits."""
-        head = self.prefix + '_'
-        if not self.name.startswith(head):
-            return None
-        token = self.name[len(head):].split('_', 1)[0]
-        if len(token) != 14 or not (token.isascii() and token.isdigit()):
+        """`{prefix}_{YYYYMMDDHHMMSS}` -> UTC datetime, else None. The whole
+        name must match: the prefix (which may itself contain `_`), `_`, and
+        exactly 14 ASCII digits that form a valid date. Anything after the
+        digits (`..._suffix`) is not ours."""
+        m = re.fullmatch(re.escape(self.prefix) + '_([0-9]{14})', self.name)
+        if m is None:
             return None
         try:
-            dt = datetime.strptime(token, "%Y%m%d%H%M%S")
+            dt = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
         except ValueError:
             return None
         return dt.replace(tzinfo=timezone.utc)
@@ -974,7 +1344,7 @@ class SnapshotInfo:
 
     @property
     def is_managed(self) -> bool:
-        return self.name.startswith(self.prefix + '_') and self.timestamp is not None
+        return self.timestamp is not None
 
     def __repr__(self):
         return f"SnapshotInfo({self.full_name}, age={self.age})"

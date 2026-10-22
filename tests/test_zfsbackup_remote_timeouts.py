@@ -21,9 +21,10 @@ import pytest
 import websocket
 
 from _remote_support import (  # noqa: F401  (fixtures)
-    OTHER_SERVER_FP, SERVER_FP, fake_connect_pinned, make_transport,
+    OTHER_SERVER_FP, SERVER_FP, fake_connect_pinned, make_transport, snapshot_presence,
 )
 from libzfseasy.zfs import StreamHandle
+from _snapshot_support import listed_info
 from zfsbackup import remote
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup.config import BackupConfig, DatasetConfig, Destination, RemoteDatasetConfig
@@ -71,6 +72,13 @@ def _tls_connect_is_faked(fake_connect_pinned):
     return fake_connect_pinned
 
 
+@pytest.fixture(autouse=True)
+def _snapshots_are_present(snapshot_presence):
+    """After every acknowledged step the client checks (`zfs get guid`) that the snapshot it sent
+    still exists; here it always does, and no `zfs` runs."""
+    return snapshot_presence
+
+
 @pytest.fixture
 def rbm(tmp_path):
     config = BackupConfig(
@@ -86,16 +94,20 @@ def tr():
     return make_transport(URL)
 
 
-def snapshot(name="autosnap_20240101120000"):
-    snap = MagicMock()
-    snap.name = name
-    snap.timestamp = datetime.strptime(name.split("_", 1)[1][:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-    return snap
+def snapshot(name="autosnap_20240101120000", guid=None):
+    """A managed snapshot as the manager's one listing delivers it (S-1): `createtxg` ordered like
+    the name, and `guid` (the resume tests' 111/222/333 for the 20240101/02/03 names)."""
+    if guid is None:
+        guid = {"autosnap_20240101120000": 111, "autosnap_20240102120000": 222,
+                "autosnap_20240103120000": 333}.get(name, "auto")
+    if guid == "auto":
+        return listed_info(name, "autosnap")
+    return listed_info(name, "autosnap", guid=guid)
 
 
 class Outcome(tuple):
     """`(result, set_anchor)` -- what most tests unpack -- plus the other
-    mocked `local_manager` calls and the `_get_resume_stream` stand-in."""
+    mocked `local_manager` calls."""
 
     def __new__(cls, result, set_anchor, **extra):
         self = super().__new__(cls, (result, set_anchor))
@@ -104,27 +116,49 @@ class Outcome(tuple):
 
 
 def started(stream, mode="fresh", inflight=False, sent=None, base=None):
-    """What `_get_resume_stream` returns after starting `stream`."""
+    """What `_try_resume` (mode `resume`) or `_start_fresh` returns after starting `stream`."""
     return _SendStream(stream, mode, inflight, sent, base)
+
+
+def stub_start(mocker, manager, stream, mode="fresh", inflight=False, sent=None, base=None):
+    """Patch the two places a stream is started so `_transfer` is handed `stream`: a `resume`
+    comes out of `_try_resume` (step 0), anything else out of `_start_fresh`, which sends the
+    step it is asked for (`sent`, `base` override that); `stream=None` is a `zfs send` that
+    could not be started. `_push_step` itself is the real one."""
+    if stream is None:
+        mocker.patch.object(manager, "_try_resume", return_value=("fresh", None))
+        mocker.patch.object(manager, "_start_fresh", return_value=None)
+    elif mode == "resume":
+        mocker.patch.object(manager, "_try_resume", return_value=("resume", started(stream, mode, inflight, sent, base)))
+    else:
+        mocker.patch.object(manager, "_try_resume", return_value=("fresh", None))
+        mocker.patch.object(
+            manager, "_start_fresh",
+            side_effect=lambda dsi, dest, prev, step, m: started(
+                stream, "fresh", inflight, sent or step, base if base is not None else prev),
+        )
 
 
 def transfer(rbm_dsi, mocker, stream, ws, mode="fresh", inflight=False, sent=None, base=None, latest=None,
              common=None, **kwargs):
-    """`_transfer` with the send already started (`_get_resume_stream`
-    patched out: it is exercised on its own in test_zfsbackup_remote.py and
-    in TestRealResumeStreamUnderTimeouts below)."""
+    """`_transfer` with the send already started (`stub_start`: step 0 and the fresh start are
+    exercised on their own in test_zfsbackup_remote.py and in TestRealResumeStreamUnderTimeouts
+    below). A `resume` of a snapshot other than `latest` is followed by a stop request, so the
+    chain that would continue after it is not run here."""
     manager, dsi = rbm_dsi
     latest = latest or snapshot()
-    mocker.patch.object(
-        manager, "_get_resume_stream",
-        return_value=stream if stream is None else started(stream, mode, inflight, sent, base),
-    )
+    stub_start(mocker, manager, stream, mode, inflight, sent, base)
+    if mode == "resume" and "should_stop" not in kwargs:
+        answers = iter([False, True])
+        kwargs["should_stop"] = lambda: next(answers, True)
     mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
     lm = manager.local_manager
     set_anchor = mocker.patch.object(lm, "set_anchor", return_value=True)
     get_anchor = mocker.patch.object(lm, "get_anchor", return_value=None)
     clear_inflight = mocker.patch.object(lm, "clear_inflight", return_value=True)
     set_inflight = mocker.patch.object(lm, "set_inflight", return_value=True)
+    # a failed step re-lists to see whether its snapshot vanished: it has not
+    mocker.patch.object(lm, "list_snapshots", return_value=[latest])
     result = manager._transfer(tr(), "client1", dsi, latest, common, "offsite", snapshots=[latest], **kwargs)
     return Outcome(result, set_anchor, get_anchor=get_anchor, clear_inflight=clear_inflight,
                    set_inflight=set_inflight)
@@ -633,7 +667,7 @@ class TestCloseHandshakeAndStreamClose:
         stream = FakeStream()
         stream.read = MagicMock(side_effect=KeyboardInterrupt)
         ws = ok_ws()
-        mocker.patch.object(manager, "_get_resume_stream", return_value=started(stream))
+        stub_start(mocker, manager, stream)
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
         set_anchor = mocker.patch.object(manager.local_manager, "set_anchor")
         with pytest.raises(KeyboardInterrupt):
@@ -648,7 +682,7 @@ class TestCloseHandshakeAndStreamClose:
         stream = FakeStream()
         stream.read = MagicMock(side_effect=KeyboardInterrupt)
         stream.close = MagicMock(side_effect=Exception("killed by SIGPIPE"))
-        mocker.patch.object(manager, "_get_resume_stream", return_value=started(stream))
+        stub_start(mocker, manager, stream)
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
         with pytest.raises(KeyboardInterrupt):
             manager._transfer(tr(), "client1", dsi, snapshot(), None, "offsite", snapshots=[snapshot()])
@@ -897,10 +931,28 @@ class TestLogRefusal:
         assert self.logged(caplog, {"error": "server is reloading; retry later", "retry": True}) == [
             ("INFO", f"server {self.URL_} is reloading; skipping pool/data this cycle")]
 
-    @pytest.mark.parametrize("result", [{"retry": True}, {"error": "something else", "retry": True},
-                                        {"status": "error", "error": "x", "retry": True}])
-    def test_any_other_retryable_reply_uses_the_reloading_wording(self, caplog, result):
-        assert self.logged(caplog, result) == [
+    @pytest.mark.parametrize("result, shown", [
+        ({"retry": True}, "unknown"),
+        ({"error": "something else", "retry": True}, "something else"),
+        ({"status": "error", "error": "x", "retry": True}, "x"),
+        ({"error": "no configuration is recorded for pool/b/c1/data; negotiate again", "retry": True},
+         "no configuration is recorded for pool/b/c1/data; negotiate again"),
+    ])
+    def test_any_other_retryable_reply_asks_to_retry_with_the_servers_text(self, caplog, result, shown):
+        expected = shown if result.get("error") else ""
+        got = self.logged(caplog, result)
+        assert [lv for lv, _ in got] == ["INFO"]
+        msg = got[0][1]
+        assert msg.startswith(f"server {self.URL_} asks to retry pool/data (") and msg.endswith("); skipping this cycle")
+        assert expected in msg
+        assert "is reloading" not in msg and "is busy" not in msg
+
+    def test_the_real_busy_and_reloading_refusals_keep_their_own_wording(self, caplog):
+        from zfsbackup import api
+        assert self.logged(caplog, api.BUSY_ERROR) == [
+            ("INFO", f"server {self.URL_} is busy with another stream of pool/data; skipping this cycle")]
+        caplog.clear()
+        assert self.logged(caplog, api.RELOADING_ERROR) == [
             ("INFO", f"server {self.URL_} is reloading; skipping pool/data this cycle")]
 
     def test_a_non_retryable_refusal_is_an_error_with_the_servers_text(self, caplog):
@@ -1316,7 +1368,7 @@ class TestNoProbeWhenThePeerCannotHaveLeftARefusal:
         stream.read = MagicMock(side_effect=KeyboardInterrupt)
         ws = ok_ws()
         ws.recv.return_value = REFUSAL_JSON
-        mocker.patch.object(manager, "_get_resume_stream", return_value=started(stream))
+        stub_start(mocker, manager, stream)
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
         with pytest.raises(KeyboardInterrupt):
             manager._transfer(tr(), "client1", dsi, snapshot(), None, "offsite", snapshots=[snapshot()])
@@ -1326,7 +1378,7 @@ class TestNoProbeWhenThePeerCannotHaveLeftARefusal:
 # ---------------------------------------------------------------------------
 # Resume protocol, transfer level: `/stream?mode=fresh|resume[&from=...]`, the
 # in-flight pin and the anchor. (The decision table for WHICH stream starts is
-# in test_zfsbackup_remote.py; here `_get_resume_stream`'s result is given.)
+# in test_zfsbackup_remote.py; here the started stream is given.)
 # ---------------------------------------------------------------------------
 
 from urllib.parse import parse_qs, urlsplit  # noqa: E402
@@ -1361,7 +1413,7 @@ class TestStreamUrlModes:
     def test_a_resume_says_mode_resume_and_carries_from(self, rbm, mocker):
         ws = ok_ws()
         transfer(rbm, mocker, FakeStream(), ws, mode="resume", base=snapshot(OLD), sent=snapshot(MID),
-                 latest=snapshot(NEW), followup=False)
+                 latest=snapshot(NEW))
         assert query(ws) == {"mode": ["resume"], "from": [OLD]}
 
     def test_a_resumed_full_stream_has_no_from(self, rbm, mocker):
@@ -1374,7 +1426,7 @@ class TestStreamUrlModes:
         different, newer target) must not leak into the URL."""
         ws = ok_ws()
         transfer(rbm, mocker, FakeStream(), ws, mode="resume", base=snapshot(OLD), sent=snapshot(MID),
-                 latest=snapshot(NEW), common=snapshot(MID), followup=False)
+                 latest=snapshot(NEW), common=snapshot(MID))
         assert query(ws)["from"] == [OLD]
 
     def test_the_mode_is_always_present(self, rbm, mocker):
@@ -1417,7 +1469,7 @@ class TestPinAndAnchorAfterTheTransfer:
     def test_a_failed_anchor_write_keeps_the_pin(self, rbm, mocker):
         manager, _ = rbm
         stream, ws = FakeStream(), ok_ws()
-        mocker.patch.object(manager, "_get_resume_stream", return_value=started(stream, inflight=True))
+        stub_start(mocker, manager, stream, inflight=True)
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
         mocker.patch.object(manager.local_manager, "get_anchor", return_value=None)
         mocker.patch.object(manager.local_manager, "set_anchor", return_value=False)
@@ -1451,16 +1503,17 @@ class TestResumeAnchorRules:
         ws = ok_ws()
         manager, dsi = rbm
         stream = FakeStream()
-        mocker.patch.object(manager, "_get_resume_stream",
-                            return_value=started(stream, "resume", True, snapshot(sent), snapshot(OLD)))
+        stub_start(mocker, manager, stream, "resume", True, snapshot(sent), snapshot(OLD))
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
         lm = manager.local_manager
         set_anchor = mocker.patch.object(lm, "set_anchor", return_value=True)
         mocker.patch.object(lm, "get_anchor", return_value=existing)
         clear = mocker.patch.object(lm, "clear_inflight", return_value=True)
         snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
+        # a stop request right after the resume: the chain that would go on to NEW is not run here
+        answers = iter([False, True])
         ok = manager._transfer(tr(), "client1", dsi, snaps[0], None, "offsite", snapshots=snaps,
-                               followup=False, **kw)
+                               should_stop=lambda: next(answers, True), **kw)
         return ok, set_anchor, clear
 
     def test_the_resumed_snapshot_becomes_the_anchor(self, rbm, mocker, caplog):
@@ -1477,14 +1530,14 @@ class TestResumeAnchorRules:
         assert set_anchor.call_args.args[1:] == ("offsite", MID)
         clear.assert_called_once()
 
-    def test_a_newer_anchor_is_never_moved_backwards_and_the_pin_stays(self, rbm, mocker, caplog):
-        """S2: nothing was written, so the pin keeps protecting the resumed pair until the
-        follow-up (or the next send) writes its own."""
+    def test_a_newer_anchor_is_never_moved_backwards(self, rbm, mocker, caplog):
+        """S2: nothing is written. (`anchored` stops right after the resume, which settles the pin
+        itself; the step's own handling of the pin is `TestPushStepClearPin`.)"""
         with caplog.at_level(logging.DEBUG):
             ok, set_anchor, clear = self.anchored(rbm, mocker, existing=NEW, sent=MID)
         assert ok is True
         set_anchor.assert_not_called()
-        clear.assert_not_called()
+        clear.assert_called_once()                          # the clean stop's clear, nothing else
         assert f"Keeping anchor {NEW}" in caplog.text
 
     def test_the_same_anchor_is_rewritten_not_skipped(self, rbm, mocker):
@@ -1496,44 +1549,107 @@ class TestResumeAnchorRules:
         ok, set_anchor, clear = self.anchored(rbm, mocker, existing="autosnap_20990101000000", sent=MID)
         assert set_anchor.call_args.args[1:] == ("offsite", MID)
 
-    def test_a_fresh_send_always_moves_the_anchor_even_to_an_older_snapshot_than_the_current_one(self, rbm, mocker):
-        """The never-backwards rule is for resumes only: a fresh send of `latest`
-        is, by construction, the newest snapshot."""
+    def test_a_fresh_step_older_than_the_anchor_leaves_it_too_and_keeps_the_pin(self, rbm, mocker):
+        """The never-backwards rule holds for every send, not only a resume: a chain step after
+        a resume (or a concurrent cycle) can be older than the anchor."""
         manager, dsi = rbm
         ws = ok_ws()
-        mocker.patch.object(manager, "_get_resume_stream",
-                            return_value=started(FakeStream(), "fresh", True, snapshot(MID), None))
+        stub_start(mocker, manager, FakeStream(), "fresh", True, snapshot(MID), None)
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
         set_anchor = mocker.patch.object(manager.local_manager, "set_anchor", return_value=True)
         mocker.patch.object(manager.local_manager, "get_anchor", return_value=NEW)
-        mocker.patch.object(manager.local_manager, "clear_inflight")
+        clear = mocker.patch.object(manager.local_manager, "clear_inflight")
         snaps = [snapshot(NEW), snapshot(MID)]
         manager._transfer(tr(), "client1", dsi, snaps[1], None, "offsite", snapshots=snaps)
-        assert set_anchor.call_args.args[1:] == ("offsite", MID)
+        set_anchor.assert_not_called()
+        clear.assert_not_called()
+
+    def test_a_fresh_step_newer_than_the_anchor_moves_it(self, rbm, mocker):
+        manager, dsi = rbm
+        stub_start(mocker, manager, FakeStream(), "fresh", True, snapshot(NEW), None)
+        mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
+        set_anchor = mocker.patch.object(manager.local_manager, "set_anchor", return_value=True)
+        mocker.patch.object(manager.local_manager, "get_anchor", return_value=MID)
+        clear = mocker.patch.object(manager.local_manager, "clear_inflight")
+        snaps = [snapshot(NEW), snapshot(MID)]
+        manager._transfer(tr(), "client1", dsi, snaps[0], None, "offsite", snapshots=snaps)
+        assert set_anchor.call_args.args[1:] == ("offsite", NEW)
+        clear.assert_called_once()
 
     def test_a_failed_anchor_write_keeps_the_pin_on_a_resume(self, rbm, mocker):
         manager, dsi = rbm
-        mocker.patch.object(manager, "_get_resume_stream",
-                            return_value=started(FakeStream(), "resume", True, snapshot(MID), snapshot(OLD)))
+        stub_start(mocker, manager, FakeStream(), "resume", True, snapshot(MID), snapshot(OLD))
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
         mocker.patch.object(manager.local_manager, "get_anchor", return_value=OLD)
         mocker.patch.object(manager.local_manager, "set_anchor", return_value=False)
         clear = mocker.patch.object(manager.local_manager, "clear_inflight")
         snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
-        manager._transfer(tr(), "client1", dsi, snaps[0], None, "offsite", snapshots=snaps, followup=False)
+        assert manager._transfer(tr(), "client1", dsi, snaps[0], None, "offsite", snapshots=snaps) is False
         clear.assert_not_called()
+
+
+class TestPushStepClearPin:
+    """`_push_step(..., clear_pin=)`: the pin written for a step is released after its anchor only
+    when the caller says so (the last step of a chain); a step in the middle leaves it for the
+    next step's pin to overwrite."""
+
+    def push(self, rbm, mocker, clear_pin, existing=None, sent=MID, **kw):
+        from zfsbackup.remote import _OK
+        manager, dsi = rbm
+        mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
+        lm = manager.local_manager
+        set_anchor = mocker.patch.object(lm, "set_anchor", return_value=True)
+        mocker.patch.object(lm, "get_anchor", return_value=existing)
+        clear = mocker.patch.object(lm, "clear_inflight", return_value=True)
+        snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
+        step = next(s for s in snaps if s.name == sent)
+        started_ = started(FakeStream(), "fresh", True, step, snapshot(OLD))
+        outcome = manager._push_step(tr(), "client1", dsi, "offsite", snaps, started_, clear_pin=clear_pin, **kw)
+        return outcome, set_anchor, clear
+
+    def test_clear_pin_true_releases_the_pin_after_the_anchor(self, rbm, mocker):
+        outcome, set_anchor, clear = self.push(rbm, mocker, True)
+        assert outcome == "ok"
+        set_anchor.assert_called_once()
+        clear.assert_called_once()
+
+    def test_clear_pin_false_keeps_it(self, rbm, mocker):
+        outcome, set_anchor, clear = self.push(rbm, mocker, False)
+        assert outcome == "ok"
+        set_anchor.assert_called_once()                      # the anchor is written either way
+        clear.assert_not_called()
+
+    def test_a_kept_newer_anchor_keeps_the_pin_whatever_clear_pin_says(self, rbm, mocker):
+        outcome, set_anchor, clear = self.push(rbm, mocker, True, existing=NEW)
+        assert outcome == "ok"
+        set_anchor.assert_not_called()
+        clear.assert_not_called()
+
+    def test_the_default_releases_it(self, rbm, mocker):
+        """A caller that does not say (a single stream) gets the old behaviour."""
+        manager, dsi = rbm
+        mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
+        lm = manager.local_manager
+        mocker.patch.object(lm, "set_anchor", return_value=True)
+        mocker.patch.object(lm, "get_anchor", return_value=None)
+        clear = mocker.patch.object(lm, "clear_inflight", return_value=True)
+        snaps = [snapshot(NEW)]
+        manager._push_step(tr(), "client1", dsi, "offsite", snaps, started(FakeStream(), "fresh", True, snaps[0], None))
+        clear.assert_called_once()
 
 
 class TestShouldStop:
     def test_a_pending_stop_starts_no_send_at_all(self, rbm, mocker, caplog):
         manager, dsi = rbm
-        get_stream = mocker.patch.object(manager, "_get_resume_stream")
+        get_stream = mocker.patch.object(manager, "_try_resume")
+        start = mocker.patch.object(manager, "_start_fresh")
         ws_cls = mocker.patch("zfsbackup.remote.websocket.WebSocket")
         latest = snapshot(NEW)
         with caplog.at_level(logging.INFO):
             assert manager._transfer(tr(), "c", dsi, latest, None, "offsite", snapshots=[latest],
                                      should_stop=lambda: True) is False
         get_stream.assert_not_called()
+        start.assert_not_called()
         ws_cls.assert_not_called()
         assert "stop requested; not starting a send of pool/data" in caplog.text
 
@@ -1545,7 +1661,8 @@ class TestShouldStop:
         manager, dsi = rbm
         manager.config.dry_run = True
         stop = MagicMock(return_value=True)
-        get_stream = mocker.patch.object(manager, "_get_resume_stream")
+        get_stream = mocker.patch.object(manager, "_try_resume")
+        start = mocker.patch.object(manager, "_start_fresh")
         get_info = mocker.patch("zfsbackup.remote.zfs.send.resume_info")
         get_resume = mocker.patch("zfsbackup.remote.zfs.send.resume")
         session = MagicMock()
@@ -1553,14 +1670,14 @@ class TestShouldStop:
         assert manager._transfer(make_transport(URL, session=session), "c", dsi, latest, None, "offsite",
                                  snapshots=[latest], should_stop=stop) is True
         stop.assert_not_called()
-        for m in (get_stream, get_info, get_resume, session.get, session.post):
+        for m in (get_stream, start, get_info, get_resume, session.get, session.post):
             m.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# `_get_resume_stream` NOT patched out: the real resume decision feeding the
+# `_try_resume` and `_start_fresh` NOT patched out: the real resume decision feeding the
 # real transfer under websocket failures. Only the edges are mocked: the
-# resume-token GET, the token decoder, the GUID listing, `zfs send`, the
+# resume-token GET, the token decoder, `zfs send`, the
 # local property writes and the websocket.
 # ---------------------------------------------------------------------------
 
@@ -1592,7 +1709,6 @@ class TestRealResumeStreamUnderTimeouts:
             "zfsbackup.remote.zfs.send.resume_info",
             return_value=ResumeToken(toname=f"pool/data@{MID}", toguid=222, fromguid=111, flags=frozenset()),
         )
-        mocker.patch.object(manager, "_snapshot_guids", return_value={111: OLD, 222: MID, 333: NEW})
         lm = manager.local_manager
         self.set_inflight = mocker.patch.object(
             lm, "set_inflight", side_effect=lambda *a, **k: (self.order.append("pin"), True)[1]
