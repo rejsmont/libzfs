@@ -22,6 +22,10 @@ jobs:
     # A wedged fork test must not burn hours. The suite takes ~14 min on a
     # laptop (real-daemon, forkserver and sd_notify tests), so allow headroom.
     timeout-minutes: 60
+    # A matrix entry marked `experimental` may fail without failing the
+    # workflow: it is reported, not enforced, until it has been green (see 3.15
+    # below).
+    continue-on-error: ${{ matrix.experimental == true }}
 
     strategy:
       # When one version breaks, we need to know whether it is that
@@ -36,6 +40,16 @@ jobs:
         # accident. Boundaries between versions are where things hide.
         python: ["3.11", "3.12", "3.13", "3.14"]
         include:
+          # 3.15 (plan decision C3: "3.11-3.14, plus 3.15 in CI; declared
+          # supported once green"). actions/setup-python resolves "3.15" to the
+          # stable 3.15.x builds in actions/python-versions' manifest (3.15.0
+          # and 3.15.1 are listed for ubuntu 22.04/24.04/26.04 and macOS), so no
+          # `allow-prereleases` is needed. Non-blocking until the first green
+          # run on both the 3.15 poetry host and the suite; then drop
+          # `experimental` and move "3.15" into the `python` list above.
+          - os: ubuntu-latest
+            python: "3.15"
+            experimental: true
           # Development happens on macOS, where the multiprocessing
           # default start method is `spawn` rather than Linux's `fork`
           # (or `forkserver` on 3.14). The fork-safety tests pin
@@ -154,3 +168,113 @@ jobs:
           poetry run pytest
           -W error::sqlalchemy.exc.SADeprecationWarning
           -W error::sqlalchemy.exc.SAWarning
+
+  # Packaging smoke test (plan C20). The test jobs above run from a source
+  # checkout, where a file missing from the wheel is invisible: a new migration
+  # that the build forgets to include, or a console script pointing at a module
+  # that does not ship, only shows up on the first real install. This job builds
+  # the wheel and sdist, checks what is in them, installs the wheel into a clean
+  # venv WITHOUT the dev dependencies, away from the checkout, and runs the two
+  # console scripts through import, migrate --check and --test-config.
+  package:
+    name: package / py${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the newest stable.
+        python: ["3.11", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install poetry
+        run: pipx install --python "${{ steps.py.outputs.python-path }}" poetry==2.1.1
+
+      - name: Build the wheel and the sdist
+        run: poetry build
+
+      - name: Check what the wheel and the sdist contain
+        run: |
+          python - <<'PY'
+          import glob
+          import sys
+          import tarfile
+          import zipfile
+
+          problems = []
+
+          (wheel,) = glob.glob("dist/*.whl")
+          names = zipfile.ZipFile(wheel).namelist()
+          migrations = [
+              n for n in names
+              if n.startswith("zfsbackup/config/store/migrations/versions/")
+              and n.endswith(".py") and not n.endswith("__init__.py")
+          ]
+          if not migrations:
+              problems.append("wheel: no zfsbackup/config/store/migrations/versions/*.py revision")
+          for required in ("zfsbackup/version.py", "zfsbackup/daemon_entry.py"):
+              if required not in names:
+                  problems.append(f"wheel: {required} is missing")
+          for prefix in ("packaging/", "tests/"):
+              leaked = [n for n in names if n.startswith(prefix)]
+              if leaked:
+                  problems.append(f"wheel: top-level {prefix} must not ship, found {leaked[:3]}")
+          entry = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
+          scripts = zipfile.ZipFile(wheel).read(entry[0]).decode() if entry else ""
+          for script in ("zfsbackupd", "zfsbackup-config"):
+              if script not in scripts:
+                  problems.append(f"wheel: console script {script} is not declared")
+
+          (sdist,) = glob.glob("dist/*.tar.gz")
+          members = tarfile.open(sdist).getnames()
+          if not any(m.endswith("/packaging/systemd/zfsbackup.service") for m in members):
+              problems.append("sdist: packaging/systemd/zfsbackup.service is missing")
+
+          print(f"wheel: {len(names)} files, {len(migrations)} migration revision(s)")
+          print(f"sdist: {len(members)} files")
+          if problems:
+              sys.exit("\n".join(problems))
+          PY
+
+      # No poetry, no dev group: what a user's `pip install` gets, with the
+      # newest runtime dependencies pyproject allows.
+      - name: Install the wheel into a clean venv
+        run: |
+          python -m venv "$RUNNER_TEMP/pkgvenv"
+          "$RUNNER_TEMP/pkgvenv/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/pkgvenv/bin/python" -m pip list
+          if "$RUNNER_TEMP/pkgvenv/bin/python" -m pip show pytest >/dev/null 2>&1; then
+            echo "::error::pytest is installed in the clean venv: a runtime dependency pulls in dev tooling"
+            exit 1
+          fi
+
+      - name: Provide stub zfs/zpool binaries
+        run: |
+          mkdir -p "$RUNNER_TEMP/zfsstub"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zfs"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zpool"
+          chmod +x "$RUNNER_TEMP/zfsstub/zfs" "$RUNNER_TEMP/zfsstub/zpool"
+          echo "ZFS_CMD=$RUNNER_TEMP/zfsstub/zfs" >> "$GITHUB_ENV"
+          echo "ZPOOL_CMD=$RUNNER_TEMP/zfsstub/zpool" >> "$GITHUB_ENV"
+
+      # Run from a scratch directory, not the checkout: nothing may import
+      # from the source tree, and the config database is created here.
+      - name: Smoke test the console scripts
+        run: |
+          set -x
+          bin="$RUNNER_TEMP/pkgvenv/bin"
+          work="$RUNNER_TEMP/pkgwork"
+          mkdir -p "$work"
+          cd "$work"
+          "$bin/zfsbackupd" --version
+          "$bin/zfsbackup-config" --version
+          "$bin/zfsbackup-config" -c "$work/config.db" import "$GITHUB_WORKSPACE/zfsbackup/config.example.yaml"
+          "$bin/zfsbackup-config" -c "$work/config.db" migrate --check
+          "$bin/zfsbackupd" --test-config -c "$work/config.db"
