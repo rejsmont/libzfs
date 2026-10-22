@@ -1,0 +1,1672 @@
+##### SECTION M6 (-L (and -c) mismatch between a full receive and a later incremental, both directions)  tag=C  zfs-2.4.1-1ubuntu5.1
+=== CASE M6/big.00_src_props
+--- cmd
+zfs get -H -o name,property,value recordsize zfsbcapc/M6/cs/big
+--- rc
+0
+--- stdout
+zfsbcapc/M6/cs/big	recordsize	1M
+--- stderr
+=== END
+=== CASE M6/big.none_then_none.1_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_n_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_none.2_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_n_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_none.3_incr_again
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_n_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_none.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_n_n
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_n_n@a
+zfsbcapc/M6/srv/big_n_n@b
+zfsbcapc/M6/srv/big_n_n@c
+--- stderr
+=== END
+=== CASE M6/big.none_then_none.5_F_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_n_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_none.6_F_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_n_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.L_then_none.1_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_L_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.L_then_none.2_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_L_n
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: incremental send stream requires -L (--large-block), to match previous receive.
+=== END
+=== CASE M6/big.L_then_none.3_incr_again
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_L_n
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: most recent snapshot of zfsbcapc/M6/srv/big_L_n does not
+match incremental source
+=== END
+=== CASE M6/big.L_then_none.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_L_n
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_L_n@a
+--- stderr
+=== END
+=== CASE M6/big.L_then_none.5_F_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_L_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.L_then_none.6_F_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_L_n_F
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: incremental send stream requires -L (--large-block), to match previous receive.
+=== END
+=== CASE M6/big.none_then_L.1_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_n_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_L.2_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_n_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_L.3_incr_again
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_n_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_L.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_n_L
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_n_L@a
+zfsbcapc/M6/srv/big_n_L@b
+zfsbcapc/M6/srv/big_n_L@c
+--- stderr
+=== END
+=== CASE M6/big.none_then_L.5_F_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_n_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_L.6_F_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_n_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_none.1_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_Lc_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_none.2_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_Lc_n
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: incremental send stream requires -L (--large-block), to match previous receive.
+=== END
+=== CASE M6/big.Lc_then_none.3_incr_again
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_Lc_n
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: most recent snapshot of zfsbcapc/M6/srv/big_Lc_n does not
+match incremental source
+=== END
+=== CASE M6/big.Lc_then_none.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_Lc_n
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_Lc_n@a
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_none.5_F_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_Lc_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_none.6_F_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_Lc_n_F
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: incremental send stream requires -L (--large-block), to match previous receive.
+=== END
+=== CASE M6/big.none_then_Lc.1_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_n_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_Lc.2_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_n_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_Lc.3_incr_again
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_n_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_Lc.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_n_Lc
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_n_Lc@a
+zfsbcapc/M6/srv/big_n_Lc@b
+zfsbcapc/M6/srv/big_n_Lc@c
+--- stderr
+=== END
+=== CASE M6/big.none_then_Lc.5_F_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_n_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_Lc.6_F_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_n_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.c_then_none.1_full
+--- cmd
+zfs send -c zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_c_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.c_then_none.2_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_c_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.c_then_none.3_incr_again
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_c_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.c_then_none.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_c_n
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_c_n@a
+zfsbcapc/M6/srv/big_c_n@b
+zfsbcapc/M6/srv/big_c_n@c
+--- stderr
+=== END
+=== CASE M6/big.c_then_none.5_F_full
+--- cmd
+zfs send -c zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_c_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.c_then_none.6_F_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_c_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_c.1_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_n_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_c.2_incr
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_n_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_c.3_incr_again
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_n_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_c.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_n_c
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_n_c@a
+zfsbcapc/M6/srv/big_n_c@b
+zfsbcapc/M6/srv/big_n_c@c
+--- stderr
+=== END
+=== CASE M6/big.none_then_c.5_F_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_n_c_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.none_then_c.6_F_incr
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_n_c_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.L_then_c.1_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_L_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.L_then_c.2_incr
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_L_c
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: incremental send stream requires -L (--large-block), to match previous receive.
+=== END
+=== CASE M6/big.L_then_c.3_incr_again
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_L_c
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: most recent snapshot of zfsbcapc/M6/srv/big_L_c does not
+match incremental source
+=== END
+=== CASE M6/big.L_then_c.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_L_c
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_L_c@a
+--- stderr
+=== END
+=== CASE M6/big.L_then_c.5_F_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_L_c_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.L_then_c.6_F_incr
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_L_c_F
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: incremental send stream requires -L (--large-block), to match previous receive.
+=== END
+=== CASE M6/big.c_then_L.1_full
+--- cmd
+zfs send -c zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_c_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.c_then_L.2_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_c_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.c_then_L.3_incr_again
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_c_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.c_then_L.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_c_L
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_c_L@a
+zfsbcapc/M6/srv/big_c_L@b
+zfsbcapc/M6/srv/big_c_L@c
+--- stderr
+=== END
+=== CASE M6/big.c_then_L.5_F_full
+--- cmd
+zfs send -c zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_c_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.c_then_L.6_F_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_c_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.L_then_Lc.1_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_L_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.L_then_Lc.2_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_L_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.L_then_Lc.3_incr_again
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_L_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.L_then_Lc.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_L_Lc
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_L_Lc@a
+zfsbcapc/M6/srv/big_L_Lc@b
+zfsbcapc/M6/srv/big_L_Lc@c
+--- stderr
+=== END
+=== CASE M6/big.L_then_Lc.5_F_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_L_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.L_then_Lc.6_F_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_L_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_L.1_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_Lc_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_L.2_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_Lc_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_L.3_incr_again
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_Lc_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_L.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_Lc_L
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_Lc_L@a
+zfsbcapc/M6/srv/big_Lc_L@b
+zfsbcapc/M6/srv/big_Lc_L@c
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_L.5_F_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_Lc_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_L.6_F_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_Lc_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_Lc.1_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_Lc_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_Lc.2_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/big_Lc_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_Lc.3_incr_again
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/big_Lc_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_Lc.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/big_Lc_Lc
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/big_Lc_Lc@a
+zfsbcapc/M6/srv/big_Lc_Lc@b
+zfsbcapc/M6/srv/big_Lc_Lc@c
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_Lc.5_F_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/big_Lc_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/big.Lc_then_Lc.6_F_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -F -u zfsbcapc/M6/srv/big_Lc_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.00_src_props
+--- cmd
+zfs get -H -o name,property,value recordsize zfsbcapc/M6/cs/small
+--- rc
+0
+--- stdout
+zfsbcapc/M6/cs/small	recordsize	128K
+--- stderr
+=== END
+=== CASE M6/small.none_then_none.1_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_n_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_none.2_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_n_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_none.3_incr_again
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_n_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_none.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_n_n
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_n_n@a
+zfsbcapc/M6/srv/small_n_n@b
+zfsbcapc/M6/srv/small_n_n@c
+--- stderr
+=== END
+=== CASE M6/small.none_then_none.5_F_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_n_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_none.6_F_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_n_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_none.1_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_L_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_none.2_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_L_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_none.3_incr_again
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_L_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_none.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_L_n
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_L_n@a
+zfsbcapc/M6/srv/small_L_n@b
+zfsbcapc/M6/srv/small_L_n@c
+--- stderr
+=== END
+=== CASE M6/small.L_then_none.5_F_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_L_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_none.6_F_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_L_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_L.1_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_n_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_L.2_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_n_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_L.3_incr_again
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_n_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_L.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_n_L
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_n_L@a
+zfsbcapc/M6/srv/small_n_L@b
+zfsbcapc/M6/srv/small_n_L@c
+--- stderr
+=== END
+=== CASE M6/small.none_then_L.5_F_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_n_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_L.6_F_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_n_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_none.1_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_Lc_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_none.2_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_Lc_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_none.3_incr_again
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_Lc_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_none.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_Lc_n
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_Lc_n@a
+zfsbcapc/M6/srv/small_Lc_n@b
+zfsbcapc/M6/srv/small_Lc_n@c
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_none.5_F_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_Lc_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_none.6_F_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_Lc_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_Lc.1_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_n_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_Lc.2_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_n_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_Lc.3_incr_again
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_n_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_Lc.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_n_Lc
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_n_Lc@a
+zfsbcapc/M6/srv/small_n_Lc@b
+zfsbcapc/M6/srv/small_n_Lc@c
+--- stderr
+=== END
+=== CASE M6/small.none_then_Lc.5_F_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_n_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_Lc.6_F_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_n_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.c_then_none.1_full
+--- cmd
+zfs send -c zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_c_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.c_then_none.2_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_c_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.c_then_none.3_incr_again
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_c_n
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.c_then_none.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_c_n
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_c_n@a
+zfsbcapc/M6/srv/small_c_n@b
+zfsbcapc/M6/srv/small_c_n@c
+--- stderr
+=== END
+=== CASE M6/small.c_then_none.5_F_full
+--- cmd
+zfs send -c zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_c_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.c_then_none.6_F_incr
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_c_n_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_c.1_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_n_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_c.2_incr
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_n_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_c.3_incr_again
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_n_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_c.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_n_c
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_n_c@a
+zfsbcapc/M6/srv/small_n_c@b
+zfsbcapc/M6/srv/small_n_c@c
+--- stderr
+=== END
+=== CASE M6/small.none_then_c.5_F_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_n_c_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.none_then_c.6_F_incr
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_n_c_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_c.1_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_L_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_c.2_incr
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_L_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_c.3_incr_again
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_L_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_c.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_L_c
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_L_c@a
+zfsbcapc/M6/srv/small_L_c@b
+zfsbcapc/M6/srv/small_L_c@c
+--- stderr
+=== END
+=== CASE M6/small.L_then_c.5_F_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_L_c_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_c.6_F_incr
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_L_c_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.c_then_L.1_full
+--- cmd
+zfs send -c zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_c_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.c_then_L.2_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_c_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.c_then_L.3_incr_again
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_c_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.c_then_L.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_c_L
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_c_L@a
+zfsbcapc/M6/srv/small_c_L@b
+zfsbcapc/M6/srv/small_c_L@c
+--- stderr
+=== END
+=== CASE M6/small.c_then_L.5_F_full
+--- cmd
+zfs send -c zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_c_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.c_then_L.6_F_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_c_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_Lc.1_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_L_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_Lc.2_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_L_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_Lc.3_incr_again
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_L_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_Lc.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_L_Lc
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_L_Lc@a
+zfsbcapc/M6/srv/small_L_Lc@b
+zfsbcapc/M6/srv/small_L_Lc@c
+--- stderr
+=== END
+=== CASE M6/small.L_then_Lc.5_F_full
+--- cmd
+zfs send -L  zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_L_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.L_then_Lc.6_F_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_L_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_L.1_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_Lc_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_L.2_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_Lc_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_L.3_incr_again
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_Lc_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_L.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_Lc_L
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_Lc_L@a
+zfsbcapc/M6/srv/small_Lc_L@b
+zfsbcapc/M6/srv/small_Lc_L@c
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_L.5_F_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_Lc_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_L.6_F_incr
+--- cmd
+zfs send -L  -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_Lc_L_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_Lc.1_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_Lc_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_Lc.2_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -u zfsbcapc/M6/srv/small_Lc_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_Lc.3_incr_again
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/small@b zfsbcapc/M6/cs/small@c | zfs receive -u zfsbcapc/M6/srv/small_Lc_Lc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_Lc.4_snaps
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/M6/srv/small_Lc_Lc
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/small_Lc_Lc@a
+zfsbcapc/M6/srv/small_Lc_Lc@b
+zfsbcapc/M6/srv/small_Lc_Lc@c
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_Lc.5_F_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/small@a | zfs receive -u zfsbcapc/M6/srv/small_Lc_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/small.Lc_then_Lc.6_F_incr
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/small@a zfsbcapc/M6/cs/small@b | zfs receive -F -u zfsbcapc/M6/srv/small_Lc_Lc_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.none_none_L.1_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/chain_none_none_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.none_none_L.2_incr_b
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/chain_none_none_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.none_none_L.3_incr_c
+--- cmd
+zfs send -L -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/chain_none_none_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.none_L_none.1_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/chain_none_L_none
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.none_L_none.2_incr_b
+--- cmd
+zfs send -L -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/chain_none_L_none
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.none_L_none.3_incr_c
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/chain_none_L_none
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: incremental send stream requires -L (--large-block), to match previous receive.
+=== END
+=== CASE M6/chain.none_L_L.1_full
+--- cmd
+zfs send  zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/chain_none_L_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.none_L_L.2_incr_b
+--- cmd
+zfs send -L -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/chain_none_L_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.none_L_L.3_incr_c
+--- cmd
+zfs send -L -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/chain_none_L_L
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.L_L_none.1_full
+--- cmd
+zfs send -L zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/chain_L_L_none
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.L_L_none.2_incr_b
+--- cmd
+zfs send -L -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/chain_L_L_none
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.L_L_none.3_incr_c
+--- cmd
+zfs send  -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/chain_L_L_none
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: incremental send stream requires -L (--large-block), to match previous receive.
+=== END
+=== CASE M6/chain.Lc_Lc_c.1_full
+--- cmd
+zfs send -L -c zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/chain_Lc_Lc_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.Lc_Lc_c.2_incr_b
+--- cmd
+zfs send -L -c -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | zfs receive -u zfsbcapc/M6/srv/chain_Lc_Lc_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/chain.Lc_Lc_c.3_incr_c
+--- cmd
+zfs send -c -i zfsbcapc/M6/cs/big@b zfsbcapc/M6/cs/big@c | zfs receive -u zfsbcapc/M6/srv/chain_Lc_Lc_c
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: incremental send stream requires -L (--large-block), to match previous receive.
+=== END
+=== CASE M6/resumed.1_full
+--- cmd
+zfs send -L zfsbcapc/M6/cs/big@a | zfs receive -u zfsbcapc/M6/srv/resumed_mismatch
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M6/resumed.2_incr_cut_without_L
+--- cmd
+zfs send -i zfsbcapc/M6/cs/big@a zfsbcapc/M6/cs/big@b | head -c 400000 | zfs receive -s -u zfsbcapc/M6/srv/resumed_mismatch
+--- rc
+1
+--- pipestatus
+141 141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: incremental send stream requires -L (--large-block), to match previous receive.
+=== END
+=== CASE M6/resumed.3_token
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M6/srv/resumed_mismatch
+--- rc
+0
+--- stdout
+zfsbcapc/M6/srv/resumed_mismatch	receive_resume_token	-
+--- stderr
+=== END

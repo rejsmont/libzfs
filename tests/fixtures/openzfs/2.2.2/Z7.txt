@@ -1,0 +1,387 @@
+##### SECTION Z7 (server-side zfs get -s local org.zfsbackup:* and zfs destroy of a snapshot on a raw copy that has no key)  tag=C  zfs-2.2.2-0ubuntu9.5
+=== CASE Z7/00_raw_full
+--- cmd
+zfs send -w zfsbcapc/Z7/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z7/01_raw_incr_b
+--- cmd
+zfs send -w -i zfsbcapc/Z7/cs/enc@a zfsbcapc/Z7/cs/enc@b | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z7/02_raw_incr_c
+--- cmd
+zfs send -w -i zfsbcapc/Z7/cs/enc@b zfsbcapc/Z7/cs/enc@c | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z7/10_keystatus
+--- cmd
+zfs get -H -o name,property,value keystatus,encryptionroot zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+zfsbcapc/Z7/srv/rx	keystatus	unavailable
+zfsbcapc/Z7/srv/rx	encryptionroot	zfsbcapc/Z7/srv/rx
+--- stderr
+=== END
+=== CASE Z7/11_list_cols
+--- cmd
+zfs list -H -t snapshot -o name,createtxg,guid,userrefs,clones,encryption,keystatus -r zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+zfsbcapc/Z7/srv/rx@a	1866	4409692572737291494	0	-	aes-256-gcm	unavailable
+zfsbcapc/Z7/srv/rx@b	1870	17345096454384145779	0	-	aes-256-gcm	unavailable
+zfsbcapc/Z7/srv/rx@c	1874	7866789106285975046	0	-	aes-256-gcm	unavailable
+--- stderr
+=== END
+=== CASE Z7/20_get_local_all
+--- cmd
+zfs get -H -s local all zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+zfsbcapc/Z7/srv/rx	keylocation	prompt	local
+zfsbcapc/Z7/srv/rx	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	local
+zfsbcapc/Z7/srv/rx	org.zfsbackup:source_dataset	pool/data	local
+zfsbcapc/Z7/srv/rx	org.zfsbackup:client_id	client-1	local
+zfsbcapc/Z7/srv/rx	org.zfsbackup:anchor.d1	snap_20260101000000	local
+--- stderr
+=== END
+=== CASE Z7/21_get_local_org
+--- cmd
+zfs get -H -s local -o name,property,value,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,org.zfsbackup:anchor.d1 zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+zfsbcapc/Z7/srv/rx	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	local
+zfsbcapc/Z7/srv/rx	org.zfsbackup:client_id	client-1	local
+zfsbcapc/Z7/srv/rx	org.zfsbackup:source_dataset	pool/data	local
+zfsbcapc/Z7/srv/rx	org.zfsbackup:anchor.d1	snap_20260101000000	local
+--- stderr
+=== END
+=== CASE Z7/22_get_local_recursive
+--- cmd
+zfs get -H -r -s local -o name,property,value org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset zfsbcapc/Z7/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z7/srv/rx	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==
+zfsbcapc/Z7/srv/rx	org.zfsbackup:client_id	client-1
+zfsbcapc/Z7/srv/rx	org.zfsbackup:source_dataset	pool/data
+--- stderr
+=== END
+=== CASE Z7/23_get_local_wildcard
+--- cmd
+zfs get -H -s local org.zfsbackup:* zfsbcapc/Z7/srv/rx
+--- rc
+2
+--- stdout
+--- stderr
+bad property list: invalid property 'org.zfsbackup:*'
+usage:
+	get [-rHp] [-d max] [-o "all" | field[,...]]
+	    [-t type[,...]] [-s source[,...]]
+	    <"all" | property[,...]> [filesystem|volume|snapshot|bookmark] ...
+
+The following properties are supported:
+
+	PROPERTY       EDIT  INHERIT   VALUES
+
+	available        NO       NO   <size>
+	clones           NO       NO   <dataset>[,...]
+	compressratio    NO       NO   <1.00x or higher if compressed>
+	createtxg        NO       NO   <uint64>
+	creation         NO       NO   <date>
+	defer_destroy    NO       NO   yes | no
+	encryptionroot   NO       NO   <filesystem | volume>
+	filesystem_count  NO       NO   <count>
+	guid             NO       NO   <uint64>
+	keystatus        NO       NO   none | unavailable | available
+	logicalreferenced  NO       NO   <size>
+	logicalused      NO       NO   <size>
+	mounted          NO       NO   yes | no
+	objsetid         NO       NO   <uint64>
+	origin           NO       NO   <snapshot>
+	receive_resume_token  NO       NO   <string token>
+	redact_snaps     NO       NO   <snapshot>[,...]
+	refcompressratio  NO       NO   <1.00x or higher if compressed>
+	referenced       NO       NO   <size>
+	snapshot_count   NO       NO   <count>
+	snapshots_changed  NO       NO   <date>
+	type             NO       NO   filesystem | volume | snapshot | bookmark
+	used             NO       NO   <size>
+	usedbychildren   NO       NO   <size>
+	usedbydataset    NO       NO   <size>
+	usedbyrefreservation  NO       NO   <size>
+	usedbysnapshots  NO       NO   <size>
+	userrefs         NO       NO   <count>
+	written          NO       NO   <size>
+	aclinherit      YES      YES   discard | noallow | restricted | passthrough | passthrough-x
+	aclmode         YES      YES   discard | groupmask | passthrough | restricted
+	acltype         YES      YES   off | nfsv4 | posix
+	atime           YES      YES   on | off
+	canmount        YES       NO   on | off | noauto
+	casesensitivity  NO      YES   sensitive | insensitive | mixed
+	checksum        YES      YES   on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein | edonr | blake3
+	compression     YES      YES   on | off | lzjb | gzip | gzip-[1-9] | zle | lz4 | zstd | zstd-[1-19] | zstd-fast | zstd-fast-[1-10,20,30,40,50,60,70,80,90,100,500,1000]
+	context         YES       NO   <selinux context>
+	copies          YES      YES   1 | 2 | 3
+	dedup           YES      YES   on | off | verify | sha256[,verify] | sha512[,verify] | skein[,verify] | edonr,verify | blake3[,verify]
+	defcontext      YES       NO   <selinux defcontext>
+	devices         YES      YES   on | off
+	dnodesize       YES      YES   legacy | auto | 1k | 2k | 4k | 8k | 16k
+	encryption       NO      YES   on | off | aes-128-ccm | aes-192-ccm | aes-256-ccm | aes-128-gcm | aes-192-gcm | aes-256-gcm
+	exec            YES      YES   on | off
+	filesystem_limit YES       NO   <count> | none
+	fscontext       YES       NO   <selinux fscontext>
+	keyformat        NO       NO   none | raw | hex | passphrase
+	keylocation     YES       NO   prompt | <file URI> | <https URL> | <http URL>
+	logbias         YES      YES   latency | throughput
+	mlslabel        YES      YES   <sensitivity label>
+	mountpoint      YES      YES   <path> | legacy | none
+	nbmand          YES      YES   on | off
+	normalization    NO      YES   none | formC | formD | formKC | formKD
+	overlay         YES      YES   on | off
+	pbkdf2iters      NO       NO   <iters>
+	primarycache    YES      YES   all | none | metadata
+	quota           YES       NO   <size> | none
+	readonly        YES      YES   on | off
+	recordsize      YES      YES   512 to 1M, power of 2
+	redundant_metadata YES      YES   all | most | some | none
+	refquota        YES       NO   <size> | none
+	refreservation  YES       NO   <size> | none
+	relatime        YES      YES   on | off
+	reservation     YES       NO   <size> | none
+	rootcontext     YES       NO   <selinux rootcontext>
+	secondarycache  YES      YES   all | none | metadata
+	setuid          YES      YES   on | off
+	sharenfs        YES      YES   on | off | NFS share options
+	sharesmb        YES      YES   on | off | SMB share options
+	snapdev         YES      YES   hidden | visible
+	snapdir         YES      YES   hidden | visible
+	snapshot_limit  YES       NO   <count> | none
+	special_small_blocks YES      YES   zero or 512 to 1M, power of 2
+	sync            YES      YES   standard | always | disabled
+	utf8only         NO      YES   on | off
+	version         YES       NO   1 | 2 | 3 | 4 | 5 | current
+	volblocksize     NO      YES   512 to 128k, power of 2
+	volmode         YES      YES   default | full | geom | dev | none
+	volsize         YES       NO   <size>
+	vscan           YES      YES   on | off
+	xattr           YES      YES   on | off | dir | sa
+	zoned           YES      YES   on | off
+	userused@...     NO       NO   <size>
+	groupused@...    NO       NO   <size>
+	projectused@...  NO       NO   <size>
+	userobjused@...  NO       NO   <size>
+	groupobjused@...  NO       NO   <size>
+	projectobjused@...  NO       NO   <size>
+	userquota@...   YES       NO   <size> | none
+	groupquota@...  YES       NO   <size> | none
+	projectquota@... YES       NO   <size> | none
+	userobjquota@... YES       NO   <size> | none
+	groupobjquota@... YES       NO   <size> | none
+	projectobjquota@... YES       NO   <size> | none
+	written@<snap>   NO       NO   <size>
+	written#<bookmark>  NO       NO   <size>
+
+Sizes are specified in bytes with standard units such as K, M, G, etc.
+
+User-defined properties can be specified by using a name containing a colon (:).
+
+The {user|group|project}[obj]{used|quota}@ properties must be appended with
+a user|group|project specifier of one of these forms:
+    POSIX name      (eg: "matt")
+    POSIX id        (eg: "126829")
+    SMB name@domain (eg: "matt@sun")
+    SMB SID         (eg: "S-1-234-567-89")
+=== END
+=== CASE Z7/24_get_local_received_all
+--- cmd
+zfs get -H -s local,received -o name,property,value,source all zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+zfsbcapc/Z7/srv/rx	keylocation	prompt	local
+zfsbcapc/Z7/srv/rx	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	local
+zfsbcapc/Z7/srv/rx	org.zfsbackup:source_dataset	pool/data	local
+zfsbcapc/Z7/srv/rx	org.zfsbackup:client_id	client-1	local
+zfsbcapc/Z7/srv/rx	org.zfsbackup:anchor.d1	snap_20260101000000	local
+--- stderr
+=== END
+=== CASE Z7/25_get_value
+--- cmd
+zfs get -H -o value org.zfsbackup:config zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==
+--- stderr
+=== END
+=== CASE Z7/30_set_user_prop_keyless
+--- cmd
+zfs set org.zfsbackup:anchor.d2=x zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z7/31_inherit_user_prop_keyless
+--- cmd
+zfs inherit org.zfsbackup:anchor.d2 zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z7/40_dry_destroy_single
+--- cmd
+zfs destroy -n -v -p zfsbcapc/Z7/srv/rx@a
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/Z7/srv/rx@a
+reclaim	84992
+--- stderr
+=== END
+=== CASE Z7/41_dry_destroy_batch
+--- cmd
+zfs destroy -n -v -p zfsbcapc/Z7/srv/rx@a,b
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/Z7/srv/rx@a
+destroy	zfsbcapc/Z7/srv/rx@b
+reclaim	169984
+--- stderr
+=== END
+=== CASE Z7/42_destroy_single
+--- cmd
+zfs destroy -v -p zfsbcapc/Z7/srv/rx@a
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/Z7/srv/rx@a
+reclaim	84992
+--- stderr
+=== END
+=== CASE Z7/43_list
+--- cmd
+zfs list -H -t snapshot -o name,keystatus -r zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+zfsbcapc/Z7/srv/rx@b	unavailable
+zfsbcapc/Z7/srv/rx@c	unavailable
+--- stderr
+=== END
+=== CASE Z7/44_destroy_batch
+--- cmd
+zfs destroy -v -p zfsbcapc/Z7/srv/rx@b
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/Z7/srv/rx@b
+reclaim	84992
+--- stderr
+=== END
+=== CASE Z7/45_list
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+zfsbcapc/Z7/srv/rx@c
+--- stderr
+=== END
+=== CASE Z7/50_raw_incr_after_destroys
+--- cmd
+zfs send -w -i zfsbcapc/Z7/cs/enc@c zfsbcapc/Z7/cs/enc@d | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z7/51_list
+--- cmd
+zfs list -H -t snapshot -o name -r zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+zfsbcapc/Z7/srv/rx@c
+zfsbcapc/Z7/srv/rx@d
+--- stderr
+=== END
+=== CASE Z7/60_snapshot_keyless
+--- cmd
+zfs snapshot zfsbcapc/Z7/srv/rx@srv1
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z7/61_hold_keyless
+--- cmd
+zfs hold keep zfsbcapc/Z7/srv/rx@srv1
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z7/62_destroy_held_keyless
+--- cmd
+zfs destroy -v -p zfsbcapc/Z7/srv/rx@srv1
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/Z7/srv/rx@srv1
+reclaim	0
+--- stderr
+cannot destroy snapshot zfsbcapc/Z7/srv/rx@srv1: dataset is busy
+=== END
+=== CASE Z7/63_release
+--- cmd
+zfs release keep zfsbcapc/Z7/srv/rx@srv1
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z7/64_destroy_keyless_local_snapshot
+--- cmd
+zfs destroy -v -p zfsbcapc/Z7/srv/rx@srv1
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/Z7/srv/rx@srv1
+reclaim	0
+--- stderr
+=== END
+=== CASE Z7/65_list_final
+--- cmd
+zfs list -H -t snapshot -o name,userrefs,keystatus -r zfsbcapc/Z7/srv/rx
+--- rc
+0
+--- stdout
+zfsbcapc/Z7/srv/rx@c	0	unavailable
+zfsbcapc/Z7/srv/rx@d	0	unavailable
+--- stderr
+=== END

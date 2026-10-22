@@ -1,0 +1,647 @@
+##### SECTION M3_Z8 (destroy failures: held, cloned, busy (send in progress), recursive child hold; batch vs single; dry runs)  tag=C  zfs-2.4.1-1ubuntu5.1
+=== CASE M3_Z8/held.00_holds
+--- cmd
+zfs holds -H zfsbcapc/M3_Z8/held@s2
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/held@s2	keep	Thu Oct 22 02:38 2026
+--- stderr
+=== END
+=== CASE M3_Z8/held.01_list_start
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/held
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/held	-	-
+zfsbcapc/M3_Z8/held@s1	0	-
+zfsbcapc/M3_Z8/held@s2	1	-
+zfsbcapc/M3_Z8/held@s3	0	-
+zfsbcapc/M3_Z8/held@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/held.10_dry_batch
+--- cmd
+zfs destroy -n -v -p zfsbcapc/M3_Z8/held@s1,s2,s3
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/held@s1
+destroy	zfsbcapc/M3_Z8/held@s2
+destroy	zfsbcapc/M3_Z8/held@s3
+reclaim	41984
+--- stderr
+=== END
+=== CASE M3_Z8/held.11_dry_single
+--- cmd
+zfs destroy -n -v -p zfsbcapc/M3_Z8/held@s2
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/held@s2
+reclaim	14336
+--- stderr
+=== END
+=== CASE M3_Z8/held.12_dry_range
+--- cmd
+zfs destroy -n -v -p zfsbcapc/M3_Z8/held@s1%s3
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/held@s1
+destroy	zfsbcapc/M3_Z8/held@s2
+destroy	zfsbcapc/M3_Z8/held@s3
+reclaim	41984
+--- stderr
+=== END
+=== CASE M3_Z8/held.20_batch
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/held@s1,s2,s3
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/held@s1
+destroy	zfsbcapc/M3_Z8/held@s2
+destroy	zfsbcapc/M3_Z8/held@s3
+reclaim	41984
+--- stderr
+cannot destroy snapshot zfsbcapc/M3_Z8/held@s2: it's being held. Run 'zfs holds -r zfsbcapc/M3_Z8/held@s2' to see holders.
+=== END
+=== CASE M3_Z8/held.21_list_after_batch
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/held
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/held	-	-
+zfsbcapc/M3_Z8/held@s1	0	-
+zfsbcapc/M3_Z8/held@s2	1	-
+zfsbcapc/M3_Z8/held@s3	0	-
+zfsbcapc/M3_Z8/held@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/held.30_single
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/held@s2
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/held@s2
+reclaim	14336
+--- stderr
+cannot destroy snapshot zfsbcapc/M3_Z8/held@s2: it's being held. Run 'zfs holds -r zfsbcapc/M3_Z8/held@s2' to see holders.
+=== END
+=== CASE M3_Z8/held.31_list_after_single
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/held
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/held	-	-
+zfsbcapc/M3_Z8/held@s1	0	-
+zfsbcapc/M3_Z8/held@s2	1	-
+zfsbcapc/M3_Z8/held@s3	0	-
+zfsbcapc/M3_Z8/held@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/held.40_range
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/held@s1%s3
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/held@s1
+destroy	zfsbcapc/M3_Z8/held@s2
+destroy	zfsbcapc/M3_Z8/held@s3
+reclaim	41984
+--- stderr
+cannot destroy snapshot zfsbcapc/M3_Z8/held@s2: it's being held. Run 'zfs holds -r zfsbcapc/M3_Z8/held@s2' to see holders.
+=== END
+=== CASE M3_Z8/held.41_list_after_range
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/held
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/held	-	-
+zfsbcapc/M3_Z8/held@s1	0	-
+zfsbcapc/M3_Z8/held@s2	1	-
+zfsbcapc/M3_Z8/held@s3	0	-
+zfsbcapc/M3_Z8/held@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/held.50_control_batch_without_held
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/held@s1,s3
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/held@s1
+destroy	zfsbcapc/M3_Z8/held@s3
+reclaim	27648
+--- stderr
+=== END
+=== CASE M3_Z8/held.51_list_after_control
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/held
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/held	-	-
+zfsbcapc/M3_Z8/held@s2	1	-
+zfsbcapc/M3_Z8/held@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/held.60_dry_control
+--- cmd
+zfs destroy -n -v -p zfsbcapc/M3_Z8/held@s4
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/held@s4
+reclaim	0
+--- stderr
+=== END
+=== CASE M3_Z8/cloned.01_list_start
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/cloned
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/cloned	-	-
+zfsbcapc/M3_Z8/cloned@s1	0	-
+zfsbcapc/M3_Z8/cloned@s2	0	zfsbcapc/M3_Z8/clone1
+zfsbcapc/M3_Z8/cloned@s3	0	-
+zfsbcapc/M3_Z8/cloned@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/cloned.10_dry_batch
+--- cmd
+zfs destroy -n -v -p zfsbcapc/M3_Z8/cloned@s1,s2,s3
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/cloned@s1
+destroy	zfsbcapc/M3_Z8/cloned@s2
+destroy	zfsbcapc/M3_Z8/cloned@s3
+--- stderr
+cannot destroy 'zfsbcapc/M3_Z8/cloned@s2': snapshot has dependent clones
+use '-R' to destroy the following datasets:
+zfsbcapc/M3_Z8/clone1
+=== END
+=== CASE M3_Z8/cloned.11_dry_single
+--- cmd
+zfs destroy -n -v -p zfsbcapc/M3_Z8/cloned@s2
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/cloned@s2
+--- stderr
+cannot destroy 'zfsbcapc/M3_Z8/cloned@s2': snapshot has dependent clones
+use '-R' to destroy the following datasets:
+zfsbcapc/M3_Z8/clone1
+=== END
+=== CASE M3_Z8/cloned.12_dry_range
+--- cmd
+zfs destroy -n -v -p zfsbcapc/M3_Z8/cloned@s1%s3
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/cloned@s1
+destroy	zfsbcapc/M3_Z8/cloned@s2
+destroy	zfsbcapc/M3_Z8/cloned@s3
+--- stderr
+cannot destroy 'zfsbcapc/M3_Z8/cloned@s2': snapshot has dependent clones
+use '-R' to destroy the following datasets:
+zfsbcapc/M3_Z8/clone1
+=== END
+=== CASE M3_Z8/cloned.20_batch
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/cloned@s1,s2,s3
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/cloned@s1
+destroy	zfsbcapc/M3_Z8/cloned@s2
+destroy	zfsbcapc/M3_Z8/cloned@s3
+--- stderr
+cannot destroy 'zfsbcapc/M3_Z8/cloned@s2': snapshot has dependent clones
+use '-R' to destroy the following datasets:
+zfsbcapc/M3_Z8/clone1
+=== END
+=== CASE M3_Z8/cloned.21_list_after_batch
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/cloned
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/cloned	-	-
+zfsbcapc/M3_Z8/cloned@s1	0	-
+zfsbcapc/M3_Z8/cloned@s2	0	zfsbcapc/M3_Z8/clone1
+zfsbcapc/M3_Z8/cloned@s3	0	-
+zfsbcapc/M3_Z8/cloned@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/cloned.30_single
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/cloned@s2
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/cloned@s2
+--- stderr
+cannot destroy 'zfsbcapc/M3_Z8/cloned@s2': snapshot has dependent clones
+use '-R' to destroy the following datasets:
+zfsbcapc/M3_Z8/clone1
+=== END
+=== CASE M3_Z8/cloned.31_list_after_single
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/cloned
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/cloned	-	-
+zfsbcapc/M3_Z8/cloned@s1	0	-
+zfsbcapc/M3_Z8/cloned@s2	0	zfsbcapc/M3_Z8/clone1
+zfsbcapc/M3_Z8/cloned@s3	0	-
+zfsbcapc/M3_Z8/cloned@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/cloned.40_range
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/cloned@s1%s3
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/cloned@s1
+destroy	zfsbcapc/M3_Z8/cloned@s2
+destroy	zfsbcapc/M3_Z8/cloned@s3
+--- stderr
+cannot destroy 'zfsbcapc/M3_Z8/cloned@s2': snapshot has dependent clones
+use '-R' to destroy the following datasets:
+zfsbcapc/M3_Z8/clone1
+=== END
+=== CASE M3_Z8/cloned.41_list_after_range
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/cloned
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/cloned	-	-
+zfsbcapc/M3_Z8/cloned@s1	0	-
+zfsbcapc/M3_Z8/cloned@s2	0	zfsbcapc/M3_Z8/clone1
+zfsbcapc/M3_Z8/cloned@s3	0	-
+zfsbcapc/M3_Z8/cloned@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/cloned.50_control_batch_without_clone
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/cloned@s1,s3
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/cloned@s1
+destroy	zfsbcapc/M3_Z8/cloned@s3
+reclaim	29696
+--- stderr
+=== END
+=== CASE M3_Z8/cloned.51_list_after_control
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/cloned
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/cloned	-	-
+zfsbcapc/M3_Z8/cloned@s2	0	zfsbcapc/M3_Z8/clone1
+zfsbcapc/M3_Z8/cloned@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/cloned.60_two_clones_single
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/cloned@s4
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/cloned@s4
+--- stderr
+cannot destroy 'zfsbcapc/M3_Z8/cloned@s4': snapshot has dependent clones
+use '-R' to destroy the following datasets:
+zfsbcapc/M3_Z8/clone3
+zfsbcapc/M3_Z8/clone2
+=== END
+=== CASE M3_Z8/cloned.61_two_clones_dry
+--- cmd
+zfs destroy -n -v -p zfsbcapc/M3_Z8/cloned@s4
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/cloned@s4
+--- stderr
+cannot destroy 'zfsbcapc/M3_Z8/cloned@s4': snapshot has dependent clones
+use '-R' to destroy the following datasets:
+zfsbcapc/M3_Z8/clone3
+zfsbcapc/M3_Z8/clone2
+=== END
+=== CASE M3_Z8/busy.00_sender_running
+--- cmd
+pgrep -a -x zfs; pgrep -a -x sleep
+--- rc
+0
+--- stdout
+196608 zfs send zfsbcapc/M3_Z8/busy@s4
+196609 sleep 60
+--- stderr
+=== END
+=== CASE M3_Z8/busy.01_list_start
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/busy
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/busy	-	-
+zfsbcapc/M3_Z8/busy@s1	0	-
+zfsbcapc/M3_Z8/busy@s2	0	-
+zfsbcapc/M3_Z8/busy@s3	0	-
+zfsbcapc/M3_Z8/busy@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/busy.10_dry_batch
+--- cmd
+zfs destroy -n -v -p zfsbcapc/M3_Z8/busy@s3,s4
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/busy@s3
+destroy	zfsbcapc/M3_Z8/busy@s4
+reclaim	15360
+--- stderr
+=== END
+=== CASE M3_Z8/busy.11_dry_single
+--- cmd
+zfs destroy -n -v -p zfsbcapc/M3_Z8/busy@s4
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/busy@s4
+reclaim	0
+--- stderr
+=== END
+=== CASE M3_Z8/busy.20_batch
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/busy@s3,s4
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/busy@s3
+destroy	zfsbcapc/M3_Z8/busy@s4
+reclaim	15360
+--- stderr
+cannot destroy snapshot zfsbcapc/M3_Z8/busy@s4: dataset is busy
+=== END
+=== CASE M3_Z8/busy.21_list_after_batch
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/busy
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/busy	-	-
+zfsbcapc/M3_Z8/busy@s1	0	-
+zfsbcapc/M3_Z8/busy@s2	0	-
+zfsbcapc/M3_Z8/busy@s3	0	-
+zfsbcapc/M3_Z8/busy@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/busy.30_single
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/busy@s4
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/busy@s4
+reclaim	0
+--- stderr
+cannot destroy snapshot zfsbcapc/M3_Z8/busy@s4: dataset is busy
+=== END
+=== CASE M3_Z8/busy.31_list_after_single
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/busy
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/busy	-	-
+zfsbcapc/M3_Z8/busy@s1	0	-
+zfsbcapc/M3_Z8/busy@s2	0	-
+zfsbcapc/M3_Z8/busy@s3	0	-
+zfsbcapc/M3_Z8/busy@s4	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/busy.40_range
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/busy@s3%s4
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/busy@s3
+destroy	zfsbcapc/M3_Z8/busy@s4
+reclaim	15360
+--- stderr
+cannot destroy snapshot zfsbcapc/M3_Z8/busy@s4: dataset is busy
+=== END
+=== CASE M3_Z8/busy.50_control_other_snapshot
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/busy@s1
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/busy@s1
+reclaim	14336
+--- stderr
+=== END
+=== CASE M3_Z8/busy.60_sender_gone
+--- cmd
+pgrep -a -x zfs; pgrep -a -x sleep; true
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M3_Z8/busy.61_batch_after_sender_gone
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/busy@s3,s4
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/busy@s3
+destroy	zfsbcapc/M3_Z8/busy@s4
+reclaim	15360
+--- stderr
+=== END
+=== CASE M3_Z8/busy.62_list_after
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/busy
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/busy	-	-
+zfsbcapc/M3_Z8/busy@s2	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/rec.01_list_start
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/rec
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/rec	-	-
+zfsbcapc/M3_Z8/rec@t1	0	-
+zfsbcapc/M3_Z8/rec@t2	0	-
+zfsbcapc/M3_Z8/rec@t3	0	-
+zfsbcapc/M3_Z8/rec/c	-	-
+zfsbcapc/M3_Z8/rec/c@t1	1	-
+zfsbcapc/M3_Z8/rec/c@t2	0	-
+zfsbcapc/M3_Z8/rec/c@t3	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/rec.10_dry_r
+--- cmd
+zfs destroy -n -v -p -r zfsbcapc/M3_Z8/rec@t1
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/rec@t1
+destroy	zfsbcapc/M3_Z8/rec/c@t1
+reclaim	14336
+--- stderr
+=== END
+=== CASE M3_Z8/rec.11_dry_r_batch
+--- cmd
+zfs destroy -n -v -p -r zfsbcapc/M3_Z8/rec@t1,t2
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/rec@t1
+destroy	zfsbcapc/M3_Z8/rec@t2
+destroy	zfsbcapc/M3_Z8/rec/c@t1
+destroy	zfsbcapc/M3_Z8/rec/c@t2
+reclaim	28672
+--- stderr
+=== END
+=== CASE M3_Z8/rec.20_r
+--- cmd
+zfs destroy -v -p -r zfsbcapc/M3_Z8/rec@t1
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/rec@t1
+destroy	zfsbcapc/M3_Z8/rec/c@t1
+reclaim	14336
+--- stderr
+cannot destroy snapshot zfsbcapc/M3_Z8/rec/c@t1: it's being held. Run 'zfs holds -r zfsbcapc/M3_Z8/rec/c@t1' to see holders.
+=== END
+=== CASE M3_Z8/rec.21_list_after_r
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/rec
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/rec	-	-
+zfsbcapc/M3_Z8/rec@t1	0	-
+zfsbcapc/M3_Z8/rec@t2	0	-
+zfsbcapc/M3_Z8/rec@t3	0	-
+zfsbcapc/M3_Z8/rec/c	-	-
+zfsbcapc/M3_Z8/rec/c@t1	1	-
+zfsbcapc/M3_Z8/rec/c@t2	0	-
+zfsbcapc/M3_Z8/rec/c@t3	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/rec.30_r_batch
+--- cmd
+zfs destroy -v -p -r zfsbcapc/M3_Z8/rec@t1,t2
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/rec@t1
+destroy	zfsbcapc/M3_Z8/rec@t2
+destroy	zfsbcapc/M3_Z8/rec/c@t1
+destroy	zfsbcapc/M3_Z8/rec/c@t2
+reclaim	28672
+--- stderr
+cannot destroy snapshot zfsbcapc/M3_Z8/rec/c@t1: it's being held. Run 'zfs holds -r zfsbcapc/M3_Z8/rec/c@t1' to see holders.
+=== END
+=== CASE M3_Z8/rec.31_list_after_r_batch
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/rec
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/rec	-	-
+zfsbcapc/M3_Z8/rec@t1	0	-
+zfsbcapc/M3_Z8/rec@t2	0	-
+zfsbcapc/M3_Z8/rec@t3	0	-
+zfsbcapc/M3_Z8/rec/c	-	-
+zfsbcapc/M3_Z8/rec/c@t1	1	-
+zfsbcapc/M3_Z8/rec/c@t2	0	-
+zfsbcapc/M3_Z8/rec/c@t3	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/rec.40_child_single
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/rec/c@t1
+--- rc
+1
+--- stdout
+destroy	zfsbcapc/M3_Z8/rec/c@t1
+reclaim	0
+--- stderr
+cannot destroy snapshot zfsbcapc/M3_Z8/rec/c@t1: it's being held. Run 'zfs holds -r zfsbcapc/M3_Z8/rec/c@t1' to see holders.
+=== END
+=== CASE M3_Z8/rec.50_parent_only_nonrecursive
+--- cmd
+zfs destroy -v -p zfsbcapc/M3_Z8/rec@t1
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/rec@t1
+reclaim	14336
+--- stderr
+=== END
+=== CASE M3_Z8/rec.51_list_after_parent_only
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/rec
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/rec	-	-
+zfsbcapc/M3_Z8/rec@t2	0	-
+zfsbcapc/M3_Z8/rec@t3	0	-
+zfsbcapc/M3_Z8/rec/c	-	-
+zfsbcapc/M3_Z8/rec/c@t1	1	-
+zfsbcapc/M3_Z8/rec/c@t2	0	-
+zfsbcapc/M3_Z8/rec/c@t3	0	-
+--- stderr
+=== END
+=== CASE M3_Z8/rec.60_control_r_no_hold
+--- cmd
+zfs destroy -v -p -r zfsbcapc/M3_Z8/rec@t3
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/M3_Z8/rec@t3
+destroy	zfsbcapc/M3_Z8/rec/c@t3
+reclaim	0
+--- stderr
+=== END
+=== CASE M3_Z8/rec.61_list_after_control
+--- cmd
+zfs list -H -t all -o name,userrefs,clones -r zfsbcapc/M3_Z8/rec
+--- rc
+0
+--- stdout
+zfsbcapc/M3_Z8/rec	-	-
+zfsbcapc/M3_Z8/rec@t2	0	-
+zfsbcapc/M3_Z8/rec/c	-	-
+zfsbcapc/M3_Z8/rec/c@t1	1	-
+zfsbcapc/M3_Z8/rec/c@t2	0	-
+--- stderr
+=== END
