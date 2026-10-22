@@ -274,6 +274,13 @@ class _BoundedErrors(list):
         self[keep] = '... %d lines omitted ...' % self._omitted
 
 
+def _append_error(errors, line):
+    """Append one stripped, non-empty stderr line to `errors`. Only the first line of a message is capitalised
+    (`cannot destroy ...` -> `Cannot destroy ...`): continuation lines carry dataset names and other verbatim text
+    (`pool/clone3`) that must stay byte-exact."""
+    errors.append(line[0].upper() + line[1:] if not errors else line)
+
+
 def _child_env() -> dict:
     """The environment every `zfs`/`zpool` child runs in: the caller's, with the C locale forced.
 
@@ -407,7 +414,7 @@ class Command:
                         break
                     error = line.strip()
                     if error:
-                        errors.append(error[0].upper() + error[1:])
+                        _append_error(errors, error)
             except (OSError, ValueError):
                 # The pipe was closed under us (reaped); whatever was read so far stands.
                 pass
@@ -475,7 +482,7 @@ class Command:
                     break
                 error = line.strip()
                 if error:
-                    errors.append(error[0].upper() + error[1:])
+                    _append_error(errors, error)
         thread = threading.Thread(target=reader, daemon=True)
         thread.start()
         return thread
@@ -506,7 +513,7 @@ class Command:
                                 break
                     error = bytes(line).decode('utf-8', errors='replace').strip()
                     if error:
-                        errors.append(error[0].upper() + error[1:] + (' [truncated]' if truncated else ''))
+                        _append_error(errors, error + (' [truncated]' if truncated else ''))
             except (OSError, ValueError):
                 # The pipe was closed under us (abort/reap); whatever was read so far stands.
                 pass
@@ -654,7 +661,7 @@ class StreamHandle:
                 for line in remainder.decode('utf-8', errors='replace').splitlines():
                     error = line.strip()
                     if error:
-                        self._errors.append(error[0].upper() + error[1:])
+                        _append_error(self._errors, error)
             self._close_pipe(stderr)
         # process.stdout is only ever piped on the send side (the receive
         # side opens it as DEVNULL); if it's a distinct file object from the
@@ -1927,7 +1934,7 @@ class SendCommand(Command):
         for line in stderr_lines:
             line = line.strip()
             if line:
-                errors.append(line[0].upper() + line[1:])
+                _append_error(errors, line)
         text = '\n'.join(errors)
         if info is None:
             if rc == 0:
@@ -2032,7 +2039,7 @@ class SendCommand(Command):
                 for line in remainder.splitlines():
                     error = line.strip()
                     if error:
-                        errors.append(error[0].upper() + error[1:])
+                        _append_error(errors, error)
             except Exception:
                 pass
         rc = process.poll()

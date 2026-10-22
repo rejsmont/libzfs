@@ -644,7 +644,7 @@ class TestSendStdoutEof:
 
     @pytest.mark.unit
     @pytest.mark.subprocess
-    def test_eof_then_nonzero_rc_raises_capitalised_stderr(self, mock_subprocess):
+    def test_eof_then_nonzero_rc_raises_stderr_with_first_line_capitalised(self, mock_subprocess):
         order = []
         process = self._eof_process(
             order, rc=1, stderr_bytes=b'cannot open dataset: does not exist\n  second problem\n\n')
@@ -653,7 +653,7 @@ class TestSendStdoutEof:
         with pytest.raises(Exception) as exc_info:
             SendCommand._exec_stream(['zfs', 'send', 'testpool/fs@snap'])
 
-        assert str(exc_info.value) == 'Cannot open dataset: does not exist\nSecond problem'
+        assert str(exc_info.value) == 'Cannot open dataset: does not exist\nsecond problem'
         assert order.count('wait') == 1
         assert 'stderr.eof' in order  # the reader reached EOF before the message was raised
         process.stderr.read.assert_not_called()
@@ -796,7 +796,7 @@ class TestSendStdoutEofRealChild:
 
         assert 'result' not in outcome
         assert isinstance(outcome.get('error'), Exception)
-        assert 'Disk exploded' in str(outcome['error'])
+        assert 'disk exploded' in str(outcome['error'])
         # A regression to the old spin (peek()/poll() in a tight loop until the child exits) would poll thousands of
         # times while the child floods stderr; the fixed code polls once per capture and then blocks in wait().
         assert len(outcome['polls']) <= 3, 'send EOF handling spun: %d poll() calls' % len(outcome['polls'])
@@ -1073,10 +1073,10 @@ class TestStreamStderrReaderRealChild:
             # 4000 stderr lines are bounded: 200 first + one marker + 200 last
             assert len(handle._errors) == 401
             assert handle._errors[0].startswith('Stderr line 0')
-            assert handle._errors[199].startswith('Stderr line 199')
+            assert handle._errors[199].startswith('stderr line 199')
             assert handle._errors[200] == '... 3600 lines omitted ...'
-            assert handle._errors[201].startswith('Stderr line 3800')
-            assert handle._errors[-1].startswith('Stderr line 3999')
+            assert handle._errors[201].startswith('stderr line 3800')
+            assert handle._errors[-1].startswith('stderr line 3999')
             return handle
 
         guard.run(body)
@@ -1103,7 +1103,7 @@ class TestStreamStderrReaderRealChild:
         message = guard.run(body)
         lines = message.split('\n')
         assert lines[0].startswith('Noise line 0')
-        assert lines[-1] == 'Fatal: it broke'
+        assert lines[-1] == 'fatal: it broke'
         assert len(lines) == 401
         (proc,) = guard.procs
         assert proc.returncode == 1
@@ -1133,10 +1133,10 @@ class TestStreamStderrReaderRealChild:
         message, handle = guard.run(body)
         lines = message.split('\n')
         assert lines[0].startswith('Recv line 0')
-        assert lines[-1] == 'Cannot receive: stream is bad'
+        assert lines[-1] == 'cannot receive: stream is bad'
         assert len(lines) == 401                       # bounded: 200 first + marker + 200 last
         assert lines[200] == '... 3601 lines omitted ...'
-        assert lines[199].startswith('Recv line 199')
+        assert lines[199].startswith('recv line 199')
         assert not handle._stderr_thread.is_alive()
         (proc,) = guard.procs
         assert proc.returncode == 1 and proc.stdin.closed and proc.stderr.closed
@@ -1235,7 +1235,7 @@ class TestStreamStderrReaderRealChild:
 
         lines = guard.run(body).split('\n')
         assert lines[0].startswith('Late line 0')
-        assert lines[-1] == 'Send failed: i/o error'
+        assert lines[-1] == 'send failed: i/o error'
         assert len(lines) == 401
         assert lines[200] == '... 601 lines omitted ...'
 
@@ -1393,7 +1393,7 @@ class TestStreamStderrReaderMocked:
         process.stderr.readline.side_effect = [b'  first \xff problem\n', b'\n', b'   \n', b'second\n', b'']
         errors = []
         Command._start_stderr_reader_bin(process, errors).join(5)
-        assert errors == ['First � problem', 'Second']
+        assert errors == ['First � problem', 'second']
 
     @pytest.mark.unit
     def test_reader_survives_a_pipe_closed_under_it(self):
@@ -1544,7 +1544,7 @@ class TestStreamStderrReaderMocked:
         handle = StreamHandle(process, stream)
         with pytest.raises(Exception) as exc:
             handle.close()
-        assert str(exc.value) == 'Oops: failed\nAnd more'
+        assert str(exc.value) == 'Oops: failed\nand more'
         process.stderr.read.assert_called_once()
         process.stderr.close.assert_called_once()
 
@@ -1789,7 +1789,7 @@ class TestStreamHandleCloseAndAbortRealChild:
         lines = message.split('\n')
         assert len(lines) <= 401
         assert lines[0].startswith('Line 0 ')
-        assert lines[-1] == 'Final line'
+        assert lines[-1] == 'final line'
         assert any(l.startswith('... ') and l.endswith(' lines omitted ...') for l in lines)
         assert len(message) < 200_000
 
@@ -2048,19 +2048,19 @@ class TestStderrLineTruncation:
         errors = self._read(data)
         assert len(errors) == 3
         assert errors[0] == 'A' + 'a' * (64 * 1024 - 1) + ' [truncated]'
-        assert errors[1:] == ['Next line', 'Last']
+        assert errors[1:] == ['next line', 'last']
 
     @pytest.mark.unit
     def test_a_line_that_just_fits_is_not_truncated(self):
         body = b'b' * (64 * 1024 - 2)                      # + '\n' = exactly the read limit - 1
-        assert self._read(body + b'\nafter\n') == ['B' + 'b' * (64 * 1024 - 3), 'After']
+        assert self._read(body + b'\nafter\n') == ['B' + 'b' * (64 * 1024 - 3), 'after']
         exact = b'c' * (64 * 1024 - 1)                      # + '\n' = exactly the read limit, ends with a newline
-        assert self._read(exact + b'\nafter\n') == ['C' + 'c' * (64 * 1024 - 2), 'After']
+        assert self._read(exact + b'\nafter\n') == ['C' + 'c' * (64 * 1024 - 2), 'after']
 
     @pytest.mark.unit
     def test_line_one_byte_over_the_limit_is_truncated(self):
         errors = self._read(b'd' * (64 * 1024) + b'\nafter\n')
-        assert errors[0].endswith(' [truncated]') and errors[1:] == ['After']
+        assert errors[0].endswith(' [truncated]') and errors[1:] == ['after']
 
     @pytest.mark.unit
     def test_overlong_unterminated_final_line_ends_the_reader(self):
@@ -2073,7 +2073,7 @@ class TestStderrLineTruncation:
         data = (b'x' * 150_000 + b'\n') * 3 + b'done\n'
         errors = self._read(data)
         assert [e.endswith(' [truncated]') for e in errors] == [True, True, True, False]
-        assert errors[-1] == 'Done'
+        assert errors[-1] == 'done'
 
     @pytest.mark.unit
     def test_readline_is_always_called_with_the_limit(self):
@@ -2586,3 +2586,131 @@ class TestUnMountCommandExtended:
         UnMountCommand()(sample_filesystem, unload_keys=True)
         call_args = mock_subprocess.call_args[0][0]
         assert '-u' in call_args
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Multi-line stderr: only the FIRST non-empty line is capitalised; continuation lines are the real zfs text
+# ---------------------------------------------------------------------------------------------------------------------
+
+CLONES_STDERR_LINES = ["cannot destroy 'p/fs@s': snapshot has dependent clones",
+                       "use '-R' to destroy the following datasets:",
+                       "p/clone3"]
+CLONES_MESSAGE = ("Cannot destroy 'p/fs@s': snapshot has dependent clones\n"
+                  "use '-R' to destroy the following datasets:\n"
+                  "p/clone3")
+# Leading noise: the first NON-empty line is the one that is capitalised.
+BLANK_LEADS = [pytest.param(b'', id='no-blank'),
+               pytest.param(b'\n', id='blank-first'),
+               pytest.param(b'   \n\n', id='whitespace-first')]
+CLONES_STDERR_BYTES = b''.join(line.encode() + b'\n' for line in CLONES_STDERR_LINES)
+
+
+class TestStderrFirstLineOnlyBinaryPaths:
+    """Binary stderr reader, the `_exec_capture_bin` no-thread fallback and the `StreamHandle.close` remainder
+    fallback all go through `_append_error`.
+
+    Mutation check (per-line capitalisation restored at one site, each verified separately): in
+    `_start_stderr_reader_bin` it fails 11 tests (the 3 reader tests, the truncation-suffix test, the 3
+    `_exec_stream` tests, the 4 real-child tests); in the `StreamHandle.close` fallback it fails the 3 `close`
+    fallback tests; in the `_exec_capture_bin` no-thread fallback it fails the 3 capture tests.
+    """
+
+    @pytest.fixture
+    def guard(self, monkeypatch):
+        return _StreamGuard(monkeypatch)
+
+    @staticmethod
+    def _child(code):
+        return [sys.executable, '-c', code]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('lead', BLANK_LEADS)
+    def test_binary_reader_capitalises_only_the_first_non_empty_line(self, lead):
+        process = MagicMock()
+        process.stderr.readline.side_effect = (lead.splitlines(keepends=True)
+                                               + CLONES_STDERR_BYTES.splitlines(keepends=True) + [b''])
+        errors = []
+        Command._start_stderr_reader_bin(process, errors).join(5)
+        assert '\n'.join(errors) == CLONES_MESSAGE
+
+    @pytest.mark.unit
+    def test_binary_reader_keeps_the_truncation_suffix_on_the_first_line_only(self):
+        process = MagicMock()
+        from libzfseasy.zfs import _BoundedErrors
+        process.stderr = io.BytesIO(b'x' * 200_000 + b'\ncontinuation line\n')
+        errors = _BoundedErrors()
+        Command._start_stderr_reader_bin(process, errors).join(10)
+        assert errors[0] == 'X' + 'x' * (64 * 1024 - 1) + ' [truncated]'
+        assert errors[1] == 'continuation line'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lead', BLANK_LEADS)
+    def test_exec_stream_startup_failure_keeps_continuation_lines_verbatim(self, mock_subprocess, lead):
+        order = []
+        process = TestSendStdoutEof._eof_process(order, rc=1, stderr_bytes=lead + CLONES_STDERR_BYTES)
+        mock_subprocess.return_value = process
+        with pytest.raises(Exception) as exc:
+            SendCommand._exec_stream(['zfs', 'send', 'p/fs@s'])
+        assert str(exc.value) == CLONES_MESSAGE
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('lead', BLANK_LEADS)
+    def test_capture_without_a_reader_thread_drains_stderr_with_the_same_rule(self, lead):
+        process = MagicMock()
+        process.stdout.peek.return_value = b''
+        process.poll.return_value = 1
+        process.stderr.read.return_value = lead + CLONES_STDERR_BYTES
+        errors = []
+        with pytest.raises(Exception) as exc:
+            SendCommand._exec_capture_bin(process, errors, None)
+        assert str(exc.value) == CLONES_MESSAGE
+        assert errors == CLONES_MESSAGE.split('\n')
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('lead', BLANK_LEADS)
+    def test_close_fallback_without_a_thread_reads_stderr_with_the_same_rule(self, lead):
+        process = _open_pipes(MagicMock())
+        process.wait.return_value = 1
+        process.stderr.read.return_value = lead + CLONES_STDERR_BYTES
+        stream = MagicMock()
+        stream.closed = False
+        handle = StreamHandle(process, stream)
+        with pytest.raises(Exception) as exc:
+            handle.close()
+        assert str(exc.value) == CLONES_MESSAGE
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lead', ['', '\\n'], ids=['no-blank', 'blank-first'])
+    def test_real_send_child_failing_at_startup(self, guard, lead):
+        code = _script("import sys",
+                       "sys.stderr.write(%r)" % (lead.replace('\\n', '\n')
+                                                  + '\n'.join(CLONES_STDERR_LINES) + '\n'),
+                       "sys.exit(1)")
+
+        def body():
+            with pytest.raises(Exception) as exc:
+                SendCommand._exec_stream(self._child(code))
+            return str(exc.value)
+
+        assert guard.run(body) == CLONES_MESSAGE
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lead', ['', '\\n'], ids=['no-blank', 'blank-first'])
+    def test_real_receive_child_failing_at_close(self, guard, lead):
+        code = _script("import sys",
+                       "sys.stdin.buffer.read()",
+                       "sys.stderr.write(%r)" % (lead.replace('\\n', '\n')
+                                                  + '\n'.join(CLONES_STDERR_LINES) + '\n'),
+                       "sys.exit(1)")
+
+        def body():
+            handle = ReceiveCommand._exec_stream_in(self._child(code))
+            handle.write(b'some stream bytes')
+            with pytest.raises(Exception) as exc:
+                handle.close()
+            return str(exc.value)
+
+        assert guard.run(body) == CLONES_MESSAGE

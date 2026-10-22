@@ -1402,7 +1402,7 @@ class TestExecRealPipes:
     @pytest.mark.subprocess
     def test_interleaved_large_output_with_failure_raises_collected_stderr(self, real_child):
         """(a) Same volume, rc != 0: every row is yielded first, then the exception carries ALL
-        stderr lines (>64 KB of them), capitalised and in order."""
+        stderr lines (>64 KB of them), in order; only the first is capitalised."""
         script = _INTERLEAVED_CHILD.format(rc=3)
         seen = []
 
@@ -1416,7 +1416,7 @@ class TestExecRealPipes:
         assert len(seen) == 300
         lines = str(exc).split('\n')
         assert len(lines) == 300
-        assert lines[0].startswith('Warn 0 eee') and lines[-1].startswith('Warn 299 eee')
+        assert lines[0].startswith('Warn 0 eee') and lines[-1].startswith('warn 299 eee')
         assert sum(len(l) for l in lines) > 64 * 1024
         assert real_child.procs[0].returncode == 3
         assert not any(t.is_alive() for t in real_child.stderr_threads)
@@ -3019,7 +3019,7 @@ class TestExecCollect:
                               returncode=0)
         lines, errors, rc = Command._exec_collect(['zfs', 'x'])
         assert lines == ['first', '\tindented = 1', '', 'last']
-        assert errors == ['Boom happened', 'Again']
+        assert errors == ['Boom happened', 'again']
         assert rc == 0
 
     @pytest.mark.unit
@@ -3294,7 +3294,7 @@ class TestResumeInfoBlockOnStderr:
     def test_multi_line_error_keeps_every_remaining_line(self, mock_subprocess):
         mock_subprocess.setup(stdout=[], stderr=_lines(FULL_CONTENTS, ['cannot resume send: one', '  second line']),
                               returncode=255)
-        assert SendCommand.resume_info(TOKEN_FULL).error == 'Cannot resume send: one\nSecond line'
+        assert SendCommand.resume_info(TOKEN_FULL).error == 'Cannot resume send: one\nsecond line'
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -3394,11 +3394,11 @@ class TestExecCollectRawStderr:
 
     @pytest.mark.unit
     @pytest.mark.subprocess
-    def test_default_mode_still_strips_drops_and_capitalises(self, mock_subprocess):
+    def test_default_mode_still_strips_drops_and_capitalises_the_first_line_only(self, mock_subprocess):
         mock_subprocess.setup(stdout=['out\n'], stderr=['\tindented = 1\n', '\n', '  spaced  \n', 'lower case\n'],
                               returncode=255)
         _, errors, _ = Command._exec_collect(['zfs', 'x'])
-        assert errors == ['Indented = 1', 'Spaced', 'Lower case']
+        assert errors == ['Indented = 1', 'spaced', 'lower case']
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -3689,7 +3689,7 @@ class TestExecCollectRobustness:
         assert info.toguid == 1 and info.toname == 'p/a@s'
         # the child saw the C locale, its invalid bytes were replaced, and 300 KB of stderr did not block it
         assert info.error.startswith('Locale=C/C bad \ufffd\ufffd bytes')
-        assert ('X' + 'x' * 299999) in info.error.splitlines()
+        assert ('x' * 300000) in info.error.splitlines()
         assert os.environ['LC_ALL'] == 'de_DE.UTF-8'
 
 
@@ -4295,3 +4295,87 @@ class TestResumeInfoSignalDeath:
         mock_subprocess.setup(stdout=_lines(FULL_CONTENTS), stderr=['cannot resume send: target is busy'],
                               returncode=-signal.SIGPIPE)
         assert SendCommand.resume_info(TOKEN_FULL).error == 'Cannot resume send: target is busy'
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Multi-line stderr: only the FIRST non-empty line is capitalised; continuation lines are the real zfs text
+# ---------------------------------------------------------------------------------------------------------------------
+
+CLONES_STDERR = ["cannot destroy 'p/fs@s': snapshot has dependent clones",
+                 "use '-R' to destroy the following datasets:",
+                 'p/clone3']
+CLONES_MESSAGE = ("Cannot destroy 'p/fs@s': snapshot has dependent clones\n"
+                  "use '-R' to destroy the following datasets:\n"
+                  "p/clone3")
+
+# (leading stderr lines, case id): the first NON-empty line is the one that is capitalised
+LEADING_NOISE = [pytest.param([], id='no-blank'),
+                 pytest.param(['\n'], id='blank-first'),
+                 pytest.param(['   \n', '\n'], id='whitespace-first')]
+
+
+class TestStderrFirstLineOnlyTextReaders:
+    """The text stderr readers (`_start_stderr_reader`, `_start_stderr_reader_lines`) capitalise only the first
+    collected line. Mutation check: per-line capitalisation restored in `_start_stderr_reader` fails the `_exec`,
+    `_exec_out` and `_exec_collect` tests below (the `_exec_lines` ones live in test_framing.py)."""
+
+    @staticmethod
+    def _stderr(noise):
+        return noise + [line + '\n' for line in CLONES_STDERR]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('noise', LEADING_NOISE)
+    def test_exec_raises_with_only_the_first_line_capitalised(self, mock_subprocess, noise):
+        mock_subprocess.setup(stdout=[], stderr=self._stderr(noise), returncode=1)
+        with pytest.raises(Exception) as exc:
+            Command._exec(['zfs', 'destroy', 'p/fs@s'])
+        assert str(exc.value) == CLONES_MESSAGE
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('noise', LEADING_NOISE)
+    def test_exec_out_raises_with_only_the_first_line_capitalised(self, mock_subprocess, noise):
+        process = mock_subprocess.setup(stdout=['row\n'], stderr=self._stderr(noise), returncode=1)
+        process.poll.side_effect = None
+        process.poll.return_value = 1
+        out = Command._exec_out(['zfs', 'destroy', 'p/fs@s'])
+        assert next(out) == 'row'
+        with pytest.raises(Exception) as exc:
+            next(out)
+        assert str(exc.value) == CLONES_MESSAGE
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('noise', LEADING_NOISE)
+    def test_exec_collect_returns_only_the_first_line_capitalised(self, mock_subprocess, noise):
+        mock_subprocess.setup(stdout=[], stderr=self._stderr(noise), returncode=1)
+        _, errors, rc = Command._exec_collect(['zfs', 'destroy', 'p/fs@s'])
+        assert rc == 1
+        assert '\n'.join(errors) == CLONES_MESSAGE
+        assert errors[2] == 'p/clone3'
+
+
+class TestStderrFirstLineOnlyResumeInfo:
+    """`SendCommand.resume_info` builds its error text from the raw stderr lines with the same rule."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('noise', LEADING_NOISE)
+    def test_error_text_capitalises_only_the_first_line(self, mock_subprocess, noise):
+        mock_subprocess.setup(stdout=[], returncode=255,
+                              stderr=_lines(FULL_CONTENTS) + noise + _lines(CLONES_STDERR))
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info.toguid == 0x61034bf73452096e
+        assert info.error == CLONES_MESSAGE
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_resume_failure_without_a_block_raises_the_same_text(self, mock_subprocess):
+        stderr = ["cannot resume send: 'p/a@s1' used in the initial send no longer exists",
+                  "use 'p/Clone3'"]
+        mock_subprocess.setup(stdout=[], stderr=_lines(stderr), returncode=255)
+        with pytest.raises(Exception) as exc:
+            SendCommand.resume_info(TOKEN_FULL)
+        assert str(exc.value) == ("Cannot resume send: 'p/a@s1' used in the initial send no longer exists\n"
+                                  "use 'p/Clone3'")

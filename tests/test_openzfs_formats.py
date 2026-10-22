@@ -62,12 +62,13 @@ def assert_runs_captured_command(mock, rec):
 
 
 def failure_message(stderr):
-    """The text libzfseasy's exception carries for `stderr`: stripped non-empty lines, first letter capitalised."""
+    """The text libzfseasy's exception carries for `stderr`: stripped non-empty lines, the first letter of the
+    FIRST line capitalised (continuation lines carry dataset names and are left verbatim)."""
     out = []
     for line in stderr.splitlines():
         line = line.strip()
         if line:
-            out.append(line[0].upper() + line[1:])
+            out.append(line[0].upper() + line[1:] if not out else line)
     return '\n'.join(out)
 
 
@@ -652,9 +653,9 @@ class TestFailedBatchM3:
             zfs.destroy(arg, **kwargs)
         lines = str(exc.value).split('\n')
         assert lines[0] == "Cannot destroy 'zfsbcapc/M3_Z8/cloned@s4': snapshot has dependent clones"
-        assert lines[1] == "Use '-R' to destroy the following datasets:"
-        # compared lower-cased: every stderr line gets its first letter capitalised, which also hits a clone name
-        assert {l.lower() for l in lines[2:]} == {'zfsbcapc/m3_z8/clone2', 'zfsbcapc/m3_z8/clone3'}
+        assert lines[1] == "use '-R' to destroy the following datasets:"
+        # continuation lines are the real zfs text: clone names keep their case
+        assert set(lines[2:]) == {'zfsbcapc/M3_Z8/clone2', 'zfsbcapc/M3_Z8/clone3'}
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -819,7 +820,7 @@ class TestListM4:
         rec = load_section(version, 'M4')['M4/49_two_snapshots_one_fs_one_command']
         assert rec.rc == 1
         assert failure_message(rec.stderr) == \
-            'Cannot create snapshots : multiple snapshots of same fs not allowed\nNo snapshots were created'
+            'Cannot create snapshots : multiple snapshots of same fs not allowed\nno snapshots were created'
 
 
 # --------------------------------------------------------------------------------------------------------------

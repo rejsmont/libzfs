@@ -533,7 +533,20 @@ class TestExecLinesMocked:
         with pytest.raises(Exception) as info:
             list(Command._exec_lines(['zfs', 'x']))
         assert type(info.value) is Exception
-        assert str(info.value) == "Cannot open 'p/x': dataset does not exist\nSecond line"
+        assert str(info.value) == "Cannot open 'p/x': dataset does not exist\nsecond line"
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lead', [b'', b'\n', b'  \n\n'], ids=['no-blank', 'blank-first', 'whitespace-first'])
+    def test_only_the_first_non_empty_stderr_line_is_capitalised(self, feed, lead):
+        """The dependent-clones failure: the continuation lines (a dataset name!) are the real zfs text.
+        Mutation check: per-line capitalisation restored in `_start_stderr_reader_lines` fails these 3."""
+        feed.set(b'', returncode=1, stderr=lead + b"cannot destroy 'p/fs@s': snapshot has dependent clones\n"
+                                                 b"use '-R' to destroy the following datasets:\np/clone3\n")
+        with pytest.raises(Exception) as info:
+            list(Command._exec_lines(['zfs', 'destroy', 'p/fs@s']))
+        assert str(info.value) == ("Cannot destroy 'p/fs@s': snapshot has dependent clones\n"
+                                   "use '-R' to destroy the following datasets:\np/clone3")
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -652,7 +665,7 @@ class TestExecLinesRealChildren:
 
         _, exc = _bounded(consume)
         assert type(exc) is Exception
-        assert str(exc) == 'Cannot open: gone\nSecond'
+        assert str(exc) == 'Cannot open: gone\nsecond'
         assert seen == ['a', 'b']
         assert children[0].returncode == 1
 
