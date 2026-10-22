@@ -9,6 +9,9 @@ never leaks URL credentials (production readiness plan S5/S6 follow-ups).
 * `receive` validates the names in `reset` (`-x`) and `props` (`-o`) before it execs; every name zfsbackup
   excludes passes, so the server's receive cannot start raising.
 * `_redact` clips what it scans (`_MAX_REDACT`) without leaking a credential cut by the clip.
+* `receive` refuses a property that is both set (`props`, `origin`) and reset (`-x`); `send.resume` /
+  `send.resume_info` refuse a malformed resume token (empty, leading `-`, whitespace/control character, over-long)
+  - both with no `Popen` call.
 
 Nothing here runs `zfs`: `subprocess.Popen` is the `mock_subprocess` fixture, and "no Popen call" is asserted
 on it.
@@ -318,6 +321,91 @@ class TestReceiveNamesAreValidated:
 
 
 # ---------------------------------------------------------------------------
+# receive: a property cannot be both set (-o) and excluded (-x)
+# ---------------------------------------------------------------------------
+
+_ORIGIN = Snapshot(Filesystem("pool/src"), "snap")
+
+
+def _target(form):
+    return Filesystem("pool/backup") if form == "filesystem" else Dataset("pool/backup")
+
+
+class TestReceiveSetAndResetOverlap:
+    """zfs refuses `-o k=v -x k` with a usage error; libzfseasy raises ValueError before it execs."""
+
+    @pytest.mark.parametrize("form", ["filesystem", "dataset"])
+    @pytest.mark.parametrize("reset", [["compression"], "compression", ("compression",),
+                                       ["org:other", "compression"], "mountpoint,compression"])
+    def test_a_props_name_in_reset_raises_before_exec(self, mock_subprocess, form, reset):
+        with pytest.raises(ValueError, match="cannot be both set .* and reset: compression"):
+            getattr(zfs.receive, form)(_target(form), props={"compression": "lz4", "org:a": "1"}, reset=reset)
+        no_exec(mock_subprocess)
+
+    @pytest.mark.parametrize("form", ["filesystem", "dataset"])
+    def test_every_overlapping_name_is_named_sorted(self, mock_subprocess, form):
+        with pytest.raises(ValueError) as excinfo:
+            getattr(zfs.receive, form)(_target(form), props={"org:b": "1", "org:a": "2", "quota": "1G"},
+                                       reset=["org:b", "mountpoint", "org:a"])
+        assert str(excinfo.value).endswith("reset: org:a, org:b")
+        assert "quota" not in str(excinfo.value) and "mountpoint" not in str(excinfo.value)
+        no_exec(mock_subprocess)
+
+    @pytest.mark.parametrize("form", ["filesystem", "dataset"])
+    def test_origin_together_with_resetting_origin_raises_before_exec(self, mock_subprocess, form):
+        with pytest.raises(ValueError, match="cannot be both set .* and reset: origin"):
+            getattr(zfs.receive, form)(_target(form), origin=_ORIGIN, reset=["origin"])
+        no_exec(mock_subprocess)
+
+    def test_origin_is_named_alongside_a_props_overlap(self):
+        from libzfseasy.zfs import ReceiveCommand
+        with pytest.raises(ValueError) as excinfo:
+            ReceiveCommand._get_options(origin=_ORIGIN, props={"org:a": "1"}, reset=["origin", "org:a"])
+        assert str(excinfo.value).endswith("reset: org:a, origin")
+
+    def test_resetting_origin_without_an_origin_is_not_an_overlap(self):
+        from libzfseasy.zfs import ReceiveCommand
+        assert ReceiveCommand._get_options(reset=["origin"]) == ["-x", "origin"]
+        assert ReceiveCommand._get_options(props={"org:a": "1"}, reset=["origin"]) == [
+            "-o", "org:a=1", "-x", "origin"]
+
+    def test_disjoint_sets_still_give_o_flags_then_x_flags(self):
+        from libzfseasy.zfs import ReceiveCommand
+        assert ReceiveCommand._get_options(props={"org:k": "v", "compression": "lz4"}, reset=["mountpoint"]) == [
+            "-o", "org:k=v", "-o", "compression=lz4", "-x", "mountpoint"]
+        assert ReceiveCommand._get_options(origin=_ORIGIN, props={"org:k": "v"}, reset=["mountpoint", "org:x"]) == [
+            "-o", "origin=pool/src@snap", "-o", "org:k=v", "-x", "mountpoint", "-x", "org:x"]
+
+    @pytest.mark.parametrize("form", ["filesystem", "dataset"])
+    @pytest.mark.parametrize("reset", [["mountpoint", "org:x"], "mountpoint,org:x", ("mountpoint", "org:x")])
+    def test_disjoint_sets_reach_zfs(self, mock_subprocess, form, reset):
+        mock_subprocess.setup(stdout="")
+        handle = getattr(zfs.receive, form)(_target(form), props={"org:k": "v"}, reset=reset)
+        handle.close()
+        argv = mock_subprocess.call_args_list[0][0][0][1:]
+        assert argv == ["receive", "-o", "org:k=v", "-x", "mountpoint", "-x", "org:x", "pool/backup"]
+
+    def test_names_are_compared_exactly(self):
+        """`org:a` vs `org:ab` or a different case is not an overlap (zfs property names are case sensitive)."""
+        from libzfseasy.zfs import ReceiveCommand
+        assert ReceiveCommand._get_options(props={"org:a": "1"}, reset=["org:ab", "ORG:a"]) == [
+            "-o", "org:a=1", "-x", "org:ab", "-x", "ORG:a"]
+
+    def test_no_reset_means_no_check(self):
+        from libzfseasy.zfs import ReceiveCommand
+        assert ReceiveCommand._get_options(props={"org:a": "1"}, origin=_ORIGIN) == [
+            "-o", "origin=pool/src@snap", "-o", "org:a=1"]
+
+    @pytest.mark.parametrize("make", [lambda names: (n for n in names), lambda names: iter(names)],
+                             ids=["generator", "iterator"])
+    def test_reset_as_a_one_shot_iterable_is_honoured(self, make):
+        from libzfseasy.zfs import ReceiveCommand
+        assert ReceiveCommand._get_options(reset=make(["mountpoint", "org:x"])) == ["-x", "mountpoint", "-x", "org:x"]
+        with pytest.raises(ValueError, match="cannot be both set"):
+            ReceiveCommand._get_options(props={"org:x": "1"}, reset=make(["org:x"]))
+
+
+# ---------------------------------------------------------------------------
 # _redact
 # ---------------------------------------------------------------------------
 
@@ -411,3 +499,85 @@ class TestRedact:
             def __str__(self):
                 return "q" * 100_000
         assert len(_redact(Big())) == _MAX_REDACT + 3
+
+
+# ---------------------------------------------------------------------------
+# send.resume / send.resume_info: the token is checked before zfs is run
+# ---------------------------------------------------------------------------
+
+_GOOD_TOKEN = ("1-a292306e5-b8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a7968064cae0f26c48f2499"
+               "525a9c520f1d00aacfa4bf2d34b33531818f238834cbe7b33276a20c97382e5f312735319188a4a0af48b53f352f4131d8a0da"
+               "16e0100ed3915db")
+
+_BAD_TOKENS = [
+    pytest.param("", id="empty"),
+    pytest.param(None, id="none"),
+    pytest.param(123, id="int"),
+    pytest.param(b"1-abc", id="bytes"),
+    pytest.param("-t", id="dash-t"),
+    pytest.param("-" + _GOOD_TOKEN, id="leading-dash"),
+    pytest.param("--version", id="long-option"),
+    pytest.param("1-abc def", id="space"),
+    pytest.param(" 1-abc", id="leading-space"),
+    pytest.param("1-abc\n", id="trailing-newline"),
+    pytest.param("1-abc\tdef", id="tab"),
+    pytest.param("1-abc\x00def", id="nul"),
+    pytest.param("1-abc\x1bdef", id="escape"),
+    pytest.param("1-abc\x7fdef", id="del"),
+    pytest.param("1-abcé", id="non-ascii"),
+    pytest.param("1-" + "a" * 16383, id="over-long"),
+]
+
+
+class TestSendResumeTokenIsCheckedBeforeExec:
+    @pytest.mark.parametrize("token", _BAD_TOKENS)
+    def test_resume_raises_before_exec(self, mock_subprocess, token):
+        from libzfseasy.zfs import ResumeTokenError
+        with pytest.raises(ResumeTokenError, match="Not a valid ZFS resume token"):
+            zfs.send.resume(token)
+        no_exec(mock_subprocess)
+
+    @pytest.mark.parametrize("token", _BAD_TOKENS)
+    def test_resume_info_still_raises_before_exec(self, mock_subprocess, token):
+        from libzfseasy.zfs import ResumeTokenError
+        with pytest.raises(ResumeTokenError):
+            zfs.send.resume_info(token)
+        no_exec(mock_subprocess)
+
+    def test_the_embed_flag_does_not_bypass_the_check(self, mock_subprocess):
+        from libzfseasy.zfs import ResumeTokenError
+        with pytest.raises(ResumeTokenError):
+            zfs.send.resume("-evil", embed=True)
+        no_exec(mock_subprocess)
+
+    def test_resume_error_is_a_value_error(self, mock_subprocess):
+        with pytest.raises(ValueError):
+            zfs.send.resume("")
+        no_exec(mock_subprocess)
+
+    @staticmethod
+    def _stream(mock_subprocess):
+        from unittest.mock import MagicMock
+        process = MagicMock()
+        process.stdout.peek.return_value = b"ZFS_DATA"
+        process.poll.return_value = None
+        mock_subprocess.return_value = process
+
+    def test_a_valid_token_gives_dash_t_token(self, mock_subprocess):
+        self._stream(mock_subprocess)
+        zfs.send.resume(_GOOD_TOKEN)
+        assert mock_subprocess.call_count == 1
+        assert mock_subprocess.call_args[0][0][1:] == ["send", "-t", _GOOD_TOKEN]
+
+    def test_a_valid_token_with_embed(self, mock_subprocess):
+        self._stream(mock_subprocess)
+        zfs.send.resume(_GOOD_TOKEN, embed=True)
+        assert mock_subprocess.call_args[0][0][1:] == ["send", "-e", "-t", _GOOD_TOKEN]
+
+    def test_the_length_limit_is_inclusive(self, mock_subprocess):
+        from libzfseasy.zfs import _RESUME_TOKEN_MAX_LEN
+        self._stream(mock_subprocess)
+        token = "1-" + "a" * (_RESUME_TOKEN_MAX_LEN - 2)
+        assert len(token) == _RESUME_TOKEN_MAX_LEN
+        zfs.send.resume(token)
+        assert mock_subprocess.call_args[0][0][-1] == token

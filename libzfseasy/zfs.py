@@ -11,6 +11,7 @@ import re
 import shlex
 import subprocess
 import shutil
+import signal
 import threading
 import time
 
@@ -273,12 +274,38 @@ class _BoundedErrors(list):
         self[keep] = '... %d lines omitted ...' % self._omitted
 
 
+def _child_env() -> dict:
+    """The environment every `zfs`/`zpool` child runs in: the caller's, with the C locale forced.
+
+    zfs translates its messages and prints values by locale, and callers (`exists()`, the destroy/receive error
+    handling in zfsbackup) match on the English text. `LC_ALL` beats every other locale variable, so a caller's own
+    `LC_ALL`/`LANG` is deliberately overridden for the child; the rest of the environment is passed through."""
+    return dict(os.environ, LC_ALL='C', LANG='C')
+
+
+def _failure_text(errors, rc) -> str:
+    """The text of a failed child's exception: the stderr lines joined by newlines. Only when stderr was empty,
+    a description of the exit status instead: `Command failed with exit code N`, or `Command killed by signal
+    <NAME>` when the child died of a signal (a negative return code, e.g. SIGPIPE)."""
+    text = '\n'.join(errors)
+    if text:
+        return text
+    if isinstance(rc, int) and not isinstance(rc, bool) and rc < 0:
+        try:
+            name = signal.Signals(-rc).name
+        except ValueError:
+            name = str(-rc)
+        return f'Command killed by signal {name}'
+    return f'Command failed with exit code {rc}'
+
+
 class Command:
 
     @classmethod
     def _exec(cls, cmd):
         _log_command(cmd)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                                   env=_child_env())
         errors = []
         stderr_thread = cls._start_stderr_reader(process, errors)
         while True:
@@ -289,7 +316,8 @@ class Command:
     @classmethod
     def _exec_out(cls, cmd):
         _log_command(cmd)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                                   env=_child_env())
         errors = []
         stderr_thread = cls._start_stderr_reader(process, errors)
         completed = False
@@ -332,7 +360,7 @@ class Command:
 
         Unlike `_exec_out` (kept as it is: zfsbackup calls it directly) nothing is stripped or dropped."""
         _log_command(cmd)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
         errors = _BoundedErrors()
         stderr_thread = cls._start_stderr_reader_lines(process, errors)
         completed = False
@@ -362,7 +390,7 @@ class Command:
                 cls._join_stderr_reader(stderr_thread)
                 process.wait()
         if rc != 0:
-            raise Exception('\n'.join(errors))
+            raise Exception(_failure_text(errors, rc))
 
     @staticmethod
     def _start_stderr_reader_lines(process, errors):
@@ -395,11 +423,12 @@ class Command:
         the first letter capitalised, like the other helpers; with `raw_stderr` they are returned exactly as
         printed (newline removed, indentation kept) for callers that parse structured stderr. The child is always
         reaped and the stderr thread joined (bounded, see `_join_stderr_reader`), even if the caller is interrupted.
-        `env` replaces the child's environment when given. Output is decoded as UTF-8 with replacement, so odd
-        bytes can neither raise nor kill the stderr reader (which would leave the child blocked on a full pipe)."""
+        `env` replaces the child's environment when given (default: `_child_env()`, the C locale). Output is decoded as UTF-8 with
+        replacement, so odd bytes can neither raise nor kill the stderr reader (which would leave the child blocked on a full pipe)."""
         _log_command(cmd)
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
-                                   encoding='utf-8', errors='replace', env=env)
+                                   encoding='utf-8', errors='replace',
+                                   env=_child_env() if env is None else env)
         errors = _BoundedErrors()
         if raw_stderr:
             def reader():
@@ -545,7 +574,7 @@ class Command:
         if stderr_thread is not None:
             stderr_thread.join()
         if rc != 0:
-            raise Exception('\n'.join(errors))
+            raise Exception(_failure_text(errors, rc))
         return False
 
 
@@ -634,7 +663,7 @@ class StreamHandle:
         if stdout is not None and stdout is not self._stream:
             self._close_pipe(stdout)
         if rc != 0:
-            raise Exception('\n'.join(self._errors)) from stream_error
+            raise Exception(_failure_text(self._errors, rc)) from stream_error
         if stream_error is not None:
             raise stream_error
 
@@ -671,6 +700,8 @@ class StringListArgument:
             slist = []
         elif isinstance(slist, str):
             slist = str(slist).split(separator)
+        else:
+            slist = list(slist)  # materialise: a one-shot iterable must survive validating and then using it
         if validator:
             for s in slist:
                 validator(s)
@@ -689,6 +720,7 @@ class DatasetListArgument:
             dslist = []
         elif not isinstance(dslist, Iterable):
             dslist = [dslist]
+        dslist = list(dslist)  # materialise: a one-shot iterable must survive validating and then using it
         for ds in dslist:
             if not isinstance(ds, (Filesystem, Volume, Dataset, Snapshot)):
                 raise ValueError('Expected Filesystem, Volume, Dataset or Snapshot, got '
@@ -708,6 +740,7 @@ class ZFSListArgument:
             zlist = []
         elif not isinstance(zlist, Iterable):
             zlist = [zlist]
+        zlist = list(zlist)  # materialise: a one-shot iterable must survive validating and then using it
         for ds in zlist:
             if not isinstance(ds, ZFS):
                 raise ValueError('Expected Filesystem, Volume, Dataset, Snapshot or Bookmark, got '
@@ -760,7 +793,8 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
             cmd += ['-d', str(depth)]
 
         if types:
-            cmd += ['-t', cls._slist_to_str(types, validator=Validate.type)]
+            types = cls._slist_to_list(types, validator=Validate.type)  # once: `types` is used again for `wanted`
+            cmd += ['-t', ','.join(str(t) for t in types)]
 
         if isinstance(sort, str):
             cls._check_sort_key(sort)
@@ -1017,6 +1051,17 @@ class BookmarkCommand(Command):
 
 
 class DestroyCommand(Command):
+    """Wraps `zfs destroy -v -p` (a dry run `-n` unless `destroy=True`).
+
+    Lazy mode (`lazy=True`, `dataset` and `snapshots`): the result is a generator that runs zfs on first iteration
+    and yields the `destroy` lines zfs has printed so far; if zfs then fails, the lines already printed are still
+    yielded and the bare subprocess-error Exception is raised only afterwards, at the end of the iteration.
+
+    A dry run (`destroy=False`) does not predict every failure: it succeeds on a snapshot that carries a user hold
+    (the hold is only checked when the snapshot is really destroyed) but fails on one that has a clone (without
+    `clones=True`/`recursive=True`, which destroy the clones too). Do not read a clean dry run as a promise that the
+    destroy will go through.
+    """
 
     def __call__(self, *args, **kwargs):
         return self._destroy(*args, **kwargs)
@@ -1086,6 +1131,8 @@ class DestroyCommand(Command):
             elif str(snap.dataset) != str(ds):
                 raise ValueError('Snapshots must come from the same dataset')
             snaps += ',' + snap.short if snaps else snap.short
+        if ds is None:
+            raise ValueError('Expected at least one Snapshot or SnapshotRange, got none')
         snaps = ds.name + '@' + snaps
 
         cmd = cls._base(destroy, recursive, clones)
@@ -1332,8 +1379,9 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
              depth: int = 0, lazy=False) -> Iterable[ZFS]:
 
         sources = cls._slist_to_list(sources, validator=Validate.source)
-        wanted = _wanted_types(cls._slist_to_list(types, validator=Validate.type))
-        types = cls._slist_to_str(types, validator=Validate.type)
+        types = cls._slist_to_list(types, validator=Validate.type)  # once: a one-shot iterable is used twice below
+        wanted = _wanted_types(types)
+        types = ','.join(str(t) for t in types)
         properties = cls._slist_to_list(properties, validator=Validate.attribute)
         datasets = [str(d) for d in cls._zlist_to_list(ds)]
         # Enforce column order: name, property, value, received, source
@@ -1614,6 +1662,8 @@ class InheritCommand(Command):
 
         if isinstance(props, str):
             props = [props]
+        else:
+            props = list(props)  # materialise: a one-shot iterable is walked twice below
 
         # Reject invalid caller-supplied names before anything reaches zfs.
         for prop in props:
@@ -1651,7 +1701,11 @@ class ResumeToken:
         fromguid: int -- GUID of the incremental source snapshot; None for a full stream.
         object, offset, bytes: int -- where the receive stopped (object number, offset within it, bytes received).
         flags: frozenset -- names of the `*ok` stream features recorded in the token (embedok, compressok, rawok,
-            largeblockok, savedok, ...).
+            largeblockok, savedok, ...). The recorded set depends on the dataset's feature state, not only on the
+            flags the send was started with (for example `largeblockok` is recorded only when the `large_blocks`
+            feature is active), and on the OpenZFS version. Accept a token iff `required <= flags <= allowed` for
+            the send mode you use (both bounds: an unexpected flag such as `embedok` or `rawok` must be refused);
+            never test equality.
         error: str -- zfs's reason when the token can no longer be resumed from this pool (target or source
             snapshot destroyed, ...); None when `zfs send -t` would work. The contents are still reported.
     """
@@ -1669,6 +1723,14 @@ class ResumeToken:
 _RESUME_TOKEN_MAX_LEN = 16384
 _RESUME_TOKEN_RE = re.compile(r'[\x21-\x7e]+')
 _RESUME_INT_FIELDS = ('toguid', 'fromguid', 'object', 'offset', 'bytes')
+
+
+def _check_resume_token(token) -> None:
+    """Raise ResumeTokenError unless `token` looks like a resume token: a non-empty printable-ASCII string of
+    bounded length that cannot be taken for an option (no leading `-`). Used before any `zfs send -t` is run."""
+    if not isinstance(token, str) or not token or len(token) > _RESUME_TOKEN_MAX_LEN \
+            or not _RESUME_TOKEN_RE.fullmatch(token) or token.startswith('-'):
+        raise ResumeTokenError('Not a valid ZFS resume token')
 
 
 def _find_resume_block(lines):
@@ -1820,7 +1882,11 @@ class SendCommand(Command):
         Returns:
             StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
                 for the subprocess and raises on non-zero exit
+
+        Raises:
+            ResumeTokenError: the token is malformed (checked, like `resume_info`, before zfs is run)
         """
+        _check_resume_token(token)
         cmd = [_zfs_cmd(), 'send'] + cls._get_options(embed=embed) + ['-t', token]
         return cls._exec_stream(cmd)
 
@@ -1840,16 +1906,13 @@ class SendCommand(Command):
         Raises:
             ResumeTokenError: the token is malformed, or zfs rejects it (for example a corrupt token)
         """
-        if not isinstance(token, str) or not token or len(token) > _RESUME_TOKEN_MAX_LEN \
-                or not _RESUME_TOKEN_RE.fullmatch(token) or token.startswith('-'):
-            raise ResumeTokenError('Not a valid ZFS resume token')
+        _check_resume_token(token)
 
         # Which stream carries the contents block can vary by OpenZFS version (stdout on 2.4.1): look in stdout
         # first, then in stderr (read raw, so the tab indentation survives).
         # Run in the C locale so zfs's messages are the English ones callers match on (staleness, corruption).
-        env = dict(os.environ, LC_ALL='C', LANG='C')
         lines, stderr_lines, rc = cls._exec_collect([_zfs_cmd(), 'send', '-nv', '-t', token], raw_stderr=True,
-                                                    env=env)
+                                                    env=_child_env())
         info = _parse_resume_contents(lines)
         span = None
         if info is None:
@@ -1871,9 +1934,9 @@ class SendCommand(Command):
                 raise ResumeTokenError('zfs printed no resume token contents')
             if 'resume' in text.lower():
                 raise ResumeTokenError(text)
-            raise Exception(text or f'Command failed with exit code {rc}')
+            raise Exception(_failure_text(errors, rc))
         if rc != 0:
-            info = dataclasses.replace(info, error=text or f'Command failed with exit code {rc}')
+            info = dataclasses.replace(info, error=_failure_text(errors, rc))
         return info
 
     @classmethod
@@ -1933,7 +1996,7 @@ class SendCommand(Command):
         _log_command(cmd)
         errors = _BoundedErrors()
         stderr_thread = None
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
         try:
             # stderr is drained on its own thread from the start, so a child writing more than a pipe buffer of
             # diagnostics can neither block itself nor stall the stdout peek below.
@@ -1980,7 +2043,7 @@ class SendCommand(Command):
             StreamHandle._close_pipe(getattr(process, 'stdout', None))
             if stderr_thread is None or not stderr_thread.is_alive():
                 StreamHandle._close_pipe(getattr(process, 'stderr', None))
-            raise Exception('\n'.join(errors))
+            raise Exception(_failure_text(errors, rc))
         return False
 
 
@@ -2007,7 +2070,8 @@ class ReceiveCommand(Command, StringListArgument):
         Keyword arguments:
             ds: Filesystem -- target ZFS filesystem
             props: Properties -- properties to set on the target filesystem (default None)
-            reset: Properties -- properties to reset on the target filesystem (default None)
+            reset: StringList -- names of properties to exclude (`-x`: keep the received value out, use the local
+                default); a name that is also in `props` (or `origin`) raises ValueError (default None)
             origin: Snapshot -- forces the stream to be received as a clone of the given snapshot (default None)
             force: bool -- force discarding changes or incompatible snapshots from the target filesystem (default False)
             holds: bool -- receive holds (default True)
@@ -2037,7 +2101,8 @@ class ReceiveCommand(Command, StringListArgument):
         Keyword arguments:
             ds: Filesystem -- target ZFS filesystem
             props: Properties -- properties to set on the target filesystem (default None)
-            reset: Properties -- properties to reset on the target filesystem (default None)
+            reset: StringList -- names of properties to exclude (`-x`: keep the received value out, use the local
+                default); a name that is also in `props` (or `origin`) raises ValueError (default None)
             origin: Snapshot -- forces the stream to be received as a clone of the given snapshot (default None)
             force: bool -- force discarding changes or incompatible snapshots from the target filesystem (default False)
             holds: bool -- receive holds (default True)
@@ -2085,7 +2150,13 @@ class ReceiveCommand(Command, StringListArgument):
             cmd += cls._get_props(props, True)
         reset = kwargs.get('reset', None)
         if reset:
-            for s in cls._slist_to_list(reset, validator=Validate.attribute):
+            reset_names = cls._slist_to_list(reset, validator=Validate.attribute)
+            # zfs refuses a property that is both set (-o) and excluded (-x) with a usage error (rc 2).
+            set_names = set(props or ()) | ({'origin'} if origin else set())
+            both = sorted(set(reset_names) & set_names)
+            if both:
+                raise ValueError('Properties cannot be both set (props/origin) and reset: ' + ', '.join(both))
+            for s in reset_names:
                 cmd += ['-x', s]
         if kwargs.get('force', False):
             cmd += ['-F']
@@ -2124,7 +2195,8 @@ class ReceiveCommand(Command, StringListArgument):
         # process.wait().
         errors = _BoundedErrors()
         stderr_thread = None
-        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   env=_child_env())
         try:
             # stderr is drained on a thread from the start (a receive writing a lot of diagnostics must not block
             # on a full pipe while the caller is still writing the stream); close() joins it before raising.
@@ -2133,7 +2205,7 @@ class ReceiveCommand(Command, StringListArgument):
             rc = process.poll()
             if rc is not None and rc != 0:
                 cls._join_stderr_reader(stderr_thread)
-                raise Exception('\n'.join(errors) or f'Command failed with exit code {rc}')
+                raise Exception(_failure_text(errors, rc))
         except BaseException:
             cls._abort_stream(process, stderr_thread)
             raise
