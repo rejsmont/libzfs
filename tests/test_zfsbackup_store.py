@@ -57,6 +57,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from _raw_support import stub_table_ddl
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
@@ -6080,7 +6081,9 @@ _STAMP_TABLE = "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL P
 def _our_table_ddl():
     """DDL for every table of zfsbackup's schema except `alembic_version`."""
     return [
-        f"CREATE TABLE {name} (id INTEGER)"
+        # Every column some revision added (`raw`, the TLS columns): the schema
+        # check refuses a head-stamped file that lacks one.
+        stub_table_ddl(name)
         for name in sorted(Base.metadata.tables)
         if name != "alembic_version"
     ]
@@ -8494,8 +8497,11 @@ class TestNoPythonColumnDefaults:
 
 _BASELINE_REVISION = "a1c28e1b3f34"
 # TLS/mTLS M5: trust + host-identity tables, destination pins, client cert/key
-# paths, `client_id_file` dropped. Revises the baseline; it is the head.
+# paths, `client_id_file` dropped. Revises the baseline; no longer the head.
 _TLS_REVISION = "7c3e9d51b2a8"
+# Milestone B (B3): `dataset_remotes.raw`, a nullable BOOLEAN. Revises the TLS
+# revision; it is the head.
+_RAW_REVISION = "5d2f8a60c1e4"
 _SUPERSEDED_REVISION = "2e8aa45e2667"
 
 
@@ -8605,36 +8611,41 @@ class TestBaselinePositivityChecks:
 
 @pytest.mark.unit
 class TestBaselineRevision:
-    def test_head_revision_is_the_tls_revision(self, migrated_db):
-        assert _code_head(migrated_db) == _TLS_REVISION
+    def test_head_revision_is_the_raw_revision(self, migrated_db):
+        assert _code_head(migrated_db) == _RAW_REVISION
         with migrated_db.connect() as conn:
             assert (
                 conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-                == _TLS_REVISION
+                == _RAW_REVISION
             )
 
-    def test_there_are_exactly_two_scripts_baseline_then_tls(self):
+    def test_there_are_exactly_three_scripts_baseline_tls_then_raw(self):
         scripts = sorted(
             p.name for p in (_MIGRATIONS_DIR / "versions").glob("*.py")
             if not p.name.startswith("__")
         )
-        assert len(scripts) == 2, scripts
-        assert _BASELINE_REVISION in scripts[0] and _TLS_REVISION in scripts[1]
+        assert len(scripts) == 3, scripts
+        assert _BASELINE_REVISION in scripts[0]
+        assert _TLS_REVISION in scripts[1]
+        assert _RAW_REVISION in scripts[2]
         assert not any(_SUPERSEDED_REVISION in name for name in scripts)
 
     def test_the_revisions_form_one_linear_chain(self, migrated_db):
         with migrated_db.connect() as conn:
             script = ScriptDirectory.from_config(_build_config(conn))
         assert script.get_bases() == [_BASELINE_REVISION]
-        assert script.get_heads() == [_TLS_REVISION]
+        assert script.get_heads() == [_RAW_REVISION]
+        assert script.get_revision(_RAW_REVISION).down_revision == _TLS_REVISION
         assert script.get_revision(_TLS_REVISION).down_revision == _BASELINE_REVISION
         assert script.get_revision(_BASELINE_REVISION).down_revision is None
 
-    def test_the_known_revisions_are_both_revisions_and_the_expected_head_is_the_tls_one(self):
+    def test_the_known_revisions_are_all_three_and_the_expected_head_is_the_raw_one(self):
         from zfsbackup.config.store import migrate
 
-        assert migrate.EXPECTED_HEAD == _TLS_REVISION
-        assert migrate.KNOWN_REVISIONS == frozenset({_BASELINE_REVISION, _TLS_REVISION})
+        assert migrate.EXPECTED_HEAD == _RAW_REVISION
+        assert migrate.KNOWN_REVISIONS == frozenset(
+            {_BASELINE_REVISION, _TLS_REVISION, _RAW_REVISION}
+        )
 
     def test_a_database_stamped_with_the_superseded_id_is_refused_loudly(self, migrated_db):
         _exec(migrated_db, "UPDATE alembic_version SET version_num = :v", v=_SUPERSEDED_REVISION)
