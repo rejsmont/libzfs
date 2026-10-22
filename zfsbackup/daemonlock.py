@@ -139,6 +139,7 @@ import errno
 import fcntl
 import logging
 import os
+import random
 import signal
 import stat as stat_module
 import time
@@ -1219,9 +1220,17 @@ def hold_workers_lock(path) -> Optional[int]:
             return None
 
 
+#: `workers_present` tries the exclusive lock this many times, `_PROBE_RETRY_DELAY`
+#: seconds apart (jittered), before it reports a holder: about 100 ms in all.
+_PROBE_ATTEMPTS = 5
+_PROBE_RETRY_DELAY = 0.025
+
+
 def workers_present(resolved) -> bool:
     """Does any process hold the workers lock? A momentary `LOCK_EX|LOCK_NB` on
-    a fresh read-only descriptor: contention means a holder. The lock is always
+    a fresh read-only descriptor: contention that lasts through a few short
+    retries (about 100 ms) means a holder, because another probe's own
+    momentary lock clears at once. Never blocks longer than that. The lock is always
     released and the descriptor closed before returning. A missing file is
     `False`. Raises `DaemonLockError` if the file exists but cannot be opened or
     locked for any reason other than contention."""
@@ -1239,15 +1248,23 @@ def workers_present(resolved) -> bool:
             raise DaemonLockError(
                 errno.EINVAL, f"workers lock file {path} is not a regular file", str(path)
             )
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
-                return True
-            raise DaemonLockError(
-                exc.errno, f"cannot lock {path}: {exc.strerror}", str(path)
-            ) from exc
-        return False
+        for attempt in range(_PROBE_ATTEMPTS):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    raise DaemonLockError(
+                        exc.errno, f"cannot lock {path}: {exc.strerror}", str(path)
+                    ) from exc
+                if attempt + 1 < _PROBE_ATTEMPTS:
+                    # Two probes (`migrate` and a starting daemon) each hold
+                    # `LOCK_EX` for an instant and would each take the other
+                    # for a worker. A real worker holds `LOCK_SH` for its whole
+                    # life, so it is still there after a short, jittered wait.
+                    time.sleep(_PROBE_RETRY_DELAY * random.uniform(0.5, 1.5))
+                continue
+            return False
+        return True
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)

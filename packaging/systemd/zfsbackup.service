@@ -1,0 +1,78 @@
+# zfsbackup daemon unit. Install to /etc/systemd/system/zfsbackup.service.
+#
+# Assumes the wheel is installed in a virtualenv at /opt/zfsbackup/venv and the
+# configuration database is /var/lib/zfsbackup/config.db (see the README for the
+# install order: sysusers, tmpfiles, `zfsbackup-config import`, enroll, then
+# `systemctl enable --now zfsbackup`).
+#
+# systemd older than 253 does not know Type=notify-reload: install the drop-in
+# zfsbackup.service.d/pre-253.conf next to this file (README).
+
+[Unit]
+Description=ZFS Backup Daemon
+# The network is needed by the remote backup worker and the API worker; the pool
+# must be imported and its datasets mounted before the first `zfs` call.
+# (Wants= on a unit that does not exist, e.g. zfs-mount.service on a system
+# without ZFS's own units, is not an error.)
+Wants=network-online.target zfs-mount.service
+After=network-online.target zfs-mount.service zfs-import.target
+# /var/lib/zfsbackup may be on a ZFS dataset mounted by zfs-mount.service.
+RequiresMountsFor=/var/lib/zfsbackup
+# A host that has not run `zfsbackup-config import` yet FAILS the start with an
+# "assertion failed" instead of looping (Restart= does not apply to a unit whose
+# start was never attempted; the install scenario confirms this).
+AssertPathExists=/var/lib/zfsbackup/config.db
+
+[Service]
+# systemd >= 253: the supervisor reports READY after its workers are forked and
+# a reload as RELOADING -> READY. systemd sends the reload SIGHUP itself, so
+# there is NO ExecReload= line here (with one, `systemctl reload` would signal
+# twice). Older systemd: pre-253.conf.
+Type=notify-reload
+# Only the supervisor talks to systemd. Workers never see $NOTIFY_SOCKET (the
+# supervisor removes it before the first fork), so "main" is exact.
+NotifyAccess=main
+
+# Apply pending schema migrations before the daemon starts. `--backup-dir` copies
+# the database there first, and only when the schema is actually behind (never
+# on a plain restart, so a restart loop cannot fill the disk). It runs as root,
+# like the daemon; the store handles files created by root (setgid directory,
+# group `zfsbackup`). It refuses (exit 75) while workers of a previous daemon
+# still run, and the start then fails and is retried after RestartSec.
+ExecStartPre=/opt/zfsbackup/venv/bin/zfsbackup-config -c /var/lib/zfsbackup/config.db migrate --backup-dir /var/lib/zfsbackup/backups
+ExecStart=/opt/zfsbackup/venv/bin/zfsbackupd -c /var/lib/zfsbackup/config.db
+# Log lines are flushed per record already; this keeps any stray print() ordered.
+Environment=PYTHONUNBUFFERED=1
+
+# On `systemctl stop`, SIGTERM only the supervisor. It raises its stop flag;
+# workers leave at their next safe point, and the API worker gives in-flight
+# receives up to 20 s. The default (control-group) would SIGTERM every worker
+# directly and cut a `zfs send` mid-stream.
+KillMode=mixed
+# The supervisor waits up to 30 s for workers, then escalates; a realistic stop
+# takes well under a minute. 90 s leaves room for a stop that lands during a
+# reload (a database read, at most 5 s). The supervisor itself makes no `zfs`
+# call, so a hung pool cannot stall the stop; a worker stuck in `zfs` is
+# escalated (SIGTERM, then SIGKILL) inside the same 30 s budget.
+TimeoutStopSec=90
+
+Restart=on-failure
+# Restart also after:
+#   SIGHUP  a stray SIGHUP in the few milliseconds before the daemon ignores it
+#           (the console script ignores it first thing, but the interpreter's
+#           own start-up cannot), which would otherwise count as a clean exit;
+#   76      "the installed zfsbackup changed under me, restart me" (the daemon's
+#           EXIT_CODE_VERSION_CHANGED, zfsbackup/version.py). Nothing exits 76
+#           yet: the self-restart on upgrade arrives with milestone D (S-8).
+#           Until then upgrade with `systemctl stop`, install, `systemctl start`.
+RestartForceExitStatus=SIGHUP 76
+RestartSec=60
+
+# Deliberately NO ProtectSystem=, ProtectHome=, PrivateTmp= or any other option
+# that gives the service a private mount namespace: the daemon runs `zfs create`
+# / `zfs receive`, whose mounts must appear on the host, not only inside the
+# service's namespace. (If the daemon is ever sandboxed, make that mount
+# propagation work first and test it with a real receive.)
+
+[Install]
+WantedBy=multi-user.target

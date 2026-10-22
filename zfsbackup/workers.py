@@ -45,7 +45,7 @@ from multiprocessing import Process
 from multiprocessing.synchronize import Event
 from typing import List, Optional, Union
 
-from zfsbackup import procident
+from zfsbackup import logsetup, procident
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
 from zfsbackup.config import BackupConfig
 from zfsbackup.stopflag import STOP_POLL, ReloadEpoch, StopFlag
@@ -81,6 +81,28 @@ WORKER_EXIT_RELOAD = 3
 API_STOP_DRAIN = 20
 
 
+#: Maps C0 and C1 control characters (and DEL) to a visible backslash-x escape,
+#: for client-controlled text that goes into a log line.
+_CONTROL_CHAR_TABLE = {
+    **{c: f'\\x{c:02x}' for c in range(0x20)},
+    **{c: f'\\x{c:02x}' for c in range(0x7f, 0xa0)},
+}
+
+
+#: Longest client-controlled text (a request path, a bad request line) that
+#: goes into one log line. A request line can be 64 KiB, and journald cuts a
+#: stream at 48 KiB and reads a priority prefix at the start of each piece.
+MAX_LOGGED_REQUEST = 1024
+
+
+def _clip_for_log(text: str) -> str:
+    """`text` cut to `MAX_LOGGED_REQUEST` characters, with a marker that says
+    how many were dropped."""
+    if len(text) <= MAX_LOGGED_REQUEST:
+        return text
+    return f'{text[:MAX_LOGGED_REQUEST]}...({len(text) - MAX_LOGGED_REQUEST} more)'
+
+
 class ExitReason(enum.Enum):
     """Why a worker should leave its loop. Priority is the declaration order:
     a stop beats a gone supervisor beats a reload."""
@@ -90,15 +112,14 @@ class ExitReason(enum.Enum):
     RELOAD = 'reload'
 
 
-def _setup_logging(verbose: bool = False) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+def _setup_logging(log_level: int = logging.INFO) -> None:
+    """Configure this process's logging (`zfsbackup.logsetup`). Called in every
+    worker, whatever the start method: a child does not rely on inheriting the
+    supervisor's handler."""
+    logsetup.configure(log_level)
 
 
-def _init_child_process(verbose: bool = False) -> None:
+def _init_child_process(log_level: int = logging.INFO) -> None:
     """First statement of **every** worker `run()`. Nothing may precede it.
 
     Resets the `SIGINT`/`SIGTERM` dispositions this child must not own,
@@ -180,7 +201,7 @@ def _init_child_process(verbose: bool = False) -> None:
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
-    _setup_logging(verbose)
+    _setup_logging(log_level)
 
 
 def _pid_exists(pid: int) -> bool:
@@ -268,7 +289,7 @@ class _SupervisorWatch:
     ) -> None:
         #: Constructors run in the supervisor, so this is its pid. Not a
         #: constructor parameter: the worker signatures are pinned to
-        #: `(config, stop_event, verbose)` plus the keyword-only reload trio.
+        #: `(config, stop_event, log_level)` plus the keyword-only reload trio.
         self.supervisor_pid = os.getpid()
         #: Its start token (`procident`): pid reuse after a `kill -9` is
         #: detected by identity, not by "some process has that pid".
@@ -402,7 +423,7 @@ class BaseWorker(_SupervisorWatch, Process):
         worker_name: str,
         config: BackupConfig,
         stop_event: StopEvent,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
@@ -421,7 +442,7 @@ class BaseWorker(_SupervisorWatch, Process):
         super().__init__(name=worker_name, daemon=True)
         self.config = config
         self.stop_event = stop_event
-        self.verbose = verbose
+        self.log_level = log_level
         self._watch_init(reload_epoch, born_epoch, workers_lock)
 
     @abstractmethod
@@ -440,7 +461,7 @@ class BaseWorker(_SupervisorWatch, Process):
         """Called once after setup but before the main loop. Override for per-run init."""
 
     def run(self) -> None:
-        _init_child_process(self.verbose)
+        _init_child_process(self.log_level)
         self._arm_supervisor_watch()
         self._hold_workers_lock()
         logger = logging.getLogger(__name__)
@@ -495,14 +516,14 @@ class SnapshotWorker(BaseWorker):
         self,
         config: BackupConfig,
         stop_event: StopEvent,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
     ):
         super().__init__(
-            'snapshot-worker', config, stop_event, verbose,
+            'snapshot-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
         )
 
@@ -549,14 +570,14 @@ class PruningWorker(BaseWorker):
         self,
         config: BackupConfig,
         stop_event: StopEvent,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
     ):
         super().__init__(
-            'pruning-worker', config, stop_event, verbose,
+            'pruning-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
         )
 
@@ -584,7 +605,7 @@ class RemoteBackupWorker(BaseWorker):
         self,
         config: BackupConfig,
         stop_event: StopEvent,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
@@ -602,7 +623,7 @@ class RemoteBackupWorker(BaseWorker):
         passed to `RemoteBackupManager(config, manager, client_id=,
         tls_dir=)`."""
         super().__init__(
-            'remote-backup-worker', config, stop_event, verbose,
+            'remote-backup-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
         )
         self.tls_dir = tls_dir
@@ -795,6 +816,7 @@ def _api_server_class():
         import socketserver
         import ssl
         from werkzeug.serving import ThreadedWSGIServer, WSGIRequestHandler
+        from werkzeug.urls import uri_to_iri
 
         log = logging.getLogger(__name__)
 
@@ -1225,6 +1247,29 @@ def _api_server_class():
                     return
                 super().log_error(format, *args)
 
+            def log_request(self, code='-', size='-'):
+                """werkzeug's per-request access line, demoted by status
+                class so the journal is not flooded: 1xx-3xx DEBUG, 4xx INFO,
+                5xx WARNING (a status that is not a number: INFO). Through
+                werkzeug's own `log`, so the logger name and the line format
+                are unchanged."""
+                try:
+                    status = int(code)
+                except (TypeError, ValueError):
+                    level = 'info'
+                else:
+                    level = 'warning' if status >= 500 else 'info' if status >= 400 else 'debug'
+                try:
+                    path = uri_to_iri(self.path)
+                    msg = f"{self.command} {path} {self.request_version}"
+                except AttributeError:
+                    msg = self.requestline  # `path` is unset after a bad request line
+                # The decoded path is client-controlled: escape control
+                # characters as werkzeug does (no ANSI colour, either: this
+                # goes to a log, not a terminal).
+                msg = _clip_for_log(msg).translate(_CONTROL_CHAR_TABLE)
+                self.log(level, '"%s" %s %s', msg, str(code), size)
+
         class ApiServer(ThreadedWSGIServer):
             def __init__(
                 self, host, port, app, gateway, *,
@@ -1560,7 +1605,7 @@ class ApiWorker(_SupervisorWatch, Process):
         self,
         config: BackupConfig,
         stop_event: StopEvent,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
@@ -1579,7 +1624,7 @@ class ApiWorker(_SupervisorWatch, Process):
         super().__init__(name='api-worker', daemon=True)
         self.config = config
         self.stop_event = stop_event
-        self.verbose = verbose
+        self.log_level = log_level
         self.config_db = config_db
         self._watch_init(reload_epoch, born_epoch, workers_lock)
         self._trust = None
@@ -1650,7 +1695,7 @@ class ApiWorker(_SupervisorWatch, Process):
         most `API_STOP_DRAIN` seconds). Then the server is shut down, its
         socket closed (so the replacement worker can bind the port), and the
         worker exits `WORKER_EXIT_RELOAD` or returns."""
-        _init_child_process(self.verbose)
+        _init_child_process(self.log_level)
         self._arm_supervisor_watch()
         self._hold_workers_lock()
         logger = logging.getLogger(__name__)

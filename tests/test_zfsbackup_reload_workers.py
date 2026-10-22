@@ -101,8 +101,8 @@ class TestConstructorTrio:
     @pytest.mark.parametrize("cls", ALL_FIVE)
     def test_the_old_positional_constructors_still_work(self, cls):
         stop = StopFlag()
-        worker = _build(cls, make_config(), stop, True)
-        assert worker.stop_event is stop and worker.verbose is True
+        worker = _build(cls, make_config(), stop, logging.DEBUG)
+        assert worker.stop_event is stop and worker.log_level == logging.DEBUG
         assert worker.reload_epoch is None
         assert worker.born_epoch == 0
         assert worker.workers_lock is None

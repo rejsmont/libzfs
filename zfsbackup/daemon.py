@@ -31,6 +31,7 @@ import os  # noqa: E402
 import socket  # noqa: E402
 import stat  # noqa: E402
 import sys  # noqa: E402
+import threading  # noqa: E402
 import time  # noqa: E402
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -60,9 +61,11 @@ from zfsbackup.runtime_config import (
 )
 from zfsbackup import daemonlock
 from zfsbackup import identity
+from zfsbackup import logsetup
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup import procident
 from zfsbackup import sdnotify
+from zfsbackup.version import version_string
 from zfsbackup.stopflag import ReloadEpoch, StopFlag
 from zfsbackup.workers import (
     WORKER_EXIT_RELOAD,
@@ -73,11 +76,9 @@ from zfsbackup.workers import (
 )
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+# Logging is configured by `main()` (`logsetup.configure`), not at import: an
+# importer (the test suite, a console-script wrapper) keeps its own, and every
+# worker configures its own process (`workers._init_child_process`).
 
 logger = logging.getLogger(__name__)
 
@@ -634,7 +635,7 @@ class BackupDaemon:
         self,
         config: BackupConfig,
         resolved_config: ResolvedConfigPath,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         key: Optional[Tuple[int, int]] = None,
         presence_lock=None,
@@ -672,7 +673,9 @@ class BackupDaemon:
         #: `config_path` rather than merely retyped, so a bare `Path` cannot
         #: sneak back in unnoticed.
         self.resolved_config = resolved_config
-        self.verbose = verbose
+        #: The numeric level (`--log-level`, `-v`), handed to every worker so
+        #: that it configures its own logging at the same level.
+        self.log_level = log_level
         self._presence_lock = presence_lock
         self._dry_run_override = dry_run_override
         self._workers_lock = workers_lock
@@ -922,7 +925,7 @@ class BackupDaemon:
         return cls(
             h.config,
             self._stop_event,
-            self.verbose,
+            self.log_level,
             reload_epoch=self._reload_epoch,
             born_epoch=h.epoch,
             workers_lock=self._workers_lock_path(),
@@ -983,6 +986,17 @@ class BackupDaemon:
         not between these two lines.
         """
         dispose_all()
+        if multiprocessing.get_start_method() == 'fork':
+            others = [t.name for t in threading.enumerate() if t is not threading.current_thread()]
+            if others:
+                # Today the supervisor is single-threaded. A thread added later
+                # that holds a lock (a logging handler's, the stdout buffer's)
+                # at the instant of the fork leaves it held for ever in the
+                # child, which then hangs on its first log line.
+                logger.error(
+                    "forking worker %s while other threads are running (%s): a lock one of "
+                    "them holds would stay locked in the child", name, ', '.join(others),
+                )
         h = self._handoff
         worker = self._new_worker(name)
         worker.start()
@@ -2178,6 +2192,25 @@ class BackupDaemon:
             self._spawn(name)
 
 
+class _VersionAction(argparse.Action):
+    """`--version`, building the line (which imports the store package for the
+    schema head) only when the flag is given."""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None):
+        super().__init__(option_strings, dest=dest, default=default, nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(version_string('zfsbackupd'))
+        parser.exit()
+
+
+def _log_level(args: argparse.Namespace) -> int:
+    """The numeric log level `--log-level` and `-v` ask for (default INFO)."""
+    return logsetup.resolve_level(
+        getattr(args, 'log_level', None), bool(getattr(args, 'verbose', False))
+    )
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -2214,7 +2247,18 @@ def main():
     parser.add_argument(
         '-v', '--verbose',
         action='store_true',
-        help='Enable verbose (debug) logging'
+        help='Enable verbose (debug) logging; same as --log-level debug'
+    )
+    parser.add_argument(
+        '--log-level',
+        choices=logsetup.LEVEL_NAMES,
+        default=None,
+        help='Log level (default: info). With -v, the finer of the two wins.'
+    )
+    parser.add_argument(
+        '--version',
+        action=_VersionAction,
+        help='Print the version, the wire protocol and the config schema, and exit'
     )
     parser.add_argument(
         '--test-config',
@@ -2224,9 +2268,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.setLevel(logging.DEBUG)
+    logsetup.configure(_log_level(args))
 
     abandoned: List[str] = []
     try:
@@ -2573,7 +2615,7 @@ def _run(args: argparse.Namespace, abandoned: Optional[List[str]] = None) -> int
     # DDL"). With live reload the supervisor reads on every accepted change,
     # so keep them out of the log unless something is actually wrong --
     # except under --verbose, which shows them as before.
-    if not getattr(args, 'verbose', False):
+    if _log_level(args) > logging.DEBUG:
         logging.getLogger('alembic').setLevel(logging.WARNING)
     # Read once and REMOVED from the environment before anything can fork,
     # start a forkserver or exec `zfs`: neither workers nor `zfs` inherit it.
@@ -2807,7 +2849,7 @@ def _run_startup(
         daemon = BackupDaemon(
             config,
             resolved,
-            verbose=args.verbose,
+            log_level=_log_level(args),
             key=key,
             presence_lock=lock,
             dry_run_override=bool(args.dry_run),
