@@ -28,7 +28,9 @@ from unittest.mock import MagicMock
 import pytest
 
 import _reload_workers
-from _reload_workers import FdProbeWorker, GatedSnapshotWorker, descriptors_on
+from _reload_workers import (
+    FdProbeWorker, GatedSnapshotWorker, SlowEnumerationPruningWorker, descriptors_on,
+)
 from test_zfsbackup_daemon_closeout import (  # noqa: F401
     SUPERVISOR,
     Parent,
@@ -875,3 +877,65 @@ class TestRealWorkerProcesses:
         (record,) = [json.loads(p.read_text()) for p in rec.glob("probe.*.json")]
         assert record["before"] == 0, "nothing inherited from the supervisor"
         assert record["after"] == 1, "the worker took exactly its own descriptor"
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.filterwarnings(
+    "ignore:This process \\(pid=.*\\) is multi-threaded, use of fork\\(\\) "
+    "may lead to deadlocks in the child:DeprecationWarning"
+)
+@pytest.mark.parametrize("method", START_METHODS)
+class TestPruningWorkerNoticesDuringTheEnumeration:
+    """Plan B: the received datasets cost a few `zfs get` each, so listing them is a safe point.
+    A REAL `PruningWorker` process, its real `_get_datasets`, over a ~20 s stubbed enumeration
+    (400 datasets, 50 ms each): a stop or a reload leaves within about a second and never prunes
+    from the partial list."""
+
+    @pytest.fixture
+    def slow(self, tmp_path):
+        started = []
+
+        def start(method):
+            rec = tmp_path / f"rec-{method}"
+            rec.mkdir()
+            stop, epoch = StopFlag(), ReloadEpoch()
+            worker = SlowEnumerationPruningWorker(
+                make_config(), stop, reload_epoch=epoch, born_epoch=0)
+            worker.start_method = method
+            worker.record_dir = str(rec)
+            started.append(worker)
+            worker.start()
+            assert wait_until(lambda: "enum:3" in _events(rec), 60), f"{method} worker never began"
+            return worker, rec, epoch, stop
+
+        yield start
+        for worker in started:
+            worker.kill()
+            worker.join(10)
+
+    def _check(self, worker, rec, expected_exit):
+        started = time.monotonic()
+        worker.join(30)
+        assert worker.exitcode == expected_exit
+        assert time.monotonic() - started < 10, "the enumeration was not interrupted"
+        events = _events(rec)
+        assert "cut" in events and "complete" not in events
+        assert len([e for e in events if e.startswith("enum:")]) < 400
+        assert [e for e in events if e.startswith("pruned:")] == [], "pruned from a partial list"
+
+    def test_a_reload_cuts_the_enumeration_and_nothing_is_pruned(self, slow, method):
+        worker, rec, epoch, stop = slow(method)
+        epoch.set(1)
+        self._check(worker, rec, WORKER_EXIT_RELOAD)
+
+    def test_a_stop_cuts_the_enumeration_and_nothing_is_pruned(self, slow, method):
+        worker, rec, epoch, stop = slow(method)
+        stop.set()
+        self._check(worker, rec, 0)
+
+    def test_stop_wins_over_reload_during_the_enumeration(self, slow, method):
+        worker, rec, epoch, stop = slow(method)
+        epoch.set(1)
+        stop.set()
+        self._check(worker, rec, 0)

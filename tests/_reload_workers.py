@@ -23,7 +23,7 @@ import os
 import time
 
 from _config_handoff import _SelectableStartMethod
-from zfsbackup.workers import ApiWorker, SnapshotWorker
+from zfsbackup.workers import ApiWorker, PruningWorker, SnapshotWorker
 
 
 class FakeDataset:
@@ -90,6 +90,55 @@ class GatedSnapshotWorker(_ForcedMethodWatch, SnapshotWorker):
         while not os.path.exists(self.release_path) and time.monotonic() < deadline:
             time.sleep(0.05)
         self._note(f"done:{dsi.name}")
+
+
+class _SlowEnumeration:
+    """Stands in for `DatasetManager` in `SlowEnumerationPruningWorker`: its
+    `received_datasets(should_stop)` keeps the real contract (check `should_stop`
+    before each dataset, return the partial list once it is true) but each
+    "dataset" takes `delay` seconds, so the enumeration lasts `count * delay`.
+    Every examined dataset is appended as `enum:<i>` to `<record_dir>/events`."""
+
+    datasets = ()
+
+    def __init__(self, note, count, delay):
+        self._note, self._count, self._delay = note, count, delay
+
+    def received_datasets(self, should_stop=None):
+        found = []
+        for i in range(self._count):
+            if should_stop is not None and should_stop():
+                self._note("cut")
+                return found
+            self._note(f"enum:{i}")
+            time.sleep(self._delay)
+            found.append(FakeDataset(f"recv/{i}"))
+        self._note("complete")
+        return found
+
+
+class SlowEnumerationPruningWorker(_ForcedMethodWatch, PruningWorker):
+    """The REAL `PruningWorker._get_datasets` over a slow, stubbed enumeration:
+    "a stop or a reload is noticed during the listing, not after it". A dataset
+    that reaches `_process_dataset` is appended as `pruned:<name>` -- after a
+    stop or reload there must be none."""
+
+    record_dir = None
+    count = 400
+    delay = 0.05
+
+    def _note(self, line):
+        fd = os.open(os.path.join(self.record_dir, "events"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (line + "\n").encode())
+        finally:
+            os.close(fd)
+
+    def _get_datasets(self, manager):
+        return PruningWorker._get_datasets(self, _SlowEnumeration(self._note, self.count, self.delay))
+
+    def _process_dataset(self, manager, dsi):
+        self._note(f"pruned:{dsi.name}")
 
 
 class FdProbeWorker(_ForcedMethodWatch, SnapshotWorker):

@@ -5,7 +5,7 @@ import pickle
 import pytest
 from libzfseasy.types import (
     Validate, Property, PropertyNames, ZFS, Dataset, Filesystem, 
-    Volume, Snapshot, SnapshotRange, Bookmark, InvalidNameError
+    Volume, Snapshot, SnapshotRange, Bookmark, InvalidNameError, InvalidValueError
 )
 
 
@@ -1504,3 +1504,125 @@ class TestPropertyNamesAdditions:
             Snapshot(Volume('pool/v'), 's').check_property('xattr')
         with pytest.raises(ValueError):
             Snapshot(Filesystem('pool/fs'), 's').check_property('volsize')
+
+
+class TestValidateValue:
+    """B1: `Validate.value` refuses what `zfs list -H` / `zfs get -H` output cannot frame: newline, carriage return,
+    tab and NUL. The message names the character and its offset, never the value."""
+
+    CHARS = [('\n', 'newline'), ('\r', 'carriage return'), ('\t', 'tab'), ('\x00', 'NUL')]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('char,what', CHARS, ids=[w for _, w in CHARS])
+    @pytest.mark.parametrize('prefix,suffix', [('', ''), ('abc', ''), ('', 'abc'), ('abc', 'def'), ('\u00e9\u4e2d', 'z')],
+                             ids=['alone', 'at-end', 'at-start', 'middle', 'after-multibyte'])
+    def test_each_character_is_refused_with_its_offset(self, char, what, prefix, suffix):
+        with pytest.raises(InvalidValueError) as info:
+            Validate.value(prefix + char + suffix)
+        assert what in str(info.value)
+        assert '(offset %d)' % len(prefix) in str(info.value)
+
+    @pytest.mark.unit
+    def test_it_is_a_value_error(self):
+        assert issubclass(InvalidValueError, ValueError)
+        assert not issubclass(InvalidValueError, InvalidNameError)
+        with pytest.raises(ValueError):
+            Validate.value('a\nb')
+
+    @pytest.mark.unit
+    def test_the_first_offending_character_is_reported(self):
+        with pytest.raises(InvalidValueError, match=r'tab \(offset 2\)'):
+            Validate.value('ab\tc\nd\x00')
+        with pytest.raises(InvalidValueError, match=r'newline \(offset 1\)'):
+            Validate.value('a\n\t')
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('value', [
+        '', 'plain', 'with spaces', ' leading and trailing ', "quotes ' \" ` and = signs", '100%', 'caf\u00e9 \u4e2d\u6587',
+        '\U0001F600', '\x0b\x0c\x1b\x7f', '\u2028\u2029\x85', '\\n is two characters', 'a' * 100000, 'file:///k',
+        'https://user:pass@host/x', 'lz4', '-', '\udcff',
+    ])
+    def test_everything_else_is_accepted(self, value):
+        Validate.value(value)                                  # must not raise
+        Validate.value(value, 'org.t:v')
+
+    @pytest.mark.unit
+    def test_a_huge_value_is_not_echoed(self):
+        value = 'SECRET' * 20000 + '\n' + 'TAIL' * 20000
+        with pytest.raises(InvalidValueError) as info:
+            Validate.value(value, 'org.t:v')
+        message = str(info.value)
+        assert 'SECRET' not in message and 'TAIL' not in message
+        assert len(message) < 300
+        assert 'offset 120000' in message
+
+    @pytest.mark.unit
+    def test_a_secret_value_is_not_echoed(self):
+        with pytest.raises(InvalidValueError) as info:
+            Validate.value('hunter2\nmore', 'org.t:secret')
+        assert 'hunter2' not in str(info.value) and 'more' not in str(info.value)
+
+    @pytest.mark.unit
+    def test_the_property_is_named(self):
+        with pytest.raises(InvalidValueError, match=r"^The value of 'org.t:v' contains a newline"):
+            Validate.value('a\nb', 'org.t:v')
+        with pytest.raises(InvalidValueError, match=r'^A property value contains a newline'):
+            Validate.value('a\nb')
+        with pytest.raises(InvalidValueError, match=r'^A property value contains a newline'):
+            Validate.value('a\nb', None)
+        with pytest.raises(InvalidValueError, match=r'^A property value contains a newline'):
+            Validate.value('a\nb', '')
+
+    @pytest.mark.unit
+    def test_a_long_property_name_is_clipped_to_64_characters(self):
+        prop = 'org.t:' + 'n' * 200
+        with pytest.raises(InvalidValueError) as info:
+            Validate.value('a\nb', prop)
+        message = str(info.value)
+        assert repr(prop[:64]) + '...' in message
+        assert prop[:65] not in message
+        assert len(message) < 250
+
+    @pytest.mark.unit
+    def test_a_property_name_of_exactly_64_is_not_marked_as_clipped(self):
+        prop = 'p' * 64
+        with pytest.raises(InvalidValueError) as info:
+            Validate.value('a\nb', prop)
+        assert repr(prop) + ' contains' in str(info.value)
+
+    @pytest.mark.unit
+    def test_a_hostile_property_name_cannot_inject_a_line_into_the_message(self):
+        with pytest.raises(InvalidValueError) as info:
+            Validate.value('a\nb', 'x\nFORGED log line\r\x00')
+        message = str(info.value)
+        assert '\n' not in message and '\r' not in message and '\x00' not in message
+
+    @pytest.mark.unit
+    def test_a_non_string_property_name_is_tolerated(self):
+        with pytest.raises(InvalidValueError, match=r"'42'"):
+            Validate.value('a\nb', 42)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('value', [0, 1024, 3.5, True, None, object(), ['a'], {'a': 1}])
+    def test_non_strings_are_checked_as_their_str(self, value):
+        Validate.value(value)                                  # str() of these has none of the four characters
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('char,what', CHARS, ids=[w for _, w in CHARS])
+    def test_non_strings_whose_str_has_a_bad_character_are_refused(self, char, what):
+        class Weird:
+            def __str__(self):
+                return 'a' + char + 'b'
+
+        with pytest.raises(InvalidValueError, match=what):
+            Validate.value(Weird(), 'org.t:v')
+        with pytest.raises(InvalidValueError):
+            Validate.value(Property('a' + char + 'b', 'local'), 'org.t:v')     # str(Property) is the value
+
+    @pytest.mark.unit
+    def test_is_linear_time(self):
+        import time
+        start = time.perf_counter()
+        for _ in range(20):
+            Validate.value('x' * 1_000_000)
+        assert time.perf_counter() - start < 2.0

@@ -13,18 +13,28 @@ SETUP (manual):
   ./scenarios/cleanup_test_pool.sh
 """
 
+import contextlib
+import logging
 import subprocess
 import time
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from typing import List
 
 import pytest
 
 import libzfseasy as zfs
-from libzfseasy.types import Dataset, Filesystem
+from libzfseasy.types import Dataset, Filesystem, Snapshot
 from libzfseasy.zfs import _zfs_cmd
 
-from zfsbackup.backup_manager import DatasetManager
+from zfsbackup.backup_manager import (
+    PROP_ANCHOR_PREFIX,
+    PROP_CLIENT_ID,
+    PROP_CONFIG,
+    PROP_INFLIGHT_PREFIX,
+    PROP_SOURCE_DATASET,
+    DatasetManager,
+)
 from zfsbackup.config import (
     BackupConfig,
     DatasetConfig,
@@ -133,28 +143,33 @@ def target_root(auto_zfs_pool):
         pass
 
 
-@pytest.fixture
-def source_cfg_path(tmp_path, source_fs):
-    """Write a client YAML config pointing to *source_fs* with a remote destination."""
-    cfg = tmp_path / 'client.yaml'
-    cfg.write_text(
-        f"datasets:\n"
-        f"  - name: {source_fs.name}\n"
-        f"    frequency: 1s\n"
-        f"    retention:\n"
-        f"      1h: 1d\n"
-        f"    remote:\n"
-        f"      - destination: server\n"
-        f"destinations:\n"
-        f"  server:\n"
-        f"    url: https://127.0.0.1:18082\n"
-        f"snapshot_prefix: autosnap\n"
-    )
-    return cfg
+# --- end-to-end send/receive rig (B-7) ---------------------------------------
+#
+# A real, mTLS-only `ApiWorker` on loopback serves a config database whose
+# `remote_backup.target_dataset` is a dataset on the test pool; a client identity
+# is pinned in that database exactly as `zfsbackup-config enroll` would pin it
+# (`store.trust`), and a client `RemoteBackupManager` whose destination carries
+# the server's fingerprint backs a real source dataset up to it. Both ends run
+# real `zfs send` / `zfs receive`.
+
+#: The id the server binds to the pinned client certificate. It names the
+#: server-side dataset: `<target>/<CLIENT_ID>/<source dataset without its pool>`.
+CLIENT_ID = 'b7-client'
+DEST = 'server'
 
 
 @pytest.fixture
-def server_cfg_path(tmp_path, source_fs, target_root):
+def api_port():
+    """A free loopback port for this test's API worker."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture
+def server_cfg_path(tmp_path, source_fs, target_root, api_port):
     """Write a server YAML config with remote_backup enabled."""
     cfg = tmp_path / 'server.yaml'
     # datasets list must be non-empty; use the source as a disabled placeholder.
@@ -166,7 +181,7 @@ def server_cfg_path(tmp_path, source_fs, target_root):
         f"  enabled: true\n"
         f"  target_dataset: {target_root}\n"
         f"api_host: 127.0.0.1\n"
-        f"api_port: 18082\n"
+        f"api_port: {api_port}\n"
         f"snapshot_prefix: autosnap\n"
     )
     return cfg
@@ -177,10 +192,9 @@ def server_config_db(tmp_path, server_cfg_path):
     """Import `server_cfg_path` into a fresh SQLite config store under
     `tmp_path` and return the `ResolvedConfigPath` addressing it.
 
-    `running_server` reads the server config from this store with
-    `read_config` and hands the resulting `BackupConfig` to a real
-    `ApiWorker` (workers never open the DB) -- `server_cfg_path` remains
-    this fixture's YAML input, unchanged.
+    The server config is read from this store with `read_config` and handed to
+    a real `ApiWorker` (workers never open the DB); the same database holds the
+    client pins (`store.trust`) and has its TLS directory (`<db>.tls`).
     """
     from zfsbackup.config.store import import_yaml, resolve_config_path
 
@@ -190,47 +204,300 @@ def server_config_db(tmp_path, server_cfg_path):
     return resolved
 
 
-@pytest.fixture
-def running_server(server_config_db):
-    """Start a real ApiWorker on port 18082 (HTTPS); wait until ready; tear down after the test."""
-    import warnings
+class _KilledStream:
+    """The client's real `zfs send` handle, cut off after `limit` bytes: the
+    next read raises, which is what a transport that died mid-transfer looks
+    like to `RemoteBackupManager` (it closes the handle -- killing `zfs send`
+    through the closed pipe -- and drops the websocket without a `done`)."""
 
-    import requests
-    from _tls_support import ensure_server_identity
-    from zfsbackup.config.store import read_config
+    def __init__(self, handle, limit):
+        self._handle, self._limit, self.sent = handle, limit, 0
+
+    def read(self, size=-1):
+        if self.sent >= self._limit:
+            raise RuntimeError('test: the stream was killed')
+        want = self._limit - self.sent if size is None or size < 0 else min(size, self._limit - self.sent)
+        data = self._handle.read(want)
+        self.sent += len(data)
+        return data
+
+    def close(self):
+        return self._handle.close()
+
+
+class E2E:
+    """An enrolled client and a running server over a real pool.
+
+    `source` is the client's dataset (one managed `DatasetManager` + a real
+    `RemoteBackupManager`); `server_ds` is where its backups land."""
+
+    def __init__(self, source, target_root, base, server_fp, client, client_tls,
+                 manager, remote_mgr, caplog, monkeypatch):
+        self.source = source
+        self.target_root = target_root
+        self.base = base
+        self.server_fp = server_fp
+        self.client = client                # the pinned client `Identity`
+        self.client_tls = client_tls
+        self.manager = manager
+        self.dsi = manager.datasets[0]
+        self.remote_mgr = remote_mgr
+        self.caplog = caplog
+        self.monkeypatch = monkeypatch
+        relative = source.name.split('/', 1)[1]
+        self.server_ds = f'{target_root}/{CLIENT_ID}/{relative}'
+
+    # -- the client's data ------------------------------------------------------
+    def snapshot(self, hours_ago):
+        """A real managed snapshot named for `hours_ago`; returns its short name."""
+        name = snap_name_at(hours_ago)
+        zfs.snapshot(self.source, name)
+        return name
+
+    def write(self, name, mib):
+        """Write `mib` MiB of incompressible data to `name` in the source's mountpoint."""
+        mountpoint = _zfs_get(self.source.name, 'mountpoint')
+        target = f'{mountpoint}/{name}'
+        cmd = ['dd', 'if=/dev/urandom', f'of={target}', 'bs=1048576', f'count={mib}']
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:      # a root-owned mountpoint (sudo-wrapped pool)
+            result = subprocess.run(['sudo', '-n'] + cmd, capture_output=True)
+        if result.returncode != 0:
+            pytest.skip(f'cannot write into the test dataset at {mountpoint}: '
+                        f'{result.stderr.decode(errors="replace").strip()}')
+
+    # -- the transfer ------------------------------------------------------------
+    def cycle(self):
+        """One worker-style pass: `begin_cycle()`, then `backup_dataset` to the destination."""
+        self.remote_mgr.begin_cycle()
+        return self.remote_mgr.backup_dataset(self.dsi, self.dsi.config.remote[0])
+
+    @contextlib.contextmanager
+    def killed_streams(self, limit):
+        """Within the block every `zfs send` the client starts dies after `limit`
+        bytes. Yields the list of `_KilledStream`s started."""
+        real = zfs.send.snapshot
+        streams = []
+
+        def killed(*args, **kwargs):
+            stream = _KilledStream(real(*args, **kwargs), limit)
+            streams.append(stream)
+            return stream
+
+        # `patch.object`, not `monkeypatch.setattr`: `snapshot` is a classmethod looked up through
+        # the INSTANCE, and monkeypatch's undo would leave the bound method behind as an instance
+        # attribute (shadowing the class); `patch.object` deletes what it added.
+        with mock.patch.object(zfs.send, 'snapshot', killed):
+            yield streams
+
+    # -- what is on each side --------------------------------------------------------
+    def local_snaps(self):
+        return _snapshot_guids(self.source.name)
+
+    def server_snaps(self):
+        return _snapshot_guids(self.server_ds)
+
+    def server_prop(self, prop):
+        return _zfs_get(self.server_ds, prop)
+
+    def server_local(self, prop):
+        """`prop` on the server dataset if set LOCALLY there, else None."""
+        return _zfs_get_local(self.server_ds, prop)
+
+    @contextlib.contextmanager
+    def properties_in_streams(self):
+        """Within the block every `zfs send` the client starts is a `-p` stream: the
+        source dataset's properties (the forged ones below included) travel in it. The
+        real client never does this; a hostile one can."""
+        real = zfs.send.snapshot
+
+        def with_properties(*args, **kwargs):
+            kwargs['properties'] = True
+            return real(*args, **kwargs)
+
+        with mock.patch.object(zfs.send, 'snapshot', with_properties):
+            yield
+
+    def forge_on_the_source(self):
+        """Put hostile values for the server's ownership and config properties on the
+        client's dataset, so that a `-p` stream carries them; -> the forged config."""
+        evil = DatasetConfig(
+            name='victim/data', frequency=timedelta(hours=1),
+            retention_rules=[RetentionRule(timedelta(seconds=1), timedelta(seconds=1))],
+        ).to_property()
+        zfs.set(self.source, {
+            PROP_CLIENT_ID: 'attacker',
+            PROP_SOURCE_DATASET: 'victim/data',
+            PROP_CONFIG: evil,
+        })
+        return evil
+
+    def wait_for_resume_token(self, timeout=30):
+        """The server's `receive_resume_token` once the aborted receive has saved it."""
+        deadline = time.monotonic() + timeout
+        token = '-'
+        while time.monotonic() < deadline:
+            if subprocess.run([_zfs_cmd(), 'list', '-H', self.server_ds],
+                              capture_output=True).returncode == 0:
+                token = self.server_prop('receive_resume_token')
+                if token not in ('-', ''):
+                    return token
+            time.sleep(0.2)
+        return token
+
+    def log_lines(self):
+        return [r.getMessage() for r in self.caplog.records if r.name.startswith('zfsbackup.remote')]
+
+
+def _zfs_get(dataset, prop):
+    result = subprocess.run(
+        [_zfs_cmd(), 'get', '-H', '-o', 'value', prop, dataset],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _zfs_get_local(dataset, prop):
+    """`prop` of `dataset` if it is set LOCALLY (`zfs get -s local`), else `None`.
+
+    `zfs get` without `-s` also reports an inherited or received value; the ownership
+    properties must be local on the server (plan B-1b) or a stream could replace them."""
+    result = subprocess.run(
+        [_zfs_cmd(), 'get', '-H', '-o', 'value', '-s', 'local', prop, dataset],
+        capture_output=True, text=True,
+    )
+    value = result.stdout.strip() if result.returncode == 0 else ''
+    return value or None
+
+
+def _zfs_get_source(dataset, prop):
+    """The SOURCE column of `prop` on `dataset` (`local`, `received`, `inherited from ...`, `-`), else `None`."""
+    result = subprocess.run(
+        [_zfs_cmd(), 'get', '-H', '-o', 'source', prop, dataset],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _zfs_get_received(dataset, prop):
+    """`prop` of `dataset` if a RECEIVED value is recorded for it (`zfs get -s received`), else `None`."""
+    result = subprocess.run(
+        [_zfs_cmd(), 'get', '-H', '-o', 'value', '-s', 'received', prop, dataset],
+        capture_output=True, text=True,
+    )
+    value = result.stdout.strip() if result.returncode == 0 else ''
+    return value or None
+
+
+def _snapshot_guids(dataset):
+    """`{short snapshot name: guid}` of `dataset`'s own snapshots (empty when it does not exist)."""
+    result = subprocess.run(
+        [_zfs_cmd(), 'list', '-H', '-p', '-t', 'snapshot', '-d', '1', '-o', 'name,guid', dataset],
+        capture_output=True, text=True,
+    )
+    guids = {}
+    for line in result.stdout.splitlines():
+        name, _, guid = line.partition('\t')
+        if '@' in name:
+            guids[name.split('@', 1)[1]] = int(guid)
+    return guids
+
+
+@pytest.fixture
+def api_server(server_config_db, tmp_path, source_fs, target_root):
+    """Start a real `ApiWorker` (HTTPS with required client certificates) for
+    `server_config_db`, with an enrolled client pinned in that database; wait
+    until it answers; tear it down after the test.
+
+    -> `SimpleNamespace(base, port, server_fp, client, client_tls, other_client_tls)`:
+    the `https://127.0.0.1:<port>` URL, the server certificate's fingerprint, the
+    pinned client `Identity` with its `<db>.tls`-style directory, and a directory
+    for a second, NOT enrolled client identity.
+    """
+    import os
+    import types
+
+    from _tls_support import client_identity, ensure_server_identity, pin_client, try_get
+    from zfsbackup.config.store import dispose_all, read_config
     from zfsbackup.stopflag import StopFlag
     from zfsbackup.workers import ApiWorker
 
-    # `ApiWorker` takes the supervisor's detached `BackupConfig` and a
-    # `StopFlag`; the config database path is for its TLS identity and client
-    # trust only (M9), and the supervisor would have created `<db>.tls/server.*`
-    # at startup.
+    if os.environ.get('MULTIPASS_VM'):
+        pytest.skip('the end-to-end tests write into the pool mountpoints from this host; '
+                    'run them on the machine that owns the pool')
+
+    # What the supervisor would have done at startup / what `enroll` does.
+    server = ensure_server_identity(server_config_db)
+    client_tls = tmp_path / 'client.db.tls'
+    client = client_identity(client_tls)
+    pin_client(server_config_db, client, CLIENT_ID, server_fp=server.fingerprint)
     snapshot = read_config(server_config_db)
-    ensure_server_identity(server_config_db)
+    dispose_all()                       # nothing in this process holds the database open
+
+    port = snapshot.config.api_port
     stop = StopFlag()
     worker = ApiWorker(snapshot.config, stop, verbose=False, config_db=server_config_db)
     worker.start()
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if not worker.is_alive():
+                pytest.fail(f'the API worker exited early ({worker.exitcode})')
+            answer = try_get(port, '/health')
+            if isinstance(answer, tuple) and answer[0] == 200:
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail('the API worker did not answer /health within 30 seconds')
 
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')      # self-signed server certificate
-                if requests.get('https://127.0.0.1:18082/health', timeout=1, verify=False).ok:
-                    break
-        except Exception:
-            pass
-        time.sleep(0.3)
-    else:
-        worker.terminate()
-        pytest.fail('Server ApiWorker did not start within 15 seconds')
+        yield types.SimpleNamespace(
+            base=f'https://127.0.0.1:{port}', port=port, server_fp=server.fingerprint,
+            client=client, client_tls=client_tls, other_client_tls=tmp_path / 'other.db.tls',
+        )
+    finally:
+        stop.set()
+        worker.join(timeout=30)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=10)
+        if worker.is_alive():
+            worker.kill()
+            worker.join(timeout=10)
 
-    yield 'https://127.0.0.1:18082'
 
-    stop.set()
-    worker.join(timeout=5)
-    if worker.is_alive():
-        worker.terminate()
+def _client_config(source_fs, base, server_fp):
+    """The client's config: `source_fs` backed up to the enrolled destination `server`."""
+    return BackupConfig(
+        datasets=[
+            DatasetConfig(
+                name=source_fs.name,
+                frequency=timedelta(hours=24),
+                retention_rules=[RetentionRule(timedelta(hours=1), timedelta(days=30))],
+                remote=[RemoteDatasetConfig(destination=DEST)],
+            )
+        ],
+        destinations={DEST: Destination(url=base, server_fingerprint=server_fp)},
+        snapshot_prefix='autosnap',
+    )
+
+
+@pytest.fixture
+def e2e(api_server, source_fs, target_root, caplog, monkeypatch):
+    """The enrolled client against the running server, on real datasets."""
+    caplog.set_level(logging.DEBUG, logger='zfsbackup.remote')
+    config = _client_config(source_fs, api_server.base, api_server.server_fp)
+    manager = DatasetManager(config)
+    remote_mgr = RemoteBackupManager(
+        config, manager, client_id=CLIENT_ID, tls_dir=api_server.client_tls
+    )
+    rig = E2E(source_fs, target_root, api_server.base, api_server.server_fp, api_server.client,
+              api_server.client_tls, manager, remote_mgr, caplog, monkeypatch)
+    try:
+        yield rig
+    finally:
+        remote_mgr.close()
+        # A killed stream leaves partial receive state on the server dataset;
+        # `target_root`'s recursive destroy removes it with the rest.
 
 
 # ---------------------------------------------------------------------------
@@ -437,119 +704,422 @@ class TestRealPruning:
 # TestRealSendReceive
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(
-    reason="needs the M16 sweep for M10/M11: these drive the remote client against a real "
-    "ApiWorker, which is now mTLS-only; they must enroll a client identity (a pin in the "
-    "server database, `Destination.server_fingerprint`, `RemoteBackupManager(client_id=, "
-    "tls_dir=)`) instead of using the removed `ClientIdentity`"
-)
+MIB = 1024 * 1024
+
+
 class TestRealSendReceive:
-    """End-to-end backup tests using two real daemon processes (client + server ApiWorker)."""
+    """End-to-end backups over real mTLS: a client enrolled in the server's
+    config database sends a real dataset to a real `ApiWorker`, which runs a real
+    `zfs receive`.
 
-    def _setup_client(self, source_cfg_path):
-        config = BackupConfig.from_file(source_cfg_path)
-        manager = DatasetManager(config)
-        dsi = manager.datasets[0]
-        remote_mgr = RemoteBackupManager(config, manager, client_id='real-client')
-        return config, manager, dsi, remote_mgr
+    The bookkeeping contract checked after every transfer: the snapshots on the
+    server carry the SAME guids as the client's (a byte-for-byte replica, not a
+    look-alike), the anchor names the snapshot actually sent, and the
+    `inflight` pin is cleared once the anchor is written.
+    """
 
-    def _server_snap_names(self, target_root, source_fs, config):
-        """Return short snapshot names present on the server-side target dataset."""
-        client_id = 'real-client'   # (see the skip reason above)
-        relative = source_fs.name.split('/', 1)[1]
-        server_ds = f'{target_root}/{client_id}/{relative}'
-        return list_real_snapshot_names(server_ds)
+    def _assert_replicated(self, e2e, *names):
+        local, server = e2e.local_snaps(), e2e.server_snaps()
+        for name in names:
+            assert name in server, f'{name} is not on the server: {sorted(server)}'
+            assert server[name] == local[name], f'{name}: guid differs between client and server'
 
-    def test_full_initial_backup_transfers_snapshot(
-        self, source_fs, target_root, source_cfg_path, running_server
-    ):
-        config, manager, dsi, remote_mgr = self._setup_client(source_cfg_path)
+    # -- full and incremental ------------------------------------------------
+    def test_full_send_replicates_the_snapshot(self, e2e):
+        e2e.write('data.bin', 4)
+        s1 = e2e.snapshot(2)
 
-        manager.create_snapshot(dsi)
-        snaps = manager.list_snapshots(dsi)
-        assert len(snaps) == 1
+        assert e2e.cycle() is True
 
-        result = remote_mgr.backup_dataset(dsi, dsi.config.remote[0])
-        assert result is True
+        assert list(e2e.server_snaps()) == [s1]
+        self._assert_replicated(e2e, s1)
+        assert any(f'Sending full snapshot {e2e.source.name}@{s1}' in m for m in e2e.log_lines())
+        # The data arrived, not just the name.
+        assert (_zfs_get(f'{e2e.server_ds}@{s1}', 'logicalreferenced')
+                == _zfs_get(f'{e2e.source.name}@{s1}', 'logicalreferenced'))
+        assert e2e.server_prop('receive_resume_token') == '-'
 
-        server_snaps = self._server_snap_names(target_root, source_fs, config)
-        assert snaps[0].name in server_snaps
+    def test_anchor_and_inflight_after_a_full_send(self, e2e):
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(2)
 
-    def test_incremental_backup_transfers_second_snapshot(
-        self, source_fs, target_root, source_cfg_path, running_server
-    ):
-        config, manager, dsi, remote_mgr = self._setup_client(source_cfg_path)
+        assert e2e.cycle() is True
 
-        # First backup (full send).
-        manager.create_snapshot(dsi)
-        remote_mgr.backup_dataset(dsi, dsi.config.remote[0])
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == s1
+        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert _zfs_get(e2e.source.name, f'{PROP_INFLIGHT_PREFIX}{DEST}') == '-'
 
-        # Wait so the second snapshot gets a distinct 1s-aligned name.
-        time.sleep(2)
-        manager.create_snapshot(dsi)
-        snaps = manager.list_snapshots(dsi)
-        assert len(snaps) == 2
+    def test_server_dataset_is_stamped_with_its_owner(self, e2e):
+        e2e.write('data.bin', 1)
+        e2e.snapshot(2)
 
-        # Second backup (incremental send).
-        result = remote_mgr.backup_dataset(dsi, dsi.config.remote[0])
-        assert result is True
+        assert e2e.cycle() is True
 
-        server_snaps = self._server_snap_names(target_root, source_fs, config)
-        assert len(server_snaps) == 2
+        assert e2e.server_prop(PROP_CLIENT_ID) == CLIENT_ID
+        assert e2e.server_prop(PROP_SOURCE_DATASET) == e2e.source.name
+        stored = DatasetConfig.from_property(e2e.server_prop(PROP_CONFIG))
+        assert stored.name == e2e.source.name
+        # The client's own bookkeeping properties are not part of the stream.
+        assert e2e.server_prop(f'{PROP_ANCHOR_PREFIX}{DEST}') == '-'
+        assert e2e.server_prop(f'{PROP_INFLIGHT_PREFIX}{DEST}') == '-'
 
-    def test_anchor_set_to_latest_snapshot_name(
-        self, source_fs, target_root, source_cfg_path, running_server
-    ):
-        config, manager, dsi, remote_mgr = self._setup_client(source_cfg_path)
+    # -- the server's own properties are LOCAL and survive a hostile stream (plan B-1b) -------------
+    def _assert_local_ownership(self, e2e):
+        assert e2e.server_local(PROP_CLIENT_ID) == CLIENT_ID
+        assert e2e.server_local(PROP_SOURCE_DATASET) == e2e.source.name
 
-        manager.create_snapshot(dsi)
-        snaps = manager.list_snapshots(dsi)
-        latest_name = snaps[0].name
+    def test_ownership_properties_are_local_on_the_server_after_each_receive(self, e2e):
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(3)
+        assert e2e.cycle() is True
+        self._assert_local_ownership(e2e)
+        assert e2e.server_local(PROP_CONFIG) == e2e.dsi.config.to_property(DEST)
 
-        remote_mgr.backup_dataset(dsi, dsi.config.remote[0])
+        e2e.write('more.bin', 1)
+        s2 = e2e.snapshot(2)
+        assert e2e.cycle() is True
+        assert set(e2e.server_snaps()) == {s1, s2}
+        self._assert_local_ownership(e2e)
 
-        anchor = manager.get_anchor(dsi, 'server')
-        assert anchor == latest_name
+    def test_nothing_received_is_recorded_for_the_excluded_properties(self, e2e):
+        """`zfs receive -o <name>=<server's value>` for the three owned names (plan B-1b; `-x` does
+        not protect a local value on a full `-F` receive of a `-p` stream): even a stream that
+        carries them leaves no RECEIVED value behind."""
+        e2e.forge_on_the_source()
+        e2e.write('data.bin', 1)
+        e2e.snapshot(2)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is True
+        for prop in (PROP_CLIENT_ID, PROP_SOURCE_DATASET, PROP_CONFIG):
+            assert _zfs_get_received(e2e.server_ds, prop) is None, prop
 
-    def test_fresh_anchor_skips_backup_in_worker(
-        self, source_fs, target_root, source_cfg_path, running_server
-    ):
-        """RemoteBackupWorker._process_dataset should skip transfer when anchor is fresh."""
+    def test_a_full_properties_stream_cannot_rewrite_the_ownership(self, e2e):
+        e2e.forge_on_the_source()
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(2)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is True
+        assert list(e2e.server_snaps()) == [s1]
+        # local, and the BOUND id / the real client dataset -- not the forged ones
+        assert e2e.server_local(PROP_CLIENT_ID) == CLIENT_ID
+        assert e2e.server_local(PROP_SOURCE_DATASET) == e2e.source.name
+        assert e2e.server_prop(PROP_CLIENT_ID) == CLIENT_ID
+        assert e2e.server_prop(PROP_SOURCE_DATASET) == e2e.source.name
+
+    def test_an_incremental_properties_stream_cannot_rewrite_the_ownership(self, e2e):
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(3)
+        assert e2e.cycle() is True
+        e2e.forge_on_the_source()
+        e2e.write('more.bin', 1)
+        s2 = e2e.snapshot(2)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is True
+        assert set(e2e.server_snaps()) == {s1, s2}
+        assert e2e.server_local(PROP_CLIENT_ID) == CLIENT_ID
+        assert e2e.server_local(PROP_SOURCE_DATASET) == e2e.source.name
+
+    def test_a_properties_stream_cannot_replace_the_config_the_server_prunes_by(self, e2e):
+        """The negotiate writes the canonical config before the stream; the stream's own copy must
+        not be the one in effect afterwards (the server prunes received datasets by it)."""
+        evil = e2e.forge_on_the_source()
+        e2e.write('data.bin', 1)
+        e2e.snapshot(2)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is True
+        assert e2e.server_prop(PROP_CONFIG) != evil, 'the forged config is the one in effect'
+        assert e2e.server_local(PROP_CONFIG) == e2e.dsi.config.to_property(DEST)
+
+    def test_the_next_cycle_restores_the_config_whatever_the_stream_carried(self, e2e):
+        """Negotiate writes the config on every cycle, so the window is one cycle at most."""
+        e2e.forge_on_the_source()
+        e2e.write('data.bin', 1)
+        e2e.snapshot(3)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is True
+        e2e.write('more.bin', 1)
+        e2e.snapshot(2)
+        assert e2e.cycle() is True                           # an ordinary client this time
+        assert e2e.server_local(PROP_CONFIG) == e2e.dsi.config.to_property(DEST)
+        self._assert_local_ownership(e2e)
+
+    # -- B-1b: the three owned values are in effect, as LOCAL values, right after any `-p` stream ------
+    def _owned_expected(self, e2e):
+        return {
+            PROP_CONFIG: e2e.dsi.config.to_property(DEST),
+            PROP_CLIENT_ID: CLIENT_ID,
+            PROP_SOURCE_DATASET: e2e.source.name,
+        }
+
+    def _assert_owned_values_in_effect(self, e2e, forged_config):
+        """`config`, `client_id` and `source_dataset` are LOCAL on the server dataset and equal to
+        the server's own values (the stored canonical config, the bound id, the URL's dataset) --
+        the effective value, the local value and the source column all agree, whatever the stream
+        carried."""
+        for prop, expected in self._owned_expected(e2e).items():
+            assert e2e.server_local(prop) == expected, f'{prop}: local value'
+            assert e2e.server_prop(prop) == expected, f'{prop}: effective value'
+            assert _zfs_get_source(e2e.server_ds, prop) == 'local', f'{prop}: source'
+        assert e2e.server_prop(PROP_CONFIG) != forged_config
+
+    def test_owned_values_are_local_right_after_a_full_properties_stream(self, e2e):
+        forged = e2e.forge_on_the_source()
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(2)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is True
+        assert list(e2e.server_snaps()) == [s1]
+        self._assert_owned_values_in_effect(e2e, forged)
+
+    def test_owned_values_are_local_right_after_an_incremental_properties_stream(self, e2e):
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(3)
+        assert e2e.cycle() is True
+        forged = e2e.forge_on_the_source()
+        e2e.write('more.bin', 1)
+        s2 = e2e.snapshot(2)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is True
+        assert set(e2e.server_snaps()) == {s1, s2}
+        self._assert_owned_values_in_effect(e2e, forged)
+
+    def test_owned_values_are_local_right_after_a_resumed_full_properties_stream(self, e2e):
+        """The first `-p` send is killed; the resumed one (`zfs send -t`, the flags are in the
+        token) completes it."""
+        forged = e2e.forge_on_the_source()
+        e2e.write('data.bin', 24)
+        s1 = e2e.snapshot(3)
+        with e2e.properties_in_streams(), e2e.killed_streams(4 * MIB) as streams:
+            assert e2e.cycle() is False
+        assert streams and streams[0].sent == 4 * MIB
+        assert e2e.wait_for_resume_token() not in ('-', ''), 'the server saved no partial receive state'
+        # the aborted receive already carried the server's values
+        assert e2e.server_local(PROP_CLIENT_ID) == CLIENT_ID
+        assert e2e.cycle() is True                           # resumes
+        assert any(f'Resuming interrupted transfer for {e2e.source.name}@{s1}' in m for m in e2e.log_lines())
+        assert list(e2e.server_snaps()) == [s1]
+        self._assert_owned_values_in_effect(e2e, forged)
+
+    def test_owned_values_are_local_right_after_a_resumed_incremental_properties_stream(self, e2e):
+        e2e.write('base.bin', 1)
+        s1 = e2e.snapshot(5)
+        assert e2e.cycle() is True
+        forged = e2e.forge_on_the_source()
+        e2e.write('data.bin', 24)
+        s2 = e2e.snapshot(3)
+        with e2e.properties_in_streams(), e2e.killed_streams(4 * MIB) as streams:
+            assert e2e.cycle() is False
+        assert streams
+        assert e2e.wait_for_resume_token() not in ('-', ''), 'the server saved no partial receive state'
+        assert e2e.cycle() is True
+        assert any(f'Resuming interrupted transfer for {e2e.source.name}@{s2}' in m for m in e2e.log_lines())
+        assert set(e2e.server_snaps()) == {s1, s2}
+        self._assert_owned_values_in_effect(e2e, forged)
+
+    def test_owned_values_are_local_after_an_ordinary_stream_too(self, e2e):
+        e2e.write('data.bin', 1)
+        e2e.snapshot(2)
+        assert e2e.cycle() is True
+        self._assert_owned_values_in_effect(e2e, forged_config='')
+
+    def test_incremental_send_transfers_the_second_snapshot(self, e2e):
+        e2e.write('data.bin', 2)
+        s1 = e2e.snapshot(3)
+        assert e2e.cycle() is True
+
+        e2e.write('more.bin', 2)
+        s2 = e2e.snapshot(2)
+        assert e2e.cycle() is True
+
+        assert set(e2e.server_snaps()) == {s1, s2}
+        self._assert_replicated(e2e, s1, s2)
+        assert any(f'incremental from {s1}' in m for m in e2e.log_lines())
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == s2
+        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert (_zfs_get(f'{e2e.server_ds}@{s2}', 'logicalreferenced')
+                == _zfs_get(f'{e2e.source.name}@{s2}', 'logicalreferenced'))
+
+    def test_incremental_send_across_an_intermediate_snapshot(self, e2e):
+        # B-5 will make every managed intermediate arrive; for now the contract is
+        # the base and the newest snapshot are on the server with matching guids.
+        e2e.write('data.bin', 2)
+        s1 = e2e.snapshot(4)
+        assert e2e.cycle() is True
+
+        e2e.write('more.bin', 1)
+        e2e.snapshot(3)
+        e2e.write('even_more.bin', 1)
+        s3 = e2e.snapshot(2)
+        assert e2e.cycle() is True
+
+        self._assert_replicated(e2e, s1, s3)
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == s3
+
+    def test_a_cycle_with_nothing_new_sends_nothing(self, e2e):
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(2)
+        assert e2e.cycle() is True
+        before = e2e.server_snaps()
+
+        assert e2e.cycle() is True
+
+        assert e2e.server_snaps() == before
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == s1
+        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+
+    # -- resume after a killed stream ----------------------------------------
+    def _kill_a_first_send(self, e2e, snapshot_hours_ago=3, data_mib=24, after=4 * MIB):
+        """Write data, snapshot it, and kill the first send `after` bytes in.
+        Leaves the server holding a resume token. -> the snapshot's short name."""
+        e2e.write('data.bin', data_mib)
+        s1 = e2e.snapshot(snapshot_hours_ago)
+        with e2e.killed_streams(after) as streams:
+            assert e2e.cycle() is False
+        assert streams and streams[0].sent == after
+        token = e2e.wait_for_resume_token()
+        assert token not in ('-', ''), 'the server saved no partial receive state'
+        return s1
+
+    def test_a_killed_stream_leaves_the_pin_and_no_anchor(self, e2e):
+        s1 = self._kill_a_first_send(e2e)
+
+        assert e2e.server_snaps() == {}
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) is None
+        # The pin survives a failed send: both ends stay protected from the pruner.
+        assert e2e.manager.get_inflight(e2e.dsi, DEST) == ('', s1)
+        assert any('Transfer failed' in m for m in e2e.log_lines())
+
+    def test_resume_after_a_killed_stream_completes_the_snapshot(self, e2e):
+        s1 = self._kill_a_first_send(e2e)
+
+        assert e2e.cycle() is True
+
+        logs = e2e.log_lines()
+        assert any(f'Resuming interrupted transfer for {e2e.source.name}@{s1}' in m for m in logs)
+        assert not any('sending fresh' in m for m in logs)
+        assert list(e2e.server_snaps()) == [s1]
+        self._assert_replicated(e2e, s1)
+        assert e2e.server_prop('receive_resume_token') == '-'
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == s1
+        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert (_zfs_get(f'{e2e.server_ds}@{s1}', 'logicalreferenced')
+                == _zfs_get(f'{e2e.source.name}@{s1}', 'logicalreferenced'))
+
+    def test_resume_is_followed_by_a_send_to_the_newest_snapshot(self, e2e):
+        s1 = self._kill_a_first_send(e2e, snapshot_hours_ago=3)
+        e2e.write('newer.bin', 1)
+        s2 = e2e.snapshot(2)
+
+        assert e2e.cycle() is True
+
+        logs = e2e.log_lines()
+        assert any(f'Resumed {e2e.source.name}@{s1}' in m for m in logs)
+        assert any(f'incremental from {s1}' in m for m in logs)
+        assert set(e2e.server_snaps()) == {s1, s2}
+        self._assert_replicated(e2e, s1, s2)
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == s2
+        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+
+    def test_a_token_for_a_destroyed_snapshot_is_discarded_for_a_fresh_send(self, e2e):
+        s1 = self._kill_a_first_send(e2e, snapshot_hours_ago=3)
+        zfs.destroy(Snapshot(e2e.source, s1), destroy=True)
+        e2e.write('newer.bin', 1)
+        s2 = e2e.snapshot(2)
+
+        assert e2e.cycle() is True
+
+        logs = e2e.log_lines()
+        assert any('Not resuming' in m and 'sending fresh' in m for m in logs)
+        assert not any('Resuming interrupted transfer' in m for m in logs)
+        assert list(e2e.server_snaps()) == [s2]
+        self._assert_replicated(e2e, s2)
+        assert e2e.server_prop('receive_resume_token') == '-'
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == s2
+
+    # -- the worker's scheduling -----------------------------------------------
+    def _worker(self, e2e):
+        from zfsbackup.stopflag import StopFlag
         from zfsbackup.workers import RemoteBackupWorker
 
-        config, manager, dsi, remote_mgr = self._setup_client(source_cfg_path)
+        worker = RemoteBackupWorker(
+            e2e.manager.config, StopFlag(), tls_dir=e2e.client_tls, client_id=CLIENT_ID
+        )
+        worker._remote_manager = e2e.remote_mgr
+        return worker
 
-        manager.create_snapshot(dsi)
-        remote_mgr.backup_dataset(dsi, dsi.config.remote[0])
-        first_server_snaps = self._server_snap_names(target_root, source_fs, config)
-        assert len(first_server_snaps) == 1
+    def test_fresh_anchor_skips_the_backup_in_the_worker(self, e2e):
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(3)
+        assert e2e.cycle() is True
+        e2e.snapshot(2)     # newer, but the anchor (3h) is younger than the 24h frequency
 
-        # Simulate a second worker cycle immediately — anchor age < frequency (1s) → skip.
-        worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
-        worker._remote_manager = remote_mgr
-        worker._process_dataset(manager, dsi)
+        self._worker(e2e)._process_dataset(e2e.manager, e2e.dsi)
 
-        second_server_snaps = self._server_snap_names(target_root, source_fs, config)
-        assert len(second_server_snaps) == 1  # no new snapshot transferred
+        assert list(e2e.server_snaps()) == [s1]
 
-    def test_negotiate_reports_common_snapshot_after_full_backup(
-        self, source_fs, target_root, source_cfg_path, running_server
-    ):
-        import requests as req
+    def test_stale_anchor_makes_the_worker_send(self, e2e):
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(3)
+        assert e2e.cycle() is True
+        s2 = e2e.snapshot(2)
+        e2e.dsi.config.remote[0].frequency = timedelta(minutes=1)   # anchor is 3h old
 
-        config, manager, dsi, remote_mgr = self._setup_client(source_cfg_path)
+        worker = self._worker(e2e)
+        worker._remote_manager.begin_cycle()
+        worker._process_dataset(e2e.manager, e2e.dsi)
 
-        manager.create_snapshot(dsi)
-        snaps = manager.list_snapshots(dsi)
-        remote_mgr.backup_dataset(dsi, dsi.config.remote[0])
+        assert set(e2e.server_snaps()) == {s1, s2}
+        self._assert_replicated(e2e, s1, s2)
 
-        client_id = 'real-client'   # (see the skip reason above)
-        url = f'{running_server}/backup/{client_id}/{source_fs.name}/negotiate'
-        resp = req.post(url, json={
-            'snapshots': [s.name for s in snaps],
-            'config': dsi.config.to_property(),
-        })
+    # -- protocol and trust ------------------------------------------------------
+    def test_negotiate_reports_the_common_snapshot(self, e2e):
+        from urllib.parse import quote
 
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data['common_snapshot'] == snaps[0].name
+        from zfsbackup import identity
+        from zfsbackup.protocol import protocol_headers
+
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(2)
+        assert e2e.cycle() is True
+        url = f'{e2e.base}/backup/{CLIENT_ID}/{quote(e2e.source.name, safe="/")}/negotiate'
+
+        session = identity.pinned_session(e2e.client, e2e.server_fp, timeout=15)
+        session.headers.update(protocol_headers())          # every endpoint but /health needs it (S-5)
+        try:
+            known = session.post(url, json={
+                'snapshots': [s1], 'config': e2e.dsi.config.to_property(),
+            })
+            unknown = session.post(url, json={
+                'snapshots': ['autosnap_19990101000000'], 'config': e2e.dsi.config.to_property(),
+            })
+        finally:
+            session.close()
+
+        assert known.status_code == 200
+        assert known.json()['common_snapshot'] == s1
+        assert known.json()['server_dataset'] == e2e.server_ds
+        assert unknown.status_code == 200
+        assert unknown.json()['common_snapshot'] is None
+
+    def test_a_client_that_is_not_enrolled_gets_nothing_onto_the_pool(self, e2e, api_server):
+        from _tls_support import client_identity
+
+        client_identity(api_server.other_client_tls)        # a valid identity, but never pinned
+        stranger = RemoteBackupManager(
+            e2e.manager.config, e2e.manager, client_id=CLIENT_ID, tls_dir=api_server.other_client_tls
+        )
+        try:
+            e2e.write('data.bin', 1)
+            e2e.snapshot(2)
+
+            stranger.begin_cycle()
+            assert stranger.backup_dataset(e2e.dsi, e2e.dsi.config.remote[0]) is False
+        finally:
+            stranger.close()
+
+        errors = [r.getMessage() for r in e2e.caplog.records
+                  if r.name.startswith('zfsbackup.remote') and r.levelno >= logging.ERROR]
+        assert any('does not trust this client' in m or 'connection reset after TLS handshake' in m
+                   for m in errors), errors
+        assert _zfs_get(e2e.server_ds, 'name') is None
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) is None

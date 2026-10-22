@@ -91,6 +91,7 @@ from zfsbackup import daemonlock, identity
 from zfsbackup.cli import enroll as enroll_cli
 from zfsbackup.cli import write as cli_write
 from zfsbackup.config.store import ConfigBusy, ConfigConflict, dispose_all, resolve_config_path, revoke_pin
+from zfsbackup.protocol import PROTOCOL_HEADER, PROTOCOL_VERSION
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -577,7 +578,8 @@ class TestIdempotency:
         (Reply(503, {"error": "busy", "retry": True}), 75, "busy (HTTP 503)"),
         (Reply(404, {}), 1, "does not look like a zfsbackup server"),
         (Reply(200, {"client_id": 7}), 1, "unexpected body"),
-        (Reply(200, {"client_id": CID, "fingerprint": "ee" * 32}), 1, "reports certificate"),
+        (Reply(200, {"client_id": CID, "fingerprint": "ee" * 32, "protocol": PROTOCOL_VERSION}), 1,
+         "reports certificate"),
         (Reply(200, "<html>nope</html>"), 1, "unexpected body"),
     ], ids=["500", "503-retry", "404", "bad-body", "wrong-fingerprint", "html"])
     def test_a_whoami_answer_that_is_not_trust_or_distrust(self, run, enrolled, effect, code, fragment):
@@ -2073,3 +2075,425 @@ class TestPromptOnATty:
         assert status == 1
         assert "TYPED-SECRET-TEXT" not in output
         assert "malformed enrollment token" in output
+
+
+# --------------------------------------------------------------------------
+# The wire protocol version (plan S-5)
+# --------------------------------------------------------------------------
+
+#: The WSGI key of the header, as the recording middleware keeps it (`Seen.headers`).
+PROTOCOL_KEY = "HTTP_" + PROTOCOL_HEADER.upper().replace("-", "_")
+UPGRADE = "client and the server must be upgraded together"
+NO_VERSION = "no wire protocol version (it predates the protocol check)"
+
+
+def refusal_426(protocol=2, **extra):
+    body = {"error": "unsupported zfsbackup protocol", "reason": "protocol", "supported": [protocol]}
+    if protocol is not None:
+        body["protocol"] = protocol
+    return Reply(426, {**body, **extra})
+
+
+class TestProtocolVersion:
+    """`enroll` names its protocol in every request (`X-Zfsbackup-Protocol`), refuses a server that
+    answers 426 with reason `protocol`, and refuses a `/whoami` whose `protocol` is missing, not an
+    int, a bool or unsupported -- after the body-type check, before the fingerprint check. The token
+    is never risked on a server it cannot speak to."""
+
+    @pytest.fixture
+    def enrolled(self, run, client, make_server, reloads):
+        srv = make_server()
+        token = srv.token()
+        assert do_enroll(run, client, srv, token).exit_code == 0
+        reloads.clear()
+        srv.log.clear()
+        return types.SimpleNamespace(srv=srv, token=token, db=client, reloads=reloads)
+
+    # -- the header is sent ---------------------------------------------------------------------
+    def test_the_enroll_request_carries_it(self, run, client, make_server):
+        srv = make_server()
+        assert do_enroll(run, client, srv, srv.token()).exit_code == 0
+        (request,) = srv.seen("/enroll")
+        assert request.headers[PROTOCOL_KEY] == str(PROTOCOL_VERSION) == "1"
+
+    def test_the_whoami_request_carries_it(self, run, enrolled):
+        assert do_enroll(run, enrolled.db, enrolled.srv, enrolled.token).exit_code == 0
+        (request,) = enrolled.srv.seen("/whoami")
+        assert request.headers[PROTOCOL_KEY] == "1"
+
+    def test_every_request_of_a_run_carries_it(self, run, enrolled):
+        enrolled.srv.on("/whoami", Reply(403, {"error": "client not trusted"}), then=None)
+        assert do_enroll(run, enrolled.db, enrolled.srv, enrolled.token).exit_code in (0, 1)
+        assert enrolled.srv.log
+        for request in enrolled.srv.log:
+            assert request.headers.get(PROTOCOL_KEY) == "1", request
+
+    def test_the_real_server_accepts_it_without_further_configuration(self, run, client, make_server):
+        """The control for every 426 test below: nothing but the header stands between this client
+        and a real server."""
+        srv = make_server()
+        assert do_enroll(run, client, srv, srv.token()).exit_code == 0
+        assert dest(client).server_fingerprint == srv.fp
+
+    # -- a real server that speaks another protocol --------------------------------------------------
+    def test_a_real_server_with_another_protocol_is_refused_and_the_token_is_not_spent(
+        self, run, client, make_server, reloads, monkeypatch
+    ):
+        from zfsbackup import api
+        srv = make_server()
+        token = srv.token()
+        monkeypatch.setattr(api, "PROTOCOL_VERSION", 2)
+        monkeypatch.setattr(api, "SUPPORTED_PROTOCOLS", frozenset({2}))
+        before = db_state(client)
+        result = do_enroll(run, client, srv, token)
+        assert result.exit_code == 1
+        assert UPGRADE in result.stderr
+        assert f"{srv.url} speaks protocol 2, but this client speaks protocol 1" in result.stderr
+        assert srv.token_state() == "active"                 # the 426 came before the body was read
+        assert srv.clients() == {}
+        untouched(client, before, reloads)
+
+    def test_a_trusted_client_meeting_a_server_with_another_protocol(self, run, enrolled, monkeypatch):
+        from zfsbackup import api
+        monkeypatch.setattr(api, "PROTOCOL_VERSION", 2)
+        monkeypatch.setattr(api, "SUPPORTED_PROTOCOLS", frozenset({2}))
+        before = db_state(enrolled.db)
+        result = do_enroll(run, enrolled.db, enrolled.srv, enrolled.token)
+        assert result.exit_code == 1
+        assert UPGRADE in result.stderr and "speaks protocol 2" in result.stderr
+        assert enrolled.srv.seen("/enroll") == []
+        untouched(enrolled.db, before, enrolled.reloads)
+
+    # -- a scripted 426 -----------------------------------------------------------------------------
+    @pytest.mark.parametrize("path", ["/whoami", "/enroll"])
+    @pytest.mark.parametrize("reply, theirs", [
+        (refusal_426(2), "protocol 2"),
+        (refusal_426(9), "protocol 9"),
+        (refusal_426(None), NO_VERSION),
+        (Reply(426, {"reason": "protocol", "protocol": "2"}), NO_VERSION),
+        (Reply(426, {"reason": "protocol", "protocol": True}), NO_VERSION),
+        (Reply(426, {"reason": "protocol", "protocol": 2.5}), NO_VERSION),
+        (Reply(426, {"reason": "protocol", "protocol": None}), NO_VERSION),
+        (Reply(426, {"reason": "protocol"}), NO_VERSION),
+    ], ids=["v2", "v9", "no-protocol", "string", "bool", "float", "null", "bare"])
+    def test_a_426_with_reason_protocol_is_exit_1_with_the_upgrade_advice(
+        self, run, enrolled, path, reply, theirs
+    ):
+        # `/enroll` is only reached by a client the server does not trust yet: have /whoami say so
+        if path == "/enroll":
+            enrolled.srv.on("/whoami", Reply(403, {"error": "client not trusted"}))
+        enrolled.srv.on(path, reply)
+        before = db_state(enrolled.db)
+        result = do_enroll(run, enrolled.db, enrolled.srv, enrolled.token)
+        assert result.exit_code == 1, result.stderr
+        assert f"{enrolled.srv.url} speaks {theirs}, but this client speaks protocol 1" in result.stderr
+        assert f"The {UPGRADE}" in result.stderr
+        if path == "/whoami":
+            assert enrolled.srv.seen("/enroll") == []                # the token is not risked
+        untouched(enrolled.db, before, enrolled.reloads)
+
+    @pytest.mark.parametrize("path", ["/whoami", "/enroll"])
+    @pytest.mark.parametrize("reply", [
+        Reply(426, {"error": "boom"}),
+        Reply(426, {"error": "boom", "reason": "other", "protocol": 2}),
+        Reply(426, {"error": "boom", "reason": ["protocol"]}),
+        Reply(426, {}),
+        Reply(426, "<html>upgrade required</html>"),
+    ], ids=["no-reason", "other-reason", "reason-not-a-string", "empty", "html"])
+    def test_a_426_with_another_reason_is_the_generic_message(self, run, enrolled, path, reply):
+        if path == "/enroll":
+            enrolled.srv.on("/whoami", Reply(403, {"error": "client not trusted"}))
+        enrolled.srv.on(path, reply)
+        before = db_state(enrolled.db)
+        result = do_enroll(run, enrolled.db, enrolled.srv, enrolled.token)
+        assert result.exit_code == 1, result.stderr
+        assert f"{enrolled.srv.url} answered HTTP 426 to {path}" in result.stderr
+        assert UPGRADE not in result.stderr
+        untouched(enrolled.db, before, enrolled.reloads)
+
+    def test_the_426_text_from_the_server_is_not_echoed(self, run, enrolled):
+        """The advice is the client's own wording; the server's `error` text (which could say
+        anything) is not repeated."""
+        enrolled.srv.on("/whoami", Reply(426, {"reason": "protocol", "protocol": 2,
+                                              "error": "TRUST-ME-RUN-THIS rm -rf /"}))
+        result = do_enroll(run, enrolled.db, enrolled.srv, enrolled.token)
+        assert "TRUST-ME" not in everything(result)
+
+    # -- a /whoami without a supported protocol --------------------------------------------------------
+    @pytest.mark.parametrize("field, theirs", [
+        (None, NO_VERSION),                      # the key is absent: a server older than the check
+        (2, "protocol 2"), (0, "protocol 0"), (-1, "protocol -1"), (99, "protocol 99"),
+        ("1", NO_VERSION), (True, NO_VERSION), (False, NO_VERSION), (1.0, NO_VERSION),
+        ([1], NO_VERSION), ({"v": 1}, NO_VERSION),
+    ], ids=["missing", "two", "zero", "minus-one", "ninety-nine", "string-one", "true", "false",
+            "float-one", "list", "dict"])
+    def test_a_whoami_without_a_supported_protocol_is_refused(self, run, enrolled, field, theirs):
+        body = {"client_id": CID, "fingerprint": client_cert(enrolled.db).fingerprint}
+        if field is not None:
+            body["protocol"] = field
+        enrolled.srv.on("/whoami", Reply(200, body))
+        before = db_state(enrolled.db)
+        result = do_enroll(run, enrolled.db, enrolled.srv, enrolled.token)
+        assert result.exit_code == 1, result.stderr
+        assert f"{enrolled.srv.url} speaks {theirs}, but this client speaks protocol 1" in result.stderr
+        assert UPGRADE in result.stderr
+        assert enrolled.srv.seen("/enroll") == []
+        untouched(enrolled.db, before, enrolled.reloads)
+
+    def test_a_json_null_protocol_is_refused(self, run, enrolled):
+        enrolled.srv.on("/whoami", Reply(200, {"client_id": CID, "fingerprint": "ab" * 32,
+                                              "protocol": None}))
+        result = do_enroll(run, enrolled.db, enrolled.srv, enrolled.token)
+        assert result.exit_code == 1 and NO_VERSION in result.stderr
+
+    def test_the_supported_protocol_passes_the_check(self, run, enrolled):
+        """The control: protocol 1 and the right fingerprint is the ordinary success."""
+        result = do_enroll(run, enrolled.db, enrolled.srv, enrolled.token)
+        assert result.exit_code == 0 and "already enrolled" in result.stdout
+
+    # -- the order of the checks on a 200 /whoami -----------------------------------------------------
+    @pytest.mark.parametrize("body", [
+        {"client_id": 7, "fingerprint": "ab" * 32, "protocol": 99},
+        {"client_id": CID, "fingerprint": 5, "protocol": 99},
+        {"client_id": CID, "protocol": 99},
+        {"fingerprint": "ab" * 32, "protocol": 99},
+        {"protocol": 99},
+        {"client_id": None, "fingerprint": None},
+    ], ids=["id-int", "fingerprint-int", "no-fingerprint", "no-id", "protocol-only", "nulls"])
+    def test_a_malformed_body_is_the_body_error_not_the_protocol_one(self, run, enrolled, body):
+        enrolled.srv.on("/whoami", Reply(200, body))
+        result = do_enroll(run, enrolled.db, enrolled.srv, enrolled.token)
+        assert result.exit_code == 1
+        assert "answered /whoami with an unexpected body" in result.stderr
+        assert UPGRADE not in result.stderr and "protocol" not in result.stderr.replace("/whoami", "")
+
+    def test_the_protocol_is_judged_before_the_fingerprint(self, run, enrolled):
+        enrolled.srv.on("/whoami", Reply(200, {"client_id": CID, "fingerprint": "ee" * 32, "protocol": 2}))
+        result = do_enroll(run, enrolled.db, enrolled.srv, enrolled.token)
+        assert result.exit_code == 1
+        assert UPGRADE in result.stderr and "reports certificate" not in result.stderr
+
+    def test_a_supported_protocol_then_gets_the_fingerprint_check(self, run, enrolled):
+        enrolled.srv.on("/whoami", Reply(200, {"client_id": CID, "fingerprint": "ee" * 32, "protocol": 1}))
+        result = do_enroll(run, enrolled.db, enrolled.srv, enrolled.token)
+        assert result.exit_code == 1
+        assert "reports certificate" in result.stderr and UPGRADE not in result.stderr
+
+
+# --------------------------------------------------------------------------
+# A 200 from /enroll whose `protocol` is missing or unsupported: the local success path
+# still runs, THEN the command exits 1
+# --------------------------------------------------------------------------
+
+BAD_PROTOCOLS = [
+    pytest.param("missing", NO_VERSION, id="missing"),
+    pytest.param(99, "protocol 99", id="99"),
+    pytest.param("1", NO_VERSION, id="string-one"),
+    pytest.param(True, NO_VERSION, id="true"),
+    pytest.param(0, "protocol 0", id="zero"),
+    pytest.param(1.0, NO_VERSION, id="float"),
+    pytest.param(None, NO_VERSION, id="null"),
+]
+
+
+def set_protocol(value):
+    """A body edit: `protocol` becomes `value` (the key is removed for "missing")."""
+    def edit(body):
+        if value == "missing":
+            body.pop("protocol", None)
+        else:
+            body["protocol"] = value
+    return edit
+
+
+class TestProtocolAfterAcceptedEnrollment:
+    """The server accepted the enrollment (its answer is a real 200 from the real app, edited) but
+    names no supported protocol. The destination is recorded, the pin and the token spent, the daemon
+    signalled once -- and then the exit status says the server cannot take backups."""
+
+    def assert_late_message(self, result, srv, theirs):
+        err = result.stderr
+        assert "the server accepted" in err and "refused" in err
+        assert f"{srv.url} speaks {theirs}, but this client speaks protocol 1" in err
+        assert f"The {UPGRADE}" in err
+        assert "NOT undone" in err
+
+    @pytest.mark.parametrize("value, theirs", BAD_PROTOCOLS)
+    def test_enrolled(self, run, client, make_server, reloads, value, theirs):
+        srv = make_server()
+        token = srv.token()
+        srv.edit_body("/enroll", set_protocol(value))
+        result = do_enroll(run, client, srv, token)
+        assert result.exit_code == 1, result.stderr
+        # everything the success path does has been done
+        assert dest(client).server_fingerprint == srv.fp
+        assert client_cert(client).fingerprint in {p.fingerprint for p in srv.pins().values()}
+        assert srv.token_state() == "consumed"
+        assert len(reloads) == 1
+        assert "enrolled" in result.stdout or "destination" in result.stdout
+        self.assert_late_message(result, srv, theirs)
+        assert "the server accepted the enrollment" in result.stderr
+        assert token not in everything(result) and secret_of(token) not in everything(result)
+
+    @pytest.mark.parametrize("value, theirs", BAD_PROTOCOLS)
+    def test_already_trusted(self, run, client, make_server, reloads, value, theirs):
+        srv = make_server()
+        assert do_enroll(run, client, srv, srv.token()).exit_code == 0
+        # a second destination name for the same server, with the trusted certificate hidden from
+        # the probe, so that /enroll is sent and the real server answers `already_trusted`
+        reloads.clear()
+        srv.log.clear()
+        srv.on("/whoami", Reply(403, {"error": "client not trusted"}))
+        srv.edit_body("/enroll", set_protocol(value))
+        token = srv.token()
+        result = do_enroll(run, client, srv, token, name="mirror", fname="again")
+        assert result.exit_code == 1, result.stderr
+        assert dest(client, "mirror").server_fingerprint == srv.fp
+        assert srv.token_state() == "active"                       # already trusted: not spent
+        assert len(reloads) == 1
+        self.assert_late_message(result, srv, theirs)
+        assert "the server accepted this host's certificate" in result.stderr
+        assert token not in everything(result)
+
+    def test_the_success_output_is_printed_before_the_error(self, run, client, make_server):
+        srv = make_server()
+        srv.edit_body("/enroll", set_protocol("missing"))
+        result = do_enroll(run, client, srv, srv.token())
+        assert result.exit_code == 1
+        assert result.stdout.strip(), "the local success report was printed"
+        assert "Traceback" not in everything(result)
+
+    def test_a_good_protocol_is_exit_zero(self, run, client, make_server, reloads):
+        """The happy path is unchanged by the late-error plumbing."""
+        srv = make_server()
+        srv.edit_body("/enroll", set_protocol(PROTOCOL_VERSION))      # explicitly a good one
+        result = do_enroll(run, client, srv, srv.token())
+        assert result.exit_code == 0, result.stderr
+        assert dest(client).server_fingerprint == srv.fp and len(reloads) == 1
+        assert "unsupported wire protocol" not in everything(result)
+
+    def test_an_untouched_real_server_is_exit_zero(self, run, client, make_server):
+        srv = make_server()
+        result = do_enroll(run, client, srv, srv.token())
+        assert result.exit_code == 0 and UPGRADE not in everything(result)
+
+    def test_a_conflict_at_the_destination_commit_wins_with_75_and_no_late_error(
+        self, run, client, make_server, monkeypatch
+    ):
+        srv = make_server()
+        srv.edit_body("/enroll", set_protocol("missing"))
+        monkeypatch.setattr(enroll_cli, "commit_config",
+                            lambda *a, **k: (_ for _ in ()).throw(ConfigConflict(1, 2)))
+        result = do_enroll(run, client, srv, srv.token())
+        assert result.exit_code == 75, result.stderr
+        assert "unsupported wire protocol" not in result.stderr and UPGRADE not in result.stderr
+        assert "Traceback" not in everything(result)
+
+    def test_a_busy_database_wins_too(self, run, client, make_server, monkeypatch):
+        srv = make_server()
+        srv.edit_body("/enroll", set_protocol(99))
+
+        def busy(*args, **kwargs):
+            raise ConfigBusy("the configuration database is busy")
+
+        monkeypatch.setattr(enroll_cli, "commit_config", busy)
+        result = do_enroll(run, client, srv, srv.token())
+        assert result.exit_code == 75 and UPGRADE not in result.stderr
+
+    # -- --new-key, generated paths ----------------------------------------------------------------
+    @pytest.fixture
+    def enrolled(self, run, client, make_server, reloads):
+        srv = make_server("a")
+        assert do_enroll(run, client, srv, srv.token()).exit_code == 0
+        reloads.clear()
+        srv.log.clear()
+        return types.SimpleNamespace(srv=srv, db=client, reloads=reloads, old=client_cert(client))
+
+    @pytest.mark.parametrize("value, theirs", [BAD_PROTOCOLS[0], BAD_PROTOCOLS[1]])
+    def test_new_key_default_paths_promotes_prints_then_fails(self, run, enrolled, value, theirs):
+        scoped = enrolled.srv.token(client_id=CID, replace=True)
+        enrolled.srv.edit_body("/enroll", set_protocol(value))
+        result = do_enroll(run, enrolled.db, enrolled.srv, scoped, "--new-key", fname="s")
+        assert result.exit_code == 1, result.stderr
+        new = client_cert(enrolled.db)
+        assert new.fingerprint != enrolled.old.fingerprint              # client.next became client.*
+        assert next_files(enrolled.db) == []
+        assert "new client key installed" in result.stdout               # `_new_key_lines` was printed
+        assert f"client certificate: {new.fingerprint}" in result.stdout
+        assert {p.fingerprint for p in enrolled.srv.clients()[CID].pins} == {new.fingerprint}
+        self.assert_late_message(result, enrolled.srv, theirs)
+        assert scoped not in everything(result)
+
+    def test_new_key_default_paths_with_a_good_protocol_is_exit_zero(self, run, enrolled):
+        scoped = enrolled.srv.token(client_id=CID, replace=True)
+        result = do_enroll(run, enrolled.db, enrolled.srv, scoped, "--new-key", fname="s")
+        assert result.exit_code == 0, result.stderr
+
+    # -- --new-key, configured paths ---------------------------------------------------------------
+    @pytest.fixture
+    def conf(self, run, db, reloads, make_server, tmp_path):
+        srv = make_server("a")
+        old = identity.ensure_identity(tmp_path / "mine", identity.ROLE_CLIENT)
+        new = identity.ensure_identity(tmp_path / "next", identity.ROLE_CLIENT)
+        make_db(run, db, PLAIN_YAML + f'client_cert_file: "{old.cert_path}"\n'
+                                      f'client_key_file: "{old.key_path}"\n')
+        seed_client_id(db, CID)
+        assert do_enroll(run, db, srv, srv.token()).exit_code == 0
+        reloads.clear()
+        srv.log.clear()
+        return types.SimpleNamespace(
+            db=db, srv=srv, old=old, new=new, reloads=reloads,
+            args=("--new-key", "--cert", str(new.cert_path), "--key", str(new.key_path)))
+
+    @pytest.mark.parametrize("value, theirs", [BAD_PROTOCOLS[0], BAD_PROTOCOLS[2]])
+    def test_new_key_configured_paths_commits_them_then_fails(self, run, conf, value, theirs):
+        gen = generation(conf.db)
+        scoped = conf.srv.token(client_id=CID, replace=True)
+        conf.srv.edit_body("/enroll", set_protocol(value))
+        result = do_enroll(run, conf.db, conf.srv, scoped, *conf.args, fname="s")
+        assert result.exit_code == 1, result.stderr
+        config = stored(conf.db)
+        assert config.client_cert_file == conf.new.cert_path and config.client_key_file == conf.new.key_path
+        assert generation(conf.db) == gen + 1
+        assert len(conf.reloads) == 1
+        assert "client_cert_file / client_key_file now point at" in result.stdout
+        assert conf.old.cert_path.exists() and conf.old.key_path.exists()
+        self.assert_late_message(result, conf.srv, theirs)
+
+    def test_new_key_configured_paths_conflict_wins_with_75(self, run, conf, monkeypatch):
+        scoped = conf.srv.token(client_id=CID, replace=True)
+        conf.srv.edit_body("/enroll", set_protocol("missing"))
+        real = enroll_cli.commit_config
+        state = {"armed": True}
+
+        def competing(*args, **kwargs):
+            if state["armed"]:
+                state["armed"] = False
+                assert Cli()("set", "check_interval", "10m", "-c", conf.db).exit_code == 0
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(enroll_cli, "commit_config", competing)
+        result = do_enroll(run, conf.db, conf.srv, scoped, *conf.args, fname="s")
+        assert result.exit_code == 75, result.stderr
+        assert UPGRADE not in result.stderr
+
+    # -- the message ---------------------------------------------------------------------------------
+    def test_protocol_after_success_never_includes_secrets(self):
+        token = "zfsb1." + "ab" * 32 + "." + "S3CR3T" * 7
+        for server_protocol in (None, 2, True, "1", token, ["x", token], {"k": token}, 10 ** 30):
+            message = str(enroll_cli._protocol_after_success("https://h:1", server_protocol, "the enrollment"))
+            assert token not in message and "S3CR3T" not in message
+            assert "https://h:1 speaks" in message
+            assert message.count("\n") == 1
+
+    def test_protocol_after_success_text(self):
+        message = str(enroll_cli._protocol_after_success("https://h:1", 3, "the enrollment"))
+        assert message.startswith("the server accepted the enrollment, but it speaks an unsupported wire protocol")
+        assert "will be refused" in message and "NOT undone" in message
+        assert "https://h:1 speaks protocol 3, but this client speaks protocol 1" in message
+
+    def test_supported_protocol_predicate(self):
+        for good in (1,):
+            assert enroll_cli._supported_protocol(good) is True
+        for bad in (None, 0, 2, -1, True, False, 1.0, "1", [1], {}, 10 ** 30):
+            assert enroll_cli._supported_protocol(bad) is False

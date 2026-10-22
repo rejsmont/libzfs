@@ -72,6 +72,17 @@ class InvalidNameError(ValueError):
     allows but libzfseasy cannot represent."""
 
 
+class InvalidValueError(ValueError):
+    """A property value this library refuses to pass to zfs (a `ValueError`, so existing handlers keep working).
+    Raised by `Validate.value` before any command runs; the message never contains the value itself."""
+
+
+# Characters `zfs list -H` / `zfs get -H` cannot frame inside a value: the row and column separators, a carriage return
+# (a line break to many readers) and NUL (which cannot pass through argv at all).
+_UNFRAMEABLE = re.compile(r'[\n\r\t\x00]')
+_UNFRAMEABLE_NAMES = {'\n': 'newline', '\r': 'carriage return', '\t': 'tab', '\x00': 'NUL'}
+
+
 class Validate:
     # All patterns are ASCII-only (matched with re.ASCII) and applied with re.fullmatch, so a trailing newline or a
     # non-ASCII word character can never slip through.
@@ -128,8 +139,13 @@ class Validate:
 
     @staticmethod
     def attribute(s: str) -> None:
+        # A leading `-` is refused outright: a name goes into argv bare (`zfs set name=v`, `zfs inherit name`,
+        # `zfs get name`), where `-o:x` would be parsed as an option. OpenZFS itself would accept it (zfs_prop_user
+        # takes any run of alnum and `:._-` containing a `:`), and it also caps a name below ZAP_MAXNAMELEN (256).
         try:
             Validate.zfsname(s)
+            if s.startswith('-') or len(s) > Validate.max_name_len:
+                raise ValueError(s)
         except ValueError:
             raise ValueError(s + ' is not a valid ZFS property name')
         if (':' not in s) and (s not in PropertyNames.all):
@@ -149,6 +165,32 @@ class Validate:
     @staticmethod
     def property(s: str) -> None:
         Validate.attribute(s)
+
+    @staticmethod
+    def value(s, prop: Optional[str] = None) -> None:
+        """Refuse a property value that `zfs list -H` / `zfs get -H` output could not frame: one containing a newline,
+        carriage return, tab or NUL. Every value libzfseasy passes to zfs goes through this before the command runs.
+
+        Keyword arguments:
+            s: str -- the value exactly as it will be passed to zfs (anything else is converted with `str()`)
+            prop: str -- the property (or option) name, used only in the error message (default None)
+
+        Raises:
+            InvalidValueError (a ValueError) -- naming the property, the character and its offset; the value itself is
+                never included, so a huge or secret value is not echoed into logs or API responses
+        """
+        if not isinstance(s, str):
+            s = str(s)
+        m = _UNFRAMEABLE.search(s)
+        if m is None:
+            return
+        if prop:
+            prop = str(prop)
+            what = 'The value of ' + repr(prop[:64]) + ('...' if len(prop) > 64 else '')
+        else:
+            what = 'A property value'
+        raise InvalidValueError(what + ' contains a ' + _UNFRAMEABLE_NAMES[m.group()] + ' (offset ' + str(m.start())
+                                + '); zfs output cannot represent newline, carriage return, tab or NUL in a value')
 
     @staticmethod
     def dataset(s: str) -> None:

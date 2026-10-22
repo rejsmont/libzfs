@@ -244,27 +244,58 @@ class TestPropertyHelpers:
     def test_get_prop_returns_value(self, mocker):
         manager = DatasetManager(_make_config())
         dsi = manager.datasets[0]
-        mock_prop = MagicMock()
-        mock_prop.__str__ = lambda self: 'testvalue'
-        mock_ds = MagicMock()
-        mock_ds.__getitem__ = MagicMock(return_value=mock_prop)
-        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[mock_ds])
-        result = manager._get_prop(dsi.dataset, 'org.test:prop')
-        assert result == 'testvalue'
+        value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value='testvalue')
+        assert manager._get_prop(dsi.dataset, 'org.test:prop') == 'testvalue'
+        value.assert_called_once_with(dsi.dataset, 'org.test:prop')
+
+    def test_get_prop_reads_the_effective_value_whatever_its_source(self, mocker):
+        """No `sources` filter: `get_anchor` relies on seeing an inherited anchor."""
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value='v')
+        manager._get_prop(dsi.dataset, 'org.test:prop')
+        assert value.call_args.args == (dsi.dataset, 'org.test:prop')
+        assert value.call_args.kwargs == {}
+
+    @pytest.mark.parametrize('text', ['a\tb', 'line1\nline2', 'tab\there\nand a newline', ' lead and trail ',
+                                      'x\ry'])
+    def test_get_prop_returns_a_value_with_control_characters_exactly(self, mocker, text):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value=text)
+        assert manager._get_prop(dsi.dataset, 'org.test:prop') == text
+
+    def test_get_prop_frames_a_multiline_value_through_the_real_get(self, mock_subprocess):
+        """Through the real `zfs get -H -o value` (only Popen mocked): the lines of one value are
+        joined, tabs kept -- a `zfs list -H` row could not carry it."""
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        mock_subprocess.setup(stdout=['first\tpart\n', 'second line\n'])
+        assert manager._get_prop(dsi.dataset, 'org.test:prop') == 'first\tpart\nsecond line'
+        argv = mock_subprocess.call_args_list[0][0][0][1:]
+        assert argv[0] == 'get' and '-s' not in argv and argv[-2:] == ['org.test:prop', 'pool/data']
 
     def test_get_prop_returns_none_on_exception(self, mocker):
         manager = DatasetManager(_make_config())
         dsi = manager.datasets[0]
-        mocker.patch('zfsbackup.backup_manager.zfs.list', side_effect=Exception('err'))
+        value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=Exception('err'))
         assert manager._get_prop(dsi.dataset, 'org.test:prop') is None
+        value.assert_called_once()
 
     def test_get_prop_returns_none_when_prop_is_none(self, mocker):
         manager = DatasetManager(_make_config())
         dsi = manager.datasets[0]
-        mock_ds = MagicMock()
-        mock_ds.__getitem__ = MagicMock(return_value=None)
-        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[mock_ds])
+        value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value=None)
         assert manager._get_prop(dsi.dataset, 'org.test:prop') is None
+        value.assert_called_once()
+
+    def test_get_prop_never_uses_the_listing(self, mocker):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        listing = mocker.patch('zfsbackup.backup_manager.zfs.list')
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value='x')
+        manager._get_prop(dsi.dataset, 'org.test:prop')
+        listing.assert_not_called()
 
     def test_set_anchor_calls_zfs_set(self, mocker):
         manager = DatasetManager(_make_config())
@@ -440,6 +471,58 @@ class TestAnchorExceptions:
         manager.clear_anchor(dsi, 'offsite')  # must not raise
 
 
+class FakeReceived:
+    """`zfs.list` (the enumeration) and `zfs.get.value` (the per-dataset property reads) of
+    `DatasetManager.received_datasets()`, in memory (plan B-1c).
+
+    `datasets` is the list of names the listing returns; `local[name]` / `received[name]` map a
+    property to the value `zfs get -s local|received` would print (a missing key reads as unset);
+    `errors[(name, prop)]` makes that read raise. Every `zfs.get.value` call is recorded in `reads`
+    as `(name, prop, sources)`."""
+
+    def __init__(self, mocker, datasets=(), local=None, received=None, errors=None, list_error=None):
+        self.datasets = list(datasets)
+        self.local = local or {}
+        self.received = received or {}
+        self.errors = errors or {}
+        self.list_error = list_error
+        self.reads = []
+        self.list = mocker.patch('zfsbackup.backup_manager.zfs.list', side_effect=self._list)
+        self.value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=self._value)
+
+    def _list(self, *args, **kwargs):
+        if self.list_error is not None:
+            raise self.list_error
+        return [Filesystem(n) for n in self.datasets]
+
+    def _value(self, ds, prop, sources=None, raw=False):
+        self.reads.append((ds.name, prop, sources))
+        if (ds.name, prop) in self.errors:
+            raise self.errors[(ds.name, prop)]
+        local = self.local.get(ds.name, {}).get(prop)
+        received = self.received.get(ds.name, {}).get(prop)
+        if sources == 'local':
+            return local
+        if sources == 'received':
+            return received
+        return local if local is not None else received
+
+    def reads_of(self, name):
+        return [(p, src) for n, p, src in self.reads if n == name]
+
+
+def _remote_manager(target='pool/backups', **kwargs):
+    config = _make_config(**kwargs)
+    config.remote_backup = RemoteServerConfig(target_dataset=target, enabled=True)
+    return DatasetManager(config)
+
+
+def _client_props(client_id='client1', config=None):
+    from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+    return {PROP_CLIENT_ID: client_id,
+            PROP_CONFIG: config if config is not None else DatasetConfig(name='pool/data').to_property()}
+
+
 class TestReceivedDatasetsSuccess:
     def _make_remote_config(self):
         config = _make_config()
@@ -447,52 +530,465 @@ class TestReceivedDatasetsSuccess:
         return config
 
     def test_returns_dataset_info_for_valid_props(self, mocker):
-        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
-        from zfsbackup.config import DatasetConfig
-        config_encoded = DatasetConfig(name='pool/data').to_property()
-
-        mock_ds = MagicMock()
-        mock_ds.__getitem__ = MagicMock(side_effect=lambda k: {
-            PROP_CLIENT_ID: 'client1',
-            PROP_CONFIG: config_encoded,
-        }.get(k))
-        mock_ds.name = 'pool/backups/client1'
-
-        manager = DatasetManager(self._make_remote_config())
-        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[mock_ds])
-        result = manager.received_datasets()
+        FakeReceived(mocker, ['pool/backups/client1'], local={'pool/backups/client1': _client_props()})
+        result = DatasetManager(self._make_remote_config()).received_datasets()
         assert len(result) == 1
+        assert result[0].name == 'pool/backups/client1'
+        assert isinstance(result[0], DatasetInfo)
 
     def test_skips_ds_with_missing_client_id(self, mocker):
-        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
-        from zfsbackup.config import DatasetConfig
-        config_encoded = DatasetConfig(name='pool/data').to_property()
-
-        mock_ds = MagicMock()
-        mock_ds.__getitem__ = MagicMock(side_effect=lambda k: {
-            PROP_CLIENT_ID: None,
-            PROP_CONFIG: config_encoded,
-        }.get(k))
-
-        manager = DatasetManager(self._make_remote_config())
-        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[mock_ds])
-        result = manager.received_datasets()
-        assert result == []
+        from zfsbackup.backup_manager import PROP_CLIENT_ID
+        props = _client_props()
+        del props[PROP_CLIENT_ID]
+        fake = FakeReceived(mocker, ['pool/backups/client1'], local={'pool/backups/client1': props})
+        assert DatasetManager(self._make_remote_config()).received_datasets() == []
+        assert ('pool/backups/client1', PROP_CLIENT_ID, 'local') in fake.reads
 
     def test_skips_ds_with_invalid_config_prop(self, mocker):
-        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+        FakeReceived(mocker, ['pool/backups/client1'],
+                     local={'pool/backups/client1': _client_props(config='not-valid-base64!!!')})
+        assert DatasetManager(self._make_remote_config()).received_datasets() == []
 
-        mock_ds = MagicMock()
-        mock_ds.__getitem__ = MagicMock(side_effect=lambda k: {
-            PROP_CLIENT_ID: 'client1',
-            PROP_CONFIG: 'not-valid-base64!!!',
-        }.get(k))
-        mock_ds.name = 'pool/backups/client1'
+    def test_the_decoded_config_is_the_one_returned(self, mocker):
+        cfg = DatasetConfig(name='pool/src', recursive=True,
+                            retention_rules=[RetentionRule(timedelta(hours=1), timedelta(hours=9))])
+        FakeReceived(mocker, ['pool/backups/client1/src'],
+                     local={'pool/backups/client1/src': _client_props(config=cfg.to_property())})
+        (dsi,) = DatasetManager(self._make_remote_config()).received_datasets()
+        assert dsi.config.name == 'pool/src'
+        assert dsi.config.retention_rules[0].keep_for == timedelta(hours=9)
+        assert dsi.config.recursive is False             # forced: received datasets are pruned flat
 
-        manager = DatasetManager(self._make_remote_config())
-        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[mock_ds])
-        result = manager.received_datasets()
+
+class TestReceivedDatasetsStopsAtASafePoint:
+    """Plan B. Each received dataset costs two or three `zfs get` executions, so `received_datasets`
+    takes the pruning worker's `should_stop` and checks it BEFORE each dataset's reads. Once it is true the
+    datasets examined so far come back (a partial list, only good for leaving), and the skip memory
+    `_received_skip_noted`, which is trimmed against a COMPLETE listing, is left alone."""
+
+    T = 'pool/backups'
+    NAMES = [f'pool/backups/c/d{i}' for i in range(5)]
+
+    def local(self, names=None):
+        return {n: _client_props('c') for n in (names or self.NAMES)}
+
+    def manager(self):
+        return _remote_manager(self.T)
+
+    @staticmethod
+    def stop_after(n, events=None):
+        """A `should_stop` that is false for its first `n` calls, then true."""
+        calls = []
+
+        def should_stop():
+            calls.append(1)
+            if events is not None:
+                events.append('stop?')
+            return len(calls) > n
+        should_stop.calls = calls
+        return should_stop
+
+    def test_without_a_check_the_listing_is_complete(self, mocker):
+        FakeReceived(mocker, self.NAMES, local=self.local())
+        assert [d.name for d in self.manager().received_datasets()] == self.NAMES
+
+    def test_a_check_that_never_fires_changes_nothing(self, mocker):
+        FakeReceived(mocker, self.NAMES, local=self.local())
+        stop = self.stop_after(10 ** 6)
+        assert [d.name for d in self.manager().received_datasets(should_stop=stop)] == self.NAMES
+        assert len(stop.calls) == len(self.NAMES)             # once per dataset
+
+    def test_a_stop_mid_way_returns_the_datasets_examined_so_far(self, mocker):
+        fake = FakeReceived(mocker, self.NAMES, local=self.local())
+        result = self.manager().received_datasets(should_stop=self.stop_after(2))
+        assert [d.name for d in result] == self.NAMES[:2]
+        assert all(isinstance(d, DatasetInfo) for d in result)
+        for name in self.NAMES[2:]:
+            assert fake.reads_of(name) == [], f'{name} was read after the stop'
+        assert fake.reads_of(self.NAMES[1]) != []
+
+    def test_the_check_comes_before_each_datasets_property_reads(self, mocker):
+        events = []
+        fake = FakeReceived(mocker, self.NAMES[:3], local=self.local())
+        fake.value.side_effect = lambda ds, prop, sources=None, raw=False: (
+            events.append(f'read:{ds.name}'), fake._value(ds, prop, sources))[1]
+        self.manager().received_datasets(should_stop=self.stop_after(10 ** 6, events))
+        for i, name in enumerate(self.NAMES[:3]):
+            first_read = events.index(f'read:{name}')
+            assert events[first_read - 1] == 'stop?', events
+
+    def test_a_stop_before_the_first_dataset_reads_no_property(self, mocker):
+        fake = FakeReceived(mocker, self.NAMES, local=self.local())
+        result = self.manager().received_datasets(should_stop=lambda: True)
         assert result == []
+        assert fake.reads == []                                # not one `zfs get`
+        fake.list.assert_called_once()                         # the enumeration itself already ran
+
+    def test_the_stop_ends_the_enumeration_not_just_one_dataset(self, mocker):
+        fake = FakeReceived(mocker, self.NAMES, local=self.local())
+        stop = self.stop_after(1)
+        self.manager().received_datasets(should_stop=stop)
+        assert len(stop.calls) == 2                            # not asked again after it said yes
+        assert len(fake.reads) == len(fake.reads_of(self.NAMES[0]))
+
+    def test_the_skip_memory_is_untouched_by_a_stopped_listing(self, mocker, caplog):
+        gone = 'pool/backups/c/gone'
+        later = self.NAMES[4]
+        fake = FakeReceived(mocker, self.NAMES, local=self.local())
+        manager = self.manager()
+        manager._received_skip_noted.update({gone: 'old problem', later: 'old problem'})
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            manager.received_datasets(should_stop=self.stop_after(2))
+        # `gone` is not in the (partial) listing and `later` was not reached: trimming against
+        # that would forget two problems that were never re-examined
+        assert manager._received_skip_noted == {gone: 'old problem', later: 'old problem'}
+        # control: a complete listing does trim
+        manager.received_datasets()
+        assert manager._received_skip_noted == {}
+
+    def test_a_dataset_examined_before_the_stop_is_still_noted_or_cleared(self, mocker):
+        """The memory of datasets that WERE examined is kept current."""
+        fake = FakeReceived(mocker, self.NAMES, local=self.local())
+        manager = self.manager()
+        manager._received_skip_noted[self.NAMES[0]] = 'old problem'
+        manager.received_datasets(should_stop=self.stop_after(2))
+        assert self.NAMES[0] not in manager._received_skip_noted        # accepted now: forgotten
+
+    def test_no_warning_is_issued_by_a_stop(self, mocker, caplog):
+        FakeReceived(mocker, self.NAMES, local=self.local())
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            self.manager().received_datasets(should_stop=self.stop_after(2))
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_disabled_remote_backup_never_consults_the_check(self, mocker):
+        FakeReceived(mocker)
+        stop = self.stop_after(10 ** 6)
+        assert DatasetManager(_make_config()).received_datasets(should_stop=stop) == []
+        assert stop.calls == []
+
+    def test_a_failing_listing_never_consults_the_check(self, mocker):
+        FakeReceived(mocker, list_error=RuntimeError('pool is suspended'))
+        stop = self.stop_after(10 ** 6)
+        assert self.manager().received_datasets(should_stop=stop) == []
+        assert stop.calls == []
+
+
+class TestReceivedDatasetsForgedRows:
+    """Plan B-1c. `received_datasets()` enumerates with `zfs list` (names only) and reads each
+    dataset's `client_id` and `config` one at a time, LOCAL only; a dataset whose properties do not
+    describe a client tree it lies in is skipped -- alone."""
+
+    T = 'pool/backups'
+    GOOD = DatasetConfig(name='pool/data').to_property()
+
+    def manager(self, target=None):
+        return _remote_manager(target or self.T)
+
+    def run(self, mocker, datasets, local=None, received=None, errors=None, target=None):
+        fake = FakeReceived(mocker, datasets, local, received, errors)
+        return fake, self.manager(target).received_datasets()
+
+    @staticmethod
+    def warnings(caplog):
+        return [r.getMessage() for r in caplog.records
+                if r.name == 'zfsbackup.backup_manager' and r.levelno == logging.WARNING]
+
+    @staticmethod
+    def debugs(caplog):
+        return [r.getMessage() for r in caplog.records
+                if r.name == 'zfsbackup.backup_manager' and r.levelno == logging.DEBUG]
+
+    # -- one case per skip reason ------------------------------------------------------------
+    def test_a_dataset_with_neither_property_local_is_skipped_at_debug_only(self, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            fake, result = self.run(mocker, ['pool/backups', 'pool/backups/client1'])
+        assert result == []
+        assert self.warnings(caplog) == []
+        assert any('not a client dataset' in m for m in self.debugs(caplog))
+
+    def test_such_a_dataset_with_a_received_config_is_a_warning(self, mocker, caplog):
+        from zfsbackup.backup_manager import PROP_CONFIG
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            fake, result = self.run(mocker, ['pool/backups/client1'],
+                                    received={'pool/backups/client1': {PROP_CONFIG: self.GOOD}})
+        assert result == []
+        (warning,) = self.warnings(caplog)
+        assert 'pool/backups/client1' in warning and 'only received' in warning
+        assert 'never trusted' in warning
+        assert ('pool/backups/client1', PROP_CONFIG, 'received') in fake.reads
+
+    def test_a_received_client_id_alone_is_not_looked_for(self, mocker):
+        """Only the config is probed for a received copy: one extra read, not two."""
+        from zfsbackup.backup_manager import PROP_CLIENT_ID
+        fake, result = self.run(mocker, ['pool/backups/client1'],
+                                received={'pool/backups/client1': {PROP_CLIENT_ID: 'client1'}})
+        assert result == []
+        assert [r for r in fake.reads if r[2] == 'received'] == [
+            ('pool/backups/client1', 'org.zfsbackup:config', 'received')]
+
+    @pytest.mark.parametrize('present', ['client_id', 'config'])
+    def test_only_one_property_set_is_skipped_with_a_warning(self, mocker, caplog, present):
+        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+        props = _client_props()
+        keep = PROP_CLIENT_ID if present == 'client_id' else PROP_CONFIG
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            fake, result = self.run(mocker, ['pool/backups/client1'],
+                                    local={'pool/backups/client1': {keep: props[keep]}})
+        assert result == []
+        missing = PROP_CONFIG if present == 'client_id' else PROP_CLIENT_ID
+        (warning,) = self.warnings(caplog)
+        assert f'{missing} is not set locally' in warning
+
+    @pytest.mark.parametrize('bad_id', ['../x', 'a/b', 'x y', '-lead', '.lead', 'a\nb', 'a\tb', 'é',
+                                        'x' * 65, 'a:b'])
+    def test_a_client_id_that_fails_the_grammar_is_skipped(self, mocker, caplog, bad_id):
+        from zfsbackup.config import client_id_problem
+        assert client_id_problem(bad_id) is not None
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            fake, result = self.run(mocker, ['pool/backups/client1'],
+                                    local={'pool/backups/client1': _client_props(bad_id)})
+        assert result == []
+        (warning,) = self.warnings(caplog)
+        assert 'is invalid' in warning
+        assert '\n' not in warning and '\t' not in warning        # logged with !r
+
+    @pytest.mark.parametrize('client_id, dataset', [
+        ('client1', 'pool/backups/other/data'),                  # another client's tree
+        ('B', 'pool/backups/Bx'),                                 # a prefix sibling of B
+        ('B', 'pool/backups/Bx/data'),
+        ('B', 'pool/backups/A/data'),                             # B's id planted in A's tree
+        ('B', 'pool/backups'),                                    # the target itself
+        ('B', 'pool/backups/b'),                                  # case differs
+        ('B', 'pool/elsewhere/B/data'),                           # outside the target
+        ('B', 'pool/backups/B2'),
+        ('c1', 'pool/backups/c1x/c1'),
+    ])
+    def test_a_dataset_outside_its_clients_tree_is_skipped(self, mocker, caplog, client_id, dataset):
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            fake, result = self.run(mocker, [dataset], local={dataset: _client_props(client_id)})
+        assert result == []
+        (warning,) = self.warnings(caplog)
+        assert 'lies outside its client' in warning
+        assert f"'pool/backups/{client_id}'" in warning
+
+    @pytest.mark.parametrize('client_id, dataset', [
+        ('B', 'pool/backups/B'), ('B', 'pool/backups/B/x'), ('B', 'pool/backups/B/x/y/z'),
+        ('b-1.x_y', 'pool/backups/b-1.x_y/data'),
+    ])
+    def test_the_container_itself_and_everything_below_it_is_accepted(self, mocker, client_id, dataset):
+        fake, result = self.run(mocker, [dataset], local={dataset: _client_props(client_id)})
+        assert [d.name for d in result] == [dataset]
+
+    def test_a_trailing_slash_on_the_target_is_ignored(self, mocker):
+        fake, result = self.run(mocker, ['pool/backups/c1/d'], target='pool/backups/',
+                                local={'pool/backups/c1/d': _client_props('c1')})
+        assert [d.name for d in result] == ['pool/backups/c1/d']
+
+    @pytest.mark.parametrize('config', [
+        'not-valid-base64!!!',
+        'e30=',                                              # {} : no name / frequency
+        'bnVsbA==',                                          # null
+        '\ud800',                                            # a lone surrogate
+        'café',                                         # non-ASCII
+    ])
+    def test_an_undecodable_config_is_skipped(self, mocker, caplog, config):
+        ds = 'pool/backups/client1'
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            fake, result = self.run(mocker, [ds], local={ds: _client_props(config=config)})
+        assert result == []
+        (warning,) = self.warnings(caplog)
+        assert 'does not decode' in warning
+
+    def test_a_config_with_a_newline_or_tab_or_without_padding_is_skipped(self, mocker):
+        ds = 'pool/backups/client1'
+        for bad in (self.GOOD[:12] + '\n' + self.GOOD[12:], self.GOOD[:12] + '\t' + self.GOOD[12:],
+                    self.GOOD.rstrip('=')[:-1]):
+            fake, result = self.run(mocker, [ds], local={ds: _client_props(config=bad)})
+            assert result == [], repr(bad)
+
+    def test_each_dataset_gets_its_own_config(self, mocker):
+        """The value read for a dataset is the value of THAT dataset."""
+        a, b = 'pool/backups/A/data', 'pool/backups/B/data'
+        cfg_a = DatasetConfig(name='pool/a').to_property()
+        cfg_b = DatasetConfig(name='pool/b').to_property()
+        fake, result = self.run(mocker, [a, b], local={a: _client_props('A', cfg_a), b: _client_props('B', cfg_b)})
+        assert {d.name: d.config.name for d in result} == {a: 'pool/a', b: 'pool/b'}
+
+    @pytest.mark.parametrize('failing', ['client_id', 'config', 'received'])
+    def test_a_read_that_raises_skips_that_dataset_with_a_warning(self, mocker, caplog, failing):
+        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+        ds = 'pool/backups/client1'
+        err = RuntimeError('zfs get failed')
+        if failing == 'received':
+            fake = FakeReceived(mocker, [ds])
+            original = fake._value
+
+            def value(d, prop, sources=None, raw=False):
+                if sources == 'received':
+                    raise err
+                return original(d, prop, sources, raw)
+
+            fake.value.side_effect = value
+            with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+                result = self.manager().received_datasets()
+        else:
+            prop = PROP_CLIENT_ID if failing == 'client_id' else PROP_CONFIG
+            with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+                fake, result = self.run(mocker, [ds], local={ds: _client_props()}, errors={(ds, prop): err})
+        assert result == []
+        (warning,) = self.warnings(caplog)
+        assert 'cannot read its properties' in warning
+
+    # -- reads are local-only -------------------------------------------------------------------
+    def test_client_id_and_config_are_read_with_sources_local(self, mocker):
+        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+        ds = 'pool/backups/client1/data'
+        fake, result = self.run(mocker, [ds], local={ds: _client_props()})
+        assert len(result) == 1
+        assert fake.reads_of(ds) == [(PROP_CLIENT_ID, 'local'), (PROP_CONFIG, 'local')]
+        for call in fake.value.call_args_list:
+            assert call.kwargs.get('sources') == 'local'
+
+    def test_a_received_only_client_id_and_config_never_count(self, mocker):
+        """What a `zfs send -p` stream can set: a RECEIVED pair is not a client dataset."""
+        ds = 'pool/backups/client1/data'
+        fake, result = self.run(mocker, [ds], received={ds: _client_props()})
+        assert result == []
+
+    def test_an_inherited_pair_never_counts(self, mocker):
+        """A nested server dataset under another client's inherits nothing: the local read says unset."""
+        parent, child = 'pool/backups/A', 'pool/backups/A/nested'
+        fake, result = self.run(mocker, [parent, child], local={parent: _client_props('A')})
+        assert [d.name for d in result] == [parent]
+
+    # -- isolation ------------------------------------------------------------------------------
+    def test_one_bad_dataset_does_not_empty_the_list(self, mocker, caplog):
+        names = ['pool/backups/a/ok1', 'pool/backups/a/forged', 'pool/backups/a/ok2',
+                 'pool/backups/a/broken', 'pool/backups/a/ok3']
+        local = {n: _client_props('a') for n in names}
+        local['pool/backups/a/forged'] = _client_props('b')                  # b's id in a's tree
+        local['pool/backups/a/broken'] = _client_props('a', config='%%%')
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            fake, result = self.run(mocker, names, local=local)
+        assert [d.name for d in result] == ['pool/backups/a/ok1', 'pool/backups/a/ok2', 'pool/backups/a/ok3']
+        assert len(self.warnings(caplog)) == 2
+
+    def test_a_read_error_on_one_dataset_leaves_the_others(self, mocker):
+        names = ['pool/backups/a/x', 'pool/backups/a/y']
+        local = {n: _client_props('a') for n in names}
+        fake, result = self.run(mocker, names, local=local,
+                                errors={(names[0], 'org.zfsbackup:config'): RuntimeError('boom')})
+        assert [d.name for d in result] == [names[1]]
+
+    # -- the listing ----------------------------------------------------------------------------
+    def test_a_failed_listing_is_an_error_and_an_empty_list(self, mocker, caplog):
+        fake = FakeReceived(mocker, list_error=RuntimeError('cannot open pool/backups'))
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            assert self.manager().received_datasets() == []
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1 and 'Failed to discover received datasets' in errors[0].getMessage()
+        assert fake.reads == []
+
+    def test_the_listing_asks_for_no_properties(self, mocker):
+        fake, _ = self.run(mocker, ['pool/backups/c/d'], local={'pool/backups/c/d': _client_props('c')})
+        (call,) = fake.list.call_args_list
+        assert 'properties' not in call.kwargs
+        assert call.kwargs['recursive'] is True and call.kwargs['types'] == 'filesystem'
+        assert str(call.kwargs['roots']) == 'pool/backups'
+
+    def test_the_real_listing_command_has_only_name_and_type_columns(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[])
+        self.manager().received_datasets()
+        argv = mock_subprocess.call_args_list[0][0][0][1:]
+        assert argv[:2] == ['list', '-H'] and argv[argv.index('-o') + 1] == 'name,type'
+        assert 'org.zfsbackup:config' not in ' '.join(argv)
+
+    def test_disabled_or_unconfigured_remote_backup_lists_nothing(self, mocker):
+        fake = FakeReceived(mocker)
+        assert DatasetManager(_make_config()).received_datasets() == []
+        fake.list.assert_not_called()
+
+    # -- warn once ------------------------------------------------------------------------------
+    def test_a_standing_problem_is_a_warning_once_then_debug(self, mocker, caplog):
+        ds = 'pool/backups/c/d'
+        FakeReceived(mocker, [ds], local={ds: _client_props('c', config='%%%')})
+        manager = self.manager()
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            for _ in range(4):
+                assert manager.received_datasets() == []
+        assert len(self.warnings(caplog)) == 1
+        assert len([m for m in self.debugs(caplog) if 'Skipping received dataset' in m]) == 3
+
+    def test_a_changed_problem_warns_again(self, mocker, caplog):
+        ds = 'pool/backups/c/d'
+        fake = FakeReceived(mocker, [ds], local={ds: _client_props('c', config='%%%')})
+        manager = self.manager()
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            manager.received_datasets()
+            manager.received_datasets()
+            fake.local[ds] = _client_props('x')                        # now outside its tree
+            manager.received_datasets()
+            manager.received_datasets()
+        warnings = self.warnings(caplog)
+        assert len(warnings) == 2 and 'does not decode' in warnings[0] and 'outside' in warnings[1]
+
+    def test_a_recovered_dataset_warns_again_if_it_breaks_again(self, mocker, caplog):
+        ds = 'pool/backups/c/d'
+        fake = FakeReceived(mocker, [ds], local={ds: _client_props('c', config='%%%')})
+        manager = self.manager()
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            manager.received_datasets()
+            fake.local[ds] = _client_props('c')
+            assert [d.name for d in manager.received_datasets()] == [ds]
+            assert manager._received_skip_noted == {}
+            fake.local[ds] = _client_props('c', config='%%%')
+            manager.received_datasets()
+        assert len(self.warnings(caplog)) == 2
+
+    def test_names_that_disappeared_are_forgotten(self, mocker, caplog):
+        ds = 'pool/backups/c/d'
+        fake = FakeReceived(mocker, [ds], local={ds: _client_props('c', config='%%%')})
+        manager = self.manager()
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            manager.received_datasets()
+            assert list(manager._received_skip_noted) == [ds]
+            fake.datasets = []
+            manager.received_datasets()
+            assert manager._received_skip_noted == {}
+            fake.datasets = [ds]
+            manager.received_datasets()
+        assert len(self.warnings(caplog)) == 2
+
+    def test_a_dataset_that_is_not_a_client_dataset_is_never_noted(self, mocker):
+        FakeReceived(mocker, ['pool/backups', 'pool/backups/c'])
+        manager = self.manager()
+        manager.received_datasets()
+        assert manager._received_skip_noted == {}
+
+    def test_the_memory_is_per_manager(self, mocker, caplog):
+        ds = 'pool/backups/c/d'
+        FakeReceived(mocker, [ds], local={ds: _client_props('c', config='%%%')})
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            self.manager().received_datasets()
+            self.manager().received_datasets()
+        assert len(self.warnings(caplog)) == 2
+
+    # -- _received_dataset_info ---------------------------------------------------------------------
+    def test_info_for_a_valid_dataset(self, mocker):
+        ds = 'pool/backups/c/d'
+        FakeReceived(mocker, local={ds: _client_props('c')})
+        dsi, problem = self.manager()._received_dataset_info(Filesystem(ds), self.T)
+        assert problem is None and dsi.name == ds and dsi.config.recursive is False
+
+    def test_info_for_a_non_client_dataset_is_none_none(self, mocker):
+        FakeReceived(mocker)
+        assert self.manager()._received_dataset_info(Filesystem('pool/backups/c'), self.T) == (None, None)
+
+    def test_info_reports_a_failing_read_instead_of_raising(self, mocker):
+        ds = 'pool/backups/c/d'
+        FakeReceived(mocker, errors={(ds, 'org.zfsbackup:client_id'): RuntimeError('x')})
+        dsi, problem = self.manager()._received_dataset_info(Filesystem(ds), self.T)
+        assert dsi is None and 'cannot read its properties' in problem
 
 
 class TestCollapseRetentionRules:
@@ -841,9 +1337,13 @@ def _zget(name, props, ptype='filesystem'):
     """`zfs get -H -o name,property,value,received,source all <name>` lines.
 
     `props` is a list of `(property, value, source)`; a `received` source also
-    fills the `received` column, like the real command.
+    fills the `received` column, like the real command. The shape is what a
+    real `zfs get -H -o name,property,value,received,source all <name>` prints:
+    the `type` row first, then the properties.
     """
-    lines = [f'{name}\tname\t{name}\t-\t-\n', f'{name}\ttype\t{ptype}\t-\t-\n']
+    # `zfs get all` opens with the `type` row (it has no `name` row: `name` is not a gettable
+    # property of `all`); libzfseasy's lead rule keys on that first row.
+    lines = [f'{name}\ttype\t{ptype}\t-\t-\n']
     for prop, value, source in props:
         received = value if source == 'received' else '-'
         lines.append(f'{name}\t{prop}\t{value}\t{received}\t{source}\n')
@@ -1931,8 +2431,9 @@ class TestInflightProperty:
 
     def test_a_failed_read_is_none(self, mocker):
         manager = DatasetManager(_make_config())
-        mocker.patch('zfsbackup.backup_manager.zfs.list', side_effect=Exception('err'))
+        value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=Exception('err'))
         assert manager.get_inflight(manager.datasets[0], 'offsite') is None
+        value.assert_called_once()                      # the failure came from the read, not elsewhere
 
 
 class TestSetAnchorReturnsBool:
@@ -2216,16 +2717,24 @@ class TestUnrepresentableNamesInZfsOutput:
         assert len(self._skip_warnings(caplog)) == 2
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
-    def test_received_datasets_skips_an_unrepresentable_child(self, mock_subprocess, caplog):
+    def test_received_datasets_skips_an_unrepresentable_child(self, mock_subprocess, mocker, caplog):
         good = DatasetConfig(name='pool/backups/cid/data').to_property()
         other = DatasetConfig(name='pool/backups/cid/other').to_property()
         mock_subprocess.setup(stdout=[
-            'pool/backups\tfilesystem\t-\t-\n',
-            'pool/backups/cid\tfilesystem\t-\t-\n',
-            f'pool/backups/cid/data\tfilesystem\tcid\t{good}\n',
-            f'pool/backups/cid/.system\tfilesystem\tcid\t{good}\n',
-            f'pool/backups/cid/other\tfilesystem\tcid\t{other}\n',
+            'pool/backups\tfilesystem\n',
+            'pool/backups/cid\tfilesystem\n',
+            'pool/backups/cid/data\tfilesystem\n',
+            'pool/backups/cid/.system\tfilesystem\n',
+            'pool/backups/cid/other\tfilesystem\n',
         ])
+        local = {
+            'pool/backups/cid/data': {'org.zfsbackup:client_id': 'cid', 'org.zfsbackup:config': good},
+            'pool/backups/cid/other': {'org.zfsbackup:client_id': 'cid', 'org.zfsbackup:config': other},
+        }
+        value = mocker.patch(
+            'zfsbackup.backup_manager.zfs.get.value',
+            side_effect=lambda ds, prop, sources=None, raw=False: local.get(ds.name, {}).get(prop),
+        )
         config = _make_config(
             remote_backup=RemoteServerConfig(target_dataset='pool/backups'),
         )
@@ -2237,3 +2746,5 @@ class TestUnrepresentableNamesInZfsOutput:
         warnings = self._skip_warnings(caplog)
         assert len(warnings) == 1 and "'pool/backups/cid/.system'" in warnings[0]
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        # the unrepresentable row never reached a property read
+        assert all(c.args[0].name != 'pool/backups/cid/.system' for c in value.call_args_list)

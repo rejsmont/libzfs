@@ -564,7 +564,14 @@ class PruningWorker(BaseWorker):
         return config.effective_prune_interval.total_seconds()
 
     def _get_datasets(self, manager: DatasetManager) -> List[DatasetInfo]:
-        return manager.datasets + manager.received_datasets()
+        # Enumerating the received datasets costs a few `zfs get` each, so it
+        # is itself a safe point (`should_stop`: stop > supervisor gone >
+        # reload). A listing cut short by one is never pruned from: `[]`
+        # here, and `run()` leaves at its next check (the reason is sticky).
+        received = manager.received_datasets(should_stop=self._should_stop)
+        if self._should_stop():
+            return []
+        return manager.datasets + received
 
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
         manager.prune_snapshots(dsi)

@@ -83,9 +83,17 @@ class FakeZfs:
         self.list_roots = []
         self.list_recursive = []             # (root, recursive) of each snapshot listing
         self.received = []                   # datasets `received_datasets()` finds
+        self.received_values = {}            # dataset -> {property: local value} for `zfs.get.value`
         self.destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
         mocker.patch.object(zfs.get, '_exec_out', side_effect=self._get)
         mocker.patch('zfsbackup.backup_manager.zfs.list', side_effect=self._list)
+        mocker.patch.object(zfs.get, 'value', side_effect=self._value)
+
+    # -- zfs get -H -o value (B-1c: the received datasets' properties, one at a time) ------------
+    def _value(self, ds, prop, sources=None, raw=False):
+        if sources not in (None, 'local', 'received'):
+            raise AssertionError(f'unexpected sources={sources!r}')
+        return self.received_values.get(ds.name, {}).get(prop)
 
     # -- zfs get -------------------------------------------------------------
     def _get(self, cmd):
@@ -655,9 +663,7 @@ class TestReceivedDatasetsArePrunedNonRecursively:
         cfg = DatasetConfig(name='pool/src', recursive=recursive, retention_rules=retention(2))
         ds = MagicMock()
         ds.name = name
-        ds.__getitem__ = MagicMock(side_effect=lambda k: {
-            PROP_CLIENT_ID: 'c1', PROP_CONFIG: cfg.to_property(),
-        }.get(k))
+        fz.received_values[name] = {PROP_CLIENT_ID: 'c1', PROP_CONFIG: cfg.to_property()}
         fz.received.append(ds)
         return cfg
 

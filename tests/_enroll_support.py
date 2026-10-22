@@ -12,6 +12,9 @@ and nothing here runs a real `zfs`.
   through to the real app after the first N scripted answers. `zfs.exists` is stubbed in
   memory (`ZfsStub`), so the server never reaches a `zfs` binary.
 * `Reply` / `RESET` / `HANG` -- scripted answers.
+* `RealServer.edit_body(path, fn)` -- let the REAL app answer, then let `fn(body_dict)` change a 200
+  JSON answer before it is sent (e.g. drop `protocol` from a real `/enroll` or `/rotate` answer: the
+  server-side change happens, the client sees an answer that lacks the protocol).
 * `make_server` -- fixture factory (stops every server at teardown).
 * `closed_port` / `plain_http_server` / `silent_server` -- a port nobody listens on,
   a server that answers plaintext HTTP, a server that accepts and says nothing.
@@ -134,6 +137,45 @@ class ZfsStub:
         return name in self.existing
 
 
+class _BodyEditor:
+    """Wraps the real app: for a path with an edit registered (`RealServer.edit_body`), a 200 JSON
+    object answer is passed through `fn(dict)` (in place) and re-encoded."""
+
+    def __init__(self, server: "RealServer", inner) -> None:
+        self.server = server
+        self.inner = inner
+
+    def __call__(self, environ, start_response):
+        edit = self.server._edits.get(environ["PATH_INFO"])
+        if edit is None:
+            return self.inner(environ, start_response)
+        captured = {}
+
+        def capture(status, headers, exc_info=None):
+            captured["status"], captured["headers"] = status, list(headers)
+            return lambda data: None
+
+        result = self.inner(environ, capture)
+        try:
+            body = b"".join(result)
+        finally:
+            close = getattr(result, "close", None)
+            if close is not None:
+                close()
+        if captured["status"].startswith("200"):
+            try:
+                data = json.loads(body)
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                edit(data)
+                body = json.dumps(data).encode()
+        headers = [(k, v) for k, v in captured["headers"] if k.lower() != "content-length"]
+        headers.append(("Content-Length", str(len(body))))
+        start_response(captured["status"], headers)
+        return [body]
+
+
 class _Middleware:
     def __init__(self, server: "RealServer", inner) -> None:
         self.server = server
@@ -195,7 +237,8 @@ class RealServer:
         dispose_all()
         config.dry_run = dry_run
         self.app = api.create_app(config, self.trust.gateway, self.trust.server_fp)
-        self.app.wsgi_app = _Middleware(self, self.app.wsgi_app)
+        self._edits: Dict[str, Callable[[dict], None]] = {}
+        self.app.wsgi_app = _Middleware(self, _BodyEditor(self, self.app.wsgi_app))
         self.log: List[Seen] = []
         self._lock = threading.Lock()
         self._script: Dict[str, tuple] = {}
@@ -239,6 +282,16 @@ class RealServer:
         the real app). An effect of None passes that one request through."""
         with self._lock:
             self._script[path] = (list(effects), then)
+        return self
+
+    def edit_body(self, path: str, fn: Optional[Callable[[dict], None]]) -> "RealServer":
+        """Let the real app answer `path`, then change a 200 JSON object answer with `fn(dict)`
+        (`None` removes the edit). The server-side effect of the request still happens."""
+        with self._lock:
+            if fn is None:
+                self._edits.pop(path, None)
+            else:
+                self._edits[path] = fn
         return self
 
     def _effect(self, path: str, n: int):

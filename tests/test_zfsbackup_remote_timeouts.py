@@ -28,6 +28,7 @@ from zfsbackup import remote
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup.config import BackupConfig, DatasetConfig, Destination, RemoteDatasetConfig
 from zfsbackup.identity import PinMismatch
+from zfsbackup.protocol import protocol_headers
 from zfsbackup.remote import (
     WS_CONNECT_TIMEOUT,
     WS_FINAL_ACK_TIMEOUT,
@@ -188,6 +189,7 @@ class TestTimeouts:
         assert names == ["connect", "settimeout", "send_binary", "send_binary", "send", "settimeout", "recv"]
         assert ws.connect.call_args.kwargs == {
             "socket": fake_connect_pinned.socks[0], "timeout": WS_CONNECT_TIMEOUT,
+            "header": protocol_headers(),             # the wire protocol version (plan S-5)
         }
         timeouts = [c.args[0] for c in ws.settimeout.call_args_list]
         assert timeouts == [WS_IDLE_TIMEOUT, WS_FINAL_ACK_TIMEOUT]

@@ -13,7 +13,8 @@ every socket is `127.0.0.1`.
   `zfsbackup.config.store.trust` writers on a real config database.
 * `https_get` / `tls_probe` -- one TLS 1.3 HTTPS request / bare handshake against the
   daemon API, certificate verification off (the server certificate is self-signed and
-  pinned by fingerprint in production).
+  pinned by fingerprint in production). `https_get` sends the wire protocol header
+  (plan S-5) unless `protocol=False`.
 """
 
 import hashlib
@@ -26,6 +27,7 @@ from typing import Iterable, Optional, Sequence
 
 from zfsbackup import identity
 from zfsbackup.config.store import trust as store_trust
+from zfsbackup.protocol import protocol_headers
 
 LOOPBACK = "127.0.0.1"
 #: Generous per-operation timeout: everything is loopback, so hitting it means a hang.
@@ -185,14 +187,17 @@ def insecure_client_context(ident: Optional["identity.Identity"] = None,
 
 
 def https_get(port: int, path: str, ctx: Optional[ssl.SSLContext] = None, *,
-              host: str = LOOPBACK, timeout: float = IO_TIMEOUT, headers=None):
+              host: str = LOOPBACK, timeout: float = IO_TIMEOUT, headers=None,
+              protocol: bool = True):
     """-> `(status, body_bytes)`. Raises `ssl.SSLError` / `OSError` if the connection or the
-    request fails (a certificate TLS 1.3 rejects shows up on the first read, not at connect)."""
+    request fails (a certificate TLS 1.3 rejects shows up on the first read, not at connect).
+    The request names this code's wire protocol version (plan S-5) unless `protocol=False`; an
+    explicit `headers` entry of the same name wins."""
     conn = http.client.HTTPSConnection(
         host, port, timeout=timeout, context=ctx or insecure_client_context()
     )
     try:
-        conn.request("GET", path, headers=headers or {})
+        conn.request("GET", path, headers={**(protocol_headers() if protocol else {}), **(headers or {})})
         response = conn.getresponse()
         return response.status, response.read()
     finally:

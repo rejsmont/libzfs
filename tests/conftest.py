@@ -449,6 +449,69 @@ def pytest_sessionfinish(session, exitstatus):
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
+_MISSING = object()
+_LIBZFSEASY_BEFORE = {}
+
+
+def _libzfseasy_state():
+    """`(module attributes, {command singleton name: (singleton, its instance attributes)})`."""
+    import libzfseasy
+    from libzfseasy.zfs import Command
+
+    module = dict(vars(libzfseasy))
+    instances = {n: (o, dict(vars(o))) for n, o in module.items() if isinstance(o, Command)}
+    return module, instances
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_setup(item):
+    """Remember `libzfseasy`'s attributes before ANY fixture of the test runs."""
+    _LIBZFSEASY_BEFORE[item.nodeid] = _libzfseasy_state()
+    yield
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Fails the test that leaves `libzfseasy` patched, instead of a random later one.
+
+    `libzfseasy`'s command singletons (`zfs.exists`, `zfs.list`, `zfs.get.value`, ...) are shared
+    by every test in the process, and a patch that is not undone silently changes what the next
+    test calls. The classic way to leak one is two undo stacks over one attribute: `mocker.patch`
+    and `monkeypatch.setattr` unwind in the order the FIXTURES were first requested, so when
+    `monkeypatch` came before `mocker` the later `monkeypatch` undo put the earlier mock back
+    (`libzfseasy.exists` stayed a `MagicMock` after `test_zfsbackup_api_protocol`'s websocket
+    tests, which made two `test_zfsbackup_prune_descendants` tests fail only in multi-file runs).
+
+    A hook wrapper, not a fixture, so the comparison happens after EVERY fixture finalizer has
+    run. It restores whatever differs (one leak must not cascade) and then fails the test."""
+    outcome = yield
+    before = _LIBZFSEASY_BEFORE.pop(item.nodeid, None)
+    if before is None:
+        return
+    import libzfseasy
+
+    module_before, instances_before = before
+    module = vars(libzfseasy)
+    leaked = []
+    for name, value in module_before.items():
+        if not name.startswith("__") and module.get(name, _MISSING) is not value:
+            leaked.append(f"libzfseasy.{name}")
+            module[name] = value
+    for name, (obj, attrs) in instances_before.items():
+        now = vars(obj)
+        for attr in set(now) | set(attrs):
+            if not attr.startswith("__") and now.get(attr, _MISSING) is not attrs.get(attr, _MISSING):
+                leaked.append(f"libzfseasy.{name}.{attr}")
+                if attr in attrs:
+                    now[attr] = attrs[attr]
+                else:
+                    del now[attr]
+    if leaked and outcome.excinfo is None:
+        raise pytest.fail.Exception(
+            "this test left libzfseasy patched (undone now): " + ", ".join(sorted(leaked)), pytrace=False
+        )
+
+
 @pytest.fixture(autouse=True)
 def _restore_signal_handlers():
     """Saves `SIGINT`/`SIGTERM`/`SIGHUP` dispositions before each test and restores

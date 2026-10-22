@@ -358,16 +358,72 @@ class TestPruningWorker:
         worker._process_dataset(manager, dsi)
         manager.prune_snapshots.assert_called_once_with(dsi)
 
-    def test_get_datasets_includes_received(self, mocker):
+    def test_get_datasets_includes_received(self, worker_config):
         manager = MagicMock()
         local = [MagicMock()]
         received = [MagicMock()]
         manager.datasets = local
         manager.received_datasets.return_value = received
-        worker = PruningWorker.__new__(PruningWorker)
+        worker = PruningWorker(worker_config, multiprocessing.Event())     # nothing pending
         result = worker._get_datasets(manager)
         assert local[0] in result
         assert received[0] in result
+        assert result == local + received
+
+    def test_the_enumeration_is_given_the_workers_exit_check(self, worker_config):
+        """The listing is a safe point: it checks the worker's own "any reason to leave"."""
+        manager = MagicMock()
+        manager.datasets = []
+        manager.received_datasets.return_value = []
+        worker = PruningWorker(worker_config, multiprocessing.Event())
+        worker._get_datasets(manager)
+        manager.received_datasets.assert_called_once_with(should_stop=worker._should_stop)
+
+    def test_the_check_passed_follows_the_stop_flag(self, worker_config):
+        stop = multiprocessing.Event()
+        manager = MagicMock()
+        manager.datasets = []
+        seen = []
+        manager.received_datasets.side_effect = lambda should_stop=None: (
+            seen.append(should_stop()), stop.set(), seen.append(should_stop()), [])[-1]
+        PruningWorker(worker_config, stop)._get_datasets(manager)
+        assert seen == [False, True]
+
+    def test_a_pending_stop_gives_no_datasets_even_if_the_listing_returned_some(self, worker_config):
+        """A listing cut short is partial: the worker must not prune from it (`run()` leaves at
+        its next check; the reason is sticky)."""
+        stop = multiprocessing.Event()
+        stop.set()
+        manager = MagicMock()
+        manager.datasets = [MagicMock()]
+        manager.received_datasets.return_value = [MagicMock()]
+        assert PruningWorker(worker_config, stop)._get_datasets(manager) == []
+
+    def test_a_pending_reload_gives_no_datasets(self, worker_config):
+        epoch = ReloadEpoch()
+        epoch.set(1)
+        manager = MagicMock()
+        manager.datasets = [MagicMock()]
+        manager.received_datasets.return_value = [MagicMock()]
+        worker = PruningWorker(worker_config, multiprocessing.Event(), reload_epoch=epoch, born_epoch=0)
+        assert worker._get_datasets(manager) == []
+
+    def test_a_reason_arriving_during_the_listing_gives_no_datasets(self, worker_config):
+        stop = multiprocessing.Event()
+        manager = MagicMock()
+        manager.datasets = [MagicMock()]
+        partial = [MagicMock()]
+        manager.received_datasets.side_effect = lambda should_stop=None: (stop.set(), partial)[1]
+        assert PruningWorker(worker_config, stop)._get_datasets(manager) == []
+
+    def test_a_reload_epoch_that_matches_is_no_reason(self, worker_config):
+        epoch = ReloadEpoch()
+        epoch.set(2)
+        manager = MagicMock()
+        manager.datasets = []
+        manager.received_datasets.return_value = [MagicMock()]
+        worker = PruningWorker(worker_config, multiprocessing.Event(), reload_epoch=epoch, born_epoch=2)
+        assert len(worker._get_datasets(manager)) == 1
 
     def test_run_stops_when_event_set(self, worker_config, mocker):
         stop_event = multiprocessing.Event()
