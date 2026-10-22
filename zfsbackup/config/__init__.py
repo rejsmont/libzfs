@@ -39,10 +39,12 @@ from zfsbackup.config.model import (
     client_id_problem,
     client_tls_files_problem,
     destination_url_problem,
+    duration_ok,
     generate_client_id,
     normalize_fingerprint,
     parse_time_duration,
     validate_retention_uniqueness,
+    wire_config_problem,
     # Not public, but imported across module boundaries by backup_manager
     # and remote at prune time. Re-exported so the move of `config/model.py` into
     # this package did not silently change their import path.
@@ -60,8 +62,10 @@ __all__ = [
     "client_id_problem",
     "client_tls_files_problem",
     "destination_url_problem",
+    "duration_ok",
     "generate_client_id",
     "normalize_fingerprint",
     "parse_time_duration",
     "validate_retention_uniqueness",
+    "wire_config_problem",
 ]

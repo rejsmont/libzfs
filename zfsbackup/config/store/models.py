@@ -430,6 +430,14 @@ class DatasetRemote(Base):
     )
     frequency_seconds: Mapped[Optional[float]] = mapped_column(nullable=True)
     frequency_literal: Mapped[Optional[str]] = mapped_column(nullable=True)
+    # Send mode for this dataset x destination (`RemoteDatasetConfig.raw`).
+    # NULL = auto ("raw if and only if the dataset is encrypted"), 1 = raw
+    # required, 0 = never raw. Deliberately nullable with NO `default=` /
+    # `server_default`: NULL is the meaningful third state, and a default
+    # would silently turn "auto" into a hard True/False on insert -- a stream
+    # format the server copy cannot leave without a full re-send. Existing
+    # rows migrate to NULL (revision 5d2f8a60c1e4).
+    raw: Mapped[Optional[bool]] = mapped_column(nullable=True)
 
     dataset: Mapped["Dataset"] = relationship(back_populates="remotes")
     destination: Mapped["Destination"] = relationship(back_populates="dataset_remotes")

@@ -14,7 +14,8 @@ in `backup_manager.py`: name, frequency, recursive, retention-rule count, remote
 destinations) plus `enabled`, which the report implies by listing only enabled
 datasets. `RETENTION` is `never` for a dataset with no retention rules (never
 pruned) and the rule count otherwise. A remote destination that inherits the
-dataset's frequency shows `inherit (X)`, X being the dataset frequency.
+dataset's frequency shows `inherit (X)`, X being the dataset frequency; each
+remote entry shows ` raw=true` or ` raw=false` when set (auto shows nothing).
 Durations are shown as typed (`30d` stays `30d`, never `1M`).
 
 `--json` shape (stable; new keys may be added, none renamed or removed)::
@@ -34,6 +35,7 @@ Durations are shown as typed (`30d` stays `30d`, never `1M`).
             "effective_frequency": str,
             "retention_override":  [{"age": str, "keep_for": str}, ...] | null
                                                   # null = inherits the dataset's rules
+            "raw":                 bool | null,  # null = auto (raw iff the dataset is encrypted)
           }, ...
         ]
       }, ...
@@ -53,7 +55,7 @@ to.
 """
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from zfsbackup.cli.render import duration_literal
 from zfsbackup.config import BackupConfig, DatasetConfig, RetentionRule
@@ -92,6 +94,7 @@ def _dataset_json(ds: DatasetConfig) -> Dict[str, Any]:
                 _rules(r.retention_rules, f"{key}.remote[{r.destination}].retention")
                 if r.retention_rules else None
             ),
+            "raw": None if r.raw is None else bool(r.raw),
         })
     return {
         "name": ds.name,
@@ -118,6 +121,10 @@ def _table(header: List[str], rows: List[List[str]]) -> str:
     return "".join(line(r) + "\n" for r in [header] + rows)
 
 
+def _raw_text(raw: Optional[bool]) -> str:
+    return "auto" if raw is None else ("true" if raw else "false")
+
+
 def _yes_no(value: bool) -> str:
     return "yes" if value else "no"
 
@@ -135,6 +142,7 @@ def render_datasets(config: BackupConfig, *, enabled_only: bool = False, as_json
             remote = ", ".join(
                 f"{r['destination']}: "
                 + (f"inherit ({r['effective_frequency']})" if r["frequency"] is None else r["frequency"])
+                + ("" if r["raw"] is None else f" raw={_raw_text(r['raw'])}")
                 for r in e["remotes"]
             )
         else:

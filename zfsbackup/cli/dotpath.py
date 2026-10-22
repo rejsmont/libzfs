@@ -25,6 +25,7 @@ always accepted, with the same grammar::
     datasets . NAME . (enabled | recursive | frequency)
     datasets . NAME . retention [ . AGE ]
     datasets . NAME . remote . DEST . frequency
+    datasets . NAME . remote . DEST . raw
     datasets . NAME . remote . DEST . retention [ . AGE ]
     destinations . NAME . (url | server_fingerprint)
     remote_backup . (target_dataset | enabled)
@@ -62,6 +63,13 @@ Two settings are *paired* or *pinned*, and deliberately awkward to change:
 ``set destinations.N.url`` refuses ``http://`` (and any non-https URL) with the
 model's own wording (`destination_url_problem`).
 
+``datasets.N.remote.D.raw`` is ``true``, ``false`` or ``auto``; ``auto`` (and
+`unset`) stores nothing, meaning "raw if and only if the dataset is encrypted".
+The value is read as YAML, so ``yes``/``no`` mean true/false as for the other
+booleans; anything else -- including ``1``/``0``, which the model accepts for
+the other flags but refuses here -- is refused naming the key, because the
+setting fixes the stream format of the server copy.
+
 Retention rules are matched by their length in seconds (``retention.7d`` finds
 a rule written ``1w``) and stored with the literal as typed. Removing a
 dataset's last rule leaves it with ``retention: forever`` (never prune); a
@@ -96,6 +104,7 @@ __all__ = [
     "prefix_change_warnings",
     "get_lines",
     "pin_change_warnings",
+    "raw_change_warnings",
     "kind_of",
     "parse_dict",
     "resolve",
@@ -187,6 +196,8 @@ def kind_of(segs: Segs) -> str:
                 return "remote_name"
             if sub == "frequency":
                 return "remote_frequency"
+            if sub == "raw":
+                return "remote_raw"
             if sub == "retention":
                 return "remote_retention" if n == 5 else "remote_rule"
     if head == "destinations":
@@ -404,7 +415,7 @@ class _Resolver:
             yield segs
             return
         word, tail = _split_word(rest)
-        if word in ("frequency", "destination"):
+        if word in ("frequency", "destination", "raw"):
             if tail:
                 self.fail(4, f"{format_path(segs)}.{word} has no sub-settings")
             else:
@@ -414,7 +425,7 @@ class _Resolver:
         else:
             self.fail(
                 4,
-                f"{format_path(segs)} has no setting {rest!r}; valid: frequency, retention",
+                f"{format_path(segs)} has no setting {rest!r}; valid: frequency, raw, retention",
             )
 
 
@@ -563,6 +574,9 @@ def get_lines(config: BackupConfig, segs: Segs) -> List[str]:
         if remote.frequency is None:
             return [f"inherit ({_lit(ds.frequency, f'datasets[{ds.name}].frequency')})"]
         return [_lit(remote.frequency, path)]
+    if kind == "remote_raw":
+        raw = _remote(_dataset(config, segs[1]), segs[3]).raw
+        return ["auto" if raw is None else _bool(raw)]
     if kind == "remote_retention":
         ds = _dataset(config, segs[1])
         remote = _remote(ds, segs[3])
@@ -818,6 +832,33 @@ def pin_change_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
     return messages
 
 
+def _raw_text(raw: Optional[bool]) -> str:
+    return "auto" if raw is None else ("true" if raw else "false")
+
+
+def raw_change_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
+    """A warning for each remote entry present in both configurations whose
+    effective `raw` (auto / true / false) changed. Raw and plain streams are
+    different copies on the server: if the destination already holds one, the
+    client refuses the mismatched copy until it is renamed aside, then sends in
+    full. A new entry, a removed one and an unchanged value are not warned about."""
+    messages: List[str] = []
+    before = {(ds.name, r.destination): r.raw for ds in old.datasets for r in ds.remote}
+    for ds in new.datasets:
+        for r in ds.remote:
+            key = (ds.name, r.destination)
+            if key not in before or before[key] == r.raw:
+                continue
+            where = format_path(("datasets", ds.name, "remote", r.destination, "raw"))
+            messages.append(
+                f"{where} changes from {_raw_text(before[key])} to {_raw_text(r.raw)}: if "
+                f"destination {r.destination!r} already holds a copy of {ds.name!r}, the "
+                "next backup to it will be refused until that server copy is renamed aside, "
+                "after which a full send follows"
+            )
+    return messages
+
+
 def _pruning_starts(old: BackupConfig, new: BackupConfig, segs: Segs) -> List[str]:
     """A warning when this edit gives a never-pruned dataset retention rules:
     the pruning worker starts destroying its old snapshots."""
@@ -898,6 +939,12 @@ def set_value(config: BackupConfig, segs: Segs, text: str) -> Change:
             remote.pop("frequency", None)
         else:
             remote["frequency"] = value
+    elif kind == "remote_raw":
+        remote = _remote_entry(_entry(data, segs[1]), segs[3])
+        if value is None or value == "auto":
+            remote.pop("raw", None)  # auto is the absent key
+        else:
+            remote["raw"] = value  # anything but a real bool is refused by the model
     elif kind == "remote_retention":
         remote = _remote_entry(_entry(data, segs[1]), segs[3])
         if value is None:
@@ -962,6 +1009,7 @@ def set_value(config: BackupConfig, segs: Segs, text: str) -> Change:
     if kind == "destination_fingerprint":
         warnings.extend(pin_change_warnings(config, new))
     warnings.extend(prefix_change_warnings(config, new))
+    warnings.extend(raw_change_warnings(config, new))
     if (
         kind == "server_field"
         and segs[1] == "enabled"
@@ -1008,6 +1056,8 @@ def unset_value(config: BackupConfig, segs: Segs) -> Change:
         scope = segs[:3]
     elif kind == "remote_frequency":
         _remote_entry(_entry(data, segs[1]), segs[3]).pop("frequency", None)
+    elif kind == "remote_raw":
+        _remote_entry(_entry(data, segs[1]), segs[3]).pop("raw", None)  # auto
     elif kind == "remote_retention":
         _remote_entry(_entry(data, segs[1]), segs[3]).pop("retention", None)
     elif kind == "remote_rule":
@@ -1038,4 +1088,5 @@ def unset_value(config: BackupConfig, segs: Segs) -> Change:
     warnings.extend(_pruning_starts(config, new, segs))
     if kind == "destination_fingerprint":
         warnings.extend(pin_change_warnings(config, new))
+    warnings.extend(raw_change_warnings(config, new))
     return Change(new, warnings, scope)

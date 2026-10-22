@@ -423,7 +423,7 @@ class TestGateInTheApp:
 
     @pytest.mark.parametrize(
         "arrange",
-        ["exists-raises", "create-fails", "set-fails", "receive-raises", "send-raises",
+        ["exists-raises", "not-negotiated", "placeholder-overwrite", "receive-raises", "send-raises",
          "connection-closed", "write-error", "ok"],
     )
     def test_the_gate_is_released_on_every_path(self, authed, mocker, source_props, arrange):
@@ -437,13 +437,15 @@ class TestGateInTheApp:
         if arrange == "exists-raises":
             # The D7 source check reads `exists` first and reports a failure to the client.
             exists.side_effect = RuntimeError("zfs exploded")
-        elif arrange == "create-fails":
-            exists.side_effect = [True, True, False]       # ownership, config read, then gone
-            mocker.patch("zfsbackup.api.zfs.create", side_effect=RuntimeError("cannot create"))
-        elif arrange == "set-fails":
-            exists.side_effect = [True, True, False]
-            mocker.patch("zfsbackup.api.zfs.create")
-            mocker.patch("zfsbackup.api.zfs.set", side_effect=RuntimeError("cannot set"))
+        elif arrange == "not-negotiated":
+            exists.return_value = False                    # R0: no dataset and no pending config
+        elif arrange == "placeholder-overwrite":
+            # zfs refuses an encrypted full over an existing dataset: the reply is rewritten
+            writer.close.side_effect = RuntimeError(
+                "cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an "
+                "encrypted filesystem or overwrite an unencrypted one with an encrypted one"
+            )
+            ws.receive.side_effect = [b"x", json.dumps({"done": True})]
         elif arrange == "send-raises":
             # A refusal that cannot be sent escapes the handler; the gate still releases.
             source_props.return_value = {"org.zfsbackup:source_dataset": "tank/data"}
@@ -630,6 +632,78 @@ class TestServerReceiveTimeout:
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             self._handler(authed)(ws, "client1", "pool/data")       # must not raise
         assert "no data from the client" in json.loads(ws.send.call_args[0][0])["error"]
+
+
+class TestDrainWaitsForTheAck:
+    """R1 releases the per-dataset claim before the final `ok`, but the reload drain is
+    counted by the gate, which still drops only after `_receive_stream` returns: a reload
+    never cuts the connection between the claim release and the ack."""
+
+    @staticmethod
+    def _handler(authed):
+        return authed.app.view_functions["backup_stream"].__wrapped__
+
+    def test_the_gate_drops_only_after_the_ack_though_the_claim_is_free(self, authed, mocker):
+        gate = authed.gate
+        mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
+        mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=MagicMock())
+        order = []
+        in_send, let_go = threading.Event(), threading.Event()
+        ws = MagicMock()
+        ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+
+        def send(message):
+            assert json.loads(message) == {"status": "ok"}
+            in_send.set()
+            assert let_go.wait(20), "the ack was never let go"
+            order.append("ack sent")
+
+        ws.send.side_effect = send
+        errors = []
+
+        def run_first():
+            try:
+                with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+                    self._handler(authed)(ws, "client1", "pool/data")
+            except BaseException as exc:      # noqa: BLE001 -- handed to the test thread
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_first, daemon=True)
+        thread.start()
+        try:
+            assert in_send.wait(20), "the stream never reached the ack"
+            assert gate.active == 1
+            assert gate.wait_idle(0) is False
+            # The claim is already free: the client's next stream for the same dataset is
+            # served (not 'busy') while the first one is still inside its ack.
+            nxt = MagicMock()
+            nxt.receive.side_effect = [json.dumps({"done": True})]
+            # (run from a thread of its own: the ack send of `ws` is parked in the first one)
+            second_sent = []
+
+            def run_second():
+                try:
+                    with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+                        self._handler(authed)(nxt, "client1", "pool/data")
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+                second_sent.extend(json.loads(c[0][0]) for c in nxt.send.call_args_list)
+
+            second = threading.Thread(target=run_second, daemon=True)
+            second.start()
+            second.join(20)
+            assert not second.is_alive()
+            assert second_sent == [{"status": "ok"}]
+            assert gate.active == 1                   # the first is still counted
+            gate.start_draining()                     # a reload decides to leave now
+            assert gate.wait_idle(0.3) is False       # ...and the drain keeps waiting
+        finally:
+            let_go.set()
+            thread.join(20)
+        assert not thread.is_alive() and errors == []
+        assert gate.wait_idle(10) is True
+        assert order == ["ack sent"]
+        assert gate.active == 0
 
 
 # ---------------------------------------------------------------------------

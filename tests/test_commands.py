@@ -1402,7 +1402,7 @@ class TestExecRealPipes:
     @pytest.mark.subprocess
     def test_interleaved_large_output_with_failure_raises_collected_stderr(self, real_child):
         """(a) Same volume, rc != 0: every row is yielded first, then the exception carries ALL
-        stderr lines (>64 KB of them), capitalised and in order."""
+        stderr lines (>64 KB of them), in order; only the first is capitalised."""
         script = _INTERLEAVED_CHILD.format(rc=3)
         seen = []
 
@@ -1416,7 +1416,7 @@ class TestExecRealPipes:
         assert len(seen) == 300
         lines = str(exc).split('\n')
         assert len(lines) == 300
-        assert lines[0].startswith('Warn 0 eee') and lines[-1].startswith('Warn 299 eee')
+        assert lines[0].startswith('Warn 0 eee') and lines[-1].startswith('warn 299 eee')
         assert sum(len(l) for l in lines) > 64 * 1024
         assert real_child.procs[0].returncode == 3
         assert not any(t.is_alive() for t in real_child.stderr_threads)
@@ -3019,7 +3019,7 @@ class TestExecCollect:
                               returncode=0)
         lines, errors, rc = Command._exec_collect(['zfs', 'x'])
         assert lines == ['first', '\tindented = 1', '', 'last']
-        assert errors == ['Boom happened', 'Again']
+        assert errors == ['Boom happened', 'again']
         assert rc == 0
 
     @pytest.mark.unit
@@ -3294,7 +3294,7 @@ class TestResumeInfoBlockOnStderr:
     def test_multi_line_error_keeps_every_remaining_line(self, mock_subprocess):
         mock_subprocess.setup(stdout=[], stderr=_lines(FULL_CONTENTS, ['cannot resume send: one', '  second line']),
                               returncode=255)
-        assert SendCommand.resume_info(TOKEN_FULL).error == 'Cannot resume send: one\nSecond line'
+        assert SendCommand.resume_info(TOKEN_FULL).error == 'Cannot resume send: one\nsecond line'
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -3394,11 +3394,11 @@ class TestExecCollectRawStderr:
 
     @pytest.mark.unit
     @pytest.mark.subprocess
-    def test_default_mode_still_strips_drops_and_capitalises(self, mock_subprocess):
+    def test_default_mode_still_strips_drops_and_capitalises_the_first_line_only(self, mock_subprocess):
         mock_subprocess.setup(stdout=['out\n'], stderr=['\tindented = 1\n', '\n', '  spaced  \n', 'lower case\n'],
                               returncode=255)
         _, errors, _ = Command._exec_collect(['zfs', 'x'])
-        assert errors == ['Indented = 1', 'Spaced', 'Lower case']
+        assert errors == ['Indented = 1', 'spaced', 'lower case']
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -3504,10 +3504,11 @@ class TestResumeInfoEnvironment:
 
     @pytest.mark.unit
     @pytest.mark.subprocess
-    def test_collect_without_env_passes_none(self, mock_subprocess):
+    def test_collect_without_env_gets_the_c_locale(self, mock_subprocess):
         mock_subprocess.setup(stdout=[], returncode=0)
         Command._exec_collect(['zfs', 'x'])
-        assert mock_subprocess.call_args.kwargs.get('env') is None
+        env = mock_subprocess.call_args.kwargs['env']
+        assert env['LC_ALL'] == 'C' and env['LANG'] == 'C'
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -3520,7 +3521,7 @@ class TestResumeInfoEnvironment:
     @pytest.mark.unit
     @pytest.mark.subprocess
     @pytest.mark.parametrize('path', ['_exec', '_exec_out', '_exec_stream', '_exec_stream_in'])
-    def test_other_exec_paths_pass_no_env(self, mock_subprocess, path):
+    def test_other_exec_paths_get_the_c_locale(self, mock_subprocess, path):
         cmd = ['zfs', 'x']
         if path in ('_exec_stream', '_exec_stream_in'):
             process = MagicMock()
@@ -3534,14 +3535,16 @@ class TestResumeInfoEnvironment:
         result = getattr(owner, path)(cmd)
         if path == '_exec_out':
             list(result)
-        assert mock_subprocess.call_args.kwargs.get('env') is None
+        env = mock_subprocess.call_args.kwargs['env']
+        assert env['LC_ALL'] == 'C' and env['LANG'] == 'C'
 
     @pytest.mark.unit
     @pytest.mark.subprocess
-    def test_ordinary_commands_do_not_get_the_c_locale(self, mock_subprocess):
+    def test_ordinary_commands_get_the_c_locale(self, mock_subprocess):
         mock_subprocess.setup(stdout=[])
         ListCommand()()
-        assert mock_subprocess.call_args.kwargs.get('env') is None
+        env = mock_subprocess.call_args.kwargs['env']
+        assert env['LC_ALL'] == 'C' and env['LANG'] == 'C'
 
 
 class TestExecCollectRobustness:
@@ -3686,5 +3689,693 @@ class TestExecCollectRobustness:
         assert info.toguid == 1 and info.toname == 'p/a@s'
         # the child saw the C locale, its invalid bytes were replaced, and 300 KB of stderr did not block it
         assert info.error.startswith('Locale=C/C bad \ufffd\ufffd bytes')
-        assert ('X' + 'x' * 299999) in info.error.splitlines()
+        assert ('x' * 300000) in info.error.splitlines()
         assert os.environ['LC_ALL'] == 'de_DE.UTF-8'
+
+
+# ---------------------------------------------------------------------------
+# S1a: the C locale reaches every Popen
+# ---------------------------------------------------------------------------
+
+
+def _stream_process():
+    process = MagicMock()
+    process.stdout.peek.return_value = b'ZFS_DATA'
+    process.poll.return_value = None
+    process.stdin = io.BufferedWriter(io.BytesIO())
+    return process
+
+
+def _run_kind(kind, mock_subprocess):
+    """Run one libzfseasy entry point that starts a child, against the mocked Popen."""
+    if kind in ('exec_stream', 'exec_stream_in'):
+        mock_subprocess.return_value = _stream_process()
+    elif kind == 'resume_info':
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS))
+    elif kind == 'list':
+        mock_subprocess.setup(stdout=[])
+    else:
+        mock_subprocess.setup(stdout=[], returncode=0)
+    cmd = ['zfs', 'x']
+    if kind == 'exec':
+        Command._exec(cmd)
+    elif kind == 'exec_out':
+        list(Command._exec_out(cmd))
+    elif kind == 'exec_lines':
+        list(Command._exec_lines(cmd))
+    elif kind == 'collect':
+        Command._exec_collect(cmd)
+    elif kind == 'collect_raw':
+        Command._exec_collect(cmd, raw_stderr=True)
+    elif kind == 'exec_stream':
+        SendCommand._exec_stream(cmd)
+    elif kind == 'exec_stream_in':
+        ReceiveCommand._exec_stream_in(cmd)
+    elif kind == 'resume_info':
+        SendCommand.resume_info(TOKEN_FULL)
+    elif kind == 'list':
+        ListCommand()()
+    else:
+        raise AssertionError(kind)
+
+
+_ENV_KINDS = ['exec', 'exec_out', 'exec_lines', 'collect', 'collect_raw', 'exec_stream', 'exec_stream_in',
+              'resume_info', 'list']
+
+
+class TestChildEnvReachesEveryPopen:
+
+    @pytest.fixture
+    def hermetic_path(self, monkeypatch):
+        from _hermetic import hermetic_env
+        path = hermetic_env()['PATH']       # a private PATH with stub zfs/zpool only
+        monkeypatch.setenv('PATH', path)
+        return path
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('kind', _ENV_KINDS)
+    @pytest.mark.parametrize('locale', [None, 'de_DE.UTF-8'], ids=['no-locale', 'caller-de_DE'])
+    def test_every_popen_runs_in_the_c_locale_with_the_rest_of_the_environment(
+            self, mock_subprocess, monkeypatch, hermetic_path, kind, locale):
+        if locale is None:
+            monkeypatch.delenv('LC_ALL', raising=False)
+            monkeypatch.delenv('LANG', raising=False)
+        else:
+            monkeypatch.setenv('LC_ALL', locale)
+            monkeypatch.setenv('LANG', locale)
+        monkeypatch.setenv('LC_MESSAGES', 'de_DE.UTF-8')
+        monkeypatch.setenv('LIBZFSEASY_TEST_KEEP', 'kept')
+        before = dict(os.environ)
+
+        _run_kind(kind, mock_subprocess)
+
+        assert mock_subprocess.call_count == 1
+        env = mock_subprocess.call_args.kwargs['env']
+        assert env['LC_ALL'] == 'C' and env['LANG'] == 'C'
+        assert env['PATH'] == hermetic_path
+        assert env['LIBZFSEASY_TEST_KEEP'] == 'kept'
+        assert env['LC_MESSAGES'] == 'de_DE.UTF-8'        # only LC_ALL and LANG are forced
+        assert {k: v for k, v in env.items() if k not in ('LC_ALL', 'LANG')} == \
+            {k: v for k, v in before.items() if k not in ('LC_ALL', 'LANG')}
+        assert env is not os.environ
+        assert dict(os.environ) == before                  # the parent is untouched
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('raw', [False, True])
+    def test_collect_with_an_explicit_env_uses_exactly_that(self, mock_subprocess, monkeypatch, raw):
+        monkeypatch.setenv('LC_ALL', 'de_DE.UTF-8')
+        mock_subprocess.setup(stdout=[], returncode=0)
+        Command._exec_collect(['zfs', 'x'], raw_stderr=raw, env={'ONLY': '1'})
+        assert mock_subprocess.call_args.kwargs['env'] == {'ONLY': '1'}
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_collect_with_an_empty_explicit_env_is_not_replaced(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], returncode=0)
+        Command._exec_collect(['zfs', 'x'], env={})
+        assert mock_subprocess.call_args.kwargs['env'] == {}
+
+    @pytest.mark.unit
+    def test_child_env_is_a_fresh_copy_each_call(self, monkeypatch):
+        from libzfseasy.zfs import _child_env
+        monkeypatch.setenv('LC_ALL', 'fr_FR.UTF-8')
+        first = _child_env()
+        first['MUTATED'] = '1'
+        assert 'MUTATED' not in _child_env()
+        assert os.environ['LC_ALL'] == 'fr_FR.UTF-8'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_real_child_sees_the_c_locale_and_the_callers_environment(self, real_child, monkeypatch, hermetic_path):
+        monkeypatch.setenv('LC_ALL', 'de_DE.UTF-8')
+        monkeypatch.setenv('LANG', 'de_DE.UTF-8')
+        monkeypatch.setenv('LIBZFSEASY_TEST_KEEP', 'kept')
+        script = ('import os\n'
+                  'for k in ("LC_ALL", "LANG", "PATH", "LIBZFSEASY_TEST_KEEP"):\n'
+                  '    print(k + "=" + os.environ.get(k, "<unset>"))\n')
+        for run in (lambda: list(Command._exec_out(real_child.cmd(script))),
+                    lambda: list(Command._exec_lines(real_child.cmd(script))),
+                    lambda: Command._exec_collect(real_child.cmd(script))[0]):
+            lines, exc = real_child.run(run)
+            assert exc is None
+            assert lines == ['LC_ALL=C', 'LANG=C', 'PATH=' + hermetic_path, 'LIBZFSEASY_TEST_KEEP=kept']
+
+
+# ---------------------------------------------------------------------------
+# S1a: failure messages (`_failure_text`) -- unit, then with real children
+# ---------------------------------------------------------------------------
+
+
+class TestFailureText:
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('errors, rc, expected', [
+        (['Boom'], 1, 'Boom'),
+        (['First', 'Second'], 1, 'First\nSecond'),
+        (['Boom'], -13, 'Boom'),                                    # stderr wins over the signal
+        ([], 3, 'Command failed with exit code 3'),
+        ([], 1, 'Command failed with exit code 1'),
+        ([], -13, 'Command killed by signal SIGPIPE'),
+        ([], -9, 'Command killed by signal SIGKILL'),
+        ([], -15, 'Command killed by signal SIGTERM'),
+        ([], -11, 'Command killed by signal SIGSEGV'),
+        ([], -1, 'Command killed by signal SIGHUP'),
+        ([], -255, 'Command killed by signal 255'),                 # not a signal number: the bare number
+        ([], -100000, 'Command killed by signal 100000'),
+        ([], None, 'Command failed with exit code None'),           # not an int: never a signal
+        ([], '3', 'Command failed with exit code 3'),
+        ([], -13.0, 'Command failed with exit code -13.0'),
+        ([], True, 'Command failed with exit code True'),
+    ])
+    def test_failure_text(self, errors, rc, expected):
+        from libzfseasy.zfs import _failure_text
+        assert _failure_text(errors, rc) == expected
+
+    @pytest.mark.unit
+    def test_an_empty_bounded_error_list_counts_as_empty(self):
+        from libzfseasy.zfs import _BoundedErrors, _failure_text
+        assert _failure_text(_BoundedErrors(), -13) == 'Command killed by signal SIGPIPE'
+        errors = _BoundedErrors()
+        errors.append('Boom')
+        assert _failure_text(errors, -13) == 'Boom'
+
+    @pytest.mark.unit
+    def test_a_signal_with_no_known_name_does_not_raise(self):
+        from libzfseasy.zfs import _failure_text
+        for rc in range(-130, 0):
+            text = _failure_text([], rc)
+            assert text.startswith('Command killed by signal ') and text.split()[-1]
+
+
+_SIGPIPE_CHILD = ('import os, signal\n'
+                  'signal.signal(signal.SIGPIPE, signal.SIG_DFL)\n'
+                  'os.kill(os.getpid(), signal.SIGPIPE)\n')
+_EXIT3_CHILD = 'import sys\nsys.exit(3)\n'
+_STDERR_EXIT3_CHILD = 'import sys\nsys.stderr.write("disk on fire\\n")\nsys.stderr.flush()\nsys.exit(3)\n'
+_STDERR_SIGPIPE_CHILD = ('import os, signal, sys\n'
+                         'sys.stderr.write("disk on fire\\n")\nsys.stderr.flush()\n'
+                         'signal.signal(signal.SIGPIPE, signal.SIG_DFL)\n'
+                         'os.kill(os.getpid(), signal.SIGPIPE)\n')
+
+
+def _drain_stream_in(cmd):
+    handle = ReceiveCommand._exec_stream_in(cmd)
+    handle.close()
+
+
+_HELPER_RUNNERS = {
+    '_exec': lambda cmd: Command._exec(cmd),
+    '_exec_out': lambda cmd: list(Command._exec_out(cmd)),
+    '_exec_lines': lambda cmd: list(Command._exec_lines(cmd)),
+    '_exec_stream': lambda cmd: SendCommand._exec_stream(cmd),
+    '_exec_stream_in': _drain_stream_in,
+}
+
+
+class TestFailureMessagesWithRealChildren:
+    """Real `sys.executable` children (no pool, no zfs): the exception text for a signal death, a plain non-zero
+    exit, and the precedence of stderr text."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('runner', sorted(_HELPER_RUNNERS))
+    @pytest.mark.parametrize('script, rc, message', [
+        (_SIGPIPE_CHILD, -signal.SIGPIPE, 'Command killed by signal SIGPIPE'),
+        (_EXIT3_CHILD, 3, 'Command failed with exit code 3'),
+        (_STDERR_EXIT3_CHILD, 3, 'Disk on fire'),
+        (_STDERR_SIGPIPE_CHILD, -signal.SIGPIPE, 'Disk on fire'),
+    ], ids=['sigpipe', 'exit3', 'stderr-exit3', 'stderr-sigpipe'])
+    def test_helper_failure_message(self, real_child, runner, script, rc, message):
+        _, exc = real_child.run(lambda: _HELPER_RUNNERS[runner](real_child.cmd(script)))
+        assert type(exc) is Exception
+        assert str(exc) == message
+        assert real_child.procs[0].returncode == rc
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_out_yields_its_rows_before_the_signal_message(self, real_child):
+        script = 'import sys\nsys.stdout.write("row1\\nrow2\\n")\nsys.stdout.flush()\n' + _SIGPIPE_CHILD
+        seen = []
+
+        def consume():
+            for row in Command._exec_out(real_child.cmd(script)):
+                seen.append(row)
+
+        _, exc = real_child.run(consume)
+        assert seen == ['row1', 'row2']
+        assert str(exc) == 'Command killed by signal SIGPIPE'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_collect_reports_a_signal_death_as_a_negative_rc(self, real_child):
+        lines, errors, rc = real_child.run(lambda: Command._exec_collect(real_child.cmd(_SIGPIPE_CHILD)))[0]
+        assert (lines, errors, rc) == ([], [], -signal.SIGPIPE)
+
+
+_FAKE_CHILD_ZFS = '''#!{python}
+import os, signal, sys
+mode = os.environ.get("FAKE_ZFS_MODE", "")
+if mode in ("stderr_exit3", "stderr_sigpipe"):
+    sys.stderr.write("disk on fire\\n"); sys.stderr.flush()
+if mode in ("sigpipe", "stderr_sigpipe"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGPIPE)
+if mode in ("exit3", "stderr_exit3"):
+    sys.exit(3)
+sys.exit(0)
+'''
+
+
+@pytest.fixture
+def child_zfs(tmp_path, monkeypatch):
+    """`ZFS_CMD` -> a script run by the test interpreter whose behaviour is chosen by `FAKE_ZFS_MODE`; PATH and
+    `ZPOOL_CMD` are the hermetic ones, so nothing the code does can reach a real zfs."""
+    from _hermetic import hermetic_env
+    script = tmp_path / 'fake_zfs_child'
+    script.write_text(_FAKE_CHILD_ZFS.format(python=sys.executable))
+    script.chmod(0o755)
+    env = hermetic_env()
+    monkeypatch.setenv('PATH', env['PATH'])
+    monkeypatch.setenv('ZPOOL_CMD', env['ZPOOL_CMD'])
+    monkeypatch.setenv('ZFS_CMD', str(script))
+
+    def mode(name):
+        monkeypatch.setenv('FAKE_ZFS_MODE', name)
+    return mode
+
+
+_FS = Filesystem('p/a')
+
+
+def _public_calls():
+    def receive():
+        ReceiveCommand.filesystem(_FS).close()
+
+    def resume():
+        SendCommand.resume(TOKEN_FULL)
+
+    return {
+        'list': lambda: ListCommand()(),
+        'set': lambda: SetCommand()(_FS, {'org:x': '1'}),
+        'destroy': lambda: DestroyCommand.dataset(_FS, destroy=True),
+        'send.partial': lambda: SendCommand.partial(_FS),
+        'send.resume': resume,
+        'receive': receive,
+    }
+
+
+class TestFailureMessagesThroughTheCommands:
+    """The same messages through the public commands, with `ZFS_CMD` pointed at a real child."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('name', sorted(_public_calls()))
+    @pytest.mark.parametrize('mode, message', [
+        ('sigpipe', 'Command killed by signal SIGPIPE'),
+        ('exit3', 'Command failed with exit code 3'),
+        ('stderr_exit3', 'Disk on fire'),
+        ('stderr_sigpipe', 'Disk on fire'),
+    ])
+    def test_message(self, real_child, child_zfs, name, mode, message):
+        child_zfs(mode)
+        _, exc = real_child.run(_public_calls()[name])
+        assert type(exc) is Exception and str(exc) == message
+        assert all(p.returncode is not None for p in real_child.procs)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('name', sorted(_public_calls()))
+    def test_a_clean_exit_raises_nothing(self, real_child, child_zfs, name):
+        child_zfs('ok')
+        _, exc = real_child.run(_public_calls()[name])
+        assert exc is None
+
+
+# ---------------------------------------------------------------------------
+# L2: destroying an empty list of snapshots
+# ---------------------------------------------------------------------------
+
+
+class TestDestroyEmptySnapshotList:
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('empty', [lambda: [], lambda: iter(()), lambda: (s for s in ()), lambda: (),
+                                       lambda: set()], ids=['list', 'iter', 'generator', 'tuple', 'set'])
+    @pytest.mark.parametrize('kwargs', [{}, {'destroy': True}, {'destroy': True, 'lazy': True},
+                                        {'destroy': True, 'recursive': True, 'force': True}])
+    def test_snapshots_raises_before_exec(self, mock_subprocess, empty, kwargs):
+        with pytest.raises(ValueError, match='at least one'):
+            DestroyCommand.snapshots(empty(), **kwargs)
+        assert mock_subprocess.call_count == 0
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_of_an_empty_list_raises_before_exec(self, mock_subprocess):
+        with pytest.raises(ValueError, match='at least one'):
+            DestroyCommand()([], destroy=True)
+        with pytest.raises(ValueError, match='at least one'):
+            DestroyCommand()([])
+        import libzfseasy
+        with pytest.raises(ValueError, match='at least one'):
+            libzfseasy.destroy([], destroy=True)
+        assert mock_subprocess.call_count == 0
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_lazy_form_raises_at_the_call_not_at_the_first_next(self, mock_subprocess):
+        with pytest.raises(ValueError):
+            DestroyCommand.snapshots([], destroy=True, lazy=True)       # no iteration needed
+        assert mock_subprocess.call_count == 0
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_one_element_iterator_still_runs(self, mock_subprocess, sample_snapshot):
+        mock_subprocess.setup(stdout=['destroy\ttestpool/filesystem@snap1\n'])
+        assert DestroyCommand.snapshots(iter([sample_snapshot]), destroy=True) == ['testpool/filesystem@snap1']
+        assert mock_subprocess.call_args[0][0][-1] == 'testpool/filesystem@snap1'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_wrong_element_type_message_is_unchanged(self, mock_subprocess):
+        with pytest.raises(ValueError, match='Expected Snapshot or SnapshotRange'):
+            DestroyCommand.snapshots(['not a snapshot'], destroy=True)
+        assert mock_subprocess.call_count == 0
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_lazy_destroy_yields_its_lines_then_raises_on_a_failing_exit(self, mock_subprocess, sample_filesystem):
+        a, b = Snapshot(sample_filesystem, 'a'), Snapshot(sample_filesystem, 'b')
+        process = mock_subprocess.setup(
+            stdout=['destroy\ttestpool/filesystem@a\n', 'destroy\ttestpool/filesystem@b\n'],
+            stderr='cannot destroy: dataset is busy', returncode=1)
+        process.poll.side_effect = None
+        process.poll.return_value = 1
+        gen = DestroyCommand.snapshots([a, b], destroy=True, lazy=True)
+        assert mock_subprocess.call_count == 0             # nothing runs until the first next()
+        seen = []
+        with pytest.raises(Exception, match='Cannot destroy: dataset is busy') as excinfo:
+            for line in gen:
+                seen.append(line)
+        assert seen == ['testpool/filesystem@a', 'testpool/filesystem@b']
+        assert type(excinfo.value) is Exception            # the bare subprocess error, not a ValueError
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_non_lazy_destroy_raises_without_returning_the_lines(self, mock_subprocess, sample_snapshot):
+        process = mock_subprocess.setup(stdout=['destroy\ttestpool/filesystem@snap1\n'], stderr='cannot destroy',
+                                        returncode=1)
+        process.poll.side_effect = None
+        process.poll.return_value = 1
+        with pytest.raises(Exception, match='Cannot destroy'):
+            DestroyCommand.snapshots(sample_snapshot, destroy=True)
+
+
+# ---------------------------------------------------------------------------
+# One-shot iterables (generators, iterators) are accepted wherever a list is
+# ---------------------------------------------------------------------------
+
+_ONE_SHOT = pytest.mark.parametrize('make', [lambda items: (i for i in items), lambda items: iter(list(items))],
+                                    ids=['generator', 'iterator'])
+
+
+def _argv(mock_subprocess, n=0):
+    return list(mock_subprocess.call_args_list[n][0][0])[1:]
+
+
+_GET_ROWS = [
+    'testpool/filesystem\tname\ttestpool/filesystem\t-\t-\n',
+    'testpool/filesystem\ttype\tfilesystem\t-\t-\n',
+    'testpool/filesystem\tcompression\tlz4\t-\tlocal\n',
+    'testpool/filesystem\tquota\t10G\t-\tinherited from testpool\n',
+    'testpool/filesystem@s\tname\ttestpool/filesystem@s\t-\t-\n',
+    'testpool/filesystem@s\ttype\tsnapshot\t-\t-\n',
+    'testpool/filesystem@s\tcompression\tlz4\t-\tlocal\n',
+]
+
+
+class TestOneShotIterables:
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_receive_set_and_reset_overlap_is_still_caught(self, mock_subprocess, make):
+        with pytest.raises(ValueError, match='cannot be both set'):
+            ReceiveCommand.filesystem(Filesystem('p/a'), props={'org:x': '1'}, reset=make(['org:x']))
+        assert mock_subprocess.call_count == 0
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_receive_one_shot_reset_gives_x_flags(self, mock_subprocess, make):
+        mock_subprocess.setup(stdout='')
+        ReceiveCommand.filesystem(Filesystem('p/a'), props={'org:k': 'v'}, reset=make(['mountpoint', 'org:x'])).close()
+        assert _argv(mock_subprocess) == ['receive', '-o', 'org:k=v', '-x', 'mountpoint', '-x', 'org:x', 'p/a']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_list_one_shot_properties(self, mock_subprocess, make):
+        mock_subprocess.setup(stdout=[])
+        ListCommand()(properties=make(['compression', 'mountpoint']))
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-o') + 1] == 'name,type,compression,mountpoint'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_list_one_shot_types_and_the_wanted_filter(self, mock_subprocess, make):
+        mock_subprocess.setup(stdout=['testpool/fs@s\tsnapshot\n', 'testpool/fs\tfilesystem\n',
+                                      'testpool/v\tvolume\n'])
+        result = ListCommand()(types=make(['filesystem', 'volume']))
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-t') + 1] == 'filesystem,volume'
+        assert [(type(o), o.name) for o in result] == [(Filesystem, 'testpool/fs'), (Volume, 'testpool/v')]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_list_one_shot_types_lazy(self, mock_subprocess, make):
+        mock_subprocess.setup(stdout=['testpool/fs@s\tsnapshot\n', 'testpool/fs\tfilesystem\n'])
+        result = list(ListCommand()(types=make(['filesystem', 'volume']), lazy=True))
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-t') + 1] == 'filesystem,volume'
+        assert [o.name for o in result] == ['testpool/fs']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_get_one_shot_types_and_the_wanted_filter(self, mock_subprocess, make):
+        mock_subprocess.setup(stdout=list(_GET_ROWS))
+        result = GetCommand()(ds=Filesystem('testpool/filesystem'), properties=['compression'],
+                              types=make(['filesystem', 'volume']))
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-t') + 1] == 'filesystem,volume'
+        assert [o.name for o in result] == ['testpool/filesystem']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_get_one_shot_properties_and_sources(self, mock_subprocess, make):
+        mock_subprocess.setup(stdout=list(_GET_ROWS))
+        result = GetCommand()(ds=Filesystem('testpool/filesystem'), properties=make(['compression', 'quota']),
+                              sources=make(['local']))
+        argv = _argv(mock_subprocess)
+        assert 'name,type,compression,quota' in argv
+        (fs,) = [o for o in result if o.name == 'testpool/filesystem']
+        assert fs['compression'].value == 'lz4'
+        assert 'quota' not in fs                  # its source is `inherited`, not `local`
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_get_one_shot_types_lazy(self, mock_subprocess, make):
+        mock_subprocess.setup(stdout=list(_GET_ROWS))
+        result = list(GetCommand()(ds=Filesystem('testpool/filesystem'), properties=['compression'],
+                                   types=make(['filesystem']), lazy=True))
+        assert '-t' in _argv(mock_subprocess) and 'filesystem' in _argv(mock_subprocess)
+        assert [o.name for o in result] == ['testpool/filesystem']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_get_value_one_shot_sources(self, mock_subprocess, make):
+        mock_subprocess.setup(stdout=['lz4\n'])
+        assert GetCommand.value(Filesystem('testpool/filesystem'), 'compression', sources=make(['local', 'received'])) \
+            == 'lz4'
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-s') + 1] == 'local,received'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_inherit_one_shot_props_runs_one_inherit_per_name(self, mock_subprocess, make):
+        fs = Filesystem('testpool/filesystem', {'compression': 'lz4', 'quota': '10G'})
+        mock_subprocess.setup_multi(([''],), ([''],))
+        InheritCommand()(fs, make(['compression', 'quota']))
+        assert mock_subprocess.call_count == 2
+        assert _argv(mock_subprocess, 0) == ['inherit', 'compression', 'testpool/filesystem']
+        assert _argv(mock_subprocess, 1) == ['inherit', 'quota', 'testpool/filesystem']
+        assert 'compression' not in fs and 'quota' not in fs     # both were cleared after their own call
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_inherit_one_shot_invalid_name_runs_nothing(self, mock_subprocess, make):
+        fs = Filesystem('testpool/filesystem', {'compression': 'lz4'})
+        with pytest.raises(ValueError):
+            InheritCommand()(fs, make(['compression', 'not-a-property']))
+        assert mock_subprocess.call_count == 0
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_allow_one_shot_users_groups_permissions(self, mock_subprocess, make):
+        mock_subprocess.setup()
+        AllowCommand()(Filesystem('testpool/filesystem'), make(['create', 'destroy']),
+                       users=make(['alice', 'bob']), groups=make(['ops', 'dev']))
+        argv = _argv(mock_subprocess)
+        assert argv[argv.index('-u') + 1] == 'alice,bob'
+        assert argv[argv.index('-g') + 1] == 'ops,dev'
+        assert argv[-2:] == ['create,destroy', 'testpool/filesystem']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_get_one_shot_datasets(self, mock_subprocess, make):
+        mock_subprocess.setup(stdout=list(_GET_ROWS))
+        GetCommand()(ds=make([Filesystem('testpool/filesystem'), Snapshot(Filesystem('testpool/filesystem'), 's')]),
+                     properties=['compression'])
+        assert _argv(mock_subprocess)[-2:] == ['testpool/filesystem', 'testpool/filesystem@s']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @_ONE_SHOT
+    def test_list_one_shot_roots(self, mock_subprocess, make):
+        mock_subprocess.setup(stdout=['testpool/a\tfilesystem\n'])
+        ListCommand()(roots=make([Filesystem('testpool/a'), Filesystem('testpool/b')]))
+        assert _argv(mock_subprocess)[-2:] == ['testpool/a', 'testpool/b']
+
+
+class TestResumeInfoSignalDeath:
+    """A child killed by a signal prints nothing: the message is `_failure_text`'s, never `exit code -13`."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_no_contents_and_no_stderr_raises_the_signal_message(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], returncode=-signal.SIGPIPE)
+        with pytest.raises(Exception) as excinfo:
+            SendCommand.resume_info(TOKEN_FULL)
+        assert type(excinfo.value) is Exception
+        assert str(excinfo.value) == 'Command killed by signal SIGPIPE'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_contents_and_no_stderr_sets_error_to_the_signal_message(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS), returncode=-signal.SIGPIPE)
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info.toname == 'rtp/send/a@s1'
+        assert info.error == 'Command killed by signal SIGPIPE'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_plain_non_zero_exit_without_stderr_keeps_its_wording(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[], returncode=3)
+        with pytest.raises(Exception, match='^Command failed with exit code 3$'):
+            SendCommand.resume_info(TOKEN_FULL)
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS), returncode=3)
+        assert SendCommand.resume_info(TOKEN_FULL).error == 'Command failed with exit code 3'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_stderr_text_still_wins_over_the_signal(self, mock_subprocess):
+        mock_subprocess.setup(stdout=_lines(FULL_CONTENTS), stderr=['cannot resume send: target is busy'],
+                              returncode=-signal.SIGPIPE)
+        assert SendCommand.resume_info(TOKEN_FULL).error == 'Cannot resume send: target is busy'
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Multi-line stderr: only the FIRST non-empty line is capitalised; continuation lines are the real zfs text
+# ---------------------------------------------------------------------------------------------------------------------
+
+CLONES_STDERR = ["cannot destroy 'p/fs@s': snapshot has dependent clones",
+                 "use '-R' to destroy the following datasets:",
+                 'p/clone3']
+CLONES_MESSAGE = ("Cannot destroy 'p/fs@s': snapshot has dependent clones\n"
+                  "use '-R' to destroy the following datasets:\n"
+                  "p/clone3")
+
+# (leading stderr lines, case id): the first NON-empty line is the one that is capitalised
+LEADING_NOISE = [pytest.param([], id='no-blank'),
+                 pytest.param(['\n'], id='blank-first'),
+                 pytest.param(['   \n', '\n'], id='whitespace-first')]
+
+
+class TestStderrFirstLineOnlyTextReaders:
+    """The text stderr readers (`_start_stderr_reader`, `_start_stderr_reader_lines`) capitalise only the first
+    collected line. Mutation check: per-line capitalisation restored in `_start_stderr_reader` fails the `_exec`,
+    `_exec_out` and `_exec_collect` tests below (the `_exec_lines` ones live in test_framing.py)."""
+
+    @staticmethod
+    def _stderr(noise):
+        return noise + [line + '\n' for line in CLONES_STDERR]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('noise', LEADING_NOISE)
+    def test_exec_raises_with_only_the_first_line_capitalised(self, mock_subprocess, noise):
+        mock_subprocess.setup(stdout=[], stderr=self._stderr(noise), returncode=1)
+        with pytest.raises(Exception) as exc:
+            Command._exec(['zfs', 'destroy', 'p/fs@s'])
+        assert str(exc.value) == CLONES_MESSAGE
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('noise', LEADING_NOISE)
+    def test_exec_out_raises_with_only_the_first_line_capitalised(self, mock_subprocess, noise):
+        process = mock_subprocess.setup(stdout=['row\n'], stderr=self._stderr(noise), returncode=1)
+        process.poll.side_effect = None
+        process.poll.return_value = 1
+        out = Command._exec_out(['zfs', 'destroy', 'p/fs@s'])
+        assert next(out) == 'row'
+        with pytest.raises(Exception) as exc:
+            next(out)
+        assert str(exc.value) == CLONES_MESSAGE
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('noise', LEADING_NOISE)
+    def test_exec_collect_returns_only_the_first_line_capitalised(self, mock_subprocess, noise):
+        mock_subprocess.setup(stdout=[], stderr=self._stderr(noise), returncode=1)
+        _, errors, rc = Command._exec_collect(['zfs', 'destroy', 'p/fs@s'])
+        assert rc == 1
+        assert '\n'.join(errors) == CLONES_MESSAGE
+        assert errors[2] == 'p/clone3'
+
+
+class TestStderrFirstLineOnlyResumeInfo:
+    """`SendCommand.resume_info` builds its error text from the raw stderr lines with the same rule."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('noise', LEADING_NOISE)
+    def test_error_text_capitalises_only_the_first_line(self, mock_subprocess, noise):
+        mock_subprocess.setup(stdout=[], returncode=255,
+                              stderr=_lines(FULL_CONTENTS) + noise + _lines(CLONES_STDERR))
+        info = SendCommand.resume_info(TOKEN_FULL)
+        assert info.toguid == 0x61034bf73452096e
+        assert info.error == CLONES_MESSAGE
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_resume_failure_without_a_block_raises_the_same_text(self, mock_subprocess):
+        stderr = ["cannot resume send: 'p/a@s1' used in the initial send no longer exists",
+                  "use 'p/Clone3'"]
+        mock_subprocess.setup(stdout=[], stderr=_lines(stderr), returncode=255)
+        with pytest.raises(Exception) as exc:
+            SendCommand.resume_info(TOKEN_FULL)
+        assert str(exc.value) == ("Cannot resume send: 'p/a@s1' used in the initial send no longer exists\n"
+                                  "use 'p/Clone3'")

@@ -57,6 +57,7 @@ from unittest import mock
 
 import pytest
 from _hermetic import hermetic_env
+from _raw_support import stub_table_ddl
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.pool import StaticPool
@@ -2132,7 +2133,7 @@ class TestUnrecordedTableSubsets:
     def _build(self, db: Path, names, *foreign: str) -> None:
         conn = sqlite3.connect(str(db))
         for name in (*names, *foreign):
-            conn.execute(f"CREATE TABLE {name} (id INTEGER PRIMARY KEY)")
+            conn.execute(stub_table_ddl(name))
         conn.commit()
         conn.close()
         os.chmod(db, 0o660)

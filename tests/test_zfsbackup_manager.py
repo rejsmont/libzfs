@@ -13,6 +13,11 @@ from zfsbackup.backup_manager import (
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, RetentionRule, RemoteServerConfig, RemoteDatasetConfig, Duration,
 )
+from _snapshot_support import NO_TXG, list_row, listed_info, listed_snapshot
+from _prune_support import (  # noqa: F401
+    VERSIONS, PrunePool, hourly_name, prune_manager, prune_pool, records,
+)
+from zfsbackup.backup_manager import PROP_ANCHOR_PREFIX, PROP_INFLIGHT_PREFIX
 
 
 def _make_config(**kwargs) -> BackupConfig:
@@ -27,8 +32,12 @@ def _make_config(**kwargs) -> BackupConfig:
 def _make_snap_info(prefix: str, days_old: int) -> SnapshotInfo:
     dt = datetime.now(timezone.utc) - timedelta(days=days_old)
     name = f"{prefix}_{dt.strftime('%Y%m%d%H%M%S')}"
-    snap = ZFSSnapshot(Filesystem('pool/data'), name)
-    return SnapshotInfo(snap, prefix)
+    return listed_info(name, prefix)
+
+
+def _stamp(age: timedelta, prefix: str = 'autosnap') -> str:
+    """A managed snapshot name dated `age` ago."""
+    return f"{prefix}_{(datetime.now(timezone.utc) - age).strftime('%Y%m%d%H%M%S')}"
 
 
 class TestDatasetManagerDatasets:
@@ -85,8 +94,7 @@ class TestNeedsSnapshot:
         manager = DatasetManager(_make_config())
         dsi = manager.datasets[0]
         dsi.config.frequency = timedelta(hours=1)
-        snap = MagicMock()
-        snap.age = timedelta(hours=2)
+        snap = listed_info(_stamp(timedelta(hours=2)))
         mocker.patch.object(manager, 'list_snapshots', return_value=[snap])
         assert manager.needs_snapshot(dsi) is True
 
@@ -94,8 +102,7 @@ class TestNeedsSnapshot:
         manager = DatasetManager(_make_config())
         dsi = manager.datasets[0]
         dsi.config.frequency = timedelta(hours=1)
-        snap = MagicMock()
-        snap.age = timedelta(minutes=30)
+        snap = listed_info(_stamp(timedelta(minutes=30)))
         mocker.patch.object(manager, 'list_snapshots', return_value=[snap])
         assert manager.needs_snapshot(dsi) is False
 
@@ -104,11 +111,21 @@ class TestCreateSnapshot:
     def test_creates_snapshot_and_returns_info(self, mocker):
         manager = DatasetManager(_make_config())
         dsi = manager.datasets[0]
-        mock_snap = ZFSSnapshot(Filesystem('pool/data'), 'autosnap_20240101120000')
-        mocker.patch('zfsbackup.backup_manager.zfs.snapshot', return_value=mock_snap)
+        made = []
+
+        def take(ds, name, **kwargs):
+            made.append(name)
+            return ZFSSnapshot(Filesystem('pool/data'), name)
+
+        mocker.patch('zfsbackup.backup_manager.zfs.snapshot', side_effect=take)
+        mocker.patch(
+            'zfsbackup.backup_manager.zfs.list',
+            side_effect=lambda **kw: [listed_snapshot(made[0], txg=77)],
+        )
         result = manager.create_snapshot(dsi)
         assert result is not None
         assert result.name.startswith('autosnap_')
+        assert result.createtxg == 77                  # the listed object, not the bare one
 
     def test_dry_run_skips_zfs_call(self, mocker):
         manager = DatasetManager(_make_config(dry_run=True))
@@ -124,6 +141,10 @@ class TestCreateSnapshot:
         snap1 = ZFSSnapshot(Filesystem('pool/data'), 'autosnap_20240101120000')
         snap2 = ZFSSnapshot(Filesystem('pool/data/sub'), 'autosnap_20240101120000')
         mocker.patch('zfsbackup.backup_manager.zfs.snapshot', return_value=[snap1, snap2])
+        mocker.patch(
+            'zfsbackup.backup_manager.zfs.list',
+            return_value=[listed_snapshot('autosnap_20240101120000')],
+        )
         result = manager.create_snapshot(dsi)
         assert result is not None
 
@@ -144,6 +165,7 @@ class TestCreateSnapshot:
             return ZFSSnapshot(Filesystem('pool/data'), name)
 
         mocker.patch('zfsbackup.backup_manager.zfs.snapshot', side_effect=capture_snap)
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
         manager.create_snapshot(dsi)
         assert captured['name'].startswith('mysnap_')
 
@@ -153,8 +175,8 @@ class TestListSnapshots:
         manager = DatasetManager(_make_config())
         dsi = manager.datasets[0]
         fs = Filesystem('pool/data')
-        managed = ZFSSnapshot(fs, 'autosnap_20240101120000')
-        unmanaged = ZFSSnapshot(fs, 'manual_20240101120000')
+        managed = listed_snapshot('autosnap_20240101120000')
+        unmanaged = listed_snapshot('manual_20240101120000')
         mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[managed, unmanaged])
         result = manager.list_snapshots(dsi)
         assert len(result) == 1
@@ -164,8 +186,8 @@ class TestListSnapshots:
         manager = DatasetManager(_make_config())
         dsi = manager.datasets[0]
         fs = Filesystem('pool/data')
-        older = ZFSSnapshot(fs, 'autosnap_20240101120000')
-        newer = ZFSSnapshot(fs, 'autosnap_20240102120000')
+        older = listed_snapshot('autosnap_20240101120000')
+        newer = listed_snapshot('autosnap_20240102120000')
         mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[older, newer])
         result = manager.list_snapshots(dsi)
         assert result[0].name == 'autosnap_20240102120000'
@@ -180,7 +202,7 @@ class TestListSnapshots:
         manager = DatasetManager(_make_config())
         dsi = manager.datasets[0]
         fs = Filesystem('pool/data')
-        snap = ZFSSnapshot(fs, 'autosnap_20240101120000')
+        snap = listed_snapshot('autosnap_20240101120000')
         mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[snap])
         manager.list_snapshots(dsi)
         assert len(dsi.snapshots) == 1
@@ -410,15 +432,603 @@ class TestPruneSnapshots:
         manager.prune_snapshots(dsi)
         mock_destroy.assert_called_once()
 
-    def test_destroy_exception_does_not_propagate(self, mocker):
-        manager = DatasetManager(_make_config())
-        dsi = manager.datasets[0]
-        snaps = [_make_snap_info('autosnap', 5 + i) for i in range(3)]
-        mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
-        mocker.patch.object(manager, 'get_anchors', return_value=set())
-        mocker.patch.object(manager, 'needs_prunning', return_value=snaps[1:])
-        mocker.patch('zfsbackup.backup_manager.zfs.destroy', side_effect=Exception('destroy failed'))
-        manager.prune_snapshots(dsi)  # must not raise
+    def test_destroy_exception_does_not_propagate(self, prune_pool, caplog):
+        """Every destroy fails (a send holds each name). Nothing escapes, the batch error is logged once,
+        each member is retried alone, and each is remembered as stuck. (Before B-4 this passed only
+        because a stub `zfs list` returned nothing.)"""
+        manager, dsi = prune_manager()
+        fresh, olds = prune_pool.populate('pool/data', old=3)
+        for name in olds:
+            prune_pool.send('pool/data', name)
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)  # must not raise
+        assert prune_pool.sizes == [3, 1, 1, 1]
+        assert all(not c.ok for c in prune_pool.calls)
+        assert len(records(caplog, logging.ERROR, 'Failed to prune snapshot batch')) == 1
+        assert set(manager._prune_stuck) == {('pool/data', n) for n in olds}
+        assert prune_pool.names_of('pool/data') == set(olds) | {fresh}
+        assert records(caplog, logging.INFO, 'Successfully pruned') == []
+
+
+def _destroyed(pool, dataset, before):
+    """The short names that left `dataset` since `before` (a set of its names)."""
+    return before - pool.names_of(dataset)
+
+
+class TestPruneBatchFallbackAndStuck:
+    """B-4 (decision B8): a failed batch destroys nothing, so each member is retried alone; held and
+    cloned snapshots are skipped up front; a name that cannot go is remembered and retried alone."""
+
+    DS = 'pool/data'
+
+    def build(self, pool, old=20, **kw):
+        manager, dsi = prune_manager(self.DS, **kw)
+        fresh, olds = pool.populate(self.DS, old=old)
+        return manager, dsi, fresh, olds
+
+    # -- the pre-skip --------------------------------------------------------------------------------
+    def test_one_held_snapshot_among_20_is_left_out_of_a_single_batch_of_19(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool)
+        held = olds[7]
+        prune_pool.hold(self.DS, held)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.sizes == [19]
+        assert held not in prune_pool.batches[0]
+        assert prune_pool.names_of(self.DS) == {fresh, held}
+        warnings = records(caplog, logging.WARNING)
+        assert len(warnings) == 1
+        assert f'zfs holds {self.DS}@{held}' in warnings[0]
+        assert 'it is tried again alone every cycle' in warnings[0]
+        assert records(caplog, logging.INFO, 'has 19 snapshots to prune')      # counted after the pre-skip
+        assert records(caplog, logging.INFO, 'Successfully pruned 19 snapshots')
+        assert records(caplog, logging.ERROR) == []
+
+    def test_the_hold_count_is_named(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=3)
+        prune_pool.hold(self.DS, olds[0], count=3)
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert '3 user hold(s)' in records(caplog, logging.WARNING)[0]
+
+    def test_a_cloned_snapshot_is_left_out_and_the_warning_names_its_clones(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=5)
+        prune_pool.clone(self.DS, olds[2], 'pool/clone-b', 'pool/clone-a')   # `clones` is in unstable order
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.sizes == [4]
+        assert olds[2] not in prune_pool.batches[0]
+        (warning,) = records(caplog, logging.WARNING)
+        assert 'pool/clone-a' in warning and 'pool/clone-b' in warning
+        assert olds[2] in warning
+        assert prune_pool.names_of(self.DS) == {fresh, olds[2]}
+
+    def test_the_pre_skip_also_applies_to_a_dry_run_which_never_destroys(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=5, dry_run=True)
+        prune_pool.clone(self.DS, olds[1])
+        prune_pool.hold(self.DS, olds[3])
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.calls == []
+        assert len(records(caplog, logging.WARNING)) == 2
+        (planned,) = records(caplog, logging.INFO, '[DRY RUN] Would prune snapshots')
+        assert olds[1] not in planned and olds[3] not in planned
+        assert all(olds[i] in planned for i in (0, 2, 4))
+        assert prune_pool.names_of(self.DS) == set(olds) | {fresh}
+
+    @pytest.mark.parametrize('dry_run', [False, True])
+    def test_destroy_is_never_called_with_nothing_when_every_candidate_is_held_or_cloned(
+            self, prune_pool, caplog, dry_run):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=4, dry_run=dry_run)
+        for name in olds[:2]:
+            prune_pool.hold(self.DS, name)
+        for name in olds[2:]:
+            prune_pool.clone(self.DS, name)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+            manager.prune_snapshots(dsi)
+        assert prune_pool.calls == [] and prune_pool.empty_calls == []
+        assert len(records(caplog, logging.WARNING)) == 4
+        assert records(caplog, logging.INFO, 'Successfully pruned') == []
+
+    def test_a_pre_skipped_name_warns_once_and_is_debug_afterwards(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=3)
+        prune_pool.hold(self.DS, olds[1])
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            for _ in range(3):
+                manager.prune_snapshots(dsi)
+        assert len(records(caplog, logging.WARNING)) == 1
+        assert len(records(caplog, logging.DEBUG, 'still not pruning')) == 2
+        # cycle 1 destroyed the two free ones; while it stays held the name is skipped again each
+        # cycle (a pre-skip, not a destroy attempt), so no further call is made.
+        assert prune_pool.sizes == [2]
+
+    def test_a_hold_released_later_lets_the_name_go_alone_with_one_info(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=4)
+        held = olds[1]
+        prune_pool.hold(self.DS, held)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+            assert prune_pool.names_of(self.DS) == {fresh, held}
+            prune_pool.release(self.DS, held)
+            manager.prune_snapshots(dsi)
+        assert prune_pool.batches[1:] == [[held]]        # alone, never in a batch
+        assert prune_pool.names_of(self.DS) == {fresh}
+        assert manager._prune_stuck == {}
+        (info,) = records(caplog, logging.INFO, 'which could not be destroyed earlier')
+        assert held in info
+        assert len(records(caplog, logging.WARNING)) == 1
+
+    def test_a_cloned_snapshot_whose_clone_is_gone_goes_on_a_later_cycle(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=3)
+        prune_pool.clone(self.DS, olds[0])
+        manager.prune_snapshots(dsi)
+        prune_pool.unclone(self.DS, olds[0])
+        manager.prune_snapshots(dsi)
+        assert prune_pool.names_of(self.DS) == {fresh}
+
+    # -- the fallback --------------------------------------------------------------------------------
+    @pytest.mark.parametrize('version', VERSIONS)
+    def test_a_hold_that_appears_after_the_listing_fails_the_batch_and_each_member_goes_alone(
+            self, mocker, caplog, version):
+        pool = PrunePool(mocker, version)
+        manager, dsi, fresh, olds = self.build(pool)
+        late = olds[11]
+        pool.before_destroy = lambda p, call: (
+            p.hold(self.DS, late) if len(call.names) > 1 else None)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert pool.sizes == [20] + [1] * 20
+        assert not pool.calls[0].ok
+        assert pool.batches[1:] == [[n] for n in pool.batches[0]]       # same members, one per call
+        assert pool.names_of(self.DS) == {fresh, late}                  # 19 destroyed, only the late hold stays
+        assert len(records(caplog, logging.ERROR, 'Failed to prune snapshot batch')) == 1
+        (warning,) = records(caplog, logging.WARNING)
+        assert late in warning and f'zfs holds {self.DS}@{late}' in warning     # re-listed: the hold is named
+        assert ('pool/data', late) in manager._prune_stuck
+        assert records(caplog, logging.INFO, 'Successfully pruned 19 snapshots')
+        assert pool.empty_calls == []
+
+    def test_a_snapshot_destroyed_by_someone_else_mid_prune_is_dropped_quietly(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=4)
+        gone = olds[1]
+        prune_pool.before_destroy = lambda p, call: (
+            p.vanish(self.DS, gone) if gone in p.snaps[self.DS] else None)
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.names_of(self.DS) == {fresh}
+        assert manager._prune_stuck == {}
+        assert records(caplog, logging.WARNING) == []
+        assert records(caplog, logging.DEBUG, 'disappeared while pruning')
+
+    @pytest.mark.parametrize('version', VERSIONS)
+    def test_a_failing_single_destroy_is_retried_alone_next_cycle_with_no_second_warning(
+            self, mocker, caplog, version):
+        pool = PrunePool(mocker, version)
+        manager, dsi, fresh, olds = self.build(pool, old=5)
+        busy = olds[2]
+        pool.send(self.DS, busy)       # `dataset is busy` on every version; the listing shows nothing
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+            assert pool.names_of(self.DS) == {fresh, busy}
+            pool.calls.clear()
+            manager.prune_snapshots(dsi)
+            manager.prune_snapshots(dsi)
+        assert pool.batches == [[busy], [busy]]                  # alone each cycle, nothing else
+        warnings = records(caplog, logging.WARNING)
+        assert len(warnings) == 1 and busy in warnings[0]
+        assert 'zfs would not destroy it' in warnings[0]
+        assert 'send in progress' in warnings[0]
+        assert len(records(caplog, logging.DEBUG, 'still not pruning')) == 2
+
+    def test_a_stuck_name_never_rejoins_a_multi_snapshot_batch_and_gets_one_info_when_it_goes(
+            self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=3)
+        stuck = olds[0]
+        prune_pool.send(self.DS, stuck)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)                           # cycle 1: batch fails, 2 go, 1 stuck
+            assert prune_pool.names_of(self.DS) == {fresh, stuck}
+            prune_pool.calls.clear()
+            more = [hourly_name(10 + i) for i in range(4)]          # four new candidates
+            for name in more:
+                prune_pool.add_snapshot(self.DS, name)
+            manager.prune_snapshots(dsi)                           # cycle 2
+            assert [sorted(b) for b in prune_pool.batches] == [sorted(more), [stuck]]
+            assert prune_pool.sizes == [4, 1]
+            prune_pool.end_send(self.DS, stuck)
+            prune_pool.calls.clear()
+            manager.prune_snapshots(dsi)                           # cycle 3: it finally goes
+        assert prune_pool.batches == [[stuck]]
+        assert prune_pool.names_of(self.DS) == {fresh}
+        assert manager._prune_stuck == {}
+        assert len(records(caplog, logging.INFO, 'which could not be destroyed earlier')) == 1
+        assert len(records(caplog, logging.WARNING)) == 1
+
+    def test_stuck_memory_is_per_dataset(self, prune_pool):
+        other = 'pool/other'
+        rules = [RetentionRule(timedelta(hours=1), timedelta(hours=2))]
+        manager = DatasetManager(_make_config(datasets=[
+            DatasetConfig(name=self.DS, retention_rules=rules),
+            DatasetConfig(name=other, retention_rules=rules),
+        ]))
+        dsi, dso = manager.datasets
+        _, olds = prune_pool.populate(self.DS, old=3)
+        prune_pool.snaps[other] = list(olds) + [hourly_name(0, 10)]    # the same names on another dataset
+        prune_pool.send(self.DS, olds[0])
+        manager.prune_snapshots(dsi)
+        manager.prune_snapshots(dso)
+        assert olds[0] in prune_pool.names_of(self.DS)
+        assert prune_pool.names_of(other) == {prune_pool.snaps[other][-1]}   # the other dataset pruned all its own
+        assert set(manager._prune_stuck) == {(self.DS, olds[0])}
+
+    # -- forgetting ----------------------------------------------------------------------------------
+    def test_a_stuck_entry_is_forgotten_when_the_snapshot_vanishes(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=3)
+        prune_pool.send(self.DS, olds[0])
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+            assert manager._prune_stuck
+            prune_pool.vanish(self.DS, olds[0])
+            manager.prune_snapshots(dsi)
+        assert manager._prune_stuck == {}
+        assert records(caplog, logging.INFO, 'which could not be destroyed earlier') == []
+
+    def test_a_stuck_entry_is_forgotten_when_every_snapshot_is_gone(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=2)
+        prune_pool.send(self.DS, olds[0])
+        manager.prune_snapshots(dsi)
+        assert manager._prune_stuck
+        prune_pool.snaps[self.DS] = []
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert manager._prune_stuck == {}
+        assert records(caplog, logging.INFO, 'which could not be destroyed earlier') == []
+
+    def test_a_stuck_entry_is_forgotten_when_the_snapshot_stops_being_a_candidate(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=3)
+        prune_pool.send(self.DS, olds[0])
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+            assert manager._prune_stuck
+            # an anchor now pins it: retention no longer proposes it
+            prune_pool.props[self.DS] = [(PROP_ANCHOR_PREFIX + 'offsite', olds[0], 'local')]
+            prune_pool.end_send(self.DS, olds[0])
+            prune_pool.calls.clear()
+            manager.prune_snapshots(dsi)
+        assert prune_pool.calls == []
+        assert manager._prune_stuck == {}
+        assert records(caplog, logging.INFO, 'which could not be destroyed earlier') == []
+        assert olds[0] in prune_pool.names_of(self.DS)
+
+    # -- counting ------------------------------------------------------------------------------------
+    def test_the_success_count_is_the_number_of_snapshots_destroyed_never_the_returned_lines(
+            self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=6, recursive=True)
+        # a child with the same names: a recursive destroy returns 2 `destroy` lines per name
+        prune_pool.snaps[self.DS + '/c'] = list(prune_pool.snaps[self.DS])
+        prune_pool.send(self.DS, olds[0])
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert all(c.recursive for c in prune_pool.calls)
+        assert prune_pool.sizes == [6] + [1] * 6
+        assert len(prune_pool.names_of(self.DS)) == 2
+        assert records(caplog, logging.INFO, 'Successfully pruned 5 snapshots')
+        assert len(records(caplog, logging.INFO, 'Successfully pruned')) == 1
+
+    def test_a_cycle_whose_every_destroy_failed_reports_no_success(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=2)
+        for name in olds:
+            prune_pool.send(self.DS, name)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert records(caplog, logging.INFO, 'Successfully pruned') == []
+
+    def test_a_failed_batch_of_a_full_cycle_counts_only_the_singles_that_went(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=45)
+        prune_pool.send(self.DS, olds[30])                              # in the second batch of 20
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.sizes == [20, 20, 5] + [1] * 20
+        assert prune_pool.ok_calls and sum(len(c.names) for c in prune_pool.ok_calls) == 44
+        assert records(caplog, logging.INFO, 'Successfully pruned 44 snapshots')
+
+    def test_45_candidates_make_calls_of_20_20_and_5(self, prune_pool):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=45)
+        manager.prune_snapshots(dsi)
+        assert prune_pool.sizes == [20, 20, 5]
+        assert all(c.kwargs == {'destroy': True, 'recursive': False, 'clones': False} for c in prune_pool.calls)
+        assert prune_pool.names_of(self.DS) == {fresh}
+
+    # -- the explanation of a failure ----------------------------------------------------------------
+    def test_a_failed_re_list_still_marks_the_names_stuck_with_the_generic_reason(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=3)
+        prune_pool.send(self.DS, olds[0])
+        # the cycle's own listing is the first; the explanation's re-list (the second) fails
+        prune_pool.list_fails_from = 2
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.names_of(self.DS) == {fresh, olds[0]}
+        (warning,) = records(caplog, logging.WARNING)
+        assert olds[0] in warning and 'zfs would not destroy it' in warning
+        assert ('pool/data', olds[0]) in manager._prune_stuck
+        assert records(caplog, logging.DEBUG, 'Could not re-list')
+        assert len(prune_pool.snapshot_lists) == 2
+
+    def test_the_generic_reason_mentions_descendants_only_for_a_recursive_dataset(self, prune_pool):
+        for recursive, expected in ((False, False), (True, True)):
+            prune_pool.snaps.clear()
+            prune_pool.sending.clear()
+            manager, dsi, fresh, olds = self.build(prune_pool, old=2, recursive=recursive)
+            prune_pool.send(self.DS, olds[0])
+            manager.prune_snapshots(dsi)
+            reason = manager._prune_stuck[(self.DS, olds[0])]
+            assert ('descendant' in reason) is expected
+
+
+def zfs_get_exec_out():
+    """The mocked `zfs.get._exec_out` (installed by `PrunePool`)."""
+    import libzfseasy as zfs
+    return zfs.get._exec_out
+
+
+class TestPruneReReadsProtectionsBeforeEveryDestroy:
+    """The pass's first read of the anchors and in-flight pins goes stale: the remote worker pins, sends,
+    anchors and re-pins while the fallback retries a failed batch. `_still_prunable` re-reads them right
+    before every real destroy call (a batch and each single) and drops a name that became protected."""
+
+    DS = 'pool/data'
+    CH = 'pool/data/c'
+
+    def build(self, pool, old=5, recursive=False, dry_run=False):
+        manager, dsi = prune_manager(self.DS, recursive=recursive, dry_run=dry_run)
+        fresh, olds = pool.populate(self.DS, old=old)
+        if recursive:
+            pool.snaps[self.CH] = list(pool.snaps[self.DS])
+        return manager, dsi, fresh, olds
+
+    def protect_after_the_batch_fails(self, pool, olds, props, dataset=None):
+        """Set `props` on `dataset` as the first multi-name destroy call starts: after the pass's read
+        and the re-read before the batch, before the re-reads before the singles."""
+        def hook(p, call):
+            if len(call.names) > 1 and dataset not in p.props:
+                p.props[dataset or self.DS] = props
+        pool.before_destroy = hook
+        pool.send(self.DS, olds[0])      # a send in progress: the batch fails with EBUSY
+
+    PINS = {
+        'inflight pin': lambda olds: (PROP_INFLIGHT_PREFIX + 'offsite', f'{olds[2]},{olds[3]}', 'local'),
+        'another destinations anchor': lambda olds: (PROP_ANCHOR_PREFIX + 'other-dest', olds[2], 'local'),
+        'received anchor': lambda olds: (PROP_ANCHOR_PREFIX + 'offsite', olds[2], 'received'),
+        'local anchor': lambda olds: (PROP_ANCHOR_PREFIX + 'offsite', olds[2], 'local'),
+    }
+
+    @pytest.mark.parametrize('kind', sorted(PINS))
+    def test_a_protection_that_appears_after_the_batch_failed_stops_that_names_single_retry(
+            self, prune_pool, caplog, kind):
+        manager, dsi, fresh, olds = self.build(prune_pool)
+        prop = self.PINS[kind](olds)
+        protected = {olds[2], olds[3]} if kind == 'inflight pin' else {olds[2]}
+        self.protect_after_the_batch_fails(prune_pool, olds, [prop])
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert not prune_pool.calls[0].ok and len(prune_pool.calls[0].names) == 5
+        singles = [c.names[0] for c in prune_pool.calls[1:]]
+        assert protected.isdisjoint(singles)
+        assert sorted(singles) == sorted(set(olds) - protected)       # the others were still retried
+        assert prune_pool.names_of(self.DS) == {fresh, olds[0]} | protected     # olds[0]: the sender holds it
+        assert not (protected & {k[1] for k in manager._prune_stuck})  # protected is not "stuck"
+        assert len(records(caplog, logging.INFO, 'became an anchor or in-flight snapshot')) == len(protected)
+
+    def test_without_the_re_read_the_race_destroys_the_protected_snapshot(self, prune_pool, mocker):
+        """The control: the same race against a pass that keeps its first protect-set."""
+        manager, dsi, fresh, olds = self.build(prune_pool)
+        mocker.patch.object(manager, '_still_prunable', side_effect=lambda d, group: group)
+        self.protect_after_the_batch_fails(
+            prune_pool, olds, [(PROP_ANCHOR_PREFIX + 'offsite', olds[2], 'local')])
+        manager.prune_snapshots(dsi)
+        assert olds[2] not in prune_pool.names_of(self.DS)
+
+    def test_a_protection_that_appears_before_the_batch_filters_the_batch_call(self, prune_pool, mocker, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool)
+        calls = []
+
+        def anchors(d, own_properties_last=False):
+            calls.append(1)
+            return set() if len(calls) == 1 else {olds[1]}        # the re-read before the batch sees a pin
+
+        mocker.patch.object(manager, 'get_anchors', side_effect=anchors)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.sizes == [4]
+        assert olds[1] not in prune_pool.batches[0]
+        assert prune_pool.names_of(self.DS) == {fresh, olds[1]}
+        assert manager._prune_stuck == {}
+        assert records(caplog, logging.ERROR) == []
+
+    # -- the order of the re-read: the dataset's own properties come LAST ------------------------
+    @pytest.mark.parametrize('recursive', [False, True])
+    @pytest.mark.parametrize('dests', [(), ('offsite',), ('offsite', 'cold', 'lab')])
+    def test_the_datasets_own_property_read_is_the_last_zfs_call_before_each_destroy(
+            self, prune_pool, recursive, dests):
+        manager, dsi = prune_manager(self.DS, recursive=recursive, destinations=dests)
+        fresh, olds = prune_pool.populate(self.DS, old=4)
+        if recursive:
+            prune_pool.snaps[self.CH] = list(prune_pool.snaps[self.DS])
+        prune_pool.send(self.DS, olds[0])               # the batch fails: a batch call, then 4 singles
+        manager.prune_snapshots(dsi)
+        events = prune_pool.events
+        destroys = [i for i, e in enumerate(events) if e[0] == 'destroy']
+        assert len(destroys) == 5
+        for i in destroys:
+            assert events[i - 1] == ('get', self.DS, False), events[max(0, i - 6):i + 1]
+            # before it: the per-destination reads, and (recursive) the descendants' read first of all
+            tail = events[:i - 1]
+            for dest in reversed(sorted(dests)):         # configured destinations are read sorted
+                assert tail.pop() == ('value', self.DS, PROP_ANCHOR_PREFIX + dest)
+            if recursive:
+                assert tail.pop() == ('get', self.DS, True)
+
+    def test_the_default_order_of_get_anchors_is_unchanged_and_the_flag_reverses_the_own_read(self, prune_pool):
+        manager, dsi = prune_manager(self.DS, destinations=('offsite', 'cold'))
+        prune_pool.populate(self.DS, old=1)
+        manager.get_anchors(dsi)
+        assert prune_pool.events == [
+            ('get', self.DS, False),
+            ('value', self.DS, PROP_ANCHOR_PREFIX + 'cold'),
+            ('value', self.DS, PROP_ANCHOR_PREFIX + 'offsite'),
+        ]
+        prune_pool.events.clear()
+        manager.get_anchors(dsi, own_properties_last=False)
+        assert [e[0] for e in prune_pool.events] == ['get', 'value', 'value']
+        prune_pool.events.clear()
+        manager.get_anchors(dsi, own_properties_last=True)
+        assert [e[0] for e in prune_pool.events] == ['value', 'value', 'get']
+
+    def test_both_orders_return_the_same_set(self, prune_pool):
+        manager, dsi = prune_manager(self.DS, destinations=('offsite',))
+        fresh, olds = prune_pool.populate(self.DS, old=3)
+        prune_pool.props[self.DS] = [
+            (PROP_ANCHOR_PREFIX + 'offsite', olds[0], 'local'),
+            (PROP_INFLIGHT_PREFIX + 'other', f'{olds[1]},{olds[2]}', 'local'),
+        ]
+        assert manager.get_anchors(dsi) == manager.get_anchors(dsi, own_properties_last=True) \
+            == set(olds)
+
+    def test_a_whole_chain_step_completing_during_the_descendants_read_loses_nothing(self, prune_pool, caplog):
+        """The reviewer's probe, inverted. The remote worker pins (a, b), sends, anchors b, and clears the pin
+        while the pruner's re-read is reading the descendants. The own-properties read comes after it, so
+        the new anchor b is seen and kept; the old base a was never a candidate this pass."""
+        manager, dsi, fresh, olds = self.build(prune_pool, old=5, recursive=True)
+        old_base, new_anchor = olds[1], olds[2]
+        prune_pool.props[self.DS] = [(PROP_ANCHOR_PREFIX + 'offsite', old_base, 'local')]
+        recursive_reads = []
+        real_get = prune_pool._get
+
+        def get(cmd):
+            if '-r' in cmd:
+                recursive_reads.append(cmd)
+                if len(recursive_reads) == 2:       # the re-read's descendant read (the pass made the first)
+                    prune_pool.props[self.DS] = [(PROP_ANCHOR_PREFIX + 'offsite', new_anchor, 'local')]
+            return real_get(cmd)
+
+        mocker_target = zfs_get_exec_out()
+        mocker_target.side_effect = get
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        for ds in (self.DS, self.CH):
+            assert new_anchor in prune_pool.names_of(ds), ds       # the new anchor survived
+            assert old_base in prune_pool.names_of(ds), ds         # the old base was not a candidate
+        assert len(records(caplog, logging.INFO, 'became an anchor or in-flight snapshot')) == 1
+        # the next pass: the old base is free now and goes, the anchor stays; the one after is stable
+        manager.prune_snapshots(dsi)
+        assert prune_pool.names_of(self.DS) == {fresh, new_anchor}
+        assert prune_pool.names_of(self.CH) == {fresh, new_anchor}
+        prune_pool.calls.clear()
+        manager.prune_snapshots(dsi)
+        assert prune_pool.calls == []
+        assert prune_pool.names_of(self.DS) == {fresh, new_anchor}
+
+    def test_a_pin_whose_to_snapshot_no_longer_exists_still_protects_its_from(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=4)
+        gone = hourly_name(40)
+        prune_pool.props[self.DS] = [(PROP_INFLIGHT_PREFIX + 'offsite', f'{olds[1]},{gone}', 'local')]
+        assert manager.get_anchors(dsi) == {olds[1], gone}
+        manager.prune_snapshots(dsi)
+        assert olds[1] in prune_pool.names_of(self.DS)
+        assert prune_pool.names_of(self.DS) == {fresh, olds[1]}
+        assert olds[1] not in [n for c in prune_pool.calls for n in c.names]
+
+    def test_a_pin_appearing_after_the_batch_failed_protects_its_from_though_its_to_is_gone(
+            self, prune_pool, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=5)
+        gone = hourly_name(50)
+        self.protect_after_the_batch_fails(
+            prune_pool, olds, [(PROP_INFLIGHT_PREFIX + 'offsite', f'{olds[2]},{gone}', 'local')])
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert olds[2] in prune_pool.names_of(self.DS)
+        assert olds[2] not in [c.names[0] for c in prune_pool.calls[1:]]
+
+    def test_a_batch_whose_every_member_became_protected_is_never_destroyed_empty(self, prune_pool, mocker, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=3)
+        mocker.patch.object(manager, 'get_anchors', side_effect=[set(), set(olds)])
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.calls == [] and prune_pool.empty_calls == []
+        assert prune_pool.names_of(self.DS) == set(olds) | {fresh}
+        assert len(records(caplog, logging.INFO, 'became an anchor or in-flight snapshot')) == 3
+        assert records(caplog, logging.INFO, 'Successfully pruned') == []
+
+    def test_a_re_read_that_raises_destroys_nothing_logs_an_error_and_leaves_the_stuck_memory(
+            self, prune_pool, mocker, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=4)
+        prune_pool.send(self.DS, olds[0])
+        manager.prune_snapshots(dsi)                       # olds[0] is stuck now
+        stuck = dict(manager._prune_stuck)
+        assert list(stuck) == [(self.DS, olds[0])]
+        prune_pool.calls.clear()
+        mocker.patch.object(manager, 'get_anchors', side_effect=[set(), RuntimeError('pool I/O suspended')])
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.calls == []
+        assert manager._prune_stuck == stuck
+        (error,) = records(caplog, logging.ERROR)
+        assert 'Cannot re-read the anchors of pool/data' in error and 'pool I/O suspended' in error
+        assert olds[0] in error
+
+    def test_a_re_read_that_raises_after_a_failed_batch_issues_no_single_destroy(self, prune_pool, mocker, caplog):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=3)
+        prune_pool.send(self.DS, olds[0])
+        mocker.patch.object(
+            manager, 'get_anchors', side_effect=[set(), set()] + [RuntimeError('boom')] * 3)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert prune_pool.sizes == [3]                   # the batch only; every single was refused
+        assert manager._prune_stuck == {}
+        assert len(records(caplog, logging.ERROR, 'Cannot re-read the anchors')) == 3
+        assert prune_pool.names_of(self.DS) == set(olds) | {fresh}
+
+    @pytest.mark.parametrize('recursive', [False, True])
+    def test_a_dry_run_re_reads_nothing_and_destroys_nothing(self, prune_pool, mocker, recursive):
+        manager, dsi, fresh, olds = self.build(prune_pool, recursive=recursive, dry_run=True)
+        anchors = mocker.spy(manager, 'get_anchors')
+        still = mocker.spy(manager, '_still_prunable')
+        prune_pool.send(self.DS, olds[0])
+        manager.prune_snapshots(dsi)
+        assert prune_pool.calls == []
+        still.assert_not_called()
+        assert anchors.call_count == 1                    # the pass's own read
+        assert len(prune_pool.get_calls) == (2 if recursive else 1)    # + the one `get -r` of a recursive pass
+
+    @pytest.mark.parametrize('recursive', [False, True])
+    def test_one_re_read_per_real_destroy_call(self, prune_pool, mocker, recursive):
+        manager, dsi, fresh, olds = self.build(prune_pool, old=25, recursive=recursive)
+        prune_pool.send(self.DS, olds[-3])                # in the first batch (newest first): it fails, 20 singles follow
+        anchors = mocker.spy(manager, 'get_anchors')
+        manager.prune_snapshots(dsi)
+        assert prune_pool.sizes == [20, 5] + [1] * 20
+        assert anchors.call_count == 1 + len(prune_pool.calls)
+        if recursive:
+            gets = [c for c in prune_pool.get_calls if '-r' in c]
+            assert len(gets) == 1 + len(prune_pool.calls)
+
+    @pytest.mark.parametrize('kind', ['child anchor', 'child inflight pin'])
+    def test_a_descendants_protection_appearing_after_the_batch_failed_stops_the_single(
+            self, prune_pool, caplog, kind):
+        manager, dsi, fresh, olds = self.build(prune_pool, recursive=True)
+        prop = ((PROP_ANCHOR_PREFIX + 'offsite', olds[2], 'local') if kind == 'child anchor'
+                else (PROP_INFLIGHT_PREFIX + 'offsite', f'{olds[1]},{olds[2]}', 'local'))
+        protected = {olds[2]} if kind == 'child anchor' else {olds[1], olds[2]}
+        self.protect_after_the_batch_fails(prune_pool, olds, [prop], dataset=self.CH)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert all(c.recursive for c in prune_pool.calls)
+        assert protected.isdisjoint(c.names[0] for c in prune_pool.calls[1:])
+        assert prune_pool.names_of(self.DS) == {fresh, olds[0]} | protected
+        assert prune_pool.names_of(self.CH) == {fresh, olds[0]} | protected     # nor the child's copy
+        assert len(records(caplog, logging.INFO, 'became an anchor or in-flight snapshot')) == len(protected)
 
 
 class TestDatasetReport:
@@ -2092,7 +2702,8 @@ class TestPruneHonoursEveryAnchor:
         manager, dsi, snaps = _pruning_manager()
         mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
         dsi.snapshots = snaps
-        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'renamed-away', snaps[2].name, 'local')]))
+        orphan = _zget('pool/data', [(A + 'renamed-away', snaps[2].name, 'local')])
+        mock_subprocess.setup_multi((orphan,), (orphan,))      # the pass's read, then the one before the destroy
         mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
         manager.prune_snapshots(dsi)
         destroyed = self.destroyed(mock_destroy)
@@ -2103,7 +2714,8 @@ class TestPruneHonoursEveryAnchor:
         manager, dsi, snaps = _pruning_manager()
         mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
         dsi.snapshots = snaps
-        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        none = _zget('pool/data', [])
+        mock_subprocess.setup_multi((none,), (none,))
         mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
         manager.prune_snapshots(dsi)
         assert self.destroyed(mock_destroy) == [s.snapshot for s in snaps[1:]]
@@ -2644,6 +3256,12 @@ class TestUnrepresentableNamesInZfsOutput:
         )])
         return DatasetManager(config)
 
+    @staticmethod
+    def _odd_row(short):
+        """A row for a snapshot name libzfseasy cannot represent (leading/trailing space), with
+        the listing's full column set."""
+        return f'pool/data@{short}\tsnapshot\t5\t6\t0\t-\toff\t-\n'
+
     def _rows(self):
         """Newest first as `zfs list` sorts them; the two oddly named ones are
         what a VM actually showed (`zfs snapshot 'pool/fs@ manual'`)."""
@@ -2652,11 +3270,11 @@ class TestUnrepresentableNamesInZfsOutput:
             'old1': self._snap_name(3),
             'old2': self._snap_name(4),
             'lines': [
-                f'pool/data@{self._snap_name(4)}\tsnapshot\t-\n',
-                'pool/data@ manual\tsnapshot\t-\n',
-                f'pool/data@{self._snap_name(3)}\tsnapshot\t-\n',
-                'pool/data@manual \tsnapshot\t-\n',
-                f'pool/data@{self._snap_name(0.2)}\tsnapshot\t-\n',
+                list_row(self._snap_name(4)),
+                self._odd_row(' manual'),
+                list_row(self._snap_name(3)),
+                self._odd_row('manual '),
+                list_row(self._snap_name(0.2)),
             ],
         }
 
@@ -2691,7 +3309,7 @@ class TestUnrepresentableNamesInZfsOutput:
     def test_a_listing_of_only_unrepresentable_rows_is_empty_not_an_error(
         self, mock_subprocess, caplog
     ):
-        mock_subprocess.setup(stdout=['pool/data@ manual\tsnapshot\t-\n'])
+        mock_subprocess.setup(stdout=[self._odd_row(' manual')])
         manager = self._manager()
         with caplog.at_level(logging.WARNING):
             assert manager.list_snapshots(manager.datasets[0]) == []
@@ -2748,3 +3366,734 @@ class TestUnrepresentableNamesInZfsOutput:
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
         # the unrepresentable row never reached a property read
         assert all(c.args[0].name != 'pool/backups/cid/.system' for c in value.call_args_list)
+
+
+# ===========================================================================
+# S-1 (plan B9, B11; table T-S1): ordering by createtxg, the one listing, the
+# future-dated newest snapshot and the backwards-clock name collision.
+# ===========================================================================
+
+from datetime import datetime as _real_datetime  # noqa: E402
+
+from _snapshot_support import FrozenClock, frozen_clock  # noqa: E402,F401  (fixture)
+from zfsbackup.backup_manager import (  # noqa: E402
+    SNAPSHOT_LIST_PROPERTIES, snapshot_newer, snapshot_order_key,
+)
+
+NTP_MESSAGE = 'system clock is behind the newest snapshot; check NTP'
+
+
+def _records(caplog, text, level=None):
+    return [r for r in caplog.records
+            if text in r.getMessage() and (level is None or r.levelname == level)]
+
+
+def _hourly_manager(**kwargs):
+    config = _make_config(
+        datasets=[DatasetConfig(name='pool/data', frequency=timedelta(hours=1),
+                                retention_rules=kwargs.pop('rules', []))],
+        **kwargs,
+    )
+    return DatasetManager(config)
+
+
+class TestOneListingCarriesEverything:
+    """S1-a."""
+
+    COLUMNS = 'name,type,createtxg,guid,userrefs,clones,encryption,keystatus'
+
+    def test_the_constant_is_the_six_columns_in_order(self):
+        assert SNAPSHOT_LIST_PROPERTIES == [
+            'createtxg', 'guid', 'userrefs', 'clones', 'encryption', 'keystatus']
+
+    def test_exactly_one_zfs_list_with_the_six_columns(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[list_row('autosnap_20240101120000', txg=10)])
+        manager = _hourly_manager()
+        (snap,) = manager.list_snapshots(manager.datasets[0])
+        assert mock_subprocess.call_count == 1
+        argv = list(mock_subprocess.call_args_list[0].args[0])
+        assert argv[1] == 'list'
+        assert argv[argv.index('-o') + 1] == self.COLUMNS
+        assert argv[argv.index('-t') + 1] == 'snapshot'
+        assert argv[-1] == 'pool/data'
+        assert snap.createtxg == 10
+
+    def test_every_column_reaches_the_snapshot_info(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[
+            'pool/data@autosnap_20240101120000\tsnapshot\t77\t123456\t3\tpool/c1,pool/c2\t'
+            'aes-256-gcm\tavailable\n'
+        ])
+        manager = _hourly_manager()
+        (snap,) = manager.list_snapshots(manager.datasets[0])
+        assert (snap.createtxg, snap.guid, snap.userrefs) == (77, 123456, 3)
+        assert snap.clones == ('pool/c1', 'pool/c2')
+        assert snap.encrypted is True and snap.key_loaded is True
+
+    def test_a_recursive_listing_passes_the_flag_and_the_same_columns(self, mocker):
+        lst = mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
+        manager = _hourly_manager()
+        manager.list_snapshots(manager.datasets[0], recursive=True)
+        lst.assert_called_once()
+        assert lst.call_args.kwargs['properties'] == SNAPSHOT_LIST_PROPERTIES
+        assert lst.call_args.kwargs['recursive'] is True
+
+    def test_the_list_passed_to_zfs_is_a_copy(self, mocker):
+        """A caller mutating what it passed must not change the shared constant."""
+        lst = mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[])
+        manager = _hourly_manager()
+        manager.list_snapshots(manager.datasets[0])
+        assert lst.call_args.kwargs['properties'] is not SNAPSHOT_LIST_PROPERTIES
+
+
+class TestListingOrder:
+    """S1-a: newest first by createtxg, then name timestamp, then name."""
+
+    def listing(self, mocker, *snaps):
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=list(snaps))
+        manager = _hourly_manager()
+        dsi = manager.datasets[0]
+        return manager.list_snapshots(dsi), dsi
+
+    def test_txg_order_differs_from_name_order(self, mocker):
+        a = listed_snapshot('autosnap_20240101120000', txg=30)
+        b = listed_snapshot('autosnap_20240103120000', txg=10)       # latest NAME, oldest txg
+        c = listed_snapshot('autosnap_20240102120000', txg=20)
+        result, dsi = self.listing(mocker, a, b, c)
+        assert [s.name for s in result] == [
+            'autosnap_20240101120000', 'autosnap_20240102120000', 'autosnap_20240103120000']
+        assert dsi.snapshots == result
+
+    def test_a_hand_made_future_name_with_the_lowest_txg_is_the_oldest(self, mocker):
+        future = listed_snapshot('autosnap_20990101000000', txg=1)
+        recent = listed_snapshot('autosnap_20200101000000', txg=900)  # created later, dated earlier
+        result, _ = self.listing(mocker, future, recent)
+        assert [s.name for s in result] == ['autosnap_20200101000000', 'autosnap_20990101000000']
+
+    def test_listing_order_from_zfs_does_not_matter(self, mocker):
+        snaps = [listed_snapshot(f'autosnap_2024010{i}120000', txg=t)
+                 for i, t in ((1, 3), (2, 1), (3, 2))]
+        forward, _ = self.listing(mocker, *snaps)
+        backward, _ = self.listing(mocker, *reversed(snaps))
+        assert [s.name for s in forward] == [s.name for s in backward]
+
+    def test_equal_txg_breaks_the_tie_by_name_timestamp(self, mocker):
+        """`zfs snapshot a@x a@y` shares one txg."""
+        older = listed_snapshot('autosnap_20240101120000', txg=50)
+        newer = listed_snapshot('autosnap_20240102120000', txg=50)
+        lonely = listed_snapshot('autosnap_20240103120000', txg=49)
+        result, _ = self.listing(mocker, newer, lonely, older)
+        assert [s.name for s in result] == [
+            'autosnap_20240102120000', 'autosnap_20240101120000', 'autosnap_20240103120000']
+
+    def test_equal_txg_is_deterministic_in_either_input_order(self, mocker):
+        x = listed_snapshot('autosnap_20240101120000', txg=5)
+        y = listed_snapshot('autosnap_20240102120000', txg=5)
+        one, _ = self.listing(mocker, x, y)
+        two, _ = self.listing(mocker, y, x)
+        assert [s.name for s in one] == [s.name for s in two] == [
+            'autosnap_20240102120000', 'autosnap_20240101120000']
+
+    def test_unmanaged_snapshots_are_not_listed_whatever_their_txg(self, mocker):
+        managed = listed_snapshot('autosnap_20240101120000', txg=1)
+        manual = listed_snapshot('manual', txg=999)
+        suffixed = listed_snapshot('autosnap_20240102120000_x', txg=998)
+        result, _ = self.listing(mocker, managed, manual, suffixed)
+        assert [s.name for s in result] == ['autosnap_20240101120000']
+
+    def test_the_order_key_agrees_with_the_listing(self, mocker):
+        snaps = [listed_snapshot(f'autosnap_2024010{i}120000', txg=t)
+                 for i, t in ((1, 2), (2, 9), (3, 4))]
+        result, _ = self.listing(mocker, *snaps)
+        assert result == sorted(result, key=snapshot_order_key, reverse=True)
+
+
+class TestSnapshotWithoutATxg:
+    """S1-a: a managed snapshot with no createtxg is dropped, with one WARNING per newly seen name."""
+
+    def manager_and_dsi(self):
+        manager = _hourly_manager()
+        return manager, manager.datasets[0]
+
+    def listing(self, mocker, *snaps):
+        return mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=list(snaps))
+
+    def test_it_is_dropped_and_warned_about_once(self, mocker, caplog):
+        good = listed_snapshot('autosnap_20240101120000', txg=5)
+        bad = listed_snapshot('autosnap_20240102120000', txg=NO_TXG)
+        self.listing(mocker, good, bad)
+        manager, dsi = self.manager_and_dsi()
+        with caplog.at_level(logging.WARNING):
+            result = manager.list_snapshots(dsi)
+        assert [s.name for s in result] == ['autosnap_20240101120000']
+        (rec,) = _records(caplog, 'have no createtxg', 'WARNING')
+        assert 'pool/data@autosnap_20240102120000' in rec.getMessage()
+        assert 'pool/data@autosnap_20240101120000' not in rec.getMessage()
+
+    def test_its_name_is_still_known_to_the_collision_check(self, mocker):
+        good = listed_snapshot('autosnap_20240101120000', txg=5)
+        bad = listed_snapshot('autosnap_20240102120000', txg=NO_TXG)
+        self.listing(mocker, good, bad)
+        manager, dsi = self.manager_and_dsi()
+        manager.list_snapshots(dsi)
+        assert dsi.listed_names == {'autosnap_20240101120000', 'autosnap_20240102120000'}
+
+    def test_the_next_listing_does_not_repeat_the_warning(self, mocker, caplog):
+        bad = listed_snapshot('autosnap_20240102120000', txg=NO_TXG)
+        self.listing(mocker, bad)
+        manager, dsi = self.manager_and_dsi()
+        with caplog.at_level(logging.WARNING):
+            for _ in range(4):
+                manager.list_snapshots(dsi)
+        assert len(_records(caplog, 'have no createtxg')) == 1
+
+    def test_a_new_name_warns_again_naming_only_the_new_one(self, mocker, caplog):
+        bad1 = listed_snapshot('autosnap_20240102120000', txg=NO_TXG)
+        bad2 = listed_snapshot('autosnap_20240103120000', txg=NO_TXG)
+        lst = self.listing(mocker, bad1)
+        manager, dsi = self.manager_and_dsi()
+        with caplog.at_level(logging.WARNING):
+            manager.list_snapshots(dsi)
+            lst.return_value = [bad1, bad2]
+            manager.list_snapshots(dsi)
+        first, second = _records(caplog, 'have no createtxg')
+        assert 'autosnap_20240103120000' in second.getMessage()
+        assert 'autosnap_20240102120000' not in second.getMessage()
+
+    def test_it_is_tracked_per_dataset(self, mocker, caplog):
+        bad = listed_snapshot('autosnap_20240102120000', txg=NO_TXG)
+        self.listing(mocker, bad)
+        config = _make_config(datasets=[DatasetConfig(name='pool/a'), DatasetConfig(name='pool/b')])
+        manager = DatasetManager(config)
+        with caplog.at_level(logging.WARNING):
+            for dsi in manager.datasets:
+                manager.list_snapshots(dsi)
+        assert len(_records(caplog, 'have no createtxg')) == 2
+
+    def test_a_dropped_future_dated_snapshot_is_never_taken_for_the_newest(self, mocker, frozen_clock, caplog):
+        recent = listed_snapshot(frozen_clock.stamp(-timedelta(minutes=30)), txg=5)
+        future = listed_snapshot(frozen_clock.stamp(timedelta(days=3)), txg=NO_TXG)
+        self.listing(mocker, recent, future)
+        manager, dsi = self.manager_and_dsi()
+        with caplog.at_level(logging.ERROR):
+            assert manager.needs_snapshot(dsi) is False         # 30 min < 1 h: not due
+        assert not _records(caplog, NTP_MESSAGE)
+
+    def test_it_can_never_be_pruned(self, mocker, frozen_clock):
+        old = listed_snapshot(frozen_clock.stamp(-timedelta(days=30)), txg=NO_TXG)
+        newest = listed_snapshot(frozen_clock.stamp(-timedelta(minutes=5)), txg=9)
+        self.listing(mocker, old, newest)
+        manager = _hourly_manager(rules=[RetentionRule(timedelta(hours=1), timedelta(hours=2))])
+        dsi = manager.datasets[0]
+        manager.list_snapshots(dsi)
+        assert manager.needs_prunning(dsi) == []                # `old` is not even in the list
+
+
+class TestRetentionOrderIsUnchanged:
+    """B9: slots and ages come from the name timestamp and the OLDEST snapshot of a slot is kept;
+    only 'always keep the newest' (and any newest/older comparison) follows createtxg."""
+
+    RULE = RetentionRule(timedelta(hours=1), timedelta(days=1))
+
+    def prune_names(self, manager, dsi, snaps):
+        dsi.snapshots = snaps
+        return sorted(s.name for s in manager.needs_prunning(dsi))
+
+    def test_the_oldest_snapshot_of_a_slot_is_kept(self, frozen_clock):
+        manager = _hourly_manager(rules=[self.RULE])
+        dsi = manager.datasets[0]
+        # three snapshots in the 08:00 slot, then the newest in the 10:00 slot
+        a, b, c = (listed_info(f'autosnap_202610220{m}', txg=t)
+                   for m, t in (('81000', 1), ('84000', 2), ('85500', 3)))
+        newest = listed_info('autosnap_20261022102000', txg=4)
+        pruned = self.prune_names(manager, dsi, [newest, c, b, a])
+        assert pruned == ['autosnap_20261022084000', 'autosnap_20261022085500']
+
+    def test_the_walk_does_not_depend_on_the_list_order(self, frozen_clock):
+        manager = _hourly_manager(rules=[self.RULE])
+        dsi = manager.datasets[0]
+        snaps = [listed_info(n, txg=t) for n, t in (
+            ('autosnap_20261022081000', 1), ('autosnap_20261022084000', 2),
+            ('autosnap_20261022085500', 3), ('autosnap_20261022102000', 4))]
+        expected = ['autosnap_20261022084000', 'autosnap_20261022085500']
+        assert self.prune_names(manager, dsi, list(snaps)) == expected
+        assert self.prune_names(manager, dsi, list(reversed(snaps))) == expected
+
+    def test_keep_newest_follows_txg_not_the_name(self, frozen_clock):
+        """A hand-made `prefix_20990101000000` has the lowest txg: it is NOT the newest. The
+        newest by txg (`c`) is kept even though it shares a slot with an older `b`."""
+        manager = _hourly_manager(rules=[self.RULE])
+        dsi = manager.datasets[0]
+        hand_made = listed_info('autosnap_20990101000000', txg=1)
+        b = listed_info('autosnap_20261022080500', txg=5)
+        c = listed_info('autosnap_20261022082000', txg=9)            # newest by txg; same slot as b
+        for order in ([hand_made, b, c], [c, b, hand_made], [b, hand_made, c]):
+            assert self.prune_names(manager, dsi, order) == []
+
+    def test_without_the_txg_rule_c_would_have_been_pruned(self, frozen_clock):
+        """Control for the test above: take `c` out of newest-by-txg (txg below `b`) and it is the
+        slot's second snapshot, so it is pruned."""
+        manager = _hourly_manager(rules=[self.RULE])
+        dsi = manager.datasets[0]
+        hand_made = listed_info('autosnap_20990101000000', txg=100)
+        b = listed_info('autosnap_20261022080500', txg=5)
+        c = listed_info('autosnap_20261022082000', txg=4)
+        assert self.prune_names(manager, dsi, [hand_made, b, c]) == ['autosnap_20261022082000']
+
+    def test_a_later_created_earlier_dated_snapshot_is_the_newest_and_kept(self, frozen_clock):
+        manager = _hourly_manager(rules=[self.RULE])
+        dsi = manager.datasets[0]
+        regular = [listed_info(f'autosnap_2026102208{m}00', txg=t)
+                   for m, t in (('10', 1), ('20', 2), ('30', 3))]
+        late = listed_info('autosnap_20200101000000', txg=500)       # created last, dated 2020
+        # by name `late` is ancient (older than the rule's 1 d horizon): never claims a slot,
+        # but it is the newest by txg, so it survives
+        pruned = self.prune_names(manager, dsi, regular + [late])
+        assert 'autosnap_20200101000000' not in pruned
+        assert pruned == ['autosnap_20261022082000', 'autosnap_20261022083000']
+
+    def test_ages_come_from_the_name_timestamp(self, frozen_clock):
+        """Past the keep_for horizon BY NAME means prunable, whatever the txg says."""
+        manager = _hourly_manager(rules=[RetentionRule(timedelta(hours=1), timedelta(hours=2))])
+        dsi = manager.datasets[0]
+        old_name_high_txg = listed_info('autosnap_20261020000000', txg=800)
+        newest = listed_info('autosnap_20261022101000', txg=900)
+        assert self.prune_names(manager, dsi, [newest, old_name_high_txg]) == ['autosnap_20261020000000']
+
+    def test_a_snapshot_with_no_txg_in_a_hand_built_list_sorts_oldest(self, frozen_clock):
+        manager = _hourly_manager(rules=[self.RULE])
+        dsi = manager.datasets[0]
+        bare = listed_info('autosnap_20261022101000', txg=NO_TXG)
+        stamped = listed_info('autosnap_20261022100500', txg=3)
+        # the txg-less one is never "the newest" although its name is later: the stamped one is kept
+        # as such, and the bare one (second in the same hour slot) is pruned
+        assert self.prune_names(manager, dsi, [bare, stamped]) == ['autosnap_20261022101000']
+
+
+class TestClockTolerance:
+    """B11: `max(5 minutes, check_interval)`."""
+
+    def test_the_default_is_five_minutes(self):
+        manager = _hourly_manager()
+        assert manager.config.check_interval == timedelta(minutes=5)
+        assert manager.clock_tolerance() == timedelta(minutes=5)
+
+    def test_a_longer_check_interval_widens_it(self):
+        manager = _hourly_manager(check_interval=timedelta(minutes=30))
+        assert manager.clock_tolerance() == timedelta(minutes=30)
+
+    def test_a_shorter_check_interval_does_not_narrow_it(self):
+        manager = _hourly_manager(check_interval=timedelta(seconds=10))
+        assert manager.clock_tolerance() == timedelta(minutes=5)
+
+    @pytest.mark.parametrize('check, ahead, behind', [
+        (timedelta(minutes=5), timedelta(minutes=5), False),             # exactly the tolerance
+        (timedelta(minutes=5), timedelta(minutes=5, seconds=1), True),
+        (timedelta(minutes=5), timedelta(seconds=-1), False),            # in the past
+        (timedelta(minutes=5), timedelta(0), False),
+        (timedelta(minutes=30), timedelta(minutes=30), False),
+        (timedelta(minutes=30), timedelta(minutes=30, seconds=1), True),
+        (timedelta(minutes=30), timedelta(minutes=20), False),
+        (timedelta(seconds=10), timedelta(minutes=5, seconds=1), True),
+    ])
+    def test_boundary(self, frozen_clock, caplog, check, ahead, behind):
+        manager = _hourly_manager(check_interval=check)
+        dsi = manager.datasets[0]
+        snap = listed_info(frozen_clock.stamp(ahead))
+        with caplog.at_level(logging.ERROR):
+            assert manager.clock_behind(dsi, snap) is behind
+        assert bool(_records(caplog, NTP_MESSAGE, 'ERROR')) is behind
+
+    def test_a_snapshot_with_no_timestamp_is_never_behind(self):
+        manager = _hourly_manager()
+        stub = MagicMock()
+        stub.timestamp = None
+        assert manager.clock_behind(manager.datasets[0], stub) is False
+
+
+class TestFutureDatedNewest:
+    """S1-c / B11: a newest snapshot dated beyond the tolerance means the clock is wrong."""
+
+    def setup_listing(self, mocker, frozen_clock, *snaps):
+        self.lst = mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=list(snaps))
+        manager = _hourly_manager()
+        return manager, manager.datasets[0]
+
+    def test_a_normal_newest_is_due_by_age_only(self, mocker, frozen_clock, caplog):
+        old = listed_snapshot(frozen_clock.stamp(-timedelta(hours=3)), txg=1)
+        recent = listed_snapshot(frozen_clock.stamp(-timedelta(minutes=20)), txg=2)
+        manager, dsi = self.setup_listing(mocker, frozen_clock, old, recent)
+        with caplog.at_level(logging.DEBUG):
+            assert manager.needs_snapshot(dsi) is False
+            frozen_clock.advance(timedelta(minutes=45))               # now 65 min old
+            assert manager.needs_snapshot(dsi) is True
+        assert not _records(caplog, NTP_MESSAGE)
+
+    def test_a_future_dated_newest_is_due_and_the_error_is_logged_once(self, mocker, frozen_clock, caplog):
+        future = listed_snapshot(frozen_clock.stamp(timedelta(hours=9)), txg=9)
+        manager, dsi = self.setup_listing(mocker, frozen_clock, future)
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(5):
+                assert manager.needs_snapshot(dsi) is True
+        errors = _records(caplog, NTP_MESSAGE, 'ERROR')
+        assert len(errors) == 1
+        assert 'pool/data' in errors[0].getMessage() and future.name.split('@')[-1] in errors[0].getMessage()
+
+    def test_after_the_new_snapshot_it_is_not_due_and_stays_quiet(self, mocker, frozen_clock, caplog):
+        future = listed_snapshot(frozen_clock.stamp(timedelta(hours=9)), txg=9)
+        manager, dsi = self.setup_listing(mocker, frozen_clock, future)
+        made = []
+
+        def take(ds, name, **kw):
+            made.append(name)
+            return ZFSSnapshot(Filesystem('pool/data'), name)
+
+        mocker.patch('zfsbackup.backup_manager.zfs.snapshot', side_effect=take)
+        with caplog.at_level(logging.WARNING):
+            assert manager.needs_snapshot(dsi) is True
+            # the pool now has the future one and the new one, which is the newest by txg
+            self.lst.side_effect = lambda **kw: [future, listed_snapshot(made[0], txg=10)]
+            created = manager.create_snapshot(dsi)
+            assert created is not None and created.createtxg == 10
+            assert dsi.snapshots[0].name == made[0]
+            for _ in range(3):
+                assert manager.needs_snapshot(dsi) is False
+        assert made == ['autosnap_20261022100000']                 # the aligned name, not the future one
+        assert len(_records(caplog, NTP_MESSAGE)) == 1               # only the first, before the snapshot
+        assert not _records(caplog, 'already exists')
+
+    def test_it_is_due_again_when_the_new_snapshot_gets_old(self, mocker, frozen_clock):
+        future = listed_snapshot(frozen_clock.stamp(timedelta(hours=9)), txg=9)
+        fresh = listed_snapshot(frozen_clock.stamp(-timedelta(minutes=30)), txg=10)
+        manager, dsi = self.setup_listing(mocker, frozen_clock, future, fresh)
+        assert manager.needs_snapshot(dsi) is False
+        frozen_clock.advance(timedelta(minutes=31))
+        assert manager.needs_snapshot(dsi) is True
+
+    def test_a_past_dated_name_with_a_newer_txg_is_due_once(self, mocker, frozen_clock, caplog):
+        """The clock jumped forward, a snapshot was made, then it was corrected back: the newest by
+        txg is dated years ago. Due; one snapshot fixes it."""
+        ancient_new = listed_snapshot('autosnap_20200101000000', txg=50)
+        future_old = listed_snapshot(frozen_clock.stamp(timedelta(hours=1)), txg=20)
+        manager, dsi = self.setup_listing(mocker, frozen_clock, ancient_new, future_old)
+        mocker.patch('zfsbackup.backup_manager.zfs.snapshot',
+                     side_effect=lambda ds, name, **kw: ZFSSnapshot(Filesystem('pool/data'), name))
+        with caplog.at_level(logging.WARNING):
+            assert manager.needs_snapshot(dsi) is True             # age of the txg-newest: years
+            made = manager.create_snapshot(dsi)                     # re-lists the same mock: no new one
+        assert made is not None
+        assert not _records(caplog, NTP_MESSAGE)                    # it is old, not future-dated
+        self.lst.return_value = [ancient_new, future_old, listed_snapshot(
+            frozen_clock.stamp(), txg=60)]
+        assert manager.needs_snapshot(dsi) is False
+
+    def test_the_error_is_logged_again_for_a_different_future_snapshot(self, mocker, frozen_clock, caplog):
+        first = listed_snapshot(frozen_clock.stamp(timedelta(hours=9)), txg=9)
+        second = listed_snapshot(frozen_clock.stamp(timedelta(hours=12)), txg=10)
+        manager, dsi = self.setup_listing(mocker, frozen_clock, first)
+        with caplog.at_level(logging.ERROR):
+            manager.needs_snapshot(dsi)
+            self.lst.return_value = [first, second]
+            manager.needs_snapshot(dsi)
+            manager.needs_snapshot(dsi)
+        assert len(_records(caplog, NTP_MESSAGE)) == 2
+
+    def test_the_error_is_logged_again_after_the_condition_cleared(self, mocker, frozen_clock, caplog):
+        future = listed_snapshot(frozen_clock.stamp(timedelta(hours=9)), txg=9)
+        normal = listed_snapshot(frozen_clock.stamp(-timedelta(minutes=10)), txg=10)
+        manager, dsi = self.setup_listing(mocker, frozen_clock, future)
+        with caplog.at_level(logging.ERROR):
+            manager.needs_snapshot(dsi)                              # error 1
+            self.lst.return_value = [future, normal]
+            manager.needs_snapshot(dsi)                              # normal newest: clears the memory
+            self.lst.return_value = [future]
+            manager.needs_snapshot(dsi)                              # error 2: it is a new episode
+        assert len(_records(caplog, NTP_MESSAGE)) == 2
+
+    def test_the_error_is_tracked_per_dataset(self, mocker, frozen_clock, caplog):
+        future = listed_snapshot(frozen_clock.stamp(timedelta(hours=9)), txg=9)
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[future])
+        config = _make_config(datasets=[
+            DatasetConfig(name='pool/a', frequency=timedelta(hours=1)),
+            DatasetConfig(name='pool/b', frequency=timedelta(hours=1)),
+        ])
+        manager = DatasetManager(config)
+        a, b = manager.datasets
+        with caplog.at_level(logging.ERROR):
+            manager.needs_snapshot(a)
+            manager.needs_snapshot(b)
+            manager.needs_snapshot(a)
+        assert len(_records(caplog, NTP_MESSAGE)) == 2
+
+    def test_within_the_tolerance_a_future_name_is_not_an_error(self, mocker, frozen_clock, caplog):
+        """Jitter (an NTP step of a few minutes): not due, no error."""
+        near = listed_snapshot(frozen_clock.stamp(timedelta(minutes=4)), txg=9)
+        manager, dsi = self.setup_listing(mocker, frozen_clock, near)
+        with caplog.at_level(logging.DEBUG):
+            assert manager.needs_snapshot(dsi) is False
+        assert not _records(caplog, NTP_MESSAGE)
+
+    def test_just_past_the_tolerance_it_is_due(self, mocker, frozen_clock, caplog):
+        beyond = listed_snapshot(frozen_clock.stamp(timedelta(minutes=5, seconds=1)), txg=9)
+        manager, dsi = self.setup_listing(mocker, frozen_clock, beyond)
+        with caplog.at_level(logging.DEBUG):
+            assert manager.needs_snapshot(dsi) is True
+        assert len(_records(caplog, NTP_MESSAGE, 'ERROR')) == 1
+
+    def test_the_check_interval_moves_the_boundary(self, mocker, frozen_clock):
+        twenty = listed_snapshot(frozen_clock.stamp(timedelta(minutes=20)), txg=9)
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[twenty])
+        short = _hourly_manager()
+        long = _hourly_manager(check_interval=timedelta(minutes=30))
+        assert short.needs_snapshot(short.datasets[0]) is True       # beyond 5 min
+        assert long.needs_snapshot(long.datasets[0]) is False         # within 30 min
+
+    def test_the_newest_is_the_newest_by_txg(self, mocker, frozen_clock, caplog):
+        """A future-dated snapshot that is OLDER by txg than a normal one is not 'the newest'."""
+        future_old_txg = listed_snapshot(frozen_clock.stamp(timedelta(days=2)), txg=1)
+        normal = listed_snapshot(frozen_clock.stamp(-timedelta(minutes=10)), txg=2)
+        manager, dsi = self.setup_listing(mocker, frozen_clock, future_old_txg, normal)
+        with caplog.at_level(logging.ERROR):
+            assert manager.needs_snapshot(dsi) is False
+        assert not _records(caplog, NTP_MESSAGE)
+
+
+class TestGeneratedNameCollision:
+    """S1-c: a clock that went backwards regenerates a name that exists."""
+
+    def pool(self, mocker, frozen_clock):
+        """The pool: today's 10:00 snapshot exists (txg 5) and the newest by txg is a future-dated
+        one (the clock was ahead for a while, then was put back)."""
+        existing = listed_snapshot('autosnap_20261022100000', txg=5)
+        future = listed_snapshot(frozen_clock.stamp(timedelta(hours=9)), txg=9)
+        lst = mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[existing, future])
+        snapshot = mocker.patch('zfsbackup.backup_manager.zfs.snapshot')
+        manager = _hourly_manager()
+        return manager, manager.datasets[0], lst, snapshot
+
+    def test_it_is_not_due_and_warns_once_per_name(self, mocker, frozen_clock, caplog):
+        manager, dsi, _, snapshot = self.pool(mocker, frozen_clock)
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(5):
+                assert manager.needs_snapshot(dsi) is False
+        (rec,) = _records(caplog, 'already exists', 'WARNING')
+        assert 'autosnap_20261022100000' in rec.getMessage() and 'pool/data' in rec.getMessage()
+        snapshot.assert_not_called()
+        # the same fact repeats quietly at DEBUG
+        assert len(_records(caplog, 'already exists', 'DEBUG')) == 4
+
+    def test_the_future_dated_error_is_still_logged_once(self, mocker, frozen_clock, caplog):
+        manager, dsi, _, _ = self.pool(mocker, frozen_clock)
+        with caplog.at_level(logging.ERROR):
+            for _ in range(3):
+                manager.needs_snapshot(dsi)
+        assert len(_records(caplog, NTP_MESSAGE)) == 1
+
+    def test_the_worker_makes_no_zfs_snapshot_call_and_does_not_loop(self, mocker, frozen_clock, caplog):
+        from zfsbackup.workers import SnapshotWorker
+        manager, dsi, lst, snapshot = self.pool(mocker, frozen_clock)
+        worker = SnapshotWorker.__new__(SnapshotWorker)
+        with caplog.at_level(logging.INFO):
+            for _ in range(10):
+                worker._process_dataset(manager, dsi)
+        snapshot.assert_not_called()
+        assert lst.call_count == 10                       # one listing per cycle and nothing else
+        assert not _records(caplog, 'needs snapshot')
+
+    def test_a_new_hour_generates_a_new_name_and_is_due_again(self, mocker, frozen_clock, caplog):
+        manager, dsi, _, _ = self.pool(mocker, frozen_clock)
+        with caplog.at_level(logging.WARNING):
+            assert manager.needs_snapshot(dsi) is False
+            frozen_clock.advance(timedelta(hours=1))                 # 11:30 -> name ..110000
+            assert manager.needs_snapshot(dsi) is True
+        assert len(_records(caplog, 'already exists')) == 1
+
+    def test_each_taken_name_warns_once(self, mocker, frozen_clock, caplog):
+        manager, dsi, lst, _ = self.pool(mocker, frozen_clock)
+        lst.return_value = lst.return_value + [listed_snapshot('autosnap_20261022110000', txg=6)]
+        with caplog.at_level(logging.WARNING):
+            manager.needs_snapshot(dsi)
+            frozen_clock.advance(timedelta(hours=1))
+            manager.needs_snapshot(dsi)
+            manager.needs_snapshot(dsi)
+        assert len(_records(caplog, 'already exists', 'WARNING')) == 2
+
+    def test_a_taken_name_is_not_a_collision_when_not_due(self, mocker, frozen_clock, caplog):
+        recent = listed_snapshot(frozen_clock.stamp(-timedelta(minutes=10)), txg=9)   # 10:20 (not aligned)
+        existing = listed_snapshot('autosnap_20261022100000', txg=5)
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[recent, existing])
+        manager = _hourly_manager()
+        with caplog.at_level(logging.DEBUG):
+            assert manager.needs_snapshot(manager.datasets[0]) is False
+        assert not _records(caplog, 'already exists')
+
+    def test_a_name_listed_without_a_txg_still_counts_as_taken(self, mocker, frozen_clock, caplog):
+        """The dropped snapshot is invisible to ordering but its NAME is occupied."""
+        taken = listed_snapshot('autosnap_20261022100000', txg=NO_TXG)
+        old = listed_snapshot(frozen_clock.stamp(-timedelta(hours=5)), txg=1)
+        mocker.patch('zfsbackup.backup_manager.zfs.list', return_value=[taken, old])
+        manager = _hourly_manager()
+        with caplog.at_level(logging.WARNING):
+            assert manager.needs_snapshot(manager.datasets[0]) is False
+        assert _records(caplog, 'already exists', 'WARNING')
+
+    def test_create_snapshot_itself_does_not_recheck_the_name(self, mocker, frozen_clock):
+        """The guard is in `needs_snapshot`; a direct `create_snapshot` reaches `zfs snapshot`,
+        which fails for an existing name and is reported, not raised."""
+        manager, dsi, _, snapshot = self.pool(mocker, frozen_clock)
+        snapshot.side_effect = Exception("cannot create snapshot 'pool/data@autosnap_20261022100000': dataset already exists")
+        assert manager.create_snapshot(dsi) is None
+        snapshot.assert_called_once()
+
+
+class TestCreateSnapshotRelists:
+    """S1-a: `create_snapshot` re-lists after `zfs snapshot`; the bare object has no createtxg."""
+
+    def setup(self, mocker, existing=()):
+        made = []
+
+        def take(ds, name, **kw):
+            made.append(name)
+            return ZFSSnapshot(Filesystem('pool/data'), name)
+
+        snapshot = mocker.patch('zfsbackup.backup_manager.zfs.snapshot', side_effect=take)
+        lst = mocker.patch('zfsbackup.backup_manager.zfs.list')
+        lst.side_effect = lambda **kw: list(existing) + [listed_snapshot(made[0], txg=100)]
+        manager = _hourly_manager()
+        return manager, manager.datasets[0], made, snapshot, lst
+
+    def test_the_listed_object_is_returned_and_is_first(self, mocker, frozen_clock):
+        old = listed_snapshot(frozen_clock.stamp(-timedelta(hours=2)), txg=3)
+        manager, dsi, made, snapshot, lst = self.setup(mocker, [old])
+        result = manager.create_snapshot(dsi)
+        assert result.name == made[0] and result.createtxg == 100
+        assert dsi.snapshots[0] is result
+        assert [s.name for s in dsi.snapshots] == [made[0], old.short]
+        lst.assert_called_once()
+        assert lst.call_args.kwargs['properties'] == SNAPSHOT_LIST_PROPERTIES
+
+    def test_the_new_snapshot_is_the_newest_by_txg_even_if_dated_earlier(self, mocker, frozen_clock):
+        """A snapshot named in the future exists; the new aligned one is still the newest."""
+        future = listed_snapshot(frozen_clock.stamp(timedelta(days=1)), txg=3)
+        manager, dsi, made, _, _ = self.setup(mocker, [future])
+        result = manager.create_snapshot(dsi)
+        assert dsi.snapshots[0] is result and dsi.snapshots[1].name == future.short
+
+    def test_one_snapshot_call_and_one_listing(self, mocker, frozen_clock):
+        manager, dsi, made, snapshot, lst = self.setup(mocker)
+        manager.create_snapshot(dsi)
+        snapshot.assert_called_once()
+        lst.assert_called_once()
+
+    def test_dry_run_neither_snapshots_nor_lists(self, mocker, frozen_clock):
+        config = _make_config(datasets=[DatasetConfig(name='pool/data')], dry_run=True)
+        manager = DatasetManager(config)
+        snapshot = mocker.patch('zfsbackup.backup_manager.zfs.snapshot')
+        lst = mocker.patch('zfsbackup.backup_manager.zfs.list')
+        assert manager.create_snapshot(manager.datasets[0]) is None
+        snapshot.assert_not_called()
+        lst.assert_not_called()
+
+    def test_a_failed_snapshot_does_not_list(self, mocker):
+        manager = _hourly_manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.snapshot', side_effect=Exception('boom'))
+        lst = mocker.patch('zfsbackup.backup_manager.zfs.list')
+        assert manager.create_snapshot(manager.datasets[0]) is None
+        lst.assert_not_called()
+
+    def test_a_failed_relist_leaves_the_snapshots_unchanged(self, mocker, frozen_clock, caplog):
+        old = listed_info(frozen_clock.stamp(-timedelta(hours=2)), txg=3)
+        manager, dsi, made, _, lst = self.setup(mocker)
+        dsi.snapshots = [old]
+        names_before = list(dsi.snapshots)
+        lst.side_effect = Exception('cannot open pool/data')
+        with caplog.at_level(logging.INFO):
+            result = manager.create_snapshot(dsi)
+        assert dsi.snapshots == names_before and dsi.snapshots[0] is old
+        assert result is not None and result.name == made[0]         # the snapshot exists
+        assert result.createtxg is None                              # the bare object
+        assert _records(caplog, 'could not re-list', 'WARNING')
+        assert _records(caplog, 'Successfully created snapshot')
+        assert not _records(caplog, 'Failed to create snapshot')
+
+    def test_an_empty_relist_returns_the_bare_object(self, mocker, frozen_clock):
+        manager, dsi, made, _, lst = self.setup(mocker)
+        lst.side_effect = lambda **kw: []
+        result = manager.create_snapshot(dsi)
+        assert result is not None and result.name == made[0]
+        assert dsi.snapshots == []
+
+    def test_the_next_cycle_lists_again(self, mocker, frozen_clock):
+        manager, dsi, made, _, lst = self.setup(mocker)
+        lst.side_effect = Exception('transient')
+        manager.create_snapshot(dsi)
+        lst.side_effect = lambda **kw: [listed_snapshot(made[0], txg=100)]
+        assert [s.name for s in manager.list_snapshots(dsi)] == [made[0]]
+
+
+class TestServerPrunerRefusesUnusableConfig:
+    """S1-a: `_received_dataset_info` runs the shared shape check. A zero age, keep_for or
+    frequency is a division by zero in `needs_prunning`; the dataset is skipped instead."""
+
+    PATH = 'pool/backups/client1/data'
+
+    @staticmethod
+    def wire(frequency=3600, rules=((3600, 86400),), remote=()):
+        import base64
+        import json
+        return base64.b64encode(json.dumps({
+            'name': 'pool/data', 'recursive': False, 'frequency': frequency, 'enabled': True,
+            'retention_rules': [{'age': a, 'keep_for': k} for a, k in rules],
+            'remote': [{'destination': d, 'frequency': f} for d, f in remote],
+        }).encode()).decode()
+
+    def received(self, mocker, value):
+        FakeReceived(mocker, [self.PATH], local={self.PATH: _client_props(config=value)})
+        return DatasetManager(_remote_manager().config)
+
+    def test_a_usable_config_is_accepted(self, mocker):
+        manager = self.received(mocker, self.wire())
+        (dsi,) = manager.received_datasets()
+        assert dsi.name == self.PATH
+
+    @pytest.mark.parametrize('kwargs, why', [
+        (dict(frequency=0), 'frequency is not positive'),
+        (dict(rules=((0, 86400),)), 'a retention rule has a duration that is not positive'),
+        (dict(rules=((3600, 0),)), 'a retention rule has a duration that is not positive'),
+        (dict(rules=((3600, 86400), (0, 0))), 'a retention rule has a duration that is not positive'),
+        (dict(remote=(('offsite', -5),)), 'a remote frequency is not positive'),
+    ], ids=['zero-frequency', 'zero-age', 'zero-keep_for', 'second-rule-zero', 'negative-remote-frequency'])
+    def test_it_is_skipped_with_the_unusable_message(self, mocker, caplog, kwargs, why):
+        manager = self.received(mocker, self.wire(**kwargs))
+        with caplog.at_level(logging.WARNING):
+            assert manager.received_datasets() == []
+        (rec,) = _records(caplog, 'Skipping received dataset', 'WARNING')
+        assert f"org.zfsbackup:config is unusable ({why})" in rec.getMessage()
+        assert 'not pruned until this is fixed' in rec.getMessage()
+
+    def test_the_skip_is_announced_once_and_repeats_at_debug(self, mocker, caplog):
+        manager = self.received(mocker, self.wire(frequency=0))
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(3):
+                manager.received_datasets()
+        assert len(_records(caplog, 'Skipping received dataset', 'WARNING')) == 1
+        assert len(_records(caplog, 'Skipping received dataset', 'DEBUG')) == 2
+
+    def test_it_is_accepted_again_once_fixed(self, mocker, caplog):
+        fake = FakeReceived(mocker, [self.PATH], local={self.PATH: _client_props(config=self.wire(frequency=0))})
+        manager = DatasetManager(_remote_manager().config)
+        assert manager.received_datasets() == []
+        fake.local[self.PATH] = _client_props(config=self.wire())
+        assert [d.name for d in manager.received_datasets()] == [self.PATH]
+
+    def test_the_prune_cycle_never_divides_by_zero(self, mocker, frozen_clock):
+        """What the skip prevents: `needs_prunning` on the zero-age config raises."""
+        cfg = DatasetConfig(
+            name='pool/data', frequency=timedelta(hours=1),
+            retention_rules=[RetentionRule(timedelta(0), timedelta(hours=1))],
+        )
+        manager = DatasetManager(_make_config(datasets=[cfg]))
+        dsi = manager.datasets[0]
+        dsi.snapshots = [listed_info(frozen_clock.stamp(-timedelta(minutes=10)), txg=2),
+                         listed_info(frozen_clock.stamp(-timedelta(minutes=20)), txg=1)]
+        with pytest.raises(ZeroDivisionError):
+            manager.needs_prunning(dsi)

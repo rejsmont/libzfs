@@ -1,0 +1,66 @@
+# OpenZFS output captures
+
+Real `zfs` / `zpool` output from OpenZFS **2.1.5**, **2.2.2** and **2.4.1** (Multipass VMs; versions, kernel and pool features are in each `ENV.txt`), committed so the mocked suite can replay it through libzfseasy's parsers
+(`tests/test_openzfs_formats.py`) without a pool. Nothing here is hand-written.
+
+## Where they come from
+
+`scenarios/test_openzfs_matrix.sh --captures` runs `captures.sh` in each VM, once per locale, on a throwaway
+file-backed pool. Only the **C locale** pass (`LC_ALL=C LANG=C`) is kept here: the default-locale pass differs only in
+non-deterministic order (clone lists, `zfs get all` rows, a random `pbkdf2salt`, a SIGPIPE race), and no
+`zfs`/`zpool` message catalogue is installed on the VMs, so no message text differs.
+
+Layout: `<version>/<SECTION>.txt` for each section, plus `M1-SUMMARY.tsv` (one parsed line per M1 resume token) and
+`ENV.txt` (versions, locale, pool features).
+
+| Section | Contents |
+|---|---|
+| M1 | `send -nv -t` of the resume token cut from a send, per send-flag set (128K/1M, lz4/off, plain/encrypted, full + incremental) |
+| M2 | stale tokens: incremental source / target destroyed or recreated, sender renamed or moved, receiver base gone or replaced |
+| M3_Z8 | `destroy -v -p` of single / batch / range / `-r` snapshots, with a hold, a clone, or a send in progress |
+| M4 | `zfs list` with `createtxg,guid,userrefs,clones`, clone lists, holds, equal txgs |
+| EP | encryption properties (`encryption`, `keystatus`, `encryptionroot`, `keyformat`, `keylocation`) |
+| M5_Z1, M6 | raw / plain receive into pre-created or new datasets, `-F`, `-o`; `-L` mismatch between full and incremental |
+| Z2, Z3, Z5, Z6, Z7 | ownership properties on raw receives, a partial new-dataset receive, `change-key`, `encryptionroot` of received copies, a raw copy with no key |
+| Z4 | key unloaded: what still works, what fails, and the wording |
+
+M1 is trimmed: the `0_base`, `4_resume`, `5_after` and `6_snaps` records of each token case are left out (the summary
+keeps the resume status). Every kept record has its exact bytes.
+
+## Record format
+
+```
+##### SECTION <name> (<description>)  tag=C  <zfs version>
+=== CASE <section>/<id>
+--- cmd
+<the command line, as run>
+--- rc
+<exit status (of the last command of a pipeline)>
+--- pipestatus          only for pipelines: one status per stage
+--- stdout
+<exact stdout>
+--- stderr
+<exact stderr>
+--- send.stderr         only for pipelines, and only when the sending side printed something
+<stderr of the `zfs send` stage>
+=== END
+```
+
+A resume token is the argument after `-t` in the `cmd` line. `tests/_openzfs_fixtures.py` parses a section file
+into `{id: Record}` (`cmd`, `rc`, `stdout`, `stderr`, `pipestatus`, `send_stderr`, plus `.token`, `.stdout_lines`,
+`.stderr_lines`); `load_m1_summary(version)` reads `M1-SUMMARY.tsv`. A capture writes every non-empty stdout/stderr with its final
+newline, so the section files lose nothing against the per-record files (`<id>.{cmd,rc,stdout,stderr}`) the script
+also leaves behind; an empty `send.stderr` has no marker.
+
+## Regenerating
+
+Needs the Multipass VMs (`zfsb-zfs21`, `zfsb-zfs22`, `zfsb-zfs24`) provisioned by the matrix script:
+
+```
+MATRIX_LOG_DIR=/some/dir scenarios/test_openzfs_matrix.sh --captures-only        # or --captures with the other tiers
+```
+
+The script leaves `<vm>.captures/{default,C}/` under `$MATRIX_LOG_DIR`. Copy each `C/<SECTION>.txt`,
+`C/M1-SUMMARY.tsv` and `C/ENV.txt` to `tests/fixtures/openzfs/<2.1.5|2.2.2|2.4.1>/`, dropping the four M1 record kinds
+named above if the total grows past ~1.5 MB. Then run `pytest tests/test_openzfs_formats.py`: a new OpenZFS release
+that changes a wording or a flag set shows up as a failing, per-version test.

@@ -119,6 +119,7 @@ from click.testing import CliRunner
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError, SQLAlchemyError
 
+from _raw_support import stub_table_ddl
 from _cli_support import (
     FakeDaemon,
     UNVERIFIED_LINUX_ONLY,
@@ -2967,7 +2968,7 @@ class TestTableSubsetsThroughTheCli:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path)
         for name in names:
-            conn.execute(f"CREATE TABLE {name} (id INTEGER PRIMARY KEY)")
+            conn.execute(stub_table_ddl(name))
         conn.commit()
         conn.close()
         os.chmod(path, 0o660)

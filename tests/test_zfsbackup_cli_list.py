@@ -156,11 +156,13 @@ class TestListDatasets:
             {
                 "destination": "offsite", "frequency": None,
                 "effective_frequency": "1h", "retention_override": None,
+                "raw": None,
             },
             {
                 "destination": "dc.two", "frequency": "4h",
                 "effective_frequency": "4h",
                 "retention_override": [{"age": "1d", "keep_for": "7d"}],
+                "raw": None,
             },
         ]
         forever = data["tank/vm.01"]

@@ -438,7 +438,7 @@ _TOP_KEYS = (
     "dry_run", "client_cert_file", "client_key_file", "destinations", "remote_backup", "datasets",
 )
 _DATASET_KEYS = ("name", "enabled", "frequency", "recursive", "retention", "remote")
-_REMOTE_KEYS = ("destination", "frequency", "retention")
+_REMOTE_KEYS = ("destination", "frequency", "retention", "raw")
 _DESTINATION_KEYS = ("url", "server_fingerprint")
 _SERVER_KEYS = ("target_dataset", "enabled")
 
@@ -694,6 +694,7 @@ def _session(
             + _recreate_warnings(original, canon)
             + dotpath.pin_change_warnings(original, canon)
             + dotpath.prefix_change_warnings(original, canon)
+            + dotpath.raw_change_warnings(original, canon)
         ):
             warn(message)
         committing = True

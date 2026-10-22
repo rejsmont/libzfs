@@ -1,0 +1,382 @@
+##### SECTION Z4 (zfs snapshot and send with the key unloaded (raw ok, plain error text))  tag=C  zfs-2.1.5-1ubuntu6~22.04.7
+=== CASE Z4/00_plain_cut_key_loaded
+--- cmd
+zfs send zfsbcapc/Z4/cs/enc@a | head -c 1000000 | zfs receive -s -u zfsbcapc/Z4/srv/plaintok
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-a374cf14e-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140686a76776ed7aff33e7bb01923c27583e2f31379581a12aad382939b120593fca443fb9583f352fd92111ea24060048921b72
+=== END
+=== CASE Z4/01_raw_cut_key_loaded
+--- cmd
+zfs send -w zfsbcapc/Z4/cs/enc@a | head -c 1000000 | zfs receive -s -u zfsbcapc/Z4/srv/rawtok
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-cea795205-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc140686a76776ed7aff33e7bb01923c27583e2f31379581a12aad382939b120593fca443fb9583f352fd92111661e3703c2fdc9f9b90545a9c5c5f9d9103109a87b60f24589e530290600fa9a21f9
+=== END
+=== CASE Z4/02_control_plain_wc_key_loaded
+--- cmd
+zfs send zfsbcapc/Z4/cs/enc@a | wc -c
+--- rc
+0
+--- stdout
+2148208
+--- stderr
+=== END
+=== CASE Z4/10_unmount
+--- cmd
+zfs unmount zfsbcapc/Z4/cs/enc
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z4/11_unload_key
+--- cmd
+zfs unload-key zfsbcapc/Z4/cs/enc
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z4/12_keystatus
+--- cmd
+zfs get -H -o name,property,value keystatus zfsbcapc/Z4/cs/enc zfsbcapc/Z4/cs/enc@a
+--- rc
+0
+--- stdout
+zfsbcapc/Z4/cs/enc	keystatus	unavailable
+zfsbcapc/Z4/cs/enc@a	keystatus	unavailable
+--- stderr
+=== END
+=== CASE Z4/20_snapshot_key_unloaded
+--- cmd
+zfs snapshot zfsbcapc/Z4/cs/enc@k1
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z4/21_snapshot_recursive_r_key_unloaded
+--- cmd
+zfs snapshot -r zfsbcapc/Z4/cs/enc@k2
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z4/22_snapshots
+--- cmd
+zfs list -H -t snapshot -o name,keystatus,encryption,createtxg -r zfsbcapc/Z4/cs/enc
+--- rc
+0
+--- stdout
+zfsbcapc/Z4/cs/enc@a	unavailable	aes-256-gcm	1659
+zfsbcapc/Z4/cs/enc@b	unavailable	aes-256-gcm	1660
+zfsbcapc/Z4/cs/enc@c	unavailable	aes-256-gcm	1661
+zfsbcapc/Z4/cs/enc@k1	unavailable	aes-256-gcm	1675
+zfsbcapc/Z4/cs/enc@k2	unavailable	aes-256-gcm	1676
+--- stderr
+=== END
+=== CASE Z4/30_send_w_full_wc
+--- cmd
+zfs send -w zfsbcapc/Z4/cs/enc@a | wc -c
+--- rc
+0
+--- stdout
+2120452
+--- stderr
+=== END
+=== CASE Z4/31_send_w_incr_wc
+--- cmd
+zfs send -w -i zfsbcapc/Z4/cs/enc@a zfsbcapc/Z4/cs/enc@b | wc -c
+--- rc
+0
+--- stdout
+2113380
+--- stderr
+=== END
+=== CASE Z4/32_send_w_nv
+--- cmd
+zfs send -w -nv zfsbcapc/Z4/cs/enc@a
+--- rc
+0
+--- stdout
+full send of zfsbcapc/Z4/cs/enc@a estimated size is 2.05M
+total estimated size is 2.05M
+--- stderr
+=== END
+=== CASE Z4/33_send_w_snapshot_made_while_unloaded_wc
+--- cmd
+zfs send -w -i zfsbcapc/Z4/cs/enc@c zfsbcapc/Z4/cs/enc@k1 | wc -c
+--- rc
+0
+--- stdout
+1652
+--- stderr
+=== END
+=== CASE Z4/34_send_w_p_wc
+--- cmd
+zfs send -w -p zfsbcapc/Z4/cs/enc@a | wc -c
+--- rc
+0
+--- stdout
+2122084
+--- stderr
+=== END
+=== CASE Z4/35_send_w_nv_incr
+--- cmd
+zfs send -w -nv -i zfsbcapc/Z4/cs/enc@a zfsbcapc/Z4/cs/enc@b
+--- rc
+0
+--- stdout
+send from zfsbcapc/Z4/cs/enc@a to zfsbcapc/Z4/cs/enc@b estimated size is 2.05M
+total estimated size is 2.05M
+--- stderr
+=== END
+=== CASE Z4/40_send_plain_full_wc
+--- cmd
+zfs send zfsbcapc/Z4/cs/enc@a | wc -c
+--- rc
+1
+--- stdout
+0
+--- stderr
+warning: cannot send 'zfsbcapc/Z4/cs/enc@a': dataset key must be loaded
+=== END
+=== CASE Z4/41_send_plain_incr_wc
+--- cmd
+zfs send -i zfsbcapc/Z4/cs/enc@a zfsbcapc/Z4/cs/enc@b | wc -c
+--- rc
+1
+--- stdout
+0
+--- stderr
+warning: cannot send 'zfsbcapc/Z4/cs/enc@b': dataset key must be loaded
+=== END
+=== CASE Z4/42_send_plain_nv
+--- cmd
+zfs send -nv zfsbcapc/Z4/cs/enc@a
+--- rc
+0
+--- stdout
+full send of zfsbcapc/Z4/cs/enc@a estimated size is 2.05M
+total estimated size is 2.05M
+--- stderr
+=== END
+=== CASE Z4/43_send_plain_nv_incr
+--- cmd
+zfs send -nv -i zfsbcapc/Z4/cs/enc@a zfsbcapc/Z4/cs/enc@b
+--- rc
+0
+--- stdout
+send from zfsbcapc/Z4/cs/enc@a to zfsbcapc/Z4/cs/enc@b estimated size is 2.05M
+total estimated size is 2.05M
+--- stderr
+=== END
+=== CASE Z4/44_send_plain_L_c_wc
+--- cmd
+zfs send -L -c zfsbcapc/Z4/cs/enc@a | wc -c
+--- rc
+1
+--- stdout
+0
+--- stderr
+warning: cannot send 'zfsbcapc/Z4/cs/enc@a': dataset key must be loaded
+=== END
+=== CASE Z4/45_send_plain_L_c_nv
+--- cmd
+zfs send -L -c -nv zfsbcapc/Z4/cs/enc@a
+--- rc
+0
+--- stdout
+full send of zfsbcapc/Z4/cs/enc@a estimated size is 2.05M
+total estimated size is 2.05M
+--- stderr
+=== END
+=== CASE Z4/46_send_plain_e_wc
+--- cmd
+zfs send -e zfsbcapc/Z4/cs/enc@a | wc -c
+--- rc
+1
+--- stdout
+0
+--- stderr
+warning: cannot send 'zfsbcapc/Z4/cs/enc@a': dataset key must be loaded
+=== END
+=== CASE Z4/47_send_plain_p_nv
+--- cmd
+zfs send -p -nv zfsbcapc/Z4/cs/enc@a
+--- rc
+1
+--- stdout
+--- stderr
+cannot send zfsbcapc/Z4/cs/enc@a: encrypted dataset zfsbcapc/Z4/cs/enc may not be sent with properties without the raw flag
+warning: cannot send 'zfsbcapc/Z4/cs/enc@a': backup failed
+=== END
+=== CASE Z4/48_send_plain_snapshot_made_while_unloaded
+--- cmd
+zfs send -nv zfsbcapc/Z4/cs/enc@k1
+--- rc
+0
+--- stdout
+full send of zfsbcapc/Z4/cs/enc@k1 estimated size is 6.08M
+total estimated size is 6.08M
+--- stderr
+=== END
+=== CASE Z4/50_send_nv_t_plain_token_key_unloaded
+--- cmd
+zfs send -nv -t 1-a374cf14e-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140686a76776ed7aff33e7bb01923c27583e2f31379581a12aad382939b120593fca443fb9583f352fd92111ea24060048921b72
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	object = 0x2
+	offset = 0xc0000
+	bytes = 0xe1288
+	toguid = 0xf76cf9efbabacce5
+	toname = zfsbcapc/Z4/cs/enc@a
+full send of zfsbcapc/Z4/cs/enc@a estimated size is 1.17M
+total estimated size is 1.17M
+--- stderr
+=== END
+=== CASE Z4/51_resume_plain_token_key_unloaded
+--- cmd
+zfs send -t 1-a374cf14e-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140686a76776ed7aff33e7bb01923c27583e2f31379581a12aad382939b120593fca443fb9583f352fd92111ea24060048921b72 | zfs receive -s -u zfsbcapc/Z4/srv/plaintok
+--- rc
+1
+--- pipestatus
+255 1
+--- stdout
+--- stderr
+cannot receive: failed to read from stream
+--- send.stderr
+warning: cannot send 'zfsbcapc/Z4/cs/enc@a': source key must be loaded
+=== END
+=== CASE Z4/52_send_nv_t_raw_token_key_unloaded
+--- cmd
+zfs send -nv -t 1-cea795205-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc140686a76776ed7aff33e7bb01923c27583e2f31379581a12aad382939b120593fca443fb9583f352fd92111661e3703c2fdc9f9b90545a9c5c5f9d9103109a87b60f24589e530290600fa9a21f9
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	object = 0x2
+	offset = 0xc0000
+	bytes = 0xe1854
+	toguid = 0xf76cf9efbabacce5
+	toname = zfsbcapc/Z4/cs/enc@a
+	compressok = 1
+	rawok = 1
+full send of zfsbcapc/Z4/cs/enc@a estimated size is 1.17M
+total estimated size is 1.17M
+--- stderr
+=== END
+=== CASE Z4/53_resume_raw_token_key_unloaded
+--- cmd
+zfs send -t 1-cea795205-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc140686a76776ed7aff33e7bb01923c27583e2f31379581a12aad382939b120593fca443fb9583f352fd92111661e3703c2fdc9f9b90545a9c5c5f9d9103109a87b60f24589e530290600fa9a21f9 | zfs receive -s -u zfsbcapc/Z4/srv/rawtok
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z4/54_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z4/srv/rawtok
+--- rc
+0
+--- stdout
+zfsbcapc/Z4/srv/rawtok@a	17828899832878255333	1679
+--- stderr
+=== END
+=== CASE Z4/60_hold_key_unloaded
+--- cmd
+zfs hold keep zfsbcapc/Z4/cs/enc@a
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z4/61_destroy_snapshot_key_unloaded
+--- cmd
+zfs destroy -v -p zfsbcapc/Z4/cs/enc@k2
+--- rc
+0
+--- stdout
+destroy	zfsbcapc/Z4/cs/enc@k2
+reclaim	0
+--- stderr
+=== END
+=== CASE Z4/62_list_after
+--- cmd
+zfs list -H -t snapshot -o name,keystatus,userrefs -r zfsbcapc/Z4/cs/enc
+--- rc
+0
+--- stdout
+zfsbcapc/Z4/cs/enc@a	unavailable	1
+zfsbcapc/Z4/cs/enc@b	unavailable	0
+zfsbcapc/Z4/cs/enc@c	unavailable	0
+zfsbcapc/Z4/cs/enc@k1	unavailable	0
+--- stderr
+=== END
+=== CASE Z4/63_bookmark_key_unloaded
+--- cmd
+zfs bookmark zfsbcapc/Z4/cs/enc@a zfsbcapc/Z4/cs/enc#bm
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z4/70_server_raw_full
+--- cmd
+zfs send -w zfsbcapc/Z4/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z4/srv/copy
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z4/71_server_snapshot_no_key
+--- cmd
+zfs snapshot zfsbcapc/Z4/srv/copy@srv1
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z4/72_server_send_w_wc
+--- cmd
+zfs send -w zfsbcapc/Z4/srv/copy@a | wc -c
+--- rc
+0
+--- stdout
+2120452
+--- stderr
+=== END
+=== CASE Z4/73_server_send_plain_wc
+--- cmd
+zfs send zfsbcapc/Z4/srv/copy@a | wc -c
+--- rc
+1
+--- stdout
+0
+--- stderr
+warning: cannot send 'zfsbcapc/Z4/srv/copy@a': dataset key must be loaded
+=== END

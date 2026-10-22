@@ -501,6 +501,7 @@ class TestRemoteBackupWorker:
         anchor_snap.age = timedelta(minutes=30)
         manager.get_anchor.return_value = 'autosnap_20240101120000'
         manager.list_snapshots.return_value = [anchor_snap]
+        manager.clock_behind.return_value = False       # the anchor is not future-dated
 
         worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
         worker.name = 'remote-backup-worker'
@@ -1113,3 +1114,185 @@ class TestForkedWorkerRunsOnTheInheritedConfig:
 
         assert worker.exitcode == 0
         forbid.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# S1-c / B11: a future-dated anchor makes the remote destination due.
+# ---------------------------------------------------------------------------
+
+from datetime import timezone  # noqa: E402
+
+from _snapshot_support import frozen_clock, listed_info  # noqa: E402,F401  (fixture)
+
+NTP_MESSAGE = 'system clock is behind the newest snapshot; check NTP'
+
+
+class TestFutureDatedAnchor:
+    """The remote worker skips a destination whose anchor is younger than the frequency. An anchor
+    dated beyond the clock tolerance is not 'young': the clock is wrong, and the destination is
+    due (`DatasetManager.clock_behind` logs the ERROR once per destination)."""
+
+    def build(self, mocker, frozen_clock, anchors, *, check_interval=timedelta(minutes=5),
+              destinations=('a', 'b')):
+        config = BackupConfig(
+            datasets=[DatasetConfig(
+                name='pool/data', frequency=timedelta(hours=1),
+                remote=[RemoteDatasetConfig(destination=d) for d in destinations],
+            )],
+            check_interval=check_interval,
+        )
+        manager = DatasetManager(config)
+        dsi = manager.datasets[0]
+        # one snapshot per distinct anchor offset (minutes from the frozen "now"), fixed at build time
+        snaps = {m: listed_info(frozen_clock.stamp(timedelta(minutes=m)), txg=i + 1)
+                 for i, m in enumerate(sorted(set(anchors.values())))}
+        anchor_name = {dest: snaps[m].name for dest, m in anchors.items()}
+        mocker.patch.object(manager, 'list_snapshots', side_effect=lambda d: list(snaps.values()))
+        mocker.patch.object(manager, 'get_anchor', side_effect=lambda d, dest: anchor_name.get(dest))
+        worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
+        worker.name = 'remote-backup-worker'
+        worker._exit_reason = lambda: None
+        worker._remote_manager = MagicMock()
+        return worker, manager, dsi
+
+    def cycle(self, worker, manager, dsi):
+        worker._remote_manager.backup_dataset.reset_mock()
+        worker._process_dataset(manager, dsi)
+        return [c.args[1].destination for c in worker._remote_manager.backup_dataset.call_args_list]
+
+    def test_a_fresh_past_anchor_is_not_due(self, mocker, frozen_clock, caplog):
+        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': -20, 'b': -20})
+        with caplog.at_level(logging.DEBUG):
+            assert self.cycle(worker, manager, dsi) == []
+        assert not [r for r in caplog.records if NTP_MESSAGE in r.getMessage()]
+
+    def test_an_old_anchor_is_due(self, mocker, frozen_clock):
+        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': -90, 'b': -90})
+        assert self.cycle(worker, manager, dsi) == ['a', 'b']
+
+    def test_a_future_dated_anchor_is_due_with_one_error_per_destination(
+        self, mocker, frozen_clock, caplog
+    ):
+        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 600, 'b': 600})
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(3):
+                assert self.cycle(worker, manager, dsi) == ['a', 'b']
+        errors = [r for r in caplog.records if NTP_MESSAGE in r.getMessage() and r.levelname == 'ERROR']
+        assert len(errors) == 2                          # once for each destination, not per cycle
+        text = ' '.join(r.getMessage() for r in errors)
+        assert 'anchor for a' in text and 'anchor for b' in text
+
+    def test_each_destination_is_judged_by_its_own_anchor(self, mocker, frozen_clock, caplog):
+        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 600, 'b': -20})
+        with caplog.at_level(logging.DEBUG):
+            assert self.cycle(worker, manager, dsi) == ['a']
+        errors = [r for r in caplog.records if NTP_MESSAGE in r.getMessage()]
+        assert len(errors) == 1 and 'anchor for a' in errors[0].getMessage()
+
+    def test_an_anchor_within_the_tolerance_is_just_young(self, mocker, frozen_clock, caplog):
+        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 4, 'b': 4})
+        with caplog.at_level(logging.DEBUG):
+            assert self.cycle(worker, manager, dsi) == []
+        assert not [r for r in caplog.records if NTP_MESSAGE in r.getMessage()]
+
+    def test_just_past_the_tolerance_it_is_due(self, mocker, frozen_clock):
+        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 6, 'b': 6})
+        assert self.cycle(worker, manager, dsi) == ['a', 'b']
+
+    def test_a_long_check_interval_widens_the_tolerance(self, mocker, frozen_clock):
+        worker, manager, dsi = self.build(
+            mocker, frozen_clock, {'a': 20, 'b': 20}, check_interval=timedelta(minutes=30))
+        assert self.cycle(worker, manager, dsi) == []
+
+    def test_the_error_comes_again_for_a_later_episode(self, mocker, frozen_clock, caplog):
+        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 600}, destinations=('a',))
+        with caplog.at_level(logging.ERROR):
+            self.cycle(worker, manager, dsi)                       # episode 1
+            frozen_clock.advance(timedelta(hours=11))               # the anchor is now past: normal
+            self.cycle(worker, manager, dsi)
+            frozen_clock.advance(-timedelta(hours=11))              # the clock goes back again
+            self.cycle(worker, manager, dsi)                       # episode 2
+        assert len([r for r in caplog.records if NTP_MESSAGE in r.getMessage()]) == 2
+
+    def test_no_anchor_is_due_and_not_an_error(self, mocker, frozen_clock, caplog):
+        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 0, 'b': 0})
+        manager.get_anchor.side_effect = lambda d, dest: None
+        with caplog.at_level(logging.ERROR):
+            assert self.cycle(worker, manager, dsi) == ['a', 'b']
+        assert not caplog.records
+
+
+# ---------------------------------------------------------------------------
+# Dataset order: the remote worker sends ancestors before descendants
+# ---------------------------------------------------------------------------
+
+def _named(*names):
+    import types
+    return [types.SimpleNamespace(name=n) for n in names]
+
+
+def _remote_worker():
+    worker = RemoteBackupWorker(BackupConfig(datasets=[], destinations={}), StopFlag(), client_id="c")
+    worker._remote_manager = MagicMock()
+    return worker
+
+
+class TestRemoteWorkerDatasetOrder:
+    """A child sent before its parent would leave the parent's server dataset as an unowned
+    placeholder that a raw (or encrypted-target) full stream can never replace: the remote worker
+    visits datasets by path depth, shallowest first, and keeps config order within a depth."""
+
+    @staticmethod
+    def order(*names):
+        manager = MagicMock(datasets=_named(*names))
+        return [d.name for d in _remote_worker()._get_datasets(manager)]
+
+    def test_a_child_listed_before_its_parent_is_processed_after_it(self):
+        assert self.order('tank/data/child', 'tank/data') == ['tank/data', 'tank/data/child']
+
+    def test_equal_depth_keeps_config_order(self):
+        assert self.order('tank/b', 'tank/a', 'tank/c') == ['tank/b', 'tank/a', 'tank/c']
+        assert self.order('tank/c', 'tank/a', 'tank/b') == ['tank/c', 'tank/a', 'tank/b']
+
+    def test_mixed_depths(self):
+        assert self.order('tank/x/y', 'tank/b', 'tank/x', 'tank/a/c', 'tank/a') == [
+            'tank/b', 'tank/x', 'tank/a', 'tank/x/y', 'tank/a/c']
+
+    def test_nested_grandparents(self):
+        assert self.order('tank/p/c/g', 'tank/p/c', 'tank/p') == ['tank/p', 'tank/p/c', 'tank/p/c/g']
+        assert self.order('tank/p/c/g', 'tank/q', 'tank/p', 'tank/p/c') == [
+            'tank/q', 'tank/p', 'tank/p/c', 'tank/p/c/g']
+
+    def test_a_pool_root_comes_first(self):
+        assert self.order('tank/a', 'tank') == ['tank', 'tank/a']
+
+    def test_the_config_list_itself_is_not_reordered(self):
+        names = ['tank/p/c', 'tank/p']
+        manager = MagicMock(datasets=_named(*names))
+        before = list(manager.datasets)
+        _remote_worker()._get_datasets(manager)
+        assert manager.datasets == before
+
+    def test_an_empty_list_is_empty(self):
+        assert self.order() == []
+
+    def test_begin_cycle_still_runs_first(self):
+        worker = _remote_worker()
+        worker._get_datasets(MagicMock(datasets=_named('tank/a/b', 'tank/a')))
+        worker._remote_manager.begin_cycle.assert_called_once_with()
+
+
+class TestOtherWorkersKeepConfigOrder:
+    NAMES = ('tank/p/c', 'tank/p', 'tank/q/r', 'tank/q')
+
+    def test_the_snapshot_worker(self, worker_config):
+        manager = MagicMock(datasets=_named(*self.NAMES))
+        result = SnapshotWorker(worker_config, multiprocessing.Event())._get_datasets(manager)
+        assert [d.name for d in result] == list(self.NAMES)
+
+    def test_the_pruning_worker(self, worker_config):
+        received = _named('tank/backups/c1/z/y', 'tank/backups/c1/z')
+        manager = MagicMock(datasets=_named(*self.NAMES))
+        manager.received_datasets.return_value = received
+        result = PruningWorker(worker_config, multiprocessing.Event())._get_datasets(manager)
+        assert [d.name for d in result] == list(self.NAMES) + [d.name for d in received]

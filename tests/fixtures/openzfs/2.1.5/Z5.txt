@@ -1,0 +1,511 @@
+##### SECTION Z5 (raw incremental after zfs change-key, and after change-key -i)  tag=C  zfs-2.1.5-1ubuntu6~22.04.7
+=== CASE Z5/A.00_raw_full
+--- cmd
+zfs send -w zfsbcapc/Z5/cs/ea@a | zfs receive -s -u zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.01_src_keyinfo
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/cs/ea
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/cs/ea	keyformat	passphrase
+zfsbcapc/Z5/cs/ea	keylocation	file:///var/tmp/zfsb-matrix/cap.key1
+zfsbcapc/Z5/cs/ea	pbkdf2iters	350000
+zfsbcapc/Z5/cs/ea	pbkdf2salt	1.34E
+zfsbcapc/Z5/cs/ea	encryptionroot	zfsbcapc/Z5/cs/ea
+zfsbcapc/Z5/cs/ea	keystatus	available
+--- stderr
+=== END
+=== CASE Z5/A.02_srv_keyinfo
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/ea	keyformat	passphrase
+zfsbcapc/Z5/srv/ea	keylocation	prompt
+zfsbcapc/Z5/srv/ea	pbkdf2iters	350000
+zfsbcapc/Z5/srv/ea	pbkdf2salt	1.34E
+zfsbcapc/Z5/srv/ea	encryptionroot	zfsbcapc/Z5/srv/ea
+zfsbcapc/Z5/srv/ea	keystatus	unavailable
+--- stderr
+=== END
+=== CASE Z5/A.10_change_key
+--- cmd
+zfs change-key -o keyformat=passphrase -o keylocation=file:///var/tmp/zfsb-matrix/cap.key2 zfsbcapc/Z5/cs/ea
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.11_src_keyinfo_after
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/cs/ea
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/cs/ea	keyformat	passphrase
+zfsbcapc/Z5/cs/ea	keylocation	file:///var/tmp/zfsb-matrix/cap.key2
+zfsbcapc/Z5/cs/ea	pbkdf2iters	350000
+zfsbcapc/Z5/cs/ea	pbkdf2salt	7.81E
+zfsbcapc/Z5/cs/ea	encryptionroot	zfsbcapc/Z5/cs/ea
+zfsbcapc/Z5/cs/ea	keystatus	available
+--- stderr
+=== END
+=== CASE Z5/A.20_raw_incr_pre_change_snapshot
+--- cmd
+zfs send -w -i zfsbcapc/Z5/cs/ea@a zfsbcapc/Z5/cs/ea@b | zfs receive -s -u zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.21_srv_keyinfo
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/ea	keyformat	passphrase
+zfsbcapc/Z5/srv/ea	keylocation	prompt
+zfsbcapc/Z5/srv/ea	pbkdf2iters	350000
+zfsbcapc/Z5/srv/ea	pbkdf2salt	7.81E
+zfsbcapc/Z5/srv/ea	encryptionroot	zfsbcapc/Z5/srv/ea
+zfsbcapc/Z5/srv/ea	keystatus	unavailable
+--- stderr
+=== END
+=== CASE Z5/A.22_srv_load.k1
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key1 zfsbcapc/Z5/srv/ea
+--- rc
+255
+--- stdout
+--- stderr
+Key load error: Incorrect key provided for 'zfsbcapc/Z5/srv/ea'.
+=== END
+=== CASE Z5/A.22_srv_load.k2
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key2 zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.23_raw_incr_post_change_snapshot
+--- cmd
+zfs send -w -i zfsbcapc/Z5/cs/ea@b zfsbcapc/Z5/cs/ea@d | zfs receive -s -u zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.24_srv_keyinfo
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/ea	keyformat	passphrase
+zfsbcapc/Z5/srv/ea	keylocation	prompt
+zfsbcapc/Z5/srv/ea	pbkdf2iters	350000
+zfsbcapc/Z5/srv/ea	pbkdf2salt	7.81E
+zfsbcapc/Z5/srv/ea	encryptionroot	zfsbcapc/Z5/srv/ea
+zfsbcapc/Z5/srv/ea	keystatus	unavailable
+--- stderr
+=== END
+=== CASE Z5/A.25_srv_load.k1
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key1 zfsbcapc/Z5/srv/ea
+--- rc
+255
+--- stdout
+--- stderr
+Key load error: Incorrect key provided for 'zfsbcapc/Z5/srv/ea'.
+=== END
+=== CASE Z5/A.25_srv_load.k2
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key2 zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.26_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/ea@a	2308432387744665911	1701
+zfsbcapc/Z5/srv/ea@b	15740988016545641308	1706
+zfsbcapc/Z5/srv/ea@d	12538467452752801588	1712
+--- stderr
+=== END
+=== CASE Z5/A.30_raw_full_new_leaf_after_change
+--- cmd
+zfs send -w zfsbcapc/Z5/cs/ea@d | zfs receive -s -u zfsbcapc/Z5/srv/ea_new
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.31_new_keyinfo
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/srv/ea_new
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/ea_new	keyformat	passphrase
+zfsbcapc/Z5/srv/ea_new	keylocation	prompt
+zfsbcapc/Z5/srv/ea_new	pbkdf2iters	350000
+zfsbcapc/Z5/srv/ea_new	pbkdf2salt	7.81E
+zfsbcapc/Z5/srv/ea_new	encryptionroot	zfsbcapc/Z5/srv/ea_new
+zfsbcapc/Z5/srv/ea_new	keystatus	unavailable
+--- stderr
+=== END
+=== CASE Z5/A.32_new_load.k1
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key1 zfsbcapc/Z5/srv/ea_new
+--- rc
+255
+--- stdout
+--- stderr
+Key load error: Incorrect key provided for 'zfsbcapc/Z5/srv/ea_new'.
+=== END
+=== CASE Z5/A.32_new_load.k2
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key2 zfsbcapc/Z5/srv/ea_new
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.40_raw_full_old_snapshot_new_leaf
+--- cmd
+zfs send -w zfsbcapc/Z5/cs/ea@a | zfs receive -s -u zfsbcapc/Z5/srv/ea_old
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.41_old_snapshot_load.k1
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key1 zfsbcapc/Z5/srv/ea_old
+--- rc
+255
+--- stdout
+--- stderr
+Key load error: Incorrect key provided for 'zfsbcapc/Z5/srv/ea_old'.
+=== END
+=== CASE Z5/A.41_old_snapshot_load.k2
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key2 zfsbcapc/Z5/srv/ea_old
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.50_change_key_back
+--- cmd
+zfs change-key -o keyformat=passphrase -o keylocation=file:///var/tmp/zfsb-matrix/cap.key1 zfsbcapc/Z5/cs/ea
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.51_raw_incr_daemon_flags
+--- cmd
+zfs send -w -i zfsbcapc/Z5/cs/ea@d zfsbcapc/Z5/cs/ea@e | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.52_srv_keyinfo
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/ea	keyformat	passphrase
+zfsbcapc/Z5/srv/ea	keylocation	prompt
+zfsbcapc/Z5/srv/ea	pbkdf2iters	350000
+zfsbcapc/Z5/srv/ea	pbkdf2salt	3.45E
+zfsbcapc/Z5/srv/ea	encryptionroot	zfsbcapc/Z5/srv/ea
+zfsbcapc/Z5/srv/ea	keystatus	unavailable
+--- stderr
+=== END
+=== CASE Z5/A.53_srv_load.k1
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key1 zfsbcapc/Z5/srv/ea
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/A.53_srv_load.k2
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key2 zfsbcapc/Z5/srv/ea
+--- rc
+255
+--- stdout
+--- stderr
+Key load error: Incorrect key provided for 'zfsbcapc/Z5/srv/ea'.
+=== END
+=== CASE Z5/B.00_encryptionroot_before
+--- cmd
+zfs get -H -o name,property,value encryptionroot,keystatus zfsbcapc/Z5/cs/eb zfsbcapc/Z5/cs/eb/c zfsbcapc/Z5/cs/eb/c@a
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/cs/eb	encryptionroot	zfsbcapc/Z5/cs/eb
+zfsbcapc/Z5/cs/eb	keystatus	available
+zfsbcapc/Z5/cs/eb/c	encryptionroot	zfsbcapc/Z5/cs/eb/c
+zfsbcapc/Z5/cs/eb/c	keystatus	available
+zfsbcapc/Z5/cs/eb/c@a	encryptionroot	zfsbcapc/Z5/cs/eb/c
+zfsbcapc/Z5/cs/eb/c@a	keystatus	available
+--- stderr
+=== END
+=== CASE Z5/B.10_raw_full_child
+--- cmd
+zfs send -w zfsbcapc/Z5/cs/eb/c@a | zfs receive -s -u zfsbcapc/Z5/srv/ebc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/B.11_srv_keyinfo
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/srv/ebc
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/ebc	keyformat	passphrase
+zfsbcapc/Z5/srv/ebc	keylocation	prompt
+zfsbcapc/Z5/srv/ebc	pbkdf2iters	350000
+zfsbcapc/Z5/srv/ebc	pbkdf2salt	4.97E
+zfsbcapc/Z5/srv/ebc	encryptionroot	zfsbcapc/Z5/srv/ebc
+zfsbcapc/Z5/srv/ebc	keystatus	unavailable
+--- stderr
+=== END
+=== CASE Z5/B.20_change_key_i
+--- cmd
+zfs change-key -i zfsbcapc/Z5/cs/eb/c
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/B.21_encryptionroot_after
+--- cmd
+zfs get -H -o name,property,value encryptionroot,keystatus,keylocation zfsbcapc/Z5/cs/eb zfsbcapc/Z5/cs/eb/c zfsbcapc/Z5/cs/eb/c@a zfsbcapc/Z5/cs/eb/c@b
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/cs/eb	encryptionroot	zfsbcapc/Z5/cs/eb
+zfsbcapc/Z5/cs/eb	keystatus	available
+zfsbcapc/Z5/cs/eb	keylocation	file:///var/tmp/zfsb-matrix/cap.key1
+zfsbcapc/Z5/cs/eb/c	encryptionroot	zfsbcapc/Z5/cs/eb
+zfsbcapc/Z5/cs/eb/c	keystatus	available
+zfsbcapc/Z5/cs/eb/c	keylocation	none
+zfsbcapc/Z5/cs/eb/c@a	encryptionroot	zfsbcapc/Z5/cs/eb
+zfsbcapc/Z5/cs/eb/c@a	keystatus	available
+zfsbcapc/Z5/cs/eb/c@a	keylocation	-
+zfsbcapc/Z5/cs/eb/c@b	encryptionroot	zfsbcapc/Z5/cs/eb
+zfsbcapc/Z5/cs/eb/c@b	keystatus	available
+zfsbcapc/Z5/cs/eb/c@b	keylocation	-
+--- stderr
+=== END
+=== CASE Z5/B.30_raw_incr_pre_snapshot
+--- cmd
+zfs send -w -i zfsbcapc/Z5/cs/eb/c@a zfsbcapc/Z5/cs/eb/c@b | zfs receive -s -u zfsbcapc/Z5/srv/ebc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/B.31_srv_keyinfo
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/srv/ebc
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/ebc	keyformat	passphrase
+zfsbcapc/Z5/srv/ebc	keylocation	prompt
+zfsbcapc/Z5/srv/ebc	pbkdf2iters	350000
+zfsbcapc/Z5/srv/ebc	pbkdf2salt	14.0E
+zfsbcapc/Z5/srv/ebc	encryptionroot	zfsbcapc/Z5/srv/ebc
+zfsbcapc/Z5/srv/ebc	keystatus	unavailable
+--- stderr
+=== END
+=== CASE Z5/B.32_srv_load.k1
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key1 zfsbcapc/Z5/srv/ebc
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/B.32_srv_load.k2
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key2 zfsbcapc/Z5/srv/ebc
+--- rc
+255
+--- stdout
+--- stderr
+Key load error: Incorrect key provided for 'zfsbcapc/Z5/srv/ebc'.
+=== END
+=== CASE Z5/B.40_raw_incr_post_snapshot
+--- cmd
+zfs send -w -i zfsbcapc/Z5/cs/eb/c@b zfsbcapc/Z5/cs/eb/c@c | zfs receive -s -u zfsbcapc/Z5/srv/ebc
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/B.41_srv_keyinfo
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/srv/ebc
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/ebc	keyformat	passphrase
+zfsbcapc/Z5/srv/ebc	keylocation	prompt
+zfsbcapc/Z5/srv/ebc	pbkdf2iters	350000
+zfsbcapc/Z5/srv/ebc	pbkdf2salt	14.0E
+zfsbcapc/Z5/srv/ebc	encryptionroot	zfsbcapc/Z5/srv/ebc
+zfsbcapc/Z5/srv/ebc	keystatus	unavailable
+--- stderr
+=== END
+=== CASE Z5/B.42_srv_load.k1
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key1 zfsbcapc/Z5/srv/ebc
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/B.42_srv_load.k2
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key2 zfsbcapc/Z5/srv/ebc
+--- rc
+255
+--- stdout
+--- stderr
+Key load error: Incorrect key provided for 'zfsbcapc/Z5/srv/ebc'.
+=== END
+=== CASE Z5/B.43_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z5/srv/ebc
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/ebc@a	17585372638106130403	1748
+zfsbcapc/Z5/srv/ebc@b	16882786833099289039	1753
+zfsbcapc/Z5/srv/ebc@c	8404643574520491618	1759
+--- stderr
+=== END
+=== CASE Z5/B.50_raw_full_post_snapshot_new_leaf
+--- cmd
+zfs send -w zfsbcapc/Z5/cs/eb/c@c | zfs receive -s -u zfsbcapc/Z5/srv/ebc_new
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/B.51_new_keyinfo
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/srv/ebc_new
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/ebc_new	keyformat	passphrase
+zfsbcapc/Z5/srv/ebc_new	keylocation	prompt
+zfsbcapc/Z5/srv/ebc_new	pbkdf2iters	350000
+zfsbcapc/Z5/srv/ebc_new	pbkdf2salt	14.0E
+zfsbcapc/Z5/srv/ebc_new	encryptionroot	zfsbcapc/Z5/srv/ebc_new
+zfsbcapc/Z5/srv/ebc_new	keystatus	unavailable
+--- stderr
+=== END
+=== CASE Z5/B.52_new_load.k1
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key1 zfsbcapc/Z5/srv/ebc_new
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/B.52_new_load.k2
+--- cmd
+zfs load-key -L file:///var/tmp/zfsb-matrix/cap.key2 zfsbcapc/Z5/srv/ebc_new
+--- rc
+255
+--- stdout
+--- stderr
+Key load error: Incorrect key provided for 'zfsbcapc/Z5/srv/ebc_new'.
+=== END
+=== CASE Z5/C.00_raw_parent
+--- cmd
+zfs send -w zfsbcapc/Z5/cs/eb@a | zfs receive -s -u zfsbcapc/Z5/srv/eb
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/C.01_raw_child_under_raw_parent
+--- cmd
+zfs send -w zfsbcapc/Z5/cs/eb/c@c | zfs receive -s -u zfsbcapc/Z5/srv/eb/c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z5/C.02_srv_keyinfo
+--- cmd
+zfs get -H -o name,property,value keyformat,keylocation,pbkdf2iters,pbkdf2salt,encryptionroot,keystatus zfsbcapc/Z5/srv/eb zfsbcapc/Z5/srv/eb/c
+--- rc
+0
+--- stdout
+zfsbcapc/Z5/srv/eb	keyformat	passphrase
+zfsbcapc/Z5/srv/eb	keylocation	prompt
+zfsbcapc/Z5/srv/eb	pbkdf2iters	350000
+zfsbcapc/Z5/srv/eb	pbkdf2salt	14.0E
+zfsbcapc/Z5/srv/eb	encryptionroot	zfsbcapc/Z5/srv/eb
+zfsbcapc/Z5/srv/eb	keystatus	unavailable
+zfsbcapc/Z5/srv/eb/c	keyformat	passphrase
+zfsbcapc/Z5/srv/eb/c	keylocation	prompt
+zfsbcapc/Z5/srv/eb/c	pbkdf2iters	350000
+zfsbcapc/Z5/srv/eb/c	pbkdf2salt	14.0E
+zfsbcapc/Z5/srv/eb/c	encryptionroot	zfsbcapc/Z5/srv/eb/c
+zfsbcapc/Z5/srv/eb/c	keystatus	unavailable
+--- stderr
+=== END

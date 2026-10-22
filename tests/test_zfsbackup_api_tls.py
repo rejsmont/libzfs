@@ -2958,3 +2958,146 @@ class TestRealDaemonTls:
                 assert identity.fingerprint_der(tls_sock.getpeercert(binary_form=True)) == fingerprint
         self._stop(d)
         assert files == {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in tls.iterdir()}
+
+
+# ===========================================================================
+# R1: the per-dataset claim is released before the final `ok`, over real TLS
+# ===========================================================================
+
+
+@pytest.mark.integration
+class TestStreamClaimReleasedBeforeOkOverTls:
+    """The real `/stream` route (flask-sock over the per-connection TLS server, the client
+    authenticated by its pinned certificate), with only `zfs` faked: a client that opens its
+    next stream the moment it reads `ok` must not be told `busy`.
+
+    The server's tail after `ok` (back in `_receive_stream`: its `finally` and the gate) is
+    stretched to `ACK_TAIL` seconds by delaying the return of the `ok` send, so the second
+    stream deterministically arrives while the first handler is still running. Before R1 that
+    window was the whole difference; after it the claim is already free."""
+
+    ACK_TAIL = 1.0
+    SERVER_DS = "pool/backups/alice/pool/data"
+    BUSY = {"error": "busy", "retry": True}
+
+    @pytest.fixture
+    def rig(self, pki, mocker):
+        import types
+        from unittest.mock import MagicMock, PropertyMock
+
+        import simple_websocket
+
+        from zfsbackup.backup_manager import DatasetManager
+        from zfsbackup.config import RemoteServerConfig
+
+        pki.pin_alice()
+        mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
+        mocker.patch("zfsbackup.api.read_zfsbackup_properties", return_value={})
+        mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
+        mocker.patch(
+            "zfsbackup.api.zfs.get.value",
+            return_value=api.canonical_dataset_config(DatasetConfig(name="pool/data").to_property()),
+        )
+        writers = []
+
+        def new_writer(*args, **kwargs):
+            writers.append(MagicMock())
+            return writers[-1]
+
+        mocker.patch("zfsbackup.api.zfs.receive.filesystem", side_effect=new_writer)
+        ok_sent_at = []
+        tail = self.ACK_TAIL
+        real_send = simple_websocket.Server.send
+
+        def slow_ok_send(self, data, *args, **kwargs):
+            real_send(self, data, *args, **kwargs)
+            if data == json.dumps({"status": "ok"}):
+                ok_sent_at.append(time.monotonic())
+                time.sleep(tail)           # the handler's tail, after the client has `ok`
+
+        mocker.patch.object(simple_websocket.Server, "send", slow_ok_send)
+        config = BackupConfig(
+            datasets=[DatasetConfig(name="pool/data")],
+            remote_backup=RemoteServerConfig(target_dataset="pool/backups", enabled=True),
+        )
+        app = api.create_app(config, pki.gateway, pki.server.fingerprint)
+        return types.SimpleNamespace(
+            app=app, gate=app.extensions["zfsbackup.stream_gate"], writers=writers,
+            ok_sent_at=ok_sent_at, ctx=insecure_client_context(pki.alice),
+        )
+
+    @staticmethod
+    def _open(port, ctx):
+        import websocket
+
+        from zfsbackup.protocol import protocol_headers
+
+        raw = socket.create_connection((LOOPBACK, port), timeout=IO_TIMEOUT)
+        tls = ctx.wrap_socket(raw)
+        ws = websocket.WebSocket()
+        ws.connect(
+            f"wss://{LOOPBACK}:{port}/backup/alice/pool/data/stream?mode=fresh",
+            socket=tls, timeout=IO_TIMEOUT, header=protocol_headers(),
+        )
+        return ws
+
+    @classmethod
+    def _stream(cls, port, ctx, chunks=3):
+        """Open a stream, send `chunks` chunks and `done`; -> (ws, the first reply)."""
+        ws = cls._open(port, ctx)
+        for _ in range(chunks):
+            ws.send_binary(b"x" * 4096)
+        ws.send(json.dumps({"done": True}))
+        return ws, json.loads(ws.recv())
+
+    def test_the_next_stream_right_after_ok_is_served_not_busy(self, pki, rig):
+        opened = []
+        with Serving(rig.app, pki.gateway) as s:
+            try:
+                first, reply = self._stream(s.port, rig.ctx)
+                opened.append(first)
+                assert reply == {"status": "ok"}
+                got_ok = time.monotonic()
+                # ...at once, without waiting for the first handler to return:
+                second, reply = self._stream(s.port, rig.ctx)
+                opened.append(second)
+                assert reply == {"status": "ok"}, reply            # not 'busy'
+                assert time.monotonic() - got_ok < self.ACK_TAIL, (
+                    "the second stream was not concurrent with the first handler's tail"
+                )
+                assert len(rig.writers) == 2
+                for writer in rig.writers:
+                    writer.close.assert_called_once()
+            finally:
+                for ws in opened:
+                    with contextlib.suppress(Exception):
+                        ws.close()
+                assert _eventually(lambda: rig.gate.active == 0, timeout=30)
+        assert len(rig.ok_sent_at) == 2
+
+    def test_the_claim_is_held_while_a_stream_is_still_receiving(self, pki, rig):
+        """The control: with the first stream still open (no `done` yet) the second one IS
+        refused, so the test above passes because of the early release, not because the
+        claims never collide."""
+        opened = []
+        with Serving(rig.app, pki.gateway) as s:
+            try:
+                first = self._open(s.port, rig.ctx)
+                opened.append(first)
+                first.send_binary(b"x" * 4096)
+                assert _eventually(lambda: rig.gate.active == 1, timeout=20)
+                second = self._open(s.port, rig.ctx)
+                opened.append(second)
+                second.send(json.dumps({"done": True}))
+                assert json.loads(second.recv()) == self.BUSY
+                first.send(json.dumps({"done": True}))
+                assert json.loads(first.recv()) == {"status": "ok"}
+                # once the first has been answered the name is free again
+                third, reply = self._stream(s.port, rig.ctx)
+                opened.append(third)
+                assert reply == {"status": "ok"}
+            finally:
+                for ws in opened:
+                    with contextlib.suppress(Exception):
+                        ws.close()
+                assert _eventually(lambda: rig.gate.active == 0, timeout=30)

@@ -84,7 +84,8 @@ from zfsbackup.config.store.mapper import CONFIG_TABLES, PRESERVED_TABLES
 pytestmark = pytest.mark.unit
 
 BASELINE = "a1c28e1b3f34"
-TLS_HEAD = "7c3e9d51b2a8"
+TLS_HEAD = "7c3e9d51b2a8"       # the TLS revision: no longer the head
+RAW_HEAD = "5d2f8a60c1e4"       # the head: adds dataset_remotes.raw (milestone B)
 
 HEX = "0123456789abcdef" * 4          # a canonical 64-hex value
 HEX2 = "fedcba9876543210" * 4
@@ -868,7 +869,12 @@ def assert_old_rows_intact(db_path):
         BASELINE_ROWS["global_settings"][0]]
     assert table_rows(db_path, "datasets") == BASELINE_ROWS["datasets"]
     assert table_rows(db_path, "destinations", "name, url") == BASELINE_ROWS["destinations"]
-    assert table_rows(db_path, "dataset_remotes") == BASELINE_ROWS["dataset_remotes"]
+    # The five columns every revision has; `raw` (head only) is checked by
+    # test_zfsbackup_store_raw.py -- here it is only required to be NULL when present.
+    assert table_rows(db_path, "dataset_remotes", "id, dataset_id, destination_name, "
+                      "frequency_seconds, frequency_literal") == BASELINE_ROWS["dataset_remotes"]
+    if "raw" in column_names(db_path, "dataset_remotes"):
+        assert q(db_path, "SELECT count(*) FROM dataset_remotes WHERE raw IS NOT NULL") == [(0,)]
     assert table_rows(db_path, "retention_rules") == BASELINE_ROWS["retention_rules"]
     assert table_rows(db_path, "remote_server") == BASELINE_ROWS["remote_server"]
 
@@ -892,15 +898,15 @@ class TestUpgradeFromTheBaselineWithData:
         with open_config_connection(resolved, readonly=True) as conn:
             with pytest.raises(SchemaOutOfDate) as excinfo:
                 check_schema(conn)
-        assert BASELINE in str(excinfo.value) and TLS_HEAD in str(excinfo.value)
+        assert BASELINE in str(excinfo.value) and RAW_HEAD in str(excinfo.value)
         assert excinfo.value.recorded_revisions == (BASELINE,)
 
     def test_upgrade_reaches_the_new_head_and_keeps_every_row(self, old):
         resolved, db = old
         result = upgrade_schema(resolved)
         dispose_all()
-        assert result.changed and result.from_revs == (BASELINE,) and result.to_rev == TLS_HEAD
-        assert q(db, "SELECT version_num FROM alembic_version") == [(TLS_HEAD,)]
+        assert result.changed and result.from_revs == (BASELINE,) and result.to_rev == RAW_HEAD
+        assert q(db, "SELECT version_num FROM alembic_version") == [(RAW_HEAD,)]
         assert_old_rows_intact(db)
 
     def test_user_version_survives_the_table_rebuilds(self, old):
@@ -1054,7 +1060,7 @@ class TestUpgradeFromTheBaselineWithData:
         upgrade_schema(resolved)
         dispose_all()
         _alembic(resolved, "downgrade", BASELINE)
-        _alembic(resolved, "upgrade", TLS_HEAD)
+        _alembic(resolved, "upgrade", RAW_HEAD)       # the real head, so `raw` is compared too
         ref_engine = make_engine(f"sqlite:///{tmp_path / 'ref.db'}")
         Base.metadata.create_all(ref_engine)
         mig_engine = make_engine(f"sqlite:///{db}")
@@ -1364,7 +1370,7 @@ class TestConfigSnapshotClientId:
         sql_exec(stored, [("INSERT INTO host_identity (id, client_id, created_at) VALUES (1,'h',1.0)",)])
         snap = read_config(stored)
         dispose_all()
-        assert snap.config.snapshot_prefix == "zb" and snap.schema_rev == TLS_HEAD
+        assert snap.config.snapshot_prefix == "zb" and snap.schema_rev == RAW_HEAD
         assert snap.config.destinations["offsite"].server_fingerprint == HEX
         assert snap.config.client_cert_file == Path("/etc/zfsbackup/client.crt")
         assert not hasattr(snap.config, "client_id_file")
