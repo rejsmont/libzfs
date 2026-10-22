@@ -91,7 +91,14 @@ from zfsbackup.config.store.paths import (
     open_config_connection,
 )
 
-__all__ = ["BackupError", "BackupInfo", "backup_database"]
+__all__ = [
+    "BackupBusy",
+    "BackupError",
+    "BackupInfo",
+    "BackupPublishError",
+    "BackupSourceError",
+    "backup_database",
+]
 
 #: Name used when `dst` is an existing directory.
 DEFAULT_BACKUP_NAME = "config.db"
@@ -107,7 +114,24 @@ _BACKUP_MODE = 0o600
 
 
 class BackupError(RuntimeError):
-    """The backup could not be made, and nothing was published."""
+    """The backup could not be made, and nothing was published.
+
+    Callers branch on the subclasses, never on the message text.
+    """
+
+
+class BackupBusy(BackupError):
+    """The source stayed locked past the deadline; retry later (CLI: 75)."""
+
+
+class BackupSourceError(BackupError):
+    """The source database cannot be backed up as it is: not in WAL mode,
+    oversized, failing `quick_check`, or unreadable mid-copy (CLI: 78)."""
+
+
+class BackupPublishError(BackupError):
+    """The copy was made but could not be published durably: no hard links on
+    the destination filesystem, or the directory fsync failed (CLI: 1)."""
 
 
 class BackupInfo(NamedTuple):
@@ -169,7 +193,7 @@ def _snapshot_to_memory(source: sqlite3.Connection, where: Path) -> sqlite3.Conn
     the refusals described in the module docstring."""
     mode = source.execute("PRAGMA journal_mode").fetchone()[0]
     if str(mode).lower() != "wal":
-        raise BackupError(
+        raise BackupSourceError(
             f"{where} is not in WAL journal mode (it is {mode!r}); refusing "
             "to back it up online, because a writer could make the copy wait "
             "without end. The store switches a database to WAL on its first "
@@ -179,7 +203,7 @@ def _snapshot_to_memory(source: sqlite3.Connection, where: Path) -> sqlite3.Conn
     pages = source.execute("PRAGMA page_count").fetchone()[0]
     size = pages * source.execute("PRAGMA page_size").fetchone()[0]
     if size > MAX_BACKUP_BYTES:
-        raise BackupError(
+        raise BackupSourceError(
             f"{where} is {size} bytes, larger than the {MAX_BACKUP_BYTES} "
             "byte limit for an online backup; this is not a plausible "
             "zfsbackup config database"
@@ -188,7 +212,7 @@ def _snapshot_to_memory(source: sqlite3.Connection, where: Path) -> sqlite3.Conn
 
     def _progress(status: int, remaining: int, total: int) -> None:
         if time.monotonic() > deadline:
-            raise BackupError(
+            raise BackupBusy(
                 f"backup of {where} did not finish within "
                 f"{BACKUP_DEADLINE_SECONDS:.0f}s (the database stayed locked)"
             )
@@ -216,10 +240,11 @@ def backup_database(
     never overwritten); `ConfigPathError` subclasses for a source
     path/permission problem (the store's preflight, which requires write
     access to the database and its directory) or a destination that cannot be
-    written (`ConfigDbPermissionError`); `BackupError` for a non-WAL or
-    oversized source, a copy that exceeds its deadline or fails
-    `PRAGMA quick_check`, a filesystem without hard links, or a failure to make
-    the result durable. Nothing is left under the final name on failure.
+    written (`ConfigDbPermissionError`); `BackupError` subclasses: `BackupSourceError` (non-WAL or
+    oversized source, failed `PRAGMA quick_check`, unreadable mid-copy),
+    `BackupBusy` (the copy exceeded its deadline, or the source stayed locked),
+    `BackupPublishError` (a filesystem without hard links, or a failure to make
+    the result durable). Nothing is left under the final name on failure.
 
     Returns `BackupInfo(store_id, generation, schema_rev, sha256)`, read from
     the COPY (so they describe exactly the bytes written and hashed). See the
@@ -252,12 +277,15 @@ def backup_database(
             try:
                 memory = _snapshot_to_memory(source, resolved.path)
             except sqlite3.OperationalError as exc:
-                raise BackupError(f"backup of {resolved.path} failed: {exc}") from exc
+                # SQLITE_BUSY (5) / SQLITE_LOCKED (6), primary codes.
+                busy = (getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF in (5, 6)
+                cls = BackupBusy if busy else BackupSourceError
+                raise cls(f"backup of {resolved.path} failed: {exc}") from exc
         # The source connection (and its WAL read mark) is gone from here on.
         try:
             check = _scalar(memory, "PRAGMA quick_check")
             if check != "ok":
-                raise BackupError(
+                raise BackupSourceError(
                     f"backup of {resolved.path} failed quick_check: {check}"
                 )
             store_id = int(_scalar(memory, "PRAGMA user_version") or 0)
@@ -293,7 +321,7 @@ def backup_database(
         except FileExistsError:
             raise FileExistsError(_exists_message(target)) from None
         except OSError as exc:
-            raise BackupError(
+            raise BackupPublishError(
                 f"cannot publish the backup as {target}: {exc.strerror or exc}. "
                 "The destination filesystem must support hard links (a plain "
                 "rename could overwrite a concurrent backup)."
@@ -305,7 +333,7 @@ def backup_database(
         try:
             _fsync_dir(directory)
         except OSError as exc:
-            raise BackupError(
+            raise BackupPublishError(
                 f"could not make the backup {target} durable (fsync of "
                 f"{directory} failed: {exc.strerror or exc}); it was removed"
             ) from exc

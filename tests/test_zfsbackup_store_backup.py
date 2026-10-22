@@ -76,8 +76,11 @@ from zfsbackup.config import store as store_package
 from zfsbackup.config.store import (
     EXPECTED_HEAD,
     KNOWN_REVISIONS,
+    BackupBusy,
     BackupError,
     BackupInfo,
+    BackupPublishError,
+    BackupSourceError,
     ConfigDbPermissionError,
     ConfigSnapshot,
     SchemaOutOfDate,
@@ -895,13 +898,13 @@ class TestRefusals:
         conn = sqlite3.connect(str(db_path))
         assert conn.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
         conn.close()
-        with pytest.raises(BackupError, match="WAL"):
+        with pytest.raises(BackupSourceError, match="WAL"):
             backup_database(seeded, out_dir / "b.db")
         assert names(out_dir) == []
 
     def test_a_source_over_the_size_cap_is_refused(self, seeded, out_dir, monkeypatch):
         monkeypatch.setattr(backup_module, "MAX_BACKUP_BYTES", 1000)
-        with pytest.raises(BackupError, match="limit"):
+        with pytest.raises(BackupSourceError, match="limit"):
             backup_database(seeded, out_dir / "b.db")
         assert names(out_dir) == []
 
@@ -918,12 +921,71 @@ class TestRefusals:
 
     def test_the_progress_deadline_raises_backup_error(self, seeded, out_dir, monkeypatch):
         monkeypatch.setattr(backup_module, "BACKUP_DEADLINE_SECONDS", -1.0)
-        with pytest.raises(BackupError, match="did not finish"):
+        with pytest.raises(BackupBusy, match="did not finish"):
             backup_database(seeded, out_dir / "b.db")
         assert names(out_dir) == []
 
     def test_backup_error_is_a_runtime_error(self):
         assert issubclass(BackupError, RuntimeError)
+
+    def test_the_subclasses_are_distinct_backup_errors_exported_by_the_store(self):
+        subclasses = (BackupBusy, BackupSourceError, BackupPublishError)
+        for cls in subclasses:
+            assert issubclass(cls, BackupError) and cls is not BackupError
+            assert cls.__name__ in store_package.__all__
+            assert getattr(store_package, cls.__name__) is cls
+            assert getattr(backup_module, cls.__name__) is cls
+        assert "BackupError" in store_package.__all__
+        for a in subclasses:                      # siblings: no one catches another's
+            for b in subclasses:
+                assert a is b or not issubclass(a, b)
+
+    def test_every_refusal_is_still_caught_as_a_backup_error(
+        self, seeded, db_path, out_dir, monkeypatch
+    ):
+        monkeypatch.setattr(backup_module, "BACKUP_DEADLINE_SECONDS", -1.0)
+        with pytest.raises(BackupError):
+            backup_database(seeded, out_dir / "b.db")
+        monkeypatch.undo()
+        monkeypatch.setattr(backup_module, "MAX_BACKUP_BYTES", 1)
+        with pytest.raises(BackupError):
+            backup_database(seeded, out_dir / "b.db")
+        assert names(out_dir) == []
+
+    @pytest.mark.parametrize("code", [5, 6, 261, 517, 262])
+    def test_a_busy_or_locked_error_mid_copy_is_backup_busy(
+        self, seeded, out_dir, monkeypatch, code
+    ):
+        """SQLITE_BUSY (5) / SQLITE_LOCKED (6) and their extended codes (the low
+        byte is the primary code). Mocked: a real BUSY cannot be reached now that
+        a non-WAL source is refused."""
+        def locked(source, where):
+            exc = sqlite3.OperationalError("database is locked")
+            exc.sqlite_errorcode = code
+            raise exc
+
+        monkeypatch.setattr(backup_module, "_snapshot_to_memory", locked)
+        with pytest.raises(BackupBusy) as excinfo:
+            backup_database(seeded, out_dir / "b.db")
+        assert isinstance(excinfo.value.__cause__, sqlite3.OperationalError)
+        assert not isinstance(excinfo.value, BackupSourceError)
+        assert names(out_dir) == []
+
+    @pytest.mark.parametrize("code", [1, 10, 11, 14, 266, None])
+    def test_any_other_operational_error_mid_copy_is_a_source_error(
+        self, seeded, out_dir, monkeypatch, code
+    ):
+        def broken(source, where):
+            exc = sqlite3.OperationalError("disk I/O error")
+            if code is not None:
+                exc.sqlite_errorcode = code
+            raise exc
+
+        monkeypatch.setattr(backup_module, "_snapshot_to_memory", broken)
+        with pytest.raises(BackupSourceError) as excinfo:
+            backup_database(seeded, out_dir / "b.db")
+        assert not isinstance(excinfo.value, BackupBusy)
+        assert names(out_dir) == []
 
     def test_a_failed_quick_check_publishes_nothing(self, seeded, out_dir, monkeypatch):
         real = backup_module._scalar
@@ -932,14 +994,14 @@ class TestRefusals:
             return "*** in database main ***" if statement == "PRAGMA quick_check" else real(conn, statement)
 
         monkeypatch.setattr(backup_module, "_scalar", scalar)
-        with pytest.raises(BackupError, match="quick_check"):
+        with pytest.raises(BackupSourceError, match="quick_check"):
             backup_database(seeded, out_dir / "b.db")
         assert names(out_dir) == []
 
     def test_a_failure_leaves_a_previous_backup_alone(self, seeded, out_dir, monkeypatch):
         first = backup_database(seeded, out_dir / "good.db")
         monkeypatch.setattr(backup_module, "BACKUP_DEADLINE_SECONDS", -1.0)
-        with pytest.raises(BackupError):
+        with pytest.raises(BackupBusy):
             backup_database(seeded, out_dir / "next.db")
         assert names(out_dir) == ["good.db"]
         assert sha256(out_dir / "good.db") == first.sha256
@@ -947,7 +1009,7 @@ class TestRefusals:
     def test_a_failure_leaves_the_source_alone(self, seeded, db_path, out_dir, monkeypatch):
         before = dump(db_path)
         monkeypatch.setattr(backup_module, "BACKUP_DEADLINE_SECONDS", -1.0)
-        with pytest.raises(BackupError):
+        with pytest.raises(BackupBusy):
             backup_database(seeded, out_dir / "b.db")
         dispose_all()
         assert dump(db_path) == before
@@ -1027,7 +1089,7 @@ class TestPublish:
             raise OSError(errno.EIO, "Input/output error")
 
         monkeypatch.setattr(backup_module, "_fsync_dir", failing)
-        with pytest.raises(BackupError, match="durable"):
+        with pytest.raises(BackupPublishError, match="durable"):
             backup_database(seeded, out_dir / "b.db")
         assert names(out_dir) == []                 # not the final name, not the temporary one
 
@@ -1035,7 +1097,7 @@ class TestPublish:
         monkeypatch.setattr(
             backup_module, "_fsync_dir", lambda d: (_ for _ in ()).throw(OSError(errno.EIO, "x"))
         )
-        with pytest.raises(BackupError):
+        with pytest.raises(BackupPublishError):
             backup_database(seeded, out_dir)
         assert names(out_dir) == []
 
@@ -1057,9 +1119,24 @@ class TestPublish:
             raise PermissionError(errno.EPERM, "Operation not permitted")
 
         monkeypatch.setattr(backup_module.os, "link", eperm)
-        with pytest.raises(BackupError, match="hard links"):
+        with pytest.raises(BackupPublishError, match="hard links"):
             backup_database(seeded, out_dir / "b.db")
         monkeypatch.undo()
+        assert names(out_dir) == []
+
+    @pytest.mark.parametrize("code", [errno.EPERM, errno.EXDEV, errno.EMLINK, errno.ENOTSUP, errno.EIO])
+    def test_any_link_oserror_is_a_publish_error_not_a_source_error(
+        self, seeded, out_dir, monkeypatch, code
+    ):
+        def failing(src, dst, *args, **kwargs):
+            raise OSError(code, os.strerror(code))
+
+        monkeypatch.setattr(backup_module.os, "link", failing)
+        with pytest.raises(BackupPublishError) as excinfo:
+            backup_database(seeded, out_dir / "b.db")
+        monkeypatch.undo()
+        assert not isinstance(excinfo.value, (BackupBusy, BackupSourceError))
+        assert isinstance(excinfo.value.__cause__, OSError)
         assert names(out_dir) == []
 
     def test_there_is_no_overwriting_rename_fallback(self, seeded, out_dir, monkeypatch):
@@ -1067,7 +1144,7 @@ class TestPublish:
         monkeypatch.setattr(backup_module.os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError(errno.EXDEV, "x")))
         monkeypatch.setattr(backup_module.os, "rename", lambda *a, **k: replaced.append(a))
         monkeypatch.setattr(backup_module.os, "replace", lambda *a, **k: replaced.append(a))
-        with pytest.raises(BackupError):
+        with pytest.raises(BackupPublishError):
             backup_database(seeded, out_dir / "b.db")
         monkeypatch.undo()
         assert replaced == [] and names(out_dir) == []

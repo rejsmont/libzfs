@@ -463,7 +463,7 @@ def api_server(server_config_db, tmp_path, source_fs, target_root):
 
     def launch():
         stop = StopFlag()
-        worker = ApiWorker(snapshot.config, stop, verbose=False, config_db=server_config_db)
+        worker = ApiWorker(snapshot.config, stop, config_db=server_config_db)
         worker.start()
         running.update(stop=stop, worker=worker)
         deadline = time.monotonic() + 30
@@ -2033,3 +2033,105 @@ class TestRealUserPropertyLimit:
         assert len(value) == 8188
         zfs.set(source_fs, {PROP_CONFIG: value})
         assert _zfs_get_local(source_fs.name, PROP_CONFIG) == value
+
+
+# ---------------------------------------------------------------------------
+# TestRealCheck (C13: `zfsbackup-config check` against real snapshots)
+# ---------------------------------------------------------------------------
+
+class TestRealCheck:
+    """`check` reads real `zfs list` / `zfs get` output: a dataset with a managed snapshot is OK, the lack of a
+    daemon is CRIT (exit 1), a backdated newest snapshot is CRIT, and `--prometheus --output` writes a
+    parseable file. Read-only: the database is only imported, nothing is signalled."""
+
+    @staticmethod
+    def _database(tmp_path, source_fs):
+        from click.testing import CliRunner
+        from zfsbackup.cli.main import cli
+
+        source = tmp_path / 'check.yaml'
+        source.write_text(
+            'snapshot_prefix: "autosnap"\n'
+            'check_interval: "5m"\n'
+            'datasets:\n'
+            f'  - name: "{source_fs.name}"\n'
+            '    frequency: "1h"\n'
+            '    retention:\n'
+            '      "1d": "30d"\n'
+        )
+        database = tmp_path / 'cfg' / 'config.db'
+        result = CliRunner().invoke(cli, ['-c', str(database), 'import', str(source)], prog_name='zfsbackup-config')
+        assert result.exit_code == 0, result.output
+        return database
+
+    @staticmethod
+    def _check(database, *args):
+        from click.testing import CliRunner
+        from zfsbackup.cli.main import cli
+
+        result = CliRunner().invoke(
+            cli, ['-c', str(database), 'check', *args], prog_name='zfsbackup-config')
+        return result
+
+    @staticmethod
+    def _entries(result):
+        import json as _json
+
+        data = _json.loads(result.stdout)
+        return data, {(e['source'], e['subject']): e for e in data['entries']}
+
+    def test_a_fresh_managed_snapshot_is_ok_and_no_daemon_is_crit(self, source_fs, tmp_path):
+        database = self._database(tmp_path, source_fs)
+        zfs.snapshot(source_fs, snap_name_at(0.2))
+        result = self._check(database, '--json')
+        data, entries = self._entries(result)
+        assert entries[('snapshot', source_fs.name)]['state'] == 'OK'
+        assert entries[('snapshot', source_fs.name)]['age_seconds'] < 3600
+        assert entries[('daemon', 'process')]['state'] == 'CRIT'
+        assert data['state'] == 'CRIT'
+        assert result.exit_code == 1
+
+    def test_a_backdated_newest_snapshot_is_crit(self, source_fs, tmp_path):
+        database = self._database(tmp_path, source_fs)
+        zfs.snapshot(source_fs, snap_name_at(5))      # 5 h old against a 1 h frequency: past the 4 h crit
+        result = self._check(database, '--json')
+        _, entries = self._entries(result)
+        assert entries[('snapshot', source_fs.name)]['state'] == 'CRIT'
+        assert result.exit_code == 1
+        assert self._check(database, '--nagios').exit_code == 2
+
+    def test_no_managed_snapshot_is_crit(self, source_fs, tmp_path):
+        database = self._database(tmp_path, source_fs)
+        zfs.snapshot(source_fs, 'manual_snap')        # unmanaged: does not count
+        _, entries = self._entries(self._check(database, '--json'))
+        assert entries[('snapshot', source_fs.name)]['state'] == 'CRIT'
+        assert 'no managed snapshots' in entries[('snapshot', source_fs.name)]['reason']
+
+    def test_prometheus_output_file_is_written_and_parseable(self, source_fs, tmp_path):
+        import os
+        import re
+
+        database = self._database(tmp_path, source_fs)
+        zfs.snapshot(source_fs, snap_name_at(0.2))
+        target = tmp_path / 'prom' / 'zfsbackup.prom'
+        target.parent.mkdir()
+        result = self._check(database, '--prometheus', '--output', str(target))
+        assert result.exit_code == 0                  # with --output the exit code says the file was written
+        assert result.stdout == ''
+        assert os.stat(target).st_mode & 0o7777 == 0o644
+        assert [p.name for p in target.parent.iterdir()] == ['zfsbackup.prom']
+        sample = re.compile(r'^[a-zA-Z_:][a-zA-Z0-9_:]*(\{([a-z_]+="([^"\\\n]|\\.)*",?)*\})? -?[0-9.e+-]+$')
+        samples = [l for l in target.read_text().splitlines() if not l.startswith('#')]
+        assert samples and all(sample.match(s) for s in samples), samples
+        assert f'zfsbackup_snapshot_check_state{{dataset="{source_fs.name}"}} 0' in samples
+        assert 'zfsbackup_check_success 0' in samples            # ... and the verdict (no daemon) is in the file
+        assert any(s.startswith(f'zfsbackup_snapshot_age_seconds{{dataset="{source_fs.name}"}} ') for s in samples)
+
+    def test_check_changes_nothing_on_the_pool(self, source_fs, tmp_path):
+        database = self._database(tmp_path, source_fs)
+        zfs.snapshot(source_fs, snap_name_at(0.2))
+        before = list_real_snapshot_names(source_fs.name)
+        self._check(database)
+        self._check(database, '--json')
+        assert list_real_snapshot_names(source_fs.name) == before
+        assert _zfs_get_local(source_fs.name, PROP_CONFIG) in (None, '-', '')
