@@ -873,6 +873,7 @@ def _rich_config(**over) -> BackupConfig:
                         retention_rules=[
                             RetentionRule(age=Duration('2d'), keep_for=Duration('8w')),
                         ],
+                        raw=True,
                     )
                 ],
             ),
@@ -1783,3 +1784,168 @@ class TestFromPropertyIsStrict:
         assert restored.recursive == cfg.recursive and restored.enabled == cfg.enabled
         assert restored.frequency == cfg.frequency
         assert restored.to_property() == encoded
+
+
+# ---------------------------------------------------------------------------
+# Milestone B (B3): the per-destination `raw` setting
+# ---------------------------------------------------------------------------
+
+
+def _raw_dataset(**remote_entry) -> dict:
+    """A `datasets[]` mapping with one remote entry, as parsed YAML hands it over."""
+    return {
+        'name': 'pool/a',
+        'remote': [{'destination': 'offsite', **remote_entry}],
+    }
+
+
+@pytest.mark.unit
+class TestRemoteRawParse:
+    """`DatasetConfig.from_dict` reads `raw` through `_raw_from_config`: `true`,
+    `false`, `auto` and an omitted key are the only accepted spellings. The
+    stream format of the server copy cannot change without a full re-send, so
+    nothing else is guessed at."""
+
+    def test_the_field_defaults_to_auto(self):
+        assert RemoteDatasetConfig(destination='d').raw is None
+
+    def test_an_omitted_key_is_auto(self):
+        remote = DatasetConfig.from_dict(_raw_dataset()).remote[0]
+        assert remote.raw is None
+
+    @pytest.mark.parametrize('value, expected', [
+        (True, True),
+        (False, False),
+        ('auto', None),
+        (None, None),            # `raw:` with nothing after it: the same as omitted
+    ])
+    def test_accepted_values(self, value, expected):
+        remote = DatasetConfig.from_dict(_raw_dataset(raw=value)).remote[0]
+        assert remote.raw is expected
+
+    def test_false_is_not_confused_with_auto(self):
+        # `False` is falsy like `None`; a `value or None` shortcut would merge them.
+        assert DatasetConfig.from_dict(_raw_dataset(raw=False)).remote[0].raw is False
+
+    @pytest.mark.parametrize('value', [
+        1, 0, 2, -1, 1.0, 0.0,
+        'true', 'false', 'True', 'yes', 'no', 'on', 'AUTO', 'Auto', 'auto ', '', 'maybe',
+        [], [True], {}, {'raw': True},
+    ], ids=repr)
+    def test_refused_values(self, value):
+        with pytest.raises(ValueError, match=r"datasets\[pool/a\]\.remote\[offsite\]\.raw"):
+            DatasetConfig.from_dict(_raw_dataset(raw=value))
+
+    def test_the_error_says_what_is_accepted_and_what_was_given(self):
+        with pytest.raises(ValueError) as excinfo:
+            DatasetConfig.from_dict(_raw_dataset(raw=1))
+        assert 'true, false or auto' in str(excinfo.value)
+        assert 'int' in str(excinfo.value) and '1' in str(excinfo.value)
+        with pytest.raises(ValueError, match="str 'true'"):
+            DatasetConfig.from_dict(_raw_dataset(raw='true'))
+
+    def test_each_destination_has_its_own_setting(self):
+        data = {'name': 'pool/a', 'remote': [
+            {'destination': 'x', 'raw': True},
+            {'destination': 'y'},
+            {'destination': 'z', 'raw': False},
+        ]}
+        assert [r.raw for r in DatasetConfig.from_dict(data).remote] == [True, None, False]
+
+    def test_it_combines_with_a_frequency_and_a_retention_override(self):
+        remote = DatasetConfig.from_dict(_raw_dataset(
+            raw=True, frequency='4h', retention={'1d': '7d'}
+        )).remote[0]
+        assert remote.raw is True
+        assert remote.frequency == timedelta(hours=4)
+        assert [(r.age, r.keep_for) for r in remote.retention_rules] == [
+            (timedelta(days=1), timedelta(days=7))
+        ]
+
+    def test_a_refused_value_is_refused_whatever_else_is_valid(self):
+        with pytest.raises(ValueError, match=r'\.raw '):
+            DatasetConfig.from_dict(_raw_dataset(raw='true', frequency='4h'))
+
+    @pytest.mark.parametrize('literal, expected', [
+        ('true', True), ('false', False), ('yes', True), ('no', False),   # YAML booleans
+        ('auto', None), ('null', None), ('~', None),
+    ])
+    def test_through_from_file(self, tmp_path, literal, expected):
+        path = tmp_path / 'raw.yaml'
+        path.write_text(
+            'datasets:\n  - name: "pool/a"\n    remote:\n'
+            f'      - destination: "offsite"\n        raw: {literal}\n'
+            'destinations:\n  offsite:\n    url: "https://h:8080"\n'
+        )
+        assert BackupConfig.from_file(path).datasets[0].remote[0].raw is expected
+
+    @pytest.mark.parametrize('literal', ['1', '0', '"true"', '"yes"', '[]', '{}', 'maybe'])
+    def test_through_from_file_refused(self, tmp_path, literal):
+        path = tmp_path / 'raw.yaml'
+        path.write_text(
+            'datasets:\n  - name: "pool/a"\n    remote:\n'
+            f'      - destination: "offsite"\n        raw: {literal}\n'
+            'destinations:\n  offsite:\n    url: "https://h:8080"\n'
+        )
+        with pytest.raises(ValueError, match=r'remote\[offsite\]\.raw'):
+            BackupConfig.from_file(path)
+
+
+@pytest.mark.unit
+class TestRemoteRawIsClientSideOnly:
+    """`raw` decides how the client sends; it is not part of the wire config."""
+
+    def _cfg(self, **remote_kwargs):
+        return DatasetConfig(
+            name='pool/data',
+            frequency=timedelta(hours=1),
+            retention_rules=[RetentionRule(timedelta(hours=1), timedelta(days=1))],
+            remote=[RemoteDatasetConfig(destination='offsite', **remote_kwargs)],
+        )
+
+    @pytest.mark.parametrize('raw', [True, False])
+    def test_to_property_is_byte_identical_whatever_raw_is(self, raw):
+        assert self._cfg(raw=raw).to_property() == self._cfg().to_property()
+        assert self._cfg(raw=raw).to_property('offsite') == self._cfg().to_property('offsite')
+
+    def test_the_encoded_remote_entry_has_only_destination_and_frequency(self):
+        encoded = self._cfg(raw=True).to_property()
+        remote = json.loads(base64.b64decode(encoded).decode())['remote']
+        assert remote == [{'destination': 'offsite', 'frequency': None}]
+        assert 'raw' not in base64.b64decode(encoded).decode()
+
+    def test_the_wire_decoder_yields_auto(self):
+        decoded = DatasetConfig.from_property(self._cfg(raw=True).to_property())
+        assert [r.raw for r in decoded.remote] == [None]
+
+
+@pytest.mark.unit
+class TestRemoteRawEquality:
+    def test_the_three_states_are_distinct(self):
+        a, b, c = (RemoteDatasetConfig(destination='d', raw=v) for v in (None, True, False))
+        assert a != b and a != c and b != c
+        assert a == RemoteDatasetConfig(destination='d')
+
+    def test_none_is_not_false(self):
+        assert RemoteDatasetConfig(destination='d', raw=None) != RemoteDatasetConfig(destination='d', raw=False)
+
+    @pytest.mark.parametrize('before, after', [
+        (None, True), (None, False), (True, False), (True, None), (False, None), (False, True),
+    ])
+    def test_same_as_and_eq_see_a_change_of_raw(self, before, after):
+        def cfg(raw):
+            config = _rich_config()
+            config.datasets[0].remote[0].raw = raw
+            return config
+
+        a, b = cfg(before), cfg(after)
+        assert not a.same_as(b) and not b.same_as(a)
+        assert a != b
+        assert a.same_as(cfg(before)) and a == cfg(before)
+
+    def test_a_raw_equal_to_the_samples_is_not_a_difference(self):
+        # Setting raw to the value it already has is not a difference.
+        a = _rich_config()
+        b = _rich_config()
+        b.datasets[0].remote[0].raw = True
+        assert a.same_as(b)

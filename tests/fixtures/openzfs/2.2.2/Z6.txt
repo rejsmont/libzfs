@@ -1,0 +1,448 @@
+##### SECTION Z6 (encryption and encryptionroot of a raw copy, a raw child under a raw parent, plain under an encrypted target, plain under an unencrypted target)  tag=C  zfs-2.2.2-0ubuntu9.5
+=== CASE Z6/00_sources
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus,keylocation,keyformat zfsbcapc/Z6/cs/ep zfsbcapc/Z6/cs/ep/ec zfsbcapc/Z6/cs/pl
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/cs/ep	encryption	aes-256-gcm
+zfsbcapc/Z6/cs/ep	encryptionroot	zfsbcapc/Z6/cs/ep
+zfsbcapc/Z6/cs/ep	keystatus	available
+zfsbcapc/Z6/cs/ep	keylocation	file:///var/tmp/zfsb-matrix/cap.key1
+zfsbcapc/Z6/cs/ep	keyformat	passphrase
+zfsbcapc/Z6/cs/ep/ec	encryption	aes-256-gcm
+zfsbcapc/Z6/cs/ep/ec	encryptionroot	zfsbcapc/Z6/cs/ep
+zfsbcapc/Z6/cs/ep/ec	keystatus	available
+zfsbcapc/Z6/cs/ep/ec	keylocation	none
+zfsbcapc/Z6/cs/ep/ec	keyformat	passphrase
+zfsbcapc/Z6/cs/pl	encryption	off
+zfsbcapc/Z6/cs/pl	encryptionroot	-
+zfsbcapc/Z6/cs/pl	keystatus	-
+zfsbcapc/Z6/cs/pl	keylocation	none
+zfsbcapc/Z6/cs/pl	keyformat	none
+--- stderr
+=== END
+=== CASE Z6/10_raw_parent
+--- cmd
+zfs send -w zfsbcapc/Z6/cs/ep@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/srv/ep
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/11_props
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus,keylocation,keyformat zfsbcapc/Z6/srv/ep
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/srv/ep	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/ep	encryptionroot	zfsbcapc/Z6/srv/ep
+zfsbcapc/Z6/srv/ep	keystatus	unavailable
+zfsbcapc/Z6/srv/ep	keylocation	prompt
+zfsbcapc/Z6/srv/ep	keyformat	passphrase
+--- stderr
+=== END
+=== CASE Z6/12_raw_child_under_raw_parent
+--- cmd
+zfs send -w zfsbcapc/Z6/cs/ep/ec@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/srv/ep/ec
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/13_props
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus,keylocation,keyformat zfsbcapc/Z6/srv/ep/ec
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/srv/ep/ec	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/ep/ec	encryptionroot	zfsbcapc/Z6/srv/ep/ec
+zfsbcapc/Z6/srv/ep/ec	keystatus	unavailable
+zfsbcapc/Z6/srv/ep/ec	keylocation	prompt
+zfsbcapc/Z6/srv/ep/ec	keyformat	passphrase
+--- stderr
+=== END
+=== CASE Z6/14_raw_child_under_plain_parent
+--- cmd
+zfs send -w zfsbcapc/Z6/cs/ep/ec@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/srv/q/ec
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/15_props
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus,keylocation,keyformat zfsbcapc/Z6/srv/q/ec
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/srv/q/ec	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/q/ec	encryptionroot	zfsbcapc/Z6/srv/q/ec
+zfsbcapc/Z6/srv/q/ec	keystatus	unavailable
+zfsbcapc/Z6/srv/q/ec	keylocation	prompt
+zfsbcapc/Z6/srv/q/ec	keyformat	passphrase
+--- stderr
+=== END
+=== CASE Z6/16_raw_R_tree
+--- cmd
+zfs send -w -R zfsbcapc/Z6/cs/ep@a | zfs receive -s -u zfsbcapc/Z6/srv/tree
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/17_props
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus,keylocation,keyformat zfsbcapc/Z6/srv/tree zfsbcapc/Z6/srv/tree/ec
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/srv/tree	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/tree	encryptionroot	zfsbcapc/Z6/srv/tree
+zfsbcapc/Z6/srv/tree	keystatus	unavailable
+zfsbcapc/Z6/srv/tree	keylocation	file:///var/tmp/zfsb-matrix/cap.key1
+zfsbcapc/Z6/srv/tree	keyformat	passphrase
+zfsbcapc/Z6/srv/tree/ec	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/tree/ec	encryptionroot	zfsbcapc/Z6/srv/tree
+zfsbcapc/Z6/srv/tree/ec	keystatus	unavailable
+zfsbcapc/Z6/srv/tree/ec	keylocation	none
+zfsbcapc/Z6/srv/tree/ec	keyformat	passphrase
+--- stderr
+=== END
+=== CASE Z6/20_plain_under_unenc
+--- cmd
+zfs send zfsbcapc/Z6/cs/pl@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/srv/pl
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/21_props
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus,keylocation,keyformat zfsbcapc/Z6/srv/pl
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/srv/pl	encryption	off
+zfsbcapc/Z6/srv/pl	encryptionroot	-
+zfsbcapc/Z6/srv/pl	keystatus	-
+zfsbcapc/Z6/srv/pl	keylocation	none
+zfsbcapc/Z6/srv/pl	keyformat	none
+--- stderr
+=== END
+=== CASE Z6/22_plain_under_enc
+--- cmd
+zfs send zfsbcapc/Z6/cs/pl@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/esrv/pl
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/23_props
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus,keylocation,keyformat zfsbcapc/Z6/esrv/pl zfsbcapc/Z6/esrv
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/esrv	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv	keystatus	available
+zfsbcapc/Z6/esrv	keylocation	file:///var/tmp/zfsb-matrix/cap.key2
+zfsbcapc/Z6/esrv	keyformat	passphrase
+zfsbcapc/Z6/esrv/pl	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/pl	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/pl	keystatus	available
+zfsbcapc/Z6/esrv/pl	keylocation	none
+zfsbcapc/Z6/esrv/pl	keyformat	passphrase
+--- stderr
+=== END
+=== CASE Z6/24_enc_source_plain_under_unenc
+--- cmd
+zfs send zfsbcapc/Z6/cs/ep@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/srv/decrypted
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/25_props
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus,keylocation,keyformat zfsbcapc/Z6/srv/decrypted
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/srv/decrypted	encryption	off
+zfsbcapc/Z6/srv/decrypted	encryptionroot	-
+zfsbcapc/Z6/srv/decrypted	keystatus	-
+zfsbcapc/Z6/srv/decrypted	keylocation	none
+zfsbcapc/Z6/srv/decrypted	keyformat	none
+--- stderr
+=== END
+=== CASE Z6/26_enc_source_plain_under_enc
+--- cmd
+zfs send zfsbcapc/Z6/cs/ep@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/esrv/decrypted
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/27_props
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus,keylocation,keyformat zfsbcapc/Z6/esrv/decrypted
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/esrv/decrypted	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/decrypted	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/decrypted	keystatus	available
+zfsbcapc/Z6/esrv/decrypted	keylocation	none
+zfsbcapc/Z6/esrv/decrypted	keyformat	passphrase
+--- stderr
+=== END
+=== CASE Z6/30_raw_leaf_under_id_under_enc
+--- cmd
+zfs send -w zfsbcapc/Z6/cs/ep@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/esrv/id1/ep
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/31_raw_child_under_raw_parent_under_id
+--- cmd
+zfs send -w zfsbcapc/Z6/cs/ep/ec@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/esrv/id1/ep/ec
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/32_plain_leaf_under_id_under_enc
+--- cmd
+zfs send zfsbcapc/Z6/cs/pl@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/esrv/id1/pl
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/33_raw_leaf_under_id_under_unenc
+--- cmd
+zfs send -w zfsbcapc/Z6/cs/ep@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/srv/id1/ep
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/34_plain_leaf_under_id_under_unenc
+--- cmd
+zfs send zfsbcapc/Z6/cs/pl@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z6/srv/id1/pl
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z6/35_props_id_enc
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus,keylocation,keyformat zfsbcapc/Z6/esrv/id1 zfsbcapc/Z6/esrv/id1/ep zfsbcapc/Z6/esrv/id1/ep/ec zfsbcapc/Z6/esrv/id1/pl
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/esrv/id1	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/id1	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/id1	keystatus	available
+zfsbcapc/Z6/esrv/id1	keylocation	none
+zfsbcapc/Z6/esrv/id1	keyformat	passphrase
+zfsbcapc/Z6/esrv/id1/ep	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/id1/ep	encryptionroot	zfsbcapc/Z6/esrv/id1/ep
+zfsbcapc/Z6/esrv/id1/ep	keystatus	unavailable
+zfsbcapc/Z6/esrv/id1/ep	keylocation	prompt
+zfsbcapc/Z6/esrv/id1/ep	keyformat	passphrase
+zfsbcapc/Z6/esrv/id1/ep/ec	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/id1/ep/ec	encryptionroot	zfsbcapc/Z6/esrv/id1/ep/ec
+zfsbcapc/Z6/esrv/id1/ep/ec	keystatus	unavailable
+zfsbcapc/Z6/esrv/id1/ep/ec	keylocation	prompt
+zfsbcapc/Z6/esrv/id1/ep/ec	keyformat	passphrase
+zfsbcapc/Z6/esrv/id1/pl	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/id1/pl	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/id1/pl	keystatus	available
+zfsbcapc/Z6/esrv/id1/pl	keylocation	none
+zfsbcapc/Z6/esrv/id1/pl	keyformat	passphrase
+--- stderr
+=== END
+=== CASE Z6/36_props_id_unenc
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus,keylocation,keyformat zfsbcapc/Z6/srv/id1 zfsbcapc/Z6/srv/id1/ep zfsbcapc/Z6/srv/id1/pl
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/srv/id1	encryption	off
+zfsbcapc/Z6/srv/id1	encryptionroot	-
+zfsbcapc/Z6/srv/id1	keystatus	-
+zfsbcapc/Z6/srv/id1	keylocation	none
+zfsbcapc/Z6/srv/id1	keyformat	none
+zfsbcapc/Z6/srv/id1/ep	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/id1/ep	encryptionroot	zfsbcapc/Z6/srv/id1/ep
+zfsbcapc/Z6/srv/id1/ep	keystatus	unavailable
+zfsbcapc/Z6/srv/id1/ep	keylocation	prompt
+zfsbcapc/Z6/srv/id1/ep	keyformat	passphrase
+zfsbcapc/Z6/srv/id1/pl	encryption	off
+zfsbcapc/Z6/srv/id1/pl	encryptionroot	-
+zfsbcapc/Z6/srv/id1/pl	keystatus	-
+zfsbcapc/Z6/srv/id1/pl	keylocation	none
+zfsbcapc/Z6/srv/id1/pl	keyformat	none
+--- stderr
+=== END
+=== CASE Z6/40_everything
+--- cmd
+zfs get -H -r -o name,property,value encryption,encryptionroot,keystatus zfsbcapc/Z6/srv zfsbcapc/Z6/esrv
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/esrv	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv	keystatus	available
+zfsbcapc/Z6/esrv/decrypted	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/decrypted	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/decrypted	keystatus	available
+zfsbcapc/Z6/esrv/decrypted@a	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/decrypted@a	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/decrypted@a	keystatus	available
+zfsbcapc/Z6/esrv/id1	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/id1	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/id1	keystatus	available
+zfsbcapc/Z6/esrv/id1/ep	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/id1/ep	encryptionroot	zfsbcapc/Z6/esrv/id1/ep
+zfsbcapc/Z6/esrv/id1/ep	keystatus	unavailable
+zfsbcapc/Z6/esrv/id1/ep@a	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/id1/ep@a	encryptionroot	zfsbcapc/Z6/esrv/id1/ep
+zfsbcapc/Z6/esrv/id1/ep@a	keystatus	unavailable
+zfsbcapc/Z6/esrv/id1/ep/ec	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/id1/ep/ec	encryptionroot	zfsbcapc/Z6/esrv/id1/ep/ec
+zfsbcapc/Z6/esrv/id1/ep/ec	keystatus	unavailable
+zfsbcapc/Z6/esrv/id1/ep/ec@a	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/id1/ep/ec@a	encryptionroot	zfsbcapc/Z6/esrv/id1/ep/ec
+zfsbcapc/Z6/esrv/id1/ep/ec@a	keystatus	unavailable
+zfsbcapc/Z6/esrv/id1/pl	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/id1/pl	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/id1/pl	keystatus	available
+zfsbcapc/Z6/esrv/id1/pl@a	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/id1/pl@a	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/id1/pl@a	keystatus	available
+zfsbcapc/Z6/esrv/pl	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/pl	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/pl	keystatus	available
+zfsbcapc/Z6/esrv/pl@a	encryption	aes-256-gcm
+zfsbcapc/Z6/esrv/pl@a	encryptionroot	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/pl@a	keystatus	available
+zfsbcapc/Z6/srv	encryption	off
+zfsbcapc/Z6/srv	encryptionroot	-
+zfsbcapc/Z6/srv	keystatus	-
+zfsbcapc/Z6/srv/decrypted	encryption	off
+zfsbcapc/Z6/srv/decrypted	encryptionroot	-
+zfsbcapc/Z6/srv/decrypted	keystatus	-
+zfsbcapc/Z6/srv/decrypted@a	encryption	off
+zfsbcapc/Z6/srv/decrypted@a	encryptionroot	-
+zfsbcapc/Z6/srv/decrypted@a	keystatus	-
+zfsbcapc/Z6/srv/ep	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/ep	encryptionroot	zfsbcapc/Z6/srv/ep
+zfsbcapc/Z6/srv/ep	keystatus	unavailable
+zfsbcapc/Z6/srv/ep@a	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/ep@a	encryptionroot	zfsbcapc/Z6/srv/ep
+zfsbcapc/Z6/srv/ep@a	keystatus	unavailable
+zfsbcapc/Z6/srv/ep/ec	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/ep/ec	encryptionroot	zfsbcapc/Z6/srv/ep/ec
+zfsbcapc/Z6/srv/ep/ec	keystatus	unavailable
+zfsbcapc/Z6/srv/ep/ec@a	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/ep/ec@a	encryptionroot	zfsbcapc/Z6/srv/ep/ec
+zfsbcapc/Z6/srv/ep/ec@a	keystatus	unavailable
+zfsbcapc/Z6/srv/id1	encryption	off
+zfsbcapc/Z6/srv/id1	encryptionroot	-
+zfsbcapc/Z6/srv/id1	keystatus	-
+zfsbcapc/Z6/srv/id1/ep	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/id1/ep	encryptionroot	zfsbcapc/Z6/srv/id1/ep
+zfsbcapc/Z6/srv/id1/ep	keystatus	unavailable
+zfsbcapc/Z6/srv/id1/ep@a	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/id1/ep@a	encryptionroot	zfsbcapc/Z6/srv/id1/ep
+zfsbcapc/Z6/srv/id1/ep@a	keystatus	unavailable
+zfsbcapc/Z6/srv/id1/pl	encryption	off
+zfsbcapc/Z6/srv/id1/pl	encryptionroot	-
+zfsbcapc/Z6/srv/id1/pl	keystatus	-
+zfsbcapc/Z6/srv/id1/pl@a	encryption	off
+zfsbcapc/Z6/srv/id1/pl@a	encryptionroot	-
+zfsbcapc/Z6/srv/id1/pl@a	keystatus	-
+zfsbcapc/Z6/srv/pl	encryption	off
+zfsbcapc/Z6/srv/pl	encryptionroot	-
+zfsbcapc/Z6/srv/pl	keystatus	-
+zfsbcapc/Z6/srv/pl@a	encryption	off
+zfsbcapc/Z6/srv/pl@a	encryptionroot	-
+zfsbcapc/Z6/srv/pl@a	keystatus	-
+zfsbcapc/Z6/srv/q	encryption	off
+zfsbcapc/Z6/srv/q	encryptionroot	-
+zfsbcapc/Z6/srv/q	keystatus	-
+zfsbcapc/Z6/srv/q/ec	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/q/ec	encryptionroot	zfsbcapc/Z6/srv/q/ec
+zfsbcapc/Z6/srv/q/ec	keystatus	unavailable
+zfsbcapc/Z6/srv/q/ec@a	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/q/ec@a	encryptionroot	zfsbcapc/Z6/srv/q/ec
+zfsbcapc/Z6/srv/q/ec@a	keystatus	unavailable
+zfsbcapc/Z6/srv/tree	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/tree	encryptionroot	zfsbcapc/Z6/srv/tree
+zfsbcapc/Z6/srv/tree	keystatus	unavailable
+zfsbcapc/Z6/srv/tree@a	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/tree@a	encryptionroot	zfsbcapc/Z6/srv/tree
+zfsbcapc/Z6/srv/tree@a	keystatus	unavailable
+zfsbcapc/Z6/srv/tree/ec	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/tree/ec	encryptionroot	zfsbcapc/Z6/srv/tree
+zfsbcapc/Z6/srv/tree/ec	keystatus	unavailable
+zfsbcapc/Z6/srv/tree/ec@a	encryption	aes-256-gcm
+zfsbcapc/Z6/srv/tree/ec@a	encryptionroot	zfsbcapc/Z6/srv/tree
+zfsbcapc/Z6/srv/tree/ec@a	keystatus	unavailable
+--- stderr
+=== END
+=== CASE Z6/41_snapshot_view
+--- cmd
+zfs list -H -t snapshot -o name,encryption,keystatus,encryptionroot -r zfsbcapc/Z6/srv zfsbcapc/Z6/esrv
+--- rc
+0
+--- stdout
+zfsbcapc/Z6/esrv/decrypted@a	aes-256-gcm	available	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/id1/ep@a	aes-256-gcm	unavailable	zfsbcapc/Z6/esrv/id1/ep
+zfsbcapc/Z6/esrv/id1/ep/ec@a	aes-256-gcm	unavailable	zfsbcapc/Z6/esrv/id1/ep/ec
+zfsbcapc/Z6/esrv/id1/pl@a	aes-256-gcm	available	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/esrv/pl@a	aes-256-gcm	available	zfsbcapc/Z6/esrv
+zfsbcapc/Z6/srv/decrypted@a	off	-	-
+zfsbcapc/Z6/srv/ep@a	aes-256-gcm	unavailable	zfsbcapc/Z6/srv/ep
+zfsbcapc/Z6/srv/ep/ec@a	aes-256-gcm	unavailable	zfsbcapc/Z6/srv/ep/ec
+zfsbcapc/Z6/srv/id1/ep@a	aes-256-gcm	unavailable	zfsbcapc/Z6/srv/id1/ep
+zfsbcapc/Z6/srv/id1/pl@a	off	-	-
+zfsbcapc/Z6/srv/pl@a	off	-	-
+zfsbcapc/Z6/srv/q/ec@a	aes-256-gcm	unavailable	zfsbcapc/Z6/srv/q/ec
+zfsbcapc/Z6/srv/tree@a	aes-256-gcm	unavailable	zfsbcapc/Z6/srv/tree
+zfsbcapc/Z6/srv/tree/ec@a	aes-256-gcm	unavailable	zfsbcapc/Z6/srv/tree
+--- stderr
+=== END

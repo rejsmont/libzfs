@@ -275,6 +275,27 @@ def _bool_from_config(value, key: str, *, null_warning: Optional[str] = None) ->
     )
 
 
+def _raw_from_config(value, key: str) -> Optional[bool]:
+    """Parse a dataset remote's `raw` setting taken off parsed YAML.
+
+    `true` and `false` are the booleans; `auto` (or an omitted/null key) is
+    `None`, "raw if and only if the dataset is encrypted". Anything else,
+    including the strings ``"true"``/``"false"`` and the integers 0/1, is an
+    error naming the key: this setting decides the stream format of the server
+    copy, which cannot be changed afterwards without a full re-send, so it is
+    never guessed at.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value == 'auto':
+        return None
+    raise ValueError(
+        f"{key} must be true, false or auto, got {type(value).__name__} {value!r}"
+    )
+
+
 def _str_from_config(value, key: str) -> str:
     """Ensure a value taken directly off parsed YAML is a string.
 
@@ -680,6 +701,11 @@ class RemoteDatasetConfig:
     # Empty = inherit DatasetConfig.retention_rules; non-empty REPLACES the
     # dataset-level set entirely for this destination (override, not merge).
     retention_rules: List[RetentionRule] = field(default_factory=list)
+    # Send mode for this dataset x destination. None = auto (raw if and only if
+    # the dataset is encrypted); True = raw required (an unencrypted dataset is
+    # refused); False = never raw (needs the key loaded). Client-side only: it
+    # is not part of `to_property` and never goes on the wire.
+    raw: Optional[bool] = None
 
 
 @dataclass
@@ -930,8 +956,13 @@ class DatasetConfig:
                     remote_retention_rules.append(RetentionRule(age=age, keep_for=keep_for))
                 remote_retention_rules.sort(key=lambda rr: rr.age)
 
+            raw = _raw_from_config(
+                r.get('raw'), f"datasets[{name}].remote[{dest}].raw"
+            )
+
             remote.append(RemoteDatasetConfig(
-                destination=dest, frequency=freq, retention_rules=remote_retention_rules
+                destination=dest, frequency=freq, retention_rules=remote_retention_rules,
+                raw=raw,
             ))
 
         return cls(
@@ -942,6 +973,42 @@ class DatasetConfig:
             enabled=enabled,
             remote=remote,
         )
+
+
+def duration_ok(value) -> bool:
+    """A finite, strictly positive duration -- the client's own rule
+    (`_interval_from_config` for a frequency, `_positive_duration_from_config`
+    for a retention `age`/`keep_for`). Zero is refused: an `age` of 0 is a
+    zero-width slot, a division by zero in `DatasetManager.needs_prunning`
+    on every server pruning cycle."""
+    return isinstance(value, timedelta) and value > timedelta(0)
+
+
+def wire_config_problem(cfg: 'DatasetConfig') -> Optional[str]:
+    """Why a `DatasetConfig` decoded by `DatasetConfig.from_property` (a
+    client's wire config; it never went through `from_dict`) is unusable on a
+    server, or `None`. The shape the pruner relies on: `name` a string,
+    `recursive`/`enabled` booleans, durations finite and greater than zero
+    (the decoder already refuses NaN and infinity), `remote[].destination`
+    strings. A decoded remote `frequency` of 0 is already `None` (inherit),
+    so only a negative one reaches the check. The message names the problem,
+    never the input. Shared by the API (before a config is stored) and by the
+    server pruner (before a stored config is acted on)."""
+    if not isinstance(cfg.name, str):
+        return "name is not a string"
+    if type(cfg.recursive) is not bool or type(cfg.enabled) is not bool:
+        return "recursive and enabled must be booleans"
+    if not duration_ok(cfg.frequency):
+        return "frequency is not positive"
+    for rule in cfg.retention_rules:
+        if not (duration_ok(rule.age) and duration_ok(rule.keep_for)):
+            return "a retention rule has a duration that is not positive"
+    for remote in cfg.remote:
+        if not isinstance(remote.destination, str):
+            return "a remote destination is not a string"
+        if remote.frequency is not None and not duration_ok(remote.frequency):
+            return "a remote frequency is not positive"
+    return None
 
 
 def _same(a, b) -> bool:

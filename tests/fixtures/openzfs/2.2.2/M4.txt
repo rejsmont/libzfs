@@ -1,0 +1,213 @@
+##### SECTION M4 (zfs list -H -r -t snapshot -o name,type,createtxg,guid,userrefs,clones (0/1/2 clones, holds, equal txg, -s createtxg))  tag=C  zfs-2.2.2-0ubuntu9.5
+=== CASE M4/00_noclones
+--- cmd
+zfs list -H -r -t snapshot -o name,type,createtxg,guid,userrefs,clones zfsbcapc/M4/l
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l@s1	snapshot	870	11669195105444335911	0	-
+zfsbcapc/M4/l@s2	snapshot	871	13080297701443856104	0	-
+zfsbcapc/M4/l@s3	snapshot	872	97939244343576843	0	-
+zfsbcapc/M4/l/child@s1	snapshot	870	7963189275650643613	0	-
+zfsbcapc/M4/l/child@s2	snapshot	871	6739046502319215659	0	-
+zfsbcapc/M4/l/child@s3	snapshot	872	16580641344595571544	0	-
+--- stderr
+=== END
+=== CASE M4/01_noclones_sorted
+--- cmd
+zfs list -H -r -t snapshot -o name,type,createtxg,guid,userrefs,clones -s createtxg zfsbcapc/M4/l
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l@s1	snapshot	870	11669195105444335911	0	-
+zfsbcapc/M4/l/child@s1	snapshot	870	7963189275650643613	0	-
+zfsbcapc/M4/l@s2	snapshot	871	13080297701443856104	0	-
+zfsbcapc/M4/l/child@s2	snapshot	871	6739046502319215659	0	-
+zfsbcapc/M4/l@s3	snapshot	872	97939244343576843	0	-
+zfsbcapc/M4/l/child@s3	snapshot	872	16580641344595571544	0	-
+--- stderr
+=== END
+=== CASE M4/02_noclones_sorted_rev
+--- cmd
+zfs list -H -r -t snapshot -o name,type,createtxg,guid,userrefs,clones -S createtxg zfsbcapc/M4/l
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l@s3	snapshot	872	97939244343576843	0	-
+zfsbcapc/M4/l/child@s3	snapshot	872	16580641344595571544	0	-
+zfsbcapc/M4/l@s2	snapshot	871	13080297701443856104	0	-
+zfsbcapc/M4/l/child@s2	snapshot	871	6739046502319215659	0	-
+zfsbcapc/M4/l@s1	snapshot	870	11669195105444335911	0	-
+zfsbcapc/M4/l/child@s1	snapshot	870	7963189275650643613	0	-
+--- stderr
+=== END
+=== CASE M4/03_all_types
+--- cmd
+zfs list -H -r -t all -o name,type,createtxg,guid,userrefs,clones zfsbcapc/M4/l
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l	filesystem	868	3848706966794115659	-	-
+zfsbcapc/M4/l@s1	snapshot	870	11669195105444335911	0	-
+zfsbcapc/M4/l@s2	snapshot	871	13080297701443856104	0	-
+zfsbcapc/M4/l@s3	snapshot	872	97939244343576843	0	-
+zfsbcapc/M4/l/child	filesystem	869	4104634382239671435	-	-
+zfsbcapc/M4/l/child@s1	snapshot	870	7963189275650643613	0	-
+zfsbcapc/M4/l/child@s2	snapshot	871	6739046502319215659	0	-
+zfsbcapc/M4/l/child@s3	snapshot	872	16580641344595571544	0	-
+--- stderr
+=== END
+=== CASE M4/04_noclones_parseable
+--- cmd
+zfs list -H -p -r -t snapshot -o name,type,createtxg,guid,userrefs,clones zfsbcapc/M4/l
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l@s1	snapshot	870	11669195105444335911	0	-
+zfsbcapc/M4/l@s2	snapshot	871	13080297701443856104	0	-
+zfsbcapc/M4/l@s3	snapshot	872	97939244343576843	0	-
+zfsbcapc/M4/l/child@s1	snapshot	870	7963189275650643613	0	-
+zfsbcapc/M4/l/child@s2	snapshot	871	6739046502319215659	0	-
+zfsbcapc/M4/l/child@s3	snapshot	872	16580641344595571544	0	-
+--- stderr
+=== END
+=== CASE M4/10_one_clone
+--- cmd
+zfs list -H -r -t snapshot -o name,type,createtxg,guid,userrefs,clones zfsbcapc/M4/l
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l@s1	snapshot	870	11669195105444335911	0	-
+zfsbcapc/M4/l@s2	snapshot	871	13080297701443856104	0	zfsbcapc/M4/c1
+zfsbcapc/M4/l@s3	snapshot	872	97939244343576843	0	-
+zfsbcapc/M4/l/child@s1	snapshot	870	7963189275650643613	0	-
+zfsbcapc/M4/l/child@s2	snapshot	871	6739046502319215659	0	-
+zfsbcapc/M4/l/child@s3	snapshot	872	16580641344595571544	0	-
+--- stderr
+=== END
+=== CASE M4/20_two_clones_same_snapshot
+--- cmd
+zfs list -H -r -t snapshot -o name,type,createtxg,guid,userrefs,clones zfsbcapc/M4/l
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l@s1	snapshot	870	11669195105444335911	0	-
+zfsbcapc/M4/l@s2	snapshot	871	13080297701443856104	0	zfsbcapc/M4/c2,zfsbcapc/M4/c1
+zfsbcapc/M4/l@s3	snapshot	872	97939244343576843	0	-
+zfsbcapc/M4/l/child@s1	snapshot	870	7963189275650643613	0	-
+zfsbcapc/M4/l/child@s2	snapshot	871	6739046502319215659	0	-
+zfsbcapc/M4/l/child@s3	snapshot	872	16580641344595571544	0	-
+--- stderr
+=== END
+=== CASE M4/30_three_clones_two_snapshots
+--- cmd
+zfs list -H -r -t snapshot -o name,type,createtxg,guid,userrefs,clones -s createtxg zfsbcapc/M4/l
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l@s1	snapshot	870	11669195105444335911	0	-
+zfsbcapc/M4/l/child@s1	snapshot	870	7963189275650643613	0	-
+zfsbcapc/M4/l@s2	snapshot	871	13080297701443856104	0	zfsbcapc/M4/c2,zfsbcapc/M4/c1
+zfsbcapc/M4/l/child@s2	snapshot	871	6739046502319215659	0	-
+zfsbcapc/M4/l@s3	snapshot	872	97939244343576843	0	zfsbcapc/M4/c3
+zfsbcapc/M4/l/child@s3	snapshot	872	16580641344595571544	0	-
+--- stderr
+=== END
+=== CASE M4/31_clone_origin
+--- cmd
+zfs list -H -o name,origin zfsbcapc/M4/c1 zfsbcapc/M4/c2 zfsbcapc/M4/c3
+--- rc
+0
+--- stdout
+zfsbcapc/M4/c1	zfsbcapc/M4/l@s2
+zfsbcapc/M4/c2	zfsbcapc/M4/l@s2
+zfsbcapc/M4/c3	zfsbcapc/M4/l@s3
+--- stderr
+=== END
+=== CASE M4/40_two_holds
+--- cmd
+zfs list -H -r -t snapshot -o name,type,createtxg,guid,userrefs,clones zfsbcapc/M4/l
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l@s1	snapshot	870	11669195105444335911	2	-
+zfsbcapc/M4/l@s2	snapshot	871	13080297701443856104	0	zfsbcapc/M4/c2,zfsbcapc/M4/c1
+zfsbcapc/M4/l@s3	snapshot	872	97939244343576843	0	zfsbcapc/M4/c3
+zfsbcapc/M4/l/child@s1	snapshot	870	7963189275650643613	0	-
+zfsbcapc/M4/l/child@s2	snapshot	871	6739046502319215659	0	-
+zfsbcapc/M4/l/child@s3	snapshot	872	16580641344595571544	0	-
+--- stderr
+=== END
+=== CASE M4/41_holds
+--- cmd
+zfs holds -H zfsbcapc/M4/l@s1
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l@s1	a	Thu Oct 22 02:36 2026
+zfsbcapc/M4/l@s1	b	Thu Oct 22 02:36 2026
+--- stderr
+=== END
+=== CASE M4/49_two_snapshots_one_fs_one_command
+--- cmd
+zfs snapshot zfsbcapc/M4/l@e1 zfsbcapc/M4/l@e2
+--- rc
+1
+--- stdout
+--- stderr
+cannot create snapshots : multiple snapshots of same fs not allowed
+no snapshots were created
+=== END
+=== CASE M4/50_equal_txg_parent_child
+--- cmd
+zfs list -H -r -t snapshot -o name,type,createtxg,guid,userrefs,clones -s createtxg zfsbcapc/M4/l
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l@s1	snapshot	870	11669195105444335911	2	-
+zfsbcapc/M4/l/child@s1	snapshot	870	7963189275650643613	0	-
+zfsbcapc/M4/l@s2	snapshot	871	13080297701443856104	0	zfsbcapc/M4/c2,zfsbcapc/M4/c1
+zfsbcapc/M4/l/child@s2	snapshot	871	6739046502319215659	0	-
+zfsbcapc/M4/l@s3	snapshot	872	97939244343576843	0	zfsbcapc/M4/c3
+zfsbcapc/M4/l/child@s3	snapshot	872	16580641344595571544	0	-
+zfsbcapc/M4/l@e1	snapshot	878	15673079355361212581	0	-
+zfsbcapc/M4/l/child@e1	snapshot	878	3187904446425208285	0	-
+--- stderr
+=== END
+=== CASE M4/51_equal_txg_two_datasets
+--- cmd
+zfs list -H -t snapshot -o name,createtxg -s createtxg zfsbcapc/M4/l@x1 zfsbcapc/M4/l2@x1
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l@x1	880
+zfsbcapc/M4/l2@x1	880
+--- stderr
+=== END
+=== CASE M4/60_filesystem_rows
+--- cmd
+zfs list -H -t filesystem -o name,type,createtxg,guid,userrefs,clones zfsbcapc/M4/l zfsbcapc/M4/c1
+--- rc
+0
+--- stdout
+zfsbcapc/M4/c1	filesystem	873	5102211170081432225	-	-
+zfsbcapc/M4/l	filesystem	868	3848706966794115659	-	-
+--- stderr
+=== END
+=== CASE M4/61_sorted_by_name_for_comparison
+--- cmd
+zfs list -H -r -t snapshot -o name,type,createtxg,guid,userrefs,clones -s name zfsbcapc/M4/l
+--- rc
+0
+--- stdout
+zfsbcapc/M4/l/child@e1	snapshot	878	3187904446425208285	0	-
+zfsbcapc/M4/l/child@s1	snapshot	870	7963189275650643613	0	-
+zfsbcapc/M4/l/child@s2	snapshot	871	6739046502319215659	0	-
+zfsbcapc/M4/l/child@s3	snapshot	872	16580641344595571544	0	-
+zfsbcapc/M4/l@e1	snapshot	878	15673079355361212581	0	-
+zfsbcapc/M4/l@s1	snapshot	870	11669195105444335911	2	-
+zfsbcapc/M4/l@s2	snapshot	871	13080297701443856104	0	zfsbcapc/M4/c2,zfsbcapc/M4/c1
+zfsbcapc/M4/l@s3	snapshot	872	97939244343576843	0	zfsbcapc/M4/c3
+zfsbcapc/M4/l@x1	snapshot	880	13465836280919973564	0	-
+--- stderr
+=== END

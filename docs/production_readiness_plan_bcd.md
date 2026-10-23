@@ -208,6 +208,22 @@ holds before and after B-2a, the S-8 contract, B-6 first without status files, C
    - the S-8 upgrade-under-a-running-daemon step;
    - the D7 hung-pool test on a disposable `zfsb-hang` VM;
    - L1's stale "receive -x" wording.
+6. **Carried in from milestone B's final review (2026-10-22):**
+   - **B-2b must keep the chain recoverable.** The milestone-B anchor backstop puts the anchor back on the base
+     when a just-sent snapshot vanished on the client, while the server keeps it; the next `-i base …` works only
+     because `-F` rolls that server-only snapshot back. With "`-F` only onto a dataset with no snapshots" that
+     becomes a permanent "does not match incremental source" stall, so B-2b needs a rule for it (e.g. allow `-F`
+     when the server's newest snapshot is newer than the incremental's base and was never anchored by the client).
+     Likewise, a full send when no common snapshot exists still runs `-F` onto an existing server copy, which can
+     wipe its history on an unencrypted target (carried from milestone A).
+   - **S-3: the R0 pending map is evicted globally** (LRU, 4096 entries): an enrolled client negotiating thousands
+     of names can evict other clients' entries (their next stream is refused with "negotiate again", retryable).
+     Out of scope under Q1, but cap it per client id when S-3 adds per-client limits.
+   - **A child backed up before its parent** is handled by the remote worker sending parents first (milestone B);
+     a parent added to the config after its child has been backed up still meets the placeholder refusal, which
+     needs the operator's rename (documented in the runbook, milestone C's B-9).
+   - `.claude/agents/zfs-code-reviewer.md` still says "newest-per-slot" (the pruner keeps the oldest per slot):
+     an agent definition, left for the user to approve.
 
 ---
 

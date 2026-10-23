@@ -32,6 +32,8 @@ Choices that make the contract hold:
 - Destinations are sorted by name (the store has no stable order for them);
   datasets and a dataset's `remote:` entries keep the config's own order, which
   is the order the operator wrote them in and the order the daemon walks them.
+- A dataset's remote entry writes `raw` only when it is `true` or `false`; `auto`
+  (the default, `None`) is the absent key.
 - Durations are double-quoted literals, so a literal such as `30d` or `12h6d`
   is never reinterpreted by YAML and is stored exactly as written.
 
@@ -144,6 +146,10 @@ def _dataset_entry(ds: DatasetConfig) -> dict:
                 item["retention"] = _retention_mapping(
                     remote.retention_rules, f"{rkey}.retention"
                 )
+            if remote.raw is not None:
+                # `raw: auto` (None) is the default and is left out, like an
+                # inherited frequency; a bare bool is never read back as text.
+                item["raw"] = bool(remote.raw)
             remotes.append(item)
         entry["remote"] = remotes
     return entry

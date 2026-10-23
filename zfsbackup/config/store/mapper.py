@@ -483,6 +483,10 @@ def _dataset_to_dataclass(
             destination=remote.destination_name,
             frequency=remote_frequency,
             retention_rules=_scoped_rules(remote),
+            # NULL = auto = None, passed straight through (never coerced to
+            # False). The Boolean column type already converts 0/1 to bool;
+            # the `is None` test only keeps NULL from becoming False.
+            raw=remote.raw,
         ))
 
     return DatasetConfig(
@@ -1426,6 +1430,8 @@ def save_config(
                     None if remote.frequency is None
                     else getattr(remote.frequency, "literal", None)
                 ),
+                # None (auto) stays NULL; True/False stay 1/0.
+                raw=remote.raw,
             )
             session.add(remote_row)
             session.flush()  # obtain remote_row.id for the scoped rules' FK

@@ -554,18 +554,47 @@ class TestAuthorization:
         zfs.set.assert_not_called()
 
     def test_each_client_streams_into_its_own_tree(self, two, zfs):
-        # per stream: the ownership check and the config read find the dataset, then it is gone
-        zfs.exists.side_effect = [True, True, False] * 2
+        zfs.exists.return_value = True
         for cert, owner in ((two.a, "host-a"), (two.b, "host-b")):
             _stream(two, cert, owner)
-        created = [str(c[0][0]) for c in zfs.create.call_args_list]
-        assert created == [self.A_DATA, self.B_DATA]
-        # stamped by the recreate and received with `-o` (plan B-1b), always with the bound id
-        stamped = [c[0][1][PROP_CLIENT_ID] for c in zfs.set.call_args_list]
-        assert stamped == ["host-a", "host-b"]
+        zfs.create.assert_not_called()          # R0: the handler creates and stamps nothing
+        zfs.set.assert_not_called()
+        # received with `-o` (plan B-1b), always with the bound id
         received = [(str(c.args[0]), c.kwargs["props"][PROP_CLIENT_ID]) for c in zfs.receive.call_args_list]
         assert received == [(self.A_DATA, "host-a"), (self.B_DATA, "host-b")]
         assert [str(c.args[0]) for c in zfs.value.call_args_list] == [self.A_DATA, self.B_DATA]
+
+    def test_each_client_creates_its_new_dataset_in_its_own_tree(self, two, zfs):
+        """The datasets do not exist: the receive creates them (no `-F`), still under the bound id."""
+        zfs.exists.return_value = False
+        for cert, owner in ((two.a, "host-a"), (two.b, "host-b")):
+            resp = two.client(cert).post(
+                f"/backup/{owner}/pool/data/negotiate",
+                json={"snapshots": [], "config": DatasetConfig(name="pool/data").to_property()},
+            )
+            assert resp.status_code == 200
+            _stream(two, cert, owner)
+        assert [str(c.args[0]) for c in zfs.receive.call_args_list] == [self.A_DATA, self.B_DATA]
+        assert [c.kwargs["force"] for c in zfs.receive.call_args_list] == [False, False]
+        assert [c.kwargs["props"][PROP_CLIENT_ID] for c in zfs.receive.call_args_list] == ["host-a", "host-b"]
+        zfs.set.assert_not_called()
+        # only the parents were made, each under its own id
+        assert [str(c.args[0]) for c in zfs.create.call_args_list] == [
+            "pool/backups/host-a", "pool/backups/host-b"]
+
+    def test_a_pending_config_of_a_is_never_used_by_b(self, two, zfs):
+        """A negotiated first and has not streamed; B streams the same dataset name. B's server
+        dataset is its own (`host-b`), so A's pending entry is not found: B is told to negotiate."""
+        zfs.exists.return_value = False
+        resp = two.client(two.a).post(
+            "/backup/host-a/pool/data/negotiate",
+            json={"snapshots": [], "config": DatasetConfig(name="pool/data").to_property()},
+        )
+        assert resp.status_code == 200
+        ws = _stream(two, two.b, "host-b")
+        sent = [json.loads(c[0][0]) for c in ws.send.call_args_list]
+        assert len(sent) == 1 and "negotiate again" in sent[0]["error"]
+        zfs.receive.assert_not_called()
 
     def test_b_cannot_reach_a_through_the_handler_argument_either(self, two, zfs):
         """The websocket view is handed the URL's id, but uses the binding."""
@@ -575,9 +604,10 @@ class TestAuthorization:
         handler = two.app.view_functions["backup_stream"].__wrapped__
         with two.context("/backup/host-b/pool/data/stream", who=two.b, query_string={"mode": "resume"}):
             handler(ws, "host-a", "pool/data")
-        assert str(zfs.create.call_args[0][0]) == self.B_DATA
+        assert str(zfs.receive.call_args.args[0]) == self.B_DATA
         assert str(zfs.value.call_args.args[0]) == self.B_DATA            # the config is B's, not A's
         assert zfs.receive.call_args.kwargs["props"][PROP_CLIENT_ID] == "host-b"
+        zfs.create.assert_not_called()
 
 
 class TestBadDatasetNames:

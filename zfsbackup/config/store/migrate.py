@@ -118,7 +118,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, Tuple
 
 from alembic import command
 from alembic.config import Config
@@ -154,8 +154,8 @@ _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 # B1) -- see the module docstring. They MUST be edited together with any new
 # revision file; `_assert_scripts_match_constants` (run first on every upgrade
 # path, and by the test suite) fails loudly if they drift.
-EXPECTED_HEAD = "7c3e9d51b2a8"
-KNOWN_REVISIONS = frozenset({"a1c28e1b3f34", "7c3e9d51b2a8"})
+EXPECTED_HEAD = "5d2f8a60c1e4"
+KNOWN_REVISIONS = frozenset({"a1c28e1b3f34", "7c3e9d51b2a8", "5d2f8a60c1e4"})
 
 # The tables (`alembic_version` excluded) that a database AT each known
 # revision holds, newest first. Only used to diagnose a database whose stamp
@@ -171,12 +171,92 @@ KNOWN_REVISIONS = frozenset({"a1c28e1b3f34", "7c3e9d51b2a8"})
 # whenever a revision changes the table set (the head's is `Base.metadata`).
 _TABLES_AT_REVISION: Tuple[Tuple[str, frozenset], ...] = (
     (EXPECTED_HEAD, frozenset(Base.metadata.tables)),
+    # 5d2f8a60c1e4 only added a column (`dataset_remotes.raw`), so the TLS
+    # revision's table set equals the head's. Table names alone cannot tell
+    # the two apart; `_COLUMNS_ADDED_AT_REVISION` below does.
+    ("7c3e9d51b2a8", frozenset(Base.metadata.tables)),
     ("a1c28e1b3f34", frozenset({
         "global_settings", "datasets", "destinations", "dataset_remotes",
         "retention_rules", "remote_server",
     })),
 )
 _OUR_TABLE_NAMES = frozenset().union(*(t for _, t in _TABLES_AT_REVISION))
+
+# Columns a revision ADDED to an existing table, as (table, column) pairs.
+# A revision that changes only columns leaves `_TABLES_AT_REVISION` unable to
+# distinguish it from its predecessor, and the first (newest) table-set match
+# would always win: a database at the older revision that lost its
+# `alembic_version` was told `alembic stamp head`, which makes `check_schema`
+# say "up to date" while every read fails with `OperationalError: no such
+# column: dataset_remotes.raw`. So a `_TABLES_AT_REVISION` entry matches only
+# if its table set is equal AND every column added at that revision or any
+# OLDER one is present. Add an entry here whenever a revision adds a column
+# (a table-creating revision needs only its `_TABLES_AT_REVISION` entry). The
+# same data backs `check_schema`'s defence in depth: a database STAMPED at
+# head but missing such a column is refused as `SchemaColumnsMissing`.
+_COLUMNS_ADDED_AT_REVISION: Dict[str, Tuple[Tuple[str, str], ...]] = {
+    "7c3e9d51b2a8": (
+        ("destinations", "server_fingerprint"),
+        ("global_settings", "client_cert_file"),
+        ("global_settings", "client_key_file"),
+    ),
+    "5d2f8a60c1e4": (("dataset_remotes", "raw"),),
+}
+
+
+def _columns_required_by(revision: str) -> Tuple[Tuple[str, str, str], ...]:
+    """`(adding_revision, table, column)` for every column a database at
+    `revision` must hold: those added at `revision` and at every older one
+    (those later in `_TABLES_AT_REVISION`, which is newest first)."""
+    revisions = [rev for rev, _names in _TABLES_AT_REVISION]
+    if revision not in revisions:
+        return ()  # nothing known about it (tests substitute a fake head)
+    older_or_same = revisions[revisions.index(revision):]
+    return tuple(
+        (rev, table, column)
+        for rev in older_or_same
+        for table, column in _COLUMNS_ADDED_AT_REVISION.get(rev, ())
+    )
+
+
+def _missing_columns(connection: Connection, revision: str) -> list:
+    """The `_columns_required_by(revision)` entries that `connection`'s
+    database does not hold, as `(adding_revision, table, column)`. A table
+    that is not there at all is not reported: that is a different damage
+    (the table-set checks and the read's own "no such table" own it), and a
+    column cannot be "added" to a table that does not exist."""
+    insp = inspect(connection)
+    present: Dict[str, set] = {}
+    missing = []
+    for rev, table, column in _columns_required_by(revision):
+        if table not in present:
+            present[table] = (
+                {c["name"] for c in insp.get_columns(table)}
+                if insp.has_table(table) else None
+            )
+        if present[table] is not None and column not in present[table]:
+            missing.append((rev, table, column))
+    return missing
+
+
+def _revision_before(revision: str) -> str:
+    """The revision that precedes `revision` in `_TABLES_AT_REVISION`: the one
+    to stamp a database that lacks the columns `revision` added, so that
+    `zfsbackup-config migrate` applies `revision` for real."""
+    revisions = [rev for rev, _names in _TABLES_AT_REVISION]
+    return revisions[revisions.index(revision) + 1]
+
+
+def _stamp_back_is_safe(revision: str) -> bool:
+    """Whether stamping the revision before `revision` and re-running
+    `migrate` can work for a database that has all of the tables: only if
+    `revision` created none (a column-only revision). The TLS revision
+    created tables as well as columns, so replaying it over a database that
+    already holds them fails with 'table already exists'; the only remedy
+    there is a backup."""
+    revisions = [rev for rev, _names in _TABLES_AT_REVISION]
+    tables = dict(_TABLES_AT_REVISION)
+    return tables[revision] == tables[revisions[revisions.index(revision) + 1]]
 
 
 def _unknown_revisions(revisions) -> list:
@@ -424,6 +504,22 @@ class SchemaIntegrityError(SchemaError):
     """
 
 
+class SchemaColumnsMissing(SchemaError):
+    """Raised by `check_schema` when a database is stamped at the head but
+    lacks a column that a revision at or below the head added
+    (`_COLUMNS_ADDED_AT_REVISION`).
+
+    How it arises: an unstamped database at an older, column-only revision
+    that was stamped `head` by hand (the advice an earlier version gave), or
+    a hand-edited file. Without this check `check_schema` and `migrate
+    --check` say "up to date" while every read fails with a bare
+    `OperationalError: no such column: ...`, which is not an exit-78 error
+    and names no remedy. The message gives the remedy: stamp the revision
+    before the one that added the column, then `zfsbackup-config migrate`
+    adds it for real.
+    """
+
+
 @dataclass(frozen=True)
 class SchemaUpgrade:
     """What `upgrade_schema` did. `from_revs` is the sorted tuple of
@@ -458,7 +554,10 @@ def _refuse_unrecorded_tables(connection: Connection) -> None:
     ours to migrate: raise instead of grafting the schema in (item 10.4).
 
     - The tables are EXACTLY the set some known revision leaves
-      (`_TABLES_AT_REVISION`: the head's, or the baseline's six) ->
+      (`_TABLES_AT_REVISION`: the head's, or the baseline's six) and hold
+      every column that revision and its predecessors added
+      (`_COLUMNS_ADDED_AT_REVISION`; so a column-only difference gets the
+      older revision's remedy, never `alembic stamp head`) ->
       `SchemaSplitBrain` (our tables, the stamp lost; the message names the
       revision they match and how to recover). Exactly, not "a subset"
       (item 10.5): a foreign file whose only table is called `datasets` must
@@ -474,7 +573,13 @@ def _refuse_unrecorded_tables(connection: Connection) -> None:
     if not tables:
         return
     found = set(tables)
-    matches = [rev for rev, names in _TABLES_AT_REVISION if found == names]
+    # Table names AND columns: a column-only revision shares its predecessor's
+    # table set, and the first match must not claim a database that lacks the
+    # columns of the revision it names (`_COLUMNS_ADDED_AT_REVISION`).
+    matches = [
+        rev for rev, names in _TABLES_AT_REVISION
+        if found == names and not _missing_columns(connection, rev)
+    ]
     if matches:
         revision = matches[0]
         if revision == EXPECTED_HEAD:
@@ -487,8 +592,9 @@ def _refuse_unrecorded_tables(connection: Connection) -> None:
         else:
             what = (
                 f"its tables are exactly those of this package's older "
-                f"schema revision {revision!r} (typically a first import "
-                f"interrupted before it committed)"
+                f"schema revision {revision!r} (a first import interrupted "
+                f"before it committed, or an older database whose stamp "
+                f"was lost)"
             )
             remedy = (
                 f"If the existing tables are at revision {revision!r}, fix "
@@ -670,6 +776,9 @@ def check_schema(connection: Connection) -> str:
       (`check_schema` cannot perform the initial migration; the text points
       at `zfsbackup-config import`, not `migrate`). The text is neutral
       about who is asking -- the daemon appends its own sentence.
+    - `SchemaColumnsMissing` if it is stamped at `EXPECTED_HEAD` but lacks a
+      column a revision added (a wrong hand-made stamp); the message names
+      the revision to stamp before `zfsbackup-config migrate`.
 
     Returns `EXPECTED_HEAD` with no exception only when the database's
     recorded heads are exactly `{EXPECTED_HEAD}`.
@@ -712,6 +821,30 @@ def check_schema(connection: Connection) -> str:
             f"{EXPECTED_HEAD}. Create "
             f"the configuration database with `zfsbackup-config import`.",
             recorded_revisions=(),
+        )
+
+    # Stamped at head: confirm the columns the revisions added are really
+    # there (see `SchemaColumnsMissing`). One PRAGMA per table involved.
+    missing = _missing_columns(connection, EXPECTED_HEAD)
+    if missing:
+        oldest = missing[-1][0]  # `_columns_required_by` is newest first
+        listed = ", ".join(f"{table}.{column}" for _rev, table, column in missing)
+        if _stamp_back_is_safe(oldest):
+            remedy = (
+                f"Fix this by stamping the revision before it (`alembic "
+                f"stamp {_revision_before(oldest)}`) and then running "
+                f"`zfsbackup-config migrate`; otherwise restore the "
+                f"database from a backup."
+            )
+        else:
+            # Revision `oldest` also created tables, which this database
+            # holds: replaying it would fail with 'table already exists'.
+            remedy = "Restore the database from a backup."
+        raise SchemaColumnsMissing(
+            f"{_db_label(connection)} is stamped at schema revision "
+            f"{EXPECTED_HEAD!r} but lacks {listed}, which revision "
+            f"{oldest!r} adds; the stamp does not match the tables. "
+            f"{remedy} Nothing was changed."
         )
 
     return EXPECTED_HEAD

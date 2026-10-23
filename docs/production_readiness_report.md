@@ -86,7 +86,8 @@ closing the identical latent gap before it could bite.
   an operator cleared it. Now:
   - **The client checks the token before using it:** `zfs send -nv -t` decodes it; the target must match a
     managed local snapshot of the same dataset by GUID (a token's `toname` goes stale after a rename); the
-    source must be older; no send flags are allowed (our plain send records none).
+    source must be older; the token's flags must fit the send mode (milestone B: plain `-L -c` accepts
+    ∅ ⊆ flags ⊆ {compressok, largeblockok}, raw `-w` requires rawok and allows compressok/largeblockok).
   - **Only definitive staleness leads to a fresh send.** Anything uncertain skips the cycle rather than
     discard the server's partial progress.
   - **`/stream?mode=fresh|resume`:** on `fresh`, the server discards stale partial state with an
@@ -107,14 +108,14 @@ closing the identical latent gap before it could bite.
       runs `zfs receive -A`. That favours keeping partial progress over making progress.
     - Resume-token checks happen only on the client; the server relies on the authenticated client id
       and the per-dataset lock.
-    - An encrypted dataset is still sent decrypted (non-raw) on a *fresh* send; the wire is now TLS, but
-      the stream carries the data decrypted. That isn't a resume issue; it needs a `raw` option and
-      server-side key handling.
-    - Resume with H5's `-I` is untested.
-- **H5 — Incremental sends use `-i`, not `-I`.** `RemoteBackupManager._transfer` (`remote.py`) emits a single increment,
-  so snapshots created *between* two backups are never replicated; the server's history
-  diverges from the client's. **Live-confirmed** in the two-VM run: the server was missing
-  intermediate snapshots the client had.
+    - *(Resolved in milestone B, S-6.)* Encrypted datasets are sent raw (`-w`) under the per-destination
+      `raw: auto` default, so the server never holds the key; a raw/plain mismatch with an existing server
+      copy is refused with the rename fix.
+    - Resume within the milestone-B `-i` chain is covered (a resume runs as step 0, then the rest of the chain).
+- **H5 — Incremental sends use `-i`, not `-I`.** *(Resolved in milestone B, B5-b.)* Every managed snapshot now
+  reaches the server as a chain of `-i` steps, oldest first by `createtxg`; unmanaged snapshots are never
+  sent. Before, `RemoteBackupManager._transfer` emitted a single increment and the server missed the
+  intermediate snapshots (live-confirmed in the two-VM run).
 
 ---
 

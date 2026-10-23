@@ -16,11 +16,15 @@ Nothing here talks to ZFS and no socket is opened.
 * `RealTrust` -- a REAL `api.TrustGateway` over a real config database (the real
   `zfsbackup.config.store.trust` writers) plus token / pin helpers.
 * `enroll_body` / `rotate_body` -- the request bodies of the wire contract.
+* `pending_configs` / `pending_guard` -- the live pending-config map (R0: the configurations negotiate
+  accepted for server datasets nothing has received yet) and its lock, found through the closures of
+  `create_app`.
 """
 
 import base64
 import contextlib
 import datetime as dt
+import inspect
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
@@ -383,3 +387,86 @@ def rotate_body(server_fp: str, client_id: str, old_fp: str, successor: ClientCe
         "version": 1, "successor_cert_pem": successor.cert_pem,
         "signature": successor.signature_b64(payload),
     }
+
+
+# ---------------------------------------------------------------------------
+# Internals of create_app that tests assert on
+# ---------------------------------------------------------------------------
+
+
+def _find_in_closures(app, name: str):
+    """The closure variable `name` of `create_app`, found by walking the closures reachable from the
+    app's views (breadth first, functions only). Tolerant of the helpers being moved around: it
+    only needs the name to be closed over by SOME function the views reach."""
+    seen, queue = set(), [v for v in app.view_functions.values()]
+    while queue:
+        fn = queue.pop(0)
+        fn = getattr(fn, "__wrapped__", fn)
+        if not inspect.isfunction(fn) or id(fn) in seen:
+            continue
+        seen.add(id(fn))
+        for var, cell in zip(fn.__code__.co_freevars, fn.__closure__ or ()):
+            try:
+                value = cell.cell_contents
+            except ValueError:          # an empty cell
+                continue
+            if var == name:
+                return value
+            queue.append(value)
+            queue.append(getattr(value, "__wrapped__", None))
+    raise LookupError(f"no function reachable from the views closes over {name!r}")
+
+
+def pending_configs(app):
+    """The live `server dataset -> (canonical config, client dataset)` map of `app`
+    (an `OrderedDict`, oldest first). Read it; to change it call the app."""
+    return _find_in_closures(app, "pending_configs")
+
+
+def pending_deadlines(app):
+    """The `server dataset -> monotonic deadline` map that goes with `pending_configs(app)`."""
+    return _find_in_closures(app, "pending_deadlines")
+
+
+def pending_guard(app):
+    """The lock that guards `pending_configs(app)`."""
+    return _find_in_closures(app, "pending_guard")
+
+
+def pending_api(app):
+    """`(claim, lookup, forget)`: `_claim_pending(server_dataset, canonical, dataset)` (record the entry,
+    -> the rival client dataset or None), `_pending(server_dataset)` and `_forget_pending(server_dataset)`
+    of `app`, the very functions its handlers call."""
+    return (_find_in_closures(app, "_claim_pending"), _find_in_closures(app, "_pending"),
+            _find_in_closures(app, "_forget_pending"))
+
+
+def streams_in_progress(app):
+    """The live set of server datasets with a stream or a negotiate in progress."""
+    return _find_in_closures(app, "streams_in_progress")
+
+
+class ApiClock:
+    """A settable monotonic clock for `zfsbackup.api` (the pending-config TTL). `advance(dt)` moves
+    it; only `api.time` is replaced (a copy of the `time` module with `monotonic` swapped), so no
+    other code sees the fake."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def patch_api_clock(mocker, start: float = 1000.0) -> ApiClock:
+    import time
+    import types
+
+    clock = ApiClock(start)
+    shim = types.SimpleNamespace(**{k: getattr(time, k) for k in dir(time) if not k.startswith("__")})
+    shim.monotonic = clock
+    mocker.patch("zfsbackup.api.time", shim)
+    return clock

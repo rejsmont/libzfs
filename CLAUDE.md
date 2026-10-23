@@ -94,35 +94,55 @@ reads one value exactly.
 
 ### `zfsbackup` — Automated snapshot daemon
 
-**[zfsbackup/config/model.py](zfsbackup/config/model.py)** — YAML config loader. `BackupConfig.from_file()` parses global settings and a list of `DatasetConfig` objects. Each dataset has a `frequency` (how often to snapshot) and tiered `retention` rules (`RetentionRule(age, keep_for)`). Time durations use a custom format: `m`=minutes, `h`=hours, `d`=days, `w`=weeks, `M`=months (~30d), `y`=years (~365d). Destination URLs must be `https://` with a non-zero port (`Destination.server_fingerprint` is the pinned server certificate, set by `enroll`); `client_cert_file`/`client_key_file` are optional absolute overrides (both or neither). The client id is **not** configuration: its grammar (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, `client_id_problem`) and generator live here, but the value lives in the `host_identity` table, and `from_file` refuses the old file-based setting with a pointer to `identity set-client-id`.
+**[zfsbackup/config/model.py](zfsbackup/config/model.py)** — YAML config loader. `BackupConfig.from_file()` parses global settings and a list of `DatasetConfig` objects. Each dataset has a `frequency` (how often to snapshot) and tiered `retention` rules (`RetentionRule(age, keep_for)`). Time durations use a custom format: `m`=minutes, `h`=hours, `d`=days, `w`=weeks, `M`=months (~30d), `y`=years (~365d). Destination URLs must be `https://` with a non-zero port (`Destination.server_fingerprint` is the pinned server certificate, set by `enroll`); `client_cert_file`/`client_key_file` are optional absolute overrides (both or neither). The client id is **not** configuration: its grammar (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, `client_id_problem`) and generator live here, but the value lives in the `host_identity` table, and `from_file` refuses the old file-based setting with a pointer to `identity set-client-id`. `RemoteDatasetConfig.raw` (`Optional[bool]`: `auto`/omitted = None = raw iff the dataset is encrypted, `true`, `false`) is per dataset × destination, client-side only (`to_property` never carries it). `duration_ok`/`wire_config_problem` (positive durations, config shape) are shared by the server's negotiate and pruner.
 
 **[zfsbackup/backup_manager.py](zfsbackup/backup_manager.py)** — Core logic:
 - `DatasetManager` — owns the list of `DatasetInfo` objects, checks whether a snapshot is due (`needs_snapshot`), creates snapshots via `libzfseasy`, and lists existing ones
 - `DatasetInfo` — pairs a `libzfseasy.Dataset` with its `DatasetConfig`; computes the aligned reference time for period boundaries
-- `SnapshotInfo` — wraps a `libzfseasy.Snapshot`; parses the `{prefix}_{YYYYMMDDHHMMSS}` name to get a timestamp and calculates age
-- Retention/destruction lives on `DatasetManager` too — the tiered slot-based `needs_prunning` (keeps the oldest snapshot per time slot, always keeps `snapshots[0]`, skips anchored snapshots) and `prune_snapshots` (destroys in batches, honors `dry_run`). Anchor state is stored in the `org.zfsbackup:anchor.*` user properties. A recursive prune (`zfs destroy -r`) never destroys a name a descendant protects — its local/received anchors (one `zfs get -r`) or an enabled configured descendant's own retention — and skips the dataset if those cannot be read. Received datasets (server side) are always pruned non-recursively: the client never sends `-R`, so each received child is its own client dataset with its own retention.
+- `SnapshotInfo` — wraps a `libzfseasy.Snapshot`; a snapshot is managed only if its name is exactly `{prefix}_{14 digits}` (a suffix makes it unmanaged); carries `createtxg`, `guid`, `userrefs`, `clones`, `encrypted`, `key_loaded` from the one listing (`SNAPSHOT_LIST_PROPERTIES`), sorted newest first by `createtxg` (`snapshot_order_key`; `snapshot_newer` is False when either txg is unknown); a snapshot without `createtxg` is dropped with one WARNING. Names give slot and age only; every newest/older comparison uses `createtxg`. A newest name dated beyond `max(5 min, check_interval)` in the future → ERROR once ("check NTP") and the dataset is due; a generated name that already exists → WARNING once, not due (backwards clock).
+- Retention/destruction lives on `DatasetManager` too — the tiered slot-based `needs_prunning` (keeps the oldest snapshot per time slot, always keeps the newest by `createtxg`, skips anchored snapshots) and `prune_snapshots` (batches of 20, honors `dry_run`). Held (`userrefs > 0`) or cloned candidates are skipped up front; a failed batch is retried one snapshot at a time; a name that still won't go is remembered in `_prune_stuck` (WARNING once, tried alone each cycle, INFO when it finally goes). Anchors, inflight pins and descendants' protection are re-read right before every destroy call (`_still_prunable`, the dataset's own properties read last; a failed re-read destroys nothing), because a chain step may become anchored during the pass. Anchor state is stored in the `org.zfsbackup:anchor.*` user properties. A recursive prune (`zfs destroy -r`) never destroys a name a descendant protects — its local/received anchors (one `zfs get -r`) or an enabled configured descendant's own retention — and skips the dataset if those cannot be read. Received datasets (server side) are always pruned non-recursively: the client never sends `-R`, so each received child is its own client dataset with its own retention.
 
 **[zfsbackup/daemon.py](zfsbackup/daemon.py)** — `BackupDaemon` is a **multiprocessing supervisor**, not a single-process loop: it owns a shared **`zfsbackup.stopflag.StopFlag`** (a lock-free shared byte — **not** a `multiprocessing.Event`; see below), installs `SIGINT`/`SIGTERM`/`SIGHUP` handlers, spawns the worker processes, then polls and restarts any that die. It also runs the live-reload state machine: a SIGHUP or the 10 s poll leads to read, validate, build and the pre-start checks; then the `Handoff` swap and a `ReloadEpoch` bump; then a staggered turnover (see Live reload below). The supervisor itself makes **no `zfs` call** (a hung pool must not stall signals or restarts). Under the `forkserver` start method (the Linux default from Python 3.14) a dead forkserver makes `poll()` report every worker as exit 255 while they live: such workers are classified *lost* by process identity (start token), counted toward no restart limit, and replaced only once the orphan has exited. Entry point: `python -m zfsbackup.daemon` (flags `-c/--config`, `-d/--dry-run`, `-v/--verbose`, `--test-config`).
 
-**[zfsbackup/workers.py](zfsbackup/workers.py)** — the per-dataset work runs here. `BaseWorker.run` builds a `DatasetManager`, iterates its datasets calling an abstract `_process_dataset`, and sleeps in short slices (`_wait`), checking at every safe point (loop top, between datasets and remote destinations, each slice) for an `ExitReason`: STOP, then SUPERVISOR_GONE, then RELOAD. RELOAD means the shared `ReloadEpoch` moved past the worker's `born_epoch`, and the worker exits with code 3 (`WORKER_EXIT_RELOAD`) to be respawned on the new config (`_SupervisorWatch` — an orphaned worker exits on its own, never mid-transfer). Workers receive the supervisor's config object (and the client id) and never open the config DB, with one exception: the API worker, which reaches the trust tables only through `zfsbackup.config.store.trust` (see "Who reads and writes what"). Subclasses: `SnapshotWorker` (first, once per incarnation, checks the datasets exist and syncs their `org.zfsbackup:config` property — work the supervisor used to do), `PruningWorker`, `RemoteBackupWorker` (lazy-imports `RemoteBackupManager`; gets the `client_id` and the `<db>.tls/` path), `ApiWorker` (HTTPS only; binds the server in its main thread and exits 1 if it cannot, so the supervisor's backoff applies; on reload it drains in-flight receives through `api.StreamGate`, answering 503 + retry meanwhile, then calls `server.shutdown()`; see the TLS paragraph below). Every worker holds `<db>.workers.lock` `LOCK_SH` for life.
+**[zfsbackup/workers.py](zfsbackup/workers.py)** — the per-dataset work runs here. `BaseWorker.run` builds a `DatasetManager`, iterates its datasets calling an abstract `_process_dataset`, and sleeps in short slices (`_wait`), checking at every safe point (loop top, between datasets and remote destinations, each slice) for an `ExitReason`: STOP, then SUPERVISOR_GONE, then RELOAD. RELOAD means the shared `ReloadEpoch` moved past the worker's `born_epoch`, and the worker exits with code 3 (`WORKER_EXIT_RELOAD`) to be respawned on the new config (`_SupervisorWatch` — an orphaned worker exits on its own, never mid-transfer). Workers receive the supervisor's config object (and the client id) and never open the config DB, with one exception: the API worker, which reaches the trust tables only through `zfsbackup.config.store.trust` (see "Who reads and writes what"). Subclasses: `SnapshotWorker` (first, once per incarnation, checks the datasets exist and syncs their `org.zfsbackup:config` property — work the supervisor used to do), `PruningWorker`, `RemoteBackupWorker` (lazy-imports `RemoteBackupManager`; gets the `client_id` and the `<db>.tls/` path; an anchor dated beyond the clock tolerance makes the destination due, ERROR once), `ApiWorker` (HTTPS only; binds the server in its main thread and exits 1 if it cannot, so the supervisor's backoff applies; on reload it drains in-flight receives through `api.StreamGate`, answering 503 + retry meanwhile, then calls `server.shutdown()`; see the TLS paragraph below). Every worker holds `<db>.workers.lock` `LOCK_SH` for life.
 
 **[zfsbackup/remote.py](zfsbackup/remote.py)** / **[zfsbackup/api.py](zfsbackup/api.py)** — remote send/receive transfer (`RemoteBackupManager`) and the HTTP control API (`create_app`). Transport is TLS 1.3 with mutual authentication and fingerprint pinning (B1 is resolved); the residual caveats are in [docs/production_readiness_report.md](docs/production_readiness_report.md) (werkzeug's development server, no mid-stream revocation, no rate limiting on `/enroll`).
-Resume: the client fetches the server's `receive_resume_token`, decodes it with `zfs.send.resume_info`
-(`zfs send -nv -t`) and resumes only a managed local snapshot of the same dataset matched **by guid**
-with no send flags; definitive staleness → a fresh send, anything uncertain → skip the cycle. `/stream`
-takes `?mode=fresh|resume`; on `fresh` the server aborts stale partial state (`zfs receive -A`). The anchor
-records the snapshot actually sent (never backwards) and a resumed older snapshot is followed by a send to
-`latest` in the same cycle. `org.zfsbackup:inflight.<dest>` = `<from>,<to>` pins snapshots while they are
-sent (the pruner protects them like anchors; `rename` copies/clears them like anchors). Two client
-datasets mapping to one server dataset are refused (409); a concurrent stream for the same server dataset
-gets a retryable `busy`.
+Send flags are frozen (OpenZFS 2.1/2.2/2.4 captures in `tests/fixtures/openzfs/`): plain `-L -c`, raw `-w`, a
+resume is `zfs send -t` with no flags; `-L` is permanent once received. The mode is decided once per dataset ×
+destination from the newest snapshot's encryption/keystatus and `raw` (`raw: true` on an unencrypted dataset, or
+plain with the key unloaded → one ERROR, nothing sent); negotiate reports `server_copy: none|plain|raw` and a
+mismatch is refused with one ERROR naming the `zfs rename` fix (the client never touches server data).
+Intermediates go as a chain of `-i` steps: every managed snapshot newer by `createtxg` than the common one,
+oldest first; per step pin (`org.zfsbackup:inflight.<dest>` = `<from>,<to>`), send, ack, anchor, then check the
+sent snapshot still exists by guid (gone → anchor back to the base, pin kept, chain stops). The pin stays until
+the next step overwrites it and is cleared after the last step. A first full sends the newest only; a stop
+between steps pauses the chain; a vanished member is rebuilt around; a named common snapshot that is not managed
+skips the cycle; the anchor never moves backwards. Resume: the client fetches the server's
+`receive_resume_token`, decodes it with `zfs.send.resume_info` (`zfs send -nv -t`), and accepts it only for a
+managed local snapshot matched **by guid** whose flags satisfy `required <= flags <= allowed` for the mode (plain:
+∅ ⊆ flags ⊆ {compressok, largeblockok}; raw: {rawok} ⊆ flags ⊆ {rawok, compressok, largeblockok}; never
+embedok/savedok); definitive staleness → a fresh send, anything uncertain → skip the cycle. A resume runs as
+step 0, then one re-negotiate and the rest of the chain. `/stream` takes `?mode=fresh|resume`; on `fresh` the
+server aborts stale partial state (`zfs receive -A`). The pruner protects pinned snapshots like anchors; `rename`
+copies/clears them like anchors. The remote worker sends each client's datasets parents first.
+Negotiate holds the server dataset's claim (a concurrent negotiate or stream gets the retryable `busy` 503) and,
+for a missing dataset, creates only its parent chain and keeps the canonical config in an in-memory pending map
+(TTL 600 s, refreshed by each negotiate, capped at 4096, lost on restart); the receive itself creates the leaf
+(raw streams and encrypted targets need that), so `-F` is passed only when the dataset exists. Two client
+datasets mapping to one server dataset are refused (409), including against a live pending entry or an unowned
+placeholder; a child whose ancestor is claimed, pending, or a new partial receive gets 503 retry; configs over
+8 KiB are refused (400). The server releases a stream's claim before any reply, so chain steps run back to back. A connection failure
+before any stream byte on a step after a successful one in the same cycle (typically the server's API worker
+exiting for a reload) is retried for the connect only (`CONNECT_RETRY_DELAYS`, ~7 s, stop-aware), then stops the
+chain quietly (INFO, `_STOP`); on the first stream of a cycle it is an ERROR as before.
 Wire protocol (`zfsbackup/protocol.py`): every request carries `X-Zfsbackup-Protocol: 1`; anything else gets
 426 (after authentication, so an untrusted caller still sees 401/403 first) on every endpoint except `/health`, and `/whoami`, `/enroll` and `/rotate` report `protocol`. Client and
 server must be upgraded together.
 Trust boundary on the server (one client's values must never reach another client's data): negotiate stores
 only a canonical re-encoding of the client's config; every receive passes `client_id` (from the certificate
-binding), `source_dataset` and that stored `config` as `-o` (`-x` does not protect local values on a full `-F`
-receive of a `-p` stream), and a stream with no stored local config is refused. `received_datasets()` lists
+binding), `source_dataset` and that config (the dataset's local value, else this client dataset's live pending
+entry) as `-o` (`SERVER_OWNED_PROPERTIES`; `-x` does not protect local values on a full `-F` receive of a `-p`
+stream), and a stream with neither is refused ("negotiate again", retryable). `received_datasets()` lists
 names only, then reads each dataset's `client_id`/`config` with `zfs.get.value(sources='local')` and skips (one
 WARNING) anything outside `<target>/<client_id>/`, with an invalid id, or with a config that is missing,
 undecodable or only received. The client's sent values survive as hidden `received` values under the server's
@@ -289,10 +309,13 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_real_zfs.py` | Real ZFS commands, marked `real_zfs` |
 | `tests/test_commands_part2.py` | Command classes `AllowCommand` through `MountCommand` |
 | `tests/test_zfsbackup_basic.py` | Package smoke tests |
-| `tests/test_zfsbackup_manager.py` | `DatasetManager`, retention/pruning |
+| `tests/test_zfsbackup_manager.py` | `DatasetManager`, retention/pruning; the one six-column listing and txg order; B-4 prune fallback, held/cloned pre-skip, stuck names, protection re-read before every destroy |
 | `tests/test_zfsbackup_prune_descendants.py` | Recursive prune honours descendants' anchors and configured retention; received datasets pruned non-recursively |
+| `tests/test_openzfs_formats.py` | Captured OpenZFS 2.1.5/2.2.2/2.4.1 output (`tests/fixtures/openzfs/`, loader `tests/_openzfs_fixtures.py`) replayed through `resume_info`, destroy, list/get and zfsbackup's stale-token and `receive -A` classifiers |
+| `tests/test_zfsbackup_store_raw.py` | `dataset_remotes.raw` migration up/down, mapper round trip, column-aware stamp advice and `SchemaColumnsMissing`, the column-registry guard |
+| `tests/test_zfsbackup_cli_raw.py` | `raw` through render/export/import, get/set/unset, list, edit, and the warning on a change |
 | `tests/test_zfsbackup_prune_forged_bytes.py` | B-1 end to end: forged `zfs -H` bytes through the real libzfseasy parsers into `received_datasets()`/`prune_snapshots()`; another client's snapshots are never destroyed (`bk/A` vs `bk/Ax`) |
-| `tests/test_zfsbackup_snapshot_info.py` | `SnapshotInfo` / `DatasetInfo` time computation |
+| `tests/test_zfsbackup_snapshot_info.py` | `SnapshotInfo` / `DatasetInfo` time computation; strict name parse, `snapshot_order_key`/`snapshot_newer`, clock rules |
 | `tests/test_zfsbackup_daemon.py` | `BackupDaemon` supervisor: single config read, handoff to workers, presence lock |
 | `tests/test_zfsbackup_workers.py` | Worker loop and interval behaviour; config pickling across start methods |
 | `tests/test_zfsbackup_daemonlock.py` | Daemon presence lock: held/stale/contention, permissions, fork vs spawn |
@@ -301,16 +324,16 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_signals.py` | Fork-pinned SIGINT/SIGTERM reset in worker children |
 | `tests/test_zfsbackup_stopflag.py` | `StopFlag` semantics |
 | `tests/test_zfsbackup_stop_signals.py` | Real daemon: kill a worker, then signal the supervisor — must exit, not wedge |
-| `tests/test_zfsbackup_api.py` | HTTP control API behind a stubbed trust gateway (stream modes, abort, 409 collision, busy lock, receive error reporting) |
-| `tests/test_zfsbackup_api_negotiate.py` | `/negotiate` input validation: body shape, canonical config (positive durations), client dataset names, 400 before any write |
+| `tests/test_zfsbackup_api.py` | HTTP control API behind a stubbed trust gateway (stream modes, abort, 409 collision, busy lock, receive error reporting, the claim released before every reply, the receive creating the leaf) |
+| `tests/test_zfsbackup_api_negotiate.py` | `/negotiate`: body shape, canonical config (positive durations, 8 KiB cap), client dataset names, 400 before any write; parent-only creation, pending map (TTL, bounds, refresh), `server_copy`, placeholder ownership (D7), the negotiate claim, unsettled ancestors |
 | `tests/test_zfsbackup_api_protocol.py` | Wire protocol header: 426 matrix (`/health` exempt, `/enroll` first), `protocol` in `/whoami`/`/enroll`/`/rotate`, per-peer refusal log cap |
-| `tests/test_zfsbackup_api_receive.py` | Receive ownership: `-o` of `config`/`client_id`/`source_dataset` on fresh and resume, refusal without a stored config, recreate-after-abort stamps |
+| `tests/test_zfsbackup_api_receive.py` | Receive ownership: `-o` of `config`/`client_id`/`source_dataset` on fresh and resume, config from the pending entry, refusal without one, `-F` only when the dataset exists, the placeholder-overwrite message |
 | `tests/test_zfsbackup_api_auth.py` | Authentication and authorization: 401/403, the client-id binding (cert B cannot touch A's data), `/whoami`, the `/enroll` and `/rotate` matrices against a real trust store, predecessor retirement, `TrustGateway` |
 | `tests/test_zfsbackup_api_tls.py` | API worker TLS: per-connection handshake, TLS 1.3 only, connection caps and deadlines, revocation/addition with no restart, real `ApiWorker` under fork/spawn/forkserver, dry-run throwaway identity |
 | `tests/test_zfsbackup_api_wssession.py` | Websocket `_SessionSocket`: fd never closed while a reader is inside it, serialised writes, `end()`/hand-over close, no response after the upgrade, `ws_end_timeout` validation |
 | `tests/test_zfsbackup_api_drain.py` | Post-response drain: client teardown after a response or websocket session is quiet (DEBUG, no traceback), bounded drain deadline, post-websocket 200 never written, websocket reader joined before `/stream` returns |
 | `tests/test_zfsbackup_api_bind.py` | API server binds without a reverse DNS lookup |
-| `tests/test_zfsbackup_remote.py` | `RemoteBackupManager`: negotiation, resume protocol, transfer (the pinned transport is faked) |
+| `tests/test_zfsbackup_remote.py` | `RemoteBackupManager`: negotiation, the `-i` chain (order, pins kept between steps, anchors, stop, rebuild, backstop), resume as step 0, per-mode token matrix, send modes and `server_copy` mismatch (the pinned transport is faked) |
 | `tests/test_zfsbackup_config.py` | Config loading, retention collapse, per-destination rules |
 | `tests/test_zfsbackup_duration.py` | The `Duration` type and its literal preservation |
 | `tests/test_zfsbackup_store_tls_schema.py` | Trust/identity schema and migration `7c3e9d51b2a8`, new `validate_config` rules, `ConfigSnapshot.client_id`, `import` keeps the id and the trust tables |
@@ -355,7 +378,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_orphan_safety_net.py` | The orphan net and test hygiene: fork-without-exec, subreapers, fresh session marker, real-tier opt-in skip, hermetic env, guard PATH |
 | `tests/test_no_real_zfs_guard.py` | The conftest guard that fails any test reaching a real `zfs`/`zpool` |
 | `tests/test_marker_tiers.py` | `unit` and `integration` partition the mocked suite |
-| `tests/test_zfsbackup_real.py` | Daemon against a real pool, marked `real_zfs` |
+| `tests/test_zfsbackup_real.py` | Daemon against a real pool, marked `real_zfs`: end-to-end mTLS send/receive, plain and raw chains, R0 layouts (raw/plain under encrypted and unencrypted targets), held/cloned prune, txg order, the user-property size limit |
 
 Tests without a `unit`/`integration`/`real_zfs` marker are marked `unit` by a hook in `conftest.py`.
 
@@ -364,6 +387,13 @@ Shared TLS test helpers (importable from any test module; `tests/` is on `sys.pa
 - `tests/_api_support.py` — client certificates, `FakeGateway`, `Authed` (a Flask app presenting `SSL_CLIENT_CERT`), `RealTrust`, the `/enroll` and `/rotate` request bodies.
 - `tests/_remote_support.py` — `make_transport`, `fake_connect_pinned`, `client_tls_dir`, `whoami_json` for `RemoteBackupManager` tests.
 - `tests/_enroll_support.py` — `RealServer` (real app + real gateway + real TLS listener) for the `enroll`/`identity rotate` CLI tests; `tests/_pty_driver.py` answers a prompt on a real pty.
+
+Other shared helpers:
+- `tests/_snapshot_support.py` — `listed_snapshot`/`listed_info`/`list_row` (snapshots and `zfs list` rows with the six listing columns; `txg=` to make txg order differ from name order) and a `frozen_clock` fixture.
+- `tests/_prune_support.py` — `PrunePool`, a stateful fake of list/get/destroy with OpenZFS's all-or-nothing destroy and the captured per-version stderr; `before_destroy` hooks inject races; the `prune_pool` fixture fails a test that destroys an empty list.
+- `tests/_raw_support.py` — databases built through the real migrations at a given revision, stamp helpers, `stub_table_ddl()` (stub tables carrying every registered column).
+- `tests/_openzfs_fixtures.py` — `load_section(version, section)` / `load_m1_summary(version)` over `tests/fixtures/openzfs/{2.1.5,2.2.2,2.4.1}/` (regenerate with `scenarios/test_openzfs_matrix.sh --captures`).
+- When verifying a commit in a `git worktree`, run `PYTHONPATH=<worktree> <venv python> -m pytest`: the editable install otherwise imports the main tree.
 
 The `mock_subprocess` fixture in `conftest.py` patches `subprocess.Popen`. Use `mock_subprocess.setup(stdout=[...], stderr='', returncode=0)` for a single call and `mock_subprocess.setup_multi(...)` for sequences.
 
