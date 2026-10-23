@@ -216,7 +216,9 @@ holds before and after B-2a, the S-8 contract, B-6 first without status files, C
    - the D7 hung-pool test on a disposable `zfsb-hang` VM;
    - L1's stale "receive -x" wording.
 6. **Carried in from milestone B's final review (2026-10-22):**
-   - **B-2b must keep the chain recoverable.** The milestone-B anchor backstop puts the anchor back on the base
+   - **RESOLVED in milestone C (2026-10-22): B-2b was pulled forward** after scenario R2c showed the data loss;
+     the backstop stays recoverable through the client's `discard` permit (CLAUDE.md, remote paragraph).
+     Original note: **B-2b must keep the chain recoverable.** The milestone-B anchor backstop puts the anchor back on the base
      when a just-sent snapshot vanished on the client, while the server keeps it; the next `-i base …` works only
      because `-F` rolls that server-only snapshot back. With "`-F` only onto a dataset with no snapshots" that
      becomes a permanent "does not match incremental source" stall, so B-2b needs a rule for it (e.g. allow `-F`
@@ -227,6 +229,13 @@ holds before and after B-2a, the S-8 contract, B-6 first without status files, C
    - **S-3: the R0 pending map is evicted globally** (LRU, 4096 entries): an enrolled client negotiating thousands
      of names can evict other clients' entries (their next stream is refused with "negotiate again", retryable).
      Out of scope under Q1, but cap it per client id when S-3 adds per-client limits.
+   - **Deferred from the B-2b reviews (2026-10-22):** (a) `-F` is decided from a listing but applied by the kernel at
+     the end of the receive, so a snapshot that appears on the server copy mid-receive (an operator's `zfs snapshot
+     -r`, or an orphaned `zfs receive` of a previous API worker committing late) is destroyed unpermitted; fix by
+     passing `-F` only when needed (the permitted discard, or a head modified since the base) and verify a resume
+     without `-F` first (M7 U2 shows it fails when newer snapshots exist); README documents the residual. (b) Check
+     the stream's DRR_BEGIN `drr_fromguid` against the declared `from_guid` before spawning `zfs receive`. (c) An
+     exiting API worker should reap its `zfs receive` children before it exits.
    - **A child backed up before its parent** is handled by the remote worker sending parents first (milestone B);
      a parent added to the config after its child has been backed up still meets the placeholder refusal, which
      needs the operator's rename (documented in the runbook, milestone C's B-9).
@@ -1175,7 +1184,7 @@ B-9 can be written so it is correct whether or not B-2a has landed. That keeps t
   - Raw restores: `zfs load-key` with the client's original key, then `zfs mount`.
 - **Seed and rejoin (needs verifying in R2):**
   - An in-place restore lets the client resume incrementals only if it restores the **server's newest** snapshot.
-  - If it restores an older one, the next client → server incremental has a base that is not the server's most recent snapshot. That fails today, since `-F` only rolls back to the most recent snapshot, and it fails after B-2b too. The runbook then says to rename the server copy aside (see 2).
+  - If it restores an older one, the next client → server incremental has a base that is not the server's most recent snapshot. (Correction, 2026-10-22: this did NOT fail before B-2b. `-F` on a `-i` receive destroyed every server snapshot newer than the base, on 2.1, 2.2 and 2.4; captures M7. Since B-2b the server refuses it.) The runbook says to rename the server copy aside (see 2), or destroy the newer snapshots if they are expendable.
 - **Holds:** after B-2a the server has none (`-h`), so restore needs no `zfs release` step.
 
 **Changes to scenario R (C23, `real-zfs-scenario-dev`):**

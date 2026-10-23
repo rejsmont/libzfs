@@ -119,10 +119,15 @@
 #            ONE WARNING for the cloned one); after the clone is destroyed that snapshot goes and the next incremental still succeeds
 #        R2  a full restore in place: (a) from the server's NEWEST snapshot (the original renamed aside first): guids equal, the next cycle is
 #            INCREMENTAL; (b) a `-p` restore: the received values are asserted for whichever received-dataset semantics the server copy has
-#            (B-2a hardening or not), the documented fix, and `-x` keeps them out; (c) from an OLDER snapshot, which the README says cannot
-#            rejoin: the client is refused every cycle and the server copy is untouched (see the finding the scenario prints if it is not)
-#        R3  no common snapshot: the full send onto a server copy that has snapshots is refused every cycle, the server copy and history
-#            are untouched; after the documented rename aside a full send succeeds and the aside copy is intact
+#            (B-2a hardening or not), the documented fix, and `-x` keeps them out; (c) from an OLDER snapshot: the server never rolls its
+#            history back for the client, so the client logs ONE ERROR (naming the server copy, the newer snapshots and the `zfs rename` /
+#            `zfs destroy <ds>@<first>%<last>` fixes) and sends nothing, the server copy is untouched; then the printed destroy is run and the
+#            next cycle is the incremental from the common snapshot; (d) an in-place `zfs rollback -r`: the same refusal, the local anchor
+#            survives the rollback, then the rename-aside fix (the next cycle is a full send, the aside copy keeps its whole history);
+#            (e) the backstop's end state (acked snapshot destroyed on the client, anchor back at the base): the next cycle continues and
+#            the server replaces exactly that snapshot (server WARNING)
+#        R3  no common snapshot: ONE client ERROR (no full-stream attempt per cycle), the server copy and history are untouched; after the
+#            documented rename aside a full send succeeds and the aside copy is intact
 #        R4  a raw restore of an encrypted dataset (the server cannot mount or read it; `zfs send -w`; a wrong key is refused, the original
 #            key loads it; the next cycle is a raw incremental)
 #        R5  the host's `zfsbackup-config backup`, restored with the README's steps onto a host whose <db>.tls exists and whose check timer is
@@ -789,6 +794,11 @@ CK_READY=1; R_READY=1
 for vm in "$SERVER_VM" "$CLIENT_VM"; do
     msh "$vm" "test -f '$SRC_DIR/zfsbackup/cli/check.py'" || CK_READY=0
     msh "$vm" "test -f '$SRC_DIR/zfsbackup/cli/backup.py'" || R_READY=0
+done
+# B-2b (the server never rolls its history back for a client): scenario R2c-R3 assert the refusal and its ERROR wording.
+for vm in "$SERVER_VM" "$CLIENT_VM"; do
+    msh "$vm" "grep -q '_rollback_permit' '$SRC_DIR/zfsbackup/remote.py' && grep -q 'decide_receive' '$SRC_DIR/zfsbackup/api.py'" \
+        || warn "$vm: shipped tree ($SRC_REF) lacks the B-2b rollback refusal (_rollback_permit / decide_receive): R2c, R2d, R2e and R3 will FAIL (ship the work tree: SRC_REF=WORKTREE)"
 done
 [ "$CK_READY" -eq 1 ] || warn "shipped tree ($SRC_REF) has no \`zfsbackup-config check\`: scenario CK will be skipped"
 [ "$R_READY" -eq 1 ] || warn "shipped tree ($SRC_REF) has no \`zfsbackup-config backup\`: scenario R will be skipped"
@@ -2781,11 +2791,15 @@ fi
 #   R2  full restore in place: (a) from the server's NEWEST snapshot, the original renamed aside first (as the README says): guids equal, readonly
 #       as sent, no received properties, and the next cycle is INCREMENTAL (seed and rejoin); (b) a `-p` restore: what arrives as RECEIVED values is
 #       asserted for whichever received-dataset semantics the server copy has (B-2a: readonly/canmount/volmode), then undone as documented, and the
-#       `-x` receive brings none of them; (c) from an OLDER snapshot: it cannot rejoin (the documented negative case), the server copy and its history
-#       stay untouched, the client logs a refusal each cycle
-#   R3  no common snapshot (the client dataset recreated from scratch): the client's full send onto the server copy that has snapshots is refused
-#       every cycle and the server copy and its history stay untouched; after the documented rename aside a full send succeeds into a fresh dataset
-#       and the aside copy is intact
+#       `-x` receive brings none of them; (c) from an OLDER snapshot: it cannot rejoin (the server never rolls its history back for a client), the
+#       server copy and its history stay untouched, the client logs ONE ERROR per episode naming the `zfs rename` and `zfs destroy <ds>@<a>%<b>`
+#       fixes; the printed destroy is run and the next cycle is the incremental from the common snapshot; (d) an in-place `zfs rollback -r`:
+#       the same refusal, the local anchor survives the rollback, then the rename-aside fix (next cycle = full send, the aside copy keeps its
+#       history); (e) the backstop's end state (the pin and anchor as the backstop leaves them, built by hand: the race cannot be timed from
+#       a shell): the next cycle continues and the server replaces exactly the one acked snapshot the client no longer has (server WARNING)
+#   R3  no common snapshot (the client dataset recreated from scratch): ONE client ERROR (the A4 wording: the server copy holds snapshots none of
+#       which this host has; no full-stream attempt per cycle), the server copy and its history stay untouched; after the documented rename
+#       aside a full send succeeds into a fresh dataset and the aside copy is intact
 #   R4  raw restore of an encrypted dataset: the server cannot read it (no key), `zfs send -w` back, the wrong key is refused, the original key
 #       loads it, the data matches, and the next cycle is a raw INCREMENTAL
 #   R5  the host's configuration backup: (a) a client's DB + .tls restored (existing .tls moved aside, check timer enabled and stopped around it):
@@ -3007,9 +3021,11 @@ else
     msh "$CLIENT_VM" "zfs destroy -r '$SOURCE_DS'" || true
 
     echo
-    step "R2c — a restore from an OLDER snapshot cannot rejoin (the documented negative case)"
+    step "R2c — a restore from an OLDER snapshot cannot rejoin: the server never rolls its history back; ONE ERROR names the way out"
     R_OLD="$R_S2"
     R_PRE="$(r_fp "$SERVER_VM" "$SD")"
+    R_NEWER="$(r_snaps "$SERVER_VM" "$SD" | sed -n "/^${R_OLD}\$/,\$p" | sed 1d)"       # the server snapshots newer than the restored one
+    R_NEWER_FIRST="$(printf '%s\n' "$R_NEWER" | head -n1)"; R_NEWER_LAST="$(printf '%s\n' "$R_NEWER" | tail -n1)"
     if r_restore_send "-L -c" "$SD@$R_OLD" -u "$SOURCE_DS"; then pass "(R2c) the older snapshot $R_OLD was restored in place"; else fail "(R2c) the restore of $R_OLD failed"; fi
     r_guid_eq R2c "$SOURCE_DS" "$SD" "$R_OLD"
     r_write "$SOURCE_DS" f5.bin 300000; R_S5="$(r_snap "$SOURCE_DS")"
@@ -3017,20 +3033,117 @@ else
     start_daemon "$CLIENT_VM"
     sleep 80      # at least two remote cycles (30s)
     check "(R2c) $R_S5 did NOT reach the server" "no" "$(r_snaps "$SERVER_VM" "$SD" | grep -qx "$R_S5" && echo yes || echo no)"
-    check "(R2c) the server copy and its whole history are untouched (names and guids)" "$R_PRE" "$(r_fp "$SERVER_VM" "$SD")"
-    nref="$(r_refusals "$mark_c" | wc -l | tr -d '[:space:]')"
-    if [ "$nref" -ge 2 ]; then pass "(R2c) the client logs a refusal on each cycle ($nref WARNING/ERROR lines in 80s)"; else fail "(R2c) expected a refusal per cycle, saw $nref WARNING/ERROR lines"; fi
-    r_refusals "$mark_c" | head -n 3 | cut -c1-300 | sed 's/^/    client: /'
-    check_lacks "(R2c) the client sent no full stream and the server saw no destroy" "Backup complete|Pruned ${SD}" "$(log_since_vm "$CLIENT_VM" "$mark_c") $(log_since_vm "$SERVER_VM" "$mark_s" | grep "Pruned ${SD}")"
-    if r_snaps "$SERVER_VM" "$SD" | grep -qx "$R_S5"; then
-        finding "(R2c) PRODUCT/README: restoring an OLDER snapshot in place and continuing DID rejoin: the client's incremental ${R_OLD} -> ${R_S5} was accepted (zfs receive -F rolled the server copy back to ${R_OLD} and DESTROYED its newer snapshots). The server copy now holds: $(r_snaps "$SERVER_VM" "$SD" | tr '\n' ' '). README \"Rejoining\" says the send is refused and the server copy is never rewritten"
-    fi
-    R_R2C_MSG="$(r_refusals "$mark_c" | head -n 1 | cut -c1-300)"
+    if [ "$R_PRE" = "$(r_fp "$SERVER_VM" "$SD")" ]; then pass "(R2c) the server copy and its whole history are untouched (names and guids)"
+    else fail "(R2c) the server copy CHANGED (the server rolled its history back for the client): was '$R_PRE', now '$(r_fp "$SERVER_VM" "$SD")'"; fi
+    R_R2C_ERRS="$(r_refusals "$mark_c" | grep ' ERROR ')"
+    nerr="$(printf '%s' "$R_R2C_ERRS" | grep -c . | tr -d '[:space:]')"
+    check "(R2c) exactly ONE client ERROR in the window (>= 2 cycles; then DEBUG), no WARNING" "1 0" \
+        "$nerr $(r_refusals "$mark_c" | grep -c ' WARNING ' | tr -d '[:space:]')"
+    printf '%s\n' "$R_R2C_ERRS" | head -n 1 | cut -c1-600 | sed 's/^/    client: /'
+    check_has "(R2c) the ERROR names the server copy, the common snapshot and the $(printf '%s\n' "$R_NEWER" | grep -c .) newer snapshot(s) this host does not have" \
+        "the server copy ${SD} has [0-9]+ snapshot\(s\) newer than ${R_OLD} that this host does not have .*${R_NEWER_FIRST}" "$R_R2C_ERRS"
+    check_has "(R2c) ... and names the keep-it fix: zfs rename ${SD} <a name outside the backup target>" "zfs rename ${SD} <a name outside the backup target>" "$R_R2C_ERRS"
+    check_has "(R2c) ... and the expendable fix: zfs destroy ${SD}@${R_NEWER_FIRST}%${R_NEWER_LAST} (a range, README 'Rejoining')" \
+        "zfs destroy ${SD}@${R_NEWER_FIRST}%${R_NEWER_LAST}( |\$)" "$R_R2C_ERRS"
+    check_lacks "(R2c) the client sent no stream and the server saw no destroy or rollback" "Backup complete|Sending (full|incremental)|Pruned ${SD}|allowed the receive to destroy" \
+        "$(log_since_vm "$CLIENT_VM" "$mark_c") $(log_since_vm "$SERVER_VM" "$mark_s" | grep -E "Pruned ${SD}|allowed the receive to destroy")"
+    R_R2C_MSG="$(printf '%s\n' "$R_R2C_ERRS" | head -n 1 | cut -c1-300)"
+
+    # ── R2c-fix (a): the expendable fix, exactly as the ERROR prints it ──
+    echo
+    step "R2c-fix (a) — the printed \`zfs destroy <server>@<first>%<last>\` on the server: the next cycle sends the incremental from the common snapshot"
+    R_FIX_CMD="$(printf '%s\n' "$R_R2C_ERRS" | grep -oE 'zfs destroy [^ ]+@[^ ]+' | head -n1)"
+    check_has "(R2c-fix) the destroy command was parsed from the log" "^zfs destroy ${SD}@[^ ]+%[^ ]+\$" "$R_FIX_CMD"
+    mark_c="$(loglines "$CLIENT_VM")"; mark_s="$(loglines "$SERVER_VM")"
+    if [ -n "$R_FIX_CMD" ] && msh "$SERVER_VM" "$R_FIX_CMD"; then pass "(R2c-fix) on the server: $R_FIX_CMD"; else fail "(R2c-fix) the printed command failed or was not found: '$R_FIX_CMD'"; fi
+    if r_wait_snap "$SERVER_VM" "$SD" "$R_S5" 150; then pass "(R2c-fix) the next cycle sent $R_S5"; else fail "(R2c-fix) $R_S5 never reached the server after the destroy"; fi
+    wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${R_S5}" 30
+    rlog="$(log_since_vm "$CLIENT_VM" "$mark_c")"
+    check_has "(R2c-fix) it was INCREMENTAL from the common snapshot $R_OLD" "Backup complete: ${SOURCE_DS}@${R_S5} \(incremental from ${R_OLD}\)" "$rlog"
+    check_lacks "(R2c-fix) no ERROR and no full send" " ERROR |\(full\)" "$rlog"
+    check "(R2c-fix) the server keeps everything up to $R_OLD (names and guids) and then has $R_S5" \
+        "$(printf '%s' "$R_PRE" | sed "s/\(${R_OLD}:[0-9]*\).*/\1/") ${R_S5}:$(guid "$CLIENT_VM" "$SOURCE_DS@$R_S5")" "$(r_fp "$SERVER_VM" "$SD")"
+    r_guid_eq R2c-fix "$SOURCE_DS" "$SD" "$R_S5"
+
+    # ── R2d: an in-place rollback ──
+    echo
+    step "R2d — \`zfs rollback -r\` on the client (not a restore): the same refusal, ONE ERROR, the server untouched, the local anchors survive; then the rename-aside fix"
+    R_ANCH="org.zfsbackup:anchor.${DEST_NAME}"
+    r_anchor() { msh "$CLIENT_VM" "zfs get -H -o value,source '$R_ANCH' '$SOURCE_DS'" | tr '\t' ' ' | tr -d '\r'; }
+    mark_c="$(loglines "$CLIENT_VM")"
+    r_write "$SOURCE_DS" f6.bin 300000; R_Q6="$(r_snap "$SOURCE_DS")"
+    r_wait_snap "$SERVER_VM" "$SD" "$R_Q6" 150 && pass "(R2d) $R_Q6 reached the server" || fail "(R2d) $R_Q6 never reached the server"
+    r_write "$SOURCE_DS" f7.bin 300000; R_Q7="$(r_snap "$SOURCE_DS")"
+    r_wait_snap "$SERVER_VM" "$SD" "$R_Q7" 150 && pass "(R2d) $R_Q7 reached the server" || fail "(R2d) $R_Q7 never reached the server"
+    wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${R_Q7}" 30
+    stop_daemon "$CLIENT_VM"
+    check "(R2d) before the rollback the dataset's own anchor is $R_Q7" "$R_Q7 local" "$(r_anchor)"
+    R_PRE="$(r_fp "$SERVER_VM" "$SD")"
+    msh "$CLIENT_VM" "zfs rollback -r '$SOURCE_DS@$R_S5'" && pass "(R2d) zfs rollback -r $SOURCE_DS@$R_S5 (destroys $R_Q6 and $R_Q7 on the client)" || fail "(R2d) the rollback failed"
+    check "(R2d) the client now has $R_S5 but neither $R_Q6 nor $R_Q7" "yes no no" "$(for s in $R_S5 $R_Q6 $R_Q7; do r_snaps "$CLIENT_VM" "$SOURCE_DS" | grep -qx "$s" && printf 'yes ' || printf 'no '; done | sed 's/ $//')"
+    check "(R2d) the rollback kept the LOCAL anchor (still $R_Q7: a dataset that rolled back is recognisable)" "$R_Q7 local" "$(r_anchor)"
+    r_write "$SOURCE_DS" f8.bin 300000; R_Q8="$(r_snap "$SOURCE_DS")"
+    mark_c="$(loglines "$CLIENT_VM")"; mark_s="$(loglines "$SERVER_VM")"
+    start_daemon "$CLIENT_VM"
+    sleep 80
+    check "(R2d) $R_Q8 did NOT reach the server" "no" "$(r_snaps "$SERVER_VM" "$SD" | grep -qx "$R_Q8" && echo yes || echo no)"
+    if [ "$R_PRE" = "$(r_fp "$SERVER_VM" "$SD")" ]; then pass "(R2d) the server copy and its whole history are untouched (names and guids)"
+    else fail "(R2d) the server copy CHANGED (the server rolled its history back for the client): was '$R_PRE', now '$(r_fp "$SERVER_VM" "$SD")'"; fi
+    R_R2D_ERRS="$(r_refusals "$mark_c" | grep ' ERROR ')"
+    check "(R2d) exactly ONE client ERROR in the window (>= 2 cycles), no WARNING" "1 0" \
+        "$(printf '%s' "$R_R2D_ERRS" | grep -c . | tr -d '[:space:]') $(r_refusals "$mark_c" | grep -c ' WARNING ' | tr -d '[:space:]')"
+    printf '%s\n' "$R_R2D_ERRS" | head -n 1 | cut -c1-600 | sed 's/^/    client: /'
+    check_has "(R2d) the ERROR names the server copy, $R_S5, and $R_Q6 .. $R_Q7" "the server copy ${SD} has 2 snapshot\(s\) newer than ${R_S5} that this host does not have .*${R_Q6}.*${R_Q7}" "$R_R2D_ERRS"
+    check_has "(R2d) ... with both fixes: zfs rename ${SD} <...> and zfs destroy ${SD}@${R_Q6}%${R_Q7}" "zfs rename ${SD} <a name outside the backup target>.*zfs destroy ${SD}@${R_Q6}%${R_Q7}" "$R_R2D_ERRS"
+    check_lacks "(R2d) the client sent no stream and the server saw no destroy or rollback" "Backup complete|Sending (full|incremental)|Pruned ${SD}|allowed the receive to destroy" \
+        "$(log_since_vm "$CLIENT_VM" "$mark_c") $(log_since_vm "$SERVER_VM" "$mark_s" | grep -E "Pruned ${SD}|allowed the receive to destroy")"
+    check "(R2d) the refusal wrote no anchor: still $R_Q7 (local)" "$R_Q7 local" "$(r_anchor)"
+
+    # ── R2d-fix (b): the keep-it fix ──
+    echo
+    step "R2d-fix (b) — the printed \`zfs rename <server> <outside the target>\`: the next cycle sends a full stream, the aside copy keeps its whole history"
+    R_ASIDE2="${SERVER_POOL}/backups-aside/${CLIENT_ID}-data-rolledback-$(date +%F)"
+    mark_c="$(loglines "$CLIENT_VM")"
+    msh "$SERVER_VM" "zfs create -p '${SERVER_POOL}/backups-aside' && zfs rename '$SD' '$R_ASIDE2'" && pass "(R2d-fix) the server copy was renamed out of the target tree" || fail "(R2d-fix) the rename aside failed"
+    if r_wait_snap "$SERVER_VM" "$SD" "$R_Q8" 150; then pass "(R2d-fix) the next cycle sent $R_Q8 in full into a fresh dataset"; else fail "(R2d-fix) $R_Q8 never reached the server after the rename aside"; fi
+    wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${R_Q8} \(full\)" 30 && pass "(R2d-fix) log: Backup complete (full)" || fail "(R2d-fix) no 'Backup complete ... (full)' for $R_Q8"
+    r_guid_eq R2d-fix "$SOURCE_DS" "$SD" "$R_Q8"
+    check "(R2d-fix) the new server copy holds exactly that snapshot" "$R_Q8" "$(r_snaps "$SERVER_VM" "$SD" | tr '\n' ' ' | sed 's/ *$//')"
+    check "(R2d-fix) the aside copy keeps its full history (names and guids), nothing was rolled back" "$R_PRE" "$(r_fp "$SERVER_VM" "$R_ASIDE2")"
+    check_lacks "(R2d-fix) no further ERROR after the fix" " ERROR " "$(log_since_vm "$CLIENT_VM" "$mark_c")"
+
+    # ── R2e: the backstop's end state ──
+    echo
+    step "R2e — the backstop's end state (a snapshot the server acked and the client then destroyed, the anchor moved back): the next cycle continues and only that snapshot is replaced"
+    # The backstop itself (the sent snapshot vanishing in the window between the ack and the exists-check) cannot be timed from a shell; its end
+    # state can be built exactly: the snapshot on the server, destroyed here, the anchor back at the base and the pin left (`<base>,<sent>`).
+    # The race itself is the real_zfs tier's (tests/test_zfsbackup_real.py).
+    mark_c="$(loglines "$CLIENT_VM")"
+    r_write "$SOURCE_DS" f9.bin 300000; R_Q9="$(r_snap "$SOURCE_DS")"
+    r_wait_snap "$SERVER_VM" "$SD" "$R_Q9" 150 && pass "(R2e) $R_Q9 reached the server" || fail "(R2e) $R_Q9 never reached the server"
+    wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${R_Q9} \(incremental from ${R_Q8}\)" 30
+    stop_daemon "$CLIENT_VM"
+    R_Q9_GUID="$(guid "$SERVER_VM" "$SD@$R_Q9")"
+    msh "$CLIENT_VM" "zfs destroy '$SOURCE_DS@$R_Q9' && zfs set '$R_ANCH=$R_Q8' 'org.zfsbackup:inflight.${DEST_NAME}=${R_Q8},${R_Q9}' '$SOURCE_DS'" \
+        && pass "(R2e) $R_Q9 destroyed on the client, anchor back at $R_Q8, pin left as the backstop leaves it" || fail "(R2e) could not build the backstop state"
+    r_write "$SOURCE_DS" f10.bin 300000; R_Q10="$(r_snap "$SOURCE_DS")"
+    mark_c="$(loglines "$CLIENT_VM")"; mark_s="$(loglines "$SERVER_VM")"
+    start_daemon "$CLIENT_VM"
+    if r_wait_snap "$SERVER_VM" "$SD" "$R_Q10" 150; then pass "(R2e) the next cycle continued: $R_Q10 reached the server"; else fail "(R2e) $R_Q10 never reached the server"; fi
+    wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${R_Q10}" 30
+    rlog="$(log_since_vm "$CLIENT_VM" "$mark_c")"
+    check_has "(R2e) it was INCREMENTAL from the base $R_Q8" "Backup complete: ${SOURCE_DS}@${R_Q10} \(incremental from ${R_Q8}\)" "$rlog"
+    check_lacks "(R2e) the client logged no ERROR (this is the case the client permits)" " ERROR " "$rlog"
+    check "(R2e) the server holds the base and the new snapshot only: exactly $R_Q9 was replaced" "$R_Q8 $R_Q10" "$(r_snaps "$SERVER_VM" "$SD" | tr '\n' ' ' | sed 's/ *$//')"
+    check_has "(R2e) the server WARNING names $R_Q9" " WARNING .*allowed the receive to destroy 1 snapshot\(s\) of ${SD} .*${R_Q9}" "$(log_since_vm "$SERVER_VM" "$mark_s")"
+    r_guid_eq R2e "$SOURCE_DS" "$SD" "$R_Q10"
+    check "(R2e) the pin is cleared and the anchor is $R_Q10" "- $R_Q10 local" \
+        "$(r_zget "$CLIENT_VM" "org.zfsbackup:inflight.${DEST_NAME}" "$SOURCE_DS") $(r_anchor)"
     stop_daemon "$CLIENT_VM"
 
     # ── R3: no common snapshot ──
     echo
-    step "R3 — no common snapshot: the full send onto a server copy with snapshots is refused every cycle; after the documented rename aside a full send succeeds"
+    step "R3 — no common snapshot: the client logs ONE ERROR and sends nothing (no full-stream attempt per cycle); after the documented rename aside a full send succeeds"
     msh "$CLIENT_VM" "zfs destroy -r '$SOURCE_DS' && zfs create '$SOURCE_DS'" || fail "(R3) could not recreate the client dataset"
     r_write "$SOURCE_DS" g1.bin 700000; R_S6="$(r_snap "$SOURCE_DS")"
     R_PRE="$(r_fp "$SERVER_VM" "$SD")"; R_SD_GUID="$(guid "$SERVER_VM" "$SD")"
@@ -3039,11 +3152,17 @@ else
     sleep 80
     check "(R3) the new dataset's first snapshot $R_S6 did NOT reach the server" "no" "$(r_snaps "$SERVER_VM" "$SD" | grep -qx "$R_S6" && echo yes || echo no)"
     check "(R3) the server copy and its history are untouched (names, guids, dataset guid)" "$R_PRE $R_SD_GUID" "$(r_fp "$SERVER_VM" "$SD") $(guid "$SERVER_VM" "$SD")"
-    nref="$(r_refusals "$mark_c" | wc -l | tr -d '[:space:]')"
-    if [ "$nref" -ge 2 ]; then pass "(R3) the client is refused on each cycle ($nref WARNING/ERROR lines in 80s)"; else fail "(R3) expected a refusal per cycle, saw $nref"; fi
-    r_refusals "$mark_c" | head -n 3 | cut -c1-300 | sed 's/^/    client: /'
-    R_R3_MSG="$(r_refusals "$mark_c" | head -n 1 | cut -c1-300)"
-    check_has "(R3) the client's message names a cause the operator can act on (no common snapshot / has snapshots / refused)" "snapshot|refus|receive|destination|common" "$R_R3_MSG"
+    R_R3_ERRS="$(r_refusals "$mark_c" | grep ' ERROR ')"
+    check "(R3) exactly ONE client ERROR over >= 2 cycles (80s), no WARNING, not one per cycle" "1 0" \
+        "$(printf '%s' "$R_R3_ERRS" | grep -c . | tr -d '[:space:]') $(r_refusals "$mark_c" | grep -c ' WARNING ' | tr -d '[:space:]')"
+    printf '%s\n' "$R_R3_ERRS" | head -n 1 | cut -c1-600 | sed 's/^/    client: /'
+    R_R3_MSG="$(printf '%s\n' "$R_R3_ERRS" | head -n 1 | cut -c1-600)"
+    check_has "(R3) the ERROR says the server copy holds snapshots none of which this host has, and that a full stream cannot replace it" \
+        "the server copy ${SD} holds snapshots but none of them is a snapshot this host still has, and a full stream cannot replace it, so nothing is sent" "$R_R3_MSG"
+    check_has "(R3) ... and names the fix: zfs rename ${SD} <a name outside the backup target>" "zfs rename ${SD} <a name outside the backup target>" "$R_R3_MSG"
+    # the client stops before it sends: no full-stream attempt reached the server, so the server's own `no_common` refusal is not reached
+    check_lacks "(R3) no full stream was started: no 'Sending full', no 'Backup complete', no server refusal" "Sending full|Backup complete|server .* refused|no_common|Transfer failed" \
+        "$(log_since_vm "$CLIENT_VM" "$mark_c") $(log_since_vm "$SERVER_VM" "$mark_s" | grep -E ' (WARNING|ERROR) ')"
     # the README's rename aside
     R_ASIDE="${SERVER_POOL}/backups-aside/${CLIENT_ID}-data-$(date +%F)"
     msh "$SERVER_VM" "zfs create -p '${SERVER_POOL}/backups-aside' && zfs rename '$SD' '$R_ASIDE'" && pass "(R3) the server copy was renamed out of the target tree (the README's commands)" || fail "(R3) the rename aside failed"

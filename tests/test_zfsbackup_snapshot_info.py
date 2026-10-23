@@ -426,6 +426,37 @@ class TestStrictNameParseTable:
         assert info.timestamp == STAMP and info.timestamp.tzinfo is timezone.utc
 
 
+class TestParseSnapshotTimestamp:
+    """`parse_snapshot_timestamp(prefix, name)` is the one place a name is judged managed (B-2b: the
+    client also uses it on names the SERVER reports); `SnapshotInfo` is a thin wrapper."""
+
+    @pytest.mark.parametrize('prefix, name', [
+        ('autosnap', 'autosnap_20261019120000'), ('auto_snap', 'auto_snap_20261019120000'),
+        ('a.b', 'aXb_20261019120000'), ('x|y', 'x|y_20261019120000'), ('x|y', 'y_20261019120000'),
+        ('autosnap', 'autosnap_20261019120000_x'), ('autosnap', 'autosnap_20260230120000'),
+        ('autosnap', 'autosnap_202610191200000'), ('auto', 'autosnap_20261019120000'),
+    ])
+    def test_it_agrees_with_snapshotinfo(self, prefix, name):
+        from zfsbackup.backup_manager import parse_snapshot_timestamp
+        info = SnapshotInfo(TestStrictNameParseTable._object(name), prefix)
+        assert parse_snapshot_timestamp(prefix, name) == info.timestamp
+
+    def test_a_managed_name_is_a_utc_datetime(self):
+        from zfsbackup.backup_manager import parse_snapshot_timestamp
+        got = parse_snapshot_timestamp('autosnap', 'autosnap_20261019120000')
+        assert got == datetime(2026, 10, 19, 12, 0, 0, tzinfo=timezone.utc)
+        assert got.tzinfo is timezone.utc
+
+    @pytest.mark.parametrize('name', [
+        '', 'autosnap', 'autosnap_', 'autosnap_20261019120000_keep', 'autosnap_2026101912000',
+        'autosnap_202610191200000', 'autosnap_20261319120000', 'other_20261019120000',
+        'autosnap_20261019120000\n', ' autosnap_20261019120000',
+    ])
+    def test_everything_else_is_none(self, name):
+        from zfsbackup.backup_manager import parse_snapshot_timestamp
+        assert parse_snapshot_timestamp('autosnap', name) is None
+
+
 # ---------------------------------------------------------------------------
 # S1-a: what a listed snapshot carries.
 # ---------------------------------------------------------------------------

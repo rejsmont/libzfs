@@ -18,7 +18,7 @@
 #      because /tmp is a tmpfs). The MULTIPASS_VM wrapper is deliberately NOT used: `multipass exec` adds
 #      buffering, and stdin=DEVNULL through it hits the known wedge;
 #   5. captures the zfs output formats zfsbackup parses (B4) with a tiny guest script (see --no-formats);
-#   6. with --captures / --captures-only: runs the SP spike (plan items M1-M6, Z1-Z8): ~250 recorded zfs
+#   6. with --captures / --captures-only: runs the SP spike (plan items M1-M7, Z1-Z8): ~250 recorded zfs
 #      commands on a throwaway file-backed pool (keyfiles, never prompts), once per locale (default login
 #      environment, then LC_ALL=C LANG=C), each record kept as exact-byte files for the fixtures (see CAPTURES);
 #   7. prints a per-version summary (pass/fail/skip/error counts and the failing test ids).
@@ -33,7 +33,7 @@
 #   ./scenarios/test_openzfs_matrix.sh --purge              # delete the matrix VMs (only these three) at the end
 #   ./scenarios/test_openzfs_matrix.sh --captures-only      # SP spike only: ship the scripts, run the captures, no pytest/formats
 #   ./scenarios/test_openzfs_matrix.sh --captures           # ... in addition to pytest and the formats
-#   ./scenarios/test_openzfs_matrix.sh --captures-only --sections M3,Z4   # a subset (M1 M2 M3 M4 EP M5 M6 Z2 Z3 Z4 Z5 Z6 Z7)
+#   ./scenarios/test_openzfs_matrix.sh --captures-only --sections M3,Z4   # a subset (M1 M2 M3 M4 EP M5 M6 M7 Z2 Z3 Z4 Z5 Z6 Z7)
 #   ./scenarios/test_openzfs_matrix.sh --captures-only --locales default,C,en_US.utf8   # passes (default: default,C)
 #   SRC_REF=<commit-ish> ...     # ship that tree instead of HEAD; for uncommitted work: SRC_REF=$(git stash create)
 #   MATRIX_LOG_DIR=<dir> ...     # where the per-VM logs go (default: a fresh mktemp dir, printed at the end)
@@ -47,7 +47,7 @@
 #   <vm>.captures/<locale>/{ENV.txt,M1-SUMMARY.tsv,SETUP-ERRORS.log}   versions + locale env; one parsed line per M1 token
 #   <vm>.captures.log   the run's progress;  <vm>.locale-diff.txt  default vs LC_ALL=C, ids/sizes/pool names normalised
 #   Sections: M1 token flags, M2 stale tokens, M3_Z8 destroy failures, M4 listing, EP encryption properties,
-#   M5_Z1 raw receive and -F, M6 -L mismatch, Z2 ownership -o on raw, Z3 partial new dataset, Z4 key unloaded,
+#   M5_Z1 raw receive and -F, M6 -L mismatch, M7 -F/rollback/modified-head semantics (B-2b U1 U2 U4 U5 U6), Z2 ownership -o on raw, Z3 partial new dataset, Z4 key unloaded,
 #   Z5 change-key, Z6 encryption/encryptionroot, Z7 raw copy without a key.
 #
 # Exit status: 0 when every selected version ran and no test failed or errored, 1 otherwise, 2 on usage errors.
@@ -105,7 +105,7 @@ done
 for f in ${EXTRA_TESTS[@]+"${EXTRA_TESTS[@]}"}; do
     case "$f" in tests/*.py) ;; *) echo "--extra takes a repo-relative tests/*.py path, got '$f'" >&2; exit 2 ;; esac
 done
-case "$SECTIONS" in *[!A-Za-z0-9,]*) echo "--sections takes a comma list like M3,Z4 (M1 M2 M3 M4 EP M5 M6 Z2 Z3 Z4 Z5 Z6 Z7)" >&2; exit 2 ;; esac
+case "$SECTIONS" in *[!A-Za-z0-9,]*) echo "--sections takes a comma list like M3,Z4 (M1 M2 M3 M4 EP M5 M6 M7 Z2 Z3 Z4 Z5 Z6 Z7)" >&2; exit 2 ;; esac
 case "$LOCALES" in ""|*[!A-Za-z0-9,._@-]*) echo "--locales takes a comma list like default,C" >&2; exit 2 ;; esac
 
 # ─────────────────────────────── Output helpers ─────────────────────────────
@@ -997,6 +997,199 @@ sec_M6() {
     end_section
 }
 
+# ================================================================ M7: -F / rollback / modified-head semantics (plan B-2b: U1 U2 U4 U5 U6)
+# helpers (plain commands only; everything the daemon's receiver would do is spelled out)
+# m7_src <ds> <enc 0|1> <snap>...: a dataset with one fresh random file per snapshot (M7MB MiB, default 3), snapshots in order
+m7_src() {
+    local ds="$1" enc="$2" s o=""; shift 2
+    [ "$enc" = 1 ] && o="-o encryption=aes-256-gcm -o keyformat=passphrase -o keylocation=file://$KEY1"
+    st zfs create -o compression=off $o "$ds" || return 1
+    for s in "$@"; do rnd "/$ds/f_$s" "${M7MB:-3}"; st zfs snapshot "$ds@$s"; done
+}
+# m7_xfer '<sender>' '<receiver>': an UNRECORDED setup transfer
+m7_xfer() { st bash -c "set -o pipefail; $1 | $2"; }
+# m7_hist <src> <target> <w>: the receiver's history is old, new1 (a full stream of old, then an incremental to new1); w = -w for raw
+m7_hist() {
+    m7_xfer "zfs send $3 $1@old" "zfs receive -u $2"
+    m7_xfer "zfs send $3 -i $1@old $1@new1" "zfs receive -u $2"
+}
+# m7_ab <src> <target> <w>: the receiver's newest snapshot is b (full a, incremental a -> b)
+m7_ab() {
+    m7_xfer "zfs send $3 $1@a" "zfs receive -u $2"
+    m7_xfer "zfs send $3 -i $1@a $1@b" "zfs receive -u $2"
+}
+# m7_modify <ds> write|read|mount: change the head of a received dataset (mounts it, then unmounts it again)
+m7_modify() {
+    local ds="$1" how="$2" mp
+    case "$(zfs get -H -o value encryption "$ds" 2>/dev/null)" in off|"") ;; *) st zfs load-key -L "file://$KEY1" "$ds" ;; esac
+    st zfs mount "$ds"
+    mp="$(zfs get -H -o value mountpoint "$ds" 2>/dev/null)"
+    case "$how" in
+        write) st bash -c "echo head-change > '$mp/head_change'" ;;
+        read)  st bash -c "cat '$mp'/f_* >/dev/null" ;;
+        mount) ;;
+    esac
+    st zpool sync "$P"
+    st zfs unmount "$ds"
+}
+m7_written() { cap "$1" zfs get -H -o name,property,value written "$2"; }
+
+sec_M7() {
+    section M7 "-F on an incremental whose receiver is ahead (U1/U2), rollback -r vs local user properties (U4), modified head (U5), full stream onto a copy with snapshots (U6)"
+    local src t tk n how w sfx otherp
+    # ------------------------------------------------------------ U1
+    st zfs create "$R/u1"; src="$R/u1src"
+    m7_src "$src" 0 old new1 new2
+    note "U1: sender $src has old,new1,new2. Each receiver t_* is built with a full stream of @old and an incremental to @new1 (its history is AHEAD of the base @old). Then: zfs send -i @old @new2 | zfs receive [-F] -s -u"
+    snaps U1.00_sender_snaps "$src"
+    for n in a b c d; do m7_hist "$src" "$R/u1/t_$n" ""; done
+    st zfs hold keep "$R/u1/t_d@new1"
+    snaps U1.a1_before "$R/u1/t_a"
+    cappipe U1.a2_F_incr "0" "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u1/t_a"
+    snaps U1.a3_after "$R/u1/t_a"
+    cap U1.a4_token zfs get -H -o name,property,value receive_resume_token "$R/u1/t_a"
+    snaps U1.b1_before "$R/u1/t_b"
+    cappipe U1.b2_noF_incr "0" "zfs send -i $src@old $src@new2" "zfs receive -s -u $R/u1/t_b"
+    snaps U1.b3_after "$R/u1/t_b"
+    cap U1.b4_token zfs get -H -o name,property,value receive_resume_token "$R/u1/t_b"
+    note "U1 c/d: the sender no longer has @new1 (it was destroyed there after the receiver got it: the rollback/restore situation)"
+    st zfs destroy "$src@new1"
+    snaps U1.c0_sender_snaps "$src"
+    snaps U1.c1_before "$R/u1/t_c"
+    cappipe U1.c2_F_incr_sender_lacks_new1 "0" "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u1/t_c"
+    snaps U1.c3_after "$R/u1/t_c"
+    cap U1.d0_holds zfs holds -H "$R/u1/t_d@new1"
+    snaps U1.d1_before "$R/u1/t_d"
+    cappipe U1.d2_F_incr_newer_snapshot_held "0" "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u1/t_d"
+    snaps U1.d3_after "$R/u1/t_d"
+    # ------------------------------------------------------------ U2
+    st zfs create "$R/u2"; src="$R/u2src"
+    m7_src "$src" 0 old new1 new2
+    note "U2: the same -F -s incremental cut after 1000000 bytes; are the newer snapshots still there while the partial state exists; then resume"
+    snaps U2.00_sender_snaps "$src"
+    for n in a b c; do m7_hist "$src" "$R/u2/t_$n" ""; done
+    snaps U2.a1_before "$R/u2/t_a"
+    cappipe U2.a2_F_incr_cut 1000000 "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u2/t_a"
+    snaps U2.a3_while_partial "$R/u2/t_a"
+    cap U2.a3b_list_all zfs list -H -t all -o name,type -r "$R/u2/t_a"
+    cap U2.a4_token_prop zfs get -H -o name,property,value receive_resume_token "$R/u2/t_a"
+    tk="$(tok "$R/u2/t_a")"; echo "$tk" > "$SD/U2.a.token"
+    cap U2.a5_send_nv_t zfs send -nv -t "$tk"
+    cappipe U2.a6_resume_F 0 "zfs send -t $tk" "zfs receive -F -s -u $R/u2/t_a"
+    snaps U2.a7_after_resume "$R/u2/t_a"
+    cap U2.a8_token_prop zfs get -H -o name,property,value receive_resume_token "$R/u2/t_a"
+    note "U2 b: the same cut, then the resume WITHOUT -F"
+    cappipe U2.b1_F_incr_cut 1000000 "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u2/t_b"
+    snaps U2.b2_while_partial "$R/u2/t_b"
+    tk="$(tok "$R/u2/t_b")"; echo "$tk" > "$SD/U2.b.token"
+    cappipe U2.b3_resume_noF 0 "zfs send -t $tk" "zfs receive -s -u $R/u2/t_b"
+    snaps U2.b4_after_resume "$R/u2/t_b"
+    cap U2.b5_token_prop zfs get -H -o name,property,value receive_resume_token "$R/u2/t_b"
+    note "U2 c: the same cut, then zfs receive -A (the server's fresh-mode abort)"
+    cappipe U2.c1_F_incr_cut 1000000 "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u2/t_c"
+    snaps U2.c2_while_partial "$R/u2/t_c"
+    cap U2.c3_abort zfs receive -A "$R/u2/t_c"
+    snaps U2.c4_after_abort "$R/u2/t_c"
+    cap U2.c5_token_prop zfs get -H -o name,property,value receive_resume_token "$R/u2/t_c"
+    # ------------------------------------------------------------ U4
+    st zfs create "$R/u4"; src="$R/u4/src"
+    st zfs create "$src"
+    st zfs set org.zfsbackup:anchor.x=snapA "$src"
+    rnd "/$src/f_a" 1; st zfs snapshot "$src@A"
+    st zfs set org.zfsbackup:anchor.y=afterA "$src"
+    rnd "/$src/f_b" 1; st zfs snapshot "$src@B"
+    rnd "/$src/f_c" 1; st zfs snapshot "$src@C"
+    note "U4: local user properties on the sender survive zfs rollback -r @A?"
+    cap U4.a1_props_before zfs get -H -o name,property,value,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y "$src"
+    snaps U4.a2_snaps_before "$src"
+    cap U4.a3_rollback_without_r zfs rollback "$src@A"
+    cap U4.a4_rollback_r zfs rollback -r "$src@A"
+    snaps U4.a5_snaps_after "$src"
+    cap U4.a6_props_after zfs get -H -o name,property,value,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y "$src"
+    capsh U4.a7_local_all "zfs get -H -s local -o property,value,source all $src | grep -E '^org\\.'"
+    note "U4 b: the anchors arrive as RECEIVED properties (send -p); rollback -r on the receiving copy; plus a local override"
+    m7_xfer "zfs send -p $src@A" "zfs receive -u $R/u4/rcv"
+    st zfs set org.zfsbackup:anchor.w=snapW "$src"; st zfs snapshot "$src@W"
+    m7_xfer "zfs send -p -i $src@A $src@W" "zfs receive -u $R/u4/rcv"
+    rnd "/$src/f_x" 1; st zfs snapshot "$src@X"
+    m7_xfer "zfs send -p -i $src@W $src@X" "zfs receive -u $R/u4/rcv"
+    st zfs set org.zfsbackup:anchor.z=localz "$R/u4/rcv"
+    st zfs set org.zfsbackup:anchor.x=localx "$R/u4/rcv"
+    snaps U4.b1_snaps_before "$R/u4/rcv"
+    cap U4.b2_props_before zfs get -H -o name,property,value,received,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y,org.zfsbackup:anchor.w,org.zfsbackup:anchor.z "$R/u4/rcv"
+    cap U4.b3_rollback_r zfs rollback -r "$R/u4/rcv@A"
+    snaps U4.b4_snaps_after "$R/u4/rcv"
+    cap U4.b5_props_after zfs get -H -o name,property,value,received,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y,org.zfsbackup:anchor.w,org.zfsbackup:anchor.z "$R/u4/rcv"
+    # ------------------------------------------------------------ U5
+    st zfs create "$R/u5"
+    for w in plain raw; do
+        src="$R/u5/src_$w"
+        if [ "$w" = raw ]; then m7_src "$src" 1 a b c; sfx="-w"; else m7_src "$src" 0 a b c; sfx=""; fi
+        note "U5 $w: receiver newest snapshot == base @b, then its head is modified; zfs send $sfx -i @b @c, without -F and then with -F ($RF)"
+        # c0: control, head untouched
+        t="$R/u5/${w}_c0"; m7_ab "$src" "$t" "$sfx"
+        m7_written "U5.$w.c0.1_written" "$t"
+        cappipe "U5.$w.c0.2_noF_untouched" 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -s -u $t"
+        snaps "U5.$w.c0.3_snaps" "$t"
+        for how in mount write read; do
+            t="$R/u5/${w}_$how"; m7_ab "$src" "$t" "$sfx"
+            m7_written "U5.$w.$how.1_written_before" "$t"
+            m7_modify "$t" "$how"
+            m7_written "U5.$w.$how.2_written_after" "$t"
+            cappipe "U5.$w.$how.3_noF" 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -s -u $t"
+            snaps "U5.$w.$how.4_snaps_after_noF" "$t"
+            cappipe "U5.$w.$how.5_F" 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -F -s -u $t"
+            snaps "U5.$w.$how.6_snaps_after_F" "$t"
+            cap "U5.$w.$how.7_diff_ok" zfs get -H -o name,property,value receive_resume_token,written "$t"
+        done
+        if [ "$w" = raw ]; then
+            # the server's case: modified while the key was loaded, then the key is gone again
+            t="$R/u5/raw_unloaded"; m7_ab "$src" "$t" "$sfx"
+            m7_modify "$t" write
+            st zfs unload-key "$t"
+            cap U5.raw.unloaded.1_keystatus zfs get -H -o name,property,value keystatus,written "$t"
+            cappipe U5.raw.unloaded.2_noF 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -s -u $t"
+            cappipe U5.raw.unloaded.3_F 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -F -s -u $t"
+            snaps U5.raw.unloaded.4_snaps_after "$t"
+            # load-key and unload-key only (no mount): does the key load alone modify the head?
+            t="$R/u5/raw_keyload"; m7_ab "$src" "$t" "$sfx"
+            st zfs load-key -L "file://$KEY1" "$t"; st zpool sync "$P"; st zfs unload-key "$t"
+            cap U5.raw.keyload.1_written zfs get -H -o name,property,value keystatus,written "$t"
+            cappipe U5.raw.keyload.2_noF 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -s -u $t"
+            snaps U5.raw.keyload.3_snaps_after "$t"
+        fi
+    done
+    # ------------------------------------------------------------ U6
+    st zfs create "$R/u6"; src="$R/u6/src"; otherp="$R/u6/other"
+    m7_src "$src" 0 a b c
+    m7_src "$otherp" 0 a z
+    m7_src "$R/u6/esrc" 1 a b c
+    note "U6: a FULL stream onto an existing copy; the copy (src a,b) has snapshots a,b. Per case: without -F (zfs receive -s -u), then with -F ($RF), each on a fresh copy"
+    for n in same_newer:"$src@c" same_existing_name:"$src@a" other_same_name:"$otherp@a" other_new_name:"$otherp@z"; do
+        for how in noF F; do
+            t="$R/u6/c_${n%%:*}_$how"; m7_ab "$src" "$t" ""
+            snaps "U6.${n%%:*}.$how.1_before" "$t"
+            cappipe "U6.${n%%:*}.$how.2_recv" 0 "zfs send ${n#*:}" "zfs receive $([ $how = F ] && echo -F) -s -u $t"
+            snaps "U6.${n%%:*}.$how.3_after" "$t"
+            cap "U6.${n%%:*}.$how.4_props" zfs get -H -o name,property,value,source receive_resume_token "$t"
+        done
+    done
+    note "U6 empty: the existing dataset has NO snapshots (placeholder / cut first receive)"
+    for how in noF F; do
+        t="$R/u6/empty_$how"; st zfs create "$t"
+        cappipe "U6.empty.$how.1_recv" 0 "zfs send $src@c" "zfs receive $([ $how = F ] && echo -F) -s -u $t"
+        snaps "U6.empty.$how.2_after" "$t"
+    done
+    note "U6 raw: a raw full stream of the encrypted dataset onto a raw copy that has snapshots a,b"
+    for how in noF F; do
+        t="$R/u6/raw_$how"; m7_ab "$R/u6/esrc" "$t" "-w"
+        snaps "U6.raw.$how.1_before" "$t"
+        cappipe "U6.raw.$how.2_recv" 0 "zfs send -w $R/u6/esrc@c" "zfs receive $([ $how = F ] && echo -F) -s -u $t"
+        snaps "U6.raw.$how.3_after" "$t"
+    done
+    end_section
+}
+
 # ================================================================ Z2: -o org.zfsbackup:* (and ownership props) on raw receives
 sec_Z2() {
     section Z2 "-o org.zfsbackup:{config,client_id,source_dataset} on raw full / incremental / resumed full / resumed incremental; -o readonly/canmount/volmode on raw"
@@ -1366,6 +1559,7 @@ want M4    && sec_M4
 want EP    && sec_EP
 want M5    && sec_M5
 want M6    && sec_M6
+want M7    && sec_M7
 want Z2    && sec_Z2
 want Z3    && sec_Z3
 want Z4    && sec_Z4

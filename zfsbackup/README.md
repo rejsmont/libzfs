@@ -750,6 +750,13 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
   ```
   Inside the tree it would still be pruned, and its `source_dataset` would get the new send refused with
   409. Destroy the aside copy when you no longer need it.
+  **Under an encrypted target**, a plain copy inherits the target's key, and ZFS refuses to rename a dataset
+  out of the encryption root it inherits from. Put the encryption root *above* the target (for example
+  `tank/enc` as the root, `tank/enc/backups` as the target, `tank/enc/aside` for aside copies; the aside
+  dataset must stay under that root), or first make the copy its own encryption root with
+  `zfs change-key -o keyformat=… -o keylocation=file:///… <copy>` (both options are required; a `prompt`
+  location waits for a passphrase on a terminal). A raw copy is always its own encryption root and renames
+  anywhere.
 - **Sizing.** Nothing limits a client's space or bandwidth (`zfs set quota=… <target>/<client_id>` does; see
   [First run](#first-run)); a host's remote sends run one after another.
 
@@ -832,9 +839,10 @@ Backups on a server are ZFS datasets, so restoring is ZFS work: this README give
 there is no restore command and no restore over the API. **Rule one: never mount, `zfs set`, `zfs
 inherit` or otherwise modify a received dataset.** Work from clones and sends, which change nothing the daemon relies on.
 
-> **Rule two: do not roll a backed-up client dataset back.** Restoring an older snapshot in place, or a `zfs
-> rollback`, while the dataset is still being sent makes the server destroy its newer snapshots on the next
-> cycle. Restore from the server's newest snapshot, or into a new name. Details under
+> **Rule two: rolling a backed-up client dataset back pauses its backup.** After a `zfs rollback`, or a
+> restore of an older snapshot in place, the server still holds snapshots the client no longer has; it never
+> destroys them for the client, so that dataset's sends stop (one ERROR) until you decide on the server.
+> Restore from the server's newest snapshot, or into a new name, to avoid that. Details under
 > [Rejoining](#rejoining-seed-and-continue).
 
 ### Getting files back (file-level)
@@ -890,17 +898,32 @@ the client**: the server has none, so a lost key means a lost raw backup.
 
 ### Rejoining: seed and continue
 
-> **Never roll a backed-up dataset back, and never restore an older snapshot over it under the same name,
-> while it is still being sent to that destination.** The server receives an incremental stream with
-> `zfs receive -F`, which first rolls the server copy back to the stream's base snapshot, and that
-> **destroys every server snapshot newer than the base**. A client that rolls back (`zfs rollback`), or restores
-> an older snapshot in place, and then sends an incremental from it is accepted, and the next cycle erases the
-> server's newer history. (Reproduced on OpenZFS 2.4.1; a fix is planned, and until it lands this is how it is.)
+> **The server never rolls its history back for a client.** An incremental receive with `zfs receive -F` would
+> roll the server copy back to the stream's base and destroy every server snapshot newer than it (OpenZFS 2.1,
+> 2.2 and 2.4 alike). So the server passes `-F` only when the base is its newest snapshot (or when the one
+> newer snapshot is one the client itself sent and then lost, see below), and refuses any other stream whose
+> base is older than its newest snapshot. A client that rolls back (`zfs rollback -r`), or restores an older
+> snapshot in place under the same name, finds the server ahead of it: it logs one ERROR naming the server copy
+> and the snapshots involved, and sends nothing for that dataset until you act. `check` shows the remote lag
+> growing meanwhile. Nothing is lost while it waits.
+>
+> Then, on the server, either **keep** the newer snapshots by renaming the server copy aside (out of the
+> target tree, see [Renaming a server copy aside](#operating-the-backup-server)); the next cycle sends a full
+> stream into a fresh server dataset. Or, if they are expendable, **destroy** just them with the
+> `zfs destroy <server copy>@<first>%<last>` the ERROR prints (a `%` range is inclusive, by creation order; over
+> 64 newer snapshots it prints the open-ended `<first>%`, which runs to the newest);
+> the next cycle continues incrementally.
+>
+> The one case the client lets the server roll back by itself: a snapshot it had just sent was deleted on the
+> client before the client could record the send. The server then holds exactly one snapshot the client never
+> recorded, newer than the client's recorded base, and the next cycle replaces it (the server logs a WARNING
+> naming it).
 
 Safe ways to bring a dataset back on the client:
 
 1. **Restore the server's NEWEST snapshot in place.** The next send is incremental from it and loses nothing.
-   Negotiation matches snapshots by guid; check the next cycle in the log or with `zfsbackup-config check`.
+   Negotiation finds the common snapshot by name, and the server checks the stream's base by guid; check the
+   next cycle in the log or with `zfsbackup-config check`.
 2. **Restore into a new dataset name** (and configure that name). The server stores it as a separate
    dataset, sent in full, and the old server copy stays untouched until you decide to destroy it.
 3. **Rename the server copy aside first** (above), then do whatever you need on the client. The next cycle
@@ -910,10 +933,11 @@ It also pays to stop the sending while you work: disable the dataset (`zfsbackup
 'datasets[tank/data].enabled' false`) or stop the daemon, and enable it again when the client is as you want it.
 
 When there is simply **no common snapshot** (the dataset on the client was replaced by an unrelated one, or
-you restored a snapshot the server does not have), the server never replaces or wipes its copy (ZFS refuses a
-full stream onto a dataset that has snapshots), encrypted or not. Instead the client's send is refused every
-cycle, which shows as remote lag turning CRIT in `check`, until you rename the server copy aside (above). The
-next cycle then sends a full stream into a fresh dataset. Keep the aside copy until you are satisfied.
+you restored a snapshot the server does not have), the server never replaces or wipes its copy: it refuses a
+full stream onto a dataset that has snapshots (so would ZFS), encrypted or not. The client logs one ERROR and
+sends nothing for that dataset, which shows as remote lag turning CRIT in `check`, until you rename the server
+copy aside (above). The next cycle then sends a full stream into a fresh dataset. Keep the aside copy until you
+are satisfied.
 
 ### Recovering a whole host
 
@@ -960,11 +984,11 @@ What to know before you rely on it. None of these blocks a deployment on a netwo
 list with background is in [docs/production_readiness_report.md](../docs/production_readiness_report.md).
 
 **Remote backup and the API**
-- **Rolling a backed-up client dataset back destroys the server's newer snapshots.** A `zfs rollback` of
-  a dataset that is still being sent, or restoring an older snapshot over it under the same name, makes the
-  next incremental send roll the server copy back to that snapshot (`zfs receive -F`) and discard everything
-  newer. Never do it while the dataset is sent to a destination: restore the server's newest snapshot, or
-  restore into a new name (see [Rejoining](#rejoining-seed-and-continue)). A fix is pending.
+- **A rollback on the client pauses that dataset's backup.** After a `zfs rollback` of a dataset that is
+  being sent, or restoring an older snapshot over it under the same name, the server holds snapshots the
+  client no longer has. It keeps them and refuses the client's sends (one ERROR on the client) until the
+  operator renames the server copy aside or destroys those snapshots (see
+  [Rejoining](#rejoining-seed-and-continue)). There is no command that accepts the loss for you.
 - **The HTTP server** is werkzeug's WSGI server (the version is pinned to one minor release, and its
   internals are covered by tests). It has no production-grade alternative that fits the design, so the
   protections around it are zfsbackup's own: a per-connection TLS handshake with a timeout, at most 64
@@ -988,9 +1012,15 @@ list with background is in [docs/production_readiness_report.md](../docs/product
   cleared by a receive flag.
 - **A client with a different `snapshot_prefix`** is never pruned on the server (it keeps everything).
 - **No common snapshot means a refusal, not an overwrite.** If a client and its server copy have no snapshot
-  in common (a restore from an older snapshot, a replaced dataset), ZFS refuses the full stream because the
-  server copy has snapshots, and the server copy is left untouched. The client is refused every cycle, and
-  `check` shows the remote lag, until the operator renames the server copy aside; then a full send goes out.
+  in common (a restore of a snapshot the server does not have, a replaced dataset), the server refuses the
+  full stream because its copy has snapshots, and the server copy is left untouched. The client logs one
+  ERROR and sends nothing for that dataset, and `check` shows the remote lag, until the operator renames the
+  server copy aside; then a full send goes out.
+- **Do not take snapshots under the backup target by hand** (for example a `zfs snapshot -r` of the whole
+  pool) while receives may be running. The server decides at the start of a receive whether it may roll the
+  copy back to the stream's base; a snapshot that appears on that copy during the receive can still be
+  destroyed by it. The target is dedicated to zfsbackup; snapshot the received data through the client's
+  retention, or clone it outside the target.
 - **A parent added to the configuration after its child** has been backed up meets the placeholder refusal
   and needs the operator's rename (see [Operating the backup server](#operating-the-backup-server)).
 - **The server enumerates every dataset under the target** on each pruning cycle (two or three `zfs get`

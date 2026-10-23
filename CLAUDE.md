@@ -94,7 +94,8 @@ Properties are stored internally as integer-indexed lists (using `_prop_names` c
 split on `\n` only) and fail closed per row and per object (wrong column count, out-of-scope or duplicate names,
 non-contiguous groups, and the "lead rule": an object's `get` rows must start with `type` for `all`, or
 `name`,`type` for an explicit list, so `GetCommand` must never pass `-s`). `zfs.get.value(ds, prop, sources=…)`
-reads one value exactly.
+reads one value exactly. `zfs.list(..., strict=True)` raises instead of skipping any row the default parse
+would skip (with a WARNING); the server's `-F` decision lists with it.
 
 **[libzfseasy/\_\_init\_\_.py](libzfseasy/__init__.py)** instantiates one singleton per command class and exports them as module-level names (`zfs.list`, `zfs.create`, `zfs.snapshot`, etc.). This is the public API.
 
@@ -136,7 +137,22 @@ copies/clears them like anchors. The remote worker sends each client's datasets 
 Negotiate holds the server dataset's claim (a concurrent negotiate or stream gets the retryable `busy` 503) and,
 for a missing dataset, creates only its parent chain and keeps the canonical config in an in-memory pending map
 (TTL 600 s, refreshed by each negotiate, capped at 4096, lost on restart); the receive itself creates the leaf
-(raw streams and encrypted targets need that), so `-F` is passed only when the dataset exists. Two client
+(raw streams and encrypted targets need that), so `-F` is passed only when the dataset exists.
+**No rollback of server history (B-2b):** `-F` on a `-i` receive destroys every server snapshot newer than the
+base (2.1/2.2/2.4, `tests/fixtures/openzfs/*/M7.txt`), so under the claim and before any `receive -A` the
+server lists its snapshots (`createtxg`, `guid`) and `decide_receive` passes `-F` only for a copy without
+snapshots, a base (`from_guid`, else `from`) that is its newest, or newer snapshots all named in the client's
+`discard`; otherwise it refuses (`reason`: `server_newer`, `base_missing`, `no_common`, `listing` for an untrusted
+listing, never `retry`).
+Negotiate reports `server_newer` (≤ 64, oldest first) and `server_newer_count`, or `server_newer_unknown: true`
+when a common snapshot exists but the list cannot be trusted; the client then sends nothing and writes no anchor
+or pin that cycle (one WARNING), and `_settle_up_to_date` never overwrites an anchor naming a snapshot this host
+lacks unless the server is pre-B-2b. A failed local-anchor read (`LocalAnchorUnreadable`) is a WARNING, never the
+rollback ERROR. The client's `_rollback_permit`
+sends `discard` only for the backstop case: its LOCAL anchor (`get_local_anchor`, never inherited) is the
+common snapshot or a live managed snapshot past it by `createtxg` (the server may have pruned the base) and the server holds exactly one newer managed snapshot this host does not have. Anything else
+(a rollback, an in-place restore; no common snapshot with a non-empty `server_copy`) is one ERROR and nothing
+sent, checked before `_settle_up_to_date` so a rollback is never laundered into a backstop. Two client
 datasets mapping to one server dataset are refused (409), including against a live pending entry or an unowned
 placeholder; a child whose ancestor is claimed, pending, or a new partial receive gets 503 retry; configs over
 8 KiB are refused (400). The server releases a stream's claim before any reply, so chain steps run back to back. A connection failure
@@ -323,7 +339,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 |---|---|
 | `tests/test_types.py` | `Validate`, `Property`, type classes |
 | `tests/test_commands.py` | Each command class, mocked subprocess |
-| `tests/test_framing.py` | `-H` output framing: unframeable values refused on write, fail-closed `list`/`get` row parsing (forged/duplicate/out-of-scope rows), `get.value`, `_exec_lines` |
+| `tests/test_framing.py` | `-H` output framing: unframeable values refused on write, fail-closed `list`/`get` row parsing (forged/duplicate/out-of-scope rows), `get.value`, `_exec_lines`, `list(strict=True)` |
 | `tests/test_libzfseasy_argv_hygiene.py` | Property names starting with `-` or over 255 characters refused, `receive` name validation, `_redact` clipping |
 | `tests/test_integration.py` | End-to-end workflows, mocked subprocess |
 | `tests/test_real_zfs.py` | Real ZFS commands, marked `real_zfs` |

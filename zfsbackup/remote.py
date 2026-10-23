@@ -32,7 +32,10 @@ import websocket
 import libzfseasy as zfs
 from libzfseasy.zfs import ResumeTokenError
 from zfsbackup import identity as ident
-from zfsbackup.backup_manager import DatasetInfo, DatasetManager, snapshot_newer
+from zfsbackup.backup_manager import (
+    DatasetInfo, DatasetManager, LocalAnchorUnreadable, parse_snapshot_timestamp,
+    snapshot_newer,
+)
 from zfsbackup.config import (
     BackupConfig, Destination, RemoteDatasetConfig, _collapse_retention_rules,
     destination_url_problem,
@@ -192,6 +195,13 @@ def _log_refusal(base_url: str, ds_name: str, result: dict) -> None:
             logger.info(f"server {base_url} asks to retry {ds_name} ({error}); skipping this cycle")
     else:
         logger.error(f"server refused {ds_name}: {result.get('error') or 'unknown error'}")
+
+
+#: The `reason` of the server's refusal to receive a stream because it would
+#: destroy, or cannot replace, snapshots it holds (`api.decide_receive`), or
+#: because it cannot list them reliably (`listing`): logged once per episode
+#: (`RemoteBackupManager._note_refusal`).
+_STREAM_REFUSAL_REASONS = ('server_newer', 'base_missing', 'no_common', 'listing')
 
 
 def _protocol_mismatch(where: str, server_protocol, *, refused: bool) -> str:
@@ -462,6 +472,17 @@ class RemoteBackupManager:
         # last successful negotiate (`server_copy` is `None` for a server that
         # does not report it).
         self._server_info: Dict[Tuple[str, str], Tuple[Optional[str], Optional[str]]] = {}
+        # `(dataset name, destination) -> (server_newer_count, server_newer)`
+        # from the last successful negotiate: the server snapshots newer than
+        # the common one, `[{"name", "guid"}, ...]` oldest first. Empty for a
+        # server that does not report them (an older release).
+        self._server_newer: Dict[Tuple[str, str], Tuple[int, list]] = {}
+        # `(dataset name, destination) -> 'known' | 'unknown' | 'absent'`:
+        # whether the last negotiate reported `server_newer` (`known`, also
+        # when the list is empty), reported `server_newer_unknown` (a common
+        # snapshot whose newer snapshots the server could not tell) or
+        # reported neither (`absent`: a server that predates B-2b).
+        self._server_newer_status: Dict[Tuple[str, str], str] = {}
         self._no_client_id_logged = False
         # The loaded client identity and the stat signature of its files.
         self._identity: Optional[Identity] = None
@@ -563,9 +584,18 @@ class RemoteBackupManager:
                 )
                 return False
 
+        # Before any local anchor or pin is written, or anything is sent
+        # (negotiate has already written on the server by now) -- in
+        # particular before `_settle_up_to_date`, which would otherwise record
+        # `latest` as the anchor of a rolled-back dataset and make it look
+        # like a backstop.
+        discard = self._rollback_permit(dsi, destination, common_snap, snapshots)
+        if discard is None:
+            return False
+
         return self._transfer(
             transport, client_id, dsi, latest, common_snap, destination,
-            snapshots=snapshots, should_stop=should_stop, mode=mode,
+            snapshots=snapshots, should_stop=should_stop, mode=mode, discard=discard,
         )
 
     def _send_mode(self, dsi: DatasetInfo, remote_cfg: RemoteDatasetConfig, newest) -> Optional[str]:
@@ -615,10 +645,164 @@ class RemoteBackupManager:
         self._log_refusal_once(key, (
             f"{dsi.name} -> {destination}: the server copy {name} is a {copy} copy but this "
             f"dataset is now sent {mode}; nothing is sent. On the server, move the old copy "
-            f"aside with `zfs rename {name} {name}.{copy}-<date>`; the next cycle sends a "
-            f"full {mode} stream"
+            f"aside with `zfs rename {name} <a name outside the backup target>` (see README "
+            f"'Renaming a server copy aside'); the next cycle sends a full {mode} stream"
         ))
         return False
+
+    def _discard_names(self, dsi: DatasetInfo, destination: str, discard: Tuple[str, ...]) -> str:
+        """The names (else the guids) of the server snapshots `discard` lets
+        the server destroy, for log lines."""
+        entries = self._server_newer.get((dsi.name, destination), (0, []))[1]
+        by_guid = {e.get('guid'): e.get('name') for e in entries if isinstance(e, dict)}
+        return ', '.join(str(by_guid.get(g) or f"guid {g}") for g in discard)
+
+    def _rollback_permit(
+        self, dsi: DatasetInfo, destination: str, common_snap, snapshots: list
+    ) -> Optional[Tuple[str, ...]]:
+        """Whether this cycle may send, and which server snapshots it lets the
+        server destroy: `()` (send, destroy nothing), a tuple of snapshot guids
+        (the `discard` of every stream of the cycle) or `None` (refused: ERROR
+        once per episode, nothing is sent and nothing is written).
+
+        The server receives into an existing dataset with `-F` only when that
+        destroys nothing or only the snapshots named in `discard`
+        (`api.decide_receive`), because `-F` destroys every server snapshot
+        newer than the incremental base. Naming one is only right for a
+        snapshot of ours that was sent and then destroyed here while it was
+        being sent (the backstop of `_push_step` moved the anchor back to the
+        base): the server has it, we do not, and that is the one snapshot we
+        may let it discard. A host that rolled back or restored an older
+        snapshot looks the same from the negotiate answer, so the evidence is
+        local and all of it must hold:
+
+        1. the dataset's OWN (local, never inherited) anchor for this
+           destination names a snapshot that is in our managed listing and is
+           not older (`createtxg`) than the common one. After the backstop the
+           anchor is the base, and the server's pruner may since have removed
+           the base from the server, making an older snapshot the common one;
+           the anchor then still names a live local snapshot at or past the
+           common one, so equality with the common snapshot would refuse that
+           recovery for ever. A rollback or an in-place restore leaves the
+           anchor naming a snapshot that no longer exists here, and a restore
+           under a new name has no local anchor, so both are refused;
+        2. the server names exactly one newer snapshot (and counts one);
+        3. that snapshot's name is a managed one that is not a local snapshot
+           name, and its guid equals no local snapshot's guid (a name can be
+           reused for a different snapshot; a guid cannot);
+        4. its guid is a readable decimal number.
+
+        No newer snapshots, or a server that does not report them, needs no
+        permit.
+
+        With no common snapshot but a server copy that holds snapshots, a full
+        stream cannot replace it (zfs refuses): refused here, once, rather
+        than started every cycle."""
+        key = (f"{dsi.name} [server newer]", destination)
+        none_key = (f"{dsi.name} [no common]", destination)
+        unknown_key = (f"{dsi.name} [server newer unknown]", destination)
+        copy, server_ds = self._server_info.get((dsi.name, destination), (None, None))
+        server_ds = server_ds or dsi.name
+        if common_snap is None:
+            self._refusal_logged.pop(key, None)
+            self._refusal_logged.pop(unknown_key, None)
+            if copy not in ('plain', 'raw'):
+                self._refusal_logged.pop(none_key, None)
+                return ()
+            self._log_refusal_once(none_key, (
+                f"{dsi.name} -> {destination}: the server copy {server_ds} holds snapshots but "
+                "none of them is a snapshot this host still has, and a full stream cannot "
+                "replace it, so nothing is sent. To keep the server copy, on the server: "
+                f"zfs rename {server_ds} <a name outside the backup target> (the next cycle "
+                "sends a full stream; see README 'Renaming a server copy aside'). "
+                "See README 'Rejoining'"
+            ))
+            return None
+        self._refusal_logged.pop(none_key, None)
+        if self._server_newer_status.get((dsi.name, destination)) == 'unknown':
+            # The server has a common snapshot but could not tell what is newer
+            # than it. That is not "nothing newer": writing an anchor now
+            # could launder a rollback into the backstop later. Nothing is
+            # written or sent (the stream would be refused with `listing`).
+            self._refusal_logged.pop(key, None)
+            self._log_warning_once(unknown_key, (
+                f"{dsi.name} -> {destination}: the server copy {server_ds} could not list "
+                f"which of its snapshots are newer than {common_snap.name}, so nothing is sent "
+                "and no anchor is written this cycle; the next cycle retries"
+            ))
+            return None
+        self._refusal_logged.pop(unknown_key, None)
+        count, entries = self._server_newer.get((dsi.name, destination), (0, []))
+        if not entries:
+            self._refusal_logged.pop(key, None)
+            return ()
+        guid = None
+        unreadable_key = (f"{dsi.name} [local anchor]", destination)
+        if len(entries) == 1 and count == 1 and isinstance(entries[0], dict):
+            name, text = entries[0].get('name'), entries[0].get('guid')
+            try:
+                if (
+                    isinstance(name, str) and isinstance(text, str)
+                    and re.fullmatch(r'[0-9]{1,20}', text) is not None
+                    and parse_snapshot_timestamp(self.config.snapshot_prefix, name) is not None
+                    and name not in {s.name for s in snapshots}
+                    and int(text) not in {s.guid for s in snapshots if s.guid is not None}
+                    and self._anchor_at_or_past(dsi, destination, common_snap, snapshots)
+                ):
+                    guid = text
+            except LocalAnchorUnreadable as e:
+                # Not evidence of a rollback: the read failed. Say so instead
+                # of the rollback ERROR, and send nothing this cycle.
+                self._log_warning_once(unreadable_key, (
+                    f"{dsi.name} -> {destination}: cannot read the local anchor property "
+                    f"org.zfsbackup:anchor.{destination} ({e}), which decides whether the "
+                    f"server may discard its newer snapshot; nothing is sent this cycle"
+                ))
+                return None
+        self._refusal_logged.pop(unreadable_key, None)
+        if guid is not None:
+            self._refusal_logged.pop(key, None)
+            return (guid,)
+        names = [str(e.get('name')) for e in entries if isinstance(e, dict)] or ['?']
+        first, last = names[0], names[-1]
+        truncated = count > len(entries)
+        if len(names) == 1 and not truncated:
+            shown, destroy = first, first
+        elif truncated:
+            # `first%` (a blank last) ranges to the newest (zfs-destroy(8)).
+            shown = (
+                f"{first}\u2026{last}; the list is truncated, the oldest {len(names)} of "
+                f"{count} are named"
+            )
+            destroy = f"{first}%"
+        else:
+            shown, destroy = f"{first}\u2026{last}", f"{first}%{last}"
+        self._log_refusal_once(key, (
+            f"{dsi.name} -> {destination}: the server copy {server_ds} has {count} "
+            f"snapshot(s) newer than {common_snap.name} that this host does not have "
+            f"({shown}), for example after a rollback or an in-place restore of this dataset, "
+            "or snapshots taken on the server. Sending would make the server destroy them, "
+            "so nothing is sent. To keep them, on the server: "
+            f"zfs rename {server_ds} <a name outside the backup target> (the next cycle "
+            "sends a full stream; see README 'Renaming a server copy aside'). If they are "
+            f"expendable: zfs destroy {server_ds}@{destroy} "
+            "(the next cycle continues). See README 'Rejoining'"
+        ))
+        return None
+
+    def _anchor_at_or_past(self, dsi: DatasetInfo, destination: str, common_snap, snapshots: list) -> bool:
+        """Rule 1 of `_rollback_permit`: this dataset's local anchor for the
+        destination names a snapshot in `snapshots` whose `createtxg` is at
+        least the common snapshot's (both known)."""
+        name = self.local_manager.get_local_anchor(dsi, destination)
+        if not name:
+            return False
+        anchor = next((s for s in snapshots if s.name == name), None)
+        return (
+            anchor is not None
+            and anchor.createtxg is not None and common_snap.createtxg is not None
+            and anchor.createtxg >= common_snap.createtxg
+        )
 
     # ------------------------------------------------- identity and transport
 
@@ -788,6 +972,22 @@ class RemoteBackupManager:
             logger.error(message)
         else:
             logger.debug(message)
+
+    def _note_refusal(self, base_url: str, ds_name: str, destination: str, result: dict) -> None:
+        """Log a server refusal that arrived instead of the final ack, or in
+        place of a broken pipe (`_log_refusal`), except that the refusals to
+        destroy or replace server snapshots, or to list them
+        (`_STREAM_REFUSAL_REASONS`; a
+        well-behaved client is stopped before it gets one, so this is a race or
+        an older client's view) are ERROR once per episode, then DEBUG."""
+        if result.get('reason') in _STREAM_REFUSAL_REASONS and not result.get('retry'):
+            self._log_refusal_once(
+                (f"{ds_name} [server refusal]", destination),
+                f"server {base_url} refused {ds_name} -> {destination}: "
+                f"{result.get('error') or 'unknown error'}",
+            )
+        else:
+            _log_refusal(base_url, ds_name, result)
 
     def _refuse_destination(self, destination: str, transport: _Transport, message: str) -> None:
         """A destination-level refusal: logged once, and the destination is
@@ -1044,6 +1244,18 @@ class RemoteBackupManager:
             self._server_info[(dsi.name, destination)] = (
                 body.get('server_copy'), body.get('server_dataset')
             )
+            newer, newer_count = body.get('server_newer'), body.get('server_newer_count')
+            self._server_newer[(dsi.name, destination)] = (
+                newer_count if type(newer_count) is int else 0,
+                newer if isinstance(newer, list) else [],
+            )
+            if body.get('server_newer_unknown') is True:
+                status = 'unknown'
+            elif 'server_newer' in body or 'server_newer_count' in body:
+                status = 'known'
+            else:
+                status = 'absent'
+            self._server_newer_status[(dsi.name, destination)] = status
             return body.get('common_snapshot')
         except NegotiationFailed:
             raise
@@ -1066,6 +1278,7 @@ class RemoteBackupManager:
         snapshots: Optional[list] = None,
         should_stop: Optional[Callable[[], bool]] = None,
         mode: str = 'plain',
+        discard: Tuple[str, ...] = (),
     ) -> bool:
         """Bring the server up to `latest`, one `zfs send -i` per snapshot.
 
@@ -1080,6 +1293,8 @@ class RemoteBackupManager:
         (the next cycle continues from the anchor), except that a step whose
         snapshot has vanished is rebuilt around, once per missing member.
         `mode` is the send mode (`_SEND_MODES`), fixed for the whole chain.
+        `discard` (`_rollback_permit`) is the guids of the server snapshots
+        every stream of this cycle lets the server destroy.
         A stop mid-chain returns True: the work continues next cycle."""
         base_url = transport.base_url
         if snapshots is None:
@@ -1107,6 +1322,11 @@ class RemoteBackupManager:
                 + (f"{common_snap.name} -> " if common_snap else "full ")
                 + ' -> '.join(s.name for s in chain)
                 + f" ({len(chain)} step(s)) -> {base_url}"
+                + (
+                    f"; the server would be allowed to discard {self._discard_names(dsi, destination, discard)} "
+                    "(a snapshot it holds that this host does not)"
+                    if discard else ""
+                )
             )
             return True
 
@@ -1123,7 +1343,8 @@ class RemoteBackupManager:
         if resumed is not None:
             finished = resumed.sent.name == latest.name
             outcome = self._push_step(
-                transport, client_id, dsi, destination, snapshots, resumed, clear_pin=finished
+                transport, client_id, dsi, destination, snapshots, resumed,
+                clear_pin=finished, discard=discard,
             )
             if outcome != _OK:
                 return outcome == _ANCHOR_FAILED and finished
@@ -1159,6 +1380,9 @@ class RemoteBackupManager:
                         "of this cycle rather than sending a full stream"
                     )
                     return False
+            discard = self._rollback_permit(dsi, destination, common_snap, snapshots)
+            if discard is None:
+                return False
             if common_snap is not None and common_snap.name == latest.name:
                 self._settle_up_to_date(dsi, latest, destination, snapshots)
                 return True
@@ -1200,7 +1424,7 @@ class RemoteBackupManager:
                 outcome = _FAILED if started is None else self._push_step(
                     transport, client_id, dsi, destination, snapshots, started,
                     clear_pin=step is chain[-1], after_success=sent_any,
-                    should_stop=should_stop,
+                    should_stop=should_stop, discard=discard,
                 )
                 if outcome == _OK:
                     sent_any = True
@@ -1275,6 +1499,7 @@ class RemoteBackupManager:
         clear_pin: bool = True,
         after_success: bool = False,
         should_stop: Optional[Callable[[], bool]] = None,
+        discard: Tuple[str, ...] = (),
     ) -> str:
         """Send ONE stream (`started`, from `_try_resume` or `_start_fresh`) over
         the pinned websocket, wait for the server's ack, then record the anchor
@@ -1298,7 +1523,11 @@ class RemoteBackupManager:
         retry. A stop, or exhausted retries, reap the send exactly once (the
         `finally`), change neither the anchor nor the pin (the previous
         step's stays in place) and return `_STOP` (INFO, no re-list). The
-        first stream of a cycle fails as always."""
+        first stream of a cycle fails as always.
+
+        `discard` is the guids of the server snapshots the server may destroy
+        for this stream (`_rollback_permit`), sent as `&discard=` on every
+        stream of the cycle."""
         base_url = transport.base_url
         stream, mode, inflight_set, sent, base = started
 
@@ -1314,14 +1543,23 @@ class RemoteBackupManager:
             #
             # `mode` is required by the server: `resume` only when this stream
             # continues the server's resume token, `fresh` for a new stream
-            # (the server then discards any partial receive state). `from` is
-            # informational.
+            # (the server then discards any partial receive state). `from`
+            # (the base's name) and `from_guid` (its guid, preferred when
+            # present) tell the server which of its snapshots the stream is
+            # incremental from: it passes `-F` only if that destroys nothing,
+            # or only the snapshots listed in `discard` (guids; the cycle's
+            # `_rollback_permit`). A server that predates them ignores all
+            # three.
             ws_url = (
                 f"{transport.endpoint.ws_base}/backup/{_path(client_id)}/{_path(dsi.name)}"
                 f"/stream?mode={mode}"
             )
             if base is not None:
                 ws_url += f"&from={quote(base.name, safe='')}"
+                if base.guid is not None:
+                    ws_url += f"&from_guid={base.guid}"
+            if discard:
+                ws_url += f"&discard={','.join(discard)}"
             ws = websocket.WebSocket()
             # TCP + TLS handshake + pin check BEFORE any websocket byte; a
             # wrong server raises `PinMismatch` (not an OSError) and, like any
@@ -1432,6 +1670,9 @@ class RemoteBackupManager:
                     # the anchor is not advanced and the next cycle retries.
                     _log_refusal(base_url, dsi.name, result)
                     return _STOP
+                if result.get('reason') in _STREAM_REFUSAL_REASONS:
+                    self._note_refusal(base_url, dsi.name, destination, result)
+                    return _FAILED
                 logger.error(
                     f"Transfer failed for {dsi.name}: {result.get('error', 'unknown error')}"
                 )
@@ -1452,7 +1693,7 @@ class RemoteBackupManager:
             timed_out = isinstance(e, (TimeoutError, websocket.WebSocketTimeoutException))
             refusal = _peer_refusal(ws) if sending and not timed_out else None
             if refusal is not None:
-                _log_refusal(base_url, dsi.name, refusal)
+                self._note_refusal(base_url, dsi.name, destination, refusal)
                 if _is_reloading_refusal(refusal):
                     # Reloading or busy, seen as a failed send: the same
                     # retryable refusal as at the ack, so the chain stops
@@ -1485,6 +1726,7 @@ class RemoteBackupManager:
                 except Exception:
                     pass
 
+        self._refusal_logged.pop((f"{dsi.name} [server refusal]", destination), None)
         old_anchor = self.local_manager.get_anchor(dsi, destination)
         keep_anchor = False
         if old_anchor and old_anchor != sent.name:
@@ -1589,9 +1831,25 @@ class RemoteBackupManager:
         wrote = False
         if not anchored:
             newer = False
+            current = None
             if anchor and snapshots:
                 current = next((s for s in snapshots if s.name == anchor), None)
                 newer = snapshot_newer(current, latest)
+            if (
+                anchor and snapshots and current is None
+                and self._server_newer_status.get((dsi.name, destination), 'absent') != 'absent'
+            ):
+                # The anchor names a snapshot this host no longer has (a
+                # rollback or an in-place restore, or the pruner after a
+                # backstop). A server that reports B-2b state may hold that
+                # snapshot, so moving the anchor to `latest` would let a later
+                # cycle mistake the rollback for the backstop and send
+                # `discard`. Left as it is; the pin stays too.
+                logger.debug(
+                    f"{dsi.name} -> {destination}: the anchor {anchor!r} names a snapshot this "
+                    f"host does not have; left unchanged although {latest.name} is on the server"
+                )
+                return
             wrote = not newer
             anchored = newer or self.local_manager.set_anchor(dsi, destination, latest.name)
         if anchored and self.local_manager.get_inflight(dsi, destination) is not None:

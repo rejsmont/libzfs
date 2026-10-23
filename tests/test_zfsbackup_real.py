@@ -2135,3 +2135,206 @@ class TestRealCheck:
         self._check(database, '--json')
         assert list_real_snapshot_names(source_fs.name) == before
         assert _zfs_get_local(source_fs.name, PROP_CONFIG) in (None, '-', '')
+
+
+# ---------------------------------------------------------------------------
+# B-2b: the server never rolls back history the client cannot account for
+# ---------------------------------------------------------------------------
+#
+# `zfs receive -F` of an incremental stream destroys every snapshot of the destination newer than the
+# stream's base (tests/fixtures/openzfs/*/M7.txt). The server therefore passes `-F` only when that
+# destroys nothing, or exactly the snapshots the client names (`discard`, by guid). The client names one
+# only for the snapshot it lost while it was being sent (the backstop) and otherwise refuses, once.
+
+class TestRealNoRollback(_ChainTests):
+
+    def prime(self, e2e, hours=(10, 8, 6)):
+        """Send `hours` (oldest first) to the server: a full send of the first, then a chain.
+        -> the three short names; the local anchor is the last."""
+        first = self.snapshots(e2e, [hours[0]])[0]
+        assert e2e.cycle() is True
+        rest = self.snapshots(e2e, list(hours[1:]))
+        assert e2e.cycle() is True
+        names = [first] + rest
+        self.assert_on_the_server(e2e, names)
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == names[-1]
+        return names
+
+    def rollback(self, e2e, to):
+        """`zfs rollback -r` of the client's dataset: skips (never errors) when not permitted."""
+        _zfs_run('rollback', '-r', f'{e2e.source.name}@{to}')
+
+    def errors(self, e2e, since=0):
+        """The client's ERROR messages (`zfsbackup.remote`) logged after the first `since` of them."""
+        return [r.getMessage() for r in e2e.caplog.records
+                if r.name.startswith('zfsbackup.remote') and r.levelno >= logging.ERROR][since:]
+
+    def n_errors(self, e2e):
+        return len(self.errors(e2e))
+
+    # -- a rolled-back client ----------------------------------------------------------------
+
+    @pytest.mark.parametrize('keep', [0, 1], ids=['rollback-to-the-first', 'rollback-to-the-second'])
+    def test_a_rollback_is_refused_and_the_server_keeps_every_snapshot(self, e2e, keep):
+        names = self.prime(e2e)
+        before = e2e.server_snaps()
+        self.rollback(e2e, names[keep])
+        e2e.snapshot(1)                                            # new history after the rollback
+        mark = self.n_errors(e2e)
+
+        assert e2e.cycle() is False
+
+        assert e2e.server_snaps() == before                        # same names, same guids
+        assert len(self.errors(e2e, mark)) == 1
+        assert 'zfs rename' in self.errors(e2e, mark)[0]
+        # `zfs rollback -r` leaves the dataset's own properties: the anchor still names a lost snapshot
+        assert e2e.manager.get_local_anchor(e2e.dsi, DEST) == names[-1]
+        assert e2e.server_prop('receive_resume_token') == '-'
+        # ...and the same the next cycle, quietly
+        assert e2e.cycle() is False
+        assert len(self.errors(e2e, mark)) == 1
+        assert e2e.server_snaps() == before
+
+    @pytest.mark.parametrize('keep, destroy', [(0, '%s%%%s'), (1, '%s')], ids=['range', 'single'])
+    def test_after_the_operator_destroys_the_newer_snapshots_the_next_cycle_continues(self, e2e, keep, destroy):
+        names = self.prime(e2e)
+        self.rollback(e2e, names[keep])
+        newest = e2e.snapshot(1)
+        assert e2e.cycle() is False
+
+        lost = names[keep + 1:]
+        _zfs_run('destroy', f'{e2e.server_ds}@' + (destroy % ((lost[0], lost[-1]) if len(lost) > 1 else (lost[0],))))
+        assert e2e.cycle() is True
+
+        server = e2e.server_snaps()
+        assert set(server) == set(names[:keep + 1]) | {newest}
+        self.assert_on_the_server(e2e, names[:keep + 1] + [newest])
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == newest
+
+    def test_renaming_the_server_copy_aside_lets_the_next_cycle_send_in_full(self, e2e, auto_zfs_pool):
+        names = self.prime(e2e)
+        self.rollback(e2e, names[1])
+        newest = e2e.snapshot(1)
+        assert e2e.cycle() is False
+
+        aside = f'{auto_zfs_pool.name}/zfsbackup_aside'
+        _zfs_run('rename', e2e.server_ds, aside)
+        try:
+            assert e2e.cycle() is True
+            assert list(e2e.server_snaps()) == [newest]              # a full stream: only the newest
+            assert set(_snapshot_guids(aside)) == set(names)           # the old copy is whole
+            assert e2e.manager.get_anchor(e2e.dsi, DEST) == newest
+        finally:
+            subprocess.run([_zfs_cmd(), 'destroy', '-r', aside], capture_output=True)
+
+    def test_the_server_refuses_on_its_own_when_the_client_does_not_ask(self, e2e):
+        """A client that skips its check (a race, an older release): the server compares the base with
+        what it holds and refuses before it reads a byte."""
+        names = self.prime(e2e)
+        before = e2e.server_snaps()
+        self.rollback(e2e, names[1])
+        e2e.snapshot(1)
+        mark = self.n_errors(e2e)
+        with mock.patch.object(e2e.remote_mgr, '_rollback_permit', return_value=()):
+            assert e2e.cycle() is False
+
+        assert e2e.server_snaps() == before
+        assert any('refused' in m for m in self.errors(e2e, mark))
+        assert e2e.server_prop('receive_resume_token') == '-'
+
+    # -- the backstop ----------------------------------------------------------------------------
+
+    def test_the_backstop_is_recovered_by_the_next_cycle_and_only_that_snapshot_goes(self, e2e):
+        """A sent snapshot destroyed on the client right after the ack: the anchor goes back to the base,
+        the server keeps it, and the next cycle lets the server drop exactly that one."""
+        first = self.snapshots(e2e, [10])[0]
+        assert e2e.cycle() is True
+        lost = self.snapshots(e2e, [8])[0]
+        real = e2e.manager.set_anchor
+
+        def set_anchor_then_lose_it(dsi, destination, name):
+            ok = real(dsi, destination, name)
+            if name == lost and lost in e2e.local_snaps():
+                zfs.destroy(Snapshot(e2e.source, lost), destroy=True)
+            return ok
+
+        with mock.patch.object(e2e.manager, 'set_anchor', set_anchor_then_lose_it):
+            e2e.cycle()
+        assert any('was destroyed while it was being sent' in m for m in self.errors(e2e))
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == first
+        assert set(e2e.server_snaps()) == {first, lost}
+        lost_guid = e2e.server_snaps()[lost]
+        first_guid = e2e.server_snaps()[first]
+
+        newest = self.snapshots(e2e, [3])[0]
+        mark = self.n_errors(e2e)
+        assert e2e.cycle() is True
+
+        assert self.errors(e2e, mark) == []
+        assert set(e2e.server_snaps()) == {first, newest}            # `lost` went, nothing else
+        assert e2e.server_snaps()[first] == first_guid
+        assert lost_guid not in e2e.server_snaps().values()
+        self.assert_on_the_server(e2e, [first, newest])
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == newest
+
+    # -- -F is still right when it destroys nothing -----------------------------------------------
+
+    def test_a_modified_server_head_with_the_base_the_newest_snapshot_still_succeeds(self, e2e):
+        """Someone wrote to the server's copy since its last snapshot: zfs wants `-F` to discard that, and
+        the guard must allow it (nothing newer than the base exists)."""
+        first = self.snapshots(e2e, [10])[0]
+        assert e2e.cycle() is True
+        mountpoint = _zfs_get(e2e.server_ds, 'mountpoint')
+        mount = subprocess.run([_zfs_cmd(), 'mount', e2e.server_ds], capture_output=True, text=True)
+        if mount.returncode != 0:
+            pytest.skip(f'cannot mount the server copy: {mount.stderr.strip()}')
+        cmd = ['dd', 'if=/dev/urandom', f'of={mountpoint}/dirty.bin', 'bs=65536', 'count=4']
+        if subprocess.run(cmd, capture_output=True).returncode != 0 and \
+                subprocess.run(['sudo', '-n'] + cmd, capture_output=True).returncode != 0:
+            pytest.skip(f'cannot write into the server copy at {mountpoint}')
+        subprocess.run(['sync'])
+        deadline = time.monotonic() + 15
+        while _zfs_get(e2e.server_ds, 'written') == '0' and time.monotonic() < deadline:
+            time.sleep(0.5)                                      # `written` follows the transaction group
+        assert _zfs_get(e2e.server_ds, 'written') != '0', 'the write never showed in `written`'
+        second = self.snapshots(e2e, [6])[0]
+        mark = self.n_errors(e2e)
+
+        assert e2e.cycle() is True
+
+        assert self.errors(e2e, mark) == []
+        assert set(e2e.server_snaps()) == {first, second}
+        self.assert_on_the_server(e2e, [first, second])
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == second
+
+    # -- a full stream onto a copy that has snapshots -------------------------------------------------
+
+    def lose_every_local_snapshot(self, e2e, names):
+        for name in names:
+            zfs.destroy(Snapshot(e2e.source, name), destroy=True)
+        return e2e.snapshot(1)
+
+    def test_a_full_stream_onto_a_copy_with_snapshots_is_refused_by_the_client(self, e2e):
+        names = self.prime(e2e)
+        before = e2e.server_snaps()
+        self.lose_every_local_snapshot(e2e, names)
+        mark = self.n_errors(e2e)
+
+        assert e2e.cycle() is False
+        assert e2e.cycle() is False
+
+        assert e2e.server_snaps() == before
+        assert len(self.errors(e2e, mark)) == 1 and 'zfs rename' in self.errors(e2e, mark)[0]
+        assert e2e.server_prop('receive_resume_token') == '-'
+
+    def test_a_full_stream_onto_a_copy_with_snapshots_is_refused_by_the_server(self, e2e):
+        names = self.prime(e2e)
+        before = e2e.server_snaps()
+        self.lose_every_local_snapshot(e2e, names)
+        mark = self.n_errors(e2e)
+        with mock.patch.object(e2e.remote_mgr, '_rollback_permit', return_value=()):
+            assert e2e.cycle() is False
+
+        assert e2e.server_snaps() == before
+        assert any('refused' in m for m in self.errors(e2e, mark))
+        assert e2e.server_prop('receive_resume_token') == '-'

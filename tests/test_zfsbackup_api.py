@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from simple_websocket import ConnectionClosed
 
 from _api_support import Authed, CLIENT_ID
+from _snapshot_support import listed_snapshot
 from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
 from zfsbackup.backup_manager import (
     DatasetInfo, DatasetManager, SnapshotInfo, PROP_CLIENT_ID, PROP_CONFIG,
@@ -700,7 +701,13 @@ class Stream:
         self.ws.receive.side_effect = [b'chunk', json.dumps({'done': True})]
         self.order = []
         self.exists = mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
-        self.list = mocker.patch('zfsbackup.api.zfs.list', return_value=[])
+        # `zfs.list` serves two callers: the receive-flag decision lists the server dataset's
+        # snapshots (`types='snapshot'`, rows from `self.snapshots`), and the fresh-mode token
+        # lookup lists the dataset itself (`self.token_rows`). Tests that make ONE of them fail
+        # use `fail_token_lookup` / `fail_snapshot_listing`, so the other keeps working.
+        self.snapshots = []
+        self.token_rows = []
+        self.list = mocker.patch('zfsbackup.api.zfs.list', side_effect=self._list)
         self.create = mocker.patch('zfsbackup.api.zfs.create')
         self.set = mocker.patch('zfsbackup.api.zfs.set')
         self.abort = mocker.patch('zfsbackup.api.zfs.receive.abort')
@@ -716,6 +723,37 @@ class Stream:
         self.get_value.side_effect = lambda *a, **k: (self.order.append('get'), self.stored)[1]
         self.receive.side_effect = lambda *a, **k: (self.order.append('receive'), self.writer)[1]
 
+    def _list(self, *args, **kwargs):
+        return list(self.snapshots if kwargs.get('types') == 'snapshot' else self.token_rows)
+
+    def server_has(self, *snaps):
+        """The server dataset holds these snapshots, oldest first: a name (txg and guid derived
+        from it, as `_snapshot_support` does) or a `(name, txg, guid)` tuple."""
+        self.snapshots = [
+            listed_snapshot(s, SERVER_DS) if isinstance(s, str)
+            else listed_snapshot(s[0], SERVER_DS, txg=s[1], guid=s[2])
+            for s in snaps
+        ]
+
+    def fail_token_lookup(self, exc):
+        """Only the listing of the dataset itself (the resume-token lookup) raises `exc`."""
+        def fail(*args, **kwargs):
+            if kwargs.get('types') == 'snapshot':
+                return self._list(*args, **kwargs)
+            raise exc
+        self.list.side_effect = fail
+
+    def fail_snapshot_listing(self, exc):
+        """Only the listing of the dataset's snapshots (the `-F` decision) raises `exc`."""
+        def fail(*args, **kwargs):
+            if kwargs.get('types') == 'snapshot':
+                raise exc
+            return self._list(*args, **kwargs)
+        self.list.side_effect = fail
+
+    def restore_listing(self):
+        self.list.side_effect = self._list
+
     @property
     def claimed(self):
         """A copy of the set of server datasets with a stream in progress
@@ -726,7 +764,7 @@ class Stream:
         """The server dataset reports `value` as its receive_resume_token."""
         row = MagicMock()
         row.__getitem__ = MagicMock(return_value=value)
-        self.list.return_value = [row]
+        self.token_rows = [row]
 
     def run(self, mode='fresh', *, ws=None, client='client1', dataset='pool/data', **query):
         qs = dict(query)
@@ -750,6 +788,14 @@ class Stream:
 @pytest.fixture
 def stream(mocker):
     return Stream(mocker)
+
+
+def assert_only_the_snapshot_listing(stream):
+    """`zfs.list` ran exactly once, for the snapshots (the `-F` decision), never for a token."""
+    (call,) = stream.list.call_args_list
+    assert call.kwargs['types'] == 'snapshot'
+    assert call.kwargs['properties'] == ['createtxg', 'guid']
+    assert str(call.kwargs['roots']) == SERVER_DS
 
 
 class TestStreamModeIsRequired:
@@ -877,7 +923,7 @@ class TestFreshStreamDiscardsPartialState:
     def test_fresh_looks_the_token_up_by_name_alone(self, stream):
         stream.token(None)
         stream.run('fresh')
-        kwargs = stream.list.call_args.kwargs
+        (kwargs,) = [c.kwargs for c in stream.list.call_args_list if c.kwargs.get('types') != 'snapshot']
         assert str(kwargs['roots']) == SERVER_DS
         assert kwargs['properties'] == ['receive_resume_token']
         assert 'types' not in kwargs                  # a filesystem OR a volume
@@ -886,7 +932,7 @@ class TestFreshStreamDiscardsPartialState:
         stream.token(TOKEN)
         stream.run('resume')
         stream.abort.assert_not_called()
-        stream.list.assert_not_called()
+        assert_only_the_snapshot_listing(stream)       # the -F decision; no token lookup
         assert stream.order == ['get', 'receive']
         assert stream.sent == [{'status': 'ok'}]
 
@@ -923,7 +969,7 @@ class TestFreshStreamDiscardsPartialState:
         assert stream.gate.active == 0
 
     def test_a_token_lookup_failure_refuses_the_stream_and_aborts_nothing(self, stream):
-        stream.list.side_effect = RuntimeError('boom')
+        stream.fail_token_lookup(RuntimeError('boom'))
         stream.run('fresh')
         assert stream.sent == [{
             'error': f'Failed to check {SERVER_DS} for partial receive state: boom'
@@ -968,23 +1014,25 @@ class TestDryRunAndOrder:
                      "refusing to mix in 'pool/data'"
         }]
 
-    def test_the_order_is_source_check_config_read_token_lookup_abort_receive(
+    def test_the_order_is_source_check_config_read_snapshots_token_lookup_abort_receive(
         self, stream, source_props
     ):
         events = []
         source_props.side_effect = lambda ds: events.append('source') or {}
         stream.get_value.side_effect = lambda *a, **k: (events.append('config'), stream.stored)[1]
         stream.token(TOKEN)
-        stream.list.side_effect = lambda **k: events.append('token') or [
-            MagicMock(__getitem__=MagicMock(return_value=TOKEN))
-        ]
+        stream.list.side_effect = lambda **k: (
+            events.append('snapshots') or []
+            if k.get('types') == 'snapshot'
+            else events.append('token') or [MagicMock(__getitem__=MagicMock(return_value=TOKEN))]
+        )
         stream.abort.side_effect = lambda *a: events.append('abort')
         stream.create.side_effect = lambda *a, **k: events.append('create')
         stream.set.side_effect = lambda *a, **k: events.append('set')
         stream.receive.side_effect = lambda *a, **k: (events.append('receive'), stream.writer)[1]
         stream.exists.side_effect = [True, True, True, False]
         stream.run('fresh')
-        assert events == ['source', 'config', 'token', 'abort', 'receive']
+        assert events == ['source', 'config', 'snapshots', 'token', 'abort', 'receive']
 
 
 class TestSourceDatasetCheck:
@@ -1177,8 +1225,12 @@ class TestFreshWithTokenThroughRealCommands:
     """Abort and receive run as real argv (only Popen is mocked): `receive -A`
     precedes `receive -F -s -u`."""
 
+    #: `zfs list -t snapshot -o name,type,createtxg,guid` of a server dataset with one snapshot
+    SNAPSHOT_ROWS = [f'{SERVER_DS}@autosnap_20260101000000\tsnapshot\t100\t5000\n']
+
     def setup_popen(self, mock_subprocess, token_row, abort=('', '', 0)):
         mock_subprocess.setup_multi(
+            (self.SNAPSHOT_ROWS,),      # zfs list -t snapshot  (the -F decision)
             (token_row,),               # zfs list -o name,type,receive_resume_token
             abort,                      # zfs receive -A
             ('',),                      # zfs receive (the stream); no `zfs set` after it
@@ -1194,30 +1246,33 @@ class TestFreshWithTokenThroughRealCommands:
         self.setup_popen(mock_subprocess, [f'{SERVER_DS}\tfilesystem\t{TOKEN}\n'])
         ws = MagicMock()
         ws.receive.side_effect = [b'chunk', json.dumps({'done': True})]
-        with authed.context(STREAM_PATH, query_string={'mode': 'fresh'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'fresh', 'from_guid': '5000'}):
             handler(ws, 'client1', 'pool/data')
         argvs = [c[0][0][1:] for c in mock_subprocess.call_args_list]
-        assert len(argvs) == 3, argvs
-        assert argvs[0][0] == 'list'
-        assert argvs[1] == ['receive', '-A', SERVER_DS]
-        assert argvs[2][0] == 'receive' and '-A' not in argvs[2]
-        assert '-s' in argvs[2] and argvs[2][-1] == SERVER_DS
-        assert argvs[2].count('-o') == 3 and '-x' not in argvs[2]      # the owned values, in the receive
+        assert len(argvs) == 4, argvs
+        assert argvs[0][0] == 'list' and 'snapshot' in argvs[0]        # the -F decision, before the abort
+        assert argvs[1][0] == 'list' and 'receive_resume_token' in ','.join(argvs[1])
+        assert argvs[2] == ['receive', '-A', SERVER_DS]
+        assert argvs[3][0] == 'receive' and '-A' not in argvs[3]
+        assert '-s' in argvs[3] and argvs[3][-1] == SERVER_DS
+        assert argvs[3].count('-o') == 3 and '-x' not in argvs[3]      # the owned values, in the receive
         assert json.loads(ws.send.call_args[0][0]) == {'status': 'ok'}
 
-    def test_resume_runs_no_list_and_no_abort(self, mocker, mock_subprocess):
+    def test_resume_runs_only_the_snapshot_listing_and_no_abort(self, mocker, mock_subprocess):
         mocker.patch.object(DatasetManager, 'datasets', new_callable=PropertyMock, return_value=[])
         mocker.patch('zfsbackup.api.read_zfsbackup_properties', return_value={})
         mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         authed = Authed(_remote_config())
         handler = authed.app.view_functions['backup_stream'].__wrapped__
-        mock_subprocess.setup_multi(('',))
+        mock_subprocess.setup_multi((self.SNAPSHOT_ROWS,), ('',))     # list -t snapshot, receive
         ws = MagicMock()
         ws.receive.side_effect = [json.dumps({'done': True})]
-        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume', 'from_guid': '5000'}):
             handler(ws, 'client1', 'pool/data')
         argvs = [c[0][0][1:] for c in mock_subprocess.call_args_list]
-        assert [a[0] for a in argvs] == ['receive'] and '-A' not in argvs[0]
+        # the one listing is the -F decision; there is no token lookup and no abort
+        assert [a[0] for a in argvs] == ['list', 'receive'] and '-A' not in argvs[1]
+        assert 'snapshot' in argvs[0] and 'receive_resume_token' not in ','.join(argvs[0])
 
     @pytest.mark.parametrize('stderr, rc, clean', [
         (f"cannot receive: '{SERVER_DS}' does not have any resumable receive state to abort", 1, True),
@@ -1238,16 +1293,16 @@ class TestFreshWithTokenThroughRealCommands:
         )
         ws = MagicMock()
         ws.receive.side_effect = [json.dumps({'done': True})]
-        with authed.context(STREAM_PATH, query_string={'mode': 'fresh'}):
+        with authed.context(STREAM_PATH, query_string={'mode': 'fresh', 'from_guid': '5000'}):
             handler(ws, 'client1', 'pool/data')
         sent = json.loads(ws.send.call_args[0][0])
         if clean:
             assert sent == {'status': 'ok'}
-            assert len(mock_subprocess.call_args_list) == 3
+            assert len(mock_subprocess.call_args_list) == 4
         else:
             assert sent['error'].startswith(f'Failed to discard the partial receive state of {SERVER_DS}: ')
             assert 'permission denied' in sent['error']
-            assert len(mock_subprocess.call_args_list) == 2      # no receive was started
+            assert len(mock_subprocess.call_args_list) == 3      # no receive was started
 
 
 def _ws():
@@ -1468,8 +1523,8 @@ class TestDatasetLockIsReleased:
             return lambda: props.configure_mock(side_effect=None, return_value={})
 
         def token_fails(s, props):
-            s.list.side_effect = RuntimeError('x')
-            return lambda: setattr(s.list, 'side_effect', None)
+            s.fail_token_lookup(RuntimeError('x'))
+            return s.restore_listing
 
         def abort_fails(s, props):
             s.token('1-t')
@@ -2113,7 +2168,7 @@ class TestClaimReleasedBeforeTheReply:
 
     @staticmethod
     def _token_lookup_fails(s, props):
-        s.list.side_effect = RuntimeError('cannot list')
+        s.fail_token_lookup(RuntimeError('cannot list'))
 
     @staticmethod
     def _abort_fails(s, props):
