@@ -43,6 +43,7 @@ positive test alone would pass vacuously on this machine (Python 3.14 on
 darwin, `spawn`-default).
 """
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -6335,11 +6336,43 @@ def _corrupt_body_file(path):
     return path
 
 
-def _open_fd_count():
-    return len(os.listdir("/dev/fd"))
+def _fd_path(fd):
+    """The file `fd` refers to, or None (closed meanwhile, or not a file).
+    Linux: /proc/self/fd; macOS: fcntl F_GETPATH (50 on Darwin)."""
+    try:
+        if os.path.isdir("/proc/self/fd"):
+            return os.readlink(f"/proc/self/fd/{fd}").removesuffix(" (deleted)")
+        f_getpath = getattr(fcntl, "F_GETPATH", None)
+        if f_getpath is not None:
+            raw = fcntl.fcntl(fd, f_getpath, b"\0" * 1024)
+            return os.fsdecode(raw.split(b"\0", 1)[0])
+    except OSError:
+        pass
+    return None
 
 
-@pytest.mark.skipif(not os.path.isdir("/dev/fd"), reason="needs /dev/fd to count descriptors")
+def _can_resolve_fd_paths():
+    if os.path.isdir("/proc/self/fd"):
+        return True
+    return os.path.isdir("/dev/fd") and getattr(fcntl, "F_GETPATH", None) is not None
+
+
+def _open_fds_on(db_path):
+    """Descriptors of THIS process open on the database file or one of its
+    -wal/-shm/-journal sidecars. Specific to the file under test: a process-wide
+    descriptor count also moves when an unrelated thread or finalizer left by an
+    earlier test (pytest-xdist worker) opens or closes something mid-test."""
+    base = os.path.realpath(db_path)
+    names = {base} | {base + suffix for suffix in ("-wal", "-shm", "-journal")}
+    # list() first: listing /dev/fd opens a descriptor of its own
+    fds = [int(n) for n in os.listdir("/dev/fd") if n.isdigit()]
+    return sorted(fd for fd in fds if _fd_path(fd) in names)
+
+
+@pytest.mark.skipif(
+    not _can_resolve_fd_paths(),
+    reason="needs /proc/self/fd (Linux) or fcntl.F_GETPATH (macOS) to resolve descriptors to paths",
+)
 @pytest.mark.integration
 class TestFailedConnectClosesTheRawConnection:
     """Item 10.6. SQLAlchemy 2.0.51 does not close the DBAPI connection when a
@@ -6359,6 +6392,18 @@ class TestFailedConnectClosesTheRawConnection:
         finally:
             gc.enable()
 
+    def test_the_probe_sees_a_descriptor_on_the_database_file(self, tmp_path):
+        """Positive control: without it, `_open_fds_on(...) == []` would pass
+        vacuously if the path resolution silently returned nothing."""
+        path = _corrupt_body_file(tmp_path / "c.db")
+        assert _open_fds_on(path) == []
+        conn = sqlite3.connect(str(path))
+        try:
+            assert len(_open_fds_on(path)) >= 1
+        finally:
+            conn.close()
+        assert _open_fds_on(path) == []
+
     @pytest.mark.parametrize("readonly", [True, False], ids=["reader", "writer"])
     def test_a_corrupt_body_file_leaves_no_open_connection_or_descriptor(
         self, tmp_path, gc_off, readonly
@@ -6375,7 +6420,7 @@ class TestFailedConnectClosesTheRawConnection:
         def _capture(dbapi_connection, connection_record):  # noqa: ANN001
             raw.append(dbapi_connection)
 
-        fds_before = _open_fd_count()
+        fds_before = _open_fds_on(path)
         try:
             with pytest.raises(DatabaseError, match="malformed"):
                 eng.connect()
@@ -6383,7 +6428,7 @@ class TestFailedConnectClosesTheRawConnection:
             for conn in raw:
                 with pytest.raises(sqlite3.ProgrammingError, match="closed"):
                     conn.execute("SELECT 1")
-            assert _open_fd_count() == fds_before
+            assert _open_fds_on(path) == fds_before == []
         finally:
             for conn in raw:
                 conn.close()  # idempotent; keeps a regression from leaking onward
@@ -6403,13 +6448,13 @@ class TestFailedConnectClosesTheRawConnection:
         def _capture(dbapi_connection, connection_record):  # noqa: ANN001
             raw.append(dbapi_connection)
 
-        fds_before = _open_fd_count()
+        fds_before = _open_fds_on(path)
         try:
             for _ in range(5):
                 with pytest.raises(DatabaseError):
                     eng.connect()
             assert len(raw) == 5
-            assert _open_fd_count() == fds_before
+            assert _open_fds_on(path) == fds_before == []
         finally:
             for conn in raw:
                 conn.close()
