@@ -33,8 +33,9 @@ daemon is a multiprocessing supervisor, not a single-process loop.
 
 **zfsbackup (`config/model.py`, `backup_manager.py`, `workers.py`, `daemon.py`, `remote.py`, `api.py`):**
 - Duration parsing edge cases (the `m` minutes vs `M` months disambiguation).
-- Retention/anchor correctness in `needs_prunning`/`prune_snapshots` (always keeps `snapshots[0]`,
-  skips anchored, newest-per-slot); `dry_run` honored in `create_snapshot`/`prune_snapshots`.
+- Retention/anchor correctness in `needs_prunning`/`prune_snapshots` (always keeps the newest snapshot
+  by `createtxg`, skips anchored and inflight-pinned snapshots, the OLDEST snapshot of each slot claims
+  it); `dry_run` honored in `create_snapshot`/`prune_snapshots`.
 - Config base64/JSON round-trip (`to_property`/`from_property`) integrity.
 - Worker loop / `stop_event.wait` handling; supervisor restart logic; no blocking calls that ignore
   the stop event. The remote path is TLS 1.3 + pinned mutual auth; check that nothing reintroduces a plaintext or unauthenticated route (residual caveats are listed in `docs/production_readiness_report.md`).

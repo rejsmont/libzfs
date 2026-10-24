@@ -4012,6 +4012,188 @@ class TestWorkersPresent:
         assert probe(db) is not None
 
 
+_PROBER_HELPER = r'''
+import sys
+from zfsbackup import daemonlock
+
+present = 0
+for _ in range(int(sys.argv[2])):
+    if daemonlock.workers_present(sys.argv[1]):
+        present += 1
+print(present, flush=True)
+'''
+
+
+class TestWorkersPresentRetries:
+    """`workers_present` retries a contended `LOCK_EX|LOCK_NB` up to
+    `_PROBE_ATTEMPTS` times with a jittered `_PROBE_RETRY_DELAY` between them:
+    two probes (`migrate` and a starting daemon) each hold `LOCK_EX` for an
+    instant and must not take each other for a worker, while a real worker's
+    `LOCK_SH` outlasts every retry.
+
+    Mutation-checked (scratch copy): `_PROBE_ATTEMPTS = 1` (a single probe)
+    fails 10 of the 12 tests in this class, among them
+    `test_a_momentary_exclusive_holder_is_not_a_worker` (release after ~30 ms)
+    and the two-process stress test (which reported free locks as held).
+    """
+
+    def test_the_constants(self):
+        assert daemonlock._PROBE_ATTEMPTS == 5
+        assert daemonlock._PROBE_RETRY_DELAY == 0.025
+
+    def test_a_momentary_exclusive_holder_is_not_a_worker(self, db):
+        """Held on another descriptor and released after ~30 ms: a single probe
+        would report a worker; the retries see the lock go."""
+        path = daemonlock.ensure_workers_lock(db)
+        thread, _stop = _transient_holder(path, fcntl.LOCK_EX, 0.03)
+        try:
+            assert daemonlock.workers_present(db) is False
+        finally:
+            thread.join(5)
+
+    def test_a_momentary_exclusive_holder_released_after_one_retry(self, db, monkeypatch):
+        path = daemonlock.ensure_workers_lock(db)
+        fd = os.open(str(path), os.O_RDONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        sleeps = []
+
+        def release_on_first_sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 1:
+                os.close(fd)
+
+        monkeypatch.setattr(daemonlock.time, "sleep", release_on_first_sleep)
+        assert daemonlock.workers_present(db) is False
+        assert len(sleeps) == 1
+
+    def test_a_real_shared_holder_in_another_process_is_present_in_bounded_time(self, db):
+        from _hermetic import hermetic_env
+
+        path = daemonlock.ensure_workers_lock(db)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _WORKERS_HELPER, str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env=hermetic_env(), cwd=str(REPO_ROOT),
+        )
+        try:
+            assert proc.stdout.readline().strip() == "ready"
+            started = time.monotonic()
+            assert daemonlock.workers_present(db) is True
+            elapsed = time.monotonic() - started
+            # four sleeps of 12.5-37.5 ms each: it did retry, and it did stop
+            assert 0.04 <= elapsed < 0.3, elapsed
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+            proc.stdout.close()
+
+    def test_a_held_lock_is_probed_attempts_times_with_jittered_sleeps_between(self, db, monkeypatch):
+        path = daemonlock.ensure_workers_lock(db)
+        fd = daemonlock.hold_workers_lock(path)
+        sleeps, attempts = [], []
+        real_flock = fcntl.flock
+
+        def counting(f, op):
+            if op & fcntl.LOCK_EX:
+                attempts.append(op)
+            return real_flock(f, op)
+
+        monkeypatch.setattr(daemonlock.fcntl, "flock", counting)
+        monkeypatch.setattr(daemonlock.time, "sleep", sleeps.append)
+        try:
+            assert daemonlock.workers_present(db) is True
+        finally:
+            os.close(fd)
+        assert len(attempts) == daemonlock._PROBE_ATTEMPTS
+        assert all(op == fcntl.LOCK_EX | fcntl.LOCK_NB for op in attempts)
+        assert len(sleeps) == daemonlock._PROBE_ATTEMPTS - 1       # none after the last
+        low, high = 0.5 * daemonlock._PROBE_RETRY_DELAY, 1.5 * daemonlock._PROBE_RETRY_DELAY
+        assert all(low <= d <= high for d in sleeps), sleeps
+        assert len(set(sleeps)) > 1, "the delay is jittered"
+
+    def test_a_free_lock_is_one_attempt_and_no_sleep(self, db, monkeypatch):
+        daemonlock.ensure_workers_lock(db)
+        sleeps = []
+        monkeypatch.setattr(daemonlock.time, "sleep", sleeps.append)
+        assert daemonlock.workers_present(db) is False
+        assert sleeps == []
+
+    def test_a_missing_file_is_false_with_no_sleep(self, db, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr(daemonlock.time, "sleep", sleeps.append)
+        assert daemonlock.workers_present(db) is False
+        assert sleeps == []
+
+    def test_an_error_other_than_contention_on_a_retry_raises_and_closes(self, db, monkeypatch):
+        path = daemonlock.ensure_workers_lock(db)
+        holder = daemonlock.hold_workers_lock(path)
+        real_flock = fcntl.flock
+        calls = []
+
+        def second_fails(f, op):
+            if op & fcntl.LOCK_EX:
+                calls.append(1)
+                if len(calls) == 2:
+                    raise OSError(errno.EIO, "Input/output error")
+            return real_flock(f, op)
+
+        monkeypatch.setattr(daemonlock.fcntl, "flock", second_fails)
+        monkeypatch.setattr(daemonlock.time, "sleep", lambda s: None)
+        before = fd_count()
+        try:
+            with pytest.raises(DaemonLockError) as exc:
+                daemonlock.workers_present(db)
+            assert exc.value.errno == errno.EIO
+            assert len(calls) == 2
+            assert fd_count() == before
+        finally:
+            os.close(holder)
+
+    @pytest.mark.parametrize("code", [errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES])
+    def test_every_contention_errno_is_retried(self, db, monkeypatch, code):
+        daemonlock.ensure_workers_lock(db)
+        real_flock = fcntl.flock
+        calls = []
+
+        def contended_twice(f, op):
+            if op & fcntl.LOCK_EX:
+                calls.append(1)
+                if len(calls) <= 2:
+                    raise OSError(code, "contended")
+            return real_flock(f, op)
+
+        monkeypatch.setattr(daemonlock.fcntl, "flock", contended_twice)
+        monkeypatch.setattr(daemonlock.time, "sleep", lambda s: None)
+        assert daemonlock.workers_present(db) is False
+        assert len(calls) == 3
+
+    @pytest.mark.skipif(not HAS_FORK, reason="needs real processes")
+    def test_two_processes_probing_a_free_lock_never_see_a_worker(self, db):
+        """Each probe holds LOCK_EX for an instant; with two processes probing
+        in a tight loop they constantly collide, and not one may report a worker."""
+        from _hermetic import hermetic_env
+
+        daemonlock.ensure_workers_lock(db)
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", _PROBER_HELPER, str(db), "3000"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=hermetic_env(), cwd=str(REPO_ROOT),
+            )
+            for _ in range(2)
+        ]
+        try:
+            results = [p.communicate(timeout=120) for p in procs]
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait(timeout=10)
+        for p, (out, err) in zip(procs, results):
+            assert p.returncode == 0, err
+            assert out.strip() == "0", f"a free lock was reported as held {out.strip()} time(s)"
+
+
 # ===========================================================================
 # G2 review fixes: device + inode proof, owner check, hidepid, padded writes,
 # O_NONBLOCK.

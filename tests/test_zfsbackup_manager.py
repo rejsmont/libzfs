@@ -262,6 +262,81 @@ class TestNeedsPrunning:
         assert good not in to_prune
 
 
+class TestGetLocalAnchor:
+    """`get_local_anchor`: the anchor as a LOCAL value of this dataset only. `get_anchor` reports
+    the effective value, inherited ones included; the rollback permit (B-2b) must not count an
+    anchor a parent passes down."""
+
+    def manager(self):
+        manager = DatasetManager(_make_config())
+        return manager, manager.datasets[0]
+
+    def test_it_reads_the_destination_property_with_the_local_source(self, mocker):
+        manager, dsi = self.manager()
+        value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value='autosnap_20240101120000')
+        assert manager.get_local_anchor(dsi, 'offsite') == 'autosnap_20240101120000'
+        value.assert_called_once_with(dsi.dataset, 'org.zfsbackup:anchor.offsite', sources='local')
+
+    def test_unset_or_inherited_is_none(self, mocker):
+        """`zfs.get.value(sources='local')` is None when the value is unset, inherited or received."""
+        manager, dsi = self.manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value=None)
+        assert manager.get_local_anchor(dsi, 'offsite') is None
+
+    def test_a_failed_read_is_unreadable_not_none(self, mocker):
+        """"Unset" and "could not be read" are different evidence: a zfs failure raises
+        `LocalAnchorUnreadable` carrying zfs's own message (the rollback permit reports it and sends
+        nothing, instead of reading a failure as "no anchor")."""
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        manager, dsi = self.manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=RuntimeError('pool suspended'))
+        with pytest.raises(LocalAnchorUnreadable, match='pool suspended') as exc:
+            manager.get_local_anchor(dsi, 'offsite')
+        assert str(exc.value) == 'pool suspended'
+        assert isinstance(exc.value.__cause__, RuntimeError)
+
+    def test_a_failure_without_a_message_still_says_something(self, mocker):
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        manager, dsi = self.manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=RuntimeError())
+        with pytest.raises(LocalAnchorUnreadable) as exc:
+            manager.get_local_anchor(dsi, 'offsite')
+        assert str(exc.value) != ''
+
+    def test_a_failed_zfs_through_the_real_get_is_unreadable(self, mock_subprocess):
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        manager, dsi = self.manager()
+        mock_subprocess.setup(stdout=[], stderr='cannot open pool/data: pool I/O is currently suspended', returncode=1)
+        with pytest.raises(LocalAnchorUnreadable, match='suspended'):
+            manager.get_local_anchor(dsi, 'offsite')
+
+    def test_the_effective_reader_still_swallows_a_failure(self, mocker):
+        """Only `get_local_anchor` changed; `get_anchor` keeps returning None on a failure."""
+        manager, dsi = self.manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=RuntimeError('pool suspended'))
+        assert manager.get_anchor(dsi, 'offsite') is None
+
+    def test_the_effective_reader_is_unchanged(self, mocker):
+        manager, dsi = self.manager()
+        value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value='inherited')
+        assert manager.get_anchor(dsi, 'offsite') == 'inherited'
+        assert value.call_args.kwargs == {}
+
+    def test_through_the_real_get_it_asks_for_local_values_only(self, mock_subprocess):
+        manager, dsi = self.manager()
+        mock_subprocess.setup(stdout=['autosnap_20240101120000\n'])
+        assert manager.get_local_anchor(dsi, 'offsite') == 'autosnap_20240101120000'
+        argv = mock_subprocess.call_args_list[0][0][0][1:]
+        assert argv[0] == 'get' and ('-s' in argv and argv[argv.index('-s') + 1] == 'local')
+        assert argv[-2:] == ['org.zfsbackup:anchor.offsite', 'pool/data']
+
+    def test_through_the_real_get_an_inherited_value_is_none(self, mock_subprocess):
+        """With `-s local` zfs prints nothing for an inherited value."""
+        manager, dsi = self.manager()
+        mock_subprocess.setup(stdout=[])
+        assert manager.get_local_anchor(dsi, 'offsite') is None
+
+
 class TestPropertyHelpers:
     def test_get_prop_returns_value(self, mocker):
         manager = DatasetManager(_make_config())

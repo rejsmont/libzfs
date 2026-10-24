@@ -180,13 +180,11 @@ datasets:
 """
 
 
-#: What `migrate` prints after a real upgrade (item 15.5 wording: the daemon
-#: reads the configuration too; since 19.1 only a daemon started BEFORE the
-#: upgrade needs a restart).
+#: What `migrate` prints after a real upgrade (C12: it only runs with the daemon
+#: stopped, so what is left to say is to start it).
 RESTART_HINT = (
-    "A daemon started before this upgrade must be restarted to run this schema (until "
-    "then it cannot apply any configuration change); one already running this version "
-    "picks it up within 10s."
+    "Start the daemon to run this schema (a daemon refuses to start on an older "
+    "one, and `migrate` refuses while one runs, so none is running now)."
 )
 
 
@@ -398,7 +396,7 @@ class TestSkeleton:
         "edit", "enroll", "export", "get", "identity", "import", "list", "migrate", "rename", "set",
         "status", "trust", "unset",
     ]
-    PLANNED = set()
+    PLANNED = {"backup", "check"}
 
     def test_help_lists_exactly_the_commands(self, run):
         result = run("--help")
@@ -2746,6 +2744,14 @@ class TestPackaging:
     def test_console_script_is_declared(self, pyproject):
         scripts = pyproject["tool"]["poetry"]["scripts"]
         assert scripts["zfsbackup-config"] == "zfsbackup.cli.main:main"
+        assert scripts["zfsbackupd"] == "zfsbackup.daemon_entry:main"
+
+    def test_daemon_console_script_target_resolves_and_is_callable(self, pyproject):
+        import importlib
+
+        module_name, _, attr = pyproject["tool"]["poetry"]["scripts"]["zfsbackupd"].partition(":")
+        target = getattr(importlib.import_module(module_name), attr)
+        assert callable(target)
 
     def test_console_script_target_resolves_and_is_callable(self, pyproject):
         import importlib
@@ -2792,6 +2798,7 @@ class TestPackaging:
         parser.optionxform = str
         parser.read_string(entry_points)
         assert parser["console_scripts"]["zfsbackup-config"] == "zfsbackup.cli.main:main"
+        assert parser["console_scripts"]["zfsbackupd"] == "zfsbackup.daemon_entry:main"
         for expected in (
             "zfsbackup/cli/main.py",
             "zfsbackup/cli/render.py",
@@ -2830,6 +2837,36 @@ class TestPackaging:
             capture_output=True, text=True, timeout=120,
         )
         assert missing.returncode == 78
+
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_installed_daemon_console_script_runs(self, tmp_path):
+        from importlib.metadata import entry_points
+
+        found = [
+            ep for ep in entry_points(group="console_scripts") if ep.name == "zfsbackupd"
+        ]
+        if not found:
+            pytest.skip("zfsbackupd is not installed (run `poetry install`)")
+        assert found[0].value == "zfsbackup.daemon_entry:main"
+        script = shutil.which("zfsbackupd", path=os.path.dirname(sys.executable))
+        if script is None:
+            pytest.skip("console script not on the interpreter's bin directory")
+        from _hermetic import hermetic_env
+
+        env = hermetic_env()
+        proc = subprocess.run(
+            [script, "--help"], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "usage: zfsbackupd" in proc.stdout
+        missing = subprocess.run(
+            [script, "--test-config", "-c", str(tmp_path / "missing.db")], cwd=tmp_path, env=env,
+            capture_output=True, text=True, timeout=120,
+        )
+        assert missing.returncode != 0, missing.stderr
+        assert missing.returncode != 129, missing.stderr  # SIGHUP's default never fired
+        assert "Traceback" not in missing.stderr, missing.stderr
 
 
 # --------------------------------------------------------------------------

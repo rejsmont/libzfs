@@ -1,0 +1,16 @@
+# OPTIONAL and disabled by default. Enable with
+#
+#   systemctl enable --now zfsbackup-check.timer
+#
+# after pointing ZFSBACKUP_CHECK_OUTPUT in zfsbackup-check.service at
+# node_exporter's textfile directory.
+[Unit]
+Description=Run the ZFS Backup health check every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -554,6 +554,29 @@ def _restore_signal_handlers():
             signal.signal(sig, handler)
 
 
+@pytest.fixture(autouse=True)
+def _restore_logsetup_state():
+    """Undoes what `zfsbackup.logsetup.configure` leaves in the pytest process.
+
+    Importing the daemon configures nothing since C3, but `daemon.main()` and
+    `workers._init_child_process()` (both called inline by many tests) call
+    `configure`, which installs a root handler bound to whatever `sys.stdout`
+    is at that moment (a per-test capture object that is closed once the test
+    ends, so a later log call prints "--- Logging error ---"), sets the root
+    level, and pins the `werkzeug` logger. After every test: remove the
+    handler `configure` installed (only that one: pytest's own capture handlers
+    and any other test's are untouched) and put both levels back."""
+    import logging
+
+    root = logging.getLogger()
+    levels = (root.level, logging.getLogger("werkzeug").level)
+    yield
+    for handler in [h for h in root.handlers if type(h).__name__ == "_ZfsbackupHandler"]:
+        root.removeHandler(handler)
+    root.setLevel(levels[0])
+    logging.getLogger("werkzeug").setLevel(levels[1])
+
+
 @pytest.fixture
 def imported_config_db(tmp_path, config_yaml_path):
     """Import `config_yaml_path` into a fresh SQLite config store under

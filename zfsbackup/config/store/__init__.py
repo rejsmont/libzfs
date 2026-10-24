@@ -297,6 +297,7 @@ from zfsbackup.config.store.migrate import (
     SchemaSplitBrain,
     SchemaUpgrade,
     SchemaVersionMismatch,
+    check_migration_packaging,
     check_schema,
     ensure_schema,
     upgrade_schema,
@@ -304,6 +305,7 @@ from zfsbackup.config.store.migrate import (
 from zfsbackup.config.store.paths import (
     CONFIG_DB_MODE,
     CONFIG_DIR_MODE,
+    CONFIG_GROUP,
     CONFIG_OWNER,
     CONFIG_PATH_ENV,
     DEFAULT_CONFIG_DB,
@@ -352,6 +354,14 @@ from zfsbackup.config.store.access import (
     read_store_state,
     write_config,
 )
+from zfsbackup.config.store.backup import (
+    BackupBusy,
+    BackupError,
+    BackupInfo,
+    BackupPublishError,
+    BackupSourceError,
+    backup_database,
+)
 from zfsbackup.config.store.trust import (
     TOKEN_MAX_TTL_SECONDS,
     ClientIdUpdate,
@@ -386,16 +396,24 @@ from zfsbackup.config.store.trust import (
 )
 
 __all__ = [
+    "backup_database",
+    "BackupBusy",
+    "BackupError",
+    "BackupInfo",
+    "BackupPublishError",
+    "BackupSourceError",
     "Base",
     "check_config_db",
     "check_config_db_suffix",
     "check_config_schema",
+    "check_migration_packaging",
     "check_schema",
     "ClientIdUpdate",
     "ClientRecord",
     "CONFIG_DB_MODE",
     "CONFIG_DIR_MODE",
     "config_error_message",
+    "CONFIG_GROUP",
     "CONFIG_OWNER",
     "CONFIG_PATH_ENV",
     "ConfigBusy",

@@ -513,13 +513,22 @@ class TestGateOnProtocolRefusals:
         receive = mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         row = MagicMock()
         row.__getitem__ = MagicMock(return_value="1-token")
-        lister = mocker.patch("zfsbackup.api.zfs.list", return_value=[row])
+        # Two listings are made: the resume token (one row) and, under the claim, the server's snapshots
+        # (B-2b: none, so `-F` is harmless and the refusal under test is the one reached).
+        token_lookup = MagicMock(return_value=[row])
+
+        def listing(*args, **kwargs):
+            if kwargs.get("types") == "snapshot":
+                return []
+            return token_lookup(*args, **kwargs)
+
+        mocker.patch("zfsbackup.api.zfs.list", side_effect=listing)
         if arrange == "mismatch":
             source_props.return_value = {"org.zfsbackup:source_dataset": "tank/data"}
         elif arrange == "source-read-fails":
             source_props.side_effect = RuntimeError("zfs get failed")
         elif arrange == "token-lookup-fails":
-            lister.side_effect = RuntimeError("zfs list failed")
+            token_lookup.side_effect = RuntimeError("zfs list failed")
         elif arrange == "abort-fails":
             abort.side_effect = Exception("pool I/O is currently suspended")
         elif arrange == "receive-start-fails":

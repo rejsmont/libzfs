@@ -66,6 +66,7 @@ from zfsbackup.config import (
     DatasetConfig,
     Destination,
     RemoteDatasetConfig,
+    RemoteServerConfig,
 )
 from zfsbackup.config.store import (
     ConfigDbNotFound,
@@ -533,6 +534,56 @@ class TestRejection:
         assert world.lock.state["target"] is None       # never accepted
         # Diagnosed: no traceback.
         assert all(not r.exc_info for r in caplog.records if r.levelno == logging.ERROR)
+
+    @pytest.mark.parametrize(
+        "name, recursive, word",
+        [
+            ("pool/backups", False, "is remote_backup.target_dataset"),
+            ("pool/backups/a", False, "is below remote_backup.target_dataset"),
+            ("pool", True, "ancestor"),
+        ],
+    )
+    def test_a_dataset_overlapping_the_receive_target_is_rejected(
+        self, world, caplog, name, recursive, word
+    ):
+        """C0: a candidate with a configured dataset at/below the enabled
+        `remote_backup.target_dataset`, or a recursive ancestor of it, is a
+        final rejection (the real `validate_config` runs); the old workers
+        keep running."""
+        before = world.start_workers()
+        bad = BackupConfig(
+            datasets=[DatasetConfig(name=name, recursive=recursive)],
+            remote_backup=RemoteServerConfig("pool/backups", enabled=True),
+        )
+        world.write((STORE, 8), config=bad)
+        world.hup()
+        self._assert_nothing_changed(world, before)
+        errors = messages(caplog, logging.ERROR)
+        assert len(errors) == 1
+        assert errors[0].startswith(
+            "configuration generation 8 rejected (trigger: SIGHUP); "
+            "still running generation 0:\n"
+        )
+        assert word in errors[0] and "received" in errors[0]
+        assert world.daemon._rejected == (STORE, 8)
+        assert world.lock.state["rejected"] == (STORE, 8)
+        assert world.lock.state["target"] is None       # refused before it was accepted
+        world.poll()
+        assert world.daemon._rejected == (STORE, 8)     # and the poll does not retry it
+        assert len(messages(caplog, logging.ERROR)) == 1
+
+    def test_the_same_datasets_with_a_disabled_receiver_are_accepted(self, world, caplog):
+        world.start_workers()
+        ok = BackupConfig(
+            datasets=[DatasetConfig(name="pool/backups/a")],
+            remote_backup=RemoteServerConfig("pool/backups", enabled=False),
+        )
+        world.write((STORE, 8), config=ok)
+        world.hup()
+        assert world.daemon._rejected is None
+        assert world.lock.state["target"] == (STORE, 8)
+        assert messages(caplog, logging.INFO, "configuration generation 8 accepted")
+        assert not messages(caplog, logging.ERROR)
 
     def test_a_schema_out_of_date_read_is_rejected_with_the_reload_wording(self, world, caplog):
         before = world.start_workers()

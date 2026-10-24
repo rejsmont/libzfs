@@ -48,6 +48,7 @@ end, against the real `python -m zfsbackup.daemon` entry point.
 """
 
 import json
+import logging
 import multiprocessing
 import signal
 
@@ -86,7 +87,7 @@ def _child_report_after_init(result_path: str) -> None:
     """Calls the real `_init_child_process` first -- exactly what every
     worker's `run()` does as its own first statement -- then reports.
     """
-    _init_child_process(verbose=False)
+    _init_child_process(log_level=logging.INFO)
     result = {
         "sigterm": _describe(signal.getsignal(signal.SIGTERM)),
         "sigint": _describe(signal.getsignal(signal.SIGINT)),

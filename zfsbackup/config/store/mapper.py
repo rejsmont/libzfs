@@ -898,6 +898,55 @@ def destination_name_problem(name: str) -> Optional[str]:
     return None
 
 
+def _dataset_components(name: str) -> List[str]:
+    """Split a dataset name into path components (a trailing `/` is ignored)."""
+    return name.rstrip("/").split("/")
+
+
+def _require_outside_target(ds: DatasetConfig, key: str, remote_backup: object) -> None:
+    """Refuse a configured dataset that overlaps `remote_backup.target_dataset`.
+
+    What bug this prevents: the server enumerates EVERYTHING under the target
+    as a received dataset. A configured dataset at or below the target would
+    be snapshotted and pruned by this host's own workers inside received
+    data (the next incremental receive then fails, and an aligned
+    `{prefix}_{ts}` name makes the prune destroy received snapshots); a
+    `recursive` ancestor reaches the same datasets through `zfs snapshot -r`
+    and `zfs destroy -r`. Enabled or not, so enabling a dataset later cannot
+    open the hole.
+
+    Compared by path COMPONENTS, never by string prefix: `tank/b` is not an
+    ancestor of `tank/backup`, and `tank/backup` is not the target
+    `tank/backups`. A non-recursive ancestor only touches its own snapshots,
+    so it stays allowed. No check without a remote_backup target (disabled or
+    unset: nothing is received, so nothing can overlap).
+    """
+    if remote_backup is None or not getattr(remote_backup, "enabled", False):
+        return
+    target = getattr(remote_backup, "target_dataset", None)
+    if not isinstance(target, str) or not target or not isinstance(ds.name, str):
+        return
+    t = _dataset_components(target)
+    d = _dataset_components(ds.name)
+    if d[: len(t)] == t:
+        where = "is" if len(d) == len(t) else "is below"
+        raise ValueError(
+            f"{key}: the dataset {where} remote_backup.target_dataset "
+            f"{target!r}. The server treats everything under the target as "
+            "received backups, so snapshotting or pruning a dataset there "
+            "would act on received data. Move the target to a dedicated "
+            "dataset that no configured dataset is at or below."
+        )
+    if ds.recursive is True and len(d) < len(t) and t[: len(d)] == d:
+        raise ValueError(
+            f"{key}: the dataset is recursive and is an ancestor of "
+            f"remote_backup.target_dataset {target!r}. Its recursive "
+            "snapshots (zfs snapshot -r) and prunes (zfs destroy -r) would "
+            "reach the received datasets under the target. Make the dataset "
+            "non-recursive, or move the target outside it."
+        )
+
+
 def validate_config(config: BackupConfig) -> List[str]:
     """Check that `config` is storable and means what it says; pure.
 
@@ -953,6 +1002,9 @@ def validate_config(config: BackupConfig) -> List[str]:
       path or is set without the other (`client_tls_files_problem`);
     - any retention rule with a non-positive `age`/`keep_for`, and any
       `validate_retention_uniqueness` collision, per scope.
+    - with remote backup ENABLED: a configured dataset (enabled or not) at or
+      below `remote_backup.target_dataset`, or a `recursive` one that is a
+      strict ancestor of it (`_require_outside_target`).
 
     Warns (returned, not raised):
 
@@ -1138,6 +1190,7 @@ def validate_config(config: BackupConfig) -> List[str]:
                 "enabling it will be refused"
             )
         _require_positive_duration(ds.frequency, f"{key}.frequency", "frequency")
+        _require_outside_target(ds, key, config.remote_backup)
 
         if not ds.retention_rules:
             warnings.append(

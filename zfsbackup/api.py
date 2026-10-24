@@ -1,6 +1,9 @@
 """The server side of remote backup: the HTTPS API clients enroll, negotiate
-and stream through. It exposes nothing about the server's own configuration,
-datasets or snapshots (plan S-4).
+and stream through. It exposes nothing about the server's own configuration or
+datasets, and about its snapshots only what concerns the authenticated
+client's own server copy: the names and guids of the copy's snapshots newer
+than the common one (`server_newer`) and the refusal messages of `/stream`
+(plan S-4).
 
 Served over HTTPS only (TLS/mTLS plan M9): `workers.ApiWorker` runs the app
 behind `workers._api_server_class()`, which does every TLS handshake on the
@@ -29,6 +32,7 @@ import functools
 import json
 import logging
 import os
+import re
 import socket
 import ssl
 import threading
@@ -38,7 +42,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Mapping, NamedTuple, Optional, Tuple
+from typing import Callable, List, Mapping, NamedTuple, Optional, Tuple
 
 from flask import Flask, after_this_request, g, jsonify, request
 from flask_sock import Sock
@@ -50,7 +54,7 @@ from libzfseasy.types import Dataset, Filesystem
 
 from zfsbackup.backup_manager import (
     PROP_CONFIG, PROP_CLIENT_ID, PROP_SOURCE_DATASET,
-    read_zfsbackup_properties,
+    property_int, read_zfsbackup_properties,
 )
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, client_id_problem, normalize_fingerprint,
@@ -88,6 +92,14 @@ RELOADING_ERROR = {'error': 'server is reloading; retry later', 'retry': True}
 #: dataset is discarded first. `resume`: the client is continuing the transfer
 #: the server's resume token describes; nothing is discarded.
 STREAM_MODES = ('fresh', 'resume')
+
+#: Most server snapshots `negotiate` names in `server_newer` (the snapshots of
+#: the server copy newer than the common one, oldest first); the total is
+#: always in `server_newer_count`.
+SERVER_NEWER_MAX = 64
+
+#: Most guids `/stream?discard=` accepts.
+DISCARD_MAX = 16
 
 #: The refusal body for `stream` while another stream (or its abort) for the
 #: SAME server dataset is running in this API worker. `retry` marks it as a
@@ -1039,6 +1051,164 @@ def client_dataset_problem(dataset) -> Optional[str]:
     except Exception:
         return "invalid client dataset name"
     return None
+
+
+_GUID_RE = re.compile(r'[0-9]{1,20}')
+
+
+class StreamBase(NamedTuple):
+    """What a `/stream` request says about its incremental base and the
+    server snapshots the client allows the receive to destroy: `name` (`from`,
+    the fallback of a client that sends no guid), `guid` (`from_guid`, the
+    base's decimal guid; preferred when present) and `discard` (`discard`, a
+    comma-separated list of decimal guids). All optional: a full stream has no
+    base."""
+    name: Optional[str] = None
+    guid: Optional[int] = None
+    discard: frozenset = frozenset()
+
+
+def parse_stream_base(args: Mapping[str, str]) -> StreamBase:
+    """The `StreamBase` of a `/stream` request's query arguments. Raises
+    `ValueError` (its text is the reply) for a `from_guid` or `discard` that is
+    not decimal guids, or a `discard` with more than `DISCARD_MAX` of them."""
+    name = args.get('from') or None
+    raw_guid = args.get('from_guid')
+    guid = None
+    if raw_guid is not None:
+        if _GUID_RE.fullmatch(raw_guid) is None:
+            raise ValueError("stream parameter from_guid: not a decimal snapshot guid")
+        guid = int(raw_guid)
+    raw_discard = args.get('discard')
+    discard = set()
+    if raw_discard:
+        parts = raw_discard.split(',')
+        if len(parts) > DISCARD_MAX:
+            raise ValueError(f"stream parameter discard: more than {DISCARD_MAX} guids")
+        for part in parts:
+            if _GUID_RE.fullmatch(part) is None:
+                raise ValueError("stream parameter discard: not a comma-separated list of decimal guids")
+            discard.add(int(part))
+    return StreamBase(name, guid, frozenset(discard))
+
+
+class ServerSnapshot(NamedTuple):
+    """A snapshot of a server dataset as `server_snapshots` lists it."""
+    name: str                # short name
+    txg: Optional[int]       # createtxg
+    guid: Optional[int]
+
+
+def server_snapshots(server_fs, *, strict: bool = True) -> List[ServerSnapshot]:
+    """The direct snapshots of `server_fs`, with `createtxg` and `guid` (None
+    where zfs did not report one). Raises if zfs fails. `strict` (the default)
+    also raises when libzfseasy would have skipped a row it cannot trust (a
+    snapshot name it cannot parse, say): a decision about what a receive may
+    destroy must not rest on a listing that silently lacks a snapshot."""
+    return [
+        ServerSnapshot(s.short, property_int(s, 'createtxg'), property_int(s, 'guid'))
+        for s in zfs.list(
+            roots=server_fs, types='snapshot', properties=['createtxg', 'guid'],
+            strict=strict,
+        )
+    ]
+
+
+def _rollback_range(names: List[str]) -> str:
+    """`first` or `first…last` for a list of snapshot names, oldest first."""
+    return names[0] if len(names) == 1 else f"{names[0]}\u2026{names[-1]}"
+
+
+class ReceiveDecision(NamedTuple):
+    """Whether, and how, a stream may be received into an existing server
+    dataset (`decide_receive`). `reason` is `None` to proceed, else the
+    refusal (`base_missing`, `server_newer`, `no_common`) with `message` as its
+    text; `force` is whether `zfs receive` gets `-F`; `rolled_back` names the
+    server snapshots that `-F` will destroy because the client allowed it."""
+    force: bool
+    reason: Optional[str] = None
+    message: str = ''
+    rolled_back: Tuple[str, ...] = ()
+
+
+def decide_receive(
+    server_dataset: str, base: StreamBase, rows: List[ServerSnapshot]
+) -> ReceiveDecision:
+    """Decide `-F` for a receive into the EXISTING server dataset holding
+    `rows` (its direct snapshots). `-F` on an incremental receive destroys
+    every server snapshot newer than the base, so it is only passed when that
+    destroys nothing, or when the client named exactly those snapshots by
+    guid in `discard`. "Newer" is by `createtxg`, never by name. Raises
+    `ValueError` when a snapshot has no `createtxg` (it cannot be ordered:
+    the caller fails closed).
+
+    - no snapshots (a placeholder, or a first receive that was cut): `-F`;
+    - a base the server does not hold (by guid when given, else by name):
+      refused, `base_missing`;
+    - the base is the newest: `-F` (it discards changes to the head only);
+    - snapshots newer than the base, all in `discard`: `-F`, those are
+      rolled back; otherwise refused, `server_newer`;
+    - no base (a full stream) but the copy holds snapshots: refused,
+      `no_common` (zfs refuses a full stream over them anyway)."""
+    if any(r.txg is None for r in rows):
+        raise ValueError("a server snapshot has no createtxg")
+    if not rows:
+        return ReceiveDecision(True)
+    rename = (
+        f"`zfs rename {server_dataset} <a name outside the backup target>` "
+        "(the next cycle sends a full stream; see README 'Renaming a server copy aside')"
+    )
+    if base.guid is None and base.name is None:
+        return ReceiveDecision(False, 'no_common', (
+            f"{server_dataset} already holds snapshots and a full stream cannot replace "
+            f"them, so nothing is received. On the server: {rename}"
+        ))
+    if base.guid is not None:
+        found = next((r for r in rows if r.guid == base.guid), None)
+    else:
+        found = next((r for r in rows if r.name == base.name), None)
+    if found is None:
+        what = f"guid {base.guid}" if base.guid is not None else repr(base.name)
+        return ReceiveDecision(False, 'base_missing', (
+            f"{server_dataset} does not hold the incremental source snapshot ({what}), "
+            "so nothing is received. This can be transient (the server's pruner may have "
+            "removed it since negotiation; the next cycle negotiates again). If it "
+            f"persists, on the server: {rename}"
+        ))
+    newer = sorted((r for r in rows if r.txg > found.txg), key=lambda r: r.txg)
+    if not newer:
+        return ReceiveDecision(True)
+    names = [r.name for r in newer]
+    if all(r.guid is not None and r.guid in base.discard for r in newer):
+        return ReceiveDecision(True, rolled_back=tuple(names))
+    return ReceiveDecision(False, 'server_newer', (
+        f"{server_dataset} holds {len(names)} snapshot(s) newer than {found.name} "
+        f"({_rollback_range(names)}) that the client did not allow to be destroyed, "
+        "so nothing is received (receiving would destroy them). To keep them, on the "
+        f"server: {rename}. If they are expendable: "
+        f"`zfs destroy {server_dataset}@{names[0]}"
+        + (f"%{names[-1]}" if len(names) > 1 else "")
+        + "` (the next cycle continues)"
+    ))
+
+
+def newer_than(server_dataset: str, common: str, snaps: List[ServerSnapshot]):
+    """The server snapshots newer (by `createtxg`) than the snapshot named
+    `common`, oldest first, as `{"name", "guid"}` (the guid a decimal
+    string, `None` if unknown); `None` when they cannot be told (a
+    snapshot has no `createtxg`: logged, and the stream, which decides
+    for itself, fails closed)."""
+    if any(s.txg is None for s in snaps):
+        logger.warning(
+            "negotiate for %s: a server snapshot has no createtxg; "
+            "not reporting server_newer", server_dataset,
+        )
+        return None
+    base = next(s for s in snaps if s.name == common)
+    return [
+        {'name': s.name, 'guid': None if s.guid is None else str(s.guid)}
+        for s in sorted((s for s in snaps if s.txg > base.txg), key=lambda s: s.txg)
+    ]
 
 
 def create_app(
@@ -2193,24 +2363,52 @@ def create_app(
         # Find the most recent snapshot present on both sides
         common_snapshot = None
         server_copy = 'none'
+        server_newer = None
         if server_fs_exists:
             try:
-                server_snaps = zfs.list(roots=server_fs, types='snapshot', properties=['creation'])
-                server_names = {s.short for s in server_snaps}
+                # Strict: `server_newer` must not rest on a listing that lacks a
+                # snapshot libzfseasy could not parse. If the listing cannot be
+                # trusted, negotiate still answers from the plain listing (as it
+                # always has) but reports `server_newer_unknown` instead of
+                # `server_newer`; the stream, which does decide what `-F` may
+                # destroy, then refuses on its own.
+                try:
+                    server_snaps = server_snapshots(server_fs)
+                    listing_trusted = True
+                except Exception as e:
+                    logger.warning(
+                        "negotiate for %s: the snapshot listing cannot be trusted (%s); "
+                        "not reporting server_newer", server_dataset, e,
+                    )
+                    server_snaps = server_snapshots(server_fs, strict=False)
+                    listing_trusted = False
+                server_names = {s.name for s in server_snaps}
                 for snap_name in client_snapshots:
                     if snap_name in server_names:
                         common_snapshot = snap_name
                         break
                 if server_names:
                     server_copy = _server_copy_kind(server_fs, client_id)
+                if common_snapshot is not None and listing_trusted:
+                    server_newer = newer_than(server_dataset, common_snapshot, server_snaps)
             except Exception as e:
                 return jsonify({'error': f'Failed to list server snapshots: {e}'}), 500
 
-        return jsonify({
+        reply = {
             'common_snapshot': common_snapshot,
             'server_dataset': server_dataset,
             'server_copy': server_copy,
-        })
+        }
+        if server_newer is not None:
+            reply['server_newer'] = server_newer[:SERVER_NEWER_MAX]
+            reply['server_newer_count'] = len(server_newer)
+        elif common_snapshot is not None:
+            # A common snapshot, but the snapshots newer than it cannot be
+            # told. Said explicitly: silence would read as "a server that does
+            # not report them", and the client must not settle its anchor (or
+            # let a rollback pass for a backstop) on a list it does not have.
+            reply['server_newer_unknown'] = True
+        return jsonify(reply)
 
     @app.route('/backup/<client_id>/<path:dataset>/negotiate', methods=['POST'])
     @_gated
@@ -2242,8 +2440,18 @@ def create_app(
         "server_dataset", "server_copy": "none" | "plain" | "raw"}`
         (`none`: the dataset is missing or holds no snapshot; `raw`: it is
         encrypted with its own encryption root, which is what a raw receive
-        leaves; `plain`: otherwise; an additive field of protocol 1); 400 `{"error"}` for a body that is not a JSON
-        object, a missing or mistyped field, an undecodable or empty
+        leaves; `plain`: otherwise; an additive field of protocol 1). With a
+        common snapshot the reply also carries `server_newer`
+        (`[{"name", "guid"}, ...]`: the server snapshots newer than it by
+        `createtxg`, oldest first, the guid a decimal string, at most
+        `SERVER_NEWER_MAX`) and `server_newer_count` (their number), both
+        additive: a client that does not know them ignores them, and a
+        `/stream` receive that would destroy such snapshots is refused
+        unless the client names them in `discard`. When there is a common
+        snapshot but the newer ones cannot be told (the listing cannot be
+        trusted, or a snapshot has no `createtxg`) the reply carries
+        `"server_newer_unknown": true` instead of the two fields above. 400
+        `{"error"}` for a body that is not a JSON object, a missing or mistyped field, an undecodable or empty
         `config` (`BAD_CONFIG_ERROR`), an invalid dataset name, or a value
         libzfseasy refuses to store (`BAD_PROPERTY_ERROR`); 409 when the
         server dataset belongs to another client id or client dataset; 500
@@ -2317,6 +2525,14 @@ def create_app(
                 except Exception:
                     pass
                 return
+            try:
+                base = parse_stream_base(request.args)
+            except ValueError as e:
+                try:
+                    ws.send(json.dumps({'error': str(e)}))
+                except Exception:
+                    pass
+                return
             if not gate.begin():
                 try:
                     ws.send(json.dumps(RELOADING_ERROR))
@@ -2324,14 +2540,17 @@ def create_app(
                     pass
                 return
             try:
-                # `?from=` (the incremental base the client negotiated) is
-                # informational only: `zfs receive` takes the base from the
-                # stream.
+                # `?from=` / `?from_guid=` name the incremental base the
+                # client negotiated and `?discard=` the server snapshots it
+                # allows the receive to destroy. `zfs receive` takes the base
+                # from the stream itself; these decide only whether it gets
+                # `-F` (`decide_receive`), which destroys every snapshot newer
+                # than the base.
                 logger.debug(
-                    "stream for %s/%s: mode=%s from=%s",
-                    client_id, dataset, mode, request.args.get('from'),
+                    "stream for %s/%s: mode=%s from=%s from_guid=%s discard=%d",
+                    client_id, dataset, mode, base.name, base.guid, len(base.discard),
                 )
-                _receive_stream(ws, client_id, dataset, mode)
+                _receive_stream(ws, client_id, dataset, mode, base)
             finally:
                 gate.end()
         finally:
@@ -2339,7 +2558,9 @@ def create_app(
             # wait for this.
             _end_websocket(ws)
 
-    def _receive_stream(ws, client_id: str, dataset: str, mode: str) -> None:
+    def _receive_stream(
+        ws, client_id: str, dataset: str, mode: str, base: StreamBase
+    ) -> None:
         # Validate the name before it becomes a key of anything. The key is
         # `<target>/<bound id>/...`, so the per-dataset claim is scoped to
         # the authenticated client.
@@ -2373,14 +2594,14 @@ def create_app(
 
         try:
             _receive_stream_locked(
-                ws, client_id, dataset, server_dataset, mode, release_claim
+                ws, client_id, dataset, server_dataset, mode, base, release_claim
             )
         finally:
             release_claim()
 
     def _receive_stream_locked(
         ws, client_id: str, dataset: str, server_dataset: str, mode: str,
-        release_claim: Callable[[], None],
+        base: StreamBase, release_claim: Callable[[], None],
     ) -> None:
         server_fs = Filesystem(server_dataset)
 
@@ -2412,9 +2633,12 @@ def create_app(
         # the receive itself (`-o`), so they are the values in effect the
         # moment it finishes -- see `SERVER_OWNED_PROPERTIES`.
         try:
+            # Asked once and reused for the `-F` decision below (the dataset
+            # is claimed, so nothing else creates or destroys it meanwhile).
+            existed = zfs.exists(server_fs)
             stored_config = (
                 zfs.get.value(Dataset(server_dataset), PROP_CONFIG, sources='local')
-                if zfs.exists(server_fs) else None
+                if existed else None
             )
         except Exception as e:
             logger.error("cannot read the configuration of %s: %s", server_dataset, e)
@@ -2459,6 +2683,64 @@ def create_app(
                 'retry': True,
             }))
             return
+
+        # Whether the receive may be forced (`-F`), decided BEFORE the abort
+        # below: a refusal must not first discard a partial receive. `-F` on
+        # an incremental receive destroys every snapshot newer than its base
+        # (a client that rolled back or restored an older snapshot would
+        # otherwise make the server destroy history it holds), so it is only
+        # passed when that destroys nothing or the client named exactly
+        # those snapshots (`decide_receive`). A listing that fails refuses.
+        decision = ReceiveDecision(False)
+        if existed:
+            try:
+                rows = server_snapshots(server_fs)
+            except Exception as e:
+                # zfs failed, or the listing could not be trusted (libzfseasy
+                # skipped a row): either way a snapshot the decision never saw
+                # could be destroyed by `-F`.
+                logger.error(
+                    "cannot list the snapshots of %s (the receive is refused): %s",
+                    server_dataset, e,
+                )
+                release_claim()
+                ws.send(json.dumps({
+                    'error': f'Failed to list the snapshots of {server_dataset}: {e}',
+                    'reason': 'listing',
+                }))
+                return
+            try:
+                decision = decide_receive(server_dataset, base, rows)
+            except ValueError as e:
+                logger.error(
+                    "cannot order the snapshots of %s (the receive is refused): %s",
+                    server_dataset, e,
+                )
+                release_claim()
+                ws.send(json.dumps({
+                    'error': (
+                        f'Cannot order the snapshots of {server_dataset}: {e}, '
+                        'so nothing is received'
+                    ),
+                    'reason': 'listing',
+                }))
+                return
+        if decision.reason is not None:
+            logger.warning(
+                "stream from client %s for %r refused (%s): %s",
+                client_id, dataset, decision.reason, decision.message,
+            )
+            release_claim()
+            ws.send(json.dumps({'error': decision.message, 'reason': decision.reason}))
+            return
+        if decision.rolled_back:
+            logger.warning(
+                "stream from client %s for %r: the client allowed the receive to destroy "
+                "%d snapshot(s) of %s newer than its incremental source, which it no "
+                "longer has: %s",
+                client_id, dataset, len(decision.rolled_back), server_dataset,
+                ', '.join(decision.rolled_back),
+            )
 
         if mode == 'fresh':
             # D3: a fresh stream cannot continue a partial receive. Discard
@@ -2515,16 +2797,21 @@ def create_app(
         # both modes, so a resumed receive (`mode=resume`) gets exactly the
         # same flags as the fresh one it continues.
         #
-        # `-F` only for a dataset that exists (an incremental, a resume, a full
-        # over an existing one). A full stream into a dataset that does not
-        # exist creates it and needs none: zfs refuses `-F` together with a
-        # raw stream (or an encrypted target) onto an EXISTING dataset, so the
-        # dataset must not be pre-created, and without `-F` a dataset that
-        # appears in between is an error rather than overwritten.
+        # `-F` only for a dataset that exists AND that `decide_receive` allowed:
+        # an incremental (or a resume) onto an existing dataset needs it to
+        # discard changes made to the head since the last snapshot, but it
+        # also destroys every snapshot newer than the base, so it is passed
+        # only when none exist or the client allowed them. A full stream into
+        # a dataset that does not exist creates it and needs none: zfs refuses
+        # `-F` together with a raw stream (or an encrypted target) onto an
+        # EXISTING dataset, so the dataset must not be pre-created, and without
+        # `-F` a dataset that appears in between is an error rather than
+        # overwritten. The abort above may have destroyed a new dataset, so
+        # existence is asked again.
         try:
             writer = zfs.receive.filesystem(
                 server_fs, props=owned,
-                force=zfs.exists(server_fs), save=True, mount=False,
+                force=decision.force and zfs.exists(server_fs), save=True, mount=False,
             )
         except Exception as e:
             release_claim()

@@ -29,6 +29,7 @@ certificate is rejected under TLS 1.3.
 """
 
 import datetime
+import functools
 import hashlib
 import http.client
 import json
@@ -400,13 +401,38 @@ class PerConnTlsServer(ThreadedWSGIServer):
             tls.settimeout(None)
         except (OSError, ssl.SSLError) as exc:  # TimeoutError is an OSError
             self.events.add(Event(False, error=exc))
-            try:
-                tls.close()
-            except OSError:
-                pass
+            self._linger_then_close(tls)
             return
         self.events.add(Event(True, peer_der=tls.getpeercert(binary_form=True)))
         super().process_request_thread(tls, client_address)
+
+    def _linger_then_close(self, tls, limit: float = 2.0) -> None:
+        """Close after a failed handshake without resetting the peer.
+
+        Under TLS 1.3 the client's handshake completes before the server has
+        judged its certificate, so a client that rejected-by-us writes its first
+        request while our fatal alert is on the wire.  Closing a socket that
+        still has unread received data makes the kernel send RST, which can
+        destroy the alert in the client's receive queue: the client then sees
+        ``SSLEOFError`` instead of the alert -- depending purely on timing
+        (observed ~1 run in 3 under CPU load).  So read (and drop) what the
+        client sent, at the OS level (the TLS object is dead), until it closes
+        or ``limit`` elapses, and only then close."""
+        deadline = time.monotonic() + limit
+        try:
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                tls.settimeout(left)
+                if not socket.socket.recv(tls, 65536):
+                    break
+        except OSError:                                    # includes TimeoutError
+            pass
+        try:
+            tls.close()
+        except OSError:
+            pass
 
 
 class _Running:
@@ -460,6 +486,34 @@ class Holder:
 STREAM_CHUNK = 64 * 1024
 
 
+def _reader_joined(route):
+    """Wrap a flask-sock route so the connection is not closed under the reader.
+
+    Stock simple-websocket runs a reader thread that sits in ``SSL_read`` on the
+    connection's ``SSLSocket``.  When the route returns, werkzeug closes the
+    connection on the connection's thread while that reader may still be inside
+    OpenSSL: the descriptor number is freed, the next accepted connection (here
+    the next run's *client* or server socket, same process) is handed the same
+    number, and OpenSSL's next ``read()`` on it consumes the NEW connection's
+    bytes -- its handshake fails with ``UNEXPECTED_MESSAGE`` or
+    ``DECRYPTION_FAILED_OR_BAD_RECORD_MAC``.  The product avoids this with
+    ``workers._SessionSocket.end``; this spike harness has no such wrapper, so
+    the route sends the close frame itself and waits for the reader to leave
+    (it does once the peer answers the close frame) before returning."""
+    @functools.wraps(route)
+    def wrapper(ws, *args, **kwargs):
+        try:
+            return route(ws, *args, **kwargs)
+        finally:
+            try:
+                ws.close()
+            except Exception:                               # already closed
+                pass
+            ws.thread.join(IO_TIMEOUT)
+
+    return wrapper
+
+
 def make_app() -> Flask:
     app = Flask(__name__)
     app.config["PROPAGATE_EXCEPTIONS"] = True
@@ -481,11 +535,13 @@ def make_app() -> Flask:
         return jsonify(cert=request.environ.get("SSL_CLIENT_CERT"), scheme=request.scheme)
 
     @sock.route("/ws/cert")
+    @_reader_joined
     def ws_cert(ws):
         ws.send(json.dumps({"cert": ws.environ.get("SSL_CLIENT_CERT"),
                             "scheme": ws.environ.get("wsgi.url_scheme")}))
 
     @sock.route("/ws/echo")
+    @_reader_joined
     def ws_echo(ws):
         while True:
             msg = ws.receive(timeout=IO_TIMEOUT)
@@ -498,6 +554,7 @@ def make_app() -> Flask:
         ws.send("should not get here")
 
     @sock.route("/ws/stream")
+    @_reader_joined
     def ws_stream(ws):
         """Upload sink with a concurrent writer.
 

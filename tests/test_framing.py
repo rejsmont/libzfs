@@ -1001,6 +1001,204 @@ class TestListSkipRules:
         assert feed.argv == ['list', '-H', '-r', '-t', 'filesystem', '-o', 'name,type,compression', 'pool/a']
 
 
+class _TrackedProc(_Proc):
+    """A `_Proc` that notes whether it was reaped (`wait` or `poll` called)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.reaped = False
+
+    def poll(self):
+        self.reaped = True
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.reaped = True
+        return self.returncode
+
+
+class TestListStrict:
+    """`list(strict=True)`: any row that would be skipped raises instead of returning a partial result
+    (B-2b: the server decides whether to destroy snapshots from this listing, so a hidden row is not acceptable)."""
+
+    TRUST = 'zfs list output could not be trusted: '
+    GOOD = (('pool/a', 'filesystem'), ('pool/b', 'volume'), ('pool/c', 'filesystem'))
+
+    def _strict(self, feed, rows, **kw):
+        feed.set(_rows(*rows) if not isinstance(rows, bytes) else rows)
+        return ListCommand()(strict=True, **kw)
+
+    def _raises(self, feed, rows, **kw):
+        with pytest.raises(Exception) as exc:
+            self._strict(feed, rows, **kw)
+        assert type(exc.value) is Exception, 'a bare Exception, like the other zfs failures'
+        return str(exc.value)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_clean_listing_returns_the_normal_list(self, feed):
+        result = self._strict(feed, self.GOOD)
+        assert [(type(o), o.name) for o in result] == [(Filesystem, 'pool/a'), (Volume, 'pool/b'),
+                                                       (Filesystem, 'pool/c')]
+        assert isinstance(result, list)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_empty_listing_is_clean(self, feed):
+        assert self._strict(feed, []) == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_strict_is_off_by_default(self, feed):
+        feed.set(_rows(self.GOOD[0], ('pool/x', 'bogus'), self.GOOD[2]))
+        assert [o.name for o in ListCommand()()] == ['pool/c']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('rows, kw, fragment', [
+        pytest.param([GOOD[0], ('pool/x',), GOOD[2]], {}, 'expected 2 columns, got 1', id='too-few-columns'),
+        pytest.param([GOOD[0], ('pool/x', 'filesystem', 'extra'), GOOD[2]], {}, 'expected 2 columns, got 3',
+                     id='too-many-columns'),
+        pytest.param(b'pool/a\tfilesystem\n\npool/c\tfilesystem\n', {}, 'empty line', id='empty-line'),
+        pytest.param([GOOD[0], ('pool/x', 'bogus'), GOOD[2]], {}, 'bogus', id='unknown-type'),
+        pytest.param([('pool/a', 'filesystem'), ('pool/a@s', 'snapshot')], {'types': 'filesystem'},
+                     'was not requested', id='unrequested-type'),
+        pytest.param([('pool/a', 'filesystem'), ('other/x', 'filesystem')],
+                     {'roots': Filesystem('pool/a'), 'recursive': True}, 'outside the requested roots',
+                     id='outside-the-roots'),
+        pytest.param([GOOD[0], ('pool/.system', 'filesystem'), GOOD[2]], {}, 'cannot represent the name',
+                     id='unrepresentable-name'),
+        pytest.param([GOOD[0], ('pool/a', 'filesystem')], {}, 'name appears 2 times', id='duplicate-name'),
+    ])
+    def test_every_skip_reason_raises_with_the_first_reason(self, feed, rows, kw, fragment):
+        message = self._raises(feed, rows, **kw)
+        assert message.startswith(self.TRUST)
+        assert fragment in message
+        assert ' skipped, the first: ' in message
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_one_row_is_singular_and_several_are_plural(self, feed):
+        assert self._raises(feed, [self.GOOD[0], ('pool/x', 'filesystem', 'extra')]).startswith(
+            self.TRUST + '2 rows skipped, the first: ')       # the bad row and the row before it (continuation)
+        assert self._raises(feed, [('pool/x', 'bogus')]).startswith(self.TRUST + '1 row skipped, the first: ')
+        assert self._raises(feed, [('pool/a', 'filesystem'), ('pool/a', 'filesystem')]).startswith(
+            self.TRUST + '1 row skipped, the first: ')
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_first_reason_is_the_first_in_the_output(self, feed):
+        message = self._raises(feed, [('pool/x', 'bogus'), ('pool/y',), self.GOOD[0]])
+        assert 'bogus' in message.split('the first: ', 1)[1] and 'expected 2 columns' not in message
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_name_that_fails_to_parse_with_another_error_raises(self, feed, monkeypatch):
+        real = ZFS.from_name
+
+        def from_name(name, dstype=None, properties=None):
+            if name == 'pool/b':
+                raise ValueError('odd')
+            return real(name, dstype, properties)
+
+        monkeypatch.setattr(ZFS, 'from_name', staticmethod(from_name))
+        message = self._raises(feed, self.GOOD)
+        assert 'cannot parse the name (odd)' in message
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_properties_that_cannot_be_applied_raise(self, feed, monkeypatch):
+        def update(self, props, lenient=False):
+            raise ValueError('nope')
+
+        monkeypatch.setattr(Filesystem, 'update', update)
+        message = self._raises(feed, [('pool/a', 'filesystem', 'lz4'), ('pool/b', 'volume', '-')],
+                               properties='compression')
+        assert 'cannot apply the properties (nope)' in message
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_continuation_drop_is_counted(self, feed):
+        message = self._raises(feed, [self.GOOD[0], self.GOOD[1], ('tail',), self.GOOD[2]])
+        assert message.startswith(self.TRUST + '2 rows skipped, the first: ')
+        assert 'expected 2 columns, got 1' in message
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_invalid_name_raises_even_when_its_warning_was_deduplicated_away(self, feed, caplog):
+        rows = [self.GOOD[0], ('pool/.system', 'filesystem'), self.GOOD[2]]
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            first = self._raises(feed, rows)
+            warnings_after_first = list(_warnings(caplog))
+            second = self._raises(feed, rows)
+        assert warnings_after_first and _warnings(caplog) == warnings_after_first      # the second logged nothing new
+        assert first == second and 'cannot represent the name' in second
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_row_in_the_message_is_redacted_and_clipped(self, feed):
+        secret = 'https://user:hunter2@host/key'
+        message = self._raises(feed, [('pool/a', 'filesystem', secret)])
+        assert 'hunter2' not in message and '***@host' in message
+        long = self._raises(feed, [('pool/a', 'filesystem', 'x' * 5000)])
+        assert len(long) < 400 and '...' in long and 'x' * 200 not in long
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_non_strict_keeps_the_partial_result_and_the_same_warnings(self, feed, caplog):
+        rows = [self.GOOD[0], ('pool/x', 'bogus'), self.GOOD[2]]
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            feed.set(_rows(*rows))
+            partial = ListCommand()(strict=False)
+            plain = list(_warnings(caplog))
+            caplog.clear()
+            with pytest.raises(Exception):
+                feed.set(_rows(*rows))
+                ListCommand()(strict=True)
+            strict = list(_warnings(caplog))
+        assert [o.name for o in partial] == ['pool/c']
+        assert plain and strict == plain
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_nonzero_exit_raises_the_subprocess_error_not_the_trust_error(self, feed):
+        feed.set(_rows(('pool/x', 'bogus')), stderr=b"cannot open 'pool/x': dataset does not exist\n", returncode=1)
+        with pytest.raises(Exception) as exc:
+            ListCommand()(strict=True)
+        assert 'dataset does not exist' in str(exc.value) and self.TRUST not in str(exc.value)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_strict_with_lazy_is_a_value_error_before_anything_runs(self, feed):
+        with pytest.raises(ValueError, match='strict'):
+            ListCommand()(strict=True, lazy=True)
+        assert feed.calls == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_process_is_read_to_the_end_and_reaped_before_the_raise(self, monkeypatch):
+        procs = []
+
+        def popen(cmd, *args, **kwargs):
+            procs.append(_TrackedProc(_rows(('pool/a', 'filesystem'), ('pool/x', 'bogus'), ('pool/c', 'filesystem'))))
+            return procs[-1]
+
+        monkeypatch.setattr(subprocess, 'Popen', popen)
+        with pytest.raises(Exception, match='could not be trusted'):
+            ListCommand()(strict=True)
+        (proc,) = procs
+        assert proc.reaped and proc.stdout.read() == b''             # nothing left unread
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_argv_is_the_same_as_without_strict(self, feed):
+        feed.set(_rows(('pool@s', 'snapshot', '1', '2')))
+        ListCommand()(roots=Filesystem('pool'), types='snapshot', properties=['createtxg', 'guid'], strict=True)
+        strict_argv = feed.argv
+        ListCommand()(roots=Filesystem('pool'), types='snapshot', properties=['createtxg', 'guid'])
+        assert strict_argv == feed.argv
+
+
 class TestListDuplicateNames:
     """zfs prints each object once: a name that comes back is a forgery, and nothing says which row is real."""
 

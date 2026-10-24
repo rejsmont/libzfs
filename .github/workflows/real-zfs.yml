@@ -1,0 +1,166 @@
+name: real-zfs
+
+# The real-pool test tier (`pytest -m real_zfs`) on a GitHub-hosted runner
+# (plan C21 / S-10a, decision C10). Everything else runs the mocked suite
+# (tests.yml, latest-deps.yml); this is the only workflow that touches a real
+# `zfs`/`zpool`.
+#
+# SECURITY: this workflow must NEVER run for a pull request. It runs
+# `sudo zpool create` and real `zfs` commands as root-equivalent, so it would
+# execute whatever code a PR carries with that power. Hence the triggers below
+# are `schedule` and `workflow_dispatch` ONLY (tests/test_ci_workflows.py pins
+# this), the job refuses any ref but master, and the token is read-only.
+# Scheduled runs always use the default branch; the `if:` guard also stops a
+# manual dispatch of some other branch.
+#
+# WHAT IT NEEDS from the runner: passwordless sudo (hosted runners have it), a
+# `zfs` kernel module for the running kernel, and OpenZFS userland. Ubuntu
+# ships zfs.ko inside the kernel's linux-modules package (also for the -azure
+# flavour the hosted runners boot), so `modprobe zfs` is expected to work, and
+# the real_zfs tests' own session fixture (`auto_zfs_pool` in tests/conftest.py)
+# then makes the file-backed pool and falls back to sudo wrappers when
+# delegation is not enough. The "Preflight" step below proves the pool works
+# BEFORE pytest runs, because a real_zfs test that cannot get a pool SKIPS (by
+# design: never errors) and a job where every test skipped would otherwise be
+# green. If hosted runners stop allowing this, the fallback (decision C10) is a
+# self-hosted runner on the zfsb-ci VM, restricted to this same two-trigger
+# workflow; see docs/production_readiness_plan_bcd.md C10/C21.
+#
+# Known mismatch to watch: the ubuntu-24.04 image's 6.17.0-azure kernel
+# (runner image 20261012) carries OpenZFS 2.3.4 in its linux-modules package
+# while noble's `zfsutils-linux` userland is 2.2.2. OpenZFS keeps the
+# userland/kernel interface compatible across minor releases and this is the
+# pairing any 24.04 HWE host gets from apt, but it has not been exercised from
+# here (only on zfsb-ci, whose 6.8 kernel carries 2.2.2): the install step logs
+# both versions so a failure that traces to the pairing is visible in the log.
+
+on:
+  schedule:
+    # Nightly, 03:23 UTC.
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One real-pool run at a time, and never cancelled half-way (a cancelled job
+# would leave the pool to the runner's teardown rather than the fixture's).
+concurrency:
+  group: real-zfs
+  cancel-in-progress: false
+
+jobs:
+  real-zfs:
+    name: real_zfs / ubuntu-24.04 / py3.12
+    # schedule always runs the default branch; this refuses a dispatch of any
+    # other ref and any fork that enabled scheduled workflows on a non-default
+    # branch.
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: "3.12"
+
+      - name: Install poetry
+        run: pipx install --python "${{ steps.py.outputs.python-path }}" poetry==2.1.1
+
+      - name: Cache the project virtualenv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-real-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: |
+          poetry config virtualenvs.in-project true
+          poetry env use "${{ steps.py.outputs.python-path }}"
+          poetry install --with dev
+
+      # No ZFS_CMD/ZPOOL_CMD stubs here, unlike every other workflow: with
+      # ZFSB_REAL_ZFS=1 the suite resolves the real binaries from PATH.
+      - name: Install OpenZFS and load the kernel module
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zfsutils-linux
+          echo "kernel: $(uname -r)"
+          if ! sudo modprobe zfs; then
+            echo "::error title=modprobe zfs failed::the hosted runner's kernel $(uname -r) did not load zfs.ko (decision C10: fall back to a self-hosted runner)"
+            ls -l "/lib/modules/$(uname -r)/kernel/zfs" || true
+            modinfo zfs || true
+            sudo dmesg | tail -n 30 || true
+            exit 1
+          fi
+          echo "kernel module: $(cat /sys/module/zfs/version 2>/dev/null || echo unknown)"
+          zfs version
+          which zfs zpool
+
+      - name: Preflight, a file-backed pool must work before pytest runs
+        # A real_zfs test with no pool skips instead of failing, so prove here
+        # that one can be created, written to and snapshotted, and that the pool
+        # is gone afterwards. This is also the plain-shell copy of what the
+        # `auto_zfs_pool` fixture does.
+        run: |
+          set -euo pipefail
+          img="$RUNNER_TEMP/zfsb-preflight.img"
+          pool=zfsb_ci_preflight
+          cleanup() {
+            sudo zpool destroy -f "$pool" 2>/dev/null || true
+            rm -f "$img"
+          }
+          trap cleanup EXIT
+          truncate -s 256m "$img"
+          sudo zpool create "$pool" "$img"
+          sudo zfs create "$pool/probe"
+          sudo zfs snapshot "$pool/probe@s1"
+          sudo zfs list -r -t all "$pool"
+          sudo zpool status "$pool"
+
+      - name: Run the real_zfs tests
+        env:
+          ZFSB_REAL_ZFS: "1"
+        run: >
+          poetry run pytest -m real_zfs -rs --no-cov
+          --junitxml="$RUNNER_TEMP/real-zfs-junit.xml"
+
+      # pytest exits 0 when every selected test skipped. Passing here means at
+      # least one real test actually ran against the pool.
+      - name: Fail if the real tier did not really run
+        if: always()
+        run: |
+          python3 - "$RUNNER_TEMP/real-zfs-junit.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failed = sum(int(s.get("failures", 0)) + int(s.get("errors", 0)) for s in suites)
+          passed = total - skipped - failed
+          print(f"real_zfs: {total} selected, {passed} passed, {skipped} skipped, {failed} failed")
+          if passed == 0:
+              sys.exit("::error title=real tier did not run::no real_zfs test passed "
+                       f"({skipped} skipped): the pool fixture could not make a pool?")
+          PY
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          zpool list || true
+          zfs list -t all || true
+          sudo dmesg | tail -n 50 || true
+
+      - name: Upload the junit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-zfs-junit
+          path: ${{ runner.temp }}/real-zfs-junit.xml
+          if-no-files-found: ignore

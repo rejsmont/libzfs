@@ -64,6 +64,7 @@ __all__ = [
     "CliError",
     "BackupFailed",
     "ConfigUnusable",
+    "RetryLater",
     "is_database_unusable",
     "exit_code_for",
     "format_error",
@@ -96,6 +97,13 @@ class ConfigUnusable(CliError):
     rather than 1 (the operator's input)."""
 
     exit_code = EXIT_CONFIG
+
+
+class RetryLater(CliError):
+    """Nothing is wrong with the input; the situation is temporary (a lock
+    held, survivors of a stopped daemon still running): exit 75."""
+
+    exit_code = EXIT_BUSY
 
 
 def _is_locked(exc: OperationalError) -> bool:

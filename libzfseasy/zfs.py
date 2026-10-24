@@ -108,8 +108,22 @@ class _SkippedRows:
     def __init__(self, command: str):
         self.command = command
         self.count = 0
+        # Every row the parse refused, logged one by one or not (`count` only counts what `skip` handled, for the
+        # summary line), and why the first one was; `list(strict=True)` raises on a non-zero total.
+        self.total = 0
+        self.first_problem = None
+
+    def _remember(self, reason: str, row=None) -> None:
+        self.total += 1
+        if self.first_problem is None:
+            self.first_problem = reason if row is None else '%s: %r' % (reason, _clip(_redact(row)))
+
+    def untrusted(self, reason: str, row=None) -> None:
+        """Count a row that was skipped (and reported) elsewhere, without logging it again."""
+        self._remember(reason, row)
 
     def skip(self, reason: str, row=None) -> None:
+        self._remember(reason, row)
         self.count += 1
         if self.count <= _MAX_ROW_WARNINGS:
             if row is None:
@@ -773,6 +787,7 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
             sort: str | [str] | {str, bool} -- result sorting order (default None)
             asc: bool -- whether to sort in ascending order (default True)
             lazy: bool -- whether to return a generator instead of a list (default False)
+            strict: bool -- raise instead of skipping rows that cannot be trusted (default False; see below)
 
         Returns:
             An Iterable containing ZFS datasets -- a Generator if lazy is True, List otherwise
@@ -783,6 +798,13 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
         roots / depth, a name libzfseasy cannot parse, and -- in the default (list) mode only -- a name that appears
         more than once, which drops every row with that name. A lazy listing applies the per-row checks only: it
         cannot take back an object it has already yielded when the same name appears again later.
+
+        With `strict=True` the same rows are still logged, but if there was any of them the call raises a bare
+        Exception whose message starts with 'zfs list output could not be trusted:' (it gives how many rows and why
+        the first one was refused) instead of returning a partial result. It is raised only after zfs has been read
+        to the end and has exited, and a zfs failure (non-zero exit) takes precedence with its own error.
+        `strict=True` with `lazy=True` raises ValueError before anything runs: a lazy listing cannot take back
+        objects it has already yielded.
         """
 
         return self._list(*args, **kwargs)
@@ -790,7 +812,11 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
     @classmethod
     def _list(cls, roots: Optional[DatasetList] = None, types: Optional[str] = None, recursive: bool = False,
               depth: int = 0, properties: Optional[StringList] = None, sort: Optional[Sort] = None,
-              asc: bool = True, lazy=False) -> Iterable[ZFS]:
+              asc: bool = True, lazy=False, strict: bool = False) -> Iterable[ZFS]:
+
+        if strict and lazy:
+            raise ValueError('strict=True cannot be combined with lazy=True: a lazy listing cannot take back the '
+                             'objects it has already yielded')
 
         cmd = [_zfs_cmd(), 'list', '-H']
 
@@ -840,6 +866,9 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
         for n in sorted(twice):
             skips.skip('name appears %d times' % names[n], n)
         skips.done()
+        if strict and skips.total:
+            raise Exception('zfs list output could not be trusted: %d row%s skipped, the first: %s' % (
+                skips.total, '' if skips.total == 1 else 's', skips.first_problem))
         return [o for o in result if o.name not in twice]
 
     @classmethod
@@ -914,6 +943,7 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
             obj = ZFS.from_name(name, dstype)
         except InvalidNameError as e:
             _skip_invalid_name(name, e)
+            skips.untrusted('libzfseasy cannot represent the name (%s)' % _clip(e), line)
             return None, False
         except ValueError as e:
             skips.skip('cannot parse the name (%s)' % _clip(e), line)

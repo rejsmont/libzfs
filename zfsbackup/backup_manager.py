@@ -260,6 +260,11 @@ def clear_zfsbackup_properties(
     return wanted
 
 
+class LocalAnchorUnreadable(Exception):
+    """`DatasetManager.get_local_anchor` could not read the property because
+    zfs failed (not because it is unset). The text is zfs's own message."""
+
+
 class DatasetInfo:
     """Information about a dataset."""
 
@@ -448,6 +453,23 @@ class DatasetManager:
         """Return the anchor snapshot name for a given destination, or None."""
         prop = f"{PROP_ANCHOR_PREFIX}{destination}"
         return self._get_prop(dsi.dataset, prop)
+
+    def get_local_anchor(self, dsi: DatasetInfo, destination: str) -> Optional[str]:
+        """The anchor snapshot name for a destination as a LOCAL value of
+        this very dataset, or `None` (unset, inherited or received).
+        `get_anchor` also reports an inherited value, which must not
+        count where the anchor is evidence about this dataset's own history
+        (`RemoteBackupManager._rollback_permit`): a dataset restored under a
+        new name has no local anchor even if its parent has one.
+
+        Raises `LocalAnchorUnreadable` when zfs fails: "unset" and "could not
+        be read" are different evidence and the caller must tell them apart."""
+        prop = f"{PROP_ANCHOR_PREFIX}{destination}"
+        try:
+            return zfs.get.value(dsi.dataset, prop, sources='local')
+        except Exception as e:
+            logger.debug(f"Failed to read local property {prop} from {dsi.name}: {e!r}")
+            raise LocalAnchorUnreadable(str(e) or repr(e)) from e
 
     def set_anchor(self, dsi: DatasetInfo, destination: str, snapshot_name: str) -> bool:
         """Record the anchor snapshot for a destination. `True` if the
@@ -1297,6 +1319,26 @@ def _property_int(snapshot, name: str) -> Optional[int]:
         return None
 
 
+#: The public spelling of `_property_int` (`api.py` reads server snapshots with it).
+property_int = _property_int
+
+
+def parse_snapshot_timestamp(prefix: str, name: str) -> Optional[datetime]:
+    """`{prefix}_{YYYYMMDDHHMMSS}` -> UTC datetime, else None. The whole
+    name must match: the prefix (which may itself contain `_`), `_`, and
+    exactly 14 ASCII digits that form a valid date. Anything after the
+    digits (`..._suffix`) is not ours. A name is managed exactly when this
+    is not None."""
+    m = re.fullmatch(re.escape(prefix) + '_([0-9]{14})', name)
+    if m is None:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc)
+
+
 class SnapshotInfo:
     """Information about a snapshot with parsed metadata.
 
@@ -1323,18 +1365,9 @@ class SnapshotInfo:
         self.key_loaded: Optional[bool] = None if keystatus is None else keystatus == 'available'
 
     def _parse_timestamp(self) -> Optional[datetime]:
-        """`{prefix}_{YYYYMMDDHHMMSS}` -> UTC datetime, else None. The whole
-        name must match: the prefix (which may itself contain `_`), `_`, and
-        exactly 14 ASCII digits that form a valid date. Anything after the
-        digits (`..._suffix`) is not ours."""
-        m = re.fullmatch(re.escape(self.prefix) + '_([0-9]{14})', self.name)
-        if m is None:
-            return None
-        try:
-            dt = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
-        except ValueError:
-            return None
-        return dt.replace(tzinfo=timezone.utc)
+        """`{prefix}_{YYYYMMDDHHMMSS}` -> UTC datetime, else None
+        (`parse_snapshot_timestamp`)."""
+        return parse_snapshot_timestamp(self.prefix, self.name)
 
     @property
     def age(self) -> timedelta:

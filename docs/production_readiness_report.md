@@ -7,6 +7,14 @@ client↔server remote-backup feature.
 completeness gaps, not blockers.** The local snapshot + retention core is solid and anchor-aware; the
 remote-backup transport is now TLS 1.3 with pinned mutual authentication.
 
+> **Status 2026-10-22.** This report predates the production-readiness plan. Its open items are tracked there:
+> [production_readiness_plan.md](production_readiness_plan.md) (milestone A, the trust boundary, PR #5) and
+> [production_readiness_plan_bcd.md](production_readiness_plan_bcd.md) (B, snapshot and send correctness,
+> PR #6; C, install/operate/restore; D, hardening for 1.0). Resolved since: H5 (intermediate snapshots, B),
+> the raw-send caveat under H4 (B), M6's "no backup-succeeded signal" in part (`zfsbackup-config check`, C), and
+> "werkzeug's development server" is now a pinned, contract-tested dependency (C) rather than an open risk.
+> The operator runbook is [zfsbackup/README.md](../zfsbackup/README.md).
+
 The transfer *happy path* is verified working end-to-end over two real VMs — see
 [`two_vm_backup_report.md`](two_vm_backup_report.md). A green functional run is **not** a security or
 completeness sign-off; read the residuals under B1 before exposing the API beyond a trusted network.

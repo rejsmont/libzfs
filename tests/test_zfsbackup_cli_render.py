@@ -329,11 +329,32 @@ def _random_remote_backup(rng: random.Random):
 _FINGERPRINTS = [None, None, "ab" * 32, DIGIT_FINGERPRINT, "0123456789abcdef" * 4, "e" * 64, "9" * 64]
 
 
+#: A target no name in `_NAMES` is at, below or (as a prefix) above.
+_SAFE_TARGET = "pool/received"
+
+
+def _overlaps_target(name: str, recursive: bool, target: str) -> bool:
+    """Would `validate_config` (C0) refuse a dataset `name` beside `target`?
+    Written out independently of the store, by path components: at or below
+    the target, or a RECURSIVE strict ancestor of it."""
+    d, t = name.rstrip("/").split("/"), target.rstrip("/").split("/")
+    if d[: len(t)] == t:
+        return True
+    return recursive and len(d) < len(t) and t[: len(d)] == d
+
+
 def random_config(rng: random.Random) -> BackupConfig:
     """A random but VALID configuration: `validate_config` refuses an ENABLED
     dataset (or `remote_backup`) whose name libzfseasy rejects, so the
     YAML-hostile names in `_NAMES` are only ever used disabled. (The random
-    draws are unchanged: the flag is decided after them.)"""
+    draws are unchanged: the flag is decided after them.)
+
+    C0: `validate_config` also refuses a dataset (enabled or not) at or below
+    an ENABLED `remote_backup.target_dataset`, or a recursive ancestor of it.
+    `_NAMES` is drawn for both, so a collision is possible; when one happens
+    the target (not the datasets) is moved to `_SAFE_TARGET`, which keeps the
+    dataset mix, the YAML-hostile names and the enabled remote_backup that
+    the round trips exist to exercise. No random draw is added or removed."""
     def rules(max_rules=4):
         count = rng.randint(1, max_rules)
         ages = rng.sample(_LITERALS, count)
@@ -366,16 +387,28 @@ def random_config(rng: random.Random) -> BackupConfig:
             retention_rules=rules() if rng.random() < 0.8 else [],
             remote=remote,
         ))
+    snapshot_prefix = rng.choice(["autosnap", "x:y", "#p", "zb", "true"])
+    check_interval = D(rng.choice(_LITERALS))
+    prune_interval = D(rng.choice(_LITERALS)) if rng.random() < 0.5 else None
+    api_host = rng.choice(["127.0.0.1", "0.0.0.0", "::1", "host.example"])
+    api_port = rng.choice([1, 80, 8080, 65535])
+    dry_run = rng.random() < 0.5
+    remote_backup = _random_remote_backup(rng)
+    if remote_backup is not None and remote_backup.enabled and any(
+        _overlaps_target(ds.name, ds.recursive, remote_backup.target_dataset)
+        for ds in datasets
+    ):
+        remote_backup = RemoteServerConfig(_SAFE_TARGET, enabled=True)
     return BackupConfig(
         datasets=datasets,
-        snapshot_prefix=rng.choice(["autosnap", "x:y", "#p", "zb", "true"]),
-        check_interval=D(rng.choice(_LITERALS)),
-        prune_interval=D(rng.choice(_LITERALS)) if rng.random() < 0.5 else None,
-        api_host=rng.choice(["127.0.0.1", "0.0.0.0", "::1", "host.example"]),
-        api_port=rng.choice([1, 80, 8080, 65535]),
-        dry_run=rng.random() < 0.5,
+        snapshot_prefix=snapshot_prefix,
+        check_interval=check_interval,
+        prune_interval=prune_interval,
+        api_host=api_host,
+        api_port=api_port,
+        dry_run=dry_run,
         destinations=destinations,
-        remote_backup=_random_remote_backup(rng),
+        remote_backup=remote_backup,
         client_cert_file=Path(rng.choice(["/tmp/c.pem", "/a b/c#d.pem"])) if tls else None,
         client_key_file=Path(rng.choice(["/tmp/k.key", "/a b/k:1.key"])) if tls else None,
     )

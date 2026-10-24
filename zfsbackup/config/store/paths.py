@@ -231,6 +231,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CONFIG_DB_MODE",
     "CONFIG_DIR_MODE",
+    "CONFIG_GROUP",
     "CONFIG_OWNER",
     "CONFIG_PATH_ENV",
     "ConfigDbCreatedConcurrently",
@@ -316,9 +317,12 @@ CONFIG_DIR_MODE = 0o2770
 CONFIG_DB_MODE = 0o660
 
 #: The service user and group the config store is meant to belong to.
-#: Creating them is a packaging concern (`sysusers.d`/`tmpfiles.d`, or a
-#: systemd unit's `User=`/`Group=`), not something this module can or
-#: should do -- they must already exist before `import` runs. This module
+#: Only the GROUP is meaningful (decision C8: sysusers creates the
+#: `zfsbackup` group alone, the daemon stays root, tmpfiles creates the
+#: directory `2770 root:zfsbackup`), so every operator-facing message names
+#: the group only (`CONFIG_GROUP`). Creating the group is a packaging concern
+#: (`sysusers.d`/`tmpfiles.d`), not something this module can or
+#: should do -- it must already exist before `import` runs. This module
 #: changes ownership in exactly one case (Q7, `_chgrp_to_service_group`):
 #: when ROOT creates the default directory or database it `chgrp`s it to
 #: the GROUP half of this value (and warns if that group does not exist).
@@ -326,6 +330,11 @@ CONFIG_DB_MODE = 0o660
 #: and it is also used to build the "who should run chmod" advice in error
 #: messages.
 CONFIG_OWNER = "zfsbackup:zfsbackup"
+
+#: The group half of `CONFIG_OWNER`: the only part ever applied, and the only
+#: part the advice messages name (a `zfsbackup` USER is never created or
+#: required, so advice must not tell an operator to chown to one).
+CONFIG_GROUP = CONFIG_OWNER.split(":", 1)[1]
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 
@@ -869,7 +878,7 @@ def _dir_not_writable_message(resolved: ResolvedConfigPath, directory: Path) -> 
         "file inside a directory needs both write AND search permission "
         "on it, so the directory itself must have both, not only the "
         f"database file. Target: {directory} should be "
-        f"{CONFIG_DIR_MODE:04o} owned by {CONFIG_OWNER} (group-writable "
+        f"{CONFIG_DIR_MODE:04o} with group {CONFIG_GROUP} (group-writable "
         "and group-searchable, because whichever of the daemon or the "
         "CLI opens the database first is the one that has to create the "
         "sidecars)."
@@ -886,7 +895,7 @@ def _file_not_writable_message(resolved: ResolvedConfigPath, real: Path) -> str:
         "read-only engine does not switch it (it only warns), but a "
         "non-WAL database would make readers and the CLI writer block each "
         f"other. Target: {real} should be "
-        f"{CONFIG_DB_MODE:04o} owned by {CONFIG_OWNER}."
+        f"{CONFIG_DB_MODE:04o} with group {CONFIG_GROUP}."
     )
 
 
@@ -976,7 +985,7 @@ def _sidecar_unusable_message(
         "process of another user having been the first to open the "
         "database and exited uncleanly. Fix: the owner "
         f"({owner}) or root must run: chmod {CONFIG_DB_MODE:04o} {sidecar}; "
-        f"chgrp {CONFIG_OWNER.split(':', 1)[1]} {sidecar}. Never blindly "
+        f"chgrp {CONFIG_GROUP} {sidecar}. Never blindly "
         "`rm` a -wal file (it can hold committed data not yet "
         "checkpointed); the -shm is safe to remove only when no process "
         "has the database open."
@@ -1008,12 +1017,12 @@ def _unreadable_message(
     owner = _username(st.st_uid)
     group = _groupname(st.st_gid)
     mode = stat_module.S_IMODE(st.st_mode)
-    target_group = CONFIG_OWNER.split(":", 1)[1]
+    target_group = CONFIG_GROUP
     return (
         f"{shown} is not readable by this process. You may not be in "
         f"the '{target_group}' group. Actual: owner={owner} "
         f"group={group} mode={mode:04o}. Target: {CONFIG_DB_MODE:04o} "
-        f"owned by {CONFIG_OWNER}."
+        f"with group {CONFIG_GROUP}."
     )
 
 
@@ -1033,12 +1042,12 @@ def _permission_failure_message(action: str, context_path: Path, exc: OSError) -
         actual = f"{context_path}: owner={owner} group={group} mode={mode:04o}"
     except OSError:
         actual = f"{context_path}: <could not stat -- missing or inaccessible>"
-    target_group = CONFIG_OWNER.split(":", 1)[1]
+    target_group = CONFIG_GROUP
     return (
         f"Cannot {action}: {exc.strerror or exc} (errno {exc.errno}). "
         f"You may not be in the '{target_group}' group, or may not have "
-        f"the permissions this needs. Actual: {actual}. Target: owned "
-        f"by {CONFIG_OWNER}."
+        f"the permissions this needs. Actual: {actual}. Target: group "
+        f"{CONFIG_GROUP}."
     )
 
 
@@ -1270,7 +1279,7 @@ def _chgrp_to_service_group(path: Path, what: str, *, fd: Optional[int] = None) 
     """
     if os.geteuid() != 0:
         return
-    group = CONFIG_OWNER.split(":", 1)[1]
+    group = CONFIG_GROUP
     try:
         import grp
 

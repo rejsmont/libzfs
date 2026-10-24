@@ -58,18 +58,11 @@ Readiness here is keyed off each *worker's own* log line instead:
 
 Not the `BaseWorker.run()` DEBUG "{name} cycle" line the loop body logs
 immediately before dataset processing, which would be the tighter marker
-in-process tests can use (see `test_zfsbackup_workers.py`): `-v`'s
-`logging.getLogger().setLevel(logging.DEBUG)` in `main()` only raises the
-level in the **supervisor's own** process. Because this daemon is launched
-via `python -m zfsbackup.daemon`, `multiprocessing`'s `spawn` start method
-re-imports `zfsbackup.daemon` in every child to reconstruct `__main__` --
-running its module-level `logging.basicConfig(level=logging.INFO, ...)`
-again before `workers._init_child_process`'s own
-`_setup_logging(verbose=True)` gets a chance, and `logging.basicConfig` is
-a no-op once handlers already exist. Measured: workers never emit a single
-DEBUG line under this launch shape, `-v` and all. Real, but orthogonal to
-item 8x, and not this module's to fix -- the INFO markers above hold
-regardless.
+in-process tests can use (see `test_zfsbackup_workers.py`). (History: before
+C3 the module-level `logging.basicConfig` of `zfsbackup.daemon` re-ran in every
+`spawn` child and made `-v` a no-op for workers; importing the daemon now
+configures nothing and every worker calls `logsetup.configure` itself, so the
+INFO markers above hold either way.)
 
 **Two more flakiness hazards, both designed around:**
 - `communicate()` can hang forever once the supervisor is dead, because an
@@ -110,6 +103,7 @@ defect under test. This control is expected to leave its own harness
 process genuinely wedged, so its teardown kills it unconditionally too.
 """
 
+import logging
 import multiprocessing
 import os
 import re
@@ -465,15 +459,21 @@ def _mp_event_daemon_harness(resolved_config, log_path: str) -> None:
     os.dup2(log_fh.fileno(), 1)
     os.dup2(log_fh.fileno(), 2)
 
+    from zfsbackup import logsetup
     from zfsbackup.daemon import BackupDaemon
     from zfsbackup.runtime_config import load_runtime_config
+
+    # Importing the daemon no longer configures logging (C3); `main()` does,
+    # and this harness bypasses `main()`. Without it the "parked" markers the
+    # test waits for are never written.
+    logsetup.configure(logging.DEBUG)
 
     # `load_runtime_config` returns a frozen `ConfigSnapshot` (item 15.1);
     # `--dry-run` is applied to the detached `BackupConfig` inside it, as
     # `daemon._run` does.
     config = load_runtime_config(resolved_config).config
     config.dry_run = True
-    daemon = BackupDaemon(config, resolved_config, verbose=True)
+    daemon = BackupDaemon(config, resolved_config, log_level=logging.DEBUG)
     daemon._stop_event = multiprocessing.Event()
     daemon.run()
 
