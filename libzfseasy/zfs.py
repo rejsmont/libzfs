@@ -248,7 +248,7 @@ class _Scope:
 
 
 # How long to give an abandoned child process to honor SIGTERM before
-# escalating to SIGKILL when reaping it in Command._exec_out's finally block.
+# escalating to SIGKILL when reaping it in Command._exec_lines's finally block.
 _TERMINATE_TIMEOUT = 5
 
 # Limits on the stderr a streaming child can make us keep: at most this many lines from the start and from the end
@@ -289,6 +289,15 @@ def _log_command(cmd) -> None:
         logger.debug('Executing command: %s', shlex.join([_redact(a) for a in cmd]))
 
 
+def _command_label(cmd) -> str:
+    """The first words of an argv for a log message: the binary's base name and its subcommand, redacted and clipped."""
+    try:
+        words = [os.path.basename(str(cmd[0]))] + [str(a) for a in cmd[1:2]]
+    except (TypeError, IndexError):
+        return 'command'
+    return shlex.join([_redact(w) for w in words])
+
+
 def _check_values(properties) -> None:
     """Refuse (`Validate.value`) any value in a `{name: value}` mapping or `(name, value)` iterable that zfs output
     could not frame, before the command that would pass it to zfs is built. Values are checked as `str(value)`, the
@@ -303,7 +312,9 @@ def _check_values(properties) -> None:
 class _BoundedErrors(list):
     """A list of error lines that keeps the first and the last `_STDERR_KEEP_LINES` entries and collapses the
     middle into a single `... N lines omitted ...` marker, so a pathological stderr cannot grow memory without
-    bound. Appended to by the stderr reader thread and read only after the thread was joined."""
+    bound. Appended to by the stderr reader thread. It is read after the thread was joined; if the bounded join timed
+    out (a stray holder of the pipe), the reader may still be appending, which is harmless for a read that only
+    formats the lines collected so far."""
 
     def __init__(self):
         super().__init__()
@@ -358,52 +369,32 @@ class Command:
 
     @classmethod
     def _exec(cls, cmd):
-        _log_command(cmd)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
-                                   env=_child_env())
-        errors = []
-        stderr_thread = cls._start_stderr_reader(process, errors)
-        while True:
-            output = cls._exec_capture(process, errors, stderr_thread)
-            if output is False:
-                break
+        """Run `cmd` to completion for its side effect, discarding stdout. Built on `_exec_lines`, so it shares its
+        bytes/surrogateescape reading, bounded stderr and cleanup: if the caller is interrupted (any `BaseException`,
+        `KeyboardInterrupt` included) while the child runs, the child is terminated (SIGTERM, SIGKILL after
+        `_TERMINATE_TIMEOUT`) and reaped before the exception propagates. Raises the bare subprocess-error Exception
+        on a non-zero exit."""
+        lines = cls._exec_lines(cmd)
+        try:
+            for _ in lines:
+                pass
+        finally:
+            # Close explicitly: a traceback would otherwise keep the suspended generator (and its child) alive.
+            lines.close()
 
     @classmethod
     def _exec_out(cls, cmd):
-        _log_command(cmd)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
-                                   env=_child_env())
-        errors = []
-        stderr_thread = cls._start_stderr_reader(process, errors)
-        completed = False
+        """Run `cmd` and yield its stdout lines stripped, skipping empty ones (zfsbackup calls this directly). A
+        layer over `_exec_lines`: only `\\n` ends a line (`\\r` stays inside it), and an abandoned generator reaps
+        the child. Raises the bare subprocess-error Exception on a non-zero exit, after the last line."""
+        lines = cls._exec_lines(cmd)
         try:
-            while True:
-                output = cls._exec_capture(process, errors, stderr_thread)
-                if output is False:
-                    completed = True
-                    break
-                elif output != '' and output is not None:
-                    yield output
+            for line in lines:
+                line = line.strip()
+                if line:
+                    yield line
         finally:
-            # If the generator is abandoned mid-iteration (caller breaks out of
-            # a loop, or it's garbage collected), make sure the child is reaped
-            # and the stderr reader thread isn't left blocked on readline()
-            # forever. A normal, fully-consumed run has already reaped the
-            # child and joined the thread inside _exec_capture, so skip
-            # redoing that work (and an extra poll()) here.
-            if not completed:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=_TERMINATE_TIMEOUT)
-                    except subprocess.TimeoutExpired:
-                        # Child ignored SIGTERM; escalate rather than risk
-                        # the stderr thread staying blocked on readline()
-                        # (and this wait()) forever.
-                        process.kill()
-                        process.wait()
-                stderr_thread.join()
-                process.wait()
+            lines.close()
 
     @classmethod
     def _exec_lines(cls, cmd):
@@ -411,15 +402,19 @@ class Command:
         line's `\\n` is removed (a trailing empty column and trailing spaces in a value survive, `\\r` is not a line
         break) and blank lines are yielded too. Stdout is read as bytes and decoded as UTF-8 with `surrogateescape`, so
         an invalid byte in a value can neither raise nor be lost. Raises the bare subprocess-error Exception (stderr
-        lines) on a non-zero exit, after the last line. An abandoned generator reaps the child like `_exec_out`.
+        lines) on a non-zero exit, after the last line. An abandoned generator, or any exception raised into it (an
+        interrupt), terminates and reaps the child (see `_TERMINATE_TIMEOUT`). This is the one exec core: `_exec` and
+        `_exec_out` are built on it.
 
-        Unlike `_exec_out` (kept as it is: zfsbackup calls it directly) nothing is stripped or dropped."""
+        Unlike `_exec_out` (which strips and drops empty lines) nothing is stripped or dropped."""
         _log_command(cmd)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
         errors = _BoundedErrors()
-        stderr_thread = cls._start_stderr_reader_lines(process, errors)
+        process = None
+        stderr_thread = None
         completed = False
         try:
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
+            stderr_thread = cls._start_stderr_reader_lines(process, errors)
             while True:
                 line = process.stdout.readline()
                 rc = process.poll()
@@ -434,22 +429,40 @@ class Command:
             cls._join_stderr_reader(stderr_thread)
             completed = True
         finally:
-            if not completed:
-                if process.poll() is None:
-                    process.terminate()
+            if not completed and process is not None:
+                abandoned = False
+                try:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=_TERMINATE_TIMEOUT)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            try:
+                                process.wait(timeout=_TERMINATE_TIMEOUT)
+                            except subprocess.TimeoutExpired:
+                                # SIGKILL did not take effect: the child is in uninterruptible sleep (typically a hung
+                                # pool). Never block the caller on it; Popen reaps it later when it finally exits.
+                                abandoned = True
+                                logger.warning('%s (pid %s) did not exit after SIGKILL (uninterruptible, likely a '
+                                               'hung pool); abandoning it', _command_label(cmd), process.pid)
+                except BaseException:
+                    # A further interrupt arrived while waiting: do not leave a SIGTERM-ignoring child running.
                     try:
-                        process.wait(timeout=_TERMINATE_TIMEOUT)
-                    except subprocess.TimeoutExpired:
                         process.kill()
-                        process.wait()
-                cls._join_stderr_reader(stderr_thread)
-                process.wait()
+                    except OSError:
+                        pass
+                    raise
+                if not abandoned:
+                    # (An abandoned child still holds stderr open, so the join could only time out.)
+                    cls._join_stderr_reader(stderr_thread)
+                    process.wait()
         if rc != 0:
             raise Exception(_failure_text(errors, rc))
 
     @staticmethod
     def _start_stderr_reader_lines(process, errors):
-        """`_start_stderr_reader` for a pipe that may be binary (decoded as UTF-8 with replacement, so an odd byte
+        """The stderr reader for a pipe that may be binary (decoded as UTF-8 with replacement, so an odd byte
         cannot kill the reader and leave the child blocked on a full pipe) or text (a mocked process). Lines are
         read at most `_STDERR_MAX_LINE` at a time; anything that is neither ends the thread quietly."""
         def reader():
@@ -481,28 +494,33 @@ class Command:
         `env` replaces the child's environment when given (default: `_child_env()`, the C locale). Output is decoded as UTF-8 with
         replacement, so odd bytes can neither raise nor kill the stderr reader (which would leave the child blocked on a full pipe)."""
         _log_command(cmd)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
-                                   encoding='utf-8', errors='replace',
-                                   env=_child_env() if env is None else env)
         errors = _BoundedErrors()
-        if raw_stderr:
-            def reader():
-                try:
-                    while True:
-                        line = process.stderr.readline()
-                        if line == '':
-                            break
-                        errors.append(line.rstrip('\r\n'))
-                except (OSError, ValueError):
-                    # The pipe broke or was closed under us; whatever was read so far stands.
-                    pass
-            stderr_thread = threading.Thread(target=reader, daemon=True)
-            stderr_thread.start()
-        else:
-            stderr_thread = cls._start_stderr_reader(process, errors)
+        process = None
+        stderr_thread = None
         lines = []
         completed = False
         try:
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                                       encoding='utf-8', errors='replace',
+                                       env=_child_env() if env is None else env)
+            if raw_stderr:
+                stderr = process.stderr
+
+                def reader():
+                    try:
+                        while True:
+                            line = stderr.readline()
+                            if line == '':
+                                break
+                            errors.append(line.rstrip('\r\n'))
+                    except (OSError, ValueError):
+                        # The pipe broke or was closed under us; whatever was read so far stands.
+                        pass
+                thread = threading.Thread(target=reader, daemon=True)
+                thread.start()
+                stderr_thread = thread  # only a started thread may be joined by the cleanup
+            else:
+                stderr_thread = cls._start_stderr_reader_lines(process, errors)
             while True:
                 line = process.stdout.readline()
                 if line == '':
@@ -512,28 +530,12 @@ class Command:
             cls._join_stderr_reader(stderr_thread)
             completed = True
         finally:
-            if not completed:
+            if not completed and process is not None:
                 if process.poll() is None:
                     process.kill()
                     process.wait()
                 cls._join_stderr_reader(stderr_thread)
         return lines, list(errors), rc
-
-    @staticmethod
-    def _start_stderr_reader(process, errors):
-        # Drain stderr in a dedicated thread so a full stderr pipe can never
-        # block the child while we read stdout (and vice versa).
-        def reader():
-            while True:
-                line = process.stderr.readline()
-                if line == '':
-                    break
-                error = line.strip()
-                if error:
-                    _append_error(errors, error)
-        thread = threading.Thread(target=reader, daemon=True)
-        thread.start()
-        return thread
 
     @staticmethod
     def _start_stderr_reader_bin(process, errors):
@@ -614,23 +616,6 @@ class Command:
                 pipe = getattr(process, name, None)
                 if pipe is not None and not (thread is not None and thread.is_alive() and name == 'stderr'):
                     StreamHandle._close_pipe(pipe)
-
-    @staticmethod
-    def _exec_capture(process, errors, stderr_thread=None):
-        stdout = process.stdout.readline()
-        rc = process.poll()
-        if stdout != '':
-            return stdout.strip()
-        # stdout hit EOF; block until the child actually exits instead of
-        # returning None and letting the caller's `while True` loop spin on
-        # readline()/poll() until it does.
-        if rc is None:
-            rc = process.wait()
-        if stderr_thread is not None:
-            stderr_thread.join()
-        if rc != 0:
-            raise Exception(_failure_text(errors, rc))
-        return False
 
 
 class StreamHandle:
@@ -1162,11 +1147,16 @@ class DestroyCommand(Command):
     def _destroy_lines(lines: Iterable[str]) -> Iterable[str]:
         # `zfs destroy -v -p` prints `destroy\t<name>` per object and a final `reclaim\t<bytes>` summary line; only
         # the former are returned.
-        for line in lines:
-            line = line.strip()
-            if line.startswith('reclaim\t'):
-                continue
-            yield line.replace('destroy\t', '')
+        try:
+            for line in lines:
+                line = line.strip()
+                if line.startswith('reclaim\t'):
+                    continue
+                yield line.replace('destroy\t', '')
+        finally:
+            close = getattr(lines, 'close', None)
+            if close is not None:
+                close()
 
     @classmethod
     def dataset(cls, dataset: Dataset, destroy: bool = False, recursive: bool = False, clones: bool = False,
@@ -1179,12 +1169,17 @@ class DestroyCommand(Command):
         if force:
             cmd += ['-f']
         cmd += [str(dataset)]
-        result = cls._destroy_lines(cls._exec_out(cmd))
+        source = cls._exec_out(cmd)
+        result = cls._destroy_lines(source)
 
         if lazy:
             return (o for o in result)
-        else:
+        try:
             return [o for o in result]
+        finally:
+            # An interrupt in the comprehension must not leave the child alive behind the traceback's frame.
+            result.close()
+            source.close()
 
     @classmethod
     def snapshots(cls, snapshots: Union[Snapshots, Iterable[Snapshots]], destroy: bool = False, recursive: bool = False,
@@ -1209,12 +1204,17 @@ class DestroyCommand(Command):
         if force:
             cmd += ['-d']
         cmd += [snaps]
-        result = cls._destroy_lines(cls._exec_out(cmd))
+        source = cls._exec_out(cmd)
+        result = cls._destroy_lines(source)
 
         if lazy:
             return (o for o in result)
-        else:
+        try:
             return [o for o in result]
+        finally:
+            # An interrupt in the comprehension must not leave the child alive behind the traceback's frame.
+            result.close()
+            source.close()
 
     @classmethod
     def bookmark(cls, bookmark: Bookmark, destroy: bool = True) -> None:
