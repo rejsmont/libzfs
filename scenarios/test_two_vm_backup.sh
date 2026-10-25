@@ -67,17 +67,17 @@
 #        K8  `import` of a YAML leaves `identity show` unchanged (and the destination still works)
 #        K9  `identity set-client-id` is refused while enrolled
 #        K10 importing a config with an http:// destination is refused and changes nothing
-#   L1 trust boundary (plan B-1, S-4, S-5; needs a tree with them, else skipped with a warning). Fresh pools. A is the real,
+#   L1 trust boundary (plan B-1, S-4, S-5, B-2a; needs a tree with them, else skipped with a warning). Fresh pools. A is the real,
 #      enrolled victim client (four snapshots on the server); B is an enrolled ATTACKER whose daemon is modified (a
-#      sitecustomize in /opt/zfsb-evil makes it `zfs send -p` and stop re-syncing its config property). B (and the
+#      sitecustomize in /opt/zfsb-evil makes it `zfs send -p` on demand and stop re-syncing its config property). B (and the
 #      harness, for what a client cannot do) plants `\n`/`\t` forged `zfs list -H` rows in org.zfsbackup:* values, trying to
 #      make the server's pruner apply a keep-only-the-newest retention to A's dataset and to datasets outside the target:
-#        L1a   end to end over mTLS: raw `zfs set` on B's dataset (libzfseasy refuses the same values), a full and an
-#              incremental -p stream; the server holds its own LOCAL canonical values (client_id, source_dataset and
-#              config go to the receive as `-o`), and the client's sent value survives as a HIDDEN `received` value under
-#              the local one: asserted on the `received` column (`zfs get -o property,value,received,source`) to be the
-#              very value B sent - `-s received` cannot see a received value hidden under a local one, so it proves
-#              nothing here; the pruner runs >= 4 cycles, A and the outside datasets are identical by name and guid
+#        L1a   end to end over mTLS: raw `zfs set` on B's dataset (libzfseasy refuses the same values); B's FULL and INCREMENTAL `-p`
+#              streams are refused by the server's stream header check (B-2a: reason stream_header, nothing created, nothing changed);
+#              B's honest plain streams are received, and the server's dataset holds its own LOCAL canonical config/client_id/
+#              source_dataset with NO received value (a plain stream carries no properties, so none of B's planted values arrives -
+#              before B-2a they arrived as hidden `received` values under the server's locals); the pruner runs >= 4 cycles, A and
+#              the outside datasets are identical by name and guid
 #        L1b   hostile /negotiate bodies with B's certificate are 400 and write nothing; S-5: 426 without or with a wrong
 #              X-Zfsbackup-Protocol; S-4: /config, /datasets, /datasets/<n>/snapshots are 404
 #        L1c   forged LOCAL values planted on the server (row-forging config and client id, A's id on a dataset in B's tree,
@@ -85,6 +85,26 @@
 #              prefix) and >= 5 prune cycles: none is pruned, each is reported by ONE WARNING; a CONTROL dataset with the
 #              same config legitimately in B's tree IS pruned, and the pre-fix tree (L1_BASELINE_REF, default 768cfed) is shown
 #              to select A's dataset with the attacker's retention in the same state
+#   L2 hostile streams and inert server copies (milestone D: B-2a stream header + neutralising receive options, B-2c ownership,
+#      B-3-lite; needs a tree with them, else skipped). Fresh pools, quiet config. A is an honest client; B is L1's modified client,
+#      whose send mode (plain | p | R | I | basemismatch) is read from a file on every send:
+#        L2a   B's -p / -R / -I streams (a full -p onto a dataset that does not exist, then an incremental of each kind onto one that does)
+#              are refused with stream_header before zfs receive is spawned: the copy (snapshots, guids, properties) and the rest of
+#              the target are exactly as before; once B is honest again the whole backlog goes out as a chain
+#        L2b   an incremental stream that declares the server's NEWEST snapshot as its base but really starts at an older one (so `-F`
+#              would be passed and destroy the newest) is refused with base_mismatch; nothing is destroyed
+#        L2c   a volume stream onto an existing, owned FILESYSTEM copy is refused with type_mismatch; after the operator's `zfs rename`
+#              (the client's ERROR says so) the volume goes out
+#        L2d   a plain filesystem whose source has mountpoint=/somewhere, canmount=on, setuid/exec/devices on, sharenfs/sharesmb on: the
+#              server copy has the nine safe values as LOCAL properties, and after `zfs mount -a` / `zfs share -a` nothing below the
+#              target is mounted or shared
+#        L2e   a user hold on the source snapshot: the server snapshot has userrefs 0 (`receive -h`)
+#        L2f   a zvol is backed up end to end (full + incremental): a volume with readonly=on / volmode=none, no /dev/zvol or /dev/zd*
+#              node on the server, its data readable through a volmode=dev clone outside the target (the README's restore)
+#        L2g   an existing server dataset (and an existing ANCESTOR) without a LOCAL org.zfsbackup:client_id is never adopted: 409 with
+#              the `zfs set org.zfsbackup:client_id=<id> <ds>` hint (ONE server WARNING, the client's ERROR), nothing sent or written;
+#              after the operator's `zfs set` the backups proceed
+#        L2h   a client that shortens its retention gets ONE server WARNING per dataset (old -> new horizon); lengthening it logs none
 #   B2 milestone B (B5-b chain, B-4 prune fallback; needs a tree with them, else skipped). Fresh pools, J's quiet config.
 #        B2  a backlog of B2_N (6) managed snapshots built on the client while the server daemon is DOWN, with three
 #            unmanaged snapshots in between (a hand-made name, a managed name with a `_suffix`, a suffixed one that is the
@@ -151,6 +171,8 @@
 #   ./scenarios/test_two_vm_backup.sh --no-k     # everything except scenario K
 #   ./scenarios/test_two_vm_backup.sh --only-l1  # provision, then only scenario L1 (fresh pools of its own)
 #   ./scenarios/test_two_vm_backup.sh --no-l1    # everything except scenario L1
+#   ./scenarios/test_two_vm_backup.sh --only-l2  # provision, then only scenario L2 (hostile streams, inert server copies)
+#   ./scenarios/test_two_vm_backup.sh --no-l2    # everything except scenario L2
 #   ./scenarios/test_two_vm_backup.sh --only-m   # provision, then only scenario M (several --only-X flags combine)
 #   ./scenarios/test_two_vm_backup.sh --no-m     # everything except scenario M
 #   ./scenarios/test_two_vm_backup.sh --only-b2  # provision, then only scenario B2 (backlog chain + B-4 prune fallback)
@@ -223,8 +245,8 @@ SNAP_TIMEOUT=120         # ~4 snapshot periods
 
 # Flags
 PURGE=0; KEEP_POOLS=0; KEEP=0; BIG=1
-ONLY_J=0; ONLY_K=0; ONLY_L1=0; ONLY_M=0; ONLY_B2=0; ONLY_R=0
-NO_J=0;   NO_K=0;   NO_L1=0;   NO_M=0;   NO_B2=0;   NO_R=0
+ONLY_J=0; ONLY_K=0; ONLY_L1=0; ONLY_L2=0; ONLY_M=0; ONLY_B2=0; ONLY_R=0
+NO_J=0;   NO_K=0;   NO_L1=0;   NO_L2=0;   NO_M=0;   NO_B2=0;   NO_R=0
 for arg in "$@"; do
     case "$arg" in
         --purge)      PURGE=1 ;;
@@ -235,6 +257,8 @@ for arg in "$@"; do
         --no-k)       NO_K=1 ;;       # everything except scenario K
         --only-l1)    ONLY_L1=1 ;;    # provision + scenario L1 only (A-K skipped): for iterating on L1
         --no-l1)      NO_L1=1 ;;      # everything except scenario L1
+        --only-l2)    ONLY_L2=1 ;;    # provision + scenario L2 (hostile streams, inert server copies) only
+        --no-l2)      NO_L2=1 ;;      # everything except scenario L2
         --only-m)     ONLY_M=1 ;;     # provision + scenario M (encrypted / raw) only
         --no-m)       NO_M=1 ;;       # everything except scenario M
         --only-b2)    ONLY_B2=1 ;;    # provision + scenario B2 (backlog chain + B-4 prune fallback) only
@@ -250,8 +274,8 @@ done
 
 # Which scenario blocks run. With any --only-X flag set, exactly the blocks flagged run (A-I count as "default" and run
 # only when no --only-X is given); otherwise everything runs except the blocks named by --no-X.
-ONLY_ANY=$((ONLY_J + ONLY_K + ONLY_L1 + ONLY_M + ONLY_B2 + ONLY_R))
-scn_enabled() { # scn_enabled j|k|l1|m|b2|r
+ONLY_ANY=$((ONLY_J + ONLY_K + ONLY_L1 + ONLY_L2 + ONLY_M + ONLY_B2 + ONLY_R))
+scn_enabled() { # scn_enabled j|k|l1|l2|m|b2|r
     local up only no; up="$(printf '%s' "$1" | tr 'a-z' 'A-Z')"; only="ONLY_$up"; no="NO_$up"
     if [ "$ONLY_ANY" -gt 0 ]; then [ "${!only}" -eq 1 ]; else [ "${!no}" -eq 0 ]; fi
 }
@@ -289,9 +313,11 @@ check() { # check "<description>" <expected> <actual>
 mexec() { local vm="$1"; shift; multipass exec "$vm" -- "$@"; }
 msh()   { local vm="$1"; shift; multipass exec "$vm" -- sudo bash -c "$*"; }
 
-vm_exists()  { multipass info "$1" >/dev/null 2>&1; }
-vm_running() { multipass info "$1" 2>/dev/null | awk -F': *' '/^State/{print $2}' | grep -qi running; }
-vm_ip()      { multipass info "$1" 2>/dev/null | awk -F': *' '/^IPv4/{print $2; exit}'; }
+# `multipass list` (not `info`): `info` ssh-es into the guest for its load figures and FAILS when the guest is merely slow (a loaded host),
+# which made an existing VM look missing ("launch failed: instance already exists"). `list` only asks the daemon.
+vm_exists()  { multipass list 2>/dev/null | awk -v n="$1" 'NR>1 && $1==n {f=1} END{exit !f}'; }
+vm_running() { multipass list 2>/dev/null | awk -v n="$1" 'NR>1 && $1==n && tolower($2)=="running" {f=1} END{exit !f}'; }
+vm_ip()      { multipass list 2>/dev/null | awk -v n="$1" 'NR>1 && $1==n {print $3; exit}'; }
 
 ensure_vm() {
     local vm="$1"
@@ -555,7 +581,7 @@ log_lineno() { msh "$1" "tail -n +$(( $2 + 1 )) '$LOG' | grep -nE '$3' | head -n
 wait_log_vm() { # wait_log_vm <vm> <mark> <ERE> <timeout>
     local waited=0
     while :; do
-        log_since_vm "$1" "$2" | grep -qE -- "$3" && return 0
+        log_since_vm "$1" "$2" | gq -E -- "$3" && return 0
         [ "$waited" -ge "$4" ] && return 1
         sleep 2; waited=$((waited+2))
     done
@@ -712,13 +738,16 @@ probe() {
 probe_body() { msh "$CLIENT_VM" "cat /tmp/zfsb-probe.json 2>/dev/null"; }
 
 # check_has "<description>" "<ERE>" "<text>" / check_lacks — pass when the text does / does not match
+# grep -q on a pipe exits at the first match; with `set -o pipefail` a producer larger than the pipe buffer then
+# dies of SIGPIPE and the pipeline fails although grep matched. gq reads all its input (use it after a log).
+gq() { grep "$@" >/dev/null; }
 check_has() {
-    if printf '%s' "$3" | grep -qE -- "$2"; then pass "$1"; else
+    if grep -qE -- "$2" <<<"$3"; then pass "$1"; else
         fail "$1 (no match for /$2/ in: $(printf '%s' "$3" | tr '\n' '|' | cut -c1-300))"
     fi
 }
 check_lacks() {
-    if printf '%s' "$3" | grep -qE -- "$2"; then
+    if grep -qE -- "$2" <<<"$3"; then
         fail "$1 (unexpected /$2/ in: $(printf '%s' "$3" | tr '\n' '|' | cut -c1-300))"
     else pass "$1"; fi
 }
@@ -769,6 +798,17 @@ for vm in "$SERVER_VM" "$CLIENT_VM"; do
     else
         warn "$vm: shipped tree ($SRC_REF) lacks the B-1/S-5 trust-boundary work: scenario L1 will be skipped"
         L1_READY=0
+    fi
+done
+
+# Milestone D B-2 (stream header check, inert server copies, ownership 409, retention-shrink warning): scenario L2.
+L2_READY=1
+for vm in "$SERVER_VM" "$CLIENT_VM"; do
+    if msh "$vm" "grep -q 'parse_stream_header' '$SRC_DIR/zfsbackup/api.py' && grep -q '_STREAM_REFUSAL_HINTS' '$SRC_DIR/zfsbackup/remote.py'"; then
+        info "$vm: shipped tree has the B-2 stream header check (api.py parse_stream_header) and the refusal hints (remote.py)"
+    else
+        warn "$vm: shipped tree ($SRC_REF) lacks the B-2 stream header check: scenario L2 will be skipped, L1a would FAIL"
+        L2_READY=0
     fi
 done
 
@@ -1024,7 +1064,7 @@ if wait_for_proc send_running 240; then
     if [ -n "$l_done" ] && [ -n "$l_swap" ] && [ "$l_done" -lt "$l_swap" ]; then pass "log order: 'Backup complete' (line $l_done) comes before 'Reloaded remote worker' (line $l_swap)"; else
         fail "log order wrong: Backup complete at '$l_done', Reloaded remote worker at '$l_swap'"; fi
     if [ "$dur" -ge 65 ]; then
-        if log_since_vm "$CLIENT_VM" "$mark_e" | grep -qE "remote worker \(pid=$rpid_e\) is still finishing work begun under generation"; then
+        if log_since_vm "$CLIENT_VM" "$mark_e" | gq -E "remote worker \(pid=$rpid_e\) is still finishing work begun under generation"; then
             pass "send outlived the reload by ${dur}s: the deferral WARNING was logged"
         else fail "send outlived the reload by ${dur}s but no deferral WARNING was logged"; fi
     else
@@ -1160,7 +1200,7 @@ echo "$out" | sed 's/^/    CLI: /'
 check "(H) rename --clear-stale-props with a running daemon exits 0" "0" "$rc"
 case "$out" in *"reload requested from daemon pid $sup_h"*) pass "(H) the CLI verified and signalled the running client daemon (pid $sup_h)" ;; *) fail "(H) no reload request reported for pid $sup_h" ;; esac
 case "$out" in *"Cleared on '$REN_OLD': "*) pass "(H) the CLI reports it cleared the stale properties" ;; *) fail "(H) no 'Cleared on' line" ;; esac
-if printf '%s' "$out" | grep -q "Cleared on" && ! printf '%s' "$out" | grep -qE "inherit "; then pass "(H) no 'zfs inherit' fallback commands were printed"; else fail "(H) the CLI fell back to printing zfs inherit commands"; fi
+if printf '%s' "$out" | gq "Cleared on" && ! printf '%s' "$out" | gq -E "inherit "; then pass "(H) no 'zfs inherit' fallback commands were printed"; else fail "(H) the CLI fell back to printing zfs inherit commands"; fi
 check "(H) no org.zfsbackup:* property is left on $REN_OLD" "0" \
     "$(msh "$CLIENT_VM" "zfs get -H -o property -s local,received all '$REN_OLD' | grep -c '^org.zfsbackup:'" | tr -d '[:space:]')"
 wait_log_vm "$CLIENT_VM" "$mark_h" "accepted .*trigger: SIGHUP" 10 && pass "(H) the daemon accepted the rename by SIGHUP" || fail "(H) no 'accepted ... SIGHUP' line for the rename"
@@ -1348,7 +1388,7 @@ else
             fail "(J1) server snapshots: [$(server_snaps | tr '\n' ' ')] (wanted $T and $N)"; fi
         j_synced "J1" "$N"
         check "(J1) the resumed snapshot $T is byte-identical too" "$(guid "$CLIENT_VM" "${SOURCE_DS}@${T}")" "$(guid "$SERVER_VM" "$(server_ds)@${T}")"
-        log_since_vm "$SERVER_VM" "$mark_s" | grep -q 'mode=resume' && pass "(J1) server log: the first stream was mode=resume" || fail "(J1) no 'mode=resume' in the server log"
+        log_since_vm "$SERVER_VM" "$mark_s" | gq 'mode=resume' && pass "(J1) server log: the first stream was mode=resume" || fail "(J1) no 'mode=resume' in the server log"
         check "(J1) the server discarded no partial state (resume keeps it)" "0" "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -c 'discarding the partial receive state')"
         check "(J1) no traceback in the client log" "0" "$(log_since_vm "$CLIENT_VM" "$mark_c" | grep -c Traceback)"
     fi
@@ -1374,8 +1414,8 @@ else
         stop_daemon "$CLIENT_VM"
         show_log "$CLIENT_VM" "$mark_c" 'Resum|Not resuming|Sending (incremental|full)|Backup complete|Transfer failed'
         show_log "$SERVER_VM" "$mark_s" 'discarding the partial|stream\?mode='
-        log_since_vm "$SERVER_VM" "$mark_s" | grep -q 'mode=fresh' && pass "(J2) server log: the stream was mode=fresh" || fail "(J2) no 'mode=fresh' in the server log"
-        log_since_vm "$SERVER_VM" "$mark_s" | grep -qE 'WARNING.*discarding the partial receive state of' && pass "(J2) server log: it discarded the partial receive state" || fail "(J2) no 'discarding the partial receive state' WARNING on the server"
+        log_since_vm "$SERVER_VM" "$mark_s" | gq 'mode=fresh' && pass "(J2) server log: the stream was mode=fresh" || fail "(J2) no 'mode=fresh' in the server log"
+        log_since_vm "$SERVER_VM" "$mark_s" | gq -E 'WARNING.*discarding the partial receive state of' && pass "(J2) server log: it discarded the partial receive state" || fail "(J2) no 'discarding the partial receive state' WARNING on the server"
         check "(J2) the client did not log a resume" "0" "$(log_since_vm "$CLIENT_VM" "$mark_c" | grep -c 'Resumed ')"
         j_synced "J2" "$T3"
         if server_snaps | grep -qx "$T2"; then fail "(J2) the destroyed snapshot $T2 exists on the server"; else pass "(J2) the destroyed snapshot $T2 never reached the server"; fi
@@ -1471,8 +1511,8 @@ else
             else fail "(J5) log order wrong: resumed='$l_r' 2->3='$l_3' 3->4='$l_4' 4->5='$l_5'"; fi
             check_lacks "(J5) no full send and no 'Not resuming' on the way" "Sending full snapshot|Not resuming" "$jl5"
             check "(J5) the client did not send C1 or C2 again" "0" "$(printf '%s\n' "$jl5" | grep -cE "Sending incremental ${SOURCE_DS}: [^ ]+ -> (${C1}|${C2})\$")"
-            log_since_vm "$SERVER_VM" "$mark_s" | grep -q 'mode=resume' && pass "(J5) server log: the first stream was mode=resume" || fail "(J5) no 'mode=resume' in the server log"
-            check "(J5) ... followed by three mode=fresh streams" "3" "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -c 'mode=fresh')"
+            log_since_vm "$SERVER_VM" "$mark_s" | gq 'mode=resume' && pass "(J5) server log: the first stream was mode=resume" || fail "(J5) no 'mode=resume' in the server log"
+            check "(J5) ... followed by three mode=fresh streams" "3" "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -cE 'GET /backup/[^ ]*/stream\?mode=fresh')"
             check "(J5) the server discarded no partial state" "0" "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -c 'discarding the partial receive state')"
             j5_ok=1; for x in "$C1" "$C2" "$C3" "$C4" "$C5"; do
                 [ "$(guid "$CLIENT_VM" "${SOURCE_DS}@${x}")" = "$(guid "$SERVER_VM" "$(server_ds)@${x}")" ] && [ -n "$(guid "$SERVER_VM" "$(server_ds)@${x}")" ] || { j5_ok=0; echo "    guid mismatch or missing: $x"; }
@@ -1517,7 +1557,7 @@ else
     mark_s="$(loglines "$SERVER_VM")"; mark_c="$(loglines "$CLIENT_VM")"
     start_daemon "$CLIENT_VM"
     wait_log_vm "$SERVER_VM" "$mark_s" "POST /backup/[^ ]*${CLIENT2_DS}/negotiate HTTP/1\.1[^\"]*\" 409" 150
-    if log_since_vm "$SERVER_VM" "$mark_s" | grep -qE "POST /backup/[^ ]*${CLIENT2_DS}/negotiate HTTP/1\.1[^\"]*\" 409"; then
+    if log_since_vm "$SERVER_VM" "$mark_s" | gq -E "POST /backup/[^ ]*${CLIENT2_DS}/negotiate HTTP/1\.1[^\"]*\" 409"; then
         pass "(J4) server log: negotiate for ${CLIENT2_DS} was refused with 409"
     else fail "(J4) no 409 for the negotiate of ${CLIENT2_DS} in the server log within 150s"; fi
     show_log "$SERVER_VM" "$mark_s" "negotiate HTTP/1\.1[^\"]*\" 409"
@@ -1622,8 +1662,8 @@ else
     expect_chain="${B2_S0}"; prev="$B2_S0"; ok_steps=0; ok_done=0
     for x in "${B2_SNAPS[@]}"; do
         expect_chain="$expect_chain -> $x"
-        printf '%s\n' "$b2log" | grep -qE "Sending incremental ${SOURCE_DS}: ${prev} -> ${x}\$" && ok_steps=$((ok_steps+1))
-        printf '%s\n' "$b2log" | grep -qE "Backup complete: ${SOURCE_DS}@${x} \(incremental from ${prev}\)" && ok_done=$((ok_done+1))
+        printf '%s\n' "$b2log" | gq -E "Sending incremental ${SOURCE_DS}: ${prev} -> ${x}\$" && ok_steps=$((ok_steps+1))
+        printf '%s\n' "$b2log" | gq -E "Backup complete: ${SOURCE_DS}@${x} \(incremental from ${prev}\)" && ok_done=$((ok_done+1))
         prev="$x"
     done
     check_has "(B2) the cycle announced the whole chain: ${B2_N} snapshots, oldest first" "Sending ${B2_N} snapshots of ${SOURCE_DS} to ${DEST_NAME}: ${expect_chain}\$" "$b2log"
@@ -2106,6 +2146,114 @@ l1_probe() {
     msh "$CLIENT_VM" "rm -f /tmp/zfsb-probe.json; curl -sk --connect-timeout 5 --max-time 20 $hdr $certargs -X $method $dataargs -o /tmp/zfsb-probe.json -w '%{http_code}' 'https://${SERVER_IP}:${API_PORT}${path}'" | tr -d '[:space:]'
 }
 
+# ── the modified client B (shared by L1 and L2) ──
+# B is an enrolled client with its OWN DB and TLS dir on the client VM ($K_DB_B) whose daemon runs under a sitecustomize that
+# changes what it sends. It is the OPPOSITE of a bug fix: it is what a malicious operator of B's host would run. What it does
+# is read from $L1_EVIL_DIR/mode on every send (a hostile mode needs no daemon restart): whitespace-separated
+# "<dataset basename>=<mode>" words, "*=<mode>" for the rest, plain when nothing matches:
+#   plain          the honest `zfs send -L -c`
+#   p | R          adds -p / -R (a compound stream: the properties, or a whole replication, travel with it)
+#   I              an incremental step goes out as `-I prev next`
+#   basemismatch   an incremental step declares <prev> but the stream really starts at the snapshot named in $L1_EVIL_DIR/otherbase
+# and it never re-syncs org.zfsbackup:config on its dataset, so what B planted there stays.
+install_evil_client() {
+    put_guest_file "$CLIENT_VM" "$L1_EVIL_DIR/sitecustomize.py" <<'PYEOF'
+import os, sys
+try:
+    import libzfseasy.zfs as _z
+    from libzfseasy.types import Snapshot as _Snap
+    from zfsbackup.backup_manager import DatasetManager as _DM
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _orig = _z.SendCommand.snapshot
+    def _modes():
+        out = {}
+        try:
+            for word in open(os.path.join(_here, 'mode')).read().split():
+                k, _, v = word.partition('=')
+                out[k] = v
+        except OSError:
+            pass
+        return out
+    def _snapshot(ds, since=None, **kw):
+        modes = _modes()
+        base = str(ds.dataset).rsplit('/', 1)[-1]
+        mode = modes.get(base, modes.get('*', 'plain'))
+        if mode == 'p':
+            kw['properties'] = True            # zfs send -p: the dataset's properties travel with the stream
+        elif mode == 'R':
+            kw['replicate'] = True             # zfs send -R
+        elif mode == 'I' and since is not None:
+            kw['intermediate'] = True          # zfs send -I prev next
+        elif mode == 'basemismatch' and since is not None:
+            other = open(os.path.join(_here, 'otherbase')).read().strip()
+            since = _Snap(since.dataset, other)   # declared base: <prev>; the stream's real base: <other>
+        return _orig(ds, since=since, **kw)
+    _z.SendCommand.snapshot = staticmethod(_snapshot)
+    _DM.sync_config_property = lambda self, dsi: None
+    print('zfsb-evil: modified client active, send modes from %s/mode (pid %d)' % (_here, os.getpid()), file=sys.stderr)
+except Exception as exc:
+    print('zfsb-evil: PATCH FAILED: %r' % (exc,), file=sys.stderr)
+PYEOF
+    evil_mode "*=plain"
+}
+evil_mode() { printf '%s\n' "$1" | put_guest_file "$CLIENT_VM" "$L1_EVIL_DIR/mode"; }          # evil_mode "bdata=p bnew=plain"
+evil_otherbase() { printf '%s\n' "$1" | put_guest_file "$CLIENT_VM" "$L1_EVIL_DIR/otherbase"; } # the short snapshot name `basemismatch` really sends from
+# B's config: one dataset per argument, the destination NOT pinned (enroll pins it); then imported into B's own DB
+put_b_config() { # put_b_config <client dataset>...
+    local items="" d
+    for d in "$@"; do
+        items="${items}  - name: \"${d}\"
+    enabled: true
+    frequency: \"1d\"
+    retention:
+      \"1s\": \"1d\"
+    remote:
+      - destination: ${DEST_NAME}
+        frequency: \"30s\"
+"
+    done
+    msh "$CLIENT_VM" "mkdir -p /var/lib/zfsbackup-b" || die "could not create /var/lib/zfsbackup-b"
+    put_guest_file "$CLIENT_VM" /var/lib/zfsbackup-b/config.yaml <<EOF
+snapshot_prefix: "autosnap"
+check_interval: "15s"
+prune_interval: "5m"
+destinations:
+  ${DEST_NAME}:
+    url: "https://${SERVER_IP}:${API_PORT}"
+datasets:
+${items}
+EOF
+    cli_b import --no-backup /var/lib/zfsbackup-b/config.yaml | sed 's/^/    CLI(B): /'
+}
+# B takes <client id>, gets a token from the server and enrolls: a normal enrollment. Sets B_FP.
+B_FP=""
+enroll_b() { # enroll_b <label> <client id>
+    local lbl="$1" bid="$2" out rc
+    out="$(cli_b identity set-client-id "$bid")"; rc=$?
+    check "($lbl) B takes client id $bid" "0" "$rc"
+    mint_token || die "($lbl) could not create a token for B"
+    put_token "$CLIENT_VM" /tmp/zfsb-token-l1b || die "($lbl) could not deliver B's token file"
+    out="$(cli_b enroll "$DEST_NAME" --url "https://${SERVER_IP}:${API_PORT}" --token-file /tmp/zfsb-token-l1b)"; rc=$?
+    printf '%s\n' "$out" | sed 's/^/    CLI(B): /'
+    msh "$CLIENT_VM" "rm -f /tmp/zfsb-token-l1b" || true
+    check "($lbl) B enrolls: exit 0" "0" "$rc"
+    B_FP="$(cli_jget_db "$CLIENT_VM" "$K_DB_B" 'd["client_certificate"]["fingerprint"]' identity show --json | tr -d '[:space:]')"
+}
+
+# ── refusals of a hostile stream: waiting for it and what it must (not) have changed ──
+# b_wait_refusal <server log mark> <client id> <client dataset> <reason> <timeout>: the server logged "stream from client <id> for '<ds>' refused (<reason>)"
+b_wait_refusal() { wait_log_vm "$SERVER_VM" "$1" "stream from client $2 for '$3' refused \($4\)" "$5"; }
+# b_refusal_effects <label> <server dataset> <snapshot> <server log mark> <B log mark> <reason> <message ERE> [level]: the snapshot is NOT on the server,
+# the server logged the refusal with its reason (WARNING for the first of a dataset and reason, until a stream of the dataset succeeds; DEBUG for a
+# repeat: pass DEBUG), and B's daemon logged one ERROR for it (the client's refusal wording or its transfer failure)
+b_refusal_effects() {
+    check "($1) $3 did NOT reach the server" "no" "$(l1_server_snaps "$2" | grep -qx "$3" && echo yes || echo no)"
+    check_has "($1) the server's ${8:-WARNING} names the reason ($6): $7" "${8:-WARNING}.*refused \($6\): .*$7" "$(log_since_vm "$SERVER_VM" "$4")"
+    check_has "($1) B's log: the refusal as an ERROR" "ERROR.*($7|Transfer failed)" "$(blog_since "$5")"
+    check "($1) no receive was left half-done on the server (no resume token)" "0" "$(msh "$SERVER_VM" "zfs list -H -o receive_resume_token '$2' 2>/dev/null | grep -vc '^-\$'" | tr -d '[:space:]')"
+    check "($1) no zfs receive process is left running on the server" "0" "$(msh "$SERVER_VM" "pgrep -fc '[z]fs (receive|recv)'" | tr -d '[:space:]')"
+}
+
 echo
 step "SCENARIO L1 — a hostile enrolled client (B) cannot make the server prune A's data (forged property rows, send -p, prefix tricks)"
 if ! scn_enabled l1; then
@@ -2125,23 +2273,8 @@ else
     PIN_FP=""; CLIENT_ID=""
 
     # ── guest-side helpers (shipped as files: never piped through exec) ──
-    # the modified client: always `zfs send -p`, and never re-syncs org.zfsbackup:config on its dataset (so what B planted
-    # stays). It is the OPPOSITE of a bug fix: it is what a malicious operator of B's host would run.
-    put_guest_file "$CLIENT_VM" "$L1_EVIL_DIR/sitecustomize.py" <<'PYEOF'
-import os, sys
-try:
-    import libzfseasy.zfs as _z
-    from zfsbackup.backup_manager import DatasetManager as _DM
-    _orig = _z.SendCommand.snapshot
-    def _snapshot(ds, since=None, **kw):
-        kw['properties'] = True            # zfs send -p: the dataset's properties travel with the stream
-        return _orig(ds, since=since, **kw)
-    _z.SendCommand.snapshot = staticmethod(_snapshot)
-    _DM.sync_config_property = lambda self, dsi: None
-    print('zfsb-evil: send -p and no config sync active (pid %d)' % os.getpid(), file=sys.stderr)
-except Exception as exc:
-    print('zfsb-evil: PATCH FAILED: %r' % (exc,), file=sys.stderr)
-PYEOF
+    # the modified client (install_evil_client): `zfs send -p` on demand, and it never re-syncs org.zfsbackup:config
+    install_evil_client
     # what the daemon's own library does with a hostile value: every one must be refused before any zfs command runs
     put_guest_file "$CLIENT_VM" "$L1_DIR/validate_probe.py" <<'PYEOF'
 import sys
@@ -2261,35 +2394,9 @@ PYEOF
 
     # ── B: its own DB, certificate and id; a daemon that is MODIFIED ──
     echo
-    step "L1a — B enrolls (a normal enrollment); its daemon is modified to send -p and to keep what B plants"
-    msh "$CLIENT_VM" "mkdir -p /var/lib/zfsbackup-b" || die "could not create /var/lib/zfsbackup-b"
-    put_guest_file "$CLIENT_VM" /var/lib/zfsbackup-b/config.yaml <<EOF
-snapshot_prefix: "autosnap"
-check_interval: "15s"
-prune_interval: "5m"
-destinations:
-  ${DEST_NAME}:
-    url: "https://${SERVER_IP}:${API_PORT}"
-datasets:
-  - name: "${L1_B_SRC}"
-    enabled: true
-    frequency: "1d"
-    retention:
-      "1s": "1d"
-    remote:
-      - destination: ${DEST_NAME}
-        frequency: "30s"
-EOF
-    cli_b import --no-backup /var/lib/zfsbackup-b/config.yaml | sed 's/^/    CLI(B): /'
-    out="$(cli_b identity set-client-id "$L1_B_ID")"; rc=$?
-    check "(L1) B takes client id $L1_B_ID" "0" "$rc"
-    mint_token || die "(L1) could not create a token for B"
-    put_token "$CLIENT_VM" /tmp/zfsb-token-l1b || die "(L1) could not deliver B's token file"
-    out="$(cli_b enroll "$DEST_NAME" --url "https://${SERVER_IP}:${API_PORT}" --token-file /tmp/zfsb-token-l1b)"; rc=$?
-    printf '%s\n' "$out" | sed 's/^/    CLI(B): /'
-    msh "$CLIENT_VM" "rm -f /tmp/zfsb-token-l1b" || true
-    check "(L1) B enrolls: exit 0" "0" "$rc"
-    B_FP="$(cli_jget_db "$CLIENT_VM" "$K_DB_B" 'd["client_certificate"]["fingerprint"]' identity show --json | tr -d '[:space:]')"
+    step "L1a — B enrolls (a normal enrollment); its daemon is modified to send -p (on demand) and to keep what B plants"
+    put_b_config "$L1_B_SRC"
+    enroll_b "L1" "$L1_B_ID"
     check "(L1) the server pins B's certificate under $L1_B_ID, and A's under $L1_A_ID" "$B_FP - $A_FP -" "$(trust_pins "$L1_B_ID") $(trust_pins "$L1_A_ID")"
 
     # The daemon's own library refuses hostile values (a cooperative client cannot be talked into writing them).
@@ -2301,57 +2408,74 @@ EOF
 
     # Server prune cycles from here on (15s each); A's and the outside fingerprints must survive every one of them.
     mark_s="$(loglines "$SERVER_VM")"
-    step "L1a phase 1 — forged ROWS planted with the raw zfs CLI, then the first (full, -p) stream"
+    step "L1a phase 1 — forged ROWS planted with the raw zfs CLI, then a FULL stream with -p: the server REFUSES it (B-2a, stream header)"
     out="$(msh "$CLIENT_VM" "bash '$L1_DIR/plant_client.sh' '$L1_EVIL' '$L1_B_SRC' '$TARGET_DS' '$L1_A_ID' '$L1_OUT' 1 2>&1")"
     check_has "(L1a) the raw zfs CLI planted the forged values on B's dataset" "^PLANTED" "$out"
     check_lacks "(L1a) ... planting did not fail" "SETFAIL" "$out"
     check_has "(L1a) B's local config really is a multi-line forged value (control)" "^3$" "$(msh "$CLIENT_VM" "zfs get -H -o value org.zfsbackup:config '$L1_B_SRC' | wc -l" | tr -d '[:space:]')"
     B_S1="$(l1_snap_b)"
-    mark_b="$(blog_mark)"
+    evil_mode "*=p"
+    mark_b="$(blog_mark)"; rmark_s="$(loglines "$SERVER_VM")"
     start_b_daemon
-    check_has "(L1a) B's daemon runs the modified client (send -p, no config sync)" "zfsb-evil: send -p and no config sync active" "$(sleep 5; blog_since "$mark_b")"
+    check_has "(L1a) B's daemon runs the modified client (send -p, no config sync)" "zfsb-evil: modified client active" "$(sleep 5; blog_since "$mark_b")"
     check_lacks "(L1a) ... the patch applied" "PATCH FAILED" "$(blog_since "$mark_b")"
-    waited=0; until l1_server_snaps "$L1_B_DS" | grep -qx "$B_S1" || [ "$waited" -ge 150 ]; do sleep 3; waited=$((waited+3)); done
+    b_wait_refusal "$rmark_s" "$L1_B_ID" "$L1_B_SRC" stream_header 150 || fail "(L1a) the server never logged the refusal of B's -p stream"
     stop_b_daemon
-    if l1_server_snaps "$L1_B_DS" | grep -qx "$B_S1"; then pass "(L1a) B's first snapshot $B_S1 reached the server (full stream with -p)"; else fail "(L1a) $B_S1 never reached the server: $(blog_since "$mark_b" | tail -n 5 | tr '\n' '|')"; fi
-    check_has "(L1a) B's log: Backup complete (full)" "Backup complete: ${L1_B_SRC}@${B_S1} \(full\)" "$(blog_since "$mark_b")"
-    l1_check_b_dataset() { # l1_check_b_dataset <label>: B's server dataset holds the SERVER's values, the forged ones are inert
+    b_refusal_effects "L1a-1" "$L1_B_DS" "$B_S1" "$rmark_s" "$mark_b" "stream_header" "compound streams"
+    check "(L1a-1) the forged stream created NOTHING on the server for B's dataset (the leaf is made by the receive)" "0" "$(msh "$SERVER_VM" "zfs list -H -o name '$L1_B_DS' 2>/dev/null | wc -l" | tr -d '[:space:]')"
+    check "(L1a-1) A's received dataset and the datasets outside the target are untouched" "$A_BEFORE $OUT_BEFORE" "$(l1_fp "$L1_A_DS") $(l1_fp "$L1_OUT" "$L1_SIB")"
+
+    l1_check_b_dataset() { # l1_check_b_dataset <label>: B's server dataset holds the SERVER's values; the planted ones never arrived
         check "($1) B's server dataset: local client_id is B's bound id" "$L1_B_ID" "$(l1_sprop "$L1_B_DS" org.zfsbackup:client_id local | tr -d '[:space:]')"
         check "($1) B's local config is ONE line (the canonical re-encoding)" "1" "$(l1_sprop_ln "$L1_B_DS" org.zfsbackup:config local)"
         check "($1) ... it decodes to B's real dataset name, not the attacker's" "$L1_B_SRC" "$(l1_cfg_expr "$L1_B_DS" 'd["name"]' | tr -d '[:space:]')"
         check "($1) ... with B's real retention (1s/86400s), not the attacker's 1s/1s" "[{'age': 1.0, 'keep_for': 86400.0}]" "$(l1_cfg_expr "$L1_B_DS" 'd["retention_rules"]')"
         check "($1) B's local source_dataset is the URL's, not the planted one" "$L1_B_SRC" "$(l1_sprop "$L1_B_DS" org.zfsbackup:source_dataset local | tr -d '[:space:]')"
         for p in config client_id source_dataset; do
-            # What counts is the EFFECTIVE value: its source is LOCAL (the server's own, passed with `receive -o`). `-s received` lists only
-            # properties whose source is received and cannot see a received value hidden under a local one; the `received` COLUMN can.
-            # `-o` does NOT stop a `send -p` stream's own value from being recorded in that column, it only overrides it
-            # ("hidden"): EXPECTED, and inert while nothing runs `zfs inherit` on the property (that would bring it back; the
-            # client's sent values survive as hidden received values under the server's locals). So assert on the columns:
-            # the source is LOCAL, the value is the server's, and the received column holds exactly what B sent (a non-"-" value
-            # that `-s received` would never have listed).
+            # The effective value is a LOCAL one (the server's own, passed with `receive -o`), and since only plain streams are
+            # accepted nothing of B's travelled: the RECEIVED column is empty ("-"). (Before B-2a a `send -p` stream was
+            # received and B's values sat hidden under the server's locals in that column; that stream is now refused.)
             row="$(msh "$SERVER_VM" "zfs get -H -o property,source org.zfsbackup:$p '$L1_B_DS'" | tr -d '\r' | tr '\t' ' ')"
-            check "($1) the effective org.zfsbackup:$p is a LOCAL value (the server's, not the stream's)" "org.zfsbackup:$p local" "$row"
-            check "($1) org.zfsbackup:$p: the RECEIVED column holds B's sent value, hidden under the local one (expected)" \
-                "$(l1_clientval "$L1_B_SRC" org.zfsbackup:$p)" "$(l1_rcvd "$L1_B_DS" org.zfsbackup:$p)"
-            info "($1) org.zfsbackup:$p value/received/source: $(msh "$SERVER_VM" "zfs get -H -o value,received,source org.zfsbackup:$p '$L1_B_DS'" | tr -d '\r\n' | tr '\t' '|' | cut -c1-120)"
+            check "($1) the effective org.zfsbackup:$p is a LOCAL value (the server's)" "org.zfsbackup:$p local" "$row"
+            check "($1) org.zfsbackup:$p: no RECEIVED value at all (a plain stream carries no properties)" "-" "$(l1_rcvd "$L1_B_DS" org.zfsbackup:$p)"
         done
+        check "($1) the dynamic org.zfsbackup:anchor.l1evil B planted never arrived (neither local nor received)" "-/-" "$(l1_sprop_ln "$L1_B_DS" org.zfsbackup:anchor.l1evil local,received | sed 's/^0$/-/')/$(l1_rcvd "$L1_B_DS" org.zfsbackup:anchor.l1evil)"
     }
-    l1_check_b_dataset "L1a-1"
-    check_has "(L1a-1) control: the -p stream really carried B's properties (the dynamic anchor.l1evil arrived as RECEIVED)" "autosnap_20200101000001" "$(l1_sprop "$L1_B_DS" org.zfsbackup:anchor.l1evil received)"
 
-    step "L1a phase 2 — a clean-looking, VALID forged config and A's id as plain values, then an incremental -p stream"
+    step "L1a phase 2 — a clean-looking, VALID forged config and A's id as plain values; B now sends the honest plain full stream"
     out="$(msh "$CLIENT_VM" "bash '$L1_DIR/plant_client.sh' '$L1_EVIL' '$L1_B_SRC' '$TARGET_DS' '$L1_A_ID' '$L1_OUT' 2 2>&1")"
     check_has "(L1a) phase 2 values planted" "^PLANTED" "$out"
     msh "$CLIENT_VM" "head -c 200000 /dev/urandom >> \$(zfs get -H -o value mountpoint '$L1_B_SRC')/b1.bin"
     B_S2="$(l1_snap_b)"
+    evil_mode "*=plain"
     mark_b="$(blog_mark)"
     start_b_daemon
     waited=0; until l1_server_snaps "$L1_B_DS" | grep -qx "$B_S2" || [ "$waited" -ge 150 ]; do sleep 3; waited=$((waited+3)); done
     stop_b_daemon
-    if l1_server_snaps "$L1_B_DS" | grep -qx "$B_S2"; then pass "(L1a) B's second snapshot $B_S2 reached the server (incremental, with -p)"; else fail "(L1a) $B_S2 never reached the server: $(blog_since "$mark_b" | tail -n 5 | tr '\n' '|')"; fi
-    check_has "(L1a) B's log: Backup complete (incremental from $B_S1)" "Backup complete: ${L1_B_SRC}@${B_S2} \(incremental from ${B_S1}\)" "$(blog_since "$mark_b")"
+    if l1_server_snaps "$L1_B_DS" | grep -qx "$B_S2"; then pass "(L1a) B's snapshot $B_S2 reached the server (plain full stream; $B_S1 was never sent: a full send is the newest only)"; else fail "(L1a) $B_S2 never reached the server: $(blog_since "$mark_b" | tail -n 5 | tr '\n' '|')"; fi
+    check_has "(L1a) B's log: Backup complete (full)" "Backup complete: ${L1_B_SRC}@${B_S2} \(full\)" "$(blog_since "$mark_b")"
     l1_check_b_dataset "L1a-2"
-    check "(L1a-2) B's guids match the client's (the data itself is intact)" "$(guid "$CLIENT_VM" "${L1_B_SRC}@${B_S2}")" "$(guid "$SERVER_VM" "${L1_B_DS}@${B_S2}")"
+    check "(L1a-2) B's guid matches the client's (the data itself is intact)" "$(guid "$CLIENT_VM" "${L1_B_SRC}@${B_S2}")" "$(guid "$SERVER_VM" "${L1_B_DS}@${B_S2}")"
+
+    step "L1a phase 3 — an INCREMENTAL stream with -p is refused as well; the honest incremental that follows is received"
+    msh "$CLIENT_VM" "head -c 200000 /dev/urandom >> \$(zfs get -H -o value mountpoint '$L1_B_SRC')/b2.bin"
+    B_S3="$(l1_snap_b)"
+    evil_mode "*=p"
+    mark_b="$(blog_mark)"; rmark_s="$(loglines "$SERVER_VM")"
+    start_b_daemon
+    b_wait_refusal "$rmark_s" "$L1_B_ID" "$L1_B_SRC" stream_header 150 || fail "(L1a) the server never logged the refusal of B's incremental -p stream"
+    stop_b_daemon
+    b_refusal_effects "L1a-3" "$L1_B_DS" "$B_S3" "$rmark_s" "$mark_b" "stream_header" "compound streams"
+    check "(L1a-3) B's dataset still holds exactly $B_S2, with its guid" "$B_S2 $(guid "$CLIENT_VM" "${L1_B_SRC}@${B_S2}")" "$(l1_server_snaps "$L1_B_DS" | tr '\n' ' ' | sed 's/ *$//') $(guid "$SERVER_VM" "${L1_B_DS}@${B_S2}")"
+    evil_mode "*=plain"
+    mark_b="$(blog_mark)"
+    start_b_daemon
+    waited=0; until l1_server_snaps "$L1_B_DS" | grep -qx "$B_S3" || [ "$waited" -ge 150 ]; do sleep 3; waited=$((waited+3)); done
+    stop_b_daemon
+    if l1_server_snaps "$L1_B_DS" | grep -qx "$B_S3"; then pass "(L1a) B's snapshot $B_S3 reached the server (plain incremental)"; else fail "(L1a) $B_S3 never reached the server: $(blog_since "$mark_b" | tail -n 5 | tr '\n' '|')"; fi
+    check_has "(L1a) B's log: Backup complete (incremental from $B_S2)" "Backup complete: ${L1_B_SRC}@${B_S3} \(incremental from ${B_S2}\)" "$(blog_since "$mark_b")"
+    l1_check_b_dataset "L1a-3"
+    check "(L1a-3) B's guids match the client's (the data itself is intact)" "$(guid "$CLIENT_VM" "${L1_B_SRC}@${B_S3}")" "$(guid "$SERVER_VM" "${L1_B_DS}@${B_S3}")"
 
     step "L1a — the server's pruner runs several cycles over the forged state"
     if l1_wait_cycles "$mark_s" 4 200; then pass "(L1a) the server's pruner completed $(l1_cycles "$mark_s") cycles since B's first stream"; else fail "(L1a) fewer than 4 prune cycles in 200s ($(l1_cycles "$mark_s"))"; fi
@@ -2394,7 +2518,8 @@ EOF
     l1chk "(L1b) a tab in the client dataset name (%09): 400" "400" "$(l1_probe "$B_BASE" POST "/backup/${L1_B_ID}/${CLIENT_POOL}/ev%09il/negotiate" 1 "$(mkbody '[]' "$GOODBODY")")"
     # a config whose JSON strings carry a forged row: valid JSON, so it is accepted -- but only its canonical base64 is stored
     # an EXISTING dataset in B's tree (an earlier receive would have made it): negotiate stores the canonical config on it as LOCAL properties
-    msh "$SERVER_VM" "zfs create '$TARGET_DS/$L1_B_ID/rowname'" || fail "(L1b) could not pre-create rowname"
+    # (B-2c: stamped with B's id, as the server's own negotiate/receive would have made it; an unstamped one is refused with 409, see L2)
+    msh "$SERVER_VM" "zfs create -o org.zfsbackup:client_id='$L1_B_ID' '$TARGET_DS/$L1_B_ID/rowname'" || fail "(L1b) could not pre-create rowname"
     EVILNAME='{"name":"x\nzbserver/outside\tfilesystem\tzfsb-l1-a\tAAAA","recursive":false,"frequency":1.0,"enabled":true,"retention_rules":[{"age":1.0,"keep_for":1.0}],"remote":[]}'
     l1chk "(L1b) a config with a forged row INSIDE its JSON name: 200 (valid JSON), stored canonically" "200" "$(l1_probe "$B_BASE" POST "$(neg rowname)" 1 "$(mkbody '[]' "$EVILNAME")")"
     l1chk "(L1b) ... its stored local config is one line" "1" "$(l1_sprop_ln "$TARGET_DS/$L1_B_ID/rowname" org.zfsbackup:config local)"
@@ -2523,7 +2648,7 @@ write_m_config() {
     frequency: \"1d\"
     recursive: false
     retention:
-      \"1s\": \"1d\"
+      \"1s\": \"${M_RET_KEEP:-1d}\"
     remote:
       - destination: ${DEST_NAME}
         frequency: \"30s\"
@@ -2643,7 +2768,7 @@ else
         stop_daemon "$CLIENT_VM"
         show_log "$CLIENT_VM" "$mark_c" 'Resum|Not resuming|Sending|Backup complete|Transfer failed|ERROR'
         check_lacks "(M3) no 'Not resuming', no ERROR, no traceback" "Not resuming|ERROR|Traceback" "$(log_since_vm "$CLIENT_VM" "$mark_c")"
-        log_since_vm "$SERVER_VM" "$mark_s" | grep -q 'mode=resume' && pass "(M3) server log: the first stream was mode=resume" || fail "(M3) no mode=resume in the server log"
+        log_since_vm "$SERVER_VM" "$mark_s" | gq 'mode=resume' && pass "(M3) server log: the first stream was mode=resume" || fail "(M3) no mode=resume in the server log"
         check "(M3) the token is cleared, the anchor is $M3N and no pin is left" "- $M3N " "$(m_token "$M_ENC") $(m_anchor "$M_ENC") $(m_pin "$M_ENC")"
         m_match "M3" "$M_ENC" "$M3T"; m_match "M3" "$M_ENC" "$M3N"
         check "(M3) the copy is encrypted, key unavailable, root = itself" "yes unavailable $SD" "$(m_nonoff "$(m_sget encryption "$SD")") $(m_sget keystatus "$SD") $(m_sget encryptionroot "$SD")"
@@ -2720,19 +2845,20 @@ else
     check "(M6) the ERROR was logged exactly once" "1" "$(printf '%s\n' "$clog" | grep -cE "ERROR.*the server copy ${SW} is a plain copy")"
     check "(M6) nothing was sent (no send logged, no /stream on the server)" "0 0" "$(printf '%s' "$clog" | grep -cE 'Sending (incremental|full)|Backup complete') $(printf '%s\n' "$slog" | grep -cE '/stream')"
     check "(M6) the server copy is untouched: still plain, $M6B absent" "off no" "$(m_sget encryption "$SW") $(m_ssnaps "$M_SW" | grep -qx "$M6B" && echo yes || echo no)"
-    hint="$(printf '%s\n' "$clog" | grep -oE 'zfs rename [^ ]+ [^ `]+' | head -n1)"
+    hint="$(printf '%s\n' "$clog" | grep -oE 'zfs rename [^ ]+ <a name outside the backup target>' | head -n1)"
     echo "    hint: $hint"
-    hsrc="$(printf '%s' "$hint" | awk '{print $3}')"; hdst="$(printf '%s' "$hint" | awk '{print $4}')"
-    check "(M6) the hint renames the server copy aside: zfs rename <copy> <copy>.plain-<date>" "$SW $SW.plain-<date>" "$hsrc $hdst"
+    hsrc="$(printf '%s' "$hint" | awk '{print $3}')"
+    check "(M6) the hint renames the server copy to a name OUTSIDE the backup target: zfs rename <copy> <a name outside the backup target>" "$SW" "$hsrc"
     check_has "(M6) ... and says the next cycle sends a full raw stream" "the next cycle sends a full raw stream" "$clog"
+    M6_ASIDE="${SERVER_POOL}/m6-msw-plain"           # outside ${TARGET_DS}: a name inside it would be a received dataset the pruner takes over
     mark_c="$(loglines "$CLIENT_VM")"
-    msh "$SERVER_VM" "zfs rename '$hsrc' '${hdst/<date>/20261022}'" && pass "(M6) the operator renamed the copy aside" || fail "(M6) the rename failed"
+    msh "$SERVER_VM" "zfs rename '$hsrc' '$M6_ASIDE'" && pass "(M6) the operator renamed the copy aside, out of the target tree" || fail "(M6) the rename failed"
     wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${M_SW}@${M6B} \(full\)" 120 && pass "(M6) the next cycle sent $M6B as a FULL stream" || fail "(M6) no full send of $M6B after the rename"
     stop_daemon "$CLIENT_VM"
     check "(M6) the new server copy is ENCRYPTED, key unavailable, root = the copy itself" "yes unavailable $SW" "$(m_nonoff "$(m_sget encryption "$SW")") $(m_sget keystatus "$SW") $(m_sget encryptionroot "$SW")"
     m_match "M6" "$M_SW" "$M6B"
     check "(M6) the old plain copy is untouched under its new name (still plain, still has $M6A)" "off yes" \
-        "$(m_sget encryption "${SW}.plain-20261022") $(msh "$SERVER_VM" "zfs list -H -t snapshot -o name '${SW}.plain-20261022'" | grep -q "@${M6A}\$" && echo yes || echo no)"
+        "$(m_sget encryption "$M6_ASIDE") $(msh "$SERVER_VM" "zfs list -H -t snapshot -o name '$M6_ASIDE'" | grep -q "@${M6A}\$" && echo yes || echo no)"
     check "(M6) the anchor is the new snapshot" "$M6B" "$(m_anchor "$M_SW")"
 
     # ── M7: raw: true on an unencrypted dataset ──
@@ -2777,13 +2903,358 @@ else
     m_touch "$M_PL" 300000; M8B="$(m_snap "$M_PL")"
     m_wait_ssnap "$M_PL" "$M8B" 120 && pass "(M8) an incremental follows into the encrypted target ($M8B)" || fail "(M8) $M8B never arrived"
     m_match "M8" "$M_PL" "$M8B"
-    msh "$SERVER_VM" "zfs mount '$PS' >/dev/null 2>&1; true" || true
-    check "(M8) the data is readable on the server (key available) and identical" "$(msh "$CLIENT_VM" "md5sum \$(zfs get -H -o value mountpoint '$M_PL')/f.bin | cut -d' ' -f1" | tr -d '[:space:]')" \
-        "$(msh "$SERVER_VM" "md5sum \$(zfs get -H -o value mountpoint '$PS')/f.bin | cut -d' ' -f1" | tr -d '[:space:]')"
+    # B-2a: the copy is canmount=noauto, mountpoint=none: it is read the README's way, through a clone OUTSIDE the target tree (an encrypted
+    # origin's clone shares its key, which is available here)
+    M8_CLONE="${SERVER_POOL}/m8restore"
+    check "(M8) the copy itself is not mountable (canmount=noauto, mountpoint=none)" "noauto none no" "$(m_sget canmount "$PS") $(m_sget mountpoint "$PS") $(m_sget mounted "$PS")"
+    check "(M8) the data is readable through a clone outside the target (key available) and identical" "$(msh "$CLIENT_VM" "md5sum \$(zfs get -H -o value mountpoint '$M_PL')/f.bin | cut -d' ' -f1" | tr -d '[:space:]')" \
+        "$(msh "$SERVER_VM" "zfs clone -o mountpoint=/mnt/m8restore -o canmount=on -o readonly=on '$PS@$M8B' '$M8_CLONE' && md5sum /mnt/m8restore/f.bin | cut -d' ' -f1; zfs destroy '$M8_CLONE' >/dev/null 2>&1" | tr -d '[:space:]')"
     stop_daemon "$CLIENT_VM"
     check_lacks "(M) no traceback in the client log" "Traceback" "$(log_since_vm "$CLIENT_VM" "$mmark_c")"
     check_lacks "(M) no traceback in the server log" "Traceback" "$(log_since_vm "$SERVER_VM" "$mmark_s")"
     msh "$CLIENT_VM" "rm -f '$M_KEY'" || true; msh "$SERVER_VM" "rm -f '$M_SKEY'" || true
+fi
+
+# ═════════════ Scenario L2: hostile streams are refused, server copies are inert, unowned datasets are never adopted ═════════════
+# Milestone D, plan B-2a (the stream header check and the neutralising `-o` set), B-2c (ownership) and B-3-lite (a shrinking
+# retention is announced). Fresh pools, J's quiet config (snapshot frequency 1d: every snapshot is one this scenario takes),
+# server pruner 20s. Client A is the real, honest client; client B is L1's MODIFIED client (install_evil_client: its send mode is read
+# from a file on every send), so a hostile stream needs no code of its own: the server must hold even if a client is modified.
+#   L2a  B sends -p, -R and -I streams (a full -p onto a dataset that does not exist, an incremental -p/-R/-I onto one that does): every
+#        one is refused with reason stream_header before `zfs receive` is spawned; the copy (snapshots, guids, properties) and everything
+#        else under the target is exactly as before; when B sends honestly again, the whole backlog goes out as a chain
+#   L2b  a plain incremental stream that DECLARES the base <S2> (the server's newest, so `-F` would be passed) but really starts at
+#        <S1>: refused (base_mismatch); <S2> survives (the stream would have destroyed it)
+#   L2c  a volume stream onto an existing FILESYSTEM copy (an empty, owned placeholder): refused (type_mismatch), nothing changes; after the
+#        operator's `zfs rename` (the hint in the client's ERROR) the volume goes out
+#   L2d  a plain filesystem whose source asks for mountpoint=/somewhere, canmount=on, setuid/exec/devices on, sharenfs/sharesmb on: the
+#        server copy has the safe values as LOCAL properties (canmount=noauto readonly=on volmode=none mountpoint=none sharenfs=off
+#        sharesmb=off setuid=off exec=off devices=off), nothing is received, and after `zfs mount -a` / `zfs share -a` nothing under the
+#        target is mounted or shared
+#   L2e  a source snapshot with a user hold, sent normally: the server snapshot has userrefs 0 (`receive -h`)
+#   L2f  a zvol is backed up end to end (full, incremental), is a volume with readonly=on / volmode=none, has no /dev/zvol or /dev/zd* node on
+#        the server; its data is readable through a clone with volmode=dev outside the target (the README's restore)
+#   L2g  B-2c: an existing server dataset with no LOCAL org.zfsbackup:client_id (a dataset of the operator's) is never adopted: the client's
+#        negotiate gets 409 with the `zfs set org.zfsbackup:client_id=<id> <ds>` hint (one WARNING on the server, one ERROR on the client),
+#        nothing is sent and the dataset is not touched; the same for an unowned ANCESTOR; after the operator's `zfs set` the backups proceed
+#   L2h  B-3-lite: a client that shortens its retention gets ONE server WARNING per dataset (old -> new horizon); lengthening it, or the
+#        repeated negotiates, log none
+L2_A_ID="zfsb-l2-a"; L2_B_ID="zfsb-l2-b"
+L2_PROPS="${CLIENT_POOL}/props"; L2_VOL="${CLIENT_POOL}/zvol1"; L2_VT="${CLIENT_POOL}/vtype"
+L2_GD="${CLIENT_POOL}/gdata"; L2_ANC="${CLIENT_POOL}/anc"; L2_ANCC="${CLIENT_POOL}/anc/child"
+L2_BD="${CLIENT_POOL}/bdata"; L2_BN="${CLIENT_POOL}/bnew"
+L2_DEEP="${CLIENT_POOL}/lvl1/lvl2/lvl3"   # two ancestors that do not exist on the server: negotiate creates them one level at a time
+L2_MP="/zfsb-l2-hostile-mp"          # the mountpoint the hostile source asks for
+L2_HOLD="zfsb-l2-keep"
+L2_VCLONE="${SERVER_POOL}/l2vclone"  # outside the target: the README's restore clone of a volume
+l2_sds()   { printf '%s' "${TARGET_DS}/$1/${2#${CLIENT_POOL}/}"; }                                    # l2_sds <client id> <client dataset>
+l2_ssn()   { msh "$SERVER_VM" "zfs list -H -t snapshot -d 1 -o name '$1' 2>/dev/null" | sed 's/.*@//' | grep -v '^$' || true; }   # the dataset's own snapshots
+l2_wait_ssn() { local waited=0; until l2_ssn "$1" | grep -qx "$2"; do [ "$waited" -ge "$3" ] && return 1; sleep 3; waited=$((waited+3)); done; }   # <server ds> <snap> <timeout>
+l2_snap()  { sleep 2; msh "$CLIENT_VM" "n=autosnap_\$(date -u +%Y%m%d%H%M%S); zfs snapshot '$1'@\$n && echo \$n" | tr -d '[:space:]'; }
+l2_sget()  { msh "$SERVER_VM" "zfs get -H -o value $1 '$2' 2>/dev/null" | tr -d '[:space:]'; }        # l2_sget <prop> <server ds>
+l2_ssrc()  { msh "$SERVER_VM" "zfs get -H -o source $1 '$2' 2>/dev/null" | tr -d '[:space:]'; }
+l2_cget()  { msh "$CLIENT_VM" "zfs get -H -o value $1 '$2' 2>/dev/null" | tr -d '[:space:]'; }
+l2_exists() { msh "$SERVER_VM" "zfs list -H -o name '$1' >/dev/null 2>&1 && echo yes || echo no" | tr -d '[:space:]'; }
+# value+source of the properties a hostile stream might change, and the dataset's snapshot guids: the copy's state in one line
+l2_pfp()   { msh "$SERVER_VM" "{ zfs get -H -o property,value,source canmount,readonly,mountpoint,volmode,sharenfs,sharesmb,setuid,exec,devices,mounted,receive_resume_token,org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset '$1'; zfs list -H -t snapshot -d 1 -s createtxg -o name,guid '$1'; } 2>&1" | tr '\t\n' ' |' | md5sum_host; }
+md5sum_host() { if command -v md5sum >/dev/null 2>&1; then md5sum | cut -d' ' -f1; else md5 -q; fi; }
+# everything under the target outside B's tree (names and guids): a hostile stream of B must not change any of it
+l2_others_fp() { msh "$SERVER_VM" "zfs list -H -t all -o name,guid -r '$TARGET_DS' | grep -v '/$L2_B_ID' | sort | md5sum | cut -d' ' -f1" | tr -d '[:space:]'; }
+l2_nodes() { msh "$SERVER_VM" "echo \$(ls /dev/zd* 2>/dev/null | wc -l) \$(find /dev/zvol -mindepth 1 2>/dev/null | wc -l)" | tr -d '\r'; }   # "<zd nodes> <zvol links>"
+l2_count_log() { log_since_vm "$1" "$2" | grep -cE -- "$3"; }
+
+echo
+step "SCENARIO L2 — hostile streams are refused, server copies are inert, unowned datasets are never adopted, a shrinking retention is announced (B-2a, B-2c, B-3-lite)"
+if ! scn_enabled l2; then
+    info "scenario L2 skipped (--no-l2 / another --only-X)"
+elif [ "$L2_READY" -ne 1 ]; then
+    warn "scenario L2 skipped: the shipped tree has no B-2 stream header check"
+else
+    TARGET_DS="${SERVER_POOL}/backups"
+    stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"; stop_b_daemon
+    remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"
+    msh "$CLIENT_VM" "rm -f '$L1_B_LOG'" || true
+    recreate_pool "$SERVER_VM" "$SERVER_POOL"; recreate_pool "$CLIENT_VM" "$CLIENT_POOL"
+    msh "$SERVER_VM" "zfs create -p '$TARGET_DS'" || die "failed to create $TARGET_DS"
+    info "server OpenZFS: $(msh "$SERVER_VM" "zfs version | head -n1" | tr -d '\r')"
+    L2_NODES_BEFORE="$(l2_nodes)"
+    msh "$CLIENT_VM" "
+        set -e
+        zfs create '$SOURCE_DS'
+        zfs create -o mountpoint='$L2_MP' -o canmount=on -o setuid=on -o exec=on -o devices=on '$L2_PROPS'
+        for d in '$L2_GD' '$L2_ANC' '$L2_ANCC' '$L2_BD' '$L2_BN'; do zfs create \$d; done
+        zfs create -p '$L2_DEEP' 
+        zfs create -V 32M '$L2_VOL'
+        zfs create -V 16M '$L2_VT'
+        for d in '$SOURCE_DS' '$L2_PROPS' '$L2_GD' '$L2_ANCC' '$L2_BD' '$L2_BN' '$L2_DEEP'; do head -c 300000 /dev/urandom > \$(zfs get -H -o value mountpoint \$d)/f.bin; done
+        for v in '$L2_VOL' '$L2_VT'; do for i in \$(seq 30); do [ -b /dev/zvol/\$v ] && break; sleep 1; done; done
+        dd if=/dev/urandom of=/dev/zvol/$L2_VOL bs=1M count=8 conv=fsync status=none
+        dd if=/dev/urandom of=/dev/zvol/$L2_VT bs=1M count=4 conv=fsync status=none
+    " || die "(L2) could not create the client datasets"
+    # sharing needs an NFS/SMB stack the VM may lack: the property is set before zfs tries to share, so a failing share is tolerated
+    out="$(msh "$CLIENT_VM" "zfs set sharenfs=on '$L2_PROPS' 2>&1; zfs set sharesmb=on '$L2_PROPS' 2>&1; true")"
+    [ -n "$out" ] && echo "    (client) $(printf '%s' "$out" | tr '\n' '|' | cut -c1-200)"
+    check "(L2d) precondition: the SOURCE asks for a mountpoint of its choosing, canmount=on, setuid/exec/devices on and sharenfs/sharesmb on" \
+        "$L2_MP on on on on on on" "$(l2_cget mountpoint "$L2_PROPS") $(l2_cget canmount "$L2_PROPS") $(l2_cget setuid "$L2_PROPS") $(l2_cget exec "$L2_PROPS") $(l2_cget devices "$L2_PROPS") $(l2_cget sharenfs "$L2_PROPS" | sed 's/^on.*/on/') $(l2_cget sharesmb "$L2_PROPS" | sed 's/^on.*/on/')"
+    L2_VSUM="$(msh "$CLIENT_VM" "head -c 8388608 /dev/zvol/$L2_VOL | sha256sum | cut -d' ' -f1" | tr -d '[:space:]')"
+    L2_S_DATA="$(l2_snap "$SOURCE_DS")"; L2_S_PROPS="$(l2_snap "$L2_PROPS")"; L2_S_VOL="$(l2_snap "$L2_VOL")"
+    msh "$CLIENT_VM" "zfs hold '$L2_HOLD' '$L2_PROPS@$L2_S_PROPS'" || fail "(L2e) could not place the hold"
+    check "(L2e) precondition: the client's snapshot $L2_S_PROPS has a user hold" "1" "$(l2_cget userrefs "$L2_PROPS@$L2_S_PROPS")"
+
+    SERVER_PRUNE="20s"; PIN_FP=""; CLIENT_ID=""; M_RET_KEEP="1d"
+    write_server_config
+    write_m_config "$SOURCE_DS:omit" "$L2_PROPS:omit" "$L2_VOL:omit"
+    start_daemon "$SERVER_VM"
+    wait_health || die "(L2) server API never became healthy"
+    out="$(cli_vm "$CLIENT_VM" identity set-client-id "$L2_A_ID")"; rc=$?
+    check "(L2) A takes client id $L2_A_ID" "0" "$rc"
+    enroll_client
+    check "(L2) A is enrolled as $L2_A_ID" "$L2_A_ID" "$CLIENT_ID"
+    L2_DATA_SD="$(l2_sds "$CLIENT_ID" "$SOURCE_DS")"; L2_PROPS_SD="$(l2_sds "$CLIENT_ID" "$L2_PROPS")"; L2_VOL_SD="$(l2_sds "$CLIENT_ID" "$L2_VOL")"
+    l2mark_c="$(loglines "$CLIENT_VM")"; l2mark_s="$(loglines "$SERVER_VM")"
+    start_daemon "$CLIENT_VM"
+    l2_wait_ssn "$L2_DATA_SD" "$L2_S_DATA" 150 && pass "(L2) the plain dataset $L2_S_DATA reached the server" || fail "(L2) $L2_S_DATA never reached the server"
+    l2_wait_ssn "$L2_PROPS_SD" "$L2_S_PROPS" 90 && pass "(L2d) the hostile-property dataset $L2_S_PROPS reached the server" || fail "(L2d) $L2_S_PROPS never reached the server"
+    l2_wait_ssn "$L2_VOL_SD" "$L2_S_VOL" 90 && pass "(L2f) the zvol snapshot $L2_S_VOL reached the server" || fail "(L2f) $L2_S_VOL never reached the server"
+    show_log "$CLIENT_VM" "$l2mark_c" 'Backup complete|Transfer failed|ERROR|WARNING'
+
+    # ── L2d: the server copy is inert ──
+    echo
+    step "L2d — the server copy of a hostile-looking source is inert: safe LOCAL properties, nothing mounted or shared"
+    check "(L2d) the copy is a filesystem" "filesystem" "$(l2_sget type "$L2_PROPS_SD")"
+    for kv in canmount:noauto readonly:on volmode:none mountpoint:none sharenfs:off sharesmb:off setuid:off exec:off devices:off; do
+        p="${kv%%:*}"; v="${kv#*:}"
+        check "(L2d) $p is $v as a LOCAL property (the server's own, not the source's)" "$v local" "$(l2_sget "$p" "$L2_PROPS_SD") $(l2_ssrc "$p" "$L2_PROPS_SD")"
+    done
+    check "(L2d) the copy holds no RECEIVED property at all (a plain stream carries none)" "0" "$(msh "$SERVER_VM" "zfs get -H -s received -o property all '$L2_PROPS_SD' | wc -l" | tr -d '[:space:]')"
+    check "(L2d) the copy is not mounted" "no" "$(l2_sget mounted "$L2_PROPS_SD")"
+    msh "$SERVER_VM" "zfs mount -a; zfs share -a; true" || true
+    check "(L2d) control: \`zfs mount -a\` works (the target itself, which is not a received dataset, is mounted) and the listing below it has the container and the two filesystem copies (at least 3 filesystems)" "yes yes" \
+        "$(l2_sget mounted "$TARGET_DS") $(msh "$SERVER_VM" "[ \$(zfs list -H -r -t filesystem -o name '$TARGET_DS' | grep -vc '^$TARGET_DS\$') -ge 3 ] && echo yes || echo no" | tr -d '[:space:]')"
+    check "(L2d) after \`zfs mount -a\`: nothing at or below the target (the container, every copy) is mounted" "0" \
+        "$(msh "$SERVER_VM" "zfs list -H -r -t filesystem -o name,mounted '$TARGET_DS' | grep -v '^$TARGET_DS[[:space:]]' | grep -c 'yes\$'" | tr -d '[:space:]')"
+    check "(L2d) ... /proc/mounts has no mount of any dataset below the target, and the source's mountpoint $L2_MP does not exist on the server" "0 no" \
+        "$(msh "$SERVER_VM" "grep -c '^$TARGET_DS/' /proc/mounts; [ -e '$L2_MP' ] && echo yes || echo no" | tr '\n' ' ' | sed 's/ *$//')"
+    check "(L2d) after \`zfs share -a\`: no dataset below the target has sharenfs or sharesmb other than off (and the listing is not empty: at least 6 rows)" "0 yes" \
+        "$(msh "$SERVER_VM" "zfs get -H -r -t filesystem -o name,value sharenfs,sharesmb '$TARGET_DS' | grep -v '^$TARGET_DS[[:space:]]' | grep -vc 'off\$'; [ \$(zfs get -H -r -t filesystem -o name,value sharenfs,sharesmb '$TARGET_DS' | grep -vc '^$TARGET_DS[[:space:]]') -ge 6 ] && echo yes || echo no" | tr '\n' ' ' | sed 's/ *$//')"
+    check "(L2d) the containers the server created are canmount=noauto and owned (a local client id) too" "noauto $CLIENT_ID" \
+        "$(l2_sget canmount "${TARGET_DS}/${CLIENT_ID}") $(msh "$SERVER_VM" "zfs get -H -o value -s local org.zfsbackup:client_id '${TARGET_DS}/${CLIENT_ID}'" | tr -d '[:space:]')"
+    check "(L2d) the plain dataset's copy is inert too (canmount=noauto readonly=on mountpoint=none)" "noauto on none" \
+        "$(l2_sget canmount "$L2_DATA_SD") $(l2_sget readonly "$L2_DATA_SD") $(l2_sget mountpoint "$L2_DATA_SD")"
+    check "(L2d) the client's own dataset keeps its settings (the server never reaches back)" "$L2_MP on" "$(l2_cget mountpoint "$L2_PROPS") $(l2_cget canmount "$L2_PROPS")"
+    check "(L2d) guid of $L2_S_PROPS matches" "$(guid "$CLIENT_VM" "$L2_PROPS@$L2_S_PROPS")" "$(guid "$SERVER_VM" "$L2_PROPS_SD@$L2_S_PROPS")"
+
+    # ── L2e: holds ──
+    echo
+    step "L2e — a user hold on the source snapshot does not follow it to the server (receive -h)"
+    check "(L2e) the server snapshot has userrefs 0" "0" "$(l2_sget userrefs "$L2_PROPS_SD@$L2_S_PROPS")"
+    check "(L2e) ... and no hold tag" "0" "$(msh "$SERVER_VM" "zfs holds -H '$L2_PROPS_SD@$L2_S_PROPS' | wc -l" | tr -d '[:space:]')"
+    check "(L2e) the client's snapshot still has its hold (control)" "1" "$(l2_cget userrefs "$L2_PROPS@$L2_S_PROPS")"
+
+    # ── L2f: zvol ──
+    echo
+    step "L2f — a zvol is backed up end to end and never becomes a device node on the server"
+    check "(L2f) the copy is a VOLUME of the source's size" "volume 33554432" "$(l2_sget type "$L2_VOL_SD") $(msh "$SERVER_VM" "zfs get -Hp -o value volsize '$L2_VOL_SD'" | tr -d '[:space:]')"
+    check "(L2f) readonly=on and volmode=none as LOCAL properties" "on local none local" "$(l2_sget readonly "$L2_VOL_SD") $(l2_ssrc readonly "$L2_VOL_SD") $(l2_sget volmode "$L2_VOL_SD") $(l2_ssrc volmode "$L2_VOL_SD")"
+    check "(L2f) the server's own client_id / source_dataset are LOCAL values" "$CLIENT_ID $L2_VOL" \
+        "$(zprop "$SERVER_VM" "$L2_VOL_SD" org.zfsbackup:client_id) $(zprop "$SERVER_VM" "$L2_VOL_SD" org.zfsbackup:source_dataset)"
+    check "(L2f) guid of $L2_S_VOL matches" "$(guid "$CLIENT_VM" "$L2_VOL@$L2_S_VOL")" "$(guid "$SERVER_VM" "$L2_VOL_SD@$L2_S_VOL")"
+    check "(L2f) the server has no /dev/zd* node and no /dev/zvol link (counts as before the scenario)" "$L2_NODES_BEFORE" "$(l2_nodes)"
+    check "(L2f) ... in particular no /dev/zvol/$L2_VOL_SD" "no" "$(msh "$SERVER_VM" "[ -e '/dev/zvol/$L2_VOL_SD' ] && echo yes || echo no" | tr -d '[:space:]')"
+    msh "$CLIENT_VM" "dd if=/dev/urandom of=/dev/zvol/$L2_VOL bs=1M seek=8 count=4 conv=fsync status=none" || fail "(L2f) could not write to the zvol"
+    L2_S_VOL2="$(l2_snap "$L2_VOL")"
+    if l2_wait_ssn "$L2_VOL_SD" "$L2_S_VOL2" 150; then pass "(L2f) the zvol's incremental $L2_S_VOL2 reached the server"; else fail "(L2f) $L2_S_VOL2 never reached the server"; fi
+    check_has "(L2f) ... as an incremental from $L2_S_VOL" "Backup complete: ${L2_VOL}@${L2_S_VOL2} \(incremental from ${L2_S_VOL}\)" "$(log_since_vm "$CLIENT_VM" "$l2mark_c")"
+    check "(L2f) guid of $L2_S_VOL2 matches" "$(guid "$CLIENT_VM" "$L2_VOL@$L2_S_VOL2")" "$(guid "$SERVER_VM" "$L2_VOL_SD@$L2_S_VOL2")"
+    check "(L2f) readonly=on / volmode=none still hold after the incremental" "on none" "$(l2_sget readonly "$L2_VOL_SD") $(l2_sget volmode "$L2_VOL_SD")"
+    check "(L2f) still no device node on the server after the incremental" "$L2_NODES_BEFORE" "$(l2_nodes)"
+    # the README's restore: a clone OUTSIDE the target tree with volmode=dev, read as a block device
+    got="$(msh "$SERVER_VM" "timeout 90 bash -c \"zfs clone -o volmode=dev '$L2_VOL_SD@$L2_S_VOL' '$L2_VCLONE' && for i in \\\$(seq 30); do [ -b /dev/zvol/$L2_VCLONE ] && break; sleep 1; done; head -c 8388608 /dev/zvol/$L2_VCLONE | sha256sum | cut -d' ' -f1\"; zfs destroy '$L2_VCLONE' 2>&1" | tr -d '[:space:]')"
+    check "(L2f) the data is intact: the first 8 MiB read through a volmode=dev clone of the server snapshot hash like the source" "$L2_VSUM" "$got"
+    check "(L2f) the clone is gone and the server is back to no device nodes" "no $L2_NODES_BEFORE" "$(l2_exists "$L2_VCLONE") $(l2_nodes)"
+    # a received VOLUME is pruned like a filesystem copy: two expired planted snapshots go, the newest (the third, planted last) stays; the planted
+    # newest is then removed, or the next incremental would find the server ahead of its base
+    msh "$SERVER_VM" "for p in 1 2 3; do zfs snapshot '$L2_VOL_SD@autosnap_2020010100000'\$p; done" || fail "(L2f) could not plant snapshots on the volume copy"
+    waited=0; until ! l2_ssn "$L2_VOL_SD" | grep -qxE 'autosnap_2020010100000[12]' || [ "$waited" -ge 120 ]; do sleep 5; waited=$((waited+5)); done
+    check "(L2f) the server's pruner destroyed the expired planted snapshots of the VOLUME copy, kept the newest and the real ones" "autosnap_20200101000003 2" \
+        "$(l2_ssn "$L2_VOL_SD" | grep -x 'autosnap_2020010100000[1-3]' | tr '\n' ' ' | sed 's/ *$//') $(l2_ssn "$L2_VOL_SD" | grep -cxE "${L2_S_VOL}|${L2_S_VOL2}")"
+    msh "$SERVER_VM" "zfs destroy '$L2_VOL_SD@autosnap_20200101000003'" || fail "(L2f) could not remove the planted newest snapshot"
+    if [ "$CK_READY" -eq 1 ]; then
+        ck_run "$SERVER_VM" --json
+        check_has "(L2f) the server's \`check\` grades the received VOLUME (an entry for $L2_VOL_SD)" "$L2_VOL_SD" "$(msh "$SERVER_VM" "cat /tmp/zfsb-ck.out")"
+    fi
+
+    # ── L2h: retention shrink ──
+    echo
+    step "L2h — a client that shortens its retention is announced on the server (B-3-lite)"
+    horizon_re() { echo "WARNING.*negotiate from client ${CLIENT_ID} for '$1': the retention horizon of $2 shrinks from 1d to 1h"; }
+    hmark_s="$(loglines "$SERVER_VM")"
+    M_RET_KEEP="1h"
+    write_m_config "$SOURCE_DS:omit" "$L2_PROPS:omit" "$L2_VOL:omit"
+    for pair in "$SOURCE_DS:$L2_DATA_SD" "$L2_PROPS:$L2_PROPS_SD" "$L2_VOL:$L2_VOL_SD"; do
+        c="${pair%%:*}"; sd="${pair#*:}"
+        if wait_log_vm "$SERVER_VM" "$hmark_s" "$(horizon_re "$c" "$sd")" 150; then pass "(L2h) the server warned: the retention horizon of $sd shrinks from 1d to 1h"; else fail "(L2h) no shrink WARNING for $sd"; fi
+    done
+    check "(L2h) the stored config on the server now keeps 1h (the client's retention, as sent)" "[{'age': 1.0, 'keep_for': 3600.0}]" "$(l1_cfg_expr "$L2_DATA_SD" 'd["retention_rules"]')"
+    sleep 70        # at least two more negotiates per dataset (30s cycle): the same config warns no more
+    hlog="$(log_since_vm "$SERVER_VM" "$hmark_s")"
+    for pair in "$SOURCE_DS:$L2_DATA_SD" "$L2_PROPS:$L2_PROPS_SD" "$L2_VOL:$L2_VOL_SD"; do
+        c="${pair%%:*}"; sd="${pair#*:}"
+        check "(L2h) exactly ONE shrink WARNING for $sd, however many negotiates followed" "1" "$(printf '%s\n' "$hlog" | grep -cE "$(horizon_re "$c" "$sd")")"
+    done
+    check_has "(L2h) the WARNING says what happens: older snapshots are pruned from the next pruning cycle" "WARNING.*shrinks from 1d to 1h; the server applies the client's retention as sent, so snapshots older than 1h are pruned" "$hlog"
+    hmark_s="$(loglines "$SERVER_VM")"
+    M_RET_KEEP="1d"
+    write_m_config "$SOURCE_DS:omit" "$L2_PROPS:omit" "$L2_VOL:omit"
+    sleep 75
+    check "(L2h) lengthening it again logs no retention WARNING" "0" "$(l2_count_log "$SERVER_VM" "$hmark_s" 'retention horizon')"
+    check "(L2h) ... and the server follows the client back to 1d" "[{'age': 1.0, 'keep_for': 86400.0}]" "$(l1_cfg_expr "$L2_DATA_SD" 'd["retention_rules"]')"
+
+    # ── L2g / L2c: an unowned dataset, an unowned ancestor, a type mismatch (all on A's tree) ──
+    echo
+    step "L2g/L2c — datasets nothing here made are never adopted (409 + hint); a volume stream onto a filesystem copy is refused"
+    stop_daemon "$CLIENT_VM"
+    L2_GD_SD="$(l2_sds "$CLIENT_ID" "$L2_GD")"; L2_ANC_SD="${TARGET_DS}/${CLIENT_ID}/anc"; L2_ANCC_SD="$(l2_sds "$CLIENT_ID" "$L2_ANCC")"; L2_VT_SD="$(l2_sds "$CLIENT_ID" "$L2_VT")"
+    L2_S_GD="$(l2_snap "$L2_GD")"; L2_S_ANCC="$(l2_snap "$L2_ANCC")"; L2_S_VT="$(l2_snap "$L2_VT")"; L2_S_DEEP="$(l2_snap "$L2_DEEP")"
+    L2_DEEP_SD="$(l2_sds "$CLIENT_ID" "$L2_DEEP")"
+    # the operator's own datasets: gdata and anc by plain `zfs create` (no org.zfsbackup:client_id), vtype as an EMPTY FILESYSTEM that IS owned
+    # (what negotiate would make): a full volume stream would be a type mismatch there
+    msh "$SERVER_VM" "zfs create '$L2_GD_SD' && zfs create '$L2_ANC_SD' && zfs create -o org.zfsbackup:client_id='$CLIENT_ID' '$L2_VT_SD'" || die "(L2g) could not create the operator's datasets"
+    check "(L2g) precondition: neither $L2_GD_SD nor $L2_ANC_SD has a LOCAL client id (an inherited one is not an owner)" "0" \
+        "$(msh "$SERVER_VM" "zfs get -H -s local -o value org.zfsbackup:client_id '$L2_GD_SD' '$L2_ANC_SD' | wc -l" | tr -d '[:space:]')"
+    M_RET_KEEP="1d"
+    write_m_config "$SOURCE_DS:omit" "$L2_PROPS:omit" "$L2_VOL:omit" "$L2_VT:omit" "$L2_GD:omit" "$L2_ANCC:omit" "$L2_DEEP:omit"
+    l2mark_c="$(loglines "$CLIENT_VM")"; l2mark_s="$(loglines "$SERVER_VM")"
+    start_daemon "$CLIENT_VM"
+    wait_log_vm "$SERVER_VM" "$l2mark_s" "refusing to use ${L2_GD_SD}: it exists with no local" 150 && pass "(L2g) the server refused to use the unowned $L2_GD_SD (WARNING)" || fail "(L2g) no 'refusing to use ${L2_GD_SD}' WARNING"
+    wait_log_vm "$SERVER_VM" "$l2mark_s" "refusing to use ${L2_ANC_SD}: it exists with no local" 90 && pass "(L2g) ... and the unowned ancestor $L2_ANC_SD" || fail "(L2g) no 'refusing to use ${L2_ANC_SD}' WARNING"
+    wait_log_vm "$SERVER_VM" "$l2mark_s" "stream from client ${CLIENT_ID} for '${L2_VT}' refused \(type_mismatch\)" 120 && pass "(L2c) the server refused the volume stream onto the filesystem copy (type_mismatch)" || fail "(L2c) no type_mismatch refusal for $L2_VT"
+    # the rest of A is not held up by the three bad datasets
+    L2_S_DATA2="$(l2_snap "$SOURCE_DS")"
+    l2_wait_ssn "$L2_DATA_SD" "$L2_S_DATA2" 150 && pass "(L2g) one bad dataset does not stop the others: $SOURCE_DS's new snapshot $L2_S_DATA2 arrived" || fail "(L2g) $L2_S_DATA2 never arrived"
+    sleep 70        # more cycles: the refusals repeat on the client's schedule, the log lines must not
+    slog="$(log_since_vm "$SERVER_VM" "$l2mark_s")"; clog="$(log_since_vm "$CLIENT_VM" "$l2mark_c")"
+    show_log "$CLIENT_VM" "$l2mark_c" 'ERROR|WARNING'
+    # B-2c: ancestors that are missing are created ONE LEVEL AT A TIME, each stamped with the client id and never mounted
+    if l2_wait_ssn "$L2_DEEP_SD" "$L2_S_DEEP" 150; then pass "(L2g) a dataset two levels below nothing ($L2_DEEP) arrived: its missing ancestors were made by negotiate"; else fail "(L2g) $L2_S_DEEP never reached $L2_DEEP_SD"; fi
+    for lv in lvl1 lvl1/lvl2; do
+        check "(L2g) the ancestor ${lv} is a filesystem, canmount=noauto, not mounted, owned (LOCAL client id), no source_dataset" "filesystem noauto no $CLIENT_ID 0" \
+            "$(l2_sget type "${TARGET_DS}/${CLIENT_ID}/${lv}") $(l2_sget canmount "${TARGET_DS}/${CLIENT_ID}/${lv}") $(l2_sget mounted "${TARGET_DS}/${CLIENT_ID}/${lv}") $(msh "$SERVER_VM" "zfs get -H -o value -s local org.zfsbackup:client_id '${TARGET_DS}/${CLIENT_ID}/${lv}'" | tr -d '[:space:]') $(msh "$SERVER_VM" "zfs get -H -s local -o value org.zfsbackup:source_dataset '${TARGET_DS}/${CLIENT_ID}/${lv}' | wc -l" | tr -d '[:space:]')"
+    done
+    check "(L2g) ... and the leaf the receive created is inert, with matching guid" "$(guid "$CLIENT_VM" "$L2_DEEP@$L2_S_DEEP") noauto on none" "$(guid "$SERVER_VM" "$L2_DEEP_SD@$L2_S_DEEP") $(l2_sget canmount "$L2_DEEP_SD") $(l2_sget readonly "$L2_DEEP_SD") $(l2_sget mountpoint "$L2_DEEP_SD")"
+    check_has "(L2g) the WARNING names the one command that adopts it: zfs set org.zfsbackup:client_id=$CLIENT_ID $L2_GD_SD" "refusing to use ${L2_GD_SD}: .*run: zfs set org.zfsbackup:client_id=${CLIENT_ID} ${L2_GD_SD}\$" "$slog"
+    check "(L2g) ... once, however many cycles it repeated (gdata)" "1" "$(printf '%s\n' "$slog" | grep -c "refusing to use ${L2_GD_SD}:")"
+    check "(L2g) ... once (the ancestor $L2_ANC_SD)" "1" "$(printf '%s\n' "$slog" | grep -c "refusing to use ${L2_ANC_SD}:")"
+    check_has "(L2g) the client's log carries the hint (gdata)" "zfs set org.zfsbackup:client_id=${CLIENT_ID} ${L2_GD_SD}" "$clog"
+    check_has "(L2g) ... and for the unowned ancestor" "zfs set org.zfsbackup:client_id=${CLIENT_ID} ${L2_ANC_SD}" "$clog"
+    check "(L2g) nothing was sent to either: no snapshot on $L2_GD_SD, and $L2_ANCC_SD does not exist" "0 no" "$(l2_ssn "$L2_GD_SD" | count) $(l2_exists "$L2_ANCC_SD")"
+    check "(L2g) the unowned datasets were not touched (no config or client id written to them)" "0" \
+        "$(msh "$SERVER_VM" "zfs get -H -s local -o property all '$L2_GD_SD' '$L2_ANC_SD' | grep -c 'org.zfsbackup'" | tr -d '[:space:]')"
+    check_lacks "(L2g) the client never started a send for them" "Sending (full|incremental).*(${L2_GD}|${L2_ANCC})" "$clog"
+    check "(L2c) the placeholder is still an EMPTY FILESYSTEM (nothing received, nothing destroyed)" "filesystem 0" "$(l2_sget type "$L2_VT_SD") $(l2_ssn "$L2_VT_SD" | count)"
+    check_has "(L2c) the server's WARNING says what it saw" "WARNING.*stream from client ${CLIENT_ID} for '${L2_VT}' refused \(type_mismatch\): ${L2_VT_SD} is a filesystem on the server and the stream is a volume" "$slog"
+    check_has "(L2c) the client's ERROR carries the hint: zfs rename it to a name outside the backup target" "ERROR.*refused ${L2_VT}.*zfs.*rename" "$clog"
+    check "(L2c) no resume token and no receive left on the server" "0 0" "$(msh "$SERVER_VM" "zfs get -H -o value receive_resume_token '$L2_VT_SD' | grep -vc '^-\$'; pgrep -fc '[z]fs (receive|recv)'" | tr '\n' ' ' | sed 's/ *$//')"
+    # the operator acts
+    msh "$SERVER_VM" "zfs set org.zfsbackup:client_id='$CLIENT_ID' '$L2_GD_SD'" || fail "(L2g) zfs set on gdata failed"
+    if l2_wait_ssn "$L2_GD_SD" "$L2_S_GD" 150; then pass "(L2g) after the operator's \`zfs set org.zfsbackup:client_id\`, $L2_S_GD reached the adopted dataset"; else fail "(L2g) $L2_S_GD never reached $L2_GD_SD after the adoption"; fi
+    check "(L2g) the adopted copy is inert (canmount=noauto readonly=on mountpoint=none, not mounted) and carries the server's config" "noauto on none no $L2_GD" \
+        "$(l2_sget canmount "$L2_GD_SD") $(l2_sget readonly "$L2_GD_SD") $(l2_sget mountpoint "$L2_GD_SD") $(l2_sget mounted "$L2_GD_SD") $(zprop "$SERVER_VM" "$L2_GD_SD" org.zfsbackup:source_dataset)"
+    check "(L2g) guid of $L2_S_GD matches" "$(guid "$CLIENT_VM" "$L2_GD@$L2_S_GD")" "$(guid "$SERVER_VM" "$L2_GD_SD@$L2_S_GD")"
+    msh "$SERVER_VM" "zfs set org.zfsbackup:client_id='$CLIENT_ID' '$L2_ANC_SD'" || fail "(L2g) zfs set on anc failed"
+    if l2_wait_ssn "$L2_ANCC_SD" "$L2_S_ANCC" 150; then pass "(L2g) after adopting the ancestor, $L2_S_ANCC reached $L2_ANCC_SD (created by the receive)"; else fail "(L2g) $L2_S_ANCC never reached $L2_ANCC_SD"; fi
+    check "(L2g) guid of $L2_S_ANCC matches, and the new copy is inert" "$(guid "$CLIENT_VM" "$L2_ANCC@$L2_S_ANCC") noauto on none" "$(guid "$SERVER_VM" "$L2_ANCC_SD@$L2_S_ANCC") $(l2_sget canmount "$L2_ANCC_SD") $(l2_sget readonly "$L2_ANCC_SD") $(l2_sget mountpoint "$L2_ANCC_SD")"
+    msh "$SERVER_VM" "zfs rename '$L2_VT_SD' '${L2_VT_SD}.aside'" || fail "(L2c) the operator's zfs rename failed"
+    if l2_wait_ssn "$L2_VT_SD" "$L2_S_VT" 150; then pass "(L2c) after the operator's \`zfs rename\`, the volume $L2_S_VT went out (a full stream)"; else fail "(L2c) $L2_S_VT never reached $L2_VT_SD after the rename"; fi
+    check "(L2c) the new copy is a VOLUME with readonly=on / volmode=none, and its guid matches" "volume on none $(guid "$CLIENT_VM" "$L2_VT@$L2_S_VT")" \
+        "$(l2_sget type "$L2_VT_SD") $(l2_sget readonly "$L2_VT_SD") $(l2_sget volmode "$L2_VT_SD") $(guid "$SERVER_VM" "$L2_VT_SD@$L2_S_VT")"
+    check "(L2c) the filesystem put aside is untouched (still empty)" "filesystem 0" "$(l2_sget type "${L2_VT_SD}.aside") $(l2_ssn "${L2_VT_SD}.aside" | count)"
+    check "(L2c) the server still has no device node" "$L2_NODES_BEFORE" "$(l2_nodes)"
+    stop_daemon "$CLIENT_VM"
+    check_lacks "(L2) no traceback in A's log" "Traceback" "$(log_since_vm "$CLIENT_VM" "$l2mark_c")"
+    check_lacks "(L2) no traceback in the server log (so far)" "Traceback" "$(log_since_vm "$SERVER_VM" "$l2mark_s")"
+
+    # ── L2a / L2b: the modified client ──
+    echo
+    step "L2a/L2b — B (a modified client) sends -p, -R, -I and a mislabeled stream: each is refused before zfs receive is spawned"
+    bmark_s="$(loglines "$SERVER_VM")"
+    install_evil_client
+    put_b_config "$L2_BD" "$L2_BN"
+    enroll_b "L2" "$L2_B_ID"
+    L2_BD_SD="$(l2_sds "$L2_B_ID" "$L2_BD")"; L2_BN_SD="$(l2_sds "$L2_B_ID" "$L2_BN")"
+    B_S1="$(l2_snap "$L2_BD")"; B_N1="$(l2_snap "$L2_BN")"
+    # L2i: the backup target is never created by the server: with it gone a negotiate fails and creates nothing (the parent chain is made with `zfs create`, no -p)
+    step "L2i — the backup target must already exist: the server creates nothing above <target>/<client id>"
+    msh "$SERVER_VM" "zfs rename '$TARGET_DS' '${TARGET_DS}.away'" || die "(L2i) could not move the target away"
+    evil_mode "*=plain"
+    imark_s="$(loglines "$SERVER_VM")"; mark_b="$(blog_mark)"
+    start_b_daemon
+    wait_log_vm "$SERVER_VM" "$imark_s" "cannot record ${L2_BD_SD}" 120 && pass "(L2i) the server logged that it cannot record ${L2_BD_SD} (ERROR)" || fail "(L2i) no 'cannot record ${L2_BD_SD}' on the server"
+    stop_b_daemon
+    check "(L2i) nothing was created: the target does not exist and no dataset named like it was made" "no 0" "$(l2_exists "$TARGET_DS") $(msh "$SERVER_VM" "zfs list -H -o name -r '$SERVER_POOL' | grep -c '^$TARGET_DS\$\|^$TARGET_DS/'" | tr -d '[:space:]')"
+    if [ "$CK_READY" -eq 1 ]; then
+        ck_run "$SERVER_VM" --json
+        check "(L2i) \`check\` on the server reports the missing target as CRIT (exit 1)" "1 CRIT" "$CK_RC $(ck_expr "$SERVER_VM" 'd["state"]' | tr -d '[:space:]')"
+    fi
+    msh "$SERVER_VM" "zfs rename '${TARGET_DS}.away' '$TARGET_DS'" || die "(L2i) could not move the target back"
+    # run 1: bdata honest (the base the later refusals work on), bnew with a FULL -p stream onto a dataset that does not exist
+    evil_mode "bdata=plain bnew=p"
+    mark_b="$(blog_mark)"; rmark_s="$(loglines "$SERVER_VM")"
+    start_b_daemon
+    check_has "(L2a) B's daemon runs the modified client" "zfsb-evil: modified client active" "$(sleep 5; blog_since "$mark_b")"
+    l2_wait_ssn "$L2_BD_SD" "$B_S1" 150 && pass "(L2a) B's honest full stream $B_S1 of bdata was received" || fail "(L2a) $B_S1 never reached $L2_BD_SD"
+    b_wait_refusal "$rmark_s" "$L2_B_ID" "$L2_BN" stream_header 90 || fail "(L2a) the server never logged the refusal of B's full -p stream of bnew"
+    stop_b_daemon
+    b_refusal_effects "L2a-full-p" "$L2_BN_SD" "$B_N1" "$rmark_s" "$mark_b" "stream_header" "compound streams"
+    check "(L2a-full-p) nothing was created for the refused dataset: $L2_BN_SD does not exist" "no" "$(l2_exists "$L2_BN_SD")"
+    check "(L2a) bdata's copy is a plain, inert filesystem: guid matches, canmount=noauto readonly=on" "$(guid "$CLIENT_VM" "$L2_BD@$B_S1") noauto on" "$(guid "$SERVER_VM" "$L2_BD_SD@$B_S1") $(l2_sget canmount "$L2_BD_SD") $(l2_sget readonly "$L2_BD_SD")"
+    msh "$CLIENT_VM" "head -c 200000 /dev/urandom >> \$(zfs get -H -o value mountpoint '$L2_BD')/f.bin"
+    B_S2="$(l2_snap "$L2_BD")"
+    mark_b="$(blog_mark)"
+    start_b_daemon
+    l2_wait_ssn "$L2_BD_SD" "$B_S2" 150 && pass "(L2a) B's honest incremental $B_S2 was received" || fail "(L2a) $B_S2 never reached $L2_BD_SD"
+    stop_b_daemon
+    # the pending snapshot every hostile run tries to send as ITS first step ($B_S2 -> $B_S3)
+    msh "$CLIENT_VM" "head -c 200000 /dev/urandom >> \$(zfs get -H -o value mountpoint '$L2_BD')/f.bin"
+    B_S3="$(l2_snap "$L2_BD")"
+    evil_otherbase "$B_S1"
+    L2_COPY_FP="$(l2_pfp "$L2_BD_SD")"; L2_OTHERS_FP="$(l2_others_fp)"; L2_S2_GUID="$(guid "$SERVER_VM" "$L2_BD_SD@$B_S2")"
+    check "(L2a) the server holds exactly $B_S1 and $B_S2 of bdata before the hostile runs" "$B_S1 $B_S2" "$(l2_ssn "$L2_BD_SD" | tr '\n' ' ' | sed 's/ *$//')"
+    # the server warns once per (dataset, reason) until a stream of that dataset succeeds, so the first -p refusal of bdata is a WARNING and the
+    # -R and -I ones, refused for the same reason, are DEBUG lines (the client retries every cycle); base_mismatch is a new reason: a WARNING again
+    for hm in "p:stream_header:compound streams:WARNING" "R:stream_header:compound streams:DEBUG" "I:stream_header:compound streams:DEBUG" "basemismatch:base_mismatch:source guid:WARNING"; do
+        mode="${hm%%:*}"; rest="${hm#*:}"; reason="${rest%%:*}"; rest="${rest#*:}"; msgre="${rest%%:*}"; lvl="${rest#*:}"
+        lbl="L2a-$mode"; [ "$mode" = basemismatch ] && lbl="L2b-basemismatch"
+        evil_mode "bdata=$mode bnew=p"
+        mark_b="$(blog_mark)"; rmark_s="$(loglines "$SERVER_VM")"
+        start_b_daemon
+        if b_wait_refusal "$rmark_s" "$L2_B_ID" "$L2_BD" "$reason" 150; then pass "($lbl) the server refused B's $mode stream of the incremental $B_S2 -> $B_S3 ($reason)"; else fail "($lbl) the server never logged the refusal ($reason)"; fi
+        stop_b_daemon
+        b_refusal_effects "$lbl" "$L2_BD_SD" "$B_S3" "$rmark_s" "$mark_b" "$reason" "$msgre" "$lvl"
+        check "($lbl) bdata's copy is exactly as before: snapshots, guids and properties" "$L2_COPY_FP" "$(l2_pfp "$L2_BD_SD")"
+        check "($lbl) everything else under the target is unchanged (A's tree, the containers)" "$L2_OTHERS_FP" "$(l2_others_fp)"
+    done
+    check "(L2a) the server's log warned ONCE for bdata/stream_header however many streams were refused (the repeats are DEBUG lines)" "1 yes" \
+        "$(log_since_vm "$SERVER_VM" "$bmark_s" | grep -cE "WARNING.*for '${L2_BD}' refused \(stream_header\)") $([ "$(log_since_vm "$SERVER_VM" "$bmark_s" | grep -cE "DEBUG.*for '${L2_BD}' refused \(stream_header\)")" -ge 2 ] && echo yes || echo no)"
+    check "(L2b) the stream that declared $B_S2 as its base and started at $B_S1 destroyed nothing: $B_S2 is there with its guid" "$L2_S2_GUID" "$(guid "$SERVER_VM" "$L2_BD_SD@$B_S2")"
+    check_has "(L2b) the server's WARNING names both guids (declared and real)" "refused \(base_mismatch\): the client declared the incremental source guid ${L2_S2_GUID}, but the stream's source guid is $(guid "$CLIENT_VM" "$L2_BD@$B_S1")" "$(log_since_vm "$SERVER_VM" "$bmark_s")"
+    # B goes honest: the whole backlog goes out as a chain, and the refused dataset arrives as a full stream
+    evil_mode "*=plain"
+    mark_b="$(blog_mark)"
+    start_b_daemon
+    l2_wait_ssn "$L2_BD_SD" "$B_S3" 150 && pass "(L2a) when B sends honestly again, $B_S3 is received" || fail "(L2a) $B_S3 never reached $L2_BD_SD"
+    l2_wait_ssn "$L2_BN_SD" "$B_N1" 90 && pass "(L2a) ... and bnew's full stream $B_N1 creates the dataset" || fail "(L2a) $B_N1 never reached $L2_BN_SD"
+    stop_b_daemon
+    check_has "(L2a) B's log: Backup complete ($B_S3 as an incremental from $B_S2)" "Backup complete: ${L2_BD}@${B_S3} \(incremental from ${B_S2}\)" "$(blog_since "$mark_b")"
+    check "(L2a) guids match for $B_S1 $B_S2 $B_S3 (the data itself is intact)" "ok" \
+        "$(b_ok=ok; for x in $B_S1 $B_S2 $B_S3; do [ "$(guid "$CLIENT_VM" "$L2_BD@$x")" = "$(guid "$SERVER_VM" "$L2_BD_SD@$x")" ] || b_ok=bad; done; echo $b_ok)"
+    check "(L2a) bnew's copy is inert too: canmount=noauto readonly=on mountpoint=none, no received property" "noauto on none 0" \
+        "$(l2_sget canmount "$L2_BN_SD") $(l2_sget readonly "$L2_BN_SD") $(l2_sget mountpoint "$L2_BN_SD") $(msh "$SERVER_VM" "zfs get -H -s received -o property all '$L2_BN_SD' | wc -l" | tr -d '[:space:]')"
+    check "(L2a) the server's pruner kept the full history of bdata through all of it" "$B_S1 $B_S2 $B_S3" "$(l2_ssn "$L2_BD_SD" | tr '\n' ' ' | sed 's/ *$//')"
+    check_lacks "(L2) no traceback in the server log" "Traceback" "$(log_since_vm "$SERVER_VM" "$l2mark_s")"
+    check_lacks "(L2) no traceback in B's log" "Traceback" "$(blog_since 0)"
+    stop_daemon "$CLIENT_VM"; stop_b_daemon
+    msh "$CLIENT_VM" "{ zfs release '$L2_HOLD' '$L2_PROPS@$L2_S_PROPS'; rm -rf '$L1_EVIL_DIR' '$L1_B_LOG' '$L2_MP'; } >/dev/null 2>&1; true" || true
 fi
 
 # ═════════════ Scenario R: restore (README "Restoring data" and "Restoring a configuration backup", plan B-9, C23) ═════════════
@@ -3011,21 +3482,30 @@ else
     if r_restore_send "-p -L -c" "$SD@$R_NEWEST" -u "$SOURCE_DS"; then pass "(R2b) a -p restore works (exit 0)"; else fail "(R2b) the -p restore failed"; fi
     check_has "(R2b) the server's org.zfsbackup:* values arrived as RECEIVED values (that is what -p carries)" "org.zfsbackup:(client_id|source_dataset|config)" \
         "$(msh "$CLIENT_VM" "zfs get -H -s received -o property all '$SOURCE_DS'" )"
+    R_INERT_RE='^(readonly|canmount|mountpoint|volmode|sharenfs|sharesmb|setuid|exec|devices)$'
     if [ "$R_HARDENED" = yes ]; then
-        check "(R2b) the server copy is hardened (readonly/canmount): the client dataset is read-only as RECEIVED, as documented" "on received" \
-            "$(msh "$CLIENT_VM" "zfs get -H -o value,source readonly '$SOURCE_DS'" | tr '\t' ' ' | tr -d '\r')"
-        msh "$CLIENT_VM" "zfs inherit readonly '$SOURCE_DS'; zfs inherit volmode '$SOURCE_DS'; zfs set canmount=on '$SOURCE_DS'"
-        check "(R2b) the documented fix (zfs inherit readonly, inherit volmode, set canmount=on) makes it writable" "off on" "$(r_zget "$CLIENT_VM" readonly "$SOURCE_DS") $(r_zget "$CLIENT_VM" canmount "$SOURCE_DS")"
+        # B-2a: the server copy carries nine LOCAL values that make it inert; a -p stream carries them to the restored dataset as RECEIVED
+        # values (read-only, never mounted, no mountpoint, no devices/setuid/exec), which the README documents and tells the operator to undo
+        check "(R2b) the server copy is inert (B-2a): all nine of readonly/canmount/mountpoint/volmode/sharenfs/sharesmb/setuid/exec/devices arrive as RECEIVED values" \
+            "canmount devices exec mountpoint readonly setuid sharenfs sharesmb volmode" \
+            "$(msh "$CLIENT_VM" "zfs get -H -s received -o property all '$SOURCE_DS'" | tr -d '\r' | grep -E "$R_INERT_RE" | sort | tr '\n' ' ' | sed 's/ *$//')"
+        check "(R2b) ... so the restored dataset is read-only and will not mount: readonly=on (received), canmount=noauto, mountpoint=none" "on received noauto none" \
+            "$(msh "$CLIENT_VM" "zfs get -H -o value,source readonly '$SOURCE_DS'" | tr '\t' ' ' | tr -d '\r') $(r_zget "$CLIENT_VM" canmount "$SOURCE_DS") $(r_zget "$CLIENT_VM" mountpoint "$SOURCE_DS")"
+        msh "$CLIENT_VM" "for p in readonly mountpoint volmode sharenfs sharesmb setuid exec devices; do zfs inherit \$p '$SOURCE_DS'; done; zfs set canmount=on '$SOURCE_DS'"
+        check "(R2b) the README's fix (zfs inherit of the eight, zfs set canmount=on) makes it an ordinary dataset again: writable, mountable at its parent's path, setuid/exec/devices on" \
+            "off on /$SOURCE_DS on on on" \
+            "$(r_zget "$CLIENT_VM" readonly "$SOURCE_DS") $(r_zget "$CLIENT_VM" canmount "$SOURCE_DS") $(r_zget "$CLIENT_VM" mountpoint "$SOURCE_DS") $(r_zget "$CLIENT_VM" setuid "$SOURCE_DS") $(r_zget "$CLIENT_VM" exec "$SOURCE_DS") $(r_zget "$CLIENT_VM" devices "$SOURCE_DS")"
+        msh "$CLIENT_VM" "zfs get -H -o property,value,source readonly,canmount,mountpoint,sharenfs,volmode '$SOURCE_DS'" | tr '\t\r' ' ' | sed 's/^/    after the fix: /'
     else
         check "(R2b) the server copy is not hardened yet (no readonly/canmount/volmode values): nothing read-only arrives, only org.zfsbackup:*" "off 0" \
-            "$(r_zget "$CLIENT_VM" readonly "$SOURCE_DS") $(r_nrcvd "$SOURCE_DS" '^(readonly|canmount|volmode)$')"
+            "$(r_zget "$CLIENT_VM" readonly "$SOURCE_DS") $(r_nrcvd "$SOURCE_DS" "$R_INERT_RE")"
         info "(R2b) the README's read-only claim for a -p restore applies once the server copy carries readonly/canmount/volmode (B-2a)"
     fi
     msh "$CLIENT_VM" "zfs destroy -r '$SOURCE_DS'" || fail "(R2b) could not destroy the -p restore"
-    if r_restore_send "-p -L -c" "$SD@$R_NEWEST" -x readonly -x canmount -x volmode -x org.zfsbackup:config -x org.zfsbackup:client_id -x org.zfsbackup:source_dataset -u "$SOURCE_DS"; then
+    if r_restore_send "-p -L -c" "$SD@$R_NEWEST" -x readonly -x canmount -x mountpoint -x volmode -x sharenfs -x sharesmb -x setuid -x exec -x devices -x org.zfsbackup:config -x org.zfsbackup:client_id -x org.zfsbackup:source_dataset -u "$SOURCE_DS"; then
         pass "(R2b) the README's -x receive accepts the options (exit 0)"; else fail "(R2b) the -x receive failed"; fi
-    check "(R2b) with those -x options no readonly/canmount/volmode/org.zfsbackup:config|client_id|source_dataset is RECEIVED" "0" \
-        "$(r_nrcvd "$SOURCE_DS" '^(readonly|canmount|volmode|org.zfsbackup:(config|client_id|source_dataset))$')"
+    check "(R2b) with those -x options none of the nine inert values nor org.zfsbackup:config|client_id|source_dataset is RECEIVED" "0" \
+        "$(r_nrcvd "$SOURCE_DS" '^(readonly|canmount|mountpoint|volmode|sharenfs|sharesmb|setuid|exec|devices|org.zfsbackup:(config|client_id|source_dataset))$')"
     msh "$CLIENT_VM" "zfs destroy -r '$SOURCE_DS'" || true
 
     echo

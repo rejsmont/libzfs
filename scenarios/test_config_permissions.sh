@@ -152,12 +152,12 @@ check() { # check "<description>" <expected> <actual>
 }
 # check_re "<description>" "<ERE>" "<text>"  — pass when the text matches
 check_re() {
-    if printf '%s' "$3" | grep -qE -- "$2"; then pass "$1"; else
+    if grep -qE -- "$2" <<<"$3"; then pass "$1"; else
         fail "$1 (no match for /$2/ in: $(printf '%s' "$3" | tr '\n' '|' | cut -c1-300))"
     fi
 }
 check_no_re() { # check_no_re "<description>" "<ERE>" "<text>"  — pass when the text does NOT match
-    if printf '%s' "$3" | grep -qE -- "$2"; then
+    if grep -qE -- "$2" <<<"$3"; then
         fail "$1 (unexpected /$2/ in: $(printf '%s' "$3" | tr '\n' '|' | cut -c1-300))"
     else pass "$1"; fi
 }

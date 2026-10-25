@@ -122,12 +122,12 @@ check() { # check "<description>" <expected> <actual>
     if [ "$2" = "$3" ]; then pass "$1 ($3)"; else fail "$1 (expected='$2' actual='$3')"; fi
 }
 check_re() { # check_re "<description>" "<ERE>" "<text>"
-    if printf '%s' "$3" | grep -qE -- "$2"; then pass "$1"; else
+    if grep -qE -- "$2" <<<"$3"; then pass "$1"; else
         fail "$1 (no match for /$2/ in: $(printf '%s' "$3" | tr '\n' '|' | cut -c1-400))"
     fi
 }
 check_no_re() { # check_no_re "<description>" "<ERE>" "<text>"
-    if printf '%s' "$3" | grep -qE -- "$2"; then
+    if grep -qE -- "$2" <<<"$3"; then
         fail "$1 (unexpected /$2/ in: $(printf '%s' "$3" | tr '\n' '|' | cut -c1-400))"
     else pass "$1"; fi
 }
