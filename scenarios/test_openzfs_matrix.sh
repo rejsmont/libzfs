@@ -33,7 +33,7 @@
 #   ./scenarios/test_openzfs_matrix.sh --purge              # delete the matrix VMs (only these three) at the end
 #   ./scenarios/test_openzfs_matrix.sh --captures-only      # SP spike only: ship the scripts, run the captures, no pytest/formats
 #   ./scenarios/test_openzfs_matrix.sh --captures           # ... in addition to pytest and the formats
-#   ./scenarios/test_openzfs_matrix.sh --captures-only --sections M3,Z4   # a subset (M1 M2 M3 M4 EP M5 M6 M7 M8 Z2 Z3 Z4 Z5 Z6 Z7)
+#   ./scenarios/test_openzfs_matrix.sh --captures-only --sections M3,Z4   # a subset (M1 M2 M3 M4 EP M5 M6 M7 M8 M9 Z2 Z3 Z4 Z5 Z6 Z7)
 #   ./scenarios/test_openzfs_matrix.sh --captures-only --locales default,C,en_US.utf8   # passes (default: default,C)
 #   SRC_REF=<commit-ish> ...     # ship that tree instead of HEAD; for uncommitted work: SRC_REF=$(git stash create)
 #   MATRIX_LOG_DIR=<dir> ...     # where the per-VM logs go (default: a fresh mktemp dir, printed at the end)
@@ -49,7 +49,8 @@
 #   Sections: M1 token flags, M2 stale tokens, M3_Z8 destroy failures, M4 listing, EP encryption properties,
 #   M5_Z1 raw receive and -F, M6 -L mismatch, M7 -F/rollback/modified-head semantics (B-2b U1 U2 U4 U5 U6),
 #   M8 the server receive argv (B-2a: -o canmount/readonly/volmode + -x mountpoint/sharenfs/sharesmb/setuid/exec/devices + -h on plain/raw
-#   filesystems and volumes, holds, resume, -F onto an existing copy, server-side operations, created ancestors), Z2 ownership -o on raw, Z3 partial new dataset, Z4 key unloaded,
+#   filesystems and volumes, holds, resume, -F onto an existing copy, server-side operations, created ancestors),
+#   M9 zfs version -j / list -j / get -j (plan D8 / S4a: OpenZFS 2.3+ JSON; values with newline/tab/0xff/quote, every source type, sort, -p, received, errors; the usage text on 2.1/2.2), Z2 ownership -o on raw, Z3 partial new dataset, Z4 key unloaded,
 #   Z5 change-key, Z6 encryption/encryptionroot, Z7 raw copy without a key.
 #
 # Exit status: 0 when every selected version ran and no test failed or errored, 1 otherwise, 2 on usage errors.
@@ -107,7 +108,7 @@ done
 for f in ${EXTRA_TESTS[@]+"${EXTRA_TESTS[@]}"}; do
     case "$f" in tests/*.py) ;; *) echo "--extra takes a repo-relative tests/*.py path, got '$f'" >&2; exit 2 ;; esac
 done
-case "$SECTIONS" in *[!A-Za-z0-9,]*) echo "--sections takes a comma list like M3,Z4 (M1 M2 M3 M4 EP M5 M6 M7 M8 Z2 Z3 Z4 Z5 Z6 Z7)" >&2; exit 2 ;; esac
+case "$SECTIONS" in *[!A-Za-z0-9,]*) echo "--sections takes a comma list like M3,Z4 (M1 M2 M3 M4 EP M5 M6 M7 M8 M9 Z2 Z3 Z4 Z5 Z6 Z7)" >&2; exit 2 ;; esac
 case "$LOCALES" in ""|*[!A-Za-z0-9,._@-]*) echo "--locales takes a comma list like default,C" >&2; exit 2 ;; esac
 
 # ─────────────────────────────── Output helpers ─────────────────────────────
@@ -2098,6 +2099,260 @@ sec_Z7() {
 }
 
 
+# ================================================================ M9: zfs list -j / zfs get -j (plan D8 / S4a: OpenZFS 2.3+ JSON output)
+# Run on every version: 2.3+ answers the -j commands; 2.1/2.2 only print a usage text (the fallback probe), so there
+# they get a short subset. The -H references (all versions) use the same datasets, for a -j vs -H parity test.
+# The user-property values hold a newline, a tab, a 0xff byte, quotes, a backslash, control bytes and non-ASCII.
+sec_M9() {
+    section M9 "zfs version -j, zfs list -j, zfs get -j: values with newline/tab/0xff/quote, every source type, sort, -p, received, errors; the -H references; the usage text on versions without -j"
+    local JSON=0 UP UPX
+    # NOT by exit status: 2.1/2.2 `zfs version -j` exits 0 and prints the plain-text version (the flag is ignored)
+    [ "$(zfs version -j 2>/dev/null </dev/null | head -c 1)" = '{' ] && JSON=1
+    # UP: the user properties whose -j output is valid JSON under LC_ALL=C; UPX adds the two that truncate it there (0xff, UTF-8)
+    UP="zfsb:nl,zfsb:tab,zfsb:q,zfsb:bs,zfsb:bsn,zfsb:ctl,zfsb:json,zfsb:dash,zfsb:fake,zfsb:empty,zfsb:lt,zfsb:missing"
+    UPX="zfsb:nl,zfsb:tab,zfsb:ff,zfsb:q,zfsb:bs,zfsb:bsn,zfsb:ctl,zfsb:u8,zfsb:json,zfsb:dash,zfsb:fake,zfsb:empty,zfsb:lt,zfsb:missing"
+
+    # ---- name attempts first (unrecorded successes show up in the listings below)
+    note "names: tab, newline, a UTF-8 e-acute, a 0xff byte, '%', ',', '@', '#', a trailing space, a leading space, ':' and 'a b' (a space) are attempted; the created ones appear in the listings"
+    capsh 00_name_tab "zfs create $R/\$'t\\tab'"
+    capsh 00_name_nl "zfs create $R/\$'n\\nl'"
+    capsh 00_name_u8 "zfs create $R/\$'caf\\xc3\\xa9'"
+    capsh 00_name_ff "zfs create $R/\$'f\\xffb'"
+    capsh 00_name_pct "zfs create $R/'p%ct'"
+    capsh 00_name_comma "zfs create $R/'c,omma'"
+    capsh 00_name_at "zfs create $R/'a@t'"
+    capsh 00_name_hash "zfs create $R/'h#ash'"
+    capsh 00_name_trail "zfs create $R/'trail '"
+    capsh 00_name_lead "zfs create $R/' lead'"
+    capsh 00_name_colon "zfs create $R/'co:lon'"
+    capsh 00_name_space "zfs create $R/'sp ace'"
+    capsh 00_name_snap_space "zfs snapshot '$R/sp ace@s p'"
+    capsh 00_name_ctl "zfs create $R/\$'c\\x01tl'"
+
+    # ---- fixtures
+    note "setup: $R/src (compression=lz4, user props zfsb:nl='line1<LF>line2' zfsb:tab='a<TAB>b' zfsb:ff='a<0xff>b' zfsb:q='say \"hi\"' zfsb:bs='back\\slash' zfsb:bsn='a\\nb' (backslash, n) zfsb:ctl='x<0x01>y<0x7f>z' zfsb:u8='cafe-acute <U+1F600>' zfsb:json='{\"a\":[1,2]}' zfsb:dash='-' zfsb:fake='inherited from foo' zfsb:empty='' zfsb:lt='<&>'), children zz aa mm (created in that order), $R/vol (a zvol, 8M), $R/empty, snapshots s1 (recursive) and s2 (recursive), src/mm@extra, hold on src@s1, clone $R/clone of src@s1, bookmark src#bm1, $R/recv from zfs send -R src@s1, $R/tmp mounted ro"
+    st zfs set mountpoint=none "$R"
+    st zfs create -o compression=lz4 "$R/src"
+    st zfs create "$R/src/zz"; st zfs create "$R/src/aa"; st zfs create "$R/src/mm"
+    st zfs create "$R/src/child"
+    st zfs create -V 8M "$R/vol"
+    st zfs create "$R/empty"
+    st zfs set "zfsb:nl=line1"$'\n'"line2" "$R/src"
+    st zfs set "zfsb:tab=a"$'\t'"b" "$R/src"
+    st zfs set "zfsb:ff=a"$'\xff'"b" "$R/src"
+    st zfs set 'zfsb:q=say "hi"' "$R/src"
+    st zfs set 'zfsb:bs=back\slash' "$R/src"
+    st zfs set 'zfsb:bsn=a\nb' "$R/src"
+    st zfs set "zfsb:ctl=x"$'\x01'"y"$'\x7f'"z" "$R/src"
+    st zfs set "zfsb:u8=caf"$'\xc3\xa9'" "$'\xf0\x9f\x98\x80' "$R/src"
+    st zfs set 'zfsb:json={"a":[1,2]}' "$R/src"
+    st zfs set 'zfsb:dash=-' "$R/src"
+    st zfs set 'zfsb:fake=inherited from foo' "$R/src"
+    st zfs set 'zfsb:empty=' "$R/src"
+    st zfs set 'zfsb:lt=<&>' "$R/src"
+    st zfs set "zfsb:nl=child"$'\n'"override" "$R/src/child"          # a local override of an inheritable value
+    st zfs set "zfsb:ff=aa"$'\xff'"local" "$R/src/aa"
+    st zfs set 'zfsb:vol=on a volume' "$R/vol"
+    st zfs snapshot -r "$R/src@s1"
+    st zfs snapshot "$R/vol@s1"
+    st zfs set "zfsb:nl=snap"$'\n'"value" "$R/src@s1"                 # a user property on a snapshot
+    st zfs set "zfsb:ff=snap"$'\xff' "$R/src/aa@s1"
+    st zfs snapshot -r "$R/src@s2"
+    st zfs snapshot "$R/src/mm@extra"
+    st zfs hold keep "$R/src@s1"
+    st zfs clone "$R/src@s1" "$R/clone"
+    st zfs bookmark "$R/src@s1" "$R/src#bm1"
+    st bash -c "zfs send -R '$R/src@s1' | zfs receive -u '$R/recv'"
+    st zfs set 'zfsb:q=LOCAL over received' "$R/recv"                  # local value over a received one
+    st zfs inherit zfsb:nl "$R/recv/child"                            # inherited over a received one
+    st zfs create -o "mountpoint=/$P-m9tmp" "$R/tmp"
+    st zfs unmount "$R/tmp"; st zfs mount -o ro "$R/tmp"              # readonly: source 'temporary'
+
+    # a dataset whose guid is >= 2**63 (guids are random 64-bit): --json-int has to carry it
+    note "big: $R/big is a dataset whose guid is >= 9223372036854775808 (tried g1..g40, the others destroyed)"
+    local i g
+    for i in $(seq 1 40); do
+        st zfs create "$R/g$i" || continue
+        g="$(zfs get -Hp -o value guid "$R/g$i" 2>/dev/null)"
+        if [ "${#g}" -ge 20 ] || { [ "${#g}" -eq 19 ] && [[ ! "$g" < 9223372036854775808 ]]; }; then
+            st zfs rename "$R/g$i" "$R/big"; break
+        fi
+        st zfs destroy "$R/g$i"
+    done
+
+    # ---- the -H references (every version)
+    note "H*: the -H forms of the same objects (every version), for the -j vs -H parity test"
+    cap H01_list_all zfs list -H -r -t all -o name,type,createtxg,guid,userrefs,clones,origin "$R"
+    cap H02_get_user zfs get -H -o name,property,value,received,source "$UPX,type" "$R/src"
+    cap H03_get_user_recv_r zfs get -H -r -t all -o name,property,value,received,source "$UPX" "$R/recv"
+    cap H04_get_user_p zfs get -H -p -o name,property,value,received,source "$UPX" "$R/src"
+    cap H05_list_p zfs list -H -p -r -t all -o name,type,used,available,referenced,creation,compressratio,volsize,mountpoint,quota "$R"
+    cap H06_list_sorted zfs list -H -r -t all -s createtxg -o name,type,createtxg "$R/src"
+    cap H07_get_mixed zfs get -H -o name,property,value,received,source compression,mountpoint,type,mounted,volsize,origin,clones,userrefs,createtxg,used,creation "$R/src" "$R/src/child" "$R/src@s1" "$R/vol"
+    cap H08_get_all_src zfs get -H -o name,property,value,received,source all "$R/src"
+
+    if [ "$JSON" != 1 ]; then
+        note "this version has no zfs -j: the fallback probe. Everything below is what the probe and the -j callers see"
+        cap J00_version_j zfs version -j
+        cap J01_version zfs version
+        cap J02_list_j zfs list -j "$R/src"
+        cap J03_list_j_r_t_all zfs list -j -r -t all "$R"
+        cap J04_list_j_o zfs list -j -o name,type "$R/src"
+        cap J05_list_json zfs list --json "$R/src"
+        cap J06_list_json_int zfs list --json-int "$R/src"
+        cap J07_get_j_all zfs get -j all "$R/src"
+        cap J08_get_j_user zfs get -j "$UP" "$R/src"
+        cap J09_get_j_noargs zfs get -j
+        cap J10_get_json zfs get --json all "$R/src"
+        cap J11_list_j_noargs zfs list -j
+        cap J12_zpool_version_j zpool version -j
+        cap J13_zpool_list_j zpool list -j
+        end_section
+        return
+    fi
+
+    # ---- 2.3+: version
+    cap J00_version_j zfs version -j
+    cap J01_version zfs version
+    cap J02_zpool_version_j zpool version -j
+    cap J03_version_j_json_int zfs version --json-int
+    cap J04_version_json zfs version --json
+
+    # ---- list -j
+    cap L10_src zfs list -j "$R/src"
+    cap L11_d0 zfs list -j -d 0 "$R"
+    cap L12_r zfs list -j -r "$R"
+    cap L13_r_t_all zfs list -j -r -t all "$R"
+    cap L14_r_t_snapshot zfs list -j -r -t snapshot "$R/src"
+    cap L15_r_t_filesystem zfs list -j -r -t filesystem "$R"
+    cap L16_r_t_volume zfs list -j -r -t volume "$R"
+    cap L17_r_t_bookmark zfs list -j -r -t bookmark "$R/src"
+    cap L18_t_list zfs list -j -r -t filesystem,volume,snapshot -o name,type "$R/src"
+    cap L19_o_libzfseasy zfs list -j -r -t all -o name,type,createtxg,guid,userrefs,clones,origin "$R"
+    cap L20_o_libzfseasy_p zfs list -j -p -r -t all -o name,type,createtxg,guid,userrefs,clones,origin "$R"
+    cap L21_o_user zfs list -j -r -t all -o name,type,"$UP" "$R/src"
+    cap L22_o_numeric zfs list -j -r -t all -o name,type,used,available,referenced,creation,compressratio,volsize,mountpoint,quota "$R"
+    cap L23_o_numeric_p zfs list -j -p -r -t all -o name,type,used,available,referenced,creation,compressratio,volsize,mountpoint,quota "$R"
+    cap L24_s_createtxg zfs list -j -r -t all -s createtxg -o name,type,createtxg "$R/src"
+    cap L25_S_createtxg zfs list -j -r -t all -S createtxg -o name,type,createtxg "$R/src"
+    cap L26_s_type_s_name zfs list -j -r -t all -s type -s name -o name,type "$R/src"
+    cap L27_s_name zfs list -j -r -t all -s name -o name,type "$R/src"
+    cap L28_default_order_snapshots zfs list -j -r -t snapshot -o name,createtxg "$R/src"
+    cap L29_d1 zfs list -j -d 1 -t all "$R/src"
+    cap L30_d1_snapshot zfs list -j -d 1 -t snapshot "$R/src"
+    cap L31_empty_fs_snapshots zfs list -j -t snapshot "$R/empty"
+    cap L32_empty_fs_snapshots_r zfs list -j -r -t snapshot "$R/empty"
+    cap L33_empty_bookmarks zfs list -j -r -t bookmark "$R/empty"
+    cap L34_snapshot_names zfs list -j "$R/src@s1" "$R/src@s2"
+    cap L35_snapshot_t zfs list -j -t snapshot "$R/src@s1"
+    cap L36_clone zfs list -j -o name,origin,type "$R/clone"
+    cap L37_space_name zfs list -j -r -t all -o name,type "$R/sp ace"
+    cap L38_received zfs list -j -r -t all -o name,type,"$UP" "$R/recv"
+    cap L39_nonexistent zfs list -j "$R/nonexistent"
+    cap L40_nonexistent_snapshot zfs list -j "$R/src@nonexistent"
+    cap L41_nonexistent_t_snapshot zfs list -j -t snapshot "$R/nonexistent"
+    cap L42_one_good_one_missing zfs list -j "$R/src" "$R/nonexistent"
+    cap L43_bad_property zfs list -j -o nosuchprop "$R/src"
+    cap L44_bad_type zfs list -j -t nosuchtype "$R/src"
+    cap L45_j_with_H zfs list -j -H "$R/src"
+    cap L46_json_int zfs list --json-int "$R/src"
+    cap L47_json_long zfs list --json "$R/src"
+    cap L48_json_int_p zfs list -j --json-int -o name,used,creation,createtxg,guid "$R/src"
+    cap L49_bad_option zfs list -j --bogus "$R/src"
+    cap L50_nonexistent_pool zfs list -j nosuchpool_m9/x
+    cap L51_stdin_not_tty zfs list -j -o name "$R/src"
+    cap L52_o_all_props zfs list -j -o all "$R/src"
+    cap L53_o_zfsb_ff_only zfs list -j -o zfsb:ff "$R/src"
+
+    # ---- values that truncate the document: a 0xff byte (invalid UTF-8) and valid non-ASCII UTF-8, under LC_ALL=C and LC_ALL=C.UTF-8
+    note "U*: zfsb:ff = 'a<0xff>b' (on src, src/aa and src@s1) and zfsb:u8 = 'caf<e-acute> <U+1F600>': each under LC_ALL=C (what libzfseasy will force) and LC_ALL=C.UTF-8; is the document complete, what rc and stderr"
+    cap U00_locale_a locale -a
+    for loc in C C.UTF-8; do
+        cap "U10_get_ff_$loc" env LC_ALL=$loc zfs get -j zfsb:ff "$R/src"
+        cap "U11_get_u8_$loc" env LC_ALL=$loc zfs get -j zfsb:u8 "$R/src"
+        cap "U12_get_both_$loc" env LC_ALL=$loc zfs get -j "$UPX" "$R/src"
+        cap "U13_get_ff_r_t_all_$loc" env LC_ALL=$loc zfs get -j -r -t all zfsb:ff,type "$R/src"
+        cap "U14_get_ff_snapshot_$loc" env LC_ALL=$loc zfs get -j zfsb:ff,zfsb:nl "$R/src@s1" "$R/src/aa@s1"
+        cap "U15_list_o_ff_$loc" env LC_ALL=$loc zfs list -j -o name,zfsb:ff "$R/src"
+        cap "U16_list_o_u8_$loc" env LC_ALL=$loc zfs list -j -o name,zfsb:u8 "$R/src"
+        cap "U17_list_o_ff_r_$loc" env LC_ALL=$loc zfs list -j -r -t all -o name,zfsb:ff "$R/src"
+        cap "U18_get_all_src_$loc" env LC_ALL=$loc zfs get -j all "$R/src"
+        cap "U19_get_all_recv_$loc" env LC_ALL=$loc zfs get -j all "$R/recv"
+        cap "U20_get_second_dataset_ff_$loc" env LC_ALL=$loc zfs get -j type "$R/empty" "$R/src" "$R/vol"
+        cap "U21_get_user_r_t_all_$loc" env LC_ALL=$loc zfs get -j -r -t all "$UPX" "$R/src"
+    done
+    cap U22_get_prefix_kept_C env LC_ALL=C zfs get -j zfsb:nl,zfsb:ff "$R/empty" "$R/src" "$R/vol"
+    note "D*: the same object named twice (duplicate keys in a JSON object?)"
+    cap D10_get_same_twice zfs get -j type "$R/src" "$R/src"
+    cap D11_get_r_and_child zfs get -j -r -d 1 type "$R/src" "$R/src/aa"
+    cap D12_list_same_twice zfs list -j -o name,type "$R/src" "$R/src"
+    cap D13_list_r_and_child zfs list -j -r -d 1 -o name,type "$R/src" "$R/src/aa"
+    cap B10_guid_big_H zfs get -H -p -o name,property,value guid "$R/big"
+    cap B11_guid_big_j zfs get -j guid "$R/big"
+    cap B12_guid_big_json_int zfs get -j --json-int guid,createtxg,used "$R/big"
+    cap B13_list_guid_big_json_int zfs list -j --json-int -o name,guid,createtxg,used "$R/big"
+    cap B14_list_guid_big_j zfs list -j -o name,guid "$R/big"
+    cap U30_get_all_clean_dataset zfs get -j all "$R/empty"
+    cap U31_get_all_clean_dataset_p zfs get -j -p all "$R/empty"
+
+    # ---- get -j
+    cap G10_all_src zfs get -j all "$R/src"
+    cap G11_all_src_p zfs get -j -p all "$R/src"
+    cap G12_user zfs get -j "$UP" "$R/src"
+    cap G13_user_p zfs get -j -p "$UP,type,name,creation,used" "$R/src"
+    cap G14_user_notp zfs get -j "$UP,type,name,creation,used" "$R/src"
+    cap G15_user_r_t_all zfs get -j -r -t all "$UP" "$R/src"
+    cap G16_user_recv_r zfs get -j -r -t all "$UP" "$R/recv"
+    cap G17_s_local zfs get -j -r -t all -s local "$UP" "$R/src"
+    cap G18_s_inherited zfs get -j -r -t all -s inherited "$UP" "$R/src"
+    cap G19_s_default zfs get -j -s default compression,checksum,atime "$R/src/child"
+    cap G20_s_none zfs get -j -s none type,creation,used,guid "$R/src"
+    cap G21_s_received zfs get -j -r -t all -s received "$UP" "$R/recv"
+    cap G22_s_temporary zfs get -j -s temporary readonly,mountpoint,type "$R/tmp"
+    cap G23_s_local_inherited zfs get -j -r -s local,inherited "$UP" "$R/src"
+    cap G24_o_five zfs get -j -r -t all -o name,property,value,received,source "$UP" "$R/recv"
+    cap G25_o_property_value zfs get -j -o property,value "$UP" "$R/src"
+    cap G26_o_received zfs get -j -o name,property,received "$UP" "$R/recv"
+    cap G27_o_value_only zfs get -j -o value "$UP" "$R/src"
+    cap G28_o_source_only zfs get -j -o source "$UP" "$R/src"
+    cap G29_o_name_received_source zfs get -j -o name,received,source zfsb:q,zfsb:nl "$R/recv" "$R/recv/child"
+    cap G30_o_all zfs get -j -o all zfsb:q "$R/recv"
+    cap G31_recv_r_default zfs get -j -r "$UP" "$R/recv"
+    cap G32_mixed zfs get -j compression,mountpoint,type,mounted,volsize,origin,clones,userrefs,createtxg,used,creation "$R/src" "$R/src/child" "$R/src@s1" "$R/vol"
+    cap G33_mixed_p zfs get -j -p compression,mountpoint,type,mounted,volsize,origin,clones,userrefs,createtxg,used,creation "$R/src" "$R/src/child" "$R/src@s1" "$R/vol"
+    cap G34_all_snapshot zfs get -j all "$R/src@s1"
+    cap G35_all_volume zfs get -j all "$R/vol"
+    cap G36_all_volume_snapshot zfs get -j all "$R/vol@s1"
+    cap G37_all_bookmark zfs get -j all "$R/src#bm1"
+    cap G38_clone zfs get -j origin,clones,userrefs,type "$R/clone" "$R/src@s1"
+    cap G39_d1 zfs get -j -d 1 -t all type,createtxg "$R/src"
+    cap G40_r_t_snapshot_sorted zfs get -j -r -t snapshot -s local,none createtxg,type "$R/src"
+    cap G41_order_requested zfs get -j zfsb:ff,type,name "$R/src"
+    cap G42_empty_snapshots zfs get -j -r -t snapshot type "$R/empty"
+    cap G43_space_name zfs get -j type,zfsb:ff "$R/sp ace"
+    cap G44_space_snapshot zfs get -j type "$R/sp ace@s p"
+    cap G45_volsize_on_fs zfs get -j volsize,volblocksize,quota "$R/src"
+    cap G46_nonexistent zfs get -j type "$R/nonexistent"
+    cap G47_nonexistent_snapshot zfs get -j type "$R/src@nonexistent"
+    cap G48_bad_property zfs get -j nosuchprop "$R/src"
+    cap G49_bad_property_and_type zfs get -j nosuchprop,type "$R/src"
+    cap G50_one_good_one_missing zfs get -j type "$R/src" "$R/nonexistent"
+    cap G51_noargs zfs get -j
+    cap G52_j_with_H zfs get -j -H type "$R/src"
+    cap G53_json_int zfs get --json-int type,used,creation "$R/src"
+    cap G54_json_long zfs get --json type,used "$R/src"
+    cap G55_json_int_p zfs get -j --json-int -p type,used,creation,createtxg,guid "$R/src"
+    cap G56_bad_option zfs get -j --bogus type "$R/src"
+    cap G57_bad_source zfs get -j -s nosuchsource type "$R/src"
+    cap G58_inherited_mountpoint zfs get -j -r mountpoint,compression,zfsb:nl "$R/src"
+    cap G59_name_type_leads zfs get -j name,type,zfsb:ff "$R/src" "$R/src/aa"
+    cap G60_all_r_snapshot_empty_list zfs get -j -r -t snapshot all "$R/empty"
+    cap G61_all_recv zfs get -j all "$R/recv"
+    cap G62_p_user_recv zfs get -j -p -r "$UP" "$R/recv"
+    end_section
+}
+
+
 # ================================================================ M1 summary: one mechanically parsed line per token
 summarize_m1() {
     [ -d "$OUT/M1" ] || return 0
@@ -2126,6 +2381,7 @@ want M5    && sec_M5
 want M6    && sec_M6
 want M7    && sec_M7
 want M8    && sec_M8
+want M9    && sec_M9
 want Z2    && sec_Z2
 want Z3    && sec_Z3
 want Z4    && sec_Z4

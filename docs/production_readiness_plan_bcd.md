@@ -1722,6 +1722,16 @@ This is a proposal. I edited no files. The baseline is `prod-trust-boundary` wit
   - Feed both `_list` (`:750-802`) and the S3 group iterator, keeping the scope and type checks as defence in depth. Do not use `-p`, so values match the `-H` path.
   - Lazy mode parses the whole document, then yields.
 - **Verify:** a parity test (the same pool read through `-j` and `-H` gives the same objects and rows) on zfsb-zfs24; the fallback on zfsb-zfs21/22; mocked tests from the captured documents.
+- **Decided 2026-10-25: deferred past 1.0, no `-j` code.** The S4a captures (`tests/fixtures/openzfs/*/M9.txt`,
+  section M9 of `scenarios/test_openzfs_matrix.sh`) refute the premise that `-j` is a safer path:
+  1. on 2.1/2.2 `zfs version -j` exits 0 and prints plain text, so a probe must parse stdout, not trust the rc;
+  2. on 2.4.1 `-j` output is silently truncated (rc 0, empty stderr, invalid JSON) at the first value it cannot
+     encode: any `\xff` in every locale, and any non-ASCII value under `LC_ALL=C`, which libzfseasy always sets;
+  3. `--json-int` clamps guids at or above 2^63 to 9223372036854775807;
+  4. there is no equivalent of the `received` column (a `RECEIVED` source shows its value only with
+     `-o received`, and a locally overridden received value is not shown at all);
+  5. a multi-target `-j` call with one missing target prints nothing for the others (rc 1).
+  The only gain would be ASCII values containing a newline or tab, which the `-H` path already refuses fail-closed.
 
 #### 4. Deferred (on purpose)
 - D2(c) `StreamHandle.close(timeout)` / `abort()` (DD7).
