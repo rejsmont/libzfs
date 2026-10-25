@@ -1484,8 +1484,9 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         ambiguous, an invalid property name, a property twice for one object, a name outside the requested objects /
         depth, an object without a valid `type` row, an object whose rows do not start with the rows zfs prints first
         (`name`, `type` for a property list, `type` for `all`: rows forged for the next object would merge into its
-        group, but not without repeating them) and -- in the default (list) mode only -- every object whose rows
-        are not contiguous (zfs prints each object's rows together, so a name that comes back was forged). A lazy
+        group, but not without repeating them; with a property list also an object whose rows are not exactly
+        `name`, `type` and the requested properties, in that order) and -- in the default (list) mode only -- every
+        object whose rows are not contiguous (zfs prints each object's rows together, so a name that comes back was forged). A lazy
         call drops a name that comes back too, but cannot take back the object it already yielded under that name.
         For one value read safely whatever it contains, use `value()`.
         """
@@ -1507,23 +1508,24 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             cls._get_options(recursive=recursive, depth=depth, types=types, properties=properties, datasets=datasets)
         scope = _Scope(datasets, recursive=recursive, depth=depth)
         lead = cls._lead_properties(properties)
+        expected = cls._expected_properties(properties)
 
         if lazy:
-            return cls._lazy_objects(cmd, sources, scope, wanted, lead)
+            return cls._lazy_objects(cmd, sources, scope, wanted, lead, expected)
 
         skips = _SkippedRows('get')
         twice = set()
         result = list(cls._lines_to_objects(cls._exec_lines(cmd), sources, skips=skips, scope=scope, types=wanted,
-                                            twice=twice, lead=lead))
+                                            twice=twice, lead=lead, expected=expected))
         skips.done()
         return [o for o in result if o is not None and o.name not in twice]
 
     @classmethod
-    def _lazy_objects(cls, cmd, sources, scope, wanted, lead=_LEAD_ALL):
+    def _lazy_objects(cls, cmd, sources, scope, wanted, lead=_LEAD_ALL, expected=None):
         skips = _SkippedRows('get')
         try:
             for obj in cls._lines_to_objects(cls._exec_lines(cmd), sources, skips=skips, scope=scope, types=wanted,
-                                             lead=lead):
+                                             lead=lead, expected=expected):
                 if obj is not None:
                     yield obj
         finally:
@@ -1571,7 +1573,8 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         property twice for one object, an object that does not have a valid `type`, and an object whose rows are not
         contiguous (every group of that name is dropped). With an explicit property list a group that contains a
         property that was not requested is dropped as well: a forged copy of a requested property is a duplicate and
-        any other property is unrequested. Everything refused is logged as `get()` does. With `'all'` a value that
+        any other property is unrequested. So is a group whose rows are not exactly `name`, `type` and the
+        requested properties, in that order (zfs prints one row per requested property, in the requested order). Everything refused is logged as `get()` does. With `'all'` a value that
         contains newlines can still forge extra rows inside its own object's group (never another object's). An
         explicit list closes in-group forging only with `received=False`: with the `received` column, the sender's
         raw bytes sit in a column the caller does not read, and a tab in it is refused rather than interpreted.
@@ -1600,15 +1603,15 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             cls._get_options(recursive=recursive, depth=depth, types=types, properties=properties, datasets=datasets)
         scope = _Scope(datasets, recursive=recursive, depth=depth)
         lead = cls._lead_properties(properties)
-        # The properties zfs can print for this call: every one it was asked for, `name` and `type` (the lead rows).
-        allowed = None if 'all' in properties else set(properties) | set(lead)
+        # The exact rows zfs prints for each object for this call: `name`, `type`, then every property asked for.
+        expected = cls._expected_properties(properties)
 
         skips = _SkippedRows('get')
         twice = set()
         kept = []
         dropped = set()
-        for group in cls._groups(cls._exec_lines(cmd), skips, scope=scope, twice=twice, lead=lead, allowed=allowed,
-                                 received=received, exact=received):
+        for group in cls._groups(cls._exec_lines(cmd), skips, scope=scope, twice=twice, lead=lead,
+                                 expected=expected, received=received, exact=received):
             problem = None
             if group.bad:
                 dropped.add(group.name)
@@ -1759,7 +1762,7 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         else:
             # `name,type` lead every object's rows (see `_lead_properties`); drop the caller's own copies (and any
             # other repeat, which zfs would print twice) so that no property appears twice for one object.
-            properties = list(dict.fromkeys(['name', 'type'] + properties))
+            properties = list(GetCommand._expected_properties(properties))
         cmd += [','.join(properties)]
 
         datasets = kwargs.get('datasets', False)
@@ -1767,6 +1770,17 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             cmd += [datasets] if isinstance(datasets, str) else list(datasets)
 
         return cmd
+
+    @staticmethod
+    def _expected_properties(properties) -> Optional[tuple]:
+        """The exact property sequence zfs prints for every object when the call carries an explicit property list
+        (None for `all`, whose expansion is not fixed): `name`, `type`, then the caller's properties in order, each
+        once. This is what `_get_options` puts on the command line, so it is what zfs was asked for; zfs prints one
+        row per requested property, in that order, and nothing else (a user property, a property that does not apply
+        to the type, `written@<snap>` and `userquota@` forms included)."""
+        if 'all' in properties:
+            return None
+        return tuple(dict.fromkeys(['name', 'type'] + list(properties)))
 
     @staticmethod
     def _lead_properties(properties) -> tuple:
@@ -1813,12 +1827,12 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
 
     @staticmethod
     def _groups(lines, skips: _SkippedRows, scope: Optional[Callable[[str], bool]] = None,
-                twice: Optional[set] = None, lead: tuple = _LEAD_ALL, allowed: Optional[set] = None,
-                received: bool = True, exact: bool = False) -> Iterable[_Group]:
+                twice: Optional[set] = None, lead: tuple = _LEAD_ALL, received: bool = True, exact: bool = False,
+                expected: Optional[tuple] = None) -> Iterable[_Group]:
         """Group `zfs get -H` rows by object, applying every check that does not depend on what the caller wants to
         do with the rows: a row that is too short or ambiguous, a name outside `scope`, an invalid property name; and
-        per group the lead rule, contiguity, a property twice, and (with `allowed`, the properties that were
-        requested, `name` and `type` included) a property nobody asked for. A group that fails a check is still
+        per group the lead rule, contiguity, a property twice, and (with `expected`, an explicit property list)
+        a property nobody asked for and the exact sequence of rows. A group that fails a check is still
         yielded, with `bad` set (already reported), so that a caller can name it. A group is yielded when the next
         one starts, so the caller's own warnings keep their order.
 
@@ -1827,17 +1841,39 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         zfs prints next would otherwise merge into its real group, but any forged prefix either does not start with
         the lead rows or repeats them, and the real group's own lead rows then repeat or follow it.
 
+        `expected` (`GetCommand._expected_properties`) is the exact sequence of properties every object's rows must be
+        when the call has an explicit property list: `name`, `type`, then the requested properties in order. A group
+        with one missing, extra or out of order is dropped whole. None (`all`): no such check.
+
         A name that comes back after another object's rows is not contiguous: the group is bad and the name is added
         to `twice`, so a caller holding the whole result can drop the earlier group as well."""
         seen = set()
         group = None
         props_seen = set()
         nrows = 0
+        allowed = set(expected) if expected is not None else None
+        # The properties of the current group's rows, in order, for the exact-sequence check: the rows kept, plus the
+        # property of a row of this object that was skipped (and counted) as unreadable -- a value with a tab or a
+        # newline makes such a row, real zfs prints them, and the object stays as it was before the check existed.
+        sequence = []
+
+        def closed(group):
+            # The exact-sequence check, at the end of a group. It runs last, so the specific refusals (lead, twice,
+            # unrequested) keep their wording and only a group they did not catch is refused here.
+            if expected is not None and not group.bad and tuple(sequence) != expected:
+                skips.skip('the rows of %r are not the %d requested properties in order (got %d rows)'
+                           % (_clip(group.name), len(expected), len(sequence)))
+                group.bad = True
+            return group
+
         for line in lines:
             if not line:
                 continue
             row = GetCommand._split_row(line, skips, received, exact)
             if row is None:
+                cols = line.split('\t')
+                if group is not None and len(cols) >= 2 and cols[0] == group.name:
+                    sequence.append(cols[1])
                 continue
             name, prop, value, received_value, source = row
             if scope is not None and not scope(name):
@@ -1850,11 +1886,12 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
                 continue
             if group is None or name != group.name:
                 if group is not None:
-                    yield group
+                    yield closed(group)
                     seen.add(group.name)
                 group = _Group(name)
                 props_seen = set()
                 nrows = 0
+                sequence = []
                 if name in seen:
                     # zfs prints all of an object's rows together: a name that comes back was forged.
                     if twice is not None:
@@ -1876,26 +1913,25 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
                     skips.skip('property %r of %r was not requested' % (_clip(prop), _clip(name)))
                 group.bad = True
             props_seen.add(prop)
+            sequence.append(prop)
             group.rows.append((prop, value, received_value, source))
             if prop == 'type':
                 group.dstype = value
         if group is not None:
-            yield group
+            yield closed(group)
 
     @staticmethod
     def _lines_to_objects(lines, sources, skips: Optional[_SkippedRows] = None,
                           scope: Optional[Callable[[str], bool]] = None, types: Optional[set] = None,
-                          twice: Optional[set] = None, lead: tuple = _LEAD_ALL) -> Iterable[Optional[ZFS]]:
+                          twice: Optional[set] = None, lead: tuple = _LEAD_ALL,
+                          expected: Optional[tuple] = None) -> Iterable[Optional[ZFS]]:
         """Group `zfs get -H -o name,property,value,received,source` rows into objects. Rows that cannot be trusted
         are skipped (see `GetCommand.__call__`). An object whose rows are not contiguous is never yielded again,
         and its name is added to `twice` so a caller holding the whole result can drop the earlier one as well.
         The checks are those of `_groups`, which `rows()` shares."""
         if skips is None:
             skips = _SkippedRows('get')
-        # Deliberately no `allowed=`: `rows()` drops a group that holds a property nobody requested, but `get()` does
-        # not, until a real-tier check shows zfs never prints a property name other than the one that was requested
-        # (`userquota@`, `written@` forms, aliases, case).
-        for group in GetCommand._groups(lines, skips, scope=scope, twice=twice, lead=lead):
+        for group in GetCommand._groups(lines, skips, scope=scope, twice=twice, lead=lead, expected=expected):
             if group.bad:
                 continue
             properties = {}

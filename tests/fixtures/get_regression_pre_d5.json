@@ -79,7 +79,14 @@
    [
     "Filesystem",
     "bk/ok",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -111,7 +118,14 @@
    [
     "Filesystem",
     "bk/ok",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -231,7 +245,14 @@
    [
     "Filesystem",
     "bk/B",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -263,7 +284,14 @@
    [
     "Filesystem",
     "bk/B",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -359,7 +387,14 @@
    [
     "Filesystem",
     "bk/B",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -391,7 +426,14 @@
    [
     "Filesystem",
     "bk/B",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -487,7 +529,14 @@
    [
     "Filesystem",
     "bk/ok",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -519,7 +568,14 @@
    [
     "Filesystem",
     "bk/ok",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -1293,7 +1349,14 @@
    [
     "Filesystem",
     "bk/C",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -1337,7 +1400,14 @@
    [
     "Filesystem",
     "bk/C",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -2017,70 +2087,6 @@
    "skipped 9 malformed rows of zfs get output in total (the first 5 are logged above)"
   ]
  },
- "no-type-explicit|lazy": {
-  "argv": [
-   "get",
-   "-H",
-   "-o",
-   "name,property,value,received,source",
-   "-r",
-   "-t",
-   "all",
-   "name,type,org.t:v",
-   "bk"
-  ],
-  "objects": [
-   [
-    "Filesystem",
-    "bk/B",
-    []
-   ]
-  ],
-  "skips": [
-   [
-    "get",
-    1,
-    1,
-    0,
-    "no type row for 'bk/A'"
-   ]
-  ],
-  "warnings": [
-   "skipping a row of zfs get output: no type row for 'bk/A'"
-  ]
- },
- "no-type-explicit|list": {
-  "argv": [
-   "get",
-   "-H",
-   "-o",
-   "name,property,value,received,source",
-   "-r",
-   "-t",
-   "all",
-   "name,type,org.t:v",
-   "bk"
-  ],
-  "objects": [
-   [
-    "Filesystem",
-    "bk/B",
-    []
-   ]
-  ],
-  "skips": [
-   [
-    "get",
-    1,
-    1,
-    0,
-    "no type row for 'bk/A'"
-   ]
-  ],
-  "warnings": [
-   "skipping a row of zfs get output: no type row for 'bk/A'"
-  ]
- },
  "snapshot-name-as-filesystem-all|lazy": {
   "argv": [
    "get",
@@ -2161,7 +2167,14 @@
    [
     "Filesystem",
     "bk/ok",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -2193,7 +2206,14 @@
    [
     "Filesystem",
     "bk/ok",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -2851,7 +2871,14 @@
    [
     "Filesystem",
     "bk/B",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -2883,7 +2910,14 @@
    [
     "Filesystem",
     "bk/B",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -2979,7 +3013,14 @@
    [
     "Filesystem",
     "bk/ok",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [
@@ -3011,7 +3052,14 @@
    [
     "Filesystem",
     "bk/ok",
-    []
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
    ]
   ],
   "skips": [

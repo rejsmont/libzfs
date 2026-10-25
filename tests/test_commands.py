@@ -3385,16 +3385,18 @@ class TestGetLinesToObjectsNameChange:
     @pytest.mark.subprocess
     def test_end_to_end_through_get(self, mock_subprocess):
         # (names must be in scope of the requested root: B2 drops rows zfs's own iteration cannot have printed)
-        # (an explicit property list: zfs opens every object with its `name` and `type` rows; `a` has no
-        # `compression` row here, which is all the test needs to see the properties stay with their own object)
+        # (an explicit property list: zfs prints every object's `name`, `type` and each requested property, in that
+        # order; `a`'s `compression` is `default`, which `sources=['local']` filters out in the parser, so the test
+        # still sees the properties stay with their own object)
         mock_subprocess.setup(stdout=[
             'testpool/a\tname\ttestpool/a\t-\t-\n',
             'testpool/a\ttype\tfilesystem\t-\t-\n',
+            'testpool/a\tcompression\toff\t-\tdefault\n',
             'testpool/a/b\tname\ttestpool/a/b\t-\t-\n',
             'testpool/a/b\ttype\tvolume\t-\t-\n',
             'testpool/a/b\tcompression\tgzip\t-\tlocal\n',
         ])
-        result = GetCommand()(Filesystem('testpool/a'), properties='compression', recursive=True)
+        result = GetCommand()(Filesystem('testpool/a'), properties='compression', recursive=True, sources=['local'])
         assert [r.name for r in result] == ['testpool/a', 'testpool/a/b']
         assert result[0]['compression'] is None
         assert result[1]['compression'].value == 'gzip'
@@ -3559,6 +3561,45 @@ class TestListLenientColumns:
         assert fs['atime'].value == 'on'
 
 
+class TestGetExplicitPropertySequence:
+    """An explicit property list is answered with `name`, `type` and each requested property, once, in that order
+    (the full matrix, `rows()` included, is `TestGetExplicitSequence` in tests/test_framing.py)."""
+
+    @staticmethod
+    def _rows(name, props):
+        return ['%s\t%s\t%s\t-\t%s\n' % (name, p, v, s) for p, v, s in
+                [('name', name, '-'), ('type', 'filesystem', '-')] + props]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_the_requested_sequence_with_a_repeat_in_the_request_is_accepted(self, mock_subprocess, lazy):
+        mock_subprocess.setup(stdout=self._rows('testpool/a', [('compression', 'lz4', 'local'),
+                                                               ('atime', 'on', 'default')]))
+        result = list(GetCommand()(Filesystem('testpool/a'), properties=['compression', 'atime', 'compression'],
+                                   lazy=lazy))
+        assert _argv(mock_subprocess)[-2:] == ['name,type,compression,atime', 'testpool/a']
+        assert [(r.name, r['compression'].value, r['atime'].value) for r in result] == [('testpool/a', 'lz4', 'on')]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    @pytest.mark.parametrize('shape,rows', [
+        ('missing', [('compression', 'lz4', 'local')]),
+        ('reordered', [('atime', 'on', 'default'), ('compression', 'lz4', 'local')]),
+        ('unrequested', [('compression', 'lz4', 'local'), ('atime', 'on', 'default'), ('used', '1K', '-')]),
+    ])
+    def test_anything_else_refuses_the_object_and_keeps_its_neighbour(self, mock_subprocess, caplog, lazy, shape, rows):
+        mock_subprocess.setup(stdout=self._rows('testpool/a', rows) + self._rows(
+            'testpool/b', [('compression', 'gzip', 'local'), ('atime', 'off', 'local')]))
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            result = list(GetCommand()(Filesystem('testpool'), properties=['compression', 'atime'], recursive=True,
+                                       lazy=lazy))
+        assert [r.name for r in result] == ['testpool/b']
+        assert result[0]['compression'].value == 'gzip'
+        assert len(_skip_warnings(caplog)) == 1
+
+
 class TestGetSkipsInvalidNames:
 
     @staticmethod
@@ -3627,7 +3668,8 @@ class TestGetSkipsInvalidNames:
         assert [r.name for r in result] == ['pool/a', 'pool/a/c']
         assert [r['compression'].value for r in result] == ['lz4', 'zstd']
         lazy_lines = [line + '\n' for line in
-                      self._rows('pool/a/.system', explicit=True) + self._rows('pool/a/c', 'volume', explicit=True)]
+                      self._rows('pool/a/.system', compression='off', explicit=True) +
+                      self._rows('pool/a/c', 'volume', compression='zstd', explicit=True)]
         mock_subprocess.setup(stdout=lazy_lines)
         lazy = GetCommand()(Filesystem('pool/a'), properties='compression', recursive=True, lazy=True)
         assert [r.name for r in lazy] == ['pool/a/c']
@@ -5128,7 +5170,10 @@ _GET_ROWS = [
     'testpool/filesystem@s\tname\ttestpool/filesystem@s\t-\t-\n',
     'testpool/filesystem@s\ttype\tsnapshot\t-\t-\n',
     'testpool/filesystem@s\tcompression\tlz4\t-\tlocal\n',
+    'testpool/filesystem@s\tquota\t-\t-\t-\n',
 ]
+# What zfs prints for `-o name,type,compression` (D5 follow-up: every requested property, in order, and nothing else).
+_GET_ROWS_COMPRESSION = [r for r in _GET_ROWS if '\tquota\t' not in r]
 
 
 class TestOneShotIterables:
@@ -5183,7 +5228,7 @@ class TestOneShotIterables:
     @pytest.mark.subprocess
     @_ONE_SHOT
     def test_get_one_shot_types_and_the_wanted_filter(self, mock_subprocess, make):
-        mock_subprocess.setup(stdout=list(_GET_ROWS))
+        mock_subprocess.setup(stdout=list(_GET_ROWS_COMPRESSION))
         result = GetCommand()(ds=Filesystem('testpool/filesystem'), properties=['compression'],
                               types=make(['filesystem', 'volume']))
         argv = _argv(mock_subprocess)
@@ -5207,7 +5252,7 @@ class TestOneShotIterables:
     @pytest.mark.subprocess
     @_ONE_SHOT
     def test_get_one_shot_types_lazy(self, mock_subprocess, make):
-        mock_subprocess.setup(stdout=list(_GET_ROWS))
+        mock_subprocess.setup(stdout=list(_GET_ROWS_COMPRESSION))
         result = list(GetCommand()(ds=Filesystem('testpool/filesystem'), properties=['compression'],
                                    types=make(['filesystem']), lazy=True))
         assert '-t' in _argv(mock_subprocess) and 'filesystem' in _argv(mock_subprocess)

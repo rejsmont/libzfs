@@ -1420,9 +1420,9 @@ class TestGetTabRecovery:
     """A value containing tabs shifts the `value,received,source` columns. It is recovered only when exactly one split
     is plausible: received is `-` on a non-received source, or received equals the value."""
 
-    def _get(self, feed, rows, **kw):
+    def _get(self, feed, rows, properties='org.t:v', **kw):
         feed.set(_rows(*(_get_rows('pool/a', explicit=True) + rows)))
-        return GetCommand()(Filesystem('pool/a'), properties='org.t:v', **kw)
+        return GetCommand()(Filesystem('pool/a'), properties=properties, **kw)
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -1464,7 +1464,7 @@ class TestGetTabRecovery:
     def test_the_recovery_never_crosses_into_the_next_row(self, feed):
         """The row is recovered from its own columns only: the neighbours keep their own values."""
         rows = [_row('pool/a', 'compression', 'lz4'), _row('pool/a', 'org.t:v', 'a\tb'), _row('pool/a', 'atime', 'off')]
-        (obj,) = self._get(feed, rows)
+        (obj,) = self._get(feed, rows, properties=['compression', 'org.t:v', 'atime'])
         assert (obj['compression'].value, obj['org.t:v'].value, obj['atime'].value) == ('lz4', 'a\tb', 'off')
 
     @pytest.mark.unit
@@ -1473,7 +1473,8 @@ class TestGetTabRecovery:
         rows = [('pool/a', 'org.t:v', 'v', '-'), ('pool/a', 'org.t:w'), ('pool/a',), ('stray',),
                 _row('pool/a', 'compression', 'lz4')]
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
-            (obj,) = self._get(feed, rows)
+            # zfs printed a row for `org.t:v` and `org.t:w` too; the parser skipped them (they still count in the order)
+            (obj,) = self._get(feed, rows, properties=['org.t:v', 'org.t:w', 'compression'])
         assert obj['org.t:v'] is None and obj['compression'].value == 'lz4'
         assert sum('expected 5 columns' in w for w in _warnings(caplog)) == 4
 
@@ -1540,13 +1541,15 @@ class TestGetObjectRules:
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_no_type_row_drops_the_object_in_an_explicit_list(self, feed, caplog):
-        """An explicit list: a group that is only its `name` row (the `type` row never came) has no type."""
+        """An explicit list: a group that is only its `name` row (the `type` row never came) is not the rows zfs prints
+        (`name`, `type` and every requested property, in order), so it is refused by the exact-sequence check."""
         rows = [_row('pool/a', 'name', 'pool/a', '-', '-')] + _get_rows('pool/b', explicit=True, compression='gzip')
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
             result = self._get(feed, rows, properties='compression')
         assert [o.name for o in result] == ['pool/b']
         assert result[0]['compression'].value == 'gzip'
-        assert any("no type row for 'pool/a'" in w for w in _warnings(caplog))
+        assert any("the rows of 'pool/a' are not the 3 requested properties in order (got 1 rows)" in w
+                   for w in _warnings(caplog))
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -1672,16 +1675,22 @@ class TestGetLeadRule:
         line, and a newline inside a value is simply more lines."""
         return ('\n'.join('\t'.join(r) for r in rows) + '\n').encode('utf-8', 'surrogateescape')
 
-    @staticmethod
-    def _object(name, explicit, dstype='filesystem', **props):
+    @classmethod
+    def _object(cls, name, explicit, dstype='filesystem', fill=True, **props):
+        """One object's rows as zfs prints them. With an explicit list zfs prints a row for EVERY requested property
+        (the call asks for `PROP`), so `PROP` gets a row unless the caller gives its own (`props`) or appends it
+        (`fill=False`)."""
+        if explicit and fill and cls.PROP not in props:
+            props = dict(props, **{cls.PROP: 'val'})
         return _get_rows(name, dstype, explicit=explicit, **props)
 
     def _stream(self, explicit, hostile_value, a_prop=None, b_real_prop=None):
         """A (with the hostile value as its last property) then the real group of B, as one zfs run prints them."""
         a_prop = a_prop or self.PROP
-        a = self._object('bk/A/x', explicit)
+        a = self._object('bk/A/x', explicit, fill=False)
         a.append(('bk/A/x', a_prop, hostile_value, '-', 'local'))
-        b = self._object('bk/B/y', explicit)
+        b = self._object('bk/B/y', explicit, fill=False)
+        b_real_prop = b_real_prop or (self.PROP if explicit else None)      # zfs prints every requested property
         if b_real_prop:
             b.append(('bk/B/y', b_real_prop, 'real', '-', 'local'))
         return self._text(*(a + b))
@@ -1729,9 +1738,9 @@ class TestGetLeadRule:
     @pytest.mark.parametrize('explicit', [True, False], ids=['explicit-list', 'all'])
     def test_the_object_after_the_dropped_one_is_unharmed(self, feed, explicit):
         hostile = 'v\t-\tlocal\nbk/B/y\t%s\tFORGEDCFG' % self.FORGED
-        a = self._object('bk/A/x', explicit) + [('bk/A/x', self.PROP, hostile, '-', 'local')]
+        a = self._object('bk/A/x', explicit, fill=False) + [('bk/A/x', self.PROP, hostile, '-', 'local')]
         b = self._object('bk/B/y', explicit)
-        c = self._object('bk/C/z', explicit) + [('bk/C/z', self.PROP, 'cval', '-', 'local')]
+        c = self._object('bk/C/z', explicit, fill=False) + [('bk/C/z', self.PROP, 'cval', '-', 'local')]
         result = self._get(feed, self._text(*(a + b + c)), explicit)
         assert [o.name for o in result] == ['bk/A/x', 'bk/C/z']
         assert result[1][self.PROP].value == 'cval' and result[1][self.FORGED] is None
@@ -1751,8 +1760,25 @@ class TestGetLeadRule:
             result = self._get(feed, data, explicit, lazy=lazy)
         assert [o.name for o in result] == ['bk/A/x']
         assert result[0][self.FORGED] is None
-        repeated = 'name' if explicit else 'type'                    # the real group repeats its own first row
-        assert any("property %r appears twice for 'bk/B/y'" % repeated in w for w in _warnings(caplog))
+        if explicit:
+            # the forged property is not one that was requested: the group is refused for that, before the real
+            # group's own first row can repeat anything
+            assert any("property %r of 'bk/B/y' was not requested" % self.FORGED in w for w in _warnings(caplog))
+        else:
+            # the real group repeats its own first row
+            assert any("property 'type' appears twice for 'bk/B/y'" in w for w in _warnings(caplog))
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_a_forged_prefix_of_requested_rows_only_is_dropped_as_a_repeat(self, feed, caplog, lazy):
+        """Explicit list, the forged rows are all properties that were asked for: the real group repeats the lead row."""
+        forged = ['bk/B/y\tname\tbk/B/y\t-\t-', 'bk/B/y\ttype\tfilesystem\t-\t-', 'bk/B/y\t%s\tFORGED\t-\tlocal' % self.PROP]
+        data = self._stream(True, 'v\t-\tlocal\n' + '\n'.join(forged))
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            result = self._get(feed, data, True, lazy=lazy)
+        assert [o.name for o in result] == ['bk/A/x']
+        assert any("property 'name' appears twice for 'bk/B/y'" in w for w in _warnings(caplog))
 
     # --- the received-source variant -------------------------------------------------------------------------------
 
@@ -1765,7 +1791,7 @@ class TestGetLeadRule:
         """A received property prints its value twice (`value`, `received`) and zfs shows `received` as the source, so a
         newline in it forges one 6-column row (recovered by the tab rule) and one 4-column row (skipped)."""
         value = 'x\t-\tlocal\nbk/B/y\t%s\tFORGED' % self.FORGED
-        a = self._object('bk/A/x', explicit) + [('bk/A/x', self.PROP, value, value, 'received')]
+        a = self._object('bk/A/x', explicit, fill=False) + [('bk/A/x', self.PROP, value, value, 'received')]
         b = self._object('bk/B/y', explicit)
         data = self._text(*(a + b))
         lines = data.decode().split('\n')
@@ -1932,7 +1958,8 @@ class TestGetLeadRule:
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_end_to_end_with_type_as_the_only_property(self, feed):
-        feed.set(self._text(*(self._object('bk/A/x', True) + self._object('bk/B/y', True, 'volume'))))
+        feed.set(self._text(*(self._object('bk/A/x', True, fill=False) +
+                              self._object('bk/B/y', True, 'volume', fill=False))))
         result = zfs.get(Filesystem('bk'), properties=['type'], recursive=True)
         assert feed.argv == ['get', '-H', '-o', 'name,property,value,received,source', '-r', '-t', 'all', 'name,type', 'bk']
         assert [(type(o), o.name) for o in result] == [(Filesystem, 'bk/A/x'), (Volume, 'bk/B/y')]
@@ -2901,8 +2928,14 @@ _P = 'org.t:v'
 _FORGED_P = 'org.zfsbackup:config'
 
 
-def _obj(name, dstype='filesystem', explicit=False, **props):
-    """The rows of one object, as `_get_rows` (properties as keyword arguments)."""
+def _obj(name, dstype='filesystem', explicit=False, fill=False, **props):
+    """The rows of one object, as `_get_rows` (properties as keyword arguments).
+
+    With an explicit list zfs prints a row for EVERY requested property, in order. `fill=True` adds a `_P` row (the
+    property most of these tests request) unless `props` has one; the tests that request other properties, or that
+    append their own `_P` row, pass their properties explicitly."""
+    if explicit and fill and _P not in props:
+        props = dict(props, **{_P: 'val'})
     return _get_rows(name, dstype, explicit=explicit, **props)
 
 
@@ -2990,13 +3023,15 @@ class TestGetRowsReads:
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_explicit_list_read_has_a_name_row_and_the_requested_properties(self, feed):
-        objs = [_obj('bk', explicit=True, compression='lz4', **{_P: 'x'}), _obj('bk/s@a', 'snapshot', explicit=True)]
+        objs = [_obj('bk', explicit=True, compression='lz4', **{_P: 'x'}),
+                _obj('bk/s@a', 'snapshot', explicit=True, compression='lz4', **{_P: 'y'})]
         _arm(feed, *objs)
         result = zfs.get.rows(Filesystem('bk'), properties=['compression', _P], recursive=True, types='all')
         assert list(result) == [
             GetRow('bk', 'name', 'bk', '-', '-'), GetRow('bk', 'type', 'filesystem', '-', '-'),
             GetRow('bk', 'compression', 'lz4', '-', 'local'), GetRow('bk', _P, 'x', '-', 'local'),
-            GetRow('bk/s@a', 'name', 'bk/s@a', '-', '-'), GetRow('bk/s@a', 'type', 'snapshot', '-', '-')]
+            GetRow('bk/s@a', 'name', 'bk/s@a', '-', '-'), GetRow('bk/s@a', 'type', 'snapshot', '-', '-'),
+            GetRow('bk/s@a', 'compression', 'lz4', '-', 'local'), GetRow('bk/s@a', _P, 'y', '-', 'local')]
         assert result.complete
         assert feed.calls[0][1:] == ['get', '-H', '-o', _GET_COLS, '-r', '-t', 'all', 'name,type,compression,' + _P,
                                      'bk']
@@ -3093,36 +3128,38 @@ class TestGetRowsParity:
 
     @staticmethod
     def _lead(e):
-        a = _obj('bk/A', explicit=e)
+        a = _obj('bk/A', explicit=e, fill=False)
         a.append(('bk/A', _P, 'v\t-\tlocal\nbk/B\t%s\tFORGEDCFG' % _FORGED_P, '-', 'local'))
-        return [a, _obj('bk/B', explicit=e, **{_P: 'real'}), _obj('bk/C', explicit=e)], ['bk/A', 'bk/C'], {'bk/B'}
+        return ([a, _obj('bk/B', explicit=e, **{_P: 'real'}), _obj('bk/C', explicit=e, fill=True)],
+                ['bk/A', 'bk/C'], {'bk/B'})
 
     @staticmethod
     def _contiguity(e):
-        return ([_obj('bk/A', explicit=e, **{_P: '1'}), _obj('bk/B', explicit=e), _obj('bk/A', explicit=e, **{_P: '2'})],
-                ['bk/B'], {'bk/A'})
+        return ([_obj('bk/A', explicit=e, **{_P: '1'}), _obj('bk/B', explicit=e, fill=True),
+                 _obj('bk/A', explicit=e, **{_P: '2'})], ['bk/B'], {'bk/A'})
 
     @staticmethod
     def _duplicate(e):
         a = _obj('bk/A', explicit=e, **{_P: '1'})
         a.append(('bk/A', _P, '2', '-', 'local'))
-        return [a, _obj('bk/B', explicit=e)], ['bk/B'], {'bk/A'}
+        return [a, _obj('bk/B', explicit=e, fill=True)], ['bk/B'], {'bk/A'}
 
     @staticmethod
     def _type_twice(e):
-        a = _obj('bk/A', explicit=e)
+        a = _obj('bk/A', explicit=e, fill=True)
         a.append(('bk/A', 'type', 'snapshot', '-', '-'))
-        return [a, _obj('bk/B', explicit=e)], ['bk/B'], {'bk/A'}
+        return [a, _obj('bk/B', explicit=e, fill=True)], ['bk/B'], {'bk/A'}
 
     @staticmethod
     def _wrong(name, dstype):
         def case(e):
-            return [_obj(name, dstype, explicit=e), _obj('bk/ok', explicit=e)], ['bk/ok'], {name}
+            return ([_obj(name, dstype, explicit=e, fill=True), _obj('bk/ok', explicit=e, fill=True)],
+                    ['bk/ok'], {name})
         return case
 
     @staticmethod
     def _no_type(e):
-        return [[('bk/A', 'name', 'bk/A', '-', '-')], _obj('bk/B', explicit=True)], ['bk/B'], {'bk/A'}
+        return [[('bk/A', 'name', 'bk/A', '-', '-')], _obj('bk/B', explicit=True, fill=True)], ['bk/B'], {'bk/A'}
 
     CASES = {
         'lead-rule': _lead.__func__, 'contiguity': _contiguity.__func__, 'duplicate-property': _duplicate.__func__,
@@ -3147,17 +3184,19 @@ class TestGetRowsParity:
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_an_object_with_no_type_row_is_refused_in_an_explicit_list(self, feed, caplog):
-        """Only the `name` row of the group is there (an explicit list opens with `name`, `type`)."""
+        """Only the `name` row of the group is there (an explicit list opens with `name`, `type`): the group is not
+        the rows zfs prints, so the exact-sequence check refuses it (the warning is `get()`'s, the same on both paths)."""
         objects, kept, dropped = self._no_type(True)
         res = self._both(feed, caplog, objects, True)
         assert _names(res) == kept and res.dropped == frozenset(dropped) and not res.complete
-        assert any("no type row for 'bk/A'" in w for w in _warnings(caplog))
+        assert any("the rows of 'bk/A' are not the 3 requested properties in order (got 1 rows)" in w
+                   for w in _warnings(caplog))
 
     @pytest.mark.unit
     @pytest.mark.subprocess
     @pytest.mark.parametrize('explicit', [True, False], ids=['explicit-list', 'all'])
     def test_a_type_that_was_not_requested_is_refused(self, feed, caplog, explicit):
-        objs = [_obj('bk/A', explicit=explicit), _obj('bk/A@s', 'snapshot', explicit=explicit)]
+        objs = [_obj('bk/A', explicit=explicit, fill=True), _obj('bk/A@s', 'snapshot', explicit=explicit, fill=True)]
         res = self._both(feed, caplog, objs, explicit, types='filesystem')
         assert _names(res) == ['bk/A'] and res.dropped == frozenset({'bk/A@s'}) and not res.complete
 
@@ -3223,7 +3262,7 @@ class TestGetRowsForgedObjects:
         """A forged group for the real `bk/B`, then `bk/C`, then B's real group: the name comes back."""
         a = _obj('bk/A', explicit=explicit)
         a.append(('bk/A', _P, 'v\t-\tlocal\n' + _forged_tail(_obj('bk/B', explicit=explicit)), '-', 'local'))
-        b, c = _obj('bk/B', explicit=explicit, **{_P: 'real'}), _obj('bk/C', explicit=explicit)
+        b, c = _obj('bk/B', explicit=explicit, **{_P: 'real'}), _obj('bk/C', explicit=explicit, fill=True)
         feed.sequence(_get_text(a, c, b), _list_text(a, b, c))
         res = zfs.get.rows(Filesystem('bk'), properties=[_P] if explicit else 'all', recursive=True,
                            verify_names=verify)
@@ -3297,10 +3336,10 @@ class TestGetRowsUnrequested:
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_only_the_requested_and_name_type_are_allowed(self, feed):
-        """The positive side: everything requested, plus `name` and `type`, in any order, is complete."""
+        """The positive side: `name`, `type` and everything requested, in the requested order, is complete."""
         a = _obj('bk/A', explicit=True, compression='lz4', **{_P: 'v'})
         _arm(feed, a)
-        res = zfs.get.rows(Filesystem('bk'), properties=[_P, 'compression'], recursive=True)
+        res = zfs.get.rows(Filesystem('bk'), properties=['compression', _P], recursive=True)
         assert res.complete and [r.property for r in res] == ['name', 'type', 'compression', _P]
 
     @pytest.mark.unit
@@ -3334,7 +3373,7 @@ class TestGetRowsFragments:
     def test_a_stray_fragment_makes_the_result_incomplete_and_names_no_object(self, feed, caplog, explicit):
         a = _obj('bk/A', explicit=explicit)
         a.append(('bk/A', _P, 'v\t-\tlocal\nstray', '-', 'local'))       # zfs prints `stray<TAB>-<TAB>local`
-        b = _obj('bk/B', explicit=explicit)
+        b = _obj('bk/B', explicit=explicit, fill=True)
         data = _get_text(a, b)
         assert b'\nstray\t-\tlocal\n' in data
         feed.sequence(data, _list_text(_obj('bk/A', explicit=explicit), b))
@@ -3820,8 +3859,6 @@ def _regression_corpus():
             corpus['%s-%s' % (case, 'explicit' if explicit else 'all')] = (
                 _get_text(*objects),
                 dict(ds=Filesystem('bk'), properties=[_P] if explicit else 'all', recursive=True))
-    objects, _, _ = TestGetRowsParity._no_type(True)
-    corpus['no-type-explicit'] = (_get_text(*objects), dict(ds=Filesystem('bk'), properties=[_P], recursive=True))
     tabs = _obj('bk/a', explicit=True) + [
         ('bk/a', 'org.t:p0', 'a\tb', '-', 'local'), ('bk/a', 'org.t:p1', 'a\t\tb', '-', 'local'),
         ('bk/a', 'org.t:p2', 'r1\tr2', 'r1\tr2', 'received'), ('bk/a', 'org.t:p3', 'l1\tl2', 'r1\tr2', 'local'),
@@ -3899,7 +3936,16 @@ class TestGetUnchangedByRows:
     tests/fixtures/get_regression_pre_d5.json were produced by the `libzfseasy` of commit 2fbaea0 (before D5) over
     `_regression_corpus()`: objects, properties, sources, received values, every warning, every `_SkippedRows` count
     and the argv. Regenerate only for a deliberate change of `get()`: run `_regression_summary` for both modes over
-    the corpus with the old code and dump the results as JSON."""
+    the corpus with the old code and dump the results as JSON.
+
+    The exact-sequence follow-up to D5 (an explicit property list must come back as `name`, `type` and every
+    requested property, in order) changed the fake bytes of the explicit-list entries: they used to omit the
+    requested `org.t:v` row, which real zfs always prints. Those 16 golden entries were regenerated by running the
+    pre-follow-up `libzfseasy` (HEAD ebbfe80's `zfs.py`) over the completed bytes; the current code gives the
+    identical result, so the `all` entries and every other entry stay byte-identical and the explicit ones still pin
+    "no behaviour change on well-formed output". The one entry whose group is malformed by nature
+    (`no-type-explicit`: only a `name` row) is no longer in the corpus: it is now refused for its sequence, with new
+    wording (`TestGetExplicitSequence`)."""
 
     GOLDEN = _regression_golden()
 
@@ -3978,3 +4024,392 @@ class TestGetRowsReviewFixes:
         assert res.complete and _names(res) == ['bk/A', 'bk/A@s']
         assert feed.calls[0][1:] == ['get', '-H', '-o', _GET_COLS, '-r', '-t', 'all', 'all', 'bk']
         assert feed.calls[1][1:] == ['list', '-H', '-o', 'name,type', '-r', '-t', 'all', 'bk']
+
+
+class TestGetExplicitSequence:
+    """With an explicit property list zfs prints, for every object, a `name` row, a `type` row and then one row per
+    requested property, in the requested order, and nothing else (`TestRealGetRows` proves it on 2.1.5, 2.2.2 and
+    2.4.1). `get()` (list and lazy) and `rows()` refuse an object whose rows are anything else: missing, unrequested,
+    reordered or repeated rows drop the group, whole. `'all'` has no fixed expansion and is not checked.
+
+    One deliberate tolerance: a row zfs printed but the parser skipped (a tab-ambiguous row, or a fragment a newline in
+    a value made) whose first column is the current object's name still counts toward the sequence, so the object is
+    kept with that property absent, as it always was."""
+
+    PATHS = pytest.mark.parametrize('path', ['list', 'lazy', 'rows'])
+    PROPS = ['compression', 'atime']
+
+    @staticmethod
+    def _object(name, dstype='filesystem', **props):
+        """name, type, compression, atime -- as zfs prints them for `properties=PROPS`."""
+        props = dict({'compression': 'lz4', 'atime': 'on'}, **props)
+        return _get_rows(name, dstype, explicit=True, **props)
+
+    @staticmethod
+    def _text(*objects):
+        return _get_text(*objects)
+
+    def _run(self, feed, caplog, path, data, properties=None):
+        """Read `data` through one of the three paths; `(names kept, result, warnings)`. `rows()` runs without the
+        listing so that only the sequence check decides."""
+        feed.set(data)
+        properties = self.PROPS if properties is None else properties
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            if path == 'rows':
+                res = zfs.get.rows(Filesystem('bk'), properties=properties, recursive=True, verify_names=False)
+                names = _names(res)
+            else:
+                res = list(GetCommand()(Filesystem('bk'), properties=properties, recursive=True, lazy=path == 'lazy'))
+                names = [o.name for o in res]
+        return names, res, _warnings(caplog)
+
+    def _refused(self, feed, caplog, path, bad, *, first=True, properties=None):
+        """`bad` (rows of `bk/A`) before or after a good `bk/B`: only B is kept, A is named by `rows()`."""
+        good = self._object('bk/B')
+        objects = (bad, good) if first else (good, bad)
+        names, res, warned = self._run(feed, caplog, path, self._text(*objects), properties)
+        assert names == ['bk/B'], warned
+        if path == 'rows':
+            assert not res.complete and res.skipped == 1 and res.dropped == frozenset({'bk/A'})
+            assert [r.property for r in res] == ['name', 'type', 'compression', 'atime']
+        else:
+            assert res[0]['compression'].value == 'lz4' and res[0]['atime'].value == 'on'
+        assert len([w for w in warned if 'skipping a row of zfs get output' in w]) == 1, warned
+        return warned
+
+    # --- the exact sequence is accepted ----------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('requested', [
+        ['compression', 'atime'], ['compression', 'atime', 'compression'], ['compression', 'type', 'atime'],
+        ['compression', 'atime', 'type', 'atime'],
+    ], ids=['plain', 'repeated', 'type-inside', 'type-and-repeat'])
+    def test_the_exact_sequence_is_accepted(self, feed, caplog, path, requested):
+        """Repeats in the request (and `type`, which leads anyway) are de-duplicated, here and in the `-o` list."""
+        names, res, warned = self._run(feed, caplog, path, self._text(self._object('bk/A'), self._object('bk/B')),
+                                       requested)
+        assert names == ['bk/A', 'bk/B'] and warned == []
+        assert feed.argv[-2:] == ['name,type,compression,atime', 'bk']
+        if path == 'rows':
+            assert res.complete and res.skipped == 0 and res.dropped == frozenset()
+            assert [r.property for r in res if r.name == 'bk/A'] == ['name', 'type', 'compression', 'atime']
+        else:
+            assert [(o['compression'].value, o['atime'].value) for o in res] == [('lz4', 'on')] * 2
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_every_object_type_is_the_same_sequence(self, feed, caplog, path):
+        objects = [self._object('bk'), self._object('bk@s', 'snapshot'), self._object('bk#b', 'bookmark'),
+                   self._object('bk/v', 'volume')]
+        feed.set(self._text(*objects))
+        if path == 'rows':
+            res = zfs.get.rows(Filesystem('bk'), properties=self.PROPS, recursive=True, types='all',
+                               verify_names=False)
+            assert res.complete and _names(res) == ['bk', 'bk@s', 'bk#b', 'bk/v']
+        else:
+            res = list(GetCommand()(Filesystem('bk'), properties=self.PROPS, recursive=True, types='all',
+                                    lazy=path == 'lazy'))
+            assert [o.name for o in res] == ['bk', 'bk@s', 'bk#b', 'bk/v']
+
+    # --- a missing row ---------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('first', [True, False], ids=['bad-first', 'bad-last'])
+    @pytest.mark.parametrize('missing,wording', [
+        ('compression', "the rows of 'bk/A' are not the 4 requested properties in order (got 3 rows)"),
+        ('atime', "the rows of 'bk/A' are not the 4 requested properties in order (got 3 rows)"),
+        ('type', "the rows of 'bk/A' do not start with the 'type' row zfs prints first (got 'compression')"),
+        ('name', "the rows of 'bk/A' do not start with the 'name' row zfs prints first (got 'type')"),
+    ])
+    def test_a_missing_row_refuses_the_object(self, feed, caplog, path, first, missing, wording):
+        bad = [r for r in self._object('bk/A') if r[1] != missing]
+        warned = self._refused(feed, caplog, path, bad, first=first)
+        assert any(wording in w for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_an_object_with_only_its_name_row_is_refused(self, feed, caplog, path):
+        """The `type` row never came (and nothing else): not the sequence zfs prints."""
+        warned = self._refused(feed, caplog, path, [('bk/A', 'name', 'bk/A', '-', '-')])
+        assert any("the rows of 'bk/A' are not the 4 requested properties in order (got 1 rows)" in w for w in warned)
+
+    # --- a row nobody asked for ------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('first', [True, False], ids=['bad-first', 'bad-last'])
+    @pytest.mark.parametrize('where', ['before', 'between', 'after'])
+    @pytest.mark.parametrize('extra', ['used', 'org.other:thing', 'org.zfsbackup:config'])
+    def test_an_unrequested_row_refuses_the_object(self, feed, caplog, path, first, where, extra):
+        rows = self._object('bk/A')
+        at = {'before': 2, 'between': 3, 'after': 4}[where]
+        bad = rows[:at] + [('bk/A', extra, 'FORGED', '-', 'local')] + rows[at:]
+        warned = self._refused(feed, caplog, path, bad, first=first)
+        assert any("property %r of 'bk/A' was not requested" % extra in w for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('repeat', ['name', 'type', 'compression', 'atime'])
+    def test_a_repeated_row_refuses_the_object(self, feed, caplog, path, repeat):
+        rows = self._object('bk/A')
+        bad = rows + [r for r in rows if r[1] == repeat]
+        warned = self._refused(feed, caplog, path, bad)
+        assert any("property %r appears twice for 'bk/A'" % repeat in w for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_an_unrequested_user_property_is_not_tolerated_even_when_set_locally(self, feed, caplog, path):
+        """zfs prints exactly what was asked for: a user property it was not asked for is not zfs's output."""
+        bad = self._object('bk/A') + [('bk/A', 'org.zfsbackup:anchor.d', 'snap', '-', 'local')]
+        self._refused(feed, caplog, path, bad)
+
+    # --- rows in another order ---------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('first', [True, False], ids=['bad-first', 'bad-last'])
+    def test_reordered_requested_rows_refuse_the_object(self, feed, caplog, path, first):
+        name, type_, comp, atime = self._object('bk/A')
+        warned = self._refused(feed, caplog, path, [name, type_, atime, comp], first=first)
+        assert any("the rows of 'bk/A' are not the 4 requested properties in order (got 4 rows)" in w
+                   for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_reordered_lead_rows_are_the_lead_rules_refusal(self, feed, caplog, path):
+        name, type_, comp, atime = self._object('bk/A')
+        warned = self._refused(feed, caplog, path, [type_, name, comp, atime])
+        assert any("do not start with the 'name' row zfs prints first (got 'type')" in w for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_the_order_is_the_requested_order_not_the_alphabetical_or_zfs_property_order(self, feed, caplog, path):
+        requested = ['compression', 'atime']
+        rows = _get_rows('bk/A', explicit=True, atime='on', compression='lz4')          # atime first: not requested so
+        names, res, warned = self._run(feed, caplog, path, self._text(rows), requested)
+        assert names == [] and len(warned) >= 1
+        caplog.clear()
+        names, res, warned = self._run(feed, caplog, path, self._text(rows), ['atime', 'compression'])
+        assert names == ['bk/A'] and warned == []                                        # the same bytes, requested so
+
+    # --- the tolerance: a row zfs printed and the parser skipped ----------------------------------------------------------
+
+    AMBIGUOUS = 'bk/A\tcompression\ta\t-\ta\t-\t-'          # two plausible value/received splits: skipped
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_a_tab_ambiguous_row_of_the_object_keeps_it_without_that_property(self, feed, caplog, path):
+        assert GetCommand._split_row(self.AMBIGUOUS, _SkipCounter()) is None
+        a = self._object('bk/A')
+        lines = [self._text([r]).decode() for r in a]
+        lines[2] = self.AMBIGUOUS + '\n'
+        data = (''.join(lines) + self._text(self._object('bk/B')).decode()).encode()
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/A', 'bk/B']
+        if path == 'rows':
+            assert [r.property for r in res if r.name == 'bk/A'] == ['name', 'type', 'atime']
+            assert not res.complete and res.skipped == 1 and res.dropped == frozenset()
+        else:
+            assert res[0]['compression'] is None and res[0]['atime'].value == 'on'
+            assert res[1]['compression'].value == 'lz4'
+        assert any('ambiguous' in w or 'cannot tell the value from the received column' in w for w in warned)
+        assert not any('requested properties in order' in w for w in warned)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_a_newline_in_a_value_keeps_the_object_without_that_property(self, feed, caplog, path):
+        """`compression` = `head<LF>tail`: zfs prints `bk/A<TAB>compression<TAB>head` (3 columns, the object's own
+        name: counted as its row) and `tail<TAB>-<TAB>local` (another first column: not counted)."""
+        a = self._object('bk/A', compression='head\ntail')
+        data = self._text(a, self._object('bk/B'))
+        assert b'bk/A\tcompression\thead\ntail\t-\tlocal\n' in data
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/A', 'bk/B']
+        if path == 'rows':
+            assert [r.property for r in res if r.name == 'bk/A'] == ['name', 'type', 'atime']
+            assert not res.complete and res.skipped == 2 and res.dropped == frozenset()
+        else:
+            assert res[0]['compression'] is None and res[0]['atime'].value == 'on'
+        assert not any('requested properties in order' in w for w in warned)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('junk', ['bk/B\tatime\tx', 'bk/B\tatime', 'stray', 'other\tz\t-\tlocal', 'bk/AX\tatime\tx'],
+                             ids=['other-name-3-columns', 'other-name-2-columns', 'one-column', 'other-4-columns',
+                                  'name-prefix'])
+    def test_a_skipped_row_of_another_name_does_not_count(self, feed, caplog, path, junk):
+        """A skipped line inside A's rows whose first column is not A (a neighbour's name, a forged fragment, a
+        longer name that starts with A's) is not A's row: A keeps exactly the sequence it has."""
+        a = [self._text([r]).decode() for r in self._object('bk/A')]
+        data = (''.join(a[:3]) + junk + '\n' + a[3] + self._text(self._object('bk/B')).decode()).encode()
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/A', 'bk/B'], warned
+        if path == 'rows':
+            assert [r.property for r in res if r.name == 'bk/A'] == ['name', 'type', 'compression', 'atime']
+            assert not res.complete and res.skipped == 1
+        assert not any('requested properties in order' in w for w in warned)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_a_skipped_row_of_the_object_still_leaves_a_missing_row_missing(self, feed, caplog, path):
+        """The tolerance counts the skipped row once: with it AND no `atime` row, the sequence is still short."""
+        a = [self._text([r]).decode() for r in self._object('bk/A')]
+        data = (''.join(a[:2]) + self.AMBIGUOUS + '\n' + self._text(self._object('bk/B')).decode()).encode()
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/B']
+        assert any("the rows of 'bk/A' are not the 4 requested properties in order (got 3 rows)" in w for w in warned)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_a_fragment_that_starts_with_the_objects_own_name_is_one_row_too_many(self, feed, caplog, path):
+        """Fail closed: `compression` = `v<LF>bk/A` leaves a tail `bk/A<TAB>-<TAB>local`, which looks like another
+        row of A's. A is refused (the fragment of the value counts once, the tail a second time)."""
+        a = self._object('bk/A', compression='v\nbk/A')
+        data = self._text(a)
+        assert b'\nbk/A\t-\tlocal\n' in data
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == []
+        assert any("the rows of 'bk/A' are not the 4 requested properties in order (got 5 rows)" in w
+                   for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_skipped_lines_before_the_first_group_are_ignored(self, feed, caplog, path):
+        data = b'stray\nbk/A\tcompression\n' + self._text(self._object('bk/A'))
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/A']
+        if path == 'rows':
+            assert not res.complete and res.skipped == 2
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_a_skipped_row_does_not_leak_into_the_next_group(self, feed, caplog, path):
+        """B opens after A's ambiguous row: the row was A's, B's own sequence is its own."""
+        a = [self._text([r]).decode() for r in self._object('bk/A')]
+        a[2] = self.AMBIGUOUS + '\n'
+        data = (''.join(a) + self._text(self._object('bk/B')).decode()).encode()
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/A', 'bk/B']
+        if path == 'rows':
+            assert [r.property for r in res if r.name == 'bk/B'] == ['name', 'type', 'compression', 'atime']
+
+    # --- rows(): complete=False on every refusal -----------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('shape', ['missing', 'extra', 'reordered', 'repeated', 'name-only'])
+    @pytest.mark.parametrize('verify', [True, False], ids=['verify', 'no-verify'])
+    def test_rows_is_incomplete_and_names_the_refused_object(self, feed, shape, verify):
+        name, type_, comp, atime = rows = self._object('bk/A')
+        bad = {'missing': [name, type_, comp], 'extra': rows + [('bk/A', 'used', '1', '-', 'local')],
+               'reordered': [name, type_, atime, comp], 'repeated': rows + [comp], 'name-only': [name]}[shape]
+        good = self._object('bk/B')
+        listing = _rows(('bk/A', 'filesystem'), ('bk/B', 'filesystem'))
+        feed.sequence(*([_get_text(bad, good)] + ([listing] if verify else [])))
+        res = zfs.get.rows(Filesystem('bk'), properties=self.PROPS, recursive=True, verify_names=verify)
+        assert _names(res) == ['bk/B']
+        assert not res.complete and res.skipped == 1 and res.dropped == frozenset({'bk/A'})
+        with pytest.raises(ZFSOutputError):
+            feed.sequence(*([_get_text(bad, good)] + ([listing] if verify else [])))
+            zfs.get.rows(Filesystem('bk'), properties=self.PROPS, recursive=True, verify_names=verify, strict=True)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_refused_object_is_not_counted_again_by_the_listing(self, feed):
+        name, type_, comp, atime = self._object('bk/A')
+        bad, good = [name, type_, comp], self._object('bk/B')
+        feed.sequence(_get_text(bad, good), _list_text(self._object('bk/A'), good))
+        res = zfs.get.rows(Filesystem('bk'), properties=self.PROPS, recursive=True)
+        assert res.skipped == 1 and res.dropped == frozenset({'bk/A'}) and _names(res) == ['bk/B']
+
+    # --- the lazy form ----------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_lazy_get_yields_the_good_objects_around_a_refused_one(self, feed, caplog):
+        name, type_, comp, atime = self._object('bk/B')
+        bad = [name, type_, atime, comp]
+        data = self._text(self._object('bk/A'), bad, self._object('bk/C'))
+        feed.set(data)
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            result = GetCommand()(Filesystem('bk'), properties=self.PROPS, recursive=True, lazy=True)
+            assert hasattr(result, '__next__')
+            assert [o.name for o in result] == ['bk/A', 'bk/C']
+        assert sum('requested properties in order' in w for w in _warnings(caplog)) == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_lead_row_of_the_group_after_a_refused_one_is_checked_afresh(self, feed, caplog):
+        """A's sequence is closed when B opens; B's own rows start a new sequence."""
+        a = self._object('bk/A')[:-1]                                      # missing `atime`
+        data = self._text(a, self._object('bk/B'), self._object('bk/C'))
+        names, res, warned = self._run(feed, caplog, 'list', data)
+        assert names == ['bk/B', 'bk/C'] and len(warned) == 1
+
+    # --- `all` is not checked ------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_all_is_unaffected(self, feed, caplog, path):
+        """No fixed expansion: each object carries whatever zfs printed for it, in whatever order."""
+        a = _get_rows('bk/A', compression='lz4', atime='on', **{'org.t:v': 'x'})
+        b = _get_rows('bk/B', 'volume', atime='off', compression='gzip')
+        c = _get_rows('bk/C')
+        names, res, warned = self._run(feed, caplog, path, self._text(a, b, c), 'all')
+        assert names == ['bk/A', 'bk/B', 'bk/C'] and warned == []
+        if path == 'rows':
+            assert res.complete and res.dropped == frozenset()
+            assert [r.property for r in res if r.name == 'bk/A'] == ['type', 'compression', 'atime', 'org.t:v']
+        else:
+            assert res[0]['org.t:v'].value == 'x' and res[1]['compression'].value == 'gzip'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_all_still_refuses_what_it_always_refused(self, feed, caplog):
+        a = _get_rows('bk/A', compression='lz4') + [('bk/A', 'compression', 'off', '-', 'local')]
+        names, res, warned = self._run(feed, caplog, 'list', self._text(a, _get_rows('bk/B')), 'all')
+        assert names == ['bk/B'] and any("property 'compression' appears twice" in w for w in warned)
+
+    # --- the expected sequence itself ---------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('properties,expected', [
+        (['used'], ('name', 'type', 'used')),
+        (['used', 'compression'], ('name', 'type', 'used', 'compression')),
+        (['compression', 'used', 'compression', 'used'], ('name', 'type', 'compression', 'used')),
+        (['type', 'used'], ('name', 'type', 'used')),
+        (['used', 'type', 'name'], ('name', 'type', 'used')),
+        ([], ('name', 'type')),
+        (['type'], ('name', 'type')),
+        (('a:b', 'c:d'), ('name', 'type', 'a:b', 'c:d')),
+        (['all'], None), (['used', 'all'], None), (['all', 'used'], None),
+    ])
+    def test_expected_properties(self, properties, expected):
+        assert GetCommand._expected_properties(properties) == expected
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('properties', [['used'], ['used', 'type', 'used'], ['org.t:v', 'compression'], []])
+    def test_the_dash_o_list_is_the_expected_sequence(self, properties):
+        """What zfs is asked for and what the parser expects back are one definition."""
+        (listed,) = GetCommand._get_options(properties=properties)
+        assert tuple(listed.split(',')) == GetCommand._expected_properties(properties)
