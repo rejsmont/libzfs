@@ -52,6 +52,18 @@ class TestValidate:
         """Test validation of invalid ZFS property sources."""
         with pytest.raises(ValueError):
             Validate.source('invalid')
+
+    @pytest.mark.unit
+    def test_source_invalid_message_says_source_not_type(self):
+        with pytest.raises(ValueError) as exc:
+            Validate.source('bogus')
+        assert str(exc.value) == 'bogus is not a valid ZFS source'
+        assert 'type' not in str(exc.value)
+
+    @pytest.mark.unit
+    def test_type_invalid_message_still_says_type(self):
+        with pytest.raises(ValueError, match='is not a valid ZFS type'):
+            Validate.type('bogus')
     
     @pytest.mark.unit
     def test_dataset_valid(self):

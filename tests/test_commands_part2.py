@@ -2336,6 +2336,27 @@ class TestLoadKeyCommand:
         assert '-a' in call_args
 
     @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_load_key_all_argv_is_exactly_load_key_dash_a(self, mock_subprocess):
+        mock_subprocess.setup()
+        LoadKeyCommand()(None, location=None, recursive=False)
+        assert list(mock_subprocess.call_args[0][0])[1:] == ['load-key', '-a']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_load_key_all_with_a_location_or_recursive_never_runs_zfs(self, mock_subprocess):
+        with pytest.raises(ValueError, match='Key location cannot be explicitly specified when loading all keys'):
+            LoadKeyCommand()(None, location='/etc/key')
+        with pytest.raises(ValueError, match='Recursive cannot be specified when loading all keys'):
+            LoadKeyCommand()(None, recursive=True)
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    def test_load_key_requires_ds_to_be_passed_explicitly(self):
+        with pytest.raises(TypeError):
+            LoadKeyCommand()()
+
+    @pytest.mark.unit
     def test_load_key_all_with_location_raises(self):
         with pytest.raises(ValueError, match='Key location cannot be explicitly specified when loading all keys'):
             LoadKeyCommand()(None, location='/etc/key')
@@ -2377,6 +2398,25 @@ class TestUnLoadKeyCommand:
         UnLoadKeyCommand()(None)
         call_args = mock_subprocess.call_args[0][0]
         assert '-a' in call_args
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_unload_key_all_argv_is_exactly_unload_key_dash_a(self, mock_subprocess):
+        mock_subprocess.setup()
+        UnLoadKeyCommand()(None, recursive=False)
+        assert list(mock_subprocess.call_args[0][0])[1:] == ['unload-key', '-a']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_unload_key_all_with_recursive_never_runs_zfs(self, mock_subprocess):
+        with pytest.raises(ValueError, match='Recursive cannot be specified when unloading all keys'):
+            UnLoadKeyCommand()(None, recursive=True)
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    def test_unload_key_requires_ds_to_be_passed_explicitly(self):
+        with pytest.raises(TypeError):
+            UnLoadKeyCommand()()
 
     @pytest.mark.unit
     def test_unload_key_all_with_recursive_raises(self):
@@ -2508,6 +2548,66 @@ class TestChangeKeyCommand:
         for token in call_args:
             assert token == '-o' or not token.startswith('-o ')
 
+    # `iterations` is the one `-o` value formatted from a number rather than checked by Validate.value ----------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('bad', [0, -1, -200000, '100000', True, False, 1.5, 200000.0, [200000], b'1'],
+                             ids=repr)
+    def test_change_key_iterations_must_be_a_positive_int(self, mock_subprocess, sample_filesystem, bad):
+        mock_subprocess.setup()         # so that a missing check fails the assertion below instead of hanging
+        with pytest.raises(ValueError, match='^Number of pbkdf2 iterations must be a positive integer, got ') as exc:
+            ChangeKeyCommand()(sample_filesystem, iterations=bad)
+        assert str(exc.value).endswith(repr(bad))
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_change_key_iterations_argv_is_exact(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup()
+        ChangeKeyCommand()(sample_filesystem, iterations=200000)
+        assert list(mock_subprocess.call_args[0][0])[1:] == [
+            'change-key', '-o', 'pbkdf2iters=200000', str(sample_filesystem)]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_change_key_iterations_one_is_accepted(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup()
+        ChangeKeyCommand()(sample_filesystem, iterations=1)       # zfs enforces its own minimum
+        assert 'pbkdf2iters=1' in mock_subprocess.call_args[0][0]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_change_key_without_iterations_adds_no_pbkdf2iters(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup()
+        ChangeKeyCommand()(sample_filesystem, iterations=None)
+        assert not any('pbkdf2iters' in a for a in mock_subprocess.call_args[0][0])
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('bad', [0, -1, '100000', True, 1.5], ids=repr)
+    def test_change_key_iterations_are_checked_before_the_inherit_check(self, mock_subprocess, sample_filesystem, bad):
+        """A bad number (0 included) is reported as such, not as "cannot be specified when inheriting"."""
+        mock_subprocess.setup()
+        with pytest.raises(ValueError, match='must be a positive integer'):
+            ChangeKeyCommand()(sample_filesystem, inherit=True, iterations=bad)
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_change_key_inherit_with_valid_iterations_keeps_the_inherit_message(self, mock_subprocess,
+                                                                                sample_filesystem):
+        mock_subprocess.setup()
+        with pytest.raises(ValueError, match='^Number of pbkdf2 iterations cannot be specified when inheriting keys$'):
+            ChangeKeyCommand()(sample_filesystem, inherit=True, iterations=200000)
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_change_key_inherit_with_none_iterations_runs(self, mock_subprocess, sample_filesystem):
+        mock_subprocess.setup()
+        ChangeKeyCommand()(sample_filesystem, inherit=True, iterations=None)
+        assert list(mock_subprocess.call_args[0][0])[1:] == ['change-key', '-i', str(sample_filesystem)]
 
 class TestMountCommandExtended:
 

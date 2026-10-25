@@ -130,7 +130,7 @@ class Validate:
     @staticmethod
     def source(s: str) -> None:
         if s.lower() not in ['local', 'default', 'inherited', 'temporary', 'received', 'all']:
-            raise ValueError(s + ' is not a valid ZFS type')
+            raise ValueError(s + ' is not a valid ZFS source')
 
     @staticmethod
     def propfield(s: str) -> None:

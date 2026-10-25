@@ -323,6 +323,24 @@ class TestRealBookmarkOperations:
             zfs.destroy(fs, destroy=True, recursive=True)
 
 
+    def test_exists_of_a_bookmark_present_and_missing(self, test_pool):
+        """`exists(Bookmark)` goes through `zfs get -H -o value type` (`list` refuses a Bookmark among its roots)."""
+        fs_name = f'{test_pool}/test_bookmark_exists_fs'
+        fs = zfs.create.filesystem(fs_name)
+        try:
+            snap = zfs.snapshot(fs, 'test_snap')
+            bookmark = zfs.bookmark(snap, 'test_bookmark')
+            assert zfs.exists(bookmark) is True
+            assert zfs.exists(Bookmark(fs, 'test_missing')) is False
+            assert zfs.exists(Bookmark(Filesystem(f'{fs_name}_gone'), 'test_bookmark')) is False
+
+            zfs.destroy(bookmark, destroy=True)
+            assert zfs.exists(bookmark) is False
+            assert zfs.exists(snap) is True and zfs.exists(fs) is True
+        finally:
+            zfs.destroy(fs, destroy=True, recursive=True)
+
+
 class TestRealRenameOperations:
     """Test rename operations against real ZFS."""
     

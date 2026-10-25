@@ -64,12 +64,15 @@ _warned_lock = threading.Lock()
 # instead of going quiet for the rest of a long-lived process.
 _WARNED_NAMES_TTL = 3600.0
 _warned_names_since = None
+# Bumped (under the lock) every time `_skip_invalid_name` logs a WARNING, for callers that cannot see its return value.
+_name_warnings = 0
 
 
-def _skip_invalid_name(name: str, error: Exception) -> None:
+def _skip_invalid_name(name: str, error: Exception) -> bool:
     """Log (once per distinct name per `_WARNED_NAMES_TTL`) that a row of zfs output was skipped because its name is
-    one zfs allows but libzfseasy cannot represent."""
-    global _warned_names_since
+    one zfs allows but libzfseasy cannot represent. Returns True when this call logged a WARNING (a new name, one whose
+    TTL expired, or the one-off "too many distinct names" notice), False when the name was already reported."""
+    global _warned_names_since, _name_warnings
     with _warned_lock:
         now = time.monotonic()
         if _warned_names_since is None:
@@ -78,15 +81,19 @@ def _skip_invalid_name(name: str, error: Exception) -> None:
             _warned_names.clear()
             _warned_names_since = now
         if name in _warned_names:
-            return
+            return False
         if len(_warned_names) >= _MAX_WARNED_NAMES:
             if len(_warned_names) == _MAX_WARNED_NAMES:
                 _warned_names.add(None)
+                _name_warnings += 1
                 logger.warning('skipping names from zfs output: more than %d distinct names libzfseasy cannot '
                                'represent; further ones are skipped silently', _MAX_WARNED_NAMES)
-            return
+                return True
+            return False
         _warned_names.add(name)
+        _name_warnings += 1
     logger.warning('skipping %r from zfs output: libzfseasy cannot represent this name (%s)', _clip(name), error)
+    return True
 
 
 # How much of a skipped row (or name) a warning quotes, and how many skipped rows one listing reports one by one before
@@ -112,6 +119,11 @@ class _SkippedRows:
         # summary line), and why the first one was; `list(strict=True)` raises on a non-zero total.
         self.total = 0
         self.first_problem = None
+        # The names zfs printed that libzfseasy cannot represent (reported once per name by `_skip_invalid_name`);
+        # `done()` adds their count to the listing's summary.
+        self.unrepresentable_names = 0
+        # Whether this listing logged a per-name WARNING (see `_skip_invalid_name`), which decides the summary's level.
+        self._name_warned = False
 
     def _remember(self, reason: str, row=None) -> None:
         self.total += 1
@@ -121,6 +133,22 @@ class _SkippedRows:
     def untrusted(self, reason: str, row=None) -> None:
         """Count a row that was skipped (and reported) elsewhere, without logging it again."""
         self._remember(reason, row)
+
+    def unrepresentable(self, name: str, error: Exception, row=None) -> None:
+        """Report (once per name) and count a name zfs allows but libzfseasy cannot represent. It counts toward
+        `total`, like `untrusted`, and toward the "cannot represent" count in the summary of `done()`."""
+        if _skip_invalid_name(name, error):
+            self._name_warned = True
+        self.count_unrepresentable(name, error, row)
+
+    def count_unrepresentable(self, name: str, error=None, row=None, warned: bool = False) -> None:
+        """Count a name libzfseasy cannot represent that was already handled by `_skip_invalid_name`; `warned` says
+        whether that call logged a WARNING."""
+        if warned:
+            self._name_warned = True
+        self.unrepresentable_names += 1
+        self._remember('libzfseasy cannot represent the name' + ('' if error is None else ' (%s)' % _clip(error)),
+                       row if row is not None else name)
 
     def skip(self, reason: str, row=None) -> None:
         self._remember(reason, row)
@@ -135,6 +163,12 @@ class _SkippedRows:
         if self.count > _MAX_ROW_WARNINGS:
             logger.warning('skipped %d malformed rows of zfs %s output in total (the first %d are logged above)',
                            self.count, self.command, _MAX_ROW_WARNINGS)
+        if self.unrepresentable_names:
+            # A name that persists is listed every cycle: WARNING only when this listing also logged a per-name
+            # WARNING (a new name, or one whose dedup TTL expired), otherwise DEBUG, so the hourly dedup holds.
+            logger.log(logging.WARNING if self._name_warned else logging.DEBUG,
+                       'skipped %d name%s libzfseasy cannot represent in zfs %s output',
+                       self.unrepresentable_names, '' if self.unrepresentable_names == 1 else 's', self.command)
 
 
 # The object types a row of `zfs list` / `zfs get` output can have.
@@ -942,8 +976,7 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
         try:
             obj = ZFS.from_name(name, dstype)
         except InvalidNameError as e:
-            _skip_invalid_name(name, e)
-            skips.untrusted('libzfseasy cannot represent the name (%s)' % _clip(e), line)
+            skips.unrepresentable(name, e, line)
             return None, False
         except ValueError as e:
             skips.skip('cannot parse the name (%s)' % _clip(e), line)
@@ -1638,7 +1671,13 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             skips.skip('%s (%r)' % (problem, _clip(name)))
             return None
         try:
-            return GetCommand._build(name, dstype, properties)
+            before = _name_warnings
+            obj = GetCommand._build(name, dstype, properties)
+            if obj is None:
+                # `_build` returns None only for a name libzfseasy cannot represent, and has reported it (or not,
+                # when the name was already reported: the serial says which).
+                skips.count_unrepresentable(name, warned=_name_warnings != before)
+            return obj
         except ValueError as e:
             skips.skip('cannot build %r (%s)' % (_clip(name), _clip(e)))
             return None
@@ -1821,6 +1860,7 @@ class SendCommand(Command):
             return cls.dataset(ds, *args, **kwargs)
         elif isinstance(ds, Snapshot):
             return cls.snapshot(ds, *args, **kwargs)
+        raise ValueError('Expected Dataset or Snapshot, got ' + type(ds).__name__ + ' instead')
 
     @classmethod
     def snapshot(cls, ds: Snapshot, since: Optional[Snapshot] = None, intermediate: bool = False,
@@ -2255,10 +2295,11 @@ class LoadKeyCommand(Command):
         """Load the dataset key
 
         Keyword arguments:
-            ds: Filesystem -- ZFS filesystem to unload the key for, if None,
-                unload keys for all filesystems (default None)
+            ds: Filesystem | None -- ZFS filesystem to load the key for (required). Pass None explicitly to load
+                the keys of all filesystems (`zfs load-key -a`); that cannot be combined with `location` or
+                `recursive`
             location: str -- key location (default None)
-            recursive: bool -- whether to unload keys for all child datasets (default False)
+            recursive: bool -- whether to load keys for all child datasets (default False)
 
         Returns:
             None
@@ -2300,8 +2341,8 @@ class UnLoadKeyCommand(Command):
         """Unload the dataset key
 
         Keyword arguments:
-            ds: Filesystem -- ZFS filesystem to unload the key for, if None,
-                unload keys for all filesystems (default None)
+            ds: Filesystem | None -- ZFS filesystem to unload the key for (required). Pass None explicitly to
+                unload the keys of all filesystems (`zfs unload-key -a`); that cannot be combined with `recursive`
             recursive: bool -- whether to unload keys for all child datasets (default False)
 
         Returns:
@@ -2336,8 +2377,9 @@ class ChangeKeyCommand(Command):
             inherit: bool -- inhherit the key from parent dataset (default False)
             load: bool -- load the key before changing it (default False)
             location: str -- key location (default None)
-            format: str -- key format (default None)
-            iterations: int -- the number of PBKDF2 iterations (default None)
+            fmt: str -- key format, e.g. 'passphrase' or 'raw' (default None)
+            iterations: int -- the number of PBKDF2 iterations, a positive int (default None; zfs enforces its own
+                minimum)
 
         Returns:
             None
@@ -2359,6 +2401,10 @@ class ChangeKeyCommand(Command):
         location = kwargs.get('location', None)
         fmt = kwargs.get('fmt', None)
         iterations = kwargs.get('iterations', None)
+        # The one `-o` value that skips `Validate.value`: it is formatted from a number, so require one.
+        if iterations is not None and (not isinstance(iterations, int) or isinstance(iterations, bool)
+                                       or iterations < 1):
+            raise ValueError('Number of pbkdf2 iterations must be a positive integer, got ' + repr(iterations))
         if kwargs.get('inherit', None):
             if location:
                 raise ValueError('Key location cannot be specified when inheriting keys')

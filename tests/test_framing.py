@@ -1580,7 +1580,7 @@ class TestGetObjectRules:
 
     @pytest.mark.unit
     @pytest.mark.subprocess
-    def test_unrepresentable_name_is_still_skipped_quietly(self, feed):
+    def test_unrepresentable_name_is_skipped_and_the_other_objects_kept(self, feed):
         rows = _get_rows('pool/a') + _get_rows('pool/.system', compression='off') + _get_rows('pool/c')
         assert [o.name for o in self._get(feed, rows)] == ['pool/a', 'pool/c']
 
@@ -2413,3 +2413,467 @@ class TestNeverRaisesOnHostileOutput:
                 if not lazy:
                     assert len({o.name for o in listed}) == len(listed)
                     assert len({o.name for o in got}) == len(got)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# D4: the per-listing summary of names libzfseasy cannot represent
+# ---------------------------------------------------------------------------------------------------------------------
+
+class TestSkippedNamesSummary:
+    """`_SkippedRows.done()` logs "skipped N name(s) libzfseasy cannot represent in zfs <cmd> output". It is a WARNING
+    only when that listing also logged a per-name WARNING (`_skip_invalid_name` returned True: a new name, a name whose
+    dedup TTL expired, or the one-off "more than N distinct names" notice); a name that persists is listed every
+    cycle, so a listing that only met already-reported names says it at DEBUG and the hourly dedup holds."""
+
+    BAD = ['pool/.a', 'pool/.b', 'pool/.c', 'pool/.d']
+
+    @staticmethod
+    def _summaries(caplog, cmd='list'):
+        """`[(level, message)]` of the name summaries, whatever their level."""
+        return [(r.levelno, r.getMessage()) for r in caplog.records if r.name == 'libzfseasy'
+                and r.getMessage().startswith('skipped ') and 'cannot represent in zfs %s output' % cmd in r.getMessage()]
+
+    @staticmethod
+    def _per_name(caplog):
+        return [r.getMessage() for r in caplog.records if r.name == 'libzfseasy' and r.levelno == logging.WARNING
+                and r.getMessage().startswith('skipping ')]
+
+    @staticmethod
+    def _wording(n, cmd='list'):
+        return 'skipped %d name%s libzfseasy cannot represent in zfs %s output' % (n, '' if n == 1 else 's', cmd)
+
+    def _list(self, feed, *names, lazy=False, **kw):
+        feed.set(_rows(*[(n, 'filesystem') for n in names], ('pool/ok', 'filesystem')))
+        return [o.name for o in ListCommand()(lazy=lazy, **kw)]
+
+    def _get(self, feed, *names, lazy=False):
+        rows = [r for n in names for r in _get_rows(n)] + _get_rows('pool/ok')
+        feed.set(_rows(*rows))
+        return [o.name for o in GetCommand()(properties='all', lazy=lazy)]
+
+    # the return value of _skip_invalid_name ----------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_skip_invalid_name_returns_true_only_when_it_logged(self, caplog):
+        err = InvalidNameError('x')
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            assert _skip_invalid_name('pool/.a', err) is True
+            assert _skip_invalid_name('pool/.a', err) is False
+            assert _skip_invalid_name('pool/.b', err) is True
+        assert len(self._per_name(caplog)) == 2
+
+    @pytest.mark.unit
+    def test_skip_invalid_name_returns_true_again_after_the_ttl(self, monkeypatch):
+        err = InvalidNameError('x')
+        assert _skip_invalid_name('pool/.a', err) is True
+        assert _skip_invalid_name('pool/.a', err) is False
+        monkeypatch.setattr(zfs_module, '_warned_names_since', time.monotonic() - zfs_module._WARNED_NAMES_TTL - 1)
+        assert _skip_invalid_name('pool/.a', err) is True
+
+    @pytest.mark.unit
+    def test_skip_invalid_name_overflow_notice_is_true_once(self, monkeypatch, caplog):
+        monkeypatch.setattr(zfs_module, '_MAX_WARNED_NAMES', 1)
+        err = InvalidNameError('x')
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            assert _skip_invalid_name('pool/.a', err) is True      # registered
+            assert _skip_invalid_name('pool/.b', err) is True      # the one-off "more than 1 distinct names" notice
+            assert _skip_invalid_name('pool/.c', err) is False     # silent from now on
+            assert _skip_invalid_name('pool/.d', err) is False
+        assert sum('further ones are skipped silently' in m for m in self._per_name(caplog)) == 1
+
+    @pytest.mark.unit
+    def test_the_warning_serial_moves_with_each_logged_warning(self):
+        err = InvalidNameError('x')
+        before = zfs_module._name_warnings
+        _skip_invalid_name('pool/.a', err)
+        _skip_invalid_name('pool/.a', err)
+        _skip_invalid_name('pool/.b', err)
+        assert zfs_module._name_warnings == before + 2
+
+    # list ----------------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_a_fresh_name_gets_a_per_name_warning_and_a_singular_summary_warning(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            assert self._list(feed, 'pool/.a', lazy=lazy) == ['pool/ok']
+        assert len(self._per_name(caplog)) == 1
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(1))]
+        assert self._wording(1) == 'skipped 1 name libzfseasy cannot represent in zfs list output'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_several_fresh_names_get_a_plural_summary_warning(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, *self.BAD[:3], lazy=lazy)
+        assert len(self._per_name(caplog)) == 3
+        assert self._summaries(caplog) == [(logging.WARNING, 'skipped 3 names libzfseasy cannot represent in zfs list output')]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_a_listing_of_already_reported_names_summarises_at_debug(self, feed, caplog, lazy):
+        self._list(feed, *self.BAD[:2])                                  # reports both
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            assert self._list(feed, *self.BAD[:2], lazy=lazy) == ['pool/ok']
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(2))]
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_summary_is_warning_again_after_the_ttl_expires(self, feed, caplog, monkeypatch):
+        self._list(feed, 'pool/.a')
+        self._list(feed, 'pool/.a')
+        monkeypatch.setattr(zfs_module, '_warned_names_since', time.monotonic() - zfs_module._WARNED_NAMES_TTL - 1)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, 'pool/.a')
+        assert len(self._per_name(caplog)) == 1
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(1))]
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):       # and quiet again right after
+            self._list(feed, 'pool/.a')
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(1))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_mix_of_new_and_deduped_names_warns_and_counts_both(self, feed, caplog):
+        self._list(feed, 'pool/.a')
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, 'pool/.a', 'pool/.b')
+        names = self._per_name(caplog)
+        assert len(names) == 1 and 'pool/.b' in names[0]
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(2))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_overflow_notice_counts_as_a_per_name_warning(self, feed, caplog, monkeypatch):
+        monkeypatch.setattr(zfs_module, '_MAX_WARNED_NAMES', 1)
+        self._list(feed, 'pool/.a')                                      # fills the registry
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, 'pool/.b')                                  # the one-off notice
+        assert any('further ones are skipped silently' in m for m in self._per_name(caplog))
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(1))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_listings_after_the_overflow_notice_are_debug(self, feed, caplog, monkeypatch):
+        monkeypatch.setattr(zfs_module, '_MAX_WARNED_NAMES', 1)
+        self._list(feed, 'pool/.a')
+        self._list(feed, 'pool/.b')                                      # the notice
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, 'pool/.c', 'pool/.d')                       # silent now
+            self._list(feed, 'pool/.a', 'pool/.c')
+        assert self._per_name(caplog) == []
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(2)), (logging.DEBUG, self._wording(2))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_no_unrepresentable_names_no_name_summary(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, lazy=lazy)
+            feed.set(_rows(('pool/a', 'filesystem'), ('pool/x', 'bogus')))     # a malformed row is not a name
+            list(ListCommand()(lazy=lazy))
+        assert self._summaries(caplog) == []
+
+    # strict --------------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_strict_raises_the_same_way_with_a_warning_summary(self, feed, caplog):
+        feed.set(_rows(('pool/.a', 'filesystem'), ('pool/.b', 'filesystem')))
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(Exception) as exc:
+                ListCommand()(strict=True)
+        message = str(exc.value)
+        assert message.startswith('zfs list output could not be trusted: 2 rows skipped, the first: '
+                                  'libzfseasy cannot represent the name (')
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(2))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_strict_still_raises_with_the_same_message_when_the_summary_is_debug(self, feed, caplog):
+        feed.set(_rows(('pool/.a', 'filesystem'), ('pool/.b', 'filesystem')))
+        with pytest.raises(Exception) as first:
+            ListCommand()(strict=True)
+        caplog.clear()
+        feed.set(_rows(('pool/.a', 'filesystem'), ('pool/.b', 'filesystem')))
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(Exception) as again:
+                ListCommand()(strict=True)
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(2))]
+        assert str(again.value) == str(first.value)
+        assert type(again.value) is Exception
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_strict_counts_a_deduped_name_with_a_malformed_row(self, feed, caplog):
+        self._list(feed, 'pool/.a')
+        caplog.clear()
+        feed.set(_rows(('pool/.a', 'filesystem'), ('pool/x', 'bogus'), ('pool/ok', 'filesystem')))
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(Exception, match='2 rows skipped'):
+                ListCommand()(strict=True)
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(1))]
+
+    # get -----------------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_fresh_name_warns_and_summarises_at_warning(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            assert self._get(feed, 'pool/.a', lazy=lazy) == ['pool/ok']
+        assert len(self._per_name(caplog)) == 1
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(1, 'get'))]
+        assert self._wording(1, 'get') == 'skipped 1 name libzfseasy cannot represent in zfs get output'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_plural_summary(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, *self.BAD[:3], lazy=lazy)
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(3, 'get'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_of_already_reported_names_summarises_at_debug(self, feed, caplog, lazy):
+        self._get(feed, 'pool/.a')
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, 'pool/.a', lazy=lazy)
+        assert self._summaries(caplog, 'get') == [(logging.DEBUG, self._wording(1, 'get'))]
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_mix_of_new_and_deduped_warns_and_counts_both(self, feed, caplog, lazy):
+        self._get(feed, 'pool/.a')
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, 'pool/.a', 'pool/.b', lazy=lazy)
+        assert len(self._per_name(caplog)) == 1
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(2, 'get'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_list_reports_then_get_with_the_same_name_is_debug(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, 'pool/.a')
+            self._get(feed, 'pool/.a', lazy=lazy)
+        assert len(self._per_name(caplog)) == 1                      # one registry for both commands
+        assert self._summaries(caplog, 'list') == [(logging.WARNING, self._wording(1, 'list'))]
+        assert self._summaries(caplog, 'get') == [(logging.DEBUG, self._wording(1, 'get'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_reports_then_list_with_the_same_name_is_debug(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, 'pool/.a', lazy=lazy)
+            self._list(feed, 'pool/.a')
+        assert len(self._per_name(caplog)) == 1
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(1, 'get'))]
+        assert self._summaries(caplog, 'list') == [(logging.DEBUG, self._wording(1, 'list'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_get_summary_is_warning_again_after_the_ttl(self, feed, caplog, monkeypatch):
+        self._get(feed, 'pool/.a')
+        monkeypatch.setattr(zfs_module, '_warned_names_since', time.monotonic() - zfs_module._WARNED_NAMES_TTL - 1)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, 'pool/.a')
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(1, 'get'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_overflow_notice_counts_as_a_per_name_warning(self, feed, caplog, monkeypatch, lazy):
+        monkeypatch.setattr(zfs_module, '_MAX_WARNED_NAMES', 1)
+        self._get(feed, 'pool/.a')
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, 'pool/.b', lazy=lazy)                    # the notice
+            self._get(feed, 'pool/.c', lazy=lazy)                    # silent
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(1, 'get')),
+                                                  (logging.DEBUG, self._wording(1, 'get'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_get_without_unrepresentable_names_has_no_name_summary(self, feed, caplog):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed)
+        assert self._summaries(caplog, 'get') == []
+
+    # separate records ----------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_malformed_and_unrepresentable_summaries_are_separate_records(self, feed, caplog):
+        n = _MAX_ROW_WARNINGS + 3
+        feed.set(_rows(*[('pool/bad%d' % i, 'bogus') for i in range(n)], ('pool/.a', 'filesystem'),
+                       ('pool/ok', 'filesystem')))
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            assert [o.name for o in ListCommand()()] == ['pool/ok']
+        malformed = [(r.levelno, r.getMessage()) for r in caplog.records
+                     if r.name == 'libzfseasy' and 'malformed rows' in r.getMessage()]
+        assert malformed == [(logging.WARNING, 'skipped %d malformed rows of zfs list output in total '
+                                               '(the first %d are logged above)' % (n, _MAX_ROW_WARNINGS))]
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(1))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_malformed_summary_stays_a_warning_when_the_names_are_deduped(self, feed, caplog):
+        self._list(feed, 'pool/.a')
+        n = _MAX_ROW_WARNINGS + 1
+        feed.set(_rows(*[('pool/bad%d' % i, 'bogus') for i in range(n)], ('pool/.a', 'filesystem')))
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            ListCommand()()
+        assert any('malformed rows' in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(1))]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# D1: exists() of a Bookmark goes through `zfs get`, everything else through `zfs list`
+# ---------------------------------------------------------------------------------------------------------------------
+
+class TestExistsBookmark:
+    """`list` refuses a Bookmark among its roots, so `exists(Bookmark)` asks `zfs get -H -o value type <bookmark>`."""
+
+    BM = Bookmark(Filesystem('pool/ds'), 'bm')
+    GET_ARGV = ['get', '-H', '-o', 'value', 'type', 'pool/ds#bm']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_present_bookmark_exists_and_asks_for_its_type(self, feed):
+        feed.set(b'bookmark\n')
+        assert zfs.exists(self.BM) is True
+        assert feed.calls and len(feed.calls) == 1
+        assert feed.argv == self.GET_ARGV
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('stdout', [b'-\n', b'', b'\n', b'filesystem\n', b'snapshot\n'],
+                             ids=['dash', 'nothing', 'blank', 'filesystem', 'snapshot'])
+    def test_no_type_means_no_bookmark(self, feed, stdout):
+        """Only a type of exactly 'bookmark' means the bookmark exists: '-', nothing, a blank line and any other
+        value are all False."""
+        feed.set(stdout)
+        assert zfs.exists(self.BM) is False
+        assert feed.argv == self.GET_ARGV
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('stderr', [
+        b"cannot open 'pool/ds#bm': bookmark does not exist\n",
+        b"cannot open 'pool/ds#bm': dataset does not exist\n",
+        b"cannot open 'pool/ds#bm': Dataset Does Not Exist\n",
+    ], ids=['bookmark', 'dataset', 'mixed-case'])
+    def test_does_not_exist_from_zfs_is_false(self, feed, stderr):
+        feed.set(b'', stderr=stderr, returncode=1)
+        assert zfs.exists(self.BM) is False
+        assert feed.argv == self.GET_ARGV
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_missing_bookmark_on_an_existing_dataset_is_false(self, feed):
+        """What `zfs get -H -o value type pool/ds#missing` really prints when `pool/ds` exists (identical on OpenZFS
+        2.1.5, 2.2.2 and 2.4.1) is "no such pool or dataset", not "does not exist"; the live equivalent is
+        tests/test_real_zfs.py::TestRealBookmarkOperations::test_exists_of_a_bookmark_present_and_missing."""
+        feed.set(b'', stderr=b"cannot open 'pool/ds#missing': no such pool or dataset\n", returncode=1)
+        assert zfs.exists(Bookmark(Filesystem('pool/ds'), 'missing')) is False
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('stderr', [
+        b"cannot open 'pool/ds#bm': permission denied\n",
+        b"cannot open 'pool/ds#bm': pool I/O is currently suspended\n",
+        b'',
+    ], ids=['permission', 'suspended', 'no-stderr'])
+    def test_any_other_failure_is_reraised(self, feed, stderr):
+        feed.set(b'', stderr=stderr, returncode=1)
+        with pytest.raises(Exception) as exc:
+            zfs.exists(self.BM)
+        assert 'does not exist' not in str(exc.value).lower()
+        assert type(exc.value) is Exception
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_name_that_says_does_not_exist_does_not_make_another_failure_false(self, feed):
+        """zfs quotes the object name, which its creator chose: "does not exist" inside the quotes is not zfs's reason.
+        Validate refuses spaces in a bookmark name, so the hostile stderr is constructed rather than produced."""
+        feed.set(b'', stderr=b"cannot open 'pool/ds#x does not exist': permission denied\n", returncode=1)
+        with pytest.raises(Exception, match='permission denied'):
+            zfs.exists(Bookmark(Filesystem('pool/ds'), 'x'))
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_genuine_no_such_pool_or_dataset_is_false(self, feed):
+        feed.set(b'', stderr=b"cannot open 'pool/ds#x': no such pool or dataset\n", returncode=1)
+        assert zfs.exists(Bookmark(Filesystem('pool/ds'), 'x')) is False
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_message_without_the_separator_is_judged_whole(self, feed):
+        feed.set(b'', stderr=b"dataset does not exist\n", returncode=1)
+        assert zfs.exists(self.BM) is False
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_path_does_not_match_the_quoted_name(self, feed):
+        feed.set(b'', stderr=b"cannot open 'pool/dataset does not exist': permission denied\n", returncode=1)
+        with pytest.raises(Exception, match='permission denied'):
+            zfs.exists(Filesystem('pool/ds'))
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_path_matches_the_reason_after_the_quoted_name(self, feed):
+        feed.set(b'', stderr=b"cannot open 'pool/x': dataset does not exist\n", returncode=1)
+        assert zfs.exists(Filesystem('pool/x')) is False
+
+    @pytest.mark.unit
+    def test_the_package_does_not_export_bookmark(self):
+        """`Bookmark` is imported as `_Bookmark` for exists(); it is not part of the public API."""
+        assert not hasattr(zfs, 'Bookmark')
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('ds,dstype', [
+        pytest.param(Filesystem('pool/ds'), 'filesystem', id='Filesystem'),
+        pytest.param(Snapshot(Filesystem('pool/ds'), 's'), 'snapshot', id='Snapshot'),
+    ])
+    def test_datasets_and_snapshots_keep_the_list_path(self, feed, ds, dstype):
+        feed.set(_rows((str(ds), dstype)))
+        assert zfs.exists(ds) is True
+        assert len(feed.calls) == 1 and feed.calls[0][1] == 'list'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('name', ['pool/ds', 'pool/ds#bm'], ids=['str', 'str-with-hash'])
+    def test_a_str_keeps_the_list_path_which_refuses_it_before_zfs_runs(self, feed, name):
+        """A str is not routed to `get` even when it contains '#': `list(roots=)` rejects it, as it always did."""
+        feed.set(_rows((name, 'filesystem')))
+        with pytest.raises(ValueError, match='got str instead'):
+            zfs.exists(name)
+        assert feed.calls == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_filesystem_still_answers_true_and_false(self, feed):
+        feed.set(_rows(('pool/ds', 'filesystem')))
+        assert zfs.exists(Filesystem('pool/ds')) is True
+        feed.set(b'', stderr=b"cannot open 'pool/ds': dataset does not exist\n", returncode=1)
+        assert zfs.exists(Filesystem('pool/ds')) is False

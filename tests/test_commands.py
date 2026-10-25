@@ -571,6 +571,32 @@ class TestSendCommand:
         call_args = mock_subprocess.call_args[0][0]
         assert '-i' in call_args
 
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('bad,typename', [
+        pytest.param('testpool/fs@snap', 'str', id='str'),
+        pytest.param(None, 'NoneType', id='None'),
+        pytest.param(Bookmark(Filesystem('testpool/fs'), 'bm'), 'Bookmark', id='Bookmark'),
+        pytest.param(5, 'int', id='int'),
+    ])
+    def test_send_refuses_anything_but_a_dataset_or_snapshot(self, mock_subprocess, bad, typename):
+        for send in (SendCommand(), SendCommand._send):
+            with pytest.raises(ValueError) as exc:
+                send(bad)
+            assert str(exc.value) == 'Expected Dataset or Snapshot, got %s instead' % typename
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_send_still_dispatches_a_dataset_and_a_snapshot(self, mock_subprocess, sample_filesystem, sample_snapshot):
+        process_mock = MagicMock()
+        process_mock.stdout.peek.return_value = b'ZFS_DATA'
+        process_mock.poll.return_value = None
+        mock_subprocess.return_value = process_mock
+        assert SendCommand()(sample_filesystem, since=None) is not None
+        assert SendCommand()(sample_snapshot) is not None
+        assert mock_subprocess.call_count == 2
+
 
 class TestReceiveCommand:
     """Tests for ReceiveCommand class."""
@@ -2655,22 +2681,35 @@ class TestGetSkipsInvalidNames:
 
 
 class TestSkipInvalidNameWarning:
-    """One WARNING per distinct name per process on the 'libzfseasy' logger, bounded by _MAX_WARNED_NAMES."""
+    """One per-name WARNING per distinct name per process on the 'libzfseasy' logger, bounded by _MAX_WARNED_NAMES.
+
+    A listing that logged a per-name WARNING also logs one summary line ("skipped N name(s) libzfseasy cannot
+    represent in zfs <cmd> output"); these tests count the per-name records, so `_names_only` drops the summary."""
 
     @staticmethod
     def _list(mock_subprocess, *names):
         mock_subprocess.setup(stdout=[n + '\tfilesystem\n' for n in names] + ['pool/ok\tfilesystem\n'])
         return ListCommand()()
 
+    @staticmethod
+    def _names_only(caplog):
+        return [m for m in _skip_warnings(caplog) if not m.startswith('skipped ')]
+
+    @staticmethod
+    def _summaries(caplog, level=logging.WARNING):
+        return [r.getMessage() for r in caplog.records
+                if r.name == 'libzfseasy' and r.levelno == level and r.getMessage().startswith('skipped ')]
+
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_message_names_the_row_and_the_reason(self, mock_subprocess, warned_names, caplog):
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
             self._list(mock_subprocess, 'pool/.system')
-        (message,) = _skip_warnings(caplog)
+        (message,) = self._names_only(caplog)
         assert 'skipping' in message
         assert 'pool/.system' in message
         assert 'cannot represent' in message
+        assert self._summaries(caplog) == ['skipped 1 name libzfseasy cannot represent in zfs list output']
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -2679,17 +2718,19 @@ class TestSkipInvalidNameWarning:
             self._list(mock_subprocess, 'pool/.system')
             self._list(mock_subprocess, 'pool/.system')
             self._list(mock_subprocess, 'pool/.system')
-        assert len(_skip_warnings(caplog)) == 1
+        assert len(self._names_only(caplog)) == 1
+        assert len(self._summaries(caplog)) == 1        # the repeats are summarised at DEBUG
 
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_distinct_names_each_warn(self, mock_subprocess, warned_names, caplog):
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
             self._list(mock_subprocess, 'pool/.system', 'pool/-x', 'pool/a ')
-        messages = _skip_warnings(caplog)
+        messages = self._names_only(caplog)
         assert len(messages) == 3
         for name in ('pool/.system', 'pool/-x', 'pool/a '):
             assert sum(name in m for m in messages) == 1
+        assert self._summaries(caplog) == ['skipped 3 names libzfseasy cannot represent in zfs list output']
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -2697,7 +2738,7 @@ class TestSkipInvalidNameWarning:
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
             self._list(mock_subprocess, 'pool/.system')
             list(GetCommand._lines_to_objects(iter(['pool/.system\ttype\tfilesystem\t-\t-']), ['all']))
-        assert len(_skip_warnings(caplog)) == 1
+        assert len(self._names_only(caplog)) == 1
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -2714,13 +2755,15 @@ class TestSkipInvalidNameWarning:
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
             self._list(mock_subprocess, 'pool/.a', 'pool/.b', 'pool/.c', 'pool/.d')
             self._list(mock_subprocess, 'pool/.e', 'pool/.a')
-        messages = _skip_warnings(caplog)
+        messages = self._names_only(caplog)
         assert sum('pool/.a' in m for m in messages) == 1
         assert sum('pool/.b' in m for m in messages) == 1
         assert not any(n in m for m in messages for n in ('pool/.c', 'pool/.d', 'pool/.e'))
         assert sum('further ones are skipped silently' in m for m in messages) == 1
         assert len(messages) == 3
         assert len(warned_names._warned_names) <= 3      # two names plus the one overflow sentinel
+        # The first listing logged per-name WARNINGs (and counts all four of its names); the second logged none.
+        assert self._summaries(caplog) == ['skipped 4 names libzfseasy cannot represent in zfs list output']
 
 
 class TestListNewNativeProperties:
@@ -4049,6 +4092,16 @@ class TestDestroyEmptySnapshotList:
     def test_the_lazy_form_raises_at_the_call_not_at_the_first_next(self, mock_subprocess):
         with pytest.raises(ValueError):
             DestroyCommand.snapshots([], destroy=True, lazy=True)       # no iteration needed
+        assert mock_subprocess.call_count == 0
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['eager', 'lazy'])
+    def test_an_empty_generator_is_refused_like_an_empty_list(self, mock_subprocess, lazy):
+        with pytest.raises(ValueError, match='at least one'):
+            DestroyCommand.snapshots((s for s in []), destroy=True, lazy=lazy)
+        with pytest.raises(ValueError, match='at least one'):
+            DestroyCommand.snapshots(iter(()), destroy=True, lazy=lazy)
         assert mock_subprocess.call_count == 0
 
     @pytest.mark.unit
