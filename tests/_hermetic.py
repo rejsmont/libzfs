@@ -37,6 +37,7 @@ Helpers:
 """
 
 import atexit
+import calendar
 import os
 import shutil
 import sys
@@ -229,6 +230,15 @@ def register_fork_recorder(directory: str) -> None:
 # --------------------------------------------------------------------------
 
 
+def _lstart_epoch(text: str) -> float:
+    """Epoch seconds of a `ps -o lstart=` stamp (`Sat Oct 25 02:50:11 2026`).
+
+    `_process_table` runs `ps` with TZ=UTC, so the stamp is UTC and `calendar.timegm` reads it
+    as such. `time.mktime` would read it as LOCAL time, which on a DST fall-back night is
+    ambiguous for an hour (tm_isdst=-1) and can be an hour off. Raises ValueError."""
+    return float(calendar.timegm(time.strptime(text, "%a %b %d %H:%M:%S %Y")))
+
+
 def _process_table():
     """{pid: (ppid, state, started_epoch_or_None, text)} for every process we can see.
     `text` holds the process environment when the platform lets us read it
@@ -268,6 +278,8 @@ def _process_table():
         out = subprocess.run(
             [ps, "-axww", "-E", "-o", "pid=,ppid=,stat=,lstart=,command="],
             capture_output=True, text=True, timeout=30,
+            # lstart is printed in the zone of ps's own environment: pin it to UTC
+            env={**os.environ, "TZ": "UTC"},
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return rows
@@ -276,7 +288,7 @@ def _process_table():
         if len(parts) < 9 or not parts[0].isdigit() or not parts[1].isdigit():
             continue
         try:
-            started = time.mktime(time.strptime(" ".join(parts[3:8]), "%a %b %d %H:%M:%S %Y"))
+            started = _lstart_epoch(" ".join(parts[3:8]))
         except ValueError:
             started = None
         rows[int(parts[0])] = (int(parts[1]), parts[2], started, parts[8])

@@ -17,6 +17,7 @@ The leaks are staged in nested pytest sessions (`_leak_probe.py`) started with
 """
 
 import os
+import calendar
 import re
 import signal
 import subprocess
@@ -274,6 +275,72 @@ class TestOrphanSafetyNet:
         done = pytest_with_conftest(clean)
         assert done.returncode == 0, done.stdout + done.stderr
         assert "LEAKED PROCESSES" not in done.stdout + done.stderr
+
+@pytest.fixture
+def local_zone(monkeypatch):
+    """Run with a DST local zone (`local_zone("Europe/Warsaw")`), restoring the process zone after."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is not available")
+
+    def use(name):
+        monkeypatch.setenv("TZ", name)
+        time.tzset()
+
+    yield use
+    monkeypatch.undo()
+    time.tzset()
+
+
+class TestStartTimesAreTimezoneIndependent:
+    """`ps -o lstart=` is local time; on a DST fall-back night the local hour 02:00-03:00 occurs
+    twice, so reading it with `mktime` can be an hour off and the fork-record check then
+    misclassifies a real orphan as a recycled pid. Start times are read as UTC instead."""
+
+    #: 2026-10-25 is the Europe/Warsaw fall-back night: 02:30 is ambiguous (CEST and CET)
+    STAMP = "Sun Oct 25 02:30:00 2026"
+    UTC_EPOCH = calendar.timegm((2026, 10, 25, 2, 30, 0))
+
+    @pytest.mark.parametrize("zone", ["Europe/Warsaw", "America/New_York", "Asia/Kolkata", "UTC"])
+    def test_an_ambiguous_local_stamp_is_read_as_utc(self, local_zone, zone):
+        local_zone(zone)
+        assert _hermetic._lstart_epoch(self.STAMP) == self.UTC_EPOCH
+
+    def test_the_old_local_time_reading_really_differs_here(self, local_zone):
+        """Guards the test above: in this zone `mktime` does NOT give the UTC reading."""
+        local_zone("Europe/Warsaw")
+        local = time.mktime(time.strptime(self.STAMP, "%a %b %d %H:%M:%S %Y"))
+        assert local != self.UTC_EPOCH
+
+    @pytest.mark.skipif(os.path.isdir("/proc/self"), reason="Linux reads /proc, not ps")
+    def test_ps_runs_in_utc_and_its_stamps_are_read_as_utc(self, local_zone, monkeypatch):
+        local_zone("Europe/Warsaw")
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["env"] = kwargs.get("env")
+            line = f"  4242     1 S    {self.STAMP} ZFSB_TEST_SESSION=x sleep 99\n"
+            return subprocess.CompletedProcess(argv, 0, stdout=line, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        table = _hermetic._process_table()
+        assert (seen["env"] or {}).get("TZ") == "UTC"
+        assert table[4242][2] == self.UTC_EPOCH
+
+    def test_a_fork_record_made_after_the_start_finds_the_orphan_in_a_dst_zone(self, tmp_path, local_zone):
+        """End to end in the ambiguous-hour zone: the fork record is trusted."""
+        local_zone("Europe/Warsaw")
+        records = tmp_path / "forks"
+        records.mkdir()
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        try:
+            time.sleep(1.2)
+            (records / str(child.pid)).write_text("")
+            found = find_orphans(uuid.uuid4().hex, grace=0, fork_dir=str(records), root_pid=os.getpid() + 100000)
+            assert child.pid in [row[0] for row in found]
+        finally:
+            child.kill()
+            child.wait()
+
 
 class TestSessionMarker:
     def test_a_fresh_marker_is_minted_and_exported(self):
