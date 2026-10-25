@@ -73,10 +73,11 @@
 #      harness, for what a client cannot do) plants `\n`/`\t` forged `zfs list -H` rows in org.zfsbackup:* values, trying to
 #      make the server's pruner apply a keep-only-the-newest retention to A's dataset and to datasets outside the target:
 #        L1a   end to end over mTLS: raw `zfs set` on B's dataset (libzfseasy refuses the same values), a full and an
-#              incremental -p stream; the server holds its own LOCAL canonical values (it passes them to the receive
-#              with `-o`, never `-x`), and the `received` column of config/client_id/source_dataset is "-" (asserted
-#              with `zfs get -o received`: `-s received` cannot see a received value hidden under a local one); the
-#              pruner runs >= 4 cycles, A and the outside datasets are identical by name and guid
+#              incremental -p stream; the server holds its own LOCAL canonical values (client_id, source_dataset and
+#              config go to the receive as `-o`), and the client's sent value survives as a HIDDEN `received` value under
+#              the local one: asserted on the `received` column (`zfs get -o property,value,received,source`) to be the
+#              very value B sent - `-s received` cannot see a received value hidden under a local one, so it proves
+#              nothing here; the pruner runs >= 4 cycles, A and the outside datasets are identical by name and guid
 #        L1b   hostile /negotiate bodies with B's certificate are 400 and write nothing; S-5: 426 without or with a wrong
 #              X-Zfsbackup-Protocol; S-4: /config, /datasets, /datasets/<n>/snapshots are 404
 #        L1c   forged LOCAL values planted on the server (row-forging config and client id, A's id on a dataset in B's tree,
@@ -2091,7 +2092,9 @@ l1_wait_cycles() { # l1_wait_cycles <mark> <n> <timeout>
 l1_sprop()     { msh "$SERVER_VM" "zfs get -H -o value -s $3 '$2' '$1' 2>/dev/null" | head -c 4000; }
 l1_sprop_ln()  { msh "$SERVER_VM" "zfs get -H -o value -s $3 '$2' '$1' 2>/dev/null | wc -l" | tr -d '[:space:]'; }
 # the RECEIVED column of a property ("-" when the stream carried none), whatever the property's current source
-l1_rcvd()      { msh "$SERVER_VM" "zfs get -H -o received '$2' '$1' 2>/dev/null | head -c 400" | tr -d '\r\n'; }
+l1_rcvd()      { msh "$SERVER_VM" "zfs get -H -o received '$2' '$1' 2>/dev/null | head -c 4000" | tr -d '\r\n'; }
+# a client dataset's LOCAL value (what a `send -p` stream carries), newlines dropped like l1_rcvd's
+l1_clientval() { msh "$CLIENT_VM" "zfs get -H -o value -s local '$2' '$1' 2>/dev/null | head -c 4000" | tr -d '\r\n'; }
 # decode a server dataset's local org.zfsbackup:config to a python expression over the JSON (d)
 l1_cfg_expr()  { msh "$SERVER_VM" "zfs get -H -o value -s local org.zfsbackup:config '$1' | base64 -d 2>/dev/null | '$PY' '$JGET_PY' '$2'" | tr -d '\r'; }
 # raw probe: l1_probe <cert-base|none> <METHOD> <path> <proto-header-value|-> [json body]  (probe() always sends protocol 1)
@@ -2321,11 +2324,16 @@ EOF
         for p in config client_id source_dataset; do
             # What counts is the EFFECTIVE value: its source is LOCAL (the server's own, passed with `receive -o`). `-s received` lists only
             # properties whose source is received and cannot see a received value hidden under a local one; the `received` COLUMN can.
-            # Verified on OpenZFS 2.4: `-o` does NOT stop a `send -p` stream's own value from being recorded in that column, it only
-            # overrides it ("hidden"). It is inert while nothing runs `zfs inherit` on the property (that would bring it back):
-            # reported as a finding, shown here as information, not asserted.
-            check "($1) the effective org.zfsbackup:$p is a LOCAL value (the server's, not the stream's)" "local" "$(msh "$SERVER_VM" "zfs get -H -o source org.zfsbackup:$p '$L1_B_DS'" | tr -d '[:space:]')"
-            info "($1) received column of org.zfsbackup:$p (hidden under the local value): $(l1_rcvd "$L1_B_DS" org.zfsbackup:$p | cut -c1-60)"
+            # `-o` does NOT stop a `send -p` stream's own value from being recorded in that column, it only overrides it
+            # ("hidden"): EXPECTED, and inert while nothing runs `zfs inherit` on the property (that would bring it back; the
+            # client's sent values survive as hidden received values under the server's locals). So assert on the columns:
+            # the source is LOCAL, the value is the server's, and the received column holds exactly what B sent (a non-"-" value
+            # that `-s received` would never have listed).
+            row="$(msh "$SERVER_VM" "zfs get -H -o property,source org.zfsbackup:$p '$L1_B_DS'" | tr -d '\r' | tr '\t' ' ')"
+            check "($1) the effective org.zfsbackup:$p is a LOCAL value (the server's, not the stream's)" "org.zfsbackup:$p local" "$row"
+            check "($1) org.zfsbackup:$p: the RECEIVED column holds B's sent value, hidden under the local one (expected)" \
+                "$(l1_clientval "$L1_B_SRC" org.zfsbackup:$p)" "$(l1_rcvd "$L1_B_DS" org.zfsbackup:$p)"
+            info "($1) org.zfsbackup:$p value/received/source: $(msh "$SERVER_VM" "zfs get -H -o value,received,source org.zfsbackup:$p '$L1_B_DS'" | tr -d '\r\n' | tr '\t' '|' | cut -c1-120)"
         done
     }
     l1_check_b_dataset "L1a-1"
