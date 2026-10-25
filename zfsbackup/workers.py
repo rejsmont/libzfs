@@ -43,10 +43,10 @@ import time
 from abc import abstractmethod
 from multiprocessing import Process
 from multiprocessing.synchronize import Event
-from typing import List, Optional, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
-from zfsbackup import logsetup, procident
-from zfsbackup.backup_manager import DatasetInfo, DatasetManager
+from zfsbackup import health, logsetup, procident
+from zfsbackup.backup_manager import DatasetInfo, DatasetManager, PruneResult
 from zfsbackup.config import BackupConfig
 from zfsbackup.stopflag import STOP_POLL, ReloadEpoch, StopFlag
 
@@ -418,6 +418,17 @@ class _SupervisorWatch:
 class BaseWorker(_SupervisorWatch, Process):
     """Base class for daemon worker processes with a shared polling loop."""
 
+    #: Class-level defaults so a worker built without `__init__` (or before
+    #: `run()`) records nothing; see `__init__`.
+    _status_dir = None
+    _status: Optional[health.StatusWriter] = None
+    #: Write any unwritten outcome before each dataset is processed (not only
+    #: at the rate-limited cadence): a dataset can take hours to stream, and an
+    #: outcome held in memory meanwhile is lost to a kill. Costs one write per
+    #: dataset after one that recorded something, so a worker that records for
+    #: every dataset and has very many of them turns it off.
+    _FLUSH_BEFORE_DATASET = True
+
     def __init__(
         self,
         worker_name: str,
@@ -428,6 +439,7 @@ class BaseWorker(_SupervisorWatch, Process):
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
+        status_dir=None,
     ):
         """`config` is the supervisor's detached `BackupConfig`, with
         `--dry-run` already applied. It is used as is; the worker never
@@ -438,12 +450,19 @@ class BaseWorker(_SupervisorWatch, Process):
         `WORKER_EXIT_RELOAD` at its next safe point once the shared epoch
         differs from `born_epoch` (`None` = never). `workers_lock`: path of
         `<db>.workers.lock` to hold `LOCK_SH` on while running (`None` = none).
+        `status_dir` is `<db>.status` (`daemon.Handoff.status_dir`; `None` =
+        record no outcomes, as under `--dry-run`): the worker writes its own
+        `<worker>.json` there (S-7, `health.StatusWriter`).
         """
         super().__init__(name=worker_name, daemon=True)
         self.config = config
         self.stop_event = stop_event
         self.log_level = log_level
         self._watch_init(reload_epoch, born_epoch, workers_lock)
+        self._status_dir = status_dir
+        #: Built by `run()` in the worker process (never pickled, never
+        #: shared); `None` = record nothing.
+        self._status: Optional[health.StatusWriter] = None
 
     @abstractmethod
     def _get_interval(self, config: BackupConfig) -> float:
@@ -456,6 +475,54 @@ class BaseWorker(_SupervisorWatch, Process):
     def _get_datasets(self, manager: DatasetManager) -> List[DatasetInfo]:
         """Return the list of datasets to iterate each cycle. Override to extend."""
         return manager.datasets
+
+    #: The status record kind an exception out of `_process_dataset` is
+    #: charged to (`None`: the subclass records its own failures).
+    _STATUS_KIND: Optional[str] = None
+
+    def _status_keys(
+        self, datasets: Iterable[DatasetInfo]
+    ) -> Optional[Set[Tuple[str, Optional[str]]]]:
+        """The `(dataset, destination)` pairs this worker's status file may
+        hold records for: anything else is dropped, so a dataset removed from
+        the configuration stops being reported. `None`: this cycle's list is
+        not trustworthy, drop nothing."""
+        return {(dsi.name, None) for dsi in datasets}
+
+    def _record(
+        self, kind: str, dataset: str, destination: Optional[str] = None, *,
+        ok: bool, error: Optional[str] = None, detail: Optional[str] = None,
+    ) -> None:
+        """One attempt finished (S-7): remembered for the status file, which
+        `_flush_status` writes. A no-op without a status directory."""
+        if self._status is not None:
+            self._status.record(kind, dataset, destination, ok=ok, error=error, detail=detail)
+
+    def _flush_status(self, force: bool = False, heartbeat: bool = False) -> None:
+        if self._status is not None:
+            self._status.flush(force=force, heartbeat=heartbeat)
+
+    def _open_status(self, config: BackupConfig, logger) -> Optional[health.StatusWriter]:
+        """This worker's status writer, carrying over the counters of its
+        previous incarnation's file (a reload or crash restart must not make
+        a standing failure look new), or `None`: no directory was handed
+        over, or `--dry-run`/`dry_run: true` (a dry run's outcomes are not
+        outcomes, and it writes nothing). Never raises."""
+        if self._status_dir is None or config.dry_run:
+            return None
+        try:
+            writer = health.StatusWriter(self._status_dir, self.name)
+            writer.load()
+            return writer
+        except Exception as e:
+            logger.warning(f"{self.name} will not record its outcomes: {type(e).__name__}: {e}")
+            return None
+
+    def _record_failure(self, dsi: DatasetInfo, exc: BaseException) -> None:
+        if self._STATUS_KIND is not None:
+            self._record(
+                self._STATUS_KIND, dsi.name, ok=False, error=f"{type(exc).__name__}: {exc}"
+            )
 
     def _before_loop(self, config: BackupConfig, manager: DatasetManager) -> None:
         """Called once after setup but before the main loop. Override for per-run init."""
@@ -476,25 +543,47 @@ class BaseWorker(_SupervisorWatch, Process):
                 f"minimum (hand-edited config database?); using {MIN_WORKER_INTERVAL:g}s"
             )
             interval = MIN_WORKER_INTERVAL
+        self._status = self._open_status(config, logger)
         self._before_loop(config, manager)
 
         # `_exit_reason` (stop flag > supervisor gone > reload) is checked at
         # every safe point: loop top, between datasets, and each `_wait`
         # slice -- never inside `_process_dataset`, so a reload (or a stop)
         # lets the dataset in hand finish.
+        #
+        # Outcomes (S-7) are written from this loop only: remembered after each
+        # dataset, written at most every `health.STATUS_WRITE_INTERVAL`, and
+        # forced at the end of a cycle and on the way out. A write failure is
+        # one WARNING and never reaches this loop.
         reason = self._exit_reason()
-        while reason is None:
-            logger.debug(f"{self.name} cycle")
-            for dsi in self._get_datasets(manager):
-                reason = self._exit_reason()
-                if reason is not None:
-                    break
-                try:
-                    self._process_dataset(manager, dsi)
-                except Exception as e:
-                    logger.error(f"{self.name} error on {dsi.name}: {e}", exc_info=True)
-            if reason is None:
-                reason = self._wait(interval)
+        try:
+            while reason is None:
+                logger.debug(f"{self.name} cycle")
+                datasets = self._get_datasets(manager)
+                # A list cut short by a stop or reload is not the truth about
+                # what is configured: retain only on a complete one.
+                if self._status is not None and self._exit_reason() is None:
+                    keep = self._status_keys(datasets)
+                    if keep is not None:
+                        self._status.retain(keep)
+                for dsi in datasets:
+                    reason = self._exit_reason()
+                    if reason is not None:
+                        break
+                    if self._FLUSH_BEFORE_DATASET:
+                        self._flush_status(force=True)
+                    try:
+                        self._process_dataset(manager, dsi)
+                    except Exception as e:
+                        logger.error(f"{self.name} error on {dsi.name}: {e}", exc_info=True)
+                        self._record_failure(dsi, e)
+                    self._flush_status()
+                # End of cycle: always rewrite, so `updated_at` is a heartbeat.
+                self._flush_status(force=True, heartbeat=True)
+                if reason is None:
+                    reason = self._wait(interval)
+        finally:
+            self._flush_status(force=True)
 
         self._finish(reason, logger)
 
@@ -521,11 +610,15 @@ class SnapshotWorker(BaseWorker):
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
+        status_dir=None,
     ):
         super().__init__(
             'snapshot-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
+            status_dir=status_dir,
         )
+
+    _STATUS_KIND = health.KIND_SNAPSHOT
 
     def _get_interval(self, config: BackupConfig) -> float:
         return config.check_interval.total_seconds()
@@ -560,7 +653,18 @@ class SnapshotWorker(BaseWorker):
         logger = logging.getLogger(__name__)
         if manager.needs_snapshot(dsi):
             logger.info(f"Dataset {dsi.name} needs snapshot")
-            manager.create_snapshot(dsi)
+            created = manager.create_snapshot(dsi)
+            if created is not None:
+                self._record(
+                    health.KIND_SNAPSHOT, dsi.name, ok=True,
+                    detail=str(getattr(created, 'name', '') or ''),
+                )
+            else:
+                reason = getattr(manager, 'last_snapshot_error', None)
+                self._record(
+                    health.KIND_SNAPSHOT, dsi.name, ok=False,
+                    error=reason if isinstance(reason, str) else 'the snapshot was not created (see the journal)',
+                )
 
 
 class PruningWorker(BaseWorker):
@@ -575,11 +679,23 @@ class PruningWorker(BaseWorker):
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
+        status_dir=None,
     ):
         super().__init__(
             'pruning-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
+            status_dir=status_dir,
         )
+
+    _STATUS_KIND = health.KIND_PRUNE
+    # One record per dataset per cycle: a forced write before each would be
+    # one per dataset. The rate limit and the end-of-cycle flush apply.
+    _FLUSH_BEFORE_DATASET = False
+    #: This cycle's enumeration of the received datasets (server side): why it
+    #: failed (`None`: it did not), and the backup target it enumerated
+    #: (`None`: remote backup is off).
+    _received_error: Optional[str] = None
+    _discover_target: Optional[str] = None
 
     def _get_interval(self, config: BackupConfig) -> float:
         return config.effective_prune_interval.total_seconds()
@@ -592,10 +708,55 @@ class PruningWorker(BaseWorker):
         received = manager.received_datasets(should_stop=self._should_stop)
         if self._should_stop():
             return []
+        self._note_received(manager, received)
         return manager.datasets + received
 
+    def _note_received(self, manager: DatasetManager, received: List[DatasetInfo]) -> None:
+        """Record how the enumeration of the received datasets went, under the
+        backup target's name. A failed one returns `[]`, which is not the truth
+        about what exists: `_status_keys` then keeps every record instead of
+        dropping the received datasets' (a `check` would see no data instead
+        of a failure)."""
+        self._received_error = None
+        self._discover_target = None
+        if self._status is None:
+            return
+        rb = getattr(manager.config, 'remote_backup', None)
+        if not rb or not rb.enabled:
+            return
+        error = getattr(manager, 'last_received_error', None)
+        self._received_error = error if isinstance(error, str) else None
+        self._discover_target = rb.target_dataset.rstrip('/')
+        if self._received_error is not None:
+            self._record(
+                health.KIND_DISCOVER, self._discover_target, ok=False,
+                error=f"cannot list the received datasets: {self._received_error}",
+            )
+        else:
+            self._record(
+                health.KIND_DISCOVER, self._discover_target, ok=True,
+                detail=f"{len(received)} received dataset(s)",
+            )
+
+    def _status_keys(self, datasets):
+        if self._received_error is not None:
+            return None
+        keys = super()._status_keys(datasets)
+        if self._discover_target is not None:
+            keys.add((self._discover_target, None))
+        return keys
+
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
-        manager.prune_snapshots(dsi)
+        result = manager.prune_snapshots(dsi)
+        if isinstance(result, PruneResult):
+            if result.ok:
+                self._record(health.KIND_PRUNE, dsi.name, ok=True, detail=result.summary())
+            else:
+                self._record(
+                    health.KIND_PRUNE, dsi.name, ok=False,
+                    error=result.skipped or f"{result.failed} snapshot(s) could not be destroyed",
+                    detail=result.summary(),
+                )
 
 
 class RemoteBackupWorker(BaseWorker):
@@ -612,6 +773,7 @@ class RemoteBackupWorker(BaseWorker):
         workers_lock=None,
         tls_dir=None,
         client_id: Optional[str] = None,
+        status_dir=None,
     ):
         """`tls_dir` is `<db>.tls` (the default client TLS identity lives
         there unless `client_cert_file`/`client_key_file` override it);
@@ -625,6 +787,7 @@ class RemoteBackupWorker(BaseWorker):
         super().__init__(
             'remote-backup-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
+            status_dir=status_dir,
         )
         self.tls_dir = tls_dir
         self.client_id = client_id
@@ -639,10 +802,22 @@ class RemoteBackupWorker(BaseWorker):
         return min(freqs) if freqs else config.check_interval.total_seconds()
 
     def _before_loop(self, config: BackupConfig, manager: DatasetManager) -> None:
-        from zfsbackup.remote import RemoteBackupManager
+        from zfsbackup.remote import TOKEN_SKIP_NOTE, RemoteBackupManager
         self._remote_manager = RemoteBackupManager(
             config, manager, client_id=self.client_id, tls_dir=self.tls_dir
         )
+        # A reload or restart must not reset the resume-token skip counts:
+        # carry them over from the previous incarnation's records.
+        if self._status is not None:
+            counts = {
+                (r.dataset, r.destination): r.consecutive_failures
+                for r in self._status.records
+                if r.kind == health.KIND_SEND and r.destination is not None
+                and r.result == health.RESULT_ERROR and r.consecutive_failures > 0
+                and (r.last_error or '').startswith(TOKEN_SKIP_NOTE)
+            }
+            if counts:
+                self._remote_manager.seed_token_skips(counts)
 
     def _get_datasets(self, manager: DatasetManager) -> List[DatasetInfo]:
         # Called once at the top of every cycle: each destination's `/whoami`
@@ -658,14 +833,54 @@ class RemoteBackupWorker(BaseWorker):
         # create anything on the server.
         return sorted(super()._get_datasets(manager), key=lambda d: d.name.count('/'))
 
+    def _status_keys(self, datasets: Iterable[DatasetInfo]) -> Set[Tuple[str, Optional[str]]]:
+        return {(dsi.name, rc.destination) for dsi in datasets for rc in dsi.config.remote}
+
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
         if not dsi.config.remote:
             return
+        # The destination in hand, so that an exception is charged to it (the
+        # exception itself still propagates to the loop, as before).
+        current: List[str] = []
+        try:
+            self._send_to_destinations(manager, dsi, current)
+        except Exception as e:
+            if current:
+                self._record(
+                    health.KIND_SEND, dsi.name, current[0], ok=False,
+                    error=f"{type(e).__name__}: {e}",
+                )
+            raise
+
+    def _record_send(self, dsi: DatasetInfo, destination: str, done: bool) -> None:
+        """Remember what `backup_dataset` returned. A `False` while an exit
+        reason is pending is a stop or reload cutting the cycle short: neither
+        a success nor a failure, so nothing is recorded. Otherwise `False` is
+        a failure, with the manager's own account of why when it has one."""
+        if self._status is None:
+            return
+        if done:
+            self._record(health.KIND_SEND, dsi.name, destination, ok=True)
+        elif self._exit_reason() is None:
+            problem = self._remote_manager.last_problem(dsi.name, destination)
+            self._record(
+                health.KIND_SEND, dsi.name, destination, ok=False,
+                error=problem if isinstance(problem, str) else 'not completed (see the journal)',
+            )
+        else:
+            return
+        # The next destination may stream for hours: write this outcome now.
+        self._flush_status(force=True)
+
+    def _send_to_destinations(
+        self, manager: DatasetManager, dsi: DatasetInfo, current: List[str]
+    ) -> None:
         logger = logging.getLogger(__name__)
         for index, remote_cfg in enumerate(dsi.config.remote):
             if index and self._exit_reason() is not None:
                 # Between destinations no stream is open: a safe point.
                 return
+            current[:] = [remote_cfg.destination]
             freq = (remote_cfg.frequency or dsi.config.frequency).total_seconds()
             anchor_name = manager.get_anchor(dsi, remote_cfg.destination)
             if anchor_name:
@@ -687,9 +902,10 @@ class RemoteBackupWorker(BaseWorker):
                     continue
             # `should_stop` is polled before every stream of the chain (never
             # during one): no new stream during a stop or a reload (C3).
-            self._remote_manager.backup_dataset(
+            done = self._remote_manager.backup_dataset(
                 dsi, remote_cfg, should_stop=lambda: self._exit_reason() is not None
             )
+            self._record_send(dsi, remote_cfg.destination, done)
 
 
 #: At most this many connections are served (handshaking or in a request) at

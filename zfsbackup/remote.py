@@ -84,6 +84,17 @@ HTTP_TIMEOUT = 30
 #: `/resume_token`.
 RESUME_TOKEN_TIMEOUT = 10
 
+#: S-7a: the resume-token check (`_fetch_resume_token`, `_resume_target`) skips
+#: the cycle when it cannot tell whether the server holds a partial receive --
+#: for ever, if the cause stays. After this many consecutive skipped cycles of
+#: one (dataset, destination) an ERROR is logged, once, until the check passes.
+RESUME_TOKEN_SKIP_ERROR_AFTER = 3
+
+#: What the status file's `last_error` of a token-skipped cycle starts with
+#: (`RemoteBackupManager.last_problem`); the worker seeds the skip counts of a
+#: new incarnation from the records that carry it.
+TOKEN_SKIP_NOTE = "resume token check failed"
+
 #: How long the worker's main loop waits for the shared client identity lock
 #: (`identity.lock`; the CLI's `enroll` / `identity rotate` hold it
 #: exclusively) when it loads or uses the identity. Short: a stopped or slow
@@ -530,6 +541,15 @@ class RemoteBackupManager:
         # `time.monotonic()` of the last client certificate expiry check
         # (`None`: not yet), see `_check_client_cert_expiry`.
         self._expiry_checked_at: Optional[float] = None
+        # S-7a. `(dataset, destination) -> consecutive cycles skipped by the
+        # resume-token check`, and the pairs whose ERROR was already logged.
+        # In memory: a new worker (reload, crash) counts again from 0.
+        self._token_skips: Dict[Tuple[str, str], int] = {}
+        self._token_error_logged: Set[Tuple[str, str]] = set()
+        # `(dataset, destination) -> why the last `backup_dataset` call did
+        # not complete`, where this class knows (the token check); read by
+        # `last_problem`, reset at the start of every call.
+        self._call_note: Dict[Tuple[str, str], str] = {}
 
     def begin_cycle(self) -> None:
         """Start a new pass over the datasets: forget this cycle's
@@ -570,6 +590,62 @@ class RemoteBackupManager:
             level, message = problem
             logger.log(level, message)
 
+    def _token_skipped(self, dsi: DatasetInfo, destination: str, reason: str) -> None:
+        """The resume-token check skipped this cycle for `dsi` -> `destination`
+        (the caller has logged the WARNING). Counts it; the
+        `RESUME_TOKEN_SKIP_ERROR_AFTER`th consecutive skip logs an ERROR, once
+        until `_token_ok`."""
+        key = (dsi.name, destination)
+        self._call_note[key] = f"{TOKEN_SKIP_NOTE}: {reason}"
+        count = self._token_skips[key] = self._token_skips.get(key, 0) + 1
+        if count >= RESUME_TOKEN_SKIP_ERROR_AFTER and key not in self._token_error_logged:
+            self._token_error_logged.add(key)
+            server_ds = self._server_info.get(key, (None, None))[1] or '<server dataset>'
+            logger.error(
+                f"{dsi.name} -> {destination}: the resume-token check has skipped the last "
+                f"{count} cycles in a row ({reason}); nothing is sent for this dataset until "
+                "it passes, so the destination is falling behind. See the WARNINGs above for "
+                "the cause. If the server's partial receive of this dataset is no longer "
+                f"wanted, abort it on the server with `zfs receive -A {server_ds}`; the next "
+                "cycle then sends fresh"
+            )
+
+    def seed_token_skips(self, counts: Dict[Tuple[str, str], int]) -> None:
+        """Start the resume-token skip counts of `(dataset, destination)`
+        pairs from `counts` (the worker takes them from its previous
+        incarnation's status file), so that frequent reloads cannot keep the
+        ERROR from ever firing. The ERROR itself is still logged once per
+        incarnation, at the next skip once the count reaches the threshold."""
+        for key, count in counts.items():
+            if count > 0:
+                self._token_skips[key] = max(self._token_skips.get(key, 0), int(count))
+
+    def _token_ok(self, dsi: DatasetInfo, destination: str) -> None:
+        """The resume-token check passed (or was not needed because the
+        server is up to date): the skip count restarts, and the ERROR may be
+        logged again for a later episode."""
+        key = (dsi.name, destination)
+        self._token_skips.pop(key, None)
+        if key in self._token_error_logged:
+            self._token_error_logged.discard(key)
+            logger.info(f"{dsi.name} -> {destination}: the resume-token check passes again")
+
+    def last_problem(self, dataset: str, destination: str) -> Optional[str]:
+        """Why the last `backup_dataset(dataset, destination)` did not
+        complete, as far as this manager knows (the resume-token check, else a
+        standing refusal logged for the pair or for the whole destination);
+        `None` when it does not know. For the worker's status file."""
+        note = self._call_note.get((dataset, destination))
+        if note:
+            return note
+        for key in sorted(self._refusal_logged, key=lambda k: (k[0] or '', k[1])):
+            label, dest = key
+            if dest == destination and (
+                label is None or label == dataset or label.startswith(dataset + ' [')
+            ):
+                return self._refusal_logged[key]
+        return None
+
     def close(self) -> None:
         """Close every pinned session (idempotent)."""
         for transport in self._transports.values():
@@ -595,9 +671,11 @@ class RemoteBackupManager:
         checked before every stream of the chain (between steps, never during
         one), so a stop or reload never begins another stream."""
         destination = remote_cfg.destination
+        self._call_note.pop((dsi.name, destination), None)
         dest = self.config.destinations.get(destination)
         if dest is None:
             logger.error(f"Unknown destination '{destination}' for {dsi.name}")
+            self._call_note[(dsi.name, destination)] = f"unknown destination '{destination}'"
             return False
 
         self._warn_retention_collisions(dsi, destination)
@@ -1891,6 +1969,7 @@ class RemoteBackupManager:
             f"Nothing to send for {dsi.name} -> {destination}: "
             f"{latest.name} is already on the server"
         )
+        self._token_ok(dsi, destination)
         if self.config.dry_run:
             return
         anchor = self.local_manager.get_anchor(dsi, destination)
@@ -1974,6 +2053,9 @@ class RemoteBackupManager:
                     f"(HTTP {resp.status_code}); skipping this cycle rather than "
                     "risk discarding its partial progress with a fresh send"
                 )
+                self._token_skipped(
+                    dsi, destination, f"{base_url} answered the resume-token request with HTTP {resp.status_code}"
+                )
                 return 'skip', None
             body = resp.json()
             if not isinstance(body, dict) or body.get('error'):
@@ -1993,6 +2075,7 @@ class RemoteBackupManager:
                 "skipping this cycle rather than risk discarding its partial "
                 "progress with a fresh send"
             )
+            self._token_skipped(dsi, destination, f"cannot ask {base_url} for it: {e}")
             return 'skip', None
 
     def _resume_target(self, token: str, dsi: DatasetInfo, snapshots, mode: str = 'plain') -> object:
@@ -2080,6 +2163,7 @@ class RemoteBackupManager:
         if status == 'skip':
             return 'skip', None
         if not token:
+            self._token_ok(dsi, destination)
             return 'fresh', None
         try:
             target = self._resume_target(token, dsi, snapshots, mode)
@@ -2089,7 +2173,9 @@ class RemoteBackupManager:
                 "cycle rather than risk discarding the server's partial progress "
                 "with a fresh send"
             )
+            self._token_skipped(dsi, destination, f"cannot check the token: {e}")
             return 'skip', None
+        self._token_ok(dsi, destination)
         if isinstance(target, str):
             logger.warning(
                 f"Not resuming {dsi.name}: {target}; sending fresh (the server "

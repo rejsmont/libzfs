@@ -827,9 +827,12 @@ class TestWorkerConstructors:
     def test_the_signature_is_exactly_config_stop_event_log_level(self, cls, name):
         sig = inspect.signature(cls.__init__)
         extra = EXTRA_KEYWORDS.get(cls, [])
+        # `status_dir` (S-7a) comes after the reload trio, before the class extras
+        # of the remote worker; the API worker has none (it records no outcomes).
+        status = [] if cls is ApiWorker else ['status_dir']
         assert list(sig.parameters) == [
             'self', 'config', 'stop_event', 'log_level',
-            'reload_epoch', 'born_epoch', 'workers_lock', *extra,
+            'reload_epoch', 'born_epoch', 'workers_lock', *extra, *status,
         ]
         # The reload trio is keyword-only with inert defaults, so every old
         # positional call keeps working; so are the class-specific extras (M9:
@@ -838,7 +841,7 @@ class TestWorkerConstructors:
         for trio, default in (('reload_epoch', None), ('born_epoch', 0), ('workers_lock', None)):
             assert sig.parameters[trio].kind is inspect.Parameter.KEYWORD_ONLY
             assert sig.parameters[trio].default == default
-        for name_ in extra:
+        for name_ in [*extra, *status]:
             assert sig.parameters[name_].kind is inspect.Parameter.KEYWORD_ONLY
             assert sig.parameters[name_].default is None
 
@@ -846,10 +849,11 @@ class TestWorkerConstructors:
         sig = inspect.signature(BaseWorker.__init__)
         assert list(sig.parameters) == [
             'self', 'worker_name', 'config', 'stop_event', 'log_level',
-            'reload_epoch', 'born_epoch', 'workers_lock',
+            'reload_epoch', 'born_epoch', 'workers_lock', 'status_dir',
         ]
         assert [n for n, p in sig.parameters.items()
-                if p.kind is inspect.Parameter.KEYWORD_ONLY] == ['reload_epoch', 'born_epoch', 'workers_lock']
+                if p.kind is inspect.Parameter.KEYWORD_ONLY] == [
+            'reload_epoch', 'born_epoch', 'workers_lock', 'status_dir']
 
     @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
     def test_the_old_dry_run_and_path_parameters_are_gone(self, cls, name, worker_config):

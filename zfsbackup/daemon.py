@@ -60,6 +60,7 @@ from zfsbackup.runtime_config import (
     load_runtime_config,
 )
 from zfsbackup import daemonlock
+from zfsbackup import health
 from zfsbackup import identity
 from zfsbackup import logsetup
 from zfsbackup.backup_manager import DatasetManager
@@ -158,9 +159,13 @@ class Handoff:
     """What every worker is born with, as one object: the config it runs, the
     reload epoch that config belongs to, the `(store_id, generation)` key
     it was read at (`None` when not known -- a daemon built without one, see
-    `BackupDaemon.__init__`), and this host's client id (`ConfigSnapshot.
+    `BackupDaemon.__init__`), this host's client id (`ConfigSnapshot.
     client_id`, read in the same snapshot as the config; `None` until
-    `zfsbackup-config enroll` generates one).
+    `zfsbackup-config enroll` generates one), and `<db>.status` -- where the
+    workers write their outcome files (S-7) -- or `None` for a config that
+    writes nothing (`--dry-run`, `dry_run: true`) and a daemon built without
+    a database path. The path is derived from the database path and the
+    config's `dry_run`, so a reload that flips `dry_run` flips it too.
 
     The supervisor replaces the whole object on an accepted reload and only
     then bumps the shared `ReloadEpoch`; `_new_worker` reads it exactly once,
@@ -176,6 +181,7 @@ class Handoff:
     epoch: int
     key: Optional[Tuple[int, int]]
     client_id: Optional[str] = None
+    status_dir: Optional[Path] = None
 
 
 def _gen(key: Optional[Tuple[int, int]]) -> str:
@@ -306,6 +312,15 @@ def _tls_dir(resolved) -> Optional[Path]:
     if resolved is None:
         return None
     return identity.tls_dir(getattr(resolved, 'resolved_path', resolved))
+
+
+def _status_dir_for(resolved, config: BackupConfig) -> Optional[Path]:
+    """`<db>.status` for `resolved`, or `None` when `config` is a dry run (it
+    records nothing, so no directory is created or written) or there is no
+    database path. Pure path arithmetic: see `_usable_status_dir`."""
+    if resolved is None or config.dry_run:
+        return None
+    return health.status_dir(getattr(resolved, 'resolved_path', resolved))
 
 
 def _client_identity_paths(config: BackupConfig, tls: Optional[Path]):
@@ -659,7 +674,12 @@ class BackupDaemon:
         #: Config, epoch, key and client id, swapped as one object by
         #: `_try_reload` and read once per spawn by `_new_worker`. See
         #: `Handoff`.
-        self._handoff = Handoff(config, 0, key, client_id)
+        self._handoff = Handoff(
+            config, 0, key, client_id, _status_dir_for(resolved_config, config)
+        )
+        #: Whether a failure to set up the status directory was already
+        #: reported (it is re-checked at every spawn).
+        self._status_dir_warned = False
         #: The config *database* path, with its provenance. Read by the
         #: supervisor: at startup, by every poll and by every reload
         #: (`_reload_tick`). The API worker is given it for TLS only (the
@@ -916,6 +936,12 @@ class BackupDaemon:
         elif name == 'remote':
             extra['tls_dir'] = _tls_dir(self.resolved_config)
             extra['client_id'] = h.client_id
+        if name != 'api':
+            # The outcome files (S-7): the API worker has no per-dataset
+            # outcomes and writes none.
+            status = self._usable_status_dir(h)
+            if status is not None:
+                extra['status_dir'] = status
         return cls(
             h.config,
             self._stop_event,
@@ -925,6 +951,32 @@ class BackupDaemon:
             workers_lock=self._workers_lock_path(),
             **extra,
         )
+
+    def _usable_status_dir(self, h: 'Handoff') -> Optional[Path]:
+        """`h.status_dir` once it exists and is usable, else `None` (the
+        workers then record nothing). Created or re-checked here at EVERY
+        spawn (startup, crash restarts, reloads -- a stat and an fstat), never
+        by a worker, so a directory that was replaced or whose owner or mode
+        changed is noticed. A failure is one WARNING per supervisor and is
+        retried at the next spawn; it never stops a worker from starting. No
+        `zfs` call."""
+        directory = h.status_dir
+        if directory is None:
+            return None
+        try:
+            health.ensure_status_dir(directory)
+        except Exception as e:
+            if not self._status_dir_warned:
+                self._status_dir_warned = True
+                logger.warning(
+                    f"workers will not record their outcomes: {e}"
+                    if isinstance(e, health.StatusError) else
+                    f"workers will not record their outcomes: cannot set up {directory}: "
+                    f"{type(e).__name__}: {e}"
+                )
+            return None
+        self._status_dir_warned = False
+        return directory
 
     def _workers_lock_path(self):
         """Path of `<db>.workers.lock` for every worker to hold `LOCK_SH` on
@@ -2069,7 +2121,9 @@ class BackupDaemon:
             return
 
         epoch = h.epoch + 1
-        self._handoff = Handoff(config, epoch, key, client_id)
+        self._handoff = Handoff(
+            config, epoch, key, client_id, _status_dir_for(self.resolved_config, config)
+        )
         self._reload_epoch.set(epoch)
         self._rejected = None
         self._deferred = None
@@ -2126,7 +2180,7 @@ class BackupDaemon:
         the turnover finishes (it reads `h.key`)."""
         h = self._handoff
         clear = {'deferred': None} if self._deferred is not None else {}
-        self._handoff = Handoff(h.config, h.epoch, key, h.client_id)
+        self._handoff = Handoff(h.config, h.epoch, key, h.client_id, h.status_dir)
         self._rejected = None
         self._deferred = None
         self._deferred_reason = None

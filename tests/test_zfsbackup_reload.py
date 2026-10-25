@@ -42,6 +42,7 @@ import itertools
 import logging
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -144,7 +145,7 @@ class FakeWorker:
 
     def __init__(self, name, world, config, stop_event, verbose=False, *,
                  reload_epoch=None, born_epoch=0, workers_lock=None,
-                 config_db=None, tls_dir=None, client_id=None):
+                 config_db=None, tls_dir=None, client_id=None, status_dir=None):
         self.name = name
         self.world = world
         self.config = config
@@ -158,6 +159,8 @@ class FakeWorker:
         self.config_db = config_db
         self.tls_dir = tls_dir
         self.client_id = client_id
+        # S-7a: `<db>.status`, given to every worker but the API worker.
+        self.status_dir = status_dir
         self.pid = None
         self._alive = False
         self.exitcode = None
@@ -249,6 +252,10 @@ class World:
         if dry_run:
             running.dry_run = True
         self.running_config = running
+        # The supervisor creates `<db>.status` at spawn (S-7a) and the parent
+        # must exist, as a real database's does; make it rather than filter
+        # the WARNING a missing parent would log.
+        (tmp_path / "w").mkdir(exist_ok=True)
         self.resolved = resolve_config_path(str(tmp_path / "w" / "config.db"))
         self.daemon = BackupDaemon(
             running,
@@ -3968,7 +3975,9 @@ class TestReloadHandlesWhatNoWorkerCouldStartWith:
         world.write((STORE, 1), config=cfg(remote=True))
         world.hup()
         assert world.daemon._handoff.key == (STORE, 1)
-        assert not (tmp_path / "w").exists()        # no <db>.tls, no directory at all
+        # no <db>.tls; the only thing the supervisor may make is `<db>.status` (S-7a;
+        # the harness makes the parent itself)
+        assert {p.name for p in (tmp_path / "w").iterdir()} <= {"config.db.status"}
 
     def test_a_missing_identity_warns_for_real_and_is_accepted(self, world, caplog):
         world.write((STORE, 1), config=cfg(remote=True))
@@ -5093,3 +5102,201 @@ class TestRealDaemonSupervisorBatchB:
             holder.close()
         assert d.proc.returncode == 0, d.log()
         assert "Configuration is valid!" in d.log()
+
+
+# ---------------------------------------------------------------------------
+# S-7a: the workers' status directory (`<db>.status`)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestStatusDirectory:
+    """The supervisor derives `<db>.status` from the database path and the config's
+    `dry_run` (a `Handoff` field recomputed per reload), creates or re-checks it before
+    EVERY spawn, and hands it to the snapshot, pruning and remote workers -- never to the
+    API worker. A failure to make it is one WARNING per streak and never stops a worker
+    from starting."""
+
+    @staticmethod
+    def status_path(w):
+        return Path(w.resolved.resolved_path).with_name("config.db.status")
+
+    @staticmethod
+    def given(w):
+        """name -> the `status_dir` each worker was constructed with."""
+        return {x.name: x.status_dir for x in w.made}
+
+    # -- the pure derivation ------------------------------------------------
+
+    def test_status_dir_for_is_the_db_path_plus_dot_status(self, tmp_path):
+        resolved = resolve_config_path(str(tmp_path / "config.db"))
+        got = daemon_module._status_dir_for(resolved, cfg())
+        assert got == tmp_path / "config.db.status"
+
+    def test_status_dir_for_accepts_a_plain_path_too(self, tmp_path):
+        assert daemon_module._status_dir_for(tmp_path / "x.db", cfg()) == tmp_path / "x.db.status"
+
+    def test_status_dir_for_is_none_for_a_dry_run_config(self, tmp_path):
+        resolved = resolve_config_path(str(tmp_path / "config.db"))
+        assert daemon_module._status_dir_for(resolved, cfg(dry_run=True)) is None
+
+    def test_status_dir_for_is_none_without_a_database_path(self):
+        assert daemon_module._status_dir_for(None, cfg()) is None
+
+    def test_the_handoff_carries_it_and_defaults_to_none(self, tmp_path):
+        assert Handoff(cfg(), 0, (STORE, 0)).status_dir is None
+        assert Handoff(cfg(), 0, (STORE, 0), "c", tmp_path).status_dir == tmp_path
+
+    # -- at spawn -----------------------------------------------------------
+
+    def test_the_directory_is_made_at_the_first_spawn_and_given_to_three_workers(self, world):
+        path = self.status_path(world)
+        assert world.daemon._handoff.status_dir == path
+        assert not path.exists()                    # nothing is created by constructing the daemon
+        world.start_workers()
+        assert path.is_dir() and (path.stat().st_mode & 0o777) == 0o750
+        assert self.given(world) == {"snapshot": path, "pruning": path, "api": None}
+
+    def test_the_remote_worker_gets_it_too(self, mocker, tmp_path):
+        w = World(mocker, tmp_path, config=cfg(remote=True))
+        w.start_workers()
+        path = self.status_path(w)
+        assert self.given(w) == {"snapshot": path, "pruning": path, "api": None, "remote": path}
+
+    def test_the_api_worker_is_not_given_the_keyword_at_all(self, mocker, tmp_path):
+        """`ApiWorker.__init__` has no `status_dir` parameter: passing it would be a TypeError."""
+        seen = {}
+        w = World(mocker, tmp_path)
+        original = daemon_module.ApiWorker.side_effect
+
+        def spy(*a, **k):
+            seen.update(k)
+            return original(*a, **k)
+
+        daemon_module.ApiWorker.side_effect = spy
+        w.daemon._spawn("api")
+        assert "status_dir" not in seen
+
+    def test_a_dry_run_makes_and_passes_nothing(self, mocker, tmp_path):
+        w = World(mocker, tmp_path, dry_run=True)
+        w.start_workers()
+        assert w.daemon._handoff.status_dir is None
+        assert not self.status_path(w).exists()
+        assert set(self.given(w).values()) == {None}
+
+    def test_a_dry_run_config_in_the_database_does_the_same(self, mocker, tmp_path):
+        w = World(mocker, tmp_path, config=cfg(dry_run=True))
+        w.start_workers()
+        assert w.daemon._handoff.status_dir is None and not self.status_path(w).exists()
+
+    def test_a_daemon_without_a_database_path_records_nothing(self, mocker, tmp_path):
+        w = World(mocker, tmp_path)
+        w.daemon._handoff = Handoff(w.daemon.config, 0, (STORE, 0), None, None)
+        w.daemon._spawn("snapshot")
+        assert w.made[-1].status_dir is None
+
+    def test_a_dry_run_that_becomes_live_gets_the_directory_at_the_next_spawn(self, mocker, tmp_path):
+        w = World(mocker, tmp_path, config=cfg(dry_run=True))
+        old = w.start_workers()
+        assert not self.status_path(w).exists() and set(self.given(w).values()) == {None}
+        w.write((STORE, 1), config=cfg(dry_run=False))
+        w.hup()
+        assert w.daemon._handoff.status_dir == self.status_path(w)
+        assert not self.status_path(w).exists()               # the swap alone makes nothing
+        exited_for_reload(old)
+        w.daemon._check_workers()
+        assert self.status_path(w).is_dir()
+        new = [x for x in w.made if x.born_epoch == 1]
+        assert {x.name: x.status_dir for x in new} == {
+            "snapshot": self.status_path(w), "pruning": self.status_path(w), "api": None}
+
+    def test_a_live_config_that_becomes_a_dry_run_stops_handing_it_out(self, mocker, tmp_path):
+        w = World(mocker, tmp_path)
+        old = w.start_workers()
+        w.write((STORE, 1), config=cfg(dry_run=True))
+        w.hup()
+        assert w.daemon._handoff.status_dir is None
+        exited_for_reload(old)
+        w.daemon._check_workers()
+        assert {x.status_dir for x in w.made if x.born_epoch == 1} == {None}
+
+    def test_an_identical_candidate_keeps_the_directory(self, world):
+        world.start_workers()
+        path = world.daemon._handoff.status_dir
+        world.write((STORE, 1))                               # same content, new generation
+        world.hup()
+        assert world.daemon._handoff.status_dir == path
+
+    # -- failure ------------------------------------------------------------
+
+    def test_a_failure_is_one_warning_and_the_workers_still_start(self, mocker, tmp_path, caplog):
+        w = World(mocker, tmp_path)
+        shutil.rmtree(tmp_path / "w")                         # the DB's directory is gone
+        workers = w.start_workers()
+        assert set(workers) == {"snapshot", "pruning", "api"} and all(x.is_alive() for x in workers.values())
+        assert set(self.given(w).values()) == {None}
+        lines = messages(caplog, logging.WARNING, "will not record their outcomes")
+        assert len(lines) == 1 and "does not exist" in lines[0]
+        w.daemon._spawn("snapshot")
+        w.daemon._spawn("pruning")
+        assert len(messages(caplog, logging.WARNING, "will not record their outcomes")) == 1
+
+    def test_the_next_spawn_retries_and_recovers(self, mocker, tmp_path, caplog):
+        w = World(mocker, tmp_path)
+        shutil.rmtree(tmp_path / "w")
+        w.start_workers()
+        (tmp_path / "w").mkdir()
+        w.daemon._spawn("snapshot")
+        assert w.made[-1].status_dir == self.status_path(w)
+        assert self.status_path(w).is_dir()
+
+    def test_a_new_streak_warns_again(self, mocker, tmp_path, caplog):
+        w = World(mocker, tmp_path)
+        shutil.rmtree(tmp_path / "w")
+        w.start_workers()
+        (tmp_path / "w").mkdir()
+        w.daemon._spawn("snapshot")                           # recovered
+        shutil.rmtree(tmp_path / "w")
+        w.daemon._spawn("snapshot")
+        assert len(messages(caplog, logging.WARNING, "will not record their outcomes")) == 2
+
+    def test_a_deleted_directory_is_made_again_at_every_spawn(self, world):
+        world.start_workers()
+        path = self.status_path(world)
+        shutil.rmtree(path)
+        world.daemon._spawn("pruning")
+        assert path.is_dir() and world.made[-1].status_dir == path
+
+    def test_a_loosened_directory_is_refused_and_the_worker_starts_without_it(self, world, caplog):
+        world.start_workers()
+        path = self.status_path(world)
+        os.chmod(path, 0o777)
+        world.daemon._spawn("pruning")
+        assert world.made[-1].status_dir is None
+        (line,) = messages(caplog, logging.WARNING, "will not record their outcomes")
+        assert "writable by group or others" in line
+        os.chmod(path, 0o750)
+        world.daemon._spawn("pruning")
+        assert world.made[-1].status_dir == path
+
+    def test_a_symlink_where_the_directory_belongs_is_refused(self, world, tmp_path, caplog):
+        real = tmp_path / "elsewhere"
+        real.mkdir(mode=0o750)
+        self.status_path(world).symlink_to(real)
+        world.start_workers()
+        assert set(self.given(world).values()) == {None}
+        assert list(real.iterdir()) == []
+        (line,) = messages(caplog, logging.WARNING, "will not record their outcomes")
+        assert "symlink" in line
+
+    def test_an_unexpected_error_is_a_warning_too(self, world, mocker, caplog):
+        mocker.patch("zfsbackup.daemon.health.ensure_status_dir", side_effect=RuntimeError("odd"))
+        world.start_workers()
+        assert set(self.given(world).values()) == {None}
+        (line,) = messages(caplog, logging.WARNING, "will not record their outcomes")
+        assert "RuntimeError: odd" in line and "cannot set up" in line
+
+    def test_the_supervisor_still_makes_no_zfs_call(self, world, mocker):
+        zfs_calls = mocker.patch("subprocess.Popen")
+        world.start_workers()
+        zfs_calls.assert_not_called()

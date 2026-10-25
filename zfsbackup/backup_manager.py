@@ -354,6 +354,31 @@ class LocalAnchorUnreadable(Exception):
     zfs failed (not because it is unset). The text is zfs's own message."""
 
 
+@dataclasses.dataclass(frozen=True)
+class PruneResult:
+    """What one `DatasetManager.prune_snapshots` pass did, for the worker's
+    status file (S-7): `pruned` snapshots destroyed, `failed` single destroys
+    that did not go through, `stuck` candidates currently held back (a user
+    hold, a clone, or a destroy that keeps failing; not a failure by itself),
+    and `skipped` -- why the dataset was not pruned at all this pass (the
+    snapshots or the protect-set could not be read), `None` otherwise."""
+
+    pruned: int = 0
+    failed: int = 0
+    stuck: int = 0
+    skipped: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.skipped is None and self.failed == 0
+
+    def summary(self) -> str:
+        text = f"pruned {self.pruned}"
+        if self.stuck:
+            text += f", {self.stuck} held back"
+        return text
+
+
 class DatasetInfo:
     """Information about a dataset."""
 
@@ -441,6 +466,15 @@ class DatasetManager:
         # name is never put back into a batch; it is tried alone each cycle
         # until it goes or stops being a candidate.
         self._prune_stuck: Dict[Tuple[str, str], str] = {}
+        #: Why the last `list_snapshots` / `create_snapshot` / protect-set
+        #: re-read failed (`None`: it did not). The failure is also logged;
+        #: these let a worker record it without a changed return type (S-7).
+        self.last_list_error: Optional[str] = None
+        self.last_snapshot_error: Optional[str] = None
+        #: Why the last `received_datasets()` could not enumerate the target
+        #: (`None`: it could, or remote backup is off).
+        self.last_received_error: Optional[str] = None
+        self._reread_error: Optional[str] = None
 
     @property
     def datasets(self) -> List[DatasetInfo]:
@@ -767,6 +801,7 @@ class DatasetManager:
         batch is incomplete or fails, plus two or three `zfs get` executions
         for EVERY dataset, else for each dataset the batch dropped.
         """
+        self.last_received_error = None
         rb = self.config.remote_backup
         if not rb or not rb.enabled:
             return []
@@ -783,6 +818,7 @@ class DatasetManager:
                 types='filesystem,volume',
             )
         except Exception as e:
+            self.last_received_error = f"{type(e).__name__}: {e}"
             logger.error(f"Failed to discover received datasets: {e!r}")
             return []
 
@@ -1138,9 +1174,11 @@ class DatasetManager:
 
     def list_snapshots(self, dsi: DatasetInfo, recursive: bool = False) -> List['SnapshotInfo']:
         """List all managed snapshots for a dataset."""
+        self.last_list_error = None
         try:
             return self._list_snapshots_strict(dsi, recursive)
         except Exception as e:
+            self.last_list_error = f"{type(e).__name__}: {e}"
             logger.error(f"Failed to list snapshots for {dsi.name}: {e}")
             return []
 
@@ -1153,7 +1191,9 @@ class DatasetManager:
         return f"{self.prefix}_{date_str}{time_str}"
 
     def create_snapshot(self, dsi: DatasetInfo) -> Optional['SnapshotInfo']:
-        """Create a new snapshot for the dataset."""
+        """Create a new snapshot for the dataset. `None` when it could not be
+        created (`last_snapshot_error` says why) and in a dry run."""
+        self.last_snapshot_error = None
         snap_name = self._generate_snapshot_name(dsi)
         full_name = f"{dsi.name}@{snap_name}"
         try:
@@ -1165,6 +1205,7 @@ class DatasetManager:
             snapshot = result[0] if isinstance(result, list) else result
             logger.info(f"Successfully created snapshot: {full_name}")
         except Exception as e:
+            self.last_snapshot_error = f"Failed to create snapshot {full_name}: {e}"
             logger.error(f"Failed to create snapshot {full_name}: {e}")
             return None
         # The object `zfs snapshot` returns carries no `createtxg`, so it
@@ -1225,13 +1266,18 @@ class DatasetManager:
                     protected.setdefault(sni.name, f"retention of {child.name} keeps it")
         return protected
 
-    def prune_snapshots(self, dsi: DatasetInfo) -> None:
-        """Prune snapshots according to retention policy, skipping anchored snapshots."""
+    def prune_snapshots(self, dsi: DatasetInfo) -> PruneResult:
+        """Prune snapshots according to retention policy, skipping anchored
+        snapshots. -> what the pass did (`PruneResult`); callers that only
+        want the side effect may ignore it."""
+        self._reread_error = None
         snapshots = self.list_snapshots(dsi, recursive=False)
         if not snapshots:
+            if self.last_list_error is not None:
+                return PruneResult(skipped=f"cannot list snapshots: {self.last_list_error}")
             logger.debug(f"No snapshots to prune for {dsi.name}")
             self._forget_stuck(dsi, set())
-            return
+            return PruneResult()
 
         try:
             anchors = self.get_anchors(dsi)
@@ -1260,7 +1306,7 @@ class DatasetManager:
             else:
                 self._anchor_error_noted.add(dsi.name)
                 logger.error(msg)
-            return
+            return PruneResult(skipped=f"cannot read the anchors: {e}")
         if dsi.name in self._anchor_error_noted:
             self._anchor_error_noted.discard(dsi.name)
             logger.info(f"The anchors of {dsi.name} can be read again; pruning resumes")
@@ -1279,7 +1325,7 @@ class DatasetManager:
                 else:
                     self._descendant_error_noted.add(dsi.name)
                     logger.error(msg)
-                return
+                return PruneResult(skipped=f"cannot evaluate the descendants: {e}")
             self._descendant_error_noted.discard(dsi.name)
             all_candidates = to_prune
             kept = []
@@ -1358,6 +1404,15 @@ class DatasetManager:
             self._mark_stuck_after_failure(dsi, failed)
         if pruned:
             logger.info(f"Successfully pruned {pruned} snapshots")
+        return PruneResult(
+            pruned=pruned,
+            failed=len(failed),
+            stuck=sum(1 for key in self._prune_stuck if key[0] == dsi.name),
+            skipped=(
+                f"cannot re-read the anchors before destroying: {self._reread_error}"
+                if self._reread_error is not None else None
+            ),
+        )
 
     # ── Prune fallback and stuck-snapshot memory (B4) ─────────────────────────
 
@@ -1400,6 +1455,7 @@ class DatasetManager:
             protected = set(self._descendant_anchor_protection(dsi)) if dsi.recursive else set()
             protected |= set(self.get_anchors(dsi, own_properties_last=True))
         except Exception as e:
+            self._reread_error = str(e)
             logger.error(
                 f"Cannot re-read the anchors of {dsi.name}; not destroying "
                 f"{', '.join(s.full_name for s in group)} now: {e}"
