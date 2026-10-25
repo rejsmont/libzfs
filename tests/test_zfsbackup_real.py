@@ -928,6 +928,87 @@ class TestRealPruneHeldAndCloned:
 
 
 # ---------------------------------------------------------------------------
+# TestRealForgedReceivedProperty (B-1d: a newline in a received property)
+# ---------------------------------------------------------------------------
+
+class TestRealForgedReceivedProperty:
+    """A `zfs send -p` stream carries the sender's `org.zfsbackup:anchor.*` property into the receiving
+    dataset as a RECEIVED value, and a value may hold a newline, which real `zfs get -H` prints as extra lines.
+    Under a recursive client-side ancestor the descendants' anchors are read in one `zfs get -r`: the read
+    must be refused (the ancestor is skipped this cycle, nothing destroyed, one ERROR) and prune again once
+    the property is fixed. Needs `zfs send`/`receive` and `set` permission on the test pool; skips otherwise.
+
+    NOT RUN in the authoring session (no pool on the author's machine): run it with `pytest -m real_zfs`."""
+
+    @staticmethod
+    def _receive(snapshot, target):
+        """`zfs send -p snapshot | zfs receive target`, or skip when this account may not."""
+        send = subprocess.Popen([_zfs_cmd(), 'send', '-p', snapshot], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        recv = subprocess.run([_zfs_cmd(), 'receive', target], stdin=send.stdout,
+                              capture_output=True, text=True)
+        send.stdout.close()
+        send_err = send.stderr.read().decode(errors='replace')
+        send.stderr.close()
+        send.wait()
+        failed = send.returncode != 0 or recv.returncode != 0
+        if failed:
+            text = (send_err + recv.stderr).lower()
+            if 'permission denied' in text or 'not permitted' in text:
+                pytest.skip(f'zfs send/receive not permitted for this account: {text.strip()}')
+            raise AssertionError(f'send | receive failed: {send_err.strip()} {recv.stderr.strip()}')
+
+    def test_a_received_anchor_with_a_newline_skips_the_recursive_ancestor_until_it_is_fixed(
+            self, source_fs, target_root, caplog):
+        parent = f'{target_root}/anc'
+        child = f'{parent}/rx'
+        evil = 'org.zfsbackup:anchor.evil'
+        # the sender's dataset holds a hostile value; `zfs set` refuses a newline only on some versions
+        r = subprocess.run([_zfs_cmd(), 'set', f'{evil}=junk\npool/x\ttype\tfilesystem\t-', source_fs.name],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip(f'this zfs refuses a newline in a user property: {r.stderr.strip()}')
+        zfs.snapshot(source_fs, snap_name_at(0.1))
+        sent = list_real_snapshot_names_exact(source_fs.name)[-1]
+        try:
+            zfs.create.filesystem(parent)
+            self._receive(f'{source_fs.name}@{sent}', child)
+            source_line = _zfs_run('get', '-H', '-o', 'source', evil, child).strip()
+            assert source_line == 'received', 'the premise: the hostile value arrived as a RECEIVED property'
+
+            olds = [snap_name_at(3 + i) for i in reversed(range(3))]
+            for name in olds + [snap_name_at(0.2)]:
+                zfs.snapshot(Filesystem(parent), name)
+            config = BackupConfig(
+                datasets=[DatasetConfig(
+                    name=parent, frequency=timedelta(hours=1), recursive=True,
+                    retention_rules=[RetentionRule(timedelta(hours=1), timedelta(hours=2))],
+                )],
+                snapshot_prefix='autosnap',
+            )
+            manager = DatasetManager(config)
+            dsi = manager.datasets[0]
+
+            with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+                manager.prune_snapshots(dsi)
+                manager.prune_snapshots(dsi)               # a second cycle: still skipped, and quiet
+            for name in olds:
+                assert name in list_real_snapshot_names_exact(parent), f'{name} was destroyed'
+            errors = [m for m in _prune_records(caplog, logging.ERROR) if 'Cannot read anchors' in m]
+            assert len(errors) == 1 and parent in errors[0]
+
+            # fixed: a LOCAL value replaces the received one, the strict read is clean, pruning resumes
+            _zfs_run('set', f'{evil}=fine', child)
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+                manager.prune_snapshots(dsi)
+            remaining = list_real_snapshot_names_exact(parent)
+            assert [o for o in olds if o in remaining] != olds, 'pruning did not resume'
+        finally:
+            _destroy_quietly(parent)
+
+
+# ---------------------------------------------------------------------------
 # TestRealSendReceive
 # ---------------------------------------------------------------------------
 

@@ -1,7 +1,9 @@
 """A stateful stand-in for ZFS as the pruner sees it (plan B-4: batch fallback, held/cloned pre-skip).
 
 `PrunePool` replaces `zfs.list` (snapshot listings with `userrefs`/`clones`), `zfs.exists`,
-`zfs.get._exec_out` (the anchor reads) and `zfs.destroy` in `zfsbackup.backup_manager`. Its `destroy`
+`GetCommand._exec_lines` (the anchor reads: the real `zfs.get.rows` parser runs over realistic
+`zfs get -H -o name,property,value,source` rows and the name-only verify `zfs list`, see `_get_support`)
+and `zfs.destroy` in `zfsbackup.backup_manager`. Its `destroy`
 follows what the captures under tests/fixtures/openzfs/*/M3_Z8.txt show on OpenZFS 2.1.5, 2.2.2 and 2.4.1:
 
 * a destroy call is ATOMIC: if any member is held, cloned, being sent or gone, the call raises (the bare
@@ -27,6 +29,7 @@ import pytest
 import libzfseasy as zfs
 from libzfseasy.types import Filesystem
 from _openzfs_fixtures import VERSIONS, load_section
+from _get_support import GetReader
 from _snapshot_support import listed_snapshot
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup.config import BackupConfig, DatasetConfig, RemoteDatasetConfig, RetentionRule
@@ -63,7 +66,7 @@ class DestroyCall:
         return f'DestroyCall({len(self.names)} names, recursive={self.recursive}, error={self.error!r})'
 
 
-class PrunePool:
+class PrunePool(GetReader):
     def __init__(self, mocker, version: str = DEFAULT_VERSION):
         self.version = version
         self.snaps: Dict[str, List[str]] = {}               # dataset -> short names
@@ -74,6 +77,7 @@ class PrunePool:
         self.missing: Set[str] = set()                      # datasets `zfs.exists` reports absent
         self.calls: List[DestroyCall] = []
         self.get_calls: List[List[str]] = []                # the argv of every `zfs get` (anchor reads)
+        self._init_reader()
         #: every zfs call in order: ('get', dataset, recursive), ('value', dataset, property), ('destroy', names)
         self.events: List[tuple] = []
         self.empty_calls: List[DestroyCall] = []
@@ -84,7 +88,8 @@ class PrunePool:
         self.list_fails_from: Optional[int] = None
         mocker.patch('zfsbackup.backup_manager.zfs.destroy', side_effect=self._destroy)
         mocker.patch('zfsbackup.backup_manager.zfs.list', side_effect=self._list)
-        mocker.patch.object(zfs.get, '_exec_out', side_effect=self._get)
+        # `zfs.get.rows` is a classmethod: it reaches `_exec_lines` through the CLASS, so patch it there.
+        self.exec = mocker.patch.object(type(zfs.get), '_exec_lines', side_effect=self._exec)
         mocker.patch.object(zfs.get, 'value', side_effect=self._value)
 
     # -- building the pool -----------------------------------------------------------------------
@@ -164,17 +169,8 @@ class PrunePool:
             ))
         return rows
 
-    def _get(self, cmd):
-        self.get_calls.append(list(cmd))
-        root = cmd[-1]
-        self.events.append(('get', root, '-r' in cmd))
-        if '-r' in cmd:
-            lines = []
-            for name in sorted(self.props):
-                if name == root or name.startswith(root + '/'):
-                    lines += self._zget(name)
-            return iter(lines)
-        return iter(self._zget(root))
+    def _note_get(self, root, recursive, cmd):
+        self.events.append(('get', root, recursive))
 
     def _value(self, ds, prop, sources=None, raw=False):
         """`zfs get -H -o value <prop> <ds>` (the per-destination anchor read): the effective value."""
@@ -183,13 +179,6 @@ class PrunePool:
             if p == prop:
                 return value
         return None
-
-    def _zget(self, name):
-        lines = [f'{name}\ttype\tfilesystem\t-\t-\n']
-        for prop, value, source in self.props.get(name, []):
-            received = value if source == 'received' else '-'
-            lines.append(f'{name}\t{prop}\t{value}\t{received}\t{source}\n')
-        return lines
 
     def _failure(self, members: List[Tuple[str, str]], recursive: bool, dry: bool) -> Optional[str]:
         """The captured stderr of the first member (in call order) zfs would refuse, or None."""

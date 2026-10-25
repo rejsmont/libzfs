@@ -87,16 +87,6 @@ def with_type_column(stdout):
     return out
 
 
-def with_received_column(stdout):
-    """libzfseasy reads `name,property,value,received,source`; the capture is `name,property,value,source`.
-    Insert `received=-` (these are all local or default properties)."""
-    out = []
-    for line in stdout.splitlines():
-        cols = line.split('\t')
-        out.append('\t'.join(cols[:-1] + ['-', cols[-1]]) + '\n')
-    return out
-
-
 def stream_failure(mock, stderr, rc):
     """Make the next Popen a send that dies before writing a byte (the streaming commands read bytes)."""
     proc = MagicMock()
@@ -888,12 +878,17 @@ class TestKeylessRawCopyZ7:
     DS = 'zfsbcapc/Z7/srv/rx'
 
     def test_get_local_all_lists_the_user_properties_without_the_key(self, version, mock_subprocess):
-        """`get -s local all` (here with libzfseasy's `received` column, inserted: derived from the capture, whose
-        received column is `-` for every local property) through zfsbackup's own reader."""
+        """`get -s local all` through zfsbackup's own reader (plan B-1d: `zfs.get.rows`, no `-s`). The capture's
+        four-column rows are exactly the reader's `name,property,value,source`; the capture was taken WITH `-s local`
+        (which drops the `type` row), so the `type` row zfs prints first without it is put in front, and the
+        reader's name-only cross-check list answers for the one dataset."""
         from zfsbackup.backup_manager import read_zfsbackup_properties
         rec = load_section(version, 'Z7')['Z7/20_get_local_all']
         assert rec.rc == 0
-        mock_subprocess.setup(stdout=with_received_column(rec.stdout))
+        mock_subprocess.setup_multi(
+            ([f'{self.DS}\ttype\tfilesystem\t-\n'] + rec.stdout.splitlines(keepends=True),),
+            ([f'{self.DS}\tfilesystem\n'],),
+        )
         props = read_zfsbackup_properties(Filesystem(self.DS))
         assert props == {
             'org.zfsbackup:config': 'eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==',

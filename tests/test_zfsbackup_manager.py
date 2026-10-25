@@ -7,12 +7,14 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
+from libzfseasy.zfs import GetRow, GetRows, ZFSOutputError
 from zfsbackup.backup_manager import (
     DatasetManager, DatasetInfo, SnapshotInfo, _collapse_retention_rules,
 )
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, RetentionRule, RemoteServerConfig, RemoteDatasetConfig, Duration,
 )
+from _get_support import ZfsWorld, get_lines, reads as reads_
 from _snapshot_support import NO_TXG, list_row, listed_info, listed_snapshot
 from _prune_support import (  # noqa: F401
     VERSIONS, PrunePool, hourly_name, prune_manager, prune_pool, records,
@@ -414,7 +416,7 @@ class TestPropertyHelpers:
         manager = DatasetManager(_make_config())
         dsi = manager.datasets[0]
         dsi.config.remote = []
-        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        mock_subprocess.setup_multi(*_reads('pool/data', []))
         assert manager.get_anchors(dsi) == set()
         assert _subcommands(mock_subprocess) == ['get']
 
@@ -427,7 +429,7 @@ class TestPropertyHelpers:
         ])
         manager = DatasetManager(config)
         dsi = manager.datasets[0]
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (PROP_ANCHOR_PREFIX + 'offsite', 'autosnap_20240101120000', 'local'),
         ]))
         mocker.patch.object(manager, 'get_anchor', return_value='autosnap_20240101120000')
@@ -841,12 +843,6 @@ class TestPruneBatchFallbackAndStuck:
             assert ('descendant' in reason) is expected
 
 
-def zfs_get_exec_out():
-    """The mocked `zfs.get._exec_out` (installed by `PrunePool`)."""
-    import libzfseasy as zfs
-    return zfs.get._exec_out
-
-
 class TestPruneReReadsProtectionsBeforeEveryDestroy:
     """The pass's first read of the anchors and in-flight pins goes stale: the remote worker pins, sends,
     anchors and re-pins while the fallback retries a failed batch. `_still_prunable` re-reads them right
@@ -978,17 +974,16 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         old_base, new_anchor = olds[1], olds[2]
         prune_pool.props[self.DS] = [(PROP_ANCHOR_PREFIX + 'offsite', old_base, 'local')]
         recursive_reads = []
-        real_get = prune_pool._get
+        real_exec = prune_pool._exec
 
         def get(cmd):
-            if '-r' in cmd:
+            if cmd[1] == 'get' and '-r' in cmd:
                 recursive_reads.append(cmd)
                 if len(recursive_reads) == 2:       # the re-read's descendant read (the pass made the first)
                     prune_pool.props[self.DS] = [(PROP_ANCHOR_PREFIX + 'offsite', new_anchor, 'local')]
-            return real_get(cmd)
+            return real_exec(cmd)
 
-        mocker_target = zfs_get_exec_out()
-        mocker_target.side_effect = get
+        prune_pool.exec.side_effect = get
         with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
             manager.prune_snapshots(dsi)
         for ds in (self.DS, self.CH):
@@ -1163,17 +1158,51 @@ class FakeReceived:
     `datasets` is the list of names the listing returns; `local[name]` / `received[name]` map a
     property to the value `zfs get -s local|received` would print (a missing key reads as unset);
     `errors[(name, prop)]` makes that read raise. Every `zfs.get.value` call is recorded in `reads`
-    as `(name, prop, sources)`."""
+    as `(name, prop, sources)`.
 
-    def __init__(self, mocker, datasets=(), local=None, received=None, errors=None, list_error=None):
+    Plan B-1d: `received_datasets()` first tries ONE batch `zfs.get.rows`. `zfs.get.rows` is patched here too
+    (`self.rows`), and by default it returns no rows at all, so every dataset falls back to the per-dataset
+    `get.value` path these tests were written for. `batch=True` makes it answer from `local`/`received` the
+    way the real command would (rows `name`, `type`, `client_id`, `config` for each listed dataset);
+    `batch_omit` names datasets it has no group for at all (a clean batch that simply lacks them);
+    `batch_dropped` names datasets it reports as `dropped` (which, like any refused row, also counts as
+    `skipped`); `batch_error` makes it raise."""
+
+    def __init__(self, mocker, datasets=(), local=None, received=None, errors=None, list_error=None,
+                 batch=False, batch_dropped=(), batch_error=None, batch_omit=()):
         self.datasets = list(datasets)
         self.local = local or {}
         self.received = received or {}
         self.errors = errors or {}
         self.list_error = list_error
+        self.batch = batch
+        self.batch_dropped = frozenset(batch_dropped)
+        self.batch_omit = frozenset(batch_omit)
+        self.batch_error = batch_error
         self.reads = []
         self.list = mocker.patch('zfsbackup.backup_manager.zfs.list', side_effect=self._list)
         self.value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=self._value)
+        self.rows = mocker.patch('zfsbackup.backup_manager.zfs.get.rows', side_effect=self._rows)
+
+    def _rows(self, ds=None, properties='all', **kwargs):
+        if self.batch_error is not None:
+            raise self.batch_error
+        rows = []
+        if self.batch:
+            for name in self.datasets:
+                if name in self.batch_omit:
+                    continue
+                rows.append(GetRow(name, 'name', name, None, '-'))
+                rows.append(GetRow(name, 'type', 'filesystem', None, '-'))
+                for prop in properties:
+                    for table, source in ((self.local, 'local'), (self.received, 'received')):
+                        value = table.get(name, {}).get(prop)
+                        if value is not None:
+                            rows.append(GetRow(name, prop, value, None, source))
+                            break
+                    else:
+                        rows.append(GetRow(name, prop, '-', None, '-'))
+        return GetRows(rows, skipped=len(self.batch_dropped), dropped=self.batch_dropped)
 
     def _list(self, *args, **kwargs):
         if self.list_error is not None:
@@ -1243,6 +1272,115 @@ class TestReceivedDatasetsSuccess:
         assert dsi.config.name == 'pool/src'
         assert dsi.config.retention_rules[0].keep_for == timedelta(hours=9)
         assert dsi.config.recursive is False             # forced: received datasets are pruned flat
+
+
+class TestReceivedDatasetsBatch:
+    """Plan B-1d at the seam: `received_datasets()` takes each dataset's `client_id` and `config` from ONE
+    `zfs.get.rows` batch when its group was read cleanly, and from the exact per-dataset `get.value` path
+    otherwise. `zfs.get.rows` is faked here (`FakeReceived.rows`) to hand over GetRows the real parser could
+    not produce (a partial group, a dropped name that still has rows): the guards are defence in depth, and
+    this is the only place they can be reached.
+
+    Mutation counts (scratch copy, tests failing across the B-1d files): the partial-group guard removed 1
+    (this class); the `rows.dropped` guard removed 1 (this class); the `rows.complete` guard removed 8 (1 here,
+    7 in test_zfsbackup_prune_forged_bytes); a received value taken as local 3 (2 here, 1 there); the batch
+    made non-recursive 11; `verify_names=True` on the batch 6."""
+
+    T = 'pool/backups'
+    NAMES = ['pool/backups/c', 'pool/backups/c/a', 'pool/backups/c/b']
+
+    def local(self):
+        return {n: _client_props('c') for n in self.NAMES[1:]}
+
+    def run(self, mocker, **kw):
+        fake = FakeReceived(mocker, self.NAMES, local=self.local(), batch=True, **kw)
+        return fake, _remote_manager(self.T).received_datasets()
+
+    def test_a_clean_batch_serves_every_dataset_with_no_per_dataset_read(self, mocker):
+        fake, found = self.run(mocker)
+        assert [d.name for d in found] == self.NAMES[1:]
+        assert fake.reads == []
+        assert fake.rows.call_count == 1
+
+    def test_the_batch_asks_for_exactly_the_two_properties_recursively_without_the_check_list(self, mocker):
+        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+        fake, _ = self.run(mocker)
+        (call,) = fake.rows.call_args_list
+        assert call.args[0].name == self.T and call.args[1] == [PROP_CLIENT_ID, PROP_CONFIG]
+        assert call.kwargs['recursive'] is True and call.kwargs['received'] is False
+        assert call.kwargs['verify_names'] is False and call.kwargs['types'] == 'filesystem,volume'
+
+    def test_only_the_datasets_the_batch_lacks_are_read_one_at_a_time(self, mocker):
+        fake, found = self.run(mocker, batch_omit={'pool/backups/c/b'})
+        assert [d.name for d in found] == self.NAMES[1:]                 # b is served by the exact path
+        assert {n for n, _, _ in fake.reads} == {'pool/backups/c/b'}
+
+    def test_a_group_with_only_one_of_the_two_properties_is_read_one_at_a_time(self, mocker):
+        from zfsbackup.backup_manager import PROP_CLIENT_ID
+        fake = FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        honest = fake._rows
+
+        def partial(*a, **k):
+            rows = honest(*a, **k)
+            keep = [r for r in rows if not (r.name == 'pool/backups/c/a' and r.property != PROP_CLIENT_ID
+                                            and r.property not in ('name', 'type'))]
+            return GetRows(keep, skipped=0)
+
+        fake.rows.side_effect = partial
+        found = _remote_manager(self.T).received_datasets()
+        assert [d.name for d in found] == self.NAMES[1:]
+        assert {n for n, _, _ in fake.reads} == {'pool/backups/c/a'}
+
+    def test_a_dropped_name_is_not_taken_from_rows_the_batch_still_holds_for_it(self, mocker):
+        """Rows for a name AND the name in `dropped`: the rows are not trusted (here they claim the neighbour's
+        id for the victim); the exact path decides."""
+        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+        fake = FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        honest = fake._rows
+
+        def forged(*a, **k):
+            rows = honest(*a, **k)
+            out = [r._replace(value='other') if r.name == 'pool/backups/c/a' and r.property == PROP_CLIENT_ID
+                   else r for r in rows]
+            return GetRows(out, skipped=0, dropped={'pool/backups/c/a'})
+
+        fake.rows.side_effect = forged
+        found = _remote_manager(self.T).received_datasets()
+        assert [d.name for d in found] == self.NAMES[1:]                 # 'other' would put it outside its tree
+        assert {n for n, _, _ in fake.reads} == {'pool/backups/c/a'}
+
+    def test_an_incomplete_batch_trusts_nothing_and_warns_once(self, mocker, caplog):
+        fake = FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        honest = fake._rows
+        fake.rows.side_effect = lambda *a, **k: GetRows(list(honest(*a, **k)), skipped=1)
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            found = _remote_manager(self.T).received_datasets()
+        assert [d.name for d in found] == self.NAMES[1:]
+        assert {n for n, _, _ in fake.reads} == set(self.NAMES)          # every listed dataset, exactly
+        (warning,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'skipped 1 row' in warning
+
+    def test_a_failing_batch_sends_everything_to_the_exact_path_with_one_warning(self, mocker, caplog):
+        fake = FakeReceived(mocker, self.NAMES, local=self.local(), batch_error=RuntimeError('suspended'))
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            found = _remote_manager(self.T).received_datasets()
+        assert [d.name for d in found] == self.NAMES[1:]
+        assert {n for n, _, _ in fake.reads} == set(self.NAMES)
+        (warning,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'in one call' in warning and 'suspended' in warning
+
+    def test_a_received_value_is_never_a_local_one(self, mocker):
+        fake = FakeReceived(mocker, self.NAMES[1:2], received={self.NAMES[1]: _client_props('c')}, batch=True)
+        assert _remote_manager(self.T).received_datasets() == []
+
+    def test_a_received_only_config_is_the_warning_without_a_second_read(self, mocker, caplog):
+        from zfsbackup.backup_manager import PROP_CONFIG
+        fake = FakeReceived(mocker, self.NAMES[1:2], received={self.NAMES[1]: {PROP_CONFIG: 'x'}}, batch=True)
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            assert _remote_manager(self.T).received_datasets() == []
+        (warning,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'only received' in warning
+        assert fake.reads == []
 
 
 class TestReceivedDatasetsStopsAtASafePoint:
@@ -2071,20 +2209,18 @@ from zfsbackup.backup_manager import (  # noqa: E402
 
 
 def _zget(name, props, ptype='filesystem'):
-    """`zfs get -H -o name,property,value,received,source all <name>` lines.
+    """`zfs get -H -o name,property,value,source all <name>` lines (plan B-1d: four columns, no `received`).
 
-    `props` is a list of `(property, value, source)`; a `received` source also
-    fills the `received` column, like the real command. The shape is what a
-    real `zfs get -H -o name,property,value,received,source all <name>` prints:
-    the `type` row first, then the properties.
+    `props` is a list of `(property, value, source)`. The shape is what the real command prints: the
+    `type` row first (`all` has no `name` row), then the properties.
     """
-    # `zfs get all` opens with the `type` row (it has no `name` row: `name` is not a gettable
-    # property of `all`); libzfseasy's lead rule keys on that first row.
-    lines = [f'{name}\ttype\t{ptype}\t-\t-\n']
-    for prop, value, source in props:
-        received = value if source == 'received' else '-'
-        lines.append(f'{name}\t{prop}\t{value}\t{received}\t{source}\n')
-    return lines
+    return get_lines(name, props, ptype)
+
+
+def _reads(name, props, ptype='filesystem'):
+    """The two `mock_subprocess.setup_multi` configs of ONE `read_zfsbackup_properties(<name>)`: the `get`
+    and the name-only `zfs list` cross-check `zfs.get.rows` runs after it."""
+    return reads_(name, props, ptype)
 
 
 def _fail_get(mock_subprocess, stderr):
@@ -2098,8 +2234,19 @@ def _fail_get(mock_subprocess, stderr):
     return proc
 
 
-def _cmds(mock_subprocess):
+def _raw_cmds(mock_subprocess):
+    """Every argv `Popen` was given, in order."""
     return [c.args[0] for c in mock_subprocess.call_args_list]
+
+
+def _is_verify_list(cmd):
+    """The name-only `zfs list -H -o name,type ...` that `zfs.get.rows` runs after every `zfs get`."""
+    return cmd[1] == 'list' and cmd[2:5] == ['-H', '-o', 'name,type']
+
+
+def _cmds(mock_subprocess):
+    """The argvs issued, without the name-only verify list that follows each read."""
+    return [cmd for cmd in _raw_cmds(mock_subprocess) if not _is_verify_list(cmd)]
 
 
 def _subcommands(mock_subprocess):
@@ -2111,7 +2258,7 @@ A = PROP_ANCHOR_PREFIX
 
 class TestReadZfsbackupProperties:
     def test_returns_only_org_zfsbackup_properties(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             ('compression', 'lz4', 'local'),
             (PROP_CONFIG, '{"x":1}', 'local'),
             ('org.other:thing', 'nope', 'local'),
@@ -2122,7 +2269,7 @@ class TestReadZfsbackupProperties:
         assert result == {PROP_CONFIG: '{"x":1}', A + 'offsite': 'autosnap_1'}
 
     def test_local_and_received_sources_are_kept(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (PROP_CONFIG, 'c', 'local'),
             (A + 'dest', 'snap', 'received'),
         ]))
@@ -2136,21 +2283,21 @@ class TestReadZfsbackupProperties:
     def test_other_sources_are_ignored(self, mock_subprocess, source):
         """An inherited value belongs to an ancestor; acting on it would be
         acting on the wrong dataset."""
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (PROP_CONFIG, 'ancestors', source),
             (A + 'dest', 'ancestors', source),
         ]))
         assert read_zfsbackup_properties(Filesystem('pool/data')) == {}
 
     def test_a_local_property_is_kept_beside_an_inherited_one(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (PROP_CONFIG, 'inherited-config', 'inherited from pool'),
             (A + 'dest', 'mine', 'local'),
         ]))
         assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'dest': 'mine'}
 
     def test_values_are_returned_as_strings_verbatim(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (A + 'a', 'autosnap_20240101120000', 'local'),
             (A + 'b', 'has spaces: and colons', 'local'),
             (A + 'c', '12345', 'local'),
@@ -2161,39 +2308,42 @@ class TestReadZfsbackupProperties:
         assert result[A + 'c'] == '12345' and isinstance(result[A + 'c'], str)
 
     def test_no_properties_gives_an_empty_dict(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        mock_subprocess.setup_multi(*_reads('pool/data', []))
         assert read_zfsbackup_properties(Filesystem('pool/data')) == {}
 
-    def test_empty_output_gives_an_empty_dict(self, mock_subprocess):
-        mock_subprocess.setup(stdout=[])
-        assert read_zfsbackup_properties(Filesystem('pool/data')) == {}
+    def test_empty_output_fails_the_read(self, mock_subprocess):
+        """`zfs get` printed no rows at all, not even the `type` row every existing dataset starts with: a lost
+        group, an unknown protect-set. (An empty dict is only for a dataset that printed its rows.)"""
+        mock_subprocess.setup_multi(([],))
+        with pytest.raises(ZFSOutputError, match='no usable rows'):
+            read_zfsbackup_properties(Filesystem('pool/data'))
 
-    def test_only_the_named_dataset_is_read(self, mock_subprocess):
-        """A line group for any other dataset (a child, say) is not ours."""
-        mock_subprocess.setup(stdout=(
-            _zget('pool/data', [(PROP_CONFIG, 'parent', 'local')])
-            + _zget('pool/data/child', [(PROP_CONFIG, 'child', 'local'),
-                                         (A + 'x', 'y', 'local')])
-        ))
-        assert read_zfsbackup_properties(Filesystem('pool/data')) == {PROP_CONFIG: 'parent'}
+    def test_rows_of_another_dataset_make_the_read_fail_instead_of_being_ignored(self, mock_subprocess):
+        """B-1d: the old reader quietly filtered other datasets' rows out. A row outside the requested
+        object cannot come from zfs, so the read is untrusted and RAISES: the caller must not act on it."""
+        mock_subprocess.setup_multi(
+            (_zget('pool/data', [(PROP_CONFIG, 'parent', 'local')])
+             + _zget('pool/data/child', [(PROP_CONFIG, 'child', 'local'), (A + 'x', 'y', 'local')]),),
+        )
+        with pytest.raises(ZFSOutputError, match='could not be trusted'):
+            read_zfsbackup_properties(Filesystem('pool/data'))
 
     def test_dotted_and_hyphenated_destination_names(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (A + 'off-site.eu', 'snap', 'local'),
         ]))
         assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'off-site.eu': 'snap'}
 
-    def test_issues_a_single_zfs_get_for_the_dataset_and_nothing_else(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', []))
+    def test_issues_exactly_one_zfs_get_and_nothing_else(self, mock_subprocess):
+        """One dataset, one exec: no name-only cross-check list (the `type` row is checked directly)."""
+        mock_subprocess.setup_multi(*_reads('pool/data', []))
         read_zfsbackup_properties(Filesystem('pool/data'))
-        (cmd,) = _cmds(mock_subprocess)
-        assert cmd[1] == 'get'
-        assert cmd[-1] == 'pool/data'
-        assert 'all' in cmd
-        assert '-r' not in cmd, 'a recursive get would read the whole subtree'
+        (get_cmd,) = _raw_cmds(mock_subprocess)
+        assert get_cmd[1] == 'get' and get_cmd[-2:] == ['all', 'pool/data']
+        assert '-r' not in get_cmd, 'a recursive get would read the whole subtree'
 
     def test_works_on_a_plain_dataset_object(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [(PROP_CONFIG, 'c', 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(PROP_CONFIG, 'c', 'local')]))
         assert read_zfsbackup_properties(Dataset('pool/data')) == {PROP_CONFIG: 'c'}
 
     def test_zfs_errors_propagate(self, mock_subprocess):
@@ -2206,23 +2356,18 @@ class TestReadZfsbackupProperties:
         assert PROP_CONFIG.startswith(PROP_PREFIX) and PROP_ANCHOR_PREFIX.startswith(PROP_PREFIX)
 
 
-class TestReadZfsbackupPropertiesRawParse:
-    """Mutation counts (15.5, scratch copy, tests failing in this file's
-    `ReadZfsbackupProperties*` classes): the filter moved after a `zfs.get`
-    object build 11 (3 of them the unknown-builtin ones); the tab-preserving
-    join reduced to `parts[2]` 2; the source filter dropped 10; the name filter
-    dropped 2; `-s local,received` dropped from the command 2.
+class TestReadZfsbackupPropertiesRowReader:
+    """Plan B-1d: `read_zfsbackup_properties` is `zfs.get.rows(ds, 'all', ...)`, the framing-safe row reader,
+    so the properties of its datasets are read from rows that were checked, and a read that cannot be
+    checked RAISES. (The old private text parser -- tab recovery from a `received` column -- is gone;
+    its fail-closed replacement is exercised with forged rows in `test_zfsbackup_property_reads_forged.py`.)
 
-    Item 15.5: `read_zfsbackup_properties` reads the raw `zfs get` lines and
-    filters BEFORE anything becomes a libzfseasy object. `zfs.get(...)` builds
-    `ZFS` objects for every property of the dataset. libzfseasy used to raise
-    `ValueError` there for a local/received built-in it does not know (zvol
-    `volthreading`, FreeBSD `jailed`); it now keeps such names as extras, so the
-    raw parse is about doing only the work needed (our names, exact values,
-    local/received sources), not about avoiding that failure."""
+    Mutation counts (scratch copy, tests failing across the B-1d files): `strict=True` dropped from the own
+    reader 13 (3 here, 9 in test_zfsbackup_property_reads_forged, 1 in test_zfsbackup_prune_descendants) and from
+    the descendant reader 15; both source filters (`sources=` and the Python one) removed 17; the dataset's own
+    `type`-row check removed 2; the `received` column requested again 249."""
 
-    #: Real-shaped `-o name,property,value,received,source` output with
-    #: built-in properties libzfseasy has no class for.
+    #: Real-shaped output with built-in properties libzfseasy has no class for.
     UNKNOWN_BUILTINS = [
         ('volthreading', 'off', 'local'),
         ('jailed', 'on', 'local'),
@@ -2230,67 +2375,48 @@ class TestReadZfsbackupPropertiesRawParse:
     ]
 
     def test_unknown_builtin_local_properties_do_not_break_the_read(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/zv', self.UNKNOWN_BUILTINS, ptype='volume'))
+        mock_subprocess.setup_multi(*_reads('pool/zv', self.UNKNOWN_BUILTINS, ptype='volume'))
         assert read_zfsbackup_properties(Dataset('pool/zv')) == {PROP_CONFIG: 'cfg'}
 
     @pytest.mark.parametrize('prop, value', [('volthreading', 'off'), ('jailed', 'on')])
     def test_each_unknown_builtin_alone_is_ignored_not_raised(self, mock_subprocess, prop, value):
-        mock_subprocess.setup(stdout=_zget('pool/zv', [(prop, value, 'local')], ptype='volume'))
+        mock_subprocess.setup_multi(*_reads('pool/zv', [(prop, value, 'local')], ptype='volume'))
         assert read_zfsbackup_properties(Dataset('pool/zv')) == {}
-
-    def test_the_object_path_now_accepts_the_same_output_as_extras(self, mock_subprocess):
-        """Control: building ZFS objects from the identical output no longer raises (libzfseasy keeps well-formed
-        native names it does not know in an extras store), so the raw parse is not needed to avoid a failure. It is
-        kept for what the object path would still not give: only our user properties, exact tab-containing values,
-        and local/received sources only."""
-        import libzfseasy as zfs
-
-        mock_subprocess.setup(stdout=_zget('pool/zv', [
-            ('futurething', 'off', 'local'),      # an invented native name no libzfseasy class knows
-            ('jailed', 'on', 'local'),
-            (PROP_CONFIG, 'cfg', 'local'),
-        ], ptype='volume'))
-        (obj,) = list(zfs.get(Dataset('pool/zv'), properties=['all'], sources=['local', 'received']))
-        assert obj['futurething'].value == 'off'
-        assert obj['jailed'].value == 'on'
-        assert sorted(obj._extra_props) == ['futurething', 'jailed']
-        assert obj[PROP_CONFIG].value == 'cfg'
-
-    def test_the_raw_parse_still_returns_only_our_names_with_exact_values(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/zv', self.UNKNOWN_BUILTINS + [
-            (A + 'tabbed', 'left\tright', 'local'),
-            (A + 'recv', 'x\ty', 'received'),
-            (A + 'inh', 'nope', 'inherited from pool'),
-        ], ptype='volume'))
-        assert read_zfsbackup_properties(Dataset('pool/zv')) == {
-            PROP_CONFIG: 'cfg', A + 'tabbed': 'left\tright', A + 'recv': 'x\ty',
-        }
 
     def test_the_exact_command_line(self, mock_subprocess, monkeypatch):
         monkeypatch.setenv('ZFS_CMD', '/usr/bin/true')
-        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        mock_subprocess.setup_multi(*_reads('pool/data', []))
         read_zfsbackup_properties(Filesystem('pool/data'))
-        (cmd,) = _cmds(mock_subprocess)
-        assert cmd == [
-            '/usr/bin/true', 'get', '-H', '-o', 'name,property,value,received,source',
-            '-s', 'local,received', 'all', 'pool/data',
+        assert _raw_cmds(mock_subprocess) == [
+            ['/usr/bin/true', 'get', '-H', '-o', 'name,property,value,source',
+             '-t', 'filesystem,volume', 'all', 'pool/data'],
         ]
 
+    def test_the_received_column_is_not_requested(self, mock_subprocess):
+        """The `received` column holds the sending host's raw bytes; no `-o` list that names it is sent,
+        and no `-s` (it would drop the `type` rows the reader's lead rule needs)."""
+        mock_subprocess.setup_multi(*_reads('pool/data', []))
+        read_zfsbackup_properties(Filesystem('pool/data'))
+        for cmd in _raw_cmds(mock_subprocess):
+            assert 'name,property,value,received,source' not in cmd
+            assert '-s' not in cmd
+
     def test_the_binary_is_resolved_at_call_time(self, mock_subprocess, monkeypatch):
-        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        mock_subprocess.setup_multi(*_reads('pool/data', []))
         monkeypatch.setenv('ZFS_CMD', '/opt/zfs/bin/zfs')
         read_zfsbackup_properties(Filesystem('pool/data'))
-        assert _cmds(mock_subprocess)[0][0] == '/opt/zfs/bin/zfs'
+        assert {c[0] for c in _raw_cmds(mock_subprocess)} == {'/opt/zfs/bin/zfs'}
 
     def test_an_inherited_zfsbackup_property_is_excluded(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data/child', [
+        mock_subprocess.setup_multi(*_reads('pool/data/child', [
             (PROP_CONFIG, 'from-parent', 'inherited from pool/data'),
             (A + 'dest', 'mine', 'local'),
         ]))
         assert read_zfsbackup_properties(Filesystem('pool/data/child')) == {A + 'dest': 'mine'}
 
     def test_a_tab_inside_a_value_survives(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        """Four columns, no `received`: everything between the property and the last column is the value."""
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (A + 'tabbed', 'left\tright', 'local'),
             (A + 'two', 'a\tb\tc', 'local'),
         ]))
@@ -2298,62 +2424,69 @@ class TestReadZfsbackupPropertiesRawParse:
             A + 'tabbed': 'left\tright', A + 'two': 'a\tb\tc',
         }
 
-    def test_a_received_value_without_a_tab_is_not_confused_with_its_received_column(
-        self, mock_subprocess
-    ):
-        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'r', 'xy', 'received')]))
-        assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'r': 'xy'}
-
-    def test_a_tabbed_received_value_survives(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'r', 'x\ty', 'received')]))
+    def test_a_received_value_is_kept_with_its_source(self, mock_subprocess):
+        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'r', 'x\ty', 'received')]))
         assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'r': 'x\ty'}
 
     def test_an_empty_value_is_an_empty_string(self, mock_subprocess):
-        mock_subprocess.setup(stdout=['pool/data\t' + A + 'e\t\t-\tlocal\n'])
+        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'e', '', 'local')]))
         assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'e': ''}
 
-    def test_short_lines_are_skipped(self, mock_subprocess):
-        mock_subprocess.setup(stdout=[
-            'pool/data\t' + A + 'bad\tvalue\n',
-            'garbage\n',
-            *_zget('pool/data', [(A + 'ok', 'v', 'local')]),
-        ])
-        assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'ok': 'v'}
+    def test_a_short_line_makes_the_read_fail_instead_of_being_skipped(self, mock_subprocess):
+        """The old parser dropped a short line silently and returned the rest -- a smaller protect-set."""
+        mock_subprocess.setup_multi(
+            (['pool/data\t' + A + 'bad\n', *_zget('pool/data', [(A + 'ok', 'v', 'local')])],),
+        )
+        with pytest.raises(ZFSOutputError):
+            read_zfsbackup_properties(Filesystem('pool/data'))
 
-    def test_a_foreign_dataset_name_is_excluded_even_with_a_matching_property(
-        self, mock_subprocess
-    ):
-        mock_subprocess.setup(stdout=_zget('pool/data2', [(A + 'x', 'y', 'local')]))
-        assert read_zfsbackup_properties(Filesystem('pool/data')) == {}
+    def test_garbage_makes_the_read_fail(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (['garbage\n', *_zget('pool/data', [(A + 'ok', 'v', 'local')])],),
+        )
+        with pytest.raises(ZFSOutputError):
+            read_zfsbackup_properties(Filesystem('pool/data'))
+
+    def test_a_foreign_dataset_makes_the_read_fail(self, mock_subprocess):
+        mock_subprocess.setup_multi((_zget('pool/data2', [(A + 'x', 'y', 'local')]),))
+        with pytest.raises(ZFSOutputError):
+            read_zfsbackup_properties(Filesystem('pool/data'))
+
+    def test_a_group_without_a_type_row_makes_the_read_fail(self, mock_subprocess):
+        """Rows for the dataset that do not start with its `type` row are refused by the row reader; a read
+        that ends with no usable group of the dataset's own is an unknown protect-set."""
+        mock_subprocess.setup_multi((['pool/data\t' + A + 'x\tv\tlocal\n'],))
+        with pytest.raises(ZFSOutputError):
+            read_zfsbackup_properties(Filesystem('pool/data'))
 
     def test_a_property_that_merely_contains_the_prefix_is_excluded(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             ('x' + PROP_CONFIG, 'v', 'local'),
             ('org.zfsbackupX:cfg', 'v', 'local'),
         ]))
         assert read_zfsbackup_properties(Filesystem('pool/data')) == {}
 
     def test_no_libzfseasy_object_is_built(self, mock_subprocess, mocker):
-        """The filter runs on raw text: `ZFS.update` is never reached."""
-        mock_subprocess.setup(stdout=_zget('pool/zv', self.UNKNOWN_BUILTINS, ptype='volume'))
+        """Rows, not objects: `ZFS.update` is never reached."""
+        mock_subprocess.setup_multi(*_reads('pool/zv', self.UNKNOWN_BUILTINS, ptype='volume'))
         update = mocker.patch('libzfseasy.types.ZFS.update')
         read_zfsbackup_properties(Dataset('pool/zv'))
         update.assert_not_called()
 
     def test_through_a_real_process_with_a_fake_zfs_command(self, tmp_path, monkeypatch):
-        """No `Popen` mock: a stand-in `zfs` writes real tab-separated output to
-        a real pipe, so the tab in the value and the argument vector are
-        proven end to end."""
+        """No `Popen` mock: a stand-in `zfs` writes real tab-separated output to a real pipe, so the
+        argument vector and a tab in the value are proven end to end."""
         argv_log = tmp_path / 'argv'
         fake = tmp_path / 'zfs'
         fake.write_text(
             '#!/bin/sh\n'
-            f'printf \'%s\\n\' "$@" > {argv_log}\n'
-            "printf 'pool/data\\tvolthreading\\toff\\t-\\tlocal\\n'\n"
-            "printf 'pool/data\\tjailed\\ton\\t-\\tlocal\\n'\n"
-            "printf 'pool/data\\torg.zfsbackup:config\\ta\\tb\\t-\\tlocal\\n'\n"
-            "printf 'pool/data\\torg.zfsbackup:anchor.d\\tsnap\\t-\\tinherited from pool\\n'\n"
-            "printf 'pool/data\\torg.zfsbackup:anchor.r\\trv\\trv\\treceived\\n'\n"
+            f'{{ printf \'%s\\n\' "$@"; echo --; }} >> {argv_log}\n'
+            "printf 'pool/data\\ttype\\tfilesystem\\t-\\n'\n"
+            "printf 'pool/data\\tvolthreading\\toff\\tlocal\\n'\n"
+            "printf 'pool/data\\tjailed\\ton\\tlocal\\n'\n"
+            "printf 'pool/data\\torg.zfsbackup:config\\ta\\tb\\tlocal\\n'\n"
+            "printf 'pool/data\\torg.zfsbackup:anchor.d\\tsnap\\tinherited from pool\\n'\n"
+            "printf 'pool/data\\torg.zfsbackup:anchor.r\\trv\\treceived\\n'\n"
         )
         fake.chmod(0o755)
         monkeypatch.setenv('ZFS_CMD', str(fake))
@@ -2362,8 +2495,7 @@ class TestReadZfsbackupPropertiesRawParse:
             A + 'r': 'rv',
         }
         assert argv_log.read_text().split('\n')[:-1] == [
-            'get', '-H', '-o', 'name,property,value,received,source',
-            '-s', 'local,received', 'all', 'pool/data',
+            'get', '-H', '-o', 'name,property,value,source', '-t', 'filesystem,volume', 'all', 'pool/data', '--',
         ]
 
 
@@ -2372,7 +2504,7 @@ class TestCopyAnchorProperty:
 
     def test_copy_anchor_property_copies_the_value_and_reports_copied(self, mock_subprocess):
         mock_subprocess.setup_multi(
-            (_zget('pool/data', [(A + 'old', 'autosnap_20240101120000', 'local')]),),
+            *_reads('pool/data', [(A + 'old', 'autosnap_20240101120000', 'local')]),
             ('',),
         )
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
@@ -2382,7 +2514,7 @@ class TestCopyAnchorProperty:
 
     def test_copy_anchor_property_never_deletes_the_old_property(self, mock_subprocess):
         mock_subprocess.setup_multi(
-            (_zget('pool/data', [(A + 'old', 'snap', 'local')]),),
+            *_reads('pool/data', [(A + 'old', 'snap', 'local')]),
             ('',),
         )
         copy_anchor_property(self.DS(), 'old', 'new')
@@ -2393,7 +2525,7 @@ class TestCopyAnchorProperty:
 
     def test_copy_anchor_property_sets_only_the_new_property(self, mock_subprocess):
         mock_subprocess.setup_multi(
-            (_zget('pool/data', [(A + 'old', 'snap', 'local'), (A + 'other', 'x', 'local')]),),
+            *_reads('pool/data', [(A + 'old', 'snap', 'local'), (A + 'other', 'x', 'local')]),
             ('',),
         )
         copy_anchor_property(self.DS(), 'old', 'new')
@@ -2401,18 +2533,18 @@ class TestCopyAnchorProperty:
         assert [a for a in set_cmd if '=' in a] == [f'{A}new=snap']
 
     def test_copy_anchor_property_no_source(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [(PROP_CONFIG, 'c', 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(PROP_CONFIG, 'c', 'local')]))
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'no-source'
         assert _subcommands(mock_subprocess) == ['get']
 
     def test_copy_anchor_property_no_source_even_if_the_destination_exists(self, mock_subprocess):
         """Nothing to copy takes precedence over "target already there"."""
-        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'new', 'x', 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'new', 'x', 'local')]))
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'no-source'
         assert _subcommands(mock_subprocess) == ['get']
 
     def test_copy_anchor_property_exists_is_left_alone(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (A + 'old', 'from-old', 'local'),
             (A + 'new', 'already-there', 'local'),
         ]))
@@ -2420,7 +2552,7 @@ class TestCopyAnchorProperty:
         assert _subcommands(mock_subprocess) == ['get'], 'must not overwrite'
 
     def test_copy_anchor_property_an_inherited_old_value_is_not_a_source(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (A + 'old', 'ancestors', 'inherited from pool'),
         ]))
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'no-source'
@@ -2429,23 +2561,23 @@ class TestCopyAnchorProperty:
         self, mock_subprocess
     ):
         mock_subprocess.setup_multi(
-            (_zget('pool/data', [
+            *_reads('pool/data', [
                 (A + 'old', 'mine', 'local'),
                 (A + 'new', 'ancestors', 'inherited from pool'),
-            ]),),
+            ]),
             ('',),
         )
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
 
     def test_copy_anchor_property_a_received_old_value_is_a_source(self, mock_subprocess):
         mock_subprocess.setup_multi(
-            (_zget('pool/data', [(A + 'old', 'snap', 'received')]),),
+            *_reads('pool/data', [(A + 'old', 'snap', 'received')]),
             ('',),
         )
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
 
     def test_copy_anchor_property_dry_run_issues_no_zfs_set(self, mock_subprocess, caplog):
-        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'old', 'snap', 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'old', 'snap', 'local')]))
         with caplog.at_level(logging.INFO):
             result = copy_anchor_property(self.DS(), 'old', 'new', dry_run=True)
         assert result == 'dry-run'
@@ -2455,9 +2587,9 @@ class TestCopyAnchorProperty:
     def test_copy_anchor_property_dry_run_does_not_change_the_other_outcomes(
         self, mock_subprocess
     ):
-        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        mock_subprocess.setup_multi(*_reads('pool/data', []))
         assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True) == 'no-source'
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (A + 'old', 'a', 'local'), (A + 'new', 'b', 'local'),
         ]))
         assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True) == 'exists'
@@ -2469,20 +2601,20 @@ class TestCopyAnchorProperty:
 
     def test_copy_anchor_property_dotted_destination_names(self, mock_subprocess):
         mock_subprocess.setup_multi(
-            (_zget('pool/data', [(A + 'off.site-1', 'snap', 'local')]),),
+            *_reads('pool/data', [(A + 'off.site-1', 'snap', 'local')]),
             ('',),
         )
         assert copy_anchor_property(self.DS(), 'off.site-1', 'off.site-2') == 'copied'
         assert _cmds(mock_subprocess)[1][2] == f'{A}off.site-2=snap'
 
     def test_copy_anchor_property_same_name_is_exists(self, mock_subprocess):
-        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'same', 'snap', 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'same', 'snap', 'local')]))
         assert copy_anchor_property(self.DS(), 'same', 'same') == 'exists'
         assert _subcommands(mock_subprocess) == ['get']
 
     def test_copy_anchor_property_a_set_failure_propagates(self, mock_subprocess):
         mock_subprocess.setup_multi(
-            (_zget('pool/data', [(A + 'old', 'snap', 'local')]),),
+            *_reads('pool/data', [(A + 'old', 'snap', 'local')]),
             ([], 'cannot set property: permission denied', 1),
         )
         with pytest.raises(Exception, match='permission denied'):
@@ -2499,9 +2631,9 @@ class TestCopyAnchorProperty:
     def test_copy_anchor_property_is_idempotent(self, mock_subprocess):
         """Second run sees the destination and does nothing."""
         mock_subprocess.setup_multi(
-            (_zget('pool/data', [(A + 'old', 'snap', 'local')]),),
+            *_reads('pool/data', [(A + 'old', 'snap', 'local')]),
             ('',),
-            (_zget('pool/data', [(A + 'old', 'snap', 'local'), (A + 'new', 'snap', 'local')]),),
+            *_reads('pool/data', [(A + 'old', 'snap', 'local'), (A + 'new', 'snap', 'local')]),
         )
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'exists'
@@ -2524,7 +2656,7 @@ class TestClearZfsbackupProperties:
     def _arrange(self, mock_subprocess, props=None):
         n_inherits = 8
         mock_subprocess.setup_multi(
-            (_zget('pool/data', self.FULL if props is None else props),),
+            *_reads('pool/data', self.FULL if props is None else props),
             *[('',)] * n_inherits,
         )
 
@@ -2679,7 +2811,7 @@ class TestClearZfsbackupProperties:
 
     def test_an_inherit_failure_propagates_and_stops_at_the_failure(self, mock_subprocess):
         mock_subprocess.setup_multi(
-            (_zget('pool/data', self.FULL),),
+            *_reads('pool/data', self.FULL),
             ('',),                                                    # config ok
             ([], "cannot inherit: permission denied", 1),             # first anchor fails
             ('',),
@@ -2713,7 +2845,7 @@ def _anchor_manager(*destinations):
 class TestGetAnchors:
     def test_every_local_anchor_counts_configured_or_not(self, mock_subprocess, mocker):
         manager, dsi = _anchor_manager('offsite')
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (A + 'offsite', 'autosnap_1', 'local'),
             (A + 'renamed-away', 'autosnap_2', 'local'),
         ]))
@@ -2723,12 +2855,12 @@ class TestGetAnchors:
     def test_a_received_anchor_counts(self, mock_subprocess):
         # on a receiving server it is the client's incremental base
         manager, dsi = _anchor_manager()
-        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'client', 'autosnap_3', 'received')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'client', 'autosnap_3', 'received')]))
         assert manager.get_anchors(dsi) == {'autosnap_3'}
 
     def test_an_inherited_value_is_not_in_the_raw_read(self, mock_subprocess, mocker):
         manager, dsi = _anchor_manager('offsite')
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (A + 'ancestors', 'autosnap_9', 'inherited from pool'),
         ]))
         mocker.patch.object(manager, '_get_prop', return_value=None)
@@ -2738,7 +2870,7 @@ class TestGetAnchors:
         # `get_anchor` also sees inherited values: the result stays a superset
         # of what it was before the raw read existed.
         manager, dsi = _anchor_manager('offsite', 'dc2')
-        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'offsite', 'autosnap_1', 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'offsite', 'autosnap_1', 'local')]))
         values = {'offsite': 'autosnap_1', 'dc2': 'autosnap_inherited'}
         mocker.patch.object(manager, 'get_anchor', side_effect=lambda dsi_, dest: values[dest])
         assert manager.get_anchors(dsi) == {'autosnap_1', 'autosnap_inherited'}
@@ -2746,19 +2878,18 @@ class TestGetAnchors:
     @pytest.mark.parametrize('value', ['-', ''])
     def test_empty_and_dash_values_are_skipped(self, mock_subprocess, value):
         manager, dsi = _anchor_manager()
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (A + 'x', value, 'local'), (A + 'y', 'autosnap_4', 'local'),
         ]))
         assert manager.get_anchors(dsi) == {'autosnap_4'}
 
     def test_other_zfsbackup_properties_and_builtins_are_ignored(self, mock_subprocess):
         manager, dsi = _anchor_manager()
-        lines = _zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (PROP_CONFIG, 'cfg', 'local'),
             ('volthreading', 'on', 'local'),  # a built-in libzfseasy would choke on
             (A + 'ok', 'autosnap_5', 'local'),
-        ])
-        mock_subprocess.setup(stdout=lines)
+        ]))
         assert manager.get_anchors(dsi) == {'autosnap_5'}
 
     def test_a_read_failure_raises(self, mock_subprocess):
@@ -2774,7 +2905,7 @@ class TestOrphanAnchorLogging:
 
     def run_twice(self, manager, dsi, mock_subprocess, props, caplog, times=2):
         for _ in range(times):
-            mock_subprocess.setup(stdout=_zget('pool/data', props))
+            mock_subprocess.setup_multi(*_reads('pool/data', props))
             manager.get_anchors(dsi)
 
     def test_debug_every_call_and_info_once(self, mock_subprocess, caplog):
@@ -2829,8 +2960,8 @@ class TestPruneHonoursEveryAnchor:
         manager, dsi, snaps = _pruning_manager()
         mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
         dsi.snapshots = snaps
-        orphan = _zget('pool/data', [(A + 'renamed-away', snaps[2].name, 'local')])
-        mock_subprocess.setup_multi((orphan,), (orphan,))      # the pass's read, then the one before the destroy
+        orphan = _reads('pool/data', [(A + 'renamed-away', snaps[2].name, 'local')])
+        mock_subprocess.setup_multi(*orphan, *orphan)      # the pass's read, then the one before the destroy
         mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
         manager.prune_snapshots(dsi)
         destroyed = self.destroyed(mock_destroy)
@@ -2841,8 +2972,8 @@ class TestPruneHonoursEveryAnchor:
         manager, dsi, snaps = _pruning_manager()
         mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
         dsi.snapshots = snaps
-        none = _zget('pool/data', [])
-        mock_subprocess.setup_multi((none,), (none,))
+        none = _reads('pool/data', [])
+        mock_subprocess.setup_multi(*none, *none)
         mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
         manager.prune_snapshots(dsi)
         assert self.destroyed(mock_destroy) == [s.snapshot for s in snaps[1:]]
@@ -2851,7 +2982,7 @@ class TestPruneHonoursEveryAnchor:
         manager, dsi, snaps = _pruning_manager()
         mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
         dsi.snapshots = snaps
-        mock_subprocess.setup(stdout=_zget('pool/data', [(A + 'x', snaps[3].name, 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'x', snaps[3].name, 'local')]))
         mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
         manager.prune_snapshots(dsi)
         assert snaps[0].snapshot not in self.destroyed(mock_destroy)
@@ -2861,7 +2992,7 @@ class TestPruneHonoursEveryAnchor:
         manager, dsi, snaps = _pruning_manager(['offsite'])
         mocker.patch.object(manager, 'list_snapshots', return_value=snaps)
         dsi.snapshots = snaps
-        mock_subprocess.setup(stdout=_zget('pool/data', []))
+        mock_subprocess.setup_multi(*_reads('pool/data', []))
         mocker.patch.object(manager, '_get_prop', return_value=snaps[1].name)
         mock_destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
         manager.prune_snapshots(dsi)
@@ -2911,43 +3042,43 @@ class TestCopyAnchorPropertyOverwrite:
             rows.append((A + 'old', old, 'local'))
         if new is not None:
             rows.append((A + 'new', new, new_source))
-        return _zget('pool/data', rows)
+        return _reads('pool/data', rows)
 
     def test_overwrite_with_an_absent_target_is_copied(self, mock_subprocess):
-        mock_subprocess.setup_multi((self.props('snap'),), ('',))
+        mock_subprocess.setup_multi(*self.props('snap'), ('',))
         assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'copied'
         assert _cmds(mock_subprocess)[1][1:] == ['set', f'{A}new=snap', 'pool/data']
 
     def test_overwrite_replaces_a_different_value(self, mock_subprocess):
-        mock_subprocess.setup_multi((self.props('newer', 'older'),), ('',))
+        mock_subprocess.setup_multi(*self.props('newer', 'older'), ('',))
         assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'overwritten'
         assert _subcommands(mock_subprocess) == ['get', 'set']
         assert _cmds(mock_subprocess)[1][2] == f'{A}new=newer'
 
     def test_overwrite_with_an_equal_value_is_same_and_sets_nothing(self, mock_subprocess):
-        mock_subprocess.setup(stdout=self.props('snap', 'snap'))
+        mock_subprocess.setup_multi(*self.props('snap', 'snap'))
         assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'same'
         assert _subcommands(mock_subprocess) == ['get']
 
     def test_without_overwrite_any_existing_value_is_exists(self, mock_subprocess):
         for new in ('different', 'snap'):  # equal or not: left alone
             for kwargs in ({}, {'overwrite': False}):
-                mock_subprocess.setup(stdout=self.props('snap', new))
+                mock_subprocess.setup_multi(*self.props('snap', new))
                 assert copy_anchor_property(self.DS(), 'old', 'new', **kwargs) == 'exists'
         assert 'set' not in _subcommands(mock_subprocess)
 
     def test_no_source_is_decided_first_whatever_overwrite_says(self, mock_subprocess):
-        mock_subprocess.setup(stdout=self.props(None, 'something'))
+        mock_subprocess.setup_multi(*self.props(None, 'something'))
         assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'no-source'
         assert _subcommands(mock_subprocess) == ['get']
 
     def test_dry_run_with_an_absent_target_is_dry_run(self, mock_subprocess):
-        mock_subprocess.setup(stdout=self.props('snap'))
+        mock_subprocess.setup_multi(*self.props('snap'))
         assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True) == 'dry-run'
         assert _subcommands(mock_subprocess) == ['get']
 
     def test_dry_run_with_a_different_target_names_the_overwrite(self, mock_subprocess, caplog):
-        mock_subprocess.setup(stdout=self.props('newer', 'older'))
+        mock_subprocess.setup_multi(*self.props('newer', 'older'))
         with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
             result = copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True)
         assert result == 'dry-run'
@@ -2955,11 +3086,11 @@ class TestCopyAnchorPropertyOverwrite:
         assert 'Would overwrite' in caplog.text and 'older' in caplog.text and 'newer' in caplog.text
 
     def test_dry_run_with_an_equal_target_is_still_same(self, mock_subprocess):
-        mock_subprocess.setup(stdout=self.props('snap', 'snap'))
+        mock_subprocess.setup_multi(*self.props('snap', 'snap'))
         assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True) == 'same'
 
     def test_dry_run_without_overwrite_on_an_existing_target_is_exists(self, mock_subprocess):
-        mock_subprocess.setup(stdout=self.props('a', 'b'))
+        mock_subprocess.setup_multi(*self.props('a', 'b'))
         assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True) == 'exists'
 
     def test_overwrite_is_keyword_only(self):
@@ -2975,24 +3106,24 @@ class TestCopyAnchorPropertyOverwrite:
         assert parameter.default is False and parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
     def test_overwrite_never_touches_the_old_property(self, mock_subprocess):
-        mock_subprocess.setup_multi((self.props('newer', 'older'),), ('',))
+        mock_subprocess.setup_multi(*self.props('newer', 'older'), ('',))
         copy_anchor_property(self.DS(), 'old', 'new', overwrite=True)
         for cmd in _cmds(mock_subprocess):
             assert 'inherit' not in cmd and f'{A}old' not in cmd[2:]
 
     def test_an_inherited_target_is_not_a_blocker_even_without_overwrite(self, mock_subprocess):
-        mock_subprocess.setup_multi((self.props('snap', 'ancestors', 'inherited from pool'),), ('',))
+        mock_subprocess.setup_multi(*self.props('snap', 'ancestors', 'inherited from pool'), ('',))
         assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'copied'
 
     def test_a_received_target_counts_as_existing(self, mock_subprocess):
-        mock_subprocess.setup_multi((self.props('newer', 'older', 'received'),), ('',))
+        mock_subprocess.setup_multi(*self.props('newer', 'older', 'received'), ('',))
         assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'overwritten'
 
     def test_overwrite_twice_is_overwritten_then_same(self, mock_subprocess):
         mock_subprocess.setup_multi(
-            (self.props('newer', 'older'),),
+            *self.props('newer', 'older'),
             ('',),
-            (self.props('newer', 'newer'),),
+            *self.props('newer', 'newer'),
         )
         assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'overwritten'
         assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'same'
@@ -3000,7 +3131,7 @@ class TestCopyAnchorPropertyOverwrite:
 
     def test_a_failing_overwrite_set_propagates(self, mock_subprocess):
         mock_subprocess.setup_multi(
-            (self.props('newer', 'older'),),
+            *self.props('newer', 'older'),
             ([], 'cannot set property: permission denied', 1),
         )
         with pytest.raises(Exception, match='permission denied'):
@@ -3202,7 +3333,7 @@ class TestGetAnchorsWithInflight:
     def test_the_union_of_the_anchor_and_both_inflight_names(self, mock_subprocess, mocker):
         manager = self._manager()
         dsi = manager.datasets[0]
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (PROP_ANCHOR_PREFIX + 'offsite', 'autosnap_1', 'local'),
             (IF + 'offsite', 'autosnap_1,autosnap_2', 'local'),
         ]))
@@ -3211,7 +3342,7 @@ class TestGetAnchorsWithInflight:
 
     def test_the_from_side_alone_protects_an_older_base(self, mock_subprocess, mocker):
         manager = self._manager()
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (PROP_ANCHOR_PREFIX + 'offsite', 'autosnap_3', 'local'),
             (IF + 'offsite', 'autosnap_1,autosnap_2', 'local'),
         ]))
@@ -3222,19 +3353,19 @@ class TestGetAnchorsWithInflight:
 
     def test_a_full_send_pin_protects_only_the_target(self, mock_subprocess, mocker):
         manager = self._manager()
-        mock_subprocess.setup(stdout=_zget('pool/data', [(IF + 'offsite', ',autosnap_2', 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', ',autosnap_2', 'local')]))
         mocker.patch.object(manager, 'get_anchor', return_value=None)
         assert manager.get_anchors(manager.datasets[0]) == {'autosnap_2'}
 
     def test_a_received_inflight_pin_counts(self, mock_subprocess, mocker):
         manager = self._manager()
-        mock_subprocess.setup(stdout=_zget('pool/data', [(IF + 'offsite', 'a,b', 'received')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', 'a,b', 'received')]))
         mocker.patch.object(manager, 'get_anchor', return_value=None)
         assert manager.get_anchors(manager.datasets[0]) == {'a', 'b'}
 
     def test_an_inherited_inflight_pin_does_not_count(self, mock_subprocess, mocker):
         manager = self._manager()
-        mock_subprocess.setup(stdout=_zget('pool/data', [(IF + 'offsite', 'a,b', 'inherited from pool')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', 'a,b', 'inherited from pool')]))
         mocker.patch.object(manager, 'get_anchor', return_value=None)
         assert manager.get_anchors(manager.datasets[0]) == set()
 
@@ -3243,7 +3374,7 @@ class TestGetAnchorsWithInflight:
         self, mock_subprocess, mocker, caplog, value
     ):
         manager = self._manager(destinations=())
-        mock_subprocess.setup(stdout=_zget('pool/data', [(IF + 'gone', value, 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'gone', value, 'local')]))
         with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
             assert manager.get_anchors(manager.datasets[0]) == set()
         assert 'gone' not in caplog.text
@@ -3254,7 +3385,7 @@ class TestGetAnchorsWithInflight:
         manager = self._manager(destinations=())
         dsi = manager.datasets[0]
         props = [(IF + 'old-site', 'autosnap_1,autosnap_2', 'local')]
-        mock_subprocess.setup_multi((_zget('pool/data', props),), (_zget('pool/data', props),))
+        mock_subprocess.setup_multi(*_reads('pool/data', props), *_reads('pool/data', props))
         with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
             assert manager.get_anchors(dsi) == {'autosnap_1', 'autosnap_2'}
             assert manager.get_anchors(dsi) == {'autosnap_1', 'autosnap_2'}
@@ -3268,7 +3399,7 @@ class TestGetAnchorsWithInflight:
 
     def test_a_configured_destination_is_not_announced(self, mock_subprocess, mocker, caplog):
         manager = self._manager()
-        mock_subprocess.setup(stdout=_zget('pool/data', [(IF + 'offsite', 'a,b', 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', 'a,b', 'local')]))
         mocker.patch.object(manager, 'get_anchor', return_value=None)
         with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
             manager.get_anchors(manager.datasets[0])
@@ -3278,7 +3409,7 @@ class TestGetAnchorsWithInflight:
         self, mock_subprocess, caplog
     ):
         manager = self._manager(destinations=())
-        mock_subprocess.setup(stdout=_zget('pool/data', [
+        mock_subprocess.setup_multi(*_reads('pool/data', [
             (PROP_ANCHOR_PREFIX + 'x', 's1', 'local'),
             (IF + 'x', 's2,s3', 'local'),
         ]))
@@ -3312,7 +3443,7 @@ class TestClearZfsbackupPropertiesWithInflight:
     ]
 
     def _arrange(self, mock_subprocess):
-        mock_subprocess.setup_multi((_zget('pool/data', self.PROPS),), *[('',)] * 8)
+        mock_subprocess.setup_multi(*_reads('pool/data', self.PROPS), *[('',)] * 8)
 
     def _inherited(self, mock_subprocess):
         return [cmd[2] for cmd in _cmds(mock_subprocess) if cmd[1] == 'inherit']
@@ -3344,7 +3475,7 @@ class TestClearZfsbackupPropertiesWithInflight:
 
     def test_a_dataset_with_only_inflight_pins_is_cleared_by_anchors_true(self, mock_subprocess):
         mock_subprocess.setup_multi(
-            (_zget('pool/data', [(IF + 'x', 'a,b', 'local')]),), ('',),
+            *_reads('pool/data', [(IF + 'x', 'a,b', 'local')]), ('',),
         )
         assert clear_zfsbackup_properties(self.DS(), config=False, anchors=True) == [IF + 'x']
 
@@ -3468,10 +3599,7 @@ class TestUnrepresentableNamesInZfsOutput:
     ):
         rows = self._rows()
         # list (with the odd rows), then the anchor-property read for the protect-set
-        mock_subprocess.setup_multi(
-            (rows['lines'],),
-            (['pool/data\tname\tpool/data\t-\t-\n', 'pool/data\ttype\tfilesystem\t-\t-\n'],),
-        )
+        mock_subprocess.setup_multi((rows['lines'],), *_reads('pool/data', []), *_reads('pool/data', []))
         destroy = mocker.patch('zfsbackup.backup_manager.zfs.destroy')
         manager = self._manager()
         with caplog.at_level(logging.WARNING):
@@ -3483,24 +3611,21 @@ class TestUnrepresentableNamesInZfsOutput:
         assert len(self._summary_records(caplog)) == 1
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
-    def test_received_datasets_skips_an_unrepresentable_child(self, mock_subprocess, mocker, caplog):
+    def test_received_datasets_skips_an_unrepresentable_child(self, mock_subprocess, caplog):
+        """Through the real `zfs.list` and the real batch `zfs.get.rows` (only `Popen` is faked): the name
+        libzfseasy cannot represent is skipped by the enumeration, so it is never looked up, and the
+        batch rows it appears in are ignored."""
         good = DatasetConfig(name='pool/backups/cid/data').to_property()
         other = DatasetConfig(name='pool/backups/cid/other').to_property()
-        mock_subprocess.setup(stdout=[
-            'pool/backups\tfilesystem\n',
-            'pool/backups/cid\tfilesystem\n',
-            'pool/backups/cid/data\tfilesystem\n',
-            'pool/backups/cid/.system\tfilesystem\n',
-            'pool/backups/cid/other\tfilesystem\n',
-        ])
-        local = {
-            'pool/backups/cid/data': {'org.zfsbackup:client_id': 'cid', 'org.zfsbackup:config': good},
-            'pool/backups/cid/other': {'org.zfsbackup:client_id': 'cid', 'org.zfsbackup:config': other},
-        }
-        value = mocker.patch(
-            'zfsbackup.backup_manager.zfs.get.value',
-            side_effect=lambda ds, prop, sources=None, raw=False: local.get(ds.name, {}).get(prop),
-        )
+        world = ZfsWorld(mock_subprocess)
+        world.add('pool/backups')
+        world.add('pool/backups/cid')
+        world.add('pool/backups/cid/data', [('org.zfsbackup:client_id', 'cid', 'local'),
+                                            ('org.zfsbackup:config', good, 'local')])
+        world.add('pool/backups/cid/.system', [('org.zfsbackup:client_id', 'cid', 'local'),
+                                               ('org.zfsbackup:config', good, 'local')])
+        world.add('pool/backups/cid/other', [('org.zfsbackup:client_id', 'cid', 'local'),
+                                             ('org.zfsbackup:config', other, 'local')])
         config = _make_config(
             remote_backup=RemoteServerConfig(target_dataset='pool/backups'),
         )
@@ -3514,8 +3639,9 @@ class TestUnrepresentableNamesInZfsOutput:
         assert self._summary_records(caplog) == [
             (logging.WARNING, 'skipped 1 name libzfseasy cannot represent in zfs list output')]
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
-        # the unrepresentable row never reached a property read
-        assert all(c.args[0].name != 'pool/backups/cid/.system' for c in value.call_args_list)
+        # one enumeration and one batch read; the unrepresentable row never reached a per-dataset read
+        assert [a[0] for a in world.argvs] == ['list', 'get']
+        assert world.values == []
 
 
 # ===========================================================================

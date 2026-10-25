@@ -154,6 +154,10 @@ class FakeZfsCheck:
         self.spec["props"].setdefault(dataset, {})[key] = value
         self.save()
 
+    def dataset(self, name: str, kind: str = "filesystem") -> None:
+        self.spec.setdefault("datasets", {})[name] = kind
+        self.save()
+
     def fail(self, dataset: str) -> None:
         self.spec["fail"].append(dataset)
         self.save()
@@ -324,6 +328,40 @@ class TestFormats:
         world.build(RICH_YAML)               # tank/vm.01 is `enabled: false`
         entries = world.entries()
         assert ("snapshot", "tank/vm.01", None) not in entries
+
+
+SERVER_YAML = LOCAL_YAML + """\
+remote_backup:
+  enabled: true
+  target_dataset: "bk"
+"""
+
+
+class TestServerReceivedDatasets:
+    """B-1d on the server: the received datasets' `client_id` and `config` come from ONE batched read."""
+
+    def test_two_received_datasets_cost_one_list_and_one_batch_get(self, world):
+        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+        from zfsbackup.config import DatasetConfig, Duration
+        world.build(SERVER_YAML, cert=False)
+        config = DatasetConfig(name="tank/src", frequency=Duration("1h")).to_property()
+        for name in ("bk", "bk/c1", "bk/c1/a", "bk/c1/b"):
+            world.zfs.dataset(name)
+        for name in ("bk/c1/a", "bk/c1/b"):
+            world.zfs.prop(name, PROP_CLIENT_ID, "c1")
+            world.zfs.prop(name, PROP_CONFIG, config)
+            world.zfs.snapshots(name, 600)
+        before = len(world.zfs.calls)
+        entries = world.entries()
+        assert entries[("received", "bk/c1/a", "c1")]["state"] == "OK"
+        assert entries[("received", "bk/c1/b", "c1")]["state"] == "OK"
+        calls = world.zfs.calls[before:]
+        batch = [c for c in calls if c[0] == "get" and "name,property,value,source" in c]
+        assert len(batch) == 1
+        value_reads = [c for c in calls if c[0] == "get" and c[c.index("-o") + 1] == "value"
+                       and c[-1].startswith("bk/")]
+        assert value_reads == []                    # no per-dataset read: the batch served them
+        assert {c[0] for c in calls} <= {"list", "get"}
 
 
 # --------------------------------------------------------------------------

@@ -150,11 +150,34 @@ class FakeZfsWorld:
         return _Proc(''.join(line + '\n' for line in lines).encode(), b'', 0)
 
     def _get(self, rest):
+        if rest[rest.index('-o') + 1] != 'value':
+            return self._get_rows(rest)
         prop, name = rest[-2], rest[-1]
         if name in self.get_fails:
             return _Proc(b'', f"cannot open '{name}': dataset does not exist\n".encode(), 1)
         value = self.props.get((name, prop))
         return _Proc(f"{'-' if value is None else value}\n".encode(), b'', 0)
+
+
+    def _get_rows(self, rest):
+        """The batch `zfs get -H -o name,property,value,source -r -t filesystem,volume name,type,<p>... <target>`
+        of `received_datasets()` (plan B-1d): one object after another, `name` and `type` rows first, then
+        each requested property in order (`-` when unset), every set property local."""
+        assert rest[rest.index('-o') + 1] == 'name,property,value,source', rest
+        assert '-r' in rest and '-s' not in rest, rest
+        target, requested = rest[-1], rest[-2].split(',')[2:]
+        if target in self.get_fails:
+            return _Proc(b'', f"cannot open '{target}': dataset does not exist\n".encode(), 1)
+        out = []
+        for name, dstype in [(n, 'filesystem') for n in self.filesystems] + [(n, 'volume') for n in self.volumes]:
+            if not (name == target or name.startswith(target + '/')):
+                continue
+            out.append(f'{name}\tname\t{name}\t-')
+            out.append(f'{name}\ttype\t{dstype}\t-')
+            for prop in requested:
+                value = self.props.get((name, prop))
+                out.append(f'{name}\t{prop}\t-\t-' if value is None else f'{name}\t{prop}\t{value}\tlocal')
+        return _Proc(''.join(line + '\n' for line in out).encode(), b'', 0)
 
 
 @pytest.fixture
@@ -876,9 +899,16 @@ class TestReadOnly:
 
     def test_get_is_read_only_shaped(self, world):
         collect(self.busy_server(world))
+        value_reads = batch_reads = 0
         for argv in world.calls:
             if argv[0] == 'get':
-                assert '-H' in argv and argv[argv.index('-o') + 1] == 'value'
+                assert '-H' in argv and '-s' not in argv
+                columns = argv[argv.index('-o') + 1]
+                assert columns in ('value', 'name,property,value,source'), argv   # never `received`
+                value_reads += columns == 'value' and argv[-1].startswith(TARGET + '/')
+                batch_reads += columns != 'value'
+        assert batch_reads == 1                      # the ONE batch read of the received datasets
+        assert value_reads == 0                      # every received dataset came out of it: no per-dataset read
 
     def test_the_fake_really_refuses_a_write(self, world):
         # guards the guard: a collector that wrote would raise here, and the call is recorded

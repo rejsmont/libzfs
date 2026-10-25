@@ -19,6 +19,8 @@ victim's dataset, the victim's old snapshots would be destroyed. Every scenario 
 """
 
 import dataclasses
+import logging
+import re
 from datetime import timedelta
 from unittest.mock import MagicMock
 
@@ -65,19 +67,46 @@ class FakeZfs:
         self.props = {}
         self.snapshots = {}
         self.argvs = []
+        self.batch_reads = 0                 # how many batch `get -r name,type,client_id,config` ran
+        self.batch_override = None           # raw bytes lines to print instead of the honest batch
+        self.batch_error = None              # stderr: the batch exits 1
+        self.batch_omit = set()              # datasets the honest batch leaves out (a lost group)
         mock_subprocess.side_effect = self._popen
 
     @staticmethod
-    def _proc(lines, rc=0, text=False):
-        """A finished `zfs`. `text`: `universal_newlines=True` callers (`_exec_out`) get `str`
-        lines, the others (`_exec_lines`: list and `get.value`) bytes."""
+    def _proc(lines, rc=0, text=False, stderr=''):
+        """A finished `zfs` printing the byte `lines` (`_exec_lines` reads bytes)."""
+        lines = re.findall(rb'[^\n]*\n', b''.join(lines))      # the physical lines on the pipe
         proc = MagicMock()
         proc.stdout.readline.side_effect = list(lines) + ['' if text else b'']
-        proc.stderr.readline.return_value = ''
+        proc.stderr.readline.side_effect = [stderr.rstrip('\n') + '\n', ''] if stderr else ['']
         proc.poll.side_effect = [None] * len(lines) + [rc] * 50
         proc.wait.return_value = rc
         proc.returncode = rc
         return proc
+
+    def _listed(self):
+        """`(name, type)` of every well-formed listing line, in order."""
+        out = []
+        for raw in self.listing:
+            cols = raw.decode('utf-8', 'surrogateescape').rstrip('\n').split('\t')
+            if len(cols) == 2:
+                out.append((cols[0], cols[1]))
+        return out
+
+    def _effective(self, name, prop):
+        """`(raw value lines, source)` as `zfs get` would print the property: local, else received, else unset."""
+        for source in ('local', 'received'):
+            raw = self.props.get((name, prop, source))
+            if raw is not None:
+                return raw, source
+        return [b'-\n'], '-'
+
+    @staticmethod
+    def _row(name, prop, raw, source):
+        """One `zfs get -H -o name,property,value,source` row; the value is printed RAW (its own newlines
+        become lines of the output, which is how a hostile value forges rows)."""
+        return [(f'{name}\t{prop}\t').encode() + b''.join(raw)[:-1] + f'\t{source}\n'.encode()]
 
     def _popen(self, cmd, *args, **kwargs):
         argv = list(cmd[1:])
@@ -87,13 +116,14 @@ class FakeZfs:
             types = argv[argv.index('-t') + 1] if '-t' in argv else None
             root = argv[-1]
             if types == 'filesystem,volume':
-                return self._proc(self.listing)
+                if '-r' in argv:                     # the enumeration under the target: as it was given
+                    return self._proc(self.listing)
+                # the name-only cross-check `zfs.get.rows` runs for one dataset
+                return self._proc([f'{n}\t{t}\n'.encode() for n, t in self._listed() if n == root])
             assert types == 'snapshot', argv
             rows = [_b(list_row(s, root)) for s in self.snapshots.get(root, [])]
             return self._proc(rows)
         if verb == 'get':
-            if '-r' in argv:
-                return self._proc([], text=True)
             columns = argv[argv.index('-o') + 1]
             name = argv[-1]
             if columns == 'value':                                   # zfs.get.value
@@ -101,8 +131,33 @@ class FakeZfs:
                 prop = argv[-2]
                 raw = self.props.get((name, prop, source))
                 return self._proc([b'-\n'] if raw is None else raw)
-            # read_zfsbackup_properties: `zfs get ... all <name>`: `type` first, no zfsbackup props
-            return self._proc([f'{name}\ttype\tfilesystem\t-\t-\n'], text=True)
+            assert columns == 'name,property,value,source', argv     # never the `received` column
+            assert '-s' not in argv, argv                            # it would drop the `type` rows
+            if '-r' in argv and argv[-2].startswith('name,type,'):
+                # B-1d: the ONE batch read of the received datasets' client_id and config
+                self.batch_reads += 1
+                if self.batch_error:
+                    return self._proc([], rc=1, stderr=self.batch_error)
+                if self.batch_override is not None:
+                    return self._proc(self.batch_override)
+                requested = argv[-2].split(',')[2:]
+                out, seen = [], set()
+                for dsname, dstype in self._listed():
+                    if dsname in seen or dsname in self.batch_omit or \
+                            not (dsname == name or dsname.startswith(name + '/')):
+                        continue
+                    seen.add(dsname)
+                    out += [f'{dsname}\tname\t{dsname}\t-\n'.encode(), f'{dsname}\ttype\t{dstype}\t-\n'.encode()]
+                    for prop in requested:
+                        raw, source = self._effective(dsname, prop)
+                        out += self._row(dsname, prop, raw, source)
+                return self._proc(out)
+            # `get ... all <name>`: the type row first, no zfsbackup properties
+            if '-r' in argv:
+                return self._proc([f'{n}\ttype\t{t}\t-\n'.encode() for n, t in self._listed()
+                                   if n == name or n.startswith(name + '/')])
+            dstype = dict(self._listed()).get(name, 'filesystem')
+            return self._proc([f'{name}\ttype\t{dstype}\t-\n'.encode()])
         if verb == 'destroy':
             return self._proc([], text=True)
         raise AssertionError(f'unexpected zfs command {argv}')
@@ -122,6 +177,11 @@ class FakeZfs:
     @property
     def destroy_argvs(self):
         return [a for a in self.argvs if a[0] == 'destroy']
+
+    @property
+    def values(self):
+        """The `zfs get -H -o value` reads (one property of one dataset)."""
+        return [a for a in self.argvs if a[0] == 'get' and a[a.index('-o') + 1] == 'value']
 
     @property
     def snapshot_listings(self):
@@ -439,7 +499,8 @@ class TestForgedPropertyValues:
         assert zfs.destroyed == []
 
     def test_an_inherited_or_received_copy_is_not_a_local_value(self, zfs):
-        """Only `-s local` is ever asked: a value the source filter hides reads as unset."""
+        """Only LOCAL values count: the batch prints the received one with its source, and the
+        pruner will not take it (it is the sender's, a `zfs send -p` stream)."""
         legit_world(zfs)
         del zfs.props[(NEIGHBOUR_DS, PROP_CLIENT_ID, 'local')]
         del zfs.props[(NEIGHBOUR_DS, PROP_CONFIG, 'local')]
@@ -447,12 +508,26 @@ class TestForgedPropertyValues:
         found = prune_everything(zfs)
         assert [d.name for d in found] == [VICTIM_DS]
         assert zfs.destroyed == []
-        value_reads = [a for a in zfs.argvs if a[0] == 'get' and a[a.index('-o') + 1] == 'value']
+
+    @pytest.mark.parametrize('source', ['local', 'received'])
+    def test_the_per_dataset_fallback_never_asks_for_an_unfiltered_value(self, zfs, source):
+        """When the batch cannot be used the old exact path runs: `-s local` / `-s received` only."""
+        legit_world(zfs)
+        zfs.batch_error = 'pool I/O is currently suspended'
+        del zfs.props[(NEIGHBOUR_DS, PROP_CLIENT_ID, 'local')]
+        del zfs.props[(NEIGHBOUR_DS, PROP_CONFIG, 'local')]
+        zfs.props[(NEIGHBOUR_DS, PROP_CONFIG, source)] = lines(NEIGHBOUR_CONFIG)
+        found = prune_everything(zfs)
+        assert [d.name for d in found] == [VICTIM_DS]
+        assert zfs.destroyed == []
+        value_reads = zfs.values
         assert value_reads
         assert {a[a.index('-s') + 1] for a in value_reads} <= {'local', 'received'}   # never unfiltered
 
     def test_a_zfs_get_failure_for_one_dataset_skips_it_and_serves_the_rest(self, zfs, mock_subprocess):
+        """The batch is down, so each dataset is read on its own; one of those reads fails."""
         legit_world(zfs)
+        zfs.batch_error = 'pool I/O is currently suspended'
         real = zfs._popen
 
         def failing(cmd, *args, **kwargs):
@@ -465,6 +540,24 @@ class TestForgedPropertyValues:
         mock_subprocess.side_effect = failing
         found = prune_everything(zfs)
         assert [d.name for d in found] == [VICTIM_DS]
+        assert zfs.destroyed == []
+
+    def test_an_anchor_read_failure_for_one_dataset_skips_only_its_prune(self, zfs, mock_subprocess):
+        """The batch served both; the pruner's own anchor read of the neighbour then fails: its prune is
+        skipped this cycle (an unknown protect-set), the victim is untouched."""
+        legit_world(zfs)
+        real = zfs._popen
+
+        def failing(cmd, *args, **kwargs):
+            argv = list(cmd[1:])
+            if argv[0] == 'get' and argv[-1] == NEIGHBOUR_DS and argv[-2] == 'all':
+                zfs.argvs.append(argv)
+                return zfs._proc([], rc=1)
+            return real(cmd, *args, **kwargs)
+
+        mock_subprocess.side_effect = failing
+        found = prune_everything(zfs)
+        assert sorted(d.name for d in found) == [VICTIM_DS, NEIGHBOUR_DS]
         assert zfs.destroyed == []
 
 
@@ -486,3 +579,180 @@ class TestWhyItMatters:
         dsi.config = forged
         mgr.prune_snapshots(dsi)
         assert sorted(d.split('@')[1] for d in zfs.destroyed if d.startswith(VICTIM_DS)) == sorted(OLD[:-1])
+
+
+# ---------------------------------------------------------------------------
+# Plan B-1d: the ONE batch read of the received datasets' properties
+# ---------------------------------------------------------------------------
+
+ATTACKER = 'bk/Ax/att'
+BATCH_WARNING = 'The batched property read of bk skipped'
+
+
+def warnings_of(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.name == 'zfsbackup.backup_manager' and r.levelno == logging.WARNING]
+
+
+def attacker_value(*lines):
+    """A received `config` value that forges `lines` (physical lines of `zfs get` output). zfs prints
+    the value raw and then `\treceived`, so the first line is completed to a valid row by a leading
+    `x\treceived`, and the last forged line has `\treceived` appended to it."""
+    return ''.join(f'{l}\n' for l in ('x\treceived',) + lines)[:-1]
+
+
+def raw(value):
+    """The raw `zfs get -H -o value` lines of `value`, in the fake's per-property storage."""
+    return [(part + '\n').encode() for part in value.split('\n')]
+
+
+def victim_group(client_id=VICTIM, config=NEIGHBOUR_CONFIG, name=VICTIM_DS):
+    """The rows of a forged, complete-looking group for `name` (the last row gets `\treceived`)."""
+    return (f'{name}\tname\t{name}\t-', f'{name}\ttype\tfilesystem\t-',
+            f'{name}\t{PROP_CLIENT_ID}\t{client_id}\tlocal', f'{name}\t{PROP_CONFIG}\t{config}\tlocal')
+
+
+class TestBatchRead:
+    def keeps_victim(self, zfs, found):
+        by_name = {d.name: d for d in found}
+        assert VICTIM_DS in by_name, 'the victim vanished from pruning'
+        assert by_name[VICTIM_DS].config.retention_rules == DatasetConfig.from_property(VICTIM_CONFIG).retention_rules
+        assert ATTACKER not in by_name
+
+    def prune_all(self, zfs):
+        found = prune_everything(zfs)
+        assert_contained(zfs, found)
+        assert not [d for d in zfs.destroyed if d.startswith(VICTIM_DS) or d.startswith('bk/A@')]
+        # the live control: the neighbour is still pruned under its own config
+        assert sorted(d.split('@')[1] for d in zfs.destroyed if d.startswith(NEIGHBOUR_DS)) == sorted(OLD[:-1])
+        return found
+
+    # -- cost ---------------------------------------------------------------------------------
+    def test_n_clean_datasets_cost_one_list_and_one_get(self, zfs):
+        legit_world(zfs)
+        for i in range(3):                                 # five client datasets in all
+            name = f'bk/A/extra{i}'
+            zfs.listing += lines(f'{name}\tfilesystem')
+            zfs.props[(name, PROP_CLIENT_ID, 'local')] = lines(VICTIM)
+            zfs.props[(name, PROP_CONFIG, 'local')] = lines(VICTIM_CONFIG)
+        found = manager().received_datasets()
+        assert len(found) == 5
+        assert [a[0] for a in zfs.argvs] == ['list', 'get']
+        assert zfs.batch_reads == 1 and zfs.values == []
+
+    def test_the_batch_names_exactly_the_two_properties_recursively_without_the_received_column(self, zfs):
+        legit_world(zfs)
+        manager().received_datasets()
+        (get,) = zfs.argvs[1:]
+        assert get == ['get', '-H', '-o', 'name,property,value,source', '-r', '-t', 'filesystem,volume',
+                       f'name,type,{PROP_CLIENT_ID},{PROP_CONFIG}', TARGET]
+
+    # -- the batch is down ----------------------------------------------------------------------
+    def test_a_failing_batch_sends_every_dataset_to_the_exact_path_with_one_warning(self, zfs, caplog):
+        legit_world(zfs)
+        zfs.batch_error = 'pool I/O is currently suspended'
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            found = self.prune_all(zfs)
+        assert sorted(d.name for d in found) == [VICTIM_DS, NEIGHBOUR_DS]
+        (warning,) = [w for w in warnings_of(caplog) if 'in one call' in w]
+        assert 'pool i/o is currently suspended' in warning.lower()
+        # five listed datasets: bk, bk/A, bk/Ax (no local properties: 3 reads each) + two clients (2 each)
+        assert len(zfs.values) == 3 * 3 + 2 * 2
+
+    # -- a group that is simply not there: only that dataset is re-read -------------------------------
+    def test_a_dataset_the_batch_lacks_alone_falls_back(self, zfs):
+        legit_world(zfs)
+        zfs.batch_omit = {NEIGHBOUR_DS}
+        found = self.prune_all(zfs)
+        assert sorted(d.name for d in found) == [VICTIM_DS, NEIGHBOUR_DS]
+        assert {a[-1] for a in zfs.values} == {NEIGHBOUR_DS}
+        assert len(zfs.values) == 2                        # client_id and config, nothing else
+
+    # -- local beats received ---------------------------------------------------------------------
+    def test_local_and_received_values_together_the_local_one_wins(self, zfs):
+        legit_world(zfs)
+        zfs.props[(VICTIM_DS, PROP_CLIENT_ID, 'received')] = lines(NEIGHBOUR)
+        zfs.props[(VICTIM_DS, PROP_CONFIG, 'received')] = lines(NEIGHBOUR_CONFIG)
+        found = self.prune_all(zfs)
+        self.keeps_victim(zfs, found)
+        assert zfs.values == []                            # the batch alone served them
+
+    def test_a_received_only_config_is_not_trusted_and_is_a_warning(self, zfs, caplog):
+        legit_world(zfs)
+        del zfs.props[(NEIGHBOUR_DS, PROP_CLIENT_ID, 'local')]
+        del zfs.props[(NEIGHBOUR_DS, PROP_CONFIG, 'local')]
+        zfs.props[(NEIGHBOUR_DS, PROP_CONFIG, 'received')] = lines(NEIGHBOUR_CONFIG)
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            found = prune_everything(zfs)
+        assert [d.name for d in found] == [VICTIM_DS]
+        assert zfs.destroyed == []
+        (warning,) = [w for w in warnings_of(caplog) if NEIGHBOUR_DS in w]
+        assert 'only received' in warning and 'never trusted' in warning
+        assert zfs.values == []
+
+    def test_a_received_config_ending_in_a_fake_local_row_is_not_taken_as_local(self, zfs, caplog):
+        """(a) The stray fragment: the received-only config `FORGED<TAB>local<NL>` prints as
+        `bk/Ax/data<TAB>config<TAB>FORGED<TAB>local` -- a valid-looking LOCAL row -- and then
+        `<TAB>received` alone on the next line. The fragment makes the batch incomplete, so no dataset is
+        taken from it: all fall back to the exact per-dataset path, where the config is only received."""
+        legit_world(zfs)
+        del zfs.props[(NEIGHBOUR_DS, PROP_CLIENT_ID, 'local')]
+        del zfs.props[(NEIGHBOUR_DS, PROP_CONFIG, 'local')]
+        zfs.props[(NEIGHBOUR_DS, PROP_CONFIG, 'received')] = [b'FORGED\tlocal\n', b'\n']
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            found = prune_everything(zfs)
+        assert [d.name for d in found] == [VICTIM_DS]
+        assert zfs.destroyed == []
+        warnings = warnings_of(caplog)
+        assert any(BATCH_WARNING in w for w in warnings)
+        (only_received,) = [w for w in warnings if NEIGHBOUR_DS in w and 'only received' in w]
+        assert 'never trusted' in only_received
+
+    # -- forged groups ----------------------------------------------------------------------------
+    def attacker_world(self, zfs, value, before_victim):
+        legit_world(zfs)
+        names = [n for n, _ in zfs._listed()]
+        at = names.index(VICTIM_DS) if before_victim else len(names)
+        names.insert(at, ATTACKER)
+        zfs.listing = lines(*[f'{n}\tfilesystem' for n in names])
+        zfs.props[(ATTACKER, PROP_CONFIG, 'received')] = raw(value)
+
+    @pytest.mark.parametrize('before_victim', [True, False], ids=['forged group first', 'forged group last'])
+    def test_a_forged_group_naming_the_victim_leaves_the_victim_with_its_own_retention(
+            self, zfs, caplog, before_victim):
+        """The received config of an attacker dataset forges a complete group for the victim (claiming
+        the victim's id and the NEIGHBOUR's one-hour retention). The victim's name then appears twice, so
+        neither copy is trusted: the victim is read exactly, returned, and keeps its 100 year retention."""
+        self.attacker_world(zfs, attacker_value(*victim_group()), before_victim)
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            found = self.prune_all(zfs)
+        self.keeps_victim(zfs, found)
+        assert len([w for w in warnings_of(caplog) if BATCH_WARNING in w]) == 1
+
+    @pytest.mark.parametrize('name, group', [
+        ('duplicate client_id of itself', (f'{ATTACKER}\t{PROP_CLIENT_ID}\t{VICTIM}\tlocal',
+                                          f'{ATTACKER}\t{PROP_CONFIG}\t{NEIGHBOUR_CONFIG}\tlocal')),
+        ('forged type lead', (f'{VICTIM_DS}\ttype\tfilesystem\t-',
+                              f'{VICTIM_DS}\t{PROP_CLIENT_ID}\t{VICTIM}\tlocal',
+                              f'{VICTIM_DS}\t{PROP_CONFIG}\t{NEIGHBOUR_CONFIG}\tlocal')),
+        ('group of a name outside the target', victim_group(name='evil/x')),
+        ('too short a row', ('short',)),
+    ])
+    def test_every_other_forgery_in_the_table_reaches_the_exact_path(self, zfs, caplog, name, group):
+        self.attacker_world(zfs, attacker_value(*group), before_victim=True)
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            found = self.prune_all(zfs)
+        self.keeps_victim(zfs, found)
+        assert any(BATCH_WARNING in w for w in warnings_of(caplog)), name
+
+    def test_a_tab_in_a_value_is_one_value_and_never_a_second_column(self, zfs, caplog):
+        """The config carries `X<TAB>-<TAB>local`: four columns and the source last, so it is just a
+        (non-decoding) value. Nothing about it reaches another dataset, and the batch stays in use."""
+        legit_world(zfs)
+        zfs.props[(NEIGHBOUR_DS, PROP_CONFIG, 'local')] = lines('not-base64\t-\tlocal')
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            found = prune_everything(zfs)
+        assert [d.name for d in found] == [VICTIM_DS]
+        assert zfs.destroyed == []
+        assert not any(BATCH_WARNING in w for w in warnings_of(caplog))
+        assert zfs.values == []

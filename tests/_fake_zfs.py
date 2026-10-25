@@ -11,8 +11,9 @@ JSON file.
     $FAKEZFS_FAIL    optional JSON list of ``[subcommand, dataset]`` or
                      ``[subcommand, dataset, property]`` rules; a matching call fails with a message on stderr and exit 1
 
-Supported: ``list`` (a dataset exists or "dataset does not exist"), ``get``
-(every property of the dataset as a local one), ``set PROP=VALUE DATASET`` and
+Supported: ``list`` (a dataset exists or "dataset does not exist"; also the name-only
+cross-check ``zfs.get.rows`` runs), ``get`` (the ``type`` row, then every property of the dataset as a
+local one, in the framing the row reader expects; ``-o value`` reads one), ``set PROP=VALUE DATASET`` and
 ``inherit PROP [-r] [-S] DATASET``. Anything else exits 2 so a test notices
 that the code under test asked for something it should not.
 """
@@ -70,8 +71,19 @@ if command in ("list", "get"):
         values = {"name": name, "type": "filesystem"}
         print("\t".join(values.get(c, "-") for c in columns))
     else:
-        for prop, value in state[name].items():
-            print(f"{name}\t{prop}\t{value}\t-\tlocal")
+        columns = args[args.index("-o") + 1] if "-o" in args else "name,property,value,received,source"
+        if columns == "value":                      # zfs.get.value: `get -H -o value [-s S] <prop> <ds>`
+            print(state[name].get(args[-2], "-"))
+            sys.exit(0)
+        with_received = columns == "name,property,value,received,source"
+        assert with_received or columns == "name,property,value,source", columns
+        # `get ... all <ds>` opens with the `type` row (there is no `name` row for `all`), then the
+        # properties; every property is a local one. Four columns unless `received` was asked for.
+        rows = [("type", "filesystem")] + list(state[name].items())
+        for prop, value in rows:
+            source = "-" if prop == "type" else "local"
+            extra = ("-",) if with_received else ()
+            print("\t".join((name, prop, value) + extra + (source,)))
     sys.exit(0)
 
 if command == "set":
