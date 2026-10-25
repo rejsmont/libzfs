@@ -50,6 +50,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _timer_support import timer_stretch
 from sqlalchemy.exc import OperationalError as SAOperationalError
 
 from zfsbackup.config.store import dispose_all
@@ -464,19 +465,7 @@ class TestAgainstARealLockHolder:
         assert _header(path) == (2, 2)
 
 
-def _timer_stretch(samples: int = 20, nominal: float = 0.01) -> float:
-    """How many times longer than asked this host's short sleeps really take.
-
-    SQLite's busy handler adds up the *nominal* delay of each step (1, 2, 5,
-    10, 15, ... ms) and gives up when that sum reaches `busy_timeout`, however
-    long each sleep really took. On a host whose timer is coarse (a small VM
-    where `sleep(0.01)` takes ~65 ms) a wait therefore stretches by about this
-    factor, and a real-clock bound on one statement stops meaning anything.
-    """
-    started = time.monotonic()
-    for _ in range(samples):
-        time.sleep(nominal)
-    return (time.monotonic() - started) / (samples * nominal)
+_timer_stretch = timer_stretch  # shared probe: tests/_timer_support.py
 
 
 # Above this the 2x-budget bound below cannot be told apart from a stretched

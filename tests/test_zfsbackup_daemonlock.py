@@ -27,6 +27,7 @@ import threading
 import time
 
 import pytest
+from _timer_support import coarse_timer_reason, timer_stretch
 
 from zfsbackup import daemonlock, procident
 from zfsbackup.config.store import resolve_config_path
@@ -4024,6 +4025,11 @@ print(present, flush=True)
 '''
 
 
+# Past this stretch the scaled bound (0.75 s) no longer separates a stretched
+# timer from a probe that retries far more than `_PROBE_ATTEMPTS` times.
+_MAX_TIMER_STRETCH_PROBE = 4.0
+
+
 class TestWorkersPresentRetries:
     """`workers_present` retries a contended `LOCK_EX|LOCK_NB` up to
     `_PROBE_ATTEMPTS` times with a jittered `_PROBE_RETRY_DELAY` between them:
@@ -4077,11 +4083,19 @@ class TestWorkersPresentRetries:
         )
         try:
             assert proc.stdout.readline().strip() == "ready"
+            # Four sleeps of 12.5-37.5 ms each: it did retry, and it did stop.
+            # Sleeps only ever run long, so the lower bound stands as is; the
+            # upper one scales with this host's measured sleep granularity,
+            # and a timer too coarse to tell stretch from a runaway retry
+            # loop skips instead of failing.
+            stretch = timer_stretch()
+            if stretch > _MAX_TIMER_STRETCH_PROBE:
+                pytest.skip(coarse_timer_reason(stretch))
             started = time.monotonic()
             assert daemonlock.workers_present(db) is True
             elapsed = time.monotonic() - started
-            # four sleeps of 12.5-37.5 ms each: it did retry, and it did stop
-            assert 0.04 <= elapsed < 0.3, elapsed
+            upper = 0.15 * max(1.0, stretch) + 0.15  # 0.3 on a precise timer
+            assert 0.04 <= elapsed < upper, (elapsed, stretch)
         finally:
             proc.kill()
             proc.wait(timeout=10)
