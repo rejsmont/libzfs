@@ -3318,9 +3318,21 @@ class TestUnrepresentableNamesInZfsOutput:
 
     @staticmethod
     def _skip_warnings(caplog):
+        """The per-name WARNINGs (one per name, deduplicated); not the listing's summary."""
         return [
             r.getMessage() for r in caplog.records
             if r.name == 'libzfseasy' and r.levelno == logging.WARNING
+            and r.getMessage().startswith('skipping ') and 'cannot represent' in r.getMessage()
+        ]
+
+    @staticmethod
+    def _summary_records(caplog):
+        """`(level, text)` of the listing's one summary record ("skipped N names ... cannot represent
+        ..."): WARNING when the listing also logged a per-name WARNING, DEBUG when it only met
+        names it had already reported."""
+        return [
+            (r.levelno, r.getMessage()) for r in caplog.records
+            if r.name == 'libzfseasy' and r.getMessage().startswith('skipped ')
             and 'cannot represent' in r.getMessage()
         ]
 
@@ -3368,6 +3380,9 @@ class TestUnrepresentableNamesInZfsOutput:
         assert len(warnings) == 2
         assert any("'pool/data@ manual'" in w for w in warnings)
         assert any("'pool/data@manual '" in w for w in warnings)
+        # ...and one summary of the listing (libzfseasy D4): a WARNING, because names were new
+        assert self._summary_records(caplog) == [
+            (logging.WARNING, 'skipped 2 names libzfseasy cannot represent in zfs list output')]
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
     def test_the_warning_is_not_repeated_by_the_next_listing(self, mock_subprocess, caplog):
@@ -3375,11 +3390,14 @@ class TestUnrepresentableNamesInZfsOutput:
         mock_subprocess.setup_multi((rows['lines'],), (rows['lines'],))
         manager = self._manager()
         dsi = manager.datasets[0]
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
             manager.list_snapshots(dsi)
             first = len(self._skip_warnings(caplog))
+            assert [lv for lv, _ in self._summary_records(caplog)] == [logging.WARNING]
             manager.list_snapshots(dsi)
         assert first == 2 and len(self._skip_warnings(caplog)) == 2
+        # the second listing's summary is DEBUG: the names persist, nothing new to warn about
+        assert [lv for lv, _ in self._summary_records(caplog)] == [logging.WARNING, logging.DEBUG]
 
     def test_a_listing_of_only_unrepresentable_rows_is_empty_not_an_error(
         self, mock_subprocess, caplog
@@ -3389,6 +3407,8 @@ class TestUnrepresentableNamesInZfsOutput:
         with caplog.at_level(logging.WARNING):
             assert manager.list_snapshots(manager.datasets[0]) == []
         assert len(self._skip_warnings(caplog)) == 1
+        assert self._summary_records(caplog) == [
+            (logging.WARNING, 'skipped 1 name libzfseasy cannot represent in zfs list output')]
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
     def test_pruning_still_destroys_only_the_valid_candidates(
@@ -3408,6 +3428,7 @@ class TestUnrepresentableNamesInZfsOutput:
         destroyed = sorted(s.short for s in destroy.call_args.args[0])
         assert destroyed == sorted([rows['old1'], rows['old2']])      # never the newest, never the odd ones
         assert len(self._skip_warnings(caplog)) == 2
+        assert len(self._summary_records(caplog)) == 1
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
     def test_received_datasets_skips_an_unrepresentable_child(self, mock_subprocess, mocker, caplog):
@@ -3438,6 +3459,8 @@ class TestUnrepresentableNamesInZfsOutput:
         assert all(d.config.recursive is False for d in received)
         warnings = self._skip_warnings(caplog)
         assert len(warnings) == 1 and "'pool/backups/cid/.system'" in warnings[0]
+        assert self._summary_records(caplog) == [
+            (logging.WARNING, 'skipped 1 name libzfseasy cannot represent in zfs list output')]
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
         # the unrepresentable row never reached a property read
         assert all(c.args[0].name != 'pool/backups/cid/.system' for c in value.call_args_list)

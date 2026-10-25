@@ -1,10 +1,41 @@
+import sys as _sys
+import types as _types
+
 from libzfseasy.types import Bookmark as _Bookmark
 from libzfseasy.zfs import (
     ListCommand, CreateCommand, SnapshotCommand, BookmarkCommand, DestroyCommand, RenameCommand,
     AllowCommand, UnAllowCommand, CloneCommand, GetCommand, SetCommand, InheritCommand,
     SendCommand, ReceiveCommand, ChangeKeyCommand, LoadKeyCommand, UnLoadKeyCommand,
-    MountCommand, UnMountCommand, GetRow, GetRows, ZFSOutputError
+    MountCommand, UnMountCommand, GetRow, GetRows, ZFSOutputError, ZFSTimeoutError, timeout
 )
+from libzfseasy import zfs as _zfs_module
+
+
+class _Package(_types.ModuleType):
+    """The package, with `slow_command_warning` forwarded to `libzfseasy.zfs` (where the exec core reads it), so
+    `import libzfseasy as zfs; zfs.slow_command_warning = 30` and `libzfseasy.zfs.slow_command_warning = 30` are the same
+    setting. A plain module attribute set on the package would silently do nothing."""
+
+    @property
+    def slow_command_warning(self):
+        """Seconds after which a still-running zfs/zpool command is reported at WARNING on the 'libzfseasy' logger, and
+        again at each further multiple (default 60). A positive finite number turns it on; None, zero, a negative
+        number or infinity turn it off; a bool, string or NaN is refused with ValueError. Read when each command
+        starts. `del libzfseasy.slow_command_warning` restores the default."""
+        return _zfs_module.slow_command_warning
+
+    @slow_command_warning.setter
+    def slow_command_warning(self, value):
+        if not _zfs_module._slow_setting_valid(value):
+            raise ValueError(f'slow_command_warning must be None or a number of seconds, got {value!r}')
+        _zfs_module.slow_command_warning = value
+
+    @slow_command_warning.deleter
+    def slow_command_warning(self):
+        _zfs_module.slow_command_warning = _zfs_module.DEFAULT_SLOW_COMMAND_WARNING
+
+
+_sys.modules[__name__].__class__ = _Package
 
 # Create command instances
 list = ListCommand()

@@ -3,11 +3,15 @@ from libzfseasy.types import InvalidNameError, InvalidValueError, Validate, ZFS,
 from typing import Optional, Union, Dict, Iterable, Callable, NamedTuple
 
 import collections
+import contextlib
+import contextvars
 import dataclasses
 import io
 import logging
+import math
 import os
 import re
+import selectors
 import shlex
 import subprocess
 import shutil
@@ -299,6 +303,235 @@ class _Scope:
 # escalating to SIGKILL when reaping it in Command._exec_lines's finally block.
 _TERMINATE_TIMEOUT = 5
 
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Slow-command watchdog (S2a) and opt-in timeouts (S2b)
+# ---------------------------------------------------------------------------------------------------------------------
+
+# Seconds after which a command that is still running is reported at WARNING on the 'libzfseasy' logger, and again at
+# each further multiple. One rule for this module and for `libzfseasy.slow_command_warning` (the package forwards the
+# attribute here; `del libzfseasy.slow_command_warning` restores the default): a positive finite number turns the
+# warning on; None, zero, a negative number or infinity turn it off; anything else (a bool, a string, NaN) is invalid,
+# which the package setter refuses with ValueError and a read here treats as off (a bad setting must never fail a
+# command). Read when each command starts, so a change applies to the commands that start afterwards. Behaviour is
+# otherwise unchanged: the watchdog only logs.
+DEFAULT_SLOW_COMMAND_WARNING = 60
+slow_command_warning = DEFAULT_SLOW_COMMAND_WARNING
+
+# Bytes asked of a pipe per `os.read` when reading under a timeout.
+_READ_SIZE = 65536
+# After the deadline of a timed call: how long to wait for the child after SIGTERM, and again after SIGKILL.
+_EXPIRY_WAIT = 2
+# After the child of a timed-out call is gone: how long to wait for its stderr reader before leaving it to finish by
+# itself (a grandchild may hold stderr open; the reader is a daemon thread and keeps its pipe alive until it ends).
+_EXPIRY_JOIN = 0.05
+# How long `_SlowCommandWatchdog.cancel` waits for the watchdog thread to return.
+_WATCHDOG_JOIN = 0.1
+
+
+class ZFSTimeoutError(Exception):
+    """A command run under `timeout()` did not finish in time, or was refused because an earlier timed-out child is
+    still alive. A plain `Exception` (not `OSError`, `ValueError` or the built-in `TimeoutError`). The outcome of a
+    command that timed out is unknown: a write may or may not have happened."""
+
+
+_timeout_var = contextvars.ContextVar('libzfseasy_timeout', default=None)
+
+_Thread = threading.Thread
+_Event = threading.Event
+
+
+def _check_seconds(value, what: str):
+    """`value` as a float if it is a positive, finite real number (not a bool); `ValueError` otherwise."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f'{what} must be a positive, finite number of seconds, got {value!r}')
+    return float(value)
+
+
+@contextlib.contextmanager
+def timeout(seconds):
+    """Bound every non-streaming command started inside the block to `seconds` of wall-clock time each.
+
+    `with libzfseasy.timeout(30): libzfseasy.list(...)`. The limit is held in a `contextvars.ContextVar`, so it
+    follows the calling thread (or asyncio task) only and applies to each command separately. It is read when a command
+    starts running: for the generators behind `list`/`get` that is the first `next()`, in the context of whoever calls
+    it, not where the call was made. Nested blocks: the innermost wins; `timeout(None)` lifts the limit inside an outer
+    block. No command signature changes.
+
+    Context caveats: a thread started inside the block normally begins with an empty context (no limit), but a
+    context-copying start (free-threaded builds' default, `asyncio.to_thread`, `contextvars.copy_context().run`)
+    inherits it. Do not put a `with timeout()` around a `yield` (in a generator or an async function): the limit
+    would apply to whoever resumes it.
+
+    A command that is not finished in time has its child terminated (SIGTERM, then SIGKILL after 2 s, each waited for
+    at most 2 s) and `ZFSTimeoutError` is raised; the outcome of the command is unknown. A child that survives SIGKILL
+    (uninterruptible sleep, typically a hung pool) cannot be freed: it stays registered, and every later call made
+    under a timeout raises `ZFSTimeoutError` at once, without starting a child, until it has exited. Calls made
+    without a timeout are never refused. A timeout frees the calling thread, not the stuck process.
+
+    `send` and `receive` (and their `StreamHandle`s) ignore the timeout, as does `send.resume_info`. A lazy iterator
+    (`lazy=True`) spends its budget from the first row request until its last row, including the time the consumer
+    holds it between rows.
+
+    Keyword arguments:
+        seconds: float | None -- seconds per command, positive and finite; None for no limit
+
+    Raises:
+        ValueError -- `seconds` is not None and not a positive finite number
+    """
+    if seconds is not None:
+        seconds = _check_seconds(seconds, 'timeout')
+    token = _timeout_var.set(seconds)
+    try:
+        yield
+    finally:
+        _timeout_var.reset(token)
+
+
+def _slow_setting_valid(value) -> bool:
+    """Whether `value` is an acceptable `slow_command_warning`: None or a real number other than NaN (see the comment
+    at the setting)."""
+    return value is None or (isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isnan(value))
+
+
+def _slow_interval() -> Optional[float]:
+    """The slow-command warning interval in effect now, or None when the warning is off or the setting is invalid."""
+    value = slow_command_warning
+    if not _slow_setting_valid(value) or value is None or value <= 0 or math.isinf(value):
+        return None
+    return float(value)
+
+
+class _SlowCommandWatchdog:
+    """Logs a WARNING for a command that is still running, every `interval` seconds, until cancelled.
+
+    One daemon thread per watched call, parked on an `Event` (a Timer would need re-creating at every multiple). The
+    thread holds no lock shared with other calls and no module state, so it has nothing to repair after `fork()`: the
+    child simply has no such thread, and a `cancel()` there only sets the event. Starting it may fail (thread limit);
+    the command then runs unwatched. `cancel()` joins for at most `_WATCHDOG_JOIN`, so it cannot block on a stuck logging handler."""
+
+    def __init__(self, cmd, pid, interval: float):
+        self._cmd = cmd
+        self._pid = pid
+        self._interval = interval
+        self._started = time.monotonic()
+        self._stop = _Event()
+        self._thread = None
+
+    @classmethod
+    def for_command(cls, cmd, pid) -> Optional['_SlowCommandWatchdog']:
+        """A watchdog for the child `pid` of argv `cmd` (not started), or None when the warning is off. The argv is
+        redacted only when a warning is actually logged."""
+        interval = _slow_interval()
+        return None if interval is None else cls(cmd, pid, interval)
+
+    def start(self) -> None:
+        try:
+            thread = _Thread(target=self._run, name='libzfseasy-watchdog', daemon=True)
+            thread.start()
+        except Exception:
+            return
+        self._thread = thread
+
+    def cancel(self) -> None:
+        """Stop the watchdog. The thread is joined for at most `_WATCHDOG_JOIN` (it only has to wake and return, so
+        normally microseconds), so that no watchdog thread outlives the call it watched; a thread stuck in a logging
+        handler is left behind rather than waited for."""
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=_WATCHDOG_JOIN)
+
+    def _run(self) -> None:
+        try:
+            n = 1
+            while not self._stop.wait(max(0.0, self._started + n * self._interval - time.monotonic())):
+                if self._stop.is_set():
+                    break  # cancelled between the wake-up and now
+                try:
+                    label = _command_label(self._cmd)
+                except Exception:
+                    label = 'command'
+                now = time.monotonic()
+                logger.warning('%s (pid %s) is still running after %.1f s (slow-command warning every %g s)',
+                               label, self._pid, now - self._started, self._interval)
+                # After a stall (suspended process, clock jump) skip the multiples already passed: no burst.
+                n = max(n + 1, int((now - self._started) / self._interval) + 1)
+        except Exception:
+            pass
+
+
+class _DeadlineReached(Exception):
+    """Internal: a timed read ran out of time. Never leaves `_exec_lines`."""
+
+
+class _StuckChild:
+    """A child that a timed-out call could not get rid of (it survived SIGKILL). Kept in `_stuck` until it exits."""
+
+    def __init__(self, process, stderr_thread, label: str):
+        self.process = process
+        self.stderr_thread = stderr_thread
+        self.label = label
+        self.since = time.monotonic()
+
+    def release(self) -> None:
+        """The child has exited: close what this thread may close. stdout was closed at registration (this thread was
+        its only reader); stderr only once its reader has ended, as closing a pipe a thread is blocked on risks fd
+        reuse."""
+        StreamHandle._close_pipe(getattr(self.process, 'stdout', None))
+        thread = self.stderr_thread
+        if thread is None or not thread.is_alive():
+            StreamHandle._close_pipe(getattr(self.process, 'stderr', None))
+
+
+# Children that outlived a timeout plus SIGTERM plus SIGKILL. Guarded by `_stuck_lock`; both are replaced/emptied in a
+# forked child (the children are not the child's own, and the lock may have been held by a thread that does not exist
+# there).
+_stuck = []
+_stuck_lock = threading.Lock()
+
+
+def _register_stuck(process, stderr_thread, label: str) -> None:
+    with _stuck_lock:
+        _stuck.append(_StuckChild(process, stderr_thread, label))
+
+
+def _sweep_stuck() -> list:
+    """Poll the registered children, release the ones that exited and drop them; return the ones still alive."""
+    with _stuck_lock:
+        alive = []
+        for entry in _stuck:
+            try:
+                running = entry.process.poll() is None
+            except Exception:
+                running = False
+            if running:
+                alive.append(entry)
+            else:
+                entry.release()
+        _stuck[:] = alive
+        return list(alive)
+
+
+def _admit_timed(cmd) -> None:
+    """Admission for a call under a timeout: sweep `_stuck`; if a timed-out child is still alive, raise
+    `ZFSTimeoutError` before any child is started."""
+    alive = _sweep_stuck()
+    if alive:
+        pids = ', '.join(str(getattr(e.process, 'pid', '?')) for e in alive)
+        raise ZFSTimeoutError(f'{_command_label(cmd)} not started: {len(alive)} earlier command(s) that timed out are '
+                              f'still running (pid {pids}); zfs is not answering')
+
+
+def _reset_stuck_after_fork() -> None:
+    global _stuck_lock
+    _stuck_lock = threading.Lock()
+    _stuck.clear()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_stuck_after_fork)
+
 # Limits on the stderr a streaming child can make us keep: at most this many lines from the start and from the end
 # (the middle is replaced by one marker line), each at most this many bytes.
 _STDERR_KEEP_LINES = 200
@@ -454,30 +687,67 @@ class Command:
         interrupt), terminates and reaps the child (see `_TERMINATE_TIMEOUT`). This is the one exec core: `_exec` and
         `_exec_out` are built on it.
 
-        Unlike `_exec_out` (which strips and drops empty lines) nothing is stripped or dropped."""
+        Unlike `_exec_out` (which strips and drops empty lines) nothing is stripped or dropped.
+
+        Two opt-ins act here, both read when the generator first runs: a still-running child is reported by the
+        slow-command watchdog (`slow_command_warning`), and under `timeout()` stdout is read against a deadline
+        (`_read_until`) and an expired call ends in `_expire` and `ZFSTimeoutError`. Without a timeout the path is the
+        plain `readline` loop."""
         _log_command(cmd)
+        seconds = _timeout_var.get()
+        if seconds is not None:
+            _admit_timed(cmd)
+        started = time.monotonic()
         errors = _BoundedErrors()
         process = None
         stderr_thread = None
+        watchdog = None
+        deadline = None if seconds is None else started + seconds
+        timed = seconds is not None  # False again below if the pipe cannot be read against a deadline (a mock)
         completed = False
+        settled = False
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
             stderr_thread = cls._start_stderr_reader_lines(process, errors)
-            while True:
-                line = process.stdout.readline()
-                rc = process.poll()
-                if isinstance(line, (bytes, bytearray)):
-                    line = bytes(line).decode('utf-8', errors='surrogateescape')
-                if not isinstance(line, str) or line == '':
-                    break
-                yield line[:-1] if line.endswith('\n') else line
-            # stdout hit EOF: block until the child exits (never spin), then collect the whole of stderr.
-            if rc is None:
-                rc = process.wait()
-            cls._join_stderr_reader(stderr_thread)
+            watchdog = _SlowCommandWatchdog.for_command(cmd, getattr(process, 'pid', None))
+            if watchdog is not None:
+                watchdog.start()
+            fd = cls._timed_fd(process) if timed else None
+            if fd is None:
+                timed = False
+                while True:
+                    line = process.stdout.readline()
+                    rc = process.poll()
+                    if isinstance(line, (bytes, bytearray)):
+                        line = bytes(line).decode('utf-8', errors='surrogateescape')
+                    if not isinstance(line, str) or line == '':
+                        break
+                    yield line[:-1] if line.endswith('\n') else line
+                # stdout hit EOF: block until the child exits (never spin), then collect the whole of stderr.
+                if rc is None:
+                    rc = process.wait()
+            else:
+                try:
+                    rc = yield from cls._read_until(process, fd, deadline)
+                except _DeadlineReached:
+                    error = cls._expire(process, stderr_thread, cmd, seconds)
+                    settled = True  # the child is reaped or registered; the cleanup below must not repeat it
+                    raise error from None
+            if timed:
+                # The budget bounds this wait too (the child has exited; only a grandchild holding stderr can stall it).
+                cls._join_stderr_reader(stderr_thread, min(_TERMINATE_TIMEOUT, max(0.0, deadline - time.monotonic())))
+            else:
+                cls._join_stderr_reader(stderr_thread)
             completed = True
         finally:
-            if not completed and process is not None:
+            if watchdog is not None:
+                watchdog.cancel()
+            if not completed and not settled and process is not None and timed:
+                # Any exit other than the deadline (a consumer that raised, close() or GC of the generator, an
+                # interrupt): the same bounded sequence as an expiry, ending in the registry if the child survives
+                # SIGKILL. The original exception propagates afterwards.
+                cls._reap_timed(process, stderr_thread, cmd)
+            elif not completed and not settled and process is not None:
                 abandoned = False
                 try:
                     if process.poll() is None:
@@ -507,6 +777,122 @@ class Command:
                     process.wait()
         if rc != 0:
             raise Exception(_failure_text(errors, rc))
+
+    @staticmethod
+    def _timed_fd(process) -> Optional[int]:
+        """The stdout file descriptor to read under a timeout, or None when the process has no real one (a mocked
+        pipe), in which case the call reads with `readline` and the timeout cannot apply."""
+        try:
+            fd = process.stdout.fileno()
+        except (AttributeError, OSError, ValueError):
+            return None
+        return fd if isinstance(fd, int) and not isinstance(fd, bool) else None
+
+    @staticmethod
+    def _read_until(process, fd: int, deadline: float):
+        """Generator behind `_exec_lines` under a timeout: yield the lines of the child's stdout (same framing and
+        decoding as the `readline` path) reading with `selectors` and `os.read` so the wait can end at `deadline` (a
+        monotonic time), then wait for the child to exit, also until `deadline`. Returns its return code. Raises
+        `_DeadlineReached` only if the child is still running at the deadline; the selector is closed on every way
+        out. Bypasses the `process.stdout` buffer entirely, so nothing that is read can be lost in it.
+
+        A child that has already exited when the deadline passes is not a timeout: what is already in the pipe is
+        read without blocking and the call completes normally (if a grandchild still holds the pipe open, stdout is
+        closed here, this being its only reader)."""
+        selector = selectors.DefaultSelector()
+        held = False
+        try:
+            selector.register(fd, selectors.EVENT_READ)
+            pending = b''
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if process.poll() is None:
+                        raise _DeadlineReached()
+                    remaining = 0.0  # finished: take what is already there, never block
+                if not selector.select(remaining):
+                    if remaining > 0:
+                        continue  # the deadline is checked at the top
+                    held = True  # nothing more to read, yet no EOF: someone else holds the write end
+                    break
+                chunk = os.read(fd, _READ_SIZE)
+                if not chunk:
+                    break
+                pending += chunk
+                start = 0
+                while True:
+                    end = pending.find(b'\n', start)
+                    if end < 0:
+                        break
+                    yield pending[start:end].decode('utf-8', errors='surrogateescape')
+                    start = end + 1
+                pending = pending[start:]
+            if pending:
+                yield pending.decode('utf-8', errors='surrogateescape')
+            rc = process.poll()
+            if rc is None:
+                try:
+                    rc = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    rc = process.poll()
+                    if rc is None:
+                        raise _DeadlineReached() from None
+            return rc
+        finally:
+            selector.close()
+            if held:
+                StreamHandle._close_pipe(process.stdout)
+
+    @classmethod
+    def _reap_timed(cls, process, stderr_thread, cmd) -> bool:
+        """Get rid of the child of a timed call that ends early. Returns True if the child could not be killed.
+
+        If the child is running: SIGTERM, wait up to `_EXPIRY_WAIT`; SIGKILL, wait up to `_EXPIRY_WAIT`. A child that
+        is still alive then is registered in `_stuck` (it is not ours to wait for any longer) and a WARNING is logged.
+        stdout is closed either way: this thread is its only reader. stderr is never closed while its reader may be
+        blocked on it: for a reaped child the reader is given `_EXPIRY_JOIN` and the pipe is closed only if it ended;
+        a stuck child's stderr stays open (closing a busy fd risks fd reuse) until a sweep finds the child gone. A
+        further interrupt while waiting kills the child and propagates."""
+        stuck = False
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=_EXPIRY_WAIT)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=_EXPIRY_WAIT)
+                    except subprocess.TimeoutExpired:
+                        stuck = True
+        except BaseException:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            raise
+        if stuck:
+            label = _command_label(cmd)
+            _register_stuck(process, stderr_thread, label)
+            logger.warning('%s (pid %s) did not exit after SIGTERM and SIGKILL (uninterruptible, likely a hung pool); '
+                           'calls under a timeout are refused until it exits', label, process.pid)
+        StreamHandle._close_pipe(process.stdout)
+        if not stuck:
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=_EXPIRY_JOIN)
+            if stderr_thread is None or not stderr_thread.is_alive():
+                StreamHandle._close_pipe(process.stderr)
+        return stuck
+
+    @classmethod
+    def _expire(cls, process, stderr_thread, cmd, seconds) -> 'ZFSTimeoutError':
+        """A timed call ran out of time with its child still running: reap it (`_reap_timed`) and build the
+        `ZFSTimeoutError` to raise."""
+        stuck = cls._reap_timed(process, stderr_thread, cmd)
+        message = f'{_command_label(cmd)} timed out after {seconds:g}s; outcome unknown'
+        if stuck:
+            message += f' (pid {process.pid} did not exit after SIGKILL)'
+        return ZFSTimeoutError(message)
 
     @staticmethod
     def _start_stderr_reader_lines(process, errors):
@@ -546,6 +932,7 @@ class Command:
         process = None
         stderr_thread = None
         lines = []
+        watchdog = None
         completed = False
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
@@ -569,6 +956,9 @@ class Command:
                 stderr_thread = thread  # only a started thread may be joined by the cleanup
             else:
                 stderr_thread = cls._start_stderr_reader_lines(process, errors)
+            watchdog = _SlowCommandWatchdog.for_command(cmd, getattr(process, 'pid', None))
+            if watchdog is not None:
+                watchdog.start()
             while True:
                 line = process.stdout.readline()
                 if line == '':
@@ -578,6 +968,8 @@ class Command:
             cls._join_stderr_reader(stderr_thread)
             completed = True
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
             if not completed and process is not None:
                 if process.poll() is None:
                     process.kill()
@@ -620,13 +1012,14 @@ class Command:
         return thread
 
     @staticmethod
-    def _join_stderr_reader(thread):
-        # Bounded: a stray grandchild holding the pipe open must not hang the caller (the thread is a daemon).
+    def _join_stderr_reader(thread, bound=None):
+        # Bounded (`_TERMINATE_TIMEOUT`, or `bound` if given): a stray grandchild holding the pipe open must not hang
+        # the caller (the thread is a daemon).
         # Joined at most once per thread: a second caller (e.g. the abort path after a failed start) must not
         # wait out the timeout again for a reader that already timed out.
         if thread is None or getattr(thread, '_libzfseasy_joined', False) is True:
             return
-        thread.join(timeout=_TERMINATE_TIMEOUT)
+        thread.join(timeout=_TERMINATE_TIMEOUT if bound is None else bound)
         thread._libzfseasy_joined = True
 
     @classmethod
@@ -722,7 +1115,17 @@ class StreamHandle:
                 self._stream.close()
             except (OSError, ValueError) as e:
                 stream_error = e
-        rc = self._process.wait()
+        # The wait for the child to finish after the stream was closed is watched (slow-command warning); the transfer
+        # itself, which the caller drove, never is.
+        watchdog = _SlowCommandWatchdog.for_command(getattr(self._process, 'args', None),
+                                                    getattr(self._process, 'pid', None))
+        try:
+            if watchdog is not None:
+                watchdog.start()
+            rc = self._process.wait()
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
         # Only now is the handle done: an interrupt inside wait() leaves it open so a later close() can finish.
         self._closed = True
         reader = self._stderr_thread

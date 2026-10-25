@@ -229,6 +229,12 @@ holds before and after B-2a, the S-8 contract, B-6 first without status files, C
    - **S-3: the R0 pending map is evicted globally** (LRU, 4096 entries): an enrolled client negotiating thousands
      of names can evict other clients' entries (their next stream is refused with "negotiate again", retryable).
      Out of scope under Q1, but cap it per client id when S-3 adds per-client limits.
+   - **S-14 inputs from the D6/D7 concurrency review (2026-10-25):** the stuck-child registry is per process, so
+     one hung pool makes every timed call in that API worker fail fast (503 retry) until its stuck child exits,
+     healthy pools included (DD4 as designed); a respawned API worker starts with an empty registry, so each
+     incarnation can add up to its concurrency in new D-state `zfs` processes; the budget is per command, so a
+     handler making N calls can take N × (30 + 4) s: give each handler one overall budget if that matters.
+     `send.resume_info` and `StreamHandle.close` are not bounded by `timeout()`.
    - **S-3: fold in S-12's validity WARNING** (from the S-12 review, 2026-10-25): `_ValidityWarnThrottle` bounds
      memory (256 peers) but not log volume; a holder of a former client's expired pinned certificate (its key is
      not needed: the certificate is checked before the possession proof) cycling through source addresses logs one

@@ -88,14 +88,23 @@ Wraps the `zfs` and `zpool` CLI utilities as Python objects.
 
 Properties are stored internally as integer-indexed lists (using `_prop_names` class attrs) for efficiency; user-defined properties (containing `:`) are stored separately in `_user_props`.
 
-**[libzfseasy/zfs.py](libzfseasy/zfs.py)** defines command classes (`ListCommand`, `CreateCommand`, `SnapshotCommand`, etc.), each wrapping a `zfs` subcommand. `Command._exec` / `_exec_out` drive `subprocess.Popen` and stream stdout line-by-line. `SendCommand` and `ReceiveCommand` use binary streaming variants (`_exec_stream` / `_exec_stream_in`) that return `BufferedReader`/`BufferedWriter`.
+**[libzfseasy/zfs.py](libzfseasy/zfs.py)** defines command classes (`ListCommand`, `CreateCommand`, `SnapshotCommand`, etc.), each wrapping a `zfs` subcommand. One exec core, `Command._exec_lines` (bytes, surrogateescape, `\n`-only, bounded stderr), backs `_exec` (drain) and `_exec_out` (stripped non-empty lines); on an interrupt or an abandoned generator it sends TERM, then KILL after 5 s, and abandons a child that survives KILL (D state) with one WARNING rather than blocking. A watchdog reports a command
+still running after `libzfseasy.slow_command_warning` seconds (default 60; None turns it off) at WARNING, and again at
+each further multiple. `with libzfseasy.timeout(s):` (a ContextVar, per command, non-streaming only) terminates an
+overrunning child and raises `ZFSTimeoutError`; while a timed-out child survives KILL, every later *timed* call fails
+fast (untimed calls are never refused). `SendCommand` and `ReceiveCommand` use binary streaming variants (`_exec_stream` / `_exec_stream_in`) that return `BufferedReader`/`BufferedWriter`.
 `-H` output framing is a trust boundary: every write refuses values containing `\n`, `\r`, `\t` or `\0`
 (`Validate.value`, `InvalidValueError`) before running; `list`/`get` read bytes (`_exec_lines`, surrogateescape,
 split on `\n` only) and fail closed per row and per object (wrong column count, out-of-scope or duplicate names,
 non-contiguous groups, and the "lead rule": an object's `get` rows must start with `type` for `all`, or
 `name`,`type` for an explicit list, so `GetCommand` must never pass `-s`). `zfs.get.value(ds, prop, sources=…)`
 reads one value exactly. `zfs.list(..., strict=True)` raises instead of skipping any row the default parse
-would skip (with a WARNING); the server's `-F` decision lists with it.
+would skip (with a WARNING); the server's `-F` decision lists with it. With an explicit property list, `get()` and
+`rows()` refuse an object whose rows are not exactly `name, type, p1, p2, …` in the requested order (verified on
+2.1/2.2/2.4: zfs prints exactly the requested properties). `zfs.get.rows(…)` is the fail-closed row reader for
+safety decisions (`GetRow` list with `.complete`/`.dropped`/`.skipped`; `verify_names` cross-checks names against a
+name-only `zfs list`; pass `received=False`). A listing that skips names libzfseasy cannot represent ends with one
+summary line, WARNING only when it also logged a new per-name WARNING.
 
 **[libzfseasy/\_\_init\_\_.py](libzfseasy/__init__.py)** instantiates one singleton per command class and exports them as module-level names (`zfs.list`, `zfs.create`, `zfs.snapshot`, etc.). This is the public API.
 
@@ -341,6 +350,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_commands.py` | Each command class, mocked subprocess |
 | `tests/test_framing.py` | `-H` output framing: unframeable values refused on write, fail-closed `list`/`get` row parsing (forged/duplicate/out-of-scope rows), `get.value`, `_exec_lines`, `list(strict=True)` |
 | `tests/test_libzfseasy_argv_hygiene.py` | Property names starting with `-` or over 255 characters refused, `receive` name validation, `_redact` clipping |
+| `tests/test_libzfseasy_timeouts.py` | D6 slow-command watchdog (`slow_command_warning`) and D7 `timeout()`: expiry, stuck-child registry, fail-fast timed calls, contexts and threads |
 | `tests/test_integration.py` | End-to-end workflows, mocked subprocess |
 | `tests/test_real_zfs.py` | Real ZFS commands, marked `real_zfs` |
 | `tests/test_commands_part2.py` | Command classes `AllowCommand` through `MountCommand` |

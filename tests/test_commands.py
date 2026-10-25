@@ -1322,6 +1322,14 @@ class TestExecCaptureRegressions:
         assert process.wait.call_count == 3
 
 
+def _wait_for_thread_count(baseline, limit=5.0):
+    """Give the daemon threads of the slow-command watchdog (a cancelled one needs a moment to return) time to end
+    before a `threading.active_count()` comparison."""
+    deadline = time.monotonic() + limit
+    while threading.active_count() > baseline and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+
 class _RealChildHarness:
     """Drives `Command._exec_out` / `_exec` against a REAL child (`sys.executable -c ...`), not
     the `mock_subprocess` fixture.
@@ -4104,6 +4112,7 @@ class TestExecCollect:
         process.kill.assert_called_once()
         process.wait.assert_called()
         assert release.is_set()
+        _wait_for_thread_count(before)
         assert threading.active_count() == before     # the stderr reader was joined, not abandoned
 
     @pytest.mark.unit
@@ -4470,6 +4479,7 @@ class TestExecCollectRawStderr:
         with pytest.raises(KeyboardInterrupt):
             Command._exec_collect(['zfs', 'x'], raw_stderr=True)
         process.kill.assert_called_once()
+        _wait_for_thread_count(before)
         assert threading.active_count() == before
 
 
