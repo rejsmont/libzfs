@@ -748,44 +748,14 @@ API_WS_END_TIMEOUT = 2.0
 _API_FULL_WARN_EVERY = 60.0
 
 #: S-12: a failed handshake whose client certificate is expired or not yet
-#: valid is logged at WARNING at most once per this many seconds per peer IP
-#: (every other handshake failure stays DEBUG).
-API_VALIDITY_WARN_EVERY = 3600.0
-
-#: The most peer IPs `_ValidityWarnThrottle` remembers; past it the least
-#: recently warned one is forgotten.
-API_VALIDITY_WARN_PEERS = 256
+#: valid is logged at WARNING through the shared per-peer throttle
+#: (`api._PerPeerThrottle`, kind `tls-validity`: once per peer per hour, S-3);
+#: every other handshake failure stays DEBUG.
 
 #: `ssl.SSLCertVerificationError.verify_code` values (OpenSSL
 #: `X509_V_ERR_CERT_NOT_YET_VALID` / `X509_V_ERR_CERT_HAS_EXPIRED`).
 _X509_CERT_NOT_YET_VALID = 9
 _X509_CERT_HAS_EXPIRED = 10
-
-
-class _ValidityWarnThrottle:
-    """At most one WARNING per peer IP per `every` seconds, over a map of at
-    most `max_peers` IPs (S-12). Thread-safe: handshakes run on their own
-    threads. A flood of distinct IPs cannot grow the map; it evicts the least
-    recently warned entry."""
-
-    def __init__(self, every: float = API_VALIDITY_WARN_EVERY,
-                 max_peers: int = API_VALIDITY_WARN_PEERS) -> None:
-        self._every = every
-        self._max = max_peers
-        self._last: dict = {}
-        self._guard = threading.Lock()
-
-    def allow(self, peer: str) -> bool:
-        now = time.monotonic()
-        with self._guard:
-            last = self._last.get(peer)
-            if last is not None and now - last < self._every:
-                return False
-            self._last.pop(peer, None)  # re-insert last: dict order = recency
-            self._last[peer] = now
-            while len(self._last) > self._max:
-                del self._last[next(iter(self._last))]
-        return True
 
 
 _API_SERVER_CLASS = None
@@ -826,6 +796,15 @@ def _api_server_class():
     serialises its writes and lets the connection be closed only once
     simple-websocket's reader thread has left it (`API_WS_END_TIMEOUT`).
     The slots are released in a `finally`.
+
+    **Flood control (plan S-3, `api.PeerLimits`).** Before it takes a slot,
+    `process_request` asks the peer's token bucket (burst 60, 10 per second)
+    and concurrent-connection cap (8; 32 for a peer that presented a pinned
+    certificate within the last hour); over either the connection is closed
+    on the accept thread, before a TLS byte is read. Both are O(1) under one
+    short lock. The peer's concurrency slot is released with the global one.
+    `/enroll` lockout, the in-flight cap and the log throttle live in the app
+    (`api.create_app`).
     `self.ssl_context` is
     assigned after construction purely so werkzeug's environ reports `https`,
     fills `SSL_CLIENT_CERT` and treats SSL errors as dropped connections; it
@@ -858,6 +837,8 @@ def _api_server_class():
         import ssl
         from werkzeug.serving import ThreadedWSGIServer, WSGIRequestHandler
         from werkzeug.urls import uri_to_iri
+
+        from zfsbackup import api as api_mod
 
         log = logging.getLogger(__name__)
 
@@ -1342,13 +1323,29 @@ def _api_server_class():
                 class so the journal is not flooded: 1xx-3xx DEBUG, 4xx INFO,
                 5xx WARNING (a status that is not a number: INFO). Through
                 werkzeug's own `log`, so the logger name and the line format
-                are unchanged."""
+                are unchanged. The refusal statuses a flood can repeat
+                (`api.THROTTLED_ACCESS_STATUSES`) are further limited to one
+                line per peer and status per hour (S-3)."""
                 try:
                     status = int(code)
                 except (TypeError, ValueError):
                     level = 'info'
                 else:
                     level = 'warning' if status >= 500 else 'info' if status >= 400 else 'debug'
+                    if level != 'debug' and status in api_mod.THROTTLED_ACCESS_STATUSES:
+                        # S-3: the statuses an unauthenticated flood
+                        # produces (401, 426, 429, 503, ...) are logged
+                        # once per peer, status and hour at their level;
+                        # the rest are DEBUG and counted in the hourly
+                        # summary.
+                        try:
+                            limits = self.server.limits
+                            if not limits.log.allow(
+                                f"access-{status}", api_mod.peer_key(self.client_address)
+                            ):
+                                level = 'debug'
+                        except Exception:
+                            pass
                 try:
                     path = uri_to_iri(self.path)
                     msg = f"{self.command} {path} {self.request_version}"
@@ -1370,6 +1367,7 @@ def _api_server_class():
                 max_anonymous: int = API_MAX_ANONYMOUS_CONNECTIONS,
                 reject_linger: float = API_REJECT_LINGER,
                 ws_end_timeout: float = API_WS_END_TIMEOUT,
+                limits=None,
             ):
                 if (
                     isinstance(ws_end_timeout, bool)
@@ -1400,7 +1398,18 @@ def _api_server_class():
                 self._anonymous_slots = threading.BoundedSemaphore(max_anonymous)
                 #: Per connection thread: `pinned` (the handler reads it).
                 self.connection_state = threading.local()
-                self._validity_throttle = _ValidityWarnThrottle()
+                # S-3 flood control: the app's `PeerLimits` (the API worker
+                # builds one in `create_app`), else a private one. Shared
+                # with the app's threads and the trust-poll thread; see the
+                # threading notes at `api.peer_key`.
+                if limits is None:
+                    limits = getattr(app, 'extensions', {}).get('zfsbackup.peer_limits')
+                if limits is None:
+                    limits = api_mod.PeerLimits()
+                self.limits = limits
+                # The reserve of slots for vouched peers is a share of THIS
+                # server's connection cap.
+                self.limits.rate.configure_capacity(max_connections)
                 self._full_warned_at: Optional[float] = None
                 self._anonymous_full_warned_at: Optional[float] = None
                 # No `ssl_context` here: werkzeug would wrap the listening
@@ -1418,7 +1427,21 @@ def _api_server_class():
 
             def process_request(self, request, client_address):
                 # Accept thread: never block, never handshake here.
+                #
+                # S-3, before anything else is spent on the connection: the
+                # peer's token bucket and its concurrent-connection cap
+                # (`api.PeerRateLimiter`). Over either, the connection is
+                # closed right here -- no thread, no TLS byte read. Both are
+                # O(1) under one short lock; the log line, if any, is written
+                # after the socket is closed.
+                key = api_mod.peer_key(client_address)
+                refusal = self.limits.rate.admit(key)
+                if refusal is not None:
+                    self.shutdown_request(request)
+                    self._log_flood_drop(refusal, key, client_address)
+                    return
                 if not self._slots.acquire(blocking=False):
+                    self.limits.rate.release(key)
                     now = time.monotonic()
                     if (
                         self._full_warned_at is None
@@ -1436,9 +1459,51 @@ def _api_server_class():
                 except BaseException:
                     # The thread never started: nobody else releases the slot.
                     self._slots.release()
+                    self.limits.rate.release(key)
                     raise
 
+            def _log_flood_drop(self, refusal, key, client_address) -> None:
+                """One WARNING per peer per hour for connections dropped by
+                the per-peer limits (the rest DEBUG, counted in the hourly
+                summary). Accept thread: the throttle is O(1) and a line is
+                written at most once per peer and hour. Never raises."""
+                try:
+                    host = client_address[0] if client_address else '?'
+                    # `emit`, not `log`: a suppressed line is not even
+                    # formatted here (this is the accept thread).
+                    if refusal == api_mod.ADMIT_RESERVED:
+                        self.limits.log.emit(
+                            'conn-reserve', key, logging.WARNING,
+                            "API: dropping a connection from %s: %d of %d connection slots "
+                            "are open and the rest are kept for peers with a pinned client "
+                            "certificate",
+                            host, self.max_connections - self.limits.rate.reserve,
+                            self.max_connections,
+                        )
+                    elif refusal == api_mod.ADMIT_CONCURRENT:
+                        self.limits.log.emit(
+                            'conn-cap', key, logging.WARNING,
+                            "API: dropping connections from %s: it already has the maximum "
+                            "of simultaneous connections open (%d unauthenticated, %d once "
+                            "it has presented a pinned client certificate)",
+                            host, api_mod.API_MAX_CONNECTIONS_PER_IP, api_mod.API_MAX_CONNECTIONS_PER_VOUCHED_IP,
+                        )
+                    else:
+                        self.limits.log.emit(
+                            'rate', key, logging.WARNING,
+                            "API: dropping connections from %s: more than %d at once or "
+                            "%g per second sustained; it may be flooding this server",
+                            host, self.limits.rate.burst, self.limits.rate.rate,
+                        )
+                except Exception:
+                    log.debug("API: flood log failed", exc_info=True)
+
             def process_request_thread(self, request, client_address):
+                # Connection thread. Whatever happens, both the global slot
+                # and the peer's concurrency slot (taken in `process_request`
+                # on the accept thread) are given back in the outer `finally`.
+                key = api_mod.peer_key(client_address)
+                vouched_here = False
                 try:
                     try:
                         context = self.gateway.current_context()
@@ -1461,6 +1526,13 @@ def _api_server_class():
                         self._close_after_failed_handshake(tls)
                         return
                     pinned = self._is_pinned(tls)
+                    if pinned:
+                        # This address now has a live pinned client: no
+                        # bucket, higher concurrency cap, may use the reserve
+                        # -- while this connection is open and for
+                        # `API_VOUCH_TTL` after it ends (`unvouch` below).
+                        self.limits.rate.vouch(key)
+                        vouched_here = True
                     if not pinned and not self._anonymous_slots.acquire(blocking=False):
                         now = time.monotonic()
                         if (
@@ -1485,12 +1557,26 @@ def _api_server_class():
                         if not pinned:
                             self._anonymous_slots.release()
                 finally:
-                    self._slots.release()
+                    # Nested, so that one raising cannot skip the others: a
+                    # leaked pinned-open count would keep the address
+                    # vouched for ever.
+                    try:
+                        self._slots.release()
+                    finally:
+                        try:
+                            self.limits.rate.release(key)
+                        finally:
+                            if vouched_here:
+                                self.limits.rate.unvouch(key)
 
             def _warn_certificate_validity(self, exc, client_address) -> None:
                 """S-12: a client whose certificate expired (or is not valid
                 yet) is otherwise invisible, a DEBUG line. One WARNING per
-                peer IP per `API_VALIDITY_WARN_EVERY`; never raises."""
+                peer per hour through the shared throttle (`api.
+                _PerPeerThrottle`, kind `tls-validity`, which also caps the
+                lines per hour over all peers: a holder of a former client's
+                expired certificate cycling through addresses cannot flood
+                the journal); never raises."""
                 try:
                     if not isinstance(exc, ssl.SSLCertVerificationError):
                         return
@@ -1508,10 +1594,10 @@ def _api_server_class():
                     else:
                         return
                     peer = str(client_address[0])
-                    if self._validity_throttle.allow(peer):
-                        logging.getLogger(logsetup.PEER_LOGGER).warning(
-                            "API: TLS client %s refused: %s", peer, what
-                        )
+                    self.limits.log.log(
+                        'tls-validity', api_mod.peer_key(client_address), logging.WARNING,
+                        "API: TLS client %s refused: %s", peer, what,
+                    )
                 except Exception:
                     log.debug("API: validity warning failed", exc_info=True)
 
@@ -1720,6 +1806,9 @@ class ApiWorker(_SupervisorWatch, Process):
     #: Class-level default, so a worker built by a test that bypasses
     #: `__init__` refuses to serve rather than serving without trust.
     config_db = None
+    #: The app's `api.PeerLimits` (S-3), set by `_serve`; the trust-poll
+    #: thread logs its hourly summary. `None`: nothing to flush.
+    _peer_limits = None
 
     def __init__(
         self,
@@ -1770,13 +1859,21 @@ class ApiWorker(_SupervisorWatch, Process):
         `store.trust.list_revoked`, through `_store_call` like every other
         store call of this process, waiting at most `api.STORE_CALL_WAIT`
         (a skipped call is retried next tick). A slow `list_revoked` (busy
-        database) delays only the next tick, never a request."""
+        database) delays only the next tick, never a request.
+
+        Plan S-3: the same thread logs the hourly summary of suppressed
+        refusal lines (`self._peer_limits.flush_log()`, `api.PeerLimits`, set
+        by `_serve` from the app; `None` -> not done) at the top of every tick, before anything that can wait: it
+        touches no database and takes only the throttle's own short lock."""
         from zfsbackup.api import TRUST_POLL_SECONDS
         gateway = self._trust
         stopped = threading.Event()
+        limits = self._peer_limits
 
         def loop():
             while not stopped.wait(TRUST_POLL_SECONDS):
+                if limits is not None:
+                    limits.flush_log()  # never raises
                 if sessions is not None:
                     # The write-stall pass needs no database: before the
                     # poll, so a slow or locked store never delays it.
@@ -1926,6 +2023,7 @@ class ApiWorker(_SupervisorWatch, Process):
         #: Set when the gateway asks for a restart (`TrustGateway.
         #: restart_reason`: the server identity on disk changed, confirmed).
         restart: Optional[str] = None
+        self._peer_limits = app.extensions.get('zfsbackup.peer_limits')
         poll_stopped = self._start_trust_poll(
             logger, app.extensions.get('zfsbackup.sessions')
         )

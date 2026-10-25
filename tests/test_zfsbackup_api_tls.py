@@ -32,8 +32,10 @@ Layout
   supervisor at startup, never created in a dry run (a throwaway identity in a private
   temporary directory instead), reported read-only by `--test-config`.
 * `TestHandshakeValidityWarning` / `TestValidityWarnThrottle` -- S-12: a pinned client
-  certificate that is expired / not yet valid is one WARNING per peer IP per hour on
-  the server (every other handshake failure stays DEBUG); the per-IP throttle.
+  certificate that is expired / not yet valid is one WARNING per peer per hour on
+  the server (every other handshake failure stays DEBUG); the `tls-validity` kind of the
+  shared S-3 log throttle (`api._PerPeerThrottle`). The servers here run with
+  `permissive_limits` (no accept-time bucket or caps) unless a test passes `limits=`.
 * `TestStoreWarningDedupe` -- `api.dedupe_store_warnings` and its uninstall handle (K-5),
   installed by the API worker for the length of its run only.
 
@@ -64,7 +66,7 @@ from pathlib import Path
 
 import pytest
 
-from _api_support import make_client_cert
+from _api_support import make_client_cert, permissive_limits
 from _clock_support import FakeTime
 from _hermetic import hermetic_env
 from _remote_support import write_identity_files
@@ -144,6 +146,10 @@ class Serving:
     """`workers._bind_api_server` served from a thread; shut down on exit."""
 
     def __init__(self, app, gateway, **kwargs):
+        # S-3: the per-peer bucket and connection cap would act on the many connections
+        # these tests open from 127.0.0.1; they have their own tests in
+        # test_zfsbackup_api_flood.py. A test that wants the real limits passes `limits=`.
+        kwargs.setdefault("limits", permissive_limits())
         cls = workers._api_server_class()
         self.server = cls(LOOPBACK, 0, app, gateway, **kwargs)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -2917,10 +2923,10 @@ class TestTestConfigTls:
 
 
 @pytest.fixture
-def fake_time(mocker):
-    clock = FakeTime()
-    mocker.patch.object(workers, "time", clock)
-    return clock
+def fake_time():
+    """A `FakeTime` to inject as the clock of the S-3 limits (`permissive_limits(clock=
+    fake_time.monotonic)`): the throttle takes `clock=`, nothing is patched."""
+    return FakeTime()
 
 
 def _expired_message(peer):
@@ -2989,11 +2995,13 @@ class TestHandshakeValidityWarning:
         return k
 
     @contextlib.contextmanager
-    def _server(self, kit, **kwargs):
+    def _server(self, kit, clock=None, **kwargs):
         """An `ApiServer` that is NOT serving: connections are fed to `process_request`
         over a socketpair (so the peer address can be anything), and the call blocks until
-        the server has finished with the connection."""
+        the server has finished with the connection. `clock`: the monotonic clock of the S-3
+        log throttle (default the real one); the bucket and caps are out of the way."""
         cls = workers._api_server_class()
+        kwargs.setdefault("limits", permissive_limits(clock=clock))
         server = cls(LOOPBACK, 0, echo_app, kit.gateway, **kwargs)
         try:
             yield server
@@ -3085,16 +3093,16 @@ class TestHandshakeValidityWarning:
 
     def test_a_repeat_from_the_same_ip_within_an_hour_is_silent(self, kit, caplog, fake_time):
         ctx = kit.expired()
-        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit, fake_time.monotonic) as server:
             for _ in range(4):
                 self._feed(server, ("203.0.113.7", 40000), ctx)
         assert [r.getMessage() for r in _validity_warnings(caplog)] == [_expired_message("203.0.113.7")]
 
     def test_the_same_ip_is_named_again_after_an_hour(self, kit, caplog, fake_time):
         ctx = kit.expired()
-        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit, fake_time.monotonic) as server:
             self._feed(server, ("203.0.113.7", 40000), ctx)
-            fake_time.advance(workers.API_VALIDITY_WARN_EVERY - 30)
+            fake_time.advance(api.PEER_LOG_EVERY - 30)
             self._feed(server, ("203.0.113.7", 40001), ctx)
             assert len(_validity_warnings(caplog)) == 1           # 30 s short of the hour
             fake_time.advance(60)
@@ -3105,7 +3113,7 @@ class TestHandshakeValidityWarning:
 
     def test_distinct_ips_are_independent(self, kit, caplog, fake_time):
         ctx = kit.expired()
-        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit, fake_time.monotonic) as server:
             for ip in ("198.51.100.1", "198.51.100.2", "198.51.100.1", "198.51.100.3",
                        "198.51.100.2"):
                 self._feed(server, (ip, 40000), ctx)
@@ -3116,14 +3124,14 @@ class TestHandshakeValidityWarning:
 
     def test_the_peer_port_does_not_make_a_new_peer(self, kit, caplog, fake_time):
         ctx = kit.expired()
-        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit, fake_time.monotonic) as server:
             for port in (1, 2, 3):
                 self._feed(server, ("198.51.100.9", port), ctx)
         assert len(_validity_warnings(caplog)) == 1
 
     def test_an_ipv6_peer_is_named_by_its_address(self, kit, caplog, fake_time):
         ctx = kit.not_yet_valid()
-        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit, fake_time.monotonic) as server:
             self._feed(server, ("2001:db8::7", 40000, 0, 0), ctx)
         assert [r.getMessage() for r in _validity_warnings(caplog)] == [
             _not_yet_valid_message("2001:db8::7")]
@@ -3215,12 +3223,12 @@ class TestHandshakeValidityWarning:
     def test_a_failing_throttle_does_not_break_the_handshake_path(self, kit, caplog, mocker):
         ctx = kit.expired()
         with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
-            mocker.patch.object(server._validity_throttle, "allow", side_effect=RuntimeError("boom"))
+            mocker.patch.object(server.limits.log, "allow", side_effect=RuntimeError("boom"))
             self._feed(server, ("203.0.113.7", 40000), ctx)
         assert _validity_warnings(caplog) == []
         assert "validity warning failed" in caplog.text            # DEBUG, with the traceback
 
-    def test_the_slot_is_released_after_a_refusal(self, kit, fake_time):
+    def test_the_slot_is_released_after_a_refusal(self, kit):
         ctx = kit.expired()
         with self._server(kit, max_connections=2) as server:
             for i in range(6):                                     # more refusals than slots
@@ -3230,140 +3238,160 @@ class TestHandshakeValidityWarning:
 
 
 class _SpyAllow:
+    """Records the `(kind, peer)` of every `allow` the server's log throttle is asked."""
+
     def __init__(self, throttle):
         self.calls = []
         self._real = throttle.allow
         throttle.allow = self
 
-    def __call__(self, peer):
-        result = self._real(peer)
-        self.calls.append((peer, result))
+    def __call__(self, kind, peer):
+        result = self._real(kind, peer)
+        self.calls.append((kind, peer, result))
         return result
 
 
 def _spy_allow(server) -> _SpyAllow:
-    return _SpyAllow(server._validity_throttle)
+    return _SpyAllow(server.limits.log)
 
 
 @pytest.mark.unit
 class TestValidityWarnThrottle:
-    """`workers._ValidityWarnThrottle`: one WARNING per peer per interval, bounded memory,
-    least-recently-WARNED eviction, thread-safe."""
+    """S-12's rules, now the `tls-validity` kind of the shared `api._PerPeerThrottle` (S-3): one
+    WARNING per peer per interval, bounded memory, least-recently-WARNED eviction, thread-safe.
+    (`test_zfsbackup_api_flood.py` has the rest of the throttle: the global cap, the kinds, the
+    summary.)"""
+
+    KIND = "tls-validity"
 
     @pytest.fixture
     def clock(self, fake_time):
         fake_time.frozen = 1000.0
         return fake_time
 
-    def test_the_defaults_are_the_documented_constants(self):
-        assert workers.API_VALIDITY_WARN_EVERY == 3600.0
-        assert workers.API_VALIDITY_WARN_PEERS == 256
-        t = workers._ValidityWarnThrottle()
-        assert t._every == 3600.0 and t._max == 256
+    @pytest.fixture
+    def make(self, clock):
+        """-> a throttle on the fake clock with no global cap in the way."""
+        def build(every=100, max_peers=8):
+            return api._PerPeerThrottle(every=every, max_keys=max_peers, global_max=10 ** 9,
+                                        clock=clock.monotonic)
+        return build
 
-    def test_the_server_gets_the_default_throttle(self, pki):
+    def test_the_defaults_are_the_documented_constants(self):
+        assert api.PEER_LOG_EVERY == 3600.0 and api.PEER_LOG_KEYS == 4096
+        t = api._PerPeerThrottle()
+        assert t._every == 3600.0 and t._max == 4096
+
+    def test_the_old_s12_names_are_gone(self):
+        assert not hasattr(workers, "_ValidityWarnThrottle")
+        assert not hasattr(workers, "API_VALIDITY_WARN_EVERY")
+        assert not hasattr(workers, "API_VALIDITY_WARN_PEERS")
+
+    def test_the_server_gets_the_default_limits(self, pki):
         server = workers._bind_api_server(echo_app, LOOPBACK, 0, pki.gateway)
         try:
-            assert isinstance(server._validity_throttle, workers._ValidityWarnThrottle)
-            assert server._validity_throttle._every == workers.API_VALIDITY_WARN_EVERY
-            assert server._validity_throttle._max == workers.API_VALIDITY_WARN_PEERS
+            assert isinstance(server.limits, api.PeerLimits)
+            assert isinstance(server.limits.log, api._PerPeerThrottle)
+            assert server.limits.log._every == api.PEER_LOG_EVERY
+            assert server.limits.log._max == api.PEER_LOG_KEYS
+            assert not hasattr(server, "_validity_throttle")
         finally:
             server.server_close()
 
-    def test_the_first_attempt_is_allowed_and_the_repeat_is_not(self, clock):
-        t = workers._ValidityWarnThrottle(every=100, max_peers=8)
-        assert t.allow("a") is True
-        assert t.allow("a") is False
-        assert t.allow("a") is False
+    def test_the_first_attempt_is_allowed_and_the_repeat_is_not(self, make):
+        t = make(100, 8)
+        assert t.allow(self.KIND, "a") is True
+        assert t.allow(self.KIND, "a") is False
+        assert t.allow(self.KIND, "a") is False
 
-    def test_the_boundary_is_exactly_the_interval(self, clock):
-        t = workers._ValidityWarnThrottle(every=100, max_peers=8)
-        assert t.allow("a") is True
+    def test_the_boundary_is_exactly_the_interval(self, clock, make):
+        t = make(100, 8)
+        assert t.allow(self.KIND, "a") is True
         clock.frozen += 99.9
-        assert t.allow("a") is False
+        assert t.allow(self.KIND, "a") is False
         clock.frozen += 0.1
-        assert t.allow("a") is True                                # 100 s after the warning
+        assert t.allow(self.KIND, "a") is True                                # 100 s after the warning
 
-    def test_a_suppressed_attempt_does_not_extend_the_window(self, clock):
-        t = workers._ValidityWarnThrottle(every=100, max_peers=8)
-        assert t.allow("a") is True
+    def test_a_suppressed_attempt_does_not_extend_the_window(self, clock, make):
+        t = make(100, 8)
+        assert t.allow(self.KIND, "a") is True
         clock.frozen += 60
-        assert t.allow("a") is False                               # seen again, not warned
+        assert t.allow(self.KIND, "a") is False                               # seen again, not warned
         clock.frozen += 40
-        assert t.allow("a") is True                                # measured from the warning
+        assert t.allow(self.KIND, "a") is True                                # measured from the warning
 
-    def test_an_allowed_attempt_restarts_the_window(self, clock):
-        t = workers._ValidityWarnThrottle(every=100, max_peers=8)
-        assert t.allow("a") is True
+    def test_an_allowed_attempt_restarts_the_window(self, clock, make):
+        t = make(100, 8)
+        assert t.allow(self.KIND, "a") is True
         clock.frozen += 100
-        assert t.allow("a") is True
+        assert t.allow(self.KIND, "a") is True
         clock.frozen += 99
-        assert t.allow("a") is False
+        assert t.allow(self.KIND, "a") is False
 
-    def test_peers_are_independent(self, clock):
-        t = workers._ValidityWarnThrottle(every=100, max_peers=8)
-        assert [t.allow(p) for p in "abab"] == [True, True, False, False]
+    def test_peers_are_independent(self, make):
+        t = make(100, 8)
+        assert [t.allow(self.KIND, p) for p in "abab"] == [True, True, False, False]
 
-    def test_the_map_never_outgrows_the_cap(self, clock):
-        t = workers._ValidityWarnThrottle(every=100, max_peers=5)
+    def test_the_map_never_outgrows_the_cap(self, make):
+        t = make(100, 5)
         for i in range(1000):
-            t.allow(f"10.0.{i // 256}.{i % 256}")
+            t.allow(self.KIND, f"10.0.{i // 256}.{i % 256}")
             assert len(t._last) <= 5
         assert len(t._last) == 5
 
-    def test_a_flood_of_distinct_ips_evicts_the_oldest_warned_first(self, clock):
-        t = workers._ValidityWarnThrottle(every=1000, max_peers=4)
+    def test_a_flood_of_distinct_ips_evicts_the_oldest_warned_first(self, clock, make):
+        t = make(1000, 4)
         for i, peer in enumerate("abcd"):
             clock.frozen = 1000.0 + i
-            assert t.allow(peer) is True
+            assert t.allow(self.KIND, peer) is True
         clock.frozen = 1010.0
-        assert t.allow("e") is True                                # evicts "a"
-        assert [t.allow(p) for p in "bcde"] == [False] * 4         # the rest are remembered
-        assert t.allow("a") is True                                # "a" was forgotten
+        assert t.allow(self.KIND, "e") is True                                # evicts "a"
+        assert [t.allow(self.KIND, p) for p in "bcde"] == [False] * 4         # the rest are remembered
+        assert t.allow(self.KIND, "a") is True                                # "a" was forgotten
 
-    def test_eviction_is_by_last_warned_not_by_last_seen(self, clock):
-        t = workers._ValidityWarnThrottle(every=1000, max_peers=2)
-        assert t.allow("a") is True
+    def test_eviction_is_by_last_warned_not_by_last_seen(self, clock, make):
+        t = make(1000, 2)
+        assert t.allow(self.KIND, "a") is True
         clock.frozen += 1
-        assert t.allow("b") is True
+        assert t.allow(self.KIND, "b") is True
         clock.frozen += 1
-        assert t.allow("a") is False                               # "a" seen again: still the oldest warned
-        assert t.allow("c") is True                                # so "a" goes, not "b"
-        assert t.allow("b") is False and t.allow("c") is False
-        assert t.allow("a") is True
+        assert t.allow(self.KIND, "a") is False                               # "a" seen again: still the oldest warned
+        assert t.allow(self.KIND, "c") is True                                # so "a" goes, not "b"
+        assert t.allow(self.KIND, "b") is False and t.allow(self.KIND, "c") is False
+        assert t.allow(self.KIND, "a") is True
 
-    def test_warning_again_makes_a_peer_the_newest(self, clock):
-        t = workers._ValidityWarnThrottle(every=10, max_peers=2)
-        assert t.allow("a") is True
+    def test_warning_again_makes_a_peer_the_newest(self, clock, make):
+        t = make(10, 2)
+        assert t.allow(self.KIND, "a") is True
         clock.frozen += 1
-        assert t.allow("b") is True
+        assert t.allow(self.KIND, "b") is True
         clock.frozen += 10
-        assert t.allow("a") is True                                # warned again: now the newest
-        assert t.allow("c") is True                                # evicts "b"
-        assert t.allow("a") is False and t.allow("c") is False
-        assert t.allow("b") is True
+        assert t.allow(self.KIND, "a") is True                                # warned again: now the newest
+        assert t.allow(self.KIND, "c") is True                                # evicts "b"
+        assert t.allow(self.KIND, "a") is False and t.allow(self.KIND, "c") is False
+        assert t.allow(self.KIND, "b") is True
 
-    def test_a_cap_of_one_remembers_only_the_last_peer(self, clock):
-        t = workers._ValidityWarnThrottle(every=100, max_peers=1)
-        assert t.allow("a") is True and t.allow("a") is False
-        assert t.allow("b") is True
-        assert t.allow("a") is True                                # forgotten
+    def test_a_cap_of_one_remembers_only_the_last_peer(self, make):
+        t = make(100, 1)
+        assert t.allow(self.KIND, "a") is True and t.allow(self.KIND, "a") is False
+        assert t.allow(self.KIND, "b") is True
+        assert t.allow(self.KIND, "a") is True                                # forgotten
 
-    def test_a_forgotten_peer_is_warned_again_even_within_the_interval(self, clock):
+    def test_a_forgotten_peer_is_warned_again_even_within_the_interval(self, make):
         """The price of the bound: past the cap the oldest entries lose their throttle."""
-        t = workers._ValidityWarnThrottle(every=1000, max_peers=2)
+        t = make(1000, 2)
         for p in "abc":
-            assert t.allow(p) is True
-        assert t.allow("a") is True
+            assert t.allow(self.KIND, p) is True
+        assert t.allow(self.KIND, "a") is True
 
-    def test_exactly_one_of_many_simultaneous_attempts_is_allowed(self):
-        t = workers._ValidityWarnThrottle(every=3600, max_peers=8)
+    def test_exactly_one_of_many_simultaneous_attempts_is_allowed(self, make):
+        t = make(3600, 8)
         barrier = threading.Barrier(32)
         results = []
 
         def attempt():
             barrier.wait(10)
-            results.append(t.allow("203.0.113.7"))
+            results.append(t.allow(self.KIND, "203.0.113.7"))
 
         threads = [threading.Thread(target=attempt) for _ in range(32)]
         for th in threads:
@@ -3373,18 +3401,18 @@ class TestValidityWarnThrottle:
         assert not any(th.is_alive() for th in threads)
         assert sorted(results) == [False] * 31 + [True]
 
-    def test_threads_hammering_distinct_peers_keep_the_bound_and_never_raise(self):
+    def test_threads_hammering_distinct_peers_keep_the_bound_and_never_raise(self, make):
         """The bound is checked under the throttle's own lock: inside `allow()` the map
         briefly holds one entry more than the cap (insert, then evict), so an unlocked
         read from another thread can legitimately see cap + 1."""
-        t = workers._ValidityWarnThrottle(every=3600, max_peers=16)
+        t = make(3600, 16)
         errors = []
         allowed = []
 
         def hammer(seed):
             try:
                 for i in range(400):
-                    if t.allow(f"p{(seed * 7 + i) % 90}"):
+                    if t.allow(self.KIND, f"p{(seed * 7 + i) % 90}"):
                         allowed.append(1)
                     with t._guard:
                         assert len(t._last) <= 16
@@ -3400,7 +3428,7 @@ class TestValidityWarnThrottle:
         assert len(t._last) == 16 and allowed
 
     def test_it_has_a_lock(self):
-        t = workers._ValidityWarnThrottle()
+        t = api._PerPeerThrottle()
         assert hasattr(t._guard, "acquire") and hasattr(t._guard, "release")
 
 

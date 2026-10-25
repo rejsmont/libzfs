@@ -210,7 +210,15 @@ refuses. `received_datasets()` lists filesystems and volumes.
 - **Server (`workers.py` `_api_server_class`, `api.py`).** HTTPS only, no plaintext mode, TLS 1.3 minimum. The
   handshake runs on each connection's own thread (30 s timeout) with the context the `TrustGateway` holds at that
   moment, so one silent peer cannot stall the accept loop or `shutdown()`. Caps: 64 connections in all, 16 of
-  them without a pinned client certificate; the request line and headers have an absolute 30 s deadline. A
+  them without a pinned client certificate; the request line and headers have an absolute 30 s deadline. Flood
+  control (`api.PeerLimits`, all constants, no config; peer = IPv4 address or IPv6 /64, `X-Forwarded-For` ignored):
+  a per-peer token bucket (burst 60, 10/s) and 8 concurrent connections, checked on the accept thread before any TLS
+  byte; a peer that completed a pinned handshake (or has one open) is "vouched" for 8 days: no bucket, 32
+  connections, and the last 16 of the 64 slots are reserved for vouched peers. `/enroll`: 5 failures in 15 min from
+  a peer give 429 + `Retry-After`; at most 2 in flight (1 per peer), the slot taken only after the body is read.
+  Refusal logs go through `_PerPeerThrottle` (one line per kind and peer per hour, three separate hourly budgets:
+  flood/access, anonymous, certificate holders; an hourly summary of suppressed lines). The negotiate pending map is
+  capped per client (256; never evicts an ancestor another dataset waits on; else 503 retry). A
   dedicated thread polls the trust generation every 2 s, so a revocation or an enrollment applies without a
   restart; every `store.trust` call in the API worker is serialised in-process. Running streams are registered
   (`api.SessionRegistry`) and the same thread cuts them (`force_eof`; `zfs receive` reaped, partial state kept) when
@@ -401,6 +409,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_api_auth.py` | Authentication and authorization: 401/403, the client-id binding (cert B cannot touch A's data), `/whoami`, the `/enroll` and `/rotate` matrices against a real trust store, predecessor retirement, `TrustGateway` |
 | `tests/test_zfsbackup_api_tls.py` | API worker TLS: per-connection handshake, TLS 1.3 only, connection caps and deadlines, revocation/addition with no restart, real `ApiWorker` under fork/spawn/forkserver, dry-run throwaway identity |
 | `tests/test_zfsbackup_api_sessions.py` | Running-stream cuts: `SessionRegistry` (cut reasons, `superseded_by` chain, per-view-key cache, failed read, per-session isolation, cut racing `unregister`), `TrustGateway.list_revoked`, the `/stream` route's cut and unregister paths, mid-stream revocation and the write-stall bound over real TLS, a real `ApiWorker` under fork/spawn/forkserver |
+| `tests/test_zfsbackup_api_flood.py` | Flood control: `peer_key`, `PeerRateLimiter` (bucket, caps, vouching, reserve), `EnrollGuard` (lockout, in-flight, stalled bodies), `_PerPeerThrottle` (three budgets), the per-client pending cap, accept-time drops, real-socket floods, the hourly summary from the poll thread |
 | `tests/test_zfsbackup_api_wssession.py` | Websocket `_SessionSocket`: fd never closed while a reader is inside it, serialised writes, `end()`/hand-over close, no response after the upgrade, `ws_end_timeout` validation |
 | `tests/test_zfsbackup_api_drain.py` | Post-response drain: client teardown after a response or websocket session is quiet (DEBUG, no traceback), bounded drain deadline, post-websocket 200 never written, websocket reader joined before `/stream` returns |
 | `tests/test_zfsbackup_api_bind.py` | API server binds without a reverse DNS lookup |

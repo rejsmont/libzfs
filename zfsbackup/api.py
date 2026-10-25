@@ -29,8 +29,11 @@ import binascii
 import collections
 import contextlib
 import functools
+import ipaddress
+import itertools
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -49,7 +52,7 @@ from typing import Callable, List, Mapping, NamedTuple, Optional, Tuple
 from flask import Flask, after_this_request, g, jsonify, request
 from flask_sock import Sock
 from simple_websocket import ConnectionClosed
-from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 import libzfseasy as zfs
 from libzfseasy.types import Dataset, Filesystem
@@ -73,6 +76,7 @@ from zfsbackup.identity import (
     secret_hash,
     verify_payload,
 )
+from zfsbackup.logsetup import PEER_LOGGER
 from zfsbackup.protocol import (
     PROTOCOL_HEADER, PROTOCOL_REFUSAL_REASON, PROTOCOL_VERSION, SUPPORTED_PROTOCOLS,
     parse_protocol_header,
@@ -337,11 +341,623 @@ ZFS_USER_PROPERTY_MAXLEN = 8192
 #: dataset under an encrypted target, a raw full onto any existing dataset).
 _ENCRYPTED_OVERWRITE_MARKER = 'overwrite an unencrypted one with an encrypted one'
 
-#: ERROR lines a protocol-refused peer (`who`: its address, or its client id
-#: and address) can cause before the rest are DEBUG, and how many peers the
-#: de-duplication remembers (the oldest is evicted).
-PROTOCOL_ERROR_LINES_PER_PEER = 3
-PROTOCOL_LOGGED_PEERS = 1024
+# ---------------------------------------------------------------------------
+# S-3: anonymous flood control and log throttling
+# ---------------------------------------------------------------------------
+#
+# Everything here is a constant (plan DD6/D5): no configuration, no schema.
+#
+# **Peer.** A "peer" is the address a connection came from (`peer_key`): the
+# IPv4 address, or the /64 of an IPv6 address (one host owns a whole /64, so
+# per-address limits would be free to dodge), IPv4-mapped IPv6 as IPv4.
+# `X-Forwarded-For` is never read. Behind a NAT, a proxy or a load balancer
+# that does not preserve the source address, every client of that network is
+# ONE peer, and the limits below are shared by all of them (see each class).
+#
+# **Threads.** The objects below are shared by the API worker's threads:
+#
+# - the accept thread (werkzeug's `serve_forever`): `PeerRateLimiter.admit`
+#   / `release` and `_PerPeerThrottle.log` from `ApiServer.process_request`;
+# - every connection thread (it also runs the Flask app for that
+#   connection): `PeerRateLimiter.release` / `vouch` from
+#   `process_request_thread`, `EnrollGuard.*` and `_PerPeerThrottle.log` from
+#   the routes and from `before_request`;
+# - the trust-poll thread: `_PerPeerThrottle.take_summary` (the hourly count)
+#   via `PeerLimits.flush_log`.
+#
+# Each object owns ONE `threading.Lock`, held only for dictionary and counter
+# updates -- O(1), never across I/O, logging, a store call or another lock --
+# so the accept thread can never wait on anything slow. Nothing here takes
+# `_STORE_LOCK`. Time comes from `time.monotonic` (looked up at each call, so
+# a test may patch it) or from the injected `clock`. Every table is bounded
+# and evicts its least recently used entry; a flood of distinct source
+# addresses can therefore make the server forget some peers' state (a
+# forgotten bucket is a full one, a forgotten lockout is lifted), never grow
+# its memory.
+
+#: Per-peer token bucket on accept: a burst of this many connections, refilled
+#: at this many per second, over a table of this many peers.
+API_RATE_BURST = 60
+API_RATE_REFILL = 10.0
+API_RATE_PEERS = 4096
+
+#: At most this many connections of one peer open at once, counted from
+#: accept to close (the TLS handshake included). The bucket bounds how fast
+#: connections arrive; this bounds how many a SILENT peer can hold: each
+#: waits `API_HANDSHAKE_TIMEOUT` (30 s), so without it one address at 10 per
+#: second would fill all `API_MAX_CONNECTIONS` slots and starve every pinned
+#: client. Not in the S-3 spec; the starvation requirement needs it.
+API_MAX_CONNECTIONS_PER_IP = 8
+
+#: A peer that completed a TLS handshake with a PINNED client certificate
+#: (`ApiServer._is_pinned`) is "vouched" while such a connection is open and
+#: for `API_VOUCH_TTL` seconds after the last one ended (8 days: a client
+#: that backs up daily or weekly must still be vouched when it next arrives
+#: during a flood, or it would be dropped by the reserve before it can
+#: present its certificate; the table is a bounded LRU of
+#: `API_VOUCHED_PEERS` and a vouch needs a pinned handshake. The price: an
+#: anonymous host behind a vouched NAT shares that allowance for up to 8
+#: days): no bucket, and `API_MAX_CONNECTIONS_PER_VOUCHED_IP`
+#: concurrent connections. This is the NAT answer: a site of backup clients
+#: whose cycles start together (aligned schedules) would otherwise lose
+#: connections to a 60-burst bucket. A TCP handshake plus a pinned
+#: certificate cannot be forged from another address, but an ANONYMOUS host
+#: behind the same address as a vouched client shares the allowance; it is
+#: still bound by the connection caps. At most `API_VOUCHED_PEERS` peers.
+API_VOUCH_TTL = 8 * 86400.0
+API_MAX_CONNECTIONS_PER_VOUCHED_IP = 32
+API_VOUCHED_PEERS = 1024
+
+#: Connection slots kept for vouched peers (item 6 of the S-3 review): while
+#: this many of the server's `max_connections` slots are still free, only a
+#: vouched peer (or one with a live pinned connection) is admitted; an
+#: unvouched peer is dropped once `max_connections - reserve` are open. The
+#: reserve actually used is `min(API_VOUCHED_RESERVE, max_connections // 4)`
+#: (16 of 64): enough for the concurrent streams of a typical site, a
+#: quarter of the total, and not above the 16 anonymous connections the
+#: server already allows. A silent-handshake flood from any number of
+#: addresses can therefore never take more than 48 slots.
+API_VOUCHED_RESERVE = 16
+
+#: `/enroll`: this many failed attempts from one peer within
+#: `ENROLL_FAILURE_WINDOW` seconds lock that peer out of `/enroll` (429 with
+#: `Retry-After`) for the window; at most `ENROLL_MAX_IN_FLIGHT` requests run
+#: at once (more: 503 + retry); the table holds `ENROLL_FAILURE_PEERS` peers.
+ENROLL_FAILURES_MAX = 5
+ENROLL_FAILURE_WINDOW = 900.0
+ENROLL_MAX_IN_FLIGHT = 2
+ENROLL_MAX_IN_FLIGHT_PER_PEER = 1
+ENROLL_FAILURE_PEERS = 4096
+
+#: Refusal log lines (`_PerPeerThrottle`): one WARNING per (kind, peer) per
+#: `PEER_LOG_EVERY` seconds, at most `PEER_LOG_GLOBAL_MAX` lines in all per
+#: that interval (a flood from many addresses), over `PEER_LOG_KEYS` keys.
+#: Suppressed lines are DEBUG and counted into one summary per interval.
+PEER_LOG_EVERY = 3600.0
+PEER_LOG_KEYS = 4096
+PEER_LOG_GLOBAL_MAX = 120
+PEER_LOG_ACCESS_MAX = 120
+PEER_LOG_ANON_MAX = 120
+
+#: Log kinds, in three classes with a budget each (per `PEER_LOG_EVERY`), so
+#: that a class anyone can trigger can never use up a class only certificate
+#: holders can reach:
+#:
+#: - "flood" (`PEER_LOG_ACCESS_MAX`): capacity and access lines that routine
+#:   traffic produces (a reload drain, 60 busy hosts) -- `access-*`, `rate`,
+#:   `conn-cap`, `conn-reserve`, `enroll-busy`, `store-busy`;
+#: - "anonymous" (`PEER_LOG_ANON_MAX`): refusals a caller WITHOUT a
+#:   certificate can cause -- `enroll`, `enroll-locked`, and `protocol` keyed
+#:   by a bare peer address (the key of an unauthenticated 426);
+#: - "holder" (`PEER_LOG_GLOBAL_MAX`): what only a certificate holder (or a
+#:   former one) reaches -- `auth`, `rotate`, `pending`, `tls-validity`, and
+#:   `protocol` keyed `<client id>@<peer>` (an authenticated 426).
+FLOOD_LOG_KINDS = frozenset({'rate', 'conn-cap', 'conn-reserve', 'enroll-busy', 'store-busy'})
+ANONYMOUS_LOG_KINDS = frozenset({'enroll', 'enroll-locked'})
+
+LOG_CLASS_FLOOD = 'flood'
+LOG_CLASS_ANONYMOUS = 'anonymous'
+LOG_CLASS_HOLDER = 'holder'
+
+
+def is_flood_log_kind(kind: str) -> bool:
+    return kind in FLOOD_LOG_KINDS or kind.startswith('access-')
+
+
+def log_class(kind: str, peer: str) -> str:
+    """The budget class of a log line (see above). A client id never contains
+    `@`, so `<client id>@<peer>` marks an authenticated peer."""
+    if is_flood_log_kind(kind):
+        return LOG_CLASS_FLOOD
+    if kind in ANONYMOUS_LOG_KINDS or (kind == 'protocol' and '@' not in peer):
+        return LOG_CLASS_ANONYMOUS
+    return LOG_CLASS_HOLDER
+
+
+#: Negotiate's pending-config map (`create_app`): at most this many entries
+#: per client id; a client past it evicts its OWN oldest entry.
+PENDING_CONFIGS_PER_CLIENT = 256
+
+#: The response statuses an unauthenticated flood repeats (no certificate,
+#: protocol, lockout, busy): werkzeug's access line for these is logged once
+#: per peer, status and hour (`workers` `log_request`), the rest at DEBUG.
+THROTTLED_ACCESS_STATUSES = frozenset({401, 403, 426, 429, 503})
+
+#: `PeerRateLimiter.admit` refusals.
+ADMIT_RATE = 'rate'
+ADMIT_RESERVED = 'reserved'
+
+#: `_claim_pending`'s answer when the client is at its cap and nothing of its
+#: own can be evicted (the negotiate is then refused 503 + retry).
+PENDING_FULL = object()
+ADMIT_CONCURRENT = 'concurrent'
+
+
+def peer_key(client_address) -> str:
+    """The peer a connection or request comes from: `client_address` is a
+    socket address tuple, a bare host string, or `None`. IPv4 -> the address;
+    IPv4-mapped IPv6 -> the IPv4 address; other IPv6 -> its /64
+    (`2001:db8::/64`), except loopback; anything unparseable -> the string
+    itself (clipped). Never raises."""
+    try:
+        host = client_address
+        if isinstance(client_address, (tuple, list)):
+            host = client_address[0] if client_address else None
+        if host is None:
+            return '?'
+        host = str(host)
+        try:
+            ip = ipaddress.ip_address(host.split('%', 1)[0])
+        except ValueError:
+            return host[:64] or '?'
+        if ip.version == 6:
+            if ip.ipv4_mapped is not None:
+                return str(ip.ipv4_mapped)
+            if ip.is_loopback:
+                return str(ip)
+            return f"{ipaddress.IPv6Address(int(ip) >> 64 << 64)}/64"
+        return str(ip)
+    except Exception:
+        return '?'
+
+
+class PeerRateLimiter:
+    """Per-peer admission on accept: a token bucket (`API_RATE_BURST`,
+    `API_RATE_REFILL`), a cap on concurrent connections and a reserve of
+    connection slots for vouched peers, all keyed by `peer_key`. **O(1) and
+    never blocks** (one short lock; no I/O): called on the accept thread,
+    which must never wait.
+
+    `admit(key)` -> `None` (admitted: one concurrency slot is held and the
+    caller MUST `release(key)` exactly once when the connection is over, or
+    at once if it does not go on to use it), `ADMIT_CONCURRENT`,
+    `ADMIT_RESERVED` or `ADMIT_RATE` (refused, nothing held). A refused
+    connection is dropped before any TLS byte is read.
+
+    **Vouched.** `vouch(key)` is called once per connection that completed a
+    handshake with a pinned client certificate and `unvouch(key)` when that
+    connection ends. A peer is vouched while it has such a connection open
+    OR for `API_VOUCH_TTL` seconds after the last one ended (the clock
+    starts at the end, so a long stream keeps its address vouched for as long
+    as it runs: a NAT with many streams open can always open another). A
+    vouched peer skips the bucket, gets `API_MAX_CONNECTIONS_PER_VOUCHED_IP`
+    connections and may use the reserve.
+
+    **Reserve.** `configure_capacity(max_connections)` (the server calls it)
+    sets the reserve to `min(API_VOUCHED_RESERVE, max_connections // 4)`:
+    once `max_connections - reserve` connections are open, only vouched
+    peers are admitted. Anonymous peers can therefore never take the last
+    slots, however many addresses the flood comes from; the per-peer cap
+    (`API_MAX_CONNECTIONS_PER_IP`) bounds what each address holds.
+
+    Bounded: the bucket table by `max_peers` (LRU; forgetting a peer
+    refills its bucket), the vouched table by `max_vouched` (LRU; a forgotten
+    peer is simply anonymous again), the concurrency and pinned-open tables
+    by the number of open connections."""
+
+    def __init__(
+        self,
+        *,
+        burst: int = API_RATE_BURST,
+        rate: float = API_RATE_REFILL,
+        max_peers: int = API_RATE_PEERS,
+        max_per_peer: int = API_MAX_CONNECTIONS_PER_IP,
+        max_per_vouched: int = API_MAX_CONNECTIONS_PER_VOUCHED_IP,
+        vouch_ttl: float = API_VOUCH_TTL,
+        max_vouched: int = API_VOUCHED_PEERS,
+        reserve: int = API_VOUCHED_RESERVE,
+        clock: Optional[Callable[[], float]] = None,
+    ) -> None:
+        self.burst = burst
+        self.rate = rate
+        self._max_peers = max_peers
+        self._max_per_peer = max_per_peer
+        self._max_per_vouched = max_per_vouched
+        self._vouch_ttl = vouch_ttl
+        self._max_vouched = max_vouched
+        self._reserve_wanted = reserve
+        self._clock = clock
+        self._guard = threading.Lock()
+        #: key -> [tokens, time of last update]; insertion order = recency.
+        self._buckets: 'collections.OrderedDict[str, list]' = collections.OrderedDict()
+        #: key -> open connections (entries are removed at zero).
+        self._active: dict = {}
+        #: Connections open across all keys (the sum of `_active`).
+        self._active_total = 0
+        #: key -> open connections that presented a pinned certificate.
+        self._pinned_open: dict = {}
+        #: key -> time the last pinned connection began or ended; insertion
+        #: order = recency.
+        self._vouched: 'collections.OrderedDict[str, float]' = collections.OrderedDict()
+        #: Connections an unvouched peer may reach (`None`: no reserve).
+        self._unvouched_limit: Optional[int] = None
+        self._reserve = 0
+
+    def _now(self) -> float:
+        return self._clock() if self._clock is not None else time.monotonic()
+
+    @property
+    def reserve(self) -> int:
+        """Slots only vouched peers may take (0 until `configure_capacity`)."""
+        return self._reserve
+
+    def configure_capacity(self, max_connections: int) -> None:
+        """Tell the limiter the server's connection cap; sets the reserve."""
+        reserve = min(self._reserve_wanted, max_connections // 4)
+        with self._guard:
+            self._reserve = reserve
+            self._unvouched_limit = max_connections - reserve if reserve > 0 else None
+
+    def _is_vouched_locked(self, key: str, now: float) -> bool:
+        if self._pinned_open.get(key, 0) > 0:
+            return True
+        at = self._vouched.get(key)
+        if at is None:
+            return False
+        if now - at < self._vouch_ttl:
+            return True
+        del self._vouched[key]
+        return False
+
+    def admit(self, key: str) -> Optional[str]:
+        now = self._now()
+        with self._guard:
+            vouched = self._is_vouched_locked(key, now)
+            active = self._active.get(key, 0)
+            if active >= (self._max_per_vouched if vouched else self._max_per_peer):
+                return ADMIT_CONCURRENT
+            if (
+                not vouched
+                and self._unvouched_limit is not None
+                and self._active_total >= self._unvouched_limit
+            ):
+                return ADMIT_RESERVED
+            if not vouched:
+                bucket = self._buckets.pop(key, None)  # re-insert last: recency
+                if bucket is None:
+                    tokens = float(self.burst)
+                else:
+                    tokens = min(float(self.burst), bucket[0] + (now - bucket[1]) * self.rate)
+                refused = tokens < 1.0
+                self._buckets[key] = [tokens if refused else tokens - 1.0, now]
+                while len(self._buckets) > self._max_peers:
+                    del self._buckets[next(iter(self._buckets))]
+                if refused:
+                    return ADMIT_RATE
+            self._active[key] = active + 1
+            self._active_total += 1
+        return None
+
+    def release(self, key: str) -> None:
+        with self._guard:
+            active = self._active.get(key, 0)
+            if active <= 0:
+                return
+            if active == 1:
+                del self._active[key]
+            else:
+                self._active[key] = active - 1
+            self._active_total -= 1
+
+    def _touch_vouched_locked(self, key: str, now: float) -> None:
+        self._vouched.pop(key, None)
+        self._vouched[key] = now
+        while len(self._vouched) > self._max_vouched:
+            del self._vouched[next(iter(self._vouched))]
+
+    def vouch(self, key: str) -> None:
+        """One more open connection of `key` presented a pinned certificate."""
+        now = self._now()
+        with self._guard:
+            self._pinned_open[key] = self._pinned_open.get(key, 0) + 1
+            self._touch_vouched_locked(key, now)
+
+    def unvouch(self, key: str) -> None:
+        """A connection that was `vouch`ed is over (call it exactly once per
+        `vouch`, whatever happened)."""
+        now = self._now()
+        with self._guard:
+            n = self._pinned_open.get(key, 0)
+            if n <= 0:
+                return
+            if n == 1:
+                del self._pinned_open[key]
+            else:
+                self._pinned_open[key] = n - 1
+            self._touch_vouched_locked(key, now)  # the TTL runs from here
+
+    def is_vouched(self, key: str) -> bool:
+        now = self._now()
+        with self._guard:
+            return self._is_vouched_locked(key, now)
+
+
+class EnrollGuard:
+    """`/enroll` flood control: a per-peer failure lockout and a global cap on
+    requests in flight. Used by the Flask threads (`before_request`, the
+    route, `teardown_request`); one lock, O(1) sections, no I/O.
+
+    **Failures.** `record_failure(key)` after an attempt the peer got wrong
+    (a refusal, a malformed body; NOT a 503: the server's own trouble).
+    `ENROLL_FAILURES_MAX` failures within `ENROLL_FAILURE_WINDOW` lock the
+    peer out for that long: `retry_after(key)` is then the whole seconds
+    left (900 right after the lockout, the `Retry-After` value) and the route
+    answers 429 before reading the body or touching the store. The lockout
+    is `/enroll` only: a pinned client's other requests are unaffected. A
+    success `forget`s the peer's failures. Behind a NAT five mistyped tokens
+    from anyone on the network lock the whole network out of `/enroll` for
+    15 minutes; the operator's way round is to enroll from another address.
+
+    **In flight.** `try_enter(key)` / `leave(key)`: at most `max_in_flight`
+    `/enroll` requests past their body and shape checks at once (taken right
+    before the token pre-check, NEVER while a body is being read: a peer that
+    sends headers and no body would otherwise hold the slots for the whole
+    read deadline), and at most `max_per_peer` of them per peer, because
+    each can take the process-wide store lock (`_store_call`) and run `zfs`.
+    More are answered 503 + retry. `key=None` counts only the global cap.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_failures: int = ENROLL_FAILURES_MAX,
+        window: float = ENROLL_FAILURE_WINDOW,
+        max_in_flight: int = ENROLL_MAX_IN_FLIGHT,
+        max_per_peer: int = ENROLL_MAX_IN_FLIGHT_PER_PEER,
+        max_peers: int = ENROLL_FAILURE_PEERS,
+        clock: Optional[Callable[[], float]] = None,
+    ) -> None:
+        self.max_failures = max_failures
+        self.window = window
+        self.max_in_flight = max_in_flight
+        self.max_per_peer = max_per_peer
+        self._max_peers = max_peers
+        self._clock = clock
+        self._guard = threading.Lock()
+        #: key -> [failure times within the window, locked-out-until or 0.0];
+        #: insertion order = recency of the last failure.
+        self._peers: 'collections.OrderedDict[str, list]' = collections.OrderedDict()
+        self._in_flight = 0
+        #: key -> its requests in flight (entries removed at zero).
+        self._in_flight_by_peer: dict = {}
+
+    def _now(self) -> float:
+        return self._clock() if self._clock is not None else time.monotonic()
+
+    def retry_after(self, key: str) -> int:
+        """Whole seconds `key` is still locked out for, else 0."""
+        now = self._now()
+        with self._guard:
+            entry = self._peers.get(key)
+            if entry is None or entry[1] <= now:
+                return 0
+            return max(1, math.ceil(entry[1] - now))
+
+    def record_failure(self, key: str) -> bool:
+        """Count a failed attempt; -> `True` when this one locked `key` out."""
+        now = self._now()
+        with self._guard:
+            entry = self._peers.pop(key, None)
+            if entry is None:
+                entry = [collections.deque(), 0.0]
+            times = entry[0]
+            while times and now - times[0] >= self.window:
+                times.popleft()
+            times.append(now)
+            locked = len(times) >= self.max_failures
+            if locked:
+                times.clear()
+                entry[1] = now + self.window
+            self._peers[key] = entry
+            while len(self._peers) > self._max_peers:
+                del self._peers[next(iter(self._peers))]
+            return locked
+
+    def forget(self, key: str) -> None:
+        with self._guard:
+            self._peers.pop(key, None)
+
+    def try_enter(self, key: Optional[str] = None) -> bool:
+        with self._guard:
+            if self._in_flight >= self.max_in_flight:
+                return False
+            if key is not None:
+                mine = self._in_flight_by_peer.get(key, 0)
+                if mine >= self.max_per_peer:
+                    return False
+                self._in_flight_by_peer[key] = mine + 1
+            self._in_flight += 1
+            return True
+
+    def leave(self, key: Optional[str] = None) -> None:
+        with self._guard:
+            if self._in_flight > 0:
+                self._in_flight -= 1
+            if key is not None:
+                mine = self._in_flight_by_peer.get(key, 0)
+                if mine <= 1:
+                    self._in_flight_by_peer.pop(key, None)
+                else:
+                    self._in_flight_by_peer[key] = mine - 1
+
+    @property
+    def in_flight(self) -> int:
+        with self._guard:
+            return self._in_flight
+
+
+class _PerPeerThrottle:
+    """The one throttle for log lines about a peer (enroll, rotate, auth and
+    protocol refusals, TLS certificate validity, flood drops, ...): at most
+    one line per `(kind, peer)` per `every` seconds, and at most `global_max`
+    lines in all per `every` seconds -- counted separately for three classes
+    of kind (`log_class`): "flood" (`access_max`), "anonymous" (`anon_max`:
+    what a caller without a certificate can cause) and "holder" (`global_max`:
+    what only a certificate holder can reach), so a class anyone can trigger
+    can never use up the budget of a class only certificate holders reach.
+    `log()` emits the admitted line on the
+    dedicated `logsetup.PEER_LOGGER` at the caller's level and every other one
+    at DEBUG (so `-v` still shows them), and counts the suppressed ones.
+
+    Once per `every` seconds `take_summary()` returns one line counting what
+    was suppressed (and by which kinds) in the interval that just ended, or
+    `None`; `PeerLimits.flush_log` logs it at WARNING. The trust-poll thread
+    calls it every tick, so it is emitted promptly even when no further
+    event arrives; without that thread (tests, `create_app` alone) it is
+    returned to whoever calls it. The interval is a fixed window started at
+    construction; `allow`/`log` roll it too when it has ended, so the cap
+    resets even if nothing calls `take_summary`.
+
+    Thread-safe: one lock around dictionary updates; nothing is logged under
+    it. `kind` is a small constant string chosen by the caller (it keys the
+    summary); `peer` is any string (`peer_key`, or `"<client id>@<peer>"`).
+    Bounded: `max_keys` keys, the least recently logged evicted first -- a
+    flood of addresses can make the server log an evicted peer's next line
+    early, never more than `global_max` per interval."""
+
+    def __init__(
+        self,
+        every: float = PEER_LOG_EVERY,
+        max_keys: int = PEER_LOG_KEYS,
+        global_max: int = PEER_LOG_GLOBAL_MAX,
+        clock: Optional[Callable[[], float]] = None,
+        access_max: int = PEER_LOG_ACCESS_MAX,
+        anon_max: int = PEER_LOG_ANON_MAX,
+    ) -> None:
+        self._every = every
+        self._max = max_keys
+        self._global_max = global_max
+        self._access_max = access_max
+        self._anon_max = anon_max
+        self._clock = clock
+        self._guard = threading.Lock()
+        self._last: 'collections.OrderedDict[tuple, float]' = collections.OrderedDict()
+        self._window_start = self._now()
+        #: class -> lines written in this window.
+        self._emitted: dict = {}
+        self._suppressed: dict = {}
+        #: Suppressed counts of finished intervals not yet returned.
+        self._finished: dict = {}
+
+    def _now(self) -> float:
+        return self._clock() if self._clock is not None else time.monotonic()
+
+    def _roll_locked(self, now: float) -> None:
+        if now - self._window_start < self._every:
+            return
+        for kind, count in self._suppressed.items():
+            self._finished[kind] = self._finished.get(kind, 0) + count
+        self._suppressed = {}
+        self._emitted = {}
+        self._window_start = now
+
+    def allow(self, kind: str, peer: str) -> bool:
+        """`True` when a line about `(kind, peer)` may be logged now."""
+        now = self._now()
+        with self._guard:
+            self._roll_locked(now)
+            key = (kind, peer)
+            last = self._last.get(key)
+            klass = log_class(kind, peer)
+            cap = {
+                LOG_CLASS_FLOOD: self._access_max,
+                LOG_CLASS_ANONYMOUS: self._anon_max,
+            }.get(klass, self._global_max)
+            if (last is not None and now - last < self._every) or (
+                self._emitted.get(klass, 0) >= cap
+            ):
+                self._suppressed[kind] = self._suppressed.get(kind, 0) + 1
+                return False
+            self._last.pop(key, None)  # re-insert last: dict order = recency
+            self._last[key] = now
+            while len(self._last) > self._max:
+                del self._last[next(iter(self._last))]
+            self._emitted[klass] = self._emitted.get(klass, 0) + 1
+            return True
+
+    def log(self, kind: str, peer: str, level: int, msg: str, *args) -> bool:
+        """Log `msg % args` on `PEER_LOGGER` at `level` if `allow`ed, else at
+        DEBUG; -> whether it was the admitted line."""
+        admitted = self.allow(kind, peer)
+        logging.getLogger(PEER_LOGGER).log(level if admitted else logging.DEBUG, msg, *args)
+        return admitted
+
+    def emit(self, kind: str, peer: str, level: int, msg: str, *args) -> bool:
+        """Like `log`, but a suppressed line is not formatted or logged at
+        all (only counted): for the accept thread, which must not spend time
+        on a line nobody asked for. -> whether the line was written."""
+        if not self.allow(kind, peer):
+            return False
+        logging.getLogger(PEER_LOGGER).log(level, msg, *args)
+        return True
+
+    def take_summary(self) -> Optional[str]:
+        """The count of lines suppressed in the interval(s) that ended since
+        the last call, as one line, or `None`."""
+        now = self._now()
+        with self._guard:
+            self._roll_locked(now)
+            finished, self._finished = self._finished, {}
+        if not finished:
+            return None
+        total = sum(finished.values())
+        kinds = ', '.join(f"{kind} {count}" for kind, count in sorted(finished.items()))
+        window = 'hour' if self._every == 3600 else f"{self._every:g} seconds"
+        return (
+            f"{total} refusal log line(s) suppressed in the last {window} "
+            f"({kinds}); at most one line per kind and peer is logged per {window}"
+        )
+
+
+class PeerLimits:
+    """The API worker's flood-control state, one per worker: the accept-time
+    `rate` limiter, the `/enroll` guard and the shared log throttle. Built by
+    `create_app` (`app.extensions['zfsbackup.peer_limits']`); the server and
+    the trust-poll thread take it from there. `clock` (monotonic seconds)
+    is shared by all three; tests inject it."""
+
+    def __init__(
+        self,
+        *,
+        clock: Optional[Callable[[], float]] = None,
+        rate: Optional[PeerRateLimiter] = None,
+        enroll: Optional[EnrollGuard] = None,
+        log: Optional[_PerPeerThrottle] = None,
+    ) -> None:
+        self.rate = rate if rate is not None else PeerRateLimiter(clock=clock)
+        self.enroll = enroll if enroll is not None else EnrollGuard(clock=clock)
+        self.log = log if log is not None else _PerPeerThrottle(clock=clock)
+
+    def flush_log(self) -> None:
+        """Log the hourly suppressed-lines summary if one is due (WARNING on
+        `PEER_LOGGER`). Never raises."""
+        try:
+            summary = self.log.take_summary()
+            if summary:
+                logging.getLogger(PEER_LOGGER).warning("API: %s", summary)
+        except Exception:
+            logger.debug("peer log summary failed", exc_info=True)
+
 
 #: 400 for a negotiate `config` that cannot be decoded or has the wrong shape.
 #: Deliberately unspecific: decoder details stay in the server's log.
@@ -1811,6 +2427,7 @@ def create_app(
     server_fingerprint: str,
     *,
     clock: Callable[[], float] = time.time,
+    peer_limits: Optional['PeerLimits'] = None,
 ) -> Flask:
     """The API's Flask app. There is no unauthenticated mode.
 
@@ -1824,6 +2441,10 @@ def create_app(
     from disk, so it cannot drift from the certificate the gateway's contexts
     present. `clock` (POSIX seconds) decides pin and certificate expiry and is
     passed to the store as `now` (read again under its write lock).
+    `peer_limits` (default: a new `PeerLimits`) is the flood-control state
+    (plan S-3), also published as `app.extensions['zfsbackup.peer_limits']` for
+    the server (accept-time limits) and the trust-poll thread (the hourly
+    summary); here it guards `/enroll` and throttles the refusal log lines.
 
     **Authentication** (`before_request`; it also runs on the websocket
     upgrade of `/stream`, so it is checked when a request or a stream
@@ -1877,6 +2498,8 @@ def create_app(
     #: revoked client's transfer and a stalled writer (plan S-2).
     sessions = SessionRegistry()
     app.extensions['zfsbackup.sessions'] = sessions
+    limits = peer_limits if peer_limits is not None else PeerLimits()
+    app.extensions['zfsbackup.peer_limits'] = limits
     app.extensions['zfsbackup.trust'] = trust
     app.extensions['zfsbackup.server_fingerprint'] = own_fp
     app.config['PROPAGATE_EXCEPTIONS'] = True
@@ -1922,16 +2545,89 @@ def create_app(
     #: (a separate map so the entries keep their `(config, dataset)` shape).
     pending_deadlines: dict = {}
 
+    #: `client id -> its server datasets in pending_configs, oldest first`
+    #: (S-3). The client id is the one the server dataset name is built from
+    #: (`<target>/<bound id>/...`), so it is the authenticated binding. One
+    #: client's entries are capped at `PENDING_CONFIGS_PER_CLIENT`: past it,
+    #: ITS oldest entry goes, never another client's -- the global
+    #: `PENDING_CONFIGS_MAX` eviction stays as the backstop only. Same lock.
+    pending_by_client: 'dict[str, collections.OrderedDict]' = {}
+
+    #: `pending server dataset -> monotonic deadline` of the entries a CHILD's
+    #: refused negotiate (`unsettled_ancestor`, kind `pending`) is waiting
+    #: for: they are not evicted by the per-client cap until the mark lapses
+    #: (`PENDING_CONFIG_TTL`, refreshed by each retry). A refused child holds
+    #: no entry of its own, so without the mark nothing but its own retry
+    #: would keep the parent. Same lock.
+    pending_needed: dict = {}
+
+    def _pending_owner(server_dataset: str) -> str:
+        """The client id a pending server dataset belongs to."""
+        if target and server_dataset.startswith(target + '/'):
+            return server_dataset[len(target) + 1:].split('/', 1)[0]
+        return ''
+
     def _drop_pending_locked(server_dataset: str) -> None:
         pending_configs.pop(server_dataset, None)
         pending_deadlines.pop(server_dataset, None)
+        pending_needed.pop(server_dataset, None)
+        owned = pending_by_client.get(_pending_owner(server_dataset))
+        if owned is not None:
+            owned.pop(server_dataset, None)
+            if not owned:
+                del pending_by_client[_pending_owner(server_dataset)]
 
-    def _store_pending_locked(server_dataset: str, canonical: str, dataset: str) -> None:
+    def _evictable_locked(owned, new_name: str, claimed) -> Optional[str]:
+        """The oldest of one client's entries that may be evicted to make room
+        for `new_name`: an expired one first; else the oldest that is NOT an
+        ancestor of another pending name, of a claimed name or of the new
+        name (`_ancestors_state` holds a child back on a pending ancestor;
+        losing it would let a placeholder parent be created under it). `None`
+        when every entry is such an ancestor."""
+        now = time.monotonic()
+        for name in owned:
+            if pending_deadlines.get(name, 0.0) <= now:
+                return name
+        needed = {n for n, until in pending_needed.items() if until > now}
+        for name in itertools.chain(owned, claimed, (new_name,)):
+            while '/' in name:
+                name = name.rsplit('/', 1)[0]
+                needed.add(name)
+        for name in owned:
+            if name not in needed:
+                return name
+        return None
+
+    def _store_pending_locked(
+        server_dataset: str, canonical: str, dataset: str, claimed=frozenset()
+    ) -> Optional[int]:
+        """Record the entry; -> how many of the SAME client's entries the
+        per-client cap evicted (the caller logs it, outside the lock), or
+        `None` when the client is at its cap and none of its entries may be
+        evicted (nothing is recorded; the negotiate is refused, retryable).
+        An entry being refreshed never counts against the cap."""
+        owner = _pending_owner(server_dataset)
+        owned = pending_by_client.get(owner)
+        evicted = 0
+        if owned is not None and server_dataset not in owned:
+            while len(owned) >= PENDING_CONFIGS_PER_CLIENT:
+                victim = _evictable_locked(owned, server_dataset, claimed)
+                if victim is None:
+                    return None
+                _drop_pending_locked(victim)
+                evicted += 1
+                owned = pending_by_client.get(owner)
+                if owned is None:
+                    break
         pending_configs[server_dataset] = (canonical, dataset)
         pending_configs.move_to_end(server_dataset)
         pending_deadlines[server_dataset] = time.monotonic() + PENDING_CONFIG_TTL
+        owned = pending_by_client.setdefault(owner, collections.OrderedDict())
+        owned[server_dataset] = None
+        owned.move_to_end(server_dataset)
         while len(pending_configs) > PENDING_CONFIGS_MAX:
             _drop_pending_locked(next(iter(pending_configs)))
+        return evicted
 
     def _live_pending_locked(server_dataset: str) -> Optional[Tuple[str, str]]:
         """The entry for the name unless it has expired (then it is dropped)."""
@@ -1946,14 +2642,48 @@ def create_app(
     def _claim_pending(server_dataset: str, canonical: str, dataset: str) -> Optional[str]:
         """Check and record in ONE acquisition of the lock: -> `None` once
         `(canonical, dataset)` is recorded for the name (a re-negotiate of the
-        same client dataset refreshes its deadline), or the OTHER client
-        dataset that already has a live entry."""
+        same client dataset refreshes its deadline), the OTHER client
+        dataset that already has a live entry, or `PENDING_FULL` (the client
+        is at `PENDING_CONFIGS_PER_CLIENT` and none of its entries may be
+        evicted: the caller answers 503 + retry)."""
+        with streams_guard:  # a copy, taken before (never inside) pending_guard
+            claimed = frozenset(streams_in_progress)
         with pending_guard:
             entry = _live_pending_locked(server_dataset)
             if entry is not None and entry[1] != dataset:
                 return entry[1]
-            _store_pending_locked(server_dataset, canonical, dataset)
-            return None
+            evicted = _store_pending_locked(server_dataset, canonical, dataset, claimed)
+        if evicted is None:
+            owner = _pending_owner(server_dataset)
+            limits.log.log(
+                'pending', owner, logging.WARNING,
+                "client %s has %d datasets negotiated and not yet received, all needed "
+                "as parents of the others; refusing another negotiate (503, retry)",
+                owner, PENDING_CONFIGS_PER_CLIENT,
+            )
+            return PENDING_FULL
+        if evicted:
+            owner = _pending_owner(server_dataset)
+            limits.log.log(
+                'pending', owner, logging.WARNING,
+                "client %s has more than %d datasets negotiated and not yet received; "
+                "its %d oldest pending configuration(s) were dropped (it must negotiate "
+                "them again; other clients are not affected)",
+                owner, PENDING_CONFIGS_PER_CLIENT, evicted,
+            )
+        return None
+
+    def _mark_pending_needed(server_dataset: str) -> None:
+        """A child was refused because `server_dataset` is pending: keep that
+        entry (most recently used, and protected from the per-client cap)."""
+        with pending_guard:
+            if _live_pending_locked(server_dataset) is None:
+                return
+            pending_needed[server_dataset] = time.monotonic() + PENDING_CONFIG_TTL
+            owned = pending_by_client.get(_pending_owner(server_dataset))
+            if owned is not None and server_dataset in owned:
+                owned.move_to_end(server_dataset)
+            pending_configs.move_to_end(server_dataset)
 
     def _unclaim_pending(server_dataset: str, canonical: str, dataset: str) -> None:
         """Remove the entry `_claim_pending` inserted, if it is still ours."""
@@ -2217,39 +2947,26 @@ def create_app(
             )
             _refresh_after_commit(f"retirement of pin {predecessor}")
 
-    #: Per peer (`who`), the protocol versions whose refusal was already
-    #: logged at ERROR. At most `PROTOCOL_ERROR_LINES_PER_PEER` lines per peer
-    #: (a legitimate client upgrading through a couple of versions still gets
-    #: told), later ones are DEBUG: the key is the peer, never the header
-    #: value, which an unauthenticated peer (`/enroll`) chooses freely. The
-    #: table is bounded by evicting the OLDEST peer, so a flood of new
-    #: addresses can only make the server forget one peer at a time, never
-    #: reset them all at once.
-    protocol_logged: 'collections.OrderedDict[str, set]' = collections.OrderedDict()
-    protocol_guard = threading.Lock()
+    def _peer() -> str:
+        """The throttle key of the requesting peer (`peer_key`)."""
+        return peer_key(request.remote_addr)
 
-    def _protocol_refusal(who: str):
+    def _protocol_refusal(who: str, key: Optional[str] = None):
         """None if the request names a supported protocol version
-        (`X-Zfsbackup-Protocol`), else the 426 response (plan S-5). Logged
-        at ERROR for the first `PROTOCOL_ERROR_LINES_PER_PEER` distinct
-        versions a peer sends, then at DEBUG."""
+        (`X-Zfsbackup-Protocol`), else the 426 response (plan S-5). `who` is
+        the text for the log line (an address, or a client id and address);
+        the log line (ERROR) goes through the shared per-peer throttle
+        (S-3: one per `key` per hour, `key` defaulting to the requesting
+        peer): the key is the peer, never the header value, which an
+        unauthenticated peer (`/enroll`) chooses freely. A legitimate client
+        that is refused is told once an hour and by its own log every cycle."""
         raw = request.headers.get(PROTOCOL_HEADER)
         version = parse_protocol_header(raw)
         if version in SUPPORTED_PROTOCOLS:
             return None
         sent = 'no protocol version' if raw is None else f'protocol version {raw[:16]!r}'
-        version_key = None if raw is None else raw[:16]
-        with protocol_guard:
-            seen = protocol_logged.get(who)
-            if seen is None:
-                if len(protocol_logged) >= PROTOCOL_LOGGED_PEERS:
-                    protocol_logged.popitem(last=False)
-                seen = protocol_logged[who] = set()
-            first = (version_key not in seen
-                     and len(seen) < PROTOCOL_ERROR_LINES_PER_PEER)
-            if first:
-                seen.add(version_key)
-        (logger.error if first else logger.debug)(
+        limits.log.log(
+            'protocol', key if key is not None else _peer(), logging.ERROR,
             "API: refusing %s %s from %s: it sent %s, this server speaks protocol %s "
             "(426); upgrade the client and the server together",
             request.method, request.path, who, sent,
@@ -2269,6 +2986,82 @@ def create_app(
         response.headers[PROTOCOL_HEADER] = str(PROTOCOL_VERSION)
         return response
 
+    def _enroll_admission():
+        """S-3: the `/enroll` lockout, in `before_request` after the
+        protocol check and before the body is read or the store touched:
+        429 + `Retry-After` while the peer is locked out (`EnrollGuard`: 5
+        failures in 15 min), else `None`. It takes no in-flight slot: a slot
+        held while the body is read could be held by a peer that never sends
+        it (`_enroll_enter` takes it, later).
+        """
+        peer = _peer()
+        wait = limits.enroll.retry_after(peer)
+        if wait:
+            limits.log.log(
+                'enroll-locked', peer, logging.WARNING,
+                "enrollment from %s refused: locked out for %d more seconds after %d "
+                "failed attempts", request.remote_addr, wait, limits.enroll.max_failures,
+            )
+            response = jsonify({
+                'error': f'too many failed enrollment attempts from this address; '
+                         f'retry in {wait} seconds',
+                'reason': 'rate_limited',
+                'retry_after': wait,
+            })
+            response.status_code = 429
+            response.headers['Retry-After'] = str(wait)
+            return response
+        return None
+
+    def _enroll_enter():
+        """S-3: take an `/enroll` in-flight slot -- called after the body
+        was read and the cheap checks passed, right before the token
+        pre-check (the first store call). -> a 503 + `retry` response when
+        `ENROLL_MAX_IN_FLIGHT` requests already run or this peer already has
+        `ENROLL_MAX_IN_FLIGHT_PER_PEER`, else `None` with the slot held
+        (`g.enroll_slot`, given back by `_enroll_leave` on every outcome).
+        503, not 429: the cause is this server's capacity, not the caller's
+        behaviour; the existing client (`cli/enroll.py`) already treats 503 +
+        `retry` as "busy, retry in a moment" (exit 75). Not a failure."""
+        peer = _peer()
+        if not limits.enroll.try_enter(peer):
+            limits.log.log(
+                'enroll-busy', peer, logging.WARNING,
+                "enrollment from %s refused: enrollments are already in progress "
+                "(at most %d at once, %d per address)", request.remote_addr,
+                limits.enroll.max_in_flight, limits.enroll.max_per_peer,
+            )
+            response = jsonify({
+                'error': 'the server is busy with other enrollments; retry in a moment',
+                'reason': 'busy',
+                'retry': True,
+            })
+            response.status_code = 503
+            response.headers['Retry-After'] = '2'
+            return response
+        g.enroll_slot = peer
+        return None
+
+    @app.teardown_request
+    def _enroll_leave(exc):
+        """Give back the `/enroll` in-flight slot, on every outcome."""
+        peer = g.pop('enroll_slot', None)
+        if peer is not None:
+            limits.enroll.leave(peer)
+
+    def _enroll_failed() -> bool:
+        """Count a failed `/enroll` against the requesting peer's lockout."""
+        peer = _peer()
+        locked = limits.enroll.record_failure(peer)
+        if locked:
+            limits.log.log(
+                'enroll-locked', peer, logging.WARNING,
+                "enrollment from %s: %d failed attempts; locked out of /enroll for %d seconds",
+                request.remote_addr, limits.enroll.max_failures,
+                int(limits.enroll.window),
+            )
+        return locked
+
     @app.before_request
     def _authenticate():
         """Route authentication and the protocol check; see `create_app`.
@@ -2277,7 +3070,10 @@ def create_app(
         if request.endpoint in PROTOCOL_EXEMPT_ENDPOINTS:
             return None
         if request.endpoint in UNAUTHENTICATED_ENDPOINTS:
-            return _protocol_refusal(request.remote_addr or '?')
+            refused = _protocol_refusal(request.remote_addr or '?')
+            if refused is None and request.endpoint == 'enroll':
+                return _enroll_admission()
+            return refused
         pem = request.environ.get('SSL_CLIENT_CERT')
         if not pem:
             logger.debug(
@@ -2291,7 +3087,8 @@ def create_app(
             fingerprint = None
         pin = trust.lookup(fingerprint) if fingerprint else None
         if pin is None or clock() > pin.not_after:
-            logger.warning(
+            limits.log.log(
+                'auth', _peer(), logging.WARNING,
                 "API: refusing %s %s from %s: client certificate %s is %s",
                 request.method, request.path, request.remote_addr,
                 fingerprint or '(unreadable)',
@@ -2301,14 +3098,17 @@ def create_app(
         # After authentication, so an unauthenticated caller learns nothing
         # but 401/403; before anything with a side effect (the predecessor
         # retirement below, the route).
-        refused = _protocol_refusal(f"client {pin.client_id} ({request.remote_addr})")
+        refused = _protocol_refusal(
+            f"client {pin.client_id} ({request.remote_addr})", f"{pin.client_id}@{_peer()}"
+        )
         if refused is not None:
             return refused
         g.client_id = pin.client_id
         g.fingerprint = fingerprint
         url_id = (request.view_args or {}).get('client_id')
         if url_id is not None and url_id != pin.client_id:
-            logger.warning(
+            limits.log.log(
+                'auth', f"{pin.client_id}@{_peer()}", logging.WARNING,
                 "API: refusing %s %s from %s: the URL names client %r but "
                 "certificate %s is bound to %r",
                 request.method, request.path, request.remote_addr,
@@ -2339,6 +3139,12 @@ def create_app(
             return None, (jsonify({
                 'error': f'request body too large (limit {MAX_TRUST_REQUEST_BYTES} bytes)'
             }), 413)
+        except (BadRequest, OSError, ValueError):
+            # The peer announced a body and did not send it (werkzeug's
+            # `ClientDisconnected` is a `BadRequest`), hung up, or hit the
+            # read deadline (`TimeoutError`). A refusal like any other: the
+            # callers count it as a failed attempt (S-3).
+            return None, (jsonify({'error': 'the request body could not be read'}), 400)
         try:
             body = json.loads(raw)
         except (ValueError, UnicodeDecodeError, RecursionError):
@@ -2389,7 +3195,8 @@ def create_app(
         """The response for an exception of a store trust writer."""
         from zfsbackup.config.store import ConfigBusy
         if isinstance(e, ConfigBusy):
-            logger.warning(
+            limits.log.log(
+                'store-busy', _peer(), logging.WARNING,
                 "%s from %s: the config database is busy (503, retry)",
                 action, request.remote_addr,
             )
@@ -2536,9 +3343,20 @@ def create_app(
         - 426 `{"error", "reason": "protocol", "protocol", "supported"}`:
           no `X-Zfsbackup-Protocol` header or an unsupported version; checked
           before everything else, the body is not read.
+        - 429 `{"error", "reason": "rate_limited", "retry_after"}` with
+          `Retry-After: <seconds>` (900 right after the lockout): this address
+          made `ENROLL_FAILURES_MAX` failed attempts (any 4xx below except
+          426, counted per address -- the /64 for IPv6) within
+          `ENROLL_FAILURE_WINDOW`; checked in `before_request`, so the body
+          is not read and the store not touched. Only `/enroll` is locked.
+        - 503 `{"error", "reason": "busy", "retry": true}` with `Retry-After`:
+          `ENROLL_MAX_IN_FLIGHT` enrollments are already past their body and
+          shape checks (or this address already has one); taken right before
+          the token pre-check, never while the body is read; not counted as
+          a failure.
         - Check order: shape 400 -> grammar 400 -> label 400 -> token parse
           400 -> token for another server 403 refused -> certificate 422 ->
-          signature 403 -> token pre-check 403 refused (read-only, before any
+          signature 403 -> in-flight cap 503 -> token pre-check 403 refused (read-only, before any
           `zfs` call; also refuses a revoked certificate) -> `zfs.exists`
           503 -> the store (`enroll_client`, the authority).
         - 409 `{"error", "reason": "client_id_taken", "client_id", "hint"}`:
@@ -2564,11 +3382,22 @@ def create_app(
             return refused
         body, problem = _trust_body()
         if problem is not None:
+            limits.log.log(
+                'enroll', _peer(), logging.WARNING,
+                "enrollment from %s refused: malformed request", request.remote_addr,
+            )
+            _enroll_failed()
             return problem
         remote = request.remote_addr
 
         def failed(category: str, response):
-            logger.warning("enrollment from %s refused: %s", remote, category)
+            # One WARNING per peer per hour (S-3); every failure counts
+            # towards the peer's lockout.
+            limits.log.log(
+                'enroll', _peer(), logging.WARNING,
+                "enrollment from %s refused: %s", remote, category,
+            )
+            _enroll_failed()
             return response
 
         client_id = body.get('client_id')
@@ -2623,6 +3452,9 @@ def create_app(
                          'of possession of its key failed)',
                 'reason': 'bad_signature',
             }), 403))
+        busy = _enroll_enter()  # first store call from here on: bound them
+        if busy is not None:
+            return busy
         # Token pre-check: a read-only filter BEFORE the first costly step
         # (`zfs.exists`), so an unauthenticated caller without a valid token
         # -- or presenting a certificate revoked here -- costs one SQLite read
@@ -2671,6 +3503,8 @@ def create_app(
         except Exception as e:
             return _store_failure('enrollment', e)
 
+        if outcome in (EnrollOutcome.ENROLLED, EnrollOutcome.ALREADY_TRUSTED):
+            limits.enroll.forget(_peer())
         if outcome == EnrollOutcome.ENROLLED:
             logger.info(
                 "enrolled client %s (certificate %s, label %r) from %s",
@@ -2760,7 +3594,8 @@ def create_app(
         remote = request.remote_addr
 
         def failed(category: str, response):
-            logger.warning(
+            limits.log.log(
+                'rotate', f"{client_id}@{_peer()}", logging.WARNING,
                 "rotation for client %s (certificate %s) from %s refused: %s",
                 client_id, old_fp, remote, category,
             )
@@ -2997,6 +3832,8 @@ def create_app(
                 return jsonify({'error': ancestor_conflict}), 409
             if unsettled is not None:
                 ancestor, kind = unsettled
+                if kind == 'pending':
+                    _mark_pending_needed(ancestor)
                 _note_unsettled(client_id, dataset, ancestor, kind)
                 return jsonify({
                     'error': f'{ancestor} has not settled yet; retry later', 'retry': True,
@@ -3040,6 +3877,8 @@ def create_app(
                         # Claimed in one step, BEFORE the slow create, so two
                         # negotiates for one missing name cannot both win.
                         rival = _claim_pending(server_dataset, ds_config_canonical, dataset)
+                        if rival is PENDING_FULL:
+                            return jsonify(BUSY_ERROR), 503
                         if rival is not None:
                             return jsonify({'error': _mix_message(server_dataset, rival, dataset)}), 409
                         try:

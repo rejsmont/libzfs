@@ -45,6 +45,7 @@ import pytest
 
 from _stream_support import stream_script
 from _api_support import (
+    permissive_limits,
     plain_client,
     CLIENT_ID,
     SERVER_FP,
@@ -146,18 +147,32 @@ def _untouched(zfs):
         assert not getattr(zfs, name).called, f"zfs.{name} was called"
 
 
+def _real_app(mocker, tls_config_db, **kwargs):
+    trust = RealTrust(tls_config_db)
+    app = _authed(
+        mocker, _config(), gateway=trust.gateway, server_fp=trust.server_fp, client_id=None,
+        **kwargs,
+    )
+    app.trust = trust
+    return app
+
+
 @pytest.fixture
 def real(mocker, tls_config_db):
     """An app over a REAL gateway, config database and server identity. No certificate is
     pinned and no client is bound (`client_id=None`): use `authed.client(None)` for the
     unauthenticated `/enroll` and `authed.client(cert)` for a pinned certificate.
     `authed.trust` is the `RealTrust`."""
-    trust = RealTrust(tls_config_db)
-    app = _authed(
-        mocker, _config(), gateway=trust.gateway, server_fp=trust.server_fp, client_id=None
-    )
-    app.trust = trust
-    return app
+    return _real_app(mocker, tls_config_db)
+
+
+@pytest.fixture
+def real_open(mocker, tls_config_db):
+    """`real` with S-3's `/enroll` lockout and in-flight cap out of the way
+    (`permissive_limits`), for tests that make many failing or simultaneous `/enroll` calls
+    from the one test-client address; the limits themselves are in
+    `test_zfsbackup_api_flood.py`."""
+    return _real_app(mocker, tls_config_db, peer_limits=permissive_limits())
 
 
 def _anonymous(authed):
@@ -852,6 +867,12 @@ class TestEnrollRefusals:
     """The 403 for every token problem is one and the same body."""
 
     @pytest.fixture
+    def real(self, real_open):
+        """Six refusals from one address would trip S-3's lockout (5 in 15 minutes): the
+        subject here is the body of each refusal, not the lockout."""
+        return real_open
+
+    @pytest.fixture
     def tokens(self, real, zfs):
         """-> `{case: token}`: each token is unusable for a different reason."""
         out = {}
@@ -1425,7 +1446,10 @@ class TestEnrollOutcomesAgainstTheStore:
         _enroll(real, "host-a", cert, real.trust.token())
         refresh.assert_not_called()
 
-    def test_two_concurrent_enrollments_with_one_token_have_exactly_one_winner(self, real, zfs):
+    def test_two_concurrent_enrollments_with_one_token_have_exactly_one_winner(self, real_open, zfs):
+        """Six at once; S-3's cap of 2 in flight would answer four of them 503 before the
+        store sees them (permissive limits: the store's one-winner rule is the subject)."""
+        real = real_open
         token = real.trust.token()
         barrier = threading.Barrier(6)
         statuses = []
