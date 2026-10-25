@@ -386,7 +386,7 @@ class TestParentAnchorsUnchanged:
     @pytest.mark.parametrize('row', [
         f'{PARENT}@{A}\t{ANCHOR}x\tlocal\n',
         f'{PARENT}#bm\t{ANCHOR}x\tlocal\n',
-    ])
+    ], ids=['snapshot', 'bookmark'])      # fixed ids: A is clock-derived, and xdist workers must collect the same ids
     def test_a_forged_snapshot_or_bookmark_row_in_the_discovery_skips_the_prune(self, fz, caplog, row):
         """The same, in phase 1 (three columns, no value): refused before any value is read."""
         fz.extra_source_rows = [row]
