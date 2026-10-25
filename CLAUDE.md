@@ -356,7 +356,9 @@ missing a column fails with `SchemaColumnsMissing` (78). Ownership advice names 
   `identity show [--json]`, `identity set-client-id ID [--force]`, `identity rotate [--cert --key]`;
 - operations: `backup DIR [--no-keys] [--json]` (`backup.py`: `DIR/zfsbackup-<host>-<UTC>/` with `config.db`, `tls/`
   via `identity.copy_tls_dir` under a shared `identity.lock`, and a `MANIFEST` written last; never the writer lock,
-  never a signal), `check [--json|--prometheus|--nagios] [--output FILE]` (`check.py`), `migrate --backup-dir DIR`
+  never a signal), `check [--json|--prometheus|--nagios] [--output FILE]` (`check.py`; it also grades the workers' status files —
+  consecutive failures WARN from 2, CRIT from 4, a missing file is no data, a refused file one WARN, a stale file
+  (no daemon, writer gone, or not updated for max(4 × check_interval, 24 h)) one WARN and its records ungraded), `migrate --backup-dir DIR`
   (backs up only when the schema is behind, inside the writer lock; when the schema is behind, `migrate` refuses
   with 75 while a daemon or any worker is running, so stop the daemon first), `--version`;
 
@@ -482,7 +484,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_cli_version.py` | `zfsbackup-config --version` (eager, no DB, no daemon import) |
 | `tests/test_zfsbackup_cli_backup.py` | `zfsbackup-config backup`: layout, modes, MANIFEST, `--no-keys`, exit mapping, signals, restore round trip |
 | `tests/test_zfsbackup_cli_migrate_backup.py` | `migrate --backup-dir`: behind/at head/newer, backup failures never migrate, workers-present refusal, concurrent migrates |
-| `tests/test_zfsbackup_cli_check.py` | `zfsbackup-config check`: formats, exit codes incl. Nagios UNKNOWN, escaping, atomic output, daemon and certificate entries |
+| `tests/test_zfsbackup_cli_check.py` | `zfsbackup-config check`: formats, exit codes incl. Nagios UNKNOWN, escaping, atomic output, daemon and certificate entries, worker status entries (grading, refused and stale files, trusted daemon uid) |
 | `tests/test_zfsbackup_platform_contracts.py` | Contract tests for the werkzeug, requests/urllib3 and simple-websocket internals zfsbackup overrides |
 | `tests/test_ci_workflows.py` | The CI workflows: the real-ZFS job runs only on schedule/dispatch on `master`, stubs stay in the mocked jobs |
 
@@ -492,6 +494,7 @@ Shared TLS test helpers (importable from any test module; `tests/` is on `sys.pa
 - `tests/_tls_support.py` — real generated identities, a scripted `StubTrust`, `make_gateway`, `pin_client`/`unpin_client` through the real trust writers, `https_get`/`tls_probe`.
 - `tests/_api_support.py` — client certificates, `FakeGateway`, `Authed` (a Flask app presenting `SSL_CLIENT_CERT`), `RealTrust`, the `/enroll` and `/rotate` request bodies.
 - `tests/_remote_support.py` — `make_transport`, `fake_connect_pinned`, `client_tls_dir`, `whoami_json` for `RemoteBackupManager` tests.
+- `tests/_worker_status_support.py` — worker status files built with the real `health` writer (`rec()`, `write_worker()`) for the `check`/`status` tests; `tests/_status_workers.py` — picklable worker doubles for the real-process status tests.
 - `tests/_get_support.py` — realistic `zfs get -H`/`zfs list -H` bytes, `ZfsWorld` (a Popen router by argv), `GetReader` (patches `GetCommand._exec_lines`).
 - `tests/_session_support.py` — `StreamRig` (real route, TLS server, `RealTrust` on a real DB, real trust-poll thread; only the `zfs` calls patched), `ChildWriter` (a real receive child), `ping_flood`, `finish`, `SessionApiWorker`/`ProcessRig`.
 - `tests/_stream_support.py` — `make_header` (synthetic `DRR_BEGIN`), `capture_header(s)` (the M8 `HDR.*` captures), `HEADER`/`VOLUME_HEADER`, `incremental_header`, `get_value_answers` for server receive-path tests.

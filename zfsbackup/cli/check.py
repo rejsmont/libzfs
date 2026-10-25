@@ -16,12 +16,38 @@ What it does, in order:
    makes the read-only `zfs list` / `zfs get` calls; `health.evaluate` grades them.
 3. Adds this command's own entries as `health.CheckEntry`s, so every serialiser
    handles them: the daemon (not running = CRIT; running but not on the stored
-   generation = WARN) and the client certificate (expired = CRIT, expiring
-   within 30 days or unusable = WARN).
+   generation = WARN), the client certificate (expired = CRIT, expiring
+   within 30 days or unusable = WARN) and, once the daemon's workers have
+   written their status files (`<db>.status/<worker>.json`, S-7), the outcome of
+   their last attempts (below).
 4. Prints one of: text (default; one line per entry, then an overall line),
    `--json`, `--prometheus` or `--nagios`; `--output FILE` writes the text,
    JSON or Prometheus form to FILE atomically instead of stdout (node_exporter's
    textfile collector). `--nagios` stands alone (it is one line on stdout).
+
+Worker outcomes (S-7b). One entry per `(kind, dataset[, destination])` record in
+the status files, source `worker_snapshot`, `worker_prune` or `worker_send`,
+subject the dataset, peer the destination. The grading mirrors the lag grading:
+a failed attempt counts like one missed interval, so `consecutive_failures`
+below `--warn-factor` (default 2) is OK (one failure in a row is noted in the
+reason but not a verdict: the next cycle may fix it), from `--warn-factor` WARN,
+from `--crit-factor` (default 4) CRIT. A last attempt that succeeded is OK
+whatever happened before. NO DATA IS NEVER A FAILURE: a missing status
+directory (an older daemon, or nothing written yet) or a worker with no file
+adds no entry at all. A file the reader refuses (a symlink, writable by
+group/others, an untrusted owner, too big, not JSON, a newer schema) is one
+WARN entry (source `worker_status`) naming it; the other files are still read.
+A file that cannot be taken as current is STALE and reported as one WARN
+`worker_status` entry per worker ("no recent data"), its outcomes not graded:
+no daemon is running (a stopped daemon, or a worker a live-to-dry-run reload
+replaced, leaves its last file behind for ever), the writing pid is gone, or the
+file was not updated for `max(4 x check_interval, 24 h)` (a backstop: a worker may go hours
+without writing during one long transfer). Staleness is never OK
+and never CRIT on its own (a stopped daemon is already the daemon entry's CRIT).
+In the JSON each such entry also carries `kind`, `consecutive_failures`,
+`last_attempt` and `last_success`; the Prometheus form adds
+`zfsbackup_worker_consecutive_failures`; `--nagios` adds a perfdata item per
+record (failures with the two thresholds).
 
 Exit codes:
 
@@ -41,20 +67,32 @@ Exit codes:
   exception while collecting -- since that says nothing about the backups.
 """
 
+import json
+import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
 import click
 
+from zfsbackup import health as _health  # stdlib only
 from zfsbackup import identity
 from zfsbackup.cli import status as status_view
 from zfsbackup.cli import tlsfiles
 from zfsbackup.cli.errors import CliError
 from zfsbackup.cli.write import read_snapshot
 
-__all__ = ["register", "gather", "client_certificate_entry", "daemon_entries", "CERT_WARN_DAYS"]
+__all__ = [
+    "register",
+    "gather",
+    "client_certificate_entry",
+    "daemon_entries",
+    "worker_entries",
+    "OutcomeEntry",
+    "CERT_WARN_DAYS",
+]
 
 #: A client certificate that expires within this many days is a WARN.
 CERT_WARN_DAYS = 30
@@ -65,7 +103,26 @@ EXIT_NAGIOS_UNKNOWN = 3
 SOURCE_DAEMON = "daemon"
 SOURCE_TLS = "tls"
 
+#: Prefix of the source of a worker-outcome entry (`worker_send`, ...), and
+#: the source of an entry about a status file the reader refused.
+SOURCE_WORKER = "worker"
+SOURCE_WORKER_STATUS = "worker_status"
+
 _NAGIOS_NAME = "ZFSBACKUP"
+
+
+@dataclass(frozen=True)
+class OutcomeEntry(_health.CheckEntry):
+    """A worker-outcome `CheckEntry` with the numbers behind it (the JSON,
+    Prometheus and Nagios forms use them; `health`'s own serialisers know only
+    the base fields)."""
+
+    kind: str = ""
+    consecutive_failures: int = 0
+    last_attempt: Optional[float] = None
+    last_success: Optional[float] = None
+    warn_failures: float = 0.0
+    crit_failures: float = 0.0
 
 
 # --------------------------------------------------------------------------
@@ -142,6 +199,95 @@ def client_certificate_entry(
     )
 
 
+def _ago(health: Any, now: float, ts: Optional[float]) -> str:
+    if ts is None:
+        return "never"
+    return f"{health.format_duration(max(now - ts, 0.0))} ago"
+
+
+def _outcome_entry(health: Any, rec: Any, now: float, warn: float, crit: float) -> OutcomeEntry:
+    failures = max(rec.consecutive_failures, 1 if rec.result == "error" else 0)
+    if failures >= 1 and failures >= crit:
+        state = health.STATE_CRIT
+    elif failures >= 1 and failures >= warn:
+        state = health.STATE_WARN
+    else:
+        state = health.STATE_OK
+    error = f": {rec.last_error}" if rec.last_error else ""
+    if failures == 0:
+        if rec.result is None and rec.last_attempt is None:
+            reason = "no attempt recorded yet"
+        else:
+            reason = f"last attempt succeeded {_ago(health, now, rec.last_attempt)}"
+            if rec.detail:
+                reason += f" ({rec.detail})"
+    elif state == health.STATE_OK:
+        reason = (
+            f"last attempt failed {_ago(health, now, rec.last_error_at or rec.last_attempt)} "
+            f"(1 in a row; WARN from {warn:g}){error}"
+        )
+    else:
+        reason = (
+            f"{failures} attempts in a row failed (WARN from {warn:g}, CRIT from {crit:g}); "
+            f"last failure {_ago(health, now, rec.last_error_at or rec.last_attempt)}{error}; "
+            f"last success {_ago(health, now, rec.last_success)}"
+        )
+    return OutcomeEntry(
+        f"{SOURCE_WORKER}_{rec.kind}", rec.dataset, state, reason, rec.destination,
+        kind=rec.kind, consecutive_failures=failures,
+        last_attempt=rec.last_attempt, last_success=rec.last_success,
+        warn_failures=warn, crit_failures=crit,
+    )
+
+
+_FILE_RE = re.compile(r"(\S+\.json)")
+
+
+def _problem_subject(problem: str, seen: set) -> str:
+    match = _FILE_RE.search(problem)
+    subject = match.group(1).rsplit("/", 1)[-1] if match else "status directory"
+    unique, n = subject, 1
+    while unique in seen:  # one Prometheus series per entry
+        n += 1
+        unique = f"{subject}#{n}"
+    seen.add(unique)
+    return unique
+
+
+def worker_entries(
+    health: Any, workers: status_view.Workers, now: float, warn_factor: float, crit_factor: float
+) -> List[Any]:
+    """The entries for the daemon's worker status files (see the module
+    docstring): one per outcome record, one WARN per refused file; nothing at
+    all when there is no data."""
+    entries: List[Any] = []
+    stale = workers.stale or {}
+    for st in workers.statuses:
+        if st.worker in stale:
+            # Not current (a stopped daemon's, or a replaced worker's, leftover
+            # file): never graded as if fresh -- no OK, and no CRIT for age alone.
+            failing = sum(
+                1 for r in st.records if max(r.consecutive_failures, 1 if r.result == "error" else 0)
+            )
+            entries.append(health.CheckEntry(
+                SOURCE_WORKER_STATUS, st.worker, health.STATE_WARN,
+                f"no recent data from {st.worker}: {stale[st.worker]}; its last outcomes "
+                f"({len(st.records)} record(s), {failing} failing) are not trusted as current",
+            ))
+            continue
+        for rec in st.records:
+            if rec.kind not in health.STATUS_KINDS:
+                continue  # a kind a later daemon records; this reader does not grade it
+            entries.append(_outcome_entry(health, rec, now, warn_factor, crit_factor))
+    seen: set = set()
+    for problem in workers.problems:
+        entries.append(health.CheckEntry(
+            SOURCE_WORKER_STATUS, _problem_subject(problem, seen), health.STATE_WARN,
+            f"worker status not read: {_one_line(problem)}",
+        ))
+    return entries
+
+
 def gather(
     resolved: Any, now: datetime, warn_factor: float, crit_factor: float
 ) -> Tuple[Any, List[Any]]:
@@ -176,6 +322,13 @@ def gather(
     cert = client_certificate_entry(health, config, resolved, now)
     if cert is not None:
         entries.append(cert)
+    daemon_running = None if status is None else status.daemon is not None
+    interval = getattr(config, "check_interval", None)
+    workers = status_view.collect_workers(
+        resolved, daemon_running=daemon_running, now=now.timestamp(),
+        interval=interval.total_seconds() if interval is not None else None,
+    )
+    entries.extend(worker_entries(health, workers, now.timestamp(), warn_factor, crit_factor))
     return health, entries
 
 
@@ -230,8 +383,59 @@ def render_nagios(health: Any, entries: List[Any]) -> str:
         for e in entries
         if getattr(e, "age_seconds", None) is not None
     ]
+    perf.extend(
+        f"'{_perf_label(e)}'={e.consecutive_failures};{e.warn_failures:g};{e.crit_failures:g};0"
+        for e in entries
+        if isinstance(e, OutcomeEntry)
+    )
     line = f"{_NAGIOS_NAME} {overall} - {shown}"
     return line + (" | " + " ".join(perf) if perf else "") + "\n"
+
+
+def _iso(ts: Optional[float]) -> Optional[str]:
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def render_json(health: Any, entries: List[Any], now: float, version: Optional[str]) -> str:
+    """`health.to_json`, with the worker-outcome numbers added to their
+    entries (additive keys; `"schema"` stays 1)."""
+    document = json.loads(health.to_json(entries, now, version))
+    for entry, data in zip(entries, document["entries"]):
+        if isinstance(entry, OutcomeEntry):
+            data["kind"] = entry.kind
+            data["consecutive_failures"] = entry.consecutive_failures
+            data["last_attempt"] = _iso(entry.last_attempt)
+            data["last_success"] = _iso(entry.last_success)
+    return json.dumps(document, indent=2, ensure_ascii=True)
+
+
+_OVERALL_HELP = "# HELP zfsbackup_check_overall_state "
+
+
+def render_prometheus(health: Any, entries: List[Any], now: float, version: Optional[str]) -> str:
+    """`health.to_prometheus`, plus `zfsbackup_worker_consecutive_failures`
+    (0 = the last attempt succeeded) with labels `kind`, `dataset` and, for a
+    send, `destination`, placed before the overall-state block."""
+    text = health.to_prometheus(entries, now, version)
+    outcomes = [e for e in entries if isinstance(e, OutcomeEntry)]
+    if not outcomes:
+        return text
+    lines = [
+        "# HELP zfsbackup_worker_consecutive_failures Attempts in a row that failed (0 = the last "
+        "one succeeded).",
+        "# TYPE zfsbackup_worker_consecutive_failures gauge",
+    ]
+    for e in outcomes:
+        labels = [("kind", e.kind), ("dataset", e.subject)]
+        if e.peer is not None:
+            labels.append(("destination", e.peer))
+        inner = ",".join(f'{k}="{health.escape_label_value(v)}"' for k, v in labels)
+        lines.append(f"zfsbackup_worker_consecutive_failures{{{inner}}} {e.consecutive_failures}")
+    block = "\n".join(lines) + "\n"
+    at = text.find(_OVERALL_HELP)
+    return text + block if at < 0 else text[:at] + block + text[at:]
 
 
 # --------------------------------------------------------------------------
@@ -276,7 +480,11 @@ def register(
             "WARN from --warn-factor times that interval, CRIT from --crit-factor "
             "times it. Also checks that a daemon is running on the stored "
             "configuration and that the client certificate is not about to expire "
-            "(30 days). Read-only: it runs only `zfs list`/`zfs get`, takes no lock "
+            "(30 days). Once the daemon's workers have written their status files "
+            "(<db>.status/), also grades each worker's last attempts: failures in a row "
+            "count like missed intervals (WARN from --warn-factor, CRIT from "
+            "--crit-factor); no status files is no data, never a failure. "
+            "Read-only: it runs only `zfs list`/`zfs get`, takes no lock "
             "and never signals the daemon.\n\n"
             "Output: text by default; --json; --prometheus (text exposition format); "
             "--nagios (one plugin line). --output FILE writes that output to FILE "
@@ -339,9 +547,9 @@ def _run(
         click.echo(render_nagios(health, entries), nl=False)
         return health.STATE_VALUES[overall]  # 0 OK, 1 WARN, 2 CRIT
     if as_json:
-        text = health.to_json(entries, now, installed_version()) + "\n"
+        text = render_json(health, entries, now, installed_version()) + "\n"
     elif as_prometheus:
-        text = health.to_prometheus(entries, now, installed_version())
+        text = render_prometheus(health, entries, now, installed_version())
     else:
         text = render_text(health, entries)
     if output is not None and output != "-":

@@ -160,7 +160,10 @@ means don't wait. The answer is one of:
 - no daemon is running.
 
 `zfsbackup-config status` shows the stored generation and the generation the daemon runs, accepted,
-rejected or deferred (with the reason). `status --wait SECONDS` is meant for scripts. It exits:
+rejected or deferred (with the reason). Once the workers have written their status files it also lists,
+per worker, when it last updated, how many of its records are failing and the worst failure's last error
+(`--json`: a `workers` key; absent when there is no data; it never changes the verdict or the exit code).
+`status --wait SECONDS` is meant for scripts. It exits:
 - 0 once the daemon is in sync, or when no daemon is running;
 - 1 if the daemon rejected the stored configuration, or will never catch up;
 - 75 on timeout, including a configuration that is still deferred at the deadline (never 1: a deferred
@@ -342,7 +345,10 @@ swaps nothing; fix or remove that destination and re-run (servers that already a
 rotates), and a retired certificate is refused for ever. If a destination refuses the successor, the advice
 names the servers that already accepted it. With `client_cert_file`/`client_key_file` configured, give the new pair with
 `--cert`/`--key`. The daemon picks up new generated files by itself. Exit status 75 means a destination
-was unreachable or busy: re-run.
+was unreachable or busy: wait and re-run. A server that has seen five failed enrollments from your address
+answers HTTP 429 with `Retry-After`; the message says how long to wait (15 minutes right after the
+lockout), and re-running sooner cannot succeed. A server with other enrollments in flight answers
+"busy" (wait about 2 seconds).
 
 ### A lost, stolen or revoked key
 
@@ -629,6 +635,23 @@ the server's copy shows only as lag (the client logs the reason once).
 - **`tls/client_certificate`**, only when destinations are configured: WARN when the certificate is missing
   (not enrolled), unreadable or would not be accepted, or expires within 30 days; CRIT once it has expired
   (`identity rotate`); OK otherwise.
+- **`worker_snapshot`, `worker_prune`, `worker_send`** (subject the dataset, peer the destination for a send):
+  the outcome of each worker's last attempts, read from the status files the daemon writes next to the
+  database (`<db>.status/<worker>.json`). A failed attempt counts like one missed interval: attempts failing
+  **in a row** below `--warn-factor` (default 2) are OK (a single failure is named in the reason but is not a
+  verdict), from `--warn-factor` WARN, from `--crit-factor` (default 4) CRIT; a last attempt that succeeded is
+  OK whatever came before. **No status files is "no data", never a failure**: a daemon that predates them, a
+  worker that has nothing to report yet, or a `--dry-run` daemon (which writes none) adds no entry. A status
+  file that is refused (a symlink, group- or world-writable, owned by a user the CLI does not trust, too big,
+  not JSON, or a newer schema than this CLI reads) is one `worker_status` WARN naming the file. Owners trusted
+  are root, the user running the CLI, the database file's owner and the owner of `<db>.daemon.pid` (the user
+  the daemon runs as). These entries sit beside the lag entries: the lag says that something is late, the
+  outcome says why (the last error).
+  A status file that cannot be taken as current is **stale**: no daemon is running (a stopped daemon, or a
+  worker a live-to-`--dry-run` reload replaced, leaves its last file behind), the writing process is gone, or
+  it was not updated for `max(4 x check_interval, 24 h)` (a backstop; one long transfer can keep a worker from
+  writing for hours). A stale file is one WARN `worker_status` entry ("no recent data") and its outcomes are
+  not graded: never OK, never CRIT for staleness alone. `status` marks it `STALE` and uses 24 h.
 
 ```bash
 zfsbackup-config check                       # text: one line per entry, then "overall: …"
@@ -657,7 +680,11 @@ zfsbackup-config check --prometheus --output /var/lib/node_exporter/textfile_col
   and `_check_state` (0 OK, 1 WARN, 2 CRIT), labelled `dataset` and, where it applies, `destination` or
   `client`; other checks appear as `zfsbackup_check_state{source,subject}`; then `zfsbackup_check_overall_state`,
   `zfsbackup_check_success` (1 only when nothing is WARN or CRIT), `zfsbackup_check_timestamp_seconds` and
-  `zfsbackup_build_info{version}`. The daemon and certificate entries above are
+  `zfsbackup_build_info{version}`. The worker-outcome entries above are
+  `zfsbackup_check_state{source="worker_send",subject="tank/data",peer="offsite"}` and so on, with
+  `zfsbackup_worker_consecutive_failures{kind,dataset[,destination]}` (0 = the last attempt succeeded; JSON
+  entries carry the same number as `consecutive_failures`, with `kind`, `last_attempt` and `last_success`;
+  `--nagios` adds one perfdata item per record: failures with the two thresholds). The daemon and certificate entries above are
   `zfsbackup_check_state{source="daemon",subject="process"}` and the like. Label values are escaped as the exposition format requires. There is no
   HTTP `/metrics` endpoint.
 - **A scheduled check.** The sdist ships an optional `packaging/systemd/zfsbackup-check.service` and

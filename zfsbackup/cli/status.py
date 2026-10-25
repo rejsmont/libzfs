@@ -49,6 +49,39 @@ JSON shape (stable; keys may be added, none renamed or removed)::
       "message": str                    # the text form's verdict line
     }
 
+Worker outcomes (S-7b). When the daemon's workers have written their status
+files (`<db>.status/<worker>.json`, read through the stdlib `zfsbackup.health`
+reader), the text form gets a ``workers:`` row per worker before the final
+``status:`` line, and ``--json`` gets one more key, ``"workers"``::
+
+    "workers": {
+      "directory": str,
+      "problems": [str],                # refused or unreadable files, one line each
+      "files": [{
+        "worker": str, "pid": int | null,
+        "started_at": str | null, "updated_at": str | null,   # UTC, ...Z
+        "stale": bool,                  # not current: see below
+        "stale_reason": str | null,
+        "records": int,                 # outcomes the worker tracks
+        "failing": int,                 # records whose last attempt(s) failed
+        "worst": null | {"kind", "dataset", "destination", "consecutive_failures",
+                         "last_error", "last_error_at"}
+      }]
+    }
+
+A file is **stale** when it cannot be taken as the workers' current state: no
+daemon is running (a stopped daemon's last files stay on disk for ever, as
+do those of a worker a live-to-dry-run reload replaced), the writing process
+is gone, or it was not updated for longer than `max(4 x check_interval, 24 h)`
+(`check` knows the interval; `status` reads no configuration and uses 24 h). The age
+is only a backstop: the two liveness criteria carry the signal, and a worker may go
+hours without writing during one long transfer. A
+stale file is shown as such and its outcomes are never reported as current.
+
+The key and the rows are absent when there is no status directory at all (an
+older daemon, or nothing written yet): no data is not a failure. Reading them
+never changes the verdict or an exit code.
+
 Exit codes of the command: 0; 1 when the daemon's lock file cannot be read at
 all (`probe` raised `OSError`); 78 when the database is unusable, including a
 schema that is out of date or does not match (the daemon state is printed
@@ -60,9 +93,13 @@ out (including while the daemon is still `deferred`: that is never exit 1).
 """
 
 import json
+import os
+import stat as stat_module
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from zfsbackup import daemonlock
 from zfsbackup.cli.errors import CliError, ConfigUnusable
@@ -86,7 +123,12 @@ __all__ = [
     "UNREADABLE",
     "Status",
     "WAIT_POLL_SECONDS",
+    "Workers",
     "collect",
+    "collect_workers",
+    "stale_after",
+    "stale_reason",
+    "trusted_status_uids",
     "render_json",
     "render_text",
     "wait_exit_code",
@@ -247,11 +289,227 @@ def collect(
     return Status(str(resolved.resolved_path), stored, info, verdict, message, schema_error)
 
 
+# --------------------------------------------------------------------------
+# worker status files (S-7b)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Workers:
+    """The worker status files, as read: `present` is False when there is no
+    `<db>.status/` directory ("no data"); `statuses` are the parsed files
+    (`health.WorkerStatus`); `problems` are refused or unreadable files."""
+
+    directory: str
+    present: bool
+    statuses: tuple = ()
+    problems: tuple = ()
+    #: worker name -> why its file is not current (see `stale_reason`).
+    stale: Optional[Dict[str, str]] = None
+
+    @property
+    def has_data(self) -> bool:
+        return self.present or bool(self.problems)
+
+
+def trusted_status_uids(resolved: ResolvedConfigPath) -> Set[int]:
+    """The uids whose ownership of `<db>.status/` and its files is accepted.
+
+    The reader's own default is root, this process's euid and the DB file's
+    owner. The daemon can run as another user than the DB's owner (the
+    documented layout is a DB owned by root or an operator, group `zfsbackup`,
+    and the daemon as a service user), and its status files are then owned by
+    that user. So this adds ONE more: the owner of the daemon's pid file
+    (`<db>.daemon.pid`), which the daemon itself creates -- it is the same owner
+    `daemonlock.request_reload` accepts as "the target's uid". The pid file is
+    taken only if it is a regular file (never a symlink); it stays after the
+    daemon exits, so a stopped daemon's last status stays readable. Nothing the
+    status files say can then do more than an owner of the DB directory could
+    already do, and the reader still refuses group- or world-writable files and
+    directories and symlinks."""
+    uids: Set[int] = {0, os.geteuid()}
+    try:
+        uids.add(os.stat(resolved.resolved_path).st_uid)
+    except OSError:
+        pass
+    try:
+        st = os.lstat(daemonlock.lock_path(resolved))
+    except OSError:
+        pass
+    else:
+        if stat_module.S_ISREG(st.st_mode):
+            uids.add(st.st_uid)
+    return uids
+
+
+#: A status file older than this is stale whatever the configuration says.
+STALE_FLOOR_SECONDS = 24 * 3600.0
+#: ... and, when the check interval is known, older than this many of them.
+STALE_INTERVALS = 4
+
+
+def stale_after(interval: Optional[float]) -> float:
+    """Seconds without an update after which a status file is stale: `max(4 x
+    check_interval, 24 h)`. Only a backstop: a worker writes between datasets and
+    once per cycle, so one long transfer can leave the file untouched for hours;
+    "no daemon" and "writer pid gone" are the real signals."""
+    return max(STALE_INTERVALS * interval, STALE_FLOOR_SECONDS) if interval else STALE_FLOOR_SECONDS
+
+
+def stale_reason(
+    st: Any, now: float, *, daemon_running: Optional[bool] = None,
+    interval: Optional[float] = None,
+) -> Optional[str]:
+    """Why `st` (a `health.WorkerStatus`) cannot be taken as current, or
+    `None` when it can. A file is left behind by a stopped daemon and by a
+    worker that a reload replaced (for example live -> `--dry-run`, which
+    writes nothing), and is then never updated again; its last outcomes would
+    otherwise read as fresh. `daemon_running=None` = not known."""
+    from zfsbackup import health
+
+    if daemon_running is False:
+        return "no daemon is running, so this is the last state of a stopped one"
+    if st.pid is not None and daemonlock.pid_is_alive(st.pid) is False:
+        return f"its writer (pid {st.pid}) is gone"
+    if st.updated_at is None:
+        return "it records no update time"
+    age = now - st.updated_at
+    bound = stale_after(interval)
+    if age > bound:
+        return (
+            f"not updated for {health.format_duration(age)} "
+            f"(more than {health.format_duration(bound)})"
+        )
+    return None
+
+
+def collect_workers(
+    resolved: ResolvedConfigPath, *, daemon_running: Optional[bool] = None,
+    interval: Optional[float] = None, now: Optional[float] = None,
+) -> Workers:
+    """Read every worker status file for `resolved`. Read-only and tolerant: a
+    missing directory is `present=False`, a refused file is a `problems` line.
+    Never raises for what it finds. Files that are not current are named in
+    `Workers.stale` (`stale_reason`)."""
+    from zfsbackup import health
+
+    directory = health.status_dir(resolved.resolved_path)
+    try:
+        result = health.read_status_dir(directory, trusted_uids=trusted_status_uids(resolved))
+    except Exception as exc:  # noqa: BLE001 - the reader is documented not to raise
+        return Workers(str(directory), True, (), (f"{directory}: cannot be read: {exc}",))
+    moment = time.time() if now is None else now
+    stale = {}
+    for st in result.statuses:
+        reason = stale_reason(st, moment, daemon_running=daemon_running, interval=interval)
+        if reason is not None:
+            stale[st.worker] = reason
+    return Workers(
+        str(directory), result.present, tuple(result.statuses), tuple(result.problems), stale
+    )
+
+
+def _iso(ts: Optional[float]) -> Optional[str]:
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _failures(record: Any) -> int:
+    """Attempts in a row that failed (an `error` result counts at least 1)."""
+    return max(record.consecutive_failures, 1 if record.result == "error" else 0)
+
+
+def worst_record(status: Any) -> Optional[Any]:
+    """The record with the most consecutive failures (ties: the latest error),
+    or `None` when none is failing."""
+    failing = [r for r in status.records if _failures(r) >= 1]
+    if not failing:
+        return None
+    return max(failing, key=lambda r: (_failures(r), r.last_error_at or 0.0))
+
+
+def _subject(record: Any) -> str:
+    dest = f" -> {record.destination}" if record.destination else ""
+    return f"{record.kind} {record.dataset}{dest}"
+
+
+def _worker_json(status: Any, stale: Optional[str] = None) -> Dict[str, Any]:
+    worst = worst_record(status)
+    return {
+        "worker": status.worker,
+        "stale": stale is not None,
+        "stale_reason": stale,
+        "pid": status.pid,
+        "started_at": _iso(status.started_at),
+        "updated_at": _iso(status.updated_at),
+        "records": len(status.records),
+        "failing": sum(1 for r in status.records if _failures(r) >= 1),
+        "worst": None if worst is None else {
+            "kind": worst.kind,
+            "dataset": worst.dataset,
+            "destination": worst.destination,
+            "consecutive_failures": _failures(worst),
+            "last_error": worst.last_error,
+            "last_error_at": _iso(worst.last_error_at),
+        },
+    }
+
+
+def workers_json(workers: Workers) -> Dict[str, Any]:
+    return {
+        "directory": workers.directory,
+        "problems": list(workers.problems),
+        "files": [_worker_json(s, (workers.stale or {}).get(s.worker)) for s in workers.statuses],
+    }
+
+
+def _ago(ts: Optional[float], now: float) -> str:
+    if ts is None:
+        return "never"
+    seconds = max(int(now - ts), 0)
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5400:
+        return f"{seconds // 60}m ago"
+    if seconds < 172800:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def _worker_lines(workers: Workers, now: float) -> List[Tuple[str, str]]:
+    """`(row name, value)` pairs for the text form; `("", ...)` continues the
+    previous row."""
+    rows: List[Tuple[str, str]] = []
+    for st in workers.statuses:
+        failing = sum(1 for r in st.records if _failures(r) >= 1)
+        updated = "-" if st.updated_at is None else f"{_iso(st.updated_at)} ({_ago(st.updated_at, now)})"
+        count = f"{len(st.records)} record{'s' if len(st.records) != 1 else ''}"
+        stale = (workers.stale or {}).get(st.worker)
+        rows.append(("workers" if not rows else "", (
+            f"{st.worker}: " + ("STALE (no recent data) " if stale else "")
+            + f"updated {updated}, {count}, "
+            + (f"{failing} failing" if failing else "none failing")
+        )))
+        if stale:
+            rows.append(("", f"  stale: {stale}"))
+        worst = worst_record(st)
+        if worst is not None:
+            error = f": {worst.last_error}" if worst.last_error else ""
+            label = "last known worst" if stale else "worst"
+            rows.append(("", (
+                f"  {label}: {_subject(worst)}, {_failures(worst)} failure(s) in a row{error}"
+            )))
+    for problem in workers.problems:
+        rows.append(("workers" if not rows else "", f"problem: {' '.join(problem.split())}"))
+    return rows
+
+
 def _pair_json(pair: Optional[Key]) -> Optional[Dict[str, int]]:
     return None if pair is None else {"store_id": pair[0], "generation": pair[1]}
 
 
-def render_json(status: Status) -> str:
+def render_json(status: Status, workers: Optional[Workers] = None) -> str:
     info = status.daemon
     daemon: Optional[Dict[str, Any]] = None
     if info is not None:
@@ -266,23 +524,23 @@ def render_json(status: Status) -> str:
             "deferred": _pair_json(info.deferred),
             "deferred_reason": info.deferred_reason,
         }
-    return json.dumps(
-        {
-            "database": status.database,
-            "stored": {
-                "store_id": status.stored.store_id,
-                "generation": status.stored.generation,
-            },
-            "daemon": daemon,
-            "schema_error": None if status.schema_error is None else str(status.schema_error),
-            "verdict": status.verdict,
-            "message": status.message,
+    document: Dict[str, Any] = {
+        "database": status.database,
+        "stored": {
+            "store_id": status.stored.store_id,
+            "generation": status.stored.generation,
         },
-        indent=2,
-    ) + "\n"
+        "daemon": daemon,
+        "schema_error": None if status.schema_error is None else str(status.schema_error),
+        "verdict": status.verdict,
+        "message": status.message,
+    }
+    if workers is not None and workers.has_data:
+        document["workers"] = workers_json(workers)
+    return json.dumps(document, indent=2) + "\n"
 
 
-def render_text(status: Status) -> str:
+def render_text(status: Status, workers: Optional[Workers] = None, now: Optional[float] = None) -> str:
     info = status.daemon
     rows = [
         ("database", status.database),
@@ -305,8 +563,12 @@ def render_text(status: Status) -> str:
             rows.append(("applied", gen))
     if status.schema_error is not None:
         rows.append(("schema", str(status.schema_error).strip().splitlines()[0]))
+    if workers is not None and workers.has_data:
+        rows.extend(_worker_lines(workers, time.time() if now is None else now))
     rows.append(("status", status.message))
-    return "".join(f"{name + ':':<10}{value}\n" for name, value in rows)
+    return "".join(
+        (f"{name + ':':<10}" if name else " " * 10) + f"{value}\n" for name, value in rows
+    )
 
 
 def wait_for(

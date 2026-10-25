@@ -959,10 +959,13 @@ def status_cmd(
         current = status_view.collect(resolved)
     else:
         current = status_view.wait_for(resolved, wait)
+    # The workers' last outcomes (S-7b): read once, after any wait, and never
+    # part of the verdict or the exit code.
+    workers = status_view.collect_workers(resolved, daemon_running=current.daemon is not None)
     if as_json:
-        click.echo(status_view.render_json(current), nl=False)
+        click.echo(status_view.render_json(current, workers), nl=False)
     else:
-        click.echo(status_view.render_text(current), nl=False)
+        click.echo(status_view.render_text(current, workers), nl=False)
     if current.schema_error is not None:
         # What could be said has been; now fail like any unusable database
         # (exit 78, the store's own wording).
