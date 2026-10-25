@@ -3,7 +3,7 @@ from libzfseasy.zfs import (
     ListCommand, CreateCommand, SnapshotCommand, BookmarkCommand, DestroyCommand, RenameCommand,
     AllowCommand, UnAllowCommand, CloneCommand, GetCommand, SetCommand, InheritCommand,
     SendCommand, ReceiveCommand, ChangeKeyCommand, LoadKeyCommand, UnLoadKeyCommand,
-    MountCommand, UnMountCommand
+    MountCommand, UnMountCommand, GetRow, GetRows, ZFSOutputError
 )
 
 # Create command instances

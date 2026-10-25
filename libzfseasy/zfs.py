@@ -1,6 +1,6 @@
 from libzfseasy.types import InvalidNameError, InvalidValueError, Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as Snapshot, Bookmark, \
      SnapshotRange, Property, Properties
-from typing import Optional, Union, Dict, Iterable, Callable
+from typing import Optional, Union, Dict, Iterable, Callable, NamedTuple
 
 import collections
 import dataclasses
@@ -195,6 +195,54 @@ def _type_problem(name: str, dstype: str, wanted: Optional[set]) -> Optional[str
     if (shape or 'dataset') != ('dataset' if dstype in ('filesystem', 'volume') else dstype):
         return 'name does not match type ' + dstype
     return None
+
+
+class ZFSOutputError(Exception):
+    """zfs output could not be trusted (`zfs.get.rows(..., strict=True)`). Deliberately a plain `Exception` subclass,
+    like every other zfs failure of this library: not a `ValueError` (that means a bad argument) and not an `OSError`."""
+
+
+class GetRow(NamedTuple):
+    """One row of `zfs get -H`, exactly as zfs printed it: `value` and `received` are raw (`-` is not mapped to
+    None; invalid UTF-8 is kept through surrogateescape); `received` is None when the call asked for no `received`
+    column."""
+    name: str
+    property: str
+    value: str
+    received: Optional[str]
+    source: str
+
+
+class GetRows(list):
+    """The rows `zfs.get.rows()` could trust (a list of `GetRow`), with what it could not:
+
+    complete -- True when nothing at all was refused or missing. Every safety decision (a protect set, a prune)
+        must use this, or `strict=True`: an object's rows may be incomplete without anything naming the object.
+    dropped -- frozenset of the names of the objects whose rows were refused as a whole (and, with `verify_names`,
+        of the objects `zfs list` printed that `zfs get` did not). It only names what it can: a stray fragment of a
+        forged value identifies no object, so `dropped` can be empty while `complete` is False. Use it to target
+        a re-read, never to decide that nothing was lost.
+    skipped -- how many rows / objects were refused in all, named or not."""
+
+    def __init__(self, rows=(), skipped: int = 0, dropped=frozenset()):
+        super().__init__(rows)
+        self.skipped = int(skipped)
+        self.dropped = frozenset(dropped)
+
+    @property
+    def complete(self) -> bool:
+        return self.skipped == 0
+
+
+class _Group:
+    """The rows of one object in `zfs get -H` output (see `GetCommand._groups`)."""
+    __slots__ = ('name', 'rows', 'bad', 'dstype')
+
+    def __init__(self, name: str):
+        self.name = name
+        self.rows = []      # (property, value, received, source) in the order zfs printed them
+        self.bad = False    # refused as a whole (already reported)
+        self.dstype = None  # the value of the `type` row
 
 
 class _Scope:
@@ -1482,6 +1530,161 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             skips.done()
 
     @classmethod
+    def rows(cls, ds: Optional[DatasetList] = None, properties: Optional[StringList] = 'all',
+             types: Optional[StringList] = 'all', sources: Optional[StringList] = 'all', recursive: bool = False,
+             depth: int = 0, strict: bool = False, verify_names: bool = True, received: bool = True) -> GetRows:
+        """Read properties as the raw rows zfs printed (`zfs get -H`), for callers that must know whether anything
+        was lost: a list of `GetRow(name, property, value, received, source)` that says whether it is `.complete`.
+
+        Keyword arguments:
+            ds: ZFS | [ZFS] -- objects to read (default None: every dataset)
+            properties: str | [str] -- properties to read (default 'all')
+            types: str | [str] -- object types to read (default 'all')
+            sources: str | [str] -- keep only rows from these sources (default 'all'); the `name` and `type` rows are
+                always kept. `inherited` also matches `inherited from <dataset>`. Filtered here, never by `zfs get -s`
+                (which would drop the `type` rows the checks below need)
+            recursive: bool -- also read the descendants (default False)
+            depth: int -- descendant depth to read (default 0)
+            strict: bool -- raise `ZFSOutputError` instead of returning a result that is not `.complete` (default False)
+            verify_names: bool -- also run a name-only `zfs list -H -o name,type` with the same objects, types, `-r`
+                and `-d`, and refuse any object whose name is not in it (a whole object forged through a value that
+                contains newlines is not there: names cannot contain a tab or newline, so that listing cannot be
+                forged) or that is in it but was not read (default True). Costs a second zfs run
+            received: bool -- also read the `received` column (default True). False sends
+                `-o name,property,value,source` and every `GetRow.received` is None: the column holds raw bytes of
+                whoever sent a dataset, and without it a tab in a value is unambiguous. Safety callers should
+                pass False. With the column, a row with a tab in the value or in the received column is refused
+                (skipped and counted), never guessed at: the hidden received value could otherwise rewrite the
+                reported value
+
+        Returns:
+            A `GetRows`: a list of `GetRow`, in the order zfs printed them, with the attributes `complete` (bool: not
+            a single row or object was refused or missing -- use this, or `strict`, for every safety decision),
+            `dropped` (frozenset of the names of the objects that were refused as a whole, as far as they can be named)
+            and `skipped` (int: how many rows and objects were refused in all). Values are raw: `-` is not mapped to
+            None, and invalid UTF-8 is kept (surrogateescape). Each object's rows include its `type` row (and, for a
+            property list, its `name` row), as zfs printed them. A name libzfseasy cannot represent is kept like any
+            other: nothing is built here, and dropping such a descendant could hide something that protects data.
+
+        The checks are those of `get()`: a row that is too short or ambiguous, an invalid property name, a name
+        outside the requested objects / depth, an object whose rows do not start with the rows zfs prints first, a
+        property twice for one object, an object that does not have a valid `type`, and an object whose rows are not
+        contiguous (every group of that name is dropped). With an explicit property list a group that contains a
+        property that was not requested is dropped as well: a forged copy of a requested property is a duplicate and
+        any other property is unrequested. Everything refused is logged as `get()` does. With `'all'` a value that
+        contains newlines can still forge extra rows inside its own object's group (never another object's). An
+        explicit list closes in-group forging only with `received=False`: with the `received` column, the sender's
+        raw bytes sit in a column the caller does not read, and a tab in it is refused rather than interpreted.
+
+        Residual race of `verify_names`: `zfs get` and `zfs list` are two runs. An object forged by a value, whose
+        name becomes a real object between the two runs, passes the cross-check; it can only add rows for an
+        object that exists, never remove any, so a protect set built from the rows can only grow.
+
+        Raises:
+            ValueError -- an invalid argument, before zfs runs
+            ZFSOutputError -- `strict` and the result is not complete (raised after zfs has exited)
+            Exception -- zfs failed (a non-zero exit takes precedence), with zfs's stderr as the message
+        """
+        # Validate.source accepts any case, so compare lowercased (`get()` compares the raw strings: a pre-existing
+        # quirk that is left alone there, so `sources='Local'` filters out everything).
+        sources = [str(x).lower() for x in cls._slist_to_list(sources, validator=Validate.source)]
+        # An empty `types` would leave `-t` off `zfs get` but also off `zfs list`, whose default is not the same set:
+        # always send an explicit `-t`, to both.
+        types = cls._slist_to_list(types, validator=Validate.type) or ['all']
+        wanted = _wanted_types(types)
+        types = ','.join(str(t) for t in types)
+        properties = cls._slist_to_list(properties, validator=Validate.attribute)
+        datasets = [str(d) for d in cls._zlist_to_list(ds)]
+        columns = 'name,property,value,received,source' if received else 'name,property,value,source'
+        cmd = [_zfs_cmd(), 'get', '-H', '-o', columns] + \
+            cls._get_options(recursive=recursive, depth=depth, types=types, properties=properties, datasets=datasets)
+        scope = _Scope(datasets, recursive=recursive, depth=depth)
+        lead = cls._lead_properties(properties)
+        # The properties zfs can print for this call: every one it was asked for, `name` and `type` (the lead rows).
+        allowed = None if 'all' in properties else set(properties) | set(lead)
+
+        skips = _SkippedRows('get')
+        twice = set()
+        kept = []
+        dropped = set()
+        for group in cls._groups(cls._exec_lines(cmd), skips, scope=scope, twice=twice, lead=lead, allowed=allowed,
+                                 received=received, exact=received):
+            problem = None
+            if group.bad:
+                dropped.add(group.name)
+                continue
+            if group.dstype is None:
+                problem = 'no type row for %r' % _clip(group.name)
+            else:
+                problem = _type_problem(group.name, group.dstype, wanted)
+                if problem is not None:
+                    problem = '%s (%r)' % (problem, _clip(group.name))
+            if problem is not None:
+                skips.skip(problem)
+                dropped.add(group.name)
+                continue
+            kept.append(group)
+        # A name that came back was forged somewhere: neither of its groups can be trusted.
+        dropped |= twice
+        kept = [g for g in kept if g.name not in twice]
+
+        extra_skipped, extra_first = 0, None
+        if verify_names:
+            listed, list_skips = cls._listed_names(recursive, depth, types, datasets, scope, wanted)
+            extra_skipped += list_skips.total
+            extra_first = list_skips.first_problem
+            for group in kept:
+                if group.name not in listed:
+                    skips.skip('%r is not in the zfs list of the same objects' % _clip(group.name))
+            kept = [g for g in kept if g.name in listed]
+            read = {g.name for g in kept}
+            # A name that is not an object (forged) is not worth naming: only real objects can be re-read.
+            dropped &= listed
+            for name in sorted(listed - read - dropped):
+                skips.skip('%r was listed by zfs list but not read by zfs get' % _clip(name))
+                dropped.add(name)
+        skips.done()
+
+        result = []
+        for group in kept:
+            for prop, value, rcv, source in group.rows:
+                if prop in ('name', 'type') or 'all' in sources or source in sources or \
+                        ('inherited' in sources and source.startswith('inherited from ')):
+                    result.append(GetRow(group.name, prop, value, rcv, source))
+        total = skips.total + extra_skipped
+        if strict and total:
+            raise ZFSOutputError('zfs get output could not be trusted: %d row%s skipped, the first: %s' % (
+                total, '' if total == 1 else 's', skips.first_problem or extra_first))
+        return GetRows(result, skipped=total, dropped=dropped)
+
+    @classmethod
+    def _listed_names(cls, recursive, depth, types, datasets, scope, wanted):
+        """The names a name-only `zfs list -H -o name,type` prints for the same objects, types, `-r` and `-d` as a
+        `zfs get`, and the `_SkippedRows` of the lines that were not `name<TAB>type`. Names are not built into
+        objects, so a name libzfseasy cannot represent is a name like any other. Raises when zfs fails."""
+        cmd = [_zfs_cmd(), 'list', '-H', '-o', 'name,type'] + \
+            cls._scope_options(recursive=recursive, depth=depth, types=types) + list(datasets)
+        skips = _SkippedRows('list')
+        names = set()
+        for line in cls._exec_lines(cmd):
+            if not line:
+                continue
+            cols = line.split('\t')
+            if len(cols) != 2:
+                skips.skip('expected 2 columns, got %d' % len(cols), line)
+                continue
+            name, dstype = cols
+            problem = _type_problem(name, dstype, wanted)
+            if problem is None and not scope(name):
+                problem = 'name outside the requested objects'
+            if problem is not None:
+                skips.skip(problem, line)
+                continue
+            names.add(name)
+        skips.done()
+        return names, skips
+
+    @classmethod
     def value(cls, ds: Union[ZFS, str], prop: str, sources: Optional[StringList] = None,
               raw: bool = False) -> Optional[str]:
         """Read one property of one object, framing-safe whatever the value contains
@@ -1531,7 +1734,9 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         return value
 
     @staticmethod
-    def _get_options(**kwargs):
+    def _scope_options(**kwargs):
+        """The `-r`, `-d` and `-t` flags: the ones `zfs get` and the name-only `zfs list` of `rows(verify_names=True)`
+        must both be given, so that they iterate the same objects."""
         cmd = []
         if kwargs.get('recursive', False):
             cmd += ['-r']
@@ -1542,6 +1747,11 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         types = kwargs.get('types')
         if types:
             cmd += ['-t', types]
+        return cmd
+
+    @staticmethod
+    def _get_options(**kwargs):
+        cmd = GetCommand._scope_options(**kwargs)
 
         properties = kwargs.get('properties')
         if 'all' in properties:
@@ -1566,16 +1776,28 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         return _LEAD_ALL if 'all' in properties else _LEAD_LIST
 
     @staticmethod
-    def _split_row(line: str, skips: _SkippedRows):
-        """Split one `name,property,value,received,source` row, recovering a value that contains tabs when that is
-        unambiguous; None (with a warning) otherwise."""
+    def _split_row(line: str, skips: _SkippedRows, received: bool = True, exact: bool = False):
+        """Split one `name,property,value,received,source` row (`name,property,value,source` when `received` is
+        False, and then `received` comes back None), recovering a value that contains tabs when that is unambiguous;
+        None (with a warning) otherwise. With `exact` (which `rows()` uses) a row with more than five columns is
+        never recovered: a tab in the value or the received column makes the split a guess, and a guess lets the
+        hidden received column rewrite the value."""
         cols = line.split('\t')
+        if not received:
+            if len(cols) < 4:
+                skips.skip('expected 4 columns, got %d' % len(cols), line)
+                return None
+            # Name, property and source cannot contain a tab: whatever lies between them is the value.
+            return cols[0], cols[1], '\t'.join(cols[2:-1]), None, cols[-1]
         if len(cols) < 5:
             skips.skip('expected 5 columns, got %d' % len(cols), line)
             return None
         name, prop, source, middle = cols[0], cols[1], cols[-1], cols[2:-1]
         if len(middle) == 2:
             return name, prop, middle[0], middle[1], source
+        if exact:
+            skips.skip('a tab in the value or received column makes the row ambiguous', line)
+            return None
         # `middle` is value + tab + received, and the value and/or the received value contain tabs. The split is
         # trusted only where exactly one split gives a `-` received column or a received column equal to the value
         # (and, for a `received` source, only the latter).
@@ -1590,29 +1812,34 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         return (name, prop) + candidates[0] + (source,)
 
     @staticmethod
-    def _lines_to_objects(lines, sources, skips: Optional[_SkippedRows] = None,
-                          scope: Optional[Callable[[str], bool]] = None, types: Optional[set] = None,
-                          twice: Optional[set] = None, lead: tuple = _LEAD_ALL) -> Iterable[Optional[ZFS]]:
-        """Group `zfs get -H -o name,property,value,received,source` rows into objects. Rows that cannot be trusted
-        are skipped (see `GetCommand.__call__`). An object whose rows are not contiguous is never yielded again,
-        and its name is added to `twice` so a caller holding the whole result can drop the earlier one as well.
+    def _groups(lines, skips: _SkippedRows, scope: Optional[Callable[[str], bool]] = None,
+                twice: Optional[set] = None, lead: tuple = _LEAD_ALL, allowed: Optional[set] = None,
+                received: bool = True, exact: bool = False) -> Iterable[_Group]:
+        """Group `zfs get -H` rows by object, applying every check that does not depend on what the caller wants to
+        do with the rows: a row that is too short or ambiguous, a name outside `scope`, an invalid property name; and
+        per group the lead rule, contiguity, a property twice, and (with `allowed`, the properties that were
+        requested, `name` and `type` included) a property nobody asked for. A group that fails a check is still
+        yielded, with `bad` set (already reported), so that a caller can name it. A group is yielded when the next
+        one starts, so the caller's own warnings keep their order.
 
         `lead` is the property sequence zfs prints first for every object (`GetCommand._lead_properties`). A group
         whose first rows differ is dropped whole: rows forged (through a value containing newlines) for the object
         zfs prints next would otherwise merge into its real group, but any forged prefix either does not start with
-        the lead rows or repeats them, and the real group's own lead rows then repeat or follow it."""
-        if skips is None:
-            skips = _SkippedRows('get')
+        the lead rows or repeats them, and the real group's own lead rows then repeat or follow it.
+
+        A name that comes back after another object's rows is not contiguous: the group is bad and the name is added
+        to `twice`, so a caller holding the whole result can drop the earlier group as well."""
         seen = set()
-        dsname, properties, props_seen, bad = None, {}, set(), False
+        group = None
+        props_seen = set()
         nrows = 0
         for line in lines:
             if not line:
                 continue
-            row = GetCommand._split_row(line, skips)
+            row = GetCommand._split_row(line, skips, received, exact)
             if row is None:
                 continue
-            name, prop, value, received, source = row
+            name, prop, value, received_value, source = row
             if scope is not None and not scope(name):
                 skips.skip('name outside the requested objects', line)
                 continue
@@ -1621,38 +1848,64 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             except ValueError:
                 skips.skip('invalid property name', line)
                 continue
-            if name != dsname:
-                if dsname is not None:
-                    obj = GetCommand._finish(dsname, properties, bad, skips, types)
-                    if obj is not None:
-                        yield obj
-                    seen.add(dsname)
-                dsname, properties, props_seen, bad = name, {}, set(), False
+            if group is None or name != group.name:
+                if group is not None:
+                    yield group
+                    seen.add(group.name)
+                group = _Group(name)
+                props_seen = set()
                 nrows = 0
                 if name in seen:
                     # zfs prints all of an object's rows together: a name that comes back was forged.
                     if twice is not None:
                         twice.add(name)
                     skips.skip('the rows of %r are not contiguous' % _clip(name))
-                    bad = True
+                    group.bad = True
             if nrows < len(lead) and prop != lead[nrows]:
-                if not bad:
+                if not group.bad:
                     skips.skip('the rows of %r do not start with the %r row zfs prints first (got %r)'
                                % (_clip(name), lead[nrows], _clip(prop)))
-                bad = True
+                group.bad = True
             nrows += 1
             if prop in props_seen:
-                if not bad:
+                if not group.bad:
                     skips.skip('property %r appears twice for %r' % (_clip(prop), _clip(name)))
-                bad = True
+                group.bad = True
+            elif allowed is not None and prop not in allowed:
+                if not group.bad:
+                    skips.skip('property %r of %r was not requested' % (_clip(prop), _clip(name)))
+                group.bad = True
             props_seen.add(prop)
+            group.rows.append((prop, value, received_value, source))
             if prop == 'type':
-                properties[prop] = value
-            elif 'all' in sources or source in sources or \
-                    ('inherited' in sources and source.startswith('inherited from ')):
-                properties[prop] = Property(value, source, received)
-        if dsname is not None:
-            obj = GetCommand._finish(dsname, properties, bad, skips, types)
+                group.dstype = value
+        if group is not None:
+            yield group
+
+    @staticmethod
+    def _lines_to_objects(lines, sources, skips: Optional[_SkippedRows] = None,
+                          scope: Optional[Callable[[str], bool]] = None, types: Optional[set] = None,
+                          twice: Optional[set] = None, lead: tuple = _LEAD_ALL) -> Iterable[Optional[ZFS]]:
+        """Group `zfs get -H -o name,property,value,received,source` rows into objects. Rows that cannot be trusted
+        are skipped (see `GetCommand.__call__`). An object whose rows are not contiguous is never yielded again,
+        and its name is added to `twice` so a caller holding the whole result can drop the earlier one as well.
+        The checks are those of `_groups`, which `rows()` shares."""
+        if skips is None:
+            skips = _SkippedRows('get')
+        # Deliberately no `allowed=`: `rows()` drops a group that holds a property nobody requested, but `get()` does
+        # not, until a real-tier check shows zfs never prints a property name other than the one that was requested
+        # (`userquota@`, `written@` forms, aliases, case).
+        for group in GetCommand._groups(lines, skips, scope=scope, twice=twice, lead=lead):
+            if group.bad:
+                continue
+            properties = {}
+            for prop, value, received, source in group.rows:
+                if prop == 'type':
+                    properties[prop] = value
+                elif 'all' in sources or source in sources or \
+                        ('inherited' in sources and source.startswith('inherited from ')):
+                    properties[prop] = Property(value, source, received)
+            obj = GetCommand._finish(group.name, properties, False, skips, types)
             if obj is not None:
                 yield obj
 
