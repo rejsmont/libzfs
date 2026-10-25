@@ -3187,6 +3187,55 @@ class TestClientTlsProblem:
         assert "expires on" in problems[0] and "identity rotate" in problems[0]
         assert re.search(r"in (9|10) day\(s\)", problems[0])
 
+    def test_the_expiry_message_is_the_one_identity_decides(self, tmp_path):
+        """S-12: the daemon and the remote worker's daily check share one wording
+        (`identity.client_cert_expiry_problem`); the daemon adds nothing and rewords nothing."""
+        from zfsbackup import identity as identity_module
+
+        tls = self._tls(tmp_path)
+        ident = _tls_identity(tls)
+        soon = ident.not_after - timedelta(days=10)
+        problems, loaded = self._problems(_remote_cfg(), "host-1", tls, now=soon)
+        level, message = identity_module.client_cert_expiry_problem(
+            tls / "client.crt", loaded.not_after, soon
+        )
+        assert level == logging.WARNING
+        assert problems == [message]
+
+    def test_the_daemon_asks_identity_with_the_cert_path_its_not_after_and_now(self, tmp_path, mocker):
+        from zfsbackup import identity as identity_module
+
+        tls = self._tls(tmp_path)
+        ident = _tls_identity(tls)
+        soon = ident.not_after - timedelta(days=10)
+        spy = mocker.spy(identity_module, "client_cert_expiry_problem")
+        self._problems(_remote_cfg(), "host-1", tls, now=soon)
+        spy.assert_called_once_with(tls / "client.crt", ident.not_after, soon)
+
+    def test_the_configured_certificate_path_is_named_in_the_message(self, tmp_path):
+        from zfsbackup import identity as identity_module
+
+        other = tmp_path / "elsewhere"
+        ident = _tls_identity(other)
+        config = _remote_cfg(client_cert_file=other / "client.crt", client_key_file=other / "client.key")
+        soon = ident.not_after - timedelta(days=10)
+        problems, loaded = self._problems(config, "host-1", self._tls(tmp_path), now=soon)
+        assert problems == [identity_module.client_cert_expiry_problem(
+            other / "client.crt", ident.not_after, soon)[1]]
+        assert str(other / "client.crt") in problems[0]
+
+    def test_the_window_is_identitys_thirty_days(self, tmp_path):
+        from zfsbackup import identity as identity_module
+
+        assert daemon_module.CLIENT_CERT_EXPIRY_WARN_DAYS == identity_module.CLIENT_CERT_EXPIRY_WARN_DAYS == 30
+        tls = self._tls(tmp_path)
+        ident = _tls_identity(tls)
+        edge = timedelta(days=30)
+        assert self._problems(_remote_cfg(), "host-1", tls, now=ident.not_after - edge)[0] == []
+        inside = self._problems(_remote_cfg(), "host-1", tls,
+                                now=ident.not_after - edge + timedelta(seconds=1))[0]
+        assert len(inside) == 1 and "(in 29 day(s))" in inside[0]
+
     def test_a_certificate_more_than_30_days_from_expiry_is_clean(self, tmp_path):
         tls = self._tls(tmp_path)
         ident = _tls_identity(tls)

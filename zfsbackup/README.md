@@ -96,7 +96,11 @@ send, and sends are not rate limited either.
 Snapshot names carry UTC time and retention, lag and the "clock behind" check all read it, so every host
 needs NTP (`timedatectl` should say "System clock synchronized: yes"). A snapshot dated more than
 `max(5 minutes, check_interval)` in the future is treated as a clock problem: it is logged once at ERROR,
-the dataset is treated as due, and `check` reports CRIT. TLS certificates are checked against the clock too.
+the dataset is treated as due, and `check` reports CRIT. TLS certificates are checked against the clock too:
+a server refusing a client certificate as expired or not yet valid logs one WARNING per client address per
+hour (`API: TLS client … refused: …`), and a client whose own certificate expires within 30 days, or has
+expired, logs a WARNING (an ERROR once expired) at startup, on every reload and once a day. A wrong clock on
+either side shows up as these messages; fix the clock before rotating or re-enrolling.
 
 ## Configuration
 

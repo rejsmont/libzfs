@@ -133,6 +133,9 @@ __all__ = [
     "Identity",
     "IdentityError",
     "IdentityChanged",
+    "CLIENT_CERT_EXPIRY_WARN_DAYS",
+    "client_cert_not_after",
+    "client_cert_expiry_problem",
     "CertInfo",
     "ClientCertInfo",
     "ensure_identity",
@@ -697,6 +700,44 @@ def peek_identity(directory: Union[str, Path], name: str) -> Optional[CertInfo]:
         not_after=cert.not_valid_after_utc,
         subject=cert.subject.rfc4514_string(),
     )
+
+
+#: A client certificate that expires within this many days is reported by
+#: `client_cert_expiry_problem` (the daemon's start/reload check and the
+#: remote worker's daily check).
+CLIENT_CERT_EXPIRY_WARN_DAYS = 30
+
+
+def client_cert_not_after(cert_path: Union[str, Path]) -> datetime:
+    """The `not_after` (timezone-aware UTC) of the first certificate in
+    `cert_path`, without touching any key, so an expired certificate -- which
+    `load_identity` refuses -- can still be described. Raises `IdentityError`
+    when the file is missing, unreadable or not PEM."""
+    return _load_cert_file(Path(cert_path)).not_valid_after_utc
+
+
+def client_cert_expiry_problem(
+    cert_path: Union[str, Path], not_after: datetime, now: Optional[datetime] = None,
+) -> Optional[Tuple[int, str]]:
+    """`(logging level, message)` when the client certificate `cert_path`
+    has expired (`logging.ERROR`) or expires within
+    `CLIENT_CERT_EXPIRY_WARN_DAYS` (`logging.WARNING`), else `None`. Pure:
+    nothing is read or logged. `now` defaults to the current time (naive
+    values are taken as UTC)."""
+    left = not_after - _now(now)
+    when = f"{not_after:%Y-%m-%d %H:%M} UTC"
+    if left < timedelta(0):
+        return logging.ERROR, (
+            f"the client certificate {cert_path} expired on {when}; remote backups "
+            "fail until it is replaced (`identity rotate` needs a valid certificate: "
+            "enroll again with a new token, `zfsbackup-config enroll DESTINATION ...`)"
+        )
+    if left < timedelta(days=CLIENT_CERT_EXPIRY_WARN_DAYS):
+        return logging.WARNING, (
+            f"the client certificate {cert_path} expires on {when} (in "
+            f"{max(left.days, 0)} day(s)); rotate it: `zfsbackup-config identity rotate`"
+        )
+    return None
 
 
 # --------------------------------------------------------------------------

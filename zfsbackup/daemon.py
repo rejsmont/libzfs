@@ -34,7 +34,7 @@ import sys  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -293,8 +293,9 @@ def _probe_api_bind(host: str, port: int) -> Optional[str]:
 
 
 #: A client certificate expiring within this many days is warned about
-#: (`_client_tls_problem`).
-CLIENT_CERT_EXPIRY_WARN_DAYS = 30
+#: (`_client_tls_problem`); the one definition is `identity`'s, shared with
+#: the remote worker's daily check.
+CLIENT_CERT_EXPIRY_WARN_DAYS = identity.CLIENT_CERT_EXPIRY_WARN_DAYS
 
 
 def _tls_dir(resolved) -> Optional[Path]:
@@ -405,16 +406,9 @@ def _client_tls_problem(
         except identity.IdentityError as e:
             problems.append(f"the client TLS identity cannot be used: {e}")
         else:
-            moment = now or datetime.now(timezone.utc)
-            if moment.tzinfo is None:
-                moment = moment.replace(tzinfo=timezone.utc)
-            left = loaded.not_after - moment
-            if left < timedelta(days=CLIENT_CERT_EXPIRY_WARN_DAYS):
-                problems.append(
-                    f"the client certificate {cert} expires on "
-                    f"{loaded.not_after:%Y-%m-%d %H:%M} UTC (in {max(left.days, 0)} "
-                    "day(s)); rotate it: `zfsbackup-config identity rotate`"
-                )
+            expiry = identity.client_cert_expiry_problem(cert, loaded.not_after, now)
+            if expiry is not None:
+                problems.append(expiry[1])
     unenrolled = [
         name for name in _remote_destinations(config)
         if (dest := config.destinations.get(name)) is not None

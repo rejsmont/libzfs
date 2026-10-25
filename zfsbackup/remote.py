@@ -66,6 +66,10 @@ WS_CONNECT_TIMEOUT = 30
 #: single stream byte is sent.
 CONNECT_RETRY_DELAYS = (1.0, 2.0, 4.0)
 
+#: S-12: the client certificate's expiry is checked at most this often
+#: (seconds) per `RemoteBackupManager`, at the start of a cycle.
+CLIENT_CERT_EXPIRY_CHECK_EVERY = 24 * 3600.0
+
 #: A retry wait is taken in slices of this many seconds, so a stop is noticed.
 CONNECT_RETRY_SLICE = 0.25
 #: No progress on one socket operation (a `send_binary`, or the server's
@@ -496,13 +500,48 @@ class RemoteBackupManager:
         # destination name -> (transport key, usable) for this cycle.
         self._checked: Dict[str, Tuple[Tuple[str, str], bool]] = {}
         self._per_cycle = False
+        # `time.monotonic()` of the last client certificate expiry check
+        # (`None`: not yet), see `_check_client_cert_expiry`.
+        self._expiry_checked_at: Optional[float] = None
 
     def begin_cycle(self) -> None:
         """Start a new pass over the datasets: forget this cycle's
-        `/whoami` results, and retry a client identity that failed to load."""
+        `/whoami` results, retry a client identity that failed to load, and
+        (at most once every `CLIENT_CERT_EXPIRY_CHECK_EVERY`) report a client
+        certificate that is expired or about to expire."""
         self._per_cycle = True
         self._checked.clear()
         self._identity_failed_sig = None
+        self._check_client_cert_expiry()
+
+    def _check_client_cert_expiry(self) -> None:
+        """S-12: a WARNING within `CLIENT_CERT_EXPIRY_WARN_DAYS` of the client
+        certificate's expiry, an ERROR once it has expired (the identity load
+        then fails and is logged once; this repeats the reminder daily). Reads
+        the certificate only, never the key, and never raises. The first call
+        of a manager checks; later ones at most once per
+        `CLIENT_CERT_EXPIRY_CHECK_EVERY` seconds, whether or not it found
+        anything."""
+        now = time.monotonic()
+        if (
+            self._expiry_checked_at is not None
+            and now - self._expiry_checked_at < CLIENT_CERT_EXPIRY_CHECK_EVERY
+        ):
+            return
+        self._expiry_checked_at = now
+        try:
+            cert_path, _ = self._identity_paths()
+            if not os.path.lexists(cert_path):
+                return  # not enrolled yet: `_client_identity` says so
+            problem = ident.client_cert_expiry_problem(
+                cert_path, ident.client_cert_not_after(cert_path)
+            )
+        except Exception as e:  # advisory only
+            logger.debug(f"client certificate expiry check failed: {e}")
+            return
+        if problem is not None:
+            level, message = problem
+            logger.log(level, message)
 
     def close(self) -> None:
         """Close every pinned session (idempotent)."""

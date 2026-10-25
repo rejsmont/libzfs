@@ -229,6 +229,10 @@ holds before and after B-2a, the S-8 contract, B-6 first without status files, C
    - **S-3: the R0 pending map is evicted globally** (LRU, 4096 entries): an enrolled client negotiating thousands
      of names can evict other clients' entries (their next stream is refused with "negotiate again", retryable).
      Out of scope under Q1, but cap it per client id when S-3 adds per-client limits.
+   - **S-3: fold in S-12's validity WARNING** (from the S-12 review, 2026-10-25): `_ValidityWarnThrottle` bounds
+     memory (256 peers) but not log volume; a holder of a former client's expired pinned certificate (its key is
+     not needed: the certificate is checked before the possession proof) cycling through source addresses logs one
+     WARNING per connection. Expired pins stay in the trust store. Give it S-3's global per-interval cap.
    - **Deferred from the B-2b reviews (2026-10-22):** (a) `-F` is decided from a listing but applied by the kernel at
      the end of the receive, so a snapshot that appears on the server copy mid-receive (an operator's `zfs snapshot
      -r`, or an orphaned `zfs receive` of a previous API worker committing late) is destroyed unpermitted; fix by

@@ -318,44 +318,6 @@ def _clean_db_engine_cache():
 
 
 @pytest.fixture(autouse=True)
-def _restore_store_logger_filters():
-    """Strips `zfsbackup.api._RepeatFilter` from the config store's loggers
-    after every test (and before, for a filter a non-test import left behind).
-
-    WORKAROUND for product global state: `api.dedupe_store_warnings()` (called
-    by `ApiWorker.run`, `workers.py`) permanently installs a `_RepeatFilter` on
-    the process-wide `zfsbackup.config.store.paths` / `.db` loggers, "once per
-    process", because in production `run()` is the body of a worker process.
-    A test that calls `ApiWorker.run()` inline therefore installs it in the
-    pytest process for the rest of the session, and the filter drops any later
-    WARNING whose text was already seen within an hour -- so a later test that
-    asserts "this warning was logged N times" sees fewer (observed:
-    `TestJournalModeByEngineRole::test_every_flip_flop_is_reported_once`,
-    `..._a_forked_child_warns_on_its_own...`, and
-    `TestBusyTimeoutPerAttempt::test_a_failing_restore_does_not_stop_the_busy_retries`
-    in the full suite, never alone). Generic on purpose: every current and
-    future inline `ApiWorker.run()` test is covered, not just the ones that
-    were found polluting. Looks `zfsbackup.api` up in `sys.modules` so
-    libzfseasy-only runs pay nothing.
-    """
-    import logging
-    import sys
-
-    def strip():
-        api = sys.modules.get("zfsbackup.api")
-        if api is None:
-            return
-        for name in api._STORE_LOGGERS:
-            lg = logging.getLogger(name)
-            for f in [f for f in lg.filters if isinstance(f, api._RepeatFilter)]:
-                lg.removeFilter(f)
-
-    strip()
-    yield
-    strip()
-
-
-@pytest.fixture(autouse=True)
 def _never_run_a_real_zfs(request, monkeypatch):
     """Fails any test (outside the `real_zfs` tier) whose code starts a process
     that is a real `zfs` or `zpool`: a compiled program named `zfs` / `zpool`, or

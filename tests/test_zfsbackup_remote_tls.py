@@ -16,6 +16,9 @@ and `test_zfsbackup_remote_timeouts.py` (they hand the methods a fake `_Transpor
   manager; a failed load is logged once per distinct message and retried.
 * `begin_cycle`: one `/whoami` per destination per cycle, a retry of a failed identity load, and what a
   manager used without it does.
+* `TestClientCertExpiryCheck` (S-12): `begin_cycle` reports a client certificate that expires within 30
+  days (WARNING) or has expired (ERROR) on a manager's first cycle and then every 24 h, from the
+  certificate alone (so also when the identity cannot load); silent for a missing file, DEBUG otherwise.
 * Real TLS, end to end (`TestRealTls`, `integration`): the manager against a real `ApiWorker` with real
   handshakes -- a successful pinned-mTLS backup, an impostor server, a revoked client, a client id that
   does not match, an identity rotated under a running manager. Server-side zfs is replaced in memory
@@ -866,10 +869,22 @@ class TestIdentityErrors:
                 for dest in ("offsite", "dc2"):
                     assert rig.run(index, dest) is False
         got = errors(caplog)
-        assert len(got) == 1 and got[0].startswith(self.PREFIX) and text in got[0]
+        if how == "break_expired":
+            # S-12: the first cycle logs the expiry reminder AND the identity-load error, the
+            # expiry first (it runs at the start of the cycle). The second cycle, moments later,
+            # repeats neither as an ERROR: the load error drops to DEBUG and the expiry reminder
+            # waits for its daily slot (`TestClientCertExpiryCheck`).
+            assert len(got) == 2
+            expiry, load = got
+            assert expiry.startswith("the client certificate ") and "expired on" in expiry
+            assert load.startswith(self.PREFIX) and text in load
+            assert [lv for lv, m in own(caplog) if m == expiry] == ["ERROR"]
+        else:
+            assert len(got) == 1 and got[0].startswith(self.PREFIX) and text in got[0]
+            load = got[0]
         # logged by the first failed load; not again for the other datasets and destinations of the
         # cycle (the failure is remembered), once more at DEBUG when the next cycle retries
-        assert [lv for lv, m in own(caplog) if m == got[0]] == ["ERROR", "DEBUG"]
+        assert [lv for lv, m in own(caplog) if m == load] == ["ERROR", "DEBUG"]
         assert rig.http_count == 0
         rig.assert_nothing_sent()
 
@@ -2292,6 +2307,315 @@ class TestBeginCycle:
         rig.mgr.close()
         assert rig.cycle() is True
         assert "offsite" in rig.mgr._transports
+
+
+class TestClientCertExpiryCheck:
+    """S-12 (2): `begin_cycle` -> `_check_client_cert_expiry`. On the first cycle of a manager and
+    then at most every `CLIENT_CERT_EXPIRY_CHECK_EVERY` (24 h, monotonic): a WARNING when the client
+    certificate expires within `CLIENT_CERT_EXPIRY_WARN_DAYS`, an ERROR once it has expired, nothing
+    for a certificate that is far from expiry or for a file that does not exist, DEBUG for any other
+    failure. It reads the certificate only, so it runs when the identity cannot be loaded too."""
+
+    @pytest.fixture
+    def clock(self, mocker):
+        from _clock_support import FakeTime
+
+        fake = FakeTime()
+        mocker.patch.object(remote, "time", fake)
+        return fake
+
+    @staticmethod
+    def cert(client_tls_dir, *, expires_in=None, expired_ago=None):
+        """Replace the client certificate (and key) in `client_tls_dir`; -> the `ClientCert`."""
+        import datetime as dt
+        from _api_support import make_client_cert
+
+        now = dt.datetime.now(dt.timezone.utc)
+        if expired_ago is not None:
+            made = make_client_cert(not_before=now - expired_ago - dt.timedelta(days=30),
+                                    not_after=now - expired_ago)
+        else:
+            made = make_client_cert(not_before=now - dt.timedelta(hours=1),
+                                    not_after=now + expires_in)
+        write_identity_files(client_tls_dir, made)
+        return made
+
+    @staticmethod
+    def reminders(caplog):
+        """`[(level, message)]` of the expiry reminders (WARNING/ERROR) the manager logged."""
+        return [(lv, m) for lv, m in own(caplog)
+                if lv in ("WARNING", "ERROR") and m.startswith("the client certificate ")]
+
+    @staticmethod
+    def expected(path, made):
+        return ident.client_cert_expiry_problem(path, made.not_after)
+
+    def test_the_constants(self):
+        assert remote.CLIENT_CERT_EXPIRY_CHECK_EVERY == 24 * 3600.0
+        assert ident.CLIENT_CERT_EXPIRY_WARN_DAYS == 30
+
+    # -- within the warning window ---------------------------------------------------------
+
+    def test_within_thirty_days_the_first_cycle_warns_once(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        made = self.cert(client_tls_dir, expires_in=dt.timedelta(days=10))
+        rig = make_rig()
+        assert rig.cycle() is True                                    # the backup itself goes ahead
+        level, message = self.expected(client_tls_dir / "client.crt", made)
+        assert level == logging.WARNING
+        assert self.reminders(caplog) == [("WARNING", message)]
+        assert str(client_tls_dir / "client.crt") in message and "(in 9 day(s))" in message
+        assert "zfsbackup-config identity rotate" in message
+
+    def test_and_nothing_on_the_later_cycles(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=10))
+        rig = make_rig()
+        for _ in range(6):
+            rig.cycle()
+        assert len(self.reminders(caplog)) == 1
+
+    def test_again_after_twenty_four_hours(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=10))
+        rig = make_rig()
+        rig.cycle()
+        clock.advance(24 * 3600 - 120)
+        rig.cycle()
+        assert len(self.reminders(caplog)) == 1                       # two minutes short of a day
+        clock.advance(180)
+        rig.cycle()
+        assert len(self.reminders(caplog)) == 2
+        rig.cycle()
+        assert len(self.reminders(caplog)) == 2                       # and the next day begins
+        clock.advance(24 * 3600)
+        rig.cycle()
+        assert len(self.reminders(caplog)) == 3
+
+    def test_the_certificate_is_read_once_per_check_not_per_cycle(
+        self, make_rig, client_tls_dir, clock, mocker
+    ):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=10))
+        rig = make_rig()
+        read = mocker.spy(remote.ident, "client_cert_not_after")
+        for _ in range(4):
+            rig.cycle()
+        assert read.call_count == 1
+        clock.advance(24 * 3600 + 1)
+        rig.cycle()
+        assert read.call_count == 2
+
+    def test_the_day_count_follows_the_certificate(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=2, hours=3))
+        make_rig().cycle()
+        assert "(in 2 day(s))" in self.reminders(caplog)[0][1]
+
+    # -- expired ----------------------------------------------------------------------------------
+
+    def test_an_expired_certificate_is_an_error_on_the_first_cycle_and_then_daily(
+        self, make_rig, caplog, client_tls_dir, clock
+    ):
+        import datetime as dt
+        made = self.cert(client_tls_dir, expired_ago=dt.timedelta(days=2))
+        rig = make_rig()
+        rig.cycle()
+        level, message = self.expected(client_tls_dir / "client.crt", made)
+        assert level == logging.ERROR and "expired on" in message
+        assert self.reminders(caplog) == [("ERROR", message)]
+        rig.cycle()
+        rig.cycle()
+        assert len(self.reminders(caplog)) == 1
+        clock.advance(24 * 3600 + 1)
+        rig.cycle()
+        assert self.reminders(caplog) == [("ERROR", message)] * 2
+        clock.advance(24 * 3600 + 1)
+        rig.cycle()
+        assert self.reminders(caplog) == [("ERROR", message)] * 3
+
+    def test_the_identity_load_error_is_logged_once_while_the_expiry_error_repeats_daily(
+        self, make_rig, caplog, client_tls_dir, clock
+    ):
+        """The decided contract: day one has both ERRORs (expiry, then the load failure); the
+        load failure then drops to DEBUG on every cycle, the expiry ERROR comes back each day."""
+        import datetime as dt
+        self.cert(client_tls_dir, expired_ago=dt.timedelta(days=2))
+        rig = make_rig()
+        prefix = TestIdentityErrors.PREFIX
+        for day in range(3):
+            for _ in range(2):
+                rig.cycle()
+            clock.advance(24 * 3600 + 1)
+        load_levels = [lv for lv, m in own(caplog) if m.startswith(prefix)]
+        assert load_levels.count("ERROR") == 1 and load_levels[0] == "ERROR"
+        assert load_levels.count("DEBUG") == 5
+        assert [lv for lv, m in self.reminders(caplog)] == ["ERROR"] * 3
+        first_error_order = [m for lv, m in own(caplog) if lv == "ERROR"]
+        assert first_error_order[0].startswith("the client certificate ")
+        assert first_error_order[1].startswith(prefix)
+
+    def test_an_expired_certificate_still_skips_every_send(self, make_rig, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expired_ago=dt.timedelta(days=2))
+        rig = make_rig()
+        assert rig.cycle() is False
+        rig.assert_nothing_sent()
+
+    # -- silence ------------------------------------------------------------------------------------
+
+    def test_a_certificate_far_from_expiry_is_silent(self, make_rig, caplog, clock):
+        rig = make_rig()                                              # generated: ten years
+        for _ in range(3):
+            clock.advance(24 * 3600 + 1)
+            assert rig.cycle() is True
+        assert self.reminders(caplog) == []
+        assert not [m for lv, m in own(caplog) if "expiry check" in m]
+
+    def test_thirty_one_days_is_silent(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=31))
+        make_rig().cycle()
+        assert self.reminders(caplog) == []
+
+    def test_a_missing_certificate_file_is_silent_even_at_debug(self, make_rig, caplog, client_tls_dir, clock):
+        os.unlink(client_tls_dir / "client.crt")
+        rig = make_rig()
+        assert rig.cycle() is False                                    # (the identity load says so)
+        assert self.reminders(caplog) == []
+        assert not [m for lv, m in own(caplog) if "expiry check" in m]
+        # the load failure is still reported as before
+        assert any(m.startswith(TestIdentityErrors.PREFIX) for lv, m in own(caplog) if lv == "ERROR")
+
+    def test_a_missing_tls_directory_is_silent(self, make_rig, caplog, tmp_path, clock):
+        rig = make_rig(tls_dir=tmp_path / "absent.tls")
+        rig.mgr.begin_cycle()
+        assert self.reminders(caplog) == []
+        assert not (tmp_path / "absent.tls").exists()
+
+    def test_no_tls_dir_and_no_configured_paths_never_logs_a_reminder(self, make_rig, caplog, clock):
+        rig = make_rig()
+        rig.mgr.tls_dir = None
+        rig.mgr.begin_cycle()                                          # must not raise
+        assert self.reminders(caplog) == []
+        assert [lv for lv, m in own(caplog) if "expiry check" in m] == ["DEBUG"]
+
+    @pytest.mark.parametrize("damage", ["garbage", "armour", "directory"])
+    def test_an_unreadable_or_unparseable_certificate_is_debug_only(
+        self, make_rig, caplog, client_tls_dir, clock, damage
+    ):
+        rig = make_rig()
+        crt = client_tls_dir / "client.crt"
+        if damage == "garbage":
+            crt.write_text("garbage\n")
+        elif damage == "armour":
+            crt.write_text("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+        else:
+            crt.unlink()
+            crt.mkdir()
+        rig.mgr.begin_cycle()                                          # must not raise
+        assert self.reminders(caplog) == []
+        assert [lv for lv, m in own(caplog) if "client certificate expiry check failed" in m] == ["DEBUG"]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads everything")
+    def test_a_certificate_the_process_cannot_read_is_debug_only(self, make_rig, caplog, client_tls_dir, clock):
+        rig = make_rig()
+        crt = client_tls_dir / "client.crt"
+        os.chmod(crt, 0)
+        try:
+            rig.mgr.begin_cycle()
+        finally:
+            os.chmod(crt, 0o640)
+        assert self.reminders(caplog) == []
+        assert [lv for lv, m in own(caplog) if "client certificate expiry check failed" in m] == ["DEBUG"]
+
+    def test_a_failed_check_is_not_retried_before_the_next_day(
+        self, make_rig, client_tls_dir, clock, mocker
+    ):
+        rig = make_rig()
+        (client_tls_dir / "client.crt").write_text("garbage\n")
+        read = mocker.spy(remote.ident, "client_cert_not_after")
+        for _ in range(3):
+            rig.mgr.begin_cycle()
+        assert read.call_count == 1
+
+    def test_an_unexpected_error_in_the_decision_is_swallowed(
+        self, make_rig, caplog, mocker, clock
+    ):
+        mocker.patch.object(remote.ident, "client_cert_expiry_problem", side_effect=RuntimeError("boom"))
+        rig = make_rig()
+        rig.mgr.begin_cycle()                                          # must not raise
+        assert rig.cycle() is True                                     # and the cycle works
+        assert self.reminders(caplog) == []
+        assert any("expiry check failed: boom" in m for lv, m in own(caplog) if lv == "DEBUG")
+
+    # -- independence from the identity load ---------------------------------------------------------
+
+    def test_it_runs_when_the_identity_cannot_load(self, make_rig, caplog, client_tls_dir, clock):
+        """A near-expiry certificate whose private key is unusable (mode 0644): the load fails,
+        the reminder is made all the same."""
+        import datetime as dt
+        made = self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        os.chmod(client_tls_dir / "client.key", 0o644)
+        rig = make_rig()
+        assert rig.cycle() is False
+        assert self.reminders(caplog) == [("WARNING", self.expected(client_tls_dir / "client.crt", made)[1])]
+        assert any("readable by everyone" in m for lv, m in own(caplog) if lv == "ERROR")
+
+    def test_it_runs_when_the_key_is_missing(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        os.unlink(client_tls_dir / "client.key")
+        rig = make_rig()
+        rig.mgr.begin_cycle()
+        assert len(self.reminders(caplog)) == 1
+
+    def test_it_runs_without_the_identity_ever_being_requested(self, make_rig, caplog, client_tls_dir, clock):
+        """`begin_cycle` alone (no dataset processed yet) is enough."""
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        rig = make_rig()
+        rig.mgr.begin_cycle()
+        assert len(self.reminders(caplog)) == 1
+        rig.assert_nothing_sent()
+
+    def test_a_manager_used_without_begin_cycle_never_checks(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        rig = make_rig()
+        rig.run()
+        rig.run()
+        assert self.reminders(caplog) == []
+
+    def test_each_manager_has_its_own_first_check(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        make_rig().mgr.begin_cycle()
+        make_rig().mgr.begin_cycle()
+        assert len(self.reminders(caplog)) == 2
+
+    def test_it_checks_the_configured_certificate_not_the_tls_dir_one(
+        self, make_rig, caplog, tmp_path, client_tls_dir, clock
+    ):
+        import datetime as dt
+        from _api_support import make_client_cert
+
+        now = dt.datetime.now(dt.timezone.utc)
+        near = make_client_cert(not_before=now - dt.timedelta(hours=1), not_after=now + dt.timedelta(days=4))
+        write_identity_files(tmp_path / "custom.tls", near)
+        rig = make_rig(client_cert_file=tmp_path / "custom.tls" / "client.crt",
+                       client_key_file=tmp_path / "custom.tls" / "client.key")
+        rig.mgr.begin_cycle()
+        (_, message), = self.reminders(caplog)
+        assert str(tmp_path / "custom.tls" / "client.crt") in message
+        assert str(client_tls_dir) not in message
+
+    def test_the_reminder_goes_to_the_remote_logger(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        make_rig().mgr.begin_cycle()
+        records = [r for r in caplog.records if r.getMessage().startswith("the client certificate ")]
+        assert [r.name for r in records] == ["zfsbackup.remote"]
 
 
 # ---------------------------------------------------------------------------

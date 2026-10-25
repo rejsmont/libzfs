@@ -747,6 +747,47 @@ API_WS_END_TIMEOUT = 2.0
 #: The capacity WARNING is logged at most once per this many seconds.
 _API_FULL_WARN_EVERY = 60.0
 
+#: S-12: a failed handshake whose client certificate is expired or not yet
+#: valid is logged at WARNING at most once per this many seconds per peer IP
+#: (every other handshake failure stays DEBUG).
+API_VALIDITY_WARN_EVERY = 3600.0
+
+#: The most peer IPs `_ValidityWarnThrottle` remembers; past it the least
+#: recently warned one is forgotten.
+API_VALIDITY_WARN_PEERS = 256
+
+#: `ssl.SSLCertVerificationError.verify_code` values (OpenSSL
+#: `X509_V_ERR_CERT_NOT_YET_VALID` / `X509_V_ERR_CERT_HAS_EXPIRED`).
+_X509_CERT_NOT_YET_VALID = 9
+_X509_CERT_HAS_EXPIRED = 10
+
+
+class _ValidityWarnThrottle:
+    """At most one WARNING per peer IP per `every` seconds, over a map of at
+    most `max_peers` IPs (S-12). Thread-safe: handshakes run on their own
+    threads. A flood of distinct IPs cannot grow the map; it evicts the least
+    recently warned entry."""
+
+    def __init__(self, every: float = API_VALIDITY_WARN_EVERY,
+                 max_peers: int = API_VALIDITY_WARN_PEERS) -> None:
+        self._every = every
+        self._max = max_peers
+        self._last: dict = {}
+        self._guard = threading.Lock()
+
+    def allow(self, peer: str) -> bool:
+        now = time.monotonic()
+        with self._guard:
+            last = self._last.get(peer)
+            if last is not None and now - last < self._every:
+                return False
+            self._last.pop(peer, None)  # re-insert last: dict order = recency
+            self._last[peer] = now
+            while len(self._last) > self._max:
+                del self._last[next(iter(self._last))]
+        return True
+
+
 _API_SERVER_CLASS = None
 
 
@@ -1310,6 +1351,7 @@ def _api_server_class():
                 self._anonymous_slots = threading.BoundedSemaphore(max_anonymous)
                 #: Per connection thread: `pinned` (the handler reads it).
                 self.connection_state = threading.local()
+                self._validity_throttle = _ValidityWarnThrottle()
                 self._full_warned_at: Optional[float] = None
                 self._anonymous_full_warned_at: Optional[float] = None
                 # No `ssl_context` here: werkzeug would wrap the listening
@@ -1366,6 +1408,7 @@ def _api_server_class():
                         tls.settimeout(None)
                     except Exception as exc:  # SSLError, TimeoutError, OSError
                         log.debug("API: TLS handshake with %s failed: %s", client_address, exc)
+                        self._warn_certificate_validity(exc, client_address)
                         self._close_after_failed_handshake(tls)
                         return
                     pinned = self._is_pinned(tls)
@@ -1394,6 +1437,34 @@ def _api_server_class():
                             self._anonymous_slots.release()
                 finally:
                     self._slots.release()
+
+            def _warn_certificate_validity(self, exc, client_address) -> None:
+                """S-12: a client whose certificate expired (or is not valid
+                yet) is otherwise invisible, a DEBUG line. One WARNING per
+                peer IP per `API_VALIDITY_WARN_EVERY`; never raises."""
+                try:
+                    if not isinstance(exc, ssl.SSLCertVerificationError):
+                        return
+                    code = getattr(exc, 'verify_code', None)
+                    if code == _X509_CERT_HAS_EXPIRED:
+                        what = (
+                            "its client certificate has expired; the client must "
+                            "enroll again with a new token (check its clock too)"
+                        )
+                    elif code == _X509_CERT_NOT_YET_VALID:
+                        what = (
+                            "its client certificate is not valid yet; check the "
+                            "clocks of the client and of this host"
+                        )
+                    else:
+                        return
+                    peer = str(client_address[0])
+                    if self._validity_throttle.allow(peer):
+                        logging.getLogger(logsetup.PEER_LOGGER).warning(
+                            "API: TLS client %s refused: %s", peer, what
+                        )
+                except Exception:
+                    log.debug("API: validity warning failed", exc_info=True)
 
             def shutdown_request(self, request):
                 # A connection a websocket session took over (its reader was
@@ -1717,33 +1788,39 @@ class ApiWorker(_SupervisorWatch, Process):
             sys.exit(1)
         # The trust poll opens the database every few seconds; the store's
         # preflight would otherwise repeat the same WARNING each time.
-        dedupe_store_warnings()
-        # Throwaway identities of dry-run API workers that died uncleanly.
+        uninstall_dedupe = dedupe_store_warnings()
         try:
-            import tempfile
-            _sweep_dry_run_dirs(tempfile.gettempdir())
-        except Exception:
-            logger.debug("sweeping stale dry-run identities failed", exc_info=True)
-        scratch = None
-        try:
-            identity, scratch = _server_identity(self.config_db, config.dry_run, logger)
-            self._trust = TrustGateway(identity, self.config_db)
-        except Exception as e:
-            if scratch is not None:
-                _remove_tree(scratch)
-            if isinstance(e, IdentityError):
-                logger.error(f"API worker cannot load the server TLS identity: {e}")
-            else:
-                logger.error(
-                    f"API worker cannot set up its TLS identity and client trust: "
-                    f"{type(e).__name__}: {e}"
-                )
-            sys.exit(1)
-        try:
-            self._serve(config, logger, create_app, identity)
+            # Throwaway identities of dry-run API workers that died uncleanly.
+            try:
+                import tempfile
+                _sweep_dry_run_dirs(tempfile.gettempdir())
+            except Exception:
+                logger.debug("sweeping stale dry-run identities failed", exc_info=True)
+            scratch = None
+            try:
+                identity, scratch = _server_identity(self.config_db, config.dry_run, logger)
+                self._trust = TrustGateway(identity, self.config_db)
+            except Exception as e:
+                if scratch is not None:
+                    _remove_tree(scratch)
+                if isinstance(e, IdentityError):
+                    logger.error(f"API worker cannot load the server TLS identity: {e}")
+                else:
+                    logger.error(
+                        f"API worker cannot set up its TLS identity and client trust: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                sys.exit(1)
+            try:
+                self._serve(config, logger, create_app, identity)
+            finally:
+                if scratch is not None:
+                    _remove_tree(scratch)
         finally:
-            if scratch is not None:
-                _remove_tree(scratch)
+            # The filter is process-global state; take it off on every exit
+            # (sys.exit included), not only in a worker process that is
+            # about to end anyway.
+            uninstall_dedupe()
 
     def _serve(self, config: BackupConfig, logger, create_app, identity) -> None:
         """`run()` once the server identity and the trust gateway exist."""

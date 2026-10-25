@@ -31,8 +31,11 @@ Layout
   `TestRealDaemonTls` -- where the server identity comes from: created by the
   supervisor at startup, never created in a dry run (a throwaway identity in a private
   temporary directory instead), reported read-only by `--test-config`.
-* `TestStoreWarningDedupe` -- `api.dedupe_store_warnings`, installed by the API worker
-  only.
+* `TestHandshakeValidityWarning` / `TestValidityWarnThrottle` -- S-12: a pinned client
+  certificate that is expired / not yet valid is one WARNING per peer IP per hour on
+  the server (every other handshake failure stays DEBUG); the per-IP throttle.
+* `TestStoreWarningDedupe` -- `api.dedupe_store_warnings` and its uninstall handle (K-5),
+  installed by the API worker for the length of its run only.
 
 Hygiene: no `zfs` (the conftest stub), servers bind `127.0.0.1` port 0 or a free port,
 every thread and child process is stopped in a `finally`, daemons run in their own
@@ -41,6 +44,7 @@ session and are SIGKILLed as a group if they do not leave.
 
 import contextlib
 import dataclasses
+import datetime as dt
 import errno
 import fcntl
 import json
@@ -60,7 +64,10 @@ from pathlib import Path
 
 import pytest
 
+from _api_support import make_client_cert
+from _clock_support import FakeTime
 from _hermetic import hermetic_env
+from _remote_support import write_identity_files
 from _tls_support import (
     IO_TIMEOUT,
     LOOPBACK,
@@ -78,6 +85,7 @@ from _tls_support import (
     unpin_client,
 )
 from zfsbackup import api, daemon as daemon_module, identity, workers
+from zfsbackup.logsetup import PEER_LOGGER
 from zfsbackup.config import BackupConfig, DatasetConfig, Destination, RemoteDatasetConfig
 from zfsbackup.config.store import dispose_all
 from zfsbackup.stopflag import StopFlag
@@ -110,6 +118,16 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((LOOPBACK, 0))
         return s.getsockname()[1]
+
+
+def _repeat_filters() -> dict:
+    """-> `{store logger name: [its _RepeatFilter objects]}`, only loggers that carry any."""
+    found = {}
+    for name in api._STORE_LOGGERS:
+        mine = [f for f in logging.getLogger(name).filters if isinstance(f, api._RepeatFilter)]
+        if mine:
+            found[name] = mine
+    return found
 
 
 def _eventually(predicate, timeout=20.0, interval=0.1):
@@ -2761,6 +2779,499 @@ class TestTestConfigTls:
         assert not Path(str(tls_config_db.resolved_path) + ".daemon.pid").exists()
 
 
+# ===========================================================================
+# S-12: a client whose certificate has expired (or is not valid yet) is named
+# ===========================================================================
+
+
+@pytest.fixture
+def fake_time(mocker):
+    clock = FakeTime()
+    mocker.patch.object(workers, "time", clock)
+    return clock
+
+
+def _expired_message(peer):
+    return (f"API: TLS client {peer} refused: its client certificate has expired; the client "
+            "must enroll again with a new token (check its clock too)")
+
+
+def _not_yet_valid_message(peer):
+    return (f"API: TLS client {peer} refused: its client certificate is not valid yet; check "
+            "the clocks of the client and of this host")
+
+
+def _validity_warnings(caplog):
+    return [r for r in caplog.records
+            if r.name == PEER_LOGGER and r.levelno == logging.WARNING
+            and "refused" in r.getMessage()]
+
+
+def _verification_error(code):
+    exc = ssl.SSLCertVerificationError(1, f"certificate verify failed (code {code})")
+    exc.verify_code = code
+    return exc
+
+
+@pytest.mark.integration
+class TestHandshakeValidityWarning:
+    """S-12 (1): a TLS 1.3 client's rejected certificate is otherwise one DEBUG line on the
+    server. An expired or not-yet-valid PINNED certificate (OpenSSL verify codes 10 / 9) is
+    now one WARNING per peer IP per `API_VALIDITY_WARN_EVERY`; every other handshake failure
+    stays DEBUG."""
+
+    @pytest.fixture
+    def kit(self, tmp_path):
+        class Kit:
+            pass
+
+        k = Kit()
+        k.gateway, k.server_identity, k.trust = make_gateway(tmp_path / "srv.tls")
+        k.tmp = tmp_path
+        k.n = 0
+
+        def pinned(label, *, not_before, not_after):
+            """-> an `ssl.SSLContext` presenting a certificate with this validity window,
+            pinned in the gateway."""
+            k.n += 1
+            cert = make_client_cert(cn=f"{label}-{k.n}", not_before=not_before, not_after=not_after)
+            k.trust.set_pins(
+                [*k.trust.pins, trusted_pin(cert, f"host-{k.n}")],
+                generation=k.trust.generation + 1,
+            )
+            k.gateway.refresh()
+            directory = tmp_path / f"{label}-{k.n}.tls"
+            write_identity_files(directory, cert)
+            ctx = insecure_client_context()
+            ctx.load_cert_chain(str(directory / "client.crt"), str(directory / "client.key"))
+            return ctx
+
+        now = dt.datetime.now(dt.timezone.utc)
+        k.expired = lambda: pinned(
+            "expired", not_before=now - dt.timedelta(days=9), not_after=now - dt.timedelta(days=1))
+        k.not_yet_valid = lambda: pinned(
+            "future", not_before=now + dt.timedelta(days=1), not_after=now + dt.timedelta(days=9))
+        k.valid = lambda: pinned(
+            "valid", not_before=now - dt.timedelta(hours=1), not_after=now + dt.timedelta(days=9))
+        k.unpinned = lambda: insecure_client_context(client_identity(tmp_path / "stranger.tls"))
+        return k
+
+    @contextlib.contextmanager
+    def _server(self, kit, **kwargs):
+        """An `ApiServer` that is NOT serving: connections are fed to `process_request`
+        over a socketpair (so the peer address can be anything), and the call blocks until
+        the server has finished with the connection."""
+        cls = workers._api_server_class()
+        server = cls(LOOPBACK, 0, echo_app, kit.gateway, **kwargs)
+        try:
+            yield server
+        finally:
+            server.server_close()
+
+    @staticmethod
+    def _feed(server, address, client_ctx=None, *, send=b"", timeout=IO_TIMEOUT):
+        """One connection from `address` through `server.process_request`; -> once the
+        server has closed it (it does that after logging)."""
+        server_side, client_side = socket.socketpair()
+        client_side.settimeout(timeout)
+        server.process_request(server_side, address)
+        try:
+            if client_ctx is not None:
+                try:
+                    client = client_ctx.wrap_socket(client_side)
+                except OSError:
+                    client = None
+                    client_side.settimeout(timeout)
+                else:
+                    client_side = client
+            if send:
+                client_side.sendall(send)
+            try:
+                while client_side.recv(4096):
+                    pass
+            except OSError:
+                # The TLS alert arrives before the server has logged anything; the
+                # server's half-close after logging is the EOF to wait for, on the
+                # plain socket.
+                if isinstance(client_side, ssl.SSLSocket):
+                    client_side = socket.socket(fileno=client_side.detach())
+                    client_side.settimeout(timeout)
+                    try:
+                        while client_side.recv(4096):
+                            pass
+                    except OSError:
+                        pass
+        finally:
+            client_side.close()
+
+    # -- the real thing: a pinned expired certificate over TCP -----------------------
+
+    def test_an_expired_pinned_certificate_is_one_warning_naming_the_peer(self, kit, caplog):
+        ctx = kit.expired()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"):
+            with Serving(echo_app, kit.gateway) as s:
+                spy = _spy_allow(s.server)
+                assert isinstance(try_get(s.port, "/", ctx), Exception)
+                assert _eventually(lambda: len(spy.calls) >= 1, 10)
+                assert _eventually(lambda: _validity_warnings(caplog), 10)
+        (record,) = _validity_warnings(caplog)
+        assert record.getMessage() == _expired_message(LOOPBACK)
+        assert record.name == PEER_LOGGER and record.levelno == logging.WARNING
+        # the DEBUG handshake line stays where it was, on the worker logger
+        (debug,) = [r for r in caplog.records
+                    if r.name == "zfsbackup.workers" and r.levelno == logging.DEBUG
+                    and "TLS handshake with" in r.getMessage()]
+        assert "certificate has expired" in debug.getMessage()
+        assert [r for r in caplog.records
+                if r.name == "zfsbackup.workers" and r.levelno >= logging.WARNING] == []
+
+    def test_a_not_yet_valid_pinned_certificate_has_its_own_wording(self, kit, caplog):
+        ctx = kit.not_yet_valid()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"):
+            with Serving(echo_app, kit.gateway) as s:
+                assert isinstance(try_get(s.port, "/", ctx), Exception)
+                assert _eventually(lambda: _validity_warnings(caplog), 10)
+        (record,) = _validity_warnings(caplog)
+        assert record.getMessage() == _not_yet_valid_message(LOOPBACK)
+
+    def test_a_valid_pinned_certificate_logs_no_warning(self, kit, caplog):
+        ctx = kit.valid()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"):
+            with Serving(echo_app, kit.gateway) as s:
+                assert https_get(s.port, "/", ctx)[0] == 200
+        assert _validity_warnings(caplog) == []
+
+    def test_the_server_keeps_serving_after_the_refusals(self, kit, caplog):
+        expired, valid = kit.expired(), kit.valid()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"):
+            with Serving(echo_app, kit.gateway) as s:
+                for _ in range(3):
+                    assert isinstance(try_get(s.port, "/", expired), Exception)
+                assert https_get(s.port, "/", valid)[0] == 200
+
+    # -- the throttle, through the full handshake path ---------------------------
+
+    def test_a_repeat_from_the_same_ip_within_an_hour_is_silent(self, kit, caplog, fake_time):
+        ctx = kit.expired()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            for _ in range(4):
+                self._feed(server, ("203.0.113.7", 40000), ctx)
+        assert [r.getMessage() for r in _validity_warnings(caplog)] == [_expired_message("203.0.113.7")]
+
+    def test_the_same_ip_is_named_again_after_an_hour(self, kit, caplog, fake_time):
+        ctx = kit.expired()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            self._feed(server, ("203.0.113.7", 40000), ctx)
+            fake_time.advance(workers.API_VALIDITY_WARN_EVERY - 30)
+            self._feed(server, ("203.0.113.7", 40001), ctx)
+            assert len(_validity_warnings(caplog)) == 1           # 30 s short of the hour
+            fake_time.advance(60)
+            self._feed(server, ("203.0.113.7", 40002), ctx)
+            assert len(_validity_warnings(caplog)) == 2
+            self._feed(server, ("203.0.113.7", 40003), ctx)
+            assert len(_validity_warnings(caplog)) == 2           # and the new hour has begun
+
+    def test_distinct_ips_are_independent(self, kit, caplog, fake_time):
+        ctx = kit.expired()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            for ip in ("198.51.100.1", "198.51.100.2", "198.51.100.1", "198.51.100.3",
+                       "198.51.100.2"):
+                self._feed(server, (ip, 40000), ctx)
+        assert [r.getMessage() for r in _validity_warnings(caplog)] == [
+            _expired_message("198.51.100.1"), _expired_message("198.51.100.2"),
+            _expired_message("198.51.100.3"),
+        ]
+
+    def test_the_peer_port_does_not_make_a_new_peer(self, kit, caplog, fake_time):
+        ctx = kit.expired()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            for port in (1, 2, 3):
+                self._feed(server, ("198.51.100.9", port), ctx)
+        assert len(_validity_warnings(caplog)) == 1
+
+    def test_an_ipv6_peer_is_named_by_its_address(self, kit, caplog, fake_time):
+        ctx = kit.not_yet_valid()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            self._feed(server, ("2001:db8::7", 40000, 0, 0), ctx)
+        assert [r.getMessage() for r in _validity_warnings(caplog)] == [
+            _not_yet_valid_message("2001:db8::7")]
+
+    # -- everything else stays quiet ---------------------------------------------------
+
+    def test_an_unpinned_certificate_is_not_a_validity_warning(self, kit, caplog):
+        kit.valid()                                               # (some pins exist)
+        ctx = kit.unpinned()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            spy = _spy_allow(server)
+            self._feed(server, ("203.0.113.7", 40000), ctx)
+        assert "handshake with" in caplog.text and "failed" in caplog.text   # it was refused
+        assert _validity_warnings(caplog) == [] and spy.calls == []
+
+    def test_a_handshake_that_times_out_is_not_a_validity_warning(self, kit, caplog):
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), \
+                self._server(kit, handshake_timeout=0.3) as server:
+            spy = _spy_allow(server)
+            self._feed(server, ("203.0.113.7", 40000))              # says nothing at all
+        assert "handshake with" in caplog.text
+        assert _validity_warnings(caplog) == [] and spy.calls == []
+
+    def test_a_peer_that_does_not_speak_tls_is_not_a_validity_warning(self, kit, caplog):
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            spy = _spy_allow(server)
+            self._feed(server, ("203.0.113.7", 40000), send=b"GET / HTTP/1.1\r\n\r\n")
+        assert "handshake with" in caplog.text
+        assert _validity_warnings(caplog) == [] and spy.calls == []
+
+    @pytest.mark.parametrize("exc", [
+        pytest.param(_verification_error(code), id=f"verify-code-{code}")
+        for code in (0, 2, 7, 8, 18, 19, 20, 21, 23, 26, 27, 34, 62, 11, 12)
+    ] + [
+        pytest.param(ssl.SSLError("[SSL: WRONG_VERSION_NUMBER] wrong version number"),
+                     id="plain-SSLError"),
+        pytest.param(ssl.SSLEOFError("EOF occurred in violation of protocol"), id="eof"),
+        pytest.param(ssl.SSLZeroReturnError("closed"), id="zero-return"),
+        pytest.param(TimeoutError("timed out"), id="timeout"),
+        pytest.param(ConnectionResetError("reset"), id="reset"),
+        pytest.param(OSError("boom"), id="oserror"),
+        pytest.param(ssl.SSLError("certificate has expired"), id="expired-text-but-not-a-verify-error"),
+    ])
+    def test_other_failures_never_warn(self, kit, caplog, exc):
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            server._warn_certificate_validity(exc, ("203.0.113.7", 1))
+        assert _validity_warnings(caplog) == []
+
+    def test_an_error_without_a_verify_code_never_warns(self, kit, caplog):
+        exc = ssl.SSLCertVerificationError(1, "no code")
+        exc.verify_code = None
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            server._warn_certificate_validity(exc, ("203.0.113.7", 1))
+        assert _validity_warnings(caplog) == []
+
+    @pytest.mark.parametrize("code, message", [
+        (10, _expired_message), (9, _not_yet_valid_message),
+    ])
+    def test_the_verify_code_alone_decides_the_wording(self, kit, caplog, code, message):
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            server._warn_certificate_validity(_verification_error(code), ("203.0.113.7", 1))
+        assert [r.getMessage() for r in _validity_warnings(caplog)] == [message("203.0.113.7")]
+
+    # -- robustness ---------------------------------------------------------------------
+
+    @pytest.mark.parametrize("address", [None, (), ("",), 5, [], object()],
+                             ids=["none", "empty-tuple", "empty-host", "int", "empty-list", "object"])
+    def test_a_malformed_client_address_never_raises(self, kit, caplog, address):
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            server._warn_certificate_validity(_verification_error(10), address)
+
+    @pytest.mark.parametrize("address", [None, ()], ids=["none", "empty-tuple"])
+    def test_a_malformed_client_address_does_not_break_the_handshake_path(
+        self, kit, caplog, address
+    ):
+        """The failed handshake is still logged at DEBUG, the connection is closed (the
+        peer reads the rejection, not a hang), no warning is made up, and the server goes
+        on serving."""
+        expired, valid = kit.expired(), kit.valid()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), \
+                Serving(echo_app, kit.gateway) as s:
+            started = time.monotonic()
+            self._feed(s.server, address, expired)
+            assert time.monotonic() - started < 5
+            assert https_get(s.port, "/", valid)[0] == 200
+        assert "handshake with" in caplog.text
+        assert _validity_warnings(caplog) == []
+
+    def test_a_failing_throttle_does_not_break_the_handshake_path(self, kit, caplog, mocker):
+        ctx = kit.expired()
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.workers"), self._server(kit) as server:
+            mocker.patch.object(server._validity_throttle, "allow", side_effect=RuntimeError("boom"))
+            self._feed(server, ("203.0.113.7", 40000), ctx)
+        assert _validity_warnings(caplog) == []
+        assert "validity warning failed" in caplog.text            # DEBUG, with the traceback
+
+    def test_the_slot_is_released_after_a_refusal(self, kit, fake_time):
+        ctx = kit.expired()
+        with self._server(kit, max_connections=2) as server:
+            for i in range(6):                                     # more refusals than slots
+                self._feed(server, ("203.0.113.7", 40000 + i), ctx)
+            assert server._slots.acquire(blocking=False)           # still room
+            server._slots.release()
+
+
+class _SpyAllow:
+    def __init__(self, throttle):
+        self.calls = []
+        self._real = throttle.allow
+        throttle.allow = self
+
+    def __call__(self, peer):
+        result = self._real(peer)
+        self.calls.append((peer, result))
+        return result
+
+
+def _spy_allow(server) -> _SpyAllow:
+    return _SpyAllow(server._validity_throttle)
+
+
+@pytest.mark.unit
+class TestValidityWarnThrottle:
+    """`workers._ValidityWarnThrottle`: one WARNING per peer per interval, bounded memory,
+    least-recently-WARNED eviction, thread-safe."""
+
+    @pytest.fixture
+    def clock(self, fake_time):
+        fake_time.frozen = 1000.0
+        return fake_time
+
+    def test_the_defaults_are_the_documented_constants(self):
+        assert workers.API_VALIDITY_WARN_EVERY == 3600.0
+        assert workers.API_VALIDITY_WARN_PEERS == 256
+        t = workers._ValidityWarnThrottle()
+        assert t._every == 3600.0 and t._max == 256
+
+    def test_the_server_gets_the_default_throttle(self, pki):
+        server = workers._bind_api_server(echo_app, LOOPBACK, 0, pki.gateway)
+        try:
+            assert isinstance(server._validity_throttle, workers._ValidityWarnThrottle)
+            assert server._validity_throttle._every == workers.API_VALIDITY_WARN_EVERY
+            assert server._validity_throttle._max == workers.API_VALIDITY_WARN_PEERS
+        finally:
+            server.server_close()
+
+    def test_the_first_attempt_is_allowed_and_the_repeat_is_not(self, clock):
+        t = workers._ValidityWarnThrottle(every=100, max_peers=8)
+        assert t.allow("a") is True
+        assert t.allow("a") is False
+        assert t.allow("a") is False
+
+    def test_the_boundary_is_exactly_the_interval(self, clock):
+        t = workers._ValidityWarnThrottle(every=100, max_peers=8)
+        assert t.allow("a") is True
+        clock.frozen += 99.9
+        assert t.allow("a") is False
+        clock.frozen += 0.1
+        assert t.allow("a") is True                                # 100 s after the warning
+
+    def test_a_suppressed_attempt_does_not_extend_the_window(self, clock):
+        t = workers._ValidityWarnThrottle(every=100, max_peers=8)
+        assert t.allow("a") is True
+        clock.frozen += 60
+        assert t.allow("a") is False                               # seen again, not warned
+        clock.frozen += 40
+        assert t.allow("a") is True                                # measured from the warning
+
+    def test_an_allowed_attempt_restarts_the_window(self, clock):
+        t = workers._ValidityWarnThrottle(every=100, max_peers=8)
+        assert t.allow("a") is True
+        clock.frozen += 100
+        assert t.allow("a") is True
+        clock.frozen += 99
+        assert t.allow("a") is False
+
+    def test_peers_are_independent(self, clock):
+        t = workers._ValidityWarnThrottle(every=100, max_peers=8)
+        assert [t.allow(p) for p in "abab"] == [True, True, False, False]
+
+    def test_the_map_never_outgrows_the_cap(self, clock):
+        t = workers._ValidityWarnThrottle(every=100, max_peers=5)
+        for i in range(1000):
+            t.allow(f"10.0.{i // 256}.{i % 256}")
+            assert len(t._last) <= 5
+        assert len(t._last) == 5
+
+    def test_a_flood_of_distinct_ips_evicts_the_oldest_warned_first(self, clock):
+        t = workers._ValidityWarnThrottle(every=1000, max_peers=4)
+        for i, peer in enumerate("abcd"):
+            clock.frozen = 1000.0 + i
+            assert t.allow(peer) is True
+        clock.frozen = 1010.0
+        assert t.allow("e") is True                                # evicts "a"
+        assert [t.allow(p) for p in "bcde"] == [False] * 4         # the rest are remembered
+        assert t.allow("a") is True                                # "a" was forgotten
+
+    def test_eviction_is_by_last_warned_not_by_last_seen(self, clock):
+        t = workers._ValidityWarnThrottle(every=1000, max_peers=2)
+        assert t.allow("a") is True
+        clock.frozen += 1
+        assert t.allow("b") is True
+        clock.frozen += 1
+        assert t.allow("a") is False                               # "a" seen again: still the oldest warned
+        assert t.allow("c") is True                                # so "a" goes, not "b"
+        assert t.allow("b") is False and t.allow("c") is False
+        assert t.allow("a") is True
+
+    def test_warning_again_makes_a_peer_the_newest(self, clock):
+        t = workers._ValidityWarnThrottle(every=10, max_peers=2)
+        assert t.allow("a") is True
+        clock.frozen += 1
+        assert t.allow("b") is True
+        clock.frozen += 10
+        assert t.allow("a") is True                                # warned again: now the newest
+        assert t.allow("c") is True                                # evicts "b"
+        assert t.allow("a") is False and t.allow("c") is False
+        assert t.allow("b") is True
+
+    def test_a_cap_of_one_remembers_only_the_last_peer(self, clock):
+        t = workers._ValidityWarnThrottle(every=100, max_peers=1)
+        assert t.allow("a") is True and t.allow("a") is False
+        assert t.allow("b") is True
+        assert t.allow("a") is True                                # forgotten
+
+    def test_a_forgotten_peer_is_warned_again_even_within_the_interval(self, clock):
+        """The price of the bound: past the cap the oldest entries lose their throttle."""
+        t = workers._ValidityWarnThrottle(every=1000, max_peers=2)
+        for p in "abc":
+            assert t.allow(p) is True
+        assert t.allow("a") is True
+
+    def test_exactly_one_of_many_simultaneous_attempts_is_allowed(self):
+        t = workers._ValidityWarnThrottle(every=3600, max_peers=8)
+        barrier = threading.Barrier(32)
+        results = []
+
+        def attempt():
+            barrier.wait(10)
+            results.append(t.allow("203.0.113.7"))
+
+        threads = [threading.Thread(target=attempt) for _ in range(32)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(10)
+        assert not any(th.is_alive() for th in threads)
+        assert sorted(results) == [False] * 31 + [True]
+
+    def test_threads_hammering_distinct_peers_keep_the_bound_and_never_raise(self):
+        """The bound is checked under the throttle's own lock: inside `allow()` the map
+        briefly holds one entry more than the cap (insert, then evict), so an unlocked
+        read from another thread can legitimately see cap + 1."""
+        t = workers._ValidityWarnThrottle(every=3600, max_peers=16)
+        errors = []
+        allowed = []
+
+        def hammer(seed):
+            try:
+                for i in range(400):
+                    if t.allow(f"p{(seed * 7 + i) % 90}"):
+                        allowed.append(1)
+                    with t._guard:
+                        assert len(t._last) <= 16
+            except BaseException as exc:                      # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer, args=(n,)) for n in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(30)
+        assert not any(th.is_alive() for th in threads) and errors == []
+        assert len(t._last) == 16 and allowed
+
+    def test_it_has_a_lock(self):
+        t = workers._ValidityWarnThrottle()
+        assert hasattr(t._guard, "acquire") and hasattr(t._guard, "release")
+
+
 @pytest.mark.unit
 class TestStoreWarningDedupe:
     """`api.dedupe_store_warnings` / `_RepeatFilter`: the trust poll opens the
@@ -2768,15 +3279,13 @@ class TestStoreWarningDedupe:
     every time. Installed by the API worker only."""
 
     @pytest.fixture(autouse=True)
-    def _clean_filters(self):
-        def strip():
-            for name in api._STORE_LOGGERS:
-                lg = logging.getLogger(name)
-                for f in [f for f in lg.filters if isinstance(f, api._RepeatFilter)]:
-                    lg.removeFilter(f)
-        strip()
+    def _no_filter_leaks(self):
+        """K-5: the product's own uninstall handle is what keeps the process-wide
+        loggers clean; nothing here (or in conftest) strips filters behind its
+        back. A test that leaves a `_RepeatFilter` behind fails right here."""
+        assert _repeat_filters() == {}, "a _RepeatFilter was already installed"
         yield
-        strip()
+        assert _repeat_filters() == {}, "the test left a _RepeatFilter installed"
 
     def _record(self, text, level=logging.WARNING):
         return logging.LogRecord("zfsbackup.config.store.paths", level, __file__, 1, text, None, None)
@@ -2807,17 +3316,20 @@ class TestStoreWarningDedupe:
         assert api._RepeatFilter()._interval == 3600.0
 
     def test_dedupe_installs_one_filter_on_each_store_logger_and_is_idempotent(self):
-        api.dedupe_store_warnings()
-        api.dedupe_store_warnings()
-        for name in api._STORE_LOGGERS:
-            filters = [f for f in logging.getLogger(name).filters if isinstance(f, api._RepeatFilter)]
-            assert len(filters) == 1
-        assert set(api._STORE_LOGGERS) == {
-            "zfsbackup.config.store.paths", "zfsbackup.config.store.db"
-        }
+        first = api.dedupe_store_warnings()
+        second = api.dedupe_store_warnings()
+        try:
+            for name in api._STORE_LOGGERS:
+                assert len(_repeat_filters()[name]) == 1
+            assert set(api._STORE_LOGGERS) == {
+                "zfsbackup.config.store.paths", "zfsbackup.config.store.db"
+            }
+        finally:
+            second()
+            first()
 
     def test_the_installed_filter_really_drops_the_repeat(self, caplog):
-        api.dedupe_store_warnings()
+        uninstall = api.dedupe_store_warnings()
         lg = logging.getLogger("zfsbackup.config.store.paths")
         seen = []
 
@@ -2832,20 +3344,191 @@ class TestStoreWarningDedupe:
                 lg.warning("sidecar group differs")
         finally:
             lg.removeHandler(handler)
+            uninstall()
         assert seen == ["sidecar group differs"]
 
-    def test_the_api_worker_installs_it(self, tls_config_db, mocker):
+    # -- K-5: the uninstall handle ------------------------------------------------
+
+    def test_the_handle_removes_exactly_what_it_installed(self):
+        uninstall = api.dedupe_store_warnings()
+        assert set(_repeat_filters()) == set(api._STORE_LOGGERS)
+        uninstall()
+        assert _repeat_filters() == {}
+
+    def test_the_handle_leaves_other_filters_alone(self):
+        class Other(logging.Filter):
+            pass
+
+        others = {name: Other() for name in api._STORE_LOGGERS}
+        for name, flt in others.items():
+            logging.getLogger(name).addFilter(flt)
+        try:
+            uninstall = api.dedupe_store_warnings()
+            uninstall()
+            for name, flt in others.items():
+                assert flt in logging.getLogger(name).filters
+        finally:
+            for name, flt in others.items():
+                logging.getLogger(name).removeFilter(flt)
+
+    def test_the_handle_is_idempotent(self):
+        uninstall = api.dedupe_store_warnings()
+        uninstall()
+        uninstall()
+        uninstall()
+        assert _repeat_filters() == {}
+
+    def test_a_stale_handle_does_not_remove_a_later_installs_filters(self):
+        stale = api.dedupe_store_warnings()
+        stale()
+        fresh = api.dedupe_store_warnings()
+        try:
+            stale()                                              # second call: a no-op
+            assert set(_repeat_filters()) == set(api._STORE_LOGGERS)
+        finally:
+            fresh()
+
+    def test_a_second_install_while_installed_returns_a_no_op_handle(self):
+        first = api.dedupe_store_warnings()
+        installed = _repeat_filters()
+        second = api.dedupe_store_warnings()
+        try:
+            assert _repeat_filters() == installed                # same objects, no new ones
+            second()                                             # no-op: the first install stays
+            assert _repeat_filters() == installed
+        finally:
+            first()
+        assert _repeat_filters() == {}
+
+    def test_the_outer_handle_may_go_first_and_the_inner_one_stays_harmless(self):
+        first = api.dedupe_store_warnings()
+        second = api.dedupe_store_warnings()
+        first()
+        assert _repeat_filters() == {}
+        second()                                                 # nothing left to remove
+        assert _repeat_filters() == {}
+
+    def test_a_logger_already_carrying_a_filter_is_not_taken_over(self):
+        """Only the call that installed a filter can remove it: a filter already on
+        one logger stays when the handle goes, the other logger's is removed."""
+        paths, db = (logging.getLogger(n) for n in api._STORE_LOGGERS)
+        mine = api._RepeatFilter()
+        paths.addFilter(mine)
+        try:
+            uninstall = api.dedupe_store_warnings()
+            uninstall()
+            assert mine in paths.filters
+            assert not any(isinstance(f, api._RepeatFilter) for f in db.filters)
+        finally:
+            paths.removeFilter(mine)
+
+    # -- K-5: ApiWorker.run installs it for the run and removes it on every exit ----
+
+    def _worker(self, config_db, **config):
+        stop = StopFlag()
+        stop.set()
+        return workers.ApiWorker(
+            BackupConfig(datasets=[DatasetConfig(name="pool/data")], **config),
+            stop, config_db=config_db,
+        )
+
+    def test_the_api_worker_installs_it_for_the_run_and_removes_it_after(
+        self, tls_config_db, mocker
+    ):
+        during = []
+
+        def bind(*args, **kwargs):
+            during.append(_repeat_filters())
+            return mocker.MagicMock()
+
+        mocker.patch("zfsbackup.api.create_app")
+        mocker.patch("zfsbackup.workers._bind_api_server", side_effect=bind)
+        mocker.patch("zfsbackup.workers.threading.Thread")
+        self._worker(tls_config_db, dry_run=True).run()
+        (seen,) = during
+        assert set(seen) == set(api._STORE_LOGGERS)
+        assert all(len(v) == 1 for v in seen.values())
+        assert _repeat_filters() == {}
+
+    def test_a_bind_failure_exits_one_and_leaves_no_filter(self, tls_config_db, mocker, caplog):
+        during = []
+
+        def bind(*args, **kwargs):
+            during.append(_repeat_filters())
+            raise OSError(errno.EADDRINUSE, "Address already in use")
+
+        mocker.patch("zfsbackup.api.create_app")
+        mocker.patch("zfsbackup.workers._bind_api_server", side_effect=bind)
+        with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as info:
+            self._worker(tls_config_db).run()
+        assert info.value.code == 1 and "cannot listen on" in caplog.text
+        assert set(during[0]) == set(api._STORE_LOGGERS)         # it WAS installed
+        assert _repeat_filters() == {}
+
+    def test_a_server_identity_failure_exits_one_and_leaves_no_filter(
+        self, sqlite_config_db, mocker, caplog
+    ):
+        """No server identity outside a dry run: `IdentityError`, exit 1."""
+        during = []
+        real = workers._server_identity
+
+        def spy(*args, **kwargs):
+            during.append(_repeat_filters())
+            return real(*args, **kwargs)
+
+        mocker.patch("zfsbackup.workers._server_identity", side_effect=spy)
+        with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as info:
+            self._worker(sqlite_config_db).run()
+        assert info.value.code == 1 and "cannot load the server TLS identity" in caplog.text
+        assert set(during[0]) == set(api._STORE_LOGGERS)
+        assert _repeat_filters() == {}
+
+    def test_a_gateway_setup_failure_exits_one_and_leaves_no_filter(
+        self, tls_config_db, mocker, caplog
+    ):
+        mocker.patch("zfsbackup.api.TrustGateway", side_effect=RuntimeError("boom"))
+        with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as info:
+            self._worker(tls_config_db).run()
+        assert info.value.code == 1 and "client trust: RuntimeError: boom" in caplog.text
+        assert _repeat_filters() == {}
+
+    def test_an_unexpected_error_in_the_run_still_removes_the_filter(self, tls_config_db, mocker):
+        mocker.patch("zfsbackup.api.create_app", side_effect=RuntimeError("app"))
+        with pytest.raises(RuntimeError, match="app"):
+            self._worker(tls_config_db).run()
+        assert _repeat_filters() == {}
+
+    def test_a_worker_without_a_config_database_installs_nothing(self, mocker):
+        install = mocker.patch("zfsbackup.api.dedupe_store_warnings")
+        with pytest.raises(SystemExit):
+            workers.ApiWorker(BackupConfig(datasets=[DatasetConfig(name="pool/data")]),
+                              StopFlag()).run()
+        install.assert_not_called()
+
+    def test_a_filter_installed_before_the_run_survives_it(self, tls_config_db, mocker):
+        mine = api.dedupe_store_warnings()
+        installed = _repeat_filters()
+        try:
+            mocker.patch("zfsbackup.api.create_app")
+            mocker.patch("zfsbackup.workers._bind_api_server")
+            mocker.patch("zfsbackup.workers.threading.Thread")
+            self._worker(tls_config_db, dry_run=True).run()
+            assert _repeat_filters() == installed
+        finally:
+            mine()
+
+    def test_a_later_warning_is_not_swallowed_after_a_run(self, tls_config_db, mocker, caplog):
+        """The reason for K-5: a worker that ran inline must not make a later test (or
+        anything else in the process) lose a repeated store WARNING."""
         mocker.patch("zfsbackup.api.create_app")
         mocker.patch("zfsbackup.workers._bind_api_server")
         mocker.patch("zfsbackup.workers.threading.Thread")
-        stop = StopFlag()
-        stop.set()
-        workers.ApiWorker(
-            BackupConfig(datasets=[DatasetConfig(name="pool/data")], dry_run=True),
-            stop, config_db=tls_config_db,
-        ).run()
-        for name in api._STORE_LOGGERS:
-            assert any(isinstance(f, api._RepeatFilter) for f in logging.getLogger(name).filters)
+        self._worker(tls_config_db, dry_run=True).run()
+        lg = logging.getLogger("zfsbackup.config.store.paths")
+        with caplog.at_level(logging.WARNING, logger=lg.name):
+            for _ in range(3):
+                lg.warning("same text every time")
+        assert [r.getMessage() for r in caplog.records].count("same text every time") == 3
 
     @pytest.mark.parametrize("cls", [workers.SnapshotWorker, workers.PruningWorker,
                                      workers.RemoteBackupWorker])
@@ -2857,8 +3540,7 @@ class TestStoreWarningDedupe:
         stop = StopFlag()
         stop.set()
         cls(worker_config, stop).run()
-        for name in api._STORE_LOGGERS:
-            assert not any(isinstance(f, api._RepeatFilter) for f in logging.getLogger(name).filters)
+        assert _repeat_filters() == {}
 
 
 # ===========================================================================

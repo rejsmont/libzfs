@@ -992,14 +992,28 @@ class _RepeatFilter(logging.Filter):
 _STORE_LOGGERS = ('zfsbackup.config.store.paths', 'zfsbackup.config.store.db')
 
 
-def dedupe_store_warnings() -> None:
-    """Install `_RepeatFilter` on the config store's loggers, once per
-    process. Called by `ApiWorker.run` (the only worker that opens the
-    database, for the trust poll)."""
+def dedupe_store_warnings() -> Callable[[], None]:
+    """Install `_RepeatFilter` on the config store's loggers and return the
+    uninstall handle. Called by `ApiWorker.run` (the only worker that opens
+    the database, for the trust poll), which calls the handle on every exit.
+
+    Idempotent: a logger that already carries a `_RepeatFilter` is left alone
+    and the handle does not remove it, so only the call that installed a
+    filter can remove it. The handle itself is idempotent."""
+    installed = []
     for name in _STORE_LOGGERS:
         lg = logging.getLogger(name)
         if not any(isinstance(f, _RepeatFilter) for f in lg.filters):
-            lg.addFilter(_RepeatFilter())
+            flt = _RepeatFilter()
+            lg.addFilter(flt)
+            installed.append((lg, flt))
+
+    def uninstall() -> None:
+        while installed:
+            lg, flt = installed.pop()
+            lg.removeFilter(flt)
+
+    return uninstall
 
 
 def canonical_dataset_config(encoded) -> str:
