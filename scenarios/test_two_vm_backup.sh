@@ -58,15 +58,20 @@
 #            `--client-id` hint) and the token stays usable: B then enrolls under its own id with it
 #        K4  cert B cannot reach A's data: B's certificate on A's URL gets 403 "client_id mismatch" (and no
 #            certificate gets 401); A's server copy is untouched
-#        K5  A's fingerprint is revoked while a (throttled) stream is in flight: the stream completes, the next
-#            cycle is refused (one ERROR "does not trust this client"), nothing more is sent
+#        K5  A's fingerprint is revoked while a (throttled) stream is in flight: the server CUTS the stream within
+#            ~4 s (WARNING "cutting the running stream of client ...", INFO "stream for ... was cut; zfs receive
+#            reaped, the partial receive state is kept"), keeps a receive_resume_token, the client logs the refusal
+#            once and sends nothing more
 #        K6  re-enroll with `trust token create --client-id A --replace` and a NEW certificate: same client id,
-#            same server dataset, the pending snapshot goes out INCREMENTALLY; one pin left
+#            same server dataset; the cut stream is RESUMED (mode=resume), then the pending snapshot goes out
+#            INCREMENTALLY; matching guids; one pin left
 #        K7  `identity rotate`: two pins (one with a predecessor) until the next cycle, which succeeds
 #            incrementally and retires the old pin (one pin, no predecessor)
 #        K8  `import` of a YAML leaves `identity show` unchanged (and the destination still works)
 #        K9  `identity set-client-id` is refused while enrolled
 #        K10 importing a config with an http:// destination is refused and changes nothing
+#        K11 control for the cut: an `identity rotate` (and the old pin's retirement by the successor's first request)
+#            during a running stream does NOT cut it; revoking the SUCCESSOR key then cuts it (retired-chain rule)
 #   L1 trust boundary (plan B-1, S-4, S-5, B-2a; needs a tree with them, else skipped with a warning). Fresh pools. A is the real,
 #      enrolled victim client (four snapshots on the server); B is an enrolled ATTACKER whose daemon is modified (a
 #      sitecustomize in /opt/zfsb-evil makes it `zfs send -p` on demand and stop re-syncing its config property). B (and the
@@ -1908,55 +1913,80 @@ else
         "$(msh "$SERVER_VM" "zfs list -H -r -o name '$TARGET_DS' | grep -c '/${K_ID_B}\$' | sed 's/^0\$/no/'" | tr -d '[:space:]')"
     msh "$CLIENT_VM" "rm -f /tmp/zfsb-probe.json" || true
 
-    # ── K5: revoke mid-flight ──
+    # ── K5: revoke mid-stream: the server CUTS the running stream ──
     echo
-    step "K5 — A's fingerprint is revoked while a stream is in flight: the stream completes, the next cycle is refused"
+    step "K5 — A's fingerprint is revoked while a stream is in flight: the server cuts it within ~4 s (zfs receive reaped, resume token kept); the next cycle is refused"
     stop_daemon "$CLIENT_VM"
     append_random "$J_FILE_MIB" big_k5.bin || fail "(K5) could not write the ${J_FILE_MIB} MiB file"
     K5_SNAP="$(snap_now)"
+    k5_base="$(anchor)"
+    k5_ds_guid="$(guid "$SERVER_VM" "$(server_ds)")"; k5_snap_guid="$(guid "$CLIENT_VM" "${SOURCE_DS}@${K5_SNAP}")"
     throttle_on "$J_RATE"
-    mark_c="$(loglines "$CLIENT_VM")"
+    mark_c="$(loglines "$CLIENT_VM")"; mark_s="$(loglines "$SERVER_VM")"
     start_daemon "$CLIENT_VM"
-    k5_done=0
+    k5_cut=0
     if wait_for_proc send_running 120; then
         sleep 8
-        if send_running; then
-            out="$(cli_vm "$SERVER_VM" trust revoke "$A_FP")"; rc=$?
+        if send_running && recv_running; then
+            mark_rev="$(loglines "$CLIENT_VM")"      # (the cut send's own "Sending ..." line is already above this mark)
+            # the CLI and the clock read are ONE guest command: the timestamp is taken right after the revoke committed
+            out="$(msh "$SERVER_VM" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$DB' trust revoke '$A_FP' 2>&1; rc=\$?; echo REVOKED_AT=\$(date +%s); exit \$rc")"; rc=$?
             printf '%s\n' "$out" | sed 's/^/    CLI(server): /'
+            k5_rev_at="$(printf '%s\n' "$out" | sed -n 's/^REVOKED_AT=//p' | tr -d '[:space:]')"
             check "(K5) trust revoke <A's fingerprint> exits 0" "0" "$rc"
             check_has "(K5) the CLI names the revoked certificate and client" "Revoked certificate ${A_FP} of client id ${K_ID}" "$out"
             check "(K5) A has no pinned certificate left" "" "$(trust_pins "$K_ID")"
-            sleep 6      # the API worker polls the trust generation every 2 s
-            if send_running; then pass "(K5) the stream was still in flight after the revoke took effect"; else fail "(K5) the send had already finished (raise J_FILE_MIB or lower J_RATE): inconclusive"; fi
-            if wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${K5_SNAP}" 180; then
-                k5_done=1; mark_k5="$(loglines "$CLIENT_VM")"; mark_k5s="$(loglines "$SERVER_VM")"
-                pass "(K5) the in-flight stream completed after the revoke ('Backup complete')"
-            else fail "(K5) the in-flight stream never completed: $(log_since_vm "$CLIENT_VM" "$mark_c" | tail -n 5 | tr '\n' '|')"; fi
-        else fail "(K5) the send finished before it could be revoked (raise J_FILE_MIB or lower J_RATE)"; fi
+            if wait_log_vm "$SERVER_VM" "$mark_s" "WARNING.*cutting the running stream of client ${K_ID} for '.*': its client certificate was revoked \(revoked\)" 20; then
+                k5_cut=1
+                pass "(K5) server WARNING: cutting the running stream of client $K_ID ... its client certificate was revoked (revoked)"
+                show_log "$SERVER_VM" "$mark_s" 'cutting the running stream|was cut'
+                k5_cut_at="$(msh "$SERVER_VM" "ts=\$(tail -n +$(( mark_s + 1 )) '$LOG' | grep -m1 'cutting the running stream' | cut -c1-19); date -d \"\$ts\" +%s" | tr -d '[:space:]')"
+                k5_lat=$(( k5_cut_at - k5_rev_at ))
+                info "the cut was logged ${k5_lat}s after the revoke committed (trust poll: every 2 s)"
+                if [ "$k5_lat" -ge -1 ] && [ "$k5_lat" -le 5 ]; then pass "(K5) the stream was cut ${k5_lat}s after the revoke (<= 5 s)"; else fail "(K5) the stream was cut ${k5_lat}s after the revoke (expected within ~4 s)"; fi
+            else fail "(K5) no 'cutting the running stream' WARNING on the server within 20s of the revoke: $(log_since_vm "$SERVER_VM" "$mark_s" | tail -n 5 | cut -c1-200 | tr '\n' '|')"; fi
+        else fail "(K5) the send/receive finished (or never ran) before it could be revoked (raise J_FILE_MIB or lower J_RATE)"; fi
     else fail "(K5) no zfs send observed on the client within 120s"; fi
-    throttle_off
-    if [ "$k5_done" -eq 1 ]; then
-        if wait_server_snap "$K5_SNAP" 30; then pass "(K5) $K5_SNAP is on the server"; else fail "(K5) $K5_SNAP is not on the server"; fi
-        check "(K5) the revoked stream's snapshot is byte-identical on the server" "$(guid "$CLIENT_VM" "${SOURCE_DS}@${K5_SNAP}")" "$(guid "$SERVER_VM" "$(server_ds)@${K5_SNAP}")"
-        k5_snap_guid="$(guid "$SERVER_VM" "$(server_ds)@${K5_SNAP}")"; k5_ds_guid="$(guid "$SERVER_VM" "$(server_ds)")"
+    if [ "$k5_cut" -eq 1 ]; then
+        wait_log_vm "$SERVER_VM" "$mark_s" "was cut \(.*\); zfs receive reaped, the partial receive state is kept for a resume" 15 \
+            && pass "(K5) server INFO: stream for ${SOURCE_REL} was cut; zfs receive reaped, the partial receive state is kept for a resume" \
+            || fail "(K5) no 'was cut (...); zfs receive reaped, the partial receive state is kept' INFO on the server"
+        waited=0; while recv_running && [ "$waited" -lt 20 ]; do sleep 2; waited=$((waited+2)); done
+        if recv_running; then fail "(K5) a zfs receive is still running on the server 20s after the cut"; else pass "(K5) no zfs receive is left running on the server (reaped)"; fi
+        waited=0; while [ "$(server_token)" = "-" ] && [ "$waited" -lt 30 ]; do sleep 2; waited=$((waited+2)); done
+        if [ "$(server_token)" != "-" ]; then pass "(K5) the server kept the partial receive state (receive_resume_token set)"; else fail "(K5) the server holds no receive_resume_token after the cut"; fi
+        # the access line of the cut /stream is logged when its handler returns; wait for it so the "no more requests" mark is clean
+        wait_log_vm "$SERVER_VM" "$mark_s" 'GET /backup/[^ ]*/stream\?mode=fresh' 20 || true
+        mark_k5s="$(loglines "$SERVER_VM")"
+        waited=0; while send_running && [ "$waited" -lt 30 ]; do sleep 2; waited=$((waited+2)); done
+        if send_running; then fail "(K5) the client's zfs send is still running 30s after the cut"; else pass "(K5) the client's zfs send ended after the cut (no orphan)"; fi
+        throttle_off
+        check "(K5) the client's anchor stayed at $k5_base" "$k5_base" "$(anchor)"
+        check "(K5) the in-flight pin names the cut step: ${k5_base},${K5_SNAP}" "${k5_base},${K5_SNAP}" "$(zprop "$CLIENT_VM" "$SOURCE_DS" "$J_PIN")"
+        check "(K5) the cut stream's snapshot is NOT on the server (partial state only)" "no" "$(server_snaps | grep -qx "$K5_SNAP" && echo yes || echo no)"
+        check "(K5) the server dataset is untouched (guid unchanged)" "$k5_ds_guid" "$(guid "$SERVER_VM" "$(server_ds)")"
         msh "$CLIENT_VM" "head -c 1000000 /dev/urandom >> \$(zfs get -H -o value mountpoint '$SOURCE_DS')/file1.bin"
         K5_NEXT="$(snap_now)"
-        if wait_log_vm "$CLIENT_VM" "$mark_k5" "ERROR.*(${K_REFUSED_RE})" 150; then
-            pass "(K5) the next cycle is refused: ERROR 'does not trust this client'"
-            show_log "$CLIENT_VM" "$mark_k5" "$K_REFUSED_RE"
-        else fail "(K5) no 'does not trust this client' ERROR after the revoke: $(log_since_vm "$CLIENT_VM" "$mark_k5" | tail -n 5 | tr '\n' '|')"; fi
+        if wait_log_vm "$CLIENT_VM" "$mark_c" "ERROR.*(${K_REFUSED_RE})" 150; then
+            pass "(K5) the client logs the refusal: ERROR 'does not trust this client'"
+            show_log "$CLIENT_VM" "$mark_c" "${K_REFUSED_RE}|Transfer failed"
+        else fail "(K5) no 'does not trust this client' ERROR after the revoke: $(log_since_vm "$CLIENT_VM" "$mark_c" | tail -n 5 | tr '\n' '|')"; fi
         sleep 40     # another remote cycle or two: the refusal is logged once and nothing is sent
-        check "(K5) the refusal was logged once" "1" "$(log_since_vm "$CLIENT_VM" "$mark_k5" | grep -cE "ERROR.*(${K_REFUSED_RE})")"
-        check "(K5) no zfs send ran after the revoke" "0" "$(log_since_vm "$CLIENT_VM" "$mark_k5" | grep -cE 'Sending (incremental|full)')"
-        check "(K5) no further 'Backup complete'" "0" "$(log_since_vm "$CLIENT_VM" "$mark_k5" | grep -c 'Backup complete')"
-        check "(K5) no /backup/ request reached the server after the revoke" "0" "$(log_since_vm "$SERVER_VM" "$mark_k5s" | grep -c '/backup/')"
+        check "(K5) the refusal was logged once" "1" "$(log_since_vm "$CLIENT_VM" "$mark_c" | grep -cE "ERROR.*(${K_REFUSED_RE})")"
+        check "(K5) no zfs send ran after the revoke (the cut one was the only one)" "0" "$(log_since_vm "$CLIENT_VM" "$mark_rev" | grep -cE 'Sending (incremental|full)')"
+        check "(K5) no 'Backup complete' after the revoke" "0" "$(log_since_vm "$CLIENT_VM" "$mark_rev" | grep -c 'Backup complete')"
+        check "(K5) no /backup/ request reached the server after the cut" "0" "$(log_since_vm "$SERVER_VM" "$mark_k5s" | grep -c '/backup/')"
         check "(K5) the pending snapshot $K5_NEXT is not on the server" "no" "$(server_snaps | grep -qx "$K5_NEXT" && echo yes || echo no)"
-        check "(K5) the client's anchor stayed at $K5_SNAP" "$K5_SNAP" "$(anchor)"
+        check "(K5) the server still holds the resume token" "yes" "$([ "$(server_token)" != "-" ] && echo yes || echo no)"
+        check "(K5) no zfs receive was started again" "no" "$(recv_running && echo yes || echo no)"
+    else
+        throttle_off
+        K5_NEXT="$(snap_now)"
     fi
 
     # ── K6: re-enroll under the same id with a new certificate ──
     echo
-    step "K6 — re-enroll with a --client-id $K_ID --replace token and a NEW certificate: same id, same server dataset, INCREMENTAL"
+    step "K6 — re-enroll with a --client-id $K_ID --replace token and a NEW certificate: same id, same server dataset; the cut stream is RESUMED, then INCREMENTAL"
     stop_daemon "$CLIENT_VM"
     mint_token --client-id "$K_ID" --replace || die "(K6) could not create a scoped token"
     put_token "$CLIENT_VM" /tmp/zfsb-token-t3 || die "(K6) could not deliver the token file"
@@ -1974,17 +2004,26 @@ else
     check "(K6) the token is consumed, by $K_ID with the new certificate" "consumed $K_ID $K6_FP" \
         "$(cli_jget "$SERVER_VM" 'd["state"] + " " + str(d["consumed_client_id"]) + " " + str(d["consumed_fingerprint"])' trust token show --json | tr -d '\r')"
     check "(K6) B's pin is untouched" "$B_FP -" "$(trust_pins "$K_ID_B")"
-    mark_c="$(loglines "$CLIENT_VM")"
+    mark_c="$(loglines "$CLIENT_VM")"; mark_s="$(loglines "$SERVER_VM")"
     start_daemon "$CLIENT_VM"
-    if wait_server_snap "$K5_NEXT" 150; then pass "(K6) the pending snapshot $K5_NEXT reached the server with the new certificate"; else fail "(K6) $K5_NEXT never reached the server"; fi
+    if wait_server_snap "$K5_NEXT" 180; then pass "(K6) the pending snapshot $K5_NEXT reached the server with the new certificate"; else fail "(K6) $K5_NEXT never reached the server"; fi
     wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${SOURCE_DS}@${K5_NEXT}" 30
     stop_daemon "$CLIENT_VM"
-    check_has "(K6) it was INCREMENTAL from $K5_SNAP" "Backup complete: ${SOURCE_DS}@${K5_NEXT} \(incremental from ${K5_SNAP}\)" "$(log_since_vm "$CLIENT_VM" "$mark_c")"
-    check_lacks "(K6) the refusal is not repeated: the client logs no 'does not trust'" "$K_REFUSED_RE" "$(log_since_vm "$CLIENT_VM" "$mark_c")"
+    k6log="$(log_since_vm "$CLIENT_VM" "$mark_c")"
+    show_log "$CLIENT_VM" "$mark_c" 'Resum|Not resuming|Sending|Backup complete|Transfer failed'
+    check_has "(K6) the cut stream was RESUMED: \"Resumed ${SOURCE_DS}@${K5_SNAP} (from ${k5_base})\"" "Resumed ${SOURCE_DS}@${K5_SNAP} \(from ${k5_base}\) to ${DEST_NAME}" "$k6log"
+    log_since_vm "$SERVER_VM" "$mark_s" | gq 'mode=resume' && pass "(K6) server log: the first stream was mode=resume" || fail "(K6) no 'mode=resume' in the server log"
+    check "(K6) the server discarded no partial state (the resume kept it)" "0" "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -c 'discarding the partial receive state')"
+    check_has "(K6) the cycle continued INCREMENTALLY from $K5_SNAP" "Backup complete: ${SOURCE_DS}@${K5_NEXT} \(incremental from ${K5_SNAP}\)" "$k6log"
+    check_lacks "(K6) the refusal is not repeated: the client logs no 'does not trust'" "$K_REFUSED_RE" "$k6log"
+    check_lacks "(K6) no full send and no 'Not resuming'" "Sending full snapshot|Not resuming" "$k6log"
+    check "(K6) the resumed snapshot $K5_SNAP is byte-identical on the server (guid)" "$k5_snap_guid" "$(guid "$SERVER_VM" "$(server_ds)@${K5_SNAP}")"
+    check "(K6) the resumed snapshot's guid also matches the client's" "$(guid "$CLIENT_VM" "${SOURCE_DS}@${K5_SNAP}")" "$(guid "$SERVER_VM" "$(server_ds)@${K5_SNAP}")"
     check "(K6) the server dataset is the same one (guid unchanged)" "$k5_ds_guid" "$(guid "$SERVER_VM" "$(server_ds)")"
-    check "(K6) the old snapshot $K5_SNAP is the same on the server (not re-received)" "$k5_snap_guid" "$(guid "$SERVER_VM" "$(server_ds)@${K5_SNAP}")"
+    check "(K6) the server's resume token is cleared" "-" "$(server_token)"
     check "(K6) only $K_ID's directory exists under $TARGET_DS" "2" "$(msh "$SERVER_VM" "zfs list -H -d 1 -o name '$TARGET_DS' | wc -l" | tr -d '[:space:]')"
     check "(K6) the anchor advanced to $K5_NEXT" "$K5_NEXT" "$(anchor)"
+    check "(K6) no org.zfsbackup:inflight.* pin is left on the client" "" "$(zprop "$CLIENT_VM" "$SOURCE_DS" "$J_PIN")"
 
     # ── K7: identity rotate ──
     echo
@@ -2065,6 +2104,65 @@ EOF
     check_lacks "(K10) no http:// URL got into the stored config" "http://" "$exp_before"
     check "(K10) identity show is still the same" "$id_json_after" "$(cli_out "$CLIENT_VM" identity show --json | tr -d '[:space:]')"
     msh "$CLIENT_VM" "rm -f /tmp/zfsb-http.yaml /tmp/zfsb-token-t1 /tmp/zfsb-token-t2 /tmp/zfsb-token-t3" || true
+
+    # ── K11: a rotation does not cut a running stream; revoking the successor does ──
+    echo
+    step "K11 — a rotation (and the old pin's retirement) does NOT cut a running stream; revoking the SUCCESSOR key then cuts it (successor_revoked chain)"
+    stop_daemon "$CLIENT_VM"
+    K11_RATE="${K11_RATE:-40mbit}"      # half of J_RATE: the stream must outlive the rotate, the retirement, a quiet wait and the revoke
+    append_random "$J_FILE_MIB" big_k11.bin || fail "(K11) could not write the ${J_FILE_MIB} MiB file"
+    K11_SNAP="$(snap_now)"
+    k11_old="$(client_fp)"; k11_base="$(anchor)"
+    throttle_on "$K11_RATE"
+    mark_c="$(loglines "$CLIENT_VM")"; mark_s="$(loglines "$SERVER_VM")"
+    start_daemon "$CLIENT_VM"
+    k11_ok=0
+    if wait_for_proc send_running 120; then
+        sleep 8
+        if send_running && recv_running; then
+            out="$(cli_vm "$CLIENT_VM" identity rotate)"; rc=$?
+            printf '%s\n' "$out" | sed 's/^/    CLI: /'
+            check "(K11) identity rotate during the stream exits 0" "0" "$rc"
+            K11_FP="$(client_fp)"
+            check "(K11) the certificate changed" "different" "$([ -n "$K11_FP" ] && [ "$K11_FP" != "$k11_old" ] && echo different || echo same)"
+            check "(K11) the server holds two pins (the new one names the old as predecessor)" "yes" \
+                "$(trust_pins "$K_ID" | grep -qx "$K11_FP $k11_old" && echo yes || echo no)"
+            sleep 6
+            if send_running; then pass "(K11) the stream is still running 6s after the rotation"; else fail "(K11) the stream ended (raise J_FILE_MIB or lower K11_RATE): inconclusive"; fi
+            check "(K11) the server logged no cut after the rotation" "0" "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -c 'cutting the running stream')"
+            # the successor's first request retires the old pin -- the key the RUNNING stream is on
+            code="$(probe "${TLS_DIR}/client" GET /whoami)"
+            check "(K11) the NEW certificate is accepted (/whoami 200: its first request retires the old pin)" "200" "$code"
+            waited=0; until [ "$(trust_pins "$K_ID" | grep -c .)" = "1" ] || [ "$waited" -ge 20 ]; do sleep 2; waited=$((waited+2)); done
+            check "(K11) the old pin is retired: one pin left, the new one" "$K11_FP -" "$(trust_pins "$K_ID")"
+            sleep 8      # at least three trust polls: the stream's key is now 'retired', which must not cut
+            check "(K11) the retirement did not cut the running stream (no 'cutting' line)" "0" "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -c 'cutting the running stream')"
+            if send_running && recv_running; then k11_ok=1; pass "(K11) the stream is still running (zfs send and zfs receive alive) after rotate + retirement"; else fail "(K11) the stream ended before the successor could be revoked (raise J_FILE_MIB or lower K11_RATE)"; fi
+        else fail "(K11) the send/receive finished (or never ran) before the rotation"; fi
+    else fail "(K11) no zfs send observed on the client within 120s"; fi
+    if [ "$k11_ok" -eq 1 ]; then
+        # the old key is 'retired', superseded_by the new one: revoking the new one must reach the old key's stream
+        out="$(msh "$SERVER_VM" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$DB' trust revoke '$K11_FP' 2>&1; rc=\$?; echo REVOKED_AT=\$(date +%s); exit \$rc")"; rc=$?
+        printf '%s\n' "$out" | sed 's/^/    CLI(server): /'
+        k11_rev_at="$(printf '%s\n' "$out" | sed -n 's/^REVOKED_AT=//p' | tr -d '[:space:]')"
+        check "(K11) trust revoke <the successor> exits 0" "0" "$rc"
+        if wait_log_vm "$SERVER_VM" "$mark_s" "WARNING.*cutting the running stream of client ${K_ID} for '.*': its certificate was retired by a rotation and its successor ${K11_FP} was revoked \(revoked\)" 20; then
+            pass "(K11) server WARNING: cutting the running stream ... retired by a rotation and its successor ${K11_FP} was revoked"
+            k11_cut_at="$(msh "$SERVER_VM" "ts=\$(tail -n +$(( mark_s + 1 )) '$LOG' | grep -m1 'cutting the running stream' | cut -c1-19); date -d \"\$ts\" +%s" | tr -d '[:space:]')"
+            k11_lat=$(( k11_cut_at - k11_rev_at ))
+            info "the cut was logged ${k11_lat}s after the revoke committed"
+            if [ "$k11_lat" -ge -1 ] && [ "$k11_lat" -le 5 ]; then pass "(K11) the old key's stream was cut ${k11_lat}s after the successor was revoked (<= 5 s)"; else fail "(K11) cut ${k11_lat}s after the revoke (expected within ~4 s)"; fi
+        else fail "(K11) no chain 'cutting the running stream' WARNING after revoking the successor: $(log_since_vm "$SERVER_VM" "$mark_s" | tail -n 5 | cut -c1-200 | tr '\n' '|')"; fi
+        wait_log_vm "$SERVER_VM" "$mark_s" "was cut \(.*\); zfs receive reaped, the partial receive state is kept for a resume" 15 \
+            && pass "(K11) server INFO: the stream was cut; zfs receive reaped, the partial receive state is kept for a resume" \
+            || fail "(K11) no 'was cut ... partial receive state is kept' INFO on the server"
+        check "(K11) exactly one stream was cut" "1" "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -c 'cutting the running stream')"
+        waited=0; while [ "$(server_token)" = "-" ] && [ "$waited" -lt 30 ]; do sleep 2; waited=$((waited+2)); done
+        if [ "$(server_token)" != "-" ]; then pass "(K11) the server kept the partial receive state (receive_resume_token set)"; else fail "(K11) no receive_resume_token after the cut"; fi
+        check "(K11) $K11_SNAP is not on the server (the stream was cut)" "no" "$(server_snaps | grep -qx "$K11_SNAP" && echo yes || echo no)"
+    fi
+    throttle_off
+    stop_daemon "$CLIENT_VM"
 
     check_lacks "(K) no traceback in the client log" "Traceback" "$(log_since_vm "$CLIENT_VM" "$kmark_c")"
     check_lacks "(K) no traceback in the server log" "Traceback" "$(log_since_vm "$SERVER_VM" "$kmark_s")"

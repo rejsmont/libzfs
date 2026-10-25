@@ -56,12 +56,13 @@ the client VM):**
 | K2 — token consumed | enroll with the running daemon (it sends the baseline, full, byte-identical); the same, now spent, token for B: exit 1 "refused the token", still one trusted client |
 | K3 — unscoped token, known id | B claiming A's id: exit 1, "already knows a client with id", the `--client-id` hint, "token was not used and is still valid"; token state stays `active`; the SAME token then enrolls B under its own id |
 | K4 — certificate isolation | B's cert on A's URL: 403 `client_id mismatch` naming B's id; A's cert on B's URL: 403; no cert: 401; `/backup/register`: 404; A's server data (names and guids) unchanged; no dataset for B |
-| K5 — revoke mid-flight | `trust revoke <A's fingerprint>` while a throttled 400 MiB stream runs: the stream still completes and is byte-identical; the next cycle logs one ERROR "does not trust this client", sends nothing, the anchor stays |
-| K6 — re-enroll | `trust token create --client-id A --replace` + `enroll --new-key` (a new certificate): same client id, one pin (the new one), the pending snapshot goes out as `incremental from <anchor>`, same server dataset guid, same old-snapshot guid |
+| K5 — revoke mid-stream | `trust revoke <A's fingerprint>` while a throttled 400 MiB stream runs: the server cuts the stream within ~4 s (WARNING "cutting the running stream of client ...", INFO "was cut; zfs receive reaped, the partial receive state is kept"), no `zfs receive` is left, the server holds a `receive_resume_token`, the client's `zfs send` ends; the client logs one ERROR "does not trust this client", sends nothing more, the anchor and the in-flight pin stay |
+| K6 — re-enroll | `trust token create --client-id A --replace` + `enroll --new-key` (a new certificate): same client id, one pin (the new one); the cut stream is RESUMED (`Resumed <ds>@<snap> (from <anchor>)`, server `mode=resume`, token cleared, matching guids), then the pending snapshot goes out as `incremental from <resumed snapshot>`; same server dataset guid |
 | K7 — rotate | `identity rotate`: two pins, the successor naming its predecessor; the next cycle succeeds incrementally and retires the old pin (one pin, no predecessor) |
 | K8 — import | `import` of a YAML leaves `identity show --json` byte-identical; the destination keeps working |
 | K9 — set-client-id | refused while a destination is enrolled; the id is unchanged |
 | K10 — http:// | import of a config with an `http://` destination: exit 1 "plaintext http is not supported"; the stored config (`export`) is unchanged |
+| K11 — rotation does not cut | `identity rotate` during a throttled stream and the old pin's retirement (the successor's first request) leave the stream running (no "cutting" line); revoking the SUCCESSOR key then cuts it within ~4 s ("retired by a rotation and its successor ... was revoked"), the token is kept |
 
 `test_config_permissions.sh` gained group (i): `<db>.tls` is `0750` in the DB file's group, keys `0600`,
 certificates `0640`, `identity.lock` `0640`; a group operator can read `server.crt` (and issue a token) but
