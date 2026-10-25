@@ -1819,3 +1819,77 @@ class TestPublicApiTimeout:
             kids.kill_all()
             thread.join(20)
         assert isinstance(result.get('exc'), Exception) and not isinstance(result['exc'], ZFSTimeoutError)
+
+
+class TestStuckChildrenAccessor:
+    """`libzfseasy.stuck_children()`: the public, snapshot-only view of the registry (sweeps, never blocks)."""
+
+    def test_empty_registry_gives_an_empty_tuple(self):
+        assert libzfseasy.stuck_children() == ()
+
+    def test_an_alive_stuck_child_is_reported_as_plain_data(self):
+        fake = FakeProcess(pid=777)
+        zfs_module._register_stuck(fake, FakeThread(True), 'zfs destroy')
+        result = libzfseasy.stuck_children()
+        assert isinstance(result, tuple) and len(result) == 1
+        child = result[0]
+        assert isinstance(child, libzfseasy.StuckChild)
+        assert (child.pid, child.label) == (777, 'zfs destroy')
+        assert child.since == zfs_module._stuck[0].since
+        assert not any(value is fake for value in child)          # no live process object leaks
+        assert fake.wait_calls == [] and fake.terminated == fake.killed == 0
+
+    def test_after_the_child_exits_the_next_call_sweeps_it(self):
+        fake = FakeProcess(pid=777)
+        zfs_module._register_stuck(fake, FakeThread(False), 'zfs list')
+        assert [c.pid for c in libzfseasy.stuck_children()] == [777]
+        fake.poll_value = 0
+        assert libzfseasy.stuck_children() == ()
+        assert zfs_module._stuck == [] and fake.stdout.closed and fake.stderr.closed
+
+    def test_it_never_waits_for_a_child(self):
+        fakes = [FakeProcess(pid=i) for i in (1, 2, 3)]
+        for fake in fakes:
+            zfs_module._register_stuck(fake, FakeThread(True), 'zfs list')
+        assert [c.pid for c in libzfseasy.stuck_children()] == [1, 2, 3]   # oldest first
+        assert all(f.wait_calls == [] for f in fakes)
+
+    def test_it_takes_the_registry_lock(self):
+        zfs_module._register_stuck(FakeProcess(pid=9), FakeThread(True), 'zfs list')
+        done = threading.Event()
+        seen = []
+
+        def read():
+            seen.append(libzfseasy.stuck_children())
+            done.set()
+
+        with zfs_module._stuck_lock:
+            thread = threading.Thread(target=read)
+            thread.start()
+            assert not done.wait(0.2)                              # blocked behind the held lock
+        assert done.wait(10)
+        thread.join(10)
+        assert [c.pid for c in seen[0]] == [9]
+
+    def test_concurrent_readers_and_registrations_are_safe(self):
+        errors = []
+        stop = threading.Event()
+
+        def read():
+            try:
+                while not stop.is_set():
+                    for child in libzfseasy.stuck_children():
+                        assert isinstance(child.pid, int)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        readers = [threading.Thread(target=read) for _ in range(3)]
+        for t in readers:
+            t.start()
+        for i in range(200):
+            zfs_module._register_stuck(FakeProcess(pid=2000 + i), FakeThread(False), 'zfs list')
+        stop.set()
+        for t in readers:
+            t.join(60)
+        assert not errors, errors
+        assert len(libzfseasy.stuck_children()) == 200

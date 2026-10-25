@@ -1,6 +1,6 @@
 from libzfseasy.types import InvalidNameError, InvalidValueError, Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as Snapshot, Bookmark, \
      SnapshotRange, Property, Properties
-from typing import Optional, Union, Dict, Iterable, Callable, NamedTuple
+from typing import Optional, Union, Dict, Iterable, Callable, NamedTuple, Tuple
 
 import collections
 import contextlib
@@ -394,7 +394,8 @@ def timeout(seconds):
     at most 2 s) and `ZFSTimeoutError` is raised; the outcome of the command is unknown. A child that survives SIGKILL
     (uninterruptible sleep, typically a hung pool) cannot be freed: it stays registered, and every later call made
     under a timeout raises `ZFSTimeoutError` at once, without starting a child, until it has exited. Calls made
-    without a timeout are never refused. A timeout frees the calling thread, not the stuck process.
+    without a timeout are never refused. A timeout frees the calling thread, not the stuck process;
+    `libzfseasy.stuck_children()` reports such processes (and reaps the ones that have since exited).
 
     `send` and `receive` (and their `StreamHandle`s) ignore the timeout, as does `send.resume_info`. A lazy iterator
     (`lazy=True`) spends its budget from the first row request until its last row, including the time the consumer
@@ -538,6 +539,28 @@ def _sweep_stuck() -> list:
                 entry.release()
         _stuck[:] = alive
         return list(alive)
+
+
+class StuckChild(NamedTuple):
+    """A snapshot of one child that survived a timeout's SIGTERM and SIGKILL (see `stuck_children`). Plain data: no
+    process object, so holding it keeps nothing alive. `since` is a `time.monotonic()` value (when it was registered)."""
+    pid: int
+    label: str
+    since: float
+
+
+def stuck_children() -> Tuple[StuckChild, ...]:
+    """The children of this process that a timed-out call could not get rid of (they survived SIGKILL, typically in
+    uninterruptible sleep on a hung pool) and that are still running, oldest first.
+
+    Cheap, thread-safe and never blocks: it takes the registry lock, polls each registered child without waiting
+    (`poll()`, a non-blocking `waitpid`), releases and drops the ones that have exited (so a recovered pool clears the
+    registry here, not only at the next timed call) and returns a snapshot. An empty tuple means no earlier timed-out
+    command can still be running in this process, so a caller that must not overlap a new zfs mutation with an
+    abandoned one polls this until it is empty. The registry is per process: it is empty in a forked child and lost
+    when the process exits, which is why a process replacing a worker has to wait for this before it lets go.
+    """
+    return tuple(StuckChild(getattr(e.process, 'pid', -1), e.label, e.since) for e in _sweep_stuck())
 
 
 def _admit_timed(cmd) -> None:

@@ -92,7 +92,8 @@ Properties are stored internally as integer-indexed lists (using `_prop_names` c
 still running after `libzfseasy.slow_command_warning` seconds (default 60; None turns it off) at WARNING, and again at
 each further multiple. `with libzfseasy.timeout(s):` (a ContextVar, per command, non-streaming only) terminates an
 overrunning child and raises `ZFSTimeoutError`; while a timed-out child survives KILL, every later *timed* call fails
-fast (untimed calls are never refused). `SendCommand` and `ReceiveCommand` use binary streaming variants (`_exec_stream` / `_exec_stream_in`) that return `BufferedReader`/`BufferedWriter`.
+fast (untimed calls are never refused); `libzfseasy.stuck_children()` snapshots those survivors (`StuckChild(pid,
+label, since)`, non-blocking sweep; per process, so a draining worker waits until it is empty). `SendCommand` and `ReceiveCommand` use binary streaming variants (`_exec_stream` / `_exec_stream_in`) that return `BufferedReader`/`BufferedWriter`.
 `-H` output framing is a trust boundary: every write refuses values containing `\n`, `\r`, `\t` or `\0`
 (`Validate.value`, `InvalidValueError`) before running; `list`/`get` read bytes (`_exec_lines`, surrogateescape,
 split on `\n` only) and fail closed per row and per object (wrong column count, out-of-scope or duplicate names,

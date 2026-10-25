@@ -6,7 +6,8 @@ from libzfseasy.zfs import (
     ListCommand, CreateCommand, SnapshotCommand, BookmarkCommand, DestroyCommand, RenameCommand,
     AllowCommand, UnAllowCommand, CloneCommand, GetCommand, SetCommand, InheritCommand,
     SendCommand, ReceiveCommand, ChangeKeyCommand, LoadKeyCommand, UnLoadKeyCommand,
-    MountCommand, UnMountCommand, GetRow, GetRows, PropertySource, ZFSOutputError, ZFSTimeoutError, timeout
+    MountCommand, UnMountCommand, GetRow, GetRows, PropertySource, ZFSOutputError, ZFSTimeoutError, timeout,
+    StuckChild, stuck_children
 )
 from libzfseasy import zfs as _zfs_module
 
