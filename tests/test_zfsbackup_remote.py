@@ -23,6 +23,7 @@ from zfsbackup.config import (
 )
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
 from _snapshot_support import ABSENT, NO_TXG, listed_info
+from _stream_support import get_value_answers
 from zfsbackup.remote import NegotiationFailed, RemoteBackupManager, _SendStream
 
 BASE = HTTPS_BASE
@@ -2701,6 +2702,9 @@ class TestUrlRoundTripThroughTheServer:
         zset = mocker.patch('zfsbackup.api.zfs.set')
         mocker.patch('zfsbackup.api.zfs.list', return_value=[])
         mocker.patch('zfsbackup.api.read_zfsbackup_properties', return_value={})
+        # the dataset exists with a LOCAL client id (B-2c), the bound one
+        mocker.patch('zfsbackup.api.zfs.get.value', side_effect=get_value_answers(
+            {'org.zfsbackup:client_id': 'client-1'}))
 
         config = _make_config(
             datasets=[DatasetConfig(name='pool/my data', remote=[RemoteDatasetConfig(destination='offsite')])],
@@ -5396,11 +5400,28 @@ class TestServerRefusesTheStream:
     """A race the client's check cannot see (the server changed between negotiate and stream), or an
     older client's view: the server answers with `reason` where the final ack should be."""
 
-    REASONS = ['server_newer', 'base_missing', 'no_common', 'listing']
+    #: B-2b's four and the three of B-2a (the server read the stream's header: `stream_header`
+    #: not a plain single-snapshot stream, `base_mismatch` not the declared base, `type_mismatch`
+    #: a filesystem where a volume arrives or the reverse).
+    REASONS = ['server_newer', 'base_missing', 'no_common', 'listing',
+               'stream_header', 'base_mismatch', 'type_mismatch']
+    #: The operator hint appended to the server's text; none for the older four.
+    HINTS = {
+        'stream_header': 'compare `zfsbackupd --version` on both hosts',
+        'base_mismatch': 'compare `zfsbackupd --version` on both hosts',
+        'type_mismatch': '`zfs rename` it to a name outside the backup target',
+    }
 
     def test_the_reasons_the_client_knows(self):
         from zfsbackup.remote import _STREAM_REFUSAL_REASONS
         assert set(_STREAM_REFUSAL_REASONS) == set(self.REASONS)
+        assert len(_STREAM_REFUSAL_REASONS) == len(self.REASONS)          # no duplicates
+
+    def test_exactly_the_new_reasons_carry_a_hint(self):
+        from zfsbackup.remote import _STREAM_REFUSAL_HINTS
+        assert set(_STREAM_REFUSAL_HINTS) == set(self.HINTS)
+        for reason, phrase in self.HINTS.items():
+            assert phrase in _STREAM_REFUSAL_HINTS[reason]
 
     def refusal(self, reason='server_newer', **extra):
         return {'error': f'pool/b/client1/data refused: {reason}', 'reason': reason, **extra}
@@ -5430,17 +5451,41 @@ class TestServerRefusesTheStream:
         assert 'Transfer failed' not in caplog.text
 
     @pytest.mark.parametrize('ack', [True, False], ids=['at-the-ack', 'behind-a-failed-send'])
-    def test_once_over_two_cycles_and_rearmed_by_an_acknowledged_stream(self, h5, mocker, caplog, ack):
+    @pytest.mark.parametrize('reason', REASONS)
+    def test_the_new_reasons_carry_an_operator_hint_and_the_old_ones_end_with_the_servers_text(
+        self, h5, mocker, caplog, reason, ack
+    ):
+        chain = self.refused_chain(h5, mocker, self.refusal(reason), ack)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            assert chain.run(common=S1) is False
+        (rec,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        text = rec.getMessage()
+        assert text.endswith(f'pool/b/client1/data refused: {reason}') != (reason in self.HINTS)
+        if reason in self.HINTS:
+            assert self.HINTS[reason] in text
+            assert f'pool/b/client1/data refused: {reason} (' in text      # the server's text, then the hint
+
+    @pytest.mark.parametrize('ack', [True, False], ids=['at-the-ack', 'behind-a-failed-send'])
+    @pytest.mark.parametrize('reason', ['server_newer', 'stream_header', 'base_mismatch', 'type_mismatch'])
+    def test_once_over_two_cycles_and_rearmed_by_an_acknowledged_stream(self, h5, mocker, caplog, ack, reason):
         def run(reply=None):
             chain = (self.refused_chain(h5, mocker, reply, ack) if reply is not None
                      else Chain(h5, mocker, sessions=4))
             return chain.run(common=S4)
 
         with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
-            assert run(self.refusal()) is False
-            assert run(self.refusal()) is False
+            assert run(self.refusal(reason)) is False
+            assert run(self.refusal(reason)) is False
             assert run() is True                                  # an acknowledged stream
-            assert run(self.refusal()) is False
+            assert run(self.refusal(reason)) is False
+        records = messages(caplog, 'refused pool/data -> offsite')
+        assert [r.levelname for r in records] == ['ERROR', 'DEBUG', 'ERROR']
+
+    def test_a_different_reason_is_a_new_episode(self, h5, mocker, caplog):
+        """The dedup key holds the whole message, so a changed refusal logs again at ERROR."""
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            for reason in ('stream_header', 'stream_header', 'type_mismatch'):
+                assert self.refused_chain(h5, mocker, self.refusal(reason)).run(common=S4) is False
         records = messages(caplog, 'refused pool/data -> offsite')
         assert [r.levelname for r in records] == ['ERROR', 'DEBUG', 'ERROR']
 

@@ -127,7 +127,7 @@ class FakeZfs:
             if roots.name in self.missing:
                 raise RuntimeError(f"cannot open '{roots.name}': dataset does not exist")
             return [Filesystem(roots.name)]
-        if types == 'filesystem':            # DatasetManager.received_datasets()
+        if types == 'filesystem,volume':     # DatasetManager.received_datasets()
             return list(self.received)
         assert types == 'snapshot', f'unexpected zfs.list(types={types!r})'
         self.list_roots.append(roots.name)

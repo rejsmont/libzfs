@@ -41,6 +41,9 @@ from test_zfsbackup_api import (  # noqa: F401  (Stream: a harness, not a test; 
     GOOD_CONFIG, NOT_NEGOTIATED, SERVER_DS, STREAM_PATH, TOKEN, Stream, _remote_config,
     source_props, stored_config,
 )
+from _stream_support import (
+    FILESYSTEM_FORCED, HEADER, expected_receive_argv, get_value_answers, incremental_header, stream_script,
+)
 from _api_support import Authed, pending_configs
 from libzfseasy.types import Dataset
 from zfsbackup.api import SERVER_OWNED_PROPERTIES, canonical_dataset_config
@@ -53,6 +56,9 @@ EXPECTED_PROPS = {
     PROP_CLIENT_ID: "client1",
     PROP_SOURCE_DATASET: "pool/data",
 }
+#: What the receive is given as `props` for a filesystem stream: the owned values, then the
+#: forced ones (B-2a; the forced set itself is tested in `test_zfsbackup_api_stream_header.py`).
+RECEIVE_PROPS = {**EXPECTED_PROPS, **FILESYSTEM_FORCED}
 
 
 @pytest.fixture
@@ -108,7 +114,7 @@ class TestReceiveFlags:
         stream.run(mode)
         (call,) = stream.receive.call_args_list
         assert str(call.args[0]) == SERVER_DS
-        assert call.kwargs["props"] == EXPECTED_PROPS
+        assert call.kwargs["props"] == RECEIVE_PROPS
         assert (call.kwargs["force"], call.kwargs["save"], call.kwargs["mount"]) == (True, True, False)
 
     @pytest.mark.parametrize("mode", ["fresh", "resume"])
@@ -133,7 +139,7 @@ class TestReceiveFlags:
         stream.exists.side_effect = [True, True, True, True]
         stream.run("fresh")
         (call,) = stream.receive.call_args_list
-        assert call.kwargs["props"] == EXPECTED_PROPS
+        assert call.kwargs["props"] == RECEIVE_PROPS
         stream.abort.assert_called_once()
 
     def test_the_props_are_a_fresh_dict_each_time(self, mocker):
@@ -142,7 +148,7 @@ class TestReceiveFlags:
             s = Stream(mocker)
             s.run("resume")
             props = s.receive.call_args.kwargs["props"]
-            assert props == EXPECTED_PROPS
+            assert props == RECEIVE_PROPS
             props.clear()
         assert list(SERVER_OWNED_PROPERTIES) == OWNED
 
@@ -153,7 +159,8 @@ class TestReceiveArgv:
     def run(self, mocker, mock_subprocess, mode, *, token=None):
         mocker.patch("zfsbackup.api.read_zfsbackup_properties", return_value={})
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
-        mocker.patch("zfsbackup.api.zfs.get.value", return_value=STORED)
+        mocker.patch("zfsbackup.api.zfs.get.value", side_effect=get_value_answers({
+            PROP_CONFIG: STORED, PROP_CLIENT_ID: "client1", "type": "filesystem"}))
         authed = Authed(_remote_config())
         handler = authed.app.view_functions["backup_stream"].__wrapped__
         first = len(mock_subprocess.call_args_list)          # (a test may run several streams)
@@ -169,7 +176,7 @@ class TestReceiveArgv:
             mock_subprocess.setup_multi(
                 snapshots, ([f"{SERVER_DS}\tfilesystem\t{token}\n"],), ("",), ("",))   # + abort
         ws = MagicMock()
-        ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        ws.receive.side_effect = stream_script(b"chunk", header=incremental_header(5000))
         with authed.context(STREAM_PATH, query_string={"mode": mode, "from_guid": "5000"}):
             handler(ws, "client1", "pool/data")
         assert json.loads(ws.send.call_args[0][0]) == {"status": "ok"}
@@ -182,20 +189,21 @@ class TestReceiveArgv:
     def test_every_receive_carries_o_for_all_three_in_order(self, mocker, mock_subprocess):
         for mode, token in (("resume", None), ("fresh", None), ("fresh", TOKEN)):
             argv = self.receive_argv(self.run(mocker, mock_subprocess, mode, token=token))
-            assert owned_in(argv) == [
+            assert owned_in(argv)[:3] == [
                 f"{PROP_CONFIG}={STORED}",
                 f"{PROP_CLIENT_ID}=client1",
                 f"{PROP_SOURCE_DATASET}=pool/data",
             ], (mode, token, argv)
+            assert argv == expected_receive_argv(EXPECTED_PROPS, "filesystem", SERVER_DS, force=True)
             assert argv[-1] == SERVER_DS
-            for flag in ("-F", "-s", "-u"):
+            for flag in ("-F", "-h", "-s", "-u"):
                 assert flag in argv
 
     def test_there_is_no_x_at_all(self, mocker, mock_subprocess):
         for mode in ("resume", "fresh"):
             argv = self.receive_argv(self.run(mocker, mock_subprocess, mode))
             assert "-x" not in argv
-            assert argv.count("-o") == 3
+            assert argv.count("-o") == 3 + len(FILESYSTEM_FORCED)       # the owned and the forced values
 
     def test_fresh_and_resume_argv_are_identical(self, mocker, mock_subprocess):
         fresh = self.receive_argv(self.run(mocker, mock_subprocess, "fresh"))
@@ -225,15 +233,15 @@ class TestStreamOwnsTheServerProperties:
     @pytest.mark.parametrize("mode", ["fresh", "resume"])
     def test_the_config_is_read_locally_from_the_server_dataset(self, stream, mode):
         stream.run(mode)
-        stream.get_value.assert_called_once()
-        call = stream.get_value.call_args
+        (call,) = [c for c in stream.get_value.call_args_list if c.args[1] == PROP_CONFIG]
         assert isinstance(call.args[0], Dataset) and str(call.args[0]) == SERVER_DS
-        assert call.args[1] == PROP_CONFIG
         assert call.kwargs == {"sources": "local"}          # never a received or inherited copy
+        # ...and so is the owner (B-2c); the type is the one read with no source restriction
+        assert (PROP_CLIENT_ID, "local") in stream.reads
+        assert ("type", None) in stream.reads
 
     def test_the_stored_value_is_canonicalised(self, stream):
-        stream.get_value.side_effect = None
-        stream.get_value.return_value = non_canonical_config()
+        stream.stored = non_canonical_config()
         stream.run("resume")
         props = stream.receive.call_args.kwargs["props"]
         assert props[PROP_CONFIG] == canonical_dataset_config(non_canonical_config())
@@ -248,10 +256,10 @@ class TestStreamOwnsTheServerProperties:
     def test_the_value_read_before_the_abort_is_the_one_received_with(self, stream):
         """A second read after the abort (or the receive) would find a different value, or none."""
         stream.token(TOKEN)
-        stream.get_value.side_effect = [STORED, None, "junk"]
+        stream.config_script[:] = [STORED, None, "junk"]
         stream.run("fresh")
         assert stream.receive.call_args.kwargs["props"][PROP_CONFIG] == STORED
-        assert stream.get_value.call_count == 1
+        assert stream.config_reads == 1
 
     @pytest.mark.parametrize("mode", ["fresh", "resume"])
     def test_the_url_dataset_and_the_bound_id_are_stamped(self, stream, mode):
@@ -282,14 +290,14 @@ class TestStreamOwnsTheServerProperties:
         s = Stream(mocker, dry_run=True)
         s.run("fresh")
         assert s.sent == [{"status": "ok", "dry_run": True}]
-        s.get_value.assert_not_called()
+        assert s.reads == [(PROP_CLIENT_ID, "local")]       # only the (read-only) ownership check
         s.receive.assert_not_called()
 
     def test_an_ownership_conflict_is_answered_before_the_config_is_read(self, stream, source_props):
         source_props.return_value = {PROP_SOURCE_DATASET: "tank/other"}
         stream.run("fresh")
         assert "refusing to mix in" in stream.sent[0]["error"]
-        stream.get_value.assert_not_called()
+        assert stream.config_reads == 0
         stream.receive.assert_not_called()
 
 
@@ -318,8 +326,7 @@ class TestStreamNeedsANegotiatedConfig:
     @pytest.mark.parametrize("mode", ["fresh", "resume"])
     @pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
     def test_a_dataset_without_a_local_config(self, stream, mode, value):
-        stream.get_value.side_effect = None
-        stream.get_value.return_value = value
+        stream.stored = value
         stream.token(TOKEN)
         stream.run(mode)
         self.assert_refused(stream)
@@ -336,15 +343,13 @@ class TestStreamNeedsANegotiatedConfig:
         }).encode()).decode(),                                       # decodes, but zero frequency
     ], ids=["garbage", "not-json", "no-frequency", "list", "newline", "zero-frequency"])
     def test_an_undecodable_or_unusable_config(self, stream, mode, value):
-        stream.get_value.side_effect = None
-        stream.get_value.return_value = value
+        stream.stored = value
         stream.token(TOKEN)
         stream.run(mode)
         self.assert_refused(stream)
 
     def test_the_refusal_is_logged_without_the_stored_value(self, stream, caplog):
-        stream.get_value.side_effect = None
-        stream.get_value.return_value = "SECRET-NOT-BASE64!"
+        stream.stored = "SECRET-NOT-BASE64!"
         with caplog.at_level(logging.WARNING, logger="zfsbackup.api"):
             stream.run("resume")
         assert any("negotiate first" in r.getMessage() for r in caplog.records)
@@ -352,7 +357,7 @@ class TestStreamNeedsANegotiatedConfig:
         assert "SECRET-NOT-BASE64" not in json.dumps(stream.sent)
 
     def test_a_failing_read_is_its_own_error_and_nothing_runs(self, stream, caplog):
-        stream.get_value.side_effect = RuntimeError("cannot open: permission denied for tank/secret")
+        stream.fail_config_read(RuntimeError("cannot open: permission denied for tank/secret"))
         with caplog.at_level(logging.ERROR, logger="zfsbackup.api"):
             stream.run("fresh")
         assert stream.sent == [{"error": f"Failed to read the configuration of {SERVER_DS}"}]
@@ -364,9 +369,9 @@ class TestStreamNeedsANegotiatedConfig:
         assert stream.gate.active == 0 and stream.claimed == set()
 
     def test_the_next_stream_is_served_after_a_refusal(self, stream):
-        stream.get_value.side_effect = [None, STORED]
+        stream.config_script[:] = [None, STORED]
         stream.run("resume")
-        stream.ws.receive.side_effect = [json.dumps({"done": True})]
+        stream.ws.receive.side_effect = stream_script()
         stream.run("resume")
         assert stream.sent == [NOT_NEGOTIATED, {"status": "ok"}]
 
@@ -398,12 +403,12 @@ class TestNoStampAfterTheReceive:
     def test_ok_follows_the_close_directly(self, stream, mode):
         self.record(stream)
         stream.run(mode)
-        assert stream.order == ["get", "receive", "write", "close", ("send", {"status": "ok"})]
+        assert stream.order == ["get", "receive", "write", "write", "close", ("send", {"status": "ok"})]
         stream.set.assert_not_called()
 
     def test_a_second_stream_does_not_stamp_either(self, stream):
         stream.run("resume")
-        stream.ws.receive.side_effect = [json.dumps({"done": True})]
+        stream.ws.receive.side_effect = stream_script()
         stream.run("resume")
         stream.set.assert_not_called()
         assert stream.receive.call_count == 2
@@ -439,12 +444,12 @@ class TestNoStampAfterAFailedReceive:
         assert "error" in stream.sent[-1]
 
     def test_a_client_that_disconnects(self, stream):
-        stream.ws.receive.side_effect = ConnectionClosed(None, None)
+        stream.ws.receive.side_effect = [HEADER, ConnectionClosed(None, None)]
         stream.run("resume")
         stream.set.assert_not_called()
 
     def test_a_timeout(self, stream):
-        stream.ws.receive.side_effect = [b"chunk", None]
+        stream.ws.receive.side_effect = [HEADER, None]
         stream.run("resume")
         stream.set.assert_not_called()
         assert "error" in stream.sent[-1]
@@ -484,7 +489,7 @@ class TestPendingConfigStream:
         assert fresh.sent == [{"status": "ok"}]
         (call,) = fresh.receive.call_args_list
         assert str(call.args[0]) == SERVER_DS
-        assert call.kwargs["props"] == EXPECTED_PROPS
+        assert call.kwargs["props"] == RECEIVE_PROPS
         fresh.get_value.assert_not_called()                 # no dataset to read a local property from
 
     @pytest.mark.parametrize("mode", ["fresh", "resume"])
@@ -510,7 +515,7 @@ class TestPendingConfigStream:
         """After the first receive the dataset exists (and holds its own config); a stream that
         finds neither is told to negotiate again, and receives nothing."""
         fresh.run("fresh")
-        fresh.ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        fresh.ws.receive.side_effect = stream_script(b"chunk")
         fresh.run("fresh")
         assert fresh.sent == [{"status": "ok"}, NOT_NEGOTIATED]
         assert fresh.receive.call_count == 1
@@ -523,7 +528,7 @@ class TestPendingConfigStream:
         assert fresh.sent == [{"error": "cannot receive: checksum mismatch"}]
         assert list(pending_configs(fresh.app)) == [SERVER_DS]
         fresh.writer.close.side_effect = None
-        fresh.ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        fresh.ws.receive.side_effect = stream_script(b"chunk")
         fresh.run("fresh")
         assert fresh.sent[-1] == {"status": "ok"}
         assert dict(pending_configs(fresh.app)) == {}
@@ -559,7 +564,7 @@ class TestPendingConfigStream:
         assert stream.sent == [NOT_NEGOTIATED]
         stream.receive.assert_not_called()
         assert list(pending_configs(stream.app)) == [SERVER_DS]       # theirs is untouched
-        stream.ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        stream.ws.receive.side_effect = stream_script(b"chunk")
         stream.run("fresh", dataset="tank/data")
         assert stream.sent[-1] == {"status": "ok"}
         props = stream.receive.call_args.kwargs["props"]
@@ -594,8 +599,7 @@ class TestPendingConfigStream:
                              ids=["empty", "garbage", "not-json"])
     def test_a_damaged_local_config_is_refused_and_the_entry_is_not_used(self, fresh, damaged):
         fresh.exists.return_value = True
-        fresh.get_value.side_effect = None
-        fresh.get_value.return_value = damaged
+        fresh.stored = damaged
         fresh.run("fresh")
         assert fresh.sent == [NOT_NEGOTIATED]
         fresh.receive.assert_not_called()
@@ -604,7 +608,7 @@ class TestPendingConfigStream:
 
     def test_an_unreadable_local_config_is_its_own_error_and_the_entry_is_not_used(self, fresh):
         fresh.exists.return_value = True
-        fresh.get_value.side_effect = RuntimeError("cannot open: boom")
+        fresh.fail_config_read(RuntimeError("cannot open: boom"))
         fresh.run("fresh")
         assert fresh.sent == [{"error": f"Failed to read the configuration of {SERVER_DS}"}]
         fresh.receive.assert_not_called()
@@ -636,7 +640,7 @@ class TestPendingConfigStream:
         mock_subprocess.setup_multi(("",))
         handler = authed.app.view_functions["backup_stream"].__wrapped__
         ws = MagicMock()
-        ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        ws.receive.side_effect = stream_script(b"chunk")
         with authed.context(STREAM_PATH, query_string={"mode": "fresh"}):
             handler(ws, "client1", "pool/data")
         assert json.loads(ws.send.call_args[0][0]) == {"status": "ok"}
@@ -645,8 +649,10 @@ class TestPendingConfigStream:
         assert "-F" not in argv and "-x" not in argv
         for flag in ("-s", "-u"):
             assert flag in argv
-        assert owned_in(argv) == [
+        assert owned_in(argv)[:3] == [
             f"{PROP_CONFIG}={STORED}", f"{PROP_CLIENT_ID}=client1", f"{PROP_SOURCE_DATASET}=pool/data"]
+        assert argv == expected_receive_argv(
+            EXPECTED_PROPS, "filesystem", SERVER_DS, force=False)
 
 
 class TestForceFollowsExistence:
@@ -666,7 +672,7 @@ class TestForceFollowsExistence:
         stream.run("fresh")
         assert stream.order == ["get", "abort", "receive"]
         assert stream.receive.call_args.kwargs["force"] is False
-        assert stream.receive.call_args.kwargs["props"] == EXPECTED_PROPS
+        assert stream.receive.call_args.kwargs["props"] == RECEIVE_PROPS
 
     def test_an_abort_that_leaves_the_dataset_keeps_force(self, stream):
         """An incremental's `%recv` state is discarded; the dataset and its snapshots stay (Z3)."""
@@ -679,10 +685,10 @@ class TestForceFollowsExistence:
     def test_the_values_read_before_the_abort_are_used_after_it(self, stream):
         stream.token(TOKEN)
         stream.exists.side_effect = [True, True, True, False]
-        stream.get_value.side_effect = [STORED, None, "junk"]
+        stream.config_script[:] = [STORED, None, "junk"]
         stream.run("fresh")
         assert stream.receive.call_args.kwargs["props"][PROP_CONFIG] == STORED
-        assert stream.get_value.call_count == 1
+        assert stream.config_reads == 1
 
     def test_the_existence_is_asked_once_for_the_receive_and_by_name(self, stream):
         stream.run("resume")
@@ -755,7 +761,7 @@ class TestPlaceholderOverwriteMessage:
     def test_the_next_stream_is_served(self, stream):
         self.run_close_raises(stream)
         stream.writer.close.side_effect = None
-        stream.ws.receive.side_effect = [json.dumps({"done": True})]
+        stream.ws.receive.side_effect = stream_script()
         stream.run("resume")
         assert stream.sent[-1] == {"status": "ok"}
 
@@ -1058,7 +1064,7 @@ class TestTheDecisionThroughTheStream:
         assert set(reply) == {"error", "reason"}
         for m in (stream.receive, stream.abort, stream.create, stream.set):
             m.assert_not_called()
-        stream.ws.receive.assert_not_called()          # no byte of the stream was read
+        assert stream.ws.receive.call_count == 1       # the header was read first; nothing after it
         assert stream.gate.active == 0 and stream.claimed == set()
         return reply
 
@@ -1137,7 +1143,7 @@ class TestTheDecisionThroughTheStream:
         reply = self.refused(stream, "server_newer")
         assert f"{B}…{A}" in reply["error"]               # oldest txg first
         # and from A (the newest by txg) there is nothing newer
-        stream.ws.receive.side_effect = [json.dumps({"done": True})]
+        stream.ws.receive.side_effect = stream_script(header=incremental_header(GA))
         stream.run("resume", **{"from": A, "from_guid": str(GA)})
         assert stream.sent[-1] == {"status": "ok"}
 
@@ -1207,10 +1213,11 @@ class TestTheDecisionThroughTheStream:
         assert calls["fresh"] == calls["resume"]
 
     def test_the_argv_of_a_permitted_rollback_is_the_ordinary_forced_receive(self, mocker, mock_subprocess):
-        """Through the real command: `-F -s -u` and the three `-o`, nothing else added."""
+        """Through the real command: the ordinary forced receive, nothing else added."""
         mocker.patch("zfsbackup.api.read_zfsbackup_properties", return_value={})
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
-        mocker.patch("zfsbackup.api.zfs.get.value", return_value=STORED)
+        mocker.patch("zfsbackup.api.zfs.get.value", side_effect=get_value_answers({
+            PROP_CONFIG: STORED, PROP_CLIENT_ID: "client1", "type": "filesystem"}))
         authed = Authed(_remote_config())
         handler = authed.app.view_functions["backup_stream"].__wrapped__
         mock_subprocess.setup_multi(
@@ -1218,7 +1225,7 @@ class TestTheDecisionThroughTheStream:
             ("",),
         )
         ws = MagicMock()
-        ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        ws.receive.side_effect = stream_script(b"chunk", header=incremental_header(GA))
         with authed.context(STREAM_PATH, query_string={
             "mode": "resume", "from": A, "from_guid": str(GA), "discard": str(GB),
         }):
@@ -1227,8 +1234,8 @@ class TestTheDecisionThroughTheStream:
         argvs = [c[0][0][1:] for c in mock_subprocess.call_args_list]
         assert [a[0] for a in argvs] == ["list", "receive"]
         argv = argvs[1]
-        assert argv.count("-o") == 3 and "-x" not in argv
-        assert [f for f in ("-F", "-s", "-u") if f in argv] == ["-F", "-s", "-u"]
+        assert "-x" not in argv
+        assert argv == expected_receive_argv(EXPECTED_PROPS, "filesystem", SERVER_DS, force=True)
 
     # -- listing failures fail closed -------------------------------------------------------------
 
@@ -1243,7 +1250,7 @@ class TestTheDecisionThroughTheStream:
         assert "pool I/O is currently suspended" in reply["error"]
         for m in (held.receive, held.abort, held.create, held.set):
             m.assert_not_called()
-        held.ws.receive.assert_not_called()
+        assert held.ws.receive.call_count == 1                 # the header, read before the listing
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1 and SERVER_DS in errors[0]
         assert held.gate.active == 0 and held.claimed == set()
@@ -1305,7 +1312,7 @@ class TestTheDecisionThroughTheStream:
 
     def test_the_next_stream_is_served_after_a_refusal(self, held):
         held.run("resume", **{"from": A, "from_guid": str(GA)})
-        held.ws.receive.side_effect = [json.dumps({"done": True})]
+        held.ws.receive.side_effect = stream_script(header=incremental_header(GC))
         held.run("resume", **{"from": C, "from_guid": str(GC)})
         assert held.sent[-1] == {"status": "ok"} and "reason" in held.sent[0]
 

@@ -725,8 +725,27 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
   it: the daemon enumerates everything below it and treats it as received client data, and prunes it. A
   dataset of this host's own configuration at, below, or (when it is `recursive`) above the target is refused
   when the configuration is imported or reloaded, because its snapshots and pruning would act on received
-  data. Put nothing else there. Create it before the first client connects (`zfs create tank/backups`):
-  `check` reports a target that does not exist as CRIT.
+  data. Put nothing else there. Create it before the first client connects (`zfs create tank/backups`): the
+  server does not create it, and `check` reports a target that does not exist as CRIT.
+- **Server copies are inert.** Every receive sets, as local values, `canmount=noauto`, `readonly=on`,
+  `volmode=none`, `mountpoint=none`, `sharenfs=off`, `sharesmb=off`, `setuid=off`, `exec=off` and
+  `devices=off` on a filesystem, and `readonly=on`, `volmode=none` on a volume, and takes no holds (`-h`). A
+  received dataset is never mounted, shared or exposed as a device, whatever the client's properties say;
+  the containers the server creates for a client (`<target>/<client_id>` and parents) are `canmount=noauto`.
+  Read data through a clone outside the tree ([Getting files back](#getting-files-back-file-level)).
+- **Only plain streams are received.** The server reads each stream's header before `zfs receive` runs and
+  refuses property or replication streams (`zfs send -p`, `-R`, `-I`), a stream whose base is not the one the
+  client declared, and a volume stream onto a filesystem copy (or the reverse). The client never sends those;
+  a refusal means a client/server mismatch or a bug, and is logged on both sides.
+- **The server only writes into datasets it created.** A dataset under `<target>/<client_id>` that the server
+  did not create (it has no local `org.zfsbackup:client_id`), including one you created or moved there by
+  hand, is refused with 409 and the hint `zfs set org.zfsbackup:client_id=<id> <ds>`: backups of that dataset,
+  and of new client datasets below it, stop (one ERROR on the client) while the rest carry on. Run the hint only
+  to adopt that dataset into the client's backups on purpose (and, on a filesystem, set `canmount=noauto`).
+  A server copy renamed aside and back keeps its stamp.
+- **A client that shortens its retention** is logged on the server at WARNING ("the retention horizon of …
+  shrinks from 30d to 7d"): the server applies the client's retention as sent, so older snapshots go at the
+  next pruning cycle.
 - **Layout.** A client's dataset `tank/data` is stored as `<target>/<client_id>/data`: the server drops the
   client's **pool** name and decides the rest; the client never chooses a path. A client's pool root `tank`
   is `<target>/<client_id>` itself. Two client datasets that map to the same server name (`tank/data` and
@@ -864,7 +883,7 @@ sudo zfs destroy tank/restore/data
 
 - **Outside the target tree**, because a clone takes its properties from its new parent, not from the origin:
   it does not pick up the server copy's `canmount`, `readonly`, `mountpoint`, `volmode` or `org.zfsbackup:*`
-  values (a later release may set some of these on the server copy).
+  values, so it can be mounted where you choose.
 - **A volume** is cloned with `-o volmode=dev` (and without `canmount`/`mountpoint`); read it at
   `/dev/zvol/tank/restore/data`.
 - **Destroy the clone when you are done.** While it exists its origin snapshot cannot be pruned (the pruner
@@ -877,9 +896,8 @@ sudo zfs destroy tank/restore/data
 
 On the **server**, send the snapshot to the client and receive it unmounted. Send the server's **newest**
 snapshot, or receive into a new dataset name ([Rejoining](#rejoining-seed-and-continue)). **Do not use `-p` or `-R`**:
-with them the server's own `org.zfsbackup:*` values (and the client's original properties) travel with the
-stream, and a later release may also set `readonly`, `canmount` and `volmode` on the server copy, which would
-arrive as well. Use the flags the client itself sends with: `-L -c` for a plain copy, `-w` for a raw one. A
+with them the server copy's own values travel with the stream: its `org.zfsbackup:*` values and the inert
+settings above (`readonly=on`, `canmount=noauto`, `mountpoint=none`, `exec=off` and the rest). Use the flags the client itself sends with: `-L -c` for a plain copy, `-w` for a raw one. A
 dataset that **still exists on the client must be renamed aside first** (`zfs rename tank/data
 tank/data.old`): a full receive onto an existing dataset fails.
 
@@ -894,10 +912,10 @@ ssh client sudo zfs load-key tank/secret
 sudo zfs mount tank/data
 ```
 
-If a `-p` stream was used anyway, look at what arrived with `zfs get -s received all tank/data`, and undo any
-`readonly`, `canmount` or `volmode` it set as *received* values with plain `zfs inherit readonly`, `zfs inherit
-volmode` and `zfs set canmount=on`. (Receiving with `-x readonly -x canmount -x volmode -x org.zfsbackup:config
--x org.zfsbackup:client_id -x org.zfsbackup:source_dataset` avoids it.) **Keep a copy of the encryption key off
+If a `-p` stream was used anyway, look at what arrived with `zfs get -s received all tank/data`, and undo the
+*received* values with plain `zfs inherit` (`readonly`, `mountpoint`, `volmode`, `sharenfs`, `sharesmb`,
+`setuid`, `exec`, `devices`) and `zfs set canmount=on`. (Receiving with `-x` for each of those, `-x canmount`, and for
+`org.zfsbackup:config`, `org.zfsbackup:client_id` and `org.zfsbackup:source_dataset` avoids it.) **Keep a copy of the encryption key off
 the client**: the server has none, so a lost key means a lost raw backup.
 
 ### Rejoining: seed and continue

@@ -2664,8 +2664,13 @@ class FakeServerZfs(types.SimpleNamespace):
         #: order: the server's listing grows with them (the receive's `-F` decision and the next
         #: negotiate read it), as a real pool's does.
         self.incoming = {ds: list(names) for ds, names in (incoming or {}).items()}
+        #: dataset name -> `zfs get type` (default: a filesystem), for the datasets that exist
+        self.dataset_types = {}
+        # The datasets the server already holds were made by an earlier receive: they carry the LOCAL
+        # client id (B-2c), the one in their path `<target>/<id>/...`.
         for name in self.snapshots:
-            self.store.setdefault(name, {})
+            self.store.setdefault(name, {}).setdefault(
+                "org.zfsbackup:client_id", name.split("/")[2] if name.count("/") >= 2 else None)
         super().__init__(
             exists=lambda ds: str(ds) in self.store,
             create=self._create,
@@ -2687,13 +2692,15 @@ class FakeServerZfs(types.SimpleNamespace):
             return [listed_snapshot(n, str(roots)) for n in self.snapshots.get(str(roots), [])]
         return []
 
-    def _create(self, ds, *a, **k):
-        self.store.setdefault(str(ds), {})
+    def _create(self, ds, *a, properties=None, **k):
+        self.store.setdefault(str(ds), {}).update(properties or {})
 
     def _set(self, ds, props, *a, **k):
         self.store.setdefault(str(ds), {}).update(props)
 
     def _value(self, ds, prop, sources=None, raw=False):
+        if prop == "type":
+            return self.dataset_types.get(str(ds), "filesystem") if str(ds) in self.store else None
         return self.store.get(str(ds), {}).get(prop)
 
     def _receive(self, received_path, ds, props, force=None):
@@ -2890,13 +2897,27 @@ class World:
 
     # -- the fake `zfs send`: a python byte writer in a hermetic subprocess --------------------------
     def _fake_send(self, snapshot, since=None, **flags):
+        """The stream starts with a real `DRR_BEGIN` record (the server reads it before it spawns
+        `zfs receive`): a full stream's, or an incremental one whose source guid is `since`'s.
+        Its 312 bytes replace the first 312 of the first 64 KiB chunk, so a finite stream is
+        still 64 * 65536 bytes."""
         from _hermetic import hermetic_env
+        from _snapshot_support import default_guid
+        from _stream_support import HEADER, incremental_header
 
         self.send_calls.append((snapshot, since, flags))
-        body = "while True:\n    w(b)\n" if self.endless else "for _ in range(64):\n    w(b)\n"
-        code = "import sys\nb = b'z' * 65536\nw = sys.stdout.buffer.write\n" + body
+        if since is None:
+            header = HEADER
+        else:
+            guid = since["guid"].value if hasattr(since, "__getitem__") else default_guid(str(since))
+            header = incremental_header(int(guid))
+        body = "while True:\n    w(b)\n" if self.endless else "for _ in range(63):\n    w(b)\n"
+        code = (
+            "import sys\nh = bytes.fromhex(sys.argv[1])\nb = b'z' * 65536\nw = sys.stdout.buffer.write\n"
+            "w(h + b[len(h):])\n" + body
+        )
         proc = subprocess.Popen(
-            [sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            [sys.executable, "-c", code, header.hex()], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             env=hermetic_env(),
         )
         self.sends.append(proc)

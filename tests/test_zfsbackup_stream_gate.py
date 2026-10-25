@@ -27,6 +27,8 @@ from unittest.mock import MagicMock, PropertyMock
 import pytest
 from simple_websocket import ConnectionClosed
 
+from _stream_support import DONE, HEADER, get_value_answers, stream_script
+from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
 from _api_support import Authed, CLIENT_ID, buffered_client, enroll_body, make_client_cert, rotate_body
 from _tls_support import pin_client
 from test_zfsbackup_daemon_closeout import SUPERVISOR, Parent
@@ -305,7 +307,11 @@ def stored_config(mocker):
     (plan B-1b) and is refused without one. Never a real `zfs get`."""
     return mocker.patch(
         "zfsbackup.api.zfs.get.value",
-        return_value=canonical_dataset_config(DatasetConfig(name="pool/data").to_property()),
+        side_effect=get_value_answers({
+            PROP_CONFIG: canonical_dataset_config(DatasetConfig(name="pool/data").to_property()),
+            PROP_CLIENT_ID: CLIENT_ID,          # B-2c: a LOCAL client id, this client's
+            "type": "filesystem",               # B-2a: compared with the stream's type
+        }),
     )
 
 
@@ -393,14 +399,16 @@ class TestGateInTheApp:
         seen = []
         ws = MagicMock()
 
+        script = iter([HEADER, DONE])
+
         def receive(timeout=None):
             seen.append(gate.active)
-            return json.dumps({"done": True})
+            return next(script)
 
         ws.receive.side_effect = receive
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             self._handler(authed)(ws, "client1", "pool/data")
-        assert seen == [1]
+        assert seen == [1, 1]               # the header read and the data loop: registered throughout
         assert gate.active == 0
 
     def test_a_stream_begun_before_draining_runs_to_completion(self, authed, mocker):
@@ -411,9 +419,11 @@ class TestGateInTheApp:
         mocker.patch("zfsbackup.api.zfs.set")
         ws = MagicMock()
 
+        script = iter([HEADER, DONE])
+
         def receive(timeout=None):
             gate.start_draining()             # the worker decided to leave mid-transfer
-            return json.dumps({"done": True})
+            return next(script)
 
         ws.receive.side_effect = receive
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
@@ -445,7 +455,7 @@ class TestGateInTheApp:
                 "cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an "
                 "encrypted filesystem or overwrite an unencrypted one with an encrypted one"
             )
-            ws.receive.side_effect = [b"x", json.dumps({"done": True})]
+            ws.receive.side_effect = stream_script(b"x")
         elif arrange == "send-raises":
             # A refusal that cannot be sent escapes the handler; the gate still releases.
             source_props.return_value = {"org.zfsbackup:source_dataset": "tank/data"}
@@ -457,9 +467,9 @@ class TestGateInTheApp:
             ws.receive.side_effect = ConnectionClosed(None, None)
         elif arrange == "write-error":
             writer.write.side_effect = IOError("disk full")
-            ws.receive.side_effect = [b"chunk"]
+            ws.receive.side_effect = [HEADER]
         else:
-            ws.receive.side_effect = [b"x", json.dumps({"done": True})]
+            ws.receive.side_effect = stream_script(b"x")
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             if expect_raise:
                 with pytest.raises(RuntimeError):
@@ -534,7 +544,9 @@ class TestGateOnProtocolRefusals:
         elif arrange == "receive-start-fails":
             receive.side_effect = Exception("cannot start")
         ws = MagicMock()
-        ws.receive.side_effect = ConnectionClosed(None, None)     # a regression must fail, not spin
+        # The header is read before the token lookup, the abort and the spawn (B-2a); a regression
+        # that reads on must fail, not spin.
+        ws.receive.side_effect = [HEADER, ConnectionClosed(None, None)]
         seen = []
         real_send = ws.send
         ws.send.side_effect = lambda m: seen.append(gate.active)
@@ -544,7 +556,10 @@ class TestGateOnProtocolRefusals:
         assert gate.active == 0
         if arrange not in ("receive-start-fails",):
             receive.assert_not_called()
-            ws.receive.assert_not_called()
+        if arrange in ("none", "mismatch", "source-read-fails"):
+            ws.receive.assert_not_called()                        # refused before the header
+        else:
+            assert ws.receive.call_count == 1                     # the header, and no data after it
         # Mode errors are refused before the gate; every later refusal holds it while answering.
         assert seen == ([0] if arrange == "none" else [1])
 
@@ -596,10 +611,10 @@ class TestServerReceiveTimeout:
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=MagicMock())
         ws = MagicMock()
-        ws.receive.side_effect = [b"a", json.dumps({"done": True})]
+        ws.receive.side_effect = stream_script(b"a")
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             self._handler(authed)(ws, "client1", "pool/data")
-        assert ws.receive.call_count == 2
+        assert ws.receive.call_count == 3                   # the header, the data, `done`
         for call in ws.receive.call_args_list:
             assert call.kwargs == {"timeout": WS_IDLE_TIMEOUT}
 
@@ -609,10 +624,10 @@ class TestServerReceiveTimeout:
         writer = MagicMock()
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
-        ws.receive.side_effect = [b"chunk", None]
+        ws.receive.side_effect = [HEADER, b"chunk", None]
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             self._handler(authed)(ws, "client1", "pool/data")
-        writer.write.assert_called_once_with(b"chunk")
+        assert [c.args[0] for c in writer.write.call_args_list] == [HEADER, b"chunk"]
         writer.close.assert_called_once()
         sent = json.loads(ws.send.call_args[0][0])
         assert "no data from the client" in sent["error"]
@@ -620,16 +635,30 @@ class TestServerReceiveTimeout:
         assert "status" not in sent
         assert gate.active == 0
 
-    def test_a_timeout_on_the_first_receive_also_closes_the_writer(self, authed, mocker):
+    def test_a_timeout_on_the_first_data_receive_also_closes_the_writer(self, authed, mocker):
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         writer = MagicMock()
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
+        ws.receive.side_effect = [HEADER, None]
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+            self._handler(authed)(ws, "client1", "pool/data")
+        writer.write.assert_called_once_with(HEADER)         # only the header went in
+        writer.close.assert_called_once()
+        assert "no data from the client" in json.loads(ws.send.call_args[0][0])["error"]
+
+    def test_a_timeout_before_the_header_spawns_nothing_and_releases_the_gate(self, authed, mocker):
+        mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
+        receive = mocker.patch("zfsbackup.api.zfs.receive.filesystem")
+        ws = MagicMock()
         ws.receive.return_value = None
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             self._handler(authed)(ws, "client1", "pool/data")
-        writer.write.assert_not_called()
-        writer.close.assert_called_once()
+        receive.assert_not_called()
+        sent = json.loads(ws.send.call_args[0][0])
+        assert "no data from the client" in sent["error"] and str(WS_IDLE_TIMEOUT) in sent["error"]
+        assert "reason" not in sent and "retry" not in sent
+        assert authed.gate.active == 0
 
     def test_a_writer_close_failure_during_a_timeout_is_suppressed_and_still_reported(self, authed, mocker):
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
@@ -637,7 +666,7 @@ class TestServerReceiveTimeout:
         writer.close.side_effect = Exception("receive exited 1")
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
-        ws.receive.return_value = None
+        ws.receive.side_effect = [HEADER, None]
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             self._handler(authed)(ws, "client1", "pool/data")       # must not raise
         assert "no data from the client" in json.loads(ws.send.call_args[0][0])["error"]
@@ -659,7 +688,7 @@ class TestDrainWaitsForTheAck:
         order = []
         in_send, let_go = threading.Event(), threading.Event()
         ws = MagicMock()
-        ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        ws.receive.side_effect = stream_script(b"chunk")
 
         def send(message):
             assert json.loads(message) == {"status": "ok"}
@@ -686,7 +715,7 @@ class TestDrainWaitsForTheAck:
             # The claim is already free: the client's next stream for the same dataset is
             # served (not 'busy') while the first one is still inside its ack.
             nxt = MagicMock()
-            nxt.receive.side_effect = [json.dumps({"done": True})]
+            nxt.receive.side_effect = stream_script()
             # (run from a thread of its own: the ack send of `ws` is parked in the first one)
             second_sent = []
 

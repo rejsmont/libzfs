@@ -55,7 +55,7 @@ def _b(text):
 
 
 class FakeZfs:
-    """A `zfs` that answers by argv. `listing` is the raw bytes `zfs list -r -t filesystem` prints;
+    """A `zfs` that answers by argv. `listing` is the raw bytes `zfs list -r -t filesystem,volume` prints;
     `props[(dataset, property, source)]` the raw bytes `zfs get -H -o value -s <source>` prints
     for that property (absent: `-\\n`, i.e. unset); `snapshots[dataset]` the short names `zfs list
     -t snapshot` finds. Every command is recorded in `argvs`."""
@@ -86,7 +86,7 @@ class FakeZfs:
         if verb == 'list':
             types = argv[argv.index('-t') + 1] if '-t' in argv else None
             root = argv[-1]
-            if types == 'filesystem':
+            if types == 'filesystem,volume':
                 return self._proc(self.listing)
             assert types == 'snapshot', argv
             rows = [_b(list_row(s, root)) for s in self.snapshots.get(root, [])]
@@ -218,6 +218,66 @@ class TestControl:
         (listing,) = [a for a in zfs.argvs if a[0] == 'list']
         assert listing[listing.index('-o') + 1] == 'name,type'
         assert PROP_CONFIG not in ' '.join(listing)
+
+
+# ---------------------------------------------------------------------------
+# A received volume (B-2a: a volume stream is received as a volume)
+# ---------------------------------------------------------------------------
+
+NEIGHBOUR_VOL = 'bk/Ax/vol'
+VICTIM_VOL = 'bk/A/vol'
+
+
+class TestReceivedVolume:
+    """A client volume is received as a volume (`volmode=none`, never a device). It is enumerated,
+    pruned under its own config and destroyed by snapshot name like a filesystem: nothing about it
+    assumes a mount."""
+
+    def world(self, zfs):
+        legit_world(zfs)
+        zfs.listing += lines(f'{NEIGHBOUR_VOL}\tvolume', f'{VICTIM_VOL}\tvolume')
+        zfs.props[(NEIGHBOUR_VOL, PROP_CLIENT_ID, 'local')] = lines(NEIGHBOUR)
+        zfs.props[(NEIGHBOUR_VOL, PROP_CONFIG, 'local')] = lines(NEIGHBOUR_CONFIG)
+        zfs.props[(VICTIM_VOL, PROP_CLIENT_ID, 'local')] = lines(VICTIM)
+        zfs.props[(VICTIM_VOL, PROP_CONFIG, 'local')] = lines(VICTIM_CONFIG)
+        zfs.snapshots[NEIGHBOUR_VOL] = list(OLD)
+        zfs.snapshots[VICTIM_VOL] = list(OLD)
+
+    def test_the_enumeration_returns_volumes_as_volumes(self, zfs):
+        from libzfseasy.types import Volume
+        self.world(zfs)
+        found = manager().received_datasets()
+        by_name = {d.name: d for d in found}
+        assert sorted(by_name) == sorted([VICTIM_DS, NEIGHBOUR_DS, VICTIM_VOL, NEIGHBOUR_VOL])
+        assert isinstance(by_name[NEIGHBOUR_VOL].dataset, Volume)
+        (listing,) = [a for a in zfs.argvs if a[0] == 'list']
+        assert listing[listing.index('-t') + 1] == 'filesystem,volume'
+
+    def test_a_received_volume_is_pruned_under_its_own_config(self, zfs):
+        self.world(zfs)
+        found = prune_everything(zfs)
+        assert_contained(zfs, found)
+        assert sorted(d.split('@')[1] for d in zfs.destroyed if d.startswith(NEIGHBOUR_VOL + '@')) == sorted(OLD[:-1])
+        assert not [d for d in zfs.destroyed if d.startswith((VICTIM_VOL, VICTIM_DS))]     # 100 years: all kept
+        assert NEIGHBOUR_VOL in zfs.snapshot_listings
+
+    def test_the_destroy_names_snapshots_only_and_never_touches_a_mount(self, zfs):
+        self.world(zfs)
+        prune_everything(zfs)
+        volume_destroys = [a for a in zfs.destroy_argvs if a[-1].startswith(NEIGHBOUR_VOL + '@')]
+        assert volume_destroys
+        for argv in volume_destroys:
+            assert argv[0] == 'destroy' and '@' in argv[-1]
+        everything = ' '.join(' '.join(a) for a in zfs.argvs)
+        for word in ('canmount', 'mountpoint', 'unmount', 'mount', 'volmode'):
+            assert word not in everything, word
+
+    def test_a_volume_outside_its_clients_tree_is_skipped_like_a_filesystem(self, zfs):
+        self.world(zfs)
+        zfs.props[(NEIGHBOUR_VOL, PROP_CLIENT_ID, 'local')] = lines(VICTIM)         # the forgery
+        found = prune_everything(zfs)
+        assert NEIGHBOUR_VOL not in [d.name for d in found]
+        assert not [d for d in zfs.destroyed if d.startswith(NEIGHBOUR_VOL)]
 
 
 # ---------------------------------------------------------------------------

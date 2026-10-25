@@ -16,6 +16,10 @@ from unittest.mock import MagicMock, PropertyMock, patch
 from datetime import datetime, timedelta, timezone
 from simple_websocket import ConnectionClosed
 
+from _stream_support import (
+    DONE, FILESYSTEM_FORCED, HEADER, endless_stream, expected_receive_argv, get_value_answers, incremental_header,
+    stream_script,
+)
 from _api_support import Authed, CLIENT_ID
 from _snapshot_support import listed_snapshot
 from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
@@ -222,7 +226,8 @@ class TestBackupNegotiate:
 
     def test_negotiate_creates_only_the_parent_of_a_missing_dataset(self, client_with_remote, mocker):
         """R0: the first full stream creates the leaf (zfs refuses a raw full onto a pre-created
-        one), so negotiate makes the parents with `-p` and sets nothing."""
+        one), so negotiate makes only the missing parent -- one level, never mounted, stamped
+        with the bound client id (B-2c), no `-p` -- and sets nothing."""
         mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
         mock_create = mocker.patch('zfsbackup.api.zfs.create')
         mock_set = mocker.patch('zfsbackup.api.zfs.set')
@@ -236,7 +241,9 @@ class TestBackupNegotiate:
         assert resp.status_code == 200
         mock_create.assert_called_once()
         assert str(mock_create.call_args[0][0]) == 'pool/backups/client1'      # the parent, not the leaf
-        assert mock_create.call_args.kwargs == {'parents': True}
+        assert mock_create.call_args.kwargs == {
+            'properties': {'canmount': 'noauto', PROP_CLIENT_ID: 'client1'}, 'mount': False,
+        }
         mock_set.assert_not_called()
 
     def test_negotiate_sets_the_properties_of_an_existing_dataset(self, client_with_remote, mocker):
@@ -341,7 +348,7 @@ class TestBackupStream:
         mock_writer = MagicMock()
         mock_receive = mocker.patch('zfsbackup.api.zfs.receive.filesystem', return_value=mock_writer)
         ws = MagicMock()
-        ws.receive.side_effect = [json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script()
 
         with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
@@ -364,13 +371,14 @@ class TestBackupStream:
             side_effect=RuntimeError('cannot receive: dataset is busy'),
         )
         ws = MagicMock()
+        ws.receive.side_effect = stream_script(done=False)      # the header: read before the spawn
         with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
         ws.send.assert_called_once()
         assert json.loads(ws.send.call_args[0][0]) == {
             'error': 'Failed to start zfs receive: cannot receive: dataset is busy'
         }
-        ws.receive.assert_not_called()
+        assert ws.receive.call_count == 1           # the header and nothing after it
         assert authed.gate.active == 0
 
     def test_stream_dry_run_sends_ok(self, mocker):
@@ -398,7 +406,7 @@ class TestBackupStream:
         mocker.patch('zfsbackup.api.zfs.receive.filesystem', return_value=mock_writer)
 
         ws = MagicMock()
-        ws.receive.side_effect = [b'chunk1', b'chunk2', json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script(b'chunk1', b'chunk2')
 
         with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
@@ -420,12 +428,30 @@ class TestBackupStream:
         mocker.patch('zfsbackup.api.zfs.receive.filesystem', return_value=mock_writer)
 
         ws = MagicMock()
-        ws.receive.side_effect = ConnectionClosed(None, None)
+        ws.receive.side_effect = [HEADER, ConnectionClosed(None, None)]     # gone after the header
 
         with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
 
         mock_writer.close.assert_called_once()
+
+    def test_stream_connection_closed_before_the_header_spawns_nothing(self, mocker):
+        config = _make_config(
+            remote_backup=RemoteServerConfig(target_dataset='pool/backups', enabled=True),
+        )
+        handler, authed = self._get_handler(config, mocker)
+        mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
+        receive = mocker.patch('zfsbackup.api.zfs.receive.filesystem')
+
+        ws = MagicMock()
+        ws.receive.side_effect = ConnectionClosed(None, None)
+
+        with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
+            handler(ws, 'client1', 'pool/data')
+
+        receive.assert_not_called()
+        ws.send.assert_not_called()                  # nobody to answer
+        assert authed.gate.active == 0
 
     def test_stream_write_exception_sends_error(self, mocker):
         config = _make_config(
@@ -439,7 +465,7 @@ class TestBackupStream:
         mocker.patch('zfsbackup.api.zfs.receive.filesystem', return_value=mock_writer)
 
         ws = MagicMock()
-        ws.receive.return_value = b'chunk'
+        ws.receive.side_effect = endless_stream()
 
         with authed.context(STREAM_PATH, query_string={'mode': 'resume'}):
             handler(ws, 'client1', 'pool/data')
@@ -477,7 +503,7 @@ class TestBackupStreamWriteFailure:
         writer.close.side_effect = RuntimeError('cannot receive: checksum mismatch')
         handler, authed = self._setup(mocker, writer)
         ws = MagicMock()
-        ws.receive.return_value = b'chunk'
+        ws.receive.side_effect = endless_stream()
         with caplog.at_level(logging.ERROR, logger='zfsbackup.api'):
             self._run(handler, authed, ws)
 
@@ -485,7 +511,7 @@ class TestBackupStreamWriteFailure:
             'error': 'cannot receive: checksum mismatch'
         }
         ws.send.assert_called_once()
-        writer.write.assert_called_once_with(b'chunk')
+        writer.write.assert_called_once_with(HEADER)        # the very first write (the header) failed
         writer.close.assert_called_once()
         errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
         assert len(errors) == 1
@@ -498,7 +524,7 @@ class TestBackupStreamWriteFailure:
         writer.write.side_effect = OSError(32, 'Broken pipe')
         handler, authed = self._setup(mocker, writer)       # close() raises nothing
         ws = MagicMock()
-        ws.receive.return_value = b'chunk'
+        ws.receive.side_effect = endless_stream()
         with caplog.at_level(logging.ERROR, logger='zfsbackup.api'):
             self._run(handler, authed, ws)
 
@@ -510,23 +536,23 @@ class TestBackupStreamWriteFailure:
 
     def test_a_failure_after_some_good_chunks_still_closes_exactly_once(self, mocker):
         writer = MagicMock()
-        writer.write.side_effect = [None, None, BrokenPipeError(32, 'Broken pipe')]
+        writer.write.side_effect = [None, None, None, BrokenPipeError(32, 'Broken pipe')]
         writer.close.side_effect = RuntimeError('cannot receive: out of space')
         handler, authed = self._setup(mocker, writer)
         ws = MagicMock()
-        ws.receive.side_effect = [b'a', b'b', b'c', b'never read']
+        ws.receive.side_effect = [HEADER, b'a', b'b', b'c', b'never read']
         self._run(handler, authed, ws)
-        assert writer.write.call_count == 3
+        assert [c.args[0] for c in writer.write.call_args_list] == [HEADER, b'a', b'b', b'c']
         writer.close.assert_called_once()
         assert json.loads(ws.send.call_args[0][0]) == {'error': 'cannot receive: out of space'}
-        assert ws.receive.call_count == 3                # nothing read after the failure
+        assert ws.receive.call_count == 4                # nothing read after the failure
 
     def test_a_non_oserror_write_failure_closes_once_via_the_general_path(self, mocker):
         writer = MagicMock()
         writer.write.side_effect = ValueError('bad chunk')
         handler, authed = self._setup(mocker, writer)
         ws = MagicMock()
-        ws.receive.return_value = b'chunk'
+        ws.receive.side_effect = endless_stream()
         self._run(handler, authed, ws)
         writer.close.assert_called_once()
         assert json.loads(ws.send.call_args[0][0]) == {'error': 'bad chunk'}
@@ -539,9 +565,9 @@ class TestBackupStreamWriteFailure:
         handler, authed = self._setup(mocker, writer)
         ws = MagicMock()
         ws.send.side_effect = lambda m: order.append(('send', json.loads(m)))
-        ws.receive.side_effect = [b'x', json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script(b'x')
         self._run(handler, authed, ws)
-        assert order == [('write', b'x'), ('close',), ('send', {'status': 'ok'})]
+        assert order == [('write', HEADER), ('write', b'x'), ('close',), ('send', {'status': 'ok'})]
         self.set.assert_not_called()                     # no post-receive re-stamp: `-o` did it
 
     def test_a_failing_close_after_done_reports_the_error_not_ok(self, mocker):
@@ -549,7 +575,7 @@ class TestBackupStreamWriteFailure:
         writer.close.side_effect = RuntimeError('cannot receive: bad stream')
         handler, authed = self._setup(mocker, writer)
         ws = MagicMock()
-        ws.receive.side_effect = [b'x', json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script(b'x')
         self._run(handler, authed, ws)
         assert json.loads(ws.send.call_args[0][0]) == {'error': 'cannot receive: bad stream'}
         ws.send.assert_called_once()
@@ -571,7 +597,7 @@ class TestBackupStreamWriteFailure:
 
         def receive(timeout=None):
             during.append(gate.active)
-            return b'chunk'
+            return HEADER
 
         ws.receive.side_effect = receive
         assert gate.active == 0
@@ -587,7 +613,7 @@ class TestBackupStreamWriteFailure:
         gate = authed.gate
         for _ in range(5):
             ws = MagicMock()
-            ws.receive.return_value = b'chunk'
+            ws.receive.side_effect = endless_stream()
             self._run(handler, authed, ws)
         assert gate.active == 0
         assert gate.begin() is True           # not wedged
@@ -609,7 +635,7 @@ class TestBackupStreamWriteFailure:
         # ...and the per-dataset lock: the next stream for it is not 'busy'.
         source_props.return_value = {}
         ws2 = MagicMock()
-        ws2.receive.side_effect = [json.dumps({'done': True})]
+        ws2.receive.side_effect = stream_script()
         self._run(handler, authed, ws2)
         assert json.loads(ws2.send.call_args[0][0]) == {'status': 'ok'}
 
@@ -620,10 +646,10 @@ class TestBackupStreamWriteFailure:
         handler, authed = self._setup(mocker, writer)
         gate = authed.gate
         ws = MagicMock()
-        ws.receive.side_effect = [b'x', json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script(b'x')
         ws.send.side_effect = ConnectionClosed(None, None)
         self._run(handler, authed, ws)                      # must not raise
-        writer.write.assert_called_once_with(b'x')
+        assert [c.args[0] for c in writer.write.call_args_list] == [HEADER, b'x']
         writer.close.assert_called_once()
         ws.send.assert_called_once()
         assert json.loads(ws.send.call_args[0][0]) == {'status': 'ok'}
@@ -665,7 +691,12 @@ def stored_config(mocker):
     it. `Stream` re-patches it to record ordering; tests that need another
     value (or none) set `.return_value`."""
     return mocker.patch(
-        'zfsbackup.api.zfs.get.value', return_value=canonical_dataset_config(GOOD_CONFIG)
+        'zfsbackup.api.zfs.get.value',
+        side_effect=get_value_answers({
+            PROP_CONFIG: canonical_dataset_config(GOOD_CONFIG),
+            PROP_CLIENT_ID: CLIENT_ID,      # B-2c: the dataset is this client's, by a LOCAL value
+            'type': 'filesystem',           # B-2a: what the stream's type is compared with
+        }),
     )
 
 
@@ -685,6 +716,10 @@ def _streams_in_progress(app):
     return inspect.getclosurevars(claim).nonlocals['streams_in_progress']
 
 
+#: `Stream.owner` value: the dataset's local client id is the requesting client's.
+ASKING = object()
+
+
 class Stream:
     """The `stream` handler of one app, driven directly with a mock websocket.
 
@@ -698,7 +733,10 @@ class Stream:
         self.handler = self.app.view_functions['backup_stream'].__wrapped__
         self.gate = self.app.extensions['zfsbackup.stream_gate']
         self.ws = MagicMock()
-        self.ws.receive.side_effect = [b'chunk', json.dumps({'done': True})]
+        self.ws.receive.side_effect = stream_script(b'chunk')
+        # `run` swaps this default script for one whose header is incremental when the request
+        # names a base (`from_guid`, or `from` alone): the server compares the two (B-2a).
+        self._default_script = self.ws.receive.side_effect
         self.order = []
         self.exists = mocker.patch('zfsbackup.api.zfs.exists', return_value=True)
         # `zfs.list` serves two callers: the receive-flag decision lists the server dataset's
@@ -714,14 +752,70 @@ class Stream:
         # What negotiate stored on the server dataset (plan B-1b): the stream
         # reads it (local source) and puts it in effect with `-o`.
         self.stored = canonical_dataset_config(GOOD_CONFIG)
-        self.get_value = mocker.patch('zfsbackup.api.zfs.get.value', return_value=self.stored)
+        # `zfs.get.value` answers by property name: the stored config (`order` records only this
+        # read, as 'get'), the LOCAL `client_id` (B-2c) and the dataset `type` (B-2a). `reads`
+        # lists every `(property, sources)` asked.
+        self.asking = CLIENT_ID           # the client of the current `run` (the binding)
+        self.owner = ASKING               # the local org.zfsbackup:client_id: ASKING = the
+        #                                   requesting client's (an owned dataset), None = unset
+        self.type = 'filesystem'          # what `zfs get type` says of the server dataset
+        self.config_script = []           # config answers, consumed first, then `stored`
+        self.reads = []
+        self.get_value = mocker.patch('zfsbackup.api.zfs.get.value', side_effect=self._get_value)
         self.writer = MagicMock()
         self.receive = mocker.patch('zfsbackup.api.zfs.receive.filesystem', return_value=self.writer)
         self.create.side_effect = lambda *a, **k: self.order.append('create')
         self.set.side_effect = lambda *a, **k: self.order.append('set')
         self.abort.side_effect = lambda *a, **k: self.order.append('abort')
-        self.get_value.side_effect = lambda *a, **k: (self.order.append('get'), self.stored)[1]
         self.receive.side_effect = lambda *a, **k: (self.order.append('receive'), self.writer)[1]
+
+    def _get_value(self, ds, prop, *args, sources=None, **kwargs):
+        self.reads.append((prop, sources))
+        if prop == PROP_CONFIG:
+            self.order.append('get')
+            value = self.config_script.pop(0) if self.config_script else self.stored
+        elif prop == PROP_CLIENT_ID:
+            value = self.asking if self.owner is ASKING else self.owner
+        elif prop == 'type':
+            value = self.type
+        else:
+            value = None
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def fail_config_read(self, exc, *, once=False):
+        """Reading the stored config raises `exc` (the first time only with `once`); the owner
+        and type reads keep answering."""
+        left = [1 if once else None]
+
+        def get(ds, prop, *args, **kwargs):
+            if prop == PROP_CONFIG and left[0] != 0:
+                if left[0] is not None:
+                    left[0] -= 1
+                raise exc
+            return self._get_value(ds, prop, *args, **kwargs)
+
+        self.get_value.side_effect = get
+
+    def fail_owner_read(self, exc):
+        """Reading the LOCAL client id (the B-2c ownership check) raises `exc`."""
+        def get(ds, prop, *args, **kwargs):
+            if prop == PROP_CLIENT_ID:
+                raise exc
+            return self._get_value(ds, prop, *args, **kwargs)
+
+        self.get_value.side_effect = get
+
+    @property
+    def written(self):
+        """What was written into `zfs receive`, one entry per `write` call."""
+        return [c.args[0] for c in self.writer.write.call_args_list]
+
+    @property
+    def config_reads(self):
+        """How many times the stored config was read."""
+        return sum(1 for prop, _ in self.reads if prop == PROP_CONFIG)
 
     def _list(self, *args, **kwargs):
         return list(self.snapshots if kwargs.get('types') == 'snapshot' else self.token_rows)
@@ -770,6 +864,19 @@ class Stream:
         qs = dict(query)
         if mode is not None:
             qs['mode'] = mode
+        self.asking = client
+        if ws is None and self.ws.receive.side_effect is self._default_script:
+            if str(qs.get('from_guid', '')).isdigit():
+                guid = int(qs['from_guid'])
+            elif 'from' in qs:
+                # a base named without its guid: the stream must be incremental from the guid the
+                # server holds under that name (the default for an unknown name: 1)
+                named = [int(r['guid'].value) for r in self.snapshots if r.short == qs['from']]
+                guid = named[0] if named else 1
+            else:
+                guid = None
+            if guid is not None:
+                self.ws.receive.side_effect = stream_script(b'chunk', header=incremental_header(guid))
         who = self.authed.cert_for(client)
         with self.authed.context(f'/backup/{client}/{dataset}/stream', who=who, query_string=qs):
             self.handler(ws if ws is not None else self.ws, client, dataset)
@@ -847,12 +954,14 @@ class TestStreamModeIsRequired:
     def test_both_valid_modes_receive_the_stream(self, stream, mode):
         stream.run(mode=mode)
         assert stream.sent == [{'status': 'ok'}]
-        stream.writer.write.assert_called_once_with(b'chunk')
+        assert stream.written == [HEADER, b'chunk']         # the header first, then the data
         stream.writer.close.assert_called_once()
         stream.receive.assert_called_once()
         assert stream.gate.active == 0
 
     def test_from_is_optional_and_only_logged_at_debug(self, stream, caplog):
+        # a declared base name means an incremental stream (a non-zero source guid in the header)
+        stream.ws.receive.side_effect = stream_script(b'chunk', header=incremental_header(7))
         with caplog.at_level(logging.DEBUG, logger='zfsbackup.api'):
             stream.run(mode='resume', **{'from': 'autosnap_20240101120000'})
         assert stream.sent == [{'status': 'ok'}]
@@ -963,7 +1072,7 @@ class TestFreshStreamDiscardsPartialState:
         }]
         stream.create.assert_not_called()
         stream.receive.assert_not_called()
-        stream.ws.receive.assert_not_called()
+        assert stream.ws.receive.call_count == 1        # the header (read before the abort), no data
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1 and 'pool I/O is currently suspended' in errors[0]
         assert stream.gate.active == 0
@@ -1019,7 +1128,9 @@ class TestDryRunAndOrder:
     ):
         events = []
         source_props.side_effect = lambda ds: events.append('source') or {}
-        stream.get_value.side_effect = lambda *a, **k: (events.append('config'), stream.stored)[1]
+        stream.get_value.side_effect = lambda ds, prop, *a, **k: (
+            events.append('config') if prop == PROP_CONFIG else None, stream._get_value(ds, prop, *a, **k)
+        )[1]
         stream.token(TOKEN)
         stream.list.side_effect = lambda **k: (
             events.append('snapshots') or []
@@ -1145,7 +1256,7 @@ class TestSourceDatasetCheck:
     def test_stream_allows_no_recorded_source_and_a_matching_one(self, stream, source_props):
         stream.run('resume')
         assert stream.sent == [{'status': 'ok'}]
-        stream.ws.receive.side_effect = [b'chunk', json.dumps({'done': True})]
+        stream.ws.receive.side_effect = stream_script(b'chunk')
         source_props.return_value = {'org.zfsbackup:source_dataset': 'pool/data'}
         stream.run('resume')
         assert stream.sent[-1] == {'status': 'ok'}
@@ -1245,7 +1356,7 @@ class TestFreshWithTokenThroughRealCommands:
         handler = authed.app.view_functions['backup_stream'].__wrapped__
         self.setup_popen(mock_subprocess, [f'{SERVER_DS}\tfilesystem\t{TOKEN}\n'])
         ws = MagicMock()
-        ws.receive.side_effect = [b'chunk', json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script(b'chunk', header=incremental_header(5000))
         with authed.context(STREAM_PATH, query_string={'mode': 'fresh', 'from_guid': '5000'}):
             handler(ws, 'client1', 'pool/data')
         argvs = [c[0][0][1:] for c in mock_subprocess.call_args_list]
@@ -1255,7 +1366,15 @@ class TestFreshWithTokenThroughRealCommands:
         assert argvs[2] == ['receive', '-A', SERVER_DS]
         assert argvs[3][0] == 'receive' and '-A' not in argvs[3]
         assert '-s' in argvs[3] and argvs[3][-1] == SERVER_DS
-        assert argvs[3].count('-o') == 3 and '-x' not in argvs[3]      # the owned values, in the receive
+        assert '-x' not in argvs[3]
+        assert argvs[3] == expected_receive_argv(           # the owned and the forced values, in the receive
+            {
+                PROP_CONFIG: canonical_dataset_config(GOOD_CONFIG),
+                PROP_CLIENT_ID: 'client1',
+                PROP_SOURCE_DATASET: 'pool/data',
+            },
+            'filesystem', SERVER_DS, force=True,
+        )
         assert json.loads(ws.send.call_args[0][0]) == {'status': 'ok'}
 
     def test_resume_runs_only_the_snapshot_listing_and_no_abort(self, mocker, mock_subprocess):
@@ -1266,7 +1385,7 @@ class TestFreshWithTokenThroughRealCommands:
         handler = authed.app.view_functions['backup_stream'].__wrapped__
         mock_subprocess.setup_multi((self.SNAPSHOT_ROWS,), ('',))     # list -t snapshot, receive
         ws = MagicMock()
-        ws.receive.side_effect = [json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script(header=incremental_header(5000))
         with authed.context(STREAM_PATH, query_string={'mode': 'resume', 'from_guid': '5000'}):
             handler(ws, 'client1', 'pool/data')
         argvs = [c[0][0][1:] for c in mock_subprocess.call_args_list]
@@ -1292,7 +1411,7 @@ class TestFreshWithTokenThroughRealCommands:
             mock_subprocess, [f'{SERVER_DS}\tfilesystem\t{TOKEN}\n'], abort=('', stderr, rc)
         )
         ws = MagicMock()
-        ws.receive.side_effect = [json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script(header=incremental_header(5000))
         with authed.context(STREAM_PATH, query_string={'mode': 'fresh', 'from_guid': '5000'}):
             handler(ws, 'client1', 'pool/data')
         sent = json.loads(ws.send.call_args[0][0])
@@ -1332,10 +1451,12 @@ class HeldStream:
         def receive(timeout=None):
             calls.append(1)
             if len(calls) == 1:
+                return HEADER           # the header record; the receive is spawned after it
+            if len(calls) == 2:
                 self.entered.set()
                 assert self._release.wait(20), 'the held stream was never released'
                 return b'chunk'
-            return json.dumps({'done': True})
+            return DONE
 
         self.ws.receive.side_effect = receive
 
@@ -1373,7 +1494,7 @@ class TestPerDatasetStreamLock:
             assert stream.gate.active == 1
             calls_before = stream.exists.call_count
             other = _ws()
-            other.receive.side_effect = [json.dumps({'done': True})]
+            other.receive.side_effect = stream_script()
             stream.run('resume', ws=other)
             assert _sent_by(other) == [self.BUSY]
             other.receive.assert_not_called()
@@ -1398,7 +1519,7 @@ class TestPerDatasetStreamLock:
         with HeldStream(stream) as held:
             held.release()
         ws = _ws()
-        ws.receive.side_effect = [json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script()
         stream.run('resume', ws=ws)
         assert _sent_by(ws) == [{'status': 'ok'}]
 
@@ -1425,7 +1546,7 @@ class TestPerDatasetStreamLock:
         with HeldStream(stream) as held:
             for client, dataset in (('client2', 'pool/data'), ('client1', 'pool/other')):
                 ws = _ws()
-                ws.receive.side_effect = [json.dumps({'done': True})]
+                ws.receive.side_effect = stream_script()
                 stream.run('resume', ws=ws, client=client, dataset=dataset)
                 assert _sent_by(ws) == [{'status': 'ok'}], (client, dataset)
             held.release()
@@ -1443,7 +1564,7 @@ class TestPerDatasetStreamLock:
         a, b = Stream(mocker), Stream(mocker)
         with HeldStream(a) as held:
             ws = _ws()
-            ws.receive.side_effect = [json.dumps({'done': True})]
+            ws.receive.side_effect = stream_script()
             b.run('resume', ws=ws)
             assert _sent_by(ws) == [{'status': 'ok'}]
             held.release()
@@ -1465,7 +1586,7 @@ class TestPerDatasetStreamLock:
                 calls.append(1)
                 if len(calls) == 1:
                     assert gate_open.wait(20)
-                    return b'chunk'
+                    return HEADER
                 return json.dumps({'done': True})
 
             ws.receive.side_effect = receive
@@ -1584,7 +1705,7 @@ class TestDatasetLockIsReleased:
             assert len(stream.sent) == 1 and expected in stream.sent[0]['error'], stream.sent
         revert()
         ws = _ws()
-        ws.receive.side_effect = [json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script()
         stream.writer = MagicMock()
         stream.run('fresh', ws=ws)
         assert _sent_by(ws) == [{'status': 'ok'}], name
@@ -1593,7 +1714,7 @@ class TestDatasetLockIsReleased:
     def test_the_next_stream_is_served_after_success(self, stream):
         stream.run('resume')
         ws = _ws()
-        ws.receive.side_effect = [json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script()
         stream.run('resume', ws=ws)
         assert _sent_by(ws) == [{'status': 'ok'}]
 
@@ -1611,7 +1732,7 @@ class TestDatasetLockIsReleased:
             stream.run('fresh')
         source_props.return_value = {}
         ws = _ws()
-        ws.receive.side_effect = [json.dumps({'done': True})]
+        ws.receive.side_effect = stream_script()
         stream.run('fresh', ws=ws)
         assert _sent_by(ws) == [{'status': 'ok'}]
 
@@ -1629,10 +1750,12 @@ class TestTheReceiveCreatesTheNewDataset:
     (the pending map) are in `test_zfsbackup_api_receive.py::TestPendingConfigStream`."""
 
     def owned(self, stream, client='client1', dataset='pool/data'):
+        """The whole `props` of the receive: the owned values, then the forced ones (B-2a)."""
         return {
             PROP_CONFIG: stream.stored,
             PROP_CLIENT_ID: client,
             PROP_SOURCE_DATASET: dataset,
+            **FILESYSTEM_FORCED,
         }
 
     def test_a_dataset_the_abort_destroyed_is_received_without_recreating_it(self, stream):
@@ -1659,9 +1782,9 @@ class TestTheReceiveCreatesTheNewDataset:
         """Not whatever a later read would return: the dataset is gone by then."""
         stream.token(TOKEN)
         stream.exists.side_effect = [True, True, True, False]
-        stream.get_value.side_effect = [stream.stored, None, None]
+        stream.config_script[:] = [stream.stored, None, None]
         stream.run('fresh')
-        assert stream.get_value.call_count == 1
+        assert stream.config_reads == 1
         assert stream.receive.call_args.kwargs['props'][PROP_CONFIG] == stream.stored
 
     def test_an_existing_dataset_is_never_stamped_and_keeps_force(self, stream):
@@ -1687,7 +1810,7 @@ class TestTheReceiveCreatesTheNewDataset:
         for mode in ('fresh', 'resume'):
             stream.exists.side_effect = [True, True, True, False]
             stream.token(TOKEN)
-            stream.ws.receive.side_effect = [json.dumps({'done': True})]
+            stream.ws.receive.side_effect = stream_script()
             stream.run(mode)
         assert stream.sent == [{'status': 'ok'}, {'status': 'ok'}]
         stream.create.assert_not_called()
@@ -1800,7 +1923,7 @@ class TestStreamsInProgressSet:
     def test_a_hundred_sequential_distinct_datasets_leave_it_empty(self, stream):
         for i in range(100):
             ws = _ws()
-            ws.receive.side_effect = [json.dumps({'done': True})]
+            ws.receive.side_effect = stream_script()
             stream.run('resume', ws=ws, dataset=f'pool/ds{i}')
             assert _sent_by(ws) == [{'status': 'ok'}]
             assert len(stream.claimed) == 0, i
@@ -2089,7 +2212,6 @@ class TestClaimReleasedBeforeTheReply:
         stream.writer.close.side_effect = lambda *a: during_close.append(stream.claimed)
         if how == 'write-error':
             stream.writer.write.side_effect = BrokenPipeError(32, 'Broken pipe')
-            stream.ws.receive.side_effect = [b'chunk']
         stream.run('resume')
         assert during_close == [{SERVER_DS}]
         assert releases == [(SERVER_DS, 0)]
@@ -2097,7 +2219,7 @@ class TestClaimReleasedBeforeTheReply:
 
     def test_a_second_stream_started_from_inside_the_ok_send_is_served_not_busy(self, stream, releases):
         inner = _ws()
-        inner.receive.side_effect = [b'next', json.dumps({'done': True})]
+        inner.receive.side_effect = stream_script(b'next')
         started = []
 
         def send(message):
@@ -2140,11 +2262,43 @@ class TestClaimReleasedBeforeTheReply:
 
     @staticmethod
     def _idle_timeout(s, props):
+        s.ws.receive.side_effect = [HEADER, None]
+
+    @staticmethod
+    def _idle_timeout_in_header(s, props):
         s.ws.receive.side_effect = [None]
 
     @staticmethod
     def _connection_closed(s, props):
-        s.ws.receive.side_effect = [b'chunk', ConnectionClosed(None, None)]
+        s.ws.receive.side_effect = [HEADER, ConnectionClosed(None, None)]
+
+    @staticmethod
+    def _connection_closed_in_header(s, props):
+        s.ws.receive.side_effect = [b'x' * 100, ConnectionClosed(None, None)]
+
+    @staticmethod
+    def _bad_header(s, props):
+        s.ws.receive.side_effect = [b'\0' * 400]
+
+    @staticmethod
+    def _done_in_header(s, props):
+        s.ws.receive.side_effect = [b'x' * 100, DONE]
+
+    @staticmethod
+    def _base_mismatch(s, props):
+        s.ws.receive.side_effect = stream_script(header=incremental_header(99))
+
+    @staticmethod
+    def _type_mismatch(s, props):
+        s.type = 'volume'
+
+    @staticmethod
+    def _type_read_fails(s, props):
+        s.type = RuntimeError('cannot get type')
+
+    @staticmethod
+    def _unowned(s, props):
+        s.owner = None
 
     @staticmethod
     def _receive_raises(s, props):
@@ -2160,7 +2314,11 @@ class TestClaimReleasedBeforeTheReply:
 
     @staticmethod
     def _config_read_fails(s, props):
-        s.get_value.side_effect = RuntimeError('cannot get')
+        s.fail_config_read(RuntimeError('cannot get'))
+
+    @staticmethod
+    def _owner_read_fails(s, props):
+        s.fail_owner_read(RuntimeError('cannot get'))
 
     @staticmethod
     def _no_config_recorded(s, props):
@@ -2201,7 +2359,16 @@ class TestClaimReleasedBeforeTheReply:
                                           ['cannot receive: y'], 1),
         'write-error-close-ok': ('_write_error_close_ok', ['Broken pipe'], 1),
         'idle-timeout': ('_idle_timeout', ['no data from the client'], 1),
+        'idle-timeout-in-header': ('_idle_timeout_in_header', ['no data from the client'], 0),
         'connection-closed': ('_connection_closed', [], 1),
+        'connection-closed-in-header': ('_connection_closed_in_header', [], 0),
+        'bad-header': ('_bad_header', ['not a zfs send stream'], 0),
+        'done-in-header': ('_done_in_header', ['before its 312-byte header'], 0),
+        'base-mismatch': ('_base_mismatch', ['declared a full stream'], 0),
+        'type-mismatch': ('_type_mismatch', ['is a volume on the server'], 0),
+        'type-read-fails': ('_type_read_fails', ['Failed to read the type'], 0),
+        'unowned-dataset': ('_unowned', ['not recorded as a backup'], 0),
+        'owner-read-fails': ('_owner_read_fails', ['Failed to check'], 0),
         'receive-filesystem-raises': ('_receive_raises',
                                       ['Failed to start zfs receive: boom'], 0),
         'ownership-refusal': ('_ownership', ['refusing to mix in'], 0),
@@ -2236,12 +2403,14 @@ class TestClaimReleasedBeforeTheReply:
                 assert sent == []
         # ...and the name is free for the next stream
         stream.ws.send.side_effect = None
-        stream.ws.receive.side_effect = [json.dumps({'done': True})]
+        stream.ws.receive.side_effect = stream_script()
         for mock in (stream.receive, stream.list, stream.abort, stream.create, stream.exists,
-                     stream.get_value, stream.writer.close, stream.writer.write, source_props):
+                     stream.writer.close, stream.writer.write, source_props):
             mock.side_effect = None
         stream.exists.return_value = True
-        stream.get_value.return_value = stream.stored = canonical_dataset_config(GOOD_CONFIG)
+        stream.get_value.side_effect = stream._get_value
+        stream.owner, stream.type = ASKING, 'filesystem'
+        stream.stored = canonical_dataset_config(GOOD_CONFIG)
         stream.list.return_value = []
         source_props.return_value = {}
         stream.run('resume')
@@ -2272,7 +2441,7 @@ class TestClaimReleasedBeforeTheReply:
 
         if how == 'config-read-fails':
             # an early refusal: released before the reply, the finally must not release again
-            stream.get_value.side_effect = [RuntimeError('cannot get'), stream.stored]
+            stream.fail_config_read(RuntimeError('cannot get'), once=True)
             stream.ws.send.side_effect = lambda m: take_over()
         elif how == 'close-raises':
             stream.writer.close.side_effect = [RuntimeError('cannot receive: x'), None]

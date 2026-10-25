@@ -180,6 +180,18 @@ names only, then reads each dataset's `client_id`/`config` with `zfs.get.value(s
 WARNING) anything outside `<target>/<client_id>/`, with an invalid id, or with a config that is missing,
 undecodable or only received. The client's sent values survive as hidden `received` values under the server's
 locals, so never `zfs inherit -S` them. `/config`, `/datasets` and `/datasets/<n>/snapshots` no longer exist.
+**Receive hardening (B-2a/B-2c/B-3-lite).** The server reads the stream's 312-byte `DRR_BEGIN`
+(`read_stream_header`/`parse_stream_header`) before it lists snapshots, decides `-F`, aborts or spawns anything:
+a compound stream (`send -p`/`-R`/`-I`) is refused, the declared base must match `drr_fromguid`
+(`stream_base_problem`; a base named without a guid must match the server's guid for that name), and the object
+type picks the forced `-o` set (`RECEIVE_PROPERTIES_FILESYSTEM`: canmount=noauto, readonly, mountpoint=none,
+share*/setuid/exec/devices off; `RECEIVE_PROPERTIES_VOLUME`: readonly, volmode=none only — a volume refuses
+`-o canmount`); `-h`, never `-x`. The header bytes are fed to `zfs receive` unchanged. Refusals carry a `reason`
+(no `retry`) and log one WARNING per (dataset, reason) until a stream succeeds. A dataset on the backup path without
+a LOCAL `client_id` is never adopted (409 naming `zfs set org.zfsbackup:client_id=<id> <ds>`, one WARNING);
+negotiate creates missing ancestors one level at a time (`zfs create -u -o canmount=noauto -o client_id`, no
+`-p`). Negotiate logs one WARNING when a new config shortens the retention horizon (`retention_shrink`), never
+refuses. `received_datasets()` lists filesystems and volumes.
 
 **TLS, authentication and enrollment** (plan: [docs/tls_mtls_plan.md](docs/tls_mtls_plan.md); wire contract at its end).
 - **[zfsbackup/identity.py](zfsbackup/identity.py)** is the one implementation of the crypto plumbing shared by the
@@ -374,6 +386,9 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_api_negotiate.py` | `/negotiate`: body shape, canonical config (positive durations, 8 KiB cap), client dataset names, 400 before any write; parent-only creation, pending map (TTL, bounds, refresh), `server_copy`, placeholder ownership (D7), the negotiate claim, unsettled ancestors |
 | `tests/test_zfsbackup_api_protocol.py` | Wire protocol header: 426 matrix (`/health` exempt, `/enroll` first), `protocol` in `/whoami`/`/enroll`/`/rotate`, per-peer refusal log cap |
 | `tests/test_zfsbackup_api_receive.py` | Receive ownership: `-o` of `config`/`client_id`/`source_dataset` on fresh and resume, config from the pending entry, refusal without one, `-F` only when the dataset exists, the placeholder-overwrite message |
+| `tests/test_zfsbackup_api_stream_header.py` | B-2a: `DRR_BEGIN` parsing (M8 captures and synthetic), the websocket header reader, declared base vs `drr_fromguid` and name-only bases, the forced `-o` sets per type, header bytes fed first, refusals logged once |
+| `tests/test_zfsbackup_api_ownership.py` | B-2c: unowned datasets refused (409, one WARNING) on negotiate, `/stream` and `/resume_token`; ancestors created one level at a time |
+| `tests/test_zfsbackup_api_retention_shrink.py` | B-3-lite: the retention-horizon WARNING on negotiate; never refuses |
 | `tests/test_zfsbackup_api_auth.py` | Authentication and authorization: 401/403, the client-id binding (cert B cannot touch A's data), `/whoami`, the `/enroll` and `/rotate` matrices against a real trust store, predecessor retirement, `TrustGateway` |
 | `tests/test_zfsbackup_api_tls.py` | API worker TLS: per-connection handshake, TLS 1.3 only, connection caps and deadlines, revocation/addition with no restart, real `ApiWorker` under fork/spawn/forkserver, dry-run throwaway identity |
 | `tests/test_zfsbackup_api_wssession.py` | Websocket `_SessionSocket`: fd never closed while a reader is inside it, serialised writes, `end()`/hand-over close, no response after the upgrade, `ws_end_timeout` validation |
@@ -447,6 +462,7 @@ Shared TLS test helpers (importable from any test module; `tests/` is on `sys.pa
 - `tests/_tls_support.py` — real generated identities, a scripted `StubTrust`, `make_gateway`, `pin_client`/`unpin_client` through the real trust writers, `https_get`/`tls_probe`.
 - `tests/_api_support.py` — client certificates, `FakeGateway`, `Authed` (a Flask app presenting `SSL_CLIENT_CERT`), `RealTrust`, the `/enroll` and `/rotate` request bodies.
 - `tests/_remote_support.py` — `make_transport`, `fake_connect_pinned`, `client_tls_dir`, `whoami_json` for `RemoteBackupManager` tests.
+- `tests/_stream_support.py` — `make_header` (synthetic `DRR_BEGIN`), `capture_header(s)` (the M8 `HDR.*` captures), `HEADER`/`VOLUME_HEADER`, `incremental_header`, `get_value_answers` for server receive-path tests.
 - `tests/_enroll_support.py` — `RealServer` (real app + real gateway + real TLS listener) for the `enroll`/`identity rotate` CLI tests; `tests/_pty_driver.py` answers a prompt on a real pty.
 
 Other shared helpers:

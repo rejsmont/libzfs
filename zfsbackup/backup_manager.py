@@ -649,7 +649,10 @@ class DatasetManager:
           returned. A dataset with neither property set locally is not a
           received client dataset (the target itself, the `<target>/<id>`
           container, intermediate parents): skipped at DEBUG -- or at
-          WARNING if it carries a *received* config (one more read).
+          WARNING if it carries a *received* config (one more read). A
+          dataset with a valid local `client_id` (inside its client's tree)
+          and no config is a container negotiate stamped (B-2c): skipped at
+          DEBUG as well.
 
         Cost: two `zfs get` executions per received filesystem per pruning
         cycle (three for a dataset with neither property set locally), on
@@ -665,7 +668,12 @@ class DatasetManager:
             all_ds = zfs.list(
                 roots=Dataset(target),
                 recursive=True,
-                types='filesystem',
+                # Volumes too: a client volume is received as a volume
+                # (`volmode=none`, never a device) and is pruned and
+                # health-checked like a filesystem. Nothing downstream
+                # assumes a mount: it lists snapshots under the name and
+                # destroys them.
+                types='filesystem,volume',
             )
         except Exception as e:
             logger.error(f"Failed to discover received datasets: {e!r}")
@@ -728,8 +736,6 @@ class DatasetManager:
             return None, None
         if client_id is None:
             return None, f"{PROP_CLIENT_ID} is not set locally"
-        if config_value is None:
-            return None, f"{PROP_CONFIG} is not set locally"
         id_problem = client_id_problem(client_id)
         if id_problem is not None:
             return None, f"{PROP_CLIENT_ID}={client_id!r} is invalid: {id_problem}"
@@ -739,6 +745,18 @@ class DatasetManager:
                 f"it lies outside its client's tree {home!r} "
                 f"({PROP_CLIENT_ID}={client_id!r})"
             )
+        if config_value is None:
+            # B-2c: the server's negotiate stamps `client_id` (and nothing
+            # else) on every container it creates (`<target>/<id>` and the
+            # intermediate parents), so "client_id, no config" is such a
+            # container, not a damaged client dataset: not pruned, not worth
+            # a WARNING. (A leaf whose config was removed by hand lands here
+            # too; it is then not pruned either, only quietly.)
+            logger.debug(
+                f"{ds.name}: {PROP_CLIENT_ID} set, no local {PROP_CONFIG}; "
+                "a container, not a client dataset"
+            )
+            return None, None
         try:
             ds_config = DatasetConfig.from_property(config_value)
         except Exception as e:

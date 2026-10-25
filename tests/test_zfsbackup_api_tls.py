@@ -3676,9 +3676,16 @@ class TestStreamClaimReleasedBeforeOkOverTls:
         mocker.patch.object(DatasetManager, "datasets", new_callable=PropertyMock, return_value=[])
         mocker.patch("zfsbackup.api.read_zfsbackup_properties", return_value={})
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
+        from _stream_support import get_value_answers
+
         mocker.patch(
             "zfsbackup.api.zfs.get.value",
-            return_value=api.canonical_dataset_config(DatasetConfig(name="pool/data").to_property()),
+            side_effect=get_value_answers({
+                "org.zfsbackup:config": api.canonical_dataset_config(
+                    DatasetConfig(name="pool/data").to_property()),
+                "org.zfsbackup:client_id": "alice",         # B-2c: a local client id, the bound one
+                "type": "filesystem",                       # B-2a
+            }),
         )
         writers = []
 
@@ -3725,8 +3732,11 @@ class TestStreamClaimReleasedBeforeOkOverTls:
 
     @classmethod
     def _stream(cls, port, ctx, chunks=3):
-        """Open a stream, send `chunks` chunks and `done`; -> (ws, the first reply)."""
+        """Open a stream, send its header, `chunks` chunks and `done`; -> (ws, the first reply)."""
+        from _stream_support import HEADER
+
         ws = cls._open(port, ctx)
+        ws.send_binary(HEADER)
         for _ in range(chunks):
             ws.send_binary(b"x" * 4096)
         ws.send(json.dumps({"done": True}))
@@ -3764,8 +3774,11 @@ class TestStreamClaimReleasedBeforeOkOverTls:
         opened = []
         with Serving(rig.app, pki.gateway) as s:
             try:
+                from _stream_support import HEADER
+
                 first = self._open(s.port, rig.ctx)
                 opened.append(first)
+                first.send_binary(HEADER)
                 first.send_binary(b"x" * 4096)
                 assert _eventually(lambda: rig.gate.active == 1, timeout=20)
                 second = self._open(s.port, rig.ctx)

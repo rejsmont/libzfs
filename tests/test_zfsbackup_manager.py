@@ -1411,18 +1411,57 @@ class TestReceivedDatasetsForgedRows:
         assert [r for r in fake.reads if r[2] == 'received'] == [
             ('pool/backups/client1', 'org.zfsbackup:config', 'received')]
 
-    @pytest.mark.parametrize('present', ['client_id', 'config'])
-    def test_only_one_property_set_is_skipped_with_a_warning(self, mocker, caplog, present):
+    def test_a_config_without_a_local_client_id_is_skipped_with_a_warning(self, mocker, caplog):
         from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
         props = _client_props()
-        keep = PROP_CLIENT_ID if present == 'client_id' else PROP_CONFIG
         with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
             fake, result = self.run(mocker, ['pool/backups/client1'],
-                                    local={'pool/backups/client1': {keep: props[keep]}})
+                                    local={'pool/backups/client1': {PROP_CONFIG: props[PROP_CONFIG]}})
         assert result == []
-        missing = PROP_CONFIG if present == 'client_id' else PROP_CLIENT_ID
         (warning,) = self.warnings(caplog)
-        assert f'{missing} is not set locally' in warning
+        assert f'{PROP_CLIENT_ID} is not set locally' in warning
+
+    def test_a_client_id_without_a_config_is_a_container_skipped_at_debug(self, mocker, caplog):
+        """B-2c: negotiate stamps `client_id` (and nothing else) on `<target>/<id>` and on the
+        intermediate parents it creates. They are not client datasets: not pruned, no WARNING."""
+        from zfsbackup.backup_manager import PROP_CLIENT_ID
+        props = _client_props()
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            fake, result = self.run(mocker, ['pool/backups/client1'],
+                                    local={'pool/backups/client1': {PROP_CLIENT_ID: props[PROP_CLIENT_ID]}})
+        assert result == []
+        assert self.warnings(caplog) == []
+        (debug,) = [m for m in self.debugs(caplog) if 'a container, not a client dataset' in m]
+        assert 'pool/backups/client1' in debug and PROP_CLIENT_ID in debug
+
+    def test_a_container_below_the_id_directory_is_skipped_at_debug_too(self, mocker, caplog):
+        from zfsbackup.backup_manager import PROP_CLIENT_ID
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            fake, result = self.run(mocker, ['pool/backups/client1/a'],
+                                    local={'pool/backups/client1/a': {PROP_CLIENT_ID: 'client1'}})
+        assert result == []
+        assert self.warnings(caplog) == []
+
+    @pytest.mark.parametrize('bad_id', ['../x', 'x y', '-lead', 'a\nb'])
+    def test_a_container_with_an_invalid_client_id_is_still_a_warning(self, mocker, caplog, bad_id):
+        """The container exemption needs a VALID id: the checks that come first still run."""
+        from zfsbackup.backup_manager import PROP_CLIENT_ID
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            fake, result = self.run(mocker, ['pool/backups/client1'],
+                                    local={'pool/backups/client1': {PROP_CLIENT_ID: bad_id}})
+        assert result == []
+        (warning,) = self.warnings(caplog)
+        assert 'is invalid' in warning
+
+    def test_a_container_stamped_with_another_clients_id_is_still_a_warning(self, mocker, caplog):
+        """A dataset outside its own client's tree is skipped with a WARNING whether or not it has a config."""
+        from zfsbackup.backup_manager import PROP_CLIENT_ID
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            fake, result = self.run(mocker, ['pool/backups/other'],
+                                    local={'pool/backups/other': {PROP_CLIENT_ID: 'client1'}})
+        assert result == []
+        (warning,) = self.warnings(caplog)
+        assert 'lies outside its client' in warning
 
     @pytest.mark.parametrize('bad_id', ['../x', 'a/b', 'x y', '-lead', '.lead', 'a\nb', 'a\tb', 'é',
                                         'x' * 65, 'a:b'])
@@ -1578,8 +1617,21 @@ class TestReceivedDatasetsForgedRows:
         fake, _ = self.run(mocker, ['pool/backups/c/d'], local={'pool/backups/c/d': _client_props('c')})
         (call,) = fake.list.call_args_list
         assert 'properties' not in call.kwargs
-        assert call.kwargs['recursive'] is True and call.kwargs['types'] == 'filesystem'
+        assert call.kwargs['recursive'] is True and call.kwargs['types'] == 'filesystem,volume'
         assert str(call.kwargs['roots']) == 'pool/backups'
+
+    def test_a_received_volume_is_returned_like_a_filesystem(self, mocker):
+        """A volume stream is received as a volume (B-2a); the pruner and the health check handle
+        it by name, so it is a received dataset all the same."""
+        from libzfseasy.types import Volume
+        vol, fs = 'pool/backups/c/vol', 'pool/backups/c/fs'
+        fake = FakeReceived(mocker, [fs, vol], local={
+            vol: _client_props('c'), fs: _client_props('c')})
+        fake.list.side_effect = lambda *a, **k: [Filesystem(fs), Volume(vol)]
+        result = self.manager().received_datasets()
+        assert [d.name for d in result] == [fs, vol]
+        assert isinstance(result[1].dataset, Volume)
+        assert fake.list.call_args.kwargs['types'] == 'filesystem,volume'
 
     def test_the_real_listing_command_has_only_name_and_type_columns(self, mock_subprocess):
         mock_subprocess.setup(stdout=[])

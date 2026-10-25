@@ -71,7 +71,7 @@ class FakeZfsWorld:
 
     * `snaps[dataset]` -- snapshot names, or `(name, txg)` pairs to pin the `createtxg`
     * `props[(dataset, prop)]` -- a user property (everything is `local`)
-    * `filesystems` -- what `zfs list -t filesystem -r <target>` returns
+    * `filesystems` / `volumes` -- what `zfs list -t filesystem,volume -r <target>` returns
     * `list_fails` -- datasets whose snapshot listing exits 1
     * `missing_targets` -- targets whose strict (non-recursive) filesystem listing prints nothing
       (`empty_target`) or exits 1 with "does not exist"; `target_list_fails` -- targets whose
@@ -85,6 +85,7 @@ class FakeZfsWorld:
         self.snaps = {}
         self.props = {}
         self.filesystems = []
+        self.volumes = []
         self.list_fails = set()
         self.get_fails = set()
         self.empty_targets = set()
@@ -128,7 +129,10 @@ class FakeZfsWorld:
                 cells = dict(zip(known, list_row(name, root, **kw).rstrip('\n').split('\t')))
                 lines.append('\t'.join(cells.get(c, '-') for c in columns))
             return _Proc(''.join(line + '\n' for line in lines).encode(), b'', 0)
-        assert types == 'filesystem', types
+        # the strict look at the target is filesystem-only; the recursive enumeration of received
+        # datasets (`received_datasets`) asks for volumes too
+        assert types in ('filesystem', 'filesystem,volume'), types
+        assert ('-r' in rest) == (types == 'filesystem,volume'), rest
         if '-r' not in rest:
             # the strict look at the target itself (health_collect._target_problem)
             if root in self.target_list_fails:
@@ -141,6 +145,8 @@ class FakeZfsWorld:
                           + '\n').encode(), b'', 0)
         lines = ['\t'.join({'name': n, 'type': 'filesystem'}.get(c, '-') for c in columns)
                  for n in self.filesystems]
+        lines += ['\t'.join({'name': n, 'type': 'volume'}.get(c, '-') for c in columns)
+                  for n in self.volumes]
         return _Proc(''.join(line + '\n' for line in lines).encode(), b'', 0)
 
     def _get(self, rest):
@@ -536,7 +542,40 @@ def add_received(world, name, client_id, cfg, snapshots=()):
     world.snaps[name] = list(snapshots)
 
 
+def add_received_volume(world, name, client_id, cfg, snapshots=()):
+    world.volumes.append(name)
+    world.set_prop(name, PROP_CLIENT_ID, client_id)
+    world.set_prop(name, PROP_CONFIG, cfg.to_property())
+    world.snaps[name] = list(snapshots)
+
+
 class TestReceivedObservations:
+    def test_a_received_volume_is_observed_like_a_filesystem(self, world):
+        add_received_volume(world, f'{TARGET}/laptop/vol', 'laptop', client_ds('pool/vol'), [at(7200), at(600)])
+        (o,) = collect(server_config())
+        assert (o.source, o.subject, o.peer) == ('received', f'{TARGET}/laptop/vol', 'laptop')
+        assert o.newest_ts == epoch_of(at(600))
+        assert o.expected_seconds == HOUR and o.error is None
+
+    def test_a_received_volume_is_graded_by_its_lag(self, world):
+        add_received_volume(world, f'{TARGET}/c/vol', 'c', client_ds('pool/vol', '1h'), [at(10 * HOUR)])
+        add_received(world, f'{TARGET}/c/fs', 'c', client_ds('pool/fs', '1h'), [at(60)])
+        entries = {e.subject: e for e in graded(server_config(), world)}
+        assert entries[f'{TARGET}/c/vol'].state == STATE_CRIT
+        assert entries[f'{TARGET}/c/fs'].state == STATE_OK
+
+    def test_the_enumeration_asks_for_volumes_too_and_snapshots_are_listed_by_name(self, world):
+        add_received_volume(world, f'{TARGET}/c/vol', 'c', client_ds('pool/vol'), [at(60)])
+        collect(server_config())
+        enumeration = [a for a in world.calls if a[0] == 'list' and '-r' in a and 'snapshot' not in a]
+        assert enumeration and all(a[a.index('-t') + 1] == 'filesystem,volume' for a in enumeration)
+        assert not [a for a in world.calls if a[0] not in ('list', 'get')]       # read-only, no mount handling
+
+    def test_a_volume_beside_filesystems_in_one_tree(self, world):
+        add_received(world, f'{TARGET}/c/fs', 'c', client_ds('pool/fs'), [at(60)])
+        add_received_volume(world, f'{TARGET}/c/vol', 'c', client_ds('pool/vol'), [at(60)])
+        assert sorted(o.subject for o in collect(server_config())) == [f'{TARGET}/c/fs', f'{TARGET}/c/vol']
+
     def test_a_received_dataset_is_observed(self, world):
         add_received(world, f'{TARGET}/laptop/src', 'laptop', client_ds(), [at(7200), at(600)])
         (o,) = collect(server_config())

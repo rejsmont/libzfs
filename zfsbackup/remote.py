@@ -202,10 +202,37 @@ def _log_refusal(base_url: str, ds_name: str, result: dict) -> None:
 
 
 #: The `reason` of the server's refusal to receive a stream because it would
-#: destroy, or cannot replace, snapshots it holds (`api.decide_receive`), or
-#: because it cannot list them reliably (`listing`): logged once per episode
-#: (`RemoteBackupManager._note_refusal`).
-_STREAM_REFUSAL_REASONS = ('server_newer', 'base_missing', 'no_common', 'listing')
+#: destroy, or cannot replace, snapshots it holds (`api.decide_receive`),
+#: because it cannot list them reliably (`listing`), or because the stream
+#: itself is not what the client declared or the server accepts
+#: (`stream_header`: not a plain single-snapshot stream; `base_mismatch`: its
+#: incremental source is not the declared one; `type_mismatch`: the server
+#: holds a filesystem where this is a volume, or the reverse): logged once per
+#: episode (`RemoteBackupManager._note_refusal`), re-armed by the next success.
+_STREAM_REFUSAL_REASONS = (
+    'server_newer', 'base_missing', 'no_common', 'listing',
+    'stream_header', 'base_mismatch', 'type_mismatch',
+)
+
+#: What the operator should do about the refusals that need more than the
+#: server's own text: appended to the logged message.
+_STREAM_REFUSAL_HINTS = {
+    'stream_header': (
+        " (the server does not accept what this client sent: a client/server version skew "
+        "or a bug in one of them; compare `zfsbackupd --version` on both hosts and report "
+        "it if they match)"
+    ),
+    'base_mismatch': (
+        " (the stream is not the one this client declared: a client/server version skew "
+        "or a bug in one of them; compare `zfsbackupd --version` on both hosts and report "
+        "it if they match)"
+    ),
+    'type_mismatch': (
+        " (the server holds a dataset of the other kind under this name: on the server, "
+        "`zfs rename` it to a name outside the backup target; the next cycle sends a full "
+        "stream)"
+    ),
+}
 
 
 def _protocol_mismatch(where: str, server_protocol, *, refused: bool) -> str:
@@ -1023,7 +1050,8 @@ class RemoteBackupManager:
             self._log_refusal_once(
                 (f"{ds_name} [server refusal]", destination),
                 f"server {base_url} refused {ds_name} -> {destination}: "
-                f"{result.get('error') or 'unknown error'}",
+                f"{result.get('error') or 'unknown error'}"
+                f"{_STREAM_REFUSAL_HINTS.get(result.get('reason'), '')}",
             )
         else:
             _log_refusal(base_url, ds_name, result)

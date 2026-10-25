@@ -33,14 +33,16 @@ import json
 import logging
 import os
 import re
+import shlex
 import socket
 import ssl
+import struct
 import threading
 import time
 import types
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Mapping, NamedTuple, Optional, Tuple
 
@@ -148,6 +150,159 @@ PROTOCOL_EXEMPT_ENDPOINTS = frozenset({'health'})
 #: The dynamic `anchor.*`/`inflight.*` names cannot be listed; they can only
 #: pin snapshots on the server, never cause one to be destroyed.
 SERVER_OWNED_PROPERTIES = (PROP_CONFIG, PROP_CLIENT_ID, PROP_SOURCE_DATASET)
+
+#: Plan B-2a: what the server forces onto a received FILESYSTEM, as LOCAL
+#: values (`-o`, never `-x`): on OpenZFS 2.1.5, 2.2.2 and 2.4.1 (captures M8,
+#: `tests/fixtures/openzfs/*/M8.txt`) `-o <prop>=<safe value>` wins as a local
+#: value in every case captured (a missing dataset, an incremental, an existing
+#: placeholder, an existing dataset with preset locals, raw), whereas `-x` does
+#: NOT protect a full `-F` receive of a `-p` stream into an existing dataset
+#: (the stream's value becomes effective, source `received`). Together: never
+#: mounted (`canmount=noauto`, so `zfs mount -a` mounts nothing), never shared,
+#: no setuid/exec/devices, no mountpoint of the client's choosing, never
+#: written by anything but the receive (`readonly`), never a zvol device.
+#: Disjoint from `SERVER_OWNED_PROPERTIES` (also `-o`; one name twice is a zfs
+#: usage error).
+RECEIVE_PROPERTIES_FILESYSTEM = {
+    'canmount': 'noauto',
+    'readonly': 'on',
+    'volmode': 'none',
+    'mountpoint': 'none',
+    'sharenfs': 'off',
+    'sharesmb': 'off',
+    'setuid': 'off',
+    'exec': 'off',
+    'devices': 'off',
+}
+
+#: The same for a received VOLUME. A volume REFUSES `-o canmount`
+#: ("property 'canmount' does not apply to datasets of this type"; full,
+#: incremental and resume, plain and raw) and `-o mountpoint` and the other
+#: filesystem-only properties, so only these two are passed; `-x` of the
+#: filesystem-only names is accepted on a volume but prints one "does not
+#: apply" warning each, so it is not used either (and `-x` protects nothing,
+#: see above). A volume has no mount to neutralise; `volmode=none` keeps its
+#: device node (udev/LVM probing) off the server.
+RECEIVE_PROPERTIES_VOLUME = {
+    'readonly': 'on',
+    'volmode': 'none',
+}
+
+assert not set(RECEIVE_PROPERTIES_FILESYSTEM) & set(SERVER_OWNED_PROPERTIES)
+assert not set(RECEIVE_PROPERTIES_VOLUME) & set(SERVER_OWNED_PROPERTIES)
+
+#: The `dmu_replay_record` that opens every `zfs send` substream (OpenZFS
+#: `include/sys/zfs_ioctl.h`), 312 bytes: `drr_type` u32 (`DRR_BEGIN` = 0),
+#: `drr_payloadlen` u32, then the `drr_begin` union member -- `drr_magic` u64,
+#: `drr_versioninfo` u64, `drr_creation_time` u64, `drr_type`
+#: (`dmu_objset_type_t`) u32, `drr_flags` u32, `drr_toguid` u64,
+#: `drr_fromguid` u64, `drr_toname` char[256] (`MAXNAMELEN`). Fields are in the
+#: SENDER's byte order; `DMU_BACKUP_MAGIC` tells which (the receiver byte-swaps
+#: when it reads the magic swapped). Offsets: magic 8, versioninfo 16,
+#: creation 24, objset type 32, flags 36, toguid 40, fromguid 48, toname 56.
+DRR_BEGIN = 0
+DRR_RECORD_SIZE = 312
+DMU_BACKUP_MAGIC = 0x2F5bacbac
+#: `dmu_objset_type_t`: NONE 0, META 1, ZFS 2, ZVOL 3 (sys/fs/zfs.h).
+DMU_OST_ZFS = 2
+DMU_OST_ZVOL = 3
+#: `DMU_GET_STREAM_HDRTYPE(drr_versioninfo)` = bits 0-1: 1 = a plain
+#: substream (the only type accepted), 2 = a compound stream (what `zfs send
+#: -p`/`-R` writes first: a stub record with objset type 0 and an nvlist
+#: payload, then `DRR_END`, then the real substream's begin). A non-zero
+#: `drr_payloadlen` is normal for raw and resume substreams; the payload
+#: follows the record and is passed to `zfs receive` untouched.
+DMU_SUBSTREAM = 1
+DMU_COMPOUNDSTREAM = 2
+
+
+class StreamHeader(NamedTuple):
+    """The fields of a stream's `DRR_BEGIN` record the server acts on."""
+    kind: str            # 'filesystem' or 'volume' (the stream's object-set type)
+    to_guid: int
+    from_guid: int       # 0 for a full stream
+    versioninfo: int
+    to_name: str         # `pool/ds@snap` as the sender wrote it; for logging only
+    big_endian: bool
+
+
+class StreamHeaderError(ValueError):
+    """A stream's first record cannot be accepted (`parse_stream_header`, or a
+    stream that ended / stalled before it was complete). The text is the
+    reply to the client; never contains stream bytes beyond what is named."""
+
+
+def parse_stream_header(data: bytes) -> StreamHeader:
+    """Parse the leading `dmu_replay_record` of a `zfs send` stream (see
+    `DRR_RECORD_SIZE`). Raises `StreamHeaderError` for fewer than
+    `DRR_RECORD_SIZE` bytes, a magic that is not `DMU_BACKUP_MAGIC` in either
+    byte order, a first record that is not `DRR_BEGIN`, a compound stream
+    (`zfs send -p`, `-R`, `-I`: the client sends none of these), or an object
+    set that is neither a filesystem nor a volume. Does not look at the
+    payload that may follow the record."""
+    if len(data) < DRR_RECORD_SIZE:
+        raise StreamHeaderError(
+            f"the stream ended after {len(data)} bytes, before its {DRR_RECORD_SIZE}-byte header"
+        )
+    if struct.unpack_from('<Q', data, 8)[0] == DMU_BACKUP_MAGIC:
+        order = '<'
+    elif struct.unpack_from('>Q', data, 8)[0] == DMU_BACKUP_MAGIC:
+        order = '>'
+    else:
+        raise StreamHeaderError("the data is not a zfs send stream (bad magic)")
+    layout = struct.Struct(order + 'II' + 'QQQ' + 'II' + 'QQ' + '256s')
+    assert layout.size == DRR_RECORD_SIZE
+    (drr_type, _payloadlen, _magic, versioninfo, _creation, objset, _flags, to_guid, from_guid,
+     to_name) = layout.unpack_from(data, 0)
+    if drr_type != DRR_BEGIN:
+        raise StreamHeaderError("the stream does not start with a begin record")
+    hdrtype = versioninfo & 3
+    if hdrtype == DMU_COMPOUNDSTREAM:
+        raise StreamHeaderError(
+            "compound streams (zfs send -p, -R or -I) are not accepted; "
+            "send a plain stream of one snapshot"
+        )
+    if hdrtype != DMU_SUBSTREAM:
+        raise StreamHeaderError(f"unsupported stream header type ({hdrtype})")
+    if objset == DMU_OST_ZFS:
+        kind = 'filesystem'
+    elif objset == DMU_OST_ZVOL:
+        kind = 'volume'
+    else:
+        raise StreamHeaderError(f"the stream holds an unsupported object set type ({objset})")
+    name = to_name.split(b'\0', 1)[0].decode('utf-8', errors='replace')
+    return StreamHeader(kind, to_guid, from_guid, versioninfo, name, order == '>')
+
+
+def stream_base_problem(header: StreamHeader, base: 'StreamBase') -> Optional[str]:
+    """Why the stream's real incremental source (`drr_fromguid`) disagrees with
+    the base the client declared, or `None`. `decide_receive` decides `-F` from
+    the DECLARED base, so a stream that is incremental from something else
+    could destroy more than was checked. A declared guid must equal
+    `drr_fromguid`; a declared name only (a client without `from_guid`) must
+    meet a non-zero one; no declared base must meet 0 (a full stream)."""
+    if base.guid is not None:
+        expected = base.guid
+    elif base.name is not None:
+        if header.from_guid != 0:
+            return None
+        return f"the stream is a full stream, but the client named the incremental source {base.name!r}"
+    else:
+        expected = 0
+    if header.from_guid == expected:
+        return None
+    if expected == 0:
+        return (
+            "the client declared a full stream, but the stream is incremental "
+            f"(source guid {header.from_guid})"
+        )
+    if header.from_guid == 0:
+        return f"the client declared the incremental source guid {expected}, but the stream is a full stream"
+    return (
+        f"the client declared the incremental source guid {expected}, but the stream's source "
+        f"guid is {header.from_guid}"
+    )
+
 
 #: The configurations negotiate has accepted for server datasets that do not
 #: exist yet are kept in memory until the first receive creates the dataset
@@ -1049,6 +1204,51 @@ def canonical_dataset_config(encoded) -> str:
     return canonical
 
 
+def retention_horizon(config: DatasetConfig) -> Optional[timedelta]:
+    """How far back `config` keeps snapshots: its longest `keep_for` (the
+    pruner keeps nothing older than the largest expiry of any rule), or
+    `None` -- forever -- for a config with no retention rules (the pruner
+    prunes nothing then)."""
+    rules = config.retention_rules
+    return max(r.keep_for for r in rules) if rules else None
+
+
+def format_horizon(horizon: Optional[timedelta]) -> str:
+    """`'forever'` or the horizon as a short literal (`30d`, `36h`, `90s`):
+    the largest of d/h/m/s that divides it exactly; a fractional horizon is
+    shown in seconds with its full decimal value (never an exponent)."""
+    if horizon is None:
+        return 'forever'
+    # Exact integer microseconds (a float has too few digits for a long horizon).
+    micros = (horizon.days * 86400 + horizon.seconds) * 1_000_000 + horizon.microseconds
+    whole, fraction = divmod(abs(micros), 1_000_000)
+    sign = '-' if micros < 0 else ''
+    if fraction:
+        return f"{sign}{whole}.{fraction:06d}".rstrip('0') + 's'
+    for unit, size in (('d', 86400), ('h', 3600), ('m', 60)):
+        if whole >= size and whole % size == 0:
+            return f"{sign}{whole // size}{unit}"
+    return f"{sign}{whole}s"
+
+
+def retention_shrink(
+    stored: str, canonical_new: str
+) -> Optional[Tuple[Optional[timedelta], Optional[timedelta]]]:
+    """B-3-lite: `(old, new)` retention horizons (`retention_horizon`) when the
+    config in `canonical_new` keeps snapshots for a SHORTER time than the
+    stored `stored` (a finite horizon replacing a longer or unbounded one),
+    else `None` (equal, longer). Raises `ValueError` when `stored` does not
+    decode (the caller skips the comparison)."""
+    try:
+        old = retention_horizon(DatasetConfig.from_property(stored))
+    except Exception as e:
+        raise ValueError(f"stored config does not decode ({type(e).__name__})") from None
+    new = retention_horizon(DatasetConfig.from_property(canonical_new))
+    if new is not None and (old is None or new < old):
+        return old, new
+    return None
+
+
 def client_dataset_problem(dataset) -> Optional[str]:
     """Why the client dataset name in a `/backup/<id>/<dataset>/...` URL is
     unusable, or `None`. It becomes `org.zfsbackup:source_dataset` verbatim,
@@ -1104,6 +1304,34 @@ def parse_stream_base(args: Mapping[str, str]) -> StreamBase:
                 raise ValueError("stream parameter discard: not a comma-separated list of decimal guids")
             discard.add(int(part))
     return StreamBase(name, guid, frozenset(discard))
+
+
+def read_stream_header(ws, timeout: float) -> bytes:
+    """Read the websocket until at least `DRR_RECORD_SIZE` stream bytes have
+    arrived and return everything read so far (the header and whatever came
+    with it; the caller feeds all of it to `zfs receive` unchanged). A text
+    message other than `done` is ignored, as in the main receive loop; `done`
+    (or a close) before the header is complete raises `StreamHeaderError`.
+    `ws.receive` returning `None` is a stall: `TimeoutError`, like the main
+    loop. `ConnectionClosed` propagates."""
+    buf = b''
+    while len(buf) < DRR_RECORD_SIZE:
+        data = ws.receive(timeout=timeout)
+        if data is None:
+            raise TimeoutError(f"no data from the client for {timeout}s")
+        if isinstance(data, str):
+            try:
+                done = bool(json.loads(data).get('done'))
+            except (ValueError, AttributeError):
+                done = False
+            if done:
+                raise StreamHeaderError(
+                    f"the stream ended after {len(buf)} bytes, before its "
+                    f"{DRR_RECORD_SIZE}-byte header"
+                )
+            continue
+        buf += data
+    return buf
 
 
 class ServerSnapshot(NamedTuple):
@@ -1485,6 +1713,57 @@ def create_app(
         val = str(prop)
         return val if val != 'none' else None
 
+    #: `(server dataset, reason)` pairs whose stream refusal (`refuse_stream`)
+    #: was already announced at WARNING; forgotten when a stream of the
+    #: dataset succeeds. Bounded.
+    _refused_noted: set = set()
+
+    #: Datasets already announced at WARNING as unowned (once each, bounded):
+    #: a client negotiates every cycle, and the refusal repeats until the
+    #: operator acts.
+    _unowned_noted: set = set()
+
+    def _owner_problem(
+        server_dataset: str, local_id: Optional[str], client_id: str
+    ) -> Optional[str]:
+        """The 409 text for an EXISTING server dataset whose LOCAL
+        `org.zfsbackup:client_id` is `local_id` (`None`: not set locally), or
+        `None` when it is this client's. A dataset with no local id was not
+        made by a negotiate or a receive of this server (an operator's own
+        `<target>/<id>`, a dataset moved in, a received-only copy of the
+        property): it is never adopted silently (plan B-2c, because the full
+        `-F` receive would overwrite it and the pruner would take over its
+        snapshots); the message names the one command that adopts it on
+        purpose."""
+        if local_id is None:
+            if server_dataset not in _unowned_noted:
+                if len(_unowned_noted) > 1024:
+                    _unowned_noted.clear()
+                _unowned_noted.add(server_dataset)
+                logger.warning(
+                    "refusing to use %s: it exists with no local %s, so it was not created "
+                    "for a backup; to adopt it on purpose run: zfs set %s=%s %s",
+                    server_dataset, PROP_CLIENT_ID, PROP_CLIENT_ID, client_id,
+                    shlex.quote(server_dataset),
+                )
+            return (
+                f"server dataset {server_dataset} already exists on the server and is not "
+                f"recorded as a backup ({PROP_CLIENT_ID} is not set on it); refusing to "
+                "adopt it. If it is meant to hold this client's backups, the server "
+                f"operator can adopt it on purpose: zfs set {PROP_CLIENT_ID}={client_id} "
+                f"{shlex.quote(server_dataset)}"
+            )
+        if local_id != client_id:
+            # The other id is not named: it is not this client's business.
+            return (
+                f"server dataset {server_dataset} is recorded as another "
+                f"client's ({PROP_CLIENT_ID} differs from your bound client id "
+                f"{client_id!r}); refusing to use it. The server operator must "
+                "resolve this"
+            )
+        _unowned_noted.discard(server_dataset)
+        return None
+
     def _ownership_conflict(
         server_dataset: str, dataset: str, client_id: str
     ) -> Optional[str]:
@@ -1495,26 +1774,32 @@ def create_app(
           the bound `client_id` -- the server namespace is the binding's, and
           a dataset stamped for another id (an operator rename, a changed
           host id) is never written through;
+        - it has NO local client id (plan B-2c): an existing dataset nothing
+          here made is not adopted (`_owner_problem`). Every dataset a
+          negotiate or a receive creates carries a local id from the start
+          (`zfs create -o`, `zfs receive -o`, also while a first receive is
+          only partial), so this only meets datasets that came from
+          elsewhere;
         - it records a different client dataset as its source.
           `_server_dataset` drops the pool, so `tank/data` and `backup/data`
           map to the same server dataset and would otherwise silently share
           (and overwrite) it.
 
-        A dataset without a property (never negotiated) is not a conflict for
-        that property. Raises if the dataset's properties cannot be read."""
+        A dataset without a source-dataset property (a container negotiate
+        made, never negotiated itself) is not a conflict for that property.
+        Raises if the dataset's properties cannot be read."""
         ds = Dataset(server_dataset)
         if not zfs.exists(ds):
             return None
         props = read_zfsbackup_properties(ds)
         recorded_id = props.get(PROP_CLIENT_ID)
         if recorded_id and recorded_id != client_id:
-            # The other id is not named: it is not this client's business.
-            return (
-                f"server dataset {server_dataset} is recorded as another "
-                f"client's ({PROP_CLIENT_ID} differs from your bound client id "
-                f"{client_id!r}); refusing to use it. The server operator must "
-                "resolve this"
-            )
+            return _owner_problem(server_dataset, recorded_id, client_id)
+        problem = _owner_problem(
+            server_dataset, zfs.get.value(ds, PROP_CLIENT_ID, sources='local'), client_id
+        )
+        if problem is not None:
+            return problem
         recorded = props.get(PROP_SOURCE_DATASET)
         if recorded and recorded != dataset:
             return (
@@ -2183,40 +2468,56 @@ def create_app(
         with streams_guard:
             return name in streams_in_progress
 
-    def _ancestors_state(server_dataset: str, client_id: str) -> Tuple[Optional[Tuple[str, str]], list]:
-        """`(unsettled, missing)` for the ancestors of `server_dataset` up to
-        `<target>/<id>`. `unsettled` is `(ancestor, kind)` for the nearest
-        ancestor a child must not be created under yet, or `None`:
-        `'claimed'` (a stream or negotiate is working on it), `'pending'`
-        (negotiated, first receive not completed), or `'partial'` (a NEW
-        partial first receive: a `receive_resume_token` and no snapshot yet;
-        a child under it would make the later `zfs receive -A` fail with "has
-        children". An ancestor that already has snapshots, a cut
-        incremental, does not block). `missing` lists the ancestors that do
-        not exist (a `create -p` makes them), nearest first. One `zfs get`
-        per existing ancestor, plus one listing for one that has a token.
-        Raises if zfs fails."""
+    def _ancestors_state(
+        server_dataset: str, client_id: str
+    ) -> Tuple[Optional[Tuple[str, str]], list, Optional[str]]:
+        """`(unsettled, missing, conflict)` for the ancestors of
+        `server_dataset` up to `<target>/<id>`. `unsettled` is `(ancestor,
+        kind)` for the nearest ancestor a child must not be created under
+        yet, or `None`: `'claimed'` (a stream or negotiate is working on it),
+        `'pending'` (negotiated, first receive not completed), or `'partial'`
+        (a NEW partial first receive: a `receive_resume_token` and no
+        snapshot yet; a child under it would make the later `zfs receive -A`
+        fail with "has children". An ancestor that already has snapshots, a
+        cut incremental, does not block). `missing` lists the ancestors that
+        do not exist (negotiate creates them, one level at a time), nearest
+        first. `conflict` (plan B-2c) is the 409 text for the nearest EXISTING
+        ancestor that is not this client's container -- no local client id
+        (an operator's own `<target>/<id>` or a dataset below it) or another
+        client's -- else `None`. Ownership is read per ancestor, walking up
+        from the leaf's parent: an existing ancestor is checked for an owner
+        BEFORE its token, but an ancestor that is claimed or pending returns
+        first (`unsettled`), so the owner of that ancestor and of those above
+        it is not read until it settles. One
+        `zfs get` per existing ancestor for the owner, plus one more for the
+        token and one listing for one that has a token. Raises if zfs
+        fails."""
         base = f"{target}/{client_id}"
         ancestor = server_dataset.rsplit('/', 1)[0]
         missing = []
         while ancestor == base or ancestor.startswith(base + '/'):
             if _is_claimed(ancestor):
-                return (ancestor, 'claimed'), missing
+                return (ancestor, 'claimed'), missing, None
             if _pending(ancestor) is not None:
-                return (ancestor, 'pending'), missing
+                return (ancestor, 'pending'), missing, None
             ds = Dataset(ancestor)
             if zfs.exists(ds):
+                conflict = _owner_problem(
+                    ancestor, zfs.get.value(ds, PROP_CLIENT_ID, sources='local'), client_id
+                )
+                if conflict is not None:
+                    return None, missing, conflict
                 if (
                     zfs.get.value(ds, 'receive_resume_token') is not None
                     and not zfs.list(roots=ds, types='snapshot', properties=['creation'])
                 ):
-                    return (ancestor, 'partial'), missing
+                    return (ancestor, 'partial'), missing, None
             else:
                 missing.append(ancestor)
             if ancestor == base:
                 break
             ancestor = ancestor.rsplit('/', 1)[0]
-        return None, missing
+        return None, missing, None
 
     #: Ancestors already announced at WARNING as holding up their children
     #: (once each; forgotten when a child gets past them, so a later episode
@@ -2249,6 +2550,39 @@ def create_app(
                 "nothing was received yet); they follow once it has", ancestor,
             )
 
+    def _note_retention_shrink(
+        client_id: str, dataset: str, server_dataset: str, server_fs, canonical_new: str
+    ) -> None:
+        """B-3-lite (plan DD2): before negotiate overwrites the stored config,
+        compare the longest retention horizon of the stored canonical config
+        with the new one and log ONE WARNING when it shrinks (old -> new).
+        Never refuses and never raises: the server applies the client's
+        retention verbatim (a client admin's typo would make the next
+        pruning cycle destroy history), so this is only the operator's
+        notice. A stored config that cannot be read or decoded is skipped
+        (DEBUG). The comparison is against the config now stored; after the
+        overwrite the shrink is the stored state, so a repeat negotiate with
+        the same config warns no more."""
+        try:
+            stored = zfs.get.value(server_fs, PROP_CONFIG, sources='local')
+            if stored is None:
+                return
+            shrink = retention_shrink(stored, canonical_new)
+        except Exception as e:
+            logger.debug(
+                "negotiate from client %s for %r: not comparing the retention of %s: %s",
+                client_id, dataset, server_dataset, e,
+            )
+            return
+        if shrink is not None:
+            logger.warning(
+                "negotiate from client %s for %r: the retention horizon of %s shrinks from %s "
+                "to %s; the server applies the client's retention as sent, so snapshots older "
+                "than %s are pruned from the next pruning cycle",
+                client_id, dataset, server_dataset, format_horizon(shrink[0]),
+                format_horizon(shrink[1]), format_horizon(shrink[1]),
+            )
+
     def _negotiate_claimed(
         client_id: str, dataset: str, server_dataset: str, client_snapshots: list,
         ds_config_canonical: str,
@@ -2268,12 +2602,12 @@ def create_app(
             if conflict is not None:
                 return jsonify({'error': conflict}), 409
 
-        # A dataset that is missing -- or exists without a recorded owner (a
-        # placeholder parent a child's negotiate created, or a receive that
-        # has not yet applied its `-o` values) -- may already be spoken for by
+        # A dataset that is missing -- or exists without a recorded SOURCE
+        # dataset (a placeholder parent a child's negotiate created; it carries
+        # the client id, B-2c) -- may already be spoken for by
         # another client dataset that negotiated first and has not received
         # yet: same check, same message as for an owned one. (A recorded
-        # owner is `_ownership_conflict`'s.)
+        # source dataset is `_ownership_conflict`'s.)
         earlier = _pending(server_dataset)
         if earlier is not None and earlier[1] != dataset:
             try:
@@ -2294,11 +2628,15 @@ def create_app(
         missing_ancestors: list = []
         if not server_fs_exists and not config.dry_run:
             try:
-                unsettled, missing_ancestors = _ancestors_state(server_dataset, client_id)
+                unsettled, missing_ancestors, ancestor_conflict = _ancestors_state(
+                    server_dataset, client_id
+                )
             except Exception as e:
                 logger.error("negotiate from client %s: cannot check the parents of %s: %s",
                              client_id, server_dataset, e)
                 return jsonify({'error': f'Failed to check the parents of {server_dataset}'}), 500
+            if ancestor_conflict is not None:
+                return jsonify({'error': ancestor_conflict}), 409
             if unsettled is not None:
                 ancestor, kind = unsettled
                 _note_unsettled(client_id, dataset, ancestor, kind)
@@ -2321,6 +2659,9 @@ def create_app(
         if not config.dry_run:
             try:
                 if server_fs_exists:
+                    _note_retention_shrink(
+                        client_id, dataset, server_dataset, server_fs, ds_config_canonical
+                    )
                     zfs.set(server_fs, {
                         PROP_CONFIG: ds_config_canonical,
                         PROP_CLIENT_ID: client_id,
@@ -2344,13 +2685,29 @@ def create_app(
                         if rival is not None:
                             return jsonify({'error': _mix_message(server_dataset, rival, dataset)}), 409
                         try:
-                            # Only the parent chain, never the dataset itself.
+                            # Only the parent chain, never the dataset itself,
+                            # and one level at a time, outermost first (no `-p`:
+                            # only a name this pass checked as missing is ever
+                            # created, so a dataset that appeared meanwhile is a
+                            # failure, not adopted). Each one is stamped with the
+                            # local `client_id` (B-2c) and never mounted (B-2a).
                             # Limitation: this makes `<target>/<id>` a plain
                             # placeholder for the first non-root dataset, so a raw
                             # backup of the client's pool-root dataset received
                             # after another one meets the encrypted-overwrite
                             # refusal (`_receive_error` explains it).
-                            zfs.create(Filesystem(server_dataset.rsplit('/', 1)[0]), parents=True)
+                            # Filesystems only (no size, no positional argument:
+                            # `zfs.create` never dispatches to `create -V`; see the
+                            # note at the receive about volumes).
+                            for ancestor in reversed(missing_ancestors):
+                                zfs.create(
+                                    Filesystem(ancestor),
+                                    properties={
+                                        'canmount': 'noauto',
+                                        PROP_CLIENT_ID: client_id,
+                                    },
+                                    mount=False,
+                                )
                         except BaseException:
                             _unclaim_pending(server_dataset, ds_config_canonical, dataset)
                             raise
@@ -2468,7 +2825,10 @@ def create_app(
         `{"error"}` for a body that is not a JSON object, a missing or mistyped field, an undecodable or empty
         `config` (`BAD_CONFIG_ERROR`), an invalid dataset name, or a value
         libzfseasy refuses to store (`BAD_PROPERTY_ERROR`); 409 when the
-        server dataset belongs to another client id or client dataset; 500
+        server dataset belongs to another client id or client dataset, or
+        when it, or an existing ancestor up to `<target>/<id>`, has no local
+        `org.zfsbackup:client_id` (an operator's dataset is never adopted
+        silently: the message names the `zfs set` that adopts it; B-2c); 500
         when `zfs` fails; 401/403/426/503 as for every gated endpoint. A
         400 is decided before anything is written."""
         disabled = _require_enabled()
@@ -2698,8 +3058,71 @@ def create_app(
             }))
             return
 
-        # Whether the receive may be forced (`-F`), decided BEFORE the abort
-        # below: a refusal must not first discard a partial receive. `-F` on
+        # Plan B-2a: the stream's first record says what it is (a filesystem
+        # or a volume: the property set below) and what it is incremental
+        # from. It is read BEFORE the snapshot listing and the `-F` decision
+        # (so the decision is made after the wait for the first bytes, with
+        # nothing between it and the receive but the abort) and before
+        # anything is destroyed or spawned, so a refusal discards nothing.
+        # Everything read (the header and whatever arrived with it) is fed to
+        # `zfs receive` unchanged. Refusals carry a `reason` and no `retry`.
+        def refuse_stream(reason: str, message: str) -> None:
+            # WARNING once per (server dataset, reason) until a stream of this
+            # dataset succeeds (a client retries a refused stream every cycle).
+            key = (server_dataset, reason)
+            if key in _refused_noted:
+                logger.debug(
+                    "stream from client %s for %r refused (%s): %s",
+                    client_id, dataset, reason, message,
+                )
+            else:
+                if len(_refused_noted) > 1024:
+                    _refused_noted.clear()
+                _refused_noted.add(key)
+                logger.warning(
+                    "stream from client %s for %r refused (%s): %s",
+                    client_id, dataset, reason, message,
+                )
+            release_claim()
+            with contextlib.suppress(Exception):
+                ws.send(json.dumps({'error': message, 'reason': reason}))
+
+        try:
+            head_bytes = read_stream_header(ws, WS_IDLE_TIMEOUT)
+            header = parse_stream_header(head_bytes)
+        except ConnectionClosed:
+            return  # nobody to answer; nothing was spawned, the caller releases the claim
+        except StreamHeaderError as e:
+            refuse_stream('stream_header', str(e))
+            return
+        except Exception as e:
+            release_claim()
+            with contextlib.suppress(Exception):
+                ws.send(json.dumps({'error': _receive_error(e, server_dataset)}))
+            return
+        mismatch = stream_base_problem(header, base)
+        if mismatch is not None:
+            refuse_stream('base_mismatch', f"{mismatch}, so nothing is received")
+            return
+        if existed:
+            try:
+                existing_type = zfs.get.value(Dataset(server_dataset), 'type')
+            except Exception as e:
+                logger.error("cannot read the type of %s: %s", server_dataset, e)
+                release_claim()
+                with contextlib.suppress(Exception):
+                    ws.send(json.dumps({'error': f'Failed to read the type of {server_dataset}'}))
+                return
+            if existing_type != header.kind:
+                refuse_stream('type_mismatch', (
+                    f"{server_dataset} is a {existing_type} on the server and the stream is a "
+                    f"{header.kind}, so nothing is received"
+                ))
+                return
+
+        # Whether the receive may be forced (`-F`), decided after the header
+        # (above) and BEFORE the abort below: a refusal must not first discard
+        # a partial receive. `-F` on
         # an incremental receive destroys every snapshot newer than its base
         # (a client that rolled back or restored an older snapshot would
         # otherwise make the server destroy history it holds), so it is only
@@ -2723,6 +3146,19 @@ def create_app(
                     'reason': 'listing',
                 }))
                 return
+            if base.guid is None and base.name is not None:
+                # A client that named its base without a guid: the snapshot
+                # the server holds under that name must be the one the stream
+                # is really incremental from (`decide_receive` finds the base
+                # by name here, and `-F` is decided from what it finds).
+                named = next((r for r in rows if r.name == base.name), None)
+                if named is not None and named.guid is not None and named.guid != header.from_guid:
+                    refuse_stream('base_mismatch', (
+                        f"the client named {base.name!r} as the incremental source, which the "
+                        f"server holds with guid {named.guid}, but the stream's source guid is "
+                        f"{header.from_guid}, so nothing is received"
+                    ))
+                    return
             try:
                 decision = decide_receive(server_dataset, base, rows)
             except ValueError as e:
@@ -2822,10 +3258,31 @@ def create_app(
         # `-F` a dataset that appears in between is an error rather than
         # overwritten. The abort above may have destroyed a new dataset, so
         # existence is asked again.
+        #
+        # Plan B-2a: the same call also neutralises what arrives, by the
+        # stream's own object-set type (`header`, read above): `-o` of the
+        # mount/share/privilege properties and canmount for a filesystem, only
+        # `readonly`/`volmode` for a volume (it refuses the rest), `-h` (no
+        # holds from the stream: a client hold would pin server snapshots
+        # against the pruner) and never `-x` (it protects nothing on a full
+        # `-F` receive into an existing dataset). Identical for fresh and
+        # resumed receives, full and incremental. The outcome of `zfs receive`
+        # is its EXIT STATUS (`writer.close()`), never its stderr: OpenZFS 2.1
+        # prints a "sharesmb ... must be upgraded" line on raw receives that
+        # succeed.
+        #
+        # The server never creates a volume (`zfs create -V`): OpenZFS 2.4.1
+        # oopses on `zfs create -V ... -o readonly=...`. Volumes only arrive
+        # through the receive, which is fine. The only `zfs create` here is the
+        # container filesystems negotiate makes.
+        receive_props = (
+            RECEIVE_PROPERTIES_VOLUME if header.kind == 'volume' else RECEIVE_PROPERTIES_FILESYSTEM
+        )
         try:
             writer = zfs.receive.filesystem(
-                server_fs, props=owned,
-                force=decision.force and zfs.exists(server_fs), save=True, mount=False,
+                server_fs, props={**owned, **receive_props},
+                force=decision.force and zfs.exists(server_fs), holds=False,
+                save=True, mount=False,
             )
         except Exception as e:
             release_claim()
@@ -2834,8 +3291,12 @@ def create_app(
 
         reaped = False  # `writer.close()` already called on the write-error path
         try:
+            first = head_bytes  # the header record and what arrived with it, unchanged
             while True:
-                data = ws.receive(timeout=WS_IDLE_TIMEOUT)
+                if first is not None:
+                    data, first = first, None
+                else:
+                    data = ws.receive(timeout=WS_IDLE_TIMEOUT)
                 if data is None:
                     raise TimeoutError(
                         f"no data from the client for {WS_IDLE_TIMEOUT}s"
@@ -2878,6 +3339,9 @@ def create_app(
             writer.close()
             # The dataset exists now with the owned values as local ones.
             _forget_pending(server_dataset)
+            _refused_noted.difference_update(
+                {k for k in _refused_noted if k[0] == server_dataset}
+            )
             # The receive has finished and been reaped: nothing more touches
             # this dataset. Release the per-dataset claim BEFORE the final
             # ack, or a client that streams its next snapshot as soon as it
