@@ -1471,3 +1471,60 @@ class TestApiWorkerDrainsTrustWrites:
         assert seen["status"] == 200, "the enrollment begun before the reload was not cut off"
         assert env.finished_at >= seen["ended"]
         assert env.events == ["shutdown", "server_close"]
+
+
+# ---------------------------------------------------------------------------
+# Plan S-2: the session registry reaches the worker, and a stalled write cannot hold the drain
+# ---------------------------------------------------------------------------
+
+
+class TestApiWorkerWiresTheSessionRegistry:
+    def test_the_trust_poll_thread_gets_the_apps_registry(self, env, mocker):
+        seen = []
+        real = ApiWorker._start_trust_poll
+
+        def spy(self, logger, sessions=None):
+            seen.append((sessions, env.app.extensions.get("zfsbackup.sessions")))
+            return real(self, logger, sessions)
+
+        mocker.patch.object(ApiWorker, "_start_trust_poll", spy)
+        env.epoch.set(1)
+        outcome, code = run_worker(env, lambda e: None)
+        assert (outcome, code) == ("exit", 3)
+        (passed, published), = seen
+        assert passed is published and isinstance(passed, api_module.SessionRegistry)
+
+
+@pytest.mark.integration
+class TestStalledWriterDoesNotHoldTheDrain:
+    """A client that completes the handshake and then reads nothing blocks the server's pong
+    write; the route behind it never returns, so its gate slot was never released and a
+    reload's drain (`wait_idle(None)`) never ended. The stall bound frees it."""
+
+    def test_wait_idle_completes_once_the_stall_limit_cut_the_stream(
+        self, tls_config_db, tmp_path, mocker
+    ):
+        import threading
+
+        from _session_support import StreamRig, eventually, ping_flood
+
+        rig = StreamRig(tls_config_db, tmp_path, mocker, stall_limit=1.5, small_buffers=True)
+        stop = threading.Event()
+        try:
+            alice = rig.new_client("alice")
+            ws = rig.connect(alice, rcvbuf=4096)
+            rig.start_stream(ws)
+            session = rig.only_session()
+            ping_flood(ws, stop=stop)
+            assert eventually(
+                lambda: session.ws.sock._write_started is not None
+                and time.monotonic() - session.ws.sock._write_started > 0.3, 60
+            ), "the pong write never blocked"
+            rig.gate.start_draining()
+            assert rig.gate.active == 1
+            assert rig.gate.wait_idle(0.3) is False, "the drain must wait for the running stream"
+            assert rig.gate.wait_idle(30) is True, "a stalled write held the drain"
+            assert session.cut_reason is not None
+        finally:
+            stop.set()
+            rig.close()

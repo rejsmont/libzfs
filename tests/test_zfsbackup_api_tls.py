@@ -2193,6 +2193,138 @@ class TestTrustPollThread:
         finally:
             stopped.set()
 
+    # -- plan S-2: the session registry is enforced after every poll ------------------
+
+    class FakeSessions:
+        """`api.SessionRegistry`'s two passes, recording the order against the gateway's."""
+
+        def __init__(self, gateway, events, stall_error=None, revoke_error=None):
+            self.gateway = gateway
+            self.events = events
+            self.stall_error = stall_error
+            self.revoke_error = revoke_error
+            self.revocation_gateways = []
+
+        def enforce_stalls(self):
+            self.events.append("stalls")
+            if self.stall_error is not None:
+                raise self.stall_error
+            return 0
+
+        def enforce_revocations(self, trust):
+            self.events.append("revocations")
+            self.revocation_gateways.append(trust)
+            if self.revoke_error is not None:
+                raise self.revoke_error
+            return 0
+
+        def enforce(self, trust):          # the old single entry point: must not be used
+            raise AssertionError("the poll thread calls the two passes separately")
+
+    @pytest.fixture
+    def events(self, worker):
+        events = []
+        real_poll = worker._trust.poll
+
+        def poll():
+            events.append("poll")
+            return real_poll()
+
+        worker._trust.poll = poll
+        return events
+
+    def test_each_tick_is_stalls_then_poll_then_revocations(self, worker, events):
+        sessions = self.FakeSessions(worker._trust, events)
+        stopped = worker._start_trust_poll(logging.getLogger("t"), sessions)
+        try:
+            assert _eventually(lambda: events.count("revocations") >= 3, 5)
+        finally:
+            stopped.set()
+        ticks = [events[i:i + 3] for i in range(0, 9, 3)]
+        assert ticks == [["stalls", "poll", "revocations"]] * 3
+        assert all(g is worker._trust for g in sessions.revocation_gateways)
+
+    def test_the_stall_pass_has_run_before_a_poll_that_never_returns(self, worker, events):
+        """F4: the write-stall bound needs no database, so a hung store read (the poll) never
+        delays it for the tick it is hung in."""
+        release = threading.Event()
+        worker._trust.poll = lambda: (events.append("poll"), release.wait(30))
+        sessions = self.FakeSessions(worker._trust, events)
+        stopped = worker._start_trust_poll(logging.getLogger("t"), sessions)
+        try:
+            assert _eventually(lambda: events[:2] == ["stalls", "poll"], 5)
+            assert "revocations" not in events
+        finally:
+            release.set()
+            stopped.set()
+
+    def test_the_stall_pass_raising_does_not_skip_the_poll_or_the_revocation_pass(
+        self, worker, events
+    ):
+        sessions = self.FakeSessions(worker._trust, events, stall_error=RuntimeError("boom"))
+        stopped = worker._start_trust_poll(logging.getLogger("t"), sessions)
+        try:
+            assert _eventually(lambda: events.count("revocations") >= 2, 5)
+        finally:
+            stopped.set()
+        assert events[:3] == ["stalls", "poll", "revocations"]
+
+    def test_the_revocation_pass_raising_does_not_end_the_loop(self, worker, events):
+        sessions = self.FakeSessions(worker._trust, events, revoke_error=RuntimeError("boom"))
+        stopped = worker._start_trust_poll(logging.getLogger("t"), sessions)
+        try:
+            assert _eventually(lambda: events.count("revocations") >= 3, 5)
+        finally:
+            stopped.set()
+
+    def test_both_passes_run_even_when_the_poll_raises(self, worker, events):
+        worker._trust.error = RuntimeError("poll boom")
+        sessions = self.FakeSessions(worker._trust, events)
+        stopped = worker._start_trust_poll(logging.getLogger("t"), sessions)
+        try:
+            assert _eventually(lambda: events.count("revocations") >= 3, 5)
+        finally:
+            stopped.set()
+        assert events.count("stalls") >= 3
+
+    def test_enforcement_stops_with_the_loop(self, worker, events):
+        sessions = self.FakeSessions(worker._trust, events)
+        stopped = worker._start_trust_poll(logging.getLogger("t"), sessions)
+        assert _eventually(lambda: events.count("revocations") >= 2, 5)
+        stopped.set()
+        for thread in [t for t in threading.enumerate() if t.name == "trust-poll"]:
+            thread.join(5)
+        seen = len(events)
+        time.sleep(0.2)
+        assert len(events) == seen
+
+    def test_no_registry_means_no_enforcement_and_polling_continues(self, worker):
+        stopped = worker._start_trust_poll(logging.getLogger("t"), None)
+        try:
+            assert _eventually(lambda: worker._trust.polls >= 3, 5)
+        finally:
+            stopped.set()
+
+    def test_the_real_registry_is_enforced_by_the_real_thread(self, worker):
+        """Not a fake: a `SessionRegistry` with a stalled session, driven by the thread."""
+        from types import SimpleNamespace
+
+        class Sock:
+            eof_checked = 0
+
+            def force_eof_if_write_stalled(self, limit):
+                Sock.eof_checked += 1
+                return None
+
+        registry = api.SessionRegistry(stall_limit=1.0)
+        registry.register(api.StreamSession(SimpleNamespace(sock=Sock()), "a" * 64, "alice", "p/d"))
+        worker._trust.view = SimpleNamespace(key=None, pins={})   # nothing trusted: no store read
+        stopped = worker._start_trust_poll(logging.getLogger("t"), registry)
+        try:
+            assert _eventually(lambda: Sock.eof_checked >= 3, 5)
+        finally:
+            stopped.set()
+
     def test_the_reload_drain_callback_polls_nothing_and_watches_stop_and_supervisor(
         self, worker, mocker
     ):

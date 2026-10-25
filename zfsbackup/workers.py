@@ -1021,6 +1021,26 @@ def _api_server_class():
             the post-response drain never reads a websocket request
             (`_DeadlineReader._drain_into`).
 
+            **Write-stall bound (plan S-2).** A peer that completes the
+            handshake and then never reads fills its receive window, and the
+            next `sendall` blocks while holding `_write_lock` -- a pong the
+            reader thread answers, or the route's close frame / final reply.
+            Nothing on the writing thread can bound that, and the route that
+            is stuck behind it never returns, so its stream gate slot (and
+            with it a reload's drain) is never released. So the start of the
+            write in progress is recorded (`_write_started`, `time.
+            monotonic()`), set and cleared under `_state` exactly where the
+            write enters and leaves `_tls`, and the API worker's trust-poll
+            thread -- a THIRD thread -- calls `force_eof_if_write_stalled`
+            for every live session each tick. The check and the shutdown are
+            one step under `_state`, so a write that finished and was
+            replaced by a new one between the poll thread's read and its
+            shutdown can never be cut by mistake. The shutdown is safe from
+            that thread without any further protocol: while a write is
+            recorded `_busy > 0`, and `end()` neither returns True nor lets
+            the server close the connection before `_busy` is 0, so the
+            descriptor is open for the whole of the call.
+
             Only what simple-websocket and `api._end_websocket` use is
             offered; anything else fails loudly rather than bypassing the
             write lock or the descriptor accounting."""
@@ -1036,16 +1056,25 @@ def _api_server_class():
                 self._close_when_idle = False
                 #: Something was written (the `101`): the session is upgraded.
                 self.upgraded = False
+                #: `time.monotonic()` at which the write now inside `_tls`
+                #: started, else `None`. Only written under `_state`, by the
+                #: thread holding `_write_lock`; read (under `_state`) by the
+                #: trust-poll thread's stall check.
+                self._write_started: Optional[float] = None
 
-            def _enter(self) -> bool:
+            def _enter(self, write: bool = False) -> bool:
                 with self._state:
                     if self._ended:
                         return False
                     self._busy += 1
+                    if write:
+                        self._write_started = time.monotonic()
                     return True
 
-            def _leave(self) -> None:
+            def _leave(self, write: bool = False) -> None:
                 with self._state:
+                    if write:
+                        self._write_started = None
                     self._busy -= 1
                     if self._busy:
                         return
@@ -1068,7 +1097,7 @@ def _api_server_class():
 
             def sendall(self, data, flags=0) -> None:
                 with self._write_lock:
-                    if not self._enter():
+                    if not self._enter(write=True):
                         raise BrokenPipeError(errno.EPIPE, "the websocket session has ended")
                     # Before the write: even a failed one may have put bytes
                     # of the `101` on the wire.
@@ -1076,7 +1105,7 @@ def _api_server_class():
                     try:
                         self._tls.sendall(data, flags)
                     finally:
-                        self._leave()
+                        self._leave(write=True)
 
             def send(self, data, flags=0) -> int:
                 self.sendall(data, flags)
@@ -1099,6 +1128,26 @@ def _api_server_class():
                     socket.socket.shutdown(self._tls, socket.SHUT_RDWR)
                 except OSError:
                     pass
+
+            def force_eof_if_write_stalled(self, limit: float) -> Optional[float]:
+                """Plan S-2. Called from the API worker's trust-poll thread
+                (not from either thread that uses the socket). If the write
+                in progress started more than `limit` seconds ago, shut the
+                connection down (`force_eof`) so that write fails at once ->
+                the age of the write that was cut; else `None`. Check and
+                shutdown happen under `_state`, which is also where a write
+                starts and ends, so it is always the stalled write that is
+                cut. Takes no lock another thread can hold for long (never
+                `_write_lock`). Never raises."""
+                with self._state:
+                    started = self._write_started
+                    if started is None:
+                        return None
+                    age = time.monotonic() - started
+                    if age <= limit:
+                        return None
+                    self.force_eof()
+                    return age
 
             def end(self, timeout: float) -> bool:
                 """Refuse new I/O (a `recv` is EOF, a write `EPIPE`), then
@@ -1700,7 +1749,7 @@ class ApiWorker(_SupervisorWatch, Process):
         self._watch_init(reload_epoch, born_epoch, workers_lock)
         self._trust = None
 
-    def _start_trust_poll(self, logger):
+    def _start_trust_poll(self, logger, sessions=None):
         """Start the trust-poll thread: `TrustGateway.poll()` every
         `api.TRUST_POLL_SECONDS` until the returned event is set. A thread of
         its own, so a slow trust read (a busy database: seconds; a hung
@@ -1709,17 +1758,41 @@ class ApiWorker(_SupervisorWatch, Process):
         new connections during the drains. A daemon thread: a poll stuck in
         the kernel does not keep the process alive. The event is a
         `threading.Event` set by ordinary code on the main thread, never
-        from a signal handler."""
+        from a signal handler.
+
+        Plan S-2: the same thread enforces the websocket sessions
+        (`api.SessionRegistry`, the app's `extensions['zfsbackup.sessions']`;
+        `None` -> not done) every tick: `enforce_stalls()` BEFORE the poll
+        (it needs no database) cuts a session whose write has been stalled
+        for `WS_IDLE_TIMEOUT`, and `enforce_revocations(gateway)` AFTER it
+        cuts the ones whose pin was revoked. This is the only thread that
+        cuts a session; it is also the only caller of
+        `store.trust.list_revoked`, through `_store_call` like every other
+        store call of this process, waiting at most `api.STORE_CALL_WAIT`
+        (a skipped call is retried next tick). A slow `list_revoked` (busy
+        database) delays only the next tick, never a request."""
         from zfsbackup.api import TRUST_POLL_SECONDS
         gateway = self._trust
         stopped = threading.Event()
 
         def loop():
             while not stopped.wait(TRUST_POLL_SECONDS):
+                if sessions is not None:
+                    # The write-stall pass needs no database: before the
+                    # poll, so a slow or locked store never delays it.
+                    try:
+                        sessions.enforce_stalls()
+                    except Exception:  # never raises; belt and braces
+                        logger.debug("session stall check failed", exc_info=True)
                 try:
                     gateway.poll()
                 except Exception:  # poll() never raises; belt and braces
                     logger.debug("trust poll failed", exc_info=True)
+                if sessions is not None:
+                    try:
+                        sessions.enforce_revocations(gateway)
+                    except Exception:  # never raises; belt and braces
+                        logger.debug("session revocation check failed", exc_info=True)
 
         thread = threading.Thread(target=loop, name='trust-poll', daemon=True)
         thread.start()
@@ -1853,7 +1926,9 @@ class ApiWorker(_SupervisorWatch, Process):
         #: Set when the gateway asks for a restart (`TrustGateway.
         #: restart_reason`: the server identity on disk changed, confirmed).
         restart: Optional[str] = None
-        poll_stopped = self._start_trust_poll(logger)
+        poll_stopped = self._start_trust_poll(
+            logger, app.extensions.get('zfsbackup.sessions')
+        )
         try:
             # Sliced wait: wakes every `STOP_POLL` to check the exit reasons,
             # that the server thread is still alive and whether the trust

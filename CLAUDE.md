@@ -212,7 +212,11 @@ refuses. `received_datasets()` lists filesystems and volumes.
   moment, so one silent peer cannot stall the accept loop or `shutdown()`. Caps: 64 connections in all, 16 of
   them without a pinned client certificate; the request line and headers have an absolute 30 s deadline. A
   dedicated thread polls the trust generation every 2 s, so a revocation or an enrollment applies without a
-  restart; every `store.trust` call in the API worker is serialised in-process. The API worker drains and
+  restart; every `store.trust` call in the API worker is serialised in-process. Running streams are registered
+  (`api.SessionRegistry`) and the same thread cuts them (`force_eof`; `zfs receive` reaped, partial state kept) when
+  their certificate is revoked for any reason but a rotation's `retired` (a retired key is followed down
+  `superseded_by`, so revoking its successor cuts it too), or when a write to the peer has been blocked longer than
+  `WS_IDLE_TIMEOUT`; a cut before the data loop never runs `receive -A` or spawns a receive. The API worker drains and
   exits 1 (so the supervisor restarts it) only for a confirmed on-disk server-identity change (`IdentityChanged`).
 - **Authentication.** Every endpoint except `/health` and `/enroll` needs a client certificate pinned in the
   trust tables (401 without one, 403 if unknown or expired). The client id a request acts as is the one the
@@ -396,6 +400,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_api_retention_shrink.py` | B-3-lite: the retention-horizon WARNING on negotiate; never refuses |
 | `tests/test_zfsbackup_api_auth.py` | Authentication and authorization: 401/403, the client-id binding (cert B cannot touch A's data), `/whoami`, the `/enroll` and `/rotate` matrices against a real trust store, predecessor retirement, `TrustGateway` |
 | `tests/test_zfsbackup_api_tls.py` | API worker TLS: per-connection handshake, TLS 1.3 only, connection caps and deadlines, revocation/addition with no restart, real `ApiWorker` under fork/spawn/forkserver, dry-run throwaway identity |
+| `tests/test_zfsbackup_api_sessions.py` | Running-stream cuts: `SessionRegistry` (cut reasons, `superseded_by` chain, per-view-key cache, failed read, per-session isolation, cut racing `unregister`), `TrustGateway.list_revoked`, the `/stream` route's cut and unregister paths, mid-stream revocation and the write-stall bound over real TLS, a real `ApiWorker` under fork/spawn/forkserver |
 | `tests/test_zfsbackup_api_wssession.py` | Websocket `_SessionSocket`: fd never closed while a reader is inside it, serialised writes, `end()`/hand-over close, no response after the upgrade, `ws_end_timeout` validation |
 | `tests/test_zfsbackup_api_drain.py` | Post-response drain: client teardown after a response or websocket session is quiet (DEBUG, no traceback), bounded drain deadline, post-websocket 200 never written, websocket reader joined before `/stream` returns |
 | `tests/test_zfsbackup_api_bind.py` | API server binds without a reverse DNS lookup |
@@ -468,6 +473,7 @@ Shared TLS test helpers (importable from any test module; `tests/` is on `sys.pa
 - `tests/_api_support.py` — client certificates, `FakeGateway`, `Authed` (a Flask app presenting `SSL_CLIENT_CERT`), `RealTrust`, the `/enroll` and `/rotate` request bodies.
 - `tests/_remote_support.py` — `make_transport`, `fake_connect_pinned`, `client_tls_dir`, `whoami_json` for `RemoteBackupManager` tests.
 - `tests/_get_support.py` — realistic `zfs get -H`/`zfs list -H` bytes, `ZfsWorld` (a Popen router by argv), `GetReader` (patches `GetCommand._exec_lines`).
+- `tests/_session_support.py` — `StreamRig` (real route, TLS server, `RealTrust` on a real DB, real trust-poll thread; only the `zfs` calls patched), `ChildWriter` (a real receive child), `ping_flood`, `finish`, `SessionApiWorker`/`ProcessRig`.
 - `tests/_stream_support.py` — `make_header` (synthetic `DRR_BEGIN`), `capture_header(s)` (the M8 `HDR.*` captures), `HEADER`/`VOLUME_HEADER`, `incremental_header`, `get_value_answers` for server receive-path tests.
 - `tests/_enroll_support.py` — `RealServer` (real app + real gateway + real TLS listener) for the `enroll`/`identity rotate` CLI tests; `tests/_pty_driver.py` answers a prompt on a real pty.
 

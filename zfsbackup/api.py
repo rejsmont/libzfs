@@ -438,18 +438,21 @@ def _end_websocket(ws) -> None:
         thread.join(WS_READER_JOIN_TIMEOUT)
     if not thread.is_alive():
         return
-    sock = getattr(ws, 'sock', None)
-    force_eof = getattr(sock, 'force_eof', None)
-    if not callable(force_eof):
-        if not isinstance(sock, socket.socket):
-            return
-        force_eof = functools.partial(socket.socket.shutdown, sock, socket.SHUT_RDWR)
+    force_eof = _ws_force_eof(ws)
+    if force_eof is None:
+        return
     logger.debug("stream: the websocket reader is still waiting on a silent peer; "
                  "shutting the socket down")
     with contextlib.suppress(OSError):
         force_eof()
     with contextlib.suppress(RuntimeError):
         thread.join(WS_READER_JOIN_TIMEOUT)
+
+
+class _StreamCut(Exception):
+    """The running stream's session was cut by `SessionRegistry` (its pin was
+    revoked, or a write to the client stalled); never leaves
+    `create_app._receive_stream_locked`."""
 
 
 class _BadDatasetName(ValueError):
@@ -639,7 +642,10 @@ class TrustGateway:
     - `current_context()` is what the API server wraps each new connection
       with (`workers._api_server_class`), on that connection's own thread. A
       connection already established keeps the context it was accepted with;
-      revocation reaches new connections only (streams in flight finish).
+      a revocation reaches new connections through it, and a RUNNING
+      `/stream` through `SessionRegistry.enforce` (plan S-2: cut on
+      `revoked`, `successor_revoked`, `client_revoked` and `replaced`; a
+      `retired` pin -- a rotation -- finishes its stream).
     - `poll()` is called by `ApiWorker`'s trust-poll thread every
       `TRUST_POLL_SECONDS`. It reads the cheap trust key
       (`store.trust.read_trust_key`) and only when that changed reads the
@@ -701,13 +707,15 @@ class TrustGateway:
         rotate_client: Optional[Callable] = None,
         retire_predecessor: Optional[Callable] = None,
         token_precheck: Optional[Callable] = None,
+        list_revoked: Optional[Callable] = None,
     ) -> None:
         """`identity` is the loaded server `identity.Identity`; `resolved`
         the `ResolvedConfigPath` of the config database. The callables are
         seams for tests; the defaults are `store.trust.read_trust_key`,
         `store.trust.read_trust`, `identity.server_context` and
         `store.trust.enroll_client` / `rotate_client` / `retire_predecessor` /
-        `token_precheck` (all through the `zfsbackup.config.store` package).
+        `token_precheck` / `list_revoked` (all through the
+        `zfsbackup.config.store` package).
         With the default factory, rebuilds wait at most
         `GATEWAY_LOCK_TIMEOUT` for the identity lock; the initial context
         waits the identity module's default. A `context_factory` is called
@@ -717,7 +725,7 @@ class TrustGateway:
         (`ApiWorker`) then exits."""
         store = (
             read_trust_key, read_trust, enroll_client, rotate_client,
-            retire_predecessor, token_precheck,
+            retire_predecessor, token_precheck, list_revoked,
         )
         if any(f is None for f in store):
             from zfsbackup.config import store as _store
@@ -727,6 +735,7 @@ class TrustGateway:
             rotate_client = rotate_client or _store.rotate_client
             retire_predecessor = retire_predecessor or _store.retire_predecessor
             token_precheck = token_precheck or _store.token_precheck
+            list_revoked = list_revoked or _store.list_revoked
         server_context_fn = None
         if context_factory is None:
             from zfsbackup.identity import server_context
@@ -751,6 +760,7 @@ class TrustGateway:
         self._rotate_client = rotate_client
         self._retire_predecessor = retire_predecessor
         self._token_precheck = token_precheck
+        self._list_revoked = list_revoked
         self._lock = threading.Lock()
         #: Message of the read failure currently in effect (logged once).
         self._problem: Optional[str] = None
@@ -813,6 +823,15 @@ class TrustGateway:
         read-only filter `/enroll` runs before it spends a `zfs` call. Takes
         no write lock and writes nothing."""
         return _store_call(self._token_precheck, self._resolved, wait=STORE_CALL_WAIT, **kwargs)
+
+    def list_revoked(self) -> tuple:
+        """`store.trust.list_revoked(resolved)` -> every `RevokedPin`
+        (read-only, one snapshot). For `SessionRegistry`, called from the
+        trust-poll thread. Waits at most `STORE_CALL_WAIT` for the store lock,
+        then raises `ConfigBusy`: skipping is safe, because the registry
+        marks a session checked only after a completed read, so the next tick
+        asks again -- and the stall pass has already run by then."""
+        return tuple(_store_call(self._list_revoked, self._resolved, wait=STORE_CALL_WAIT))
 
     def poll(self) -> bool:
         """Re-read the pins if the trust key changed (or the installed view
@@ -1110,6 +1129,339 @@ class TrustGateway:
             logger.warning(f"{message} ({state})")
         else:
             logger.debug("trust read still failing: %s", message)
+
+
+#: The `RevokedPin.reason` values that cut a RUNNING stream today (plan S-2,
+#: DD5): the key was unpinned because it is not to be trusted any more. The
+#: RULE is a denylist, though (`SessionRegistry._revocation`): every recorded
+#: reason cuts except `NOT_CUT_REVOCATION_REASONS`, so a reason added to
+#: `store.models.REVOCATION_REASONS` later cuts by default. This set documents
+#: the reasons known now.
+CUT_REVOCATION_REASONS = frozenset({
+    'revoked', 'successor_revoked', 'client_revoked', 'replaced',
+})
+
+#: The one reason that does not cut by itself: `retired` is a rotation
+#: predecessor retired by its successor's first request (the legitimate host
+#: moving to its new key), and its stream finishes -- unless a key further
+#: down its `superseded_by` chain was revoked. Nor is a certificate's expiry
+#: mid-stream a reason.
+NOT_CUT_REVOCATION_REASONS = frozenset({'retired'})
+
+
+class StreamSession:
+    """One running `/stream` websocket session, as `SessionRegistry` knows it.
+
+    Created and (un)registered by the route's own thread; `cut_reason` is
+    written once, by `SessionRegistry` under its lock (the trust-poll
+    thread), and read by the route's thread, which stops at once when it is
+    set. `server_dataset` is filled in by the route once it has validated the
+    name (for the log line only)."""
+
+    __slots__ = ('ws', 'fingerprint', 'client_id', 'dataset', 'server_dataset',
+                 'cut_reason', 'checked_key')
+
+    def __init__(self, ws, fingerprint: str, client_id: str, dataset: str) -> None:
+        self.ws = ws
+        self.fingerprint = fingerprint
+        self.client_id = client_id
+        self.dataset = dataset
+        self.server_dataset: Optional[str] = None
+        #: Why the session was cut (`SessionRegistry._cut`), else `None`.
+        self.cut_reason: Optional[str] = None
+        #: The trust-view key at which `SessionRegistry` last read the
+        #: revocation records for this session successfully and found
+        #: nothing that cuts it (written and read by the trust-poll thread
+        #: only). Anything that can change the answer -- a revocation, a
+        #: rotation, an enrollment -- bumps the trust generation and so the
+        #: view's key; until it moves the store is not asked again.
+        self.checked_key: Optional[tuple] = None
+
+
+def _ws_force_eof(ws) -> Optional[Callable[[], None]]:
+    """How to shut a websocket's connection down at the OS level from another
+    thread: the `_SessionSocket`'s `force_eof` under the API worker's server,
+    else a plain `socket.shutdown` of a real socket, else `None`."""
+    sock = getattr(ws, 'sock', None)
+    force_eof = getattr(sock, 'force_eof', None)
+    if callable(force_eof):
+        return force_eof
+    if isinstance(sock, socket.socket):
+        return functools.partial(socket.socket.shutdown, sock, socket.SHUT_RDWR)
+    return None
+
+
+class SessionRegistry:
+    """The running `/stream` sessions of this API worker (plan S-2), so a
+    revoked client's transfer and a writer stalled on a peer that does not
+    read can be cut. `app.extensions['zfsbackup.sessions']`.
+
+    **Threads.**
+
+    - A *route thread* (one per connection; `create_app.backup_stream`)
+      `register()`s its session before it does any work and `unregister()`s
+      it, in a `finally`, AFTER `_end_websocket` and before the route
+      returns. It reads its own session's `cut_reason`.
+    - The *trust-poll thread* (`workers.ApiWorker._start_trust_poll`) calls
+      `enforce()` after every `TrustGateway.poll()`. It is the only caller of
+      `enforce`, hence the only thread that cuts a session and the only one
+      that calls `store.trust.list_revoked`.
+    - Nothing else touches the registry.
+
+    **Lock.** `_lock` guards `_sessions` and is held for the whole of a cut
+    (a `shutdown(2)` call and a counter, both non-blocking) and for
+    `register`/`unregister`. It is never held across a `store.trust` call or
+    a log call, and the only lock taken under it is
+    `_SessionSocket._state`, which nothing holding `_state` ever takes
+    `_lock` under. So the order is `_lock` -> `_state`, never the reverse.
+
+    **Descriptor lifetime.** A cut is `force_eof()`, a `socket.shutdown` of
+    the connection's descriptor. That is only safe while the connection is
+    open: werkzeug closes it after the route returns, and the number can then
+    belong to another client. So the rule is: *a cut happens only to a
+    session that is registered, under `_lock`, and a session is unregistered
+    (under `_lock`) before its route returns*. `unregister()` therefore
+    returns only after any cut that was running has finished, and none
+    starts afterwards; the connection is closed later still.
+    `_end_websocket` runs BEFORE `unregister`, deliberately: a route stuck in
+    it (its close frame waits for `_write_lock`, held by the reader thread's
+    blocked pong) must still be reachable by the write-stall check.
+
+    **What is cut, and why a trust-view diff.** `enforce` asks the store
+    only about registered sessions whose fingerprint is no longer in the
+    gateway's view (`TrustGateway.view.pins`) and that have not been checked
+    at the view's current key: a pin leaves the view when it is unpinned,
+    and every unpinning is recorded in `revoked_fingerprints` in the same
+    transaction, with the reason. So the cost of an idle server is one
+    dictionary lookup per session per tick, and of a session on a retired
+    key one `list_revoked` per trust change, however long it runs. A session
+    whose pin is still in the view is never cut by revocation; an expired
+    certificate is not cut either (the pin stays in the view). The reasons
+    that cut are every recorded reason but `retired` (a denylist,
+    `NOT_CUT_REVOCATION_REASONS`; `CUT_REVOCATION_REASONS` lists today's);
+    no record at all (e.g. the
+    database file was replaced) cuts nothing.
+
+    **A retired key is followed down its chain.** A rotation records the
+    old key as `retired` with `superseded_by` = the key whose first request
+    retired it, and a LATER revocation of that key does not change its
+    record (`revoke_pin` keeps the first reason and unpins the live
+    successors as `successor_revoked`; `revoke_client` unpins them as
+    `client_revoked`). So a session on a retired key is cut when any key
+    along `superseded_by` is itself recorded with a cut reason: the thief
+    who kept the old key's connection open through the rotation does not
+    outlive `trust revoke OLD`, `trust revoke NEW` or `trust revoke
+    --client`. A chain that ends in a live pin, or in nothing (no record,
+    or a `retired` record without `superseded_by`, written before that
+    column existed), cuts nothing. The chain walk uses only the records
+    `list_revoked` returns, is cycle-safe, and costs no extra store call.
+
+    **Stall bound.** Every tick, each registered session's socket is asked to
+    `force_eof_if_write_stalled(WS_IDLE_TIMEOUT)`.
+
+    **What this does not cover.** A trusted peer sending one frame every
+    less than `WS_IDLE_TIMEOUT` seconds is neither stalled (it reads) nor
+    idle; it holds its dataset claim (and a gate slot, so a reload waits
+    for it) as long as it likes, until it is revoked. The claim is scoped
+    to the client's own `<target>/<client_id>/...`, so only that client and
+    a reload suffer."""
+
+    def __init__(self, stall_limit: float = WS_IDLE_TIMEOUT) -> None:
+        self._stall_limit = stall_limit
+        self._lock = threading.Lock()
+        self._sessions: 'list[StreamSession]' = []
+        #: The failure in effect per kind of pass (`_note`): "read" (the
+        #: revocation list), "stall" (the write-stall check) and "cut"
+        #: (the revocation pass's per-session work), each logged once.
+        self._problems: dict = {}
+
+    def register(self, session: StreamSession) -> None:
+        with self._lock:
+            self._sessions.append(session)
+
+    def unregister(self, session: StreamSession) -> None:
+        """Remove `session`; after this returns nothing can cut it (see the
+        class docstring). Idempotent."""
+        with self._lock:
+            with contextlib.suppress(ValueError):
+                self._sessions.remove(session)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+    def enforce(self, trust: 'TrustGateway') -> int:
+        """Both passes, stall check first -> how many sessions were cut.
+        The API worker's trust-poll thread calls the two separately
+        (`enforce_stalls` before `TrustGateway.poll()`,
+        `enforce_revocations` after it). Never raises."""
+        return self.enforce_stalls() + self.enforce_revocations(trust)
+
+    def enforce_stalls(self) -> int:
+        """The write-stall pass, from the trust-poll thread: shut down every
+        session whose write has been blocked for `stall_limit`. Needs no
+        database, so it runs BEFORE `TrustGateway.poll()` and is never held
+        up by a slow store. A failure for one session is isolated from the
+        others, and logged once while it persists (WARNING; INFO when it
+        clears). Never raises."""
+        try:
+            with self._lock:
+                sessions = list(self._sessions)
+        except Exception:  # pragma: no cover -- a plain list copy
+            return 0
+        cuts = 0
+        failure = None
+        for session in sessions:
+            try:
+                if self._cut_if_stalled(session):
+                    cuts += 1
+            except Exception as e:
+                logger.debug("stall check of a session failed", exc_info=True)
+                failure = failure or f"{type(e).__name__}: {e}"
+        self._note(
+            'stall', failure and f"the write-stall check of a running stream failed: {failure}",
+            "the write-stall check works again",
+        )
+        return cuts
+
+    def enforce_revocations(self, trust: 'TrustGateway') -> int:
+        """The revocation pass, from the trust-poll thread after
+        `TrustGateway.poll()`: cut the sessions whose pin was revoked (see the
+        class docstring). Never raises; a failure is logged once while it
+        persists and the pass is retried next tick (no session is marked
+        checked unless its own check completed)."""
+        try:
+            return self._cut_revoked(trust)
+        except Exception as e:
+            logger.debug("revocation pass failed", exc_info=True)
+            self._note(
+                'cut', f"the revocation check of running streams failed: "
+                f"{type(e).__name__}: {e}", "the revocation check works again",
+            )
+            return 0
+
+    def _note(self, kind: str, problem: Optional[str], recovered: str) -> None:
+        """Log `problem` at WARNING once per distinct text per `kind` while it
+        lasts, and `recovered` at INFO when `problem` is `None` after one."""
+        before = self._problems.get(kind)
+        if problem is None:
+            if before is not None:
+                del self._problems[kind]
+                logger.info(recovered)
+        elif problem != before:
+            self._problems[kind] = problem
+            logger.warning(problem)
+
+    def _cut_if_stalled(self, session: StreamSession) -> bool:
+        message = None
+        with self._lock:
+            if session not in self._sessions or session.cut_reason is not None:
+                return False
+            check = getattr(getattr(session.ws, 'sock', None),
+                            'force_eof_if_write_stalled', None)
+            if not callable(check):
+                return False
+            # Unlike `_cut`, the reason is published AFTER the shutdown: the
+            # socket decides "stalled" and shuts down in one step under its
+            # own `_state` (so a finished write is never cut by mistake), and
+            # setting `cut_reason` beforehand would mark a healthy session
+            # cut. A route thread woken by the shutdown that looks before the
+            # next line still ends the stream (`ConnectionClosed`); it only
+            # misses the "was cut" INFO line.
+            age = check(self._stall_limit)
+            if age is None:
+                return False
+            session.cut_reason = f"a write to the client has been blocked for {age:.0f}s"
+            message = self._describe(session)
+        logger.warning("cutting the running stream %s", message)
+        return True
+
+    def _cut_revoked(self, trust: 'TrustGateway') -> int:
+        with self._lock:
+            sessions = list(self._sessions)
+        view = trust.view
+        if view.key is None:
+            return 0   # nothing has been trusted yet: no session can exist
+        gone = [s for s in sessions
+                if s.cut_reason is None and s.fingerprint not in view.pins
+                and s.checked_key != view.key]
+        if not gone:
+            self._note('read', None, "the revocation list can be read again")
+            return 0
+        try:
+            records = {r.fingerprint: r for r in trust.list_revoked()}
+        except Exception as e:
+            # Includes `ConfigBusy`: the store lock was not free within
+            # `STORE_CALL_WAIT`. Nothing is marked checked, so the next tick
+            # asks again.
+            self._note(
+                'read',
+                f"cannot check whether {len(gone)} running stream(s) lost their "
+                f"client certificate: {type(e).__name__}: {e}; retrying every "
+                f"{TRUST_POLL_SECONDS:g} s",
+                "the revocation list can be read again",
+            )
+            return 0
+        self._note('read', None, "the revocation list can be read again")
+        cuts = 0
+        failure = None
+        for session in gone:
+            try:
+                why = self._revocation(session.fingerprint, records)
+                if why is None:
+                    session.checked_key = view.key
+                elif self._cut(session, why):
+                    cuts += 1
+            except Exception as e:
+                logger.debug("revocation check of a session failed", exc_info=True)
+                failure = failure or f"{type(e).__name__}: {e}"
+        self._note(
+            'cut', failure and f"the revocation check of a running stream failed: {failure}",
+            "the revocation check works again",
+        )
+        return cuts
+
+    @staticmethod
+    def _revocation(fingerprint: str, records: dict) -> Optional[str]:
+        """Why the session on `fingerprint` must be cut, or `None`. The
+        key's own record, else -- for a `retired` one -- that of each key
+        along `superseded_by`, oldest first. A denylist: any recorded reason
+        cuts except `retired`, which is followed instead."""
+        record = records.get(fingerprint)
+        seen = {fingerprint}
+        via = ''
+        while record is not None:
+            if record.reason not in NOT_CUT_REVOCATION_REASONS:
+                if not via:
+                    return f"its client certificate was revoked ({record.reason})"
+                return f"{via}revoked ({record.reason})"
+            successor = record.superseded_by if record.reason == 'retired' else None
+            if successor is None or successor in seen:
+                return None
+            seen.add(successor)
+            via = f"its certificate was retired by a rotation and its successor {successor} was "
+            record = records.get(successor)
+        return None
+
+    def _cut(self, session: StreamSession, reason: str) -> bool:
+        with self._lock:
+            if session not in self._sessions or session.cut_reason is not None:
+                return False
+            session.cut_reason = reason
+            force_eof = _ws_force_eof(session.ws)
+            if force_eof is not None:
+                with contextlib.suppress(Exception):
+                    force_eof()
+            message = self._describe(session)
+        logger.warning("cutting the running stream %s", message)
+        return True
+
+    @staticmethod
+    def _describe(session: StreamSession) -> str:
+        return (
+            f"of client {session.client_id} for "
+            f"{session.server_dataset or session.dataset!r}: {session.cut_reason}"
+        )
 
 
 class _RepeatFilter(logging.Filter):
@@ -1475,7 +1827,9 @@ def create_app(
 
     **Authentication** (`before_request`; it also runs on the websocket
     upgrade of `/stream`, so it is checked when a request or a stream
-    STARTS -- a stream already running finishes even if its pin is revoked):
+    STARTS; a stream already running is cut only by `SessionRegistry.enforce`,
+    which the API worker's trust-poll thread runs, when its pin is REVOKED --
+    not when it is retired by a rotation or the certificate expires):
 
     1. `/health` and `/enroll` are exempt (`UNAUTHENTICATED_ENDPOINTS`).
        `/health` is also exempt from the protocol check; `/enroll` is not
@@ -1519,6 +1873,10 @@ def create_app(
     app = Flask(__name__)
     gate = StreamGate()
     app.extensions['zfsbackup.stream_gate'] = gate
+    #: The running `/stream` sessions, for the trust-poll thread to cut a
+    #: revoked client's transfer and a stalled writer (plan S-2).
+    sessions = SessionRegistry()
+    app.extensions['zfsbackup.sessions'] = sessions
     app.extensions['zfsbackup.trust'] = trust
     app.extensions['zfsbackup.server_fingerprint'] = own_fp
     app.config['PROPAGATE_EXCEPTIONS'] = True
@@ -2879,9 +3237,16 @@ def create_app(
 
     @sock.route('/backup/<client_id>/<path:dataset>/stream')
     def backup_stream(ws, client_id: str, dataset: str):
+        # Authenticated at the upgrade (`_authenticate`); the bound id only.
+        client_id = g.client_id
+        # Registered before anything that can block on the peer, so the
+        # trust-poll thread can cut this session (revoked pin, stalled
+        # write); unregistered after `_end_websocket` and before the route
+        # returns, i.e. while the connection is certainly still open (see
+        # `SessionRegistry`).
+        session = StreamSession(ws, getattr(g, 'fingerprint', None) or '', client_id, dataset)
+        sessions.register(session)
         try:
-            # Authenticated at the upgrade (`_authenticate`); the bound id only.
-            client_id = g.client_id
             if not (enabled and target):
                 try:
                     ws.send(json.dumps({'error': 'remote_backup disabled'}))
@@ -2924,16 +3289,20 @@ def create_app(
                     "stream for %s/%s: mode=%s from=%s from_guid=%s discard=%d",
                     client_id, dataset, mode, base.name, base.guid, len(base.discard),
                 )
-                _receive_stream(ws, client_id, dataset, mode, base)
+                _receive_stream(ws, client_id, dataset, mode, base, session)
             finally:
                 gate.end()
         finally:
-            # After the session's `gate.end()`: a reload's drain does not
-            # wait for this.
-            _end_websocket(ws)
+            try:
+                # After the session's `gate.end()`: a reload's drain does not
+                # wait for this.
+                _end_websocket(ws)
+            finally:
+                sessions.unregister(session)
 
     def _receive_stream(
-        ws, client_id: str, dataset: str, mode: str, base: StreamBase
+        ws, client_id: str, dataset: str, mode: str, base: StreamBase,
+        session: StreamSession,
     ) -> None:
         # Validate the name before it becomes a key of anything. The key is
         # `<target>/<bound id>/...`, so the per-dataset claim is scoped to
@@ -2946,6 +3315,7 @@ def create_app(
             except Exception:
                 pass
             return
+        session.server_dataset = server_dataset
         if not _claim_dataset(server_dataset):
             try:
                 ws.send(json.dumps(BUSY_ERROR))
@@ -2968,14 +3338,14 @@ def create_app(
 
         try:
             _receive_stream_locked(
-                ws, client_id, dataset, server_dataset, mode, base, release_claim
+                ws, client_id, dataset, server_dataset, mode, base, release_claim, session
             )
         finally:
             release_claim()
 
     def _receive_stream_locked(
         ws, client_id: str, dataset: str, server_dataset: str, mode: str,
-        base: StreamBase, release_claim: Callable[[], None],
+        base: StreamBase, release_claim: Callable[[], None], session: StreamSession,
     ) -> None:
         server_fs = Filesystem(server_dataset)
 
@@ -3087,6 +3457,21 @@ def create_app(
             with contextlib.suppress(Exception):
                 ws.send(json.dumps({'error': message, 'reason': reason}))
 
+        def cut_before_changes(where: str) -> bool:
+            # The session was cut (`SessionRegistry`: revoked pin, stalled
+            # write) but simple-websocket still hands out the frames it had
+            # queued before the EOF, so the route can get this far. From here
+            # on nothing is destroyed or spawned: `receive -A` on a new
+            # dataset whose first full receive was cut would destroy it.
+            # Nobody to answer; the caller releases the claim.
+            if session.cut_reason is None:
+                return False
+            logger.info(
+                "stream for %s was cut (%s) %s; nothing was changed",
+                server_dataset, session.cut_reason, where,
+            )
+            return True
+
         try:
             head_bytes = read_stream_header(ws, WS_IDLE_TIMEOUT)
             header = parse_stream_header(head_bytes)
@@ -3099,6 +3484,8 @@ def create_app(
             release_claim()
             with contextlib.suppress(Exception):
                 ws.send(json.dumps({'error': _receive_error(e, server_dataset)}))
+            return
+        if cut_before_changes("after its header"):
             return
         mismatch = stream_base_problem(header, base)
         if mismatch is not None:
@@ -3192,6 +3579,9 @@ def create_app(
                 ', '.join(decision.rolled_back),
             )
 
+        if cut_before_changes("before the receive state was discarded"):
+            release_claim()
+            return
         if mode == 'fresh':
             # D3: a fresh stream cannot continue a partial receive. Discard
             # its saved state first, or `zfs receive` refuses with "contains
@@ -3211,6 +3601,11 @@ def create_app(
                 }))
                 return
             if token:
+                # Again, after the lookup (a zfs call that can take a while):
+                # a revoke landing during it must not reach `receive -A`.
+                if cut_before_changes("before the receive state was discarded"):
+                    release_claim()
+                    return
                 logger.warning(
                     "discarding the partial receive state of %s: the client "
                     "is sending a fresh stream", server_dataset,
@@ -3278,6 +3673,9 @@ def create_app(
         receive_props = (
             RECEIVE_PROPERTIES_VOLUME if header.kind == 'volume' else RECEIVE_PROPERTIES_FILESYSTEM
         )
+        if cut_before_changes("before zfs receive was started"):
+            release_claim()
+            return
         try:
             writer = zfs.receive.filesystem(
                 server_fs, props={**owned, **receive_props},
@@ -3290,6 +3688,29 @@ def create_app(
             return
 
         reaped = False  # `writer.close()` already called on the write-error path
+        closed_ok = False  # `writer.close()` returned: zfs receive exited 0
+
+        def note_cut(completed: bool) -> None:
+            # Only for a session `SessionRegistry` cut. What is kept is
+            # decided by `writer.close()` (zfs receive's own exit status),
+            # not by where the cut landed: a cut after the last data frame
+            # (a queued `{"done": true}` met the cut check first) or during
+            # the final ack leaves a complete, committed receive.
+            if session.cut_reason is None:
+                return
+            if completed:
+                logger.info(
+                    "stream for %s was cut (%s) after the receive had completed; "
+                    "the snapshot was committed",
+                    server_dataset, session.cut_reason,
+                )
+            else:
+                logger.info(
+                    "stream for %s was cut (%s); zfs receive reaped, the partial "
+                    "receive state is kept for a resume",
+                    server_dataset, session.cut_reason,
+                )
+
         try:
             first = head_bytes  # the header record and what arrived with it, unchanged
             while True:
@@ -3297,6 +3718,14 @@ def create_app(
                     data, first = first, None
                 else:
                     data = ws.receive(timeout=WS_IDLE_TIMEOUT)
+                if session.cut_reason is not None:
+                    # Cut by the trust-poll thread (revoked pin, stalled
+                    # write; `SessionRegistry`): the socket is already shut
+                    # down, but frames the reader had queued before that would
+                    # otherwise still be fed to `zfs receive`. Stop here; the
+                    # handler below reaps the receive, which `-s` leaves
+                    # resumable.
+                    raise _StreamCut(session.cut_reason)
                 if data is None:
                     raise TimeoutError(
                         f"no data from the client for {WS_IDLE_TIMEOUT}s"
@@ -3337,6 +3766,7 @@ def create_app(
             # sending 'status: ok'.
             reaped = True  # the handler below must not close a second time
             writer.close()
+            closed_ok = True
             # The dataset exists now with the owned values as local ones.
             _forget_pending(server_dataset)
             _refused_noted.difference_update(
@@ -3348,17 +3778,30 @@ def create_app(
             # reads `ok` (a chain step, a resume follow-up) can get `busy`.
             release_claim()
             ws.send(json.dumps({'status': 'ok'}))
-        except ConnectionClosed:
-            # Client already disconnected; best-effort reap the `zfs
-            # receive` process. Any error it raises here can't be reported
-            # back (the socket is gone) so it's intentionally suppressed.
+        except (ConnectionClosed, _StreamCut):
+            # Client already disconnected, or the session was cut
+            # (`_StreamCut`, `session.cut_reason`); best-effort reap the `zfs
+            # receive` process: its stdin is closed, so it exits (`-s` keeps
+            # a partial receive resumable) and no child outlives the stream.
+            # Any error it raises here can't be reported back (the socket is
+            # gone) so it's intentionally suppressed. A cut session also
+            # carries a read error that is the symptom, not the cause, when
+            # the reader saw the shutdown first -- hence the same branch.
             if not reaped:
-                with contextlib.suppress(Exception):
+                try:
                     writer.close()
+                    closed_ok = True
+                except Exception:
+                    pass
+            note_cut(closed_ok)
         except Exception as e:
             if not reaped:
-                with contextlib.suppress(Exception):
+                try:
                     writer.close()
+                    closed_ok = True
+                except Exception:
+                    pass
+            note_cut(closed_ok)
             # Reaped (or given up on): same ordering as the success path, the
             # claim goes before the client reads the error and retries.
             release_claim()
