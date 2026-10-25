@@ -1009,6 +1009,96 @@ class TestRealForgedReceivedProperty:
 
 
 # ---------------------------------------------------------------------------
+# TestRealNewlinePropertiesAndPruning (the two-phase org.zfsbackup:* property read)
+# ---------------------------------------------------------------------------
+
+class TestRealNewlinePropertiesAndPruning:
+    """`zfs get -H` prints a value raw, so a value with a newline is several lines. The anchor read is two-phase:
+    which `org.zfsbackup:*` properties a dataset has is read without any value column, then only those are read as
+    values. So a newline in a property that is not ours -- on the pool root (inherited by everything below it) or
+    on the backed-up dataset itself -- no longer stops pruning, while a newline in one of OUR values (an anchor)
+    still makes the read refuse, once, until it is fixed. Needs `set` permission on the test pool and a zfs that
+    accepts a newline in a user property; skips otherwise (never errors). Everything set here is cleared in
+    `finally` (the pool root's property with `zfs inherit`); only the test pool and `source_fs` are touched.
+
+    NOT RUN in the authoring session: run it with `ZFSB_REAL_ZFS=1 pytest -m real_zfs -k NewlineProperties`."""
+
+    NEWLINE = 'first line\nsecond line'
+
+    @staticmethod
+    def _set_or_skip(dataset, prop, value):
+        r = subprocess.run([_zfs_cmd(), 'set', f'{prop}={value}', dataset], capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip(f'zfs set {prop} on {dataset} not possible here (permission, or this zfs refuses a '
+                        f'newline in a user property): {r.stderr.strip()}')
+
+    @staticmethod
+    def _inherit_quietly(dataset, prop):
+        subprocess.run([_zfs_cmd(), 'inherit', prop, dataset], capture_output=True)
+
+    @staticmethod
+    def _six_snapshots(source_fs):
+        for h in [5.5, 4.5, 3.5, 2.5, 1.5, 0.5]:          # oldest first, as in TestRealPruning
+            zfs.snapshot(source_fs, snap_name_at(h))
+
+    @staticmethod
+    def _manager(source_fs):
+        config = BackupConfig(
+            datasets=[DatasetConfig(
+                name=source_fs.name, frequency=timedelta(hours=1),
+                retention_rules=[RetentionRule(timedelta(hours=1), timedelta(hours=3))],
+            )],
+            snapshot_prefix='autosnap',
+        )
+        manager = DatasetManager(config)
+        return manager, manager.datasets[0]
+
+    def test_a_newline_on_the_pool_root_and_on_an_unrelated_property_does_not_stop_pruning(
+            self, source_fs, auto_zfs_pool, caplog):
+        root = auto_zfs_pool.name
+        note, own, rooted = 'user:zfsb_note', 'user:zfsb_own', 'org.zfsbackup:anchor.rootonly'
+        try:
+            self._set_or_skip(root, note, self.NEWLINE)
+            # an org.zfsbackup name the dataset only INHERITS (no descendant sets it): not discovered, not read
+            self._set_or_skip(root, rooted, self.NEWLINE)
+            self._set_or_skip(source_fs.name, own, self.NEWLINE)
+            premise = _zfs_run('get', '-H', '-o', 'source', note, source_fs.name).strip()
+            assert premise.startswith('inherited from'), 'the premise: the dataset inherits the root\'s value'
+            self._six_snapshots(source_fs)
+            manager, dsi = self._manager(source_fs)
+            with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+                manager.prune_snapshots(dsi)
+            assert [m for m in _prune_records(caplog, logging.ERROR) if 'Cannot read anchors' in m] == []
+            assert len(list_real_snapshot_names_exact(source_fs.name)) == 3, 'pruning did not go ahead'
+        finally:
+            self._inherit_quietly(root, note)
+            self._inherit_quietly(root, rooted)
+            self._inherit_quietly(source_fs.name, own)
+
+    def test_a_newline_in_an_anchor_value_still_refuses_the_read_once_and_pruning_resumes_when_fixed(
+            self, source_fs, caplog):
+        anchor = 'org.zfsbackup:anchor.offsite'
+        try:
+            self._six_snapshots(source_fs)
+            self._set_or_skip(source_fs.name, anchor, self.NEWLINE)
+            manager, dsi = self._manager(source_fs)
+            with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+                manager.prune_snapshots(dsi)
+                manager.prune_snapshots(dsi)                # still broken: skipped again, and quiet
+            assert len(list_real_snapshot_names_exact(source_fs.name)) == 6, 'something was destroyed'
+            errors = [m for m in _prune_records(caplog, logging.ERROR) if 'Cannot read anchors' in m]
+            assert len(errors) == 1 and source_fs.name in errors[0]
+
+            self._set_or_skip(source_fs.name, anchor, 'one line')       # fixed
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+                manager.prune_snapshots(dsi)
+            assert len(list_real_snapshot_names_exact(source_fs.name)) < 6, 'pruning did not resume'
+        finally:
+            self._inherit_quietly(source_fs.name, anchor)
+
+
+# ---------------------------------------------------------------------------
 # TestRealSendReceive
 # ---------------------------------------------------------------------------
 

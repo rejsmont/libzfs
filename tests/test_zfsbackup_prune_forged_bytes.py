@@ -131,6 +131,11 @@ class FakeZfs:
                 prop = argv[-2]
                 raw = self.props.get((name, prop, source))
                 return self._proc([b'-\n'] if raw is None else raw)
+            if columns == 'name,property,source':
+                # phase 1 of the own-property read (names and sources, `-s`, no value): the honest world has
+                # no `org.zfsbackup:*` property on the datasets the pruner itself reads, so it prints nothing
+                assert '-s' in argv and argv[-2] == 'all', argv
+                return self._proc([])
             assert columns == 'name,property,value,source', argv     # never the `received` column
             assert '-s' not in argv, argv                            # it would drop the `type` rows
             if '-r' in argv and argv[-2].startswith('name,type,'):
@@ -152,12 +157,15 @@ class FakeZfs:
                         raw, source = self._effective(dsname, prop)
                         out += self._row(dsname, prop, raw, source)
                 return self._proc(out)
-            # `get ... all <name>`: the type row first, no zfsbackup properties
-            if '-r' in argv:
-                return self._proc([f'{n}\ttype\t{t}\t-\n'.encode() for n, t in self._listed()
-                                   if n == name or n.startswith(name + '/')])
+            # phase 2 of the own read, `get ... name,type[,props] <name>`: exactly `name`, `type`, then each
+            # requested property (unset: `-`)
+            assert argv[-2].startswith('name,type'), argv
+            assert '-r' not in argv, argv       # nothing below a received dataset carries a property here
             dstype = dict(self._listed()).get(name, 'filesystem')
-            return self._proc([f'{name}\ttype\t{dstype}\t-\n'.encode()])
+            out = [f'{name}\tname\t{name}\t-\n'.encode(), f'{name}\ttype\t{dstype}\t-\n'.encode()]
+            for prop in argv[-2].split(',')[2:]:
+                out += [f'{name}\t{prop}\t-\t-\n'.encode()]
+            return self._proc(out)
         if verb == 'destroy':
             return self._proc([], text=True)
         raise AssertionError(f'unexpected zfs command {argv}')

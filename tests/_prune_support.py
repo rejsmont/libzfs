@@ -1,8 +1,9 @@
 """A stateful stand-in for ZFS as the pruner sees it (plan B-4: batch fallback, held/cloned pre-skip).
 
 `PrunePool` replaces `zfs.list` (snapshot listings with `userrefs`/`clones`), `zfs.exists`,
-`GetCommand._exec_lines` (the anchor reads: the real `zfs.get.rows` parser runs over realistic
-`zfs get -H -o name,property,value,source` rows and the name-only verify `zfs list`, see `_get_support`)
+`GetCommand._exec_lines` (the anchor reads: the real parsers run over realistic output of both phases of the
+two-phase property read, `zfs get -H -o name,property,source -s local,received ...` then the explicit-list
+`zfs get -H -o name,property,value,source ...`, see `_get_support`)
 and `zfs.destroy` in `zfsbackup.backup_manager`. Its `destroy`
 follows what the captures under tests/fixtures/openzfs/*/M3_Z8.txt show on OpenZFS 2.1.5, 2.2.2 and 2.4.1:
 
@@ -76,14 +77,18 @@ class PrunePool(GetReader):
         self.props: Dict[str, List[Tuple[str, str, str]]] = {}   # dataset -> [(property, value, source)]
         self.missing: Set[str] = set()                      # datasets `zfs.exists` reports absent
         self.calls: List[DestroyCall] = []
-        self.get_calls: List[List[str]] = []                # the argv of every `zfs get` (anchor reads)
+        self.get_calls: List[List[str]] = []                # the argv of every phase-2 `zfs get` (values)
         self._init_reader()
-        #: every zfs call in order: ('get', dataset, recursive), ('value', dataset, property), ('destroy', names)
+        #: every zfs call in order: ('discover', dataset, recursive) (phase 1 of a property read: names and sources),
+        #: ('get', dataset, recursive) (phase 2: the values), ('value', dataset, property), ('destroy', names)
         self.events: List[tuple] = []
         self.empty_calls: List[DestroyCall] = []
         self.snapshot_lists: List[Tuple[str, bool]] = []    # (dataset, recursive) of each snapshot listing
         #: `fn(pool, call)` runs as a destroy call starts, before the checks (race injection).
         self.before_destroy: Optional[Callable[['PrunePool', DestroyCall], None]] = None
+        #: `fn(phase, dataset, recursive)` runs as a property read starts (`phase` is 'discover' or 'get'): change
+        #: `pool.props` between the two phases of a read.
+        self.on_read: Optional[Callable[[str, str, bool], None]] = None
         #: the Nth (1-based) and later snapshot listings raise.
         self.list_fails_from: Optional[int] = None
         mocker.patch('zfsbackup.backup_manager.zfs.destroy', side_effect=self._destroy)
@@ -171,6 +176,13 @@ class PrunePool(GetReader):
 
     def _note_get(self, root, recursive, cmd):
         self.events.append(('get', root, recursive))
+        if self.on_read is not None:
+            self.on_read('get', root, recursive)
+
+    def _note_discover(self, root, recursive, cmd):
+        self.events.append(('discover', root, recursive))
+        if self.on_read is not None:
+            self.on_read('discover', root, recursive)
 
     def _value(self, ds, prop, sources=None, raw=False):
         """`zfs get -H -o value <prop> <ds>` (the per-destination anchor read): the effective value."""

@@ -1245,3 +1245,111 @@ class TestRealGetRowsForgedStream:
         result = zfs.get(Filesystem(forge_tree['parent']), properties=[_FORGE_PROP], recursive=True,
                          types='filesystem,volume')
         assert isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# `zfs.get.property_sources()` against the real binary: names, properties and sources, never a value
+# ---------------------------------------------------------------------------------------------------------------------
+
+_PS_NEWLINE_PROP = 'org.t:nl'
+_PS_NEWLINE_VALUE = 'line1\nline2'
+
+
+@pytest.fixture(scope='class')
+def sources_tree(test_pool):
+    """`parent` (a newline-valued user property, so every descendant inherits it) with `kid` (local `org.zfsbackup:*`
+    properties), `sp ace` (a space in its name) with a child, and `bare` (nothing local); one `test_psrc` parent."""
+    parent = f'{test_pool}/test_psrc'
+    names = {'parent': parent, 'kid': f'{parent}/kid', 'space': f'{parent}/sp ace',
+             'space_kid': f'{parent}/sp ace/kid', 'bare': f'{parent}/bare'}
+    _raw_zfs_ok('create', parent)
+    try:
+        _raw_zfs_ok('set', f'{_PS_NEWLINE_PROP}={_PS_NEWLINE_VALUE}', parent)
+        for key in ('kid', 'space', 'space_kid', 'bare'):
+            _raw_zfs_ok('create', names[key])
+        _raw_zfs_ok('set', 'org.zfsbackup:config=cfg', names['kid'])
+        _raw_zfs_ok('set', 'org.zfsbackup:anchor.d=snap-1', names['kid'])
+        _raw_zfs_ok('set', 'org.zfsbackup:config=cfg-space', names['space'])
+        yield names
+    finally:
+        try:
+            _raw_zfs('destroy', '-r', parent)
+        except Exception:
+            _cleanup_test_datasets(test_pool.name)
+
+
+class TestRealPropertySources:
+    """A hostile (newline-valued) user property on the root cannot disturb a read that never asks for values."""
+
+    PREFIX = 'org.zfsbackup:'
+
+    def _expected(self, tree, *keys):
+        """The local `org.zfsbackup:*` rows of these datasets, from a raw `zfs get` (not from libzfseasy)."""
+        out = {}
+        for key in keys:
+            raw = _raw_zfs_ok('get', '-H', '-o', 'name,property,source', '-s', 'local', 'all', tree[key]).stdout
+            for line in raw.decode('utf-8', 'surrogateescape').split('\n'):
+                if line and line.split('\t')[1].startswith(self.PREFIX):
+                    out[tuple(line.split('\t'))] = True
+        return set(out)
+
+    def test_returns_exactly_the_local_org_zfsbackup_rows_and_does_not_raise(self, sources_tree):
+        got = zfs.get.property_sources(Filesystem(sources_tree['parent']), recursive=True,
+                                       sources=['local', 'received'], prefix=self.PREFIX, types='filesystem,volume')
+        assert set(got) == self._expected(sources_tree, 'kid', 'space')
+        assert len(got) == len(set(got)) == 3
+        assert {r.source for r in got} == {'local'}
+        assert {r.name for r in got} == {sources_tree['kid'], sources_tree['space']}
+        assert all(isinstance(r, zfs.PropertySource) for r in got)
+
+    def test_the_newline_valued_property_is_listed_by_name_and_never_by_value(self, sources_tree):
+        got = zfs.get.property_sources(Filesystem(sources_tree['parent']), recursive=True, sources='local',
+                                       types='filesystem,volume')
+        assert zfs.PropertySource(sources_tree['parent'], _PS_NEWLINE_PROP, 'local') in got
+        assert not any('line1' in f or 'line2' in f for row in got for f in row)
+
+    def test_inherited_rows_name_the_origin(self, sources_tree):
+        got = zfs.get.property_sources(Filesystem(sources_tree['kid']), sources='inherited',
+                                       prefix=_PS_NEWLINE_PROP)
+        assert got == [zfs.PropertySource(sources_tree['kid'], _PS_NEWLINE_PROP,
+                                          'inherited from ' + sources_tree['parent'])]
+
+    def test_an_origin_with_a_space_is_read(self, sources_tree):
+        got = zfs.get.property_sources(Filesystem(sources_tree['space_kid']), sources='inherited',
+                                       prefix=self.PREFIX)
+        assert got == [zfs.PropertySource(sources_tree['space_kid'], 'org.zfsbackup:config',
+                                          'inherited from ' + sources_tree['space'])]
+
+    def test_phase_two_a_strict_explicit_read_of_those_names_succeeds(self, sources_tree):
+        found = zfs.get.property_sources(Filesystem(sources_tree['parent']), recursive=True,
+                                         sources=['local', 'received'], prefix=self.PREFIX, types='filesystem,volume')
+        names = sorted({r.name for r in found})
+        props = sorted({r.property for r in found})
+        res = zfs.get.rows([Filesystem(n) for n in names], properties=props, types='filesystem,volume',
+                           received=False, strict=True)
+        assert res.complete
+        by = {(r.name, r.property): r for r in res if r.property in props}
+        for row in found:
+            assert by[(row.name, row.property)].source == 'local'
+        assert by[(sources_tree['kid'], 'org.zfsbackup:config')].value == 'cfg'
+        assert by[(sources_tree['space'], 'org.zfsbackup:config')].value == 'cfg-space'
+
+    def test_a_dataset_name_with_a_space(self, sources_tree):
+        got = zfs.get.property_sources(Filesystem(sources_tree['space']), sources='local', prefix=self.PREFIX)
+        assert got == [zfs.PropertySource(sources_tree['space'], 'org.zfsbackup:config', 'local')]
+
+    def test_a_dataset_whose_properties_all_filter_out_prints_nothing_and_exits_zero(self, sources_tree):
+        raw = _raw_zfs('get', '-H', '-o', 'name,property,source', '-s', 'received', 'all', sources_tree['bare'])
+        assert raw.returncode == 0 and raw.stdout == b''
+        assert zfs.get.property_sources(Filesystem(sources_tree['bare']), sources='received') == []
+        assert zfs.get.property_sources(Filesystem(sources_tree['bare']), sources='local',
+                                        prefix=self.PREFIX) == []
+
+    def test_every_row_of_every_type_passes_the_validators(self, rows_tree):
+        """Whatever `zfs get all` prints for filesystems, volumes, snapshots and bookmarks on this OpenZFS is accepted,
+        in the same objects `zfs list` names."""
+        got = zfs.get.property_sources(Filesystem(rows_tree['parent']), recursive=True, types='all')
+        assert {r.name for r in got} == set(_raw_list_names(['-r', '-t', 'all'], [rows_tree['parent']]))
+        assert {r.property for r in got} >= {'type', 'used', 'org.t:v'}
+        assert all(r.source in ('local', 'default', 'received', 'temporary', '-') or r.source.startswith('inherited from ')
+                   for r in got)

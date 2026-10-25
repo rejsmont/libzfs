@@ -14,7 +14,7 @@ from zfsbackup.backup_manager import (
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, RetentionRule, RemoteServerConfig, RemoteDatasetConfig, Duration,
 )
-from _get_support import ZfsWorld, get_lines, reads as reads_
+from _get_support import ZfsWorld, explicit_lines, get_lines, reads as reads_, source_lines
 from _snapshot_support import NO_TXG, list_row, listed_info, listed_snapshot
 from _prune_support import (  # noqa: F401
     VERSIONS, PrunePool, hourly_name, prune_manager, prune_pool, records,
@@ -431,7 +431,7 @@ class TestPropertyHelpers:
         dsi = manager.datasets[0]
         mock_subprocess.setup_multi(*_reads('pool/data', [
             (PROP_ANCHOR_PREFIX + 'offsite', 'autosnap_20240101120000', 'local'),
-        ]))
+        ], dests=('offsite',)))
         mocker.patch.object(manager, 'get_anchor', return_value='autosnap_20240101120000')
         anchors = manager.get_anchors(dsi)
         assert anchors == {'autosnap_20240101120000'}
@@ -932,29 +932,53 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         destroys = [i for i, e in enumerate(events) if e[0] == 'destroy']
         assert len(destroys) == 5
         for i in destroys:
+            # the last zfs call: phase 2 of the dataset's own read (the values), right after its discovery
             assert events[i - 1] == ('get', self.DS, False), events[max(0, i - 6):i + 1]
-            # before it: the per-destination reads, and (recursive) the descendants' read first of all
-            tail = events[:i - 1]
+            assert events[i - 2] == ('discover', self.DS, False), events[max(0, i - 6):i + 1]
+            # before them: the per-destination reads, and (recursive) the descendants' read first of all. No
+            # descendant has a property of ours here, so that read is its discovery alone (one exec).
+            tail = events[:i - 2]
             for dest in reversed(sorted(dests)):         # configured destinations are read sorted
                 assert tail.pop() == ('value', self.DS, PROP_ANCHOR_PREFIX + dest)
             if recursive:
-                assert tail.pop() == ('get', self.DS, True)
+                assert tail.pop() == ('discover', self.DS, True)
+
+    @pytest.mark.parametrize('dests', [(), ('offsite', 'cold')])
+    def test_the_own_read_is_still_the_last_when_a_descendant_has_properties(self, prune_pool, dests):
+        """A descendant that carries one of our properties makes the recursive read two execs; the dataset's own
+        two execs still come after it, and after the per-destination reads."""
+        manager, dsi = prune_manager(self.DS, recursive=True, destinations=dests)
+        fresh, olds = prune_pool.populate(self.DS, old=2)
+        prune_pool.snaps[self.CH] = list(prune_pool.snaps[self.DS])
+        prune_pool.props[self.CH] = [(PROP_ANCHOR_PREFIX + 'elsewhere', olds[0], 'local')]
+        prune_pool.send(self.DS, olds[1])               # the batch fails: a batch call, then singles
+        manager.prune_snapshots(dsi)
+        events = prune_pool.events
+        destroys = [i for i, e in enumerate(events) if e[0] == 'destroy']
+        assert len(destroys) >= 2
+        for i in destroys:
+            assert events[i - 2:i] == [('discover', self.DS, False), ('get', self.DS, False)]
+            tail = events[:i - 2]
+            for dest in reversed(sorted(dests)):
+                assert tail.pop() == ('value', self.DS, PROP_ANCHOR_PREFIX + dest)
+            assert tail[-2:] == [('discover', self.DS, True), ('get', self.DS, True)]
 
     def test_the_default_order_of_get_anchors_is_unchanged_and_the_flag_reverses_the_own_read(self, prune_pool):
         manager, dsi = prune_manager(self.DS, destinations=('offsite', 'cold'))
         prune_pool.populate(self.DS, old=1)
         manager.get_anchors(dsi)
         assert prune_pool.events == [
+            ('discover', self.DS, False),
             ('get', self.DS, False),
             ('value', self.DS, PROP_ANCHOR_PREFIX + 'cold'),
             ('value', self.DS, PROP_ANCHOR_PREFIX + 'offsite'),
         ]
         prune_pool.events.clear()
         manager.get_anchors(dsi, own_properties_last=False)
-        assert [e[0] for e in prune_pool.events] == ['get', 'value', 'value']
+        assert [e[0] for e in prune_pool.events] == ['discover', 'get', 'value', 'value']
         prune_pool.events.clear()
         manager.get_anchors(dsi, own_properties_last=True)
-        assert [e[0] for e in prune_pool.events] == ['value', 'value', 'get']
+        assert [e[0] for e in prune_pool.events] == ['value', 'value', 'discover', 'get']
 
     def test_both_orders_return_the_same_set(self, prune_pool):
         manager, dsi = prune_manager(self.DS, destinations=('offsite',))
@@ -1070,7 +1094,9 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         assert prune_pool.calls == []
         still.assert_not_called()
         assert anchors.call_count == 1                    # the pass's own read
-        assert len(prune_pool.get_calls) == (2 if recursive else 1)    # + the one `get -r` of a recursive pass
+        # its own two execs, + the discovery `get -r` of a recursive pass (no descendant has a property: one exec)
+        assert len(prune_pool.source_calls) == (2 if recursive else 1)
+        assert len(prune_pool.get_calls) == 1
 
     @pytest.mark.parametrize('recursive', [False, True])
     def test_one_re_read_per_real_destroy_call(self, prune_pool, mocker, recursive):
@@ -1080,9 +1106,10 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         manager.prune_snapshots(dsi)
         assert prune_pool.sizes == [20, 5] + [1] * 20
         assert anchors.call_count == 1 + len(prune_pool.calls)
+        assert len(prune_pool.get_calls) == 1 + len(prune_pool.calls)           # phase 2 of the own read
         if recursive:
-            gets = [c for c in prune_pool.get_calls if '-r' in c]
-            assert len(gets) == 1 + len(prune_pool.calls)
+            gets = [c for c in prune_pool.source_calls if '-r' in c]
+            assert len(gets) == 1 + len(prune_pool.calls)       # (and no phase 2: no descendant has a property)
 
     @pytest.mark.parametrize('kind', ['child anchor', 'child inflight pin'])
     def test_a_descendants_protection_appearing_after_the_batch_failed_stops_the_single(
@@ -2217,10 +2244,11 @@ def _zget(name, props, ptype='filesystem'):
     return get_lines(name, props, ptype)
 
 
-def _reads(name, props, ptype='filesystem'):
-    """The two `mock_subprocess.setup_multi` configs of ONE `read_zfsbackup_properties(<name>)`: the `get`
-    and the name-only `zfs list` cross-check `zfs.get.rows` runs after it."""
-    return reads_(name, props, ptype)
+def _reads(name, props, ptype='filesystem', dests=()):
+    """The two `mock_subprocess.setup_multi` configs of ONE `read_zfsbackup_properties(<name>)`: the discovery
+    and the strict read of the values. `get_anchors` always asks phase 2 for the anchor and inflight names of
+    every configured destination (`dests`, sorted, anchor then inflight) besides what the discovery found."""
+    return reads_(name, props, ptype, also=[p + d for d in sorted(dests) for p in (PROP_ANCHOR_PREFIX, PROP_INFLIGHT_PREFIX)])
 
 
 def _fail_get(mock_subprocess, stderr):
@@ -2240,13 +2268,20 @@ def _raw_cmds(mock_subprocess):
 
 
 def _is_verify_list(cmd):
-    """The name-only `zfs list -H -o name,type ...` that `zfs.get.rows` runs after every `zfs get`."""
+    """A name-only `zfs list -H -o name,type ...` (the cross-check `zfs.get.rows` runs with `verify_names`; the
+    property readers no longer run one)."""
     return cmd[1] == 'list' and cmd[2:5] == ['-H', '-o', 'name,type']
 
 
+def _is_discovery(cmd):
+    """Phase 1 of a property read: `zfs get -H -o name,property,source -s local,received ...` (no values)."""
+    return cmd[1] == 'get' and cmd[2:4] == ['-H', '-o'] and cmd[4] == 'name,property,source'
+
+
 def _cmds(mock_subprocess):
-    """The argvs issued, without the name-only verify list that follows each read."""
-    return [cmd for cmd in _raw_cmds(mock_subprocess) if not _is_verify_list(cmd)]
+    """The argvs issued, one `get` per property read: the discovery exec (phase 1) that precedes every read of the
+    values (phase 2) is left out, so `['get', 'set']` still means "read, then set". `_raw_cmds` has them all."""
+    return [cmd for cmd in _raw_cmds(mock_subprocess) if not _is_verify_list(cmd) and not _is_discovery(cmd)]
 
 
 def _subcommands(mock_subprocess):
@@ -2312,18 +2347,21 @@ class TestReadZfsbackupProperties:
         assert read_zfsbackup_properties(Filesystem('pool/data')) == {}
 
     def test_empty_output_fails_the_read(self, mock_subprocess):
-        """`zfs get` printed no rows at all, not even the `type` row every existing dataset starts with: a lost
-        group, an unknown protect-set. (An empty dict is only for a dataset that printed its rows.)"""
-        mock_subprocess.setup_multi(([],))
+        """Both execs printed nothing at all (exit 0), not even the `type` row every existing dataset starts with:
+        a lost group, an unknown protect-set. An empty discovery is a legitimate "no properties", so the read
+        asks for `type` alone, and its absence is what refuses to read as "no anchors"."""
+        mock_subprocess.setup_multi(([],), ([],))
         with pytest.raises(ZFSOutputError, match='no usable rows'):
             read_zfsbackup_properties(Filesystem('pool/data'))
+        assert len(_raw_cmds(mock_subprocess)) == 2
 
     def test_rows_of_another_dataset_make_the_read_fail_instead_of_being_ignored(self, mock_subprocess):
         """B-1d: the old reader quietly filtered other datasets' rows out. A row outside the requested
         object cannot come from zfs, so the read is untrusted and RAISES: the caller must not act on it."""
         mock_subprocess.setup_multi(
-            (_zget('pool/data', [(PROP_CONFIG, 'parent', 'local')])
-             + _zget('pool/data/child', [(PROP_CONFIG, 'child', 'local'), (A + 'x', 'y', 'local')]),),
+            (source_lines('pool/data', [(PROP_CONFIG, 'parent', 'local')]),),
+            (explicit_lines('pool/data', [PROP_CONFIG], {PROP_CONFIG: ('parent', 'local')})
+             + explicit_lines('pool/data/child', [PROP_CONFIG], {PROP_CONFIG: ('child', 'local')}),),
         )
         with pytest.raises(ZFSOutputError, match='could not be trusted'):
             read_zfsbackup_properties(Filesystem('pool/data'))
@@ -2334,13 +2372,15 @@ class TestReadZfsbackupProperties:
         ]))
         assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'off-site.eu': 'snap'}
 
-    def test_issues_exactly_one_zfs_get_and_nothing_else(self, mock_subprocess):
-        """One dataset, one exec: no name-only cross-check list (the `type` row is checked directly)."""
+    def test_issues_exactly_two_zfs_gets_and_nothing_else(self, mock_subprocess):
+        """One dataset, two execs (discovery, then the values): no name-only list, no recursion."""
         mock_subprocess.setup_multi(*_reads('pool/data', []))
         read_zfsbackup_properties(Filesystem('pool/data'))
-        (get_cmd,) = _raw_cmds(mock_subprocess)
-        assert get_cmd[1] == 'get' and get_cmd[-2:] == ['all', 'pool/data']
-        assert '-r' not in get_cmd, 'a recursive get would read the whole subtree'
+        discovery, values = _raw_cmds(mock_subprocess)
+        assert discovery[1] == 'get' and discovery[-2:] == ['all', 'pool/data']
+        assert values[1] == 'get' and values[-2:] == ['name,type', 'pool/data']
+        for cmd in (discovery, values):
+            assert '-r' not in cmd, 'a recursive get would read the whole subtree'
 
     def test_works_on_a_plain_dataset_object(self, mock_subprocess):
         mock_subprocess.setup_multi(*_reads('pool/data', [(PROP_CONFIG, 'c', 'local')]))
@@ -2357,15 +2397,16 @@ class TestReadZfsbackupProperties:
 
 
 class TestReadZfsbackupPropertiesRowReader:
-    """Plan B-1d: `read_zfsbackup_properties` is `zfs.get.rows(ds, 'all', ...)`, the framing-safe row reader,
-    so the properties of its datasets are read from rows that were checked, and a read that cannot be
-    checked RAISES. (The old private text parser -- tab recovery from a `received` column -- is gone;
-    its fail-closed replacement is exercised with forged rows in `test_zfsbackup_property_reads_forged.py`.)
+    """Plan B-1d, now two-phase: `read_zfsbackup_properties` discovers its names with a value-free
+    `-o name,property,source -s local,received` exec and reads exactly those with `zfs.get.rows(..., received=False,
+    strict=True)`, the framing-safe row reader, so the properties are read from rows that were checked, and a read
+    that cannot be checked RAISES. (The old private text parser -- tab recovery from a `received` column -- is gone;
+    its fail-closed replacement is exercised with forged rows in `test_zfsbackup_property_reads_forged.py`, the two
+    phases themselves in `test_zfsbackup_property_reads_two_phase.py`.)
 
-    Mutation counts (scratch copy, tests failing across the B-1d files): `strict=True` dropped from the own
-    reader 13 (3 here, 9 in test_zfsbackup_property_reads_forged, 1 in test_zfsbackup_prune_descendants) and from
-    the descendant reader 15; both source filters (`sources=` and the Python one) removed 17; the dataset's own
-    `type`-row check removed 2; the `received` column requested again 249."""
+    Mutation counts (scratch copy, tests failing across the property-reader files): `strict=True` dropped from
+    phase 2 16; the discovery's `-s`/source filter widened 38; the `org.zfsbackup:` prefix filter dropped 57; the
+    own `type`-row check removed 3; the `received` column requested again 277."""
 
     #: Real-shaped output with built-in properties libzfseasy has no class for.
     UNKNOWN_BUILTINS = [
@@ -2383,23 +2424,46 @@ class TestReadZfsbackupPropertiesRowReader:
         mock_subprocess.setup_multi(*_reads('pool/zv', [(prop, value, 'local')], ptype='volume'))
         assert read_zfsbackup_properties(Dataset('pool/zv')) == {}
 
-    def test_the_exact_command_line(self, mock_subprocess, monkeypatch):
+    def test_the_exact_command_lines_of_both_phases(self, mock_subprocess, monkeypatch):
+        """Nothing set: discovery, then `type` alone (`name,type` is what an explicit list always starts with)."""
         monkeypatch.setenv('ZFS_CMD', '/usr/bin/true')
         mock_subprocess.setup_multi(*_reads('pool/data', []))
         read_zfsbackup_properties(Filesystem('pool/data'))
         assert _raw_cmds(mock_subprocess) == [
-            ['/usr/bin/true', 'get', '-H', '-o', 'name,property,value,source',
+            ['/usr/bin/true', 'get', '-H', '-o', 'name,property,source', '-s', 'local,received',
              '-t', 'filesystem,volume', 'all', 'pool/data'],
+            ['/usr/bin/true', 'get', '-H', '-o', 'name,property,value,source',
+             '-t', 'filesystem,volume', 'name,type', 'pool/data'],
         ]
 
-    def test_the_received_column_is_not_requested(self, mock_subprocess):
-        """The `received` column holds the sending host's raw bytes; no `-o` list that names it is sent,
-        and no `-s` (it would drop the `type` rows the reader's lead rule needs)."""
-        mock_subprocess.setup_multi(*_reads('pool/data', []))
+    def test_phase_two_asks_for_exactly_the_names_phase_one_found_once_each_in_first_seen_order(
+            self, mock_subprocess, monkeypatch):
+        monkeypatch.setenv('ZFS_CMD', '/usr/bin/true')
+        mock_subprocess.setup_multi(*_reads('pool/data', [
+            ('compression', 'lz4', 'local'),                    # not ours: never asked for
+            (A + 'zeta', 'z', 'local'),
+            ('org.other:thing', 'x', 'local'),
+            (PROP_CONFIG, 'c', 'received'),
+            (A + 'alpha', 'a', 'local'),
+            (A + 'inh', 'i', 'inherited from pool'),            # inherited: not discovered (and `-s` drops it)
+        ]))
+        assert read_zfsbackup_properties(Filesystem('pool/data')) == {A + 'zeta': 'z', PROP_CONFIG: 'c', A + 'alpha': 'a'}
+        assert _raw_cmds(mock_subprocess)[1][-2:] == [f'name,type,{A}zeta,{PROP_CONFIG},{A}alpha', 'pool/data']
+
+    def test_no_value_is_requested_in_phase_one_and_no_received_column_anywhere(self, mock_subprocess):
+        """Phase 1 has no value column (so nothing an owner writes can disturb it) and uses `-s`; phase 2 has no
+        `received` column (the sender's raw bytes) and no `-s` (it would drop the `type` rows its lead rule needs).
+        No name-only `zfs list` runs: phase 1 is the completeness oracle."""
+        mock_subprocess.setup_multi(*_reads('pool/data', [(PROP_CONFIG, 'c', 'local')]))
         read_zfsbackup_properties(Filesystem('pool/data'))
-        for cmd in _raw_cmds(mock_subprocess):
+        discovery, values = _raw_cmds(mock_subprocess)
+        assert discovery[discovery.index('-o') + 1] == 'name,property,source'
+        assert discovery[discovery.index('-s') + 1] == 'local,received'
+        assert values[values.index('-o') + 1] == 'name,property,value,source'
+        assert '-s' not in values
+        for cmd in (discovery, values):
             assert 'name,property,value,received,source' not in cmd
-            assert '-s' not in cmd
+        assert not any(_is_verify_list(c) for c in _raw_cmds(mock_subprocess))
 
     def test_the_binary_is_resolved_at_call_time(self, mock_subprocess, monkeypatch):
         mock_subprocess.setup_multi(*_reads('pool/data', []))
@@ -2435,27 +2499,46 @@ class TestReadZfsbackupPropertiesRowReader:
     def test_a_short_line_makes_the_read_fail_instead_of_being_skipped(self, mock_subprocess):
         """The old parser dropped a short line silently and returned the rest -- a smaller protect-set."""
         mock_subprocess.setup_multi(
+            *_reads('pool/data', [(A + 'ok', 'v', 'local')])[:1],
             (['pool/data\t' + A + 'bad\n', *_zget('pool/data', [(A + 'ok', 'v', 'local')])],),
         )
         with pytest.raises(ZFSOutputError):
             read_zfsbackup_properties(Filesystem('pool/data'))
 
+    def test_a_short_line_in_the_discovery_makes_the_read_fail(self, mock_subprocess):
+        mock_subprocess.setup_multi((['pool/data\t' + A + 'bad\n'],))
+        with pytest.raises(ZFSOutputError):
+            read_zfsbackup_properties(Filesystem('pool/data'))
+        assert len(_raw_cmds(mock_subprocess)) == 1, 'phase 2 must not run on an untrusted discovery'
+
     def test_garbage_makes_the_read_fail(self, mock_subprocess):
         mock_subprocess.setup_multi(
+            *_reads('pool/data', [(A + 'ok', 'v', 'local')])[:1],
             (['garbage\n', *_zget('pool/data', [(A + 'ok', 'v', 'local')])],),
         )
         with pytest.raises(ZFSOutputError):
             read_zfsbackup_properties(Filesystem('pool/data'))
 
     def test_a_foreign_dataset_makes_the_read_fail(self, mock_subprocess):
-        mock_subprocess.setup_multi((_zget('pool/data2', [(A + 'x', 'y', 'local')]),))
+        mock_subprocess.setup_multi(
+            *_reads('pool/data', [(A + 'x', 'y', 'local')])[:1],
+            (explicit_lines('pool/data2', [A + 'x'], {A + 'x': ('y', 'local')}),),
+        )
         with pytest.raises(ZFSOutputError):
             read_zfsbackup_properties(Filesystem('pool/data'))
 
+    def test_a_foreign_dataset_in_the_discovery_makes_the_read_fail(self, mock_subprocess):
+        mock_subprocess.setup_multi((source_lines('pool/data2', [(A + 'x', 'y', 'local')]),))
+        with pytest.raises(ZFSOutputError, match='outside the requested'):
+            read_zfsbackup_properties(Filesystem('pool/data'))
+
     def test_a_group_without_a_type_row_makes_the_read_fail(self, mock_subprocess):
-        """Rows for the dataset that do not start with its `type` row are refused by the row reader; a read
-        that ends with no usable group of the dataset's own is an unknown protect-set."""
-        mock_subprocess.setup_multi((['pool/data\t' + A + 'x\tv\tlocal\n'],))
+        """Rows for the dataset that do not start with the rows zfs prints first (`name`, `type`) are refused by
+        the row reader; a read that ends with no usable group of the dataset's own is an unknown protect-set."""
+        mock_subprocess.setup_multi(
+            *_reads('pool/data', [(A + 'x', 'v', 'local')])[:1],
+            (['pool/data\t' + A + 'x\tv\tlocal\n'],),
+        )
         with pytest.raises(ZFSOutputError):
             read_zfsbackup_properties(Filesystem('pool/data'))
 
@@ -2475,18 +2558,24 @@ class TestReadZfsbackupPropertiesRowReader:
 
     def test_through_a_real_process_with_a_fake_zfs_command(self, tmp_path, monkeypatch):
         """No `Popen` mock: a stand-in `zfs` writes real tab-separated output to a real pipe, so the
-        argument vector and a tab in the value are proven end to end."""
+        argument vectors and a tab in the value are proven end to end. The stand-in answers each phase by its
+        `-o` list, the way zfs does."""
         argv_log = tmp_path / 'argv'
         fake = tmp_path / 'zfs'
         fake.write_text(
             '#!/bin/sh\n'
             f'{{ printf \'%s\\n\' "$@"; echo --; }} >> {argv_log}\n'
-            "printf 'pool/data\\ttype\\tfilesystem\\t-\\n'\n"
-            "printf 'pool/data\\tvolthreading\\toff\\tlocal\\n'\n"
-            "printf 'pool/data\\tjailed\\ton\\tlocal\\n'\n"
-            "printf 'pool/data\\torg.zfsbackup:config\\ta\\tb\\tlocal\\n'\n"
-            "printf 'pool/data\\torg.zfsbackup:anchor.d\\tsnap\\tinherited from pool\\n'\n"
-            "printf 'pool/data\\torg.zfsbackup:anchor.r\\trv\\treceived\\n'\n"
+            'if [ "$4" = "name,property,source" ]; then\n'
+            "  printf 'pool/data\\tvolthreading\\tlocal\\n'\n"
+            "  printf 'pool/data\\tjailed\\tlocal\\n'\n"
+            "  printf 'pool/data\\torg.zfsbackup:config\\tlocal\\n'\n"
+            "  printf 'pool/data\\torg.zfsbackup:anchor.r\\treceived\\n'\n"
+            'else\n'
+            "  printf 'pool/data\\tname\\tpool/data\\t-\\n'\n"
+            "  printf 'pool/data\\ttype\\tfilesystem\\t-\\n'\n"
+            "  printf 'pool/data\\torg.zfsbackup:config\\ta\\tb\\tlocal\\n'\n"
+            "  printf 'pool/data\\torg.zfsbackup:anchor.r\\trv\\treceived\\n'\n"
+            'fi\n'
         )
         fake.chmod(0o755)
         monkeypatch.setenv('ZFS_CMD', str(fake))
@@ -2495,7 +2584,10 @@ class TestReadZfsbackupPropertiesRowReader:
             A + 'r': 'rv',
         }
         assert argv_log.read_text().split('\n')[:-1] == [
-            'get', '-H', '-o', 'name,property,value,source', '-t', 'filesystem,volume', 'all', 'pool/data', '--',
+            'get', '-H', '-o', 'name,property,source', '-s', 'local,received', '-t', 'filesystem,volume',
+            'all', 'pool/data', '--',
+            'get', '-H', '-o', 'name,property,value,source', '-t', 'filesystem,volume',
+            f'name,type,{PROP_CONFIG},{A}r', 'pool/data', '--',
         ]
 
 
@@ -2626,7 +2718,8 @@ class TestCopyAnchorProperty:
         _fail_get(mock_subprocess, 'dataset does not exist')
         with pytest.raises(Exception, match='does not exist'):
             copy_anchor_property(self.DS(), 'old', 'new')
-        assert _subcommands(mock_subprocess) == ['get']
+        # the discovery (phase 1) failed: that is the only exec, and nothing was set
+        assert [c[1] for c in _raw_cmds(mock_subprocess)] == ['get']
 
     def test_copy_anchor_property_is_idempotent(self, mock_subprocess):
         """Second run sees the destination and does nothing."""
@@ -2825,7 +2918,7 @@ class TestClearZfsbackupProperties:
         _fail_get(mock_subprocess, 'dataset does not exist')
         with pytest.raises(Exception, match='does not exist'):
             clear_zfsbackup_properties(self.DS(), config=True, anchors=True)
-        assert _subcommands(mock_subprocess) == ['get']
+        assert [c[1] for c in _raw_cmds(mock_subprocess)] == ['get']
 
 
 # ---------------------------------------------------------------------------
@@ -2848,7 +2941,7 @@ class TestGetAnchors:
         mock_subprocess.setup_multi(*_reads('pool/data', [
             (A + 'offsite', 'autosnap_1', 'local'),
             (A + 'renamed-away', 'autosnap_2', 'local'),
-        ]))
+        ], dests=('offsite',)))
         mocker.patch.object(manager, '_get_prop', return_value='autosnap_1')
         assert manager.get_anchors(dsi) == {'autosnap_1', 'autosnap_2'}
 
@@ -2862,7 +2955,7 @@ class TestGetAnchors:
         manager, dsi = _anchor_manager('offsite')
         mock_subprocess.setup_multi(*_reads('pool/data', [
             (A + 'ancestors', 'autosnap_9', 'inherited from pool'),
-        ]))
+        ], dests=('offsite',)))
         mocker.patch.object(manager, '_get_prop', return_value=None)
         assert manager.get_anchors(dsi) == set()
 
@@ -2870,7 +2963,7 @@ class TestGetAnchors:
         # `get_anchor` also sees inherited values: the result stays a superset
         # of what it was before the raw read existed.
         manager, dsi = _anchor_manager('offsite', 'dc2')
-        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'offsite', 'autosnap_1', 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'offsite', 'autosnap_1', 'local')], dests=('offsite', 'dc2')))
         values = {'offsite': 'autosnap_1', 'dc2': 'autosnap_inherited'}
         mocker.patch.object(manager, 'get_anchor', side_effect=lambda dsi_, dest: values[dest])
         assert manager.get_anchors(dsi) == {'autosnap_1', 'autosnap_inherited'}
@@ -2903,9 +2996,9 @@ class TestOrphanAnchorLogging:
     def orphans(self, caplog, level):
         return [r for r in caplog.records if r.levelno == level and 'configured destination' in r.getMessage()]
 
-    def run_twice(self, manager, dsi, mock_subprocess, props, caplog, times=2):
+    def run_twice(self, manager, dsi, mock_subprocess, props, caplog, times=2, dests=()):
         for _ in range(times):
-            mock_subprocess.setup_multi(*_reads('pool/data', props))
+            mock_subprocess.setup_multi(*_reads('pool/data', props, dests=dests))
             manager.get_anchors(dsi)
 
     def test_debug_every_call_and_info_once(self, mock_subprocess, caplog):
@@ -2940,7 +3033,8 @@ class TestOrphanAnchorLogging:
         manager, dsi = _anchor_manager('offsite')
         mocker.patch.object(manager, '_get_prop', return_value=None)
         with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
-            self.run_twice(manager, dsi, mock_subprocess, [(A + 'offsite', 's1', 'local')], caplog, times=1)
+            self.run_twice(manager, dsi, mock_subprocess, [(A + 'offsite', 's1', 'local')], caplog, times=1,
+                           dests=('offsite',))
         assert self.orphans(caplog, logging.DEBUG) == []
         assert [r for r in caplog.records if r.levelno == logging.INFO] == []
 
@@ -3353,19 +3447,19 @@ class TestGetAnchorsWithInflight:
 
     def test_a_full_send_pin_protects_only_the_target(self, mock_subprocess, mocker):
         manager = self._manager()
-        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', ',autosnap_2', 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', ',autosnap_2', 'local')], dests=('offsite',)))
         mocker.patch.object(manager, 'get_anchor', return_value=None)
         assert manager.get_anchors(manager.datasets[0]) == {'autosnap_2'}
 
     def test_a_received_inflight_pin_counts(self, mock_subprocess, mocker):
         manager = self._manager()
-        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', 'a,b', 'received')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', 'a,b', 'received')], dests=('offsite',)))
         mocker.patch.object(manager, 'get_anchor', return_value=None)
         assert manager.get_anchors(manager.datasets[0]) == {'a', 'b'}
 
     def test_an_inherited_inflight_pin_does_not_count(self, mock_subprocess, mocker):
         manager = self._manager()
-        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', 'a,b', 'inherited from pool')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', 'a,b', 'inherited from pool')], dests=('offsite',)))
         mocker.patch.object(manager, 'get_anchor', return_value=None)
         assert manager.get_anchors(manager.datasets[0]) == set()
 
@@ -3399,7 +3493,7 @@ class TestGetAnchorsWithInflight:
 
     def test_a_configured_destination_is_not_announced(self, mock_subprocess, mocker, caplog):
         manager = self._manager()
-        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', 'a,b', 'local')]))
+        mock_subprocess.setup_multi(*_reads('pool/data', [(IF + 'offsite', 'a,b', 'local')], dests=('offsite',)))
         mocker.patch.object(manager, 'get_anchor', return_value=None)
         with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
             manager.get_anchors(manager.datasets[0])

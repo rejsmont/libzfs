@@ -20,7 +20,7 @@ import pytest
 import libzfseasy as zfs
 from libzfseasy.types import Filesystem, Snapshot as ZFSSnapshot
 from libzfseasy.zfs import ZFSOutputError
-from _get_support import GetReader, ZfsWorld, get_lines, list_lines as list_lines_
+from _get_support import GetReader, ZfsWorld, explicit_lines, get_lines, list_lines as list_lines_, source_lines
 from _snapshot_support import listed_snapshot
 from _prune_support import (  # noqa: F401
     VERSIONS, PrunePool, hourly_name, prune_manager, prune_pool, records,
@@ -72,7 +72,8 @@ class FakeZfs(GetReader):
     def __init__(self, mocker):
         self.snaps = {PARENT: [A, B, C]}
         self.props = {}                      # dataset -> [(property, value, source)]
-        self.extra_rows = []                 # raw lines appended to a `-r` listing
+        self.extra_rows = []                 # raw lines appended to a `-r` value read (phase 2)
+        self.extra_source_rows = []          # raw lines appended to a discovery (phase 1)
         self.recursive_get_error = None
         self.plain_get_error = None
         self.list_errors = set()
@@ -108,6 +109,9 @@ class FakeZfs(GetReader):
     def _props_of(self, name):
         # the received datasets' client_id/config are written locally by the server's negotiate
         return self.props.get(name, []) + [(p, v, 'local') for p, v in self.received_values.get(name, {}).items()]
+
+    def _sources(self, cmd):
+        return super()._sources(cmd) + self.extra_source_rows
 
     def _get(self, cmd):
         lines = super()._get(cmd)
@@ -365,6 +369,7 @@ class TestParentAnchorsUnchanged:
         """B-1d: a snapshot or bookmark row cannot come from `zfs get -t filesystem,volume`. The old reader
         filtered such rows out and went on; the row reader refuses a listing that holds one, so the
         protect-set is unknown, the dataset is skipped this cycle, and nothing is destroyed."""
+        fz.props[CHILD] = [(ANCHOR + 'y', 'autosnap_19990101000000', 'local')]   # so phase 2 runs below
         fz.extra_rows = [
             f'{PARENT}@{A}\t{ANCHOR}x\t{C}\tlocal\n',
             f'{PARENT}#bm\t{ANCHOR}x\t{C}\tlocal\n',
@@ -376,6 +381,23 @@ class TestParentAnchorsUnchanged:
         assert f'Cannot read anchors for {PARENT}; skipping pruning this cycle' in caplog.text
         fz.extra_rows = []
         prune(manager, dsi)                    # the next, clean cycle prunes
+        assert fz.destroyed == [B, C]
+
+    @pytest.mark.parametrize('row', [
+        f'{PARENT}@{A}\t{ANCHOR}x\tlocal\n',
+        f'{PARENT}#bm\t{ANCHOR}x\tlocal\n',
+    ])
+    def test_a_forged_snapshot_or_bookmark_row_in_the_discovery_skips_the_prune(self, fz, caplog, row):
+        """The same, in phase 1 (three columns, no value): refused before any value is read."""
+        fz.extra_source_rows = [row]
+        manager, dsi = make_manager()
+        with caplog.at_level(logging.INFO):
+            prune(manager, dsi)
+        fz.destroy.assert_not_called()
+        assert f'Cannot read anchors for {PARENT}; skipping pruning this cycle' in caplog.text
+        assert [c for c in fz.get_calls if '-r' in c] == [], 'no value is read after an untrusted discovery'
+        fz.extra_source_rows = []
+        prune(manager, dsi)
         assert fz.destroyed == [B, C]
 
 
@@ -414,8 +436,8 @@ class TestNonRecursiveParent:
     def test_the_single_get_is_for_the_dataset_alone(self, fz):
         manager, dsi = make_manager(recursive=False)
         prune(manager, dsi)
-        # the dataset alone: the pass's read, then the re-read before the one destroy call
-        assert [c[-1] for c in fz.get_cmds] == [PARENT] * (1 + len(fz.destroy.call_args_list))
+        # the dataset alone: the pass's read, then the re-read before the one destroy call; two execs each
+        assert [c[-1] for c in fz.get_cmds] == [PARENT] * 2 * (1 + len(fz.destroy.call_args_list))
         assert not fz.recursive_gets
 
 
@@ -549,18 +571,29 @@ def _world(mock_subprocess, **datasets):
 class TestReadDescendantZfsbackupProperties:
     """`read_descendant_zfsbackup_properties` over a Popen-level `zfs`: the real row reader parses the bytes."""
 
-    def test_the_commands_are_one_recursive_filesystem_and_volume_get_and_its_name_only_list(
+    def test_the_commands_are_two_recursive_filesystem_and_volume_gets_and_no_name_only_list(
             self, mock_subprocess):
+        """Discovery (names and sources, `-s`, no values), then an explicit-list read of the found names."""
         world = ZfsWorld(mock_subprocess)
         world.add(PARENT)
         world.add(CHILD, [(ANCHOR + 'x', 'v', 'local')])
         read_descendant_zfsbackup_properties(Filesystem(PARENT))
-        (get_argv,), (list_argv,) = world.gets, world.verify_lists
-        assert get_argv == ['get', '-H', '-o', 'name,property,value,source', '-r', '-t', 'filesystem,volume',
-                            'all', PARENT]
-        assert '-s' not in get_argv and 'received' not in ','.join(get_argv)
-        assert '-r' in list_argv and list_argv[-1] == PARENT
-        assert [a[0] for a in world.argvs] == ['get', 'list']
+        assert world.argvs == [
+            ['get', '-H', '-o', 'name,property,source', '-s', 'local,received', '-r', '-t', 'filesystem,volume',
+             'all', PARENT],
+            ['get', '-H', '-o', 'name,property,value,source', '-r', '-t', 'filesystem,volume',
+             f'name,type,{ANCHOR}x', PARENT],
+        ]
+        assert world.verify_lists == []
+
+    def test_with_no_property_below_the_dataset_the_read_is_one_exec(self, mock_subprocess):
+        """The discovery names nothing that is a descendant (the dataset's own rows do not count): that is the
+        answer, and the strict discovery is the proof. No second exec, and no `type` read."""
+        world = ZfsWorld(mock_subprocess)
+        world.add(PARENT, [(ANCHOR + 'mine', 'p', 'local')])
+        world.add(CHILD, [('compression', 'lz4', 'local'), (ANCHOR + 'inh', 'p', f'inherited from {PARENT}')])
+        assert read_descendant_zfsbackup_properties(Filesystem(PARENT)) == {}
+        assert len(world.argvs) == 1 and world.argvs[0][world.argvs[0].index('-o') + 1] == 'name,property,source'
 
     def test_the_parent_is_excluded_and_only_strict_descendants_count(self, mock_subprocess):
         world = ZfsWorld(mock_subprocess)
@@ -647,19 +680,30 @@ class TestSingleDatasetReaderIsFramingSafe:
         world = ZfsWorld(mock_subprocess)
         world.add('pool/data')
         read_zfsbackup_properties(Filesystem('pool/data'))
-        (get_argv,) = world.gets
-        assert get_argv == ['get', '-H', '-o', 'name,property,value,source', '-t', 'filesystem,volume',
-                            'all', 'pool/data']
-        assert '-r' not in get_argv
+        discovery, values = world.gets
+        assert discovery == ['get', '-H', '-o', 'name,property,source', '-s', 'local,received', '-t',
+                             'filesystem,volume', 'all', 'pool/data']
+        assert values == ['get', '-H', '-o', 'name,property,value,source', '-t', 'filesystem,volume',
+                          'name,type', 'pool/data']
+        assert '-r' not in discovery + values
 
     def test_descendant_rows_are_not_accepted_for_the_single_read(self, mock_subprocess):
         """B-1d: the single read is not recursive, so a descendant's rows in its output are out of scope.
         The old reader quietly dropped them; the row reader refuses the read."""
         mock_subprocess.setup_multi(
-            (zget('pool/data', [(PROP_CONFIG, 'parent', 'local')])
-             + zget('pool/data/child', [(ANCHOR + 'x', 'child', 'local')]),),
+            (source_lines('pool/data', [(PROP_CONFIG, 'parent', 'local')]),),
+            (explicit_lines('pool/data', [PROP_CONFIG], {PROP_CONFIG: ('parent', 'local')})
+             + explicit_lines('pool/data/child', [PROP_CONFIG], {PROP_CONFIG: ('child', 'local')}),),
         )
         with pytest.raises(ZFSOutputError):
+            read_zfsbackup_properties(Filesystem('pool/data'))
+
+    def test_descendant_rows_in_the_discovery_are_not_accepted_for_the_single_read(self, mock_subprocess):
+        mock_subprocess.setup_multi(
+            (source_lines('pool/data', [(PROP_CONFIG, 'parent', 'local')])
+             + source_lines('pool/data/child', [(ANCHOR + 'x', 'child', 'local')]),),
+        )
+        with pytest.raises(ZFSOutputError, match='outside the requested'):
             read_zfsbackup_properties(Filesystem('pool/data'))
 
 

@@ -238,6 +238,33 @@ class GetRows(list):
         return self.skipped == 0
 
 
+class PropertySource(NamedTuple):
+    """One row of `zfs.get.property_sources()`: an object, one of its properties and where that property's value comes
+    from, exactly as zfs printed them. There is no value in it, by design. `source` is `local`, `default`, `received`,
+    `temporary`, `inherited from <dataset>` or `-` (the property does not apply, or is a read-only one)."""
+    name: str
+    property: str
+    source: str
+
+
+# The sources `zfs get` prints besides `inherited from <dataset>`.
+_PLAIN_SOURCES = frozenset(('local', 'default', 'received', 'temporary', '-'))
+_INHERITED = 'inherited from '
+
+
+def _plain_name_problem(name: str) -> Optional[str]:
+    """Why `name` cannot be an object name zfs printed, or None. Deliberately only the *shape* (non-empty, no control
+    character, no byte that was not valid UTF-8, within zfs's 255-byte limit), not `Validate.dataset`: a name zfs allows
+    but libzfseasy cannot represent must still be seen by a caller that is deciding what is safe to keep."""
+    if not name:
+        return 'empty name'
+    if any(ord(c) < 0x20 or ord(c) == 0x7f or 0xd800 <= ord(c) <= 0xdfff for c in name):
+        return 'a control character or an invalid byte in a name'
+    if len(name.encode('utf-8', 'surrogateescape')) > Validate.max_name_len:
+        return 'a name longer than %d bytes' % Validate.max_name_len
+    return None
+
+
 class _Group:
     """The rows of one object in `zfs get -H` output (see `GetCommand._groups`)."""
     __slots__ = ('name', 'rows', 'bad', 'dstype')
@@ -1859,7 +1886,8 @@ class CloneCommand(Command):
 
 # The rows `zfs get` prints first for every object: `name`, `type` for an explicit property list (`GetCommand` sends
 # them first), `type` for `all` (the first entry of OpenZFS's property table; the leading `name` is a placeholder
-# zfs skips). `GetCommand` never passes `-s` to zfs (it filters sources itself), which would drop these rows.
+# zfs skips). `GetCommand` never passes `-s` to zfs (it filters sources itself), which would drop these rows -- except
+# `property_sources`, which has no value column and so no lead rule.
 _LEAD_LIST = ('name', 'type')
 _LEAD_ALL = ('type',)
 
@@ -2138,6 +2166,145 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         if value == '-' and not raw:
             return None
         return value
+
+    @classmethod
+    def property_sources(cls, ds: Optional[ZFSList] = None, types: Optional[StringList] = 'all',
+                         sources: Optional[StringList] = 'all', recursive: bool = False, depth: int = 0,
+                         prefix: Optional[StringList] = None) -> list:
+        """Discover which properties exist on objects and where each comes from, with no values
+        (`zfs get -H -o name,property,source [-s sources] [-r | -d depth] -t types all <ds>`): phase one of a
+        fail-closed read. Phase two is an explicit-list `rows()` of just the names wanted.
+
+        Why this cannot be forged: every column is a dataset name, a property name or a source, none of which can
+        contain a tab or a newline (zfs refuses them in names; a property name is `[A-Za-z0-9:._-]`; a source is
+        `local`, `default`, `received`, `temporary`, `-` or `inherited from <dataset name>`). The only column an owner
+        controls freely, the value, is not requested, so one odd value anywhere (a newline in an unrelated user property,
+        one inherited from the pool root) cannot disturb the read. The same fact is why `-s` is allowed here: `get()`
+        and `rows()` never pass it because it drops the `type` rows their value-bearing lead rule needs, and there is no
+        lead rule when there is no value to frame.
+
+        Keyword arguments:
+            ds: ZFS | [ZFS] -- objects to read (default None: every dataset). Do not pass overlapping roots with
+                `recursive`: an object zfs prints twice is refused as a duplicate
+            types: str | [str] -- object types to read (default 'all'); always sent as an explicit `-t`
+            sources: str | [str] -- keep only properties from these sources (default 'all': no `-s`), filtered by zfs.
+                `inherited` matches `inherited from <dataset>`
+            recursive: bool -- also read the descendants (default False)
+            depth: int -- descendant depth to read (default 0)
+            prefix: str | [str] -- keep only properties whose name starts with one of these (default None: all),
+                filtered here, after every row has been checked (so a malformed row is never hidden by it). A string is
+                one prefix, never a comma list
+
+        Returns:
+            A list of `PropertySource(name, property, source)` in the order zfs printed them (each object's rows
+            together). Names are not built into objects: a name libzfseasy cannot represent is kept like any other.
+
+        Everything is checked and anything wrong raises, never skips: a line that is not exactly three tab-separated
+        columns, an invalid object name, a name outside the requested objects / depth / types, an invalid property name
+        (by shape: a lowercase native name, or a user property with a `:`; never `Validate.attribute`), a source outside the grammar above, a property twice for one object, an object
+        whose rows are not contiguous. Raised only after zfs has exited, and a zfs failure takes precedence.
+
+        Raises:
+            ValueError -- an invalid argument, before zfs runs
+            ZFSOutputError -- the output could not be trusted (the message names the first problem and how many)
+            Exception -- zfs failed, with zfs's stderr as the message (`ZFSTimeoutError` under `timeout()`)
+        """
+        sources = [str(x).lower() for x in cls._slist_to_list(sources, validator=Validate.source)]
+        types = cls._slist_to_list(types, validator=Validate.type) or ['all']
+        wanted = _wanted_types(types)
+        types = ','.join(str(t) for t in types)
+        datasets = [str(d) for d in cls._zlist_to_list(ds)]
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth < 0:
+            raise ValueError('depth must be a non-negative integer, got %r' % (depth,))
+        if prefix is None:
+            prefixes = []
+        elif isinstance(prefix, str):
+            prefixes = [prefix]
+        elif isinstance(prefix, (list, tuple, set, frozenset)):
+            prefixes = list(prefix)
+        else:
+            raise ValueError('prefix must be None, a string or a list of strings, got %s' % type(prefix).__name__)
+        for x in prefixes:
+            if not isinstance(x, str) or not re.fullmatch(Validate.name, x, re.ASCII):
+                raise ValueError('%s is not a valid property name prefix' % _clip(repr(x)))
+
+        cmd = [_zfs_cmd(), 'get', '-H', '-o', 'name,property,source']
+        if sources and 'all' not in sources:
+            cmd += ['-s', ','.join(sources)]
+        cmd += cls._scope_options(recursive=recursive, depth=depth, types=types) + ['all'] + datasets
+        scope = _Scope(datasets, recursive=recursive, depth=depth)
+
+        found = []
+        seen = set()        # (name, property) pairs
+        finished = set()    # objects whose rows have ended
+        current = None
+        problems = 0
+        first = None
+        lines = cls._exec_lines(cmd)
+        try:
+            for line in lines:
+                if not line:
+                    continue
+                problem = cls._source_row_problem(line, wanted, scope)
+                row = None
+                if problem is None:
+                    row = PropertySource(*line.split('\t'))
+                    if row.name != current:
+                        if current is not None:
+                            finished.add(current)
+                        current = row.name
+                        if row.name in finished:
+                            problem = 'the rows of %r are not contiguous' % _clip(row.name)
+                    if problem is None and (row.name, row.property) in seen:
+                        problem = 'property %r appears twice for %r' % (_clip(row.property), _clip(row.name))
+                    seen.add((row.name, row.property))
+                if problem is not None:
+                    problems += 1
+                    if first is None:
+                        first = '%s: %r' % (problem, _clip(_redact(line)))
+                    continue
+                if not prefixes or row.property.startswith(tuple(prefixes)):
+                    found.append(row)
+        finally:
+            lines.close()
+        if problems:
+            raise ZFSOutputError('zfs get output could not be trusted: %d row%s refused, the first: %s' % (
+                problems, '' if problems == 1 else 's', first))
+        return found
+
+    @staticmethod
+    def _source_row_problem(line: str, wanted: Optional[set], scope: Callable[[str], bool]) -> Optional[str]:
+        """Why one `name<TAB>property<TAB>source` row of `property_sources()` cannot be trusted, or None."""
+        cols = line.split('\t')
+        if len(cols) != 3:
+            return 'expected 3 columns, got %d' % len(cols)
+        name, prop, source = cols
+        problem = _plain_name_problem(name)
+        if problem is not None:
+            return problem
+        if '@' in name:
+            if wanted is not None and 'snapshot' not in wanted:
+                return 'a snapshot was not requested'
+        elif '#' in name:
+            if wanted is not None and 'bookmark' not in wanted:
+                return 'a bookmark was not requested'
+        elif wanted is not None and not wanted & {'filesystem', 'volume'}:
+            return 'a dataset was not requested'
+        if not scope(name):
+            return 'name outside the requested objects'
+        # Shape only (never `Validate.attribute`): zfs allows property names that this library refuses (a leading `-`, one
+        # carried in a received stream), and an unrelated odd name must not stop the read. A name that is wanted
+        # reaches argv in phase two, where `rows()` validates it strictly.
+        if not (re.fullmatch(Validate.native, prop, re.ASCII) or
+                (':' in prop and len(prop) <= Validate.max_name_len and re.fullmatch(Validate.name, prop, re.ASCII))):
+            return 'invalid property name'
+        if source not in _PLAIN_SOURCES:
+            if not source.startswith(_INHERITED):
+                return 'invalid source'
+            origin = source[len(_INHERITED):]
+            if _plain_name_problem(origin) is not None or '@' in origin or '#' in origin:
+                return 'invalid source'
+        return None
 
     @staticmethod
     def _scope_options(**kwargs):

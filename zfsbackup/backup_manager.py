@@ -62,6 +62,11 @@ CLOCK_TOLERANCE = timedelta(minutes=5)
 _OWN_SOURCES = ('local', 'received')
 
 
+class _PropertiesChanged(ZFSOutputError):
+    """The two reads of `_read_own_properties` disagree about which `org.zfsbackup:*` properties an object has:
+    something was set or cleared between them (or a value forged a row). Retried once, then raised."""
+
+
 def _own_zfsbackup_rows(rows) -> Dict[str, Dict[str, str]]:
     """`{dataset name: {org.zfsbackup:* property: value}}` from `GetRow`s,
     keeping the `local`/`received` rows only and using nothing but `value`
@@ -75,57 +80,143 @@ def _own_zfsbackup_rows(rows) -> Dict[str, Dict[str, str]]:
     return result
 
 
-def read_zfsbackup_properties(ds: Dataset) -> Dict[str, str]:
+def _read_own_properties_once(
+    ds: Dataset, recursive: bool, also: Tuple[str, ...] = ()
+) -> Dict[str, Dict[str, str]]:
+    """One attempt of `_read_own_properties` (two execs). `also` (own read only)
+    names properties that are asked for in phase 2 whether or not phase 1 saw
+    them."""
+    prefix = ds.name + '/'
+    if recursive:
+        def in_scope(name: str) -> bool:
+            return name.startswith(prefix) and '@' not in name and '#' not in name
+    else:
+        def in_scope(name: str) -> bool:
+            return name == ds.name
+
+    # Phase 1: which org.zfsbackup:* properties exist, and where they come
+    # from. No value column, so nothing an owner writes can disturb it.
+    found = [
+        r for r in zfs.get.property_sources(
+            ds, types='filesystem,volume', sources=list(_OWN_SOURCES),
+            recursive=recursive, prefix=PROP_PREFIX,
+        )
+        if in_scope(r.name)
+    ]
+    expected = {(r.name, r.property) for r in found}
+    if recursive and not expected:
+        # Nothing below `ds` carries a property of ours: that is the answer,
+        # and phase 1 is strict (it raised on any bad row, and zfs failed on
+        # a missing `ds`, so `ds` exists; the caller's own read of `ds` is in
+        # the same try).
+        return {}
+
+    # Phase 2: read exactly those property names, strictly. An object that
+    # lacks one of them prints `-` (explicit lists are exact), so a forged or
+    # missing row cannot go unnoticed. With no names the read asks for `type`
+    # alone, which is what proves the dataset itself was read.
+    names = list(dict.fromkeys([r.property for r in found] + list(also))) or ['type']
+    rows = zfs.get.rows(
+        ds, names, types='filesystem,volume', recursive=recursive,
+        received=False, strict=True,
+        # Phase 1 (unforgeable, names only) is the completeness oracle: every
+        # object that has one of our properties is in it and must come back
+        # below with the same ones, so a name-only `zfs list` adds nothing.
+        verify_names=False,
+    )
+    if not recursive and not any(r.name == ds.name and r.property == 'type' for r in rows):
+        raise ZFSOutputError(f"zfs get printed no usable rows for {ds.name!r}")
+    got = _own_zfsbackup_rows(r for r in rows if in_scope(r.name))
+    seen = {(n, p) for n, props in got.items() for p in props}
+    # A property of `also` that is here now but was not in phase 1 was set
+    # between the two execs: it can only grow the protect-set, so it is kept.
+    # (Nothing else can be added: a forged row cannot join a non-recursive
+    # group, and any other new name was never asked for.)
+    allowed = {(n, p) for (n, p) in seen - expected if p in also}
+    if seen - allowed != expected:
+        gone = sorted(expected - seen)
+        new = sorted(seen - expected - allowed)
+        detail = (f"{gone[0][1]} on {gone[0][0]} is no longer set" if gone
+                  else f"{new[0][1]} on {new[0][0]} was not there before")
+        raise _PropertiesChanged(
+            f"the org.zfsbackup properties of {ds.name!r} changed while they were being read ({detail})"
+        )
+    return got
+
+
+def _read_own_properties(
+    ds: Dataset, recursive: bool, also: Tuple[str, ...] = ()
+) -> Dict[str, Dict[str, str]]:
+    """`{object name: {org.zfsbackup:* property: value}}` for `ds` (or, with
+    `recursive`, its descendants), local/received only. The two-phase read
+    behind `read_zfsbackup_properties` and `read_descendant_zfsbackup_properties`.
+
+    A property set or cleared between the two execs makes them disagree; the
+    pair is then read once more, and a second disagreement raises
+    `ZFSOutputError`. Never a smaller set: a vanished property could only be
+    trusted together with a new one the explicit list would not have asked for
+    (an `inflight.*` cleared and an `anchor.*` set between the execs would
+    otherwise read as "nothing pinned"). `also` (non-recursive only) closes the
+    remaining hole: names the caller knows it cares about are always asked for,
+    so one created after phase 1 is still seen, and such an addition is accepted."""
+    if also and recursive:
+        raise ValueError("`also` is for the own read only")
+    also = tuple(dict.fromkeys(also))
+    try:
+        return _read_own_properties_once(ds, recursive, also)
+    except _PropertiesChanged as e:
+        logger.debug(f"{e}; reading again")
+    return _read_own_properties_once(ds, recursive, also)
+
+
+def read_zfsbackup_properties(ds: Dataset, also: Iterable[str] = ()) -> Dict[str, str]:
     """Return every `org.zfsbackup:*` user property set on `ds`, name -> value.
 
     Properties are kept with their `local` and `received` sources only (an
     inherited value belongs to an ancestor, and acting on it would be acting
     on the wrong dataset).
 
-    Read with `zfs.get.rows(ds, 'all', received=False, strict=True)`, the
-    framing-safe row reader: no `-s` (it would drop the `type` rows the
-    reader checks), no `received` column (raw bytes of whoever sent the
-    dataset), and the source filter applied here. A value that forges rows
-    can only add to the result or break the dataset's group; a broken group,
-    a duplicated property, or any row the reader had to skip makes the call
-    RAISE (`ZFSOutputError`) instead of returning a smaller set. Callers
-    treat a raise as "unknown, do not act" (the pruner skips the dataset,
-    the API answers 500, the CLI reports the failure). Also raises whatever
-    `zfs get` raises.
+    Two execs, so only `org.zfsbackup:*` values are ever read as values:
+    `zfs.get.property_sources` lists which of our properties `ds` has
+    (`-o name,property,source`, no value column, nothing forgeable), then a
+    strict explicit-list `zfs.get.rows` (`received=False`) reads exactly
+    those. A newline in an unrelated property, or in any value `ds` merely
+    inherits, can no longer matter. A newline in one of OUR values (a tab is
+    recovered unambiguously: no `received` column), a duplicated or forged
+    row, a group that is not exactly the requested rows, or a property that
+    disappeared (or appeared, unless named in `also`) between the two execs
+    (after one re-read) makes the call RAISE (`ZFSOutputError`) instead of
+    returning a smaller set.
+
+    `also` names properties to ask for in the second exec even if the first
+    did not list them (the pruner passes `anchor.<d>` and `inflight.<d>` of
+    every configured destination): one created between the two execs is then
+    returned, not missed. The cost is that a newline in a value of such a name
+    that `ds` merely INHERITS now breaks the read as well. With no `org.zfsbackup:*` property the
+    second exec asks for `type` alone, which proves `ds` itself was read: an
+    empty answer is never a silent "no anchors". Callers treat a raise as
+    "unknown, do not act" (the pruner skips the dataset, the API answers
+    500, the CLI reports the failure). Also raises whatever `zfs get` raises.
     """
-    rows = zfs.get.rows(
-        ds, 'all', types='filesystem,volume', sources=list(_OWN_SOURCES),
-        received=False, strict=True,
-        # One dataset, one exec. `verify_names` (a second, name-only `zfs
-        # list`) would only add what is checked directly below: a group for
-        # `ds` that is absent or forged. A forged copy of it is a name that
-        # came back (both groups dropped, so `strict` raises), and a malformed
-        # real one is dropped and counted.
-        verify_names=False,
-    )
-    if not any(r.name == ds.name and r.property == 'type' for r in rows):
-        raise ZFSOutputError(f"zfs get printed no usable rows for {ds.name!r}")
-    return _own_zfsbackup_rows(r for r in rows if r.name == ds.name).get(ds.name, {})
+    return _read_own_properties(ds, False, tuple(also)).get(ds.name, {})
 
 
 def read_descendant_zfsbackup_properties(ds: Dataset) -> Dict[str, Dict[str, str]]:
     """`read_zfsbackup_properties` for every DESCENDANT of `ds` (not `ds`
-    itself), in one recursive `zfs.get.rows`: `{descendant name: {property:
-    value}}`, only descendants that have at least one local/received
-    `org.zfsbackup:*` property appear. Snapshots and bookmarks are excluded
-    (`-t filesystem,volume`). Raises whatever `zfs get` raises, and
-    `ZFSOutputError` if any group in the subtree was dropped or any row
-    skipped (`strict=True`): the pruner must not prune on an unknown
-    protect-set, so the ancestor is skipped this cycle."""
-    rows = zfs.get.rows(
-        ds, 'all', types='filesystem,volume', sources=list(_OWN_SOURCES),
-        recursive=True, received=False, strict=True,
-    )
-    prefix = ds.name + '/'
-    return _own_zfsbackup_rows(
-        r for r in rows
-        if r.name.startswith(prefix) and '@' not in r.name and '#' not in r.name
-    )
+    itself), recursively: `{descendant name: {property: value}}`, only
+    descendants that have at least one local/received `org.zfsbackup:*`
+    property appear. Snapshots and bookmarks are excluded (`-t
+    filesystem,volume`). Same two-phase read (two execs; ONE when no
+    descendant has a property of ours). Phase 1 is the completeness check
+    that replaces the name-only `zfs list` of `verify_names`: every object it
+    names must come back from phase 2 with the same properties. Raises
+    whatever `zfs get` raises, and `ZFSOutputError` if any group in the
+    subtree was dropped or any row skipped, or the two phases disagree: the
+    pruner must not prune on an unknown protect-set, so the ancestor is
+    skipped this cycle. (A bad value INHERITED by `ds` itself from above can
+    still break `ds`'s own group in phase 2, but only when a descendant sets
+    that same property name locally.)"""
+    return _read_own_properties(ds, True)
 
 
 def copy_anchor_property(
@@ -543,8 +634,9 @@ class DatasetManager:
         of protecting more. Sources:
 
         * every `anchor.*` user property set `local` or `received` on the
-          dataset (via `read_zfsbackup_properties`: the framing-safe
-          `zfs.get.rows`, which raises rather than return a partial set).
+          dataset (via `read_zfsbackup_properties`: a two-exec read that
+          only ever reads our own values and raises rather than return a
+          partial set).
           An anchor of a destination
           that was renamed or removed from the config still points at the
           real incremental base until an operator clears it, and a daemon on
@@ -577,7 +669,11 @@ class DatasetManager:
                 anchor = self.get_anchor(dsi, name)
                 if anchor:
                     anchors.add(anchor)
-        for prop, value in read_zfsbackup_properties(dsi.dataset).items():
+        # Ask for the configured destinations' names up front: an `inflight.*`
+        # the remote worker creates between the two execs is then still seen.
+        also = [f"{pre}{name}" for name in sorted(configured)
+                for pre in (PROP_ANCHOR_PREFIX, PROP_INFLIGHT_PREFIX)]
+        for prop, value in read_zfsbackup_properties(dsi.dataset, also).items():
             if prop.startswith(PROP_ANCHOR_PREFIX):
                 prefix = PROP_ANCHOR_PREFIX
                 pinned = [value] if value and value != '-' else []
@@ -1147,10 +1243,14 @@ class DatasetManager:
             msg = f"Cannot read anchors for {dsi.name}; skipping pruning this cycle: {e}"
             if isinstance(e, ZFSOutputError):
                 msg += (
-                    f". Some property of {dsi.name} or of an ancestor (or, for a recursive "
-                    "dataset, of a descendant) holds a value zfs printed in a way that cannot "
-                    "be framed (a newline or a stray tab); the dataset or property is named "
-                    "above. Find where it is set with `zfs get <property> <dataset>`, then "
+                    f". An org.zfsbackup:* property set on {dsi.name} (or, for a recursive "
+                    "dataset, on a descendant) holds a value zfs printed in a way that cannot "
+                    "be framed (a newline), or changed while it was being "
+                    "read (the next cycle reads it again). Unrelated properties do not "
+                    "matter, and an inherited value matters only if a descendant sets the "
+                    "same property itself (or, for a configured destination, its anchor or "
+                    "in-flight name). The dataset or property is named above. Find where it "
+                    "is set with `zfs get <property> <dataset>`, then "
                     "`zfs inherit <property> <dataset>` or `zfs set <property>=<one line> "
                     "<dataset>` on the dataset whose SOURCE column says so (`zfs inherit` "
                     "hides a received value). Pruning of this dataset resumes by itself."
@@ -1275,10 +1375,17 @@ class DatasetManager:
         (pin before the send, anchor before the pin is cleared), so a fresh
         read always sees a snapshot in use; one destroyed before its step
         starts is a vanished chain member, which the sender rebuilds around.
-        Costs, per destroy call, one `zfs get` of the dataset's own
-        properties, one per configured destination (`get_anchor`) and, for
-        a recursive dataset, one recursive `zfs get` plus its name-only
-        `zfs list`; no snapshot listing. If the read fails nothing is
+        Costs, per destroy call, two execs for the dataset's own properties
+        (discovery, then the values; the second is the last `zfs` call made
+        before the destroy; it also asks for `anchor.<d>`/`inflight.<d>` of
+        every configured destination, so a pin the remote worker creates
+        between the two execs is seen -- a pin of an UNCONFIGURED destination
+        created in that window is not, the same race as any set after the
+        read), one per configured destination (`get_anchor`)
+        and, for a recursive dataset, two recursive `zfs get`s (one when no
+        descendant has a property of ours) and no `zfs list`; no snapshot
+        listing. A re-read after a property changed between the two execs
+        adds two more. If the read fails nothing is
         destroyed (-> `[]`). (A `zfs hold` on the in-flight pair would be the
         airtight alternative; it is deferred because holds left by a crash
         would need cleaning up.)"""

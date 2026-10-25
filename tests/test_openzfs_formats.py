@@ -878,16 +878,21 @@ class TestKeylessRawCopyZ7:
     DS = 'zfsbcapc/Z7/srv/rx'
 
     def test_get_local_all_lists_the_user_properties_without_the_key(self, version, mock_subprocess):
-        """`get -s local all` through zfsbackup's own reader (plan B-1d: `zfs.get.rows`, no `-s`). The capture's
-        four-column rows are exactly the reader's `name,property,value,source`; the capture was taken WITH `-s local`
-        (which drops the `type` row), so the `type` row zfs prints first without it is put in front, and the
-        reader's name-only cross-check list answers for the one dataset."""
+        """`get -s local all` through zfsbackup's own two-phase reader. The capture's four-column rows
+        (`name,property,value,source`, taken WITH `-s local`, so no `type` row) are the real values and sources: the
+        discovery (`-o name,property,source`) is the same rows without the value column, and the values read is an
+        explicit-list answer (`name`, `type`, then the requested names) built from the same rows."""
         from zfsbackup.backup_manager import read_zfsbackup_properties
+        from _get_support import explicit_lines
         rec = load_section(version, 'Z7')['Z7/20_get_local_all']
         assert rec.rc == 0
+        rows = [line.split('\t') for line in rec.stdout.splitlines()]
+        assert all(len(r) == 4 and r[0] == self.DS for r in rows)
+        discovery = [f'{r[0]}\t{r[1]}\t{r[3]}\n' for r in rows]
+        ours = [r[1] for r in rows if r[1].startswith('org.zfsbackup:')]
         mock_subprocess.setup_multi(
-            ([f'{self.DS}\ttype\tfilesystem\t-\n'] + rec.stdout.splitlines(keepends=True),),
-            ([f'{self.DS}\tfilesystem\n'],),
+            (discovery,),
+            (explicit_lines(self.DS, ours, {r[1]: (r[2], r[3]) for r in rows}),),
         )
         props = read_zfsbackup_properties(Filesystem(self.DS))
         assert props == {
