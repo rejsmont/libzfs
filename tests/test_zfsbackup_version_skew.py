@@ -223,11 +223,18 @@ class TestCodeSignature:
 
     def test_it_is_not_cached(self, site):
         info = make_dist(site)
+        record = info / "RECORD"
+        base = os.stat(record).st_mtime_ns
         seen = []
-        for _ in range(3):
+        for n in range(3):
             seen.append(code_signature())
             replace_record(info)
-        assert len(set(seen)) == 3
+            # explicit, clearly different mtimes: two replacements inside one filesystem timestamp tick
+            # (~1 ms on ext4, which also recycles inode numbers) would otherwise repeat the identity
+            stamp = base + (n + 1) * 10_000_000_000
+            os.utime(record, ns=(stamp, stamp))
+        seen.append(code_signature())
+        assert len(set(seen)) == 4
 
     def test_a_missing_record_falls_back_to_the_package_init(self, site):
         info = make_dist(site)

@@ -1675,7 +1675,9 @@ class DestroyCommand(Command):
         result = cls._destroy_lines(source)
 
         if lazy:
-            return (o for o in result)
+            # `result` itself, not `(o for o in result)`: on CPython 3.12.3 closing a generator expression does not
+            # release the inner iterator (only deallocation does), so the child would outlive `close()`.
+            return result
         try:
             return [o for o in result]
         finally:
@@ -1710,7 +1712,9 @@ class DestroyCommand(Command):
         result = cls._destroy_lines(source)
 
         if lazy:
-            return (o for o in result)
+            # `result` itself, not `(o for o in result)`: on CPython 3.12.3 closing a generator expression does not
+            # release the inner iterator (only deallocation does), so the child would outlive `close()`.
+            return result
         try:
             return [o for o in result]
         finally:
