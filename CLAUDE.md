@@ -139,7 +139,7 @@ survive reloads; a newer incarnation's file is never overwritten). The superviso
 spawn and hands it over in the `Handoff` (`status_dir`, `None` under dry run). The remote worker logs one ERROR after
 3 consecutive cycles skipped by the resume-token check.
 
-**[zfsbackup/remote.py](zfsbackup/remote.py)** / **[zfsbackup/api.py](zfsbackup/api.py)** — remote send/receive transfer (`RemoteBackupManager`) and the HTTP control API (`create_app`). Transport is TLS 1.3 with mutual authentication and fingerprint pinning (B1 is resolved); the residual caveats are in [docs/production_readiness_report.md](docs/production_readiness_report.md) (werkzeug's development server, no mid-stream revocation, no rate limiting on `/enroll`).
+**[zfsbackup/remote.py](zfsbackup/remote.py)** / **[zfsbackup/api.py](zfsbackup/api.py)** — remote send/receive transfer (`RemoteBackupManager`) and the HTTP control API (`create_app`). Transport is TLS 1.3 with mutual authentication and fingerprint pinning (B1 is resolved); the residual caveats are in [docs/production_readiness_report.md](docs/production_readiness_report.md) (werkzeug's development server; mid-stream revocation and `/enroll` flood control are resolved in milestone D).
 Send flags are frozen (OpenZFS 2.1/2.2/2.4 captures in `tests/fixtures/openzfs/`): plain `-L -c`, raw `-w`, a
 resume is `zfs send -t` with no flags; `-L` is permanent once received. The mode is decided once per dataset ×
 destination from the newest snapshot's encryption/keystatus and `raw` (`raw: true` on an unencrypted dataset, or

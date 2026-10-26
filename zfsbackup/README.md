@@ -89,7 +89,7 @@ The order matters, because the unit refuses to start without a database (`Assert
 
 On the **server**, also set a quota per client once its first backup has created `<target>/<client_id>`
 (`zfs set quota=2T tank/backups/<client_id>`): neither the daemon nor the API limits how much a client may
-send, and sends are not rate limited either.
+send, and sends are not bandwidth limited either.
 
 ### Clocks
 
@@ -383,8 +383,9 @@ reloads and hands the new id to its remote worker.
 
 The API listens on `api_host:api_port` (default `127.0.0.1:8080`; set `api_host` to an address clients can
 reach). Allow inbound TCP to that port from your clients' addresses only: `/health` and `/enroll` answer
-anyone who can connect, and `/enroll` has no rate limiting, although a wrong token is refused and nothing
-is enrolled without a valid one. Clients pin the server's own certificate and the server reads the client
+anyone who can connect. Each source address (an IPv6 /64) is rate limited and capped at 8 connections until it
+has presented a pinned client certificate, and 5 failed enrollments in 15 minutes lock it out of `/enroll`
+(429); a wrong token is refused and nothing is enrolled without a valid one. Clients pin the server's own certificate and the server reads the client
 certificate in the TLS handshake, so a TLS-terminating proxy in front of the API will not work. The server
 is served by a pinned version of werkzeug's WSGI server, hardened against slow and hostile peers; see
 [Known limitations](#known-limitations) and
@@ -1065,10 +1066,12 @@ list with background is in [docs/production_readiness_report.md](../docs/product
   protections around it are zfsbackup's own: a per-connection TLS handshake with a timeout, at most 64
   connections (16 without a client certificate), an absolute deadline for request headers, and a bounded
   drain. Restrict the port by firewall.
-- **No mid-stream revocation.** A revoked client's stream already in flight finishes; new connections are
-  refused within about 2 seconds.
-- **`/enroll` is not rate limited** (only the connection caps). A wrong token enrolls nothing; the secret has
-  256 bits.
+- **Revocation cuts running streams** within about 2 seconds (the partial receive is kept for a resume); a key
+  rotation does not.
+- **Flood control is per address, with constants, no configuration**: a rate limit and 8 connections per
+  address (32 and a reserved share of the slots once it has presented a pinned client certificate), and a
+  15-minute `/enroll` lockout after 5 failures. Clients behind one NAT share an address. A flood spread over
+  many addresses is still bounded only by the connection caps; restrict the port by firewall.
 - **A trusted client can postpone a reload** on the server by streaming without pause: the API worker waits
   for in-flight receives and never cuts them. The websocket idle timeout is 600 s.
 - **Server certificate re-keying is unsupported.** The certificate is self-signed for ten years and clients

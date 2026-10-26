@@ -52,11 +52,11 @@ open, the WebSocket handler piped arbitrary client bytes into `zfs receive -F` u
 **Residual risks** (none blocks a deployment on a network you control; all are open):
 
 - **werkzeug's development server** serves the API (see Operations). No production WSGI server.
-- **No mid-stream revocation.** A revoked client's stream already in flight finishes; revocation refuses
-  new connections within about 2 s.
-- **No rate limiting on `/enroll`.** It is reachable without a certificate and is bounded only by the
-  connection caps; a wrong token enrolls nothing, but it can be guessed at the speed the caps allow
-  (256-bit secret) and it costs the server a request each. Restrict the port to your clients by firewall.
+- ~~No mid-stream revocation~~ — resolved in milestone D (S-2): a revocation cuts running streams within about
+  2 s, keeping the partial receive for a resume.
+- ~~No rate limiting on `/enroll`~~ — resolved in milestone D (S-3): per-address rate limits and connection caps,
+  a slot reserve for clients with a pinned certificate, a 15-minute `/enroll` lockout after 5 failures. A flood
+  from many addresses is bounded only by the connection caps; restrict the port to your clients by firewall.
 - **Client-driven server retention (M8)** is unchanged, but now only authenticated clients can drive it.
 - **A trusted peer can postpone a reload.** On a reload the API worker waits for in-flight receives and
   never cuts them (decision D5); the only per-stream bound is the 600 s websocket idle timeout, so a
@@ -187,5 +187,5 @@ layer (TLS and mutual authentication, B1) was finished 2026-10-20; resume was fi
 2. ~~B1 (auth + TLS on the API; validate/authorize `client_id`)~~ — done; residuals under B1.
 3. H5 (`-i` → `-I`) — correctness/completeness. (H4, resume, is done.)
 4. M6 (surface backup failures) and M7/M8 (pruning safety) — reliability hardening.
-5. Ops: production WSGI, `/enroll` rate limiting, and the reload-time API bind check (the systemd unit and restart backoff are
+5. Ops: production WSGI, ~~`/enroll` rate limiting~~ (done, S-3), and the reload-time API bind check (the systemd unit and restart backoff are
    done).
