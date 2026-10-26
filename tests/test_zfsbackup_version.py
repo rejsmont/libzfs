@@ -442,11 +442,13 @@ def built(tmp_path_factory):
 @pytest.mark.integration
 class TestBuiltPackages:
     @pytest.fixture(scope="class")
-    def wheel(self, built):
+    @classmethod
+    def wheel(cls, built):
         return built[0]
 
     @pytest.fixture(scope="class")
-    def names(self, wheel):
+    @classmethod
+    def names(cls, wheel):
         with zipfile.ZipFile(wheel) as archive:
             return archive.namelist()
 

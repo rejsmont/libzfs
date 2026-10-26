@@ -2737,7 +2737,8 @@ class TestExportOutputFile:
 
 class TestPackaging:
     @pytest.fixture(scope="class")
-    def pyproject(self):
+    @classmethod
+    def pyproject(cls):
         with open(REPO / "pyproject.toml", "rb") as handle:
             return tomllib.load(handle)
 
