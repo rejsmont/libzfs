@@ -474,6 +474,14 @@ def _signalled_notice(
             f"{requested}; superseded by generation {info.rejected[1]}, which daemon "
             f"{who} rejected; see its log"
         ), None
+    if answer in ("deferred", "superseded-deferred") and info is not None and info.draining is not None:
+        # S-8: it reloads nothing while it drains for an upgrade; the restarted
+        # daemon loads the stored key. Not a re-check.
+        newest = info.deferred[1] if info.deferred is not None else key[1]
+        return (
+            f"{requested}; the daemon is draining for an upgrade and does not reload: "
+            f"generation {newest} is applied after it restarts, not by a re-check"
+        ), None
     if answer == "deferred":
         reason = (info.deferred_reason if info is not None else None) or "see the daemon log"
         return (

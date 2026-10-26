@@ -10,6 +10,8 @@ Nothing here talks to ZFS and no socket is opened.
   (`token_precheck`, `enroll_client`, `rotate_client`, `retire_predecessor`), each scriptable and counted.
 * `plain_client` / `buffered_client` -- test clients that send the wire protocol header
   (plan S-5, `protocol=None` for none) and the second of them a certificate.
+* `permissive_limits` -- an `api.PeerLimits` (S-3) that never refuses, for tests that open many
+  connections or make many failing `/enroll` calls from 127.0.0.1.
 * `Authed` -- a Flask app built over a gateway, with a test client / request context that
   presents a client certificate in `environ["SSL_CLIENT_CERT"]`, exactly where the TLS
   layer puts it. `client_id` pins one certificate under that id (`Authed.who`).
@@ -120,6 +122,29 @@ def make_client_cert(
     return ClientCert(
         key=key, cert=cert, cert_pem=pem,
         fingerprint=identity.fingerprint_pem(pem), not_after=cert.not_valid_after_utc,
+    )
+
+
+# ---------------------------------------------------------------------------
+# S-3 flood control that gets out of the way
+# ---------------------------------------------------------------------------
+
+
+def permissive_limits(*, clock: Optional[Callable[[], float]] = None, log=None):
+    """An `api.PeerLimits` whose accept-time bucket, connection caps and `/enroll` lockout and
+    in-flight caps, and the vouched reserve (none) are so large that they never act, for tests whose subject is something else
+    and that open many connections or make many failing `/enroll` calls from one address
+    (127.0.0.1). The log throttle is the real one (`clock` and `log` pass through), so the
+    refusal lines keep their once-per-peer shape."""
+    from zfsbackup.api import EnrollGuard, PeerLimits, PeerRateLimiter
+
+    big = 10 ** 9
+    return PeerLimits(
+        clock=clock,
+        rate=PeerRateLimiter(burst=big, rate=float(big), max_per_peer=big, max_per_vouched=big,
+                             reserve=0, clock=clock),
+        enroll=EnrollGuard(max_failures=big, max_in_flight=big, max_per_peer=big, clock=clock),
+        log=log,
     )
 
 
@@ -252,12 +277,15 @@ class Authed:
     """
 
     def __init__(self, config, *, client_id: Optional[str] = CLIENT_ID, gateway=None,
-                 server_fp: str = SERVER_FP, clock: Optional[Callable[[], float]] = None):
+                 server_fp: str = SERVER_FP, clock: Optional[Callable[[], float]] = None,
+                 peer_limits=None):
         self.config = config
         self.gateway = gateway if gateway is not None else FakeGateway()
         self.server_fp = server_fp
         self.certs: Dict[str, ClientCert] = {}
         kwargs = {} if clock is None else {"clock": clock}
+        if peer_limits is not None:
+            kwargs["peer_limits"] = peer_limits
         self.app = create_app(config, self.gateway, server_fp, **kwargs)
         self.app.testing = True
         self.who = self.cert_for(client_id) if client_id is not None else None
@@ -265,6 +293,11 @@ class Authed:
     @property
     def gate(self):
         return self.app.extensions["zfsbackup.stream_gate"]
+
+    @property
+    def limits(self):
+        """The app's `api.PeerLimits` (S-3 flood control)."""
+        return self.app.extensions["zfsbackup.peer_limits"]
 
     def cert_for(self, client_id: str) -> ClientCert:
         cert = self.certs.get(client_id)
@@ -421,6 +454,18 @@ def pending_configs(app):
     """The live `server dataset -> (canonical config, client dataset)` map of `app`
     (an `OrderedDict`, oldest first). Read it; to change it call the app."""
     return _find_in_closures(app, "pending_configs")
+
+
+def pending_needed(app):
+    """The `server dataset -> deadline` marks a refused child (`unsettled_ancestor`) leaves on
+    its pending parent."""
+    return _find_in_closures(app, "pending_needed")
+
+
+def pending_by_client(app):
+    """The `client id -> OrderedDict of its pending server datasets, oldest first` map (S-3's
+    per-client cap) that goes with `pending_configs(app)`."""
+    return _find_in_closures(app, "pending_by_client")
 
 
 def pending_deadlines(app):

@@ -32,7 +32,10 @@ import websocket
 import libzfseasy as zfs
 from libzfseasy.zfs import ResumeTokenError
 from zfsbackup import identity as ident
-from zfsbackup.backup_manager import DatasetInfo, DatasetManager, snapshot_newer
+from zfsbackup.backup_manager import (
+    DatasetInfo, DatasetManager, LocalAnchorUnreadable, parse_snapshot_timestamp,
+    snapshot_newer,
+)
 from zfsbackup.config import (
     BackupConfig, Destination, RemoteDatasetConfig, _collapse_retention_rules,
     destination_url_problem,
@@ -63,6 +66,10 @@ WS_CONNECT_TIMEOUT = 30
 #: single stream byte is sent.
 CONNECT_RETRY_DELAYS = (1.0, 2.0, 4.0)
 
+#: S-12: the client certificate's expiry is checked at most this often
+#: (seconds) per `RemoteBackupManager`, at the start of a cycle.
+CLIENT_CERT_EXPIRY_CHECK_EVERY = 24 * 3600.0
+
 #: A retry wait is taken in slices of this many seconds, so a stop is noticed.
 CONNECT_RETRY_SLICE = 0.25
 #: No progress on one socket operation (a `send_binary`, or the server's
@@ -74,8 +81,23 @@ WS_FINAL_ACK_TIMEOUT = 3600
 
 #: `/whoami`, `/negotiate` (seconds; connect + TLS handshake + answer).
 HTTP_TIMEOUT = 30
-#: `/resume_token`.
-RESUME_TOKEN_TIMEOUT = 10
+#: `/resume_token`. Not shorter than `HTTP_TIMEOUT`: the server may take its
+#: whole `api.ZFS_REQUEST_BUDGET` (plus the kill of a timed-out `zfs`) to
+#: answer, and the client must still be listening for the `zfs_timeout` 503
+#: (`api.py` asserts the inequality). A client that gave up first would leave
+#: the server's hung `zfs` running and start another one with its next request.
+RESUME_TOKEN_TIMEOUT = 30
+
+#: S-7a: the resume-token check (`_fetch_resume_token`, `_resume_target`) skips
+#: the cycle when it cannot tell whether the server holds a partial receive --
+#: for ever, if the cause stays. After this many consecutive skipped cycles of
+#: one (dataset, destination) an ERROR is logged, once, until the check passes.
+RESUME_TOKEN_SKIP_ERROR_AFTER = 3
+
+#: What the status file's `last_error` of a token-skipped cycle starts with
+#: (`RemoteBackupManager.last_problem`); the worker seeds the skip counts of a
+#: new incarnation from the records that carry it.
+TOKEN_SKIP_NOTE = "resume token check failed"
 
 #: How long the worker's main loop waits for the shared client identity lock
 #: (`identity.lock`; the CLI's `enroll` / `identity rotate` hold it
@@ -104,9 +126,11 @@ class NegotiationFailed(Exception):
     fall through to a send. `reloading` is True for the server's retryable
     503 ("server is reloading; retry later")."""
 
-    def __init__(self, message: str, reloading: bool = False):
+    def __init__(self, message: str, reloading: bool = False, zfs_timeout: bool = False):
         super().__init__(message)
         self.reloading = reloading
+        #: The server's zfs did not answer in time (already logged, counted).
+        self.zfs_timeout = zfs_timeout
 
 
 #: The server's `api.BUSY_ERROR['error']` (the API imports this module, so the
@@ -192,6 +216,40 @@ def _log_refusal(base_url: str, ds_name: str, result: dict) -> None:
             logger.info(f"server {base_url} asks to retry {ds_name} ({error}); skipping this cycle")
     else:
         logger.error(f"server refused {ds_name}: {result.get('error') or 'unknown error'}")
+
+
+#: The `reason` of the server's refusal to receive a stream because it would
+#: destroy, or cannot replace, snapshots it holds (`api.decide_receive`),
+#: because it cannot list them reliably (`listing`), or because the stream
+#: itself is not what the client declared or the server accepts
+#: (`stream_header`: not a plain single-snapshot stream; `base_mismatch`: its
+#: incremental source is not the declared one; `type_mismatch`: the server
+#: holds a filesystem where this is a volume, or the reverse): logged once per
+#: episode (`RemoteBackupManager._note_refusal`), re-armed by the next success.
+_STREAM_REFUSAL_REASONS = (
+    'server_newer', 'base_missing', 'no_common', 'listing',
+    'stream_header', 'base_mismatch', 'type_mismatch',
+)
+
+#: What the operator should do about the refusals that need more than the
+#: server's own text: appended to the logged message.
+_STREAM_REFUSAL_HINTS = {
+    'stream_header': (
+        " (the server does not accept what this client sent: a client/server version skew "
+        "or a bug in one of them; compare `zfsbackupd --version` on both hosts and report "
+        "it if they match)"
+    ),
+    'base_mismatch': (
+        " (the stream is not the one this client declared: a client/server version skew "
+        "or a bug in one of them; compare `zfsbackupd --version` on both hosts and report "
+        "it if they match)"
+    ),
+    'type_mismatch': (
+        " (the server holds a dataset of the other kind under this name: on the server, "
+        "`zfs rename` it to a name outside the backup target; the next cycle sends a full "
+        "stream)"
+    ),
+}
 
 
 def _protocol_mismatch(where: str, server_protocol, *, refused: bool) -> str:
@@ -462,6 +520,17 @@ class RemoteBackupManager:
         # last successful negotiate (`server_copy` is `None` for a server that
         # does not report it).
         self._server_info: Dict[Tuple[str, str], Tuple[Optional[str], Optional[str]]] = {}
+        # `(dataset name, destination) -> (server_newer_count, server_newer)`
+        # from the last successful negotiate: the server snapshots newer than
+        # the common one, `[{"name", "guid"}, ...]` oldest first. Empty for a
+        # server that does not report them (an older release).
+        self._server_newer: Dict[Tuple[str, str], Tuple[int, list]] = {}
+        # `(dataset name, destination) -> 'known' | 'unknown' | 'absent'`:
+        # whether the last negotiate reported `server_newer` (`known`, also
+        # when the list is empty), reported `server_newer_unknown` (a common
+        # snapshot whose newer snapshots the server could not tell) or
+        # reported neither (`absent`: a server that predates B-2b).
+        self._server_newer_status: Dict[Tuple[str, str], str] = {}
         self._no_client_id_logged = False
         # The loaded client identity and the stat signature of its files.
         self._identity: Optional[Identity] = None
@@ -475,13 +544,149 @@ class RemoteBackupManager:
         # destination name -> (transport key, usable) for this cycle.
         self._checked: Dict[str, Tuple[Tuple[str, str], bool]] = {}
         self._per_cycle = False
+        # `time.monotonic()` of the last client certificate expiry check
+        # (`None`: not yet), see `_check_client_cert_expiry`.
+        self._expiry_checked_at: Optional[float] = None
+        # S-7a. `(dataset, destination) -> consecutive cycles skipped by the
+        # resume-token check`, and the pairs whose ERROR was already logged.
+        # In memory: a new worker (reload, crash) counts again from 0.
+        self._token_skips: Dict[Tuple[str, str], int] = {}
+        self._token_error_logged: Set[Tuple[str, str]] = set()
+        # The same for negotiate answered `zfs_timeout` (the server's zfs did
+        # not answer in time): consecutive skipped cycles, ERROR once at
+        # `RESUME_TOKEN_SKIP_ERROR_AFTER`, re-armed by a good negotiate.
+        self._negotiate_zfs_skips: Dict[Tuple[str, str], int] = {}
+        self._negotiate_zfs_error_logged: Set[Tuple[str, str]] = set()
+        # `(dataset, destination) -> why the last `backup_dataset` call did
+        # not complete`, where this class knows (the token check); read by
+        # `last_problem`, reset at the start of every call.
+        self._call_note: Dict[Tuple[str, str], str] = {}
 
     def begin_cycle(self) -> None:
         """Start a new pass over the datasets: forget this cycle's
-        `/whoami` results, and retry a client identity that failed to load."""
+        `/whoami` results, retry a client identity that failed to load, and
+        (at most once every `CLIENT_CERT_EXPIRY_CHECK_EVERY`) report a client
+        certificate that is expired or about to expire."""
         self._per_cycle = True
         self._checked.clear()
         self._identity_failed_sig = None
+        self._check_client_cert_expiry()
+
+    def _check_client_cert_expiry(self) -> None:
+        """S-12: a WARNING within `CLIENT_CERT_EXPIRY_WARN_DAYS` of the client
+        certificate's expiry, an ERROR once it has expired (the identity load
+        then fails and is logged once; this repeats the reminder daily). Reads
+        the certificate only, never the key, and never raises. The first call
+        of a manager checks; later ones at most once per
+        `CLIENT_CERT_EXPIRY_CHECK_EVERY` seconds, whether or not it found
+        anything."""
+        now = time.monotonic()
+        if (
+            self._expiry_checked_at is not None
+            and now - self._expiry_checked_at < CLIENT_CERT_EXPIRY_CHECK_EVERY
+        ):
+            return
+        self._expiry_checked_at = now
+        try:
+            cert_path, _ = self._identity_paths()
+            if not os.path.lexists(cert_path):
+                return  # not enrolled yet: `_client_identity` says so
+            problem = ident.client_cert_expiry_problem(
+                cert_path, ident.client_cert_not_after(cert_path)
+            )
+        except Exception as e:  # advisory only
+            logger.debug(f"client certificate expiry check failed: {e}")
+            return
+        if problem is not None:
+            level, message = problem
+            logger.log(level, message)
+
+    def _token_skipped(self, dsi: DatasetInfo, destination: str, reason: str) -> None:
+        """The resume-token check skipped this cycle for `dsi` -> `destination`
+        (the caller has logged the WARNING). Counts it; the
+        `RESUME_TOKEN_SKIP_ERROR_AFTER`th consecutive skip logs an ERROR, once
+        until `_token_ok`."""
+        key = (dsi.name, destination)
+        self._call_note[key] = f"{TOKEN_SKIP_NOTE}: {reason}"
+        count = self._token_skips[key] = self._token_skips.get(key, 0) + 1
+        if count >= RESUME_TOKEN_SKIP_ERROR_AFTER and key not in self._token_error_logged:
+            self._token_error_logged.add(key)
+            server_ds = self._server_info.get(key, (None, None))[1] or '<server dataset>'
+            logger.error(
+                f"{dsi.name} -> {destination}: the resume-token check has skipped the last "
+                f"{count} cycles in a row ({reason}); nothing is sent for this dataset until "
+                "it passes, so the destination is falling behind. See the WARNINGs above for "
+                "the cause. If the server's partial receive of this dataset is no longer "
+                f"wanted, abort it on the server with `zfs receive -A {server_ds}`; the next "
+                "cycle then sends fresh"
+            )
+
+    def seed_token_skips(self, counts: Dict[Tuple[str, str], int]) -> None:
+        """Start the resume-token skip counts of `(dataset, destination)`
+        pairs from `counts` (the worker takes them from its previous
+        incarnation's status file), so that frequent reloads cannot keep the
+        ERROR from ever firing. The ERROR itself is still logged once per
+        incarnation, at the next skip once the count reaches the threshold."""
+        for key, count in counts.items():
+            if count > 0:
+                self._token_skips[key] = max(self._token_skips.get(key, 0), int(count))
+
+    def _negotiate_zfs_skipped(self, dsi: DatasetInfo, destination: str, base_url: str) -> None:
+        """Negotiate was answered `zfs_timeout` (S-14): WARNING once per
+        episode, and the `RESUME_TOKEN_SKIP_ERROR_AFTER`th consecutive skipped
+        cycle logs an ERROR, once until `_negotiate_zfs_ok`, so a server whose
+        pool stays hung is not an eternal INFO."""
+        key = (dsi.name, destination)
+        self._call_note[key] = f"negotiate skipped: {base_url}'s zfs did not answer in time"
+        self._log_warning_once(
+            (f"{dsi.name} [negotiate zfs_timeout]", destination),
+            f"server {base_url} could not answer the negotiation of {dsi.name} in time "
+            "(its zfs did not answer); skipping this cycle",
+        )
+        count = self._negotiate_zfs_skips[key] = self._negotiate_zfs_skips.get(key, 0) + 1
+        if count >= RESUME_TOKEN_SKIP_ERROR_AFTER and key not in self._negotiate_zfs_error_logged:
+            self._negotiate_zfs_error_logged.add(key)
+            logger.error(
+                f"{dsi.name} -> {destination}: the server's zfs has not answered the "
+                f"negotiation for the last {count} cycles in a row; nothing is sent for "
+                "this dataset until it does, so the destination is falling behind. Check "
+                "the server's pool (a hung pool leaves `zfs` processes in uninterruptible "
+                "sleep)"
+            )
+
+    def _negotiate_zfs_ok(self, dsi: DatasetInfo, destination: str) -> None:
+        key = (dsi.name, destination)
+        self._negotiate_zfs_skips.pop(key, None)
+        self._refusal_logged.pop((f"{dsi.name} [negotiate zfs_timeout]", destination), None)
+        if key in self._negotiate_zfs_error_logged:
+            self._negotiate_zfs_error_logged.discard(key)
+            logger.info(f"{dsi.name} -> {destination}: the server answers negotiations again")
+
+    def _token_ok(self, dsi: DatasetInfo, destination: str) -> None:
+        """The resume-token check passed (or was not needed because the
+        server is up to date): the skip count restarts, and the ERROR may be
+        logged again for a later episode."""
+        key = (dsi.name, destination)
+        self._token_skips.pop(key, None)
+        if key in self._token_error_logged:
+            self._token_error_logged.discard(key)
+            logger.info(f"{dsi.name} -> {destination}: the resume-token check passes again")
+
+    def last_problem(self, dataset: str, destination: str) -> Optional[str]:
+        """Why the last `backup_dataset(dataset, destination)` did not
+        complete, as far as this manager knows (the resume-token check, else a
+        standing refusal logged for the pair or for the whole destination);
+        `None` when it does not know. For the worker's status file."""
+        note = self._call_note.get((dataset, destination))
+        if note:
+            return note
+        for key in sorted(self._refusal_logged, key=lambda k: (k[0] or '', k[1])):
+            label, dest = key
+            if dest == destination and (
+                label is None or label == dataset or label.startswith(dataset + ' [')
+            ):
+                return self._refusal_logged[key]
+        return None
 
     def close(self) -> None:
         """Close every pinned session (idempotent)."""
@@ -508,9 +713,11 @@ class RemoteBackupManager:
         checked before every stream of the chain (between steps, never during
         one), so a stop or reload never begins another stream."""
         destination = remote_cfg.destination
+        self._call_note.pop((dsi.name, destination), None)
         dest = self.config.destinations.get(destination)
         if dest is None:
             logger.error(f"Unknown destination '{destination}' for {dsi.name}")
+            self._call_note[(dsi.name, destination)] = f"unknown destination '{destination}'"
             return False
 
         self._warn_retention_collisions(dsi, destination)
@@ -541,7 +748,7 @@ class RemoteBackupManager:
         except NegotiationFailed as e:
             # Never fall through to a send: with no answer we would treat
             # "unknown" as "no common snapshot" and start a full send.
-            if e.reloading:
+            if e.reloading and not e.zfs_timeout:  # a zfs timeout was logged by `_negotiate`
                 logger.info(
                     f"server {transport.base_url} is {_retry_word(e)}; skipping {dsi.name} this cycle"
                 )
@@ -563,9 +770,18 @@ class RemoteBackupManager:
                 )
                 return False
 
+        # Before any local anchor or pin is written, or anything is sent
+        # (negotiate has already written on the server by now) -- in
+        # particular before `_settle_up_to_date`, which would otherwise record
+        # `latest` as the anchor of a rolled-back dataset and make it look
+        # like a backstop.
+        discard = self._rollback_permit(dsi, destination, common_snap, snapshots)
+        if discard is None:
+            return False
+
         return self._transfer(
             transport, client_id, dsi, latest, common_snap, destination,
-            snapshots=snapshots, should_stop=should_stop, mode=mode,
+            snapshots=snapshots, should_stop=should_stop, mode=mode, discard=discard,
         )
 
     def _send_mode(self, dsi: DatasetInfo, remote_cfg: RemoteDatasetConfig, newest) -> Optional[str]:
@@ -615,10 +831,164 @@ class RemoteBackupManager:
         self._log_refusal_once(key, (
             f"{dsi.name} -> {destination}: the server copy {name} is a {copy} copy but this "
             f"dataset is now sent {mode}; nothing is sent. On the server, move the old copy "
-            f"aside with `zfs rename {name} {name}.{copy}-<date>`; the next cycle sends a "
-            f"full {mode} stream"
+            f"aside with `zfs rename {name} <a name outside the backup target>` (see README "
+            f"'Renaming a server copy aside'); the next cycle sends a full {mode} stream"
         ))
         return False
+
+    def _discard_names(self, dsi: DatasetInfo, destination: str, discard: Tuple[str, ...]) -> str:
+        """The names (else the guids) of the server snapshots `discard` lets
+        the server destroy, for log lines."""
+        entries = self._server_newer.get((dsi.name, destination), (0, []))[1]
+        by_guid = {e.get('guid'): e.get('name') for e in entries if isinstance(e, dict)}
+        return ', '.join(str(by_guid.get(g) or f"guid {g}") for g in discard)
+
+    def _rollback_permit(
+        self, dsi: DatasetInfo, destination: str, common_snap, snapshots: list
+    ) -> Optional[Tuple[str, ...]]:
+        """Whether this cycle may send, and which server snapshots it lets the
+        server destroy: `()` (send, destroy nothing), a tuple of snapshot guids
+        (the `discard` of every stream of the cycle) or `None` (refused: ERROR
+        once per episode, nothing is sent and nothing is written).
+
+        The server receives into an existing dataset with `-F` only when that
+        destroys nothing or only the snapshots named in `discard`
+        (`api.decide_receive`), because `-F` destroys every server snapshot
+        newer than the incremental base. Naming one is only right for a
+        snapshot of ours that was sent and then destroyed here while it was
+        being sent (the backstop of `_push_step` moved the anchor back to the
+        base): the server has it, we do not, and that is the one snapshot we
+        may let it discard. A host that rolled back or restored an older
+        snapshot looks the same from the negotiate answer, so the evidence is
+        local and all of it must hold:
+
+        1. the dataset's OWN (local, never inherited) anchor for this
+           destination names a snapshot that is in our managed listing and is
+           not older (`createtxg`) than the common one. After the backstop the
+           anchor is the base, and the server's pruner may since have removed
+           the base from the server, making an older snapshot the common one;
+           the anchor then still names a live local snapshot at or past the
+           common one, so equality with the common snapshot would refuse that
+           recovery for ever. A rollback or an in-place restore leaves the
+           anchor naming a snapshot that no longer exists here, and a restore
+           under a new name has no local anchor, so both are refused;
+        2. the server names exactly one newer snapshot (and counts one);
+        3. that snapshot's name is a managed one that is not a local snapshot
+           name, and its guid equals no local snapshot's guid (a name can be
+           reused for a different snapshot; a guid cannot);
+        4. its guid is a readable decimal number.
+
+        No newer snapshots, or a server that does not report them, needs no
+        permit.
+
+        With no common snapshot but a server copy that holds snapshots, a full
+        stream cannot replace it (zfs refuses): refused here, once, rather
+        than started every cycle."""
+        key = (f"{dsi.name} [server newer]", destination)
+        none_key = (f"{dsi.name} [no common]", destination)
+        unknown_key = (f"{dsi.name} [server newer unknown]", destination)
+        copy, server_ds = self._server_info.get((dsi.name, destination), (None, None))
+        server_ds = server_ds or dsi.name
+        if common_snap is None:
+            self._refusal_logged.pop(key, None)
+            self._refusal_logged.pop(unknown_key, None)
+            if copy not in ('plain', 'raw'):
+                self._refusal_logged.pop(none_key, None)
+                return ()
+            self._log_refusal_once(none_key, (
+                f"{dsi.name} -> {destination}: the server copy {server_ds} holds snapshots but "
+                "none of them is a snapshot this host still has, and a full stream cannot "
+                "replace it, so nothing is sent. To keep the server copy, on the server: "
+                f"zfs rename {server_ds} <a name outside the backup target> (the next cycle "
+                "sends a full stream; see README 'Renaming a server copy aside'). "
+                "See README 'Rejoining'"
+            ))
+            return None
+        self._refusal_logged.pop(none_key, None)
+        if self._server_newer_status.get((dsi.name, destination)) == 'unknown':
+            # The server has a common snapshot but could not tell what is newer
+            # than it. That is not "nothing newer": writing an anchor now
+            # could launder a rollback into the backstop later. Nothing is
+            # written or sent (the stream would be refused with `listing`).
+            self._refusal_logged.pop(key, None)
+            self._log_warning_once(unknown_key, (
+                f"{dsi.name} -> {destination}: the server copy {server_ds} could not list "
+                f"which of its snapshots are newer than {common_snap.name}, so nothing is sent "
+                "and no anchor is written this cycle; the next cycle retries"
+            ))
+            return None
+        self._refusal_logged.pop(unknown_key, None)
+        count, entries = self._server_newer.get((dsi.name, destination), (0, []))
+        if not entries:
+            self._refusal_logged.pop(key, None)
+            return ()
+        guid = None
+        unreadable_key = (f"{dsi.name} [local anchor]", destination)
+        if len(entries) == 1 and count == 1 and isinstance(entries[0], dict):
+            name, text = entries[0].get('name'), entries[0].get('guid')
+            try:
+                if (
+                    isinstance(name, str) and isinstance(text, str)
+                    and re.fullmatch(r'[0-9]{1,20}', text) is not None
+                    and parse_snapshot_timestamp(self.config.snapshot_prefix, name) is not None
+                    and name not in {s.name for s in snapshots}
+                    and int(text) not in {s.guid for s in snapshots if s.guid is not None}
+                    and self._anchor_at_or_past(dsi, destination, common_snap, snapshots)
+                ):
+                    guid = text
+            except LocalAnchorUnreadable as e:
+                # Not evidence of a rollback: the read failed. Say so instead
+                # of the rollback ERROR, and send nothing this cycle.
+                self._log_warning_once(unreadable_key, (
+                    f"{dsi.name} -> {destination}: cannot read the local anchor property "
+                    f"org.zfsbackup:anchor.{destination} ({e}), which decides whether the "
+                    f"server may discard its newer snapshot; nothing is sent this cycle"
+                ))
+                return None
+        self._refusal_logged.pop(unreadable_key, None)
+        if guid is not None:
+            self._refusal_logged.pop(key, None)
+            return (guid,)
+        names = [str(e.get('name')) for e in entries if isinstance(e, dict)] or ['?']
+        first, last = names[0], names[-1]
+        truncated = count > len(entries)
+        if len(names) == 1 and not truncated:
+            shown, destroy = first, first
+        elif truncated:
+            # `first%` (a blank last) ranges to the newest (zfs-destroy(8)).
+            shown = (
+                f"{first}\u2026{last}; the list is truncated, the oldest {len(names)} of "
+                f"{count} are named"
+            )
+            destroy = f"{first}%"
+        else:
+            shown, destroy = f"{first}\u2026{last}", f"{first}%{last}"
+        self._log_refusal_once(key, (
+            f"{dsi.name} -> {destination}: the server copy {server_ds} has {count} "
+            f"snapshot(s) newer than {common_snap.name} that this host does not have "
+            f"({shown}), for example after a rollback or an in-place restore of this dataset, "
+            "or snapshots taken on the server. Sending would make the server destroy them, "
+            "so nothing is sent. To keep them, on the server: "
+            f"zfs rename {server_ds} <a name outside the backup target> (the next cycle "
+            "sends a full stream; see README 'Renaming a server copy aside'). If they are "
+            f"expendable: zfs destroy {server_ds}@{destroy} "
+            "(the next cycle continues). See README 'Rejoining'"
+        ))
+        return None
+
+    def _anchor_at_or_past(self, dsi: DatasetInfo, destination: str, common_snap, snapshots: list) -> bool:
+        """Rule 1 of `_rollback_permit`: this dataset's local anchor for the
+        destination names a snapshot in `snapshots` whose `createtxg` is at
+        least the common snapshot's (both known)."""
+        name = self.local_manager.get_local_anchor(dsi, destination)
+        if not name:
+            return False
+        anchor = next((s for s in snapshots if s.name == name), None)
+        return (
+            anchor is not None
+            and anchor.createtxg is not None and common_snap.createtxg is not None
+            and anchor.createtxg >= common_snap.createtxg
+        )
 
     # ------------------------------------------------- identity and transport
 
@@ -788,6 +1158,23 @@ class RemoteBackupManager:
             logger.error(message)
         else:
             logger.debug(message)
+
+    def _note_refusal(self, base_url: str, ds_name: str, destination: str, result: dict) -> None:
+        """Log a server refusal that arrived instead of the final ack, or in
+        place of a broken pipe (`_log_refusal`), except that the refusals to
+        destroy or replace server snapshots, or to list them
+        (`_STREAM_REFUSAL_REASONS`; a
+        well-behaved client is stopped before it gets one, so this is a race or
+        an older client's view) are ERROR once per episode, then DEBUG."""
+        if result.get('reason') in _STREAM_REFUSAL_REASONS and not result.get('retry'):
+            self._log_refusal_once(
+                (f"{ds_name} [server refusal]", destination),
+                f"server {base_url} refused {ds_name} -> {destination}: "
+                f"{result.get('error') or 'unknown error'}"
+                f"{_STREAM_REFUSAL_HINTS.get(result.get('reason'), '')}",
+            )
+        else:
+            _log_refusal(base_url, ds_name, result)
 
     def _refuse_destination(self, destination: str, transport: _Transport, message: str) -> None:
         """A destination-level refusal: logged once, and the destination is
@@ -992,10 +1379,17 @@ class RemoteBackupManager:
                 timeout=HTTP_TIMEOUT,
             )
             if _is_reloading(resp):
-                # The one retryable 503 covers a reload and a busy/unsettled
-                # dataset; the server's own text tells which.
+                # The one retryable 503 covers a reload, a busy/unsettled
+                # dataset and (S-14) a server `zfs` that did not answer in
+                # time; the server's own `reason`/text tells which.
                 body = _json_body(resp)
                 text = str(body.get('error') or '')
+                if body.get('reason') == 'zfs_timeout':
+                    self._negotiate_zfs_skipped(dsi, destination, base_url)
+                    raise NegotiationFailed(
+                        f"server is busy: {text or 'zfs timed out; retry later'}", reloading=True,
+                        zfs_timeout=True,
+                    )
                 if body.get('reason') == 'unsettled_ancestor':
                     # A parent has not completed its first backup, so this
                     # child waits for it: visible at WARNING, once per
@@ -1040,10 +1434,23 @@ class RemoteBackupManager:
             resp.raise_for_status()
             self._refusal_logged.pop((dsi.name, destination), None)
             self._refusal_logged.pop((f"{dsi.name} [unsettled]", destination), None)
+            self._negotiate_zfs_ok(dsi, destination)
             body = resp.json()
             self._server_info[(dsi.name, destination)] = (
                 body.get('server_copy'), body.get('server_dataset')
             )
+            newer, newer_count = body.get('server_newer'), body.get('server_newer_count')
+            self._server_newer[(dsi.name, destination)] = (
+                newer_count if type(newer_count) is int else 0,
+                newer if isinstance(newer, list) else [],
+            )
+            if body.get('server_newer_unknown') is True:
+                status = 'unknown'
+            elif 'server_newer' in body or 'server_newer_count' in body:
+                status = 'known'
+            else:
+                status = 'absent'
+            self._server_newer_status[(dsi.name, destination)] = status
             return body.get('common_snapshot')
         except NegotiationFailed:
             raise
@@ -1066,6 +1473,7 @@ class RemoteBackupManager:
         snapshots: Optional[list] = None,
         should_stop: Optional[Callable[[], bool]] = None,
         mode: str = 'plain',
+        discard: Tuple[str, ...] = (),
     ) -> bool:
         """Bring the server up to `latest`, one `zfs send -i` per snapshot.
 
@@ -1080,6 +1488,8 @@ class RemoteBackupManager:
         (the next cycle continues from the anchor), except that a step whose
         snapshot has vanished is rebuilt around, once per missing member.
         `mode` is the send mode (`_SEND_MODES`), fixed for the whole chain.
+        `discard` (`_rollback_permit`) is the guids of the server snapshots
+        every stream of this cycle lets the server destroy.
         A stop mid-chain returns True: the work continues next cycle."""
         base_url = transport.base_url
         if snapshots is None:
@@ -1107,6 +1517,11 @@ class RemoteBackupManager:
                 + (f"{common_snap.name} -> " if common_snap else "full ")
                 + ' -> '.join(s.name for s in chain)
                 + f" ({len(chain)} step(s)) -> {base_url}"
+                + (
+                    f"; the server would be allowed to discard {self._discard_names(dsi, destination, discard)} "
+                    "(a snapshot it holds that this host does not)"
+                    if discard else ""
+                )
             )
             return True
 
@@ -1123,7 +1538,8 @@ class RemoteBackupManager:
         if resumed is not None:
             finished = resumed.sent.name == latest.name
             outcome = self._push_step(
-                transport, client_id, dsi, destination, snapshots, resumed, clear_pin=finished
+                transport, client_id, dsi, destination, snapshots, resumed,
+                clear_pin=finished, discard=discard,
             )
             if outcome != _OK:
                 return outcome == _ANCHOR_FAILED and finished
@@ -1143,7 +1559,7 @@ class RemoteBackupManager:
             try:
                 common_name = self._negotiate(transport, client_id, dsi, snapshots, destination)
             except NegotiationFailed as e:
-                if e.reloading:
+                if e.reloading and not e.zfs_timeout:
                     logger.info(
                         f"server {transport.base_url} is {_retry_word(e)}; {dsi.name} continues next cycle"
                     )
@@ -1159,6 +1575,9 @@ class RemoteBackupManager:
                         "of this cycle rather than sending a full stream"
                     )
                     return False
+            discard = self._rollback_permit(dsi, destination, common_snap, snapshots)
+            if discard is None:
+                return False
             if common_snap is not None and common_snap.name == latest.name:
                 self._settle_up_to_date(dsi, latest, destination, snapshots)
                 return True
@@ -1200,7 +1619,7 @@ class RemoteBackupManager:
                 outcome = _FAILED if started is None else self._push_step(
                     transport, client_id, dsi, destination, snapshots, started,
                     clear_pin=step is chain[-1], after_success=sent_any,
-                    should_stop=should_stop,
+                    should_stop=should_stop, discard=discard,
                 )
                 if outcome == _OK:
                     sent_any = True
@@ -1275,6 +1694,7 @@ class RemoteBackupManager:
         clear_pin: bool = True,
         after_success: bool = False,
         should_stop: Optional[Callable[[], bool]] = None,
+        discard: Tuple[str, ...] = (),
     ) -> str:
         """Send ONE stream (`started`, from `_try_resume` or `_start_fresh`) over
         the pinned websocket, wait for the server's ack, then record the anchor
@@ -1298,7 +1718,11 @@ class RemoteBackupManager:
         retry. A stop, or exhausted retries, reap the send exactly once (the
         `finally`), change neither the anchor nor the pin (the previous
         step's stays in place) and return `_STOP` (INFO, no re-list). The
-        first stream of a cycle fails as always."""
+        first stream of a cycle fails as always.
+
+        `discard` is the guids of the server snapshots the server may destroy
+        for this stream (`_rollback_permit`), sent as `&discard=` on every
+        stream of the cycle."""
         base_url = transport.base_url
         stream, mode, inflight_set, sent, base = started
 
@@ -1314,14 +1738,23 @@ class RemoteBackupManager:
             #
             # `mode` is required by the server: `resume` only when this stream
             # continues the server's resume token, `fresh` for a new stream
-            # (the server then discards any partial receive state). `from` is
-            # informational.
+            # (the server then discards any partial receive state). `from`
+            # (the base's name) and `from_guid` (its guid, preferred when
+            # present) tell the server which of its snapshots the stream is
+            # incremental from: it passes `-F` only if that destroys nothing,
+            # or only the snapshots listed in `discard` (guids; the cycle's
+            # `_rollback_permit`). A server that predates them ignores all
+            # three.
             ws_url = (
                 f"{transport.endpoint.ws_base}/backup/{_path(client_id)}/{_path(dsi.name)}"
                 f"/stream?mode={mode}"
             )
             if base is not None:
                 ws_url += f"&from={quote(base.name, safe='')}"
+                if base.guid is not None:
+                    ws_url += f"&from_guid={base.guid}"
+            if discard:
+                ws_url += f"&discard={','.join(discard)}"
             ws = websocket.WebSocket()
             # TCP + TLS handshake + pin check BEFORE any websocket byte; a
             # wrong server raises `PinMismatch` (not an OSError) and, like any
@@ -1432,6 +1865,9 @@ class RemoteBackupManager:
                     # the anchor is not advanced and the next cycle retries.
                     _log_refusal(base_url, dsi.name, result)
                     return _STOP
+                if result.get('reason') in _STREAM_REFUSAL_REASONS:
+                    self._note_refusal(base_url, dsi.name, destination, result)
+                    return _FAILED
                 logger.error(
                     f"Transfer failed for {dsi.name}: {result.get('error', 'unknown error')}"
                 )
@@ -1452,7 +1888,7 @@ class RemoteBackupManager:
             timed_out = isinstance(e, (TimeoutError, websocket.WebSocketTimeoutException))
             refusal = _peer_refusal(ws) if sending and not timed_out else None
             if refusal is not None:
-                _log_refusal(base_url, dsi.name, refusal)
+                self._note_refusal(base_url, dsi.name, destination, refusal)
                 if _is_reloading_refusal(refusal):
                     # Reloading or busy, seen as a failed send: the same
                     # retryable refusal as at the ack, so the chain stops
@@ -1485,6 +1921,7 @@ class RemoteBackupManager:
                 except Exception:
                     pass
 
+        self._refusal_logged.pop((f"{dsi.name} [server refusal]", destination), None)
         old_anchor = self.local_manager.get_anchor(dsi, destination)
         keep_anchor = False
         if old_anchor and old_anchor != sent.name:
@@ -1582,6 +2019,7 @@ class RemoteBackupManager:
             f"Nothing to send for {dsi.name} -> {destination}: "
             f"{latest.name} is already on the server"
         )
+        self._token_ok(dsi, destination)
         if self.config.dry_run:
             return
         anchor = self.local_manager.get_anchor(dsi, destination)
@@ -1589,9 +2027,25 @@ class RemoteBackupManager:
         wrote = False
         if not anchored:
             newer = False
+            current = None
             if anchor and snapshots:
                 current = next((s for s in snapshots if s.name == anchor), None)
                 newer = snapshot_newer(current, latest)
+            if (
+                anchor and snapshots and current is None
+                and self._server_newer_status.get((dsi.name, destination), 'absent') != 'absent'
+            ):
+                # The anchor names a snapshot this host no longer has (a
+                # rollback or an in-place restore, or the pruner after a
+                # backstop). A server that reports B-2b state may hold that
+                # snapshot, so moving the anchor to `latest` would let a later
+                # cycle mistake the rollback for the backstop and send
+                # `discard`. Left as it is; the pin stays too.
+                logger.debug(
+                    f"{dsi.name} -> {destination}: the anchor {anchor!r} names a snapshot this "
+                    f"host does not have; left unchanged although {latest.name} is on the server"
+                )
+                return
             wrote = not newer
             anchored = newer or self.local_manager.set_anchor(dsi, destination, latest.name)
         if anchored and self.local_manager.get_inflight(dsi, destination) is not None:
@@ -1635,6 +2089,18 @@ class RemoteBackupManager:
                 timeout=RESUME_TOKEN_TIMEOUT,
             )
             if _is_reloading(resp):
+                if _json_body(resp).get('reason') == 'zfs_timeout':
+                    # S-14: the server's zfs did not answer in time. Not a
+                    # reload: the cycle is skipped like any unreadable token
+                    # check (counted, so a server that stays stuck is
+                    # escalated), never a fresh send.
+                    self._log_warning_once(
+                        (f"{dsi.name} [zfs_timeout]", destination),
+                        f"server {base_url} could not read the resume state of {dsi.name} "
+                        "in time (its zfs did not answer); skipping this cycle",
+                    )
+                    self._token_skipped(dsi, destination, f"{base_url}'s zfs did not answer in time")
+                    return 'skip', None
                 logger.info(
                     f"server {base_url} is reloading; skipping {dsi.name} this cycle"
                 )
@@ -1649,6 +2115,9 @@ class RemoteBackupManager:
                     f"(HTTP {resp.status_code}); skipping this cycle rather than "
                     "risk discarding its partial progress with a fresh send"
                 )
+                self._token_skipped(
+                    dsi, destination, f"{base_url} answered the resume-token request with HTTP {resp.status_code}"
+                )
                 return 'skip', None
             body = resp.json()
             if not isinstance(body, dict) or body.get('error'):
@@ -1656,6 +2125,7 @@ class RemoteBackupManager:
                     (body.get('error') if isinstance(body, dict) else None)
                     or "unexpected reply"
                 )
+            self._refusal_logged.pop((f"{dsi.name} [zfs_timeout]", destination), None)
             token = body.get('resume_token')
             return ('token', token) if token else ('none', None)
         except Exception as e:
@@ -1668,6 +2138,7 @@ class RemoteBackupManager:
                 "skipping this cycle rather than risk discarding its partial "
                 "progress with a fresh send"
             )
+            self._token_skipped(dsi, destination, f"cannot ask {base_url} for it: {e}")
             return 'skip', None
 
     def _resume_target(self, token: str, dsi: DatasetInfo, snapshots, mode: str = 'plain') -> object:
@@ -1755,6 +2226,7 @@ class RemoteBackupManager:
         if status == 'skip':
             return 'skip', None
         if not token:
+            self._token_ok(dsi, destination)
             return 'fresh', None
         try:
             target = self._resume_target(token, dsi, snapshots, mode)
@@ -1764,7 +2236,9 @@ class RemoteBackupManager:
                 "cycle rather than risk discarding the server's partial progress "
                 "with a fresh send"
             )
+            self._token_skipped(dsi, destination, f"cannot check the token: {e}")
             return 'skip', None
+        self._token_ok(dsi, destination)
         if isinstance(target, str):
             logger.warning(
                 f"Not resuming {dsi.name}: {target}; sending fresh (the server "

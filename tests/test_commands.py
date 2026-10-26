@@ -571,6 +571,32 @@ class TestSendCommand:
         call_args = mock_subprocess.call_args[0][0]
         assert '-i' in call_args
 
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('bad,typename', [
+        pytest.param('testpool/fs@snap', 'str', id='str'),
+        pytest.param(None, 'NoneType', id='None'),
+        pytest.param(Bookmark(Filesystem('testpool/fs'), 'bm'), 'Bookmark', id='Bookmark'),
+        pytest.param(5, 'int', id='int'),
+    ])
+    def test_send_refuses_anything_but_a_dataset_or_snapshot(self, mock_subprocess, bad, typename):
+        for send in (SendCommand(), SendCommand._send):
+            with pytest.raises(ValueError) as exc:
+                send(bad)
+            assert str(exc.value) == 'Expected Dataset or Snapshot, got %s instead' % typename
+        mock_subprocess.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_send_still_dispatches_a_dataset_and_a_snapshot(self, mock_subprocess, sample_filesystem, sample_snapshot):
+        process_mock = MagicMock()
+        process_mock.stdout.peek.return_value = b'ZFS_DATA'
+        process_mock.poll.return_value = None
+        mock_subprocess.return_value = process_mock
+        assert SendCommand()(sample_filesystem, since=None) is not None
+        assert SendCommand()(sample_snapshot) is not None
+        assert mock_subprocess.call_count == 2
+
 
 class TestReceiveCommand:
     """Tests for ReceiveCommand class."""
@@ -1110,8 +1136,8 @@ class TestExecCaptureRegressions:
 
     1. A deadlock/hang when reading large stdout with little or no stderr. The
        fix drains stdout and stderr independently (stderr is read on a
-       dedicated background thread via `Command._start_stderr_reader`, decoupled
-       from the stdout-reading loop in `_exec_capture`) so that a full stdout
+       dedicated background thread via `Command._start_stderr_reader_lines`, decoupled
+       from the stdout-reading loop in `_exec_lines`) so that a full stdout
        pipe can never be blocked behind a stderr read, and vice versa. The
        mock_subprocess fixture does not use real OS pipes (it drives
        MagicMock.readline via side_effect lists), so it cannot reproduce the
@@ -1151,7 +1177,8 @@ class TestExecCaptureRegressions:
 
     @pytest.mark.unit
     def test_stderr_reader_blank_line_no_indexerror(self):
-        """Direct unit test of the stderr-draining helper: a stderr line
+        """Direct unit test of the stderr-draining helper (`_start_stderr_reader_lines`, the one reader behind
+        `_exec`, `_exec_out`, `_exec_lines` and non-raw `_exec_collect`): a stderr line
         consisting only of a newline strips to '', and indexing error[0] must
         not raise IndexError. Because the reader runs on a background thread,
         an uncaught exception there would not normally fail the test, so we
@@ -1168,7 +1195,7 @@ class TestExecCaptureRegressions:
 
         threading.excepthook = hook
         try:
-            thread = Command._start_stderr_reader(process, errors)
+            thread = Command._start_stderr_reader_lines(process, errors)
             thread.join(timeout=5)
         finally:
             threading.excepthook = original_hook
@@ -1212,22 +1239,29 @@ class TestExecCaptureRegressions:
             'A background thread raised IndexError while processing a blank stderr line'
 
     @pytest.mark.unit
-    def test_exec_capture_eof_but_poll_none_calls_wait(self):
-        """Regression test for the EOF-but-still-running race: stdout hits
-        EOF (readline() == '') while poll() still reports None (the child
-        hasn't been reaped by the OS yet). _exec_capture must resolve the
-        return code by blocking on process.wait() rather than returning
-        None and leaving the caller's `while True` loop to spin on
-        readline()/poll() until the child eventually shows up as exited."""
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('rc, raises', [(0, False), (1, True)], ids=['clean', 'failing'])
+    def test_exec_lines_eof_but_poll_none_calls_wait(self, mock_subprocess, rc, raises):
+        """Regression test for the EOF-but-still-running race (formerly `_exec_capture`, folded into `_exec_lines`
+        by D3): stdout hits EOF (readline() == '') while poll() still reports None (the child hasn't been reaped
+        by the OS yet). `_exec_lines` must resolve the return code by blocking on process.wait() exactly once
+        rather than leaving the loop to spin on readline()/poll(), and use that code (a non-zero one raises)."""
         process = MagicMock()
         process.stdout.readline.return_value = ''
+        process.stderr.readline.return_value = ''
         process.poll.return_value = None
-        process.wait.return_value = 0
+        process.wait.return_value = rc
+        mock_subprocess.return_value = process
 
-        result = Command._exec_capture(process, [])
+        if raises:
+            with pytest.raises(Exception, match='exit code 1'):
+                list(Command._exec_lines(['zfs', 'list']))
+        else:
+            assert list(Command._exec_lines(['zfs', 'list'])) == []
 
-        process.wait.assert_called_once()
-        assert result is False
+        process.wait.assert_called_once_with()
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -1288,6 +1322,14 @@ class TestExecCaptureRegressions:
         assert process.wait.call_count == 3
 
 
+def _wait_for_thread_count(baseline, limit=5.0):
+    """Give the daemon threads of the slow-command watchdog (a cancelled one needs a moment to return) time to end
+    before a `threading.active_count()` comparison."""
+    deadline = time.monotonic() + limit
+    while threading.active_count() > baseline and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+
 class _RealChildHarness:
     """Drives `Command._exec_out` / `_exec` against a REAL child (`sys.executable -c ...`), not
     the `mock_subprocess` fixture.
@@ -1316,14 +1358,14 @@ class _RealChildHarness:
                 return super().poll()
 
         monkeypatch.setattr(subprocess, 'Popen', RecordingPopen)
-        real_start = Command._start_stderr_reader
+        real_start = Command._start_stderr_reader_lines
 
         def recording_start(process, errors):
             thread = real_start(process, errors)
             harness.stderr_threads.append(thread)
             return thread
 
-        monkeypatch.setattr(Command, '_start_stderr_reader', staticmethod(recording_start))
+        monkeypatch.setattr(Command, '_start_stderr_reader_lines', staticmethod(recording_start))
 
     @staticmethod
     def cmd(script):
@@ -1378,7 +1420,8 @@ sys.exit({rc})
 
 
 class TestExecRealPipes:
-    """The deadlock/spin fixes in `Command._exec_out` / `_exec_capture` (commit a8a3d88), proven
+    """The deadlock/spin fixes in `Command._exec_out` / `_exec_lines` (commit a8a3d88; `_exec_capture` was folded
+    into `_exec_lines` by D3), proven
     with real OS pipes. Each test fails against the pre-fix code: (a) deadlocks without the
     stderr drain thread, (b) leaks the child and thread without the generator `finally`, (c)
     spins on readline()/poll() without the `wait()` at EOF."""
@@ -1495,7 +1538,7 @@ class TestExecRealPipes:
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_stdout_eof_before_exit_does_not_spin(self, real_child):
-        """(c) The child closes stdout, lingers 0.3 s, then exits 0. `_exec_capture` must block in
+        """(c) The child closes stdout, lingers 0.3 s, then exits 0. `_exec_lines` must block in
         wait() rather than looping readline()/poll(): the poll count stays tiny (a spinning
         regression makes thousands of calls in that window)."""
         script = (
@@ -1531,6 +1574,950 @@ class TestExecRealPipes:
         assert isinstance(exc, Exception) and str(exc) == 'Cannot open dataset'
         proc = real_child.procs[0]
         assert real_child.polls[proc.pid] <= 5
+
+
+def _drive(entry, cmd, sink=None):
+    """Run `cmd` through one of the three entry points; return the lines it yielded (`_exec` yields none). Lines
+    are appended to `sink` as they arrive, so a failing run still reports what came before the exception."""
+    sink = [] if sink is None else sink
+    if entry == '_exec':
+        Command._exec(cmd)
+    else:
+        for line in getattr(Command, entry)(cmd):
+            sink.append(line)
+    return sink
+
+
+_ENTRIES = ['_exec', '_exec_out', '_exec_lines']
+
+
+class TestExecCoreCleanupMocked:
+    """D3: `_exec` and `_exec_out` are layers over `_exec_lines`, so one cleanup path serves them all. These pin it
+    with a mocked `Popen`: an interrupt terminates the child, a child that survives SIGKILL is abandoned with exactly
+    one WARNING and never waited for a third time. (The real-pipe counterparts are in `TestExecCoreRealChildren`.)"""
+
+    @staticmethod
+    def _interrupted_process(pid=4242):
+        process = MagicMock()
+        process.pid = pid
+        process.stdout.readline.side_effect = KeyboardInterrupt()
+        process.stderr.readline.return_value = ''
+        process.poll.return_value = None
+        return process
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', ['_exec', '_exec_out', '_exec_lines'])
+    def test_child_that_survives_sigkill_is_abandoned_with_one_warning(self, mock_subprocess, monkeypatch, caplog,
+                                                                       entry):
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.05)
+        process = self._interrupted_process()
+        process.wait.side_effect = [subprocess.TimeoutExpired(cmd='zfs', timeout=0.05),
+                                    subprocess.TimeoutExpired(cmd='zfs', timeout=0.05)]
+        mock_subprocess.return_value = process
+        cmd = ['/usr/local/sbin/zfs', 'destroy', 'tank/x']
+
+        started = time.monotonic()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(KeyboardInterrupt):
+                list(getattr(Command, entry)(cmd)) if entry != '_exec' else Command._exec(cmd)
+        assert time.monotonic() - started < 5            # nothing blocked on the unkillable child
+
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        assert process.wait.call_args_list == [call(timeout=0.05), call(timeout=0.05)]   # no third (unbounded) wait
+        warnings = [r for r in caplog.records if r.name == 'libzfseasy' and r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert message.startswith('zfs destroy (pid 4242) did not exit after SIGKILL')
+        assert 'abandoning it' in message
+        assert '/usr/local/sbin' not in message           # the base name, not the path
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_abandon_warning_redacts_a_url_credential(self, mock_subprocess, monkeypatch, caplog):
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.05)
+        process = self._interrupted_process(pid=77)
+        process.wait.side_effect = [subprocess.TimeoutExpired(cmd='zfs', timeout=0.05)] * 2
+        mock_subprocess.return_value = process
+
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(KeyboardInterrupt):
+                Command._exec(['zfs', 'https://user:hunter2@host/key'])
+
+        text = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'hunter2' not in text and 'user:' not in text
+        warning = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning) == 1 and 'https://***@host/key' in warning[0] and '(pid 77)' in warning[0]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    @pytest.mark.parametrize('kill_error', [None, ProcessLookupError()], ids=['kill-ok', 'kill-raises'])
+    def test_a_second_interrupt_during_the_cleanup_wait_kills_the_child(self, mock_subprocess, monkeypatch, entry,
+                                                                       kill_error):
+        """F1: the first interrupt starts SIGTERM + a bounded wait; a second one arriving in that wait must still send
+        a (non-blocking) SIGKILL before it propagates, and never wait again."""
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.05)
+        process = self._interrupted_process()
+        process.wait.side_effect = KeyboardInterrupt()
+        process.kill.side_effect = kill_error
+        mock_subprocess.return_value = process
+        cmd = ['zfs', 'destroy', 'tank/x']
+
+        with pytest.raises(KeyboardInterrupt):
+            _drive(entry, cmd)
+
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        assert process.wait.call_count == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_abandon_path_does_not_join_the_stderr_reader(self, mock_subprocess, monkeypatch):
+        """F4: an abandoned child still holds stderr open, so joining its reader could only time out (another
+        `_TERMINATE_TIMEOUT`): the abandon path returns without it."""
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 1.0)
+        release = threading.Event()
+        joined = []
+        monkeypatch.setattr(Command, '_join_stderr_reader', staticmethod(joined.append))
+        process = self._interrupted_process()
+        process.stderr.readline.side_effect = lambda *_limit: (release.wait(30), '')[1]     # a reader that never ends
+        process.wait.side_effect = [subprocess.TimeoutExpired(cmd='zfs', timeout=1)] * 2
+        mock_subprocess.return_value = process
+        try:
+            started = time.monotonic()
+            with pytest.raises(KeyboardInterrupt):
+                Command._exec(['zfs', 'destroy', 'tank/x'])
+            assert time.monotonic() - started < 0.5
+            assert joined == []
+            assert process.wait.call_count == 2
+        finally:
+            release.set()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    def test_a_child_that_cannot_be_started_raises_its_own_error(self, entry, caplog):
+        """F2: `Popen` is inside the `try` with `process` still None: a failed spawn raises the OSError itself, with
+        no NameError/UnboundLocalError from the cleanup and no abandon warning."""
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(FileNotFoundError):
+                _drive(entry, ['/nonexistent/dir/zfs', 'list'])
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_collect_cannot_start_either(self):
+        with pytest.raises(FileNotFoundError):
+            Command._exec_collect(['/nonexistent/dir/zfs', 'list'])
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('raw', [False, True])
+    def test_exec_collect_reaps_the_child_when_the_reader_cannot_start(self, mock_subprocess, monkeypatch, raw):
+        """F2: the stderr reader is started inside the `try`, so an interrupt (or a thread-start failure) there
+        still kills and reaps the already spawned child, and the ORIGINAL exception propagates (in the raw branch the
+        thread is assigned only after a successful start(), so the cleanup never joins an unstarted thread)."""
+        process = MagicMock()
+        process.pid = 9
+        process.poll.return_value = None
+        process.wait.return_value = -9
+        mock_subprocess.return_value = process
+
+        real_thread = threading.Thread
+
+        class NoThread(real_thread):
+            def start(self):
+                raise KeyboardInterrupt()
+
+        def boom(*_args):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(Command, '_start_stderr_reader_lines', staticmethod(boom))
+        monkeypatch.setattr('libzfseasy.zfs.threading', MagicMock(Thread=NoThread))
+        with pytest.raises(KeyboardInterrupt):
+            Command._exec_collect(['zfs', 'x'], raw_stderr=raw)
+        process.kill.assert_called_once()
+        assert process.wait.called
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_destroy_lines_closes_its_source_when_exhausted_or_abandoned(self):
+        closed = []
+
+        def source():
+            try:
+                yield 'destroy\ttank/a'
+                yield 'reclaim\t10'
+                yield 'destroy\ttank/b'
+            finally:
+                closed.append(True)
+
+        assert list(DestroyCommand._destroy_lines(source())) == ['tank/a', 'tank/b']
+        assert closed == [True]
+
+        src = source()                      # the caller keeps its own reference: only the explicit close can end it
+        gen = DestroyCommand._destroy_lines(src)
+        assert next(gen) == 'tank/a'
+        gen.close()
+        assert closed == [True, True]
+        del src
+
+        class Plain:                        # a source without close() (a list iterator) is still fine
+            def __iter__(self):
+                return iter(['destroy\ttank/c'])
+
+        assert list(DestroyCommand._destroy_lines(Plain())) == ['tank/c']
+
+    @staticmethod
+    def _record_joins(monkeypatch):
+        joined = []
+        real = Command._join_stderr_reader
+        monkeypatch.setattr(Command, '_join_stderr_reader', staticmethod(lambda t: (joined.append(t), real(t))))
+        return joined
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    def test_an_interrupt_in_the_term_wait_kills_once_and_skips_join_wait_and_warning(self, mock_subprocess,
+                                                                                     monkeypatch, caplog, entry):
+        """F1: whatever interrupts a cleanup step is re-raised after one non-blocking kill; the join and the final
+        wait are skipped and nothing is reported as abandoned."""
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.05)
+        joined = self._record_joins(monkeypatch)
+        process = self._interrupted_process()
+        process.wait.side_effect = KeyboardInterrupt()
+        mock_subprocess.return_value = process
+
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(KeyboardInterrupt):
+                _drive(entry, ['zfs', 'destroy', 'tank/x'])
+
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        assert process.wait.call_count == 1 and joined == []
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('kill_error', [None, ProcessLookupError()], ids=['kill-ok', 'kill-raises'])
+    def test_an_interrupt_in_the_kill_wait_kills_a_second_time(self, mock_subprocess, monkeypatch, caplog,
+                                                              kill_error):
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.05)
+        joined = self._record_joins(monkeypatch)
+        process = self._interrupted_process()
+        process.wait.side_effect = [subprocess.TimeoutExpired(cmd='zfs', timeout=0.05), KeyboardInterrupt()]
+        process.kill.side_effect = [None, kill_error] if kill_error else None   # only the last-resort kill may fail
+        mock_subprocess.return_value = process
+
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(KeyboardInterrupt) as info:
+                Command._exec(['zfs', 'destroy', 'tank/x'])
+
+        assert process.kill.call_count == 2                  # the escalation, then the last-resort one
+        assert process.wait.call_count == 2 and joined == []
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        chain, exc = [], info.value.__context__
+        while exc is not None:
+            chain.append(type(exc))
+            exc = exc.__context__
+        assert KeyboardInterrupt in chain                        # the original interrupt is kept as context
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_plain_error_in_a_cleanup_step_is_also_followed_by_a_kill(self, mock_subprocess):
+        process = self._interrupted_process()
+        process.wait.side_effect = RuntimeError('boom')
+        mock_subprocess.return_value = process
+        with pytest.raises(RuntimeError, match='boom'):
+            Command._exec(['zfs', 'set', 'a=b', 'tank'])
+        process.kill.assert_called_once()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    @pytest.mark.parametrize('error', [KeyboardInterrupt(), OSError('no such binary')], ids=['interrupt', 'oserror'])
+    def test_popen_failing_leaves_nothing_to_clean_up(self, mock_subprocess, monkeypatch, entry, error):
+        """F2: `Popen` is inside the `try` but `process` is still None: the error itself propagates (no
+        UnboundLocalError/AttributeError from the `finally`), and there is nothing to join or wait for."""
+        joined = self._record_joins(monkeypatch)
+        mock_subprocess.side_effect = error
+        with pytest.raises(type(error)):
+            _drive(entry, ['zfs', 'list'])
+        assert joined == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('raw', [False, True])
+    @pytest.mark.parametrize('error', [KeyboardInterrupt(), OSError('no such binary')], ids=['interrupt', 'oserror'])
+    def test_exec_collect_popen_failing_leaves_nothing_to_clean_up(self, mock_subprocess, monkeypatch, raw, error):
+        joined = self._record_joins(monkeypatch)
+        mock_subprocess.side_effect = error
+        with pytest.raises(type(error)):
+            Command._exec_collect(['zfs', 'list'], raw_stderr=raw)
+        assert joined == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_collect_reader_start_failure_kills_waits_and_joins(self, mock_subprocess, monkeypatch):
+        joined = self._record_joins(monkeypatch)
+        process = MagicMock()
+        process.pid = 9
+        process.poll.return_value = None
+        process.wait.return_value = -9
+        mock_subprocess.return_value = process
+
+        def boom(*_args):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(Command, '_start_stderr_reader_lines', staticmethod(boom))
+        with pytest.raises(KeyboardInterrupt):
+            Command._exec_collect(['zfs', 'x'])
+        process.kill.assert_called_once()
+        process.wait.assert_called_once()
+        assert joined == [None]                              # the reader never existed; the join is a no-op
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('what', ['dataset', 'snapshots'])
+    def test_an_interrupt_in_the_eager_destroy_terminates_the_child_before_it_reaches_the_caller(
+            self, mock_subprocess, what):
+        """F3, mocked: the KeyboardInterrupt comes from stdout mid-iteration; the exception (and with it the
+        `dataset()` frame) is still referenced, yet the child was terminated and waited for."""
+        process = self._interrupted_process()
+        process.stdout.readline.side_effect = ['destroy\ttank/x\n', KeyboardInterrupt()]
+        process.wait.return_value = -15
+        mock_subprocess.return_value = process
+        fs = Filesystem('tank/x')
+        held = None
+        try:
+            if what == 'dataset':
+                DestroyCommand().dataset(fs, destroy=True)
+            else:
+                DestroyCommand().snapshots([Snapshot(fs, 's1')], destroy=True)
+        except KeyboardInterrupt as exc:
+            held = exc
+        assert held is not None
+        process.terminate.assert_called_once()
+        assert process.wait.called
+        process.kill.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('what', ['dataset', 'snapshots'])
+    def test_a_lazy_destroy_starts_nothing_up_front_and_close_reaps_the_child(self, mock_subprocess, what):
+        process = MagicMock()
+        process.pid = 3
+        process.stdout.readline.side_effect = ['destroy\ttank/x\n', 'destroy\ttank/y\n', '']
+        process.stderr.readline.return_value = ''
+        process.poll.return_value = None
+        process.wait.return_value = -15
+        mock_subprocess.return_value = process
+        fs = Filesystem('tank/x')
+
+        if what == 'dataset':
+            gen = DestroyCommand().dataset(fs, destroy=True, lazy=True)
+        else:
+            gen = DestroyCommand().snapshots([Snapshot(fs, 's1')], destroy=True, lazy=True)
+        mock_subprocess.assert_not_called()                  # nothing closed, nothing even started yet
+        process.terminate.assert_not_called()
+
+        assert next(gen) == 'tank/x'
+        gen.close()
+        process.terminate.assert_called_once()
+        assert process.wait.called
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_normal_interrupt_path_joins_and_waits_once_each(self, mock_subprocess, monkeypatch):
+        """F4's counterpart: a child that honours SIGTERM is joined (once) and given the final wait."""
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.05)
+        joined = self._record_joins(monkeypatch)
+        process = self._interrupted_process()
+        process.wait.return_value = -15
+        mock_subprocess.return_value = process
+        with pytest.raises(KeyboardInterrupt):
+            Command._exec(['zfs', 'set', 'a=b', 'tank'])
+        assert len(joined) == 1
+        assert process.wait.call_args_list == [call(timeout=0.05), call()]
+        process.kill.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_label_of_a_malformed_argv_does_not_break_the_cleanup(self):
+        from libzfseasy.zfs import _command_label
+        assert _command_label(['zfs']) == 'zfs'
+        assert _command_label([]) == 'command'
+        assert _command_label(None) == 'command'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_sigkill_that_works_is_not_an_abandon(self, mock_subprocess, monkeypatch, caplog):
+        """The escalation path as before: SIGTERM ignored, SIGKILL reaps. wait: timed, timed, final unbounded
+        (3 calls), no WARNING."""
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.05)
+        process = self._interrupted_process()
+        process.wait.side_effect = [subprocess.TimeoutExpired(cmd='zfs', timeout=0.05), 0, 0]
+        mock_subprocess.return_value = process
+
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(KeyboardInterrupt):
+                Command._exec(['zfs', 'set', 'a=b', 'tank'])
+
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        assert process.wait.call_count == 3
+        assert process.wait.call_args_list[2] == call()
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('where', ['set', 'destroy', 'create'])
+    def test_an_interrupt_during_a_write_command_terminates_the_child(self, mock_subprocess, where, sample_pool):
+        """Before D3 `_exec` left the child running when the caller was interrupted; now every write command
+        terminates and reaps it before the KeyboardInterrupt propagates."""
+        process = self._interrupted_process()
+        process.wait.return_value = -15
+        mock_subprocess.return_value = process
+        fs = Filesystem(f'{sample_pool}/filesystem')
+
+        with pytest.raises(KeyboardInterrupt):
+            if where == 'set':
+                SetCommand()(fs, {'compression': 'lz4'})
+            elif where == 'destroy':
+                DestroyCommand().dataset(fs, destroy=True)
+            else:
+                CreateCommand().filesystem(f'{sample_pool}/newfs')
+
+        process.terminate.assert_called_once()
+        assert process.wait.called
+        process.kill.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_interrupt_after_the_child_exited_does_not_signal_it(self, mock_subprocess):
+        process = self._interrupted_process()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        mock_subprocess.return_value = process
+        with pytest.raises(KeyboardInterrupt):
+            Command._exec(['zfs', 'set', 'a=b', 'tank'])
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_failing_start_of_the_stderr_reader_still_reaps_the_child(self, mock_subprocess, monkeypatch):
+        """The reader is started inside the `try`: if starting its thread fails (or is interrupted) the child that
+        was already spawned is terminated and reaped, not leaked."""
+        process = MagicMock()
+        process.pid = 5
+        process.poll.return_value = None
+        process.wait.return_value = -15
+        mock_subprocess.return_value = process
+
+        def boom(*_args):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(Command, '_start_stderr_reader_lines', staticmethod(boom))
+        with pytest.raises(KeyboardInterrupt):
+            Command._exec(['zfs', 'set', 'a=b', 'tank'])
+        process.terminate.assert_called_once()
+        assert process.wait.called
+
+
+_BIG_ONE_LINE_STDERR = '''
+import sys
+for i in range(20):
+    sys.stderr.write("e" * 10000); sys.stderr.flush()
+    sys.stdout.write(("row %d " % i + "o" * 1000 + "\\n") * 20); sys.stdout.flush()
+sys.stderr.write("\\n"); sys.stderr.flush()
+sys.exit(4)
+'''
+
+_BIG_MANY_LINES_STDERR = '''
+import sys
+for i in range(2000):
+    sys.stderr.write("warn %d " % i + "e" * 100 + "\\n"); sys.stderr.flush()
+    if i % 10 == 0:
+        sys.stdout.write(("row %d " % i + "o" * 1000 + "\\n") * 5); sys.stdout.flush()
+sys.exit(1)
+'''
+
+
+@pytest.fixture
+def interrupt_on_start(real_child, monkeypatch):
+    """Arm a SIGALRM timer, from inside `Command._exec_lines`'s `try` (right after the stderr reader started), whose
+    handler raises KeyboardInterrupt in the main thread: a real signal-driven interrupt at a deterministic point.
+    `arm(ready_file=None, delay=0.3, second_after=None)`; with `ready_file` the handler waits for that file to exist
+    (the child's signal that it is ready to ignore SIGTERM) before it raises; with `second_after` it raises a
+    second KeyboardInterrupt that many seconds after the first (i.e. while the cleanup is waiting for the child)."""
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip('a signal-driven interrupt needs the main thread')
+    state = {'old': signal.getsignal(signal.SIGALRM), 'fired': None, 'second': None}
+
+    def arm(ready_file=None, delay=0.3, second_after=None):
+        inner = Command._start_stderr_reader_lines
+
+        def handler(signum, frame):
+            if ready_file is not None and not os.path.exists(ready_file):
+                signal.setitimer(signal.ITIMER_REAL, 0.05)
+                return
+            if state['fired'] is None:
+                state['fired'] = time.monotonic()
+                if second_after is not None:
+                    signal.setitimer(signal.ITIMER_REAL, second_after)
+            else:
+                state['second'] = time.monotonic()
+            raise KeyboardInterrupt()
+
+        def start(process, errors):
+            thread = inner(process, errors)
+            signal.signal(signal.SIGALRM, handler)
+            signal.setitimer(signal.ITIMER_REAL, delay)
+            return thread
+
+        monkeypatch.setattr(Command, '_start_stderr_reader_lines', staticmethod(start))
+
+    safety = threading.Timer(40, real_child.kill_all)       # a regression that hangs the cleanup fails, not hangs
+    safety.daemon = True
+    safety.start()
+    yield arm, state
+    safety.cancel()
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, state['old'])
+
+
+_IGNORE_SIGTERM_CHILD = (
+    'import signal, sys, time\n'
+    'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+    'open(sys.argv[1], "w").close()\n'
+    'time.sleep(120)\n'
+)
+
+
+class TestExecCoreRealChildren:
+    """D3 against REAL children (`sys.executable`, no pool): only real pipes and real signals can prove what the
+    mocked `TestExecCoreCleanupMocked` assumes. Every run is bounded by a watchdog or by the patched
+    `_TERMINATE_TIMEOUT`, so a regression fails instead of hanging."""
+
+    # -- bytes in, text out --------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', ['_exec_out', '_exec_lines'])
+    def test_invalid_utf8_on_stdout_survives_as_surrogates_and_r_stays_inside_the_line(self, real_child, entry):
+        script = ('import sys\n'
+                  'sys.stdout.buffer.write(b"a\\rb \\xff\\n"); sys.stdout.flush()\n')
+        result, exc = real_child.run(lambda: _drive(entry, real_child.cmd(script)))
+        assert exc is None
+        assert result == ['a\rb \udcff']
+        assert real_child.procs[0].returncode == 0
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_discards_invalid_utf8_stdout_without_raising(self, real_child):
+        script = 'import sys\nsys.stdout.buffer.write(b"\\xff\\xfe\\n" * 100); sys.stdout.flush()\n'
+        result, exc = real_child.run(lambda: _drive('_exec', real_child.cmd(script)))
+        assert exc is None and result == []
+        assert real_child.procs[0].returncode == 0
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    def test_invalid_utf8_on_stderr_is_replaced_in_the_error_text(self, real_child, entry):
+        script = ('import sys\n'
+                  'sys.stderr.buffer.write(b"bad \\xff\\xfe thing\\n"); sys.stderr.flush()\n'
+                  'sys.stdout.buffer.write(b"out \\xff\\n"); sys.stdout.flush()\n'
+                  'sys.exit(3)\n')
+        _, exc = real_child.run(lambda: _drive(entry, real_child.cmd(script)))
+        assert isinstance(exc, Exception)
+        assert str(exc) == 'Bad �� thing'
+        assert real_child.procs[0].returncode == 3
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_out_strips_crlf_and_drops_lone_cr_lines_but_keeps_an_inner_cr(self, real_child):
+        script = ('import sys\n'
+                  'sys.stdout.buffer.write(b"keep\\rinside\\nclean\\r\\n\\r\\n   \\nlast\\n\\r"); sys.stdout.flush()\n')
+        rows, exc = real_child.run(lambda: _drive('_exec_out', real_child.cmd(script)))
+        assert exc is None
+        assert rows == ['keep\rinside', 'clean', 'last']          # '\r' never splits; blank and lone-'\r' dropped
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_lines_keeps_every_line_exactly(self, real_child):
+        script = ('import sys\n'
+                  'sys.stdout.buffer.write(b"keep\\rinside\\nclean\\r\\n\\r\\n\\nlast\\n\\r"); sys.stdout.flush()\n')
+        rows, exc = real_child.run(lambda: _drive('_exec_lines', real_child.cmd(script)))
+        assert exc is None
+        assert rows == ['keep\rinside', 'clean\r', '\r', '', 'last', '\r']
+
+    # -- big stderr ------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    def test_200kb_single_line_of_stderr_with_large_stdout_finishes_and_raises(self, real_child, entry):
+        rows = []
+        _, exc = real_child.run(lambda: _drive(entry, real_child.cmd(_BIG_ONE_LINE_STDERR), rows))
+        assert isinstance(exc, Exception)
+        text = str(exc)
+        # read 64 KiB at a time: 3 x 65536 + 3392 characters, rejoined by 3 newlines
+        assert len(text) == 200003
+        assert text.count('\n') == 3
+        assert text.startswith('E' + 'e' * 100)                  # only the first piece is capitalised
+        if entry != '_exec':
+            assert len(rows) == 400 and rows[0].startswith('row 0 ooo') and rows[-1].startswith('row 19 ooo')
+        assert real_child.procs[0].returncode == 4
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    def test_many_stderr_lines_are_capped_with_an_omitted_marker(self, real_child, entry):
+        rows = []
+        _, exc = real_child.run(lambda: _drive(entry, real_child.cmd(_BIG_MANY_LINES_STDERR), rows))
+        assert isinstance(exc, Exception)
+        lines = str(exc).split('\n')
+        assert len(lines) == 401                                  # 200 head + marker + 200 tail
+        assert lines[0].startswith('Warn 0 eee') and lines[199].startswith('warn 199 eee')
+        assert lines[200] == '... 1600 lines omitted ...'
+        assert lines[201].startswith('warn 1800 eee') and lines[-1].startswith('warn 1999 eee')
+        if entry != '_exec':
+            assert len(rows) == 1000
+        assert real_child.procs[0].returncode == 1
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+
+    # -- a real interrupt --------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    def test_a_keyboard_interrupt_terminates_and_reaps_the_child(self, real_child, interrupt_on_start, entry):
+        arm, _state = interrupt_on_start
+        arm()
+        script = ('import sys, time\n'
+                  'sys.stderr.write("noise\\n"); sys.stderr.flush()\n'
+                  'time.sleep(120)\n')
+        started = time.monotonic()
+        with pytest.raises(KeyboardInterrupt):
+            _drive(entry, real_child.cmd(script))
+        assert time.monotonic() - started < 15
+
+        proc = real_child.procs[0]
+        assert proc.returncode == -signal.SIGTERM
+        assert real_child.stderr_threads and not any(t.is_alive() for t in real_child.stderr_threads)
+        with pytest.raises(ProcessLookupError):                   # reaped, not a zombie
+            os.kill(proc.pid, 0)
+        self._assert_no_session_orphan(proc.pid)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    def test_a_keyboard_interrupt_kills_a_child_that_ignores_sigterm(self, real_child, interrupt_on_start,
+                                                                     monkeypatch, tmp_path, entry):
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.5)
+        ready = tmp_path / 'ready'
+        arm, state = interrupt_on_start
+        arm(ready_file=str(ready))
+        cmd = [sys.executable, '-c', _IGNORE_SIGTERM_CHILD, str(ready)]
+
+        with pytest.raises(KeyboardInterrupt):
+            _drive(entry, cmd)
+        done = time.monotonic()
+
+        proc = real_child.procs[0]
+        assert ready.exists()                                     # SIGTERM was already being ignored
+        assert proc.returncode == -signal.SIGKILL
+        assert 0.4 <= done - state['fired'] < 10                  # about the patched bound, not 120 s
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+        with pytest.raises(ProcessLookupError):
+            os.kill(proc.pid, 0)
+        self._assert_no_session_orphan(proc.pid)
+
+    @staticmethod
+    def _assert_no_session_orphan(pid):
+        from tests._hermetic import find_orphans
+        marker = os.environ.get('ZFSB_TEST_SESSION')
+        if not marker:
+            pytest.skip('no test-session marker in this run')
+        assert pid not in [o[0] for o in find_orphans(marker, grace=1.0, fork_dir=None)]
+
+    # -- the explicit close: an exception's traceback keeps the suspended generator (and its child) alive ---------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_reaps_the_child_while_the_interrupt_traceback_is_held(self, real_child, monkeypatch):
+        """An interrupt that lands in `_exec`'s own loop (between two resumptions of `_exec_lines`, not inside it)
+        leaves the generator suspended; the traceback keeps `_exec`'s frame, and so the generator, alive for as long
+        as the caller holds the exception. `_exec` must close it explicitly: the child is reaped by the time the
+        exception arrives, not whenever the traceback is dropped."""
+        real = Command._exec_lines
+
+        class Tripwire:
+            """The real `_exec_lines`, except that the second `next()` raises, in the caller's frame."""
+            def __init__(self, gen):
+                self.gen, self.calls = gen, 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.calls += 1
+                if self.calls == 2:
+                    raise KeyboardInterrupt()
+                return next(self.gen)
+
+            def close(self):
+                self.gen.close()
+
+        monkeypatch.setattr(Command, '_exec_lines', staticmethod(lambda cmd: Tripwire(real(cmd))))
+        script = 'import time\nprint("first", flush=True)\ntime.sleep(120)\n'
+        held = None
+        try:
+            Command._exec(real_child.cmd(script))
+        except KeyboardInterrupt as exc:
+            held = exc
+        assert held is not None and held.__traceback__ is not None       # still referenced below
+
+        proc = real_child.procs[0]
+        assert proc.returncode == -signal.SIGTERM
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_out_reaps_the_child_while_a_thrown_exception_is_held(self, real_child):
+        """The same for `_exec_out`: an exception thrown in at the `yield` leaves through its `finally`, which must
+        close the inner generator even though the exception's traceback still references the frame."""
+        script = 'import time\nprint("first", flush=True)\ntime.sleep(120)\n'
+        gen = Command._exec_out(real_child.cmd(script))
+        assert next(gen) == 'first'
+        held = None
+        try:
+            gen.throw(RuntimeError('boom'))
+        except RuntimeError as exc:
+            held = exc
+        assert held is not None and held.__traceback__ is not None
+
+        proc = real_child.procs[0]
+        assert proc.returncode == -signal.SIGTERM
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+
+    # -- review follow-ups: a second interrupt, an interrupt before the loop, the eager destroy ---------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    def test_a_second_interrupt_during_the_cleanup_wait_kills_a_sigterm_ignoring_child(
+            self, real_child, interrupt_on_start, monkeypatch, tmp_path, entry):
+        """F1 with a real signal: the child ignores SIGTERM, so the first interrupt's cleanup waits (here up to 5 s);
+        a second KeyboardInterrupt arrives 0.4 s into that wait. It propagates at once, and the child has been sent
+        SIGKILL on the way out (not left running for 120 s)."""
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 5)
+        ready = tmp_path / 'ready'
+        arm, state = interrupt_on_start
+        arm(ready_file=str(ready), second_after=0.4)
+
+        with pytest.raises(KeyboardInterrupt):
+            _drive(entry, [sys.executable, '-c', _IGNORE_SIGTERM_CHILD, str(ready)])
+        left = time.monotonic()
+
+        assert state['second'] is not None                       # the second interrupt is what ended the call
+        assert left - state['fired'] < 3                         # not the full bounded wait
+        proc = real_child.procs[0]
+        proc.wait(timeout=10)                                    # the SIGKILL was sent: it dies without any help
+        assert proc.returncode == -signal.SIGKILL
+        with pytest.raises(ProcessLookupError):
+            os.kill(proc.pid, 0)
+        self._assert_no_session_orphan(proc.pid)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    def test_an_interrupt_while_the_stderr_reader_starts_reaps_the_child(self, real_child, monkeypatch, entry):
+        """F2: the reader start is inside the `try`, so the already spawned real child is terminated and reaped."""
+        real_start = Command._start_stderr_reader_lines
+
+        def start_then_interrupt(process, errors):
+            real_start(process, errors)
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(Command, '_start_stderr_reader_lines', staticmethod(start_then_interrupt))
+        with pytest.raises(KeyboardInterrupt):
+            _drive(entry, real_child.cmd('import time\ntime.sleep(120)\n'))
+
+        proc = real_child.procs[0]
+        assert proc.returncode == -signal.SIGTERM
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+        with pytest.raises(ProcessLookupError):
+            os.kill(proc.pid, 0)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('raw', [False, True])
+    def test_exec_collect_reaps_a_real_child_when_the_reader_start_is_interrupted(self, real_child, monkeypatch, raw):
+        real_start = Command._start_stderr_reader_lines
+
+        def start_then_interrupt(process, errors):
+            real_start(process, errors)
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(Command, '_start_stderr_reader_lines', staticmethod(start_then_interrupt))
+        if raw:
+            real_thread = threading.Thread
+
+            class Thread(real_thread):
+                def start(self):
+                    super().start()
+                    raise KeyboardInterrupt()
+
+            monkeypatch.setattr('libzfseasy.zfs.threading', MagicMock(Thread=Thread))
+        with pytest.raises(KeyboardInterrupt):
+            Command._exec_collect(real_child.cmd('import time\ntime.sleep(120)\n'), raw_stderr=raw)
+
+        proc = real_child.procs[0]
+        assert proc.returncode == -signal.SIGKILL
+        with pytest.raises(ProcessLookupError):
+            os.kill(proc.pid, 0)
+
+    @staticmethod
+    def _tripwire_exec_out(monkeypatch, real_child, level='source'):
+        """Replace `Command._exec_out` by a wrapper around the REAL `_exec_out` of a real child that prints one
+        destroy line and sleeps; its second `next()` raises KeyboardInterrupt in the *caller's* frame (the eager
+        destroy comprehension), not inside the generator."""
+        real = Command._exec_out
+        script = 'import time\nprint("destroy\\ttank/x", flush=True)\ntime.sleep(120)\n'
+
+        class Tripwire:
+            def __init__(self, gen):
+                self.gen, self.calls = gen, 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.calls += 1
+                if self.calls == 2:
+                    raise KeyboardInterrupt()
+                return next(self.gen)
+
+            def close(self):
+                self.gen.close()
+
+        if level == 'source':
+            monkeypatch.setattr(Command, '_exec_out', staticmethod(lambda cmd: Tripwire(real(real_child.cmd(script)))))
+        else:
+            real_lines = DestroyCommand._destroy_lines
+            monkeypatch.setattr(Command, '_exec_out', staticmethod(lambda cmd: real(real_child.cmd(script))))
+            monkeypatch.setattr(DestroyCommand, '_destroy_lines', staticmethod(lambda src: Tripwire(real_lines(src))))
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('level', ['source', 'result'])
+    @pytest.mark.parametrize('what', ['dataset', 'snapshots'])
+    def test_an_interrupt_in_the_eager_destroy_comprehension_reaps_the_child(self, real_child, monkeypatch, what,
+                                                                             level):
+        """F3: the eager `destroy.dataset/snapshots` close their generators in a `finally`; with the exception (and
+        so the `dataset()` frame) still referenced, the child is nevertheless already reaped. `level` is where the
+        interrupt is raised: inside `_destroy_lines` while it pulls from `_exec_out` ('source': that generator's own
+        `finally` ends it) or in the comprehension itself, between two items of `_destroy_lines` ('result': only the
+        explicit closes in `dataset`/`snapshots` end the suspended generators)."""
+        self._tripwire_exec_out(monkeypatch, real_child, level)
+        fs = Filesystem('tank/x')
+        held = None
+        try:
+            if what == 'dataset':
+                DestroyCommand().dataset(fs, destroy=True)
+            else:
+                DestroyCommand().snapshots([Snapshot(fs, 's1')], destroy=True)
+        except KeyboardInterrupt as exc:
+            held = exc
+        assert held is not None and held.__traceback__ is not None
+
+        proc = real_child.procs[0]
+        assert proc.returncode == -signal.SIGTERM
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_abandoned_lazy_destroy_reaps_the_child(self, real_child):
+        script = 'import time\nprint("destroy\\ttank/x", flush=True)\ntime.sleep(120)\n'
+        real = Command._exec_out
+        gen = None
+        try:
+            Command._exec_out = staticmethod(lambda cmd: real(real_child.cmd(script)))
+            gen = DestroyCommand().dataset(Filesystem('tank/x'), destroy=True, lazy=True)
+        finally:
+            Command._exec_out = real
+        assert next(gen) == 'tank/x'
+        proc = real_child.procs[0]
+        assert proc.returncode is None
+        gen.close()
+        gen = None
+        import gc
+        gc.collect()
+        assert proc.returncode == -signal.SIGTERM
+
+    # -- an abandoned generator ------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('how', ['close', 'del-gc'])
+    @pytest.mark.parametrize('entry', ['_exec_out', '_exec_lines'])
+    def test_an_abandoned_generator_reaps_the_child(self, real_child, entry, how):
+        script = 'import sys, time\nprint("first", flush=True)\ntime.sleep(120)\n'
+        gen = getattr(Command, entry)(real_child.cmd(script))
+        assert next(gen) == 'first'
+        proc = real_child.procs[0]
+        assert proc.returncode is None
+
+        if how == 'close':
+            gen.close()
+        else:
+            def drop():
+                nonlocal gen
+                gen = None
+                import gc
+                gc.collect()
+            _, exc = real_child.run(drop)
+            assert exc is None
+
+        assert proc.returncode == -signal.SIGTERM
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+        with pytest.raises(ProcessLookupError):
+            os.kill(proc.pid, 0)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('how', ['close', 'del-gc'])
+    def test_an_abandoned_exec_out_kills_a_child_that_ignores_sigterm(self, real_child, monkeypatch, how):
+        monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.5)
+        script = ('import signal, sys, time\n'
+                  'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                  'print("ready", flush=True)\n'
+                  'time.sleep(120)\n')
+        gen = Command._exec_out(real_child.cmd(script))
+        assert next(gen) == 'ready'
+        proc = real_child.procs[0]
+
+        def drop():
+            nonlocal gen
+            if how == 'close':
+                gen.close()
+            gen = None
+            import gc
+            gc.collect()
+
+        _, exc = real_child.run(drop, timeout=30)
+
+        assert exc is None
+        assert proc.returncode == -signal.SIGKILL
+        assert not any(t.is_alive() for t in real_child.stderr_threads)
+        with pytest.raises(ProcessLookupError):
+            os.kill(proc.pid, 0)
 
 
 class TestSpacesInsideNames:
@@ -2406,16 +3393,18 @@ class TestGetLinesToObjectsNameChange:
     @pytest.mark.subprocess
     def test_end_to_end_through_get(self, mock_subprocess):
         # (names must be in scope of the requested root: B2 drops rows zfs's own iteration cannot have printed)
-        # (an explicit property list: zfs opens every object with its `name` and `type` rows; `a` has no
-        # `compression` row here, which is all the test needs to see the properties stay with their own object)
+        # (an explicit property list: zfs prints every object's `name`, `type` and each requested property, in that
+        # order; `a`'s `compression` is `default`, which `sources=['local']` filters out in the parser, so the test
+        # still sees the properties stay with their own object)
         mock_subprocess.setup(stdout=[
             'testpool/a\tname\ttestpool/a\t-\t-\n',
             'testpool/a\ttype\tfilesystem\t-\t-\n',
+            'testpool/a\tcompression\toff\t-\tdefault\n',
             'testpool/a/b\tname\ttestpool/a/b\t-\t-\n',
             'testpool/a/b\ttype\tvolume\t-\t-\n',
             'testpool/a/b\tcompression\tgzip\t-\tlocal\n',
         ])
-        result = GetCommand()(Filesystem('testpool/a'), properties='compression', recursive=True)
+        result = GetCommand()(Filesystem('testpool/a'), properties='compression', recursive=True, sources=['local'])
         assert [r.name for r in result] == ['testpool/a', 'testpool/a/b']
         assert result[0]['compression'] is None
         assert result[1]['compression'].value == 'gzip'
@@ -2580,6 +3569,45 @@ class TestListLenientColumns:
         assert fs['atime'].value == 'on'
 
 
+class TestGetExplicitPropertySequence:
+    """An explicit property list is answered with `name`, `type` and each requested property, once, in that order
+    (the full matrix, `rows()` included, is `TestGetExplicitSequence` in tests/test_framing.py)."""
+
+    @staticmethod
+    def _rows(name, props):
+        return ['%s\t%s\t%s\t-\t%s\n' % (name, p, v, s) for p, v, s in
+                [('name', name, '-'), ('type', 'filesystem', '-')] + props]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_the_requested_sequence_with_a_repeat_in_the_request_is_accepted(self, mock_subprocess, lazy):
+        mock_subprocess.setup(stdout=self._rows('testpool/a', [('compression', 'lz4', 'local'),
+                                                               ('atime', 'on', 'default')]))
+        result = list(GetCommand()(Filesystem('testpool/a'), properties=['compression', 'atime', 'compression'],
+                                   lazy=lazy))
+        assert _argv(mock_subprocess)[-2:] == ['name,type,compression,atime', 'testpool/a']
+        assert [(r.name, r['compression'].value, r['atime'].value) for r in result] == [('testpool/a', 'lz4', 'on')]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    @pytest.mark.parametrize('shape,rows', [
+        ('missing', [('compression', 'lz4', 'local')]),
+        ('reordered', [('atime', 'on', 'default'), ('compression', 'lz4', 'local')]),
+        ('unrequested', [('compression', 'lz4', 'local'), ('atime', 'on', 'default'), ('used', '1K', '-')]),
+    ])
+    def test_anything_else_refuses_the_object_and_keeps_its_neighbour(self, mock_subprocess, caplog, lazy, shape, rows):
+        mock_subprocess.setup(stdout=self._rows('testpool/a', rows) + self._rows(
+            'testpool/b', [('compression', 'gzip', 'local'), ('atime', 'off', 'local')]))
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            result = list(GetCommand()(Filesystem('testpool'), properties=['compression', 'atime'], recursive=True,
+                                       lazy=lazy))
+        assert [r.name for r in result] == ['testpool/b']
+        assert result[0]['compression'].value == 'gzip'
+        assert len(_skip_warnings(caplog)) == 1
+
+
 class TestGetSkipsInvalidNames:
 
     @staticmethod
@@ -2648,29 +3676,43 @@ class TestGetSkipsInvalidNames:
         assert [r.name for r in result] == ['pool/a', 'pool/a/c']
         assert [r['compression'].value for r in result] == ['lz4', 'zstd']
         lazy_lines = [line + '\n' for line in
-                      self._rows('pool/a/.system', explicit=True) + self._rows('pool/a/c', 'volume', explicit=True)]
+                      self._rows('pool/a/.system', compression='off', explicit=True) +
+                      self._rows('pool/a/c', 'volume', compression='zstd', explicit=True)]
         mock_subprocess.setup(stdout=lazy_lines)
         lazy = GetCommand()(Filesystem('pool/a'), properties='compression', recursive=True, lazy=True)
         assert [r.name for r in lazy] == ['pool/a/c']
 
 
 class TestSkipInvalidNameWarning:
-    """One WARNING per distinct name per process on the 'libzfseasy' logger, bounded by _MAX_WARNED_NAMES."""
+    """One per-name WARNING per distinct name per process on the 'libzfseasy' logger, bounded by _MAX_WARNED_NAMES.
+
+    A listing that logged a per-name WARNING also logs one summary line ("skipped N name(s) libzfseasy cannot
+    represent in zfs <cmd> output"); these tests count the per-name records, so `_names_only` drops the summary."""
 
     @staticmethod
     def _list(mock_subprocess, *names):
         mock_subprocess.setup(stdout=[n + '\tfilesystem\n' for n in names] + ['pool/ok\tfilesystem\n'])
         return ListCommand()()
 
+    @staticmethod
+    def _names_only(caplog):
+        return [m for m in _skip_warnings(caplog) if not m.startswith('skipped ')]
+
+    @staticmethod
+    def _summaries(caplog, level=logging.WARNING):
+        return [r.getMessage() for r in caplog.records
+                if r.name == 'libzfseasy' and r.levelno == level and r.getMessage().startswith('skipped ')]
+
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_message_names_the_row_and_the_reason(self, mock_subprocess, warned_names, caplog):
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
             self._list(mock_subprocess, 'pool/.system')
-        (message,) = _skip_warnings(caplog)
+        (message,) = self._names_only(caplog)
         assert 'skipping' in message
         assert 'pool/.system' in message
         assert 'cannot represent' in message
+        assert self._summaries(caplog) == ['skipped 1 name libzfseasy cannot represent in zfs list output']
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -2679,17 +3721,19 @@ class TestSkipInvalidNameWarning:
             self._list(mock_subprocess, 'pool/.system')
             self._list(mock_subprocess, 'pool/.system')
             self._list(mock_subprocess, 'pool/.system')
-        assert len(_skip_warnings(caplog)) == 1
+        assert len(self._names_only(caplog)) == 1
+        assert len(self._summaries(caplog)) == 1        # the repeats are summarised at DEBUG
 
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_distinct_names_each_warn(self, mock_subprocess, warned_names, caplog):
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
             self._list(mock_subprocess, 'pool/.system', 'pool/-x', 'pool/a ')
-        messages = _skip_warnings(caplog)
+        messages = self._names_only(caplog)
         assert len(messages) == 3
         for name in ('pool/.system', 'pool/-x', 'pool/a '):
             assert sum(name in m for m in messages) == 1
+        assert self._summaries(caplog) == ['skipped 3 names libzfseasy cannot represent in zfs list output']
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -2697,7 +3741,7 @@ class TestSkipInvalidNameWarning:
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
             self._list(mock_subprocess, 'pool/.system')
             list(GetCommand._lines_to_objects(iter(['pool/.system\ttype\tfilesystem\t-\t-']), ['all']))
-        assert len(_skip_warnings(caplog)) == 1
+        assert len(self._names_only(caplog)) == 1
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -2714,13 +3758,15 @@ class TestSkipInvalidNameWarning:
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
             self._list(mock_subprocess, 'pool/.a', 'pool/.b', 'pool/.c', 'pool/.d')
             self._list(mock_subprocess, 'pool/.e', 'pool/.a')
-        messages = _skip_warnings(caplog)
+        messages = self._names_only(caplog)
         assert sum('pool/.a' in m for m in messages) == 1
         assert sum('pool/.b' in m for m in messages) == 1
         assert not any(n in m for m in messages for n in ('pool/.c', 'pool/.d', 'pool/.e'))
         assert sum('further ones are skipped silently' in m for m in messages) == 1
         assert len(messages) == 3
         assert len(warned_names._warned_names) <= 3      # two names plus the one overflow sentinel
+        # The first listing logged per-name WARNINGs (and counts all four of its names); the second logged none.
+        assert self._summaries(caplog) == ['skipped 4 names libzfseasy cannot represent in zfs list output']
 
 
 class TestListNewNativeProperties:
@@ -3049,7 +4095,7 @@ class TestExecCollect:
         process = MagicMock()
         process.stdout.readline.side_effect = ['partial\n', KeyboardInterrupt()]
 
-        def blocked_stderr_read():
+        def blocked_stderr_read(*_limit):
             release.wait(timeout=10)       # bounded: a regression fails the join check instead of hanging
             return ''
 
@@ -3066,6 +4112,7 @@ class TestExecCollect:
         process.kill.assert_called_once()
         process.wait.assert_called()
         assert release.is_set()
+        _wait_for_thread_count(before)
         assert threading.active_count() == before     # the stderr reader was joined, not abandoned
 
     @pytest.mark.unit
@@ -3432,6 +4479,7 @@ class TestExecCollectRawStderr:
         with pytest.raises(KeyboardInterrupt):
             Command._exec_collect(['zfs', 'x'], raw_stderr=True)
         process.kill.assert_called_once()
+        _wait_for_thread_count(before)
         assert threading.active_count() == before
 
 
@@ -3601,8 +4649,16 @@ class TestExecCollectRobustness:
         assert exc is None
         lines, errors, rc = result
         assert lines == ['done'] and rc == 2
-        assert len(errors) == 401
-        assert len(errors[-1]) == 300000
+        assert len(errors) == 401                       # 200 head + the omitted-lines marker + 200 tail, either way
+        if raw:
+            assert len(errors[-1]) == 300000
+            assert errors[200] == '... 1 lines omitted ...'
+        else:
+            # The non-raw reader reads at most _STDERR_MAX_LINE (64 KiB) at a time, so the 300000-char line arrives as
+            # five pieces (4 x 65536 + 37856): 405 lines in all, the oldest 5 collapsed into the marker.
+            assert [len(e) for e in errors[-5:]] == [65536] * 4 + [37856]
+            assert errors[200] == '... 5 lines omitted ...'
+            assert sum(len(e) for e in errors[-5:]) == 300000
         assert real_child.procs[0].returncode == 2
 
     @pytest.mark.unit
@@ -4053,6 +5109,16 @@ class TestDestroyEmptySnapshotList:
 
     @pytest.mark.unit
     @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['eager', 'lazy'])
+    def test_an_empty_generator_is_refused_like_an_empty_list(self, mock_subprocess, lazy):
+        with pytest.raises(ValueError, match='at least one'):
+            DestroyCommand.snapshots((s for s in []), destroy=True, lazy=lazy)
+        with pytest.raises(ValueError, match='at least one'):
+            DestroyCommand.snapshots(iter(()), destroy=True, lazy=lazy)
+        assert mock_subprocess.call_count == 0
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
     def test_a_one_element_iterator_still_runs(self, mock_subprocess, sample_snapshot):
         mock_subprocess.setup(stdout=['destroy\ttestpool/filesystem@snap1\n'])
         assert DestroyCommand.snapshots(iter([sample_snapshot]), destroy=True) == ['testpool/filesystem@snap1']
@@ -4114,7 +5180,10 @@ _GET_ROWS = [
     'testpool/filesystem@s\tname\ttestpool/filesystem@s\t-\t-\n',
     'testpool/filesystem@s\ttype\tsnapshot\t-\t-\n',
     'testpool/filesystem@s\tcompression\tlz4\t-\tlocal\n',
+    'testpool/filesystem@s\tquota\t-\t-\t-\n',
 ]
+# What zfs prints for `-o name,type,compression` (D5 follow-up: every requested property, in order, and nothing else).
+_GET_ROWS_COMPRESSION = [r for r in _GET_ROWS if '\tquota\t' not in r]
 
 
 class TestOneShotIterables:
@@ -4169,7 +5238,7 @@ class TestOneShotIterables:
     @pytest.mark.subprocess
     @_ONE_SHOT
     def test_get_one_shot_types_and_the_wanted_filter(self, mock_subprocess, make):
-        mock_subprocess.setup(stdout=list(_GET_ROWS))
+        mock_subprocess.setup(stdout=list(_GET_ROWS_COMPRESSION))
         result = GetCommand()(ds=Filesystem('testpool/filesystem'), properties=['compression'],
                               types=make(['filesystem', 'volume']))
         argv = _argv(mock_subprocess)
@@ -4193,7 +5262,7 @@ class TestOneShotIterables:
     @pytest.mark.subprocess
     @_ONE_SHOT
     def test_get_one_shot_types_lazy(self, mock_subprocess, make):
-        mock_subprocess.setup(stdout=list(_GET_ROWS))
+        mock_subprocess.setup(stdout=list(_GET_ROWS_COMPRESSION))
         result = list(GetCommand()(ds=Filesystem('testpool/filesystem'), properties=['compression'],
                                    types=make(['filesystem']), lazy=True))
         assert '-t' in _argv(mock_subprocess) and 'filesystem' in _argv(mock_subprocess)
@@ -4315,9 +5384,10 @@ LEADING_NOISE = [pytest.param([], id='no-blank'),
 
 
 class TestStderrFirstLineOnlyTextReaders:
-    """The text stderr readers (`_start_stderr_reader`, `_start_stderr_reader_lines`) capitalise only the first
-    collected line. Mutation check: per-line capitalisation restored in `_start_stderr_reader` fails the `_exec`,
-    `_exec_out` and `_exec_collect` tests below (the `_exec_lines` ones live in test_framing.py)."""
+    """The text stderr readers (`_start_stderr_reader_lines`, `_start_stderr_reader_bin`) capitalise only the first
+    collected line. Mutation check: per-line capitalisation restored in `_start_stderr_reader_lines` fails the `_exec`,
+    `_exec_out` and `_exec_collect` tests below (`_exec` and `_exec_out` are layers over `_exec_lines` since D3; the
+    `_exec_lines` ones live in test_framing.py)."""
 
     @staticmethod
     def _stderr(noise):

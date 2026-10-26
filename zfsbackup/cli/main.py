@@ -18,6 +18,10 @@ Commands:
 - `import YAML`  -- replace the stored configuration with a YAML file.
 - `export`       -- print the stored configuration as YAML.
 - `migrate`      -- bring the database schema up to this version.
+- `check [--json|--prometheus|--nagios] [--output FILE]` -- is the backup healthy?
+  (`check.py`; read-only: `zfs list`/`zfs get`, no lock, never signals.)
+- `backup DIR [--no-keys]` -- a consistent backup of the database and the TLS
+  identities (`backup.py`; no lock, never signals the daemon).
 - `list datasets|destinations` -- read-only tables (`listing.py`).
 - `get PATH` / `set PATH VALUE` / `unset PATH` -- one setting at a time
   (`dotpath.py`).
@@ -67,8 +71,8 @@ import click
 import yaml
 
 from zfsbackup import daemonlock
-from zfsbackup.cli import dotpath, editor, enroll, rename, status as status_view, trust
-from zfsbackup.cli.errors import BackupFailed, CliError, is_database_unusable, report
+from zfsbackup.cli import backup, check as check_view, dotpath, editor, enroll, rename, status as status_view, trust
+from zfsbackup.cli.errors import BackupFailed, CliError, RetryLater, is_database_unusable, report
 from zfsbackup.cli.listing import render_datasets, render_destinations
 from zfsbackup.cli.render import render_yaml
 from zfsbackup.cli.write import (
@@ -90,6 +94,7 @@ from zfsbackup.config.store import (
     SchemaError,
     SchemaOutOfDate,
     check_config_schema,
+    check_migration_packaging,
     dispose_all,
     import_yaml,
     read_config,
@@ -169,6 +174,9 @@ class State:
     #: `--reload-wait`: seconds `notify_daemon` waits for the daemon's
     #: acknowledgement after a SIGHUP (0 = do not wait).
     reload_wait: float = DEFAULT_RELOAD_WAIT
+    #: `migrate` has reached the point where it may change the schema (set
+    #: under the writer lock): an interrupt then cannot say whether it did.
+    migrating: bool = False
     _restore_levels: Dict[str, int] = field(default_factory=dict, repr=False)
 
     def install_logging(self) -> None:
@@ -292,6 +300,14 @@ class _Group(click.Group):
                 # Say that once: keep what else the notes know (the backup's
                 # path, a skipped cleanup), drop their copy of the verdict.
                 notes = [n for n in map(_without_applied_claim, notes) if n]
+            elif state is not None and state.migrating:
+                # ^C can land before, inside or just after the schema commit.
+                where = where_flag(state.resolved) if state.resolved is not None else ""
+                click.echo(
+                    f"{word} -- the migration may or may not have been applied; "
+                    f"run `zfsbackup-config{where} migrate --check` to check",
+                    err=True,
+                )
             else:
                 click.echo(word, err=True)
             for note in notes:
@@ -340,6 +356,19 @@ def _check_seconds(ctx, param, value):
     return value
 
 
+def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+    """Eager `--version`: print the one version line and exit 0, before `-c` is
+    looked at, so it needs no database. `zfsbackup.version` is imported here,
+    not at module level, so ordinary invocations do not pay for it (its schema
+    head import is the heavy part)."""
+    if not value or ctx.resilient_parsing:
+        return
+    from zfsbackup.version import version_string
+
+    click.echo(version_string("zfsbackup-config"))
+    ctx.exit(0)
+
+
 # `type=str`, not `Path`: `str(Path("")) == "."` would turn `-c ""` into "the
 # current directory" and defeat `resolve_config_path`'s fallthrough to
 # $ZFSBACKUP_CONFIG (same reasoning as the daemon's `-c`).
@@ -354,6 +383,11 @@ def _check_seconds(ctx, param, value):
         "--reload-wait is a global option and goes BEFORE the subcommand, "
         "e.g. `zfsbackup-config --reload-wait 10 set check_interval 5m`."
     ),
+)
+@click.option(
+    "--version", is_flag=True, is_eager=True, expose_value=False,
+    callback=_print_version,
+    help="Show the version, wire protocol and config schema, and exit.",
 )
 @click.option(
     "-c", "--config", "config_path", default=None, metavar="DB",
@@ -750,15 +784,34 @@ def _write_in_place(output: str, target: str, text: str) -> None:
     "migrate",
     help=(
         "Bring the database schema up to the version this zfsbackup expects. "
-        "With --check, only report whether it is current (exit 1 if behind)."
+        "With --check, only report whether it is current (exit 1 if behind). "
+        "A schema that is behind is only migrated with the daemon stopped: "
+        "refused (exit 75) while a daemon or any of its workers run. "
+        "With --backup-dir DIR, a schema that is behind is first backed up "
+        "(see there)."
     ),
 )
 @click.option(
     "--check", is_flag=True, default=False,
     help="Do not change anything; exit 1 if the schema is behind.",
 )
+@click.option(
+    "--backup-dir", "backup_dir", default=None, metavar="DIR",
+    type=click.Path(file_okay=False, path_type=Path),
+    help=(
+        "Only when the schema is behind: first write a copy of the database "
+        "to DIR/config.db.pre-<revision>-<UTC time> (never overwritten; DIR is "
+        "created if missing), and migrate only if that succeeded (exit 1 "
+        "otherwise). An identical backup already in DIR (same revision, store id "
+        "and generation) is kept instead of writing another, so a start-up retry "
+        "loop cannot fill the disk. Nothing is written when the schema is "
+        "current. Does not back up the TLS keys (a migration does not touch them)."
+    ),
+)
 @_common
-def migrate_cmd(check: bool, config_path: Optional[str], verbose: bool) -> None:
+def migrate_cmd(
+    check: bool, backup_dir: Optional[Path], config_path: Optional[str], verbose: bool
+) -> None:
     state = _state(config_path, verbose)
     resolved = state.resolve()
 
@@ -782,16 +835,26 @@ def migrate_cmd(check: bool, config_path: Optional[str], verbose: bool) -> None:
     # revision (a tableless file: migrate cannot help, `import` can). Not a substitute for the check under the lock:
     # `upgrade_schema` repeats it inside its own transaction.
     try:
-        check_config_schema(resolved)
+        current = check_config_schema(resolved)
     except SchemaOutOfDate as exc:
         if not exc.recorded_revisions:
             raise
+    else:
+        if backup_dir is not None:
+            # Current: nothing to back up and nothing to migrate. No lock and
+            # no file written -- the unit runs this on every start.
+            click.echo(f"Schema is up to date (revision {current}).")
+            return
 
     # Serialise with `import` and every other write: the same writer lock they
     # take (a concurrent migrate that won the race reports `changed=False`).
     # `check_config_schema` above is also the preflight, so a missing database
     # leaves no lock file behind. `ConfigBusy` -> exit 75.
     with writer_lock(resolved):
+        _guard_and_backup_if_behind(resolved, backup_dir)
+        # Only from here can the schema change: an interrupt after this point
+        # cannot say whether it did (`_Group.invoke`); before it, nothing was.
+        state.migrating = True
         upgrade = upgrade_schema(resolved)
     if not upgrade.changed:
         click.echo(f"Schema is up to date (revision {upgrade.to_rev}).")
@@ -799,10 +862,56 @@ def migrate_cmd(check: bool, config_path: Optional[str], verbose: bool) -> None:
     before = ", ".join(upgrade.from_revs)
     click.echo(f"Migrated the schema of {resolved.resolved_path} from {before} to {upgrade.to_rev}.")
     click.echo(
-        "A daemon started before this upgrade must be restarted to run this schema "
-        "(until then it cannot apply any configuration change); one already running "
-        f"this version picks it up within {daemonlock.RELOAD_POLL_SECONDS}s."
+        "Start the daemon to run this schema (a daemon refuses to start on an older "
+        "one, and `migrate` refuses while one runs, so none is running now)."
     )
+
+
+def _guard_and_backup_if_behind(resolved: ResolvedConfigPath, backup_dir: Optional[Path]) -> None:
+    """`migrate`, under the writer lock: if the schema is (still) behind,
+    refuse while a daemon or any worker runs (75), then -- with `--backup-dir`
+    -- write the pre-migration backup. Any failure raises and the caller never
+    migrates. A schema that a concurrent migrate brought to head meanwhile
+    needs neither. Every other schema error (a NEWER database, an unknown
+    history) propagates exactly as before, with no backup.
+
+    With `--backup-dir` the migration scripts are checked against the schema
+    constants FIRST (`check_migration_packaging`): a packaging defect fails
+    `upgrade_schema` every time, and a backup written before it would be
+    written again on every retry."""
+    if backup_dir is not None:
+        check_migration_packaging()
+    try:
+        check_config_schema(resolved)
+        return
+    except SchemaOutOfDate as exc:
+        if not exc.recorded_revisions:
+            raise
+        from_revs = exc.recorded_revisions
+    # Old code must not run against a new schema, so nothing may be running at
+    # all -- not a previous daemon's survivors (a `KillMode=process` stop), and
+    # not the running daemon or its workers either: `migrate` needs the daemon
+    # stopped. The presence lock covers a live supervisor between worker
+    # restarts or before its first worker; the workers lock covers the workers.
+    # A lock that cannot be examined raises (`DaemonLockError`, exit 1): not
+    # knowing is not permission.
+    if daemonlock.probe(resolved) is not None or daemonlock.workers_present(resolved):
+        raise RetryLater(
+            "the schema is behind and a zfsbackup daemon or its workers are running; "
+            "refusing to migrate the schema under them (a migration needs the daemon "
+            "stopped, including its own workers). Stop the daemon (or wait for the "
+            "workers to exit) and run again."
+        )
+    if backup_dir is None:
+        return
+    saved = backup.backup_before_migrate(resolved, backup_dir, from_revs)
+    if saved.reused:
+        click.echo(f"an identical pre-migration backup already exists: {saved.path}")
+    else:
+        click.echo(
+            f"Backed up {resolved.resolved_path} (schema {saved.schema_rev or 'none'}, "
+            f"generation {saved.generation}) to {saved.path}."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -850,10 +959,13 @@ def status_cmd(
         current = status_view.collect(resolved)
     else:
         current = status_view.wait_for(resolved, wait)
+    # The workers' last outcomes (S-7b): read once, after any wait, and never
+    # part of the verdict or the exit code.
+    workers = status_view.collect_workers(resolved, daemon_running=current.daemon is not None)
     if as_json:
-        click.echo(status_view.render_json(current), nl=False)
+        click.echo(status_view.render_json(current, workers), nl=False)
     else:
-        click.echo(status_view.render_text(current), nl=False)
+        click.echo(status_view.render_text(current, workers), nl=False)
     if current.schema_error is not None:
         # What could be said has been; now fail like any unusable database
         # (exit 78, the store's own wording).
@@ -862,7 +974,10 @@ def status_cmd(
         return
     code = status_view.wait_exit_code(current)
     if code == 75:
-        extra = "" if "daemon log" in current.message else "; if it does not catch up, see the daemon log"
+        extra = (
+            "" if "daemon log" in current.message or "after the restart" in current.message
+            else "; if it does not catch up, see the daemon log"
+        )
         click.echo(
             f"error: the daemon is not yet in sync after {wait:g}s: {current.message}{extra}",
             err=True,
@@ -1312,6 +1427,8 @@ def rename_destination_cmd(
 trust.register(cli, _common, _state)
 # After trust.register: `identity rotate` is added to its `identity` group.
 enroll.register(cli, _common, _state)
+backup.register(cli, _common, _state)
+check_view.register(cli, _common, _state)
 
 
 _sigterm_seen = False

@@ -16,6 +16,9 @@ and `test_zfsbackup_remote_timeouts.py` (they hand the methods a fake `_Transpor
   manager; a failed load is logged once per distinct message and retried.
 * `begin_cycle`: one `/whoami` per destination per cycle, a retry of a failed identity load, and what a
   manager used without it does.
+* `TestClientCertExpiryCheck` (S-12): `begin_cycle` reports a client certificate that expires within 30
+  days (WARNING) or has expired (ERROR) on a manager's first cycle and then every 24 h, from the
+  certificate alone (so also when the identity cannot load); silent for a missing file, DEBUG otherwise.
 * Real TLS, end to end (`TestRealTls`, `integration`): the manager against a real `ApiWorker` with real
   handshakes -- a successful pinned-mTLS backup, an impostor server, a revoked client, a client id that
   does not match, an identity rotated under a running manager. Server-side zfs is replaced in memory
@@ -532,7 +535,7 @@ class TestContract:
         assert not hasattr(rig.mgr, "identity")
 
     def test_the_constants(self):
-        assert (HTTP_TIMEOUT, remote.RESUME_TOKEN_TIMEOUT) == (30, 10)
+        assert (HTTP_TIMEOUT, remote.RESUME_TOKEN_TIMEOUT) == (30, 30)
         assert NO_CLIENT_ID_MESSAGE == "no client id; run `zfsbackup-config enroll`"
 
     def test_the_remote_module_has_no_plaintext_downgrade(self):
@@ -866,10 +869,22 @@ class TestIdentityErrors:
                 for dest in ("offsite", "dc2"):
                     assert rig.run(index, dest) is False
         got = errors(caplog)
-        assert len(got) == 1 and got[0].startswith(self.PREFIX) and text in got[0]
+        if how == "break_expired":
+            # S-12: the first cycle logs the expiry reminder AND the identity-load error, the
+            # expiry first (it runs at the start of the cycle). The second cycle, moments later,
+            # repeats neither as an ERROR: the load error drops to DEBUG and the expiry reminder
+            # waits for its daily slot (`TestClientCertExpiryCheck`).
+            assert len(got) == 2
+            expiry, load = got
+            assert expiry.startswith("the client certificate ") and "expired on" in expiry
+            assert load.startswith(self.PREFIX) and text in load
+            assert [lv for lv, m in own(caplog) if m == expiry] == ["ERROR"]
+        else:
+            assert len(got) == 1 and got[0].startswith(self.PREFIX) and text in got[0]
+            load = got[0]
         # logged by the first failed load; not again for the other datasets and destinations of the
         # cycle (the failure is remembered), once more at DEBUG when the next cycle retries
-        assert [lv for lv, m in own(caplog) if m == got[0]] == ["ERROR", "DEBUG"]
+        assert [lv for lv, m in own(caplog) if m == load] == ["ERROR", "DEBUG"]
         assert rig.http_count == 0
         rig.assert_nothing_sent()
 
@@ -2294,6 +2309,315 @@ class TestBeginCycle:
         assert "offsite" in rig.mgr._transports
 
 
+class TestClientCertExpiryCheck:
+    """S-12 (2): `begin_cycle` -> `_check_client_cert_expiry`. On the first cycle of a manager and
+    then at most every `CLIENT_CERT_EXPIRY_CHECK_EVERY` (24 h, monotonic): a WARNING when the client
+    certificate expires within `CLIENT_CERT_EXPIRY_WARN_DAYS`, an ERROR once it has expired, nothing
+    for a certificate that is far from expiry or for a file that does not exist, DEBUG for any other
+    failure. It reads the certificate only, so it runs when the identity cannot be loaded too."""
+
+    @pytest.fixture
+    def clock(self, mocker):
+        from _clock_support import FakeTime
+
+        fake = FakeTime()
+        mocker.patch.object(remote, "time", fake)
+        return fake
+
+    @staticmethod
+    def cert(client_tls_dir, *, expires_in=None, expired_ago=None):
+        """Replace the client certificate (and key) in `client_tls_dir`; -> the `ClientCert`."""
+        import datetime as dt
+        from _api_support import make_client_cert
+
+        now = dt.datetime.now(dt.timezone.utc)
+        if expired_ago is not None:
+            made = make_client_cert(not_before=now - expired_ago - dt.timedelta(days=30),
+                                    not_after=now - expired_ago)
+        else:
+            made = make_client_cert(not_before=now - dt.timedelta(hours=1),
+                                    not_after=now + expires_in)
+        write_identity_files(client_tls_dir, made)
+        return made
+
+    @staticmethod
+    def reminders(caplog):
+        """`[(level, message)]` of the expiry reminders (WARNING/ERROR) the manager logged."""
+        return [(lv, m) for lv, m in own(caplog)
+                if lv in ("WARNING", "ERROR") and m.startswith("the client certificate ")]
+
+    @staticmethod
+    def expected(path, made):
+        return ident.client_cert_expiry_problem(path, made.not_after)
+
+    def test_the_constants(self):
+        assert remote.CLIENT_CERT_EXPIRY_CHECK_EVERY == 24 * 3600.0
+        assert ident.CLIENT_CERT_EXPIRY_WARN_DAYS == 30
+
+    # -- within the warning window ---------------------------------------------------------
+
+    def test_within_thirty_days_the_first_cycle_warns_once(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        made = self.cert(client_tls_dir, expires_in=dt.timedelta(days=10))
+        rig = make_rig()
+        assert rig.cycle() is True                                    # the backup itself goes ahead
+        level, message = self.expected(client_tls_dir / "client.crt", made)
+        assert level == logging.WARNING
+        assert self.reminders(caplog) == [("WARNING", message)]
+        assert str(client_tls_dir / "client.crt") in message and "(in 9 day(s))" in message
+        assert "zfsbackup-config identity rotate" in message
+
+    def test_and_nothing_on_the_later_cycles(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=10))
+        rig = make_rig()
+        for _ in range(6):
+            rig.cycle()
+        assert len(self.reminders(caplog)) == 1
+
+    def test_again_after_twenty_four_hours(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=10))
+        rig = make_rig()
+        rig.cycle()
+        clock.advance(24 * 3600 - 120)
+        rig.cycle()
+        assert len(self.reminders(caplog)) == 1                       # two minutes short of a day
+        clock.advance(180)
+        rig.cycle()
+        assert len(self.reminders(caplog)) == 2
+        rig.cycle()
+        assert len(self.reminders(caplog)) == 2                       # and the next day begins
+        clock.advance(24 * 3600)
+        rig.cycle()
+        assert len(self.reminders(caplog)) == 3
+
+    def test_the_certificate_is_read_once_per_check_not_per_cycle(
+        self, make_rig, client_tls_dir, clock, mocker
+    ):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=10))
+        rig = make_rig()
+        read = mocker.spy(remote.ident, "client_cert_not_after")
+        for _ in range(4):
+            rig.cycle()
+        assert read.call_count == 1
+        clock.advance(24 * 3600 + 1)
+        rig.cycle()
+        assert read.call_count == 2
+
+    def test_the_day_count_follows_the_certificate(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=2, hours=3))
+        make_rig().cycle()
+        assert "(in 2 day(s))" in self.reminders(caplog)[0][1]
+
+    # -- expired ----------------------------------------------------------------------------------
+
+    def test_an_expired_certificate_is_an_error_on_the_first_cycle_and_then_daily(
+        self, make_rig, caplog, client_tls_dir, clock
+    ):
+        import datetime as dt
+        made = self.cert(client_tls_dir, expired_ago=dt.timedelta(days=2))
+        rig = make_rig()
+        rig.cycle()
+        level, message = self.expected(client_tls_dir / "client.crt", made)
+        assert level == logging.ERROR and "expired on" in message
+        assert self.reminders(caplog) == [("ERROR", message)]
+        rig.cycle()
+        rig.cycle()
+        assert len(self.reminders(caplog)) == 1
+        clock.advance(24 * 3600 + 1)
+        rig.cycle()
+        assert self.reminders(caplog) == [("ERROR", message)] * 2
+        clock.advance(24 * 3600 + 1)
+        rig.cycle()
+        assert self.reminders(caplog) == [("ERROR", message)] * 3
+
+    def test_the_identity_load_error_is_logged_once_while_the_expiry_error_repeats_daily(
+        self, make_rig, caplog, client_tls_dir, clock
+    ):
+        """The decided contract: day one has both ERRORs (expiry, then the load failure); the
+        load failure then drops to DEBUG on every cycle, the expiry ERROR comes back each day."""
+        import datetime as dt
+        self.cert(client_tls_dir, expired_ago=dt.timedelta(days=2))
+        rig = make_rig()
+        prefix = TestIdentityErrors.PREFIX
+        for day in range(3):
+            for _ in range(2):
+                rig.cycle()
+            clock.advance(24 * 3600 + 1)
+        load_levels = [lv for lv, m in own(caplog) if m.startswith(prefix)]
+        assert load_levels.count("ERROR") == 1 and load_levels[0] == "ERROR"
+        assert load_levels.count("DEBUG") == 5
+        assert [lv for lv, m in self.reminders(caplog)] == ["ERROR"] * 3
+        first_error_order = [m for lv, m in own(caplog) if lv == "ERROR"]
+        assert first_error_order[0].startswith("the client certificate ")
+        assert first_error_order[1].startswith(prefix)
+
+    def test_an_expired_certificate_still_skips_every_send(self, make_rig, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expired_ago=dt.timedelta(days=2))
+        rig = make_rig()
+        assert rig.cycle() is False
+        rig.assert_nothing_sent()
+
+    # -- silence ------------------------------------------------------------------------------------
+
+    def test_a_certificate_far_from_expiry_is_silent(self, make_rig, caplog, clock):
+        rig = make_rig()                                              # generated: ten years
+        for _ in range(3):
+            clock.advance(24 * 3600 + 1)
+            assert rig.cycle() is True
+        assert self.reminders(caplog) == []
+        assert not [m for lv, m in own(caplog) if "expiry check" in m]
+
+    def test_thirty_one_days_is_silent(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=31))
+        make_rig().cycle()
+        assert self.reminders(caplog) == []
+
+    def test_a_missing_certificate_file_is_silent_even_at_debug(self, make_rig, caplog, client_tls_dir, clock):
+        os.unlink(client_tls_dir / "client.crt")
+        rig = make_rig()
+        assert rig.cycle() is False                                    # (the identity load says so)
+        assert self.reminders(caplog) == []
+        assert not [m for lv, m in own(caplog) if "expiry check" in m]
+        # the load failure is still reported as before
+        assert any(m.startswith(TestIdentityErrors.PREFIX) for lv, m in own(caplog) if lv == "ERROR")
+
+    def test_a_missing_tls_directory_is_silent(self, make_rig, caplog, tmp_path, clock):
+        rig = make_rig(tls_dir=tmp_path / "absent.tls")
+        rig.mgr.begin_cycle()
+        assert self.reminders(caplog) == []
+        assert not (tmp_path / "absent.tls").exists()
+
+    def test_no_tls_dir_and_no_configured_paths_never_logs_a_reminder(self, make_rig, caplog, clock):
+        rig = make_rig()
+        rig.mgr.tls_dir = None
+        rig.mgr.begin_cycle()                                          # must not raise
+        assert self.reminders(caplog) == []
+        assert [lv for lv, m in own(caplog) if "expiry check" in m] == ["DEBUG"]
+
+    @pytest.mark.parametrize("damage", ["garbage", "armour", "directory"])
+    def test_an_unreadable_or_unparseable_certificate_is_debug_only(
+        self, make_rig, caplog, client_tls_dir, clock, damage
+    ):
+        rig = make_rig()
+        crt = client_tls_dir / "client.crt"
+        if damage == "garbage":
+            crt.write_text("garbage\n")
+        elif damage == "armour":
+            crt.write_text("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+        else:
+            crt.unlink()
+            crt.mkdir()
+        rig.mgr.begin_cycle()                                          # must not raise
+        assert self.reminders(caplog) == []
+        assert [lv for lv, m in own(caplog) if "client certificate expiry check failed" in m] == ["DEBUG"]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads everything")
+    def test_a_certificate_the_process_cannot_read_is_debug_only(self, make_rig, caplog, client_tls_dir, clock):
+        rig = make_rig()
+        crt = client_tls_dir / "client.crt"
+        os.chmod(crt, 0)
+        try:
+            rig.mgr.begin_cycle()
+        finally:
+            os.chmod(crt, 0o640)
+        assert self.reminders(caplog) == []
+        assert [lv for lv, m in own(caplog) if "client certificate expiry check failed" in m] == ["DEBUG"]
+
+    def test_a_failed_check_is_not_retried_before_the_next_day(
+        self, make_rig, client_tls_dir, clock, mocker
+    ):
+        rig = make_rig()
+        (client_tls_dir / "client.crt").write_text("garbage\n")
+        read = mocker.spy(remote.ident, "client_cert_not_after")
+        for _ in range(3):
+            rig.mgr.begin_cycle()
+        assert read.call_count == 1
+
+    def test_an_unexpected_error_in_the_decision_is_swallowed(
+        self, make_rig, caplog, mocker, clock
+    ):
+        mocker.patch.object(remote.ident, "client_cert_expiry_problem", side_effect=RuntimeError("boom"))
+        rig = make_rig()
+        rig.mgr.begin_cycle()                                          # must not raise
+        assert rig.cycle() is True                                     # and the cycle works
+        assert self.reminders(caplog) == []
+        assert any("expiry check failed: boom" in m for lv, m in own(caplog) if lv == "DEBUG")
+
+    # -- independence from the identity load ---------------------------------------------------------
+
+    def test_it_runs_when_the_identity_cannot_load(self, make_rig, caplog, client_tls_dir, clock):
+        """A near-expiry certificate whose private key is unusable (mode 0644): the load fails,
+        the reminder is made all the same."""
+        import datetime as dt
+        made = self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        os.chmod(client_tls_dir / "client.key", 0o644)
+        rig = make_rig()
+        assert rig.cycle() is False
+        assert self.reminders(caplog) == [("WARNING", self.expected(client_tls_dir / "client.crt", made)[1])]
+        assert any("readable by everyone" in m for lv, m in own(caplog) if lv == "ERROR")
+
+    def test_it_runs_when_the_key_is_missing(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        os.unlink(client_tls_dir / "client.key")
+        rig = make_rig()
+        rig.mgr.begin_cycle()
+        assert len(self.reminders(caplog)) == 1
+
+    def test_it_runs_without_the_identity_ever_being_requested(self, make_rig, caplog, client_tls_dir, clock):
+        """`begin_cycle` alone (no dataset processed yet) is enough."""
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        rig = make_rig()
+        rig.mgr.begin_cycle()
+        assert len(self.reminders(caplog)) == 1
+        rig.assert_nothing_sent()
+
+    def test_a_manager_used_without_begin_cycle_never_checks(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        rig = make_rig()
+        rig.run()
+        rig.run()
+        assert self.reminders(caplog) == []
+
+    def test_each_manager_has_its_own_first_check(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        make_rig().mgr.begin_cycle()
+        make_rig().mgr.begin_cycle()
+        assert len(self.reminders(caplog)) == 2
+
+    def test_it_checks_the_configured_certificate_not_the_tls_dir_one(
+        self, make_rig, caplog, tmp_path, client_tls_dir, clock
+    ):
+        import datetime as dt
+        from _api_support import make_client_cert
+
+        now = dt.datetime.now(dt.timezone.utc)
+        near = make_client_cert(not_before=now - dt.timedelta(hours=1), not_after=now + dt.timedelta(days=4))
+        write_identity_files(tmp_path / "custom.tls", near)
+        rig = make_rig(client_cert_file=tmp_path / "custom.tls" / "client.crt",
+                       client_key_file=tmp_path / "custom.tls" / "client.key")
+        rig.mgr.begin_cycle()
+        (_, message), = self.reminders(caplog)
+        assert str(tmp_path / "custom.tls" / "client.crt") in message
+        assert str(client_tls_dir) not in message
+
+    def test_the_reminder_goes_to_the_remote_logger(self, make_rig, caplog, client_tls_dir, clock):
+        import datetime as dt
+        self.cert(client_tls_dir, expires_in=dt.timedelta(days=5))
+        make_rig().mgr.begin_cycle()
+        records = [r for r in caplog.records if r.getMessage().startswith("the client certificate ")]
+        assert [r.name for r in records] == ["zfsbackup.remote"]
+
+
 # ---------------------------------------------------------------------------
 # Real TLS, end to end
 # ---------------------------------------------------------------------------
@@ -2304,10 +2628,11 @@ RECV_NAME = "received.txt"
 
 class _Writer:
     """The server's fake `zfs receive`: counts the bytes and appends the total to a file at close
-    (the API worker is another process)."""
+    (the API worker is another process). `landed` runs once the receive has completed: the
+    snapshot it carried now exists on the server."""
 
-    def __init__(self, path):
-        self.path, self.n = path, 0
+    def __init__(self, path, landed=None):
+        self.path, self.n, self.landed = path, 0, landed
 
     def write(self, data):
         self.n += len(data)
@@ -2315,6 +2640,8 @@ class _Writer:
     def close(self):
         with open(self.path, "a") as fh:
             fh.write(f"{self.n}\n")
+        if self.landed is not None:
+            self.landed()
 
 
 _NS = types.SimpleNamespace      # (`_list` has a parameter called `types`)
@@ -2327,14 +2654,23 @@ class FakeServerZfs(types.SimpleNamespace):
     The state lives in the (forked) API worker's copy; the properties the receive was given are
     appended to the `received_props` file next to the received bytes, for the client side to read."""
 
-    def __init__(self, received_path, snapshots=None):
+    def __init__(self, received_path, snapshots=None, incoming=None):
         self.store = {}                    # dataset name -> {property: value}
         self.received_props_path = received_path + ".props"
         #: dataset name -> the short snapshot names it already holds (what `negotiate` lists).
         #: Seed it BEFORE the API worker starts: the forked worker has its own copy.
-        self.snapshots = dict(snapshots or {})
+        self.snapshots = {ds: list(names) for ds, names in (snapshots or {}).items()}
+        #: dataset name -> the short names of the snapshots its next completed receives bring, in
+        #: order: the server's listing grows with them (the receive's `-F` decision and the next
+        #: negotiate read it), as a real pool's does.
+        self.incoming = {ds: list(names) for ds, names in (incoming or {}).items()}
+        #: dataset name -> `zfs get type` (default: a filesystem), for the datasets that exist
+        self.dataset_types = {}
+        # The datasets the server already holds were made by an earlier receive: they carry the LOCAL
+        # client id (B-2c), the one in their path `<target>/<id>/...`.
         for name in self.snapshots:
-            self.store.setdefault(name, {})
+            self.store.setdefault(name, {}).setdefault(
+                "org.zfsbackup:client_id", name.split("/")[2] if name.count("/") >= 2 else None)
         super().__init__(
             exists=lambda ds: str(ds) in self.store,
             create=self._create,
@@ -2342,38 +2678,59 @@ class FakeServerZfs(types.SimpleNamespace):
             list=self._list,
             get=types.SimpleNamespace(value=self._value),
             receive=types.SimpleNamespace(
-                filesystem=lambda ds, props=None, **k: self._receive(received_path, ds, props),
+                filesystem=lambda ds, props=None, **k: self._receive(received_path, ds, props, k.get("force")),
                 abort=lambda *a, **k: None,
             ),
         )
 
     def _list(self, roots=None, types=None, properties=None, **k):
         if types == "snapshot":
-            return [_NS(short=n) for n in self.snapshots.get(str(roots), [])]
+            # with the `createtxg` and `guid` the listing is asked for (the receive decides `-F`
+            # from them): derived from the name, so they agree with the client's own listing
+            from _snapshot_support import listed_snapshot
+
+            return [listed_snapshot(n, str(roots)) for n in self.snapshots.get(str(roots), [])]
         return []
 
-    def _create(self, ds, *a, **k):
-        self.store.setdefault(str(ds), {})
+    def _create(self, ds, *a, properties=None, **k):
+        self.store.setdefault(str(ds), {}).update(properties or {})
 
     def _set(self, ds, props, *a, **k):
         self.store.setdefault(str(ds), {}).update(props)
 
     def _value(self, ds, prop, sources=None, raw=False):
+        if prop == "type":
+            return self.dataset_types.get(str(ds), "filesystem") if str(ds) in self.store else None
         return self.store.get(str(ds), {}).get(prop)
 
-    def _receive(self, received_path, ds, props):
+    def _receive(self, received_path, ds, props, force=None):
         self.store.setdefault(str(ds), {}).update(props or {})
         with open(self.received_props_path, "a") as fh:
-            fh.write(json.dumps({"dataset": str(ds), "props": props}) + "\n")
-        return _Writer(received_path)
+            fh.write(json.dumps({"dataset": str(ds), "props": props, "force": force}) + "\n")
+        return _Writer(received_path, lambda: self._landed(str(ds), bool(force)))
+
+    def _landed(self, ds, force):
+        """The receive completed: the next incoming snapshot exists. An `incoming` entry may be
+        `(name, [names])`: a receive with `-F` also destroys those (what `zfs receive -F` of an
+        incremental does to the snapshots newer than its base). The listing is written to a file
+        next to the received bytes for the client side to read."""
+        if self.incoming.get(ds):
+            item = self.incoming[ds].pop(0)
+            name, destroyed = (item, []) if isinstance(item, str) else item
+            held = self.snapshots.setdefault(ds, [])
+            if force:
+                held[:] = [n for n in held if n not in destroyed]
+            held.append(name)
+            with open(self.received_props_path + ".snaps", "w") as fh:
+                json.dump(held, fh)
 
     def properties_of(self, name):
         """What `zfsbackup.api.read_zfsbackup_properties` shows for `name`."""
         return dict(self.store.get(name, {}))
 
 
-def fake_server_zfs(received_path, snapshots=None):
-    return FakeServerZfs(received_path, snapshots)
+def fake_server_zfs(received_path, snapshots=None, incoming=None):
+    return FakeServerZfs(received_path, snapshots, incoming)
 
 
 def _snap(name):
@@ -2396,9 +2753,15 @@ class _LocalManager:
     def get_anchor(self, dsi, dest):
         return self.anchors.get(dest)
 
+    def get_local_anchor(self, dsi, dest):
+        return self.anchors.get(dest)
+
     def set_anchor(self, dsi, dest, name):
         self.anchors[dest] = name
         return True
+
+    def clear_anchor(self, dsi, dest):
+        self.anchors.pop(dest, None)
 
     def set_inflight(self, dsi, dest, from_name, to_name):
         self.pins.append((dest, from_name, to_name))
@@ -2481,7 +2844,8 @@ class World:
     `RemoteBackupManager` against it. Cleans up after itself: the worker, the impostor and every
     fake `zfs send` child."""
 
-    def __init__(self, tls_config_db, tmp_path, mocker, monkeypatch, caplog, server_snapshots=None):
+    def __init__(self, tls_config_db, tmp_path, mocker, monkeypatch, caplog, server_snapshots=None,
+                 server_incoming=None):
         from _reload_workers import SelectableApiWorker
         from zfsbackup.stopflag import StopFlag
 
@@ -2500,7 +2864,7 @@ class World:
         caplog.set_level(logging.DEBUG, logger="zfsbackup.remote")
         self.caplog = caplog
         # the server's zfs, in memory: the forked worker inherits the patched module
-        self.server_zfs = fake_server_zfs(str(self.received_path), server_snapshots)
+        self.server_zfs = fake_server_zfs(str(self.received_path), server_snapshots, server_incoming)
         mocker.patch("zfsbackup.api.zfs", self.server_zfs)
         mocker.patch(
             "zfsbackup.api.read_zfsbackup_properties", lambda ds: self.server_zfs.properties_of(ds.name)
@@ -2533,13 +2897,27 @@ class World:
 
     # -- the fake `zfs send`: a python byte writer in a hermetic subprocess --------------------------
     def _fake_send(self, snapshot, since=None, **flags):
+        """The stream starts with a real `DRR_BEGIN` record (the server reads it before it spawns
+        `zfs receive`): a full stream's, or an incremental one whose source guid is `since`'s.
+        Its 312 bytes replace the first 312 of the first 64 KiB chunk, so a finite stream is
+        still 64 * 65536 bytes."""
         from _hermetic import hermetic_env
+        from _snapshot_support import default_guid
+        from _stream_support import HEADER, incremental_header
 
         self.send_calls.append((snapshot, since, flags))
-        body = "while True:\n    w(b)\n" if self.endless else "for _ in range(64):\n    w(b)\n"
-        code = "import sys\nb = b'z' * 65536\nw = sys.stdout.buffer.write\n" + body
+        if since is None:
+            header = HEADER
+        else:
+            guid = since["guid"].value if hasattr(since, "__getitem__") else default_guid(str(since))
+            header = incremental_header(int(guid))
+        body = "while True:\n    w(b)\n" if self.endless else "for _ in range(63):\n    w(b)\n"
+        code = (
+            "import sys\nh = bytes.fromhex(sys.argv[1])\nb = b'z' * 65536\nw = sys.stdout.buffer.write\n"
+            "w(h + b[len(h):])\n" + body
+        )
         proc = subprocess.Popen(
-            [sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            [sys.executable, "-c", code, header.hex()], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             env=hermetic_env(),
         )
         self.sends.append(proc)
@@ -2638,6 +3016,12 @@ class World:
             return []
         return [int(x) for x in self.received_path.read_text().split()]
 
+    def server_snapshot_names(self):
+        """The short names the fake server holds after its last completed receive (None before the
+        first)."""
+        path = Path(str(self.received_path) + ".props.snaps")
+        return json.loads(path.read_text()) if path.exists() else None
+
     def received_props(self):
         """The `props` (`-o`) each fake `zfs receive` was started with, in order."""
         path = Path(str(self.received_path) + ".props")
@@ -2674,8 +3058,12 @@ class World:
 
 @pytest.fixture
 def world(tls_config_db, tmp_path, mocker, monkeypatch, caplog, request):
+    # `param`: the server's snapshots (`{dataset: [short names]}`), or `(snapshots, incoming)` where
+    # `incoming` are the snapshots its next completed receives bring (`FakeServerZfs`)
+    param = getattr(request, "param", None)
+    snapshots, incoming = param if isinstance(param, tuple) else (param, None)
     w = World(tls_config_db, tmp_path, mocker, monkeypatch, caplog,
-              server_snapshots=getattr(request, "param", None))
+              server_snapshots=snapshots, server_incoming=incoming)
     w._managers = []
     try:
         yield w
@@ -2893,6 +3281,9 @@ class TestRealTls:
 
 CHAIN_SNAPS = [f"autosnap_202610201{h}0000" for h in ("20", "10", "00")] + ["autosnap_20261020090000"]
 CHAIN_SERVER = {"testpool/backups/client-a/data": ["autosnap_20261020090000"]}
+#: the three snapshots the chain brings, oldest first: after each receive the server's listing has it
+CHAIN_INCOMING = {"testpool/backups/client-a/data": CHAIN_SNAPS[2::-1]}
+CHAIN_WORLD = (CHAIN_SERVER, CHAIN_INCOMING)
 
 
 @pytest.mark.integration
@@ -2907,7 +3298,7 @@ class TestRealTlsChain:
     newer ones, and one cycle sends all three as back-to-back `-i` streams. The server's per-dataset
     claim is released before it answers each stream, so the next one never meets `busy`."""
 
-    @pytest.mark.parametrize("world", [CHAIN_SERVER], indirect=True)
+    @pytest.mark.parametrize("world", [CHAIN_WORLD], indirect=True)
     def test_a_three_step_chain_goes_through_back_to_back(self, world, caplog):
         world.enroll()
         world.local.snaps = [_snap(n) for n in CHAIN_SNAPS]
@@ -2933,13 +3324,120 @@ class TestRealTlsChain:
         assert {p["dataset"] for p in props} == {"testpool/backups/client-a/data"}
         assert {p["props"]["org.zfsbackup:client_id"] for p in props} == {"client-a"}
 
-    @pytest.mark.parametrize("world", [CHAIN_SERVER], indirect=True)
-    def test_a_second_cycle_runs_the_same_chain_again_unblocked(self, world):
-        """The fake server's list is fixed (it does not grow with the receives), so the second cycle
-        sends the same three again; the point is that nothing is left in a state that blocks it."""
+    @pytest.mark.parametrize("world", [(CHAIN_SERVER, {
+        "testpool/backups/client-a/data": CHAIN_SNAPS[2::-1] + ["autosnap_20261020130000"]
+    })], indirect=True)
+    def test_a_second_cycle_continues_the_chain_unblocked(self, world):
+        """The server's listing grows with the receives: the second cycle negotiates the newest
+        snapshot of the first, and sends the one new snapshot incrementally from it. Nothing the
+        first cycle left behind blocks it."""
         world.enroll()
         world.local.snaps = [_snap(n) for n in CHAIN_SNAPS]
         mgr, dsi = world.manager()
         assert world.cycle(mgr, dsi) is True
+        newest = "autosnap_20261020130000"
+        world.local.snaps = [_snap(newest)] + world.local.snaps
         assert world.cycle(mgr, dsi) is True
-        assert _eventually(lambda: len(world.received()) == 6, 20)
+        assert _eventually(lambda: len(world.received()) == 4, 20)
+        assert (world.send_calls[-1][1].short, world.send_calls[-1][0].short) == (CHAIN_SNAPS[0], newest)
+        assert world.local.anchors["offsite"] == newest
+
+
+R1, R2, R3, R4, R5 = (f"autosnap_2026102010{m}00" for m in ("00", "10", "20", "30", "40"))
+GUARD_DS = "testpool/backups/client-a/data"
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.skipif(START_METHOD not in multiprocessing.get_all_start_methods(), reason="needs fork")
+@pytest.mark.filterwarnings(
+    "ignore:This process \\(pid=.*\\) is multi-threaded, use of fork\\(\\) "
+    "may lead to deadlocks in the child:DeprecationWarning"
+)
+class TestRealTlsRollbackGuard:
+    """B-2b over a real socket: the client's `discard` and the server's decision (`decide_receive`),
+    both real, with the server's zfs in memory (`FakeServerZfs`: a forced receive drops what its
+    `incoming` entry says it destroys). The server holds R1, R2 (and R3 where stated)."""
+
+    def lost(self, world, snapshot_presence, caplog):
+        """Cycle 1: R3 goes over and is destroyed locally while it is being sent; the backstop puts
+        the anchor back on R2. Returns the manager and its dataset."""
+        world.enroll()
+        world.local.snaps = [_snap(n) for n in (R3, R2, R1)]
+        world.local.anchors["offsite"] = R2
+        mgr, dsi = world.manager()
+        snapshot_presence.gone.add(R3)
+        mark = len(own(caplog))
+        world.cycle(mgr, dsi)
+        assert _eventually(lambda: world.received() == [64 * 65536], 20)
+        assert world.local.anchors["offsite"] == R2                        # back on the base
+        assert world.server_snapshot_names() == [R1, R2, R3]               # the server has R3
+        assert any("was destroyed while it was being sent" in m for m in world.errors_since(mark))
+        snapshot_presence.gone.clear()
+        return mgr, dsi
+
+    @pytest.mark.parametrize("world", [(
+        {GUARD_DS: [R1, R2]}, {GUARD_DS: [R3, (R4, [R3]), R5]},
+    )], indirect=True)
+    def test_the_backstop_is_recovered_by_the_next_cycle_and_only_that_snapshot_goes(
+        self, world, snapshot_presence, caplog
+    ):
+        mgr, dsi = self.lost(world, snapshot_presence, caplog)
+        world.local.snaps = [_snap(n) for n in (R5, R4, R2, R1)]          # R3 is gone here, two new
+        mark = len(own(caplog))
+        assert world.cycle(mgr, dsi) is True
+        assert _eventually(lambda: len(world.received()) == 3, 20)
+        assert world.errors_since(mark) == []
+        assert [(since.short, snap.short) for snap, since, _ in world.send_calls[1:]] == [(R2, R4), (R4, R5)]
+        assert world.local.anchors["offsite"] == R5
+        # the server dropped exactly the snapshot we lost, and nothing else
+        assert world.server_snapshot_names() == [R1, R2, R4, R5]
+        assert all(p["force"] is True for p in world.received_props())
+
+    @pytest.mark.parametrize("world", [({GUARD_DS: [R1, R2, R3]}, {GUARD_DS: [R4]})], indirect=True)
+    def test_a_rolled_back_client_is_refused_before_anything_is_sent(self, world, caplog):
+        """The host rolled back to R2 (`zfs rollback -r` destroyed R3, keeping the local anchor on
+        it) and made R4. Nothing is sent, nothing on the server changes, the operator is told."""
+        world.enroll()
+        world.local.snaps = [_snap(n) for n in (R4, R2, R1)]
+        world.local.anchors["offsite"] = R3
+        mgr, dsi = world.manager()
+        mark = len(own(caplog))
+        assert world.cycle(mgr, dsi) is False
+        assert world.sends == [] and world.send_calls == []
+        assert world.received() == [] and world.received_props() == []
+        assert world.server_snapshot_names() is None                       # no receive ever completed
+        assert world.local.anchors["offsite"] == R3 and world.local.pins == []
+        (error,) = world.errors_since(mark)
+        assert f"has 1 snapshot(s) newer than {R2}" in error and R3 in error and "zfs rename" in error
+
+    @pytest.mark.parametrize("world", [({GUARD_DS: [R1, R2, R3]}, {GUARD_DS: [R4]})], indirect=True)
+    @pytest.mark.parametrize("how", ["no-discard", "wrong-guid"])
+    def test_the_server_refuses_on_its_own_when_the_client_does_not_ask(self, world, caplog, how, mocker):
+        """A client that skips its check (a race, an older release): the server compares the base
+        with what it holds and refuses before it reads a byte of the stream."""
+        world.enroll()
+        world.local.snaps = [_snap(n) for n in (R4, R2, R1)]
+        mgr, dsi = world.manager()
+        guids = () if how == "no-discard" else ("123456789",)
+        mocker.patch.object(mgr, "_rollback_permit", return_value=guids)
+        mark = len(own(caplog))
+        assert world.cycle(mgr, dsi) is False
+        assert world.server_snapshot_names() is None and world.received_props() == []
+        (error,) = world.errors_since(mark)
+        assert "refused pool" not in error and "testpool/data -> offsite" in error
+        assert f"{GUARD_DS} holds 1 snapshot(s) newer than {R2}" in error and R3 in error
+        assert world.local.anchors.get("offsite") is None
+
+    @pytest.mark.parametrize("world", [({GUARD_DS: [R1, R2, R3]}, {})], indirect=True)
+    def test_a_full_stream_onto_a_copy_with_snapshots_is_refused_by_the_server(self, world, caplog, mocker):
+        """The client's own check is bypassed (no common snapshot reported): the server's `no_common`."""
+        world.enroll()
+        world.local.snaps = [_snap(n) for n in (R5, R4)]
+        mgr, dsi = world.manager()
+        mocker.patch.object(mgr, "_rollback_permit", return_value=())
+        mark = len(own(caplog))
+        assert world.cycle(mgr, dsi) is False
+        assert world.server_snapshot_names() is None and world.received_props() == []
+        (error,) = world.errors_since(mark)
+        assert "already holds snapshots and a full stream cannot replace them" in error

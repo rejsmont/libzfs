@@ -43,7 +43,9 @@ from unittest.mock import MagicMock, PropertyMock
 
 import pytest
 
+from _stream_support import stream_script
 from _api_support import (
+    permissive_limits,
     plain_client,
     CLIENT_ID,
     SERVER_FP,
@@ -76,7 +78,7 @@ from zfsbackup.api import (
     canonical_dataset_config,
     create_app,
 )
-from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_SOURCE_DATASET, DatasetManager
+from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG, PROP_SOURCE_DATASET, DatasetManager
 from zfsbackup.config import BackupConfig, DatasetConfig, RemoteServerConfig
 from zfsbackup.config.store import trust as store_trust
 from zfsbackup.config.store.errors import ConfigBusy
@@ -108,8 +110,27 @@ def authed(mocker):
 
 @pytest.fixture
 def zfs(mocker):
-    """Every `zfs` entry point `api` uses, patched: nothing runs, everything is recorded."""
+    """Every `zfs` entry point `api` uses, patched: nothing runs, everything is recorded.
+
+    `value` answers by property name: the dataset's LOCAL client id (B-2c) is the id in its path
+    (`<target>/<id>/...`) unless `owners` maps the dataset name to another value (`None`: not set),
+    its config is the one negotiate stored (plan B-1b; a stream is refused without), its type a
+    filesystem (B-2a)."""
+    owners = {}
+    stored = canonical_dataset_config(DatasetConfig(name="pool/data").to_property())
+
+    def answer(ds, prop, *args, sources=None, **kwargs):
+        name = str(ds)
+        if prop == PROP_CLIENT_ID:
+            return owners[name] if name in owners else name.split("/")[2]
+        if prop == PROP_CONFIG:
+            return stored
+        if prop == "type":
+            return "filesystem"
+        return None
+
     return types.SimpleNamespace(
+        owners=owners,
         exists=mocker.patch("zfsbackup.api.zfs.exists", return_value=False),
         list=mocker.patch("zfsbackup.api.zfs.list", return_value=[]),
         create=mocker.patch("zfsbackup.api.zfs.create"),
@@ -117,11 +138,7 @@ def zfs(mocker):
         abort=mocker.patch("zfsbackup.api.zfs.receive.abort"),
         receive=mocker.patch("zfsbackup.api.zfs.receive.filesystem"),
         props=mocker.patch("zfsbackup.api.read_zfsbackup_properties", return_value={}),
-        # the local `org.zfsbackup:config` negotiate stored (plan B-1b); a stream is refused without
-        value=mocker.patch(
-            "zfsbackup.api.zfs.get.value",
-            return_value=canonical_dataset_config(DatasetConfig(name="pool/data").to_property()),
-        ),
+        value=mocker.patch("zfsbackup.api.zfs.get.value", side_effect=answer),
     )
 
 
@@ -130,18 +147,32 @@ def _untouched(zfs):
         assert not getattr(zfs, name).called, f"zfs.{name} was called"
 
 
+def _real_app(mocker, tls_config_db, **kwargs):
+    trust = RealTrust(tls_config_db)
+    app = _authed(
+        mocker, _config(), gateway=trust.gateway, server_fp=trust.server_fp, client_id=None,
+        **kwargs,
+    )
+    app.trust = trust
+    return app
+
+
 @pytest.fixture
 def real(mocker, tls_config_db):
     """An app over a REAL gateway, config database and server identity. No certificate is
     pinned and no client is bound (`client_id=None`): use `authed.client(None)` for the
     unauthenticated `/enroll` and `authed.client(cert)` for a pinned certificate.
     `authed.trust` is the `RealTrust`."""
-    trust = RealTrust(tls_config_db)
-    app = _authed(
-        mocker, _config(), gateway=trust.gateway, server_fp=trust.server_fp, client_id=None
-    )
-    app.trust = trust
-    return app
+    return _real_app(mocker, tls_config_db)
+
+
+@pytest.fixture
+def real_open(mocker, tls_config_db):
+    """`real` with S-3's `/enroll` lockout and in-flight cap out of the way
+    (`permissive_limits`), for tests that make many failing or simultaneous `/enroll` calls
+    from the one test-client address; the limits themselves are in
+    `test_zfsbackup_api_flood.py`."""
+    return _real_app(mocker, tls_config_db, peer_limits=permissive_limits())
 
 
 def _anonymous(authed):
@@ -452,7 +483,7 @@ class TestClientIdMismatch:
 def _stream(authed, cert, client_id, *, mode="resume", dataset="pool/data", ws=None):
     """Drive the websocket handler authenticated as `cert`, with a URL naming `client_id`."""
     ws = ws or MagicMock()
-    ws.receive.side_effect = [json.dumps({"done": True})]
+    ws.receive.side_effect = stream_script()
     handler = authed.app.view_functions["backup_stream"].__wrapped__
     with authed.context(f"/backup/{client_id}/{dataset}/stream", who=cert, query_string={"mode": mode}):
         handler(ws, client_id, dataset)
@@ -532,11 +563,19 @@ class TestAuthorization:
         assert "secret-other-host" not in error
         assert "host-b" in error and "server operator" in error
 
-    def test_a_dataset_recorded_for_the_bound_id_or_for_nobody_is_fine(self, two, zfs):
+    def test_a_dataset_recorded_for_the_bound_id_or_for_no_source_dataset_is_fine(self, two, zfs):
         zfs.exists.return_value = True
         for recorded in ({PROP_CLIENT_ID: "host-b"}, {}):
             zfs.props.return_value = recorded
             assert two.client(two.b).get("/backup/host-b/pool/data/resume_token").status_code == 200
+
+    def test_a_dataset_with_no_local_client_id_is_409_for_everyone(self, two, zfs):
+        """B-2c: not made by a negotiate or a receive of this server, so not adopted silently."""
+        zfs.exists.return_value = True
+        zfs.owners[self.B_DATA] = None
+        resp = two.client(two.b).get("/backup/host-b/pool/data/resume_token")
+        assert resp.status_code == 409
+        assert f"zfs set {PROP_CLIENT_ID}=host-b {self.B_DATA}" in resp.get_json()["error"]
 
     def test_a_missing_dataset_is_never_a_conflict(self, two, zfs):
         zfs.exists.return_value = False
@@ -562,7 +601,8 @@ class TestAuthorization:
         # received with `-o` (plan B-1b), always with the bound id
         received = [(str(c.args[0]), c.kwargs["props"][PROP_CLIENT_ID]) for c in zfs.receive.call_args_list]
         assert received == [(self.A_DATA, "host-a"), (self.B_DATA, "host-b")]
-        assert [str(c.args[0]) for c in zfs.value.call_args_list] == [self.A_DATA, self.B_DATA]
+        configs = [str(c.args[0]) for c in zfs.value.call_args_list if c.args[1] == PROP_CONFIG]
+        assert configs == [self.A_DATA, self.B_DATA]
 
     def test_each_client_creates_its_new_dataset_in_its_own_tree(self, two, zfs):
         """The datasets do not exist: the receive creates them (no `-F`), still under the bound id."""
@@ -600,12 +640,12 @@ class TestAuthorization:
         """The websocket view is handed the URL's id, but uses the binding."""
         zfs.exists.side_effect = [True, True, False]
         ws = MagicMock()
-        ws.receive.side_effect = [json.dumps({"done": True})]
+        ws.receive.side_effect = stream_script()
         handler = two.app.view_functions["backup_stream"].__wrapped__
         with two.context("/backup/host-b/pool/data/stream", who=two.b, query_string={"mode": "resume"}):
             handler(ws, "host-a", "pool/data")
         assert str(zfs.receive.call_args.args[0]) == self.B_DATA
-        assert str(zfs.value.call_args.args[0]) == self.B_DATA            # the config is B's, not A's
+        assert {str(c.args[0]) for c in zfs.value.call_args_list} == {self.B_DATA}   # all reads are B's, not A's
         assert zfs.receive.call_args.kwargs["props"][PROP_CLIENT_ID] == "host-b"
         zfs.create.assert_not_called()
 
@@ -825,6 +865,12 @@ class TestEnroll:
 @pytest.mark.integration
 class TestEnrollRefusals:
     """The 403 for every token problem is one and the same body."""
+
+    @pytest.fixture
+    def real(self, real_open):
+        """Six refusals from one address would trip S-3's lockout (5 in 15 minutes): the
+        subject here is the body of each refusal, not the lockout."""
+        return real_open
 
     @pytest.fixture
     def tokens(self, real, zfs):
@@ -1400,7 +1446,10 @@ class TestEnrollOutcomesAgainstTheStore:
         _enroll(real, "host-a", cert, real.trust.token())
         refresh.assert_not_called()
 
-    def test_two_concurrent_enrollments_with_one_token_have_exactly_one_winner(self, real, zfs):
+    def test_two_concurrent_enrollments_with_one_token_have_exactly_one_winner(self, real_open, zfs):
+        """Six at once; S-3's cap of 2 in flight would answer four of them 503 before the
+        store sees them (permissive limits: the store's one-winner rule is the subject)."""
+        real = real_open
         token = real.trust.token()
         barrier = threading.Barrier(6)
         statuses = []

@@ -43,6 +43,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -2497,3 +2498,243 @@ class TestProtocolAfterAcceptedEnrollment:
             assert enroll_cli._supported_protocol(good) is True
         for bad in (None, 0, 2, -1, True, False, 1.0, "1", [1], {}, 10 ** 30):
             assert enroll_cli._supported_protocol(bad) is False
+
+
+# --------------------------------------------------------------------------
+# S-7b: 429 / 503 waits (Retry-After)
+# --------------------------------------------------------------------------
+
+
+def _http_date(offset: float) -> str:
+    from email.utils import formatdate
+
+    return formatdate(time.time() + offset, usegmt=True)
+
+
+class TestRetryAfter:
+    """The server's S-3 flood control answers 429 + `Retry-After` and a busy 503: the CLI maps both to
+    exit 75 (retry) and tells the operator how long to wait. `Retry-After` is server-supplied text, so
+    every unusable form degrades to the body's `retry_after` or to a generic wait."""
+
+    def enroll_with(self, run, client, make_server, reply):
+        srv = make_server().on("/enroll", reply)
+        before = db_state(client)
+        result = do_enroll(run, client, srv, srv.token())
+        assert len(srv.seen("/enroll")) == 1                      # a POST is never retried
+        assert dest(client) is None
+        return srv, before, result
+
+    # -- 429 -----------------------------------------------------------------------------------------
+    @pytest.mark.parametrize("header, wait, shown", [
+        ("900", "wait about 15 minutes", "(Retry-After: 900s)"),
+        ("30", "wait about 30 seconds", "(Retry-After: 30s)"),
+        ("1", "wait about 1 second ", "(Retry-After: 1s)"),
+        ("89", "wait about 89 seconds", "(Retry-After: 89s)"),
+        ("90", "wait about 2 minutes", "(Retry-After: 90s)"),
+        ("5399", "wait about 90 minutes", "(Retry-After: 5399s)"),
+        ("5400", "wait about 2 hours", "(Retry-After: 5400s)"),
+        ("86400", "wait about 24 hours", "(Retry-After: 86400s)"),
+        ("99999999", "wait about 24 hours", "(Retry-After: 86400s)"),     # clamped to a day
+    ], ids=lambda v: str(v))
+    def test_retry_after_seconds(self, run, client, make_server, reloads, header, wait, shown):
+        reply = Reply(429, {"error": "slow down", "reason": "rate_limited"},
+                      headers={"Retry-After": header})
+        _, before, result = self.enroll_with(run, client, make_server, reply)
+        assert result.exit_code == 75, result.stderr
+        assert "is refusing requests from this host for now (HTTP 429, too many failed enrollments)" in result.stderr
+        assert wait in result.stderr, result.stderr
+        assert "and try again" in result.stderr
+        assert shown in result.stderr
+        untouched(client, before, reloads)
+
+    def test_an_http_date_is_a_delta_from_now(self, run, client, make_server, reloads):
+        reply = Reply(429, {"reason": "rate_limited"}, headers={"Retry-After": _http_date(600)})
+        _, before, result = self.enroll_with(run, client, make_server, reply)
+        assert result.exit_code == 75, result.stderr
+        assert "wait about 10 minutes" in result.stderr or "wait about 9 minutes" in result.stderr
+        untouched(client, before, reloads)
+
+    def test_a_date_in_the_past_is_not_a_negative_wait(self, run, client, make_server):
+        reply = Reply(429, {"reason": "rate_limited"}, headers={"Retry-After": _http_date(-3600)})
+        _, _, result = self.enroll_with(run, client, make_server, reply)
+        assert result.exit_code == 75, result.stderr
+        assert "(Retry-After: 0s)" in result.stderr
+        assert "-" not in result.stderr.split("wait about", 1)[1].split("and try again")[0]
+
+    def test_a_far_future_date_is_clamped_to_a_day(self, run, client, make_server):
+        reply = Reply(429, {"reason": "rate_limited"}, headers={"Retry-After": _http_date(10 ** 7)})
+        _, _, result = self.enroll_with(run, client, make_server, reply)
+        assert result.exit_code == 75
+        assert "wait about 24 hours" in result.stderr and "(Retry-After: 86400s)" in result.stderr
+
+    @pytest.mark.parametrize("junk", [
+        "soon", "-5", "1.5", "1e3", "1000000000", "0x10", "", "  ", "Mon, 99 Foo 2020 99:99:99 GMT",
+    ])
+    def test_unusable_retry_after_is_generic_and_still_75(self, run, client, make_server, reloads, junk):
+        reply = Reply(429, {"error": "slow down", "reason": "rate_limited"},
+                      headers={"Retry-After": junk})
+        _, before, result = self.enroll_with(run, client, make_server, reply)
+        assert result.exit_code == 75, result.stderr
+        assert "wait a little and try again" in result.stderr, result.stderr
+        assert "Retry-After:" not in result.stderr
+        untouched(client, before, reloads)
+
+    def test_no_retry_after_header_is_generic(self, run, client, make_server):
+        _, _, result = self.enroll_with(
+            run, client, make_server, Reply(429, {"error": "x", "reason": "rate_limited"}))
+        assert result.exit_code == 75
+        assert "wait a little and try again" in result.stderr and "Retry-After" not in result.stderr
+
+    def test_the_body_retry_after_is_the_fallback(self, run, client, make_server):
+        _, _, result = self.enroll_with(
+            run, client, make_server,
+            Reply(429, {"error": "x", "reason": "rate_limited", "retry_after": 120}))
+        assert result.exit_code == 75
+        assert "wait about 2 minutes" in result.stderr and "(Retry-After: 120s)" in result.stderr
+
+    def test_the_header_wins_over_the_body(self, run, client, make_server):
+        _, _, result = self.enroll_with(
+            run, client, make_server,
+            Reply(429, {"reason": "rate_limited", "retry_after": 30}, headers={"Retry-After": "900"}))
+        assert "wait about 15 minutes" in result.stderr and "(Retry-After: 900s)" in result.stderr
+
+    def test_a_junk_header_falls_back_to_the_body(self, run, client, make_server):
+        _, _, result = self.enroll_with(
+            run, client, make_server,
+            Reply(429, {"reason": "rate_limited", "retry_after": 30}, headers={"Retry-After": "soon"}))
+        assert "wait about 30 seconds" in result.stderr
+
+    @pytest.mark.parametrize("value", [True, False, "30", None, [30], {"s": 30}, float("nan")])
+    def test_a_body_retry_after_of_the_wrong_type_is_ignored(self, run, client, make_server, value):
+        import json as _json
+
+        body = _json.loads(_json.dumps({"reason": "rate_limited", "retry_after": value}, allow_nan=True)
+                           .replace("NaN", "null"))
+        _, _, result = self.enroll_with(run, client, make_server, Reply(429, body))
+        assert result.exit_code == 75
+        assert "wait a little and try again" in result.stderr
+
+    def test_a_negative_body_retry_after_is_zero(self, run, client, make_server):
+        _, _, result = self.enroll_with(
+            run, client, make_server, Reply(429, {"reason": "rate_limited", "retry_after": -50}))
+        assert result.exit_code == 75
+        assert "(Retry-After: 0s)" in result.stderr
+
+    def test_a_429_without_the_rate_limited_reason_omits_the_enrollment_wording(
+        self, run, client, make_server
+    ):
+        for body in ({"error": "slow down"}, {"error": "x", "reason": "other"}, {}):
+            srv = make_server().on("/enroll", Reply(429, body, headers={"Retry-After": "30"}))
+            result = do_enroll(run, client, srv, srv.token())
+            assert result.exit_code == 75, result.stderr
+            assert "is refusing requests from this host for now (HTTP 429)" in result.stderr
+            assert "too many failed enrollments" not in result.stderr
+            assert "wait about 30 seconds and try again" in result.stderr
+
+    def test_a_non_json_429_body_is_still_75(self, run, client, make_server):
+        _, _, result = self.enroll_with(
+            run, client, make_server, Reply(429, "<html>too many</html>", headers={"Retry-After": "30"}))
+        assert result.exit_code == 75
+        assert "wait about 30 seconds" in result.stderr
+
+    def test_the_server_text_never_reaches_the_wait_line(self, run, client, make_server):
+        evil = "\x1b[31mred\x07\nline2"
+        _, _, result = self.enroll_with(
+            run, client, make_server,
+            Reply(429, {"reason": "rate_limited", "error": evil}, headers={"Retry-After": "30"}))
+        assert "\x1b" not in everything(result) and "\x07" not in everything(result)
+
+    def test_a_429_during_the_whoami_probe_is_75_too(self, run, client, make_server, reloads):
+        srv = make_server()
+        token = srv.token()
+        assert do_enroll(run, client, srv, token).exit_code == 0
+        reloads.clear()
+        srv.log.clear()
+        srv.on("/whoami", Reply(429, {"reason": "rate_limited"}, headers={"Retry-After": "60"}))
+        before = db_state(client)
+        result = do_enroll(run, client, srv, token)
+        assert result.exit_code == 75, result.stderr
+        assert "wait about 60 seconds" in result.stderr
+        assert srv.seen("/enroll") == []                          # the token was not even sent
+        untouched(client, before, reloads)
+
+    # -- 503 busy ------------------------------------------------------------------------------------
+    @pytest.mark.parametrize("header, phrase", [
+        ("2", "wait about 2 seconds and retry"),
+        ("1", "wait about 1 second and retry"),
+        ("120", "wait about 2 minutes and retry"),
+    ])
+    def test_a_busy_503_with_retry_after_names_the_wait(self, run, client, make_server, reloads, header, phrase):
+        reply = Reply(503, {"error": "busy", "retry": True, "reason": "busy"},
+                      headers={"Retry-After": header})
+        _, before, result = self.enroll_with(run, client, make_server, reply)
+        assert result.exit_code == 75, result.stderr
+        assert "is busy (HTTP 503)" in result.stderr
+        assert phrase in result.stderr, result.stderr
+        assert "retry in a moment" not in result.stderr
+        untouched(client, before, reloads)
+
+    def test_a_busy_503_without_the_header_says_retry_in_a_moment(self, run, client, make_server):
+        _, _, result = self.enroll_with(
+            run, client, make_server, Reply(503, {"error": "busy", "retry": True, "reason": "busy"}))
+        assert result.exit_code == 75
+        assert "retry in a moment" in result.stderr and "wait about" not in result.stderr
+
+    def test_a_busy_503_with_a_junk_header_says_retry_in_a_moment(self, run, client, make_server):
+        _, _, result = self.enroll_with(
+            run, client, make_server,
+            Reply(503, {"error": "busy", "retry": True}, headers={"Retry-After": "later"}))
+        assert result.exit_code == 75 and "retry in a moment" in result.stderr
+
+    def test_a_busy_503_may_use_the_body_retry_after(self, run, client, make_server):
+        _, _, result = self.enroll_with(
+            run, client, make_server, Reply(503, {"error": "busy", "retry": True, "retry_after": 5}))
+        assert result.exit_code == 75 and "wait about 5 seconds and retry" in result.stderr
+
+    def test_a_final_503_ignores_retry_after(self, run, client, make_server):
+        _, _, result = self.enroll_with(
+            run, client, make_server,
+            Reply(503, {"error": "off", "reason": "unavailable"}, headers={"Retry-After": "30"}))
+        assert result.exit_code == 1
+        assert "cannot do /enroll right now (HTTP 503)" in result.stderr and "wait" not in result.stderr
+
+    # -- against the real flood control (S-3) --------------------------------------------------------
+    def test_after_five_bad_tokens_the_real_server_locks_the_address_out(
+        self, run, client, make_server, reloads
+    ):
+        srv = make_server()
+        for n in range(5):
+            bad = do_enroll(run, client, srv, make_foreign_token(srv), fname=f"bad{n}")
+            assert bad.exit_code == 1, bad.stderr
+        good = srv.token()
+        before = db_state(client)
+        result = do_enroll(run, client, srv, good, fname="good")
+        assert result.exit_code == 75, result.stderr
+        assert "(HTTP 429, too many failed enrollments)" in result.stderr
+        assert "wait about 15 minutes and try again" in result.stderr
+        assert re.search(r"\(Retry-After: (899|900)s\)", result.stderr), result.stderr
+        assert srv.token_state() == "active"                       # the token was not spent
+        assert dest(client) is None
+        untouched(client, before, reloads)
+
+    def test_the_parser_never_raises_on_what_a_server_can_send(self):
+        parse = enroll_cli._parse_retry_after
+        assert parse("\u0664\u0662", {}) is None                  # Arabic-Indic digits: not delta-seconds
+        assert parse(None, {}) is None and parse(30, {}) is None and parse(b"30", {}) is None
+        assert parse("30", {}) == 30 and parse(" 30 ", {}) == 30
+        assert parse("99999999", {}) == 86400
+        assert parse("999999999999", {"retry_after": 7}) == 7      # over nine digits: not believed
+        assert parse(None, {"retry_after": 1e30}) == 86400
+        assert parse(None, {"retry_after": float("inf")}) == 86400
+        assert parse(None, {"retry_after": float("nan")}) is None
+        assert parse("Thu, 01 Jan 1970 00:00:00 GMT", {}) == 0
+        assert parse("Thu, 01 Jan 2999 00:00:00 GMT", {}) == 86400
+
+    @pytest.mark.parametrize("seconds, phrase", [
+        (None, "wait a little"), (0, "wait about 1 second"), (1, "wait about 1 second"),
+        (2, "wait about 2 seconds"), (89, "wait about 89 seconds"), (90, "wait about 2 minutes"),
+        (900, "wait about 15 minutes"), (5399, "wait about 90 minutes"), (5400, "wait about 2 hours"),
+        (3600 * 24, "wait about 24 hours"),
+    ])
+    def test_the_wait_phrase(self, seconds, phrase):
+        assert enroll_cli._wait_phrase(seconds).startswith(phrase)

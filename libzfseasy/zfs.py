@@ -1,13 +1,17 @@
 from libzfseasy.types import InvalidNameError, InvalidValueError, Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as Snapshot, Bookmark, \
      SnapshotRange, Property, Properties
-from typing import Optional, Union, Dict, Iterable, Callable
+from typing import Optional, Union, Dict, Iterable, Callable, NamedTuple, Tuple
 
 import collections
+import contextlib
+import contextvars
 import dataclasses
 import io
 import logging
+import math
 import os
 import re
+import selectors
 import shlex
 import subprocess
 import shutil
@@ -64,12 +68,15 @@ _warned_lock = threading.Lock()
 # instead of going quiet for the rest of a long-lived process.
 _WARNED_NAMES_TTL = 3600.0
 _warned_names_since = None
+# Bumped (under the lock) every time `_skip_invalid_name` logs a WARNING, for callers that cannot see its return value.
+_name_warnings = 0
 
 
-def _skip_invalid_name(name: str, error: Exception) -> None:
+def _skip_invalid_name(name: str, error: Exception) -> bool:
     """Log (once per distinct name per `_WARNED_NAMES_TTL`) that a row of zfs output was skipped because its name is
-    one zfs allows but libzfseasy cannot represent."""
-    global _warned_names_since
+    one zfs allows but libzfseasy cannot represent. Returns True when this call logged a WARNING (a new name, one whose
+    TTL expired, or the one-off "too many distinct names" notice), False when the name was already reported."""
+    global _warned_names_since, _name_warnings
     with _warned_lock:
         now = time.monotonic()
         if _warned_names_since is None:
@@ -78,15 +85,19 @@ def _skip_invalid_name(name: str, error: Exception) -> None:
             _warned_names.clear()
             _warned_names_since = now
         if name in _warned_names:
-            return
+            return False
         if len(_warned_names) >= _MAX_WARNED_NAMES:
             if len(_warned_names) == _MAX_WARNED_NAMES:
                 _warned_names.add(None)
+                _name_warnings += 1
                 logger.warning('skipping names from zfs output: more than %d distinct names libzfseasy cannot '
                                'represent; further ones are skipped silently', _MAX_WARNED_NAMES)
-            return
+                return True
+            return False
         _warned_names.add(name)
+        _name_warnings += 1
     logger.warning('skipping %r from zfs output: libzfseasy cannot represent this name (%s)', _clip(name), error)
+    return True
 
 
 # How much of a skipped row (or name) a warning quotes, and how many skipped rows one listing reports one by one before
@@ -108,8 +119,43 @@ class _SkippedRows:
     def __init__(self, command: str):
         self.command = command
         self.count = 0
+        # Every row the parse refused, logged one by one or not (`count` only counts what `skip` handled, for the
+        # summary line), and why the first one was; `list(strict=True)` raises on a non-zero total.
+        self.total = 0
+        self.first_problem = None
+        # The names zfs printed that libzfseasy cannot represent (reported once per name by `_skip_invalid_name`);
+        # `done()` adds their count to the listing's summary.
+        self.unrepresentable_names = 0
+        # Whether this listing logged a per-name WARNING (see `_skip_invalid_name`), which decides the summary's level.
+        self._name_warned = False
+
+    def _remember(self, reason: str, row=None) -> None:
+        self.total += 1
+        if self.first_problem is None:
+            self.first_problem = reason if row is None else '%s: %r' % (reason, _clip(_redact(row)))
+
+    def untrusted(self, reason: str, row=None) -> None:
+        """Count a row that was skipped (and reported) elsewhere, without logging it again."""
+        self._remember(reason, row)
+
+    def unrepresentable(self, name: str, error: Exception, row=None) -> None:
+        """Report (once per name) and count a name zfs allows but libzfseasy cannot represent. It counts toward
+        `total`, like `untrusted`, and toward the "cannot represent" count in the summary of `done()`."""
+        if _skip_invalid_name(name, error):
+            self._name_warned = True
+        self.count_unrepresentable(name, error, row)
+
+    def count_unrepresentable(self, name: str, error=None, row=None, warned: bool = False) -> None:
+        """Count a name libzfseasy cannot represent that was already handled by `_skip_invalid_name`; `warned` says
+        whether that call logged a WARNING."""
+        if warned:
+            self._name_warned = True
+        self.unrepresentable_names += 1
+        self._remember('libzfseasy cannot represent the name' + ('' if error is None else ' (%s)' % _clip(error)),
+                       row if row is not None else name)
 
     def skip(self, reason: str, row=None) -> None:
+        self._remember(reason, row)
         self.count += 1
         if self.count <= _MAX_ROW_WARNINGS:
             if row is None:
@@ -121,6 +167,12 @@ class _SkippedRows:
         if self.count > _MAX_ROW_WARNINGS:
             logger.warning('skipped %d malformed rows of zfs %s output in total (the first %d are logged above)',
                            self.count, self.command, _MAX_ROW_WARNINGS)
+        if self.unrepresentable_names:
+            # A name that persists is listed every cycle: WARNING only when this listing also logged a per-name
+            # WARNING (a new name, or one whose dedup TTL expired), otherwise DEBUG, so the hourly dedup holds.
+            logger.log(logging.WARNING if self._name_warned else logging.DEBUG,
+                       'skipped %d name%s libzfseasy cannot represent in zfs %s output',
+                       self.unrepresentable_names, '' if self.unrepresentable_names == 1 else 's', self.command)
 
 
 # The object types a row of `zfs list` / `zfs get` output can have.
@@ -147,6 +199,81 @@ def _type_problem(name: str, dstype: str, wanted: Optional[set]) -> Optional[str
     if (shape or 'dataset') != ('dataset' if dstype in ('filesystem', 'volume') else dstype):
         return 'name does not match type ' + dstype
     return None
+
+
+class ZFSOutputError(Exception):
+    """zfs output could not be trusted (`zfs.get.rows(..., strict=True)`). Deliberately a plain `Exception` subclass,
+    like every other zfs failure of this library: not a `ValueError` (that means a bad argument) and not an `OSError`."""
+
+
+class GetRow(NamedTuple):
+    """One row of `zfs get -H`, exactly as zfs printed it: `value` and `received` are raw (`-` is not mapped to
+    None; invalid UTF-8 is kept through surrogateescape); `received` is None when the call asked for no `received`
+    column."""
+    name: str
+    property: str
+    value: str
+    received: Optional[str]
+    source: str
+
+
+class GetRows(list):
+    """The rows `zfs.get.rows()` could trust (a list of `GetRow`), with what it could not:
+
+    complete -- True when nothing at all was refused or missing. Every safety decision (a protect set, a prune)
+        must use this, or `strict=True`: an object's rows may be incomplete without anything naming the object.
+    dropped -- frozenset of the names of the objects whose rows were refused as a whole (and, with `verify_names`,
+        of the objects `zfs list` printed that `zfs get` did not). It only names what it can: a stray fragment of a
+        forged value identifies no object, so `dropped` can be empty while `complete` is False. Use it to target
+        a re-read, never to decide that nothing was lost.
+    skipped -- how many rows / objects were refused in all, named or not."""
+
+    def __init__(self, rows=(), skipped: int = 0, dropped=frozenset()):
+        super().__init__(rows)
+        self.skipped = int(skipped)
+        self.dropped = frozenset(dropped)
+
+    @property
+    def complete(self) -> bool:
+        return self.skipped == 0
+
+
+class PropertySource(NamedTuple):
+    """One row of `zfs.get.property_sources()`: an object, one of its properties and where that property's value comes
+    from, exactly as zfs printed them. There is no value in it, by design. `source` is `local`, `default`, `received`,
+    `temporary`, `inherited from <dataset>` or `-` (the property does not apply, or is a read-only one)."""
+    name: str
+    property: str
+    source: str
+
+
+# The sources `zfs get` prints besides `inherited from <dataset>`.
+_PLAIN_SOURCES = frozenset(('local', 'default', 'received', 'temporary', '-'))
+_INHERITED = 'inherited from '
+
+
+def _plain_name_problem(name: str) -> Optional[str]:
+    """Why `name` cannot be an object name zfs printed, or None. Deliberately only the *shape* (non-empty, no control
+    character, no byte that was not valid UTF-8, within zfs's 255-byte limit), not `Validate.dataset`: a name zfs allows
+    but libzfseasy cannot represent must still be seen by a caller that is deciding what is safe to keep."""
+    if not name:
+        return 'empty name'
+    if any(ord(c) < 0x20 or ord(c) == 0x7f or 0xd800 <= ord(c) <= 0xdfff for c in name):
+        return 'a control character or an invalid byte in a name'
+    if len(name.encode('utf-8', 'surrogateescape')) > Validate.max_name_len:
+        return 'a name longer than %d bytes' % Validate.max_name_len
+    return None
+
+
+class _Group:
+    """The rows of one object in `zfs get -H` output (see `GetCommand._groups`)."""
+    __slots__ = ('name', 'rows', 'bad', 'dstype')
+
+    def __init__(self, name: str):
+        self.name = name
+        self.rows = []      # (property, value, received, source) in the order zfs printed them
+        self.bad = False    # refused as a whole (already reported)
+        self.dstype = None  # the value of the `type` row
 
 
 class _Scope:
@@ -200,8 +327,261 @@ class _Scope:
 
 
 # How long to give an abandoned child process to honor SIGTERM before
-# escalating to SIGKILL when reaping it in Command._exec_out's finally block.
+# escalating to SIGKILL when reaping it in Command._exec_lines's finally block.
 _TERMINATE_TIMEOUT = 5
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Slow-command watchdog (S2a) and opt-in timeouts (S2b)
+# ---------------------------------------------------------------------------------------------------------------------
+
+# Seconds after which a command that is still running is reported at WARNING on the 'libzfseasy' logger, and again at
+# each further multiple. One rule for this module and for `libzfseasy.slow_command_warning` (the package forwards the
+# attribute here; `del libzfseasy.slow_command_warning` restores the default): a positive finite number turns the
+# warning on; None, zero, a negative number or infinity turn it off; anything else (a bool, a string, NaN) is invalid,
+# which the package setter refuses with ValueError and a read here treats as off (a bad setting must never fail a
+# command). Read when each command starts, so a change applies to the commands that start afterwards. Behaviour is
+# otherwise unchanged: the watchdog only logs.
+DEFAULT_SLOW_COMMAND_WARNING = 60
+slow_command_warning = DEFAULT_SLOW_COMMAND_WARNING
+
+# Bytes asked of a pipe per `os.read` when reading under a timeout.
+_READ_SIZE = 65536
+# After the deadline of a timed call: how long to wait for the child after SIGTERM, and again after SIGKILL.
+_EXPIRY_WAIT = 2
+# After the child of a timed-out call is gone: how long to wait for its stderr reader before leaving it to finish by
+# itself (a grandchild may hold stderr open; the reader is a daemon thread and keeps its pipe alive until it ends).
+_EXPIRY_JOIN = 0.05
+# How long `_SlowCommandWatchdog.cancel` waits for the watchdog thread to return.
+_WATCHDOG_JOIN = 0.1
+
+
+class ZFSTimeoutError(Exception):
+    """A command run under `timeout()` did not finish in time, or was refused because an earlier timed-out child is
+    still alive. A plain `Exception` (not `OSError`, `ValueError` or the built-in `TimeoutError`). The outcome of a
+    command that timed out is unknown: a write may or may not have happened."""
+
+
+_timeout_var = contextvars.ContextVar('libzfseasy_timeout', default=None)
+
+_Thread = threading.Thread
+_Event = threading.Event
+
+
+def _check_seconds(value, what: str):
+    """`value` as a float if it is a positive, finite real number (not a bool); `ValueError` otherwise."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f'{what} must be a positive, finite number of seconds, got {value!r}')
+    return float(value)
+
+
+@contextlib.contextmanager
+def timeout(seconds):
+    """Bound every non-streaming command started inside the block to `seconds` of wall-clock time each.
+
+    `with libzfseasy.timeout(30): libzfseasy.list(...)`. The limit is held in a `contextvars.ContextVar`, so it
+    follows the calling thread (or asyncio task) only and applies to each command separately. It is read when a command
+    starts running: for the generators behind `list`/`get` that is the first `next()`, in the context of whoever calls
+    it, not where the call was made. Nested blocks: the innermost wins; `timeout(None)` lifts the limit inside an outer
+    block. No command signature changes.
+
+    Context caveats: a thread started inside the block normally begins with an empty context (no limit), but a
+    context-copying start (free-threaded builds' default, `asyncio.to_thread`, `contextvars.copy_context().run`)
+    inherits it. Do not put a `with timeout()` around a `yield` (in a generator or an async function): the limit
+    would apply to whoever resumes it.
+
+    A command that is not finished in time has its child terminated (SIGTERM, then SIGKILL after 2 s, each waited for
+    at most 2 s) and `ZFSTimeoutError` is raised; the outcome of the command is unknown. A child that survives SIGKILL
+    (uninterruptible sleep, typically a hung pool) cannot be freed: it stays registered, and every later call made
+    under a timeout raises `ZFSTimeoutError` at once, without starting a child, until it has exited. Calls made
+    without a timeout are never refused. A timeout frees the calling thread, not the stuck process;
+    `libzfseasy.stuck_children()` reports such processes (and reaps the ones that have since exited).
+
+    `send` and `receive` (and their `StreamHandle`s) ignore the timeout, as does `send.resume_info`. A lazy iterator
+    (`lazy=True`) spends its budget from the first row request until its last row, including the time the consumer
+    holds it between rows.
+
+    Keyword arguments:
+        seconds: float | None -- seconds per command, positive and finite; None for no limit
+
+    Raises:
+        ValueError -- `seconds` is not None and not a positive finite number
+    """
+    if seconds is not None:
+        seconds = _check_seconds(seconds, 'timeout')
+    token = _timeout_var.set(seconds)
+    try:
+        yield
+    finally:
+        _timeout_var.reset(token)
+
+
+def _slow_setting_valid(value) -> bool:
+    """Whether `value` is an acceptable `slow_command_warning`: None or a real number other than NaN (see the comment
+    at the setting)."""
+    return value is None or (isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isnan(value))
+
+
+def _slow_interval() -> Optional[float]:
+    """The slow-command warning interval in effect now, or None when the warning is off or the setting is invalid."""
+    value = slow_command_warning
+    if not _slow_setting_valid(value) or value is None or value <= 0 or math.isinf(value):
+        return None
+    return float(value)
+
+
+class _SlowCommandWatchdog:
+    """Logs a WARNING for a command that is still running, every `interval` seconds, until cancelled.
+
+    One daemon thread per watched call, parked on an `Event` (a Timer would need re-creating at every multiple). The
+    thread holds no lock shared with other calls and no module state, so it has nothing to repair after `fork()`: the
+    child simply has no such thread, and a `cancel()` there only sets the event. Starting it may fail (thread limit);
+    the command then runs unwatched. `cancel()` joins for at most `_WATCHDOG_JOIN`, so it cannot block on a stuck logging handler."""
+
+    def __init__(self, cmd, pid, interval: float):
+        self._cmd = cmd
+        self._pid = pid
+        self._interval = interval
+        self._started = time.monotonic()
+        self._stop = _Event()
+        self._thread = None
+
+    @classmethod
+    def for_command(cls, cmd, pid) -> Optional['_SlowCommandWatchdog']:
+        """A watchdog for the child `pid` of argv `cmd` (not started), or None when the warning is off. The argv is
+        redacted only when a warning is actually logged."""
+        interval = _slow_interval()
+        return None if interval is None else cls(cmd, pid, interval)
+
+    def start(self) -> None:
+        try:
+            thread = _Thread(target=self._run, name='libzfseasy-watchdog', daemon=True)
+            thread.start()
+        except Exception:
+            return
+        self._thread = thread
+
+    def cancel(self) -> None:
+        """Stop the watchdog. The thread is joined for at most `_WATCHDOG_JOIN` (it only has to wake and return, so
+        normally microseconds), so that no watchdog thread outlives the call it watched; a thread stuck in a logging
+        handler is left behind rather than waited for."""
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=_WATCHDOG_JOIN)
+
+    def _run(self) -> None:
+        try:
+            n = 1
+            while not self._stop.wait(max(0.0, self._started + n * self._interval - time.monotonic())):
+                if self._stop.is_set():
+                    break  # cancelled between the wake-up and now
+                try:
+                    label = _command_label(self._cmd)
+                except Exception:
+                    label = 'command'
+                now = time.monotonic()
+                logger.warning('%s (pid %s) is still running after %.1f s (slow-command warning every %g s)',
+                               label, self._pid, now - self._started, self._interval)
+                # After a stall (suspended process, clock jump, or the log call itself blocking on a slow handler) skip
+                # the multiples already passed: no burst. Read the clock again, as the warning above may have taken long.
+                n = max(n + 1, int((time.monotonic() - self._started) / self._interval) + 1)
+        except Exception:
+            pass
+
+
+class _DeadlineReached(Exception):
+    """Internal: a timed read ran out of time. Never leaves `_exec_lines`."""
+
+
+class _StuckChild:
+    """A child that a timed-out call could not get rid of (it survived SIGKILL). Kept in `_stuck` until it exits."""
+
+    def __init__(self, process, stderr_thread, label: str):
+        self.process = process
+        self.stderr_thread = stderr_thread
+        self.label = label
+        self.since = time.monotonic()
+
+    def release(self) -> None:
+        """The child has exited: close what this thread may close. stdout was closed at registration (this thread was
+        its only reader); stderr only once its reader has ended, as closing a pipe a thread is blocked on risks fd
+        reuse."""
+        StreamHandle._close_pipe(getattr(self.process, 'stdout', None))
+        thread = self.stderr_thread
+        if thread is None or not thread.is_alive():
+            StreamHandle._close_pipe(getattr(self.process, 'stderr', None))
+
+
+# Children that outlived a timeout plus SIGTERM plus SIGKILL. Guarded by `_stuck_lock`; both are replaced/emptied in a
+# forked child (the children are not the child's own, and the lock may have been held by a thread that does not exist
+# there).
+_stuck = []
+_stuck_lock = threading.Lock()
+
+
+def _register_stuck(process, stderr_thread, label: str) -> None:
+    with _stuck_lock:
+        _stuck.append(_StuckChild(process, stderr_thread, label))
+
+
+def _sweep_stuck() -> list:
+    """Poll the registered children, release the ones that exited and drop them; return the ones still alive."""
+    with _stuck_lock:
+        alive = []
+        for entry in _stuck:
+            try:
+                running = entry.process.poll() is None
+            except Exception:
+                running = False
+            if running:
+                alive.append(entry)
+            else:
+                entry.release()
+        _stuck[:] = alive
+        return list(alive)
+
+
+class StuckChild(NamedTuple):
+    """A snapshot of one child that survived a timeout's SIGTERM and SIGKILL (see `stuck_children`). Plain data: no
+    process object, so holding it keeps nothing alive. `since` is a `time.monotonic()` value (when it was registered)."""
+    pid: int
+    label: str
+    since: float
+
+
+def stuck_children() -> Tuple[StuckChild, ...]:
+    """The children of this process that a timed-out call could not get rid of (they survived SIGKILL, typically in
+    uninterruptible sleep on a hung pool) and that are still running, oldest first.
+
+    Cheap, thread-safe and never blocks: it takes the registry lock, polls each registered child without waiting
+    (`poll()`, a non-blocking `waitpid`), releases and drops the ones that have exited (so a recovered pool clears the
+    registry here, not only at the next timed call) and returns a snapshot. An empty tuple means no earlier timed-out
+    command can still be running in this process, so a caller that must not overlap a new zfs mutation with an
+    abandoned one polls this until it is empty. The registry is per process: it is empty in a forked child and lost
+    when the process exits, which is why a process replacing a worker has to wait for this before it lets go.
+    """
+    return tuple(StuckChild(getattr(e.process, 'pid', -1), e.label, e.since) for e in _sweep_stuck())
+
+
+def _admit_timed(cmd) -> None:
+    """Admission for a call under a timeout: sweep `_stuck`; if a timed-out child is still alive, raise
+    `ZFSTimeoutError` before any child is started."""
+    alive = _sweep_stuck()
+    if alive:
+        pids = ', '.join(str(getattr(e.process, 'pid', '?')) for e in alive)
+        raise ZFSTimeoutError(f'{_command_label(cmd)} not started: {len(alive)} earlier command(s) that timed out are '
+                              f'still running (pid {pids}); zfs is not answering')
+
+
+def _reset_stuck_after_fork() -> None:
+    global _stuck_lock
+    _stuck_lock = threading.Lock()
+    _stuck.clear()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_stuck_after_fork)
 
 # Limits on the stderr a streaming child can make us keep: at most this many lines from the start and from the end
 # (the middle is replaced by one marker line), each at most this many bytes.
@@ -241,6 +621,15 @@ def _log_command(cmd) -> None:
         logger.debug('Executing command: %s', shlex.join([_redact(a) for a in cmd]))
 
 
+def _command_label(cmd) -> str:
+    """The first words of an argv for a log message: the binary's base name and its subcommand, redacted and clipped."""
+    try:
+        words = [os.path.basename(str(cmd[0]))] + [str(a) for a in cmd[1:2]]
+    except (TypeError, IndexError):
+        return 'command'
+    return shlex.join([_redact(w) for w in words])
+
+
 def _check_values(properties) -> None:
     """Refuse (`Validate.value`) any value in a `{name: value}` mapping or `(name, value)` iterable that zfs output
     could not frame, before the command that would pass it to zfs is built. Values are checked as `str(value)`, the
@@ -255,7 +644,9 @@ def _check_values(properties) -> None:
 class _BoundedErrors(list):
     """A list of error lines that keeps the first and the last `_STDERR_KEEP_LINES` entries and collapses the
     middle into a single `... N lines omitted ...` marker, so a pathological stderr cannot grow memory without
-    bound. Appended to by the stderr reader thread and read only after the thread was joined."""
+    bound. Appended to by the stderr reader thread. It is read after the thread was joined; if the bounded join timed
+    out (a stray holder of the pipe), the reader may still be appending, which is harmless for a read that only
+    formats the lines collected so far."""
 
     def __init__(self):
         super().__init__()
@@ -310,52 +701,32 @@ class Command:
 
     @classmethod
     def _exec(cls, cmd):
-        _log_command(cmd)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
-                                   env=_child_env())
-        errors = []
-        stderr_thread = cls._start_stderr_reader(process, errors)
-        while True:
-            output = cls._exec_capture(process, errors, stderr_thread)
-            if output is False:
-                break
+        """Run `cmd` to completion for its side effect, discarding stdout. Built on `_exec_lines`, so it shares its
+        bytes/surrogateescape reading, bounded stderr and cleanup: if the caller is interrupted (any `BaseException`,
+        `KeyboardInterrupt` included) while the child runs, the child is terminated (SIGTERM, SIGKILL after
+        `_TERMINATE_TIMEOUT`) and reaped before the exception propagates. Raises the bare subprocess-error Exception
+        on a non-zero exit."""
+        lines = cls._exec_lines(cmd)
+        try:
+            for _ in lines:
+                pass
+        finally:
+            # Close explicitly: a traceback would otherwise keep the suspended generator (and its child) alive.
+            lines.close()
 
     @classmethod
     def _exec_out(cls, cmd):
-        _log_command(cmd)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
-                                   env=_child_env())
-        errors = []
-        stderr_thread = cls._start_stderr_reader(process, errors)
-        completed = False
+        """Run `cmd` and yield its stdout lines stripped, skipping empty ones (zfsbackup calls this directly). A
+        layer over `_exec_lines`: only `\\n` ends a line (`\\r` stays inside it), and an abandoned generator reaps
+        the child. Raises the bare subprocess-error Exception on a non-zero exit, after the last line."""
+        lines = cls._exec_lines(cmd)
         try:
-            while True:
-                output = cls._exec_capture(process, errors, stderr_thread)
-                if output is False:
-                    completed = True
-                    break
-                elif output != '' and output is not None:
-                    yield output
+            for line in lines:
+                line = line.strip()
+                if line:
+                    yield line
         finally:
-            # If the generator is abandoned mid-iteration (caller breaks out of
-            # a loop, or it's garbage collected), make sure the child is reaped
-            # and the stderr reader thread isn't left blocked on readline()
-            # forever. A normal, fully-consumed run has already reaped the
-            # child and joined the thread inside _exec_capture, so skip
-            # redoing that work (and an extra poll()) here.
-            if not completed:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=_TERMINATE_TIMEOUT)
-                    except subprocess.TimeoutExpired:
-                        # Child ignored SIGTERM; escalate rather than risk
-                        # the stderr thread staying blocked on readline()
-                        # (and this wait()) forever.
-                        process.kill()
-                        process.wait()
-                stderr_thread.join()
-                process.wait()
+            lines.close()
 
     @classmethod
     def _exec_lines(cls, cmd):
@@ -363,45 +734,220 @@ class Command:
         line's `\\n` is removed (a trailing empty column and trailing spaces in a value survive, `\\r` is not a line
         break) and blank lines are yielded too. Stdout is read as bytes and decoded as UTF-8 with `surrogateescape`, so
         an invalid byte in a value can neither raise nor be lost. Raises the bare subprocess-error Exception (stderr
-        lines) on a non-zero exit, after the last line. An abandoned generator reaps the child like `_exec_out`.
+        lines) on a non-zero exit, after the last line. An abandoned generator, or any exception raised into it (an
+        interrupt), terminates and reaps the child (see `_TERMINATE_TIMEOUT`). This is the one exec core: `_exec` and
+        `_exec_out` are built on it.
 
-        Unlike `_exec_out` (kept as it is: zfsbackup calls it directly) nothing is stripped or dropped."""
+        Unlike `_exec_out` (which strips and drops empty lines) nothing is stripped or dropped.
+
+        Two opt-ins act here, both read when the generator first runs: a still-running child is reported by the
+        slow-command watchdog (`slow_command_warning`), and under `timeout()` stdout is read against a deadline
+        (`_read_until`) and an expired call ends in `_expire` and `ZFSTimeoutError`. Without a timeout the path is the
+        plain `readline` loop."""
         _log_command(cmd)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
+        seconds = _timeout_var.get()
+        if seconds is not None:
+            _admit_timed(cmd)
+        started = time.monotonic()
         errors = _BoundedErrors()
-        stderr_thread = cls._start_stderr_reader_lines(process, errors)
+        process = None
+        stderr_thread = None
+        watchdog = None
+        deadline = None if seconds is None else started + seconds
+        timed = seconds is not None  # False again below if the pipe cannot be read against a deadline (a mock)
         completed = False
+        settled = False
         try:
-            while True:
-                line = process.stdout.readline()
-                rc = process.poll()
-                if isinstance(line, (bytes, bytearray)):
-                    line = bytes(line).decode('utf-8', errors='surrogateescape')
-                if not isinstance(line, str) or line == '':
-                    break
-                yield line[:-1] if line.endswith('\n') else line
-            # stdout hit EOF: block until the child exits (never spin), then collect the whole of stderr.
-            if rc is None:
-                rc = process.wait()
-            cls._join_stderr_reader(stderr_thread)
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
+            stderr_thread = cls._start_stderr_reader_lines(process, errors)
+            watchdog = _SlowCommandWatchdog.for_command(cmd, getattr(process, 'pid', None))
+            if watchdog is not None:
+                watchdog.start()
+            fd = cls._timed_fd(process) if timed else None
+            if fd is None:
+                timed = False
+                while True:
+                    line = process.stdout.readline()
+                    rc = process.poll()
+                    if isinstance(line, (bytes, bytearray)):
+                        line = bytes(line).decode('utf-8', errors='surrogateescape')
+                    if not isinstance(line, str) or line == '':
+                        break
+                    yield line[:-1] if line.endswith('\n') else line
+                # stdout hit EOF: block until the child exits (never spin), then collect the whole of stderr.
+                if rc is None:
+                    rc = process.wait()
+            else:
+                try:
+                    rc = yield from cls._read_until(process, fd, deadline)
+                except _DeadlineReached:
+                    error = cls._expire(process, stderr_thread, cmd, seconds)
+                    settled = True  # the child is reaped or registered; the cleanup below must not repeat it
+                    raise error from None
+            if timed:
+                # The budget bounds this wait too (the child has exited; only a grandchild holding stderr can stall it).
+                cls._join_stderr_reader(stderr_thread, min(_TERMINATE_TIMEOUT, max(0.0, deadline - time.monotonic())))
+            else:
+                cls._join_stderr_reader(stderr_thread)
             completed = True
         finally:
-            if not completed:
-                if process.poll() is None:
-                    process.terminate()
+            if watchdog is not None:
+                watchdog.cancel()
+            if not completed and not settled and process is not None and timed:
+                # Any exit other than the deadline (a consumer that raised, close() or GC of the generator, an
+                # interrupt): the same bounded sequence as an expiry, ending in the registry if the child survives
+                # SIGKILL. The original exception propagates afterwards.
+                cls._reap_timed(process, stderr_thread, cmd)
+            elif not completed and not settled and process is not None:
+                abandoned = False
+                try:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=_TERMINATE_TIMEOUT)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            try:
+                                process.wait(timeout=_TERMINATE_TIMEOUT)
+                            except subprocess.TimeoutExpired:
+                                # SIGKILL did not take effect: the child is in uninterruptible sleep (typically a hung
+                                # pool). Never block the caller on it; Popen reaps it later when it finally exits.
+                                abandoned = True
+                                logger.warning('%s (pid %s) did not exit after SIGKILL (uninterruptible, likely a '
+                                               'hung pool); abandoning it', _command_label(cmd), process.pid)
+                except BaseException:
+                    # A further interrupt arrived while waiting: do not leave a SIGTERM-ignoring child running.
                     try:
-                        process.wait(timeout=_TERMINATE_TIMEOUT)
-                    except subprocess.TimeoutExpired:
                         process.kill()
-                        process.wait()
-                cls._join_stderr_reader(stderr_thread)
-                process.wait()
+                    except OSError:
+                        pass
+                    raise
+                if not abandoned:
+                    # (An abandoned child still holds stderr open, so the join could only time out.)
+                    cls._join_stderr_reader(stderr_thread)
+                    process.wait()
         if rc != 0:
             raise Exception(_failure_text(errors, rc))
 
     @staticmethod
+    def _timed_fd(process) -> Optional[int]:
+        """The stdout file descriptor to read under a timeout, or None when the process has no real one (a mocked
+        pipe), in which case the call reads with `readline` and the timeout cannot apply."""
+        try:
+            fd = process.stdout.fileno()
+        except (AttributeError, OSError, ValueError):
+            return None
+        return fd if isinstance(fd, int) and not isinstance(fd, bool) else None
+
+    @staticmethod
+    def _read_until(process, fd: int, deadline: float):
+        """Generator behind `_exec_lines` under a timeout: yield the lines of the child's stdout (same framing and
+        decoding as the `readline` path) reading with `selectors` and `os.read` so the wait can end at `deadline` (a
+        monotonic time), then wait for the child to exit, also until `deadline`. Returns its return code. Raises
+        `_DeadlineReached` only if the child is still running at the deadline; the selector is closed on every way
+        out. Bypasses the `process.stdout` buffer entirely, so nothing that is read can be lost in it.
+
+        A child that has already exited when the deadline passes is not a timeout: what is already in the pipe is
+        read without blocking and the call completes normally (if a grandchild still holds the pipe open, stdout is
+        closed here, this being its only reader)."""
+        selector = selectors.DefaultSelector()
+        held = False
+        try:
+            selector.register(fd, selectors.EVENT_READ)
+            pending = b''
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if process.poll() is None:
+                        raise _DeadlineReached()
+                    remaining = 0.0  # finished: take what is already there, never block
+                if not selector.select(remaining):
+                    if remaining > 0:
+                        continue  # the deadline is checked at the top
+                    held = True  # nothing more to read, yet no EOF: someone else holds the write end
+                    break
+                chunk = os.read(fd, _READ_SIZE)
+                if not chunk:
+                    break
+                pending += chunk
+                start = 0
+                while True:
+                    end = pending.find(b'\n', start)
+                    if end < 0:
+                        break
+                    yield pending[start:end].decode('utf-8', errors='surrogateescape')
+                    start = end + 1
+                pending = pending[start:]
+            if pending:
+                yield pending.decode('utf-8', errors='surrogateescape')
+            rc = process.poll()
+            if rc is None:
+                try:
+                    rc = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    rc = process.poll()
+                    if rc is None:
+                        raise _DeadlineReached() from None
+            return rc
+        finally:
+            selector.close()
+            if held:
+                StreamHandle._close_pipe(process.stdout)
+
+    @classmethod
+    def _reap_timed(cls, process, stderr_thread, cmd) -> bool:
+        """Get rid of the child of a timed call that ends early. Returns True if the child could not be killed.
+
+        If the child is running: SIGTERM, wait up to `_EXPIRY_WAIT`; SIGKILL, wait up to `_EXPIRY_WAIT`. A child that
+        is still alive then is registered in `_stuck` (it is not ours to wait for any longer) and a WARNING is logged.
+        stdout is closed either way: this thread is its only reader. stderr is never closed while its reader may be
+        blocked on it: for a reaped child the reader is given `_EXPIRY_JOIN` and the pipe is closed only if it ended;
+        a stuck child's stderr stays open (closing a busy fd risks fd reuse) until a sweep finds the child gone. A
+        further interrupt while waiting kills the child and propagates."""
+        stuck = False
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=_EXPIRY_WAIT)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=_EXPIRY_WAIT)
+                    except subprocess.TimeoutExpired:
+                        stuck = True
+        except BaseException:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            raise
+        if stuck:
+            label = _command_label(cmd)
+            _register_stuck(process, stderr_thread, label)
+            logger.warning('%s (pid %s) did not exit after SIGTERM and SIGKILL (uninterruptible, likely a hung pool); '
+                           'calls under a timeout are refused until it exits', label, process.pid)
+        StreamHandle._close_pipe(process.stdout)
+        if not stuck:
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=_EXPIRY_JOIN)
+            if stderr_thread is None or not stderr_thread.is_alive():
+                StreamHandle._close_pipe(process.stderr)
+        return stuck
+
+    @classmethod
+    def _expire(cls, process, stderr_thread, cmd, seconds) -> 'ZFSTimeoutError':
+        """A timed call ran out of time with its child still running: reap it (`_reap_timed`) and build the
+        `ZFSTimeoutError` to raise."""
+        stuck = cls._reap_timed(process, stderr_thread, cmd)
+        message = f'{_command_label(cmd)} timed out after {seconds:g}s; outcome unknown'
+        if stuck:
+            message += f' (pid {process.pid} did not exit after SIGKILL)'
+        return ZFSTimeoutError(message)
+
+    @staticmethod
     def _start_stderr_reader_lines(process, errors):
-        """`_start_stderr_reader` for a pipe that may be binary (decoded as UTF-8 with replacement, so an odd byte
+        """The stderr reader for a pipe that may be binary (decoded as UTF-8 with replacement, so an odd byte
         cannot kill the reader and leave the child blocked on a full pipe) or text (a mocked process). Lines are
         read at most `_STDERR_MAX_LINE` at a time; anything that is neither ends the thread quietly."""
         def reader():
@@ -433,28 +979,37 @@ class Command:
         `env` replaces the child's environment when given (default: `_child_env()`, the C locale). Output is decoded as UTF-8 with
         replacement, so odd bytes can neither raise nor kill the stderr reader (which would leave the child blocked on a full pipe)."""
         _log_command(cmd)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
-                                   encoding='utf-8', errors='replace',
-                                   env=_child_env() if env is None else env)
         errors = _BoundedErrors()
-        if raw_stderr:
-            def reader():
-                try:
-                    while True:
-                        line = process.stderr.readline()
-                        if line == '':
-                            break
-                        errors.append(line.rstrip('\r\n'))
-                except (OSError, ValueError):
-                    # The pipe broke or was closed under us; whatever was read so far stands.
-                    pass
-            stderr_thread = threading.Thread(target=reader, daemon=True)
-            stderr_thread.start()
-        else:
-            stderr_thread = cls._start_stderr_reader(process, errors)
+        process = None
+        stderr_thread = None
         lines = []
+        watchdog = None
         completed = False
         try:
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                                       encoding='utf-8', errors='replace',
+                                       env=_child_env() if env is None else env)
+            if raw_stderr:
+                stderr = process.stderr
+
+                def reader():
+                    try:
+                        while True:
+                            line = stderr.readline()
+                            if line == '':
+                                break
+                            errors.append(line.rstrip('\r\n'))
+                    except (OSError, ValueError):
+                        # The pipe broke or was closed under us; whatever was read so far stands.
+                        pass
+                thread = threading.Thread(target=reader, daemon=True)
+                thread.start()
+                stderr_thread = thread  # only a started thread may be joined by the cleanup
+            else:
+                stderr_thread = cls._start_stderr_reader_lines(process, errors)
+            watchdog = _SlowCommandWatchdog.for_command(cmd, getattr(process, 'pid', None))
+            if watchdog is not None:
+                watchdog.start()
             while True:
                 line = process.stdout.readline()
                 if line == '':
@@ -464,28 +1019,14 @@ class Command:
             cls._join_stderr_reader(stderr_thread)
             completed = True
         finally:
-            if not completed:
+            if watchdog is not None:
+                watchdog.cancel()
+            if not completed and process is not None:
                 if process.poll() is None:
                     process.kill()
                     process.wait()
                 cls._join_stderr_reader(stderr_thread)
         return lines, list(errors), rc
-
-    @staticmethod
-    def _start_stderr_reader(process, errors):
-        # Drain stderr in a dedicated thread so a full stderr pipe can never
-        # block the child while we read stdout (and vice versa).
-        def reader():
-            while True:
-                line = process.stderr.readline()
-                if line == '':
-                    break
-                error = line.strip()
-                if error:
-                    _append_error(errors, error)
-        thread = threading.Thread(target=reader, daemon=True)
-        thread.start()
-        return thread
 
     @staticmethod
     def _start_stderr_reader_bin(process, errors):
@@ -522,13 +1063,14 @@ class Command:
         return thread
 
     @staticmethod
-    def _join_stderr_reader(thread):
-        # Bounded: a stray grandchild holding the pipe open must not hang the caller (the thread is a daemon).
+    def _join_stderr_reader(thread, bound=None):
+        # Bounded (`_TERMINATE_TIMEOUT`, or `bound` if given): a stray grandchild holding the pipe open must not hang
+        # the caller (the thread is a daemon).
         # Joined at most once per thread: a second caller (e.g. the abort path after a failed start) must not
         # wait out the timeout again for a reader that already timed out.
         if thread is None or getattr(thread, '_libzfseasy_joined', False) is True:
             return
-        thread.join(timeout=_TERMINATE_TIMEOUT)
+        thread.join(timeout=_TERMINATE_TIMEOUT if bound is None else bound)
         thread._libzfseasy_joined = True
 
     @classmethod
@@ -566,23 +1108,6 @@ class Command:
                 pipe = getattr(process, name, None)
                 if pipe is not None and not (thread is not None and thread.is_alive() and name == 'stderr'):
                     StreamHandle._close_pipe(pipe)
-
-    @staticmethod
-    def _exec_capture(process, errors, stderr_thread=None):
-        stdout = process.stdout.readline()
-        rc = process.poll()
-        if stdout != '':
-            return stdout.strip()
-        # stdout hit EOF; block until the child actually exits instead of
-        # returning None and letting the caller's `while True` loop spin on
-        # readline()/poll() until it does.
-        if rc is None:
-            rc = process.wait()
-        if stderr_thread is not None:
-            stderr_thread.join()
-        if rc != 0:
-            raise Exception(_failure_text(errors, rc))
-        return False
 
 
 class StreamHandle:
@@ -641,7 +1166,17 @@ class StreamHandle:
                 self._stream.close()
             except (OSError, ValueError) as e:
                 stream_error = e
-        rc = self._process.wait()
+        # The wait for the child to finish after the stream was closed is watched (slow-command warning); the transfer
+        # itself, which the caller drove, never is.
+        watchdog = _SlowCommandWatchdog.for_command(getattr(self._process, 'args', None),
+                                                    getattr(self._process, 'pid', None))
+        try:
+            if watchdog is not None:
+                watchdog.start()
+            rc = self._process.wait()
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
         # Only now is the handle done: an interrupt inside wait() leaves it open so a later close() can finish.
         self._closed = True
         reader = self._stderr_thread
@@ -773,6 +1308,7 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
             sort: str | [str] | {str, bool} -- result sorting order (default None)
             asc: bool -- whether to sort in ascending order (default True)
             lazy: bool -- whether to return a generator instead of a list (default False)
+            strict: bool -- raise instead of skipping rows that cannot be trusted (default False; see below)
 
         Returns:
             An Iterable containing ZFS datasets -- a Generator if lazy is True, List otherwise
@@ -783,6 +1319,13 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
         roots / depth, a name libzfseasy cannot parse, and -- in the default (list) mode only -- a name that appears
         more than once, which drops every row with that name. A lazy listing applies the per-row checks only: it
         cannot take back an object it has already yielded when the same name appears again later.
+
+        With `strict=True` the same rows are still logged, but if there was any of them the call raises a bare
+        Exception whose message starts with 'zfs list output could not be trusted:' (it gives how many rows and why
+        the first one was refused) instead of returning a partial result. It is raised only after zfs has been read
+        to the end and has exited, and a zfs failure (non-zero exit) takes precedence with its own error.
+        `strict=True` with `lazy=True` raises ValueError before anything runs: a lazy listing cannot take back
+        objects it has already yielded.
         """
 
         return self._list(*args, **kwargs)
@@ -790,7 +1333,11 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
     @classmethod
     def _list(cls, roots: Optional[DatasetList] = None, types: Optional[str] = None, recursive: bool = False,
               depth: int = 0, properties: Optional[StringList] = None, sort: Optional[Sort] = None,
-              asc: bool = True, lazy=False) -> Iterable[ZFS]:
+              asc: bool = True, lazy=False, strict: bool = False) -> Iterable[ZFS]:
+
+        if strict and lazy:
+            raise ValueError('strict=True cannot be combined with lazy=True: a lazy listing cannot take back the '
+                             'objects it has already yielded')
 
         cmd = [_zfs_cmd(), 'list', '-H']
 
@@ -840,6 +1387,9 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
         for n in sorted(twice):
             skips.skip('name appears %d times' % names[n], n)
         skips.done()
+        if strict and skips.total:
+            raise Exception('zfs list output could not be trusted: %d row%s skipped, the first: %s' % (
+                skips.total, '' if skips.total == 1 else 's', skips.first_problem))
         return [o for o in result if o.name not in twice]
 
     @classmethod
@@ -913,7 +1463,7 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
         try:
             obj = ZFS.from_name(name, dstype)
         except InvalidNameError as e:
-            _skip_invalid_name(name, e)
+            skips.unrepresentable(name, e, line)
             return None, False
         except ValueError as e:
             skips.skip('cannot parse the name (%s)' % _clip(e), line)
@@ -1099,11 +1649,16 @@ class DestroyCommand(Command):
     def _destroy_lines(lines: Iterable[str]) -> Iterable[str]:
         # `zfs destroy -v -p` prints `destroy\t<name>` per object and a final `reclaim\t<bytes>` summary line; only
         # the former are returned.
-        for line in lines:
-            line = line.strip()
-            if line.startswith('reclaim\t'):
-                continue
-            yield line.replace('destroy\t', '')
+        try:
+            for line in lines:
+                line = line.strip()
+                if line.startswith('reclaim\t'):
+                    continue
+                yield line.replace('destroy\t', '')
+        finally:
+            close = getattr(lines, 'close', None)
+            if close is not None:
+                close()
 
     @classmethod
     def dataset(cls, dataset: Dataset, destroy: bool = False, recursive: bool = False, clones: bool = False,
@@ -1116,12 +1671,17 @@ class DestroyCommand(Command):
         if force:
             cmd += ['-f']
         cmd += [str(dataset)]
-        result = cls._destroy_lines(cls._exec_out(cmd))
+        source = cls._exec_out(cmd)
+        result = cls._destroy_lines(source)
 
         if lazy:
             return (o for o in result)
-        else:
+        try:
             return [o for o in result]
+        finally:
+            # An interrupt in the comprehension must not leave the child alive behind the traceback's frame.
+            result.close()
+            source.close()
 
     @classmethod
     def snapshots(cls, snapshots: Union[Snapshots, Iterable[Snapshots]], destroy: bool = False, recursive: bool = False,
@@ -1146,12 +1706,17 @@ class DestroyCommand(Command):
         if force:
             cmd += ['-d']
         cmd += [snaps]
-        result = cls._destroy_lines(cls._exec_out(cmd))
+        source = cls._exec_out(cmd)
+        result = cls._destroy_lines(source)
 
         if lazy:
             return (o for o in result)
-        else:
+        try:
             return [o for o in result]
+        finally:
+            # An interrupt in the comprehension must not leave the child alive behind the traceback's frame.
+            result.close()
+            source.close()
 
     @classmethod
     def bookmark(cls, bookmark: Bookmark, destroy: bool = True) -> None:
@@ -1345,7 +1910,8 @@ class CloneCommand(Command):
 
 # The rows `zfs get` prints first for every object: `name`, `type` for an explicit property list (`GetCommand` sends
 # them first), `type` for `all` (the first entry of OpenZFS's property table; the leading `name` is a placeholder
-# zfs skips). `GetCommand` never passes `-s` to zfs (it filters sources itself), which would drop these rows.
+# zfs skips). `GetCommand` never passes `-s` to zfs (it filters sources itself), which would drop these rows -- except
+# `property_sources`, which has no value column and so no lead rule.
 _LEAD_LIST = ('name', 'type')
 _LEAD_ALL = ('type',)
 
@@ -1373,8 +1939,9 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         ambiguous, an invalid property name, a property twice for one object, a name outside the requested objects /
         depth, an object without a valid `type` row, an object whose rows do not start with the rows zfs prints first
         (`name`, `type` for a property list, `type` for `all`: rows forged for the next object would merge into its
-        group, but not without repeating them) and -- in the default (list) mode only -- every object whose rows
-        are not contiguous (zfs prints each object's rows together, so a name that comes back was forged). A lazy
+        group, but not without repeating them; with a property list also an object whose rows are not exactly
+        `name`, `type` and the requested properties, in that order) and -- in the default (list) mode only -- every
+        object whose rows are not contiguous (zfs prints each object's rows together, so a name that comes back was forged). A lazy
         call drops a name that comes back too, but cannot take back the object it already yielded under that name.
         For one value read safely whatever it contains, use `value()`.
         """
@@ -1396,27 +1963,184 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             cls._get_options(recursive=recursive, depth=depth, types=types, properties=properties, datasets=datasets)
         scope = _Scope(datasets, recursive=recursive, depth=depth)
         lead = cls._lead_properties(properties)
+        expected = cls._expected_properties(properties)
 
         if lazy:
-            return cls._lazy_objects(cmd, sources, scope, wanted, lead)
+            return cls._lazy_objects(cmd, sources, scope, wanted, lead, expected)
 
         skips = _SkippedRows('get')
         twice = set()
         result = list(cls._lines_to_objects(cls._exec_lines(cmd), sources, skips=skips, scope=scope, types=wanted,
-                                            twice=twice, lead=lead))
+                                            twice=twice, lead=lead, expected=expected))
         skips.done()
         return [o for o in result if o is not None and o.name not in twice]
 
     @classmethod
-    def _lazy_objects(cls, cmd, sources, scope, wanted, lead=_LEAD_ALL):
+    def _lazy_objects(cls, cmd, sources, scope, wanted, lead=_LEAD_ALL, expected=None):
         skips = _SkippedRows('get')
         try:
             for obj in cls._lines_to_objects(cls._exec_lines(cmd), sources, skips=skips, scope=scope, types=wanted,
-                                             lead=lead):
+                                             lead=lead, expected=expected):
                 if obj is not None:
                     yield obj
         finally:
             skips.done()
+
+    @classmethod
+    def rows(cls, ds: Optional[DatasetList] = None, properties: Optional[StringList] = 'all',
+             types: Optional[StringList] = 'all', sources: Optional[StringList] = 'all', recursive: bool = False,
+             depth: int = 0, strict: bool = False, verify_names: bool = True, received: bool = True) -> GetRows:
+        """Read properties as the raw rows zfs printed (`zfs get -H`), for callers that must know whether anything
+        was lost: a list of `GetRow(name, property, value, received, source)` that says whether it is `.complete`.
+
+        Keyword arguments:
+            ds: ZFS | [ZFS] -- objects to read (default None: every dataset)
+            properties: str | [str] -- properties to read (default 'all')
+            types: str | [str] -- object types to read (default 'all')
+            sources: str | [str] -- keep only rows from these sources (default 'all'); the `name` and `type` rows are
+                always kept. `inherited` also matches `inherited from <dataset>`. Filtered here, never by `zfs get -s`
+                (which would drop the `type` rows the checks below need)
+            recursive: bool -- also read the descendants (default False)
+            depth: int -- descendant depth to read (default 0)
+            strict: bool -- raise `ZFSOutputError` instead of returning a result that is not `.complete` (default False)
+            verify_names: bool -- also run a name-only `zfs list -H -o name,type` with the same objects, types, `-r`
+                and `-d`, and refuse any object whose name is not in it (a whole object forged through a value that
+                contains newlines is not there: names cannot contain a tab or newline, so that listing cannot be
+                forged) or that is in it but was not read (default True). Costs a second zfs run
+            received: bool -- also read the `received` column (default True). False sends
+                `-o name,property,value,source` and every `GetRow.received` is None: the column holds raw bytes of
+                whoever sent a dataset, and without it a tab in a value is unambiguous. Safety callers should
+                pass False. With the column, a row with a tab in the value or in the received column is refused
+                (skipped and counted), never guessed at: the hidden received value could otherwise rewrite the
+                reported value
+
+        Returns:
+            A `GetRows`: a list of `GetRow`, in the order zfs printed them, with the attributes `complete` (bool: not
+            a single row or object was refused or missing -- use this, or `strict`, for every safety decision),
+            `dropped` (frozenset of the names of the objects that were refused as a whole, as far as they can be named)
+            and `skipped` (int: how many rows and objects were refused in all). Values are raw: `-` is not mapped to
+            None, and invalid UTF-8 is kept (surrogateescape). Each object's rows include its `type` row (and, for a
+            property list, its `name` row), as zfs printed them. A name libzfseasy cannot represent is kept like any
+            other: nothing is built here, and dropping such a descendant could hide something that protects data.
+
+        The checks are those of `get()`: a row that is too short or ambiguous, an invalid property name, a name
+        outside the requested objects / depth, an object whose rows do not start with the rows zfs prints first, a
+        property twice for one object, an object that does not have a valid `type`, and an object whose rows are not
+        contiguous (every group of that name is dropped). With an explicit property list a group that contains a
+        property that was not requested is dropped as well: a forged copy of a requested property is a duplicate and
+        any other property is unrequested. So is a group whose rows are not exactly `name`, `type` and the
+        requested properties, in that order (zfs prints one row per requested property, in the requested order). Everything refused is logged as `get()` does. With `'all'` a value that
+        contains newlines can still forge extra rows inside its own object's group (never another object's). An
+        explicit list closes in-group forging only with `received=False`: with the `received` column, the sender's
+        raw bytes sit in a column the caller does not read, and a tab in it is refused rather than interpreted.
+
+        Residual race of `verify_names`: `zfs get` and `zfs list` are two runs. An object forged by a value, whose
+        name becomes a real object between the two runs, passes the cross-check; it can only add rows for an
+        object that exists, never remove any, so a protect set built from the rows can only grow.
+
+        Raises:
+            ValueError -- an invalid argument, before zfs runs
+            ZFSOutputError -- `strict` and the result is not complete (raised after zfs has exited)
+            Exception -- zfs failed (a non-zero exit takes precedence), with zfs's stderr as the message
+        """
+        # Validate.source accepts any case, so compare lowercased (`get()` compares the raw strings: a pre-existing
+        # quirk that is left alone there, so `sources='Local'` filters out everything).
+        sources = [str(x).lower() for x in cls._slist_to_list(sources, validator=Validate.source)]
+        # An empty `types` would leave `-t` off `zfs get` but also off `zfs list`, whose default is not the same set:
+        # always send an explicit `-t`, to both.
+        types = cls._slist_to_list(types, validator=Validate.type) or ['all']
+        wanted = _wanted_types(types)
+        types = ','.join(str(t) for t in types)
+        properties = cls._slist_to_list(properties, validator=Validate.attribute)
+        datasets = [str(d) for d in cls._zlist_to_list(ds)]
+        columns = 'name,property,value,received,source' if received else 'name,property,value,source'
+        cmd = [_zfs_cmd(), 'get', '-H', '-o', columns] + \
+            cls._get_options(recursive=recursive, depth=depth, types=types, properties=properties, datasets=datasets)
+        scope = _Scope(datasets, recursive=recursive, depth=depth)
+        lead = cls._lead_properties(properties)
+        # The exact rows zfs prints for each object for this call: `name`, `type`, then every property asked for.
+        expected = cls._expected_properties(properties)
+
+        skips = _SkippedRows('get')
+        twice = set()
+        kept = []
+        dropped = set()
+        for group in cls._groups(cls._exec_lines(cmd), skips, scope=scope, twice=twice, lead=lead,
+                                 expected=expected, received=received, exact=received):
+            problem = None
+            if group.bad:
+                dropped.add(group.name)
+                continue
+            if group.dstype is None:
+                problem = 'no type row for %r' % _clip(group.name)
+            else:
+                problem = _type_problem(group.name, group.dstype, wanted)
+                if problem is not None:
+                    problem = '%s (%r)' % (problem, _clip(group.name))
+            if problem is not None:
+                skips.skip(problem)
+                dropped.add(group.name)
+                continue
+            kept.append(group)
+        # A name that came back was forged somewhere: neither of its groups can be trusted.
+        dropped |= twice
+        kept = [g for g in kept if g.name not in twice]
+
+        extra_skipped, extra_first = 0, None
+        if verify_names:
+            listed, list_skips = cls._listed_names(recursive, depth, types, datasets, scope, wanted)
+            extra_skipped += list_skips.total
+            extra_first = list_skips.first_problem
+            for group in kept:
+                if group.name not in listed:
+                    skips.skip('%r is not in the zfs list of the same objects' % _clip(group.name))
+            kept = [g for g in kept if g.name in listed]
+            read = {g.name for g in kept}
+            # A name that is not an object (forged) is not worth naming: only real objects can be re-read.
+            dropped &= listed
+            for name in sorted(listed - read - dropped):
+                skips.skip('%r was listed by zfs list but not read by zfs get' % _clip(name))
+                dropped.add(name)
+        skips.done()
+
+        result = []
+        for group in kept:
+            for prop, value, rcv, source in group.rows:
+                if prop in ('name', 'type') or 'all' in sources or source in sources or \
+                        ('inherited' in sources and source.startswith('inherited from ')):
+                    result.append(GetRow(group.name, prop, value, rcv, source))
+        total = skips.total + extra_skipped
+        if strict and total:
+            raise ZFSOutputError('zfs get output could not be trusted: %d row%s skipped, the first: %s' % (
+                total, '' if total == 1 else 's', skips.first_problem or extra_first))
+        return GetRows(result, skipped=total, dropped=dropped)
+
+    @classmethod
+    def _listed_names(cls, recursive, depth, types, datasets, scope, wanted):
+        """The names a name-only `zfs list -H -o name,type` prints for the same objects, types, `-r` and `-d` as a
+        `zfs get`, and the `_SkippedRows` of the lines that were not `name<TAB>type`. Names are not built into
+        objects, so a name libzfseasy cannot represent is a name like any other. Raises when zfs fails."""
+        cmd = [_zfs_cmd(), 'list', '-H', '-o', 'name,type'] + \
+            cls._scope_options(recursive=recursive, depth=depth, types=types) + list(datasets)
+        skips = _SkippedRows('list')
+        names = set()
+        for line in cls._exec_lines(cmd):
+            if not line:
+                continue
+            cols = line.split('\t')
+            if len(cols) != 2:
+                skips.skip('expected 2 columns, got %d' % len(cols), line)
+                continue
+            name, dstype = cols
+            problem = _type_problem(name, dstype, wanted)
+            if problem is None and not scope(name):
+                problem = 'name outside the requested objects'
+            if problem is not None:
+                skips.skip(problem, line)
+                continue
+            names.add(name)
+        skips.done()
+        return names, skips
 
     @classmethod
     def value(cls, ds: Union[ZFS, str], prop: str, sources: Optional[StringList] = None,
@@ -1467,8 +2191,149 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             return None
         return value
 
+    @classmethod
+    def property_sources(cls, ds: Optional[ZFSList] = None, types: Optional[StringList] = 'all',
+                         sources: Optional[StringList] = 'all', recursive: bool = False, depth: int = 0,
+                         prefix: Optional[StringList] = None) -> list:
+        """Discover which properties exist on objects and where each comes from, with no values
+        (`zfs get -H -o name,property,source [-s sources] [-r | -d depth] -t types all <ds>`): phase one of a
+        fail-closed read. Phase two is an explicit-list `rows()` of just the names wanted.
+
+        Why this cannot be forged: every column is a dataset name, a property name or a source, none of which can
+        contain a tab or a newline (zfs refuses them in names; a property name is `[A-Za-z0-9:._-]`; a source is
+        `local`, `default`, `received`, `temporary`, `-` or `inherited from <dataset name>`). The only column an owner
+        controls freely, the value, is not requested, so one odd value anywhere (a newline in an unrelated user property,
+        one inherited from the pool root) cannot disturb the read. The same fact is why `-s` is allowed here: `get()`
+        and `rows()` never pass it because it drops the `type` rows their value-bearing lead rule needs, and there is no
+        lead rule when there is no value to frame.
+
+        Keyword arguments:
+            ds: ZFS | [ZFS] -- objects to read (default None: every dataset). Do not pass overlapping roots with
+                `recursive`: an object zfs prints twice is refused as a duplicate
+            types: str | [str] -- object types to read (default 'all'); always sent as an explicit `-t`
+            sources: str | [str] -- keep only properties from these sources (default 'all': no `-s`), filtered by zfs.
+                `inherited` matches `inherited from <dataset>`
+            recursive: bool -- also read the descendants (default False)
+            depth: int -- descendant depth to read (default 0)
+            prefix: str | [str] -- keep only properties whose name starts with one of these (default None: all),
+                filtered here, after every row has been checked (so a malformed row is never hidden by it). A string is
+                one prefix, never a comma list
+
+        Returns:
+            A list of `PropertySource(name, property, source)` in the order zfs printed them (each object's rows
+            together). Names are not built into objects: a name libzfseasy cannot represent is kept like any other.
+
+        Everything is checked and anything wrong raises, never skips: a line that is not exactly three tab-separated
+        columns, an invalid object name, a name outside the requested objects / depth / types, an invalid property name
+        (by shape: a lowercase native name, or a user property with a `:`; never `Validate.attribute`), a source outside the grammar above, a property twice for one object, an object
+        whose rows are not contiguous. Raised only after zfs has exited, and a zfs failure takes precedence.
+
+        Raises:
+            ValueError -- an invalid argument, before zfs runs
+            ZFSOutputError -- the output could not be trusted (the message names the first problem and how many)
+            Exception -- zfs failed, with zfs's stderr as the message (`ZFSTimeoutError` under `timeout()`)
+        """
+        sources = [str(x).lower() for x in cls._slist_to_list(sources, validator=Validate.source)]
+        types = cls._slist_to_list(types, validator=Validate.type) or ['all']
+        wanted = _wanted_types(types)
+        types = ','.join(str(t) for t in types)
+        datasets = [str(d) for d in cls._zlist_to_list(ds)]
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth < 0:
+            raise ValueError('depth must be a non-negative integer, got %r' % (depth,))
+        if prefix is None:
+            prefixes = []
+        elif isinstance(prefix, str):
+            prefixes = [prefix]
+        elif isinstance(prefix, (list, tuple, set, frozenset)):
+            prefixes = list(prefix)
+        else:
+            raise ValueError('prefix must be None, a string or a list of strings, got %s' % type(prefix).__name__)
+        for x in prefixes:
+            if not isinstance(x, str) or not re.fullmatch(Validate.name, x, re.ASCII):
+                raise ValueError('%s is not a valid property name prefix' % _clip(repr(x)))
+
+        cmd = [_zfs_cmd(), 'get', '-H', '-o', 'name,property,source']
+        if sources and 'all' not in sources:
+            cmd += ['-s', ','.join(sources)]
+        cmd += cls._scope_options(recursive=recursive, depth=depth, types=types) + ['all'] + datasets
+        scope = _Scope(datasets, recursive=recursive, depth=depth)
+
+        found = []
+        seen = set()        # (name, property) pairs
+        finished = set()    # objects whose rows have ended
+        current = None
+        problems = 0
+        first = None
+        lines = cls._exec_lines(cmd)
+        try:
+            for line in lines:
+                if not line:
+                    continue
+                problem = cls._source_row_problem(line, wanted, scope)
+                row = None
+                if problem is None:
+                    row = PropertySource(*line.split('\t'))
+                    if row.name != current:
+                        if current is not None:
+                            finished.add(current)
+                        current = row.name
+                        if row.name in finished:
+                            problem = 'the rows of %r are not contiguous' % _clip(row.name)
+                    if problem is None and (row.name, row.property) in seen:
+                        problem = 'property %r appears twice for %r' % (_clip(row.property), _clip(row.name))
+                    seen.add((row.name, row.property))
+                if problem is not None:
+                    problems += 1
+                    if first is None:
+                        first = '%s: %r' % (problem, _clip(_redact(line)))
+                    continue
+                if not prefixes or row.property.startswith(tuple(prefixes)):
+                    found.append(row)
+        finally:
+            lines.close()
+        if problems:
+            raise ZFSOutputError('zfs get output could not be trusted: %d row%s refused, the first: %s' % (
+                problems, '' if problems == 1 else 's', first))
+        return found
+
     @staticmethod
-    def _get_options(**kwargs):
+    def _source_row_problem(line: str, wanted: Optional[set], scope: Callable[[str], bool]) -> Optional[str]:
+        """Why one `name<TAB>property<TAB>source` row of `property_sources()` cannot be trusted, or None."""
+        cols = line.split('\t')
+        if len(cols) != 3:
+            return 'expected 3 columns, got %d' % len(cols)
+        name, prop, source = cols
+        problem = _plain_name_problem(name)
+        if problem is not None:
+            return problem
+        if '@' in name:
+            if wanted is not None and 'snapshot' not in wanted:
+                return 'a snapshot was not requested'
+        elif '#' in name:
+            if wanted is not None and 'bookmark' not in wanted:
+                return 'a bookmark was not requested'
+        elif wanted is not None and not wanted & {'filesystem', 'volume'}:
+            return 'a dataset was not requested'
+        if not scope(name):
+            return 'name outside the requested objects'
+        # Shape only (never `Validate.attribute`): zfs allows property names that this library refuses (a leading `-`, one
+        # carried in a received stream), and an unrelated odd name must not stop the read. A name that is wanted
+        # reaches argv in phase two, where `rows()` validates it strictly.
+        if not (re.fullmatch(Validate.native, prop, re.ASCII) or
+                (':' in prop and len(prop) <= Validate.max_name_len and re.fullmatch(Validate.name, prop, re.ASCII))):
+            return 'invalid property name'
+        if source not in _PLAIN_SOURCES:
+            if not source.startswith(_INHERITED):
+                return 'invalid source'
+            origin = source[len(_INHERITED):]
+            if _plain_name_problem(origin) is not None or '@' in origin or '#' in origin:
+                return 'invalid source'
+        return None
+
+    @staticmethod
+    def _scope_options(**kwargs):
+        """The `-r`, `-d` and `-t` flags: the ones `zfs get` and the name-only `zfs list` of `rows(verify_names=True)`
+        must both be given, so that they iterate the same objects."""
         cmd = []
         if kwargs.get('recursive', False):
             cmd += ['-r']
@@ -1479,6 +2344,11 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         types = kwargs.get('types')
         if types:
             cmd += ['-t', types]
+        return cmd
+
+    @staticmethod
+    def _get_options(**kwargs):
+        cmd = GetCommand._scope_options(**kwargs)
 
         properties = kwargs.get('properties')
         if 'all' in properties:
@@ -1486,7 +2356,7 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         else:
             # `name,type` lead every object's rows (see `_lead_properties`); drop the caller's own copies (and any
             # other repeat, which zfs would print twice) so that no property appears twice for one object.
-            properties = list(dict.fromkeys(['name', 'type'] + properties))
+            properties = list(GetCommand._expected_properties(properties))
         cmd += [','.join(properties)]
 
         datasets = kwargs.get('datasets', False)
@@ -1496,6 +2366,17 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         return cmd
 
     @staticmethod
+    def _expected_properties(properties) -> Optional[tuple]:
+        """The exact property sequence zfs prints for every object when the call carries an explicit property list
+        (None for `all`, whose expansion is not fixed): `name`, `type`, then the caller's properties in order, each
+        once. This is what `_get_options` puts on the command line, so it is what zfs was asked for; zfs prints one
+        row per requested property, in that order, and nothing else (a user property, a property that does not apply
+        to the type, `written@<snap>` and `userquota@` forms included)."""
+        if 'all' in properties:
+            return None
+        return tuple(dict.fromkeys(['name', 'type'] + list(properties)))
+
+    @staticmethod
     def _lead_properties(properties) -> tuple:
         """The rows zfs prints first for every object, for the property list `_get_options` sends: `name`, `type`
         for an explicit list (the two properties it puts first), `type` alone for `all` (zfs expands `all` in
@@ -1503,16 +2384,28 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         return _LEAD_ALL if 'all' in properties else _LEAD_LIST
 
     @staticmethod
-    def _split_row(line: str, skips: _SkippedRows):
-        """Split one `name,property,value,received,source` row, recovering a value that contains tabs when that is
-        unambiguous; None (with a warning) otherwise."""
+    def _split_row(line: str, skips: _SkippedRows, received: bool = True, exact: bool = False):
+        """Split one `name,property,value,received,source` row (`name,property,value,source` when `received` is
+        False, and then `received` comes back None), recovering a value that contains tabs when that is unambiguous;
+        None (with a warning) otherwise. With `exact` (which `rows()` uses) a row with more than five columns is
+        never recovered: a tab in the value or the received column makes the split a guess, and a guess lets the
+        hidden received column rewrite the value."""
         cols = line.split('\t')
+        if not received:
+            if len(cols) < 4:
+                skips.skip('expected 4 columns, got %d' % len(cols), line)
+                return None
+            # Name, property and source cannot contain a tab: whatever lies between them is the value.
+            return cols[0], cols[1], '\t'.join(cols[2:-1]), None, cols[-1]
         if len(cols) < 5:
             skips.skip('expected 5 columns, got %d' % len(cols), line)
             return None
         name, prop, source, middle = cols[0], cols[1], cols[-1], cols[2:-1]
         if len(middle) == 2:
             return name, prop, middle[0], middle[1], source
+        if exact:
+            skips.skip('a tab in the value or received column makes the row ambiguous', line)
+            return None
         # `middle` is value + tab + received, and the value and/or the received value contain tabs. The split is
         # trusted only where exactly one split gives a `-` received column or a received column equal to the value
         # (and, for a `received` source, only the latter).
@@ -1527,29 +2420,56 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         return (name, prop) + candidates[0] + (source,)
 
     @staticmethod
-    def _lines_to_objects(lines, sources, skips: Optional[_SkippedRows] = None,
-                          scope: Optional[Callable[[str], bool]] = None, types: Optional[set] = None,
-                          twice: Optional[set] = None, lead: tuple = _LEAD_ALL) -> Iterable[Optional[ZFS]]:
-        """Group `zfs get -H -o name,property,value,received,source` rows into objects. Rows that cannot be trusted
-        are skipped (see `GetCommand.__call__`). An object whose rows are not contiguous is never yielded again,
-        and its name is added to `twice` so a caller holding the whole result can drop the earlier one as well.
+    def _groups(lines, skips: _SkippedRows, scope: Optional[Callable[[str], bool]] = None,
+                twice: Optional[set] = None, lead: tuple = _LEAD_ALL, received: bool = True, exact: bool = False,
+                expected: Optional[tuple] = None) -> Iterable[_Group]:
+        """Group `zfs get -H` rows by object, applying every check that does not depend on what the caller wants to
+        do with the rows: a row that is too short or ambiguous, a name outside `scope`, an invalid property name; and
+        per group the lead rule, contiguity, a property twice, and (with `expected`, an explicit property list)
+        a property nobody asked for and the exact sequence of rows. A group that fails a check is still
+        yielded, with `bad` set (already reported), so that a caller can name it. A group is yielded when the next
+        one starts, so the caller's own warnings keep their order.
 
         `lead` is the property sequence zfs prints first for every object (`GetCommand._lead_properties`). A group
         whose first rows differ is dropped whole: rows forged (through a value containing newlines) for the object
         zfs prints next would otherwise merge into its real group, but any forged prefix either does not start with
-        the lead rows or repeats them, and the real group's own lead rows then repeat or follow it."""
-        if skips is None:
-            skips = _SkippedRows('get')
+        the lead rows or repeats them, and the real group's own lead rows then repeat or follow it.
+
+        `expected` (`GetCommand._expected_properties`) is the exact sequence of properties every object's rows must be
+        when the call has an explicit property list: `name`, `type`, then the requested properties in order. A group
+        with one missing, extra or out of order is dropped whole. None (`all`): no such check.
+
+        A name that comes back after another object's rows is not contiguous: the group is bad and the name is added
+        to `twice`, so a caller holding the whole result can drop the earlier group as well."""
         seen = set()
-        dsname, properties, props_seen, bad = None, {}, set(), False
+        group = None
+        props_seen = set()
         nrows = 0
+        allowed = set(expected) if expected is not None else None
+        # The properties of the current group's rows, in order, for the exact-sequence check: the rows kept, plus the
+        # property of a row of this object that was skipped (and counted) as unreadable -- a value with a tab or a
+        # newline makes such a row, real zfs prints them, and the object stays as it was before the check existed.
+        sequence = []
+
+        def closed(group):
+            # The exact-sequence check, at the end of a group. It runs last, so the specific refusals (lead, twice,
+            # unrequested) keep their wording and only a group they did not catch is refused here.
+            if expected is not None and not group.bad and tuple(sequence) != expected:
+                skips.skip('the rows of %r are not the %d requested properties in order (got %d rows)'
+                           % (_clip(group.name), len(expected), len(sequence)))
+                group.bad = True
+            return group
+
         for line in lines:
             if not line:
                 continue
-            row = GetCommand._split_row(line, skips)
+            row = GetCommand._split_row(line, skips, received, exact)
             if row is None:
+                cols = line.split('\t')
+                if group is not None and len(cols) >= 2 and cols[0] == group.name:
+                    sequence.append(cols[1])
                 continue
-            name, prop, value, received, source = row
+            name, prop, value, received_value, source = row
             if scope is not None and not scope(name):
                 skips.skip('name outside the requested objects', line)
                 continue
@@ -1558,38 +2478,64 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             except ValueError:
                 skips.skip('invalid property name', line)
                 continue
-            if name != dsname:
-                if dsname is not None:
-                    obj = GetCommand._finish(dsname, properties, bad, skips, types)
-                    if obj is not None:
-                        yield obj
-                    seen.add(dsname)
-                dsname, properties, props_seen, bad = name, {}, set(), False
+            if group is None or name != group.name:
+                if group is not None:
+                    yield closed(group)
+                    seen.add(group.name)
+                group = _Group(name)
+                props_seen = set()
                 nrows = 0
+                sequence = []
                 if name in seen:
                     # zfs prints all of an object's rows together: a name that comes back was forged.
                     if twice is not None:
                         twice.add(name)
                     skips.skip('the rows of %r are not contiguous' % _clip(name))
-                    bad = True
+                    group.bad = True
             if nrows < len(lead) and prop != lead[nrows]:
-                if not bad:
+                if not group.bad:
                     skips.skip('the rows of %r do not start with the %r row zfs prints first (got %r)'
                                % (_clip(name), lead[nrows], _clip(prop)))
-                bad = True
+                group.bad = True
             nrows += 1
             if prop in props_seen:
-                if not bad:
+                if not group.bad:
                     skips.skip('property %r appears twice for %r' % (_clip(prop), _clip(name)))
-                bad = True
+                group.bad = True
+            elif allowed is not None and prop not in allowed:
+                if not group.bad:
+                    skips.skip('property %r of %r was not requested' % (_clip(prop), _clip(name)))
+                group.bad = True
             props_seen.add(prop)
+            sequence.append(prop)
+            group.rows.append((prop, value, received_value, source))
             if prop == 'type':
-                properties[prop] = value
-            elif 'all' in sources or source in sources or \
-                    ('inherited' in sources and source.startswith('inherited from ')):
-                properties[prop] = Property(value, source, received)
-        if dsname is not None:
-            obj = GetCommand._finish(dsname, properties, bad, skips, types)
+                group.dstype = value
+        if group is not None:
+            yield closed(group)
+
+    @staticmethod
+    def _lines_to_objects(lines, sources, skips: Optional[_SkippedRows] = None,
+                          scope: Optional[Callable[[str], bool]] = None, types: Optional[set] = None,
+                          twice: Optional[set] = None, lead: tuple = _LEAD_ALL,
+                          expected: Optional[tuple] = None) -> Iterable[Optional[ZFS]]:
+        """Group `zfs get -H -o name,property,value,received,source` rows into objects. Rows that cannot be trusted
+        are skipped (see `GetCommand.__call__`). An object whose rows are not contiguous is never yielded again,
+        and its name is added to `twice` so a caller holding the whole result can drop the earlier one as well.
+        The checks are those of `_groups`, which `rows()` shares."""
+        if skips is None:
+            skips = _SkippedRows('get')
+        for group in GetCommand._groups(lines, skips, scope=scope, twice=twice, lead=lead, expected=expected):
+            if group.bad:
+                continue
+            properties = {}
+            for prop, value, received, source in group.rows:
+                if prop == 'type':
+                    properties[prop] = value
+                elif 'all' in sources or source in sources or \
+                        ('inherited' in sources and source.startswith('inherited from ')):
+                    properties[prop] = Property(value, source, received)
+            obj = GetCommand._finish(group.name, properties, False, skips, types)
             if obj is not None:
                 yield obj
 
@@ -1608,7 +2554,13 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             skips.skip('%s (%r)' % (problem, _clip(name)))
             return None
         try:
-            return GetCommand._build(name, dstype, properties)
+            before = _name_warnings
+            obj = GetCommand._build(name, dstype, properties)
+            if obj is None:
+                # `_build` returns None only for a name libzfseasy cannot represent, and has reported it (or not,
+                # when the name was already reported: the serial says which).
+                skips.count_unrepresentable(name, warned=_name_warnings != before)
+            return obj
         except ValueError as e:
             skips.skip('cannot build %r (%s)' % (_clip(name), _clip(e)))
             return None
@@ -1791,6 +2743,7 @@ class SendCommand(Command):
             return cls.dataset(ds, *args, **kwargs)
         elif isinstance(ds, Snapshot):
             return cls.snapshot(ds, *args, **kwargs)
+        raise ValueError('Expected Dataset or Snapshot, got ' + type(ds).__name__ + ' instead')
 
     @classmethod
     def snapshot(cls, ds: Snapshot, since: Optional[Snapshot] = None, intermediate: bool = False,
@@ -2225,10 +3178,11 @@ class LoadKeyCommand(Command):
         """Load the dataset key
 
         Keyword arguments:
-            ds: Filesystem -- ZFS filesystem to unload the key for, if None,
-                unload keys for all filesystems (default None)
+            ds: Filesystem | None -- ZFS filesystem to load the key for (required). Pass None explicitly to load
+                the keys of all filesystems (`zfs load-key -a`); that cannot be combined with `location` or
+                `recursive`
             location: str -- key location (default None)
-            recursive: bool -- whether to unload keys for all child datasets (default False)
+            recursive: bool -- whether to load keys for all child datasets (default False)
 
         Returns:
             None
@@ -2270,8 +3224,8 @@ class UnLoadKeyCommand(Command):
         """Unload the dataset key
 
         Keyword arguments:
-            ds: Filesystem -- ZFS filesystem to unload the key for, if None,
-                unload keys for all filesystems (default None)
+            ds: Filesystem | None -- ZFS filesystem to unload the key for (required). Pass None explicitly to
+                unload the keys of all filesystems (`zfs unload-key -a`); that cannot be combined with `recursive`
             recursive: bool -- whether to unload keys for all child datasets (default False)
 
         Returns:
@@ -2306,8 +3260,9 @@ class ChangeKeyCommand(Command):
             inherit: bool -- inhherit the key from parent dataset (default False)
             load: bool -- load the key before changing it (default False)
             location: str -- key location (default None)
-            format: str -- key format (default None)
-            iterations: int -- the number of PBKDF2 iterations (default None)
+            fmt: str -- key format, e.g. 'passphrase' or 'raw' (default None)
+            iterations: int -- the number of PBKDF2 iterations, a positive int (default None; zfs enforces its own
+                minimum)
 
         Returns:
             None
@@ -2329,6 +3284,10 @@ class ChangeKeyCommand(Command):
         location = kwargs.get('location', None)
         fmt = kwargs.get('fmt', None)
         iterations = kwargs.get('iterations', None)
+        # The one `-o` value that skips `Validate.value`: it is formatted from a number, so require one.
+        if iterations is not None and (not isinstance(iterations, int) or isinstance(iterations, bool)
+                                       or iterations < 1):
+            raise ValueError('Number of pbkdf2 iterations must be a positive integer, got ' + repr(iterations))
         if kwargs.get('inherit', None):
             if location:
                 raise ValueError('Key location cannot be specified when inheriting keys')

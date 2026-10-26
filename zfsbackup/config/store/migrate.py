@@ -700,6 +700,20 @@ def _assert_scripts_match_constants() -> None:
         )
 
 
+def check_migration_packaging() -> None:
+    """Public, read-only: raise `MigrationPackagingError` if the installed
+    migration scripts disagree with `EXPECTED_HEAD` / `KNOWN_REVISIONS`;
+    return `None` otherwise.
+
+    It is the exact check `upgrade_schema` runs first (and for the same
+    reasons: no database, no lock, no writes), exposed so a caller that does
+    something irreversible BEFORE `upgrade_schema` -- the pre-migration
+    backup -- can refuse a broken install first. Without it a deterministic
+    packaging failure under a restart loop writes a fresh backup every cycle.
+    """
+    _assert_scripts_match_constants()
+
+
 def _assert_foreign_keys_intact(connection: Connection) -> None:
     """`PRAGMA foreign_key_check`; raise `SchemaIntegrityError` if it returns
     any row. See that exception for why. Valid on an FK-off connection (the

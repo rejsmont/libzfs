@@ -101,8 +101,8 @@ class TestConstructorTrio:
     @pytest.mark.parametrize("cls", ALL_FIVE)
     def test_the_old_positional_constructors_still_work(self, cls):
         stop = StopFlag()
-        worker = _build(cls, make_config(), stop, True)
-        assert worker.stop_event is stop and worker.verbose is True
+        worker = _build(cls, make_config(), stop, logging.DEBUG)
+        assert worker.stop_event is stop and worker.log_level == logging.DEBUG
         assert worker.reload_epoch is None
         assert worker.born_epoch == 0
         assert worker.workers_lock is None
@@ -200,7 +200,9 @@ class TestExitReason:
         assert worker._exit_reason() is ExitReason.STOP
 
     def test_the_declaration_order_is_the_priority(self):
-        assert list(ExitReason) == [ExitReason.STOP, ExitReason.SUPERVISOR_GONE, ExitReason.RELOAD]
+        assert list(ExitReason) == [
+            ExitReason.STOP, ExitReason.SUPERVISOR_GONE, ExitReason.RELOAD, ExitReason.UPGRADE,
+        ]
 
     def test_without_an_epoch_reload_is_never_reported(self, monkeypatch, parts):
         worker, _ = _worker(monkeypatch, parts, epoch=False, born=5)

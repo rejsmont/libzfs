@@ -2,6 +2,12 @@
 
 ## Status / implementation notes (2026-10-20)
 
+**Status 2026-10-22:** merged to master as PR #4 (`609df66`); scenario K passed in the two-VM harness. Later
+changes to the wire contract (the `X-Zfsbackup-Protocol` header and 426, `protocol` in `/whoami`/`/enroll`/`/rotate`,
+the removed info endpoints) are in [production_readiness_plan.md](production_readiness_plan.md) milestone A.
+Milestone C (B-2b, additive, protocol still 1): negotiate answers `server_newer` and `server_newer_count` (or `server_newer_unknown: true`); `/stream`
+takes `from_guid` and `discard`, and refuses with `reason` `server_newer`, `base_missing`, `no_common` or `listing` (see CLAUDE.md).
+
 **Implemented**: M1–M16 and M18 on branch `tls-mtls`, uncommitted at the time of writing. M17 (the two-VM
 harness over TLS, scenario K) is written; its first real run is still to be recorded in
 [two_vm_backup_report.md](two_vm_backup_report.md). B1 is marked resolved in

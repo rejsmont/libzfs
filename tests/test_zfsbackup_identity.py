@@ -1418,6 +1418,205 @@ class TestPeekIdentity:
         assert info.not_after == ident.not_after
 
 
+@pytest.mark.unit
+class TestClientCertExpiry:
+    """S-12 (2): `client_cert_not_after` reads an (even expired) client certificate without
+    its key; `client_cert_expiry_problem` is the pure `(level, message)` decision shared by
+    the daemon's start/reload check and the remote worker's daily one."""
+
+    WARN = timedelta(days=identity.CLIENT_CERT_EXPIRY_WARN_DAYS)
+    PATH = "/var/lib/zfsbackup/config.db.tls/client.crt"
+
+    def _problem(self, left, now=FIXED_NOW, path=PATH):
+        return identity.client_cert_expiry_problem(path, now + left, now)
+
+    # -- constants and exports ----------------------------------------------------
+
+    def test_the_window_is_thirty_days_and_exported(self):
+        assert identity.CLIENT_CERT_EXPIRY_WARN_DAYS == 30
+        for name in ("CLIENT_CERT_EXPIRY_WARN_DAYS", "client_cert_not_after",
+                     "client_cert_expiry_problem"):
+            assert name in identity.__all__
+
+    def test_the_daemon_shares_the_one_definition(self):
+        from zfsbackup import daemon
+
+        assert daemon.CLIENT_CERT_EXPIRY_WARN_DAYS is identity.CLIENT_CERT_EXPIRY_WARN_DAYS
+
+    # -- the decision: boundaries ------------------------------------------------------
+
+    def test_exactly_thirty_days_left_is_silent(self):
+        assert self._problem(self.WARN) is None
+
+    def test_one_second_inside_the_window_is_a_warning(self):
+        level, message = self._problem(self.WARN - timedelta(seconds=1))
+        assert level == logging.WARNING
+        assert "(in 29 day(s))" in message
+
+    def test_far_from_expiry_is_silent(self):
+        assert self._problem(timedelta(days=365)) is None
+        assert self._problem(self.WARN + timedelta(seconds=1)) is None
+
+    def test_expired_one_second_ago_is_an_error(self):
+        level, message = self._problem(-timedelta(seconds=1))
+        assert level == logging.ERROR
+
+    def test_exactly_now_is_not_yet_expired(self):
+        level, message = self._problem(timedelta(0))
+        assert level == logging.WARNING and "(in 0 day(s))" in message
+
+    def test_long_expired_is_an_error(self):
+        level, message = self._problem(-timedelta(days=400))
+        assert level == logging.ERROR
+
+    @pytest.mark.parametrize("left, days", [
+        (timedelta(hours=1), 0), (timedelta(hours=23, minutes=59), 0),
+        (timedelta(days=1), 1), (timedelta(days=1, hours=23), 1),
+        (timedelta(days=12, hours=5), 12), (timedelta(days=29, hours=23), 29),
+    ])
+    def test_the_days_left_are_whole_days_clamped_at_zero(self, left, days):
+        level, message = self._problem(left)
+        assert level == logging.WARNING and f"(in {days} day(s))" in message
+
+    def test_the_days_never_go_negative(self):
+        for left in (timedelta(0), timedelta(seconds=1), timedelta(minutes=5)):
+            assert "(in 0 day(s))" in self._problem(left)[1]
+
+    # -- the decision: wording ------------------------------------------------------------
+
+    def test_the_warning_wording(self):
+        not_after = datetime(2026, 11, 3, 4, 5, 59, tzinfo=timezone.utc)
+        level, message = identity.client_cert_expiry_problem(
+            self.PATH, not_after, datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc))
+        assert level == logging.WARNING
+        assert message == (
+            f"the client certificate {self.PATH} expires on 2026-11-03 04:05 UTC (in 13 "
+            "day(s)); rotate it: `zfsbackup-config identity rotate`"
+        )
+
+    def test_the_error_wording(self):
+        not_after = datetime(2026, 10, 1, 8, 30, tzinfo=timezone.utc)
+        level, message = identity.client_cert_expiry_problem(self.PATH, not_after, FIXED_NOW)
+        assert level == logging.ERROR
+        assert message == (
+            f"the client certificate {self.PATH} expired on 2026-10-01 08:30 UTC; remote "
+            "backups fail until it is replaced (`identity rotate` needs a valid certificate: "
+            "enroll again with a new token, `zfsbackup-config enroll DESTINATION ...`)"
+        )
+
+    def test_the_path_is_named_as_given(self):
+        for path in ("relative/client.crt", Path("/x/y/client.crt")):
+            assert str(path) in self._problem(timedelta(days=2), path=path)[1]
+
+    # -- the decision: `now` -------------------------------------------------------------------
+
+    def test_a_naive_now_is_taken_as_utc(self):
+        naive = FIXED_NOW.replace(tzinfo=None)
+        assert identity.client_cert_expiry_problem(
+            self.PATH, FIXED_NOW + timedelta(days=3), naive
+        ) == identity.client_cert_expiry_problem(self.PATH, FIXED_NOW + timedelta(days=3), FIXED_NOW)
+        level, _ = identity.client_cert_expiry_problem(self.PATH, FIXED_NOW - HOUR, naive)
+        assert level == logging.ERROR
+
+    def test_an_aware_now_in_another_zone_is_the_same_instant(self):
+        plus_five = timezone(timedelta(hours=5))
+        now = FIXED_NOW.astimezone(plus_five)
+        not_after = FIXED_NOW + timedelta(days=3)
+        assert identity.client_cert_expiry_problem(self.PATH, not_after, now) == \
+            identity.client_cert_expiry_problem(self.PATH, not_after, FIXED_NOW)
+
+    def test_without_now_it_uses_the_current_time(self):
+        soon = datetime.now(timezone.utc) + timedelta(days=3, hours=1)
+        level, message = identity.client_cert_expiry_problem(self.PATH, soon)
+        assert level == logging.WARNING and "(in 3 day(s))" in message
+        assert identity.client_cert_expiry_problem(
+            self.PATH, datetime.now(timezone.utc) - HOUR)[0] == logging.ERROR
+        assert identity.client_cert_expiry_problem(
+            self.PATH, datetime.now(timezone.utc) + timedelta(days=90)) is None
+
+    def test_it_is_pure(self, caplog):
+        """Nothing is read (the path does not exist) and nothing is logged."""
+        with caplog.at_level(logging.DEBUG):
+            self._problem(-DAY, path="/no/such/dir/client.crt")
+            self._problem(DAY, path="/no/such/dir/client.crt")
+        assert caplog.records == []
+
+    # -- client_cert_not_after ---------------------------------------------------------------------
+
+    def test_not_after_of_a_valid_certificate(self, tmp_path):
+        cert = make_cert(key_of("ec256"))
+        (tmp_path / "client.crt").write_text(pem_of(cert))              # and no key at all
+        result = identity.client_cert_not_after(tmp_path / "client.crt")
+        assert result == FIXED_NOW + DAY
+        assert result.tzinfo is not None and result.utcoffset() == timedelta(0)
+
+    def test_not_after_of_an_expired_certificate_which_load_identity_refuses(self, tmp_path):
+        cert = make_cert(key_of("ec256"), not_before=FIXED_NOW - 9 * DAY, not_after=FIXED_NOW - 2 * DAY)
+        d = make_tlsdir(tmp_path)
+        d.mkdir(exist_ok=True)
+        cert_path, key_path = identity.identity_paths(d, "client")
+        cert_path.write_text(pem_of(cert))
+        key_path.write_bytes(key_pem(key_of("ec256")))
+        key_path.chmod(0o600)
+        with pytest.raises(identity.IdentityError):
+            identity.load_identity(cert_path, key_path, identity.ROLE_CLIENT)
+        assert identity.client_cert_not_after(cert_path) == FIXED_NOW - 2 * DAY
+
+    def test_not_after_takes_a_string_path_too(self, tmp_path):
+        (tmp_path / "client.crt").write_text(pem_of(make_cert(key_of("ec256"))))
+        assert identity.client_cert_not_after(str(tmp_path / "client.crt")) == FIXED_NOW + DAY
+
+    def test_not_after_does_not_check_the_purpose(self, tmp_path):
+        (tmp_path / "x.crt").write_text(pem_of(make_cert(key_of("ec256"), eku=(SERVER_AUTH,))))
+        assert identity.client_cert_not_after(tmp_path / "x.crt") == FIXED_NOW + DAY
+
+    def test_not_after_is_the_first_certificate_of_a_bundle(self, tmp_path):
+        first = make_cert(key_of("ec256"), not_after=FIXED_NOW + 3 * DAY)
+        second = make_cert(key_of("ec256:other"), not_after=FIXED_NOW + 30 * DAY)
+        (tmp_path / "client.crt").write_text(pem_of(first) + pem_of(second))
+        assert identity.client_cert_not_after(tmp_path / "client.crt") == FIXED_NOW + 3 * DAY
+
+    def test_not_after_of_a_missing_file_is_an_identity_error(self, tmp_path):
+        with pytest.raises(identity.IdentityError):
+            identity.client_cert_not_after(tmp_path / "client.crt")
+        with pytest.raises(identity.IdentityError):
+            identity.client_cert_not_after(tmp_path / "no-such-dir" / "client.crt")
+
+    @pytest.mark.parametrize("content", [
+        "", "garbage\n", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
+    ], ids=["empty", "text", "corrupt-armour", "a-key"])
+    def test_not_after_of_a_non_pem_file_is_an_identity_error(self, tmp_path, content):
+        (tmp_path / "client.crt").write_text(content)
+        with pytest.raises(identity.IdentityError):
+            identity.client_cert_not_after(tmp_path / "client.crt")
+
+    def test_not_after_of_a_directory_is_an_identity_error(self, tmp_path):
+        (tmp_path / "client.crt").mkdir()
+        with pytest.raises(identity.IdentityError):
+            identity.client_cert_not_after(tmp_path / "client.crt")
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads everything")
+    def test_not_after_of_an_unreadable_file_is_an_identity_error(self, tmp_path):
+        path = tmp_path / "client.crt"
+        path.write_text(pem_of(make_cert(key_of("ec256"))))
+        path.chmod(0)
+        try:
+            with pytest.raises(identity.IdentityError):
+                identity.client_cert_not_after(path)
+        finally:
+            path.chmod(0o600)
+
+    def test_not_after_and_the_decision_compose(self, tmp_path):
+        """The way the callers use them."""
+        cert = make_cert(key_of("ec256"), not_before=FIXED_NOW - DAY, not_after=FIXED_NOW + 5 * DAY)
+        path = tmp_path / "client.crt"
+        path.write_text(pem_of(cert))
+        level, message = identity.client_cert_expiry_problem(
+            path, identity.client_cert_not_after(path), FIXED_NOW)
+        assert level == logging.WARNING and str(path) in message and "(in 5 day(s))" in message
+
+
 # ==========================================================================
 # ensure_identity
 # ==========================================================================

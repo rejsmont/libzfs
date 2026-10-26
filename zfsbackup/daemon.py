@@ -31,9 +31,10 @@ import os  # noqa: E402
 import socket  # noqa: E402
 import stat  # noqa: E402
 import sys  # noqa: E402
+import threading  # noqa: E402
 import time  # noqa: E402
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -59,13 +60,26 @@ from zfsbackup.runtime_config import (
     load_runtime_config,
 )
 from zfsbackup import daemonlock
+from zfsbackup import health
 from zfsbackup import identity
+from zfsbackup import logsetup
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup import procident
 from zfsbackup import sdnotify
+from zfsbackup.version import (
+    EXIT_CODE_VERSION_CHANGED,
+    CodeSignature,
+    code_signature,
+    editable_install,
+    installed_in_site_packages,
+    version_string,
+)
 from zfsbackup.stopflag import ReloadEpoch, StopFlag
 from zfsbackup.workers import (
+    EPOCH_UPGRADE_DRAIN,
+    EPOCH_UPGRADE_DRAIN_API,
     WORKER_EXIT_RELOAD,
+    WORKER_EXIT_VERSION_SKEW,
     ApiWorker,
     PruningWorker,
     RemoteBackupWorker,
@@ -73,11 +87,9 @@ from zfsbackup.workers import (
 )
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+# Logging is configured by `main()` (`logsetup.configure`), not at import: an
+# importer (the test suite, a console-script wrapper) keeps its own, and every
+# worker configures its own process (`workers._init_child_process`).
 
 logger = logging.getLogger(__name__)
 
@@ -152,14 +164,32 @@ RELOAD_DEFER_NOTICE = 60
 RELOAD_DEFER_REPEAT = 900
 
 
+#: How often a drain for an upgrade (S-8) that is still waiting for workers
+#: to reach a safe point says so.
+VERSION_DRAIN_REPEAT = 900
+
+#: "No signature was passed": `BackupDaemon` reads its own (unit tests and
+#: embedded use). `None` means "the guard is off".
+_UNSET = object()
+
+#: The workers a version-skew drain waits for: the ones that import code
+#: lazily from disk (`workers.*.drains_for_upgrade`). Snapshot and pruning run
+#: until the supervisor stops them.
+_DRAIN_WORKERS = frozenset({'remote', 'api'})
+
+
 @dataclass(frozen=True)
 class Handoff:
     """What every worker is born with, as one object: the config it runs, the
     reload epoch that config belongs to, the `(store_id, generation)` key
     it was read at (`None` when not known -- a daemon built without one, see
-    `BackupDaemon.__init__`), and this host's client id (`ConfigSnapshot.
+    `BackupDaemon.__init__`), this host's client id (`ConfigSnapshot.
     client_id`, read in the same snapshot as the config; `None` until
-    `zfsbackup-config enroll` generates one).
+    `zfsbackup-config enroll` generates one), and `<db>.status` -- where the
+    workers write their outcome files (S-7) -- or `None` for a config that
+    writes nothing (`--dry-run`, `dry_run: true`) and a daemon built without
+    a database path. The path is derived from the database path and the
+    config's `dry_run`, so a reload that flips `dry_run` flips it too.
 
     The supervisor replaces the whole object on an accepted reload and only
     then bumps the shared `ReloadEpoch`; `_new_worker` reads it exactly once,
@@ -175,6 +205,7 @@ class Handoff:
     epoch: int
     key: Optional[Tuple[int, int]]
     client_id: Optional[str] = None
+    status_dir: Optional[Path] = None
 
 
 def _gen(key: Optional[Tuple[int, int]]) -> str:
@@ -292,8 +323,9 @@ def _probe_api_bind(host: str, port: int) -> Optional[str]:
 
 
 #: A client certificate expiring within this many days is warned about
-#: (`_client_tls_problem`).
-CLIENT_CERT_EXPIRY_WARN_DAYS = 30
+#: (`_client_tls_problem`); the one definition is `identity`'s, shared with
+#: the remote worker's daily check.
+CLIENT_CERT_EXPIRY_WARN_DAYS = identity.CLIENT_CERT_EXPIRY_WARN_DAYS
 
 
 def _tls_dir(resolved) -> Optional[Path]:
@@ -304,6 +336,15 @@ def _tls_dir(resolved) -> Optional[Path]:
     if resolved is None:
         return None
     return identity.tls_dir(getattr(resolved, 'resolved_path', resolved))
+
+
+def _status_dir_for(resolved, config: BackupConfig) -> Optional[Path]:
+    """`<db>.status` for `resolved`, or `None` when `config` is a dry run (it
+    records nothing, so no directory is created or written) or there is no
+    database path. Pure path arithmetic: see `_usable_status_dir`."""
+    if resolved is None or config.dry_run:
+        return None
+    return health.status_dir(getattr(resolved, 'resolved_path', resolved))
 
 
 def _client_identity_paths(config: BackupConfig, tls: Optional[Path]):
@@ -404,16 +445,9 @@ def _client_tls_problem(
         except identity.IdentityError as e:
             problems.append(f"the client TLS identity cannot be used: {e}")
         else:
-            moment = now or datetime.now(timezone.utc)
-            if moment.tzinfo is None:
-                moment = moment.replace(tzinfo=timezone.utc)
-            left = loaded.not_after - moment
-            if left < timedelta(days=CLIENT_CERT_EXPIRY_WARN_DAYS):
-                problems.append(
-                    f"the client certificate {cert} expires on "
-                    f"{loaded.not_after:%Y-%m-%d %H:%M} UTC (in {max(left.days, 0)} "
-                    "day(s)); rotate it: `zfsbackup-config identity rotate`"
-                )
+            expiry = identity.client_cert_expiry_problem(cert, loaded.not_after, now)
+            if expiry is not None:
+                problems.append(expiry[1])
     unenrolled = [
         name for name in _remote_destinations(config)
         if (dest := config.destinations.get(name)) is not None
@@ -628,13 +662,55 @@ class BackupDaemon:
     A rejected candidate leaves every worker running the old generation.
     Progress is published in the presence lock's pid file
     (`applied=`/`target=`/`rejected=`).
+
+    **Version-skew guard (S-8).** The signature of the installed code
+    (`version.code_signature()`: version, the identity of the dist-info
+    `RECORD`, the Python interpreter) is taken when the process starts, and
+    checked again right before the first fork. It is compared every
+    `RELOAD_POLL_SECONDS` (and on a SIGHUP) -- before the reload tick, so a
+    reload cannot respawn workers onto code the supervisor is not running --
+    and before every spawn. Workers compare it with the disk at their own
+    start (`WORKER_EXIT_VERSION_SKEW`). The supervisor never acts on a single
+    read or a worker's report alone: it drains only when it has itself read
+    the same difference twice, a poll apart (a transient I/O error reads as
+    "not installed"); otherwise the worker is just restarted, counted as no
+    failure. A confirmed change starts a drain, not a stop: the shared
+    `ReloadEpoch` is set to `EPOCH_UPGRADE_DRAIN`, the remote and API workers
+    (which import code lazily from disk) finish their current work at a safe
+    point -- never mid-transfer, no time limit -- and are not respawned, the
+    snapshot and pruning workers keep running, reloads are off (a SIGHUP is
+    answered, not applied), the drain is in the pid file (`draining=`), and
+    once the last drained worker has left `run()` raises the stop flag for
+    the rest and returns `EXIT_CODE_VERSION_CHANGED` (76), which the unit's
+    `RestartForceExitStatus=` turns into a restart on the new code. A SIGTERM
+    during the drain is the ordinary stop and exit. No `execv`, no `zfs` call.
+    Off (one log line) when zfsbackup is not an installed distribution or its
+    signature is unreadable at start -- except that missing metadata under
+    site-packages (an install in flight) exits 76 at once instead. Not
+    detected: an upgrade of another package, and source edits of an editable
+    install.
     """
+
+    #: Class-level defaults of the S-8 guard, so a supervisor built without
+    #: `__init__` (a test double) behaves as before the guard existed.
+    _code_signature: Optional[CodeSignature] = None
+    _version_skew = None
+    _version_status = None
+    _signature_problem = None
+    _skew_candidate = None
+    _ready_pending = False
+    _deferred_spawns: frozenset = frozenset()
+    _drain_reported: frozenset = frozenset()
+    _version_exit = False
+    _version_drain_logged_at = 0.0
+    _version_unreadable = False
+    _next_version_check_at = 0.0
 
     def __init__(
         self,
         config: BackupConfig,
         resolved_config: ResolvedConfigPath,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         key: Optional[Tuple[int, int]] = None,
         presence_lock=None,
@@ -642,6 +718,7 @@ class BackupDaemon:
         workers_lock=None,
         notifier: Optional[sdnotify.Notifier] = None,
         client_id: Optional[str] = None,
+        started_signature=_UNSET,
     ):
         """`key` is the `(store_id, generation)` that `config` was read at,
         and `client_id` this host's client id from the same snapshot
@@ -660,11 +737,22 @@ class BackupDaemon:
         default is a no-op, and `_run_startup` passes the one it built from
         `$NOTIFY_SOCKET`. Only `run()` and `_reload_tick` use it -- never a
         signal handler.
+
+        `started_signature` is the `version.code_signature()` taken when the
+        PROCESS started (`_run_startup` takes it first thing, before the wait
+        for a previous daemon's workers, which is unbounded): the code this
+        supervisor is running. Omitted, it is read now; `None` turns the
+        version-skew guard off.
         """
         #: Config, epoch, key and client id, swapped as one object by
         #: `_try_reload` and read once per spawn by `_new_worker`. See
         #: `Handoff`.
-        self._handoff = Handoff(config, 0, key, client_id)
+        self._handoff = Handoff(
+            config, 0, key, client_id, _status_dir_for(resolved_config, config)
+        )
+        #: Whether a failure to set up the status directory was already
+        #: reported (it is re-checked at every spawn).
+        self._status_dir_warned = False
         #: The config *database* path, with its provenance. Read by the
         #: supervisor: at startup, by every poll and by every reload
         #: (`_reload_tick`). The API worker is given it for TLS only (the
@@ -672,7 +760,9 @@ class BackupDaemon:
         #: `config_path` rather than merely retyped, so a bare `Path` cannot
         #: sneak back in unnoticed.
         self.resolved_config = resolved_config
-        self.verbose = verbose
+        #: The numeric level (`--log-level`, `-v`), handed to every worker so
+        #: that it configures its own logging at the same level.
+        self.log_level = log_level
         self._presence_lock = presence_lock
         self._dry_run_override = dry_run_override
         self._workers_lock = workers_lock
@@ -794,6 +884,52 @@ class BackupDaemon:
         #: not by a signal.
         self._stop_signum = None
         self._stop_reported = False
+        #: The version-skew guard (S-8). `_code_signature` is what the
+        #: installed code looked like when this process started (`None`: not
+        #: an installed distribution, or unreadable -- the guard is off, said
+        #: once by `run()`); it is handed to every worker, and the poll
+        #: compares it with the disk every `RELOAD_POLL_SECONDS`.
+        #: `_version_skew` is `(old, new)` once a change was seen and the
+        #: drain begun (`_begin_version_drain`): workers leave at their next
+        #: safe point and are not respawned, reloads stop, and the supervisor
+        #: exits `EXIT_CODE_VERSION_CHANGED` once every worker has left --
+        #: `_version_exit` -- unless a stop was requested meanwhile. Main
+        #: thread only, never touched by a signal handler. Not part of the
+        #: reload `Handoff`: it never changes in a supervisor's life, and a
+        #: reload must not be able to drop it.
+        started = self._signature_now() if started_signature is _UNSET else started_signature
+        self._code_signature: Optional[CodeSignature] = (
+            started if started is not None and started.installed else None
+        )
+        #: Why the guard is off (`None`: it is on): "unreadable" (the
+        #: signature could not be read) or "not installed" (no dist-info).
+        self._signature_problem: Optional[str] = (
+            None if self._code_signature is not None
+            else "unreadable" if started is None else "not installed"
+        )
+        self._version_skew: Optional[Tuple[CodeSignature, Optional[CodeSignature]]] = None
+        self._version_exit = False
+        self._version_drain_logged_at = 0.0
+        #: The status text of a drain (`STATUS=`), kept so a later `READY=1`
+        #: does not replace it.
+        self._version_status: Optional[str] = None
+        #: The last differing signature the SUPERVISOR read and when
+        #: (`_confirm_skew`): the drain starts only on the same difference
+        #: seen twice, a poll apart -- a transient read error is not an
+        #: upgrade.
+        self._skew_candidate: Optional[Tuple[CodeSignature, float]] = None
+        #: Consecutive `WORKER_EXIT_VERSION_SKEW` exits per worker that the
+        #: supervisor's own read did not confirm.
+        self._skew_reports: Dict[str, int] = {}
+        #: Workers whose spawn `_spawn_blocked_by_skew` deferred and that do
+        #: not exist yet. `applied=` is not published, and READY=1 not sent,
+        #: while any is pending (`_ready_pending`: READY owed).
+        self._deferred_spawns: frozenset = frozenset()
+        self._ready_pending = False
+        #: `(name, pid)` of the deaths already logged during a drain.
+        self._drain_reported: frozenset = frozenset()
+        self._next_version_check_at = self._monotonic() + RELOAD_POLL_SECONDS
+        self._version_unreadable = False
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGHUP, self._sighup_handler)
@@ -919,15 +1055,50 @@ class BackupDaemon:
         elif name == 'remote':
             extra['tls_dir'] = _tls_dir(self.resolved_config)
             extra['client_id'] = h.client_id
+        if name != 'api':
+            # The outcome files (S-7): the API worker has no per-dataset
+            # outcomes and writes none.
+            status = self._usable_status_dir(h)
+            if status is not None:
+                extra['status_dir'] = status
+        if self._code_signature is not None:
+            # A plain tuple: see `workers._SupervisorWatch._exit_on_version_skew`.
+            extra['code_signature'] = self._code_signature.as_tuple()
         return cls(
             h.config,
             self._stop_event,
-            self.verbose,
+            self.log_level,
             reload_epoch=self._reload_epoch,
             born_epoch=h.epoch,
             workers_lock=self._workers_lock_path(),
             **extra,
         )
+
+    def _usable_status_dir(self, h: 'Handoff') -> Optional[Path]:
+        """`h.status_dir` once it exists and is usable, else `None` (the
+        workers then record nothing). Created or re-checked here at EVERY
+        spawn (startup, crash restarts, reloads -- a stat and an fstat), never
+        by a worker, so a directory that was replaced or whose owner or mode
+        changed is noticed. A failure is one WARNING per supervisor and is
+        retried at the next spawn; it never stops a worker from starting. No
+        `zfs` call."""
+        directory = h.status_dir
+        if directory is None:
+            return None
+        try:
+            health.ensure_status_dir(directory)
+        except Exception as e:
+            if not self._status_dir_warned:
+                self._status_dir_warned = True
+                logger.warning(
+                    f"workers will not record their outcomes: {e}"
+                    if isinstance(e, health.StatusError) else
+                    f"workers will not record their outcomes: cannot set up {directory}: "
+                    f"{type(e).__name__}: {e}"
+                )
+            return None
+        self._status_dir_warned = False
+        return directory
 
     def _workers_lock_path(self):
         """Path of `<db>.workers.lock` for every worker to hold `LOCK_SH` on
@@ -947,7 +1118,7 @@ class BackupDaemon:
             names.append('remote')
         return names
 
-    def _spawn(self, name: str, verb: str = 'Started') -> multiprocessing.Process:
+    def _spawn(self, name: str, verb: str = 'Started') -> Optional[multiprocessing.Process]:
         """The **single fork point** for every worker, at startup and at
         every crash restart alike.
 
@@ -981,8 +1152,31 @@ class BackupDaemon:
         The worker's epoch is recorded from the same `Handoff` `_new_worker`
         reads: only this (main) thread ever replaces `self._handoff`, and
         not between these two lines.
+
+        **Version-skew guard (S-8).** Before anything is forked the installed
+        code is compared with the baseline (one version lookup and two stats):
+        when it differs, the OLD code decides, so no worker is forked into a
+        half-installed tree. The spawn is deferred by the normal restart delay
+        (no failure counted), the difference counts as one supervisor read
+        towards confirming the drain, and `None` is returned. During a drain
+        nothing is spawned at all.
         """
+        if self._version_skew is not None:
+            return None
+        if self._spawn_blocked_by_skew(name):
+            return None
         dispose_all()
+        if multiprocessing.get_start_method() == 'fork':
+            others = [t.name for t in threading.enumerate() if t is not threading.current_thread()]
+            if others:
+                # Today the supervisor is single-threaded. A thread added later
+                # that holds a lock (a logging handler's, the stdout buffer's)
+                # at the instant of the fork leaves it held for ever in the
+                # child, which then hangs on its first log line.
+                logger.error(
+                    "forking worker %s while other threads are running (%s): a lock one of "
+                    "them holds would stay locked in the child", name, ', '.join(others),
+                )
         h = self._handoff
         worker = self._new_worker(name)
         worker.start()
@@ -1004,6 +1198,7 @@ class BackupDaemon:
         on = f" on generation {_gen(h.key)}" if verb == 'Reloaded' else ""
         logger.info(f"{verb} {name} worker (pid={worker.pid}){on}")
         self._restart_at.pop(name, None)
+        self._deferred_spawns = self._deferred_spawns - {name}
         return worker
 
     def _forget_worker(self, name: str, *, keep_failures: bool = True) -> None:
@@ -1021,6 +1216,7 @@ class BackupDaemon:
         self._worker_fs.pop(name, None)
         self._worker_addr.pop(name, None)
         self._lost.discard(name)
+        self._deferred_spawns = self._deferred_spawns - {name}
         if not keep_failures:
             self._failures.pop(name, None)
 
@@ -1196,6 +1392,13 @@ class BackupDaemon:
         exited. Lost workers count like live ones on their recorded epoch in
         `_maybe_complete` / `_log_deferred_switches`.
 
+        **Version skew (S-8).** A worker that exits `WORKER_EXIT_VERSION_SKEW`
+        is not a crash: nothing is counted, nothing is restarted, and the
+        supervisor checks for itself (`_worker_saw_version_skew`) and either
+        drains (exit 76 follows) or restarts the worker after the normal
+        delay. During a drain nothing is respawned (no turnover, no crash
+        restart, no replacement of a lost worker) and no death is counted.
+
         **One crash-looping worker is fatal to the daemon, not just to that
         worker.** A daemon that keeps three of four workers alive after the
         fourth gave up -- say, taking no snapshots while the API keeps
@@ -1274,6 +1477,18 @@ class BackupDaemon:
         ]
 
         for name, worker in dead:
+            if worker.exitcode == WORKER_EXIT_VERSION_SKEW:
+                # Not a crash, whatever follows: no failure counted. The
+                # supervisor reads the signature itself (`_worker_saw_version_
+                # skew`): a confirmed change drains the daemon; otherwise the
+                # worker is restarted after the normal delay.
+                self._worker_saw_version_skew(name, worker)
+                continue
+            if self._version_skew is not None:
+                # Draining for an upgrade: nothing is restarted or counted,
+                # but every death is said once.
+                self._log_drain_death(name, worker)
+                continue
             if worker.exitcode == WORKER_EXIT_RELOAD:
                 if self._stop_event.is_set():
                     # It saw RELOAD just before STOP: a normal exit, left in
@@ -1298,7 +1513,7 @@ class BackupDaemon:
                 self._crash_looped.add(name)
                 del self._workers[name]
 
-        if not self._crash_looped:
+        if not self._crash_looped and self._version_skew is None:
             if turnovers and active is None:
                 active = set(self._active_worker_names())
             for i, (name, worker) in enumerate(turnovers):
@@ -1366,8 +1581,13 @@ class BackupDaemon:
 
         if self._stop_event.is_set():
             return
-        self._log_deferred_switches()
+        if self._version_skew is None:
+            # (A drain has its own periodic WARNING, `_log_version_drain`.)
+            self._log_deferred_switches()
         self._maybe_complete()
+        if self._ready_pending and not self._deferred_spawns:
+            self._ready_pending = False
+            self._notify_ready()
 
     def _log_deferred_switches(self) -> None:
         """D5: a reload never kills in-flight work, so a worker busy with a
@@ -1402,6 +1622,10 @@ class BackupDaemon:
         switched: it will be respawned on the current `Handoff`."""
         h = self._handoff
         if self._applied_epoch >= h.epoch:
+            return
+        if self._deferred_spawns:
+            # A respawn the skew guard deferred: that worker does not exist
+            # yet, so the generation is not applied by every worker.
             return
         for name in self._workers:
             if name in self._restart_at:
@@ -1577,13 +1801,43 @@ class BackupDaemon:
         """Run the supervisor until the stop event is set. Returns the
         daemon's process exit code: 0 for a clean shutdown, 1 if **any**
         worker crash-looped -- in which case `_check_workers` has already
-        stopped the whole daemon rather than let it run degraded. Returning
-        a code at all, rather than always 0, is what lets a service manager
-        see that a daemon that gave up is not a successful run.
+        stopped the whole daemon rather than let it run degraded -- or
+        `EXIT_CODE_VERSION_CHANGED` (76) after the drain for an upgrade under
+        the running daemon ran to its end (S-8). Returning a code at all,
+        rather than always 0, is what lets a service manager see that a
+        daemon that gave up is not a successful run.
         """
         logger.info("=" * 60)
         logger.info("ZFS Backup Daemon Starting")
         logger.info("=" * 60)
+        if self._code_signature is None:
+            if self._signature_problem == "unreadable":
+                logger.warning(
+                    "cannot read the installed zfsbackup's signature: the "
+                    "version-skew guard is off; restart the daemon yourself "
+                    "after upgrading it"
+                )
+            else:
+                logger.info(
+                    "zfsbackup is not an installed distribution here (no dist-info "
+                    "metadata): the version-skew guard is off; restart the daemon "
+                    "after changing its code"
+                )
+        else:
+            logger.info(f"zfsbackup {self._code_signature}")
+            logger.info(
+                "version-skew guard on: a reinstall of zfsbackup or a replaced "
+                "Python interpreter makes the daemon drain and exit "
+                f"{EXIT_CODE_VERSION_CHANGED} (a service manager restarts it). "
+                "An upgrade of another package (werkzeug, cryptography, ...) is "
+                "NOT detected: restart the daemon yourself (`systemctl restart "
+                "zfsbackup`)."
+            )
+            if editable_install():
+                logger.info(
+                    "editable install: only reinstalls are detected; restart the "
+                    "daemon after source changes"
+                )
 
         # The supervisor makes no `zfs` call (B1): a hung pool inside one
         # would stall SIGTERM, SIGHUP and every worker restart, because
@@ -1623,6 +1877,10 @@ class BackupDaemon:
                 # line precedes its consequence in the log.
                 self._report_stop_signal()
                 logger.info("Shutdown requested during startup; no workers started")
+            elif self._start_blocked_by_skew():
+                # The OLD code decides, before anything is forked (S-8): the
+                # install changed while this process was starting.
+                self._version_exit = True
             else:
                 logger.info("=" * 60)
                 logger.info("Starting workers...")
@@ -1633,12 +1891,35 @@ class BackupDaemon:
                 # workers' own first act, e.g. the dataset check, is not
                 # waited for). Not sent into a shutdown.
                 if not self._stop_event.is_set():
-                    self._notify_ready()
+                    if self._deferred_spawns:
+                        # A worker the skew guard deferred does not exist yet:
+                        # not started, so not READY (sent by `_check_workers`
+                        # once it is, or when a drain begins).
+                        self._ready_pending = True
+                    else:
+                        self._notify_ready()
 
                 while not self._stop_event.is_set():
                     self._supervisor_sleep(SUPERVISOR_POLL)
                     if self._stop_event.is_set():
                         break
+                    # Before the reload: a reload would respawn workers onto
+                    # code the supervisor is not running. A SIGHUP does not
+                    # wait for the 10 s cadence.
+                    self._check_code_version(force=self._hup_requested)
+                    if self._version_skew is not None:
+                        # Draining for an upgrade (S-8): no reload (a SIGHUP is
+                        # consumed, or `_supervisor_sleep` would spin on it),
+                        # no respawn; signals, SIGTERM included, are still
+                        # served by this loop.
+                        if self._hup_requested:
+                            self._hup_requested = False
+                            self._answer_hup_while_draining()
+                        self._check_workers()
+                        if self._version_drained() or self._drain_lost_a_worker():
+                            break
+                        self._log_version_drain()
+                        continue
                     self._reload_tick()
                     if self._stop_event.is_set():
                         break
@@ -1660,7 +1941,362 @@ class BackupDaemon:
             logger.info("Shutting down workers...")
             self._shutdown_workers()
         logger.info("Daemon stopped")
+        # Only a drain that ran to its end: a SIGTERM/SIGINT at any point
+        # (even one racing the last worker's exit) is an ordinary stop.
+        if self._version_exit and self._stop_signum is None:
+            return EXIT_CODE_VERSION_CHANGED
         return 1 if self._crash_looped else 0
+
+    # -- version-skew guard (S-8) ------------------------------------------
+
+    @staticmethod
+    def _signature_now() -> Optional[CodeSignature]:
+        """`version.code_signature()`: one version lookup and one `stat`, no
+        `zfs` call, nothing cached. `None` = cannot tell. A named seam for
+        tests (the supervisor's start-up value and every poll go through it)."""
+        return code_signature()
+
+    def _confirm_skew(self, current: CodeSignature) -> bool:
+        """One supervisor read that DIFFERS from the baseline. `True` only
+        when the same difference was read before, at least `RELOAD_POLL_SECONDS`
+        ago: a transient I/O error reads as "not installed" (importlib.metadata
+        swallows a failed directory listing), and an upgrade in flight changes
+        under the reader; neither may drain a daemon. Anything else records
+        `current` as the candidate and answers `False`."""
+        now = self._monotonic()
+        candidate = self._skew_candidate
+        if candidate is None or candidate[0] != current:
+            self._skew_candidate = (current, now)
+            return False
+        return now - candidate[1] >= RELOAD_POLL_SECONDS
+
+    def _check_code_version(self, force: bool = False) -> bool:
+        """Compare the installed code with the signature taken at process
+        start, every `RELOAD_POLL_SECONDS` (or now, with `force`). When the
+        same difference is read twice, a poll apart (`_confirm_skew`), begin
+        the drain (`_begin_version_drain`) and return `True`; also `True`
+        while a drain is under way.
+
+        Never once a stop is under way (a SIGTERM stop must not turn into
+        exit 76: the operator asked for a stop, not a restart). A signature
+        that cannot be read is "no change" (one WARNING while it lasts); one
+        that reads as *not installed* counts as a difference -- an upgrade
+        removes the old distribution before it installs the new one -- but
+        only once confirmed."""
+        if self._version_skew is not None:
+            return True
+        baseline = self._code_signature
+        if baseline is None or self._stop_event.is_set():
+            return False
+        now = self._monotonic()
+        if not force and now < self._next_version_check_at:
+            return False
+        self._next_version_check_at = now + RELOAD_POLL_SECONDS
+        current = self._signature_now()
+        if current is None:
+            if not self._version_unreadable:
+                self._version_unreadable = True
+                logger.warning(
+                    "cannot read the installed zfsbackup's signature; not "
+                    "checking whether it was upgraded (will retry)"
+                )
+            return False
+        self._version_unreadable = False
+        if current == baseline:
+            self._skew_candidate = None
+            return False
+        if not self._confirm_skew(current):
+            return False
+        self._begin_version_drain(baseline, current)
+        return True
+
+    def _start_blocked_by_skew(self) -> bool:
+        """Right before the first fork: has the installed code changed since
+        this process started (an install landed while it waited for a previous
+        daemon's workers, or read its configuration)? Read twice, a second
+        apart, and blocked only if both differ from the baseline (an install in
+        flight changes under the reader; a transient error reads as "not
+        installed" once, not twice). Then no worker is started and the daemon
+        exits `EXIT_CODE_VERSION_CHANGED`; the service manager retries after its
+        restart delay."""
+        baseline = self._code_signature
+        if baseline is None:
+            return False
+        first = self._signature_now()
+        if first is None or first == baseline:
+            return False
+        # Not `_supervisor_sleep`: a pending SIGHUP would end it at once and
+        # make the two reads back to back. Only a stop ends this wait.
+        self._stop_event.wait(1.0)
+        second = self._signature_now()
+        if second is None or second == baseline or self._stop_event.is_set():
+            return False
+        logger.warning(
+            f"zfsbackup was changed on disk while the daemon was starting: "
+            f"{second.change_from(baseline)}. Not starting any worker; exiting "
+            f"{EXIT_CODE_VERSION_CHANGED} (a service manager restarts the daemon "
+            f"on {EXIT_CODE_VERSION_CHANGED})."
+        )
+        return True
+
+    def _spawn_blocked_by_skew(self, name: str) -> bool:
+        """`_spawn`'s guard: the installed code no longer matches the baseline.
+        The spawn is deferred by `WORKER_RESTART_DELAY` (no failure counted;
+        the `due` loop of `_check_workers` forks it later) and the read counts
+        towards confirming the drain, which this may begin. An unreadable
+        signature or one equal to the baseline lets the spawn go."""
+        baseline = self._code_signature
+        if baseline is None or self._stop_event.is_set():
+            return False
+        current = self._signature_now()
+        if current is None or current == baseline:
+            return False
+        if self._confirm_skew(current):
+            self._begin_version_drain(baseline, current, f"before starting the {name} worker")
+            return True
+        self._restart_at[name] = self._monotonic() + WORKER_RESTART_DELAY
+        self._deferred_spawns = self._deferred_spawns | {name}
+        logger.warning(
+            f"the installed zfsbackup differs from the running one "
+            f"({current.change_from(baseline)}); not starting the {name} worker "
+            f"yet, checking again in {WORKER_RESTART_DELAY}s"
+        )
+        return True
+
+    def _worker_saw_version_skew(
+        self, name: str, worker: multiprocessing.Process
+    ) -> None:
+        """A worker exited `WORKER_EXIT_VERSION_SKEW`: it read a signature
+        other than ours at its start. That alone drains nothing: the worker's
+        read can be a transient error or a half-written install. The
+        supervisor reads for itself (`_confirm_skew`); a confirmed difference
+        begins the drain. Otherwise the worker is restarted after the normal
+        delay, counted as no failure -- but a worker that keeps reporting
+        (3 in a row, none having lived `WORKER_STABLE_UPTIME`) is believed
+        and drains the daemon. Ignored during a drain or a stop."""
+        if self._version_skew is not None or self._stop_event.is_set():
+            return
+        baseline = self._code_signature
+        current = self._signature_now()
+        if current is not None and baseline is not None and current != baseline:
+            if self._confirm_skew(current):
+                self._begin_version_drain(
+                    baseline, current,
+                    f"{name} worker (pid={worker.pid}) found it changed at its start",
+                )
+                return
+        now = self._monotonic()
+        if now - self._started_at.get(name, now) >= WORKER_STABLE_UPTIME:
+            self._skew_reports[name] = 0
+        reports = self._skew_reports.get(name, 0) + 1
+        self._skew_reports[name] = reports
+        if reports >= 3:
+            self._begin_version_drain(
+                baseline, current,
+                f"{name} worker (pid={worker.pid}) reported it {reports} times in a row",
+            )
+            return
+        self._restart_at[name] = now + WORKER_RESTART_DELAY
+        logger.warning(
+            f"{name} worker (pid={worker.pid}) found the installed zfsbackup "
+            "changed at its start, but this process does not (yet) see the "
+            f"difference; restarting it in {WORKER_RESTART_DELAY}s"
+        )
+
+    def _begin_version_drain(
+        self,
+        old: Optional[CodeSignature],
+        new: Optional[CodeSignature],
+        why: Optional[str] = None,
+    ) -> None:
+        """Start the drain for an upgrade (S-8). Not a stop: the stop flag is
+        NOT raised yet. The shared `ReloadEpoch` is set to
+        `EPOCH_UPGRADE_DRAIN`, which only the workers that import code lazily
+        from disk obey, in two stages (`_version_drained`): the remote worker
+        leaves at its next safe point -- between datasets or destinations,
+        however long that takes -- while the API worker keeps serving; once
+        it is gone the epoch becomes `EPOCH_UPGRADE_DRAIN_API` and the API
+        worker finishes its in-flight receives and leaves. Neither is
+        respawned (`_check_workers`). The snapshot and pruning workers keep
+        running through a long drain; if one is found not running
+        (`_drain_lost_a_worker`) the drain ends through the ordinary stop. The
+        loop keeps serving signals, reloads nothing and answers a SIGHUP
+        (`_answer_hup_while_draining`). When the last drained worker
+        has gone `run()` leaves its loop, its `finally`
+        raises the stop flag for the rest (the ordinary 30 s budget) and the
+        exit code is `EXIT_CODE_VERSION_CHANGED`. A SIGTERM/SIGINT meanwhile
+        is the ordinary stop with the ordinary exit code. No time cap.
+
+        The drain is published in the pid file (`draining=<unix time>`,
+        `draining_reason=`) and, to systemd, as `STATUS=` only: a
+        self-initiated drain is not a stop job, so no `STOPPING=1` (that comes
+        once the workers are gone) and no `EXTEND_TIMEOUT_USEC`."""
+        self._version_skew = (old, new)
+        self._version_drain_logged_at = self._monotonic()
+        self._reload_epoch.set(EPOCH_UPGRADE_DRAIN)
+        if old is not None and new is not None and new != old:
+            change = new.change_from(old)
+        else:
+            change = "the installed code changed (and reads the same again now)"
+        logger.warning(
+            f"zfsbackup was changed on disk while the daemon was running: "
+            f"{change}{f' ({why})' if why else ''}. The daemon will exit "
+            f"{EXIT_CODE_VERSION_CHANGED} (a service manager restarts it on "
+            f"{EXIT_CODE_VERSION_CHANGED}) once the running transfers and "
+            "receives reach a safe point: the remote worker finishes its "
+            "current work first, then the API worker (which serves until "
+            "then); neither is restarted -- nothing is interrupted, there is "
+            "no time limit -- while snapshots and pruning continue until then. The configuration is not reloaded "
+            "meanwhile. SIGTERM during the drain stops the daemon the usual way."
+        )
+        text = (
+            f"zfsbackup upgraded ({change}); draining the remote worker, then "
+            f"the API worker, then exiting {EXIT_CODE_VERSION_CHANGED}"
+        )
+        self._version_status = text
+        self._status_sent = text
+        if self._presence_lock is not None:
+            self._presence_lock.set_state(draining=int(time.time()), draining_reason=text)
+        self._notify.status(text)
+        if self._ready_pending:
+            # READY was owed for workers the guard deferred; they will never
+            # start now. Do not leave a Type=notify start hanging.
+            self._ready_pending = False
+            self._notify_ready()
+
+    def _drain_worker_running(self, name: str) -> bool:
+        """Is the `name` worker (still) running? A forkserver orphan that still
+        runs counts; a name with no worker object (never forked, or deferred)
+        does not."""
+        worker = self._workers.get(name)
+        if worker is None:
+            return False
+        if name in self._lost:
+            return self._lost_running(name, worker)
+        return worker.is_alive() or self._orphaned(name, worker)
+
+    def _version_drained(self) -> bool:
+        """The two-stage end of the drain. Stage 1 (the epoch is
+        `EPOCH_UPGRADE_DRAIN`): the remote worker leaves at its next safe point
+        while the API worker keeps serving -- so a remote worker stuck in an
+        uninterruptible `zfs` call cannot leave the server refusing every
+        client. When it is gone (or there is none) the epoch becomes
+        `EPOCH_UPGRADE_DRAIN_API`, stage 2: the API worker finishes its
+        in-flight receives and leaves. When it is gone too the drain is over:
+        the exit is marked as `EXIT_CODE_VERSION_CHANGED` unless a stop was
+        requested meanwhile (then `run()` takes the ordinary path and exit
+        code)."""
+        if self._stop_event.is_set():
+            return False
+        if self._reload_epoch.get() == EPOCH_UPGRADE_DRAIN:
+            if self._drain_worker_running('remote'):
+                return False
+            self._reload_epoch.set(EPOCH_UPGRADE_DRAIN_API)
+            logger.info(
+                "the remote worker has left; the API worker now finishes its "
+                "in-flight receives and leaves"
+            )
+        if self._drain_worker_running('api'):
+            return False
+        self._version_exit = True
+        return True
+
+    def _log_drain_death(self, name: str, worker: multiprocessing.Process) -> None:
+        """Say once that a worker is gone during a drain. A drained worker
+        leaving with 0 is the plan (INFO); anything else is an ERROR, and for
+        the snapshot and pruning workers (which are never restarted during the
+        drain) `_drain_lost_a_worker` ends the drain over it."""
+        key = (name, worker.pid)
+        if key in self._drain_reported:
+            return
+        self._drain_reported = self._drain_reported | {key}
+        if name in _DRAIN_WORKERS and worker.exitcode == 0:
+            logger.info(f"{name} worker (pid={worker.pid}) has left for the upgrade")
+        else:
+            logger.error(
+                f"{name} worker (pid={worker.pid}) exited with code "
+                f"{worker.exitcode} during the upgrade drain; it is not restarted"
+            )
+
+    def _drain_lost_a_worker(self) -> bool:
+        """During the drain the snapshot and pruning workers must keep running
+        (the drain's WARNING promises it) and nothing restarts them. If one
+        that the configuration needs is not running -- it crashed, its respawn
+        was deferred by the skew guard, a forkserver orphan exited -- say so
+        once (ERROR) and end the drain through the ordinary stop instead of
+        waiting, possibly for ever, with no snapshots or pruning: the stop flag
+        (30 s budget; a cut transfer resumes with `zfs receive -s`), then exit
+        `EXIT_CODE_VERSION_CHANGED`."""
+        if self._stop_event.is_set():
+            return False
+        missing = [
+            name for name in self._active_worker_names()
+            if name not in _DRAIN_WORKERS and not self._drain_worker_running(name)
+        ]
+        if not missing:
+            return False
+        logger.error(
+            f"the {', '.join(missing)} worker(s) are not running during the "
+            "zfsbackup upgrade drain and are not restarted; ending the drain "
+            f"now: stopping the daemon the usual way and exiting "
+            f"{EXIT_CODE_VERSION_CHANGED}"
+        )
+        self._version_exit = True
+        return True
+
+    def _log_version_drain(self) -> None:
+        """Say every `VERSION_DRAIN_REPEAT` seconds which workers the drain is
+        still waiting for."""
+        now = self._monotonic()
+        if now - self._version_drain_logged_at < VERSION_DRAIN_REPEAT:
+            return
+        self._version_drain_logged_at = now
+        stage1 = self._reload_epoch.get() == EPOCH_UPGRADE_DRAIN
+        waiting = [n for n in (('remote', 'api') if stage1 else ('api',))
+                   if self._drain_worker_running(n)]
+        logger.warning(
+            "still draining for the zfsbackup upgrade; waiting for "
+            f"{' and then '.join(waiting) or 'no one'} to reach a safe point "
+            "(in-flight transfers are never interrupted)"
+        )
+
+    def _answer_hup_while_draining(self) -> None:
+        """A SIGHUP during the drain: the configuration is not reloaded, but
+        the sender (`zfsbackup-config`, `systemctl reload`) gets an answer
+        rather than silence. RELOADING=1 ... READY=1 around it, and when the
+        stored key is not the running one it is published as `deferred=` with
+        the reason (it is loaded by the restarted daemon). Never raises."""
+        if self._stop_event.is_set():
+            return
+        self._notify.reloading()
+        try:
+            h = self._handoff
+            logger.info(
+                "SIGHUP while draining for the zfsbackup upgrade: not reloading "
+                "the configuration; the restarted daemon loads it"
+            )
+            if h.key is None or self._presence_lock is None:
+                return
+            try:
+                try:
+                    state = read_store_state(self.resolved_config)
+                finally:
+                    dispose_all()
+            except Exception as e:
+                logger.debug("reading the store state while draining failed: %s", e)
+                return
+            stored = (state.store_id, state.generation)
+            if stored != h.key:
+                self._rejected = None
+                self._deferred = stored
+                self._deferred_reason = (
+                    "upgrade draining: applied after the daemon restarts, not re-checked"
+                )
+                self._presence_lock.set_state(
+                    rejected=None, deferred=stored, deferred_reason=self._deferred_reason
+                )
+        finally:
+            self._notify_ready()
 
     # -- live reload (item 17.2) -------------------------------------------
 
@@ -1717,7 +2353,10 @@ class BackupDaemon:
 
     def _status_text(self) -> str:
         """The `systemctl status` line: the running generation, plus the
-        candidate the last reload refused (if it is still the stored one)."""
+        candidate the last reload refused (if it is still the stored one). A
+        drain for an upgrade (S-8) replaces it."""
+        if self._version_status is not None:
+            return self._version_status
         text = f"generation {_gen(self._handoff.key)}"
         if self._rejected is not None:
             text += f"; generation {_gen(self._rejected)} rejected"
@@ -2061,7 +2700,9 @@ class BackupDaemon:
             return
 
         epoch = h.epoch + 1
-        self._handoff = Handoff(config, epoch, key, client_id)
+        self._handoff = Handoff(
+            config, epoch, key, client_id, _status_dir_for(self.resolved_config, config)
+        )
         self._reload_epoch.set(epoch)
         self._rejected = None
         self._deferred = None
@@ -2118,7 +2759,7 @@ class BackupDaemon:
         the turnover finishes (it reads `h.key`)."""
         h = self._handoff
         clear = {'deferred': None} if self._deferred is not None else {}
-        self._handoff = Handoff(h.config, h.epoch, key, h.client_id)
+        self._handoff = Handoff(h.config, h.epoch, key, h.client_id, h.status_dir)
         self._rejected = None
         self._deferred = None
         self._deferred_reason = None
@@ -2178,6 +2819,25 @@ class BackupDaemon:
             self._spawn(name)
 
 
+class _VersionAction(argparse.Action):
+    """`--version`, building the line (which imports the store package for the
+    schema head) only when the flag is given."""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None):
+        super().__init__(option_strings, dest=dest, default=default, nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(version_string('zfsbackupd'))
+        parser.exit()
+
+
+def _log_level(args: argparse.Namespace) -> int:
+    """The numeric log level `--log-level` and `-v` ask for (default INFO)."""
+    return logsetup.resolve_level(
+        getattr(args, 'log_level', None), bool(getattr(args, 'verbose', False))
+    )
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -2214,7 +2874,18 @@ def main():
     parser.add_argument(
         '-v', '--verbose',
         action='store_true',
-        help='Enable verbose (debug) logging'
+        help='Enable verbose (debug) logging; same as --log-level debug'
+    )
+    parser.add_argument(
+        '--log-level',
+        choices=logsetup.LEVEL_NAMES,
+        default=None,
+        help='Log level (default: info). With -v, the finer of the two wins.'
+    )
+    parser.add_argument(
+        '--version',
+        action=_VersionAction,
+        help='Print the version, the wire protocol and the config schema, and exit'
     )
     parser.add_argument(
         '--test-config',
@@ -2224,9 +2895,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.setLevel(logging.DEBUG)
+    logsetup.configure(_log_level(args))
 
     abandoned: List[str] = []
     try:
@@ -2573,7 +3242,7 @@ def _run(args: argparse.Namespace, abandoned: Optional[List[str]] = None) -> int
     # DDL"). With live reload the supervisor reads on every accepted change,
     # so keep them out of the log unless something is actually wrong --
     # except under --verbose, which shows them as before.
-    if not getattr(args, 'verbose', False):
+    if _log_level(args) > logging.DEBUG:
         logging.getLogger('alembic').setLevel(logging.WARNING)
     # Read once and REMOVED from the environment before anything can fork,
     # start a forkserver or exec `zfs`: neither workers nor `zfs` inherit it.
@@ -2619,6 +3288,29 @@ def _run_startup(
     not the validation, and reports the TLS state read-only. Any refusal
     after the lock was taken releases it.
     """
+    # First, before anything that can wait: the signature of the code this
+    # PROCESS is running (S-8). `_wait_for_previous_workers` below is
+    # unbounded; an upgrade landing during it must be seen as a change, not
+    # become the baseline of a supervisor that runs the old code.
+    started_signature = code_signature()
+    if (
+        not args.test_config
+        and (started_signature is None or not started_signature.installed)
+        and installed_in_site_packages()
+    ):
+        # The package files are under site-packages but their metadata is
+        # missing or unreadable: an install is in flight (or the read failed).
+        # Starting would switch the version-skew guard off for the life of
+        # the process, so leave and let the service manager retry.
+        logger.error(
+            "cannot read the installed zfsbackup's "
+            + ("signature" if started_signature is None else "metadata (not installed)")
+            + " although its files are under site-packages: an install is "
+            "probably in progress. Not starting; exiting "
+            f"{EXIT_CODE_VERSION_CHANGED} (a service manager retries after its "
+            "restart delay)."
+        )
+        return EXIT_CODE_VERSION_CHANGED
     resolved = None
     lock = None
     try:
@@ -2807,13 +3499,14 @@ def _run_startup(
         daemon = BackupDaemon(
             config,
             resolved,
-            verbose=args.verbose,
+            log_level=_log_level(args),
             key=key,
             presence_lock=lock,
             dry_run_override=bool(args.dry_run),
             workers_lock=daemonlock.workers_lock_path(resolved),
             notifier=notifier,
             client_id=snapshot.client_id,
+            started_signature=started_signature,
         )
         # `BackupDaemon.__init__` has replaced the startup handler; a SIGHUP
         # that landed before that is carried over. A SIGHUP landing between

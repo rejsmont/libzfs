@@ -1,0 +1,3078 @@
+{
+ "bookmark-name-as-volume-all|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type volume ('bk/A#b')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type volume ('bk/A#b')"
+  ]
+ },
+ "bookmark-name-as-volume-all|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type volume ('bk/A#b')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type volume ('bk/A#b')"
+  ]
+ },
+ "bookmark-name-as-volume-explicit|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type volume ('bk/A#b')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type volume ('bk/A#b')"
+  ]
+ },
+ "bookmark-name-as-volume-explicit|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type volume ('bk/A#b')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type volume ('bk/A#b')"
+  ]
+ },
+ "contiguity-all|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "1",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/B",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "the rows of 'bk/A' are not contiguous"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: the rows of 'bk/A' are not contiguous"
+  ]
+ },
+ "contiguity-all|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/B",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "the rows of 'bk/A' are not contiguous"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: the rows of 'bk/A' are not contiguous"
+  ]
+ },
+ "contiguity-explicit|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "1",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/B",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "the rows of 'bk/A' are not contiguous"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: the rows of 'bk/A' are not contiguous"
+  ]
+ },
+ "contiguity-explicit|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/B",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "the rows of 'bk/A' are not contiguous"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: the rows of 'bk/A' are not contiguous"
+  ]
+ },
+ "duplicate-property-all|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/B",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "property 'org.t:v' appears twice for 'bk/A'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: property 'org.t:v' appears twice for 'bk/A'"
+  ]
+ },
+ "duplicate-property-all|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/B",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "property 'org.t:v' appears twice for 'bk/A'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: property 'org.t:v' appears twice for 'bk/A'"
+  ]
+ },
+ "duplicate-property-explicit|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/B",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "property 'org.t:v' appears twice for 'bk/A'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: property 'org.t:v' appears twice for 'bk/A'"
+  ]
+ },
+ "duplicate-property-explicit|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/B",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "property 'org.t:v' appears twice for 'bk/A'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: property 'org.t:v' appears twice for 'bk/A'"
+  ]
+ },
+ "filesystem-name-as-snapshot-all|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type snapshot ('bk/A')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type snapshot ('bk/A')"
+  ]
+ },
+ "filesystem-name-as-snapshot-all|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type snapshot ('bk/A')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type snapshot ('bk/A')"
+  ]
+ },
+ "filesystem-name-as-snapshot-explicit|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type snapshot ('bk/A')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type snapshot ('bk/A')"
+  ]
+ },
+ "filesystem-name-as-snapshot-explicit|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type snapshot ('bk/A')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type snapshot ('bk/A')"
+  ]
+ },
+ "forged-capture|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "b123p"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "b123p",
+    [
+     [
+      "org.t:v",
+      "-",
+      "-",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/attacker",
+    []
+   ],
+   [
+    "Filesystem",
+    "b123p/cr",
+    [
+     [
+      "org.t:v",
+      "cr\rx",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/empty",
+    [
+     [
+      "org.t:v",
+      "",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/ff",
+    [
+     [
+      "org.t:v",
+      "\udcff\udcfe",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/forger",
+    []
+   ],
+   [
+    "Filesystem",
+    "b123p/recv",
+    []
+   ],
+   [
+    "Snapshot",
+    "b123p/recv@s",
+    []
+   ],
+   [
+    "Filesystem",
+    "b123p/recv2",
+    [
+     [
+      "org.t:v",
+      "r1\tr2",
+      "received",
+      "r1\tr2"
+     ]
+    ]
+   ],
+   [
+    "Snapshot",
+    "b123p/recv2@s",
+    [
+     [
+      "org.t:v",
+      "r1\tr2",
+      "inherited from b123p/recv2",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/recv3",
+    []
+   ],
+   [
+    "Snapshot",
+    "b123p/recv3@s",
+    [
+     [
+      "org.t:v",
+      "l1\tl2",
+      "inherited from b123p/recv3",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/src",
+    []
+   ],
+   [
+    "Snapshot",
+    "b123p/src@s",
+    []
+   ],
+   [
+    "Filesystem",
+    "b123p/src2",
+    [
+     [
+      "org.t:v",
+      "r1\tr2",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Snapshot",
+    "b123p/src2@s",
+    [
+     [
+      "org.t:v",
+      "r1\tr2",
+      "inherited from b123p/src2",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/tab",
+    [
+     [
+      "org.t:v",
+      "a\tb",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/trail",
+    [
+     [
+      "org.t:v",
+      "trail  ",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    15,
+    15,
+    0,
+    "expected 5 columns, got 3: 'b123p/attacker\\torg.t:v\\tline1'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: expected 5 columns, got 3: 'b123p/attacker\\torg.t:v\\tline1'",
+   "skipping a row of zfs get output: expected 5 columns, got 3: 'line2\\t-\\tlocal'",
+   "skipping a row of zfs get output: expected 5 columns, got 3: 'b123p/forger\\torg.t:v\\tX'",
+   "skipping a row of zfs get output: the rows of 'b123p/victim' do not start with the 'name' row zfs prints first (got 'filesystem')",
+   "skipping a row of zfs get output: expected 5 columns, got 3: 'b123p/recv\\torg.t:v\\tX'",
+   "skipped 15 malformed rows of zfs get output in total (the first 5 are logged above)"
+  ]
+ },
+ "forged-capture|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "b123p"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "b123p",
+    [
+     [
+      "org.t:v",
+      "-",
+      "-",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/attacker",
+    []
+   ],
+   [
+    "Filesystem",
+    "b123p/cr",
+    [
+     [
+      "org.t:v",
+      "cr\rx",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/empty",
+    [
+     [
+      "org.t:v",
+      "",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/ff",
+    [
+     [
+      "org.t:v",
+      "\udcff\udcfe",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/forger",
+    []
+   ],
+   [
+    "Filesystem",
+    "b123p/recv",
+    []
+   ],
+   [
+    "Snapshot",
+    "b123p/recv@s",
+    []
+   ],
+   [
+    "Filesystem",
+    "b123p/recv2",
+    [
+     [
+      "org.t:v",
+      "r1\tr2",
+      "received",
+      "r1\tr2"
+     ]
+    ]
+   ],
+   [
+    "Snapshot",
+    "b123p/recv2@s",
+    [
+     [
+      "org.t:v",
+      "r1\tr2",
+      "inherited from b123p/recv2",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/recv3",
+    []
+   ],
+   [
+    "Snapshot",
+    "b123p/recv3@s",
+    [
+     [
+      "org.t:v",
+      "l1\tl2",
+      "inherited from b123p/recv3",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/src",
+    []
+   ],
+   [
+    "Snapshot",
+    "b123p/src@s",
+    []
+   ],
+   [
+    "Filesystem",
+    "b123p/src2",
+    [
+     [
+      "org.t:v",
+      "r1\tr2",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Snapshot",
+    "b123p/src2@s",
+    [
+     [
+      "org.t:v",
+      "r1\tr2",
+      "inherited from b123p/src2",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/tab",
+    [
+     [
+      "org.t:v",
+      "a\tb",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "b123p/trail",
+    [
+     [
+      "org.t:v",
+      "trail  ",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    15,
+    15,
+    0,
+    "expected 5 columns, got 3: 'b123p/attacker\\torg.t:v\\tline1'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: expected 5 columns, got 3: 'b123p/attacker\\torg.t:v\\tline1'",
+   "skipping a row of zfs get output: expected 5 columns, got 3: 'line2\\t-\\tlocal'",
+   "skipping a row of zfs get output: expected 5 columns, got 3: 'b123p/forger\\torg.t:v\\tX'",
+   "skipping a row of zfs get output: the rows of 'b123p/victim' do not start with the 'name' row zfs prints first (got 'filesystem')",
+   "skipping a row of zfs get output: expected 5 columns, got 3: 'b123p/recv\\torg.t:v\\tX'",
+   "skipped 15 malformed rows of zfs get output in total (the first 5 are logged above)"
+  ]
+ },
+ "ghost-explicit|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "v",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/ghost",
+    [
+     [
+      "org.t:v",
+      "FORGED",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/C",
+    [
+     [
+      "org.t:v",
+      "c",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    0,
+    0,
+    0,
+    null
+   ]
+  ],
+  "warnings": []
+ },
+ "ghost-explicit|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "v",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/ghost",
+    [
+     [
+      "org.t:v",
+      "FORGED",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/C",
+    [
+     [
+      "org.t:v",
+      "c",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    0,
+    0,
+    0,
+    null
+   ]
+  ],
+  "warnings": []
+ },
+ "ghost|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "v",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/ghost",
+    [
+     [
+      "org.t:v",
+      "FORGED",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/C",
+    [
+     [
+      "org.t:v",
+      "c",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    0,
+    0,
+    0,
+    null
+   ]
+  ],
+  "warnings": []
+ },
+ "ghost|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "v",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/ghost",
+    [
+     [
+      "org.t:v",
+      "FORGED",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/C",
+    [
+     [
+      "org.t:v",
+      "c",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    0,
+    0,
+    0,
+    null
+   ]
+  ],
+  "warnings": []
+ },
+ "lead-rule-all|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "v",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/C",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "the rows of 'bk/B' do not start with the 'type' row zfs prints first (got 'org.zfsbackup:config')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: the rows of 'bk/B' do not start with the 'type' row zfs prints first (got 'org.zfsbackup:config')"
+  ]
+ },
+ "lead-rule-all|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "v",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/C",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "the rows of 'bk/B' do not start with the 'type' row zfs prints first (got 'org.zfsbackup:config')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: the rows of 'bk/B' do not start with the 'type' row zfs prints first (got 'org.zfsbackup:config')"
+  ]
+ },
+ "lead-rule-explicit|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "v",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/C",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "the rows of 'bk/B' do not start with the 'name' row zfs prints first (got 'org.zfsbackup:config')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: the rows of 'bk/B' do not start with the 'name' row zfs prints first (got 'org.zfsbackup:config')"
+  ]
+ },
+ "lead-rule-explicit|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "v",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/C",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "the rows of 'bk/B' do not start with the 'name' row zfs prints first (got 'org.zfsbackup:config')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: the rows of 'bk/B' do not start with the 'name' row zfs prints first (got 'org.zfsbackup:config')"
+  ]
+ },
+ "mixed-all|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Snapshot",
+    "bk@s",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Bookmark",
+    "bk#b",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/c",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Snapshot",
+    "bk/c@s",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Volume",
+    "bk/v",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/a b",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    3,
+    2,
+    1,
+    "libzfseasy cannot represent the name: 'bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...'"
+   ]
+  ],
+  "warnings": [
+   "skipping 'bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...' from zfs output: libzfseasy cannot represent this name (bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa is not a valid ZFS dataset name)",
+   "skipping a row of zfs get output: name outside the requested objects: 'other/x\\ttype\\tfilesystem\\t-\\t-'",
+   "skipping a row of zfs get output: name outside the requested objects: 'other/x\\tcompression\\tlz4\\t-\\tlocal'",
+   "skipped 1 name libzfseasy cannot represent in zfs get output"
+  ]
+ },
+ "mixed-all|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Snapshot",
+    "bk@s",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Bookmark",
+    "bk#b",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/c",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Snapshot",
+    "bk/c@s",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Volume",
+    "bk/v",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/a b",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    3,
+    2,
+    1,
+    "libzfseasy cannot represent the name: 'bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...'"
+   ]
+  ],
+  "warnings": [
+   "skipping 'bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...' from zfs output: libzfseasy cannot represent this name (bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa is not a valid ZFS dataset name)",
+   "skipping a row of zfs get output: name outside the requested objects: 'other/x\\ttype\\tfilesystem\\t-\\t-'",
+   "skipping a row of zfs get output: name outside the requested objects: 'other/x\\tcompression\\tlz4\\t-\\tlocal'",
+   "skipped 1 name libzfseasy cannot represent in zfs get output"
+  ]
+ },
+ "mixed-bookmark|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "bookmark",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Bookmark",
+    "bk#b",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    9,
+    9,
+    0,
+    "type filesystem was not requested ('bk')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: type filesystem was not requested ('bk')",
+   "skipping a row of zfs get output: type snapshot was not requested ('bk@s')",
+   "skipping a row of zfs get output: type filesystem was not requested ('bk/c')",
+   "skipping a row of zfs get output: type snapshot was not requested ('bk/c@s')",
+   "skipping a row of zfs get output: type volume was not requested ('bk/v')",
+   "skipped 9 malformed rows of zfs get output in total (the first 5 are logged above)"
+  ]
+ },
+ "mixed-bookmark|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "bookmark",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Bookmark",
+    "bk#b",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    9,
+    9,
+    0,
+    "type filesystem was not requested ('bk')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: type filesystem was not requested ('bk')",
+   "skipping a row of zfs get output: type snapshot was not requested ('bk@s')",
+   "skipping a row of zfs get output: type filesystem was not requested ('bk/c')",
+   "skipping a row of zfs get output: type snapshot was not requested ('bk/c@s')",
+   "skipping a row of zfs get output: type volume was not requested ('bk/v')",
+   "skipped 9 malformed rows of zfs get output in total (the first 5 are logged above)"
+  ]
+ },
+ "mixed-filesystem+volume|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "filesystem,volume",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/c",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Volume",
+    "bk/v",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/a b",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    6,
+    5,
+    1,
+    "type snapshot was not requested ('bk@s')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: type snapshot was not requested ('bk@s')",
+   "skipping a row of zfs get output: type bookmark was not requested ('bk#b')",
+   "skipping a row of zfs get output: type snapshot was not requested ('bk/c@s')",
+   "skipping 'bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...' from zfs output: libzfseasy cannot represent this name (bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa is not a valid ZFS dataset name)",
+   "skipping a row of zfs get output: name outside the requested objects: 'other/x\\ttype\\tfilesystem\\t-\\t-'",
+   "skipping a row of zfs get output: name outside the requested objects: 'other/x\\tcompression\\tlz4\\t-\\tlocal'",
+   "skipped 1 name libzfseasy cannot represent in zfs get output"
+  ]
+ },
+ "mixed-filesystem+volume|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "filesystem,volume",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/c",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Volume",
+    "bk/v",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/a b",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    6,
+    5,
+    1,
+    "type snapshot was not requested ('bk@s')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: type snapshot was not requested ('bk@s')",
+   "skipping a row of zfs get output: type bookmark was not requested ('bk#b')",
+   "skipping a row of zfs get output: type snapshot was not requested ('bk/c@s')",
+   "skipping 'bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...' from zfs output: libzfseasy cannot represent this name (bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa is not a valid ZFS dataset name)",
+   "skipping a row of zfs get output: name outside the requested objects: 'other/x\\ttype\\tfilesystem\\t-\\t-'",
+   "skipping a row of zfs get output: name outside the requested objects: 'other/x\\tcompression\\tlz4\\t-\\tlocal'",
+   "skipped 1 name libzfseasy cannot represent in zfs get output"
+  ]
+ },
+ "mixed-snapshot|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "snapshot",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Snapshot",
+    "bk@s",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Snapshot",
+    "bk/c@s",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    8,
+    8,
+    0,
+    "type filesystem was not requested ('bk')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: type filesystem was not requested ('bk')",
+   "skipping a row of zfs get output: type bookmark was not requested ('bk#b')",
+   "skipping a row of zfs get output: type filesystem was not requested ('bk/c')",
+   "skipping a row of zfs get output: type volume was not requested ('bk/v')",
+   "skipping a row of zfs get output: type filesystem was not requested ('bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...')",
+   "skipped 8 malformed rows of zfs get output in total (the first 5 are logged above)"
+  ]
+ },
+ "mixed-snapshot|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "snapshot",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Snapshot",
+    "bk@s",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Snapshot",
+    "bk/c@s",
+    [
+     [
+      "compression",
+      "lz4",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    8,
+    8,
+    0,
+    "type filesystem was not requested ('bk')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: type filesystem was not requested ('bk')",
+   "skipping a row of zfs get output: type bookmark was not requested ('bk#b')",
+   "skipping a row of zfs get output: type filesystem was not requested ('bk/c')",
+   "skipping a row of zfs get output: type volume was not requested ('bk/v')",
+   "skipping a row of zfs get output: type filesystem was not requested ('bk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...')",
+   "skipped 8 malformed rows of zfs get output in total (the first 5 are logged above)"
+  ]
+ },
+ "nine-bad-objects|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    9,
+    9,
+    0,
+    "unknown type 'bogus' ('bk/x0')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/x0')",
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/x1')",
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/x2')",
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/x3')",
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/x4')",
+   "skipped 9 malformed rows of zfs get output in total (the first 5 are logged above)"
+  ]
+ },
+ "nine-bad-objects|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    9,
+    9,
+    0,
+    "unknown type 'bogus' ('bk/x0')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/x0')",
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/x1')",
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/x2')",
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/x3')",
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/x4')",
+   "skipped 9 malformed rows of zfs get output in total (the first 5 are logged above)"
+  ]
+ },
+ "snapshot-name-as-filesystem-all|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type filesystem ('bk/A@s')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type filesystem ('bk/A@s')"
+  ]
+ },
+ "snapshot-name-as-filesystem-all|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type filesystem ('bk/A@s')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type filesystem ('bk/A@s')"
+  ]
+ },
+ "snapshot-name-as-filesystem-explicit|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type filesystem ('bk/A@s')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type filesystem ('bk/A@s')"
+  ]
+ },
+ "snapshot-name-as-filesystem-explicit|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "name does not match type filesystem ('bk/A@s')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: name does not match type filesystem ('bk/A@s')"
+  ]
+ },
+ "stray|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "v",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/B",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "expected 5 columns, got 1: 'stray'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: expected 5 columns, got 1: 'stray'",
+   "skipping a row of zfs get output: expected 5 columns, got 3: 'stray2\\t-\\tlocal'"
+  ]
+ },
+ "stray|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/A",
+    [
+     [
+      "org.t:v",
+      "v",
+      "local",
+      "-"
+     ]
+    ]
+   ],
+   [
+    "Filesystem",
+    "bk/B",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "expected 5 columns, got 1: 'stray'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: expected 5 columns, got 1: 'stray'",
+   "skipping a row of zfs get output: expected 5 columns, got 3: 'stray2\\t-\\tlocal'"
+  ]
+ },
+ "tabs-all|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-t",
+   "all",
+   "name,type,org.t:p0,org.t:p1,org.t:p2,org.t:p3,org.t:p4,org.t:p5,org.t:p6,org.t:p7",
+   "bk/a"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/a",
+    [
+     [
+      "org.t:p0",
+      "a\tb",
+      "local",
+      "-"
+     ],
+     [
+      "org.t:p1",
+      "a\t\tb",
+      "local",
+      "-"
+     ],
+     [
+      "org.t:p2",
+      "r1\tr2",
+      "received",
+      "r1\tr2"
+     ],
+     [
+      "org.t:p5",
+      "x",
+      "inherited from bk",
+      "-"
+     ],
+     [
+      "org.t:p6",
+      "k",
+      "default",
+      "-"
+     ],
+     [
+      "org.t:p7",
+      "\udcff",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'",
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p4\\ta\\tb\\t-\\treceived'"
+  ]
+ },
+ "tabs-all|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-t",
+   "all",
+   "name,type,org.t:p0,org.t:p1,org.t:p2,org.t:p3,org.t:p4,org.t:p5,org.t:p6,org.t:p7",
+   "bk/a"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/a",
+    [
+     [
+      "org.t:p0",
+      "a\tb",
+      "local",
+      "-"
+     ],
+     [
+      "org.t:p1",
+      "a\t\tb",
+      "local",
+      "-"
+     ],
+     [
+      "org.t:p2",
+      "r1\tr2",
+      "received",
+      "r1\tr2"
+     ],
+     [
+      "org.t:p5",
+      "x",
+      "inherited from bk",
+      "-"
+     ],
+     [
+      "org.t:p6",
+      "k",
+      "default",
+      "-"
+     ],
+     [
+      "org.t:p7",
+      "\udcff",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'",
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p4\\ta\\tb\\t-\\treceived'"
+  ]
+ },
+ "tabs-default+received|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-t",
+   "all",
+   "name,type,org.t:p0,org.t:p1,org.t:p2,org.t:p3,org.t:p4,org.t:p5,org.t:p6,org.t:p7",
+   "bk/a"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/a",
+    [
+     [
+      "org.t:p2",
+      "r1\tr2",
+      "received",
+      "r1\tr2"
+     ],
+     [
+      "org.t:p6",
+      "k",
+      "default",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'",
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p4\\ta\\tb\\t-\\treceived'"
+  ]
+ },
+ "tabs-default+received|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-t",
+   "all",
+   "name,type,org.t:p0,org.t:p1,org.t:p2,org.t:p3,org.t:p4,org.t:p5,org.t:p6,org.t:p7",
+   "bk/a"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/a",
+    [
+     [
+      "org.t:p2",
+      "r1\tr2",
+      "received",
+      "r1\tr2"
+     ],
+     [
+      "org.t:p6",
+      "k",
+      "default",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'",
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p4\\ta\\tb\\t-\\treceived'"
+  ]
+ },
+ "tabs-inherited|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-t",
+   "all",
+   "name,type,org.t:p0,org.t:p1,org.t:p2,org.t:p3,org.t:p4,org.t:p5,org.t:p6,org.t:p7",
+   "bk/a"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/a",
+    [
+     [
+      "org.t:p5",
+      "x",
+      "inherited from bk",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'",
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p4\\ta\\tb\\t-\\treceived'"
+  ]
+ },
+ "tabs-inherited|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-t",
+   "all",
+   "name,type,org.t:p0,org.t:p1,org.t:p2,org.t:p3,org.t:p4,org.t:p5,org.t:p6,org.t:p7",
+   "bk/a"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/a",
+    [
+     [
+      "org.t:p5",
+      "x",
+      "inherited from bk",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'",
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p4\\ta\\tb\\t-\\treceived'"
+  ]
+ },
+ "tabs-local|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-t",
+   "all",
+   "name,type,org.t:p0,org.t:p1,org.t:p2,org.t:p3,org.t:p4,org.t:p5,org.t:p6,org.t:p7",
+   "bk/a"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/a",
+    [
+     [
+      "org.t:p0",
+      "a\tb",
+      "local",
+      "-"
+     ],
+     [
+      "org.t:p1",
+      "a\t\tb",
+      "local",
+      "-"
+     ],
+     [
+      "org.t:p7",
+      "\udcff",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'",
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p4\\ta\\tb\\t-\\treceived'"
+  ]
+ },
+ "tabs-local|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-t",
+   "all",
+   "name,type,org.t:p0,org.t:p1,org.t:p2,org.t:p3,org.t:p4,org.t:p5,org.t:p6,org.t:p7",
+   "bk/a"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/a",
+    [
+     [
+      "org.t:p0",
+      "a\tb",
+      "local",
+      "-"
+     ],
+     [
+      "org.t:p1",
+      "a\t\tb",
+      "local",
+      "-"
+     ],
+     [
+      "org.t:p7",
+      "\udcff",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'",
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p4\\ta\\tb\\t-\\treceived'"
+  ]
+ },
+ "tabs-temporary|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-t",
+   "all",
+   "name,type,org.t:p0,org.t:p1,org.t:p2,org.t:p3,org.t:p4,org.t:p5,org.t:p6,org.t:p7",
+   "bk/a"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/a",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'",
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p4\\ta\\tb\\t-\\treceived'"
+  ]
+ },
+ "tabs-temporary|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-t",
+   "all",
+   "name,type,org.t:p0,org.t:p1,org.t:p2,org.t:p3,org.t:p4,org.t:p5,org.t:p6,org.t:p7",
+   "bk/a"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/a",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    2,
+    2,
+    0,
+    "cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p3\\tl1\\tl2\\tr1\\tr2\\tlocal'",
+   "skipping a row of zfs get output: cannot tell the value from the received column: 'bk/a\\torg.t:p4\\ta\\tb\\t-\\treceived'"
+  ]
+ },
+ "type-twice-all|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/B",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "property 'type' appears twice for 'bk/A'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: property 'type' appears twice for 'bk/A'"
+  ]
+ },
+ "type-twice-all|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/B",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "property 'type' appears twice for 'bk/A'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: property 'type' appears twice for 'bk/A'"
+  ]
+ },
+ "type-twice-explicit|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/B",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "property 'type' appears twice for 'bk/A'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: property 'type' appears twice for 'bk/A'"
+  ]
+ },
+ "type-twice-explicit|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/B",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "property 'type' appears twice for 'bk/A'"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: property 'type' appears twice for 'bk/A'"
+  ]
+ },
+ "unknown-type-all|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "unknown type 'bogus' ('bk/A')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/A')"
+  ]
+ },
+ "unknown-type-all|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "all",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    []
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "unknown type 'bogus' ('bk/A')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/A')"
+  ]
+ },
+ "unknown-type-explicit|lazy": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "unknown type 'bogus' ('bk/A')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/A')"
+  ]
+ },
+ "unknown-type-explicit|list": {
+  "argv": [
+   "get",
+   "-H",
+   "-o",
+   "name,property,value,received,source",
+   "-r",
+   "-t",
+   "all",
+   "name,type,org.t:v",
+   "bk"
+  ],
+  "objects": [
+   [
+    "Filesystem",
+    "bk/ok",
+    [
+     [
+      "org.t:v",
+      "val",
+      "local",
+      "-"
+     ]
+    ]
+   ]
+  ],
+  "skips": [
+   [
+    "get",
+    1,
+    1,
+    0,
+    "unknown type 'bogus' ('bk/A')"
+   ]
+  ],
+  "warnings": [
+   "skipping a row of zfs get output: unknown type 'bogus' ('bk/A')"
+  ]
+ }
+}

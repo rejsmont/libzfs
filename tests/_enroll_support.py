@@ -15,7 +15,9 @@ and nothing here runs a real `zfs`.
 * `RealServer.edit_body(path, fn)` -- let the REAL app answer, then let `fn(body_dict)` change a 200
   JSON answer before it is sent (e.g. drop `protocol` from a real `/enroll` or `/rotate` answer: the
   server-side change happens, the client sees an answer that lacks the protocol).
-* `make_server` -- fixture factory (stops every server at teardown).
+* `make_server` -- fixture factory (stops every server at teardown); `peer_limits=` / `server_kwargs=`
+  go to `create_app` / the server class (S-3 flood control); `record=False` leaves the app unwrapped
+  (no request recorder, scripts or body edits: it would read a body before the app does).
 * `closed_port` / `plain_http_server` / `silent_server` -- a port nobody listens on,
   a server that answers plaintext HTTP, a server that accepts and says nothing.
 * `reloads` -- fixture: `daemonlock.request_reload` replaced by a recorder.
@@ -224,7 +226,8 @@ class RealServer:
     `make_server` fixture."""
 
     def __init__(self, base: Path, zfs: ZfsStub, *, remote: bool = True,
-                 dry_run: bool = False) -> None:
+                 dry_run: bool = False, peer_limits=None, server_kwargs=None,
+                 record: bool = True) -> None:
         base.parent.mkdir(parents=True, exist_ok=True)
         source = base.with_name(base.name + ".in.yaml")      # the import creates `base` itself
         source.write_text(REMOTE_ON if remote else REMOTE_OFF)
@@ -236,14 +239,17 @@ class RealServer:
         config = read_config(self.resolved).config
         dispose_all()
         config.dry_run = dry_run
-        self.app = api.create_app(config, self.trust.gateway, self.trust.server_fp)
+        # S-3: the app's own flood-control state unless a test supplies one
+        extra = {} if peer_limits is None else {"peer_limits": peer_limits}
+        self.app = api.create_app(config, self.trust.gateway, self.trust.server_fp, **extra)
         self._edits: Dict[str, Callable[[dict], None]] = {}
-        self.app.wsgi_app = _Middleware(self, _BodyEditor(self, self.app.wsgi_app))
+        if record:      # the recorder reads each body in full BEFORE the app: not for a stalled-body test
+            self.app.wsgi_app = _Middleware(self, _BodyEditor(self, self.app.wsgi_app))
         self.log: List[Seen] = []
         self._lock = threading.Lock()
         self._script: Dict[str, tuple] = {}
         cls = workers._api_server_class()
-        self._server = cls(LOOPBACK, 0, self.app, self.trust.gateway)
+        self._server = cls(LOOPBACK, 0, self.app, self.trust.gateway, **(server_kwargs or {}))
         # a scripted RESET makes the handler thread's next socket call fail; werkzeug would
         # print that traceback to sys.stderr, i.e. into the CLI's captured stderr
         self._server.handle_error = lambda request, client_address: None

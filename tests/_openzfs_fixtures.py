@@ -16,6 +16,8 @@ A section file starts with one `##### SECTION ...` header line, then holds recor
 `load_section` returns `{record id: Record}` where the id is the whole text after `=== CASE ` (it includes the
 section: `M2/i_from_destroyed.8_nv_t`). Each marker's text is exactly the bytes the command printed (every
 non-empty capture ends in a newline), so `stdout` and `stderr` are the real strings, to be fed to a mocked `Popen`.
+The files are decoded as UTF-8 with `errors='surrogateescape'` (M9 has invalid UTF-8 on purpose), so a record's text
+round-trips to its exact bytes with `text.encode('utf-8', 'surrogateescape')`.
 """
 import os
 from typing import Dict, List, Optional
@@ -109,7 +111,9 @@ def load_section(version: str, section: str) -> Dict[str, Record]:
     """Records of `<version>/<section>.txt` (cached; treat as read-only)."""
     key = (version, section)
     if key not in _CACHE:
-        with open(os.path.join(version_dir(version), section + '.txt'), encoding='utf-8', newline='') as f:
+        # surrogateescape: M9 holds a value with a 0xff byte; encode('utf-8', 'surrogateescape') gives the exact bytes back
+        with open(os.path.join(version_dir(version), section + '.txt'), encoding='utf-8', errors='surrogateescape',
+                  newline='') as f:
             _CACHE[key] = parse_section(f.read())
     return _CACHE[key]
 

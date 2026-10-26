@@ -1,0 +1,1925 @@
+##### SECTION M9 (zfs version -j, zfs list -j, zfs get -j: values with newline/tab/0xff/quote, every source type, sort, -p, received, errors; the -H references; the usage text on versions without -j)  tag=C  zfs-2.1.5-1ubuntu6~22.04.7
+#note: names: tab, newline, a UTF-8 e-acute, a 0xff byte, '%', ',', '@', '#', a trailing space, a leading space, ':' and 'a b' (a space) are attempted; the created ones appear in the listings
+=== CASE M9/00_name_tab
+--- cmd
+zfs create zfsbcapc/M9/$'t\tab'
+--- rc
+1
+--- stdout
+--- stderr
+cannot create 'zfsbcapc/M9/t	ab': invalid character '	' in name
+=== END
+=== CASE M9/00_name_nl
+--- cmd
+zfs create zfsbcapc/M9/$'n\nl'
+--- rc
+1
+--- stdout
+--- stderr
+cannot create 'zfsbcapc/M9/n
+l': invalid character '
+' in name
+=== END
+=== CASE M9/00_name_u8
+--- cmd
+zfs create zfsbcapc/M9/$'caf\xc3\xa9'
+--- rc
+1
+--- stdout
+--- stderr
+cannot create 'zfsbcapc/M9/cafÃ©': invalid character 'Ã' in name
+=== END
+=== CASE M9/00_name_ff
+--- cmd
+zfs create zfsbcapc/M9/$'f\xffb'
+--- rc
+1
+--- stdout
+--- stderr
+cannot create 'zfsbcapc/M9/fÿb': invalid character 'ÿ' in name
+=== END
+=== CASE M9/00_name_pct
+--- cmd
+zfs create zfsbcapc/M9/'p%ct'
+--- rc
+1
+--- stdout
+--- stderr
+cannot create 'zfsbcapc/M9/p%ct': invalid character % in name
+=== END
+=== CASE M9/00_name_comma
+--- cmd
+zfs create zfsbcapc/M9/'c,omma'
+--- rc
+1
+--- stdout
+--- stderr
+cannot create 'zfsbcapc/M9/c,omma': invalid character ',' in name
+=== END
+=== CASE M9/00_name_at
+--- cmd
+zfs create zfsbcapc/M9/'a@t'
+--- rc
+1
+--- stdout
+--- stderr
+cannot create 'zfsbcapc/M9/a@t': snapshot delimiter '@' is not expected here
+=== END
+=== CASE M9/00_name_hash
+--- cmd
+zfs create zfsbcapc/M9/'h#ash'
+--- rc
+1
+--- stdout
+--- stderr
+cannot create 'zfsbcapc/M9/h#ash': bookmark delimiter '#' is not expected here
+=== END
+=== CASE M9/00_name_trail
+--- cmd
+zfs create zfsbcapc/M9/'trail '
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M9/00_name_lead
+--- cmd
+zfs create zfsbcapc/M9/' lead'
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M9/00_name_colon
+--- cmd
+zfs create zfsbcapc/M9/'co:lon'
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M9/00_name_space
+--- cmd
+zfs create zfsbcapc/M9/'sp ace'
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M9/00_name_snap_space
+--- cmd
+zfs snapshot 'zfsbcapc/M9/sp ace@s p'
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M9/00_name_ctl
+--- cmd
+zfs create zfsbcapc/M9/$'c\x01tl'
+--- rc
+1
+--- stdout
+--- stderr
+cannot create 'zfsbcapc/M9/ctl': invalid character '' in name
+=== END
+#note: setup: zfsbcapc/M9/src (compression=lz4, user props zfsb:nl='line1<LF>line2' zfsb:tab='a<TAB>b' zfsb:ff='a<0xff>b' zfsb:q='say "hi"' zfsb:bs='back\slash' zfsb:bsn='a\nb' (backslash, n) zfsb:ctl='x<0x01>y<0x7f>z' zfsb:u8='cafe-acute <U+1F600>' zfsb:json='{"a":[1,2]}' zfsb:dash='-' zfsb:fake='inherited from foo' zfsb:empty='' zfsb:lt='<&>'), children zz aa mm (created in that order), zfsbcapc/M9/vol (a zvol, 8M), zfsbcapc/M9/empty, snapshots s1 (recursive) and s2 (recursive), src/mm@extra, hold on src@s1, clone zfsbcapc/M9/clone of src@s1, bookmark src#bm1, zfsbcapc/M9/recv from zfs send -R src@s1, zfsbcapc/M9/tmp mounted ro
+#note: big: zfsbcapc/M9/big is a dataset whose guid is >= 9223372036854775808 (tried g1..g40, the others destroyed)
+#note: H*: the -H forms of the same objects (every version), for the -j vs -H parity test
+=== CASE M9/H01_list_all
+--- cmd
+zfs list -H -r -t all -o name,type,createtxg,guid,userrefs,clones,origin zfsbcapc/M9
+--- rc
+0
+--- stdout
+zfsbcapc/M9	filesystem	9	10082551068096423426	-	-	-
+zfsbcapc/M9/ lead	filesystem	11	5795802290722726355	-	-	-
+zfsbcapc/M9/big	filesystem	79	17412872966677623239	-	-	-
+zfsbcapc/M9/clone	filesystem	54	16515815031211568794	-	-	zfsbcapc/M9/src@s1
+zfsbcapc/M9/co:lon	filesystem	12	14823409553564110529	-	-	-
+zfsbcapc/M9/empty	filesystem	30	15656251233901251947	-	-	-
+zfsbcapc/M9/recv	filesystem	57	13795671876093886586	-	-	-
+zfsbcapc/M9/recv@s1	snapshot	60	10811287237154646469	0	-	-
+zfsbcapc/M9/recv/aa	filesystem	70	259709881712975445	-	-	-
+zfsbcapc/M9/recv/aa@s1	snapshot	72	6553295830024924851	0	-	-
+zfsbcapc/M9/recv/child	filesystem	65	11837590551449570962	-	-	-
+zfsbcapc/M9/recv/child@s1	snapshot	67	2369771757204943506	0	-	-
+zfsbcapc/M9/recv/mm	filesystem	63	7559730986167241307	-	-	-
+zfsbcapc/M9/recv/mm@s1	snapshot	64	2989756439143665669	0	-	-
+zfsbcapc/M9/recv/zz	filesystem	68	16286445452391415795	-	-	-
+zfsbcapc/M9/recv/zz@s1	snapshot	69	4161583179355739122	0	-	-
+zfsbcapc/M9/sp ace	filesystem	13	13991736687234278901	-	-	-
+zfsbcapc/M9/sp ace@s p	snapshot	14	11840730900998901943	0	-	-
+zfsbcapc/M9/src	filesystem	21	13427024700696096747	-	-	-
+zfsbcapc/M9/src@s1	snapshot	47	10811287237154646469	1	zfsbcapc/M9/clone	-
+zfsbcapc/M9/src@s2	snapshot	51	6526919490327156370	0	-	-
+zfsbcapc/M9/src#bm1	bookmark	47	10811287237154646469	-	-	-
+zfsbcapc/M9/src/aa	filesystem	24	3636867536465688858	-	-	-
+zfsbcapc/M9/src/aa@s1	snapshot	47	6553295830024924851	0	-	-
+zfsbcapc/M9/src/aa@s2	snapshot	51	13648847083297175204	0	-	-
+zfsbcapc/M9/src/child	filesystem	26	1722165770428892846	-	-	-
+zfsbcapc/M9/src/child@s1	snapshot	47	2369771757204943506	0	-	-
+zfsbcapc/M9/src/child@s2	snapshot	51	4975982345891344506	0	-	-
+zfsbcapc/M9/src/mm	filesystem	25	9451098184467082205	-	-	-
+zfsbcapc/M9/src/mm@s1	snapshot	47	2989756439143665669	0	-	-
+zfsbcapc/M9/src/mm@s2	snapshot	51	565905144616804251	0	-	-
+zfsbcapc/M9/src/mm@extra	snapshot	52	15443370833030246635	0	-	-
+zfsbcapc/M9/src/zz	filesystem	23	10881735650539702828	-	-	-
+zfsbcapc/M9/src/zz@s1	snapshot	47	4161583179355739122	0	-	-
+zfsbcapc/M9/src/zz@s2	snapshot	51	6621070066321565592	0	-	-
+zfsbcapc/M9/tmp	filesystem	76	5227749528750519242	-	-	-
+zfsbcapc/M9/trail 	filesystem	10	4032544017150631591	-	-	-
+zfsbcapc/M9/vol	volume	27	16631009489415143935	-	-	-
+zfsbcapc/M9/vol@s1	snapshot	48	16419612623015370574	0	-	-
+--- stderr
+=== END
+=== CASE M9/H02_get_user
+--- cmd
+zfs get -H -o name,property,value,received,source zfsb:nl,zfsb:tab,zfsb:ff,zfsb:q,zfsb:bs,zfsb:bsn,zfsb:ctl,zfsb:u8,zfsb:json,zfsb:dash,zfsb:fake,zfsb:empty,zfsb:lt,zfsb:missing,type zfsbcapc/M9/src
+--- rc
+0
+--- stdout
+zfsbcapc/M9/src	zfsb:nl	line1
+line2	-	local
+zfsbcapc/M9/src	zfsb:tab	a	b	-	local
+zfsbcapc/M9/src	zfsb:ff	aÿb	-	local
+zfsbcapc/M9/src	zfsb:q	say "hi"	-	local
+zfsbcapc/M9/src	zfsb:bs	back\slash	-	local
+zfsbcapc/M9/src	zfsb:bsn	a\nb	-	local
+zfsbcapc/M9/src	zfsb:ctl	xyz	-	local
+zfsbcapc/M9/src	zfsb:u8	cafÃ© ðŸ˜€	-	local
+zfsbcapc/M9/src	zfsb:json	{"a":[1,2]}	-	local
+zfsbcapc/M9/src	zfsb:dash	-	-	local
+zfsbcapc/M9/src	zfsb:fake	inherited from foo	-	local
+zfsbcapc/M9/src	zfsb:empty		-	local
+zfsbcapc/M9/src	zfsb:lt	<&>	-	local
+zfsbcapc/M9/src	zfsb:missing	-	-	-
+zfsbcapc/M9/src	type	filesystem	-	-
+--- stderr
+=== END
+=== CASE M9/H03_get_user_recv_r
+--- cmd
+zfs get -H -r -t all -o name,property,value,received,source zfsb:nl,zfsb:tab,zfsb:ff,zfsb:q,zfsb:bs,zfsb:bsn,zfsb:ctl,zfsb:u8,zfsb:json,zfsb:dash,zfsb:fake,zfsb:empty,zfsb:lt,zfsb:missing zfsbcapc/M9/recv
+--- rc
+0
+--- stdout
+zfsbcapc/M9/recv	zfsb:nl	line1
+line2	line1
+line2	received
+zfsbcapc/M9/recv	zfsb:tab	a	b	a	b	received
+zfsbcapc/M9/recv	zfsb:ff	aÿb	aÿb	received
+zfsbcapc/M9/recv	zfsb:q	LOCAL over received	say "hi"	local
+zfsbcapc/M9/recv	zfsb:bs	back\slash	back\slash	received
+zfsbcapc/M9/recv	zfsb:bsn	a\nb	a\nb	received
+zfsbcapc/M9/recv	zfsb:ctl	xyz	xyz	received
+zfsbcapc/M9/recv	zfsb:u8	cafÃ© ðŸ˜€	cafÃ© ðŸ˜€	received
+zfsbcapc/M9/recv	zfsb:json	{"a":[1,2]}	{"a":[1,2]}	received
+zfsbcapc/M9/recv	zfsb:dash	-	-	received
+zfsbcapc/M9/recv	zfsb:fake	inherited from foo	inherited from foo	received
+zfsbcapc/M9/recv	zfsb:empty			received
+zfsbcapc/M9/recv	zfsb:lt	<&>	<&>	received
+zfsbcapc/M9/recv	zfsb:missing	-	-	-
+zfsbcapc/M9/recv@s1	zfsb:nl	snap
+value	snap
+value	received
+zfsbcapc/M9/recv@s1	zfsb:tab	a	b	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:ff	aÿb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:q	LOCAL over received	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:bs	back\slash	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:bsn	a\nb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:ctl	xyz	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:u8	cafÃ© ðŸ˜€	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:json	{"a":[1,2]}	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:dash	-	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:fake	inherited from foo	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:empty		-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:lt	<&>	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv@s1	zfsb:missing	-	-	-
+zfsbcapc/M9/recv/aa	zfsb:nl	line1
+line2	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:tab	a	b	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:ff	aaÿlocal	aaÿlocal	received
+zfsbcapc/M9/recv/aa	zfsb:q	LOCAL over received	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:bs	back\slash	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:bsn	a\nb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:ctl	xyz	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:u8	cafÃ© ðŸ˜€	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:json	{"a":[1,2]}	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:dash	-	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:fake	inherited from foo	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:empty		-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:lt	<&>	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa	zfsb:missing	-	-	-
+zfsbcapc/M9/recv/aa@s1	zfsb:nl	line1
+line2	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:tab	a	b	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:ff	snapÿ	snapÿ	received
+zfsbcapc/M9/recv/aa@s1	zfsb:q	LOCAL over received	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:bs	back\slash	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:bsn	a\nb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:ctl	xyz	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:u8	cafÃ© ðŸ˜€	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:json	{"a":[1,2]}	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:dash	-	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:fake	inherited from foo	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:empty		-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:lt	<&>	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/aa@s1	zfsb:missing	-	-	-
+zfsbcapc/M9/recv/child	zfsb:nl	line1
+line2	child
+override	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:tab	a	b	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:ff	aÿb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:q	LOCAL over received	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:bs	back\slash	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:bsn	a\nb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:ctl	xyz	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:u8	cafÃ© ðŸ˜€	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:json	{"a":[1,2]}	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:dash	-	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:fake	inherited from foo	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:empty		-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:lt	<&>	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child	zfsb:missing	-	-	-
+zfsbcapc/M9/recv/child@s1	zfsb:nl	line1
+line2	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:tab	a	b	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:ff	aÿb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:q	LOCAL over received	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:bs	back\slash	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:bsn	a\nb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:ctl	xyz	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:u8	cafÃ© ðŸ˜€	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:json	{"a":[1,2]}	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:dash	-	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:fake	inherited from foo	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:empty		-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:lt	<&>	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/child@s1	zfsb:missing	-	-	-
+zfsbcapc/M9/recv/mm	zfsb:nl	line1
+line2	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:tab	a	b	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:ff	aÿb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:q	LOCAL over received	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:bs	back\slash	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:bsn	a\nb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:ctl	xyz	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:u8	cafÃ© ðŸ˜€	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:json	{"a":[1,2]}	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:dash	-	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:fake	inherited from foo	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:empty		-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:lt	<&>	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm	zfsb:missing	-	-	-
+zfsbcapc/M9/recv/mm@s1	zfsb:nl	line1
+line2	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:tab	a	b	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:ff	aÿb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:q	LOCAL over received	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:bs	back\slash	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:bsn	a\nb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:ctl	xyz	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:u8	cafÃ© ðŸ˜€	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:json	{"a":[1,2]}	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:dash	-	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:fake	inherited from foo	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:empty		-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:lt	<&>	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/mm@s1	zfsb:missing	-	-	-
+zfsbcapc/M9/recv/zz	zfsb:nl	line1
+line2	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:tab	a	b	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:ff	aÿb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:q	LOCAL over received	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:bs	back\slash	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:bsn	a\nb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:ctl	xyz	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:u8	cafÃ© ðŸ˜€	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:json	{"a":[1,2]}	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:dash	-	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:fake	inherited from foo	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:empty		-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:lt	<&>	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz	zfsb:missing	-	-	-
+zfsbcapc/M9/recv/zz@s1	zfsb:nl	line1
+line2	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:tab	a	b	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:ff	aÿb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:q	LOCAL over received	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:bs	back\slash	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:bsn	a\nb	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:ctl	xyz	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:u8	cafÃ© ðŸ˜€	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:json	{"a":[1,2]}	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:dash	-	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:fake	inherited from foo	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:empty		-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:lt	<&>	-	inherited from zfsbcapc/M9/recv
+zfsbcapc/M9/recv/zz@s1	zfsb:missing	-	-	-
+--- stderr
+=== END
+=== CASE M9/H04_get_user_p
+--- cmd
+zfs get -H -p -o name,property,value,received,source zfsb:nl,zfsb:tab,zfsb:ff,zfsb:q,zfsb:bs,zfsb:bsn,zfsb:ctl,zfsb:u8,zfsb:json,zfsb:dash,zfsb:fake,zfsb:empty,zfsb:lt,zfsb:missing zfsbcapc/M9/src
+--- rc
+0
+--- stdout
+zfsbcapc/M9/src	zfsb:nl	line1
+line2	-	local
+zfsbcapc/M9/src	zfsb:tab	a	b	-	local
+zfsbcapc/M9/src	zfsb:ff	aÿb	-	local
+zfsbcapc/M9/src	zfsb:q	say "hi"	-	local
+zfsbcapc/M9/src	zfsb:bs	back\slash	-	local
+zfsbcapc/M9/src	zfsb:bsn	a\nb	-	local
+zfsbcapc/M9/src	zfsb:ctl	xyz	-	local
+zfsbcapc/M9/src	zfsb:u8	cafÃ© ðŸ˜€	-	local
+zfsbcapc/M9/src	zfsb:json	{"a":[1,2]}	-	local
+zfsbcapc/M9/src	zfsb:dash	-	-	local
+zfsbcapc/M9/src	zfsb:fake	inherited from foo	-	local
+zfsbcapc/M9/src	zfsb:empty		-	local
+zfsbcapc/M9/src	zfsb:lt	<&>	-	local
+zfsbcapc/M9/src	zfsb:missing	-	-	-
+--- stderr
+=== END
+=== CASE M9/H05_list_p
+--- cmd
+zfs list -H -p -r -t all -o name,type,used,available,referenced,creation,compressratio,volsize,mountpoint,quota zfsbcapc/M9
+--- rc
+0
+--- stdout
+zfsbcapc/M9	filesystem	10940416	2807250944	24576	1792940870	1.00	-	none	0
+zfsbcapc/M9/ lead	filesystem	24576	2807250944	24576	1792940870	1.00	-	none	0
+zfsbcapc/M9/big	filesystem	24576	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/clone	filesystem	0	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/co:lon	filesystem	24576	2807250944	24576	1792940870	1.00	-	none	0
+zfsbcapc/M9/empty	filesystem	24576	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/recv	filesystem	122880	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/recv@s1	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/recv/aa	filesystem	24576	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/recv/aa@s1	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/recv/child	filesystem	24576	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/recv/child@s1	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/recv/mm	filesystem	24576	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/recv/mm@s1	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/recv/zz	filesystem	24576	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/recv/zz@s1	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/sp ace	filesystem	24576	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/sp ace@s p	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/src	filesystem	122880	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/src@s1	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/src@s2	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/src#bm1	bookmark	-	-	24576	1792940871	-	-	-	-
+zfsbcapc/M9/src/aa	filesystem	24576	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/src/aa@s1	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/src/aa@s2	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/src/child	filesystem	24576	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/src/child@s1	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/src/child@s2	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/src/mm	filesystem	24576	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/src/mm@s1	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/src/mm@s2	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/src/mm@extra	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/src/zz	filesystem	24576	2807250944	24576	1792940871	1.00	-	none	0
+zfsbcapc/M9/src/zz@s1	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/src/zz@s2	snapshot	0	-	24576	1792940871	1.00	-	-	-
+zfsbcapc/M9/tmp	filesystem	24576	2807250944	24576	1792940871	1.00	-	/zfsbcapc-m9tmp	0
+zfsbcapc/M9/trail 	filesystem	24576	2807250944	24576	1792940870	1.00	-	none	0
+zfsbcapc/M9/vol	volume	10498048	2817736704	12288	1792940871	1.00	8388608	-	-
+zfsbcapc/M9/vol@s1	snapshot	0	-	12288	1792940871	1.00	8388608	-	-
+--- stderr
+=== END
+=== CASE M9/H06_list_sorted
+--- cmd
+zfs list -H -r -t all -s createtxg -o name,type,createtxg zfsbcapc/M9/src
+--- rc
+0
+--- stdout
+zfsbcapc/M9/src	filesystem	21
+zfsbcapc/M9/src/zz	filesystem	23
+zfsbcapc/M9/src/aa	filesystem	24
+zfsbcapc/M9/src/mm	filesystem	25
+zfsbcapc/M9/src/child	filesystem	26
+zfsbcapc/M9/src@s1	snapshot	47
+zfsbcapc/M9/src#bm1	bookmark	47
+zfsbcapc/M9/src/aa@s1	snapshot	47
+zfsbcapc/M9/src/child@s1	snapshot	47
+zfsbcapc/M9/src/mm@s1	snapshot	47
+zfsbcapc/M9/src/zz@s1	snapshot	47
+zfsbcapc/M9/src@s2	snapshot	51
+zfsbcapc/M9/src/aa@s2	snapshot	51
+zfsbcapc/M9/src/child@s2	snapshot	51
+zfsbcapc/M9/src/mm@s2	snapshot	51
+zfsbcapc/M9/src/zz@s2	snapshot	51
+zfsbcapc/M9/src/mm@extra	snapshot	52
+--- stderr
+=== END
+=== CASE M9/H07_get_mixed
+--- cmd
+zfs get -H -o name,property,value,received,source compression,mountpoint,type,mounted,volsize,origin,clones,userrefs,createtxg,used,creation zfsbcapc/M9/src zfsbcapc/M9/src/child zfsbcapc/M9/src@s1 zfsbcapc/M9/vol
+--- rc
+0
+--- stdout
+zfsbcapc/M9/src	compression	lz4	-	local
+zfsbcapc/M9/src	mountpoint	none	-	inherited from zfsbcapc/M9
+zfsbcapc/M9/src	type	filesystem	-	-
+zfsbcapc/M9/src	mounted	no	-	-
+zfsbcapc/M9/src	volsize	-	-	-
+zfsbcapc/M9/src	origin	-	-	-
+zfsbcapc/M9/src	clones	-	-	-
+zfsbcapc/M9/src	userrefs	-	-	-
+zfsbcapc/M9/src	createtxg	21	-	-
+zfsbcapc/M9/src	used	120K	-	-
+zfsbcapc/M9/src	creation	Sun Oct 25 16:07 2026	-	-
+zfsbcapc/M9/src@s1	compression	-	-	-
+zfsbcapc/M9/src@s1	mountpoint	-	-	-
+zfsbcapc/M9/src@s1	type	snapshot	-	-
+zfsbcapc/M9/src@s1	mounted	-	-	-
+zfsbcapc/M9/src@s1	volsize	-	-	-
+zfsbcapc/M9/src@s1	origin	-	-	-
+zfsbcapc/M9/src@s1	clones	zfsbcapc/M9/clone	-	-
+zfsbcapc/M9/src@s1	userrefs	1	-	-
+zfsbcapc/M9/src@s1	createtxg	47	-	-
+zfsbcapc/M9/src@s1	used	0B	-	-
+zfsbcapc/M9/src@s1	creation	Sun Oct 25 16:07 2026	-	-
+zfsbcapc/M9/src/child	compression	lz4	-	inherited from zfsbcapc/M9/src
+zfsbcapc/M9/src/child	mountpoint	none	-	inherited from zfsbcapc/M9
+zfsbcapc/M9/src/child	type	filesystem	-	-
+zfsbcapc/M9/src/child	mounted	no	-	-
+zfsbcapc/M9/src/child	volsize	-	-	-
+zfsbcapc/M9/src/child	origin	-	-	-
+zfsbcapc/M9/src/child	clones	-	-	-
+zfsbcapc/M9/src/child	userrefs	-	-	-
+zfsbcapc/M9/src/child	createtxg	26	-	-
+zfsbcapc/M9/src/child	used	24K	-	-
+zfsbcapc/M9/src/child	creation	Sun Oct 25 16:07 2026	-	-
+zfsbcapc/M9/vol	compression	off	-	default
+zfsbcapc/M9/vol	mountpoint	-	-	-
+zfsbcapc/M9/vol	type	volume	-	-
+zfsbcapc/M9/vol	mounted	-	-	-
+zfsbcapc/M9/vol	volsize	8M	-	local
+zfsbcapc/M9/vol	origin	-	-	-
+zfsbcapc/M9/vol	clones	-	-	-
+zfsbcapc/M9/vol	userrefs	-	-	-
+zfsbcapc/M9/vol	createtxg	27	-	-
+zfsbcapc/M9/vol	used	10.0M	-	-
+zfsbcapc/M9/vol	creation	Sun Oct 25 16:07 2026	-	-
+--- stderr
+=== END
+=== CASE M9/H08_get_all_src
+--- cmd
+zfs get -H -o name,property,value,received,source all zfsbcapc/M9/src
+--- rc
+0
+--- stdout
+zfsbcapc/M9/src	type	filesystem	-	-
+zfsbcapc/M9/src	creation	Sun Oct 25 16:07 2026	-	-
+zfsbcapc/M9/src	used	120K	-	-
+zfsbcapc/M9/src	available	2.61G	-	-
+zfsbcapc/M9/src	referenced	24K	-	-
+zfsbcapc/M9/src	compressratio	1.00x	-	-
+zfsbcapc/M9/src	mounted	no	-	-
+zfsbcapc/M9/src	quota	none	-	default
+zfsbcapc/M9/src	reservation	none	-	default
+zfsbcapc/M9/src	recordsize	128K	-	default
+zfsbcapc/M9/src	mountpoint	none	-	inherited from zfsbcapc/M9
+zfsbcapc/M9/src	sharenfs	off	-	default
+zfsbcapc/M9/src	checksum	on	-	default
+zfsbcapc/M9/src	compression	lz4	-	local
+zfsbcapc/M9/src	atime	on	-	default
+zfsbcapc/M9/src	devices	on	-	default
+zfsbcapc/M9/src	exec	on	-	default
+zfsbcapc/M9/src	setuid	on	-	default
+zfsbcapc/M9/src	readonly	off	-	default
+zfsbcapc/M9/src	zoned	off	-	default
+zfsbcapc/M9/src	snapdir	hidden	-	default
+zfsbcapc/M9/src	aclmode	discard	-	default
+zfsbcapc/M9/src	aclinherit	restricted	-	default
+zfsbcapc/M9/src	createtxg	21	-	-
+zfsbcapc/M9/src	canmount	on	-	default
+zfsbcapc/M9/src	xattr	on	-	default
+zfsbcapc/M9/src	copies	1	-	default
+zfsbcapc/M9/src	version	5	-	-
+zfsbcapc/M9/src	utf8only	off	-	-
+zfsbcapc/M9/src	normalization	none	-	-
+zfsbcapc/M9/src	casesensitivity	sensitive	-	-
+zfsbcapc/M9/src	vscan	off	-	default
+zfsbcapc/M9/src	nbmand	off	-	default
+zfsbcapc/M9/src	sharesmb	off	-	default
+zfsbcapc/M9/src	refquota	none	-	default
+zfsbcapc/M9/src	refreservation	none	-	default
+zfsbcapc/M9/src	guid	13427024700696096747	-	-
+zfsbcapc/M9/src	primarycache	all	-	default
+zfsbcapc/M9/src	secondarycache	all	-	default
+zfsbcapc/M9/src	usedbysnapshots	0B	-	-
+zfsbcapc/M9/src	usedbydataset	24K	-	-
+zfsbcapc/M9/src	usedbychildren	96K	-	-
+zfsbcapc/M9/src	usedbyrefreservation	0B	-	-
+zfsbcapc/M9/src	logbias	latency	-	default
+zfsbcapc/M9/src	objsetid	118	-	-
+zfsbcapc/M9/src	dedup	off	-	default
+zfsbcapc/M9/src	mlslabel	none	-	default
+zfsbcapc/M9/src	sync	standard	-	default
+zfsbcapc/M9/src	dnodesize	legacy	-	default
+zfsbcapc/M9/src	refcompressratio	1.00x	-	-
+zfsbcapc/M9/src	written	0	-	-
+zfsbcapc/M9/src	logicalused	60K	-	-
+zfsbcapc/M9/src	logicalreferenced	12K	-	-
+zfsbcapc/M9/src	volmode	default	-	default
+zfsbcapc/M9/src	filesystem_limit	none	-	default
+zfsbcapc/M9/src	snapshot_limit	none	-	default
+zfsbcapc/M9/src	filesystem_count	none	-	default
+zfsbcapc/M9/src	snapshot_count	none	-	default
+zfsbcapc/M9/src	snapdev	hidden	-	default
+zfsbcapc/M9/src	acltype	off	-	default
+zfsbcapc/M9/src	context	none	-	default
+zfsbcapc/M9/src	fscontext	none	-	default
+zfsbcapc/M9/src	defcontext	none	-	default
+zfsbcapc/M9/src	rootcontext	none	-	default
+zfsbcapc/M9/src	relatime	off	-	default
+zfsbcapc/M9/src	redundant_metadata	all	-	default
+zfsbcapc/M9/src	overlay	on	-	default
+zfsbcapc/M9/src	encryption	off	-	default
+zfsbcapc/M9/src	keylocation	none	-	default
+zfsbcapc/M9/src	keyformat	none	-	default
+zfsbcapc/M9/src	pbkdf2iters	0	-	default
+zfsbcapc/M9/src	special_small_blocks	0	-	default
+zfsbcapc/M9/src	zfsb:json	{"a":[1,2]}	-	local
+zfsbcapc/M9/src	zfsb:u8	cafÃ© ðŸ˜€	-	local
+zfsbcapc/M9/src	zfsb:tab	a	b	-	local
+zfsbcapc/M9/src	zfsb:fake	inherited from foo	-	local
+zfsbcapc/M9/src	zfsb:dash	-	-	local
+zfsbcapc/M9/src	zfsb:bsn	a\nb	-	local
+zfsbcapc/M9/src	zfsb:ctl	xyz	-	local
+zfsbcapc/M9/src	zfsb:lt	<&>	-	local
+zfsbcapc/M9/src	zfsb:ff	aÿb	-	local
+zfsbcapc/M9/src	zfsb:q	say "hi"	-	local
+zfsbcapc/M9/src	zfsb:nl	line1
+line2	-	local
+zfsbcapc/M9/src	zfsb:empty		-	local
+zfsbcapc/M9/src	zfsb:bs	back\slash	-	local
+--- stderr
+=== END
+#note: this version has no zfs -j: the fallback probe. Everything below is what the probe and the -j callers see
+=== CASE M9/J00_version_j
+--- cmd
+zfs version -j
+--- rc
+0
+--- stdout
+zfs-2.1.5-1ubuntu6~22.04.7
+zfs-kmod-2.1.5-1ubuntu6~22.04.7
+--- stderr
+=== END
+=== CASE M9/J01_version
+--- cmd
+zfs version
+--- rc
+0
+--- stdout
+zfs-2.1.5-1ubuntu6~22.04.7
+zfs-kmod-2.1.5-1ubuntu6~22.04.7
+--- stderr
+=== END
+=== CASE M9/J02_list_j
+--- cmd
+zfs list -j zfsbcapc/M9/src
+--- rc
+2
+--- stdout
+--- stderr
+invalid option 'j'
+usage:
+	list [-Hp] [-r|-d max] [-o property[,...]] [-s property]...
+	    [-S property]... [-t type[,...]] [filesystem|volume|snapshot] ...
+
+The following properties are supported:
+
+	PROPERTY       EDIT  INHERIT   VALUES
+
+	available        NO       NO   <size>
+	clones           NO       NO   <dataset>[,...]
+	compressratio    NO       NO   <1.00x or higher if compressed>
+	createtxg        NO       NO   <uint64>
+	creation         NO       NO   <date>
+	defer_destroy    NO       NO   yes | no
+	encryptionroot   NO       NO   <filesystem | volume>
+	filesystem_count  NO       NO   <count>
+	guid             NO       NO   <uint64>
+	keystatus        NO       NO   none | unavailable | available
+	logicalreferenced  NO       NO   <size>
+	logicalused      NO       NO   <size>
+	mounted          NO       NO   yes | no
+	objsetid         NO       NO   <uint64>
+	origin           NO       NO   <snapshot>
+	receive_resume_token  NO       NO   <string token>
+	redact_snaps     NO       NO   <snapshot>[,...]
+	refcompressratio  NO       NO   <1.00x or higher if compressed>
+	referenced       NO       NO   <size>
+	snapshot_count   NO       NO   <count>
+	type             NO       NO   filesystem | volume | snapshot | bookmark
+	used             NO       NO   <size>
+	usedbychildren   NO       NO   <size>
+	usedbydataset    NO       NO   <size>
+	usedbyrefreservation  NO       NO   <size>
+	usedbysnapshots  NO       NO   <size>
+	userrefs         NO       NO   <count>
+	written          NO       NO   <size>
+	aclinherit      YES      YES   discard | noallow | restricted | passthrough | passthrough-x
+	aclmode         YES      YES   discard | groupmask | passthrough | restricted
+	acltype         YES      YES   off | nfsv4 | posix
+	atime           YES      YES   on | off
+	canmount        YES       NO   on | off | noauto
+	casesensitivity  NO      YES   sensitive | insensitive | mixed
+	checksum        YES      YES   on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein | edonr
+	compression     YES      YES   on | off | lzjb | gzip | gzip-[1-9] | zle | lz4 | zstd | zstd-[1-19] | zstd-fast | zstd-fast-[1-10,20,30,40,50,60,70,80,90,100,500,1000]
+	context         YES       NO   <selinux context>
+	copies          YES      YES   1 | 2 | 3
+	dedup           YES      YES   on | off | verify | sha256[,verify] | sha512[,verify] | skein[,verify] | edonr,verify
+	defcontext      YES       NO   <selinux defcontext>
+	devices         YES      YES   on | off
+	dnodesize       YES      YES   legacy | auto | 1k | 2k | 4k | 8k | 16k
+	encryption       NO      YES   on | off | aes-128-ccm | aes-192-ccm | aes-256-ccm | aes-128-gcm | aes-192-gcm | aes-256-gcm
+	exec            YES      YES   on | off
+	filesystem_limit YES       NO   <count> | none
+	fscontext       YES       NO   <selinux fscontext>
+	keyformat        NO       NO   none | raw | hex | passphrase
+	keylocation     YES       NO   prompt | <file URI> | <https URL> | <http URL>
+	logbias         YES      YES   latency | throughput
+	mlslabel        YES      YES   <sensitivity label>
+	mountpoint      YES      YES   <path> | legacy | none
+	nbmand          YES      YES   on | off
+	normalization    NO      YES   none | formC | formD | formKC | formKD
+	overlay         YES      YES   on | off
+	pbkdf2iters      NO       NO   <iters>
+	primarycache    YES      YES   all | none | metadata
+	quota           YES       NO   <size> | none
+	readonly        YES      YES   on | off
+	recordsize      YES      YES   512 to 1M, power of 2
+	redundant_metadata YES      YES   all | most
+	refquota        YES       NO   <size> | none
+	refreservation  YES       NO   <size> | none
+	relatime        YES      YES   on | off
+	reservation     YES       NO   <size> | none
+	rootcontext     YES       NO   <selinux rootcontext>
+	secondarycache  YES      YES   all | none | metadata
+	setuid          YES      YES   on | off
+	sharenfs        YES      YES   on | off | NFS share options
+	sharesmb        YES      YES   on | off | SMB share options
+	snapdev         YES      YES   hidden | visible
+	snapdir         YES      YES   hidden | visible
+	snapshot_limit  YES       NO   <count> | none
+	special_small_blocks YES      YES   zero or 512 to 1M, power of 2
+	sync            YES      YES   standard | always | disabled
+	utf8only         NO      YES   on | off
+	version         YES       NO   1 | 2 | 3 | 4 | 5 | current
+	volblocksize     NO      YES   512 to 128k, power of 2
+	volmode         YES      YES   default | full | geom | dev | none
+	volsize         YES       NO   <size>
+	vscan           YES      YES   on | off
+	xattr           YES      YES   on | off | dir | sa
+	zoned           YES      YES   on | off
+	userused@...     NO       NO   <size>
+	groupused@...    NO       NO   <size>
+	projectused@...  NO       NO   <size>
+	userobjused@...  NO       NO   <size>
+	groupobjused@...  NO       NO   <size>
+	projectobjused@...  NO       NO   <size>
+	userquota@...   YES       NO   <size> | none
+	groupquota@...  YES       NO   <size> | none
+	projectquota@... YES       NO   <size> | none
+	userobjquota@... YES       NO   <size> | none
+	groupobjquota@... YES       NO   <size> | none
+	projectobjquota@... YES       NO   <size> | none
+	written@<snap>   NO       NO   <size>
+	written#<bookmark>  NO       NO   <size>
+
+Sizes are specified in bytes with standard units such as K, M, G, etc.
+
+User-defined properties can be specified by using a name containing a colon (:).
+
+The {user|group|project}[obj]{used|quota}@ properties must be appended with
+a user|group|project specifier of one of these forms:
+    POSIX name      (eg: "matt")
+    POSIX id        (eg: "126829")
+    SMB name@domain (eg: "matt@sun")
+    SMB SID         (eg: "S-1-234-567-89")
+=== END
+=== CASE M9/J03_list_j_r_t_all
+--- cmd
+zfs list -j -r -t all zfsbcapc/M9
+--- rc
+2
+--- stdout
+--- stderr
+invalid option 'j'
+usage:
+	list [-Hp] [-r|-d max] [-o property[,...]] [-s property]...
+	    [-S property]... [-t type[,...]] [filesystem|volume|snapshot] ...
+
+The following properties are supported:
+
+	PROPERTY       EDIT  INHERIT   VALUES
+
+	available        NO       NO   <size>
+	clones           NO       NO   <dataset>[,...]
+	compressratio    NO       NO   <1.00x or higher if compressed>
+	createtxg        NO       NO   <uint64>
+	creation         NO       NO   <date>
+	defer_destroy    NO       NO   yes | no
+	encryptionroot   NO       NO   <filesystem | volume>
+	filesystem_count  NO       NO   <count>
+	guid             NO       NO   <uint64>
+	keystatus        NO       NO   none | unavailable | available
+	logicalreferenced  NO       NO   <size>
+	logicalused      NO       NO   <size>
+	mounted          NO       NO   yes | no
+	objsetid         NO       NO   <uint64>
+	origin           NO       NO   <snapshot>
+	receive_resume_token  NO       NO   <string token>
+	redact_snaps     NO       NO   <snapshot>[,...]
+	refcompressratio  NO       NO   <1.00x or higher if compressed>
+	referenced       NO       NO   <size>
+	snapshot_count   NO       NO   <count>
+	type             NO       NO   filesystem | volume | snapshot | bookmark
+	used             NO       NO   <size>
+	usedbychildren   NO       NO   <size>
+	usedbydataset    NO       NO   <size>
+	usedbyrefreservation  NO       NO   <size>
+	usedbysnapshots  NO       NO   <size>
+	userrefs         NO       NO   <count>
+	written          NO       NO   <size>
+	aclinherit      YES      YES   discard | noallow | restricted | passthrough | passthrough-x
+	aclmode         YES      YES   discard | groupmask | passthrough | restricted
+	acltype         YES      YES   off | nfsv4 | posix
+	atime           YES      YES   on | off
+	canmount        YES       NO   on | off | noauto
+	casesensitivity  NO      YES   sensitive | insensitive | mixed
+	checksum        YES      YES   on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein | edonr
+	compression     YES      YES   on | off | lzjb | gzip | gzip-[1-9] | zle | lz4 | zstd | zstd-[1-19] | zstd-fast | zstd-fast-[1-10,20,30,40,50,60,70,80,90,100,500,1000]
+	context         YES       NO   <selinux context>
+	copies          YES      YES   1 | 2 | 3
+	dedup           YES      YES   on | off | verify | sha256[,verify] | sha512[,verify] | skein[,verify] | edonr,verify
+	defcontext      YES       NO   <selinux defcontext>
+	devices         YES      YES   on | off
+	dnodesize       YES      YES   legacy | auto | 1k | 2k | 4k | 8k | 16k
+	encryption       NO      YES   on | off | aes-128-ccm | aes-192-ccm | aes-256-ccm | aes-128-gcm | aes-192-gcm | aes-256-gcm
+	exec            YES      YES   on | off
+	filesystem_limit YES       NO   <count> | none
+	fscontext       YES       NO   <selinux fscontext>
+	keyformat        NO       NO   none | raw | hex | passphrase
+	keylocation     YES       NO   prompt | <file URI> | <https URL> | <http URL>
+	logbias         YES      YES   latency | throughput
+	mlslabel        YES      YES   <sensitivity label>
+	mountpoint      YES      YES   <path> | legacy | none
+	nbmand          YES      YES   on | off
+	normalization    NO      YES   none | formC | formD | formKC | formKD
+	overlay         YES      YES   on | off
+	pbkdf2iters      NO       NO   <iters>
+	primarycache    YES      YES   all | none | metadata
+	quota           YES       NO   <size> | none
+	readonly        YES      YES   on | off
+	recordsize      YES      YES   512 to 1M, power of 2
+	redundant_metadata YES      YES   all | most
+	refquota        YES       NO   <size> | none
+	refreservation  YES       NO   <size> | none
+	relatime        YES      YES   on | off
+	reservation     YES       NO   <size> | none
+	rootcontext     YES       NO   <selinux rootcontext>
+	secondarycache  YES      YES   all | none | metadata
+	setuid          YES      YES   on | off
+	sharenfs        YES      YES   on | off | NFS share options
+	sharesmb        YES      YES   on | off | SMB share options
+	snapdev         YES      YES   hidden | visible
+	snapdir         YES      YES   hidden | visible
+	snapshot_limit  YES       NO   <count> | none
+	special_small_blocks YES      YES   zero or 512 to 1M, power of 2
+	sync            YES      YES   standard | always | disabled
+	utf8only         NO      YES   on | off
+	version         YES       NO   1 | 2 | 3 | 4 | 5 | current
+	volblocksize     NO      YES   512 to 128k, power of 2
+	volmode         YES      YES   default | full | geom | dev | none
+	volsize         YES       NO   <size>
+	vscan           YES      YES   on | off
+	xattr           YES      YES   on | off | dir | sa
+	zoned           YES      YES   on | off
+	userused@...     NO       NO   <size>
+	groupused@...    NO       NO   <size>
+	projectused@...  NO       NO   <size>
+	userobjused@...  NO       NO   <size>
+	groupobjused@...  NO       NO   <size>
+	projectobjused@...  NO       NO   <size>
+	userquota@...   YES       NO   <size> | none
+	groupquota@...  YES       NO   <size> | none
+	projectquota@... YES       NO   <size> | none
+	userobjquota@... YES       NO   <size> | none
+	groupobjquota@... YES       NO   <size> | none
+	projectobjquota@... YES       NO   <size> | none
+	written@<snap>   NO       NO   <size>
+	written#<bookmark>  NO       NO   <size>
+
+Sizes are specified in bytes with standard units such as K, M, G, etc.
+
+User-defined properties can be specified by using a name containing a colon (:).
+
+The {user|group|project}[obj]{used|quota}@ properties must be appended with
+a user|group|project specifier of one of these forms:
+    POSIX name      (eg: "matt")
+    POSIX id        (eg: "126829")
+    SMB name@domain (eg: "matt@sun")
+    SMB SID         (eg: "S-1-234-567-89")
+=== END
+=== CASE M9/J04_list_j_o
+--- cmd
+zfs list -j -o name,type zfsbcapc/M9/src
+--- rc
+2
+--- stdout
+--- stderr
+invalid option 'j'
+usage:
+	list [-Hp] [-r|-d max] [-o property[,...]] [-s property]...
+	    [-S property]... [-t type[,...]] [filesystem|volume|snapshot] ...
+
+The following properties are supported:
+
+	PROPERTY       EDIT  INHERIT   VALUES
+
+	available        NO       NO   <size>
+	clones           NO       NO   <dataset>[,...]
+	compressratio    NO       NO   <1.00x or higher if compressed>
+	createtxg        NO       NO   <uint64>
+	creation         NO       NO   <date>
+	defer_destroy    NO       NO   yes | no
+	encryptionroot   NO       NO   <filesystem | volume>
+	filesystem_count  NO       NO   <count>
+	guid             NO       NO   <uint64>
+	keystatus        NO       NO   none | unavailable | available
+	logicalreferenced  NO       NO   <size>
+	logicalused      NO       NO   <size>
+	mounted          NO       NO   yes | no
+	objsetid         NO       NO   <uint64>
+	origin           NO       NO   <snapshot>
+	receive_resume_token  NO       NO   <string token>
+	redact_snaps     NO       NO   <snapshot>[,...]
+	refcompressratio  NO       NO   <1.00x or higher if compressed>
+	referenced       NO       NO   <size>
+	snapshot_count   NO       NO   <count>
+	type             NO       NO   filesystem | volume | snapshot | bookmark
+	used             NO       NO   <size>
+	usedbychildren   NO       NO   <size>
+	usedbydataset    NO       NO   <size>
+	usedbyrefreservation  NO       NO   <size>
+	usedbysnapshots  NO       NO   <size>
+	userrefs         NO       NO   <count>
+	written          NO       NO   <size>
+	aclinherit      YES      YES   discard | noallow | restricted | passthrough | passthrough-x
+	aclmode         YES      YES   discard | groupmask | passthrough | restricted
+	acltype         YES      YES   off | nfsv4 | posix
+	atime           YES      YES   on | off
+	canmount        YES       NO   on | off | noauto
+	casesensitivity  NO      YES   sensitive | insensitive | mixed
+	checksum        YES      YES   on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein | edonr
+	compression     YES      YES   on | off | lzjb | gzip | gzip-[1-9] | zle | lz4 | zstd | zstd-[1-19] | zstd-fast | zstd-fast-[1-10,20,30,40,50,60,70,80,90,100,500,1000]
+	context         YES       NO   <selinux context>
+	copies          YES      YES   1 | 2 | 3
+	dedup           YES      YES   on | off | verify | sha256[,verify] | sha512[,verify] | skein[,verify] | edonr,verify
+	defcontext      YES       NO   <selinux defcontext>
+	devices         YES      YES   on | off
+	dnodesize       YES      YES   legacy | auto | 1k | 2k | 4k | 8k | 16k
+	encryption       NO      YES   on | off | aes-128-ccm | aes-192-ccm | aes-256-ccm | aes-128-gcm | aes-192-gcm | aes-256-gcm
+	exec            YES      YES   on | off
+	filesystem_limit YES       NO   <count> | none
+	fscontext       YES       NO   <selinux fscontext>
+	keyformat        NO       NO   none | raw | hex | passphrase
+	keylocation     YES       NO   prompt | <file URI> | <https URL> | <http URL>
+	logbias         YES      YES   latency | throughput
+	mlslabel        YES      YES   <sensitivity label>
+	mountpoint      YES      YES   <path> | legacy | none
+	nbmand          YES      YES   on | off
+	normalization    NO      YES   none | formC | formD | formKC | formKD
+	overlay         YES      YES   on | off
+	pbkdf2iters      NO       NO   <iters>
+	primarycache    YES      YES   all | none | metadata
+	quota           YES       NO   <size> | none
+	readonly        YES      YES   on | off
+	recordsize      YES      YES   512 to 1M, power of 2
+	redundant_metadata YES      YES   all | most
+	refquota        YES       NO   <size> | none
+	refreservation  YES       NO   <size> | none
+	relatime        YES      YES   on | off
+	reservation     YES       NO   <size> | none
+	rootcontext     YES       NO   <selinux rootcontext>
+	secondarycache  YES      YES   all | none | metadata
+	setuid          YES      YES   on | off
+	sharenfs        YES      YES   on | off | NFS share options
+	sharesmb        YES      YES   on | off | SMB share options
+	snapdev         YES      YES   hidden | visible
+	snapdir         YES      YES   hidden | visible
+	snapshot_limit  YES       NO   <count> | none
+	special_small_blocks YES      YES   zero or 512 to 1M, power of 2
+	sync            YES      YES   standard | always | disabled
+	utf8only         NO      YES   on | off
+	version         YES       NO   1 | 2 | 3 | 4 | 5 | current
+	volblocksize     NO      YES   512 to 128k, power of 2
+	volmode         YES      YES   default | full | geom | dev | none
+	volsize         YES       NO   <size>
+	vscan           YES      YES   on | off
+	xattr           YES      YES   on | off | dir | sa
+	zoned           YES      YES   on | off
+	userused@...     NO       NO   <size>
+	groupused@...    NO       NO   <size>
+	projectused@...  NO       NO   <size>
+	userobjused@...  NO       NO   <size>
+	groupobjused@...  NO       NO   <size>
+	projectobjused@...  NO       NO   <size>
+	userquota@...   YES       NO   <size> | none
+	groupquota@...  YES       NO   <size> | none
+	projectquota@... YES       NO   <size> | none
+	userobjquota@... YES       NO   <size> | none
+	groupobjquota@... YES       NO   <size> | none
+	projectobjquota@... YES       NO   <size> | none
+	written@<snap>   NO       NO   <size>
+	written#<bookmark>  NO       NO   <size>
+
+Sizes are specified in bytes with standard units such as K, M, G, etc.
+
+User-defined properties can be specified by using a name containing a colon (:).
+
+The {user|group|project}[obj]{used|quota}@ properties must be appended with
+a user|group|project specifier of one of these forms:
+    POSIX name      (eg: "matt")
+    POSIX id        (eg: "126829")
+    SMB name@domain (eg: "matt@sun")
+    SMB SID         (eg: "S-1-234-567-89")
+=== END
+=== CASE M9/J05_list_json
+--- cmd
+zfs list --json zfsbcapc/M9/src
+--- rc
+2
+--- stdout
+--- stderr
+invalid option '-'
+usage:
+	list [-Hp] [-r|-d max] [-o property[,...]] [-s property]...
+	    [-S property]... [-t type[,...]] [filesystem|volume|snapshot] ...
+
+The following properties are supported:
+
+	PROPERTY       EDIT  INHERIT   VALUES
+
+	available        NO       NO   <size>
+	clones           NO       NO   <dataset>[,...]
+	compressratio    NO       NO   <1.00x or higher if compressed>
+	createtxg        NO       NO   <uint64>
+	creation         NO       NO   <date>
+	defer_destroy    NO       NO   yes | no
+	encryptionroot   NO       NO   <filesystem | volume>
+	filesystem_count  NO       NO   <count>
+	guid             NO       NO   <uint64>
+	keystatus        NO       NO   none | unavailable | available
+	logicalreferenced  NO       NO   <size>
+	logicalused      NO       NO   <size>
+	mounted          NO       NO   yes | no
+	objsetid         NO       NO   <uint64>
+	origin           NO       NO   <snapshot>
+	receive_resume_token  NO       NO   <string token>
+	redact_snaps     NO       NO   <snapshot>[,...]
+	refcompressratio  NO       NO   <1.00x or higher if compressed>
+	referenced       NO       NO   <size>
+	snapshot_count   NO       NO   <count>
+	type             NO       NO   filesystem | volume | snapshot | bookmark
+	used             NO       NO   <size>
+	usedbychildren   NO       NO   <size>
+	usedbydataset    NO       NO   <size>
+	usedbyrefreservation  NO       NO   <size>
+	usedbysnapshots  NO       NO   <size>
+	userrefs         NO       NO   <count>
+	written          NO       NO   <size>
+	aclinherit      YES      YES   discard | noallow | restricted | passthrough | passthrough-x
+	aclmode         YES      YES   discard | groupmask | passthrough | restricted
+	acltype         YES      YES   off | nfsv4 | posix
+	atime           YES      YES   on | off
+	canmount        YES       NO   on | off | noauto
+	casesensitivity  NO      YES   sensitive | insensitive | mixed
+	checksum        YES      YES   on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein | edonr
+	compression     YES      YES   on | off | lzjb | gzip | gzip-[1-9] | zle | lz4 | zstd | zstd-[1-19] | zstd-fast | zstd-fast-[1-10,20,30,40,50,60,70,80,90,100,500,1000]
+	context         YES       NO   <selinux context>
+	copies          YES      YES   1 | 2 | 3
+	dedup           YES      YES   on | off | verify | sha256[,verify] | sha512[,verify] | skein[,verify] | edonr,verify
+	defcontext      YES       NO   <selinux defcontext>
+	devices         YES      YES   on | off
+	dnodesize       YES      YES   legacy | auto | 1k | 2k | 4k | 8k | 16k
+	encryption       NO      YES   on | off | aes-128-ccm | aes-192-ccm | aes-256-ccm | aes-128-gcm | aes-192-gcm | aes-256-gcm
+	exec            YES      YES   on | off
+	filesystem_limit YES       NO   <count> | none
+	fscontext       YES       NO   <selinux fscontext>
+	keyformat        NO       NO   none | raw | hex | passphrase
+	keylocation     YES       NO   prompt | <file URI> | <https URL> | <http URL>
+	logbias         YES      YES   latency | throughput
+	mlslabel        YES      YES   <sensitivity label>
+	mountpoint      YES      YES   <path> | legacy | none
+	nbmand          YES      YES   on | off
+	normalization    NO      YES   none | formC | formD | formKC | formKD
+	overlay         YES      YES   on | off
+	pbkdf2iters      NO       NO   <iters>
+	primarycache    YES      YES   all | none | metadata
+	quota           YES       NO   <size> | none
+	readonly        YES      YES   on | off
+	recordsize      YES      YES   512 to 1M, power of 2
+	redundant_metadata YES      YES   all | most
+	refquota        YES       NO   <size> | none
+	refreservation  YES       NO   <size> | none
+	relatime        YES      YES   on | off
+	reservation     YES       NO   <size> | none
+	rootcontext     YES       NO   <selinux rootcontext>
+	secondarycache  YES      YES   all | none | metadata
+	setuid          YES      YES   on | off
+	sharenfs        YES      YES   on | off | NFS share options
+	sharesmb        YES      YES   on | off | SMB share options
+	snapdev         YES      YES   hidden | visible
+	snapdir         YES      YES   hidden | visible
+	snapshot_limit  YES       NO   <count> | none
+	special_small_blocks YES      YES   zero or 512 to 1M, power of 2
+	sync            YES      YES   standard | always | disabled
+	utf8only         NO      YES   on | off
+	version         YES       NO   1 | 2 | 3 | 4 | 5 | current
+	volblocksize     NO      YES   512 to 128k, power of 2
+	volmode         YES      YES   default | full | geom | dev | none
+	volsize         YES       NO   <size>
+	vscan           YES      YES   on | off
+	xattr           YES      YES   on | off | dir | sa
+	zoned           YES      YES   on | off
+	userused@...     NO       NO   <size>
+	groupused@...    NO       NO   <size>
+	projectused@...  NO       NO   <size>
+	userobjused@...  NO       NO   <size>
+	groupobjused@...  NO       NO   <size>
+	projectobjused@...  NO       NO   <size>
+	userquota@...   YES       NO   <size> | none
+	groupquota@...  YES       NO   <size> | none
+	projectquota@... YES       NO   <size> | none
+	userobjquota@... YES       NO   <size> | none
+	groupobjquota@... YES       NO   <size> | none
+	projectobjquota@... YES       NO   <size> | none
+	written@<snap>   NO       NO   <size>
+	written#<bookmark>  NO       NO   <size>
+
+Sizes are specified in bytes with standard units such as K, M, G, etc.
+
+User-defined properties can be specified by using a name containing a colon (:).
+
+The {user|group|project}[obj]{used|quota}@ properties must be appended with
+a user|group|project specifier of one of these forms:
+    POSIX name      (eg: "matt")
+    POSIX id        (eg: "126829")
+    SMB name@domain (eg: "matt@sun")
+    SMB SID         (eg: "S-1-234-567-89")
+=== END
+=== CASE M9/J06_list_json_int
+--- cmd
+zfs list --json-int zfsbcapc/M9/src
+--- rc
+2
+--- stdout
+--- stderr
+invalid option '-'
+usage:
+	list [-Hp] [-r|-d max] [-o property[,...]] [-s property]...
+	    [-S property]... [-t type[,...]] [filesystem|volume|snapshot] ...
+
+The following properties are supported:
+
+	PROPERTY       EDIT  INHERIT   VALUES
+
+	available        NO       NO   <size>
+	clones           NO       NO   <dataset>[,...]
+	compressratio    NO       NO   <1.00x or higher if compressed>
+	createtxg        NO       NO   <uint64>
+	creation         NO       NO   <date>
+	defer_destroy    NO       NO   yes | no
+	encryptionroot   NO       NO   <filesystem | volume>
+	filesystem_count  NO       NO   <count>
+	guid             NO       NO   <uint64>
+	keystatus        NO       NO   none | unavailable | available
+	logicalreferenced  NO       NO   <size>
+	logicalused      NO       NO   <size>
+	mounted          NO       NO   yes | no
+	objsetid         NO       NO   <uint64>
+	origin           NO       NO   <snapshot>
+	receive_resume_token  NO       NO   <string token>
+	redact_snaps     NO       NO   <snapshot>[,...]
+	refcompressratio  NO       NO   <1.00x or higher if compressed>
+	referenced       NO       NO   <size>
+	snapshot_count   NO       NO   <count>
+	type             NO       NO   filesystem | volume | snapshot | bookmark
+	used             NO       NO   <size>
+	usedbychildren   NO       NO   <size>
+	usedbydataset    NO       NO   <size>
+	usedbyrefreservation  NO       NO   <size>
+	usedbysnapshots  NO       NO   <size>
+	userrefs         NO       NO   <count>
+	written          NO       NO   <size>
+	aclinherit      YES      YES   discard | noallow | restricted | passthrough | passthrough-x
+	aclmode         YES      YES   discard | groupmask | passthrough | restricted
+	acltype         YES      YES   off | nfsv4 | posix
+	atime           YES      YES   on | off
+	canmount        YES       NO   on | off | noauto
+	casesensitivity  NO      YES   sensitive | insensitive | mixed
+	checksum        YES      YES   on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein | edonr
+	compression     YES      YES   on | off | lzjb | gzip | gzip-[1-9] | zle | lz4 | zstd | zstd-[1-19] | zstd-fast | zstd-fast-[1-10,20,30,40,50,60,70,80,90,100,500,1000]
+	context         YES       NO   <selinux context>
+	copies          YES      YES   1 | 2 | 3
+	dedup           YES      YES   on | off | verify | sha256[,verify] | sha512[,verify] | skein[,verify] | edonr,verify
+	defcontext      YES       NO   <selinux defcontext>
+	devices         YES      YES   on | off
+	dnodesize       YES      YES   legacy | auto | 1k | 2k | 4k | 8k | 16k
+	encryption       NO      YES   on | off | aes-128-ccm | aes-192-ccm | aes-256-ccm | aes-128-gcm | aes-192-gcm | aes-256-gcm
+	exec            YES      YES   on | off
+	filesystem_limit YES       NO   <count> | none
+	fscontext       YES       NO   <selinux fscontext>
+	keyformat        NO       NO   none | raw | hex | passphrase
+	keylocation     YES       NO   prompt | <file URI> | <https URL> | <http URL>
+	logbias         YES      YES   latency | throughput
+	mlslabel        YES      YES   <sensitivity label>
+	mountpoint      YES      YES   <path> | legacy | none
+	nbmand          YES      YES   on | off
+	normalization    NO      YES   none | formC | formD | formKC | formKD
+	overlay         YES      YES   on | off
+	pbkdf2iters      NO       NO   <iters>
+	primarycache    YES      YES   all | none | metadata
+	quota           YES       NO   <size> | none
+	readonly        YES      YES   on | off
+	recordsize      YES      YES   512 to 1M, power of 2
+	redundant_metadata YES      YES   all | most
+	refquota        YES       NO   <size> | none
+	refreservation  YES       NO   <size> | none
+	relatime        YES      YES   on | off
+	reservation     YES       NO   <size> | none
+	rootcontext     YES       NO   <selinux rootcontext>
+	secondarycache  YES      YES   all | none | metadata
+	setuid          YES      YES   on | off
+	sharenfs        YES      YES   on | off | NFS share options
+	sharesmb        YES      YES   on | off | SMB share options
+	snapdev         YES      YES   hidden | visible
+	snapdir         YES      YES   hidden | visible
+	snapshot_limit  YES       NO   <count> | none
+	special_small_blocks YES      YES   zero or 512 to 1M, power of 2
+	sync            YES      YES   standard | always | disabled
+	utf8only         NO      YES   on | off
+	version         YES       NO   1 | 2 | 3 | 4 | 5 | current
+	volblocksize     NO      YES   512 to 128k, power of 2
+	volmode         YES      YES   default | full | geom | dev | none
+	volsize         YES       NO   <size>
+	vscan           YES      YES   on | off
+	xattr           YES      YES   on | off | dir | sa
+	zoned           YES      YES   on | off
+	userused@...     NO       NO   <size>
+	groupused@...    NO       NO   <size>
+	projectused@...  NO       NO   <size>
+	userobjused@...  NO       NO   <size>
+	groupobjused@...  NO       NO   <size>
+	projectobjused@...  NO       NO   <size>
+	userquota@...   YES       NO   <size> | none
+	groupquota@...  YES       NO   <size> | none
+	projectquota@... YES       NO   <size> | none
+	userobjquota@... YES       NO   <size> | none
+	groupobjquota@... YES       NO   <size> | none
+	projectobjquota@... YES       NO   <size> | none
+	written@<snap>   NO       NO   <size>
+	written#<bookmark>  NO       NO   <size>
+
+Sizes are specified in bytes with standard units such as K, M, G, etc.
+
+User-defined properties can be specified by using a name containing a colon (:).
+
+The {user|group|project}[obj]{used|quota}@ properties must be appended with
+a user|group|project specifier of one of these forms:
+    POSIX name      (eg: "matt")
+    POSIX id        (eg: "126829")
+    SMB name@domain (eg: "matt@sun")
+    SMB SID         (eg: "S-1-234-567-89")
+=== END
+=== CASE M9/J07_get_j_all
+--- cmd
+zfs get -j all zfsbcapc/M9/src
+--- rc
+2
+--- stdout
+--- stderr
+invalid option 'j'
+usage:
+	get [-rHp] [-d max] [-o "all" | field[,...]]
+	    [-t type[,...]] [-s source[,...]]
+	    <"all" | property[,...]> [filesystem|volume|snapshot|bookmark] ...
+
+The following properties are supported:
+
+	PROPERTY       EDIT  INHERIT   VALUES
+
+	available        NO       NO   <size>
+	clones           NO       NO   <dataset>[,...]
+	compressratio    NO       NO   <1.00x or higher if compressed>
+	createtxg        NO       NO   <uint64>
+	creation         NO       NO   <date>
+	defer_destroy    NO       NO   yes | no
+	encryptionroot   NO       NO   <filesystem | volume>
+	filesystem_count  NO       NO   <count>
+	guid             NO       NO   <uint64>
+	keystatus        NO       NO   none | unavailable | available
+	logicalreferenced  NO       NO   <size>
+	logicalused      NO       NO   <size>
+	mounted          NO       NO   yes | no
+	objsetid         NO       NO   <uint64>
+	origin           NO       NO   <snapshot>
+	receive_resume_token  NO       NO   <string token>
+	redact_snaps     NO       NO   <snapshot>[,...]
+	refcompressratio  NO       NO   <1.00x or higher if compressed>
+	referenced       NO       NO   <size>
+	snapshot_count   NO       NO   <count>
+	type             NO       NO   filesystem | volume | snapshot | bookmark
+	used             NO       NO   <size>
+	usedbychildren   NO       NO   <size>
+	usedbydataset    NO       NO   <size>
+	usedbyrefreservation  NO       NO   <size>
+	usedbysnapshots  NO       NO   <size>
+	userrefs         NO       NO   <count>
+	written          NO       NO   <size>
+	aclinherit      YES      YES   discard | noallow | restricted | passthrough | passthrough-x
+	aclmode         YES      YES   discard | groupmask | passthrough | restricted
+	acltype         YES      YES   off | nfsv4 | posix
+	atime           YES      YES   on | off
+	canmount        YES       NO   on | off | noauto
+	casesensitivity  NO      YES   sensitive | insensitive | mixed
+	checksum        YES      YES   on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein | edonr
+	compression     YES      YES   on | off | lzjb | gzip | gzip-[1-9] | zle | lz4 | zstd | zstd-[1-19] | zstd-fast | zstd-fast-[1-10,20,30,40,50,60,70,80,90,100,500,1000]
+	context         YES       NO   <selinux context>
+	copies          YES      YES   1 | 2 | 3
+	dedup           YES      YES   on | off | verify | sha256[,verify] | sha512[,verify] | skein[,verify] | edonr,verify
+	defcontext      YES       NO   <selinux defcontext>
+	devices         YES      YES   on | off
+	dnodesize       YES      YES   legacy | auto | 1k | 2k | 4k | 8k | 16k
+	encryption       NO      YES   on | off | aes-128-ccm | aes-192-ccm | aes-256-ccm | aes-128-gcm | aes-192-gcm | aes-256-gcm
+	exec            YES      YES   on | off
+	filesystem_limit YES       NO   <count> | none
+	fscontext       YES       NO   <selinux fscontext>
+	keyformat        NO       NO   none | raw | hex | passphrase
+	keylocation     YES       NO   prompt | <file URI> | <https URL> | <http URL>
+	logbias         YES      YES   latency | throughput
+	mlslabel        YES      YES   <sensitivity label>
+	mountpoint      YES      YES   <path> | legacy | none
+	nbmand          YES      YES   on | off
+	normalization    NO      YES   none | formC | formD | formKC | formKD
+	overlay         YES      YES   on | off
+	pbkdf2iters      NO       NO   <iters>
+	primarycache    YES      YES   all | none | metadata
+	quota           YES       NO   <size> | none
+	readonly        YES      YES   on | off
+	recordsize      YES      YES   512 to 1M, power of 2
+	redundant_metadata YES      YES   all | most
+	refquota        YES       NO   <size> | none
+	refreservation  YES       NO   <size> | none
+	relatime        YES      YES   on | off
+	reservation     YES       NO   <size> | none
+	rootcontext     YES       NO   <selinux rootcontext>
+	secondarycache  YES      YES   all | none | metadata
+	setuid          YES      YES   on | off
+	sharenfs        YES      YES   on | off | NFS share options
+	sharesmb        YES      YES   on | off | SMB share options
+	snapdev         YES      YES   hidden | visible
+	snapdir         YES      YES   hidden | visible
+	snapshot_limit  YES       NO   <count> | none
+	special_small_blocks YES      YES   zero or 512 to 1M, power of 2
+	sync            YES      YES   standard | always | disabled
+	utf8only         NO      YES   on | off
+	version         YES       NO   1 | 2 | 3 | 4 | 5 | current
+	volblocksize     NO      YES   512 to 128k, power of 2
+	volmode         YES      YES   default | full | geom | dev | none
+	volsize         YES       NO   <size>
+	vscan           YES      YES   on | off
+	xattr           YES      YES   on | off | dir | sa
+	zoned           YES      YES   on | off
+	userused@...     NO       NO   <size>
+	groupused@...    NO       NO   <size>
+	projectused@...  NO       NO   <size>
+	userobjused@...  NO       NO   <size>
+	groupobjused@...  NO       NO   <size>
+	projectobjused@...  NO       NO   <size>
+	userquota@...   YES       NO   <size> | none
+	groupquota@...  YES       NO   <size> | none
+	projectquota@... YES       NO   <size> | none
+	userobjquota@... YES       NO   <size> | none
+	groupobjquota@... YES       NO   <size> | none
+	projectobjquota@... YES       NO   <size> | none
+	written@<snap>   NO       NO   <size>
+	written#<bookmark>  NO       NO   <size>
+
+Sizes are specified in bytes with standard units such as K, M, G, etc.
+
+User-defined properties can be specified by using a name containing a colon (:).
+
+The {user|group|project}[obj]{used|quota}@ properties must be appended with
+a user|group|project specifier of one of these forms:
+    POSIX name      (eg: "matt")
+    POSIX id        (eg: "126829")
+    SMB name@domain (eg: "matt@sun")
+    SMB SID         (eg: "S-1-234-567-89")
+=== END
+=== CASE M9/J08_get_j_user
+--- cmd
+zfs get -j zfsb:nl,zfsb:tab,zfsb:q,zfsb:bs,zfsb:bsn,zfsb:ctl,zfsb:json,zfsb:dash,zfsb:fake,zfsb:empty,zfsb:lt,zfsb:missing zfsbcapc/M9/src
+--- rc
+2
+--- stdout
+--- stderr
+invalid option 'j'
+usage:
+	get [-rHp] [-d max] [-o "all" | field[,...]]
+	    [-t type[,...]] [-s source[,...]]
+	    <"all" | property[,...]> [filesystem|volume|snapshot|bookmark] ...
+
+The following properties are supported:
+
+	PROPERTY       EDIT  INHERIT   VALUES
+
+	available        NO       NO   <size>
+	clones           NO       NO   <dataset>[,...]
+	compressratio    NO       NO   <1.00x or higher if compressed>
+	createtxg        NO       NO   <uint64>
+	creation         NO       NO   <date>
+	defer_destroy    NO       NO   yes | no
+	encryptionroot   NO       NO   <filesystem | volume>
+	filesystem_count  NO       NO   <count>
+	guid             NO       NO   <uint64>
+	keystatus        NO       NO   none | unavailable | available
+	logicalreferenced  NO       NO   <size>
+	logicalused      NO       NO   <size>
+	mounted          NO       NO   yes | no
+	objsetid         NO       NO   <uint64>
+	origin           NO       NO   <snapshot>
+	receive_resume_token  NO       NO   <string token>
+	redact_snaps     NO       NO   <snapshot>[,...]
+	refcompressratio  NO       NO   <1.00x or higher if compressed>
+	referenced       NO       NO   <size>
+	snapshot_count   NO       NO   <count>
+	type             NO       NO   filesystem | volume | snapshot | bookmark
+	used             NO       NO   <size>
+	usedbychildren   NO       NO   <size>
+	usedbydataset    NO       NO   <size>
+	usedbyrefreservation  NO       NO   <size>
+	usedbysnapshots  NO       NO   <size>
+	userrefs         NO       NO   <count>
+	written          NO       NO   <size>
+	aclinherit      YES      YES   discard | noallow | restricted | passthrough | passthrough-x
+	aclmode         YES      YES   discard | groupmask | passthrough | restricted
+	acltype         YES      YES   off | nfsv4 | posix
+	atime           YES      YES   on | off
+	canmount        YES       NO   on | off | noauto
+	casesensitivity  NO      YES   sensitive | insensitive | mixed
+	checksum        YES      YES   on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein | edonr
+	compression     YES      YES   on | off | lzjb | gzip | gzip-[1-9] | zle | lz4 | zstd | zstd-[1-19] | zstd-fast | zstd-fast-[1-10,20,30,40,50,60,70,80,90,100,500,1000]
+	context         YES       NO   <selinux context>
+	copies          YES      YES   1 | 2 | 3
+	dedup           YES      YES   on | off | verify | sha256[,verify] | sha512[,verify] | skein[,verify] | edonr,verify
+	defcontext      YES       NO   <selinux defcontext>
+	devices         YES      YES   on | off
+	dnodesize       YES      YES   legacy | auto | 1k | 2k | 4k | 8k | 16k
+	encryption       NO      YES   on | off | aes-128-ccm | aes-192-ccm | aes-256-ccm | aes-128-gcm | aes-192-gcm | aes-256-gcm
+	exec            YES      YES   on | off
+	filesystem_limit YES       NO   <count> | none
+	fscontext       YES       NO   <selinux fscontext>
+	keyformat        NO       NO   none | raw | hex | passphrase
+	keylocation     YES       NO   prompt | <file URI> | <https URL> | <http URL>
+	logbias         YES      YES   latency | throughput
+	mlslabel        YES      YES   <sensitivity label>
+	mountpoint      YES      YES   <path> | legacy | none
+	nbmand          YES      YES   on | off
+	normalization    NO      YES   none | formC | formD | formKC | formKD
+	overlay         YES      YES   on | off
+	pbkdf2iters      NO       NO   <iters>
+	primarycache    YES      YES   all | none | metadata
+	quota           YES       NO   <size> | none
+	readonly        YES      YES   on | off
+	recordsize      YES      YES   512 to 1M, power of 2
+	redundant_metadata YES      YES   all | most
+	refquota        YES       NO   <size> | none
+	refreservation  YES       NO   <size> | none
+	relatime        YES      YES   on | off
+	reservation     YES       NO   <size> | none
+	rootcontext     YES       NO   <selinux rootcontext>
+	secondarycache  YES      YES   all | none | metadata
+	setuid          YES      YES   on | off
+	sharenfs        YES      YES   on | off | NFS share options
+	sharesmb        YES      YES   on | off | SMB share options
+	snapdev         YES      YES   hidden | visible
+	snapdir         YES      YES   hidden | visible
+	snapshot_limit  YES       NO   <count> | none
+	special_small_blocks YES      YES   zero or 512 to 1M, power of 2
+	sync            YES      YES   standard | always | disabled
+	utf8only         NO      YES   on | off
+	version         YES       NO   1 | 2 | 3 | 4 | 5 | current
+	volblocksize     NO      YES   512 to 128k, power of 2
+	volmode         YES      YES   default | full | geom | dev | none
+	volsize         YES       NO   <size>
+	vscan           YES      YES   on | off
+	xattr           YES      YES   on | off | dir | sa
+	zoned           YES      YES   on | off
+	userused@...     NO       NO   <size>
+	groupused@...    NO       NO   <size>
+	projectused@...  NO       NO   <size>
+	userobjused@...  NO       NO   <size>
+	groupobjused@...  NO       NO   <size>
+	projectobjused@...  NO       NO   <size>
+	userquota@...   YES       NO   <size> | none
+	groupquota@...  YES       NO   <size> | none
+	projectquota@... YES       NO   <size> | none
+	userobjquota@... YES       NO   <size> | none
+	groupobjquota@... YES       NO   <size> | none
+	projectobjquota@... YES       NO   <size> | none
+	written@<snap>   NO       NO   <size>
+	written#<bookmark>  NO       NO   <size>
+
+Sizes are specified in bytes with standard units such as K, M, G, etc.
+
+User-defined properties can be specified by using a name containing a colon (:).
+
+The {user|group|project}[obj]{used|quota}@ properties must be appended with
+a user|group|project specifier of one of these forms:
+    POSIX name      (eg: "matt")
+    POSIX id        (eg: "126829")
+    SMB name@domain (eg: "matt@sun")
+    SMB SID         (eg: "S-1-234-567-89")
+=== END
+=== CASE M9/J09_get_j_noargs
+--- cmd
+zfs get -j
+--- rc
+2
+--- stdout
+--- stderr
+invalid option 'j'
+usage:
+	get [-rHp] [-d max] [-o "all" | field[,...]]
+	    [-t type[,...]] [-s source[,...]]
+	    <"all" | property[,...]> [filesystem|volume|snapshot|bookmark] ...
+
+The following properties are supported:
+
+	PROPERTY       EDIT  INHERIT   VALUES
+
+	available        NO       NO   <size>
+	clones           NO       NO   <dataset>[,...]
+	compressratio    NO       NO   <1.00x or higher if compressed>
+	createtxg        NO       NO   <uint64>
+	creation         NO       NO   <date>
+	defer_destroy    NO       NO   yes | no
+	encryptionroot   NO       NO   <filesystem | volume>
+	filesystem_count  NO       NO   <count>
+	guid             NO       NO   <uint64>
+	keystatus        NO       NO   none | unavailable | available
+	logicalreferenced  NO       NO   <size>
+	logicalused      NO       NO   <size>
+	mounted          NO       NO   yes | no
+	objsetid         NO       NO   <uint64>
+	origin           NO       NO   <snapshot>
+	receive_resume_token  NO       NO   <string token>
+	redact_snaps     NO       NO   <snapshot>[,...]
+	refcompressratio  NO       NO   <1.00x or higher if compressed>
+	referenced       NO       NO   <size>
+	snapshot_count   NO       NO   <count>
+	type             NO       NO   filesystem | volume | snapshot | bookmark
+	used             NO       NO   <size>
+	usedbychildren   NO       NO   <size>
+	usedbydataset    NO       NO   <size>
+	usedbyrefreservation  NO       NO   <size>
+	usedbysnapshots  NO       NO   <size>
+	userrefs         NO       NO   <count>
+	written          NO       NO   <size>
+	aclinherit      YES      YES   discard | noallow | restricted | passthrough | passthrough-x
+	aclmode         YES      YES   discard | groupmask | passthrough | restricted
+	acltype         YES      YES   off | nfsv4 | posix
+	atime           YES      YES   on | off
+	canmount        YES       NO   on | off | noauto
+	casesensitivity  NO      YES   sensitive | insensitive | mixed
+	checksum        YES      YES   on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein | edonr
+	compression     YES      YES   on | off | lzjb | gzip | gzip-[1-9] | zle | lz4 | zstd | zstd-[1-19] | zstd-fast | zstd-fast-[1-10,20,30,40,50,60,70,80,90,100,500,1000]
+	context         YES       NO   <selinux context>
+	copies          YES      YES   1 | 2 | 3
+	dedup           YES      YES   on | off | verify | sha256[,verify] | sha512[,verify] | skein[,verify] | edonr,verify
+	defcontext      YES       NO   <selinux defcontext>
+	devices         YES      YES   on | off
+	dnodesize       YES      YES   legacy | auto | 1k | 2k | 4k | 8k | 16k
+	encryption       NO      YES   on | off | aes-128-ccm | aes-192-ccm | aes-256-ccm | aes-128-gcm | aes-192-gcm | aes-256-gcm
+	exec            YES      YES   on | off
+	filesystem_limit YES       NO   <count> | none
+	fscontext       YES       NO   <selinux fscontext>
+	keyformat        NO       NO   none | raw | hex | passphrase
+	keylocation     YES       NO   prompt | <file URI> | <https URL> | <http URL>
+	logbias         YES      YES   latency | throughput
+	mlslabel        YES      YES   <sensitivity label>
+	mountpoint      YES      YES   <path> | legacy | none
+	nbmand          YES      YES   on | off
+	normalization    NO      YES   none | formC | formD | formKC | formKD
+	overlay         YES      YES   on | off
+	pbkdf2iters      NO       NO   <iters>
+	primarycache    YES      YES   all | none | metadata
+	quota           YES       NO   <size> | none
+	readonly        YES      YES   on | off
+	recordsize      YES      YES   512 to 1M, power of 2
+	redundant_metadata YES      YES   all | most
+	refquota        YES       NO   <size> | none
+	refreservation  YES       NO   <size> | none
+	relatime        YES      YES   on | off
+	reservation     YES       NO   <size> | none
+	rootcontext     YES       NO   <selinux rootcontext>
+	secondarycache  YES      YES   all | none | metadata
+	setuid          YES      YES   on | off
+	sharenfs        YES      YES   on | off | NFS share options
+	sharesmb        YES      YES   on | off | SMB share options
+	snapdev         YES      YES   hidden | visible
+	snapdir         YES      YES   hidden | visible
+	snapshot_limit  YES       NO   <count> | none
+	special_small_blocks YES      YES   zero or 512 to 1M, power of 2
+	sync            YES      YES   standard | always | disabled
+	utf8only         NO      YES   on | off
+	version         YES       NO   1 | 2 | 3 | 4 | 5 | current
+	volblocksize     NO      YES   512 to 128k, power of 2
+	volmode         YES      YES   default | full | geom | dev | none
+	volsize         YES       NO   <size>
+	vscan           YES      YES   on | off
+	xattr           YES      YES   on | off | dir | sa
+	zoned           YES      YES   on | off
+	userused@...     NO       NO   <size>
+	groupused@...    NO       NO   <size>
+	projectused@...  NO       NO   <size>
+	userobjused@...  NO       NO   <size>
+	groupobjused@...  NO       NO   <size>
+	projectobjused@...  NO       NO   <size>
+	userquota@...   YES       NO   <size> | none
+	groupquota@...  YES       NO   <size> | none
+	projectquota@... YES       NO   <size> | none
+	userobjquota@... YES       NO   <size> | none
+	groupobjquota@... YES       NO   <size> | none
+	projectobjquota@... YES       NO   <size> | none
+	written@<snap>   NO       NO   <size>
+	written#<bookmark>  NO       NO   <size>
+
+Sizes are specified in bytes with standard units such as K, M, G, etc.
+
+User-defined properties can be specified by using a name containing a colon (:).
+
+The {user|group|project}[obj]{used|quota}@ properties must be appended with
+a user|group|project specifier of one of these forms:
+    POSIX name      (eg: "matt")
+    POSIX id        (eg: "126829")
+    SMB name@domain (eg: "matt@sun")
+    SMB SID         (eg: "S-1-234-567-89")
+=== END
+=== CASE M9/J10_get_json
+--- cmd
+zfs get --json all zfsbcapc/M9/src
+--- rc
+2
+--- stdout
+--- stderr
+invalid option '-'
+usage:
+	get [-rHp] [-d max] [-o "all" | field[,...]]
+	    [-t type[,...]] [-s source[,...]]
+	    <"all" | property[,...]> [filesystem|volume|snapshot|bookmark] ...
+
+The following properties are supported:
+
+	PROPERTY       EDIT  INHERIT   VALUES
+
+	available        NO       NO   <size>
+	clones           NO       NO   <dataset>[,...]
+	compressratio    NO       NO   <1.00x or higher if compressed>
+	createtxg        NO       NO   <uint64>
+	creation         NO       NO   <date>
+	defer_destroy    NO       NO   yes | no
+	encryptionroot   NO       NO   <filesystem | volume>
+	filesystem_count  NO       NO   <count>
+	guid             NO       NO   <uint64>
+	keystatus        NO       NO   none | unavailable | available
+	logicalreferenced  NO       NO   <size>
+	logicalused      NO       NO   <size>
+	mounted          NO       NO   yes | no
+	objsetid         NO       NO   <uint64>
+	origin           NO       NO   <snapshot>
+	receive_resume_token  NO       NO   <string token>
+	redact_snaps     NO       NO   <snapshot>[,...]
+	refcompressratio  NO       NO   <1.00x or higher if compressed>
+	referenced       NO       NO   <size>
+	snapshot_count   NO       NO   <count>
+	type             NO       NO   filesystem | volume | snapshot | bookmark
+	used             NO       NO   <size>
+	usedbychildren   NO       NO   <size>
+	usedbydataset    NO       NO   <size>
+	usedbyrefreservation  NO       NO   <size>
+	usedbysnapshots  NO       NO   <size>
+	userrefs         NO       NO   <count>
+	written          NO       NO   <size>
+	aclinherit      YES      YES   discard | noallow | restricted | passthrough | passthrough-x
+	aclmode         YES      YES   discard | groupmask | passthrough | restricted
+	acltype         YES      YES   off | nfsv4 | posix
+	atime           YES      YES   on | off
+	canmount        YES       NO   on | off | noauto
+	casesensitivity  NO      YES   sensitive | insensitive | mixed
+	checksum        YES      YES   on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein | edonr
+	compression     YES      YES   on | off | lzjb | gzip | gzip-[1-9] | zle | lz4 | zstd | zstd-[1-19] | zstd-fast | zstd-fast-[1-10,20,30,40,50,60,70,80,90,100,500,1000]
+	context         YES       NO   <selinux context>
+	copies          YES      YES   1 | 2 | 3
+	dedup           YES      YES   on | off | verify | sha256[,verify] | sha512[,verify] | skein[,verify] | edonr,verify
+	defcontext      YES       NO   <selinux defcontext>
+	devices         YES      YES   on | off
+	dnodesize       YES      YES   legacy | auto | 1k | 2k | 4k | 8k | 16k
+	encryption       NO      YES   on | off | aes-128-ccm | aes-192-ccm | aes-256-ccm | aes-128-gcm | aes-192-gcm | aes-256-gcm
+	exec            YES      YES   on | off
+	filesystem_limit YES       NO   <count> | none
+	fscontext       YES       NO   <selinux fscontext>
+	keyformat        NO       NO   none | raw | hex | passphrase
+	keylocation     YES       NO   prompt | <file URI> | <https URL> | <http URL>
+	logbias         YES      YES   latency | throughput
+	mlslabel        YES      YES   <sensitivity label>
+	mountpoint      YES      YES   <path> | legacy | none
+	nbmand          YES      YES   on | off
+	normalization    NO      YES   none | formC | formD | formKC | formKD
+	overlay         YES      YES   on | off
+	pbkdf2iters      NO       NO   <iters>
+	primarycache    YES      YES   all | none | metadata
+	quota           YES       NO   <size> | none
+	readonly        YES      YES   on | off
+	recordsize      YES      YES   512 to 1M, power of 2
+	redundant_metadata YES      YES   all | most
+	refquota        YES       NO   <size> | none
+	refreservation  YES       NO   <size> | none
+	relatime        YES      YES   on | off
+	reservation     YES       NO   <size> | none
+	rootcontext     YES       NO   <selinux rootcontext>
+	secondarycache  YES      YES   all | none | metadata
+	setuid          YES      YES   on | off
+	sharenfs        YES      YES   on | off | NFS share options
+	sharesmb        YES      YES   on | off | SMB share options
+	snapdev         YES      YES   hidden | visible
+	snapdir         YES      YES   hidden | visible
+	snapshot_limit  YES       NO   <count> | none
+	special_small_blocks YES      YES   zero or 512 to 1M, power of 2
+	sync            YES      YES   standard | always | disabled
+	utf8only         NO      YES   on | off
+	version         YES       NO   1 | 2 | 3 | 4 | 5 | current
+	volblocksize     NO      YES   512 to 128k, power of 2
+	volmode         YES      YES   default | full | geom | dev | none
+	volsize         YES       NO   <size>
+	vscan           YES      YES   on | off
+	xattr           YES      YES   on | off | dir | sa
+	zoned           YES      YES   on | off
+	userused@...     NO       NO   <size>
+	groupused@...    NO       NO   <size>
+	projectused@...  NO       NO   <size>
+	userobjused@...  NO       NO   <size>
+	groupobjused@...  NO       NO   <size>
+	projectobjused@...  NO       NO   <size>
+	userquota@...   YES       NO   <size> | none
+	groupquota@...  YES       NO   <size> | none
+	projectquota@... YES       NO   <size> | none
+	userobjquota@... YES       NO   <size> | none
+	groupobjquota@... YES       NO   <size> | none
+	projectobjquota@... YES       NO   <size> | none
+	written@<snap>   NO       NO   <size>
+	written#<bookmark>  NO       NO   <size>
+
+Sizes are specified in bytes with standard units such as K, M, G, etc.
+
+User-defined properties can be specified by using a name containing a colon (:).
+
+The {user|group|project}[obj]{used|quota}@ properties must be appended with
+a user|group|project specifier of one of these forms:
+    POSIX name      (eg: "matt")
+    POSIX id        (eg: "126829")
+    SMB name@domain (eg: "matt@sun")
+    SMB SID         (eg: "S-1-234-567-89")
+=== END
+=== CASE M9/J11_list_j_noargs
+--- cmd
+zfs list -j
+--- rc
+2
+--- stdout
+--- stderr
+invalid option 'j'
+usage:
+	list [-Hp] [-r|-d max] [-o property[,...]] [-s property]...
+	    [-S property]... [-t type[,...]] [filesystem|volume|snapshot] ...
+
+The following properties are supported:
+
+	PROPERTY       EDIT  INHERIT   VALUES
+
+	available        NO       NO   <size>
+	clones           NO       NO   <dataset>[,...]
+	compressratio    NO       NO   <1.00x or higher if compressed>
+	createtxg        NO       NO   <uint64>
+	creation         NO       NO   <date>
+	defer_destroy    NO       NO   yes | no
+	encryptionroot   NO       NO   <filesystem | volume>
+	filesystem_count  NO       NO   <count>
+	guid             NO       NO   <uint64>
+	keystatus        NO       NO   none | unavailable | available
+	logicalreferenced  NO       NO   <size>
+	logicalused      NO       NO   <size>
+	mounted          NO       NO   yes | no
+	objsetid         NO       NO   <uint64>
+	origin           NO       NO   <snapshot>
+	receive_resume_token  NO       NO   <string token>
+	redact_snaps     NO       NO   <snapshot>[,...]
+	refcompressratio  NO       NO   <1.00x or higher if compressed>
+	referenced       NO       NO   <size>
+	snapshot_count   NO       NO   <count>
+	type             NO       NO   filesystem | volume | snapshot | bookmark
+	used             NO       NO   <size>
+	usedbychildren   NO       NO   <size>
+	usedbydataset    NO       NO   <size>
+	usedbyrefreservation  NO       NO   <size>
+	usedbysnapshots  NO       NO   <size>
+	userrefs         NO       NO   <count>
+	written          NO       NO   <size>
+	aclinherit      YES      YES   discard | noallow | restricted | passthrough | passthrough-x
+	aclmode         YES      YES   discard | groupmask | passthrough | restricted
+	acltype         YES      YES   off | nfsv4 | posix
+	atime           YES      YES   on | off
+	canmount        YES       NO   on | off | noauto
+	casesensitivity  NO      YES   sensitive | insensitive | mixed
+	checksum        YES      YES   on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein | edonr
+	compression     YES      YES   on | off | lzjb | gzip | gzip-[1-9] | zle | lz4 | zstd | zstd-[1-19] | zstd-fast | zstd-fast-[1-10,20,30,40,50,60,70,80,90,100,500,1000]
+	context         YES       NO   <selinux context>
+	copies          YES      YES   1 | 2 | 3
+	dedup           YES      YES   on | off | verify | sha256[,verify] | sha512[,verify] | skein[,verify] | edonr,verify
+	defcontext      YES       NO   <selinux defcontext>
+	devices         YES      YES   on | off
+	dnodesize       YES      YES   legacy | auto | 1k | 2k | 4k | 8k | 16k
+	encryption       NO      YES   on | off | aes-128-ccm | aes-192-ccm | aes-256-ccm | aes-128-gcm | aes-192-gcm | aes-256-gcm
+	exec            YES      YES   on | off
+	filesystem_limit YES       NO   <count> | none
+	fscontext       YES       NO   <selinux fscontext>
+	keyformat        NO       NO   none | raw | hex | passphrase
+	keylocation     YES       NO   prompt | <file URI> | <https URL> | <http URL>
+	logbias         YES      YES   latency | throughput
+	mlslabel        YES      YES   <sensitivity label>
+	mountpoint      YES      YES   <path> | legacy | none
+	nbmand          YES      YES   on | off
+	normalization    NO      YES   none | formC | formD | formKC | formKD
+	overlay         YES      YES   on | off
+	pbkdf2iters      NO       NO   <iters>
+	primarycache    YES      YES   all | none | metadata
+	quota           YES       NO   <size> | none
+	readonly        YES      YES   on | off
+	recordsize      YES      YES   512 to 1M, power of 2
+	redundant_metadata YES      YES   all | most
+	refquota        YES       NO   <size> | none
+	refreservation  YES       NO   <size> | none
+	relatime        YES      YES   on | off
+	reservation     YES       NO   <size> | none
+	rootcontext     YES       NO   <selinux rootcontext>
+	secondarycache  YES      YES   all | none | metadata
+	setuid          YES      YES   on | off
+	sharenfs        YES      YES   on | off | NFS share options
+	sharesmb        YES      YES   on | off | SMB share options
+	snapdev         YES      YES   hidden | visible
+	snapdir         YES      YES   hidden | visible
+	snapshot_limit  YES       NO   <count> | none
+	special_small_blocks YES      YES   zero or 512 to 1M, power of 2
+	sync            YES      YES   standard | always | disabled
+	utf8only         NO      YES   on | off
+	version         YES       NO   1 | 2 | 3 | 4 | 5 | current
+	volblocksize     NO      YES   512 to 128k, power of 2
+	volmode         YES      YES   default | full | geom | dev | none
+	volsize         YES       NO   <size>
+	vscan           YES      YES   on | off
+	xattr           YES      YES   on | off | dir | sa
+	zoned           YES      YES   on | off
+	userused@...     NO       NO   <size>
+	groupused@...    NO       NO   <size>
+	projectused@...  NO       NO   <size>
+	userobjused@...  NO       NO   <size>
+	groupobjused@...  NO       NO   <size>
+	projectobjused@...  NO       NO   <size>
+	userquota@...   YES       NO   <size> | none
+	groupquota@...  YES       NO   <size> | none
+	projectquota@... YES       NO   <size> | none
+	userobjquota@... YES       NO   <size> | none
+	groupobjquota@... YES       NO   <size> | none
+	projectobjquota@... YES       NO   <size> | none
+	written@<snap>   NO       NO   <size>
+	written#<bookmark>  NO       NO   <size>
+
+Sizes are specified in bytes with standard units such as K, M, G, etc.
+
+User-defined properties can be specified by using a name containing a colon (:).
+
+The {user|group|project}[obj]{used|quota}@ properties must be appended with
+a user|group|project specifier of one of these forms:
+    POSIX name      (eg: "matt")
+    POSIX id        (eg: "126829")
+    SMB name@domain (eg: "matt@sun")
+    SMB SID         (eg: "S-1-234-567-89")
+=== END
+=== CASE M9/J12_zpool_version_j
+--- cmd
+zpool version -j
+--- rc
+0
+--- stdout
+zfs-2.1.5-1ubuntu6~22.04.7
+zfs-kmod-2.1.5-1ubuntu6~22.04.7
+--- stderr
+=== END
+=== CASE M9/J13_zpool_list_j
+--- cmd
+zpool list -j
+--- rc
+2
+--- stdout
+--- stderr
+invalid option 'j'
+usage:
+	list [-gHLpPv] [-o property[,...]] [-T d|u] [pool] ... 
+	    [interval [count]]
+
+the following properties are supported:
+
+	PROPERTY             EDIT   VALUES
+
+	allocated              NO   <size>
+	capacity               NO   <size>
+	checkpoint             NO   <size>
+	dedupratio             NO   <1.00x or higher if deduped>
+	expandsize             NO   <size>
+	fragmentation          NO   <percent>
+	free                   NO   <size>
+	freeing                NO   <size>
+	guid                   NO   <guid>
+	health                 NO   <state>
+	leaked                 NO   <size>
+	load_guid              NO   <load_guid>
+	size                   NO   <size>
+	altroot               YES   <path>
+	ashift                YES   <ashift, 9-16, or 0=default>
+	autoexpand            YES   on | off
+	autoreplace           YES   on | off
+	autotrim              YES   on | off
+	bootfs                YES   <filesystem>
+	cachefile             YES   <file> | none
+	comment               YES   <comment-string>
+	compatibility         YES   <file[,file...]> | off | legacy
+	delegation            YES   on | off
+	failmode              YES   wait | continue | panic
+	listsnapshots         YES   on | off
+	multihost             YES   on | off
+	readonly              YES   on | off
+	version               YES   <version>
+	feature@...           YES   disabled | enabled | active
+
+The feature@ properties must be appended with a feature name.
+See zpool-features(7).
+=== END

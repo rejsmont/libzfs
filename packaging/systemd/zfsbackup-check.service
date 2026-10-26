@@ -1,0 +1,18 @@
+# OPTIONAL. Writes the health report in Prometheus text format for node_exporter's
+# textfile collector. Not enabled by anything: see zfsbackup-check.timer.
+#
+# Change the output path for your node_exporter, either by editing the line
+# below or with `systemctl edit zfsbackup-check.service`. The directory must
+# exist and be the one node_exporter reads (--collector.textfile.directory).
+[Unit]
+Description=ZFS Backup health check (Prometheus textfile)
+
+[Service]
+Type=oneshot
+Environment=ZFSBACKUP_CHECK_OUTPUT=/var/lib/node_exporter/textfile_collector/zfsbackup.prom
+ExecStart=/opt/zfsbackup/venv/bin/zfsbackup-config -c /var/lib/zfsbackup/config.db check --prometheus --output ${ZFSBACKUP_CHECK_OUTPUT}
+# With --output, `check` exits 0 once the file is written, whatever the verdict:
+# health is in the metrics (zfsbackup_*_check_state, zfsbackup_check_success), not
+# in this unit's state. A failed unit therefore means the check could not run or
+# could not write the file (database unusable, unwritable path, a crash); the
+# previous file stays, and zfsbackup_check_timestamp_seconds shows how old it is.

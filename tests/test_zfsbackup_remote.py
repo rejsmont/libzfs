@@ -22,7 +22,8 @@ from zfsbackup.config import (
     BackupConfig, DatasetConfig, RemoteDatasetConfig, Destination, RetentionRule, Duration,
 )
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
-from _snapshot_support import ABSENT, listed_info
+from _snapshot_support import ABSENT, NO_TXG, listed_info
+from _stream_support import get_value_answers
 from zfsbackup.remote import NegotiationFailed, RemoteBackupManager, _SendStream
 
 BASE = HTTPS_BASE
@@ -83,6 +84,7 @@ def _no_local_zfs_property_writes(mocker):
     harmless defaults here, so a test that does not care never reaches even the stub `zfs`.
     Tests that assert on them patch the instance (which wins over these class patches)."""
     mocker.patch.object(DatasetManager, 'get_anchor', return_value=None)
+    mocker.patch.object(DatasetManager, 'get_local_anchor', return_value=None)
     mocker.patch.object(DatasetManager, 'set_anchor', return_value=True)
     mocker.patch.object(DatasetManager, 'get_inflight', return_value=None)
     mocker.patch.object(DatasetManager, 'set_inflight', return_value=True)
@@ -257,6 +259,12 @@ def sinfo(name, guid=None, **props):
     return listed_info(name, 'autosnap', guid=guid, **props)
 
 
+def frm(name):
+    """The `from=<name>&from_guid=<guid>` part of a stream URL whose incremental base is the local
+    snapshot `name` (`_push_step` sends both; the server prefers the guid)."""
+    return f'from={name}&from_guid={sinfo(name).guid}'
+
+
 def messages(caplog, text, level=None):
     return [r for r in caplog.records
             if text in r.getMessage() and (level is None or r.levelname == level)]
@@ -332,6 +340,9 @@ class Harness:
         self.set_anchor = mocker.patch.object(lm, 'set_anchor', side_effect=anchored, return_value=True)
         self.clear_anchor = mocker.patch.object(lm, 'clear_anchor', return_value=None)
         self.get_anchor = mocker.patch.object(lm, 'get_anchor', return_value=None)
+        #: the dataset's OWN anchor (`get_anchor` may also report an inherited one): what the
+        #: rollback permit reads
+        self.get_local_anchor = mocker.patch.object(lm, 'get_local_anchor', return_value=None)
         self.get_inflight = mocker.patch.object(lm, 'get_inflight', return_value=None)
 
     def stopper(self, *script, default=False):
@@ -356,12 +367,25 @@ class Harness:
 
     NOFIELD = object()
 
-    def server_says(self, common=None, copy=NOFIELD, server_dataset='pool/b/client1/data', **response):
+    def server_says(self, common=None, copy=NOFIELD, server_dataset='pool/b/client1/data',
+                    newer=NOFIELD, newer_count=NOFIELD, unknown=False, **response):
         """The server's answer to POST .../negotiate (for `Chain(negotiate=REAL)`): the common
-        snapshot, and `server_copy` unless `copy` is left out (an older server)."""
+        snapshot, and `server_copy` unless `copy` is left out (an older server). `newer` (a list of
+        `{"name", "guid"}`) is `server_newer` and `newer_count` `server_newer_count` (default: the
+        length of `newer`); both are left out, as an older server does, unless given. `unknown`
+        adds `server_newer_unknown: true` (a common snapshot whose newer ones the server could not
+        tell; it then sends neither list field)."""
         body = {'common_snapshot': common, 'server_dataset': server_dataset}
+        if unknown:
+            body['server_newer_unknown'] = True
         if copy is not self.NOFIELD:
             body['server_copy'] = copy
+        if newer is not self.NOFIELD:
+            body['server_newer'] = newer
+            if newer_count is self.NOFIELD:
+                newer_count = len(newer)
+        if newer_count is not self.NOFIELD:
+            body['server_newer_count'] = newer_count
         self.rm.post(re.compile(r'.*/negotiate$'), **(response or {'json': body}))
 
     def token_gets(self):
@@ -499,12 +523,12 @@ class TestFetchResumeToken:
         (rec,) = messages(caplog, 'pool busy')
         assert rec.levelname == 'WARNING'
 
-    def test_exactly_one_get_with_a_10_second_timeout(self, h):
+    def test_exactly_one_get_with_the_resume_token_timeout(self, h):
         h.token('1-abc')
         self.fetch(h)
         assert h.rm.call_count == 1
         assert h.rm.last_request.method == 'GET'
-        assert h.rm.last_request.timeout == 10
+        assert h.rm.last_request.timeout == 30       # S-14: not shorter than the server's zfs budget
 
 
 class TestBusyServer:
@@ -1121,7 +1145,7 @@ class TestChainSteps:
         with caplog.at_level(logging.INFO):
             assert chain.run(common=S1) is True
         assert chain.sent() == [(S1, S2), (S2, S3), (S3, S4), (S4, S5)]
-        assert chain.urls() == [f'?mode=fresh&from={a}' for a in (S1, S2, S3, S4)]
+        assert chain.urls() == [f'?mode=fresh&{frm(a)}' for a in (S1, S2, S3, S4)]
         assert chain.ws_cls.call_count == 4
         assert f'Sending 4 snapshots of pool/data to offsite: {S1} -> {S2} -> {S3} -> {S4} -> {S5}' in caplog.text
 
@@ -1500,7 +1524,7 @@ class TestResumeThenTheRestOfTheChain:
         chain = Chain(h5, mocker, sessions=6, negotiate=S2)
         with caplog.at_level(logging.INFO):
             assert chain.run(common=S1) is True
-        assert chain.urls() == [f'?mode=resume&from={S1}'] + [f'?mode=fresh&from={a}' for a in (S2, S3, S4)]
+        assert chain.urls() == [f'?mode=resume&{frm(S1)}'] + [f'?mode=fresh&{frm(a)}' for a in (S2, S3, S4)]
         h5.send_resume.assert_called_once_with(TOKEN_INCR)
         assert chain.sent() == [(S2, S3), (S3, S4), (S4, S5)]
         chain.negotiate.assert_called_once()
@@ -1625,7 +1649,7 @@ class TestResumeThenTheRestOfTheChain:
         chain = Chain(h5, mocker, sessions=6)
         assert chain.run(common=S1, mode='plain') is True
         h5.send_resume.assert_not_called()
-        assert chain.urls()[0] == f'?mode=fresh&from={S1}'
+        assert chain.urls()[0] == f'?mode=fresh&{frm(S1)}'
 
     def test_the_resume_is_zfs_send_t_with_no_flags(self, resumed_s2, mocker):
         chain = Chain(resumed_s2, mocker, sessions=6, negotiate=S2)
@@ -1847,7 +1871,7 @@ class TestAlreadyOnTheServer:
         h.decodes_to(toguid=222, fromguid=111)
         chain = Chain(h, mocker, negotiate=NEW)                   # the server now holds even NEW
         assert chain.run() is True
-        assert chain.ws_cls.call_count == 1 and chain.urls() == [f'?mode=resume&from={OLD}']
+        assert chain.ws_cls.call_count == 1 and chain.urls() == [f'?mode=resume&{frm(OLD)}']
         assert len(h.token_gets()) == 1       # no second token fetch
         assert h.order == [('pin', OLD, MID), 'send-t']                                # no second pin or send
         assert [c.args[1:] for c in h.set_anchor.call_args_list] == [('offsite', MID), ('offsite', NEW)]
@@ -1877,7 +1901,7 @@ class TestBackupDatasetPlumbing:
     def test_a_normal_cycle_sends_every_newer_snapshot_from_the_negotiated_one(self, wired):
         h, chain, cfg = wired
         assert h.rbm.backup_dataset(h.dsi, cfg) is True
-        assert chain.urls() == [f'?mode=fresh&from={OLD}', f'?mode=fresh&from={MID}']
+        assert chain.urls() == [f'?mode=fresh&{frm(OLD)}', f'?mode=fresh&{frm(MID)}']
         assert [c.args[1:] for c in h.set_anchor.call_args_list] == [('offsite', MID), ('offsite', NEW)]
 
     def test_the_send_mode_and_the_common_snapshot_reach_transfer(self, wired, mocker):
@@ -1903,7 +1927,7 @@ class TestBackupDatasetPlumbing:
         h.decodes_to(toguid=222, fromguid=111)
         assert h.rbm.backup_dataset(h.dsi, cfg, should_stop=lambda: False) is True
         # the interrupted OLD -> MID first, then (one re-negotiate) the chain on to NEW
-        assert chain.urls() == [f'?mode=resume&from={OLD}', f'?mode=fresh&from={MID}']
+        assert chain.urls() == [f'?mode=resume&{frm(OLD)}', f'?mode=fresh&{frm(MID)}']
         assert chain.negotiate.call_count == 2
 
     def test_a_skip_from_the_resume_token_is_false_and_leaves_everything(self, wired):
@@ -2069,7 +2093,7 @@ class TestTransfer:
         result = rbm._transfer(tr(), 'client1', dsi, latest, common, 'offsite', snapshots=[latest, common])
         assert result is True
         connect_url = mock_ws.connect.call_args[0][0]
-        assert connect_url.endswith('/stream?mode=fresh&from=autosnap_20240101120000')
+        assert connect_url.endswith(f'/stream?mode=fresh&{frm("autosnap_20240101120000")}')
 
 
 class TestBackupDataset:
@@ -2678,6 +2702,9 @@ class TestUrlRoundTripThroughTheServer:
         zset = mocker.patch('zfsbackup.api.zfs.set')
         mocker.patch('zfsbackup.api.zfs.list', return_value=[])
         mocker.patch('zfsbackup.api.read_zfsbackup_properties', return_value={})
+        # the dataset exists with a LOCAL client id (B-2c), the bound one
+        mocker.patch('zfsbackup.api.zfs.get.value', side_effect=get_value_answers(
+            {'org.zfsbackup:client_id': 'client-1'}))
 
         config = _make_config(
             datasets=[DatasetConfig(name='pool/my data', remote=[RemoteDatasetConfig(destination='offsite')])],
@@ -3125,7 +3152,7 @@ class TestTokenFlagMatrix:
         h5.decodes_to(toguid=222, fromguid=111, flags=frozenset({'rawok', 'compressok'}))
         chain = Chain(h5, mocker, sessions=6, negotiate=S2)
         assert chain.run(common=S1, mode='raw') is True
-        assert chain.urls()[0] == f'?mode=resume&from={S1}'
+        assert chain.urls()[0] == f'?mode=resume&{frm(S1)}'
         h5.send_resume.assert_called_once_with(TOKEN_INCR)
 
 
@@ -3393,7 +3420,7 @@ class TestModeFixedAcrossTheChain:
         assert chain.sent() == [(S1, S2), (S2, S3), (S3, S4), (S4, S5)]
         for call in h5.send_snapshot.call_args_list:
             assert {k: v for k, v in call.kwargs.items() if k != 'since'} == {'raw': True}
-        assert chain.urls() == [f'?mode=fresh&from={a}' for a in (S1, S2, S3, S4)]
+        assert chain.urls() == [f'?mode=fresh&{frm(a)}' for a in (S1, S2, S3, S4)]
 
     def test_every_step_of_a_plain_chain_is_L_and_c(self, h5, mocker):
         chain = Chain(h5, mocker, sessions=6, negotiate=S1)
@@ -3413,7 +3440,7 @@ class TestModeFixedAcrossTheChain:
         h5.decodes_to(toguid=222, fromguid=111, flags=frozenset({'rawok', 'compressok'}))
         chain = Chain(h5, mocker, sessions=6, negotiate=[S1, S2], relist=[raw_listing, plain_listing])
         assert h5.rbm.backup_dataset(h5.dsi, cfg_for(None)) is True
-        assert chain.urls()[0] == f'?mode=resume&from={S1}'
+        assert chain.urls()[0] == f'?mode=resume&{frm(S1)}'
         assert [s for s, _ in chain.sent()] == [S2, S3, S4]
         for call in h5.send_snapshot.call_args_list:
             assert {k: v for k, v in call.kwargs.items() if k != 'since'} == {'raw': True}
@@ -3427,7 +3454,7 @@ class TestModeFixedAcrossTheChain:
         chain = Chain(h5, mocker, sessions=6, negotiate=S1)
         assert h5.rbm.backup_dataset(h5.dsi, cfg_for(None)) is True
         h5.send_resume.assert_not_called()
-        assert chain.urls()[0] == f'?mode=fresh&from={S1}'
+        assert chain.urls()[0] == f'?mode=fresh&{frm(S1)}'
         assert h5.send_snapshot.call_args_list[0].kwargs['raw'] is True
 
 
@@ -3457,7 +3484,7 @@ class TestServerCopyMismatch:
         (rec,) = messages(caplog, 'nothing is sent', 'ERROR')
         text = rec.getMessage()
         assert f'is a {kind} copy' in text
-        assert f'zfs rename pool/b/client1/data pool/b/client1/data.{kind}-<date>' in text
+        assert 'zfs rename pool/b/client1/data' in text and 'outside the backup target' in text
         return text
 
     def test_a_plain_copy_while_sending_raw(self, h, mocker, caplog):
@@ -3558,7 +3585,7 @@ class TestServerCopyMismatch:
         with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
             h.rbm.backup_dataset(h.dsi, cfg_for(None))
         (rec,) = messages(caplog, 'nothing is sent', 'ERROR')
-        assert 'zfs rename tank/backups/client-a/data tank/backups/client-a/data.plain-<date>' in rec.getMessage()
+        assert 'zfs rename tank/backups/client-a/data' in rec.getMessage()
 
 
 # ===========================================================================
@@ -4758,3 +4785,1218 @@ class TestConnectRetryAfterASuccessfulStep:
         chain.run(common=S1)
         sizes = [round(d / CONNECT_RETRY_SLICE) for d in CONNECT_RETRY_DELAYS]
         assert sizes == [4, 8, 16] and len(sleeps.call_args_list) == sum(sizes)
+
+
+# ===========================================================================
+# B-2b: the server's `-F` must not roll back history this host cannot account for
+# ===========================================================================
+#
+# The server receives into an existing dataset with `-F`, which destroys every server snapshot
+# newer than the incremental base (OpenZFS 2.4.1: tests/fixtures/openzfs/*/M7.txt). A host that
+# rolled back (`zfs rollback -r`) or restored an older snapshot negotiates exactly like a host whose
+# last-sent snapshot was destroyed while it was being sent (the backstop), so the client decides
+# from local evidence (`_rollback_permit`) and tells the server in `discard` which snapshot it may
+# drop. Everything else is refused here, once per episode, before anything is sent or written.
+
+#: A managed name this host does not have (the server holds it), and its guid.
+GONE = 'autosnap_20240102130000'
+GONE_GUID = '777000000000000001'
+#: Another one, newer than S5, for the "latest == common" cases.
+GONE_NEWEST = 'autosnap_20240106120000'
+
+
+def entry(name=GONE, guid=GONE_GUID):
+    return {'name': name, 'guid': guid}
+
+
+def discard_q(*guids):
+    return '&discard=' + ','.join(guids)
+
+
+class TestServerNewerIsRecorded:
+    """`_negotiate` keeps what the server says about its newer snapshots; a reply without it
+    (an older server, no common snapshot) leaves nothing behind."""
+
+    def negotiate(self, h, **body):
+        h.rm.post(re.compile(r'.*/negotiate$'), json={'server_dataset': 'pool/b/c', **body})
+        return h.rbm._negotiate(h.transport, 'client1', h.dsi, h.snaps, 'offsite')
+
+    def recorded(self, h):
+        return h.rbm._server_newer[(h.dsi.name, 'offsite')]
+
+    def test_the_list_and_the_count_are_kept(self, h):
+        assert self.negotiate(h, common_snapshot=OLD, server_newer=[entry()], server_newer_count=1) == OLD
+        assert self.recorded(h) == (1, [entry()])
+
+    def test_a_reply_without_them_records_nothing(self, h):
+        self.negotiate(h, common_snapshot=OLD)
+        assert self.recorded(h) == (0, [])
+
+    def test_a_later_reply_without_them_forgets_the_earlier_ones(self, h):
+        self.negotiate(h, common_snapshot=OLD, server_newer=[entry()], server_newer_count=1)
+        self.negotiate(h, common_snapshot=OLD)
+        assert self.recorded(h) == (0, [])
+
+    def test_no_common_snapshot_records_nothing(self, h):
+        self.negotiate(h, common_snapshot=None, server_copy='plain')
+        assert self.recorded(h) == (0, [])
+
+    @pytest.mark.parametrize('count', ['1', 1.0, True, None, [1]])
+    def test_a_count_that_is_not_an_int_is_zero(self, h, count):
+        self.negotiate(h, common_snapshot=OLD, server_newer=[entry()], server_newer_count=count)
+        assert self.recorded(h) == (0, [entry()])
+
+    @pytest.mark.parametrize('newer', ['x', {'name': GONE}, 5, None])
+    def test_a_list_that_is_not_a_list_is_empty(self, h, newer):
+        self.negotiate(h, common_snapshot=OLD, server_newer=newer, server_newer_count=1)
+        assert self.recorded(h) == (1, [])
+
+    def test_it_is_kept_per_dataset_and_destination(self, h):
+        self.negotiate(h, common_snapshot=OLD, server_newer=[entry()], server_newer_count=1)
+        assert (h.dsi.name, 'dc2') not in h.rbm._server_newer
+
+
+class TestRollbackPermit:
+    """`backup_dataset` through the real `_negotiate` (the server's answer is a requests_mock route),
+    five local snapshots S1..S5, the server holding S1..S2 and the snapshot we lost."""
+
+    def cycle(self, h5, mocker, *, common=S2, newer=Harness.NOFIELD, count=Harness.NOFIELD,
+              anchor=S2, copy='plain', sessions=6, **kw):
+        h5.server_says(common=common, copy=copy, newer=newer, newer_count=count)
+        h5.get_local_anchor.return_value = anchor
+        chain = Chain(h5, mocker, sessions=sessions, negotiate=REAL)
+        return chain, h5.rbm.backup_dataset(h5.dsi, cfg_for(None), **kw)
+
+    def assert_refused(self, h5, chain, ok, caplog=None):
+        assert ok is False
+        chain.ws_cls.assert_not_called()
+        h5.nothing_started()                                   # no pin, no `zfs send`
+        assert not h5.token_gets()                             # nor a resume-token request
+        for m in (h5.set_anchor, h5.clear_anchor, h5.set_inflight, h5.clear_inflight):
+            m.assert_not_called()
+
+    # -- no permit needed -------------------------------------------------------------------
+
+    def test_nothing_newer_sends_without_a_discard(self, h5, mocker):
+        chain, ok = self.cycle(h5, mocker, newer=[], anchor=None)
+        assert ok is True
+        assert chain.urls() == [f'?mode=fresh&{frm(a)}' for a in (S2, S3, S4)]
+        assert all('discard' not in u for u in chain.urls())
+        h5.get_local_anchor.assert_not_called()
+
+    def test_an_older_server_that_reports_nothing_sends_as_before(self, h5, mocker):
+        chain, ok = self.cycle(h5, mocker)                     # no server_newer, no server_newer_count
+        assert ok is True
+        assert chain.urls() == [f'?mode=fresh&{frm(a)}' for a in (S2, S3, S4)]
+        h5.get_local_anchor.assert_not_called()
+
+    def test_garbage_in_the_new_fields_is_no_information(self, h5, mocker):
+        chain, ok = self.cycle(h5, mocker, newer='garbage', count='many')
+        assert ok is True and all('discard' not in u for u in chain.urls())
+
+    def test_no_common_snapshot_and_no_server_copy_is_the_ordinary_full_send(self, h5, mocker):
+        chain, ok = self.cycle(h5, mocker, common=None, copy='none', anchor=None)
+        assert ok is True
+        assert chain.sent() == [(None, S5)] and chain.urls() == ['?mode=fresh']
+
+    # -- the permitted case -------------------------------------------------------------------
+
+    def test_the_snapshot_we_lost_is_permitted_and_rides_every_stream_of_the_cycle(self, h5, mocker, caplog):
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, newer=[entry()], anchor=S2)
+        assert ok is True
+        assert chain.sent() == [(S2, S3), (S3, S4), (S4, S5)]
+        assert chain.urls() == [f'?mode=fresh&{frm(a)}{discard_q(GONE_GUID)}' for a in (S2, S3, S4)]
+        assert [c.args[1:] for c in h5.set_anchor.call_args_list] == [
+            ('offsite', S3), ('offsite', S4), ('offsite', S5)]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_local_anchor_is_read_for_this_dataset_and_destination(self, h5, mocker):
+        self.cycle(h5, mocker, newer=[entry()])
+        h5.get_local_anchor.assert_called_once_with(h5.dsi, 'offsite')
+
+    def test_the_effective_anchor_is_not_what_counts(self, h5, mocker, caplog):
+        """The anchor an ancestor passes down is not evidence about THIS dataset's own history (a
+        dataset restored under a new name inherits its parent's)."""
+        h5.get_anchor.return_value = S2                          # effective: inherited
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, newer=[entry()], anchor=None)   # local: unset
+        self.assert_refused(h5, chain, ok)
+        assert messages(caplog, 'snapshot(s) newer than', 'ERROR')
+
+    def test_the_resume_of_a_permitted_cycle_carries_the_discard_too(self, h5, mocker):
+        h5.token(TOKEN_INCR)
+        h5.decodes_to(toguid=222, fromguid=111)
+        h5.rm.post(re.compile(r'.*/negotiate$'), [
+            {'json': {'common_snapshot': S1, 'server_dataset': 'pool/b/c', 'server_copy': 'plain',
+                      'server_newer': [entry()], 'server_newer_count': 1}},
+            {'json': {'common_snapshot': S5, 'server_dataset': 'pool/b/c', 'server_copy': 'plain',
+                      'server_newer': [], 'server_newer_count': 0}},
+        ])
+        h5.get_local_anchor.return_value = S1
+        chain = Chain(h5, mocker, sessions=4, negotiate=REAL)
+        assert h5.rbm.backup_dataset(h5.dsi, cfg_for(None)) is True
+        assert chain.urls() == [f'?mode=resume&{frm(S1)}{discard_q(GONE_GUID)}']
+
+    # -- every refusal ----------------------------------------------------------------------------
+
+    REFUSALS = [
+        pytest.param(dict(anchor=S1), id='anchor-is-an-older-snapshot-than-common'),
+        pytest.param(dict(anchor=GONE), id='anchor-names-the-lost-snapshot'),
+        pytest.param(dict(anchor='autosnap_20990101000000'), id='anchor-names-a-snapshot-that-does-not-exist-here'),
+        pytest.param(dict(newer=[entry(GONE, '1152921504606846975')], anchor=S2, guid_of_local=S3),
+                     id='newer-entry-has-the-guid-of-a-local-snapshot'),
+        pytest.param(dict(anchor=None), id='anchor-missing'),
+        pytest.param(dict(anchor=''), id='anchor-empty'),
+        pytest.param(dict(newer=[entry(), entry('autosnap_20240102140000', '8')]), id='two-entries'),
+        pytest.param(dict(newer=[entry()], count=2), id='count-larger-than-the-list'),
+        pytest.param(dict(newer=[entry()], count=0), id='count-zero'),
+        pytest.param(dict(newer=[entry(), entry('autosnap_20240102140000', '8')], count=1), id='list-longer-than-count'),
+        pytest.param(dict(newer=[entry(S3, '5')]), id='the-newer-snapshot-is-a-local-one'),
+        pytest.param(dict(newer=[entry('manual-before-upgrade')]), id='unmanaged-name'),
+        pytest.param(dict(newer=[entry(GONE + '_keep')]), id='managed-prefix-with-a-suffix'),
+        pytest.param(dict(newer=[entry('autosnap_2024010213000')]), id='thirteen-digits'),
+        pytest.param(dict(newer=[entry('autosnap_202401021300000')]), id='fifteen-digits'),
+        pytest.param(dict(newer=[entry('autosnap_20241302130000')]), id='impossible-date'),
+        pytest.param(dict(newer=[entry('other_20240102130000')]), id='another-prefix'),
+        pytest.param(dict(newer=[entry('')]), id='empty-name'),
+        pytest.param(dict(newer=[entry(None)]), id='null-name'),
+        pytest.param(dict(newer=[entry(5)]), id='numeric-name'),
+        pytest.param(dict(newer=[entry(guid='abc')]), id='guid-alpha'),
+        pytest.param(dict(newer=[entry(guid='')]), id='guid-empty'),
+        pytest.param(dict(newer=[entry(guid='-1')]), id='guid-negative'),
+        pytest.param(dict(newer=[entry(guid='1e3')]), id='guid-exponent'),
+        pytest.param(dict(newer=[entry(guid='0x10')]), id='guid-hex'),
+        pytest.param(dict(newer=[entry(guid=' 7')]), id='guid-space'),
+        pytest.param(dict(newer=[entry(guid='7' * 21)]), id='guid-21-digits'),
+        pytest.param(dict(newer=[entry(guid=None)]), id='guid-null'),
+        pytest.param(dict(newer=[entry(guid=777)]), id='guid-a-number-not-a-string'),
+        pytest.param(dict(newer=[{'name': GONE}]), id='guid-missing'),
+        pytest.param(dict(newer=[{'guid': GONE_GUID}]), id='name-missing'),
+        pytest.param(dict(newer=['autosnap_20240102130000']), id='entry-is-a-string'),
+        pytest.param(dict(newer=[None]), id='entry-is-null'),
+    ]
+
+    @pytest.mark.parametrize('kw', REFUSALS)
+    def test_it_is_refused_with_one_error_and_nothing_sent_or_written(self, h5, mocker, caplog, kw):
+        kw = {'newer': [entry()], 'anchor': S2, **kw}
+        local = kw.pop('guid_of_local', None)
+        if local is not None:                          # the named entry carries a local snapshot's guid
+            kw['newer'] = [entry(GONE, str(by_name(h5.snaps, local).guid))]
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, **kw)
+        self.assert_refused(h5, chain, ok)
+        (rec,) = messages(caplog, 'snapshot(s) newer than', 'ERROR')
+        assert f'newer than {S2}' in rec.getMessage()
+
+    def test_the_error_tells_the_operator_what_to_do_for_one_snapshot(self, h5, mocker, caplog):
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, newer=[entry()], anchor=None)
+        (rec,) = messages(caplog, 'snapshot(s) newer than', 'ERROR')
+        text = rec.getMessage()
+        assert 'pool/data -> offsite' in text and 'pool/b/client1/data has 1 snapshot(s)' in text
+        assert f'newer than {S2}' in text and f'({GONE})' in text
+        assert 'nothing is sent' in text
+        assert 'zfs rename pool/b/client1/data <a name outside the backup target>' in text
+        assert f'zfs destroy pool/b/client1/data@{GONE} ' in text and '%' not in text
+        assert "README 'Rejoining'" in text
+
+    def test_the_error_for_several_names_gives_a_range(self, h5, mocker, caplog):
+        e2 = entry('autosnap_20240102140000', '8')
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, newer=[entry(), e2], anchor=S2)
+        (rec,) = messages(caplog, 'snapshot(s) newer than', 'ERROR')
+        assert f'has 2 snapshot(s) newer than {S2}' in rec.getMessage()
+        assert f'({GONE}…autosnap_20240102140000)' in rec.getMessage()
+        assert f'zfs destroy pool/b/client1/data@{GONE}%autosnap_20240102140000 ' in rec.getMessage()
+
+    def test_the_count_is_the_servers_even_when_the_list_is_capped(self, h5, mocker, caplog):
+        names = [entry(f'autosnap_2024020{i}120000', str(i)) for i in range(1, 5)]
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, newer=names, count=70, anchor=S2)
+        self.assert_refused(h5, chain, ok)
+        (rec,) = messages(caplog, 'snapshot(s) newer than', 'ERROR')
+        assert 'has 70 snapshot(s)' in rec.getMessage()
+
+    def test_a_truncated_list_asks_for_the_open_ended_destroy(self, h5, mocker, caplog):
+        """The server names at most 64 of them; the message must not pretend the named ones are all."""
+        names = [entry(f'autosnap_2024020{i}120000', str(i)) for i in range(1, 5)]
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, newer=names, count=70, anchor=S2)
+        (rec,) = messages(caplog, 'snapshot(s) newer than', 'ERROR')
+        text = rec.getMessage()
+        assert 'truncated' in text and 'autosnap_20240201120000' in text and 'autosnap_20240204120000' in text
+        assert 'zfs destroy pool/b/client1/data@autosnap_20240201120000%' in text
+        assert '%autosnap_20240204120000' not in text            # not a range that ends at the last NAMED one
+
+    def test_a_complete_list_asks_for_a_closed_range(self, h5, mocker, caplog):
+        names = [entry(f'autosnap_2024020{i}120000', str(i)) for i in range(1, 4)]
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, newer=names, anchor=S2)
+        (rec,) = messages(caplog, 'snapshot(s) newer than', 'ERROR')
+        assert 'zfs destroy pool/b/client1/data@autosnap_20240201120000%autosnap_20240203120000' in rec.getMessage()
+        assert 'truncated' not in rec.getMessage()
+
+    # -- rule 1: the local anchor names a live local snapshot at or past the common one -----------------
+
+    def test_a_live_anchor_newer_than_the_common_snapshot_is_permitted(self, h5, mocker):
+        """The server's pruner may have removed the base the backstop put the anchor back on, so the
+        common snapshot is older than the anchor; the anchor still names a snapshot we have."""
+        chain, ok = self.cycle(h5, mocker, common=S2, newer=[entry()], anchor=S3)
+        assert ok is True
+        assert all(u.endswith(discard_q(GONE_GUID)) for u in chain.urls()) and chain.urls()
+
+    def test_a_live_anchor_older_than_the_common_snapshot_is_refused(self, h5, mocker):
+        chain, ok = self.cycle(h5, mocker, common=S3, newer=[entry()], anchor=S2)
+        self.assert_refused(h5, chain, ok)
+
+    def test_an_anchor_whose_createtxg_is_unknown_is_refused(self, h5):
+        snaps = [sinfo(S3, txg=NO_TXG)] + [s for s in h5.snaps if s.name != S3]
+        h5.rbm._server_newer[(h5.dsi.name, 'offsite')] = (1, [entry()])
+        h5.get_local_anchor.return_value = S3
+        assert h5.rbm._rollback_permit(h5.dsi, 'offsite', by_name(snaps, S2), snaps) is None
+
+    def test_a_common_snapshot_whose_createtxg_is_unknown_is_refused(self, h5):
+        snaps = [sinfo(S2, txg=NO_TXG)] + [s for s in h5.snaps if s.name != S2]
+        h5.rbm._server_newer[(h5.dsi.name, 'offsite')] = (1, [entry()])
+        h5.get_local_anchor.return_value = S3
+        assert h5.rbm._rollback_permit(h5.dsi, 'offsite', by_name(snaps, S2), snaps) is None
+
+    def test_an_entry_with_the_guid_of_a_local_snapshot_is_refused_under_another_name(self, h5, mocker):
+        """A name can be reused for a different snapshot; a guid cannot."""
+        guid = str(by_name(h5.snaps, S4).guid)
+        chain, ok = self.cycle(h5, mocker, newer=[entry(GONE, guid)], anchor=S2)
+        self.assert_refused(h5, chain, ok)
+
+    def test_a_dry_run_with_a_permit_says_what_the_server_would_discard(self, h5, mocker, caplog):
+        h5.rbm.config.dry_run = True
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, newer=[entry()], anchor=S2)
+        (rec,) = messages(caplog, '[DRY RUN]')
+        assert 'discard' in rec.getMessage() and GONE in rec.getMessage()
+
+    def test_a_dry_run_without_a_permit_has_no_discard_clause(self, h5, mocker, caplog):
+        h5.rbm.config.dry_run = True
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, newer=[], anchor=None)
+        (rec,) = messages(caplog, '[DRY RUN]')
+        assert 'discard' not in rec.getMessage()
+
+    def test_a_refusal_in_the_other_destination_does_not_affect_this_one(self, h5, mocker):
+        """The record is per (dataset, destination)."""
+        chain, ok = self.cycle(h5, mocker, newer=[entry()], anchor=S2)
+        assert ok is True
+        assert ('pool/data', 'dc2') not in h5.rbm._server_newer
+
+    # -- once per episode ---------------------------------------------------------------------------
+
+    def test_the_error_is_logged_once_over_two_cycles(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, newer=[entry()], anchor=None)
+            chain, ok = self.cycle(h5, mocker, newer=[entry()], anchor=None)
+        assert ok is False
+        records = messages(caplog, 'snapshot(s) newer than')
+        assert [r.levelname for r in records] == ['ERROR', 'DEBUG']
+        assert records[0].getMessage() == records[1].getMessage()
+
+    def test_it_is_rearmed_by_a_cycle_that_passes_and_logs_again_when_it_comes_back(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, newer=[entry()], anchor=None)              # ERROR
+            chain, ok = self.cycle(h5, mocker, newer=[], sessions=8)          # operator fixed it: passes
+            assert ok is True
+            chain, ok = self.cycle(h5, mocker, newer=[entry()], anchor=None)  # a new episode
+        assert [r.levelname for r in messages(caplog, 'snapshot(s) newer than')] == ['ERROR', 'ERROR']
+
+    def test_a_different_situation_logs_again(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, newer=[entry()], anchor=None)
+            self.cycle(h5, mocker, newer=[entry(), entry('autosnap_20240102140000', '8')], anchor=None)
+        assert [r.levelname for r in messages(caplog, 'snapshot(s) newer than')] == ['ERROR', 'ERROR']
+
+    def test_a_permitted_cycle_also_rearms(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, newer=[entry()], anchor=None)
+            chain, ok = self.cycle(h5, mocker, newer=[entry()], anchor=S2, sessions=8)
+            assert ok is True
+            self.cycle(h5, mocker, newer=[entry()], anchor=None)
+        assert [r.levelname for r in messages(caplog, 'snapshot(s) newer than')] == ['ERROR', 'ERROR']
+
+    # -- the laundering case -------------------------------------------------------------------------
+
+    def test_latest_equal_to_common_with_newer_server_snapshots_and_no_anchor_does_not_settle(
+        self, h5, mocker, caplog
+    ):
+        """A rolled-back client whose newest snapshot is on the server: `_settle_up_to_date` would
+        write `latest` as the anchor (the anchor named a snapshot that no longer exists) and the
+        next cycle would look exactly like a backstop. The check runs first."""
+        h5.get_inflight.return_value = (S4, S5)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, common=S5, newer=[entry(GONE_NEWEST)], anchor=None)
+        self.assert_refused(h5, chain, ok)
+        h5.get_anchor.assert_not_called()                       # not even read: the settle did not run
+        h5.get_inflight.assert_not_called()
+        assert messages(caplog, 'snapshot(s) newer than', 'ERROR')
+
+    def test_latest_equal_to_common_with_a_stale_anchor_on_a_lost_snapshot_does_not_settle(self, h5, mocker):
+        """The anchor is the newest snapshot the host ever sent -- which a rollback destroyed."""
+        chain, ok = self.cycle(h5, mocker, common=S5, newer=[entry(GONE_NEWEST)], anchor=GONE_NEWEST)
+        self.assert_refused(h5, chain, ok)
+        h5.get_anchor.assert_not_called()
+
+    def test_latest_equal_to_common_with_a_genuine_backstop_anchor_settles_and_sends_nothing(self, h5, mocker):
+        h5.get_anchor.return_value = S5
+        chain, ok = self.cycle(h5, mocker, common=S5, newer=[entry(GONE_NEWEST)], anchor=S5)
+        assert ok is True
+        chain.ws_cls.assert_not_called()
+        h5.nothing_started()
+        h5.set_anchor.assert_not_called()                        # already right
+
+    # -- dry run ----------------------------------------------------------------------------------------
+
+    def test_a_dry_run_with_a_permit_plans_the_chain_and_writes_nothing(self, h5, mocker, caplog):
+        h5.rbm.config.dry_run = True
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, newer=[entry()], anchor=S2)
+        assert ok is True
+        assert f'[DRY RUN] Would send pool/data: {S2} -> {S3} -> {S4} -> {S5} (3 step(s))' in caplog.text
+        chain.ws_cls.assert_not_called()
+        h5.nothing_started()
+        for m in (h5.set_anchor, h5.clear_anchor, h5.set_inflight, h5.clear_inflight):
+            m.assert_not_called()
+
+    def test_a_dry_run_still_reports_a_refusal_and_writes_nothing(self, h5, mocker, caplog):
+        h5.rbm.config.dry_run = True
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, newer=[entry()], anchor=None)
+        self.assert_refused(h5, chain, ok)
+        assert messages(caplog, 'snapshot(s) newer than', 'ERROR')
+
+    # -- the pure function --------------------------------------------------------------------------------
+
+    def permit(self, h5, entries, count, common=S2, anchor=S2, server_copy=('plain', 'pool/b/c')):
+        h5.rbm._server_newer[(h5.dsi.name, 'offsite')] = (count, entries)
+        h5.rbm._server_info[(h5.dsi.name, 'offsite')] = server_copy
+        h5.get_local_anchor.return_value = anchor
+        return h5.rbm._rollback_permit(h5.dsi, 'offsite', by_name(h5.snaps, common), h5.snaps)
+
+    def test_the_result_is_a_tuple_of_the_guid_strings(self, h5):
+        assert self.permit(h5, [entry()], 1) == (GONE_GUID,)
+
+    def test_no_entries_is_the_empty_tuple_whatever_the_count(self, h5):
+        assert self.permit(h5, [], 0) == ()
+        assert self.permit(h5, [], 5) == ()           # nothing named: nothing to permit, the server decides
+
+    def test_a_missing_count_is_a_refusal_when_an_entry_is_named(self, h5):
+        h5.rbm._server_newer[(h5.dsi.name, 'offsite')] = (0, [entry()])
+        h5.get_local_anchor.return_value = S2
+        assert h5.rbm._rollback_permit(h5.dsi, 'offsite', by_name(h5.snaps, S2), h5.snaps) is None
+
+    def test_an_unknown_dataset_has_nothing_recorded(self, h5):
+        assert h5.rbm._rollback_permit(h5.dsi, 'dc2', by_name(h5.snaps, S2), h5.snaps) == ()
+
+
+class TestBackstopThenContinue:
+    """The backstop and the permit are two halves of one recovery. Cycle 1 sends S3, which a destroy
+    takes while it is being sent (the anchor goes back to the base S2, the server keeps S3). Cycle 2
+    finds S3 on the server and nowhere here: it sends the rest with `discard=<guid of S3>`, the
+    server (api.decide_receive) passes `-F`, and the anchor moves on."""
+
+    def test_two_cycles(self, h5, mocker, caplog, snapshot_presence):
+        anchors = {'offsite': S2}
+        h5.get_anchor.side_effect = lambda dsi, dest: anchors.get(dest)
+        h5.get_local_anchor.side_effect = lambda dsi, dest: anchors.get(dest)
+
+        def set_anchor(dsi, dest, name):
+            anchors[dest] = name
+            h5.events.append(('anchor', name))
+            return True
+
+        h5.set_anchor.side_effect = set_anchor
+        s3_guid = str(by_name(h5.snaps, S3).guid)
+
+        # cycle 1: the server holds S1, S2; S3 goes over and is then destroyed locally
+        h5.server_says(common=S2, copy='plain', newer=[])
+        snapshot_presence.gone.add(S3)
+        chain1 = Chain(h5, mocker, sessions=6, negotiate=REAL)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            assert h5.rbm.backup_dataset(h5.dsi, cfg_for(None)) is False
+        assert chain1.sent() == [(S2, S3)]                                   # and nothing after it
+        assert anchors['offsite'] == S2                                      # back on the base
+        assert [c.args[1:][1] for c in h5.set_anchor.call_args_list] == [S3, S2]
+        h5.clear_inflight.assert_not_called()                                # the pin is kept
+        assert messages(caplog, 'was destroyed while it was being sent', 'ERROR')
+        assert not messages(caplog, 'snapshot(s) newer than')
+
+        # cycle 2: S3 is gone here; the server still has it and says so
+        caplog.clear()
+        snapshot_presence.gone.clear()
+        h5.snaps = [s for s in h5.snaps if s.name != S3]
+        h5.latest = h5.snaps[0]
+        h5.send_snapshot.reset_mock()
+        h5.set_anchor.reset_mock()
+        h5.server_says(common=S2, copy='plain', newer=[entry(S3, s3_guid)])
+        chain2 = Chain(h5, mocker, sessions=6, negotiate=REAL)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            assert h5.rbm.backup_dataset(h5.dsi, cfg_for(None)) is True
+        assert chain2.sent() == [(S2, S4), (S4, S5)]
+        assert chain2.urls() == [f'?mode=fresh&{frm(S2)}{discard_q(s3_guid)}',
+                                 f'?mode=fresh&{frm(S4)}{discard_q(s3_guid)}']
+        assert anchors['offsite'] == S5
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_same_server_state_after_a_rollback_is_refused(self, h5, mocker, caplog):
+        """Same negotiate answer, but the anchor is the snapshot the host sent and then rolled
+        away (S4), not the common one."""
+        s3_guid = str(by_name(h5.snaps, S3).guid)
+        h5.snaps = [s for s in h5.snaps if s.name not in (S3, S4)]            # rolled back to S2, then S5 new
+        h5.latest = h5.snaps[0]
+        h5.server_says(common=S2, copy='plain', newer=[entry(S3, s3_guid)])
+        h5.get_local_anchor.return_value = S4
+        chain = Chain(h5, mocker, sessions=4, negotiate=REAL)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            assert h5.rbm.backup_dataset(h5.dsi, cfg_for(None)) is False
+        chain.ws_cls.assert_not_called()
+        h5.set_anchor.assert_not_called()
+        assert len(messages(caplog, 'snapshot(s) newer than', 'ERROR')) == 1
+
+
+def script_negotiate(h, *answers):
+    """Real `_negotiate`, answering from `answers`: `(common, newer entries or None)`, one per call."""
+    bodies = []
+    for common, newer in answers:
+        body = {'common_snapshot': common, 'server_dataset': 'pool/b/c', 'server_copy': 'plain'}
+        if newer is not None:
+            body['server_newer'] = newer
+            body['server_newer_count'] = len(newer)
+        bodies.append({'json': body})
+    h.rm.post(re.compile(r'.*/negotiate$'), bodies)
+
+
+class TestPermitAfterAResume:
+    """The permit is evaluated again after the post-resume re-negotiate: the answer can differ."""
+
+    @pytest.fixture
+    def resumed(self, h5):
+        h5.token(TOKEN_INCR)
+        h5.decodes_to(toguid=222, fromguid=111)
+        # the anchor the resumed step just wrote is what the second permit reads
+        h5.get_local_anchor.side_effect = lambda dsi, dest: (
+            h5.set_anchor.call_args.args[2] if h5.set_anchor.call_args else S1)
+        return h5
+
+    def test_the_second_negotiate_may_permit(self, resumed, mocker):
+        script_negotiate(resumed, (S1, []), (S2, [entry()]))
+        chain = Chain(resumed, mocker, sessions=6, negotiate=REAL)
+        assert resumed.rbm.backup_dataset(resumed.dsi, cfg_for(None)) is True
+        assert chain.urls() == [
+            f'?mode=resume&{frm(S1)}',                                        # step 0: nothing to permit yet
+            f'?mode=fresh&{frm(S2)}{discard_q(GONE_GUID)}',
+            f'?mode=fresh&{frm(S3)}{discard_q(GONE_GUID)}',
+            f'?mode=fresh&{frm(S4)}{discard_q(GONE_GUID)}',
+        ]
+
+    def test_the_second_negotiate_may_refuse_and_the_resume_is_kept(self, resumed, mocker, caplog):
+        script_negotiate(resumed, (S1, []), (S2, [entry(), entry('autosnap_20240102140000', '8')]))
+        chain = Chain(resumed, mocker, sessions=6, negotiate=REAL)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            assert resumed.rbm.backup_dataset(resumed.dsi, cfg_for(None)) is False
+        assert chain.ws_cls.call_count == 1                                   # only the resume
+        resumed.send_snapshot.assert_not_called()
+        assert [c.args[1:][1] for c in resumed.set_anchor.call_args_list] == [S2]
+        (rec,) = messages(caplog, 'snapshot(s) newer than', 'ERROR')
+        assert f'newer than {S2}' in rec.getMessage()
+
+    def test_the_second_negotiate_with_latest_equal_to_common_and_newer_snapshots_does_not_settle(
+        self, resumed, mocker
+    ):
+        resumed.get_local_anchor.side_effect = lambda dsi, dest: None
+        script_negotiate(resumed, (S1, []), (S5, [entry(GONE_NEWEST)]))
+        chain = Chain(resumed, mocker, sessions=6, negotiate=REAL)
+        assert resumed.rbm.backup_dataset(resumed.dsi, cfg_for(None)) is False
+        assert chain.ws_cls.call_count == 1
+        assert [c.args[1:][1] for c in resumed.set_anchor.call_args_list] == [S2]   # no settle write of S5
+
+    def test_a_server_copy_with_no_common_snapshot_after_the_resume_is_refused(self, resumed, mocker, caplog):
+        script_negotiate(resumed, (S1, []), (None, None))
+        chain = Chain(resumed, mocker, sessions=6, negotiate=REAL)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            assert resumed.rbm.backup_dataset(resumed.dsi, cfg_for(None)) is False
+        assert chain.ws_cls.call_count == 1
+        resumed.send_snapshot.assert_not_called()                              # no full stream
+        assert messages(caplog, 'none of them is a snapshot this host still has', 'ERROR')
+
+
+class TestNoCommonOntoACopyWithSnapshots:
+    """A4: no common snapshot, but the server copy holds snapshots. A full stream cannot replace
+    them (zfs refuses, with and without -F), so it used to start, and fail, every cycle."""
+
+    def cycle(self, h5, mocker, copy, sessions=3):
+        if copy == 'raw':                  # a raw copy is only "matching" for an encrypted dataset
+            encrypted_snaps(h5, 'aes-256-gcm', 'available', names=FIVE)
+        h5.server_says(common=None, copy=copy)
+        chain = Chain(h5, mocker, sessions=sessions, negotiate=REAL)
+        return chain, h5.rbm.backup_dataset(h5.dsi, cfg_for(None))
+
+    @pytest.mark.parametrize('copy', ['plain', 'raw'])
+    def test_it_is_refused_once_naming_zfs_rename_and_nothing_is_sent(self, h5, mocker, caplog, copy):
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, copy)
+        assert ok is False
+        chain.ws_cls.assert_not_called()
+        h5.nothing_started()
+        assert not h5.token_gets()
+        for m in (h5.set_anchor, h5.set_inflight, h5.clear_inflight):
+            m.assert_not_called()
+        (rec,) = messages(caplog, 'none of them is a snapshot this host still has', 'ERROR')
+        text = rec.getMessage()
+        assert 'pool/data -> offsite' in text and 'pool/b/client1/data' in text
+        assert 'a full stream cannot replace it' in text
+        assert 'zfs rename pool/b/client1/data <a name outside the backup target>' in text
+        assert "README 'Rejoining'" in text
+
+    @pytest.mark.parametrize('copy', ['none', Harness.NOFIELD])
+    def test_no_copy_or_an_older_server_is_the_ordinary_full_send(self, h5, mocker, copy):
+        chain, ok = self.cycle(h5, mocker, copy)
+        assert ok is True and chain.sent() == [(None, S5)]
+
+    def test_once_per_episode_and_rearmed_by_the_fix(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, 'plain')
+            self.cycle(h5, mocker, 'plain')
+            self.cycle(h5, mocker, 'none')                                     # the operator renamed it aside
+            self.cycle(h5, mocker, 'plain')
+        assert [r.levelname for r in messages(caplog, 'none of them is a snapshot')] == [
+            'ERROR', 'DEBUG', 'ERROR']
+
+    def test_it_is_separate_from_the_server_newer_episode(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, 'plain')
+            h5.server_says(common=S2, copy='plain', newer=[entry()])
+            Chain(h5, mocker, sessions=2, negotiate=REAL)
+            h5.get_local_anchor.return_value = None
+            h5.rbm.backup_dataset(h5.dsi, cfg_for(None))
+        assert len(messages(caplog, 'none of them is a snapshot', 'ERROR')) == 1
+        assert len(messages(caplog, 'snapshot(s) newer than', 'ERROR')) == 1
+
+    def test_a_dry_run_reports_it_and_writes_nothing(self, h5, mocker, caplog):
+        h5.rbm.config.dry_run = True
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, 'plain')
+        assert ok is False and messages(caplog, 'none of them is a snapshot', 'ERROR')
+        h5.set_anchor.assert_not_called()
+
+    def test_a_mode_mismatch_is_still_reported_first(self, h5, mocker, caplog):
+        """The server copy is raw but this host sends plain: that refusal (rename aside) comes before."""
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            h5.server_says(common=None, copy='raw')
+            Chain(h5, mocker, sessions=1, negotiate=REAL)
+            ok = h5.rbm.backup_dataset(h5.dsi, cfg_for(None))
+        assert ok is False
+        assert messages(caplog, 'is a raw copy but this dataset is now sent plain', 'ERROR')
+        assert not messages(caplog, 'none of them is a snapshot')
+
+
+class TestServerRefusesTheStream:
+    """A race the client's check cannot see (the server changed between negotiate and stream), or an
+    older client's view: the server answers with `reason` where the final ack should be."""
+
+    #: B-2b's four and the three of B-2a (the server read the stream's header: `stream_header`
+    #: not a plain single-snapshot stream, `base_mismatch` not the declared base, `type_mismatch`
+    #: a filesystem where a volume arrives or the reverse).
+    REASONS = ['server_newer', 'base_missing', 'no_common', 'listing',
+               'stream_header', 'base_mismatch', 'type_mismatch']
+    #: The operator hint appended to the server's text; none for the older four.
+    HINTS = {
+        'stream_header': 'compare `zfsbackupd --version` on both hosts',
+        'base_mismatch': 'compare `zfsbackupd --version` on both hosts',
+        'type_mismatch': '`zfs rename` it to a name outside the backup target',
+    }
+
+    def test_the_reasons_the_client_knows(self):
+        from zfsbackup.remote import _STREAM_REFUSAL_REASONS
+        assert set(_STREAM_REFUSAL_REASONS) == set(self.REASONS)
+        assert len(_STREAM_REFUSAL_REASONS) == len(self.REASONS)          # no duplicates
+
+    def test_exactly_the_new_reasons_carry_a_hint(self):
+        from zfsbackup.remote import _STREAM_REFUSAL_HINTS
+        assert set(_STREAM_REFUSAL_HINTS) == set(self.HINTS)
+        for reason, phrase in self.HINTS.items():
+            assert phrase in _STREAM_REFUSAL_HINTS[reason]
+
+    def refusal(self, reason='server_newer', **extra):
+        return {'error': f'pool/b/client1/data refused: {reason}', 'reason': reason, **extra}
+
+    def refused_chain(self, h5, mocker, reply, ack=True):
+        chain = Chain(h5, mocker, sessions=4)
+        ws = chain.sessions[0]
+        if ack:
+            ws.recv.side_effect = None
+            ws.recv.return_value = json.dumps(reply)
+        else:
+            ws.send_binary.side_effect = BrokenPipeError('broken pipe')
+            ws.recv.return_value = json.dumps(reply)
+        return chain
+
+    @pytest.mark.parametrize('ack', [True, False], ids=['at-the-ack', 'behind-a-failed-send'])
+    @pytest.mark.parametrize('reason', REASONS)
+    def test_it_is_an_error_naming_the_servers_text_and_nothing_moves(self, h5, mocker, caplog, reason, ack):
+        chain = self.refused_chain(h5, mocker, self.refusal(reason), ack)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            assert chain.run(common=S1) is False
+        assert chain.ws_cls.call_count == 1
+        (rec,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert f'refused pool/data -> offsite: pool/b/client1/data refused: {reason}' in rec.getMessage()
+        h5.set_anchor.assert_not_called()
+        h5.clear_inflight.assert_not_called()                      # the pin is kept
+        assert 'Transfer failed' not in caplog.text
+
+    @pytest.mark.parametrize('ack', [True, False], ids=['at-the-ack', 'behind-a-failed-send'])
+    @pytest.mark.parametrize('reason', REASONS)
+    def test_the_new_reasons_carry_an_operator_hint_and_the_old_ones_end_with_the_servers_text(
+        self, h5, mocker, caplog, reason, ack
+    ):
+        chain = self.refused_chain(h5, mocker, self.refusal(reason), ack)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            assert chain.run(common=S1) is False
+        (rec,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        text = rec.getMessage()
+        assert text.endswith(f'pool/b/client1/data refused: {reason}') != (reason in self.HINTS)
+        if reason in self.HINTS:
+            assert self.HINTS[reason] in text
+            assert f'pool/b/client1/data refused: {reason} (' in text      # the server's text, then the hint
+
+    @pytest.mark.parametrize('ack', [True, False], ids=['at-the-ack', 'behind-a-failed-send'])
+    @pytest.mark.parametrize('reason', ['server_newer', 'stream_header', 'base_mismatch', 'type_mismatch'])
+    def test_once_over_two_cycles_and_rearmed_by_an_acknowledged_stream(self, h5, mocker, caplog, ack, reason):
+        def run(reply=None):
+            chain = (self.refused_chain(h5, mocker, reply, ack) if reply is not None
+                     else Chain(h5, mocker, sessions=4))
+            return chain.run(common=S4)
+
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            assert run(self.refusal(reason)) is False
+            assert run(self.refusal(reason)) is False
+            assert run() is True                                  # an acknowledged stream
+            assert run(self.refusal(reason)) is False
+        records = messages(caplog, 'refused pool/data -> offsite')
+        assert [r.levelname for r in records] == ['ERROR', 'DEBUG', 'ERROR']
+
+    def test_a_different_reason_is_a_new_episode(self, h5, mocker, caplog):
+        """The dedup key holds the whole message, so a changed refusal logs again at ERROR."""
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            for reason in ('stream_header', 'stream_header', 'type_mismatch'):
+                assert self.refused_chain(h5, mocker, self.refusal(reason)).run(common=S4) is False
+        records = messages(caplog, 'refused pool/data -> offsite')
+        assert [r.levelname for r in records] == ['ERROR', 'DEBUG', 'ERROR']
+
+    def test_a_refusal_that_asks_to_retry_is_the_ordinary_quiet_stop(self, h5, mocker, caplog):
+        chain = self.refused_chain(h5, mocker, self.refusal(retry=True))
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain.run(common=S1)
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_another_reason_is_the_ordinary_transfer_failure(self, h5, mocker, caplog):
+        chain = self.refused_chain(h5, mocker, {'error': 'zfs receive failed', 'reason': 'whatever'})
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            assert chain.run(common=S1) is False
+        assert 'Transfer failed for pool/data: zfs receive failed' in caplog.text
+        assert 'refused pool/data -> offsite' not in caplog.text
+
+    def test_the_chain_stops_at_the_refusal(self, h5, mocker):
+        chain = self.refused_chain(h5, mocker, self.refusal())
+        assert chain.run(common=S1) is False
+        assert chain.sent() == [(S1, S2)]
+        assert chain.ws_cls.call_count == 1
+
+    def test_the_refusal_key_is_per_destination(self, h5, mocker, caplog):
+        chain = self.refused_chain(h5, mocker, self.refusal())
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            chain.run(common=S1)
+        assert ('pool/data [server refusal]', 'offsite') in h5.rbm._refusal_logged
+
+
+# ===========================================================================
+# B-2b review fixes: `server_newer_unknown`, an unreadable local anchor, the settle hardening
+# ===========================================================================
+
+
+def wire_anchor(h, anchor):
+    """Make the harness's anchor a real, mutable value: `get_anchor` / `get_local_anchor` read it,
+    `set_anchor` / `clear_anchor` change it. -> the `{destination: name}` dict."""
+    anchors = {'offsite': anchor} if anchor is not None else {}
+    h.get_anchor.side_effect = lambda dsi, dest: anchors.get(dest)
+    h.get_local_anchor.side_effect = lambda dsi, dest: anchors.get(dest)
+
+    def set_anchor(dsi, dest, name):
+        anchors[dest] = name
+        h.events.append(('anchor', name))
+        return True
+
+    h.set_anchor.side_effect = set_anchor
+    h.clear_anchor.side_effect = lambda dsi, dest: anchors.pop(dest, None)
+    return anchors
+
+
+def server_newer_status(h):
+    return h.rbm._server_newer_status[(h.dsi.name, 'offsite')]
+
+
+class TestServerNewerStatusIsRecorded:
+    """`_negotiate` records whether the server reported `server_newer` (`known`, an empty list too),
+    said it could not (`unknown`) or said nothing (`absent`: a server that predates B-2b)."""
+
+    def negotiate(self, h, **body):
+        h.rm.post(re.compile(r'.*/negotiate$'), json={'server_dataset': 'pool/b/c', **body})
+        return h.rbm._negotiate(h.transport, 'client1', h.dsi, h.snaps, 'offsite')
+
+    def test_a_list_is_known(self, h):
+        self.negotiate(h, common_snapshot=OLD, server_newer=[entry()], server_newer_count=1)
+        assert server_newer_status(h) == 'known'
+
+    def test_an_empty_list_is_known(self, h):
+        self.negotiate(h, common_snapshot=OLD, server_newer=[], server_newer_count=0)
+        assert server_newer_status(h) == 'known'
+
+    def test_the_count_alone_is_known(self, h):
+        self.negotiate(h, common_snapshot=OLD, server_newer_count=0)
+        assert server_newer_status(h) == 'known'
+
+    def test_the_marker_is_unknown_and_records_no_list(self, h):
+        assert self.negotiate(h, common_snapshot=OLD, server_newer_unknown=True) == OLD
+        assert server_newer_status(h) == 'unknown'
+        assert h.rbm._server_newer[(h.dsi.name, 'offsite')] == (0, [])
+
+    def test_neither_is_absent(self, h):
+        self.negotiate(h, common_snapshot=OLD)
+        assert server_newer_status(h) == 'absent'
+
+    def test_no_common_snapshot_and_no_fields_is_absent(self, h):
+        self.negotiate(h, common_snapshot=None, server_copy='plain')
+        assert server_newer_status(h) == 'absent'
+
+    @pytest.mark.parametrize('value', [False, 1, 'true', 'yes', None, [True]])
+    def test_only_the_literal_true_is_the_marker(self, h, value):
+        self.negotiate(h, common_snapshot=OLD, server_newer_unknown=value)
+        assert server_newer_status(h) == 'absent'
+
+    def test_the_marker_wins_over_a_list_beside_it(self, h):
+        """A contradictory reply must not be read as a trusted list."""
+        self.negotiate(h, common_snapshot=OLD, server_newer_unknown=True, server_newer=[entry()],
+                       server_newer_count=1)
+        assert server_newer_status(h) == 'unknown'
+
+    def test_each_negotiate_replaces_the_status_and_the_list(self, h):
+        """No `server_newer` leaks from one negotiate into the next."""
+        key = (h.dsi.name, 'offsite')
+        self.negotiate(h, common_snapshot=OLD, server_newer=[entry()], server_newer_count=1)
+        assert (server_newer_status(h), h.rbm._server_newer[key]) == ('known', (1, [entry()]))
+        self.negotiate(h, common_snapshot=OLD, server_newer_unknown=True)
+        assert (server_newer_status(h), h.rbm._server_newer[key]) == ('unknown', (0, []))
+        self.negotiate(h, common_snapshot=OLD, server_newer=[entry()], server_newer_count=1)
+        assert (server_newer_status(h), h.rbm._server_newer[key]) == ('known', (1, [entry()]))
+        self.negotiate(h, common_snapshot=OLD)
+        assert (server_newer_status(h), h.rbm._server_newer[key]) == ('absent', (0, []))
+
+    def test_it_is_kept_per_dataset_and_destination(self, h):
+        self.negotiate(h, common_snapshot=OLD, server_newer_unknown=True)
+        assert (h.dsi.name, 'dc2') not in h.rbm._server_newer_status
+
+
+class TestServerNewerUnknown:
+    """`_rollback_permit` with a common snapshot and the marker: the server could not say what is
+    newer, which is not "nothing newer". Nothing is sent, no anchor and no pin is written (an
+    anchor written now could launder a rollback into the backstop later), one WARNING per
+    episode, and the next cycle retries."""
+
+    TEXT = ('pool/data -> offsite: the server copy pool/b/client1/data could not list which of its '
+            f'snapshots are newer than {S2}, so nothing is sent and no anchor is written this cycle; '
+            'the next cycle retries')
+
+    def cycle(self, h5, mocker, *, unknown=True, common=S2, newer=Harness.NOFIELD, anchor=S2,
+              sessions=6, **kw):
+        h5.server_says(common=common, copy='plain', newer=newer, unknown=unknown)
+        h5.get_local_anchor.return_value = anchor
+        chain = Chain(h5, mocker, sessions=sessions, negotiate=REAL)
+        return chain, h5.rbm.backup_dataset(h5.dsi, cfg_for(None), **kw)
+
+    def assert_nothing_happened(self, h5, chain, ok):
+        assert ok is False
+        chain.ws_cls.assert_not_called()
+        h5.nothing_started()                                   # no pin, no `zfs send`
+        assert not h5.token_gets()
+        for m in (h5.set_anchor, h5.clear_anchor, h5.set_inflight, h5.clear_inflight):
+            m.assert_not_called()
+
+    def test_nothing_is_sent_written_or_pinned(self, h5, mocker):
+        chain, ok = self.cycle(h5, mocker)
+        self.assert_nothing_happened(h5, chain, ok)
+
+    def test_the_permit_is_none(self, h5):
+        h5.rbm._server_newer_status[(h5.dsi.name, 'offsite')] = 'unknown'
+        h5.rbm._server_info[(h5.dsi.name, 'offsite')] = ('plain', 'pool/b/client1/data')
+        assert h5.rbm._rollback_permit(h5.dsi, 'offsite', by_name(h5.snaps, S2), h5.snaps) is None
+        h5.get_local_anchor.assert_not_called()                # decided before the anchor is read
+
+    @pytest.mark.parametrize('anchor', [S2, S3, None, GONE], ids=['at-common', 'past-common', 'unset', 'lost'])
+    def test_whatever_the_anchor_says_nothing_is_sent(self, h5, mocker, anchor):
+        chain, ok = self.cycle(h5, mocker, anchor=anchor)
+        self.assert_nothing_happened(h5, chain, ok)
+
+    def test_it_is_one_warning_with_the_wording(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker)
+        (rec,) = messages(caplog, 'could not list which of its snapshots are newer')
+        assert rec.levelname == 'WARNING' and rec.getMessage() == self.TEXT
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not messages(caplog, 'snapshot(s) newer than')           # not the rollback refusal
+
+    def test_the_server_copy_name_is_the_servers(self, h5, mocker, caplog):
+        h5.server_says(common=S2, copy='plain', server_dataset='tank/elsewhere/data', unknown=True)
+        Chain(h5, mocker, sessions=2, negotiate=REAL)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            h5.rbm.backup_dataset(h5.dsi, cfg_for(None))
+        (rec,) = messages(caplog, 'could not list which', 'WARNING')
+        assert 'the server copy tank/elsewhere/data could not list' in rec.getMessage()
+
+    def test_one_warning_then_debug_over_repeated_cycles(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            for _ in range(3):
+                chain, ok = self.cycle(h5, mocker)
+                self.assert_nothing_happened(h5, chain, ok)
+        records = messages(caplog, 'could not list which of its snapshots are newer')
+        assert [r.levelname for r in records] == ['WARNING', 'DEBUG', 'DEBUG']
+        assert len({r.getMessage() for r in records}) == 1
+
+    def test_it_is_rearmed_by_a_normal_negotiate_and_logs_again_when_it_comes_back(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker)                                        # WARNING
+            chain, ok = self.cycle(h5, mocker, unknown=False, newer=[], sessions=8)   # healed: sends
+            assert ok is True and chain.sent() == [(S2, S3), (S3, S4), (S4, S5)]
+            self.cycle(h5, mocker)                                        # a new episode
+        assert [r.levelname for r in messages(caplog, 'could not list which of its snapshots are newer')] == [
+            'WARNING', 'WARNING']
+
+    def test_it_is_rearmed_by_a_cycle_without_a_common_snapshot_too(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker)
+            h5.server_says(common=None, copy='none')
+            Chain(h5, mocker, sessions=2, negotiate=REAL)
+            h5.rbm.backup_dataset(h5.dsi, cfg_for(None))
+            self.cycle(h5, mocker)
+        assert [r.levelname for r in messages(caplog, 'could not list which of its snapshots are newer')] == [
+            'WARNING', 'WARNING']
+
+    def test_it_ends_a_server_newer_refusal_episode(self, h5, mocker, caplog):
+        """The two episodes are separate: the rollback ERROR is logged again after the marker cycle."""
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker, unknown=False, newer=[entry()], anchor=None)       # ERROR
+            self.cycle(h5, mocker)                                                    # WARNING
+            self.cycle(h5, mocker, unknown=False, newer=[entry()], anchor=None)       # ERROR again
+        assert [r.levelname for r in messages(caplog, 'snapshot(s) newer than')] == ['ERROR', 'ERROR']
+        assert [r.levelname for r in messages(caplog, 'could not list which')] == ['WARNING']
+
+    def test_a_dry_run_reports_it_and_writes_nothing(self, h5, mocker, caplog):
+        h5.rbm.config.dry_run = True
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker)
+        self.assert_nothing_happened(h5, chain, ok)
+        assert messages(caplog, 'could not list which', 'WARNING')
+        assert not messages(caplog, '[DRY RUN]')
+
+    def test_the_marker_leaves_no_list_behind_for_the_next_negotiate(self, h5, mocker):
+        """A trusted `server_newer` from an earlier cycle must not survive a marker cycle and
+        permit a discard (or a refusal) in a later one."""
+        chain, ok = self.cycle(h5, mocker, unknown=False, newer=[entry()], anchor=S2, sessions=8)
+        assert ok is True and all(u.endswith(discard_q(GONE_GUID)) for u in chain.urls())
+        self.cycle(h5, mocker)                                                        # the marker
+        assert h5.rbm._server_newer[(h5.dsi.name, 'offsite')] == (0, [])
+        chain, ok = self.cycle(h5, mocker, unknown=False, newer=[], sessions=8)       # nothing newer now
+        assert ok is True and chain.urls() and all('discard' not in u for u in chain.urls())
+
+    def test_a_marker_without_a_common_snapshot_changes_nothing(self, h5, mocker):
+        """The server only sends the marker with a common snapshot; if it ever came without, the
+        ordinary full send decides (no server copy here)."""
+        h5.server_says(common=None, copy='none', unknown=True)
+        chain = Chain(h5, mocker, sessions=2, negotiate=REAL)
+        assert h5.rbm.backup_dataset(h5.dsi, cfg_for(None)) is True
+        assert chain.sent() == [(None, S5)]
+
+
+class TestLaunderingARollbackIntoABackstop:
+    """The scenario the marker exists for. The host sent S1..S4 (anchor S4), then rolled back to S3
+    (S4 is destroyed here, the server still has it). If the first cycle after that, with a server
+    that cannot say what is newer, wrote an anchor, the anchor would name a live local snapshot at
+    the common one, and the next cycle (the server can list now: S4 is newer) would read the
+    rollback as a backstop and send `discard=<guid of S4>`, making the server destroy history the
+    host knows nothing about.
+
+    Two layouts: `new-snapshot` (a snapshot S5 was taken after the rollback, so there is something
+    to send: the marker handling in `_rollback_permit` is what stops it) and `up-to-date` (the
+    newest local snapshot IS the common one, so only bookkeeping would run: `_settle_up_to_date`
+    would overwrite the anchor). The marker handling returns first in both, so the settle hardening is
+    a second line that the layouts cannot reach alone: `TestSettleHardening` pins it directly."""
+
+    LAYOUTS = {
+        'new-snapshot': (S1, S2, S3, S5),
+        'up-to-date': (S1, S2, S3),
+    }
+
+    @pytest.fixture(params=sorted(LAYOUTS))
+    def rolled_back(self, h5, request):
+        names = self.LAYOUTS[request.param]
+        h5.snaps = [s for s in h5.snaps if s.name in names]
+        h5.latest = h5.snaps[0]
+        h5.layout = request.param
+        h5.s4_guid = str(sinfo(S4).guid)
+        h5.anchors = wire_anchor(h5, S4)
+        return h5
+
+    def cycle(self, h, mocker, **server):
+        h.server_says(common=S3, copy='plain', **server)
+        chain = Chain(h, mocker, sessions=4, negotiate=REAL)
+        return chain, h.rbm.backup_dataset(h.dsi, cfg_for(None))
+
+    def test_the_marker_cycle_leaves_the_anchor_and_the_trusted_cycle_sends_no_discard(
+        self, rolled_back, mocker, caplog
+    ):
+        h = rolled_back
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain1, ok1 = self.cycle(h, mocker, unknown=True)
+            assert ok1 is False
+            assert h.anchors == {'offsite': S4}                                # untouched
+            chain1.ws_cls.assert_not_called()
+            h.nothing_started()
+            h.set_anchor.assert_not_called()
+            assert [r.levelname for r in messages(caplog, 'could not list which')] == ['WARNING']
+
+            chain2, ok2 = self.cycle(h, mocker, newer=[entry(S4, h.s4_guid)])
+        assert ok2 is False
+        chain2.ws_cls.assert_not_called()                                      # so no `discard` anywhere
+        h.nothing_started()
+        assert chain1.urls() == chain2.urls() == []
+        assert h.anchors == {'offsite': S4}
+        h.set_anchor.assert_not_called()
+        (rec,) = messages(caplog, 'snapshot(s) newer than', 'ERROR')           # the rollback is refused
+        assert f'newer than {S3}' in rec.getMessage() and f'({S4})' in rec.getMessage()
+
+    def test_the_trusted_cycle_alone_refuses_the_same_rollback(self, rolled_back, mocker, caplog):
+        """The control: with no marker cycle first, the anchor S4 names a snapshot this host no longer
+        has, so the rollback is not a backstop."""
+        h = rolled_back
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h, mocker, newer=[entry(S4, h.s4_guid)])
+        assert ok is False
+        chain.ws_cls.assert_not_called()
+        assert len(messages(caplog, 'snapshot(s) newer than', 'ERROR')) == 1
+
+    def test_the_marker_cycle_alone_never_makes_a_later_backstop_look_genuine(self, rolled_back, mocker):
+        h = rolled_back
+        self.cycle(h, mocker, unknown=True)
+        assert h.rbm.local_manager.get_local_anchor(h.dsi, 'offsite') == S4
+        assert h.rbm._rollback_permit(
+            h.dsi, 'offsite', by_name(h.snaps, S3), h.snaps) is None
+
+
+class TestAnUnreadableLocalAnchorIsNotARollback:
+    """Fix 3: `get_local_anchor` raises `LocalAnchorUnreadable` when zfs fails. In the backstop
+    case (the server names exactly one newer snapshot and every other check passed) the read
+    decides, so a failed read is a WARNING and a skipped cycle -- not the rollback ERROR, which
+    would send the operator to destroy a snapshot over a transient zfs failure."""
+
+    ERROR = 'cannot open pool/data: pool I/O is currently suspended'
+    TEXT = ('pool/data -> offsite: cannot read the local anchor property org.zfsbackup:anchor.offsite '
+            f'({ERROR}), which decides whether the server may discard its newer snapshot; '
+            'nothing is sent this cycle')
+
+    def cycle(self, h5, mocker, *, failing=True, newer=None, sessions=6):
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        h5.server_says(common=S2, copy='plain', newer=[entry()] if newer is None else newer)
+        if failing:
+            h5.get_local_anchor.side_effect = LocalAnchorUnreadable(self.ERROR)
+        else:
+            h5.get_local_anchor.side_effect = None
+            h5.get_local_anchor.return_value = S2
+        chain = Chain(h5, mocker, sessions=sessions, negotiate=REAL)
+        return chain, h5.rbm.backup_dataset(h5.dsi, cfg_for(None))
+
+    def test_nothing_is_sent_and_nothing_is_written(self, h5, mocker):
+        chain, ok = self.cycle(h5, mocker)
+        assert ok is False
+        chain.ws_cls.assert_not_called()
+        h5.nothing_started()
+        assert not h5.token_gets()
+        for m in (h5.set_anchor, h5.clear_anchor, h5.set_inflight, h5.clear_inflight):
+            m.assert_not_called()
+
+    def test_it_is_one_warning_and_no_rollback_error(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker)
+        (rec,) = messages(caplog, 'cannot read the local anchor property')
+        assert rec.levelname == 'WARNING' and rec.getMessage() == self.TEXT
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not messages(caplog, 'snapshot(s) newer than')
+        assert 'zfs destroy' not in caplog.text and 'zfs rename' not in caplog.text
+
+    def test_the_destination_is_in_the_property_name_of_the_warning(self, h5, mocker, caplog):
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker)
+        assert 'org.zfsbackup:anchor.offsite' in caplog.text
+
+    def test_one_warning_then_debug_over_repeated_cycles(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            for _ in range(3):
+                chain, ok = self.cycle(h5, mocker)
+                assert ok is False
+        records = messages(caplog, 'cannot read the local anchor property')
+        assert [r.levelname for r in records] == ['WARNING', 'DEBUG', 'DEBUG']
+
+    def test_it_is_rearmed_once_the_anchor_reads_again(self, h5, mocker, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker)                                              # WARNING
+            chain, ok = self.cycle(h5, mocker, failing=False, sessions=8)       # reads: a genuine backstop
+            assert ok is True and chain.urls()
+            assert all(u.endswith(discard_q(GONE_GUID)) for u in chain.urls())
+            self.cycle(h5, mocker)                                              # a new episode
+        assert [r.levelname for r in messages(caplog, 'cannot read the local anchor property')] == [
+            'WARNING', 'WARNING']
+
+    def test_it_is_rearmed_by_a_rollback_refusal_too(self, h5, mocker, caplog):
+        """Unreadable, then readable but not at/past common (a rollback: ERROR), then unreadable again."""
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            self.cycle(h5, mocker)
+            h5.get_local_anchor.side_effect = None
+            h5.get_local_anchor.return_value = None
+            h5.server_says(common=S2, copy='plain', newer=[entry()])
+            Chain(h5, mocker, sessions=2, negotiate=REAL)
+            assert h5.rbm.backup_dataset(h5.dsi, cfg_for(None)) is False
+            self.cycle(h5, mocker)
+        assert [r.levelname for r in messages(caplog, 'cannot read the local anchor property')] == [
+            'WARNING', 'WARNING']
+        assert [r.levelname for r in messages(caplog, 'snapshot(s) newer than')] == ['ERROR']
+
+    def test_a_certain_refusal_is_not_masked_by_an_unreadable_anchor(self, h5, mocker, caplog):
+        """The anchor is only read when every other check passed; a name that is not a managed one is
+        refused whatever the anchor says (and the read is not even attempted)."""
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, newer=[entry('manual-before-upgrade')])
+        assert ok is False
+        chain.ws_cls.assert_not_called()
+        h5.get_local_anchor.assert_not_called()
+        assert len(messages(caplog, 'snapshot(s) newer than', 'ERROR')) == 1
+        assert not messages(caplog, 'cannot read the local anchor property')
+
+    def test_two_newer_snapshots_never_read_the_anchor(self, h5, mocker, caplog):
+        with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, newer=[entry(), entry('autosnap_20240102140000', '8')])
+        assert ok is False
+        h5.get_local_anchor.assert_not_called()
+        assert len(messages(caplog, 'snapshot(s) newer than', 'ERROR')) == 1
+
+    def test_no_newer_snapshots_never_read_the_anchor(self, h5, mocker):
+        chain, ok = self.cycle(h5, mocker, newer=[], sessions=8)
+        assert ok is True
+        h5.get_local_anchor.assert_not_called()
+
+    def test_the_effective_anchor_failing_is_unaffected(self, h5, mocker):
+        """Only the local reader raises; `get_anchor` keeps its own behaviour (a mock here)."""
+        h5.get_anchor.return_value = None
+        chain, ok = self.cycle(h5, mocker, failing=False, sessions=8)
+        assert ok is True
+
+
+class TestSettleHardening:
+    """`_settle_up_to_date`: when the anchor names a snapshot that is not in the local listing
+    (a rollback, an in-place restore, or the pruner after a backstop) and the server reported
+    its B-2b state (`known` or `unknown`), moving the anchor to `latest` could let a later cycle
+    mistake the rollback for the backstop: nothing is written and the pin stays. A server that
+    predates B-2b (`absent`) keeps the old overwrite."""
+
+    def run(self, h5, mocker, anchor, status, pin=(S4, S5), dry=False):
+        h5.get_anchor.return_value = anchor
+        h5.get_inflight.return_value = pin
+        h5.rbm.config.dry_run = dry
+        if status is not None:
+            h5.rbm._server_newer_status[(h5.dsi.name, 'offsite')] = status
+        chain = Chain(h5, mocker, sessions=1)
+        return chain.run(common=S5)
+
+    @pytest.mark.parametrize('status', ['known', 'unknown'])
+    def test_an_anchor_not_in_the_listing_is_left_and_the_pin_stays(self, h5, mocker, caplog, status,
+                                                                    snapshot_presence):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            assert self.run(h5, mocker, anchor=GONE, status=status) is True
+        h5.set_anchor.assert_not_called()
+        h5.clear_anchor.assert_not_called()
+        h5.clear_inflight.assert_not_called()
+        assert snapshot_presence.calls == []                       # returned before the pin check
+        (rec,) = messages(caplog, 'names a snapshot this host does not have')
+        assert rec.levelname == 'DEBUG' and GONE in rec.getMessage()
+        assert not [r for r in caplog.records if r.levelno >= logging.INFO and r.name == 'zfsbackup.remote']
+
+    @pytest.mark.parametrize('status', ['absent', None], ids=['absent', 'never-negotiated'])
+    def test_an_old_server_keeps_the_overwrite(self, h5, mocker, status, snapshot_presence):
+        assert self.run(h5, mocker, anchor=GONE, status=status) is True
+        assert [c.args[1:][1] for c in h5.set_anchor.call_args_list] == [S5]
+        h5.clear_inflight.assert_called_once()
+
+    @pytest.mark.parametrize('status', ['known', 'unknown', 'absent'])
+    def test_no_anchor_at_all_is_still_written(self, h5, mocker, status, snapshot_presence):
+        assert self.run(h5, mocker, anchor=None, status=status) is True
+        assert [c.args[1:][1] for c in h5.set_anchor.call_args_list] == [S5]
+        h5.clear_inflight.assert_called_once()
+
+    @pytest.mark.parametrize('status', ['known', 'unknown', 'absent'])
+    def test_an_older_local_anchor_is_still_moved_forward(self, h5, mocker, status, snapshot_presence):
+        assert self.run(h5, mocker, anchor=S4, status=status) is True
+        assert [c.args[1:][1] for c in h5.set_anchor.call_args_list] == [S5]
+        h5.clear_inflight.assert_called_once()
+
+    @pytest.mark.parametrize('status', ['known', 'unknown', 'absent'])
+    def test_the_right_anchor_is_untouched_and_the_pin_released(self, h5, mocker, status, snapshot_presence):
+        assert self.run(h5, mocker, anchor=S5, status=status) is True
+        h5.set_anchor.assert_not_called()
+        h5.clear_inflight.assert_called_once()
+
+    @pytest.mark.parametrize('status', ['known', 'unknown', 'absent'])
+    def test_a_dry_run_writes_nothing_whatever_the_status(self, h5, mocker, status):
+        assert self.run(h5, mocker, anchor=GONE, status=status, dry=True) is True
+        for m in (h5.set_anchor, h5.clear_anchor, h5.clear_inflight):
+            m.assert_not_called()
+
+    def test_an_empty_listing_does_not_trigger_it(self, h5, mocker, snapshot_presence):
+        """`snapshots` empty: there is nothing to compare the anchor with, the old path runs."""
+        h5.get_anchor.return_value = GONE
+        h5.rbm._server_newer_status[(h5.dsi.name, 'offsite')] = 'known'
+        h5.rbm._settle_up_to_date(h5.dsi, h5.latest, 'offsite', [])
+        assert [c.args[1:][1] for c in h5.set_anchor.call_args_list] == [S5]
+
+    def test_the_status_is_per_destination(self, h5, mocker, snapshot_presence):
+        h5.rbm._server_newer_status[(h5.dsi.name, 'dc2')] = 'known'
+        assert self.run(h5, mocker, anchor=GONE, status=None) is True    # offsite never negotiated
+        assert [c.args[1:][1] for c in h5.set_anchor.call_args_list] == [S5]
+
+    # -- end to end through `backup_dataset` -----------------------------------------------------------------
+
+    def cycle(self, h5, mocker, **server):
+        h5.snaps = [s for s in h5.snaps if s.name in (S1, S2, S3)]       # S4 and S5 are gone locally
+        h5.latest = h5.snaps[0]
+        anchors = wire_anchor(h5, S4)
+        h5.get_inflight.return_value = (S2, S3)
+        h5.server_says(common=S3, copy='plain', **server)
+        chain = Chain(h5, mocker, sessions=2, negotiate=REAL)
+        return chain, h5.rbm.backup_dataset(h5.dsi, cfg_for(None)), anchors
+
+    def test_a_trusted_empty_list_with_a_lost_anchor_leaves_it(self, h5, mocker, snapshot_presence):
+        chain, ok, anchors = self.cycle(h5, mocker, newer=[])
+        assert ok is True
+        chain.ws_cls.assert_not_called()
+        assert anchors == {'offsite': S4}
+        h5.set_anchor.assert_not_called()
+        h5.clear_inflight.assert_not_called()
+
+    def test_an_old_server_with_a_lost_anchor_overwrites_it(self, h5, mocker, snapshot_presence):
+        chain, ok, anchors = self.cycle(h5, mocker)                      # no server_newer fields at all
+        assert ok is True
+        chain.ws_cls.assert_not_called()
+        assert anchors == {'offsite': S3}
+        h5.clear_inflight.assert_called_once()

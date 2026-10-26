@@ -177,6 +177,13 @@ concurrency reviewer also reviews the item.
    - C23: two-VM scenario R (restore), after B-5 (and S-6);
    - C24: release checklist and report rewrites.
 
+**Carried into C7's restore runbook (from the C8 concurrency review):** restoring a config-DB backup brings back
+consumed enrollment tokens and revoked or retired fingerprints, which breaks "revocation is permanent": after a
+restore, re-apply every revocation made since the backup (`trust list` on the live DB first, then `trust revoke`),
+or restore only on a host whose trust state has not changed. API-worker trust writes (`/enroll`, `/rotate`) can
+also land between a pre-migration backup and the upgrade. `zfsbackup-config backup` is a writer-or-root
+operation.
+
 Appendix C1 has the full items; Appendix C2 has the changes made after the milestone D input (restore that
 holds before and after B-2a, the S-8 contract, B-6 first without status files, C0).
 
@@ -209,16 +216,36 @@ holds before and after B-2a, the S-8 contract, B-6 first without status files, C
    - the D7 hung-pool test on a disposable `zfsb-hang` VM;
    - L1's stale "receive -x" wording.
 6. **Carried in from milestone B's final review (2026-10-22):**
-   - **B-2b must keep the chain recoverable.** The milestone-B anchor backstop puts the anchor back on the base
+   - **RESOLVED in milestone C (2026-10-22): B-2b was pulled forward** after scenario R2c showed the data loss;
+     the backstop stays recoverable through the client's `discard` permit (CLAUDE.md, remote paragraph).
+     Original note: **B-2b must keep the chain recoverable.** The milestone-B anchor backstop puts the anchor back on the base
      when a just-sent snapshot vanished on the client, while the server keeps it; the next `-i base …` works only
      because `-F` rolls that server-only snapshot back. With "`-F` only onto a dataset with no snapshots" that
      becomes a permanent "does not match incremental source" stall, so B-2b needs a rule for it (e.g. allow `-F`
      when the server's newest snapshot is newer than the incremental's base and was never anchored by the client).
-     Likewise, a full send when no common snapshot exists still runs `-F` onto an existing server copy, which can
-     wipe its history on an unencrypted target (carried from milestone A).
+     A full send when no common snapshot exists still passes `-F` onto an existing server copy, but zfs refuses it
+     ("destination has snapshots … must destroy them to overwrite it", checked on OpenZFS 2.4.1, 2026-10-22), so
+     history is never wiped; the client is refused each cycle until the operator renames the copy aside.
    - **S-3: the R0 pending map is evicted globally** (LRU, 4096 entries): an enrolled client negotiating thousands
      of names can evict other clients' entries (their next stream is refused with "negotiate again", retryable).
      Out of scope under Q1, but cap it per client id when S-3 adds per-client limits.
+   - **S-14 inputs from the D6/D7 concurrency review (2026-10-25):** the stuck-child registry is per process, so
+     one hung pool makes every timed call in that API worker fail fast (503 retry) until its stuck child exits,
+     healthy pools included (DD4 as designed); a respawned API worker starts with an empty registry, so each
+     incarnation can add up to its concurrency in new D-state `zfs` processes; the budget is per command, so a
+     handler making N calls can take N × (30 + 4) s: give each handler one overall budget if that matters.
+     `send.resume_info` and `StreamHandle.close` are not bounded by `timeout()`.
+   - **S-3: fold in S-12's validity WARNING** (from the S-12 review, 2026-10-25): `_ValidityWarnThrottle` bounds
+     memory (256 peers) but not log volume; a holder of a former client's expired pinned certificate (its key is
+     not needed: the certificate is checked before the possession proof) cycling through source addresses logs one
+     WARNING per connection. Expired pins stay in the trust store. Give it S-3's global per-interval cap.
+   - **Deferred from the B-2b reviews (2026-10-22):** (a) `-F` is decided from a listing but applied by the kernel at
+     the end of the receive, so a snapshot that appears on the server copy mid-receive (an operator's `zfs snapshot
+     -r`, or an orphaned `zfs receive` of a previous API worker committing late) is destroyed unpermitted; fix by
+     passing `-F` only when needed (the permitted discard, or a head modified since the base) and verify a resume
+     without `-F` first (M7 U2 shows it fails when newer snapshots exist); README documents the residual. (b) Check
+     the stream's DRR_BEGIN `drr_fromguid` against the declared `from_guid` before spawning `zfs receive`. (c) An
+     exiting API worker should reap its `zfs receive` children before it exits.
    - **A child backed up before its parent** is handled by the remote worker sending parents first (milestone B);
      a parent added to the config after its child has been backed up still meets the placeholder refusal, which
      needs the operator's rename (documented in the runbook, milestone C's B-9).
@@ -1167,7 +1194,7 @@ B-9 can be written so it is correct whether or not B-2a has landed. That keeps t
   - Raw restores: `zfs load-key` with the client's original key, then `zfs mount`.
 - **Seed and rejoin (needs verifying in R2):**
   - An in-place restore lets the client resume incrementals only if it restores the **server's newest** snapshot.
-  - If it restores an older one, the next client → server incremental has a base that is not the server's most recent snapshot. That fails today, since `-F` only rolls back to the most recent snapshot, and it fails after B-2b too. The runbook then says to rename the server copy aside (see 2).
+  - If it restores an older one, the next client → server incremental has a base that is not the server's most recent snapshot. (Correction, 2026-10-22: this did NOT fail before B-2b. `-F` on a `-i` receive destroyed every server snapshot newer than the base, on 2.1, 2.2 and 2.4; captures M7. Since B-2b the server refuses it.) The runbook says to rename the server copy aside (see 2), or destroy the newer snapshots if they are expendable.
 - **Holds:** after B-2a the server has none (`-h`), so restore needs no `zfs release` step.
 
 **Changes to scenario R (C23, `real-zfs-scenario-dev`):**
@@ -1695,6 +1722,16 @@ This is a proposal. I edited no files. The baseline is `prod-trust-boundary` wit
   - Feed both `_list` (`:750-802`) and the S3 group iterator, keeping the scope and type checks as defence in depth. Do not use `-p`, so values match the `-H` path.
   - Lazy mode parses the whole document, then yields.
 - **Verify:** a parity test (the same pool read through `-j` and `-H` gives the same objects and rows) on zfsb-zfs24; the fallback on zfsb-zfs21/22; mocked tests from the captured documents.
+- **Decided 2026-10-25: deferred past 1.0, no `-j` code.** The S4a captures (`tests/fixtures/openzfs/*/M9.txt`,
+  section M9 of `scenarios/test_openzfs_matrix.sh`) refute the premise that `-j` is a safer path:
+  1. on 2.1/2.2 `zfs version -j` exits 0 and prints plain text, so a probe must parse stdout, not trust the rc;
+  2. on 2.4.1 `-j` output is silently truncated (rc 0, empty stderr, invalid JSON) at the first value it cannot
+     encode: any `\xff` in every locale, and any non-ASCII value under `LC_ALL=C`, which libzfseasy always sets;
+  3. `--json-int` clamps guids at or above 2^63 to 9223372036854775807;
+  4. there is no equivalent of the `received` column (a `RECEIVED` source shows its value only with
+     `-o received`, and a locally overridden received value is not shown at all);
+  5. a multi-target `-j` call with one missing target prints nothing for the others (rc 1).
+  The only gain would be ASCII values containing a newline or tab, which the `-H` path already refuses fail-closed.
 
 #### 4. Deferred (on purpose)
 - D2(c) `StreamHandle.close(timeout)` / `abort()` (DD7).

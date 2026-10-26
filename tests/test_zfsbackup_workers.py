@@ -798,36 +798,41 @@ EXTRA_KEYWORDS = {
 
 
 class TestWorkerConstructors:
-    """`(config, stop_event, verbose=False)` for every concrete worker;
-    `BaseWorker(worker_name, config, stop_event, verbose=False)`. There is no
+    """`(config, stop_event, log_level=logging.INFO)` for every concrete
+    worker; `BaseWorker(worker_name, config, stop_event, log_level=logging.INFO)`.
+    The fourth parameter is the numeric logging level (C3), not a `-v` flag. There is no
     path and no `dry_run` parameter any more: `--dry-run` is applied to the
     config by the supervisor before the handoff.
 
     Mutation-checked (scratch copy): re-adding a trailing `dry_run` parameter
     to `SnapshotWorker.__init__` fails 2 tests
-    (`test_the_signature_is_exactly_config_stop_event_verbose[snapshot]` and
+    (`test_the_signature_is_exactly_config_stop_event_log_level[snapshot]` and
     `test_the_old_dry_run_and_path_parameters_are_gone[snapshot]`)."""
 
     @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
-    def test_positional_config_stop_event_verbose(self, cls, name, worker_config):
+    def test_positional_config_stop_event_log_level(self, cls, name, worker_config):
         stop = multiprocessing.Event()
-        worker = cls(worker_config, stop, True)
+        worker = cls(worker_config, stop, logging.DEBUG)
         assert worker.config is worker_config
         assert worker.stop_event is stop
-        assert worker.verbose is True
+        assert worker.log_level == logging.DEBUG
+        assert not hasattr(worker, 'verbose')
         assert worker.name == name and worker.daemon is True
 
     @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
-    def test_verbose_defaults_to_false(self, cls, name, worker_config):
-        assert cls(worker_config, multiprocessing.Event()).verbose is False
+    def test_log_level_defaults_to_info(self, cls, name, worker_config):
+        assert cls(worker_config, multiprocessing.Event()).log_level == logging.INFO
 
     @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
-    def test_the_signature_is_exactly_config_stop_event_verbose(self, cls, name):
+    def test_the_signature_is_exactly_config_stop_event_log_level(self, cls, name):
         sig = inspect.signature(cls.__init__)
         extra = EXTRA_KEYWORDS.get(cls, [])
+        # `status_dir` (S-7a) comes after the reload trio, before the class extras
+        # of the remote worker; the API worker has none (it records no outcomes).
+        status = [] if cls is ApiWorker else ['status_dir']
         assert list(sig.parameters) == [
-            'self', 'config', 'stop_event', 'verbose',
-            'reload_epoch', 'born_epoch', 'workers_lock', *extra,
+            'self', 'config', 'stop_event', 'log_level',
+            'reload_epoch', 'born_epoch', 'workers_lock', *extra, *status, 'code_signature',
         ]
         # The reload trio is keyword-only with inert defaults, so every old
         # positional call keeps working; so are the class-specific extras (M9:
@@ -836,18 +841,21 @@ class TestWorkerConstructors:
         for trio, default in (('reload_epoch', None), ('born_epoch', 0), ('workers_lock', None)):
             assert sig.parameters[trio].kind is inspect.Parameter.KEYWORD_ONLY
             assert sig.parameters[trio].default == default
-        for name_ in extra:
+        # `code_signature` (S-8) is the last: the supervisor's `version.code_signature()`,
+        # `None` = no version-skew check.
+        for name_ in [*extra, *status, 'code_signature']:
             assert sig.parameters[name_].kind is inspect.Parameter.KEYWORD_ONLY
             assert sig.parameters[name_].default is None
 
     def test_base_worker_signature_takes_the_name_first(self):
         sig = inspect.signature(BaseWorker.__init__)
         assert list(sig.parameters) == [
-            'self', 'worker_name', 'config', 'stop_event', 'verbose',
-            'reload_epoch', 'born_epoch', 'workers_lock',
+            'self', 'worker_name', 'config', 'stop_event', 'log_level',
+            'reload_epoch', 'born_epoch', 'workers_lock', 'status_dir', 'code_signature',
         ]
         assert [n for n, p in sig.parameters.items()
-                if p.kind is inspect.Parameter.KEYWORD_ONLY] == ['reload_epoch', 'born_epoch', 'workers_lock']
+                if p.kind is inspect.Parameter.KEYWORD_ONLY] == [
+            'reload_epoch', 'born_epoch', 'workers_lock', 'status_dir', 'code_signature']
 
     @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
     def test_the_old_dry_run_and_path_parameters_are_gone(self, cls, name, worker_config):

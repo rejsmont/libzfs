@@ -24,7 +24,7 @@ from _remote_support import (  # noqa: F401  (fixtures)
     OTHER_SERVER_FP, SERVER_FP, fake_connect_pinned, make_transport, snapshot_presence,
 )
 from libzfseasy.zfs import StreamHandle
-from _snapshot_support import listed_info
+from _snapshot_support import ABSENT, listed_info
 from zfsbackup import remote
 from zfsbackup.backup_manager import DatasetManager
 from zfsbackup.config import BackupConfig, DatasetConfig, Destination, RemoteDatasetConfig
@@ -174,7 +174,8 @@ class TestTimeouts:
     def test_the_constants(self):
         assert (WS_CONNECT_TIMEOUT, WS_IDLE_TIMEOUT, WS_FINAL_ACK_TIMEOUT) == (30, 600, 3600)
         assert WS_CONNECT_TIMEOUT < WS_IDLE_TIMEOUT < WS_FINAL_ACK_TIMEOUT
-        assert (HTTP_TIMEOUT, RESUME_TOKEN_TIMEOUT) == (30, 10)
+        # S-14: the resume-token request outlasts the server's zfs budget (api asserts the inequality)
+        assert (HTTP_TIMEOUT, RESUME_TOKEN_TIMEOUT) == (30, 30)
 
     def test_the_pinned_tls_connect_is_bounded_by_the_websocket_connect_timeout(
         self, rbm, mocker, fake_connect_pinned
@@ -1408,13 +1409,26 @@ class TestStreamUrlModes:
     def test_an_incremental_fresh_send_carries_from(self, rbm, mocker):
         ws = ok_ws()
         transfer(rbm, mocker, FakeStream(), ws, base=snapshot(OLD), sent=snapshot(NEW), latest=snapshot(NEW))
-        assert connect_url(ws).endswith(f"/stream?mode=fresh&from={OLD}")
+        assert connect_url(ws).endswith(f"/stream?mode=fresh&from={OLD}&from_guid=111")
 
     def test_a_resume_says_mode_resume_and_carries_from(self, rbm, mocker):
         ws = ok_ws()
         transfer(rbm, mocker, FakeStream(), ws, mode="resume", base=snapshot(OLD), sent=snapshot(MID),
                  latest=snapshot(NEW))
-        assert query(ws) == {"mode": ["resume"], "from": [OLD]}
+        assert query(ws) == {"mode": ["resume"], "from": [OLD], "from_guid": ["111"]}
+
+    def test_a_base_without_a_guid_carries_only_the_name(self, rbm, mocker):
+        """The server then falls back to the name (`decide_receive`)."""
+        ws = ok_ws()
+        transfer(rbm, mocker, FakeStream(), ws, base=listed_info(OLD, "autosnap", guid=ABSENT),
+                 sent=snapshot(NEW), latest=snapshot(NEW))
+        assert query(ws) == {"mode": ["fresh"], "from": [OLD]}
+
+    def test_from_guid_is_the_bases_decimal_guid(self, rbm, mocker):
+        ws = ok_ws()
+        base = snapshot(OLD, guid=0xffffffffffffffff)
+        transfer(rbm, mocker, FakeStream(), ws, base=base, sent=snapshot(NEW), latest=snapshot(NEW))
+        assert query(ws)["from_guid"] == ["18446744073709551615"]
 
     def test_a_resumed_full_stream_has_no_from(self, rbm, mocker):
         ws = ok_ws()
@@ -1427,7 +1441,7 @@ class TestStreamUrlModes:
         ws = ok_ws()
         transfer(rbm, mocker, FakeStream(), ws, mode="resume", base=snapshot(OLD), sent=snapshot(MID),
                  latest=snapshot(NEW), common=snapshot(MID))
-        assert query(ws)["from"] == [OLD]
+        assert query(ws)["from"] == [OLD] and query(ws)["from_guid"] == ["111"]
 
     def test_the_mode_is_always_present(self, rbm, mocker):
         for mode in ("fresh", "resume"):
@@ -1439,7 +1453,7 @@ class TestStreamUrlModes:
         ws = ok_ws()
         transfer(rbm, mocker, FakeStream(), ws, base=snapshot("autosnap_20240101120000_a b:c"),
                  sent=snapshot(NEW), latest=snapshot(NEW))
-        assert connect_url(ws).endswith("&from=autosnap_20240101120000_a%20b%3Ac")
+        assert "&from=autosnap_20240101120000_a%20b%3Ac&from_guid=" in connect_url(ws)
 
 
 class TestPinAndAnchorAfterTheTransfer:
@@ -1747,7 +1761,7 @@ class TestRealResumeStreamUnderTimeouts:
         self.clear_inflight.assert_not_called()
         self.set_anchor.assert_not_called()
         assert self.stream.closes == 1
-        assert query(ws) == {"mode": ["resume"], "from": [OLD]}
+        assert query(ws) == {"mode": ["resume"], "from": [OLD], "from_guid": ["111"]}
         self.send_snapshot.assert_not_called()
 
     def test_a_connect_failure_of_a_resume_closes_the_zfs_send_and_keeps_the_pin(self, rbm, mocker):

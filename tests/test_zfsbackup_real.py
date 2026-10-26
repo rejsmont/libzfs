@@ -463,7 +463,7 @@ def api_server(server_config_db, tmp_path, source_fs, target_root):
 
     def launch():
         stop = StopFlag()
-        worker = ApiWorker(snapshot.config, stop, verbose=False, config_db=server_config_db)
+        worker = ApiWorker(snapshot.config, stop, config_db=server_config_db)
         worker.start()
         running.update(stop=stop, worker=worker)
         deadline = time.monotonic() + 30
@@ -928,6 +928,177 @@ class TestRealPruneHeldAndCloned:
 
 
 # ---------------------------------------------------------------------------
+# TestRealForgedReceivedProperty (B-1d: a newline in a received property)
+# ---------------------------------------------------------------------------
+
+class TestRealForgedReceivedProperty:
+    """A `zfs send -p` stream carries the sender's `org.zfsbackup:anchor.*` property into the receiving
+    dataset as a RECEIVED value, and a value may hold a newline, which real `zfs get -H` prints as extra lines.
+    Under a recursive client-side ancestor the descendants' anchors are read in one `zfs get -r`: the read
+    must be refused (the ancestor is skipped this cycle, nothing destroyed, one ERROR) and prune again once
+    the property is fixed. Needs `zfs send`/`receive` and `set` permission on the test pool; skips otherwise.
+
+    NOT RUN in the authoring session (no pool on the author's machine): run it with `pytest -m real_zfs`."""
+
+    @staticmethod
+    def _receive(snapshot, target):
+        """`zfs send -p snapshot | zfs receive target`, or skip when this account may not."""
+        send = subprocess.Popen([_zfs_cmd(), 'send', '-p', snapshot], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        recv = subprocess.run([_zfs_cmd(), 'receive', target], stdin=send.stdout,
+                              capture_output=True, text=True)
+        send.stdout.close()
+        send_err = send.stderr.read().decode(errors='replace')
+        send.stderr.close()
+        send.wait()
+        failed = send.returncode != 0 or recv.returncode != 0
+        if failed:
+            text = (send_err + recv.stderr).lower()
+            if 'permission denied' in text or 'not permitted' in text:
+                pytest.skip(f'zfs send/receive not permitted for this account: {text.strip()}')
+            raise AssertionError(f'send | receive failed: {send_err.strip()} {recv.stderr.strip()}')
+
+    def test_a_received_anchor_with_a_newline_skips_the_recursive_ancestor_until_it_is_fixed(
+            self, source_fs, target_root, caplog):
+        parent = f'{target_root}/anc'
+        child = f'{parent}/rx'
+        evil = 'org.zfsbackup:anchor.evil'
+        # the sender's dataset holds a hostile value; `zfs set` refuses a newline only on some versions
+        r = subprocess.run([_zfs_cmd(), 'set', f'{evil}=junk\npool/x\ttype\tfilesystem\t-', source_fs.name],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip(f'this zfs refuses a newline in a user property: {r.stderr.strip()}')
+        zfs.snapshot(source_fs, snap_name_at(0.1))
+        sent = list_real_snapshot_names_exact(source_fs.name)[-1]
+        try:
+            zfs.create.filesystem(parent)
+            self._receive(f'{source_fs.name}@{sent}', child)
+            source_line = _zfs_run('get', '-H', '-o', 'source', evil, child).strip()
+            assert source_line == 'received', 'the premise: the hostile value arrived as a RECEIVED property'
+
+            olds = [snap_name_at(3 + i) for i in reversed(range(3))]
+            for name in olds + [snap_name_at(0.2)]:
+                zfs.snapshot(Filesystem(parent), name)
+            config = BackupConfig(
+                datasets=[DatasetConfig(
+                    name=parent, frequency=timedelta(hours=1), recursive=True,
+                    retention_rules=[RetentionRule(timedelta(hours=1), timedelta(hours=2))],
+                )],
+                snapshot_prefix='autosnap',
+            )
+            manager = DatasetManager(config)
+            dsi = manager.datasets[0]
+
+            with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+                manager.prune_snapshots(dsi)
+                manager.prune_snapshots(dsi)               # a second cycle: still skipped, and quiet
+            for name in olds:
+                assert name in list_real_snapshot_names_exact(parent), f'{name} was destroyed'
+            errors = [m for m in _prune_records(caplog, logging.ERROR) if 'Cannot read anchors' in m]
+            assert len(errors) == 1 and parent in errors[0]
+
+            # fixed: a LOCAL value replaces the received one, the strict read is clean, pruning resumes
+            _zfs_run('set', f'{evil}=fine', child)
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+                manager.prune_snapshots(dsi)
+            remaining = list_real_snapshot_names_exact(parent)
+            assert [o for o in olds if o in remaining] != olds, 'pruning did not resume'
+        finally:
+            _destroy_quietly(parent)
+
+
+# ---------------------------------------------------------------------------
+# TestRealNewlinePropertiesAndPruning (the two-phase org.zfsbackup:* property read)
+# ---------------------------------------------------------------------------
+
+class TestRealNewlinePropertiesAndPruning:
+    """`zfs get -H` prints a value raw, so a value with a newline is several lines. The anchor read is two-phase:
+    which `org.zfsbackup:*` properties a dataset has is read without any value column, then only those are read as
+    values. So a newline in a property that is not ours -- on the pool root (inherited by everything below it) or
+    on the backed-up dataset itself -- no longer stops pruning, while a newline in one of OUR values (an anchor)
+    still makes the read refuse, once, until it is fixed. Needs `set` permission on the test pool and a zfs that
+    accepts a newline in a user property; skips otherwise (never errors). Everything set here is cleared in
+    `finally` (the pool root's property with `zfs inherit`); only the test pool and `source_fs` are touched.
+
+    NOT RUN in the authoring session: run it with `ZFSB_REAL_ZFS=1 pytest -m real_zfs -k NewlineProperties`."""
+
+    NEWLINE = 'first line\nsecond line'
+
+    @staticmethod
+    def _set_or_skip(dataset, prop, value):
+        r = subprocess.run([_zfs_cmd(), 'set', f'{prop}={value}', dataset], capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip(f'zfs set {prop} on {dataset} not possible here (permission, or this zfs refuses a '
+                        f'newline in a user property): {r.stderr.strip()}')
+
+    @staticmethod
+    def _inherit_quietly(dataset, prop):
+        subprocess.run([_zfs_cmd(), 'inherit', prop, dataset], capture_output=True)
+
+    @staticmethod
+    def _six_snapshots(source_fs):
+        for h in [5.5, 4.5, 3.5, 2.5, 1.5, 0.5]:          # oldest first, as in TestRealPruning
+            zfs.snapshot(source_fs, snap_name_at(h))
+
+    @staticmethod
+    def _manager(source_fs):
+        config = BackupConfig(
+            datasets=[DatasetConfig(
+                name=source_fs.name, frequency=timedelta(hours=1),
+                retention_rules=[RetentionRule(timedelta(hours=1), timedelta(hours=3))],
+            )],
+            snapshot_prefix='autosnap',
+        )
+        manager = DatasetManager(config)
+        return manager, manager.datasets[0]
+
+    def test_a_newline_on_the_pool_root_and_on_an_unrelated_property_does_not_stop_pruning(
+            self, source_fs, auto_zfs_pool, caplog):
+        root = auto_zfs_pool.name
+        note, own, rooted = 'user:zfsb_note', 'user:zfsb_own', 'org.zfsbackup:anchor.rootonly'
+        try:
+            self._set_or_skip(root, note, self.NEWLINE)
+            # an org.zfsbackup name the dataset only INHERITS (no descendant sets it): not discovered, not read
+            self._set_or_skip(root, rooted, self.NEWLINE)
+            self._set_or_skip(source_fs.name, own, self.NEWLINE)
+            premise = _zfs_run('get', '-H', '-o', 'source', note, source_fs.name).strip()
+            assert premise.startswith('inherited from'), 'the premise: the dataset inherits the root\'s value'
+            self._six_snapshots(source_fs)
+            manager, dsi = self._manager(source_fs)
+            with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+                manager.prune_snapshots(dsi)
+            assert [m for m in _prune_records(caplog, logging.ERROR) if 'Cannot read anchors' in m] == []
+            assert len(list_real_snapshot_names_exact(source_fs.name)) == 3, 'pruning did not go ahead'
+        finally:
+            self._inherit_quietly(root, note)
+            self._inherit_quietly(root, rooted)
+            self._inherit_quietly(source_fs.name, own)
+
+    def test_a_newline_in_an_anchor_value_still_refuses_the_read_once_and_pruning_resumes_when_fixed(
+            self, source_fs, caplog):
+        anchor = 'org.zfsbackup:anchor.offsite'
+        try:
+            self._six_snapshots(source_fs)
+            self._set_or_skip(source_fs.name, anchor, self.NEWLINE)
+            manager, dsi = self._manager(source_fs)
+            with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+                manager.prune_snapshots(dsi)
+                manager.prune_snapshots(dsi)                # still broken: skipped again, and quiet
+            assert len(list_real_snapshot_names_exact(source_fs.name)) == 6, 'something was destroyed'
+            errors = [m for m in _prune_records(caplog, logging.ERROR) if 'Cannot read anchors' in m]
+            assert len(errors) == 1 and source_fs.name in errors[0]
+
+            self._set_or_skip(source_fs.name, anchor, 'one line')       # fixed
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+                manager.prune_snapshots(dsi)
+            assert len(list_real_snapshot_names_exact(source_fs.name)) < 6, 'pruning did not resume'
+        finally:
+            self._inherit_quietly(source_fs.name, anchor)
+
+
+# ---------------------------------------------------------------------------
 # TestRealSendReceive
 # ---------------------------------------------------------------------------
 
@@ -1008,69 +1179,118 @@ class TestRealSendReceive:
         assert set(e2e.server_snaps()) == {s1, s2}
         self._assert_local_ownership(e2e)
 
-    def test_nothing_received_is_recorded_for_the_excluded_properties(self, e2e):
-        """`zfs receive -o <name>=<server's value>` for the three owned names (plan B-1b; `-x` does
-        not protect a local value on a full `-F` receive of a `-p` stream): even a stream that
-        carries them leaves no RECEIVED value behind."""
-        e2e.forge_on_the_source()
-        e2e.write('data.bin', 1)
-        e2e.snapshot(2)
-        with e2e.properties_in_streams():
-            assert e2e.cycle() is True
+    # -- a `-p` (compound) stream is refused at its header (B-2a); nothing on the server changes -----------
+    REFUSED_TEXT = 'compound streams (zfs send -p, -R or -I) are not accepted'
+
+    def _refusals(self, e2e):
+        """The client's ERROR records naming the compound-stream refusal (logged once per episode)."""
+        return [r for r in e2e.caplog.records
+                if r.name.startswith('zfsbackup.remote') and r.levelno >= logging.ERROR
+                and self.REFUSED_TEXT in r.getMessage()]
+
+    def _server_state(self, e2e):
+        """What the server holds for the dataset, to compare before and after a refusal: its snapshots
+        (with guids), the resume token, and for each owned property the LOCAL and the RECEIVED value."""
+        state = {'snapshots': e2e.server_snaps(), 'token': e2e.server_prop('receive_resume_token')}
         for prop in (PROP_CLIENT_ID, PROP_SOURCE_DATASET, PROP_CONFIG):
-            assert _zfs_get_received(e2e.server_ds, prop) is None, prop
+            state[prop] = (e2e.server_local(prop), _zfs_get_received(e2e.server_ds, prop))
+        return state
 
-    def test_a_full_properties_stream_cannot_rewrite_the_ownership(self, e2e):
-        e2e.forge_on_the_source()
-        e2e.write('data.bin', 1)
-        s1 = e2e.snapshot(2)
-        with e2e.properties_in_streams():
-            assert e2e.cycle() is True
-        assert list(e2e.server_snaps()) == [s1]
-        # local, and the BOUND id / the real client dataset -- not the forged ones
-        assert e2e.server_local(PROP_CLIENT_ID) == CLIENT_ID
-        assert e2e.server_local(PROP_SOURCE_DATASET) == e2e.source.name
-        assert e2e.server_prop(PROP_CLIENT_ID) == CLIENT_ID
-        assert e2e.server_prop(PROP_SOURCE_DATASET) == e2e.source.name
-
-    def test_an_incremental_properties_stream_cannot_rewrite_the_ownership(self, e2e):
-        e2e.write('data.bin', 1)
-        s1 = e2e.snapshot(3)
-        assert e2e.cycle() is True
-        e2e.forge_on_the_source()
-        e2e.write('more.bin', 1)
-        s2 = e2e.snapshot(2)
-        with e2e.properties_in_streams():
-            assert e2e.cycle() is True
-        assert set(e2e.server_snaps()) == {s1, s2}
-        assert e2e.server_local(PROP_CLIENT_ID) == CLIENT_ID
-        assert e2e.server_local(PROP_SOURCE_DATASET) == e2e.source.name
-
-    def test_a_properties_stream_cannot_replace_the_config_the_server_prunes_by(self, e2e):
-        """The negotiate writes the canonical config before the stream; the stream's own copy must
-        not be the one in effect afterwards (the server prunes received datasets by it)."""
-        evil = e2e.forge_on_the_source()
-        e2e.write('data.bin', 1)
-        e2e.snapshot(2)
-        with e2e.properties_in_streams():
-            assert e2e.cycle() is True
-        assert e2e.server_prop(PROP_CONFIG) != evil, 'the forged config is the one in effect'
-        assert e2e.server_local(PROP_CONFIG) == e2e.dsi.config.to_property(DEST)
-
-    def test_the_next_cycle_restores_the_config_whatever_the_stream_carried(self, e2e):
-        """Negotiate writes the config on every cycle, so the window is one cycle at most."""
+    def test_nothing_received_is_recorded_for_the_excluded_properties(self, e2e):
+        """A stream that carries the owned names (`-p`) is refused before `zfs receive` runs, so no
+        RECEIVED value of `client_id`/`source_dataset`/`config` is recorded -- not by the refused stream
+        and not by the plain one that follows it."""
         e2e.forge_on_the_source()
         e2e.write('data.bin', 1)
         e2e.snapshot(3)
-        with e2e.properties_in_streams():
-            assert e2e.cycle() is True
+        assert e2e.cycle() is True
         e2e.write('more.bin', 1)
         e2e.snapshot(2)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is False
+        for prop in (PROP_CLIENT_ID, PROP_SOURCE_DATASET, PROP_CONFIG):
+            assert _zfs_get_received(e2e.server_ds, prop) is None, prop
+        assert e2e.cycle() is True
+        for prop in (PROP_CLIENT_ID, PROP_SOURCE_DATASET, PROP_CONFIG):
+            assert _zfs_get_received(e2e.server_ds, prop) is None, prop
+
+    def test_a_full_properties_stream_is_refused_and_creates_nothing(self, e2e):
+        forged = e2e.forge_on_the_source()
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(2)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is False
+        assert len(self._refusals(e2e)) == 1, e2e.log_lines()
+        assert e2e.server_snaps() == {}
+        assert _zfs_get(e2e.server_ds, 'name') is None      # the leaf was never created
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) is None
+        # the next honest (plain) stream succeeds, with the server's own values in effect
+        assert e2e.cycle() is True
+        assert list(e2e.server_snaps()) == [s1]
+        self._assert_owned_values_in_effect(e2e, forged)
+
+    def test_an_incremental_properties_stream_is_refused_and_the_ownership_is_unchanged(self, e2e):
+        e2e.write('data.bin', 1)
+        s1 = e2e.snapshot(3)
+        assert e2e.cycle() is True
+        before = self._server_state(e2e)
+        forged = e2e.forge_on_the_source()
+        e2e.write('more.bin', 1)
+        s2 = e2e.snapshot(2)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is False
+        assert len(self._refusals(e2e)) == 1, e2e.log_lines()
+        assert self._server_state(e2e) == before             # no new snapshot, nothing local rewritten
+        assert set(e2e.server_snaps()) == {s1}
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == s1
+        assert e2e.cycle() is True
+        assert set(e2e.server_snaps()) == {s1, s2}
+        self._assert_owned_values_in_effect(e2e, forged)
+
+    def test_a_properties_stream_cannot_replace_the_config_the_server_prunes_by(self, e2e):
+        """The server's canonical config is what it prunes by. A stream carrying a forged one never gets
+        to `zfs receive`: the local value is the canonical config before, during and after."""
+        e2e.write('data.bin', 1)
+        e2e.snapshot(3)
+        assert e2e.cycle() is True
+        canonical = e2e.dsi.config.to_property(DEST)
+        assert e2e.server_local(PROP_CONFIG) == canonical
+        evil = e2e.forge_on_the_source()
+        e2e.write('more.bin', 1)
+        e2e.snapshot(2)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is False
+        assert e2e.server_prop(PROP_CONFIG) != evil, 'the forged config is the one in effect'
+        assert e2e.server_local(PROP_CONFIG) == canonical
+        assert _zfs_get_received(e2e.server_ds, PROP_CONFIG) is None
+
+    def test_the_next_plain_cycle_succeeds_whatever_the_refused_stream_carried(self, e2e):
+        """A refused `-p` cycle leaves no pin-induced wedge: the next ordinary client cycle sends and the
+        three owned values are the server's own."""
+        forged = e2e.forge_on_the_source()
+        e2e.write('data.bin', 1)
+        e2e.snapshot(3)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is False
+        e2e.write('more.bin', 1)
+        s2 = e2e.snapshot(2)
         assert e2e.cycle() is True                           # an ordinary client this time
+        assert list(e2e.server_snaps()) == [s2]              # a first full sends the newest only
         assert e2e.server_local(PROP_CONFIG) == e2e.dsi.config.to_property(DEST)
         self._assert_local_ownership(e2e)
+        self._assert_owned_values_in_effect(e2e, forged)
 
-    # -- B-1b: the three owned values are in effect, as LOCAL values, right after any `-p` stream ------
+    def test_the_refusal_is_logged_once_per_episode(self, e2e):
+        """A client retries the refused stream every cycle: ERROR the first time, DEBUG after."""
+        e2e.write('data.bin', 1)
+        e2e.snapshot(2)
+        for _ in range(3):
+            with e2e.properties_in_streams():
+                assert e2e.cycle() is False
+        assert len(self._refusals(e2e)) == 1, e2e.log_lines()
+        assert e2e.server_snaps() == {}
+
+    # -- B-1b: the three owned values are in effect, as LOCAL values, right after any (plain) stream ------
     def _owned_expected(self, e2e):
         return {
             PROP_CONFIG: e2e.dsi.config.to_property(DEST),
@@ -1089,34 +1309,34 @@ class TestRealSendReceive:
             assert _zfs_get_source(e2e.server_ds, prop) == 'local', f'{prop}: source'
         assert e2e.server_prop(PROP_CONFIG) != forged_config
 
-    def test_owned_values_are_local_right_after_a_full_properties_stream(self, e2e):
+    # A plain stream carries no properties, so hostile values on the source dataset never reach the
+    # server; the server's `-o` values are local after each kind of plain receive.
+    def test_owned_values_are_local_right_after_a_full_plain_stream_from_a_forged_source(self, e2e):
         forged = e2e.forge_on_the_source()
         e2e.write('data.bin', 1)
         s1 = e2e.snapshot(2)
-        with e2e.properties_in_streams():
-            assert e2e.cycle() is True
+        assert e2e.cycle() is True
         assert list(e2e.server_snaps()) == [s1]
         self._assert_owned_values_in_effect(e2e, forged)
 
-    def test_owned_values_are_local_right_after_an_incremental_properties_stream(self, e2e):
+    def test_owned_values_are_local_right_after_an_incremental_plain_stream_from_a_forged_source(self, e2e):
         e2e.write('data.bin', 1)
         s1 = e2e.snapshot(3)
         assert e2e.cycle() is True
         forged = e2e.forge_on_the_source()
         e2e.write('more.bin', 1)
         s2 = e2e.snapshot(2)
-        with e2e.properties_in_streams():
-            assert e2e.cycle() is True
+        assert e2e.cycle() is True
         assert set(e2e.server_snaps()) == {s1, s2}
         self._assert_owned_values_in_effect(e2e, forged)
 
-    def test_owned_values_are_local_right_after_a_resumed_full_properties_stream(self, e2e):
-        """The first `-p` send is killed; the resumed one (`zfs send -t`, the flags are in the
-        token) completes it."""
+    def test_owned_values_are_local_right_after_a_resumed_full_plain_stream(self, e2e):
+        """The first send is killed; the resumed one (`zfs send -t`, the flags are in the token)
+        completes it."""
         forged = e2e.forge_on_the_source()
         e2e.write('data.bin', 24)
         s1 = e2e.snapshot(3)
-        with e2e.properties_in_streams(), e2e.killed_streams(4 * MIB) as streams:
+        with e2e.killed_streams(4 * MIB) as streams:
             assert e2e.cycle() is False
         assert streams and streams[0].sent == 4 * MIB
         assert e2e.wait_for_resume_token() not in ('-', ''), 'the server saved no partial receive state'
@@ -1127,19 +1347,47 @@ class TestRealSendReceive:
         assert list(e2e.server_snaps()) == [s1]
         self._assert_owned_values_in_effect(e2e, forged)
 
-    def test_owned_values_are_local_right_after_a_resumed_incremental_properties_stream(self, e2e):
+    def test_owned_values_are_local_right_after_a_resumed_incremental_plain_stream(self, e2e):
         e2e.write('base.bin', 1)
         s1 = e2e.snapshot(5)
         assert e2e.cycle() is True
         forged = e2e.forge_on_the_source()
         e2e.write('data.bin', 24)
         s2 = e2e.snapshot(3)
-        with e2e.properties_in_streams(), e2e.killed_streams(4 * MIB) as streams:
+        with e2e.killed_streams(4 * MIB) as streams:
             assert e2e.cycle() is False
         assert streams
         assert e2e.wait_for_resume_token() not in ('-', ''), 'the server saved no partial receive state'
         assert e2e.cycle_after_a_cut() is True   # the token shows before the server lets go: a busy 503 is possible
         assert any(f'Resuming interrupted transfer for {e2e.source.name}@{s2}' in m for m in e2e.log_lines())
+        assert set(e2e.server_snaps()) == {s1, s2}
+        self._assert_owned_values_in_effect(e2e, forged)
+
+    # -- a large `-p` stream is refused while it is still being sent: no partial state, nothing to resume ---
+    def test_a_large_full_properties_stream_leaves_no_partial_state(self, e2e):
+        forged = e2e.forge_on_the_source()
+        e2e.write('data.bin', 24)
+        s1 = e2e.snapshot(3)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is False
+        assert e2e.server_snaps() == {}
+        assert _zfs_get(e2e.server_ds, 'name') is None       # no dataset, so no resume token either
+        assert e2e.cycle() is True
+        assert list(e2e.server_snaps()) == [s1]
+        self._assert_owned_values_in_effect(e2e, forged)
+
+    def test_a_large_incremental_properties_stream_leaves_no_partial_state(self, e2e):
+        e2e.write('base.bin', 1)
+        s1 = e2e.snapshot(5)
+        assert e2e.cycle() is True
+        before = self._server_state(e2e)
+        forged = e2e.forge_on_the_source()
+        e2e.write('data.bin', 24)
+        s2 = e2e.snapshot(3)
+        with e2e.properties_in_streams():
+            assert e2e.cycle() is False
+        assert self._server_state(e2e) == before              # in particular no receive_resume_token
+        assert e2e.cycle() is True
         assert set(e2e.server_snaps()) == {s1, s2}
         self._assert_owned_values_in_effect(e2e, forged)
 
@@ -1621,8 +1869,8 @@ class _NewDatasetTests:
         _destroy_quietly(name)
 
     # -- helpers --------------------------------------------------------------------
-    def negotiate(self, e2e, snapshots):
-        """A raw `POST .../negotiate` as the enrolled client; -> the JSON answer."""
+    def negotiate_response(self, e2e, snapshots):
+        """A raw `POST .../negotiate` as the enrolled client; -> the `requests` response."""
         from urllib.parse import quote
 
         from zfsbackup import identity
@@ -1632,12 +1880,24 @@ class _NewDatasetTests:
         session = identity.pinned_session(e2e.client, e2e.server_fp, timeout=15)
         session.headers.update(protocol_headers())
         try:
-            resp = session.post(url, json={
+            return session.post(url, json={
                 'snapshots': list(snapshots), 'config': e2e.dsi.config.to_property(DEST)})
         finally:
             session.close()
+
+    def negotiate(self, e2e, snapshots):
+        """A raw `POST .../negotiate` as the enrolled client; -> the JSON answer (it must be a 200)."""
+        resp = self.negotiate_response(e2e, snapshots)
         assert resp.status_code == 200, resp.text
         return resp.json()
+
+    def make_owned_placeholder(self, e2e):
+        """An empty leaf the way the server makes one (`zfs create -u -o canmount=noauto -o client_id`,
+        below the parents a negotiate creates): a dataset on the backup path that IS the server's."""
+        self.negotiate(e2e, [])                                    # creates the parent chain only
+        assert _zfs_get(e2e.server_ds, 'name') is None
+        _zfs_run('create', '-u', '-o', 'canmount=noauto', '-o', f'{PROP_CLIENT_ID}={CLIENT_ID}', e2e.server_ds)
+        assert e2e.server_local(PROP_CLIENT_ID) == CLIENT_ID
 
     def assert_owned_locally(self, e2e):
         for prop, expected in ((PROP_CLIENT_ID, CLIENT_ID), (PROP_SOURCE_DATASET, e2e.source.name),
@@ -1697,10 +1957,35 @@ class _NewDatasetTests:
         assert answer['common_snapshot'] == s1
 
     def test_a_placeholder_without_snapshots_is_none(self, e2e):
+        """An empty leaf the server owns (it carries the LOCAL client id) has no copy to report."""
         s1 = self.first_send(e2e)
-        _zfs_run('create', '-p', e2e.server_ds)                    # what a pre-creating server left behind
+        self.make_owned_placeholder(e2e)
 
         assert self.negotiate(e2e, [s1])['server_copy'] == 'none'
+
+    def test_a_dataset_the_server_did_not_create_is_refused_and_left_alone(self, e2e):
+        """B-2c: an existing dataset on the backup path without a LOCAL `client_id` is never adopted --
+        negotiate answers 409 naming the one command that adopts it on purpose, nothing is received
+        into it, and nothing on it changes."""
+        s1 = self.first_send(e2e)
+        self.negotiate(e2e, [])                                    # the parent chain
+        _zfs_run('create', '-u', e2e.server_ds)                    # not the server's: no client id
+        before = (e2e.server_local(PROP_CLIENT_ID), e2e.server_local(PROP_CONFIG), e2e.server_snaps())
+        assert before[0] is None
+
+        resp = self.negotiate_response(e2e, [s1])
+        assert resp.status_code == 409, resp.text
+        assert 'not recorded as a backup' in resp.text
+        assert f'zfs set {PROP_CLIENT_ID}={CLIENT_ID} {e2e.server_ds}' in resp.text
+
+        assert e2e.cycle() is False
+        assert any('not recorded as a backup' in m for m in e2e.log_lines()), e2e.log_lines()
+        assert (e2e.server_local(PROP_CLIENT_ID), e2e.server_local(PROP_CONFIG), e2e.server_snaps()) == before
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) is None
+
+        # the operator adopts it on purpose (the command the refusal named): the server then owns it
+        _zfs_run('set', f'{PROP_CLIENT_ID}={CLIENT_ID}', e2e.server_ds)
+        assert self.negotiate_response(e2e, [s1]).status_code == 200
 
     def test_an_incremental_follows_and_the_owned_values_stay_local(self, e2e):
         s1 = self.first_send(e2e)
@@ -1796,12 +2081,12 @@ class _NewDatasetTests:
 
     # -- a pre-existing dataset ----------------------------------------------------------
     def test_a_full_stream_over_an_existing_placeholder(self, e2e):
-        """A dataset that exists without snapshots (the parent made for a child that was backed up
-        first, or a pre-creating server's leaf). Where zfs refuses an encrypted full over it, the
+        """A dataset the server owns that exists without snapshots (the parent made for a child that was
+        backed up first, or an empty leaf). Where zfs refuses an encrypted full over it, the
         client is told why in the server's words; where it does not (plain, unencrypted target), the
         full replaces it."""
         s1 = self.first_send(e2e)
-        _zfs_run('create', '-p', e2e.server_ds)
+        self.make_owned_placeholder(e2e)
 
         ok = e2e.cycle()
 
@@ -2033,3 +2318,308 @@ class TestRealUserPropertyLimit:
         assert len(value) == 8188
         zfs.set(source_fs, {PROP_CONFIG: value})
         assert _zfs_get_local(source_fs.name, PROP_CONFIG) == value
+
+
+# ---------------------------------------------------------------------------
+# TestRealCheck (C13: `zfsbackup-config check` against real snapshots)
+# ---------------------------------------------------------------------------
+
+class TestRealCheck:
+    """`check` reads real `zfs list` / `zfs get` output: a dataset with a managed snapshot is OK, the lack of a
+    daemon is CRIT (exit 1), a backdated newest snapshot is CRIT, and `--prometheus --output` writes a
+    parseable file. Read-only: the database is only imported, nothing is signalled."""
+
+    @staticmethod
+    def _database(tmp_path, source_fs):
+        from click.testing import CliRunner
+        from zfsbackup.cli.main import cli
+
+        source = tmp_path / 'check.yaml'
+        source.write_text(
+            'snapshot_prefix: "autosnap"\n'
+            'check_interval: "5m"\n'
+            'datasets:\n'
+            f'  - name: "{source_fs.name}"\n'
+            '    frequency: "1h"\n'
+            '    retention:\n'
+            '      "1d": "30d"\n'
+        )
+        database = tmp_path / 'cfg' / 'config.db'
+        result = CliRunner().invoke(cli, ['-c', str(database), 'import', str(source)], prog_name='zfsbackup-config')
+        assert result.exit_code == 0, result.output
+        return database
+
+    @staticmethod
+    def _check(database, *args):
+        from click.testing import CliRunner
+        from zfsbackup.cli.main import cli
+
+        result = CliRunner().invoke(
+            cli, ['-c', str(database), 'check', *args], prog_name='zfsbackup-config')
+        return result
+
+    @staticmethod
+    def _entries(result):
+        import json as _json
+
+        data = _json.loads(result.stdout)
+        return data, {(e['source'], e['subject']): e for e in data['entries']}
+
+    def test_a_fresh_managed_snapshot_is_ok_and_no_daemon_is_crit(self, source_fs, tmp_path):
+        database = self._database(tmp_path, source_fs)
+        zfs.snapshot(source_fs, snap_name_at(0.2))
+        result = self._check(database, '--json')
+        data, entries = self._entries(result)
+        assert entries[('snapshot', source_fs.name)]['state'] == 'OK'
+        assert entries[('snapshot', source_fs.name)]['age_seconds'] < 3600
+        assert entries[('daemon', 'process')]['state'] == 'CRIT'
+        assert data['state'] == 'CRIT'
+        assert result.exit_code == 1
+
+    def test_a_backdated_newest_snapshot_is_crit(self, source_fs, tmp_path):
+        database = self._database(tmp_path, source_fs)
+        zfs.snapshot(source_fs, snap_name_at(5))      # 5 h old against a 1 h frequency: past the 4 h crit
+        result = self._check(database, '--json')
+        _, entries = self._entries(result)
+        assert entries[('snapshot', source_fs.name)]['state'] == 'CRIT'
+        assert result.exit_code == 1
+        assert self._check(database, '--nagios').exit_code == 2
+
+    def test_no_managed_snapshot_is_crit(self, source_fs, tmp_path):
+        database = self._database(tmp_path, source_fs)
+        zfs.snapshot(source_fs, 'manual_snap')        # unmanaged: does not count
+        _, entries = self._entries(self._check(database, '--json'))
+        assert entries[('snapshot', source_fs.name)]['state'] == 'CRIT'
+        assert 'no managed snapshots' in entries[('snapshot', source_fs.name)]['reason']
+
+    def test_prometheus_output_file_is_written_and_parseable(self, source_fs, tmp_path):
+        import os
+        import re
+
+        database = self._database(tmp_path, source_fs)
+        zfs.snapshot(source_fs, snap_name_at(0.2))
+        target = tmp_path / 'prom' / 'zfsbackup.prom'
+        target.parent.mkdir()
+        result = self._check(database, '--prometheus', '--output', str(target))
+        assert result.exit_code == 0                  # with --output the exit code says the file was written
+        assert result.stdout == ''
+        assert os.stat(target).st_mode & 0o7777 == 0o644
+        assert [p.name for p in target.parent.iterdir()] == ['zfsbackup.prom']
+        sample = re.compile(r'^[a-zA-Z_:][a-zA-Z0-9_:]*(\{([a-z_]+="([^"\\\n]|\\.)*",?)*\})? -?[0-9.e+-]+$')
+        samples = [l for l in target.read_text().splitlines() if not l.startswith('#')]
+        assert samples and all(sample.match(s) for s in samples), samples
+        assert f'zfsbackup_snapshot_check_state{{dataset="{source_fs.name}"}} 0' in samples
+        assert 'zfsbackup_check_success 0' in samples            # ... and the verdict (no daemon) is in the file
+        assert any(s.startswith(f'zfsbackup_snapshot_age_seconds{{dataset="{source_fs.name}"}} ') for s in samples)
+
+    def test_check_changes_nothing_on_the_pool(self, source_fs, tmp_path):
+        database = self._database(tmp_path, source_fs)
+        zfs.snapshot(source_fs, snap_name_at(0.2))
+        before = list_real_snapshot_names(source_fs.name)
+        self._check(database)
+        self._check(database, '--json')
+        assert list_real_snapshot_names(source_fs.name) == before
+        assert _zfs_get_local(source_fs.name, PROP_CONFIG) in (None, '-', '')
+
+
+# ---------------------------------------------------------------------------
+# B-2b: the server never rolls back history the client cannot account for
+# ---------------------------------------------------------------------------
+#
+# `zfs receive -F` of an incremental stream destroys every snapshot of the destination newer than the
+# stream's base (tests/fixtures/openzfs/*/M7.txt). The server therefore passes `-F` only when that
+# destroys nothing, or exactly the snapshots the client names (`discard`, by guid). The client names one
+# only for the snapshot it lost while it was being sent (the backstop) and otherwise refuses, once.
+
+class TestRealNoRollback(_ChainTests):
+
+    def prime(self, e2e, hours=(10, 8, 6)):
+        """Send `hours` (oldest first) to the server: a full send of the first, then a chain.
+        -> the three short names; the local anchor is the last."""
+        first = self.snapshots(e2e, [hours[0]])[0]
+        assert e2e.cycle() is True
+        rest = self.snapshots(e2e, list(hours[1:]))
+        assert e2e.cycle() is True
+        names = [first] + rest
+        self.assert_on_the_server(e2e, names)
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == names[-1]
+        return names
+
+    def rollback(self, e2e, to):
+        """`zfs rollback -r` of the client's dataset: skips (never errors) when not permitted."""
+        _zfs_run('rollback', '-r', f'{e2e.source.name}@{to}')
+
+    def errors(self, e2e, since=0):
+        """The client's ERROR messages (`zfsbackup.remote`) logged after the first `since` of them."""
+        return [r.getMessage() for r in e2e.caplog.records
+                if r.name.startswith('zfsbackup.remote') and r.levelno >= logging.ERROR][since:]
+
+    def n_errors(self, e2e):
+        return len(self.errors(e2e))
+
+    # -- a rolled-back client ----------------------------------------------------------------
+
+    @pytest.mark.parametrize('keep', [0, 1], ids=['rollback-to-the-first', 'rollback-to-the-second'])
+    def test_a_rollback_is_refused_and_the_server_keeps_every_snapshot(self, e2e, keep):
+        names = self.prime(e2e)
+        before = e2e.server_snaps()
+        self.rollback(e2e, names[keep])
+        e2e.snapshot(1)                                            # new history after the rollback
+        mark = self.n_errors(e2e)
+
+        assert e2e.cycle() is False
+
+        assert e2e.server_snaps() == before                        # same names, same guids
+        assert len(self.errors(e2e, mark)) == 1
+        assert 'zfs rename' in self.errors(e2e, mark)[0]
+        # `zfs rollback -r` leaves the dataset's own properties: the anchor still names a lost snapshot
+        assert e2e.manager.get_local_anchor(e2e.dsi, DEST) == names[-1]
+        assert e2e.server_prop('receive_resume_token') == '-'
+        # ...and the same the next cycle, quietly
+        assert e2e.cycle() is False
+        assert len(self.errors(e2e, mark)) == 1
+        assert e2e.server_snaps() == before
+
+    @pytest.mark.parametrize('keep, destroy', [(0, '%s%%%s'), (1, '%s')], ids=['range', 'single'])
+    def test_after_the_operator_destroys_the_newer_snapshots_the_next_cycle_continues(self, e2e, keep, destroy):
+        names = self.prime(e2e)
+        self.rollback(e2e, names[keep])
+        newest = e2e.snapshot(1)
+        assert e2e.cycle() is False
+
+        lost = names[keep + 1:]
+        _zfs_run('destroy', f'{e2e.server_ds}@' + (destroy % ((lost[0], lost[-1]) if len(lost) > 1 else (lost[0],))))
+        assert e2e.cycle() is True
+
+        server = e2e.server_snaps()
+        assert set(server) == set(names[:keep + 1]) | {newest}
+        self.assert_on_the_server(e2e, names[:keep + 1] + [newest])
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == newest
+
+    def test_renaming_the_server_copy_aside_lets_the_next_cycle_send_in_full(self, e2e, auto_zfs_pool):
+        names = self.prime(e2e)
+        self.rollback(e2e, names[1])
+        newest = e2e.snapshot(1)
+        assert e2e.cycle() is False
+
+        aside = f'{auto_zfs_pool.name}/zfsbackup_aside'
+        _zfs_run('rename', e2e.server_ds, aside)
+        try:
+            assert e2e.cycle() is True
+            assert list(e2e.server_snaps()) == [newest]              # a full stream: only the newest
+            assert set(_snapshot_guids(aside)) == set(names)           # the old copy is whole
+            assert e2e.manager.get_anchor(e2e.dsi, DEST) == newest
+        finally:
+            subprocess.run([_zfs_cmd(), 'destroy', '-r', aside], capture_output=True)
+
+    def test_the_server_refuses_on_its_own_when_the_client_does_not_ask(self, e2e):
+        """A client that skips its check (a race, an older release): the server compares the base with
+        what it holds and refuses before it reads a byte."""
+        names = self.prime(e2e)
+        before = e2e.server_snaps()
+        self.rollback(e2e, names[1])
+        e2e.snapshot(1)
+        mark = self.n_errors(e2e)
+        with mock.patch.object(e2e.remote_mgr, '_rollback_permit', return_value=()):
+            assert e2e.cycle() is False
+
+        assert e2e.server_snaps() == before
+        assert any('refused' in m for m in self.errors(e2e, mark))
+        assert e2e.server_prop('receive_resume_token') == '-'
+
+    # -- the backstop ----------------------------------------------------------------------------
+
+    def test_the_backstop_is_recovered_by_the_next_cycle_and_only_that_snapshot_goes(self, e2e):
+        """A sent snapshot destroyed on the client right after the ack: the anchor goes back to the base,
+        the server keeps it, and the next cycle lets the server drop exactly that one."""
+        first = self.snapshots(e2e, [10])[0]
+        assert e2e.cycle() is True
+        lost = self.snapshots(e2e, [8])[0]
+        real = e2e.manager.set_anchor
+
+        def set_anchor_then_lose_it(dsi, destination, name):
+            ok = real(dsi, destination, name)
+            if name == lost and lost in e2e.local_snaps():
+                zfs.destroy(Snapshot(e2e.source, lost), destroy=True)
+            return ok
+
+        with mock.patch.object(e2e.manager, 'set_anchor', set_anchor_then_lose_it):
+            e2e.cycle()
+        assert any('was destroyed while it was being sent' in m for m in self.errors(e2e))
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == first
+        assert set(e2e.server_snaps()) == {first, lost}
+        lost_guid = e2e.server_snaps()[lost]
+        first_guid = e2e.server_snaps()[first]
+
+        newest = self.snapshots(e2e, [3])[0]
+        mark = self.n_errors(e2e)
+        assert e2e.cycle() is True
+
+        assert self.errors(e2e, mark) == []
+        assert set(e2e.server_snaps()) == {first, newest}            # `lost` went, nothing else
+        assert e2e.server_snaps()[first] == first_guid
+        assert lost_guid not in e2e.server_snaps().values()
+        self.assert_on_the_server(e2e, [first, newest])
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == newest
+
+    # -- -F is still right when it destroys nothing -----------------------------------------------
+
+    def test_a_modified_server_head_with_the_base_the_newest_snapshot_still_succeeds(self, e2e):
+        """Someone wrote to the server's copy since its last snapshot: zfs wants `-F` to discard that, and
+        the guard must allow it (nothing newer than the base exists)."""
+        first = self.snapshots(e2e, [10])[0]
+        assert e2e.cycle() is True
+        mountpoint = _zfs_get(e2e.server_ds, 'mountpoint')
+        mount = subprocess.run([_zfs_cmd(), 'mount', e2e.server_ds], capture_output=True, text=True)
+        if mount.returncode != 0:
+            pytest.skip(f'cannot mount the server copy: {mount.stderr.strip()}')
+        cmd = ['dd', 'if=/dev/urandom', f'of={mountpoint}/dirty.bin', 'bs=65536', 'count=4']
+        if subprocess.run(cmd, capture_output=True).returncode != 0 and \
+                subprocess.run(['sudo', '-n'] + cmd, capture_output=True).returncode != 0:
+            pytest.skip(f'cannot write into the server copy at {mountpoint}')
+        subprocess.run(['sync'])
+        deadline = time.monotonic() + 15
+        while _zfs_get(e2e.server_ds, 'written') == '0' and time.monotonic() < deadline:
+            time.sleep(0.5)                                      # `written` follows the transaction group
+        assert _zfs_get(e2e.server_ds, 'written') != '0', 'the write never showed in `written`'
+        second = self.snapshots(e2e, [6])[0]
+        mark = self.n_errors(e2e)
+
+        assert e2e.cycle() is True
+
+        assert self.errors(e2e, mark) == []
+        assert set(e2e.server_snaps()) == {first, second}
+        self.assert_on_the_server(e2e, [first, second])
+        assert e2e.manager.get_anchor(e2e.dsi, DEST) == second
+
+    # -- a full stream onto a copy that has snapshots -------------------------------------------------
+
+    def lose_every_local_snapshot(self, e2e, names):
+        for name in names:
+            zfs.destroy(Snapshot(e2e.source, name), destroy=True)
+        return e2e.snapshot(1)
+
+    def test_a_full_stream_onto_a_copy_with_snapshots_is_refused_by_the_client(self, e2e):
+        names = self.prime(e2e)
+        before = e2e.server_snaps()
+        self.lose_every_local_snapshot(e2e, names)
+        mark = self.n_errors(e2e)
+
+        assert e2e.cycle() is False
+        assert e2e.cycle() is False
+
+        assert e2e.server_snaps() == before
+        assert len(self.errors(e2e, mark)) == 1 and 'zfs rename' in self.errors(e2e, mark)[0]
+        assert e2e.server_prop('receive_resume_token') == '-'
+
+    def test_a_full_stream_onto_a_copy_with_snapshots_is_refused_by_the_server(self, e2e):
+        names = self.prime(e2e)
+        before = e2e.server_snaps()
+        self.lose_every_local_snapshot(e2e, names)
+        mark = self.n_errors(e2e)
+        with mock.patch.object(e2e.remote_mgr, '_rollback_permit', return_value=()):
+            assert e2e.cycle() is False
+
+        assert e2e.server_snaps() == before
+        assert any('refused' in m for m in self.errors(e2e, mark))
+        assert e2e.server_prop('receive_resume_token') == '-'

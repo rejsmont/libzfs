@@ -1774,3 +1774,241 @@ class TestSimpleWebsocketPin:
         assert spec is not None, "pyproject.toml does not pin simple-websocket"
         installed = importlib.metadata.version("simple-websocket")
         assert installed in SpecifierSet(spec.replace(" ", "")), (installed, spec)
+
+
+# ---------------------------------------------------------------------------
+# Plan S-2: the write-stall bound (`_write_started`, `force_eof_if_write_stalled`)
+# ---------------------------------------------------------------------------
+
+
+class FailingTls(FakeTls):
+    """A connection whose write fails (or blocks first, on `gate`)."""
+
+    def __init__(self, *, exc=None, gate=None, **kw):
+        super().__init__(**kw)
+        self.exc = exc
+        self.gate = gate
+        self.entered = threading.Event()
+
+    def sendall(self, data, flags=0):
+        self.entered.set()
+        if self.gate is not None:
+            assert self.gate.wait(IO_TIMEOUT), "test bug: never released"
+        if self.exc is not None:
+            raise self.exc
+        super().sendall(data, flags)
+
+
+def small_pair(session_cls):
+    """A session over a real loopback socket with tiny buffers, and its peer."""
+    tls, peer = SockTls.pair()
+    tls.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    peer.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    return session_cls(tls), tls, peer
+
+
+@pytest.mark.unit
+class TestWriteStallCheck:
+    def test_the_check_is_offered_to_the_registry(self, session_cls):
+        assert callable(session_cls.force_eof_if_write_stalled)
+        sess = session_cls(FakeTls())
+        assert sess._write_started is None
+
+    def test_a_blocked_sendall_is_released_past_the_limit(self, session_cls):
+        sess, tls, peer = small_pair(session_cls)
+        try:
+            writer, box = in_thread(sess.sendall, b"z" * (64 * 1024 * 1024))   # the peer never reads
+            assert eventually(lambda: sess._write_started is not None, 5.0, 0.005)
+            time.sleep(0.4)
+            assert writer.is_alive(), "the write did not block"
+            age = sess.force_eof_if_write_stalled(0.2)
+            assert age is not None and age >= 0.4 - 0.05
+            writer.join(IO_TIMEOUT)
+            assert not writer.is_alive()
+            assert isinstance(box.exc, OSError)                 # EPIPE / reset: the write failed
+            assert sess._write_started is None and sess._busy == 0
+        finally:
+            tls.close()
+            peer.close()
+
+    def test_below_the_limit_nothing_is_cut_and_the_write_completes(self, session_cls):
+        sess, tls, peer = small_pair(session_cls)
+        payload = b"z" * (2 * 1024 * 1024)
+        try:
+            writer, box = in_thread(sess.sendall, payload)
+            assert eventually(lambda: sess._write_started is not None, 5.0, 0.005)
+            time.sleep(0.2)
+            assert sess.force_eof_if_write_stalled(60.0) is None
+            assert writer.is_alive(), "a check below the limit must not shut the connection"
+            got = _read_exactly(peer, len(payload))             # the peer reads at last
+            writer.join(IO_TIMEOUT)
+            assert box.exc is None and len(got) == len(payload)
+        finally:
+            tls.close()
+            peer.close()
+
+    def test_idle_means_none_whatever_the_limit(self, session_cls):
+        sess = session_cls(FakeTls())
+        for limit in (-1.0, 0.0, 1.0):
+            assert sess.force_eof_if_write_stalled(limit) is None
+        sess.sendall(b"done")
+        for limit in (-1.0, 0.0):
+            assert sess.force_eof_if_write_stalled(limit) is None
+        assert sess._write_started is None
+
+    def test_the_mark_is_a_monotonic_time_set_when_the_write_starts(self, session_cls):
+        gate = threading.Event()
+        tls = FailingTls(gate=gate)
+        sess = session_cls(tls)
+        before = time.monotonic()
+        writer, _ = in_thread(sess.sendall, b"x")
+        try:
+            assert tls.entered.wait(IO_TIMEOUT)
+            mark = sess._write_started
+            assert mark is not None and before <= mark <= time.monotonic()
+        finally:
+            gate.set()
+            writer.join(IO_TIMEOUT)
+        assert sess._write_started is None
+
+    def test_a_write_that_finished_and_was_replaced_is_not_cut_by_a_stale_check(
+        self, session_cls
+    ):
+        """The first write started long ago and is over; the second one is young. A check
+        whose limit lies between the two ages must find only the young one."""
+        gate = threading.Event()
+        tls = FailingTls()
+        sess = session_cls(tls)
+        forced = []
+        sess.force_eof = lambda: forced.append(True)
+        sess.sendall(b"first")
+        time.sleep(0.4)
+        tls.gate = gate
+        tls.entered.clear()
+        writer, _ = in_thread(sess.sendall, b"second")
+        try:
+            assert tls.entered.wait(IO_TIMEOUT)
+            assert sess.force_eof_if_write_stalled(0.3) is None     # 0.4 s ago would exceed it
+            assert forced == []
+        finally:
+            gate.set()
+            writer.join(IO_TIMEOUT)
+        assert sess.force_eof_if_write_stalled(0.0) is None
+
+    def test_a_cut_only_ever_happens_while_a_write_is_recorded(self, session_cls):
+        """Check and shutdown are one step under `_state`: whenever `force_eof` runs, the
+        write that justifies it is still in progress. A checker hammering a writer that starts
+        and ends thousands of writes never sees the opposite."""
+        tls = FakeTls()
+        sess = session_cls(tls)
+        violations, cuts = [], []
+
+        def force():
+            cuts.append(1)
+            if sess._write_started is None or not sess._busy:
+                violations.append(True)
+
+        sess.force_eof = force
+        stop = threading.Event()
+
+        def write_loop():
+            while not stop.is_set():
+                sess.sendall(b"w")
+
+        writer, _ = in_thread(write_loop)
+        try:
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                sess.force_eof_if_write_stalled(0.0)
+        finally:
+            stop.set()
+            writer.join(IO_TIMEOUT)
+        assert cuts, "the checker never caught a write in progress: the test proves nothing"
+        assert violations == []
+
+    def test_the_mark_is_cleared_after_a_failed_write(self, session_cls):
+        sess = session_cls(FailingTls(exc=OSError(errno.ECONNRESET, "reset")))
+        with pytest.raises(OSError):
+            sess.sendall(b"x")
+        assert sess._write_started is None and sess._busy == 0
+        assert sess.force_eof_if_write_stalled(0.0) is None
+
+    def test_a_refused_write_after_end_leaves_no_mark(self, session_cls):
+        sess = session_cls(FakeTls())
+        sess.end(1.0)
+        with pytest.raises(BrokenPipeError):
+            sess.sendall(b"x")
+        assert sess._write_started is None
+
+    def test_recv_never_sets_the_mark(self, session_cls):
+        gate = threading.Event()
+        tls = FakeTls(recv_gate=gate)
+        sess = session_cls(tls)
+        reader, box = in_thread(sess.recv, 10)
+        try:
+            assert tls.recv_entered.wait(IO_TIMEOUT)
+            assert sess._write_started is None
+            assert sess.force_eof_if_write_stalled(-1.0) is None     # a silent reader is not a stall
+        finally:
+            gate.set()
+            reader.join(IO_TIMEOUT)
+        assert box.value == b"data" and sess._write_started is None
+
+    def test_a_write_queued_behind_a_blocked_one_does_not_count(self, session_cls):
+        """Only the write inside the connection is timed: a second writer waiting for the
+        write lock has not started."""
+        gate = threading.Event()
+        tls = FailingTls(gate=gate)
+        sess = session_cls(tls)
+        first, _ = in_thread(sess.sendall, b"1")
+        assert tls.entered.wait(IO_TIMEOUT)
+        mark = sess._write_started
+        second, _ = in_thread(sess.sendall, b"2")
+        time.sleep(0.2)
+        try:
+            assert sess._write_started == mark
+        finally:
+            gate.set()
+            first.join(IO_TIMEOUT)
+            second.join(IO_TIMEOUT)
+        assert sess._write_started is None
+
+    def test_it_does_not_wait_for_the_write_lock(self, session_cls):
+        """The checker must never queue behind the writer it is trying to release."""
+        gate = threading.Event()
+        tls = FailingTls(gate=gate)
+        sess = session_cls(tls)
+        writer, _ = in_thread(sess.sendall, b"1")
+        assert tls.entered.wait(IO_TIMEOUT)
+        forced = []
+        sess.force_eof = lambda: forced.append(True)
+        try:
+            started = time.monotonic()
+            age = sess.force_eof_if_write_stalled(-1.0)
+            assert age is not None and time.monotonic() - started < 2.0
+            assert forced == [True]
+        finally:
+            gate.set()
+            writer.join(IO_TIMEOUT)
+
+    def test_after_end_the_check_finds_nothing(self, session_cls):
+        sess = session_cls(FakeTls())
+        sess.end(1.0)
+        assert sess.force_eof_if_write_stalled(-1.0) is None
+
+    def test_it_never_raises_on_a_connection_already_closed(self, session_cls):
+        gate = threading.Event()
+        a, b = tcp_pair()
+        sess = session_cls(a)
+        tls_gate = FailingTls(gate=gate)
+        sess._tls = tls_gate                                  # so the write can be held
+        writer, _ = in_thread(sess.sendall, b"1")
+        assert tls_gate.entered.wait(IO_TIMEOUT)
+        sess._tls = a
+        a.close()
+        try:
+            assert sess.force_eof_if_write_stalled(-1.0) is not None     # EBADF swallowed
+        finally:
+            gate.set()
+            writer.join(IO_TIMEOUT)
+            b.close()

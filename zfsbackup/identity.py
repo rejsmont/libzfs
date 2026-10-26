@@ -133,6 +133,9 @@ __all__ = [
     "Identity",
     "IdentityError",
     "IdentityChanged",
+    "CLIENT_CERT_EXPIRY_WARN_DAYS",
+    "client_cert_not_after",
+    "client_cert_expiry_problem",
     "CertInfo",
     "ClientCertInfo",
     "ensure_identity",
@@ -141,6 +144,8 @@ __all__ = [
     "promote_identity",
     "complete_promotion",
     "discard_identity",
+    "copy_tls_dir",
+    "KeyUnreadable",
     # TLS
     "PinMismatch",
     "server_context",
@@ -695,6 +700,44 @@ def peek_identity(directory: Union[str, Path], name: str) -> Optional[CertInfo]:
         not_after=cert.not_valid_after_utc,
         subject=cert.subject.rfc4514_string(),
     )
+
+
+#: A client certificate that expires within this many days is reported by
+#: `client_cert_expiry_problem` (the daemon's start/reload check and the
+#: remote worker's daily check).
+CLIENT_CERT_EXPIRY_WARN_DAYS = 30
+
+
+def client_cert_not_after(cert_path: Union[str, Path]) -> datetime:
+    """The `not_after` (timezone-aware UTC) of the first certificate in
+    `cert_path`, without touching any key, so an expired certificate -- which
+    `load_identity` refuses -- can still be described. Raises `IdentityError`
+    when the file is missing, unreadable or not PEM."""
+    return _load_cert_file(Path(cert_path)).not_valid_after_utc
+
+
+def client_cert_expiry_problem(
+    cert_path: Union[str, Path], not_after: datetime, now: Optional[datetime] = None,
+) -> Optional[Tuple[int, str]]:
+    """`(logging level, message)` when the client certificate `cert_path`
+    has expired (`logging.ERROR`) or expires within
+    `CLIENT_CERT_EXPIRY_WARN_DAYS` (`logging.WARNING`), else `None`. Pure:
+    nothing is read or logged. `now` defaults to the current time (naive
+    values are taken as UTC)."""
+    left = not_after - _now(now)
+    when = f"{not_after:%Y-%m-%d %H:%M} UTC"
+    if left < timedelta(0):
+        return logging.ERROR, (
+            f"the client certificate {cert_path} expired on {when}; remote backups "
+            "fail until it is replaced (`identity rotate` needs a valid certificate: "
+            "enroll again with a new token, `zfsbackup-config enroll DESTINATION ...`)"
+        )
+    if left < timedelta(days=CLIENT_CERT_EXPIRY_WARN_DAYS):
+        return logging.WARNING, (
+            f"the client certificate {cert_path} expires on {when} (in "
+            f"{max(left.days, 0)} day(s)); rotate it: `zfsbackup-config identity rotate`"
+        )
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -1594,6 +1637,182 @@ def discard_identity(
                 os.close(lock_fd)
     finally:
         os.close(dir_fd)
+
+
+# --------------------------------------------------------------------------
+# A consistent copy of the TLS directory (backups)
+# --------------------------------------------------------------------------
+
+#: What `copy_tls_dir` copies, key files marked. An explicit list, not a glob:
+#: `identity.lock` and the writers' `.<name>.tmp` files are not identities.
+_COPIED_FILES = (
+    (SERVER_CRT, False), (SERVER_KEY, True),
+    (CLIENT_CRT, False), (CLIENT_KEY, True),
+    (CLIENT_NEXT_CRT, False), (CLIENT_NEXT_KEY, True),
+)
+
+
+class KeyUnreadable(PermissionError):
+    """`copy_tls_dir` may not read a private key (they are 0600 and owned by
+    the daemon's user, so a group operator cannot). `filename` is the key.
+    Nothing has been created at the destination when this is raised; copy
+    the certificates only with `include_keys=False`."""
+
+    def __init__(self, path: Union[str, Path]):
+        super().__init__(errno.EACCES, "permission denied reading a TLS private key", str(path))
+
+
+def copy_tls_dir(
+    src: Union[str, Path],
+    dst: Union[str, Path],
+    *,
+    include_keys: bool = True,
+    lock_timeout: float = _DEFAULT_LOCK_TIMEOUT,
+) -> List[str]:
+    """Copy the identities in the TLS directory `src` (`server.*`, `client.*`,
+    `client.next.*`) to `dst`, as one consistent snapshot; -> the names copied.
+
+    The files are read while holding `src/identity.lock` shared (no writer runs
+    meanwhile), so a certificate and its key are never read from either side
+    of a rotation or promotion. The lock is released before anything is
+    written. The lock is opened read-only (never created) and taken shared, so it
+    does not hold up the daemon's own readers. The identity lock file itself is
+    not copied; if `src` has none, the files are read unlocked and read again
+    under the lock if one has appeared meanwhile.
+
+    `dst` is created (0700; its parent must exist) or may be an existing
+    directory (set to 0700); an existing file is never overwritten
+    (`IdentityError`). Keys are written 0600, certificates 0640. On failure
+    whatever this call created is removed again.
+
+    `include_keys=False` copies certificates only and never opens a key. A key
+    this process may not read raises `KeyUnreadable` (a `PermissionError`)
+    before anything is created. A missing `src` or any other failure is
+    `IdentityError`. Only the stdlib and `cryptography` are involved; the
+    contents are copied verbatim and not parsed.
+    """
+    src_dir, dst_dir = Path(src), Path(dst)
+    try:
+        src_fd = os.open(str(src_dir), os.O_RDONLY | _O_CLOEXEC | _O_NOFOLLOW | _O_DIRECTORY)
+    except FileNotFoundError:
+        raise IdentityError(f"TLS directory {src_dir} does not exist", src_dir) from None
+    except OSError as exc:
+        what = (
+            "is a symlink or not a directory"
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR) else exc.strerror
+        )
+        raise IdentityError(f"cannot read TLS directory {src_dir}: {what}", src_dir) from None
+    try:
+        def read_all() -> List[Tuple[str, bytes, bool]]:
+            found: List[Tuple[str, bytes, bool]] = []
+            for name, is_key in _COPIED_FILES:
+                if is_key and not include_keys:
+                    continue
+                path = src_dir / name
+                if not os.path.lexists(path):
+                    continue
+                try:
+                    data, _ = _read_file(path, "private key" if is_key else "certificate")
+                except _AccessDenied as exc:
+                    if is_key:
+                        raise KeyUnreadable(path) from None
+                    raise IdentityError(str(exc), exc.path) from None
+                found.append((name, data, is_key))
+            return found
+
+        lock_path = src_dir / IDENTITY_LOCK
+
+        def read_locked() -> Optional[List[Tuple[str, bytes, bool]]]:
+            """The files read under a SHARED lock (a writer holds it
+            exclusively while it moves anything, so this excludes every
+            writer; it never blocks the daemon's own shared readers). The
+            lock is opened read-only, so it is never created here. `None` if
+            there is no lock file."""
+            lock_fd, _ = _open_lock(src_dir, None, write=False)
+            if lock_fd is None:
+                return None
+            try:
+                _flock(lock_fd, lock_path, fcntl.LOCK_SH, lock_timeout)
+                return read_all()
+            finally:
+                os.close(lock_fd)
+
+        blobs = read_locked()
+        if blobs is None:
+            # No lock file yet: no writer has ever run here, or one is about
+            # to. Every writer creates the lock BEFORE it touches a file, so
+            # a lock still absent after an unlocked read proves that no
+            # writer overlapped it; one that appeared meanwhile may have, and
+            # the read is redone under that lock.
+            blobs = read_all()
+            if os.path.lexists(lock_path):
+                blobs = read_locked()
+                if blobs is None:  # removed again in between: nothing to lock
+                    blobs = read_all()
+    finally:
+        os.close(src_fd)
+
+    created_dir = False
+    try:
+        os.mkdir(str(dst_dir), 0o700)
+        created_dir = True
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise IdentityError(
+            f"cannot create {dst_dir}: {exc.strerror}", dst_dir
+        ) from None
+    try:
+        dst_fd = os.open(str(dst_dir), os.O_RDONLY | _O_CLOEXEC | _O_NOFOLLOW | _O_DIRECTORY)
+    except OSError as exc:
+        if created_dir:
+            with contextlib.suppress(OSError):
+                os.rmdir(str(dst_dir))
+        raise IdentityError(
+            f"cannot use {dst_dir} as the destination: {exc.strerror}", dst_dir
+        ) from None
+    written: List[str] = []
+    try:
+        os.fchmod(dst_fd, 0o700)  # exactly, whatever the umask
+        for name, data, is_key in blobs:
+            mode = KEY_MODE if is_key else CERT_MODE
+            try:
+                fd = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_CLOEXEC | _O_NOFOLLOW,
+                    mode, dir_fd=dst_fd,
+                )
+            except FileExistsError:
+                raise IdentityError(
+                    f"{dst_dir / name} already exists; not overwriting it", dst_dir / name
+                ) from None
+            except OSError as exc:
+                raise IdentityError(
+                    f"cannot create {dst_dir / name}: {exc.strerror}", dst_dir / name
+                ) from None
+            written.append(name)
+            try:
+                os.fchmod(fd, mode)  # exactly, whatever the umask
+                _write_all(fd, data)
+                os.fsync(fd)
+            except OSError as exc:
+                raise IdentityError(
+                    f"cannot write {dst_dir / name}: {exc.strerror}", dst_dir / name
+                ) from None
+            finally:
+                os.close(fd)
+        _fsync_dir(dst_fd, dst_dir)
+    except BaseException:
+        for name in written:
+            with contextlib.suppress(OSError):
+                os.unlink(name, dir_fd=dst_fd)
+        if created_dir:
+            with contextlib.suppress(OSError):
+                os.rmdir(str(dst_dir))
+        raise
+    finally:
+        os.close(dst_fd)
+    return [name for name, _, _ in blobs]
 
 
 # --------------------------------------------------------------------------

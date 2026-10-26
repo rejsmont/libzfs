@@ -18,7 +18,7 @@
 #      because /tmp is a tmpfs). The MULTIPASS_VM wrapper is deliberately NOT used: `multipass exec` adds
 #      buffering, and stdin=DEVNULL through it hits the known wedge;
 #   5. captures the zfs output formats zfsbackup parses (B4) with a tiny guest script (see --no-formats);
-#   6. with --captures / --captures-only: runs the SP spike (plan items M1-M6, Z1-Z8): ~250 recorded zfs
+#   6. with --captures / --captures-only: runs the SP spike (plan items M1-M7, Z1-Z8): ~250 recorded zfs
 #      commands on a throwaway file-backed pool (keyfiles, never prompts), once per locale (default login
 #      environment, then LC_ALL=C LANG=C), each record kept as exact-byte files for the fixtures (see CAPTURES);
 #   7. prints a per-version summary (pass/fail/skip/error counts and the failing test ids).
@@ -33,7 +33,7 @@
 #   ./scenarios/test_openzfs_matrix.sh --purge              # delete the matrix VMs (only these three) at the end
 #   ./scenarios/test_openzfs_matrix.sh --captures-only      # SP spike only: ship the scripts, run the captures, no pytest/formats
 #   ./scenarios/test_openzfs_matrix.sh --captures           # ... in addition to pytest and the formats
-#   ./scenarios/test_openzfs_matrix.sh --captures-only --sections M3,Z4   # a subset (M1 M2 M3 M4 EP M5 M6 Z2 Z3 Z4 Z5 Z6 Z7)
+#   ./scenarios/test_openzfs_matrix.sh --captures-only --sections M3,Z4   # a subset (M1 M2 M3 M4 EP M5 M6 M7 M8 M9 Z2 Z3 Z4 Z5 Z6 Z7)
 #   ./scenarios/test_openzfs_matrix.sh --captures-only --locales default,C,en_US.utf8   # passes (default: default,C)
 #   SRC_REF=<commit-ish> ...     # ship that tree instead of HEAD; for uncommitted work: SRC_REF=$(git stash create)
 #   MATRIX_LOG_DIR=<dir> ...     # where the per-VM logs go (default: a fresh mktemp dir, printed at the end)
@@ -47,7 +47,10 @@
 #   <vm>.captures/<locale>/{ENV.txt,M1-SUMMARY.tsv,SETUP-ERRORS.log}   versions + locale env; one parsed line per M1 token
 #   <vm>.captures.log   the run's progress;  <vm>.locale-diff.txt  default vs LC_ALL=C, ids/sizes/pool names normalised
 #   Sections: M1 token flags, M2 stale tokens, M3_Z8 destroy failures, M4 listing, EP encryption properties,
-#   M5_Z1 raw receive and -F, M6 -L mismatch, Z2 ownership -o on raw, Z3 partial new dataset, Z4 key unloaded,
+#   M5_Z1 raw receive and -F, M6 -L mismatch, M7 -F/rollback/modified-head semantics (B-2b U1 U2 U4 U5 U6),
+#   M8 the server receive argv (B-2a: -o canmount/readonly/volmode + -x mountpoint/sharenfs/sharesmb/setuid/exec/devices + -h on plain/raw
+#   filesystems and volumes, holds, resume, -F onto an existing copy, server-side operations, created ancestors),
+#   M9 zfs version -j / list -j / get -j (plan D8 / S4a: OpenZFS 2.3+ JSON; values with newline/tab/0xff/quote, every source type, sort, -p, received, errors; the usage text on 2.1/2.2), Z2 ownership -o on raw, Z3 partial new dataset, Z4 key unloaded,
 #   Z5 change-key, Z6 encryption/encryptionroot, Z7 raw copy without a key.
 #
 # Exit status: 0 when every selected version ran and no test failed or errored, 1 otherwise, 2 on usage errors.
@@ -105,7 +108,7 @@ done
 for f in ${EXTRA_TESTS[@]+"${EXTRA_TESTS[@]}"}; do
     case "$f" in tests/*.py) ;; *) echo "--extra takes a repo-relative tests/*.py path, got '$f'" >&2; exit 2 ;; esac
 done
-case "$SECTIONS" in *[!A-Za-z0-9,]*) echo "--sections takes a comma list like M3,Z4 (M1 M2 M3 M4 EP M5 M6 Z2 Z3 Z4 Z5 Z6 Z7)" >&2; exit 2 ;; esac
+case "$SECTIONS" in *[!A-Za-z0-9,]*) echo "--sections takes a comma list like M3,Z4 (M1 M2 M3 M4 EP M5 M6 M7 M8 M9 Z2 Z3 Z4 Z5 Z6 Z7)" >&2; exit 2 ;; esac
 case "$LOCALES" in ""|*[!A-Za-z0-9,._@-]*) echo "--locales takes a comma list like default,C" >&2; exit 2 ;; esac
 
 # ─────────────────────────────── Output helpers ─────────────────────────────
@@ -558,7 +561,7 @@ truncate -s "${CAP_POOL_SIZE:-3g}" "$IMG" && zpool create -f -m "/$P" "$P" "$IMG
 cleanup_pool() {
     pkill -x sleep >/dev/null 2>&1
     rm -f "$W/st.out" "$W/st.err"
-    if [ "${CAP_KEEP:-0}" != 1 ]; then zpool destroy -f "$P" >/dev/null 2>&1; rm -f "$IMG" "$KEY1" "$KEY2"; fi
+    if [ "${CAP_KEEP:-0}" != 1 ]; then zpool destroy -f "$P" >/dev/null 2>&1; rm -f "$IMG" "$KEY1" "$KEY2"; rm -rf "$W"/m8-*; fi
 }
 trap cleanup_pool EXIT
 
@@ -997,6 +1000,762 @@ sec_M6() {
     end_section
 }
 
+# ================================================================ M7: -F / rollback / modified-head semantics (plan B-2b: U1 U2 U4 U5 U6)
+# helpers (plain commands only; everything the daemon's receiver would do is spelled out)
+# m7_src <ds> <enc 0|1> <snap>...: a dataset with one fresh random file per snapshot (M7MB MiB, default 3), snapshots in order
+m7_src() {
+    local ds="$1" enc="$2" s o=""; shift 2
+    [ "$enc" = 1 ] && o="-o encryption=aes-256-gcm -o keyformat=passphrase -o keylocation=file://$KEY1"
+    st zfs create -o compression=off $o "$ds" || return 1
+    for s in "$@"; do rnd "/$ds/f_$s" "${M7MB:-3}"; st zfs snapshot "$ds@$s"; done
+}
+# m7_xfer '<sender>' '<receiver>': an UNRECORDED setup transfer
+m7_xfer() { st bash -c "set -o pipefail; $1 | $2"; }
+# m7_hist <src> <target> <w>: the receiver's history is old, new1 (a full stream of old, then an incremental to new1); w = -w for raw
+m7_hist() {
+    m7_xfer "zfs send $3 $1@old" "zfs receive -u $2"
+    m7_xfer "zfs send $3 -i $1@old $1@new1" "zfs receive -u $2"
+}
+# m7_ab <src> <target> <w>: the receiver's newest snapshot is b (full a, incremental a -> b)
+m7_ab() {
+    m7_xfer "zfs send $3 $1@a" "zfs receive -u $2"
+    m7_xfer "zfs send $3 -i $1@a $1@b" "zfs receive -u $2"
+}
+# m7_modify <ds> write|read|mount: change the head of a received dataset (mounts it, then unmounts it again)
+m7_modify() {
+    local ds="$1" how="$2" mp
+    case "$(zfs get -H -o value encryption "$ds" 2>/dev/null)" in off|"") ;; *) st zfs load-key -L "file://$KEY1" "$ds" ;; esac
+    st zfs mount "$ds"
+    mp="$(zfs get -H -o value mountpoint "$ds" 2>/dev/null)"
+    case "$how" in
+        write) st bash -c "echo head-change > '$mp/head_change'" ;;
+        read)  st bash -c "cat '$mp'/f_* >/dev/null" ;;
+        mount) ;;
+    esac
+    st zpool sync "$P"
+    st zfs unmount "$ds"
+}
+m7_written() { cap "$1" zfs get -H -o name,property,value written "$2"; }
+
+sec_M7() {
+    section M7 "-F on an incremental whose receiver is ahead (U1/U2), rollback -r vs local user properties (U4), modified head (U5), full stream onto a copy with snapshots (U6)"
+    local src t tk n how w sfx otherp
+    # ------------------------------------------------------------ U1
+    st zfs create "$R/u1"; src="$R/u1src"
+    m7_src "$src" 0 old new1 new2
+    note "U1: sender $src has old,new1,new2. Each receiver t_* is built with a full stream of @old and an incremental to @new1 (its history is AHEAD of the base @old). Then: zfs send -i @old @new2 | zfs receive [-F] -s -u"
+    snaps U1.00_sender_snaps "$src"
+    for n in a b c d; do m7_hist "$src" "$R/u1/t_$n" ""; done
+    st zfs hold keep "$R/u1/t_d@new1"
+    snaps U1.a1_before "$R/u1/t_a"
+    cappipe U1.a2_F_incr "0" "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u1/t_a"
+    snaps U1.a3_after "$R/u1/t_a"
+    cap U1.a4_token zfs get -H -o name,property,value receive_resume_token "$R/u1/t_a"
+    snaps U1.b1_before "$R/u1/t_b"
+    cappipe U1.b2_noF_incr "0" "zfs send -i $src@old $src@new2" "zfs receive -s -u $R/u1/t_b"
+    snaps U1.b3_after "$R/u1/t_b"
+    cap U1.b4_token zfs get -H -o name,property,value receive_resume_token "$R/u1/t_b"
+    note "U1 c/d: the sender no longer has @new1 (it was destroyed there after the receiver got it: the rollback/restore situation)"
+    st zfs destroy "$src@new1"
+    snaps U1.c0_sender_snaps "$src"
+    snaps U1.c1_before "$R/u1/t_c"
+    cappipe U1.c2_F_incr_sender_lacks_new1 "0" "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u1/t_c"
+    snaps U1.c3_after "$R/u1/t_c"
+    cap U1.d0_holds zfs holds -H "$R/u1/t_d@new1"
+    snaps U1.d1_before "$R/u1/t_d"
+    cappipe U1.d2_F_incr_newer_snapshot_held "0" "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u1/t_d"
+    snaps U1.d3_after "$R/u1/t_d"
+    # ------------------------------------------------------------ U2
+    st zfs create "$R/u2"; src="$R/u2src"
+    m7_src "$src" 0 old new1 new2
+    note "U2: the same -F -s incremental cut after 1000000 bytes; are the newer snapshots still there while the partial state exists; then resume"
+    snaps U2.00_sender_snaps "$src"
+    for n in a b c; do m7_hist "$src" "$R/u2/t_$n" ""; done
+    snaps U2.a1_before "$R/u2/t_a"
+    cappipe U2.a2_F_incr_cut 1000000 "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u2/t_a"
+    snaps U2.a3_while_partial "$R/u2/t_a"
+    cap U2.a3b_list_all zfs list -H -t all -o name,type -r "$R/u2/t_a"
+    cap U2.a4_token_prop zfs get -H -o name,property,value receive_resume_token "$R/u2/t_a"
+    tk="$(tok "$R/u2/t_a")"; echo "$tk" > "$SD/U2.a.token"
+    cap U2.a5_send_nv_t zfs send -nv -t "$tk"
+    cappipe U2.a6_resume_F 0 "zfs send -t $tk" "zfs receive -F -s -u $R/u2/t_a"
+    snaps U2.a7_after_resume "$R/u2/t_a"
+    cap U2.a8_token_prop zfs get -H -o name,property,value receive_resume_token "$R/u2/t_a"
+    note "U2 b: the same cut, then the resume WITHOUT -F"
+    cappipe U2.b1_F_incr_cut 1000000 "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u2/t_b"
+    snaps U2.b2_while_partial "$R/u2/t_b"
+    tk="$(tok "$R/u2/t_b")"; echo "$tk" > "$SD/U2.b.token"
+    cappipe U2.b3_resume_noF 0 "zfs send -t $tk" "zfs receive -s -u $R/u2/t_b"
+    snaps U2.b4_after_resume "$R/u2/t_b"
+    cap U2.b5_token_prop zfs get -H -o name,property,value receive_resume_token "$R/u2/t_b"
+    note "U2 c: the same cut, then zfs receive -A (the server's fresh-mode abort)"
+    cappipe U2.c1_F_incr_cut 1000000 "zfs send -i $src@old $src@new2" "zfs receive -F -s -u $R/u2/t_c"
+    snaps U2.c2_while_partial "$R/u2/t_c"
+    cap U2.c3_abort zfs receive -A "$R/u2/t_c"
+    snaps U2.c4_after_abort "$R/u2/t_c"
+    cap U2.c5_token_prop zfs get -H -o name,property,value receive_resume_token "$R/u2/t_c"
+    # ------------------------------------------------------------ U4
+    st zfs create "$R/u4"; src="$R/u4/src"
+    st zfs create "$src"
+    st zfs set org.zfsbackup:anchor.x=snapA "$src"
+    rnd "/$src/f_a" 1; st zfs snapshot "$src@A"
+    st zfs set org.zfsbackup:anchor.y=afterA "$src"
+    rnd "/$src/f_b" 1; st zfs snapshot "$src@B"
+    rnd "/$src/f_c" 1; st zfs snapshot "$src@C"
+    note "U4: local user properties on the sender survive zfs rollback -r @A?"
+    cap U4.a1_props_before zfs get -H -o name,property,value,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y "$src"
+    snaps U4.a2_snaps_before "$src"
+    cap U4.a3_rollback_without_r zfs rollback "$src@A"
+    cap U4.a4_rollback_r zfs rollback -r "$src@A"
+    snaps U4.a5_snaps_after "$src"
+    cap U4.a6_props_after zfs get -H -o name,property,value,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y "$src"
+    capsh U4.a7_local_all "zfs get -H -s local -o property,value,source all $src | grep -E '^org\\.'"
+    note "U4 b: the anchors arrive as RECEIVED properties (send -p); rollback -r on the receiving copy; plus a local override"
+    m7_xfer "zfs send -p $src@A" "zfs receive -u $R/u4/rcv"
+    st zfs set org.zfsbackup:anchor.w=snapW "$src"; st zfs snapshot "$src@W"
+    m7_xfer "zfs send -p -i $src@A $src@W" "zfs receive -u $R/u4/rcv"
+    rnd "/$src/f_x" 1; st zfs snapshot "$src@X"
+    m7_xfer "zfs send -p -i $src@W $src@X" "zfs receive -u $R/u4/rcv"
+    st zfs set org.zfsbackup:anchor.z=localz "$R/u4/rcv"
+    st zfs set org.zfsbackup:anchor.x=localx "$R/u4/rcv"
+    snaps U4.b1_snaps_before "$R/u4/rcv"
+    cap U4.b2_props_before zfs get -H -o name,property,value,received,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y,org.zfsbackup:anchor.w,org.zfsbackup:anchor.z "$R/u4/rcv"
+    cap U4.b3_rollback_r zfs rollback -r "$R/u4/rcv@A"
+    snaps U4.b4_snaps_after "$R/u4/rcv"
+    cap U4.b5_props_after zfs get -H -o name,property,value,received,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y,org.zfsbackup:anchor.w,org.zfsbackup:anchor.z "$R/u4/rcv"
+    # ------------------------------------------------------------ U5
+    st zfs create "$R/u5"
+    for w in plain raw; do
+        src="$R/u5/src_$w"
+        if [ "$w" = raw ]; then m7_src "$src" 1 a b c; sfx="-w"; else m7_src "$src" 0 a b c; sfx=""; fi
+        note "U5 $w: receiver newest snapshot == base @b, then its head is modified; zfs send $sfx -i @b @c, without -F and then with -F ($RF)"
+        # c0: control, head untouched
+        t="$R/u5/${w}_c0"; m7_ab "$src" "$t" "$sfx"
+        m7_written "U5.$w.c0.1_written" "$t"
+        cappipe "U5.$w.c0.2_noF_untouched" 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -s -u $t"
+        snaps "U5.$w.c0.3_snaps" "$t"
+        for how in mount write read; do
+            t="$R/u5/${w}_$how"; m7_ab "$src" "$t" "$sfx"
+            m7_written "U5.$w.$how.1_written_before" "$t"
+            m7_modify "$t" "$how"
+            m7_written "U5.$w.$how.2_written_after" "$t"
+            cappipe "U5.$w.$how.3_noF" 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -s -u $t"
+            snaps "U5.$w.$how.4_snaps_after_noF" "$t"
+            cappipe "U5.$w.$how.5_F" 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -F -s -u $t"
+            snaps "U5.$w.$how.6_snaps_after_F" "$t"
+            cap "U5.$w.$how.7_diff_ok" zfs get -H -o name,property,value receive_resume_token,written "$t"
+        done
+        if [ "$w" = raw ]; then
+            # the server's case: modified while the key was loaded, then the key is gone again
+            t="$R/u5/raw_unloaded"; m7_ab "$src" "$t" "$sfx"
+            m7_modify "$t" write
+            st zfs unload-key "$t"
+            cap U5.raw.unloaded.1_keystatus zfs get -H -o name,property,value keystatus,written "$t"
+            cappipe U5.raw.unloaded.2_noF 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -s -u $t"
+            cappipe U5.raw.unloaded.3_F 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -F -s -u $t"
+            snaps U5.raw.unloaded.4_snaps_after "$t"
+            # load-key and unload-key only (no mount): does the key load alone modify the head?
+            t="$R/u5/raw_keyload"; m7_ab "$src" "$t" "$sfx"
+            st zfs load-key -L "file://$KEY1" "$t"; st zpool sync "$P"; st zfs unload-key "$t"
+            cap U5.raw.keyload.1_written zfs get -H -o name,property,value keystatus,written "$t"
+            cappipe U5.raw.keyload.2_noF 0 "zfs send $sfx -i $src@b $src@c" "zfs receive -s -u $t"
+            snaps U5.raw.keyload.3_snaps_after "$t"
+        fi
+    done
+    # ------------------------------------------------------------ U6
+    st zfs create "$R/u6"; src="$R/u6/src"; otherp="$R/u6/other"
+    m7_src "$src" 0 a b c
+    m7_src "$otherp" 0 a z
+    m7_src "$R/u6/esrc" 1 a b c
+    note "U6: a FULL stream onto an existing copy; the copy (src a,b) has snapshots a,b. Per case: without -F (zfs receive -s -u), then with -F ($RF), each on a fresh copy"
+    for n in same_newer:"$src@c" same_existing_name:"$src@a" other_same_name:"$otherp@a" other_new_name:"$otherp@z"; do
+        for how in noF F; do
+            t="$R/u6/c_${n%%:*}_$how"; m7_ab "$src" "$t" ""
+            snaps "U6.${n%%:*}.$how.1_before" "$t"
+            cappipe "U6.${n%%:*}.$how.2_recv" 0 "zfs send ${n#*:}" "zfs receive $([ $how = F ] && echo -F) -s -u $t"
+            snaps "U6.${n%%:*}.$how.3_after" "$t"
+            cap "U6.${n%%:*}.$how.4_props" zfs get -H -o name,property,value,source receive_resume_token "$t"
+        done
+    done
+    note "U6 empty: the existing dataset has NO snapshots (placeholder / cut first receive)"
+    for how in noF F; do
+        t="$R/u6/empty_$how"; st zfs create "$t"
+        cappipe "U6.empty.$how.1_recv" 0 "zfs send $src@c" "zfs receive $([ $how = F ] && echo -F) -s -u $t"
+        snaps "U6.empty.$how.2_after" "$t"
+    done
+    note "U6 raw: a raw full stream of the encrypted dataset onto a raw copy that has snapshots a,b"
+    for how in noF F; do
+        t="$R/u6/raw_$how"; m7_ab "$R/u6/esrc" "$t" "-w"
+        snaps "U6.raw.$how.1_before" "$t"
+        cappipe "U6.raw.$how.2_recv" 0 "zfs send -w $R/u6/esrc@c" "zfs receive $([ $how = F ] && echo -F) -s -u $t"
+        snaps "U6.raw.$how.3_after" "$t"
+    done
+    end_section
+}
+
+# ================================================================ M8: the server receive argv (plan B-2a): -o / -x hardening on every dataset type
+# The argv under test (api.py _receive_stream_locked, fresh and resume):
+#   zfs receive -o org.zfsbackup:config=.. -o org.zfsbackup:client_id=.. -o org.zfsbackup:source_dataset=..
+#       -o canmount=noauto -o readonly=on -o volmode=none -x mountpoint -x sharenfs -x sharesmb -x setuid -x exec -x devices
+#       [-F] -h -s -u <ds>
+# and the ancestors: zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=<id> <ancestor>
+M8RO="-o canmount=noauto -o readonly=on -o volmode=none"
+M8X="-x mountpoint -x sharenfs -x sharesmb -x setuid -x exec -x devices"
+M8ARGS="$OWN $M8RO $M8X"
+M8ARGS_VOL="$OWN -o readonly=on -o volmode=none $M8X"          # the same without the filesystem-only canmount (see M8 sec 4)
+M8RXN="zfs receive $M8ARGS -h -s -u"                           # a missing dataset: no -F
+M8RXF="zfs receive $M8ARGS -F -h -s -u"                        # an existing dataset
+M8VXN="zfs receive $M8ARGS_VOL -h -s -u"
+M8VXF="zfs receive $M8ARGS_VOL -F -h -s -u"
+M8O="$OWN $M8RO -o mountpoint=none -o sharenfs=off -o sharesmb=off -o setuid=off -o exec=off -o devices=off"
+M8OV="$OWN -o readonly=on -o volmode=none -o mountpoint=none -o sharenfs=off -o sharesmb=off -o setuid=off -o exec=off -o devices=off"
+M8VS="$OWN -o readonly=on -o volmode=none"
+M8PROPS="type,volsize,mountpoint,canmount,readonly,volmode,sharenfs,sharesmb,setuid,exec,devices,mounted,$PROPS_OWN"
+m8get() { cap "$1" zfs get -H -o name,property,value,received,source "$M8PROPS${3:+,$3}" "$2"; }
+m8snaps() { cap "$1" zfs list -H -t snapshot -o name,guid,createtxg,userrefs -r "$2"; }
+m8tok() { cap "$1" zfs get -H -o name,property,value receive_resume_token "$2"; }
+
+# m8_fs <ds> <mountpoint> <enc 0|1>: a filesystem with hostile LOCAL properties and forged org.zfsbackup:* values.
+# @a (mountpoint as given), then mountpoint (<mp>2) and sharenfs change, @b, @c. (A -p stream carries the LIVE properties, not
+# the snapshot's.) Without nfs-kernel-server / samba the sharenfs/sharesmb sets report "not shared": ignored here, recorded below.
+m8_fs() {
+    local ds="$1" mp="$2" enc="$3" o=""
+    [ "$enc" = 1 ] && o="-o encryption=aes-256-gcm -o keyformat=passphrase -o keylocation=file://$KEY1"
+    zfs create -o compression=off $o -o mountpoint="$mp" -o canmount=on -o setuid=on -o exec=on -o devices=on \
+        -o readonly=off -o volmode=dev -o sharenfs=on "$ds" >/dev/null 2>&1
+    zfs set sharesmb=on "$ds" >/dev/null 2>&1
+    zfs list -H "$ds" >/dev/null 2>&1 || { echo "SETUP FAILED [$SEC]: m8_fs $ds was not created" >> "$OUT/SETUP-ERRORS.log"; return 1; }
+    st zfs set org.zfsbackup:config=FORGED "$ds"; st zfs set org.zfsbackup:client_id=forged-id "$ds"
+    st zfs set org.zfsbackup:source_dataset=forged/ds "$ds"
+    rnd "$mp/f_a" 3; st zfs snapshot "$ds@a"
+    zfs set mountpoint="${mp}2" "$ds" >/dev/null 2>&1; zfs set sharenfs=ro "$ds" >/dev/null 2>&1
+    rnd "${mp}2/f_b" 3; st zfs snapshot "$ds@b"
+    rnd "${mp}2/f_c" 3; st zfs snapshot "$ds@c"
+}
+# m8_node <zvol>: wait for the /dev/zvol node of a volume that should have one
+m8_node() { local i; for i in $(seq 1 50); do [ -e "/dev/zvol/$1" ] && break; sleep 0.2; done; udevadm settle >/dev/null 2>&1; }
+# m8_zv <ds> <enc 0|1>: an 8 MiB volume (volmode=dev, then readonly=off local), 5 MiB of random data in @a, rewrites in @b and @c
+m8_zv() {
+    local ds="$1" o="-o volmode=dev"
+    [ "$2" = 1 ] && o="$o -o encryption=aes-256-gcm -o keyformat=passphrase -o keylocation=file://$KEY1"
+    # NEVER 'zfs create -V ... -o volmode=dev -o readonly=<x>': on OpenZFS 2.4.1 (Ubuntu 26.04, kernel 7.0.0-38, arm64) that is a kernel
+    # NULL dereference in zvol_os_set_disk_ro (the zfs process dies with SIGSEGV and every later zvol operation hangs in D state until
+    # the VM is power-cycled). readonly is set on the existing volume instead (fine on all three versions).
+    zfs create -V 8M $o "$ds" >/dev/null 2>&1 || { echo "SETUP FAILED [$SEC]: m8_zv $ds was not created" >> "$OUT/SETUP-ERRORS.log"; return 1; }
+    st zfs set readonly=off "$ds"
+    m8_node "$ds"
+    st dd if=/dev/urandom of="/dev/zvol/$ds" bs=1M count=5 conv=fsync status=none; st zfs snapshot "$ds@a"
+    st dd if=/dev/urandom of="/dev/zvol/$ds" bs=1M count=3 seek=3 conv=fsync status=none; st zfs snapshot "$ds@b"
+    st dd if=/dev/urandom of="/dev/zvol/$ds" bs=1M count=2 seek=1 conv=fsync status=none; st zfs snapshot "$ds@c"
+}
+# m8_nodes <id>: which /dev/zvol and /dev/zd* nodes exist (the sources have one each; a received volume must not add one)
+m8_nodes() {
+    capsh "$1" "udevadm settle; echo '# find /dev/zvol/$R'; find /dev/zvol/$R -mindepth 1 2>&1 | sort; echo '# /dev/zd* count'; ls /dev/zd* 2>/dev/null | wc -l"
+}
+# m8_mounts <id> <ds>: mount -a, then everything still mounted or shared under <ds>; THEN an explicit 'zfs share <fs>' on each
+# filesystem (on Linux that mounts a canmount=noauto dataset whose sharenfs/sharesmb is effective: see its "mounted" afterwards)
+m8_mounts() {
+    cap "$1.1_zfs_mount_a" zfs mount -a
+    capsh "$1.2_zfs_mount_list" "zfs mount | grep -F '$2/'; echo grep_rc=\$?"
+    capsh "$1.3_proc_mounts" "grep -F '$2/' /proc/mounts; echo grep_rc=\$?"
+    cap "$1.4_mounted_shared_props" zfs get -H -r -t filesystem -o name,property,value,source mounted,sharenfs,sharesmb "$2"
+    capsh "$1.5_zfs_share_each" "for d in \$(zfs list -H -t filesystem -o name -r '$2'); do echo \"## \$d\"; zfs share \"\$d\" 2>&1; echo rc=\$?; done"
+    cap "$1.6_mounted_after_share" zfs get -H -r -t filesystem -o name,property,value mounted "$2"
+    capsh "$1.7_zfs_mount_list_after_share" "zfs mount | grep -F '$2/'; echo grep_rc=\$?"
+    capsh "$1.8_unmount_what_share_mounted" "for i in 1 2 3; do for d in \$(zfs mount | awk '{print \$1}' | grep -F '$2/' | tac); do zfs unmount \"\$d\" 2>/dev/null; done; done; zfs mount | grep -F '$2/'; echo grep_rc=\$?"
+}
+# m8_build <T> <src> <snd> <rxn> <rxf>: an UNRECORDED setup: full @a, then the incremental @a -> @b
+m8_build() { m7_xfer "$3 $2@a" "$4 $1"; m7_xfer "$3 -i $2@a $2@b" "$5 $1"; }
+
+sec_M8() {
+    section M8 "the server receive argv (B-2a): -o canmount/readonly/volmode + -x mountpoint/sharenfs/sharesmb/setuid/exec/devices + -h on plain/raw filesystems and volumes, -p, holds, resume, -F onto an existing copy, server-side operations, ancestors"
+    local fsp="$R/fsp" efs="$R/efs" zvp="$R/zvp" zve="$R/zve" ctl="$R/ctl" hs="$R/hs" srvm="$R/srvm" esrvm="$R/esrvm"
+    local SPL="zfs send -L -c" SPLP="zfs send -p -L -c" SRAW="zfs send -w" SRAWP="zfs send -w -p"
+    local T T2 tk mode S SND RN RF2 n nm opt p f k
+    # ---- fixtures (unrecorded): hostile sources, volumes, and the server parents built the way api.py builds them
+    m8_fs "$fsp" "$W/m8-fsp" 0
+    m8_fs "$efs" "$W/m8-efs" 1
+    m8_zv "$zvp" 0
+    m8_zv "$zve" 1
+    st zfs create -o compression=off "$hs"; rnd "/$hs/f_a" 2; st zfs snapshot "$hs@a"; rnd "/$hs/f_b" 2; st zfs snapshot "$hs@b"
+    st zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x "$srvm"; st zfs set mountpoint="$W/m8-srv" "$srvm"
+    st zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x -o encryption=aes-256-gcm -o keyformat=passphrase \
+        -o keylocation=file://$KEY2 -o mountpoint="$W/m8-esrv" "$esrvm"
+    note "fixtures: fsp = hostile plain fs (mountpoint=$W/m8-fsp then $W/m8-fsp2, canmount=on setuid/exec/devices=on readonly=off volmode=dev sharenfs=on then ro, sharesmb=on, forged org.zfsbackup:*) @a @b @c; efs = the same, encrypted (key loaded); zvp/zve = 8M volumes (volmode=dev readonly=off), plain / encrypted, @a @b @c; hs = plain fs for holds. srvm / esrvm = server parents created with 'zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x' (esrvm encrypted, key loaded), mountpoint set to a temp path so a wrongly mounted copy would show"
+    capsh C0.hostile_create_and_share "zfs create -o mountpoint=$W/m8-probe -o canmount=on -o sharenfs=on $R/probe; echo create_rc=\$?; zfs set sharesmb=on $R/probe; echo set_sharesmb_rc=\$?; zfs set sharenfs=ro $R/probe; echo set_sharenfs_rc=\$?; zfs get -H -o name,property,value,source sharenfs,sharesmb,mounted $R/probe"
+    cap C0.fsp_props zfs get -H -o name,property,value,source mountpoint,canmount,readonly,volmode,sharenfs,sharesmb,setuid,exec,devices,$PROPS_OWN "$fsp"
+    cap C0.zvp_props zfs get -H -o name,property,value,source type,volsize,volmode,readonly,canmount "$zvp"
+    cap C0.srvm_props zfs get -H -o name,property,value,source canmount,mounted,mountpoint,encryption,keystatus,org.zfsbackup:client_id "$srvm" "$esrvm"
+
+    # ================================ 1: plain (-L -c) full into a missing dataset, then the incremental (-F: the dataset exists), no -p
+    note "1: $SPL (no -p) into a missing dataset, then the incremental: M8RXN = '$M8RXN', M8RXF = '$M8RXF'"
+    T="$srvm/c1"
+    cappipe C1.1_full 0 "$SPL $fsp@a" "$M8RXN $T"
+    m8get C1.2_props "$T"; m8snaps C1.3_snaps "$T"
+    cappipe C1.4_incr 0 "$SPL -i $fsp@a $fsp@b" "$M8RXF $T"
+    m8get C1.5_props "$T"; m8snaps C1.6_snaps "$T"
+    capsh C1.7_all_local "zfs get -H -s local,received -o property,value,received,source all $T | sort"
+
+    # ================================ 2: the same with a -p stream (hostile properties on the source); then mount -a / share
+    note "2: the same with $SPLP; the stream carries mountpoint=$W/m8-fsp2 (live value), canmount=on, setuid/exec/devices=on, sharenfs=ro, sharesmb=on, readonly=off, volmode=dev and forged org.zfsbackup:* values"
+    T="$srvm/c2"
+    cappipe C2.1_full_p 0 "$SPLP $fsp@a" "$M8RXN $T"
+    m8get C2.2_props "$T"; m8snaps C2.3_snaps "$T"
+    cappipe C2.4_incr_p 0 "$SPLP -i $fsp@a $fsp@b" "$M8RXF $T"
+    m8get C2.5_props "$T"; m8snaps C2.6_snaps "$T"
+    capsh C2.7_all_local "zfs get -H -s local,received -o property,value,received,source all $T | sort"
+    m8_mounts C2.8 "$srvm"
+    capsh C2.9_dirs "find $W/m8-srv $W/m8-fsp2 -maxdepth 2 2>&1 | sort"
+    note "2 control: the SAME -p stream received WITHOUT the hardening (no -o, no -x) after the source is gone, then mount -a: does the attack work? (the source is destroyed first so its mountpoint is free)"
+    m8_fs "$ctl" "$W/m8-ctl" 0
+    zfs set mountpoint="$W/m8-ctl" "$ctl" >/dev/null 2>&1
+    capsh C2.10_ctl_stream "zfs send -p $ctl@a > $W/m8-ctl.stream; echo send_rc=\$?; ls -l $W/m8-ctl.stream | awk '{print \$5}'"
+    st zfs destroy -r "$ctl"
+    cap C2.11_ctl_receive_unhardened bash -c "zfs receive -s -u $srvm/ctl < $W/m8-ctl.stream"
+    m8get C2.12_ctl_props "$srvm/ctl"
+    cap C2.13_ctl_mount_a zfs mount -a
+    capsh C2.14_ctl_mount_list "zfs mount | grep -F '$srvm/'; echo grep_rc=\$?"
+    st zfs destroy -r "$srvm/ctl"; rm -f "$W/m8-ctl.stream"
+
+    # ================================ 3: raw (-w) from an encrypted source, with and without -p
+    note "3: raw full / incremental, with and without -p, into an unencrypted parent (srvm) and an encrypted one (esrvm, key loaded)"
+    for p in nop p; do
+        SND="$SRAW"; [ $p = p ] && SND="$SRAWP"
+        T="$srvm/r_$p"
+        cappipe "C3.$p.1_full" 0 "$SND $efs@a" "$M8RXN $T"
+        m8get "C3.$p.2_props" "$T" encryption,keystatus,encryptionroot; m8snaps "C3.$p.3_snaps" "$T"
+        cappipe "C3.$p.4_incr" 0 "$SND -i $efs@a $efs@b" "$M8RXF $T"
+        m8get "C3.$p.5_props" "$T" encryption,keystatus,encryptionroot; m8snaps "C3.$p.6_snaps" "$T"
+        T="$esrvm/r_$p"
+        cappipe "C3.$p.7_full_enc_parent" 0 "$SND $efs@a" "$M8RXN $T"
+        m8get "C3.$p.8_props_enc_parent" "$T" encryption,keystatus,encryptionroot
+        cappipe "C3.$p.9_incr_enc_parent" 0 "$SND -i $efs@a $efs@b" "$M8RXF $T"
+        m8get "C3.$p.10_props_enc_parent" "$T" encryption,keystatus,encryptionroot
+    done
+    note "3: with the key loaded on the raw copy, does mount -a mount it (canmount=noauto)?"
+    cap C3.11_load_key zfs load-key -L "file://$KEY1" "$srvm/r_p"
+    m8_mounts C3.12 "$srvm"
+    cap C3.13_unload_key zfs unload-key "$srvm/r_p"
+
+    # ================================ 4: volumes
+    note "4: a ZVOL source, full and incremental, plain and raw, -p and not. FIRST the full argv; THEN every option alone (which one is refused?); THEN the argv without canmount"
+    for mode in plain raw; do
+        for p in nop p; do
+            if [ $mode = plain ]; then S="$zvp"; SND="$SPL"; [ $p = p ] && SND="$SPLP"; else S="$zve"; SND="$SRAW"; [ $p = p ] && SND="$SRAWP"; fi
+            T="$srvm/v_${mode}_$p"
+            cappipe "C4.$mode.$p.1_full_argv" 0 "$SND $S@a" "$M8RXN $T"
+            cap "C4.$mode.$p.2_exists" zfs list -H -o name,type -t all -r "$srvm"
+            m8_nodes "C4.$mode.$p.3_nodes"
+        done
+    done
+    for mode in plain raw; do
+        if [ $mode = plain ]; then S="$zvp"; SND="$SPLP"; else S="$zve"; SND="$SRAWP"; fi
+        n=0
+        for opt in "-o canmount=noauto" "-o readonly=on" "-o volmode=none" "-x mountpoint" "-x sharenfs" "-x sharesmb" "-x setuid" "-x exec" "-x devices" \
+                   "-h" "$OWN" "$OWN $M8RO" "$M8X" "$OWN -o readonly=on -o volmode=none $M8X"; do
+            n=$((n+1)); nm="$(printf '%s' "$opt" | cut -c1-24 | tr -c 'A-Za-z0-9\n' '_')"
+            cappipe "C4.opt.$mode.$(printf %02d $n)_$nm" 0 "$SND $S@a" "zfs receive $opt -s -u $srvm/vo_${mode}_$n"
+        done
+    done
+    note "4 viable argv: M8ARGS_VOL = '$M8ARGS_VOL' (no canmount): full, node check, incremental with -F and with the FULL argv, for plain / raw x -p / not"
+    for mode in plain raw; do
+        for p in nop p; do
+            if [ $mode = plain ]; then S="$zvp"; SND="$SPL"; [ $p = p ] && SND="$SPLP"; else S="$zve"; SND="$SRAW"; [ $p = p ] && SND="$SRAWP"; fi
+            T="$srvm/vv_${mode}_$p"
+            cappipe "C4.vol.$mode.$p.1_full" 0 "$SND $S@a" "$M8VXN $T"
+            m8get "C4.vol.$mode.$p.2_props" "$T" encryption,keystatus,refreservation; m8snaps "C4.vol.$mode.$p.3_snaps" "$T"
+            m8_nodes "C4.vol.$mode.$p.4_nodes"
+            cappipe "C4.vol.$mode.$p.5_incr" 0 "$SND -i $S@a $S@b" "$M8VXF $T"
+            m8get "C4.vol.$mode.$p.6_props" "$T"; m8snaps "C4.vol.$mode.$p.7_snaps" "$T"
+            m8_nodes "C4.vol.$mode.$p.8_nodes"
+            cappipe "C4.vol.$mode.$p.9_incr_full_argv" 0 "$SND -i $S@b $S@c" "$M8RXF $T"
+            m8snaps "C4.vol.$mode.$p.10_snaps" "$T"
+        done
+    done
+
+    # ================================ 5: send -h (holds)
+    note "5: holds on the source snapshots @a @b; send -h variants into the hardened argv (receive -h) and, as a contrast, without receive -h"
+    st zfs hold keep "$hs@a"; st zfs hold keep "$hs@b"
+    cap C5.0_source_holds zfs holds -H "$hs@a" "$hs@b"
+    n=0
+    for f in "-h" "-p -h" "-R -h" "-L -c -h"; do
+        n=$((n+1))
+        cappipe "C5.$n.1_send_h_recv_h" 0 "zfs send $f $hs@a" "$M8RXN $srvm/h_$n"
+        m8snaps "C5.$n.2_snaps" "$srvm/h_$n"; cap "C5.$n.3_holds" zfs holds -H "$srvm/h_$n@a"
+        cappipe "C5.$n.4_incr_send_h_recv_h" 0 "zfs send $f -i $hs@a $hs@b" "$M8RXF $srvm/h_$n"
+        m8snaps "C5.$n.5_snaps" "$srvm/h_$n"; cap "C5.$n.6_holds" zfs holds -H "$srvm/h_$n@a" "$srvm/h_$n@b"
+        cappipe "C5.$n.7_send_h_recv_noh" 0 "zfs send $f $hs@a" "zfs receive $M8ARGS -s -u $srvm/hn_$n"
+        m8snaps "C5.$n.8_snaps" "$srvm/hn_$n"; cap "C5.$n.9_holds" zfs holds -H "$srvm/hn_$n@a"
+        cappipe "C5.$n.10_incr_send_h_recv_noh" 0 "zfs send $f -i $hs@a $hs@b" "zfs receive $M8ARGS -F -s -u $srvm/hn_$n"
+        m8snaps "C5.$n.11_snaps" "$srvm/hn_$n"; cap "C5.$n.12_holds" zfs holds -H "$srvm/hn_$n@a" "$srvm/hn_$n@b"
+    done
+    cappipe C5.9_send_noh_recv_h 0 "zfs send $hs@a" "$M8RXN $srvm/h_plain"
+    m8snaps C5.10_snaps "$srvm/h_plain"; cap C5.11_holds zfs holds -H "$srvm/h_plain@a"
+
+    # ================================ 6: interrupted (-s) full and incremental, resumed with zfs send -t into the same argv
+    note "6: full and incremental cut after 1000000 bytes (head -c), resumed with 'zfs send -t <token>' into the same argv: the full resume with -F (the partial dataset exists) and without; the incremental with -F"
+    for mode in plain_fs raw_fs plain_zv raw_zv; do
+        case $mode in
+            plain_fs) S="$fsp"; SND="$SPL";  RN="$M8RXN"; RF2="$M8RXF" ;;
+            raw_fs)   S="$efs"; SND="$SRAW"; RN="$M8RXN"; RF2="$M8RXF" ;;
+            plain_zv) S="$zvp"; SND="$SPL";  RN="$M8VXN"; RF2="$M8VXF" ;;
+            raw_zv)   S="$zve"; SND="$SRAW"; RN="$M8VXN"; RF2="$M8VXF" ;;
+        esac
+        T="$srvm/rs_$mode"
+        cappipe "C6.$mode.1_full_cut" 1000000 "$SND $S@a" "$RN $T"
+        tk="$(tok "$T")"; echo "$tk" > "$SD/C6.$mode.full.token"
+        m8tok "C6.$mode.2_token" "$T"; m8get "C6.$mode.3_props_partial" "$T"
+        cappipe "C6.$mode.4_full_resume_F" 0 "zfs send -t $tk" "$RF2 $T"
+        m8get "C6.$mode.5_props_final" "$T"; m8snaps "C6.$mode.6_snaps" "$T"; m8tok "C6.$mode.7_token" "$T"
+        cappipe "C6.$mode.8_incr_cut" 1000000 "$SND -i $S@a $S@b" "$RF2 $T"
+        tk="$(tok "$T")"; echo "$tk" > "$SD/C6.$mode.incr.token"
+        m8tok "C6.$mode.9_token" "$T"; m8get "C6.$mode.10_props_partial" "$T"
+        cappipe "C6.$mode.11_incr_resume_F" 0 "zfs send -t $tk" "$RF2 $T"
+        m8get "C6.$mode.12_props_final" "$T"; m8snaps "C6.$mode.13_snaps" "$T"; m8tok "C6.$mode.14_token" "$T"
+        T2="$srvm/rsn_$mode"
+        cappipe "C6.$mode.15_full_cut2" 1000000 "$SND $S@a" "$RN $T2"
+        tk="$(tok "$T2")"; echo "$tk" > "$SD/C6.$mode.full2.token"
+        cappipe "C6.$mode.16_full_resume_noF" 0 "zfs send -t $tk" "$RN $T2"
+        m8get "C6.$mode.17_props_final" "$T2"; m8snaps "C6.$mode.18_snaps" "$T2"
+        case $mode in *_zv)
+            T2="$srvm/rsc_$mode"
+            cappipe "C6.$mode.19_full_cut3" 1000000 "$SND $S@a" "$RN $T2"
+            tk="$(tok "$T2")"; echo "$tk" > "$SD/C6.$mode.full3.token"
+            cappipe "C6.$mode.20_full_resume_with_canmount" 0 "zfs send -t $tk" "$M8RXF $T2"
+            m8tok "C6.$mode.21_token" "$T2"; m8snaps "C6.$mode.22_snaps" "$T2"
+            cappipe "C6.$mode.23_full_resume_without_canmount" 0 "zfs send -t $tk" "$M8VXF $T2"
+            m8snaps "C6.$mode.24_snaps" "$T2" ;;
+        esac
+    done
+    note "6 -p: the resumed full of a -p stream (the stream's properties are in the token's stream, not re-sent)"
+    T="$srvm/rs_p"
+    cappipe C6.p.1_full_cut 1000000 "$SPLP $fsp@a" "$M8RXN $T"
+    tk="$(tok "$T")"; echo "$tk" > "$SD/C6.p.full.token"
+    m8get C6.p.2_props_partial "$T"
+    cappipe C6.p.3_full_resume_F 0 "zfs send -t $tk" "$M8RXF $T"
+    m8get C6.p.4_props_final "$T"
+
+    # ================================ 7: a full -F -p receive into an EXISTING dataset without snapshots
+    note "7: an existing dataset with no snapshots (the placeholder), a full -p stream received with -F and the full -x list: which of the six -x properties end up local / received? a = placeholder as api.py creates ancestors; b = placeholder with LOCAL values preset; c = b without any -x (control); d = b with a stream without -p; e = b without -F"
+    T="$srvm/e7a"; st zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x "$T"
+    m8get C7.a1_before "$T"
+    cappipe C7.a2_full_F_p 0 "$SPLP $fsp@a" "$M8RXF $T"
+    m8get C7.a3_after "$T"; m8snaps C7.a4_snaps "$T"
+    capsh C7.a5_all_local "zfs get -H -s local,received -o property,value,received,source all $T | sort"
+    for k in b c d e; do
+        T="$srvm/e7$k"
+        st zfs create -u -o canmount=noauto -o mountpoint=$W/m8-pre -o sharenfs=ro -o sharesmb=off -o setuid=off -o exec=off -o devices=off "$T"
+        m8get "C7.$k.1_before" "$T"
+        case $k in
+            b) cappipe "C7.$k.2_recv" 0 "$SPLP $fsp@a" "$M8RXF $T" ;;
+            c) cappipe "C7.$k.2_recv" 0 "$SPLP $fsp@a" "zfs receive $OWN $M8RO -F -h -s -u $T" ;;
+            d) cappipe "C7.$k.2_recv" 0 "$SPL $fsp@a" "$M8RXF $T" ;;
+            e) cappipe "C7.$k.2_recv" 0 "$SPLP $fsp@a" "$M8RXN $T" ;;
+        esac
+        m8get "C7.$k.3_after" "$T"; m8snaps "C7.$k.4_snaps" "$T"
+    done
+    T="$srvm/e7g"; st zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x "$T"
+    cappipe C7.g.1_raw_p_full_F 0 "$SRAWP $efs@a" "$M8RXF $T"
+    m8get C7.g.2_after "$T" encryption,keystatus; m8snaps C7.g.3_snaps "$T"
+    m8_mounts C7.m "$srvm"
+
+    # ================================ 8: server operations on a received readonly=on canmount=noauto dataset
+    note "8: server-side operations on received copies built with the argv. a = plain copy from a -p stream (received forged org.zfsbackup:* values under the -o locals); b = snapshot destroy; c = receive -A; m* = modifying the head; z = a volume; r = a raw copy (key unloaded)"
+    T="$srvm/o8a"; m8_build "$T" "$fsp" "$SPLP" "$M8RXN" "$M8RXF"
+    m8get C8.a0_props "$T"
+    cap C8.a1_set_anchor zfs set org.zfsbackup:anchor.x=snapA "$T"
+    cap C8.a2_set_inflight zfs set org.zfsbackup:inflight.x=snapA,snapB "$T"
+    cap C8.a3_get zfs get -H -o name,property,value,received,source org.zfsbackup:anchor.x,org.zfsbackup:inflight.x "$T"
+    cap C8.a4_inherit_anchor zfs inherit org.zfsbackup:anchor.x "$T"
+    cap C8.a5_get zfs get -H -o name,property,value,received,source org.zfsbackup:anchor.x,org.zfsbackup:inflight.x "$T"
+    cap C8.a6_inherit_config zfs inherit org.zfsbackup:config "$T"
+    cap C8.a7_get_config zfs get -H -o name,property,value,received,source $PROPS_OWN "$T"
+    cap C8.a8_inherit_S_client_id zfs inherit -S org.zfsbackup:client_id "$T"
+    cap C8.a9_get zfs get -H -o name,property,value,received,source $PROPS_OWN "$T"
+    cap C8.a10_set_after_inherit zfs set org.zfsbackup:config=B64 "$T"
+    cap C8.a11_set_canmount_readonly zfs set canmount=noauto readonly=on "$T"
+    cap C8.b1_destroy_oldest zfs destroy "$T@a"
+    m8snaps C8.b2_snaps "$T"
+    cap C8.b3_destroy_newest zfs destroy "$T@b"
+    m8snaps C8.b4_snaps "$T"
+    T="$srvm/o8c"; m8_build "$T" "$fsp" "$SPL" "$M8RXN" "$M8RXF"
+    cappipe C8.c1_incr_cut 1000000 "$SPL -i $fsp@b $fsp@c" "$M8RXF $T"
+    m8tok C8.c2_token "$T"; m8snaps C8.c3_snaps "$T"
+    cap C8.c4_set_anchor_while_partial zfs set org.zfsbackup:anchor.x=snapB "$T"
+    cap C8.c5_abort zfs receive -A "$T"
+    m8tok C8.c6_token "$T"; m8snaps C8.c7_snaps "$T"; m8get C8.c8_props "$T"
+    cappipe C8.c9_incr_again 0 "$SPL -i $fsp@b $fsp@c" "$M8RXF $T"
+    m8snaps C8.c10_snaps "$T"
+    # ---- the head of a readonly copy: can it be modified, and what does the next incremental do
+    for k in prop mount rowrite write; do
+        T="$srvm/o8m_$k"; m8_build "$T" "$fsp" "$SPL" "$M8RXN" "$M8RXF"
+        cap "C8.m.$k.0_written" zfs get -H -o name,property,value written "$T"
+        case $k in
+            prop)    cap "C8.m.$k.1_set_anchor" zfs set org.zfsbackup:anchor.x=snapB "$T" ;;
+            mount)   cap "C8.m.$k.1_mount" zfs mount "$T"; cap "C8.m.$k.2_unmount" zfs unmount "$T" ;;
+            rowrite) cap "C8.m.$k.1_mount" zfs mount "$T"
+                     capsh "C8.m.$k.2_write" "echo head-change > \"\$(zfs get -H -o value mountpoint $T)/head_change\""
+                     capsh "C8.m.$k.3_touch" "touch \"\$(zfs get -H -o value mountpoint $T)/f_a\""
+                     cap "C8.m.$k.4_unmount" zfs unmount "$T" ;;
+            write)   cap "C8.m.$k.1_readonly_off" zfs set readonly=off "$T"
+                     cap "C8.m.$k.2_mount" zfs mount "$T"
+                     capsh "C8.m.$k.3_write" "echo head-change > \"\$(zfs get -H -o value mountpoint $T)/head_change\""
+                     cap "C8.m.$k.4_unmount" zfs unmount "$T"
+                     cap "C8.m.$k.5_readonly_on" zfs set readonly=on "$T" ;;
+        esac
+        st zpool sync "$P"
+        cap "C8.m.$k.9_written" zfs get -H -o name,property,value,source written,readonly,canmount "$T"
+        cappipe "C8.m.$k.10_incr_noF" 0 "$SPL -i $fsp@b $fsp@c" "zfs receive $M8ARGS -h -s -u $T"
+        m8snaps "C8.m.$k.11_snaps" "$T"
+        cappipe "C8.m.$k.12_incr_F" 0 "$SPL -i $fsp@b $fsp@c" "$M8RXF $T"
+        m8snaps "C8.m.$k.13_snaps" "$T"; m8get "C8.m.$k.14_props" "$T"
+    done
+    # ---- a volume: readonly=on and the node
+    T="$srvm/o8z"; m8_build "$T" "$zvp" "$SPL" "$M8VXN" "$M8VXF"
+    m8_nodes C8.z0_nodes
+    cap C8.z1_volmode_dev zfs set volmode=dev "$T"
+    m8_node "$T"; m8_nodes C8.z2_nodes
+    capsh C8.z3_write_readonly_on "dd if=/dev/urandom of=/dev/zvol/$T bs=1M count=1 seek=6 conv=fsync status=none"
+    cap C8.z4_readonly_off zfs set readonly=off "$T"
+    capsh C8.z5_write_readonly_off "dd if=/dev/urandom of=/dev/zvol/$T bs=1M count=1 seek=6 conv=fsync status=none"
+    cap C8.z6_readonly_on zfs set readonly=on "$T"
+    cap C8.z7_volmode_none zfs set volmode=none "$T"
+    st zpool sync "$P"; m8_nodes C8.z8_nodes
+    cap C8.z9_written zfs get -H -o name,property,value written "$T"
+    cappipe C8.z10_incr_noF 0 "$SPL -i $zvp@b $zvp@c" "zfs receive $M8ARGS_VOL -h -s -u $T"
+    cappipe C8.z11_incr_F 0 "$SPL -i $zvp@b $zvp@c" "$M8VXF $T"
+    m8snaps C8.z12_snaps "$T"; m8_nodes C8.z13_nodes
+    # ---- a raw copy with the key unloaded
+    T="$srvm/o8r"; m8_build "$T" "$efs" "$SRAWP" "$M8RXN" "$M8RXF"
+    cap C8.r0_keystatus zfs get -H -o name,property,value keystatus,mounted "$T"
+    cap C8.r1_set_anchor zfs set org.zfsbackup:anchor.x=snapA "$T"
+    cap C8.r2_inherit_anchor zfs inherit org.zfsbackup:anchor.x "$T"
+    cap C8.r3_inherit_config zfs inherit org.zfsbackup:config "$T"
+    cap C8.r4_get zfs get -H -o name,property,value,received,source $PROPS_OWN "$T"
+    cappipe C8.r5_incr_cut 1000000 "$SRAW -i $efs@b $efs@c" "$M8RXF $T"
+    m8tok C8.r6_token "$T"
+    cap C8.r7_abort zfs receive -A "$T"
+    m8tok C8.r8_token "$T"
+    cap C8.r9_destroy_oldest zfs destroy "$T@a"
+    m8snaps C8.r10_snaps "$T"
+
+    # ================================ 10: the alternative hardening: -o <prop>=<safe value> instead of -x
+    note "10: the same properties set LOCALLY with -o instead of excluded with -x (M8O = '$M8O'): onto a missing dataset, an incremental, the existing-placeholder -F -p case of section 7, raw, and a volume"
+    T="$srvm/o10a"
+    cappipe C10.a1_full_p 0 "$SPLP $fsp@a" "zfs receive $M8O -h -s -u $T"
+    m8get C10.a2_props "$T"
+    cappipe C10.a3_incr_p 0 "$SPLP -i $fsp@a $fsp@b" "zfs receive $M8O -F -h -s -u $T"
+    m8get C10.a4_props "$T"
+    T="$srvm/o10b"; st zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x "$T"
+    cappipe C10.b1_existing_F_p 0 "$SPLP $fsp@a" "zfs receive $M8O -F -h -s -u $T"
+    m8get C10.b2_props "$T"; capsh C10.b3_all_local "zfs get -H -s local,received -o property,value,received,source all $T | sort"
+    T="$srvm/o10c"; st zfs create -u -o canmount=noauto -o mountpoint=$W/m8-pre -o sharenfs=ro -o setuid=off -o exec=off -o devices=off "$T"
+    cappipe C10.c1_existing_preset_F_p 0 "$SPLP $fsp@a" "zfs receive $M8O -F -h -s -u $T"
+    m8get C10.c2_props "$T"
+    T="$srvm/o10d"
+    cappipe C10.d1_raw_p_full 0 "$SRAWP $efs@a" "zfs receive $M8O -h -s -u $T"
+    m8get C10.d2_props "$T" encryption,keystatus
+    T="$srvm/o10e"; st zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x "$T"
+    cappipe C10.e1_raw_p_existing_F 0 "$SRAWP $efs@a" "zfs receive $M8O -F -h -s -u $T"
+    m8get C10.e2_props "$T" encryption,keystatus
+    cappipe C10.f1_volume_full 0 "$SPLP $zvp@a" "zfs receive $M8O -h -s -u $srvm/o10f"
+    cappipe C10.f2_volume_full_no_canmount 0 "$SPLP $zvp@a" "zfs receive $M8OV -h -s -u $srvm/o10g"
+    m8_mounts C10.m "$srvm"
+
+    # ================================ 11-15: the DESIGN THAT REPLACED -x: filesystems get M8O (-o only), volumes M8VS (no canmount, no -x)
+    note "11-15: filesystem set FSN/FSF = 'zfs receive M8O [-F] -h -s -u' with M8O = '$M8O'; volume set VSN/VSF = 'zfs receive M8VS [-F] -h -s -u' with M8VS = '$M8VS'. No -x anywhere"
+    local FSN="zfs receive $M8O -h -s -u" FSF="zfs receive $M8O -F -h -s -u" VSN="zfs receive $M8VS -h -s -u" VSF="zfs receive $M8VS -F -h -s -u"
+    CRE="zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x"
+    local srvn="$R/srvn" srvw="$R/srvw" par="$R/srvn/par" tag
+    st zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x "$srvn"; st zfs set mountpoint="$W/m8-srvn" "$srvn"
+    st zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x "$srvw"
+    capsh C11.0_host "uname -m; lscpu | grep -i 'byte order'; printf '\\001\\000' | od -An -tu2 | tr -d ' ' | sed 's/^1\$/little-endian (u16 of 01 00 is 1)/;s/^256\$/big-endian (u16 of 01 00 is 256)/'"
+    cap C11.0_efs_props zfs get -H -o name,property,value,source sharesmb,sharenfs,mountpoint,canmount "$efs"
+    capsh C11.0_zd_count_baseline "udevadm settle; ls /dev/zd* 2>/dev/null | wc -l"
+
+    # ---- 11: filesystems: raw incremental with / without -p, the sharesmb line, then resume and a modified head
+    for p in nop p; do
+        SND="$SRAW"; [ $p = p ] && SND="$SRAWP"; T="$srvn/fr_$p"
+        cappipe "C11.raw.$p.1_full" 0 "$SND $efs@a" "$FSN $T"
+        cappipe "C11.raw.$p.2_incr" 0 "$SND -i $efs@a $efs@b" "$FSF $T"
+        cappipe "C11.raw.$p.3_incr2" 0 "$SND -i $efs@b $efs@c" "$FSF $T"
+        m8get "C11.raw.$p.4_props" "$T" encryption,keystatus,encryptionroot; m8snaps "C11.raw.$p.5_snaps" "$T"
+    done
+    for p in nop p; do
+        SND="$SPL"; [ $p = p ] && SND="$SPLP"; T="$srvn/fp_$p"
+        cappipe "C11.plain.$p.1_full" 0 "$SND $fsp@a" "$FSN $T"
+        cappipe "C11.plain.$p.2_incr" 0 "$SND -i $fsp@a $fsp@b" "$FSF $T"
+        m8get "C11.plain.$p.3_props" "$T"
+    done
+    for mode in plain raw; do
+        if [ $mode = plain ]; then S="$fsp"; SND="$SPL"; else S="$efs"; SND="$SRAW"; fi
+        T="$srvn/fres_$mode"
+        cappipe "C11.res.$mode.1_full_cut" 1000000 "$SND $S@a" "$FSN $T"
+        tk="$(tok "$T")"; echo "$tk" > "$SD/C11.res.$mode.full.token"
+        cappipe "C11.res.$mode.2_full_resume_F" 0 "zfs send -t $tk" "$FSF $T"
+        m8get "C11.res.$mode.3_props" "$T"; m8snaps "C11.res.$mode.4_snaps" "$T"; m8tok "C11.res.$mode.5_token" "$T"
+        cappipe "C11.res.$mode.6_incr_cut" 1000000 "$SND -i $S@a $S@b" "$FSF $T"
+        tk="$(tok "$T")"; echo "$tk" > "$SD/C11.res.$mode.incr.token"
+        cappipe "C11.res.$mode.7_incr_resume_F" 0 "zfs send -t $tk" "$FSF $T"
+        m8get "C11.res.$mode.8_props" "$T"; m8snaps "C11.res.$mode.9_snaps" "$T"; m8tok "C11.res.$mode.10_token" "$T"
+        T2="$srvn/fresn_$mode"
+        cappipe "C11.res.$mode.11_full_cut2" 1000000 "$SND $S@a" "$FSN $T2"
+        tk="$(tok "$T2")"
+        cappipe "C11.res.$mode.12_full_resume_noF" 0 "zfs send -t $tk" "$FSN $T2"
+        m8snaps "C11.res.$mode.13_snaps" "$T2"
+    done
+    T="$srvn/fmod"; m8_build "$T" "$fsp" "$SPL" "$FSN" "$FSF"
+    m8get C11.mod.0_props "$T"
+    cap C11.mod.1_readonly_off zfs set readonly=off "$T"
+    cap C11.mod.2_mountpoint zfs set mountpoint="$W/m8-mod" "$T"
+    cap C11.mod.3_mount zfs mount "$T"
+    capsh C11.mod.4_write "echo head-change > $W/m8-mod/head_change"
+    cap C11.mod.5_unmount zfs unmount "$T"
+    cap C11.mod.6_readonly_on zfs set readonly=on "$T"
+    st zpool sync "$P"
+    cap C11.mod.7_written zfs get -H -o name,property,value,source written,readonly,mountpoint "$T"
+    cappipe C11.mod.8_incr_noF 0 "$SPL -i $fsp@b $fsp@c" "zfs receive $M8O -h -s -u $T"
+    m8snaps C11.mod.9_snaps "$T"
+    cappipe C11.mod.10_incr_F 0 "$SPL -i $fsp@b $fsp@c" "$FSF $T"
+    m8snaps C11.mod.11_snaps "$T"; m8get C11.mod.12_props "$T"
+
+    # ---- 12: volumes (no -x, no canmount): stderr must be empty, no node
+    for mode in plain raw; do
+        for p in nop p; do
+            if [ $mode = plain ]; then S="$zvp"; SND="$SPL"; [ $p = p ] && SND="$SPLP"; else S="$zve"; SND="$SRAW"; [ $p = p ] && SND="$SRAWP"; fi
+            T="$srvw/v_${mode}_$p"
+            cappipe "C12.$mode.$p.1_full" 0 "$SND $S@a" "$VSN $T"
+            cappipe "C12.$mode.$p.2_incr" 0 "$SND -i $S@a $S@b" "$VSF $T"
+            cappipe "C12.$mode.$p.3_incr2" 0 "$SND -i $S@b $S@c" "$VSF $T"
+            m8get "C12.$mode.$p.4_props" "$T" encryption,keystatus,refreservation; m8snaps "C12.$mode.$p.5_snaps" "$T"
+            T2="$srvw/vr_${mode}_$p"
+            cappipe "C12.$mode.$p.6_full_cut" 1000000 "$SND $S@a" "$VSN $T2"
+            tk="$(tok "$T2")"; echo "$tk" > "$SD/C12.$mode.$p.full.token"
+            cappipe "C12.$mode.$p.7_full_resume_F" 0 "zfs send -t $tk" "$VSF $T2"
+            cappipe "C12.$mode.$p.8_incr_cut" 1000000 "$SND -i $S@a $S@b" "$VSF $T2"
+            tk="$(tok "$T2")"; echo "$tk" > "$SD/C12.$mode.$p.incr.token"
+            cappipe "C12.$mode.$p.9_incr_resume_F" 0 "zfs send -t $tk" "$VSF $T2"
+            m8get "C12.$mode.$p.10_props" "$T2"; m8snaps "C12.$mode.$p.11_snaps" "$T2"; m8tok "C12.$mode.$p.12_token" "$T2"
+        done
+    done
+    capsh C12.20_nodes "udevadm settle; echo '# find /dev/zvol/$srvw (must be empty)'; find /dev/zvol/$srvw 2>&1 | sort; echo '# /dev/zd* count (baseline in C11.0_zd_count_baseline)'; ls /dev/zd* 2>/dev/null | wc -l"
+    T="$srvw/vmod"; m8_build "$T" "$zvp" "$SPL" "$VSN" "$VSF"
+    cap C12.mod.1_volmode_dev zfs set volmode=dev "$T"
+    m8_node "$T"
+    cap C12.mod.2_readonly_off zfs set readonly=off "$T"
+    capsh C12.mod.3_write "dd if=/dev/urandom of=/dev/zvol/$T bs=1M count=1 seek=6 conv=fsync status=none"
+    cap C12.mod.4_readonly_on zfs set readonly=on "$T"
+    cap C12.mod.5_volmode_none zfs set volmode=none "$T"
+    st zpool sync "$P"
+    cap C12.mod.6_written zfs get -H -o name,property,value written,readonly,volmode "$T"
+    cappipe C12.mod.7_incr_noF 0 "$SPL -i $zvp@b $zvp@c" "zfs receive $M8VS -h -s -u $T"
+    m8snaps C12.mod.8_snaps "$T"
+    cappipe C12.mod.9_incr_F 0 "$SPL -i $zvp@b $zvp@c" "$VSF $T"
+    m8snaps C12.mod.10_snaps "$T"
+    capsh C12.mod.11_nodes "udevadm settle; find /dev/zvol/$srvw 2>&1 | sort; ls /dev/zd* 2>/dev/null | wc -l"
+
+    # ---- 13: after the filesystem set: mount -a and share -a mount and share nothing; a child under a received parent
+    note "13: srvn holds fr_*/fp_*/fres_*/fmod copies received with the filesystem set: mount -a / share -a. Then a child received under a RECEIVED parent (mountpoint=none), and under a created ancestor beneath it"
+    m8_mounts C13.a "$srvn"
+    cap C13.a9_share_a zfs share -a
+    capsh C13.a10_mounted_after_share_a "zfs mount | grep -F '$srvn/'; echo grep_rc=\$?"
+    cappipe C13.b1_parent_full 0 "$SPL $fsp@a" "$FSN $par"
+    m8get C13.b2_parent_props "$par"
+    cappipe C13.b3_child_full 0 "$SPL $fsp@a" "$FSN $par/child"
+    m8get C13.b4_child_props "$par/child"
+    cappipe C13.b5_child_incr 0 "$SPL -i $fsp@a $fsp@b" "$FSF $par/child"
+    m8snaps C13.b6_child_snaps "$par/child"
+    cappipe C13.b7_parent_incr 0 "$SPL -i $fsp@a $fsp@b" "$FSF $par"
+    cappipe C13.b8_raw_child 0 "$SRAW $efs@a" "$FSN $par/rawchild"
+    m8get C13.b9_rawchild_props "$par/rawchild" encryption,keystatus
+    cappipe C13.b10_raw_child_incr 0 "$SRAW -i $efs@a $efs@b" "$FSF $par/rawchild"
+    cap C13.b11_created_ancestor $CRE "$par/anc"
+    cappipe C13.b12_child_under_ancestor 0 "$SPL $fsp@a" "$FSN $par/anc/leaf"
+    cappipe C13.b13_vol_under_received_parent 0 "$SPL $zvp@a" "$VSN $par/vol"
+    m8get C13.b14_vol_props "$par/vol"
+    m8_mounts C13.c "$srvn"
+    cap C13.c9_share_a zfs share -a
+    capsh C13.c10_mounted_after_share_a "zfs mount | grep -F '$srvn/'; echo grep_rc=\$?"
+    cap C13.d1_children zfs list -H -t all -o name,type,canmount,mountpoint -r "$par"
+
+    # ---- 14: the first 312 bytes (one struct dmu_replay_record = DRR_BEGIN) of each stream, as hex
+    note "14: HDR.* = the first 312 bytes of the stream as one line of hex (od -An -v -tx1), preceded by 'bytes=N'. Byte order of the host: see C11.0_host. Sources: fsp@a/@b (plain fs), efs@a/@b (raw fs), zvp@a (volume), zve@a (raw volume)"
+    hdr() { capsh "$1" "set +o pipefail; h=\$($2 | head -c 312 | od -An -v -tx1 | tr -d ' \\n'); echo bytes=\$((\${#h}/2)); echo \$h"; }
+    hdr HDR.plain_full "zfs send $fsp@a"
+    hdr HDR.plain_incr "zfs send -i $fsp@a $fsp@b"
+    hdr HDR.plain_c "zfs send -c $fsp@a"
+    hdr HDR.plain_L "zfs send -L $fsp@a"
+    hdr HDR.plain_Lc "zfs send -L -c $fsp@a"
+    hdr HDR.plain_Lc_incr "zfs send -L -c -i $fsp@a $fsp@b"
+    hdr HDR.plain_p "zfs send -p $fsp@a"
+    hdr HDR.plain_p_incr "zfs send -p -i $fsp@a $fsp@b"
+    # a -p stream is a COMPOUND stream: the first 312 bytes are a stub (versioninfo 2, type 0) followed by payloadlen bytes of nvlist; then
+    # a DRR_END (312 bytes, type 5) and the real DRR_BEGIN, the 312 bytes at offset 624+payloadlen. hdr2 records payloadlen and that inner record.
+    hdr2() { capsh "$1" "set +o pipefail; f=$W/m8-hdr2.tmp; $2 | head -c 8192 > \$f; plen=\$(od -An -tu4 -j4 -N4 \$f | tr -d ' '); echo payloadlen=\$plen; h=\$(tail -c +\$((624+plen+1)) \$f | head -c 312 | od -An -v -tx1 | tr -d ' \\n'); echo inner_bytes=\$((\${#h}/2)); echo \$h; rm -f \$f"; }
+    hdr2 HDR.plain_p_inner "zfs send -p $fsp@a"
+    hdr2 HDR.plain_p_incr_inner "zfs send -p -i $fsp@a $fsp@b"
+    hdr2 HDR.plain_Lc_p_inner "zfs send -p -L -c $fsp@a"
+    hdr HDR.raw_full "zfs send -w $efs@a"
+    hdr HDR.raw_incr "zfs send -w -i $efs@a $efs@b"
+    hdr HDR.raw_p "zfs send -w -p $efs@a"
+    hdr HDR.raw_p_incr "zfs send -w -p -i $efs@a $efs@b"
+    hdr2 HDR.raw_p_inner "zfs send -w -p $efs@a"
+    hdr2 HDR.raw_p_incr_inner "zfs send -w -p -i $efs@a $efs@b"
+    hdr2 HDR.volume_p_inner "zfs send -p $zvp@a"
+    hdr2 HDR.volume_raw_p_inner "zfs send -w -p $zve@a"
+    hdr HDR.volume_full "zfs send $zvp@a"
+    hdr HDR.volume_Lc_full "zfs send -L -c $zvp@a"
+    hdr HDR.volume_incr "zfs send -i $zvp@a $zvp@b"
+    hdr HDR.volume_raw_full "zfs send -w $zve@a"
+    hdr HDR.volume_raw_incr "zfs send -w -i $zve@a $zve@b"
+    T="$srvn/hdr_res"
+    cappipe C14.r1_full_cut 1000000 "$SPL $fsp@a" "$FSN $T"
+    tk="$(tok "$T")"; echo "$tk" > "$SD/HDR.res_full.token"
+    hdr HDR.resume_plain_full "zfs send -t $tk"
+    cappipe C14.r2_full_resume 0 "zfs send -t $tk" "$FSF $T"
+    cappipe C14.r3_incr_cut 1000000 "$SPL -i $fsp@a $fsp@b" "$FSF $T"
+    tk="$(tok "$T")"; echo "$tk" > "$SD/HDR.res_incr.token"
+    hdr HDR.resume_plain_incr "zfs send -t $tk"
+    T="$srvn/hdr_resr"
+    cappipe C14.r4_raw_full_cut 1000000 "$SRAW $efs@a" "$FSN $T"
+    tk="$(tok "$T")"; echo "$tk" > "$SD/HDR.res_raw_full.token"
+    hdr HDR.resume_raw_full "zfs send -t $tk"
+    cappipe C14.r5_raw_full_resume 0 "zfs send -t $tk" "$FSF $T"
+    cappipe C14.r6_raw_incr_cut 1000000 "$SRAW -i $efs@a $efs@b" "$FSF $T"
+    tk="$(tok "$T")"; echo "$tk" > "$SD/HDR.res_raw_incr.token"
+    hdr HDR.resume_raw_incr "zfs send -t $tk"
+    T="$srvw/hdr_resv"
+    cappipe C14.r7_volume_cut 1000000 "$SPL $zvp@a" "$VSN $T"
+    tk="$(tok "$T")"; echo "$tk" > "$SD/HDR.res_volume.token"
+    hdr HDR.resume_volume_full "zfs send -t $tk"
+
+    # ================================ 9: ancestors under an encrypted / unencrypted parent
+    note "9: zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x as api.py creates ancestors"
+    CRE="zfs create -u -o canmount=noauto -o org.zfsbackup:client_id=x"
+    cap C9.a1_unencrypted_parent $CRE "$srvm/cl9"
+    cap C9.a2_props zfs get -H -o name,property,value,source encryption,keystatus,encryptionroot,canmount,mounted,mountpoint,org.zfsbackup:client_id "$srvm/cl9"
+    cap C9.a3_child_of_child $CRE "$srvm/cl9/ds9"
+    cap C9.a4_props zfs get -H -o name,property,value,source encryption,keystatus,encryptionroot,canmount,mounted,mountpoint,org.zfsbackup:client_id "$srvm/cl9/ds9"
+    cap C9.a5_again $CRE "$srvm/cl9"
+    cap C9.b1_encrypted_parent_key_loaded $CRE "$esrvm/cl9"
+    cap C9.b2_props zfs get -H -o name,property,value,source encryption,keystatus,encryptionroot,canmount,mounted,mountpoint,org.zfsbackup:client_id "$esrvm/cl9"
+    cap C9.b3_child_of_child $CRE "$esrvm/cl9/ds9"
+    cap C9.b4_props zfs get -H -o name,property,value,source encryption,keystatus,encryptionroot,canmount,mounted,org.zfsbackup:client_id "$esrvm/cl9/ds9"
+    cappipe C9.b5_plain_full_into_encrypted_parent 0 "$SPL $fsp@a" "$M8RXN $esrvm/cl9/plain"
+    m8get C9.b6_props "$esrvm/cl9/plain" encryption,keystatus,encryptionroot
+    cappipe C9.b7_raw_full_into_encrypted_parent 0 "$SRAW $efs@a" "$M8RXN $esrvm/cl9/raw"
+    m8get C9.b8_props "$esrvm/cl9/raw" encryption,keystatus,encryptionroot
+    cappipe C9.b9_raw_full_into_encrypted_grandchild 0 "$SRAW $efs@a" "$M8RXN $esrvm/cl9/ds9/raw"
+    m8get C9.b10_props "$esrvm/cl9/ds9/raw" encryption,keystatus,encryptionroot
+    cap C9.c1_unload_key zfs unload-key "$esrvm"
+    cap C9.c2_encrypted_parent_key_unloaded $CRE "$esrvm/cl9_locked"
+    cap C9.c3_exists zfs list -H -o name -r "$esrvm"
+    cappipe C9.c4_raw_full_key_unloaded 0 "$SRAW $efs@a" "$M8RXN $esrvm/cl9/raw_locked"
+    cappipe C9.c5_plain_full_key_unloaded 0 "$SPL $fsp@a" "$M8RXN $esrvm/cl9/plain_locked"
+    cap C9.c6_load_key zfs load-key -L "file://$KEY2" "$esrvm"
+    end_section
+}
+
 # ================================================================ Z2: -o org.zfsbackup:* (and ownership props) on raw receives
 sec_Z2() {
     section Z2 "-o org.zfsbackup:{config,client_id,source_dataset} on raw full / incremental / resumed full / resumed incremental; -o readonly/canmount/volmode on raw"
@@ -1340,6 +2099,260 @@ sec_Z7() {
 }
 
 
+# ================================================================ M9: zfs list -j / zfs get -j (plan D8 / S4a: OpenZFS 2.3+ JSON output)
+# Run on every version: 2.3+ answers the -j commands; 2.1/2.2 only print a usage text (the fallback probe), so there
+# they get a short subset. The -H references (all versions) use the same datasets, for a -j vs -H parity test.
+# The user-property values hold a newline, a tab, a 0xff byte, quotes, a backslash, control bytes and non-ASCII.
+sec_M9() {
+    section M9 "zfs version -j, zfs list -j, zfs get -j: values with newline/tab/0xff/quote, every source type, sort, -p, received, errors; the -H references; the usage text on versions without -j"
+    local JSON=0 UP UPX
+    # NOT by exit status: 2.1/2.2 `zfs version -j` exits 0 and prints the plain-text version (the flag is ignored)
+    [ "$(zfs version -j 2>/dev/null </dev/null | head -c 1)" = '{' ] && JSON=1
+    # UP: the user properties whose -j output is valid JSON under LC_ALL=C; UPX adds the two that truncate it there (0xff, UTF-8)
+    UP="zfsb:nl,zfsb:tab,zfsb:q,zfsb:bs,zfsb:bsn,zfsb:ctl,zfsb:json,zfsb:dash,zfsb:fake,zfsb:empty,zfsb:lt,zfsb:missing"
+    UPX="zfsb:nl,zfsb:tab,zfsb:ff,zfsb:q,zfsb:bs,zfsb:bsn,zfsb:ctl,zfsb:u8,zfsb:json,zfsb:dash,zfsb:fake,zfsb:empty,zfsb:lt,zfsb:missing"
+
+    # ---- name attempts first (unrecorded successes show up in the listings below)
+    note "names: tab, newline, a UTF-8 e-acute, a 0xff byte, '%', ',', '@', '#', a trailing space, a leading space, ':' and 'a b' (a space) are attempted; the created ones appear in the listings"
+    capsh 00_name_tab "zfs create $R/\$'t\\tab'"
+    capsh 00_name_nl "zfs create $R/\$'n\\nl'"
+    capsh 00_name_u8 "zfs create $R/\$'caf\\xc3\\xa9'"
+    capsh 00_name_ff "zfs create $R/\$'f\\xffb'"
+    capsh 00_name_pct "zfs create $R/'p%ct'"
+    capsh 00_name_comma "zfs create $R/'c,omma'"
+    capsh 00_name_at "zfs create $R/'a@t'"
+    capsh 00_name_hash "zfs create $R/'h#ash'"
+    capsh 00_name_trail "zfs create $R/'trail '"
+    capsh 00_name_lead "zfs create $R/' lead'"
+    capsh 00_name_colon "zfs create $R/'co:lon'"
+    capsh 00_name_space "zfs create $R/'sp ace'"
+    capsh 00_name_snap_space "zfs snapshot '$R/sp ace@s p'"
+    capsh 00_name_ctl "zfs create $R/\$'c\\x01tl'"
+
+    # ---- fixtures
+    note "setup: $R/src (compression=lz4, user props zfsb:nl='line1<LF>line2' zfsb:tab='a<TAB>b' zfsb:ff='a<0xff>b' zfsb:q='say \"hi\"' zfsb:bs='back\\slash' zfsb:bsn='a\\nb' (backslash, n) zfsb:ctl='x<0x01>y<0x7f>z' zfsb:u8='cafe-acute <U+1F600>' zfsb:json='{\"a\":[1,2]}' zfsb:dash='-' zfsb:fake='inherited from foo' zfsb:empty='' zfsb:lt='<&>'), children zz aa mm (created in that order), $R/vol (a zvol, 8M), $R/empty, snapshots s1 (recursive) and s2 (recursive), src/mm@extra, hold on src@s1, clone $R/clone of src@s1, bookmark src#bm1, $R/recv from zfs send -R src@s1, $R/tmp mounted ro"
+    st zfs set mountpoint=none "$R"
+    st zfs create -o compression=lz4 "$R/src"
+    st zfs create "$R/src/zz"; st zfs create "$R/src/aa"; st zfs create "$R/src/mm"
+    st zfs create "$R/src/child"
+    st zfs create -V 8M "$R/vol"
+    st zfs create "$R/empty"
+    st zfs set "zfsb:nl=line1"$'\n'"line2" "$R/src"
+    st zfs set "zfsb:tab=a"$'\t'"b" "$R/src"
+    st zfs set "zfsb:ff=a"$'\xff'"b" "$R/src"
+    st zfs set 'zfsb:q=say "hi"' "$R/src"
+    st zfs set 'zfsb:bs=back\slash' "$R/src"
+    st zfs set 'zfsb:bsn=a\nb' "$R/src"
+    st zfs set "zfsb:ctl=x"$'\x01'"y"$'\x7f'"z" "$R/src"
+    st zfs set "zfsb:u8=caf"$'\xc3\xa9'" "$'\xf0\x9f\x98\x80' "$R/src"
+    st zfs set 'zfsb:json={"a":[1,2]}' "$R/src"
+    st zfs set 'zfsb:dash=-' "$R/src"
+    st zfs set 'zfsb:fake=inherited from foo' "$R/src"
+    st zfs set 'zfsb:empty=' "$R/src"
+    st zfs set 'zfsb:lt=<&>' "$R/src"
+    st zfs set "zfsb:nl=child"$'\n'"override" "$R/src/child"          # a local override of an inheritable value
+    st zfs set "zfsb:ff=aa"$'\xff'"local" "$R/src/aa"
+    st zfs set 'zfsb:vol=on a volume' "$R/vol"
+    st zfs snapshot -r "$R/src@s1"
+    st zfs snapshot "$R/vol@s1"
+    st zfs set "zfsb:nl=snap"$'\n'"value" "$R/src@s1"                 # a user property on a snapshot
+    st zfs set "zfsb:ff=snap"$'\xff' "$R/src/aa@s1"
+    st zfs snapshot -r "$R/src@s2"
+    st zfs snapshot "$R/src/mm@extra"
+    st zfs hold keep "$R/src@s1"
+    st zfs clone "$R/src@s1" "$R/clone"
+    st zfs bookmark "$R/src@s1" "$R/src#bm1"
+    st bash -c "zfs send -R '$R/src@s1' | zfs receive -u '$R/recv'"
+    st zfs set 'zfsb:q=LOCAL over received' "$R/recv"                  # local value over a received one
+    st zfs inherit zfsb:nl "$R/recv/child"                            # inherited over a received one
+    st zfs create -o "mountpoint=/$P-m9tmp" "$R/tmp"
+    st zfs unmount "$R/tmp"; st zfs mount -o ro "$R/tmp"              # readonly: source 'temporary'
+
+    # a dataset whose guid is >= 2**63 (guids are random 64-bit): --json-int has to carry it
+    note "big: $R/big is a dataset whose guid is >= 9223372036854775808 (tried g1..g40, the others destroyed)"
+    local i g
+    for i in $(seq 1 40); do
+        st zfs create "$R/g$i" || continue
+        g="$(zfs get -Hp -o value guid "$R/g$i" 2>/dev/null)"
+        if [ "${#g}" -ge 20 ] || { [ "${#g}" -eq 19 ] && [[ ! "$g" < 9223372036854775808 ]]; }; then
+            st zfs rename "$R/g$i" "$R/big"; break
+        fi
+        st zfs destroy "$R/g$i"
+    done
+
+    # ---- the -H references (every version)
+    note "H*: the -H forms of the same objects (every version), for the -j vs -H parity test"
+    cap H01_list_all zfs list -H -r -t all -o name,type,createtxg,guid,userrefs,clones,origin "$R"
+    cap H02_get_user zfs get -H -o name,property,value,received,source "$UPX,type" "$R/src"
+    cap H03_get_user_recv_r zfs get -H -r -t all -o name,property,value,received,source "$UPX" "$R/recv"
+    cap H04_get_user_p zfs get -H -p -o name,property,value,received,source "$UPX" "$R/src"
+    cap H05_list_p zfs list -H -p -r -t all -o name,type,used,available,referenced,creation,compressratio,volsize,mountpoint,quota "$R"
+    cap H06_list_sorted zfs list -H -r -t all -s createtxg -o name,type,createtxg "$R/src"
+    cap H07_get_mixed zfs get -H -o name,property,value,received,source compression,mountpoint,type,mounted,volsize,origin,clones,userrefs,createtxg,used,creation "$R/src" "$R/src/child" "$R/src@s1" "$R/vol"
+    cap H08_get_all_src zfs get -H -o name,property,value,received,source all "$R/src"
+
+    if [ "$JSON" != 1 ]; then
+        note "this version has no zfs -j: the fallback probe. Everything below is what the probe and the -j callers see"
+        cap J00_version_j zfs version -j
+        cap J01_version zfs version
+        cap J02_list_j zfs list -j "$R/src"
+        cap J03_list_j_r_t_all zfs list -j -r -t all "$R"
+        cap J04_list_j_o zfs list -j -o name,type "$R/src"
+        cap J05_list_json zfs list --json "$R/src"
+        cap J06_list_json_int zfs list --json-int "$R/src"
+        cap J07_get_j_all zfs get -j all "$R/src"
+        cap J08_get_j_user zfs get -j "$UP" "$R/src"
+        cap J09_get_j_noargs zfs get -j
+        cap J10_get_json zfs get --json all "$R/src"
+        cap J11_list_j_noargs zfs list -j
+        cap J12_zpool_version_j zpool version -j
+        cap J13_zpool_list_j zpool list -j
+        end_section
+        return
+    fi
+
+    # ---- 2.3+: version
+    cap J00_version_j zfs version -j
+    cap J01_version zfs version
+    cap J02_zpool_version_j zpool version -j
+    cap J03_version_j_json_int zfs version --json-int
+    cap J04_version_json zfs version --json
+
+    # ---- list -j
+    cap L10_src zfs list -j "$R/src"
+    cap L11_d0 zfs list -j -d 0 "$R"
+    cap L12_r zfs list -j -r "$R"
+    cap L13_r_t_all zfs list -j -r -t all "$R"
+    cap L14_r_t_snapshot zfs list -j -r -t snapshot "$R/src"
+    cap L15_r_t_filesystem zfs list -j -r -t filesystem "$R"
+    cap L16_r_t_volume zfs list -j -r -t volume "$R"
+    cap L17_r_t_bookmark zfs list -j -r -t bookmark "$R/src"
+    cap L18_t_list zfs list -j -r -t filesystem,volume,snapshot -o name,type "$R/src"
+    cap L19_o_libzfseasy zfs list -j -r -t all -o name,type,createtxg,guid,userrefs,clones,origin "$R"
+    cap L20_o_libzfseasy_p zfs list -j -p -r -t all -o name,type,createtxg,guid,userrefs,clones,origin "$R"
+    cap L21_o_user zfs list -j -r -t all -o name,type,"$UP" "$R/src"
+    cap L22_o_numeric zfs list -j -r -t all -o name,type,used,available,referenced,creation,compressratio,volsize,mountpoint,quota "$R"
+    cap L23_o_numeric_p zfs list -j -p -r -t all -o name,type,used,available,referenced,creation,compressratio,volsize,mountpoint,quota "$R"
+    cap L24_s_createtxg zfs list -j -r -t all -s createtxg -o name,type,createtxg "$R/src"
+    cap L25_S_createtxg zfs list -j -r -t all -S createtxg -o name,type,createtxg "$R/src"
+    cap L26_s_type_s_name zfs list -j -r -t all -s type -s name -o name,type "$R/src"
+    cap L27_s_name zfs list -j -r -t all -s name -o name,type "$R/src"
+    cap L28_default_order_snapshots zfs list -j -r -t snapshot -o name,createtxg "$R/src"
+    cap L29_d1 zfs list -j -d 1 -t all "$R/src"
+    cap L30_d1_snapshot zfs list -j -d 1 -t snapshot "$R/src"
+    cap L31_empty_fs_snapshots zfs list -j -t snapshot "$R/empty"
+    cap L32_empty_fs_snapshots_r zfs list -j -r -t snapshot "$R/empty"
+    cap L33_empty_bookmarks zfs list -j -r -t bookmark "$R/empty"
+    cap L34_snapshot_names zfs list -j "$R/src@s1" "$R/src@s2"
+    cap L35_snapshot_t zfs list -j -t snapshot "$R/src@s1"
+    cap L36_clone zfs list -j -o name,origin,type "$R/clone"
+    cap L37_space_name zfs list -j -r -t all -o name,type "$R/sp ace"
+    cap L38_received zfs list -j -r -t all -o name,type,"$UP" "$R/recv"
+    cap L39_nonexistent zfs list -j "$R/nonexistent"
+    cap L40_nonexistent_snapshot zfs list -j "$R/src@nonexistent"
+    cap L41_nonexistent_t_snapshot zfs list -j -t snapshot "$R/nonexistent"
+    cap L42_one_good_one_missing zfs list -j "$R/src" "$R/nonexistent"
+    cap L43_bad_property zfs list -j -o nosuchprop "$R/src"
+    cap L44_bad_type zfs list -j -t nosuchtype "$R/src"
+    cap L45_j_with_H zfs list -j -H "$R/src"
+    cap L46_json_int zfs list --json-int "$R/src"
+    cap L47_json_long zfs list --json "$R/src"
+    cap L48_json_int_p zfs list -j --json-int -o name,used,creation,createtxg,guid "$R/src"
+    cap L49_bad_option zfs list -j --bogus "$R/src"
+    cap L50_nonexistent_pool zfs list -j nosuchpool_m9/x
+    cap L51_stdin_not_tty zfs list -j -o name "$R/src"
+    cap L52_o_all_props zfs list -j -o all "$R/src"
+    cap L53_o_zfsb_ff_only zfs list -j -o zfsb:ff "$R/src"
+
+    # ---- values that truncate the document: a 0xff byte (invalid UTF-8) and valid non-ASCII UTF-8, under LC_ALL=C and LC_ALL=C.UTF-8
+    note "U*: zfsb:ff = 'a<0xff>b' (on src, src/aa and src@s1) and zfsb:u8 = 'caf<e-acute> <U+1F600>': each under LC_ALL=C (what libzfseasy will force) and LC_ALL=C.UTF-8; is the document complete, what rc and stderr"
+    cap U00_locale_a locale -a
+    for loc in C C.UTF-8; do
+        cap "U10_get_ff_$loc" env LC_ALL=$loc zfs get -j zfsb:ff "$R/src"
+        cap "U11_get_u8_$loc" env LC_ALL=$loc zfs get -j zfsb:u8 "$R/src"
+        cap "U12_get_both_$loc" env LC_ALL=$loc zfs get -j "$UPX" "$R/src"
+        cap "U13_get_ff_r_t_all_$loc" env LC_ALL=$loc zfs get -j -r -t all zfsb:ff,type "$R/src"
+        cap "U14_get_ff_snapshot_$loc" env LC_ALL=$loc zfs get -j zfsb:ff,zfsb:nl "$R/src@s1" "$R/src/aa@s1"
+        cap "U15_list_o_ff_$loc" env LC_ALL=$loc zfs list -j -o name,zfsb:ff "$R/src"
+        cap "U16_list_o_u8_$loc" env LC_ALL=$loc zfs list -j -o name,zfsb:u8 "$R/src"
+        cap "U17_list_o_ff_r_$loc" env LC_ALL=$loc zfs list -j -r -t all -o name,zfsb:ff "$R/src"
+        cap "U18_get_all_src_$loc" env LC_ALL=$loc zfs get -j all "$R/src"
+        cap "U19_get_all_recv_$loc" env LC_ALL=$loc zfs get -j all "$R/recv"
+        cap "U20_get_second_dataset_ff_$loc" env LC_ALL=$loc zfs get -j type "$R/empty" "$R/src" "$R/vol"
+        cap "U21_get_user_r_t_all_$loc" env LC_ALL=$loc zfs get -j -r -t all "$UPX" "$R/src"
+    done
+    cap U22_get_prefix_kept_C env LC_ALL=C zfs get -j zfsb:nl,zfsb:ff "$R/empty" "$R/src" "$R/vol"
+    note "D*: the same object named twice (duplicate keys in a JSON object?)"
+    cap D10_get_same_twice zfs get -j type "$R/src" "$R/src"
+    cap D11_get_r_and_child zfs get -j -r -d 1 type "$R/src" "$R/src/aa"
+    cap D12_list_same_twice zfs list -j -o name,type "$R/src" "$R/src"
+    cap D13_list_r_and_child zfs list -j -r -d 1 -o name,type "$R/src" "$R/src/aa"
+    cap B10_guid_big_H zfs get -H -p -o name,property,value guid "$R/big"
+    cap B11_guid_big_j zfs get -j guid "$R/big"
+    cap B12_guid_big_json_int zfs get -j --json-int guid,createtxg,used "$R/big"
+    cap B13_list_guid_big_json_int zfs list -j --json-int -o name,guid,createtxg,used "$R/big"
+    cap B14_list_guid_big_j zfs list -j -o name,guid "$R/big"
+    cap U30_get_all_clean_dataset zfs get -j all "$R/empty"
+    cap U31_get_all_clean_dataset_p zfs get -j -p all "$R/empty"
+
+    # ---- get -j
+    cap G10_all_src zfs get -j all "$R/src"
+    cap G11_all_src_p zfs get -j -p all "$R/src"
+    cap G12_user zfs get -j "$UP" "$R/src"
+    cap G13_user_p zfs get -j -p "$UP,type,name,creation,used" "$R/src"
+    cap G14_user_notp zfs get -j "$UP,type,name,creation,used" "$R/src"
+    cap G15_user_r_t_all zfs get -j -r -t all "$UP" "$R/src"
+    cap G16_user_recv_r zfs get -j -r -t all "$UP" "$R/recv"
+    cap G17_s_local zfs get -j -r -t all -s local "$UP" "$R/src"
+    cap G18_s_inherited zfs get -j -r -t all -s inherited "$UP" "$R/src"
+    cap G19_s_default zfs get -j -s default compression,checksum,atime "$R/src/child"
+    cap G20_s_none zfs get -j -s none type,creation,used,guid "$R/src"
+    cap G21_s_received zfs get -j -r -t all -s received "$UP" "$R/recv"
+    cap G22_s_temporary zfs get -j -s temporary readonly,mountpoint,type "$R/tmp"
+    cap G23_s_local_inherited zfs get -j -r -s local,inherited "$UP" "$R/src"
+    cap G24_o_five zfs get -j -r -t all -o name,property,value,received,source "$UP" "$R/recv"
+    cap G25_o_property_value zfs get -j -o property,value "$UP" "$R/src"
+    cap G26_o_received zfs get -j -o name,property,received "$UP" "$R/recv"
+    cap G27_o_value_only zfs get -j -o value "$UP" "$R/src"
+    cap G28_o_source_only zfs get -j -o source "$UP" "$R/src"
+    cap G29_o_name_received_source zfs get -j -o name,received,source zfsb:q,zfsb:nl "$R/recv" "$R/recv/child"
+    cap G30_o_all zfs get -j -o all zfsb:q "$R/recv"
+    cap G31_recv_r_default zfs get -j -r "$UP" "$R/recv"
+    cap G32_mixed zfs get -j compression,mountpoint,type,mounted,volsize,origin,clones,userrefs,createtxg,used,creation "$R/src" "$R/src/child" "$R/src@s1" "$R/vol"
+    cap G33_mixed_p zfs get -j -p compression,mountpoint,type,mounted,volsize,origin,clones,userrefs,createtxg,used,creation "$R/src" "$R/src/child" "$R/src@s1" "$R/vol"
+    cap G34_all_snapshot zfs get -j all "$R/src@s1"
+    cap G35_all_volume zfs get -j all "$R/vol"
+    cap G36_all_volume_snapshot zfs get -j all "$R/vol@s1"
+    cap G37_all_bookmark zfs get -j all "$R/src#bm1"
+    cap G38_clone zfs get -j origin,clones,userrefs,type "$R/clone" "$R/src@s1"
+    cap G39_d1 zfs get -j -d 1 -t all type,createtxg "$R/src"
+    cap G40_r_t_snapshot_sorted zfs get -j -r -t snapshot -s local,none createtxg,type "$R/src"
+    cap G41_order_requested zfs get -j zfsb:ff,type,name "$R/src"
+    cap G42_empty_snapshots zfs get -j -r -t snapshot type "$R/empty"
+    cap G43_space_name zfs get -j type,zfsb:ff "$R/sp ace"
+    cap G44_space_snapshot zfs get -j type "$R/sp ace@s p"
+    cap G45_volsize_on_fs zfs get -j volsize,volblocksize,quota "$R/src"
+    cap G46_nonexistent zfs get -j type "$R/nonexistent"
+    cap G47_nonexistent_snapshot zfs get -j type "$R/src@nonexistent"
+    cap G48_bad_property zfs get -j nosuchprop "$R/src"
+    cap G49_bad_property_and_type zfs get -j nosuchprop,type "$R/src"
+    cap G50_one_good_one_missing zfs get -j type "$R/src" "$R/nonexistent"
+    cap G51_noargs zfs get -j
+    cap G52_j_with_H zfs get -j -H type "$R/src"
+    cap G53_json_int zfs get --json-int type,used,creation "$R/src"
+    cap G54_json_long zfs get --json type,used "$R/src"
+    cap G55_json_int_p zfs get -j --json-int -p type,used,creation,createtxg,guid "$R/src"
+    cap G56_bad_option zfs get -j --bogus type "$R/src"
+    cap G57_bad_source zfs get -j -s nosuchsource type "$R/src"
+    cap G58_inherited_mountpoint zfs get -j -r mountpoint,compression,zfsb:nl "$R/src"
+    cap G59_name_type_leads zfs get -j name,type,zfsb:ff "$R/src" "$R/src/aa"
+    cap G60_all_r_snapshot_empty_list zfs get -j -r -t snapshot all "$R/empty"
+    cap G61_all_recv zfs get -j all "$R/recv"
+    cap G62_p_user_recv zfs get -j -p -r "$UP" "$R/recv"
+    end_section
+}
+
+
 # ================================================================ M1 summary: one mechanically parsed line per token
 summarize_m1() {
     [ -d "$OUT/M1" ] || return 0
@@ -1366,6 +2379,9 @@ want M4    && sec_M4
 want EP    && sec_EP
 want M5    && sec_M5
 want M6    && sec_M6
+want M7    && sec_M7
+want M8    && sec_M8
+want M9    && sec_M9
 want Z2    && sec_Z2
 want Z3    && sec_Z3
 want Z4    && sec_Z4

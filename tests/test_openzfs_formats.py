@@ -87,16 +87,6 @@ def with_type_column(stdout):
     return out
 
 
-def with_received_column(stdout):
-    """libzfseasy reads `name,property,value,received,source`; the capture is `name,property,value,source`.
-    Insert `received=-` (these are all local or default properties)."""
-    out = []
-    for line in stdout.splitlines():
-        cols = line.split('\t')
-        out.append('\t'.join(cols[:-1] + ['-', cols[-1]]) + '\n')
-    return out
-
-
 def stream_failure(mock, stderr, rc):
     """Make the next Popen a send that dies before writing a byte (the streaming commands read bytes)."""
     proc = MagicMock()
@@ -120,7 +110,7 @@ def sender_rc(rec):
 
 class TestFixtures:
     def test_every_version_has_every_section(self, version):
-        for section in ('M1', 'M2', 'M3_Z8', 'M4', 'EP', 'Z4', 'Z7'):
+        for section in ('M1', 'M2', 'M3_Z8', 'M4', 'EP', 'Z4', 'Z7', 'M7'):
             assert load_section(version, section), section
 
     def test_versions_match_their_directory(self, version):
@@ -888,12 +878,22 @@ class TestKeylessRawCopyZ7:
     DS = 'zfsbcapc/Z7/srv/rx'
 
     def test_get_local_all_lists_the_user_properties_without_the_key(self, version, mock_subprocess):
-        """`get -s local all` (here with libzfseasy's `received` column, inserted: derived from the capture, whose
-        received column is `-` for every local property) through zfsbackup's own reader."""
+        """`get -s local all` through zfsbackup's own two-phase reader. The capture's four-column rows
+        (`name,property,value,source`, taken WITH `-s local`, so no `type` row) are the real values and sources: the
+        discovery (`-o name,property,source`) is the same rows without the value column, and the values read is an
+        explicit-list answer (`name`, `type`, then the requested names) built from the same rows."""
         from zfsbackup.backup_manager import read_zfsbackup_properties
+        from _get_support import explicit_lines
         rec = load_section(version, 'Z7')['Z7/20_get_local_all']
         assert rec.rc == 0
-        mock_subprocess.setup(stdout=with_received_column(rec.stdout))
+        rows = [line.split('\t') for line in rec.stdout.splitlines()]
+        assert all(len(r) == 4 and r[0] == self.DS for r in rows)
+        discovery = [f'{r[0]}\t{r[1]}\t{r[3]}\n' for r in rows]
+        ours = [r[1] for r in rows if r[1].startswith('org.zfsbackup:')]
+        mock_subprocess.setup_multi(
+            (discovery,),
+            (explicit_lines(self.DS, ours, {r[1]: (r[2], r[3]) for r in rows}),),
+        )
         props = read_zfsbackup_properties(Filesystem(self.DS))
         assert props == {
             'org.zfsbackup:config': 'eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==',
@@ -1120,3 +1120,205 @@ class TestKeyUnloadedSendZ4:
         with pytest.raises(Exception) as exc:
             zfs.send.snapshot(self.SNAP, properties=True)
         assert 'may not be sent with properties without the raw flag' in str(exc.value)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# M7 (B-2b): what `zfs receive -F` does to snapshots newer than the base, and what the server therefore decides
+# --------------------------------------------------------------------------------------------------------------
+
+def m7(version):
+    return load_section(version, 'M7')
+
+
+def listed(rec):
+    """`[(short name, guid, createtxg)]` of a captured `zfs list -H -t snapshot -o name,guid,createtxg` (note the
+    column order: libzfseasy asks for `name,type,createtxg,guid`)."""
+    rows = []
+    for line in rec.stdout.splitlines():
+        name, guid, txg = line.split('\t')
+        rows.append((name.split('@', 1)[1], int(guid), int(txg)))
+    return rows
+
+
+def names_of(rec):
+    return [n for n, _g, _t in listed(rec)]
+
+
+def as_server_rows(rec):
+    """The capture re-ordered into the columns `api.server_snapshots` asks for (`name,type,createtxg,guid`)."""
+    return ['%s\tsnapshot\t%d\t%d\n' % (line.split('\t')[0], int(line.split('\t')[2]), int(line.split('\t')[1]))
+            for line in rec.stdout.splitlines()]
+
+
+def server_view(mock, rec):
+    """What the server's `server_snapshots` makes of `rec` (through the real `zfs list` parser)."""
+    from zfsbackup.api import server_snapshots
+    replay(mock, rec, stdout=as_server_rows(rec))
+    return server_snapshots(Filesystem(rec.cmd.split()[-1]))
+
+
+def decide(rows, base_name, base_guid, discard=()):
+    from zfsbackup.api import StreamBase, decide_receive
+    return decide_receive('srv/ds', StreamBase(base_name, base_guid, frozenset(discard)), rows)
+
+
+class TestForcedIncrementalDestroysNewerSnapshotsM7:
+    """U1/U2: the premise of the B-2b guard, on every version."""
+
+    def test_u1_f_destroys_the_newer_snapshot_and_without_f_zfs_refuses(self, version):
+        recs = m7(version)
+        before, after = names_of(recs['M7/U1.a1_before']), names_of(recs['M7/U1.a3_after'])
+        assert before == ['old', 'new1'] and after == ['old', 'new2']          # new1 is GONE after -F
+        assert recs['M7/U1.a2_F_incr'].rc == 0 and ' receive -F ' in recs['M7/U1.a2_F_incr'].cmd
+        refused = recs['M7/U1.b2_noF_incr']
+        assert refused.rc == 1 and ' receive -F ' not in refused.cmd
+        assert 'has been modified' in refused.stderr and 'since most recent snapshot' in refused.stderr
+        assert names_of(recs['M7/U1.b3_after']) == ['old', 'new1']             # untouched
+
+    def test_u1_the_same_when_the_sender_no_longer_has_the_snapshot(self, version):
+        """The rollback / restore situation: the sender lost @new1, the receiver (the server) keeps it
+        until a `-F` stream from @old removes it."""
+        recs = m7(version)
+        assert names_of(recs['M7/U1.c0_sender_snaps']) == ['old', 'new2']
+        assert names_of(recs['M7/U1.c1_before']) == ['old', 'new1']
+        assert recs['M7/U1.c2_F_incr_sender_lacks_new1'].rc == 0
+        assert names_of(recs['M7/U1.c3_after']) == ['old', 'new2']
+
+    def test_u1_a_held_newer_snapshot_makes_f_fail_and_nothing_is_destroyed(self, version):
+        recs = m7(version)
+        assert recs['M7/U1.d2_F_incr_newer_snapshot_held'].rc == 1
+        assert 'dataset is busy' in recs['M7/U1.d2_F_incr_newer_snapshot_held'].stderr
+        assert names_of(recs['M7/U1.d3_after']) == names_of(recs['M7/U1.d1_before']) == ['old', 'new1']
+
+    def test_u2_the_newer_snapshot_is_still_there_while_a_cut_receive_is_partial(self, version):
+        recs = m7(version)
+        assert names_of(recs['M7/U2.a3_while_partial']) == ['old', 'new1']
+        assert recs['M7/U2.a2_F_incr_cut'].rc == 1 and 'Partially received snapshot is saved' in recs['M7/U2.a2_F_incr_cut'].stderr
+
+    def test_u2_a_forced_resume_destroys_it_and_an_unforced_resume_is_refused(self, version):
+        recs = m7(version)
+        assert recs['M7/U2.a6_resume_F'].rc == 0
+        assert names_of(recs['M7/U2.a7_after_resume']) == ['old', 'new2']      # new1 destroyed by the resume
+        noforce = recs['M7/U2.b3_resume_noF']
+        assert noforce.rc == 1 and ' receive -F ' not in noforce.cmd
+        assert names_of(recs['M7/U2.b4_after_resume']) == ['old', 'new1']
+
+    def test_u2_a_fresh_mode_abort_keeps_the_newer_snapshot(self, version):
+        recs = m7(version)
+        assert recs['M7/U2.c3_abort'].cmd.startswith('zfs receive -A')
+        assert names_of(recs['M7/U2.c4_after_abort']) == ['old', 'new1']
+
+
+class TestServerDecisionOnTheCapturedHistoryM7:
+    """The server's decision (`api.decide_receive`) on the listings the captures hold, read through the real
+    list parser."""
+
+    def base_guid(self, recs, name='old'):
+        return dict((n, g) for n, g, _t in listed(recs['M7/U1.00_sender_snaps']))[name]
+
+    def test_u1_the_stream_that_would_destroy_new1_is_refused_unless_the_client_names_it(self, version, mock_subprocess):
+        recs = m7(version)
+        rows = server_view(mock_subprocess, recs['M7/U1.a1_before'])
+        old, new1 = self.base_guid(recs), self.base_guid(recs, 'new1')
+        refused = decide(rows, 'old', old)
+        assert refused.force is False and refused.reason == 'server_newer' and 'new1' in refused.message
+        allowed = decide(rows, 'old', old, discard={new1})
+        assert allowed.force is True and allowed.rolled_back == ('new1',)
+        # the capture says that is exactly what -F then does
+        assert names_of(recs['M7/U1.a3_after']) == ['old', 'new2']
+
+    def test_u1_the_negotiate_answer_for_it(self, version, mock_subprocess):
+        from zfsbackup.api import newer_than
+        recs = m7(version)
+        rows = server_view(mock_subprocess, recs['M7/U1.c1_before'])
+        assert newer_than('srv/ds', 'old', rows) == [{'name': 'new1', 'guid': str(self.base_guid(recs, 'new1'))}]
+        assert newer_than('srv/ds', 'new1', rows) == []
+
+    def test_u2_a_resume_stream_goes_through_the_same_table(self, version, mock_subprocess):
+        recs = m7(version)
+        rows = server_view(mock_subprocess, recs['M7/U2.a3_while_partial'])      # new1 present while partial
+        old = dict((n, g) for n, g, _t in listed(recs['M7/U2.00_sender_snaps']))['old']
+        assert decide(rows, 'old', old).reason == 'server_newer'
+
+    def test_u5_a_modified_head_with_the_base_the_newest_snapshot_gets_f(self, version, mock_subprocess):
+        """U5 plain and raw: without -F zfs refuses the modified head, with -F it receives and keeps a, b."""
+        recs = m7(version)
+        for kind in ('plain', 'raw'):
+            noforce = recs['M7/U5.%s.write.3_noF' % kind]
+            assert noforce.rc == 1 and 'has been modified' in noforce.stderr, kind
+            assert recs['M7/U5.%s.write.5_F' % kind].rc == 0, kind
+            assert names_of(recs['M7/U5.%s.write.6_snaps_after_F' % kind]) == ['a', 'b', 'c'], kind
+            rows = server_view(mock_subprocess, recs['M7/U5.%s.write.4_snaps_after_noF' % kind])
+            b_guid = dict((n, g) for n, g, _t in listed(recs['M7/U5.%s.write.4_snaps_after_noF' % kind]))['b']
+            decision = decide(rows, 'b', b_guid)
+            assert decision.force is True and decision.rolled_back == (), kind
+
+    def test_u5_an_unmodified_head_needs_no_f(self, version):
+        recs = m7(version)
+        for kind in ('plain', 'raw'):
+            assert recs['M7/U5.%s.c0.2_noF_untouched' % kind].rc == 0, kind
+
+    @pytest.mark.parametrize('case', ['same_newer', 'same_existing_name', 'other_same_name', 'other_new_name'])
+    def test_u6_a_full_stream_onto_a_copy_with_snapshots_is_refused_by_zfs_with_and_without_f(self, version, mock_subprocess, case):
+        recs = m7(version)
+        noforce, forced = recs['M7/U6.%s.noF.2_recv' % case], recs['M7/U6.%s.F.2_recv' % case]
+        assert noforce.rc == 1 and 'must specify -F to overwrite it' in noforce.stderr
+        assert forced.rc == 1 and 'destination has snapshots' in forced.stderr and 'must destroy them to overwrite it' in forced.stderr
+        for after in ('noF', 'F'):
+            assert names_of(recs['M7/U6.%s.%s.3_after' % (case, after)]) == names_of(recs['M7/U6.%s.%s.1_before' % (case, after)])
+        # ...so the server refuses it up front, with a reason, before zfs sees a byte
+        rows = server_view(mock_subprocess, recs['M7/U6.%s.F.1_before' % case])
+        decision = decide(rows, None, None)
+        assert decision.force is False and decision.reason == 'no_common' and 'zfs rename' in decision.message
+
+    def test_u6_raw_is_refused_the_same_way(self, version, mock_subprocess):
+        recs = m7(version)
+        assert recs['M7/U6.raw.noF.2_recv'].rc == 1 and recs['M7/U6.raw.F.2_recv'].rc == 1
+        assert 'destination has snapshots' in recs['M7/U6.raw.F.2_recv'].stderr
+        rows = server_view(mock_subprocess, recs['M7/U6.raw.F.1_before'])
+        assert decide(rows, None, None).reason == 'no_common'
+
+    def test_u6_an_existing_dataset_without_snapshots_takes_a_forced_full_stream(self, version, mock_subprocess):
+        recs = m7(version)
+        assert recs['M7/U6.empty.noF.1_recv'].rc == 1 and 'must specify -F' in recs['M7/U6.empty.noF.1_recv'].stderr
+        assert recs['M7/U6.empty.F.1_recv'].rc == 0 and names_of(recs['M7/U6.empty.F.2_after']) == ['c']
+        rows = server_view(mock_subprocess, recs['M7/U6.empty.noF.2_after'])
+        assert rows == [] and decide(rows, None, None).force is True
+
+
+class TestRollbackKeepsLocalAnchorsM7:
+    """U4: `zfs rollback -r` destroys snapshots but leaves the dataset's properties alone -- which is why the
+    client can recognise a rollback by an anchor that names a snapshot that no longer exists."""
+
+    def test_rollback_needs_r_and_keeps_every_property(self, version):
+        recs = m7(version)
+        assert recs['M7/U4.a3_rollback_without_r'].rc == 1 and 'use \'-r\'' in recs['M7/U4.a3_rollback_without_r'].stderr
+        assert recs['M7/U4.a4_rollback_r'].rc == 0
+        assert names_of(recs['M7/U4.a2_snaps_before']) == ['A', 'B', 'C'] and names_of(recs['M7/U4.a5_snaps_after']) == ['A']
+        assert recs['M7/U4.a6_props_after'].stdout == recs['M7/U4.a1_props_before'].stdout
+        assert recs['M7/U4.b5_props_after'].stdout == recs['M7/U4.b2_props_before'].stdout
+
+    def anchor_value(self, mock, rec, prop, dataset):
+        """`get_local_anchor` on a dataset whose `zfs get -s local` prints what the capture shows for the rows with
+        source `local` (derived: zfs filters on the source itself)."""
+        from zfsbackup.backup_manager import DatasetManager
+        from zfsbackup.config import BackupConfig, DatasetConfig
+        lines = []
+        for line in rec.stdout.splitlines():
+            cols = line.split('\t')
+            if cols[1] == prop and cols[-1] == 'local':
+                lines.append(cols[2] + '\n')
+        replay(mock, rec, stdout=lines)
+        manager = DatasetManager(BackupConfig(datasets=[DatasetConfig(name=dataset)]))
+        dsi = manager.datasets[0]
+        return manager.get_local_anchor(dsi, prop.rsplit('.', 1)[1])
+
+    def test_the_local_anchor_survives_the_rollback(self, version, mock_subprocess):
+        recs = m7(version)
+        assert self.anchor_value(mock_subprocess, recs['M7/U4.a6_props_after'], 'org.zfsbackup:anchor.x', 'pool/data') == 'snapA'
+
+    def test_a_received_anchor_is_not_a_local_one(self, version, mock_subprocess):
+        recs = m7(version)
+        rec = recs['M7/U4.b5_props_after']
+        assert self.anchor_value(mock_subprocess, rec, 'org.zfsbackup:anchor.y', 'pool/data') is None     # received
+        assert self.anchor_value(mock_subprocess, rec, 'org.zfsbackup:anchor.x', 'pool/data') == 'localx'

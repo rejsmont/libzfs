@@ -1107,7 +1107,10 @@ class TestDiscardedWebsocketResponse:
 
     def test_the_status_line_is_still_logged(self, make_handler, caplog):
         h = make_handler(response_started=False)
-        with caplog.at_level(logging.DEBUG):
+        # A 200 access line is DEBUG since C3 (1xx-3xx DEBUG, 4xx INFO, 5xx
+        # WARNING), and the werkzeug logger sits at INFO unless
+        # `logsetup.configure` pinned it, so lower it explicitly.
+        with caplog.at_level(logging.DEBUG, logger='werkzeug'):
             self._respond(h, 200, "websocket", "Upgrade")
         assert any(" 200 " in r.getMessage() for r in caplog.records)
 

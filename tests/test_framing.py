@@ -31,8 +31,8 @@ from libzfseasy.types import (
     Bookmark, Dataset, Filesystem, InvalidNameError, InvalidValueError, Property, Snapshot, Validate, Volume, ZFS,
 )
 from libzfseasy.zfs import (
-    Command, GetCommand, ListCommand, _MAX_QUOTED, _MAX_ROW_WARNINGS, _Scope, _skip_invalid_name, _wanted_types,
-    _zfs_cmd,
+    Command, GetCommand, GetRow, GetRows, ListCommand, ZFSOutputError, _MAX_QUOTED, _MAX_ROW_WARNINGS, _Scope,
+    _skip_invalid_name, _wanted_types, _zfs_cmd,
 )
 
 zfs_module = importlib.import_module('libzfseasy.zfs')
@@ -193,15 +193,26 @@ class _Feed:
 
     def __init__(self):
         self.calls = []
+        self._queue = None
         self.set()
 
     def set(self, stdout=b'', stderr=b'', returncode=0):
+        self._queue = None
         self._args = (stdout, stderr, returncode)
+        return self
+
+    def sequence(self, *runs):
+        """The next calls get these processes in order (`stdout` or `(stdout, stderr, returncode)` each); one call
+        more than that fails the test: `zfs.get.rows()` must run exactly the commands a test expects."""
+        self._queue = [run if isinstance(run, tuple) else (run,) for run in runs]
         return self
 
     def __call__(self, cmd, *args, **kwargs):
         assert 'text' not in kwargs and 'universal_newlines' not in kwargs, kwargs   # bytes, decoded by us
         self.calls.append(list(cmd))
+        if self._queue is not None:
+            assert self._queue, 'an unexpected extra zfs call: %r' % (list(cmd),)
+            return _Proc(*self._queue.pop(0))
         return _Proc(*self._args)
 
     @property
@@ -1001,6 +1012,204 @@ class TestListSkipRules:
         assert feed.argv == ['list', '-H', '-r', '-t', 'filesystem', '-o', 'name,type,compression', 'pool/a']
 
 
+class _TrackedProc(_Proc):
+    """A `_Proc` that notes whether it was reaped (`wait` or `poll` called)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.reaped = False
+
+    def poll(self):
+        self.reaped = True
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.reaped = True
+        return self.returncode
+
+
+class TestListStrict:
+    """`list(strict=True)`: any row that would be skipped raises instead of returning a partial result
+    (B-2b: the server decides whether to destroy snapshots from this listing, so a hidden row is not acceptable)."""
+
+    TRUST = 'zfs list output could not be trusted: '
+    GOOD = (('pool/a', 'filesystem'), ('pool/b', 'volume'), ('pool/c', 'filesystem'))
+
+    def _strict(self, feed, rows, **kw):
+        feed.set(_rows(*rows) if not isinstance(rows, bytes) else rows)
+        return ListCommand()(strict=True, **kw)
+
+    def _raises(self, feed, rows, **kw):
+        with pytest.raises(Exception) as exc:
+            self._strict(feed, rows, **kw)
+        assert type(exc.value) is Exception, 'a bare Exception, like the other zfs failures'
+        return str(exc.value)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_clean_listing_returns_the_normal_list(self, feed):
+        result = self._strict(feed, self.GOOD)
+        assert [(type(o), o.name) for o in result] == [(Filesystem, 'pool/a'), (Volume, 'pool/b'),
+                                                       (Filesystem, 'pool/c')]
+        assert isinstance(result, list)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_empty_listing_is_clean(self, feed):
+        assert self._strict(feed, []) == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_strict_is_off_by_default(self, feed):
+        feed.set(_rows(self.GOOD[0], ('pool/x', 'bogus'), self.GOOD[2]))
+        assert [o.name for o in ListCommand()()] == ['pool/c']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('rows, kw, fragment', [
+        pytest.param([GOOD[0], ('pool/x',), GOOD[2]], {}, 'expected 2 columns, got 1', id='too-few-columns'),
+        pytest.param([GOOD[0], ('pool/x', 'filesystem', 'extra'), GOOD[2]], {}, 'expected 2 columns, got 3',
+                     id='too-many-columns'),
+        pytest.param(b'pool/a\tfilesystem\n\npool/c\tfilesystem\n', {}, 'empty line', id='empty-line'),
+        pytest.param([GOOD[0], ('pool/x', 'bogus'), GOOD[2]], {}, 'bogus', id='unknown-type'),
+        pytest.param([('pool/a', 'filesystem'), ('pool/a@s', 'snapshot')], {'types': 'filesystem'},
+                     'was not requested', id='unrequested-type'),
+        pytest.param([('pool/a', 'filesystem'), ('other/x', 'filesystem')],
+                     {'roots': Filesystem('pool/a'), 'recursive': True}, 'outside the requested roots',
+                     id='outside-the-roots'),
+        pytest.param([GOOD[0], ('pool/.system', 'filesystem'), GOOD[2]], {}, 'cannot represent the name',
+                     id='unrepresentable-name'),
+        pytest.param([GOOD[0], ('pool/a', 'filesystem')], {}, 'name appears 2 times', id='duplicate-name'),
+    ])
+    def test_every_skip_reason_raises_with_the_first_reason(self, feed, rows, kw, fragment):
+        message = self._raises(feed, rows, **kw)
+        assert message.startswith(self.TRUST)
+        assert fragment in message
+        assert ' skipped, the first: ' in message
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_one_row_is_singular_and_several_are_plural(self, feed):
+        assert self._raises(feed, [self.GOOD[0], ('pool/x', 'filesystem', 'extra')]).startswith(
+            self.TRUST + '2 rows skipped, the first: ')       # the bad row and the row before it (continuation)
+        assert self._raises(feed, [('pool/x', 'bogus')]).startswith(self.TRUST + '1 row skipped, the first: ')
+        assert self._raises(feed, [('pool/a', 'filesystem'), ('pool/a', 'filesystem')]).startswith(
+            self.TRUST + '1 row skipped, the first: ')
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_first_reason_is_the_first_in_the_output(self, feed):
+        message = self._raises(feed, [('pool/x', 'bogus'), ('pool/y',), self.GOOD[0]])
+        assert 'bogus' in message.split('the first: ', 1)[1] and 'expected 2 columns' not in message
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_name_that_fails_to_parse_with_another_error_raises(self, feed, monkeypatch):
+        real = ZFS.from_name
+
+        def from_name(name, dstype=None, properties=None):
+            if name == 'pool/b':
+                raise ValueError('odd')
+            return real(name, dstype, properties)
+
+        monkeypatch.setattr(ZFS, 'from_name', staticmethod(from_name))
+        message = self._raises(feed, self.GOOD)
+        assert 'cannot parse the name (odd)' in message
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_properties_that_cannot_be_applied_raise(self, feed, monkeypatch):
+        def update(self, props, lenient=False):
+            raise ValueError('nope')
+
+        monkeypatch.setattr(Filesystem, 'update', update)
+        message = self._raises(feed, [('pool/a', 'filesystem', 'lz4'), ('pool/b', 'volume', '-')],
+                               properties='compression')
+        assert 'cannot apply the properties (nope)' in message
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_continuation_drop_is_counted(self, feed):
+        message = self._raises(feed, [self.GOOD[0], self.GOOD[1], ('tail',), self.GOOD[2]])
+        assert message.startswith(self.TRUST + '2 rows skipped, the first: ')
+        assert 'expected 2 columns, got 1' in message
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_invalid_name_raises_even_when_its_warning_was_deduplicated_away(self, feed, caplog):
+        rows = [self.GOOD[0], ('pool/.system', 'filesystem'), self.GOOD[2]]
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            first = self._raises(feed, rows)
+            warnings_after_first = list(_warnings(caplog))
+            second = self._raises(feed, rows)
+        assert warnings_after_first and _warnings(caplog) == warnings_after_first      # the second logged nothing new
+        assert first == second and 'cannot represent the name' in second
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_row_in_the_message_is_redacted_and_clipped(self, feed):
+        secret = 'https://user:hunter2@host/key'
+        message = self._raises(feed, [('pool/a', 'filesystem', secret)])
+        assert 'hunter2' not in message and '***@host' in message
+        long = self._raises(feed, [('pool/a', 'filesystem', 'x' * 5000)])
+        assert len(long) < 400 and '...' in long and 'x' * 200 not in long
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_non_strict_keeps_the_partial_result_and_the_same_warnings(self, feed, caplog):
+        rows = [self.GOOD[0], ('pool/x', 'bogus'), self.GOOD[2]]
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            feed.set(_rows(*rows))
+            partial = ListCommand()(strict=False)
+            plain = list(_warnings(caplog))
+            caplog.clear()
+            with pytest.raises(Exception):
+                feed.set(_rows(*rows))
+                ListCommand()(strict=True)
+            strict = list(_warnings(caplog))
+        assert [o.name for o in partial] == ['pool/c']
+        assert plain and strict == plain
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_nonzero_exit_raises_the_subprocess_error_not_the_trust_error(self, feed):
+        feed.set(_rows(('pool/x', 'bogus')), stderr=b"cannot open 'pool/x': dataset does not exist\n", returncode=1)
+        with pytest.raises(Exception) as exc:
+            ListCommand()(strict=True)
+        assert 'dataset does not exist' in str(exc.value) and self.TRUST not in str(exc.value)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_strict_with_lazy_is_a_value_error_before_anything_runs(self, feed):
+        with pytest.raises(ValueError, match='strict'):
+            ListCommand()(strict=True, lazy=True)
+        assert feed.calls == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_process_is_read_to_the_end_and_reaped_before_the_raise(self, monkeypatch):
+        procs = []
+
+        def popen(cmd, *args, **kwargs):
+            procs.append(_TrackedProc(_rows(('pool/a', 'filesystem'), ('pool/x', 'bogus'), ('pool/c', 'filesystem'))))
+            return procs[-1]
+
+        monkeypatch.setattr(subprocess, 'Popen', popen)
+        with pytest.raises(Exception, match='could not be trusted'):
+            ListCommand()(strict=True)
+        (proc,) = procs
+        assert proc.reaped and proc.stdout.read() == b''             # nothing left unread
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_argv_is_the_same_as_without_strict(self, feed):
+        feed.set(_rows(('pool@s', 'snapshot', '1', '2')))
+        ListCommand()(roots=Filesystem('pool'), types='snapshot', properties=['createtxg', 'guid'], strict=True)
+        strict_argv = feed.argv
+        ListCommand()(roots=Filesystem('pool'), types='snapshot', properties=['createtxg', 'guid'])
+        assert strict_argv == feed.argv
+
+
 class TestListDuplicateNames:
     """zfs prints each object once: a name that comes back is a forgery, and nothing says which row is real."""
 
@@ -1211,9 +1420,9 @@ class TestGetTabRecovery:
     """A value containing tabs shifts the `value,received,source` columns. It is recovered only when exactly one split
     is plausible: received is `-` on a non-received source, or received equals the value."""
 
-    def _get(self, feed, rows, **kw):
+    def _get(self, feed, rows, properties='org.t:v', **kw):
         feed.set(_rows(*(_get_rows('pool/a', explicit=True) + rows)))
-        return GetCommand()(Filesystem('pool/a'), properties='org.t:v', **kw)
+        return GetCommand()(Filesystem('pool/a'), properties=properties, **kw)
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -1255,7 +1464,7 @@ class TestGetTabRecovery:
     def test_the_recovery_never_crosses_into_the_next_row(self, feed):
         """The row is recovered from its own columns only: the neighbours keep their own values."""
         rows = [_row('pool/a', 'compression', 'lz4'), _row('pool/a', 'org.t:v', 'a\tb'), _row('pool/a', 'atime', 'off')]
-        (obj,) = self._get(feed, rows)
+        (obj,) = self._get(feed, rows, properties=['compression', 'org.t:v', 'atime'])
         assert (obj['compression'].value, obj['org.t:v'].value, obj['atime'].value) == ('lz4', 'a\tb', 'off')
 
     @pytest.mark.unit
@@ -1264,7 +1473,8 @@ class TestGetTabRecovery:
         rows = [('pool/a', 'org.t:v', 'v', '-'), ('pool/a', 'org.t:w'), ('pool/a',), ('stray',),
                 _row('pool/a', 'compression', 'lz4')]
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
-            (obj,) = self._get(feed, rows)
+            # zfs printed a row for `org.t:v` and `org.t:w` too; the parser skipped them (they still count in the order)
+            (obj,) = self._get(feed, rows, properties=['org.t:v', 'org.t:w', 'compression'])
         assert obj['org.t:v'] is None and obj['compression'].value == 'lz4'
         assert sum('expected 5 columns' in w for w in _warnings(caplog)) == 4
 
@@ -1331,13 +1541,15 @@ class TestGetObjectRules:
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_no_type_row_drops_the_object_in_an_explicit_list(self, feed, caplog):
-        """An explicit list: a group that is only its `name` row (the `type` row never came) has no type."""
+        """An explicit list: a group that is only its `name` row (the `type` row never came) is not the rows zfs prints
+        (`name`, `type` and every requested property, in order), so it is refused by the exact-sequence check."""
         rows = [_row('pool/a', 'name', 'pool/a', '-', '-')] + _get_rows('pool/b', explicit=True, compression='gzip')
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
             result = self._get(feed, rows, properties='compression')
         assert [o.name for o in result] == ['pool/b']
         assert result[0]['compression'].value == 'gzip'
-        assert any("no type row for 'pool/a'" in w for w in _warnings(caplog))
+        assert any("the rows of 'pool/a' are not the 3 requested properties in order (got 1 rows)" in w
+                   for w in _warnings(caplog))
 
     @pytest.mark.unit
     @pytest.mark.subprocess
@@ -1382,7 +1594,7 @@ class TestGetObjectRules:
 
     @pytest.mark.unit
     @pytest.mark.subprocess
-    def test_unrepresentable_name_is_still_skipped_quietly(self, feed):
+    def test_unrepresentable_name_is_skipped_and_the_other_objects_kept(self, feed):
         rows = _get_rows('pool/a') + _get_rows('pool/.system', compression='off') + _get_rows('pool/c')
         assert [o.name for o in self._get(feed, rows)] == ['pool/a', 'pool/c']
 
@@ -1463,16 +1675,22 @@ class TestGetLeadRule:
         line, and a newline inside a value is simply more lines."""
         return ('\n'.join('\t'.join(r) for r in rows) + '\n').encode('utf-8', 'surrogateescape')
 
-    @staticmethod
-    def _object(name, explicit, dstype='filesystem', **props):
+    @classmethod
+    def _object(cls, name, explicit, dstype='filesystem', fill=True, **props):
+        """One object's rows as zfs prints them. With an explicit list zfs prints a row for EVERY requested property
+        (the call asks for `PROP`), so `PROP` gets a row unless the caller gives its own (`props`) or appends it
+        (`fill=False`)."""
+        if explicit and fill and cls.PROP not in props:
+            props = dict(props, **{cls.PROP: 'val'})
         return _get_rows(name, dstype, explicit=explicit, **props)
 
     def _stream(self, explicit, hostile_value, a_prop=None, b_real_prop=None):
         """A (with the hostile value as its last property) then the real group of B, as one zfs run prints them."""
         a_prop = a_prop or self.PROP
-        a = self._object('bk/A/x', explicit)
+        a = self._object('bk/A/x', explicit, fill=False)
         a.append(('bk/A/x', a_prop, hostile_value, '-', 'local'))
-        b = self._object('bk/B/y', explicit)
+        b = self._object('bk/B/y', explicit, fill=False)
+        b_real_prop = b_real_prop or (self.PROP if explicit else None)      # zfs prints every requested property
         if b_real_prop:
             b.append(('bk/B/y', b_real_prop, 'real', '-', 'local'))
         return self._text(*(a + b))
@@ -1520,9 +1738,9 @@ class TestGetLeadRule:
     @pytest.mark.parametrize('explicit', [True, False], ids=['explicit-list', 'all'])
     def test_the_object_after_the_dropped_one_is_unharmed(self, feed, explicit):
         hostile = 'v\t-\tlocal\nbk/B/y\t%s\tFORGEDCFG' % self.FORGED
-        a = self._object('bk/A/x', explicit) + [('bk/A/x', self.PROP, hostile, '-', 'local')]
+        a = self._object('bk/A/x', explicit, fill=False) + [('bk/A/x', self.PROP, hostile, '-', 'local')]
         b = self._object('bk/B/y', explicit)
-        c = self._object('bk/C/z', explicit) + [('bk/C/z', self.PROP, 'cval', '-', 'local')]
+        c = self._object('bk/C/z', explicit, fill=False) + [('bk/C/z', self.PROP, 'cval', '-', 'local')]
         result = self._get(feed, self._text(*(a + b + c)), explicit)
         assert [o.name for o in result] == ['bk/A/x', 'bk/C/z']
         assert result[1][self.PROP].value == 'cval' and result[1][self.FORGED] is None
@@ -1542,8 +1760,25 @@ class TestGetLeadRule:
             result = self._get(feed, data, explicit, lazy=lazy)
         assert [o.name for o in result] == ['bk/A/x']
         assert result[0][self.FORGED] is None
-        repeated = 'name' if explicit else 'type'                    # the real group repeats its own first row
-        assert any("property %r appears twice for 'bk/B/y'" % repeated in w for w in _warnings(caplog))
+        if explicit:
+            # the forged property is not one that was requested: the group is refused for that, before the real
+            # group's own first row can repeat anything
+            assert any("property %r of 'bk/B/y' was not requested" % self.FORGED in w for w in _warnings(caplog))
+        else:
+            # the real group repeats its own first row
+            assert any("property 'type' appears twice for 'bk/B/y'" in w for w in _warnings(caplog))
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_a_forged_prefix_of_requested_rows_only_is_dropped_as_a_repeat(self, feed, caplog, lazy):
+        """Explicit list, the forged rows are all properties that were asked for: the real group repeats the lead row."""
+        forged = ['bk/B/y\tname\tbk/B/y\t-\t-', 'bk/B/y\ttype\tfilesystem\t-\t-', 'bk/B/y\t%s\tFORGED\t-\tlocal' % self.PROP]
+        data = self._stream(True, 'v\t-\tlocal\n' + '\n'.join(forged))
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            result = self._get(feed, data, True, lazy=lazy)
+        assert [o.name for o in result] == ['bk/A/x']
+        assert any("property 'name' appears twice for 'bk/B/y'" in w for w in _warnings(caplog))
 
     # --- the received-source variant -------------------------------------------------------------------------------
 
@@ -1556,7 +1791,7 @@ class TestGetLeadRule:
         """A received property prints its value twice (`value`, `received`) and zfs shows `received` as the source, so a
         newline in it forges one 6-column row (recovered by the tab rule) and one 4-column row (skipped)."""
         value = 'x\t-\tlocal\nbk/B/y\t%s\tFORGED' % self.FORGED
-        a = self._object('bk/A/x', explicit) + [('bk/A/x', self.PROP, value, value, 'received')]
+        a = self._object('bk/A/x', explicit, fill=False) + [('bk/A/x', self.PROP, value, value, 'received')]
         b = self._object('bk/B/y', explicit)
         data = self._text(*(a + b))
         lines = data.decode().split('\n')
@@ -1723,7 +1958,8 @@ class TestGetLeadRule:
     @pytest.mark.unit
     @pytest.mark.subprocess
     def test_end_to_end_with_type_as_the_only_property(self, feed):
-        feed.set(self._text(*(self._object('bk/A/x', True) + self._object('bk/B/y', True, 'volume'))))
+        feed.set(self._text(*(self._object('bk/A/x', True, fill=False) +
+                              self._object('bk/B/y', True, 'volume', fill=False))))
         result = zfs.get(Filesystem('bk'), properties=['type'], recursive=True)
         assert feed.argv == ['get', '-H', '-o', 'name,property,value,received,source', '-r', '-t', 'all', 'name,type', 'bk']
         assert [(type(o), o.name) for o in result] == [(Filesystem, 'bk/A/x'), (Volume, 'bk/B/y')]
@@ -2215,3 +2451,1965 @@ class TestNeverRaisesOnHostileOutput:
                 if not lazy:
                     assert len({o.name for o in listed}) == len(listed)
                     assert len({o.name for o in got}) == len(got)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# D4: the per-listing summary of names libzfseasy cannot represent
+# ---------------------------------------------------------------------------------------------------------------------
+
+class TestSkippedNamesSummary:
+    """`_SkippedRows.done()` logs "skipped N name(s) libzfseasy cannot represent in zfs <cmd> output". It is a WARNING
+    only when that listing also logged a per-name WARNING (`_skip_invalid_name` returned True: a new name, a name whose
+    dedup TTL expired, or the one-off "more than N distinct names" notice); a name that persists is listed every
+    cycle, so a listing that only met already-reported names says it at DEBUG and the hourly dedup holds."""
+
+    BAD = ['pool/.a', 'pool/.b', 'pool/.c', 'pool/.d']
+
+    @staticmethod
+    def _summaries(caplog, cmd='list'):
+        """`[(level, message)]` of the name summaries, whatever their level."""
+        return [(r.levelno, r.getMessage()) for r in caplog.records if r.name == 'libzfseasy'
+                and r.getMessage().startswith('skipped ') and 'cannot represent in zfs %s output' % cmd in r.getMessage()]
+
+    @staticmethod
+    def _per_name(caplog):
+        return [r.getMessage() for r in caplog.records if r.name == 'libzfseasy' and r.levelno == logging.WARNING
+                and r.getMessage().startswith('skipping ')]
+
+    @staticmethod
+    def _wording(n, cmd='list'):
+        return 'skipped %d name%s libzfseasy cannot represent in zfs %s output' % (n, '' if n == 1 else 's', cmd)
+
+    def _list(self, feed, *names, lazy=False, **kw):
+        feed.set(_rows(*[(n, 'filesystem') for n in names], ('pool/ok', 'filesystem')))
+        return [o.name for o in ListCommand()(lazy=lazy, **kw)]
+
+    def _get(self, feed, *names, lazy=False):
+        rows = [r for n in names for r in _get_rows(n)] + _get_rows('pool/ok')
+        feed.set(_rows(*rows))
+        return [o.name for o in GetCommand()(properties='all', lazy=lazy)]
+
+    # the return value of _skip_invalid_name ----------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_skip_invalid_name_returns_true_only_when_it_logged(self, caplog):
+        err = InvalidNameError('x')
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            assert _skip_invalid_name('pool/.a', err) is True
+            assert _skip_invalid_name('pool/.a', err) is False
+            assert _skip_invalid_name('pool/.b', err) is True
+        assert len(self._per_name(caplog)) == 2
+
+    @pytest.mark.unit
+    def test_skip_invalid_name_returns_true_again_after_the_ttl(self, monkeypatch):
+        err = InvalidNameError('x')
+        assert _skip_invalid_name('pool/.a', err) is True
+        assert _skip_invalid_name('pool/.a', err) is False
+        monkeypatch.setattr(zfs_module, '_warned_names_since', time.monotonic() - zfs_module._WARNED_NAMES_TTL - 1)
+        assert _skip_invalid_name('pool/.a', err) is True
+
+    @pytest.mark.unit
+    def test_skip_invalid_name_overflow_notice_is_true_once(self, monkeypatch, caplog):
+        monkeypatch.setattr(zfs_module, '_MAX_WARNED_NAMES', 1)
+        err = InvalidNameError('x')
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            assert _skip_invalid_name('pool/.a', err) is True      # registered
+            assert _skip_invalid_name('pool/.b', err) is True      # the one-off "more than 1 distinct names" notice
+            assert _skip_invalid_name('pool/.c', err) is False     # silent from now on
+            assert _skip_invalid_name('pool/.d', err) is False
+        assert sum('further ones are skipped silently' in m for m in self._per_name(caplog)) == 1
+
+    @pytest.mark.unit
+    def test_the_warning_serial_moves_with_each_logged_warning(self):
+        err = InvalidNameError('x')
+        before = zfs_module._name_warnings
+        _skip_invalid_name('pool/.a', err)
+        _skip_invalid_name('pool/.a', err)
+        _skip_invalid_name('pool/.b', err)
+        assert zfs_module._name_warnings == before + 2
+
+    # list ----------------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_a_fresh_name_gets_a_per_name_warning_and_a_singular_summary_warning(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            assert self._list(feed, 'pool/.a', lazy=lazy) == ['pool/ok']
+        assert len(self._per_name(caplog)) == 1
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(1))]
+        assert self._wording(1) == 'skipped 1 name libzfseasy cannot represent in zfs list output'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_several_fresh_names_get_a_plural_summary_warning(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, *self.BAD[:3], lazy=lazy)
+        assert len(self._per_name(caplog)) == 3
+        assert self._summaries(caplog) == [(logging.WARNING, 'skipped 3 names libzfseasy cannot represent in zfs list output')]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_a_listing_of_already_reported_names_summarises_at_debug(self, feed, caplog, lazy):
+        self._list(feed, *self.BAD[:2])                                  # reports both
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            assert self._list(feed, *self.BAD[:2], lazy=lazy) == ['pool/ok']
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(2))]
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_summary_is_warning_again_after_the_ttl_expires(self, feed, caplog, monkeypatch):
+        self._list(feed, 'pool/.a')
+        self._list(feed, 'pool/.a')
+        monkeypatch.setattr(zfs_module, '_warned_names_since', time.monotonic() - zfs_module._WARNED_NAMES_TTL - 1)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, 'pool/.a')
+        assert len(self._per_name(caplog)) == 1
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(1))]
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):       # and quiet again right after
+            self._list(feed, 'pool/.a')
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(1))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_mix_of_new_and_deduped_names_warns_and_counts_both(self, feed, caplog):
+        self._list(feed, 'pool/.a')
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, 'pool/.a', 'pool/.b')
+        names = self._per_name(caplog)
+        assert len(names) == 1 and 'pool/.b' in names[0]
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(2))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_overflow_notice_counts_as_a_per_name_warning(self, feed, caplog, monkeypatch):
+        monkeypatch.setattr(zfs_module, '_MAX_WARNED_NAMES', 1)
+        self._list(feed, 'pool/.a')                                      # fills the registry
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, 'pool/.b')                                  # the one-off notice
+        assert any('further ones are skipped silently' in m for m in self._per_name(caplog))
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(1))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_listings_after_the_overflow_notice_are_debug(self, feed, caplog, monkeypatch):
+        monkeypatch.setattr(zfs_module, '_MAX_WARNED_NAMES', 1)
+        self._list(feed, 'pool/.a')
+        self._list(feed, 'pool/.b')                                      # the notice
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, 'pool/.c', 'pool/.d')                       # silent now
+            self._list(feed, 'pool/.a', 'pool/.c')
+        assert self._per_name(caplog) == []
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(2)), (logging.DEBUG, self._wording(2))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['list', 'lazy'])
+    def test_no_unrepresentable_names_no_name_summary(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, lazy=lazy)
+            feed.set(_rows(('pool/a', 'filesystem'), ('pool/x', 'bogus')))     # a malformed row is not a name
+            list(ListCommand()(lazy=lazy))
+        assert self._summaries(caplog) == []
+
+    # strict --------------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_strict_raises_the_same_way_with_a_warning_summary(self, feed, caplog):
+        feed.set(_rows(('pool/.a', 'filesystem'), ('pool/.b', 'filesystem')))
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(Exception) as exc:
+                ListCommand()(strict=True)
+        message = str(exc.value)
+        assert message.startswith('zfs list output could not be trusted: 2 rows skipped, the first: '
+                                  'libzfseasy cannot represent the name (')
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(2))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_strict_still_raises_with_the_same_message_when_the_summary_is_debug(self, feed, caplog):
+        feed.set(_rows(('pool/.a', 'filesystem'), ('pool/.b', 'filesystem')))
+        with pytest.raises(Exception) as first:
+            ListCommand()(strict=True)
+        caplog.clear()
+        feed.set(_rows(('pool/.a', 'filesystem'), ('pool/.b', 'filesystem')))
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(Exception) as again:
+                ListCommand()(strict=True)
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(2))]
+        assert str(again.value) == str(first.value)
+        assert type(again.value) is Exception
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_strict_counts_a_deduped_name_with_a_malformed_row(self, feed, caplog):
+        self._list(feed, 'pool/.a')
+        caplog.clear()
+        feed.set(_rows(('pool/.a', 'filesystem'), ('pool/x', 'bogus'), ('pool/ok', 'filesystem')))
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            with pytest.raises(Exception, match='2 rows skipped'):
+                ListCommand()(strict=True)
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(1))]
+
+    # get -----------------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_fresh_name_warns_and_summarises_at_warning(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            assert self._get(feed, 'pool/.a', lazy=lazy) == ['pool/ok']
+        assert len(self._per_name(caplog)) == 1
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(1, 'get'))]
+        assert self._wording(1, 'get') == 'skipped 1 name libzfseasy cannot represent in zfs get output'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_plural_summary(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, *self.BAD[:3], lazy=lazy)
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(3, 'get'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_of_already_reported_names_summarises_at_debug(self, feed, caplog, lazy):
+        self._get(feed, 'pool/.a')
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, 'pool/.a', lazy=lazy)
+        assert self._summaries(caplog, 'get') == [(logging.DEBUG, self._wording(1, 'get'))]
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_mix_of_new_and_deduped_warns_and_counts_both(self, feed, caplog, lazy):
+        self._get(feed, 'pool/.a')
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, 'pool/.a', 'pool/.b', lazy=lazy)
+        assert len(self._per_name(caplog)) == 1
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(2, 'get'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_list_reports_then_get_with_the_same_name_is_debug(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._list(feed, 'pool/.a')
+            self._get(feed, 'pool/.a', lazy=lazy)
+        assert len(self._per_name(caplog)) == 1                      # one registry for both commands
+        assert self._summaries(caplog, 'list') == [(logging.WARNING, self._wording(1, 'list'))]
+        assert self._summaries(caplog, 'get') == [(logging.DEBUG, self._wording(1, 'get'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_reports_then_list_with_the_same_name_is_debug(self, feed, caplog, lazy):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, 'pool/.a', lazy=lazy)
+            self._list(feed, 'pool/.a')
+        assert len(self._per_name(caplog)) == 1
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(1, 'get'))]
+        assert self._summaries(caplog, 'list') == [(logging.DEBUG, self._wording(1, 'list'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_get_summary_is_warning_again_after_the_ttl(self, feed, caplog, monkeypatch):
+        self._get(feed, 'pool/.a')
+        monkeypatch.setattr(zfs_module, '_warned_names_since', time.monotonic() - zfs_module._WARNED_NAMES_TTL - 1)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, 'pool/.a')
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(1, 'get'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('lazy', [False, True], ids=['get', 'lazy'])
+    def test_get_overflow_notice_counts_as_a_per_name_warning(self, feed, caplog, monkeypatch, lazy):
+        monkeypatch.setattr(zfs_module, '_MAX_WARNED_NAMES', 1)
+        self._get(feed, 'pool/.a')
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed, 'pool/.b', lazy=lazy)                    # the notice
+            self._get(feed, 'pool/.c', lazy=lazy)                    # silent
+        assert self._summaries(caplog, 'get') == [(logging.WARNING, self._wording(1, 'get')),
+                                                  (logging.DEBUG, self._wording(1, 'get'))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_get_without_unrepresentable_names_has_no_name_summary(self, feed, caplog):
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            self._get(feed)
+        assert self._summaries(caplog, 'get') == []
+
+    # separate records ----------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_malformed_and_unrepresentable_summaries_are_separate_records(self, feed, caplog):
+        n = _MAX_ROW_WARNINGS + 3
+        feed.set(_rows(*[('pool/bad%d' % i, 'bogus') for i in range(n)], ('pool/.a', 'filesystem'),
+                       ('pool/ok', 'filesystem')))
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            assert [o.name for o in ListCommand()()] == ['pool/ok']
+        malformed = [(r.levelno, r.getMessage()) for r in caplog.records
+                     if r.name == 'libzfseasy' and 'malformed rows' in r.getMessage()]
+        assert malformed == [(logging.WARNING, 'skipped %d malformed rows of zfs list output in total '
+                                               '(the first %d are logged above)' % (n, _MAX_ROW_WARNINGS))]
+        assert self._summaries(caplog) == [(logging.WARNING, self._wording(1))]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_malformed_summary_stays_a_warning_when_the_names_are_deduped(self, feed, caplog):
+        self._list(feed, 'pool/.a')
+        n = _MAX_ROW_WARNINGS + 1
+        feed.set(_rows(*[('pool/bad%d' % i, 'bogus') for i in range(n)], ('pool/.a', 'filesystem')))
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            ListCommand()()
+        assert any('malformed rows' in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+        assert self._summaries(caplog) == [(logging.DEBUG, self._wording(1))]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# D1: exists() of a Bookmark goes through `zfs get`, everything else through `zfs list`
+# ---------------------------------------------------------------------------------------------------------------------
+
+class TestExistsBookmark:
+    """`list` refuses a Bookmark among its roots, so `exists(Bookmark)` asks `zfs get -H -o value type <bookmark>`."""
+
+    BM = Bookmark(Filesystem('pool/ds'), 'bm')
+    GET_ARGV = ['get', '-H', '-o', 'value', 'type', 'pool/ds#bm']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_present_bookmark_exists_and_asks_for_its_type(self, feed):
+        feed.set(b'bookmark\n')
+        assert zfs.exists(self.BM) is True
+        assert feed.calls and len(feed.calls) == 1
+        assert feed.argv == self.GET_ARGV
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('stdout', [b'-\n', b'', b'\n', b'filesystem\n', b'snapshot\n'],
+                             ids=['dash', 'nothing', 'blank', 'filesystem', 'snapshot'])
+    def test_no_type_means_no_bookmark(self, feed, stdout):
+        """Only a type of exactly 'bookmark' means the bookmark exists: '-', nothing, a blank line and any other
+        value are all False."""
+        feed.set(stdout)
+        assert zfs.exists(self.BM) is False
+        assert feed.argv == self.GET_ARGV
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('stderr', [
+        b"cannot open 'pool/ds#bm': bookmark does not exist\n",
+        b"cannot open 'pool/ds#bm': dataset does not exist\n",
+        b"cannot open 'pool/ds#bm': Dataset Does Not Exist\n",
+    ], ids=['bookmark', 'dataset', 'mixed-case'])
+    def test_does_not_exist_from_zfs_is_false(self, feed, stderr):
+        feed.set(b'', stderr=stderr, returncode=1)
+        assert zfs.exists(self.BM) is False
+        assert feed.argv == self.GET_ARGV
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_missing_bookmark_on_an_existing_dataset_is_false(self, feed):
+        """What `zfs get -H -o value type pool/ds#missing` really prints when `pool/ds` exists (identical on OpenZFS
+        2.1.5, 2.2.2 and 2.4.1) is "no such pool or dataset", not "does not exist"; the live equivalent is
+        tests/test_real_zfs.py::TestRealBookmarkOperations::test_exists_of_a_bookmark_present_and_missing."""
+        feed.set(b'', stderr=b"cannot open 'pool/ds#missing': no such pool or dataset\n", returncode=1)
+        assert zfs.exists(Bookmark(Filesystem('pool/ds'), 'missing')) is False
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('stderr', [
+        b"cannot open 'pool/ds#bm': permission denied\n",
+        b"cannot open 'pool/ds#bm': pool I/O is currently suspended\n",
+        b'',
+    ], ids=['permission', 'suspended', 'no-stderr'])
+    def test_any_other_failure_is_reraised(self, feed, stderr):
+        feed.set(b'', stderr=stderr, returncode=1)
+        with pytest.raises(Exception) as exc:
+            zfs.exists(self.BM)
+        assert 'does not exist' not in str(exc.value).lower()
+        assert type(exc.value) is Exception
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_name_that_says_does_not_exist_does_not_make_another_failure_false(self, feed):
+        """zfs quotes the object name, which its creator chose: "does not exist" inside the quotes is not zfs's reason.
+        Validate refuses spaces in a bookmark name, so the hostile stderr is constructed rather than produced."""
+        feed.set(b'', stderr=b"cannot open 'pool/ds#x does not exist': permission denied\n", returncode=1)
+        with pytest.raises(Exception, match='permission denied'):
+            zfs.exists(Bookmark(Filesystem('pool/ds'), 'x'))
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_genuine_no_such_pool_or_dataset_is_false(self, feed):
+        feed.set(b'', stderr=b"cannot open 'pool/ds#x': no such pool or dataset\n", returncode=1)
+        assert zfs.exists(Bookmark(Filesystem('pool/ds'), 'x')) is False
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_message_without_the_separator_is_judged_whole(self, feed):
+        feed.set(b'', stderr=b"dataset does not exist\n", returncode=1)
+        assert zfs.exists(self.BM) is False
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_path_does_not_match_the_quoted_name(self, feed):
+        feed.set(b'', stderr=b"cannot open 'pool/dataset does not exist': permission denied\n", returncode=1)
+        with pytest.raises(Exception, match='permission denied'):
+            zfs.exists(Filesystem('pool/ds'))
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_list_path_matches_the_reason_after_the_quoted_name(self, feed):
+        feed.set(b'', stderr=b"cannot open 'pool/x': dataset does not exist\n", returncode=1)
+        assert zfs.exists(Filesystem('pool/x')) is False
+
+    @pytest.mark.unit
+    def test_the_package_does_not_export_bookmark(self):
+        """`Bookmark` is imported as `_Bookmark` for exists(); it is not part of the public API."""
+        assert not hasattr(zfs, 'Bookmark')
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('ds,dstype', [
+        pytest.param(Filesystem('pool/ds'), 'filesystem', id='Filesystem'),
+        pytest.param(Snapshot(Filesystem('pool/ds'), 's'), 'snapshot', id='Snapshot'),
+    ])
+    def test_datasets_and_snapshots_keep_the_list_path(self, feed, ds, dstype):
+        feed.set(_rows((str(ds), dstype)))
+        assert zfs.exists(ds) is True
+        assert len(feed.calls) == 1 and feed.calls[0][1] == 'list'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('name', ['pool/ds', 'pool/ds#bm'], ids=['str', 'str-with-hash'])
+    def test_a_str_keeps_the_list_path_which_refuses_it_before_zfs_runs(self, feed, name):
+        """A str is not routed to `get` even when it contains '#': `list(roots=)` rejects it, as it always did."""
+        feed.set(_rows((name, 'filesystem')))
+        with pytest.raises(ValueError, match='got str instead'):
+            zfs.exists(name)
+        assert feed.calls == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_filesystem_still_answers_true_and_false(self, feed):
+        feed.set(_rows(('pool/ds', 'filesystem')))
+        assert zfs.exists(Filesystem('pool/ds')) is True
+        feed.set(b'', stderr=b"cannot open 'pool/ds': dataset does not exist\n", returncode=1)
+        assert zfs.exists(Filesystem('pool/ds')) is False
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# D5: `zfs.get.rows()` -- the rows zfs printed, and whether anything was lost
+# ---------------------------------------------------------------------------------------------------------------------
+# Every test feeds exact bytes: `zfs get -H` first, then (with `verify_names`, the default) the name-only
+# `zfs list -H -o name,type` of the same objects. The live equivalents are in tests/test_real_zfs.py (`TestRealGetRows`).
+
+_GET_COLS = 'name,property,value,received,source'
+_P = 'org.t:v'
+_FORGED_P = 'org.zfsbackup:config'
+
+
+def _obj(name, dstype='filesystem', explicit=False, fill=False, **props):
+    """The rows of one object, as `_get_rows` (properties as keyword arguments).
+
+    With an explicit list zfs prints a row for EVERY requested property, in order. `fill=True` adds a `_P` row (the
+    property most of these tests request) unless `props` has one; the tests that request other properties, or that
+    append their own `_P` row, pass their properties explicitly."""
+    if explicit and fill and _P not in props:
+        props = dict(props, **{_P: 'val'})
+    return _get_rows(name, dstype, explicit=explicit, **props)
+
+
+def _get_text(*objects):
+    """`zfs get -H` output for these objects (each a list of row tuples)."""
+    return _rows(*[row for obj in objects for row in obj])
+
+
+def _list_text(*objects):
+    """The `zfs list -H -o name,type` output of the same objects."""
+    return _rows(*[(obj[0][0], next(r[2] for r in obj if r[1] == 'type')) for obj in objects])
+
+
+def _arm(feed, *objects, listing=None):
+    """Queue the two zfs runs of a `rows()` call: the get output of `objects`, then their listing (or `listing`)."""
+    feed.sequence(_get_text(*objects), _list_text(*objects) if listing is None else listing)
+
+
+def _forged_tail(rows, last_prop=_P, last_value='FORGED'):
+    """The text a value must hold so that zfs prints these rows (and, last, `last_prop` of the final object, to
+    which zfs appends the real row's own `received` and `source` columns)."""
+    return '\n'.join(['\t'.join(r) for r in rows] + ['%s\t%s\t%s' % (rows[0][0], last_prop, last_value)])
+
+
+def _names(result):
+    return list(dict.fromkeys(row.name for row in result))
+
+
+def _four(rows):
+    """Rows without the `received` column (what `received=False` makes zfs print)."""
+    return [r[:3] + r[4:] for r in rows]
+
+
+class TestGetRowsTypes:
+    """`GetRow`, `GetRows`, `ZFSOutputError` and their exports."""
+
+    @pytest.mark.unit
+    def test_exported_from_the_package(self):
+        assert zfs.GetRow is GetRow and zfs.GetRows is GetRows and zfs.ZFSOutputError is ZFSOutputError
+        assert callable(zfs.get.rows)
+
+    @pytest.mark.unit
+    def test_getrow_is_a_named_tuple_of_the_five_columns(self):
+        row = GetRow('bk', 'type', 'filesystem', '-', '-')
+        assert GetRow._fields == ('name', 'property', 'value', 'received', 'source')
+        assert tuple(row) == ('bk', 'type', 'filesystem', '-', '-')
+        name, prop, value, received, source = row
+        assert (name, prop, value, received, source) == (row.name, row.property, row.value, row.received, row.source)
+
+    @pytest.mark.unit
+    def test_getrows_is_a_list_that_says_whether_it_is_complete(self):
+        assert isinstance(GetRows(), list)
+        clean = GetRows([GetRow('a', 'type', 'filesystem', '-', '-')])
+        assert clean.complete and clean.skipped == 0 and clean.dropped == frozenset() and len(clean) == 1
+        lossy = GetRows([], skipped=2, dropped={'a'})
+        assert not lossy.complete and lossy.skipped == 2
+        assert lossy.dropped == frozenset({'a'}) and isinstance(lossy.dropped, frozenset)
+        assert not GetRows(skipped=1).complete
+
+    @pytest.mark.unit
+    def test_zfsoutputerror_is_a_plain_exception(self):
+        """Neither a bad argument (ValueError) nor an OS error: like every other zfs failure of this library."""
+        assert ZFSOutputError.__bases__ == (Exception,)
+        assert not issubclass(ZFSOutputError, (ValueError, OSError))
+
+
+class TestGetRowsReads:
+    """A clean read: the exact rows, the exact argv of both zfs runs, nothing lost."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_all_recursive_read(self, feed):
+        objs = [_obj('bk', compression='lz4'), _obj('bk/v', 'volume', compression='off')]
+        _arm(feed, *objs)
+        result = zfs.get.rows(Filesystem('bk'), recursive=True, types=['filesystem', 'volume'])
+        assert type(result) is GetRows
+        assert list(result) == [
+            GetRow('bk', 'type', 'filesystem', '-', '-'), GetRow('bk', 'compression', 'lz4', '-', 'local'),
+            GetRow('bk/v', 'type', 'volume', '-', '-'), GetRow('bk/v', 'compression', 'off', '-', 'local')]
+        assert result.complete and result.skipped == 0 and result.dropped == frozenset()
+        assert [c[1:] for c in feed.calls] == [
+            ['get', '-H', '-o', _GET_COLS, '-r', '-t', 'filesystem,volume', 'all', 'bk'],
+            ['list', '-H', '-o', 'name,type', '-r', '-t', 'filesystem,volume', 'bk']]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_explicit_list_read_has_a_name_row_and_the_requested_properties(self, feed):
+        objs = [_obj('bk', explicit=True, compression='lz4', **{_P: 'x'}),
+                _obj('bk/s@a', 'snapshot', explicit=True, compression='lz4', **{_P: 'y'})]
+        _arm(feed, *objs)
+        result = zfs.get.rows(Filesystem('bk'), properties=['compression', _P], recursive=True, types='all')
+        assert list(result) == [
+            GetRow('bk', 'name', 'bk', '-', '-'), GetRow('bk', 'type', 'filesystem', '-', '-'),
+            GetRow('bk', 'compression', 'lz4', '-', 'local'), GetRow('bk', _P, 'x', '-', 'local'),
+            GetRow('bk/s@a', 'name', 'bk/s@a', '-', '-'), GetRow('bk/s@a', 'type', 'snapshot', '-', '-'),
+            GetRow('bk/s@a', 'compression', 'lz4', '-', 'local'), GetRow('bk/s@a', _P, 'y', '-', 'local')]
+        assert result.complete
+        assert feed.calls[0][1:] == ['get', '-H', '-o', _GET_COLS, '-r', '-t', 'all', 'name,type,compression,' + _P,
+                                     'bk']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('properties,props', [(['type'], {}), (['used', 'type', 'used'], {'used': '1K'})])
+    def test_requested_type_is_not_an_unrequested_property(self, feed, properties, props):
+        """`type` (requested or not) and `name` (which libzfseasy never lets a caller ask for) lead every group."""
+        objs = [_obj('bk', explicit=True, **props)]
+        _arm(feed, *objs)
+        result = zfs.get.rows(Filesystem('bk'), properties=properties)
+        assert result.complete and len(result) == len(objs[0])
+        assert feed.calls[0][-2] == 'name,type' + (',used' if props else '')
+
+    @pytest.mark.unit
+    def test_name_cannot_be_requested(self):
+        with pytest.raises(ValueError):
+            zfs.get.rows(Filesystem('bk'), properties=['name'])
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('sources', [None, 'all', 'local', 'default', 'inherited', 'temporary', 'received',
+                                         ['local', 'inherited'], ['default', 'temporary', 'received']])
+    @pytest.mark.parametrize('explicit', [True, False], ids=['explicit-list', 'all'])
+    def test_no_source_value_ever_passes_dash_s_to_either_run(self, feed, sources, explicit):
+        """`-s` would remove the `type` rows the checks stand on, and would change what the listing is compared with."""
+        objs = [_obj('bk', explicit=explicit, **{_P: 'x'})]
+        _arm(feed, *objs)
+        result = zfs.get.rows(Filesystem('bk'), properties=[_P] if explicit else 'all', sources=sources)
+        assert len(feed.calls) == 2
+        assert all('-s' not in call for call in feed.calls)
+        assert result.complete and _names(result) == ['bk']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_verify_names_false_runs_only_zfs_get(self, feed):
+        feed.sequence(_get_text(_obj('bk')))
+        result = zfs.get.rows(Filesystem('bk'), verify_names=False)
+        assert len(feed.calls) == 1 and feed.calls[0][1] == 'get'
+        assert result.complete and list(result) == [GetRow('bk', 'type', 'filesystem', '-', '-')]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_no_datasets_reads_everything(self, feed):
+        _arm(feed, _obj('a'), _obj('b'))
+        result = zfs.get.rows()
+        assert _names(result) == ['a', 'b'] and result.complete
+        assert feed.calls[0][1:] == ['get', '-H', '-o', _GET_COLS, '-t', 'all', 'all']
+        assert feed.calls[1][1:] == ['list', '-H', '-o', 'name,type', '-t', 'all']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_empty_read_is_complete(self, feed):
+        feed.sequence(b'', b'')
+        result = zfs.get.rows(Filesystem('bk'))
+        assert list(result) == [] and result.complete and result.dropped == frozenset()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('kwargs', [
+        {'sources': 'sometimes'}, {'types': 'zvol'}, {'properties': 'Bad-Prop'}, {'properties': ['-o']},
+        {'ds': 'bk'}, {'ds': [Filesystem('bk'), 'bk/a']},
+    ], ids=['sources', 'types', 'property', 'dash-property', 'str-ds', 'str-in-list'])
+    def test_a_bad_argument_is_a_value_error_before_zfs_runs(self, feed, kwargs):
+        with pytest.raises(ValueError):
+            zfs.get.rows(**kwargs)
+        assert feed.calls == []
+
+
+class TestGetRowsParity:
+    """`rows()` makes the checks `get()` makes: on the same bytes both keep the same objects with the same values and
+    log the same warnings; what `get()` drops, `rows()` drops and (when it can) names."""
+
+    @staticmethod
+    def _both(feed, caplog, objects, explicit, **kw):
+        data = _get_text(*objects)
+        props = [_P] if explicit else 'all'
+        feed.set(data)
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            got = zfs.get(Filesystem('bk'), properties=props, recursive=True, **kw)
+        old_warnings = _warnings(caplog)
+        caplog.clear()
+        feed.set(data)
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            res = zfs.get.rows(Filesystem('bk'), properties=props, recursive=True, verify_names=False, **kw)
+        assert _warnings(caplog) == old_warnings
+        assert _names(res) == [o.name for o in got]
+        for obj in got:
+            mine = {r.property: r.value for r in res if r.name == obj.name and r.property not in ('name', 'type')}
+            assert mine == {p: obj[p].value for p in mine}
+            assert all(obj[p] is not None for p in mine)
+        return res
+
+    @staticmethod
+    def _lead(e):
+        a = _obj('bk/A', explicit=e, fill=False)
+        a.append(('bk/A', _P, 'v\t-\tlocal\nbk/B\t%s\tFORGEDCFG' % _FORGED_P, '-', 'local'))
+        return ([a, _obj('bk/B', explicit=e, **{_P: 'real'}), _obj('bk/C', explicit=e, fill=True)],
+                ['bk/A', 'bk/C'], {'bk/B'})
+
+    @staticmethod
+    def _contiguity(e):
+        return ([_obj('bk/A', explicit=e, **{_P: '1'}), _obj('bk/B', explicit=e, fill=True),
+                 _obj('bk/A', explicit=e, **{_P: '2'})], ['bk/B'], {'bk/A'})
+
+    @staticmethod
+    def _duplicate(e):
+        a = _obj('bk/A', explicit=e, **{_P: '1'})
+        a.append(('bk/A', _P, '2', '-', 'local'))
+        return [a, _obj('bk/B', explicit=e, fill=True)], ['bk/B'], {'bk/A'}
+
+    @staticmethod
+    def _type_twice(e):
+        a = _obj('bk/A', explicit=e, fill=True)
+        a.append(('bk/A', 'type', 'snapshot', '-', '-'))
+        return [a, _obj('bk/B', explicit=e, fill=True)], ['bk/B'], {'bk/A'}
+
+    @staticmethod
+    def _wrong(name, dstype):
+        def case(e):
+            return ([_obj(name, dstype, explicit=e, fill=True), _obj('bk/ok', explicit=e, fill=True)],
+                    ['bk/ok'], {name})
+        return case
+
+    @staticmethod
+    def _no_type(e):
+        return [[('bk/A', 'name', 'bk/A', '-', '-')], _obj('bk/B', explicit=True, fill=True)], ['bk/B'], {'bk/A'}
+
+    CASES = {
+        'lead-rule': _lead.__func__, 'contiguity': _contiguity.__func__, 'duplicate-property': _duplicate.__func__,
+        'type-twice': _type_twice.__func__,
+        'snapshot-name-as-filesystem': _wrong.__func__('bk/A@s', 'filesystem'),
+        'filesystem-name-as-snapshot': _wrong.__func__('bk/A', 'snapshot'),
+        'bookmark-name-as-volume': _wrong.__func__('bk/A#b', 'volume'),
+        'unknown-type': _wrong.__func__('bk/A', 'bogus'),
+    }
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('explicit', [True, False], ids=['explicit-list', 'all'])
+    @pytest.mark.parametrize('case', sorted(CASES))
+    def test_the_same_objects_are_kept_and_the_refused_ones_are_named(self, feed, caplog, case, explicit):
+        objects, kept, dropped = self.CASES[case](explicit)
+        res = self._both(feed, caplog, objects, explicit)
+        assert _names(res) == kept
+        assert not res.complete and res.skipped >= 1
+        assert res.dropped == frozenset(dropped)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_object_with_no_type_row_is_refused_in_an_explicit_list(self, feed, caplog):
+        """Only the `name` row of the group is there (an explicit list opens with `name`, `type`): the group is not
+        the rows zfs prints, so the exact-sequence check refuses it (the warning is `get()`'s, the same on both paths)."""
+        objects, kept, dropped = self._no_type(True)
+        res = self._both(feed, caplog, objects, True)
+        assert _names(res) == kept and res.dropped == frozenset(dropped) and not res.complete
+        assert any("the rows of 'bk/A' are not the 3 requested properties in order (got 1 rows)" in w
+                   for w in _warnings(caplog))
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('explicit', [True, False], ids=['explicit-list', 'all'])
+    def test_a_type_that_was_not_requested_is_refused(self, feed, caplog, explicit):
+        objs = [_obj('bk/A', explicit=explicit, fill=True), _obj('bk/A@s', 'snapshot', explicit=explicit, fill=True)]
+        res = self._both(feed, caplog, objs, explicit, types='filesystem')
+        assert _names(res) == ['bk/A'] and res.dropped == frozenset({'bk/A@s'}) and not res.complete
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_invalid_property_name_skips_just_that_row(self, feed, caplog):
+        rows = _obj('bk/A') + [('bk/A', 'Bad-Prop', 'v', '-', 'local'), ('bk/A', 'a b', 'v', '-', 'local'),
+                               ('bk/A', 'atime', 'off', '-', 'local')]
+        res = self._both(feed, caplog, [rows], False)
+        assert [r.property for r in res] == ['type', 'atime']
+        assert not res.complete and res.skipped == 2 and res.dropped == frozenset()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_name_outside_the_requested_objects_is_skipped(self, feed, caplog):
+        res = self._both(feed, caplog, [_obj('bk/A'), _obj('other/x'), _obj('bk/B')], False)
+        assert _names(res) == ['bk/A', 'bk/B'] and res.skipped == 1 and not res.complete
+        assert res.dropped == frozenset()
+
+
+class TestGetRowsForgedObjects:
+    """What the second run (`verify_names`) is for: a whole object forged through a value that holds newlines."""
+
+    @staticmethod
+    def _ghost_stream(explicit, ghost='bk/ghost'):
+        ghost_rows = _obj(ghost, explicit=explicit)
+        a = _obj('bk/A', explicit=explicit)
+        a.append(('bk/A', _P, 'v\t-\tlocal\n' + _forged_tail(ghost_rows), '-', 'local'))
+        return a, _obj('bk/C', explicit=explicit, **{_P: 'c'})
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('explicit', [True, False], ids=['explicit-list', 'all'])
+    def test_a_forged_object_is_removed_by_the_listing(self, feed, explicit):
+        a, c = self._ghost_stream(explicit)
+        data = _get_text(a, c)
+        assert b'bk/ghost\t' + _P.encode() + b'\tFORGED\t-\tlocal\n' in data      # the shape the attack gives zfs
+        feed.sequence(data, _list_text(_obj('bk/A', explicit=explicit), c))
+        res = zfs.get.rows(Filesystem('bk'), properties=[_P] if explicit else 'all', recursive=True)
+        assert _names(res) == ['bk/A', 'bk/C']
+        assert not res.complete and res.skipped == 1
+        assert res.dropped == frozenset()                       # a forged name is not an object: nothing to re-read
+        assert [r.value for r in res if r.property == _P] == ['v', 'c']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('explicit', [True, False], ids=['explicit-list', 'all'])
+    def test_without_the_listing_the_forged_object_is_kept_and_nothing_notices(self, feed, explicit):
+        """The limit `verify_names=False` accepts: a forged group with the lead rows is a well-formed object."""
+        a, c = self._ghost_stream(explicit)
+        feed.sequence(_get_text(a, c))
+        res = zfs.get.rows(Filesystem('bk'), properties=[_P] if explicit else 'all', recursive=True,
+                           verify_names=False)
+        assert _names(res) == ['bk/A', 'bk/ghost', 'bk/C']
+        assert res.complete and res.dropped == frozenset()
+        assert [r.value for r in res if r.name == 'bk/ghost' and r.property == _P] == ['FORGED']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('verify', [True, False], ids=['verify', 'no-verify'])
+    @pytest.mark.parametrize('explicit', [True, False], ids=['explicit-list', 'all'])
+    def test_a_forged_group_under_a_real_name_drops_both_groups(self, feed, explicit, verify):
+        """A forged group for the real `bk/B`, then `bk/C`, then B's real group: the name comes back."""
+        a = _obj('bk/A', explicit=explicit)
+        a.append(('bk/A', _P, 'v\t-\tlocal\n' + _forged_tail(_obj('bk/B', explicit=explicit)), '-', 'local'))
+        b, c = _obj('bk/B', explicit=explicit, **{_P: 'real'}), _obj('bk/C', explicit=explicit, fill=True)
+        feed.sequence(_get_text(a, c, b), _list_text(a, b, c))
+        res = zfs.get.rows(Filesystem('bk'), properties=[_P] if explicit else 'all', recursive=True,
+                           verify_names=verify)
+        assert _names(res) == ['bk/A', 'bk/C']
+        assert not res.complete and res.skipped == 1
+        assert res.dropped == frozenset({'bk/B'})
+        assert not any(r.value in ('FORGED', 'real') for r in res)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('explicit', [True, False], ids=['explicit-list', 'all'])
+    def test_a_forged_group_right_before_the_real_one_is_a_duplicate(self, feed, explicit):
+        a = _obj('bk/A', explicit=explicit)
+        a.append(('bk/A', _P, 'v\t-\tlocal\n' + _forged_tail(_obj('bk/B', explicit=explicit)), '-', 'local'))
+        b = _obj('bk/B', explicit=explicit, **{_P: 'real'})
+        _arm(feed, a, b)
+        res = zfs.get.rows(Filesystem('bk'), properties=[_P] if explicit else 'all', recursive=True)
+        assert _names(res) == ['bk/A'] and not res.complete and res.dropped == frozenset({'bk/B'})
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_forged_name_that_comes_back_is_not_reported_as_dropped(self, feed):
+        """`dropped` holds only names `zfs list` printed: a forged name appearing twice is not an object."""
+        ghost = _obj('bk/ghost')
+        a = _obj('bk/A')
+        a.append(('bk/A', _P, 'v\t-\tlocal\n' + _forged_tail(ghost), '-', 'local'))
+        c = _obj('bk/C')
+        c.append(('bk/C', _P, 'v\t-\tlocal\n' + _forged_tail(ghost), '-', 'local'))
+        feed.sequence(_get_text(a, c), _list_text(_obj('bk/A'), _obj('bk/C')))
+        res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert _names(res) == ['bk/A', 'bk/C'] and not res.complete and res.dropped == frozenset()
+
+
+class TestGetRowsUnrequested:
+    """With an explicit property list, a group holding a property nobody asked for is refused whole."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('extra', [_FORGED_P, 'compression', 'used', 'org.other:thing'])
+    def test_an_unrequested_property_drops_the_group(self, feed, caplog, extra):
+        a = _obj('bk/A', explicit=True, **{_P: 'v'})
+        a.append(('bk/A', extra, 'FORGED', '-', 'local'))
+        b = _obj('bk/B', explicit=True, **{_P: 'w'})
+        _arm(feed, a, b)
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            res = zfs.get.rows(Filesystem('bk'), properties=[_P], recursive=True)
+        assert _names(res) == ['bk/B'] and [r.value for r in res if r.property == _P] == ['w']
+        assert not res.complete and res.skipped == 1 and res.dropped == frozenset({'bk/A'})
+        assert any('was not requested' in w and extra in w for w in _warnings(caplog))
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_unrequested_row_with_an_invalid_property_name_skips_only_the_row(self, feed):
+        """`userquota@root` is not a name libzfseasy accepts anywhere: the row is skipped like any invalid name."""
+        a = _obj('bk/A', explicit=True, **{_P: 'v'})
+        a.append(('bk/A', 'userquota@root', 'FORGED', '-', 'local'))
+        _arm(feed, a)
+        res = zfs.get.rows(Filesystem('bk'), properties=[_P], recursive=True)
+        assert [r.property for r in res] == ['name', 'type', _P] and res.skipped == 1 and res.dropped == frozenset()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('extra', [_FORGED_P, 'compression'])
+    def test_the_same_bytes_are_kept_for_all(self, feed, extra):
+        a = _obj('bk/A', **{_P: 'v'})
+        a.append(('bk/A', extra, 'x', '-', 'local'))
+        _arm(feed, a)
+        res = zfs.get.rows(Filesystem('bk'), properties='all', recursive=True)
+        assert res.complete and {r.property for r in res} == {'type', _P, extra}
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_only_the_requested_and_name_type_are_allowed(self, feed):
+        """The positive side: `name`, `type` and everything requested, in the requested order, is complete."""
+        a = _obj('bk/A', explicit=True, compression='lz4', **{_P: 'v'})
+        _arm(feed, a)
+        res = zfs.get.rows(Filesystem('bk'), properties=['compression', _P], recursive=True)
+        assert res.complete and [r.property for r in res] == ['name', 'type', 'compression', _P]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('verify', [True, False], ids=['verify', 'no-verify'])
+    def test_a_forged_copy_of_a_requested_property_is_a_duplicate(self, feed, verify):
+        a = _obj('bk/A', explicit=True, **{_P: 'real'})
+        a.append(('bk/A', _P, 'FORGED', '-', 'local'))
+        b = _obj('bk/B', explicit=True, **{_P: 'w'})
+        feed.sequence(*([_get_text(a, b)] + ([_list_text(a, b)] if verify else [])))
+        res = zfs.get.rows(Filesystem('bk'), properties=[_P], recursive=True, verify_names=verify)
+        assert _names(res) == ['bk/B'] and not res.complete and res.dropped == frozenset({'bk/A'})
+        assert 'FORGED' not in [r.value for r in res]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_dropped_group_is_not_counted_again_by_the_listing(self, feed):
+        a = _obj('bk/A', explicit=True)
+        a.append(('bk/A', 'compression', 'x', '-', 'local'))
+        _arm(feed, a)
+        res = zfs.get.rows(Filesystem('bk'), properties=[_P], recursive=True)
+        assert res.skipped == 1 and res.dropped == frozenset({'bk/A'}) and list(res) == []
+
+
+class TestGetRowsFragments:
+    """A row that is not a row: skipped, counted, never raised, and named by nothing."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('explicit', [True, False], ids=['explicit-list', 'all'])
+    def test_a_stray_fragment_makes_the_result_incomplete_and_names_no_object(self, feed, caplog, explicit):
+        a = _obj('bk/A', explicit=explicit)
+        a.append(('bk/A', _P, 'v\t-\tlocal\nstray', '-', 'local'))       # zfs prints `stray<TAB>-<TAB>local`
+        b = _obj('bk/B', explicit=explicit, fill=True)
+        data = _get_text(a, b)
+        assert b'\nstray\t-\tlocal\n' in data
+        feed.sequence(data, _list_text(_obj('bk/A', explicit=explicit), b))
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            res = zfs.get.rows(Filesystem('bk'), properties=[_P] if explicit else 'all', recursive=True)
+        assert _names(res) == ['bk/A', 'bk/B']
+        assert res.skipped == 1 and not res.complete and res.dropped == frozenset()
+        assert [r.value for r in res if r.name == 'bk/A' and r.property == _P] == ['v']
+        assert any('expected 5 columns' in w for w in _warnings(caplog))
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_each_fragment_counts(self, feed):
+        a = _obj('bk/A')
+        a.append(('bk/A', _P, 'line1\nline2', '-', 'local'))             # two fragments: 3 columns each
+        _arm(feed, a)
+        res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert res.skipped == 2 and _names(res) == ['bk/A']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_warnings_are_those_of_get_and_capped(self, feed, caplog):
+        a = _obj('bk/A')
+        a.append(('bk/A', _P, 'x' + '\n'.join(['s'] * 8), '-', 'local'))     # 8 lines, none of them a row
+        _arm(feed, a)
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert res.skipped == 8
+        warned = _warnings(caplog)
+        assert len([w for w in warned if 'skipping a row of zfs get output' in w]) == _MAX_ROW_WARNINGS
+        assert any('skipped 8 malformed rows of zfs get output in total' in w for w in warned)
+
+
+class TestGetRowsReceivedColumn:
+    """`received=False` asks zfs for four columns: the column that holds a stranger's raw bytes is never read."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_argv_and_none_received(self, feed):
+        a = _obj('bk/A', **{_P: 'v'})
+        feed.sequence(_rows(*_four(a)), _list_text(a))
+        res = zfs.get.rows(Filesystem('bk'), recursive=True, received=False)
+        assert feed.calls[0][1:5] == ['get', '-H', '-o', 'name,property,value,source']
+        assert feed.calls[1][1:] == ['list', '-H', '-o', 'name,type', '-r', '-t', 'all', 'bk']
+        assert list(res) == [GetRow('bk/A', 'type', 'filesystem', None, '-'), GetRow('bk/A', _P, 'v', None, 'local')]
+        assert res.complete
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('value', ['a\tb', 'a\tb\tc', '\t', '\t\t', 'x\tlocal', 'x\t-\t-', ''],
+                             ids=['two', 'three', 'one-tab', 'two-tabs', 'source-like', 'dashes', 'empty'])
+    @pytest.mark.parametrize('source', ['local', 'received', 'inherited from bk'])
+    def test_a_value_with_tabs_is_recovered_exactly(self, feed, value, source):
+        a = _obj('bk/A') + [('bk/A', _P, value, '-', source)]
+        feed.sequence(_rows(*_four(a)), _list_text(a))
+        res = zfs.get.rows(Filesystem('bk/A'), received=False)
+        assert res.complete
+        assert [(r.value, r.source, r.received) for r in res if r.property == _P] == [(value, source, None)]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_row_with_fewer_than_four_columns_is_skipped(self, feed):
+        a = _obj('bk/A') + [('bk/A', _P, 'v', '-', 'local')]
+        text = _rows(*_four(a)) + _rows(('bk/A', 'compression', 'lz4'), ('stray',))
+        feed.sequence(text, _list_text(a))
+        res = zfs.get.rows(Filesystem('bk/A'), received=False)
+        assert res.skipped == 2 and not res.complete and 'compression' not in {r.property for r in res}
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_same_tab_value_is_ambiguous_with_the_received_column(self, feed):
+        """Why `received=False` exists: with five columns this local value over a received one cannot be told apart."""
+        a = _obj('bk/A') + [('bk/A', _P, 'l1\tl2', 'r1\tr2', 'local')]
+        feed.sequence(_get_text(a), _list_text(a))
+        res = zfs.get.rows(Filesystem('bk/A'))
+        assert res.skipped == 1 and not res.complete and _P not in {r.property for r in res}
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_forged_object_removal_works_without_the_received_column(self, feed):
+        a = _obj('bk/A')
+        a.append(('bk/A', _P, 'v\t-\tlocal\n' + _forged_tail(_obj('bk/ghost')), '-', 'local'))
+        text = _get_text(a)
+        # the same attack through a four-column print: drop the received column of every printed line
+        text = ('\n'.join('\t'.join(l.split('\t')[:3] + l.split('\t')[4:]) if len(l.split('\t')) == 5 else l
+                          for l in text.decode().split('\n'))).encode()
+        feed.sequence(text, _list_text(_obj('bk/A')))
+        res = zfs.get.rows(Filesystem('bk'), recursive=True, received=False)
+        assert 'bk/ghost' not in _names(res) and not res.complete
+
+
+class TestGetRowsSources:
+    """Sources are filtered here, after the checks; the `name` and `type` rows are never filtered."""
+
+    @staticmethod
+    def _object():
+        rows = _obj('bk/A', explicit=True)
+        rows += [('bk/A', _P, 'lv', '-', 'local'),
+                 ('bk/A', 'compression', 'on', '-', 'default'),
+                 ('bk/A', 'atime', 'on', '-', 'inherited from bk'),
+                 ('bk/A', 'sync', 'always', '-', 'temporary'),
+                 ('bk/A', 'org.t:w', 'rv', 'rv', 'received'),
+                 ('bk/A', 'org.t:x', 'lv', 'rv', 'local')]
+        return rows
+
+    PROPS = [_P, 'compression', 'atime', 'sync', 'org.t:w', 'org.t:x']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('sources,expected', [
+        ('all', [_P, 'compression', 'atime', 'sync', 'org.t:w', 'org.t:x']),
+        ('local', [_P, 'org.t:x']),
+        ('default', ['compression']),
+        ('inherited', ['atime']),
+        ('temporary', ['sync']),
+        ('received', ['org.t:w']),
+        (['local', 'received'], [_P, 'org.t:w', 'org.t:x']),
+        (['default', 'inherited'], ['compression', 'atime']),
+        (None, []),
+    ])
+    def test_kept_rows(self, feed, sources, expected):
+        obj = self._object()
+        _arm(feed, obj)
+        res = zfs.get.rows(Filesystem('bk/A'), properties=self.PROPS, sources=sources)
+        assert res.complete and res.skipped == 0
+        assert [r.property for r in res] == ['name', 'type'] + expected
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_inherited_matches_inherited_from_a_dataset(self, feed):
+        obj = _obj('bk/A') + [('bk/A', 'atime', 'on', '-', 'inherited from bk/deep/er'),
+                              ('bk/A', 'sync', 'x', '-', 'local')]
+        _arm(feed, obj)
+        res = zfs.get.rows(Filesystem('bk/A'), sources='inherited')
+        assert list(res) == [GetRow('bk/A', 'type', 'filesystem', '-', '-'),
+                             GetRow('bk/A', 'atime', 'on', '-', 'inherited from bk/deep/er')]
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_local_over_received_is_the_local_row_and_received_only_is_a_received_row(self, feed):
+        _arm(feed, self._object())
+        res = zfs.get.rows(Filesystem('bk/A'), properties=self.PROPS)
+        by = {r.property: r for r in res}
+        assert by['org.t:x'] == GetRow('bk/A', 'org.t:x', 'lv', 'rv', 'local')
+        assert by['org.t:w'] == GetRow('bk/A', 'org.t:w', 'rv', 'rv', 'received')
+        assert by[_P].received == '-' and by['compression'].received == '-'      # the raw column, not None
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_filter_comes_after_the_checks(self, feed):
+        """A forged duplicate of a property whose source the caller filters out still drops the group."""
+        obj = _obj('bk/A', explicit=True) + [('bk/A', 'sync', 'x', '-', 'temporary'),
+                                             ('bk/A', 'sync', 'y', '-', 'temporary')]
+        _arm(feed, obj)
+        res = zfs.get.rows(Filesystem('bk/A'), properties=['sync'], sources='local')
+        assert list(res) == [] and not res.complete and res.dropped == frozenset({'bk/A'})
+
+
+class TestGetRowsRawValues:
+    """Values are what zfs printed: nothing is mapped, trimmed or normalised."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_raw_values(self, feed):
+        obj = _obj('bk/A') + [('bk/A', 'org.t:a', '-', '-', '-'), ('bk/A', 'org.t:b', '\udcff\udcfe', '-', 'local'),
+                              ('bk/A', 'org.t:c', '', '-', 'local'), ('bk/A', 'org.t:d', 'trail  ', '-', 'local'),
+                              ('bk/A', 'org.t:e', 'cr\rx', 'cr\rx', 'received'), ('bk/A', 'org.t:f', 'é☃', '-', 'local')]
+        _arm(feed, obj)
+        res = zfs.get.rows(Filesystem('bk/A'))
+        by = {r.property: r for r in res}
+        assert res.complete
+        assert by['org.t:a'].value == '-' and by['org.t:a'].source == '-' and by['org.t:a'].received == '-'
+        assert by['org.t:b'].value.encode('utf-8', 'surrogateescape') == b'\xff\xfe'
+        assert by['org.t:c'].value == '' and by['org.t:d'].value == 'trail  '
+        assert (by['org.t:e'].value, by['org.t:e'].received) == ('cr\rx', 'cr\rx')
+        assert by['org.t:f'].value == 'é☃'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_invalid_utf8_in_a_tab_value_is_recovered_exactly_without_the_received_column(self, feed):
+        obj = _obj('bk/A') + [('bk/A', _P, 'a\tb\udcff', '-', 'local')]
+        feed.sequence(_rows(*_four(obj)), _list_text(obj))
+        res = zfs.get.rows(Filesystem('bk/A'), received=False)
+        assert res.complete
+        assert [r.value.encode('utf-8', 'surrogateescape') for r in res if r.property == _P] == [b'a\tb\xff']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_same_row_with_the_received_column_is_skipped_not_guessed(self, feed, caplog):
+        obj = _obj('bk/A') + [('bk/A', _P, 'a\tb\udcff', '-', 'local')]
+        _arm(feed, obj)
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            res = zfs.get.rows(Filesystem('bk/A'))
+        assert not res.complete and res.skipped == 1 and _P not in {r.property for r in res}
+        assert any('ambiguous' in w for w in _warnings(caplog))
+
+
+class TestGetRowsUnrepresentableNames:
+    """A name libzfseasy cannot build is kept like any other: nothing is built, and dropping such a descendant could
+    hide something that protects data. `get()` skips it."""
+
+    NAMES = ['bk/' + 'a' * 300, 'bk/a b', 'bk/ünï', 'bk/x☃']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('name', NAMES, ids=['300-chars', 'space', 'non-ascii', 'snowman'])
+    def test_kept_complete_and_silent(self, feed, caplog, name):
+        obj = _obj(name, **{_P: 'v'})
+        _arm(feed, obj, _obj('bk/ok'))
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert _names(res) == [name, 'bk/ok']
+        assert res.complete and res.skipped == 0 and res.dropped == frozenset()
+        assert [r for r in caplog.records if r.name == 'libzfseasy' and r.levelno >= logging.INFO] == []
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_name_only_listing_keeps_it_too(self, feed):
+        """With `verify_names` the listing is read without building objects: the long name is a name like another."""
+        name = 'bk/' + 'a' * 300
+        feed.sequence(_get_text(_obj(name)), _list_text(_obj(name)))
+        assert zfs.get.rows(Filesystem('bk'), recursive=True).complete
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_get_skips_the_same_name(self, feed):
+        name = 'bk/' + 'a' * 300
+        feed.set(_get_text(_obj(name), _obj('bk/ok')))
+        assert [o.name for o in zfs.get(Filesystem('bk'), recursive=True)] == ['bk/ok']
+
+
+class TestGetRowsStrict:
+    """`strict=True`: the same result, raised instead of returned when it is not complete -- after zfs has exited."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_complete_read_is_returned(self, feed):
+        _arm(feed, _obj('bk/A'))
+        res = zfs.get.rows(Filesystem('bk'), recursive=True, strict=True)
+        assert res.complete and _names(res) == ['bk/A']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_skipped_row_raises(self, feed):
+        a = _obj('bk/A')
+        a.append(('bk/A', _P, 'v\t-\tlocal\nstray', '-', 'local'))
+        _arm(feed, a)
+        with pytest.raises(ZFSOutputError) as exc:
+            zfs.get.rows(Filesystem('bk'), recursive=True, strict=True)
+        assert '1 row skipped' in str(exc.value) and 'expected 5 columns' in str(exc.value)
+        assert len(feed.calls) == 2                 # both runs happened, and were read to the end
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_count_is_plural_and_the_first_reason_is_the_first_in_the_output(self, feed):
+        a = _obj('bk/A', explicit=True)
+        a.append(('bk/A', 'compression', 'x', '-', 'local'))
+        c = _obj('bk/C', explicit=True)
+        c.append(('bk/C', _P, 'v\t-\tlocal\nstray', '-', 'local'))
+        _arm(feed, a, c)
+        with pytest.raises(ZFSOutputError) as exc:
+            zfs.get.rows(Filesystem('bk'), properties=[_P], recursive=True, strict=True)
+        assert '2 rows skipped' in str(exc.value) and "property 'compression' of 'bk/A' was not requested" in str(exc.value)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_forged_name_raises(self, feed):
+        a = _obj('bk/A')
+        a.append(('bk/A', _P, 'v\t-\tlocal\n' + _forged_tail(_obj('bk/ghost')), '-', 'local'))
+        feed.sequence(_get_text(a), _list_text(_obj('bk/A')))
+        with pytest.raises(ZFSOutputError, match='not in the zfs list'):
+            zfs.get.rows(Filesystem('bk'), recursive=True, strict=True)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_listed_but_unread_name_raises(self, feed):
+        feed.sequence(_get_text(_obj('bk/A')), _list_text(_obj('bk/A'), _obj('bk/B')))
+        with pytest.raises(ZFSOutputError, match='listed by zfs list but not read by zfs get'):
+            zfs.get.rows(Filesystem('bk'), recursive=True, strict=True)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_list_anomaly_raises_with_its_reason(self, feed):
+        feed.sequence(_get_text(_obj('bk/A')), _list_text(_obj('bk/A')) + b'garbage\n')
+        with pytest.raises(ZFSOutputError, match='expected 2 columns'):
+            zfs.get.rows(Filesystem('bk'), recursive=True, strict=True)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_failed_get_raises_the_bare_exception_even_with_a_fragment_in_the_output(self, feed):
+        a = _obj('bk/A')
+        a.append(('bk/A', _P, 'v\t-\tlocal\nstray', '-', 'local'))
+        feed.sequence((_get_text(a), b"cannot open 'bk': dataset does not exist\n", 1))
+        with pytest.raises(Exception, match="Cannot open 'bk': dataset does not exist") as exc:
+            zfs.get.rows(Filesystem('bk'), recursive=True, strict=True)
+        assert type(exc.value) is Exception
+        assert len(feed.calls) == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('strict', [True, False])
+    def test_a_failed_list_raises_the_bare_exception_first(self, feed, strict):
+        a = _obj('bk/A')
+        a.append(('bk/A', _P, 'v\t-\tlocal\nstray', '-', 'local'))
+        feed.sequence(_get_text(a), (b'', b'cannot iterate filesystems: I/O error\n', 1))
+        with pytest.raises(Exception, match='Cannot iterate filesystems: I/O error') as exc:
+            zfs.get.rows(Filesystem('bk'), recursive=True, strict=strict)
+        assert type(exc.value) is Exception
+        assert len(feed.calls) == 2
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_failed_get_is_raised_without_strict_too(self, feed):
+        feed.sequence((b'', b'permission denied\n', 1))
+        with pytest.raises(Exception, match='Permission denied') as exc:
+            zfs.get.rows(Filesystem('bk'))
+        assert type(exc.value) is Exception
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_not_strict_returns_the_same_lossy_result(self, feed):
+        a = _obj('bk/A')
+        a.append(('bk/A', _P, 'v\t-\tlocal\nstray', '-', 'local'))
+        _arm(feed, a)
+        res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert not res.complete and res.skipped == 1
+
+
+class TestGetRowsRaces:
+    """The listing runs after the read: an object may appear or vanish in between. Either way the result says so."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_object_read_but_gone_from_the_listing_is_removed(self, feed):
+        feed.sequence(_get_text(_obj('bk/A'), _obj('bk/B')), _list_text(_obj('bk/A')))
+        res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert _names(res) == ['bk/A'] and not res.complete and res.skipped == 1
+        assert res.dropped == frozenset()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_object_listed_but_not_read_is_named(self, feed):
+        feed.sequence(_get_text(_obj('bk/A')), _list_text(_obj('bk/A'), _obj('bk/B')))
+        res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert _names(res) == ['bk/A'] and not res.complete and res.skipped == 1
+        assert res.dropped == frozenset({'bk/B'})
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_both_at_once(self, feed):
+        feed.sequence(_get_text(_obj('bk/A'), _obj('bk/B')), _list_text(_obj('bk/A'), _obj('bk/C')))
+        res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert _names(res) == ['bk/A'] and res.skipped == 2 and res.dropped == frozenset({'bk/C'})
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_refused_object_that_is_listed_is_not_counted_twice(self, feed):
+        a = _obj('bk/A', **{_P: '1'})
+        a.append(('bk/A', _P, '2', '-', 'local'))
+        feed.sequence(_get_text(a, _obj('bk/B')), _list_text(_obj('bk/A'), _obj('bk/B')))
+        res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert res.skipped == 1 and res.dropped == frozenset({'bk/A'}) and _names(res) == ['bk/B']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_refused_object_the_listing_lacks_is_not_named(self, feed):
+        """It is not known to be an object at all (it may have been forged): `dropped` holds only listed names."""
+        a = _obj('bk/A', **{_P: '1'})
+        a.append(('bk/A', _P, '2', '-', 'local'))
+        feed.sequence(_get_text(a, _obj('bk/B')), _list_text(_obj('bk/B')))
+        res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert res.skipped == 1 and res.dropped == frozenset() and _names(res) == ['bk/B']
+
+
+class TestGetRowsListAnomalies:
+    """The listing is read as strictly as `list()` reads it: anything that is not `name<TAB>type` of an object in scope
+    makes the result incomplete."""
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('line,kwargs', [
+        pytest.param(b'bk/zz\tfilesystem\textra\n', {}, id='three-columns'),
+        pytest.param(b'garbage\n', {}, id='one-column'),
+        pytest.param(b'bk/zz\tbogus\n', {}, id='foreign-type'),
+        pytest.param(b'other/x\tfilesystem\n', {}, id='out-of-scope-name'),
+        pytest.param(b'bk/zz\tsnapshot\n', {}, id='name-does-not-match-type'),
+        pytest.param(b'bk/zz@s\tsnapshot\n', {'types': 'filesystem'}, id='type-not-requested'),
+        pytest.param(b'bk/zz\tfilesystem\t\n', {}, id='trailing-tab'),
+    ])
+    def test_a_stray_listing_line_makes_the_result_incomplete(self, feed, line, kwargs):
+        a = _obj('bk/A', **{_P: 'v'})
+        feed.sequence(_get_text(a), _list_text(a) + line)
+        res = zfs.get.rows(Filesystem('bk'), recursive=True, **kwargs)
+        assert _names(res) == ['bk/A'] and [r.value for r in res if r.property == _P] == ['v']
+        assert not res.complete and res.skipped == 1 and res.dropped == frozenset()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_anomalous_line_for_a_real_object_removes_it(self, feed):
+        a = _obj('bk/A')
+        feed.sequence(_get_text(a, _obj('bk/B')), b'bk/A\tbogus\n' + _list_text(_obj('bk/B')))
+        res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert _names(res) == ['bk/B'] and not res.complete and res.skipped == 2
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_blank_listing_lines_are_ignored_not_counted(self, feed):
+        a = _obj('bk/A')
+        feed.sequence(_get_text(a), b'\n' + _list_text(a) + b'\n\n')
+        res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert res.complete and res.skipped == 0 and _names(res) == ['bk/A']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_an_empty_listing_removes_everything_read(self, feed):
+        feed.sequence(_get_text(_obj('bk/A')), b'')
+        res = zfs.get.rows(Filesystem('bk'), recursive=True)
+        assert list(res) == [] and not res.complete and res.skipped == 1
+
+
+class TestGetRowsScopeFlags:
+    """`get` and the name-only `list` iterate the same objects only if they are given the same `-r`, `-d`, `-t` and
+    objects."""
+
+    @staticmethod
+    def _flags(call, drop_properties):
+        """An argv's scope part: everything after the `-o <columns>` pair, without the property list."""
+        args = call[1:]
+        assert args[:3] == [args[0], '-H', '-o'] and args[0] in ('get', 'list')
+        rest = args[4:]
+        if drop_properties:
+            i = rest.index('-t') + 2                    # `-t` is always sent; the property list follows it
+            assert rest[i] == 'all' or rest[i].startswith('name,type')
+            rest = rest[:i] + rest[i + 1:]
+        return rest
+
+    SHAPES = {
+        'recursive-filesystems-volumes': (dict(ds=[Filesystem('bk')], recursive=True, types='filesystem,volume'),
+                                          ['-r', '-t', 'filesystem,volume', 'bk']),
+        'single-dataset-all': (dict(ds=Filesystem('bk/a')), ['-t', 'all', 'bk/a']),
+        'batched-explicit': (dict(ds=[Filesystem('bk/a'), Volume('bk/v'), Snapshot(Filesystem('bk/a'), 's')],
+                                  properties=['compression', _P], depth=1, types=['snapshot', 'filesystem', 'volume']),
+                             ['-d', '1', '-t', 'snapshot,filesystem,volume', 'bk/a', 'bk/v', 'bk/a@s']),
+        'recursive-and-depth': (dict(ds=[Filesystem('bk')], recursive=True, depth=2, types='snapshot'),
+                                ['-r', '-d', '2', '-t', 'snapshot', 'bk']),
+        'every-pool': (dict(types='bookmark'), ['-t', 'bookmark']),
+        'received-off': (dict(ds=Filesystem('bk'), recursive=True, received=False), ['-r', '-t', 'all', 'bk']),
+    }
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('shape', sorted(SHAPES))
+    def test_get_and_list_get_the_same_scope(self, feed, shape):
+        kwargs, expected = self.SHAPES[shape]
+        feed.sequence(b'', b'')
+        res = zfs.get.rows(**kwargs)
+        assert res.complete
+        get_call, list_call = feed.calls
+        assert self._flags(get_call, True) == expected
+        assert self._flags(list_call, False) == expected
+        assert list_call[1:5] == ['list', '-H', '-o', 'name,type']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_scope_is_shared_code(self):
+        assert GetCommand._get_options(recursive=True, depth=2, types='all', properties=['all'], datasets=['x']) == \
+            GetCommand._scope_options(recursive=True, depth=2, types='all') + ['all', 'x']
+        assert GetCommand._scope_options() == []
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# D5 regression: `get()` is byte-identical to what it did before `rows()` shared its parser
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _regression_corpus():
+    """`{id: (stdout bytes, kwargs of zfs.get)}`: the captured forged output, every parity case, tab recovery, source
+    filters, mixed types, an unrepresentable name, a forged ghost and stray fragments."""
+    corpus = {'forged-capture': (FORGED_GET, dict(ds=Filesystem('b123p'), properties=['org.t:v'], recursive=True,
+                                                  types='all'))}
+    for case, build in sorted(TestGetRowsParity.CASES.items()):
+        for explicit in (True, False):
+            objects, _, _ = build(explicit)
+            corpus['%s-%s' % (case, 'explicit' if explicit else 'all')] = (
+                _get_text(*objects),
+                dict(ds=Filesystem('bk'), properties=[_P] if explicit else 'all', recursive=True))
+    tabs = _obj('bk/a', explicit=True) + [
+        ('bk/a', 'org.t:p0', 'a\tb', '-', 'local'), ('bk/a', 'org.t:p1', 'a\t\tb', '-', 'local'),
+        ('bk/a', 'org.t:p2', 'r1\tr2', 'r1\tr2', 'received'), ('bk/a', 'org.t:p3', 'l1\tl2', 'r1\tr2', 'local'),
+        ('bk/a', 'org.t:p4', 'a\tb', '-', 'received'), ('bk/a', 'org.t:p5', 'x', '-', 'inherited from bk'),
+        ('bk/a', 'org.t:p6', 'k', '-', 'default'), ('bk/a', 'org.t:p7', '\udcff', '-', 'local')]
+    for sources in ('all', 'local', 'inherited', ['default', 'received'], 'temporary'):
+        corpus['tabs-%s' % ('+'.join(sources) if isinstance(sources, list) else sources)] = (
+            _get_text(tabs), dict(ds=Filesystem('bk/a'), properties=['org.t:p%d' % i for i in range(8)],
+                                  sources=sources))
+    mixed = []
+    for name, dstype in (('bk', 'filesystem'), ('bk@s', 'snapshot'), ('bk#b', 'bookmark'), ('bk/c', 'filesystem'),
+                         ('bk/c@s', 'snapshot'), ('bk/v', 'volume'), ('bk/' + 'a' * 300, 'filesystem'),
+                         ('bk/a b', 'filesystem'), ('other/x', 'filesystem')):
+        mixed.append(_obj(name, dstype, compression='lz4'))
+    for types in ('all', 'snapshot', ['filesystem', 'volume'], 'bookmark'):
+        corpus['mixed-%s' % ('+'.join(types) if isinstance(types, list) else types)] = (
+            _get_text(*mixed), dict(ds=Filesystem('bk'), properties='all', recursive=True, types=types))
+    a, c = TestGetRowsForgedObjects._ghost_stream(False)
+    corpus['ghost'] = (_get_text(a, c), dict(ds=Filesystem('bk'), recursive=True))
+    corpus['ghost-explicit'] = (_get_text(*TestGetRowsForgedObjects._ghost_stream(True)),
+                                dict(ds=Filesystem('bk'), properties=[_P], recursive=True))
+    stray = _obj('bk/A') + [('bk/A', _P, 'v\t-\tlocal\nstray\nstray2', '-', 'local')]
+    corpus['stray'] = (_get_text(stray, _obj('bk/B')), dict(ds=Filesystem('bk'), recursive=True))
+    corpus['nine-bad-objects'] = (
+        _get_text(*[_obj('bk/x%d' % i, 'bogus') for i in range(9)] + [_obj('bk/ok')]),
+        dict(ds=Filesystem('bk'), recursive=True))
+    return corpus
+
+
+def _regression_summary(data, kwargs, lazy):
+    """What `zfs.get` did with `data`: its objects and properties, its warnings, and the `_SkippedRows` it kept."""
+    skipped = []
+
+    class Recording(zfs_module._SkippedRows):
+        def __init__(self, *args, **kw):
+            super().__init__(*args, **kw)
+            skipped.append(self)
+
+    real = zfs_module._SkippedRows
+    zfs_module._SkippedRows = Recording
+    zfs_module._warned_names, zfs_module._warned_names_since = set(), None
+    real_popen = subprocess.Popen
+    feeder = _Feed().set(data)
+    records = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler, log = Collect(logging.WARNING), logging.getLogger('libzfseasy')
+    log.addHandler(handler)
+    subprocess.Popen = feeder
+    try:
+        result = list(zfs.get(lazy=lazy, **kwargs))
+    finally:
+        subprocess.Popen = real_popen
+        zfs_module._SkippedRows = real
+        log.removeHandler(handler)
+    objects = [(type(o).__name__, o.name, sorted((str(k), p.value, p.source, p.received) for k, p in o.properties))
+               for o in result]
+    counts = [(s.command, s.total, s.count, s.unrepresentable_names, s.first_problem) for s in skipped]
+    return {'objects': objects, 'warnings': [r.getMessage() for r in records if r.levelno >= logging.WARNING],
+            'skips': counts, 'argv': feeder.calls[0][1:]}
+
+
+def _regression_golden():
+    import json
+    import pathlib
+    with open(pathlib.Path(__file__).parent / 'fixtures' / 'get_regression_pre_d5.json') as fh:
+        return json.load(fh)
+
+
+class TestGetUnchangedByRows:
+    """`zfs.get()` and its lazy form share their parser with `rows()` since D5. The expectations in
+    tests/fixtures/get_regression_pre_d5.json were produced by the `libzfseasy` of commit 2fbaea0 (before D5) over
+    `_regression_corpus()`: objects, properties, sources, received values, every warning, every `_SkippedRows` count
+    and the argv. Regenerate only for a deliberate change of `get()`: run `_regression_summary` for both modes over
+    the corpus with the old code and dump the results as JSON.
+
+    The exact-sequence follow-up to D5 (an explicit property list must come back as `name`, `type` and every
+    requested property, in order) changed the fake bytes of the explicit-list entries: they used to omit the
+    requested `org.t:v` row, which real zfs always prints. Those 16 golden entries were regenerated by running the
+    pre-follow-up `libzfseasy` (HEAD ebbfe80's `zfs.py`) over the completed bytes; the current code gives the
+    identical result, so the `all` entries and every other entry stay byte-identical and the explicit ones still pin
+    "no behaviour change on well-formed output". The one entry whose group is malformed by nature
+    (`no-type-explicit`: only a `name` row) is no longer in the corpus: it is now refused for its sequence, with new
+    wording (`TestGetExplicitSequence`)."""
+
+    GOLDEN = _regression_golden()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('key', sorted(GOLDEN))
+    def test_same_results_warnings_and_skip_counts(self, key):
+        import json
+        cid, mode = key.rsplit('|', 1)
+        data, kwargs = _regression_corpus()[cid]
+        got = json.loads(json.dumps(_regression_summary(data, dict(kwargs), mode == 'lazy'), default=repr))
+        assert got == self.GOLDEN[key]
+
+    @pytest.mark.unit
+    def test_every_corpus_entry_has_both_modes_in_the_fixture(self):
+        keys = {'%s|%s' % (cid, mode) for cid in _regression_corpus() for mode in ('list', 'lazy')}
+        assert keys == set(self.GOLDEN)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_get_never_runs_a_second_command_and_rows_is_not_get(self, feed):
+        feed.set(_get_text(_obj('bk/A')))
+        assert [o.name for o in zfs.get(Filesystem('bk'), recursive=True)] == ['bk/A']
+        assert len(feed.calls) == 1
+
+
+class TestGetRowsReviewFixes:
+    """The D5 review: an ambiguous 5-column row is skipped (never guessed), sources are case-insensitive, an empty
+    `types` means `all` for both runs."""
+
+    ANCHOR = 'org.zfsbackup:anchor.d'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_extra_tabs_with_the_received_column_are_not_guessed(self, feed):
+        """`serverval<TAB>evil<TAB>-` could be value `serverval` + received `evil`, or a value holding two tabs: with
+        the hidden received column in the output it is not recoverable, and must not be taken for either."""
+        a = _obj('p/a', explicit=True) + [('p/a', self.ANCHOR, 'serverval\tevil', '-', 'local')]
+        assert b'p/a\t%s\tserverval\tevil\t-\tlocal\n' % self.ANCHOR.encode() in _get_text(a)
+        _arm(feed, a)
+        res = zfs.get.rows(Filesystem('p'), properties=[self.ANCHOR], recursive=True)
+        assert not res.complete and res.skipped == 1
+        assert self.ANCHOR not in {r.property for r in res} and res.dropped == frozenset()
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_without_the_received_column_the_value_is_exact(self, feed):
+        a = _obj('p/a', explicit=True) + [('p/a', self.ANCHOR, 'serverval\tevil', '-', 'local')]
+        feed.sequence(_rows(*_four(a)), _list_text(a))
+        assert b'p/a\t%s\tserverval\tevil\tlocal\n' % self.ANCHOR.encode() in _rows(*_four(a))
+        res = zfs.get.rows(Filesystem('p'), properties=[self.ANCHOR], recursive=True, received=False)
+        assert res.complete
+        assert [r.value for r in res if r.property == self.ANCHOR] == ['serverval\tevil']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('spelling,lower', [
+        ('Local', 'local'), ('LOCAL', 'local'), ('Received', 'received'), ('ALL', 'all'), ('Inherited', 'inherited'),
+        (['Local', 'DEFAULT'], ['local', 'default']), ('Temporary', 'temporary'),
+    ])
+    def test_sources_are_case_insensitive(self, feed, spelling, lower):
+        obj = TestGetRowsSources._object()
+        _arm(feed, obj)
+        got = zfs.get.rows(Filesystem('bk/A'), properties=TestGetRowsSources.PROPS, sources=spelling)
+        _arm(feed, obj)
+        want = zfs.get.rows(Filesystem('bk/A'), properties=TestGetRowsSources.PROPS, sources=lower)
+        assert list(got) == list(want) and got.complete
+        assert all('-s' not in c for c in feed.calls)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('types', [None, '', [], ()])
+    def test_empty_types_means_all_for_both_runs(self, feed, types):
+        _arm(feed, _obj('bk/A'), _obj('bk/A@s', 'snapshot'))
+        res = zfs.get.rows(Filesystem('bk'), recursive=True, types=types)
+        assert res.complete and _names(res) == ['bk/A', 'bk/A@s']
+        assert feed.calls[0][1:] == ['get', '-H', '-o', _GET_COLS, '-r', '-t', 'all', 'all', 'bk']
+        assert feed.calls[1][1:] == ['list', '-H', '-o', 'name,type', '-r', '-t', 'all', 'bk']
+
+
+class TestGetExplicitSequence:
+    """With an explicit property list zfs prints, for every object, a `name` row, a `type` row and then one row per
+    requested property, in the requested order, and nothing else (`TestRealGetRows` proves it on 2.1.5, 2.2.2 and
+    2.4.1). `get()` (list and lazy) and `rows()` refuse an object whose rows are anything else: missing, unrequested,
+    reordered or repeated rows drop the group, whole. `'all'` has no fixed expansion and is not checked.
+
+    One deliberate tolerance: a row zfs printed but the parser skipped (a tab-ambiguous row, or a fragment a newline in
+    a value made) whose first column is the current object's name still counts toward the sequence, so the object is
+    kept with that property absent, as it always was."""
+
+    PATHS = pytest.mark.parametrize('path', ['list', 'lazy', 'rows'])
+    PROPS = ['compression', 'atime']
+
+    @staticmethod
+    def _object(name, dstype='filesystem', **props):
+        """name, type, compression, atime -- as zfs prints them for `properties=PROPS`."""
+        props = dict({'compression': 'lz4', 'atime': 'on'}, **props)
+        return _get_rows(name, dstype, explicit=True, **props)
+
+    @staticmethod
+    def _text(*objects):
+        return _get_text(*objects)
+
+    def _run(self, feed, caplog, path, data, properties=None):
+        """Read `data` through one of the three paths; `(names kept, result, warnings)`. `rows()` runs without the
+        listing so that only the sequence check decides."""
+        feed.set(data)
+        properties = self.PROPS if properties is None else properties
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            if path == 'rows':
+                res = zfs.get.rows(Filesystem('bk'), properties=properties, recursive=True, verify_names=False)
+                names = _names(res)
+            else:
+                res = list(GetCommand()(Filesystem('bk'), properties=properties, recursive=True, lazy=path == 'lazy'))
+                names = [o.name for o in res]
+        return names, res, _warnings(caplog)
+
+    def _refused(self, feed, caplog, path, bad, *, first=True, properties=None):
+        """`bad` (rows of `bk/A`) before or after a good `bk/B`: only B is kept, A is named by `rows()`."""
+        good = self._object('bk/B')
+        objects = (bad, good) if first else (good, bad)
+        names, res, warned = self._run(feed, caplog, path, self._text(*objects), properties)
+        assert names == ['bk/B'], warned
+        if path == 'rows':
+            assert not res.complete and res.skipped == 1 and res.dropped == frozenset({'bk/A'})
+            assert [r.property for r in res] == ['name', 'type', 'compression', 'atime']
+        else:
+            assert res[0]['compression'].value == 'lz4' and res[0]['atime'].value == 'on'
+        assert len([w for w in warned if 'skipping a row of zfs get output' in w]) == 1, warned
+        return warned
+
+    # --- the exact sequence is accepted ----------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('requested', [
+        ['compression', 'atime'], ['compression', 'atime', 'compression'], ['compression', 'type', 'atime'],
+        ['compression', 'atime', 'type', 'atime'],
+    ], ids=['plain', 'repeated', 'type-inside', 'type-and-repeat'])
+    def test_the_exact_sequence_is_accepted(self, feed, caplog, path, requested):
+        """Repeats in the request (and `type`, which leads anyway) are de-duplicated, here and in the `-o` list."""
+        names, res, warned = self._run(feed, caplog, path, self._text(self._object('bk/A'), self._object('bk/B')),
+                                       requested)
+        assert names == ['bk/A', 'bk/B'] and warned == []
+        assert feed.argv[-2:] == ['name,type,compression,atime', 'bk']
+        if path == 'rows':
+            assert res.complete and res.skipped == 0 and res.dropped == frozenset()
+            assert [r.property for r in res if r.name == 'bk/A'] == ['name', 'type', 'compression', 'atime']
+        else:
+            assert [(o['compression'].value, o['atime'].value) for o in res] == [('lz4', 'on')] * 2
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_every_object_type_is_the_same_sequence(self, feed, caplog, path):
+        objects = [self._object('bk'), self._object('bk@s', 'snapshot'), self._object('bk#b', 'bookmark'),
+                   self._object('bk/v', 'volume')]
+        feed.set(self._text(*objects))
+        if path == 'rows':
+            res = zfs.get.rows(Filesystem('bk'), properties=self.PROPS, recursive=True, types='all',
+                               verify_names=False)
+            assert res.complete and _names(res) == ['bk', 'bk@s', 'bk#b', 'bk/v']
+        else:
+            res = list(GetCommand()(Filesystem('bk'), properties=self.PROPS, recursive=True, types='all',
+                                    lazy=path == 'lazy'))
+            assert [o.name for o in res] == ['bk', 'bk@s', 'bk#b', 'bk/v']
+
+    # --- a missing row ---------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('first', [True, False], ids=['bad-first', 'bad-last'])
+    @pytest.mark.parametrize('missing,wording', [
+        ('compression', "the rows of 'bk/A' are not the 4 requested properties in order (got 3 rows)"),
+        ('atime', "the rows of 'bk/A' are not the 4 requested properties in order (got 3 rows)"),
+        ('type', "the rows of 'bk/A' do not start with the 'type' row zfs prints first (got 'compression')"),
+        ('name', "the rows of 'bk/A' do not start with the 'name' row zfs prints first (got 'type')"),
+    ])
+    def test_a_missing_row_refuses_the_object(self, feed, caplog, path, first, missing, wording):
+        bad = [r for r in self._object('bk/A') if r[1] != missing]
+        warned = self._refused(feed, caplog, path, bad, first=first)
+        assert any(wording in w for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_an_object_with_only_its_name_row_is_refused(self, feed, caplog, path):
+        """The `type` row never came (and nothing else): not the sequence zfs prints."""
+        warned = self._refused(feed, caplog, path, [('bk/A', 'name', 'bk/A', '-', '-')])
+        assert any("the rows of 'bk/A' are not the 4 requested properties in order (got 1 rows)" in w for w in warned)
+
+    # --- a row nobody asked for ------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('first', [True, False], ids=['bad-first', 'bad-last'])
+    @pytest.mark.parametrize('where', ['before', 'between', 'after'])
+    @pytest.mark.parametrize('extra', ['used', 'org.other:thing', 'org.zfsbackup:config'])
+    def test_an_unrequested_row_refuses_the_object(self, feed, caplog, path, first, where, extra):
+        rows = self._object('bk/A')
+        at = {'before': 2, 'between': 3, 'after': 4}[where]
+        bad = rows[:at] + [('bk/A', extra, 'FORGED', '-', 'local')] + rows[at:]
+        warned = self._refused(feed, caplog, path, bad, first=first)
+        assert any("property %r of 'bk/A' was not requested" % extra in w for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('repeat', ['name', 'type', 'compression', 'atime'])
+    def test_a_repeated_row_refuses_the_object(self, feed, caplog, path, repeat):
+        rows = self._object('bk/A')
+        bad = rows + [r for r in rows if r[1] == repeat]
+        warned = self._refused(feed, caplog, path, bad)
+        assert any("property %r appears twice for 'bk/A'" % repeat in w for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_an_unrequested_user_property_is_not_tolerated_even_when_set_locally(self, feed, caplog, path):
+        """zfs prints exactly what was asked for: a user property it was not asked for is not zfs's output."""
+        bad = self._object('bk/A') + [('bk/A', 'org.zfsbackup:anchor.d', 'snap', '-', 'local')]
+        self._refused(feed, caplog, path, bad)
+
+    # --- rows in another order ---------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('first', [True, False], ids=['bad-first', 'bad-last'])
+    def test_reordered_requested_rows_refuse_the_object(self, feed, caplog, path, first):
+        name, type_, comp, atime = self._object('bk/A')
+        warned = self._refused(feed, caplog, path, [name, type_, atime, comp], first=first)
+        assert any("the rows of 'bk/A' are not the 4 requested properties in order (got 4 rows)" in w
+                   for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_reordered_lead_rows_are_the_lead_rules_refusal(self, feed, caplog, path):
+        name, type_, comp, atime = self._object('bk/A')
+        warned = self._refused(feed, caplog, path, [type_, name, comp, atime])
+        assert any("do not start with the 'name' row zfs prints first (got 'type')" in w for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_the_order_is_the_requested_order_not_the_alphabetical_or_zfs_property_order(self, feed, caplog, path):
+        requested = ['compression', 'atime']
+        rows = _get_rows('bk/A', explicit=True, atime='on', compression='lz4')          # atime first: not requested so
+        names, res, warned = self._run(feed, caplog, path, self._text(rows), requested)
+        assert names == [] and len(warned) >= 1
+        caplog.clear()
+        names, res, warned = self._run(feed, caplog, path, self._text(rows), ['atime', 'compression'])
+        assert names == ['bk/A'] and warned == []                                        # the same bytes, requested so
+
+    # --- the tolerance: a row zfs printed and the parser skipped ----------------------------------------------------------
+
+    AMBIGUOUS = 'bk/A\tcompression\ta\t-\ta\t-\t-'          # two plausible value/received splits: skipped
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_a_tab_ambiguous_row_of_the_object_keeps_it_without_that_property(self, feed, caplog, path):
+        assert GetCommand._split_row(self.AMBIGUOUS, _SkipCounter()) is None
+        a = self._object('bk/A')
+        lines = [self._text([r]).decode() for r in a]
+        lines[2] = self.AMBIGUOUS + '\n'
+        data = (''.join(lines) + self._text(self._object('bk/B')).decode()).encode()
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/A', 'bk/B']
+        if path == 'rows':
+            assert [r.property for r in res if r.name == 'bk/A'] == ['name', 'type', 'atime']
+            assert not res.complete and res.skipped == 1 and res.dropped == frozenset()
+        else:
+            assert res[0]['compression'] is None and res[0]['atime'].value == 'on'
+            assert res[1]['compression'].value == 'lz4'
+        assert any('ambiguous' in w or 'cannot tell the value from the received column' in w for w in warned)
+        assert not any('requested properties in order' in w for w in warned)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_a_newline_in_a_value_keeps_the_object_without_that_property(self, feed, caplog, path):
+        """`compression` = `head<LF>tail`: zfs prints `bk/A<TAB>compression<TAB>head` (3 columns, the object's own
+        name: counted as its row) and `tail<TAB>-<TAB>local` (another first column: not counted)."""
+        a = self._object('bk/A', compression='head\ntail')
+        data = self._text(a, self._object('bk/B'))
+        assert b'bk/A\tcompression\thead\ntail\t-\tlocal\n' in data
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/A', 'bk/B']
+        if path == 'rows':
+            assert [r.property for r in res if r.name == 'bk/A'] == ['name', 'type', 'atime']
+            assert not res.complete and res.skipped == 2 and res.dropped == frozenset()
+        else:
+            assert res[0]['compression'] is None and res[0]['atime'].value == 'on'
+        assert not any('requested properties in order' in w for w in warned)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    @pytest.mark.parametrize('junk', ['bk/B\tatime\tx', 'bk/B\tatime', 'stray', 'other\tz\t-\tlocal', 'bk/AX\tatime\tx'],
+                             ids=['other-name-3-columns', 'other-name-2-columns', 'one-column', 'other-4-columns',
+                                  'name-prefix'])
+    def test_a_skipped_row_of_another_name_does_not_count(self, feed, caplog, path, junk):
+        """A skipped line inside A's rows whose first column is not A (a neighbour's name, a forged fragment, a
+        longer name that starts with A's) is not A's row: A keeps exactly the sequence it has."""
+        a = [self._text([r]).decode() for r in self._object('bk/A')]
+        data = (''.join(a[:3]) + junk + '\n' + a[3] + self._text(self._object('bk/B')).decode()).encode()
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/A', 'bk/B'], warned
+        if path == 'rows':
+            assert [r.property for r in res if r.name == 'bk/A'] == ['name', 'type', 'compression', 'atime']
+            assert not res.complete and res.skipped == 1
+        assert not any('requested properties in order' in w for w in warned)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_a_skipped_row_of_the_object_still_leaves_a_missing_row_missing(self, feed, caplog, path):
+        """The tolerance counts the skipped row once: with it AND no `atime` row, the sequence is still short."""
+        a = [self._text([r]).decode() for r in self._object('bk/A')]
+        data = (''.join(a[:2]) + self.AMBIGUOUS + '\n' + self._text(self._object('bk/B')).decode()).encode()
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/B']
+        assert any("the rows of 'bk/A' are not the 4 requested properties in order (got 3 rows)" in w for w in warned)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_a_fragment_that_starts_with_the_objects_own_name_is_one_row_too_many(self, feed, caplog, path):
+        """Fail closed: `compression` = `v<LF>bk/A` leaves a tail `bk/A<TAB>-<TAB>local`, which looks like another
+        row of A's. A is refused (the fragment of the value counts once, the tail a second time)."""
+        a = self._object('bk/A', compression='v\nbk/A')
+        data = self._text(a)
+        assert b'\nbk/A\t-\tlocal\n' in data
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == []
+        assert any("the rows of 'bk/A' are not the 4 requested properties in order (got 5 rows)" in w
+                   for w in warned), warned
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_skipped_lines_before_the_first_group_are_ignored(self, feed, caplog, path):
+        data = b'stray\nbk/A\tcompression\n' + self._text(self._object('bk/A'))
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/A']
+        if path == 'rows':
+            assert not res.complete and res.skipped == 2
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_a_skipped_row_does_not_leak_into_the_next_group(self, feed, caplog, path):
+        """B opens after A's ambiguous row: the row was A's, B's own sequence is its own."""
+        a = [self._text([r]).decode() for r in self._object('bk/A')]
+        a[2] = self.AMBIGUOUS + '\n'
+        data = (''.join(a) + self._text(self._object('bk/B')).decode()).encode()
+        names, res, warned = self._run(feed, caplog, path, data)
+        assert names == ['bk/A', 'bk/B']
+        if path == 'rows':
+            assert [r.property for r in res if r.name == 'bk/B'] == ['name', 'type', 'compression', 'atime']
+
+    # --- rows(): complete=False on every refusal -----------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('shape', ['missing', 'extra', 'reordered', 'repeated', 'name-only'])
+    @pytest.mark.parametrize('verify', [True, False], ids=['verify', 'no-verify'])
+    def test_rows_is_incomplete_and_names_the_refused_object(self, feed, shape, verify):
+        name, type_, comp, atime = rows = self._object('bk/A')
+        bad = {'missing': [name, type_, comp], 'extra': rows + [('bk/A', 'used', '1', '-', 'local')],
+               'reordered': [name, type_, atime, comp], 'repeated': rows + [comp], 'name-only': [name]}[shape]
+        good = self._object('bk/B')
+        listing = _rows(('bk/A', 'filesystem'), ('bk/B', 'filesystem'))
+        feed.sequence(*([_get_text(bad, good)] + ([listing] if verify else [])))
+        res = zfs.get.rows(Filesystem('bk'), properties=self.PROPS, recursive=True, verify_names=verify)
+        assert _names(res) == ['bk/B']
+        assert not res.complete and res.skipped == 1 and res.dropped == frozenset({'bk/A'})
+        with pytest.raises(ZFSOutputError):
+            feed.sequence(*([_get_text(bad, good)] + ([listing] if verify else [])))
+            zfs.get.rows(Filesystem('bk'), properties=self.PROPS, recursive=True, verify_names=verify, strict=True)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_a_refused_object_is_not_counted_again_by_the_listing(self, feed):
+        name, type_, comp, atime = self._object('bk/A')
+        bad, good = [name, type_, comp], self._object('bk/B')
+        feed.sequence(_get_text(bad, good), _list_text(self._object('bk/A'), good))
+        res = zfs.get.rows(Filesystem('bk'), properties=self.PROPS, recursive=True)
+        assert res.skipped == 1 and res.dropped == frozenset({'bk/A'}) and _names(res) == ['bk/B']
+
+    # --- the lazy form ----------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_lazy_get_yields_the_good_objects_around_a_refused_one(self, feed, caplog):
+        name, type_, comp, atime = self._object('bk/B')
+        bad = [name, type_, atime, comp]
+        data = self._text(self._object('bk/A'), bad, self._object('bk/C'))
+        feed.set(data)
+        with caplog.at_level(logging.WARNING, logger='libzfseasy'):
+            result = GetCommand()(Filesystem('bk'), properties=self.PROPS, recursive=True, lazy=True)
+            assert hasattr(result, '__next__')
+            assert [o.name for o in result] == ['bk/A', 'bk/C']
+        assert sum('requested properties in order' in w for w in _warnings(caplog)) == 1
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_the_lead_row_of_the_group_after_a_refused_one_is_checked_afresh(self, feed, caplog):
+        """A's sequence is closed when B opens; B's own rows start a new sequence."""
+        a = self._object('bk/A')[:-1]                                      # missing `atime`
+        data = self._text(a, self._object('bk/B'), self._object('bk/C'))
+        names, res, warned = self._run(feed, caplog, 'list', data)
+        assert names == ['bk/B', 'bk/C'] and len(warned) == 1
+
+    # --- `all` is not checked ------------------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @PATHS
+    def test_all_is_unaffected(self, feed, caplog, path):
+        """No fixed expansion: each object carries whatever zfs printed for it, in whatever order."""
+        a = _get_rows('bk/A', compression='lz4', atime='on', **{'org.t:v': 'x'})
+        b = _get_rows('bk/B', 'volume', atime='off', compression='gzip')
+        c = _get_rows('bk/C')
+        names, res, warned = self._run(feed, caplog, path, self._text(a, b, c), 'all')
+        assert names == ['bk/A', 'bk/B', 'bk/C'] and warned == []
+        if path == 'rows':
+            assert res.complete and res.dropped == frozenset()
+            assert [r.property for r in res if r.name == 'bk/A'] == ['type', 'compression', 'atime', 'org.t:v']
+        else:
+            assert res[0]['org.t:v'].value == 'x' and res[1]['compression'].value == 'gzip'
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_all_still_refuses_what_it_always_refused(self, feed, caplog):
+        a = _get_rows('bk/A', compression='lz4') + [('bk/A', 'compression', 'off', '-', 'local')]
+        names, res, warned = self._run(feed, caplog, 'list', self._text(a, _get_rows('bk/B')), 'all')
+        assert names == ['bk/B'] and any("property 'compression' appears twice" in w for w in warned)
+
+    # --- the expected sequence itself ---------------------------------------------------------------------------------------
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('properties,expected', [
+        (['used'], ('name', 'type', 'used')),
+        (['used', 'compression'], ('name', 'type', 'used', 'compression')),
+        (['compression', 'used', 'compression', 'used'], ('name', 'type', 'compression', 'used')),
+        (['type', 'used'], ('name', 'type', 'used')),
+        (['used', 'type', 'name'], ('name', 'type', 'used')),
+        ([], ('name', 'type')),
+        (['type'], ('name', 'type')),
+        (('a:b', 'c:d'), ('name', 'type', 'a:b', 'c:d')),
+        (['all'], None), (['used', 'all'], None), (['all', 'used'], None),
+    ])
+    def test_expected_properties(self, properties, expected):
+        assert GetCommand._expected_properties(properties) == expected
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('properties', [['used'], ['used', 'type', 'used'], ['org.t:v', 'compression'], []])
+    def test_the_dash_o_list_is_the_expected_sequence(self, properties):
+        """What zfs is asked for and what the parser expects back are one definition."""
+        (listed,) = GetCommand._get_options(properties=properties)
+        assert tuple(listed.split(',')) == GetCommand._expected_properties(properties)

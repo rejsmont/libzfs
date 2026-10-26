@@ -28,6 +28,7 @@ number of tests in this file that then fail):
   recording the worker after the log line: 1.
 """
 
+import argparse
 import logging
 import multiprocessing
 import os
@@ -856,8 +857,11 @@ class TestAbandonedWorkers:
         )
         mocker.patch("zfsbackup.daemon.BackupDaemon", return_value=crashing)
         collected = []
-        args = MagicMock(
-            config=str(sqlite_config_db.path), dry_run=False, test_config=False, verbose=False
+        # A real Namespace: `_log_level(args)` reads `args.log_level`, and a
+        # MagicMock attribute is a Mock, not a level name.
+        args = argparse.Namespace(
+            config=str(sqlite_config_db.path), dry_run=False, test_config=False,
+            verbose=False, log_level=None,
         )
         assert daemon_module._run(args, collected) == 1
         assert collected == ["api"]

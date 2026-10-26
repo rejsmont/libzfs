@@ -418,29 +418,33 @@ class FakeDaemon:
 
     def __init__(self, db: Path, *, pid=4321, generation=None, start="tok",
                  applied=None, target=None, rejected=None, deferred=None,
-                 deferred_reason=None, raw: bytes = None) -> None:
+                 deferred_reason=None, draining=None, draining_reason=None,
+                 raw: bytes = None) -> None:
         db.parent.mkdir(parents=True, exist_ok=True)
         self.path = daemonlock.lock_path(db)
         self._fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o660)
         fcntl.flock(self._fd, fcntl.LOCK_EX)
         self.set(pid=pid, generation=generation, start=start, applied=applied,
                  target=target, rejected=rejected, deferred=deferred,
-                 deferred_reason=deferred_reason, raw=raw)
+                 deferred_reason=deferred_reason, draining=draining,
+                 draining_reason=draining_reason, raw=raw)
 
     def set(self, *, pid=_UNSET, generation=_UNSET, start=_UNSET, applied=_UNSET,
             target=_UNSET, rejected=_UNSET, deferred=_UNSET, deferred_reason=_UNSET,
-            raw=None) -> None:
+            draining=_UNSET, draining_reason=_UNSET, raw=None) -> None:
         """Rewrite the pid file. Omitted fields keep their previous value."""
         if raw is None:
             for name, value in (("pid", pid), ("generation", generation), ("start", start),
                                 ("applied", applied), ("target", target),
                                 ("rejected", rejected), ("deferred", deferred),
-                                ("deferred_reason", deferred_reason)):
+                                ("deferred_reason", deferred_reason),
+                                ("draining", draining), ("draining_reason", draining_reason)):
                 if value is not _UNSET:
                     setattr(self, name, value)
             data = daemonlock._format(self.pid, self.generation, self.start,
                                       self.applied, self.target, self.rejected,
-                                      self.deferred, self.deferred_reason)
+                                      self.deferred, self.deferred_reason,
+                                      self.draining, self.draining_reason)
         else:
             data = raw
         os.pwrite(self._fd, data, 0)

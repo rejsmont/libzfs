@@ -323,6 +323,24 @@ class TestRealBookmarkOperations:
             zfs.destroy(fs, destroy=True, recursive=True)
 
 
+    def test_exists_of_a_bookmark_present_and_missing(self, test_pool):
+        """`exists(Bookmark)` goes through `zfs get -H -o value type` (`list` refuses a Bookmark among its roots)."""
+        fs_name = f'{test_pool}/test_bookmark_exists_fs'
+        fs = zfs.create.filesystem(fs_name)
+        try:
+            snap = zfs.snapshot(fs, 'test_snap')
+            bookmark = zfs.bookmark(snap, 'test_bookmark')
+            assert zfs.exists(bookmark) is True
+            assert zfs.exists(Bookmark(fs, 'test_missing')) is False
+            assert zfs.exists(Bookmark(Filesystem(f'{fs_name}_gone'), 'test_bookmark')) is False
+
+            zfs.destroy(bookmark, destroy=True)
+            assert zfs.exists(bookmark) is False
+            assert zfs.exists(snap) is True and zfs.exists(fs) is True
+        finally:
+            zfs.destroy(fs, destroy=True, recursive=True)
+
+
 class TestRealRenameOperations:
     """Test rename operations against real ZFS."""
     
@@ -908,3 +926,430 @@ class TestRealGetLeadRows:
         assert len(result) >= 8
         assert {type(o) for o in result} == {Filesystem, Volume, Snapshot, Bookmark}
 
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# D5: `zfs.get.rows()` against the real binary (OpenZFS 2.1 / 2.2 / 2.4)
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _fact(request, text):
+    """Print a finding on its own line of the terminal report (the matrix log keeps it): `ROWS-FACT[<zfs version>]`."""
+    line = 'ROWS-FACT[%s]: %s' % (_zfs_version_line(), text)
+    reporter = request.config.pluginmanager.get_plugin('terminalreporter')
+    if reporter is not None:
+        reporter.write_line('')
+        reporter.write_line(line)
+    else:
+        print(line)
+
+
+def _zfs_version_line():
+    try:
+        out = subprocess.run([_zfs_cmd(), 'version'], capture_output=True, text=True).stdout.split('\n')[0]
+    except OSError:
+        return '?'
+    return out.strip() or '?'
+
+
+@pytest.fixture(scope='class')
+def rows_tree(test_pool):
+    """`parent` (filesystem) with `fs` (user properties, a userquota, two snapshots and a bookmark), `fs/child` and a
+    volume `vol`, all snapshotted by `@s1`; one `test_rows` parent."""
+    from libzfseasy.types import ZFS
+    parent = f'{test_pool}/test_rows'
+    fs, child, vol = f'{parent}/fs', f'{parent}/fs/child', f'{parent}/vol'
+    zfs.create.filesystem(parent)
+    try:
+        zfs.create.filesystem(fs)
+        zfs.create.filesystem(child)
+        zfs.create.volume(vol, '8M')
+        _raw_zfs_ok('set', 'org.t:v=pv', parent)
+        _raw_zfs_ok('set', 'org.t:v=fv', 'org.t:w=w1', fs)
+        _raw_zfs_ok('set', 'userquota@root=1M', fs)
+        zfs.snapshot(Filesystem(parent), 's1', recursive=True)
+        zfs.snapshot(Filesystem(fs), 's2')
+        zfs.bookmark(Snapshot(Filesystem(fs), 's1'), 'bm')
+        yield {'parent': parent, 'fs': fs, 'child': child, 'vol': vol, 'snap': f'{fs}@s1', 'bookmark': f'{fs}#bm',
+               'pool': test_pool.name}
+    finally:
+        try:
+            _destroy_volume_when_idle(Volume(vol))
+        except Exception:
+            pass
+        try:
+            zfs.destroy(Filesystem(parent), destroy=True, recursive=True)
+        except Exception:
+            _cleanup_test_datasets(test_pool.name)
+
+
+def _scope_flags(recursive=False, depth=0, types=None):
+    flags = (['-r'] if recursive else []) + (['-d', str(depth)] if depth else [])
+    return flags + (['-t', types] if types else [])
+
+
+def _raw_list_names(flags, targets):
+    out = _raw_zfs_ok('list', '-H', '-o', 'name,type', *flags, *targets).stdout.decode('utf-8', 'surrogateescape')
+    return [line.split('\t')[0] for line in out.split('\n') if line]
+
+
+# id -> (rows() scope kwargs, target keys of the tree)
+_ROWS_SHAPES = {
+    'r-filesystems-volumes': (dict(recursive=True, types='filesystem,volume'), ['parent']),
+    'single-dataset-all': (dict(types='all'), ['fs']),
+    'r-filesystem': (dict(recursive=True, types='filesystem'), ['parent']),
+    'r-all-types': (dict(recursive=True, types='all'), ['parent']),
+    'r-snapshot': (dict(recursive=True, types='snapshot'), ['parent']),
+    'r-bookmark': (dict(recursive=True, types='bookmark'), ['parent']),
+    'no-r-snapshot': (dict(types='snapshot'), ['fs']),
+    'no-r-bookmark': (dict(types='bookmark'), ['fs']),
+    'd1-all-types': (dict(depth=1, types='all'), ['parent']),
+    'd1-all-types-fs': (dict(depth=1, types='all'), ['fs']),
+    'd2-snapshot': (dict(depth=2, types='snapshot'), ['parent']),
+    'd1-snapshot-bookmark': (dict(depth=1, types='snapshot,bookmark'), ['fs']),
+    'several-targets': (dict(types='all'), ['fs', 'vol', 'snap']),
+    'snapshot-target': (dict(types='all'), ['snap']),
+    'snapshot-target-r': (dict(recursive=True, types='all'), ['snap']),
+    'bookmark-target': (dict(types='all'), ['bookmark']),
+    'pool-d1': (dict(depth=1, types='all'), ['pool']),
+}
+_ROWS_PROPS = {'all': 'all', 'explicit': ['org.t:v', 'org.t:w', 'org.t:unset']}
+
+
+class TestRealGetRows:
+    """D5: `zfs get` and the name-only `zfs list` iterate the same objects for the same scope flags, and an explicit
+    property list prints nothing but what was asked (plus `name`, `type`)."""
+
+    @staticmethod
+    def _targets(tree, keys):
+        return [tree[k] for k in keys]
+
+    @pytest.mark.parametrize('props', sorted(_ROWS_PROPS))
+    @pytest.mark.parametrize('shape', sorted(_ROWS_SHAPES))
+    def test_get_and_list_print_the_same_names(self, rows_tree, shape, props):
+        kwargs, keys = _ROWS_SHAPES[shape]
+        flags, targets = _scope_flags(**kwargs), self._targets(rows_tree, keys)
+        wanted = 'all' if props == 'all' else ','.join(['name', 'type'] + _ROWS_PROPS[props])
+        got = [g[0] for g in _get_groups(*flags, wanted, *targets)]
+        assert len(set(got)) == len(got), 'a name is not contiguous'
+        assert sorted(got) == sorted(_raw_list_names(flags, targets)), (shape, flags)
+
+    @pytest.mark.parametrize('props', sorted(_ROWS_PROPS))
+    @pytest.mark.parametrize('shape', sorted(_ROWS_SHAPES))
+    def test_rows_is_complete_and_names_what_list_names(self, rows_tree, shape, props):
+        from libzfseasy.types import ZFS
+        kwargs, keys = _ROWS_SHAPES[shape]
+        targets = self._targets(rows_tree, keys)
+        res = zfs.get.rows([ZFS.from_name(t) for t in targets], properties=_ROWS_PROPS[props], **kwargs)
+        assert res.complete and res.skipped == 0 and res.dropped == frozenset(), (shape, res.skipped)
+        assert sorted({r.name for r in res}) == sorted(_raw_list_names(_scope_flags(**kwargs), targets))
+        strict = zfs.get.rows([ZFS.from_name(t) for t in targets], properties=_ROWS_PROPS[props], strict=True,
+                              **kwargs)
+        assert list(strict) == list(res)
+
+    def test_rows_without_a_property_or_scope_argument_reads_the_pool_tree(self, rows_tree):
+        res = zfs.get.rows(Filesystem(rows_tree['parent']), recursive=True)
+        assert res.complete
+        assert {r.name for r in res} == set(_raw_list_names(['-r', '-t', 'all'], [rows_tree['parent']]))
+
+    def test_rows_values_match_the_raw_columns(self, rows_tree):
+        fs = Filesystem(rows_tree['fs'])
+        res = zfs.get.rows(fs, properties=['org.t:v', 'org.t:w', 'org.t:unset', 'compression'])
+        by = {r.property: r for r in res}
+        assert by['org.t:v'] == zfs.GetRow(rows_tree['fs'], 'org.t:v', 'fv', '-', 'local')
+        assert by['org.t:unset'].value == '-' and by['org.t:unset'].source == '-'
+        assert by['name'].value == rows_tree['fs'] and by['type'].value == 'filesystem'
+        child = zfs.get.rows(Filesystem(rows_tree['child']), properties=['org.t:v'])
+        (inherited,) = [r for r in child if r.property == 'org.t:v']
+        assert inherited.value == 'fv' and inherited.source == 'inherited from ' + rows_tree['fs']
+        only = zfs.get.rows(Filesystem(rows_tree['child']), properties=['org.t:v'], sources='Inherited')
+        assert [r.property for r in only] == ['name', 'type', 'org.t:v']
+
+    # --- the default -t: zfs get and zfs list disagree --------------------------------------------------------------
+
+    def test_without_dash_t_get_reads_every_type_and_list_only_filesystems_and_volumes(self, rows_tree, request):
+        """Characterisation: why `rows()` always sends `-t` (with `types=None` it sends `-t all` to both)."""
+        parent = rows_tree['parent']
+        got = {g[0] for g in _get_groups('-r', 'all', parent)}
+        listed = set(_raw_list_names(['-r'], [parent]))
+        extra = got - listed
+        assert listed <= got and extra and all('@' in n or '#' in n for n in extra)
+        got1 = {g[0] for g in _get_groups('-d', '1', 'all', parent)}
+        extra1 = got1 - set(_raw_list_names(['-d', '1'], [parent]))
+        _fact(request, 'no -t: `zfs get -r` prints %d objects, `zfs list -r` %d (extra: snapshots/bookmarks); '
+                       '`-d 1` extra: %d' % (len(got), len(listed), len(extra1)))
+
+    @pytest.mark.parametrize('types', [None, '', []])
+    def test_rows_with_no_types_sends_dash_t_all_and_is_complete(self, rows_tree, types):
+        res = zfs.get.rows(Filesystem(rows_tree['parent']), recursive=True, types=types)
+        assert res.complete, (res.skipped, sorted(res.dropped))
+        assert {r.name for r in res} == set(_raw_list_names(['-r', '-t', 'all'], [rows_tree['parent']]))
+
+    # --- a bookmark operand -----------------------------------------------------------------------------------------
+
+    def test_list_accepts_a_bookmark_operand_only_with_dash_t_and_rows_always_sends_it(self, rows_tree, request):
+        from libzfseasy.types import ZFS
+        bookmark = rows_tree['bookmark']
+        plain = _raw_zfs('list', '-H', '-o', 'name,type', bookmark)
+        typed = _raw_zfs('list', '-H', '-o', 'name,type', '-t', 'all', bookmark)
+        only = _raw_zfs('list', '-H', '-o', 'name,type', '-t', 'bookmark', bookmark)
+        _fact(request, 'list of a bookmark operand: no -t rc=%d (%s); -t all rc=%d %r; -t bookmark rc=%d %r' % (
+            plain.returncode, plain.stderr.decode().strip().split(': ', 1)[-1][:60], typed.returncode,
+            typed.stdout.decode(), only.returncode, only.stdout.decode()))
+        assert plain.returncode != 0                      # why `-t` must always be sent
+        assert typed.returncode == 0 and only.returncode == 0
+        for types in ('all', 'bookmark', None):
+            res = zfs.get.rows(ZFS.from_name(bookmark), types=types, verify_names=True)
+            assert res.complete and {r.name for r in res} == {bookmark}, types
+
+    # --- an explicit list prints only what was asked -----------------------------------------------------------------
+
+    _EXPLICIT = {
+        'user': ['org.t:v', 'org.t:w', 'org.t:unset', 'org.other:x'],
+        'native': ['compression', 'used', 'mountpoint', 'volsize', 'quota', 'referenced', 'creation', 'guid', 'clones',
+                   'origin', 'defer_destroy'],
+        'userquota': ['userquota@root', 'userused@root', 'groupused@root'],
+        'written': ['written', 'written@s1', 'written@s2', 'written@nosuch'],
+        'mixed': ['org.t:v', 'compression', 'userused@root', 'written@s1', 'volsize', 'userrefs'],
+        'inapplicable': ['volsize', 'mountpoint', 'defer_destroy', 'userrefs', 'snapshot_count'],
+    }
+
+    @pytest.mark.parametrize('lid', sorted(_EXPLICIT))
+    @pytest.mark.parametrize('recursive_flags', [['-r', '-t', 'all'], ['-r', '-t', 'filesystem,volume'],
+                                                  ['-t', 'snapshot']], ids=['r-all', 'r-fsvol', 'snap-no-r'])
+    def test_only_requested_properties_are_printed_and_every_object_gets_every_one(self, rows_tree, request, lid,
+                                                                                   recursive_flags):
+        props = self._EXPLICIT[lid]
+        groups = _get_groups(*recursive_flags, ','.join(props), rows_tree['parent'] if '-r' in recursive_flags
+                             else rows_tree['fs'])
+        assert groups
+        extras, missing, misordered = set(), [], []
+        for name, rows in groups:
+            printed = [r[0] for r in rows]
+            extras |= set(printed) - set(props)
+            missing += [(name, p) for p in props if p not in printed]
+            if printed != props:
+                misordered.append(name)
+        # (a) zfs prints no property name nobody asked for
+        assert extras == set(), (lid, sorted(extras))
+        # (b) every object gets a row for every requested property, in the requested order
+        assert missing == [], (lid, missing[:5])
+        assert misordered == [], (lid, misordered[:3])
+        if recursive_flags == ['-r', '-t', 'all']:
+            _fact(request, 'explicit list %-12s: %d objects, printed-extra=%s, objects missing a requested row=%d' % (
+                lid, len(groups), sorted(extras), len({n for n, _ in missing})))
+
+    def test_name_and_type_requested_twice_are_printed_twice(self, rows_tree):
+        """The reason `_get_options` de-duplicates the lead rows: zfs prints a repeated property once per mention."""
+        (group,) = _get_groups('name,type,type,name,used', rows_tree['fs'])
+        assert [r[0] for r in group[1]] == ['name', 'type', 'type', 'name', 'used']
+
+    def test_rows_never_reports_an_unrequested_property_on_real_output(self, rows_tree):
+        res = zfs.get.rows(Filesystem(rows_tree['parent']), properties=['org.t:v', 'compression', 'used', 'written'],
+                           recursive=True, types='all')
+        assert res.complete
+        names = {r.name for r in res}
+        for name in names:
+            assert [r.property for r in res if r.name == name] == ['name', 'type', 'org.t:v', 'compression', 'used',
+                                                                    'written']
+
+    def test_libzfseasy_cannot_request_the_at_sign_properties(self, rows_tree):
+        """Not a rows() matter -- `Validate.attribute` refuses them everywhere -- recorded because the raw tests above
+        read them: `userquota@`, `userused@`, `written@<snap>`."""
+        for prop in ('userquota@root', 'userused@root', 'written@s1'):
+            with pytest.raises(ValueError):
+                zfs.get.rows(Filesystem(rows_tree['fs']), properties=[prop])
+
+
+# --- a crafted `zfs send -p` stream forging rows for another dataset ---------------------------------------------------
+
+_FORGE_PROP = 'org.zfsbackup:config'
+
+
+def _forged_value(victim):
+    """A property value that makes `zfs get` print rows for `victim`: zfs prints a received value twice (the value and
+    the received column), so the rows come out twice, around a valid-looking row of the attacker's own."""
+    return 'a\t-\tlocal\n%s\t%s\tFORGED\t-\tlocal\n%s\tzz' % (victim, _FORGE_PROP, victim)
+
+
+@pytest.fixture(scope='class')
+def forge_tree(test_pool):
+    """bystanders c_by, n_mid, victims b_vic (right after attacker a_att) and z_vic (after n_mid, after attacker
+    m_att); the attackers are received from `send -p` streams of sources that no longer exist."""
+    parent = f'{test_pool}/test_rows_forge'
+    names = {k: f'{parent}/{k}' for k in ('a_att', 'b_vic', 'c_by', 'm_att', 'n_mid', 'z_vic')}
+    zfs.create.filesystem(parent)
+    try:
+        for key in ('b_vic', 'c_by', 'n_mid', 'z_vic'):
+            zfs.create.filesystem(names[key])
+            _raw_zfs_ok('set', f'{_FORGE_PROP}=cfg-{key}', names[key])
+            _raw_zfs_ok('set', 'org.zfsbackup:anchor.d=snap-%s' % key, names[key])
+        baseline = zfs.get.rows(Filesystem(parent), recursive=True, types='filesystem')
+        assert baseline.complete
+        for attacker, victim in (('a_att', 'b_vic'), ('m_att', 'z_vic')):
+            src = f'{parent}/zz_src'
+            zfs.create.filesystem(src)
+            _raw_zfs_ok('set', f'{_FORGE_PROP}={_forged_value(names[victim])}', src)
+            _raw_zfs_ok('snapshot', f'{src}@s')
+            stream = _raw_zfs_ok('send', '-p', f'{src}@s').stdout
+            zfs.destroy(Filesystem(src), destroy=True, recursive=True)
+            _raw_zfs_ok('receive', '-u', names[attacker], stdin=stream)
+        yield {'parent': parent, 'names': names, 'baseline': baseline}
+    finally:
+        try:
+            zfs.destroy(Filesystem(parent), destroy=True, recursive=True)
+        except Exception:
+            _cleanup_test_datasets(test_pool.name)
+
+
+class TestRealGetRowsForgedStream:
+    """A received value with newlines and tabs forges rows for another dataset. `get()` cannot tell; `rows()` says so."""
+
+    STABLE = ('type', _FORGE_PROP, 'org.zfsbackup:anchor.d')
+
+    @staticmethod
+    def _by_name(rows, props):
+        out = {}
+        for r in rows:
+            if r.property in props and (r.source != '-' or r.property == 'type'):   # unset: an explicit list prints it
+                out.setdefault(r.name, []).append((r.property, r.value, r.received, r.source))
+        return out
+
+    @pytest.mark.parametrize('props', ['all', [_FORGE_PROP, 'org.zfsbackup:anchor.d']], ids=['all', 'explicit'])
+    def test_the_forged_victims_are_dropped_and_nobody_elses_rows_change(self, forge_tree, request, props):
+        names = forge_tree['names']
+        raw = _raw_zfs_ok('get', '-H', '-o', _GET_COLUMNS, '-r', '-t', 'filesystem,volume',
+                          'all' if props == 'all' else 'name,type,' + ','.join(props),
+                          forge_tree['parent']).stdout.decode('utf-8', 'surrogateescape')
+        for victim in ('b_vic', 'z_vic'):                       # the attack is real: zfs printed forged victim rows
+            assert '\n%s\t%s\tFORGED\t-\tlocal\n' % (names[victim], _FORGE_PROP) in raw
+        res = zfs.get.rows(Filesystem(forge_tree['parent']), properties=props, recursive=True,
+                           types='filesystem,volume')
+        assert not res.complete
+        assert {names['b_vic'], names['z_vic']} <= res.dropped
+        assert not {r.name for r in res} & {names['b_vic'], names['z_vic']}
+        after = self._by_name(res, self.STABLE)
+        before = self._by_name(forge_tree['baseline'], self.STABLE)
+        for key in ('c_by', 'n_mid'):                           # untouched bystanders: identical rows
+            assert sorted(after[names[key]]) == sorted(before[names[key]]), key
+        assert sorted(after[forge_tree['parent']]) == sorted(before[forge_tree['parent']])
+        assert not any(r.value == 'FORGED' and r.name != names['a_att'] and r.name != names['m_att'] for r in res)
+        with pytest.raises(zfs.ZFSOutputError):
+            zfs.get.rows(Filesystem(forge_tree['parent']), properties=props, recursive=True,
+                         types='filesystem,volume', strict=True)
+        _fact(request, 'forged stream, props=%s: skipped=%d dropped=%d (victims dropped: %s)' % (
+            'all' if props == 'all' else 'explicit', res.skipped, len(res.dropped),
+            sorted(n.rsplit('/', 1)[1] for n in res.dropped)))
+
+    def test_get_alone_cannot_tell(self, forge_tree):
+        """For contrast, and as the reason for rows(): `get()` returns results with no sign anything was lost."""
+        result = zfs.get(Filesystem(forge_tree['parent']), properties=[_FORGE_PROP], recursive=True,
+                         types='filesystem,volume')
+        assert isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# `zfs.get.property_sources()` against the real binary: names, properties and sources, never a value
+# ---------------------------------------------------------------------------------------------------------------------
+
+_PS_NEWLINE_PROP = 'org.t:nl'
+_PS_NEWLINE_VALUE = 'line1\nline2'
+
+
+@pytest.fixture(scope='class')
+def sources_tree(test_pool):
+    """`parent` (a newline-valued user property, so every descendant inherits it) with `kid` (local `org.zfsbackup:*`
+    properties), `sp ace` (a space in its name) with a child, and `bare` (nothing local); one `test_psrc` parent."""
+    parent = f'{test_pool}/test_psrc'
+    names = {'parent': parent, 'kid': f'{parent}/kid', 'space': f'{parent}/sp ace',
+             'space_kid': f'{parent}/sp ace/kid', 'bare': f'{parent}/bare'}
+    _raw_zfs_ok('create', parent)
+    try:
+        _raw_zfs_ok('set', f'{_PS_NEWLINE_PROP}={_PS_NEWLINE_VALUE}', parent)
+        for key in ('kid', 'space', 'space_kid', 'bare'):
+            _raw_zfs_ok('create', names[key])
+        _raw_zfs_ok('set', 'org.zfsbackup:config=cfg', names['kid'])
+        _raw_zfs_ok('set', 'org.zfsbackup:anchor.d=snap-1', names['kid'])
+        _raw_zfs_ok('set', 'org.zfsbackup:config=cfg-space', names['space'])
+        yield names
+    finally:
+        try:
+            _raw_zfs('destroy', '-r', parent)
+        except Exception:
+            _cleanup_test_datasets(test_pool.name)
+
+
+class TestRealPropertySources:
+    """A hostile (newline-valued) user property on the root cannot disturb a read that never asks for values."""
+
+    PREFIX = 'org.zfsbackup:'
+
+    def _expected(self, tree, *keys):
+        """The local `org.zfsbackup:*` rows of these datasets, from a raw `zfs get` (not from libzfseasy)."""
+        out = {}
+        for key in keys:
+            raw = _raw_zfs_ok('get', '-H', '-o', 'name,property,source', '-s', 'local', 'all', tree[key]).stdout
+            for line in raw.decode('utf-8', 'surrogateescape').split('\n'):
+                if line and line.split('\t')[1].startswith(self.PREFIX):
+                    out[tuple(line.split('\t'))] = True
+        return set(out)
+
+    def test_returns_exactly_the_local_org_zfsbackup_rows_and_does_not_raise(self, sources_tree):
+        got = zfs.get.property_sources(Filesystem(sources_tree['parent']), recursive=True,
+                                       sources=['local', 'received'], prefix=self.PREFIX, types='filesystem,volume')
+        assert set(got) == self._expected(sources_tree, 'kid', 'space')
+        assert len(got) == len(set(got)) == 3
+        assert {r.source for r in got} == {'local'}
+        assert {r.name for r in got} == {sources_tree['kid'], sources_tree['space']}
+        assert all(isinstance(r, zfs.PropertySource) for r in got)
+
+    def test_the_newline_valued_property_is_listed_by_name_and_never_by_value(self, sources_tree):
+        got = zfs.get.property_sources(Filesystem(sources_tree['parent']), recursive=True, sources='local',
+                                       types='filesystem,volume')
+        assert zfs.PropertySource(sources_tree['parent'], _PS_NEWLINE_PROP, 'local') in got
+        assert not any('line1' in f or 'line2' in f for row in got for f in row)
+
+    def test_inherited_rows_name_the_origin(self, sources_tree):
+        got = zfs.get.property_sources(Filesystem(sources_tree['kid']), sources='inherited',
+                                       prefix=_PS_NEWLINE_PROP)
+        assert got == [zfs.PropertySource(sources_tree['kid'], _PS_NEWLINE_PROP,
+                                          'inherited from ' + sources_tree['parent'])]
+
+    def test_an_origin_with_a_space_is_read(self, sources_tree):
+        got = zfs.get.property_sources(Filesystem(sources_tree['space_kid']), sources='inherited',
+                                       prefix=self.PREFIX)
+        assert got == [zfs.PropertySource(sources_tree['space_kid'], 'org.zfsbackup:config',
+                                          'inherited from ' + sources_tree['space'])]
+
+    def test_phase_two_a_strict_explicit_read_of_those_names_succeeds(self, sources_tree):
+        found = zfs.get.property_sources(Filesystem(sources_tree['parent']), recursive=True,
+                                         sources=['local', 'received'], prefix=self.PREFIX, types='filesystem,volume')
+        names = sorted({r.name for r in found})
+        props = sorted({r.property for r in found})
+        res = zfs.get.rows([Filesystem(n) for n in names], properties=props, types='filesystem,volume',
+                           received=False, strict=True)
+        assert res.complete
+        by = {(r.name, r.property): r for r in res if r.property in props}
+        for row in found:
+            assert by[(row.name, row.property)].source == 'local'
+        assert by[(sources_tree['kid'], 'org.zfsbackup:config')].value == 'cfg'
+        assert by[(sources_tree['space'], 'org.zfsbackup:config')].value == 'cfg-space'
+
+    def test_a_dataset_name_with_a_space(self, sources_tree):
+        got = zfs.get.property_sources(Filesystem(sources_tree['space']), sources='local', prefix=self.PREFIX)
+        assert got == [zfs.PropertySource(sources_tree['space'], 'org.zfsbackup:config', 'local')]
+
+    def test_a_dataset_whose_properties_all_filter_out_prints_nothing_and_exits_zero(self, sources_tree):
+        raw = _raw_zfs('get', '-H', '-o', 'name,property,source', '-s', 'received', 'all', sources_tree['bare'])
+        assert raw.returncode == 0 and raw.stdout == b''
+        assert zfs.get.property_sources(Filesystem(sources_tree['bare']), sources='received') == []
+        assert zfs.get.property_sources(Filesystem(sources_tree['bare']), sources='local',
+                                        prefix=self.PREFIX) == []
+
+    def test_every_row_of_every_type_passes_the_validators(self, rows_tree):
+        """Whatever `zfs get all` prints for filesystems, volumes, snapshots and bookmarks on this OpenZFS is accepted,
+        in the same objects `zfs list` names."""
+        got = zfs.get.property_sources(Filesystem(rows_tree['parent']), recursive=True, types='all')
+        assert {r.name for r in got} == set(_raw_list_names(['-r', '-t', 'all'], [rows_tree['parent']]))
+        assert {r.property for r in got} >= {'type', 'used', 'org.t:v'}
+        assert all(r.source in ('local', 'default', 'received', 'temporary', '-') or r.source.startswith('inherited from ')
+                   for r in got)

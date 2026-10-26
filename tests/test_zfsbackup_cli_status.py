@@ -16,6 +16,8 @@ Sections:
 - ``TestWaitFor``             the polling loop on an injected clock: re-reads the
                               stored key, applying -> in sync, timeouts.
 - ``TestStatusNeverSignals``  no signal of any kind, no `request_reload`.
+- ``TestWorkerRows``          (S-7b) the ``workers:`` rows and the JSON ``workers`` key from the
+                              worker status files; staleness; the verdict and exit codes never move.
 """
 
 import contextlib
@@ -26,8 +28,10 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,7 +46,8 @@ from _cli_support import (
     run,
     store_key,
 )
-from zfsbackup import daemonlock, procident
+from _worker_status_support import LIVE_PID, iso, make_dir, rec, status_dir, write_worker
+from zfsbackup import daemonlock, health, procident
 from zfsbackup.cli import errors as cli_errors
 from zfsbackup.cli import status as status_view
 from zfsbackup.config.store import dispose_all, resolve_config_path
@@ -1298,3 +1303,568 @@ class TestStatusNeverSignals:
         live_daemon(db, applied=store_key(db))
         assert status(run, db).exit_code == 0
         assert status(run, db).exit_code == 0  # and again: probing leaves no shared lock behind
+
+
+# --------------------------------------------------------------------------
+# S-7b: worker outcomes from `<db>.status/`
+# --------------------------------------------------------------------------
+
+SEND = "remote-backup-worker"
+SNAP = "snapshot-worker"
+PRUNE = "pruning-worker"
+UPDATED = r"updated \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \(\d+[smhd] ago\)"
+
+
+@pytest.fixture
+def live(run, plain, db, live_daemon):
+    """A plain database with a live daemon that is in sync."""
+    live_daemon(db, applied=store_key(db))
+    return db
+
+
+def rows_of(result):
+    """The text lines from the first `workers:` row up to (excluding) `status:`."""
+    lines = result.stdout.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith("workers:"))
+    end = next(i for i, l in enumerate(lines) if l.startswith("status:"))
+    return lines[start:end]
+
+
+class TestWorkerRows:
+    def test_no_status_directory_changes_nothing(self, run, live):
+        text = status(run, live)
+        assert "workers" not in text.stdout and text.exit_code == 0
+        data = as_json(status(run, live, "--json"))
+        assert "workers" not in data
+        assert set(data) == {"database", "stored", "daemon", "schema_error", "verdict", "message"}
+
+    def test_the_text_is_byte_identical_without_data(self, run, live):
+        lines = status(run, live).stdout.splitlines()
+        assert [l.split(":")[0] for l in lines] == [
+            "database", "stored", "daemon", "applied", "target", "rejected", "status"]
+
+    def test_an_empty_directory_has_no_rows_but_the_json_key(self, run, live):
+        make_dir(live)
+        assert "workers" not in status(run, live).stdout
+        data = as_json(status(run, live, "--json"))
+        assert data["workers"] == {"directory": str(status_dir(live)), "problems": [], "files": []}
+
+    def test_rows_come_before_the_final_status_line(self, run, live):
+        write_worker(live, SNAP, [rec("snapshot", "tank/a"), rec("snapshot", "tank/b")])
+        write_worker(live, SEND, [rec("send", "tank/a", "offsite")])
+        result = status(run, live)
+        lines = result.stdout.splitlines()
+        assert lines[-1] == "status:   in sync"
+        rows = rows_of(result)
+        assert len(rows) == 2
+        # the files are listed in name order; the first row carries the label, the next none
+        assert re.fullmatch(rf"workers:  {SEND}: {UPDATED}, 1 record, none failing", rows[0])
+        assert re.fullmatch(rf"          {SNAP}: {UPDATED}, 2 records, none failing", rows[1])
+        assert lines.index(rows[0]) > lines.index(next(l for l in lines if l.startswith("rejected:")))
+
+    def test_a_failing_worker_gets_a_worst_row(self, run, live):
+        write_worker(live, SEND, [
+            rec("send", "tank/a", "offsite", failures=3, error="connection refused"),
+            rec("send", "tank/b", "offsite"),
+        ])
+        rows = rows_of(status(run, live))
+        assert re.fullmatch(rf"workers:  {SEND}: {UPDATED}, 2 records, 1 failing", rows[0])
+        assert rows[1] == "            worst: send tank/a -> offsite, 3 failure(s) in a row: connection refused"
+        assert len(rows) == 2
+
+    def test_a_local_record_has_no_destination_arrow(self, run, live):
+        write_worker(live, PRUNE, [rec("prune", "tank/a", failures=1, error="busy")])
+        assert "            worst: prune tank/a, 1 failure(s) in a row: busy" in rows_of(status(run, live))
+
+    def test_a_failure_without_an_error_text_has_no_colon(self, run, live):
+        record = rec("snapshot", "tank/a", failures=2)
+        del record["last_error"], record["last_error_at"]
+        write_worker(live, SNAP, [record])
+        assert "            worst: snapshot tank/a, 2 failure(s) in a row" in rows_of(status(run, live))
+
+    def test_the_worst_is_the_most_failures(self, run, live):
+        now = time.time()
+        write_worker(live, SEND, [
+            rec("send", "tank/a", "o", failures=2, error="two", error_at=now - 10),
+            rec("send", "tank/b", "o", failures=5, error="five", error_at=now - 900),
+            rec("send", "tank/c", "o", failures=4, error="four", error_at=now - 5),
+        ])
+        worst = as_json(status(run, live, "--json"))["workers"]["files"][0]["worst"]
+        assert (worst["dataset"], worst["consecutive_failures"], worst["last_error"]) == ("tank/b", 5, "five")
+
+    def test_a_tie_goes_to_the_latest_error(self, run, live):
+        now = time.time()
+        write_worker(live, SEND, [
+            rec("send", "tank/a", "o", failures=3, error="old", error_at=now - 900),
+            rec("send", "tank/b", "o", failures=3, error="new", error_at=now - 5),
+            rec("send", "tank/c", "o", failures=3, error="mid", error_at=now - 300),
+        ])
+        worst = as_json(status(run, live, "--json"))["workers"]["files"][0]["worst"]
+        assert worst["dataset"] == "tank/b"
+
+    def test_an_error_result_with_zero_failures_counts_as_one(self, run, live):
+        write_worker(live, SEND, [rec("send", "tank/a", "o", result="error", failures=0, error="x")])
+        (entry,) = as_json(status(run, live, "--json"))["workers"]["files"]
+        assert entry["failing"] == 1 and entry["worst"]["consecutive_failures"] == 1
+
+    def test_successes_are_not_failing(self, run, live):
+        write_worker(live, SEND, [rec("send", "tank/a", "o", error="old", error_at=time.time() - 99,
+                                      failures=0, result="ok")])
+        (entry,) = as_json(status(run, live, "--json"))["workers"]["files"]
+        assert entry["failing"] == 0 and entry["worst"] is None
+        assert len(rows_of(status(run, live))) == 1
+
+    def test_a_heartbeat_file_with_no_records_is_a_row_with_zero_records(self, run, live):
+        write_worker(live, SNAP, [])
+        rows = rows_of(status(run, live))
+        assert len(rows) == 1
+        assert re.fullmatch(rf"workers:  {SNAP}: {UPDATED}, 0 records, none failing", rows[0])
+        (entry,) = as_json(status(run, live, "--json"))["workers"]["files"]
+        assert entry["records"] == 0 and entry["failing"] == 0 and entry["worst"] is None
+        assert entry["stale"] is False
+
+    def test_a_discover_failure_is_the_worst(self, run, live):
+        write_worker(live, SEND, [
+            rec("send", "tank/a", "offsite", failures=2, error="x"),
+            rec("discover", "bk", failures=3, error="cannot list the received datasets: pool busy"),
+        ])
+        rows = rows_of(status(run, live))
+        assert rows[1] == ("            worst: discover bk, 3 failure(s) in a row: "
+                           "cannot list the received datasets: pool busy")
+        worst = as_json(status(run, live, "--json"))["workers"]["files"][0]["worst"]
+        assert (worst["kind"], worst["dataset"], worst["destination"]) == ("discover", "bk", None)
+
+    def test_a_mount_point_status_directory_is_a_problem_row(self, run, live, monkeypatch):
+        write_worker(live, SNAP, [rec("snapshot", "tank/a")])
+        directory = status_dir(live)
+        real = os.stat
+
+        def other_device(path, *a, **k):
+            result = real(path, *a, **k)
+            if not a and not k and str(path) == str(directory.parent):
+                fields = list(result)[:10]
+                fields[2] = result.st_dev + 1
+                return os.stat_result(fields)
+            return result
+
+        monkeypatch.setattr(os, "stat", other_device)
+        result = status(run, live)
+        assert result.exit_code == 0
+        assert "workers:  problem: " in result.stdout and "is a mount point" in result.stdout
+        assert SNAP not in result.stdout
+
+    def test_a_file_without_an_update_time_prints_a_dash(self, run, live):
+        write_worker(live, SNAP, [rec("snapshot", "tank/a")], updated_at=None)
+        assert any("updated -," in row for row in rows_of(status(run, live)))
+
+    def test_problem_rows(self, run, live):
+        directory = make_dir(live)
+        bad = directory / "pruning-worker.json"
+        bad.write_text("{ nope")
+        os.chmod(bad, 0o640)
+        rows = rows_of(status(run, live))
+        assert len(rows) == 1 and rows[0].startswith("workers:  problem: ")
+        assert "not valid JSON" in rows[0] and "pruning-worker.json" in rows[0]
+
+    def test_problem_rows_follow_the_worker_rows(self, run, live):
+        write_worker(live, SNAP, [rec("snapshot", "tank/a")])
+        bad = status_dir(live) / "pruning-worker.json"
+        bad.write_text("{ nope")
+        os.chmod(bad, 0o640)
+        rows = rows_of(status(run, live))
+        assert rows[0].startswith(f"workers:  {SNAP}:")
+        assert rows[1].startswith("          problem: ") and "pruning-worker.json" in rows[1]
+        data = as_json(status(run, live, "--json"))["workers"]
+        assert len(data["problems"]) == 1 and [f["worker"] for f in data["files"]] == [SNAP]
+
+    def test_a_problem_is_one_line(self):
+        workers = status_view.Workers("/d", True, (), ("/d/x.json broke\n  badly\n",))
+        rows = status_view._worker_lines(workers, 0.0)
+        assert rows == [("workers", "problem: /d/x.json broke badly")]
+
+    def test_a_group_writable_directory_is_a_problem_row_not_an_error(self, run, live):
+        write_worker(live, SNAP, [rec("snapshot", "tank/a")])
+        os.chmod(status_dir(live), 0o770)
+        try:
+            result = status(run, live)
+        finally:
+            os.chmod(status_dir(live), 0o750)
+        assert result.exit_code == 0
+        assert "workers:  problem: " in result.stdout and "writable by group or others" in result.stdout
+
+    def test_the_json_shape(self, run, live):
+        now = time.time()
+        write_worker(live, SEND, [
+            rec("send", "tank/a", "offsite", failures=3, error="refused", error_at=now - 120),
+            rec("send", "tank/b", "offsite"), rec("scrub", "tank/b"),
+        ], pid=LIVE_PID, started_at=now - 7200, updated_at=now - 30)
+        data = as_json(status(run, live, "--json"))
+        assert list(data["workers"]) == ["directory", "problems", "files"]
+        assert data["workers"]["directory"] == str(status_dir(live))
+        assert data["workers"]["problems"] == []
+        (entry,) = data["workers"]["files"]
+        assert list(entry) == ["worker", "stale", "stale_reason", "pid", "started_at", "updated_at",
+                               "records", "failing", "worst"]
+        assert entry["worker"] == SEND and entry["pid"] == LIVE_PID
+        assert entry["stale"] is False and entry["stale_reason"] is None
+        assert entry["records"] == 3 and entry["failing"] == 1
+        assert entry["started_at"] == iso(now - 7200) and entry["updated_at"] == iso(now - 30)
+        assert entry["worst"] == {
+            "kind": "send", "dataset": "tank/a", "destination": "offsite",
+            "consecutive_failures": 3, "last_error": "refused", "last_error_at": iso(now - 120)}
+
+    def test_null_fields_in_the_json(self, run, live):
+        write_worker(live, SNAP, [rec("snapshot", "tank/a")], pid=None, started_at=None, updated_at=None)
+        (entry,) = as_json(status(run, live, "--json"))["workers"]["files"]
+        assert entry["pid"] is None and entry["started_at"] is None and entry["updated_at"] is None
+        assert entry["worst"] is None
+
+    def test_the_existing_keys_are_untouched(self, run, live):
+        before = as_json(status(run, live, "--json"))
+        write_worker(live, SEND, [rec("send", "tank/a", "offsite", failures=9)])
+        after = as_json(status(run, live, "--json"))
+        assert {k: v for k, v in after.items() if k != "workers"} == before
+
+    def test_json_is_still_the_only_thing_on_stdout(self, run, live):
+        write_worker(live, SEND, [rec("send", "tank/a", "offsite", failures=9)])
+        result = status(run, live, "--json")
+        assert result.stderr == "" and result.stdout.endswith("}\n")
+        json.loads(result.stdout)
+
+    @pytest.mark.parametrize("args", [(), ("--json",)])
+    def test_exit_code_and_verdict_never_move(self, run, plain, db, live_daemon, args):
+        write_worker(db, SEND, [rec("send", "tank/a", "offsite", failures=50)])
+        assert status(run, db, *args).exit_code == 0                      # no daemon
+        live_daemon(db, applied=store_key(db))
+        result = status(run, db, *args)
+        assert result.exit_code == 0
+        if args:
+            assert as_json(result)["verdict"] == "in-sync"
+        else:
+            assert result.stdout.splitlines()[-1] == "status:   in sync"
+
+    def test_a_behind_daemon_is_still_exit_0_with_rows(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1))
+        write_worker(db, SEND, [rec("send", "tank/a", "offsite", failures=9)])
+        result = status(run, db)
+        assert result.exit_code == 0 and "workers:  " in result.stdout
+        assert as_json(status(run, db, "--json"))["verdict"] == "behind"
+        assert result.stdout.splitlines()[-1].startswith("status:   daemon on generation")
+
+    def test_wait_is_unaffected(self, run, plain, db, live_daemon):
+        write_worker(db, SEND, [rec("send", "tank/a", "offsite", failures=9)])
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), target=(sid, gen))
+        timeout = status(run, db, "--wait", "0")
+        assert timeout.exit_code == 75
+        assert "workers:  " in timeout.stdout                              # printed before the exit
+        assert as_json(status(run, db, "--json"))["verdict"] == "applying"
+
+    def test_wait_in_sync_is_0_with_rows(self, run, live):
+        write_worker(live, SEND, [rec("send", "tank/a", "offsite", failures=9)])
+        result = status(run, live, "--wait", "1")
+        assert result.exit_code == 0 and "workers:  " in result.stdout
+
+    def test_wait_rejected_is_still_1(self, run, plain, db, live_daemon):
+        write_worker(db, SEND, [rec("send", "tank/a", "offsite")])
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), rejected=(sid, gen))
+        assert status(run, db, "--wait", "1").exit_code == 1
+
+    def test_the_files_are_read_after_the_wait(self, run, plain, db, live_daemon, monkeypatch):
+        calls = []
+        real = status_view.collect_workers
+        monkeypatch.setattr(status_view, "collect_workers",
+                            lambda *a, **k: calls.append("workers") or real(*a, **k))
+        real_wait = status_view.wait_for
+        monkeypatch.setattr(status_view, "wait_for",
+                            lambda *a, **k: calls.append("wait") or real_wait(*a, **k))
+        live_daemon(db, applied=store_key(db))
+        status(run, db, "--wait", "1")
+        assert calls == ["wait", "workers"]
+
+    def test_a_reader_that_blows_up_is_a_problem_row_not_a_crash(self, run, live, monkeypatch):
+        make_dir(live)
+
+        def boom(*a, **k):
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(health, "read_status_dir", boom)
+        result = status(run, live)
+        assert result.exit_code == 0
+        assert "workers:  problem: " in result.stdout and "kaboom" in result.stdout
+
+    def test_status_writes_nothing_into_the_status_directory(self, run, live):
+        path = write_worker(live, SEND, [rec("send", "tank/a", "offsite", failures=2)])
+        before = (path.read_bytes(), os.stat(path).st_mtime_ns, sorted(os.listdir(status_dir(live))))
+        status(run, live)
+        status(run, live, "--json")
+        assert (path.read_bytes(), os.stat(path).st_mtime_ns, sorted(os.listdir(status_dir(live)))) == before
+
+
+class TestWorkerStale:
+    def test_without_a_daemon_every_file_is_stale(self, run, plain, db):
+        write_worker(db, SEND, [rec("send", "tank/a", "offsite", failures=3, error="refused")])
+        result = status(run, db)
+        assert result.exit_code == 0
+        rows = rows_of(result)
+        assert re.fullmatch(rf"workers:  {SEND}: STALE \(no recent data\) {UPDATED}, 1 record, 1 failing", rows[0])
+        assert rows[1] == "            stale: no daemon is running, so this is the last state of a stopped one"
+        assert rows[2] == ("            last known worst: send tank/a -> offsite, "
+                           "3 failure(s) in a row: refused")
+        assert "worst:" not in "\n".join(r for r in rows if "last known worst" not in r)
+        assert result.stdout.splitlines()[-1] == "status:   no running daemon"
+
+    def test_json_without_a_daemon(self, run, plain, db):
+        write_worker(db, SEND, [rec("send", "tank/a", "offsite", failures=3)])
+        (entry,) = as_json(status(run, db, "--json"))["workers"]["files"]
+        assert entry["stale"] is True
+        assert entry["stale_reason"] == "no daemon is running, so this is the last state of a stopped one"
+        assert entry["worst"]["dataset"] == "tank/a"             # still reported, as the last known
+
+    def test_a_dead_writer_is_stale(self, run, live):
+        pid = dead_pid()
+        write_worker(live, SEND, [rec("send", "tank/a", "offsite", failures=3)], pid=pid)
+        write_worker(live, SNAP, [rec("snapshot", "tank/a")])
+        files = {f["worker"]: f for f in as_json(status(run, live, "--json"))["workers"]["files"]}
+        assert files[SEND]["stale"] is True and files[SEND]["stale_reason"] == f"its writer (pid {pid}) is gone"
+        assert files[SNAP]["stale"] is False and files[SNAP]["stale_reason"] is None
+        rows = rows_of(status(run, live))
+        assert f"workers:  {SEND}: STALE (no recent data) " in rows[0]
+        assert any(r == f"            stale: its writer (pid {pid}) is gone" for r in rows)
+        assert sum("STALE" in r for r in rows) == 1
+
+    def test_a_writer_whose_liveness_is_unknown_is_not_stale_by_that(self, run, live, monkeypatch):
+        monkeypatch.setattr(daemonlock, "pid_is_alive", lambda pid: None)
+        write_worker(live, SEND, [rec("send", "tank/a", "offsite")], pid=dead_pid())
+        (entry,) = as_json(status(run, live, "--json"))["workers"]["files"]
+        assert entry["stale"] is False
+
+    @pytest.mark.parametrize("hours, stale", [(23, False), (25, True)])
+    def test_status_uses_24_hours(self, run, live, hours, stale):
+        write_worker(live, SEND, [rec("send", "tank/a", "offsite")], updated_at=time.time() - hours * 3600)
+        (entry,) = as_json(status(run, live, "--json"))["workers"]["files"]
+        assert entry["stale"] is stale
+        if stale:
+            assert entry["stale_reason"] == "not updated for 1d1h (more than 1d)"
+
+    def test_a_missing_update_time_is_stale(self, run, live):
+        write_worker(live, SEND, [rec("send", "tank/a", "offsite")], updated_at=None)
+        (entry,) = as_json(status(run, live, "--json"))["workers"]["files"]
+        assert entry["stale"] is True and entry["stale_reason"] == "it records no update time"
+
+    def test_a_fresh_file_has_no_stale_row(self, run, live):
+        write_worker(live, SEND, [rec("send", "tank/a", "offsite", failures=2)])
+        text = status(run, live).stdout
+        assert "STALE" not in text and "stale:" not in text and "last known" not in text
+        assert "worst: send tank/a -> offsite" in text
+
+    def test_a_supervisor_gone_still_counts_as_a_daemon_for_staleness_of_the_lock(self, run, plain, db, live_daemon):
+        # the lock is held (a daemon exists as far as the file is concerned); only the pid decides
+        live_daemon(db, pid=dead_pid(), start="tok")
+        write_worker(db, SEND, [rec("send", "tank/a", "offsite")])
+        (entry,) = as_json(status(run, db, "--json"))["workers"]["files"]
+        assert entry["stale"] is False
+
+    def test_collect_workers_functions_directly(self, plain, db):
+        resolved = _resolved(db)
+        path = write_worker(db, SEND, [rec("send", "tank/a", "offsite")])
+        now = time.time()
+        assert status_view.collect_workers(resolved, daemon_running=True, now=now).stale == {}
+        assert list(status_view.collect_workers(resolved, daemon_running=False, now=now).stale) == [SEND]
+        assert status_view.collect_workers(resolved, daemon_running=None, now=now).stale == {}
+        later = status_view.collect_workers(resolved, daemon_running=True, now=now + 30 * 3600)
+        assert list(later.stale) == [SEND]
+        wide = status_view.collect_workers(resolved, daemon_running=True, now=now + 30 * 3600,
+                                           interval=10 * 3600)
+        assert wide.stale == {}                                           # 4 x 10h = 40h
+        assert path.exists()
+
+
+# --------------------------------------------------------------------------
+# draining for an upgrade (S-8: `draining=` / `draining_reason=` in the pid file)
+# --------------------------------------------------------------------------
+
+DRAIN_AT = 1_790_000_000
+DRAIN_WHY = "zfsbackup upgraded (1.0.0 -> 1.1.0); draining the remote worker, then the API worker, then exiting 76"
+UPGRADE_DEFERRED_WHY = "upgrade draining: applied after the daemon restarts, not re-checked"
+
+
+def after_restart_text(gen):
+    return (
+        f"daemon is draining for an upgrade and does not reload: generation {gen} "
+        "will be applied after the restart, not before"
+    )
+
+
+class TestDraining:
+    def drain_kw(self):
+        return dict(draining=DRAIN_AT, draining_reason=DRAIN_WHY)
+
+    # -- verdicts ----------------------------------------------------------
+
+    def test_draining_with_the_stored_key_ahead_and_no_deferral_is_behind_after_the_restart(
+        self, run, plain, db, live_daemon
+    ):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), **self.drain_kw())
+        assert verdict(run, db) == "behind"
+        msg = message(run, db)
+        assert msg == after_restart_text(gen)
+        assert "after the restart" in msg and "re-check" not in msg and "daemon log" not in msg
+
+    def test_draining_with_a_deferral_for_the_stored_key_is_deferred(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen),
+                    deferred_reason=UPGRADE_DEFERRED_WHY, **self.drain_kw())
+        assert verdict(run, db) == "deferred"
+        msg = message(run, db)
+        assert msg == after_restart_text(gen) and "re-checks every poll" not in msg
+
+    def test_draining_with_a_deferral_for_another_key_is_behind(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen - 1),
+                    deferred_reason=UPGRADE_DEFERRED_WHY, **self.drain_kw())
+        assert verdict(run, db) == "behind"
+
+    def test_draining_with_applied_equal_to_stored_is_in_sync(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db), **self.drain_kw())
+        assert verdict(run, db) == "in-sync"
+        assert message(run, db) == "in sync"
+
+    def test_draining_with_a_target_is_applying(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), target=(sid, gen), **self.drain_kw())
+        assert verdict(run, db) == "applying"
+
+    def test_draining_with_the_key_rejected_is_still_rejected(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), rejected=(sid, gen), **self.drain_kw())
+        assert verdict(run, db) == "rejected"
+
+    def test_not_draining_a_deferral_still_says_it_rechecks_every_poll(
+        self, run, plain, db, live_daemon
+    ):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen), deferred_reason=REASON)
+        assert message(run, db) == deferred_text(gen)
+        assert "after the restart" not in message(run, db)
+
+    def test_not_draining_behind_keeps_its_old_wording(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1))
+        assert SEE_LOG in message(run, db) and "after the restart" not in message(run, db)
+
+    # -- text ---------------------------------------------------------------
+
+    def test_the_text_has_a_draining_row_before_the_final_status_line(
+        self, run, plain, db, live_daemon
+    ):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), **self.drain_kw())
+        lines = status(run, db).stdout.splitlines()
+        assert lines[-1] == f"status:   {after_restart_text(gen)}"
+        row = lines[-2]
+        since = datetime_utc(DRAIN_AT)
+        assert row.startswith(f"draining: since {since} (") and row.endswith(f"): {DRAIN_WHY}")
+        assert re.search(r"\((\d+d) ago\)", row), row          # 2026 vs 2026-09: days ago
+
+    def test_the_row_is_absent_when_not_draining(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db))
+        assert "draining" not in status(run, db).stdout
+
+    def test_the_row_disappears_when_the_drain_ends(self, run, plain, db, live_daemon):
+        daemon = live_daemon(db, applied=store_key(db), **self.drain_kw())
+        assert "draining:" in status(run, db).stdout
+        daemon.set(draining=None, draining_reason=None)
+        assert "draining" not in status(run, db).stdout
+
+    def test_a_drain_without_a_reason_has_no_trailing_colon(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db), draining=DRAIN_AT)
+        row = [l for l in status(run, db).stdout.splitlines() if l.startswith("draining:")][0]
+        assert not row.endswith(":") and "): " not in row
+
+    def test_the_age_is_rendered_against_the_given_clock(self):
+        info = daemonlock.DaemonInfo(
+            pid=1, generation=0, start="t", applied=(1, 0), draining=DRAIN_AT, draining_reason="why")
+        st = status_view.Status(
+            "db", SimpleNamespace(store_id=1, generation=0), info, "in-sync", "in sync")
+        out = status_view.render_text(st, now=DRAIN_AT + 125)
+        assert f"draining: since {datetime_utc(DRAIN_AT)} (2m ago): why" in out
+        assert f"(7s ago)" in status_view.render_text(st, now=DRAIN_AT + 7)
+        assert "(0s ago)" in status_view.render_text(st, now=DRAIN_AT - 50)       # never negative
+
+    # -- JSON ---------------------------------------------------------------
+
+    def test_json_has_the_two_keys_only_while_draining(self, run, plain, db, live_daemon):
+        daemon = live_daemon(db, applied=store_key(db), **self.drain_kw())
+        doc = as_json(status(run, db, "--json"))["daemon"]
+        assert doc["draining"] == DRAIN_AT and isinstance(doc["draining"], int)
+        assert doc["draining_reason"] == DRAIN_WHY
+        daemon.set(draining=None, draining_reason=None)
+        doc = as_json(status(run, db, "--json"))["daemon"]
+        assert "draining" not in doc and "draining_reason" not in doc
+
+    def test_json_reason_is_null_when_absent(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db), draining=DRAIN_AT)
+        doc = as_json(status(run, db, "--json"))["daemon"]
+        assert doc["draining"] == DRAIN_AT and doc["draining_reason"] is None
+
+    def test_the_existing_exact_shape_is_unchanged_when_not_draining(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db))
+        assert set(as_json(status(run, db, "--json"))["daemon"]) == {
+            "pid", "reload_capable", "supervisor_alive", "generation", "applied", "target",
+            "rejected", "deferred", "deferred_reason",
+        }
+
+    # -- --wait ---------------------------------------------------------------
+
+    def test_wait_under_a_drain_is_75_with_the_restart_explanation(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), **self.drain_kw())
+        started = time.monotonic()
+        result = status(run, db, "--wait", "0.6")
+        assert result.exit_code == 75, (result.stdout, result.stderr)
+        assert time.monotonic() - started >= 0.5
+        assert "after the restart" in result.stderr
+        assert "see the daemon log" not in result.stderr and "daemon log" not in result.stderr
+        assert result.stderr.startswith(
+            f"error: the daemon is not yet in sync after 0.6s: {after_restart_text(gen)}"
+        )
+
+    def test_wait_under_a_drain_with_a_deferral_is_75_never_1(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen),
+                    deferred_reason=UPGRADE_DEFERRED_WHY, **self.drain_kw())
+        result = status(run, db, "--wait", "0.4")
+        assert result.exit_code == 75
+        assert "after the restart" in result.stderr and "daemon log" not in result.stderr
+
+    def test_wait_under_a_drain_with_json_is_75_too(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), **self.drain_kw())
+        result = status(run, db, "--wait", "0.3", "--json")
+        assert result.exit_code == 75
+        assert as_json(result)["verdict"] == "behind"
+
+    def test_wait_under_a_drain_in_sync_is_0(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db), **self.drain_kw())
+        assert status(run, db, "--wait", "5").exit_code == 0
+
+    def test_the_wait_exit_code_for_a_draining_behind_daemon_is_75_not_1(self):
+        modern = daemonlock.DaemonInfo(pid=1, generation=0, start="t", draining=DRAIN_AT)
+        got = status_view.wait_exit_code(status_view.Status("db", None, modern, "behind", "m"))
+        assert got == 75
+
+    def test_a_plain_behind_wait_still_points_at_the_daemon_log(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1))
+        result = status(run, db, "--wait", "0.3")
+        assert result.exit_code == 75 and "daemon log" in result.stderr
+
+
+def datetime_utc(ts):
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

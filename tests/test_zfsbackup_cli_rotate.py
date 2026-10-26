@@ -1121,3 +1121,52 @@ class TestProtocolAfterAcceptedRotation:
         assert result.exit_code == 1
         assert "S3CR3T" not in everything(result)
         assert "PRIVATE KEY" not in everything(result)
+
+
+# --------------------------------------------------------------------------
+# S-7b: a 429 or a busy 503 with Retry-After is `busy` (exit 75), not `refused`
+# --------------------------------------------------------------------------
+
+
+class TestRetryAfter:
+    @pytest.mark.parametrize("path", ["/rotate", "/whoami"])
+    def test_a_429_is_busy_and_names_the_wait(self, run, one, path):
+        one.srv.on(path, Reply(429, {"error": "slow", "reason": "rate_limited"},
+                               headers={"Retry-After": "900"}))
+        before = pair_bytes(one.db)
+        result = rotate(run, one.db)
+        assert result.exit_code == 75, result.stderr
+        assert table_rows(result) == {"offsite": "busy"}
+        assert "wait about 15 minutes and try again" in result.stdout
+        assert "(Retry-After: 900s)" in result.stdout
+        assert pair_bytes(one.db) == before and len(next_files(one.db)) == 2
+        assert "NOTHING was swapped" in result.stderr
+
+    def test_a_429_without_the_header_says_wait_a_little(self, run, one):
+        one.srv.on("/rotate", Reply(429, {}))
+        result = rotate(run, one.db)
+        assert result.exit_code == 75
+        assert table_rows(result) == {"offsite": "busy"}
+        assert "wait a little and try again" in result.stdout and "Retry-After" not in result.stdout
+
+    def test_a_429_beside_an_accepting_server_is_75_and_the_rerun_completes(self, run, two):
+        two.b.on("/rotate", Reply(429, {}, headers={"Retry-After": "30"}), then=None)
+        first = rotate(run, two.db)
+        assert first.exit_code == 75, first.stderr
+        assert table_rows(first) == {"offsite": "rotated", "second": "busy"}
+        assert "wait about 30 seconds" in first.stdout
+        second = rotate(run, two.db)
+        assert second.exit_code == 0, second.stderr
+        assert table_rows(second) == {"offsite": "already", "second": "rotated"}
+
+    def test_a_busy_503_with_retry_after_names_the_wait(self, run, one):
+        one.srv.on("/rotate", Reply(503, {"retry": True, "error": "busy"}, headers={"Retry-After": "2"}))
+        result = rotate(run, one.db)
+        assert result.exit_code == 75
+        assert table_rows(result) == {"offsite": "busy"}
+        assert "wait about 2 seconds and retry" in result.stdout
+
+    def test_a_busy_503_without_it_keeps_the_old_wording(self, run, one):
+        one.srv.on("/rotate", Reply(503, {"retry": True, "error": "busy"}))
+        result = rotate(run, one.db)
+        assert result.exit_code == 75 and "retry in a moment" in result.stdout

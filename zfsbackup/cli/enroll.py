@@ -69,7 +69,9 @@ import re
 import ssl
 import stat
 import sys
+import time
 from dataclasses import dataclass
+from datetime import timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -150,6 +152,55 @@ class _TransportError(Exception):
 class _Reply:
     status: int
     body: Dict[str, Any]
+    #: Whole seconds the server asked us to wait (`Retry-After`, else the body's
+    #: `retry_after`), or `None`. Clamped to `_MAX_RETRY_AFTER`.
+    retry_after: Optional[int] = None
+
+
+#: A `Retry-After` beyond a day is not believed (and not shown as such).
+_MAX_RETRY_AFTER = 86400
+
+
+def _parse_retry_after(header: Any, body: Dict[str, Any]) -> Optional[int]:
+    """`Retry-After` (delta-seconds or an HTTP date), else the body's
+    `retry_after`, as whole seconds in `[0, _MAX_RETRY_AFTER]`; `None` if neither
+    says. Server-supplied: nothing here raises."""
+    seconds: Optional[float] = None
+    if isinstance(header, str) and header.strip():
+        text = header.strip()
+        if text.isascii() and text.isdigit() and len(text) <= 9:
+            seconds = float(text)
+        else:
+            try:
+                from email.utils import parsedate_to_datetime
+
+                when = parsedate_to_datetime(text)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                seconds = when.timestamp() - time.time()
+            except (TypeError, ValueError, IndexError, OverflowError):
+                seconds = None
+    if seconds is None:
+        value = body.get("retry_after")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value:
+            seconds = float(value)
+    if seconds is None:
+        return None
+    return int(min(max(seconds, 0.0), float(_MAX_RETRY_AFTER)))
+
+
+def _wait_phrase(seconds: Optional[int]) -> str:
+    """"wait about 15 minutes" / "wait about 2 seconds" / "wait a little"."""
+    if seconds is None:
+        return "wait a little"
+    if seconds < 90:
+        n = max(seconds, 1)
+        return f"wait about {n} second{'s' if n != 1 else ''}"
+    if seconds < 5400:
+        minutes = (seconds + 30) // 60
+        return f"wait about {minutes} minutes"
+    hours = (seconds + 1800) // 3600
+    return f"wait about {hours} hour{'s' if hours != 1 else ''}"
 
 
 def _clean(text: Any, *secrets: str) -> str:
@@ -318,7 +369,11 @@ class _Server:
                 data = response.json() if response.content else {}
             except ValueError:
                 data = {}
-            return _Reply(response.status_code, data if isinstance(data, dict) else {})
+            body = data if isinstance(data, dict) else {}
+            return _Reply(
+                response.status_code, body,
+                _parse_retry_after(response.headers.get("Retry-After"), body),
+            )
         finally:
             response.close()
 
@@ -400,9 +455,22 @@ def _generic_failure(reply: _Reply, url: str, what: str, *secrets: str) -> CliEr
     suffix = f": {text}" if text else ""
     if status == 426 and reason == PROTOCOL_REFUSAL_REASON:
         return _protocol_mismatch(url, reply.body.get("protocol"))
+    if status == 429:
+        # The server locked this address out after repeated failed enrollments
+        # (reason `rate_limited`): retrying before the lockout ends cannot
+        # succeed, so say how long to wait.
+        return _Retry(
+            f"{url} is refusing requests from this host for now (HTTP 429"
+            + (", too many failed enrollments" if reason == "rate_limited" else "")
+            + f"); {_wait_phrase(reply.retry_after)} and try again"
+            + ("" if reply.retry_after is None else f" (Retry-After: {reply.retry_after}s)"),
+            "busy",
+        )
     if status == 503:
         if reply.body.get("retry"):
-            return _Retry(f"{url} is busy (HTTP 503){suffix}; retry in a moment", "busy")
+            when = ("retry in a moment" if reply.retry_after is None
+                    else f"{_wait_phrase(reply.retry_after)} and retry")
+            return _Retry(f"{url} is busy (HTTP 503){suffix}; {when}", "busy")
         if reason == "dry_run":
             return CliError(f"{url} is a dry-run server and does not accept {what}{suffix}")
         return CliError(f"{url} cannot do {what} right now (HTTP 503){suffix}")

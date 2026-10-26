@@ -27,6 +27,8 @@ from unittest.mock import MagicMock, PropertyMock
 import pytest
 from simple_websocket import ConnectionClosed
 
+from _stream_support import DONE, HEADER, get_value_answers, stream_script
+from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
 from _api_support import Authed, CLIENT_ID, buffered_client, enroll_body, make_client_cert, rotate_body
 from _tls_support import pin_client
 from test_zfsbackup_daemon_closeout import SUPERVISOR, Parent
@@ -305,7 +307,11 @@ def stored_config(mocker):
     (plan B-1b) and is refused without one. Never a real `zfs get`."""
     return mocker.patch(
         "zfsbackup.api.zfs.get.value",
-        return_value=canonical_dataset_config(DatasetConfig(name="pool/data").to_property()),
+        side_effect=get_value_answers({
+            PROP_CONFIG: canonical_dataset_config(DatasetConfig(name="pool/data").to_property()),
+            PROP_CLIENT_ID: CLIENT_ID,          # B-2c: a LOCAL client id, this client's
+            "type": "filesystem",               # B-2a: compared with the stream's type
+        }),
     )
 
 
@@ -393,14 +399,16 @@ class TestGateInTheApp:
         seen = []
         ws = MagicMock()
 
+        script = iter([HEADER, DONE])
+
         def receive(timeout=None):
             seen.append(gate.active)
-            return json.dumps({"done": True})
+            return next(script)
 
         ws.receive.side_effect = receive
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             self._handler(authed)(ws, "client1", "pool/data")
-        assert seen == [1]
+        assert seen == [1, 1]               # the header read and the data loop: registered throughout
         assert gate.active == 0
 
     def test_a_stream_begun_before_draining_runs_to_completion(self, authed, mocker):
@@ -411,9 +419,11 @@ class TestGateInTheApp:
         mocker.patch("zfsbackup.api.zfs.set")
         ws = MagicMock()
 
+        script = iter([HEADER, DONE])
+
         def receive(timeout=None):
             gate.start_draining()             # the worker decided to leave mid-transfer
-            return json.dumps({"done": True})
+            return next(script)
 
         ws.receive.side_effect = receive
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
@@ -445,7 +455,7 @@ class TestGateInTheApp:
                 "cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an "
                 "encrypted filesystem or overwrite an unencrypted one with an encrypted one"
             )
-            ws.receive.side_effect = [b"x", json.dumps({"done": True})]
+            ws.receive.side_effect = stream_script(b"x")
         elif arrange == "send-raises":
             # A refusal that cannot be sent escapes the handler; the gate still releases.
             source_props.return_value = {"org.zfsbackup:source_dataset": "tank/data"}
@@ -457,9 +467,9 @@ class TestGateInTheApp:
             ws.receive.side_effect = ConnectionClosed(None, None)
         elif arrange == "write-error":
             writer.write.side_effect = IOError("disk full")
-            ws.receive.side_effect = [b"chunk"]
+            ws.receive.side_effect = [HEADER]
         else:
-            ws.receive.side_effect = [b"x", json.dumps({"done": True})]
+            ws.receive.side_effect = stream_script(b"x")
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             if expect_raise:
                 with pytest.raises(RuntimeError):
@@ -513,19 +523,30 @@ class TestGateOnProtocolRefusals:
         receive = mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         row = MagicMock()
         row.__getitem__ = MagicMock(return_value="1-token")
-        lister = mocker.patch("zfsbackup.api.zfs.list", return_value=[row])
+        # Two listings are made: the resume token (one row) and, under the claim, the server's snapshots
+        # (B-2b: none, so `-F` is harmless and the refusal under test is the one reached).
+        token_lookup = MagicMock(return_value=[row])
+
+        def listing(*args, **kwargs):
+            if kwargs.get("types") == "snapshot":
+                return []
+            return token_lookup(*args, **kwargs)
+
+        mocker.patch("zfsbackup.api.zfs.list", side_effect=listing)
         if arrange == "mismatch":
             source_props.return_value = {"org.zfsbackup:source_dataset": "tank/data"}
         elif arrange == "source-read-fails":
             source_props.side_effect = RuntimeError("zfs get failed")
         elif arrange == "token-lookup-fails":
-            lister.side_effect = RuntimeError("zfs list failed")
+            token_lookup.side_effect = RuntimeError("zfs list failed")
         elif arrange == "abort-fails":
             abort.side_effect = Exception("pool I/O is currently suspended")
         elif arrange == "receive-start-fails":
             receive.side_effect = Exception("cannot start")
         ws = MagicMock()
-        ws.receive.side_effect = ConnectionClosed(None, None)     # a regression must fail, not spin
+        # The header is read before the token lookup, the abort and the spawn (B-2a); a regression
+        # that reads on must fail, not spin.
+        ws.receive.side_effect = [HEADER, ConnectionClosed(None, None)]
         seen = []
         real_send = ws.send
         ws.send.side_effect = lambda m: seen.append(gate.active)
@@ -535,7 +556,10 @@ class TestGateOnProtocolRefusals:
         assert gate.active == 0
         if arrange not in ("receive-start-fails",):
             receive.assert_not_called()
-            ws.receive.assert_not_called()
+        if arrange in ("none", "mismatch", "source-read-fails"):
+            ws.receive.assert_not_called()                        # refused before the header
+        else:
+            assert ws.receive.call_count == 1                     # the header, and no data after it
         # Mode errors are refused before the gate; every later refusal holds it while answering.
         assert seen == ([0] if arrange == "none" else [1])
 
@@ -587,10 +611,10 @@ class TestServerReceiveTimeout:
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=MagicMock())
         ws = MagicMock()
-        ws.receive.side_effect = [b"a", json.dumps({"done": True})]
+        ws.receive.side_effect = stream_script(b"a")
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             self._handler(authed)(ws, "client1", "pool/data")
-        assert ws.receive.call_count == 2
+        assert ws.receive.call_count == 3                   # the header, the data, `done`
         for call in ws.receive.call_args_list:
             assert call.kwargs == {"timeout": WS_IDLE_TIMEOUT}
 
@@ -600,10 +624,10 @@ class TestServerReceiveTimeout:
         writer = MagicMock()
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
-        ws.receive.side_effect = [b"chunk", None]
+        ws.receive.side_effect = [HEADER, b"chunk", None]
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             self._handler(authed)(ws, "client1", "pool/data")
-        writer.write.assert_called_once_with(b"chunk")
+        assert [c.args[0] for c in writer.write.call_args_list] == [HEADER, b"chunk"]
         writer.close.assert_called_once()
         sent = json.loads(ws.send.call_args[0][0])
         assert "no data from the client" in sent["error"]
@@ -611,16 +635,30 @@ class TestServerReceiveTimeout:
         assert "status" not in sent
         assert gate.active == 0
 
-    def test_a_timeout_on_the_first_receive_also_closes_the_writer(self, authed, mocker):
+    def test_a_timeout_on_the_first_data_receive_also_closes_the_writer(self, authed, mocker):
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
         writer = MagicMock()
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
+        ws.receive.side_effect = [HEADER, None]
+        with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
+            self._handler(authed)(ws, "client1", "pool/data")
+        writer.write.assert_called_once_with(HEADER)         # only the header went in
+        writer.close.assert_called_once()
+        assert "no data from the client" in json.loads(ws.send.call_args[0][0])["error"]
+
+    def test_a_timeout_before_the_header_spawns_nothing_and_releases_the_gate(self, authed, mocker):
+        mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
+        receive = mocker.patch("zfsbackup.api.zfs.receive.filesystem")
+        ws = MagicMock()
         ws.receive.return_value = None
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             self._handler(authed)(ws, "client1", "pool/data")
-        writer.write.assert_not_called()
-        writer.close.assert_called_once()
+        receive.assert_not_called()
+        sent = json.loads(ws.send.call_args[0][0])
+        assert "no data from the client" in sent["error"] and str(WS_IDLE_TIMEOUT) in sent["error"]
+        assert "reason" not in sent and "retry" not in sent
+        assert authed.gate.active == 0
 
     def test_a_writer_close_failure_during_a_timeout_is_suppressed_and_still_reported(self, authed, mocker):
         mocker.patch("zfsbackup.api.zfs.exists", return_value=True)
@@ -628,7 +666,7 @@ class TestServerReceiveTimeout:
         writer.close.side_effect = Exception("receive exited 1")
         mocker.patch("zfsbackup.api.zfs.receive.filesystem", return_value=writer)
         ws = MagicMock()
-        ws.receive.return_value = None
+        ws.receive.side_effect = [HEADER, None]
         with authed.context(STREAM_PATH, query_string={"mode": "resume"}):
             self._handler(authed)(ws, "client1", "pool/data")       # must not raise
         assert "no data from the client" in json.loads(ws.send.call_args[0][0])["error"]
@@ -650,7 +688,7 @@ class TestDrainWaitsForTheAck:
         order = []
         in_send, let_go = threading.Event(), threading.Event()
         ws = MagicMock()
-        ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        ws.receive.side_effect = stream_script(b"chunk")
 
         def send(message):
             assert json.loads(message) == {"status": "ok"}
@@ -677,7 +715,7 @@ class TestDrainWaitsForTheAck:
             # The claim is already free: the client's next stream for the same dataset is
             # served (not 'busy') while the first one is still inside its ack.
             nxt = MagicMock()
-            nxt.receive.side_effect = [json.dumps({"done": True})]
+            nxt.receive.side_effect = stream_script()
             # (run from a thread of its own: the ack send of `ws` is parked in the first one)
             second_sent = []
 
@@ -1433,3 +1471,483 @@ class TestApiWorkerDrainsTrustWrites:
         assert seen["status"] == 200, "the enrollment begun before the reload was not cut off"
         assert env.finished_at >= seen["ended"]
         assert env.events == ["shutdown", "server_close"]
+
+
+# ---------------------------------------------------------------------------
+# Plan S-2: the session registry reaches the worker, and a stalled write cannot hold the drain
+# ---------------------------------------------------------------------------
+
+
+class TestApiWorkerWiresTheSessionRegistry:
+    def test_the_trust_poll_thread_gets_the_apps_registry(self, env, mocker):
+        seen = []
+        real = ApiWorker._start_trust_poll
+
+        def spy(self, logger, sessions=None):
+            seen.append((sessions, env.app.extensions.get("zfsbackup.sessions")))
+            return real(self, logger, sessions)
+
+        mocker.patch.object(ApiWorker, "_start_trust_poll", spy)
+        env.epoch.set(1)
+        outcome, code = run_worker(env, lambda e: None)
+        assert (outcome, code) == ("exit", 3)
+        (passed, published), = seen
+        assert passed is published and isinstance(passed, api_module.SessionRegistry)
+
+
+@pytest.mark.integration
+class TestStalledWriterDoesNotHoldTheDrain:
+    """A client that completes the handshake and then reads nothing blocks the server's pong
+    write; the route behind it never returns, so its gate slot was never released and a
+    reload's drain (`wait_idle(None)`) never ended. The stall bound frees it."""
+
+    def test_wait_idle_completes_once_the_stall_limit_cut_the_stream(
+        self, tls_config_db, tmp_path, mocker
+    ):
+        import threading
+
+        from _session_support import StreamRig, eventually, ping_flood
+
+        rig = StreamRig(tls_config_db, tmp_path, mocker, stall_limit=1.5, small_buffers=True)
+        stop = threading.Event()
+        try:
+            alice = rig.new_client("alice")
+            ws = rig.connect(alice, rcvbuf=4096)
+            rig.start_stream(ws)
+            session = rig.only_session()
+            ping_flood(ws, stop=stop)
+            assert eventually(
+                lambda: session.ws.sock._write_started is not None
+                and time.monotonic() - session.ws.sock._write_started > 0.3, 60
+            ), "the pong write never blocked"
+            rig.gate.start_draining()
+            assert rig.gate.active == 1
+            assert rig.gate.wait_idle(0.3) is False, "the drain must wait for the running stream"
+            assert rig.gate.wait_idle(30) is True, "a stalled write held the drain"
+            assert session.cut_reason is not None
+        finally:
+            stop.set()
+            rig.close()
+
+
+# ---------------------------------------------------------------------------
+# ApiWorker: no successor while a timed-out zfs child is still alive (S-14)
+# ---------------------------------------------------------------------------
+
+STUCK_START = "timed-out zfs process(es) to exit before"
+STUCK_END = "the timed-out zfs process(es) have exited"
+STUCK_ABORT = "stopped waiting for"
+
+
+@pytest.fixture
+def stuck(monkeypatch):
+    """libzfseasy's per-process registry of children that outlived a timeout, empty for the test and put back
+    after. `stuck.add()` registers a child that never exits until `stuck.release()` (the real `_register_stuck`,
+    so the worker's own `libzfseasy.stuck_children()` reads it for real)."""
+    from libzfseasy import zfs as zfs_module
+    from test_zfsbackup_api_timeouts import FakeChild
+
+    saved = list(zfs_module._stuck)
+    zfs_module._stuck.clear()
+
+    class Registry:
+        children = []
+
+        def add(self, label="zfs set"):
+            child = FakeChild()
+            child.pid = 424200 + len(self.children)
+            zfs_module._register_stuck(child, None, label)
+            self.children.append(child)
+            return child
+
+        def release(self):
+            for child in self.children:
+                child.code = 0
+
+    registry = Registry()
+    registry.children = []
+    # A worker that wrongly never leaves its wait must fail an assertion, not hang the run: the child "exits" after a
+    # while whatever the test does.
+    valve = threading.Timer(45, registry.release)
+    valve.daemon = True
+    valve.start()
+    yield registry
+    valve.cancel()
+    registry.release()
+    zfs_module._stuck[:] = saved
+
+
+def _wait_log(caplog, text, timeout=20.0):
+    assert wait_until(lambda: text in caplog.text, timeout), f"{text!r} never logged:\n{caplog.text}"
+
+
+def _count(caplog, text):
+    return sum(1 for r in caplog.records if text in r.getMessage())
+
+
+class TestApiWorkerWaitsForStuckChildren:
+    """`ApiWorker._wait_for_stuck_children`: every exit that lets a successor start waits until
+    `libzfseasy.stuck_children()` is empty, with the server still up (so callers keep getting a fast 503)."""
+
+    HOLD = 1.2          # more than two `STOP_POLL` slices: a worker that did not wait would be gone
+
+    def _hold_then_release(self, e, stuck, caplog, seen):
+        """Driver tail: let the wait run for `HOLD` seconds, note what the worker did meanwhile, free the child."""
+        _wait_log(caplog, STUCK_START)
+        time.sleep(self.HOLD)
+        seen["events_while_waiting"] = list(e.events)
+        seen["end_logged_while_waiting"] = STUCK_END in caplog.text
+        seen["released_at"] = time.monotonic()
+        stuck.release()
+
+    def test_a_reload_waits_for_the_stuck_child_then_exits_3(self, env, stuck, caplog):
+        child = stuck.add("zfs set")
+        env.epoch.set(1)
+        seen = {}
+        with caplog.at_level(logging.INFO):
+            outcome, code = run_worker(env, lambda e: self._hold_then_release(e, stuck, caplog, seen))
+        assert (outcome, code) == ("exit", 3)
+        assert seen["events_while_waiting"] == [], "the server was shut down while the wait ran"
+        assert seen["end_logged_while_waiting"] is False
+        assert env.finished_at >= seen["released_at"]
+        assert env.events == ["shutdown", "server_close"]
+        starts = [r.getMessage() for r in caplog.records if STUCK_START in r.getMessage()]
+        assert len(starts) == 1 and f"pid {child.pid} (zfs set)" in starts[0]
+        assert "waiting for 1 timed-out" in starts[0] and "before reloading" in starts[0]
+        assert _count(caplog, STUCK_END) == 1
+        assert _count(caplog, STUCK_ABORT) == 0
+        assert "exiting to switch configuration" in caplog.text
+
+    def test_several_stuck_children_are_all_named_and_all_waited_for(self, env, stuck, caplog):
+        first, second = stuck.add("zfs set"), stuck.add("zfs receive -A")
+        env.epoch.set(1)
+        seen = {}
+
+        def driver(e):
+            _wait_log(caplog, STUCK_START)
+            first.code = 0                                  # one gone, one still stuck
+            time.sleep(self.HOLD)
+            seen["ended"] = STUCK_END in caplog.text
+            second.code = 0
+
+        with caplog.at_level(logging.INFO):
+            assert run_worker(env, driver) == ("exit", 3)
+        assert seen["ended"] is False, "one gone child ended a wait for two"
+        (start,) = [r.getMessage() for r in caplog.records if STUCK_START in r.getMessage()]
+        assert "waiting for 2 timed-out" in start
+        assert f"pid {first.pid} (zfs set)" in start and f"pid {second.pid} (zfs receive -A)" in start
+        assert _count(caplog, STUCK_END) == 1
+
+    def test_the_upgrade_drain_waits_then_returns_cleanly(self, env, stuck, caplog):
+        from zfsbackup.workers import EPOCH_UPGRADE_DRAIN_API
+
+        stuck.add()
+        env.epoch.set(EPOCH_UPGRADE_DRAIN_API)
+        seen = {}
+        with caplog.at_level(logging.INFO):
+            outcome, code = run_worker(env, lambda e: self._hold_then_release(e, stuck, caplog, seen))
+        assert (outcome, code) == ("returned", None)
+        assert seen["events_while_waiting"] == [] and seen["end_logged_while_waiting"] is False
+        assert env.finished_at >= seen["released_at"]
+        starts = [r.getMessage() for r in caplog.records if STUCK_START in r.getMessage()]
+        assert len(starts) == 1 and "before upgrading" in starts[0]
+        assert _count(caplog, STUCK_END) == 1
+        assert "exiting so that the daemon can restart" in caplog.text
+
+    def test_an_identity_change_restart_waits_then_exits_1(self, env, stuck, caplog, mocker):
+        from zfsbackup.api import TrustGateway
+
+        stuck.add()
+        mocker.patch.object(
+            TrustGateway, "restart_reason", new_callable=PropertyMock, return_value="server identity changed"
+        )
+        seen = {}
+        with caplog.at_level(logging.INFO):
+            outcome, code = run_worker(env, lambda e: self._hold_then_release(e, stuck, caplog, seen))
+        assert (outcome, code) == ("exit", 1)
+        assert seen["events_while_waiting"] == [] and seen["end_logged_while_waiting"] is False
+        assert env.finished_at >= seen["released_at"]
+        (start,) = [r.getMessage() for r in caplog.records if STUCK_START in r.getMessage()]
+        assert "before restarting" in start
+        assert _count(caplog, STUCK_END) == 1
+        assert env.events == ["shutdown", "server_close"]
+
+    def test_a_dead_server_thread_waits_then_exits_1(self, env, stuck, caplog):
+        stuck.add()
+        env.server_kwargs = {"serve_error": RuntimeError("serve failed")}
+        seen = {}
+        with caplog.at_level(logging.INFO):
+            outcome, code = run_worker(env, lambda e: self._hold_then_release(e, stuck, caplog, seen))
+        assert (outcome, code) == ("exit", 1)
+        assert seen["events_while_waiting"] == [], "the socket was closed under the wait"
+        assert seen["end_logged_while_waiting"] is False
+        assert env.finished_at >= seen["released_at"]
+        (start,) = [r.getMessage() for r in caplog.records if STUCK_START in r.getMessage()]
+        assert "before restarting" in start
+        assert _count(caplog, STUCK_END) == 1
+        assert env.events == ["server_close"]               # no shutdown() on a dead thread
+
+    # -- a stop during the wait ----------------------------------------------------------------------------
+
+    def test_a_stop_during_a_reload_wait_ends_it_promptly_and_exits_as_a_stop(self, env, stuck, caplog):
+        stuck.add()
+        env.epoch.set(1)
+        marks = {}
+
+        def driver(e):
+            _wait_log(caplog, STUCK_START)
+            time.sleep(0.6)
+            marks["stopped_at"] = time.monotonic()
+            e.stop.set()
+
+        with caplog.at_level(logging.INFO):
+            outcome, code = run_worker(env, driver)
+        assert (outcome, code) == ("returned", None)        # exit status 0, not the reload exit
+        assert env.finished_at - marks["stopped_at"] < 3.0
+        assert _count(caplog, STUCK_ABORT) == 1 and "timed-out zfs process(es) after" in caplog.text
+        assert ": stopping" in caplog.text
+        assert _count(caplog, STUCK_END) == 0
+        assert "API worker stopped" in caplog.text
+        assert "exiting to switch configuration" not in caplog.text
+        assert env.events == ["shutdown", "server_close"]
+
+    def test_a_stop_during_an_upgrade_wait_is_a_stop(self, env, stuck, caplog):
+        from zfsbackup.workers import EPOCH_UPGRADE_DRAIN_API
+
+        stuck.add()
+        env.epoch.set(EPOCH_UPGRADE_DRAIN_API)
+
+        def driver(e):
+            _wait_log(caplog, STUCK_START)
+            e.stop.set()
+
+        with caplog.at_level(logging.INFO):
+            assert run_worker(env, driver) == ("returned", None)
+        assert _count(caplog, STUCK_ABORT) == 1 and _count(caplog, STUCK_END) == 0
+        assert "API worker stopped" in caplog.text
+        assert "exiting so that the daemon can restart" not in caplog.text
+
+    def test_a_stop_during_a_restart_wait_is_a_stop_not_exit_1(self, env, stuck, caplog, mocker):
+        from zfsbackup.api import TrustGateway
+
+        stuck.add()
+        mocker.patch.object(TrustGateway, "restart_reason", new_callable=PropertyMock, return_value="identity")
+
+        def driver(e):
+            _wait_log(caplog, STUCK_START)
+            e.stop.set()
+
+        with caplog.at_level(logging.INFO):
+            outcome, code = run_worker(env, driver)
+        assert (outcome, code) == ("returned", None)
+        assert _count(caplog, STUCK_ABORT) == 1 and _count(caplog, STUCK_END) == 0
+        assert "API worker stopped" in caplog.text
+
+    def test_a_gone_supervisor_ends_the_wait_too(self, env, stuck, monkeypatch, caplog):
+        world = Parent(monkeypatch)
+        env.worker.supervisor_pid = SUPERVISOR
+        env.worker.supervisor_start = None
+        monkeypatch.setattr(workers.multiprocessing, "get_start_method", lambda allow_none=False: "spawn")
+        stuck.add()
+        env.epoch.set(1)
+        marks = {}
+
+        def driver(e):
+            _wait_log(caplog, STUCK_START)
+            time.sleep(0.6)
+            marks["gone_at"] = time.monotonic()
+            world.parent = 1
+
+        with caplog.at_level(logging.INFO):
+            outcome, code = run_worker(env, driver)
+        assert (outcome, code) == ("returned", None)         # became a stop, not a reload
+        assert env.finished_at - marks["gone_at"] < 3.0
+        assert "supervisor 4242 is gone" in caplog.text
+        assert _count(caplog, STUCK_ABORT) == 1 and _count(caplog, STUCK_END) == 0
+
+    @pytest.mark.parametrize("how", ["stop", "gone"])
+    def test_a_stop_or_gone_supervisor_never_starts_the_wait(self, env, stuck, monkeypatch, caplog, mocker, how):
+        """Nothing replaces a stopping worker, so there is nobody to overlap: no wait, no log line, and the
+        registry is not even consulted."""
+        import libzfseasy
+
+        stuck.add()
+        calls = mocker.patch.object(libzfseasy, "stuck_children", wraps=libzfseasy.stuck_children)
+        if how == "gone":
+            world = Parent(monkeypatch)
+            env.worker.supervisor_pid = SUPERVISOR
+            env.worker.supervisor_start = None
+            monkeypatch.setattr(workers.multiprocessing, "get_start_method", lambda allow_none=False: "spawn")
+
+        def driver(e):
+            e.wait_listening()
+            if how == "stop":
+                e.stop.set()
+            else:
+                world.parent = 1
+
+        with caplog.at_level(logging.INFO):
+            assert run_worker(env, driver) == ("returned", None)
+        assert env.elapsed < 10
+        assert "timed-out zfs" not in caplog.text
+        assert calls.call_count == 0
+        assert env.events == ["shutdown", "server_close"]
+
+    # -- nothing stuck / a broken registry ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "how, expected", [("reload", ("exit", 3)), ("upgrade", ("returned", None)), ("restart", ("exit", 1))]
+    )
+    def test_an_empty_registry_means_no_wait_and_no_log_line(self, env, stuck, caplog, mocker, how, expected):
+        from zfsbackup.api import TrustGateway
+        from zfsbackup.workers import EPOCH_UPGRADE_DRAIN_API
+
+        if how == "reload":
+            env.epoch.set(1)
+        elif how == "upgrade":
+            env.epoch.set(EPOCH_UPGRADE_DRAIN_API)
+        else:
+            mocker.patch.object(TrustGateway, "restart_reason", new_callable=PropertyMock, return_value="identity")
+        with caplog.at_level(logging.DEBUG):
+            outcome, code = run_worker(env, lambda e: None)
+        assert (outcome, code) == expected and env.elapsed < 10
+        assert "timed-out zfs" not in caplog.text and "stuck_children() failed" not in caplog.text
+        assert env.events == ["shutdown", "server_close"]
+
+    def test_a_child_that_exited_before_the_wait_is_swept_and_not_waited_for(self, env, stuck, caplog):
+        child = stuck.add()
+        child.code = 0                                       # gone already; stuck_children() drops it
+        env.epoch.set(1)
+        with caplog.at_level(logging.INFO):
+            assert run_worker(env, lambda e: None) == ("exit", 3)
+        assert "timed-out zfs" not in caplog.text
+
+    def test_a_raising_registry_at_the_start_does_not_hang_the_exit(self, env, caplog, mocker):
+        import libzfseasy
+
+        mocker.patch.object(libzfseasy, "stuck_children", side_effect=RuntimeError("registry broke"))
+        env.worker.log_level = logging.DEBUG       # the worker sets the root level itself
+        env.epoch.set(1)
+        with caplog.at_level(logging.DEBUG):
+            outcome, code = run_worker(env, lambda e: None)
+        assert (outcome, code) == ("exit", 3)
+        assert env.elapsed < 10
+        failed = [r for r in caplog.records if "stuck_children() failed" in r.getMessage()]
+        assert len(failed) == 1 and failed[0].levelno == logging.DEBUG and failed[0].exc_info
+        assert "timed-out zfs" not in caplog.text
+
+    def test_a_registry_that_breaks_mid_wait_ends_the_wait_without_an_end_line(self, env, stuck, caplog, mocker):
+        import libzfseasy
+
+        child = stuck.add()
+        real = libzfseasy.stuck_children
+        state = {"calls": 0}
+
+        def flaky():
+            state["calls"] += 1
+            if state["calls"] >= 3:
+                raise RuntimeError("registry broke")
+            return real()
+
+        mocker.patch.object(libzfseasy, "stuck_children", side_effect=flaky)
+        env.worker.log_level = logging.DEBUG       # the worker sets the root level itself
+        env.epoch.set(1)
+        with caplog.at_level(logging.DEBUG):
+            outcome, code = run_worker(env, lambda e: None)
+        assert (outcome, code) == ("exit", 3)
+        assert child.code is None, "the child is still stuck: the wait gave up because of the error"
+        assert env.elapsed < 10
+        assert _count(caplog, STUCK_START) == 1 and _count(caplog, STUCK_END) == 0
+        assert _count(caplog, "stuck_children() failed") == 1
+
+    # -- ordering and behaviour while waiting -------------------------------------------------------------------
+
+    def test_the_stuck_wait_begins_only_after_the_gate_is_idle(self, env, stuck, caplog, mocker):
+        import libzfseasy
+
+        stuck.add()
+        polled = mocker.patch.object(libzfseasy, "stuck_children", wraps=libzfseasy.stuck_children)
+        seen = {}
+
+        def driver(e):
+            e.wait_listening()
+            assert e.gate.begin()
+            e.epoch.set(1)
+            assert wait_until(lambda: e.gate.draining)
+            _wait_log(caplog, "waiting for 1 in-flight receive(s) to finish before reloading")
+            time.sleep(self.HOLD)
+            seen["polled_during_stream_wait"] = polled.call_count
+            seen["stuck_logged_during_stream_wait"] = STUCK_START in caplog.text
+            seen["gate_ended_at"] = time.time()
+            e.gate.end()
+            _wait_log(caplog, STUCK_START)
+            time.sleep(0.3)
+            stuck.release()
+
+        with caplog.at_level(logging.INFO):
+            assert run_worker(env, driver) == ("exit", 3)
+        assert seen["polled_during_stream_wait"] == 0, "the registry was consulted while a stream was in flight"
+        assert seen["stuck_logged_during_stream_wait"] is False
+        (start,) = [r for r in caplog.records if STUCK_START in r.getMessage()]
+        assert start.created >= seen["gate_ended_at"]
+        messages = [r.getMessage() for r in caplog.records]
+        assert (
+            messages.index(next(m for m in messages if "in-flight receive(s) to finish" in m))
+            < messages.index(start.getMessage())
+        )
+        assert _count(caplog, STUCK_END) == 1
+
+    def test_during_a_reload_wait_requests_get_the_fast_503_and_no_zfs_child_is_spawned(
+        self, env, stuck, caplog, mocker
+    ):
+        import libzfseasy
+
+        popen = mocker.patch("subprocess.Popen")
+        stuck.add()
+        env.epoch.set(1)
+        seen = {}
+
+        def driver(e):
+            _wait_log(caplog, STUCK_START)
+            client = e.client()
+            begun = time.monotonic()
+            seen["negotiate"] = client.post("/backup/client1/pool/data/negotiate", json=_negotiate_body())
+            seen["token"] = client.get("/backup/client1/pool/data/resume_token")
+            seen["health"] = client.get("/health").status_code
+            seen["elapsed"] = time.monotonic() - begun
+            with libzfseasy.timeout(5), pytest.raises(libzfseasy.ZFSTimeoutError, match="not started"):
+                libzfseasy.exists(libzfseasy.types.Filesystem("pool/x"))
+            seen["popen_calls"] = popen.call_count
+            stuck.release()
+
+        with caplog.at_level(logging.INFO):
+            assert run_worker(env, driver) == ("exit", 3)
+        for key in ("negotiate", "token"):
+            assert seen[key].status_code == 503 and seen[key].get_json()["retry"] is True, key
+        assert seen["negotiate"].get_json() == api_module.RELOADING_ERROR
+        assert seen["health"] == 200
+        assert seen["elapsed"] < 5
+        assert seen["popen_calls"] == 0 and popen.call_count == 0, "a zfs child was started during the wait"
+
+    def test_a_timed_request_is_refused_zfs_timeout_while_the_gate_is_open(self, env, stuck, caplog, mocker):
+        """The dead-thread exit does not close the gate (nothing is draining); the registry refuses the
+        handler's timed zfs call at once, so the reply is `zfs_timeout` and no child is started."""
+        popen = mocker.patch("subprocess.Popen")
+        stuck.add()
+        env.server_kwargs = {"serve_error": RuntimeError("serve failed")}
+        seen = {}
+
+        def driver(e):
+            _wait_log(caplog, STUCK_START)
+            begun = time.monotonic()
+            seen["negotiate"] = e.client().post("/backup/client1/pool/data/negotiate", json=_negotiate_body())
+            seen["elapsed"] = time.monotonic() - begun
+            seen["popen_calls"] = popen.call_count
+            stuck.release()
+
+        with caplog.at_level(logging.INFO):
+            assert run_worker(env, driver) == ("exit", 1)
+        assert seen["negotiate"].status_code == 503
+        assert seen["negotiate"].get_json() == api_module.ZFS_TIMEOUT_ERROR
+        assert seen["elapsed"] < 5
+        assert seen["popen_calls"] == 0 and popen.call_count == 0

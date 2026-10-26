@@ -41,13 +41,15 @@ the source when any doc disagrees with it.
   **at call time** (so runtime overrides and the test sudo-wrappers work). argv is always a list
   with `_zfs_cmd()`/`_zpool_cmd()` as element 0 — never `shell=True`, never `subprocess.run`.
 - **`Command` base — the exec helpers:**
-  - `_exec(cmd)` — run and drain/discard output (mutating commands).
-  - `_exec_out(cmd)` — generator yielding stripped stdout lines (`list`, `get`, `destroy`).
+  - `_exec_lines(cmd)` — the one exec core: bytes, surrogateescape, `\n`-only splitting, bounded
+    stderr (`_start_stderr_reader_lines`), and on interrupt TERM → KILL → abandon with a WARNING.
+  - `_exec(cmd)` — drains `_exec_lines` and discards output (mutating commands).
+  - `_exec_out(cmd)` — generator yielding the stripped, non-empty lines of `_exec_lines`.
   - `_exec_stream(cmd)` → `io.BufferedReader` for `send` (peeks 8 bytes, non-blocking
     `select.select` on stderr via `_exec_capture_bin`, guards against mocked processes).
   - `_exec_stream_in(cmd)` → `io.BufferedWriter` for `receive` (polls once for immediate failure).
-  - `_exec_capture` accumulates stderr and **raises a bare `Exception('\n'.join(errors))` on
-    non-zero return code**. This is the universal subprocess-error pattern.
+  - A non-zero return code **raises a bare `Exception`** built from the collected stderr
+    (`_failure_text`), after the last stdout line. This is the universal subprocess-error pattern.
 - **Argument mixins:** `PropertyCommand._get_props`, `StringListArgument`, `DatasetListArgument`,
   `ZFSListArgument`. Commands multiply-inherit these.
 - **Command pattern:** each `*Command` defines `__call__(self, *args, **kwargs)` delegating to a

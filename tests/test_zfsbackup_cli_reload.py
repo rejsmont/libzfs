@@ -118,11 +118,12 @@ def resolved(db):
 
 
 def info(*, pid=4321, generation=None, start="tok", applied=None, target=None, rejected=None,
-         deferred=None, deferred_reason=None):
+         deferred=None, deferred_reason=None, draining=None, draining_reason=None):
     return daemonlock.DaemonInfo(
         pid=pid, generation=generation, start=start,
         applied=applied, target=target, rejected=rejected,
         deferred=deferred, deferred_reason=deferred_reason,
+        draining=draining, draining_reason=draining_reason,
     )
 
 
@@ -3155,3 +3156,75 @@ class TestRotateReloadMatrix:
         result = run("identity", "rotate", *configured.args, "-c", configured.db)
         assert result.exit_code == 75, result.stderr
         assert configured.reloads == []
+
+
+class TestDrainingNotice:
+    """S-8: a daemon draining for an upgrade reloads nothing; it answers a SIGHUP with a
+    `deferred=` whose reason says so, and the CLI must not promise a re-check."""
+
+    KEY = (7, 5)
+    WHY = "upgrade draining: applied after the daemon restarts, not re-checked"
+    DRAIN = dict(draining=1_790_000_000, draining_reason="zfsbackup upgraded (1.0.0 -> 1.1.0)")
+
+    def notice(self, resolved, monkeypatch, daemon, wait=3.0):
+        reloaded(monkeypatch, "signalled")
+        Clock().install(monkeypatch)
+        probes(monkeypatch, daemon)
+        return cli_write._daemon_notice(resolved, 5, 7, wait)
+
+    def test_a_deferred_key_under_a_drain_says_it_waits_for_the_restart(self, resolved, monkeypatch):
+        line, warning = self.notice(
+            resolved, monkeypatch,
+            info(applied=(7, 4), deferred=self.KEY, deferred_reason=self.WHY, **self.DRAIN),
+        )
+        assert warning is None
+        assert line == (
+            "config updated (generation 5); reload requested from daemon pid 4321; the daemon is "
+            "draining for an upgrade and does not reload: generation 5 is applied after it "
+            "restarts, not by a re-check"
+        )
+        assert "draining for an upgrade" in line
+        assert "re-checks every poll" not in line
+
+    def test_a_later_deferred_generation_under_a_drain_names_that_generation(
+        self, resolved, monkeypatch
+    ):
+        line, warning = self.notice(
+            resolved, monkeypatch,
+            info(applied=(7, 4), deferred=(7, 6), deferred_reason=self.WHY, **self.DRAIN),
+        )
+        assert "generation 6 is applied after it restarts" in line
+        assert "re-checks every poll" not in line and warning is None
+
+    def test_without_a_drain_the_deferred_wording_is_unchanged(self, resolved, monkeypatch):
+        line, _ = self.notice(
+            resolved, monkeypatch, info(applied=(7, 4), deferred=self.KEY, deferred_reason="port busy"),
+        )
+        assert "it re-checks every poll (10 s)" in line and "draining" not in line
+
+    def test_an_applied_key_under_a_drain_is_still_applied(self, resolved, monkeypatch):
+        line, _ = self.notice(resolved, monkeypatch, info(applied=self.KEY, **self.DRAIN))
+        assert line.endswith("it is now on generation 5") and "draining" not in line
+
+    def test_a_rejection_under_a_drain_still_warns(self, resolved, monkeypatch):
+        _, warning = self.notice(
+            resolved, monkeypatch, info(applied=(7, 4), rejected=self.KEY, **self.DRAIN)
+        )
+        assert warning is not None and "rejected generation 5" in warning
+
+    def test_a_set_under_a_drain_prints_the_drain_notice_on_stdout_only(
+        self, run, rich, db, monkeypatch
+    ):
+        reloaded(monkeypatch, "signalled")
+        Clock().install(monkeypatch)
+        sid, gen = store_key(db)
+        probes(
+            monkeypatch,
+            info(applied=(sid, gen), deferred=(sid, gen + 1), deferred_reason=self.WHY, **self.DRAIN),
+        )
+        result = run("set", "check_interval", "10m", "-c", db)
+        assert result.exit_code == 0, result.stderr
+        last = result.stdout.splitlines()[-1]
+        assert "draining for an upgrade" in last and "re-checks every poll" not in last
+        assert f"generation {gen + 1} is applied after it restarts" in last
+        assert "warning" not in result.stderr

@@ -592,7 +592,7 @@ class TestNewWorkerHandsOverTheTrio:
         factory = mocker.patch(f"zfsbackup.daemon.{self.CLASSES[name]}")
         daemon._new_worker(name)
         (call,) = factory.call_args_list
-        assert call.args == (daemon.config, daemon._stop_event, daemon.verbose)
+        assert call.args == (daemon.config, daemon._stop_event, daemon.log_level)
         kw = call.kwargs
         assert kw["reload_epoch"] is daemon._reload_epoch
         assert isinstance(kw["reload_epoch"], ReloadEpoch)

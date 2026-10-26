@@ -22,7 +22,7 @@ Layout: `TestBodyShape`, `TestConfigShape`, `TestCanonicalDatasetConfig` (the fu
 in memory), `TestPendingMapBounds` (the cap and the lock), `TestServerCopy` (S6-d), then the R0 fixes:
 `TestPlaceholderOwnership` (D7 for an existing dataset without an owner, the atomic 409),
 `TestNegotiateClaim` (negotiate holds the name), `TestUnsettledAncestor`, `TestPendingTtl` and
-`TestConfigSizeLimit` (8 KiB).
+`TestConfigSizeLimit` (8 KiB), and B-2b: `TestServerNewer` (the server snapshots beyond the common one).
 """
 
 import base64
@@ -35,17 +35,24 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from _stream_support import get_value_answers, stream_script
 from _api_support import (
     CLIENT_ID, Authed, patch_api_clock, pending_api, pending_configs, pending_deadlines, pending_guard,
     streams_in_progress,
 )
 from test_zfsbackup_api import STREAM_PATH, Stream  # noqa: F401  (Stream: a harness, not a test)
+from zfsbackup import api as _zfs_api
 from zfsbackup.api import (
-    BAD_CONFIG_ERROR, CONFIG_TOO_LARGE_ERROR, BAD_PROPERTY_ERROR, SERVER_OWNED_PROPERTIES, canonical_dataset_config,
+    BAD_CONFIG_ERROR, CONFIG_TOO_LARGE_ERROR, BAD_PROPERTY_ERROR, SERVER_NEWER_MAX, SERVER_OWNED_PROPERTIES,
+    canonical_dataset_config,
     client_dataset_problem,
 )
 from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG, PROP_SOURCE_DATASET
 from zfsbackup.config import BackupConfig, DatasetConfig, RemoteServerConfig, RetentionRule
+
+#: The real `zfs.get.value`, captured before any test patches it: a test that drives the real
+#: command through a mocked `Popen` puts it back as the mock's `side_effect`.
+REAL_GET_VALUE = _zfs_api.zfs.get.value
 
 URL = f"/backup/{CLIENT_ID}/pool/data/negotiate"
 SERVER_DS = "pool/backups/client1/data"
@@ -78,12 +85,24 @@ def _config(**kwargs) -> BackupConfig:
     )
 
 
+class ZfsMocks(dict):
+    """The patched `zfs` calls by name; `.answers` is the `get.value` stand-in (`.answers.values`
+    the live table it answers from)."""
+    answers = None
+
+
 @pytest.fixture(autouse=True)
 def zfs(mocker):
-    mocks = {n: mocker.patch(f"zfsbackup.api.zfs.{n}") for n in ("exists", "list", "create", "set")}
+    mocks = ZfsMocks({n: mocker.patch(f"zfsbackup.api.zfs.{n}") for n in ("exists", "list", "create", "set")})
     mocks["exists"].return_value = False
     mocks["list"].return_value = []
     mocks["props"] = mocker.patch("zfsbackup.api.read_zfsbackup_properties", return_value={})
+    # `zfs get -o value` answers by property name: the LOCAL client id of an existing dataset
+    # (B-2c: every dataset negotiate or a receive made carries it) and its stored config (B-3-lite
+    # compares it). `values` is the live table; a test changes an entry to model another state.
+    answers = get_value_answers({PROP_CLIENT_ID: CLIENT_ID, PROP_CONFIG: None})
+    mocks["get_value"] = mocker.patch("zfsbackup.api.zfs.get.value", side_effect=answers)
+    mocks.answers = answers
     return mocks
 
 
@@ -492,18 +511,30 @@ class TestStoredValue:
         assert zfs["set"].call_count == 3
 
     def test_a_new_dataset_gets_its_parents_and_nothing_else(self, client, zfs):
-        """R0: only the parent chain (`-p`), never the leaf and never a `zfs set`."""
+        """R0: only the missing parents (one `zfs create` each, unmounted, stamped with the bound
+        client id: B-2c), never the leaf and never a `zfs set`."""
         order = []
         zfs["create"].side_effect = lambda *a, **k: order.append(("create", str(a[0]), k))
         zfs["set"].side_effect = lambda *a, **k: order.append(("set",))
         assert post_json(client, body_with()).status_code == 200
-        assert order == [("create", "pool/backups/client1", {"parents": True})]
+        assert order == [("create", "pool/backups/client1", CREATE_KWARGS)]
 
-    def test_a_top_level_dataset_creates_the_target_and_the_id_directory(self, client, zfs):
-        """`pool` -> `<target>/<id>`: its parent is the target, and `-p` makes the id directory."""
+    def test_a_top_level_dataset_creates_nothing_the_target_must_exist(self, client, zfs):
+        """`pool` -> `<target>/<id>` is the leaf itself: its parent is the target, which negotiate
+        never creates (no `-p` any more) and the first receive makes the leaf."""
         assert post_json(client, body_with(), url=f"/backup/{CLIENT_ID}/pool/negotiate").status_code == 200
-        assert str(zfs["create"].call_args[0][0]) == "pool/backups"
-        assert zfs["create"].call_args.kwargs == {"parents": True}
+        zfs["create"].assert_not_called()
+
+    def test_a_missing_target_fails_the_create_and_unclaims_the_pending_entry(self, client, authed, zfs):
+        """`zfs create` of `<target>/<id>` fails when the target is missing: a 500 with the zfs text
+        only in the log, nothing remembered for the stream, nothing left claimed."""
+        zfs["create"].side_effect = RuntimeError("cannot create 'pool/backups/client1': parent does not exist")
+        resp = negotiate(client)
+        assert resp.status_code == 500
+        assert resp.get_json() == {"error": f"Failed to record the configuration of {SERVER_DS}"}
+        assert "parent does not exist" not in resp.get_data(as_text=True)
+        assert dict(pending_configs(authed.app)) == {}
+        assert streams_in_progress(authed.app) == set() and authed.gate.active == 0
 
     def test_a_previously_stored_foreign_config_is_replaced(self, client, zfs):
         """An existing dataset whose recorded config is something else: the negotiate rewrites it."""
@@ -815,7 +846,7 @@ class TestPendingConfigs:
             "common_snapshot": None, "server_dataset": SERVER_DS, "server_copy": "none"}
         (call,) = zfs["create"].call_args_list
         assert str(call.args[0]) == "pool/backups/client1"       # the parent, never the leaf
-        assert call.kwargs == {"parents": True}
+        assert call.kwargs == CREATE_KWARGS
         zfs["set"].assert_not_called()
         zfs["list"].assert_not_called()                          # nothing to compare on a missing dataset
         assert dict(pending_configs(authed.app)) == {
@@ -823,15 +854,18 @@ class TestPendingConfigs:
 
     def test_the_leaf_is_never_created_for_any_depth(self, zfs):
         # a fresh app per name: a child's negotiate may be told to retry while an ancestor is pending
-        for dataset, parent in (("pool/a", "pool/backups/client1"),
-                                ("pool/a/b", "pool/backups/client1/a"),
-                                ("pool/a/b/c", "pool/backups/client1/a/b"),
-                                ("pool", "pool/backups")):
+        for dataset, created in (
+            ("pool/a", ["pool/backups/client1"]),
+            ("pool/a/b", ["pool/backups/client1", "pool/backups/client1/a"]),
+            ("pool/a/b/c", ["pool/backups/client1", "pool/backups/client1/a",
+                            "pool/backups/client1/a/b"]),
+            ("pool", []),               # the leaf is `<target>/<id>`: the target must exist
+        ):
             zfs["create"].reset_mock()
             assert negotiate(Authed(_config()).client(), dataset=dataset).status_code == 200
-            (call,) = zfs["create"].call_args_list
-            assert str(call.args[0]) == parent, dataset
-            assert call.kwargs == {"parents": True}
+            # outermost first, one level at a time, never the leaf itself
+            assert [str(c.args[0]) for c in zfs["create"].call_args_list] == created, dataset
+            assert all(c.kwargs == CREATE_KWARGS for c in zfs["create"].call_args_list)
 
     def test_an_existing_dataset_gets_its_three_properties_and_no_create(self, client, authed, zfs):
         zfs["exists"].return_value = True
@@ -950,7 +984,7 @@ class TestPendingMapBounds:
         s.run("fresh", dataset="pool/d0")
         assert "negotiate again" in s.sent[0]["error"]
         s.receive.assert_not_called()
-        s.ws.receive.side_effect = [b"chunk", json.dumps({"done": True})]
+        s.ws.receive.side_effect = stream_script(b"chunk")
         s.run("fresh", dataset="pool/d1")
         assert s.sent[-1] == {"status": "ok"}
 
@@ -1027,7 +1061,7 @@ ID_TREE = "pool/backups/client1"
 
 
 @pytest.fixture
-def server_props(mocker):
+def server_props(mocker, zfs):
     """`zfs get -o value` for `encryption` and `encryptionroot` of the server dataset; set
     `.encryption` / `.root` (None is zfs's `-`)."""
     holder = MagicMock()
@@ -1036,6 +1070,8 @@ def server_props(mocker):
     holder.calls = []
 
     def value(ds, prop, **kwargs):
+        if prop in (PROP_CLIENT_ID, PROP_CONFIG):       # the ownership check and B-3-lite: not under test
+            return zfs.answers(ds, prop, **kwargs)
         holder.calls.append((str(ds), prop, kwargs))
         if prop == "encryption":
             return holder.encryption
@@ -1048,8 +1084,16 @@ def server_props(mocker):
 
 
 def with_snapshots(zfs, *names):
+    """The server dataset exists and holds these snapshots, oldest first: a name (`createtxg` and
+    `guid` derived from it by `_snapshot_support`) or a `(name, txg, guid)` tuple."""
+    from _snapshot_support import listed_snapshot
+
     zfs["exists"].return_value = True
-    zfs["list"].return_value = [type("S", (), {"short": n})() for n in names]
+    zfs["list"].return_value = [
+        listed_snapshot(n, SERVER_DS) if isinstance(n, str)
+        else listed_snapshot(n[0], SERVER_DS, txg=n[1], guid=n[2])
+        for n in names
+    ]
 
 
 class TestServerCopy:
@@ -1088,7 +1132,7 @@ class TestServerCopy:
     def test_a_missing_dataset_is_none_and_nothing_is_read(self, client, zfs, server_props):
         resp = negotiate(client, snapshots=["a"])
         assert resp.get_json()["server_copy"] == "none"
-        server_props.mock.assert_not_called()
+        assert server_props.calls == []
 
     def test_an_existing_dataset_without_snapshots_is_none_and_nothing_is_read(
         self, client, zfs, server_props
@@ -1099,7 +1143,7 @@ class TestServerCopy:
         resp = negotiate(client, snapshots=["a"])
         assert resp.get_json() == {
             "common_snapshot": None, "server_dataset": SERVER_DS, "server_copy": "none"}
-        server_props.mock.assert_not_called()
+        assert server_props.calls == []
 
     def test_the_two_properties_are_read_for_the_server_dataset(self, client, zfs, server_props):
         with_snapshots(zfs, "a")
@@ -1141,7 +1185,15 @@ class TestServerCopy:
 
     def test_the_next_request_is_served_after_a_zfs_failure(self, client, zfs, server_props):
         with_snapshots(zfs, "a")
-        server_props.mock.side_effect = [RuntimeError("x"), "off"]
+        real = server_props.mock.side_effect
+        failures = [RuntimeError("x")]
+
+        def flaky(ds, prop, **kwargs):
+            if prop == "encryption" and failures:
+                raise failures.pop()
+            return real(ds, prop, **kwargs)
+
+        server_props.mock.side_effect = flaky
         assert negotiate(client, snapshots=["a"]).status_code == 500
         assert negotiate(client, snapshots=["a"]).get_json()["server_copy"] == "plain"
 
@@ -1165,20 +1217,27 @@ class TestServerCopy:
     def test_through_the_real_get_command(self, client, zfs, mock_subprocess):
         """Only `Popen` is mocked: the argv and the framing of the two reads."""
         with_snapshots(zfs, "a")
-        mock_subprocess.setup_multi((["aes-256-gcm\n"],), ([SERVER_DS + "\n"],))
+        zfs["get_value"].side_effect = REAL_GET_VALUE
+        mock_subprocess.setup_multi(
+            ([CLIENT_ID + "\n"],),             # the ownership check: the LOCAL client id
+            (["-\n"],),                        # B-3-lite: no stored config to compare
+            (["aes-256-gcm\n"],), ([SERVER_DS + "\n"],),
+        )
         resp = negotiate(client, snapshots=["a"])
         assert resp.get_json()["server_copy"] == "raw"
         argvs = [c[0][0][1:] for c in mock_subprocess.call_args_list]
-        assert argvs == [
+        assert argvs[2:] == [
             ["get", "-H", "-o", "value", "encryption", SERVER_DS],
             ["get", "-H", "-o", "value", "encryptionroot", SERVER_DS],
         ]
 
     def test_through_the_real_get_command_for_a_plain_copy(self, client, zfs, mock_subprocess):
         with_snapshots(zfs, "a")
-        mock_subprocess.setup_multi((["off\n"],))
+        zfs["get_value"].side_effect = REAL_GET_VALUE
+        mock_subprocess.setup_multi(([CLIENT_ID + "\n"],), (["-\n"],), (["off\n"],))
         assert negotiate(client, snapshots=["a"]).get_json()["server_copy"] == "plain"
-        assert len(mock_subprocess.call_args_list) == 1
+        argvs = [c[0][0][1:] for c in mock_subprocess.call_args_list]
+        assert len(argvs) == 3 and argvs[2] == ["get", "-H", "-o", "value", "encryption", SERVER_DS]
 
 
 # ---------------------------------------------------------------------------
@@ -1186,20 +1245,32 @@ class TestServerCopy:
 # ---------------------------------------------------------------------------
 
 BUSY = {"error": "busy", "retry": True}
+#: How negotiate creates each missing ancestor: never mounted, stamped with the bound client id
+#: (B-2c), no `-p`.
+CREATE_KWARGS = {"properties": {"canmount": "noauto", PROP_CLIENT_ID: CLIENT_ID}, "mount": False}
 OTHER_DS = "tank/data"          # maps to the same server dataset as pool/data
 PARENT_DS = "pool/backups/client1"
 
 
 @pytest.fixture
-def ancestors(mocker):
-    """`zfs.get.value` (the `receive_resume_token` of an ancestor): `.token` maps a dataset name to
-    its token (default: none)."""
+def ancestors(mocker, zfs):
+    """`zfs.get.value` of an ancestor: `.token` maps a dataset name to its `receive_resume_token`
+    (default: none); `.owner` maps one to its LOCAL client id (default: the requesting client's,
+    B-2c; `None` = not set locally); `.reads` lists every `(dataset, property)` asked."""
     holder = MagicMock()
     holder.token = {}
-    holder.mock = mocker.patch(
-        "zfsbackup.api.zfs.get.value",
-        side_effect=lambda ds, prop, **kw: holder.token.get(str(ds)),
-    )
+    holder.owner = {}
+    holder.reads = []
+
+    def value(ds, prop, **kw):
+        holder.reads.append((str(ds), prop))
+        if prop == PROP_CLIENT_ID:
+            return holder.owner.get(str(ds), CLIENT_ID)
+        if prop == "receive_resume_token":
+            return holder.token.get(str(ds))
+        return zfs.answers(ds, prop, **kw)
+
+    holder.mock = mocker.patch("zfsbackup.api.zfs.get.value", side_effect=value)
     return holder
 
 
@@ -1484,14 +1555,20 @@ class TestUnsettledAncestor:
         assert_nothing_written(zfs)
 
     def test_an_existing_ancestor_without_a_token_proceeds(self, client, zfs, ancestors):
+        existing(zfs, PARENT_DS, PARENT_DS + "/a")
+        assert ancestor_negotiate(client, "pool/a/b").status_code == 200
+        zfs["create"].assert_not_called()               # every ancestor exists: nothing to create
+
+    def test_a_missing_id_directory_above_an_existing_ancestor_is_created_alone(self, client, zfs, ancestors):
         existing(zfs, PARENT_DS + "/a")
         assert ancestor_negotiate(client, "pool/a/b").status_code == 200
-        assert str(zfs["create"].call_args.args[0]) == PARENT_DS + "/a"
+        assert [str(c.args[0]) for c in zfs["create"].call_args_list] == [PARENT_DS]
 
     def test_ancestors_that_do_not_exist_proceed(self, client, zfs, ancestors):
         existing(zfs)
         assert ancestor_negotiate(client, "pool/a/b/c").status_code == 200
-        assert str(zfs["create"].call_args.args[0]) == PARENT_DS + "/a/b"
+        assert [str(c.args[0]) for c in zfs["create"].call_args_list] == [      # outermost first
+            PARENT_DS, PARENT_DS + "/a", PARENT_DS + "/a/b"]
 
     def test_the_calls_are_exactly_the_ancestors_between_the_dataset_and_the_id_directory(
         self, client, zfs, ancestors
@@ -1500,9 +1577,11 @@ class TestUnsettledAncestor:
         assert ancestor_negotiate(client, "pool/a/b/c").status_code == 200
         assert [str(c.args[0]) for c in zfs["exists"].call_args_list] == [
             PARENT_DS + "/a/b/c", PARENT_DS + "/a/b", PARENT_DS + "/a", PARENT_DS]
-        assert [str(c.args[0]) for c in ancestors.mock.call_args_list] == [
-            PARENT_DS + "/a/b", PARENT_DS + "/a", PARENT_DS]        # the target itself is never read
-        assert {c.args[1] for c in ancestors.mock.call_args_list} == {"receive_resume_token"}
+        assert ancestors.reads == [                      # the target itself is never read
+            (PARENT_DS + "/a/b", PROP_CLIENT_ID), (PARENT_DS + "/a/b", "receive_resume_token"),
+            (PARENT_DS + "/a", PROP_CLIENT_ID), (PARENT_DS + "/a", "receive_resume_token"),
+            (PARENT_DS, PROP_CLIENT_ID), (PARENT_DS, "receive_resume_token"),
+        ]
 
     @pytest.mark.parametrize("dataset, extra_exists", [
         ("pool", 0),            # `<target>/<id>`: its parent is the target, which is not checked
@@ -1519,7 +1598,8 @@ class TestUnsettledAncestor:
         zfs["exists"].return_value = True
         assert ancestor_negotiate(client, "pool/a/b/c").status_code == 200
         assert {str(c.args[0]) for c in zfs["exists"].call_args_list} == {PARENT_DS + "/a/b/c"}
-        ancestors.mock.assert_not_called()
+        assert ancestors.reads == [                       # the ownership check, B-3-lite's read
+            (PARENT_DS + "/a/b/c", PROP_CLIENT_ID), (PARENT_DS + "/a/b/c", PROP_CONFIG)]
 
     def test_a_dry_run_skips_the_check(self, zfs, ancestors):
         dry = Authed(_config(dry_run=True))
@@ -1801,7 +1881,8 @@ class TestAncestorClaims:
         existing(zfs)
         seen = self.held_during_create(authed, zfs)
         assert ancestor_negotiate(client, "pool/a/b/c").status_code == 200
-        assert seen == [{PARENT_DS + "/a/b/c", PARENT_DS + "/a/b", PARENT_DS + "/a", PARENT_DS}]
+        everything = {PARENT_DS + "/a/b/c", PARENT_DS + "/a/b", PARENT_DS + "/a", PARENT_DS}
+        assert seen == [everything] * 3         # one create per missing ancestor, all claimed throughout
         assert streams_in_progress(authed.app) == set()
 
     def test_an_existing_ancestor_is_not_claimed(self, client, authed, zfs, ancestors):
@@ -1989,7 +2070,7 @@ class TestPartialAncestorRule:
     def test_a_token_and_a_snapshot_does_not_block(self, client, zfs, parent):
         self.snapshots(zfs, "autosnap_1")
         assert ancestor_negotiate(client, "pool/a/b").status_code == 200
-        assert str(zfs["create"].call_args.args[0]) == parent
+        assert [str(c.args[0]) for c in zfs["create"].call_args_list] == [PARENT_DS]    # only the id directory
 
     def test_no_token_does_not_block_and_nothing_is_listed(self, client, zfs, ancestors):
         existing(zfs, PARENT_DS + "/a")
@@ -2104,3 +2185,329 @@ class TestSizeRefusalWording:
         assert malformed.get_json() == {"error": BAD_CONFIG_ERROR}
         assert "8 KiB" in CONFIG_TOO_LARGE_ERROR
         assert CONFIG_TOO_LARGE_ERROR != BAD_CONFIG_ERROR
+
+
+# ---------------------------------------------------------------------------
+# B-2b: `server_newer` -- what the server holds beyond the common snapshot
+# ---------------------------------------------------------------------------
+
+
+class TestServerNewer:
+    """With a common snapshot, negotiate also names the server snapshots newer than it (by
+    `createtxg`, never by name), oldest first, guids as decimal strings, at most 64, with their
+    number in `server_newer_count`. The client uses them to refuse (or, for exactly one snapshot it
+    sent and lost, to allow) the `-F` rollback of server history. Additive: protocol 1."""
+
+    A, B, C, D = (f"autosnap_2026010{i}000000" for i in (1, 2, 3, 4))
+
+    @pytest.fixture(autouse=True)
+    def _props(self, server_props):
+        return server_props
+
+    def reply(self, client, zfs, server, offered, **kw):
+        with_snapshots(zfs, *server)
+        resp = negotiate(client, snapshots=offered, **kw)
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        return resp.get_json()
+
+    def test_nothing_newer_is_an_empty_list_and_a_zero_count(self, client, zfs):
+        body = self.reply(client, zfs, [self.A, self.B], [self.B, self.A])
+        assert body["common_snapshot"] == self.B
+        assert body["server_newer"] == [] and body["server_newer_count"] == 0
+
+    def test_newer_snapshots_are_listed_oldest_first_with_string_guids(self, client, zfs):
+        body = self.reply(client, zfs, [(self.A, 100, 11), (self.B, 200, 22), (self.C, 300, 33)],
+                          [self.A])
+        assert body["server_newer"] == [
+            {"name": self.B, "guid": "22"}, {"name": self.C, "guid": "33"},
+        ]
+        assert body["server_newer_count"] == 2
+        assert all(isinstance(e["guid"], str) for e in body["server_newer"])
+
+    def test_a_guid_above_two_to_the_fifty_third_survives_exactly(self, client, zfs):
+        big = 2 ** 64 - 1
+        body = self.reply(client, zfs, [(self.A, 1, 5), (self.B, 2, big)], [self.A])
+        assert body["server_newer"] == [{"name": self.B, "guid": "18446744073709551615"}]
+
+    def test_the_order_is_createtxg_not_the_name(self, client, zfs):
+        """B's name is older than C's but C was created first; the common snapshot is B (by name)."""
+        body = self.reply(client, zfs, [(self.A, 100, 1), (self.B, 300, 2), (self.C, 200, 3)],
+                          [self.A])
+        assert [e["name"] for e in body["server_newer"]] == [self.C, self.B]
+        # a name that sorts after the common one but was created BEFORE it is not newer
+        body = self.reply(client, zfs, [(self.A, 100, 1), (self.B, 300, 2), (self.C, 200, 3)],
+                          [self.B])
+        assert body["server_newer"] == [] and body["server_newer_count"] == 0
+
+    def test_newer_is_relative_to_the_common_snapshot_the_client_listing_picks(self, client, zfs):
+        """The client lists newest first; the first of its names the server holds is the common one."""
+        body = self.reply(client, zfs, [self.A, self.B, self.C, self.D],
+                          ["autosnap_29990101000000", self.B, self.A])
+        assert body["common_snapshot"] == self.B
+        assert [e["name"] for e in body["server_newer"]] == [self.C, self.D]
+
+    def test_the_list_is_capped_at_64_and_the_count_is_the_total(self, client, zfs):
+        names = [(f"autosnap_20260101{i:06d}", 100 + i, 1000 + i) for i in range(71)]
+        body = self.reply(client, zfs, names, [names[0][0]])
+        assert body["server_newer_count"] == 70
+        assert len(body["server_newer"]) == SERVER_NEWER_MAX == 64
+        assert [e["name"] for e in body["server_newer"]] == [n[0] for n in names[1:65]]   # the OLDEST 64
+
+    def test_exactly_at_the_cap(self, client, zfs):
+        names = [(f"autosnap_20260101{i:06d}", 100 + i, 1000 + i) for i in range(65)]
+        body = self.reply(client, zfs, names, [names[0][0]])
+        assert body["server_newer_count"] == len(body["server_newer"]) == 64
+
+    def test_no_common_snapshot_means_neither_key(self, client, zfs):
+        body = self.reply(client, zfs, [self.A, self.B], ["autosnap_29990101000000"])
+        assert body["common_snapshot"] is None
+        assert "server_newer" not in body and "server_newer_count" not in body
+        assert body["server_copy"] == "plain"
+
+    def test_a_missing_dataset_means_neither_key(self, client, zfs):
+        resp = negotiate(client, snapshots=[self.A])
+        assert resp.status_code == 200
+        assert "server_newer" not in resp.get_json() and "server_newer_count" not in resp.get_json()
+
+    def test_a_dataset_without_snapshots_means_neither_key(self, client, zfs):
+        body = self.reply(client, zfs, [], [self.A])
+        assert body == {"common_snapshot": None, "server_dataset": SERVER_DS, "server_copy": "none"}
+
+    def test_a_snapshot_without_a_guid_is_null(self, client, zfs):
+        from _snapshot_support import ABSENT, listed_snapshot
+        zfs["exists"].return_value = True
+        zfs["list"].return_value = [
+            listed_snapshot(self.A, SERVER_DS, txg=1, guid=5),
+            listed_snapshot(self.B, SERVER_DS, txg=2, guid=ABSENT),
+        ]
+        body = negotiate(client, snapshots=[self.A]).get_json()
+        assert body["server_newer"] == [{"name": self.B, "guid": None}]
+
+    def test_a_snapshot_without_createtxg_omits_the_list_and_warns(self, client, zfs, caplog):
+        """The server cannot say what is newer; the stream, which decides for itself, then fails
+        closed. The negotiate answer is otherwise intact."""
+        from _snapshot_support import ABSENT, listed_snapshot
+        zfs["exists"].return_value = True
+        zfs["list"].return_value = [
+            listed_snapshot(self.A, SERVER_DS, txg=1, guid=5),
+            listed_snapshot(self.B, SERVER_DS, txg=ABSENT, guid=6),
+        ]
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.api"):
+            resp = negotiate(client, snapshots=[self.A])
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["common_snapshot"] == self.A and body["server_copy"] == "plain"
+        assert "server_newer" not in body and "server_newer_count" not in body
+        assert body["server_newer_unknown"] is True
+        (rec,) = [r for r in caplog.records if r.levelno == logging.WARNING and "createtxg" in r.getMessage()]
+        assert SERVER_DS in rec.getMessage()
+
+    def test_one_listing_with_createtxg_and_guid_serves_common_and_newer(self, client, zfs):
+        self.reply(client, zfs, [self.A, self.B], [self.A])
+        (call,) = zfs["list"].call_args_list
+        assert call.kwargs["types"] == "snapshot"
+        assert call.kwargs["properties"] == ["createtxg", "guid"]
+        assert str(call.kwargs["roots"]) == SERVER_DS
+
+    def test_the_other_keys_are_unchanged(self, client, zfs):
+        body = self.reply(client, zfs, [self.A, self.B], [self.A])
+        assert set(body) == {"common_snapshot", "server_dataset", "server_copy",
+                             "server_newer", "server_newer_count"}
+        assert body["server_dataset"] == SERVER_DS
+
+    def test_a_listing_failure_is_still_the_500(self, client, zfs):
+        zfs["exists"].return_value = True
+        zfs["list"].side_effect = RuntimeError(SECRET)
+        resp = negotiate(client, snapshots=[self.A])
+        assert resp.status_code == 500
+        assert resp.get_json() == {"error": f"Failed to list server snapshots: {SECRET}"}
+
+    def test_a_dry_run_negotiates_the_same(self, mocker, zfs):
+        authed = Authed(_config(dry_run=True))
+        with_snapshots(zfs, (self.A, 1, 5), (self.B, 2, 6))
+        body = negotiate(authed.client(), snapshots=[self.A]).get_json()
+        assert body["server_newer"] == [{"name": self.B, "guid": "6"}]
+
+
+class TestServerNewerNeedsATrustedListing:
+    """`server_newer` is read from a strict listing. When libzfseasy had to skip a row, negotiate still
+    answers from the plain listing (as it always has) but omits `server_newer`; the stream refuses on its own."""
+
+    A, B = "autosnap_20260101000000", "autosnap_20260102000000"
+    UNTRUSTED = Exception("zfs list output could not be trusted: 1 row skipped, the first: expected 4 columns, got 2")
+
+    @pytest.fixture(autouse=True)
+    def _props(self, server_props):
+        return server_props
+
+    def rows(self):
+        from _snapshot_support import listed_snapshot
+        return [listed_snapshot(self.A, SERVER_DS, txg=1, guid=5), listed_snapshot(self.B, SERVER_DS, txg=2, guid=6)]
+
+    def arrange(self, zfs, strict_raises, plain_raises=None):
+        zfs["exists"].return_value = True
+        calls = []
+
+        def listing(*args, **kwargs):
+            calls.append(kwargs.get("strict", False))
+            if kwargs.get("strict"):
+                if strict_raises is not None:
+                    raise strict_raises
+            elif plain_raises is not None:
+                raise plain_raises
+            return self.rows()
+
+        zfs["list"].side_effect = listing
+        return calls
+
+    def test_a_trusted_listing_is_one_strict_call(self, client, zfs):
+        calls = self.arrange(zfs, None)
+        body = negotiate(client, snapshots=[self.A]).get_json()
+        assert calls == [True] and body["server_newer_count"] == 1
+
+    def test_an_untrusted_listing_falls_back_and_omits_server_newer(self, client, zfs, caplog):
+        calls = self.arrange(zfs, self.UNTRUSTED)
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.api"):
+            resp = negotiate(client, snapshots=[self.A])
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert calls == [True, False]
+        assert body["common_snapshot"] == self.A and body["server_copy"] == "plain"
+        assert "server_newer" not in body and "server_newer_count" not in body
+        assert body["server_newer_unknown"] is True
+        (rec,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert SERVER_DS in rec.getMessage() and "could not be trusted" in rec.getMessage()
+
+    def test_a_failure_of_zfs_itself_is_the_500_when_the_fallback_fails_too(self, client, zfs):
+        self.arrange(zfs, RuntimeError(SECRET), plain_raises=RuntimeError(SECRET))
+        resp = negotiate(client, snapshots=[self.A])
+        assert resp.status_code == 500
+        assert resp.get_json() == {"error": f"Failed to list server snapshots: {SECRET}"}
+
+    def test_the_gate_is_released_on_both_paths(self, client, authed, zfs):
+        self.arrange(zfs, self.UNTRUSTED)
+        negotiate(client, snapshots=[self.A])
+        assert authed.gate.active == 0
+        self.arrange(zfs, RuntimeError("x"), plain_raises=RuntimeError("x"))
+        negotiate(client, snapshots=[self.A])
+        assert authed.gate.active == 0
+
+
+class TestServerNewerUnknown:
+    """B-2b review fix: a common snapshot whose newer snapshots cannot be told is answered with
+    `"server_newer_unknown": true` and without `server_newer` / `server_newer_count`. Silence alone
+    would read as "a server that predates the fields", and the client must not settle its anchor on a
+    list it does not have. The marker is never `false`: it is absent whenever the list is trusted
+    (or there is no common snapshot to be newer than)."""
+
+    A, B = "autosnap_20260101000000", "autosnap_20260102000000"
+    UNTRUSTED = Exception("zfs list output could not be trusted: 1 row skipped, the first: expected 4 columns, got 2")
+    LIST_KEYS = ("server_newer", "server_newer_count")
+
+    @pytest.fixture(autouse=True)
+    def _props(self, server_props):
+        return server_props
+
+    def rows(self, *, txg_b=2):
+        from _snapshot_support import listed_snapshot
+        return [listed_snapshot(self.A, SERVER_DS, txg=1, guid=5),
+                listed_snapshot(self.B, SERVER_DS, txg=txg_b, guid=6)]
+
+    def untrusted(self, zfs, **rows_kw):
+        """The strict listing raises; the plain one returns the rows."""
+        zfs["exists"].return_value = True
+
+        def listing(*args, **kwargs):
+            if kwargs.get("strict"):
+                raise self.UNTRUSTED
+            return self.rows(**rows_kw)
+
+        zfs["list"].side_effect = listing
+
+    def no_createtxg(self, zfs):
+        from _snapshot_support import ABSENT
+        zfs["exists"].return_value = True
+        zfs["list"].return_value = self.rows(txg_b=ABSENT)
+
+    def assert_marked(self, body, common):
+        assert body["server_newer_unknown"] is True
+        assert not any(k in body for k in self.LIST_KEYS)
+        assert body["common_snapshot"] == common and body["server_copy"] == "plain"
+        assert body["server_dataset"] == SERVER_DS
+
+    def test_an_untrusted_listing_with_a_common_snapshot_is_marked(self, client, zfs):
+        self.untrusted(zfs)
+        resp = negotiate(client, snapshots=[self.A])
+        assert resp.status_code == 200
+        self.assert_marked(resp.get_json(), self.A)
+
+    def test_a_snapshot_without_createtxg_with_a_common_snapshot_is_marked(self, client, zfs):
+        self.no_createtxg(zfs)
+        resp = negotiate(client, snapshots=[self.A])
+        assert resp.status_code == 200
+        self.assert_marked(resp.get_json(), self.A)
+
+    def test_the_marker_is_the_json_literal_true(self, client, zfs):
+        self.untrusted(zfs)
+        raw = negotiate(client, snapshots=[self.A]).get_data(as_text=True)
+        assert '"server_newer_unknown":true' in raw.replace(" ", "")
+
+    def test_the_whole_reply_is_exactly_the_old_keys_plus_the_marker(self, client, zfs):
+        self.untrusted(zfs)
+        body = negotiate(client, snapshots=[self.A]).get_json()
+        assert set(body) == {"common_snapshot", "server_dataset", "server_copy", "server_newer_unknown"}
+
+    # -- never present when the list is trusted or there is nothing to be newer than --------------------------
+
+    def test_a_trusted_listing_has_no_marker(self, client, zfs):
+        zfs["exists"].return_value = True
+        zfs["list"].return_value = self.rows()
+        body = negotiate(client, snapshots=[self.A]).get_json()
+        assert "server_newer_unknown" not in body
+        assert body["server_newer"] == [{"name": self.B, "guid": "6"}] and body["server_newer_count"] == 1
+
+    def test_a_trusted_listing_with_nothing_newer_has_no_marker_either(self, client, zfs):
+        zfs["exists"].return_value = True
+        zfs["list"].return_value = self.rows()
+        body = negotiate(client, snapshots=[self.B]).get_json()
+        assert "server_newer_unknown" not in body
+        assert body["server_newer"] == [] and body["server_newer_count"] == 0
+
+    @pytest.mark.parametrize("cause", ["untrusted", "no_createtxg"])
+    def test_no_common_snapshot_has_no_marker_whatever_the_listing(self, client, zfs, cause):
+        getattr(self, cause)(zfs)
+        body = negotiate(client, snapshots=["autosnap_29990101000000"]).get_json()
+        assert body["common_snapshot"] is None
+        assert "server_newer_unknown" not in body
+        assert not any(k in body for k in self.LIST_KEYS)
+
+    def test_a_missing_dataset_has_no_marker(self, client, zfs):
+        resp = negotiate(client, snapshots=[self.A])
+        assert resp.status_code == 200
+        assert "server_newer_unknown" not in resp.get_json()
+
+    def test_a_dataset_without_snapshots_has_no_marker(self, client, zfs):
+        with_snapshots(zfs)
+        body = negotiate(client, snapshots=[self.A]).get_json()
+        assert body == {"common_snapshot": None, "server_dataset": SERVER_DS, "server_copy": "none"}
+
+    def test_a_failure_of_both_listings_is_the_500_without_a_marker(self, client, zfs):
+        zfs["exists"].return_value = True
+        zfs["list"].side_effect = RuntimeError(SECRET)
+        resp = negotiate(client, snapshots=[self.A])
+        assert resp.status_code == 500
+        assert "server_newer_unknown" not in resp.get_json()
+
+    def test_a_trusted_negotiate_after_an_untrusted_one_is_unmarked(self, client, zfs):
+        """No state is kept between requests."""
+        self.untrusted(zfs)
+        assert negotiate(client, snapshots=[self.A]).get_json()["server_newer_unknown"] is True
+        zfs["list"].side_effect = None
+        zfs["list"].return_value = self.rows()
+        body = negotiate(client, snapshots=[self.A]).get_json()
+        assert "server_newer_unknown" not in body and body["server_newer_count"] == 1
+
+    def test_a_dry_run_marks_the_same(self, mocker, zfs):
+        authed = Authed(_config(dry_run=True))
+        self.untrusted(zfs)
+        self.assert_marked(negotiate(authed.client(), snapshots=[self.A]).get_json(), self.A)

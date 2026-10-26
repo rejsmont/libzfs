@@ -1,5 +1,6 @@
 """Unit tests for BackupDaemon."""
 
+import logging
 import multiprocessing
 import signal
 import sqlite3
@@ -51,11 +52,11 @@ class TestBackupDaemonInit:
         # lacks the `.url()`/`.resolved_path` every real open needs --
         # would sneak back in unnoticed.
         assert daemon.resolved_config == sqlite_config_db
-        assert daemon.verbose is False
+        assert daemon.log_level == logging.INFO
 
-    def test_verbose_flag(self, sqlite_config_db, sample_backup_config):
-        daemon = BackupDaemon(sample_backup_config, sqlite_config_db, verbose=True)
-        assert daemon.verbose is True
+    def test_log_level_is_stored(self, sqlite_config_db, sample_backup_config):
+        daemon = BackupDaemon(sample_backup_config, sqlite_config_db, log_level=logging.DEBUG)
+        assert daemon.log_level == logging.DEBUG
 
     def test_stop_event_initially_clear(self, sqlite_config_db, sample_backup_config):
         daemon = BackupDaemon(sample_backup_config, sqlite_config_db)
@@ -1897,7 +1898,7 @@ class TestRunReadsOnceAndReportsTheGeneration:
         _daemon_module._run(_args(resolved.path, dry_run=True))
         assert seen == [True]
 
-    def test_the_daemon_is_given_verbose_and_the_resolved_database(self, bumped, mocker, lock_spy):
+    def test_the_daemon_is_given_the_log_level_and_the_resolved_database(self, bumped, mocker, lock_spy):
         resolved, generation = bumped
         factory, _ = _stub_daemon(mocker)
         _daemon_module._run(_args(resolved.path, verbose=True))
@@ -1908,13 +1909,19 @@ class TestRunReadsOnceAndReportsTheGeneration:
         notifier = kwargs.pop('notifier')
         assert isinstance(notifier, Notifier)       # a no-op one without $NOTIFY_SOCKET
         assert kwargs == {
-            'verbose': True,
+            'log_level': logging.DEBUG,
             'key': (read_config(resolved).store_id, generation),
             'presence_lock': lock_spy[0],
             'dry_run_override': False,
             'workers_lock': _daemonlock.workers_lock_path(resolved),
             'client_id': None,          # `host_identity` holds none yet (the snapshot's own)
+            # S-8: the signature of the code this PROCESS started with (taken by
+            # `_run_startup` before anything that can wait), not one the daemon reads itself.
+            'started_signature': kwargs['started_signature'],
         }
+        assert kwargs['started_signature'] is None or isinstance(
+            kwargs['started_signature'], _daemon_module.CodeSignature
+        )
 
     def test_dry_run_is_handed_on_so_a_reload_can_reapply_it(self, bumped, mocker, lock_spy):
         resolved, _ = bumped
@@ -1983,7 +1990,7 @@ class TestTestConfigReportsTheSchemaRevision:
 class TestWorkerConfigHandoff:
     """Every worker, at startup and at every crash restart, is constructed
     with the supervisor's own `BackupConfig` object, its stop flag and the
-    verbose flag -- `cls(self.config, self._stop_event, self.verbose)` -- and
+    numeric log level -- `cls(self.config, self._stop_event, self.log_level)` -- and
     nothing in the daemon reaches back to the database afterwards.
 
     Mutation-checked (scratch copy; failing tests in this file): `_new_worker`
@@ -1999,18 +2006,18 @@ class TestWorkerConfigHandoff:
         snapshot = load_runtime_config(literal_config_db)
         dispose_all()
         snapshot.config.dry_run = True
-        daemon = BackupDaemon(snapshot.config, literal_config_db, verbose=True)
+        daemon = BackupDaemon(snapshot.config, literal_config_db, log_level=logging.DEBUG)
         return daemon, snapshot
 
     @pytest.mark.parametrize('name', NAMES)
-    def test_new_worker_is_handed_the_supervisors_config_stop_flag_and_verbose(
+    def test_new_worker_is_handed_the_supervisors_config_stop_flag_and_log_level(
         self, supervisor, name
     ):
         daemon, snapshot = supervisor
         worker = daemon._new_worker(name)
         assert worker.config is snapshot.config
         assert worker.stop_event is daemon._stop_event
-        assert worker.verbose is True
+        assert worker.log_level == logging.DEBUG
 
     def test_all_four_workers_share_one_config_object(self, supervisor):
         daemon, _ = supervisor
@@ -2022,16 +2029,22 @@ class TestWorkerConfigHandoff:
         ('snapshot', 'SnapshotWorker'), ('pruning', 'PruningWorker'),
         ('api', 'ApiWorker'), ('remote', 'RemoteBackupWorker'),
     ])
-    def test_the_constructor_call_is_exactly_config_stop_verbose(
-        self, supervisor, mocker, name, cls
+    @pytest.mark.parametrize('guard', [True, False], ids=['guard-on', 'guard-off'])
+    def test_the_constructor_call_is_exactly_config_stop_log_level(
+        self, supervisor, mocker, name, cls, guard
     ):
         daemon, snapshot = supervisor
+        # Hermetic: whether this environment has an installed distribution is irrelevant.
+        daemon._code_signature = (
+            _daemon_module.CodeSignature('1.0.0', '/x/RECORD', (1, 2, 3)) if guard else None
+        )
         factory = mocker.patch(f'zfsbackup.daemon.{cls}')
         daemon._new_worker(name)
-        # Positional (config, stop flag, verbose) as before, plus the
+        # Positional (config, stop flag, log level) as before, plus the
         # keyword-only reload trio, plus (M9) what only that worker gets: the
         # API worker the config database (TLS identity and trust only), the
-        # remote worker the TLS directory and the Handoff's client id.
+        # remote worker the TLS directory and the Handoff's client id, plus
+        # (S-8) the supervisor's code signature when the version-skew guard is on.
         extra = {
             'api': {'config_db': daemon.resolved_config},
             'remote': {
@@ -2039,13 +2052,16 @@ class TestWorkerConfigHandoff:
                 'client_id': None,
             },
         }.get(name, {})
+        if guard:
+            extra = {**extra, 'code_signature': daemon._code_signature.as_tuple()}
         factory.assert_called_once_with(
-            snapshot.config, daemon._stop_event, True,
+            snapshot.config, daemon._stop_event, logging.DEBUG,
             reload_epoch=daemon._reload_epoch,
             born_epoch=daemon._reload_epoch.get(),
             workers_lock=daemon._workers_lock_path(),
             **extra,
         )
+        assert ('code_signature' in factory.call_args.kwargs) is guard
 
     def test_a_restart_is_constructed_from_the_same_config_object(self, supervisor, mocker):
         daemon, snapshot = supervisor
@@ -2055,9 +2071,9 @@ class TestWorkerConfigHandoff:
         configs = []
         real = _daemon_module.SnapshotWorker
 
-        def spy(config, stop, verbose, **kwargs):
+        def spy(config, stop, log_level, **kwargs):
             configs.append(config)
-            return real(config, stop, verbose, **kwargs)
+            return real(config, stop, log_level, **kwargs)
 
         mocker.patch('zfsbackup.daemon.SnapshotWorker', side_effect=spy)
         daemon._spawn('snapshot')
@@ -2164,8 +2180,8 @@ class TestWorkerConfigHandoff:
 def _bind_recording_worker(method, record_dir):
     """A `RecordingSnapshotWorker` factory with the `SnapshotWorker`
     constructor signature `BackupDaemon._new_worker` calls."""
-    def factory(config, stop_event, verbose, **kwargs):
-        worker = RecordingSnapshotWorker(config, stop_event, verbose, **kwargs)
+    def factory(config, stop_event, log_level, **kwargs):
+        worker = RecordingSnapshotWorker(config, stop_event, log_level, **kwargs)
         worker.start_method = method
         worker.record_dir = str(record_dir)
         return worker
@@ -2267,8 +2283,8 @@ def _bind_recording(cls, method, record_dir):
     """As `_bind_recording_worker`, for any recording double: the factory
     passes through the keyword-only arguments `_new_worker` adds for that
     worker (`config_db`; `tls_dir` and `client_id`)."""
-    def factory(config, stop_event, verbose, **kwargs):
-        worker = cls(config, stop_event, verbose, **kwargs)
+    def factory(config, stop_event, log_level, **kwargs):
+        worker = cls(config, stop_event, log_level, **kwargs)
         worker.start_method = method
         worker.record_dir = str(record_dir)
         return worker

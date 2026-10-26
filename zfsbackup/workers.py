@@ -27,6 +27,18 @@ Nothing that owns a SQLite handle may cross the process boundary -- never a
 `dispose_all()` before each fork so that no inherited descriptor exists
 either. A `BackupConfig` is plain dataclasses, safe on both counts.
 
+**Code-version skew (S-8).** `spawn` and `forkserver` import from disk, and
+the remote and API workers import `zfsbackup.remote` / `zfsbackup.api` lazily,
+so a worker started after an in-place upgrade runs new code under an old
+supervisor. The first thing `run()` does, before those imports, is compare
+`version.code_signature()` with the supervisor's (`code_signature=`); on a
+difference it exits `WORKER_EXIT_VERSION_SKEW`. The supervisor then reads the
+signature itself: a confirmed change starts a drain (`EPOCH_UPGRADE_DRAIN`: the
+remote and API workers leave at their next safe point, never mid-transfer, and
+are not respawned; snapshot and pruning keep running until the end) and the
+daemon exits 76 so that its service manager restarts it on the new code;
+otherwise the worker is simply restarted.
+
 A worker also never outlives its supervisor. The stop flag cannot say "the
 supervisor was `kill -9`'d" (nobody is left to raise it), so every worker
 watches for that itself and treats it as a stop; see `_SupervisorWatch`.
@@ -43,12 +55,13 @@ import time
 from abc import abstractmethod
 from multiprocessing import Process
 from multiprocessing.synchronize import Event
-from typing import List, Optional, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
-from zfsbackup import procident
-from zfsbackup.backup_manager import DatasetInfo, DatasetManager
+from zfsbackup import health, logsetup, procident
+from zfsbackup.backup_manager import DatasetInfo, DatasetManager, PruneResult
 from zfsbackup.config import BackupConfig
 from zfsbackup.stopflag import STOP_POLL, ReloadEpoch, StopFlag
+from zfsbackup.version import CodeSignature, code_signature
 
 #: What a worker accepts as its stop signal.
 #:
@@ -75,30 +88,78 @@ MIN_WORKER_INTERVAL = 1.0
 #: older than the current epoch; otherwise it is a crash.
 WORKER_EXIT_RELOAD = 3
 
+#: The value the supervisor writes to the shared `ReloadEpoch` to drain the
+#: remote worker for an upgrade (S-8), the first stage of a two-stage drain
+#: (see `EPOCH_UPGRADE_DRAIN_API`). No real epoch is negative;
+#: unlike a reload's change it means "leave at your next safe point and do not
+#: come back" (`ExitReason.UPGRADE`, exit 0) for the workers with
+#: `drains_for_upgrade`, and nothing at all for the others (snapshot, pruning),
+#: which keep running until the supervisor stops them.
+EPOCH_UPGRADE_DRAIN = -1
+
+#: The second stage of the drain: the remote worker has left, now the API
+#: worker may drain too (it keeps serving until then, so a remote worker stuck
+#: in an uninterruptible `zfs` call cannot leave the server refusing every
+#: client). The remote worker obeys -1 and -2, the API worker only -2.
+EPOCH_UPGRADE_DRAIN_API = -2
+
+#: Exit status of a worker that found, at its start, that the installed
+#: zfsbackup is no longer the one its supervisor started with (S-8: an in-place
+#: upgrade; `spawn`/`forkserver` import from disk, so it may be running new
+#: code under an old supervisor). Not a crash: the supervisor counts it toward
+#: no restart limit, does not respawn the worker, and starts the cooperative
+#: stop that ends in `version.EXIT_CODE_VERSION_CHANGED`.
+WORKER_EXIT_VERSION_SKEW = 4
+
 #: How long the API worker waits for in-flight receives on a STOP or a gone
 #: supervisor, before abandoning them (the sender resumes: `zfs receive -s`).
 #: Inside `BackupDaemon._shutdown_workers`' shared 30s budget.
 API_STOP_DRAIN = 20
 
 
+#: Maps C0 and C1 control characters (and DEL) to a visible backslash-x escape,
+#: for client-controlled text that goes into a log line.
+_CONTROL_CHAR_TABLE = {
+    **{c: f'\\x{c:02x}' for c in range(0x20)},
+    **{c: f'\\x{c:02x}' for c in range(0x7f, 0xa0)},
+}
+
+
+#: Longest client-controlled text (a request path, a bad request line) that
+#: goes into one log line. A request line can be 64 KiB, and journald cuts a
+#: stream at 48 KiB and reads a priority prefix at the start of each piece.
+MAX_LOGGED_REQUEST = 1024
+
+
+def _clip_for_log(text: str) -> str:
+    """`text` cut to `MAX_LOGGED_REQUEST` characters, with a marker that says
+    how many were dropped."""
+    if len(text) <= MAX_LOGGED_REQUEST:
+        return text
+    return f'{text[:MAX_LOGGED_REQUEST]}...({len(text) - MAX_LOGGED_REQUEST} more)'
+
+
 class ExitReason(enum.Enum):
     """Why a worker should leave its loop. Priority is the declaration order:
-    a stop beats a gone supervisor beats a reload."""
+    a stop beats a gone supervisor beats a reload or an upgrade drain."""
 
     STOP = 'stop'
     SUPERVISOR_GONE = 'supervisor-gone'
     RELOAD = 'reload'
+    #: The supervisor is draining for an in-place upgrade (S-8): finish the
+    #: work in hand like for a reload (never mid-transfer, the API worker
+    #: waits for its in-flight receives), then exit 0 -- no respawn follows.
+    UPGRADE = 'upgrade'
 
 
-def _setup_logging(verbose: bool = False) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+def _setup_logging(log_level: int = logging.INFO) -> None:
+    """Configure this process's logging (`zfsbackup.logsetup`). Called in every
+    worker, whatever the start method: a child does not rely on inheriting the
+    supervisor's handler."""
+    logsetup.configure(log_level)
 
 
-def _init_child_process(verbose: bool = False) -> None:
+def _init_child_process(log_level: int = logging.INFO) -> None:
     """First statement of **every** worker `run()`. Nothing may precede it.
 
     Resets the `SIGINT`/`SIGTERM` dispositions this child must not own,
@@ -180,7 +241,7 @@ def _init_child_process(verbose: bool = False) -> None:
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
-    _setup_logging(verbose)
+    _setup_logging(log_level)
 
 
 def _pid_exists(pid: int) -> bool:
@@ -259,16 +320,31 @@ class _SupervisorWatch:
     born_epoch: int = 0
     workers_lock: Optional[str] = None
     supervisor_start: Optional[str] = None
+    #: The supervisor's `version.code_signature()` taken at its start (`None`
+    #: = the guard is off). Not part of the reload `Handoff`: it never changes
+    #: in a supervisor's life.
+    code_signature: Optional[tuple] = None
+    #: Whether this worker leaves for an upgrade drain (S-8,
+    #: `EPOCH_UPGRADE_DRAIN`). Only the workers that import code lazily from
+    #: disk do (remote, API); the snapshot and pruning workers keep running
+    #: until the supervisor stops them.
+    drains_for_upgrade = False
+    #: The shared-epoch value at or below which this worker drains: -1 for the
+    #: remote worker, -2 for the API worker (`EPOCH_UPGRADE_DRAIN_API`), `None`
+    #: for the workers that do not drain. Kept consistent with
+    #: `drains_for_upgrade` by the two subclasses that set it.
+    upgrade_drain_epoch: Optional[int] = None
 
     def _watch_init(
         self,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
+        code_signature=None,
     ) -> None:
         #: Constructors run in the supervisor, so this is its pid. Not a
         #: constructor parameter: the worker signatures are pinned to
-        #: `(config, stop_event, verbose)` plus the keyword-only reload trio.
+        #: `(config, stop_event, log_level)` plus the keyword-only reload trio.
         self.supervisor_pid = os.getpid()
         #: Its start token (`procident`): pid reuse after a `kill -9` is
         #: detected by identity, not by "some process has that pid".
@@ -276,6 +352,11 @@ class _SupervisorWatch:
         self.reload_epoch = reload_epoch
         self.born_epoch = born_epoch
         self.workers_lock = workers_lock
+        #: A plain tuple (`CodeSignature.as_tuple()`) or `None`; a
+        #: `CodeSignature` is accepted and converted.
+        self.code_signature = (
+            code_signature.as_tuple() if hasattr(code_signature, 'as_tuple') else code_signature
+        )
         self._workers_lock_fd: Optional[int] = None
         self._parent_at_start: Optional[int] = None
         self._direct_child = True
@@ -341,6 +422,46 @@ class _SupervisorWatch:
                 )
         return True
 
+    def _exit_on_version_skew(self, logger) -> None:
+        """First act of a worker's `run()` (S-8), BEFORE any lazy import of
+        `zfsbackup.remote` / `zfsbackup.api`: compare the installed code's
+        signature, read now, with the one the supervisor started with. A
+        difference means the code on disk is not what the supervisor runs (an
+        in-place upgrade; under `spawn`/`forkserver` this process may have just
+        imported the new code): leave at once with `WORKER_EXIT_VERSION_SKEW`
+        instead of running a mix. The supervisor decides what that means: it
+        reads the signature itself and drains the daemon only if it sees the
+        same difference twice (a transient read error is not an upgrade);
+        otherwise it just restarts this worker. Checked even when a stop is
+        pending (the supervisor ignores exit 4 during a stop); a signature
+        that cannot be read or compared is "no change". One file stat; no
+        `zfs` call.
+
+        Cross-version contract (a worker and its supervisor can be different
+        code only in this window, but keep it stable): the `code_signature=`
+        constructor keyword, a plain tuple; exit status 4
+        (`WORKER_EXIT_VERSION_SKEW`); and `EPOCH_UPGRADE_DRAIN` (-1, then
+        -2 for the API worker) in the shared `ReloadEpoch`."""
+        expected = self.code_signature
+        if expected is None:
+            return
+        try:
+            current = code_signature()
+            if current is None or current.as_tuple() == tuple(expected):
+                return
+        except Exception:
+            return
+        try:
+            what = current.change_from(CodeSignature(*expected))
+        except Exception:
+            what = "the installed code differs"
+        logger.warning(
+            f"{self.name}: the installed zfsbackup changed since the daemon "
+            f"started ({what}); not starting with mixed code. The supervisor "
+            "checks for itself and drains the daemon (exit 76) or restarts this worker."
+        )
+        sys.exit(WORKER_EXIT_VERSION_SKEW)
+
     def _hold_workers_lock(self) -> None:
         """Take `LOCK_SH` on `<db>.workers.lock` for the life of this process
         (item 18.5): the presence lock that lets a restarted daemon see
@@ -366,8 +487,14 @@ class _SupervisorWatch:
         if self._supervisor_gone():
             return ExitReason.SUPERVISOR_GONE
         epoch = self.reload_epoch
-        if epoch is not None and epoch.get() != self.born_epoch:
-            return ExitReason.RELOAD
+        if epoch is not None:
+            current = epoch.get()
+            if current < 0:
+                # A drain stage (S-8), never a real epoch.
+                mine = self.upgrade_drain_epoch
+                return ExitReason.UPGRADE if mine is not None and current <= mine else None
+            if current != self.born_epoch:
+                return ExitReason.RELOAD
         return None
 
     def _should_stop(self) -> bool:
@@ -397,16 +524,29 @@ class _SupervisorWatch:
 class BaseWorker(_SupervisorWatch, Process):
     """Base class for daemon worker processes with a shared polling loop."""
 
+    #: Class-level defaults so a worker built without `__init__` (or before
+    #: `run()`) records nothing; see `__init__`.
+    _status_dir = None
+    _status: Optional[health.StatusWriter] = None
+    #: Write any unwritten outcome before each dataset is processed (not only
+    #: at the rate-limited cadence): a dataset can take hours to stream, and an
+    #: outcome held in memory meanwhile is lost to a kill. Costs one write per
+    #: dataset after one that recorded something, so a worker that records for
+    #: every dataset and has very many of them turns it off.
+    _FLUSH_BEFORE_DATASET = True
+
     def __init__(
         self,
         worker_name: str,
         config: BackupConfig,
         stop_event: StopEvent,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
+        status_dir=None,
+        code_signature=None,
     ):
         """`config` is the supervisor's detached `BackupConfig`, with
         `--dry-run` already applied. It is used as is; the worker never
@@ -417,12 +557,22 @@ class BaseWorker(_SupervisorWatch, Process):
         `WORKER_EXIT_RELOAD` at its next safe point once the shared epoch
         differs from `born_epoch` (`None` = never). `workers_lock`: path of
         `<db>.workers.lock` to hold `LOCK_SH` on while running (`None` = none).
+        `status_dir` is `<db>.status` (`daemon.Handoff.status_dir`; `None` =
+        record no outcomes, as under `--dry-run`): the worker writes its own
+        `<worker>.json` there (S-7, `health.StatusWriter`). `code_signature`
+        is the supervisor's `version.code_signature()` (`None` = no skew
+        check): `run()` leaves with `WORKER_EXIT_VERSION_SKEW` if the installed
+        code no longer matches it (S-8).
         """
         super().__init__(name=worker_name, daemon=True)
         self.config = config
         self.stop_event = stop_event
-        self.verbose = verbose
-        self._watch_init(reload_epoch, born_epoch, workers_lock)
+        self.log_level = log_level
+        self._watch_init(reload_epoch, born_epoch, workers_lock, code_signature)
+        self._status_dir = status_dir
+        #: Built by `run()` in the worker process (never pickled, never
+        #: shared); `None` = record nothing.
+        self._status: Optional[health.StatusWriter] = None
 
     @abstractmethod
     def _get_interval(self, config: BackupConfig) -> float:
@@ -436,14 +586,63 @@ class BaseWorker(_SupervisorWatch, Process):
         """Return the list of datasets to iterate each cycle. Override to extend."""
         return manager.datasets
 
+    #: The status record kind an exception out of `_process_dataset` is
+    #: charged to (`None`: the subclass records its own failures).
+    _STATUS_KIND: Optional[str] = None
+
+    def _status_keys(
+        self, datasets: Iterable[DatasetInfo]
+    ) -> Optional[Set[Tuple[str, Optional[str]]]]:
+        """The `(dataset, destination)` pairs this worker's status file may
+        hold records for: anything else is dropped, so a dataset removed from
+        the configuration stops being reported. `None`: this cycle's list is
+        not trustworthy, drop nothing."""
+        return {(dsi.name, None) for dsi in datasets}
+
+    def _record(
+        self, kind: str, dataset: str, destination: Optional[str] = None, *,
+        ok: bool, error: Optional[str] = None, detail: Optional[str] = None,
+    ) -> None:
+        """One attempt finished (S-7): remembered for the status file, which
+        `_flush_status` writes. A no-op without a status directory."""
+        if self._status is not None:
+            self._status.record(kind, dataset, destination, ok=ok, error=error, detail=detail)
+
+    def _flush_status(self, force: bool = False, heartbeat: bool = False) -> None:
+        if self._status is not None:
+            self._status.flush(force=force, heartbeat=heartbeat)
+
+    def _open_status(self, config: BackupConfig, logger) -> Optional[health.StatusWriter]:
+        """This worker's status writer, carrying over the counters of its
+        previous incarnation's file (a reload or crash restart must not make
+        a standing failure look new), or `None`: no directory was handed
+        over, or `--dry-run`/`dry_run: true` (a dry run's outcomes are not
+        outcomes, and it writes nothing). Never raises."""
+        if self._status_dir is None or config.dry_run:
+            return None
+        try:
+            writer = health.StatusWriter(self._status_dir, self.name)
+            writer.load()
+            return writer
+        except Exception as e:
+            logger.warning(f"{self.name} will not record its outcomes: {type(e).__name__}: {e}")
+            return None
+
+    def _record_failure(self, dsi: DatasetInfo, exc: BaseException) -> None:
+        if self._STATUS_KIND is not None:
+            self._record(
+                self._STATUS_KIND, dsi.name, ok=False, error=f"{type(exc).__name__}: {exc}"
+            )
+
     def _before_loop(self, config: BackupConfig, manager: DatasetManager) -> None:
         """Called once after setup but before the main loop. Override for per-run init."""
 
     def run(self) -> None:
-        _init_child_process(self.verbose)
+        _init_child_process(self.log_level)
         self._arm_supervisor_watch()
-        self._hold_workers_lock()
         logger = logging.getLogger(__name__)
+        self._exit_on_version_skew(logger)
+        self._hold_workers_lock()
         logger.info(f"{self.name} started")
 
         config = self.config
@@ -455,25 +654,51 @@ class BaseWorker(_SupervisorWatch, Process):
                 f"minimum (hand-edited config database?); using {MIN_WORKER_INTERVAL:g}s"
             )
             interval = MIN_WORKER_INTERVAL
-        self._before_loop(config, manager)
+        self._status = self._open_status(config, logger)
+        # Skipped when a reason to leave is already pending (a stop, a reload
+        # or a drain that arrived while this worker was starting): the lazy
+        # imports and the dataset checks of `_before_loop` are pointless then.
+        if self._exit_reason() is None:
+            self._before_loop(config, manager)
 
         # `_exit_reason` (stop flag > supervisor gone > reload) is checked at
         # every safe point: loop top, between datasets, and each `_wait`
         # slice -- never inside `_process_dataset`, so a reload (or a stop)
         # lets the dataset in hand finish.
+        #
+        # Outcomes (S-7) are written from this loop only: remembered after each
+        # dataset, written at most every `health.STATUS_WRITE_INTERVAL`, and
+        # forced at the end of a cycle and on the way out. A write failure is
+        # one WARNING and never reaches this loop.
         reason = self._exit_reason()
-        while reason is None:
-            logger.debug(f"{self.name} cycle")
-            for dsi in self._get_datasets(manager):
-                reason = self._exit_reason()
-                if reason is not None:
-                    break
-                try:
-                    self._process_dataset(manager, dsi)
-                except Exception as e:
-                    logger.error(f"{self.name} error on {dsi.name}: {e}", exc_info=True)
-            if reason is None:
-                reason = self._wait(interval)
+        try:
+            while reason is None:
+                logger.debug(f"{self.name} cycle")
+                datasets = self._get_datasets(manager)
+                # A list cut short by a stop or reload is not the truth about
+                # what is configured: retain only on a complete one.
+                if self._status is not None and self._exit_reason() is None:
+                    keep = self._status_keys(datasets)
+                    if keep is not None:
+                        self._status.retain(keep)
+                for dsi in datasets:
+                    reason = self._exit_reason()
+                    if reason is not None:
+                        break
+                    if self._FLUSH_BEFORE_DATASET:
+                        self._flush_status(force=True)
+                    try:
+                        self._process_dataset(manager, dsi)
+                    except Exception as e:
+                        logger.error(f"{self.name} error on {dsi.name}: {e}", exc_info=True)
+                        self._record_failure(dsi, e)
+                    self._flush_status()
+                # End of cycle: always rewrite, so `updated_at` is a heartbeat.
+                self._flush_status(force=True, heartbeat=True)
+                if reason is None:
+                    reason = self._wait(interval)
+        finally:
+            self._flush_status(force=True)
 
         self._finish(reason, logger)
 
@@ -483,6 +708,12 @@ class BaseWorker(_SupervisorWatch, Process):
                 f"{self.name} finished its current work; exiting to switch configuration"
             )
             sys.exit(WORKER_EXIT_RELOAD)
+        if reason is ExitReason.UPGRADE:
+            logger.info(
+                f"{self.name} finished its current work; exiting so that the daemon "
+                "can restart on the upgraded zfsbackup"
+            )
+            return
         # STOP and SUPERVISOR_GONE both end here with exit status 0. The
         # latter was already logged once, at ERROR, by the watch.
         logger.info(f"{self.name} stopped")
@@ -495,16 +726,21 @@ class SnapshotWorker(BaseWorker):
         self,
         config: BackupConfig,
         stop_event: StopEvent,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
+        status_dir=None,
+        code_signature=None,
     ):
         super().__init__(
-            'snapshot-worker', config, stop_event, verbose,
+            'snapshot-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
+            status_dir=status_dir, code_signature=code_signature,
         )
+
+    _STATUS_KIND = health.KIND_SNAPSHOT
 
     def _get_interval(self, config: BackupConfig) -> float:
         return config.check_interval.total_seconds()
@@ -539,7 +775,18 @@ class SnapshotWorker(BaseWorker):
         logger = logging.getLogger(__name__)
         if manager.needs_snapshot(dsi):
             logger.info(f"Dataset {dsi.name} needs snapshot")
-            manager.create_snapshot(dsi)
+            created = manager.create_snapshot(dsi)
+            if created is not None:
+                self._record(
+                    health.KIND_SNAPSHOT, dsi.name, ok=True,
+                    detail=str(getattr(created, 'name', '') or ''),
+                )
+            else:
+                reason = getattr(manager, 'last_snapshot_error', None)
+                self._record(
+                    health.KIND_SNAPSHOT, dsi.name, ok=False,
+                    error=reason if isinstance(reason, str) else 'the snapshot was not created (see the journal)',
+                )
 
 
 class PruningWorker(BaseWorker):
@@ -549,16 +796,29 @@ class PruningWorker(BaseWorker):
         self,
         config: BackupConfig,
         stop_event: StopEvent,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
+        status_dir=None,
+        code_signature=None,
     ):
         super().__init__(
-            'pruning-worker', config, stop_event, verbose,
+            'pruning-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
+            status_dir=status_dir, code_signature=code_signature,
         )
+
+    _STATUS_KIND = health.KIND_PRUNE
+    # One record per dataset per cycle: a forced write before each would be
+    # one per dataset. The rate limit and the end-of-cycle flush apply.
+    _FLUSH_BEFORE_DATASET = False
+    #: This cycle's enumeration of the received datasets (server side): why it
+    #: failed (`None`: it did not), and the backup target it enumerated
+    #: (`None`: remote backup is off).
+    _received_error: Optional[str] = None
+    _discover_target: Optional[str] = None
 
     def _get_interval(self, config: BackupConfig) -> float:
         return config.effective_prune_interval.total_seconds()
@@ -571,26 +831,78 @@ class PruningWorker(BaseWorker):
         received = manager.received_datasets(should_stop=self._should_stop)
         if self._should_stop():
             return []
+        self._note_received(manager, received)
         return manager.datasets + received
 
+    def _note_received(self, manager: DatasetManager, received: List[DatasetInfo]) -> None:
+        """Record how the enumeration of the received datasets went, under the
+        backup target's name. A failed one returns `[]`, which is not the truth
+        about what exists: `_status_keys` then keeps every record instead of
+        dropping the received datasets' (a `check` would see no data instead
+        of a failure)."""
+        self._received_error = None
+        self._discover_target = None
+        if self._status is None:
+            return
+        rb = getattr(manager.config, 'remote_backup', None)
+        if not rb or not rb.enabled:
+            return
+        error = getattr(manager, 'last_received_error', None)
+        self._received_error = error if isinstance(error, str) else None
+        self._discover_target = rb.target_dataset.rstrip('/')
+        if self._received_error is not None:
+            self._record(
+                health.KIND_DISCOVER, self._discover_target, ok=False,
+                error=f"cannot list the received datasets: {self._received_error}",
+            )
+        else:
+            self._record(
+                health.KIND_DISCOVER, self._discover_target, ok=True,
+                detail=f"{len(received)} received dataset(s)",
+            )
+
+    def _status_keys(self, datasets):
+        if self._received_error is not None:
+            return None
+        keys = super()._status_keys(datasets)
+        if self._discover_target is not None:
+            keys.add((self._discover_target, None))
+        return keys
+
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
-        manager.prune_snapshots(dsi)
+        result = manager.prune_snapshots(dsi)
+        if isinstance(result, PruneResult):
+            if result.ok:
+                self._record(health.KIND_PRUNE, dsi.name, ok=True, detail=result.summary())
+            else:
+                self._record(
+                    health.KIND_PRUNE, dsi.name, ok=False,
+                    error=result.skipped or f"{result.failed} snapshot(s) could not be destroyed",
+                    detail=result.summary(),
+                )
 
 
 class RemoteBackupWorker(BaseWorker):
     """Worker that periodically sends snapshots to configured remote destinations."""
 
+    #: Imports `zfsbackup.remote` lazily from disk: leaves for an upgrade drain
+    #: first (stage 1).
+    drains_for_upgrade = True
+    upgrade_drain_epoch = EPOCH_UPGRADE_DRAIN
+
     def __init__(
         self,
         config: BackupConfig,
         stop_event: StopEvent,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
         tls_dir=None,
         client_id: Optional[str] = None,
+        status_dir=None,
+        code_signature=None,
     ):
         """`tls_dir` is `<db>.tls` (the default client TLS identity lives
         there unless `client_cert_file`/`client_key_file` override it);
@@ -602,8 +914,9 @@ class RemoteBackupWorker(BaseWorker):
         passed to `RemoteBackupManager(config, manager, client_id=,
         tls_dir=)`."""
         super().__init__(
-            'remote-backup-worker', config, stop_event, verbose,
+            'remote-backup-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
+            status_dir=status_dir, code_signature=code_signature,
         )
         self.tls_dir = tls_dir
         self.client_id = client_id
@@ -618,10 +931,22 @@ class RemoteBackupWorker(BaseWorker):
         return min(freqs) if freqs else config.check_interval.total_seconds()
 
     def _before_loop(self, config: BackupConfig, manager: DatasetManager) -> None:
-        from zfsbackup.remote import RemoteBackupManager
+        from zfsbackup.remote import TOKEN_SKIP_NOTE, RemoteBackupManager
         self._remote_manager = RemoteBackupManager(
             config, manager, client_id=self.client_id, tls_dir=self.tls_dir
         )
+        # A reload or restart must not reset the resume-token skip counts:
+        # carry them over from the previous incarnation's records.
+        if self._status is not None:
+            counts = {
+                (r.dataset, r.destination): r.consecutive_failures
+                for r in self._status.records
+                if r.kind == health.KIND_SEND and r.destination is not None
+                and r.result == health.RESULT_ERROR and r.consecutive_failures > 0
+                and (r.last_error or '').startswith(TOKEN_SKIP_NOTE)
+            }
+            if counts:
+                self._remote_manager.seed_token_skips(counts)
 
     def _get_datasets(self, manager: DatasetManager) -> List[DatasetInfo]:
         # Called once at the top of every cycle: each destination's `/whoami`
@@ -637,14 +962,54 @@ class RemoteBackupWorker(BaseWorker):
         # create anything on the server.
         return sorted(super()._get_datasets(manager), key=lambda d: d.name.count('/'))
 
+    def _status_keys(self, datasets: Iterable[DatasetInfo]) -> Set[Tuple[str, Optional[str]]]:
+        return {(dsi.name, rc.destination) for dsi in datasets for rc in dsi.config.remote}
+
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
         if not dsi.config.remote:
             return
+        # The destination in hand, so that an exception is charged to it (the
+        # exception itself still propagates to the loop, as before).
+        current: List[str] = []
+        try:
+            self._send_to_destinations(manager, dsi, current)
+        except Exception as e:
+            if current:
+                self._record(
+                    health.KIND_SEND, dsi.name, current[0], ok=False,
+                    error=f"{type(e).__name__}: {e}",
+                )
+            raise
+
+    def _record_send(self, dsi: DatasetInfo, destination: str, done: bool) -> None:
+        """Remember what `backup_dataset` returned. A `False` while an exit
+        reason is pending is a stop or reload cutting the cycle short: neither
+        a success nor a failure, so nothing is recorded. Otherwise `False` is
+        a failure, with the manager's own account of why when it has one."""
+        if self._status is None:
+            return
+        if done:
+            self._record(health.KIND_SEND, dsi.name, destination, ok=True)
+        elif self._exit_reason() is None:
+            problem = self._remote_manager.last_problem(dsi.name, destination)
+            self._record(
+                health.KIND_SEND, dsi.name, destination, ok=False,
+                error=problem if isinstance(problem, str) else 'not completed (see the journal)',
+            )
+        else:
+            return
+        # The next destination may stream for hours: write this outcome now.
+        self._flush_status(force=True)
+
+    def _send_to_destinations(
+        self, manager: DatasetManager, dsi: DatasetInfo, current: List[str]
+    ) -> None:
         logger = logging.getLogger(__name__)
         for index, remote_cfg in enumerate(dsi.config.remote):
             if index and self._exit_reason() is not None:
                 # Between destinations no stream is open: a safe point.
                 return
+            current[:] = [remote_cfg.destination]
             freq = (remote_cfg.frequency or dsi.config.frequency).total_seconds()
             anchor_name = manager.get_anchor(dsi, remote_cfg.destination)
             if anchor_name:
@@ -666,9 +1031,10 @@ class RemoteBackupWorker(BaseWorker):
                     continue
             # `should_stop` is polled before every stream of the chain (never
             # during one): no new stream during a stop or a reload (C3).
-            self._remote_manager.backup_dataset(
+            done = self._remote_manager.backup_dataset(
                 dsi, remote_cfg, should_stop=lambda: self._exit_reason() is not None
             )
+            self._record_send(dsi, remote_cfg.destination, done)
 
 
 #: At most this many connections are served (handshaking or in a request) at
@@ -726,6 +1092,17 @@ API_WS_END_TIMEOUT = 2.0
 #: The capacity WARNING is logged at most once per this many seconds.
 _API_FULL_WARN_EVERY = 60.0
 
+#: S-12: a failed handshake whose client certificate is expired or not yet
+#: valid is logged at WARNING through the shared per-peer throttle
+#: (`api._PerPeerThrottle`, kind `tls-validity`: once per peer per hour, S-3);
+#: every other handshake failure stays DEBUG.
+
+#: `ssl.SSLCertVerificationError.verify_code` values (OpenSSL
+#: `X509_V_ERR_CERT_NOT_YET_VALID` / `X509_V_ERR_CERT_HAS_EXPIRED`).
+_X509_CERT_NOT_YET_VALID = 9
+_X509_CERT_HAS_EXPIRED = 10
+
+
 _API_SERVER_CLASS = None
 
 
@@ -764,6 +1141,15 @@ def _api_server_class():
     serialises its writes and lets the connection be closed only once
     simple-websocket's reader thread has left it (`API_WS_END_TIMEOUT`).
     The slots are released in a `finally`.
+
+    **Flood control (plan S-3, `api.PeerLimits`).** Before it takes a slot,
+    `process_request` asks the peer's token bucket (burst 60, 10 per second)
+    and concurrent-connection cap (8; 32 for a peer that presented a pinned
+    certificate within the last hour); over either the connection is closed
+    on the accept thread, before a TLS byte is read. Both are O(1) under one
+    short lock. The peer's concurrency slot is released with the global one.
+    `/enroll` lockout, the in-flight cap and the log throttle live in the app
+    (`api.create_app`).
     `self.ssl_context` is
     assigned after construction purely so werkzeug's environ reports `https`,
     fills `SSL_CLIENT_CERT` and treats SSL errors as dropped connections; it
@@ -795,6 +1181,9 @@ def _api_server_class():
         import socketserver
         import ssl
         from werkzeug.serving import ThreadedWSGIServer, WSGIRequestHandler
+        from werkzeug.urls import uri_to_iri
+
+        from zfsbackup import api as api_mod
 
         log = logging.getLogger(__name__)
 
@@ -958,6 +1347,26 @@ def _api_server_class():
             the post-response drain never reads a websocket request
             (`_DeadlineReader._drain_into`).
 
+            **Write-stall bound (plan S-2).** A peer that completes the
+            handshake and then never reads fills its receive window, and the
+            next `sendall` blocks while holding `_write_lock` -- a pong the
+            reader thread answers, or the route's close frame / final reply.
+            Nothing on the writing thread can bound that, and the route that
+            is stuck behind it never returns, so its stream gate slot (and
+            with it a reload's drain) is never released. So the start of the
+            write in progress is recorded (`_write_started`, `time.
+            monotonic()`), set and cleared under `_state` exactly where the
+            write enters and leaves `_tls`, and the API worker's trust-poll
+            thread -- a THIRD thread -- calls `force_eof_if_write_stalled`
+            for every live session each tick. The check and the shutdown are
+            one step under `_state`, so a write that finished and was
+            replaced by a new one between the poll thread's read and its
+            shutdown can never be cut by mistake. The shutdown is safe from
+            that thread without any further protocol: while a write is
+            recorded `_busy > 0`, and `end()` neither returns True nor lets
+            the server close the connection before `_busy` is 0, so the
+            descriptor is open for the whole of the call.
+
             Only what simple-websocket and `api._end_websocket` use is
             offered; anything else fails loudly rather than bypassing the
             write lock or the descriptor accounting."""
@@ -973,16 +1382,25 @@ def _api_server_class():
                 self._close_when_idle = False
                 #: Something was written (the `101`): the session is upgraded.
                 self.upgraded = False
+                #: `time.monotonic()` at which the write now inside `_tls`
+                #: started, else `None`. Only written under `_state`, by the
+                #: thread holding `_write_lock`; read (under `_state`) by the
+                #: trust-poll thread's stall check.
+                self._write_started: Optional[float] = None
 
-            def _enter(self) -> bool:
+            def _enter(self, write: bool = False) -> bool:
                 with self._state:
                     if self._ended:
                         return False
                     self._busy += 1
+                    if write:
+                        self._write_started = time.monotonic()
                     return True
 
-            def _leave(self) -> None:
+            def _leave(self, write: bool = False) -> None:
                 with self._state:
+                    if write:
+                        self._write_started = None
                     self._busy -= 1
                     if self._busy:
                         return
@@ -1005,7 +1423,7 @@ def _api_server_class():
 
             def sendall(self, data, flags=0) -> None:
                 with self._write_lock:
-                    if not self._enter():
+                    if not self._enter(write=True):
                         raise BrokenPipeError(errno.EPIPE, "the websocket session has ended")
                     # Before the write: even a failed one may have put bytes
                     # of the `101` on the wire.
@@ -1013,7 +1431,7 @@ def _api_server_class():
                     try:
                         self._tls.sendall(data, flags)
                     finally:
-                        self._leave()
+                        self._leave(write=True)
 
             def send(self, data, flags=0) -> int:
                 self.sendall(data, flags)
@@ -1036,6 +1454,26 @@ def _api_server_class():
                     socket.socket.shutdown(self._tls, socket.SHUT_RDWR)
                 except OSError:
                     pass
+
+            def force_eof_if_write_stalled(self, limit: float) -> Optional[float]:
+                """Plan S-2. Called from the API worker's trust-poll thread
+                (not from either thread that uses the socket). If the write
+                in progress started more than `limit` seconds ago, shut the
+                connection down (`force_eof`) so that write fails at once ->
+                the age of the write that was cut; else `None`. Check and
+                shutdown happen under `_state`, which is also where a write
+                starts and ends, so it is always the stalled write that is
+                cut. Takes no lock another thread can hold for long (never
+                `_write_lock`). Never raises."""
+                with self._state:
+                    started = self._write_started
+                    if started is None:
+                        return None
+                    age = time.monotonic() - started
+                    if age <= limit:
+                        return None
+                    self.force_eof()
+                    return age
 
             def end(self, timeout: float) -> bool:
                 """Refuse new I/O (a `recv` is EOF, a write `EPIPE`), then
@@ -1225,6 +1663,45 @@ def _api_server_class():
                     return
                 super().log_error(format, *args)
 
+            def log_request(self, code='-', size='-'):
+                """werkzeug's per-request access line, demoted by status
+                class so the journal is not flooded: 1xx-3xx DEBUG, 4xx INFO,
+                5xx WARNING (a status that is not a number: INFO). Through
+                werkzeug's own `log`, so the logger name and the line format
+                are unchanged. The refusal statuses a flood can repeat
+                (`api.THROTTLED_ACCESS_STATUSES`) are further limited to one
+                line per peer and status per hour (S-3)."""
+                try:
+                    status = int(code)
+                except (TypeError, ValueError):
+                    level = 'info'
+                else:
+                    level = 'warning' if status >= 500 else 'info' if status >= 400 else 'debug'
+                    if level != 'debug' and status in api_mod.THROTTLED_ACCESS_STATUSES:
+                        # S-3: the statuses an unauthenticated flood
+                        # produces (401, 426, 429, 503, ...) are logged
+                        # once per peer, status and hour at their level;
+                        # the rest are DEBUG and counted in the hourly
+                        # summary.
+                        try:
+                            limits = self.server.limits
+                            if not limits.log.allow(
+                                f"access-{status}", api_mod.peer_key(self.client_address)
+                            ):
+                                level = 'debug'
+                        except Exception:
+                            pass
+                try:
+                    path = uri_to_iri(self.path)
+                    msg = f"{self.command} {path} {self.request_version}"
+                except AttributeError:
+                    msg = self.requestline  # `path` is unset after a bad request line
+                # The decoded path is client-controlled: escape control
+                # characters as werkzeug does (no ANSI colour, either: this
+                # goes to a log, not a terminal).
+                msg = _clip_for_log(msg).translate(_CONTROL_CHAR_TABLE)
+                self.log(level, '"%s" %s %s', msg, str(code), size)
+
         class ApiServer(ThreadedWSGIServer):
             def __init__(
                 self, host, port, app, gateway, *,
@@ -1235,6 +1712,7 @@ def _api_server_class():
                 max_anonymous: int = API_MAX_ANONYMOUS_CONNECTIONS,
                 reject_linger: float = API_REJECT_LINGER,
                 ws_end_timeout: float = API_WS_END_TIMEOUT,
+                limits=None,
             ):
                 if (
                     isinstance(ws_end_timeout, bool)
@@ -1265,6 +1743,18 @@ def _api_server_class():
                 self._anonymous_slots = threading.BoundedSemaphore(max_anonymous)
                 #: Per connection thread: `pinned` (the handler reads it).
                 self.connection_state = threading.local()
+                # S-3 flood control: the app's `PeerLimits` (the API worker
+                # builds one in `create_app`), else a private one. Shared
+                # with the app's threads and the trust-poll thread; see the
+                # threading notes at `api.peer_key`.
+                if limits is None:
+                    limits = getattr(app, 'extensions', {}).get('zfsbackup.peer_limits')
+                if limits is None:
+                    limits = api_mod.PeerLimits()
+                self.limits = limits
+                # The reserve of slots for vouched peers is a share of THIS
+                # server's connection cap.
+                self.limits.rate.configure_capacity(max_connections)
                 self._full_warned_at: Optional[float] = None
                 self._anonymous_full_warned_at: Optional[float] = None
                 # No `ssl_context` here: werkzeug would wrap the listening
@@ -1282,7 +1772,21 @@ def _api_server_class():
 
             def process_request(self, request, client_address):
                 # Accept thread: never block, never handshake here.
+                #
+                # S-3, before anything else is spent on the connection: the
+                # peer's token bucket and its concurrent-connection cap
+                # (`api.PeerRateLimiter`). Over either, the connection is
+                # closed right here -- no thread, no TLS byte read. Both are
+                # O(1) under one short lock; the log line, if any, is written
+                # after the socket is closed.
+                key = api_mod.peer_key(client_address)
+                refusal = self.limits.rate.admit(key)
+                if refusal is not None:
+                    self.shutdown_request(request)
+                    self._log_flood_drop(refusal, key, client_address)
+                    return
                 if not self._slots.acquire(blocking=False):
+                    self.limits.rate.release(key)
                     now = time.monotonic()
                     if (
                         self._full_warned_at is None
@@ -1300,9 +1804,51 @@ def _api_server_class():
                 except BaseException:
                     # The thread never started: nobody else releases the slot.
                     self._slots.release()
+                    self.limits.rate.release(key)
                     raise
 
+            def _log_flood_drop(self, refusal, key, client_address) -> None:
+                """One WARNING per peer per hour for connections dropped by
+                the per-peer limits (the rest DEBUG, counted in the hourly
+                summary). Accept thread: the throttle is O(1) and a line is
+                written at most once per peer and hour. Never raises."""
+                try:
+                    host = client_address[0] if client_address else '?'
+                    # `emit`, not `log`: a suppressed line is not even
+                    # formatted here (this is the accept thread).
+                    if refusal == api_mod.ADMIT_RESERVED:
+                        self.limits.log.emit(
+                            'conn-reserve', key, logging.WARNING,
+                            "API: dropping a connection from %s: %d of %d connection slots "
+                            "are open and the rest are kept for peers with a pinned client "
+                            "certificate",
+                            host, self.max_connections - self.limits.rate.reserve,
+                            self.max_connections,
+                        )
+                    elif refusal == api_mod.ADMIT_CONCURRENT:
+                        self.limits.log.emit(
+                            'conn-cap', key, logging.WARNING,
+                            "API: dropping connections from %s: it already has the maximum "
+                            "of simultaneous connections open (%d unauthenticated, %d once "
+                            "it has presented a pinned client certificate)",
+                            host, api_mod.API_MAX_CONNECTIONS_PER_IP, api_mod.API_MAX_CONNECTIONS_PER_VOUCHED_IP,
+                        )
+                    else:
+                        self.limits.log.emit(
+                            'rate', key, logging.WARNING,
+                            "API: dropping connections from %s: more than %d at once or "
+                            "%g per second sustained; it may be flooding this server",
+                            host, self.limits.rate.burst, self.limits.rate.rate,
+                        )
+                except Exception:
+                    log.debug("API: flood log failed", exc_info=True)
+
             def process_request_thread(self, request, client_address):
+                # Connection thread. Whatever happens, both the global slot
+                # and the peer's concurrency slot (taken in `process_request`
+                # on the accept thread) are given back in the outer `finally`.
+                key = api_mod.peer_key(client_address)
+                vouched_here = False
                 try:
                     try:
                         context = self.gateway.current_context()
@@ -1321,9 +1867,17 @@ def _api_server_class():
                         tls.settimeout(None)
                     except Exception as exc:  # SSLError, TimeoutError, OSError
                         log.debug("API: TLS handshake with %s failed: %s", client_address, exc)
+                        self._warn_certificate_validity(exc, client_address)
                         self._close_after_failed_handshake(tls)
                         return
                     pinned = self._is_pinned(tls)
+                    if pinned:
+                        # This address now has a live pinned client: no
+                        # bucket, higher concurrency cap, may use the reserve
+                        # -- while this connection is open and for
+                        # `API_VOUCH_TTL` after it ends (`unvouch` below).
+                        self.limits.rate.vouch(key)
+                        vouched_here = True
                     if not pinned and not self._anonymous_slots.acquire(blocking=False):
                         now = time.monotonic()
                         if (
@@ -1348,7 +1902,49 @@ def _api_server_class():
                         if not pinned:
                             self._anonymous_slots.release()
                 finally:
-                    self._slots.release()
+                    # Nested, so that one raising cannot skip the others: a
+                    # leaked pinned-open count would keep the address
+                    # vouched for ever.
+                    try:
+                        self._slots.release()
+                    finally:
+                        try:
+                            self.limits.rate.release(key)
+                        finally:
+                            if vouched_here:
+                                self.limits.rate.unvouch(key)
+
+            def _warn_certificate_validity(self, exc, client_address) -> None:
+                """S-12: a client whose certificate expired (or is not valid
+                yet) is otherwise invisible, a DEBUG line. One WARNING per
+                peer per hour through the shared throttle (`api.
+                _PerPeerThrottle`, kind `tls-validity`, which also caps the
+                lines per hour over all peers: a holder of a former client's
+                expired certificate cycling through addresses cannot flood
+                the journal); never raises."""
+                try:
+                    if not isinstance(exc, ssl.SSLCertVerificationError):
+                        return
+                    code = getattr(exc, 'verify_code', None)
+                    if code == _X509_CERT_HAS_EXPIRED:
+                        what = (
+                            "its client certificate has expired; the client must "
+                            "enroll again with a new token (check its clock too)"
+                        )
+                    elif code == _X509_CERT_NOT_YET_VALID:
+                        what = (
+                            "its client certificate is not valid yet; check the "
+                            "clocks of the client and of this host"
+                        )
+                    else:
+                        return
+                    peer = str(client_address[0])
+                    self.limits.log.log(
+                        'tls-validity', api_mod.peer_key(client_address), logging.WARNING,
+                        "API: TLS client %s refused: %s", peer, what,
+                    )
+                except Exception:
+                    log.debug("API: validity warning failed", exc_info=True)
 
             def shutdown_request(self, request):
                 # A connection a websocket session took over (its reader was
@@ -1552,20 +2148,29 @@ def _remove_tree(path) -> None:
 class ApiWorker(_SupervisorWatch, Process):
     """Worker that serves the HTTPS API (inspection and remote-backup receive)."""
 
+    #: Imports `zfsbackup.api` lazily from disk: leaves for an upgrade drain,
+    #: but only after the remote worker has (stage 2); it serves until then.
+    drains_for_upgrade = True
+    upgrade_drain_epoch = EPOCH_UPGRADE_DRAIN_API
+
     #: Class-level default, so a worker built by a test that bypasses
     #: `__init__` refuses to serve rather than serving without trust.
     config_db = None
+    #: The app's `api.PeerLimits` (S-3), set by `_serve`; the trust-poll
+    #: thread logs its hourly summary. `None`: nothing to flush.
+    _peer_limits = None
 
     def __init__(
         self,
         config: BackupConfig,
         stop_event: StopEvent,
-        verbose: bool = False,
+        log_level: int = logging.INFO,
         *,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
         config_db=None,
+        code_signature=None,
     ):
         """`config` is the supervisor's detached `BackupConfig`, dry-run
         already applied; see `BaseWorker`.
@@ -1579,12 +2184,12 @@ class ApiWorker(_SupervisorWatch, Process):
         super().__init__(name='api-worker', daemon=True)
         self.config = config
         self.stop_event = stop_event
-        self.verbose = verbose
+        self.log_level = log_level
         self.config_db = config_db
-        self._watch_init(reload_epoch, born_epoch, workers_lock)
+        self._watch_init(reload_epoch, born_epoch, workers_lock, code_signature)
         self._trust = None
 
-    def _start_trust_poll(self, logger):
+    def _start_trust_poll(self, logger, sessions=None):
         """Start the trust-poll thread: `TrustGateway.poll()` every
         `api.TRUST_POLL_SECONDS` until the returned event is set. A thread of
         its own, so a slow trust read (a busy database: seconds; a hung
@@ -1593,17 +2198,49 @@ class ApiWorker(_SupervisorWatch, Process):
         new connections during the drains. A daemon thread: a poll stuck in
         the kernel does not keep the process alive. The event is a
         `threading.Event` set by ordinary code on the main thread, never
-        from a signal handler."""
+        from a signal handler.
+
+        Plan S-2: the same thread enforces the websocket sessions
+        (`api.SessionRegistry`, the app's `extensions['zfsbackup.sessions']`;
+        `None` -> not done) every tick: `enforce_stalls()` BEFORE the poll
+        (it needs no database) cuts a session whose write has been stalled
+        for `WS_IDLE_TIMEOUT`, and `enforce_revocations(gateway)` AFTER it
+        cuts the ones whose pin was revoked. This is the only thread that
+        cuts a session; it is also the only caller of
+        `store.trust.list_revoked`, through `_store_call` like every other
+        store call of this process, waiting at most `api.STORE_CALL_WAIT`
+        (a skipped call is retried next tick). A slow `list_revoked` (busy
+        database) delays only the next tick, never a request.
+
+        Plan S-3: the same thread logs the hourly summary of suppressed
+        refusal lines (`self._peer_limits.flush_log()`, `api.PeerLimits`, set
+        by `_serve` from the app; `None` -> not done) at the top of every tick, before anything that can wait: it
+        touches no database and takes only the throttle's own short lock."""
         from zfsbackup.api import TRUST_POLL_SECONDS
         gateway = self._trust
         stopped = threading.Event()
+        limits = self._peer_limits
 
         def loop():
             while not stopped.wait(TRUST_POLL_SECONDS):
+                if limits is not None:
+                    limits.flush_log()  # never raises
+                if sessions is not None:
+                    # The write-stall pass needs no database: before the
+                    # poll, so a slow or locked store never delays it.
+                    try:
+                        sessions.enforce_stalls()
+                    except Exception:  # never raises; belt and braces
+                        logger.debug("session stall check failed", exc_info=True)
                 try:
                     gateway.poll()
                 except Exception:  # poll() never raises; belt and braces
                     logger.debug("trust poll failed", exc_info=True)
+                if sessions is not None:
+                    try:
+                        sessions.enforce_revocations(gateway)
+                    except Exception:  # never raises; belt and braces
+                        logger.debug("session revocation check failed", exc_info=True)
 
         thread = threading.Thread(target=loop, name='trust-poll', daemon=True)
         thread.start()
@@ -1613,6 +2250,53 @@ class ApiWorker(_SupervisorWatch, Process):
         """`StreamGate.wait_idle`'s abort callback while draining for a
         reload or a restart: a stop or a gone supervisor ends the wait."""
         return self._exit_reason() in (ExitReason.STOP, ExitReason.SUPERVISOR_GONE)
+
+    def _wait_for_stuck_children(self, logger, action: str) -> None:
+        """After the stream gate is idle and before this process lets a
+        successor start (plan S-14): wait, in `STOP_POLL` slices, until
+        `libzfseasy.stuck_children()` is empty, i.e. until every `zfs` child a
+        timed-out handler call abandoned (it survived SIGKILL, typically a
+        D-state process on a hung pool) has exited. The registry dies with this
+        process, so a successor would start with it empty and could issue a
+        mutation (`zfs set`, `receive -A`) that overlaps the abandoned one.
+        New requests keep getting the fast 503 retry meanwhile (the registry
+        refuses every timed call). A stop or a gone supervisor ends the wait
+        (`_reload_drain_abort`), exactly like the stream wait. One INFO when
+        it starts waiting and one when it ends."""
+        import libzfseasy
+
+        try:
+            stuck = libzfseasy.stuck_children()
+        except Exception:
+            logger.debug("stuck_children() failed", exc_info=True)
+            return
+        if not stuck:
+            return
+        listing = ", ".join(f"pid {c.pid} ({c.label})" for c in stuck)
+        logger.info(
+            f"waiting for {len(stuck)} timed-out zfs process(es) to exit before {action}: "
+            f"{listing}"
+        )
+        started = time.monotonic()
+        while True:
+            try:
+                stuck = libzfseasy.stuck_children()
+            except Exception:
+                logger.debug("stuck_children() failed", exc_info=True)
+                return
+            if not stuck:
+                logger.info(
+                    f"the timed-out zfs process(es) have exited after "
+                    f"{time.monotonic() - started:.0f} s; {action} now"
+                )
+                return
+            if self._reload_drain_abort():
+                logger.info(
+                    f"stopped waiting for {len(stuck)} timed-out zfs process(es) "
+                    f"after {time.monotonic() - started:.0f} s: stopping"
+                )
+                return
+            self.stop_event.wait(timeout=STOP_POLL)
 
     def run(self) -> None:
         """Serve until stopped or until the configuration changes. Exits with
@@ -1650,10 +2334,12 @@ class ApiWorker(_SupervisorWatch, Process):
         most `API_STOP_DRAIN` seconds). Then the server is shut down, its
         socket closed (so the replacement worker can bind the port), and the
         worker exits `WORKER_EXIT_RELOAD` or returns."""
-        _init_child_process(self.verbose)
+        _init_child_process(self.log_level)
         self._arm_supervisor_watch()
-        self._hold_workers_lock()
         logger = logging.getLogger(__name__)
+        # Before the lazy `zfsbackup.api` / `identity` imports below.
+        self._exit_on_version_skew(logger)
+        self._hold_workers_lock()
         logger.info("API worker started")
 
         # The supervisor's detached `BackupConfig`. This process opens the
@@ -1672,33 +2358,39 @@ class ApiWorker(_SupervisorWatch, Process):
             sys.exit(1)
         # The trust poll opens the database every few seconds; the store's
         # preflight would otherwise repeat the same WARNING each time.
-        dedupe_store_warnings()
-        # Throwaway identities of dry-run API workers that died uncleanly.
+        uninstall_dedupe = dedupe_store_warnings()
         try:
-            import tempfile
-            _sweep_dry_run_dirs(tempfile.gettempdir())
-        except Exception:
-            logger.debug("sweeping stale dry-run identities failed", exc_info=True)
-        scratch = None
-        try:
-            identity, scratch = _server_identity(self.config_db, config.dry_run, logger)
-            self._trust = TrustGateway(identity, self.config_db)
-        except Exception as e:
-            if scratch is not None:
-                _remove_tree(scratch)
-            if isinstance(e, IdentityError):
-                logger.error(f"API worker cannot load the server TLS identity: {e}")
-            else:
-                logger.error(
-                    f"API worker cannot set up its TLS identity and client trust: "
-                    f"{type(e).__name__}: {e}"
-                )
-            sys.exit(1)
-        try:
-            self._serve(config, logger, create_app, identity)
+            # Throwaway identities of dry-run API workers that died uncleanly.
+            try:
+                import tempfile
+                _sweep_dry_run_dirs(tempfile.gettempdir())
+            except Exception:
+                logger.debug("sweeping stale dry-run identities failed", exc_info=True)
+            scratch = None
+            try:
+                identity, scratch = _server_identity(self.config_db, config.dry_run, logger)
+                self._trust = TrustGateway(identity, self.config_db)
+            except Exception as e:
+                if scratch is not None:
+                    _remove_tree(scratch)
+                if isinstance(e, IdentityError):
+                    logger.error(f"API worker cannot load the server TLS identity: {e}")
+                else:
+                    logger.error(
+                        f"API worker cannot set up its TLS identity and client trust: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                sys.exit(1)
+            try:
+                self._serve(config, logger, create_app, identity)
+            finally:
+                if scratch is not None:
+                    _remove_tree(scratch)
         finally:
-            if scratch is not None:
-                _remove_tree(scratch)
+            # The filter is process-global state; take it off on every exit
+            # (sys.exit included), not only in a worker process that is
+            # about to end anyway.
+            uninstall_dedupe()
 
     def _serve(self, config: BackupConfig, logger, create_app, identity) -> None:
         """`run()` once the server identity and the trust gateway exist."""
@@ -1731,7 +2423,10 @@ class ApiWorker(_SupervisorWatch, Process):
         #: Set when the gateway asks for a restart (`TrustGateway.
         #: restart_reason`: the server identity on disk changed, confirmed).
         restart: Optional[str] = None
-        poll_stopped = self._start_trust_poll(logger)
+        self._peer_limits = app.extensions.get('zfsbackup.peer_limits')
+        poll_stopped = self._start_trust_poll(
+            logger, app.extensions.get('zfsbackup.sessions')
+        )
         try:
             # Sliced wait: wakes every `STOP_POLL` to check the exit reasons,
             # that the server thread is still alive and whether the trust
@@ -1757,11 +2452,11 @@ class ApiWorker(_SupervisorWatch, Process):
             if not died:
                 gate.start_draining()
                 active = gate.active
-                if reason is ExitReason.RELOAD or (reason is None and restart):
+                if reason in (ExitReason.RELOAD, ExitReason.UPGRADE) or (reason is None and restart):
                     if active:
                         logger.info(
                             f"waiting for {active} in-flight receive(s) to finish "
-                            f"before {'reloading' if reason else 'restarting'}"
+                            f"before {'reloading' if reason is ExitReason.RELOAD else 'upgrading' if reason is ExitReason.UPGRADE else 'restarting'}"
                         )
                         gate.wait_idle(None, abort=self._reload_drain_abort)
                         # A stop that aborted the wait changes what we are doing.
@@ -1773,6 +2468,19 @@ class ApiWorker(_SupervisorWatch, Process):
                             f"abandoning {gate.active} in-flight receive(s); the "
                             "sender resumes them (zfs receive -s)"
                         )
+            # Every exit that lets a successor start (reload, upgrade, restart
+            # for an identity change, a dead server thread): no abandoned
+            # `zfs` child of this process may still be running (S-14). A stop
+            # does not wait: nothing replaces the worker.
+            if reason not in (ExitReason.STOP, ExitReason.SUPERVISOR_GONE):
+                self._wait_for_stuck_children(
+                    logger,
+                    'reloading' if reason is ExitReason.RELOAD
+                    else 'upgrading' if reason is ExitReason.UPGRADE
+                    else 'restarting',
+                )
+                # A stop that aborted the wait changes what we are doing.
+                reason = self._exit_reason() or reason
         finally:
             poll_stopped.set()
             # Every exit path past a successful bind: stop accepting, free
@@ -1795,4 +2503,10 @@ class ApiWorker(_SupervisorWatch, Process):
                 "API worker finished its current work; exiting to switch configuration"
             )
             sys.exit(WORKER_EXIT_RELOAD)
+        if reason is ExitReason.UPGRADE:
+            logger.info(
+                "API worker finished its current work; exiting so that the daemon "
+                "can restart on the upgraded zfsbackup"
+            )
+            return
         logger.info("API worker stopped")
