@@ -1038,6 +1038,25 @@ class TestRealWorkerProcesses:
             return st is not None and st.pid == pid and len(st.records) >= records
         return ready
 
+    def outcomes(self, sdir, pid, expected, name='snapshot-worker'):
+        """The file is this worker's AND shows `expected` ({dataset: (result, consecutive_failures)}). A pid alone is not
+        enough: the worker flushes before each dataset, so its first file can still hold the counters it loaded for the
+        datasets it has not reached yet."""
+        def ready():
+            try:
+                st = read_worker_status(sdir, name)
+            except health.StatusError:
+                return False
+            if st is None or st.pid != pid:
+                return False
+            recs = by_key(st)
+            return all(
+                (key := ('snapshot', ds, None)) in recs
+                and (recs[key].result, recs[key].consecutive_failures) == want
+                for ds, want in expected.items()
+            )
+        return ready
+
     def test_the_file_appears_with_the_workers_own_pid(self, launch, sdir, method):
         stop = StopFlag()
         worker = launch(method, {'pool/a': 'ok', 'pool/b': 'fail'}, stop=stop)
@@ -1061,7 +1080,7 @@ class TestRealWorkerProcesses:
         first.join(60)
         assert first.exitcode == WORKER_EXIT_RELOAD
         second = launch(method, {'pool/a': 'fail', 'pool/b': 'ok'}, epoch=epoch, born=1)
-        assert wait_until(self.file_with(sdir, second.pid))
+        assert wait_until(self.outcomes(sdir, second.pid, {'pool/a': ('error', 2), 'pool/b': ('ok', 0)}))
         recs = by_key(status(sdir))
         assert recs[('snapshot', 'pool/a', None)].consecutive_failures == 2
         assert recs[('snapshot', 'pool/b', None)].consecutive_failures == 0
@@ -1074,7 +1093,7 @@ class TestRealWorkerProcesses:
         first.join(30)
         assert first.exitcode != 0
         second = launch(method, {'pool/a': 'fail', 'pool/b': 'ok'})
-        assert wait_until(self.file_with(sdir, second.pid))
+        assert wait_until(self.outcomes(sdir, second.pid, {'pool/a': ('error', 2), 'pool/b': ('ok', 0)}))
         recs = by_key(status(sdir))
         assert recs[('snapshot', 'pool/a', None)].consecutive_failures == 2
         assert recs[('snapshot', 'pool/b', None)].consecutive_failures == 0
