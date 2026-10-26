@@ -2251,6 +2251,53 @@ class ApiWorker(_SupervisorWatch, Process):
         reload or a restart: a stop or a gone supervisor ends the wait."""
         return self._exit_reason() in (ExitReason.STOP, ExitReason.SUPERVISOR_GONE)
 
+    def _wait_for_stuck_children(self, logger, action: str) -> None:
+        """After the stream gate is idle and before this process lets a
+        successor start (plan S-14): wait, in `STOP_POLL` slices, until
+        `libzfseasy.stuck_children()` is empty, i.e. until every `zfs` child a
+        timed-out handler call abandoned (it survived SIGKILL, typically a
+        D-state process on a hung pool) has exited. The registry dies with this
+        process, so a successor would start with it empty and could issue a
+        mutation (`zfs set`, `receive -A`) that overlaps the abandoned one.
+        New requests keep getting the fast 503 retry meanwhile (the registry
+        refuses every timed call). A stop or a gone supervisor ends the wait
+        (`_reload_drain_abort`), exactly like the stream wait. One INFO when
+        it starts waiting and one when it ends."""
+        import libzfseasy
+
+        try:
+            stuck = libzfseasy.stuck_children()
+        except Exception:
+            logger.debug("stuck_children() failed", exc_info=True)
+            return
+        if not stuck:
+            return
+        listing = ", ".join(f"pid {c.pid} ({c.label})" for c in stuck)
+        logger.info(
+            f"waiting for {len(stuck)} timed-out zfs process(es) to exit before {action}: "
+            f"{listing}"
+        )
+        started = time.monotonic()
+        while True:
+            try:
+                stuck = libzfseasy.stuck_children()
+            except Exception:
+                logger.debug("stuck_children() failed", exc_info=True)
+                return
+            if not stuck:
+                logger.info(
+                    f"the timed-out zfs process(es) have exited after "
+                    f"{time.monotonic() - started:.0f} s; {action} now"
+                )
+                return
+            if self._reload_drain_abort():
+                logger.info(
+                    f"stopped waiting for {len(stuck)} timed-out zfs process(es) "
+                    f"after {time.monotonic() - started:.0f} s: stopping"
+                )
+                return
+            self.stop_event.wait(timeout=STOP_POLL)
+
     def run(self) -> None:
         """Serve until stopped or until the configuration changes. Exits with
         status 1 -- so the supervisor's crash backoff and restart apply -- if
@@ -2421,6 +2468,19 @@ class ApiWorker(_SupervisorWatch, Process):
                             f"abandoning {gate.active} in-flight receive(s); the "
                             "sender resumes them (zfs receive -s)"
                         )
+            # Every exit that lets a successor start (reload, upgrade, restart
+            # for an identity change, a dead server thread): no abandoned
+            # `zfs` child of this process may still be running (S-14). A stop
+            # does not wait: nothing replaces the worker.
+            if reason not in (ExitReason.STOP, ExitReason.SUPERVISOR_GONE):
+                self._wait_for_stuck_children(
+                    logger,
+                    'reloading' if reason is ExitReason.RELOAD
+                    else 'upgrading' if reason is ExitReason.UPGRADE
+                    else 'restarting',
+                )
+                # A stop that aborted the wait changes what we are doing.
+                reason = self._exit_reason() or reason
         finally:
             poll_stopped.set()
             # Every exit path past a successful bind: stop accepting, free
