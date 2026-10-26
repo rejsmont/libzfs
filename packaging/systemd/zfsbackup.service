@@ -61,10 +61,13 @@ Restart=on-failure
 #   SIGHUP  a stray SIGHUP in the few milliseconds before the daemon ignores it
 #           (the console script ignores it first thing, but the interpreter's
 #           own start-up cannot), which would otherwise count as a clean exit;
-#   76      "the installed zfsbackup changed under me, restart me" (the daemon's
-#           EXIT_CODE_VERSION_CHANGED, zfsbackup/version.py). Nothing exits 76
-#           yet: the self-restart on upgrade arrives with milestone D (S-8).
-#           Until then upgrade with `systemctl stop`, install, `systemctl start`.
+#   76      "the installed zfsbackup (or its Python) changed under me, restart
+#           me" (the daemon's EXIT_CODE_VERSION_CHANGED, zfsbackup/version.py).
+#           After an in-place install the daemon drains (workers finish their
+#           current transfer at a safe point), exits 76, and systemd starts it
+#           once, RestartSec later. The recommended upgrade is still `systemctl
+#           stop`, install, `systemctl start`; a dependency-only upgrade is not
+#           detected and needs `systemctl restart`.
 RestartForceExitStatus=SIGHUP 76
 RestartSec=60
 

@@ -1334,7 +1334,7 @@ class TestDaemonAlreadyRunning:
 
         assert [f.name for f in dataclasses.fields(DaemonInfo)] == [
             "pid", "generation", "start", "applied", "target", "rejected",
-            "deferred", "deferred_reason", "stable",
+            "deferred", "deferred_reason", "draining", "draining_reason", "stable",
         ]
         assert "pid_alive" not in {f.name for f in dataclasses.fields(DaemonInfo)}
         assert DaemonInfo(1, 2) == DaemonInfo(pid=1, generation=2)
@@ -1985,14 +1985,17 @@ class TestPidFileV2Format:
             (123, None, "", None, (1, 1), None),
             (123, 45, "linux:99", (1, 2), None, None, (1, 3), "port 9100 is busy"),
             (123, 45, "linux:99", (1, 2), (1, 3), None, (1, 4), None),  # no reason
+            (123, 45, "linux:99", (1, 2), None, None, None, None, 1790000000, "draining"),
+            (123, 45, "linux:99", (1, 2), None, None, None, None, 1790000000, None),  # no reason
         ],
     )
     def test_round_trip(self, args):
         pid, gen, start, applied, target, rejected, *rest = args
-        deferred, reason = (rest + [None, None])[:2]
+        deferred, reason, draining, draining_reason = (rest + [None] * 4)[:4]
         parsed = daemonlock._parse(daemonlock._format(*args))
         assert tuple(parsed) == (
-            pid, gen, start, applied, target, rejected, deferred, reason
+            pid, gen, start, applied, target, rejected, deferred, reason,
+            draining, draining_reason,
         )
 
     def test_an_empty_start_value_is_present_and_empty(self):
@@ -5375,3 +5378,58 @@ class TestSkipIfAppliedAndDeadSupervisors:
         start_helper(db, spec=self.SPEC)
         assert daemonlock.request_reload(db, skip_if_applied=(1, 3)).outcome == "already-applied"
         assert spy.calls == []
+
+
+class TestDrainingState:
+    """`draining=<unix time>` / `draining_reason=`: the daemon is draining for an upgrade (S-8).
+    Absent otherwise; readers that predate the keys ignore them."""
+
+    def test_a_new_lock_is_not_draining(self, db, held):
+        lock = acquire(db)
+        held.append(lock)
+        assert (lock.draining, lock.draining_reason) == (None, None)
+        info = probe(db)
+        assert (info.draining, info.draining_reason) == (None, None)
+
+    def test_it_round_trips_through_the_file_and_probe(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(applied=(1, 5), draining=1790000000, draining_reason="zfsbackup upgraded")
+        raw = read(lockfile)
+        assert b"draining=1790000000\n" in raw and b"draining_reason=zfsbackup upgraded\n" in raw
+        info = probe(db)
+        assert (info.draining, info.draining_reason) == (1790000000, "zfsbackup upgraded")
+        assert info.applied == (1, 5) and info.stable is True
+
+    def test_clearing_draining_clears_the_reason_too(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(draining=1790000000, draining_reason="why")
+        lock.set_state(draining=None)
+        assert (lock.draining, lock.draining_reason) == (None, None)
+        assert b"draining" not in read(lockfile)
+
+    def test_a_reason_without_draining_is_dropped(self, db, lockfile, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(draining_reason="orphan")
+        assert lock.draining_reason is None and b"draining" not in read(lockfile)
+
+    def test_other_state_survives_and_independent_keys_do_not_interfere(self, db, held):
+        lock = acquire(db)
+        held.append(lock)
+        lock.set_state(deferred=(1, 6), deferred_reason="busy")
+        lock.set_state(draining=1790000000)
+        lock.set_state(deferred=None)
+        info = probe(db)
+        assert info.draining == 1790000000 and info.deferred is None
+
+    @pytest.mark.parametrize("junk", [b"draining=soon\n", b"draining=-5\n", b"draining=\n"])
+    def test_an_unparseable_value_is_none_not_an_error(self, junk):
+        parsed = daemonlock._parse(b"5\n3\nstart=x\n" + junk)
+        assert parsed.draining is None
+
+    def test_an_old_reader_view_ignores_the_new_keys(self):
+        raw = b"5\n3\nstart=x\napplied=1:2\ndraining=1790000000\ndraining_reason=r\n"
+        parsed = daemonlock._parse(raw)
+        assert (parsed.applied, parsed.draining, parsed.draining_reason) == ((1, 2), 1790000000, "r")

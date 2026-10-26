@@ -42,7 +42,9 @@ JSON shape (stable; keys may be added, none renamed or removed)::
         "target":   {...} | null,       # only while a reload is being applied
         "rejected": {...} | null,
         "deferred": {...} | null,       # retryable refusal; re-checked each poll
-        "deferred_reason": str | null   # one line, as the daemon published it
+        "deferred_reason": str | null,  # one line, as the daemon published it
+        "draining": int,                # ONLY while the daemon drains for an upgrade:
+        "draining_reason": str | null   #   unix time it began, and why (S-8)
       },
       "schema_error": str | null,       # the schema problem behind exit 78
       "verdict": str,                   # one of the above
@@ -216,6 +218,14 @@ def _verdict(stored: StoreState, info: Optional[daemonlock.DaemonInfo]) -> Tuple
         return APPLYING, f"applying generation {stored.generation}"
     if info.rejected == key:
         return REJECTED, f"daemon rejected generation {stored.generation}"
+    if info.draining is not None:
+        # S-8: the daemon reloads nothing while it drains for an upgrade and
+        # exits 76; the restarted daemon loads the stored key. Not a re-check.
+        msg = (
+            f"daemon is draining for an upgrade and does not reload: generation "
+            f"{stored.generation} will be applied after the restart, not before"
+        )
+        return (DEFERRED if info.deferred == key else BEHIND), msg
     if info.deferred == key:
         # Retryable: not final, and never the rejection verdict.
         return DEFERRED, (
@@ -524,6 +534,9 @@ def render_json(status: Status, workers: Optional[Workers] = None) -> str:
             "deferred": _pair_json(info.deferred),
             "deferred_reason": info.deferred_reason,
         }
+        if info.draining is not None:  # additive, and only while it is true
+            daemon["draining"] = info.draining
+            daemon["draining_reason"] = info.draining_reason
     document: Dict[str, Any] = {
         "database": status.database,
         "stored": {
@@ -561,6 +574,13 @@ def render_text(status: Status, workers: Optional[Workers] = None, now: Optional
         else:
             gen = "unknown" if info.generation is None else f"generation {info.generation}"
             rows.append(("applied", gen))
+    if info is not None and info.draining is not None:
+        since = _iso(info.draining)
+        reason = f": {info.draining_reason}" if info.draining_reason else ""
+        rows.append((
+            "draining",
+            f"since {since} ({_ago(info.draining, time.time() if now is None else now)}){reason}",
+        ))
     if status.schema_error is not None:
         rows.append(("schema", str(status.schema_error).strip().splitlines()[0]))
     if workers is not None and workers.has_data:

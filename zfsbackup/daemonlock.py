@@ -40,6 +40,8 @@ File format (ASCII; "pid file v2")::
     rejected=<store>:<gen>\\n    # final: this key will not be retried
     deferred=<store>:<gen>\\n    # refused for now, re-checked every poll
     deferred_reason=<text>\\n    # one line, printable ASCII, at most 200 chars
+    draining=<unix time>\\n    # only while draining for an upgrade (S-8)
+    draining_reason=<text>\\n  # one line, as deferred_reason
 
 `rejected=` is final (the poll never retries that key; only a new write or a
 SIGHUP does). `deferred=` is the other kind of refusal: the stored
@@ -254,6 +256,10 @@ class DaemonInfo:
     #: `rejected`), and the daemon's one-line reason (`None` when absent).
     deferred: Optional[Tuple[int, int]] = field(default=None, compare=False)
     deferred_reason: Optional[str] = field(default=None, compare=False)
+    #: Unix time the daemon began draining for an upgrade (S-8), and why
+    #: (`None` when it is not draining). Older readers ignore both keys.
+    draining: Optional[int] = field(default=None, compare=False)
+    draining_reason: Optional[str] = field(default=None, compare=False)
     #: `False` when two consecutive reads never agreed (a torn read).
     stable: bool = field(default=True, compare=False)
 
@@ -372,6 +378,8 @@ def _format(
     rejected: Optional[Tuple[int, int]] = None,
     deferred: Optional[Tuple[int, int]] = None,
     deferred_reason: Optional[str] = None,
+    draining: Optional[int] = None,
+    draining_reason: Optional[str] = None,
 ) -> bytes:
     """Pid file content. `start=None` writes the legacy two-line form; any
     string (including "") writes the v2 form."""
@@ -386,6 +394,11 @@ def _format(
             reason = _clean_reason(deferred_reason)
             if reason:
                 text += f"deferred_reason={reason}\n"
+        if draining is not None:
+            text += f"draining={int(draining)}\n"
+            reason = _clean_reason(draining_reason)
+            if reason:
+                text += f"draining_reason={reason}\n"
     return text.encode("ascii", errors="replace")
 
 
@@ -413,6 +426,8 @@ class _Parsed(NamedTuple):
     rejected: Optional[Tuple[int, int]]
     deferred: Optional[Tuple[int, int]] = None
     deferred_reason: Optional[str] = None
+    draining: Optional[int] = None
+    draining_reason: Optional[str] = None
 
 
 def _pair(value: str) -> Optional[Tuple[int, int]]:
@@ -424,6 +439,14 @@ def _pair(value: str) -> Optional[Tuple[int, int]]:
     except ValueError:
         return None
     return (a, b) if a >= 0 and b >= 0 else None
+
+
+def _unix(value: str) -> Optional[int]:
+    try:
+        n = int(value.strip())
+    except ValueError:
+        return None
+    return n if n >= 0 else None
 
 
 def _parse(raw: bytes) -> _Parsed:
@@ -457,6 +480,8 @@ def _parse(raw: bytes) -> _Parsed:
         _pair(kv["rejected"]) if "rejected" in kv else None,
         _pair(kv["deferred"]) if "deferred" in kv else None,
         (_clean_reason(kv["deferred_reason"]) or None) if "deferred_reason" in kv else None,
+        _unix(kv["draining"]) if "draining" in kv else None,
+        (_clean_reason(kv["draining_reason"]) or None) if "draining_reason" in kv else None,
     )
 
 
@@ -500,6 +525,8 @@ def _info(raw: bytes, stable: bool = True) -> DaemonInfo:
         rejected=p.rejected,
         deferred=p.deferred,
         deferred_reason=p.deferred_reason,
+        draining=p.draining,
+        draining_reason=p.draining_reason,
         stable=stable,
     )
 
@@ -530,6 +557,8 @@ class DaemonLock:
         self.rejected: Optional[Tuple[int, int]] = None
         self.deferred: Optional[Tuple[int, int]] = None
         self.deferred_reason: Optional[str] = None
+        self.draining: Optional[int] = None
+        self.draining_reason: Optional[str] = None
 
     @property
     def held(self) -> bool:
@@ -542,6 +571,7 @@ class DaemonLock:
         data = _format(
             self.pid, self.generation, self.start, self.applied, self.target,
             self.rejected, self.deferred, self.deferred_reason,
+            self.draining, self.draining_reason,
         )
         # Overwrite first, trim second: never an empty window for a reader.
         # The overwrite is padded with newlines up to the old length, so a
@@ -567,13 +597,15 @@ class DaemonLock:
 
     def set_state(
         self, *, applied=_KEEP, target=_KEEP, rejected=_KEEP,
-        deferred=_KEEP, deferred_reason=_KEEP,
+        deferred=_KEEP, deferred_reason=_KEEP, draining=_KEEP, draining_reason=_KEEP,
     ) -> None:
         """Record reload state. Each value is `Optional[Tuple[store_id, generation]]`
         (`None` clears the key); omitted keys keep their value. Setting
         `applied` also rewrites line 2 with its generation. `deferred` (a
         refusal that is re-checked at every poll) takes an optional one-line
-        `deferred_reason`; clearing `deferred` clears its reason too. One
+        `deferred_reason`; clearing `deferred` clears its reason too.
+        `draining` (unix time; `None` clears it and its reason) and
+        `draining_reason` record a drain for an upgrade (S-8). One
         write; failures are logged at WARNING and never raised."""
         if applied is not _KEEP:
             self.applied = applied
@@ -589,6 +621,14 @@ class DaemonLock:
         if deferred_reason is not _KEEP:
             self.deferred_reason = (
                 _clean_reason(deferred_reason) or None if self.deferred is not None else None
+            )
+        if draining is not _KEEP:
+            self.draining = draining
+            if draining is None:
+                self.draining_reason = None
+        if draining_reason is not _KEEP:
+            self.draining_reason = (
+                _clean_reason(draining_reason) or None if self.draining is not None else None
             )
         try:
             self._write()

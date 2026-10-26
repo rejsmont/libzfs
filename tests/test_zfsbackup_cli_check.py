@@ -953,6 +953,110 @@ class TestDaemonEntries:
         assert json.loads(result.stdout)["state"] == "WARN"
 
 
+class TestDaemonUpgradeEntry:
+    """S-8: `daemon/upgrade` is a WARN while the daemon drains for an in-place upgrade (the pid
+    file's `draining=`), never CRIT, and absent otherwise."""
+
+    SINCE = 1_790_000_000
+    REASON = "zfsbackup upgraded (1.0.0 -> 1.1.0); draining the remote worker, then the API worker"
+
+    def draining(self, **kw):
+        info = daemonlock.DaemonInfo(
+            pid=4321, generation=7, start="tok", draining=self.SINCE, draining_reason=self.REASON, **kw)
+        return status_view.Status(
+            "/x/config.db", SimpleNamespace(store_id=1, generation=7), info,
+            status_view.IN_SYNC, "in sync")
+
+    def test_a_draining_daemon_adds_one_warning_with_since_age_and_reason(self):
+        now = self.SINCE + 125
+        entries = by_subject(check_view.daemon_entries(health, self.draining(), now))
+        assert set(entries) == {"process", "config_applied", "upgrade"}
+        entry = entries["upgrade"]
+        assert (entry.source, entry.state) == ("daemon", "WARN")
+        since = datetime.fromtimestamp(self.SINCE, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert f"since {since}" in entry.reason
+        assert health.format_duration(125.0) in entry.reason and "ago" in entry.reason
+        assert self.REASON in entry.reason
+        assert entries["process"].state == "OK" and entries["config_applied"].state == "OK"
+
+    def test_a_draining_daemon_without_a_reason_has_no_trailing_colon(self):
+        status = self.draining()
+        status = dataclasses_replace(status, daemon=dataclasses_replace(status.daemon, draining_reason=None))
+        entry = by_subject(check_view.daemon_entries(health, status, self.SINCE + 1))["upgrade"]
+        assert not entry.reason.rstrip().endswith(":")
+
+    def test_an_age_in_the_past_is_clamped_to_zero(self):
+        entry = by_subject(check_view.daemon_entries(health, self.draining(), self.SINCE - 500))["upgrade"]
+        assert health.format_duration(0.0) in entry.reason
+
+    @pytest.mark.parametrize("verdict", [
+        status_view.IN_SYNC, status_view.BEHIND, status_view.DEFERRED, status_view.REJECTED,
+        status_view.APPLYING,
+    ])
+    def test_it_is_never_crit_whatever_the_verdict(self, verdict):
+        status = dataclasses_replace(self.draining(), verdict=verdict)
+        entries = check_view.daemon_entries(health, status, self.SINCE + 5)
+        assert {e.state for e in entries if e.subject == "upgrade"} == {"WARN"}
+        assert "CRIT" not in {e.state for e in entries}
+
+    def test_not_draining_adds_nothing(self):
+        entries = by_subject(check_view.daemon_entries(health, fake_status(status_view.IN_SYNC)))
+        assert "upgrade" not in entries
+
+    def test_no_daemon_adds_nothing(self):
+        entries = check_view.daemon_entries(health, fake_status(status_view.NO_DAEMON, daemon=None))
+        assert [e.subject for e in entries] == ["process"]
+
+    def test_end_to_end_json_and_overall_warn(self, healthy):
+        healthy.daemon.set(draining=self.SINCE, draining_reason=self.REASON)
+        result = healthy.check("--json")
+        assert result.exit_code == 1, result.stderr
+        document = json.loads(result.stdout)
+        assert document["state"] == "WARN"
+        entry = {(e["source"], e["subject"]): e for e in document["entries"]}[("daemon", "upgrade")]
+        assert entry["state"] == "WARN" and self.REASON in entry["reason"]
+        assert healthy.entries()[("daemon", "process", None)]["state"] == "OK"
+
+    def test_end_to_end_it_disappears_with_the_drain(self, healthy):
+        healthy.daemon.set(draining=self.SINCE, draining_reason=self.REASON)
+        assert ("daemon", "upgrade", None) in healthy.entries()
+        healthy.daemon.set(draining=None, draining_reason=None)
+        assert ("daemon", "upgrade", None) not in healthy.entries()
+        assert healthy.check().exit_code == 0
+
+    def test_end_to_end_without_a_daemon_there_is_no_upgrade_entry(self, world):
+        world.build(daemon=False)
+        assert ("daemon", "upgrade", None) not in world.entries()
+
+    def test_end_to_end_prometheus(self, healthy):
+        healthy.daemon.set(draining=self.SINCE, draining_reason=self.REASON)
+        text = healthy.check("--prometheus").stdout
+        assert 'zfsbackup_check_state{source="daemon",subject="upgrade"} 1' in text.splitlines()
+        assert "daemon" in text and 'subject="process"} 0' in text
+        for line in text.splitlines():
+            assert line.startswith("#") or PROM_SAMPLE.match(line), line
+
+    def test_end_to_end_prometheus_has_no_upgrade_series_otherwise(self, healthy):
+        assert 'subject="upgrade"' not in healthy.check("--prometheus").stdout
+
+    def test_end_to_end_nagios_is_warning_not_critical(self, healthy):
+        healthy.daemon.set(draining=self.SINCE, draining_reason=self.REASON)
+        result = healthy.check("--nagios")
+        assert result.exit_code == 1
+        assert result.stdout.startswith("ZFSBACKUP WARN - WARN daemon: upgrade")
+
+    def test_end_to_end_text(self, healthy):
+        healthy.daemon.set(draining=self.SINCE, draining_reason=self.REASON)
+        out = healthy.check().stdout
+        assert "daemon" in out and "upgrade" in out and "draining for an upgrade since" in out
+
+
+def dataclasses_replace(obj, **kw):
+    import dataclasses
+
+    return dataclasses.replace(obj, **kw)
+
+
 # --------------------------------------------------------------------------
 # 8. the client certificate
 # --------------------------------------------------------------------------

@@ -35,6 +35,7 @@ import http.server
 import importlib.metadata
 import inspect
 import io
+import os
 import socket
 import socketserver
 import ssl
@@ -1127,3 +1128,74 @@ class TestUrllib3PinMessage:
         u3_ssl.assert_fingerprint(b"der", ":".join(digest[i:i + 2] for i in range(0, 64, 2)).upper())
         _assert_signature(u3_ssl.assert_fingerprint, "urllib3.util.ssl_.assert_fingerprint",
                           ("cert", "fingerprint"), "the pin check run on every pinned connection")
+
+
+# ---------------------------------------------------------------------------
+# importlib.metadata: what the S-8 version-skew guard reads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestImportlibMetadataContract:
+    """`zfsbackup.version._record_path` takes the dist-info directory from the PRIVATE
+    `PathDistribution._path` (one directory listing less than `files`, and it works for a
+    `RECORD`-less install) and falls back to the public `Distribution.files`. If the private
+    attribute moves, the guard silently degrades to the fallback; if `files` changes too, it
+    stats `__init__.py` instead and no longer notices a reinstall."""
+
+    @pytest.fixture
+    def dist_info(self, tmp_path, monkeypatch):
+        site = tmp_path / "site"
+        info = site / "zfsbackup-9.9.9.dist-info"
+        info.mkdir(parents=True)
+        (info / "METADATA").write_text("Metadata-Version: 2.1\nName: zfsbackup\nVersion: 9.9.9\n")
+        (info / "RECORD").write_text("zfsbackup-9.9.9.dist-info/RECORD,,\n")
+        monkeypatch.syspath_prepend(str(site))
+        importlib.invalidate_caches()
+        return info
+
+    def test_a_path_distribution_exposes_its_dist_info_directory_as__path(self, dist_info):
+        dist = importlib.metadata.distribution("zfsbackup")
+        assert type(dist).__name__ == "PathDistribution"
+        assert hasattr(dist, "_path"), (
+            "importlib.metadata.PathDistribution no longer has `_path`: "
+            "zfsbackup.version._record_path falls back to Distribution.files"
+        )
+        assert os.fspath(dist._path) == str(dist_info)
+
+    def test_the_private_path_and_the_public_files_agree_on_the_record(self, dist_info):
+        dist = importlib.metadata.distribution("zfsbackup")
+        records = [f for f in dist.files or () if f.name == "RECORD"]
+        assert len(records) == 1, "Distribution.files must list the dist-info RECORD"
+        assert records[0].parent.name.endswith(".dist-info")
+        assert os.fspath(records[0].locate()) == str(dist_info / "RECORD")
+        assert os.fspath(dist._path / "RECORD") == str(dist_info / "RECORD")
+
+    def test_files_is_none_without_a_record_and_the_guard_copes(self, dist_info):
+        (dist_info / "RECORD").unlink()
+        dist = importlib.metadata.distribution("zfsbackup")
+        assert dist.files is None
+        from zfsbackup import version
+
+        assert version._record_path(dist) == str(dist_info / "RECORD")        # via `_path`
+        assert version._record_path(SimpleNamespace(files=dist.files)) is None
+
+    def test_a_dist_info_added_after_the_first_lookup_is_seen_after_invalidate_caches(
+        self, tmp_path, monkeypatch
+    ):
+        site = tmp_path / "site2"
+        site.mkdir()
+        monkeypatch.syspath_prepend(str(site))
+        importlib.invalidate_caches()
+        before = importlib.metadata.version("zfsbackup")
+        info = site / "zfsbackup-8.8.8.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text("Metadata-Version: 2.1\nName: zfsbackup\nVersion: 8.8.8\n")
+        importlib.invalidate_caches()
+        assert importlib.metadata.version("zfsbackup") == "8.8.8" != before
+
+    def test_the_version_comes_from_the_same_object_as_the_path(self, dist_info):
+        """The guard reads `.version` and `_path` from ONE `distribution()` call."""
+        dist = importlib.metadata.distribution("zfsbackup")
+        assert dist.version == "9.9.9"
+        assert dist._path.name == "zfsbackup-9.9.9.dist-info"

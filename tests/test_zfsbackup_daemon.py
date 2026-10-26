@@ -1915,7 +1915,13 @@ class TestRunReadsOnceAndReportsTheGeneration:
             'dry_run_override': False,
             'workers_lock': _daemonlock.workers_lock_path(resolved),
             'client_id': None,          # `host_identity` holds none yet (the snapshot's own)
+            # S-8: the signature of the code this PROCESS started with (taken by
+            # `_run_startup` before anything that can wait), not one the daemon reads itself.
+            'started_signature': kwargs['started_signature'],
         }
+        assert kwargs['started_signature'] is None or isinstance(
+            kwargs['started_signature'], _daemon_module.CodeSignature
+        )
 
     def test_dry_run_is_handed_on_so_a_reload_can_reapply_it(self, bumped, mocker, lock_spy):
         resolved, _ = bumped
@@ -2023,16 +2029,22 @@ class TestWorkerConfigHandoff:
         ('snapshot', 'SnapshotWorker'), ('pruning', 'PruningWorker'),
         ('api', 'ApiWorker'), ('remote', 'RemoteBackupWorker'),
     ])
+    @pytest.mark.parametrize('guard', [True, False], ids=['guard-on', 'guard-off'])
     def test_the_constructor_call_is_exactly_config_stop_log_level(
-        self, supervisor, mocker, name, cls
+        self, supervisor, mocker, name, cls, guard
     ):
         daemon, snapshot = supervisor
+        # Hermetic: whether this environment has an installed distribution is irrelevant.
+        daemon._code_signature = (
+            _daemon_module.CodeSignature('1.0.0', '/x/RECORD', (1, 2, 3)) if guard else None
+        )
         factory = mocker.patch(f'zfsbackup.daemon.{cls}')
         daemon._new_worker(name)
         # Positional (config, stop flag, log level) as before, plus the
         # keyword-only reload trio, plus (M9) what only that worker gets: the
         # API worker the config database (TLS identity and trust only), the
-        # remote worker the TLS directory and the Handoff's client id.
+        # remote worker the TLS directory and the Handoff's client id, plus
+        # (S-8) the supervisor's code signature when the version-skew guard is on.
         extra = {
             'api': {'config_db': daemon.resolved_config},
             'remote': {
@@ -2040,6 +2052,8 @@ class TestWorkerConfigHandoff:
                 'client_id': None,
             },
         }.get(name, {})
+        if guard:
+            extra = {**extra, 'code_signature': daemon._code_signature.as_tuple()}
         factory.assert_called_once_with(
             snapshot.config, daemon._stop_event, logging.DEBUG,
             reload_epoch=daemon._reload_epoch,
@@ -2047,6 +2061,7 @@ class TestWorkerConfigHandoff:
             workers_lock=daemon._workers_lock_path(),
             **extra,
         )
+        assert ('code_signature' in factory.call_args.kwargs) is guard
 
     def test_a_restart_is_constructed_from_the_same_config_object(self, supervisor, mocker):
         daemon, snapshot = supervisor

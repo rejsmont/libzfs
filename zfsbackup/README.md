@@ -559,8 +559,9 @@ has a comment saying why. In short:
   inside a 30 s budget.
 - **`Restart=on-failure`, `RestartForceExitStatus=SIGHUP 76`, `RestartSec=60`**: a daemon killed by a stray
   SIGHUP in the few milliseconds before it ignores the signal is restarted, not treated as a clean exit.
-  Exit status 76 is reserved for "the installed zfsbackup changed under me, restart me" (a later release; nothing
-  exits 76 yet).
+  Exit status 76 means "the installed zfsbackup (or its Python interpreter) changed under me, restart me":
+  the daemon drains, finishing the work in hand without cutting a transfer, then exits 76 and systemd starts it
+  once, after `RestartSec` (see [Upgrading](#upgrading-and-downgrading)). Nothing else exits 76.
 - **No `ProtectSystem=`, `ProtectHome=`, `PrivateTmp=`** or any other sandboxing that gives the service a
   private mount namespace: the daemon runs `zfs create` and `zfs receive`, and the datasets they mount must
   appear on the host, not only inside the service's namespace. Do not add them without testing a real receive.
@@ -697,9 +698,30 @@ zfsbackup-config check --prometheus --output /var/lib/node_exporter/textfile_col
 
 ## Upgrading and downgrading
 
-**Until the daemon can restart itself after an upgrade, stop it first.** `pip install --upgrade` under a
-running daemon is not safe: workers import parts of the program lazily from disk, so they would load new
-code beside old.
+**Recommended: stop it first** (step 3). An in-place `pip install --upgrade` under a running daemon is
+detected and handled, but it is the fallback, not the plan: workers import parts of the program lazily from
+disk, so for a few seconds a worker could load new code beside old.
+
+**What happens on an in-place install.** The daemon records the installed version, the identity of the
+package's `RECORD` file and the Python interpreter's binary when the process starts, and compares them every
+10 s (and before it starts a worker). A change must be read twice, 10 s apart, before the daemon acts on it, so
+a transient read error cannot restart a healthy daemon. It then logs one WARNING (old -> new), shows
+`STATUS=` in `systemctl status` and `draining=` in the pid file, reloads no configuration (a `zfsbackup-config`
+write is answered as deferred, to be applied after the restart, not re-checked) and **drains**: the remote
+worker, then the API worker, which load parts of the program from disk on demand, finish what they are doing
+at their next safe point (a `zfs send` or an inbound receive runs to its end, however long that takes, not cut
+after the usual 30 s stop budget) and are not restarted; the API worker keeps serving until the remote worker
+has left. Snapshots and pruning go on meanwhile (if one of them is found not running, the drain is cut short
+with the ordinary stop). When those two have left, the daemon stops the rest the usual way and exits
+with status 76; systemd restarts it **once**, `RestartSec` (60 s) later, on the new code, and `ExecStartPre`
+migrates the database then. In that gap `zfsbackup-config check` reports the daemon absent. A `systemctl
+stop` or SIGTERM during the drain is an ordinary stop (30 s budget, normal exit status, no restart). A daemon
+that starts while the install is half done (the package files present, their metadata missing) exits 76
+straight away and is retried after `RestartSec`.
+
+**Not covered:** upgrading a dependency on its own (werkzeug, cryptography, SQLAlchemy, ...) with the
+package untouched, and source edits of an editable (`pip install -e`) install: only a reinstall is seen. After
+those run `systemctl restart zfsbackup`. A daemon run outside systemd exits 76 and stays down.
 
 1. **Read the release notes** for a protocol or schema bump. `zfsbackupd --version` and
    `zfsbackup-config --version` print `<version> (wire protocol N, config schema <revision>)`; compare them
@@ -1080,8 +1102,9 @@ list with background is in [docs/production_readiness_report.md](../docs/product
 - **There is no restore over the API.** Restoring is ZFS work done by an operator (see [Restoring data](#restoring-data)).
 
 **Operation**
-- **Upgrading needs the daemon stopped** (see [Upgrading](#upgrading-and-downgrading)). The self-restart on
-  upgrade (exit status 76 in the unit) arrives in a later release.
+- **Stop the daemon to upgrade** (see [Upgrading](#upgrading-and-downgrading)). An in-place install is
+  detected and the daemon drains and exits 76 for systemd to restart it, but a dependency-only upgrade and
+  edits to an editable install are not detected (`systemctl restart zfsbackup`).
 - **`--test-config` does not check that datasets exist.** The snapshot worker checks them at start and logs
   an error per missing dataset.
 - **On macOS the CLI never signals the daemon**, because it cannot prove which process holds the lock; the

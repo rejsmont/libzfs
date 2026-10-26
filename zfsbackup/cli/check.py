@@ -16,7 +16,7 @@ What it does, in order:
    makes the read-only `zfs list` / `zfs get` calls; `health.evaluate` grades them.
 3. Adds this command's own entries as `health.CheckEntry`s, so every serialiser
    handles them: the daemon (not running = CRIT; running but not on the stored
-   generation = WARN), the client certificate (expired = CRIT, expiring
+   generation = WARN; draining for an upgrade = WARN `daemon/upgrade`), the client certificate (expired = CRIT, expiring
    within 30 days or unusable = WARN) and, once the daemon's workers have
    written their status files (`<db>.status/<worker>.json`, S-7), the outcome of
    their last attempts (below).
@@ -130,8 +130,13 @@ class OutcomeEntry(_health.CheckEntry):
 # --------------------------------------------------------------------------
 
 
-def daemon_entries(health: Any, status: status_view.Status) -> List[Any]:
-    """The daemon's presence, and whether it runs the stored configuration."""
+def daemon_entries(
+    health: Any, status: status_view.Status, now: Optional[float] = None
+) -> List[Any]:
+    """The daemon's presence, whether it runs the stored configuration and,
+    only while it drains for an in-place upgrade (S-8), a `daemon/upgrade`
+    WARN (never CRIT: snapshots and pruning continue and systemd restarts the
+    daemon; absent otherwise)."""
     CheckEntry = health.CheckEntry
     info = status.daemon
     if info is None:
@@ -147,6 +152,15 @@ def daemon_entries(health: Any, status: status_view.Status) -> List[Any]:
     else:  # behind, deferred, rejected, unreadable: not on the stored configuration
         state, reason = health.STATE_WARN, status.message
     entries.append(CheckEntry(SOURCE_DAEMON, "config_applied", state, reason))
+    if info.draining is not None:
+        moment = time.time() if now is None else now
+        since = datetime.fromtimestamp(info.draining, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        why = f": {info.draining_reason}" if info.draining_reason else ""
+        entries.append(CheckEntry(
+            SOURCE_DAEMON, "upgrade", health.STATE_WARN,
+            f"draining for an upgrade since {since} "
+            f"({health.format_duration(max(moment - info.draining, 0.0))} ago){why}",
+        ))
     return entries
 
 
@@ -312,7 +326,7 @@ def gather(
     else:
         if status.schema_error is not None:
             raise status.schema_error
-        daemon = daemon_entries(health, status)
+        daemon = daemon_entries(health, status, now.timestamp())
 
     from zfsbackup import health_collect
 

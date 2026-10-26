@@ -200,7 +200,9 @@ class TestExitReason:
         assert worker._exit_reason() is ExitReason.STOP
 
     def test_the_declaration_order_is_the_priority(self):
-        assert list(ExitReason) == [ExitReason.STOP, ExitReason.SUPERVISOR_GONE, ExitReason.RELOAD]
+        assert list(ExitReason) == [
+            ExitReason.STOP, ExitReason.SUPERVISOR_GONE, ExitReason.RELOAD, ExitReason.UPGRADE,
+        ]
 
     def test_without_an_epoch_reload_is_never_reported(self, monkeypatch, parts):
         worker, _ = _worker(monkeypatch, parts, epoch=False, born=5)

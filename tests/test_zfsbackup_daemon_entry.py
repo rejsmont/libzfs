@@ -14,8 +14,8 @@ what only a real process shows:
   the way out.
 - ``TestSpawnWithThreads``    `_spawn` under fork with extra threads logs one ERROR
   per spawn and still spawns; nothing under spawn/forkserver or single-threaded.
-- ``TestNothingExits76``      the version-change exit status (S-8) is defined
-  and used by nothing yet.
+- ``TestNothingExits76``      the version-change exit status (S-8) is defined in
+  `version.py`, returned by `BackupDaemon.run` alone, and named nowhere else.
 - ``TestGeneratedWrapper``    an extension-less script of the exact shape pip
   generates for ``zfsbackupd = zfsbackup.daemon_entry:main``, under fork, spawn
   and forkserver: it reaches READY, turns over a reload, survives a storm of
@@ -237,7 +237,7 @@ class TestSighupOrdering:
 
 
 # ---------------------------------------------------------------------------
-# Nothing exits 76 yet
+# Who may exit 76
 # ---------------------------------------------------------------------------
 
 
@@ -245,27 +245,75 @@ def _python_files():
     return sorted(p for p in PACKAGE.rglob("*.py") if "__pycache__" not in p.parts)
 
 
+#: The only modules that may name `EXIT_CODE_VERSION_CHANGED`: `version.py` defines it,
+#: `daemon.py` returns it from `BackupDaemon.run` (S-8), and `workers.py` refers to it in prose.
+SANCTIONED_76 = {"version.py", "daemon.py", "workers.py"}
+
+
+def _names_76(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "EXIT_CODE_VERSION_CHANGED":
+            yield node
+        elif isinstance(node, ast.Attribute) and node.attr == "EXIT_CODE_VERSION_CHANGED":
+            yield node
+        elif isinstance(node, ast.alias) and node.name == "EXIT_CODE_VERSION_CHANGED":
+            yield node
+
+
 @pytest.mark.unit
 class TestNothingExits76:
-    """`EXIT_CODE_VERSION_CHANGED = 76` is reserved for the self-restart on
-    upgrade (S-8) and is defined in `zfsbackup/version.py` alone. Until S-8
-    lands, no code path may exit with it, nor reference it: an unlisted 76
-    would make a unit's `RestartForceExitStatus=76` restart a daemon for no
-    reason. (S-8 replaces this class with its own tests.)"""
+    """`EXIT_CODE_VERSION_CHANGED = 76` is the self-restart on upgrade (S-8) and is defined in
+    `zfsbackup/version.py`. A unit's `RestartForceExitStatus=76` restarts the daemon on it, so
+    an unlisted 76 would restart a daemon for no reason: only `BackupDaemon.run` may return it,
+    and only after a drain for an upgrade."""
 
-    def test_the_constant_is_referenced_nowhere_else(self):
+    def test_the_constant_is_referenced_only_where_s8_uses_it(self):
         offenders = []
         for path in _python_files():
-            if path.name == "version.py" and path.parent == PACKAGE:
+            if path.parent == PACKAGE and path.name in SANCTIONED_76:
                 continue
-            for node in ast.walk(ast.parse(path.read_text(), str(path))):
-                if isinstance(node, ast.Name) and node.id == "EXIT_CODE_VERSION_CHANGED":
-                    offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}")
-                elif isinstance(node, ast.Attribute) and node.attr == "EXIT_CODE_VERSION_CHANGED":
-                    offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}")
-                elif isinstance(node, ast.alias) and node.name == "EXIT_CODE_VERSION_CHANGED":
-                    offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+            for node in _names_76(ast.parse(path.read_text(), str(path))):
+                offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}")
         assert offenders == []
+
+    def test_only_run_and_the_startup_refusal_return_it(self):
+        tree = ast.parse((PACKAGE / "daemon.py").read_text())
+        returns = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Return)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "EXIT_CODE_VERSION_CHANGED"
+                ):
+                    returns.append(fn.name)
+        # `run` after a drain; `_run_startup` when the install is in flight before the first fork
+        assert sorted(returns) == ["_run_startup", "run"]
+
+    def test_workers_never_exit_with_it(self):
+        """A worker leaves with `WORKER_EXIT_VERSION_SKEW`; 76 is the supervisor's alone."""
+        tree = ast.parse((PACKAGE / "workers.py").read_text())
+        code = [
+            n for n in _names_76(tree)
+            if not isinstance(n, ast.alias)
+        ]
+        assert code == [], "workers.py must not use the constant in code, only in prose"
+
+    def test_the_worker_exit_status_is_defined_once_and_is_not_76(self):
+        from zfsbackup import version, workers
+
+        assert workers.WORKER_EXIT_VERSION_SKEW == 4 != version.EXIT_CODE_VERSION_CHANGED
+        offenders = []
+        for path in _python_files():
+            for node in ast.walk(ast.parse(path.read_text(), str(path))):
+                if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "WORKER_EXIT_VERSION_SKEW"
+                    for t in node.targets
+                ):
+                    offenders.append(path.name)
+        assert offenders == ["workers.py"]
 
     def test_no_literal_76_exit_status_in_the_package(self):
         offenders = []

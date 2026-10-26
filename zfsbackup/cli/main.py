@@ -974,7 +974,10 @@ def status_cmd(
         return
     code = status_view.wait_exit_code(current)
     if code == 75:
-        extra = "" if "daemon log" in current.message else "; if it does not catch up, see the daemon log"
+        extra = (
+            "" if "daemon log" in current.message or "after the restart" in current.message
+            else "; if it does not catch up, see the daemon log"
+        )
         click.echo(
             f"error: the daemon is not yet in sync after {wait:g}s: {current.message}{extra}",
             err=True,

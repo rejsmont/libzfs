@@ -832,7 +832,7 @@ class TestWorkerConstructors:
         status = [] if cls is ApiWorker else ['status_dir']
         assert list(sig.parameters) == [
             'self', 'config', 'stop_event', 'log_level',
-            'reload_epoch', 'born_epoch', 'workers_lock', *extra, *status,
+            'reload_epoch', 'born_epoch', 'workers_lock', *extra, *status, 'code_signature',
         ]
         # The reload trio is keyword-only with inert defaults, so every old
         # positional call keeps working; so are the class-specific extras (M9:
@@ -841,7 +841,9 @@ class TestWorkerConstructors:
         for trio, default in (('reload_epoch', None), ('born_epoch', 0), ('workers_lock', None)):
             assert sig.parameters[trio].kind is inspect.Parameter.KEYWORD_ONLY
             assert sig.parameters[trio].default == default
-        for name_ in [*extra, *status]:
+        # `code_signature` (S-8) is the last: the supervisor's `version.code_signature()`,
+        # `None` = no version-skew check.
+        for name_ in [*extra, *status, 'code_signature']:
             assert sig.parameters[name_].kind is inspect.Parameter.KEYWORD_ONLY
             assert sig.parameters[name_].default is None
 
@@ -849,11 +851,11 @@ class TestWorkerConstructors:
         sig = inspect.signature(BaseWorker.__init__)
         assert list(sig.parameters) == [
             'self', 'worker_name', 'config', 'stop_event', 'log_level',
-            'reload_epoch', 'born_epoch', 'workers_lock', 'status_dir',
+            'reload_epoch', 'born_epoch', 'workers_lock', 'status_dir', 'code_signature',
         ]
         assert [n for n, p in sig.parameters.items()
                 if p.kind is inspect.Parameter.KEYWORD_ONLY] == [
-            'reload_epoch', 'born_epoch', 'workers_lock', 'status_dir']
+            'reload_epoch', 'born_epoch', 'workers_lock', 'status_dir', 'code_signature']
 
     @pytest.mark.parametrize('cls, name', WORKER_CLASSES)
     def test_the_old_dry_run_and_path_parameters_are_gone(self, cls, name, worker_config):

@@ -123,6 +123,7 @@ class FakeLock:
         self.state = {
             "applied": None, "target": None, "rejected": None,
             "deferred": None, "deferred_reason": None,
+            "draining": None, "draining_reason": None,        # S-8
         }
 
     def set_state(self, **kw):
@@ -131,6 +132,8 @@ class FakeLock:
         self.state.update(kw)
         if kw.get("deferred", True) is None:        # like DaemonLock: no key, no reason
             self.state["deferred_reason"] = None
+        if kw.get("draining", True) is None:
+            self.state["draining_reason"] = None
 
     def kinds(self, key):
         return [c for c in self.calls if key in c]
@@ -145,7 +148,8 @@ class FakeWorker:
 
     def __init__(self, name, world, config, stop_event, verbose=False, *,
                  reload_epoch=None, born_epoch=0, workers_lock=None,
-                 config_db=None, tls_dir=None, client_id=None, status_dir=None):
+                 config_db=None, tls_dir=None, client_id=None, status_dir=None,
+                 code_signature=None):
         self.name = name
         self.world = world
         self.config = config
@@ -161,6 +165,8 @@ class FakeWorker:
         self.client_id = client_id
         # S-7a: `<db>.status`, given to every worker but the API worker.
         self.status_dir = status_dir
+        # S-8: the supervisor's `version.code_signature()` (absent when the guard is off).
+        self.code_signature = code_signature
         self.pid = None
         self._alive = False
         self.exitcode = None

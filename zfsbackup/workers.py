@@ -27,6 +27,18 @@ Nothing that owns a SQLite handle may cross the process boundary -- never a
 `dispose_all()` before each fork so that no inherited descriptor exists
 either. A `BackupConfig` is plain dataclasses, safe on both counts.
 
+**Code-version skew (S-8).** `spawn` and `forkserver` import from disk, and
+the remote and API workers import `zfsbackup.remote` / `zfsbackup.api` lazily,
+so a worker started after an in-place upgrade runs new code under an old
+supervisor. The first thing `run()` does, before those imports, is compare
+`version.code_signature()` with the supervisor's (`code_signature=`); on a
+difference it exits `WORKER_EXIT_VERSION_SKEW`. The supervisor then reads the
+signature itself: a confirmed change starts a drain (`EPOCH_UPGRADE_DRAIN`: the
+remote and API workers leave at their next safe point, never mid-transfer, and
+are not respawned; snapshot and pruning keep running until the end) and the
+daemon exits 76 so that its service manager restarts it on the new code;
+otherwise the worker is simply restarted.
+
 A worker also never outlives its supervisor. The stop flag cannot say "the
 supervisor was `kill -9`'d" (nobody is left to raise it), so every worker
 watches for that itself and treats it as a stop; see `_SupervisorWatch`.
@@ -49,6 +61,7 @@ from zfsbackup import health, logsetup, procident
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager, PruneResult
 from zfsbackup.config import BackupConfig
 from zfsbackup.stopflag import STOP_POLL, ReloadEpoch, StopFlag
+from zfsbackup.version import CodeSignature, code_signature
 
 #: What a worker accepts as its stop signal.
 #:
@@ -74,6 +87,29 @@ MIN_WORKER_INTERVAL = 1.0
 #: supervisor counts it as a turnover only when the worker's `born_epoch` is
 #: older than the current epoch; otherwise it is a crash.
 WORKER_EXIT_RELOAD = 3
+
+#: The value the supervisor writes to the shared `ReloadEpoch` to drain the
+#: remote worker for an upgrade (S-8), the first stage of a two-stage drain
+#: (see `EPOCH_UPGRADE_DRAIN_API`). No real epoch is negative;
+#: unlike a reload's change it means "leave at your next safe point and do not
+#: come back" (`ExitReason.UPGRADE`, exit 0) for the workers with
+#: `drains_for_upgrade`, and nothing at all for the others (snapshot, pruning),
+#: which keep running until the supervisor stops them.
+EPOCH_UPGRADE_DRAIN = -1
+
+#: The second stage of the drain: the remote worker has left, now the API
+#: worker may drain too (it keeps serving until then, so a remote worker stuck
+#: in an uninterruptible `zfs` call cannot leave the server refusing every
+#: client). The remote worker obeys -1 and -2, the API worker only -2.
+EPOCH_UPGRADE_DRAIN_API = -2
+
+#: Exit status of a worker that found, at its start, that the installed
+#: zfsbackup is no longer the one its supervisor started with (S-8: an in-place
+#: upgrade; `spawn`/`forkserver` import from disk, so it may be running new
+#: code under an old supervisor). Not a crash: the supervisor counts it toward
+#: no restart limit, does not respawn the worker, and starts the cooperative
+#: stop that ends in `version.EXIT_CODE_VERSION_CHANGED`.
+WORKER_EXIT_VERSION_SKEW = 4
 
 #: How long the API worker waits for in-flight receives on a STOP or a gone
 #: supervisor, before abandoning them (the sender resumes: `zfs receive -s`).
@@ -105,11 +141,15 @@ def _clip_for_log(text: str) -> str:
 
 class ExitReason(enum.Enum):
     """Why a worker should leave its loop. Priority is the declaration order:
-    a stop beats a gone supervisor beats a reload."""
+    a stop beats a gone supervisor beats a reload or an upgrade drain."""
 
     STOP = 'stop'
     SUPERVISOR_GONE = 'supervisor-gone'
     RELOAD = 'reload'
+    #: The supervisor is draining for an in-place upgrade (S-8): finish the
+    #: work in hand like for a reload (never mid-transfer, the API worker
+    #: waits for its in-flight receives), then exit 0 -- no respawn follows.
+    UPGRADE = 'upgrade'
 
 
 def _setup_logging(log_level: int = logging.INFO) -> None:
@@ -280,12 +320,27 @@ class _SupervisorWatch:
     born_epoch: int = 0
     workers_lock: Optional[str] = None
     supervisor_start: Optional[str] = None
+    #: The supervisor's `version.code_signature()` taken at its start (`None`
+    #: = the guard is off). Not part of the reload `Handoff`: it never changes
+    #: in a supervisor's life.
+    code_signature: Optional[tuple] = None
+    #: Whether this worker leaves for an upgrade drain (S-8,
+    #: `EPOCH_UPGRADE_DRAIN`). Only the workers that import code lazily from
+    #: disk do (remote, API); the snapshot and pruning workers keep running
+    #: until the supervisor stops them.
+    drains_for_upgrade = False
+    #: The shared-epoch value at or below which this worker drains: -1 for the
+    #: remote worker, -2 for the API worker (`EPOCH_UPGRADE_DRAIN_API`), `None`
+    #: for the workers that do not drain. Kept consistent with
+    #: `drains_for_upgrade` by the two subclasses that set it.
+    upgrade_drain_epoch: Optional[int] = None
 
     def _watch_init(
         self,
         reload_epoch: Optional[ReloadEpoch] = None,
         born_epoch: int = 0,
         workers_lock=None,
+        code_signature=None,
     ) -> None:
         #: Constructors run in the supervisor, so this is its pid. Not a
         #: constructor parameter: the worker signatures are pinned to
@@ -297,6 +352,11 @@ class _SupervisorWatch:
         self.reload_epoch = reload_epoch
         self.born_epoch = born_epoch
         self.workers_lock = workers_lock
+        #: A plain tuple (`CodeSignature.as_tuple()`) or `None`; a
+        #: `CodeSignature` is accepted and converted.
+        self.code_signature = (
+            code_signature.as_tuple() if hasattr(code_signature, 'as_tuple') else code_signature
+        )
         self._workers_lock_fd: Optional[int] = None
         self._parent_at_start: Optional[int] = None
         self._direct_child = True
@@ -362,6 +422,46 @@ class _SupervisorWatch:
                 )
         return True
 
+    def _exit_on_version_skew(self, logger) -> None:
+        """First act of a worker's `run()` (S-8), BEFORE any lazy import of
+        `zfsbackup.remote` / `zfsbackup.api`: compare the installed code's
+        signature, read now, with the one the supervisor started with. A
+        difference means the code on disk is not what the supervisor runs (an
+        in-place upgrade; under `spawn`/`forkserver` this process may have just
+        imported the new code): leave at once with `WORKER_EXIT_VERSION_SKEW`
+        instead of running a mix. The supervisor decides what that means: it
+        reads the signature itself and drains the daemon only if it sees the
+        same difference twice (a transient read error is not an upgrade);
+        otherwise it just restarts this worker. Checked even when a stop is
+        pending (the supervisor ignores exit 4 during a stop); a signature
+        that cannot be read or compared is "no change". One file stat; no
+        `zfs` call.
+
+        Cross-version contract (a worker and its supervisor can be different
+        code only in this window, but keep it stable): the `code_signature=`
+        constructor keyword, a plain tuple; exit status 4
+        (`WORKER_EXIT_VERSION_SKEW`); and `EPOCH_UPGRADE_DRAIN` (-1, then
+        -2 for the API worker) in the shared `ReloadEpoch`."""
+        expected = self.code_signature
+        if expected is None:
+            return
+        try:
+            current = code_signature()
+            if current is None or current.as_tuple() == tuple(expected):
+                return
+        except Exception:
+            return
+        try:
+            what = current.change_from(CodeSignature(*expected))
+        except Exception:
+            what = "the installed code differs"
+        logger.warning(
+            f"{self.name}: the installed zfsbackup changed since the daemon "
+            f"started ({what}); not starting with mixed code. The supervisor "
+            "checks for itself and drains the daemon (exit 76) or restarts this worker."
+        )
+        sys.exit(WORKER_EXIT_VERSION_SKEW)
+
     def _hold_workers_lock(self) -> None:
         """Take `LOCK_SH` on `<db>.workers.lock` for the life of this process
         (item 18.5): the presence lock that lets a restarted daemon see
@@ -387,8 +487,14 @@ class _SupervisorWatch:
         if self._supervisor_gone():
             return ExitReason.SUPERVISOR_GONE
         epoch = self.reload_epoch
-        if epoch is not None and epoch.get() != self.born_epoch:
-            return ExitReason.RELOAD
+        if epoch is not None:
+            current = epoch.get()
+            if current < 0:
+                # A drain stage (S-8), never a real epoch.
+                mine = self.upgrade_drain_epoch
+                return ExitReason.UPGRADE if mine is not None and current <= mine else None
+            if current != self.born_epoch:
+                return ExitReason.RELOAD
         return None
 
     def _should_stop(self) -> bool:
@@ -440,6 +546,7 @@ class BaseWorker(_SupervisorWatch, Process):
         born_epoch: int = 0,
         workers_lock=None,
         status_dir=None,
+        code_signature=None,
     ):
         """`config` is the supervisor's detached `BackupConfig`, with
         `--dry-run` already applied. It is used as is; the worker never
@@ -452,13 +559,16 @@ class BaseWorker(_SupervisorWatch, Process):
         `<db>.workers.lock` to hold `LOCK_SH` on while running (`None` = none).
         `status_dir` is `<db>.status` (`daemon.Handoff.status_dir`; `None` =
         record no outcomes, as under `--dry-run`): the worker writes its own
-        `<worker>.json` there (S-7, `health.StatusWriter`).
+        `<worker>.json` there (S-7, `health.StatusWriter`). `code_signature`
+        is the supervisor's `version.code_signature()` (`None` = no skew
+        check): `run()` leaves with `WORKER_EXIT_VERSION_SKEW` if the installed
+        code no longer matches it (S-8).
         """
         super().__init__(name=worker_name, daemon=True)
         self.config = config
         self.stop_event = stop_event
         self.log_level = log_level
-        self._watch_init(reload_epoch, born_epoch, workers_lock)
+        self._watch_init(reload_epoch, born_epoch, workers_lock, code_signature)
         self._status_dir = status_dir
         #: Built by `run()` in the worker process (never pickled, never
         #: shared); `None` = record nothing.
@@ -530,8 +640,9 @@ class BaseWorker(_SupervisorWatch, Process):
     def run(self) -> None:
         _init_child_process(self.log_level)
         self._arm_supervisor_watch()
-        self._hold_workers_lock()
         logger = logging.getLogger(__name__)
+        self._exit_on_version_skew(logger)
+        self._hold_workers_lock()
         logger.info(f"{self.name} started")
 
         config = self.config
@@ -544,7 +655,11 @@ class BaseWorker(_SupervisorWatch, Process):
             )
             interval = MIN_WORKER_INTERVAL
         self._status = self._open_status(config, logger)
-        self._before_loop(config, manager)
+        # Skipped when a reason to leave is already pending (a stop, a reload
+        # or a drain that arrived while this worker was starting): the lazy
+        # imports and the dataset checks of `_before_loop` are pointless then.
+        if self._exit_reason() is None:
+            self._before_loop(config, manager)
 
         # `_exit_reason` (stop flag > supervisor gone > reload) is checked at
         # every safe point: loop top, between datasets, and each `_wait`
@@ -593,6 +708,12 @@ class BaseWorker(_SupervisorWatch, Process):
                 f"{self.name} finished its current work; exiting to switch configuration"
             )
             sys.exit(WORKER_EXIT_RELOAD)
+        if reason is ExitReason.UPGRADE:
+            logger.info(
+                f"{self.name} finished its current work; exiting so that the daemon "
+                "can restart on the upgraded zfsbackup"
+            )
+            return
         # STOP and SUPERVISOR_GONE both end here with exit status 0. The
         # latter was already logged once, at ERROR, by the watch.
         logger.info(f"{self.name} stopped")
@@ -611,11 +732,12 @@ class SnapshotWorker(BaseWorker):
         born_epoch: int = 0,
         workers_lock=None,
         status_dir=None,
+        code_signature=None,
     ):
         super().__init__(
             'snapshot-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
-            status_dir=status_dir,
+            status_dir=status_dir, code_signature=code_signature,
         )
 
     _STATUS_KIND = health.KIND_SNAPSHOT
@@ -680,11 +802,12 @@ class PruningWorker(BaseWorker):
         born_epoch: int = 0,
         workers_lock=None,
         status_dir=None,
+        code_signature=None,
     ):
         super().__init__(
             'pruning-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
-            status_dir=status_dir,
+            status_dir=status_dir, code_signature=code_signature,
         )
 
     _STATUS_KIND = health.KIND_PRUNE
@@ -762,6 +885,11 @@ class PruningWorker(BaseWorker):
 class RemoteBackupWorker(BaseWorker):
     """Worker that periodically sends snapshots to configured remote destinations."""
 
+    #: Imports `zfsbackup.remote` lazily from disk: leaves for an upgrade drain
+    #: first (stage 1).
+    drains_for_upgrade = True
+    upgrade_drain_epoch = EPOCH_UPGRADE_DRAIN
+
     def __init__(
         self,
         config: BackupConfig,
@@ -774,6 +902,7 @@ class RemoteBackupWorker(BaseWorker):
         tls_dir=None,
         client_id: Optional[str] = None,
         status_dir=None,
+        code_signature=None,
     ):
         """`tls_dir` is `<db>.tls` (the default client TLS identity lives
         there unless `client_cert_file`/`client_key_file` override it);
@@ -787,7 +916,7 @@ class RemoteBackupWorker(BaseWorker):
         super().__init__(
             'remote-backup-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
-            status_dir=status_dir,
+            status_dir=status_dir, code_signature=code_signature,
         )
         self.tls_dir = tls_dir
         self.client_id = client_id
@@ -2019,6 +2148,11 @@ def _remove_tree(path) -> None:
 class ApiWorker(_SupervisorWatch, Process):
     """Worker that serves the HTTPS API (inspection and remote-backup receive)."""
 
+    #: Imports `zfsbackup.api` lazily from disk: leaves for an upgrade drain,
+    #: but only after the remote worker has (stage 2); it serves until then.
+    drains_for_upgrade = True
+    upgrade_drain_epoch = EPOCH_UPGRADE_DRAIN_API
+
     #: Class-level default, so a worker built by a test that bypasses
     #: `__init__` refuses to serve rather than serving without trust.
     config_db = None
@@ -2036,6 +2170,7 @@ class ApiWorker(_SupervisorWatch, Process):
         born_epoch: int = 0,
         workers_lock=None,
         config_db=None,
+        code_signature=None,
     ):
         """`config` is the supervisor's detached `BackupConfig`, dry-run
         already applied; see `BaseWorker`.
@@ -2051,7 +2186,7 @@ class ApiWorker(_SupervisorWatch, Process):
         self.stop_event = stop_event
         self.log_level = log_level
         self.config_db = config_db
-        self._watch_init(reload_epoch, born_epoch, workers_lock)
+        self._watch_init(reload_epoch, born_epoch, workers_lock, code_signature)
         self._trust = None
 
     def _start_trust_poll(self, logger, sessions=None):
@@ -2154,8 +2289,10 @@ class ApiWorker(_SupervisorWatch, Process):
         worker exits `WORKER_EXIT_RELOAD` or returns."""
         _init_child_process(self.log_level)
         self._arm_supervisor_watch()
-        self._hold_workers_lock()
         logger = logging.getLogger(__name__)
+        # Before the lazy `zfsbackup.api` / `identity` imports below.
+        self._exit_on_version_skew(logger)
+        self._hold_workers_lock()
         logger.info("API worker started")
 
         # The supervisor's detached `BackupConfig`. This process opens the
@@ -2268,11 +2405,11 @@ class ApiWorker(_SupervisorWatch, Process):
             if not died:
                 gate.start_draining()
                 active = gate.active
-                if reason is ExitReason.RELOAD or (reason is None and restart):
+                if reason in (ExitReason.RELOAD, ExitReason.UPGRADE) or (reason is None and restart):
                     if active:
                         logger.info(
                             f"waiting for {active} in-flight receive(s) to finish "
-                            f"before {'reloading' if reason else 'restarting'}"
+                            f"before {'reloading' if reason is ExitReason.RELOAD else 'upgrading' if reason is ExitReason.UPGRADE else 'restarting'}"
                         )
                         gate.wait_idle(None, abort=self._reload_drain_abort)
                         # A stop that aborted the wait changes what we are doing.
@@ -2306,4 +2443,10 @@ class ApiWorker(_SupervisorWatch, Process):
                 "API worker finished its current work; exiting to switch configuration"
             )
             sys.exit(WORKER_EXIT_RELOAD)
+        if reason is ExitReason.UPGRADE:
+            logger.info(
+                "API worker finished its current work; exiting so that the daemon "
+                "can restart on the upgraded zfsbackup"
+            )
+            return
         logger.info("API worker stopped")

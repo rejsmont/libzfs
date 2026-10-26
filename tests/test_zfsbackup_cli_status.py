@@ -31,6 +31,7 @@ import sys
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1679,3 +1680,191 @@ class TestWorkerStale:
                                            interval=10 * 3600)
         assert wide.stale == {}                                           # 4 x 10h = 40h
         assert path.exists()
+
+
+# --------------------------------------------------------------------------
+# draining for an upgrade (S-8: `draining=` / `draining_reason=` in the pid file)
+# --------------------------------------------------------------------------
+
+DRAIN_AT = 1_790_000_000
+DRAIN_WHY = "zfsbackup upgraded (1.0.0 -> 1.1.0); draining the remote worker, then the API worker, then exiting 76"
+UPGRADE_DEFERRED_WHY = "upgrade draining: applied after the daemon restarts, not re-checked"
+
+
+def after_restart_text(gen):
+    return (
+        f"daemon is draining for an upgrade and does not reload: generation {gen} "
+        "will be applied after the restart, not before"
+    )
+
+
+class TestDraining:
+    def drain_kw(self):
+        return dict(draining=DRAIN_AT, draining_reason=DRAIN_WHY)
+
+    # -- verdicts ----------------------------------------------------------
+
+    def test_draining_with_the_stored_key_ahead_and_no_deferral_is_behind_after_the_restart(
+        self, run, plain, db, live_daemon
+    ):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), **self.drain_kw())
+        assert verdict(run, db) == "behind"
+        msg = message(run, db)
+        assert msg == after_restart_text(gen)
+        assert "after the restart" in msg and "re-check" not in msg and "daemon log" not in msg
+
+    def test_draining_with_a_deferral_for_the_stored_key_is_deferred(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen),
+                    deferred_reason=UPGRADE_DEFERRED_WHY, **self.drain_kw())
+        assert verdict(run, db) == "deferred"
+        msg = message(run, db)
+        assert msg == after_restart_text(gen) and "re-checks every poll" not in msg
+
+    def test_draining_with_a_deferral_for_another_key_is_behind(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen - 1),
+                    deferred_reason=UPGRADE_DEFERRED_WHY, **self.drain_kw())
+        assert verdict(run, db) == "behind"
+
+    def test_draining_with_applied_equal_to_stored_is_in_sync(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db), **self.drain_kw())
+        assert verdict(run, db) == "in-sync"
+        assert message(run, db) == "in sync"
+
+    def test_draining_with_a_target_is_applying(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), target=(sid, gen), **self.drain_kw())
+        assert verdict(run, db) == "applying"
+
+    def test_draining_with_the_key_rejected_is_still_rejected(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), rejected=(sid, gen), **self.drain_kw())
+        assert verdict(run, db) == "rejected"
+
+    def test_not_draining_a_deferral_still_says_it_rechecks_every_poll(
+        self, run, plain, db, live_daemon
+    ):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen), deferred_reason=REASON)
+        assert message(run, db) == deferred_text(gen)
+        assert "after the restart" not in message(run, db)
+
+    def test_not_draining_behind_keeps_its_old_wording(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1))
+        assert SEE_LOG in message(run, db) and "after the restart" not in message(run, db)
+
+    # -- text ---------------------------------------------------------------
+
+    def test_the_text_has_a_draining_row_before_the_final_status_line(
+        self, run, plain, db, live_daemon
+    ):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), **self.drain_kw())
+        lines = status(run, db).stdout.splitlines()
+        assert lines[-1] == f"status:   {after_restart_text(gen)}"
+        row = lines[-2]
+        since = datetime_utc(DRAIN_AT)
+        assert row.startswith(f"draining: since {since} (") and row.endswith(f"): {DRAIN_WHY}")
+        assert re.search(r"\((\d+d) ago\)", row), row          # 2026 vs 2026-09: days ago
+
+    def test_the_row_is_absent_when_not_draining(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db))
+        assert "draining" not in status(run, db).stdout
+
+    def test_the_row_disappears_when_the_drain_ends(self, run, plain, db, live_daemon):
+        daemon = live_daemon(db, applied=store_key(db), **self.drain_kw())
+        assert "draining:" in status(run, db).stdout
+        daemon.set(draining=None, draining_reason=None)
+        assert "draining" not in status(run, db).stdout
+
+    def test_a_drain_without_a_reason_has_no_trailing_colon(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db), draining=DRAIN_AT)
+        row = [l for l in status(run, db).stdout.splitlines() if l.startswith("draining:")][0]
+        assert not row.endswith(":") and "): " not in row
+
+    def test_the_age_is_rendered_against_the_given_clock(self):
+        info = daemonlock.DaemonInfo(
+            pid=1, generation=0, start="t", applied=(1, 0), draining=DRAIN_AT, draining_reason="why")
+        st = status_view.Status(
+            "db", SimpleNamespace(store_id=1, generation=0), info, "in-sync", "in sync")
+        out = status_view.render_text(st, now=DRAIN_AT + 125)
+        assert f"draining: since {datetime_utc(DRAIN_AT)} (2m ago): why" in out
+        assert f"(7s ago)" in status_view.render_text(st, now=DRAIN_AT + 7)
+        assert "(0s ago)" in status_view.render_text(st, now=DRAIN_AT - 50)       # never negative
+
+    # -- JSON ---------------------------------------------------------------
+
+    def test_json_has_the_two_keys_only_while_draining(self, run, plain, db, live_daemon):
+        daemon = live_daemon(db, applied=store_key(db), **self.drain_kw())
+        doc = as_json(status(run, db, "--json"))["daemon"]
+        assert doc["draining"] == DRAIN_AT and isinstance(doc["draining"], int)
+        assert doc["draining_reason"] == DRAIN_WHY
+        daemon.set(draining=None, draining_reason=None)
+        doc = as_json(status(run, db, "--json"))["daemon"]
+        assert "draining" not in doc and "draining_reason" not in doc
+
+    def test_json_reason_is_null_when_absent(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db), draining=DRAIN_AT)
+        doc = as_json(status(run, db, "--json"))["daemon"]
+        assert doc["draining"] == DRAIN_AT and doc["draining_reason"] is None
+
+    def test_the_existing_exact_shape_is_unchanged_when_not_draining(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db))
+        assert set(as_json(status(run, db, "--json"))["daemon"]) == {
+            "pid", "reload_capable", "supervisor_alive", "generation", "applied", "target",
+            "rejected", "deferred", "deferred_reason",
+        }
+
+    # -- --wait ---------------------------------------------------------------
+
+    def test_wait_under_a_drain_is_75_with_the_restart_explanation(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), **self.drain_kw())
+        started = time.monotonic()
+        result = status(run, db, "--wait", "0.6")
+        assert result.exit_code == 75, (result.stdout, result.stderr)
+        assert time.monotonic() - started >= 0.5
+        assert "after the restart" in result.stderr
+        assert "see the daemon log" not in result.stderr and "daemon log" not in result.stderr
+        assert result.stderr.startswith(
+            f"error: the daemon is not yet in sync after 0.6s: {after_restart_text(gen)}"
+        )
+
+    def test_wait_under_a_drain_with_a_deferral_is_75_never_1(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), deferred=(sid, gen),
+                    deferred_reason=UPGRADE_DEFERRED_WHY, **self.drain_kw())
+        result = status(run, db, "--wait", "0.4")
+        assert result.exit_code == 75
+        assert "after the restart" in result.stderr and "daemon log" not in result.stderr
+
+    def test_wait_under_a_drain_with_json_is_75_too(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1), **self.drain_kw())
+        result = status(run, db, "--wait", "0.3", "--json")
+        assert result.exit_code == 75
+        assert as_json(result)["verdict"] == "behind"
+
+    def test_wait_under_a_drain_in_sync_is_0(self, run, plain, db, live_daemon):
+        live_daemon(db, applied=store_key(db), **self.drain_kw())
+        assert status(run, db, "--wait", "5").exit_code == 0
+
+    def test_the_wait_exit_code_for_a_draining_behind_daemon_is_75_not_1(self):
+        modern = daemonlock.DaemonInfo(pid=1, generation=0, start="t", draining=DRAIN_AT)
+        got = status_view.wait_exit_code(status_view.Status("db", None, modern, "behind", "m"))
+        assert got == 75
+
+    def test_a_plain_behind_wait_still_points_at_the_daemon_log(self, run, plain, db, live_daemon):
+        sid, gen = bump(run, db)
+        live_daemon(db, applied=(sid, gen - 1))
+        result = status(run, db, "--wait", "0.3")
+        assert result.exit_code == 75 and "daemon log" in result.stderr
+
+
+def datetime_utc(ts):
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
