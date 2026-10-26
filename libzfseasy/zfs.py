@@ -483,8 +483,9 @@ class _SlowCommandWatchdog:
                 now = time.monotonic()
                 logger.warning('%s (pid %s) is still running after %.1f s (slow-command warning every %g s)',
                                label, self._pid, now - self._started, self._interval)
-                # After a stall (suspended process, clock jump) skip the multiples already passed: no burst.
-                n = max(n + 1, int((now - self._started) / self._interval) + 1)
+                # After a stall (suspended process, clock jump, or the log call itself blocking on a slow handler) skip
+                # the multiples already passed: no burst. Read the clock again, as the warning above may have taken long.
+                n = max(n + 1, int((time.monotonic() - self._started) / self._interval) + 1)
         except Exception:
             pass
 
