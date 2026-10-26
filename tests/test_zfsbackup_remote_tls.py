@@ -535,7 +535,7 @@ class TestContract:
         assert not hasattr(rig.mgr, "identity")
 
     def test_the_constants(self):
-        assert (HTTP_TIMEOUT, remote.RESUME_TOKEN_TIMEOUT) == (30, 10)
+        assert (HTTP_TIMEOUT, remote.RESUME_TOKEN_TIMEOUT) == (30, 30)
         assert NO_CLIENT_ID_MESSAGE == "no client id; run `zfsbackup-config enroll`"
 
     def test_the_remote_module_has_no_plaintext_downgrade(self):

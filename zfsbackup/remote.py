@@ -81,8 +81,12 @@ WS_FINAL_ACK_TIMEOUT = 3600
 
 #: `/whoami`, `/negotiate` (seconds; connect + TLS handshake + answer).
 HTTP_TIMEOUT = 30
-#: `/resume_token`.
-RESUME_TOKEN_TIMEOUT = 10
+#: `/resume_token`. Not shorter than `HTTP_TIMEOUT`: the server may take its
+#: whole `api.ZFS_REQUEST_BUDGET` (plus the kill of a timed-out `zfs`) to
+#: answer, and the client must still be listening for the `zfs_timeout` 503
+#: (`api.py` asserts the inequality). A client that gave up first would leave
+#: the server's hung `zfs` running and start another one with its next request.
+RESUME_TOKEN_TIMEOUT = 30
 
 #: S-7a: the resume-token check (`_fetch_resume_token`, `_resume_target`) skips
 #: the cycle when it cannot tell whether the server holds a partial receive --
@@ -122,9 +126,11 @@ class NegotiationFailed(Exception):
     fall through to a send. `reloading` is True for the server's retryable
     503 ("server is reloading; retry later")."""
 
-    def __init__(self, message: str, reloading: bool = False):
+    def __init__(self, message: str, reloading: bool = False, zfs_timeout: bool = False):
         super().__init__(message)
         self.reloading = reloading
+        #: The server's zfs did not answer in time (already logged, counted).
+        self.zfs_timeout = zfs_timeout
 
 
 #: The server's `api.BUSY_ERROR['error']` (the API imports this module, so the
@@ -546,6 +552,11 @@ class RemoteBackupManager:
         # In memory: a new worker (reload, crash) counts again from 0.
         self._token_skips: Dict[Tuple[str, str], int] = {}
         self._token_error_logged: Set[Tuple[str, str]] = set()
+        # The same for negotiate answered `zfs_timeout` (the server's zfs did
+        # not answer in time): consecutive skipped cycles, ERROR once at
+        # `RESUME_TOKEN_SKIP_ERROR_AFTER`, re-armed by a good negotiate.
+        self._negotiate_zfs_skips: Dict[Tuple[str, str], int] = {}
+        self._negotiate_zfs_error_logged: Set[Tuple[str, str]] = set()
         # `(dataset, destination) -> why the last `backup_dataset` call did
         # not complete`, where this class knows (the token check); read by
         # `last_problem`, reset at the start of every call.
@@ -619,6 +630,37 @@ class RemoteBackupManager:
         for key, count in counts.items():
             if count > 0:
                 self._token_skips[key] = max(self._token_skips.get(key, 0), int(count))
+
+    def _negotiate_zfs_skipped(self, dsi: DatasetInfo, destination: str, base_url: str) -> None:
+        """Negotiate was answered `zfs_timeout` (S-14): WARNING once per
+        episode, and the `RESUME_TOKEN_SKIP_ERROR_AFTER`th consecutive skipped
+        cycle logs an ERROR, once until `_negotiate_zfs_ok`, so a server whose
+        pool stays hung is not an eternal INFO."""
+        key = (dsi.name, destination)
+        self._call_note[key] = f"negotiate skipped: {base_url}'s zfs did not answer in time"
+        self._log_warning_once(
+            (f"{dsi.name} [negotiate zfs_timeout]", destination),
+            f"server {base_url} could not answer the negotiation of {dsi.name} in time "
+            "(its zfs did not answer); skipping this cycle",
+        )
+        count = self._negotiate_zfs_skips[key] = self._negotiate_zfs_skips.get(key, 0) + 1
+        if count >= RESUME_TOKEN_SKIP_ERROR_AFTER and key not in self._negotiate_zfs_error_logged:
+            self._negotiate_zfs_error_logged.add(key)
+            logger.error(
+                f"{dsi.name} -> {destination}: the server's zfs has not answered the "
+                f"negotiation for the last {count} cycles in a row; nothing is sent for "
+                "this dataset until it does, so the destination is falling behind. Check "
+                "the server's pool (a hung pool leaves `zfs` processes in uninterruptible "
+                "sleep)"
+            )
+
+    def _negotiate_zfs_ok(self, dsi: DatasetInfo, destination: str) -> None:
+        key = (dsi.name, destination)
+        self._negotiate_zfs_skips.pop(key, None)
+        self._refusal_logged.pop((f"{dsi.name} [negotiate zfs_timeout]", destination), None)
+        if key in self._negotiate_zfs_error_logged:
+            self._negotiate_zfs_error_logged.discard(key)
+            logger.info(f"{dsi.name} -> {destination}: the server answers negotiations again")
 
     def _token_ok(self, dsi: DatasetInfo, destination: str) -> None:
         """The resume-token check passed (or was not needed because the
@@ -706,7 +748,7 @@ class RemoteBackupManager:
         except NegotiationFailed as e:
             # Never fall through to a send: with no answer we would treat
             # "unknown" as "no common snapshot" and start a full send.
-            if e.reloading:
+            if e.reloading and not e.zfs_timeout:  # a zfs timeout was logged by `_negotiate`
                 logger.info(
                     f"server {transport.base_url} is {_retry_word(e)}; skipping {dsi.name} this cycle"
                 )
@@ -1337,10 +1379,17 @@ class RemoteBackupManager:
                 timeout=HTTP_TIMEOUT,
             )
             if _is_reloading(resp):
-                # The one retryable 503 covers a reload and a busy/unsettled
-                # dataset; the server's own text tells which.
+                # The one retryable 503 covers a reload, a busy/unsettled
+                # dataset and (S-14) a server `zfs` that did not answer in
+                # time; the server's own `reason`/text tells which.
                 body = _json_body(resp)
                 text = str(body.get('error') or '')
+                if body.get('reason') == 'zfs_timeout':
+                    self._negotiate_zfs_skipped(dsi, destination, base_url)
+                    raise NegotiationFailed(
+                        f"server is busy: {text or 'zfs timed out; retry later'}", reloading=True,
+                        zfs_timeout=True,
+                    )
                 if body.get('reason') == 'unsettled_ancestor':
                     # A parent has not completed its first backup, so this
                     # child waits for it: visible at WARNING, once per
@@ -1385,6 +1434,7 @@ class RemoteBackupManager:
             resp.raise_for_status()
             self._refusal_logged.pop((dsi.name, destination), None)
             self._refusal_logged.pop((f"{dsi.name} [unsettled]", destination), None)
+            self._negotiate_zfs_ok(dsi, destination)
             body = resp.json()
             self._server_info[(dsi.name, destination)] = (
                 body.get('server_copy'), body.get('server_dataset')
@@ -1509,7 +1559,7 @@ class RemoteBackupManager:
             try:
                 common_name = self._negotiate(transport, client_id, dsi, snapshots, destination)
             except NegotiationFailed as e:
-                if e.reloading:
+                if e.reloading and not e.zfs_timeout:
                     logger.info(
                         f"server {transport.base_url} is {_retry_word(e)}; {dsi.name} continues next cycle"
                     )
@@ -2039,6 +2089,18 @@ class RemoteBackupManager:
                 timeout=RESUME_TOKEN_TIMEOUT,
             )
             if _is_reloading(resp):
+                if _json_body(resp).get('reason') == 'zfs_timeout':
+                    # S-14: the server's zfs did not answer in time. Not a
+                    # reload: the cycle is skipped like any unreadable token
+                    # check (counted, so a server that stays stuck is
+                    # escalated), never a fresh send.
+                    self._log_warning_once(
+                        (f"{dsi.name} [zfs_timeout]", destination),
+                        f"server {base_url} could not read the resume state of {dsi.name} "
+                        "in time (its zfs did not answer); skipping this cycle",
+                    )
+                    self._token_skipped(dsi, destination, f"{base_url}'s zfs did not answer in time")
+                    return 'skip', None
                 logger.info(
                     f"server {base_url} is reloading; skipping {dsi.name} this cycle"
                 )
@@ -2063,6 +2125,7 @@ class RemoteBackupManager:
                     (body.get('error') if isinstance(body, dict) else None)
                     or "unexpected reply"
                 )
+            self._refusal_logged.pop((f"{dsi.name} [zfs_timeout]", destination), None)
             token = body.get('resume_token')
             return ('token', token) if token else ('none', None)
         except Exception as e:

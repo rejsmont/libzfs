@@ -232,7 +232,12 @@ refuses. `received_datasets()` lists filesystems and volumes.
   (`api.SessionRegistry`) and the same thread cuts them (`force_eof`; `zfs receive` reaped, partial state kept) when
   their certificate is revoked for any reason but a rotation's `retired` (a retired key is followed down
   `superseded_by`, so revoking its successor cuts it too), or when a write to the peer has been blocked longer than
-  `WS_IDLE_TIMEOUT`; a cut before the data loop never runs `receive -A` or spawns a receive. The API worker drains and
+  `WS_IDLE_TIMEOUT`; a cut before the data loop never runs `receive -A` or spawns a receive.
+  Every non-streaming `zfs` call a handler makes runs under one per-request budget (`api.ZFSBudget`,
+  `ZFS_REQUEST_BUDGET = 15` s through `libzfseasy.timeout`; `/stream` restarts it after the header wait); a timeout
+  answers 503 `{retry, reason: 'zfs_timeout'}`, releases the claim and never starts the receive, which itself is never
+  timed. The budget plus the kill overhead stays below the client's timeouts (a module-level assert). The client logs
+  a negotiate or resume-token `zfs_timeout` once per episode and one ERROR after 3 consecutive skipped cycles. The API worker drains and
   exits 1 (so the supervisor restarts it) only for a confirmed on-disk server-identity change (`IdentityChanged`).
 - **Authentication.** Every endpoint except `/health` and `/enroll` needs a client certificate pinned in the
   trust tables (401 without one, 403 if unknown or expired). The client id a request acts as is the one the
@@ -442,6 +447,8 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_reload_workers.py` | Worker exit protocol (STOP > SUPERVISOR_GONE > RELOAD), safe points, workers lock — real workers under fork/spawn/forkserver |
 | `tests/test_zfsbackup_stream_gate.py` | API worker drain: `StreamGate`, 503 while draining, server receive timeout |
 | `tests/test_zfsbackup_remote_tls.py` | Pinned-mTLS client: every check runs before any send (no id, not enrolled, not trusted, id mismatch), `/whoami` heuristics, identity reload, real end-to-end TLS |
+| `tests/test_zfsbackup_api_timeouts.py` | Per-request zfs budget in the API: every call site → 503 `zfs_timeout`, claim released and nothing spawned, the shared budget, WARNING once per episode, fail-fast while a timed-out child is stuck |
+| `tests/test_zfsbackup_remote_zfs_timeout.py` | Client handling of a server `zfs_timeout`: negotiate and resume-token skips, WARNING once, ERROR after 3 cycles, re-armed on success |
 | `tests/test_zfsbackup_remote_timeouts.py` | Client websocket timeouts; a failed connect never leaves `zfs send` running; 503 skips the cycle |
 | `tests/test_zfsbackup_startup_waits.py` | Startup waits for a previous daemon's survivors / dead supervisor |
 | `tests/test_zfsbackup_cli_reload.py` | CLI signals after every committed write: once-only matrix, ack loop, notice wording |

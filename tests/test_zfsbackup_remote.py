@@ -523,12 +523,12 @@ class TestFetchResumeToken:
         (rec,) = messages(caplog, 'pool busy')
         assert rec.levelname == 'WARNING'
 
-    def test_exactly_one_get_with_a_10_second_timeout(self, h):
+    def test_exactly_one_get_with_the_resume_token_timeout(self, h):
         h.token('1-abc')
         self.fetch(h)
         assert h.rm.call_count == 1
         assert h.rm.last_request.method == 'GET'
-        assert h.rm.last_request.timeout == 10
+        assert h.rm.last_request.timeout == 30       # S-14: not shorter than the server's zfs budget
 
 
 class TestBusyServer:

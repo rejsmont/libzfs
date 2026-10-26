@@ -174,7 +174,8 @@ class TestTimeouts:
     def test_the_constants(self):
         assert (WS_CONNECT_TIMEOUT, WS_IDLE_TIMEOUT, WS_FINAL_ACK_TIMEOUT) == (30, 600, 3600)
         assert WS_CONNECT_TIMEOUT < WS_IDLE_TIMEOUT < WS_FINAL_ACK_TIMEOUT
-        assert (HTTP_TIMEOUT, RESUME_TOKEN_TIMEOUT) == (30, 10)
+        # S-14: the resume-token request outlasts the server's zfs budget (api asserts the inequality)
+        assert (HTTP_TIMEOUT, RESUME_TOKEN_TIMEOUT) == (30, 30)
 
     def test_the_pinned_tls_connect_is_bounded_by_the_websocket_connect_timeout(
         self, rbm, mocker, fake_connect_pinned

@@ -55,6 +55,7 @@ from simple_websocket import ConnectionClosed
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 import libzfseasy as zfs
+from libzfseasy import ZFSTimeoutError, timeout as zfs_timeout
 from libzfseasy.types import Dataset, Filesystem
 
 from zfsbackup.backup_manager import (
@@ -81,7 +82,7 @@ from zfsbackup.protocol import (
     PROTOCOL_HEADER, PROTOCOL_REFUSAL_REASON, PROTOCOL_VERSION, SUPPORTED_PROTOCOLS,
     parse_protocol_header,
 )
-from zfsbackup.remote import WS_IDLE_TIMEOUT
+from zfsbackup.remote import HTTP_TIMEOUT, RESUME_TOKEN_TIMEOUT, WS_IDLE_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,41 @@ DISCARD_MAX = 16
 #: transient skip for the client, exactly like `RELOADING_ERROR`: never a
 #: reason to fall back to a fresh send.
 BUSY_ERROR = {'error': 'busy', 'retry': True}
+
+#: S-14: the overall time (seconds) the non-streaming `zfs` calls of one
+#: request handler may take, `ZFSBudget`. Not applied to the `zfs receive` of a
+#: stream, which a running transfer is never cut by.
+ZFS_REQUEST_BUDGET = 15.0
+
+#: What a timed-out `zfs` call adds to its limit before the handler can answer:
+#: libzfseasy waits up to 2 s after SIGTERM and 2 s after SIGKILL.
+_ZFS_KILL_OVERHEAD = 4.0
+
+#: Margin for the extra commands of a helper that runs several (up to three
+#: `zfs get`s in `read_zfsbackup_properties`), each limited to what was left
+#: when the helper started.
+_ZFS_HELPER_MARGIN = 6.0
+
+#: The refusal body (HTTP 503 for the plain endpoints, a text message on a
+#: stream) when a handler's `zfs` call did not answer in time, or was refused
+#: because an earlier timed-out `zfs` child of this worker is still stuck
+#: (libzfseasy `ZFSTimeoutError`). `retry` marks it as transient, like
+#: `BUSY_ERROR`: the client skips the cycle and never falls back to a fresh
+#: send. The wording has no "reloading" in it (the client tells that apart by
+#: text).
+ZFS_TIMEOUT_ERROR = {
+    'error': 'zfs timed out; retry later', 'retry': True, 'reason': 'zfs_timeout',
+}
+
+# The server must answer `zfs_timeout` while the client is still listening:
+# budget + kill + helper margin has to stay below every client timeout of a
+# request whose handler uses the budget (`remote.HTTP_TIMEOUT` for negotiate,
+# `remote.RESUME_TOKEN_TIMEOUT`). A client that gave up first would leave the
+# server's hung `zfs` behind and start another with its next request.
+assert (
+    ZFS_REQUEST_BUDGET + _ZFS_KILL_OVERHEAD + _ZFS_HELPER_MARGIN
+    < min(HTTP_TIMEOUT, RESUME_TOKEN_TIMEOUT)
+), "ZFS_REQUEST_BUDGET must stay below the client's request timeouts"
 
 #: Substrings of `zfs receive -A`'s stderr that mean "nothing to abort": rc 1
 #: "'<ds>' does not have any resumable receive state to abort"; rc 2 "cannot
@@ -2302,6 +2338,42 @@ def read_stream_header(ws, timeout: float) -> bytes:
     return buf
 
 
+class ZFSBudget:
+    """One overall time budget for the non-streaming `zfs` calls of one request
+    handler (plan S-14).
+
+    `call(fn, ...)` runs `fn` under `libzfseasy.timeout(<what is left>)`, so a
+    handler making N calls shares `seconds` between them instead of getting
+    `seconds` per call; with the budget spent `call` raises `ZFSTimeoutError`
+    without running anything. The limit applies per `zfs` command: a helper
+    that runs several (`read_zfsbackup_properties` runs up to three) can
+    overrun by its extra commands, each limited to what was left when the helper
+    started, and the kill of a timed-out child adds up to 4 s. A child that
+    survives SIGKILL (a hung pool) stays registered in this process, and every
+    later timed call here fails fast, healthy pools included, until it exits.
+
+    The libzfseasy limit follows the calling thread, so `call` must run `fn`
+    synchronously, and `fn` must not return a lazy iterator. Never use it for
+    `zfs.receive`/`zfs.send`: those ignore the timeout and must not be cut."""
+
+    def __init__(self, seconds: Optional[float] = None, clock: Callable[[], float] = time.monotonic) -> None:
+        self.seconds = ZFS_REQUEST_BUDGET if seconds is None else seconds
+        self._clock = clock
+        self._deadline = clock() + self.seconds
+
+    def remaining(self) -> float:
+        return self._deadline - self._clock()
+
+    def call(self, fn, *args, **kwargs):
+        left = self.remaining()
+        if left <= 0:
+            raise ZFSTimeoutError(
+                f"the {self.seconds:g} s budget for this request is spent"
+            )
+        with zfs_timeout(left):
+            return fn(*args, **kwargs)
+
+
 class ServerSnapshot(NamedTuple):
     """A snapshot of a server dataset as `server_snapshots` lists it."""
     name: str                # short name
@@ -2703,6 +2775,57 @@ def create_app(
     enabled = bool(remote_backup and remote_backup.enabled)
     target = remote_backup.target_dataset if remote_backup else None
 
+    # ------------------------------------------------------- zfs time budget
+
+    def _zfs(fn, *args, **kwargs):
+        """Run the non-streaming `zfs` call `fn` under the request's
+        `ZFSBudget` (plan S-14; created at the request's first call, so it does
+        not count time spent before it). Raises `ZFSTimeoutError`; a
+        handler answers that with `ZFS_TIMEOUT_ERROR`, never as a `zfs`
+        failure. Never wrap `zfs.receive.filesystem` in it. The budget is not
+        restarted after the receive starts: nothing after it is a pre-check."""
+        budget = g.get('zfs_budget')
+        if budget is None:
+            budget = g.zfs_budget = ZFSBudget()
+        return budget.call(fn, *args, **kwargs)
+
+    def _zfs_new_budget() -> None:
+        """Start the request's `ZFSBudget` afresh (a stream after the header
+        wait, which is the peer's time, not zfs's)."""
+        g.zfs_budget = ZFSBudget()
+
+    #: `(handler, server dataset)` pairs whose `zfs` timeout was already
+    #: announced at WARNING; forgotten when the handler succeeds for that
+    #: dataset, so each episode is announced once. Bounded.
+    _zfs_timeout_noted: set = set()
+
+    def _zfs_timed_out(
+        where: str, client_id: str, dataset: str, server_dataset: str, exc: Exception,
+        *, unknown_outcome: bool = False,
+    ) -> None:
+        """Log a handler's `zfs` timeout: WARNING once per (handler, server
+        dataset) and episode, DEBUG after. A write or an abort that timed out
+        has an unknown outcome (`unknown_outcome`), said in the line."""
+        key = (where, server_dataset)
+        text = (
+            "%s from client %s for %r: zfs did not answer in time on %s (%s)%s; "
+            "answering 503 retry"
+        )
+        tail = (
+            "; the outcome of that command is unknown and is re-read on the "
+            "next attempt" if unknown_outcome else ""
+        )
+        if key in _zfs_timeout_noted:
+            logger.debug(text, where, client_id, dataset, server_dataset, exc, tail)
+            return
+        if len(_zfs_timeout_noted) > 1024:
+            _zfs_timeout_noted.clear()
+        _zfs_timeout_noted.add(key)
+        logger.warning(text, where, client_id, dataset, server_dataset, exc, tail)
+
+    def _zfs_recovered(where: str, server_dataset: str) -> None:
+        _zfs_timeout_noted.discard((where, server_dataset))
+
     def _gated(view):
         """Count `view` as an in-flight remote operation. While the worker
         drains for a reload, new ones are refused with the retryable 503, and
@@ -2759,10 +2882,10 @@ def create_app(
         (A root elsewhere under `<target>/<id>/` only comes from a `-R` tree,
         which the client never sends; counting it would call a plain child of
         a raw parent raw.) Raises if zfs fails."""
-        encryption = zfs.get.value(server_fs, 'encryption')
+        encryption = _zfs(zfs.get.value, server_fs, 'encryption')
         if encryption in (None, 'off'):
             return 'plain'
-        return 'raw' if zfs.get.value(server_fs, 'encryptionroot') == server_fs.name else 'plain'
+        return 'raw' if _zfs(zfs.get.value, server_fs, 'encryptionroot') == server_fs.name else 'plain'
 
     def _receive_error(e: Exception, server_dataset: str) -> str:
         """The error text sent to the client for a failed receive: zfs's own
@@ -2788,11 +2911,12 @@ def create_app(
     def _resume_token(server_dataset: str) -> Optional[str]:
         """The `receive_resume_token` of the server dataset -- a filesystem
         or a volume, found by name alone -- or `None` (no dataset, or no
-        token). Raises on any other failure: callers must not guess."""
+        token). Raises on any other failure (`ZFSTimeoutError` included):
+        callers must not guess."""
         ds = Dataset(server_dataset)
-        if not zfs.exists(ds):
+        if not _zfs(zfs.exists, ds):
             return None
-        results = zfs.list(roots=ds, properties=['receive_resume_token'])
+        results = _zfs(zfs.list, roots=ds, properties=['receive_resume_token'])
         if not results:
             return None
         prop = results[0]['receive_resume_token']
@@ -2875,16 +2999,17 @@ def create_app(
 
         A dataset without a source-dataset property (a container negotiate
         made, never negotiated itself) is not a conflict for that property.
-        Raises if the dataset's properties cannot be read."""
+        Raises if the dataset's properties cannot be read
+        (`ZFSTimeoutError` included)."""
         ds = Dataset(server_dataset)
-        if not zfs.exists(ds):
+        if not _zfs(zfs.exists, ds):
             return None
-        props = read_zfsbackup_properties(ds)
+        props = _zfs(read_zfsbackup_properties, ds)
         recorded_id = props.get(PROP_CLIENT_ID)
         if recorded_id and recorded_id != client_id:
             return _owner_problem(server_dataset, recorded_id, client_id)
         problem = _owner_problem(
-            server_dataset, zfs.get.value(ds, PROP_CLIENT_ID, sources='local'), client_id
+            server_dataset, _zfs(zfs.get.value, ds, PROP_CLIENT_ID, sources='local'), client_id
         )
         if problem is not None:
             return problem
@@ -3478,8 +3603,10 @@ def create_app(
                 f"client_id {client_id!r} cannot name a dataset on this server"
             ))
         try:
-            dataset_exists = bool(zfs.exists(client_root))
+            dataset_exists = bool(_zfs(zfs.exists, client_root))
         except Exception as e:
+            # Includes `ZFSTimeoutError` (S-14): the same retryable 503 as any
+            # `zfs` failure here, which the enrolling CLI already handles.
             logger.error(
                 "enrollment from %s: cannot check %s: %s", remote, client_root.name, e,
             )
@@ -3684,7 +3811,7 @@ def create_app(
         it is not read until it settles. One
         `zfs get` per existing ancestor for the owner, plus one more for the
         token and one listing for one that has a token. Raises if zfs
-        fails."""
+        fails (`ZFSTimeoutError` included)."""
         base = f"{target}/{client_id}"
         ancestor = server_dataset.rsplit('/', 1)[0]
         missing = []
@@ -3694,15 +3821,15 @@ def create_app(
             if _pending(ancestor) is not None:
                 return (ancestor, 'pending'), missing, None
             ds = Dataset(ancestor)
-            if zfs.exists(ds):
+            if _zfs(zfs.exists, ds):
                 conflict = _owner_problem(
-                    ancestor, zfs.get.value(ds, PROP_CLIENT_ID, sources='local'), client_id
+                    ancestor, _zfs(zfs.get.value, ds, PROP_CLIENT_ID, sources='local'), client_id
                 )
                 if conflict is not None:
                     return None, missing, conflict
                 if (
-                    zfs.get.value(ds, 'receive_resume_token') is not None
-                    and not zfs.list(roots=ds, types='snapshot', properties=['creation'])
+                    _zfs(zfs.get.value, ds, 'receive_resume_token') is not None
+                    and not _zfs(zfs.list, roots=ds, types='snapshot', properties=['creation'])
                 ):
                     return (ancestor, 'partial'), missing, None
             else:
@@ -3757,10 +3884,12 @@ def create_app(
         overwrite the shrink is the stored state, so a repeat negotiate with
         the same config warns no more."""
         try:
-            stored = zfs.get.value(server_fs, PROP_CONFIG, sources='local')
+            stored = _zfs(zfs.get.value, server_fs, PROP_CONFIG, sources='local')
             if stored is None:
                 return
             shrink = retention_shrink(stored, canonical_new)
+        except ZFSTimeoutError:
+            raise  # not "unreadable": the handler answers 503 retry
         except Exception as e:
             logger.debug(
                 "negotiate from client %s for %r: not comparing the retention of %s: %s",
@@ -3782,7 +3911,7 @@ def create_app(
     ) -> object:
         """The body of negotiate, run with `server_dataset` claimed."""
         server_fs = Filesystem(server_dataset)
-        server_fs_exists = zfs.exists(server_fs)
+        server_fs_exists = _zfs(zfs.exists, server_fs)
 
         # D7 and the binding: a server dataset that records another client
         # id or another client dataset is not this one's. Checked before
@@ -3790,6 +3919,8 @@ def create_app(
         if server_fs_exists:
             try:
                 conflict = _ownership_conflict(server_dataset, dataset, client_id)
+            except ZFSTimeoutError:
+                raise  # `backup_negotiate` answers 503 retry
             except Exception as e:
                 return jsonify({'error': f'Failed to check {server_dataset}: {e}'}), 500
             if conflict is not None:
@@ -3805,8 +3936,10 @@ def create_app(
         if earlier is not None and earlier[1] != dataset:
             try:
                 owned_already = server_fs_exists and bool(
-                    read_zfsbackup_properties(Dataset(server_dataset)).get(PROP_SOURCE_DATASET)
+                    _zfs(read_zfsbackup_properties, Dataset(server_dataset)).get(PROP_SOURCE_DATASET)
                 )
+            except ZFSTimeoutError:
+                raise
             except Exception as e:
                 return jsonify({'error': f'Failed to check {server_dataset}: {e}'}), 500
             if not owned_already:
@@ -3824,6 +3957,8 @@ def create_app(
                 unsettled, missing_ancestors, ancestor_conflict = _ancestors_state(
                     server_dataset, client_id
                 )
+            except ZFSTimeoutError:
+                raise
             except Exception as e:
                 logger.error("negotiate from client %s: cannot check the parents of %s: %s",
                              client_id, server_dataset, e)
@@ -3857,7 +3992,7 @@ def create_app(
                     _note_retention_shrink(
                         client_id, dataset, server_dataset, server_fs, ds_config_canonical
                     )
-                    zfs.set(server_fs, {
+                    _zfs(zfs.set, server_fs, {
                         PROP_CONFIG: ds_config_canonical,
                         PROP_CLIENT_ID: client_id,
                         PROP_SOURCE_DATASET: dataset,
@@ -3897,7 +4032,8 @@ def create_app(
                             # `zfs.create` never dispatches to `create -V`; see the
                             # note at the receive about volumes).
                             for ancestor in reversed(missing_ancestors):
-                                zfs.create(
+                                _zfs(
+                                    zfs.create,
                                     Filesystem(ancestor),
                                     properties={
                                         'canmount': 'noauto',
@@ -3921,6 +4057,11 @@ def create_app(
                     "value: %r", client_id, dataset, str(e),
                 )
                 return _bad(BAD_PROPERTY_ERROR)
+            except ZFSTimeoutError:
+                # A `set` or `create` that timed out may or may not have
+                # happened: nothing is assumed; the next negotiate re-reads
+                # the dataset and does it again.
+                raise
             except Exception as e:
                 logger.error(
                     "negotiate from client %s: cannot record %s: %s",
@@ -3941,14 +4082,16 @@ def create_app(
                 # `server_newer`; the stream, which does decide what `-F` may
                 # destroy, then refuses on its own.
                 try:
-                    server_snaps = server_snapshots(server_fs)
+                    server_snaps = _zfs(server_snapshots, server_fs)
                     listing_trusted = True
+                except ZFSTimeoutError:
+                    raise
                 except Exception as e:
                     logger.warning(
                         "negotiate for %s: the snapshot listing cannot be trusted (%s); "
                         "not reporting server_newer", server_dataset, e,
                     )
-                    server_snaps = server_snapshots(server_fs, strict=False)
+                    server_snaps = _zfs(server_snapshots, server_fs, strict=False)
                     listing_trusted = False
                 server_names = {s.name for s in server_snaps}
                 for snap_name in client_snapshots:
@@ -3959,6 +4102,8 @@ def create_app(
                     server_copy = _server_copy_kind(server_fs, client_id)
                 if common_snapshot is not None and listing_trusted:
                     server_newer = newer_than(server_dataset, common_snapshot, server_snaps)
+            except ZFSTimeoutError:
+                raise
             except Exception as e:
                 return jsonify({'error': f'Failed to list server snapshots: {e}'}), 500
 
@@ -4068,11 +4213,22 @@ def create_app(
         if not _claim_dataset(server_dataset):
             return jsonify(BUSY_ERROR), 503
         try:
-            return _negotiate_claimed(
+            reply = _negotiate_claimed(
                 client_id, dataset, server_dataset, client_snapshots, ds_config_canonical
             )
+        except ZFSTimeoutError as e:
+            # S-14: a `zfs` call of the handler did not answer in time (or the
+            # worker's stuck-child registry refused it). Nothing is assumed
+            # about a write that timed out; the claim is released below.
+            _zfs_timed_out(
+                'negotiate', client_id, dataset, server_dataset, e,
+                unknown_outcome=True,
+            )
+            return jsonify(ZFS_TIMEOUT_ERROR), 503
         finally:
             _release_dataset(server_dataset)
+        _zfs_recovered('negotiate', server_dataset)
+        return reply
 
     @sock.route('/backup/<client_id>/<path:dataset>/stream')
     def backup_stream(ws, client_id: str, dataset: str):
@@ -4188,11 +4344,27 @@ def create_app(
     ) -> None:
         server_fs = Filesystem(server_dataset)
 
+        def zfs_timed_out(exc: Exception, *, unknown_outcome: bool = False) -> None:
+            # S-14: a pre-check `zfs` call did not answer in time (or was
+            # refused by the stuck-child registry). Nothing was spawned or
+            # changed by the stream; the claim goes before the reply, like
+            # every other refusal, and the client skips the cycle (`retry`).
+            _zfs_timed_out(
+                'stream', client_id, dataset, server_dataset, exc,
+                unknown_outcome=unknown_outcome,
+            )
+            release_claim()
+            with contextlib.suppress(Exception):
+                ws.send(json.dumps(ZFS_TIMEOUT_ERROR))
+
         # D7 and the binding: refuse to receive into a server dataset that
         # another client id or client dataset owns (read-only, so also in a
         # dry run).
         try:
             conflict = _ownership_conflict(server_dataset, dataset, client_id)
+        except ZFSTimeoutError as e:
+            zfs_timed_out(e)
+            return
         except Exception as e:
             release_claim()
             ws.send(json.dumps({'error': f'Failed to check {server_dataset}: {e}'}))
@@ -4218,11 +4390,14 @@ def create_app(
         try:
             # Asked once and reused for the `-F` decision below (the dataset
             # is claimed, so nothing else creates or destroys it meanwhile).
-            existed = zfs.exists(server_fs)
+            existed = _zfs(zfs.exists, server_fs)
             stored_config = (
-                zfs.get.value(Dataset(server_dataset), PROP_CONFIG, sources='local')
+                _zfs(zfs.get.value, Dataset(server_dataset), PROP_CONFIG, sources='local')
                 if existed else None
             )
+        except ZFSTimeoutError as e:
+            zfs_timed_out(e)
+            return
         except Exception as e:
             logger.error("cannot read the configuration of %s: %s", server_dataset, e)
             release_claim()
@@ -4326,13 +4501,19 @@ def create_app(
             return
         if cut_before_changes("after its header"):
             return
+        # The wait for the header was the peer's time, not zfs's: the checks
+        # from here to the receive get a budget of their own.
+        _zfs_new_budget()
         mismatch = stream_base_problem(header, base)
         if mismatch is not None:
             refuse_stream('base_mismatch', f"{mismatch}, so nothing is received")
             return
         if existed:
             try:
-                existing_type = zfs.get.value(Dataset(server_dataset), 'type')
+                existing_type = _zfs(zfs.get.value, Dataset(server_dataset), 'type')
+            except ZFSTimeoutError as e:
+                zfs_timed_out(e)
+                return
             except Exception as e:
                 logger.error("cannot read the type of %s: %s", server_dataset, e)
                 release_claim()
@@ -4357,7 +4538,10 @@ def create_app(
         decision = ReceiveDecision(False)
         if existed:
             try:
-                rows = server_snapshots(server_fs)
+                rows = _zfs(server_snapshots, server_fs)
+            except ZFSTimeoutError as e:
+                zfs_timed_out(e)
+                return
             except Exception as e:
                 # zfs failed, or the listing could not be trusted (libzfseasy
                 # skipped a row): either way a snapshot the decision never saw
@@ -4433,6 +4617,9 @@ def create_app(
             # the dataset still exists. `resume` never reaches this.
             try:
                 token = _resume_token(server_dataset)
+            except ZFSTimeoutError as e:
+                zfs_timed_out(e)
+                return
             except Exception as e:
                 release_claim()
                 ws.send(json.dumps({
@@ -4450,7 +4637,15 @@ def create_app(
                     "is sending a fresh stream", server_dataset,
                 )
                 try:
-                    zfs.receive.abort(Dataset(server_dataset))
+                    _zfs(zfs.receive.abort, Dataset(server_dataset))
+                except ZFSTimeoutError as e:
+                    # The outcome of the abort is unknown: the saved state may
+                    # or may not be gone (and a new dataset's first partial
+                    # receive with it). Nothing is assumed: the receive is not
+                    # started, and the next negotiate and stream re-read the
+                    # dataset and its token.
+                    zfs_timed_out(e, unknown_outcome=True)
+                    return
                 except Exception as e:
                     # Idempotent: already clean is fine, anything else refuses.
                     if not any(m in str(e).lower() for m in _ABORT_ALREADY_CLEAN):
@@ -4512,13 +4707,27 @@ def create_app(
         receive_props = (
             RECEIVE_PROPERTIES_VOLUME if header.kind == 'volume' else RECEIVE_PROPERTIES_FILESYSTEM
         )
+        try:
+            # Asked before the receive is built, under the budget: a timeout
+            # here spawns nothing. The receive itself gets no timeout.
+            force = decision.force and _zfs(zfs.exists, server_fs)
+        except ZFSTimeoutError as e:
+            zfs_timed_out(e)
+            return
+        except Exception as e:
+            release_claim()
+            ws.send(json.dumps({'error': f'Failed to start zfs receive: {e}'}))
+            return
+        # Last, after the (possibly slow) `exists` above: a revoke landing
+        # during it must not reach the spawn.
         if cut_before_changes("before zfs receive was started"):
             release_claim()
             return
+        _zfs_recovered('stream', server_dataset)
         try:
             writer = zfs.receive.filesystem(
                 server_fs, props={**owned, **receive_props},
-                force=decision.force and zfs.exists(server_fs), holds=False,
+                force=force, holds=False,
                 save=True, mount=False,
             )
         except Exception as e:
@@ -4609,7 +4818,7 @@ def create_app(
             # The dataset exists now with the owned values as local ones.
             _forget_pending(server_dataset)
             _refused_noted.difference_update(
-                {k for k in _refused_noted if k[0] == server_dataset}
+                {k for k in list(_refused_noted) if k[0] == server_dataset}
             )
             # The receive has finished and been reaped: nothing more touches
             # this dataset. Release the per-dataset claim BEFORE the final
@@ -4662,8 +4871,13 @@ def create_app(
             conflict = _ownership_conflict(server_dataset, dataset, client_id)
             if conflict is not None:
                 return jsonify({'error': conflict}), 409
-            return jsonify({'resume_token': _resume_token(server_dataset)})
+            reply = jsonify({'resume_token': _resume_token(server_dataset)})
+        except ZFSTimeoutError as e:
+            _zfs_timed_out('resume_token', client_id, dataset, server_dataset, e)
+            return jsonify(ZFS_TIMEOUT_ERROR), 503
         except Exception as e:
             return jsonify({'error': str(e)}), 500
+        _zfs_recovered('resume_token', server_dataset)
+        return reply
 
     return app
