@@ -45,6 +45,18 @@
 #       --upgrade` the current wheel, `systemctl start zfsbackup`. The ExecStartPre migration writes ONE pre-migration backup
 #       (`config.db.pre-<old rev>-<UTC>`, 0600) in /var/lib/zfsbackup/backups (0700 root), the DB is at the new head, the unit reaches
 #       READY, the client id survived; a plain RESTART writes no second backup
+#   I16 IN-PLACE UPGRADE UNDER A RUNNING DAEMON (the S-8 version-skew guard): the current tree is version N, a copy of it rebuilt as
+#       N+1 (".post1" appended to the version in a temp copy). With N running as the real unit: `pip install` N+1 over it -> the
+#       journal has the drain WARNING ("changed on disk ... will exit 76", priority 4, "N -> N+1"), the main process exits 76,
+#       systemd restarts it EXACTLY once and only after RestartSec, `zfsbackupd --version` is N+1, the second start is clean (READY,
+#       no restart loop, `status --wait` exit 0). Then a SAME-VERSION reinstall (`--force-reinstall`) is detected too ("was
+#       reinstalled"). Then with a long transfer in flight (the loopback throttled to 4 Mbit/s with `tc`, 300 MB of fresh data; not
+#       SIGSTOP: any signal aborts a running zfs send/receive), a reinstall starts the drain but the daemon does NOT exit while the
+#       transfer runs (draining= in the pid file, STATUS= says so, the API still answers /health); once the throttle is removed
+#       the transfer completes (the snapshot is on the server) and only then does it exit 76 and restart. Finally a `systemctl stop`
+#       during such a drain exits 0 (Result=success, status 0, never 76) and no restart follows. For the test, RestartSec=60 of the
+#       shipped unit is shortened to 15 s by a drop-in (the shipped value is asserted first). NOT covered here: "a start in the
+#       middle of an install exits 76" (needs a half-written install at an exact moment; the pytest suite covers it)
 #
 # The README's wording is followed as closely as a script can; where the README is wrong the scenario says so as a FINDING (listed
 # at the end, not counted as a failure).
@@ -53,6 +65,7 @@
 #   ./scenarios/test_install.sh                    # both VMs, everything (~25 min)
 #   ./scenarios/test_install.sh --only-24          # one VM (--only-22 likewise)
 #   ./scenarios/test_install.sh --no-upgrade       # skip I15 (and its second wheel build)
+#   ./scenarios/test_install.sh --no-inplace       # skip I16 (and the N+1 wheel build)
 #   ./scenarios/test_install.sh --keep             # leave the install, the pool and the daemon in place
 #   ./scenarios/test_install.sh --purge            # delete zfsb-inst22 and zfsb-inst24 (and ONLY those) at the end
 #   SRC_REF=<commit-ish> ./scenarios/test_install.sh   # build this tree (default HEAD); SRC_REF=WORKTREE builds the working tree as it
@@ -76,7 +89,7 @@ SRC_REF="${SRC_REF:-HEAD}"
 OLD_REF="${OLD_REF:-0cd236c}"
 OLD_REV="7c3e9d51b2a8"                      # the schema revision of OLD_REF (asserted)
 
-POOL="zbinst"; IMG="/var/tmp/zbinst.img"; POOL_SIZE="2g"
+POOL="zbinst"; IMG="/var/tmp/zbinst.img"; POOL_SIZE="4g"
 API_PORT="18443"
 APP="/opt/zfsbackup"; VENV="$APP/venv"      # the paths the shipped unit expects
 CFGDIR="/var/lib/zfsbackup"; DB="$CFGDIR/config.db"; BAKDIR="$CFGDIR/backups"
@@ -87,12 +100,13 @@ OPUSER="zbop"                               # the group operator
 
 VM_CPUS="${VM_CPUS:-2}"; VM_MEM="${VM_MEM:-2G}"; VM_DISK="${VM_DISK:-12G}"
 
-DO22=1; DO24=1; UPGRADE=1; KEEP=0; PURGE=0
+DO22=1; DO24=1; UPGRADE=1; INPLACE=1; KEEP=0; PURGE=0
 for arg in "$@"; do
     case "$arg" in
         --only-22) DO24=0 ;;
         --only-24) DO22=0 ;;
         --no-upgrade) UPGRADE=0 ;;
+        --no-inplace) INPLACE=0 ;;
         --keep) KEEP=1 ;;
         --purge) PURGE=1 ;;
         -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -215,6 +229,27 @@ if [ "$UPGRADE" -eq 1 ]; then
     [ -n "$OLD_WHL" ] || die "poetry build of '$OLD_REF' produced no wheel (see $WORK/old.log)"
     info "old wheel $(basename "$OLD_WHL")"
 fi
+BUMP_WHL=""; BUMP_VER=""; CUR_VER=""
+if [ "$INPLACE" -eq 1 ]; then
+    step "Building version N+1 of the current tree on the host (a temp copy with \".post1\" appended to the version)"
+    BSRC="$WORK/src-bump"; mkdir -p "$BSRC"
+    if [ "$SRC_REF" = WORKTREE ]; then
+        # the working tree as it is, minus .git and ignored files; a tracked file deleted in the tree only makes rsync say so
+        (cd "$TOP" && git ls-files -z -co --exclude-standard | rsync -a --from0 --files-from=- ./ "$BSRC/") > "$WORK/bump-copy.log" 2>&1
+        [ -f "$BSRC/pyproject.toml" ] || die "could not copy the working tree for the N+1 build (see $WORK/bump-copy.log)"
+    else
+        git -C "$TOP" archive "$SRC_REF" | tar -x -C "$BSRC" || die "git archive of '$SRC_REF' failed"
+    fi
+    CUR_VER="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$BSRC/pyproject.toml" | head -n1)"
+    [ -n "$CUR_VER" ] || die "no version = \"...\" line in pyproject.toml"
+    BUMP_VER="$CUR_VER.post1"
+    awk -v nv="$BUMP_VER" '!done && /^version = "/ { print "version = \"" nv "\""; done=1; next } { print }' "$BSRC/pyproject.toml" > "$BSRC/pyproject.toml.new" \
+        && mv "$BSRC/pyproject.toml.new" "$BSRC/pyproject.toml"
+    (cd "$BSRC" && poetry build -f wheel -o "$WORK/bump") > "$WORK/bump.log" 2>&1 || { sed 's/^/    poetry: /' "$WORK/bump.log" >&2; die "poetry build of N+1 failed"; }
+    BUMP_WHL="$(ls "$WORK"/bump/zfsbackup-*.whl 2>/dev/null | head -n1)"
+    [ -n "$BUMP_WHL" ] || die "poetry build produced no N+1 wheel (see $WORK/bump.log)"
+    info "N = $CUR_VER ($(basename "$NEW_WHL")), N+1 = $BUMP_VER ($(basename "$BUMP_WHL"))"
+fi
 NEW_WHL_BASE="$(basename "$NEW_WHL")"; NEW_SDIST_BASE="$(basename "$NEW_SDIST")"
 SDIST_DIR="${NEW_SDIST_BASE%.tar.gz}"
 
@@ -246,6 +281,29 @@ for line in sys.stdin:
     if m and pat.search(m):
         print("%s\t%s" % (r.get("PRIORITY"), m))
 PYEOF
+    # seconds between the unit's "Main process exited ... status=76" and its "Scheduled restart job" (journalctl -o short-unix)
+    put_text "$G/restartgap.awk" 644 <<'AWKEOF'
+/Main process exited, code=exited, status=76/ { a = $1 }
+/Scheduled restart job/ { b = $1 }
+END { if (a != "" && b != "") printf "%d\n", b - a; else print "none" }
+AWKEOF
+    # waitrx.sh <timeout>: wait for the daemon's stream `zfs receive` (not a short-lived `zfs receive -A`) to have read >= 1 MB, print
+    # its pid. (Not SIGSTOP: any signal makes a running zfs send/receive abort -- "cannot send ...: signal received" -- so a
+    # frozen transfer is not a thing; the loopback is throttled with tc instead.)
+    put_text "$G/waitrx.sh" 755 <<'SHEOF'
+#!/bin/bash
+end=$((SECONDS + $1))
+while [ "$SECONDS" -lt "$end" ]; do
+    for pid in $(pgrep -f '^(/[^ ]*/)?zfs receive' | tr '\n' ' '); do
+        args="$(ps -o args= -p "$pid" 2>/dev/null)"
+        case "$args" in *" -A "*|*" -A") continue ;; esac
+        rchar="$(awk '/^rchar:/ {print $2}' "/proc/$pid/io" 2>/dev/null)"
+        if [ "${rchar:-0}" -ge 1000000 ]; then echo "$pid"; exit 0; fi
+    done
+    sleep 0.2
+done
+exit 1
+SHEOF
 }
 
 # The client/server configuration. __PIN__ is the destination's server_fingerprint line once enrolled (an `import` is a full
@@ -334,6 +392,7 @@ provision() {
         need=""
         command -v zfs  >/dev/null 2>&1 || need="$need zfsutils-linux"
         command -v curl >/dev/null 2>&1 || need="$need curl"
+        command -v tc   >/dev/null 2>&1 || need="$need iproute2"
         dpkg -s python3-venv >/dev/null 2>&1 || need="$need python3-venv"
         if [ -n "$need" ]; then apt-get update -qq && apt-get install -y -qq $need; fi
         modprobe zfs 2>/dev/null || true
@@ -690,8 +749,10 @@ enroll_and_receive() {
     local nsd nsh
     nsd="$(vsh "readlink /proc/$(sd_prop MainPID)/ns/mnt" | tr -d '[:space:]')"; nsh="$(vsh 'readlink /proc/1/ns/mnt' | tr -d '[:space:]')"
     check "the daemon has no private mount namespace (the unit's mount namespace is init's)" "$nsh" "$nsd"
-    check "the dataset the daemon created for the client ($PARENT) is mounted" "yes" "$pmounted"
-    check_re "findmnt on the HOST (not the unit's namespace) shows that zfs mount" "zfs" "$(vsh "findmnt -n -o FSTYPE,TARGET /$PARENT 2>&1")"
+    # B-2a: the parents the daemon creates are canmount=noauto and never mounted, so nothing of the server tree appears on the host
+    # by itself; the only mount in this scenario is the read-only restore clone below (the README's restore recipe)
+    check "the parent the daemon created for the client ($PARENT) is canmount=noauto and not mounted (B-2a)" "noauto no" \
+        "$(vsh "zfs get -H -o value canmount '$PARENT'" | tr -d '[:space:]') $pmounted"
     check "the received copy itself is not mounted (the receive uses -u)" "no" "$mounted"
     vsh "zfs create -p '$POOL/restore' && zfs clone -o readonly=on -o canmount=on -o mountpoint=/mnt/zbinst-restore '$SDS@$snapname' '$POOL/restore/data'" \
         && pass "the README's file-level restore: a read-only clone outside the target tree was created" || fail "could not clone the received snapshot"
@@ -743,6 +804,8 @@ check_ok() {
     check "systemctl enable --now zfsbackup-check.timer exits 0" "0" "$rc"
     check "the timer is active and scheduled" "active" "$(vsh 'systemctl show -p ActiveState --value zfsbackup-check.timer' | tr -d '[:space:]')"
     check_re "... list-timers shows it with a next run" "zfsbackup-check.timer" "$(vsh 'systemctl list-timers zfsbackup-check.timer --no-pager 2>&1')"
+    # the timer fires at once when enabled on a booted host (OnBootSec=2min has elapsed): stop it first, or its run can land between the rm and our start
+    vsh "systemctl disable --now zfsbackup-check.timer >/dev/null 2>&1; while systemctl is-active --quiet zfsbackup-check.service; do sleep 1; done; true" || true
     vsh "rm -f $PROM; systemctl start zfsbackup-check.service"; rc=$?
     check "the check unit run on a healthy host exits 0, Result=success" "0 success" \
         "$rc $(vsh 'systemctl show -p Result --value zfsbackup-check.service')"
@@ -914,6 +977,171 @@ upgrade() {
     section_end
 }
 
+# ───────────────────── I16: in-place upgrade under a running daemon (S-8) ─────────────────────
+# pip_venv <wheel on the guest> [reinstall]: install into the venv, pip or (a `uv venv` has no pip) uv; --no-deps keeps it offline
+pip_venv() {
+    local whl="$1" re="${2:-}"
+    if vsh "test -x $VENV/bin/pip"; then
+        vsh "$VENV/bin/pip install -q --no-deps ${re:+--force-reinstall} '$whl' 2>&1"
+    else
+        vsh "/var/tmp/zbinst-uvtool/bin/uv pip install --python $VENV/bin/python --no-deps ${re:+--reinstall} '$whl' 2>&1"
+    fi
+}
+venv_version() { vsh "$VENV/bin/zfsbackupd --version 2>&1" | head -n1 | awk '{print $2}' | tr -d '[:space:]'; }
+SKEW_WARN='changed on disk while the daemon was running'
+n_in_journal() { jl --since "@$1" | grep -c -- "$2" | tr -d '[:space:]'; }      # n_in_journal <mark> <fixed string>
+
+# await_exit76_restart <old main pid> <mark> <label>: wait for the exit 76 and for systemd's restart onto a NEW main pid
+await_exit76_restart() {
+    local oldpid="$1" mark="$2" label="$3" gap
+    wait_guest 150 "journalctl -u $UNIT -o cat --no-pager --since @$mark | grep -q 'Main process exited, code=exited, status=76'" \
+        && pass "$label: the main process exited with status 76" || fail "$label: no 'status=76' in the journal within 150s"
+    wait_guest 90 "[ \"\$(systemctl show -p MainPID --value $UNIT)\" != $oldpid ] && systemctl is-active --quiet $UNIT" \
+        && pass "$label: systemd restarted the unit and it is active again (READY)" || fail "$label: the unit is not active again (state $(sd_prop ActiveState))"
+    gap="$(vsh "journalctl -u $UNIT -o short-unix --no-pager --since @$mark | awk -f $G/restartgap.awk" | tr -d '[:space:]')"
+    if [ "$gap" != none ] && [ "${gap:-0}" -ge 14 ] 2>/dev/null; then pass "$label: the restart came ${gap}s after the exit (RestartSec=15 for this test)"
+    else fail "$label: the restart delay was '$gap' s (expected >= 14, RestartSec=15)"; fi
+}
+
+# after_restart_clean <old main pid> <mark> <label> <wanted version>: the second start is clean, not a loop
+after_restart_clean() {
+    local oldpid="$1" mark="$2" label="$3" want="$4" newpid out rc
+    newpid="$(sd_prop MainPID)"
+    check "$label: \`zfsbackupd --version\` shows $want" "$want" "$(venv_version)"
+    check "$label: exactly one restart so far (\"Scheduled restart job\")" "1" "$(n_in_journal "$mark" 'Scheduled restart job')"
+    check "$label: the drain WARNING was logged exactly once" "1" "$(n_in_journal "$mark" "$SKEW_WARN")"
+    sleep 25
+    check "$label: 25 s later: still the new supervisor, still one restart (no restart loop)" "active $newpid 1" \
+        "$(sd_prop ActiveState) $(sd_prop MainPID) $(n_in_journal "$mark" 'Scheduled restart job')"
+    [ "$newpid" != "$oldpid" ] && pass "$label: a new supervisor (pid $oldpid -> $newpid)" || fail "$label: same supervisor pid $newpid"
+    check_re "$label: StatusText is the plain generation again" '^generation [0-9]+$' "$(sd_prop StatusText)"
+    out="$(vsh "zfsbackup-config status --wait 30 2>&1")"; rc=$?
+    check "$label: \`zfsbackup-config status --wait 30\` exits 0" "0" "$rc"
+    [ "$rc" -eq 0 ] || printf '%s\n' "$out" | sed 's/^/    status: /'
+    check_re "$label: the new daemon logged the version it runs" "zfsbackup $want" "$(jl --since @$mark)"
+}
+
+# slow_transfer <file tag>: throttle the loopback (tc tbf, 4 Mbit/s = 0.5 MB/s) and snapshot 300 MB of fresh data, so the remote worker's
+# transfer to the local API takes ~10 minutes; returns once the stream `zfs receive` (pid in RX_PID) is up and has read >= 1 MB
+RX_PID=""
+slow_transfer() {
+    vsh "tc qdisc replace dev lo root tbf rate 4mbit burst 256kb latency 1s" || { fail "could not throttle the loopback (tc)"; return 1; }
+    vsh "head -c 300000000 /dev/urandom > /$POOL/data/skew-$1.bin; sync; zfs snapshot '$POOL/data@autosnap_'\$(date -u +%Y%m%d%H%M%S)" || { fail "could not create the test snapshot"; return 1; }
+    RX_PID="$(vsh "bash $G/waitrx.sh 150" | tr -d '[:space:]')"
+    if [ -z "$RX_PID" ]; then fail "no zfs receive was reading within 150s (the remote worker did not start a transfer)"; return 1; fi
+    check_re "a throttled transfer is in flight: the stream's zfs receive ($RX_PID) is running" '^[RSD]' "$(vsh "ps -o stat= -p $RX_PID" | tr -d '[:space:]')"
+}
+unthrottle() { vsh "tc qdisc del dev lo root >/dev/null 2>&1; true" || true; }
+rx_still_running() { # the stream's receive is alive and has not read the whole 300 MB
+    vsh "kill -0 $RX_PID 2>/dev/null && [ \"\$(awk '/^rchar:/ {print \$2}' /proc/$RX_PID/io)\" -lt 250000000 ] && echo yes || echo no" | tr -d '[:space:]'
+}
+
+inplace_upgrade() {
+    section "I16 — in-place \`pip install\` over a RUNNING daemon: drain, exit 76, one restart (S-8 version-skew guard)"
+    local bwhl nwhl="$NEW_WHL_BASE" oldpid mark out rc
+    bwhl="$(basename "$BUMP_WHL")"
+    put_file "$BUMP_WHL" "$G/$bwhl" 644
+    put_file "$NEW_WHL" "$G/$nwhl" 644
+    vsh "tc qdisc del dev lo root >/dev/null 2>&1; systemctl stop $UNIT >/dev/null 2>&1; systemctl reset-failed $UNIT >/dev/null 2>&1; pkill -9 -f '^(/[^ ]*/)?zfs (receive|send)' >/dev/null 2>&1; true" || true
+    out="$(pip_venv "$G/$nwhl" reinstall)"; rc=$?
+    check "precondition: version N ($CUR_VER) is (re)installed in the venv" "0 $CUR_VER" "$rc $(venv_version)"
+    check "the SHIPPED unit has RestartSec=60 and RestartForceExitStatus naming 76" "1min yes" \
+        "$(sd_prop RestartUSec) $(vsh "systemctl show -p RestartForceExitStatus --value $UNIT | grep -q 76 && echo yes || echo no" | tr -d '[:space:]')"
+    put_text /etc/systemd/system/zfsbackup.service.d/zz-zbinst-skew.conf 644 <<'DROPEOF'
+[Service]
+RestartSec=15
+DROPEOF
+    vsh "systemctl daemon-reload" || die "daemon-reload failed"
+    check "for the test only: a drop-in shortens RestartSec to 15 s" "15s" "$(sd_prop RestartUSec)"
+    vsh "systemctl start $UNIT >$G/start.out 2>&1"; rc=$?
+    check "systemctl start returns after READY (N running)" "0 active" "$rc $(sd_prop ActiveState)"
+    [ "$rc" -eq 0 ] || vsh "cat $G/start.out; journalctl -u $UNIT -n 15 --no-pager -o cat" | sed 's/^/    start: /'
+    sleep 5
+    check "the daemon runs N: zfsbackupd --version" "$CUR_VER" "$(venv_version)"
+
+    # ---- cycle 1: N -> N+1, idle daemon
+    oldpid="$(sd_prop MainPID)"; mark=$(( $(jl_epoch) - 1 ))
+    out="$(pip_venv "$G/$bwhl")"; rc=$?
+    check "C1 ($CUR_VER -> $BUMP_VER): pip install of N+1 over the running daemon succeeds" "0" "$rc"
+    [ "$rc" -eq 0 ] || printf '%s\n' "$out" | sed 's/^/    pip: /'
+    wait_guest 90 "journalctl -u $UNIT -o cat --no-pager --since @$mark | grep -q '$SKEW_WARN'" \
+        && pass "C1: the drain WARNING appeared within 90 s (two reads, 10 s apart)" || fail "C1: no drain WARNING within 90 s"
+    local w; w="$(jl --since @$mark | grep -- "$SKEW_WARN")"
+    check_re "C1: the WARNING names the change (\"$CUR_VER -> $BUMP_VER\") and \"will exit 76\"" "$CUR_VER -> $BUMP_VER.*will exit 76" "$w"
+    check_re "C1: ... and is stored with PRIORITY 4 (warning)" $'^4\t.*changed on disk' \
+        "$(vsh "journalctl -u $UNIT -o json --no-pager --since @$mark | python3 $G/jprio.py 'changed on disk'")"
+    await_exit76_restart "$oldpid" "$mark" "C1"
+    after_restart_clean "$oldpid" "$mark" "C1" "$BUMP_VER"
+
+    # ---- cycle 2: the same version reinstalled
+    oldpid="$(sd_prop MainPID)"; mark=$(( $(jl_epoch) - 1 ))
+    out="$(pip_venv "$G/$bwhl" reinstall)"; rc=$?
+    check "C2 (same version $BUMP_VER): a forced reinstall succeeds" "0" "$rc"
+    wait_guest 90 "journalctl -u $UNIT -o cat --no-pager --since @$mark | grep -q '$SKEW_WARN'" \
+        && pass "C2: the drain WARNING appeared" || fail "C2: a same-version reinstall was not detected within 90 s"
+    check_re "C2: the WARNING says the version was reinstalled" "$BUMP_VER was reinstalled" "$(jl --since @$mark | grep -- "$SKEW_WARN")"
+    await_exit76_restart "$oldpid" "$mark" "C2"
+    after_restart_clean "$oldpid" "$mark" "C2" "$BUMP_VER"
+
+    # ---- cycle 3: the drain waits for a transfer in flight
+    SDS="$POOL/backups/$CID/data"
+    oldpid="$(sd_prop MainPID)"; mark=$(( $(jl_epoch) - 1 ))
+    if slow_transfer c3; then
+        local snap; snap="$(vsh "zfs list -H -t snapshot -o name -s createtxg '$POOL/data' | tail -n1" | tr -d '[:space:]')"; snap="${snap#*@}"
+        out="$(pip_venv "$G/$bwhl" reinstall)"
+        wait_guest 90 "journalctl -u $UNIT -o cat --no-pager --since @$mark | grep -q '$SKEW_WARN'" \
+            && pass "C3: the drain WARNING appeared during the throttled transfer" || fail "C3: no drain WARNING"
+        sleep 20
+        check "C3: in the drain, with the transfer still running: the daemon did NOT exit (same supervisor, active)" "active $oldpid" "$(sd_prop ActiveState) $(sd_prop MainPID)"
+        check "C3: ... no exit 76 yet" "0" "$(n_in_journal "$mark" 'status=76')"
+        check "C3: ... the transfer is still in flight (its zfs receive runs, < 250 MB read)" "yes" "$(rx_still_running)"
+        check "C3: the pid file carries draining=" "1" "$(vsh "grep -c '^draining=' $DB.daemon.pid" | tr -d '[:space:]')"
+        check_re "C3: StatusText says the daemon is draining" "draining" "$(sd_prop StatusText)"
+        vsh "curl -fsSk --connect-timeout 3 --max-time 6 -o $G/health.out https://127.0.0.1:$API_PORT/health" \
+            && pass "C3: the API worker still answers /health (it serves until the remote worker has left)" || fail "C3: /health does not answer during the drain"
+        unthrottle     # the rest of the 300 MB now goes at full speed; the drain may end only after it
+        await_exit76_restart "$oldpid" "$mark" "C3"
+        check "C3: the transfer ran to its end: the snapshot $snap is on the server" "yes" \
+            "$(vsh "zfs list -H -o name '$SDS@$snap' >/dev/null 2>&1 && echo yes || echo no" | tr -d '[:space:]')"
+        after_restart_clean "$oldpid" "$mark" "C3" "$BUMP_VER"
+    fi
+
+    # ---- cycle 4: systemctl stop during a drain is an ordinary stop
+    oldpid="$(sd_prop MainPID)"; mark=$(( $(jl_epoch) - 1 ))
+    if slow_transfer c4; then
+        out="$(pip_venv "$G/$bwhl" reinstall)"
+        wait_guest 90 "journalctl -u $UNIT -o cat --no-pager --since @$mark | grep -q '$SKEW_WARN'" \
+            && pass "C4: the drain WARNING appeared during the throttled transfer" || fail "C4: no drain WARNING"
+        wait_guest 20 "grep -q '^draining=' $DB.daemon.pid" || true
+        check "C4: draining (pid file draining=), the daemon still up" "1 active" \
+            "$(vsh "grep -c '^draining=' $DB.daemon.pid" | tr -d '[:space:]') $(sd_prop ActiveState)"
+        local t0=$SECONDS
+        vsh "systemctl stop $UNIT"; rc=$?
+        info "C4: the stop took $((SECONDS - t0))s"
+        check "C4: \`systemctl stop\` during the drain exits 0" "0" "$rc"
+        check "C4: inactive, Result=success, ExecMainStatus=0 (the ordinary exit code, not 76)" "inactive success 0" \
+            "$(sd_prop ActiveState) $(sd_prop Result) $(sd_prop ExecMainStatus)"
+        check "C4: the journal has no exit 76 for this run" "0" "$(n_in_journal "$mark" 'status=76')"
+        sleep 25
+        check "C4: 25 s later (RestartSec=15) no restart followed: still inactive, no restart scheduled" "inactive 0" \
+            "$(sd_prop ActiveState) $(n_in_journal "$mark" 'Scheduled restart job')"
+        unthrottle
+        vsh "pkill -9 -f '^(/[^ ]*/)?zfs (receive|send)' >/dev/null 2>&1; true" || true
+    fi
+
+    # ---- put N back and remove the test drop-in
+    vsh "
+        tc qdisc del dev lo root >/dev/null 2>&1
+        systemctl stop $UNIT >/dev/null 2>&1
+        rm -f /etc/systemd/system/zfsbackup.service.d/zz-zbinst-skew.conf
+        systemctl daemon-reload; systemctl reset-failed $UNIT >/dev/null 2>&1
+        true
+    " || true
+    out="$(pip_venv "$G/$nwhl" reinstall)"
+    check "the venv is back on N ($CUR_VER)" "$CUR_VER" "$(venv_version)"
+    section_end
+}
+
 run_vm() { # run_vm <vm> <ubuntu release> <tag>
     VM="$1"; TAG="$3"
     echo; echo "${BOLD}=================================================================${NC}"
@@ -935,6 +1163,7 @@ run_vm() { # run_vm <vm> <ubuntu release> <tag>
     backup_cmd
     clean_stop
     restart_policy
+    [ "$INPLACE" -eq 1 ] && inplace_upgrade
     [ "$UPGRADE" -eq 1 ] && upgrade
     if [ "$KEEP" -eq 0 ]; then
         vsh "{ systemctl stop $UNIT zbinst-old zfsbackup-check.timer; systemctl disable $UNIT; } >/dev/null 2>&1; true" || true
