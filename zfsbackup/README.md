@@ -1066,6 +1066,9 @@ list with background is in [docs/production_readiness_report.md](../docs/product
   protections around it are zfsbackup's own: a per-connection TLS handshake with a timeout, at most 64
   connections (16 without a client certificate), an absolute deadline for request headers, and a bounded
   drain. Restrict the port by firewall.
+- **A TLS 1.3 key-update request during a stalled server write.** A client that sends a KeyUpdate request while
+  the server is in the middle of a stalled write aborts that one transfer on OpenSSL 3.0 (Ubuntu 22.04 and 24.04);
+  it resumes on the next cycle. This is an OpenSSL limitation; zfsbackup clients never send such a request.
 - **Revocation cuts running streams** within about 2 seconds (the partial receive is kept for a resume); a key
   rotation does not.
 - **Flood control is per address, with constants, no configuration**: a rate limit and 8 connections per

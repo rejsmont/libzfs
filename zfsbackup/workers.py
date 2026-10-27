@@ -1177,6 +1177,7 @@ def _api_server_class():
         import hashlib
         import io
         import math
+        import select
         import socket
         import socketserver
         import ssl
@@ -1304,6 +1305,34 @@ def _api_server_class():
                 finally:
                     super().close()
 
+        #: `_SessionSocket`: the most bytes handed to one `SSL_write` call
+        #: (so one critical section under the TLS lock, and one turn of the
+        #: lock for a waiting reader, is bounded no matter how large the
+        #: `sendall`). A call that wants the peer is retried with the very same
+        #: slice, as OpenSSL requires.
+        _WS_WRITE_CHUNK = 64 * 1024
+
+        class _TlsLock:
+            """A mutex whose waiters cannot be overtaken: `__enter__` takes a
+            gate, then the lock, then releases the gate. A thread blocked on
+            the lock holds the gate, so the thread that just released the
+            lock cannot take it again before the waiter has (a plain
+            `threading.Lock` lets it, and a reader looping over a busy
+            stream would starve the writer). Used by `_SessionSocket`."""
+
+            __slots__ = ('_gate', '_lock')
+
+            def __init__(self):
+                self._gate = threading.Lock()
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                with self._gate:
+                    self._lock.acquire()
+
+            def __exit__(self, *exc_info):
+                self._lock.release()
+
         class _SessionSocket:
             """The socket a websocket session gets (`werkzeug.socket` in its
             environ, which simple-websocket's `Server` takes), in place of
@@ -1338,14 +1367,88 @@ def _api_server_class():
             the connection carries the websocket stream, and no HTTP response
             may be written on it (`ApiRequestHandler.send_response`).
 
-            Writes are serialised by one lock (`SSL_write` must never run on
-            one SSL object from two threads; the reader's control-frame
-            replies and the route's sends would otherwise be able to
-            overlap) and are always complete (`sendall`: simple-websocket
-            ignores `send`'s count). Reads are not locked: the reader blocks
-            in `recv` for the whole session, and it is the only reader --
-            the post-response drain never reads a websocket request
-            (`_DeadlineReader._drain_into`).
+            **One thread inside OpenSSL at a time (plan K-2).** OpenSSL does
+            not support a read and a write on one `SSL` object from two
+            threads, and this session has exactly that: the reader thread is
+            inside `recv` for the whole session while the route thread (and
+            the reader's own pong / close replies) write. Observed on Ubuntu
+            24.04 (OpenSSL 3.0.13), one TLS 1.3 connection, one reader and one
+            writer thread against a healthy peer: spurious `SSLEOFError`
+            (`SSL_get_error` sees `rwstate` changed by the other thread's
+            `SSL_write`, so a read that only needs more data reports EOF),
+            `DECRYPTION_FAILED_OR_BAD_RECORD_MAC`, and once heap corruption.
+            So every call into the TLS object (`recv`, `send`) is made under
+            ONE lock, `_tls_lock`, and the lock is never held while waiting
+            for the network: the descriptor is put in non-blocking mode (at
+            the first call, see `_io`), each call returns at once, and when
+            it needs the peer (`SSLWantReadError`, `SSLWantWriteError`) the
+            lock is released and the thread waits for the descriptor to be
+            readable / writable with `poll`, then takes the lock and retries.
+            A read that needs to write (a pending session ticket) and a
+            write that needs to read are both a retry that waits for the
+            other direction -- EXCEPT one case OpenSSL cannot handle: a peer's
+            TLS 1.3 KeyUpdate with `update_requested` that arrives while a
+            non-blocking `SSL_write` is still pending (its record only
+            partly written, the peer not reading) makes the reader's
+            `SSL_read` fail with `[SSL: BAD_LENGTH] bad length`
+            (`rec_layer_s3.c`, `len < wnum + wpend_tot`), which ends the
+            session (seen with 3.0.13; 4.0.3 answers such KeyUpdates during
+            pending writes without error). This is an OpenSSL limitation,
+            reproducible with a single-threaded non-blocking server, not a
+            defect of this wrapper. Only a pinned peer that sends such a
+            KeyUpdate while our write is stalled can trigger it (our client
+            never sends one). It fails closed: the stream is aborted, no ack
+            is sent, and the transfer resumes next cycle. Known residual
+            (plan K-2a). Buffered plaintext
+            (`SSL_pending`) is returned without waiting because every wait
+            follows an attempt that said it needs the peer; the descriptor is
+            never polled first. The critical sections are one OpenSSL call
+            on a non-blocking socket: a record's decrypt for a read, at most
+            what the kernel accepts of `_WS_WRITE_CHUNK` bytes for a write.
+
+            **Lock order.** `_write_lock` (one `sendall` at a time, so frames
+            do not interleave, and each is complete-or-raise) is taken before
+            `_tls_lock` and `_state`; `_tls_lock` and `_state` are leaves --
+            neither is ever held while taking the other, `_write_lock`, or
+            anything else, and neither is held across a wait. The write
+            lock IS held while a `sendall` waits for the peer, which is the
+            point (S-2 below) and costs a reader nothing: reads do not take
+            it. `_tls_lock` is a turnstile lock (`_TlsLock`): a thread that
+            is waiting for it cannot be overtaken by the other thread's
+            next call, so a reader looping over a busy stream cannot starve
+            the route's final reply and close frame.
+
+            **A failed write breaks the session's writes.** If `sendall`
+            raises part-way (a timeout, a reset, a cut), OpenSSL keeps the
+            partial record pending, and -- the context sets
+            `SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER` -- a LATER write of
+            different data would flush that old record and skip the first
+            bytes of the new buffer, splicing the websocket stream. So any
+            exception from the TLS write marks the writes broken
+            (`_write_broken`) and shuts the connection down (`force_eof`);
+            every later `sendall` raises `BrokenPipeError` without reaching
+            OpenSSL. Today it is unreachable (no timeout for a pinned peer,
+            and the socket is dead after a cut); this keeps it so.
+
+            Reads keep `recv`'s blocking-with-timeout meaning: the timeout is
+            the one the connection had when the session was created (`None`
+            for a pinned peer: `run_wsgi` clears it), applied as a deadline
+            to one `recv` / one `sendall`, `TimeoutError` when it passes.
+            `b''` is the orderly EOF (and the ragged EOF that
+            `SSLSocket.suppress_ragged_eofs` has always folded into it).
+            Writes are always complete (`send` in a loop: simple-websocket
+            ignores `send`'s count). There is only ever one reader -- the
+            post-response drain never reads a websocket request
+            (`_DeadlineReader._drain_into`) -- but nothing here depends on it.
+
+            The descriptor stays non-blocking for the rest of the
+            connection's life. Nothing else reads or writes the `SSLSocket`
+            after the first call: the upgrade response and everything after
+            it go through here, `ApiRequestHandler.send_response` drops any
+            response written after the `101`, and a request refused before
+            the upgrade never reached this class (the route authenticates
+            before it accepts the websocket), so its refusal is written to a
+            still-blocking socket.
 
             **Write-stall bound (plan S-2).** A peer that completes the
             handshake and then never reads fills its receive window, and the
@@ -1374,7 +1477,21 @@ def _api_server_class():
             def __init__(self, tls):
                 self._tls = tls
                 self._write_lock = threading.Lock()
+                #: Around every call into `self._tls`, and nothing else
+                #: (see "Lock order" above).
+                self._tls_lock = _TlsLock()
                 self._state = threading.Condition(threading.Lock())
+                #: The timeout the connection had when the session was
+                #: created, applied by `_io` (the descriptor itself is
+                #: non-blocking from the first call).
+                self._timeout = tls.gettimeout()
+                #: `self._tls` has been put in non-blocking mode. Under
+                #: `_tls_lock`.
+                self._nonblocking = False
+                #: A write failed part-way: no later write may reach OpenSSL
+                #: (see "A failed write breaks the session's writes").
+                #: Only touched by the thread holding `_write_lock`.
+                self._write_broken = False
                 #: Calls currently inside `self._tls` (reads and writes).
                 self._busy = 0
                 self._ended = False
@@ -1413,23 +1530,113 @@ def _api_server_class():
                     except OSError:
                         pass
 
+            def _io(self, call, deadline, blocked_on):
+                """Run `call()` (one OpenSSL call on `self._tls`) under
+                `_tls_lock`; while it says it needs the peer, wait for the
+                descriptor OUTSIDE the lock and run it again. -> its result.
+                `deadline` (`time.monotonic()`, or `None`) bounds the whole
+                thing: `TimeoutError`. `blocked_on` is the direction a bare
+                `BlockingIOError` (a plain, non-TLS socket) means.
+
+                Nothing here waits while holding a lock the other thread
+                needs, so `force_eof` (a kernel `shutdown(2)`: the
+                descriptor turns readable and writable-with-error) wakes a
+                thread waiting in `poll`, and the next attempt fails or sees
+                EOF."""
+                while True:
+                    with self._tls_lock:
+                        if not self._nonblocking:
+                            self._tls.settimeout(0.0)
+                            self._nonblocking = True
+                        try:
+                            return call()
+                        except ssl.SSLWantReadError:
+                            events = select.POLLIN
+                        except ssl.SSLWantWriteError:
+                            events = select.POLLOUT
+                        except BlockingIOError:
+                            events = blocked_on
+                        # Plaintext OpenSSL already holds is not announced by
+                        # the descriptor. A read that says it needs the peer
+                        # has none -- except what the other direction's call
+                        # buffered meanwhile -- so look before sleeping.
+                        # (Reads only: for a write, pending plaintext would
+                        # not unblock it, and the retry would spin.)
+                        if (
+                            blocked_on == select.POLLIN and events == select.POLLIN
+                            and self._pending()
+                        ):
+                            continue
+                    self._wait_fd(events, deadline)
+
+            def _pending(self) -> bool:
+                """`SSL_pending` (under `_tls_lock`). A connection without
+                the call (a plain socket) has none."""
+                pending = getattr(self._tls, 'pending', None)
+                return bool(pending is not None and pending())
+
+            def _wait_fd(self, events, deadline) -> None:
+                fd = self._tls.fileno()
+                if fd < 0:
+                    raise OSError(errno.EBADF, "the connection is closed")
+                if deadline is None:
+                    timeout_ms = None
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("The operation timed out")
+                    timeout_ms = max(1, math.ceil(remaining * 1000))
+                poller = select.poll()
+                poller.register(fd, events)
+                # Error and hang-up conditions are always reported: the
+                # caller's next attempt turns them into the real exception
+                # or EOF.
+                poller.poll(timeout_ms)
+
+            def _deadline(self) -> Optional[float]:
+                timeout = self._timeout
+                return None if timeout is None else time.monotonic() + timeout
+
             def recv(self, bufsize, flags=0):
                 if not self._enter():
                     return b''                 # EOF: the session is over
                 try:
-                    return self._tls.recv(bufsize, flags)
+                    return self._io(
+                        lambda: self._tls.recv(bufsize, flags),
+                        self._deadline(), select.POLLIN,
+                    )
                 finally:
                     self._leave()
 
             def sendall(self, data, flags=0) -> None:
                 with self._write_lock:
+                    if self._write_broken:
+                        raise BrokenPipeError(errno.EPIPE, "an earlier write on this session failed")
                     if not self._enter(write=True):
                         raise BrokenPipeError(errno.EPIPE, "the websocket session has ended")
                     # Before the write: even a failed one may have put bytes
                     # of the `101` on the wire.
                     self.upgraded = True
                     try:
-                        self._tls.sendall(data, flags)
+                        deadline = self._deadline()
+                        with memoryview(data) as view, view.cast('B') as flat:
+                            sent, total = 0, len(flat)
+                            try:
+                                while sent < total:
+                                    piece = flat[sent:sent + _WS_WRITE_CHUNK]
+                                    sent += self._io(
+                                        lambda: self._tls.send(piece, flags),
+                                        deadline, select.POLLOUT,
+                                    )
+                            except BaseException:
+                                # A record may be half written inside
+                                # OpenSSL: never write on this session again.
+                                self._write_broken = True
+                                try:
+                                    self.force_eof()
+                                except Exception:
+                                    pass   # never mask the write's own error
+                                raise
                     finally:
                         self._leave(write=True)
 
