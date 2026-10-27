@@ -113,6 +113,23 @@ Notes:
 
 ---
 
+## Release 1.0.0rc1
+
+**Run:** 2026-10-27, `SRC_REF=61a7673` (the release commit: the 1.0.0rc1 tree plus the websocket TLS lock and
+Python 3.15 support), `zfsb-server` + `zfsb-client` (Ubuntu 26.04, OpenZFS 2.4.1). Every scenario ran, none
+skipped (A–M, L1, R). Harness: **871 passed, 0 failed**. The run before the TLS lock fix, on `0d5a34d`, was 871 / 0
+as well.
+
+The harness reported one finding, not counted as a failure: its check of the README's raw-clone sentence is
+stale. The README already says that `zfs clone` of an encrypted copy succeeds without the key and only reading it
+fails; the harness's wording check predates that.
+
+The other release checks on the same tree: the OpenZFS matrix (2.1.5, 2.2.2, 2.4.1) 305 / 0 each, the install
+scenario on Ubuntu 22.04 and 24.04 (with the in-place upgrade) 433 / 0, and `test_config_permissions.sh` 321 / 0;
+those ran on `0d5a34d`/`af45675`, before the TLS and 3.15 changes, which touch neither ZFS calls nor installation.
+
+---
+
 ## Environment gotcha: `multipass exec` `/dev/null` wedge (macOS)
 
 Most of the debugging time went to a **Multipass-on-macOS** bug, reproduced
