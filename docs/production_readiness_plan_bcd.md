@@ -945,7 +945,7 @@ Each has a recommendation. Reply "accept all", or answer by number.
   - **Raw (if S-6 lands):** `zfs send -w`, then `zfs load-key` with the original key. The server never has the key, so keep a copy of the key off the client.
   - **Host recovery:** a client restored from an S-11 backup keeps its client id and pin (no re-enroll). Otherwise `identity set-client-id ID`, then `enroll` with a server-side `trust token create --client-id ID --replace`. A lost server `.tls` means every client re-enrolls (K-4).
 - **Logging:** rewrite the stale section (`README.md:529-537`) for C3.
-- **Known limitations:** K-1 (pinned werkzeug, and stop calling it "the development server"), K-2–K-14, and the operator-visible libzfseasy C2–C7 (pool names, `longname`, `zpool` required at import, a `-` value reads back as None, Ctrl-C reaching `zfs` children, no hold/rollback). Also: no restore over the API.
+- **Known limitations:** K-1 (pinned werkzeug, and stop calling it "the development server"), K-3–K-14 (K-2 resolved before 1.0.0rc1, residual K-2a), and the operator-visible libzfseasy C2–C7 (pool names, `longname`, `zpool` required at import, a `-` value reads back as None, Ctrl-C reaching `zfs` children, no hold/rollback). Also: no restore over the API.
 - **Verify:** the install scenario and scenario R follow the README verbatim. Fix up the README after they run.
 
 ##### Lane 2: store (`zfsbackup-store-developer`)

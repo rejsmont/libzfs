@@ -1930,6 +1930,38 @@ class TestExecCoreCleanupMocked:
 
     @pytest.mark.unit
     @pytest.mark.subprocess
+    @pytest.mark.parametrize('what', ['dataset', 'snapshots'])
+    def test_close_reaps_the_child_while_the_closed_generator_is_still_referenced(self, mock_subprocess, what):
+        """CPython 3.12.3 does not release a generator EXPRESSION's inner iterator on `close()` (only deallocation
+        does), so a lazy destroy wrapped in `(o for o in result)` left the child running for as long as the caller
+        kept the closed generator. The child must be gone at `close()`, whatever the caller still holds."""
+        import inspect
+        process = MagicMock()
+        process.pid = 3
+        process.stdout.readline.side_effect = ['destroy\ttank/x\n', 'destroy\ttank/y\n', '']
+        process.stderr.readline.return_value = ''
+        process.poll.return_value = None
+        process.wait.return_value = -15
+        mock_subprocess.return_value = process
+        fs = Filesystem('tank/x')
+
+        if what == 'dataset':
+            gen = DestroyCommand().dataset(fs, destroy=True, lazy=True)
+        else:
+            gen = DestroyCommand().snapshots([Snapshot(fs, 's1')], destroy=True, lazy=True)
+        assert inspect.isgenerator(gen)
+        assert gen.gi_code.co_name != '<genexpr>'            # no wrapper whose inner iterator could outlive close()
+
+        assert next(gen) == 'tank/x'
+        process.terminate.assert_not_called()
+        gen.close()
+        held = gen                                           # the closed generator stays referenced
+        process.terminate.assert_called_once()
+        assert process.wait.called
+        assert inspect.getgeneratorstate(held) == inspect.GEN_CLOSED
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
     def test_the_normal_interrupt_path_joins_and_waits_once_each(self, mock_subprocess, monkeypatch):
         """F4's counterpart: a child that honours SIGTERM is joined (once) and given the final wait."""
         monkeypatch.setattr('libzfseasy.zfs._TERMINATE_TIMEOUT', 0.05)

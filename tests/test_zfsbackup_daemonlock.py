@@ -1908,15 +1908,72 @@ IS_LINUX = sys.platform.startswith("linux")
 _REAL_KILL = os.kill
 
 
+#: Teardown must reap helpers even while a test has os.pidfd_open deleted or faked
+#: (Python 3.15's timed Popen.wait calls it on Linux) or time.sleep patched.
+_REAL_SLEEP, _REAL_MONOTONIC = time.sleep, time.monotonic
+
+
 def _hard_kill(proc):
     try:
         _REAL_KILL(proc.pid, signal.SIGKILL)
     except OSError:
         pass
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:  # pragma: no cover
-        pass
+    deadline = _REAL_MONOTONIC() + 10
+    while proc.poll() is None and _REAL_MONOTONIC() < deadline:
+        _REAL_SLEEP(0.01)
+
+
+class TestHardKillIsIndependentOfPatchedProcessPrimitives:
+    """Regression guard: `_hard_kill` runs at fixture teardown while the test's
+    monkeypatches are still live. Python 3.15's `Popen.wait(timeout=...)` calls
+    `os.pidfd_open` on Linux, so a deleted or faked one broke every teardown."""
+
+    @staticmethod
+    def _sleeper():
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def test_it_reaps_with_pidfd_open_deleted(self, monkeypatch):
+        proc = self._sleeper()
+        try:
+            monkeypatch.delattr(os, "pidfd_open", raising=False)
+            _hard_kill(proc)
+            assert proc.returncode == -signal.SIGKILL
+        finally:
+            _reap_quietly(proc)
+
+    def test_it_never_calls_a_faked_pidfd_open(self, monkeypatch):
+        calls = []
+
+        def fake(*a, **kw):
+            calls.append(a)
+            raise AssertionError("pidfd_open used")
+
+        proc = self._sleeper()
+        try:
+            monkeypatch.setattr(os, "pidfd_open", fake, raising=False)
+            _hard_kill(proc)
+            assert proc.returncode == -signal.SIGKILL
+            assert calls == []
+        finally:
+            _reap_quietly(proc)
+
+    def test_it_reaps_with_time_sleep_patched(self, monkeypatch):
+        proc = self._sleeper()
+        try:
+            monkeypatch.setattr(time, "sleep", lambda *_: None)
+            _hard_kill(proc)
+            assert proc.returncode == -signal.SIGKILL
+        finally:
+            _reap_quietly(proc)
+
+
+def _reap_quietly(proc):
+    """Safety net for the guard tests above: never leave the sleeper behind."""
+    if proc.poll() is None:
+        _hard_kill(proc)
 
 
 def _real_fd_table():
@@ -2862,8 +2919,7 @@ class TestRequestReloadOutcomes:
         victim = plain_process()
         token = procident.start_token(victim.pid) or "linux:1"
         dead = victim.pid
-        victim.kill()
-        victim.wait(timeout=10)
+        _hard_kill(victim)
         spy.calls.clear()  # the victim's own kill is not request_reload's
         holder = start_helper(db, spec=f"{dead}\n3\nstart={token}\n")
         proof(holder.pid)
@@ -3554,8 +3610,7 @@ class TestRequestReloadRealPidfd:
         victim = plain_process()
         token = procident.start_token(victim.pid)
         dead = victim.pid
-        victim.kill()
-        victim.wait(timeout=10)
+        _hard_kill(victim)
         holder = start_helper(db, spec=f"{dead}\n3\nstart={token}\n")
         result = daemonlock.request_reload(db)
         assert result.outcome == "supervisor-gone"
@@ -4745,11 +4800,7 @@ def zombie():
 
     yield make
     for proc in made:
-        try:
-            _REAL_KILL(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        proc.wait(timeout=10)
+        _hard_kill(proc)
 
 
 @pytest.mark.skipif(not HAS_TOKENS, reason="zombie detection needs /proc or sysctl")

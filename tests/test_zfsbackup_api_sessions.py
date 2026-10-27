@@ -1741,24 +1741,27 @@ class TestWriteStallOverRealTls:
             ws = rig.connect(alice, rcvbuf=4096)
             writer = rig.start_stream(ws)
             session = rig.only_session()
-            stop = threading.Event()
-
+            # ONE thread does both: a batch of pings, then read the pongs, repeat. A client SSLSocket must
+            # not be read and written from two threads at once (OpenSSL 3.0.13 turns that into a spurious
+            # SSLEOFError, websocket-client closes, and the server rightly reaps the stream).
             pongs = []
-
-            def drain():
-                while not stop.is_set():
-                    with contextlib.suppress(Exception):
-                        opcode, _data = ws.recv_data_frame(control_frame=True)
-                        if opcode == 0xA:
-                            pongs.append(1)
-
-            reader = threading.Thread(target=drain, daemon=True)
-            reader.start()
-            flood = ping_flood(ws, stop=stop, limit=3000, timeout=1)
-            flood.thread.join(60)
+            payload = b"p" * 125
+            batch = 20                                       # ~3 KiB of pongs: fits the 4 KiB client buffer
+            ws.settimeout(10)
+            began = time.monotonic()
+            sent = 0
+            while sent < 3000:
+                for _ in range(batch):
+                    ws.ping(payload)
+                    sent += 1
+                got = 0
+                while got < batch:
+                    opcode, _data = ws.recv_data_frame(control_frame=True)
+                    if opcode == 0xA:
+                        got += 1
+                        pongs.append(1)
+            assert time.monotonic() - began < 120
             time.sleep(1.5)                                  # past the limit with nothing blocked
-            stop.set()
-            reader.join(10)
             assert len(pongs) >= 500, f"only {len(pongs)} pongs came back: the write path was idle"
             assert session.cut_reason is None and writer.proc.poll() is None
             ws.settimeout(10)

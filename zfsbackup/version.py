@@ -39,8 +39,8 @@ def installed_version() -> str:
     """The installed distribution's version, re-read from metadata on every
     call (no cache), or `UNKNOWN_VERSION` if it is not installed."""
     try:
-        return version(DIST_NAME)
-    except PackageNotFoundError:
+        return version(DIST_NAME) or UNKNOWN_VERSION
+    except (PackageNotFoundError, KeyError):    # KeyError: metadata without a Version (Python >= 3.15)
         return UNKNOWN_VERSION
 
 
@@ -155,7 +155,9 @@ def code_signature() -> Optional[CodeSignature]:
             dist = distribution(DIST_NAME)
             ver = dist.version or UNKNOWN_VERSION
             path = _record_path(dist) if ver != UNKNOWN_VERSION else None
-        except PackageNotFoundError:
+        except (PackageNotFoundError, KeyError):
+            # KeyError: metadata without a Version. Python 3.15 raises it where <= 3.14 returned None (and warned).
+            # Either way the distribution is not (or no longer) installed, not "cannot tell".
             return CodeSignature(UNKNOWN_VERSION, None, None, python, exe)
         if ver == UNKNOWN_VERSION:
             return CodeSignature(UNKNOWN_VERSION, None, None, python, exe)

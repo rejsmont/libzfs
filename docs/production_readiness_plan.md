@@ -750,9 +750,13 @@ Approve, adjust, reprioritize or drop any item; each one stands on its own. One 
     - cheroot/waitress don't provide `werkzeug.socket` for flask-sock, and waitress has no TLS;
     - asyncio means rewriting every route and spike.
   - Keep it, pin it (S-9), and stop calling it "the development server" in the docs.
-- **K-2. Writes inside `SSL_read` are not under the write lock (8a).**
-  - Only a pinned peer can trigger it, by requesting a TLS 1.3 KeyUpdate, and the server's route thread writes almost nothing during a stream.
-  - Optional S-size probe (`pytest-test-author`, `zfsb-ci`): send `K` from `openssl s_client` mid-session under load.
+- **K-2. RESOLVED before 1.0.0rc1: a websocket session's reader and writer shared one `SSL` object.**
+  - The original text understated it. It was not limited to a KeyUpdate: the reader thread sits in `SSL_read` for the whole session while the route thread writes the final reply and the close frame, and OpenSSL does not support a read and a write on one `SSL` object from two threads.
+  - Observed with Ubuntu 24.04 (OpenSSL 3.0.13), on a healthy peer: spurious `SSLEOFError`, `DECRYPTION_FAILED_OR_BAD_RECORD_MAC`, and once heap corruption (abort).
+  - Fix (`workers._SessionSocket`): every `recv`/`send` on the TLS object runs under one turnstile lock (`_tls_lock`), the descriptor is non-blocking, and a call that needs the peer releases the lock and waits in `poll` before retrying. No thread waits for the network while holding the lock. `_write_lock` > `_tls_lock`/`_state` (leaves).
+  - Residual K-2a (an OpenSSL limitation): a TLS 1.3 KeyUpdate with `update_requested` that arrives while a non-blocking `SSL_write` is pending makes the reader's `SSL_read` fail with `[SSL: BAD_LENGTH] bad length` (`rec_layer_s3.c`, `len < wnum + wpend_tot`) and ends the session (seen with 3.0.13). OpenSSL 4.0.3 answers such KeyUpdates during pending writes without error (about 1,350 per 10 s run, 2 MiB writes). A macOS crash first attributed to this case came from a deliberately broken test variant (no lock around `SSL_write`), not from this code. Reproduced with a single-threaded non-blocking server, so it is not the wrapper. Only a pinned peer sending KeyUpdate while the server's write is stalled can trigger it; our client never sends KeyUpdate. It fails closed: the stream is aborted, no ack is written, the transfer resumes next cycle.
+  - Hardening: after any failure inside `sendall` the session's writes are marked broken and the connection is shut down, so a half-written record can never be followed by a different write (which would splice the stream under `SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER`).
+  - Residual (not a K item): the API worker is still a threaded werkzeug server; the client (`remote.py`, websocket-client) is single-threaded on its socket and unaffected.
 - **K-3.** `require_ca` mode is not a blocker.
 - **K-4.** Server certificate re-keying is unsupported. The certificate is self-signed for 10 years and clients ignore its expiry by design; a compromised server key means re-enrolling every client.
 - **K-5. `dedupe_store_warnings` installs a global filter** (`api.py:892-899`).

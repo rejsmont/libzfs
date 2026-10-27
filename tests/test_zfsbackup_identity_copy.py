@@ -538,8 +538,11 @@ _CYCLER = textwrap.dedent(
     from zfsbackup import identity
 
     d, stop = sys.argv[1:3]
+    # rotate until the copier signals it is done (the stop file); the time bound only keeps a lost
+    # parent from leaving this process behind, it is far above any copier run
     cycles = 0
-    while not os.path.exists(stop) and cycles < 2000:
+    give_up = time.monotonic() + 180
+    while not os.path.exists(stop) and time.monotonic() < give_up:
         identity.ensure_identity(d, "client", name="client.next")
         identity.promote_identity(d)
         cycles += 1

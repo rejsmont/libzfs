@@ -20,8 +20,8 @@ on the release branch after the last merge. Every item that touches a VM uses on
 
 ## 2. Automated checks
 
-- [ ] GitHub Actions green on the release commit: the mocked matrix (Python 3.11–3.14, SQLAlchemy 2.0 and 2.1,
-      macOS), and 3.15 if it has been promoted from experimental.
+- [ ] GitHub Actions green on the release commit: the mocked matrix (Python 3.11–3.15, SQLAlchemy 2.0 and 2.1,
+      macOS).
 - [ ] The latest **real-ZFS** workflow run on `master` (`.github/workflows/real-zfs.yml`) is green, or run it by
       hand (`workflow_dispatch`).
 - [ ] The latest **latest-deps** run is green, or its failures are understood (a contract test naming a changed

@@ -23,8 +23,9 @@ jobs:
     # laptop (real-daemon, forkserver and sd_notify tests), so allow headroom.
     timeout-minutes: 60
     # A matrix entry marked `experimental` may fail without failing the
-    # workflow: it is reported, not enforced, until it has been green (see 3.15
-    # below).
+    # workflow: it is reported, not enforced. No entry is experimental today
+    # (3.15 is a regular, supported version); the switch is kept for the next
+    # interpreter that has to be trialled before it is declared supported.
     continue-on-error: ${{ matrix.experimental == true }}
 
     strategy:
@@ -38,18 +39,8 @@ jobs:
         # symlink-loop behaviour at 3.13, and that boundary hid a real
         # bug in zfsbackup/config/store/paths.py until it was found by
         # accident. Boundaries between versions are where things hide.
-        python: ["3.11", "3.12", "3.13", "3.14"]
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
         include:
-          # 3.15 (plan decision C3: "3.11-3.14, plus 3.15 in CI; declared
-          # supported once green"). actions/setup-python resolves "3.15" to the
-          # stable 3.15.x builds in actions/python-versions' manifest (3.15.0
-          # and 3.15.1 are listed for ubuntu 22.04/24.04/26.04 and macOS), so no
-          # `allow-prereleases` is needed. Non-blocking until the first green
-          # run on both the 3.15 poetry host and the suite; then drop
-          # `experimental` and move "3.15" into the `python` list above.
-          - os: ubuntu-latest
-            python: "3.15"
-            experimental: true
           # Development happens on macOS, where the multiprocessing
           # default start method is `spawn` rather than Linux's `fork`
           # (or `forkserver` on 3.14). The fork-safety tests pin
@@ -183,8 +174,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The floor and the newest stable.
-        python: ["3.11", "3.14"]
+        # The floor and the newest two stable versions.
+        python: ["3.11", "3.14", "3.15"]
 
     steps:
       - uses: actions/checkout@v4

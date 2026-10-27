@@ -131,13 +131,19 @@ class TestMockedSuiteWorkflows:
     def test_python_3_15_is_in_the_tests_matrix(self):
         matrix = load("tests.yml")["jobs"]["test"]["strategy"]["matrix"]
         versions = set(matrix.get("python", [])) | {e.get("python") for e in matrix.get("include", [])}
-        assert "3.15" in versions
-        assert {"3.11", "3.12", "3.13", "3.14"} <= versions
+        assert {"3.11", "3.12", "3.13", "3.14", "3.15"} <= versions
 
-    def test_the_experimental_flag_only_softens_3_15(self):
+    def test_python_3_15_is_a_regular_enforced_entry(self):
+        """3.15 is a supported version: it sits in the matrix's `python` list, not in an
+        `include` entry, and no matrix entry is marked experimental (a failure on 3.15 fails
+        the workflow)."""
         matrix = load("tests.yml")["jobs"]["test"]["strategy"]["matrix"]
-        experimental = [e for e in matrix["include"] if e.get("experimental")]
-        assert [e["python"] for e in experimental] == ["3.15"]
+        assert "3.15" in matrix["python"]
+        assert not [e for e in matrix.get("include", []) if e.get("python") == "3.15"]
+        assert not [e for e in matrix.get("include", []) if e.get("experimental")]
+
+    def test_python_3_15_is_in_the_package_job(self):
+        assert "3.15" in load("tests.yml")["jobs"]["package"]["strategy"]["matrix"]["python"]
 
     def test_latest_deps_is_scheduled_unlocked_and_never_a_pr_gate(self):
         workflow = load("latest-deps.yml")
