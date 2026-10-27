@@ -14,7 +14,7 @@ server before relying on it. 1.0.0 will be this code unless running it finds a p
   backup.
 - **Frozen send flags:** plain sends `-L -c`, raw sends `-w` (per remote: `raw: auto|true|false`). A later change to
   these would need every server copy re-sent.
-- **Supported:** OpenZFS 2.1, 2.2 and 2.4 (2.3 best-effort); Python 3.11 to 3.14; Ubuntu 22.04 (with a newer
+- **Supported:** OpenZFS 2.1, 2.2 and 2.4 (2.3 best-effort); Python 3.11 to 3.15; Ubuntu 22.04 (with a newer
   Python and the systemd < 253 drop-in) and 24.04 or later. macOS is supported for development only.
 
 ### What it does

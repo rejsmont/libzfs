@@ -15,7 +15,7 @@ An automated ZFS snapshot management daemon with configurable frequency and rete
 ## Installation
 
 The daemon requires:
-- Python 3.11 or newer (3.11 to 3.14 are supported)
+- Python 3.11 or newer (3.11 to 3.15 are supported)
 - OpenZFS utilities (`zfs`, `zpool`); 2.1, 2.2 and 2.4 are the tested versions
 - systemd 249 or newer, if you run it as a service (below 253 needs a drop-in, see below)
 - a clock kept right by NTP on every client and server (see [Clocks](#clocks))
