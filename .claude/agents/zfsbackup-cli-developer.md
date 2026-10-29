@@ -11,7 +11,9 @@ the SQLite config store. Trust the source when any doc disagrees with it.
 
 ## Your files — exclusive ownership
 
-`zfsbackup/cli/**` — `__init__.py`, `__main__.py`, `main.py`, `dotpath.py`, `editor.py`, `render.py`.
+`zfsbackup/cli/**` — `__init__.py`, `__main__.py`, `main.py`, `dotpath.py`, `editor.py`, `render.py`,
+`write.py`, `listing.py`, `rename.py`, `status.py`, `errors.py`, `trust.py`, `enroll.py`, `tlsfiles.py`,
+`backup.py`, `check.py`.
 You may add a `[tool.poetry.scripts]` entry to `pyproject.toml` for your console script.
 
 You do **not** edit `zfsbackup/config/store/**` (that is `zfsbackup-store-developer`) or the daemon files
@@ -20,8 +22,9 @@ write tests; `pytest-test-author` does.
 
 ## The boundary that matters
 
-**Reach the database only through `zfsbackup.config.store.mapper` — `load_config(session)` and
-`save_config(session, config)`.** Never import ORM models, never build a `select()`, never touch a
+**Reach the database only through the public API of `zfsbackup.config.store` (its `__all__`) —
+`read_config` and `write_config` (the generation compare-and-swap, used through `write.py`), the mapper's
+`load_config`/`save_config`, and `store.trust` for the trust tables.** Never import ORM models, never build a `select()`, never touch a
 relationship. Two reasons: the mapper is what makes a later Postgres migration possible, and every
 schema invariant (partial unique indexes, the composite retention FK, the no-`destination_name`
 scoping rule) lives behind it. A CLI that writes rows directly can violate all of them.
@@ -29,26 +32,33 @@ scoping rule) lives behind it. A CLI that writes rows directly can violate all o
 ## Command surface
 
 ```
-zfsbackup-config [-c <db>] get  <dot.path>
-zfsbackup-config [-c <db>] set  <dot.path> <value>
+zfsbackup-config [-c <db>] get   <dot.path>
+zfsbackup-config [-c <db>] set   <dot.path> <value>
+zfsbackup-config [-c <db>] unset <dot.path>
 zfsbackup-config [-c <db>] edit                        # whole config in $EDITOR
 zfsbackup-config [-c <db>] list datasets
-zfsbackup-config [-c <db>] list remotes
+zfsbackup-config [-c <db>] list destinations
 zfsbackup-config [-c <db>] edit dataset <name>         # buffer has NO name field
-zfsbackup-config [-c <db>] edit remote  <name>         # buffer has NO name field
+zfsbackup-config [-c <db>] edit destination <name>     # buffer has NO name field
 zfsbackup-config [-c <db>] rename dataset <old> <new>
-zfsbackup-config [-c <db>] rename remote  <old> <new>
-zfsbackup-config [-c <db>] import <yaml> [--replace]
-zfsbackup-config [-c <db>] export [-o <file>]          # DB -> YAML, no editor
-zfsbackup-config [-c <db>] status [--wait S] [--json]  # Phase 3; read-only, never signals
+zfsbackup-config [-c <db>] rename destination <old> <new>
+zfsbackup-config [-c <db>] import <yaml> [--no-backup] # always a full replace
+zfsbackup-config [-c <db>] export [-o <file>] [--force] # DB -> YAML, no editor
+zfsbackup-config [-c <db>] migrate [--check] [--backup-dir DIR]
+zfsbackup-config [-c <db>] status [--wait SECONDS] [--json]  # read-only, never signals
+zfsbackup-config [-c <db>] trust token|list|revoke ...  # server side of enrollment
+zfsbackup-config [-c <db>] enroll DESTINATION ...       # client side
+zfsbackup-config [-c <db>] identity show|set-client-id|rotate
+zfsbackup-config [-c <db>] backup DIR [--no-keys] [--json]
+zfsbackup-config [-c <db>] check [--json|--prometheus|--nagios] [--output FILE]
 # There is no `reload` command: every committed write asks the daemon to reload (D3/D4).
 ```
 
 Flag conventions match `daemon.py`: `-c/--config`, `-v/--verbose`, `-d/--dry-run`. Ship **both**
 entry points — a console script `zfsbackup-config = "zfsbackup.cli.main:main"` and `python -m
 zfsbackup.cli` via `__main__.py`, for parity with `python -m zfsbackup.daemon` and so it works
-without an install. `pyproject.toml` declares the package as `libzfseasy` with no explicit
-`packages` list, so **verify `poetry install` actually exposes the script** rather than assuming it.
+without an install. `pyproject.toml` declares the distribution as `zfsbackup` with an explicit `packages`
+list (`libzfseasy`, `zfsbackup`), so **verify `poetry install` actually exposes the script** rather than assuming it.
 
 ## Dot-path resolution — the silent-failure trap
 
@@ -111,9 +121,9 @@ Temp files are `0600` in a private temp dir so config does not leak on a shared 
 ## Conventions
 
 - Rendered YAML targets the format in `config.example.yaml` so output is drop-in compatible with
-  `-c file.yaml`.
+  `import` (the daemon refuses a `.yaml` passed to `-c`).
 - `list` columns mirror the daemon's report in `backup_manager.py` (name, enabled, frequency,
-  recursive, retention-rule count) so CLI and log agree.
+  recursive, retention-rule count, remote destinations) so CLI and log agree.
 - Exit non-zero with a message on the stream a human reads; never traceback at the user.
 
 ## Workflow

@@ -1,0 +1,72 @@
+.TH ZFSBACKUPD 1 "October 2026" "zfsbackup" "ZFS Backup"
+.SH NAME
+zfsbackupd \- ZFS snapshot, retention and remote backup daemon
+.SH SYNOPSIS
+.B zfsbackupd
+.RB [ \-c
+.IR DATABASE ]
+.RB [ \-d ]
+.RB [ \-v ]
+.RB [ \-\-log\-level
+.IR LEVEL ]
+.RB [ \-\-test\-config ]
+.br
+.B zfsbackupd \-\-version
+.SH DESCRIPTION
+.B zfsbackupd
+is the supervisor of the zfsbackup worker processes: it creates snapshots of
+the configured datasets when they are due, prunes them with the tiered
+retention rules, sends them to the configured destinations over HTTPS with
+mutual TLS authentication, and, when the server side is configured, receives
+other hosts' snapshots.
+.PP
+It reads its configuration only from the SQLite database managed with
+.BR zfsbackup\-config (1);
+a YAML file is refused.
+It reloads the configuration on SIGHUP and when the database changes, without
+interrupting a transfer.
+.PP
+It is normally started by
+.BR systemd (1)
+as
+.IR zfsbackup.service ,
+which is neither enabled nor started by the package.
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-config " " \fIDATABASE\fR
+The configuration database.
+Default: $ZFSBACKUP_CONFIG, else /var/lib/zfsbackup/config.db.
+.TP
+.BR \-d ", " \-\-dry\-run
+Do not create or destroy snapshots, and create no TLS files.
+.TP
+.BR \-v ", " \-\-verbose
+Debug logging; the same as \fB\-\-log\-level debug\fR.
+.TP
+.BI \-\-log\-level " LEVEL"
+One of debug, info (default), warning, error.
+.TP
+.B \-\-test\-config
+Read and validate the configuration, report it, and exit.
+It works beside a running daemon.
+.TP
+.B \-\-version
+Print the version, the wire protocol and the configuration schema, and exit.
+.SH ENVIRONMENT
+.TP
+.B ZFSBACKUP_CONFIG
+The default configuration database.
+.TP
+.BR ZFS_CMD ", " ZPOOL_CMD
+Paths of the \fBzfs\fR and \fBzpool\fR binaries to use instead of those on PATH.
+.SH FILES
+.TP
+.I /var/lib/zfsbackup/config.db
+The configuration database, with the host identity and the trust tables.
+.TP
+.I /var/lib/zfsbackup/config.db.tls/
+The TLS identity: certificates and keys.
+.SH SEE ALSO
+.BR zfsbackup\-config (1),
+.BR zfs (8),
+.I /usr/share/doc/zfsbackup/README.md

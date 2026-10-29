@@ -1,21 +1,12 @@
 """Real ZFS integration tests - these actually run ZFS commands.
 
 REQUIREMENTS:
-- ZFS must be installed and available
-- Either root access OR a test pool must exist
-- Run with: pytest -m real_zfs
+- ZFS installed, and passwordless sudo for zpool/zfs (or MULTIPASS_VM=<vm>)
+- Run with: ZFSB_REAL_ZFS=1 pytest -m real_zfs (without the opt-in every test skips)
 
-SETUP:
-For safe testing, create a test pool using a file-backed vdev:
-    $ dd if=/dev/zero of=/tmp/zfs-test-disk bs=1M count=512
-    $ zpool create testpool /tmp/zfs-test-disk
-
-CLEANUP:
-    $ zpool destroy testpool
-    $ rm /tmp/zfs-test-disk
-
-WARNING: These tests will create and destroy ZFS datasets. Do NOT run against
-production pools.
+The session fixture `auto_zfs_pool` (conftest.py) creates a throwaway file-backed
+pool, `zfsbackup_pytest_<pid>`, and destroys it at the end; the tests skip if it
+cannot. They create and destroy datasets only inside that pool.
 """
 
 import os

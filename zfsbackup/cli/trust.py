@@ -125,8 +125,8 @@ MIN_PREFIX = 8
 _SHOWN = 16
 
 _REVOKE_NOTE = (
-    "New connections are refused within ~2 s; streams already in flight "
-    "finish; data under {target}/{client_id} is left in place.\n"
+    "New connections are refused and streams already in flight are cut within ~2 s "
+    "(a partial receive is kept for a resume); data under {target}/{client_id} is left in place.\n"
     "A revoked certificate can never be enrolled again: if the client should come back, "
     "it must enroll a NEW key with a new token (`zfsbackup-config enroll NAME --new-key`)."
 )
@@ -953,7 +953,7 @@ def register(
             "Revoke trust. FINGERPRINT (a unique prefix of at least 8 hex characters is "
             "enough; the full one is echoed) unpins one certificate; --client ID unpins "
             "all of that client's certificates and retires the id. New connections are "
-            "refused within ~2 s; streams already in flight finish; the client's data on "
+            "refused and streams already in flight are cut within ~2 s; the client's data on "
             "this server is left in place."
         ),
     )

@@ -63,7 +63,7 @@ from types import SimpleNamespace
 import pytest
 import websocket
 from flask import Flask
-from flask_sock import ConnectionClosed, Sock
+from zfsbackup._vendor.flask_sock import ConnectionClosed, Sock
 
 from _tls_support import (
     IO_TIMEOUT,

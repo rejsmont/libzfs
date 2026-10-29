@@ -16,30 +16,56 @@ An automated ZFS snapshot management daemon with configurable frequency and rete
 
 The daemon requires:
 - Python 3.11 or newer (3.11 to 3.15 are supported)
-- OpenZFS utilities (`zfs`, `zpool`); 2.1, 2.2 and 2.4 are the tested versions
+- OpenZFS utilities (`zfs`, `zpool`); 2.1, 2.2, 2.3 and 2.4 are the tested versions
 - systemd 249 or newer, if you run it as a service (below 253 needs a drop-in, see below)
 - a clock kept right by NTP on every client and server (see [Clocks](#clocks))
 
-zfsbackup is one Python distribution, `zfsbackup`, that ships two packages: the daemon and CLI
-(`zfsbackup`) and the ZFS bindings (`libzfseasy`). Install one wheel per host. It provides two commands:
-`zfsbackupd` (the daemon) and `zfsbackup-config` (the configuration, enrollment and operations CLI).
+zfsbackup comes as two Python distributions released together with the same version: `zfsbackup` (the daemon
+and the CLI) and `libzfseasy` (the ZFS bindings it is built on). It provides two commands: `zfsbackupd` (the
+daemon) and `zfsbackup-config` (the configuration, enrollment and operations CLI).
 
-### Install from the wheel and the sdist
+Two ways to install it; a host uses one of them, never both:
+- **Debian 13 and Ubuntu 26.04: the `.deb` packages** from the release. They use the distribution's own Python
+  libraries, so their security updates come from the distribution.
+- **Anywhere else: the wheels in a virtualenv**, with the system files from the sdist.
 
-Build the two artifacts with `poetry build` (or take them from a release): the **wheel** is the program, the
-**sdist** also carries the `packaging/` directory (systemd units, `sysusers.d`, `tmpfiles.d`), which is never
-installed by pip.
+### Install the Debian packages (Debian 13, Ubuntu 26.04)
+
+```bash
+# Debian: ZFS is in `contrib` (enable it in /etc/apt/sources.list.d/debian.sources first).
+sudo apt install ./python3-libzfseasy_<version>_all.deb ./zfsbackup_<version>_all.deb   # e.g. 1.0.0~rc2-1
+```
+
+This installs `zfsbackupd` and `zfsbackup-config` in `/usr/bin`, pulls in `zfsutils-linux` and the Python
+libraries from the archive, creates the group `zfsbackup` (sysusers) and `/var/lib/zfsbackup` (tmpfiles), and
+installs `zfsbackup.service`, `zfsbackup-check.service` and `zfsbackup-check.timer` **disabled and stopped**:
+the daemon cannot start before a configuration is imported (see [First run](#first-run)). Then:
+- **Upgrades** (`apt install` of newer `.deb`s): the package stops a running daemon before the files are replaced
+  and starts it again afterwards if it is enabled; the start migrates the database (see
+  [Upgrading](#upgrading-and-downgrading)).
+- **Updates of the Python libraries** it uses (werkzeug, cryptography, SQLAlchemy, ...) restart a running
+  daemon (a dpkg trigger). An OpenSSL update does not: `needrestart` (recommended by the package, installed by
+  default on Ubuntu) restarts services that still use the old library; without it, `systemctl restart
+  zfsbackup` after OpenSSL updates.
+- **`apt remove` / `apt purge` leave `/var/lib/zfsbackup` in place** (the configuration database, the TLS keys
+  and the trust state). Delete it by hand if you really mean to.
+
+### Install the wheels in a virtualenv
+
+Build the artifacts with `poetry build` and `poetry build -C libs/libzfseasy -o ../../dist` (or take them from a
+release): the two **wheels** are the program, the `zfsbackup` **sdist** also carries the `packaging/` directory
+(systemd units, `sysusers.d`, `tmpfiles.d`), which is never installed by pip.
 
 ```bash
 # 1. The program, in its own virtualenv. The units expect exactly this path.
 sudo apt install python3-venv                       # Debian/Ubuntu
 sudo python3 -m venv /opt/zfsbackup/venv
-sudo /opt/zfsbackup/venv/bin/pip install ./zfsbackup-0.1.0-py3-none-any.whl
+sudo /opt/zfsbackup/venv/bin/pip install ./libzfseasy-<version>-py3-none-any.whl ./zfsbackup-<version>-py3-none-any.whl
 sudo ln -s /opt/zfsbackup/venv/bin/zfsbackup-config /usr/local/bin/zfsbackup-config   # both commands on PATH:
 sudo ln -s /opt/zfsbackup/venv/bin/zfsbackupd /usr/local/bin/zfsbackupd               # the README uses them bare
 
 # 2. The system files, from the sdist.
-tar xzf zfsbackup-0.1.0.tar.gz && cd zfsbackup-0.1.0
+tar xzf zfsbackup-<version>.tar.gz && cd zfsbackup-<version>
 sudo install -D -m 0644 packaging/sysusers.d/zfsbackup.conf /etc/sysusers.d/zfsbackup.conf
 sudo install -D -m 0644 packaging/tmpfiles.d/zfsbackup.conf /etc/tmpfiles.d/zfsbackup.conf
 sudo install -D -m 0644 packaging/systemd/zfsbackup.service /etc/systemd/system/zfsbackup.service
@@ -53,12 +79,14 @@ Notes:
   interpreter for the venv, either `deadsnakes` (`apt install python3.12 python3.12-venv`, then
   `python3.12 -m venv …`) or [uv](https://docs.astral.sh/uv/):
   `UV_PYTHON_INSTALL_DIR=/opt/zfsbackup/python uv venv --python 3.12 /opt/zfsbackup/venv` and
-  `uv pip install --python /opt/zfsbackup/venv/bin/python ./zfsbackup-….whl` (a `uv venv` has no `pip`; use
+  `uv pip install --python /opt/zfsbackup/venv/bin/python ./libzfseasy-….whl ./zfsbackup-….whl` (a `uv venv` has no `pip`; use
   `uv pip`, or run `python -m ensurepip` in it first, for this and for upgrades). Keep the interpreter where
   root can reach it at boot (not under a user's home directory).
-- **Upgrading an old venv.** A venv from before the distribution was renamed holds a `libzfseasy` distribution;
-  installing `zfsbackup` into it leaves both, and `pip uninstall libzfseasy` would delete files that
-  `zfsbackup` now owns. Make a fresh venv instead (a new install is not affected).
+- **Upgrading an old venv.** Up to 1.0.0rc1 one wheel carried both packages, so a plain `pip install` of the
+  two new wheels over it **deletes `libzfseasy`** (pip removes the old wheel's files, which include it, after it
+  has installed the new `libzfseasy`). Upgrading from 1.0.0rc1, run `pip uninstall -y zfsbackup` first (see
+  [Upgrading](#upgrading-and-downgrading)). A venv from before 1.0.0rc1, which holds a distribution named
+  `libzfseasy` that carried both packages, is best replaced by a fresh venv.
 - **systemd older than 253** (`systemctl --version`; Ubuntu 22.04 has 249) does not know
   `Type=notify-reload`. Also install the drop-in, and do **not** install it on newer systemd:
   ```bash
@@ -80,11 +108,12 @@ The order matters, because the unit refuses to start without a database (`Assert
 
 1. **Write the configuration and import it** (see [Configuration](#configuration)):
    `sudo zfsbackup-config import /root/config.yaml`. This creates `/var/lib/zfsbackup/config.db`.
-2. **Check it** without starting anything: `sudo /opt/zfsbackup/venv/bin/zfsbackupd --test-config`.
+2. **Check it** without starting anything: `sudo zfsbackupd --test-config`.
 3. **Remote backups, if you use them** (see [TLS and enrollment](#tls-and-enrollment)): on the server
    `trust token create`; on each client `enroll DESTINATION --url … --token-file …`.
 4. **Start it and keep it enabled:** `sudo systemctl enable --now zfsbackup`, then `systemctl status zfsbackup`
-   and `journalctl -u zfsbackup`.
+   and `journalctl -u zfsbackup`. For the periodic health report, also `sudo systemctl enable --now
+   zfsbackup-check.timer` (see [Monitoring](#monitoring)).
 5. **Look at the health report** (see [Monitoring](#monitoring)): `zfsbackup-config check`.
 
 On the **server**, also set a quota per client once its first backup has created `<target>/<client_id>`
@@ -187,13 +216,15 @@ as a later edit, and then the change can go unnoticed until the next write. To r
 (database, identity and trust) from `zfsbackup-config backup`, with the daemon stopped, see
 [Restoring a configuration backup](#restoring-a-configuration-backup).
 
-Besides the database (and its `-wal`/`-shm` files while it is open) you will see three more files. All
-are tiny, all are safe to leave in place, and none is configuration state:
+Besides the database (and its `-wal`/`-shm` files while it is open) you will see three more files and the
+`config.db.status/` directory. All are small, all are safe to leave in place, and none is configuration state:
 - `config.db.writer.lock` serialises `zfsbackup-config` writers.
 - `config.db.daemon.pid` marks a running daemon and records the generation it has applied, is applying,
   rejected (final) or deferred (refused for now, re-checked every poll, with a one-line reason). One left behind by a crash is harmless.
 - `config.db.workers.lock` is held by every worker. A newly started daemon waits, with a warning, while
   workers of a previous daemon are still finishing.
+- `config.db.status/` (mode 0750, files 0640) holds each worker's last outcomes, read by `check` and
+  `status` (see [Monitoring](#monitoring)). The daemon creates it; a `--dry-run` daemon writes nothing there.
 
 If `zfsbackup-config` exits with status **75**, another write was in progress or the configuration
 changed (or the database was replaced) underneath it: just run the command again.
@@ -224,8 +255,10 @@ from the name, so the next send is likely a full one. `--clear-stale-props` remo
 `org.zfsbackup:*` properties. It is refused up front when the new dataset doesn't exist in ZFS yet (if
 you are about to `zfs rename`, those properties follow it). If a daemon is running, the rename itself is
 still saved but the properties are left alone: the command prints the `zfs inherit` commands to run
-after stopping the daemon and exits 1. To rename the ZFS dataset and the configuration together, use
-`zfsbackup-config rename dataset` (it handles the properties). If you renamed the ZFS dataset by hand with
+after stopping the daemon and exits 1. The one exception is a daemon the CLI signalled (Linux only, see
+above) that reports the rename applied within `--reload-wait`: then the properties are cleared. To rename
+the ZFS dataset and the configuration together, `zfs rename` the dataset (its properties follow it) and run
+`zfsbackup-config rename dataset`, which then finds nothing stale. If you renamed the ZFS dataset by hand with
 `zfs rename`, run `systemctl restart zfsbackup`: the `org.zfsbackup:config` property is synced only when
 the snapshot worker starts or the configuration changes, so `systemctl reload` with an unchanged
 configuration does not re-sync it.
@@ -240,7 +273,8 @@ rights on the datasets involved: run them as root, or grant them with
   copied to earlier datasets stay, and the exact `zfs set`/`zfs inherit` commands to undo them are
   printed.
 
-`rename destination` copies each dataset's `org.zfsbackup:anchor.<old>` to `anchor.<new>` before saving.
+`rename destination` copies each dataset's `org.zfsbackup:anchor.<old>` to `anchor.<new>` (and
+`inflight.<old>` likewise) before saving.
 If `anchor.<new>` already exists with a different value (left over from an earlier destination of that
 name), it is overwritten and both values are printed; the snapshot it used to name is no longer pinned
 by it. The daemon protects the snapshot named by *every* local or received anchor property, so keep the
@@ -331,8 +365,9 @@ zfsbackup-config trust revoke --client ID   # every certificate of that client i
   that descends from it by rotation, including successors that have already been used and retired their
   predecessor; if the fingerprint was itself retired by a rotation, `trust revoke` says so and revokes the
   successor chain. A rotation predecessor that has been retired is refused too.
-- **New connections only.** The API picks a trust change up within about 2 s, with no restart or reload.
-  A stream already in flight finishes; the client's data on the server is left in place.
+- **Within about 2 s.** The API picks a trust change up with no restart or reload: new connections are
+  refused and a stream already in flight on a revoked certificate is cut (the partial receive is kept for a
+  resume). A certificate retired by a rotation is not cut. The client's data on the server is left in place.
 - Trust changes never signal the daemon or bump the configuration generation.
 
 ### Rotation
@@ -345,9 +380,9 @@ swaps nothing; fix or remove that destination and re-run (servers that already a
 rotates), and a retired certificate is refused for ever. If a destination refuses the successor, the advice
 names the servers that already accepted it. With `client_cert_file`/`client_key_file` configured, give the new pair with
 `--cert`/`--key`. The daemon picks up new generated files by itself. Exit status 75 means a destination
-was unreachable or busy: wait and re-run. A server that has seen five failed enrollments from your address
-answers HTTP 429 with `Retry-After`; the message says how long to wait (15 minutes right after the
-lockout), and re-running sooner cannot succeed. A server with other enrollments in flight answers
+was unreachable or busy: wait and re-run. For `enroll` (not `rotate`), a server that has seen five failed
+enrollments from your address answers HTTP 429 with `Retry-After`; the message says how long to wait (15
+minutes right after the lockout), and re-running sooner cannot succeed. A server with other enrollments in flight answers
 "busy" (wait about 2 seconds).
 
 ### A lost, stolen or revoked key
@@ -435,7 +470,7 @@ zfsbackupd --test-config -c /path/to/config.db
 ### Global Settings
 
 - `snapshot_prefix`: Prefix for all managed snapshots (default: "autosnap")
-- `check_interval`: How often to check if snapshots are needed (e.g., "5m", "1h")
+- `check_interval`: How often to check if snapshots are needed (e.g., "5m", "1h"; default: "5m")
 - `prune_interval`: How often the pruning worker applies retention policy. **Omit to follow
   `check_interval`** — the value is derived when the daemon reads its config, not frozen when the
   config is written, so a later change to `check_interval` carries over.
@@ -446,6 +481,11 @@ zfsbackupd --test-config -c /path/to/config.db
   `zfsbackup-config enroll`, and is shown by `zfsbackup-config identity show`. `import` and `export` never
   touch it, and the old `client_id_file` key is refused.
 - `dry_run`: Set to `true` to test without making changes (default: false)
+- `api_host`, `api_port`: where the API listens (default `127.0.0.1`, `8080`; see
+  [Firewall and the port](#firewall-and-the-port))
+- `destinations`: client side, a mapping of name to `url` (`https://` only) and `server_fingerprint` (set by
+  `enroll`; a destination without one is not enrolled and is skipped)
+- `remote_backup`: server side, `target_dataset` (required, must exist) and `enabled` (default: true)
 
 ### Dataset Configuration
 
@@ -455,7 +495,10 @@ Each dataset can have:
 - `enabled`: Whether this dataset should be backed up (default: true)
 - `frequency`: How often to take snapshots (default: "1h")
 - `recursive`: Whether to snapshot child datasets (default: false)
-- `retention`: Dictionary of retention rules
+- `retention`: Dictionary of retention rules (default: `"1d": "30d"`); `retention: forever` never prunes
+- `remote`: a list of destinations to send to, each `destination` (a name from `destinations`) and optionally
+  `frequency` (default: the dataset's), `retention` (what the server keeps; default: the dataset's) and `raw`
+  (`auto`, the default: raw if and only if the dataset is encrypted; `true`; `false`)
 
 ### Retention Rules
 
@@ -463,15 +506,18 @@ Retention rules define how long to keep snapshots based on their age:
 
 ```yaml
 retention:
-  "1d": "1M"    # Snapshots 1 day old: keep for 1 month
-  "1w": "3M"    # Snapshots 1 week old: keep for 3 months
-  "1M": "10y"   # Snapshots 1 month old: keep for 10 years
+  "1d": "1M"    # One snapshot per day, kept for 1 month
+  "1w": "3M"    # One snapshot per week, kept for 3 months
+  "1M": "10y"   # One snapshot per month, kept for 10 years
 ```
 
 **How it works:**
-- The daemon evaluates each snapshot's age
-- Applies the appropriate retention rule
-- Deletes snapshots when: `snapshot_age + keep_duration > now`
+- Each rule is `"interval": "keep_for"`. A snapshot younger than a rule's `keep_for` falls under the rule
+  with the shortest such `keep_for`
+- Within that rule, the oldest snapshot of each `interval`-long time slot is kept and the others are deleted
+- A snapshot older than every `keep_for` is deleted
+- The newest snapshot, and snapshots that are held, cloned or still needed by a remote destination, are
+  always kept
 
 ### Time Format
 
@@ -481,6 +527,7 @@ retention:
 - `w` = weeks (e.g., "1w", "2w")
 - `M` = months (e.g., "1M", "6M") - approximate as 30 days
 - `y` = years (e.g., "1y", "10y") - approximate as 365 days
+- `s` = seconds; terms can be combined (e.g., "1h30m")
 
 ## Snapshot Naming
 
@@ -550,7 +597,7 @@ has a comment saying why. In short:
 - **`ExecStartPre=… migrate --backup-dir /var/lib/zfsbackup/backups`** upgrades the database schema before
   the daemon starts, keeping a copy first, and only when the schema is actually behind (see
   [Upgrading](#upgrading-and-downgrading)).
-- **`After=`/`Wants=` network-online, zfs-mount and zfs-import, `RequiresMountsFor=/var/lib/zfsbackup`,
+- **`After=`/`Wants=` network-online and zfs-mount, `After=` zfs-import, `RequiresMountsFor=/var/lib/zfsbackup`,
   `AssertPathExists=…/config.db`**: start after the pool is imported and mounted, and fail with a clear
   message, rather than loop, on a host that has not imported a configuration yet.
 - **`KillMode=mixed`, `TimeoutStopSec=90`**: on `systemctl stop`, SIGTERM goes to the supervisor only; it
@@ -634,6 +681,8 @@ the server's copy shows only as lag (the client logs the reason once).
 - **`daemon/config_applied`**: OK when the daemon runs the stored configuration (or is switching its workers
   to it); WARN when it is behind, has **deferred** it, **rejected** it or cannot be read. A rejected
   configuration is only a WARN because the old configuration keeps running; `zfsbackup-config status` says why.
+- **`daemon/upgrade`**, only while the daemon drains for an in-place upgrade (see
+  [Upgrading](#upgrading-and-downgrading)): WARN, never CRIT.
 - **`tls/client_certificate`**, only when destinations are configured: WARN when the certificate is missing
   (not enrolled), unreadable or would not be accepted, or expires within 30 days; CRIT once it has expired
   (`identity rotate`); OK otherwise.
@@ -692,7 +741,9 @@ zfsbackup-config check --prometheus --output /var/lib/node_exporter/textfile_col
 - **A scheduled check.** The sdist ships an optional `packaging/systemd/zfsbackup-check.service` and
   `.timer` (disabled; nothing enables them). Install both, set `ZFSBACKUP_CHECK_OUTPUT` in the service (or
   `systemctl edit zfsbackup-check.service`) to your node_exporter textfile directory, and
-  `systemctl enable --now zfsbackup-check.timer`. It runs every 5 minutes. With `--output`, `check` exits 0
+  `systemctl enable --now zfsbackup-check.timer`. The Debian/Ubuntu package installs both units, with the
+  output already set to `/var/lib/prometheus/node-exporter/zfsbackup.prom`, the directory the distribution's
+  `prometheus-node-exporter` reads: there, install that package and enable the timer. It runs every 5 minutes. With `--output`, `check` exits 0
   once the file is written, whatever the verdict, because the verdict is in the metrics; a failed unit means the
   check could not run or could not write the file (database unusable, an unwritable path, a crash), and the
   previous file stays until the next successful run.
@@ -704,7 +755,8 @@ detected and handled, but it is the fallback, not the plan: workers import parts
 disk, so for a few seconds a worker could load new code beside old.
 
 **What happens on an in-place install.** The daemon records the installed version, the identity of the
-package's `RECORD` file and the Python interpreter's binary when the process starts, and compares them every
+`zfsbackup` and `libzfseasy` installs (each one's `RECORD` file, or its `__init__.py` where there is none, as
+in the Debian packages) and the Python interpreter's binary when the process starts, and compares them every
 10 s (and before it starts a worker). A change must be read twice, 10 s apart, before the daemon acts on it, so
 a transient read error cannot restart a healthy daemon. It then logs one WARNING (old -> new), shows
 `STATUS=` in `systemctl status` and `draining=` in the pid file, reloads no configuration (a `zfsbackup-config`
@@ -720,22 +772,30 @@ stop` or SIGTERM during the drain is an ordinary stop (30 s budget, normal exit 
 that starts while the install is half done (the package files present, their metadata missing) exits 76
 straight away and is retried after `RestartSec`.
 
-**Not covered:** upgrading a dependency on its own (werkzeug, cryptography, SQLAlchemy, ...) with the
-package untouched, and source edits of an editable (`pip install -e`) install: only a reinstall is seen. After
-those run `systemctl restart zfsbackup`. A daemon run outside systemd exits 76 and stays down.
+**Not covered:** in a virtualenv, upgrading a dependency on its own (werkzeug, cryptography, SQLAlchemy, ...)
+with zfsbackup and libzfseasy untouched, and source edits of an editable (`pip install -e`) install: only a
+reinstall is seen. After those run `systemctl restart zfsbackup`. (The Debian packages restart the daemon
+themselves when a Python dependency's package is upgraded; for OpenSSL see `needrestart` above.) A daemon run outside systemd exits 76 and stays down.
 
 1. **Read the release notes** for a protocol or schema bump. `zfsbackupd --version` and
-   `zfsbackup-config --version` print `<version> (wire protocol N, config schema <revision>)`; compare them
+   `zfsbackup-config --version` print `<command> <version> (wire protocol N, config schema <revision>)`; compare them
    between the client and the server.
 2. **Back up**: `sudo zfsbackup-config backup DIR` (see [Backing up the host](#backing-up-the-host)). It does
    not signal or lock anything and is safe while the daemon runs. A group operator must pass a `DIR` of
    their own and `--no-keys`: `/var/lib/zfsbackup/backups` belongs to root.
-3. **Stop, install, start:**
+3. **Stop, install, start.** With the Debian packages this is one command, which stops the daemon itself and
+   starts it again afterwards if it is enabled:
+   ```bash
+   sudo apt install ./python3-libzfseasy_NEW_all.deb ./zfsbackup_NEW_all.deb
+   ```
+   With the wheels, install **both** new wheels:
    ```bash
    sudo systemctl stop zfsbackup
-   sudo /opt/zfsbackup/venv/bin/pip install --upgrade ./zfsbackup-NEW.whl
+   # from 1.0.0rc1 only (one wheel carried both packages; without this, pip deletes libzfseasy):
+   #   sudo /opt/zfsbackup/venv/bin/pip uninstall -y zfsbackup
+   sudo /opt/zfsbackup/venv/bin/pip install --upgrade ./libzfseasy-NEW.whl ./zfsbackup-NEW.whl
    # a venv made by uv has no pip:
-   #   sudo uv pip install --python /opt/zfsbackup/venv/bin/python --upgrade ./zfsbackup-NEW.whl
+   #   sudo uv pip install --python /opt/zfsbackup/venv/bin/python --upgrade ./libzfseasy-NEW.whl ./zfsbackup-NEW.whl
    # if the release changed packaging/ (unit files): install them from the new sdist, then
    sudo systemctl daemon-reload
    sudo systemctl start zfsbackup
@@ -752,14 +812,24 @@ those run `systemctl restart zfsbackup`. A daemon run outside systemd exits 76 a
    migration does not touch them).
 5. **Check**: `systemctl status zfsbackup`, `zfsbackup-config status`, `zfsbackup-config check`.
 
-**Downgrading** is the old wheel plus the pre-migration backup: an old release refuses a database whose
+**Downgrading** is the old release plus the pre-migration backup: an old release refuses a database whose
 schema is newer than it knows. Stop the daemon (and the check timer), install the old
-wheel, put the matching `config.db.pre-<revision>-…` in place **exactly as in [Restoring a configuration
+release, put the matching `config.db.pre-<revision>-…` in place **exactly as in [Restoring a configuration
 backup](#restoring-a-configuration-backup)** (stage it under a temporary name, remove `-wal`/`-shm` first, `mv` it in
 last; never `cp` over the existing file), start it. The pre-migration backup is a WAL-mode database: opening it
 where it lies would create `-wal`/`-shm` files in the root-only `backups/` directory, so copy it elsewhere
 before you look inside it, or open it read-only (`sqlite3 'file:/path/config.db.pre-…?mode=ro'`). Read that section first: it **loses** everything the
 trust tables recorded since that backup.
+
+With the Debian packages, **disable** the units first, not just stop them: the old package's `postinst` starts
+every enabled unit again, which would open the database in the middle of the restore.
+
+```bash
+sudo systemctl disable --now zfsbackup zfsbackup-check.timer
+sudo apt install --allow-downgrades ./python3-libzfseasy_OLD_all.deb ./zfsbackup_OLD_all.deb
+# ... put the pre-migration backup in place, as in "Restoring a configuration backup" ...
+sudo systemctl enable --now zfsbackup zfsbackup-check.timer
+```
 
 **Upgrade the client and the server together.** The two sides check a wire protocol number. A mismatch is
 answered 426 and the client logs it: remote backups pause (local snapshots and pruning go on) until both sides
@@ -804,8 +874,9 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
   retention rules that the client sent (`org.zfsbackup:config`), using the **server's** `snapshot_prefix`. A
   client with another prefix is never pruned on the server (it keeps everything), so use the same prefix.
 - **Never edit the `org.zfsbackup:*` properties** `config`, `client_id` and `source_dataset` of a received
-  dataset, and **never `zfs inherit -S`** them. The server sets them as local values, but a hidden *received*
-  copy of each sits underneath (it came with the stream); `inherit -S` would revert to the client's copy.
+  dataset, and **never `zfs inherit`** them (with or without `-S`). The server sets them as local values; a
+  received dataset without its local `config` is skipped by the pruner, and one without its local
+  `client_id` is refused for further sends.
 - **Parents are sent first.** The remote worker sends a dataset's ancestors before its descendants. If a
   child was backed up first (its parent was added to the configuration afterwards), the server holds a
   placeholder for the parent and a full stream of the parent is refused. Rename the placeholder aside
@@ -1036,7 +1107,8 @@ journalctl -u zfsbackup -p err           # errors only
   debug`. To change it for the service: `systemctl edit zfsbackup`, add `[Service]`, an empty `ExecStart=` and
   your own `ExecStart=… zfsbackupd -c … --log-level warning`. The setting applies to the workers as well.
 - **The API's access lines** (one per request) are logged by status class: 1xx to 3xx at DEBUG, 4xx
-  (including 401 and 403) at INFO, 5xx at WARNING.
+  (including 401 and 403) at INFO, 5xx at WARNING. The refusals a flood repeats (401, 403, 426, 429, 503)
+  are logged once per address, status and hour; the repeats go to DEBUG.
 - Key messages: snapshot creation and deletion, retention decisions, remote transfers and their refusals,
   reloads (accepted, rejected, deferred), TLS problems, and lifecycle events. A reload that is rejected is
   logged at WARNING with the reason.
@@ -1084,9 +1156,6 @@ list with background is in [docs/production_readiness_report.md](../docs/product
   automatic per-client quota (set `zfs set quota`). A host's remote sends run one after another.
 - **No bookmarks.** A destination that was removed from the configuration leaves its `anchor.*` property
   pinning one snapshot per dataset until you clear it (the pruner protects every local anchor).
-- **Received `anchor.*`/`inflight.*` properties** can pin snapshots on a server (disk growth only).
-  The hidden *received* copies of the properties the server sets with `-o` are inert, and cannot be
-  cleared by a receive flag.
 - **A client with a different `snapshot_prefix`** is never pruned on the server (it keeps everything).
 - **No common snapshot means a refusal, not an overwrite.** If a client and its server copy have no snapshot
   in common (a restore of a snapshot the server does not have, a replaced dataset), the server refuses the
@@ -1102,9 +1171,10 @@ list with background is in [docs/production_readiness_report.md](../docs/product
   and needs the operator's rename (see [Operating the backup server](#operating-the-backup-server)).
 - **The server enumerates every dataset under the target** on each pruning cycle (two or three `zfs get`
   executions each); very large servers are slow to cycle.
-- **The pending-stream map on the server is shared by all clients** (4096 entries, least recently used
-  first). An enrolled client that negotiates thousands of names can evict other clients' entries, whose next
-  stream is refused with a retryable "negotiate again".
+- **The pending-stream map on the server is in memory and bounded**: 256 entries per client (a client past
+  that evicts its own oldest entry) and 4096 in all, oldest evicted first. An evicted entry, or one lost
+  when the API worker restarts, only means that the next stream is refused with a retryable "negotiate
+  again".
 - **There is no restore over the API.** Restoring is ZFS work done by an operator (see [Restoring data](#restoring-data)).
 
 **Operation**

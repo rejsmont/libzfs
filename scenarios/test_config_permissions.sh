@@ -277,7 +277,7 @@ install_fixtures() {
 
     cat > "$t/zfsb-env" <<EOF
 #!/bin/sh
-export PYTHONPATH='$SRC_DIR' PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH='$SRC_DIR:$SRC_DIR/libs/libzfseasy' PYTHONDONTWRITEBYTECODE=1
 export ZFS_CMD='$FIX_DIR/zfs' ZPOOL_CMD='$FIX_DIR/zfs'
 unset ZFSBACKUP_CONFIG
 exec "\$@"
@@ -467,7 +467,7 @@ Type=__SDTYPE__
 NotifyAccess=main
 User=$SVC_USER
 Group=$SVC_GROUP
-Environment=PYTHONPATH=$SRC_DIR PYTHONDONTWRITEBYTECODE=1 ZFS_CMD=$FIX_DIR/zfs ZPOOL_CMD=$FIX_DIR/zfs
+Environment=PYTHONPATH=$SRC_DIR:$SRC_DIR/libs/libzfseasy PYTHONDONTWRITEBYTECODE=1 ZFS_CMD=$FIX_DIR/zfs ZPOOL_CMD=$FIX_DIR/zfs
 ExecStart=$PY -m zfsbackup.daemon --dry-run -v
 __EXECRELOAD__
 KillMode=mixed

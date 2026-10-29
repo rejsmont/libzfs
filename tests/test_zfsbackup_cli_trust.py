@@ -1302,7 +1302,7 @@ class TestTrustRevokeFingerprint:
 
     def test_the_closing_note_names_the_target_dataset(self, run, server, pins):
         result = revoke(run, server, pins[2].fingerprint[:8])
-        assert "New connections are refused within ~2 s; streams already in flight finish;" in result.stdout
+        assert "New connections are refused and streams already in flight are cut within ~2 s" in result.stdout
         assert "data under tank/backups/c2 is left in place." in result.stdout
 
     def test_the_closing_note_with_remote_backup_disabled_still_names_it(self, run, db):
@@ -1441,7 +1441,7 @@ class TestTrustRevokeRetired:
         out = revoke(run, server, a.fingerprint).stdout
         chain = out.index("was already retired by its successor")
         lockout = out.index("client id c1 has no other pinned certificate, so it can no longer connect")
-        note = out.index("New connections are refused within ~2 s")
+        note = out.index("New connections are refused and streams already in flight are cut within ~2 s")
         assert chain < lockout < note
         assert "(the id itself stays known; `trust revoke --client` also retires the id)" in out
         assert "data under tank/backups/c1 is left in place." in out

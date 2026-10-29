@@ -36,7 +36,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from click.testing import CliRunner
+from _click_compat import make_runner
 
 from zfsbackup.cli.main import cli
 from zfsbackup.cli.render import duration_literal, render_yaml
@@ -755,7 +755,7 @@ class TestRefusals:
 class TestThroughTheDatabase:
     @pytest.fixture
     def run(self):
-        runner = CliRunner()
+        runner = make_runner()
 
         def invoke(*args):
             result = runner.invoke(cli, [str(a) for a in args], prog_name="zfsbackup-config")

@@ -1,5 +1,13 @@
 # Production readiness: milestones B, C and D (proposal)
 
+> **Status 2026-10-28: implemented, historical.** Approved 2026-10-22 (every recommendation accepted). Milestone B was merged as
+> PR #7 (`c617b8e`, 2026-10-23); milestones C and D were merged together as PR #10 (`fb583a5`, 2026-10-26); the
+> result was released as 1.0.0rc1. Deviations: B-2b was pulled forward into C (section 5, item 6); the full
+> retention floor B-3 is deferred past 1.0 (D2, B-3-lite shipped); libzfseasy D8 (`-j`) is deferred past 1.0
+> (Appendix D2); the optional C14 (journald priority for CLI errors) was not done. The current description is
+> CLAUDE.md, [zfsbackup/README.md](../zfsbackup/README.md) and
+> [production_readiness_report.md](production_readiness_report.md).
+
 Status: **proposal, awaiting approval** (drafted 2026-10-22). Nothing here is implemented.
 
 This continues [production_readiness_plan.md](production_readiness_plan.md). That file holds the item

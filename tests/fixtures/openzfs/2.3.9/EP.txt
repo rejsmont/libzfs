@@ -1,0 +1,194 @@
+##### SECTION EP (encryption, keystatus, encryptionroot, keyformat, keylocation on fs and snapshot, before/after unload-key)  tag=C  zfs-2.3.9-0+deb13u1
+=== CASE EP/00_fs_loaded
+--- cmd
+zfs get -H -o name,property,value,source encryption,keystatus,encryptionroot,keyformat,keylocation zfsbcapc/EP/e
+--- rc
+0
+--- stdout
+zfsbcapc/EP/e	encryption	aes-256-gcm	-
+zfsbcapc/EP/e	keystatus	available	-
+zfsbcapc/EP/e	encryptionroot	zfsbcapc/EP/e	-
+zfsbcapc/EP/e	keyformat	passphrase	-
+zfsbcapc/EP/e	keylocation	file:///var/tmp/zfsb-matrix/cap.key1	local
+--- stderr
+=== END
+=== CASE EP/01_snap_loaded
+--- cmd
+zfs get -H -o name,property,value,source encryption,keystatus,encryptionroot,keyformat,keylocation zfsbcapc/EP/e@a
+--- rc
+0
+--- stdout
+zfsbcapc/EP/e@a	encryption	aes-256-gcm	-
+zfsbcapc/EP/e@a	keystatus	available	-
+zfsbcapc/EP/e@a	encryptionroot	zfsbcapc/EP/e	-
+zfsbcapc/EP/e@a	keyformat	-	-
+zfsbcapc/EP/e@a	keylocation	-	-
+--- stderr
+=== END
+=== CASE EP/02_list_loaded
+--- cmd
+zfs list -H -t all -o name,encryption,keystatus,encryptionroot,keyformat,keylocation -r zfsbcapc/EP/e
+--- rc
+0
+--- stdout
+zfsbcapc/EP/e	aes-256-gcm	available	zfsbcapc/EP/e	passphrase	file:///var/tmp/zfsb-matrix/cap.key1
+zfsbcapc/EP/e@a	aes-256-gcm	available	zfsbcapc/EP/e	-	-
+zfsbcapc/EP/e@b	aes-256-gcm	available	zfsbcapc/EP/e	-	-
+zfsbcapc/EP/e@c	aes-256-gcm	available	zfsbcapc/EP/e	-	-
+--- stderr
+=== END
+=== CASE EP/10_plain_fs
+--- cmd
+zfs get -H -o name,property,value,source encryption,keystatus,encryptionroot,keyformat,keylocation zfsbcapc/EP/p
+--- rc
+0
+--- stdout
+zfsbcapc/EP/p	encryption	off	default
+zfsbcapc/EP/p	keystatus	-	-
+zfsbcapc/EP/p	encryptionroot	-	-
+zfsbcapc/EP/p	keyformat	none	default
+zfsbcapc/EP/p	keylocation	none	default
+--- stderr
+=== END
+=== CASE EP/11_plain_snap
+--- cmd
+zfs get -H -o name,property,value,source encryption,keystatus,encryptionroot,keyformat,keylocation zfsbcapc/EP/p@a
+--- rc
+0
+--- stdout
+zfsbcapc/EP/p@a	encryption	off	default
+zfsbcapc/EP/p@a	keystatus	-	-
+zfsbcapc/EP/p@a	encryptionroot	-	-
+zfsbcapc/EP/p@a	keyformat	-	-
+zfsbcapc/EP/p@a	keylocation	-	-
+--- stderr
+=== END
+=== CASE EP/12_plain_keystatus_value
+--- cmd
+zfs get -H -o value keystatus zfsbcapc/EP/p
+--- rc
+0
+--- stdout
+-
+--- stderr
+=== END
+=== CASE EP/13_plain_list
+--- cmd
+zfs list -H -t all -o name,encryption,keystatus,encryptionroot,keyformat,keylocation -r zfsbcapc/EP/p
+--- rc
+0
+--- stdout
+zfsbcapc/EP/p	off	-	-	none	none
+zfsbcapc/EP/p@a	off	-	-	-	-
+zfsbcapc/EP/p@b	off	-	-	-	-
+zfsbcapc/EP/p@c	off	-	-	-	-
+--- stderr
+=== END
+=== CASE EP/20_unload_mounted
+--- cmd
+zfs unload-key zfsbcapc/EP/e
+--- rc
+255
+--- stdout
+--- stderr
+Key unload error: 'zfsbcapc/EP/e' is busy.
+=== END
+=== CASE EP/21_unmount
+--- cmd
+zfs unmount zfsbcapc/EP/e
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE EP/22_unload
+--- cmd
+zfs unload-key zfsbcapc/EP/e
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE EP/23_unload_again
+--- cmd
+zfs unload-key zfsbcapc/EP/e
+--- rc
+255
+--- stdout
+--- stderr
+Key unload error: Key already unloaded for 'zfsbcapc/EP/e'.
+=== END
+=== CASE EP/30_fs_unloaded
+--- cmd
+zfs get -H -o name,property,value,source encryption,keystatus,encryptionroot,keyformat,keylocation zfsbcapc/EP/e
+--- rc
+0
+--- stdout
+zfsbcapc/EP/e	encryption	aes-256-gcm	-
+zfsbcapc/EP/e	keystatus	unavailable	-
+zfsbcapc/EP/e	encryptionroot	zfsbcapc/EP/e	-
+zfsbcapc/EP/e	keyformat	passphrase	-
+zfsbcapc/EP/e	keylocation	file:///var/tmp/zfsb-matrix/cap.key1	local
+--- stderr
+=== END
+=== CASE EP/31_snap_unloaded
+--- cmd
+zfs get -H -o name,property,value,source encryption,keystatus,encryptionroot,keyformat,keylocation zfsbcapc/EP/e@a
+--- rc
+0
+--- stdout
+zfsbcapc/EP/e@a	encryption	aes-256-gcm	-
+zfsbcapc/EP/e@a	keystatus	unavailable	-
+zfsbcapc/EP/e@a	encryptionroot	zfsbcapc/EP/e	-
+zfsbcapc/EP/e@a	keyformat	-	-
+zfsbcapc/EP/e@a	keylocation	-	-
+--- stderr
+=== END
+=== CASE EP/32_list_unloaded
+--- cmd
+zfs list -H -t all -o name,encryption,keystatus,encryptionroot,keyformat,keylocation -r zfsbcapc/EP/e
+--- rc
+0
+--- stdout
+zfsbcapc/EP/e	aes-256-gcm	unavailable	zfsbcapc/EP/e	passphrase	file:///var/tmp/zfsb-matrix/cap.key1
+zfsbcapc/EP/e@a	aes-256-gcm	unavailable	zfsbcapc/EP/e	-	-
+zfsbcapc/EP/e@b	aes-256-gcm	unavailable	zfsbcapc/EP/e	-	-
+zfsbcapc/EP/e@c	aes-256-gcm	unavailable	zfsbcapc/EP/e	-	-
+--- stderr
+=== END
+=== CASE EP/33_keystatus_value
+--- cmd
+zfs get -H -o value keystatus zfsbcapc/EP/e
+--- rc
+0
+--- stdout
+unavailable
+--- stderr
+=== END
+=== CASE EP/40_load_again
+--- cmd
+zfs load-key zfsbcapc/EP/e
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE EP/41_fs_loaded_again
+--- cmd
+zfs get -H -o name,property,value,source keystatus zfsbcapc/EP/e
+--- rc
+0
+--- stdout
+zfsbcapc/EP/e	keystatus	available	-
+--- stderr
+=== END
+=== CASE EP/42_pbkdf2
+--- cmd
+zfs get -H -o name,property,value,source pbkdf2iters,pbkdf2salt zfsbcapc/EP/e
+--- rc
+0
+--- stdout
+zfsbcapc/EP/e	pbkdf2iters	350000	-
+zfsbcapc/EP/e	pbkdf2salt	14.1E	-
+--- stderr
+=== END

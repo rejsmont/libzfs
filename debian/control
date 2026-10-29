@@ -1,0 +1,82 @@
+Source: zfsbackup
+Section: admin
+Priority: optional
+Maintainer: Radoslaw Kamil Ejsmont <radoslaw@ejsmont.net>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-python,
+ pybuild-plugin-pyproject,
+ python3-all,
+ python3-poetry-core (>= 2.0),
+Standards-Version: 4.7.2
+Homepage: https://github.com/rejsmont/libzfs
+Rules-Requires-Root: no
+X-Python3-Version: >= 3.11
+
+Package: python3-libzfseasy
+Architecture: all
+Section: python
+Depends:
+ zfsutils-linux,
+ ${misc:Depends},
+ ${python3:Depends},
+Breaks:
+ zfsbackup (<< ${binary:Version}),
+Description: Python interface to the ZFS utilities (zfs and zpool)
+ libzfseasy wraps the zfs and zpool command line tools as Python objects:
+ typed datasets, snapshots and bookmarks, property handling with sources, and
+ one command class per zfs subcommand, including streaming send and receive.
+ .
+ It uses only the Python standard library and runs the zfs and zpool binaries
+ found on PATH (or named by the ZFS_CMD and ZPOOL_CMD environment variables).
+ .
+ This package is released together with zfsbackup, which depends on it.
+
+Package: zfsbackup
+Architecture: all
+Depends:
+ python3-alembic (>= 1.13),
+ python3-alembic (<< 2~),
+ python3-click (>= 8.1),
+ python3-click (<< 9~),
+ python3-cryptography (>= 43),
+ python3-flask (>= 3.1.1),
+ python3-flask (<< 4~),
+ python3-libzfseasy (= ${binary:Version}),
+ python3-requests (>= 2.31),
+ python3-requests (<< 3~),
+ python3-simple-websocket (>= 1.1),
+ python3-simple-websocket (<< 1.2~),
+ python3-sqlalchemy (>= 2.0),
+ python3-sqlalchemy (<< 2.2~),
+ python3-urllib3 (>= 2),
+ python3-urllib3 (<< 3~),
+ python3-websocket (>= 1.8.0),
+ python3-websocket (<< 2~),
+ python3-werkzeug (>= 3.1),
+ python3-werkzeug (<< 3.2~),
+ python3-yaml (>= 6.0),
+ python3-yaml (<< 7~),
+ ${misc:Depends},
+ ${python3:Depends},
+Recommends:
+ needrestart,
+Suggests:
+ prometheus-node-exporter,
+Description: Automated ZFS snapshots, retention and remote backup over mutual TLS
+ zfsbackup is a daemon that snapshots ZFS datasets on a schedule, prunes the
+ snapshots with tiered retention rules, and replicates them to other hosts
+ with incremental zfs send and receive over HTTPS with mutual TLS
+ authentication and pinned certificates. One daemon can be a backup client, a
+ backup server, or both.
+ .
+ The configuration lives in a SQLite database managed with zfsbackup-config.
+ The service is neither enabled nor started on installation: import a
+ configuration, enroll the destinations, then run
+ "systemctl enable --now zfsbackup". See /usr/share/doc/zfsbackup/README.md.
+ .
+ The daemon uses the development server of werkzeug and overrides internals
+ of werkzeug, urllib3 and simple-websocket: werkzeug and simple-websocket are
+ therefore limited to the minor series this version was tested with
+ (werkzeug 3.1, simple-websocket 1.1) and sqlalchemy to 2.0 and 2.1; the
+ other libraries are bounded to their current major version.

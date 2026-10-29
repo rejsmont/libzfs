@@ -1,7 +1,9 @@
 # OpenZFS output captures
 
-Real `zfs` / `zpool` output from OpenZFS **2.1.5**, **2.2.2** and **2.4.1** (Multipass VMs; versions, kernel and pool features are in each `ENV.txt`), committed so the mocked suite can replay it through libzfseasy's parsers
-(`tests/test_openzfs_formats.py`) without a pool. Nothing here is hand-written.
+Real `zfs` / `zpool` output from OpenZFS **2.1.5**, **2.2.2**, **2.3.9** and **2.4.1** (Multipass VMs: Ubuntu 22.04, Ubuntu 24.04, Debian 13 (`debian-13-genericcloud-arm64` cloud image, `zfs-2.3.9-0+deb13u1`) and Ubuntu 26.04; versions, kernel and pool features are in each `ENV.txt`), committed so the mocked suite can replay it through libzfseasy's parsers
+(`tests/test_openzfs_formats.py`) without a pool. The pruner's fake pool (`tests/_prune_support.py`), the stream-header
+helpers (`tests/_stream_support.py`, the `M8/HDR.*` records) and some remote/API tests use them too. Nothing here is
+hand-written.
 
 ## Where they come from
 
@@ -35,6 +37,13 @@ compound stream: its first record is a stub (`versioninfo` 2, no dataset type) f
 `DRR_END`; the real `DRR_BEGIN` is the `HDR.*_inner` record (`payloadlen=N`, `inner_bytes=312`, then the hex of the 312 bytes
 at offset `624+N`). `HDR.resume_*` come from `zfs send -t`. Creation times and guids differ per version; the flag fields do not.
 
+**Wording by version** (the tests in `tests/test_openzfs_formats.py` pin each): a held snapshot is `dataset is busy` on 2.1/2.2
+and `it's being held. Run 'zfs holds -r ...' to see holders.` on 2.3.9 and 2.4.1; `send -t` on a token whose incremental
+source is gone says `Invalid cross-device link` on 2.1/2.2/2.3.9 and `No such file or directory` on 2.4.1; a plain `send`
+of a dataset with its key unloaded says `dataset key must be loaded` on 2.1/2.2/2.3.9 and `incremental source (...) does not
+exist` on 2.4.1. Exit codes, stdout, the resume-token flag sets (`M1-SUMMARY.tsv` is identical on all four) and the `receive -F`
+history semantics (M7) did not differ on any version.
+
 M1 is trimmed: the `0_base`, `4_resume`, `5_after` and `6_snaps` records of each token case are left out (the summary
 keeps the resume status). Every kept record has its exact bytes.
 
@@ -57,21 +66,24 @@ keeps the resume status). Every kept record has its exact bytes.
 === END
 ```
 
-A resume token is the argument after `-t` in the `cmd` line. `tests/_openzfs_fixtures.py` parses a section file
-into `{id: Record}` (`cmd`, `rc`, `stdout`, `stderr`, `pipestatus`, `send_stderr`, plus `.token`, `.stdout_lines`,
+Lines starting with `#note:` between records are the capture script's remarks (what a group of cases sets up); the
+loader ignores them. A resume token is the argument after `-t` in the `cmd` line. `tests/_openzfs_fixtures.py` parses a section file
+into `{id: Record}` (the id includes the section: `M2/<case>`; `cmd`, `rc`, `stdout`, `stderr`, `pipestatus`, `send_stderr`, plus `.token`, `.stdout_lines`,
 `.stderr_lines`); `load_m1_summary(version)` reads `M1-SUMMARY.tsv`. A capture writes every non-empty stdout/stderr with its final
 newline, so the section files lose nothing against the per-record files (`<id>.{cmd,rc,stdout,stderr}`) the script
 also leaves behind; an empty `send.stderr` has no marker.
 
 ## Regenerating
 
-Needs the Multipass VMs (`zfsb-zfs21`, `zfsb-zfs22`, `zfsb-zfs24`) provisioned by the matrix script:
+Needs Multipass on the host; the matrix script uses the VMs `zfsb-zfs21`, `zfsb-zfs22`, `zfsb-zfs23` (Debian 13) and
+`zfsb-zfs24` (a missing one is created, one without `zfs` is provisioned; `--only 21,22,23,24` selects a subset, e.g.
+`--only 23 --captures` for just the Debian 13 / 2.3.9 pass):
 
 ```
 MATRIX_LOG_DIR=/some/dir scenarios/test_openzfs_matrix.sh --captures-only        # or --captures with the other tiers
 ```
 
 The script leaves `<vm>.captures/{default,C}/` under `$MATRIX_LOG_DIR`. Copy each `C/<SECTION>.txt`,
-`C/M1-SUMMARY.tsv` and `C/ENV.txt` to `tests/fixtures/openzfs/<2.1.5|2.2.2|2.4.1>/`, dropping the four M1 record kinds
+`C/M1-SUMMARY.tsv` and `C/ENV.txt` to `tests/fixtures/openzfs/<2.1.5|2.2.2|2.3.9|2.4.1>/`, dropping the four M1 record kinds
 named above if the total grows past ~1.5 MB. Then run `pytest tests/test_openzfs_formats.py`: a new OpenZFS release
 that changes a wording or a flag set shows up as a failing, per-version test.

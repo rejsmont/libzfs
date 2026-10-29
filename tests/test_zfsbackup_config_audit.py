@@ -1678,13 +1678,13 @@ class TestBadNamesThroughTheCli:
     def off(self, tmp_path):
         """A database whose only dataset has a bad name but is DISABLED (the
         import accepts it with a warning)."""
-        from click.testing import CliRunner
+        from _click_compat import make_runner
 
         from zfsbackup.cli.main import cli
 
         db = tmp_path / "cfg" / "config.db"
         source = write(tmp_path, self.OFF)
-        result = CliRunner().invoke(cli, ["import", str(source), "-c", str(db)], prog_name="zfsbackup-config")
+        result = make_runner().invoke(cli, ["import", str(source), "-c", str(db)], prog_name="zfsbackup-config")
         assert result.exit_code == 0, result.stderr
         assert CANNOT_MANAGE in result.stderr and "enabling it will be refused" in result.stderr
         dispose_all()
@@ -1692,11 +1692,11 @@ class TestBadNamesThroughTheCli:
 
     @staticmethod
     def invoke(*args, env=None, input=None):
-        from click.testing import CliRunner
+        from _click_compat import make_runner
 
         from zfsbackup.cli.main import cli
 
-        return CliRunner().invoke(
+        return make_runner().invoke(
             cli, [str(a) for a in args], env=env, input=input, prog_name="zfsbackup-config"
         )
 
@@ -1808,11 +1808,11 @@ class TestPreexistingBadNamesInTheStore:
 
     @staticmethod
     def invoke(*args):
-        from click.testing import CliRunner
+        from _click_compat import make_runner
 
         from zfsbackup.cli.main import cli
 
-        return CliRunner().invoke(
+        return make_runner().invoke(
             cli, [str(a) for a in args], prog_name="zfsbackup-config"
         )
 

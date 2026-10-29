@@ -6,15 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Install dependencies:**
 ```bash
-poetry install --with dev
+poetry install --with dev     # zfsbackup, plus libs/libzfseasy as an editable path dependency
 ```
+
+**Build:** `poetry build` (the `zfsbackup` wheel and sdist) and `poetry build -C libs/libzfseasy -o ../../dist`
+(the `libzfseasy` wheel and sdist; `-o` is relative to `-C`).
 
 **Run tests (mocked — no ZFS *pool* required, but see below):**
 ```bash
 pytest
 ```
 
-`libzfseasy/zfs.py` resolves the `zfs`/`zpool` binaries at **import** time. `tests/conftest.py`
+`libs/libzfseasy/libzfseasy/zfs.py` resolves the `zfs`/`zpool` binaries at **import** time. `tests/conftest.py`
 therefore points `ZFS_CMD`/`ZPOOL_CMD` at a harmless stub before importing it whenever they are unset,
 so a bare `pytest` never runs a real `zfs` (the developer's Mac has one), and every test subprocess gets
 a hermetic environment (`tests/_hermetic.py::hermetic_env()`: a private PATH with stub `zfs`/`zpool`
@@ -37,12 +40,15 @@ pytest -m unit
 pytest -m integration
 ```
 
-**Run real ZFS integration tests (requires a test pool):**
+**Run real ZFS integration tests (requires ZFS and passwordless `sudo` for `zpool`/`zfs`):**
 ```bash
-./scenarios/setup_test_pool.sh        # create file-backed pool
-ZFSB_REAL_ZFS=1 pytest -m real_zfs
-./scenarios/cleanup_test_pool.sh      # destroy pool when done
+ZFSB_REAL_ZFS=1 pytest -m real_zfs                     # local throwaway pool zfsbackup_pytest_<pid>
+ZFSB_REAL_ZFS=1 MULTIPASS_VM=zfsb-ci pytest -m real_zfs   # or the pool inside a Multipass VM
 ```
+
+The `auto_zfs_pool` fixture (`tests/conftest.py`) creates a file-backed pool and destroys it at session end;
+if it cannot, the real tests skip. `scenarios/setup_test_pool.sh` makes a separate manual `testpool` the
+pytest tier does not use.
 
 The real tier is **opt-in**: without `ZFSB_REAL_ZFS=1`, `pytest -m real_zfs` skips every real test
 (and an unset `ZFS_CMD`/`ZPOOL_CMD` is stubbed for the whole session). Set it per command; never export
@@ -65,7 +71,17 @@ zfsbackup-config -c /tmp/zfsbackup/config.db check                     # health:
 zfsbackup-config -c /tmp/zfsbackup/config.db backup /tmp/bk           # DB + <db>.tls + MANIFEST
 ```
 
-The distribution is named `zfsbackup` (it ships both packages); `zfsbackup/version.py` is the single version
+Two distributions, released in lockstep: `zfsbackup` (the root `pyproject.toml`, PEP 621; the `zfsbackup` package
+only) and `libzfseasy` (`libs/libzfseasy/pyproject.toml`, stdlib only, self-contained so it can later move to its
+own repository). The root `[project]` pins `libzfseasy==<same version>`; `[tool.poetry.dependencies]` adds the
+editable path source for development only. Dependency floors must stay at or below what Debian 13 and Ubuntu 26.04
+ship (the `.deb`s depend on the distro's `python3-*` packages; `docs/packaging_plan.md`); `flask-sock` 0.7.0 is
+vendored as `zfsbackup/_vendor/flask_sock.py`. **`debian/`** builds `python3-libzfseasy` and `zfsbackup`
+(`Architecture: all`, pybuild once per project; units generated from `packaging/` with `/usr/bin`; installed
+disabled; `--no-restart-after-upgrade` = stop in the new preinst, start after configure if enabled; `python3-libzfseasy` `Breaks:` older zfsbackup and `debian/zfsbackup.prerm` stops the units on `deconfigure`, so the library never changes under a running daemon; a dpkg trigger
+on the Python dependencies' directories try-restarts the daemon; purge keeps `/var/lib/zfsbackup`; autopkgtests
+`smoke` and `platform-contracts`); `.github/workflows/deb.yml` builds, lintians and installs them in `debian:13`
+and `ubuntu:26.04` containers. Both distros ship click 8.1.8 (as "8.2.0+0.really.8.1.8"). `zfsbackup/version.py` is the single version
 source (`installed_version()`, uncached), and `zfsbackupd --version` / `zfsbackup-config --version` print it with
 the wire protocol and schema head. systemd units, sysusers and tmpfiles live in `packaging/` (sdist only, never
 the wheel; never put a `.py` file there). The runbook (install, upgrade, restore, monitoring) is
@@ -73,13 +89,13 @@ the wheel; never put a `.py` file there). The runbook (install, upgrade, restore
 
 ## Architecture
 
-This repo contains two packages:
+This repo contains two packages, each its own distribution:
 
 ### `libzfseasy` — ZFS Python bindings
 
 Wraps the `zfs` and `zpool` CLI utilities as Python objects.
 
-**[libzfseasy/types.py](libzfseasy/types.py)** defines the type hierarchy:
+**[libs/libzfseasy/libzfseasy/types.py](libs/libzfseasy/libzfseasy/types.py)** defines the type hierarchy:
 - `ZFS` (base) → `Dataset` → `Filesystem`, `Volume`
 - `ZFS` → `Snapshot`, `Bookmark`
 - `SnapshotRange` — represents a `dataset@snap1%snap2` range
@@ -88,7 +104,7 @@ Wraps the `zfs` and `zpool` CLI utilities as Python objects.
 
 Properties are stored internally as integer-indexed lists (using `_prop_names` class attrs) for efficiency; user-defined properties (containing `:`) are stored separately in `_user_props`.
 
-**[libzfseasy/zfs.py](libzfseasy/zfs.py)** defines command classes (`ListCommand`, `CreateCommand`, `SnapshotCommand`, etc.), each wrapping a `zfs` subcommand. One exec core, `Command._exec_lines` (bytes, surrogateescape, `\n`-only, bounded stderr), backs `_exec` (drain) and `_exec_out` (stripped non-empty lines); on an interrupt or an abandoned generator it sends TERM, then KILL after 5 s, and abandons a child that survives KILL (D state) with one WARNING rather than blocking. A watchdog reports a command
+**[libs/libzfseasy/libzfseasy/zfs.py](libs/libzfseasy/libzfseasy/zfs.py)** defines command classes (`ListCommand`, `CreateCommand`, `SnapshotCommand`, etc.), each wrapping a `zfs` subcommand. One exec core, `Command._exec_lines` (bytes, surrogateescape, `\n`-only, bounded stderr), backs `_exec` (drain) and `_exec_out` (stripped non-empty lines); on an interrupt or an abandoned generator it sends TERM, then KILL after 5 s, and abandons a child that survives KILL (D state) with one WARNING rather than blocking. A watchdog reports a command
 still running after `libzfseasy.slow_command_warning` seconds (default 60; None turns it off) at WARNING, and again at
 each further multiple. `with libzfseasy.timeout(s):` (a ContextVar, per command, non-streaming only) terminates an
 overrunning child and raises `ZFSTimeoutError`; while a timed-out child survives KILL, every later *timed* call fails
@@ -102,19 +118,19 @@ non-contiguous groups, and the "lead rule": an object's `get` rows must start wi
 reads one value exactly. `zfs.list(..., strict=True)` raises instead of skipping any row the default parse
 would skip (with a WARNING); the server's `-F` decision lists with it. With an explicit property list, `get()` and
 `rows()` refuse an object whose rows are not exactly `name, type, p1, p2, …` in the requested order (verified on
-2.1/2.2/2.4: zfs prints exactly the requested properties). `zfs.get.rows(…)` is the fail-closed row reader for
+2.1/2.2/2.3/2.4: zfs prints exactly the requested properties). `zfs.get.rows(…)` is the fail-closed row reader for
 safety decisions (`GetRow` list with `.complete`/`.dropped`/`.skipped`; `verify_names` cross-checks names against a
 name-only `zfs list`; pass `received=False`). `zfs.get.property_sources(…)` is the value-free discovery read
 (`-o name,property,source`, `-s` allowed, `PropertySource` list, strict, names checked by shape only): nothing in it can come from a value. A listing that skips names libzfseasy cannot represent ends with one
 summary line, WARNING only when it also logged a new per-name WARNING.
 
-**[libzfseasy/\_\_init\_\_.py](libzfseasy/__init__.py)** instantiates one singleton per command class and exports them as module-level names (`zfs.list`, `zfs.create`, `zfs.snapshot`, etc.). This is the public API.
+**[libs/libzfseasy/libzfseasy/\_\_init\_\_.py](libs/libzfseasy/libzfseasy/__init__.py)** instantiates one singleton per command class and exports them as module-level names (`zfs.list`, `zfs.create`, `zfs.snapshot`, etc.). This is the public API.
 
 `ZFS_CMD` and `ZPOOL_CMD` environment variables override the resolved binary paths.
 
 ### `zfsbackup` — Automated snapshot daemon
 
-**[zfsbackup/config/model.py](zfsbackup/config/model.py)** — YAML config loader. `BackupConfig.from_file()` parses global settings and a list of `DatasetConfig` objects. Each dataset has a `frequency` (how often to snapshot) and tiered `retention` rules (`RetentionRule(age, keep_for)`). Time durations use a custom format: `m`=minutes, `h`=hours, `d`=days, `w`=weeks, `M`=months (~30d), `y`=years (~365d). Destination URLs must be `https://` with a non-zero port (`Destination.server_fingerprint` is the pinned server certificate, set by `enroll`); `client_cert_file`/`client_key_file` are optional absolute overrides (both or neither). The client id is **not** configuration: its grammar (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, `client_id_problem`) and generator live here, but the value lives in the `host_identity` table, and `from_file` refuses the old file-based setting with a pointer to `identity set-client-id`. `RemoteDatasetConfig.raw` (`Optional[bool]`: `auto`/omitted = None = raw iff the dataset is encrypted, `true`, `false`) is per dataset × destination, client-side only (`to_property` never carries it). `duration_ok`/`wire_config_problem` (positive durations, config shape) are shared by the server's negotiate and pruner.
+**[zfsbackup/config/model.py](zfsbackup/config/model.py)** — YAML config loader. `BackupConfig.from_file()` parses global settings and a list of `DatasetConfig` objects. Each dataset has a `frequency` (how often to snapshot) and tiered `retention` rules (`RetentionRule(age, keep_for)`). Time durations use a custom format: `s`=seconds, `m`=minutes, `h`=hours, `d`=days, `w`=weeks, `M`=months (~30d), `y`=years (~365d). Destination URLs must be `https://` with a non-zero port (`Destination.server_fingerprint` is the pinned server certificate, set by `enroll`); `client_cert_file`/`client_key_file` are optional absolute overrides (both or neither). The client id is **not** configuration: its grammar (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, `client_id_problem`) and generator live here, but the value lives in the `host_identity` table, and `from_file` refuses the old file-based setting with a pointer to `identity set-client-id`. `RemoteDatasetConfig.raw` (`Optional[bool]`: `auto`/omitted = None = raw iff the dataset is encrypted, `true`, `false`) is per dataset × destination, client-side only (`to_property` never carries it). `duration_ok`/`wire_config_problem` (positive durations, config shape) are shared by the server's negotiate and pruner.
 
 **[zfsbackup/backup_manager.py](zfsbackup/backup_manager.py)** — Core logic:
 - `DatasetManager` — owns the list of `DatasetInfo` objects, checks whether a snapshot is due (`needs_snapshot`), creates snapshots via `libzfseasy`, and lists existing ones
@@ -140,7 +156,7 @@ spawn and hands it over in the `Handoff` (`status_dir`, `None` under dry run). T
 3 consecutive cycles skipped by the resume-token check.
 
 **[zfsbackup/remote.py](zfsbackup/remote.py)** / **[zfsbackup/api.py](zfsbackup/api.py)** — remote send/receive transfer (`RemoteBackupManager`) and the HTTP control API (`create_app`). Transport is TLS 1.3 with mutual authentication and fingerprint pinning (B1 is resolved); the residual caveats are in [docs/production_readiness_report.md](docs/production_readiness_report.md) (werkzeug's development server; mid-stream revocation and `/enroll` flood control are resolved in milestone D).
-Send flags are frozen (OpenZFS 2.1/2.2/2.4 captures in `tests/fixtures/openzfs/`): plain `-L -c`, raw `-w`, a
+Send flags are frozen (OpenZFS 2.1/2.2/2.3/2.4 captures in `tests/fixtures/openzfs/`): plain `-L -c`, raw `-w`, a
 resume is `zfs send -t` with no flags; `-L` is permanent once received. The mode is decided once per dataset ×
 destination from the newest snapshot's encryption/keystatus and `raw` (`raw: true` on an unencrypted dataset, or
 plain with the key unloaded → one ERROR, nothing sent); negotiate reports `server_copy: none|plain|raw` and a
@@ -163,7 +179,7 @@ for a missing dataset, creates only its parent chain and keeps the canonical con
 (TTL 600 s, refreshed by each negotiate, capped at 4096, lost on restart); the receive itself creates the leaf
 (raw streams and encrypted targets need that), so `-F` is passed only when the dataset exists.
 **No rollback of server history (B-2b):** `-F` on a `-i` receive destroys every server snapshot newer than the
-base (2.1/2.2/2.4, `tests/fixtures/openzfs/*/M7.txt`), so under the claim and before any `receive -A` the
+base (2.1/2.2/2.3/2.4, `tests/fixtures/openzfs/*/M7.txt`), so under the claim and before any `receive -A` the
 server lists its snapshots (`createtxg`, `guid`) and `decide_receive` passes `-F` only for a copy without
 snapshots, a base (`from_guid`, else `from`) that is its newest, or newer snapshots all named in the client's
 `discard`; otherwise it refuses (`reason`: `server_newer`, `base_missing`, `no_common`, `listing` for an untrusted
@@ -194,8 +210,8 @@ stream), and a stream with neither is refused ("negotiate again", retryable). `r
 names only, then reads every dataset's local `client_id`/`config` in ONE `zfs.get.rows` batch (no received column;
 an incomplete batch, or a name the batch dropped, falls back to per-dataset `zfs.get.value(sources='local')`) and skips (one
 WARNING) anything outside `<target>/<client_id>/`, with an invalid id, or with a config that is missing,
-undecodable or only received. The client's sent values survive as hidden `received` values under the server's
-locals, so never `zfs inherit -S` them. `/config`, `/datasets` and `/datasets/<n>/snapshots` no longer exist.
+undecodable or only received. A plain or raw stream carries no user properties (captures: `received` is `-`),
+so the server's `-o` locals are the only values: never `zfs inherit` them. `/config`, `/datasets` and `/datasets/<n>/snapshots` no longer exist.
 **Receive hardening (B-2a/B-2c/B-3-lite).** The server reads the stream's 312-byte `DRR_BEGIN`
 (`read_stream_header`/`parse_stream_header`) before it lists snapshots, decides `-F`, aborts or spawns anything:
 a compound stream (`send -p`/`-R`/`-I`) is refused, the declared base must match `drr_fromguid`
@@ -331,7 +347,7 @@ opens the DB for configuration.
 
 **[zfsbackup/daemonlock.py](zfsbackup/daemonlock.py)** — the daemon presence lock: `flock` on
 `<db>.daemon.pid`. Pid file v2: lines 1–2 are pid and generation, then `start=`, `applied=`, `target=`,
-`rejected=`, `deferred=` and `deferred_reason=` lines (readers ignore unknown keys), written padded so a reader never sees a torn tail. A second daemon on the same DB refuses
+`rejected=`, `deferred=`, `deferred_reason=`, `draining=` and `draining_reason=` lines (readers ignore unknown keys), written padded so a reader never sees a torn tail. A second daemon on the same DB refuses
 to start, and waits instead if the holder is a verified-dead supervisor's orphans. "Running" means the lock
 is held, never that a pid exists. `request_reload()` is the only SIGHUP sender. It signals only after
 checking:
@@ -346,7 +362,7 @@ primitives (stdlib only).
 `NOTIFY_SOCKET` before any fork or `zfs` exec, so only the supervisor notifies (`NotifyAccess=main`):
 `READY=1` after the workers start, `RELOADING=1` … `READY=1` around every SIGHUP reload (READY means the
 reload was *decided*, accepted or rejected, not that the turnover finished), `STATUS=generation N`,
-`EXTEND_TIMEOUT_USEC` during startup waits, `STOPPING=1` on exit. The README unit is `Type=notify-reload`.
+`EXTEND_TIMEOUT_USEC` during startup waits, `STOPPING=1` on exit. The unit (`packaging/systemd/zfsbackup.service`) is `Type=notify-reload`.
 
 Files next to the config DB: `config.db` (+ `-wal`/`-shm` while open), `config.db.writer.lock` (CLI
 writer lock — empty, never deleted), `config.db.daemon.pid` (daemon presence lock), `config.db.workers.lock`
@@ -385,7 +401,7 @@ rejected and deferred keys, and never signals (`--wait` on a still-deferred key 
 workers, or once a *signalled* (verified, so never on macOS) daemon has applied the rename. The CLI is the only writer of the configuration and of the host identity (`host_identity.client_id`); the trust tables have a second writer, the API worker (see "Who reads and writes what"). Exit codes: 0 ok, 1 invalid/refused, 2 usage, 75 retry
 (conflict/busy), 78 config DB unusable, 130/143 interrupted/terminated.
 
-> **`zfsbackup/store/` is reserved and deliberately empty.** It is for *backup data* destinations —
+> **`zfsbackup/store/` is reserved and does not exist yet.** It is for *backup data* destinations —
 > object storage, cloud targets and the like. Configuration persistence lives under
 > `zfsbackup/config/store/`. Do not put config code in `zfsbackup/store/`, and do not move the config
 > store back out of `zfsbackup/config/`.
@@ -397,7 +413,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_types.py` | `Validate`, `Property`, type classes |
 | `tests/test_commands.py` | Each command class, mocked subprocess |
 | `tests/test_framing.py` | `-H` output framing: unframeable values refused on write, fail-closed `list`/`get` row parsing (forged/duplicate/out-of-scope rows), `get.value`, `_exec_lines`, `list(strict=True)` |
-| `tests/test_libzfseasy_argv_hygiene.py` | Property names starting with `-` or over 255 characters refused, `receive` name validation, `_redact` clipping |
+| `tests/test_libzfseasy_argv_hygiene.py` | Property names starting with `-` or over 255 characters refused, `receive` name validation and set/reset overlap, `_redact` (URL credentials, clipping), resume token checked before exec |
 | `tests/test_libzfseasy_property_sources.py` | `zfs.get.property_sources()`: exact argv, the 3-column row checks (name shape, scope, types, source grammar, duplicates, contiguity), prefix filter applied last, failure precedence, drain/reap/timeout with real children, a hostile value never appears, exports |
 | `tests/test_libzfseasy_timeouts.py` | D6 slow-command watchdog (`slow_command_warning`) and D7 `timeout()`: expiry, stuck-child registry, fail-fast timed calls, contexts and threads |
 | `tests/test_integration.py` | End-to-end workflows, mocked subprocess |
@@ -406,7 +422,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_basic.py` | Package smoke tests |
 | `tests/test_zfsbackup_manager.py` | `DatasetManager`, retention/pruning; the one six-column listing and txg order; B-4 prune fallback, held/cloned pre-skip, stuck names, protection re-read before every destroy |
 | `tests/test_zfsbackup_prune_descendants.py` | Recursive prune honours descendants' anchors and configured retention; received datasets pruned non-recursively |
-| `tests/test_openzfs_formats.py` | Captured OpenZFS 2.1.5/2.2.2/2.4.1 output (`tests/fixtures/openzfs/`, loader `tests/_openzfs_fixtures.py`) replayed through `resume_info`, destroy, list/get and zfsbackup's stale-token and `receive -A` classifiers |
+| `tests/test_openzfs_formats.py` | Captured OpenZFS 2.1.5/2.2.2/2.3.9/2.4.1 output (`tests/fixtures/openzfs/`, loader `tests/_openzfs_fixtures.py`) replayed through `resume_info`, destroy, list/get and zfsbackup's stale-token and `receive -A` classifiers; the M7 `-F` history through `decide_receive` |
 | `tests/test_zfsbackup_store_raw.py` | `dataset_remotes.raw` migration up/down, mapper round trip, column-aware stamp advice and `SchemaColumnsMissing`, the column-registry guard |
 | `tests/test_zfsbackup_cli_raw.py` | `raw` through render/export/import, get/set/unset, list, edit, and the warning on a change |
 | `tests/test_zfsbackup_property_reads_two_phase.py` | The two-step `org.zfsbackup:*` read: unrelated/inherited odd values do not block, races between the steps (re-read once, never a smaller set), configured destinations' names, empty discovery, exact argv and exec counts, last read before every destroy |
@@ -475,6 +491,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_cli_closeout.py` | `-c`/`-v` on `list`/`rename` groups, `where_flag`, console-script signal disposition, whole-config prefix-change warning |
 | `tests/test_zfsbackup_daemon_closeout.py` | Startup SIGHUP handler, supervisor-death watch and sliced waits, ApiWorker failures, real `kill -9` of the supervisor under fork/spawn/forkserver |
 | `tests/test_zfsbackup_forkserver_death.py` | Forkserver death: lost/orphaned workers, no restart-limit count, no overlap, identity-checked (pidfd) shutdown signals — real forkserver processes |
+| `tests/test_zfsbackup_forkserver_stop.py` | `BackupDaemon._stop_forkserver`: closes the alive fd and reaps the forkserver with a bounded wait (one WARNING for a live holder), no-op under fork/spawn, busy lock skipped, every private-attribute failure swallowed, order in `run()` (after `_shutdown_workers`, before "Daemon stopped", also when the loop raises); real forkserver in a driver subprocess and a real daemon stopped by SIGTERM |
 | `tests/test_zfsbackup_sdnotify.py` | systemd `sd_notify`: `NOTIFY_SOCKET` handling, READY/RELOADING/STOPPING/STATUS/EXTEND_TIMEOUT sequence, real daemon |
 | `tests/test_zfsbackup_store_sqla_compat.py` | SQLAlchemy 2.0/2.1 differences: failed-connect close probe, `%` in DB paths (CI also runs a 2.1 job) |
 | `tests/test_zfsbackup_store_wal_switch.py` | WAL-switch busy retry: wall-clock budget, per-attempt busy_timeout, real lock holders |
@@ -483,8 +500,8 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_no_real_zfs_guard.py` | The conftest guard that fails any test reaching a real `zfs`/`zpool` |
 | `tests/test_marker_tiers.py` | `unit` and `integration` partition the mocked suite |
 | `tests/test_zfsbackup_real.py` | Daemon against a real pool, marked `real_zfs`: end-to-end mTLS send/receive, plain and raw chains, R0 layouts (raw/plain under encrypted and unencrypted targets), held/cloned prune, txg order, the user-property size limit |
-| `tests/test_zfsbackup_version.py` | Single version source (uncached), lazy `__version__`, import weight, `daemon_entry`, pyproject pins and the built wheel/sdist contents |
-| `tests/test_zfsbackup_version_skew.py` | The version-skew guard: `code_signature()`, debounce, the staged upgrade drain, lost workers, SIGHUP during a drain, spawn/start guards, worker exit 4 under fork/spawn/forkserver before lazy imports, a real daemon exiting 76 |
+| `tests/test_zfsbackup_version.py` | Single version source (uncached), lazy `__version__`, import weight, `daemon_entry`; PEP 621 pyproject pins (Debian 13 floors), the lockstep versions, `libs/libzfseasy` self-contained and stdlib-only, both built wheels (disjoint files, `libzfseasy==` pin) and the sdist; `debian/` against the pyprojects (changelog version, every `Depends` floor and `<<` ceiling, the `python3-libzfseasy` pin, `X-Python3-Version`); its `Breaks:` and the `deconfigure` stop in `debian/zfsbackup.prerm` (run with a stub `deb-systemd-invoke`) |
+| `tests/test_zfsbackup_version_skew.py` | The version-skew guard: `code_signature()` over both distributions (incl. no-`RECORD` installs and libzfseasy-only changes), debounce, the staged upgrade drain, lost workers, SIGHUP during a drain, spawn/start guards, worker exit 4 under fork/spawn/forkserver before lazy imports, a real daemon exiting 76 |
 | `tests/test_zfsbackup_daemon_entry.py` | `zfsbackupd --version`, SIGHUP ignored before the daemon import, the generated console-script wrapper under fork/spawn/forkserver (READY, reload, SIGHUP storm), fork-with-threads ERROR |
 | `tests/test_zfsbackup_logsetup.py` | journald detection by dev:ino, `<N>` on every line, NUL escaping and wrapping, `--log-level`, worker children, `log_request` levels and clipping |
 | `tests/test_zfsbackup_identity_copy.py` | `identity.copy_tls_dir`: modes, no overwrite, `KeyUnreadable`, shared lock, lock appearing mid-read, consistency against a real rotation |
@@ -500,13 +517,14 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_zfsbackup_cli_backup.py` | `zfsbackup-config backup`: layout, modes, MANIFEST, `--no-keys`, exit mapping, signals, restore round trip |
 | `tests/test_zfsbackup_cli_migrate_backup.py` | `migrate --backup-dir`: behind/at head/newer, backup failures never migrate, workers-present refusal, concurrent migrates |
 | `tests/test_zfsbackup_cli_check.py` | `zfsbackup-config check`: formats, exit codes incl. Nagios UNKNOWN, escaping, atomic output, daemon and certificate entries, worker status entries (grading, refused and stale files, trusted daemon uid) |
-| `tests/test_zfsbackup_platform_contracts.py` | Contract tests for the werkzeug, requests/urllib3 and simple-websocket internals zfsbackup overrides |
-| `tests/test_ci_workflows.py` | The CI workflows: the real-ZFS job runs only on schedule/dispatch on `master`, stubs stay in the mocked jobs |
+| `tests/test_zfsbackup_platform_contracts.py` | Contract tests for the werkzeug, requests/urllib3 and simple-websocket internals zfsbackup overrides, and the `multiprocessing.forkserver` private surface `_stop_forkserver` reads; the vendored flask-sock is upstream 0.7.0 byte for byte (also the `.deb`'s autopkgtest) |
+| `tests/test_click_compat.py` | The click 8.1/≥ 8.2 `CliRunner` factory (`tests/_click_compat.py`): separate stdout/stderr, interleaved output, EOF at a prompt aborts |
+| `tests/test_ci_workflows.py` | The CI workflows: the real-ZFS job runs only on schedule/dispatch on `master`, stubs stay in the mocked jobs; the package job builds and checks both wheels; `debian-floors` runs the whole suite at Debian 13's versions (click 8.1.8); `deb.yml` (images, lintian, step order, schedule and paths; pytest and zfsbackup run only through the stubbed `debian/tests` scripts) |
 
 Tests without a `unit`/`integration`/`real_zfs` marker are marked `unit` by a hook in `conftest.py`.
 
 Shared TLS test helpers (importable from any test module; `tests/` is on `sys.path`; none reaches a real `zfs`, every socket is `127.0.0.1`):
-- `tests/_tls_support.py` — real generated identities, a scripted `StubTrust`, `make_gateway`, `pin_client`/`unpin_client` through the real trust writers, `https_get`/`tls_probe`.
+- `tests/_tls_support.py` — real generated identities, a scripted `StubTrust`, `make_gateway`, `pin_client`/`unpin_client` through the real trust writers, `https_get`/`try_get`, `raw_connect`.
 - `tests/_api_support.py` — client certificates, `FakeGateway`, `Authed` (a Flask app presenting `SSL_CLIENT_CERT`), `RealTrust`, the `/enroll` and `/rotate` request bodies.
 - `tests/_remote_support.py` — `make_transport`, `fake_connect_pinned`, `client_tls_dir`, `whoami_json` for `RemoteBackupManager` tests.
 - `tests/_worker_status_support.py` — worker status files built with the real `health` writer (`rec()`, `write_worker()`) for the `check`/`status` tests; `tests/_status_workers.py` — picklable worker doubles for the real-process status tests.
@@ -517,12 +535,15 @@ Shared TLS test helpers (importable from any test module; `tests/` is on `sys.pa
 - `tests/_enroll_support.py` — `RealServer` (real app + real gateway + real TLS listener) for the `enroll`/`identity rotate` CLI tests; `tests/_pty_driver.py` answers a prompt on a real pty.
 
 Other shared helpers:
+- `tests/_click_compat.py` — `make_runner()` / `interleaved(result)`: one `CliRunner` behaviour on click 8.1.x (both distros) and ≥ 8.2 (the lock); re-exported by `_cli_support.py`. `tests/_pyproject_support.py` — reads both `pyproject.toml`s and parses `[project]` dependencies.
 - `tests/_snapshot_support.py` — `listed_snapshot`/`listed_info`/`list_row` (snapshots and `zfs list` rows with the six listing columns; `txg=` to make txg order differ from name order) and a `frozen_clock` fixture.
 - `tests/_prune_support.py` — `PrunePool`, a stateful fake of list/get/destroy with OpenZFS's all-or-nothing destroy and the captured per-version stderr; `before_destroy` hooks inject races; the `prune_pool` fixture fails a test that destroys an empty list.
 - `tests/_raw_support.py` — databases built through the real migrations at a given revision, stamp helpers, `stub_table_ddl()` (stub tables carrying every registered column).
 - `tests/_fake_zfs_check.py` — a read-only fake `zfs` for the `check` tests (snapshot listings and `get -H -o value` from a JSON spec; anything else exits 2).
-- `tests/_openzfs_fixtures.py` — `load_section(version, section)` / `load_m1_summary(version)` over `tests/fixtures/openzfs/{2.1.5,2.2.2,2.4.1}/` (regenerate with `scenarios/test_openzfs_matrix.sh --captures`).
-- When verifying a commit in a `git worktree`, run `PYTHONPATH=<worktree> <venv python> -m pytest`: the editable install otherwise imports the main tree.
+- `tests/_openzfs_fixtures.py` — `load_section(version, section)` / `load_m1_summary(version)` over `tests/fixtures/openzfs/{2.1.5,2.2.2,2.3.9,2.4.1}/` (regenerate with `scenarios/test_openzfs_matrix.sh --captures`).
+- `tests/_cli_support.py` — CLI fixtures over a real DB built by `import` (`isolated`, `db`, `run`, `FakeZfs`, `FakeDaemon`); `tests/_fake_zfs.py` — a JSON-backed fake `zfs` executable (`$FAKEZFS_STATE`); `tests/_editor_stub.py` / `tests/_slow_editor.py` — scripted `$EDITOR`s for the `edit` and signal tests.
+- `tests/_config_handoff.py` (`config_signature`, `Recording*Worker`) and `tests/_reload_workers.py` — importable worker doubles for spawn/forkserver; `tests/_fake_pids.py` — `fake_pid()` above every `pid_max`; `tests/_clock_support.py` — `FakeTime` (patch a module's `time`); `tests/_timer_support.py` — `timer_stretch()` for real-clock bounds; `tests/_leak_probe.py` — the nested session `test_orphan_safety_net.py` runs to leak an orphan.
+- When verifying a commit in a `git worktree`, run `PYTHONPATH=<worktree>:<worktree>/libs/libzfseasy <venv python> -m pytest`: the editable installs otherwise import the main tree.
 
 The `mock_subprocess` fixture in `conftest.py` patches `subprocess.Popen`. Use `mock_subprocess.setup(stdout=[...], stderr='', returncode=0)` for a single call and `mock_subprocess.setup_multi(...)` for sequences.
 
@@ -538,9 +559,9 @@ orchestrates the cycle: subagents cannot call each other, so the main loop drive
 |---|---|---|
 | `zfs-code-reviewer` | opus / high (read-only) | Reviews the current diff for both packages; reports findings |
 | `concurrency-reviewer` | opus / high (read-only) | Depth review of fork-safety, SQLite/WAL, IPC and signal hazards only |
-| `libzfseasy-implementation-planner` | opus / high (read-only) | Turns findings into an ordered plan for `libzfseasy/` |
+| `libzfseasy-implementation-planner` | opus / high (read-only) | Turns findings into an ordered plan for `libs/libzfseasy/` |
 | `zfsbackup-implementation-planner` | opus / high (read-only) | Turns findings into an ordered plan for `zfsbackup/` |
-| `libzfseasy-developer` | sonnet / high | Implements plans in `libzfseasy/types.py`, `zfs.py` |
+| `libzfseasy-developer` | sonnet / high | Implements plans in `libs/libzfseasy/libzfseasy/types.py`, `zfs.py` |
 | `zfsbackup-developer` | sonnet / high | Daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py`, `identity.py` |
 | `zfsbackup-store-developer` | sonnet / high | `zfsbackup/config/store/**` (incl. `store/migrations/`), `alembic.ini` — ORM models, mapper, engine/session, migrations |
 | `zfsbackup-cli-developer` | sonnet / high | `zfsbackup/cli/**` — the `zfsbackup-config` Click application |

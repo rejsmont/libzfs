@@ -1,14 +1,17 @@
 # Release checklist
 
-For a zfsbackup release (the `zfsbackup` distribution, which ships `zfsbackup` and `libzfseasy`). Work through it
+For a zfsbackup release: the `zfsbackup` and `libzfseasy` distributions (same version) and the Debian packages
+`zfsbackup` and `python3-libzfseasy`. Work through it
 on the release branch after the last merge. Every item that touches a VM uses only the `zfsb-*` Multipass VMs.
 
 ## 1. Version and notes
 
-- [ ] Bump `version` in `pyproject.toml` (the only place it is written; `zfsbackup.version.installed_version()`
-      reads it from the installed metadata).
+- [ ] Bump the version in lockstep, in four places (`tests/test_zfsbackup_version.py::TestLockstep` checks the
+      first three): `version` and the `libzfseasy==` pin in `pyproject.toml`, `version` in
+      `libs/libzfseasy/pyproject.toml`, and a new `debian/changelog` entry (`1.0.0~rc2-1` for `1.0.0rc2`: `~`
+      sorts a pre-release first). `zfsbackup.version.installed_version()` reads the installed metadata.
 - [ ] `poetry lock` if dependencies changed; check the pins (`werkzeug <3.2`, `urllib3 <3`, `requests <3`,
-      `sqlalchemy <2.2`) still match what CI tested.
+      `sqlalchemy <2.2`, `simple-websocket <1.2`) still match what CI tested.
 - [ ] Release notes say, explicitly:
   - [ ] whether `PROTOCOL_VERSION` (`zfsbackup/protocol.py`) changed: if it did, **client and server must be
         upgraded together** (an unmatched peer gets 426 and remote backups pause);
@@ -31,24 +34,33 @@ on the release branch after the last merge. Every item that touches a VM uses on
 
 ## 3. Real ZFS
 
-- [ ] OpenZFS matrix: `scenarios/test_openzfs_matrix.sh --only 21,22,24 --extra tests/test_zfsbackup_real.py`
-      (2.1, 2.2 and 2.4). No two matrix runs at once on one VM.
+- [ ] OpenZFS matrix: `scenarios/test_openzfs_matrix.sh --only 21,22,23,24 --extra tests/test_zfsbackup_real.py`
+      (2.1, 2.2, 2.3 on Debian 13, and 2.4). No two matrix runs at once on one VM.
 - [ ] If the zfs output formats might have changed: `scenarios/test_openzfs_matrix.sh --captures-only` and diff
       against `tests/fixtures/openzfs/`; commit refreshed fixtures with the reason.
-- [ ] Two-VM harness, every scenario: `SRC_REF=<release ref> ./scenarios/test_two_vm_backup.sh` (A–M, L1, R).
+- [ ] Two-VM harness, every scenario: `SRC_REF=<release ref> ./scenarios/test_two_vm_backup.sh` (A–M, B2, CK,
+      L1, L2, R).
       Record the result (pass/fail counts, date, OpenZFS version) in `docs/two_vm_backup_report.md`.
 - [ ] `scenarios/test_config_permissions.sh` (the group-operator permission model).
 - [ ] Install scenario on fresh Ubuntu 22.04 (systemd 249, the `pre-253.conf` drop-in) and 24.04 (systemd 255):
-      `scenarios/test_install.sh`, including the upgrade step from the previous release's wheel.
+      `scenarios/test_install.sh`, including the upgrade step (I15) from the previous release
+      (`OLD_REF=<previous release tag>`; the default is `v1.0.0rc1`, the last single-wheel release) and the
+      in-place upgrade (I16).
 
 ## 4. Package
 
-- [ ] `poetry build`: the wheel holds `zfsbackup/` and `libzfseasy/` (with
-      `zfsbackup/config/store/migrations/versions/*.py`) and no `packaging/` or `tests/`; the sdist holds
-      `packaging/` (units, sysusers, tmpfiles).
-- [ ] `zfsbackupd --version` and `zfsbackup-config --version` from a clean venv print the new version, the wire
-      protocol and the schema head.
-- [ ] Tag the release commit and attach the wheel and sdist.
+- [ ] `poetry build` and `poetry build -C libs/libzfseasy -o ../../dist` (the CI `package` job checks the same):
+      the `zfsbackup` wheel holds `zfsbackup/` (with `zfsbackup/config/store/migrations/versions/*.py` and
+      `zfsbackup/_vendor/`) and no `libzfseasy/`, `packaging/` or `tests/`, and requires `libzfseasy==<version>`;
+      the `libzfseasy` wheel holds `libzfseasy/` only; the `zfsbackup` sdist holds `packaging/`.
+- [ ] `zfsbackupd --version` and `zfsbackup-config --version` from a clean venv with both wheels print the new
+      version, the wire protocol and the schema head.
+- [ ] The `.deb`s: the `deb` workflow (`.github/workflows/deb.yml`) is green on the release tag for Debian 13 and
+      Ubuntu 26.04 (build, lintian, install, smoke); take its artifacts. The `.deb` install scenario
+      (`SRC_REF=<release ref> ./scenarios/test_install_deb.sh`: fresh Ubuntu 26.04 and Debian 13 VMs; install,
+      upgrade under a running daemon, dependency trigger, purge, downgrade) passes on both.
+- [ ] Tag the release commit and attach both wheels, both sdists and the two `.deb`s (`Architecture: all`; the
+      Debian 13 and Ubuntu 26.04 builds have identical dependencies, so attach one build, the Debian 13 one).
 
 ## 5. After the release
 

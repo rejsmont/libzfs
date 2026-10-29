@@ -1405,10 +1405,18 @@ class Unkillable:
 class TestHungPoolEndToEnd:
     """A real child that ignores SIGTERM stands for a `zfs` on a hung pool."""
 
+    #: The first exec of a freshly written script costs 0.15-0.5 s on macOS, with spikes, so the
+    #: hang phase gets a budget well above that (the fail-fast assertions below do no exec and
+    #: do not depend on it) and the `zfs-ok` phase a generous one.
+    HANG_BUDGET = 4.0
+    OK_BUDGET = 10.0
+    #: The child writes `ready` only after it ignores TERM; the test checks it exists once the
+    #: budget expired, so "ignores TERM" is a verified premise, not an assumption.
     HANG = (
         "#!{python}\n"
         "import signal, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "open({ready!r}, 'w').close()\n"
         "time.sleep(300)\n"
     )
     MISSING = (
@@ -1423,18 +1431,33 @@ class TestHungPoolEndToEnd:
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
         return str(path)
 
+    def hang_script(self, tmp_path):
+        ready = tmp_path / "hang-ready"
+        return self.script(
+            tmp_path / "zfs-hang", self.HANG.format(python=sys.executable, ready=str(ready))
+        ), ready
+
+    @staticmethod
+    def assert_child_ignored_term(ready):
+        assert ready.exists(), (
+            "the stub never reached signal(SIGTERM, SIG_IGN) within the budget: the test's "
+            "premise (a child that ignores TERM) did not hold, raise HANG_BUDGET"
+        )
+
     def test_after_one_timeout_every_request_fails_fast_until_the_child_exits(
         self, client, authed, tmp_path, monkeypatch, mocker
     ):
-        mocker.patch("zfsbackup.api.ZFS_REQUEST_BUDGET", 0.6)
+        mocker.patch("zfsbackup.api.ZFS_REQUEST_BUDGET", self.HANG_BUDGET)
         monkeypatch.setattr(zfs_module, "_EXPIRY_WAIT", 0.2)
         kids = Unkillable(monkeypatch)
-        monkeypatch.setenv("ZFS_CMD", self.script(tmp_path / "zfs-hang", self.HANG.format(python=sys.executable)))
+        hang, ready = self.hang_script(tmp_path)
+        monkeypatch.setenv("ZFS_CMD", hang)
         try:
             kids.on = True
             started = time.monotonic()
             assert_zfs_timeout(client.get(TOKEN_URL))                 # the first request pays the budget
             assert time.monotonic() - started < 20
+            self.assert_child_ignored_term(ready)
             assert len(kids.procs) == 1 and len(zfs_module._stuck) == 1
             assert streams_in_progress(authed.app) == set()
 
@@ -1452,7 +1475,7 @@ class TestHungPoolEndToEnd:
                 time.sleep(0.02)
             assert kids.procs[0].poll() is not None
             monkeypatch.setenv("ZFS_CMD", self.script(tmp_path / "zfs-ok", self.MISSING))
-            deadline = time.monotonic() + 10
+            mocker.patch("zfsbackup.api.ZFS_REQUEST_BUDGET", self.OK_BUDGET)  # a slow first exec is no hang
             resp = client.get(TOKEN_URL)
             assert resp.status_code == 200 and resp.get_json() == {"resume_token": None}
             assert zfs_module._stuck == []
@@ -1463,12 +1486,15 @@ class TestHungPoolEndToEnd:
         self, client, tmp_path, monkeypatch, mocker
     ):
         """The normal timeout: TERM ignored, KILL lands. The request is a 503 and the NEXT one is not refused."""
-        mocker.patch("zfsbackup.api.ZFS_REQUEST_BUDGET", 0.6)
+        mocker.patch("zfsbackup.api.ZFS_REQUEST_BUDGET", self.HANG_BUDGET)
         monkeypatch.setattr(zfs_module, "_EXPIRY_WAIT", 0.3)
-        monkeypatch.setenv("ZFS_CMD", self.script(tmp_path / "zfs-hang", self.HANG.format(python=sys.executable)))
+        hang, ready = self.hang_script(tmp_path)
+        monkeypatch.setenv("ZFS_CMD", hang)
         assert_zfs_timeout(client.get(TOKEN_URL))
+        self.assert_child_ignored_term(ready)
         assert zfs_module._stuck == []
         monkeypatch.setenv("ZFS_CMD", self.script(tmp_path / "zfs-ok", self.MISSING))
+        mocker.patch("zfsbackup.api.ZFS_REQUEST_BUDGET", self.OK_BUDGET)  # a slow first exec is no hang
         assert client.get(TOKEN_URL).status_code == 200
 
 

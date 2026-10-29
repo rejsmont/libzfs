@@ -1,5 +1,11 @@
 # zfsbackup: SQLite Config Store + Config CLI + Live Reload
 
+> **Status 2026-10-28: historical.** Implemented and merged to master as PR #2 (`9a4cd77`, 2026-10-19). Later
+> milestones changed parts of it: the TLS milestone replaced `client_id_file` with the `host_identity` table and
+> added the trust tables (revision `7c3e9d51b2a8`), milestone B added `dataset_remotes.raw` (`5d2f8a60c1e4`, the
+> current head), and milestone C added `backup`, `check` and `migrate --backup-dir`. The current description is
+> CLAUDE.md ("config/store", "cli", "Live reload") and [zfsbackup/README.md](../zfsbackup/README.md).
+
 **Status (2026-10-18):** Phases 0, 1 and 2 **implemented** on branch `config-db-cli` (Checkpoint A held
 2026-10-17 with fix-up A-1…A-21; Phase 2 items 10–16 landed 2026-10-17/18); mocked suite 3810 passed.
 **Checkpoint B review held 2026-10-18** (Phase 2 sound; close-out fixes landed). **Phase 3 (live

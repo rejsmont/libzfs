@@ -1,0 +1,10 @@
+zfsbackup (1.0.0~rc1-1) unstable; urgency=medium
+
+  * First release candidate of 1.0.0, packaged for Debian 13 and Ubuntu 26.04
+    with distribution Python dependencies (no bundled virtualenv).
+  * Binary packages: python3-libzfseasy (the ZFS bindings) and zfsbackup
+    (the daemon and zfsbackup-config).
+  * The services are neither enabled nor started on installation, and
+    /var/lib/zfsbackup (configuration database, TLS keys) is never removed.
+
+ -- Radoslaw Kamil Ejsmont <radoslaw@ejsmont.net>  Wed, 28 Oct 2026 12:00:00 +0000

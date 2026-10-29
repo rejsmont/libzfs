@@ -2,11 +2,25 @@
 
 ## Status / implementation notes (2026-10-20)
 
-**Status 2026-10-22:** merged to master as PR #4 (`609df66`); scenario K passed in the two-VM harness. Later
-changes to the wire contract (the `X-Zfsbackup-Protocol` header and 426, `protocol` in `/whoami`/`/enroll`/`/rotate`,
-the removed info endpoints) are in [production_readiness_plan.md](production_readiness_plan.md) milestone A.
-Milestone C (B-2b, additive, protocol still 1): negotiate answers `server_newer` and `server_newer_count` (or `server_newer_unknown: true`); `/stream`
-takes `from_guid` and `discard`, and refuses with `reason` `server_newer`, `base_missing`, `no_common` or `listing` (see CLAUDE.md).
+**Status 2026-10-28: implemented, historical.** Merged to master as PR #4 (`609df66`, 2026-10-21); scenario K
+passed in the two-VM harness (the M17 run was recorded on 2026-10-21, 231 / 0, in
+[two_vm_backup_report.md](two_vm_backup_report.md)). Of the deferrals listed below, mid-stream revocation and
+`/enroll` rate limiting were done in milestone D (S-2, S-3), raw sends in milestone B (S-6), and
+`TestRealSendReceive` was rewritten in milestone A. The current description is CLAUDE.md ("TLS, authentication
+and enrollment") and `zfsbackup/README.md`. The wire contract at the end of this file is the 2026-10-20 state;
+later changes, all within protocol 1:
+- milestone A ([production_readiness_plan.md](production_readiness_plan.md)): the `X-Zfsbackup-Protocol` header
+  and 426 on every endpoint but `/health` (on `/enroll` checked first), `protocol` in the `/whoami`, `/enroll`
+  and `/rotate` replies, the removed info endpoints;
+- milestone B: negotiate answers `server_copy` (`none|plain|raw`);
+- milestone C (B-2b): negotiate answers `server_newer` and `server_newer_count` (or `server_newer_unknown: true`);
+  `/stream` takes `from_guid` and `discard`, and refuses with `reason` `server_newer`, `base_missing`, `no_common`
+  or `listing` (see CLAUDE.md);
+- milestone D: `/enroll` answers 429 `rate_limited` (with `Retry-After`) after 5 failures from an address in
+  15 min, and 503 `busy` past its in-flight cap (checked after the signature, before the token pre-check);
+  `/stream` refuses a bad header with `stream_header` or `base_mismatch` (B-2a); negotiate, `/stream` and
+  `/resume_token` refuse a dataset without a local `client_id` with 409 (B-2c); a `zfs` call over the
+  per-request budget answers 503 `zfs_timeout` (S-14).
 
 **Implemented**: M1–M16 and M18 on branch `tls-mtls`, uncommitted at the time of writing. M17 (the two-VM
 harness over TLS, scenario K) is written; its first real run is still to be recorded in

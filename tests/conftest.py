@@ -1049,6 +1049,42 @@ def real_contention_window(monkeypatch, _short_daemonlock_contention_window):
     return _short_daemonlock_contention_window
 
 
+@pytest.fixture(autouse=True)
+def _no_forkserver_stop_in_process_runs(monkeypatch):
+    """Turns `BackupDaemon._stop_forkserver` into a no-op for every test.
+
+    `BackupDaemon.run()` ends by stopping the multiprocessing forkserver of
+    ITS process. Under Linux/Python 3.14 (where `forkserver` is the default
+    start method) an in-process `run()` in a test would stop pytest's own
+    process-global forkserver if an earlier test started one: it would wait
+    `FORKSERVER_STOP_TIMEOUT` (and warn) while another test's forkserver child
+    is alive, and leave the forgotten forkserver as a zombie of pytest for
+    every later test. Subprocess daemons are not affected: they import the
+    module themselves. `tests/test_zfsbackup_forkserver_stop.py` opts back in
+    with `real_stop_forkserver`. Yields the production function.
+    """
+    import sys
+
+    daemon = sys.modules.get("zfsbackup.daemon")
+    if daemon is None:
+        yield None
+        return
+    production = daemon.BackupDaemon._stop_forkserver
+    monkeypatch.setattr(daemon.BackupDaemon, "_stop_forkserver", lambda self: None)
+    yield production
+
+
+@pytest.fixture
+def real_stop_forkserver(monkeypatch, _no_forkserver_stop_in_process_runs):
+    """Restore the real `BackupDaemon._stop_forkserver` for this test (depends
+    on the autouse no-op, so it runs after it and wins)."""
+    from zfsbackup.daemon import BackupDaemon
+
+    monkeypatch.setattr(
+        BackupDaemon, "_stop_forkserver", _no_forkserver_stop_in_process_runs
+    )
+
+
 @pytest.fixture
 def forbid_db(mocker):
     """Arms every way the config database could be opened from the process

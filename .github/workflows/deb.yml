@@ -1,0 +1,137 @@
+name: deb
+
+# Builds the Debian packages (debian/: python3-libzfseasy and zfsbackup, both
+# Architecture: all) for the two distributions they target, Debian 13 and Ubuntu
+# 26.04, in a container of each, with the DISTRIBUTION's Python dependencies
+# (docs/packaging_plan.md, strategy A). Per distribution it
+#
+#   1. installs the build dependencies and builds the binary packages
+#      (dpkg-buildpackage -b -us -uc: no source package, no orig tarball),
+#   2. runs lintian and fails on errors and warnings,
+#   3. installs the .debs with apt, which proves their Depends: resolve from the
+#      archive (Debian's zfsutils-linux is in contrib),
+#   4. runs the autopkgtest scripts by hand: the smoke test (both console scripts,
+#      an import of the example configuration, --test-config) and the
+#      platform-contract tests against the distribution's own flask, werkzeug,
+#      simple-websocket, websocket-client, requests, urllib3 and cryptography,
+#   5. uploads the .debs as an artifact.
+#
+# It does NOT attach anything to a GitHub release: the release checklist does
+# that by hand. The mocked suite is not run here (tests.yml does that); the
+# packages are tested as installed, not as a source tree.
+#
+# The weekly schedule is what catches a distribution update that moves an
+# internal zfsbackup overrides (werkzeug, urllib3, simple-websocket, ...): the
+# platform-contract step fails and names the internal. The pull-request filter
+# covers everything the packages are built from and tested with.
+#
+# Nothing here needs a pool or a kernel module: the installed zfs and zpool
+# binaries are never run (the smoke test points ZFS_CMD/ZPOOL_CMD at /bin/false).
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  schedule:
+    # Mondays 05:17 UTC, off the hour and an hour after latest-deps.
+    - cron: "17 5 * * 1"
+  pull_request:
+    paths:
+      - "zfsbackup/**"
+      - "libs/**"
+      - "debian/**"
+      - "packaging/**"
+      - "pyproject.toml"
+      - "libs/libzfseasy/pyproject.toml"
+      - "tests/test_zfsbackup_platform_contracts.py"
+      - "tests/test_zfsbackup_tls_platform.py"
+      - ".github/workflows/deb.yml"
+
+permissions:
+  contents: read
+
+# A superseded run tells you nothing; cancel it rather than pay for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deb:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: ${{ matrix.image }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    strategy:
+      # Which distribution broke matters more than the first failure.
+      fail-fast: false
+      matrix:
+        include:
+          - name: debian-13
+            image: "debian:13"
+          - name: ubuntu-26.04
+            image: "ubuntu:26.04"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ZFS userland is in Debian's contrib component (python3-libzfseasy
+      # depends on it); Ubuntu has it in main.
+      - name: Enable contrib (Debian)
+        run: |
+          if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+            sed -i 's/^Components: main$/Components: main contrib/' /etc/apt/sources.list.d/debian.sources
+          fi
+
+      - name: Install the build tools and the build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential devscripts equivs fakeroot dpkg-dev lintian
+          apt-get build-dep -y --no-install-recommends ./
+
+      - name: Build the binary packages
+        run: |
+          dpkg-buildpackage -b -us -uc
+          mkdir -p out
+          mv ../*.deb ../*.changes ../*.buildinfo out/
+          ls -l out
+
+      - name: Show what the packages declare
+        run: |
+          for d in out/*.deb; do
+            echo "=== $d"
+            dpkg-deb -f "$d" Package Version Architecture Depends
+            dpkg-deb -c "$d" | grep -E 'usr/bin/|systemd|sysusers|tmpfiles|dist-info/' || true
+          done
+
+      # --profile debian: Ubuntu's lintian would reject the changelog distribution
+      # "unstable" (the same package is built on both).
+      - name: Lintian
+        run: lintian --profile debian --info --fail-on error,warning out/*.changes
+
+      - name: Install the packages from the archive's dependencies
+        run: |
+          apt-get install -y --no-install-recommends ./out/python3-libzfseasy_*.deb ./out/zfsbackup_*.deb
+          dpkg -l python3-libzfseasy zfsbackup
+
+      # debian/tests/smoke is the autopkgtest of the same name; it runs from a
+      # scratch directory against the installed packages.
+      - name: Smoke test the installed packages
+        run: sh -eux debian/tests/smoke
+
+      - name: Platform-contract tests against the distribution's libraries
+        run: |
+          apt-get install -y --no-install-recommends python3-pytest python3-pytest-mock
+          sh -eux debian/tests/platform-contracts
+
+      - name: Upload the packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.name }}
+          path: |
+            out/*.deb
+            out/*.changes
+            out/*.buildinfo
+          if-no-files-found: error

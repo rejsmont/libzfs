@@ -21,8 +21,13 @@ from the **repo root** as `./scenarios/<script>.sh`.
   Same delegation model the pytest `auto_zfs_pool` fixture uses, but standalone.
 - `create_test_pool.sh` — temp-file pool with nested `mountpoint=none` datasets matching
   `zfsbackup/config.example.yaml`.
-- `test_pool.sh` — ad-hoc scratch pool for manual experimentation.
 - `test_two_vm_backup.sh` — the flagship end-to-end harness.
+- `test_openzfs_matrix.sh` — the `real_zfs` pytest tier and the format captures on OpenZFS 2.1, 2.2, 2.3 (a Debian 13 VM) and 2.4
+  (`zfsb-zfs21/22/24`; captures become `tests/fixtures/openzfs/`).
+- `test_config_permissions.sh` — the config store's group-operator permission model on real Linux.
+- `test_install.sh` — the documented install, upgrade and in-place upgrade on real systemd (`zfsb-inst22`,
+  `zfsb-inst24`).
+- `test_hung_pool.sh` — libzfseasy's watchdog and `timeout()` against a really hung pool (`zfsb-hang`).
 
 ## The two-VM harness — `test_two_vm_backup.sh`
 
@@ -33,8 +38,10 @@ bridge) — not the single-VM zfs-CLI routing the pytest suite uses. Same daemon
 role is decided purely by config (server = `remote_backup.enabled` + `target_dataset`, `api_host
 0.0.0.0`; client = `datasets[].remote` + destinations). Deliberately short, human-followable
 schedule (seconds/minutes). Scenarios: **A** full initial transfer, **B** incremental, **C**
-server-down resilience + catch-up, **D** client-restart persistence / incremental resume. Flags:
-`--keep`, `--keep-pools`, `--purge`. The file is sectioned by box-drawing comment banners; keep new
+server-down resilience + catch-up, **D** client-restart persistence / incremental resume, then E–M, B2, CK,
+L1, L2 and R (live reload, resume, TLS trust, trust boundary, hostile streams, raw sends, `check`, restore;
+the script header lists them). Flags: `--keep`, `--keep-pools`, `--purge`, `--no-big`, `--only-X`/`--no-X`;
+`SRC_REF=` picks the shipped tree. The file is sectioned by box-drawing comment banners; keep new
 code within the matching section and reuse the `mexec`/`msh` helpers.
 
 ## macOS / Multipass gotchas — internalize these
@@ -55,7 +62,7 @@ memories.)
 
 The API is HTTPS-only with mutual TLS (milestone 3): a client must be enrolled (`trust token create` on the server,
 `enroll --token-file` on the client, as root) before it can back up, and health probes need `curl -k https://`.
-The residual caveats (werkzeug development server, no `/enroll` rate limiting) are in
+The residual caveats (werkzeug's server, a trusted client can postpone a reload) are in
 `docs/production_readiness_report.md`. (`requests` is declared in `pyproject.toml`; the harness still installs it
 explicitly in the guests.)
 

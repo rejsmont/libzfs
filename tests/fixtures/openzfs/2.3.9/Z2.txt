@@ -1,0 +1,1025 @@
+##### SECTION Z2 (-o org.zfsbackup:{config,client_id,source_dataset} on raw full / incremental / resumed full / resumed incremental; -o readonly/canmount/volmode on raw)  tag=C  zfs-2.3.9-0+deb13u1
+=== CASE Z2/10_raw_full
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/full
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/10a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/full
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/full	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/full	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/full	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/full	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/full	encryptionroot	zfsbcapc/Z2/srv/full	-	-
+zfsbcapc/Z2/srv/full	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/full	canmount	on	-	default
+zfsbcapc/Z2/srv/full	readonly	off	-	default
+zfsbcapc/Z2/srv/full	volmode	default	-	default
+zfsbcapc/Z2/srv/full	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/20_incr_base
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/incr_diff
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/20a_incr_diff
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@a zfsbcapc/Z2/cs/enc@b | zfs receive -F -s -u -o org.zfsbackup:config=ZGlmZmVyZW50 -o org.zfsbackup:client_id=client-2 -o org.zfsbackup:source_dataset=pool/other zfsbcapc/Z2/srv/incr_diff
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/20b_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/incr_diff
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/incr_diff	org.zfsbackup:config	ZGlmZmVyZW50	-	local
+zfsbcapc/Z2/srv/incr_diff	org.zfsbackup:client_id	client-2	-	local
+zfsbcapc/Z2/srv/incr_diff	org.zfsbackup:source_dataset	pool/other	-	local
+zfsbcapc/Z2/srv/incr_diff	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/incr_diff	encryptionroot	zfsbcapc/Z2/srv/incr_diff	-	-
+zfsbcapc/Z2/srv/incr_diff	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/incr_diff	canmount	on	-	default
+zfsbcapc/Z2/srv/incr_diff	readonly	off	-	default
+zfsbcapc/Z2/srv/incr_diff	volmode	default	-	default
+zfsbcapc/Z2/srv/incr_diff	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/21_incr_base
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/incr_same
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/21a_incr_same
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@a zfsbcapc/Z2/cs/enc@b | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/incr_same
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/21b_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/incr_same
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/incr_same	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/incr_same	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/incr_same	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/incr_same	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/incr_same	encryptionroot	zfsbcapc/Z2/srv/incr_same	-	-
+zfsbcapc/Z2/srv/incr_same	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/incr_same	canmount	on	-	default
+zfsbcapc/Z2/srv/incr_same	readonly	off	-	default
+zfsbcapc/Z2/srv/incr_same	volmode	default	-	default
+zfsbcapc/Z2/srv/incr_same	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/22_incr_base
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/incr_none
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/22a_incr_none
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@a zfsbcapc/Z2/cs/enc@b | zfs receive -F -s -u zfsbcapc/Z2/srv/incr_none
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/22b_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/incr_none
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/incr_none	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/incr_none	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/incr_none	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/incr_none	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/incr_none	encryptionroot	zfsbcapc/Z2/srv/incr_none	-	-
+zfsbcapc/Z2/srv/incr_none	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/incr_none	canmount	on	-	default
+zfsbcapc/Z2/srv/incr_none	readonly	off	-	default
+zfsbcapc/Z2/srv/incr_none	volmode	default	-	default
+zfsbcapc/Z2/srv/incr_none	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/30_same.1_cut
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/rfull_same
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d138902e0-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406863dfbb3bb6fbea83c668024cf0996cf4bcc4d6560a84a2b4e4a4e2c48d68f32d24f2ed64fcd4b76488499c7cd80707f727e6e41516a71717e36444c02ea1e987c5162394c8a0100896820f8
+=== END
+=== CASE Z2/30_same.2_props_partial
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rfull_same
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rfull_same	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/rfull_same	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/rfull_same	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/rfull_same	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rfull_same	encryptionroot	zfsbcapc/Z2/srv/rfull_same	-	-
+zfsbcapc/Z2/srv/rfull_same	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rfull_same	canmount	on	-	default
+zfsbcapc/Z2/srv/rfull_same	readonly	off	-	default
+zfsbcapc/Z2/srv/rfull_same	volmode	default	-	default
+zfsbcapc/Z2/srv/rfull_same	receive_resume_token	1-d138902e0-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406863dfbb3bb6fbea83c668024cf0996cf4bcc4d6560a84a2b4e4a4e2c48d68f32d24f2ed64fcd4b76488499c7cd80707f727e6e41516a71717e36444c02ea1e987c5162394c8a0100896820f8	-	-
+--- stderr
+=== END
+=== CASE Z2/30_same.3_resume
+--- cmd
+zfs send -t 1-d138902e0-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406863dfbb3bb6fbea83c668024cf0996cf4bcc4d6560a84a2b4e4a4e2c48d68f32d24f2ed64fcd4b76488499c7cd80707f727e6e41516a71717e36444c02ea1e987c5162394c8a0100896820f8 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/rfull_same
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/30_same.4_props_final
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rfull_same
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rfull_same	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/rfull_same	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/rfull_same	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/rfull_same	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rfull_same	encryptionroot	zfsbcapc/Z2/srv/rfull_same	-	-
+zfsbcapc/Z2/srv/rfull_same	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rfull_same	canmount	on	-	default
+zfsbcapc/Z2/srv/rfull_same	readonly	off	-	default
+zfsbcapc/Z2/srv/rfull_same	volmode	default	-	default
+zfsbcapc/Z2/srv/rfull_same	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/30_same.5_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z2/srv/rfull_same
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rfull_same@a	14301718112736362428	3294
+--- stderr
+=== END
+=== CASE Z2/30_none.1_cut
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/rfull_none
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d138902e0-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406863dfbb3bb6fbea83c668024cf0996cf4bcc4d6560a84a2b4e4a4e2c48d68f32d24f2ed64fcd4b76488499c7cd80707f727e6e41516a71717e36444c02ea1e987c5162394c8a0100896820f8
+=== END
+=== CASE Z2/30_none.2_props_partial
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rfull_none
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rfull_none	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/rfull_none	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/rfull_none	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/rfull_none	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rfull_none	encryptionroot	zfsbcapc/Z2/srv/rfull_none	-	-
+zfsbcapc/Z2/srv/rfull_none	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rfull_none	canmount	on	-	default
+zfsbcapc/Z2/srv/rfull_none	readonly	off	-	default
+zfsbcapc/Z2/srv/rfull_none	volmode	default	-	default
+zfsbcapc/Z2/srv/rfull_none	receive_resume_token	1-d138902e0-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406863dfbb3bb6fbea83c668024cf0996cf4bcc4d6560a84a2b4e4a4e2c48d68f32d24f2ed64fcd4b76488499c7cd80707f727e6e41516a71717e36444c02ea1e987c5162394c8a0100896820f8	-	-
+--- stderr
+=== END
+=== CASE Z2/30_none.3_resume
+--- cmd
+zfs send -t 1-d138902e0-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406863dfbb3bb6fbea83c668024cf0996cf4bcc4d6560a84a2b4e4a4e2c48d68f32d24f2ed64fcd4b76488499c7cd80707f727e6e41516a71717e36444c02ea1e987c5162394c8a0100896820f8 | zfs receive -F -s -u  zfsbcapc/Z2/srv/rfull_none
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/30_none.4_props_final
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rfull_none
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rfull_none	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/rfull_none	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/rfull_none	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/rfull_none	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rfull_none	encryptionroot	zfsbcapc/Z2/srv/rfull_none	-	-
+zfsbcapc/Z2/srv/rfull_none	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rfull_none	canmount	on	-	default
+zfsbcapc/Z2/srv/rfull_none	readonly	off	-	default
+zfsbcapc/Z2/srv/rfull_none	volmode	default	-	default
+zfsbcapc/Z2/srv/rfull_none	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/30_none.5_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z2/srv/rfull_none
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rfull_none@a	14301718112736362428	3303
+--- stderr
+=== END
+=== CASE Z2/30_diff.1_cut
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/rfull_diff
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d138902e0-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406863dfbb3bb6fbea83c668024cf0996cf4bcc4d6560a84a2b4e4a4e2c48d68f32d24f2ed64fcd4b76488499c7cd80707f727e6e41516a71717e36444c02ea1e987c5162394c8a0100896820f8
+=== END
+=== CASE Z2/30_diff.2_props_partial
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rfull_diff
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rfull_diff	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/rfull_diff	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/rfull_diff	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/rfull_diff	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rfull_diff	encryptionroot	zfsbcapc/Z2/srv/rfull_diff	-	-
+zfsbcapc/Z2/srv/rfull_diff	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rfull_diff	canmount	on	-	default
+zfsbcapc/Z2/srv/rfull_diff	readonly	off	-	default
+zfsbcapc/Z2/srv/rfull_diff	volmode	default	-	default
+zfsbcapc/Z2/srv/rfull_diff	receive_resume_token	1-d138902e0-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406863dfbb3bb6fbea83c668024cf0996cf4bcc4d6560a84a2b4e4a4e2c48d68f32d24f2ed64fcd4b76488499c7cd80707f727e6e41516a71717e36444c02ea1e987c5162394c8a0100896820f8	-	-
+--- stderr
+=== END
+=== CASE Z2/30_diff.3_resume
+--- cmd
+zfs send -t 1-d138902e0-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406863dfbb3bb6fbea83c668024cf0996cf4bcc4d6560a84a2b4e4a4e2c48d68f32d24f2ed64fcd4b76488499c7cd80707f727e6e41516a71717e36444c02ea1e987c5162394c8a0100896820f8 | zfs receive -F -s -u -o org.zfsbackup:config=ZGlmZmVyZW50 -o org.zfsbackup:client_id=client-2 -o org.zfsbackup:source_dataset=pool/other zfsbcapc/Z2/srv/rfull_diff
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/30_diff.4_props_final
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rfull_diff
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rfull_diff	org.zfsbackup:config	ZGlmZmVyZW50	-	local
+zfsbcapc/Z2/srv/rfull_diff	org.zfsbackup:client_id	client-2	-	local
+zfsbcapc/Z2/srv/rfull_diff	org.zfsbackup:source_dataset	pool/other	-	local
+zfsbcapc/Z2/srv/rfull_diff	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rfull_diff	encryptionroot	zfsbcapc/Z2/srv/rfull_diff	-	-
+zfsbcapc/Z2/srv/rfull_diff	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rfull_diff	canmount	on	-	default
+zfsbcapc/Z2/srv/rfull_diff	readonly	off	-	default
+zfsbcapc/Z2/srv/rfull_diff	volmode	default	-	default
+zfsbcapc/Z2/srv/rfull_diff	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/30_diff.5_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z2/srv/rfull_diff
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rfull_diff@a	14301718112736362428	3313
+--- stderr
+=== END
+=== CASE Z2/31_same.0_base
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/rincr_same
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/31_same.1_cut
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@a zfsbcapc/Z2/cs/enc@b | head -c 500000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/rincr_same
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-13627bbefc-120-789c636064000310a501c49c50360710a715e5e7a69766a63040c19efdd9dd375f541e5300b2d991d4e52765a5269730303043d561c8a7a515a796806458e0f26c48f2499525a9c540fa8d301b56fd25f91057f4df0cffaa33db24c100499e132c9f97989bcac05095569c949c5890ac1f65a49f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300f6672923
+=== END
+=== CASE Z2/31_same.2_props_partial
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rincr_same
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rincr_same	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/rincr_same	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/rincr_same	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/rincr_same	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rincr_same	encryptionroot	zfsbcapc/Z2/srv/rincr_same	-	-
+zfsbcapc/Z2/srv/rincr_same	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rincr_same	canmount	on	-	default
+zfsbcapc/Z2/srv/rincr_same	readonly	off	-	default
+zfsbcapc/Z2/srv/rincr_same	volmode	default	-	default
+zfsbcapc/Z2/srv/rincr_same	receive_resume_token	1-13627bbefc-120-789c636064000310a501c49c50360710a715e5e7a69766a63040c19efdd9dd375f541e5300b2d991d4e52765a5269730303043d561c8a7a515a796806458e0f26c48f2499525a9c540fa8d301b56fd25f91057f4df0cffaa33db24c100499e132c9f97989bcac05095569c949c5890ac1f65a49f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300f6672923	-	-
+--- stderr
+=== END
+=== CASE Z2/31_same.3_resume
+--- cmd
+zfs send -t 1-13627bbefc-120-789c636064000310a501c49c50360710a715e5e7a69766a63040c19efdd9dd375f541e5300b2d991d4e52765a5269730303043d561c8a7a515a796806458e0f26c48f2499525a9c540fa8d301b56fd25f91057f4df0cffaa33db24c100499e132c9f97989bcac05095569c949c5890ac1f65a49f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300f6672923 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/rincr_same
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/31_same.4_props_final
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rincr_same
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rincr_same	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/rincr_same	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/rincr_same	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/rincr_same	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rincr_same	encryptionroot	zfsbcapc/Z2/srv/rincr_same	-	-
+zfsbcapc/Z2/srv/rincr_same	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rincr_same	canmount	on	-	default
+zfsbcapc/Z2/srv/rincr_same	readonly	off	-	default
+zfsbcapc/Z2/srv/rincr_same	volmode	default	-	default
+zfsbcapc/Z2/srv/rincr_same	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/31_same.5_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z2/srv/rincr_same
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rincr_same@a	14301718112736362428	3317
+zfsbcapc/Z2/srv/rincr_same@b	6932336343827077519	3328
+--- stderr
+=== END
+=== CASE Z2/31_none.0_base
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/rincr_none
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/31_none.1_cut
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@a zfsbcapc/Z2/cs/enc@b | head -c 500000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/rincr_none
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-13627bbefc-120-789c636064000310a501c49c50360710a715e5e7a69766a63040c19efdd9dd375f541e5300b2d991d4e52765a5269730303043d561c8a7a515a796806458e0f26c48f2499525a9c540fa8d301b56fd25f91057f4df0cffaa33db24c100499e132c9f97989bcac05095569c949c5890ac1f65a49f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300f6672923
+=== END
+=== CASE Z2/31_none.2_props_partial
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rincr_none
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rincr_none	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/rincr_none	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/rincr_none	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/rincr_none	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rincr_none	encryptionroot	zfsbcapc/Z2/srv/rincr_none	-	-
+zfsbcapc/Z2/srv/rincr_none	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rincr_none	canmount	on	-	default
+zfsbcapc/Z2/srv/rincr_none	readonly	off	-	default
+zfsbcapc/Z2/srv/rincr_none	volmode	default	-	default
+zfsbcapc/Z2/srv/rincr_none	receive_resume_token	1-13627bbefc-120-789c636064000310a501c49c50360710a715e5e7a69766a63040c19efdd9dd375f541e5300b2d991d4e52765a5269730303043d561c8a7a515a796806458e0f26c48f2499525a9c540fa8d301b56fd25f91057f4df0cffaa33db24c100499e132c9f97989bcac05095569c949c5890ac1f65a49f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300f6672923	-	-
+--- stderr
+=== END
+=== CASE Z2/31_none.3_resume
+--- cmd
+zfs send -t 1-13627bbefc-120-789c636064000310a501c49c50360710a715e5e7a69766a63040c19efdd9dd375f541e5300b2d991d4e52765a5269730303043d561c8a7a515a796806458e0f26c48f2499525a9c540fa8d301b56fd25f91057f4df0cffaa33db24c100499e132c9f97989bcac05095569c949c5890ac1f65a49f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300f6672923 | zfs receive -F -s -u  zfsbcapc/Z2/srv/rincr_none
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/31_none.4_props_final
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rincr_none
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rincr_none	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/rincr_none	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/rincr_none	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/rincr_none	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rincr_none	encryptionroot	zfsbcapc/Z2/srv/rincr_none	-	-
+zfsbcapc/Z2/srv/rincr_none	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rincr_none	canmount	on	-	default
+zfsbcapc/Z2/srv/rincr_none	readonly	off	-	default
+zfsbcapc/Z2/srv/rincr_none	volmode	default	-	default
+zfsbcapc/Z2/srv/rincr_none	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/31_none.5_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z2/srv/rincr_none
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rincr_none@a	14301718112736362428	3332
+zfsbcapc/Z2/srv/rincr_none@b	6932336343827077519	3342
+--- stderr
+=== END
+=== CASE Z2/31_diff.0_base
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/rincr_diff
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/31_diff.1_cut
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@a zfsbcapc/Z2/cs/enc@b | head -c 500000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/rincr_diff
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-13627bbefc-120-789c636064000310a501c49c50360710a715e5e7a69766a63040c19efdd9dd375f541e5300b2d991d4e52765a5269730303043d561c8a7a515a796806458e0f26c48f2499525a9c540fa8d301b56fd25f91057f4df0cffaa33db24c100499e132c9f97989bcac05095569c949c5890ac1f65a49f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300f6672923
+=== END
+=== CASE Z2/31_diff.2_props_partial
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rincr_diff
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rincr_diff	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/rincr_diff	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/rincr_diff	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/rincr_diff	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rincr_diff	encryptionroot	zfsbcapc/Z2/srv/rincr_diff	-	-
+zfsbcapc/Z2/srv/rincr_diff	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rincr_diff	canmount	on	-	default
+zfsbcapc/Z2/srv/rincr_diff	readonly	off	-	default
+zfsbcapc/Z2/srv/rincr_diff	volmode	default	-	default
+zfsbcapc/Z2/srv/rincr_diff	receive_resume_token	1-13627bbefc-120-789c636064000310a501c49c50360710a715e5e7a69766a63040c19efdd9dd375f541e5300b2d991d4e52765a5269730303043d561c8a7a515a796806458e0f26c48f2499525a9c540fa8d301b56fd25f91057f4df0cffaa33db24c100499e132c9f97989bcac05095569c949c5890ac1f65a49f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300f6672923	-	-
+--- stderr
+=== END
+=== CASE Z2/31_diff.3_resume
+--- cmd
+zfs send -t 1-13627bbefc-120-789c636064000310a501c49c50360710a715e5e7a69766a63040c19efdd9dd375f541e5300b2d991d4e52765a5269730303043d561c8a7a515a796806458e0f26c48f2499525a9c540fa8d301b56fd25f91057f4df0cffaa33db24c100499e132c9f97989bcac05095569c949c5890ac1f65a49f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300f6672923 | zfs receive -F -s -u -o org.zfsbackup:config=ZGlmZmVyZW50 -o org.zfsbackup:client_id=client-2 -o org.zfsbackup:source_dataset=pool/other zfsbcapc/Z2/srv/rincr_diff
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/31_diff.4_props_final
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/rincr_diff
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rincr_diff	org.zfsbackup:config	ZGlmZmVyZW50	-	local
+zfsbcapc/Z2/srv/rincr_diff	org.zfsbackup:client_id	client-2	-	local
+zfsbcapc/Z2/srv/rincr_diff	org.zfsbackup:source_dataset	pool/other	-	local
+zfsbcapc/Z2/srv/rincr_diff	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/rincr_diff	encryptionroot	zfsbcapc/Z2/srv/rincr_diff	-	-
+zfsbcapc/Z2/srv/rincr_diff	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/rincr_diff	canmount	on	-	default
+zfsbcapc/Z2/srv/rincr_diff	readonly	off	-	default
+zfsbcapc/Z2/srv/rincr_diff	volmode	default	-	default
+zfsbcapc/Z2/srv/rincr_diff	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/31_diff.5_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z2/srv/rincr_diff
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/rincr_diff@a	14301718112736362428	3346
+zfsbcapc/Z2/srv/rincr_diff@b	6932336343827077519	3357
+--- stderr
+=== END
+=== CASE Z2/40_readonly.1_raw_full
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z2/srv/ro_readonly
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/40_readonly.2_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/ro_readonly
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/ro_readonly	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/ro_readonly	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/ro_readonly	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/ro_readonly	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/ro_readonly	encryptionroot	zfsbcapc/Z2/srv/ro_readonly	-	-
+zfsbcapc/Z2/srv/ro_readonly	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/ro_readonly	canmount	on	-	default
+zfsbcapc/Z2/srv/ro_readonly	readonly	on	-	local
+zfsbcapc/Z2/srv/ro_readonly	volmode	default	-	default
+zfsbcapc/Z2/srv/ro_readonly	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/40_readonly.3_raw_incr
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@a zfsbcapc/Z2/cs/enc@b | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z2/srv/ro_readonly
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/40_readonly.4_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/ro_readonly
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/ro_readonly	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/ro_readonly	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/ro_readonly	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/ro_readonly	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/ro_readonly	encryptionroot	zfsbcapc/Z2/srv/ro_readonly	-	-
+zfsbcapc/Z2/srv/ro_readonly	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/ro_readonly	canmount	on	-	default
+zfsbcapc/Z2/srv/ro_readonly	readonly	on	-	local
+zfsbcapc/Z2/srv/ro_readonly	volmode	default	-	default
+zfsbcapc/Z2/srv/ro_readonly	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/40_canmount.1_raw_full
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o canmount=noauto zfsbcapc/Z2/srv/ro_canmount
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/40_canmount.2_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/ro_canmount
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/ro_canmount	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/ro_canmount	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/ro_canmount	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/ro_canmount	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/ro_canmount	encryptionroot	zfsbcapc/Z2/srv/ro_canmount	-	-
+zfsbcapc/Z2/srv/ro_canmount	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/ro_canmount	canmount	noauto	-	local
+zfsbcapc/Z2/srv/ro_canmount	readonly	off	-	default
+zfsbcapc/Z2/srv/ro_canmount	volmode	default	-	default
+zfsbcapc/Z2/srv/ro_canmount	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/40_canmount.3_raw_incr
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@a zfsbcapc/Z2/cs/enc@b | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o canmount=noauto zfsbcapc/Z2/srv/ro_canmount
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/40_canmount.4_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/ro_canmount
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/ro_canmount	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/ro_canmount	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/ro_canmount	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/ro_canmount	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/ro_canmount	encryptionroot	zfsbcapc/Z2/srv/ro_canmount	-	-
+zfsbcapc/Z2/srv/ro_canmount	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/ro_canmount	canmount	noauto	-	local
+zfsbcapc/Z2/srv/ro_canmount	readonly	off	-	default
+zfsbcapc/Z2/srv/ro_canmount	volmode	default	-	default
+zfsbcapc/Z2/srv/ro_canmount	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/40_volmode.1_raw_full
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o volmode=none zfsbcapc/Z2/srv/ro_volmode
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/40_volmode.2_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/ro_volmode
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/ro_volmode	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/ro_volmode	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/ro_volmode	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/ro_volmode	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/ro_volmode	encryptionroot	zfsbcapc/Z2/srv/ro_volmode	-	-
+zfsbcapc/Z2/srv/ro_volmode	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/ro_volmode	canmount	on	-	default
+zfsbcapc/Z2/srv/ro_volmode	readonly	off	-	default
+zfsbcapc/Z2/srv/ro_volmode	volmode	none	-	local
+zfsbcapc/Z2/srv/ro_volmode	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/40_volmode.3_raw_incr
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@a zfsbcapc/Z2/cs/enc@b | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o volmode=none zfsbcapc/Z2/srv/ro_volmode
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/40_volmode.4_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/ro_volmode
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/ro_volmode	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/ro_volmode	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/ro_volmode	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/ro_volmode	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/ro_volmode	encryptionroot	zfsbcapc/Z2/srv/ro_volmode	-	-
+zfsbcapc/Z2/srv/ro_volmode	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/ro_volmode	canmount	on	-	default
+zfsbcapc/Z2/srv/ro_volmode	readonly	off	-	default
+zfsbcapc/Z2/srv/ro_volmode	volmode	none	-	local
+zfsbcapc/Z2/srv/ro_volmode	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/40_all3.1_raw_full
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on -o canmount=noauto -o volmode=none zfsbcapc/Z2/srv/ro_all3
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/40_all3.2_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/ro_all3
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/ro_all3	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/ro_all3	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/ro_all3	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/ro_all3	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/ro_all3	encryptionroot	zfsbcapc/Z2/srv/ro_all3	-	-
+zfsbcapc/Z2/srv/ro_all3	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/ro_all3	canmount	noauto	-	local
+zfsbcapc/Z2/srv/ro_all3	readonly	on	-	local
+zfsbcapc/Z2/srv/ro_all3	volmode	none	-	local
+zfsbcapc/Z2/srv/ro_all3	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/40_all3.3_raw_incr
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@a zfsbcapc/Z2/cs/enc@b | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on -o canmount=noauto -o volmode=none zfsbcapc/Z2/srv/ro_all3
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/40_all3.4_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/ro_all3
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/ro_all3	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/ro_all3	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/ro_all3	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/ro_all3	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/ro_all3	encryptionroot	zfsbcapc/Z2/srv/ro_all3	-	-
+zfsbcapc/Z2/srv/ro_all3	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/ro_all3	canmount	noauto	-	local
+zfsbcapc/Z2/srv/ro_all3	readonly	on	-	local
+zfsbcapc/Z2/srv/ro_all3	volmode	none	-	local
+zfsbcapc/Z2/srv/ro_all3	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/41_raw_incr_onto_readonly_without_F
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@b zfsbcapc/Z2/cs/enc@c | zfs receive -s -u zfsbcapc/Z2/srv/ro_readonly
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/42_resume_full.1_cut
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on -o canmount=noauto -o volmode=none zfsbcapc/Z2/srv/ro_resume_full
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d138902e0-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406863dfbb3bb6fbea83c668024cf0996cf4bcc4d6560a84a2b4e4a4e2c48d68f32d24f2ed64fcd4b76488499c7cd80707f727e6e41516a71717e36444c02ea1e987c5162394c8a0100896820f8
+=== END
+=== CASE Z2/42_resume_full.2_resume
+--- cmd
+zfs send -t 1-d138902e0-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406863dfbb3bb6fbea83c668024cf0996cf4bcc4d6560a84a2b4e4a4e2c48d68f32d24f2ed64fcd4b76488499c7cd80707f727e6e41516a71717e36444c02ea1e987c5162394c8a0100896820f8 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on -o canmount=noauto -o volmode=none zfsbcapc/Z2/srv/ro_resume_full
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/42_resume_full.3_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/ro_resume_full
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/ro_resume_full	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/ro_resume_full	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/ro_resume_full	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/ro_resume_full	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/ro_resume_full	encryptionroot	zfsbcapc/Z2/srv/ro_resume_full	-	-
+zfsbcapc/Z2/srv/ro_resume_full	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/ro_resume_full	canmount	noauto	-	local
+zfsbcapc/Z2/srv/ro_resume_full	readonly	on	-	local
+zfsbcapc/Z2/srv/ro_resume_full	volmode	none	-	local
+zfsbcapc/Z2/srv/ro_resume_full	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/43_resume_incr.0_base
+--- cmd
+zfs send -w zfsbcapc/Z2/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on -o canmount=noauto -o volmode=none zfsbcapc/Z2/srv/ro_resume_incr
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/43_resume_incr.1_cut
+--- cmd
+zfs send -w -i zfsbcapc/Z2/cs/enc@a zfsbcapc/Z2/cs/enc@b | head -c 500000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on -o canmount=noauto -o volmode=none zfsbcapc/Z2/srv/ro_resume_incr
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-13627bbefc-120-789c636064000310a501c49c50360710a715e5e7a69766a63040c19efdd9dd375f541e5300b2d991d4e52765a5269730303043d561c8a7a515a796806458e0f26c48f2499525a9c540fa8d301b56fd25f91057f4df0cffaa33db24c100499e132c9f97989bcac05095569c949c5890ac1f65a49f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300f6672923
+=== END
+=== CASE Z2/43_resume_incr.2_resume
+--- cmd
+zfs send -t 1-13627bbefc-120-789c636064000310a501c49c50360710a715e5e7a69766a63040c19efdd9dd375f541e5300b2d991d4e52765a5269730303043d561c8a7a515a796806458e0f26c48f2499525a9c540fa8d301b56fd25f91057f4df0cffaa33db24c100499e132c9f97989bcac05095569c949c5890ac1f65a49f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300f6672923 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on -o canmount=noauto -o volmode=none zfsbcapc/Z2/srv/ro_resume_incr
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/43_resume_incr.3_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/ro_resume_incr
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/ro_resume_incr	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z2/srv/ro_resume_incr	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z2/srv/ro_resume_incr	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z2/srv/ro_resume_incr	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/ro_resume_incr	encryptionroot	zfsbcapc/Z2/srv/ro_resume_incr	-	-
+zfsbcapc/Z2/srv/ro_resume_incr	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/ro_resume_incr	canmount	noauto	-	local
+zfsbcapc/Z2/srv/ro_resume_incr	readonly	on	-	local
+zfsbcapc/Z2/srv/ro_resume_incr	volmode	none	-	local
+zfsbcapc/Z2/srv/ro_resume_incr	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/50_raw_p_stream_with_o
+--- cmd
+zfs send -w -p zfsbcapc/Z2/cs/enc@p | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z2/srv/forge_o
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/50a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/forge_o
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/forge_o	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	FORGED	local
+zfsbcapc/Z2/srv/forge_o	org.zfsbackup:client_id	client-1	forged-id	local
+zfsbcapc/Z2/srv/forge_o	org.zfsbackup:source_dataset	pool/data	forged/ds	local
+zfsbcapc/Z2/srv/forge_o	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/forge_o	encryptionroot	zfsbcapc/Z2/srv/forge_o	-	-
+zfsbcapc/Z2/srv/forge_o	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/forge_o	canmount	on	-	default
+zfsbcapc/Z2/srv/forge_o	readonly	off	-	default
+zfsbcapc/Z2/srv/forge_o	volmode	default	-	default
+zfsbcapc/Z2/srv/forge_o	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/51_raw_p_stream_without_o
+--- cmd
+zfs send -w -p zfsbcapc/Z2/cs/enc@p | zfs receive -F -s -u zfsbcapc/Z2/srv/forge_none
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/51a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/forge_none
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/forge_none	org.zfsbackup:config	FORGED	FORGED	received
+zfsbcapc/Z2/srv/forge_none	org.zfsbackup:client_id	forged-id	forged-id	received
+zfsbcapc/Z2/srv/forge_none	org.zfsbackup:source_dataset	forged/ds	forged/ds	received
+zfsbcapc/Z2/srv/forge_none	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/forge_none	encryptionroot	zfsbcapc/Z2/srv/forge_none	-	-
+zfsbcapc/Z2/srv/forge_none	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/forge_none	canmount	on	-	default
+zfsbcapc/Z2/srv/forge_none	readonly	off	-	default
+zfsbcapc/Z2/srv/forge_none	volmode	default	-	default
+zfsbcapc/Z2/srv/forge_none	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/52_raw_p_stream_with_x_not_o
+--- cmd
+zfs send -w -p zfsbcapc/Z2/cs/enc@p | zfs receive -F -s -u -x org.zfsbackup:config -x org.zfsbackup:client_id -x org.zfsbackup:source_dataset zfsbcapc/Z2/srv/forge_x
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z2/52a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z2/srv/forge_x
+--- rc
+0
+--- stdout
+zfsbcapc/Z2/srv/forge_x	org.zfsbackup:config	-	FORGED	-
+zfsbcapc/Z2/srv/forge_x	org.zfsbackup:client_id	-	forged-id	-
+zfsbcapc/Z2/srv/forge_x	org.zfsbackup:source_dataset	-	forged/ds	-
+zfsbcapc/Z2/srv/forge_x	encryption	aes-256-gcm	-	-
+zfsbcapc/Z2/srv/forge_x	encryptionroot	zfsbcapc/Z2/srv/forge_x	-	-
+zfsbcapc/Z2/srv/forge_x	keystatus	unavailable	-	-
+zfsbcapc/Z2/srv/forge_x	canmount	on	-	default
+zfsbcapc/Z2/srv/forge_x	readonly	off	-	default
+zfsbcapc/Z2/srv/forge_x	volmode	default	-	default
+zfsbcapc/Z2/srv/forge_x	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z2/53_raw_o_and_x_same_property
+--- cmd
+zfs send -w -p zfsbcapc/Z2/cs/enc@p | zfs receive -F -s -u -o org.zfsbackup:config=a -x org.zfsbackup:config zfsbcapc/Z2/srv/forge_ox
+--- rc
+2
+--- pipestatus
+141 2
+--- stdout
+--- stderr
+property 'org.zfsbackup:config' specified multiple times
+usage:
+	receive [-vMnsFhu] [-o <property>=<value>] ... [-x <property>] ...
+	    <filesystem|volume|snapshot>
+	receive [-vMnsFhu] [-o <property>=<value>] ... [-x <property>] ... 
+	    [-d | -e] <filesystem>
+	receive -A <filesystem|volume>
+
+For the property list, run: zfs set|get
+
+For the delegated permission list, run: zfs allow|unallow
+
+For further help on a command or topic, run: zfs help [<topic>]
+=== END

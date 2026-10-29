@@ -1418,7 +1418,7 @@ class TestStartupWindow:
     def test_a_cli_import_during_the_load_reports_an_unknown_generation(
         self, sqlite_config_db, mocker, lock_spy, config_yaml_path
     ):
-        from click.testing import CliRunner
+        from _click_compat import make_runner
 
         from zfsbackup.cli.main import cli
 
@@ -1427,7 +1427,7 @@ class TestStartupWindow:
         thread, box = self._run_in_thread(sqlite_config_db.path)
         try:
             assert entered.wait(30)
-            result = CliRunner().invoke(
+            result = make_runner().invoke(
                 cli,
                 ['import', str(config_yaml_path), '-c', str(sqlite_config_db.path)],
                 prog_name='zfsbackup-config',

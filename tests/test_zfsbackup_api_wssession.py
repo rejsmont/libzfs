@@ -72,7 +72,7 @@ from types import SimpleNamespace
 import pytest
 import websocket
 from flask import Flask
-from flask_sock import Sock
+from zfsbackup._vendor.flask_sock import Sock
 
 from _tls_support import (
     IO_TIMEOUT,
@@ -1993,17 +1993,14 @@ class TestSimpleWebsocketPin:
     def test_the_installed_version_satisfies_the_projects_pin(self):
         import importlib.metadata
         import pathlib
-        import tomllib
-        from packaging.specifiers import SpecifierSet
+        from _pyproject_support import load_pyproject, requirements
 
-        pyproject = pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml"
-        if not pyproject.exists():
+        if not (pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml").exists():
             pytest.skip("no pyproject.toml next to the tests")
-        spec = tomllib.loads(pyproject.read_text())["tool"]["poetry"]["dependencies"].get(
-            "simple-websocket")
-        assert spec is not None, "pyproject.toml does not pin simple-websocket"
+        req = requirements(load_pyproject()).get("simple-websocket")
+        assert req is not None, "pyproject.toml does not pin simple-websocket"
         installed = importlib.metadata.version("simple-websocket")
-        assert installed in SpecifierSet(spec.replace(" ", "")), (installed, spec)
+        assert req.specifier.contains(installed, prereleases=True), (installed, str(req.specifier))
 
 
 # ---------------------------------------------------------------------------

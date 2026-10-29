@@ -1,0 +1,2 @@
+# The packages are built for release files, not for the Debian archive: there is no ITP bug.
+zfsbackup: initial-upload-closes-no-bugs

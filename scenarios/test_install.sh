@@ -7,8 +7,10 @@
 #                venv comes from a uv-managed interpreter, exactly as zfsbackup/README.md ("Install ...") describes
 #   zfsb-inst24  Ubuntu 24.04, systemd 255 (Type=notify-reload), the distro's python3 (3.12) + `python3 -m venv`
 #
-# The artifacts are built on the HOST with `poetry build` (the wheel is the program, the sdist also carries `packaging/`), shipped
-# with `multipass transfer`, and installed the way the README does it: a venv at /opt/zfsbackup/venv, `systemd-sysusers`,
+# The artifacts are built on the HOST with `poetry build`: TWO wheels since the packaging split (`zfsbackup`, built at the repo root, which
+# also makes the sdist carrying `packaging/`, and `libzfseasy`, built in libs/libzfseasy; the first depends on the second at the same
+# version), or ONE wheel for a tree from before the split (SRC_REF/OLD_REF at an older ref: no libs/libzfseasy/pyproject.toml). They are
+# shipped with `multipass transfer`, and installed the way the README does it: a venv at /opt/zfsbackup/venv, `systemd-sysusers`,
 # `systemd-tmpfiles`, the unit (plus the drop-in below systemd 253), a file-backed pool (/var/tmp/zbinst.img, pool zbinst). The daemon
 # is then driven as a real systemd unit, and the host is BOTH the backup client and the backup server (the destination is
 # https://127.0.0.1:18443 and the host enrolls with itself), so one VM exercises the whole path including a real receive.
@@ -40,17 +42,23 @@
 #       operator: refused (exit 1) with the `--no-keys` pointer and nothing left behind, then `--no-keys` works (certificates, no keys)
 #   I13 a clean `systemctl stop` well inside TimeoutStopSec=90 (Result=success, no process left, the pid file removed)
 #   I14 the shipped restart policy: RestartForceExitStatus names 76 and SIGHUP, and a main process that dies of SIGHUP IS restarted
-#   I15 UPGRADE: a wheel built from OLD_REF (default 0cd236c, the milestone A tree: dist `libzfseasy`, schema 7c3e9d51b2a8, no
-#       `zfsbackupd`) is installed in the venv, its DB imported and its daemon run; then, as the README says: stop, `pip install
-#       --upgrade` the current wheel, `systemctl start zfsbackup`. The ExecStartPre migration writes ONE pre-migration backup
-#       (`config.db.pre-<old rev>-<UTC>`, 0600) in /var/lib/zfsbackup/backups (0700 root), the DB is at the new head, the unit reaches
-#       READY, the client id survived; a plain RESTART writes no second backup
+#   I15 UPGRADE: the wheel built from OLD_REF (default v1.0.0rc1, the last single-wheel release: dist `zfsbackup` holding both packages;
+#       0cd236c is the milestone A tree: dist `libzfseasy`, schema 7c3e9d51b2a8, no `zfsbackupd`) is installed in the venv, its DB
+#       imported and its daemon run; then the upgrade to the split wheels, which a plain `pip install` cannot do (see below), by the
+#       runbook's procedure: stop the daemon, `pip uninstall -y <old dist>`, `pip install libzfseasy-*.whl zfsbackup-*.whl`,
+#       `systemctl start zfsbackup`. First a throwaway venv shows why: the plain upgrade of an old `zfsbackup` single wheel to the
+#       split wheels leaves `import libzfseasy` broken (pip installs the new libzfseasy, then uninstalls the old zfsbackup, whose RECORD
+#       still lists the libzfseasy/ files). When the schema is behind (OLD_REF=0cd236c) the ExecStartPre migration writes ONE
+#       pre-migration backup (`config.db.pre-<old rev>-<UTC>`, 0600) in /var/lib/zfsbackup/backups (0700 root); the DB is at the new
+#       head, the unit reaches READY, the client id survived; a plain RESTART writes no second backup (with rc1 the schema is already at
+#       head: no migration, no backup is expected, and the scenario says so)
 #   I16 IN-PLACE UPGRADE UNDER A RUNNING DAEMON (the S-8 version-skew guard): the current tree is version N, a copy of it rebuilt as
-#       N+1 (".post1" appended to the version in a temp copy). With N running as the real unit: `pip install` N+1 over it -> the
+#       N+1 (".post1" appended to BOTH versions and to the `libzfseasy==` pin in a temp copy). With N running as the real unit: `pip install` N+1 over it -> the
 #       journal has the drain WARNING ("changed on disk ... will exit 76", priority 4, "N -> N+1"), the main process exits 76,
 #       systemd restarts it EXACTLY once and only after RestartSec, `zfsbackupd --version` is N+1, the second start is clean (READY,
 #       no restart loop, `status --wait` exit 0). Then a SAME-VERSION reinstall (`--force-reinstall`) is detected too ("was
-#       reinstalled"). Then with a long transfer in flight (the loopback throttled to 4 Mbit/s with `tc`, 300 MB of fresh data; not
+#       reinstalled"), and so is a reinstall of the `libzfseasy` wheel ALONE ("libzfseasy ... was reinstalled": the guard watches both
+#       distributions). Then with a long transfer in flight (the loopback throttled to 4 Mbit/s with `tc`, 300 MB of fresh data; not
 #       SIGSTOP: any signal aborts a running zfs send/receive), a reinstall starts the drain but the daemon does NOT exit while the
 #       transfer runs (draining= in the pid file, STATUS= says so, the API still answers /health); once the throttle is removed
 #       the transfer completes (the snapshot is on the server) and only then does it exit 76 and restart. Finally a `systemctl stop`
@@ -64,13 +72,13 @@
 # Usage (from the repo root; needs multipass and poetry on the host, no sudo):
 #   ./scenarios/test_install.sh                    # both VMs, everything (~25 min)
 #   ./scenarios/test_install.sh --only-24          # one VM (--only-22 likewise)
-#   ./scenarios/test_install.sh --no-upgrade       # skip I15 (and its second wheel build)
-#   ./scenarios/test_install.sh --no-inplace       # skip I16 (and the N+1 wheel build)
+#   ./scenarios/test_install.sh --no-upgrade       # skip I15 (and the OLD_REF wheel build)
+#   ./scenarios/test_install.sh --no-inplace       # skip I16 (and the N+1 wheel builds)
 #   ./scenarios/test_install.sh --keep             # leave the install, the pool and the daemon in place
 #   ./scenarios/test_install.sh --purge            # delete zfsb-inst22 and zfsb-inst24 (and ONLY those) at the end
 #   SRC_REF=<commit-ish> ./scenarios/test_install.sh   # build this tree (default HEAD); SRC_REF=WORKTREE builds the working tree as it
 #                                                      # is (uncommitted and untracked files included; nothing is committed or stashed)
-#   OLD_REF=<commit-ish>                           # the tree I15 upgrades FROM (default 0cd236c, milestone A)
+#   OLD_REF=<commit-ish>                           # the tree I15 upgrades FROM (default v1.0.0rc1; 0cd236c also exercises the migration)
 #
 # Multipass caveats are the usual ones (see scenarios/README.md): never send a `multipass exec`'s host stdout to /dev/null, deliver
 # files with `multipass transfer`, and a guest command that exits 4 hangs the exec (every command runs in an inner shell that maps
@@ -86,8 +94,9 @@ for _vm in "$VM22" "$VM24"; do
 done
 
 SRC_REF="${SRC_REF:-HEAD}"
-OLD_REF="${OLD_REF:-0cd236c}"
-OLD_REV="7c3e9d51b2a8"                      # the schema revision of OLD_REF (asserted)
+OLD_REF="${OLD_REF:-v1.0.0rc1}"
+OLD_REV=""                                  # the schema revision of OLD_REF: read from its database after its own `import`
+[ "$OLD_REF" = 0cd236c ] && OLD_REV_EXPECT="7c3e9d51b2a8" || OLD_REV_EXPECT=""     # (the milestone A tree's revision is asserted)
 
 POOL="zbinst"; IMG="/var/tmp/zbinst.img"; POOL_SIZE="4g"
 API_PORT="18443"
@@ -202,7 +211,10 @@ TOP="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)" || die "not in a git
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/zbinst-work.XXXXXX")" || die "cannot make a scratch directory"
 trap 'rm -rf "$WORK"' EXIT
 
-build_dist() { # build_dist <ref|WORKTREE> <outdir>  -- wheel + sdist of that tree
+# build_dist <ref|WORKTREE> <outdir>: the wheel + sdist of that tree built at its root (the zfsbackup distribution) and, for a tree
+# from after the packaging split (libs/libzfseasy/pyproject.toml exists), the libzfseasy wheel built in libs/libzfseasy. A tree from
+# before the split yields its single wheel only.
+build_dist() {
     local ref="$1" out="$2" src
     mkdir -p "$out"
     if [ "$ref" = WORKTREE ]; then
@@ -212,24 +224,32 @@ build_dist() { # build_dist <ref|WORKTREE> <outdir>  -- wheel + sdist of that tr
         git -C "$TOP" archive "$ref" | tar -x -C "$src" || die "git archive of '$ref' failed"
     fi
     (cd "$src" && poetry build -o "$out") > "$out.log" 2>&1 || { sed 's/^/    poetry: /' "$out.log" >&2; die "poetry build of '$ref' failed"; }
+    if [ -f "$src/libs/libzfseasy/pyproject.toml" ]; then
+        (cd "$src/libs/libzfseasy" && poetry build -f wheel -o "$out") > "$out.lib.log" 2>&1 \
+            || { sed 's/^/    poetry: /' "$out.lib.log" >&2; die "poetry build of libs/libzfseasy of '$ref' failed"; }
+    fi
 }
 
 step "Building the current tree on the host (SRC_REF=$SRC_REF)"
 build_dist "$SRC_REF" "$WORK/new"
 NEW_WHL="$(ls "$WORK"/new/zfsbackup-*.whl 2>/dev/null | head -n1)"; NEW_SDIST="$(ls "$WORK"/new/zfsbackup-*.tar.gz 2>/dev/null | head -n1)"
+NEW_LIB_WHL="$(ls "$WORK"/new/libzfseasy-*.whl 2>/dev/null | head -n1)"      # empty for a tree from before the packaging split (one wheel)
 [ -n "$NEW_WHL" ] && [ -n "$NEW_SDIST" ] || die "poetry build did not produce zfsbackup-*.whl and .tar.gz (see $WORK/new.log)"
 tar tzf "$NEW_SDIST" | grep -q 'packaging/systemd/zfsbackup.service$' \
     || die "the sdist of '$SRC_REF' has no packaging/systemd/zfsbackup.service: this tree predates milestone C (use SRC_REF=WORKTREE)"
-info "wheel $(basename "$NEW_WHL"), sdist $(basename "$NEW_SDIST")"
-OLD_WHL=""
+if [ -n "$NEW_LIB_WHL" ]; then info "wheels $(basename "$NEW_LIB_WHL") + $(basename "$NEW_WHL"), sdist $(basename "$NEW_SDIST")"
+else info "ONE wheel $(basename "$NEW_WHL") (a tree from before the packaging split), sdist $(basename "$NEW_SDIST")"; fi
+OLD_WHL=""; OLD_DIST=""
 if [ "$UPGRADE" -eq 1 ]; then
     step "Building the OLD tree on the host (OLD_REF=$OLD_REF)"
     build_dist "$OLD_REF" "$WORK/old"
     OLD_WHL="$(ls "$WORK"/old/*.whl 2>/dev/null | head -n1)"
     [ -n "$OLD_WHL" ] || die "poetry build of '$OLD_REF' produced no wheel (see $WORK/old.log)"
-    info "old wheel $(basename "$OLD_WHL")"
+    [ "$(ls "$WORK"/old/*.whl | wc -l | tr -d '[:space:]')" = 1 ] || die "OLD_REF '$OLD_REF' built more than one wheel: I15 upgrades FROM a single-wheel tree"
+    OLD_DIST="$(basename "$OLD_WHL" | cut -d- -f1)"        # the distribution name the old wheel installs as
+    info "old wheel $(basename "$OLD_WHL") (distribution $OLD_DIST)"
 fi
-BUMP_WHL=""; BUMP_VER=""; CUR_VER=""
+BUMP_WHL=""; BUMP_LIB_WHL=""; BUMP_VER=""; CUR_VER=""
 if [ "$INPLACE" -eq 1 ]; then
     step "Building version N+1 of the current tree on the host (a temp copy with \".post1\" appended to the version)"
     BSRC="$WORK/src-bump"; mkdir -p "$BSRC"
@@ -243,14 +263,35 @@ if [ "$INPLACE" -eq 1 ]; then
     CUR_VER="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$BSRC/pyproject.toml" | head -n1)"
     [ -n "$CUR_VER" ] || die "no version = \"...\" line in pyproject.toml"
     BUMP_VER="$CUR_VER.post1"
-    awk -v nv="$BUMP_VER" '!done && /^version = "/ { print "version = \"" nv "\""; done=1; next } { print }' "$BSRC/pyproject.toml" > "$BSRC/pyproject.toml.new" \
-        && mv "$BSRC/pyproject.toml.new" "$BSRC/pyproject.toml"
+    # bump_version <pyproject.toml>: the first `version = "..."` line becomes N+1
+    bump_version() {
+        awk -v nv="$BUMP_VER" '!done && /^version = "/ { print "version = \"" nv "\""; done=1; next } { print }' "$1" > "$1.new" && mv "$1.new" "$1"
+    }
+    bump_version "$BSRC/pyproject.toml"
+    if [ -n "$NEW_LIB_WHL" ]; then
+        # the split layout: libzfseasy's own pyproject follows (lockstep), and the root one pins it with `libzfseasy==<version>`
+        [ -f "$BSRC/libs/libzfseasy/pyproject.toml" ] || die "split wheels were built but $BSRC/libs/libzfseasy/pyproject.toml is missing"
+        bump_version "$BSRC/libs/libzfseasy/pyproject.toml"
+        sed "s/\"libzfseasy==$CUR_VER\"/\"libzfseasy==$BUMP_VER\"/" "$BSRC/pyproject.toml" > "$BSRC/pyproject.toml.new" && mv "$BSRC/pyproject.toml.new" "$BSRC/pyproject.toml"
+        grep -q "\"libzfseasy==$BUMP_VER\"" "$BSRC/pyproject.toml" || die "could not bump the libzfseasy== pin in the N+1 copy"
+    fi
     (cd "$BSRC" && poetry build -f wheel -o "$WORK/bump") > "$WORK/bump.log" 2>&1 || { sed 's/^/    poetry: /' "$WORK/bump.log" >&2; die "poetry build of N+1 failed"; }
+    if [ -n "$NEW_LIB_WHL" ]; then
+        (cd "$BSRC/libs/libzfseasy" && poetry build -f wheel -o "$WORK/bump") > "$WORK/bump.lib.log" 2>&1 \
+            || { sed 's/^/    poetry: /' "$WORK/bump.lib.log" >&2; die "poetry build of libzfseasy N+1 failed"; }
+        BUMP_LIB_WHL="$(ls "$WORK"/bump/libzfseasy-*.whl 2>/dev/null | head -n1)"
+        [ -n "$BUMP_LIB_WHL" ] || die "poetry build produced no libzfseasy N+1 wheel (see $WORK/bump.lib.log)"
+    fi
     BUMP_WHL="$(ls "$WORK"/bump/zfsbackup-*.whl 2>/dev/null | head -n1)"
     [ -n "$BUMP_WHL" ] || die "poetry build produced no N+1 wheel (see $WORK/bump.log)"
-    info "N = $CUR_VER ($(basename "$NEW_WHL")), N+1 = $BUMP_VER ($(basename "$BUMP_WHL"))"
+    info "N = $CUR_VER ($(basename "$NEW_WHL")), N+1 = $BUMP_VER ($(basename "$BUMP_WHL")${BUMP_LIB_WHL:+ + $(basename "$BUMP_LIB_WHL")})"
 fi
 NEW_WHL_BASE="$(basename "$NEW_WHL")"; NEW_SDIST_BASE="$(basename "$NEW_SDIST")"
+NEW_LIB_BASE=""; [ -n "$NEW_LIB_WHL" ] && NEW_LIB_BASE="$(basename "$NEW_LIB_WHL")"
+BUMP_BASE=""; [ -n "$BUMP_WHL" ] && BUMP_BASE="$(basename "$BUMP_WHL")"
+BUMP_LIB_BASE=""; [ -n "$BUMP_LIB_WHL" ] && BUMP_LIB_BASE="$(basename "$BUMP_LIB_WHL")"
+# the wheels as the guest sees them (space-separated; a lone zfsbackup wheel for a pre-split tree). Filled by put_wheels.
+NEW_GUEST=""; BUMP_GUEST=""; BUMP_LIB_GUEST=""
 SDIST_DIR="${NEW_SDIST_BASE%.tar.gz}"
 
 # ─────────────────────────────── Guest helper files ─────────────────────────
@@ -265,6 +306,19 @@ PYEOF
 import sqlite3, sys
 c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
 print(c.execute("select version_num from alembic_version").fetchone()[0])
+PYEOF
+    # which distribution owns the libzfseasy/ files: the venv must hold two distributions after the packaging split
+    put_text "$G/distinfo.py" 644 <<'PYEOF'
+import importlib.metadata as m
+def n(dist):
+    return sum(1 for f in (m.files(dist) or ()) if str(f).startswith("libzfseasy/"))
+def v(dist):
+    try:
+        return m.version(dist)
+    except m.PackageNotFoundError:
+        return "-"
+print("libzfseasy=%s zfsbackup=%s same=%d lib_in_lib=%d lib_in_zb=%d" % (v("libzfseasy"), v("zfsbackup"), v("libzfseasy") == v("zfsbackup") != "-",
+      n("libzfseasy") if v("libzfseasy") != "-" else 0, n("zfsbackup") if v("zfsbackup") != "-" else 0))
 PYEOF
     # journald records as "PRIORITY<TAB>message" for the lines matching argv[1] (an ERE)
     put_text "$G/jprio.py" 644 <<'PYEOF'
@@ -446,20 +500,35 @@ reset_install() {
     ' || true
 }
 
-# install_venv <wheel path on the guest>: step 1 of the README (the venv at /opt/zfsbackup/venv, the program, the /usr/local/bin link)
+# put_wheels: ship the current tree's wheels (libzfseasy first when the tree has the split) and the N+1 wheels (if built) to $G;
+# NEW_GUEST / BUMP_GUEST / BUMP_LIB_GUEST name them as the guest sees them (space-separated lists of paths, no quoting needed)
+put_wheels() {
+    NEW_GUEST=""; BUMP_GUEST=""; BUMP_LIB_GUEST=""
+    if [ -n "$NEW_LIB_WHL" ]; then put_file "$NEW_LIB_WHL" "$G/$NEW_LIB_BASE" 644; NEW_GUEST="$G/$NEW_LIB_BASE "; fi
+    put_file "$NEW_WHL" "$G/$NEW_WHL_BASE" 644; NEW_GUEST+="$G/$NEW_WHL_BASE"
+    if [ -n "$BUMP_WHL" ]; then
+        if [ -n "$BUMP_LIB_WHL" ]; then put_file "$BUMP_LIB_WHL" "$G/$BUMP_LIB_BASE" 644; BUMP_LIB_GUEST="$G/$BUMP_LIB_BASE"; BUMP_GUEST="$BUMP_LIB_GUEST "; fi
+        put_file "$BUMP_WHL" "$G/$BUMP_BASE" 644; BUMP_GUEST+="$G/$BUMP_BASE"
+    fi
+}
+
+# install_venv <wheel path on the guest>...: step 1 of the README (the venv at /opt/zfsbackup/venv, the program, the /usr/local/bin link).
+# One argument per wheel: `libzfseasy-N.whl zfsbackup-N.whl` for the split layout (the second pins the first), one for a pre-split tree.
 install_venv() {
+    local w quoted=""
+    for w in "$@"; do quoted="$quoted '$w'"; done
     if [ "$PYMODE" = uv ]; then
         vsh "
             set -e
             UV_PYTHON_INSTALL_DIR=$APP/python /var/tmp/zbinst-uvtool/bin/uv venv --python 3.12 $VENV
-            /var/tmp/zbinst-uvtool/bin/uv pip install --python $VENV/bin/python '$1'
-        " || die "uv venv / install of $1 failed on $VM"
+            /var/tmp/zbinst-uvtool/bin/uv pip install --python $VENV/bin/python $quoted
+        " || die "uv venv / install of $* failed on $VM"
     else
         vsh "
             set -e
             python3 -m venv $VENV
-            $VENV/bin/pip install -q '$1'
-        " || die "venv / pip install of $1 failed on $VM"
+            $VENV/bin/pip install -q $quoted
+        " || die "venv / pip install of $* failed on $VM"
     fi
     vsh "ln -s $VENV/bin/zfsbackup-config /usr/local/bin/zfsbackup-config" || die "ln -s failed"
 }
@@ -468,9 +537,14 @@ install_files() {
     section "I2 — install the program, the units, sysusers and tmpfiles (the README's steps)"
     reset_install
     put_helpers
-    put_file "$NEW_WHL" "$G/$NEW_WHL_BASE" 644
+    put_wheels
     put_file "$NEW_SDIST" "$G/$NEW_SDIST_BASE" 644
-    install_venv "$G/$NEW_WHL_BASE"
+    install_venv $NEW_GUEST
+    if [ -n "$NEW_LIB_WHL" ]; then
+        local di; di="$(vsh "$VENV/bin/python $G/distinfo.py" | tr '\n' ' ')"
+        check_re "the venv holds BOTH distributions, libzfseasy and zfsbackup, at the same version" 'libzfseasy=[^ ]+ zfsbackup=[^ ]+ same=1 ' "$di"
+        check_re "libzfseasy's files are in the libzfseasy distribution, none in the zfsbackup one" 'lib_in_lib=[1-9][0-9]* lib_in_zb=0 ' "$di"
+    fi
     # step 2 of the README: the system files, from the sdist (verbatim: plain `install -m 0644 ... /etc/sysusers.d/zfsbackup.conf`)
     vsh "cd $G && tar xzf '$NEW_SDIST_BASE'" || die "cannot extract the sdist on $VM"
     if ! vsh "cd $G/$SDIST_DIR && install -m 0644 packaging/sysusers.d/zfsbackup.conf /etc/sysusers.d/zfsbackup.conf >/dev/null 2>&1"; then
@@ -895,7 +969,7 @@ DROPEOF
 
 # ───────────────────────────── I15: upgrade from OLD_REF ─────────────────────────────
 upgrade() {
-    section "I15 — UPGRADE from $OLD_REF: stop, pip install --upgrade, start (the pre-migration backup)"
+    section "I15 — UPGRADE from $OLD_REF to the split wheels: stop, pip uninstall the old dist, pip install both wheels, start"
     # the install state is reset, then the old wheel is installed and run
     vsh "
         { systemctl stop $UNIT zbinst-old; systemctl reset-failed; } >/dev/null 2>&1
@@ -907,8 +981,10 @@ upgrade() {
         systemctl daemon-reload
         true
     " || die "could not reset for the upgrade"
-    local oldbase; oldbase="$(basename "$OLD_WHL")"
+    # the old wheel gets a directory of its own: it may carry the very same file name as the current tree's (both are 1.0.0rc1)
+    local oldbase; oldbase="old/$(basename "$OLD_WHL")"
     put_file "$OLD_WHL" "$G/$oldbase" 644
+    put_wheels
     install_venv "$G/$oldbase"
     # the pre-253 drop-in stays as the README says for the unit; the OLD tree has no zfsbackupd, so it runs as a transient unit
     [ "$PRE253" -eq 1 ] && vsh "install -d /etc/systemd/system/zfsbackup.service.d && install -m 0644 $G/$SDIST_DIR/packaging/systemd/zfsbackup.service.d/pre-253.conf /etc/systemd/system/zfsbackup.service.d/ && systemctl daemon-reload"
@@ -916,7 +992,10 @@ upgrade() {
     local out rc
     out="$(cli import --no-backup "$G/config-old.yaml")"; rc=$?
     check "the OLD tree's \`import\` works (exit 0)" "0" "$rc"
-    check "the database is at the OLD schema revision $OLD_REV" "$OLD_REV" "$(dbrev "$DB")"
+    OLD_REV="$(dbrev "$DB")"
+    if [ -n "$OLD_REV_EXPECT" ]; then check "the database is at the OLD schema revision $OLD_REV_EXPECT" "$OLD_REV_EXPECT" "$OLD_REV"
+    else info "the old tree's schema revision: $OLD_REV (this tree's head: $HEAD_REV)"; fi
+    local MIGRATES=0; [ "$OLD_REV" != "$HEAD_REV" ] && MIGRATES=1
     out="$(cli identity set-client-id zbinst-upgrade)"; rc=$?
     check "the old tree sets a client id (exit 0)" "0" "$rc"
     vsh "systemd-run --unit=zbinst-old --collect -p StandardOutput=append:/var/log/zbinst-old.log -p StandardError=append:/var/log/zbinst-old.log \
@@ -926,26 +1005,80 @@ upgrade() {
     # --- the README's upgrade: stop, install, start ---
     vsh "systemctl stop zbinst-old"; rc=$?
     check "the old daemon stops cleanly" "0" "$rc"
-    put_file "$NEW_WHL" "$G/$NEW_WHL_BASE" 644
     local pipout
-    if vsh "test -x $VENV/bin/pip"; then
-        pipout="$(vsh "$VENV/bin/pip install --upgrade '$G/$NEW_WHL_BASE' 2>&1")"; rc=$?
-        check "the README's \`$VENV/bin/pip install --upgrade ./zfsbackup-NEW.whl\` succeeds" "0" "$rc"
-    else
-        finding "README (\"Upgrading and downgrading\", step 3) says \`/opt/zfsbackup/venv/bin/pip install --upgrade\`, but a venv created with \`uv venv\` (the README's own recipe for Ubuntu 22.04) has no pip; used \`uv pip install --python\` instead"
-        pipout="$(vsh "/var/tmp/zbinst-uvtool/bin/uv pip install --python $VENV/bin/python --upgrade '$G/$NEW_WHL_BASE' 2>&1")"; rc=$?
-        check "the same upgrade with \`uv pip install --upgrade\` succeeds" "0" "$rc"
+    # --- why the runbook says "uninstall first": a PLAIN install of the split wheels over an old single `zfsbackup` wheel deletes
+    # libzfseasy. Shown on a COPY of the venv (the old wheel and its dependencies installed in it, so nothing is fetched), with wheels
+    # whose zfsbackup version differs from the old one (same version: pip would call the zfsbackup wheel satisfied and nothing breaks).
+    if [ -n "$NEW_LIB_WHL" ] && [ "$OLD_DIST" = zfsbackup ]; then
+        local hv=/var/tmp/zbinst-hazard hout hwheels="" oldver newver bumpver
+        oldver="$(basename "$OLD_WHL" | cut -d- -f2)"; newver="$(basename "$NEW_WHL" | cut -d- -f2)"
+        bumpver=""; [ -n "$BUMP_WHL" ] && bumpver="$(basename "$BUMP_WHL" | cut -d- -f2)"
+        if [ "$newver" != "$oldver" ]; then hwheels="$NEW_GUEST"
+        elif [ -n "$bumpver" ] && [ "$bumpver" != "$oldver" ]; then hwheels="$BUMP_GUEST"; fi
+        if [ -z "$hwheels" ]; then
+            info "the hazard of a plain \`pip install\` over the old wheel is not shown: the current tree has the same version as $OLD_REF ($oldver) and no N+1 wheel was built (pip would call the zfsbackup wheel satisfied)"
+        else
+            if vsh "test -x $VENV/bin/pip"; then
+                hout="$(vsh "
+                    set -e
+                    rm -rf $hv; cp -a $VENV $hv
+                    $hv/bin/python -m pip install -q $hwheels
+                    cd / && ZFS_CMD=/bin/true ZPOOL_CMD=/bin/true $hv/bin/python -c 'import libzfseasy; print(\"IMPORT_OK\")' 2>&1 | tail -n1
+                " 2>&1)"
+            else
+                hout="$(vsh "
+                    set -e
+                    rm -rf $hv; cp -a $VENV $hv
+                    /var/tmp/zbinst-uvtool/bin/uv pip install -q --python $hv/bin/python $hwheels
+                    cd / && ZFS_CMD=/bin/true ZPOOL_CMD=/bin/true $hv/bin/python -c 'import libzfseasy; print(\"IMPORT_OK\")' 2>&1 | tail -n1
+                " 2>&1)"
+            fi
+            if printf '%s' "$hout" | grep -q IMPORT_OK; then
+                finding "a plain install of the split wheels over the old single \`zfsbackup\` wheel ($OLD_REF) left \`libzfseasy\` importable in this venv ($PYMODE): the 'uninstall first' warning is not reproducible with this installer"
+            else
+                pass "the hazard is real ($PYMODE): a PLAIN install of the split wheels over the old single \`zfsbackup\` wheel leaves \`import libzfseasy\` broken ($(printf '%s' "$hout" | tail -n1 | cut -c1-90))"
+            fi
+            vsh "rm -rf $hv" || true
+        fi
     fi
-    [ "$rc" -eq 0 ] || echo "$pipout" | sed 's/^/    pip: /'
-    local dists
-    dists="$(vsh "if [ -x $VENV/bin/pip ]; then $VENV/bin/pip list 2>/dev/null; else /var/tmp/zbinst-uvtool/bin/uv pip list --python $VENV/bin/python 2>/dev/null; fi | grep -iE '^(libzfseasy|zfsbackup) '")"
-    if [ "$(printf '%s\n' "$dists" | grep -c .)" -ge 2 ]; then
-        finding "after \`pip install --upgrade\` of the renamed wheel the venv holds BOTH distributions ($(printf '%s' "$dists" | tr -s ' \n' ' ' | cut -c1-120)): the old \`libzfseasy\` dist is never removed, so files that exist only in the old tree stay, and \`pip uninstall libzfseasy\` would delete the new code. The README upgrade step says nothing about it (only matters for hosts that ran the pre-rename dist; nothing is deployed yet)"
+    if [ -n "$NEW_LIB_WHL" ]; then
+        # the runbook's procedure for the move from ONE wheel to TWO: the daemon is stopped (above), the old distribution is
+        # uninstalled (never upgraded in place: see the hazard shown before), then both wheels are installed
+        if vsh "test -x $VENV/bin/pip"; then
+            pipout="$(vsh "$VENV/bin/pip uninstall -y $OLD_DIST 2>&1")"; rc=$?
+            check "\`$VENV/bin/pip uninstall -y $OLD_DIST\` succeeds" "0" "$rc"
+            [ "$rc" -eq 0 ] || echo "$pipout" | sed 's/^/    pip: /'
+            pipout="$(vsh "$VENV/bin/pip install $NEW_GUEST 2>&1")"; rc=$?
+            check "\`$VENV/bin/pip install libzfseasy-*.whl zfsbackup-*.whl\` succeeds" "0" "$rc"
+        else
+            finding "README (\"Upgrading and downgrading\") shows \`/opt/zfsbackup/venv/bin/pip\`, but a venv created with \`uv venv\` (the README's own recipe for Ubuntu 22.04) has no pip; used \`uv pip uninstall\` / \`uv pip install --python\` instead"
+            pipout="$(vsh "/var/tmp/zbinst-uvtool/bin/uv pip uninstall --python $VENV/bin/python $OLD_DIST 2>&1")"; rc=$?
+            check "\`uv pip uninstall $OLD_DIST\` succeeds" "0" "$rc"
+            [ "$rc" -eq 0 ] || echo "$pipout" | sed 's/^/    uv: /'
+            pipout="$(vsh "/var/tmp/zbinst-uvtool/bin/uv pip install --python $VENV/bin/python $NEW_GUEST 2>&1")"; rc=$?
+            check "\`uv pip install libzfseasy-*.whl zfsbackup-*.whl\` succeeds" "0" "$rc"
+        fi
+        [ "$rc" -eq 0 ] || echo "$pipout" | sed 's/^/    pip: /'
+        local di; di="$(vsh "$VENV/bin/python $G/distinfo.py" | tr '\n' ' ')"
+        check_re "the venv holds both distributions at the same version, libzfseasy's files in the libzfseasy one" 'libzfseasy=[^ ]+ zfsbackup=[^ ]+ same=1 lib_in_lib=[1-9][0-9]* lib_in_zb=0 ' "$di"
+        check "\`import libzfseasy\` works after the upgrade" "yes" \
+            "$(vsh "cd / && ZFS_CMD=/bin/true ZPOOL_CMD=/bin/true $VENV/bin/python -c 'import libzfseasy; print(\"yes\")' 2>&1 | tail -n1" | tr -d '[:space:]')"
+    else
+        # a tree from before the split: one wheel, upgraded in place as the README said
+        if vsh "test -x $VENV/bin/pip"; then
+            pipout="$(vsh "$VENV/bin/pip install --upgrade '$G/$NEW_WHL_BASE' 2>&1")"; rc=$?
+            check "the README's \`$VENV/bin/pip install --upgrade ./zfsbackup-NEW.whl\` succeeds" "0" "$rc"
+        else
+            finding "README (\"Upgrading and downgrading\", step 3) says \`/opt/zfsbackup/venv/bin/pip install --upgrade\`, but a venv created with \`uv venv\` (the README's own recipe for Ubuntu 22.04) has no pip; used \`uv pip install --python\` instead"
+            pipout="$(vsh "/var/tmp/zbinst-uvtool/bin/uv pip install --python $VENV/bin/python --upgrade '$G/$NEW_WHL_BASE' 2>&1")"; rc=$?
+            check "the same upgrade with \`uv pip install --upgrade\` succeeds" "0" "$rc"
+        fi
+        [ "$rc" -eq 0 ] || echo "$pipout" | sed 's/^/    pip: /'
     fi
     vsh "install -m 0644 $G/$SDIST_DIR/packaging/systemd/zfsbackup.service /etc/systemd/system/zfsbackup.service; systemctl daemon-reload"
     check "the new tree's zfsbackupd exists now and \`--version\` works" "yes" "$(vsh "$VENV/bin/zfsbackupd --version >/dev/null 2>&1 && echo yes || echo no" | tr -d '[:space:]')"
     check "the database is still at the OLD revision before the start (the upgrade does not migrate)" "$OLD_REV" "$(dbrev "$DB")"
-    check "the backups directory is empty before the migration" "0" "$(vsh "ls -A $BAKDIR | wc -l" | tr -d '[:space:]')"
+    check "the backups directory is empty before the first start" "0" "$(vsh "ls -A $BAKDIR | wc -l" | tr -d '[:space:]')"
     local t0=$SECONDS umark; umark=$(( $(jl_epoch) - 1 ))
     out="$(vsh "systemctl start $UNIT 2>&1")"; rc=$?
     check "systemctl start zfsbackup exits 0 (ExecStartPre migrated, then READY)" "0" "$rc"
@@ -954,37 +1087,49 @@ upgrade() {
     check "the unit is active" "active" "$(sd_prop ActiveState)"
     check "the database is at the NEW head $HEAD_REV" "$HEAD_REV" "$(dbrev "$DB")"
     local bks; bks="$(vsh "ls -1 $BAKDIR")"     # (looked at before anything opens the copy: a WAL-mode copy grows -wal/-shm sidecars when read)
-    check "exactly one pre-migration backup exists in $BAKDIR" "1" "$(printf '%s\n' "$bks" | grep -c .)"
-    check_re "... named config.db.pre-$OLD_REV-<UTC time>" "^config\.db\.pre-$OLD_REV-[0-9]{8}T[0-9]{6}Z\$" "$bks"
-    local bk; bk="$BAKDIR/$(printf '%s\n' "$bks" | head -n1)"
-    check "the backup is 0600 root and the directory 0700 root" "600 root 700 root" "$(guest_stat "$bk" | awk '{print $1, $2}') $(guest_stat "$BAKDIR" | awk '{print $1, $2}')"
-    vsh "cp '$bk' $G/bk-copy.db"
-    check "the backup is a usable database still at the OLD revision" "$OLD_REV" "$(dbrev "$G/bk-copy.db")"
-    check "the client id survived the migration" "zbinst-upgrade" "$(vsh "zfsbackup-config identity show --json 2>/dev/null | python3 $G/jget.py 'd[\"client_id\"]'" | tr -d '[:space:]')"
+    if [ "$MIGRATES" -eq 1 ]; then
+        check "exactly one pre-migration backup exists in $BAKDIR" "1" "$(printf '%s\n' "$bks" | grep -c .)"
+        check_re "... named config.db.pre-$OLD_REV-<UTC time>" "^config\.db\.pre-$OLD_REV-[0-9]{8}T[0-9]{6}Z\$" "$bks"
+        local bk; bk="$BAKDIR/$(printf '%s\n' "$bks" | head -n1)"
+        check "the backup is 0600 root and the directory 0700 root" "600 root 700 root" "$(guest_stat "$bk" | awk '{print $1, $2}') $(guest_stat "$BAKDIR" | awk '{print $1, $2}')"
+        vsh "cp '$bk' $G/bk-copy.db"
+        check "the backup is a usable database still at the OLD revision" "$OLD_REV" "$(dbrev "$G/bk-copy.db")"
+    else
+        info "$OLD_REF is already at the schema head $HEAD_REV: no migration, so no pre-migration backup is expected (OLD_REF=0cd236c exercises that path)"
+        check "no pre-migration backup was written (nothing to migrate)" "0" "$(printf '%s\n' "$bks" | grep -c .)"
+    fi
+    check "the client id survived the upgrade" "zbinst-upgrade" "$(vsh "zfsbackup-config identity show --json 2>/dev/null | python3 $G/jget.py 'd[\"client_id\"]'" | tr -d '[:space:]')"
     check_re "the dataset is still configured" "$POOL/data" "$(cli list datasets)"
     check_re "the daemon is on the stored generation (StatusText)" '^generation [0-9]+$' "$(sd_prop StatusText)"
     local ujl; ujl="$(jl --since @$umark)"
-    check_re "the journal (ExecStartPre) says it backed up the database first" "Backed up $DB \\(schema $OLD_REV" "$ujl"
-    check_re "... and that it migrated $OLD_REV -> $HEAD_REV" "Migrated the schema of $DB from $OLD_REV to $HEAD_REV" "$ujl"
+    if [ "$MIGRATES" -eq 1 ]; then
+        check_re "the journal (ExecStartPre) says it backed up the database first" "Backed up $DB \\(schema $OLD_REV" "$ujl"
+        check_re "... and that it migrated $OLD_REV -> $HEAD_REV" "Migrated the schema of $DB from $OLD_REV to $HEAD_REV" "$ujl"
+    else
+        check_re "the journal (ExecStartPre) says the schema is up to date" "Schema is up to date" "$ujl"
+    fi
     # a plain restart writes no second backup
     umark=$(( $(jl_epoch) - 1 ))
     vsh "systemctl restart $UNIT"; rc=$?
     check "a plain restart exits 0" "0" "$rc"
     check "... ExecStartPre found the schema up to date" "1" "$(jl --since @$umark | grep -c 'Schema is up to date' | tr -d '[:space:]')"
-    check "... and wrote no second backup (still 1 backup file)" "1" "$(vsh "ls -1 $BAKDIR | grep -vc -- '-\(wal\|shm\)\$'" | tr -d '[:space:]')"
+    check "... and wrote no (second) backup (still $MIGRATES backup file(s))" "$MIGRATES" "$(vsh "ls -1 $BAKDIR | grep -vc -- '-\(wal\|shm\)\$'" | tr -d '[:space:]')"
     check "the unit is active again" "active" "$(sd_prop ActiveState)"
     vsh "systemctl stop $UNIT" || true
     section_end
 }
 
 # ───────────────────── I16: in-place upgrade under a running daemon (S-8) ─────────────────────
-# pip_venv <wheel on the guest> [reinstall]: install into the venv, pip or (a `uv venv` has no pip) uv; --no-deps keeps it offline
+# pip_venv "<wheel on the guest>[ <wheel>...]" [reinstall]: install into the venv, pip or (a `uv venv` has no pip) uv; --no-deps keeps it
+# offline. The first argument is a space-separated list (NEW_GUEST, BUMP_GUEST: both wheels of the split layout in one command, so pip
+# installs them together as the runbook says; BUMP_LIB_GUEST: the library alone).
 pip_venv() {
-    local whl="$1" re="${2:-}"
+    local whls="$1" re="${2:-}" w quoted=""
+    for w in $whls; do quoted="$quoted '$w'"; done
     if vsh "test -x $VENV/bin/pip"; then
-        vsh "$VENV/bin/pip install -q --no-deps ${re:+--force-reinstall} '$whl' 2>&1"
+        vsh "$VENV/bin/pip install -q --no-deps ${re:+--force-reinstall} $quoted 2>&1"
     else
-        vsh "/var/tmp/zbinst-uvtool/bin/uv pip install --python $VENV/bin/python --no-deps ${re:+--reinstall} '$whl' 2>&1"
+        vsh "/var/tmp/zbinst-uvtool/bin/uv pip install --python $VENV/bin/python --no-deps ${re:+--reinstall} $quoted 2>&1"
     fi
 }
 venv_version() { vsh "$VENV/bin/zfsbackupd --version 2>&1" | head -n1 | awk '{print $2}' | tr -d '[:space:]'; }
@@ -1038,12 +1183,10 @@ rx_still_running() { # the stream's receive is alive and has not read the whole 
 
 inplace_upgrade() {
     section "I16 — in-place \`pip install\` over a RUNNING daemon: drain, exit 76, one restart (S-8 version-skew guard)"
-    local bwhl nwhl="$NEW_WHL_BASE" oldpid mark out rc
-    bwhl="$(basename "$BUMP_WHL")"
-    put_file "$BUMP_WHL" "$G/$bwhl" 644
-    put_file "$NEW_WHL" "$G/$nwhl" 644
+    local oldpid mark out rc
+    put_wheels
     vsh "tc qdisc del dev lo root >/dev/null 2>&1; systemctl stop $UNIT >/dev/null 2>&1; systemctl reset-failed $UNIT >/dev/null 2>&1; pkill -9 -f '^(/[^ ]*/)?zfs (receive|send)' >/dev/null 2>&1; true" || true
-    out="$(pip_venv "$G/$nwhl" reinstall)"; rc=$?
+    out="$(pip_venv "$NEW_GUEST" reinstall)"; rc=$?
     check "precondition: version N ($CUR_VER) is (re)installed in the venv" "0 $CUR_VER" "$rc $(venv_version)"
     check "the SHIPPED unit has RestartSec=60 and RestartForceExitStatus naming 76" "1min yes" \
         "$(sd_prop RestartUSec) $(vsh "systemctl show -p RestartForceExitStatus --value $UNIT | grep -q 76 && echo yes || echo no" | tr -d '[:space:]')"
@@ -1061,7 +1204,7 @@ DROPEOF
 
     # ---- cycle 1: N -> N+1, idle daemon
     oldpid="$(sd_prop MainPID)"; mark=$(( $(jl_epoch) - 1 ))
-    out="$(pip_venv "$G/$bwhl")"; rc=$?
+    out="$(pip_venv "$BUMP_GUEST")"; rc=$?
     check "C1 ($CUR_VER -> $BUMP_VER): pip install of N+1 over the running daemon succeeds" "0" "$rc"
     [ "$rc" -eq 0 ] || printf '%s\n' "$out" | sed 's/^/    pip: /'
     wait_guest 90 "journalctl -u $UNIT -o cat --no-pager --since @$mark | grep -q '$SKEW_WARN'" \
@@ -1075,7 +1218,7 @@ DROPEOF
 
     # ---- cycle 2: the same version reinstalled
     oldpid="$(sd_prop MainPID)"; mark=$(( $(jl_epoch) - 1 ))
-    out="$(pip_venv "$G/$bwhl" reinstall)"; rc=$?
+    out="$(pip_venv "$BUMP_GUEST" reinstall)"; rc=$?
     check "C2 (same version $BUMP_VER): a forced reinstall succeeds" "0" "$rc"
     wait_guest 90 "journalctl -u $UNIT -o cat --no-pager --since @$mark | grep -q '$SKEW_WARN'" \
         && pass "C2: the drain WARNING appeared" || fail "C2: a same-version reinstall was not detected within 90 s"
@@ -1083,12 +1226,26 @@ DROPEOF
     await_exit76_restart "$oldpid" "$mark" "C2"
     after_restart_clean "$oldpid" "$mark" "C2" "$BUMP_VER"
 
+    # ---- cycle 2b: the library alone, reinstalled (the guard watches the libzfseasy distribution too)
+    if [ -n "$BUMP_LIB_GUEST" ]; then
+        oldpid="$(sd_prop MainPID)"; mark=$(( $(jl_epoch) - 1 ))
+        out="$(pip_venv "$BUMP_LIB_GUEST" reinstall)"; rc=$?
+        check "C2b (libzfseasy $BUMP_VER only): a forced reinstall of the library wheel alone succeeds" "0" "$rc"
+        wait_guest 90 "journalctl -u $UNIT -o cat --no-pager --since @$mark | grep -q '$SKEW_WARN'" \
+            && pass "C2b: the drain WARNING appeared" || fail "C2b: a reinstall of libzfseasy alone was not detected within 90 s"
+        check_re "C2b: the WARNING names libzfseasy" "libzfseasy $BUMP_VER was reinstalled" "$(jl --since @$mark | grep -- "$SKEW_WARN")"
+        await_exit76_restart "$oldpid" "$mark" "C2b"
+        after_restart_clean "$oldpid" "$mark" "C2b" "$BUMP_VER"
+    else
+        info "C2b skipped: this tree has a single wheel (nothing separate to reinstall)"
+    fi
+
     # ---- cycle 3: the drain waits for a transfer in flight
     SDS="$POOL/backups/$CID/data"
     oldpid="$(sd_prop MainPID)"; mark=$(( $(jl_epoch) - 1 ))
     if slow_transfer c3; then
         local snap; snap="$(vsh "zfs list -H -t snapshot -o name -s createtxg '$POOL/data' | tail -n1" | tr -d '[:space:]')"; snap="${snap#*@}"
-        out="$(pip_venv "$G/$bwhl" reinstall)"
+        out="$(pip_venv "$BUMP_GUEST" reinstall)"
         wait_guest 90 "journalctl -u $UNIT -o cat --no-pager --since @$mark | grep -q '$SKEW_WARN'" \
             && pass "C3: the drain WARNING appeared during the throttled transfer" || fail "C3: no drain WARNING"
         sleep 20
@@ -1109,7 +1266,7 @@ DROPEOF
     # ---- cycle 4: systemctl stop during a drain is an ordinary stop
     oldpid="$(sd_prop MainPID)"; mark=$(( $(jl_epoch) - 1 ))
     if slow_transfer c4; then
-        out="$(pip_venv "$G/$bwhl" reinstall)"
+        out="$(pip_venv "$BUMP_GUEST" reinstall)"
         wait_guest 90 "journalctl -u $UNIT -o cat --no-pager --since @$mark | grep -q '$SKEW_WARN'" \
             && pass "C4: the drain WARNING appeared during the throttled transfer" || fail "C4: no drain WARNING"
         wait_guest 20 "grep -q '^draining=' $DB.daemon.pid" || true
@@ -1137,7 +1294,7 @@ DROPEOF
         systemctl daemon-reload; systemctl reset-failed $UNIT >/dev/null 2>&1
         true
     " || true
-    out="$(pip_venv "$G/$nwhl" reinstall)"
+    out="$(pip_venv "$NEW_GUEST" reinstall)"
     check "the venv is back on N ($CUR_VER)" "$CUR_VER" "$(venv_version)"
     section_end
 }

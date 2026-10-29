@@ -115,7 +115,7 @@ from pathlib import Path
 import click
 import pytest
 import yaml
-from click.testing import CliRunner
+from _click_compat import make_runner
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError, SQLAlchemyError
 
@@ -220,12 +220,12 @@ def db(tmp_path) -> Path:
 
 
 class Cli:
-    """`CliRunner` with the two checks every call here wants: nothing but
-    `SystemExit` may escape a command (the error mapper owns all failures), and
-    stdout / stderr are kept apart."""
+    """A click `CliRunner` (`_click_compat.make_runner`: stdout / stderr kept apart
+    on click 8.1 and >= 8.2 alike) with the check every call here wants: nothing
+    but `SystemExit` may escape a command (the error mapper owns all failures)."""
 
     def __init__(self) -> None:
-        self.runner = CliRunner()
+        self.runner = make_runner()
 
     def __call__(self, *args, env=None, input=None):
         result = self.runner.invoke(
@@ -2742,32 +2742,40 @@ class TestPackaging:
         with open(REPO / "pyproject.toml", "rb") as handle:
             return tomllib.load(handle)
 
+    @staticmethod
+    def dependency_names(pyproject):
+        from packaging.requirements import Requirement
+        from packaging.utils import canonicalize_name
+
+        return {canonicalize_name(Requirement(d).name) for d in pyproject["project"]["dependencies"]}
+
     def test_console_script_is_declared(self, pyproject):
-        scripts = pyproject["tool"]["poetry"]["scripts"]
+        scripts = pyproject["project"]["scripts"]
         assert scripts["zfsbackup-config"] == "zfsbackup.cli.main:main"
         assert scripts["zfsbackupd"] == "zfsbackup.daemon_entry:main"
 
     def test_daemon_console_script_target_resolves_and_is_callable(self, pyproject):
         import importlib
 
-        module_name, _, attr = pyproject["tool"]["poetry"]["scripts"]["zfsbackupd"].partition(":")
+        module_name, _, attr = pyproject["project"]["scripts"]["zfsbackupd"].partition(":")
         target = getattr(importlib.import_module(module_name), attr)
         assert callable(target)
 
     def test_console_script_target_resolves_and_is_callable(self, pyproject):
         import importlib
 
-        module_name, _, attr = pyproject["tool"]["poetry"]["scripts"]["zfsbackup-config"].partition(":")
+        module_name, _, attr = pyproject["project"]["scripts"]["zfsbackup-config"].partition(":")
         target = getattr(importlib.import_module(module_name), attr)
         assert callable(target)
         assert target is cli_main.main
 
-    def test_both_packages_are_included(self, pyproject):
+    def test_the_zfsbackup_package_is_included_and_libzfseasy_is_a_dependency(self, pyproject):
         includes = {entry["include"] for entry in pyproject["tool"]["poetry"]["packages"]}
-        assert {"libzfseasy", "zfsbackup"} <= includes
+        assert includes == {"zfsbackup"}
+        assert "libzfseasy" in self.dependency_names(pyproject)
 
     def test_runtime_dependencies_the_cli_imports_are_declared(self, pyproject):
-        deps = pyproject["tool"]["poetry"]["dependencies"]
+        deps = self.dependency_names(pyproject)
         for name in ("click", "sqlalchemy", "alembic", "pyyaml"):
             assert name in deps
 

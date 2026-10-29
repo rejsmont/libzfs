@@ -29,7 +29,10 @@ When producing a plan:
 - **Assign owners.** File ownership inside `zfsbackup/` is **exclusive** — route each unit to the
   one executor that owns its files:
   - `zfsbackup-developer` → daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`,
-    `workers.py`, `remote.py`, `api.py`
+    `workers.py`, `remote.py`, `api.py`, `identity.py`, and the support and shared modules
+    (`daemonlock.py`, `stopflag.py`, `runtime_config.py`, `procident.py`, `sdnotify.py`, `protocol.py`,
+    `version.py`, `logsetup.py`, `health.py`, `health_collect.py`, `daemon_entry.py`), `packaging/**`,
+    `pyproject.toml` (see `.claude/agents/README.md`)
   - `zfsbackup-store-developer` → `zfsbackup/config/store/**` incl. `store/migrations/`, `alembic.ini` (models, mapper, engine/session,
     migrations)
   - `zfsbackup-cli-developer` → `zfsbackup/cli/**` (the `zfsbackup-config` Click application)
@@ -72,14 +75,18 @@ When producing a plan:
   `_run_cycle()` loop): it spawns and monitors worker processes, sharing a `zfsbackup.stopflag.StopFlag`
   stop flag and handling `SIGINT`/`SIGTERM`. Entry point: `python -m zfsbackup.daemon`.
 - `zfsbackup/workers.py` — the per-dataset work: `SnapshotWorker`, `PruningWorker`,
-  `RemoteBackupWorker`, `ApiWorker`, each sleeping via `stop_event.wait(timeout=interval)`.
-- `zfsbackup/remote.py` — remote transfer logic (send/receive over SSH or similar).
-- `zfsbackup/api.py` — HTTP API for daemon status/control.
+  `RemoteBackupWorker`, `ApiWorker`, each sleeping in short slices (`_wait`) and checking for an exit
+  reason (stop, supervisor gone, reload) at every safe point.
+- `zfsbackup/remote.py` — the client side of remote backup (`RemoteBackupManager`): `zfs send` streamed
+  over a pinned mutual-TLS websocket to a zfsbackup server.
+- `zfsbackup/api.py` — the server's HTTPS API (`create_app`): enrollment, negotiate, `/stream` receive,
+  resume tokens.
 - `zfsbackup/config/store/` — the SQLAlchemy config store: `models.py` (schema), `mapper.py` (ORM⇄dataclass),
   `db.py` (engine/session, WAL pragmas, fork-safe engine cache). A **separate layer** from the
   dataclasses, not a replacement — `DatasetConfig` is also a remote wire format with no DB behind it,
   and config objects outlive any session. Plans must preserve that separation.
-- `zfsbackup/cli/` — the `zfsbackup-config` Click application; the **only** writer to the store.
+- `zfsbackup/cli/` — the `zfsbackup-config` Click application; the **only** writer of configuration and
+  of the host identity (the trust tables have a second writer, the API worker, through `store.trust`).
 
 Trust the source when any doc disagrees with it, and flag the stale doc.
 
@@ -87,7 +94,7 @@ Trust the source when any doc disagrees with it, and flag the stale doc.
 - Retention rules are evaluated against snapshot age; edge cases around boundary alignment (e.g.
   "keep 1 per day for 7 days") are subtle. Any plan touching retention must specify the exact
   semantics and a table of test cases.
-- `DatasetInfo.aligned_reference_time` drives period boundaries — changes here can silently shift
+- `DatasetInfo.get_reference_time` drives period boundaries — changes here can silently shift
   which snapshots are retained.
 
 **Multiprocessing / IPC hazards:**
@@ -96,15 +103,14 @@ Trust the source when any doc disagrees with it, and flag the stale doc.
 - Any fix touching `workers.py` or IPC channels needs a plan for crash-and-restart coverage.
 
 **Remote transfer failure modes:**
-- `remote.py` uses `libzfseasy`'s streaming send/receive; the known issue of discarded `Popen`
-  handles (silent `receive` failure) in `libzfseasy` may surface here. If a fix in `libzfseasy`
-  affects the stream contract, coordinate with `libzfseasy-implementation-planner` first.
+- `remote.py` uses `libzfseasy`'s streaming send/receive, so a `libzfseasy` change to the stream
+  contract surfaces here. If a fix in `libzfseasy` affects the stream contract, coordinate with `libzfseasy-implementation-planner` first.
 
 **Tests:**
 - Three tiers: mocked unit/integration (default) and `real_zfs` (needs a pool, `-m real_zfs`).
   Two-VM end-to-end scenarios live under `scenarios/`.
 - `zfsbackup` test files: `tests/test_zfsbackup_*.py`.
-- Run: `pytest tests/test_zfsbackup_*.py`; add `-m real_zfs` for real-ZFS tests.
+- Run: `pytest tests/test_zfsbackup_*.py`; real-ZFS tests need a test pool and `ZFSB_REAL_ZFS=1 pytest -m real_zfs`.
 - Run daemon: the daemon reads only the SQLite config DB and refuses a `.yaml`. Import first —
   `python -m zfsbackup.cli -c /tmp/zfsbackup/config.db import zfsbackup/config.example.yaml`
   — then `python -m zfsbackup.daemon -c /tmp/zfsbackup/config.db --dry-run`, or `--test-config` for

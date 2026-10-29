@@ -23,7 +23,7 @@ import os
 from typing import Dict, List, Optional
 
 FIXTURE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures', 'openzfs')
-VERSIONS = ('2.1.5', '2.2.2', '2.4.1')
+VERSIONS = ('2.1.5', '2.2.2', '2.3.9', '2.4.1')
 
 _MARKERS = ('cmd', 'rc', 'pipestatus', 'stdout', 'stderr', 'send.stderr')
 

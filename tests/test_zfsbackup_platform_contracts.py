@@ -51,7 +51,7 @@ import requests  # noqa: E402
 import urllib3  # noqa: E402
 import websocket  # noqa: E402
 from flask import Flask  # noqa: E402
-from flask_sock import Sock  # noqa: E402
+from zfsbackup._vendor.flask_sock import Sock  # noqa: E402
 from requests.adapters import BaseAdapter, HTTPAdapter  # noqa: E402
 from simple_websocket import ConnectionClosed, Server as WsServer  # noqa: E402
 from simple_websocket import ws as simple_ws  # noqa: E402
@@ -76,10 +76,95 @@ def _version(dist: str) -> str:
 
 
 def _versions() -> str:
+    # flask-sock is vendored (zfsbackup/_vendor/flask_sock.py), not installed: no distribution.
     return ", ".join(
         f"{d} {_version(d)}"
-        for d in ("werkzeug", "requests", "urllib3", "simple-websocket", "flask-sock")
-    )
+        for d in ("werkzeug", "requests", "urllib3", "simple-websocket")
+    ) + ", flask-sock vendored " + VENDORED_FLASK_SOCK_VERSION
+
+
+# ---------------------------------------------------------------------------
+# The vendored flask-sock
+# ---------------------------------------------------------------------------
+
+#: Upstream flask-sock 0.7.0 (PyPI wheel) `flask_sock/__init__.py`: its size and SHA-256.
+#: zfsbackup/_vendor/flask_sock.py is that file byte for byte after a licence header; a changed
+#: hash means the vendored copy was edited or replaced, and every contract test below that
+#: names "flask-sock" describes the code it carries. To update: replace the whole file, then
+#: re-read the websocket contract tests and change these three constants together.
+VENDORED_FLASK_SOCK_VERSION = "0.7.0"
+UPSTREAM_FLASK_SOCK_SIZE = 4007
+UPSTREAM_FLASK_SOCK_SHA256 = "a3e4ba516ed70d9dca727ede671e239db1ae195d51674d58926038363f1d24e4"
+_VENDOR_HEADER_END = b"# SOFTWARE.\n\n"
+
+
+@pytest.mark.unit
+class TestVendoredFlaskSock:
+    """flask-sock is in no Debian/Ubuntu archive, so zfsbackup carries it. The contract that
+    matters is "this is still the code the websocket tests were written against"."""
+
+    @staticmethod
+    def vendored_bytes() -> bytes:
+        import zfsbackup._vendor.flask_sock as vendored
+
+        with open(vendored.__file__, "rb") as handle:
+            return handle.read()
+
+    def test_the_body_is_upstream_0_7_0_byte_for_byte(self):
+        import hashlib
+
+        data = self.vendored_bytes()
+        assert _VENDOR_HEADER_END in data, "the licence header ends with the MIT text's last line"
+        body = data[data.index(_VENDOR_HEADER_END) + len(_VENDOR_HEADER_END):]
+        assert len(body) == UPSTREAM_FLASK_SOCK_SIZE, len(body)
+        assert hashlib.sha256(body).hexdigest() == UPSTREAM_FLASK_SOCK_SHA256, (
+            "zfsbackup/_vendor/flask_sock.py no longer matches flask-sock "
+            f"{VENDORED_FLASK_SOCK_VERSION} after its header: edited or replaced"
+        )
+
+    def test_the_header_names_the_version_the_author_and_the_licence(self):
+        header = self.vendored_bytes().split(_VENDOR_HEADER_END)[0].decode()
+        assert f"Version:  {VENDORED_FLASK_SOCK_VERSION}" in header
+        assert "Miguel Grinberg" in header
+        assert "MIT License" in header and "Permission is hereby granted" in header
+        assert "Copyright (c) 2021 Miguel Grinberg" in header
+
+    def test_it_imports_only_flask_and_simple_websocket(self):
+        """(`eventlet` is a lazy import inside the `mode == 'eventlet'` branch, never reached here.)"""
+        import ast
+
+        tree = ast.parse(self.vendored_bytes().decode())
+        roots = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                roots.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                roots.add(node.module.split(".")[0])
+        assert roots - {"eventlet"} == {"functools", "flask", "simple_websocket"}, roots
+
+    def test_it_exports_what_the_api_and_the_tests_use(self):
+        import zfsbackup._vendor.flask_sock as vendored
+
+        assert vendored.Sock and vendored.ConnectionClosed is ConnectionClosed
+        assert hasattr(vendored.Sock, "route") and hasattr(vendored.Sock, "init_app")
+
+    def test_the_package_never_imports_an_installed_flask_sock(self):
+        import pathlib
+        import re
+
+        root = pathlib.Path(__file__).resolve().parent.parent / "zfsbackup"
+        offenders = []
+        for path in root.rglob("*.py"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if re.match(r"\s*(from|import)\s+flask_sock\b", line):
+                    offenders.append(f"{path.relative_to(root)}: {line.strip()}")
+        assert not offenders, offenders
+
+    def test_api_uses_the_vendored_copy(self):
+        import zfsbackup._vendor.flask_sock as vendored
+        from zfsbackup import api
+
+        assert api.Sock is vendored.Sock
 
 
 # ---------------------------------------------------------------------------
@@ -1199,3 +1284,93 @@ class TestImportlibMetadataContract:
         dist = importlib.metadata.distribution("zfsbackup")
         assert dist.version == "9.9.9"
         assert dist._path.name == "zfsbackup-9.9.9.dist-info"
+
+
+# ---------------------------------------------------------------------------
+# multiprocessing.forkserver: what BackupDaemon._stop_forkserver / _current_forkserver read
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestForkserverPrivateSurface:
+    """`BackupDaemon._current_forkserver` reads `forkserver._forkserver._forkserver_pid`, and
+    `_stop_forkserver` (which mirrors `ForkServer._stop_unlocked` minus its unbounded `waitpid`)
+    takes `_lock` without blocking, clears `_forkserver_pid`, `_forkserver_alive_fd`,
+    `_forkserver_address` (and `_forkserver_authkey` where it exists, 3.14+), closes the alive fd
+    and unlinks a non-abstract address. Every access is guarded, so a moved attribute never
+    breaks the daemon -- it silently turns the stop into a no-op and systemd SIGKILLs the
+    forkserver again (the journal line this step exists to remove). Stdlib only."""
+
+    @pytest.fixture
+    def server(self):
+        from multiprocessing import forkserver
+
+        return forkserver._forkserver
+
+    def test_the_module_keeps_its_process_global_instance(self, server):
+        from multiprocessing import forkserver
+
+        assert isinstance(server, forkserver.ForkServer), (
+            "multiprocessing.forkserver._forkserver is no longer a ForkServer: "
+            "BackupDaemon._current_forkserver and _stop_forkserver read it"
+        )
+
+    @pytest.mark.parametrize(
+        "attribute", ["_lock", "_forkserver_pid", "_forkserver_alive_fd", "_forkserver_address"]
+    )
+    def test_the_forkserver_has_the_attribute_the_daemon_reads(self, server, attribute):
+        assert hasattr(server, attribute), (
+            f"ForkServer.{attribute} is gone: BackupDaemon._stop_forkserver (and "
+            "_current_forkserver for the pid) silently stop working"
+        )
+
+    def test_the_lock_can_be_taken_without_blocking_and_released(self, server):
+        lock = server._lock
+        assert callable(getattr(lock, "acquire", None)) and callable(getattr(lock, "release", None))
+        assert lock.acquire(blocking=False) is True, "nobody should hold the lock in this test"
+        try:
+            assert lock.acquire(blocking=False) is False, "the lock is not re-entrant"
+        finally:
+            lock.release()
+
+    def test_the_unset_state_is_none_so_a_never_started_forkserver_is_skipped(self):
+        # A fresh interpreter: this process's forkserver may have been started by another test.
+        import subprocess
+        import sys
+
+        code = (
+            "from multiprocessing import forkserver as f; s = f._forkserver; "
+            "print(s._forkserver_pid, s._forkserver_alive_fd, s._forkserver_address)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split() == ["None", "None", "None"]
+
+    def test_the_authkey_exists_only_where_the_daemon_expects_it(self, server):
+        """3.14 added `_forkserver_authkey`; `_stop_forkserver` clears it only `if hasattr`."""
+        import sys
+
+        if sys.version_info >= (3, 14):
+            assert hasattr(server, "_forkserver_authkey")
+
+    def test_is_abstract_socket_namespace_exists_and_tells_the_two_apart(self):
+        from multiprocessing import util
+
+        assert callable(getattr(util, "is_abstract_socket_namespace", None)), (
+            "multiprocessing.util.is_abstract_socket_namespace is gone: "
+            "_stop_forkserver cannot decide whether to unlink the socket file"
+        )
+        assert util.is_abstract_socket_namespace("\0abstract") is True
+        assert util.is_abstract_socket_namespace("/tmp/path.sock") is False
+        assert util.is_abstract_socket_namespace(b"\0abstract") is True
+
+    def test_the_stdlib_stop_is_the_unbounded_wait_the_daemon_replaces(self):
+        """`ForkServer._stop_unlocked` exists (the daemon's bounded copy mirrors it)."""
+        from multiprocessing import forkserver
+
+        assert callable(getattr(forkserver.ForkServer, "_stop_unlocked", None))
+
+    def test_waitpid_has_wnohang(self):
+        assert isinstance(os.WNOHANG, int)

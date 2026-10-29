@@ -87,13 +87,14 @@ These need no `mock_subprocess`; they need a real SQLite engine. Keep them fast 
 ## Config — `pytest.ini`
 
 `python_files=test_*.py`, `python_classes=Test*`, `testpaths=tests`. `addopts`: `-v
---strict-markers --tb=short -m "not real_zfs"` plus coverage on `libzfseasy`. Markers: `unit`,
+--strict-markers --tb=short -m "not real_zfs"` plus coverage on `libzfseasy` and `zfsbackup`. Markers: `unit`,
 `integration`, `slow`, `subprocess`, `real_zfs`.
 
 ## Working rules
 
 - After writing a test, run exactly it: `pytest path::Class::test`; for real tests use
-  `pytest -m real_zfs` (they skip cleanly if no pool). Keep or raise coverage; add `--strict-markers`
+  `ZFSB_REAL_ZFS=1 pytest -m real_zfs` (without `ZFSB_REAL_ZFS=1` every real test skips; they also skip
+  cleanly if no pool). Keep or raise coverage; add `--strict-markers`
   clean markers.
 - Trust the source when it disagrees with any doc. When testing behavior, read the implementation
   first so mocked stdout matches what the real command emits.

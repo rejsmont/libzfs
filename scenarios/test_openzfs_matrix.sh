@@ -2,13 +2,17 @@
 #
 # test_openzfs_matrix.sh — run the real-ZFS pytest tier on every supported OpenZFS version (plan items T2 / B4).
 #
-# Supported matrix (docs/production_readiness_plan.md, decision Q5/D4); 2.3 is best-effort and not in it:
+# Supported matrix (docs/production_readiness_plan.md, decision Q5/D4; 2.3 joined with the Debian 13 release target,
+# docs/packaging_plan.md):
 #   zfsb-zfs21   Ubuntu 22.04 jammy     OpenZFS 2.1.x
 #   zfsb-zfs22   Ubuntu 24.04 noble     OpenZFS 2.2.x
+#   zfsb-zfs23   Debian 13 trixie       OpenZFS 2.3.x   (2.3.9: zfs-dkms + zfsutils-linux from `contrib`, built against the
+#                                                        cloud kernel's headers; the VM is launched from Debian's generic-cloud
+#                                                        arm64 qcow2 by URL, override with DEBIAN13_IMAGE=<url|file://path>)
 #   zfsb-zfs24   Ubuntu 26.04 resolute  OpenZFS 2.4.x   (2.4.1 verified)
 #
 # For each VM (created if missing, reused otherwise) the harness:
-#   1. installs zfsutils-linux from the distro, plus a Python >= 3.11 (the floor in pyproject.toml): the distro
+#   1. installs zfsutils-linux from the distro (Debian: zfs-dkms too, kernel module built on the spot: ~5 min), plus a Python >= 3.11 (the floor in pyproject.toml): the distro
 #      python3 is used when it is new enough; otherwise (jammy: 3.10) python3.11 comes from the deadsnakes PPA, or (Launchpad 503s) uv;
 #   2. ships `git archive $SRC_REF` (default HEAD) and builds a venv with the test dependencies;
 #   3. logs `zfs version` / `zpool version`;
@@ -24,18 +28,18 @@
 #   7. prints a per-version summary (pass/fail/skip/error counts and the failing test ids).
 #
 # Usage:
-#   ./scenarios/test_openzfs_matrix.sh                      # all three versions, tests/test_real_zfs.py only
-#   ./scenarios/test_openzfs_matrix.sh --only 21,24         # a subset (21 22 24)
+#   ./scenarios/test_openzfs_matrix.sh                      # all four versions, tests/test_real_zfs.py only
+#   ./scenarios/test_openzfs_matrix.sh --only 21,24         # a subset (21 22 23 24)
 #   ./scenarios/test_openzfs_matrix.sh --extra tests/test_zfsbackup_real.py   # more test files (repeatable)
 #   ./scenarios/test_openzfs_matrix.sh --formats-only       # provision + capture formats, no pytest
 #   ./scenarios/test_openzfs_matrix.sh --no-formats         # pytest only
 #   ./scenarios/test_openzfs_matrix.sh --keep-pools         # leave the format-capture pool in place
-#   ./scenarios/test_openzfs_matrix.sh --purge              # delete the matrix VMs (only these three) at the end
+#   ./scenarios/test_openzfs_matrix.sh --purge              # delete the matrix VMs (only these four) at the end
 #   ./scenarios/test_openzfs_matrix.sh --captures-only      # SP spike only: ship the scripts, run the captures, no pytest/formats
 #   ./scenarios/test_openzfs_matrix.sh --captures           # ... in addition to pytest and the formats
 #   ./scenarios/test_openzfs_matrix.sh --captures-only --sections M3,Z4   # a subset (M1 M2 M3 M4 EP M5 M6 M7 M8 M9 Z2 Z3 Z4 Z5 Z6 Z7)
 #   ./scenarios/test_openzfs_matrix.sh --captures-only --locales default,C,en_US.utf8   # passes (default: default,C)
-#   SRC_REF=<commit-ish> ...     # ship that tree instead of HEAD; for uncommitted work: SRC_REF=$(git stash create)
+#   SRC_REF=<commit-ish> ...     # ship that tree instead of HEAD; SRC_REF=WORKTREE ships the working tree as it is (untracked files included)
 #   MATRIX_LOG_DIR=<dir> ...     # where the per-VM logs go (default: a fresh mktemp dir, printed at the end)
 #   (uncommitted work does not need shipping for --captures-only: the capture scripts are embedded in this file)
 #
@@ -54,13 +58,17 @@
 #   Z5 change-key, Z6 encryption/encryptionroot, Z7 raw copy without a key.
 #
 # Exit status: 0 when every selected version ran and no test failed or errored, 1 otherwise, 2 on usage errors.
-# Requires: multipass on the host. Never touches ZFS on the host, and never any VM but the three above.
+# Requires: multipass on the host. Never touches ZFS on the host, and never any VM but the four above.
 
 set -uo pipefail
 
 # ─────────────────────────────── Configuration ──────────────────────────────
 # name:image:label
-ALL_TARGETS=("zfsb-zfs21:22.04:2.1" "zfsb-zfs22:24.04:2.2" "zfsb-zfs24:26.04:2.4")
+# (the middle field is a key, not necessarily a multipass image: see image_ref / distro_name)
+ALL_TARGETS=("zfsb-zfs21:22.04:2.1" "zfsb-zfs22:24.04:2.2" "zfsb-zfs23:debian13:2.3" "zfsb-zfs24:26.04:2.4")
+DEBIAN13_IMAGE="${DEBIAN13_IMAGE:-https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2}"
+image_ref()   { case "$1" in debian13) echo "$DEBIAN13_IMAGE" ;; *) echo "$1" ;; esac; }     # what `multipass launch` is given
+distro_name() { case "$1" in debian13) echo "Debian 13" ;; *) echo "Ubuntu $1" ;; esac; }
 
 VM_CPUS="${VM_CPUS:-2}"
 VM_MEM="${VM_MEM:-2G}"
@@ -104,7 +112,7 @@ for t in "${ALL_TARGETS[@]}"; do
         TARGETS+=("$t")
     fi
 done
-[ "${#TARGETS[@]}" -gt 0 ] || { echo "--only '$ONLY' selects nothing (use 21,22,24)" >&2; exit 2; }
+[ "${#TARGETS[@]}" -gt 0 ] || { echo "--only '$ONLY' selects nothing (use 21,22,23,24)" >&2; exit 2; }
 for f in ${EXTRA_TESTS[@]+"${EXTRA_TESTS[@]}"}; do
     case "$f" in tests/*.py) ;; *) echo "--extra takes a repo-relative tests/*.py path, got '$f'" >&2; exit 2 ;; esac
 done
@@ -132,8 +140,8 @@ vm_running() { multipass info "$1" 2>/dev/null | awk -F': *' '/^State/{print $2}
 ensure_vm() {
     local vm="$1" image="$2"
     if ! vm_exists "$vm"; then
-        step "Launching VM $vm (Ubuntu $image)"
-        multipass launch "$image" --name "$vm" --cpus "$VM_CPUS" --memory "$VM_MEM" --disk "$VM_DISK" \
+        step "Launching VM $vm ($(distro_name "$image"))"
+        multipass launch "$(image_ref "$image")" --name "$vm" --cpus "$VM_CPUS" --memory "$VM_MEM" --disk "$VM_DISK" \
             || die "failed to launch $vm"
     elif ! vm_running "$vm"; then
         step "Starting existing VM $vm"
@@ -142,6 +150,18 @@ ensure_vm() {
         info "VM $vm already running"
     fi
 }
+
+# SRC_REF=WORKTREE ships the working tree as it is (tracked changes AND untracked files): a commit object is built from a
+# temporary index (nothing is committed, stashed or staged in the real repository).
+if [ "$SRC_REF" = "WORKTREE" ]; then
+    wt_top="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)" || die "not in a git repo"
+    wt_idx="$(mktemp -u "${TMPDIR:-/tmp}/zfsb-wt-index.XXXXXX")"
+    wt_tree="$(cd "$wt_top" && GIT_INDEX_FILE="$wt_idx" git read-tree HEAD && GIT_INDEX_FILE="$wt_idx" git add -A && GIT_INDEX_FILE="$wt_idx" git write-tree)" \
+        || { rm -f "$wt_idx"; die "could not snapshot the working tree"; }
+    rm -f "$wt_idx"
+    SRC_REF="$(git -C "$wt_top" commit-tree "$wt_tree" -p HEAD -m 'openzfs matrix: working-tree snapshot')" || die "could not snapshot the working tree"
+    info "SRC_REF=WORKTREE -> $SRC_REF (an unreferenced commit of the working tree)"
+fi
 
 # put_file <host-file> <vm> <guest-path>: via `multipass transfer` (never piped stdin)
 put_file() { multipass transfer "$1" "$2:$3" || die "transfer of $1 to $2:$3 failed"; }
@@ -175,13 +195,27 @@ provision() {
     export DEBIAN_FRONTEND=noninteractive
     sudo mkdir -p "$WORK" && sudo chown "$(id -un)":"$(id -gn)" "$WORK"
     need=""
-    command -v zfs  >/dev/null 2>&1 || need="$need zfsutils-linux"
+    if [ "$(. /etc/os-release; echo "$ID")" = debian ]; then
+        # Debian ships OpenZFS in `contrib`, as DKMS source: the module is built against the running kernel's headers (the
+        # generic-cloud image runs the -cloud-arm64 kernel), then loaded. No Ubuntu-style prebuilt module.
+        if ! grep -qE '^Components:.*\bcontrib\b' /etc/apt/sources.list.d/debian.sources 2>/dev/null; then
+            sudo sed -i 's/^Components: main$/Components: main contrib/' /etc/apt/sources.list.d/debian.sources
+        fi
+        if ! command -v zfs >/dev/null 2>&1 || ! dkms status 2>/dev/null | grep -q '^zfs'; then
+            sudo apt-get update -qq
+            sudo -E apt-get install -y -qq "linux-headers-$(uname -r)" dkms zfs-dkms zfsutils-linux
+        fi
+        sudo modprobe zfs
+        zfs version >/dev/null 2>&1 || { echo "zfs module not loadable after the DKMS build" >&2; exit 1; }
+    else
+        command -v zfs  >/dev/null 2>&1 || need="$need zfsutils-linux"
+    fi
     command -v curl >/dev/null 2>&1 || need="$need curl"
     dpkg -s python3-venv >/dev/null 2>&1 || need="$need python3-venv"
     dpkg -s python3-pip  >/dev/null 2>&1 || need="$need python3-pip"
     if [ -n "$need" ]; then
         sudo apt-get update -qq
-        sudo apt-get install -y -qq $need
+        sudo -E apt-get install -y -qq $need
     fi
     PY="$(pick_python || true)"
     if [ -z "$PY" ]; then
@@ -226,7 +260,7 @@ run_pytest() {
     rm -rf "$WORK/tmp"; mkdir -p "$WORK/tmp"
     cd "$SRC" || exit 1
     # addopts is cleared: pytest.ini's --cov/-m "not real_zfs" would otherwise be stacked on ours
-    TMPDIR="$WORK/tmp" ZFSB_REAL_ZFS=1 PYTHONPATH="$SRC" "$VENV/bin/python" -m pytest \
+    TMPDIR="$WORK/tmp" ZFSB_REAL_ZFS=1 PYTHONPATH="$SRC:$SRC/libs/libzfseasy" "$VENV/bin/python" -m pytest \
         -o addopts= -p no:cacheprovider --basetemp="$WORK/tmp/pytest" \
         -m real_zfs -v --tb=short -rfEsx "$@"
     rc=$?
@@ -2501,7 +2535,7 @@ echo " logs: $LOG_DIR"
 for t in "${TARGETS[@]}"; do
     vm="${t%%:*}"; rest="${t#*:}"; image="${rest%%:*}"; label="${rest##*:}"
     echo
-    step "=== $vm (Ubuntu $image, OpenZFS $label.x) ==="
+    step "=== $vm ($(distro_name "$image"), OpenZFS $label.x) ==="
     if [ "$CAPTURES_ONLY" = 1 ]; then prov=ship_vm; else prov=provision_vm; fi
     if ! "$prov" "$vm" "$image"; then
         SUMMARY+=("${RED}$vm  OpenZFS $label  PROVISIONING FAILED${NC} (see $LOG_DIR/$vm.provision.log)")

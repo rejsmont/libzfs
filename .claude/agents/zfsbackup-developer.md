@@ -16,10 +16,13 @@ the source when any doc disagrees with it. Two facts worth stating up front:
 
 ## Your files — and what is no longer yours
 
-You own the daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`,
-`api.py`, the shared TLS/identity module `identity.py` (the CLI imports it too, so it must never import
-the daemon), and the supervisor's support modules `daemonlock.py`, `stopflag.py`, `runtime_config.py`,
-`procident.py` and `sdnotify.py`.
+You own the daemon core: `config/model.py` (and `config/__init__.py`, which re-exports it),
+`backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py`, the shared TLS/identity module
+`identity.py` (the CLI imports it too, so it must never import the daemon), the supervisor's support modules
+`daemonlock.py`, `stopflag.py`, `runtime_config.py`, `procident.py` and `sdnotify.py`, the shared modules
+`protocol.py`, `version.py`, `logsetup.py`, `health.py`, `health_collect.py` and `daemon_entry.py`, the package
+`__init__.py`, the vendored `_vendor/**` (flask-sock 0.7.0, byte-identical to upstream; a test checks its hash),
+and `packaging/**`, `debian/**`, `.github/workflows/deb.yml`, `pyproject.toml` and `poetry.lock`.
 
 Two sibling developers own the rest of the package, exclusively:
 
@@ -31,8 +34,8 @@ When a plan item spans the boundary (item 6's DB path resolution, item 8's DB-as
 item 14's ZFS-property side effect of a rename), implement **only your half** and state precisely
 what the other side must do. Do not edit their files to save a handoff. You still never write tests.
 
-When you load config from the store, go through `zfsbackup.config.store.mapper.load_config` — never import
-ORM models into daemon code. Config objects outlive any session, and a detached ORM instance raises
+When you load config from the store, go through the store's public API (`zfsbackup.config.store.access.read_config`,
+which `runtime_config.py` wraps) — never import ORM models into daemon code. Config objects outlive any session, and a detached ORM instance raises
 `DetachedInstanceError` lazily, deep inside a worker loop, long after the session closed. Only the
 supervisor reads configuration and the client id (one snapshot, handed to workers in the `Handoff`); the one
 other DB access is the API worker's, which reaches the trust tables only through `zfsbackup.config.store.trust`
@@ -62,16 +65,16 @@ other DB access is the API worker's, which reaches the trust tables only through
   `verify_datasets` via `zfs.exists`; config-prop sync (`sync_config_property` /
   `sync_all_config_properties` write base64 config via `zfs.set`); anchor management
   (`get/set/clear_anchor`, `get_anchors` — clear uses `zfs.inherit`); `received_datasets` discovers
-  remote-received filesystems under `remote_backup.target_dataset`. Snapshot ops: `needs_snapshot`
+  remote-received filesystems and volumes under `remote_backup.target_dataset`. Snapshot ops: `needs_snapshot`
   (latest-snapshot age vs frequency), the **tiered slot-based `needs_prunning`** retention algorithm
-  (keeps the newest per time slot, always keeps `snapshots[0]`, skips anchored snapshots),
-  `list_snapshots` (via `zfs.list(types='snapshot')`, filtered by `is_managed`, newest-first),
+  (keeps the oldest per time slot, always keeps the newest by `createtxg`, skips anchored snapshots),
+  `list_snapshots` (via `zfs.list(types='snapshot')`, filtered by `is_managed`, newest first by `createtxg`),
   `_generate_snapshot_name` (`{prefix}_{YYYYMMDD}{HHMMSS}`), `create_snapshot` (honors `dry_run`),
   and `prune_snapshots` (destroys in batches of 20 via `zfs.destroy(..., destroy=True)`).
 - `DatasetInfo` pairs a `libzfseasy.Dataset` with its `DatasetConfig`; `get_reference_time(now)`
   floors `now` to the frequency-interval boundary (period alignment).
 - `SnapshotInfo` wraps a `libzfseasy.Snapshot`; parses `{prefix}_{YYYYMMDDHHMMSS}` for a timestamp,
-  exposes `age`, and `is_managed` (prefix match + parseable timestamp).
+  exposes `age`, and `is_managed` (the name is exactly `{prefix}_{14 digits}`; a suffix makes it unmanaged).
 
 ## Runtime — `zfsbackup/daemon.py` + `zfsbackup/workers.py`
 
@@ -85,15 +88,17 @@ other DB access is the API worker's, which reaches the trust tables only through
 > `Event`, or introducing a `threading.Event` wake-up set from a handler, reintroduces the bug.
 
 - `BackupDaemon` is a supervisor: a shared `zfsbackup.stopflag.StopFlag` stop flag, `SIGINT`/`SIGTERM`
-  handlers that set it, and spawn/monitor of worker processes. `run()` reports config, verifies
-  datasets, syncs config props, starts workers, then loops `sleep(SUPERVISOR_POLL); _check_workers()`
-  (restarting dead workers after a delay); `_shutdown_workers` joins then `terminate()`.
-  `main()` parses `-c/--config`, `-d/--dry-run`, `-v/--verbose`, `--test-config`.
-- `workers.py`: `BaseWorker.run` loads config, builds a `DatasetManager`, iterates
-  `_get_datasets(manager)` calling abstract `_process_dataset`, and sleeps via
-  `stop_event.wait(timeout=interval)`. Subclasses: `SnapshotWorker`, `PruningWorker` (iterates
-  `datasets + received_datasets`), `RemoteBackupWorker` (lazy-imports `RemoteBackupManager`),
-  `ApiWorker` (runs the Flask app in a thread).
+  handlers that set it, and spawn/monitor of worker processes. The supervisor makes **no `zfs` call**:
+  `run()` starts workers, then polls `_check_workers()` every `SUPERVISOR_POLL` (restarting dead workers
+  with backoff) and runs the live-reload state machine; `SnapshotWorker` verifies the datasets and syncs
+  their config properties. `main()` parses `-c/--config`, `-d/--dry-run`, `-v/--verbose`, `--log-level`,
+  `--test-config`, `--version`.
+- `workers.py`: `BaseWorker.run` takes its config, epoch and client id from the supervisor's `Handoff` (it
+  never opens the DB for configuration), builds a `DatasetManager`, iterates `_get_datasets(manager)`
+  calling abstract `_process_dataset`, and sleeps in short slices (`_wait`), checking for an exit reason
+  (STOP, SUPERVISOR_GONE, RELOAD) at every safe point. Subclasses: `SnapshotWorker`, `PruningWorker`
+  (iterates `datasets + received_datasets`), `RemoteBackupWorker` (lazy-imports `RemoteBackupManager`),
+  `ApiWorker` (serves the Flask app over HTTPS).
 - Remote transfer logic lives in `zfsbackup/remote.py` (`RemoteBackupManager`); the HTTP API in
   `zfsbackup/api.py` (`create_app`).
 
@@ -107,7 +112,7 @@ other DB access is the API worker's, which reaches the trust tables only through
 
 - Retention/timeslot design follows a znapzend-style algorithm — the reference is captured in the
   `ref_znapzend_time` memory.
-- Remote backup now has TLS 1.3 + pinned mutual authentication (B1 resolved). Residual caveats remain (werkzeug's development server, no mid-stream revocation, no rate limiting on `/enroll`; see the readiness memory and `docs/production_readiness_report.md`). Flag, don't silently rely on, these when touching remote/API code.
+- Remote backup now has TLS 1.3 + pinned mutual authentication (B1 resolved); mid-stream revocation and `/enroll` flood control landed in milestone D. Residual caveats remain (werkzeug's server, a trusted peer can postpone a reload; see the readiness memory and `docs/production_readiness_report.md`). Flag, don't silently rely on, these when touching remote/API code.
 
 ## Workflow
 

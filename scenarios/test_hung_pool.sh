@@ -180,7 +180,7 @@ echo "pool $POOL on /dev/mapper/$DEV (loop $LOOP):"; zpool status "$POOL" | sed 
 zfs version
 set +e
 
-PYTHONPATH="$WORK/src" timeout -k 15 300 python3 -u "$WORK/driver.py" "$POOL" "$DEV"
+PYTHONPATH="$WORK/src:$WORK/src/libs/libzfseasy" timeout -k 15 300 python3 -u "$WORK/driver.py" "$POOL" "$DEV"
 rc=$?
 echo "driver exit status: $rc"
 [ "$rc" -eq 4 ] && rc=104      # a guest exit status of 4 hangs `multipass exec`

@@ -1,0 +1,96 @@
+#!/usr/bin/make -f
+# Two Python projects in one source package: libs/libzfseasy (python3-libzfseasy)
+# and the repository root (zfsbackup). Each is built and installed by pybuild
+# into its own package directory, so neither package carries the other's files
+# and each gets its own dist-info.
+
+export DH_VERBOSE = 1
+LIB_DIR = libs/libzfseasy
+LIB_PKG = debian/python3-libzfseasy
+APP_PKG = debian/zfsbackup
+
+# The units in packaging/ are written for the pip install in
+# /opt/zfsbackup/venv; packaging/ stays the one source of the units.
+VENV_BIN = /opt/zfsbackup/venv/bin
+UNIT_DIR = $(APP_PKG)/usr/lib/systemd/system
+UPSTREAM_TEXTFILE_DIR = /var/lib/node_exporter/textfile_collector
+DEBIAN_TEXTFILE_DIR = /var/lib/prometheus/node-exporter
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+# pybuild keeps one build directory per PYBUILD_NAME under .pybuild/: the two
+# projects must not share one, or the second build lands on the first's files.
+PYBUILD_LIB = PYBUILD_NAME=libzfseasy
+PYBUILD_APP = PYBUILD_NAME=zfsbackup
+
+override_dh_auto_clean:
+	$(PYBUILD_APP) dh_auto_clean
+	$(PYBUILD_LIB) dh_auto_clean --sourcedirectory=$(LIB_DIR)
+	rm -rf .pybuild $(LIB_DIR)/.pybuild
+
+override_dh_auto_configure:
+	$(PYBUILD_APP) dh_auto_configure
+	$(PYBUILD_LIB) dh_auto_configure --sourcedirectory=$(LIB_DIR)
+
+override_dh_auto_build:
+	$(PYBUILD_APP) dh_auto_build
+	$(PYBUILD_LIB) dh_auto_build --sourcedirectory=$(LIB_DIR)
+
+override_dh_auto_install:
+	$(PYBUILD_APP) dh_auto_install --destdir=$(APP_PKG)
+	$(PYBUILD_LIB) dh_auto_install --sourcedirectory=$(LIB_DIR) --destdir=$(LIB_PKG)
+
+# The runbook goes to /usr/share/doc (debian/zfsbackup.docs), not into the module
+# directory. Removed late: something after dh_auto_install puts it back.
+execute_before_dh_installdeb:
+	rm -f $(APP_PKG)/usr/lib/python3/dist-packages/zfsbackup/README.md
+
+# The mocked suite is NOT run at build time (this also makes `nocheck` a no-op):
+# it takes about 14 minutes on 4 cores, starts real daemons and worker processes
+# (fork, spawn and forkserver), binds sockets and takes flocks, so it is
+# unreliable on a loaded build host, and it wants pytest-mock, requests-mock and
+# xdist plus a click new enough for its CliRunner use. tests.yml runs the suite
+# from the source tree; debian/tests/ checks the installed packages against the
+# distribution's own libraries (the platform-contract files).
+override_dh_auto_test:
+
+# zfsbackup-check.service: packaging/ writes the Prometheus textfile to
+# /var/lib/node_exporter/textfile_collector/, node_exporter's upstream
+# convention. Debian's and Ubuntu's prometheus-node-exporter read
+# /var/lib/prometheus/node-exporter (the compiled-in --collector.textfile.directory,
+# a directory that package creates), so the packaged unit writes there.
+#
+# zfsbackup.service: its header comment describes the pip install and the pre-253
+# drop-in (not shipped here: Debian 13 and Ubuntu 26.04 have systemd >= 257), so
+# it is replaced by a Debian one.
+execute_before_dh_installsystemd:
+	install -d $(UNIT_DIR)
+	{ echo "# zfsbackup daemon unit (Debian package). Not enabled by the package: import the"; \
+	  echo "# configuration, enroll, then 'systemctl enable --now zfsbackup'."; \
+	  echo "# See /usr/share/doc/zfsbackup/README.md."; echo; \
+	  sed '1,/^$$/d' packaging/systemd/zfsbackup.service; } \
+	    | sed 's|$(VENV_BIN)|/usr/bin|g' > $(UNIT_DIR)/zfsbackup.service
+	for u in zfsbackup-check.service zfsbackup-check.timer; do \
+	    sed -e 's|$(VENV_BIN)|/usr/bin|g' \
+	        -e 's|$(UPSTREAM_TEXTFILE_DIR)|$(DEBIAN_TEXTFILE_DIR)|g' \
+	        packaging/systemd/$$u > $(UNIT_DIR)/$$u; \
+	done
+	chmod 0644 $(UNIT_DIR)/*
+	if grep -rhv '^#' $(UNIT_DIR) | grep /opt/; then echo 'unit still refers to /opt' >&2; exit 1; fi
+	grep -q '^Environment=ZFSBACKUP_CHECK_OUTPUT=$(DEBIAN_TEXTFILE_DIR)/zfsbackup.prom$$' \
+	    $(UNIT_DIR)/zfsbackup-check.service \
+	    || { echo 'zfsbackup-check.service does not write to $(DEBIAN_TEXTFILE_DIR)' >&2; exit 1; }
+
+# dh_installsysusers is not in the compat 13 sequence: call it by hand, before
+# dh_installtmpfiles (the group must exist before the directory is created).
+execute_before_dh_installtmpfiles:
+	cp packaging/sysusers.d/zfsbackup.conf debian/zfsbackup.sysusers
+	dh_installsysusers
+	cp packaging/tmpfiles.d/zfsbackup.conf debian/zfsbackup.tmpfiles
+
+# The units are installed into the package directory above, so dh_installsystemd
+# finds all three. Not enabled on installation; stopped before an upgrade and
+# started again afterwards (only if enabled: deb-systemd-invoke checks).
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-restart-after-upgrade

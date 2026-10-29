@@ -11,7 +11,9 @@ Trust the source when any doc disagrees with it.
 
 ## Your files — exclusive ownership
 
-- `zfsbackup/config/store/**` — `models.py`, `mapper.py`, `db.py`, `migrate.py`, `__init__.py`
+- `zfsbackup/config/store/**` — `models.py`, `mapper.py`, `db.py`, `migrate.py`, `paths.py`, `access.py`,
+  `trust.py`, `importer.py`, `backup.py`, `messages.py`, `errors.py`, `_liveconn.py`, `_alembic_quiet.py`,
+  `__init__.py`
 
 **`zfsbackup/store/` is a different namespace and is not yours.** It is reserved for *backup data*
 destinations (object storage, cloud targets). The config store lives under `zfsbackup/config/store/`
@@ -44,7 +46,11 @@ possible — do not let callers reach past it into the ORM.
 
 Tables: `global_settings` and `remote_server` as `CHECK(id = 1)` singletons, `datasets`,
 `destinations`, `dataset_remotes`, `retention_rules`. Classes: `Base`, `GlobalSettings`, `Dataset`,
-`Destination`, `DatasetRemote`, `RetentionRule`, `RemoteServer`, plus `NAMING_CONVENTION`.
+`Destination`, `DatasetRemote`, `RetentionRule`, `RemoteServer`, plus `NAMING_CONVENTION`. Since revision
+`7c3e9d51b2a8` (TLS milestone) also the `host_identity` singleton and the trust tables `clients`,
+`trusted_clients`, `revoked_fingerprints`, `enrollment_token` and `trust_state` (`HostIdentity`, `Client`,
+`TrustedClient`, `RevokedFingerprint`, `EnrollmentToken`, `TrustState`); `5d2f8a60c1e4` added
+`dataset_remotes.raw`.
 
 Four hard-won invariants — each one was a bug before it was a rule:
 
@@ -97,8 +103,8 @@ removed: the client id now lives in the one-row `host_identity` table, outside t
 
 ## Engine and session rules (item 5) — the highest-risk item in the plan
 
-`daemon.py` spawns 3–4 `multiprocessing.Process` workers and each opens config **inside the child**.
-On Linux the default start method is `fork`, so any engine or connection created in the supervisor
+`daemon.py` spawns 3–4 `multiprocessing.Process` workers. Only the supervisor reads configuration; the API
+worker opens the DB **inside the child**, through `store.trust` only. On Linux the default start method is `fork`, so any engine or connection created in the supervisor
 before `_start_workers()` is inherited by every child. **Shared SQLite file descriptors corrupt the
 database; they do not merely error.**
 
@@ -107,8 +113,8 @@ database; they do not merely error.**
   engine harmless rather than catastrophic.
 - The supervisor holds **no open engine while spawning** — its session is opened, read, closed, and
   the engine disposed before workers start.
-- Pragmas via a `connect` event listener: `journal_mode=WAL`, `synchronous=NORMAL`,
-  `busy_timeout=5000`, `foreign_keys=ON`.
+- Pragmas via a `connect` event listener: `journal_mode=WAL` (set by the writer; readers only check it),
+  `synchronous=FULL` for the writer and `NORMAL` for readers, `busy_timeout=5000`, `foreign_keys=ON`.
 - **Workers do not write configuration** — config reads use a read-only session factory, not a convention.
   Under WAL, readers never block and are never blocked by the single CLI writer. The trust tables are the
   exception: they have two writers, the CLI and the API worker, both through `store.trust`, which opens a

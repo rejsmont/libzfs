@@ -1,0 +1,13 @@
+# Installed-package checks: nothing here touches a real pool or the network.
+
+Tests: smoke
+Depends: @
+Restrictions: allow-stderr
+
+# The repository's platform-contract and TLS characterization tests, run against
+# the distribution's flask, werkzeug, simple-websocket, websocket-client,
+# requests, urllib3 and cryptography. A security update of one of them that moves
+# an internal zfsbackup overrides fails here.
+Tests: platform-contracts
+Depends: @, python3-pytest, python3-pytest-mock
+Restrictions: allow-stderr

@@ -5,8 +5,11 @@ disk and the remote/API workers import `zfsbackup.remote` / `zfsbackup.api` lazi
 worker (re)started after the upgrade would run NEW code under an OLD supervisor. The guard:
 
 * `version.code_signature()` -- installed version + identity of the dist-info `RECORD`
-  (`st_ino`, `st_mtime_ns`, `st_size`) + the Python interpreter (`sys.version`, the stat of
-  `sys.executable`); one distribution lookup, two stats, no hashing, no cache, no `zfs`.
+  (`st_ino`, `st_mtime_ns`, `st_size`) of BOTH distributions (`zfsbackup` and `libzfseasy`, which
+  are separate wheels; each falls back to its package's `__init__.py` when it has no `RECORD`,
+  as on a dh_python3 install) + the Python interpreter (`sys.version`, the stat of
+  `sys.executable`); one distribution lookup per distribution, three stats, no hashing, no
+  cache, no `zfs`.
 * the supervisor takes it when the PROCESS starts (before the unbounded wait for a previous
   daemon's workers), compares it every `RELOAD_POLL_SECONDS` (at once on a pending SIGHUP)
   BEFORE the reload tick and before every spawn, and drains only on the same difference read
@@ -45,6 +48,7 @@ Mutation counts (scratch copy of the tree, one revert at a time) are in the hand
 import dataclasses
 import importlib
 import importlib.metadata
+import importlib.util
 import json
 import logging
 import os
@@ -103,6 +107,7 @@ from zfsbackup.stopflag import ReloadEpoch, StopFlag
 from zfsbackup.version import (
     DIST_NAME,
     EXIT_CODE_VERSION_CHANGED,
+    LIB_DIST_NAME,
     UNKNOWN_VERSION,
     CodeSignature,
     code_signature,
@@ -134,12 +139,14 @@ def exe_ident():
 # ---------------------------------------------------------------------------
 
 
-def make_dist(root: Path, ver: str = "9.9.9", *, record: bool = True, extra=None) -> Path:
-    """`<root>/zfsbackup-<ver>.dist-info/{METADATA[,RECORD]}`."""
-    info = root / f"{DIST_NAME}-{ver}.dist-info"
+def make_dist(
+    root: Path, ver: str = "9.9.9", *, record: bool = True, extra=None, name: str = DIST_NAME
+) -> Path:
+    """`<root>/<name>-<ver>.dist-info/{METADATA[,RECORD]}` (`zfsbackup` unless `name=`)."""
+    info = root / f"{name}-{ver}.dist-info"
     info.mkdir(parents=True)
     (info / "METADATA").write_text(
-        f"Metadata-Version: 2.1\nName: {DIST_NAME}\nVersion: {ver}\n"
+        f"Metadata-Version: 2.1\nName: {name}\nVersion: {ver}\n"
     )
     if record:
         (info / "RECORD").write_text(f"{info.name}/RECORD,,\n")
@@ -159,13 +166,27 @@ def replace_record(info: Path, data: bytes = None) -> None:
     os.replace(new, target)
 
 
+def make_lib_dist(root: Path, ver: str = "9.9.9", **kw) -> Path:
+    """The `libzfseasy` dist-info next to it (`make_dist(..., name="libzfseasy")`)."""
+    return make_dist(root, ver, name=LIB_DIST_NAME, **kw)
+
+
 @pytest.fixture
 def site(tmp_path, monkeypatch):
-    """A directory FIRST on `sys.path`: a dist-info made here shadows the real one."""
+    """A directory FIRST on `sys.path`: a dist-info made here shadows the real one. It already
+    holds a `libzfseasy` 9.9.9 dist-info (`lib_info`), so what `code_signature()` reads does not
+    depend on how this environment installed the bindings (editable here, a wheel in CI); the
+    zfsbackup dist-info is made by each test with `make_dist`."""
     root = tmp_path / "site"
     root.mkdir()
+    make_lib_dist(root)
     monkeypatch.syspath_prepend(str(root))
     return root
+
+
+@pytest.fixture
+def lib_info(site):
+    return site / f"{LIB_DIST_NAME}-9.9.9.dist-info"
 
 
 # ---------------------------------------------------------------------------
@@ -175,13 +196,15 @@ def site(tmp_path, monkeypatch):
 
 @pytest.mark.unit
 class TestCodeSignature:
-    def test_reports_the_version_the_record_the_interpreter_and_their_identities(self, site):
+    def test_reports_the_version_the_record_the_interpreter_and_their_identities(self, site, lib_info):
         info = make_dist(site, "9.9.9")
         sig = code_signature()
         st = os.stat(info / "RECORD")
+        lst = os.stat(lib_info / "RECORD")
         assert sig == CodeSignature(
             "9.9.9", str(info / "RECORD"), (st.st_ino, st.st_mtime_ns, st.st_size),
             sys.version, exe_ident(),
+            "9.9.9", str(lib_info / "RECORD"), (lst.st_ino, lst.st_mtime_ns, lst.st_size),
         )
         assert sig.installed is True
 
@@ -191,6 +214,8 @@ class TestCodeSignature:
         assert isinstance(sig, CodeSignature)
         assert sig.version == version_mod.installed_version()
         assert sig.python == sys.version
+        assert sig.lib_version == importlib.metadata.version(LIB_DIST_NAME)
+        assert sig.lib_file and sig.lib_ident
 
     def test_a_same_size_replacement_of_the_record_changes_the_identity(self, site):
         """A same-version reinstall: pip rewrites the `RECORD`, byte for byte the same size."""
@@ -352,19 +377,20 @@ class TestCodeSignature:
         with mock.patch.object(version_mod, "distribution", side_effect=ValueError("corrupt metadata")):
             assert code_signature() is None
 
-    def test_exactly_one_distribution_lookup_so_version_and_path_cannot_disagree(self, site):
+    def test_exactly_one_lookup_per_distribution_so_version_and_path_cannot_disagree(self, site):
         make_dist(site)
         with mock.patch.object(
             version_mod, "distribution", wraps=importlib.metadata.distribution
         ) as lookups:
-            assert code_signature().version == "9.9.9"
-        assert lookups.call_count == 1
+            sig = code_signature()
+        assert (sig.version, sig.lib_version) == ("9.9.9", "9.9.9")
+        assert [c.args for c in lookups.call_args_list] == [(DIST_NAME,), (LIB_DIST_NAME,)]
 
-    def test_it_stats_the_record_and_the_interpreter_reads_no_record_and_runs_nothing(
-        self, site, monkeypatch
+    def test_it_stats_both_records_and_the_interpreter_reads_no_record_and_runs_nothing(
+        self, site, lib_info, monkeypatch
     ):
-        """No hashing, no `zfs`: one `stat` of the RECORD, one of the interpreter, never an
-        `open` of the RECORD, no subprocess."""
+        """No hashing, no `zfs`: one `stat` of each RECORD, one of the interpreter, never an
+        `open` of a RECORD, no subprocess."""
         info = make_dist(site)
         statted, opened = [], []
         real_stat = os.stat
@@ -385,7 +411,8 @@ class TestCodeSignature:
         monkeypatch.setattr("builtins.open", opener)
         monkeypatch.setattr("subprocess.Popen", forbidden)
         assert code_signature() is not None
-        assert [p for p in statted if p.endswith("RECORD")] == [str(info / "RECORD")]
+        assert [p for p in statted if p.endswith("RECORD")] == [
+            str(info / "RECORD"), str(lib_info / "RECORD")]
         assert statted.count(sys.executable) == 1
         assert not [p for p in opened if isinstance(p, str) and p.endswith("RECORD")]
 
@@ -426,12 +453,38 @@ class TestCodeSignature:
         assert pickle.loads(pickle.dumps(sig)) == sig
 
     def test_as_tuple_is_a_plain_tuple_that_rebuilds_the_signature(self):
-        sig = CodeSignature("1.2.3", "/x/RECORD", (1, 2, 3), "3.14.8 (main)", (4, 5, 6))
+        sig = CodeSignature(
+            "1.2.3", "/x/RECORD", (1, 2, 3), "3.14.8 (main)", (4, 5, 6),
+            "1.2.3", "/y/RECORD", (7, 8, 9),
+        )
         plain = sig.as_tuple()
-        assert type(plain) is tuple
-        assert plain == ("1.2.3", "/x/RECORD", (1, 2, 3), "3.14.8 (main)", (4, 5, 6))
+        assert type(plain) is tuple and len(plain) == 8
+        assert plain == (
+            "1.2.3", "/x/RECORD", (1, 2, 3), "3.14.8 (main)", (4, 5, 6),
+            "1.2.3", "/y/RECORD", (7, 8, 9),
+        )
         assert CodeSignature(*plain) == sig
         assert pickle.loads(pickle.dumps(plain)) == plain
+
+    def test_the_lib_fields_are_appended_in_order_so_old_positions_do_not_move(self):
+        fields = [f.name for f in dataclasses.fields(CodeSignature)]
+        assert fields == [
+            "version", "file", "ident", "python", "exe", "lib_version", "lib_file", "lib_ident"
+        ]
+        assert [f.default for f in dataclasses.fields(CodeSignature)][5:] == ["", None, None]
+
+    def test_the_real_signature_round_trips_through_its_tuple(self):
+        sig = code_signature()
+        assert CodeSignature(*sig.as_tuple()) == sig
+        assert len(pickle.loads(pickle.dumps(sig.as_tuple()))) == 8
+
+    def test_pickling_keeps_the_lib_fields(self):
+        sig = CodeSignature(
+            "1.2.3", "/x/RECORD", (1, 2, 3), "3.14.8 (main)", (4, 5, 6),
+            "1.2.3", "/y/RECORD", (7, 8, 9),
+        )
+        again = pickle.loads(pickle.dumps(sig))
+        assert again == sig and again.lib_ident == (7, 8, 9) and hash(again) == hash(sig)
 
     def test_str_names_the_file_the_identity_the_version_and_the_python(self):
         sig = CodeSignature(
@@ -440,6 +493,24 @@ class TestCodeSignature:
         assert str(sig) == "1.2.3 (RECORD inode 11, mtime_ns 22, 33 bytes), Python 3.14.8"
         assert str(CodeSignature(UNKNOWN_VERSION, None, None, "3.14.8 (main)")) == f"{UNKNOWN_VERSION}, Python 3.14.8"
         assert str(CodeSignature("1", None, None)).endswith("Python ?")
+
+    def test_str_without_lib_fields_is_unchanged_and_never_mentions_libzfseasy(self):
+        sig = CodeSignature("1.2.3", "/s/RECORD", (11, 22, 33), "3.14.8 (main, x)", None)
+        assert sig.lib_version == "" and LIB_DIST_NAME not in str(sig)
+
+    def test_str_with_lib_fields_names_libzfseasy_its_file_and_identity(self):
+        sig = CodeSignature(
+            "1.2.3", "/s/zfsbackup-1.2.3.dist-info/RECORD", (11, 22, 33), "3.14.8 (main, x)", None,
+            "1.2.3", "/s/libzfseasy-1.2.3.dist-info/RECORD", (44, 55, 66),
+        )
+        assert str(sig) == (
+            "1.2.3 (RECORD inode 11, mtime_ns 22, 33 bytes), "
+            "libzfseasy 1.2.3 (RECORD inode 44, mtime_ns 55, 66 bytes), Python 3.14.8"
+        )
+
+    def test_str_of_a_lib_that_is_not_installed_is_just_the_unknown_version(self):
+        sig = CodeSignature("1.2.3", None, None, "3.14.8 (m)", None, UNKNOWN_VERSION, None, None)
+        assert str(sig) == f"1.2.3, libzfseasy {UNKNOWN_VERSION}, Python 3.14.8"
 
     def test_change_from_in_words(self):
         old = CodeSignature("1.0.0", "/s/RECORD", (1, 2, 3), "3.14.8 (a)", (7, 8, 9))
@@ -455,6 +526,66 @@ class TestCodeSignature:
             "the Python interpreter binary was replaced"
         # Nothing was installed before: the plain version wording applies.
         assert old.change_from(gone) == f"{UNKNOWN_VERSION} -> 1.0.0"
+
+    def test_change_from_names_a_libzfseasy_only_change(self):
+        old = CodeSignature(
+            "1.0.0", "/s/RECORD", (1, 2, 3), "3.14.8 (a)", (7, 8, 9), "1.0.0", "/l/RECORD", (4, 5, 6)
+        )
+        newer = dataclasses.replace(old, lib_version="1.1.0")
+        again = dataclasses.replace(old, lib_ident=(5, 5, 6))
+        gone = dataclasses.replace(old, lib_version=UNKNOWN_VERSION, lib_file=None, lib_ident=None)
+        assert newer != old and again != old and gone != old
+        assert newer.change_from(old) == "libzfseasy 1.0.0 -> 1.1.0"
+        assert again.change_from(old) == "libzfseasy 1.0.0 was reinstalled"
+        assert gone.change_from(old) == "libzfseasy is being reinstalled or was removed"
+
+    def test_a_zfsbackup_change_is_named_before_a_libzfseasy_one(self):
+        old = CodeSignature(
+            "1.0.0", "/s/RECORD", (1, 2, 3), "3.14.8 (a)", (7, 8, 9), "1.0.0", "/l/RECORD", (4, 5, 6)
+        )
+        both = dataclasses.replace(old, version="1.1.0", lib_version="1.1.0", lib_ident=(0, 0, 0))
+        assert both.change_from(old) == "1.0.0 -> 1.1.0"
+
+    def test_a_baseline_without_lib_fields_never_blames_libzfseasy(self):
+        """A signature made by older code (`lib_version == ""`) has nothing to compare."""
+        old = CodeSignature("1.0.0", "/s/RECORD", (1, 2, 3), "3.14.8 (a)", (7, 8, 9))
+        new = dataclasses.replace(old, lib_version="1.0.0", lib_file="/l/RECORD", lib_ident=(4, 5, 6))
+        assert LIB_DIST_NAME not in new.change_from(old)
+        assert LIB_DIST_NAME not in old.change_from(new)
+
+    def test_an_old_five_tuple_baseline_is_named_as_an_older_signature_format(self):
+        """Nothing else differs, the interpreter included: the baseline just predates the lib fields."""
+        old = CodeSignature("1.0.0", "/s/RECORD", (1, 2, 3), "3.14.8 (a)", (7, 8, 9))
+        new = dataclasses.replace(old, lib_version="1.0.0", lib_file="/l/RECORD", lib_ident=(4, 5, 6))
+        assert old.lib_version == ""
+        assert new.change_from(old) == \
+            "the baseline signature came from an older zfsbackup (signature format changed)"
+        assert CodeSignature(*old.as_tuple()[:5]).change_from(old) == \
+            "the Python interpreter binary was replaced", "no lib fields on either side: unchanged wording"
+
+    def test_an_old_five_tuple_baseline_with_a_changed_interpreter_still_says_so(self):
+        old = CodeSignature("1.0.0", "/s/RECORD", (1, 2, 3), "3.14.8 (a)", (7, 8, 9))
+        lib = dict(lib_version="1.0.0", lib_file="/l/RECORD", lib_ident=(4, 5, 6))
+        version_changed = dataclasses.replace(old, python="3.14.9 (b)", **lib)
+        binary_replaced = dataclasses.replace(old, exe=(7, 9, 9), **lib)
+        both = dataclasses.replace(old, python="3.14.9 (b)", exe=(7, 9, 9), **lib)
+        assert version_changed.change_from(old) == "the Python interpreter changed (3.14.8 -> 3.14.9)"
+        assert binary_replaced.change_from(old) == "the Python interpreter binary was replaced"
+        assert both.change_from(old) == "the Python interpreter changed (3.14.8 -> 3.14.9)"
+
+    def test_an_old_baseline_with_a_zfsbackup_change_names_that_first(self):
+        old = CodeSignature("1.0.0", "/s/RECORD", (1, 2, 3), "3.14.8 (a)", (7, 8, 9))
+        lib = dict(lib_version="1.1.0", lib_file="/l/RECORD", lib_ident=(4, 5, 6))
+        assert dataclasses.replace(old, version="1.1.0", **lib).change_from(old) == "1.0.0 -> 1.1.0"
+        assert dataclasses.replace(old, ident=(9, 2, 3), **lib).change_from(old).startswith("1.0.0 was reinstalled")
+
+    def test_the_older_format_wording_is_only_for_a_new_signature_with_lib_fields(self):
+        """The reverse (a new baseline against a current signature without lib fields) and two
+        lib-less signatures keep the interpreter wording."""
+        old = CodeSignature("1.0.0", "/s/RECORD", (1, 2, 3), "3.14.8 (a)", (7, 8, 9))
+        new = dataclasses.replace(old, lib_version="1.0.0", lib_file="/l/RECORD", lib_ident=(4, 5, 6))
+        assert "older zfsbackup" not in old.change_from(new)
+        assert old.change_from(new) == "the Python interpreter binary was replaced"
 
     def test_the_public_files_list_is_the_fallback_for_the_record_path(self, tmp_path):
         record = tmp_path / "zfsbackup-1.dist-info" / "RECORD"
@@ -508,17 +639,431 @@ class TestCodeSignature:
         assert version_mod.editable_install() is False
 
 
+@pytest.fixture
+def fake_lib_package(tmp_path, monkeypatch):
+    """A `libzfseasy` package whose `__init__.py` this test owns, FIRST on `sys.path` (a
+    PYTHONPATH-shadowed copy) and NOT imported: `sys.modules['libzfseasy']` is removed for the
+    test, so `importlib.util.find_spec` (what `_lib_init_path` asks) does a path search and finds
+    this file. A stand-in module object without a `__spec__` would make `find_spec` raise, and the
+    signature would fall back to the dist's own location, which these fake sites do not have."""
+    pkg = tmp_path / "libpkg" / LIB_DIST_NAME
+    pkg.mkdir(parents=True)
+    init = pkg / "__init__.py"
+    init.write_text("# stand-in\n")
+    monkeypatch.delitem(sys.modules, LIB_DIST_NAME, raising=False)
+    monkeypatch.syspath_prepend(str(pkg.parent))
+    return init
+
+
+def load_as_libzfseasy(init: Path, monkeypatch):
+    """Import `init` as `libzfseasy` (a real module with a real spec), as a supervisor that has
+    the package loaded would have it."""
+    import importlib.util as iu
+
+    spec = iu.spec_from_file_location(LIB_DIST_NAME, init)
+    module = iu.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, LIB_DIST_NAME, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def replace_by_rename(path: Path) -> None:
+    """What dpkg does to a file: write a new one beside it and rename it over the old (same
+    bytes, so the size is unchanged; the inode and mtime move)."""
+    new = path.with_name(path.name + ".dpkg-new")
+    new.write_bytes(path.read_bytes())
+    os.replace(new, path)
+
+
+@pytest.mark.unit
+class TestLibzfseasySignature:
+    """The version-skew guard also watches the `libzfseasy` distribution: it is its own wheel
+    (or `python3-libzfseasy` package) and can be reinstalled without `zfsbackup` being touched."""
+
+    def test_the_lib_record_identity_is_reported(self, site, lib_info):
+        make_dist(site)
+        sig = code_signature()
+        st = os.stat(lib_info / "RECORD")
+        assert (sig.lib_version, sig.lib_file) == ("9.9.9", str(lib_info / "RECORD"))
+        assert sig.lib_ident == (st.st_ino, st.st_mtime_ns, st.st_size)
+
+    def test_a_lib_only_reinstall_is_a_difference_and_zfsbackup_is_untouched(self, site, lib_info):
+        info = make_dist(site)
+        before = code_signature()
+        replace_record(lib_info)
+        after = code_signature()
+        assert after != before and after.as_tuple() != before.as_tuple()
+        assert (after.version, after.file, after.ident) == (before.version, before.file, before.ident)
+        assert after.lib_ident != before.lib_ident
+        assert after.lib_ident[2] == before.lib_ident[2]
+        assert after.change_from(before) == "libzfseasy 9.9.9 was reinstalled"
+        assert (info / "RECORD").exists()
+
+    def test_a_lib_only_version_bump_is_named(self, site, lib_info):
+        make_dist(site)
+        before = code_signature()
+        lib_info.rename(site / "old-lib.tmp")
+        make_lib_dist(site, "9.9.10")
+        after = code_signature()
+        assert (after.version, after.lib_version) == ("9.9.9", "9.9.10")
+        assert after.change_from(before) == "libzfseasy 9.9.9 -> 9.9.10"
+
+    def test_a_lib_only_touch_is_a_difference(self, site, lib_info):
+        make_dist(site)
+        before = code_signature()
+        st = os.stat(lib_info / "RECORD")
+        os.utime(lib_info / "RECORD", ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+        after = code_signature()
+        assert after != before and after.lib_ident[1] != before.lib_ident[1]
+
+    def test_removing_libzfseasy_alone_is_a_difference_that_is_named(self, site, lib_info, monkeypatch):
+        make_dist(site)
+        before = code_signature()
+        for child in lib_info.iterdir():
+            child.unlink()
+        lib_info.rmdir()
+        importlib.invalidate_caches()
+        # The real distribution further down `sys.path` would otherwise answer.
+        real = importlib.metadata.distribution
+
+        def lookup(name):
+            if name == LIB_DIST_NAME:
+                raise importlib.metadata.PackageNotFoundError(name)
+            return real(name)
+
+        monkeypatch.setattr(version_mod, "distribution", lookup)
+        after = code_signature()
+        assert after is not None and after.installed, "zfsbackup itself is still installed"
+        assert (after.lib_version, after.lib_file, after.lib_ident) == (UNKNOWN_VERSION, None, None)
+        assert after != before
+        assert after.change_from(before) == "libzfseasy is being reinstalled or was removed"
+
+    @pytest.mark.filterwarnings("ignore:Implicit None on return values")
+    def test_metadata_without_a_lib_version_is_not_installed_either(self, site, lib_info):
+        make_dist(site)
+        (lib_info / "METADATA").write_text("Metadata-Version: 2.1\nName: libzfseasy\n")
+        sig = code_signature()
+        assert sig is None or sig.lib_version == UNKNOWN_VERSION
+
+    def test_zfsbackup_not_installed_does_not_look_at_libzfseasy(self):
+        with mock.patch.object(
+            version_mod, "distribution",
+            side_effect=importlib.metadata.PackageNotFoundError(DIST_NAME),
+        ) as lookups:
+            sig = code_signature()
+        assert sig == CodeSignature(UNKNOWN_VERSION, None, None, sys.version, exe_ident())
+        assert sig.lib_version == "" and lookups.call_count == 1
+
+    # -- no RECORD: the package's __init__.py stands in ---------------------
+
+    def test_a_lib_without_a_record_uses_the_import_systems_init(self, site, lib_info, fake_lib_package):
+        make_dist(site)
+        (lib_info / "RECORD").unlink()
+        sig = code_signature()
+        st = os.stat(fake_lib_package)
+        assert sig.lib_version == "9.9.9"
+        assert Path(sig.lib_file) == fake_lib_package
+        assert sig.lib_ident == (st.st_ino, st.st_mtime_ns, st.st_size)
+
+    def test_a_lib_that_never_had_a_record_is_the_same(self, site, lib_info, fake_lib_package):
+        import shutil
+
+        shutil.rmtree(lib_info)
+        make_lib_dist(site, record=False)
+        make_dist(site)
+        sig = code_signature()
+        assert sig.lib_version == "9.9.9" and Path(sig.lib_file).name == "__init__.py"
+        assert Path(sig.lib_file) == fake_lib_package
+
+    def test_a_vanishing_lib_record_reads_as_a_change(self, site, lib_info, fake_lib_package):
+        make_dist(site)
+        before = code_signature()
+        (lib_info / "RECORD").unlink()
+        after = code_signature()
+        assert after != before and after.lib_file != before.lib_file
+        assert after.change_from(before) == "libzfseasy 9.9.9 was reinstalled"
+
+    def test_replace_by_rename_of_the_lib_init_is_detected_without_a_record(
+        self, site, lib_info, fake_lib_package
+    ):
+        """dh_python3 writes no RECORD; dpkg replaces each file by rename, so the inode moves."""
+        make_dist(site)
+        (lib_info / "RECORD").unlink()
+        before = code_signature()
+        replace_by_rename(fake_lib_package)
+        after = code_signature()
+        assert after != before
+        assert after.lib_file == before.lib_file and after.lib_ident[0] != before.lib_ident[0]
+        assert after.lib_ident[2] == before.lib_ident[2]
+        assert after.change_from(before) == "libzfseasy 9.9.9 was reinstalled"
+        assert (after.version, after.file, after.ident) == (before.version, before.file, before.ident)
+
+    def test_an_unchanged_lib_init_is_not_a_difference(self, site, lib_info, fake_lib_package):
+        make_dist(site)
+        (lib_info / "RECORD").unlink()
+        assert code_signature() == code_signature()
+
+    def test_without_the_module_loaded_the_distributions_own_location_is_used(
+        self, site, lib_info, monkeypatch
+    ):
+        make_dist(site)
+        (lib_info / "RECORD").unlink()
+        init = site / LIB_DIST_NAME / "__init__.py"
+        init.parent.mkdir()
+        init.write_text("")
+        monkeypatch.delitem(sys.modules, LIB_DIST_NAME, raising=False)
+        sig = code_signature()
+        assert Path(sig.lib_file) == init
+        assert sig.lib_ident[0] == os.stat(init).st_ino
+
+    def test_without_the_module_or_files_the_import_system_is_asked_without_importing(
+        self, site, lib_info, monkeypatch
+    ):
+        """An editable install keeps its files elsewhere: `find_spec` finds them (a path search)."""
+        make_dist(site)
+        (lib_info / "RECORD").unlink()
+        monkeypatch.delitem(sys.modules, LIB_DIST_NAME, raising=False)
+        sig = code_signature()
+        assert Path(sig.lib_file).name == "__init__.py" and Path(sig.lib_file).parent.name == LIB_DIST_NAME
+        assert Path(sig.lib_file).is_file()
+        assert LIB_DIST_NAME not in sys.modules, "computing the signature must not import the package"
+
+    def test_the_lib_init_is_the_import_systems_even_when_the_dist_says_otherwise(
+        self, site, lib_info, fake_lib_package
+    ):
+        make_dist(site)
+        (lib_info / "RECORD").unlink()
+        elsewhere = site / LIB_DIST_NAME / "__init__.py"
+        elsewhere.parent.mkdir()
+        elsewhere.write_text("")
+        assert Path(code_signature().lib_file) == fake_lib_package
+
+    # -- the answer does not depend on whether this process imported libzfseasy ------
+
+    def test_the_answer_is_the_same_loaded_or_not_with_a_shadowed_copy_and_no_record(
+        self, site, lib_info, fake_lib_package, monkeypatch
+    ):
+        """A supervisor that imported the package and a worker that has not must record the same
+        file, also when a PYTHONPATH copy shadows what the dist says and there is no `RECORD`."""
+        make_dist(site)
+        (lib_info / "RECORD").unlink()
+        elsewhere = site / LIB_DIST_NAME / "__init__.py"     # where the dist says it lives
+        elsewhere.parent.mkdir()
+        elsewhere.write_text("# the dist's own copy\n")
+        not_loaded = code_signature()
+        assert LIB_DIST_NAME not in sys.modules, "computing the signature must not import the package"
+        load_as_libzfseasy(fake_lib_package, monkeypatch)
+        loaded = code_signature()
+        assert Path(not_loaded.lib_file) == fake_lib_package != elsewhere
+        assert loaded == not_loaded and loaded.as_tuple() == not_loaded.as_tuple()
+
+    def test_the_same_with_the_shadow_found_only_through_a_record_less_dist(
+        self, site, lib_info, fake_lib_package, monkeypatch
+    ):
+        import shutil
+
+        shutil.rmtree(lib_info)
+        make_lib_dist(site, record=False)           # a dist that never had a RECORD
+        make_dist(site)
+        before = code_signature()
+        load_as_libzfseasy(fake_lib_package, monkeypatch)
+        assert code_signature() == before
+
+    def test_a_loaded_module_without_a_spec_is_not_what_the_answer_comes_from(
+        self, site, lib_info, fake_lib_package, monkeypatch
+    ):
+        """The loaded module's `__file__` is not consulted: a stand-in whose `__file__` points
+        elsewhere (and which has no `__spec__`, so `find_spec` raises ValueError) gives the
+        dist's own location, never that `__file__`."""
+        make_dist(site)
+        (lib_info / "RECORD").unlink()
+        own = site / LIB_DIST_NAME / "__init__.py"
+        own.parent.mkdir()
+        own.write_text("")
+        monkeypatch.setitem(sys.modules, LIB_DIST_NAME, SimpleNamespace(__file__=str(fake_lib_package)))
+        assert Path(code_signature().lib_file) == own
+
+    def test_a_module_whose_spec_is_none_falls_back_too(self, site, lib_info, monkeypatch):
+        make_dist(site)
+        (lib_info / "RECORD").unlink()
+        own = site / LIB_DIST_NAME / "__init__.py"
+        own.parent.mkdir()
+        own.write_text("")
+        monkeypatch.setitem(
+            sys.modules, LIB_DIST_NAME, SimpleNamespace(__file__="/nowhere/__init__.py", __spec__=None)
+        )
+        assert Path(code_signature().lib_file) == own
+
+    # -- _lib_init_path: find_spec first, locate_file as the fallback ----------------
+
+    @pytest.fixture
+    def own_init(self, site, lib_info):
+        """The dist's own `libzfseasy/__init__.py` (where `locate_file` points), no `RECORD`."""
+        make_dist(site)
+        (lib_info / "RECORD").unlink()
+        init = site / LIB_DIST_NAME / "__init__.py"
+        init.parent.mkdir()
+        init.write_text("# own\n")
+        return init
+
+    @staticmethod
+    def _find_spec_returning(value=None, *, raises=None):
+        real = importlib.util.find_spec
+
+        def find_spec(name, *a, **k):
+            if name != LIB_DIST_NAME:
+                return real(name, *a, **k)
+            if raises is not None:
+                raise raises
+            return value
+
+        return mock.patch.object(importlib.util, "find_spec", side_effect=find_spec)
+
+    def test_find_spec_is_asked_for_the_package_and_its_origin_is_used(self, site, lib_info, own_init, tmp_path):
+        elsewhere = tmp_path / "elsewhere" / "__init__.py"
+        elsewhere.parent.mkdir()
+        elsewhere.write_text("")
+        spec = SimpleNamespace(origin=str(elsewhere))
+        with self._find_spec_returning(spec):
+            assert Path(code_signature().lib_file) == elsewhere
+
+    def test_no_spec_uses_locate_file(self, own_init):
+        with self._find_spec_returning(None):
+            sig = code_signature()
+        assert Path(sig.lib_file) == own_init and sig.lib_ident[0] == os.stat(own_init).st_ino
+
+    @pytest.mark.parametrize("origin", [
+        None,                                   # a namespace package
+        "",
+        "built-in",
+        "frozen",
+        "/somewhere/libzfseasy.py",             # a plain module, not a package
+        "/somewhere/libzfseasy/__init__.pyc",
+        "/somewhere/libzfseasy/core.py",
+        "libzfseasy/__init__.py",               # not absolute
+        "__init__.py",
+    ])
+    def test_an_unusable_origin_uses_locate_file(self, own_init, origin):
+        with self._find_spec_returning(SimpleNamespace(origin=origin)):
+            assert Path(code_signature().lib_file) == own_init
+
+    def test_a_spec_without_an_origin_attribute_uses_locate_file(self, own_init):
+        with self._find_spec_returning(SimpleNamespace()):
+            assert Path(code_signature().lib_file) == own_init
+
+    @pytest.mark.parametrize("exc", [ImportError("x"), ModuleNotFoundError("libzfseasy"), ValueError("no spec")])
+    def test_find_spec_raising_import_or_value_error_uses_locate_file(self, own_init, exc):
+        with self._find_spec_returning(raises=exc):
+            sig = code_signature()
+        assert sig is not None and Path(sig.lib_file) == own_init
+
+    @pytest.mark.parametrize("exc", [RuntimeError("boom"), OSError(5, "I/O error"), AttributeError("x")])
+    def test_any_other_find_spec_failure_is_cannot_tell_not_a_raise(self, own_init, exc):
+        with self._find_spec_returning(raises=exc):
+            assert code_signature() is None
+
+    @pytest.mark.parametrize("how", ["no_spec", "import_error", "value_error", "bad_origin"])
+    def test_the_fallback_target_missing_is_cannot_tell_not_a_raise(self, site, lib_info, how):
+        make_dist(site)
+        (lib_info / "RECORD").unlink()               # and no site/libzfseasy/__init__.py
+        kw = {
+            "no_spec": dict(value=None),
+            "import_error": dict(raises=ImportError("x")),
+            "value_error": dict(raises=ValueError("x")),
+            "bad_origin": dict(value=SimpleNamespace(origin="built-in")),
+        }[how]
+        with self._find_spec_returning(**kw):
+            assert code_signature() is None
+
+    def test_a_record_means_find_spec_is_never_asked(self, site, lib_info):
+        make_dist(site)
+        with self._find_spec_returning(raises=RuntimeError("must not be called")) as spy:
+            sig = code_signature()
+        assert sig.lib_file == str(lib_info / "RECORD")
+        assert LIB_DIST_NAME not in [c.args[0] for c in spy.call_args_list if c.args]
+
+    # -- failures: "cannot tell", never a false change ------------------------
+
+    @pytest.mark.parametrize("exc", [PermissionError(13, "denied"), OSError(5, "I/O error")])
+    def test_an_unexpected_io_error_on_the_lib_record_is_cannot_tell(self, site, lib_info, exc):
+        make_dist(site)
+        real_stat = os.stat
+        target = str(lib_info / "RECORD")
+
+        def stat(path, *a, **k):
+            if os.fspath(path) == target:
+                raise exc
+            return real_stat(path, *a, **k)
+
+        with mock.patch.object(version_mod.os, "stat", side_effect=stat):
+            assert code_signature() is None
+
+    def test_a_failing_lib_fallback_stat_is_cannot_tell(self, site, lib_info, fake_lib_package):
+        make_dist(site)
+        (lib_info / "RECORD").unlink()
+        real_stat = os.stat
+
+        def stat(path, *a, **k):
+            if os.fspath(path) == str(fake_lib_package):
+                raise OSError(5, "I/O error")
+            return real_stat(path, *a, **k)
+
+        with mock.patch.object(version_mod.os, "stat", side_effect=stat):
+            assert code_signature() is None
+
+    def test_a_corrupt_lib_distribution_is_cannot_tell(self, site):
+        make_dist(site)
+        real = importlib.metadata.distribution
+
+        def lookup(name):
+            if name == LIB_DIST_NAME:
+                raise ValueError("corrupt metadata")
+            return real(name)
+
+        with mock.patch.object(version_mod, "distribution", side_effect=lookup):
+            assert code_signature() is None
+
+    # -- editable installs ------------------------------------------------------
+
+    @pytest.mark.parametrize("which", ["zfsbackup", "libzfseasy"])
+    def test_either_distribution_being_editable_is_an_editable_install(self, site, lib_info, which):
+        editable = {"direct_url.json": json.dumps({"url": "file:///src", "dir_info": {"editable": True}})}
+        if which == "zfsbackup":
+            make_dist(site, extra=editable)
+        else:
+            make_dist(site)
+            (lib_info / "direct_url.json").write_text(editable["direct_url.json"])
+        assert version_mod.editable_install() is True
+
+    def test_neither_editable_is_not_an_editable_install(self, site):
+        make_dist(site)
+        assert version_mod.editable_install() is False
+
+    def test_an_unreadable_lib_direct_url_does_not_hide_an_editable_zfsbackup(self, site, lib_info):
+        make_dist(site, extra={"direct_url.json": json.dumps(
+            {"url": "file:///src", "dir_info": {"editable": True}})})
+        (lib_info / "direct_url.json").write_text("not json")
+        assert version_mod.editable_install() is True
+
+
 # ---------------------------------------------------------------------------
 # The supervisor, over the scripted World
 # ---------------------------------------------------------------------------
 
 SIG = CodeSignature(
-    "1.0.0", "/site/zfsbackup-1.0.0.dist-info/RECORD", (11, 1000, 50), "3.14.8 (main, Oct 2026)", (1, 2, 3)
+    "1.0.0", "/site/zfsbackup-1.0.0.dist-info/RECORD", (11, 1000, 50), "3.14.8 (main, Oct 2026)", (1, 2, 3),
+    "1.0.0", "/site/libzfseasy-1.0.0.dist-info/RECORD", (21, 1100, 40),
 )
 SIG_REINSTALLED = dataclasses.replace(SIG, ident=(12, 2000, 50))
 SIG_UPGRADED = dataclasses.replace(
     SIG, version="1.1.0", file="/site/zfsbackup-1.1.0.dist-info/RECORD", ident=(13, 3000, 60)
 )
+#: libzfseasy alone changed (zfsbackup's own install is untouched).
+SIG_LIB_REINSTALLED = dataclasses.replace(SIG, lib_ident=(22, 2100, 40))
+SIG_LIB_UPGRADED = dataclasses.replace(
+    SIG, lib_version="1.1.0", lib_file="/site/libzfseasy-1.1.0.dist-info/RECORD", lib_ident=(23, 3100, 45)
+)
+SIG_LIB_GONE = dataclasses.replace(SIG, lib_version=UNKNOWN_VERSION, lib_file=None, lib_ident=None)
 SIG_NEW_PYTHON = dataclasses.replace(SIG, python="3.14.9 (main, Nov 2026)")
 NOT_INSTALLED = CodeSignature(UNKNOWN_VERSION, None, None, SIG.python, SIG.exe)
 
@@ -843,6 +1388,51 @@ class TestSupervisorConfirmsTheDifference:
             assert d._check_code_version() is False
         assert d._version_skew is None
 
+    @pytest.mark.parametrize(
+        "lib_only", [SIG_LIB_REINSTALLED, SIG_LIB_UPGRADED, SIG_LIB_GONE],
+        ids=["reinstall", "upgrade", "removed"],
+    )
+    def test_a_libzfseasy_only_difference_is_debounced_like_a_zfsbackup_one(
+        self, sworld, disk, caplog, lib_only
+    ):
+        """One read does nothing; the same difference a poll later confirms it. Reinstalling
+        only `python3-libzfseasy` (or its wheel) must start the same drain."""
+        d = sworld.daemon
+        disk.value = lib_only
+        sworld.advance(RELOAD_POLL_SECONDS)
+        assert d._check_code_version() is False
+        assert d._version_skew is None and not skew_warnings(caplog)
+        sworld.advance(RELOAD_POLL_SECONDS)
+        assert d._check_code_version() is True
+        assert d._version_skew == (SIG, lib_only)
+        assert d._reload_epoch.get() == EPOCH_UPGRADE_DRAIN
+        assert not d._stop_event.is_set()
+        (warning,) = skew_warnings(caplog)
+        assert "libzfseasy" in warning and "exit 76" in warning
+
+    def test_a_lib_difference_and_a_zfsbackup_difference_are_not_a_pair(self, sworld, disk):
+        d = sworld.daemon
+        for value in (SIG_LIB_REINSTALLED, SIG_REINSTALLED, SIG_LIB_UPGRADED):
+            disk.value = value
+            sworld.advance(RELOAD_POLL_SECONDS)
+            assert d._check_code_version() is False
+        assert d._version_skew is None
+
+    def test_a_lib_difference_that_goes_away_is_forgotten(self, sworld, disk):
+        d = sworld.daemon
+        for value in (SIG_LIB_REINSTALLED, SIG, SIG_LIB_REINSTALLED):
+            disk.value = value
+            sworld.advance(RELOAD_POLL_SECONDS)
+            assert d._check_code_version() is False
+        assert d._version_skew is None
+
+    def test_a_libzfseasy_only_difference_drains_the_remote_and_api_workers_and_exits_76(
+        self, sworld, disk, mocker
+    ):
+        steps = [*confirm(disk, sworld, SIG_LIB_REINSTALLED), leave(sworld, "api", "remote")]
+        assert drive(sworld, mocker, *steps) == EXIT_CODE_VERSION_CHANGED == 76
+        assert sworld.daemon._version_skew == (SIG, SIG_LIB_REINSTALLED)
+
     def test_two_reads_less_than_a_poll_apart_are_not_a_confirmation(self, sworld, disk):
         d = sworld.daemon
         disk.value = SIG_UPGRADED
@@ -869,8 +1459,12 @@ class TestSupervisorConfirmsTheDifference:
             (NOT_INSTALLED, "zfsbackup is being reinstalled or was removed"),
             (SIG_NEW_PYTHON, "the Python interpreter changed (3.14.8 -> 3.14.9)"),
             (dataclasses.replace(SIG, exe=(9, 9, 9)), "the Python interpreter binary was replaced"),
+            (SIG_LIB_UPGRADED, "libzfseasy 1.0.0 -> 1.1.0"),
+            (SIG_LIB_REINSTALLED, "libzfseasy 1.0.0 was reinstalled"),
+            (SIG_LIB_GONE, "libzfseasy is being reinstalled or was removed"),
         ],
-        ids=["upgrade", "reinstall", "not-installed", "new-python", "new-exe"],
+        ids=["upgrade", "reinstall", "not-installed", "new-python", "new-exe",
+             "lib-upgrade", "lib-reinstall", "lib-removed"],
     )
     def test_the_warning_names_old_and_new(self, sworld, disk, caplog, new, words):
         begin_drain(sworld, disk, new)
@@ -1782,8 +2376,9 @@ class TestWorkerCheck:
 
     @pytest.mark.parametrize("cls", ALL_FIVE)
     @pytest.mark.parametrize(
-        "now", [SIG_UPGRADED, SIG_REINSTALLED, NOT_INSTALLED, SIG_NEW_PYTHON],
-        ids=["upgrade", "reinstall", "gone", "new-python"],
+        "now", [SIG_UPGRADED, SIG_REINSTALLED, NOT_INSTALLED, SIG_NEW_PYTHON,
+                SIG_LIB_UPGRADED, SIG_LIB_REINSTALLED, SIG_LIB_GONE],
+        ids=["upgrade", "reinstall", "gone", "new-python", "lib-upgrade", "lib-reinstall", "lib-gone"],
     )
     def test_a_mismatch_exits_4_with_one_warning(self, cls, now, current, caplog):
         current.return_value = now
@@ -1826,6 +2421,48 @@ class TestWorkerCheck:
         w = worker_of(workers_module.SnapshotWorker, signature=None)
         w.code_signature = garbage
         w._exit_on_version_skew(LOG)          # returns: "cannot tell" is "no change"
+
+    @pytest.mark.parametrize("cls", ALL_FIVE)
+    def test_a_matching_lib_baseline_returns_and_a_lib_only_change_exits_4(self, cls, current):
+        worker_of(cls)._exit_on_version_skew(LOG)                       # SIG == SIG: no exit
+        current.return_value = SIG_LIB_REINSTALLED
+        with pytest.raises(SystemExit) as exc:
+            worker_of(cls)._exit_on_version_skew(LOG)
+        assert exc.value.code == WORKER_EXIT_VERSION_SKEW
+
+    @pytest.mark.parametrize("cls", ALL_FIVE)
+    def test_an_old_five_tuple_baseline_exits_4_and_does_not_crash(self, cls, current, caplog):
+        """A worker started from new code under a supervisor of the old shape (the 5-tuple
+        `as_tuple()` had before the lib fields): the tuples differ, so it leaves with 4 rather
+        than run mixed code, and rebuilding the baseline from 5 items must not raise."""
+        old = SIG.as_tuple()[:5]
+        assert len(old) == 5
+        w = worker_of(cls, signature=old)
+        assert w.code_signature == old
+        with caplog.at_level(logging.WARNING, logger="test_version_skew"):
+            with pytest.raises(SystemExit) as exc:
+                w._exit_on_version_skew(LOG)
+        assert exc.value.code == WORKER_EXIT_VERSION_SKEW == 4
+        (record,) = [r for r in caplog.records if r.name == "test_version_skew"]
+        assert "changed since the daemon started" in record.getMessage()
+        assert "older zfsbackup (signature format changed)" in record.getMessage()
+
+    def test_an_old_five_tuple_whose_versions_differ_names_the_version_change(self, current, caplog):
+        current.return_value = SIG_UPGRADED
+        w = worker_of(workers_module.SnapshotWorker, signature=SIG.as_tuple()[:5])
+        with caplog.at_level(logging.WARNING, logger="test_version_skew"):
+            with pytest.raises(SystemExit):
+                w._exit_on_version_skew(LOG)
+        assert "1.0.0 -> 1.1.0" in caplog.text
+
+    def test_a_baseline_longer_than_this_code_knows_exits_4_without_crashing(self, current):
+        """A newer supervisor with more fields than this worker's `CodeSignature`: `change_from`
+        cannot be built, the worker says so generically and still exits 4."""
+        current.return_value = SIG
+        w = worker_of(workers_module.SnapshotWorker, signature=SIG.as_tuple() + ("future",))
+        with pytest.raises(SystemExit) as exc:
+            w._exit_on_version_skew(LOG)
+        assert exc.value.code == WORKER_EXIT_VERSION_SKEW
 
     def test_a_baseline_of_the_wrong_shape_may_only_exit_4(self, current):
         current.return_value = SIG_UPGRADED
@@ -2102,14 +2739,16 @@ class TestRealWorkerProcesses:
 
 
 class SkewDaemon(NotifyDaemon):
-    """A `NotifyDaemon` whose `zfsbackup` distribution metadata is a throwaway dist-info that
-    comes FIRST on `PYTHONPATH`, so a test can reinstall it under the running daemon."""
+    """A `NotifyDaemon` whose `zfsbackup` and `libzfseasy` distribution metadata are throwaway
+    dist-info directories that come FIRST on `PYTHONPATH`, so a test can reinstall either one
+    under the running daemon."""
 
     def __init__(self, tmp_path, monkeypatch, *, notify_socket, method):
         super().__init__(tmp_path, monkeypatch, notify_socket=notify_socket, method=method)
         self.site = tmp_path / "fake-site"
         self.site.mkdir()
         self.dist_info = make_dist(self.site, "9.9.9")
+        self.lib_dist_info = make_lib_dist(self.site, "9.9.9")
         old = self.env.get("PYTHONPATH")
         self.env["PYTHONPATH"] = os.pathsep.join([str(self.site)] + ([old] if old else []))
 
@@ -2163,6 +2802,25 @@ class TestRealDaemon:
         assert len(statuses) == 1 and "draining" in statuses[0]
         log = d.log()
         assert log.count(CHANGED) == 1 and "Daemon stopped" in log
+        assert "crashed repeatedly" not in log
+        assert no_survivors(d)
+
+    @pytest.mark.parametrize("method", START_METHODS)
+    def test_reinstalling_only_libzfseasy_drains_and_exits_76(self, skew_daemon, method):
+        """The `libzfseasy` wheel (or `python3-libzfseasy`) is upgraded alone: `zfsbackup`'s own
+        `RECORD` is untouched, and the daemon must still notice."""
+        d, srv = skew_daemon(method)
+        d.start("--dry-run")
+        take(srv, d, is_ready, READY_WAIT)
+        d.wait_ready()
+        assert d.info().draining is None
+        zfsbackup_record = os.stat(d.dist_info / "RECORD").st_ino
+        replace_record(d.lib_dist_info)
+        assert os.stat(d.dist_info / "RECORD").st_ino == zfsbackup_record
+        take(srv, d, lambda m: m.startswith("STOPPING=1"), 90)
+        assert d.proc.wait(timeout=90) == EXIT_CODE_VERSION_CHANGED, d.log()
+        log = d.log()
+        assert log.count(CHANGED) == 1 and "libzfseasy 9.9.9 was reinstalled" in log
         assert "crashed repeatedly" not in log
         assert no_survivors(d)
 

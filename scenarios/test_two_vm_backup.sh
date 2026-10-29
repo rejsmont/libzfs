@@ -195,8 +195,8 @@
 # NOTE ON READINESS: the harness installs `requests` explicitly in the guests (it is declared in pyproject, but
 # the guests run from a source tree, not a pip install) and binds the server API to 0.0.0.0. The API is HTTPS
 # with a pinned mTLS client certificate on everything except /health and /enroll; probes with curl use -k
-# because the PIN is verified by zfsbackup's own client, not by curl. Admission is by one-time token; there is
-# still no rate limiting on /enroll and the server is werkzeug's development server (see
+# because the PIN is verified by zfsbackup's own client, not by curl. Admission is by one-time token; /enroll
+# is rate limited, and the server is werkzeug's development server, pinned and hardened (see
 # docs/production_readiness_report.md). A green run here is not a security sign-off.
 
 set -uo pipefail
@@ -215,6 +215,9 @@ API_PORT="${API_PORT:-8080}"
 DEST_NAME="server1"                      # destination key in client config
 
 SRC_DIR="/opt/zfsbackup-src"             # extracted repo inside each VM
+# PYTHONPATH of a shipped tree. The library lives in libs/libzfseasy/ since the packaging split; trees from earlier
+# refs keep it at the root (already on the path). A path that does not exist is harmless, so both layouts work.
+SRC_PP="${SRC_DIR}:${SRC_DIR}/libs/libzfseasy"
 VENV="/opt/zfsbvenv"
 PY="${VENV}/bin/python"
 PIP="${VENV}/bin/pip"
@@ -367,8 +370,9 @@ install_stack() {
     rm -f "$tar"
     msh "$vm" "rm -rf '$SRC_DIR' && mkdir -p '$SRC_DIR' && tar -m -xf /tmp/zfsbackup-src.tar -C '$SRC_DIR' && rm -f /tmp/zfsbackup-src.tar"
 
-    # venv with runtime deps. We run from source via PYTHONPATH (pyproject only packages
-    # libzfseasy, not zfsbackup), and install `requests` explicitly — see readiness note.
+    # venv with runtime deps. We run from source via PYTHONPATH ($SRC_PP: the tree and libs/libzfseasy, or the
+    # tree alone for a ref from before the packaging split), not from a wheel, and install `requests` explicitly
+    # (and flask-sock: vendored in newer trees, still imported from pip by older ones; harmless otherwise).
     msh "$vm" "
         set -e
         test -x '$PY' || python3 -m venv '$VENV'
@@ -415,7 +419,7 @@ start_daemon() {
         systemctl reset-failed $unit 2>/dev/null || true
         systemd-run --unit=$unit --collect $kmprop \
             -p StandardOutput=append:'$LOG' -p StandardError=append:'$LOG' \
-            env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.daemon -c '$DB' -v
+            env PYTHONPATH='$SRC_PP' '$PY' -m zfsbackup.daemon -c '$DB' -v
     " || die "could not start daemon on $vm"
 }
 
@@ -444,7 +448,7 @@ put_config() { # put_config <vm> ; reads config text on stdin, installs it to $C
     msh "$vm" "install -D -m600 /tmp/zfsbackup-config.yaml '$CFG' && rm -f /tmp/zfsbackup-config.yaml" \
         || die "config install failed on $vm"
     rm -f "$tmp"
-    msh "$vm" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$DB' import --no-backup '$CFG'" \
+    msh "$vm" "env PYTHONPATH='$SRC_PP' '$PY' -m zfsbackup.cli -c '$DB' import --no-backup '$CFG'" \
         || die "config import failed on $vm"
 }
 
@@ -574,7 +578,7 @@ guid_match_anchor() { # guid_match_anchor "<description>"
 # ─────────────────────── Live-reload helpers (scenarios E-G) ─────────────────
 # The zfsbackup-config CLI on <vm>, against that VM's DB. The daemon runs as root there, so root's CLI
 # is verified (kernel lock table + start token) and SIGHUPs it. stderr is merged: the notice is on stdout.
-cli_vm() { local vm="$1"; shift; msh "$vm" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$DB' $* 2>&1"; }
+cli_vm() { local vm="$1"; shift; msh "$vm" "env PYTHONPATH='$SRC_PP' '$PY' -m zfsbackup.cli -c '$DB' $* 2>&1"; }
 # Last logged pid of worker <name> (a live reload logs "Reloaded <name> worker (pid=N) on generation G").
 wpid() { # wpid <vm> <snapshot|pruning|remote|api>
     msh "$1" "grep -oE '(Started|Restarted|Reloaded) $2 worker \\(pid=[0-9]+\\)' '$LOG' | tail -n1 | grep -oE '[0-9]+'" | tr -d '[:space:]'
@@ -655,20 +659,20 @@ PYEOF
 }
 
 # The zfsbackup-config CLI against <db> on <vm>; stderr is MERGED into the output (use for text, exit codes).
-cli_dbvm() { local vm="$1" db="$2"; shift 2; msh "$vm" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$db' $* 2>&1"; }
+cli_dbvm() { local vm="$1" db="$2"; shift 2; msh "$vm" "env PYTHONPATH='$SRC_PP' '$PY' -m zfsbackup.cli -c '$db' $* 2>&1"; }
 # Same, stdout only (stderr is dropped IN THE GUEST: warnings go to stderr and would corrupt --json / YAML).
-cli_out() { local vm="$1"; shift; msh "$vm" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$DB' $* 2>/dev/null"; }
+cli_out() { local vm="$1"; shift; msh "$vm" "env PYTHONPATH='$SRC_PP' '$PY' -m zfsbackup.cli -c '$DB' $* 2>/dev/null"; }
 # cli_jget_db <vm> <db> '<python expr over d>' <cli args...>  — print the expression over the command's JSON output
 cli_jget_db() {
     local vm="$1" db="$2" expr="$3"; shift 3
-    msh "$vm" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$db' $* 2>/dev/null | '$PY' '$JGET_PY' '$expr'"
+    msh "$vm" "env PYTHONPATH='$SRC_PP' '$PY' -m zfsbackup.cli -c '$db' $* 2>/dev/null | '$PY' '$JGET_PY' '$expr'"
 }
 cli_jget() { local vm="$1" expr="$2"; shift 2; cli_jget_db "$vm" "$DB" "$expr" "$@"; }
 
 # `zfsbackup-config check` on <vm>: ck_run <vm> [flags...] leaves the output in /tmp/zfsb-ck.out (stderr in /tmp/zfsb-ck.err) and the exit code in CK_RC;
 # ck_expr <vm> '<python expr over d>' evaluates an expression over that JSON (see put_jget).
 CK_RC=0
-ck_run()  { local vm="$1"; shift; msh "$vm" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$DB' check $* >/tmp/zfsb-ck.out 2>/tmp/zfsb-ck.err"; CK_RC=$?; }
+ck_run()  { local vm="$1"; shift; msh "$vm" "env PYTHONPATH='$SRC_PP' '$PY' -m zfsbackup.cli -c '$DB' check $* >/tmp/zfsb-ck.out 2>/tmp/zfsb-ck.err"; CK_RC=$?; }
 ck_expr() { msh "$1" "'$PY' '$JGET_PY' '$2' < /tmp/zfsb-ck.out"; }
 
 # The client's id and certificate fingerprint, from `identity show --json`
@@ -787,8 +791,8 @@ install_stack "$CLIENT_VM"
 step "Shipped source: ref '$SRC_REF' ($(git -C "$(dirname "$0")" rev-parse --short "$SRC_REF" 2>/dev/null || echo '?'))"
 J_READY=1
 for vm in "$SERVER_VM" "$CLIENT_VM"; do
-    if msh "$vm" "grep -q 'resume_info' '$SRC_DIR/libzfseasy/zfs.py' && grep -q 'mode=' '$SRC_DIR/zfsbackup/api.py'"; then
-        info "$vm: shipped tree has zfs.send.resume_info (libzfseasy/zfs.py) and /stream mode= (zfsbackup/api.py)"
+    if msh "$vm" "grep -q 'resume_info' '$SRC_DIR/libs/libzfseasy/libzfseasy/zfs.py' '$SRC_DIR/libzfseasy/zfs.py' 2>/dev/null && grep -q 'mode=' '$SRC_DIR/zfsbackup/api.py'"; then
+        info "$vm: shipped tree has zfs.send.resume_info (libzfseasy zfs.py) and /stream mode= (zfsbackup/api.py)"
     else
         warn "$vm: shipped tree ($SRC_REF) lacks resume support: scenario J will be skipped"
         J_READY=0
@@ -1930,7 +1934,7 @@ else
         if send_running && recv_running; then
             mark_rev="$(loglines "$CLIENT_VM")"      # (the cut send's own "Sending ..." line is already above this mark)
             # the CLI and the clock read are ONE guest command: the timestamp is taken right after the revoke committed
-            out="$(msh "$SERVER_VM" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$DB' trust revoke '$A_FP' 2>&1; rc=\$?; echo REVOKED_AT=\$(date +%s); exit \$rc")"; rc=$?
+            out="$(msh "$SERVER_VM" "env PYTHONPATH='$SRC_PP' '$PY' -m zfsbackup.cli -c '$DB' trust revoke '$A_FP' 2>&1; rc=\$?; echo REVOKED_AT=\$(date +%s); exit \$rc")"; rc=$?
             printf '%s\n' "$out" | sed 's/^/    CLI(server): /'
             k5_rev_at="$(printf '%s\n' "$out" | sed -n 's/^REVOKED_AT=//p' | tr -d '[:space:]')"
             check "(K5) trust revoke <A's fingerprint> exits 0" "0" "$rc"
@@ -2142,7 +2146,7 @@ EOF
     else fail "(K11) no zfs send observed on the client within 120s"; fi
     if [ "$k11_ok" -eq 1 ]; then
         # the old key is 'retired', superseded_by the new one: revoking the new one must reach the old key's stream
-        out="$(msh "$SERVER_VM" "env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c '$DB' trust revoke '$K11_FP' 2>&1; rc=\$?; echo REVOKED_AT=\$(date +%s); exit \$rc")"; rc=$?
+        out="$(msh "$SERVER_VM" "env PYTHONPATH='$SRC_PP' '$PY' -m zfsbackup.cli -c '$DB' trust revoke '$K11_FP' 2>&1; rc=\$?; echo REVOKED_AT=\$(date +%s); exit \$rc")"; rc=$?
         printf '%s\n' "$out" | sed 's/^/    CLI(server): /'
         k11_rev_at="$(printf '%s\n' "$out" | sed -n 's/^REVOKED_AT=//p' | tr -d '[:space:]')"
         check "(K11) trust revoke <the successor> exits 0" "0" "$rc"
@@ -2212,7 +2216,7 @@ start_b_daemon() {
         systemctl reset-failed zfsbackup-b 2>/dev/null || true
         systemd-run --unit=zfsbackup-b --collect \
             -p StandardOutput=append:'$L1_B_LOG' -p StandardError=append:'$L1_B_LOG' \
-            env PYTHONPATH='$L1_EVIL_DIR:$SRC_DIR' '$PY' -m zfsbackup.daemon -c '$K_DB_B' -v
+            env PYTHONPATH='$L1_EVIL_DIR:$SRC_PP' '$PY' -m zfsbackup.daemon -c '$K_DB_B' -v
     " || die "could not start B's daemon"
 }
 stop_b_daemon() { msh "$CLIENT_VM" "{ systemctl stop zfsbackup-b; systemctl reset-failed zfsbackup-b; } >/dev/null 2>&1; true" || true; }
@@ -2442,6 +2446,7 @@ import sys
 from pathlib import Path
 tree, cfgfile = sys.argv[1], sys.argv[2]
 sys.path.insert(0, tree)
+sys.path.insert(1, tree + '/libs/libzfseasy')   # the library's home since the packaging split (older trees: at the root)
 from zfsbackup.config import BackupConfig
 from zfsbackup.backup_manager import DatasetManager
 m = DatasetManager(BackupConfig.from_file(Path(cfgfile)))
@@ -2498,7 +2503,7 @@ PYEOF
     check "(L1) the server pins B's certificate under $L1_B_ID, and A's under $L1_A_ID" "$B_FP - $A_FP -" "$(trust_pins "$L1_B_ID") $(trust_pins "$L1_A_ID")"
 
     # The daemon's own library refuses hostile values (a cooperative client cannot be talked into writing them).
-    out="$(msh "$CLIENT_VM" "env PYTHONPATH='$SRC_DIR' '$PY' '$L1_DIR/validate_probe.py' '$L1_B_SRC' 2>&1")"
+    out="$(msh "$CLIENT_VM" "env PYTHONPATH='$SRC_PP' '$PY' '$L1_DIR/validate_probe.py' '$L1_B_SRC' 2>&1")"
     for c in newline tab forged-row cr; do check_has "(L1a) libzfseasy refuses a $c in a property value (Validate.value)" "^${c} REFUSED" "$out"; done
     check_has "(L1a) ... and still accepts an ordinary value (control)" "^plain ACCEPTED" "$out"
     check "(L1a) nothing hostile was written: only the control value exists" "fine-value" "$(zprop "$CLIENT_VM" "$L1_B_SRC" org.zfsbackup:anchor.l1probe)"
@@ -2657,7 +2662,7 @@ PYEOF
     check "(L1c) control: a raw 'zfs list -H' of the target shows a FORGED row for A's dataset with the attacker's config" "1" "$raw"
     check "(L1c) control: P5 holds its config only as a RECEIVED property (none local)" "0 1" "$(l1_sprop_ln "$TARGET_DS/$L1_B_ID/recvonly" org.zfsbackup:config local) $(l1_sprop_ln "$TARGET_DS/$L1_B_ID/recvonly" org.zfsbackup:config received)"
     if [ "$L1_BASELINE_OK" -eq 1 ]; then
-        base="$(msh "$SERVER_VM" "env PYTHONPATH='$L1_OLD_DIR' '$PY' '$L1_DIR/received.py' '$L1_OLD_DIR' '$CFG' 2>&1")"
+        base="$(msh "$SERVER_VM" "env PYTHONPATH='$L1_OLD_DIR:$L1_OLD_DIR/libs/libzfseasy' '$PY' '$L1_DIR/received.py' '$L1_OLD_DIR' '$CFG' 2>&1")"
         printf '%s\n' "$base" | sed 's/^/    pre-fix: /'
         check_has "(L1c) BASELINE: the pre-fix tree ($L1_BASELINE_REF) would prune A's dataset with the attacker's retention" "RECEIVED ${L1_A_DS} 1s/1s" "$base"
         check_has "(L1c) BASELINE: ... and the dataset outside the target" "RECEIVED ${L1_OUT} 1s/1s" "$base"
@@ -3436,7 +3441,7 @@ Description=ZFS Backup health check (harness copy of packaging/systemd/zfsbackup
 [Service]
 Type=oneshot
 Environment=ZFSBACKUP_CHECK_OUTPUT=/var/lib/node_exporter/textfile_collector/zfsbackup.prom
-Environment=PYTHONPATH=${SRC_DIR}
+Environment=PYTHONPATH=${SRC_PP}
 ExecStart=${PY} -m zfsbackup.cli -c ${DB} check --prometheus --output \${ZFSBACKUP_CHECK_OUTPUT}
 SuccessExitStatus=1
 EOF
@@ -3449,7 +3454,7 @@ r_cfg_restore() { # r_cfg_restore <vm> <backup dir>
     msh "$vm" "
         set -e
         DB='$DB'
-        env PYTHONPATH='$SRC_DIR' '$PY' -m zfsbackup.cli -c \$DB trust list > /root/trust-before-restore.txt
+        env PYTHONPATH='$SRC_PP' '$PY' -m zfsbackup.cli -c \$DB trust list > /root/trust-before-restore.txt
         systemctl stop zfsbackup zfsbackup-check.timer || true     # (the harness' transient unit is already gone when the daemon was stopped: "not loaded")
         install -m 0660 -g zfsbackup '$bk/config.db' \$DB.restore
         rm -f \$DB-wal \$DB-shm

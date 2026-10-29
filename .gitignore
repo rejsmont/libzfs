@@ -170,3 +170,15 @@ notebooks
 *.db
 *.db-wal
 *.db-shm
+
+# Debian package build output (dpkg-buildpackage in the checkout)
+.pybuild/
+debian/.debhelper/
+debian/files
+debian/*.substvars
+debian/*.debhelper.log
+debian/debhelper-build-stamp
+debian/zfsbackup/
+debian/python3-libzfseasy/
+debian/zfsbackup.sysusers
+debian/zfsbackup.tmpfiles

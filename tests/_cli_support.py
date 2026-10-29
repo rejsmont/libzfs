@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import List
 
 import pytest
-from click.testing import CliRunner
+from _click_compat import interleaved, make_runner  # noqa: F401  (re-exported)
 
 from zfsbackup.cli.main import cli
 from zfsbackup.config import BackupConfig
@@ -129,11 +129,12 @@ def db(tmp_path) -> Path:
 
 
 class Cli:
-    """`CliRunner` with the two checks every call wants: nothing but
-    `SystemExit` may escape a command, and stdout / stderr are kept apart."""
+    """A click `CliRunner` (`_click_compat.make_runner`: stdout / stderr kept apart
+    on click 8.1 and >= 8.2 alike) with the check every call wants: nothing but
+    `SystemExit` may escape a command."""
 
     def __init__(self) -> None:
-        self.runner = CliRunner()
+        self.runner = make_runner()
 
     def __call__(self, *args, env=None, input=None):
         result = self.runner.invoke(

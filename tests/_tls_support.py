@@ -11,10 +11,11 @@ every socket is `127.0.0.1`.
 * `make_gateway` -- a `TrustGateway` over a freshly generated server identity.
 * `pin_client` / `unpin_client` -- add or revoke a client certificate through the real
   `zfsbackup.config.store.trust` writers on a real config database.
-* `https_get` / `tls_probe` -- one TLS 1.3 HTTPS request / bare handshake against the
-  daemon API, certificate verification off (the server certificate is self-signed and
+* `https_get` / `try_get` -- one TLS 1.3 HTTPS request against the daemon API (`try_get`
+  returns the exception instead of raising), certificate verification off (the server certificate is self-signed and
   pinned by fingerprint in production). `https_get` sends the wire protocol header
   (plan S-5) unless `protocol=False`.
+* `raw_connect` -- a plain TCP connection (no TLS): a silent peer or a plaintext request.
 """
 
 import hashlib

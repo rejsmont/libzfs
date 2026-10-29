@@ -1,0 +1,85 @@
+.TH ZFSBACKUP-CONFIG 1 "October 2026" "zfsbackup" "ZFS Backup"
+.SH NAME
+zfsbackup\-config \- manage the zfsbackup configuration database
+.SH SYNOPSIS
+.B zfsbackup\-config
+.RB [ \-c
+.IR DATABASE ]
+.RB [ \-v ]
+.RB [ \-\-reload\-wait
+.IR SECONDS ]
+.I COMMAND
+.RI [ ARGS ]
+.br
+.B zfsbackup\-config \-\-version
+.SH DESCRIPTION
+.B zfsbackup\-config
+is the only writer of the zfsbackup configuration, the host identity and
+(beside the daemon's API) the trust tables.
+After every committed write it asks the running
+.BR zfsbackupd (1)
+to reload, and waits up to \fB\-\-reload\-wait\fR seconds for the answer.
+.SH COMMANDS
+.TP
+.B import \fIFILE.yaml\fR
+Replace the stored configuration with a YAML file (the outgoing one is backed up
+next to the database).
+.TP
+.B export
+Print the stored configuration as YAML.
+.TP
+.BR list " datasets|destinations"
+Show the stored datasets or destinations.
+.TP
+.BR get ", " set ", " unset
+Read, change or revert one setting by its dotted path.
+.TP
+.B edit
+Edit the configuration, or one dataset or destination, in $EDITOR.
+.TP
+.B rename
+Rename a dataset or a destination, with its ZFS property side effects.
+.TP
+.B enroll \fIDESTINATION\fR
+Enroll this host with a backup server using an enrollment token.
+.TP
+.B identity
+Show or change this host's client id; rotate its client certificate.
+.TP
+.B trust
+Server side of enrollment: enrollment tokens and the trusted client list.
+.TP
+.B status
+Compare the stored configuration with the one the daemon has applied.
+.TP
+.B check
+Grade the backup health (text, JSON, Prometheus or Nagios output).
+.TP
+.B backup \fIDIR\fR
+Back up the database and the TLS files into a new directory under DIR.
+.TP
+.B migrate
+Bring the database schema up to the installed version.
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-config " " \fIDATABASE\fR
+The configuration database.
+Default: $ZFSBACKUP_CONFIG, else /var/lib/zfsbackup/config.db.
+.TP
+.BR \-v ", " \-\-verbose
+Verbose output.
+.TP
+.BI \-\-reload\-wait " SECONDS"
+Wait this long for the daemon to acknowledge a reload (default 3; 0 does not
+wait). It goes before the command and never changes the exit status.
+.SH EXIT STATUS
+0 success; 1 invalid input or refused; 2 usage error; 75 conflict or busy, retry;
+78 the configuration database is unusable.
+.SH FILES
+.TP
+.I /var/lib/zfsbackup/config.db
+The configuration database. Operators who may run this command are members of
+the \fBzfsbackup\fR group.
+.SH SEE ALSO
+.BR zfsbackupd (1),
+.I /usr/share/doc/zfsbackup/README.md

@@ -160,13 +160,84 @@ jobs:
           -W error::sqlalchemy.exc.SADeprecationWarning
           -W error::sqlalchemy.exc.SAWarning
 
-  # Packaging smoke test (plan C20). The test jobs above run from a source
-  # checkout, where a file missing from the wheel is invisible: a new migration
-  # that the build forgets to include, or a console script pointing at a module
-  # that does not ship, only shows up on the first real install. This job builds
-  # the wheel and sdist, checks what is in them, installs the wheel into a clean
-  # venv WITHOUT the dev dependencies, away from the checkout, and runs the two
-  # console scripts through import, migrate --check and --test-config.
+  # The .deb depends on the DISTRIBUTION's python3-* packages (docs/packaging_plan.md, strategy
+  # A), so the code must work on exactly those versions, not only on poetry.lock's. This job
+  # installs Debian 13's archive versions of every runtime dependency (and Debian 13's Python,
+  # 3.13) with no lock and no poetry, installs both projects with --no-deps, runs `pip check`
+  # and the whole mocked suite. Ubuntu 26.04 ships the same or newer of everything except click,
+  # which is 8.1.8 there too (both package it as "8.2.0+0.really.8.1.8"); the lock resolves
+  # click >= 8.2, so the other jobs cover that side of click's CliRunner differences and this
+  # one covers 8.1 (tests/_click_compat.py). The pins below are floors in pyproject.toml where
+  # the floor is Debian's version (flask, websocket-client, cryptography), and
+  # tests/test_ci_workflows.py keeps them inside pyproject's ranges.
+  debian-floors:
+    name: Debian 13 versions / py3.13 / click 8.1.8
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: "3.13"
+
+      # One pip command, so the resolver cannot move a pin to satisfy a test tool.
+      - name: Install Debian 13's versions of the runtime dependencies
+        run: |
+          python -m venv "$RUNNER_TEMP/debvenv"
+          cat > "$RUNNER_TEMP/debian13.txt" <<'EOF'
+          click==8.1.8
+          flask==3.1.1
+          werkzeug==3.1.3
+          sqlalchemy==2.0.40
+          alembic==1.13.2
+          cryptography==43.0.0
+          websocket-client==1.8.0
+          simple-websocket==1.1.0
+          requests==2.32.3
+          urllib3==2.3.0
+          pyyaml==6.0.2
+          EOF
+          "$RUNNER_TEMP/debvenv/bin/python" -m pip install -r "$RUNNER_TEMP/debian13.txt" \
+            "pytest>=9,<10" "pytest-mock>=3.12" "pytest-cov>=7" "pytest-xdist>=3.5" "requests-mock>=1.12"
+          "$RUNNER_TEMP/debvenv/bin/python" -m pip install --no-deps -e libs/libzfseasy -e .
+          "$RUNNER_TEMP/debvenv/bin/python" -m pip list
+          "$RUNNER_TEMP/debvenv/bin/python" -m pip check
+
+      - name: Check the venv runs Debian 13's Python and exactly the pinned versions
+        run: |
+          "$RUNNER_TEMP/debvenv/bin/python" - "$RUNNER_TEMP/debian13.txt" <<'PY'
+          import sys
+          from importlib.metadata import version
+
+          assert sys.version_info[:2] == (3, 13), sys.version
+          for line in open(sys.argv[1]).read().split():
+              name, _, pinned = line.partition("==")
+              assert version(name) == pinned, (name, version(name), pinned)
+          PY
+
+      - name: Provide stub zfs/zpool binaries
+        run: |
+          mkdir -p "$RUNNER_TEMP/zfsstub"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zfs"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/zfsstub/zpool"
+          chmod +x "$RUNNER_TEMP/zfsstub/zfs" "$RUNNER_TEMP/zfsstub/zpool"
+          echo "ZFS_CMD=$RUNNER_TEMP/zfsstub/zfs" >> "$GITHUB_ENV"
+          echo "ZPOOL_CMD=$RUNNER_TEMP/zfsstub/zpool" >> "$GITHUB_ENV"
+
+      # Coverage is the other jobs' business; the cache provider would only write into the checkout.
+      - name: Run the mocked test suite
+        run: '"$RUNNER_TEMP/debvenv/bin/python" -m pytest -n auto --no-cov -p no:cacheprovider'
+
+  # Packaging smoke test (plan C20, two wheels since docs/packaging_plan.md). The test jobs
+  # above run from a source checkout, where a file missing from a wheel is invisible: a new
+  # migration that the build forgets to include, or a console script pointing at a module that
+  # does not ship, only shows up on the first real install. This job builds BOTH distributions
+  # (zfsbackup at the root, libzfseasy in libs/libzfseasy), checks what is in them, installs the
+  # two wheels together into a clean venv WITHOUT the dev dependencies, away from the checkout,
+  # and runs the two console scripts through import, migrate --check and --test-config.
   package:
     name: package / py${{ matrix.python }}
     runs-on: ubuntu-latest
@@ -188,10 +259,14 @@ jobs:
       - name: Install poetry
         run: pipx install --python "${{ steps.py.outputs.python-path }}" poetry==2.1.1
 
-      - name: Build the wheel and the sdist
-        run: poetry build
+      # `poetry build` makes one distribution per pyproject.toml; both land in dist/.
+      - name: Build the wheels and the sdists
+        run: |
+          poetry build
+          poetry build -C libs/libzfseasy -o "$PWD/dist"
+          ls -l dist
 
-      - name: Check what the wheel and the sdist contain
+      - name: Check what the wheels and the sdists contain
         run: |
           python - <<'PY'
           import glob
@@ -201,7 +276,21 @@ jobs:
 
           problems = []
 
-          (wheel,) = glob.glob("dist/*.whl")
+          def one(pattern):
+              found = glob.glob(pattern)
+              if len(found) != 1:
+                  problems.append(f"expected exactly one {pattern}, found {found}")
+                  return None
+              return found[0]
+
+          wheel = one("dist/zfsbackup-*.whl")
+          lib_wheel = one("dist/libzfseasy-*.whl")
+          sdist = one("dist/zfsbackup-*.tar.gz")
+          lib_sdist = one("dist/libzfseasy-*.tar.gz")
+          if None in (wheel, lib_wheel, sdist, lib_sdist):
+              sys.exit("\n".join(problems))
+
+          # -- zfsbackup wheel
           names = zipfile.ZipFile(wheel).namelist()
           migrations = [
               n for n in names
@@ -210,10 +299,12 @@ jobs:
           ]
           if not migrations:
               problems.append("wheel: no zfsbackup/config/store/migrations/versions/*.py revision")
-          for required in ("zfsbackup/version.py", "zfsbackup/daemon_entry.py"):
+          for required in (
+              "zfsbackup/version.py", "zfsbackup/daemon_entry.py", "zfsbackup/_vendor/flask_sock.py",
+          ):
               if required not in names:
                   problems.append(f"wheel: {required} is missing")
-          for prefix in ("packaging/", "tests/"):
+          for prefix in ("packaging/", "tests/", "libzfseasy/"):
               leaked = [n for n in names if n.startswith(prefix)]
               if leaked:
                   problems.append(f"wheel: top-level {prefix} must not ship, found {leaked[:3]}")
@@ -222,29 +313,68 @@ jobs:
           for script in ("zfsbackupd", "zfsbackup-config"):
               if script not in scripts:
                   problems.append(f"wheel: console script {script} is not declared")
+          zb_meta = zipfile.ZipFile(wheel).read(
+              next(n for n in names if n.endswith(".dist-info/METADATA"))
+          ).decode()
+          zb_version = next(l.split(": ", 1)[1] for l in zb_meta.splitlines() if l.startswith("Version: "))
+          if f"Requires-Dist: libzfseasy (=={zb_version})" not in zb_meta:
+              problems.append(f"wheel: Requires-Dist: libzfseasy (=={zb_version}) is missing")
+          if "flask-sock" in zb_meta.lower():
+              problems.append("wheel: flask-sock is vendored and must not be a requirement")
 
-          (sdist,) = glob.glob("dist/*.tar.gz")
+          # -- libzfseasy wheel
+          lib_names = zipfile.ZipFile(lib_wheel).namelist()
+          stray = [
+              n for n in lib_names
+              if not n.startswith("libzfseasy/") and ".dist-info/" not in n
+          ]
+          if stray:
+              problems.append(f"libzfseasy wheel: files outside libzfseasy/: {stray[:3]}")
+          if "libzfseasy/__init__.py" not in lib_names:
+              problems.append("libzfseasy wheel: libzfseasy/__init__.py is missing")
+          lib_meta = zipfile.ZipFile(lib_wheel).read(
+              next(n for n in lib_names if n.endswith(".dist-info/METADATA"))
+          ).decode()
+          if "Requires-Dist:" in lib_meta:
+              problems.append("libzfseasy wheel: it must have no dependencies")
+          if f"Version: {zb_version}\n" not in lib_meta:
+              problems.append(f"libzfseasy wheel: version differs from zfsbackup's {zb_version}")
+
+          # -- sdists
           members = tarfile.open(sdist).getnames()
           if not any(m.endswith("/packaging/systemd/zfsbackup.service") for m in members):
               problems.append("sdist: packaging/systemd/zfsbackup.service is missing")
 
-          print(f"wheel: {len(names)} files, {len(migrations)} migration revision(s)")
-          print(f"sdist: {len(members)} files")
+          print(f"zfsbackup wheel: {len(names)} files, {len(migrations)} migration revision(s)")
+          print(f"libzfseasy wheel: {len(lib_names)} files")
+          print(f"sdists: {len(members)} + {len(tarfile.open(lib_sdist).getnames())} files")
           if problems:
               sys.exit("\n".join(problems))
           PY
 
-      # No poetry, no dev group: what a user's `pip install` gets, with the
-      # newest runtime dependencies pyproject allows.
-      - name: Install the wheel into a clean venv
+      # No poetry, no dev group: what a user's `pip install` gets, with the newest runtime
+      # dependencies pyproject allows. Both wheels in one command: zfsbackup requires
+      # `libzfseasy==<same version>`, which is not on PyPI, and pip satisfies it from the
+      # second wheel on the command line.
+      - name: Install the wheels into a clean venv
         run: |
           python -m venv "$RUNNER_TEMP/pkgvenv"
           "$RUNNER_TEMP/pkgvenv/bin/python" -m pip install dist/*.whl
           "$RUNNER_TEMP/pkgvenv/bin/python" -m pip list
+          "$RUNNER_TEMP/pkgvenv/bin/python" -m pip check
           if "$RUNNER_TEMP/pkgvenv/bin/python" -m pip show pytest >/dev/null 2>&1; then
             echo "::error::pytest is installed in the clean venv: a runtime dependency pulls in dev tooling"
             exit 1
           fi
+          if "$RUNNER_TEMP/pkgvenv/bin/python" -m pip show flask-sock >/dev/null 2>&1; then
+            echo "::error::flask-sock is installed: it is vendored and must not be a dependency"
+            exit 1
+          fi
+          # Two distributions, one version, each owning only its own files.
+          "$RUNNER_TEMP/pkgvenv/bin/python" - <<'PY'
+          from importlib.metadata import version
+          assert version("zfsbackup") == version("libzfseasy"), (version("zfsbackup"), version("libzfseasy"))
+          PY
 
       - name: Provide stub zfs/zpool binaries
         run: |

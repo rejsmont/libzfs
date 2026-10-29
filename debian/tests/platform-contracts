@@ -1,0 +1,15 @@
+#!/bin/sh
+# Run from the unpacked source tree; the tests are copied away so that
+# `import zfsbackup` finds the installed package, not the checkout.
+set -eu
+
+export ZFS_CMD=/bin/false ZPOOL_CMD=/bin/false     # conftest needs the names to resolve
+src=$(pwd)
+work=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+rm -rf "$work/tests"
+cp -r "$src/tests" "$work/tests"
+cd "$work"
+
+# -c /dev/null: the checkout's pytest.ini adds coverage options for the source tree.
+exec pytest-3 -c /dev/null --rootdir="$work" -p no:cacheprovider -q \
+    tests/test_zfsbackup_platform_contracts.py tests/test_zfsbackup_tls_platform.py

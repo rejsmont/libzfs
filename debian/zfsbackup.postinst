@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    triggered)
+        # A runtime dependency's files changed. Restart the daemon only if it is
+        # running (try-restart); a restart is safe: workers leave at a safe point
+        # and an interrupted send resumes. Our own install and upgrade do not come
+        # through here: the NEW package's preinst stops the service
+        # (dh_installsystemd --no-restart-after-upgrade; our prerm does it on
+        # deconfigure) and the configure run below starts it again, and dpkg
+        # treats triggers pending at configure time as handled by it.
+        if [ -z "$DPKG_ROOT" ] && [ -d /run/systemd/system ]; then
+            deb-systemd-invoke try-restart zfsbackup.service >/dev/null || true
+        fi
+        exit 0
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
