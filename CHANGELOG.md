@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 1.0.0rc2 (2026-10-29)
+
+Second release candidate. The code is rc1's with two fixes; what is new is the packaging: `libzfseasy` is its own
+wheel, and there are Debian packages for Debian 13 and Ubuntu 26.04.
+
+### Compatibility
+
+- **Wire protocol 1**, unchanged: an rc1 client and an rc2 server (or the reverse) work together.
+- **Config schema head `5d2f8a60c1e4`**, unchanged: no migration from rc1.
+- **Send flags and `raw` semantics** unchanged.
+- **Upgrading an rc1 virtualenv needs `pip uninstall -y zfsbackup` first** (below, and `zfsbackup/README.md`,
+  "Upgrading and downgrading").
+
+### Fixes
+
+- **A stop under Python 3.14 no longer ends with a SIGKILL.** With `forkserver` (3.14's Linux default) the
+  supervisor now stops the multiprocessing forkserver before it exits (bounded at 3 s, one WARNING if something still
+  holds it), so systemd no longer kills a leftover process on every stop, restart and upgrade exit.
+- `trust revoke` now says that running streams are cut within ~2 s (rc1 already cut them; the text said they finish).
 
 ### Packaging
 
