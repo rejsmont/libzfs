@@ -793,6 +793,7 @@ themselves when a Python dependency's package is upgraded; for OpenSSL see `need
    sudo systemctl stop zfsbackup
    # from 1.0.0rc1 only (one wheel carried both packages; without this, pip deletes libzfseasy):
    #   sudo /opt/zfsbackup/venv/bin/pip uninstall -y zfsbackup
+   #   (a uv venv: sudo uv pip uninstall --python /opt/zfsbackup/venv/bin/python zfsbackup)
    sudo /opt/zfsbackup/venv/bin/pip install --upgrade ./libzfseasy-NEW.whl ./zfsbackup-NEW.whl
    # a venv made by uv has no pip:
    #   sudo uv pip install --python /opt/zfsbackup/venv/bin/python --upgrade ./libzfseasy-NEW.whl ./zfsbackup-NEW.whl

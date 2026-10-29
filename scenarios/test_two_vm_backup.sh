@@ -3778,11 +3778,10 @@ else
     if [ "$rc" -ne 0 ]; then pass "(R4) the server cannot mount the copy (no key; exit $rc)"; else fail "(R4) the server mounted an encrypted copy without its key"; fi
     msh "$SERVER_VM" "zfs clone -o canmount=on -o mountpoint=/mnt/zbr-enc '$SDE@$R_E2' '${SERVER_POOL}/renc-clone' >/dev/null 2>&1"; rc=$?
     if [ "$rc" -ne 0 ]; then
-        pass "(R4) the README is literal: an encrypted copy cannot even be cloned on the server (exit $rc)"
+        finding "README (\"Getting files back\") says \`zfs clone\` of an encrypted copy succeeds without the key; here it failed (exit $rc)"
     else
         msh "$SERVER_VM" "zfs mount '${SERVER_POOL}/renc-clone' >/dev/null 2>&1"; rc=$?
-        check "(R4) a clone of the encrypted copy can be CREATED but not read: mounting it fails (no key)" "failed" "$([ "$rc" -ne 0 ] && echo failed || echo mounted)"
-        finding "README (\"Getting files back\"): \"An encrypted (raw) copy cannot be cloned and read on the server\" - zfs creates the clone (key unavailable); only mounting/reading it fails. Wording, not a hazard"
+        check "(R4) as the README says, a clone of the encrypted copy is CREATED but cannot be read: mounting it fails (no key)" "failed" "$([ "$rc" -ne 0 ] && echo failed || echo mounted)"
         msh "$SERVER_VM" "zfs destroy '${SERVER_POOL}/renc-clone' >/dev/null 2>&1; true"
     fi
     msh "$CLIENT_VM" "zfs destroy -r '$R_ENC'" || fail "(R4) could not destroy the client's encrypted dataset"

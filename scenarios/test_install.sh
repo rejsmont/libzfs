@@ -490,7 +490,7 @@ reset_install() {
                /etc/systemd/system/zfsbackup-check.service /etc/systemd/system/zfsbackup-check.timer \
                /etc/systemd/system/timers.target.wants/zfsbackup-check.timer /etc/systemd/system/multi-user.target.wants/zfsbackup.service \
                /etc/sysusers.d/zfsbackup.conf /etc/tmpfiles.d/zfsbackup.conf \
-               /opt/zfsbackup/venv /usr/local/bin/zfsbackup-config /var/lib/zfsbackup /var/lib/node_exporter \
+               /opt/zfsbackup/venv /usr/local/bin/zfsbackup-config /usr/local/bin/zfsbackupd /var/lib/zfsbackup /var/lib/node_exporter \
                /srv/zbinst-backups /var/log/zbinst-old.log /root/zbinst
         rmdir /etc/sysusers.d 2>/dev/null     # stock Ubuntu has none; put it back to stock so the README step is tested as written
         id -u zbop >/dev/null 2>&1 && userdel -r zbop >/dev/null 2>&1
@@ -512,7 +512,7 @@ put_wheels() {
     fi
 }
 
-# install_venv <wheel path on the guest>...: step 1 of the README (the venv at /opt/zfsbackup/venv, the program, the /usr/local/bin link).
+# install_venv <wheel path on the guest>...: step 1 of the README (the venv at /opt/zfsbackup/venv, the program, the /usr/local/bin links).
 # One argument per wheel: `libzfseasy-N.whl zfsbackup-N.whl` for the split layout (the second pins the first), one for a pre-split tree.
 install_venv() {
     local w quoted=""
@@ -530,7 +530,7 @@ install_venv() {
             $VENV/bin/pip install -q $quoted
         " || die "venv / pip install of $* failed on $VM"
     fi
-    vsh "ln -s $VENV/bin/zfsbackup-config /usr/local/bin/zfsbackup-config" || die "ln -s failed"
+    vsh "ln -s $VENV/bin/zfsbackup-config /usr/local/bin/zfsbackup-config && ln -s $VENV/bin/zfsbackupd /usr/local/bin/zfsbackupd" || die "ln -s failed"
 }
 
 install_files() {
@@ -545,11 +545,8 @@ install_files() {
         check_re "the venv holds BOTH distributions, libzfseasy and zfsbackup, at the same version" 'libzfseasy=[^ ]+ zfsbackup=[^ ]+ same=1 ' "$di"
         check_re "libzfseasy's files are in the libzfseasy distribution, none in the zfsbackup one" 'lib_in_lib=[1-9][0-9]* lib_in_zb=0 ' "$di"
     fi
-    # step 2 of the README: the system files, from the sdist (verbatim: plain `install -m 0644 ... /etc/sysusers.d/zfsbackup.conf`)
+    # step 2 of the README: the system files, from the sdist (verbatim: `install -D`, stock Ubuntu has no /etc/sysusers.d)
     vsh "cd $G && tar xzf '$NEW_SDIST_BASE'" || die "cannot extract the sdist on $VM"
-    if ! vsh "cd $G/$SDIST_DIR && install -m 0644 packaging/sysusers.d/zfsbackup.conf /etc/sysusers.d/zfsbackup.conf >/dev/null 2>&1"; then
-        finding "README (\"Install from the wheel and the sdist\", step 2): \`install -m 0644 packaging/sysusers.d/zfsbackup.conf /etc/sysusers.d/zfsbackup.conf\` fails on stock Ubuntu $OSREL because /etc/sysusers.d does not exist (/etc/tmpfiles.d does); use \`install -D\` or /usr/lib/sysusers.d"
-    fi
     vsh "
         set -e
         cd $G/$SDIST_DIR
@@ -564,9 +561,8 @@ install_files() {
     check "the venv has both console scripts" "yes yes" \
         "$(vsh "test -x $VENV/bin/zfsbackupd && echo yes || echo no") $(vsh "test -x $VENV/bin/zfsbackup-config && echo yes || echo no")"
     local vd vc
-    if ! vsh "command -v zfsbackupd >/dev/null 2>&1"; then
-        finding "README (\"Start the Daemon\" and \"Upgrading\") shows a bare \`zfsbackupd --version\` / \`zfsbackupd --test-config\`, but the install steps link only zfsbackup-config into /usr/local/bin: zfsbackupd is \"command not found\" (the First run step uses the full venv path)"
-    fi
+    check "both commands are on PATH, as the README uses them bare" "yes yes" \
+        "$(vsh "command -v zfsbackupd >/dev/null && echo yes || echo no") $(vsh "command -v zfsbackup-config >/dev/null && echo yes || echo no")"
     vd="$(vsh "$VENV/bin/zfsbackupd --version 2>&1" | head -n1)"
     vc="$(vsh "zfsbackup-config --version 2>&1" | head -n1)"
     check_re "zfsbackupd --version names the wire protocol and the config schema" '^zfsbackupd [0-9][^ ]* \(wire protocol [0-9]+, config schema [0-9a-f]{12}\)$' "$vd"
@@ -835,7 +831,12 @@ enroll_and_receive() {
         "$(vsh "md5sum /$POOL/data/.zfs/snapshot/$snapname/file1.bin | cut -d' ' -f1" | tr -d '[:space:]')" \
         "$(vsh "md5sum /mnt/zbinst-restore/file1.bin 2>&1 | cut -d' ' -f1" | tr -d '[:space:]')"
     vsh "{ zfs destroy '$POOL/restore/data'; zfs destroy '$POOL/restore'; } >/dev/null 2>&1; true"
-    finding "README restore/rename examples spell the server copy \`tank/backups/<client_id>/tank/data\`; the server strips the client dataset's pool name, so the copy of $POOL/data is \`$SDS\` (\`tank/backups/<client_id>/data\`): the commands in \"Getting files back\", \"Restoring a whole dataset\" and \"Renaming a server copy aside\" name a dataset that does not exist"
+    # the README's restore/rename examples must spell the copy the way the server names it (pool name stripped)
+    if grep -q 'tank/backups/<client_id>/tank/' "$TOP/zfsbackup/README.md"; then
+        finding "README restore/rename examples spell the server copy \`tank/backups/<client_id>/tank/data\`; the server strips the client dataset's pool name (the copy of $POOL/data is \`$SDS\`)"
+    else
+        pass "the README's restore/rename examples spell the server copy as the server names it (\`tank/backups/<client_id>/data\`)"
+    fi
     # a second snapshot is incremental
     vsh "sleep 2; head -c 300000 /dev/urandom >> /$POOL/data/file1.bin; zfs snapshot '$POOL/data@autosnap_'\$(date -u +%Y%m%d%H%M%S)" || true
     waited=0
@@ -973,7 +974,7 @@ upgrade() {
     # the install state is reset, then the old wheel is installed and run
     vsh "
         { systemctl stop $UNIT zbinst-old; systemctl reset-failed; } >/dev/null 2>&1
-        rm -rf /opt/zfsbackup/venv /usr/local/bin/zfsbackup-config $CFGDIR/config.db* $CFGDIR/backups/* /srv/zbinst-backups
+        rm -rf /opt/zfsbackup/venv /usr/local/bin/zfsbackup-config /usr/local/bin/zfsbackupd $CFGDIR/config.db* $CFGDIR/backups/* /srv/zbinst-backups
         rm -rf /etc/systemd/system/zfsbackup.service.d
         zfs destroy -r '$POOL/backups' >/dev/null 2>&1; zfs create '$POOL/backups'
         zfs destroy -r '$POOL/data' >/dev/null 2>&1; zfs create '$POOL/data'
@@ -1034,7 +1035,7 @@ upgrade() {
                 " 2>&1)"
             fi
             if printf '%s' "$hout" | grep -q IMPORT_OK; then
-                finding "a plain install of the split wheels over the old single \`zfsbackup\` wheel ($OLD_REF) left \`libzfseasy\` importable in this venv ($PYMODE): the 'uninstall first' warning is not reproducible with this installer"
+                info "a plain install of the split wheels over the old single \`zfsbackup\` wheel ($OLD_REF) left \`libzfseasy\` importable ($PYMODE): the hazard the README warns of is pip's, and the README's uninstall-first procedure is safe with either installer"
             else
                 pass "the hazard is real ($PYMODE): a PLAIN install of the split wheels over the old single \`zfsbackup\` wheel leaves \`import libzfseasy\` broken ($(printf '%s' "$hout" | tail -n1 | cut -c1-90))"
             fi
@@ -1051,7 +1052,7 @@ upgrade() {
             pipout="$(vsh "$VENV/bin/pip install $NEW_GUEST 2>&1")"; rc=$?
             check "\`$VENV/bin/pip install libzfseasy-*.whl zfsbackup-*.whl\` succeeds" "0" "$rc"
         else
-            finding "README (\"Upgrading and downgrading\") shows \`/opt/zfsbackup/venv/bin/pip\`, but a venv created with \`uv venv\` (the README's own recipe for Ubuntu 22.04) has no pip; used \`uv pip uninstall\` / \`uv pip install --python\` instead"
+            info "a \`uv venv\` has no pip: the README's \`uv pip uninstall\` / \`uv pip install --python\` variant"
             pipout="$(vsh "/var/tmp/zbinst-uvtool/bin/uv pip uninstall --python $VENV/bin/python $OLD_DIST 2>&1")"; rc=$?
             check "\`uv pip uninstall $OLD_DIST\` succeeds" "0" "$rc"
             [ "$rc" -eq 0 ] || echo "$pipout" | sed 's/^/    uv: /'
@@ -1069,7 +1070,7 @@ upgrade() {
             pipout="$(vsh "$VENV/bin/pip install --upgrade '$G/$NEW_WHL_BASE' 2>&1")"; rc=$?
             check "the README's \`$VENV/bin/pip install --upgrade ./zfsbackup-NEW.whl\` succeeds" "0" "$rc"
         else
-            finding "README (\"Upgrading and downgrading\", step 3) says \`/opt/zfsbackup/venv/bin/pip install --upgrade\`, but a venv created with \`uv venv\` (the README's own recipe for Ubuntu 22.04) has no pip; used \`uv pip install --python\` instead"
+            info "a \`uv venv\` has no pip: the README's \`uv pip install --python --upgrade\` variant"
             pipout="$(vsh "/var/tmp/zbinst-uvtool/bin/uv pip install --python $VENV/bin/python --upgrade '$G/$NEW_WHL_BASE' 2>&1")"; rc=$?
             check "the same upgrade with \`uv pip install --upgrade\` succeeds" "0" "$rc"
         fi
