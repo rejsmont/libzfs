@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Test runner script for libzfseasy
+# Test runner for the mocked suite (libzfseasy and zfsbackup)
 
 set -e
 
-echo "🧪 Running libzfseasy test suite"
-echo "================================"
+echo "🧪 Running the libzfseasy/zfsbackup test suite"
+echo "=============================================="
 echo ""
 
 # Color codes
@@ -93,8 +93,9 @@ if [ "$PARALLEL" != "" ]; then
     PYTEST_CMD="$PYTEST_CMD $PARALLEL"
 fi
 
-if [ "$COVERAGE" = true ]; then
-    PYTEST_CMD="$PYTEST_CMD --cov=libzfseasy --cov-report=term-missing --cov-report=html"
+# pytest.ini's addopts already collect coverage of both packages; --no-cov turns that off.
+if [ "$COVERAGE" = false ]; then
+    PYTEST_CMD="$PYTEST_CMD --no-cov"
 fi
 
 # Add markers based on flags

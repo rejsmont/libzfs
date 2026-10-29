@@ -1,0 +1,19 @@
+[project]
+name = "libzfseasy"
+version = "1.0.0rc1"
+description = "Python interface to the ZFS utilities (zfs and zpool)"
+authors = [{name = "Radoslaw Kamil Ejsmont", email = "radoslaw@ejsmont.net"}]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.11"
+# Stdlib only. Keep it that way: the Debian package is a plain python3 library.
+dependencies = []
+
+[tool.poetry]
+packages = [
+    {include = "libzfseasy"},
+]
+
+[build-system]
+requires = ["poetry-core>=2.0,<3"]
+build-backend = "poetry.core.masonry.api"

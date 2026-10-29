@@ -1300,8 +1300,8 @@ class ListCommand(Command, StringListArgument, DatasetListArgument):
         """List ZFS datasets.
 
         Keyword arguments:
-            root: Dataset -- specify a root dataset to list from (default None)
-            dstype: str -- types of datasets to list (default None)
+            roots: Dataset | str | [Dataset | str] -- the root dataset(s) to list from (default None)
+            types: str -- types of datasets to list, e.g. 'snapshot' or 'filesystem,volume' (default None)
             recursive: bool -- whether to recursively list root dataset children (default False)
             depth: int -- child dataset depth to list (default 0)
             properties: str | [str] -- properties to include in the result (default None)
