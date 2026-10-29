@@ -1,0 +1,1326 @@
+##### SECTION Z3 (partial new-dataset receive with -s: existence, zfs list, token holder, -o values while partial, receive -A residue, retries, destroy, resume)  tag=C  zfs-2.3.9-0+deb13u1
+=== CASE Z3/raw.a.0_cut
+--- cmd
+zfs send -w zfsbcapc/Z3/cs/enc@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/raw_a
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8
+=== END
+=== CASE Z3/raw.a.1_list_srv
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	filesystem
+zfsbcapc/Z3/srv/raw_a	filesystem
+--- stderr
+=== END
+=== CASE Z3/raw.a.2_list_L
+--- cmd
+zfs list -H -t all -o name,type,mounted,canmount,readonly,used -r zfsbcapc/Z3/srv/raw_a
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_a	filesystem	no	on	on	949K
+--- stderr
+=== END
+=== CASE Z3/raw.a.3_list_L_exact
+--- cmd
+zfs list -H -o name,type zfsbcapc/Z3/srv/raw_a
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_a	filesystem
+--- stderr
+=== END
+=== CASE Z3/raw.a.4_props_partial
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z3/srv/raw_a
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_a	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z3/srv/raw_a	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z3/srv/raw_a	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z3/srv/raw_a	encryption	aes-256-gcm	-	-
+zfsbcapc/Z3/srv/raw_a	encryptionroot	zfsbcapc/Z3/srv/raw_a	-	-
+zfsbcapc/Z3/srv/raw_a	keystatus	unavailable	-	-
+zfsbcapc/Z3/srv/raw_a	canmount	on	-	default
+zfsbcapc/Z3/srv/raw_a	readonly	on	-	local
+zfsbcapc/Z3/srv/raw_a	volmode	default	-	default
+zfsbcapc/Z3/srv/raw_a	receive_resume_token	1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8	-	-
+--- stderr
+=== END
+=== CASE Z3/raw.a.5_token_recursive
+--- cmd
+zfs get -H -r -o name,property,value,source receive_resume_token zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	receive_resume_token	-	-
+zfsbcapc/Z3/srv/raw_a	receive_resume_token	1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8	-
+--- stderr
+=== END
+=== CASE Z3/raw.a.6_percent_recv
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/Z3/srv/raw_a/%recv
+--- rc
+1
+--- stdout
+--- stderr
+cannot open 'zfsbcapc/Z3/srv/raw_a/%recv': dataset does not exist
+=== END
+=== CASE Z3/raw.a.7_list_percent_recv
+--- cmd
+zfs list -H -t all zfsbcapc/Z3/srv/raw_a/%recv
+--- rc
+1
+--- stdout
+--- stderr
+cannot open 'zfsbcapc/Z3/srv/raw_a/%recv': dataset does not exist
+=== END
+=== CASE Z3/raw.a.8_zdb
+--- cmd
+zdb -d zfsbcapc 2>&1 | grep -E 'recv|raw_a'
+--- rc
+0
+--- stdout
+Dataset zfsbcapc/M7/u1/t_d/%recv [ZPL], ID 4922, cr_txg 1333, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M7/u2/t_b/%recv [ZPL], ID 4979, cr_txg 1361, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M9/recv/child@s1 [ZPL], ID 9589, cr_txg 3235, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/child [ZPL], ID 9725, cr_txg 3233, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm@s1 [ZPL], ID 9575, cr_txg 3226, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm [ZPL], ID 9571, cr_txg 3225, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz@s1 [ZPL], ID 9719, cr_txg 3232, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz [ZPL], ID 9585, cr_txg 3231, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa@s1 [ZPL], ID 9579, cr_txg 3229, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa [ZPL], ID 9713, cr_txg 3227, 24K, 6 objects
+Dataset zfsbcapc/M9/recv@s1 [ZPL], ID 9707, cr_txg 3223, 24K, 6 objects
+Dataset zfsbcapc/M9/recv [ZPL], ID 9701, cr_txg 3220, 24K, 6 objects
+Dataset zfsbcapc/Z3/srv/raw_a [ZPL], ID 10415, cr_txg 3464, 949K, 2 objects (inconsistent)
+Dataset zfsbcapc/M8/srvn/hdr_resr/%recv [ZPL], ID 9396, cr_txg 3120, 3.97M, 8 objects (inconsistent)
+Dataset zfsbcapc/M8/srvn/hdr_res/%recv [ZPL], ID 9315, cr_txg 3099, 3.90M, 8 objects (inconsistent)
+--- stderr
+=== END
+=== CASE Z3/raw.a.9_get_all_local
+--- cmd
+zfs get -H -s local,received -o name,property,value,source all zfsbcapc/Z3/srv/raw_a
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_a	readonly	on	local
+zfsbcapc/Z3/srv/raw_a	keylocation	prompt	local
+zfsbcapc/Z3/srv/raw_a	org.zfsbackup:client_id	client-1	local
+zfsbcapc/Z3/srv/raw_a	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	local
+zfsbcapc/Z3/srv/raw_a	org.zfsbackup:source_dataset	pool/data	local
+--- stderr
+=== END
+=== CASE Z3/raw.a.10_retry_fresh_full_F
+--- cmd
+zfs send -w zfsbcapc/Z3/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z3/srv/raw_a
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an encrypted filesystem or overwrite an unencrypted one with an encrypted one
+=== END
+=== CASE Z3/raw.a.11_retry_fresh_full_noF
+--- cmd
+zfs send -w zfsbcapc/Z3/cs/enc@a | zfs receive -s -u zfsbcapc/Z3/srv/raw_a
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination 'zfsbcapc/Z3/srv/raw_a' exists
+must specify -F to overwrite it
+=== END
+=== CASE Z3/raw.a.12_abort
+--- cmd
+zfs receive -A zfsbcapc/Z3/srv/raw_a
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/raw.a.13_list_after_abort
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	filesystem
+--- stderr
+=== END
+=== CASE Z3/raw.a.14_get_after_abort
+--- cmd
+zfs get -H -o name,property,value,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,receive_resume_token zfsbcapc/Z3/srv/raw_a
+--- rc
+1
+--- stdout
+--- stderr
+cannot open 'zfsbcapc/Z3/srv/raw_a': dataset does not exist
+=== END
+=== CASE Z3/raw.a.15_zdb_after
+--- cmd
+zdb -d zfsbcapc 2>&1 | grep -E 'recv|raw_a'; true
+--- rc
+0
+--- stdout
+Dataset zfsbcapc/M7/u1/t_d/%recv [ZPL], ID 4922, cr_txg 1333, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M7/u2/t_b/%recv [ZPL], ID 4979, cr_txg 1361, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M9/recv/child@s1 [ZPL], ID 9589, cr_txg 3235, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/child [ZPL], ID 9725, cr_txg 3233, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm@s1 [ZPL], ID 9575, cr_txg 3226, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm [ZPL], ID 9571, cr_txg 3225, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz@s1 [ZPL], ID 9719, cr_txg 3232, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz [ZPL], ID 9585, cr_txg 3231, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa@s1 [ZPL], ID 9579, cr_txg 3229, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa [ZPL], ID 9713, cr_txg 3227, 24K, 6 objects
+Dataset zfsbcapc/M9/recv@s1 [ZPL], ID 9707, cr_txg 3223, 24K, 6 objects
+Dataset zfsbcapc/M9/recv [ZPL], ID 9701, cr_txg 3220, 24K, 6 objects
+Dataset zfsbcapc/M8/srvn/hdr_resr/%recv [ZPL], ID 9396, cr_txg 3120, 3.97M, 8 objects (inconsistent)
+Dataset zfsbcapc/M8/srvn/hdr_res/%recv [ZPL], ID 9315, cr_txg 3099, 3.90M, 8 objects (inconsistent)
+--- stderr
+=== END
+=== CASE Z3/raw.a.16_abort_again
+--- cmd
+zfs receive -A zfsbcapc/Z3/srv/raw_a
+--- rc
+2
+--- stdout
+--- stderr
+cannot open 'zfsbcapc/Z3/srv/raw_a': dataset does not exist
+usage:
+	receive [-vMnsFhu] [-o <property>=<value>] ... [-x <property>] ...
+	    <filesystem|volume|snapshot>
+	receive [-vMnsFhu] [-o <property>=<value>] ... [-x <property>] ... 
+	    [-d | -e] <filesystem>
+	receive -A <filesystem|volume>
+
+For the property list, run: zfs set|get
+
+For the delegated permission list, run: zfs allow|unallow
+
+For further help on a command or topic, run: zfs help [<topic>]
+=== END
+=== CASE Z3/raw.a.17_fresh_full_after_abort
+--- cmd
+zfs send -w zfsbcapc/Z3/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z3/srv/raw_a
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/raw.a.18_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z3/srv/raw_a
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_a@a	13735946358667951402	3474
+--- stderr
+=== END
+=== CASE Z3/raw.b.0_cut
+--- cmd
+zfs send -w zfsbcapc/Z3/cs/enc@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/raw_b
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8
+=== END
+=== CASE Z3/raw.b.1_destroy
+--- cmd
+zfs destroy zfsbcapc/Z3/srv/raw_b
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/raw.b.2_destroy_r
+--- cmd
+zfs destroy -r zfsbcapc/Z3/srv/raw_b
+--- rc
+1
+--- stdout
+--- stderr
+cannot open 'zfsbcapc/Z3/srv/raw_b': dataset does not exist
+=== END
+=== CASE Z3/raw.b.3_list
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	filesystem
+zfsbcapc/Z3/srv/raw_a	filesystem
+zfsbcapc/Z3/srv/raw_a@a	snapshot
+--- stderr
+=== END
+=== CASE Z3/raw.c.0_cut
+--- cmd
+zfs send -w zfsbcapc/Z3/cs/enc@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/raw_c
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8
+=== END
+=== CASE Z3/raw.c.1_resume
+--- cmd
+zfs send -t 1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/raw_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/raw.c.2_props_final
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z3/srv/raw_c
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_c	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z3/srv/raw_c	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z3/srv/raw_c	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z3/srv/raw_c	encryption	aes-256-gcm	-	-
+zfsbcapc/Z3/srv/raw_c	encryptionroot	zfsbcapc/Z3/srv/raw_c	-	-
+zfsbcapc/Z3/srv/raw_c	keystatus	unavailable	-	-
+zfsbcapc/Z3/srv/raw_c	canmount	on	-	default
+zfsbcapc/Z3/srv/raw_c	readonly	on	-	local
+zfsbcapc/Z3/srv/raw_c	volmode	default	-	default
+zfsbcapc/Z3/srv/raw_c	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z3/raw.c.3_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z3/srv/raw_c
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_c@a	13735946358667951402	3491
+--- stderr
+=== END
+=== CASE Z3/raw.d.0_cut
+--- cmd
+zfs send -w zfsbcapc/Z3/cs/enc@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/raw_d
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8
+=== END
+=== CASE Z3/raw.d.1_resume_no_o
+--- cmd
+zfs send -t 1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8 | zfs receive -F -s -u zfsbcapc/Z3/srv/raw_d
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/raw.d.2_props_final
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z3/srv/raw_d
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_d	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z3/srv/raw_d	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z3/srv/raw_d	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z3/srv/raw_d	encryption	aes-256-gcm	-	-
+zfsbcapc/Z3/srv/raw_d	encryptionroot	zfsbcapc/Z3/srv/raw_d	-	-
+zfsbcapc/Z3/srv/raw_d	keystatus	unavailable	-	-
+zfsbcapc/Z3/srv/raw_d	canmount	on	-	default
+zfsbcapc/Z3/srv/raw_d	readonly	on	-	local
+zfsbcapc/Z3/srv/raw_d	volmode	default	-	default
+zfsbcapc/Z3/srv/raw_d	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z3/raw.e.0_cut
+--- cmd
+zfs send -w zfsbcapc/Z3/cs/enc@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/raw_e
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8
+=== END
+=== CASE Z3/raw.e.1_set_user_prop
+--- cmd
+zfs set org.zfsbackup:anchor.x=1 zfsbcapc/Z3/srv/raw_e
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/raw.e.2_snapshot
+--- cmd
+zfs snapshot zfsbcapc/Z3/srv/raw_e@local
+--- rc
+1
+--- stdout
+--- stderr
+cannot create snapshot 'zfsbcapc/Z3/srv/raw_e@local': dataset is busy
+=== END
+=== CASE Z3/raw.e.3_rename
+--- cmd
+zfs rename zfsbcapc/Z3/srv/raw_e zfsbcapc/Z3/srv/raw_e_renamed
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/raw.e.4_list_after
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	filesystem
+zfsbcapc/Z3/srv/raw_a	filesystem
+zfsbcapc/Z3/srv/raw_a@a	snapshot
+zfsbcapc/Z3/srv/raw_c	filesystem
+zfsbcapc/Z3/srv/raw_c@a	snapshot
+zfsbcapc/Z3/srv/raw_d	filesystem
+zfsbcapc/Z3/srv/raw_d@a	snapshot
+zfsbcapc/Z3/srv/raw_e_renamed	filesystem
+--- stderr
+=== END
+=== CASE Z3/raw.e.5_token_after_rename
+--- cmd
+zfs get -H -r -o name,property,value receive_resume_token zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_a	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_a@a	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_c	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_c@a	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_d	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_d@a	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_e_renamed	receive_resume_token	1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8
+--- stderr
+=== END
+=== CASE Z3/raw.e.6_resume_after_rename
+--- cmd
+bash -c zfs send -t 1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8 | zfs receive -s -u zfsbcapc/Z3/srv/raw_e_renamed
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/raw.f.0_cut
+--- cmd
+zfs send -w zfsbcapc/Z3/cs/enc@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/raw_f
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8
+=== END
+=== CASE Z3/raw.f.1_token_prop_value
+--- cmd
+zfs get -H -o value receive_resume_token zfsbcapc/Z3/srv/raw_f
+--- rc
+0
+--- stdout
+1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8
+--- stderr
+=== END
+=== CASE Z3/raw.g.0_base
+--- cmd
+zfs send -w zfsbcapc/Z3/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z3/srv/raw_g
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/raw.g.1_incr_cut
+--- cmd
+zfs send -w -i zfsbcapc/Z3/cs/enc@a zfsbcapc/Z3/cs/enc@b | head -c 500000 | zfs receive -F -s -u -o org.zfsbackup:config=ZGlmZmVyZW50 -o org.zfsbackup:client_id=client-2 -o org.zfsbackup:source_dataset=pool/other zfsbcapc/Z3/srv/raw_g
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-140e5a6cde-120-789c636064000310a501c49c50360710a715e5e7a69766a630408196ade5a3fc47f3f72900d9ec48eaf293b252934b181898a1ea30e4d3d28a534b40322c70793624f9a4ca92d46220fd46980dabfe927c882b4efdd349964e5ab4d900499e132c9f97989bcac05095569c949c5890ac1f65ac9f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300cfe027fd
+=== END
+=== CASE Z3/raw.g.2_list
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv/raw_g
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_g	filesystem
+zfsbcapc/Z3/srv/raw_g@a	snapshot
+--- stderr
+=== END
+=== CASE Z3/raw.g.3_props_partial
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z3/srv/raw_g
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_g	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z3/srv/raw_g	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z3/srv/raw_g	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z3/srv/raw_g	encryption	aes-256-gcm	-	-
+zfsbcapc/Z3/srv/raw_g	encryptionroot	zfsbcapc/Z3/srv/raw_g	-	-
+zfsbcapc/Z3/srv/raw_g	keystatus	unavailable	-	-
+zfsbcapc/Z3/srv/raw_g	canmount	on	-	default
+zfsbcapc/Z3/srv/raw_g	readonly	off	-	default
+zfsbcapc/Z3/srv/raw_g	volmode	default	-	default
+zfsbcapc/Z3/srv/raw_g	receive_resume_token	1-140e5a6cde-120-789c636064000310a501c49c50360710a715e5e7a69766a630408196ade5a3fc47f3f72900d9ec48eaf293b252934b181898a1ea30e4d3d28a534b40322c70793624f9a4ca92d46220fd46980dabfe927c882b4efdd349964e5ab4d900499e132c9f97989bcac05095569c949c5890ac1f65ac9f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300cfe027fd	-	-
+--- stderr
+=== END
+=== CASE Z3/raw.g.4_token_recursive
+--- cmd
+zfs get -H -r -o name,property,value receive_resume_token zfsbcapc/Z3/srv/raw_g
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_g	receive_resume_token	1-140e5a6cde-120-789c636064000310a501c49c50360710a715e5e7a69766a630408196ade5a3fc47f3f72900d9ec48eaf293b252934b181898a1ea30e4d3d28a534b40322c70793624f9a4ca92d46220fd46980dabfe927c882b4efdd349964e5ab4d900499e132c9f97989bcac05095569c949c5890ac1f65ac9f5cac9f9a97ec9004338f9b01e1cfe4fcdc82a2d4e2e2fc6c889804d43d30f9a2c47298140300cfe027fd
+zfsbcapc/Z3/srv/raw_g@a	receive_resume_token	-
+--- stderr
+=== END
+=== CASE Z3/raw.g.5_zdb
+--- cmd
+zdb -d zfsbcapc 2>&1 | grep -E 'recv|raw_g'
+--- rc
+0
+--- stdout
+Dataset zfsbcapc/M7/u1/t_d/%recv [ZPL], ID 4922, cr_txg 1333, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M7/u2/t_b/%recv [ZPL], ID 4979, cr_txg 1361, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M9/recv/child@s1 [ZPL], ID 9589, cr_txg 3235, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/child [ZPL], ID 9725, cr_txg 3233, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm@s1 [ZPL], ID 9575, cr_txg 3226, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm [ZPL], ID 9571, cr_txg 3225, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz@s1 [ZPL], ID 9719, cr_txg 3232, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz [ZPL], ID 9585, cr_txg 3231, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa@s1 [ZPL], ID 9579, cr_txg 3229, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa [ZPL], ID 9713, cr_txg 3227, 24K, 6 objects
+Dataset zfsbcapc/M9/recv@s1 [ZPL], ID 9707, cr_txg 3223, 24K, 6 objects
+Dataset zfsbcapc/M9/recv [ZPL], ID 9701, cr_txg 3220, 24K, 6 objects
+Dataset zfsbcapc/Z3/srv/raw_g/%recv [ZPL], ID 10527, cr_txg 3523, 2.47M, 8 objects (inconsistent)
+Dataset zfsbcapc/Z3/srv/raw_g@a [ZPL], ID 10464, cr_txg 3522, 2.10M, 7 objects
+Dataset zfsbcapc/Z3/srv/raw_g [ZPL], ID 10520, cr_txg 3519, 2.10M, 7 objects
+Dataset zfsbcapc/M8/srvn/hdr_resr/%recv [ZPL], ID 9396, cr_txg 3120, 3.97M, 8 objects (inconsistent)
+Dataset zfsbcapc/M8/srvn/hdr_res/%recv [ZPL], ID 9315, cr_txg 3099, 3.90M, 8 objects (inconsistent)
+--- stderr
+=== END
+=== CASE Z3/raw.g.6_destroy_base_snapshot
+--- cmd
+zfs destroy zfsbcapc/Z3/srv/raw_g@a
+--- rc
+1
+--- stdout
+--- stderr
+cannot destroy 'zfsbcapc/Z3/srv/raw_g@a': snapshot has dependent clones
+use '-R' to destroy the following datasets:
+zfsbcapc/Z3/srv/raw_g/%recv
+=== END
+=== CASE Z3/raw.g.7_abort
+--- cmd
+zfs receive -A zfsbcapc/Z3/srv/raw_g
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/raw.g.8_list_after_abort
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv/raw_g
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_g	filesystem
+zfsbcapc/Z3/srv/raw_g@a	snapshot
+--- stderr
+=== END
+=== CASE Z3/raw.g.9_props_after_abort
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z3/srv/raw_g
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/raw_g	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z3/srv/raw_g	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z3/srv/raw_g	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z3/srv/raw_g	encryption	aes-256-gcm	-	-
+zfsbcapc/Z3/srv/raw_g	encryptionroot	zfsbcapc/Z3/srv/raw_g	-	-
+zfsbcapc/Z3/srv/raw_g	keystatus	unavailable	-	-
+zfsbcapc/Z3/srv/raw_g	canmount	on	-	default
+zfsbcapc/Z3/srv/raw_g	readonly	off	-	default
+zfsbcapc/Z3/srv/raw_g	volmode	default	-	default
+zfsbcapc/Z3/srv/raw_g	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z3/raw.g.10_zdb_after
+--- cmd
+zdb -d zfsbcapc 2>&1 | grep -E 'recv|raw_g'; true
+--- rc
+0
+--- stdout
+Dataset zfsbcapc/M7/u1/t_d/%recv [ZPL], ID 4922, cr_txg 1333, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M7/u2/t_b/%recv [ZPL], ID 4979, cr_txg 1361, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M9/recv/child@s1 [ZPL], ID 9589, cr_txg 3235, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/child [ZPL], ID 9725, cr_txg 3233, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm@s1 [ZPL], ID 9575, cr_txg 3226, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm [ZPL], ID 9571, cr_txg 3225, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz@s1 [ZPL], ID 9719, cr_txg 3232, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz [ZPL], ID 9585, cr_txg 3231, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa@s1 [ZPL], ID 9579, cr_txg 3229, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa [ZPL], ID 9713, cr_txg 3227, 24K, 6 objects
+Dataset zfsbcapc/M9/recv@s1 [ZPL], ID 9707, cr_txg 3223, 24K, 6 objects
+Dataset zfsbcapc/M9/recv [ZPL], ID 9701, cr_txg 3220, 24K, 6 objects
+Dataset zfsbcapc/Z3/srv/raw_g@a [ZPL], ID 10464, cr_txg 3522, 2.10M, 7 objects
+Dataset zfsbcapc/Z3/srv/raw_g [ZPL], ID 10520, cr_txg 3519, 2.10M, 7 objects
+Dataset zfsbcapc/M8/srvn/hdr_resr/%recv [ZPL], ID 9396, cr_txg 3120, 3.97M, 8 objects (inconsistent)
+Dataset zfsbcapc/M8/srvn/hdr_res/%recv [ZPL], ID 9315, cr_txg 3099, 3.90M, 8 objects (inconsistent)
+--- stderr
+=== END
+=== CASE Z3/plain.a.0_cut
+--- cmd
+zfs send zfsbcapc/Z3/cs/plain@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/plain_a
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4
+=== END
+=== CASE Z3/plain.a.1_list_srv
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	filesystem
+zfsbcapc/Z3/srv/plain_a	filesystem
+zfsbcapc/Z3/srv/raw_a	filesystem
+zfsbcapc/Z3/srv/raw_a@a	snapshot
+zfsbcapc/Z3/srv/raw_c	filesystem
+zfsbcapc/Z3/srv/raw_c@a	snapshot
+zfsbcapc/Z3/srv/raw_d	filesystem
+zfsbcapc/Z3/srv/raw_d@a	snapshot
+zfsbcapc/Z3/srv/raw_e_renamed	filesystem
+zfsbcapc/Z3/srv/raw_e_renamed@a	snapshot
+zfsbcapc/Z3/srv/raw_f	filesystem
+zfsbcapc/Z3/srv/raw_g	filesystem
+zfsbcapc/Z3/srv/raw_g@a	snapshot
+--- stderr
+=== END
+=== CASE Z3/plain.a.2_list_L
+--- cmd
+zfs list -H -t all -o name,type,mounted,canmount,readonly,used -r zfsbcapc/Z3/srv/plain_a
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_a	filesystem	no	on	on	911K
+--- stderr
+=== END
+=== CASE Z3/plain.a.3_list_L_exact
+--- cmd
+zfs list -H -o name,type zfsbcapc/Z3/srv/plain_a
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_a	filesystem
+--- stderr
+=== END
+=== CASE Z3/plain.a.4_props_partial
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z3/srv/plain_a
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_a	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z3/srv/plain_a	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z3/srv/plain_a	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z3/srv/plain_a	encryption	off	-	default
+zfsbcapc/Z3/srv/plain_a	encryptionroot	-	-	-
+zfsbcapc/Z3/srv/plain_a	keystatus	-	-	-
+zfsbcapc/Z3/srv/plain_a	canmount	on	-	default
+zfsbcapc/Z3/srv/plain_a	readonly	on	-	local
+zfsbcapc/Z3/srv/plain_a	volmode	default	-	default
+zfsbcapc/Z3/srv/plain_a	receive_resume_token	1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4	-	-
+--- stderr
+=== END
+=== CASE Z3/plain.a.5_token_recursive
+--- cmd
+zfs get -H -r -o name,property,value,source receive_resume_token zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	receive_resume_token	-	-
+zfsbcapc/Z3/srv/plain_a	receive_resume_token	1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4	-
+zfsbcapc/Z3/srv/raw_a	receive_resume_token	-	-
+zfsbcapc/Z3/srv/raw_a@a	receive_resume_token	-	-
+zfsbcapc/Z3/srv/raw_c	receive_resume_token	-	-
+zfsbcapc/Z3/srv/raw_c@a	receive_resume_token	-	-
+zfsbcapc/Z3/srv/raw_d	receive_resume_token	-	-
+zfsbcapc/Z3/srv/raw_d@a	receive_resume_token	-	-
+zfsbcapc/Z3/srv/raw_e_renamed	receive_resume_token	-	-
+zfsbcapc/Z3/srv/raw_e_renamed@a	receive_resume_token	-	-
+zfsbcapc/Z3/srv/raw_f	receive_resume_token	1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8	-
+zfsbcapc/Z3/srv/raw_g	receive_resume_token	-	-
+zfsbcapc/Z3/srv/raw_g@a	receive_resume_token	-	-
+--- stderr
+=== END
+=== CASE Z3/plain.a.6_percent_recv
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/Z3/srv/plain_a/%recv
+--- rc
+1
+--- stdout
+--- stderr
+cannot open 'zfsbcapc/Z3/srv/plain_a/%recv': dataset does not exist
+=== END
+=== CASE Z3/plain.a.7_list_percent_recv
+--- cmd
+zfs list -H -t all zfsbcapc/Z3/srv/plain_a/%recv
+--- rc
+1
+--- stdout
+--- stderr
+cannot open 'zfsbcapc/Z3/srv/plain_a/%recv': dataset does not exist
+=== END
+=== CASE Z3/plain.a.8_zdb
+--- cmd
+zdb -d zfsbcapc 2>&1 | grep -E 'recv|plain_a'
+--- rc
+0
+--- stdout
+Dataset zfsbcapc/M7/u1/t_d/%recv [ZPL], ID 4922, cr_txg 1333, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M7/u2/t_b/%recv [ZPL], ID 4979, cr_txg 1361, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M9/recv/child@s1 [ZPL], ID 9589, cr_txg 3235, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/child [ZPL], ID 9725, cr_txg 3233, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm@s1 [ZPL], ID 9575, cr_txg 3226, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm [ZPL], ID 9571, cr_txg 3225, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz@s1 [ZPL], ID 9719, cr_txg 3232, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz [ZPL], ID 9585, cr_txg 3231, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa@s1 [ZPL], ID 9579, cr_txg 3229, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa [ZPL], ID 9713, cr_txg 3227, 24K, 6 objects
+Dataset zfsbcapc/M9/recv@s1 [ZPL], ID 9707, cr_txg 3223, 24K, 6 objects
+Dataset zfsbcapc/M9/recv [ZPL], ID 9701, cr_txg 3220, 24K, 6 objects
+Dataset zfsbcapc/Z3/srv/plain_a [ZPL], ID 10477, cr_txg 3534, 911K, 2 objects (inconsistent)
+Dataset zfsbcapc/M8/srvn/hdr_resr/%recv [ZPL], ID 9396, cr_txg 3120, 3.97M, 8 objects (inconsistent)
+Dataset zfsbcapc/M8/srvn/hdr_res/%recv [ZPL], ID 9315, cr_txg 3099, 3.90M, 8 objects (inconsistent)
+--- stderr
+=== END
+=== CASE Z3/plain.a.9_get_all_local
+--- cmd
+zfs get -H -s local,received -o name,property,value,source all zfsbcapc/Z3/srv/plain_a
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_a	readonly	on	local
+zfsbcapc/Z3/srv/plain_a	org.zfsbackup:source_dataset	pool/data	local
+zfsbcapc/Z3/srv/plain_a	org.zfsbackup:client_id	client-1	local
+zfsbcapc/Z3/srv/plain_a	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	local
+--- stderr
+=== END
+=== CASE Z3/plain.a.10_retry_fresh_full_F
+--- cmd
+zfs send zfsbcapc/Z3/cs/plain@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z3/srv/plain_a
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination zfsbcapc/Z3/srv/plain_a contains partially-complete state from "zfs receive -s".
+=== END
+=== CASE Z3/plain.a.11_retry_fresh_full_noF
+--- cmd
+zfs send zfsbcapc/Z3/cs/plain@a | zfs receive -s -u zfsbcapc/Z3/srv/plain_a
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination 'zfsbcapc/Z3/srv/plain_a' exists
+must specify -F to overwrite it
+=== END
+=== CASE Z3/plain.a.12_abort
+--- cmd
+zfs receive -A zfsbcapc/Z3/srv/plain_a
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/plain.a.13_list_after_abort
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	filesystem
+zfsbcapc/Z3/srv/raw_a	filesystem
+zfsbcapc/Z3/srv/raw_a@a	snapshot
+zfsbcapc/Z3/srv/raw_c	filesystem
+zfsbcapc/Z3/srv/raw_c@a	snapshot
+zfsbcapc/Z3/srv/raw_d	filesystem
+zfsbcapc/Z3/srv/raw_d@a	snapshot
+zfsbcapc/Z3/srv/raw_e_renamed	filesystem
+zfsbcapc/Z3/srv/raw_e_renamed@a	snapshot
+zfsbcapc/Z3/srv/raw_f	filesystem
+zfsbcapc/Z3/srv/raw_g	filesystem
+zfsbcapc/Z3/srv/raw_g@a	snapshot
+--- stderr
+=== END
+=== CASE Z3/plain.a.14_get_after_abort
+--- cmd
+zfs get -H -o name,property,value,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,receive_resume_token zfsbcapc/Z3/srv/plain_a
+--- rc
+1
+--- stdout
+--- stderr
+cannot open 'zfsbcapc/Z3/srv/plain_a': dataset does not exist
+=== END
+=== CASE Z3/plain.a.15_zdb_after
+--- cmd
+zdb -d zfsbcapc 2>&1 | grep -E 'recv|plain_a'; true
+--- rc
+0
+--- stdout
+Dataset zfsbcapc/M7/u1/t_d/%recv [ZPL], ID 4922, cr_txg 1333, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M7/u2/t_b/%recv [ZPL], ID 4979, cr_txg 1361, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M9/recv/child@s1 [ZPL], ID 9589, cr_txg 3235, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/child [ZPL], ID 9725, cr_txg 3233, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm@s1 [ZPL], ID 9575, cr_txg 3226, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm [ZPL], ID 9571, cr_txg 3225, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz@s1 [ZPL], ID 9719, cr_txg 3232, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz [ZPL], ID 9585, cr_txg 3231, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa@s1 [ZPL], ID 9579, cr_txg 3229, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa [ZPL], ID 9713, cr_txg 3227, 24K, 6 objects
+Dataset zfsbcapc/M9/recv@s1 [ZPL], ID 9707, cr_txg 3223, 24K, 6 objects
+Dataset zfsbcapc/M9/recv [ZPL], ID 9701, cr_txg 3220, 24K, 6 objects
+Dataset zfsbcapc/M8/srvn/hdr_resr/%recv [ZPL], ID 9396, cr_txg 3120, 3.97M, 8 objects (inconsistent)
+Dataset zfsbcapc/M8/srvn/hdr_res/%recv [ZPL], ID 9315, cr_txg 3099, 3.90M, 8 objects (inconsistent)
+--- stderr
+=== END
+=== CASE Z3/plain.a.16_abort_again
+--- cmd
+zfs receive -A zfsbcapc/Z3/srv/plain_a
+--- rc
+2
+--- stdout
+--- stderr
+cannot open 'zfsbcapc/Z3/srv/plain_a': dataset does not exist
+usage:
+	receive [-vMnsFhu] [-o <property>=<value>] ... [-x <property>] ...
+	    <filesystem|volume|snapshot>
+	receive [-vMnsFhu] [-o <property>=<value>] ... [-x <property>] ... 
+	    [-d | -e] <filesystem>
+	receive -A <filesystem|volume>
+
+For the property list, run: zfs set|get
+
+For the delegated permission list, run: zfs allow|unallow
+
+For further help on a command or topic, run: zfs help [<topic>]
+=== END
+=== CASE Z3/plain.a.17_fresh_full_after_abort
+--- cmd
+zfs send zfsbcapc/Z3/cs/plain@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z3/srv/plain_a
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/plain.a.18_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z3/srv/plain_a
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_a@a	8349193632946464127	3542
+--- stderr
+=== END
+=== CASE Z3/plain.b.0_cut
+--- cmd
+zfs send zfsbcapc/Z3/cs/plain@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/plain_b
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4
+=== END
+=== CASE Z3/plain.b.1_destroy
+--- cmd
+zfs destroy zfsbcapc/Z3/srv/plain_b
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/plain.b.2_destroy_r
+--- cmd
+zfs destroy -r zfsbcapc/Z3/srv/plain_b
+--- rc
+1
+--- stdout
+--- stderr
+cannot open 'zfsbcapc/Z3/srv/plain_b': dataset does not exist
+=== END
+=== CASE Z3/plain.b.3_list
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	filesystem
+zfsbcapc/Z3/srv/plain_a	filesystem
+zfsbcapc/Z3/srv/plain_a@a	snapshot
+zfsbcapc/Z3/srv/raw_a	filesystem
+zfsbcapc/Z3/srv/raw_a@a	snapshot
+zfsbcapc/Z3/srv/raw_c	filesystem
+zfsbcapc/Z3/srv/raw_c@a	snapshot
+zfsbcapc/Z3/srv/raw_d	filesystem
+zfsbcapc/Z3/srv/raw_d@a	snapshot
+zfsbcapc/Z3/srv/raw_e_renamed	filesystem
+zfsbcapc/Z3/srv/raw_e_renamed@a	snapshot
+zfsbcapc/Z3/srv/raw_f	filesystem
+zfsbcapc/Z3/srv/raw_g	filesystem
+zfsbcapc/Z3/srv/raw_g@a	snapshot
+--- stderr
+=== END
+=== CASE Z3/plain.c.0_cut
+--- cmd
+zfs send zfsbcapc/Z3/cs/plain@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/plain_c
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4
+=== END
+=== CASE Z3/plain.c.1_resume
+--- cmd
+zfs send -t 1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/plain_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/plain.c.2_props_final
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z3/srv/plain_c
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_c	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z3/srv/plain_c	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z3/srv/plain_c	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z3/srv/plain_c	encryption	off	-	default
+zfsbcapc/Z3/srv/plain_c	encryptionroot	-	-	-
+zfsbcapc/Z3/srv/plain_c	keystatus	-	-	-
+zfsbcapc/Z3/srv/plain_c	canmount	on	-	default
+zfsbcapc/Z3/srv/plain_c	readonly	on	-	local
+zfsbcapc/Z3/srv/plain_c	volmode	default	-	default
+zfsbcapc/Z3/srv/plain_c	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z3/plain.c.3_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/Z3/srv/plain_c
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_c@a	8349193632946464127	3556
+--- stderr
+=== END
+=== CASE Z3/plain.d.0_cut
+--- cmd
+zfs send zfsbcapc/Z3/cs/plain@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/plain_d
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4
+=== END
+=== CASE Z3/plain.d.1_resume_no_o
+--- cmd
+zfs send -t 1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4 | zfs receive -F -s -u zfsbcapc/Z3/srv/plain_d
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/plain.d.2_props_final
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z3/srv/plain_d
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_d	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z3/srv/plain_d	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z3/srv/plain_d	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z3/srv/plain_d	encryption	off	-	default
+zfsbcapc/Z3/srv/plain_d	encryptionroot	-	-	-
+zfsbcapc/Z3/srv/plain_d	keystatus	-	-	-
+zfsbcapc/Z3/srv/plain_d	canmount	on	-	default
+zfsbcapc/Z3/srv/plain_d	readonly	on	-	local
+zfsbcapc/Z3/srv/plain_d	volmode	default	-	default
+zfsbcapc/Z3/srv/plain_d	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z3/plain.e.0_cut
+--- cmd
+zfs send zfsbcapc/Z3/cs/plain@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/plain_e
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4
+=== END
+=== CASE Z3/plain.e.1_set_user_prop
+--- cmd
+zfs set org.zfsbackup:anchor.x=1 zfsbcapc/Z3/srv/plain_e
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/plain.e.2_snapshot
+--- cmd
+zfs snapshot zfsbcapc/Z3/srv/plain_e@local
+--- rc
+1
+--- stdout
+--- stderr
+cannot create snapshot 'zfsbcapc/Z3/srv/plain_e@local': dataset is busy
+=== END
+=== CASE Z3/plain.e.3_rename
+--- cmd
+zfs rename zfsbcapc/Z3/srv/plain_e zfsbcapc/Z3/srv/plain_e_renamed
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/plain.e.4_list_after
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	filesystem
+zfsbcapc/Z3/srv/plain_a	filesystem
+zfsbcapc/Z3/srv/plain_a@a	snapshot
+zfsbcapc/Z3/srv/plain_c	filesystem
+zfsbcapc/Z3/srv/plain_c@a	snapshot
+zfsbcapc/Z3/srv/plain_d	filesystem
+zfsbcapc/Z3/srv/plain_d@a	snapshot
+zfsbcapc/Z3/srv/plain_e_renamed	filesystem
+zfsbcapc/Z3/srv/raw_a	filesystem
+zfsbcapc/Z3/srv/raw_a@a	snapshot
+zfsbcapc/Z3/srv/raw_c	filesystem
+zfsbcapc/Z3/srv/raw_c@a	snapshot
+zfsbcapc/Z3/srv/raw_d	filesystem
+zfsbcapc/Z3/srv/raw_d@a	snapshot
+zfsbcapc/Z3/srv/raw_e_renamed	filesystem
+zfsbcapc/Z3/srv/raw_e_renamed@a	snapshot
+zfsbcapc/Z3/srv/raw_f	filesystem
+zfsbcapc/Z3/srv/raw_g	filesystem
+zfsbcapc/Z3/srv/raw_g@a	snapshot
+--- stderr
+=== END
+=== CASE Z3/plain.e.5_token_after_rename
+--- cmd
+zfs get -H -r -o name,property,value receive_resume_token zfsbcapc/Z3/srv
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv	receive_resume_token	-
+zfsbcapc/Z3/srv/plain_a	receive_resume_token	-
+zfsbcapc/Z3/srv/plain_a@a	receive_resume_token	-
+zfsbcapc/Z3/srv/plain_c	receive_resume_token	-
+zfsbcapc/Z3/srv/plain_c@a	receive_resume_token	-
+zfsbcapc/Z3/srv/plain_d	receive_resume_token	-
+zfsbcapc/Z3/srv/plain_d@a	receive_resume_token	-
+zfsbcapc/Z3/srv/plain_e_renamed	receive_resume_token	1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4
+zfsbcapc/Z3/srv/raw_a	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_a@a	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_c	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_c@a	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_d	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_d@a	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_e_renamed	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_e_renamed@a	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_f	receive_resume_token	1-d67bf0891-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc1406062d5bcb47f98fe6ef334092e704cbe725e6a6323054a5152725271624eb4719eb2717eba7e6253b24c2cce36640b83f393fb7a028b5b8383f1b222601750f4cbe28b11c26c50000f92a1fb8
+zfsbcapc/Z3/srv/raw_g	receive_resume_token	-
+zfsbcapc/Z3/srv/raw_g@a	receive_resume_token	-
+--- stderr
+=== END
+=== CASE Z3/plain.e.6_resume_after_rename
+--- cmd
+bash -c zfs send -t 1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4 | zfs receive -s -u zfsbcapc/Z3/srv/plain_e_renamed
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/plain.f.0_cut
+--- cmd
+zfs send zfsbcapc/Z3/cs/plain@a | head -c 1000000 | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data -o readonly=on zfsbcapc/Z3/srv/plain_f
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4
+=== END
+=== CASE Z3/plain.f.1_token_prop_value
+--- cmd
+zfs get -H -o value receive_resume_token zfsbcapc/Z3/srv/plain_f
+--- rc
+0
+--- stdout
+1-d43a64171-c0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406867ad55d3df1def78a0d90e439c1f27989b9a90c0c5569c549c98905c9fa51c6fac9c5fa05398999790e8910370100bebb19c4
+--- stderr
+=== END
+=== CASE Z3/plain.g.0_base
+--- cmd
+zfs send zfsbcapc/Z3/cs/plain@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/Z3/srv/plain_g
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/plain.g.1_incr_cut
+--- cmd
+zfs send -i zfsbcapc/Z3/cs/plain@a zfsbcapc/Z3/cs/plain@b | head -c 500000 | zfs receive -F -s -u -o org.zfsbackup:config=ZGlmZmVyZW50 -o org.zfsbackup:client_id=client-2 -o org.zfsbackup:source_dataset=pool/other zfsbcapc/Z3/srv/plain_g
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-e26a5b0c0-e8-789c636064000310a501c49c50360710a715e5e7a69766a6304041bdeaae9e78ef7bc50a40363b92bafca4acd4e412060666a83a0cf9b4b4e2d412900c0b5c9e0d493ea9b224b518484fe065c3aabf241fe28a67cb16709a089a471b20c97382e5f31273531918aad28a9392130b92f5a38cf5938bf50b721233f31c92206e020030c6205c
+=== END
+=== CASE Z3/plain.g.2_list
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv/plain_g
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_g	filesystem
+zfsbcapc/Z3/srv/plain_g@a	snapshot
+--- stderr
+=== END
+=== CASE Z3/plain.g.3_props_partial
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z3/srv/plain_g
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_g	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z3/srv/plain_g	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z3/srv/plain_g	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z3/srv/plain_g	encryption	off	-	default
+zfsbcapc/Z3/srv/plain_g	encryptionroot	-	-	-
+zfsbcapc/Z3/srv/plain_g	keystatus	-	-	-
+zfsbcapc/Z3/srv/plain_g	canmount	on	-	default
+zfsbcapc/Z3/srv/plain_g	readonly	off	-	default
+zfsbcapc/Z3/srv/plain_g	volmode	default	-	default
+zfsbcapc/Z3/srv/plain_g	receive_resume_token	1-e26a5b0c0-e8-789c636064000310a501c49c50360710a715e5e7a69766a6304041bdeaae9e78ef7bc50a40363b92bafca4acd4e412060666a83a0cf9b4b4e2d412900c0b5c9e0d493ea9b224b518484fe065c3aabf241fe28a67cb16709a089a471b20c97382e5f31273531918aad28a9392130b92f5a38cf5938bf50b721233f31c92206e020030c6205c	-	-
+--- stderr
+=== END
+=== CASE Z3/plain.g.4_token_recursive
+--- cmd
+zfs get -H -r -o name,property,value receive_resume_token zfsbcapc/Z3/srv/plain_g
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_g	receive_resume_token	1-e26a5b0c0-e8-789c636064000310a501c49c50360710a715e5e7a69766a6304041bdeaae9e78ef7bc50a40363b92bafca4acd4e412060666a83a0cf9b4b4e2d412900c0b5c9e0d493ea9b224b518484fe065c3aabf241fe28a67cb16709a089a471b20c97382e5f31273531918aad28a9392130b92f5a38cf5938bf50b721233f31c92206e020030c6205c
+zfsbcapc/Z3/srv/plain_g@a	receive_resume_token	-
+--- stderr
+=== END
+=== CASE Z3/plain.g.5_zdb
+--- cmd
+zdb -d zfsbcapc 2>&1 | grep -E 'recv|plain_g'
+--- rc
+0
+--- stdout
+Dataset zfsbcapc/M7/u1/t_d/%recv [ZPL], ID 4922, cr_txg 1333, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M7/u2/t_b/%recv [ZPL], ID 4979, cr_txg 1361, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M9/recv/child@s1 [ZPL], ID 9589, cr_txg 3235, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/child [ZPL], ID 9725, cr_txg 3233, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm@s1 [ZPL], ID 9575, cr_txg 3226, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm [ZPL], ID 9571, cr_txg 3225, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz@s1 [ZPL], ID 9719, cr_txg 3232, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz [ZPL], ID 9585, cr_txg 3231, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa@s1 [ZPL], ID 9579, cr_txg 3229, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa [ZPL], ID 9713, cr_txg 3227, 24K, 6 objects
+Dataset zfsbcapc/M9/recv@s1 [ZPL], ID 9707, cr_txg 3223, 24K, 6 objects
+Dataset zfsbcapc/M9/recv [ZPL], ID 9701, cr_txg 3220, 24K, 6 objects
+Dataset zfsbcapc/Z3/srv/plain_g/%recv [ZPL], ID 10596, cr_txg 3582, 2.40M, 8 objects (inconsistent)
+Dataset zfsbcapc/Z3/srv/plain_g@a [ZPL], ID 10590, cr_txg 3581, 2.03M, 7 objects
+Dataset zfsbcapc/Z3/srv/plain_g [ZPL], ID 10585, cr_txg 3579, 2.03M, 7 objects
+Dataset zfsbcapc/M8/srvn/hdr_resr/%recv [ZPL], ID 9396, cr_txg 3120, 3.97M, 8 objects (inconsistent)
+Dataset zfsbcapc/M8/srvn/hdr_res/%recv [ZPL], ID 9315, cr_txg 3099, 3.90M, 8 objects (inconsistent)
+--- stderr
+=== END
+=== CASE Z3/plain.g.6_destroy_base_snapshot
+--- cmd
+zfs destroy zfsbcapc/Z3/srv/plain_g@a
+--- rc
+1
+--- stdout
+--- stderr
+cannot destroy 'zfsbcapc/Z3/srv/plain_g@a': snapshot has dependent clones
+use '-R' to destroy the following datasets:
+zfsbcapc/Z3/srv/plain_g/%recv
+=== END
+=== CASE Z3/plain.g.7_abort
+--- cmd
+zfs receive -A zfsbcapc/Z3/srv/plain_g
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE Z3/plain.g.8_list_after_abort
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/Z3/srv/plain_g
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_g	filesystem
+zfsbcapc/Z3/srv/plain_g@a	snapshot
+--- stderr
+=== END
+=== CASE Z3/plain.g.9_props_after_abort
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/Z3/srv/plain_g
+--- rc
+0
+--- stdout
+zfsbcapc/Z3/srv/plain_g	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/Z3/srv/plain_g	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/Z3/srv/plain_g	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/Z3/srv/plain_g	encryption	off	-	default
+zfsbcapc/Z3/srv/plain_g	encryptionroot	-	-	-
+zfsbcapc/Z3/srv/plain_g	keystatus	-	-	-
+zfsbcapc/Z3/srv/plain_g	canmount	on	-	default
+zfsbcapc/Z3/srv/plain_g	readonly	off	-	default
+zfsbcapc/Z3/srv/plain_g	volmode	default	-	default
+zfsbcapc/Z3/srv/plain_g	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE Z3/plain.g.10_zdb_after
+--- cmd
+zdb -d zfsbcapc 2>&1 | grep -E 'recv|plain_g'; true
+--- rc
+0
+--- stdout
+Dataset zfsbcapc/M7/u1/t_d/%recv [ZPL], ID 4922, cr_txg 1333, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M7/u2/t_b/%recv [ZPL], ID 4979, cr_txg 1361, 9.03M, 9 objects (inconsistent)
+Dataset zfsbcapc/M9/recv/child@s1 [ZPL], ID 9589, cr_txg 3235, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/child [ZPL], ID 9725, cr_txg 3233, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm@s1 [ZPL], ID 9575, cr_txg 3226, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/mm [ZPL], ID 9571, cr_txg 3225, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz@s1 [ZPL], ID 9719, cr_txg 3232, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/zz [ZPL], ID 9585, cr_txg 3231, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa@s1 [ZPL], ID 9579, cr_txg 3229, 24K, 6 objects
+Dataset zfsbcapc/M9/recv/aa [ZPL], ID 9713, cr_txg 3227, 24K, 6 objects
+Dataset zfsbcapc/M9/recv@s1 [ZPL], ID 9707, cr_txg 3223, 24K, 6 objects
+Dataset zfsbcapc/M9/recv [ZPL], ID 9701, cr_txg 3220, 24K, 6 objects
+Dataset zfsbcapc/Z3/srv/plain_g@a [ZPL], ID 10590, cr_txg 3581, 2.03M, 7 objects
+Dataset zfsbcapc/Z3/srv/plain_g [ZPL], ID 10585, cr_txg 3579, 2.03M, 7 objects
+Dataset zfsbcapc/M8/srvn/hdr_resr/%recv [ZPL], ID 9396, cr_txg 3120, 3.97M, 8 objects (inconsistent)
+Dataset zfsbcapc/M8/srvn/hdr_res/%recv [ZPL], ID 9315, cr_txg 3099, 3.90M, 8 objects (inconsistent)
+--- stderr
+=== END

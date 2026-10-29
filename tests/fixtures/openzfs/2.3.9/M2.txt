@@ -1,0 +1,1232 @@
+##### SECTION M2 (stale resume tokens (incremental source destroyed, target destroyed/recreated, sender renamed))  tag=C  zfs-2.3.9-0+deb13u1
+=== CASE M2/i_from_destroyed.0a_base
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/i_from_destroyed@a | zfs receive -u zfsbcapc/M2/r/i_from_destroyed
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_from_destroyed.0_recv_cut
+--- cmd
+zfs send -L -c -i zfsbcapc/M2/s/i_from_destroyed@a zfsbcapc/M2/s/i_from_destroyed@b | head -c 500000 | zfs receive -s -u zfsbcapc/M2/r/i_from_destroyed
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-1097cacc4a-118-789c636064000310a501c49c50360710a715e5e7a69766a63040018feaef86550119d314806c762475f94959a9c9250c0c8d507518f26969c5a925201916b83c1b927c5265496a31909e60c886557f493ec415cb5544ffb9ac7736714092e704cbe725e6a6323054a5152725271624ebfb1ae917eb67c683dc1f9f925a5c52945f999ae29004f307c87c6e0684bf93f3730b8a528b8bf3b319e00000b11929a4
+=== END
+=== CASE M2/i_from_destroyed.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-1097cacc4a-118-789c636064000310a501c49c50360710a715e5e7a69766a63040018feaef86550119d314806c762475f94959a9c9250c0c8d507518f26969c5a925201916b83c1b927c5265496a31909e60c886557f493ec415cb5544ffb9ac7736714092e704cbe725e6a6323054a5152725271624ebfb1ae917eb67c683dc1f9f925a5c52945f999ae29004f307c87c6e0684bf93f3730b8a528b8bf3b319e00000b11929a4
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0x966850aa80fb250c
+	object = 0x81
+	offset = 0x40000
+	bytes = 0x63190
+	toguid = 0x3443af44fe1524a7
+	toname = zfsbcapc/M2/s/i_from_destroyed@b
+	compressok = 1
+send from zfsbcapc/M2/s/i_from_destroyed@a to zfsbcapc/M2/s/i_from_destroyed@b estimated size is 1.63M
+total estimated size is 1.63M
+--- stderr
+=== END
+=== CASE M2/i_from_destroyed.2_destroy_sender_from
+--- cmd
+zfs destroy zfsbcapc/M2/s/i_from_destroyed@a
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_from_destroyed.8_nv_t
+--- cmd
+zfs send -nv -t 1-1097cacc4a-118-789c636064000310a501c49c50360710a715e5e7a69766a63040018feaef86550119d314806c762475f94959a9c9250c0c8d507518f26969c5a925201916b83c1b927c5265496a31909e60c886557f493ec415cb5544ffb9ac7736714092e704cbe725e6a6323054a5152725271624ebfb1ae917eb67c683dc1f9f925a5c52945f999ae29004f307c87c6e0684bf93f3730b8a528b8bf3b319e00000b11929a4
+--- rc
+255
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0x966850aa80fb250c
+	object = 0x81
+	offset = 0x40000
+	bytes = 0x63190
+	toguid = 0x3443af44fe1524a7
+	toname = zfsbcapc/M2/s/i_from_destroyed@b
+	compressok = 1
+--- stderr
+cannot resume send: Invalid cross-device link
+=== END
+=== CASE M2/i_from_destroyed.9_resume_try
+--- cmd
+zfs send -t 1-1097cacc4a-118-789c636064000310a501c49c50360710a715e5e7a69766a63040018feaef86550119d314806c762475f94959a9c9250c0c8d507518f26969c5a925201916b83c1b927c5265496a31909e60c886557f493ec415cb5544ffb9ac7736714092e704cbe725e6a6323054a5152725271624ebfb1ae917eb67c683dc1f9f925a5c52945f999ae29004f307c87c6e0684bf93f3730b8a528b8bf3b319e00000b11929a4 | zfs receive -s -u zfsbcapc/M2/r/i_from_destroyed
+--- rc
+1
+--- pipestatus
+255 1
+--- stdout
+--- stderr
+cannot receive: failed to read from stream
+--- send.stderr
+warning: cannot send 'zfsbcapc/M2/s/i_from_destroyed@b': Invalid cross-device link
+=== END
+=== CASE M2/i_from_destroyed.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/i_from_destroyed
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/i_from_destroyed	receive_resume_token	1-1097cacc4a-118-789c636064000310a501c49c50360710a715e5e7a69766a63040018feaef86550119d314806c762475f94959a9c9250c0c8d507518f26969c5a925201916b83c1b927c5265496a31909e60c886557f493ec415cb5544ffb9ac7736714092e704cbe725e6a6323054a5152725271624ebfb1ae917eb67c683dc1f9f925a5c52945f999ae29004f307c87c6e0684bf93f3730b8a528b8bf3b319e00000b11929a4
+--- stderr
+=== END
+=== CASE M2/i_from_destroyed.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/i_from_destroyed
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_to_destroyed.0a_base
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/i_to_destroyed@a | zfs receive -u zfsbcapc/M2/r/i_to_destroyed
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_to_destroyed.0_recv_cut
+--- cmd
+zfs send -L -c -i zfsbcapc/M2/s/i_to_destroyed@a zfsbcapc/M2/s/i_to_destroyed@b | head -c 500000 | zfs receive -s -u zfsbcapc/M2/r/i_to_destroyed
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-141d321795-110-789c636064000310a501c49c50360710a715e5e7a69766a63040c1fb84ccd567dd0f962800d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b3c036f97db6d7ffdce02499e132c9f97989bcac05095569c949c5890acef6ba45fac9f195f921f9f925a5c52945f999ae2900431979b01e1dfe4fcdc82a2d4e2e2fc6c06380000773d2ac7
+=== END
+=== CASE M2/i_to_destroyed.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-141d321795-110-789c636064000310a501c49c50360710a715e5e7a69766a63040c1fb84ccd567dd0f962800d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b3c036f97db6d7ffdce02499e132c9f97989bcac05095569c949c5890acef6ba45fac9f195f921f9f925a5c52945f999ae2900431979b01e1dfe4fcdc82a2d4e2e2fc6c06380000773d2ac7
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0x74c147cdab6960ef
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0xeeebb73e77db5149
+	toname = zfsbcapc/M2/s/i_to_destroyed@b
+	compressok = 1
+send from zfsbcapc/M2/s/i_to_destroyed@a to zfsbcapc/M2/s/i_to_destroyed@b estimated size is 1.63M
+total estimated size is 1.63M
+--- stderr
+=== END
+=== CASE M2/i_to_destroyed.2_destroy_sender_to
+--- cmd
+zfs destroy zfsbcapc/M2/s/i_to_destroyed@b
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_to_destroyed.8_nv_t
+--- cmd
+zfs send -nv -t 1-141d321795-110-789c636064000310a501c49c50360710a715e5e7a69766a63040c1fb84ccd567dd0f962800d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b3c036f97db6d7ffdce02499e132c9f97989bcac05095569c949c5890acef6ba45fac9f195f921f9f925a5c52945f999ae2900431979b01e1dfe4fcdc82a2d4e2e2fc6c06380000773d2ac7
+--- rc
+255
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0x74c147cdab6960ef
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0xeeebb73e77db5149
+	toname = zfsbcapc/M2/s/i_to_destroyed@b
+	compressok = 1
+--- stderr
+cannot resume send: 'zfsbcapc/M2/s/i_to_destroyed@b' used in the initial send no longer exists
+=== END
+=== CASE M2/i_to_destroyed.9_resume_try
+--- cmd
+zfs send -t 1-141d321795-110-789c636064000310a501c49c50360710a715e5e7a69766a63040c1fb84ccd567dd0f962800d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b3c036f97db6d7ffdce02499e132c9f97989bcac05095569c949c5890acef6ba45fac9f195f921f9f925a5c52945f999ae2900431979b01e1dfe4fcdc82a2d4e2e2fc6c06380000773d2ac7 | zfs receive -s -u zfsbcapc/M2/r/i_to_destroyed
+--- rc
+1
+--- pipestatus
+255 1
+--- stdout
+--- stderr
+cannot receive: failed to read from stream
+--- send.stderr
+cannot resume send: 'zfsbcapc/M2/s/i_to_destroyed@b' used in the initial send no longer exists
+=== END
+=== CASE M2/i_to_destroyed.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/i_to_destroyed
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/i_to_destroyed	receive_resume_token	1-141d321795-110-789c636064000310a501c49c50360710a715e5e7a69766a63040c1fb84ccd567dd0f962800d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b3c036f97db6d7ffdce02499e132c9f97989bcac05095569c949c5890acef6ba45fac9f195f921f9f925a5c52945f999ae2900431979b01e1dfe4fcdc82a2d4e2e2fc6c06380000773d2ac7
+--- stderr
+=== END
+=== CASE M2/i_to_destroyed.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/i_to_destroyed
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_to_recreated.0a_base
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/i_to_recreated@a | zfs receive -u zfsbcapc/M2/r/i_to_recreated
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_to_recreated.0_recv_cut
+--- cmd
+zfs send -L -c -i zfsbcapc/M2/s/i_to_recreated@a zfsbcapc/M2/s/i_to_recreated@b | head -c 500000 | zfs receive -s -u zfsbcapc/M2/r/i_to_recreated
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-115b86fa6a-110-789c636064000310a501c49c50360710a715e5e7a69766a63040c1dae3da2717ca33c62900d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b8e727d7d74dfe5e1440b24794eb07c5e626e2a0343555a7152726241b2beaf917eb17e667c497e7c516a72516a62496a8a4312c45c6e06847f93f3730b8a528b8bf3b319e00000a61929ff
+=== END
+=== CASE M2/i_to_recreated.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-115b86fa6a-110-789c636064000310a501c49c50360710a715e5e7a69766a63040c1dae3da2717ca33c62900d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b8e727d7d74dfe5e1440b24794eb07c5e626e2a0343555a7152726241b2beaf917eb17e667c497e7c516a72516a62496a8a4312c45c6e06847f93f3730b8a528b8bf3b319e00000a61929ff
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0x5e011fa1c92bc7ad
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0x91e144dfe2f50ac5
+	toname = zfsbcapc/M2/s/i_to_recreated@b
+	compressok = 1
+send from zfsbcapc/M2/s/i_to_recreated@a to zfsbcapc/M2/s/i_to_recreated@b estimated size is 1.63M
+total estimated size is 1.63M
+--- stderr
+=== END
+=== CASE M2/i_to_recreated.2_destroy_sender_to
+--- cmd
+zfs destroy zfsbcapc/M2/s/i_to_recreated@b
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_to_recreated.3_recreate_sender_to
+--- cmd
+zfs snapshot zfsbcapc/M2/s/i_to_recreated@b
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_to_recreated.4_sender_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M2/s/i_to_recreated
+--- rc
+0
+--- stdout
+zfsbcapc/M2/s/i_to_recreated@a	6773730094267221933	696
+zfsbcapc/M2/s/i_to_recreated@b	14144336309908125111	705
+--- stderr
+=== END
+=== CASE M2/i_to_recreated.8_nv_t
+--- cmd
+zfs send -nv -t 1-115b86fa6a-110-789c636064000310a501c49c50360710a715e5e7a69766a63040c1dae3da2717ca33c62900d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b8e727d7d74dfe5e1440b24794eb07c5e626e2a0343555a7152726241b2beaf917eb17e667c497e7c516a72516a62496a8a4312c45c6e06847f93f3730b8a528b8bf3b319e00000a61929ff
+--- rc
+255
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0x5e011fa1c92bc7ad
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0x91e144dfe2f50ac5
+	toname = zfsbcapc/M2/s/i_to_recreated@b
+	compressok = 1
+--- stderr
+cannot resume send: 'zfsbcapc/M2/s/i_to_recreated@b' is no longer the same snapshot used in the initial send
+=== END
+=== CASE M2/i_to_recreated.9_resume_try
+--- cmd
+zfs send -t 1-115b86fa6a-110-789c636064000310a501c49c50360710a715e5e7a69766a63040c1dae3da2717ca33c62900d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b8e727d7d74dfe5e1440b24794eb07c5e626e2a0343555a7152726241b2beaf917eb17e667c497e7c516a72516a62496a8a4312c45c6e06847f93f3730b8a528b8bf3b319e00000a61929ff | zfs receive -s -u zfsbcapc/M2/r/i_to_recreated
+--- rc
+1
+--- pipestatus
+255 1
+--- stdout
+--- stderr
+cannot receive: failed to read from stream
+--- send.stderr
+cannot resume send: 'zfsbcapc/M2/s/i_to_recreated@b' is no longer the same snapshot used in the initial send
+=== END
+=== CASE M2/i_to_recreated.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/i_to_recreated
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/i_to_recreated	receive_resume_token	1-115b86fa6a-110-789c636064000310a501c49c50360710a715e5e7a69766a63040c1dae3da2717ca33c62900d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b8e727d7d74dfe5e1440b24794eb07c5e626e2a0343555a7152726241b2beaf917eb17e667c497e7c516a72516a62496a8a4312c45c6e06847f93f3730b8a528b8bf3b319e00000a61929ff
+--- stderr
+=== END
+=== CASE M2/i_to_recreated.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/i_to_recreated
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_from_recreated.0a_base
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/i_from_recreated@a | zfs receive -u zfsbcapc/M2/r/i_from_recreated
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_from_recreated.0_recv_cut
+--- cmd
+zfs send -L -c -i zfsbcapc/M2/s/i_from_recreated@a zfsbcapc/M2/s/i_from_recreated@b | head -c 500000 | zfs receive -s -u zfsbcapc/M2/r/i_from_recreated
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-1220364118-118-789c636064000310a501c49c50360710a715e5e7a69766a63040c1e20bbe79595797bd5500b2d991d4e52765a526973030b040d561c8a7a515a796806458e0f26c48f2499525a9c5407a83001b56fd25f9105794449df19cf1be669503923c27583e2f31379581a12aad382939b12059dfd748bf583f331ee4fef8a2d4e4a2d4c492d4148724983f40e6733320fc9d9c9f5b50945a5c9c9fcd00070006362ba6
+=== END
+=== CASE M2/i_from_recreated.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-1220364118-118-789c636064000310a501c49c50360710a715e5e7a69766a63040c1e20bbe79595797bd5500b2d991d4e52765a526973030b040d561c8a7a515a796806458e0f26c48f2499525a9c5407a83001b56fd25f9105794449df19cf1be669503923c27583e2f31379581a12aad382939b12059dfd748bf583f331ee4fef8a2d4e4a2d4c492d4148724983f40e6733320fc9d9c9f5b50945a5c9c9fcd00070006362ba6
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0xeda6d56a6e4dd0a3
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0xaa7cef9849cc5a74
+	toname = zfsbcapc/M2/s/i_from_recreated@b
+	compressok = 1
+send from zfsbcapc/M2/s/i_from_recreated@a to zfsbcapc/M2/s/i_from_recreated@b estimated size is 1.63M
+total estimated size is 1.63M
+--- stderr
+=== END
+=== CASE M2/i_from_recreated.2_destroy_sender_from
+--- cmd
+zfs destroy zfsbcapc/M2/s/i_from_recreated@a
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_from_recreated.3_recreate_sender_from
+--- cmd
+zfs snapshot zfsbcapc/M2/s/i_from_recreated@a
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_from_recreated.4_sender_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M2/s/i_from_recreated
+--- rc
+0
+--- stdout
+zfsbcapc/M2/s/i_from_recreated@b	12284957320912067188	712
+zfsbcapc/M2/s/i_from_recreated@a	18197009528285994965	720
+--- stderr
+=== END
+=== CASE M2/i_from_recreated.8_nv_t
+--- cmd
+zfs send -nv -t 1-1220364118-118-789c636064000310a501c49c50360710a715e5e7a69766a63040c1e20bbe79595797bd5500b2d991d4e52765a526973030b040d561c8a7a515a796806458e0f26c48f2499525a9c5407a83001b56fd25f9105794449df19cf1be669503923c27583e2f31379581a12aad382939b12059dfd748bf583f331ee4fef8a2d4e4a2d4c492d4148724983f40e6733320fc9d9c9f5b50945a5c9c9fcd00070006362ba6
+--- rc
+255
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0xeda6d56a6e4dd0a3
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0xaa7cef9849cc5a74
+	toname = zfsbcapc/M2/s/i_from_recreated@b
+	compressok = 1
+--- stderr
+cannot resume send: Invalid cross-device link
+=== END
+=== CASE M2/i_from_recreated.9_resume_try
+--- cmd
+zfs send -t 1-1220364118-118-789c636064000310a501c49c50360710a715e5e7a69766a63040c1e20bbe79595797bd5500b2d991d4e52765a526973030b040d561c8a7a515a796806458e0f26c48f2499525a9c5407a83001b56fd25f9105794449df19cf1be669503923c27583e2f31379581a12aad382939b12059dfd748bf583f331ee4fef8a2d4e4a2d4c492d4148724983f40e6733320fc9d9c9f5b50945a5c9c9fcd00070006362ba6 | zfs receive -s -u zfsbcapc/M2/r/i_from_recreated
+--- rc
+1
+--- pipestatus
+255 1
+--- stdout
+--- stderr
+cannot receive: failed to read from stream
+--- send.stderr
+warning: cannot send 'zfsbcapc/M2/s/i_from_recreated@b': Invalid cross-device link
+=== END
+=== CASE M2/i_from_recreated.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/i_from_recreated
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/i_from_recreated	receive_resume_token	1-1220364118-118-789c636064000310a501c49c50360710a715e5e7a69766a63040c1e20bbe79595797bd5500b2d991d4e52765a526973030b040d561c8a7a515a796806458e0f26c48f2499525a9c5407a83001b56fd25f9105794449df19cf1be669503923c27583e2f31379581a12aad382939b12059dfd748bf583f331ee4fef8a2d4e4a2d4c492d4148724983f40e6733320fc9d9c9f5b50945a5c9c9fcd00070006362ba6
+--- stderr
+=== END
+=== CASE M2/i_from_recreated.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/i_from_recreated
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_sender_renamed.0a_base
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/i_sender_renamed@a | zfs receive -u zfsbcapc/M2/r/i_sender_renamed
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_sender_renamed.0_recv_cut
+--- cmd
+zfs send -L -c -i zfsbcapc/M2/s/i_sender_renamed@a zfsbcapc/M2/s/i_sender_renamed@b | head -c 500000 | zfs receive -s -u zfsbcapc/M2/r/i_sender_renamed
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-13cffc4608-118-789c636064000310a501c49c50360710a715e5e7a69766a6304001ffe365b5d59b3edd5400b2d991d4e52765a526973030b042d561c8a7a515a796806458e0f26c48f2499525a9c540fa82301b56fd25f910575cd7b739784b85b9d201499e132c9f97989bcac05095569c949c5890acef6ba45fac9f195f9c9a97925a145f940a924e714882f903643e3703c2dfc9f9b90545a9c5c5f9d90c700000b6112abe
+=== END
+=== CASE M2/i_sender_renamed.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-13cffc4608-118-789c636064000310a501c49c50360710a715e5e7a69766a6304001ffe365b5d59b3edd5400b2d991d4e52765a526973030b042d561c8a7a515a796806458e0f26c48f2499525a9c540fa82301b56fd25f910575cd7b739784b85b9d201499e132c9f97989bcac05095569c949c5890acef6ba45fac9f195f9c9a97925a145f940a924e714882f903643e3703c2dfc9f9b90545a9c5c5f9d90c700000b6112abe
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0xd9f2b27b7da6e30f
+	object = 0x5
+	offset = 0x40000
+	bytes = 0x613d0
+	toguid = 0x790324dac13c2fd7
+	toname = zfsbcapc/M2/s/i_sender_renamed@b
+	compressok = 1
+send from zfsbcapc/M2/s/i_sender_renamed@a to zfsbcapc/M2/s/i_sender_renamed@b estimated size is 1.63M
+total estimated size is 1.63M
+--- stderr
+=== END
+=== CASE M2/i_sender_renamed.2_rename_sender
+--- cmd
+zfs rename zfsbcapc/M2/s/i_sender_renamed zfsbcapc/M2/s/i_sender_renamed_renamed
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_sender_renamed.8_nv_t
+--- cmd
+zfs send -nv -t 1-13cffc4608-118-789c636064000310a501c49c50360710a715e5e7a69766a6304001ffe365b5d59b3edd5400b2d991d4e52765a526973030b042d561c8a7a515a796806458e0f26c48f2499525a9c540fa82301b56fd25f910575cd7b739784b85b9d201499e132c9f97989bcac05095569c949c5890acef6ba45fac9f195f9c9a97925a145f940a924e714882f903643e3703c2dfc9f9b90545a9c5c5f9d90c700000b6112abe
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0xd9f2b27b7da6e30f
+	object = 0x5
+	offset = 0x40000
+	bytes = 0x613d0
+	toguid = 0x790324dac13c2fd7
+	toname = zfsbcapc/M2/s/i_sender_renamed@b
+	compressok = 1
+send from zfsbcapc/M2/s/i_sender_renamed_renamed@a to zfsbcapc/M2/s/i_sender_renamed_renamed@b estimated size is 1.63M
+total estimated size is 1.63M
+--- stderr
+=== END
+=== CASE M2/i_sender_renamed.9_resume_try
+--- cmd
+zfs send -t 1-13cffc4608-118-789c636064000310a501c49c50360710a715e5e7a69766a6304001ffe365b5d59b3edd5400b2d991d4e52765a526973030b042d561c8a7a515a796806458e0f26c48f2499525a9c540fa82301b56fd25f910575cd7b739784b85b9d201499e132c9f97989bcac05095569c949c5890acef6ba45fac9f195f9c9a97925a145f940a924e714882f903643e3703c2dfc9f9b90545a9c5c5f9d90c700000b6112abe | zfs receive -s -u zfsbcapc/M2/r/i_sender_renamed
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_sender_renamed.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/i_sender_renamed
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/i_sender_renamed	receive_resume_token	-
+--- stderr
+=== END
+=== CASE M2/i_sender_renamed.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/i_sender_renamed
+--- rc
+1
+--- stdout
+--- stderr
+'zfsbcapc/M2/r/i_sender_renamed' does not have any resumable receive state to abort
+=== END
+=== CASE M2/i_sender_moved.0a_base
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/i_sender_moved@a | zfs receive -u zfsbcapc/M2/r/i_sender_moved
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_sender_moved.0_recv_cut
+--- cmd
+zfs send -L -c -i zfsbcapc/M2/s/i_sender_moved@a zfsbcapc/M2/s/i_sender_moved@b | head -c 500000 | zfs receive -s -u zfsbcapc/M2/r/i_sender_moved
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-137adc760e-110-789c636064000310a501c49c50360710a715e5e7a69766a6304081ea228f7cbefdaf262900d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882bdea57d93aa4ab8ab6b8124cf0996cf4bcc4d6560a84a2b4e4a4e2c48d6f735d22fd6cf8c2f4ecd4b492d8acfcd2f4b4d71488298cbcd80f06f727e6e41516a71717e36031c000080d12956
+=== END
+=== CASE M2/i_sender_moved.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-137adc760e-110-789c636064000310a501c49c50360710a715e5e7a69766a6304081ea228f7cbefdaf262900d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882bdea57d93aa4ab8ab6b8124cf0996cf4bcc4d6560a84a2b4e4a4e2c48d6f735d22fd6cf8c2f4ecd4b492d8acfcd2f4b4d71488298cbcd80f06f727e6e41516a71717e36031c000080d12956
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0x92eabf0e6f48a225
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0x2ddd607a1af666ee
+	toname = zfsbcapc/M2/s/i_sender_moved@b
+	compressok = 1
+send from zfsbcapc/M2/s/i_sender_moved@a to zfsbcapc/M2/s/i_sender_moved@b estimated size is 1.63M
+total estimated size is 1.63M
+--- stderr
+=== END
+=== CASE M2/i_sender_moved.2_rename_sender_elsewhere
+--- cmd
+zfs rename zfsbcapc/M2/s/i_sender_moved zfsbcapc/M2/moved/x
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_sender_moved.8_nv_t
+--- cmd
+zfs send -nv -t 1-137adc760e-110-789c636064000310a501c49c50360710a715e5e7a69766a6304081ea228f7cbefdaf262900d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882bdea57d93aa4ab8ab6b8124cf0996cf4bcc4d6560a84a2b4e4a4e2c48d6f735d22fd6cf8c2f4ecd4b492d8acfcd2f4b4d71488298cbcd80f06f727e6e41516a71717e36031c000080d12956
+--- rc
+255
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0x92eabf0e6f48a225
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0x2ddd607a1af666ee
+	toname = zfsbcapc/M2/s/i_sender_moved@b
+	compressok = 1
+--- stderr
+cannot resume send: Invalid cross-device link
+=== END
+=== CASE M2/i_sender_moved.9_resume_try
+--- cmd
+zfs send -t 1-137adc760e-110-789c636064000310a501c49c50360710a715e5e7a69766a6304081ea228f7cbefdaf262900d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882bdea57d93aa4ab8ab6b8124cf0996cf4bcc4d6560a84a2b4e4a4e2c48d6f735d22fd6cf8c2f4ecd4b492d8acfcd2f4b4d71488298cbcd80f06f727e6e41516a71717e36031c000080d12956 | zfs receive -s -u zfsbcapc/M2/r/i_sender_moved
+--- rc
+1
+--- pipestatus
+255 1
+--- stdout
+--- stderr
+cannot receive: failed to read from stream
+--- send.stderr
+warning: cannot send 'zfsbcapc/M2/moved/x@b': Invalid cross-device link
+=== END
+=== CASE M2/i_sender_moved.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/i_sender_moved
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/i_sender_moved	receive_resume_token	1-137adc760e-110-789c636064000310a501c49c50360710a715e5e7a69766a6304081ea228f7cbefdaf262900d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882bdea57d93aa4ab8ab6b8124cf0996cf4bcc4d6560a84a2b4e4a4e2c48d6f735d22fd6cf8c2f4ecd4b492d8acfcd2f4b4d71488298cbcd80f06f727e6e41516a71717e36031c000080d12956
+--- stderr
+=== END
+=== CASE M2/i_sender_moved.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/i_sender_moved
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_receiver_base_gone.0a_base
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/i_receiver_base_gone@a | zfs receive -u zfsbcapc/M2/r/i_receiver_base_gone
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_receiver_base_gone.0_recv_cut
+--- cmd
+zfs send -L -c -i zfsbcapc/M2/s/i_receiver_base_gone@a zfsbcapc/M2/s/i_receiver_base_gone@b | head -c 500000 | zfs receive -s -u zfsbcapc/M2/r/i_receiver_base_gone
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-11e0a8fa86-118-789c636064000310a501c49c50360710a715e5e7a69766a63040c1cc7c75a51906fb162b00d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b162f2f609d5af3eab603923c27583e2f31379581a12aad382939b12059dfd748bf583f33be28353935b32cb5283e29b138353e3d3f2fd52109663e3703c2dfc9f9b90545a9c5c5f9d90c700000e90e2bba
+=== END
+=== CASE M2/i_receiver_base_gone.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-11e0a8fa86-118-789c636064000310a501c49c50360710a715e5e7a69766a63040c1cc7c75a51906fb162b00d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b162f2f609d5af3eab603923c27583e2f31379581a12aad382939b12059dfd748bf583f33be28353935b32cb5283e29b138353e3d3f2fd52109663e3703c2dfc9f9b90545a9c5c5f9d90c700000e90e2bba
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0xa3be309822276f99
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0xdbea7c950570a7a3
+	toname = zfsbcapc/M2/s/i_receiver_base_gone@b
+	compressok = 1
+send from zfsbcapc/M2/s/i_receiver_base_gone@a to zfsbcapc/M2/s/i_receiver_base_gone@b estimated size is 1.63M
+total estimated size is 1.63M
+--- stderr
+=== END
+=== CASE M2/i_receiver_base_gone.2_destroy_receiver_base
+--- cmd
+zfs destroy zfsbcapc/M2/r/i_receiver_base_gone@a
+--- rc
+1
+--- stdout
+--- stderr
+cannot destroy 'zfsbcapc/M2/r/i_receiver_base_gone@a': snapshot has dependent clones
+use '-R' to destroy the following datasets:
+zfsbcapc/M2/r/i_receiver_base_gone/%recv
+=== END
+=== CASE M2/i_receiver_base_gone.8_nv_t
+--- cmd
+zfs send -nv -t 1-11e0a8fa86-118-789c636064000310a501c49c50360710a715e5e7a69766a63040c1cc7c75a51906fb162b00d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b162f2f609d5af3eab603923c27583e2f31379581a12aad382939b12059dfd748bf583f33be28353935b32cb5283e29b138353e3d3f2fd52109663e3703c2dfc9f9b90545a9c5c5f9d90c700000e90e2bba
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0xa3be309822276f99
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0xdbea7c950570a7a3
+	toname = zfsbcapc/M2/s/i_receiver_base_gone@b
+	compressok = 1
+send from zfsbcapc/M2/s/i_receiver_base_gone@a to zfsbcapc/M2/s/i_receiver_base_gone@b estimated size is 1.63M
+total estimated size is 1.63M
+--- stderr
+=== END
+=== CASE M2/i_receiver_base_gone.9_resume_try
+--- cmd
+zfs send -t 1-11e0a8fa86-118-789c636064000310a501c49c50360710a715e5e7a69766a63040c1cc7c75a51906fb162b00d9ec48eaf293b252934b181858a0ea30e4d3d28a534b40322c70793624f9a4ca92d46220bd41800dabfe927c882b162f2f609d5af3eab603923c27583e2f31379581a12aad382939b12059dfd748bf583f33be28353935b32cb5283e29b138353e3d3f2fd52109663e3703c2dfc9f9b90545a9c5c5f9d90c700000e90e2bba | zfs receive -s -u zfsbcapc/M2/r/i_receiver_base_gone
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_receiver_base_gone.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/i_receiver_base_gone
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/i_receiver_base_gone	receive_resume_token	-
+--- stderr
+=== END
+=== CASE M2/i_receiver_base_gone.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/i_receiver_base_gone
+--- rc
+1
+--- stdout
+--- stderr
+'zfsbcapc/M2/r/i_receiver_base_gone' does not have any resumable receive state to abort
+=== END
+=== CASE M2/i_receiver_replaced.0a_base
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/i_receiver_replaced@a | zfs receive -u zfsbcapc/M2/r/i_receiver_replaced
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_receiver_replaced.0_recv_cut
+--- cmd
+zfs send -L -c -i zfsbcapc/M2/s/i_receiver_replaced@a zfsbcapc/M2/s/i_receiver_replaced@b | head -c 500000 | zfs receive -s -u zfsbcapc/M2/r/i_receiver_replaced
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-12ac5fa275-118-789c636064000310a501c49c50360710a715e5e7a69766a63040813bb3864db97db08a0290cd8ea42e3f292b35b984818105aa0e433e2dad38b50424c302976743924faa2c492d06d21b04d8b0ea2fc987b8827db579758a74c02c0724794eb07c5e626e2a0343555a7152726241b2beaf917eb17e667c516a726a66596a1190519093989c9ae29004379f9b01e1efe4fcdc82a2d4e2e2fc6c06380000a7f027f0
+=== END
+=== CASE M2/i_receiver_replaced.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-12ac5fa275-118-789c636064000310a501c49c50360710a715e5e7a69766a63040813bb3864db97db08a0290cd8ea42e3f292b35b984818105aa0e433e2dad38b50424c302976743924faa2c492d06d21b04d8b0ea2fc987b8827db579758a74c02c0724794eb07c5e626e2a0343555a7152726241b2beaf917eb17e667c516a726a66596a1190519093989c9ae29004379f9b01e1efe4fcdc82a2d4e2e2fc6c06380000a7f027f0
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0x24533f773c280347
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0x9a501b647b37ab07
+	toname = zfsbcapc/M2/s/i_receiver_replaced@b
+	compressok = 1
+send from zfsbcapc/M2/s/i_receiver_replaced@a to zfsbcapc/M2/s/i_receiver_replaced@b estimated size is 1.63M
+total estimated size is 1.63M
+--- stderr
+=== END
+=== CASE M2/i_receiver_replaced.2_destroy_receiver
+--- cmd
+zfs destroy -r zfsbcapc/M2/r/i_receiver_replaced
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_receiver_replaced.3_recreate_receiver_full
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/i_receiver_replaced@a | zfs receive -u zfsbcapc/M2/r/i_receiver_replaced
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/i_receiver_replaced.3a_token_prop
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/i_receiver_replaced
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/i_receiver_replaced	receive_resume_token	-
+--- stderr
+=== END
+=== CASE M2/i_receiver_replaced.8_nv_t
+--- cmd
+zfs send -nv -t 1-12ac5fa275-118-789c636064000310a501c49c50360710a715e5e7a69766a63040813bb3864db97db08a0290cd8ea42e3f292b35b984818105aa0e433e2dad38b50424c302976743924faa2c492d06d21b04d8b0ea2fc987b8827db579758a74c02c0724794eb07c5e626e2a0343555a7152726241b2beaf917eb17e667c516a726a66596a1190519093989c9ae29004379f9b01e1efe4fcdc82a2d4e2e2fc6c06380000a7f027f0
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0x24533f773c280347
+	object = 0x4
+	offset = 0x40000
+	bytes = 0x610b0
+	toguid = 0x9a501b647b37ab07
+	toname = zfsbcapc/M2/s/i_receiver_replaced@b
+	compressok = 1
+send from zfsbcapc/M2/s/i_receiver_replaced@a to zfsbcapc/M2/s/i_receiver_replaced@b estimated size is 1.63M
+total estimated size is 1.63M
+--- stderr
+=== END
+=== CASE M2/i_receiver_replaced.9_resume_try
+--- cmd
+zfs send -t 1-12ac5fa275-118-789c636064000310a501c49c50360710a715e5e7a69766a63040813bb3864db97db08a0290cd8ea42e3f292b35b984818105aa0e433e2dad38b50424c302976743924faa2c492d06d21b04d8b0ea2fc987b8827db579758a74c02c0724794eb07c5e626e2a0343555a7152726241b2beaf917eb17e667c516a726a66596a1190519093989c9ae29004379f9b01e1efe4fcdc82a2d4e2e2fc6c06380000a7f027f0 | zfs receive -s -u zfsbcapc/M2/r/i_receiver_replaced
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive resume stream: kernel modules must be upgraded to receive this stream.
+=== END
+=== CASE M2/i_receiver_replaced.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/i_receiver_replaced
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/i_receiver_replaced	receive_resume_token	-
+--- stderr
+=== END
+=== CASE M2/i_receiver_replaced.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/i_receiver_replaced
+--- rc
+1
+--- stdout
+--- stderr
+'zfsbcapc/M2/r/i_receiver_replaced' does not have any resumable receive state to abort
+=== END
+=== CASE M2/f_to_destroyed.0_recv_cut
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/f_to_destroyed@a | head -c 1000000 | zfs receive -s -u zfsbcapc/M2/r/f_to_destroyed
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-10cde4a80b-e8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406868bbd6d197215070a2c90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f125f9f129a9c52545f995a9290e891073b91910fe48cecf2d284a2d2ececf66800300b1a621c0
+=== END
+=== CASE M2/f_to_destroyed.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-10cde4a80b-e8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406868bbd6d197215070a2c90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f125f9f129a9c52545f995a9290e891073b91910fe48cecf2d284a2d2ececf66800300b1a621c0
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	object = 0x2
+	offset = 0xc0000
+	bytes = 0xe1288
+	toguid = 0x70c0781e68868dd1
+	toname = zfsbcapc/M2/s/f_to_destroyed@a
+	compressok = 1
+full send of zfsbcapc/M2/s/f_to_destroyed@a estimated size is 2.32M
+total estimated size is 2.32M
+--- stderr
+=== END
+=== CASE M2/f_to_destroyed.2_destroy_sender_to
+--- cmd
+zfs destroy zfsbcapc/M2/s/f_to_destroyed@a
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/f_to_destroyed.8_nv_t
+--- cmd
+zfs send -nv -t 1-10cde4a80b-e8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406868bbd6d197215070a2c90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f125f9f129a9c52545f995a9290e891073b91910fe48cecf2d284a2d2ececf66800300b1a621c0
+--- rc
+255
+--- stdout
+resume token contents:
+nvlist version: 0
+	object = 0x2
+	offset = 0xc0000
+	bytes = 0xe1288
+	toguid = 0x70c0781e68868dd1
+	toname = zfsbcapc/M2/s/f_to_destroyed@a
+	compressok = 1
+--- stderr
+cannot resume send: 'zfsbcapc/M2/s/f_to_destroyed@a' used in the initial send no longer exists
+=== END
+=== CASE M2/f_to_destroyed.9_resume_try
+--- cmd
+zfs send -t 1-10cde4a80b-e8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406868bbd6d197215070a2c90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f125f9f129a9c52545f995a9290e891073b91910fe48cecf2d284a2d2ececf66800300b1a621c0 | zfs receive -s -u zfsbcapc/M2/r/f_to_destroyed
+--- rc
+1
+--- pipestatus
+255 1
+--- stdout
+--- stderr
+cannot receive: failed to read from stream
+--- send.stderr
+cannot resume send: 'zfsbcapc/M2/s/f_to_destroyed@a' used in the initial send no longer exists
+=== END
+=== CASE M2/f_to_destroyed.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/f_to_destroyed
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/f_to_destroyed	receive_resume_token	1-10cde4a80b-e8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406868bbd6d197215070a2c90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f125f9f129a9c52545f995a9290e891073b91910fe48cecf2d284a2d2ececf66800300b1a621c0
+--- stderr
+=== END
+=== CASE M2/f_to_destroyed.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/f_to_destroyed
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/f_to_recreated.0_recv_cut
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/f_to_recreated@a | head -c 1000000 | zfs receive -s -u zfsbcapc/M2/r/f_to_recreated
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-fd1013844-e8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140686bb52d69bcd0d1bbc2d90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f125f9f145a9c945a98925a9290e891073b91910fe48cecf2d284a2d2ececf668003004d8220a2
+=== END
+=== CASE M2/f_to_recreated.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-fd1013844-e8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140686bb52d69bcd0d1bbc2d90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f125f9f145a9c945a98925a9290e891073b91910fe48cecf2d284a2d2ececf668003004d8220a2
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	object = 0x2
+	offset = 0xc0000
+	bytes = 0xe1288
+	toguid = 0x4b803137b33b1add
+	toname = zfsbcapc/M2/s/f_to_recreated@a
+	compressok = 1
+full send of zfsbcapc/M2/s/f_to_recreated@a estimated size is 2.32M
+total estimated size is 2.32M
+--- stderr
+=== END
+=== CASE M2/f_to_recreated.2_destroy_sender_to
+--- cmd
+zfs destroy zfsbcapc/M2/s/f_to_recreated@a
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/f_to_recreated.2a_destroy_sender_b
+--- cmd
+zfs destroy zfsbcapc/M2/s/f_to_recreated@b
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/f_to_recreated.3_recreate_sender_to
+--- cmd
+zfs snapshot zfsbcapc/M2/s/f_to_recreated@a
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/f_to_recreated.4_sender_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M2/s/f_to_recreated
+--- rc
+0
+--- stdout
+zfsbcapc/M2/s/f_to_recreated@a	12044427923425518778	802
+--- stderr
+=== END
+=== CASE M2/f_to_recreated.8_nv_t
+--- cmd
+zfs send -nv -t 1-fd1013844-e8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140686bb52d69bcd0d1bbc2d90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f125f9f145a9c945a98925a9290e891073b91910fe48cecf2d284a2d2ececf668003004d8220a2
+--- rc
+255
+--- stdout
+resume token contents:
+nvlist version: 0
+	object = 0x2
+	offset = 0xc0000
+	bytes = 0xe1288
+	toguid = 0x4b803137b33b1add
+	toname = zfsbcapc/M2/s/f_to_recreated@a
+	compressok = 1
+--- stderr
+cannot resume send: 'zfsbcapc/M2/s/f_to_recreated@a' is no longer the same snapshot used in the initial send
+=== END
+=== CASE M2/f_to_recreated.9_resume_try
+--- cmd
+zfs send -t 1-fd1013844-e8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140686bb52d69bcd0d1bbc2d90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f125f9f145a9c945a98925a9290e891073b91910fe48cecf2d284a2d2ececf668003004d8220a2 | zfs receive -s -u zfsbcapc/M2/r/f_to_recreated
+--- rc
+1
+--- pipestatus
+255 1
+--- stdout
+--- stderr
+cannot receive: failed to read from stream
+--- send.stderr
+cannot resume send: 'zfsbcapc/M2/s/f_to_recreated@a' is no longer the same snapshot used in the initial send
+=== END
+=== CASE M2/f_to_recreated.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/f_to_recreated
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/f_to_recreated	receive_resume_token	1-fd1013844-e8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140686bb52d69bcd0d1bbc2d90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f125f9f145a9c945a98925a9290e891073b91910fe48cecf2d284a2d2ececf668003004d8220a2
+--- stderr
+=== END
+=== CASE M2/f_to_recreated.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/f_to_recreated
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/f_sender_renamed.0_recv_cut
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/f_sender_renamed@a | head -c 1000000 | zfs receive -s -u zfsbcapc/M2/r/f_sender_renamed
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-e9991f678-f0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140606db28894d2aa6ef521c90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f1c5a97929a945f145a920e91487440624f7713320fc939c9f5b50945a5c9c9fcd0007004e5e2169
+=== END
+=== CASE M2/f_sender_renamed.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-e9991f678-f0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140606db28894d2aa6ef521c90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f1c5a97929a945f145a920e91487440624f7713320fc939c9f5b50945a5c9c9fcd0007004e5e2169
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	object = 0x2
+	offset = 0xc0000
+	bytes = 0xe1288
+	toguid = 0x64ee3524b2185a3d
+	toname = zfsbcapc/M2/s/f_sender_renamed@a
+	compressok = 1
+full send of zfsbcapc/M2/s/f_sender_renamed@a estimated size is 2.32M
+total estimated size is 2.32M
+--- stderr
+=== END
+=== CASE M2/f_sender_renamed.2_rename_sender
+--- cmd
+zfs rename zfsbcapc/M2/s/f_sender_renamed zfsbcapc/M2/s/f_sender_renamed_renamed
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/f_sender_renamed.8_nv_t
+--- cmd
+zfs send -nv -t 1-e9991f678-f0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140606db28894d2aa6ef521c90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f1c5a97929a945f145a920e91487440624f7713320fc939c9f5b50945a5c9c9fcd0007004e5e2169
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	object = 0x2
+	offset = 0xc0000
+	bytes = 0xe1288
+	toguid = 0x64ee3524b2185a3d
+	toname = zfsbcapc/M2/s/f_sender_renamed@a
+	compressok = 1
+full send of zfsbcapc/M2/s/f_sender_renamed_renamed@a estimated size is 2.32M
+total estimated size is 2.32M
+--- stderr
+=== END
+=== CASE M2/f_sender_renamed.9_resume_try
+--- cmd
+zfs send -t 1-e9991f678-f0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc140606db28894d2aa6ef521c90e439c1f27989b9a90c0c5569c549c98905c9fabe46fac5fa69f1c5a97929a945f145a920e91487440624f7713320fc939c9f5b50945a5c9c9fcd0007004e5e2169 | zfs receive -s -u zfsbcapc/M2/r/f_sender_renamed
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/f_sender_renamed.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/f_sender_renamed
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/f_sender_renamed	receive_resume_token	-
+--- stderr
+=== END
+=== CASE M2/f_sender_renamed.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/f_sender_renamed
+--- rc
+1
+--- stdout
+--- stderr
+'zfsbcapc/M2/r/f_sender_renamed' does not have any resumable receive state to abort
+=== END
+=== CASE M2/f_receiver_replaced.0_recv_cut
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/f_receiver_replaced@a | head -c 1000000 | zfs receive -s -u zfsbcapc/M2/r/f_receiver_replaced
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-f54c53875-f0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406862947171dfd77f3ce320724794eb07c5e626e2a0343555a7152726241b2beaf917eb17e5a7c516a726a66596a1190519093989c9ae29008379f9b01e19fe4fcdc82a2d4e2e2fc6c06380000c33c25ae
+=== END
+=== CASE M2/f_receiver_replaced.1_nv_t_control
+--- cmd
+zfs send -nv -t 1-f54c53875-f0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406862947171dfd77f3ce320724794eb07c5e626e2a0343555a7152726241b2beaf917eb17e5a7c516a726a66596a1190519093989c9ae29008379f9b01e19fe4fcdc82a2d4e2e2fc6c06380000c33c25ae
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	object = 0x2
+	offset = 0xc0000
+	bytes = 0xe1288
+	toguid = 0xa6dcd9fec5a2c594
+	toname = zfsbcapc/M2/s/f_receiver_replaced@a
+	compressok = 1
+full send of zfsbcapc/M2/s/f_receiver_replaced@a estimated size is 2.32M
+total estimated size is 2.32M
+--- stderr
+=== END
+=== CASE M2/f_receiver_replaced.2_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/f_receiver_replaced
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/f_receiver_replaced.3_recreate_receiver_full
+--- cmd
+zfs send -L -c zfsbcapc/M2/s/f_receiver_replaced@a | zfs receive -u zfsbcapc/M2/r/f_receiver_replaced
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M2/f_receiver_replaced.8_nv_t
+--- cmd
+zfs send -nv -t 1-f54c53875-f0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406862947171dfd77f3ce320724794eb07c5e626e2a0343555a7152726241b2beaf917eb17e5a7c516a726a66596a1190519093989c9ae29008379f9b01e19fe4fcdc82a2d4e2e2fc6c06380000c33c25ae
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	object = 0x2
+	offset = 0xc0000
+	bytes = 0xe1288
+	toguid = 0xa6dcd9fec5a2c594
+	toname = zfsbcapc/M2/s/f_receiver_replaced@a
+	compressok = 1
+full send of zfsbcapc/M2/s/f_receiver_replaced@a estimated size is 2.32M
+total estimated size is 2.32M
+--- stderr
+=== END
+=== CASE M2/f_receiver_replaced.9_resume_try
+--- cmd
+zfs send -t 1-f54c53875-f0-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c540ba43880fabfe92fcf4d2cc1406862947171dfd77f3ce320724794eb07c5e626e2a0343555a7152726241b2beaf917eb17e5a7c516a726a66596a1190519093989c9ae29008379f9b01e19fe4fcdc82a2d4e2e2fc6c06380000c33c25ae | zfs receive -s -u zfsbcapc/M2/r/f_receiver_replaced
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive resume stream: Resuming recv on existing destination 'zfsbcapc/M2/r/f_receiver_replaced'
+must specify -F to overwrite it
+=== END
+=== CASE M2/f_receiver_replaced.9a_token_after
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M2/r/f_receiver_replaced
+--- rc
+0
+--- stdout
+zfsbcapc/M2/r/f_receiver_replaced	receive_resume_token	-
+--- stderr
+=== END
+=== CASE M2/f_receiver_replaced.9b_abort
+--- cmd
+zfs receive -A zfsbcapc/M2/r/f_receiver_replaced
+--- rc
+1
+--- stdout
+--- stderr
+'zfsbcapc/M2/r/f_receiver_replaced' does not have any resumable receive state to abort
+=== END

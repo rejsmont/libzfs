@@ -1,0 +1,1138 @@
+##### SECTION M5_Z1 (raw receive: new dataset, -o props, full -F onto pre-created (unencrypted / under encrypted target), incremental, resume, -o encryption)  tag=C  zfs-2.3.9-0+deb13u1
+=== CASE M5_Z1/00_src_props
+--- cmd
+zfs get -H -o name,property,value,source encryption,encryptionroot,keystatus,keylocation zfsbcapc/M5_Z1/cs/enc zfsbcapc/M5_Z1/cs/plain
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/cs/enc	encryption	aes-256-gcm	-
+zfsbcapc/M5_Z1/cs/enc	encryptionroot	zfsbcapc/M5_Z1/cs/enc	-
+zfsbcapc/M5_Z1/cs/enc	keystatus	available	-
+zfsbcapc/M5_Z1/cs/enc	keylocation	file:///var/tmp/zfsb-matrix/cap.key1	local
+zfsbcapc/M5_Z1/cs/plain	encryption	off	default
+zfsbcapc/M5_Z1/cs/plain	encryptionroot	-	-
+zfsbcapc/M5_Z1/cs/plain	keystatus	-	-
+zfsbcapc/M5_Z1/cs/plain	keylocation	none	default
+--- stderr
+=== END
+=== CASE M5_Z1/10_raw_new_plain_opts
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u zfsbcapc/M5_Z1/srv/n0
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/10a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/n0
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n0	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/n0	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/n0	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/n0	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/n0	encryptionroot	zfsbcapc/M5_Z1/srv/n0	-	-
+zfsbcapc/M5_Z1/srv/n0	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/n0	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/n0	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/n0	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/n0	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/11_raw_new_o_user
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u -o org.x:y=v zfsbcapc/M5_Z1/srv/n1
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/11a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token,org.x:y zfsbcapc/M5_Z1/srv/n1
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n1	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/n1	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/n1	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/n1	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/n1	encryptionroot	zfsbcapc/M5_Z1/srv/n1	-	-
+zfsbcapc/M5_Z1/srv/n1	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/n1	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/n1	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/n1	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/n1	receive_resume_token	-	-	-
+zfsbcapc/M5_Z1/srv/n1	org.x:y	v	-	local
+--- stderr
+=== END
+=== CASE M5_Z1/12_raw_new_o_canmount
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u -o canmount=noauto zfsbcapc/M5_Z1/srv/n2
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/12a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/n2
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n2	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/n2	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/n2	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/n2	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/n2	encryptionroot	zfsbcapc/M5_Z1/srv/n2	-	-
+zfsbcapc/M5_Z1/srv/n2	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/n2	canmount	noauto	-	local
+zfsbcapc/M5_Z1/srv/n2	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/n2	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/n2	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/13_raw_new_o_readonly
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u -o readonly=on zfsbcapc/M5_Z1/srv/n3
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/13a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/n3
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n3	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/n3	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/n3	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/n3	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/n3	encryptionroot	zfsbcapc/M5_Z1/srv/n3	-	-
+zfsbcapc/M5_Z1/srv/n3	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/n3	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/n3	readonly	on	-	local
+zfsbcapc/M5_Z1/srv/n3	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/n3	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/14_raw_new_all_three
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u -o org.x:y=v -o canmount=noauto -o readonly=on zfsbcapc/M5_Z1/srv/n4
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/14a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token,org.x:y zfsbcapc/M5_Z1/srv/n4
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n4	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/n4	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/n4	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/n4	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/n4	encryptionroot	zfsbcapc/M5_Z1/srv/n4	-	-
+zfsbcapc/M5_Z1/srv/n4	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/n4	canmount	noauto	-	local
+zfsbcapc/M5_Z1/srv/n4	readonly	on	-	local
+zfsbcapc/M5_Z1/srv/n4	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/n4	receive_resume_token	-	-	-
+zfsbcapc/M5_Z1/srv/n4	org.x:y	v	-	local
+--- stderr
+=== END
+=== CASE M5_Z1/15_raw_p_stream_with_x
+--- cmd
+zfs send -w -p zfsbcapc/M5_Z1/cs/enc@p | zfs receive -s -u -x org.x:z zfsbcapc/M5_Z1/srv/n5
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/15a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token,org.x:y,org.x:z zfsbcapc/M5_Z1/srv/n5
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n5	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/n5	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/n5	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/n5	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/n5	encryptionroot	zfsbcapc/M5_Z1/srv/n5	-	-
+zfsbcapc/M5_Z1/srv/n5	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/n5	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/n5	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/n5	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/n5	receive_resume_token	-	-	-
+zfsbcapc/M5_Z1/srv/n5	org.x:y	srcy	srcy	received
+zfsbcapc/M5_Z1/srv/n5	org.x:z	-	srcvalue	-
+--- stderr
+=== END
+=== CASE M5_Z1/16_raw_p_stream_with_o_and_x
+--- cmd
+zfs send -w -p zfsbcapc/M5_Z1/cs/enc@p | zfs receive -s -u -o org.x:y=v -x org.x:z zfsbcapc/M5_Z1/srv/n6
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/16a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token,org.x:y,org.x:z zfsbcapc/M5_Z1/srv/n6
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n6	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/n6	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/n6	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/n6	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/n6	encryptionroot	zfsbcapc/M5_Z1/srv/n6	-	-
+zfsbcapc/M5_Z1/srv/n6	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/n6	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/n6	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/n6	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/n6	receive_resume_token	-	-	-
+zfsbcapc/M5_Z1/srv/n6	org.x:y	v	srcy	local
+zfsbcapc/M5_Z1/srv/n6	org.x:z	-	srcvalue	-
+--- stderr
+=== END
+=== CASE M5_Z1/17_raw_p_stream_without_x
+--- cmd
+zfs send -w -p zfsbcapc/M5_Z1/cs/enc@p | zfs receive -s -u zfsbcapc/M5_Z1/srv/n7
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/17a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token,org.x:y,org.x:z zfsbcapc/M5_Z1/srv/n7
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n7	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/n7	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/n7	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/n7	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/n7	encryptionroot	zfsbcapc/M5_Z1/srv/n7	-	-
+zfsbcapc/M5_Z1/srv/n7	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/n7	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/n7	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/n7	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/n7	receive_resume_token	-	-	-
+zfsbcapc/M5_Z1/srv/n7	org.x:y	srcy	srcy	received
+zfsbcapc/M5_Z1/srv/n7	org.x:z	srcvalue	srcvalue	received
+--- stderr
+=== END
+=== CASE M5_Z1/18_raw_new_daemon_flags
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/M5_Z1/srv/n8
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/18a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/n8
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n8	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/M5_Z1/srv/n8	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/M5_Z1/srv/n8	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/M5_Z1/srv/n8	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/n8	encryptionroot	zfsbcapc/M5_Z1/srv/n8	-	-
+zfsbcapc/M5_Z1/srv/n8	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/n8	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/n8	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/n8	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/n8	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/19_raw_new_two_levels_below_parent
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u zfsbcapc/M5_Z1/srv/missing/n9
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot open 'zfsbcapc/M5_Z1/srv/missing': dataset does not exist
+cannot receive new filesystem stream: unable to restore to destination
+=== END
+=== CASE M5_Z1/19b_raw_new_two_levels_with_p
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u -p zfsbcapc/M5_Z1/srv/missing2/n9
+--- rc
+2
+--- pipestatus
+141 2
+--- stdout
+--- stderr
+invalid option 'p'
+usage:
+	receive [-vMnsFhu] [-o <property>=<value>] ... [-x <property>] ...
+	    <filesystem|volume|snapshot>
+	receive [-vMnsFhu] [-o <property>=<value>] ... [-x <property>] ... 
+	    [-d | -e] <filesystem>
+	receive -A <filesystem|volume>
+
+For the property list, run: zfs set|get
+
+For the delegated permission list, run: zfs allow|unallow
+
+For further help on a command or topic, run: zfs help [<topic>]
+=== END
+=== CASE M5_Z1/19c_list_srv
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/M5_Z1/srv
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv	filesystem
+zfsbcapc/M5_Z1/srv/n0	filesystem
+zfsbcapc/M5_Z1/srv/n0@a	snapshot
+zfsbcapc/M5_Z1/srv/n1	filesystem
+zfsbcapc/M5_Z1/srv/n1@a	snapshot
+zfsbcapc/M5_Z1/srv/n2	filesystem
+zfsbcapc/M5_Z1/srv/n2@a	snapshot
+zfsbcapc/M5_Z1/srv/n3	filesystem
+zfsbcapc/M5_Z1/srv/n3@a	snapshot
+zfsbcapc/M5_Z1/srv/n4	filesystem
+zfsbcapc/M5_Z1/srv/n4@a	snapshot
+zfsbcapc/M5_Z1/srv/n5	filesystem
+zfsbcapc/M5_Z1/srv/n5@p	snapshot
+zfsbcapc/M5_Z1/srv/n6	filesystem
+zfsbcapc/M5_Z1/srv/n6@p	snapshot
+zfsbcapc/M5_Z1/srv/n7	filesystem
+zfsbcapc/M5_Z1/srv/n7@p	snapshot
+zfsbcapc/M5_Z1/srv/n8	filesystem
+zfsbcapc/M5_Z1/srv/n8@a	snapshot
+--- stderr
+=== END
+=== CASE M5_Z1/20_raw_F_onto_precreated_unenc
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -F -s -u zfsbcapc/M5_Z1/srv/pre1
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an encrypted filesystem or overwrite an unencrypted one with an encrypted one
+=== END
+=== CASE M5_Z1/20a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/pre1
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/pre1	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/pre1	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/pre1	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/pre1	encryption	off	-	default
+zfsbcapc/M5_Z1/srv/pre1	encryptionroot	-	-	-
+zfsbcapc/M5_Z1/srv/pre1	keystatus	-	-	-
+zfsbcapc/M5_Z1/srv/pre1	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/pre1	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/pre1	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/pre1	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/20b_list
+--- cmd
+zfs list -H -t all -o name,type,encryption -r zfsbcapc/M5_Z1/srv/pre1
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/pre1	filesystem	off
+--- stderr
+=== END
+=== CASE M5_Z1/21_raw_noF_onto_precreated_unenc
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u zfsbcapc/M5_Z1/srv/pre2
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination 'zfsbcapc/M5_Z1/srv/pre2' exists
+must specify -F to overwrite it
+=== END
+=== CASE M5_Z1/22_raw_F_onto_precreated_unenc_with_own_props
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/M5_Z1/srv/pre3
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an encrypted filesystem or overwrite an unencrypted one with an encrypted one
+=== END
+=== CASE M5_Z1/22a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/pre3
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/pre3	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/pre3	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/pre3	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/pre3	encryption	off	-	default
+zfsbcapc/M5_Z1/srv/pre3	encryptionroot	-	-	-
+zfsbcapc/M5_Z1/srv/pre3	keystatus	-	-	-
+zfsbcapc/M5_Z1/srv/pre3	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/pre3	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/pre3	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/pre3	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/23_raw_F_onto_precreated_with_local_props
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -F -s -u zfsbcapc/M5_Z1/srv/pre4
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an encrypted filesystem or overwrite an unencrypted one with an encrypted one
+=== END
+=== CASE M5_Z1/23a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/pre4
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/pre4	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/M5_Z1/srv/pre4	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/M5_Z1/srv/pre4	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/pre4	encryption	off	-	default
+zfsbcapc/M5_Z1/srv/pre4	encryptionroot	-	-	-
+zfsbcapc/M5_Z1/srv/pre4	keystatus	-	-	-
+zfsbcapc/M5_Z1/srv/pre4	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/pre4	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/pre4	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/pre4	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/24_raw_F_without_s_onto_precreated_unenc
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -F -u zfsbcapc/M5_Z1/srv/pre5
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an encrypted filesystem or overwrite an unencrypted one with an encrypted one
+=== END
+=== CASE M5_Z1/30_plain_F_onto_precreated_under_enc
+--- cmd
+zfs send zfsbcapc/M5_Z1/cs/plain@a | zfs receive -F -s -u zfsbcapc/M5_Z1/esrv/pre1
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an encrypted filesystem or overwrite an unencrypted one with an encrypted one
+=== END
+=== CASE M5_Z1/30a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/esrv/pre1
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/esrv/pre1	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/esrv/pre1	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/esrv/pre1	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/esrv/pre1	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/esrv/pre1	encryptionroot	zfsbcapc/M5_Z1/esrv	-	-
+zfsbcapc/M5_Z1/esrv/pre1	keystatus	available	-	-
+zfsbcapc/M5_Z1/esrv/pre1	canmount	on	-	default
+zfsbcapc/M5_Z1/esrv/pre1	readonly	off	-	default
+zfsbcapc/M5_Z1/esrv/pre1	volmode	default	-	default
+zfsbcapc/M5_Z1/esrv/pre1	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/31_plain_noF_onto_precreated_under_enc
+--- cmd
+zfs send zfsbcapc/M5_Z1/cs/plain@a | zfs receive -s -u zfsbcapc/M5_Z1/esrv/pre2
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination 'zfsbcapc/M5_Z1/esrv/pre2' exists
+must specify -F to overwrite it
+=== END
+=== CASE M5_Z1/32_plain_F_onto_precreated_under_unenc
+--- cmd
+zfs send zfsbcapc/M5_Z1/cs/plain@a | zfs receive -F -s -u zfsbcapc/M5_Z1/srv/pre6
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/32a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/pre6
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/pre6	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/pre6	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/pre6	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/pre6	encryption	off	-	default
+zfsbcapc/M5_Z1/srv/pre6	encryptionroot	-	-	-
+zfsbcapc/M5_Z1/srv/pre6	keystatus	-	-	-
+zfsbcapc/M5_Z1/srv/pre6	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/pre6	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/pre6	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/pre6	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/33_plain_new_leaf_under_enc
+--- cmd
+zfs send zfsbcapc/M5_Z1/cs/plain@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/M5_Z1/esrv/new1
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/33a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/esrv/new1
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/esrv/new1	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/M5_Z1/esrv/new1	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/M5_Z1/esrv/new1	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/M5_Z1/esrv/new1	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/esrv/new1	encryptionroot	zfsbcapc/M5_Z1/esrv	-	-
+zfsbcapc/M5_Z1/esrv/new1	keystatus	available	-	-
+zfsbcapc/M5_Z1/esrv/new1	canmount	on	-	default
+zfsbcapc/M5_Z1/esrv/new1	readonly	off	-	default
+zfsbcapc/M5_Z1/esrv/new1	volmode	default	-	default
+zfsbcapc/M5_Z1/esrv/new1	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/34_plain_new_leaf_under_unenc
+--- cmd
+zfs send zfsbcapc/M5_Z1/cs/plain@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/M5_Z1/srv/new1
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/34a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/new1
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/new1	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/M5_Z1/srv/new1	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/M5_Z1/srv/new1	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/M5_Z1/srv/new1	encryption	off	-	default
+zfsbcapc/M5_Z1/srv/new1	encryptionroot	-	-	-
+zfsbcapc/M5_Z1/srv/new1	keystatus	-	-	-
+zfsbcapc/M5_Z1/srv/new1	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/new1	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/new1	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/new1	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/35_plain_F_L_c_onto_precreated_under_enc
+--- cmd
+zfs send -L -c zfsbcapc/M5_Z1/cs/plain@a | zfs receive -F -s -u zfsbcapc/M5_Z1/esrv/pre3
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an encrypted filesystem or overwrite an unencrypted one with an encrypted one
+=== END
+=== CASE M5_Z1/40_raw_new_leaf_under_enc
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/M5_Z1/esrv/rawleaf
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/40a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/esrv/rawleaf
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/esrv/rawleaf	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/M5_Z1/esrv/rawleaf	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/M5_Z1/esrv/rawleaf	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/M5_Z1/esrv/rawleaf	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/esrv/rawleaf	encryptionroot	zfsbcapc/M5_Z1/esrv/rawleaf	-	-
+zfsbcapc/M5_Z1/esrv/rawleaf	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/esrv/rawleaf	canmount	on	-	default
+zfsbcapc/M5_Z1/esrv/rawleaf	readonly	off	-	default
+zfsbcapc/M5_Z1/esrv/rawleaf	volmode	default	-	default
+zfsbcapc/M5_Z1/esrv/rawleaf	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/41_raw_new_leaf_under_id_under_enc
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/M5_Z1/esrv/id/rawleaf
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/41a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/esrv/id/rawleaf
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/esrv/id/rawleaf	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/M5_Z1/esrv/id/rawleaf	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/M5_Z1/esrv/id/rawleaf	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/M5_Z1/esrv/id/rawleaf	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/esrv/id/rawleaf	encryptionroot	zfsbcapc/M5_Z1/esrv/id/rawleaf	-	-
+zfsbcapc/M5_Z1/esrv/id/rawleaf	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/esrv/id/rawleaf	canmount	on	-	default
+zfsbcapc/M5_Z1/esrv/id/rawleaf	readonly	off	-	default
+zfsbcapc/M5_Z1/esrv/id/rawleaf	volmode	default	-	default
+zfsbcapc/M5_Z1/esrv/id/rawleaf	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/41b_id_props
+--- cmd
+zfs get -H -o name,property,value encryption,encryptionroot,keystatus zfsbcapc/M5_Z1/esrv/id
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/esrv/id	encryption	aes-256-gcm
+zfsbcapc/M5_Z1/esrv/id	encryptionroot	zfsbcapc/M5_Z1/esrv
+zfsbcapc/M5_Z1/esrv/id	keystatus	available
+--- stderr
+=== END
+=== CASE M5_Z1/42_raw_new_leaf_under_id_under_unenc
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/M5_Z1/srv/id/rawleaf
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/42a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/id/rawleaf
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/id/rawleaf	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/M5_Z1/srv/id/rawleaf	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/M5_Z1/srv/id/rawleaf	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/M5_Z1/srv/id/rawleaf	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/id/rawleaf	encryptionroot	zfsbcapc/M5_Z1/srv/id/rawleaf	-	-
+zfsbcapc/M5_Z1/srv/id/rawleaf	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/id/rawleaf	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/id/rawleaf	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/id/rawleaf	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/id/rawleaf	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/43_raw_F_onto_precreated_under_enc
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -F -s -u zfsbcapc/M5_Z1/esrv/pre4
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: zfs receive -F cannot be used to destroy an encrypted filesystem or overwrite an unencrypted one with an encrypted one
+=== END
+=== CASE M5_Z1/43a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/esrv/pre4
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/esrv/pre4	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/esrv/pre4	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/esrv/pre4	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/esrv/pre4	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/esrv/pre4	encryptionroot	zfsbcapc/M5_Z1/esrv	-	-
+zfsbcapc/M5_Z1/esrv/pre4	keystatus	available	-	-
+zfsbcapc/M5_Z1/esrv/pre4	canmount	on	-	default
+zfsbcapc/M5_Z1/esrv/pre4	readonly	off	-	default
+zfsbcapc/M5_Z1/esrv/pre4	volmode	default	-	default
+zfsbcapc/M5_Z1/esrv/pre4	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/50_raw_incr
+--- cmd
+zfs send -w -i zfsbcapc/M5_Z1/cs/enc@a zfsbcapc/M5_Z1/cs/enc@b | zfs receive -s -u zfsbcapc/M5_Z1/srv/n0
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/50a_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M5_Z1/srv/n0
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n0@a	16311247547933889846	921
+zfsbcapc/M5_Z1/srv/n0@b	4586967258870162932	998
+--- stderr
+=== END
+=== CASE M5_Z1/51_raw_incr_with_o_user
+--- cmd
+zfs send -w -i zfsbcapc/M5_Z1/cs/enc@a zfsbcapc/M5_Z1/cs/enc@b | zfs receive -s -u -o org.x:y=incr zfsbcapc/M5_Z1/srv/n1
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/51a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token,org.x:y zfsbcapc/M5_Z1/srv/n1
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n1	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/n1	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/n1	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/n1	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/n1	encryptionroot	zfsbcapc/M5_Z1/srv/n1	-	-
+zfsbcapc/M5_Z1/srv/n1	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/n1	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/n1	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/n1	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/n1	receive_resume_token	-	-	-
+zfsbcapc/M5_Z1/srv/n1	org.x:y	incr	-	local
+--- stderr
+=== END
+=== CASE M5_Z1/52_raw_incr_daemon_flags
+--- cmd
+zfs send -w -i zfsbcapc/M5_Z1/cs/enc@a zfsbcapc/M5_Z1/cs/enc@b | zfs receive -F -s -u -o org.zfsbackup:config=eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ== -o org.zfsbackup:client_id=client-1 -o org.zfsbackup:source_dataset=pool/data zfsbcapc/M5_Z1/srv/n8
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/52a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/n8
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/n8	org.zfsbackup:config	eyJ2IjoxLCJkYXRhc2V0IjoicG9vbC9kYXRhIiwiZnJlcXVlbmN5IjoiMWgifQ==	-	local
+zfsbcapc/M5_Z1/srv/n8	org.zfsbackup:client_id	client-1	-	local
+zfsbcapc/M5_Z1/srv/n8	org.zfsbackup:source_dataset	pool/data	-	local
+zfsbcapc/M5_Z1/srv/n8	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/n8	encryptionroot	zfsbcapc/M5_Z1/srv/n8	-	-
+zfsbcapc/M5_Z1/srv/n8	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/n8	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/n8	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/n8	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/n8	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/53_raw_incr_onto_wrong_base
+--- cmd
+zfs send -w -i zfsbcapc/M5_Z1/cs/enc@b zfsbcapc/M5_Z1/cs/enc@c | zfs receive -s -u zfsbcapc/M5_Z1/srv/n2
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: most recent snapshot of zfsbcapc/M5_Z1/srv/n2 does not
+match incremental source
+=== END
+=== CASE M5_Z1/54_raw_incr_F
+--- cmd
+zfs send -w -i zfsbcapc/M5_Z1/cs/enc@b zfsbcapc/M5_Z1/cs/enc@c | zfs receive -F -s -u zfsbcapc/M5_Z1/srv/n0
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/60_raw_full_cut
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | head -c 1000000 | zfs receive -s -u zfsbcapc/M5_Z1/srv/rr
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-fcf47124c-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc140606b3a9fc499686b18f0c90e439c1f27989b9a90c0c5569c549c98905c9fabea6f15186fac9c5faa979c90e8960f3b81910ee4fcecf2d284a2d2ececf86884940dd03932f4a2c87493100009f291f4c
+=== END
+=== CASE M5_Z1/60a_unload_source_key
+--- cmd
+bash -c zfs unmount zfsbcapc/M5_Z1/cs/enc; zfs unload-key zfsbcapc/M5_Z1/cs/enc; zfs get -H -o name,property,value keystatus zfsbcapc/M5_Z1/cs/enc zfsbcapc/M5_Z1/srv/rr
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/cs/enc	keystatus	unavailable
+zfsbcapc/M5_Z1/srv/rr	keystatus	unavailable
+--- stderr
+=== END
+=== CASE M5_Z1/61_send_nv_t_keys_unloaded
+--- cmd
+zfs send -nv -t 1-fcf47124c-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc140606b3a9fc499686b18f0c90e439c1f27989b9a90c0c5569c549c98905c9fabea6f15186fac9c5faa979c90e8960f3b81910ee4fcecf2d284a2d2ececf86884940dd03932f4a2c87493100009f291f4c
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	object = 0x2
+	offset = 0xc0000
+	bytes = 0xe1854
+	toguid = 0xe25d3139620f9536
+	toname = zfsbcapc/M5_Z1/cs/enc@a
+	compressok = 1
+	rawok = 1
+full send of zfsbcapc/M5_Z1/cs/enc@a estimated size is 1.17M
+total estimated size is 1.17M
+--- stderr
+=== END
+=== CASE M5_Z1/62_raw_resume_keys_unloaded
+--- cmd
+zfs send -t 1-fcf47124c-f8-789c636064000310a500c4ec50360710e72765a52697303030419460caa7a515a796806478e0f26c48f2499525a9c5403a44820fabfe92fcf4d2cc140606b3a9fc499686b18f0c90e439c1f27989b9a90c0c5569c549c98905c9fabea6f15186fac9c5faa979c90e8960f3b81910ee4fcecf2d284a2d2ececf86884940dd03932f4a2c87493100009f291f4c | zfs receive -s -u zfsbcapc/M5_Z1/srv/rr
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/62a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token zfsbcapc/M5_Z1/srv/rr
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/rr	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/rr	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/rr	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/rr	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/rr	encryptionroot	zfsbcapc/M5_Z1/srv/rr	-	-
+zfsbcapc/M5_Z1/srv/rr	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/rr	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/rr	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/rr	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/rr	receive_resume_token	-	-	-
+--- stderr
+=== END
+=== CASE M5_Z1/63_raw_incr_cut_keys_unloaded
+--- cmd
+zfs send -w -i zfsbcapc/M5_Z1/cs/enc@a zfsbcapc/M5_Z1/cs/enc@b | head -c 500000 | zfs receive -s -u zfsbcapc/M5_Z1/srv/rr
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-11a79426f1-120-789c636064000310a501c49c50360710a715e5e7a69766a6304081d954fe244bc3d8470a40363b92bafca4acd4e412060666a83a0cf9b4b4e2d412900c0b5c9e0d493ea9b224b51848bf1166c3aabf241fe28a2f4b7d7db3f556d81b20c97382e5f31273531918aad28a9392130b92f57d4de3a30cf5938bf553f3921d92c0e6713320fc999c9f5b50945a5c9c9f0d119380ba07265f94580e936200009dfa271b
+=== END
+=== CASE M5_Z1/64_send_nv_t_keys_unloaded
+--- cmd
+zfs send -nv -t 1-11a79426f1-120-789c636064000310a501c49c50360710a715e5e7a69766a6304081d954fe244bc3d8470a40363b92bafca4acd4e412060666a83a0cf9b4b4e2d412900c0b5c9e0d493ea9b224b51848bf1166c3aabf241fe28a2f4b7d7db3f556d81b20c97382e5f31273531918aad28a9392130b92f57d4de3a30cf5938bf553f3921d92c0e6713320fc999c9f5b50945a5c9c9f0d119380ba07265f94580e936200009dfa271b
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0xe25d3139620f9536
+	object = 0x3
+	offset = 0x40000
+	bytes = 0x613ec
+	toguid = 0x3fa82e6b4d4da5f4
+	toname = zfsbcapc/M5_Z1/cs/enc@b
+	compressok = 1
+	rawok = 1
+send from zfsbcapc/M5_Z1/cs/enc@a to zfsbcapc/M5_Z1/cs/enc@b estimated size is 1.67M
+total estimated size is 1.67M
+--- stderr
+=== END
+=== CASE M5_Z1/65_raw_incr_resume_keys_unloaded
+--- cmd
+zfs send -t 1-11a79426f1-120-789c636064000310a501c49c50360710a715e5e7a69766a6304081d954fe244bc3d8470a40363b92bafca4acd4e412060666a83a0cf9b4b4e2d412900c0b5c9e0d493ea9b224b51848bf1166c3aabf241fe28a2f4b7d7db3f556d81b20c97382e5f31273531918aad28a9392130b92f57d4de3a30cf5938bf553f3921d92c0e6713320fc999c9f5b50945a5c9c9f0d119380ba07265f94580e936200009dfa271b | zfs receive -s -u zfsbcapc/M5_Z1/srv/rr
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/65a_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M5_Z1/srv/rr
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/rr@a	16311247547933889846	1021
+zfsbcapc/M5_Z1/srv/rr@b	4586967258870162932	1029
+--- stderr
+=== END
+=== CASE M5_Z1/66_load_source_key
+--- cmd
+zfs load-key zfsbcapc/M5_Z1/cs/enc
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/70_raw_o_encryption
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u -o encryption=aes-256-gcm zfsbcapc/M5_Z1/srv/e1
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: encryption property 'encryption' cannot be set or excluded for raw streams.
+=== END
+=== CASE M5_Z1/71_raw_o_encryption_off
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u -o encryption=off zfsbcapc/M5_Z1/srv/e2
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: encryption property 'encryption' cannot be set or excluded for raw streams.
+=== END
+=== CASE M5_Z1/72_raw_o_keyformat
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u -o keyformat=passphrase zfsbcapc/M5_Z1/srv/e3
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: encryption property 'keyformat' cannot be set or excluded for raw streams.
+=== END
+=== CASE M5_Z1/73_raw_o_keylocation
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u -o keylocation=prompt zfsbcapc/M5_Z1/srv/e4
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/73a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token,keylocation zfsbcapc/M5_Z1/srv/e4
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/e4	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/e4	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/e4	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/e4	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/e4	encryptionroot	zfsbcapc/M5_Z1/srv/e4	-	-
+zfsbcapc/M5_Z1/srv/e4	keystatus	unavailable	-	-
+zfsbcapc/M5_Z1/srv/e4	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/e4	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/e4	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/e4	receive_resume_token	-	-	-
+zfsbcapc/M5_Z1/srv/e4	keylocation	prompt	-	local
+--- stderr
+=== END
+=== CASE M5_Z1/74_raw_x_encryption
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u -x encryption zfsbcapc/M5_Z1/srv/e5
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: encryption property 'encryption' cannot be set or excluded for raw streams.
+=== END
+=== CASE M5_Z1/75_raw_x_keylocation
+--- cmd
+zfs send -w zfsbcapc/M5_Z1/cs/enc@a | zfs receive -s -u -x keylocation zfsbcapc/M5_Z1/srv/e6
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/76_plain_o_encryption
+--- cmd
+zfs send zfsbcapc/M5_Z1/cs/plain@a | zfs receive -s -u -o encryption=aes-256-gcm -o keyformat=passphrase -o keylocation=file:///var/tmp/zfsb-matrix/cap.key2 zfsbcapc/M5_Z1/srv/e7
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/76a_props
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:config,org.zfsbackup:client_id,org.zfsbackup:source_dataset,encryption,encryptionroot,keystatus,canmount,readonly,volmode,receive_resume_token,keylocation zfsbcapc/M5_Z1/srv/e7
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/srv/e7	org.zfsbackup:config	-	-	-
+zfsbcapc/M5_Z1/srv/e7	org.zfsbackup:client_id	-	-	-
+zfsbcapc/M5_Z1/srv/e7	org.zfsbackup:source_dataset	-	-	-
+zfsbcapc/M5_Z1/srv/e7	encryption	aes-256-gcm	-	-
+zfsbcapc/M5_Z1/srv/e7	encryptionroot	zfsbcapc/M5_Z1/srv/e7	-	-
+zfsbcapc/M5_Z1/srv/e7	keystatus	available	-	-
+zfsbcapc/M5_Z1/srv/e7	canmount	on	-	default
+zfsbcapc/M5_Z1/srv/e7	readonly	off	-	default
+zfsbcapc/M5_Z1/srv/e7	volmode	default	-	default
+zfsbcapc/M5_Z1/srv/e7	receive_resume_token	-	-	-
+zfsbcapc/M5_Z1/srv/e7	keylocation	file:///var/tmp/zfsb-matrix/cap.key2	-	local
+--- stderr
+=== END
+=== CASE M5_Z1/77_plain_o_encryption_under_enc_target
+--- cmd
+zfs send zfsbcapc/M5_Z1/cs/plain@a | zfs receive -s -u -o encryption=off zfsbcapc/M5_Z1/esrv/e8
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M5_Z1/90_list_all
+--- cmd
+zfs list -H -t all -o name,type,encryption,keystatus,encryptionroot -r zfsbcapc/M5_Z1/srv zfsbcapc/M5_Z1/esrv
+--- rc
+0
+--- stdout
+zfsbcapc/M5_Z1/esrv	filesystem	aes-256-gcm	available	zfsbcapc/M5_Z1/esrv
+zfsbcapc/M5_Z1/esrv/e8	filesystem	off	-	-
+zfsbcapc/M5_Z1/esrv/e8@a	snapshot	off	-	-
+zfsbcapc/M5_Z1/esrv/id	filesystem	aes-256-gcm	available	zfsbcapc/M5_Z1/esrv
+zfsbcapc/M5_Z1/esrv/id/rawleaf	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/esrv/id/rawleaf
+zfsbcapc/M5_Z1/esrv/id/rawleaf@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/esrv/id/rawleaf
+zfsbcapc/M5_Z1/esrv/new1	filesystem	aes-256-gcm	available	zfsbcapc/M5_Z1/esrv
+zfsbcapc/M5_Z1/esrv/new1@a	snapshot	aes-256-gcm	available	zfsbcapc/M5_Z1/esrv
+zfsbcapc/M5_Z1/esrv/pre1	filesystem	aes-256-gcm	available	zfsbcapc/M5_Z1/esrv
+zfsbcapc/M5_Z1/esrv/pre2	filesystem	aes-256-gcm	available	zfsbcapc/M5_Z1/esrv
+zfsbcapc/M5_Z1/esrv/pre3	filesystem	aes-256-gcm	available	zfsbcapc/M5_Z1/esrv
+zfsbcapc/M5_Z1/esrv/pre4	filesystem	aes-256-gcm	available	zfsbcapc/M5_Z1/esrv
+zfsbcapc/M5_Z1/esrv/rawleaf	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/esrv/rawleaf
+zfsbcapc/M5_Z1/esrv/rawleaf@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/esrv/rawleaf
+zfsbcapc/M5_Z1/srv	filesystem	off	-	-
+zfsbcapc/M5_Z1/srv/e4	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/e4
+zfsbcapc/M5_Z1/srv/e4@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/e4
+zfsbcapc/M5_Z1/srv/e6	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/e6
+zfsbcapc/M5_Z1/srv/e6@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/e6
+zfsbcapc/M5_Z1/srv/e7	filesystem	aes-256-gcm	available	zfsbcapc/M5_Z1/srv/e7
+zfsbcapc/M5_Z1/srv/e7@a	snapshot	aes-256-gcm	available	zfsbcapc/M5_Z1/srv/e7
+zfsbcapc/M5_Z1/srv/id	filesystem	off	-	-
+zfsbcapc/M5_Z1/srv/id/rawleaf	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/id/rawleaf
+zfsbcapc/M5_Z1/srv/id/rawleaf@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/id/rawleaf
+zfsbcapc/M5_Z1/srv/n0	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n0
+zfsbcapc/M5_Z1/srv/n0@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n0
+zfsbcapc/M5_Z1/srv/n0@b	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n0
+zfsbcapc/M5_Z1/srv/n0@c	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n0
+zfsbcapc/M5_Z1/srv/n1	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n1
+zfsbcapc/M5_Z1/srv/n1@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n1
+zfsbcapc/M5_Z1/srv/n1@b	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n1
+zfsbcapc/M5_Z1/srv/n2	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n2
+zfsbcapc/M5_Z1/srv/n2@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n2
+zfsbcapc/M5_Z1/srv/n3	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n3
+zfsbcapc/M5_Z1/srv/n3@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n3
+zfsbcapc/M5_Z1/srv/n4	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n4
+zfsbcapc/M5_Z1/srv/n4@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n4
+zfsbcapc/M5_Z1/srv/n5	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n5
+zfsbcapc/M5_Z1/srv/n5@p	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n5
+zfsbcapc/M5_Z1/srv/n6	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n6
+zfsbcapc/M5_Z1/srv/n6@p	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n6
+zfsbcapc/M5_Z1/srv/n7	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n7
+zfsbcapc/M5_Z1/srv/n7@p	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n7
+zfsbcapc/M5_Z1/srv/n8	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n8
+zfsbcapc/M5_Z1/srv/n8@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n8
+zfsbcapc/M5_Z1/srv/n8@b	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/n8
+zfsbcapc/M5_Z1/srv/new1	filesystem	off	-	-
+zfsbcapc/M5_Z1/srv/new1@a	snapshot	off	-	-
+zfsbcapc/M5_Z1/srv/pre1	filesystem	off	-	-
+zfsbcapc/M5_Z1/srv/pre2	filesystem	off	-	-
+zfsbcapc/M5_Z1/srv/pre3	filesystem	off	-	-
+zfsbcapc/M5_Z1/srv/pre4	filesystem	off	-	-
+zfsbcapc/M5_Z1/srv/pre5	filesystem	off	-	-
+zfsbcapc/M5_Z1/srv/pre6	filesystem	off	-	-
+zfsbcapc/M5_Z1/srv/pre6@a	snapshot	off	-	-
+zfsbcapc/M5_Z1/srv/rr	filesystem	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/rr
+zfsbcapc/M5_Z1/srv/rr@a	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/rr
+zfsbcapc/M5_Z1/srv/rr@b	snapshot	aes-256-gcm	unavailable	zfsbcapc/M5_Z1/srv/rr
+--- stderr
+=== END

@@ -23,7 +23,7 @@ from _openzfs_fixtures import VERSIONS, load_m1_summary, load_section
 pytestmark = [pytest.mark.unit, pytest.mark.subprocess]
 
 # Versions on which a message differs, pinned per version below.
-V21, V22, V24 = VERSIONS
+V21, V22, V23, V24 = VERSIONS
 
 
 @pytest.fixture(params=VERSIONS)
@@ -381,11 +381,13 @@ class TestResumeInfoStaleM2:
 
 
 class TestRealSendResumeM2:
-    """A real `zfs send -t` (not `-nv`) on a token whose incremental source is gone: the wording differs on 2.4."""
+    """A real `zfs send -t` (not `-nv`) on a token whose incremental source is gone: the wording differs on 2.4
+    (2.3.9 still says 'Invalid cross-device link', like 2.1 and 2.2)."""
 
     EXPECTED = {
         V21: "Warning: cannot send 'zfsbcapc/M2/s/i_from_destroyed@b': Invalid cross-device link",
         V22: "Warning: cannot send 'zfsbcapc/M2/s/i_from_destroyed@b': Invalid cross-device link",
+        V23: "Warning: cannot send 'zfsbcapc/M2/s/i_from_destroyed@b': Invalid cross-device link",
         V24: "Warning: cannot send 'zfsbcapc/M2/s/i_from_destroyed@b': No such file or directory",
     }
 
@@ -402,7 +404,8 @@ class TestRealSendResumeM2:
     def test_2_4_says_no_such_file_where_older_versions_say_invalid_cross_device_link(self):
         for case in ('i_from_destroyed', 'i_from_recreated', 'i_sender_moved'):
             texts = {v: records(v, 'M2')['M2/%s.9_resume_try' % case].send_stderr for v in VERSIONS}
-            assert 'Invalid cross-device link' in texts[V21] and 'Invalid cross-device link' in texts[V22], case
+            for old in (V21, V22, V23):
+                assert 'Invalid cross-device link' in texts[old], (old, case)
             assert 'No such file or directory' in texts[V24], case
             assert 'Invalid cross-device link' not in texts[V24], case
 
@@ -611,12 +614,15 @@ class TestFailedBatchM3:
     HELD = {
         V21: 'Cannot destroy snapshot zfsbcapc/M3_Z8/held@s2: dataset is busy',
         V22: 'Cannot destroy snapshot zfsbcapc/M3_Z8/held@s2: dataset is busy',
+        # 2.3.9 (Debian 13) already has the "being held" wording
+        V23: "Cannot destroy snapshot zfsbcapc/M3_Z8/held@s2: it's being held. "
+             "Run 'zfs holds -r zfsbcapc/M3_Z8/held@s2' to see holders.",
         V24: "Cannot destroy snapshot zfsbcapc/M3_Z8/held@s2: it's being held. "
              "Run 'zfs holds -r zfsbcapc/M3_Z8/held@s2' to see holders.",
     }
 
     def test_held_snapshot_wording_per_version(self, version, mock_subprocess):
-        """2.1 and 2.2 call a hold 'dataset is busy' (the same as a send in progress); 2.4 says it is being held."""
+        """2.1 and 2.2 call a hold 'dataset is busy' (the same as a send in progress); 2.3 and 2.4 say it is being held."""
         for case in ('held.20_batch', 'held.30_single', 'held.40_range'):
             rec = load_section(version, 'M3_Z8')['M3_Z8/' + case]
             replay(mock_subprocess, rec)
@@ -1065,12 +1071,14 @@ class TestKeyUnloadedSendZ4:
     PLAIN_FULL = {
         V21: "Warning: cannot send 'zfsbcapc/Z4/cs/enc@a': dataset key must be loaded",
         V22: "Warning: cannot send 'zfsbcapc/Z4/cs/enc@a': dataset key must be loaded",
+        V23: "Warning: cannot send 'zfsbcapc/Z4/cs/enc@a': dataset key must be loaded",
         # 2.4.1 reports a misleading reason: there is no incremental source in a full send
         V24: "Warning: cannot send 'zfsbcapc/Z4/cs/enc@a': incremental source ((null)) does not exist",
     }
     PLAIN_INCR = {
         V21: "Warning: cannot send 'zfsbcapc/Z4/cs/enc@b': dataset key must be loaded",
         V22: "Warning: cannot send 'zfsbcapc/Z4/cs/enc@b': dataset key must be loaded",
+        V23: "Warning: cannot send 'zfsbcapc/Z4/cs/enc@b': dataset key must be loaded",
         V24: "Warning: cannot send 'zfsbcapc/Z4/cs/enc@b': incremental source (zfsbcapc/Z4/cs/enc@a) does not exist",
     }
 
@@ -1093,7 +1101,7 @@ class TestKeyUnloadedSendZ4:
 
     def test_2_4_does_not_say_the_key_must_be_loaded(self):
         for rid in ('Z4/40_send_plain_full_wc', 'Z4/41_send_plain_incr_wc', 'Z4/44_send_plain_L_c_wc'):
-            old = [load_section(v, 'Z4')[rid].stderr for v in (V21, V22)]
+            old = [load_section(v, 'Z4')[rid].stderr for v in (V21, V22, V23)]
             new = load_section(V24, 'Z4')[rid].stderr
             assert all('key must be loaded' in t for t in old), rid
             assert 'key must be loaded' not in new, rid

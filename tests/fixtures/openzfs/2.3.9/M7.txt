@@ -1,0 +1,1513 @@
+##### SECTION M7 (-F on an incremental whose receiver is ahead (U1/U2), rollback -r vs local user properties (U4), modified head (U5), full stream onto a copy with snapshots (U6))  tag=C  zfs-2.3.9-0+deb13u1
+#note: U1: sender zfsbcapc/M7/u1src has old,new1,new2. Each receiver t_* is built with a full stream of @old and an incremental to @new1 (its history is AHEAD of the base @old). Then: zfs send -i @old @new2 | zfs receive [-F] -s -u
+=== CASE M7/U1.00_sender_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u1src
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1src@old	1488394429296913554	1308
+zfsbcapc/M7/u1src@new1	1343452768545185935	1309
+zfsbcapc/M7/u1src@new2	18386151757913461081	1310
+--- stderr
+=== END
+=== CASE M7/U1.a1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u1/t_a
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1/t_a@old	1488394429296913554	1312
+zfsbcapc/M7/u1/t_a@new1	1343452768545185935	1314
+--- stderr
+=== END
+=== CASE M7/U1.a2_F_incr
+--- cmd
+zfs send -i zfsbcapc/M7/u1src@old zfsbcapc/M7/u1src@new2 | zfs receive -F -s -u zfsbcapc/M7/u1/t_a
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U1.a3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u1/t_a
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1/t_a@old	1488394429296913554	1312
+zfsbcapc/M7/u1/t_a@new2	18386151757913461081	1329
+--- stderr
+=== END
+=== CASE M7/U1.a4_token
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M7/u1/t_a
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1/t_a	receive_resume_token	-
+--- stderr
+=== END
+=== CASE M7/U1.b1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u1/t_b
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1/t_b@old	1488394429296913554	1316
+zfsbcapc/M7/u1/t_b@new1	1343452768545185935	1318
+--- stderr
+=== END
+=== CASE M7/U1.b2_noF_incr
+--- cmd
+zfs send -i zfsbcapc/M7/u1src@old zfsbcapc/M7/u1src@new2 | zfs receive -s -u zfsbcapc/M7/u1/t_b
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: destination zfsbcapc/M7/u1/t_b has been modified
+since most recent snapshot
+=== END
+=== CASE M7/U1.b3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u1/t_b
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1/t_b@old	1488394429296913554	1316
+zfsbcapc/M7/u1/t_b@new1	1343452768545185935	1318
+--- stderr
+=== END
+=== CASE M7/U1.b4_token
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M7/u1/t_b
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1/t_b	receive_resume_token	-
+--- stderr
+=== END
+#note: U1 c/d: the sender no longer has @new1 (it was destroyed there after the receiver got it: the rollback/restore situation)
+=== CASE M7/U1.c0_sender_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u1src
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1src@old	1488394429296913554	1308
+zfsbcapc/M7/u1src@new2	18386151757913461081	1310
+--- stderr
+=== END
+=== CASE M7/U1.c1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u1/t_c
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1/t_c@old	1488394429296913554	1320
+zfsbcapc/M7/u1/t_c@new1	1343452768545185935	1322
+--- stderr
+=== END
+=== CASE M7/U1.c2_F_incr_sender_lacks_new1
+--- cmd
+zfs send -i zfsbcapc/M7/u1src@old zfsbcapc/M7/u1src@new2 | zfs receive -F -s -u zfsbcapc/M7/u1/t_c
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U1.c3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u1/t_c
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1/t_c@old	1488394429296913554	1320
+zfsbcapc/M7/u1/t_c@new2	18386151757913461081	1332
+--- stderr
+=== END
+=== CASE M7/U1.d0_holds
+--- cmd
+zfs holds -H zfsbcapc/M7/u1/t_d@new1
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1/t_d@new1	keep	Wed Oct 28 12:39 2026
+--- stderr
+=== END
+=== CASE M7/U1.d1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u1/t_d
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1/t_d@old	1488394429296913554	1324
+zfsbcapc/M7/u1/t_d@new1	1343452768545185935	1326
+--- stderr
+=== END
+=== CASE M7/U1.d2_F_incr_newer_snapshot_held
+--- cmd
+zfs send -i zfsbcapc/M7/u1src@old zfsbcapc/M7/u1src@new2 | zfs receive -F -s -u zfsbcapc/M7/u1/t_d
+--- rc
+1
+--- pipestatus
+0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: dataset is busy
+=== END
+=== CASE M7/U1.d3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u1/t_d
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u1/t_d@old	1488394429296913554	1324
+zfsbcapc/M7/u1/t_d@new1	1343452768545185935	1326
+--- stderr
+=== END
+#note: U2: the same -F -s incremental cut after 1000000 bytes; are the newer snapshots still there while the partial state exists; then resume
+=== CASE M7/U2.00_sender_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u2src
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2src@old	3817846069898136417	1340
+zfsbcapc/M7/u2src@new1	5899001891029931272	1341
+zfsbcapc/M7/u2src@new2	6073737064391940407	1342
+--- stderr
+=== END
+=== CASE M7/U2.a1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u2/t_a
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_a@old	3817846069898136417	1344
+zfsbcapc/M7/u2/t_a@new1	5899001891029931272	1346
+--- stderr
+=== END
+=== CASE M7/U2.a2_F_incr_cut
+--- cmd
+zfs send -i zfsbcapc/M7/u2src@old zfsbcapc/M7/u2src@new2 | head -c 1000000 | zfs receive -F -s -u zfsbcapc/M7/u2/t_a
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-108510dfc2-e8-789c636064000310a501c49c50360710a715e5e7a69766a6304041a277dae5a3db7e9b2800d9ec48eaf293b252934b181898a1ea30e4d3d28a534b40323c70793624f9a4ca92d462205d20c487557f493ec415e6334dc4d6d97b851820c97382e5f31273531918aad28a9392130b92f57dcdf54b8d8a8b921df252cb8d206e02008bff207b
+=== END
+=== CASE M7/U2.a3_while_partial
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u2/t_a
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_a@old	3817846069898136417	1344
+zfsbcapc/M7/u2/t_a@new1	5899001891029931272	1346
+--- stderr
+=== END
+=== CASE M7/U2.a3b_list_all
+--- cmd
+zfs list -H -t all -o name,type -r zfsbcapc/M7/u2/t_a
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_a	filesystem
+zfsbcapc/M7/u2/t_a@old	snapshot
+zfsbcapc/M7/u2/t_a@new1	snapshot
+--- stderr
+=== END
+=== CASE M7/U2.a4_token_prop
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M7/u2/t_a
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_a	receive_resume_token	1-108510dfc2-e8-789c636064000310a501c49c50360710a715e5e7a69766a6304041a277dae5a3db7e9b2800d9ec48eaf293b252934b181898a1ea30e4d3d28a534b40323c70793624f9a4ca92d462205d20c487557f493ec415e6334dc4d6d97b851820c97382e5f31273531918aad28a9392130b92f57dcdf54b8d8a8b921df252cb8d206e02008bff207b
+--- stderr
+=== END
+=== CASE M7/U2.a5_send_nv_t
+--- cmd
+zfs send -nv -t 1-108510dfc2-e8-789c636064000310a501c49c50360710a715e5e7a69766a6304041a277dae5a3db7e9b2800d9ec48eaf293b252934b181898a1ea30e4d3d28a534b40323c70793624f9a4ca92d462205d20c487557f493ec415e6334dc4d6d97b851820c97382e5f31273531918aad28a9392130b92f57dcdf54b8d8a8b921df252cb8d206e02008bff207b
+--- rc
+0
+--- stdout
+resume token contents:
+nvlist version: 0
+	fromguid = 0x34fbb6c5d3664b61
+	object = 0x3
+	offset = 0xc0000
+	bytes = 0xe1270
+	toguid = 0x544a3fae16349937
+	toname = zfsbcapc/M7/u2src@new2
+send from zfsbcapc/M7/u2src@old to zfsbcapc/M7/u2src@new2 estimated size is 5.14M
+total estimated size is 5.14M
+--- stderr
+=== END
+=== CASE M7/U2.a6_resume_F
+--- cmd
+zfs send -t 1-108510dfc2-e8-789c636064000310a501c49c50360710a715e5e7a69766a6304041a277dae5a3db7e9b2800d9ec48eaf293b252934b181898a1ea30e4d3d28a534b40323c70793624f9a4ca92d462205d20c487557f493ec415e6334dc4d6d97b851820c97382e5f31273531918aad28a9392130b92f57dcdf54b8d8a8b921df252cb8d206e02008bff207b | zfs receive -F -s -u zfsbcapc/M7/u2/t_a
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U2.a7_after_resume
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u2/t_a
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_a@old	3817846069898136417	1344
+zfsbcapc/M7/u2/t_a@new2	6073737064391940407	1360
+--- stderr
+=== END
+=== CASE M7/U2.a8_token_prop
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M7/u2/t_a
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_a	receive_resume_token	-
+--- stderr
+=== END
+#note: U2 b: the same cut, then the resume WITHOUT -F
+=== CASE M7/U2.b1_F_incr_cut
+--- cmd
+zfs send -i zfsbcapc/M7/u2src@old zfsbcapc/M7/u2src@new2 | head -c 1000000 | zfs receive -F -s -u zfsbcapc/M7/u2/t_b
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-108510dfc2-e8-789c636064000310a501c49c50360710a715e5e7a69766a6304041a277dae5a3db7e9b2800d9ec48eaf293b252934b181898a1ea30e4d3d28a534b40323c70793624f9a4ca92d462205d20c487557f493ec415e6334dc4d6d97b851820c97382e5f31273531918aad28a9392130b92f57dcdf54b8d8a8b921df252cb8d206e02008bff207b
+=== END
+=== CASE M7/U2.b2_while_partial
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u2/t_b
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_b@old	3817846069898136417	1348
+zfsbcapc/M7/u2/t_b@new1	5899001891029931272	1350
+--- stderr
+=== END
+=== CASE M7/U2.b3_resume_noF
+--- cmd
+zfs send -t 1-108510dfc2-e8-789c636064000310a501c49c50360710a715e5e7a69766a6304041a277dae5a3db7e9b2800d9ec48eaf293b252934b181898a1ea30e4d3d28a534b40323c70793624f9a4ca92d462205d20c487557f493ec415e6334dc4d6d97b851820c97382e5f31273531918aad28a9392130b92f57dcdf54b8d8a8b921df252cb8d206e02008bff207b | zfs receive -s -u zfsbcapc/M7/u2/t_b
+--- rc
+1
+--- pipestatus
+0 1
+--- stdout
+--- stderr
+cannot receive resume stream: kernel modules must be upgraded to receive this stream.
+=== END
+=== CASE M7/U2.b4_after_resume
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u2/t_b
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_b@old	3817846069898136417	1348
+zfsbcapc/M7/u2/t_b@new1	5899001891029931272	1350
+--- stderr
+=== END
+=== CASE M7/U2.b5_token_prop
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M7/u2/t_b
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_b	receive_resume_token	1-fc22b7dd5-e8-789c636064000310a501c49c50360710a715e5e7a69766a6304041a277dae5a3db7e9b2800d9ec48eaf293b252934b181854a0ea30e4d3d28a534b18e00024cf86249f5459925a0c924848c2aabf241fe20af3992662ebecbd420c90e439c1f27989b9a90c0c5569c549c98905c9fabee6faa546c545c90e79a9e546103b01ab6520c2
+--- stderr
+=== END
+#note: U2 c: the same cut, then zfs receive -A (the server's fresh-mode abort)
+=== CASE M7/U2.c1_F_incr_cut
+--- cmd
+zfs send -i zfsbcapc/M7/u2src@old zfsbcapc/M7/u2src@new2 | head -c 1000000 | zfs receive -F -s -u zfsbcapc/M7/u2/t_c
+--- rc
+1
+--- pipestatus
+141 0 1
+--- stdout
+--- stderr
+cannot receive incremental stream: checksum mismatch or incomplete stream.
+Partially received snapshot is saved.
+A resuming stream can be generated on the sending system by running:
+    zfs send -t 1-108510dfc2-e8-789c636064000310a501c49c50360710a715e5e7a69766a6304041a277dae5a3db7e9b2800d9ec48eaf293b252934b181898a1ea30e4d3d28a534b40323c70793624f9a4ca92d462205d20c487557f493ec415e6334dc4d6d97b851820c97382e5f31273531918aad28a9392130b92f57dcdf54b8d8a8b921df252cb8d206e02008bff207b
+=== END
+=== CASE M7/U2.c2_while_partial
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u2/t_c
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_c@old	3817846069898136417	1352
+zfsbcapc/M7/u2/t_c@new1	5899001891029931272	1354
+--- stderr
+=== END
+=== CASE M7/U2.c3_abort
+--- cmd
+zfs receive -A zfsbcapc/M7/u2/t_c
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U2.c4_after_abort
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u2/t_c
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_c@old	3817846069898136417	1352
+zfsbcapc/M7/u2/t_c@new1	5899001891029931272	1354
+--- stderr
+=== END
+=== CASE M7/U2.c5_token_prop
+--- cmd
+zfs get -H -o name,property,value receive_resume_token zfsbcapc/M7/u2/t_c
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u2/t_c	receive_resume_token	-
+--- stderr
+=== END
+#note: U4: local user properties on the sender survive zfs rollback -r @A?
+=== CASE M7/U4.a1_props_before
+--- cmd
+zfs get -H -o name,property,value,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y zfsbcapc/M7/u4/src
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u4/src	org.zfsbackup:anchor.x	snapA	local
+zfsbcapc/M7/u4/src	org.zfsbackup:anchor.y	afterA	local
+--- stderr
+=== END
+=== CASE M7/U4.a2_snaps_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u4/src
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u4/src@A	13673162559908680344	1379
+zfsbcapc/M7/u4/src@B	1378035266297576932	1381
+zfsbcapc/M7/u4/src@C	6105526603566017585	1382
+--- stderr
+=== END
+=== CASE M7/U4.a3_rollback_without_r
+--- cmd
+zfs rollback zfsbcapc/M7/u4/src@A
+--- rc
+1
+--- stdout
+--- stderr
+cannot rollback to 'zfsbcapc/M7/u4/src@A': more recent snapshots or bookmarks exist
+use '-r' to force deletion of the following snapshots and bookmarks:
+zfsbcapc/M7/u4/src@B
+zfsbcapc/M7/u4/src@C
+=== END
+=== CASE M7/U4.a4_rollback_r
+--- cmd
+zfs rollback -r zfsbcapc/M7/u4/src@A
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U4.a5_snaps_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u4/src
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u4/src@A	13673162559908680344	1379
+--- stderr
+=== END
+=== CASE M7/U4.a6_props_after
+--- cmd
+zfs get -H -o name,property,value,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y zfsbcapc/M7/u4/src
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u4/src	org.zfsbackup:anchor.x	snapA	local
+zfsbcapc/M7/u4/src	org.zfsbackup:anchor.y	afterA	local
+--- stderr
+=== END
+=== CASE M7/U4.a7_local_all
+--- cmd
+zfs get -H -s local -o property,value,source all zfsbcapc/M7/u4/src | grep -E '^org\.'
+--- rc
+0
+--- stdout
+org.zfsbackup:anchor.y	afterA	local
+org.zfsbackup:anchor.x	snapA	local
+--- stderr
+=== END
+#note: U4 b: the anchors arrive as RECEIVED properties (send -p); rollback -r on the receiving copy; plus a local override
+=== CASE M7/U4.b1_snaps_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u4/rcv
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u4/rcv@A	13673162559908680344	1390
+zfsbcapc/M7/u4/rcv@W	12329853747835839844	1395
+zfsbcapc/M7/u4/rcv@X	3596852804457343340	1398
+--- stderr
+=== END
+=== CASE M7/U4.b2_props_before
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y,org.zfsbackup:anchor.w,org.zfsbackup:anchor.z zfsbcapc/M7/u4/rcv
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u4/rcv	org.zfsbackup:anchor.x	localx	snapA	local
+zfsbcapc/M7/u4/rcv	org.zfsbackup:anchor.y	afterA	afterA	received
+zfsbcapc/M7/u4/rcv	org.zfsbackup:anchor.w	snapW	snapW	received
+zfsbcapc/M7/u4/rcv	org.zfsbackup:anchor.z	localz	-	local
+--- stderr
+=== END
+=== CASE M7/U4.b3_rollback_r
+--- cmd
+zfs rollback -r zfsbcapc/M7/u4/rcv@A
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U4.b4_snaps_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u4/rcv
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u4/rcv@A	13673162559908680344	1390
+--- stderr
+=== END
+=== CASE M7/U4.b5_props_after
+--- cmd
+zfs get -H -o name,property,value,received,source org.zfsbackup:anchor.x,org.zfsbackup:anchor.y,org.zfsbackup:anchor.w,org.zfsbackup:anchor.z zfsbcapc/M7/u4/rcv
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u4/rcv	org.zfsbackup:anchor.x	localx	snapA	local
+zfsbcapc/M7/u4/rcv	org.zfsbackup:anchor.y	afterA	afterA	received
+zfsbcapc/M7/u4/rcv	org.zfsbackup:anchor.w	snapW	snapW	received
+zfsbcapc/M7/u4/rcv	org.zfsbackup:anchor.z	localz	-	local
+--- stderr
+=== END
+#note: U5 plain: receiver newest snapshot == base @b, then its head is modified; zfs send  -i @b @c, without -F and then with -F (-F -s -u)
+=== CASE M7/U5.plain.c0.1_written
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/plain_c0
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_c0	written	0
+--- stderr
+=== END
+=== CASE M7/U5.plain.c0.2_noF_untouched
+--- cmd
+zfs send  -i zfsbcapc/M7/u5/src_plain@b zfsbcapc/M7/u5/src_plain@c | zfs receive -s -u zfsbcapc/M7/u5/plain_c0
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U5.plain.c0.3_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/plain_c0
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_c0@a	4939474332826289132	1411
+zfsbcapc/M7/u5/plain_c0@b	340090847625803308	1413
+zfsbcapc/M7/u5/plain_c0@c	6341346925746271280	1415
+--- stderr
+=== END
+=== CASE M7/U5.plain.mount.1_written_before
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/plain_mount
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_mount	written	0
+--- stderr
+=== END
+=== CASE M7/U5.plain.mount.2_written_after
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/plain_mount
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_mount	written	0
+--- stderr
+=== END
+=== CASE M7/U5.plain.mount.3_noF
+--- cmd
+zfs send  -i zfsbcapc/M7/u5/src_plain@b zfsbcapc/M7/u5/src_plain@c | zfs receive -s -u zfsbcapc/M7/u5/plain_mount
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U5.plain.mount.4_snaps_after_noF
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/plain_mount
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_mount@a	4939474332826289132	1417
+zfsbcapc/M7/u5/plain_mount@b	340090847625803308	1419
+zfsbcapc/M7/u5/plain_mount@c	6341346925746271280	1425
+--- stderr
+=== END
+=== CASE M7/U5.plain.mount.5_F
+--- cmd
+zfs send  -i zfsbcapc/M7/u5/src_plain@b zfsbcapc/M7/u5/src_plain@c | zfs receive -F -s -u zfsbcapc/M7/u5/plain_mount
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U5.plain.mount.6_snaps_after_F
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/plain_mount
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_mount@a	4939474332826289132	1417
+zfsbcapc/M7/u5/plain_mount@b	340090847625803308	1419
+zfsbcapc/M7/u5/plain_mount@c	6341346925746271280	1425
+--- stderr
+=== END
+=== CASE M7/U5.plain.mount.7_diff_ok
+--- cmd
+zfs get -H -o name,property,value receive_resume_token,written zfsbcapc/M7/u5/plain_mount
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_mount	receive_resume_token	-
+zfsbcapc/M7/u5/plain_mount	written	0
+--- stderr
+=== END
+=== CASE M7/U5.plain.write.1_written_before
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/plain_write
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_write	written	0
+--- stderr
+=== END
+=== CASE M7/U5.plain.write.2_written_after
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/plain_write
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_write	written	14K
+--- stderr
+=== END
+=== CASE M7/U5.plain.write.3_noF
+--- cmd
+zfs send  -i zfsbcapc/M7/u5/src_plain@b zfsbcapc/M7/u5/src_plain@c | zfs receive -s -u zfsbcapc/M7/u5/plain_write
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: destination zfsbcapc/M7/u5/plain_write has been modified
+since most recent snapshot
+=== END
+=== CASE M7/U5.plain.write.4_snaps_after_noF
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/plain_write
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_write@a	4939474332826289132	1427
+zfsbcapc/M7/u5/plain_write@b	340090847625803308	1429
+--- stderr
+=== END
+=== CASE M7/U5.plain.write.5_F
+--- cmd
+zfs send  -i zfsbcapc/M7/u5/src_plain@b zfsbcapc/M7/u5/src_plain@c | zfs receive -F -s -u zfsbcapc/M7/u5/plain_write
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U5.plain.write.6_snaps_after_F
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/plain_write
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_write@a	4939474332826289132	1427
+zfsbcapc/M7/u5/plain_write@b	340090847625803308	1429
+zfsbcapc/M7/u5/plain_write@c	6341346925746271280	1435
+--- stderr
+=== END
+=== CASE M7/U5.plain.write.7_diff_ok
+--- cmd
+zfs get -H -o name,property,value receive_resume_token,written zfsbcapc/M7/u5/plain_write
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_write	receive_resume_token	-
+zfsbcapc/M7/u5/plain_write	written	0
+--- stderr
+=== END
+=== CASE M7/U5.plain.read.1_written_before
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/plain_read
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_read	written	0
+--- stderr
+=== END
+=== CASE M7/U5.plain.read.2_written_after
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/plain_read
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_read	written	15K
+--- stderr
+=== END
+=== CASE M7/U5.plain.read.3_noF
+--- cmd
+zfs send  -i zfsbcapc/M7/u5/src_plain@b zfsbcapc/M7/u5/src_plain@c | zfs receive -s -u zfsbcapc/M7/u5/plain_read
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: destination zfsbcapc/M7/u5/plain_read has been modified
+since most recent snapshot
+=== END
+=== CASE M7/U5.plain.read.4_snaps_after_noF
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/plain_read
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_read@a	4939474332826289132	1437
+zfsbcapc/M7/u5/plain_read@b	340090847625803308	1439
+--- stderr
+=== END
+=== CASE M7/U5.plain.read.5_F
+--- cmd
+zfs send  -i zfsbcapc/M7/u5/src_plain@b zfsbcapc/M7/u5/src_plain@c | zfs receive -F -s -u zfsbcapc/M7/u5/plain_read
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U5.plain.read.6_snaps_after_F
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/plain_read
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_read@a	4939474332826289132	1437
+zfsbcapc/M7/u5/plain_read@b	340090847625803308	1439
+zfsbcapc/M7/u5/plain_read@c	6341346925746271280	1445
+--- stderr
+=== END
+=== CASE M7/U5.plain.read.7_diff_ok
+--- cmd
+zfs get -H -o name,property,value receive_resume_token,written zfsbcapc/M7/u5/plain_read
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/plain_read	receive_resume_token	-
+zfsbcapc/M7/u5/plain_read	written	0
+--- stderr
+=== END
+#note: U5 raw: receiver newest snapshot == base @b, then its head is modified; zfs send -w -i @b @c, without -F and then with -F (-F -s -u)
+=== CASE M7/U5.raw.c0.1_written
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/raw_c0
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_c0	written	0
+--- stderr
+=== END
+=== CASE M7/U5.raw.c0.2_noF_untouched
+--- cmd
+zfs send -w -i zfsbcapc/M7/u5/src_raw@b zfsbcapc/M7/u5/src_raw@c | zfs receive -s -u zfsbcapc/M7/u5/raw_c0
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U5.raw.c0.3_snaps
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/raw_c0
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_c0@a	12435076332037132016	1453
+zfsbcapc/M7/u5/raw_c0@b	2738129618913277594	1456
+zfsbcapc/M7/u5/raw_c0@c	10226535385690081595	1459
+--- stderr
+=== END
+=== CASE M7/U5.raw.mount.1_written_before
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/raw_mount
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_mount	written	0
+--- stderr
+=== END
+=== CASE M7/U5.raw.mount.2_written_after
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/raw_mount
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_mount	written	85K
+--- stderr
+=== END
+=== CASE M7/U5.raw.mount.3_noF
+--- cmd
+zfs send -w -i zfsbcapc/M7/u5/src_raw@b zfsbcapc/M7/u5/src_raw@c | zfs receive -s -u zfsbcapc/M7/u5/raw_mount
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: destination zfsbcapc/M7/u5/raw_mount has been modified
+since most recent snapshot
+=== END
+=== CASE M7/U5.raw.mount.4_snaps_after_noF
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/raw_mount
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_mount@a	12435076332037132016	1462
+zfsbcapc/M7/u5/raw_mount@b	2738129618913277594	1465
+--- stderr
+=== END
+=== CASE M7/U5.raw.mount.5_F
+--- cmd
+zfs send -w -i zfsbcapc/M7/u5/src_raw@b zfsbcapc/M7/u5/src_raw@c | zfs receive -F -s -u zfsbcapc/M7/u5/raw_mount
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U5.raw.mount.6_snaps_after_F
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/raw_mount
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_mount@a	12435076332037132016	1462
+zfsbcapc/M7/u5/raw_mount@b	2738129618913277594	1465
+zfsbcapc/M7/u5/raw_mount@c	10226535385690081595	1475
+--- stderr
+=== END
+=== CASE M7/U5.raw.mount.7_diff_ok
+--- cmd
+zfs get -H -o name,property,value receive_resume_token,written zfsbcapc/M7/u5/raw_mount
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_mount	receive_resume_token	-
+zfsbcapc/M7/u5/raw_mount	written	0
+--- stderr
+=== END
+=== CASE M7/U5.raw.write.1_written_before
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/raw_write
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_write	written	0
+--- stderr
+=== END
+=== CASE M7/U5.raw.write.2_written_after
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/raw_write
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_write	written	86.5K
+--- stderr
+=== END
+=== CASE M7/U5.raw.write.3_noF
+--- cmd
+zfs send -w -i zfsbcapc/M7/u5/src_raw@b zfsbcapc/M7/u5/src_raw@c | zfs receive -s -u zfsbcapc/M7/u5/raw_write
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: destination zfsbcapc/M7/u5/raw_write has been modified
+since most recent snapshot
+=== END
+=== CASE M7/U5.raw.write.4_snaps_after_noF
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/raw_write
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_write@a	12435076332037132016	1478
+zfsbcapc/M7/u5/raw_write@b	2738129618913277594	1481
+--- stderr
+=== END
+=== CASE M7/U5.raw.write.5_F
+--- cmd
+zfs send -w -i zfsbcapc/M7/u5/src_raw@b zfsbcapc/M7/u5/src_raw@c | zfs receive -F -s -u zfsbcapc/M7/u5/raw_write
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U5.raw.write.6_snaps_after_F
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/raw_write
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_write@a	12435076332037132016	1478
+zfsbcapc/M7/u5/raw_write@b	2738129618913277594	1481
+zfsbcapc/M7/u5/raw_write@c	10226535385690081595	1489
+--- stderr
+=== END
+=== CASE M7/U5.raw.write.7_diff_ok
+--- cmd
+zfs get -H -o name,property,value receive_resume_token,written zfsbcapc/M7/u5/raw_write
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_write	receive_resume_token	-
+zfsbcapc/M7/u5/raw_write	written	0
+--- stderr
+=== END
+=== CASE M7/U5.raw.read.1_written_before
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/raw_read
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_read	written	0
+--- stderr
+=== END
+=== CASE M7/U5.raw.read.2_written_after
+--- cmd
+zfs get -H -o name,property,value written zfsbcapc/M7/u5/raw_read
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_read	written	85K
+--- stderr
+=== END
+=== CASE M7/U5.raw.read.3_noF
+--- cmd
+zfs send -w -i zfsbcapc/M7/u5/src_raw@b zfsbcapc/M7/u5/src_raw@c | zfs receive -s -u zfsbcapc/M7/u5/raw_read
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: destination zfsbcapc/M7/u5/raw_read has been modified
+since most recent snapshot
+=== END
+=== CASE M7/U5.raw.read.4_snaps_after_noF
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/raw_read
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_read@a	12435076332037132016	1492
+zfsbcapc/M7/u5/raw_read@b	2738129618913277594	1495
+--- stderr
+=== END
+=== CASE M7/U5.raw.read.5_F
+--- cmd
+zfs send -w -i zfsbcapc/M7/u5/src_raw@b zfsbcapc/M7/u5/src_raw@c | zfs receive -F -s -u zfsbcapc/M7/u5/raw_read
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U5.raw.read.6_snaps_after_F
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/raw_read
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_read@a	12435076332037132016	1492
+zfsbcapc/M7/u5/raw_read@b	2738129618913277594	1495
+zfsbcapc/M7/u5/raw_read@c	10226535385690081595	1505
+--- stderr
+=== END
+=== CASE M7/U5.raw.read.7_diff_ok
+--- cmd
+zfs get -H -o name,property,value receive_resume_token,written zfsbcapc/M7/u5/raw_read
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_read	receive_resume_token	-
+zfsbcapc/M7/u5/raw_read	written	0
+--- stderr
+=== END
+=== CASE M7/U5.raw.unloaded.1_keystatus
+--- cmd
+zfs get -H -o name,property,value keystatus,written zfsbcapc/M7/u5/raw_unloaded
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_unloaded	keystatus	unavailable
+zfsbcapc/M7/u5/raw_unloaded	written	86.5K
+--- stderr
+=== END
+=== CASE M7/U5.raw.unloaded.2_noF
+--- cmd
+zfs send -w -i zfsbcapc/M7/u5/src_raw@b zfsbcapc/M7/u5/src_raw@c | zfs receive -s -u zfsbcapc/M7/u5/raw_unloaded
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive incremental stream: destination zfsbcapc/M7/u5/raw_unloaded has been modified
+since most recent snapshot
+=== END
+=== CASE M7/U5.raw.unloaded.3_F
+--- cmd
+zfs send -w -i zfsbcapc/M7/u5/src_raw@b zfsbcapc/M7/u5/src_raw@c | zfs receive -F -s -u zfsbcapc/M7/u5/raw_unloaded
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U5.raw.unloaded.4_snaps_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/raw_unloaded
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_unloaded@a	12435076332037132016	1508
+zfsbcapc/M7/u5/raw_unloaded@b	2738129618913277594	1511
+zfsbcapc/M7/u5/raw_unloaded@c	10226535385690081595	1522
+--- stderr
+=== END
+=== CASE M7/U5.raw.keyload.1_written
+--- cmd
+zfs get -H -o name,property,value keystatus,written zfsbcapc/M7/u5/raw_keyload
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_keyload	keystatus	unavailable
+zfsbcapc/M7/u5/raw_keyload	written	0
+--- stderr
+=== END
+=== CASE M7/U5.raw.keyload.2_noF
+--- cmd
+zfs send -w -i zfsbcapc/M7/u5/src_raw@b zfsbcapc/M7/u5/src_raw@c | zfs receive -s -u zfsbcapc/M7/u5/raw_keyload
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U5.raw.keyload.3_snaps_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u5/raw_keyload
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u5/raw_keyload@a	12435076332037132016	1525
+zfsbcapc/M7/u5/raw_keyload@b	2738129618913277594	1528
+zfsbcapc/M7/u5/raw_keyload@c	10226535385690081595	1537
+--- stderr
+=== END
+#note: U6: a FULL stream onto an existing copy; the copy (src a,b) has snapshots a,b. Per case: without -F (zfs receive -s -u), then with -F (-F -s -u), each on a fresh copy
+=== CASE M7/U6.same_newer.noF.1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_same_newer_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_newer_noF@a	18101100695481615656	1554
+zfsbcapc/M7/u6/c_same_newer_noF@b	5922116882434702561	1556
+--- stderr
+=== END
+=== CASE M7/U6.same_newer.noF.2_recv
+--- cmd
+zfs send zfsbcapc/M7/u6/src@c | zfs receive  -s -u zfsbcapc/M7/u6/c_same_newer_noF
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination 'zfsbcapc/M7/u6/c_same_newer_noF' exists
+must specify -F to overwrite it
+=== END
+=== CASE M7/U6.same_newer.noF.3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_same_newer_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_newer_noF@a	18101100695481615656	1554
+zfsbcapc/M7/u6/c_same_newer_noF@b	5922116882434702561	1556
+--- stderr
+=== END
+=== CASE M7/U6.same_newer.noF.4_props
+--- cmd
+zfs get -H -o name,property,value,source receive_resume_token zfsbcapc/M7/u6/c_same_newer_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_newer_noF	receive_resume_token	-	-
+--- stderr
+=== END
+=== CASE M7/U6.same_newer.F.1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_same_newer_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_newer_F@a	18101100695481615656	1558
+zfsbcapc/M7/u6/c_same_newer_F@b	5922116882434702561	1560
+--- stderr
+=== END
+=== CASE M7/U6.same_newer.F.2_recv
+--- cmd
+zfs send zfsbcapc/M7/u6/src@c | zfs receive -F -s -u zfsbcapc/M7/u6/c_same_newer_F
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination has snapshots (eg. zfsbcapc/M7/u6/c_same_newer_F@b)
+must destroy them to overwrite it
+=== END
+=== CASE M7/U6.same_newer.F.3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_same_newer_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_newer_F@a	18101100695481615656	1558
+zfsbcapc/M7/u6/c_same_newer_F@b	5922116882434702561	1560
+--- stderr
+=== END
+=== CASE M7/U6.same_newer.F.4_props
+--- cmd
+zfs get -H -o name,property,value,source receive_resume_token zfsbcapc/M7/u6/c_same_newer_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_newer_F	receive_resume_token	-	-
+--- stderr
+=== END
+=== CASE M7/U6.same_existing_name.noF.1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_same_existing_name_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_existing_name_noF@a	18101100695481615656	1562
+zfsbcapc/M7/u6/c_same_existing_name_noF@b	5922116882434702561	1564
+--- stderr
+=== END
+=== CASE M7/U6.same_existing_name.noF.2_recv
+--- cmd
+zfs send zfsbcapc/M7/u6/src@a | zfs receive  -s -u zfsbcapc/M7/u6/c_same_existing_name_noF
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination 'zfsbcapc/M7/u6/c_same_existing_name_noF' exists
+must specify -F to overwrite it
+=== END
+=== CASE M7/U6.same_existing_name.noF.3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_same_existing_name_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_existing_name_noF@a	18101100695481615656	1562
+zfsbcapc/M7/u6/c_same_existing_name_noF@b	5922116882434702561	1564
+--- stderr
+=== END
+=== CASE M7/U6.same_existing_name.noF.4_props
+--- cmd
+zfs get -H -o name,property,value,source receive_resume_token zfsbcapc/M7/u6/c_same_existing_name_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_existing_name_noF	receive_resume_token	-	-
+--- stderr
+=== END
+=== CASE M7/U6.same_existing_name.F.1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_same_existing_name_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_existing_name_F@a	18101100695481615656	1566
+zfsbcapc/M7/u6/c_same_existing_name_F@b	5922116882434702561	1568
+--- stderr
+=== END
+=== CASE M7/U6.same_existing_name.F.2_recv
+--- cmd
+zfs send zfsbcapc/M7/u6/src@a | zfs receive -F -s -u zfsbcapc/M7/u6/c_same_existing_name_F
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination has snapshots (eg. zfsbcapc/M7/u6/c_same_existing_name_F@a)
+must destroy them to overwrite it
+=== END
+=== CASE M7/U6.same_existing_name.F.3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_same_existing_name_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_existing_name_F@a	18101100695481615656	1566
+zfsbcapc/M7/u6/c_same_existing_name_F@b	5922116882434702561	1568
+--- stderr
+=== END
+=== CASE M7/U6.same_existing_name.F.4_props
+--- cmd
+zfs get -H -o name,property,value,source receive_resume_token zfsbcapc/M7/u6/c_same_existing_name_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_same_existing_name_F	receive_resume_token	-	-
+--- stderr
+=== END
+=== CASE M7/U6.other_same_name.noF.1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_other_same_name_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_same_name_noF@a	18101100695481615656	1570
+zfsbcapc/M7/u6/c_other_same_name_noF@b	5922116882434702561	1572
+--- stderr
+=== END
+=== CASE M7/U6.other_same_name.noF.2_recv
+--- cmd
+zfs send zfsbcapc/M7/u6/other@a | zfs receive  -s -u zfsbcapc/M7/u6/c_other_same_name_noF
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination 'zfsbcapc/M7/u6/c_other_same_name_noF' exists
+must specify -F to overwrite it
+=== END
+=== CASE M7/U6.other_same_name.noF.3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_other_same_name_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_same_name_noF@a	18101100695481615656	1570
+zfsbcapc/M7/u6/c_other_same_name_noF@b	5922116882434702561	1572
+--- stderr
+=== END
+=== CASE M7/U6.other_same_name.noF.4_props
+--- cmd
+zfs get -H -o name,property,value,source receive_resume_token zfsbcapc/M7/u6/c_other_same_name_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_same_name_noF	receive_resume_token	-	-
+--- stderr
+=== END
+=== CASE M7/U6.other_same_name.F.1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_other_same_name_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_same_name_F@a	18101100695481615656	1574
+zfsbcapc/M7/u6/c_other_same_name_F@b	5922116882434702561	1576
+--- stderr
+=== END
+=== CASE M7/U6.other_same_name.F.2_recv
+--- cmd
+zfs send zfsbcapc/M7/u6/other@a | zfs receive -F -s -u zfsbcapc/M7/u6/c_other_same_name_F
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination has snapshots (eg. zfsbcapc/M7/u6/c_other_same_name_F@a)
+must destroy them to overwrite it
+=== END
+=== CASE M7/U6.other_same_name.F.3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_other_same_name_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_same_name_F@a	18101100695481615656	1574
+zfsbcapc/M7/u6/c_other_same_name_F@b	5922116882434702561	1576
+--- stderr
+=== END
+=== CASE M7/U6.other_same_name.F.4_props
+--- cmd
+zfs get -H -o name,property,value,source receive_resume_token zfsbcapc/M7/u6/c_other_same_name_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_same_name_F	receive_resume_token	-	-
+--- stderr
+=== END
+=== CASE M7/U6.other_new_name.noF.1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_other_new_name_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_new_name_noF@a	18101100695481615656	1578
+zfsbcapc/M7/u6/c_other_new_name_noF@b	5922116882434702561	1580
+--- stderr
+=== END
+=== CASE M7/U6.other_new_name.noF.2_recv
+--- cmd
+zfs send zfsbcapc/M7/u6/other@z | zfs receive  -s -u zfsbcapc/M7/u6/c_other_new_name_noF
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination 'zfsbcapc/M7/u6/c_other_new_name_noF' exists
+must specify -F to overwrite it
+=== END
+=== CASE M7/U6.other_new_name.noF.3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_other_new_name_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_new_name_noF@a	18101100695481615656	1578
+zfsbcapc/M7/u6/c_other_new_name_noF@b	5922116882434702561	1580
+--- stderr
+=== END
+=== CASE M7/U6.other_new_name.noF.4_props
+--- cmd
+zfs get -H -o name,property,value,source receive_resume_token zfsbcapc/M7/u6/c_other_new_name_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_new_name_noF	receive_resume_token	-	-
+--- stderr
+=== END
+=== CASE M7/U6.other_new_name.F.1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_other_new_name_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_new_name_F@a	18101100695481615656	1582
+zfsbcapc/M7/u6/c_other_new_name_F@b	5922116882434702561	1584
+--- stderr
+=== END
+=== CASE M7/U6.other_new_name.F.2_recv
+--- cmd
+zfs send zfsbcapc/M7/u6/other@z | zfs receive -F -s -u zfsbcapc/M7/u6/c_other_new_name_F
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination has snapshots (eg. zfsbcapc/M7/u6/c_other_new_name_F@b)
+must destroy them to overwrite it
+=== END
+=== CASE M7/U6.other_new_name.F.3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/c_other_new_name_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_new_name_F@a	18101100695481615656	1582
+zfsbcapc/M7/u6/c_other_new_name_F@b	5922116882434702561	1584
+--- stderr
+=== END
+=== CASE M7/U6.other_new_name.F.4_props
+--- cmd
+zfs get -H -o name,property,value,source receive_resume_token zfsbcapc/M7/u6/c_other_new_name_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/c_other_new_name_F	receive_resume_token	-	-
+--- stderr
+=== END
+#note: U6 empty: the existing dataset has NO snapshots (placeholder / cut first receive)
+=== CASE M7/U6.empty.noF.1_recv
+--- cmd
+zfs send zfsbcapc/M7/u6/src@c | zfs receive  -s -u zfsbcapc/M7/u6/empty_noF
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination 'zfsbcapc/M7/u6/empty_noF' exists
+must specify -F to overwrite it
+=== END
+=== CASE M7/U6.empty.noF.2_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/empty_noF
+--- rc
+0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U6.empty.F.1_recv
+--- cmd
+zfs send zfsbcapc/M7/u6/src@c | zfs receive -F -s -u zfsbcapc/M7/u6/empty_F
+--- rc
+0
+--- pipestatus
+0 0
+--- stdout
+--- stderr
+=== END
+=== CASE M7/U6.empty.F.2_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/empty_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/empty_F@c	801711862634371903	1589
+--- stderr
+=== END
+#note: U6 raw: a raw full stream of the encrypted dataset onto a raw copy that has snapshots a,b
+=== CASE M7/U6.raw.noF.1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/raw_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/raw_noF@a	12671013278588628795	1592
+zfsbcapc/M7/u6/raw_noF@b	2104503907334158861	1595
+--- stderr
+=== END
+=== CASE M7/U6.raw.noF.2_recv
+--- cmd
+zfs send -w zfsbcapc/M7/u6/esrc@c | zfs receive  -s -u zfsbcapc/M7/u6/raw_noF
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination 'zfsbcapc/M7/u6/raw_noF' exists
+must specify -F to overwrite it
+=== END
+=== CASE M7/U6.raw.noF.3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/raw_noF
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/raw_noF@a	12671013278588628795	1592
+zfsbcapc/M7/u6/raw_noF@b	2104503907334158861	1595
+--- stderr
+=== END
+=== CASE M7/U6.raw.F.1_before
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/raw_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/raw_F@a	12671013278588628795	1598
+zfsbcapc/M7/u6/raw_F@b	2104503907334158861	1601
+--- stderr
+=== END
+=== CASE M7/U6.raw.F.2_recv
+--- cmd
+zfs send -w zfsbcapc/M7/u6/esrc@c | zfs receive -F -s -u zfsbcapc/M7/u6/raw_F
+--- rc
+1
+--- pipestatus
+141 1
+--- stdout
+--- stderr
+cannot receive new filesystem stream: destination has snapshots (eg. zfsbcapc/M7/u6/raw_F@a)
+must destroy them to overwrite it
+=== END
+=== CASE M7/U6.raw.F.3_after
+--- cmd
+zfs list -H -t snapshot -o name,guid,createtxg -r zfsbcapc/M7/u6/raw_F
+--- rc
+0
+--- stdout
+zfsbcapc/M7/u6/raw_F@a	12671013278588628795	1598
+zfsbcapc/M7/u6/raw_F@b	2104503907334158861	1601
+--- stderr
+=== END
