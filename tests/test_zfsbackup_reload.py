@@ -4862,8 +4862,9 @@ def _listening_socket():
 
 def _supervisor_children_running(supervisor: int, needle: str) -> list:
     """`ps` lines of direct children of `supervisor` whose command has `needle`."""
+    # -ww: procps cuts `command` at 80 columns otherwise
     out = subprocess.run(
-        ["ps", "-ax", "-o", "pid=,ppid=,command="], capture_output=True, text=True
+        ["ps", "-ww", "-ax", "-o", "pid=,ppid=,command="], capture_output=True, text=True
     ).stdout
     found = []
     for line in out.splitlines():

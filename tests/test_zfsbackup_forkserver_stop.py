@@ -793,8 +793,11 @@ class ForkserverDaemon(RealDaemon):
 
     def forkserver_pids(self):
         """Children of the supervisor that are the multiprocessing forkserver."""
+        # -ww: procps cuts `command` at 80 columns unless told otherwise, which on Linux drops
+        # "multiprocessing.forkserver" after a long interpreter path; BSD ps accepts it too.
         out = subprocess.run(
-            ["ps", "-ax", "-o", "pid=,ppid=,command="], capture_output=True, text=True, timeout=30
+            ["ps", "-ww", "-ax", "-o", "pid=,ppid=,command="],
+            capture_output=True, text=True, timeout=30,
         ).stdout
         pids = []
         for line in out.splitlines():
