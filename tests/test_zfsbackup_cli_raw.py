@@ -60,6 +60,7 @@ from _cli_support import (
     db,
     db_state,
     generation,
+    interleaved,
     isolated,
     make_db,
     run,
@@ -1054,7 +1055,7 @@ class TestRawChangeWarningThroughSetAndUnset:
 
     def test_the_warning_precedes_the_confirmation(self, run, rdb):
         result = ok(run, rdb, "set", OFFSITE, "false")
-        out = result.output
+        out = interleaved(result)  # stdout and stderr in the order written
         assert out.index("changes from") < out.index("config updated")
 
     def test_the_warning_is_printed_before_the_commit(self, run, rdb, monkeypatch):
@@ -1091,7 +1092,8 @@ class TestRawChangeWarningThroughEdit:
         assert result.exit_code == 0, result.stderr
         assert raw_warnings(result) == [expected_warning(DS, "offsite", "true", "false")]
         assert result.stderr.count(" changes from ") == 1
-        assert result.output.index("changes from") < result.output.index("Configuration saved")
+        out = interleaved(result)
+        assert out.index("changes from") < out.index("Configuration saved")
 
     def test_each_changed_entry_warns_once(self, run, rdb, stub, scratch_tmp):
         stub.plan([replace('        raw: true', '        raw: false'),

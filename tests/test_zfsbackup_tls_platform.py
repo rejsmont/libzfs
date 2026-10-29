@@ -54,7 +54,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID  # noqa: E402
 import requests  # noqa: E402
 import websocket  # noqa: E402
 from flask import Flask, jsonify, request  # noqa: E402
-from flask_sock import Sock  # noqa: E402
+from zfsbackup._vendor.flask_sock import Sock  # noqa: E402
 from requests.adapters import HTTPAdapter  # noqa: E402
 from werkzeug.serving import ThreadedWSGIServer, WSGIRequestHandler  # noqa: E402
 

@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Callable, List, Mapping, NamedTuple, Optional, Tuple
 
 from flask import Flask, after_this_request, g, jsonify, request
-from flask_sock import Sock
+from zfsbackup._vendor.flask_sock import Sock
 from simple_websocket import ConnectionClosed
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 

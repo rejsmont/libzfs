@@ -5,7 +5,7 @@ A database that is behind the schema is first copied to
 the writer lock and only when no workers of a previous daemon run; the schema
 is migrated only if that succeeded.
 
-The real history has one revision, so "behind" needs a second one: `Synth`
+To make a database at the real head "behind", `Synth`
 copies the real `migrations/` tree, stacks a synthetic revision on the head and
 moves `_MIGRATIONS_DIR`, `EXPECTED_HEAD` and `KNOWN_REVISIONS` together (the
 pattern of `test_zfsbackup_cli.py::stacked_revision`). The subprocess tests

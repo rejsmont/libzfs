@@ -2331,7 +2331,7 @@ class TestRealCheck:
 
     @staticmethod
     def _database(tmp_path, source_fs):
-        from click.testing import CliRunner
+        from _click_compat import make_runner
         from zfsbackup.cli.main import cli
 
         source = tmp_path / 'check.yaml'
@@ -2345,16 +2345,16 @@ class TestRealCheck:
             '      "1d": "30d"\n'
         )
         database = tmp_path / 'cfg' / 'config.db'
-        result = CliRunner().invoke(cli, ['-c', str(database), 'import', str(source)], prog_name='zfsbackup-config')
+        result = make_runner().invoke(cli, ['-c', str(database), 'import', str(source)], prog_name='zfsbackup-config')
         assert result.exit_code == 0, result.output
         return database
 
     @staticmethod
     def _check(database, *args):
-        from click.testing import CliRunner
+        from _click_compat import make_runner
         from zfsbackup.cli.main import cli
 
-        result = CliRunner().invoke(
+        result = make_runner().invoke(
             cli, ['-c', str(database), 'check', *args], prog_name='zfsbackup-config')
         return result
 
