@@ -2,7 +2,7 @@
 
 ## 1.0.0rc2 (2026-10-29)
 
-Second release candidate. The code is rc1's with two fixes; what is new is the packaging: `libzfseasy` is its own
+Second release candidate. The code is rc1's with three fixes; what is new is the packaging: `libzfseasy` is its own
 wheel, and there are Debian packages for Debian 13 and Ubuntu 26.04.
 
 ### Compatibility
@@ -18,6 +18,9 @@ wheel, and there are Debian packages for Debian 13 and Ubuntu 26.04.
 - **A stop under Python 3.14 no longer ends with a SIGKILL.** With `forkserver` (3.14's Linux default) the
   supervisor now stops the multiprocessing forkserver before it exits (bounded at 3 s, one WARNING if something still
   holds it), so systemd no longer kills a leftover process on every stop, restart and upgrade exit.
+- **libzfseasy: a second Ctrl-C during the cleanup of an interrupted command no longer leaves the `zfs` child
+  running.** The cleanup now terminates and reaps the child before it stops the slow-command watchdog; an interrupt
+  arriving while the watchdog's thread was joined used to skip the SIGTERM/SIGKILL.
 - `trust revoke` now says that running streams are cut within ~2 s (rc1 already cut them; the text said they finish).
 
 ### Packaging
