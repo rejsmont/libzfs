@@ -113,6 +113,23 @@ Notes:
 
 ---
 
+## Release 1.0.0rc2
+
+**Run:** 2026-10-29, `SRC_REF=3287042` (the 1.0.0rc2 version bump on top of the libzfseasy split and the Debian
+packages), `zfsb-server` + `zfsb-client` (Ubuntu 26.04, OpenZFS 2.4.1). Every scenario ran, none skipped.
+Harness: **871 passed, 0 failed**. Its one finding was the stale raw-clone wording check again; the harness now
+checks the README's wording instead of reporting it.
+
+The other release checks on the same commit: the OpenZFS matrix with `tests/test_zfsbackup_real.py` (2.1.5, 2.2.2,
+2.3.9, 2.4.1) 305 / 0 each; `test_config_permissions.sh` 321 / 0; the wheel install scenario on Ubuntu 22.04 and
+24.04 (the upgrade from `v1.0.0rc1` and the in-place upgrade) 462 / 0, then 466 / 0 once its stale README findings
+had become checks; the `.deb` install scenario on Ubuntu 26.04 and Debian 13 241 / 0; the mocked suite on the
+system Pythons 3.11, 3.12 and 3.13 (Ubuntu 24.04). The release commit adds a libzfseasy fix found by the
+latest-deps run (the interrupted command's child is reaped before the slow-command watchdog is cancelled), which
+changes only the order of the cleanup after an interrupt.
+
+---
+
 ## Release 1.0.0rc1
 
 **Run:** 2026-10-27, `SRC_REF=61a7673` (the release commit: the 1.0.0rc1 tree plus the websocket TLS lock and
