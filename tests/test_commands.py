@@ -2437,6 +2437,10 @@ class TestExecCoreRealChildren:
 
         proc = real_child.procs[0]
         assert proc.returncode == -signal.SIGTERM
+        # The interrupt came before the reader's handle was returned, so the cleanup could not join it: it ends on
+        # its own at the reaped child's stderr EOF, a moment later on a loaded runner (seen on macOS).
+        for t in real_child.stderr_threads:
+            t.join(timeout=10)
         assert not any(t.is_alive() for t in real_child.stderr_threads)
         with pytest.raises(ProcessLookupError):
             os.kill(proc.pid, 0)
