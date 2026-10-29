@@ -6,7 +6,7 @@ This is store-layer coverage: `zfsbackup/config/store/` defines the schema, the
 dataclass<->ORM mapper, Alembic migrations, engine/session management, path
 resolution/permissions and the YAML importer used by `zfsbackup-config import`. The daemon and its
 workers read the store through `zfsbackup.runtime_config` (item 8); the
-config CLI (Phase 2) is not built yet.
+config CLI has its own `test_zfsbackup_cli*.py` files.
 
 The Checkpoint A fix-up coverage (decision-(a) audit, A-3 CHECKs, A-4
 permissions, A-6.1 fork-vs-`-shm`) lives alongside, in

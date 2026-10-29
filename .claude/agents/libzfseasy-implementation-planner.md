@@ -1,6 +1,6 @@
 ---
 name: libzfseasy-implementation-planner
-description: Turns zfs-code-reviewer findings (or any review/bug report) for the libzfseasy bindings into a concrete, ordered implementation plan — grouping fixes, sequencing them, calling out risks, and assigning each to the right dev agent. Every plan item cites its basis. The plan is a PROPOSAL for the user to approve before any implementation — it must not be handed to coding agents until the user signs off. Read-only — produces a plan, makes no edits. Scope: libzfseasy/types.py, libzfseasy/zfs.py, and their tests.
+description: Turns zfs-code-reviewer findings (or any review/bug report) for the libzfseasy bindings into a concrete, ordered implementation plan — grouping fixes, sequencing them, calling out risks, and assigning each to the right dev agent. Every plan item cites its basis. The plan is a PROPOSAL for the user to approve before any implementation — it must not be handed to coding agents until the user signs off. Read-only — produces a plan, makes no edits. Scope: libs/libzfseasy/libzfseasy/types.py, libs/libzfseasy/libzfseasy/zfs.py, and their tests.
 tools: Read, Grep, Glob, Bash
 model: opus
 effort: high
@@ -27,7 +27,7 @@ When producing a plan:
 - **Map risks.** Call out what else could break, shared code paths, backward-compat concerns, and
   any hazards specific to the change (pipes, streams, process cleanup, etc.).
 - **Assign owners.** Route each unit to the right executor:
-  - `libzfseasy-developer` → `libzfseasy/` code (`types.py`, `zfs.py`)
+  - `libzfseasy-developer` → `libs/libzfseasy/` code (`types.py`, `zfs.py`, `__init__.py`)
   - `pytest-test-author` → tests + conftest
   - `real-zfs-scenario-dev` → shell scenarios
   - `zfs-code-reviewer` → final review
@@ -43,16 +43,17 @@ When producing a plan:
 ## libzfseasy-specific facts to plan around
 
 **Package layout:**
-- `libzfseasy/types.py` — type hierarchy: `ZFS` (base) → `Dataset` → `Filesystem`, `Volume`;
+- `libs/libzfseasy/libzfseasy/types.py` — type hierarchy: `ZFS` (base) → `Dataset` → `Filesystem`, `Volume`;
   `ZFS` → `Snapshot`, `Bookmark`; `SnapshotRange`; `Property` (value + source + received);
   `Validate` (static validators). Properties stored as integer-indexed `_props` list (using
   `_prop_names`) for built-ins, and name-keyed `_user_props` dict for user-defined properties
   (those containing `:`). Preserve this storage split — tests and commands depend on it.
-- `libzfseasy/zfs.py` — command classes: `ListCommand`, `CreateCommand`, `SnapshotCommand`, etc.
-  `Command._exec` / `_exec_out` drive `subprocess.Popen` and stream stdout line-by-line.
+- `libs/libzfseasy/libzfseasy/zfs.py` — command classes: `ListCommand`, `CreateCommand`, `SnapshotCommand`, etc.
+  `Command._exec_lines` is the one exec core (bytes, surrogateescape, `\n`-only, bounded stderr,
+  TERM → KILL cleanup); `_exec` drains it and `_exec_out` yields its stripped, non-empty lines.
   `SendCommand` and `ReceiveCommand` use binary streaming variants (`_exec_stream` /
   `_exec_stream_in`) that return `BufferedReader` / `BufferedWriter`.
-- `libzfseasy/__init__.py` — one singleton per command class, exported as module-level names
+- `libs/libzfseasy/libzfseasy/__init__.py` — one singleton per command class, exported as module-level names
   (`zfs.list`, `zfs.create`, etc.). This is the public API; renaming singletons is a breaking
   change.
 
@@ -63,13 +64,14 @@ When producing a plan:
 - `-H` flag is used for machine-readable `list`/`get` output.
 - `ZFS_CMD` and `ZPOOL_CMD` env vars override resolved binary paths.
 
-**Known outstanding exec-path issues** (may relate to new findings):
-- Abandoned `_exec_out` generator leaks the daemon stderr thread and leaves the child unreaped.
-- Stdout-EOF-but-rc-None causes a busy-spin waiting for the process to exit.
-- `SendCommand` and `ReceiveCommand` discard the `Popen` handle after returning the stream, so
-  `ReceiveCommand` failures are silent.
-- `SetCommand` and `InheritCommand` mutate the in-memory `_props` / `_user_props` before the
-  subprocess runs, so a failed subprocess call leaves the object in a corrupted state.
+**Formerly outstanding exec-path issues, all fixed** (`a8a3d88`, PR #3 and milestone D's D3; do not
+re-plan them; a regression in one of them is a finding):
+- An abandoned `_exec_out` generator leaked the stderr thread and left the child unreaped.
+- Stdout-EOF-but-rc-None caused a busy-spin waiting for the process to exit.
+- `SendCommand` and `ReceiveCommand` discarded the `Popen` handle after returning the stream, so
+  `ReceiveCommand` failures were silent (now a `StreamHandle`).
+- `SetCommand` and `InheritCommand` mutated the in-memory `_props` / `_user_props` before the
+  subprocess ran.
 
 **Tests:**
 - Three tiers: mocked unit/integration (default, no ZFS needed) and `real_zfs` (needs a pool,
@@ -80,7 +82,7 @@ When producing a plan:
 - Mock tests **cannot** prove pipe/deadlock fixes — those require `real_zfs` tests. Say so
   explicitly when a fix needs genuine pipe coverage.
 - Run: `pytest tests/test_types.py`, `pytest tests/test_commands.py`, `pytest tests/test_integration.py`;
-  add `-m real_zfs` for real-ZFS tests.
+  real-ZFS tests need a test pool and `ZFSB_REAL_ZFS=1 pytest -m real_zfs`.
 
 **Repo hygiene:**
 - Default branch is `master`; branch before committing.

@@ -15,10 +15,10 @@ domain knowledge; the cross-agent workflow lives here (and is summarized in
 |---|---|---|---|
 | `zfs-code-reviewer` | opus / high | read-only | Reviews the current diff (both packages); reports ranked findings, no edits |
 | `concurrency-reviewer` | opus / high | read-only | Depth review of fork-safety, SQLite/WAL, IPC and signal hazards only |
-| `libzfseasy-implementation-planner` | opus / high | read-only | Findings → ordered plan for `libzfseasy/` |
+| `libzfseasy-implementation-planner` | opus / high | read-only | Findings → ordered plan for `libs/libzfseasy/` |
 | `zfsbackup-implementation-planner` | opus / high | read-only | Findings → ordered plan for `zfsbackup/` (incl. `store/`, `cli/`) |
-| `libzfseasy-developer` | sonnet / high | edit | `libzfseasy/types.py`, `zfs.py` |
-| `zfsbackup-developer` | sonnet / high | edit | Daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py`; the shared TLS/identity module `identity.py` |
+| `libzfseasy-developer` | sonnet / high | edit | `libs/libzfseasy/libzfseasy/types.py`, `zfs.py`, `__init__.py` |
+| `zfsbackup-developer` | sonnet / high | edit | Daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py`; the shared TLS/identity module `identity.py`; the support and shared modules, `packaging/**` and `pyproject.toml` (see the ownership table) |
 | `zfsbackup-store-developer` | sonnet / high | edit | `zfsbackup/config/store/**` (incl. `migrations/`), `alembic.ini` — models, mapper, engine/session, migrations |
 | `zfsbackup-cli-developer` | sonnet / high | edit | `zfsbackup/cli/**` — the `zfsbackup-config` Click application |
 | `pytest-test-author` | sonnet / high | edit | Owns **all** pytest tests + `conftest.py` fixtures (both packages) |
@@ -34,11 +34,11 @@ into another's directory to save a handoff.
 
 | Path | Owner |
 |---|---|
-| `libzfseasy/**` | `libzfseasy-developer` |
-| `zfsbackup/{config,backup_manager,daemon,workers,remote,api}.py`, the supervisor support modules `zfsbackup/{daemonlock,stopflag,runtime_config,procident,sdnotify}.py`, the shared TLS/identity module `zfsbackup/identity.py` (also used by the CLI), the stdlib-only shared modules `zfsbackup/{protocol,version,logsetup,health,health_collect,daemon_entry}.py`, and `packaging/**`, `pyproject.toml`, `poetry.lock` | `zfsbackup-developer` |
+| `libs/libzfseasy/**` (incl. its `pyproject.toml` and README) | `libzfseasy-developer` |
+| `zfsbackup/__init__.py`, `zfsbackup/config/{__init__,model}.py`, `zfsbackup/{backup_manager,daemon,workers,remote,api}.py`, the supervisor support modules `zfsbackup/{daemonlock,stopflag,runtime_config,procident,sdnotify}.py`, the shared TLS/identity module `zfsbackup/identity.py` (also used by the CLI), the stdlib-only shared modules `zfsbackup/{protocol,version,logsetup,health,daemon_entry}.py`, the health collector `zfsbackup/health_collect.py`, the vendored `zfsbackup/_vendor/**`, and `packaging/**`, `debian/**`, `.github/workflows/deb.yml`, `pyproject.toml`, `poetry.lock` | `zfsbackup-developer` |
 | `zfsbackup/config/store/**` (incl. `store/migrations/`), `alembic.ini` | `zfsbackup-store-developer` |
 | `zfsbackup/cli/**` | `zfsbackup-cli-developer` |
-| `tests/**`, `conftest.py`, `.github/workflows/**` | `pytest-test-author` |
+| `tests/**`, `conftest.py`, `.github/workflows/**` except `deb.yml` | `pytest-test-author` |
 | `scenarios/**` | `real-zfs-scenario-dev` |
 
 **A plan item that spans two owners is split by the planner** into sequenced sub-items, one per
@@ -81,7 +81,8 @@ Two architectural boundaries the reviewers enforce:
 3. **Approve** — the plan is a *proposal*. See loop behavior for how approval works interactively vs.
    under `/loop`.
 4. **Implement** — the package's developer edits only its own files, keeping changes minimal and
-   idiomatic. `libzfseasy/` → `libzfseasy-developer`; `zfsbackup/` → `zfsbackup-developer`.
+   idiomatic. `libs/libzfseasy/` → `libzfseasy-developer`; `zfsbackup/` → `zfsbackup-developer`,
+   `zfsbackup-store-developer` or `zfsbackup-cli-developer`, by the ownership table above.
 5. **Test** — the developer notes coverage gaps; `pytest-test-author` writes/updates pytest tests and
    `real-zfs-scenario-dev` handles shell-based real-world coverage (pipe/deadlock/two-VM cases that
    mocked tests cannot prove).

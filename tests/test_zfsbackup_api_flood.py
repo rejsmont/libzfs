@@ -5,7 +5,7 @@ What is under test (all in `zfsbackup.api`, wired by `workers._api_server_class`
 
 * a per-peer token bucket and a per-peer cap on concurrent connections, checked on the ACCEPT
   thread before a thread or a TLS byte is spent (`PeerRateLimiter`, `peer_key`); a peer that
-  completed a handshake with a pinned certificate is "vouched" for an hour (no bucket, a higher
+  completed a handshake with a pinned certificate is "vouched" for 8 days (no bucket, a higher
   cap);
 * a per-peer `/enroll` failure lockout (429 + `Retry-After`) and a cap on `/enroll` requests in
   flight (503 busy) (`EnrollGuard`);

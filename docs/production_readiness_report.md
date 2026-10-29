@@ -1,19 +1,21 @@
 # zfsbackup — Production Readiness Report
 
-**Date:** 2026-07-07 (updated 2026-10-20: B1 resolved by the TLS/mTLS milestone)
+**Date:** 2026-07-07 (updated 2026-10-20: B1 resolved by the TLS/mTLS milestone; 2026-10-28: milestones A–D
+merged, 1.0.0rc1)
 **Scope:** `zfsbackup` (remote backup daemon) and `libzfseasy`, focused on the
 client↔server remote-backup feature.
 **Verdict:** **The security blocker (B1) is resolved; the remaining items below are residual risks and
 completeness gaps, not blockers.** The local snapshot + retention core is solid and anchor-aware; the
 remote-backup transport is now TLS 1.3 with pinned mutual authentication.
 
-> **Status 2026-10-22.** This report predates the production-readiness plan. Its open items are tracked there:
-> [production_readiness_plan.md](production_readiness_plan.md) (milestone A, the trust boundary, PR #5) and
-> [production_readiness_plan_bcd.md](production_readiness_plan_bcd.md) (B, snapshot and send correctness,
-> PR #6; C, install/operate/restore; D, hardening for 1.0). Resolved since: H5 (intermediate snapshots, B),
-> the raw-send caveat under H4 (B), M6's "no backup-succeeded signal" in part (`zfsbackup-config check`, C), and
+> **Status 2026-10-28 (1.0.0rc1).** This report predates the production-readiness plan, whose milestones are
+> all merged: [production_readiness_plan.md](production_readiness_plan.md) (milestone A, the trust boundary,
+> PR #5) and [production_readiness_plan_bcd.md](production_readiness_plan_bcd.md) (B, snapshot and send
+> correctness, PR #7; C, install/operate/restore, and D, hardening for 1.0, together in PR #10). Resolved since:
+> H3 (coverage), H5 (intermediate snapshots, B), the raw-send caveat under H4 (B), M6 (`zfsbackup-config check`,
+> C; worker status files, D), M7 (mitigated), mid-stream revocation and `/enroll` flood control (D), and
 > "werkzeug's development server" is now a pinned, contract-tested dependency (C) rather than an open risk.
-> The operator runbook is [zfsbackup/README.md](../zfsbackup/README.md).
+> The operator runbook, with the current list of known limitations, is [zfsbackup/README.md](../zfsbackup/README.md).
 
 The transfer *happy path* is verified working end-to-end over two real VMs — see
 [`two_vm_backup_report.md`](two_vm_backup_report.md). A green functional run is **not** a security or
@@ -49,21 +51,22 @@ open, the WebSocket handler piped arbitrary client bytes into `zfs receive -F` u
   at most 64 connections (16 without a client certificate), an absolute 30 s deadline for request
   headers, and a read-only token pre-check before `/enroll` reaches any `zfs` call.
 
-**Residual risks** (none blocks a deployment on a network you control; all are open):
+**Residual risks** (none blocks a deployment on a network you control; struck-through items are resolved):
 
-- **werkzeug's development server** serves the API (see Operations). No production WSGI server.
+- **werkzeug's server** serves the API (see Operations). No production WSGI server; kept deliberately.
 - ~~No mid-stream revocation~~ — resolved in milestone D (S-2): a revocation cuts running streams within about
   2 s, keeping the partial receive for a resume.
 - ~~No rate limiting on `/enroll`~~ — resolved in milestone D (S-3): per-address rate limits and connection caps,
   a slot reserve for clients with a pinned certificate, a 15-minute `/enroll` lockout after 5 failures. A flood
   from many addresses is bounded only by the connection caps; restrict the port to your clients by firewall.
-- **Client-driven server retention (M8)** is unchanged, but now only authenticated clients can drive it.
+- **Client-driven server retention (M8)** remains, but only authenticated clients can drive it, and a malicious
+  enrolled client is out of scope (plan decision Q1).
 - **A trusted peer can postpone a reload.** On a reload the API worker waits for in-flight receives and
   never cuts them (decision D5); the only per-stream bound is the 600 s websocket idle timeout, so a
   trusted client that sends a frame every ~10 minutes keeps the old configuration running on the server
   side. Deliberately not capped; before B1 this was open to any peer.
-- **`TestRealSendReceive`** (`tests/test_zfsbackup_real.py`, `real_zfs` tier) is skipped pending a rewrite
-  around an enrolled client.
+- ~~**`TestRealSendReceive`** (`tests/test_zfsbackup_real.py`, `real_zfs` tier) is skipped pending a rewrite
+  around an enrolled client~~ — resolved in milestone A: it runs end to end over real mTLS with an enrolled client.
 
 Path traversal via `client_id`/`dataset` is *mitigated* (the `Validate` name regex rejects `..` and shell
 metacharacters; the client-id grammar is `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`); a validation failure now
@@ -84,10 +87,10 @@ closing the identical latent gap before it could bite.
 
 ## High
 
-- **H3 — Coverage does not measure `zfsbackup`.** `pytest.ini` uses `--cov=libzfseasy`, and
-  the real end-to-end tests are `-m "not real_zfs"` by default, so the WebSocket `/stream`
-  receive path has no coverage in a normal run. Any quoted coverage number describes
-  `libzfseasy` only.
+- **H3 — Coverage does not measure `zfsbackup`.** *(Resolved: `pytest.ini` now has `--cov=libzfseasy` and
+  `--cov=zfsbackup`; the mocked suite drives the `/stream` route over real TLS. The `real_zfs` tier is still
+  excluded by default, and no coverage threshold is enforced.)* Originally `pytest.ini` used only
+  `--cov=libzfseasy`, so the WebSocket `/stream` receive path had no coverage in a normal run.
 - **H4 — Resume.** *(Resolved 2026-10-19 on branch `libzfseasy-fixes`.)* Before this, the server's
   `/resume_token` always returned 500 (libzfseasy refused the `receive_resume_token` property), so resume
   never ran, and nothing ever called `zfs receive -A`: one interrupted transfer could block a dataset until
@@ -109,13 +112,14 @@ closing the identical latent gap before it could bite.
   - **Remaining caveats:**
     - Client and server must be upgraded together. A new client treats an old server's `/resume_token`
       500 as uncertain and skips every cycle; an old client's `/stream` without `?mode=` is refused by a
-      new server.
+      new server. (Since milestone A every request carries `X-Zfsbackup-Protocol`, and a mismatch is
+      refused with 426.)
     - The "definitively stale" check matches zfs's English messages. `resume_info` runs with
       `LC_ALL=C` so localized hosts still match, but any token problem that isn't on the definitive list
       (an unfamiliar wording from another OpenZFS version, EIO) skips the cycle until the server operator
       runs `zfs receive -A`. That favours keeping partial progress over making progress.
     - Resume-token checks happen only on the client; the server relies on the authenticated client id
-      and the per-dataset lock.
+      and the per-dataset lock (and, since milestone D, checks every stream's `DRR_BEGIN` header).
     - *(Resolved in milestone B, S-6.)* Encrypted datasets are sent raw (`-w`) under the per-destination
       `raw: auto` default, so the server never holds the key; a raw/plain mismatch with an existing server
       copy is refused with the rename fix.
@@ -129,22 +133,28 @@ closing the identical latent gap before it could bite.
 
 ## Medium
 
-- **M6 — Silent backup failures.** `RemoteBackupWorker._process_dataset` ignores the
-  boolean return of `backup_dataset()` (`workers.py:171`). A server that is down produces a
-  single log line — no retry, backoff, alert, or "last backup succeeded" signal.
-- **M7 — No inter-worker coordination.** Snapshot, pruning, and remote workers are separate
-  processes with no locking. Retention shorter than remote frequency can prune a snapshot
-  before it is sent (mitigated by always keeping the newest + excluding anchors, but
-  unguarded and untested).
+- **M6 — Silent backup failures.** *(Resolved in milestones C and D.)* `RemoteBackupWorker._process_dataset`
+  ignored the boolean return of `backup_dataset()`, so a server that was down produced a single log line and no
+  "last backup succeeded" signal. Now every worker records its outcomes in `<db>.status/<worker>.json` (S-7), and
+  `zfsbackup-config check` grades them and the remote lag (consecutive failures WARN from 2, CRIT from 4;
+  Nagios and Prometheus output). Residual: nothing alerts by itself; run `check` from your monitoring or the
+  shipped `zfsbackup-check.timer`. A failed send is retried at the next cycle, with no backoff.
+- **M7 — No inter-worker coordination.** *(Mitigated, plan K-6.)* Snapshot, pruning, and remote workers are
+  separate processes with no locking between them. The remote worker pins the snapshots it is sending
+  (`inflight.<dest>`) before `zfs send`, the pruner always keeps the newest snapshot and every anchor and pin
+  and re-reads them right before every destroy, and a chain member pruned before it was sent is rebuilt
+  around. Residual: one failed cycle.
 - **M8 — Server retention is driven by client-supplied config.** `received_datasets()`
-  loads retention rules from a base64 property the client wrote (`backup_manager.py:168`),
-  and there is no server-side anchor protection, so a misconfigured/malicious client can
-  drive deletion of its own server-side history down to the newest snapshot.
+  loads retention rules from a base64 property the client wrote, so a misconfigured/malicious client can
+  drive deletion of its own server-side history down to the newest snapshot. A malicious enrolled client is
+  out of scope (plan decision Q1); the server retention floor (B-3) was not built, and negotiate only logs a
+  WARNING when a new config shortens the retention horizon (B-3-lite, milestone D).
   *(Update 2026-10-18: the pruner now protects every local or received `org.zfsbackup:anchor.*`
   snapshot. Conversely, because `zfs receive` does not strip user properties, a modified client could
   send a `-p` stream carrying `anchor.*` properties that pin snapshots on the server indefinitely — no
   new exposure, since `retention: forever` in the client-supplied config already does the same.
-  Since B1 was resolved only an authenticated (enrolled) client can do either.)*
+  Since B1 was resolved only an authenticated (enrolled) client can do either. Since milestone D (B-2a) the
+  server refuses compound streams, `send -p` among them.)*
 
 ---
 
@@ -165,8 +175,10 @@ closing the identical latent gap before it could bite.
   signals or restarts.
 - `--test-config` validates the config and builds the dataset list. It does not check that datasets
   exist or that destinations resolve.
-- Werkzeug's development server (`make_server`, with a per-connection TLS handshake on top) is used in
-  the `ApiWorker` — not a production WSGI server. Residual risk listed under B1.
+- Werkzeug's `ThreadedWSGIServer` (what `make_server(threaded=True)` builds, subclassed with a per-connection
+  TLS handshake, connection caps and flood control) is used in the `ApiWorker` — not a production WSGI server.
+  It is pinned to one minor release (`werkzeug >=3.1,<3.2`) and its overridden internals are covered by
+  contract tests; staying on it was decided on 2026-10-26. Residual risk listed under B1.
 
 **Good:** graceful `SIGINT`/`SIGTERM` shutdown via a shared `StopFlag` (was a `multiprocessing.Event`, which wedged the supervisor whenever a worker died mid-`wait()` — see plan item 8x); anchor-aware retention
 math is correct under the real_zfs tests; dataset-name validation blocks injection.
@@ -175,8 +187,8 @@ math is correct under the real_zfs tests; dataset-name validation blocks injecti
 
 ## Note on stale docs
 
-`CLAUDE.md`'s "SnapshotManager partially wired in / daemon loop in progress" is **stale** —
-the daemon loop, workers, and pruning are implemented and functioning. The security
+`CLAUDE.md`'s old "SnapshotManager partially wired in / daemon loop in progress" has since been
+corrected — the daemon loop, workers, and pruning are implemented and functioning. The security
 layer (TLS and mutual authentication, B1) was finished 2026-10-20; resume was finished 2026-10-19.
 
 ---
@@ -185,7 +197,7 @@ layer (TLS and mutual authentication, B1) was finished 2026-10-20; resume was fi
 
 1. ~~B2 (declare `requests`)~~ — done.
 2. ~~B1 (auth + TLS on the API; validate/authorize `client_id`)~~ — done; residuals under B1.
-3. H5 (`-i` → `-I`) — correctness/completeness. (H4, resume, is done.)
-4. M6 (surface backup failures) and M7/M8 (pruning safety) — reliability hardening.
-5. Ops: production WSGI, ~~`/enroll` rate limiting~~ (done, S-3), and the reload-time API bind check (the systemd unit and restart backoff are
-   done).
+3. ~~H5 (`-i` → `-I`)~~ — done as a chain of `-i` sends (milestone B). (H4, resume, is done.)
+4. ~~M6 (surface backup failures)~~ and ~~M7~~ — done/mitigated; M8 (server retention) is out of scope (Q1).
+5. Ops: production WSGI (not pursued: werkzeug kept, pinned and contract-tested), ~~`/enroll` rate limiting~~
+   (done, S-3), ~~the reload-time API bind check~~ (done; the systemd unit and restart backoff are done too).

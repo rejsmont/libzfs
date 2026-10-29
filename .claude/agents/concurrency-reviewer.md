@@ -18,10 +18,11 @@ interleaving is worth ten stylistic notes.
 
 `BackupDaemon` in `daemon.py` is a **multiprocessing supervisor**, not a single-process loop. It owns
 a shared `zfsbackup.stopflag.StopFlag` stop flag (**not** a `multiprocessing.Event` — see below),
-installs `SIGINT`/`SIGTERM` handlers, spawns 3–4 worker
+installs `SIGINT`/`SIGTERM`/`SIGHUP` handlers, spawns 3–4 worker
 processes, then polls and restarts any that die. The per-dataset work runs in `workers.py`;
-`BaseWorker.run` loads config, builds a `DatasetManager`, iterates datasets, and sleeps via
-`stop_event.wait(timeout=interval)`. `RemoteBackupWorker` drives real `zfs send`/`zfs receive`
+`BaseWorker.run` takes its config from the supervisor's `Handoff`, builds a `DatasetManager`, iterates
+datasets, and sleeps in short slices (`_wait`) that check for an exit reason (stop, supervisor gone,
+reload). `RemoteBackupWorker` drives real `zfs send`/`zfs receive`
 streams through `libzfseasy`'s `_exec_stream`/`_exec_stream_in`.
 
 ## Hazard 1 — fork safety (the one that corrupts data)
@@ -44,8 +45,8 @@ Check, concretely:
 
 ## Hazard 2 — SQLite/WAL correctness
 
-- Do the `connect` event-listener pragmas (`journal_mode=WAL`, `synchronous=NORMAL`,
-  `busy_timeout=5000`, `foreign_keys=ON`) fire on **every** connection, including pooled reuse and
+- Do the `connect` event-listener pragmas (`journal_mode=WAL`, `synchronous=FULL` for the writer and
+  `NORMAL` for readers, `busy_timeout=5000`, `foreign_keys=ON`) fire on **every** connection, including pooled reuse and
   the Alembic path? A `foreign_keys` pragma that misses a connection silently disables the composite
   FK that keeps retention scoping honest.
 - WAL requires a real file — is the in-memory URL path skipped correctly, and does `StaticPool` +

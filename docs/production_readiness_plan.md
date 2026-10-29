@@ -1,5 +1,13 @@
 # Production-readiness plan (libzfseasy + zfsbackup)
 
+> **Status 2026-10-28: implemented, historical.** Milestone A (the trust boundary) was merged as PR #5 (`b061209`,
+> 2026-10-22). The remaining items were re-planned in [production_readiness_plan_bcd.md](production_readiness_plan_bcd.md)
+> and merged as milestone B (PR #7) and milestones C and D (PR #10); the result was released as 1.0.0rc1. Not built:
+> the full server retention floor B-3 (only B-3-lite, a WARNING on negotiate; decision D2 of the B/C/D plan) and
+> the libzfseasy `-j` JSON path S4 (deferred past 1.0 after the M9 captures). The current description is
+> CLAUDE.md, [zfsbackup/README.md](../zfsbackup/README.md) and
+> [production_readiness_report.md](production_readiness_report.md).
+
 **Status:** proposal, nothing implemented. Drafted 2026-10-21 against `master` at `609df66`, after PR #4
 (milestone 3, TLS/mTLS) was merged. It covers both packages. Part 1 combines the two planners' output: the
 decisions you need to make, the blockers and the order of work. Parts 2 and 3 are the full per-package plans,

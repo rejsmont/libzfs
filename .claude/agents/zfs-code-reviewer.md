@@ -22,7 +22,7 @@ daemon is a multiprocessing supervisor, not a single-process loop.
   handling. Prefer a few high-confidence findings over speculation.
 - Reuse/simplification: duplicated logic that an existing helper already covers.
 
-**libzfseasy / ZFS-command correctness (`libzfseasy/zfs.py`, `types.py`):**
+**libzfseasy / ZFS-command correctness (`libs/libzfseasy/libzfseasy/zfs.py`, `types.py`):**
 - argv built as a **list** (never `shell=True`, never `subprocess.run`); binary is
   `_zfs_cmd()`/`_zpool_cmd()` (which re-read `ZFS_CMD`/`ZPOOL_CMD` at call time) as argv[0].
 - `-H` used for machine-readable `list`/`get`; correct exec helper chosen (`_exec_out` for line
