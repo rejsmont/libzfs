@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    deconfigure)
+        # python3-libzfseasy Breaks: zfsbackup (<< its own version), so dpkg
+        # deconfigures this (old) zfsbackup before it unpacks the new library,
+        # which would otherwise change libzfseasy/__init__.py under the running
+        # daemon: its version guard drains with exit 76 after 10 s, and after a
+        # longer gap systemd could start the old daemon on the new library. The
+        # generated stop below covers only "remove"; the one for "upgrade" is in
+        # the preinst of the NEW zfsbackup, which is too late when the library
+        # is unpacked first or alone. configure starts the units again (only the
+        # enabled ones), and abort-deconfigure does too.
+        if [ -z "$DPKG_ROOT" ] && [ -d /run/systemd/system ]; then
+            deb-systemd-invoke stop zfsbackup-check.service zfsbackup-check.timer zfsbackup.service >/dev/null || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

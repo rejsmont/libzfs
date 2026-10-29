@@ -284,8 +284,9 @@ class _SupervisorWatch:
       instruction -- a state `getppid()` can never report as "changed". Under
       `forkserver` the direct parent is the forkserver process, not the
       supervisor, so this comparison is meaningless there and is skipped. The
-      forkserver itself exits when the supervisor does (it watches a pipe the
-      supervisor holds), which reparents its children and trips the first rule;
+      forkserver exits once the supervisor and every worker have closed the
+      pipe it watches, so it outlives a dead supervisor while workers run;
+      the identity rule below is what catches that case;
     * `procident.identity(supervisor_pid, supervisor_start)` -- the
       supervisor's start token, recorded in the constructor -- is `'gone'`
       (no such process; covers the forkserver-before-reparent race) or

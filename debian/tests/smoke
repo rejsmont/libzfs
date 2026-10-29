@@ -1,0 +1,43 @@
+#!/bin/sh
+# The installed packages, from a scratch directory (nothing may import the source tree).
+set -eu
+
+export ZFS_CMD=/bin/false ZPOOL_CMD=/bin/false     # no real zfs is ever run
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cd "$tmp"
+
+zfsbackupd --version
+zfsbackup-config --version
+python3 -c 'import libzfseasy'
+
+# Both come from the installed packages, and the vendored flask-sock imports.
+python3 - <<'PY'
+import libzfseasy, zfsbackup, zfsbackup._vendor.flask_sock as fs
+for m in (libzfseasy, zfsbackup, fs):
+    assert m.__file__.startswith("/usr/lib/python3/dist-packages/"), m.__file__
+PY
+
+# No unit points into the pip install's virtualenv.
+if grep -v '^#' /usr/lib/systemd/system/zfsbackup.service \
+    /usr/lib/systemd/system/zfsbackup-check.service \
+    /usr/lib/systemd/system/zfsbackup-check.timer | grep /opt/; then
+    echo "a shipped unit refers to /opt/zfsbackup" >&2
+    exit 1
+fi
+
+# The check writes where Debian's prometheus-node-exporter reads textfiles.
+if ! grep -qx 'Environment=ZFSBACKUP_CHECK_OUTPUT=/var/lib/prometheus/node-exporter/zfsbackup.prom' \
+    /usr/lib/systemd/system/zfsbackup-check.service; then
+    echo "zfsbackup-check.service does not write to /var/lib/prometheus/node-exporter" >&2
+    exit 1
+fi
+
+# The database directory the way tmpfiles creates /var/lib/zfsbackup (setgid, group-writable).
+mkdir -m 2770 "$tmp/db"
+db=$tmp/db/config.db
+# The copy inside the package: minimal container images drop /usr/share/doc.
+example=/usr/lib/python3/dist-packages/zfsbackup/config.example.yaml
+zfsbackup-config -c "$db" import "$example"
+zfsbackup-config -c "$db" migrate --check
+zfsbackupd --test-config -c "$db"

@@ -1033,3 +1033,25 @@ def _child_survives_hup():
     os.kill(os.getpid(), signal.SIGHUP)
     time.sleep(0.2)
     os._exit(0)
+
+
+class TestInProcessRunsLeaveTheTestProcessForkserverAlone:
+    """conftest's autouse `_no_forkserver_stop_in_process_runs`: an in-process `run()` must
+    not stop (and zombify) pytest's own process-global forkserver, which another test may
+    still be using. Only `test_zfsbackup_forkserver_stop.py` exercises the real step."""
+
+    def test_stop_forkserver_is_a_noop_in_the_suite(self, daemon, monkeypatch):
+        import threading
+        from types import SimpleNamespace
+        from multiprocessing import forkserver
+
+        fake = SimpleNamespace(
+            _lock=threading.Lock(), _forkserver_pid=fake_pid(300),
+            _forkserver_alive_fd=None, _forkserver_address=None,
+        )
+        monkeypatch.setattr(forkserver, "_forkserver", fake)
+        monkeypatch.setattr(
+            multiprocessing, "get_start_method", lambda allow_none=False: "forkserver"
+        )
+        daemon._stop_forkserver()
+        assert fake._forkserver_pid == fake_pid(300)

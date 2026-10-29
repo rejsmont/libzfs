@@ -132,8 +132,8 @@ _FORKSERVER_LOST_EXITCODE = 255
 #:      four workers stuck in a long `zfs send` cost up to 30 + 4x10 = 70s
 #:      there, not 4x40 = 160s.
 #:
-#: So roughly 0.25 + 70 ~= 70s worst case, under systemd's default
-#: `TimeoutStopSec=90s`. On the healthy path -- workers parked in
+#: So roughly 0.25 + 70 ~= 70s worst case, under the unit's
+#: `TimeoutStopSec=90`. On the healthy path -- workers parked in
 #: `stop_event.wait()` -- the tail is one worker's `stopflag.STOP_POLL`
 #: slice, not this one; measured end-to-end shutdowns land at 0.265-0.554s.
 #:
@@ -151,7 +151,20 @@ _FORKSERVER_LOST_EXITCODE = 255
 #: (stop/RELOAD end its sync at the next dataset, and `_shutdown_workers`
 #: escalates past it). Nothing is forked after the flag is raised, so the term
 #: only delays the start of `_shutdown_workers`; size `TimeoutStopSec` with it.
+#:
+#: A fifth term, after the workers are gone: `_stop_forkserver` waits up to
+#: `FORKSERVER_STOP_TIMEOUT` (3s) for the multiprocessing forkserver, under the
+#: `forkserver` start method only. 70 + 3 + 0.25 ~= 73s still leaves 17s of the
+#: unit's `TimeoutStopSec=90` for the fourth term.
 SUPERVISOR_SLEEP_SLICE = 0.25
+
+#: Longest `_stop_forkserver` waits for the forkserver to exit once the
+#: supervisor has closed its end of the "alive" pipe. A healthy forkserver
+#: reads the EOF and exits within a few milliseconds; the bound only matters
+#: when another process still holds the pipe (an abandoned worker, a
+#: forkserver orphan), where waiting longer cannot help: systemd will kill
+#: it with the rest of the cgroup.
+FORKSERVER_STOP_TIMEOUT = 3.0
 
 #: How often the supervisor checks the config database for a committed write
 #: it was not signalled about (decision D2). Shared with the CLI's wording.
@@ -665,7 +678,8 @@ class BackupDaemon:
 
     **Version-skew guard (S-8).** The signature of the installed code
     (`version.code_signature()`: version, the identity of the dist-info
-    `RECORD`, the Python interpreter) is taken when the process starts, and
+    `RECORD` (else `__init__.py`) of both distributions, `zfsbackup` and
+    `libzfseasy`, and the Python interpreter) is taken when the process starts, and
     checked again right before the first fork. It is compared every
     `RELOAD_POLL_SECONDS` (and on a SIGHUP) -- before the reload tick, so a
     reload cannot respawn workers onto code the supervisor is not running --
@@ -1747,6 +1761,105 @@ class BackupDaemon:
         )
         self.abandoned_workers.append(name)
 
+    def _stop_forkserver(self) -> None:
+        """Stop the multiprocessing forkserver this process started, with a
+        bounded wait. Shutdown tail only, after `_shutdown_workers`.
+
+        Why: under Python 3.14 `forkserver` is the Linux default start
+        method. The forkserver exits only when it reads EOF on its "alive"
+        pipe, whose write end (`ForkServer._forkserver_alive_fd`) this
+        process holds and closes only by dying. CPython's resource tracker
+        has an exit hook that reaps it (`ResourceTracker.__del__`); the
+        forkserver has none. So the supervisor used to exit first and
+        systemd (`KillMode=mixed`) SIGKILLed the forkserver left in the
+        cgroup, on every stop, restart and exit 76 (measured on Ubuntu 26.04,
+        systemd 259), leaving
+        `systemd[1]: zfsbackup.service: Killing process N (python3) with
+        signal SIGKILL.` in the journal right after "Daemon stopped" -- a
+        line operators read as a failure.
+
+        This mirrors `ForkServer._stop_unlocked` (identical in 3.10-3.15
+        apart from 3.14's authkey) minus its unbounded `os.waitpid(pid, 0)`:
+        every forked worker is handed a copy of the write end (as its own
+        `_forkserver_alive_fd`, in `connect_to_new_process`), so the
+        forkserver sees EOF only once they are all gone. A
+        worker `_shutdown_workers` abandoned (D state) or a forkserver orphan
+        keeps it alive, and an unbounded wait would hang the stop until
+        systemd's SIGKILL. Here the wait ends at `FORKSERVER_STOP_TIMEOUT`
+        with one WARNING and the exit proceeds as before.
+
+        A no-op under `fork` and `spawn` (and never starts a forkserver to
+        stop it). A forkserver that is already dead (see `_lost`) is just
+        reaped. Reads private attributes, so, like `_current_forkserver`,
+        nothing in here may raise or block the exit."""
+        try:
+            if not self._tracks_orphans():
+                return
+            from multiprocessing import forkserver, util
+            fs = forkserver._forkserver
+            if not fs._lock.acquire(blocking=False):
+                logger.debug("forkserver lock is busy; not stopping the forkserver")
+                return
+            try:
+                pid = fs._forkserver_pid
+                if not isinstance(pid, int) or pid <= 1:
+                    return
+                alive_fd = fs._forkserver_alive_fd
+                address = fs._forkserver_address
+                # Forget it first, as `_stop_unlocked` does: whatever happens
+                # next, nothing in this process uses this forkserver again
+                # (a later `ensure_running` would start a fresh one).
+                fs._forkserver_alive_fd = None
+                fs._forkserver_pid = None
+                fs._forkserver_address = None
+                if hasattr(fs, '_forkserver_authkey'):  # 3.14+
+                    fs._forkserver_authkey = None
+            finally:
+                fs._lock.release()
+            if alive_fd is not None:
+                try:
+                    os.close(alive_fd)  # the forkserver's EOF
+                except OSError:
+                    pass
+            started = time.monotonic()
+            deadline = started + FORKSERVER_STOP_TIMEOUT
+            reaped = False
+            # Only a forkserver this call reaped had its socket unlinked: a
+            # pid that is not our child (ECHILD) can be a copy inherited
+            # through a raw `os.fork()` from a process whose forkserver is
+            # still serving -- its socket is not ours to remove.
+            ours = False
+            while True:
+                try:
+                    done, _ = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    reaped = True  # already reaped or never ours: gone
+                    break
+                if done:
+                    reaped = ours = True
+                    logger.debug(
+                        f"forkserver (pid={pid}) stopped in "
+                        f"{time.monotonic() - started:.3f}s"
+                    )
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            if not reaped:
+                logger.warning(
+                    f"forkserver (pid={pid}) did not exit within "
+                    f"{FORKSERVER_STOP_TIMEOUT:g}s: a worker that outlived the "
+                    "shutdown still holds its alive pipe, so systemd will "
+                    "kill it"
+                )
+            if ours and address and not util.is_abstract_socket_namespace(address):
+                try:
+                    os.unlink(address)
+                except OSError:
+                    pass
+        except Exception as e:
+            logger.debug(f"could not stop the forkserver: {e}")
+
     def _supervisor_sleep(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning as soon as the stop flag is set
         or a SIGHUP is pending (`_hup_requested`, one attribute read per
@@ -1826,8 +1939,8 @@ class BackupDaemon:
         else:
             logger.info(f"zfsbackup {self._code_signature}")
             logger.info(
-                "version-skew guard on: a reinstall of zfsbackup or a replaced "
-                "Python interpreter makes the daemon drain and exit "
+                "version-skew guard on: a reinstall of zfsbackup or libzfseasy, or a "
+                "replaced Python interpreter makes the daemon drain and exit "
                 f"{EXIT_CODE_VERSION_CHANGED} (a service manager restarts it). "
                 "An upgrade of another package (werkzeug, cryptography, ...) is "
                 "NOT detected: restart the daemon yourself (`systemctl restart "
@@ -1940,6 +2053,10 @@ class BackupDaemon:
             self._report_stop_signal()
             logger.info("Shutting down workers...")
             self._shutdown_workers()
+            # After the workers (they hold the forkserver's parent pipe) and
+            # still inside the `finally`, so an exception out of the poll
+            # loop gets it too. Bounded; never raises.
+            self._stop_forkserver()
         logger.info("Daemon stopped")
         # Only a drain that ran to its end: a SIGTERM/SIGINT at any point
         # (even one racing the last worker's exit) is an ordinary stop.

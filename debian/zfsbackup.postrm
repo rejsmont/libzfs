@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = purge ]; then
+	echo "zfsbackup: /var/lib/zfsbackup (configuration database, TLS keys, trust state, backups) was left in place;" >&2
+	echo "zfsbackup: remove it by hand if this host is retired, and 'groupdel zfsbackup' if you no longer need the group." >&2
+fi
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,59 @@
+# A distribution update of a runtime dependency (unattended-upgrades) happens
+# under a running daemon, and the version guard watches only zfsbackup and
+# libzfseasy. When any of these directories changes, the postinst restarts the
+# service if it is running (see "triggered" in debian/zfsbackup.postinst).
+# noawait: the package that changed is not held back waiting for us.
+#
+# The list is every pure-Python or compiled module outside the standard library
+# that the CLI, the daemon, its workers, the API and the remote client import,
+# measured by importing them all and listing sys.modules on Debian 13 and Ubuntu
+# 26.04, including the optional ones urllib3 and requests use when they are
+# installed (brotli or brotlicffi, zstandard, simplejson; Suggests: or merely
+# present on the host); python3-chardet and python3-charset-normalizer are both
+# here because requests uses one on each distribution. dpkg matches a path component-wise
+# (a directory covers what is under it; "name*" does not exist), so a module
+# that is a single file or carries the interpreter and architecture in its name
+# is listed by its exact path.
+#
+# NOT covered: shared libraries (libssl3 for ssl and cryptography, libffi,
+# libsqlite3, libyaml): no path of ours would fire for them. needrestart
+# (Recommends:) restarts a service whose mapped libraries were replaced.
+interest-noawait /usr/lib/python3/dist-packages/flask
+interest-noawait /usr/lib/python3/dist-packages/werkzeug
+interest-noawait /usr/lib/python3/dist-packages/jinja2
+interest-noawait /usr/lib/python3/dist-packages/itsdangerous
+interest-noawait /usr/lib/python3/dist-packages/blinker
+interest-noawait /usr/lib/python3/dist-packages/markupsafe
+interest-noawait /usr/lib/python3/dist-packages/simple_websocket
+interest-noawait /usr/lib/python3/dist-packages/wsproto
+interest-noawait /usr/lib/python3/dist-packages/h11
+interest-noawait /usr/lib/python3/dist-packages/websocket
+interest-noawait /usr/lib/python3/dist-packages/sqlalchemy
+interest-noawait /usr/lib/python3/dist-packages/alembic
+interest-noawait /usr/lib/python3/dist-packages/click
+interest-noawait /usr/lib/python3/dist-packages/requests
+interest-noawait /usr/lib/python3/dist-packages/urllib3
+interest-noawait /usr/lib/python3/dist-packages/cryptography
+interest-noawait /usr/lib/python3/dist-packages/yaml
+interest-noawait /usr/lib/python3/dist-packages/_yaml
+interest-noawait /usr/lib/python3/dist-packages/mako
+interest-noawait /usr/lib/python3/dist-packages/typing_extensions.py
+interest-noawait /usr/lib/python3/dist-packages/greenlet
+interest-noawait /usr/lib/python3/dist-packages/bcrypt
+interest-noawait /usr/lib/python3/dist-packages/idna
+interest-noawait /usr/lib/python3/dist-packages/certifi
+interest-noawait /usr/lib/python3/dist-packages/chardet
+interest-noawait /usr/lib/python3/dist-packages/charset_normalizer
+interest-noawait /usr/lib/python3/dist-packages/brotlicffi
+interest-noawait /usr/lib/python3/dist-packages/zstandard
+interest-noawait /usr/lib/python3/dist-packages/simplejson
+# Two packages ship modules whose file names carry the Python version and the
+# architecture: python3-cffi-backend (_cffi_backend, cryptography's backend) and
+# python3-brotli (_brotli, the one urllib3 uses when brotlicffi is absent). They
+# are watched through a version-free path the same package ships, which every
+# upgrade reinstalls: brotli.py, and python3-cffi-backend's doc directory (its
+# only other path; copyright is kept even where path-exclude drops
+# /usr/share/doc, as in Ubuntu's minimized images). Both checked to fire on
+# Debian 13 and Ubuntu 26.04.
+interest-noawait /usr/lib/python3/dist-packages/brotli.py
+interest-noawait /usr/share/doc/python3-cffi-backend
