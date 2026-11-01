@@ -223,6 +223,7 @@ build_dist() {
         src="$WORK/src-$(basename "$out")"; mkdir -p "$src"
         git -C "$TOP" archive "$ref" | tar -x -C "$src" || die "git archive of '$ref' failed"
     fi
+    BUILT_SRC="$src"     # the tree the wheels came from: the README checks read this one, never the working tree for a ref
     (cd "$src" && poetry build -o "$out") > "$out.log" 2>&1 || { sed 's/^/    poetry: /' "$out.log" >&2; die "poetry build of '$ref' failed"; }
     if [ -f "$src/libs/libzfseasy/pyproject.toml" ]; then
         (cd "$src/libs/libzfseasy" && poetry build -f wheel -o "$out") > "$out.lib.log" 2>&1 \
@@ -232,6 +233,7 @@ build_dist() {
 
 step "Building the current tree on the host (SRC_REF=$SRC_REF)"
 build_dist "$SRC_REF" "$WORK/new"
+NEW_SRC="$BUILT_SRC"
 NEW_WHL="$(ls "$WORK"/new/zfsbackup-*.whl 2>/dev/null | head -n1)"; NEW_SDIST="$(ls "$WORK"/new/zfsbackup-*.tar.gz 2>/dev/null | head -n1)"
 NEW_LIB_WHL="$(ls "$WORK"/new/libzfseasy-*.whl 2>/dev/null | head -n1)"      # empty for a tree from before the packaging split (one wheel)
 [ -n "$NEW_WHL" ] && [ -n "$NEW_SDIST" ] || die "poetry build did not produce zfsbackup-*.whl and .tar.gz (see $WORK/new.log)"
@@ -832,7 +834,7 @@ enroll_and_receive() {
         "$(vsh "md5sum /mnt/zbinst-restore/file1.bin 2>&1 | cut -d' ' -f1" | tr -d '[:space:]')"
     vsh "{ zfs destroy '$POOL/restore/data'; zfs destroy '$POOL/restore'; } >/dev/null 2>&1; true"
     # the README's restore/rename examples must spell the copy the way the server names it (pool name stripped)
-    if grep -q 'tank/backups/<client_id>/tank/' "$TOP/zfsbackup/README.md"; then
+    if grep -q 'tank/backups/<client_id>/tank/' "$NEW_SRC/zfsbackup/README.md"; then
         finding "README restore/rename examples spell the server copy \`tank/backups/<client_id>/tank/data\`; the server strips the client dataset's pool name (the copy of $POOL/data is \`$SDS\`)"
     else
         pass "the README's restore/rename examples spell the server copy as the server names it (\`tank/backups/<client_id>/data\`)"

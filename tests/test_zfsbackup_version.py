@@ -502,10 +502,11 @@ _DEBIAN_NAMES = {
     "simple-websocket": "python3-simple-websocket",
 }
 
-#: The version of the top `debian/changelog` entry (e.g. ``1.0.0~rc2-1``); the mutation tests edit it.
-CHANGELOG_VERSION = re.match(
-    r"\S+ \(([^)]+)\)", (REPO / "debian" / "changelog").read_text().splitlines()[0]
-).group(1)
+def changelog_version() -> str:
+    """The version of the top `debian/changelog` entry (e.g. ``1.0.0~rc2-1``); the mutation tests edit it. Read
+    on use, not at import: without `debian/` (an installed copy) only the tests behind `_needs_debian` need it."""
+    first = (REPO / "debian" / "changelog").read_text().splitlines()[0]
+    return re.match(r"\S+ \(([^)]+)\)", first).group(1)
 _DEB_UPSTREAM = re.compile(r"(?P<release>\d+(?:\.\d+)*)(?:~(?P<pre>(?:a|b|rc)\d+))?")
 _DEB_DEP = re.compile(r"(?P<name>[a-z0-9][a-z0-9+.-]*)\s*(?:\((?P<op>>=|<<|=|<=|>>)\s*(?P<ver>[^)\s]+)\s*\))?$")
 
@@ -701,17 +702,17 @@ class TestDebianMatchesPyprojects:
         assert debian_problems(debian_tree) == []
 
     def test_mutation_a_changelog_version_mismatch_is_reported(self, debian_tree):
-        _edit(debian_tree, "debian/changelog", f"({CHANGELOG_VERSION})", "(1.0.0~rc99-1)")
+        _edit(debian_tree, "debian/changelog", f"({changelog_version()})", "(1.0.0~rc99-1)")
         (problem,) = debian_problems(debian_tree)
         assert "debian/changelog" in problem and "1.0.0rc99" in problem
 
     def test_mutation_a_plain_release_against_a_prerelease_pyproject_is_reported(self, debian_tree):
-        _edit(debian_tree, "debian/changelog", f"({CHANGELOG_VERSION})", "(1.0.0-1)")
+        _edit(debian_tree, "debian/changelog", f"({changelog_version()})", "(1.0.0-1)")
         (problem,) = debian_problems(debian_tree)
         assert "debian/changelog" in problem
 
     def test_the_debian_revision_is_ignored(self, debian_tree):
-        _edit(debian_tree, "debian/changelog", f"({CHANGELOG_VERSION})", f"({CHANGELOG_VERSION[:-2]}-7)")
+        _edit(debian_tree, "debian/changelog", f"({changelog_version()})", f"({changelog_version()[:-2]}-7)")
         assert debian_problems(debian_tree) == []
 
     def test_mutation_a_missing_dependency_is_reported(self, debian_tree):
