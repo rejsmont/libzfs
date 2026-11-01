@@ -2366,6 +2366,60 @@ class TestExecCoreRealChildren:
             os.kill(proc.pid, 0)
         self._assert_no_session_orphan(proc.pid)
 
+    @staticmethod
+    def _second_interrupt_in_watchdog_cancel(monkeypatch):
+        """Make cancelling the slow-command watchdog end with a KeyboardInterrupt: a second Ctrl-C arriving while the
+        cleanup joins the watchdog's thread. Returns the list of cancel calls."""
+        import libzfseasy.zfs as zfs_module
+        real_cancel = zfs_module._SlowCommandWatchdog.cancel
+        calls = []
+
+        def cancel(self):
+            calls.append(self)
+            real_cancel(self)
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(zfs_module, 'slow_command_warning', 60)
+        monkeypatch.setattr(zfs_module._SlowCommandWatchdog, 'cancel', cancel)
+        return calls
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('entry', _ENTRIES)
+    def test_a_second_interrupt_while_the_watchdog_is_cancelled_still_reaps_the_child(
+            self, real_child, interrupt_on_start, monkeypatch, entry):
+        """The cleanup used to cancel the watchdog first, and cancelling joins its thread: a second interrupt during
+        that join skipped the SIGTERM and left the child running (seen once on a loaded macOS runner). The child is
+        now reaped before the watchdog is cancelled."""
+        calls = self._second_interrupt_in_watchdog_cancel(monkeypatch)
+        arm, _state = interrupt_on_start
+        arm()
+
+        with pytest.raises(KeyboardInterrupt):
+            _drive(entry, [sys.executable, '-c', 'import time\ntime.sleep(120)\n'])
+
+        assert len(calls) == 1
+        proc = real_child.procs[0]
+        assert proc.returncode == -signal.SIGTERM
+        self._assert_no_session_orphan(proc.pid)
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_exec_collect_kills_the_child_before_the_watchdog_is_cancelled(
+            self, real_child, interrupt_on_start, monkeypatch):
+        """The same order in `_exec_collect`, whose cleanup kills outright."""
+        calls = self._second_interrupt_in_watchdog_cancel(monkeypatch)
+        arm, _state = interrupt_on_start
+        arm()
+
+        with pytest.raises(KeyboardInterrupt):
+            Command._exec_collect([sys.executable, '-c', 'import time\ntime.sleep(120)\n'])
+
+        assert len(calls) == 1
+        proc = real_child.procs[0]
+        assert proc.returncode == -signal.SIGKILL
+        self._assert_no_session_orphan(proc.pid)
+
     @pytest.mark.unit
     @pytest.mark.subprocess
     @pytest.mark.parametrize('entry', _ENTRIES)
@@ -2383,6 +2437,10 @@ class TestExecCoreRealChildren:
 
         proc = real_child.procs[0]
         assert proc.returncode == -signal.SIGTERM
+        # The interrupt came before the reader's handle was returned, so the cleanup could not join it: it ends on
+        # its own at the reaped child's stderr EOF, a moment later on a loaded runner (seen on macOS).
+        for t in real_child.stderr_threads:
+            t.join(timeout=10)
         assert not any(t.is_alive() for t in real_child.stderr_threads)
         with pytest.raises(ProcessLookupError):
             os.kill(proc.pid, 0)

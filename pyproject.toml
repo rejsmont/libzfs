@@ -1,6 +1,6 @@
 [project]
 name = "zfsbackup"
-version = "1.0.0rc1"
+version = "1.0.0rc2"
 description = "Automated ZFS snapshots, retention and remote backup over mutual TLS"
 authors = [{name = "Radoslaw Kamil Ejsmont", email = "radoslaw@ejsmont.net"}]
 license = "MIT"
@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     # Released in lockstep with this distribution; the version guard (S-8)
     # watches both installs. Keep it equal to libs/libzfseasy's version.
-    "libzfseasy==1.0.0rc1",
+    "libzfseasy==1.0.0rc2",
     "pyyaml>=6.0,<7",
     "flask>=3.1.1,<4",
     # flask-sock 0.7.0 is vendored as zfsbackup/_vendor/flask_sock.py (in no

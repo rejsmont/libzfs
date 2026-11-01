@@ -791,41 +791,45 @@ class Command:
                 cls._join_stderr_reader(stderr_thread)
             completed = True
         finally:
-            if watchdog is not None:
-                watchdog.cancel()
-            if not completed and not settled and process is not None and timed:
-                # Any exit other than the deadline (a consumer that raised, close() or GC of the generator, an
-                # interrupt): the same bounded sequence as an expiry, ending in the registry if the child survives
-                # SIGKILL. The original exception propagates afterwards.
-                cls._reap_timed(process, stderr_thread, cmd)
-            elif not completed and not settled and process is not None:
-                abandoned = False
-                try:
-                    if process.poll() is None:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=_TERMINATE_TIMEOUT)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
+            # The child first, the watchdog after: cancelling joins the watchdog's thread, and a second interrupt
+            # arriving during that join must not skip the SIGTERM/SIGKILL below.
+            try:
+                if not completed and not settled and process is not None and timed:
+                    # Any exit other than the deadline (a consumer that raised, close() or GC of the generator, an
+                    # interrupt): the same bounded sequence as an expiry, ending in the registry if the child survives
+                    # SIGKILL. The original exception propagates afterwards.
+                    cls._reap_timed(process, stderr_thread, cmd)
+                elif not completed and not settled and process is not None:
+                    abandoned = False
+                    try:
+                        if process.poll() is None:
+                            process.terminate()
                             try:
                                 process.wait(timeout=_TERMINATE_TIMEOUT)
                             except subprocess.TimeoutExpired:
-                                # SIGKILL did not take effect: the child is in uninterruptible sleep (typically a hung
-                                # pool). Never block the caller on it; Popen reaps it later when it finally exits.
-                                abandoned = True
-                                logger.warning('%s (pid %s) did not exit after SIGKILL (uninterruptible, likely a '
-                                               'hung pool); abandoning it', _command_label(cmd), process.pid)
-                except BaseException:
-                    # A further interrupt arrived while waiting: do not leave a SIGTERM-ignoring child running.
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
-                    raise
-                if not abandoned:
-                    # (An abandoned child still holds stderr open, so the join could only time out.)
-                    cls._join_stderr_reader(stderr_thread)
-                    process.wait()
+                                process.kill()
+                                try:
+                                    process.wait(timeout=_TERMINATE_TIMEOUT)
+                                except subprocess.TimeoutExpired:
+                                    # SIGKILL did not take effect: the child is in uninterruptible sleep (typically
+                                    # a hung pool). Never block the caller on it; Popen reaps it later when it exits.
+                                    abandoned = True
+                                    logger.warning('%s (pid %s) did not exit after SIGKILL (uninterruptible, likely a '
+                                                   'hung pool); abandoning it', _command_label(cmd), process.pid)
+                    except BaseException:
+                        # A further interrupt arrived while waiting: do not leave a SIGTERM-ignoring child running.
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+                        raise
+                    if not abandoned:
+                        # (An abandoned child still holds stderr open, so the join could only time out.)
+                        cls._join_stderr_reader(stderr_thread)
+                        process.wait()
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
         if rc != 0:
             raise Exception(_failure_text(errors, rc))
 
@@ -1019,13 +1023,15 @@ class Command:
             cls._join_stderr_reader(stderr_thread)
             completed = True
         finally:
-            if watchdog is not None:
-                watchdog.cancel()
-            if not completed and process is not None:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
-                cls._join_stderr_reader(stderr_thread)
+            try:  # the child before the watchdog, as in `_exec_lines`
+                if not completed and process is not None:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    cls._join_stderr_reader(stderr_thread)
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
         return lines, list(errors), rc
 
     @staticmethod
