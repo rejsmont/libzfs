@@ -1035,7 +1035,11 @@ class TestRealGetRows:
         assert sorted({r.name for r in res}) == sorted(_raw_list_names(_scope_flags(**kwargs), targets))
         strict = zfs.get.rows([ZFS.from_name(t) for t in targets], properties=_ROWS_PROPS[props], strict=True,
                               **kwargs)
-        assert list(strict) == list(res)
+        if props == 'all':
+            # A second read of `all`: the space accounting (used, logicalused, …) may move in between
+            assert [(r.name, r.property, r.source) for r in strict] == [(r.name, r.property, r.source) for r in res]
+        else:
+            assert list(strict) == list(res)
 
     def test_rows_without_a_property_or_scope_argument_reads_the_pool_tree(self, rows_tree):
         res = zfs.get.rows(Filesystem(rows_tree['parent']), recursive=True)
