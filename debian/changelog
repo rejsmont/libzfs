@@ -1,3 +1,14 @@
+zfsbackup (1.0.0~rc3-1) unstable; urgency=medium
+
+  * Third release candidate of 1.0.0.
+  * Server copies now keep the client's pool name in their path
+    (<target>/<client_id>/<pool>/<dataset>), so datasets of the same name in
+    two pools of one client no longer collide.
+  * Fix a race between two concurrent `trust token create` runs on a host
+    without a server TLS identity.
+
+ -- Radoslaw Kamil Ejsmont <radoslaw@ejsmont.net>  Sun, 08 Nov 2026 12:00:00 +0000
+
 zfsbackup (1.0.0~rc2-1) unstable; urgency=medium
 
   * Second release candidate of 1.0.0, the first one packaged: for Debian 13

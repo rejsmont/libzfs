@@ -33,7 +33,7 @@ Two ways to install it; a host uses one of them, never both:
 
 ```bash
 # Debian: ZFS is in `contrib` (enable it in /etc/apt/sources.list.d/debian.sources first).
-sudo apt install ./python3-libzfseasy_<version>_all.deb ./zfsbackup_<version>_all.deb   # e.g. 1.0.0~rc2-1
+sudo apt install ./python3-libzfseasy_<version>_all.deb ./zfsbackup_<version>_all.deb   # e.g. 1.0.0~rc3-1
 ```
 
 This installs `zfsbackupd` and `zfsbackup-config` in `/usr/bin`, pulls in `zfsutils-linux` and the Python
