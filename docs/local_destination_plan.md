@@ -85,8 +85,10 @@ would implement.
 
 **1.3 `StreamHandle.terminate()` / `.pid`** — `libzfseasy-developer`;
 `libs/libzfseasy/libzfseasy/zfs.py`. *needs-approval;* route through `libzfseasy-implementation-planner`.
-- Additive: TERM, KILL after 5 s, abandon in D state as `_exec_lines` does; `close()` (:1163) stays the only
-  reaper. Lets the pump kill a stalled pair without touching `StreamHandle._process` (:1146).
+- Additive: TERM, KILL after 5 s, abandon in D state as `_exec_lines` does. Its bounded waits collect the
+  exit status; `close()` still closes the pipes and reports. Returns whether the child was abandoned; an
+  abandoned child is registered in `stuck_children()` and `close()` on it does not block. Lets the pump
+  kill a stalled pair without touching `StreamHandle._process` (:1146).
 
 ## Phase 2 — config shape (inert at runtime)
 
@@ -144,9 +146,30 @@ would implement.
   closes the receive (`-s` keeps partial state) and raises the send's error; both stderrs logged; both
   children reaped on every path.
 - Receive-side pre-checks run under `libzfseasy.timeout(≈60 s)` so a suspended target pool skips that
-  destination instead of wedging the worker; the stream itself is never timed, and a watchdog kills both
-  children after 600 s without progress (1.3). Stops only between steps. Dry run logs
+  destination instead of wedging the worker; the stream itself is never timed. The copy runs on the worker
+  thread with non-blocking fds and `select` in bounded slices — never a blocking `read()`/`write()` —
+  so the stall check (600 s without progress → `terminate()` both children, 1.3) happens between slices
+  and nothing depends on a blocked call being woken: a child that survives SIGKILL (D state on a hung
+  pool) keeps its pipe end open, so EOF/EPIPE never comes. After an abandon the pump closes without
+  waiting (`close()` on an abandoned handle) and the child is in `stuck_children()`. After EOF on the
+  send side the pump waits for `zfs receive` to commit with `StreamHandle.poll()` in bounded slices and
+  calls `terminate()` when the bound expires; it calls `close()` only once `poll()` is not None or after
+  `terminate()` (a plain `close()` is an unbounded `wait()`), and on every error path `terminate()`
+  precedes `close()`. It unregisters fds from its selector before `close()`, never closes
+  `handle.fileno()` itself, and closes both handles in `try`/`finally` (an abandoned `close()` raises).
+  While any child is stuck, every timed call in the worker process fails fast — including pre-checks for
+  other, healthy local targets — so the skip message must say so. Stops only between steps. Dry run logs
   `[DRY RUN] … -> local <target>`.
+- **Fail-open defaults in `chain.py` (from the Phase 1 review).** `_negotiate` must always fill
+  `_server_newer_status`, `server_copy` and `_server_newer`: a missing status reads as a pre-B-2b server
+  (`_settle_up_to_date` would overwrite an anchor naming a snapshot this host lacks), a missing
+  `server_copy` skips `_server_copy_matches`, an empty `_server_newer` permits nothing to discard but also
+  hides newer copies. The local stream step must also run `decide_receive` itself — there is no server
+  behind it as a second line of defence. `backup_dataset` passes `client_id` unchecked (the remote
+  `_ready_transport` enforced it), so the local `_ready_transport` must refuse a missing id. Set
+  `_logger`; give the remote-specific wording (`_retry_word`'s "server is busy", "abort it on the server",
+  "server copy", the README pointers, the `[server refusal]` key in `_record_step`) noun hooks rather than
+  copying `_rollback_permit`.
 - Wiring: the existing `RemoteBackupWorker` (:886) builds both managers lazily and dispatches on
   `dest.is_local` — same parents-first order (:952), interval (:926), status records and upgrade drain
   (:891); `check`/`status` unchanged. Local and remote sends run one after another.

@@ -497,17 +497,20 @@ class _DeadlineReached(Exception):
 class _StuckChild:
     """A child that a timed-out call could not get rid of (it survived SIGKILL). Kept in `_stuck` until it exits."""
 
-    def __init__(self, process, stderr_thread, label: str):
+    def __init__(self, process, stderr_thread, label: str, owns_stdout: bool = True):
         self.process = process
         self.stderr_thread = stderr_thread
         self.label = label
+        self.owns_stdout = owns_stdout
         self.since = time.monotonic()
 
     def release(self) -> None:
         """The child has exited: close what this thread may close. stdout was closed at registration (this thread was
-        its only reader); stderr only once its reader has ended, as closing a pipe a thread is blocked on risks fd
-        reuse."""
-        StreamHandle._close_pipe(getattr(self.process, 'stdout', None))
+        its only reader) unless the entry is an abandoned `StreamHandle`'s, whose stream pipes belong to the handle
+        (`StreamHandle.close()` closes them; a sweep must not close an fd another thread may be inside); stderr only
+        once its reader has ended, as closing a pipe a thread is blocked on risks fd reuse."""
+        if self.owns_stdout:
+            StreamHandle._close_pipe(getattr(self.process, 'stdout', None))
         thread = self.stderr_thread
         if thread is None or not thread.is_alive():
             StreamHandle._close_pipe(getattr(self.process, 'stderr', None))
@@ -520,9 +523,9 @@ _stuck = []
 _stuck_lock = threading.Lock()
 
 
-def _register_stuck(process, stderr_thread, label: str) -> None:
+def _register_stuck(process, stderr_thread, label: str, owns_stdout: bool = True) -> None:
     with _stuck_lock:
-        _stuck.append(_StuckChild(process, stderr_thread, label))
+        _stuck.append(_StuckChild(process, stderr_thread, label, owns_stdout))
 
 
 def _sweep_stuck() -> list:
@@ -800,29 +803,7 @@ class Command:
                     # SIGKILL. The original exception propagates afterwards.
                     cls._reap_timed(process, stderr_thread, cmd)
                 elif not completed and not settled and process is not None:
-                    abandoned = False
-                    try:
-                        if process.poll() is None:
-                            process.terminate()
-                            try:
-                                process.wait(timeout=_TERMINATE_TIMEOUT)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                                try:
-                                    process.wait(timeout=_TERMINATE_TIMEOUT)
-                                except subprocess.TimeoutExpired:
-                                    # SIGKILL did not take effect: the child is in uninterruptible sleep (typically
-                                    # a hung pool). Never block the caller on it; Popen reaps it later when it exits.
-                                    abandoned = True
-                                    logger.warning('%s (pid %s) did not exit after SIGKILL (uninterruptible, likely a '
-                                                   'hung pool); abandoning it', _command_label(cmd), process.pid)
-                    except BaseException:
-                        # A further interrupt arrived while waiting: do not leave a SIGTERM-ignoring child running.
-                        try:
-                            process.kill()
-                        except OSError:
-                            pass
-                        raise
+                    abandoned = cls._terminate_child(process, cmd)
                     if not abandoned:
                         # (An abandoned child still holds stderr open, so the join could only time out.)
                         cls._join_stderr_reader(stderr_thread)
@@ -1069,6 +1050,38 @@ class Command:
         return thread
 
     @staticmethod
+    def _terminate_child(process, cmd) -> bool:
+        """Stop a running child without ever blocking on it for long: SIGTERM, wait up to `_TERMINATE_TIMEOUT`;
+        SIGKILL, wait up to `_TERMINATE_TIMEOUT` again. Does nothing if the child has already exited. Returns True
+        if the child survived SIGKILL (uninterruptible sleep, typically a hung pool): it is then abandoned (one
+        WARNING; Popen reaps it later when it exits). It is reaped, if it exits, only by a `wait()`/`poll()`
+        of the caller. An interrupt arriving while waiting kills the child and propagates."""
+        abandoned = False
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=_TERMINATE_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=_TERMINATE_TIMEOUT)
+                    except subprocess.TimeoutExpired:
+                        # SIGKILL did not take effect: the child is in uninterruptible sleep (typically
+                        # a hung pool). Never block the caller on it; Popen reaps it later when it exits.
+                        abandoned = True
+                        logger.warning('%s (pid %s) did not exit after SIGKILL (uninterruptible, likely a '
+                                       'hung pool); abandoning it', _command_label(cmd), process.pid)
+        except BaseException:
+            # A further interrupt arrived while waiting: do not leave a SIGTERM-ignoring child running.
+            try:
+                process.kill()
+            except OSError:
+                pass
+            raise
+        return abandoned
+
+    @staticmethod
     def _join_stderr_reader(thread, bound=None):
         # Bounded (`_TERMINATE_TIMEOUT`, or `bound` if given): a stray grandchild holding the pipe open must not hang
         # the caller (the thread is a daemon).
@@ -1149,6 +1162,9 @@ class StreamHandle:
         self._errors = errors if errors is not None else []
         self._stderr_thread = stderr_thread
         self._closed = False
+        self._terminate_lock = threading.Lock()
+        self._terminate_done = False
+        self._abandoned = False
 
     def __enter__(self):
         return self._stream
@@ -1160,8 +1176,158 @@ class StreamHandle:
     def __getattr__(self, name):
         return getattr(self._stream, name)
 
+    @property
+    def pid(self):
+        """The child's process id (None if there is no process or it has none).
+
+        For logging and identification only. Never signal it yourself (`os.kill(handle.pid, ...)`): once the child has
+        been reaped the number may belong to another process. Use `terminate()`."""
+        return getattr(self._process, 'pid', None)
+
+    def terminate(self) -> bool:
+        """Stop the child process, e.g. when a transfer has stalled. Safe to call from another thread.
+
+        Sends SIGTERM; if the child has not exited after 5 s (`_TERMINATE_TIMEOUT`) sends SIGKILL and waits up to 5 s
+        more. Blocks for up to ~10 s. It only signals: it does not close or touch the stream, join the stderr reader
+        or report anything, so `close()` is still required (it alone closes the pipes, and raises the subprocess-error
+        Exception for the non-zero exit). A reader or writer blocked on the stream sees EOF / `BrokenPipeError` once
+        the child is gone. That is not guaranteed for a child that survives SIGKILL (below): such a child, in
+        uninterruptible sleep on a hung pool, keeps its pipe end open, so a blocked call is never woken and a caller
+        that needs to stay responsive must drive the stream non-blocking (`select`) and call this between slices.
+
+        Abandon contract. A child that survives SIGKILL is *abandoned*: one WARNING is logged, `terminate()` returns
+        True, and the child is registered like a timed-out command's (`stuck_children()` lists it, calls made under
+        `libzfseasy.timeout()` fail fast while it lives, and a sweep reaps it if it ever exits). From then on
+        `close()` never blocks on it (see `close()`). A `close()` that is already inside its wait for the child when
+        the abandon happens stays in that wait until the child exits.
+
+        Idempotent. A no-op (returns False) when there is no process or the child has already exited (including when
+        `close()` reaped it); concurrent calls are serialised and only the first escalates; a later call after an
+        abandon returns True again without signalling or logging. A call interrupted by a `BaseException`
+        (`KeyboardInterrupt`, ...) while waiting has SIGKILLed the child without waiting for it and propagates; it
+        leaves the handle retryable (a later call escalates again, or finds the child dead and returns False).
+
+        The signals go through `Popen`, which refuses to signal a child it knows to be reaped. The one window it
+        cannot close is a few instructions wide: another thread inside `close()`'s `wait()` having reaped the child
+        but not yet recorded it. A pidfd would close it, but only on Linux and with extra fd bookkeeping, so it is not
+        used.
+
+        Returns:
+            bool -- True if the child was abandoned (it survived SIGKILL and may still be running), False otherwise
+        """
+        process = self._process
+        if process is None:
+            return False
+        with self._terminate_lock:
+            if self._terminate_done:
+                return self._abandoned
+            self._terminate_done = True
+            try:
+                abandoned = Command._terminate_child(process, getattr(process, 'args', None))
+            except ProcessLookupError:
+                abandoned = False
+            except BaseException:
+                # Interrupted mid-escalation (the helper has SIGKILLed the child without waiting for it): stay
+                # retryable, so a later call escalates again, finds the child dead, or abandons and registers it.
+                self._terminate_done = False
+                raise
+            if abandoned:
+                self._abandoned = True
+                _register_stuck(process, self._stderr_thread, _command_label(getattr(process, 'args', None)),
+                                owns_stdout=False)
+            return self._abandoned
+
+    def poll(self) -> Optional[int]:
+        """Non-blocking, non-signalling check of the child: its return code, or None while it is running.
+
+        Also None when there is no process (unknown). A return code, even non-zero, only means the child has been
+        reaped: `close()` is still required, and it alone reports a failure (raises the subprocess-error Exception).
+
+        Bounded-close pattern. `close()` on a handle that was not abandoned ends in an unbounded `wait()`, so a
+        caller that must stay responsive (a receive that hangs in its final commit on a suspended pool) should, after
+        its last write: `close()` the stream side it owns only if it has to, then loop `poll()` with short sleeps while
+        its own stall bound runs; if the bound expires call `terminate()` (bounded, ~10 s); and only then, or once
+        `poll()` is not None, call `close()`. Do not call `poll()` from a thread while another is inside `close()`'s
+        `wait()` expecting an exact return code: both are safe, they just share the reaping.
+
+        Returns:
+            int | None -- the child's return code, or None if it is still running or there is no process
+        """
+        process = self._process
+        if process is None:
+            return None
+        return process.poll()
+
+    def _abandoned_and_running(self) -> bool:
+        """True if `terminate()` abandoned the child and it has not exited since (a non-blocking `poll()`)."""
+        if not self._abandoned:
+            return False
+        try:
+            return self._process.poll() is None
+        except Exception:
+            return True
+
+    def _close_abandoned(self):
+        """`close()` for a child that survived SIGKILL and is still running: release what can be released without
+        waiting for it, then raise. Never calls `wait()` and never flushes into the pipe (a child in uninterruptible
+        sleep never reads it, so a flush could block for ever)."""
+        process = self._process
+        stream = self._stream
+        stream_error = None
+        # Closed at the descriptor, bypassing the buffered writer's flush; the buffer's pending bytes are dropped.
+        # (The Buffered object closes quietly afterwards: its raw is already closed.)
+        if not getattr(stream, 'closed', False):
+            try:
+                getattr(stream, 'raw', stream).close()
+            except (OSError, ValueError) as e:
+                stream_error = e
+        stdout = getattr(process, 'stdout', None)
+        if stdout is not None and stdout is not stream:
+            self._close_pipe(stdout)
+        self._closed = True
+        # stderr stays open while its reader may still be inside it (the child holds the write end); the stuck-child
+        # registry closes it once the reader has ended.
+        reader = self._stderr_thread
+        Command._join_stderr_reader(reader, bound=_EXPIRY_JOIN)
+        stderr = getattr(process, 'stderr', None)
+        if stderr is not None and (reader is None or not reader.is_alive()):
+            self._close_pipe(stderr)
+        message = (f'{_command_label(getattr(process, "args", None))} (pid {getattr(process, "pid", "?")}) was '
+                   'abandoned in uninterruptible sleep (likely a hung pool) after SIGTERM and SIGKILL and is still '
+                   'running')
+        text = '\n'.join(self._errors)
+        if text:
+            message += '\n' + text
+        raise Exception(message) from stream_error
+
     def close(self):
+        """Close the stream, wait for the child, collect its stderr and raise the bare subprocess-error Exception if
+        it exited non-zero. Always call it, also after `terminate()`: it alone closes the pipes and reports. See the class
+        docstring for when it is safe to call.
+
+        If `terminate()` abandoned the child (it survived SIGKILL) and it is still running, nothing here waits for it:
+        the stream is closed at the descriptor without flushing (pending written bytes are dropped), the pipes the
+        handle owns are closed, the stderr reader gets a short bounded join, and the Exception raised says that the
+        child was abandoned in uninterruptible sleep (likely a hung pool) and is still running. The child stays in
+        `stuck_children()` until it exits. Like any close, this must not be called while another thread is inside a
+        read or write on the stream (closing an fd under a blocked call risks fd reuse). If the abandoned child has
+        exited by now, `close()` takes the normal path and reports its exit status.
+
+        Bounded close: `close()` on a child that has not been abandoned is an unbounded `wait()`. Call it only once
+        `poll()` is not None or after `terminate()` if you need it bounded (see `poll()`)."""
         if self._closed:
+            return
+        # A `terminate()` escalating in another thread holds the lock for up to ~10 s: wait for it (bounded, so a
+        # re-entrant call from a signal handler on the terminating thread cannot deadlock) so the abandon decision is
+        # not taken halfway through it. The lock is never held across the wait for the child below.
+        locked = self._terminate_lock.acquire(timeout=2 * _TERMINATE_TIMEOUT + 1)
+        try:
+            abandoned = self._abandoned_and_running()
+        finally:
+            if locked:
+                self._terminate_lock.release()
+        if abandoned:
+            self._close_abandoned()
             return
         # Closing a receive-side stream flushes buffered bytes; if zfs has already exited that raises
         # BrokenPipeError. Remember it, but still reap the process and collect its stderr: the real diagnostic is

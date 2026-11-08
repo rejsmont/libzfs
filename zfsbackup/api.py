@@ -78,6 +78,7 @@ from zfsbackup.identity import (
     verify_payload,
 )
 from zfsbackup.logsetup import PEER_LOGGER
+from zfsbackup import receiver
 from zfsbackup.protocol import (
     PROTOCOL_HEADER, PROTOCOL_REFUSAL_REASON, PROTOCOL_VERSION, SUPPORTED_PROTOCOLS,
     parse_protocol_header,
@@ -149,17 +150,17 @@ assert (
     < min(HTTP_TIMEOUT, RESUME_TOKEN_TIMEOUT)
 ), "ZFS_REQUEST_BUDGET must stay below the client's request timeouts"
 
-#: Substrings of `zfs receive -A`'s stderr that mean "nothing to abort": rc 1
-#: "'<ds>' does not have any resumable receive state to abort"; rc 2 "cannot
-#: open '<ds>': dataset does not exist". In this flow the server dataset
-#: always exists first (negotiate or `_receive_stream` creates it), so `-A`
-#: destroys only the saved `<ds>/%recv` state and rc 1 is the normal "already
-#: clean". rc 2 only arises for a dataset that a FULL receive created
-#: outside this flow (a legacy or manual one), which the abort itself
-#: destroys.
-_ABORT_ALREADY_CLEAN = (
-    'does not have any resumable receive state',
-    'dataset does not exist',
+#: The receive-side constants and name helpers live in `zfsbackup.receiver`
+#: (shared with the local destination); the names tests and callers know are
+#: re-exported here, and `_ABORT_ALREADY_CLEAN` / `_BadDatasetName` keep their
+#: old spelling.
+from zfsbackup.receiver import (  # noqa: E402
+    ABORT_ALREADY_CLEAN as _ABORT_ALREADY_CLEAN,
+    BadDatasetName as _BadDatasetName,
+    RECEIVE_PROPERTIES_FILESYSTEM,
+    RECEIVE_PROPERTIES_VOLUME,
+    SERVER_OWNED_PROPERTIES,
+    client_dataset_problem,
 )
 
 #: The endpoints that need no pinned client certificate (plan D7): the
@@ -173,63 +174,6 @@ UNAUTHENTICATED_ENDPOINTS = frozenset({'health', 'enroll'})
 #: `/enroll` is NOT exempt: an enrollment by a CLI that speaks another
 #: protocol would pin a client its daemon then cannot use.
 PROTOCOL_EXEMPT_ENDPOINTS = frozenset({'health'})
-
-#: The ZFS user properties the SERVER owns on a received dataset (plan B-1b):
-#: it writes them itself, as LOCAL values, from the authenticated binding
-#: (`client_id`), the URL (`source_dataset`) and the validated negotiate body
-#: (`config`, stored by negotiate). A `zfs send -p` stream carries the
-#: client's own copies, so the receive is given the server's values with
-#: `-o` (`_receive_stream_locked`), never `-x`. `-x` is NOT enough: verified
-#: on OpenZFS 2.1.5, 2.2.2 and 2.4.1, a full (`-F`) receive of a `-p` stream
-#: into an existing dataset replaces the local values with the stream's
-#: (source `received`) whatever `-x` says; `-x` only helps for an
-#: incremental or resumed receive. `-o` and `-x` of one name are mutually
-#: exclusive ("specified multiple times"), so `-o` alone is used. The values
-#: are LOCAL after a full, an incremental and a resumed receive, raw or plain
-#: (captured on the same versions).
-#: The dynamic `anchor.*`/`inflight.*` names cannot be listed; they can only
-#: pin snapshots on the server, never cause one to be destroyed.
-SERVER_OWNED_PROPERTIES = (PROP_CONFIG, PROP_CLIENT_ID, PROP_SOURCE_DATASET)
-
-#: Plan B-2a: what the server forces onto a received FILESYSTEM, as LOCAL
-#: values (`-o`, never `-x`): on OpenZFS 2.1.5, 2.2.2 and 2.4.1 (captures M8,
-#: `tests/fixtures/openzfs/*/M8.txt`) `-o <prop>=<safe value>` wins as a local
-#: value in every case captured (a missing dataset, an incremental, an existing
-#: placeholder, an existing dataset with preset locals, raw), whereas `-x` does
-#: NOT protect a full `-F` receive of a `-p` stream into an existing dataset
-#: (the stream's value becomes effective, source `received`). Together: never
-#: mounted (`canmount=noauto`, so `zfs mount -a` mounts nothing), never shared,
-#: no setuid/exec/devices, no mountpoint of the client's choosing, never
-#: written by anything but the receive (`readonly`), never a zvol device.
-#: Disjoint from `SERVER_OWNED_PROPERTIES` (also `-o`; one name twice is a zfs
-#: usage error).
-RECEIVE_PROPERTIES_FILESYSTEM = {
-    'canmount': 'noauto',
-    'readonly': 'on',
-    'volmode': 'none',
-    'mountpoint': 'none',
-    'sharenfs': 'off',
-    'sharesmb': 'off',
-    'setuid': 'off',
-    'exec': 'off',
-    'devices': 'off',
-}
-
-#: The same for a received VOLUME. A volume REFUSES `-o canmount`
-#: ("property 'canmount' does not apply to datasets of this type"; full,
-#: incremental and resume, plain and raw) and `-o mountpoint` and the other
-#: filesystem-only properties, so only these two are passed; `-x` of the
-#: filesystem-only names is accepted on a volume but prints one "does not
-#: apply" warning each, so it is not used either (and `-x` protects nothing,
-#: see above). A volume has no mount to neutralise; `volmode=none` keeps its
-#: device node (udev/LVM probing) off the server.
-RECEIVE_PROPERTIES_VOLUME = {
-    'readonly': 'on',
-    'volmode': 'none',
-}
-
-assert not set(RECEIVE_PROPERTIES_FILESYSTEM) & set(SERVER_OWNED_PROPERTIES)
-assert not set(RECEIVE_PROPERTIES_VOLUME) & set(SERVER_OWNED_PROPERTIES)
 
 #: The `dmu_replay_record` that opens every `zfs send` substream (OpenZFS
 #: `include/sys/zfs_ioctl.h`), 312 bytes: `drr_type` u32 (`DRR_BEGIN` = 0),
@@ -1007,10 +951,6 @@ CONFIG_TOO_LARGE_ERROR = 'config: too large to store as a ZFS property (the limi
 #: libzfseasy (`ValueError`, e.g. a control character zfs cannot frame).
 BAD_PROPERTY_ERROR = 'a value in this request cannot be stored as a ZFS property'
 
-#: Characters refused in a client dataset name before it reaches any `zfs`
-#: argument or property value (`zfs list -H` frames rows with them).
-_UNFRAMEABLE = frozenset('\n\r\t\0')
-
 #: 401: the connection presented no client certificate.
 CERT_REQUIRED_ERROR = {'error': 'client certificate required'}
 
@@ -1105,11 +1045,6 @@ class _StreamCut(Exception):
     """The running stream's session was cut by `SessionRegistry` (its pin was
     revoked, or a write to the client stalled); never leaves
     `create_app._receive_stream_locked`."""
-
-
-class _BadDatasetName(ValueError):
-    """The server dataset derived from a request is not a valid filesystem
-    name (`create_app._server_dataset`); answered with 400."""
 
 
 class StreamGate:
@@ -2253,25 +2188,6 @@ def retention_shrink(
     return None
 
 
-def client_dataset_problem(dataset) -> Optional[str]:
-    """Why the client dataset name in a `/backup/<id>/<dataset>/...` URL is
-    unusable, or `None`. It becomes `org.zfsbackup:source_dataset` verbatim,
-    so a character that `zfs list -H` uses as a row or column separator is
-    refused before any `zfs` call, and the whole name must be a valid
-    filesystem name on its own (the derived server name being valid does
-    not prove it: its pool component has stricter rules than one below
-    `<target>/<id>/`, e.g. `1tank`)."""
-    if not isinstance(dataset, str) or not dataset:
-        return "empty client dataset name"
-    if any(c in _UNFRAMEABLE for c in dataset):
-        return "client dataset name contains a control character"
-    try:
-        Filesystem(dataset)
-    except Exception:
-        return "invalid client dataset name"
-    return None
-
-
 _GUID_RE = re.compile(r'[0-9]{1,20}')
 
 
@@ -2854,40 +2770,15 @@ def create_app(
         return jsonify({'error': 'remote_backup disabled'}), 503
 
     def _server_dataset(client_id: str, client_dataset: str) -> str:
-        """Derive the server-side dataset path from the client's dataset
-        name: `<target>/<client_id>/<client dataset>`, pool included, so
-        datasets of the same name in two of the client's pools never meet.
-        `client_id` is always the BOUND id (`g.client_id`). Raises
-        `_BadDatasetName` (the routes answer 400) when the client dataset
-        name (`client_dataset_problem`) or the result is not a valid
-        filesystem name, so no `zfs` command ever sees it. The client name
-        is checked first: its refusal names a control character without
-        repeating it raw (`Filesystem`'s own message would)."""
-        problem = client_dataset_problem(client_dataset)
-        if problem is not None:
-            # `!r`: the name may hold the very control character refused.
-            raise _BadDatasetName(f"invalid dataset name {client_dataset!r}: {problem}")
-        name = f"{target}/{client_id}/{client_dataset}"
-        try:
-            Filesystem(name)
-        except Exception as e:
-            raise _BadDatasetName(f"invalid dataset name {name!r}: {e}") from None
-        return name
+        """`receiver.server_dataset` for this server's target: the server-side
+        dataset path of a client dataset. `client_id` is always the BOUND id
+        (`g.client_id`). Raises `_BadDatasetName` (the routes answer 400)."""
+        return receiver.server_dataset(target, client_id, client_dataset)
 
     def _server_copy_kind(server_fs, client_id: str) -> str:
-        """`'raw'` or `'plain'` for a server dataset that holds snapshots (the
-        caller answers `'none'` for one that does not): raw if it is encrypted
-        (`encryption != off`) and is its own encryption root, which is what a
-        raw receive of one dataset produces (`keystatus` is `unavailable`); a
-        plain receive into an encrypted target inherits the root of the TARGET
-        (or of its encrypted parent), and an unencrypted dataset has none.
-        (A root elsewhere under `<target>/<id>/` only comes from a `-R` tree,
-        which the client never sends; counting it would call a plain child of
-        a raw parent raw.) Raises if zfs fails."""
-        encryption = _zfs(zfs.get.value, server_fs, 'encryption')
-        if encryption in (None, 'off'):
-            return 'plain'
-        return 'raw' if _zfs(zfs.get.value, server_fs, 'encryptionroot') == server_fs.name else 'plain'
+        """`'raw'` or `'plain'` for a server dataset that holds snapshots
+        (`receiver.server_copy_kind`, under the request's budget)."""
+        return receiver.server_copy_kind(_zfs, server_fs, lib=zfs)
 
     def _receive_error(e: Exception, server_dataset: str) -> str:
         """The error text sent to the client for a failed receive: zfs's own
@@ -2911,21 +2802,10 @@ def create_app(
         return text
 
     def _resume_token(server_dataset: str) -> Optional[str]:
-        """The `receive_resume_token` of the server dataset -- a filesystem
-        or a volume, found by name alone -- or `None` (no dataset, or no
-        token). Raises on any other failure (`ZFSTimeoutError` included):
-        callers must not guess."""
-        ds = Dataset(server_dataset)
-        if not _zfs(zfs.exists, ds):
-            return None
-        results = _zfs(zfs.list, roots=ds, properties=['receive_resume_token'])
-        if not results:
-            return None
-        prop = results[0]['receive_resume_token']
-        if prop is None:
-            return None
-        val = str(prop)
-        return val if val != 'none' else None
+        """`receiver.resume_token` under the request's budget: the
+        `receive_resume_token` of the server dataset, or `None`. Raises on any
+        other failure (`ZFSTimeoutError` included): callers must not guess."""
+        return receiver.resume_token(_zfs, server_dataset, lib=zfs)
 
     #: `(server dataset, reason)` pairs whose stream refusal (`refuse_stream`)
     #: was already announced at WARNING; forgotten when a stream of the
@@ -2937,19 +2817,15 @@ def create_app(
     #: operator acts.
     _unowned_noted: set = set()
 
-    def _owner_problem(
-        server_dataset: str, local_id: Optional[str], client_id: str
+    def _note_owner(
+        server_dataset: str, client_id: str, verdict: 'receiver.OwnerVerdict'
     ) -> Optional[str]:
-        """The 409 text for an EXISTING server dataset whose LOCAL
-        `org.zfsbackup:client_id` is `local_id` (`None`: not set locally), or
-        `None` when it is this client's. A dataset with no local id was not
-        made by a negotiate or a receive of this server (an operator's own
-        `<target>/<id>`, a dataset moved in, a received-only copy of the
-        property): it is never adopted silently (plan B-2c, because the full
-        `-F` receive would overwrite it and the pruner would take over its
-        snapshots); the message names the one command that adopts it on
-        purpose."""
-        if local_id is None:
+        """Apply the log-once memory to an ownership `verdict` and return its
+        message (the routes answer 409) or `None`. A dataset with no local
+        `org.zfsbackup:client_id` is announced at WARNING once, naming the one
+        command that adopts it on purpose; one that turns out to be this
+        client's is forgotten."""
+        if verdict.unowned:
             if server_dataset not in _unowned_noted:
                 if len(_unowned_noted) > 1024:
                     _unowned_noted.clear()
@@ -2960,69 +2836,34 @@ def create_app(
                     server_dataset, PROP_CLIENT_ID, PROP_CLIENT_ID, client_id,
                     shlex.quote(server_dataset),
                 )
-            return (
-                f"server dataset {server_dataset} already exists on the server and is not "
-                f"recorded as a backup ({PROP_CLIENT_ID} is not set on it); refusing to "
-                "adopt it. If it is meant to hold this client's backups, the server "
-                f"operator can adopt it on purpose: zfs set {PROP_CLIENT_ID}={client_id} "
-                f"{shlex.quote(server_dataset)}"
-            )
-        if local_id != client_id:
-            # The other id is not named: it is not this client's business.
-            return (
-                f"server dataset {server_dataset} is recorded as another "
-                f"client's ({PROP_CLIENT_ID} differs from your bound client id "
-                f"{client_id!r}); refusing to use it. The server operator must "
-                "resolve this"
-            )
-        _unowned_noted.discard(server_dataset)
-        return None
+        elif verdict.confirmed:
+            _unowned_noted.discard(server_dataset)
+        return verdict.message
+
+    def _owner_problem(
+        server_dataset: str, local_id: Optional[str], client_id: str
+    ) -> Optional[str]:
+        """The 409 text for an EXISTING server dataset whose LOCAL
+        `org.zfsbackup:client_id` is `local_id` (`None`: not set locally), or
+        `None` when it is this client's (`receiver.owner_verdict`, plus the
+        log-once memory)."""
+        return _note_owner(
+            server_dataset, client_id, receiver.owner_verdict(server_dataset, local_id, client_id)
+        )
 
     def _ownership_conflict(
         server_dataset: str, dataset: str, client_id: str
     ) -> Optional[str]:
         """An error message (the routes answer 409) when `server_dataset`
-        exists and is not this client dataset's, else `None`:
-
-        - it records a different client id (`org.zfsbackup:client_id`) than
-          the bound `client_id` -- the server namespace is the binding's, and
-          a dataset stamped for another id (an operator rename, a changed
-          host id) is never written through;
-        - it has NO local client id (plan B-2c): an existing dataset nothing
-          here made is not adopted (`_owner_problem`). Every dataset a
-          negotiate or a receive creates carries a local id from the start
-          (`zfs create -o`, `zfs receive -o`, also while a first receive is
-          only partial), so this only meets datasets that came from
-          elsewhere;
-        - it records a different client dataset as its source. Two client
-          names never derive the same server name (`_server_dataset` keeps
-          the pool), so this meets a copy an operator renamed into place, or
-          one made under another layout, which a send would otherwise
-          silently share (and overwrite).
-
-        A dataset without a source-dataset property (a container negotiate
-        made, never negotiated itself) is not a conflict for that property.
-        Raises if the dataset's properties cannot be read
+        exists and is not this client dataset's, else `None`
+        (`receiver.ownership_conflict` under the request's budget, plus the
+        log-once memory). Raises if the dataset's properties cannot be read
         (`ZFSTimeoutError` included)."""
-        ds = Dataset(server_dataset)
-        if not _zfs(zfs.exists, ds):
-            return None
-        props = _zfs(read_zfsbackup_properties, ds)
-        recorded_id = props.get(PROP_CLIENT_ID)
-        if recorded_id and recorded_id != client_id:
-            return _owner_problem(server_dataset, recorded_id, client_id)
-        problem = _owner_problem(
-            server_dataset, _zfs(zfs.get.value, ds, PROP_CLIENT_ID, sources='local'), client_id
+        verdict = receiver.ownership_conflict(
+            _zfs, server_dataset, dataset, client_id,
+            read_properties=read_zfsbackup_properties, lib=zfs,
         )
-        if problem is not None:
-            return problem
-        recorded = props.get(PROP_SOURCE_DATASET)
-        if recorded and recorded != dataset:
-            return (
-                f"server dataset {server_dataset} already holds backups of "
-                f"{recorded!r}; refusing to mix in {dataset!r}"
-            )
-        return None
+        return _note_owner(server_dataset, client_id, verdict)
 
     # ---------------------------------------------------------------- auth
 
@@ -3826,14 +3667,11 @@ def create_app(
             ds = Dataset(ancestor)
             if _zfs(zfs.exists, ds):
                 conflict = _owner_problem(
-                    ancestor, _zfs(zfs.get.value, ds, PROP_CLIENT_ID, sources='local'), client_id
+                    ancestor, receiver.local_client_id(_zfs, ds, lib=zfs), client_id
                 )
                 if conflict is not None:
                     return None, missing, conflict
-                if (
-                    _zfs(zfs.get.value, ds, 'receive_resume_token') is not None
-                    and not _zfs(zfs.list, roots=ds, types='snapshot', properties=['creation'])
-                ):
+                if receiver.ancestor_holds_partial_receive(_zfs, ds, lib=zfs):
                     return (ancestor, 'partial'), missing, None
             else:
                 missing.append(ancestor)
@@ -4035,16 +3873,9 @@ def create_app(
                             # Filesystems only (no size, no positional argument:
                             # `zfs.create` never dispatches to `create -V`; see the
                             # note at the receive about volumes).
-                            for ancestor in reversed(missing_ancestors):
-                                _zfs(
-                                    zfs.create,
-                                    Filesystem(ancestor),
-                                    properties={
-                                        'canmount': 'noauto',
-                                        PROP_CLIENT_ID: client_id,
-                                    },
-                                    mount=False,
-                                )
+                            receiver.create_ancestors(
+                                _zfs, missing_ancestors, client_id, lib=zfs
+                            )
                         except BaseException:
                             _unclaim_pending(server_dataset, ds_config_canonical, dataset)
                             raise
@@ -4641,7 +4472,7 @@ def create_app(
                     "is sending a fresh stream", server_dataset,
                 )
                 try:
-                    _zfs(zfs.receive.abort, Dataset(server_dataset))
+                    receiver.abort_partial_receive(_zfs, server_dataset, lib=zfs)
                 except ZFSTimeoutError as e:
                     # The outcome of the abort is unknown: the saved state may
                     # or may not be gone (and a new dataset's first partial
@@ -4651,20 +4482,20 @@ def create_app(
                     zfs_timed_out(e, unknown_outcome=True)
                     return
                 except Exception as e:
-                    # Idempotent: already clean is fine, anything else refuses.
-                    if not any(m in str(e).lower() for m in _ABORT_ALREADY_CLEAN):
-                        logger.error(
-                            "cannot discard the partial receive state of %s: %s",
-                            server_dataset, e,
+                    # Idempotent (`abort_partial_receive`): already clean is
+                    # not raised, anything else refuses.
+                    logger.error(
+                        "cannot discard the partial receive state of %s: %s",
+                        server_dataset, e,
+                    )
+                    release_claim()
+                    ws.send(json.dumps({
+                        'error': (
+                            f'Failed to discard the partial receive state of '
+                            f'{server_dataset}: {e}'
                         )
-                        release_claim()
-                        ws.send(json.dumps({
-                            'error': (
-                                f'Failed to discard the partial receive state of '
-                                f'{server_dataset}: {e}'
-                            )
-                        }))
-                        return
+                    }))
+                    return
 
         # zfs.receive.filesystem() returns a StreamHandle wrapping the `zfs
         # receive` process's stdin. A startup failure raises here; it never
@@ -4708,13 +4539,10 @@ def create_app(
         # oopses on `zfs create -V ... -o readonly=...`. Volumes only arrive
         # through the receive, which is fine. The only `zfs create` here is the
         # container filesystems negotiate makes.
-        receive_props = (
-            RECEIVE_PROPERTIES_VOLUME if header.kind == 'volume' else RECEIVE_PROPERTIES_FILESYSTEM
-        )
         try:
             # Asked before the receive is built, under the budget: a timeout
             # here spawns nothing. The receive itself gets no timeout.
-            force = decision.force and _zfs(zfs.exists, server_fs)
+            force = receiver.may_force(_zfs, server_fs, decision.force, lib=zfs)
         except ZFSTimeoutError as e:
             zfs_timed_out(e)
             return
@@ -4729,11 +4557,7 @@ def create_app(
             return
         _zfs_recovered('stream', server_dataset)
         try:
-            writer = zfs.receive.filesystem(
-                server_fs, props={**owned, **receive_props},
-                force=force, holds=False,
-                save=True, mount=False,
-            )
+            writer = receiver.start_receive(server_fs, owned, header.kind, force, lib=zfs)
         except Exception as e:
             release_claim()
             ws.send(json.dumps({'error': f'Failed to start zfs receive: {e}'}))
