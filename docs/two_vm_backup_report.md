@@ -184,8 +184,8 @@ original 2026-07 findings:
   is HTTPS only (TLS 1.3), every endpoint except `/health` and `/enroll` needs a pinned client certificate, the
   client id is bound to the verified fingerprint (a mismatch is 403), `/backup/register` is gone, admission is by
   one-time token, and revocation and rotation are covered by scenario K. See
-  [`production_readiness_report.md`](production_readiness_report.md) for the residuals (werkzeug's development
-  server, no rate limiting on `/enroll`, no revocation of a stream already running).
+  [`production_readiness_report.md`](production_readiness_report.md) for the residuals (werkzeug's server, kept
+  and pinned; mid-stream revocation and `/enroll` flood control were resolved in milestone D).
 - ~~**Blocker — `requests` imported but undeclared**~~ **Resolved:** `requests` (and `cryptography`) are declared
   in `pyproject.toml`; the harness still installs them explicitly because the guests run from a source tree.
 - **High — resume is dead code**: client sends `?from=<snap>`; server never reads it

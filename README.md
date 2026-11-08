@@ -74,6 +74,6 @@ install).
 - [zfsbackup/README.md](zfsbackup/README.md): the zfsbackup runbook
 - [CHANGELOG.md](CHANGELOG.md): release notes
 - [tests/README.md](tests/README.md) and [scenarios/README.md](scenarios/README.md): testing
-- [docs/](docs/): design plans (config store and CLI, TLS), the production-readiness plan and report, the release
-  checklist and the two-VM test report
+- [docs/](docs/): design plans (config store and CLI, TLS, packaging), the production-readiness plan and report, the
+  release checklist and the two-VM test report
 - [CLAUDE.md](CLAUDE.md): architecture notes for contributors

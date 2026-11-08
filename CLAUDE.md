@@ -192,8 +192,8 @@ rollback ERROR. The client's `_rollback_permit`
 sends `discard` only for the backstop case: its LOCAL anchor (`get_local_anchor`, never inherited) is the
 common snapshot or a live managed snapshot past it by `createtxg` (the server may have pruned the base) and the server holds exactly one newer managed snapshot this host does not have. Anything else
 (a rollback, an in-place restore; no common snapshot with a non-empty `server_copy`) is one ERROR and nothing
-sent, checked before `_settle_up_to_date` so a rollback is never laundered into a backstop. Two client
-datasets mapping to one server dataset are refused (409), including against a live pending entry or an unowned
+sent, checked before `_settle_up_to_date` so a rollback is never laundered into a backstop. A server
+dataset recorded (`source_dataset`) or live-pending for another client dataset is refused (409), and so is an unowned
 placeholder; a child whose ancestor is claimed, pending, or a new partial receive gets 503 retry; configs over
 8 KiB are refused (400). The server releases a stream's claim before any reply, so chain steps run back to back. A connection failure
 before any stream byte on a step after a successful one in the same cycle (typically the server's API worker
@@ -216,7 +216,7 @@ so the server's `-o` locals are the only values: never `zfs inherit` them. `/con
 (`read_stream_header`/`parse_stream_header`) before it lists snapshots, decides `-F`, aborts or spawns anything:
 a compound stream (`send -p`/`-R`/`-I`) is refused, the declared base must match `drr_fromguid`
 (`stream_base_problem`; a base named without a guid must match the server's guid for that name), and the object
-type picks the forced `-o` set (`RECEIVE_PROPERTIES_FILESYSTEM`: canmount=noauto, readonly, mountpoint=none,
+type picks the forced `-o` set (`RECEIVE_PROPERTIES_FILESYSTEM`: canmount=noauto, readonly, volmode=none, mountpoint=none,
 share*/setuid/exec/devices off; `RECEIVE_PROPERTIES_VOLUME`: readonly, volmode=none only — a volume refuses
 `-o canmount`); `-h`, never `-x`. The header bytes are fed to `zfs receive` unchanged. Refusals carry a `reason`
 (no `retry`) and log one WARNING per (dataset, reason) until a stream succeeds. A dataset on the backup path without

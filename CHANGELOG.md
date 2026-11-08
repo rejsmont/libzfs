@@ -12,7 +12,10 @@ Third release candidate: one change to the server's dataset layout and one fix.
 - **Send flags and `raw` semantics** unchanged.
 - **The server dataset layout changed** (below). A server upgraded from rc1/rc2 does not continue the copies it
   already holds: each client dataset is sent in full again to its new path, and the old copies stay where they
-  are (still pruned by their own retention, newest snapshot always kept) until you destroy them.
+  are (still pruned by their own retention, newest snapshot always kept) until you destroy them. **Before the
+  upgrade, rename a client's old pool-root copy (`<target>/<client_id>` itself, when it holds one) out of the
+  target tree**: if it is encrypted (raw), the server cannot create the new `<target>/<client_id>/<pool>` level
+  under it and no dataset of that client is backed up until it is moved (`zfsbackup/README.md`, "Layout").
 
 ### Changes
 

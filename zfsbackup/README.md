@@ -852,7 +852,8 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
   `volmode=none`, `mountpoint=none`, `sharenfs=off`, `sharesmb=off`, `setuid=off`, `exec=off` and
   `devices=off` on a filesystem, and `readonly=on`, `volmode=none` on a volume, and takes no holds (`-h`). A
   received dataset is never mounted, shared or exposed as a device, whatever the client's properties say;
-  the containers the server creates for a client (`<target>/<client_id>` and parents) are `canmount=noauto`.
+  the containers the server creates for a client (`<target>/<client_id>`, `<target>/<client_id>/<pool>` and any
+  missing parents of a client dataset) are `canmount=noauto`.
   Read data through a clone outside the tree ([Getting files back](#getting-files-back-file-level)).
 - **Only plain streams are received.** The server reads each stream's header before `zfs receive` runs and
   refuses property or replication streams (`zfs send -p`, `-R`, `-I`), a stream whose base is not the one the
@@ -872,6 +873,13 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
   client never chooses one. A client's pool root `tank` is `<target>/<client_id>/tank`. Moving a dataset to
   another pool (or renaming it) gives it a new server path: the next backup is a full send, and the old
   server copy stays where it is until you remove it.
+  **A server upgraded from 1.0.0rc1/rc2** (which stored `tank/data` as `<target>/<client_id>/data` and a pool
+  root at `<target>/<client_id>` itself) sends every client dataset in full again to the new path; the old
+  copies stay, and count toward a quota on `<target>/<client_id>`, until you destroy them. If it holds a
+  client's pool-root copy at `<target>/<client_id>`, rename that copy out of the target tree (below) before the
+  upgraded server receives from that client: an encrypted (raw) one would block every new copy of the client,
+  since the server cannot create `<target>/<client_id>/<pool>` under a dataset whose key it lacks, and a plain
+  one would carry the new copies with it when renamed later.
 - **Retention is the client's, run by the server.** The server prunes each received dataset with the
   retention rules that the client sent (`org.zfsbackup:config`), using the **server's** `snapshot_prefix`. A
   client with another prefix is never pruned on the server (it keeps everything), so use the same prefix.
@@ -1045,7 +1053,7 @@ the client**: the server has none, so a lost key means a lost raw backup.
 
 > **The server never rolls its history back for a client.** An incremental receive with `zfs receive -F` would
 > roll the server copy back to the stream's base and destroy every server snapshot newer than it (OpenZFS 2.1,
-> 2.2 and 2.4 alike). So the server passes `-F` only when the base is its newest snapshot (or when the one
+> 2.2, 2.3 and 2.4 alike). So the server passes `-F` only when the base is its newest snapshot (or when the one
 > newer snapshot is one the client itself sent and then lost, see below), and refuses any other stream whose
 > base is older than its newest snapshot. A client that rolls back (`zfs rollback -r`), or restores an older
 > snapshot in place under the same name, finds the server ahead of it: it logs one ERROR naming the server copy
