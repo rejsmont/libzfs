@@ -922,6 +922,9 @@ class RemoteBackupWorker(BaseWorker):
         self.tls_dir = tls_dir
         self.client_id = client_id
         self._remote_manager = None
+        # (dataset, destination) pairs already warned about as local: one
+        # WARNING per pair per incarnation (see `_send_to_destinations`).
+        self._local_warned: Set[Tuple[str, str]] = set()
 
     def _get_interval(self, config: BackupConfig) -> float:
         freqs = [
@@ -1011,6 +1014,24 @@ class RemoteBackupWorker(BaseWorker):
                 # Between destinations no stream is open: a safe point.
                 return
             current[:] = [remote_cfg.destination]
+            dest = manager.config.destinations.get(remote_cfg.destination)
+            if dest is not None and getattr(dest, 'is_local', False) is True:
+                # Temporary guard (replaced by the local backup manager): the
+                # remote manager, which speaks https only, must never be
+                # handed a `zfs:` destination. Nothing is recorded in the
+                # status file; `check` (health_collect._observe_local) sees
+                # no anchor, so it grades the destination WARN then CRIT
+                # ("not yet sent") until the local manager exists. That is
+                # the intended signal: nothing is being backed up.
+                key = (dsi.name, remote_cfg.destination)
+                if key not in self._local_warned:
+                    self._local_warned.add(key)
+                    logger.warning(
+                        f"Backup of {dsi.name} to {remote_cfg.destination} "
+                        f"({dest.url}) skipped: local destinations are not "
+                        "implemented yet"
+                    )
+                continue
             freq = (remote_cfg.frequency or dsi.config.frequency).total_seconds()
             anchor_name = manager.get_anchor(dsi, remote_cfg.destination)
             if anchor_name:

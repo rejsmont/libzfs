@@ -39,7 +39,7 @@ from unittest.mock import patch
 import pytest
 from _cli_support import Cli, db, db_state, generation, isolated, stored  # noqa: F401
 
-from zfsbackup.config import BackupConfig, DatasetConfig, RemoteServerConfig
+from zfsbackup.config import BackupConfig, DatasetConfig, Destination, RemoteServerConfig
 from zfsbackup.config.store import (
     ConfigSnapshot,
     dispose_all,
@@ -206,6 +206,82 @@ class TestWording:
 
     def test_the_message_is_a_plain_value_error_with_no_traceback_text(self):
         assert "Traceback" not in refused(config("tank/backups"))
+
+
+@pytest.mark.unit
+class TestLocalDestinationTargets:
+    """Item 2.2: the same rule for the target of a `zfs:` (local) destination. The full matrix,
+    the target-versus-target rules and the wording live in
+    `test_zfsbackup_store_local_dest.py`; this is the C0 table's local twin."""
+
+    @staticmethod
+    def with_local(*datasets, local_target="tank/backups", remote=None) -> BackupConfig:
+        cfg = config(*datasets, target=remote)
+        cfg.destinations = {"local": Destination(url=f"zfs:{local_target}")}
+        return cfg
+
+    @pytest.mark.parametrize(
+        "name, recursive, ds_enabled",
+        [
+            ("tank/backups", False, True),
+            ("tank/backups/a", False, True),
+            ("tank/backups/a", False, False),
+            ("tank", True, True),
+            ("tank", True, False),
+        ],
+    )
+    def test_refused_like_the_remote_target(self, name, recursive, ds_enabled):
+        message = refused(self.with_local((name, recursive, ds_enabled)))
+        assert message.startswith(f"datasets[{name}]: ")
+        assert "local destination 'local'" in message
+
+    @pytest.mark.parametrize(
+        "name, recursive, target",
+        [
+            ("tank", False, "tank/backups"),
+            ("tank/backup", True, "tank/backups"),
+            ("tank/backups-old", True, "tank/backups"),
+            ("tank/b", True, "tank/backups"),
+            ("ta", True, "tank/backups"),
+            ("tank/backups", False, "tank/backup"),
+        ],
+    )
+    def test_components_not_string_prefix(self, name, recursive, target):
+        validate_config(self.with_local((name, recursive, True), local_target=target))
+
+    def test_remote_backup_being_disabled_does_not_switch_the_local_check_off(self):
+        cfg = self.with_local("tank/backups/a", remote="tank/other")
+        cfg.remote_backup.enabled = False
+        refused(cfg)
+
+    def test_the_remote_only_helper_cannot_see_local_destinations(self):
+        _require_outside_target(
+            DatasetConfig(name="tank/backups"), "datasets[tank/backups]", None
+        )
+
+
+@pytest.mark.integration
+class TestLocalTargetThroughTheDaemon:
+    def test_test_config_rejects_a_target_moved_onto_a_dataset(self, tmp_path, caplog):
+        path = tmp_path / "daemon" / "config.db"
+        source = tmp_path / "ok.yaml"
+        source.write_text(
+            'snapshot_prefix: "autosnap"\ndatasets:\n  - name: "tank/data"\n    frequency: "1h"\n'
+            'destinations:\n  local:\n    url: "zfs:tank/backups"\n'
+        )
+        import_yaml(source, resolve_config_path(str(path)))
+        dispose_all()
+        conn = sqlite3.connect(str(path))
+        conn.execute("UPDATE destinations SET url = 'zfs:tank'")
+        conn.commit()
+        conn.close()
+        with patch("sys.argv", ["daemon", "--test-config", "-c", str(path)]):
+            with caplog.at_level(logging.ERROR):
+                result = main()
+        dispose_all()
+        assert result == 1
+        assert "is invalid" in caplog.text
+        assert "datasets[tank/data]" in caplog.text and "local destination 'local'" in caplog.text
 
 
 # --------------------------------------------------------------------------

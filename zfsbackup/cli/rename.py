@@ -24,7 +24,10 @@ written.
 - a dataset with remote destinations needs `--force`: the server derives its
   copy's path from the client id and the dataset name, so a changed path means
   the next backup is likely a full send and the old server copy is orphaned.
-  This tool never touches a server;
+  This tool never touches a server. For a local (`zfs:`) destination the note
+  names the real copy path (`<target>/<client id>/<old>` -> `.../<new>`) and the
+  exact `zfs rename` that moves it (`-p` when the parent changes); this tool
+  does not run it;
 - `--clear-stale-props` removes `org.zfsbackup:config` and every
   `org.zfsbackup:anchor.*` and `org.zfsbackup:inflight.*` from the old dataset
   (an `inflight.*` pin is an anchor-like pin on the two snapshots of a send in
@@ -83,7 +86,9 @@ written.
   `--skip-missing`; the new name must be usable in a ZFS property name.
 - the stale `anchor.OLD` and `inflight.OLD` properties are listed afterwards and
   left in place;
-- no `--force`: the server path does not depend on the destination's name.
+- no `--force`: the server path does not depend on the destination's name (nor
+  does a local copy's: `<target>/<client id>/<dataset>`), so a local destination
+  needs nothing beyond the anchor copy above.
 
 `--dry-run` for both prints the ZFS property actions and the configuration
 change and does neither (it only reads).
@@ -224,6 +229,72 @@ def _server_note(snapshot: ConfigSnapshot, old: str, new: str) -> str:
         f"existing copy at {_server_path(cid, old)} stays where it is, orphaned "
         "(this tool never touches a server)"
     )
+
+
+def _local_copy_path(target: str, client_id: str, name: str) -> str:
+    """Where a local destination keeps client dataset `name`:
+    `<target>/<client id>/<pool>/<path>` -- the server's layout, the dataset's
+    own name below the client id."""
+    return f"{target}/{client_id}/{name}"
+
+
+def _local_note(
+    snapshot: ConfigSnapshot, destination: str, target: str, old: str, new: str
+) -> str:
+    cid = _client_id(snapshot)
+    old_path = _local_copy_path(target, cid, old)
+    new_path = _local_copy_path(target, cid, new)
+    header = (
+        f"local destination {destination!r} (zfs:{target}) keeps this dataset's copy at "
+        f"{old_path}; under the new name it would be {new_path}. "
+    )
+    if old.rpartition("/")[0] == new.rpartition("/")[0]:
+        # The new parent exists (it is the old one), so a plain `zfs rename`
+        # works. The copy also records which client dataset it holds
+        # (`org.zfsbackup:source_dataset`, a LOCAL property): the receive path
+        # refuses a copy whose recorded source differs, so it is set to the new name.
+        return (
+            header
+            + "The incremental base is found by snapshot name under the new path, so the "
+            "next backup to it is a full send unless the copy is moved and re-labelled "
+            "first: run, while no send to it is in progress, "
+            f"`zfs rename {shlex.quote(old_path)} {shlex.quote(new_path)}` and then "
+            f"`zfs set org.zfsbackup:source_dataset={shlex.quote(new)} {shlex.quote(new_path)}`; "
+            f"otherwise the copy at {old_path} stays where it is, orphaned (nothing sends "
+            "to it or prunes it to its rules any more)"
+        )
+    # Another pool or a deeper path: the new parent would have to be created,
+    # and a container made by `zfs rename -p` has no local client_id, so it is
+    # never adopted. No recipe; the copy starts afresh.
+    return (
+        header
+        + "The parent path changes, so the copy cannot simply be renamed: the next backup "
+        f"to it is a full send into {new_path}, and the copy at {old_path} stays where it "
+        "is, orphaned (nothing sends to it or prunes it to its rules any more; it can be "
+        "kept or destroyed by hand)"
+    )
+
+
+def _copy_notes(snapshot: ConfigSnapshot, ds: Any, old: str, new: str) -> str:
+    """What renaming dataset `ds` does to its copies, one note for the servers
+    (as ever) and one per local destination (the real path and the exact
+    `zfs rename`)."""
+    destinations = snapshot.config.destinations
+    notes: List[str] = []
+    if any(not _is_local(destinations, r.destination) for r in ds.remote):
+        notes.append(_server_note(snapshot, old, new))
+    for remote in ds.remote:
+        if _is_local(destinations, remote.destination):
+            notes.append(_local_note(
+                snapshot, remote.destination, destinations[remote.destination].target_dataset,
+                old, new,
+            ))
+    return "; ".join(notes)
+
+
+def _is_local(destinations: Dict[str, Any], name: str) -> bool:
+    dest = destinations.get(name)
+    return bool(dest is not None and dest.is_local)
 
 
 def _renamed_dataset_config(config: BackupConfig, old: str, new: str) -> BackupConfig:
@@ -618,10 +689,16 @@ def rename_dataset(
                 "rename it first, then run this again. Nothing was changed."
             )
 
+    notes = _copy_notes(snapshot, ds, old, new) if remotes else ""
     if remotes and not force:
+        kind = (
+            "remote backups"
+            if any(not _is_local(config.destinations, r) for r in remotes)
+            else "local backups"
+        )
         raise CliError(
-            f"{old!r} sends to {', '.join(remotes)}. Renaming it affects its remote "
-            f"backups: {_server_note(snapshot, old, new)}. "
+            f"{old!r} sends to {', '.join(remotes)}. Renaming it affects its {kind}: "
+            f"{notes}. "
             "Re-run with --force to rename anyway. Nothing was changed."
         )
 
@@ -652,7 +729,7 @@ def rename_dataset(
             f"do not follow the configuration rename and become stale{suffix}"
         )
     if remotes:
-        warn(f"--force: {_server_note(snapshot, old, new)}")
+        warn(f"--force: {notes}")
 
     stale_props = sorted(
         p for p in old_props

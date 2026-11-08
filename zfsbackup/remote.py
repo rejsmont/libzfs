@@ -271,6 +271,10 @@ def _endpoint(url: str) -> _Endpoint:
         raise ValueError(problem)
     parts = urlsplit(url.strip())
     host = parts.hostname
+    if parts.scheme.lower() != 'https' or host is None:
+        # A local `zfs:<dataset>` destination passes `destination_url_problem`
+        # but has no endpoint: never reached for one, refused if it is.
+        raise ValueError(f"url {url!r} is not an https destination")
     port = parts.port if parts.port is not None else 443
     shown = f"[{host}]" if ':' in host else host
     authority = shown if port == 443 else f"{shown}:{port}"
@@ -441,7 +445,13 @@ class RemoteBackupManager(ChainSender):
         the certificate only, never the key, and never raises. The first call
         of a manager checks; later ones at most once per
         `CLIENT_CERT_EXPIRY_CHECK_EVERY` seconds, whether or not it found
-        anything."""
+        anything. Not run at all when the configuration has no https
+        destination (a leftover certificate means nothing then)."""
+        if all(
+            getattr(d, 'is_local', False) is True
+            for d in self.config.destinations.values()
+        ):
+            return
         now = time.monotonic()
         if (
             self._expiry_checked_at is not None
@@ -534,7 +544,16 @@ class RemoteBackupManager(ChainSender):
 
     def _enrolled_endpoint(self, destination: str, dest: Destination) -> Optional[_Endpoint]:
         """The destination's endpoint, or `None` (one ERROR) when it is not
-        enrolled: not an https URL, or no pinned server fingerprint."""
+        enrolled: not an https URL, or no pinned server fingerprint. A local
+        (`zfs:<dataset>`) destination is refused outright (defence in depth:
+        the worker never hands one to this manager)."""
+        if getattr(dest, 'is_local', False) is True:
+            self._log_refusal_once(
+                (None, destination),
+                f"destination {destination} is a local destination ({dest.url}); "
+                "the remote backup manager does not send to it",
+            )
+            return None
         problem = destination_url_problem(dest.url)
         endpoint = None
         if problem is None:

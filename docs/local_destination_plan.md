@@ -20,7 +20,8 @@ enrolled with its own API over loopback.
    can share a target pool, and a loopback setup migrates with one `zfs rename`. A host that never
    enrolled has no client id, so the CLI creates one (`store.trust.ensure_client_id`, `trust.py:806`)
    when a write adds the first local destination; a later `identity set-client-id` orphans copies under
-   the old id (the CLI prints the `zfs rename`).
+   the old id (the CLI says so; a bare `zfs rename` is not offered, because every copy and container
+   carries a local `org.zfsbackup:client_id` that ownership checks and the pruner compare).
 3. **Retention of the copies.** The config stamped on each copy (`org.zfsbackup:config` =
    `to_property(destination)`, set at every receive and cycle), pruned by the existing received-dataset
    pruner — one hardened code path; copies of a removed dataset keep being pruned to their last rules.

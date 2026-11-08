@@ -790,6 +790,17 @@ class _NewKey:
     new_key: Optional[Path] = None
 
 
+def _refuse_local(name: str, url: str) -> None:
+    """Exit 1 for a `zfs:<dataset>` destination: it has no server, so there is
+    nothing to enroll with. Pure string work -- called before any token is
+    read, any file is touched or any connection is made."""
+    if Destination(url=url).is_local:
+        raise CliError(
+            f"destination {name!r} is local ({url.strip()!r}); local destinations need no "
+            "enrollment"
+        )
+
+
 def enroll(
     state: Any,
     destination: str,
@@ -809,6 +820,26 @@ def enroll(
             "--cert/--key only go with --new-key (they name the new client certificate; "
             "a plain `enroll` uses the configured one)"
         )
+    # A local destination is refused first, before the token is read: a
+    # stored destination by its url, a new one by --url. A database that
+    # cannot be read is left for `_enroll` to report in its usual order.
+    if url_opt is not None:
+        _refuse_local(destination, url_opt)
+    # This probe reads the configuration a second time (`_enroll` reads it
+    # again), so its library warnings (the never-prune one among them) are
+    # muted: they are shown once, by that later read.
+    handler = getattr(state, "handler", None)
+    if handler is not None:
+        handler.muted = True
+    try:
+        stored = read_snapshot(resolved).config.destinations.get(destination)
+    except Exception:  # noqa: BLE001 - `_enroll` re-reads and words the failure
+        stored = None
+    finally:
+        if handler is not None:
+            handler.muted = False
+    if stored is not None:
+        _refuse_local(destination, stored.url)
     token = _read_token(state, token_file, token_opt)
     try:
         token_fp, secret = identity.parse_token(str(token))
@@ -958,6 +989,10 @@ def _enroll(
     # 1. Inputs, all checked before anything is written or generated.
     snapshot = read_snapshot(resolved)
     existing = snapshot.config.destinations.get(name)
+    if url_opt is not None:
+        _refuse_local(name, url_opt)
+    if existing is not None:
+        _refuse_local(name, existing.url)  # also if it became local since
     if url_opt is None and existing is None:
         raise click.UsageError(
             f"destination {name!r} does not exist yet: pass --url https://HOST:PORT"
@@ -1484,8 +1519,15 @@ def identity_rotate(state: Any, cert: Optional[str], key: Optional[str]) -> None
 
     client_id = snapshot.client_id
     enrolled = {
-        n: d for n, d in sorted(snapshot.config.destinations.items()) if d.server_fingerprint
+        n: d for n, d in sorted(snapshot.config.destinations.items())
+        if d.server_fingerprint and not d.is_local
     }
+    destinations = snapshot.config.destinations
+    if destinations and all(d.is_local for d in destinations.values()):
+        raise CliError(
+            "every destination is local (zfs:<dataset>), and a local destination has no "
+            "server, so there is nothing to rotate against"
+        )
     if not client_id or not enrolled:
         raise CliError(
             "no destination is enrolled, so there is nothing to rotate; "
@@ -1683,7 +1725,8 @@ def register(
             "client certificate (and client id, if it has none) are generated if needed. "
             "Give the token with --token-file PATH, --token - (stdin) or at the hidden "
             "prompt; never on the command line. --url is required for a new destination "
-            "(https only). Running it again for an enrolled destination is safe: the "
+            "(https only; a local zfs: destination needs no enrollment and is refused). "
+            "Running it again for an enrolled destination is safe: the "
             "server is asked first and the token is not used. A certificate the server "
             "revoked can never be enrolled again: use --new-key, which generates a new "
             "client key (client.next), enrolls it and, once the server accepted it, makes "
