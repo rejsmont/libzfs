@@ -43,7 +43,7 @@ from libzfseasy import zfs as zfs_module
 from libzfseasy.zfs import _timeout_var
 
 from _api_support import (
-    CLIENT_ID, Authed, _find_in_closures, enroll_body, make_client_cert, pending_configs,
+    CLIENT_ID, Authed, _find_in_closures, enroll_body, make_client_cert, pending_api, pending_configs,
     streams_in_progress,
 )
 from _snapshot_support import listed_snapshot
@@ -55,8 +55,8 @@ from zfsbackup.config import BackupConfig, DatasetConfig, RemoteServerConfig
 
 pytestmark = pytest.mark.unit
 
-SERVER_DS = "pool/backups/client1/data"
-OTHER_DS = "tank/data"                  # maps to the same server dataset as pool/data
+SERVER_DS = "pool/backups/client1/pool/data"
+OTHER_DS = "tank/data"                  # another pool: its own server dataset, never pool/data's
 TOKEN_URL = f"/backup/{CLIENT_ID}/pool/data/resume_token"
 TIMEOUT_TEXT = "zfs list timed out after 30s; outcome unknown"
 
@@ -473,10 +473,11 @@ def ownership_client_id(z, client, f):
 
 
 def pending_owner(z, client, f):
-    # tank/data negotiates first and leaves a pending entry for the (missing) server dataset; pool/data
-    # then meets an existing placeholder without an owner and reads its properties a second time
-    assert negotiate(client, OTHER_DS).status_code == 200
-    z.create.reset_mock()
+    # another client dataset (tank/data) holds a pending entry for pool/data's server name (planted
+    # directly: the pool is part of the name, so tank/data no longer lands here); pool/data then meets an
+    # existing placeholder without an owner and reads its properties a second time
+    claim = pending_api(client.application)[0]
+    assert claim(SERVER_DS, api.canonical_dataset_config(GOOD_CONFIG), OTHER_DS) is None
     z.exists.return_value = True
     z.props.side_effect = [{}, f.error()]
 
@@ -598,7 +599,7 @@ class TestNegotiateTimeouts:
         fault.on = False
         zfs.create.side_effect = None
         assert negotiate(client).status_code == 200
-        assert zfs.create.call_count == 2                        # the parent chain is created again
+        assert zfs.create.call_count == 3                        # the failed first create, then both levels again
         assert SERVER_DS in pending_configs(authed.app)
 
     def test_a_timed_out_set_is_done_again_by_the_next_negotiate(self, client, authed, zfs, fault):
@@ -638,7 +639,7 @@ class TestNegotiateTimeouts:
         zfs.exists.side_effect = lambda ds: (seen.append(_timeout_var.get()), False)[1]
         zfs.create.side_effect = lambda *a, **k: seen.append(_timeout_var.get())
         assert negotiate(client).status_code == 200
-        assert len(seen) == 3                                    # exists, exists of the parent, create
+        assert len(seen) == 5            # exists of the leaf, of the pool level and of `<id>`, then two creates
         assert all(0 < s <= api.ZFS_REQUEST_BUDGET for s in seen)
         assert _timeout_var.get() is None                        # and nothing is left set
         assert limits and all(0 < s <= api.ZFS_REQUEST_BUDGET for s in limits)
@@ -1044,7 +1045,8 @@ class TestSharedBudget:
     def test_a_third_call_that_still_fits_runs(self, client, zfs, clock, limits):
         slow(clock, 9, zfs.exists, False)
         slow(clock, 9, zfs.create)
-        assert negotiate(client).status_code == 200            # exists, exists (ancestor), create: 27 s
+        # the pool root `pool`: exists, exists (ancestor `<target>/<id>`), create it: 27 s
+        assert negotiate(client, "pool").status_code == 200
         assert limits == [30.0, 21.0, 12.0]
 
     def test_each_request_has_its_own_budget(self, client, zfs, clock, limits):
@@ -1188,8 +1190,8 @@ class TestTimeoutLogging:
             negotiate(client, "pool/other")
         records = timeout_records(caplog)
         assert [r.levelno for r in records] == [logging.WARNING, logging.WARNING, logging.DEBUG, logging.DEBUG]
-        assert "pool/backups/client1/data" in records[0].getMessage()
-        assert "pool/backups/client1/other" in records[1].getMessage()
+        assert "pool/backups/client1/pool/data" in records[0].getMessage()
+        assert "pool/backups/client1/pool/other" in records[1].getMessage()
 
     def test_another_client_of_the_same_dataset_name_is_another_server_dataset(self, authed, zfs, fault, caplog):
         zfs.exists.side_effect = fault.raiser
@@ -1338,8 +1340,8 @@ class TestStuckChildFailsFast:
     def test_an_entry_that_has_exited_is_swept_and_the_call_goes_through(self, client, mock_subprocess):
         register_stuck(code=0)                                   # the "hung" child has exited since
         mock_subprocess.setup_multi(
-            ([], "cannot open 'pool/backups/client1/data': dataset does not exist\n", 1),
-            ([], "cannot open 'pool/backups/client1/data': dataset does not exist\n", 1),
+            ([], "cannot open 'pool/backups/client1/pool/data': dataset does not exist\n", 1),
+            ([], "cannot open 'pool/backups/client1/pool/data': dataset does not exist\n", 1),
         )
         resp = client.get(TOKEN_URL)
         assert resp.status_code == 200 and resp.get_json() == {"resume_token": None}
@@ -1421,7 +1423,7 @@ class TestHungPoolEndToEnd:
     )
     MISSING = (
         "#!/bin/sh\n"
-        "echo \"cannot open 'pool/backups/client1/data': dataset does not exist\" >&2\n"
+        "echo \"cannot open 'pool/backups/client1/pool/data': dataset does not exist\" >&2\n"
         "exit 1\n"
     )
 

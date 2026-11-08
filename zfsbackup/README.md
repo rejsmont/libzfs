@@ -867,10 +867,11 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
 - **A client that shortens its retention** is logged on the server at WARNING ("the retention horizon of …
   shrinks from 30d to 7d"): the server applies the client's retention as sent, so older snapshots go at the
   next pruning cycle.
-- **Layout.** A client's dataset `tank/data` is stored as `<target>/<client_id>/data`: the server drops the
-  client's **pool** name and decides the rest; the client never chooses a path. A client's pool root `tank`
-  is `<target>/<client_id>` itself. Two client datasets that map to the same server name (`tank/data` and
-  `rpool/data`) collide: the second is refused with 409.
+- **Layout.** A client's dataset `tank/data` is stored as `<target>/<client_id>/tank/data`, pool name
+  included, so `tank/data` and `rpool/data` on one host are kept apart. The server decides the path; the
+  client never chooses one. A client's pool root `tank` is `<target>/<client_id>/tank`. Moving a dataset to
+  another pool (or renaming it) gives it a new server path: the next backup is a full send, and the old
+  server copy stays where it is until you remove it.
 - **Retention is the client's, run by the server.** The server prunes each received dataset with the
   retention rules that the client sent (`org.zfsbackup:config`), using the **server's** `snapshot_prefix`. A
   client with another prefix is never pruned on the server (it keeps everything), so use the same prefix.
@@ -891,7 +892,7 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
   on the server, then let the next cycle send in full:
   ```bash
   sudo zfs create -p tank/backups-aside
-  sudo zfs rename tank/backups/<client_id>/data tank/backups-aside/<client_id>-data-$(date +%F)
+  sudo zfs rename tank/backups/<client_id>/tank/data tank/backups-aside/<client_id>-data-$(date +%F)
   ```
   Inside the tree it would still be pruned, and its `source_dataset` would get the new send refused with
   409. Destroy the aside copy when you no longer need it.
@@ -998,7 +999,7 @@ it there:
 ```bash
 sudo zfs create -p tank/restore
 sudo zfs clone -o readonly=on -o canmount=on -o mountpoint=/mnt/restore/data \
-     tank/backups/<client_id>/data@autosnap_20261021120000 tank/restore/data
+     tank/backups/<client_id>/tank/data@autosnap_20261021120000 tank/restore/data
 # … copy the files out of /mnt/restore/data …
 sudo zfs destroy tank/restore/data
 ```
@@ -1024,11 +1025,11 @@ dataset that **still exists on the client must be renamed aside first** (`zfs re
 tank/data.old`): a full receive onto an existing dataset fails.
 
 ```bash
-# on the server (plain copy; the client dataset tank/data is stored as <target>/<client_id>/data)
-sudo zfs send -L -c tank/backups/<client_id>/data@autosnap_20261021120000 \
+# on the server (plain copy; the client dataset tank/data is stored as <target>/<client_id>/tank/data)
+sudo zfs send -L -c tank/backups/<client_id>/tank/data@autosnap_20261021120000 \
   | ssh client sudo zfs receive -u tank/data
 # an encrypted dataset: raw, then load the key with the client's original key
-sudo zfs send -w tank/backups/<client_id>/secret@… | ssh client sudo zfs receive -u tank/secret
+sudo zfs send -w tank/backups/<client_id>/tank/secret@… | ssh client sudo zfs receive -u tank/secret
 ssh client sudo zfs load-key tank/secret
 # then, on the client, after checking it:
 sudo zfs mount tank/data

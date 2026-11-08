@@ -3096,7 +3096,7 @@ class TestRealTls:
         assert any("client TLS identity" in m for _, m in own(caplog)[mark:])
         # negotiate stored the config; the receive put it in effect with `-o`, with the BOUND id
         (received,) = world.received_props()
-        assert received["dataset"] == "testpool/backups/client-a/data"
+        assert received["dataset"] == "testpool/backups/client-a/testpool/data"
         assert received["props"]["org.zfsbackup:client_id"] == "client-a"
         assert received["props"]["org.zfsbackup:source_dataset"] == "testpool/data"
         assert received["props"]["org.zfsbackup:config"]
@@ -3280,9 +3280,9 @@ class TestRealTls:
 
 
 CHAIN_SNAPS = [f"autosnap_202610201{h}0000" for h in ("20", "10", "00")] + ["autosnap_20261020090000"]
-CHAIN_SERVER = {"testpool/backups/client-a/data": ["autosnap_20261020090000"]}
+CHAIN_SERVER = {"testpool/backups/client-a/testpool/data": ["autosnap_20261020090000"]}
 #: the three snapshots the chain brings, oldest first: after each receive the server's listing has it
-CHAIN_INCOMING = {"testpool/backups/client-a/data": CHAIN_SNAPS[2::-1]}
+CHAIN_INCOMING = {"testpool/backups/client-a/testpool/data": CHAIN_SNAPS[2::-1]}
 CHAIN_WORLD = (CHAIN_SERVER, CHAIN_INCOMING)
 
 
@@ -3321,11 +3321,11 @@ class TestRealTlsChain:
         # every receive was started with the server's own properties, and the bound id
         props = world.received_props()
         assert len(props) == 3
-        assert {p["dataset"] for p in props} == {"testpool/backups/client-a/data"}
+        assert {p["dataset"] for p in props} == {"testpool/backups/client-a/testpool/data"}
         assert {p["props"]["org.zfsbackup:client_id"] for p in props} == {"client-a"}
 
     @pytest.mark.parametrize("world", [(CHAIN_SERVER, {
-        "testpool/backups/client-a/data": CHAIN_SNAPS[2::-1] + ["autosnap_20261020130000"]
+        "testpool/backups/client-a/testpool/data": CHAIN_SNAPS[2::-1] + ["autosnap_20261020130000"]
     })], indirect=True)
     def test_a_second_cycle_continues_the_chain_unblocked(self, world):
         """The server's listing grows with the receives: the second cycle negotiates the newest
@@ -3344,7 +3344,7 @@ class TestRealTlsChain:
 
 
 R1, R2, R3, R4, R5 = (f"autosnap_2026102010{m}00" for m in ("00", "10", "20", "30", "40"))
-GUARD_DS = "testpool/backups/client-a/data"
+GUARD_DS = "testpool/backups/client-a/testpool/data"
 
 
 @pytest.mark.integration

@@ -119,6 +119,6 @@ datasets:
 #
 # Remote backup:
 # - Anchor snapshots (last successfully transferred) are excluded from pruning
-# - Server receives streams into <target_dataset>/<client_id>/<dataset_relative_path>
+# - Server receives streams into <target_dataset>/<client_id>/<dataset> (pool name included)
 # - Client config is stored on the server dataset as org.zfsbackup:config (base64 JSON)
 # - Anchor state is stored on the client dataset as org.zfsbackup:anchor.<destination>

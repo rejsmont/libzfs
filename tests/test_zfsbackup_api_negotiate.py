@@ -55,7 +55,7 @@ from zfsbackup.config import BackupConfig, DatasetConfig, RemoteServerConfig, Re
 REAL_GET_VALUE = _zfs_api.zfs.get.value
 
 URL = f"/backup/{CLIENT_ID}/pool/data/negotiate"
-SERVER_DS = "pool/backups/client1/data"
+SERVER_DS = "pool/backups/client1/pool/data"
 SHAPE_ERROR = "request body must be a JSON object"
 SNAPSHOTS_ERROR = "snapshots: must be a list of snapshot names"
 
@@ -517,18 +517,26 @@ class TestStoredValue:
         zfs["create"].side_effect = lambda *a, **k: order.append(("create", str(a[0]), k))
         zfs["set"].side_effect = lambda *a, **k: order.append(("set",))
         assert post_json(client, body_with()).status_code == 200
-        assert order == [("create", "pool/backups/client1", CREATE_KWARGS)]
+        assert order == [("create", ID_DS, CREATE_KWARGS), ("create", PARENT_DS, CREATE_KWARGS)]
 
-    def test_a_top_level_dataset_creates_nothing_the_target_must_exist(self, client, zfs):
-        """`pool` -> `<target>/<id>` is the leaf itself: its parent is the target, which negotiate
-        never creates (no `-p` any more) and the first receive makes the leaf."""
+    def test_a_pool_root_dataset_creates_only_the_id_directory_the_target_must_exist(self, client, zfs):
+        """`pool` -> `<target>/<id>/pool` is the leaf itself: its parent `<target>/<id>` is the only
+        ancestor negotiate makes. The target is never created (no `-p`) and the first receive makes
+        the leaf."""
         assert post_json(client, body_with(), url=f"/backup/{CLIENT_ID}/pool/negotiate").status_code == 200
+        assert [str(c.args[0]) for c in zfs["create"].call_args_list] == [ID_DS]
+
+    def test_nothing_is_created_when_every_ancestor_exists(self, client, zfs):
+        """`pool/data` -> `<target>/<id>/pool/data`: with `<target>/<id>` and the pool level there
+        both present, negotiate creates nothing (the first receive makes the leaf)."""
+        existing(zfs, ID_DS, PARENT_DS)
+        assert post_json(client, body_with()).status_code == 200
         zfs["create"].assert_not_called()
 
     def test_a_missing_target_fails_the_create_and_unclaims_the_pending_entry(self, client, authed, zfs):
         """`zfs create` of `<target>/<id>` fails when the target is missing: a 500 with the zfs text
         only in the log, nothing remembered for the stream, nothing left claimed."""
-        zfs["create"].side_effect = RuntimeError("cannot create 'pool/backups/client1': parent does not exist")
+        zfs["create"].side_effect = RuntimeError(f"cannot create {ID_DS!r}: parent does not exist")
         resp = negotiate(client)
         assert resp.status_code == 500
         assert resp.get_json() == {"error": f"Failed to record the configuration of {SERVER_DS}"}
@@ -624,7 +632,7 @@ class TestZfsFailures:
         assert post_json(client, body_with()).status_code == 200
 
     def test_the_next_request_is_served_after_a_failed_create(self, client, authed, zfs):
-        zfs["create"].side_effect = [RuntimeError(SECRET), None]
+        zfs["create"].side_effect = [RuntimeError(SECRET), None, None]   # then both missing levels
         assert post_json(client, body_with()).status_code == 500
         assert post_json(client, body_with()).status_code == 200
         assert SERVER_DS in pending_configs(authed.app)
@@ -689,8 +697,9 @@ class TestClientDatasetProblem:
         assert problem is not None and fragment in problem
         assert "\n" not in problem and "\0" not in problem        # the message is safe to log
 
-    def test_the_pool_component_is_checked_although_the_server_name_drops_it(self):
-        """`1pool/data` maps to the valid server dataset `<target>/<id>/data`."""
+    def test_the_pool_component_is_checked_although_the_server_name_accepts_it(self):
+        """`1pool/data` maps to the valid server dataset `<target>/<id>/1pool/data` (a digit is fine
+        below a pool), so only the client-name check refuses the pool component."""
         assert client_dataset_problem("1pool/data") is not None
 
 
@@ -762,12 +771,12 @@ class TestClientDatasetName:
     def test_a_single_component_name_is_fine(self, client, zfs):
         resp = post_json(client, body_with(), url=f"/backup/{CLIENT_ID}/pool/negotiate")
         assert resp.status_code == 200
-        assert resp.get_json()["server_dataset"] == "pool/backups/client1"
+        assert resp.get_json()["server_dataset"] == PARENT_DS      # the pool is kept: <target>/<id>/pool
 
     def test_a_name_with_a_space_is_fine_and_stored_verbatim(self, client, authed, zfs):
         resp = post_json(client, body_with(), url=f"/backup/{CLIENT_ID}/pool/a%20b/negotiate")
         assert resp.status_code == 200
-        assert pending_configs(authed.app)["pool/backups/client1/a b"][1] == "pool/a b"
+        assert pending_configs(authed.app)[PARENT_DS + "/a b"][1] == "pool/a b"
         zfs["exists"].return_value = True
         resp = post_json(client, body_with(), url=f"/backup/{CLIENT_ID}/pool/a%20b/negotiate")
         assert resp.status_code == 200
@@ -800,15 +809,18 @@ class TestViewRefusesControlCharacters:
         assert authed.gate.active == 0
 
     @pytest.mark.parametrize("name", ["pool\n/data", "pool\t/data", "pool\r/data", "pool\0/data"])
-    def test_the_control_character_check_names_itself_when_the_server_name_is_valid(
+    def test_a_control_character_in_the_pool_component_is_refused_with_the_server_name_check(
         self, authed, zfs, name
     ):
-        """A control character in the POOL component is dropped by the server-side mapping
-        (`<target>/<id>/data` is valid): only `client_dataset_problem` catches it."""
+        """The POOL component is part of the server name now (`<target>/<id>/<pool>/data`), so the
+        derived-name check refuses it first (it no longer slips past that check as it did when the
+        pool was dropped); `client_dataset_problem` still names the control character on its own."""
         view = authed.app.view_functions["backup_negotiate"]
         with authed.context(URL, method="POST", json=body_with()):
             resp, status = view(CLIENT_ID, name)
-        assert status == 400 and "control character" in resp.get_json()["error"]
+        assert status == 400 and resp.get_json()["error"].startswith("invalid dataset name ")
+        assert "control character" in client_dataset_problem(name)
+        _no_zfs(zfs)
 
     @pytest.mark.xfail(strict=True, reason=(
         "product: `_server_dataset` checks the derived server name first and appends the "
@@ -844,9 +856,9 @@ class TestPendingConfigs:
         assert resp.status_code == 200
         assert resp.get_json() == {
             "common_snapshot": None, "server_dataset": SERVER_DS, "server_copy": "none"}
-        (call,) = zfs["create"].call_args_list
-        assert str(call.args[0]) == "pool/backups/client1"       # the parent, never the leaf
-        assert call.kwargs == CREATE_KWARGS
+        # outermost first: `<target>/<id>`, then the pool level; never the leaf
+        assert [str(c.args[0]) for c in zfs["create"].call_args_list] == [ID_DS, PARENT_DS]
+        assert all(c.kwargs == CREATE_KWARGS for c in zfs["create"].call_args_list)
         zfs["set"].assert_not_called()
         zfs["list"].assert_not_called()                          # nothing to compare on a missing dataset
         assert dict(pending_configs(authed.app)) == {
@@ -855,11 +867,10 @@ class TestPendingConfigs:
     def test_the_leaf_is_never_created_for_any_depth(self, zfs):
         # a fresh app per name: a child's negotiate may be told to retry while an ancestor is pending
         for dataset, created in (
-            ("pool/a", ["pool/backups/client1"]),
-            ("pool/a/b", ["pool/backups/client1", "pool/backups/client1/a"]),
-            ("pool/a/b/c", ["pool/backups/client1", "pool/backups/client1/a",
-                            "pool/backups/client1/a/b"]),
-            ("pool", []),               # the leaf is `<target>/<id>`: the target must exist
+            ("pool/a", [ID_DS, PARENT_DS]),
+            ("pool/a/b", [ID_DS, PARENT_DS, PARENT_DS + "/a"]),
+            ("pool/a/b/c", [ID_DS, PARENT_DS, PARENT_DS + "/a", PARENT_DS + "/a/b"]),
+            ("pool", [ID_DS]),          # the leaf is `<target>/<id>/pool`: only `<id>` is made
         ):
             zfs["create"].reset_mock()
             assert negotiate(Authed(_config()).client(), dataset=dataset).status_code == 200
@@ -893,39 +904,57 @@ class TestPendingConfigs:
         assert DatasetConfig.from_property(entry[0]).frequency.total_seconds() == 120
         assert len(pending_configs(authed.app)) == 1
 
-    def test_a_different_client_dataset_for_the_same_server_name_is_409(self, client, authed, zfs):
-        """`tank/data` and `pool/data` both map to `<target>/<id>/data`."""
-        assert negotiate(client, dataset="pool/data").status_code == 200
-        zfs["create"].reset_mock()
-        resp = negotiate(client, dataset="tank/data")
+    def test_the_pool_is_part_of_the_server_dataset(self, client, authed, zfs):
+        """`tank/data` and `pool/data` of one client used to map to one server dataset; they are two
+        now, each with its own pending entry and no conflict between them."""
+        resp_pool = negotiate(client, dataset="pool/data")
+        resp_tank = negotiate(client, dataset="tank/data")
+        assert resp_pool.status_code == resp_tank.status_code == 200
+        assert resp_pool.get_json()["server_dataset"] == ID_DS + "/pool/data"
+        assert resp_tank.get_json()["server_dataset"] == ID_DS + "/tank/data"
+        assert dict(pending_configs(authed.app)) == {
+            ID_DS + "/pool/data": (canonical_dataset_config(enc(GOOD)), "pool/data"),
+            ID_DS + "/tank/data": (canonical_dataset_config(enc(GOOD)), "tank/data"),
+        }
+
+    def test_a_pool_root_dataset_maps_below_the_id_directory(self, client, authed, zfs):
+        resp = negotiate(client, dataset="pool")
+        assert resp.status_code == 200 and resp.get_json()["server_dataset"] == ID_DS + "/pool"
+        assert list(pending_configs(authed.app)) == [ID_DS + "/pool"]
+
+    def test_a_different_client_dataset_pending_at_the_same_server_name_is_409(self, client, authed, zfs):
+        """The pending-map rival (`_claim_pending`): another client dataset already waits at this
+        server name (e.g. made under another layout), so negotiate refuses to mix in."""
+        plant_rival(authed)
+        resp = negotiate(client, dataset="pool/data")
         assert resp.status_code == 409
         assert resp.get_json() == {"error": (
-            f"server dataset {SERVER_DS} already holds backups of 'pool/data'; "
-            "refusing to mix in 'tank/data'")}
+            f"server dataset {SERVER_DS} already holds backups of 'tank/data'; "
+            "refusing to mix in 'pool/data'")}
         zfs["create"].assert_not_called()
         zfs["set"].assert_not_called()
-        assert pending_configs(authed.app)[SERVER_DS][1] == "pool/data"      # the first one keeps it
+        assert pending_configs(authed.app)[SERVER_DS][1] == "tank/data"      # the first one keeps it
         assert authed.gate.active == 0
 
-    def test_the_refusal_is_the_same_text_as_for_an_existing_dataset(self, client, zfs):
-        negotiate(client, dataset="pool/data")
-        pending_text = negotiate(client, dataset="tank/data").get_json()["error"]
+    def test_the_refusal_is_the_same_text_as_for_an_existing_dataset(self, client, authed, zfs):
+        plant_rival(authed)
+        pending_text = negotiate(client, dataset="pool/data").get_json()["error"]
         zfs["exists"].return_value = True
-        zfs["props"].return_value = {PROP_SOURCE_DATASET: "pool/data"}
-        assert negotiate(client, dataset="tank/data").get_json()["error"] == pending_text
+        zfs["props"].return_value = {PROP_SOURCE_DATASET: "tank/data"}
+        assert negotiate(client, dataset="pool/data").get_json()["error"] == pending_text
 
     def test_the_other_client_dataset_is_refused_until_the_worker_restarts(self, client, authed, zfs):
-        negotiate(client, dataset="pool/data")
-        assert negotiate(client, dataset="tank/data").status_code == 409
+        plant_rival(authed)
+        assert negotiate(client, dataset="pool/data").status_code == 409
         again = Authed(_config())                   # a restart: the map is gone
-        assert negotiate(again.client(), dataset="tank/data").status_code == 200
+        assert negotiate(again.client(), dataset="pool/data").status_code == 200
 
     def test_two_clients_do_not_share_an_entry(self, authed, zfs):
         other = authed.cert_for("client2")
         assert negotiate(authed.client(), dataset="pool/data").status_code == 200
-        assert negotiate(authed.client(other), dataset="tank/data", client_id="client2").status_code == 200
+        assert negotiate(authed.client(other), dataset="pool/data", client_id="client2").status_code == 200
         assert sorted(pending_configs(authed.app)) == [
-            "pool/backups/client1/data", "pool/backups/client2/data"]
+            "pool/backups/client1/pool/data", "pool/backups/client2/pool/data"]
 
     def test_a_dry_run_creates_nothing_and_remembers_nothing(self, zfs):
         dry = Authed(_config(dry_run=True))
@@ -950,11 +979,69 @@ class TestPendingConfigs:
         assert dict(pending_configs(authed.app)) == {}
 
     def test_negotiating_twice_creates_the_parent_twice_and_keeps_one_entry(self, client, authed, zfs):
-        """`zfs create -p` is idempotent: a second negotiate of an unreceived dataset creates again."""
+        """Nothing exists yet, so a second negotiate of an unreceived dataset creates both parents
+        again (`<target>/<id>` and the pool level)."""
         negotiate(client)
         negotiate(client)
-        assert zfs["create"].call_count == 2
+        assert zfs["create"].call_count == 4
         assert len(pending_configs(authed.app)) == 1
+
+
+class TestServerDatasetKeepsThePool:
+    """`_server_dataset` is `<target>/<id>/<client dataset>`, POOL INCLUDED: the same dataset name in
+    two of the client's pools is two server datasets, and the pool root has its own level."""
+
+    @pytest.mark.parametrize("dataset, expected", [
+        ("tank/data", "pool/backups/client1/tank/data"),
+        ("pool/data", "pool/backups/client1/pool/data"),
+        ("pool", "pool/backups/client1/pool"),
+        ("tank", "pool/backups/client1/tank"),
+        ("tank/a/b", "pool/backups/client1/tank/a/b"),
+    ])
+    def test_the_pool_is_kept(self, client, zfs, dataset, expected):
+        resp = negotiate(client, dataset=dataset)
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert resp.get_json()["server_dataset"] == expected
+
+    def test_one_client_two_pools_one_name_are_two_server_datasets(self, client, authed, zfs):
+        tank, pool = negotiate(client, dataset="tank/data"), negotiate(client, dataset="pool/data")
+        assert tank.status_code == pool.status_code == 200
+        assert tank.get_json()["server_dataset"] == "pool/backups/client1/tank/data"
+        assert pool.get_json()["server_dataset"] == "pool/backups/client1/pool/data"
+        assert sorted(pending_configs(authed.app)) == [
+            "pool/backups/client1/pool/data", "pool/backups/client1/tank/data"]
+        # each source is recorded against its own server dataset, none refused as a mix-in
+        assert sorted(v[1] for v in pending_configs(authed.app).values()) == ["pool/data", "tank/data"]
+
+    def test_the_pool_root_dataset_is_the_parent_of_a_dataset_below_it(self, client, authed, zfs):
+        """`pool` is `<id>/pool`; `pool/data` is `<id>/pool/data`, below it: the child waits for the
+        root's first receive (the retryable unsettled-ancestor 503, not a name collision) and
+        proceeds once it has settled."""
+        root = negotiate(client, dataset="pool")
+        assert root.status_code == 200 and root.get_json()["server_dataset"] == "pool/backups/client1/pool"
+        child = negotiate(client, dataset="pool/data")
+        assert child.status_code == 503
+        assert child.get_json()["reason"] == "unsettled_ancestor"
+        assert child.get_json()["ancestor"] == "pool/backups/client1/pool"
+        pending_api(authed.app)[2]("pool/backups/client1/pool")          # the root's first receive finished
+        child = negotiate(client, dataset="pool/data")
+        assert child.status_code == 200
+        assert child.get_json()["server_dataset"] == "pool/backups/client1/pool/data"
+
+    def test_the_resume_token_route_uses_the_same_mapping(self, client, zfs):
+        for dataset, expected in (("tank/data", "pool/backups/client1/tank/data"),
+                                  ("pool", "pool/backups/client1/pool")):
+            zfs["exists"].reset_mock()
+            assert client.get(f"/backup/{CLIENT_ID}/{dataset}/resume_token").status_code == 200
+            assert str(zfs["exists"].call_args.args[0]) == expected
+
+    def test_a_dataset_recorded_for_the_same_name_in_another_pool_is_not_a_mix_in(self, client, zfs):
+        """The ownership check meets `pool/backups/client1/tank/data` recording `tank/data`: that is
+        its own owner, not a conflict, while `pool/data` (another server dataset) is untouched."""
+        zfs["exists"].return_value = True
+        zfs["props"].return_value = {PROP_SOURCE_DATASET: "tank/data"}
+        assert negotiate(client, dataset="tank/data").status_code == 200
+        assert str(zfs["set"].call_args.args[0]) == "pool/backups/client1/tank/data"
 
 
 class TestPendingMapBounds:
@@ -962,8 +1049,7 @@ class TestPendingMapBounds:
         mocker.patch("zfsbackup.api.PENDING_CONFIGS_MAX", 3)
         for n in range(5):
             assert negotiate(client, dataset=f"pool/d{n}").status_code == 200
-        assert list(pending_configs(authed.app)) == [
-            "pool/backups/client1/d2", "pool/backups/client1/d3", "pool/backups/client1/d4"]
+        assert list(pending_configs(authed.app)) == [PARENT_DS + "/d2", PARENT_DS + "/d3", PARENT_DS + "/d4"]
 
     def test_renegotiating_refreshes_an_entry_so_it_is_evicted_last(self, client, authed, zfs, mocker):
         mocker.patch("zfsbackup.api.PENDING_CONFIGS_MAX", 3)
@@ -971,8 +1057,7 @@ class TestPendingMapBounds:
             negotiate(client, dataset=f"pool/d{n}")
         negotiate(client, dataset="pool/d0")                   # now the newest
         negotiate(client, dataset="pool/d3")                   # evicts the oldest: d1
-        assert list(pending_configs(authed.app)) == [
-            "pool/backups/client1/d2", "pool/backups/client1/d0", "pool/backups/client1/d3"]
+        assert list(pending_configs(authed.app)) == [PARENT_DS + "/d2", PARENT_DS + "/d0", PARENT_DS + "/d3"]
 
     def test_an_evicted_dataset_is_told_to_negotiate_again(self, authed, zfs, mocker):
         from test_zfsbackup_api import Stream
@@ -1111,7 +1196,7 @@ class TestServerCopy:
         pytest.param("aes-256-gcm", f"{SERVER_DS}/child", "plain", id="root-below-the-dataset"),
         pytest.param("aes-256-gcm", f"{ID_TREE}/other", "plain", id="root-elsewhere-in-the-id-tree"),
         pytest.param("aes-256-gcm", f"{ID_TREE}/a/b/c", "plain", id="root-deep-in-the-id-tree"),
-        pytest.param("aes-256-gcm", f"{ID_TREE}/data", "raw", id="root-is-the-dataset-spelled-out"),
+        pytest.param("aes-256-gcm", f"{ID_TREE}/pool/data", "raw", id="root-is-the-dataset-spelled-out"),
         pytest.param("aes-256-gcm", "pool/backups", "plain", id="root-is-the-target"),
         pytest.param("aes-256-gcm", ID_TREE, "plain", id="root-is-the-id-directory"),
         pytest.param("aes-256-gcm", "pool", "plain", id="root-is-the-pool"),
@@ -1248,8 +1333,9 @@ BUSY = {"error": "busy", "retry": True}
 #: How negotiate creates each missing ancestor: never mounted, stamped with the bound client id
 #: (B-2c), no `-p`.
 CREATE_KWARGS = {"properties": {"canmount": "noauto", PROP_CLIENT_ID: CLIENT_ID}, "mount": False}
-OTHER_DS = "tank/data"          # maps to the same server dataset as pool/data
-PARENT_DS = "pool/backups/client1"
+OTHER_DS = "tank/data"          # another pool: its own server dataset (<id>/tank/data), never pool/data's
+ID_DS = "pool/backups/client1"                 # <target>/<id>: the client's own container
+PARENT_DS = ID_DS + "/pool"                    # <target>/<id>/<pool>: the pool level of pool/data
 
 
 @pytest.fixture
@@ -1274,6 +1360,14 @@ def ancestors(mocker, zfs):
     return holder
 
 
+def plant_rival(authed, server_dataset=SERVER_DS, source="tank/data"):
+    """Another client dataset (`source`) already waits in the pending map at `server_dataset`,
+    through the app's own `_claim_pending`: the `refusing to mix in` 409 no longer comes from a
+    name collision (the pool is part of the server name), so the conflict is set up directly."""
+    claim = pending_api(authed.app)[0]
+    assert claim(server_dataset, canonical_dataset_config(enc(GOOD)), source) is None
+
+
 def existing(zfs, *names):
     """Only `names` exist (everything else is missing)."""
     zfs["exists"].side_effect = lambda ds: str(ds) in names
@@ -1284,48 +1378,50 @@ class TestPlaceholderOwnership:
     or a receive that has not yet applied its `-o` values) is still spoken for by the client dataset
     that negotiated it first."""
 
-    def test_b_is_refused_on_the_placeholder_and_not_stamped_and_the_owner_still_negotiates(
-        self, client, authed, zfs
-    ):
-        assert negotiate(client, dataset="pool/data").status_code == 200
-        assert negotiate(client, dataset=OTHER_DS).status_code == 409           # while it is missing
+    def test_a_rival_is_refused_on_the_placeholder_and_not_stamped(self, client, authed, zfs):
+        """`tank/data` (OTHER_DS) holds this server name: a pending entry (it cannot be negotiated
+        into this path through the URL any more, the pool is part of the name), so `pool/data` is
+        the one refused, while the dataset is missing and again once a placeholder appears."""
+        plant_rival(authed)
+        assert negotiate(client, dataset="pool/data").status_code == 409         # while it is missing
         zfs["exists"].return_value = True                                        # the placeholder appears
         zfs["props"].return_value = {}                                           # ... with no owner
         zfs["set"].reset_mock()
 
-        refused = negotiate(client, dataset=OTHER_DS)
+        refused = negotiate(client, dataset="pool/data")
 
         assert refused.status_code == 409
         assert refused.get_json() == {"error": (
-            f"server dataset {SERVER_DS} already holds backups of 'pool/data'; "
-            f"refusing to mix in '{OTHER_DS}'")}
-        zfs["set"].assert_not_called()                          # B is not stamped
-        assert pending_configs(authed.app)[SERVER_DS][1] == "pool/data"          # A's entry is intact
-        owner = negotiate(client, dataset="pool/data")          # the rightful owner
-        assert owner.status_code == 200
+            f"server dataset {SERVER_DS} already holds backups of '{OTHER_DS}'; "
+            "refusing to mix in 'pool/data'")}
+        zfs["set"].assert_not_called()                          # the rival is not stamped
+        assert pending_configs(authed.app)[SERVER_DS][1] == OTHER_DS             # the holder's entry is intact
+
+    def test_a_recorded_owner_beats_a_stale_pending_entry(self, client, authed, zfs):
+        plant_rival(authed)
+        zfs["exists"].return_value = True
+        zfs["props"].return_value = {PROP_SOURCE_DATASET: "pool/data"}
+        assert negotiate(client, dataset="pool/data").status_code == 200
         assert zfs["set"].call_args.args[1][PROP_SOURCE_DATASET] == "pool/data"
         assert dict(pending_configs(authed.app)) == {}          # dropped: the dataset has its own config now
 
-    def test_a_recorded_owner_beats_a_stale_pending_entry(self, client, authed, zfs):
-        negotiate(client, dataset="pool/data")
+    def test_another_owner_on_an_existing_dataset_is_the_ownership_checks_409(self, client, zfs):
+        """No pending entry at all: the dataset itself records another source (an operator renamed
+        a copy into place, or it came from another layout)."""
         zfs["exists"].return_value = True
         zfs["props"].return_value = {PROP_SOURCE_DATASET: OTHER_DS}
-        assert negotiate(client, dataset=OTHER_DS).status_code == 200
-        assert zfs["set"].call_args.args[1][PROP_SOURCE_DATASET] == OTHER_DS
-
-    def test_another_owner_on_an_existing_dataset_is_the_ownership_checks_409(self, client, zfs):
-        negotiate(client, dataset="pool/data")
-        zfs["exists"].return_value = True
-        zfs["props"].return_value = {PROP_SOURCE_DATASET: "pool/data"}
-        resp = negotiate(client, dataset=OTHER_DS)
+        resp = negotiate(client, dataset="pool/data")
         assert resp.status_code == 409
+        assert resp.get_json() == {"error": (
+            f"server dataset {SERVER_DS} already holds backups of '{OTHER_DS}'; "
+            "refusing to mix in 'pool/data'")}
         zfs["set"].assert_not_called()
 
     def test_the_owner_read_failure_is_a_500_and_writes_nothing(self, client, authed, zfs):
-        negotiate(client, dataset="pool/data")
+        plant_rival(authed)
         zfs["exists"].return_value = True
         zfs["props"].side_effect = [{}, RuntimeError(SECRET)]       # the ownership check, then the owner read
-        resp = negotiate(client, dataset=OTHER_DS)
+        resp = negotiate(client, dataset="pool/data")
         assert resp.status_code == 500
         assert resp.get_json() == {"error": f"Failed to check {SERVER_DS}: {SECRET}"}
         zfs["set"].assert_not_called()
@@ -1334,12 +1430,14 @@ class TestPlaceholderOwnership:
     def test_a_placeholder_nobody_negotiated_for_is_stamped(self, client, zfs):
         """No pending entry: nothing speaks for it, the first negotiator owns it."""
         zfs["exists"].return_value = True
-        assert negotiate(client, dataset=OTHER_DS).status_code == 200
-        assert zfs["set"].call_args.args[1][PROP_SOURCE_DATASET] == OTHER_DS
+        assert negotiate(client, dataset="pool/data").status_code == 200
+        assert zfs["set"].call_args.args[1][PROP_SOURCE_DATASET] == "pool/data"
 
     def test_two_racing_negotiates_give_one_winner_and_the_loser_changes_nothing(
         self, authed, zfs
     ):
+        """A second negotiate of the same server dataset, mid-create, is told `busy`; one of a
+        different pool is a different server dataset and not part of this race."""
         inside_create, release = threading.Event(), threading.Event()
 
         def slow_create(*args, **kwargs):
@@ -1356,11 +1454,8 @@ class TestPlaceholderOwnership:
         thread.start()
         try:
             assert inside_create.wait(20)
-            loser = negotiate(authed.client(), dataset=OTHER_DS)       # the same server dataset, mid-create
-            assert loser.status_code in (409, 503)
-            assert loser.get_json() in (BUSY, {"error": (
-                f"server dataset {SERVER_DS} already holds backups of 'pool/data'; "
-                f"refusing to mix in '{OTHER_DS}'")})
+            loser = negotiate(authed.client(), dataset="pool/data")    # the same server dataset, mid-create
+            assert loser.status_code == 503 and loser.get_json() == BUSY
             assert zfs["create"].call_count == 1                      # the loser created nothing
             zfs["set"].assert_not_called()
         finally:
@@ -1375,7 +1470,7 @@ class TestPlaceholderOwnership:
         """Another client dataset took the name over while this create was running (its entry had
         expired): the failure must not drop the new owner's entry."""
         claim, _lookup, forget = pending_api(authed.app)
-        claim("pool/backups/client1/other", "cfg-o", "pool/other")
+        claim(PARENT_DS + "/other", "cfg-o", "pool/other")
 
         def create_fails_after_a_takeover(*args, **kwargs):
             forget(SERVER_DS)
@@ -1385,7 +1480,7 @@ class TestPlaceholderOwnership:
         zfs["create"].side_effect = create_fails_after_a_takeover
         assert negotiate(client, dataset="pool/data").status_code == 500
         assert pending_configs(authed.app)[SERVER_DS] == ("cfg-new-owner", OTHER_DS)
-        assert "pool/backups/client1/other" in pending_configs(authed.app)
+        assert PARENT_DS + "/other" in pending_configs(authed.app)
 
     def test_a_failed_create_removes_its_entry(self, client, authed, zfs):
         zfs["create"].side_effect = RuntimeError(SECRET)
@@ -1430,8 +1525,9 @@ class TestNegotiateClaim:
         seen = []
         zfs["create"].side_effect = lambda *a, **k: seen.append(set(streams_in_progress(authed.app)))
         assert negotiate(authed.client()).status_code == 200
-        # the dataset itself and the missing ancestor its `create -p` will make
-        assert seen == [{SERVER_DS, PARENT_DS}]
+        # the dataset itself and both missing ancestors (`<target>/<id>` and the pool level),
+        # held for each of the two creates
+        assert seen == [{SERVER_DS, PARENT_DS, ID_DS}] * 2
 
     @pytest.mark.parametrize("how", ["ok", "bad-body", "conflict", "create-fails", "set-fails",
                                      "value-error", "list-fails", "dry-run", "ancestor-unsettled"])
@@ -1555,39 +1651,47 @@ class TestUnsettledAncestor:
         assert_nothing_written(zfs)
 
     def test_an_existing_ancestor_without_a_token_proceeds(self, client, zfs, ancestors):
-        existing(zfs, PARENT_DS, PARENT_DS + "/a")
+        existing(zfs, ID_DS, PARENT_DS, PARENT_DS + "/a")
         assert ancestor_negotiate(client, "pool/a/b").status_code == 200
         zfs["create"].assert_not_called()               # every ancestor exists: nothing to create
 
-    def test_a_missing_id_directory_above_an_existing_ancestor_is_created_alone(self, client, zfs, ancestors):
+    def test_a_missing_id_directory_and_pool_level_above_an_existing_ancestor_are_created_alone(
+        self, client, zfs, ancestors
+    ):
         existing(zfs, PARENT_DS + "/a")
         assert ancestor_negotiate(client, "pool/a/b").status_code == 200
-        assert [str(c.args[0]) for c in zfs["create"].call_args_list] == [PARENT_DS]
+        assert [str(c.args[0]) for c in zfs["create"].call_args_list] == [ID_DS, PARENT_DS]
+
+    def test_only_the_id_directory_is_missing_above_the_pool_level(self, client, zfs, ancestors):
+        existing(zfs, PARENT_DS)
+        assert ancestor_negotiate(client, "pool/a").status_code == 200
+        assert [str(c.args[0]) for c in zfs["create"].call_args_list] == [ID_DS]
 
     def test_ancestors_that_do_not_exist_proceed(self, client, zfs, ancestors):
         existing(zfs)
         assert ancestor_negotiate(client, "pool/a/b/c").status_code == 200
         assert [str(c.args[0]) for c in zfs["create"].call_args_list] == [      # outermost first
-            PARENT_DS, PARENT_DS + "/a", PARENT_DS + "/a/b"]
+            ID_DS, PARENT_DS, PARENT_DS + "/a", PARENT_DS + "/a/b"]
 
     def test_the_calls_are_exactly_the_ancestors_between_the_dataset_and_the_id_directory(
         self, client, zfs, ancestors
     ):
-        existing(zfs, PARENT_DS, PARENT_DS + "/a", PARENT_DS + "/a/b")
+        existing(zfs, ID_DS, PARENT_DS, PARENT_DS + "/a", PARENT_DS + "/a/b")
         assert ancestor_negotiate(client, "pool/a/b/c").status_code == 200
         assert [str(c.args[0]) for c in zfs["exists"].call_args_list] == [
-            PARENT_DS + "/a/b/c", PARENT_DS + "/a/b", PARENT_DS + "/a", PARENT_DS]
+            PARENT_DS + "/a/b/c", PARENT_DS + "/a/b", PARENT_DS + "/a", PARENT_DS, ID_DS]
         assert ancestors.reads == [                      # the target itself is never read
             (PARENT_DS + "/a/b", PROP_CLIENT_ID), (PARENT_DS + "/a/b", "receive_resume_token"),
             (PARENT_DS + "/a", PROP_CLIENT_ID), (PARENT_DS + "/a", "receive_resume_token"),
             (PARENT_DS, PROP_CLIENT_ID), (PARENT_DS, "receive_resume_token"),
+            (ID_DS, PROP_CLIENT_ID), (ID_DS, "receive_resume_token"),
         ]
 
     @pytest.mark.parametrize("dataset, extra_exists", [
-        ("pool", 0),            # `<target>/<id>`: its parent is the target, which is not checked
-        ("pool/a", 1),          # one ancestor: `<target>/<id>`
-        ("pool/a/b", 2),
-        ("pool/a/b/c", 3),
+        ("pool", 1),            # `<target>/<id>/pool`: one ancestor, `<target>/<id>` (the target is not checked)
+        ("pool/a", 2),          # two ancestors: the pool level and `<target>/<id>`
+        ("pool/a/b", 3),
+        ("pool/a/b/c", 4),
     ])
     def test_the_cost_is_one_exists_per_ancestor(self, client, zfs, ancestors, dataset, extra_exists):
         assert ancestor_negotiate(client, dataset).status_code == 200
@@ -1672,25 +1776,25 @@ class TestPendingTtl:
 
     def test_the_409_reader(self, client, authed, zfs, clock):
         from zfsbackup.api import PENDING_CONFIG_TTL
-        negotiate(client, dataset="pool/data")
+        plant_rival(authed)
         clock.advance(PENDING_CONFIG_TTL - 1)
-        assert negotiate(client, dataset=OTHER_DS).status_code == 409
+        assert negotiate(client, dataset="pool/data").status_code == 409
         clock.advance(2)
-        assert negotiate(client, dataset=OTHER_DS).status_code == 200      # the expired entry is replaced
-        assert pending_configs(authed.app)[SERVER_DS][1] == OTHER_DS
+        assert negotiate(client, dataset="pool/data").status_code == 200   # the expired entry is replaced
+        assert pending_configs(authed.app)[SERVER_DS][1] == "pool/data"
         self.keys_agree(authed.app)
 
     def test_the_owner_check_on_an_existing_dataset_reads_the_expired_entry_as_none(
         self, client, authed, zfs, clock
     ):
         from zfsbackup.api import PENDING_CONFIG_TTL
-        negotiate(client, dataset="pool/data")
+        plant_rival(authed)
         zfs["exists"].return_value = True
         zfs["props"].return_value = {}
         clock.advance(PENDING_CONFIG_TTL - 1)
-        assert negotiate(client, dataset=OTHER_DS).status_code == 409
+        assert negotiate(client, dataset="pool/data").status_code == 409
         clock.advance(2)
-        assert negotiate(client, dataset=OTHER_DS).status_code == 200
+        assert negotiate(client, dataset="pool/data").status_code == 200
         assert dict(pending_configs(authed.app)) == {}
         self.keys_agree(authed.app)
 
@@ -1727,13 +1831,13 @@ class TestPendingTtl:
     def test_a_renegotiate_refreshes_the_deadline(self, client, authed, zfs, clock):
         """500 s in, negotiate again: still live at 1000 s after the first (500 s after the refresh),
         expired 700 s after the refresh."""
-        negotiate(client, dataset="pool/data")
+        plant_rival(authed)
         clock.advance(500)
-        negotiate(client, dataset="pool/data")
+        plant_rival(authed)                                  # the holder negotiates again: refreshed
         clock.advance(500)
-        assert negotiate(client, dataset=OTHER_DS).status_code == 409           # live
+        assert negotiate(client, dataset="pool/data").status_code == 409        # live
         clock.advance(200)
-        assert negotiate(client, dataset=OTHER_DS).status_code == 200            # expired
+        assert negotiate(client, dataset="pool/data").status_code == 200         # expired
 
     def test_the_keys_of_both_maps_always_agree(self, client, authed, zfs, clock, mocker):
         mocker.patch("zfsbackup.api.PENDING_CONFIGS_MAX", 3)
@@ -1743,14 +1847,14 @@ class TestPendingTtl:
             self.keys_agree(authed.app)
         assert len(pending_configs(authed.app)) == 3
         clock.advance(100)
-        forget("pool/backups/client1/d4")
+        forget(PARENT_DS + "/d4")
         self.keys_agree(authed.app)
         negotiate(client, dataset="pool/d9")
         self.keys_agree(authed.app)
         clock.advance(10_000)
-        lookup("pool/backups/client1/d5")                    # an expired read drops its entry
+        lookup(PARENT_DS + "/d5")                    # an expired read drops its entry
         self.keys_agree(authed.app)
-        assert "pool/backups/client1/d5" not in pending_deadlines(authed.app)
+        assert PARENT_DS + "/d5" not in pending_deadlines(authed.app)
         zfs["create"].side_effect = RuntimeError(SECRET)
         negotiate(client, dataset="pool/d10")                # a failed create withdraws its entry
         self.keys_agree(authed.app)
@@ -1759,8 +1863,7 @@ class TestPendingTtl:
         mocker.patch("zfsbackup.api.PENDING_CONFIGS_MAX", 2)
         for n in range(4):
             negotiate(client, dataset=f"pool/d{n}")
-        assert sorted(pending_deadlines(authed.app)) == [
-            "pool/backups/client1/d2", "pool/backups/client1/d3"]
+        assert sorted(pending_deadlines(authed.app)) == [PARENT_DS + "/d2", PARENT_DS + "/d3"]
 
     def test_the_stream_reader(self, mocker):
         from zfsbackup.api import PENDING_CONFIG_TTL
@@ -1881,12 +1984,12 @@ class TestAncestorClaims:
         existing(zfs)
         seen = self.held_during_create(authed, zfs)
         assert ancestor_negotiate(client, "pool/a/b/c").status_code == 200
-        everything = {PARENT_DS + "/a/b/c", PARENT_DS + "/a/b", PARENT_DS + "/a", PARENT_DS}
-        assert seen == [everything] * 3         # one create per missing ancestor, all claimed throughout
+        everything = {PARENT_DS + "/a/b/c", PARENT_DS + "/a/b", PARENT_DS + "/a", PARENT_DS, ID_DS}
+        assert seen == [everything] * 4         # one create per missing ancestor, all claimed throughout
         assert streams_in_progress(authed.app) == set()
 
     def test_an_existing_ancestor_is_not_claimed(self, client, authed, zfs, ancestors):
-        existing(zfs, PARENT_DS, PARENT_DS + "/a")
+        existing(zfs, ID_DS, PARENT_DS, PARENT_DS + "/a")
         seen = self.held_during_create(authed, zfs)
         assert ancestor_negotiate(client, "pool/a/b/c").status_code == 200
         assert seen == [{PARENT_DS + "/a/b/c", PARENT_DS + "/a/b"}]       # only the missing one, and the leaf
@@ -2014,7 +2117,7 @@ class TestAncestorClaims:
             thread.join(20)
         assert result == {"code": 200}
         assert streams_in_progress(authed.app) == set()
-        existing(zfs, PARENT_DS + "/a")                                    # the parent exists now
+        existing(zfs, ID_DS, PARENT_DS, PARENT_DS + "/a")                  # the parents exist now
         # `.../a` exists now and is not pending (only the leaf `.../a/b` is): the sibling proceeds
         assert ancestor_negotiate(authed.client(), "pool/a/c").status_code == 200
 
@@ -2026,19 +2129,19 @@ class TestPlainChildUnderARawParent:
     def test_a_child_whose_root_is_its_raw_parent_is_plain(self, client, zfs, server_props):
         with_snapshots(zfs, "a")
         server_props.encryption = "aes-256-gcm"
-        server_props.root = f"{ID_TREE}/a"                          # the parent, inside <target>/<id>/
+        server_props.root = f"{ID_TREE}/pool/a"                     # the parent, inside <target>/<id>/pool/
         resp = post_json(client, body_with(snapshots=["a"]), url=f"/backup/{CLIENT_ID}/pool/a/b/negotiate")
         assert resp.get_json()["server_copy"] == "plain"
-        assert resp.get_json()["server_dataset"] == f"{ID_TREE}/a/b"
+        assert resp.get_json()["server_dataset"] == f"{ID_TREE}/pool/a/b"
 
     def test_the_same_dataset_is_raw_once_it_is_its_own_root(self, client, zfs, server_props):
         with_snapshots(zfs, "a")
         server_props.encryption = "aes-256-gcm"
-        server_props.root = f"{ID_TREE}/a/b"
+        server_props.root = f"{ID_TREE}/pool/a/b"
         resp = post_json(client, body_with(snapshots=["a"]), url=f"/backup/{CLIENT_ID}/pool/a/b/negotiate")
         assert resp.get_json()["server_copy"] == "raw"
 
-    @pytest.mark.parametrize("root", ["pool/backups", "pool", ID_TREE, f"{ID_TREE}/other"])
+    @pytest.mark.parametrize("root", ["pool/backups", "pool", ID_TREE, f"{ID_TREE}/pool", f"{ID_TREE}/other"])
     def test_a_root_anywhere_else_is_plain(self, client, zfs, server_props, root):
         with_snapshots(zfs, "a")
         server_props.encryption, server_props.root = "aes-256-gcm", root
@@ -2070,7 +2173,7 @@ class TestPartialAncestorRule:
     def test_a_token_and_a_snapshot_does_not_block(self, client, zfs, parent):
         self.snapshots(zfs, "autosnap_1")
         assert ancestor_negotiate(client, "pool/a/b").status_code == 200
-        assert [str(c.args[0]) for c in zfs["create"].call_args_list] == [PARENT_DS]    # only the id directory
+        assert [str(c.args[0]) for c in zfs["create"].call_args_list] == [ID_DS, PARENT_DS]   # not `.../a`
 
     def test_no_token_does_not_block_and_nothing_is_listed(self, client, zfs, ancestors):
         existing(zfs, PARENT_DS + "/a")

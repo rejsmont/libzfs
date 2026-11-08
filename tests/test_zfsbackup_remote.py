@@ -2732,7 +2732,7 @@ class TestUrlRoundTripThroughTheServer:
         ) is None
 
         server_fs = exists.call_args.args[0]
-        assert server_fs.name == 'pool/backups/client-1/my data'
+        assert server_fs.name == 'pool/backups/client-1/pool/my data'
         props = zset.call_args.args[1]
         assert props['org.zfsbackup:client_id'] == 'client-1'
         assert props['org.zfsbackup:source_dataset'] == 'pool/my data'

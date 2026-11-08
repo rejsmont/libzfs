@@ -226,8 +226,9 @@ class TestBackupNegotiate:
 
     def test_negotiate_creates_only_the_parent_of_a_missing_dataset(self, client_with_remote, mocker):
         """R0: the first full stream creates the leaf (zfs refuses a raw full onto a pre-created
-        one), so negotiate makes only the missing parent -- one level, never mounted, stamped
-        with the bound client id (B-2c), no `-p` -- and sets nothing."""
+        one), so negotiate makes only the missing parents -- `<target>/<id>` and the pool level,
+        one level at a time, never mounted, stamped with the bound client id (B-2c), no `-p` --
+        and sets nothing."""
         mocker.patch('zfsbackup.api.zfs.exists', return_value=False)
         mock_create = mocker.patch('zfsbackup.api.zfs.create')
         mock_set = mocker.patch('zfsbackup.api.zfs.set')
@@ -239,11 +240,11 @@ class TestBackupNegotiate:
             json={'snapshots': [], 'config': encoded},
         )
         assert resp.status_code == 200
-        mock_create.assert_called_once()
-        assert str(mock_create.call_args[0][0]) == 'pool/backups/client1'      # the parent, not the leaf
-        assert mock_create.call_args.kwargs == {
-            'properties': {'canmount': 'noauto', PROP_CLIENT_ID: 'client1'}, 'mount': False,
-        }
+        assert [str(c.args[0]) for c in mock_create.call_args_list] == [ID_DS, POOL_DS]   # not the leaf
+        for call in mock_create.call_args_list:
+            assert call.kwargs == {
+                'properties': {'canmount': 'noauto', PROP_CLIENT_ID: 'client1'}, 'mount': False,
+            }
         mock_set.assert_not_called()
 
     def test_negotiate_sets_the_properties_of_an_existing_dataset(self, client_with_remote, mocker):
@@ -660,7 +661,9 @@ class TestBackupStreamWriteFailure:
 # Protocol: ?mode=fresh|resume, partial-receive discard, source-dataset check
 # ---------------------------------------------------------------------------
 
-SERVER_DS = 'pool/backups/client1/data'     # target / client id / the client dataset minus its pool
+SERVER_DS = 'pool/backups/client1/pool/data'     # target / client id / the client dataset, pool included
+ID_DS = 'pool/backups/client1'                   # <target>/<id>: the client's container
+POOL_DS = ID_DS + '/pool'                        # <target>/<id>/<pool>: the pool level of pool/data
 NOT_NEGOTIATED = {
     'error': (
         f'no configuration is recorded for {SERVER_DS}; negotiate again before streaming '
@@ -1046,8 +1049,8 @@ class TestFreshStreamDiscardsPartialState:
         assert stream.sent == [{'status': 'ok'}]
 
     @pytest.mark.parametrize('text', [
-        "cannot receive: 'pool/backups/client1/data' does not have any resumable receive state to abort",
-        "cannot open 'pool/backups/client1/data': dataset does not exist",
+        "cannot receive: 'pool/backups/client1/pool/data' does not have any resumable receive state to abort",
+        "cannot open 'pool/backups/client1/pool/data': dataset does not exist",
         "CANNOT OPEN 'x': Dataset Does Not Exist",
     ])
     def test_an_abort_that_finds_nothing_to_abort_is_a_clean_success(self, stream, text, caplog):
@@ -1099,7 +1102,7 @@ class TestFreshStreamDiscardsPartialState:
     def test_a_volume_is_aborted_like_a_filesystem(self, stream):
         stream.token(TOKEN)
         stream.run('fresh', dataset='pool/vol')
-        assert str(stream.abort.call_args[0][0]) == 'pool/backups/client1/vol'
+        assert str(stream.abort.call_args[0][0]) == 'pool/backups/client1/pool/vol'
 
 
 class TestDryRunAndOrder:
@@ -1234,9 +1237,10 @@ class TestSourceDatasetCheck:
         assert client_with_remote.post('/backup/client1/pool/data/negotiate', json=_body()).status_code == 500
         assert gate.active == 0
 
-    def test_the_server_dataset_drops_the_pool_so_two_pools_collide(self, stream, source_props):
-        """The reason for the check: tank/data and pool/data both map to
-        `<target>/<client>/data`."""
+    def test_a_copy_recorded_for_another_pool_is_refused_not_adopted(self, stream, source_props):
+        """The pool is part of the server name, so two pools never collide by name; the check now
+        guards a copy recorded for another source (renamed into place, or made under another
+        layout): `.../client1/pool/data` recording `tank/data` is refused."""
         source_props.return_value = {'org.zfsbackup:source_dataset': 'tank/data'}
         stream.run('fresh')
         assert stream.sent == [{'error': self.MISMATCH}]
@@ -1551,13 +1555,15 @@ class TestPerDatasetStreamLock:
                 assert _sent_by(ws) == [{'status': 'ok'}], (client, dataset)
             held.release()
 
-    def test_two_pools_mapping_to_one_server_dataset_do_share_the_lock(self, stream):
-        """`_server_dataset` drops the pool: tank/data and pool/data are the
-        same server dataset, so they exclude each other."""
+    def test_two_pools_are_two_server_datasets_and_do_not_share_the_lock(self, stream):
+        """`_server_dataset` keeps the pool: tank/data and pool/data are different server datasets
+        (`.../client1/tank/data` and `.../client1/pool/data`), so a stream of one never waits for
+        the other."""
         with HeldStream(stream) as held:
             ws = _ws()
+            ws.receive.side_effect = stream_script()
             stream.run('resume', ws=ws, dataset='tank/data')
-            assert _sent_by(ws) == [self.BUSY]
+            assert _sent_by(ws) == [{'status': 'ok'}]
             held.release()
 
     def test_the_locks_are_per_app(self, mocker):
@@ -1856,10 +1862,19 @@ class TestStreamsInProgressSet:
             held.release()
         assert stream.claimed == set()
 
-    def test_the_same_server_dataset_by_another_name_is_busy_too(self, stream):
+    def test_the_same_dataset_name_in_another_pool_is_not_busy(self, stream):
         with HeldStream(stream) as held:
             ws = _ws()
-            stream.run('resume', ws=ws, client='client1', dataset='tank/data')   # same server dataset
+            ws.receive.side_effect = stream_script()
+            stream.run('resume', ws=ws, client='client1', dataset='tank/data')   # another server dataset
+            assert _sent_by(ws) == [{'status': 'ok'}]
+            assert stream.claimed == {SERVER_DS}                                 # the held one only
+            held.release()
+
+    def test_the_same_dataset_again_is_busy(self, stream):
+        with HeldStream(stream) as held:
+            ws = _ws()
+            stream.run('resume', ws=ws, client='client1', dataset='pool/data')
             assert _sent_by(ws) == [{'error': 'busy', 'retry': True}]
             held.release()
 
@@ -1887,7 +1902,7 @@ class TestStreamsInProgressSet:
         assert stream.gate.active == 0
 
     def test_an_invalid_name_is_refused_with_no_claim_and_no_zfs(self, stream):
-        bad = 'pool/backups/client1//x'
+        bad = 'pool/backups/client1/pool//x'
         stream.run('fresh', dataset='pool//x')
         assert stream.sent == [{
             'error': f'invalid dataset name {bad!r}: {bad} is not a valid ZFS dataset name'
@@ -1937,7 +1952,7 @@ class TestStreamsInProgressSet:
                 h.__enter__()
                 held.append(h)
                 assert len(stream.claimed) == i + 1
-            assert stream.claimed == {f'pool/backups/client1/c{i}' for i in range(4)}
+            assert stream.claimed == {f'pool/backups/client1/pool/c{i}' for i in range(4)}
             for n, h in enumerate(held):
                 h.release()
                 assert len(stream.claimed) == 3 - n
@@ -2000,8 +2015,8 @@ class TestServerPathsUseTheBoundId:
         other = authed_with_remote.cert_for('client2')
         a = authed_with_remote.client().post('/backup/client1/pool/data/negotiate', json=_body())
         b = authed_with_remote.client(other).post('/backup/client2/pool/data/negotiate', json=_body())
-        assert a.get_json()['server_dataset'] == 'pool/backups/client1/data'
-        assert b.get_json()['server_dataset'] == 'pool/backups/client2/data'
+        assert a.get_json()['server_dataset'] == 'pool/backups/client1/pool/data'
+        assert b.get_json()['server_dataset'] == 'pool/backups/client2/pool/data'
 
     def test_the_stream_handler_ignores_the_client_id_it_is_called_with(self, stream):
         """The view's `client_id` argument is the URL's; the binding (`g.client_id`) is what
@@ -2021,7 +2036,7 @@ class TestServerPathsUseTheBoundId:
 
 
 class TestBadDatasetNamesAre400:
-    """A client dataset that makes `<target>/<id>/<rest>` an invalid filesystem name is a 400
+    """A client dataset that makes `<target>/<id>/<client dataset>` an invalid filesystem name is a 400
     (or a websocket error), never a 500, and no `zfs` command sees it."""
 
     BAD = 'pool/a%25b'          # the URL decodes to `pool/a%b`

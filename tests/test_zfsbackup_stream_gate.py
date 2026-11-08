@@ -492,7 +492,7 @@ class TestGateOnProtocolRefusals:
     """Every way the stream/negotiate protocol refuses a request leaves the
     gate balanced (a leaked registration would hang a reload's drain)."""
 
-    SERVER_DS = "pool/backups/client1/data"
+    SERVER_DS = "pool/backups/client1/pool/data"
 
     def _run(self, authed, ws, mode):
         qs = {} if mode is None else {"mode": mode}
@@ -506,7 +506,7 @@ class TestGateOnProtocolRefusals:
             ("none", "bogus", "unknown stream mode 'bogus'"),
             ("mismatch", "fresh", "refusing to mix in"),
             ("mismatch", "resume", "refusing to mix in"),
-            ("source-read-fails", "fresh", "Failed to check pool/backups/client1/data: "),
+            ("source-read-fails", "fresh", "Failed to check pool/backups/client1/pool/data: "),
             ("token-lookup-fails", "fresh", "for partial receive state"),
             ("abort-fails", "fresh", "Failed to discard the partial receive state"),
             ("receive-start-fails", "resume", "Failed to start zfs receive"),

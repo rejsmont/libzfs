@@ -44,13 +44,14 @@ from test_zfsbackup_api import (  # noqa: F401  (Stream: a harness, not a test; 
 from _stream_support import (
     FILESYSTEM_FORCED, HEADER, expected_receive_argv, get_value_answers, incremental_header, stream_script,
 )
-from _api_support import Authed, pending_configs
+from _api_support import Authed, pending_api, pending_configs
 from libzfseasy.types import Dataset
 from zfsbackup.api import SERVER_OWNED_PROPERTIES, canonical_dataset_config
 from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG, PROP_SOURCE_DATASET
 
 OWNED = [PROP_CONFIG, PROP_CLIENT_ID, PROP_SOURCE_DATASET]
 STORED = canonical_dataset_config(GOOD_CONFIG)
+TANK_SERVER_DS = "pool/backups/client1/tank/data"      # the pool is part of the server name
 EXPECTED_PROPS = {
     PROP_CONFIG: STORED,
     PROP_CLIENT_ID: "client1",
@@ -271,7 +272,7 @@ class TestStreamOwnsTheServerProperties:
     def test_it_uses_the_bound_id_and_the_url_dataset(self, stream):
         stream.run("resume", client="other", dataset="tank/vol")
         (call,) = stream.receive.call_args_list
-        assert str(call.args[0]) == "pool/backups/other/vol"
+        assert str(call.args[0]) == "pool/backups/other/tank/vol"
         assert call.kwargs["props"][PROP_CLIENT_ID] == "other"
         assert call.kwargs["props"][PROP_SOURCE_DATASET] == "tank/vol"
 
@@ -557,18 +558,30 @@ class TestPendingConfigStream:
         restarted.receive.assert_not_called()
 
     def test_another_client_datasets_entry_is_never_used(self, stream):
-        """`tank/data` negotiated first; `pool/data` maps to the same server dataset."""
+        """`tank/data` negotiated, `pool/data` did not: the pool is part of the server name, so the
+        entry is at `.../tank/data` and a stream of `pool/data` finds none."""
         stream.exists.return_value = False
         negotiate(stream, dataset="tank/data")
         stream.run("fresh", dataset="pool/data")
         assert stream.sent == [NOT_NEGOTIATED]
         stream.receive.assert_not_called()
-        assert list(pending_configs(stream.app)) == [SERVER_DS]       # theirs is untouched
+        assert list(pending_configs(stream.app)) == [TANK_SERVER_DS]  # theirs is untouched
         stream.ws.receive.side_effect = stream_script(b"chunk")
         stream.run("fresh", dataset="tank/data")
         assert stream.sent[-1] == {"status": "ok"}
         props = stream.receive.call_args.kwargs["props"]
         assert props[PROP_SOURCE_DATASET] == "tank/data"
+
+    def test_a_rival_entry_at_the_server_name_is_never_used(self, stream):
+        """An entry for another client dataset (`tank/data`) that sits at this dataset's server name
+        (it cannot come from a negotiate any more: the pool is part of the name) is never used for
+        a stream of `pool/data`."""
+        stream.exists.return_value = False
+        assert pending_api(stream.app)[0](SERVER_DS, STORED, "tank/data") is None
+        stream.run("fresh", dataset="pool/data")
+        assert stream.sent == [NOT_NEGOTIATED]
+        stream.receive.assert_not_called()
+        assert list(pending_configs(stream.app)) == [SERVER_DS]       # theirs is untouched
 
     def test_another_clients_entry_is_never_used(self, stream):
         stream.exists.return_value = False
@@ -576,7 +589,7 @@ class TestPendingConfigStream:
         stream.run("fresh", client="client1")
         assert stream.sent == [NOT_NEGOTIATED]
         stream.receive.assert_not_called()
-        assert list(pending_configs(stream.app)) == ["pool/backups/client2/data"]
+        assert list(pending_configs(stream.app)) == ["pool/backups/client2/pool/data"]
 
     def test_an_existing_dataset_uses_its_local_config_and_keeps_force(self, stream):
         """The dataset exists by stream time: the local property wins, the stale entry is dropped."""
@@ -791,7 +804,7 @@ from zfsbackup.api import (  # noqa: E402
 A, B, C = "autosnap_20260101000000", "autosnap_20260102000000", "autosnap_20260103000000"
 GA, GB, GC = 1001, 1002, 1003
 ROWS = [ServerSnapshot(A, 100, GA), ServerSnapshot(B, 200, GB), ServerSnapshot(C, 300, GC)]
-DS = "pool/backups/client1/data"
+DS = "pool/backups/client1/pool/data"
 
 
 def rows_for_stream():

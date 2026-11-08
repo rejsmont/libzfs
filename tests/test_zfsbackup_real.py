@@ -162,7 +162,7 @@ def target_root(auto_zfs_pool):
 # real `zfs send` / `zfs receive`.
 
 #: The id the server binds to the pinned client certificate. It names the
-#: server-side dataset: `<target>/<CLIENT_ID>/<source dataset without its pool>`.
+#: server-side dataset: `<target>/<CLIENT_ID>/<source dataset>` (pool included).
 CLIENT_ID = 'b7-client'
 DEST = 'server'
 
@@ -253,8 +253,7 @@ class E2E:
         self.remote_mgr = remote_mgr
         self.caplog = caplog
         self.monkeypatch = monkeypatch
-        relative = source.name.split('/', 1)[1]
-        self.server_ds = f'{target_root}/{CLIENT_ID}/{relative}'
+        self.server_ds = f'{target_root}/{CLIENT_ID}/{source.name}'
 
     # -- the client's data ------------------------------------------------------
     def snapshot(self, hours_ago):
