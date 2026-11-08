@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.0.0rc3 (2026-11-08)
+
+Third release candidate: one change to the server's dataset layout and one fix.
+
+### Compatibility
+
+- **Wire protocol 1**, unchanged: rc2 and rc3 clients and servers work together. The server alone decides where a
+  copy is stored, so the layout below follows the **server's** version.
+- **Config schema head `5d2f8a60c1e4`**, unchanged: no migration from rc2.
+- **Send flags and `raw` semantics** unchanged.
+- **The server dataset layout changed** (below). A server upgraded from rc1/rc2 does not continue the copies it
+  already holds: each client dataset is sent in full again to its new path, and the old copies stay where they
+  are (still pruned by their own retention, newest snapshot always kept) until you destroy them. **Before the
+  upgrade, rename a client's old pool-root copy (`<target>/<client_id>` itself, when it holds one) out of the
+  target tree**: if it is encrypted (raw), the server cannot create the new `<target>/<client_id>/<pool>` level
+  under it and no dataset of that client is backed up until it is moved (`zfsbackup/README.md`, "Layout").
+
+### Changes
+
+- **Server copies keep the client's pool name.** A client's `tank/data` is stored as
+  `<target>/<client_id>/tank/data` (it was `<target>/<client_id>/data`), and a pool root `tank` as
+  `<target>/<client_id>/tank` (it was `<target>/<client_id>` itself). Datasets of the same name in two pools of one
+  client (`tank/data`, `fast/data`) are now kept apart instead of the second being refused with 409. Moving a
+  dataset to another pool now gives it a new server path, so its next backup is a full send; `zfsbackup-config
+  rename dataset` says so.
+
+### Fixes
+
+- **`trust token create` run twice at once on a host without a server TLS identity** could fail one of them with
+  "certificate …/server.crt does not exist" while the other created it. The losing run now reads the certificate
+  the other one wrote.
+
 ## 1.0.0rc2 (2026-10-29)
 
 Second release candidate. The code is rc1's with three fixes; what is new is the packaging: `libzfseasy` is its own

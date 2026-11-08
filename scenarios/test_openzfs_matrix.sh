@@ -2081,7 +2081,8 @@ sec_Z6() {
     g 25_props "$R/srv/decrypted"
     cappipe 26_enc_source_plain_under_enc 0 "zfs send $EP@a" "zfs receive $RF $OWN $R/esrv/decrypted"
     g 27_props "$R/esrv/decrypted"
-    # the real layout: <target>/<client_id>/<dataset>
+    # an id dataset above the received one (the server's real path is <target>/<client_id>/<client pool>/<dataset>: one more placeholder level
+    # of the same kind; the captures only need a received dataset below a placeholder, so they keep one level and their names)
     st zfs create "$R/esrv/id1"; st zfs create "$R/srv/id1"
     cappipe 30_raw_leaf_under_id_under_enc 0 "zfs send -w $EP@a" "zfs receive $RF $OWN $R/esrv/id1/ep"
     cappipe 31_raw_child_under_raw_parent_under_id 0 "zfs send -w $EC@a" "zfs receive $RF $OWN $R/esrv/id1/ep/ec"

@@ -33,7 +33,7 @@ Two ways to install it; a host uses one of them, never both:
 
 ```bash
 # Debian: ZFS is in `contrib` (enable it in /etc/apt/sources.list.d/debian.sources first).
-sudo apt install ./python3-libzfseasy_<version>_all.deb ./zfsbackup_<version>_all.deb   # e.g. 1.0.0~rc2-1
+sudo apt install ./python3-libzfseasy_<version>_all.deb ./zfsbackup_<version>_all.deb   # e.g. 1.0.0~rc3-1
 ```
 
 This installs `zfsbackupd` and `zfsbackup-config` in `/usr/bin`, pulls in `zfsutils-linux` and the Python
@@ -852,7 +852,8 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
   `volmode=none`, `mountpoint=none`, `sharenfs=off`, `sharesmb=off`, `setuid=off`, `exec=off` and
   `devices=off` on a filesystem, and `readonly=on`, `volmode=none` on a volume, and takes no holds (`-h`). A
   received dataset is never mounted, shared or exposed as a device, whatever the client's properties say;
-  the containers the server creates for a client (`<target>/<client_id>` and parents) are `canmount=noauto`.
+  the containers the server creates for a client (`<target>/<client_id>`, `<target>/<client_id>/<pool>` and any
+  missing parents of a client dataset) are `canmount=noauto`.
   Read data through a clone outside the tree ([Getting files back](#getting-files-back-file-level)).
 - **Only plain streams are received.** The server reads each stream's header before `zfs receive` runs and
   refuses property or replication streams (`zfs send -p`, `-R`, `-I`), a stream whose base is not the one the
@@ -867,10 +868,18 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
 - **A client that shortens its retention** is logged on the server at WARNING ("the retention horizon of …
   shrinks from 30d to 7d"): the server applies the client's retention as sent, so older snapshots go at the
   next pruning cycle.
-- **Layout.** A client's dataset `tank/data` is stored as `<target>/<client_id>/data`: the server drops the
-  client's **pool** name and decides the rest; the client never chooses a path. A client's pool root `tank`
-  is `<target>/<client_id>` itself. Two client datasets that map to the same server name (`tank/data` and
-  `rpool/data`) collide: the second is refused with 409.
+- **Layout.** A client's dataset `tank/data` is stored as `<target>/<client_id>/tank/data`, pool name
+  included, so `tank/data` and `rpool/data` on one host are kept apart. The server decides the path; the
+  client never chooses one. A client's pool root `tank` is `<target>/<client_id>/tank`. Moving a dataset to
+  another pool (or renaming it) gives it a new server path: the next backup is a full send, and the old
+  server copy stays where it is until you remove it.
+  **A server upgraded from 1.0.0rc1/rc2** (which stored `tank/data` as `<target>/<client_id>/data` and a pool
+  root at `<target>/<client_id>` itself) sends every client dataset in full again to the new path; the old
+  copies stay, and count toward a quota on `<target>/<client_id>`, until you destroy them. If it holds a
+  client's pool-root copy at `<target>/<client_id>`, rename that copy out of the target tree (below) before the
+  upgraded server receives from that client: an encrypted (raw) one would block every new copy of the client,
+  since the server cannot create `<target>/<client_id>/<pool>` under a dataset whose key it lacks, and a plain
+  one would carry the new copies with it when renamed later.
 - **Retention is the client's, run by the server.** The server prunes each received dataset with the
   retention rules that the client sent (`org.zfsbackup:config`), using the **server's** `snapshot_prefix`. A
   client with another prefix is never pruned on the server (it keeps everything), so use the same prefix.
@@ -891,7 +900,7 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
   on the server, then let the next cycle send in full:
   ```bash
   sudo zfs create -p tank/backups-aside
-  sudo zfs rename tank/backups/<client_id>/data tank/backups-aside/<client_id>-data-$(date +%F)
+  sudo zfs rename tank/backups/<client_id>/tank/data tank/backups-aside/<client_id>-data-$(date +%F)
   ```
   Inside the tree it would still be pruned, and its `source_dataset` would get the new send refused with
   409. Destroy the aside copy when you no longer need it.
@@ -998,7 +1007,7 @@ it there:
 ```bash
 sudo zfs create -p tank/restore
 sudo zfs clone -o readonly=on -o canmount=on -o mountpoint=/mnt/restore/data \
-     tank/backups/<client_id>/data@autosnap_20261021120000 tank/restore/data
+     tank/backups/<client_id>/tank/data@autosnap_20261021120000 tank/restore/data
 # … copy the files out of /mnt/restore/data …
 sudo zfs destroy tank/restore/data
 ```
@@ -1024,11 +1033,11 @@ dataset that **still exists on the client must be renamed aside first** (`zfs re
 tank/data.old`): a full receive onto an existing dataset fails.
 
 ```bash
-# on the server (plain copy; the client dataset tank/data is stored as <target>/<client_id>/data)
-sudo zfs send -L -c tank/backups/<client_id>/data@autosnap_20261021120000 \
+# on the server (plain copy; the client dataset tank/data is stored as <target>/<client_id>/tank/data)
+sudo zfs send -L -c tank/backups/<client_id>/tank/data@autosnap_20261021120000 \
   | ssh client sudo zfs receive -u tank/data
 # an encrypted dataset: raw, then load the key with the client's original key
-sudo zfs send -w tank/backups/<client_id>/secret@… | ssh client sudo zfs receive -u tank/secret
+sudo zfs send -w tank/backups/<client_id>/tank/secret@… | ssh client sudo zfs receive -u tank/secret
 ssh client sudo zfs load-key tank/secret
 # then, on the client, after checking it:
 sudo zfs mount tank/data
@@ -1044,7 +1053,7 @@ the client**: the server has none, so a lost key means a lost raw backup.
 
 > **The server never rolls its history back for a client.** An incremental receive with `zfs receive -F` would
 > roll the server copy back to the stream's base and destroy every server snapshot newer than it (OpenZFS 2.1,
-> 2.2 and 2.4 alike). So the server passes `-F` only when the base is its newest snapshot (or when the one
+> 2.2, 2.3 and 2.4 alike). So the server passes `-F` only when the base is its newest snapshot (or when the one
 > newer snapshot is one the client itself sent and then lost, see below), and refuses any other stream whose
 > base is older than its newest snapshot. A client that rolls back (`zfs rollback -r`), or restores an older
 > snapshot in place under the same name, finds the server ahead of it: it logs one ERROR naming the server copy

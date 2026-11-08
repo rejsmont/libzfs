@@ -2258,8 +2258,9 @@ def client_dataset_problem(dataset) -> Optional[str]:
     unusable, or `None`. It becomes `org.zfsbackup:source_dataset` verbatim,
     so a character that `zfs list -H` uses as a row or column separator is
     refused before any `zfs` call, and the whole name must be a valid
-    filesystem name (`_server_dataset` drops its pool component, so checking
-    only the derived server name would not cover it)."""
+    filesystem name on its own (the derived server name being valid does
+    not prove it: its pool component has stricter rules than one below
+    `<target>/<id>/`, e.g. `1tank`)."""
     if not isinstance(dataset, str) or not dataset:
         return "empty client dataset name"
     if any(c in _UNFRAMEABLE for c in dataset):
@@ -2854,22 +2855,23 @@ def create_app(
 
     def _server_dataset(client_id: str, client_dataset: str) -> str:
         """Derive the server-side dataset path from the client's dataset
-        name: `<target>/<client_id>/<client dataset without its pool>`.
+        name: `<target>/<client_id>/<client dataset>`, pool included, so
+        datasets of the same name in two of the client's pools never meet.
         `client_id` is always the BOUND id (`g.client_id`). Raises
         `_BadDatasetName` (the routes answer 400) when the client dataset
         name (`client_dataset_problem`) or the result is not a valid
-        filesystem name, so no `zfs` command ever sees it."""
-        parts = client_dataset.split('/', 1)
-        relative = parts[1] if len(parts) > 1 else ''
-        name = f"{target}/{client_id}/{relative}" if relative else f"{target}/{client_id}"
-        try:
-            Filesystem(name)
-        except Exception as e:
-            raise _BadDatasetName(f"invalid dataset name {name!r}: {e}") from None
+        filesystem name, so no `zfs` command ever sees it. The client name
+        is checked first: its refusal names a control character without
+        repeating it raw (`Filesystem`'s own message would)."""
         problem = client_dataset_problem(client_dataset)
         if problem is not None:
             # `!r`: the name may hold the very control character refused.
             raise _BadDatasetName(f"invalid dataset name {client_dataset!r}: {problem}")
+        name = f"{target}/{client_id}/{client_dataset}"
+        try:
+            Filesystem(name)
+        except Exception as e:
+            raise _BadDatasetName(f"invalid dataset name {name!r}: {e}") from None
         return name
 
     def _server_copy_kind(server_fs, client_id: str) -> str:
@@ -2992,10 +2994,11 @@ def create_app(
           (`zfs create -o`, `zfs receive -o`, also while a first receive is
           only partial), so this only meets datasets that came from
           elsewhere;
-        - it records a different client dataset as its source.
-          `_server_dataset` drops the pool, so `tank/data` and `backup/data`
-          map to the same server dataset and would otherwise silently share
-          (and overwrite) it.
+        - it records a different client dataset as its source. Two client
+          names never derive the same server name (`_server_dataset` keeps
+          the pool), so this meets a copy an operator renamed into place, or
+          one made under another layout, which a send would otherwise
+          silently share (and overwrite).
 
         A dataset without a source-dataset property (a container negotiate
         made, never negotiated itself) is not a conflict for that property.
@@ -4023,11 +4026,12 @@ def create_app(
                             # created, so a dataset that appeared meanwhile is a
                             # failure, not adopted). Each one is stamped with the
                             # local `client_id` (B-2c) and never mounted (B-2a).
-                            # Limitation: this makes `<target>/<id>` a plain
-                            # placeholder for the first non-root dataset, so a raw
-                            # backup of the client's pool-root dataset received
-                            # after another one meets the encrypted-overwrite
-                            # refusal (`_receive_error` explains it).
+                            # Limitation: this makes `<target>/<id>/<pool>` a
+                            # plain placeholder for the first non-root dataset of
+                            # that pool, so a raw backup of the client's pool-root
+                            # dataset received after another one meets the
+                            # encrypted-overwrite refusal (`_receive_error`
+                            # explains it).
                             # Filesystems only (no size, no positional argument:
                             # `zfs.create` never dispatches to `create -V`; see the
                             # note at the receive about volumes).

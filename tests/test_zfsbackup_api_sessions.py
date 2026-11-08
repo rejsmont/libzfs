@@ -75,7 +75,7 @@ from zfsbackup.remote import WS_IDLE_TIMEOUT
 
 API_LOGGER = "zfsbackup.api"
 CUTTING = "cutting the running stream"
-SERVER = "pool/backups/alice/data"
+SERVER = "pool/backups/alice/pool/data"
 
 START_METHODS = [
     m for m in ("fork", "spawn", "forkserver") if m in multiprocessing.get_all_start_methods()
@@ -1019,7 +1019,7 @@ class Runaway(BaseException):
 
 
 ROUTE_CLIENT = CLIENT_ID                    # `client1`, the certificate Authed pins
-ROUTE_SERVER_DATASET = f"pool/backups/{ROUTE_CLIENT}/data"
+ROUTE_SERVER_DATASET = f"pool/backups/{ROUTE_CLIENT}/pool/data"
 
 
 class RouteRig:

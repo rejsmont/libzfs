@@ -1,6 +1,6 @@
 # Testing Guide for libzfseasy and zfsbackup
 
-This directory contains the test suite for both packages of the `zfsbackup` distribution: the `libzfseasy` bindings
+This directory contains the test suite for the two distributions: the `libzfseasy` bindings
 and the `zfsbackup` daemon and CLI.
 
 ## Overview
@@ -28,7 +28,7 @@ poetry install --with dev
 Or if using pip (the dev dependencies are a Poetry group, not an extra):
 
 ```bash
-pip install -e .
+pip install -e libs/libzfseasy -e .
 pip install pytest pytest-mock pytest-cov pytest-xdist requests-mock
 ```
 
@@ -150,7 +150,7 @@ pytest -x
 ### In a git worktree
 
 ```bash
-PYTHONPATH=<worktree> <venv python> -m pytest
+PYTHONPATH=<worktree>:<worktree>/libs/libzfseasy <venv python> -m pytest
 ```
 
 Without it the editable install imports the main tree's packages, not the worktree's.
@@ -291,7 +291,7 @@ Importable from any test module (`tests/` is on `sys.path`); none is collected a
 | Module | What it provides |
 |---|---|
 | `_hermetic.py` | stub policy, `hermetic_env()`, `nested_env()`, the real-`zfs` definition and the orphan hunt |
-| `_tls_support.py` | real generated identities, a scripted `StubTrust`, `make_gateway`, `pin_client`/`unpin_client`, `https_get`/`tls_probe` |
+| `_tls_support.py` | real generated identities, a scripted `StubTrust`, `make_gateway`, `pin_client`/`unpin_client`, `https_get`/`try_get`, `raw_connect` |
 | `_api_support.py` | client certificates, `FakeGateway`, `Authed`, `RealTrust`, `/enroll` and `/rotate` bodies |
 | `_remote_support.py` | `make_transport`, `fake_connect_pinned`, `client_tls_dir`, `whoami_json` for `RemoteBackupManager` tests |
 | `_enroll_support.py` | `RealServer` (real app, gateway and TLS listener) for the `enroll` / `identity rotate` CLI tests |
@@ -315,7 +315,7 @@ Importable from any test module (`tests/` is on `sys.path`); none is collected a
 
 ## Data fixtures
 
-- `fixtures/openzfs/<2.1.5|2.2.2|2.4.1>/` - real `zfs`/`zpool` output captured on each supported OpenZFS version,
+- `fixtures/openzfs/<2.1.5|2.2.2|2.3.9|2.4.1>/` - real `zfs`/`zpool` output captured on each supported OpenZFS version,
   loaded with `_openzfs_fixtures.py`; see [fixtures/openzfs/README.md](fixtures/openzfs/README.md).
 - `fixtures/get_regression_pre_d5.json` - what `zfs.get()` returned (objects, warnings, skipped-row counts, argv)
   before the D5 parser change, the regression baseline of `test_framing.py::TestGetUnchangedByRows`.

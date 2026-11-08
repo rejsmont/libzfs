@@ -43,7 +43,7 @@ from zfsbackup.stopflag import StopFlag
 #: The client id and dataset every rig stream uses.
 CLIENT = "alice"
 DATASET = "pool/data"
-SERVER_DATASET = f"pool/backups/{CLIENT}/data"
+SERVER_DATASET = f"pool/backups/{CLIENT}/pool/data"
 
 
 def eventually(predicate, timeout=20.0, interval=0.02):

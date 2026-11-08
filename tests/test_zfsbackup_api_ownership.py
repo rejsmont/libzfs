@@ -27,7 +27,7 @@ from _openzfs_fixtures import VERSIONS, load_section
 from _stream_support import HEADER
 from test_zfsbackup_api import Stream, source_props, stored_config  # noqa: F401  (Stream: harness; rest: fixtures)
 from test_zfsbackup_api_negotiate import (  # noqa: F401  (fixtures and helpers)
-    CLIENT_ID, CREATE_KWARGS, PARENT_DS, REAL_GET_VALUE, SERVER_DS, ancestor_negotiate, ancestors, authed,
+    CLIENT_ID, CREATE_KWARGS, ID_DS, PARENT_DS, REAL_GET_VALUE, SERVER_DS, ancestor_negotiate, ancestors, authed,
     client, existing, negotiate, zfs, _config, assert_nothing_written, enc, good, GOOD,
 )
 from zfsbackup import api as _api
@@ -72,13 +72,29 @@ class TestUnownedIsRefused:
         assert dict(pending_configs(authed.app)) == {}
         assert streams_in_progress(authed.app) == set() and authed.gate.active == 0
 
-    def test_an_unowned_id_directory_blocks_the_new_leaf_below_it(self, client, authed, zfs, ancestors):
-        existing(zfs, PARENT_DS)
+    def test_an_unowned_pool_level_blocks_the_new_leaf_below_it(self, client, authed, zfs, ancestors):
+        """`<target>/<id>/<pool>` is a placeholder level negotiate makes; one that exists without
+        a local client id was not made for a backup."""
+        existing(zfs, ID_DS, PARENT_DS)
         ancestors.owner[PARENT_DS] = None
         self.refused(ancestor_negotiate(client, "pool/a"), PARENT_DS)
         assert_nothing_written(zfs)
         assert dict(pending_configs(authed.app)) == {}
         assert streams_in_progress(authed.app) == set()
+
+    def test_an_unowned_id_directory_blocks_the_new_leaf_below_it(self, client, authed, zfs, ancestors):
+        existing(zfs, ID_DS)
+        ancestors.owner[ID_DS] = None
+        self.refused(ancestor_negotiate(client, "pool/a"), ID_DS)
+        assert_nothing_written(zfs)                            # the missing levels below it are not built around it
+        assert dict(pending_configs(authed.app)) == {}
+        assert streams_in_progress(authed.app) == set()
+
+    def test_an_unowned_id_directory_blocks_a_pool_root_dataset_too(self, client, zfs, ancestors):
+        existing(zfs, ID_DS)
+        ancestors.owner[ID_DS] = None
+        self.refused(negotiate(client, dataset="pool"), ID_DS)
+        assert_nothing_written(zfs)
 
     def test_an_unowned_intermediate_dataset(self, client, zfs, ancestors):
         existing(zfs, PARENT_DS, PARENT_DS + "/a")
@@ -117,7 +133,7 @@ class TestUnownedIsRefused:
         assert_nothing_written(zfs)
 
     def test_owned_containers_pass(self, client, zfs, ancestors):
-        existing(zfs, PARENT_DS, PARENT_DS + "/a")             # both carry the bound id
+        existing(zfs, ID_DS, PARENT_DS, PARENT_DS + "/a")      # all carry the bound id
         assert ancestor_negotiate(client, "pool/a/b").status_code == 200
         zfs["create"].assert_not_called()
 
@@ -184,10 +200,10 @@ class TestOwnerReadIsLocal:
         assert [(str(c.args[0]), c.kwargs) for c in calls] == [(SERVER_DS, {"sources": "local"})]
 
     def test_every_ancestor_is_read_locally(self, client, zfs, ancestors):
-        existing(zfs, PARENT_DS, PARENT_DS + "/a")
+        existing(zfs, ID_DS, PARENT_DS, PARENT_DS + "/a")
         assert ancestor_negotiate(client, "pool/a/b").status_code == 200
         calls = [c for c in ancestors.mock.call_args_list if c.args[1] == PROP_CLIENT_ID]
-        assert [str(c.args[0]) for c in calls] == [PARENT_DS + "/a", PARENT_DS]
+        assert [str(c.args[0]) for c in calls] == [PARENT_DS + "/a", PARENT_DS, ID_DS]
         assert all(c.kwargs == {"sources": "local"} for c in calls)
 
     def test_a_received_only_client_id_is_unowned(self, client, zfs, ancestors):
@@ -275,7 +291,7 @@ class TestUnownedWarning:
         assert len(warnings_of(caplog)) == 2
 
     def test_a_name_with_a_space_is_quoted_in_the_hint_and_the_log(self, client, zfs, ancestors, caplog):
-        name = "pool/backups/client1/my data"
+        name = PARENT_DS + "/my data"
         existing(zfs, name)
         ancestors.owner[name] = None
         with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
@@ -291,7 +307,7 @@ class TestUnownedWarning:
         zfs["props"].return_value = {}
         zfs["exists"].side_effect = None
         for i in range(1100):
-            name = f"pool/backups/client1/d{i}"
+            name = f"{PARENT_DS}/d{i}"
             ancestors.owner[name] = None
             assert negotiate(client, dataset=f"pool/d{i}").status_code == 409
         assert len(noted) <= 1025
@@ -405,9 +421,17 @@ class TestAncestorCreation:
         return mock_subprocess
 
     def test_the_argv_of_one_missing_ancestor(self, client, zfs, real_create):
+        existing(zfs, ID_DS)
         assert negotiate(client).status_code == 200
         assert create_argvs(real_create) == [
             ["create", "-u", "-o", "canmount=noauto", "-o", f"{PROP_CLIENT_ID}={CLIENT_ID}", PARENT_DS]]
+
+    def test_the_argv_of_both_levels_of_a_new_client(self, client, zfs, real_create):
+        """Nothing exists: `<target>/<id>` and then the pool level, one command each."""
+        existing(zfs)
+        assert negotiate(client).status_code == 200
+        stamp = ["create", "-u", "-o", "canmount=noauto", "-o", f"{PROP_CLIENT_ID}={CLIENT_ID}"]
+        assert create_argvs(real_create) == [stamp + [ID_DS], stamp + [PARENT_DS]]
 
     def test_no_dash_p_ever(self, client, zfs, real_create):
         assert ancestor_negotiate(client, "pool/a/b/c").status_code == 200
@@ -418,12 +442,12 @@ class TestAncestorCreation:
         existing(zfs)
         assert ancestor_negotiate(client, "pool/a/b/c").status_code == 200
         assert [a[-1] for a in create_argvs(real_create)] == [
-            PARENT_DS, PARENT_DS + "/a", PARENT_DS + "/a/b"]
+            ID_DS, PARENT_DS, PARENT_DS + "/a", PARENT_DS + "/a/b"]
         assert all(a[:-1] == ["create", "-u", "-o", "canmount=noauto", "-o", f"{PROP_CLIENT_ID}={CLIENT_ID}"]
                    for a in create_argvs(real_create))
 
     def test_only_the_missing_levels_are_created(self, client, zfs, real_create):
-        existing(zfs, PARENT_DS)
+        existing(zfs, ID_DS, PARENT_DS)
         assert ancestor_negotiate(client, "pool/a/b/c").status_code == 200
         assert [a[-1] for a in create_argvs(real_create)] == [PARENT_DS + "/a", PARENT_DS + "/a/b"]
 
@@ -434,7 +458,12 @@ class TestAncestorCreation:
         created = {str(c.args[0]) for c in zfs["create"].call_args_list}
         assert "pool/backups" not in asked | created and "pool" not in asked | created
 
-    def test_a_top_level_client_dataset_creates_nothing_at_all(self, client, zfs, real_create):
+    def test_a_pool_root_dataset_creates_only_the_id_directory(self, client, zfs, real_create):
+        assert negotiate(client, dataset="pool").status_code == 200
+        assert [a[-1] for a in create_argvs(real_create)] == [ID_DS]
+
+    def test_a_pool_root_dataset_with_its_id_directory_creates_nothing_at_all(self, client, zfs, real_create):
+        existing(zfs, ID_DS)
         assert negotiate(client, dataset="pool").status_code == 200
         assert create_argvs(real_create) == []
 
@@ -445,12 +474,14 @@ class TestAncestorCreation:
         record = load_section(version, "M8")["M8/C9.a1_unencrypted_parent"]
         assert record.rc == 0
         captured = record.cmd.split()[1:]
+        existing(zfs, ID_DS)                                     # exactly one level is missing
         assert negotiate(client).status_code == 200
         (argv,) = create_argvs(real_create)
         assert argv[:-1] == captured[:-1][:5] + [f"{PROP_CLIENT_ID}={CLIENT_ID}"]
         assert argv[:5] == captured[:5]
 
     def test_the_created_container_is_unmounted_and_stamped_in_one_command(self, client, zfs, real_create):
+        existing(zfs, ID_DS)
         negotiate(client)
         (argv,) = create_argvs(real_create)
         assert "-u" in argv and f"{PROP_CLIENT_ID}={CLIENT_ID}" in argv and "canmount=noauto" in argv
@@ -477,14 +508,14 @@ class TestCreateFailure:
         zfs["create"].side_effect = create
         resp = ancestor_negotiate(client, "pool/a/b")
         assert resp.status_code == 500
-        assert made == [PARENT_DS]                              # created before the failure
+        assert made == [ID_DS, PARENT_DS]                       # created before the failure
         assert dict(pending_configs(authed.app)) == {}
         assert streams_in_progress(authed.app) == set()
-        # the retry finds the first level in place and builds the rest
+        # the retry finds the first levels in place and builds the rest
         zfs["create"].side_effect = lambda ds, **k: made.append(str(ds))
-        existing(zfs, PARENT_DS)
+        existing(zfs, ID_DS, PARENT_DS)
         assert ancestor_negotiate(client, "pool/a/b").status_code == 200
-        assert made == [PARENT_DS, PARENT_DS + "/a"]
+        assert made == [ID_DS, PARENT_DS, PARENT_DS + "/a"]
         assert list(pending_configs(authed.app)) == [PARENT_DS + "/a/b"]
 
     def test_a_dataset_that_appeared_between_the_check_and_the_create_is_a_failure_not_an_adoption(

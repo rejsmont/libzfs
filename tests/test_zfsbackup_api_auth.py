@@ -492,10 +492,10 @@ def _stream(authed, cert, client_id, *, mode="resume", dataset="pool/data", ws=N
 
 class TestAuthorization:
     """Server datasets are `<target>/<bound id>/...`. Certificate B is bound to `host-b`; host
-    A's data is at `pool/backups/host-a/data`."""
+    A's data is at `pool/backups/host-a/pool/data`."""
 
-    A_DATA = "pool/backups/host-a/data"
-    B_DATA = "pool/backups/host-b/data"
+    A_DATA = "pool/backups/host-a/pool/data"
+    B_DATA = "pool/backups/host-b/pool/data"
 
     @pytest.fixture
     def two(self, authed):
@@ -618,9 +618,10 @@ class TestAuthorization:
         assert [c.kwargs["force"] for c in zfs.receive.call_args_list] == [False, False]
         assert [c.kwargs["props"][PROP_CLIENT_ID] for c in zfs.receive.call_args_list] == ["host-a", "host-b"]
         zfs.set.assert_not_called()
-        # only the parents were made, each under its own id
+        # only the parents were made (the id directory, then the pool level), each under its own id
         assert [str(c.args[0]) for c in zfs.create.call_args_list] == [
-            "pool/backups/host-a", "pool/backups/host-b"]
+            "pool/backups/host-a", "pool/backups/host-a/pool",
+            "pool/backups/host-b", "pool/backups/host-b/pool"]
 
     def test_a_pending_config_of_a_is_never_used_by_b(self, two, zfs):
         """A negotiated first and has not streamed; B streams the same dataset name. B's server
@@ -651,7 +652,7 @@ class TestAuthorization:
 
 
 class TestBadDatasetNames:
-    """A client dataset that makes `<target>/<bound id>/<rest>` an invalid name is a 400."""
+    """A client dataset that makes `<target>/<bound id>/<client dataset>` an invalid name is a 400."""
 
     @pytest.mark.parametrize("encoded", ["pool/a%25b", "pool/a%40b", "pool/a%23b", "pool/.hidden"])
     def test_negotiate_and_resume_token_say_400_and_run_nothing(self, authed, zfs, encoded):

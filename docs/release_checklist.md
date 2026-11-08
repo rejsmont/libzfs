@@ -7,8 +7,8 @@ on the release branch after the last merge. Every item that touches a VM uses on
 ## 1. Version and notes
 
 - [ ] Bump the version in lockstep, in four places (`tests/test_zfsbackup_version.py::TestLockstep` checks the
-      first three): `version` and the `libzfseasy==` pin in `pyproject.toml`, `version` in
-      `libs/libzfseasy/pyproject.toml`, and a new `debian/changelog` entry (`1.0.0~rc2-1` for `1.0.0rc2`: `~`
+      first three, `TestDebianMatchesPyprojects` the changelog): `version` and the `libzfseasy==` pin in `pyproject.toml`, `version` in
+      `libs/libzfseasy/pyproject.toml`, and a new `debian/changelog` entry (`1.0.0~rc3-1` for `1.0.0rc3`: `~`
       sorts a pre-release first). `zfsbackup.version.installed_version()` reads the installed metadata.
 - [ ] `poetry lock` if dependencies changed; check the pins (`werkzeug <3.2`, `urllib3 <3`, `requests <3`,
       `sqlalchemy <2.2`, `simple-websocket <1.2`) still match what CI tested.

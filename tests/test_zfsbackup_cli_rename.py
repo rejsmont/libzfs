@@ -339,9 +339,9 @@ class TestRenameDataset:
         assert result.exit_code == 1
         err = result.stderr
         assert "'tank/data' sends to offsite, dc.two" in err
-        # the server-side path before and after
-        assert "<server target>/<client-id>/data" in err
-        assert "<server target>/<client-id>/other" in err
+        # the server-side path before and after: the client's pool is part of it
+        assert "<server target>/<client-id>/tank/data" in err
+        assert "<server target>/<client-id>/pool2/other" in err
         # honest about what is known: a full send is LIKELY, not certain
         assert "likely a full send unless the server already has the dataset under the new path" in err
         assert "FULL send" not in err
@@ -362,25 +362,31 @@ class TestRenameDataset:
         assert [r.destination for r in moved.remote] == ["offsite", "dc.two"]
         assert moved.remote[1].frequency.literal == "4h"
 
-    def test_a_pool_only_rename_keeps_the_server_path_and_promises_no_full_send(self, run, rich):
+    def test_a_pool_only_rename_changes_the_server_path_and_says_a_full_send_is_likely(self, run, rich):
+        """The pool is part of the server path (`<target>/<id>/<pool>/...`), so moving a dataset to
+        another pool is a new server dataset like any other rename."""
         result = run("rename", "dataset", "tank/data", "pool2/data", "-c", rich)
         assert result.exit_code == 1
         err = result.stderr
-        assert "does not change" in err
-        assert "<server target>/<client-id>/data" in err
-        # the server path is the same, so incrementals CAN continue; what the
-        # new dataset lacks is the old one's anchors
-        assert "incremental sends can continue if the new dataset has the snapshots the server already holds" in err
-        assert "do not carry" in err or "does not carry" in err
-        assert "full send" not in err.lower()
+        assert "<server target>/<client-id>/tank/data" in err
+        assert "<server target>/<client-id>/pool2/data" in err
+        assert "likely a full send unless the server already has the dataset under the new path" in err
+        assert "orphaned" in err
+        assert "--force" in err and "Nothing was changed" in err
+        # the retired "same path" branch
+        assert "does not change" not in err and "incremental sends can continue" not in err
+        assert "only the pool part" not in err
 
-    def test_a_zfs_renamed_pool_only_rename_still_needs_force_but_no_full_send(self, run, rich, fake_zfs):
+    def test_a_zfs_renamed_pool_only_rename_still_needs_force_and_reports_the_new_path(
+        self, run, rich, fake_zfs
+    ):
         fake_zfs.add("pool2/data", {ANCHOR + "offsite": "snap1"})
         result = run("rename", "dataset", "tank/data", "pool2/data", "-c", rich)
         assert result.exit_code == 1
         assert "--force" in result.stderr
-        assert "the anchor properties came along with the dataset" in result.stderr
-        assert "full send" not in result.stderr.lower()
+        assert "<server target>/<client-id>/pool2/data" in result.stderr
+        assert "likely a full send" in result.stderr
+        assert "the anchor properties came along with the dataset" not in result.stderr
         assert run("rename", "dataset", "tank/data", "pool2/data", "--force", "-c", rich).exit_code == 0
 
     def test_a_dataset_without_remotes_needs_no_force_whatever_the_server_path(self, run, rich):
@@ -474,16 +480,16 @@ class TestRenameServerNoteClientId:
         assert host_client_id(rich) is None
         result = run("rename", "dataset", "tank/data", "pool2/other", "-c", rich)
         assert result.exit_code == 1
-        assert "<server target>/<client-id>/data" in result.stderr
-        assert "<server target>/<client-id>/other" in result.stderr
+        assert "<server target>/<client-id>/tank/data" in result.stderr
+        assert "<server target>/<client-id>/pool2/other" in result.stderr
 
     def test_a_stored_id_replaces_the_placeholder_in_the_refusal(self, run, rich):
         seed_client_id(rich, self.CID)
         state = db_state(rich)
         result = run("rename", "dataset", "tank/data", "pool2/other", "-c", rich)
         assert result.exit_code == 1
-        assert f"<server target>/{self.CID}/data" in result.stderr
-        assert f"<server target>/{self.CID}/other" in result.stderr
+        assert f"<server target>/{self.CID}/tank/data" in result.stderr
+        assert f"<server target>/{self.CID}/pool2/other" in result.stderr
         assert "<client-id>" not in result.stderr
         assert db_state(rich) == state
 
@@ -492,16 +498,17 @@ class TestRenameServerNoteClientId:
         result = run("rename", "dataset", "tank/data", "pool2/other", "--force", "-c", rich)
         assert result.exit_code == 0, result.stderr
         (warned,) = [w for w in warnings_in(result) if w.startswith("warning: --force:")]
-        assert f"<server target>/{self.CID}/data" in warned
-        assert f"<server target>/{self.CID}/other" in warned
+        assert f"<server target>/{self.CID}/tank/data" in warned
+        assert f"<server target>/{self.CID}/pool2/other" in warned
         assert "<client-id>" not in warned
 
     def test_a_pool_only_rename_uses_the_stored_id(self, run, rich):
         seed_client_id(rich, self.CID)
         result = run("rename", "dataset", "tank/data", "pool2/data", "-c", rich)
         assert result.exit_code == 1
-        assert f"<server target>/{self.CID}/data" in result.stderr
-        assert "does not change" in result.stderr and "<client-id>" not in result.stderr
+        assert f"<server target>/{self.CID}/tank/data" in result.stderr
+        assert f"<server target>/{self.CID}/pool2/data" in result.stderr
+        assert "does not change" not in result.stderr and "<client-id>" not in result.stderr
 
     def test_a_dataset_that_sends_nowhere_needs_no_note(self, run, rich):
         seed_client_id(rich, self.CID)
@@ -558,12 +565,15 @@ class TestRenameServerNoteClientId:
         from types import SimpleNamespace
 
         snapshot = SimpleNamespace(client_id=self.CID)
-        moved = rename._server_note(snapshot, "tank/data", "pool2/other", False)
-        assert f"<server target>/{self.CID}/data" in moved and f"<server target>/{self.CID}/other" in moved
-        pooled = rename._server_note(snapshot, "tank/data", "pool2/data", True)
-        assert f"<server target>/{self.CID}/data" in pooled and "came along" in pooled
-        bare = rename._server_note(SimpleNamespace(client_id=None), "tank/data", "pool2/other", False)
-        assert "<server target>/<client-id>/data" in bare
+        moved = rename._server_note(snapshot, "tank/data", "pool2/other")
+        assert f"<server target>/{self.CID}/tank/data" in moved
+        assert f"<server target>/{self.CID}/pool2/other" in moved
+        pooled = rename._server_note(snapshot, "tank/data", "pool2/data")      # the pool alone differs
+        assert f"<server target>/{self.CID}/tank/data" in pooled
+        assert f"<server target>/{self.CID}/pool2/data" in pooled
+        assert "orphaned" in pooled and "does not change" not in pooled
+        bare = rename._server_note(SimpleNamespace(client_id=None), "tank/data", "pool2/other")
+        assert "<server target>/<client-id>/tank/data" in bare
 
 
 def _try_exclusive_lock(path) -> str:

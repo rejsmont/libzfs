@@ -2165,7 +2165,8 @@ class TestEnrollInFlight:
 
 
 def _ds(client, name):
-    return f"{TARGET}/{client}/{name}"
+    """The server dataset of client dataset `pool/<name>`: the pool is part of it."""
+    return f"{TARGET}/{client}/pool/{name}"
 
 
 @pytest.mark.integration

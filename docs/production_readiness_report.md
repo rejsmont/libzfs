@@ -160,7 +160,7 @@ closing the identical latent gap before it could bite.
 
 ## Operations
 
-- *(Updated 2026-10-19.)* A documented systemd unit ships in `zfsbackup/README.md`: `Type=notify-reload`
+- *(Updated 2026-10-19.)* A systemd unit ships in `packaging/systemd/` (sdist) and in the `.deb`: `Type=notify-reload`
   (systemd ≥ 253; `Type=notify` + `ExecReload` for older), `NotifyAccess=main`, `KillMode=mixed` and
   `TimeoutStopSec`. The daemon sends `READY`/`RELOADING`/`STOPPING`/`STATUS` via `sd_notify`, holds a
   presence lock and pid file (`<db>.daemon.pid`), and reloads its configuration live on SIGHUP and on a
@@ -168,8 +168,8 @@ closing the identical latent gap before it could bite.
 - Worker restarts use exponential backoff (5 s to 80 s). After 6 consecutive short-lived crashes the
   daemon exits 1 and names the configuration generation (A-5, D9). Workers orphaned by a dead forkserver
   are not counted.
-- *(Resolved 2026-10-19.)* A reload bind-probes a changed API address; one that cannot be bound is
-  *deferred* (re-checked every poll) instead of crash-looping the API worker into D9. Residual: a port
+- *(Resolved 2026-10-19.)* A reload bind-probes a changed API address; one that is in use (`EADDRINUSE`) is
+  *deferred* (re-checked every poll; any other bind failure rejects the configuration) instead of crash-looping the API worker into D9. Residual: a port
   taken between the probe and the bind, or a third party already on `new_host:port` after a host-only
   change, still ends in D9. The supervisor makes no `zfs` call, so a hung pool no longer stalls reloads,
   signals or restarts.

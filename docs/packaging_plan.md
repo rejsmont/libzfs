@@ -1,6 +1,10 @@
 # Packaging plan: two wheels and a Debian package
 
-**Status: decided 2026-10-28, in progress on branch `packaging-split`.** Before this, `poetry build` made one
+**Status: decided 2026-10-28, implemented and released in 1.0.0rc2; historical.** The current state is `debian/`,
+the two `pyproject.toml`s, CLAUDE.md and `zfsbackup/README.md`; where this plan differs (no tests at package build
+time, a smaller `smoke` autopkgtest, the first packaged version `1.0.0~rc2-1`, the pins in the table), they win.
+
+**Original status: decided 2026-10-28, in progress on branch `packaging-split`.** Before this, `poetry build` made one
 wheel, `zfsbackup`, which shipped both the `zfsbackup` and the `libzfseasy` packages; the install path was the
 wheel in a virtualenv at `/opt/zfsbackup/venv` plus the units from the sdist
 ([zfsbackup/README.md](../zfsbackup/README.md), "Installation").

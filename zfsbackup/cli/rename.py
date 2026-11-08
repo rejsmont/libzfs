@@ -202,12 +202,6 @@ def _check_new_name(kind: str, old: str, new: str, existing) -> None:
         )
 
 
-def _server_relative(name: str) -> str:
-    """What the server appends after `<target>/<client id>`: the dataset name
-    without its first (pool) component (`api._server_dataset`)."""
-    return name.split("/", 1)[1] if "/" in name else ""
-
-
 def _client_id(snapshot: ConfigSnapshot) -> str:
     """This host's client id as stored in the config database (read in the same
     snapshot as the config), or the placeholder `<client-id>` when none has been
@@ -215,32 +209,20 @@ def _client_id(snapshot: ConfigSnapshot) -> str:
     return snapshot.client_id or "<client-id>"
 
 
-def _server_path(client_id: str, relative: str) -> str:
-    return f"<server target>/{client_id}" + (f"/{relative}" if relative else "")
+def _server_path(client_id: str, name: str) -> str:
+    """Where the server keeps client dataset `name` (`api._server_dataset`)."""
+    return f"<server target>/{client_id}/{name}"
 
 
-def _server_note(snapshot: ConfigSnapshot, old: str, new: str, carried: bool) -> str:
+def _server_note(snapshot: ConfigSnapshot, old: str, new: str) -> str:
     cid = _client_id(snapshot)
-    old_rel, new_rel = _server_relative(old), _server_relative(new)
-    if old_rel != new_rel:
-        return (
-            f"the server keeps this dataset at {_server_path(cid, old_rel)}; under the new "
-            f"name it would be {_server_path(cid, new_rel)}. The incremental base is "
-            "negotiated by snapshot name, so the next backup to each destination is likely "
-            "a full send unless the server already has the dataset under the new path; the "
-            f"existing copy at {_server_path(cid, old_rel)} stays where it is, orphaned "
-            "(this tool never touches a server)"
-        )
-    tail = (
-        "the anchor properties came along with the dataset"
-        if carried
-        else "a new dataset does not carry the old one's anchor properties, which only "
-        "keep its base snapshot from being pruned locally"
-    )
     return (
-        f"the server-side path {_server_path(cid, new_rel)} does not change (only the pool "
-        f"part of the name differs), so incremental sends can continue if the new dataset "
-        f"has the snapshots the server already holds; {tail}"
+        f"the server keeps this dataset at {_server_path(cid, old)}; under the new "
+        f"name it would be {_server_path(cid, new)}. The incremental base is "
+        "negotiated by snapshot name, so the next backup to each destination is likely "
+        "a full send unless the server already has the dataset under the new path; the "
+        f"existing copy at {_server_path(cid, old)} stays where it is, orphaned "
+        "(this tool never touches a server)"
     )
 
 
@@ -639,7 +621,7 @@ def rename_dataset(
     if remotes and not force:
         raise CliError(
             f"{old!r} sends to {', '.join(remotes)}. Renaming it affects its remote "
-            f"backups: {_server_note(snapshot, old, new, zfs_renamed)}. "
+            f"backups: {_server_note(snapshot, old, new)}. "
             "Re-run with --force to rename anyway. Nothing was changed."
         )
 
@@ -670,7 +652,7 @@ def rename_dataset(
             f"do not follow the configuration rename and become stale{suffix}"
         )
     if remotes:
-        warn(f"--force: {_server_note(snapshot, old, new, zfs_renamed)}")
+        warn(f"--force: {_server_note(snapshot, old, new)}")
 
     stale_props = sorted(
         p for p in old_props
