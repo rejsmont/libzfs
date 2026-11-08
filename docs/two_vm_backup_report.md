@@ -113,6 +113,25 @@ Notes:
 
 ---
 
+## Release 1.0.0rc3
+
+**Run:** 2026-11-08, `SRC_REF=9e58061` (the 1.0.0rc3 tree: server copies keep the client's pool,
+`<target>/<client_id>/<pool>/<dataset>`), `zfsb-server` + `zfsb-client` (Ubuntu 26.04, OpenZFS 2.4.1). Every
+scenario ran, none skipped. Harness: **873 passed, 0 failed**, no findings. The two checks over rc2's 871 are J4's:
+the scenario now plants a server copy that records another source dataset (two client names can no longer
+collide) and checks that negotiate refuses it with 409 naming that source, and that the planted copy stays
+untouched.
+
+The other release checks on the same commit: the OpenZFS matrix with `tests/test_zfsbackup_real.py` (2.1.5, 2.2.2,
+2.3.9, 2.4.1) 305 passed, 1 skipped each; `test_config_permissions.sh` 321 / 0; the wheel install scenario on
+Ubuntu 22.04 and 24.04 (the upgrade from `v1.0.0rc1` and the in-place upgrade) 468 / 0 (two new checks: the
+`<target>/<client_id>/<pool>` placeholder is `canmount=noauto` and unmounted, and the README spells the server
+copy with the pool); the `.deb` install scenario on Ubuntu 26.04 and Debian 13 241 / 0. The mocked suite ran on
+macOS (Python 3.14) and in CI (Python 3.11–3.15, SQLAlchemy 2.0 and 2.1, the Debian 13 floors); not on the
+`zfsb-ci` system Pythons this time.
+
+---
+
 ## Release 1.0.0rc2
 
 **Run:** 2026-10-29, `SRC_REF=3287042` (the 1.0.0rc2 version bump on top of the libzfseasy split and the Debian
