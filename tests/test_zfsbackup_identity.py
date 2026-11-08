@@ -1401,6 +1401,32 @@ class TestPeekIdentity:
         with pytest.raises(identity.IdentityError):
             identity.peek_identity(tmp_path, "client")
 
+    def test_a_certificate_renamed_in_after_the_open_is_read(self, tmp_path, monkeypatch):
+        # Two `trust token create` racing: this one's open misses server.crt, the other
+        # renames it in, and only then does this one look again. It must not report
+        # "does not exist" for a file that now exists.
+        cert = make_cert(key_of("ec256"), cn="late")
+        target = tmp_path / "server.crt"
+        real_open = os.open
+        calls = []
+
+        def racing_open(path, *args, **kwargs):
+            if str(path) == str(target) and not calls:
+                calls.append(path)
+                target.write_text(pem_of(cert))
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(identity.os, "open", racing_open)
+        info = identity.peek_identity(tmp_path, "server")
+        assert calls
+        assert info.fingerprint == fp_of(cert)
+
+    def test_a_dangling_symlink_is_an_error_not_none(self, tmp_path):
+        (tmp_path / "server.crt").symlink_to(tmp_path / "gone.crt")
+        with pytest.raises(identity.IdentityError, match="does not exist"):
+            identity.peek_identity(tmp_path, "server")
+
     def test_creates_nothing(self, tmp_path):
         d = tmp_path / "config.db.tls"
         assert identity.peek_identity(d, "client") is None

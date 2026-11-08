@@ -694,7 +694,10 @@ def peek_identity(directory: Union[str, Path], name: str) -> Optional[CertInfo]:
     except IdentityError:
         if not os.path.lexists(cert_path):
             return None
-        raise
+        # It may have appeared after the failed open (a concurrent
+        # `ensure_identity` renames the finished certificate in): read it once
+        # more, which either succeeds or fails again with the real problem.
+        cert = _load_cert_file(cert_path)
     return CertInfo(
         fingerprint=_cert_fingerprint(cert),
         not_after=cert.not_valid_after_utc,
