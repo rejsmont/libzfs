@@ -1902,10 +1902,9 @@ class TestStreamsInProgressSet:
         assert stream.gate.active == 0
 
     def test_an_invalid_name_is_refused_with_no_claim_and_no_zfs(self, stream):
-        bad = 'pool/backups/client1/pool//x'
         stream.run('fresh', dataset='pool//x')
         assert stream.sent == [{
-            'error': f'invalid dataset name {bad!r}: {bad} is not a valid ZFS dataset name'
+            'error': "invalid dataset name 'pool//x': invalid client dataset name"
         }]
         stream.untouched()                               # no exists/list/create/set/abort/receive
         stream.ws.receive.assert_not_called()

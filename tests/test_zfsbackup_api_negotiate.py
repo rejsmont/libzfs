@@ -808,30 +808,22 @@ class TestViewRefusesControlCharacters:
         _no_zfs(zfs)
         assert authed.gate.active == 0
 
-    @pytest.mark.parametrize("name", ["pool\n/data", "pool\t/data", "pool\r/data", "pool\0/data"])
-    def test_a_control_character_in_the_pool_component_is_refused_with_the_server_name_check(
-        self, authed, zfs, name
-    ):
-        """The POOL component is part of the server name now (`<target>/<id>/<pool>/data`), so the
-        derived-name check refuses it first (it no longer slips past that check as it did when the
-        pool was dropped); `client_dataset_problem` still names the control character on its own."""
+    @pytest.mark.parametrize("name", [
+        "pool\n/data", "pool\t/data", "pool\r/data", "pool\0/data",      # in the pool component
+        "pool/da\nta", "pool/da\tta", "pool/da\rta", "pool/da\0ta",      # below it
+    ])
+    def test_a_control_character_is_named_and_never_repeated_raw(self, authed, zfs, name):
+        """`client_dataset_problem` runs before the derived-name check, so the refusal says
+        "control character" and carries the name only `!r`-escaped -- also for the POOL
+        component, which is part of the server name now."""
         view = authed.app.view_functions["backup_negotiate"]
         with authed.context(URL, method="POST", json=body_with()):
             resp, status = view(CLIENT_ID, name)
-        assert status == 400 and resp.get_json()["error"].startswith("invalid dataset name ")
-        assert "control character" in client_dataset_problem(name)
+        error = resp.get_json()["error"]
+        assert status == 400 and error.startswith("invalid dataset name ")
+        assert "control character" in error
+        assert not any(c in error for c in "\n\r\t\0")
         _no_zfs(zfs)
-
-    @pytest.mark.xfail(strict=True, reason=(
-        "product: `_server_dataset` checks the derived server name first and appends the "
-        "InvalidNameError text, which repeats the name with its RAW control character; the `!r` "
-        "escaping in api.py is defeated for control characters in the relative part"))
-    @pytest.mark.parametrize("name", ["pool/da\nta", "pool/da\tta", "pool/da\rta", "pool/da\0ta"])
-    def test_the_error_text_carries_no_raw_control_character(self, authed, zfs, name):
-        view = authed.app.view_functions["backup_negotiate"]
-        with authed.context(URL, method="POST", json=body_with()):
-            resp, status = view(CLIENT_ID, name)
-        assert not any(c in resp.get_json()["error"] for c in "\n\r\t\0")
 
 
 # ---------------------------------------------------------------------------

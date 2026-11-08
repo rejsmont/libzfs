@@ -2860,16 +2860,18 @@ def create_app(
         `client_id` is always the BOUND id (`g.client_id`). Raises
         `_BadDatasetName` (the routes answer 400) when the client dataset
         name (`client_dataset_problem`) or the result is not a valid
-        filesystem name, so no `zfs` command ever sees it."""
+        filesystem name, so no `zfs` command ever sees it. The client name
+        is checked first: its refusal names a control character without
+        repeating it raw (`Filesystem`'s own message would)."""
+        problem = client_dataset_problem(client_dataset)
+        if problem is not None:
+            # `!r`: the name may hold the very control character refused.
+            raise _BadDatasetName(f"invalid dataset name {client_dataset!r}: {problem}")
         name = f"{target}/{client_id}/{client_dataset}"
         try:
             Filesystem(name)
         except Exception as e:
             raise _BadDatasetName(f"invalid dataset name {name!r}: {e}") from None
-        problem = client_dataset_problem(client_dataset)
-        if problem is not None:
-            # `!r`: the name may hold the very control character refused.
-            raise _BadDatasetName(f"invalid dataset name {client_dataset!r}: {problem}")
         return name
 
     def _server_copy_kind(server_fs, client_id: str) -> str:
