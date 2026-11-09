@@ -312,9 +312,24 @@ class TestLockHonouringSecondImport:
     ):
         target, resolved = store
         box = {}
+        # B's pre-lock check (`_refuse_foreign_before_locking`) opens a reader on
+        # A's half-made database; while that connection is open A's cleanup sees
+        # -wal/-shm and keeps the file (the safe answer). "B is still alive after
+        # 0.5 s" does not prove B got past it on a slow runner, so wait until B
+        # actually calls `writer_lock` -- the check is done and disposed by then.
+        b_at_lock = threading.Event()
+        real_writer_lock = importer_module.writer_lock
+        a_thread = threading.current_thread()
+
+        def announcing_writer_lock(*args, **kwargs):
+            if threading.current_thread() is not a_thread:   # B (A holds the lock already)
+                b_at_lock.set()
+            return real_writer_lock(*args, **kwargs)
 
         def b_starts_and_waits():
+            monkeypatch.setattr(importer_module, "writer_lock", announcing_writer_lock)
             box["thread"] = self._start_b(yaml_b, resolved, box)
+            assert b_at_lock.wait(30), "B never reached the writer lock"
             box["thread"].join(0.5)
             box["alive_in_phase3"] = box["thread"].is_alive()
             box["db_in_phase3"] = target.exists()
