@@ -100,7 +100,7 @@ jobs:
           tests/test_zfsbackup_tls_platform.py
 
       - name: Run the mocked test suite
-        run: poetry run pytest --no-cov
+        run: poetry run pytest -n auto --no-cov
 
       - name: Upload the resolved versions
         if: always()

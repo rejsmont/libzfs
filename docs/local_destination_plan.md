@@ -230,3 +230,51 @@ Phase 1 is pure refactor and Phase 2 is inert, so each phase merges on its own.
   one more stuck process per incarnation while the pool stays hung — no corruption. The fix, if needed:
   persist abandoned children (pid + start time) in the worker's status dir and treat a live recorded pid
   as stuck in the successor; and pin the EBUSY behaviour with a capture in `test_openzfs_matrix.sh`.
+
+## Addendum — a local target shared with the server (settled 2026-11-09)
+
+**Status: implemented on feature/shared-local-target (released in 1.0.0rc5).** Goal: one backup dataset `T` holds both the remote
+clients' copies and this host's own local copies, the local ones laid out like any client's
+(`T/<own client id>/<pool>/<path>`). Today `_require_disjoint_receive_targets` refuses a local target that
+overlaps an enabled `remote_backup.target_dataset`.
+
+Decisions: (1) a `zfs:` target may be **exactly** the enabled remote target; inside or above it stays
+refused, and two local destinations still never share a target. (2) While a local destination targets `T`,
+the server **reserves the host's own client id**: a loopback setup without a shared target keeps working.
+
+Why it is small: the copies are already indistinguishable from server copies (local `client_id`,
+`source_dataset`, stamped `config`, the forced `-o` set), so the server's `received_datasets()` lists and
+prunes them like any client's, and the pruning worker already de-duplicates by name (the received entry
+wins, so a shared target's copies are pruned once, untimed, on the server's own pool).
+
+Items (owners in brackets):
+
+1. **`shared_receive_target(config) -> Optional[str]`** in `config/model.py`, exported from
+   `zfsbackup.config` [zfsbackup-developer]: the remote target when `remote_backup` is enabled and a declared
+   local destination's target equals it (component-wise, a trailing `/` ignored), else `None`. The one
+   definition of "shared" for the API, the worker and the CLI.
+2. **Validation** [zfsbackup-store-developer]: `_require_disjoint_receive_targets` accepts a local target
+   EQUAL to the enabled remote target; everything else it refuses today stays refused (nested local/remote,
+   any overlap between local targets). The other checks are unchanged (`_require_outside_receive_targets`:
+   no configured dataset at, below or recursively above either).
+3. **Server guard** [zfsbackup-developer]: `create_app(..., reserved_client_id=None)`; `ApiWorker` passes the
+   Handoff's client id when `shared_receive_target(config)` is set. With it set: `/negotiate`, `/stream` and
+   `/resume_token` from a client bound to that id answer 409 `{error, reason: "reserved_client_id"}` after
+   authentication and the protocol check and before any `zfs` call, claim or spawn (a WARNING at most hourly
+   per id, naming `trust revoke --client <id>`); `/enroll` refuses the id before the token is consumed (409, same
+   reason; the read-only pre-check order otherwise unchanged); `/whoami`, `/rotate` and `/health` unchanged.
+   A reload restarts the API worker, so the reservation follows the config.
+4. **CLI** [zfsbackup-cli-developer], all only while the config shares a target: `trust token create
+   --client-id <own id>` refused (exit 1); `identity set-client-id ID` refused when `ID` is bound in the
+   trust tables to any live pin; a committed write or `import` whose result shares a target while this
+   host's own id is bound in the trust tables warns, naming `trust revoke --client <id>` (the server refuses
+   that client's receives meanwhile). `list destinations` marks a shared target. Copy-moving notes
+   (`set`/`edit` of a local target, `rename dataset`) need no change: the layout is the same.
+5. **Tests** [pytest-test-author]: the validation matrix (equal accepted, nested and local/local refused,
+   disabled remote unaffected); the API matrix (each endpoint, before any `zfs`; `/enroll` token not consumed;
+   no reservation without a shared target; loopback unaffected); the worker passing the id; the pruner
+   pruning a shared target's copies once; the CLI refusals and warning.
+6. **Docs** [main session]: README "Local destinations" (shared target; loopback → local becomes a URL switch
+   plus `trust revoke --client <id>`, no `zfs rename`), CLAUDE.md, CHANGELOG (unreleased).
+7. **Real ZFS**: one `test_zfsbackup_real_local.py` case — a remote client and a local destination into the
+   same `T`, both pruned, neither touching the other's tree.
