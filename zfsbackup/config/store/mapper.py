@@ -79,11 +79,10 @@ import logging
 import os
 import re
 import secrets
-import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -97,10 +96,11 @@ from zfsbackup.config import (
     RemoteServerConfig,
     RetentionRule,
     client_tls_files_problem,
-    destination_url_problem,
+    destination_problem,
     normalize_fingerprint,
     validate_retention_uniqueness,
 )
+from zfsbackup.config import model as _model
 from zfsbackup.config.store import models
 from zfsbackup.config.store.errors import ConfigConflict
 from zfsbackup.config.store.migrate import check_schema
@@ -166,36 +166,10 @@ assert tuple(m.__table__.name for m in _CONFIG_MODELS) == CONFIG_TABLES
 # the point of `_dataset_name_problem` below. The regex is NOT copied: it is
 # `libzfseasy.types.Validate.dataset`.
 #
-# `libzfseasy/__init__` resolves the `zfs` binary at import time and raises
-# `RuntimeError` on a host without one, but `zfsbackup-config` is documented
-# to work on such a host (a box that only manages configuration). So the
-# validator is taken from `sys.modules` when libzfseasy is already loaded (the
-# daemon), and otherwise loaded straight from `libzfseasy/types.py` by path --
-# that file imports only `re`/`typing` -- WITHOUT executing the package
-# `__init__`. Nothing here ever runs a zfs command.
-
-_dataset_validator: Optional[Callable[[str], None]] = None
-
-
-def _get_dataset_validator() -> Callable[[str], None]:
-    global _dataset_validator
-    if _dataset_validator is None:
-        loaded = sys.modules.get("libzfseasy.types")
-        if loaded is None:
-            import importlib.util  # noqa: PLC0415
-
-            package = importlib.util.find_spec("libzfseasy")  # not executed
-            if package is None or not package.submodule_search_locations:
-                raise ImportError("libzfseasy is not importable")
-            types_path = Path(list(package.submodule_search_locations)[0]) / "types.py"
-            spec = importlib.util.spec_from_file_location(
-                "_zfsbackup_libzfseasy_types", types_path
-            )
-            assert spec is not None and spec.loader is not None
-            loaded = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(loaded)
-        _dataset_validator = loaded.Validate.dataset
-    return _dataset_validator
+# The validator itself comes from `zfsbackup.config.model._get_dataset_validator`
+# (the one loader: it reads `libzfseasy/types.py` without executing the
+# package `__init__`, which raises on a host without a `zfs` binary, so
+# `zfsbackup-config` keeps working there). Nothing here runs a zfs command.
 
 
 def _dataset_name_problem(name: str) -> Optional[str]:
@@ -219,7 +193,16 @@ def _dataset_name_problem(name: str) -> Optional[str]:
     no leading, trailing or doubled '/'; no '@' or '#'; no newline or other
     control character; at most 255 characters in all."""
     try:
-        _get_dataset_validator()(name)
+        validator = _model._get_dataset_validator()
+    except ImportError as exc:
+        # Never a raw exception out of `validate_config`: the caller turns a
+        # problem string into a `ValueError` (enabled) or a warning.
+        return (
+            "cannot be checked because libzfseasy's name validator is "
+            f"unavailable ({exc})"
+        )
+    try:
+        validator(name)
     except ValueError:
         return (
             "cannot be managed by zfsbackup (its ZFS library accepts "
@@ -903,48 +886,201 @@ def _dataset_components(name: str) -> List[str]:
     return name.rstrip("/").split("/")
 
 
-def _require_outside_target(ds: DatasetConfig, key: str, remote_backup: object) -> None:
-    """Refuse a configured dataset that overlaps `remote_backup.target_dataset`.
+def _is_prefix(short: List[str], long: List[str]) -> bool:
+    """Component-wise: `short` equals `long` or is an ancestor of it."""
+    return long[: len(short)] == short
+
+
+def _local_targets(destinations: object) -> List[Tuple[str, str]]:
+    """`(destination name, target dataset)` of every declared `zfs:`
+    destination, in declaration order. USED OR NOT: a destination with no
+    dataset `remote` entry is one `set datasets.N.remote` away from receiving
+    into its target, so -- like a disabled dataset against the remote target
+    -- enabling it later must not open the hole. A target that is not a
+    non-empty string is skipped (`destination_problem` reports it)."""
+    out: List[Tuple[str, str]] = []
+    if not isinstance(destinations, dict):
+        return out
+    for name, dest in destinations.items():
+        target = getattr(dest, "target_dataset", None)
+        if getattr(dest, "is_local", False) and isinstance(target, str) and target:
+            out.append((name, target))
+    return out
+
+
+# A full ZFS name (dataset@snapshot) is at most 255 characters:
+# ZFS_MAX_DATASET_NAME_LEN is 256 including the NUL. MUST equal libzfseasy's
+# `Validate.max_name_len` (the store cannot import libzfseasy's package, see
+# `model._get_dataset_validator`; a test pins the two together).
+_MAX_FULL_NAME_LEN = 255
+# `config/model.py` CLIENT_ID_RE: 1..64 characters.
+_CLIENT_ID_MIN_LEN = 1
+_CLIENT_ID_MAX_LEN = 64
+
+
+def _local_copy_name_findings(
+    ds_name: str, prefix: str, dest_name: str, target: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """`(error, warning)` for one dataset x local destination: the copy is
+    `<target>/<client_id>/<dataset>@<prefix>_<14 digits>` and ZFS refuses a
+    full name over `_MAX_FULL_NAME_LEN` characters. The client id (1-64
+    characters) is not known to the pure `validate_config`, so: `error` when
+    even a 1-character id is too long (the config can never work -- every
+    snapshot of this dataset would fail at the destination), `warning` when
+    only a longer id would be (the failure would surface at run time, per
+    snapshot, long after the config was accepted). Both are `None` when the
+    longest id fits. Names are shown with `!r`: no raw control character."""
+    # everything but the client id: target '/' <id> '/' dataset '@' prefix
+    # '_' <14 digits>
+    fixed = len(target) + 1 + 1 + len(ds_name) + 1 + len(prefix) + 1 + 14
+    shortest = fixed + _CLIENT_ID_MIN_LEN
+    longest = fixed + _CLIENT_ID_MAX_LEN
+    where = (
+        f"dataset {ds_name!r} copied to local destination {dest_name!r} "
+        f"(target {target!r})"
+    )
+    if shortest > _MAX_FULL_NAME_LEN:
+        return (
+            f"{where}: even with a 1-character client id its snapshot names "
+            f"(<target>/<client_id>/<dataset>@{prefix}_<14 digits>) would be "
+            f"{shortest} characters, over ZFS's {_MAX_FULL_NAME_LEN}; shorten "
+            "the target, the dataset name or snapshot_prefix",
+            None,
+        )
+    if longest > _MAX_FULL_NAME_LEN:
+        fits = _MAX_FULL_NAME_LEN - fixed
+        return (
+            None,
+            f"{where}: with a 64-character client id its snapshot names would "
+            f"be {longest} characters, {longest - _MAX_FULL_NAME_LEN} over "
+            f"ZFS's {_MAX_FULL_NAME_LEN}; only client ids up to {fits} "
+            "characters fit. A recursive dataset's children have longer "
+            "names still",
+        )
+    return None, None
+
+
+def _require_outside_receive_targets(
+    ds: DatasetConfig,
+    key: str,
+    remote_backup: object,
+    destinations: object = None,
+) -> None:
+    """Refuse a configured dataset that overlaps a receive target: the remote
+    `remote_backup.target_dataset` or any local destination's `zfs:` target.
 
     What bug this prevents: the server enumerates EVERYTHING under the target
-    as a received dataset. A configured dataset at or below the target would
-    be snapshotted and pruned by this host's own workers inside received
-    data (the next incremental receive then fails, and an aligned
-    `{prefix}_{ts}` name makes the prune destroy received snapshots); a
-    `recursive` ancestor reaches the same datasets through `zfs snapshot -r`
-    and `zfs destroy -r`. Enabled or not, so enabling a dataset later cannot
-    open the hole.
+    as a received dataset, and a local destination's copies live under its
+    target in the same layout (`<target>/<client_id>/<pool>/<path>`). A
+    configured dataset at or below a target would be snapshotted and pruned
+    by this host's own workers inside received data (the next incremental
+    receive then fails, and an aligned `{prefix}_{ts}` name makes the prune
+    destroy received snapshots); a `recursive` ancestor reaches the same
+    datasets through `zfs snapshot -r` and `zfs destroy -r`. Enabled or not,
+    so enabling a dataset later cannot open the hole.
 
     Compared by path COMPONENTS, never by string prefix: `tank/b` is not an
     ancestor of `tank/backup`, and `tank/backup` is not the target
     `tank/backups`. A non-recursive ancestor only touches its own snapshots,
-    so it stays allowed. No check without a remote_backup target (disabled or
-    unset: nothing is received, so nothing can overlap).
+    so it stays allowed. The remote target counts only while remote_backup
+    is enabled (disabled or unset: nothing is received, so nothing can
+    overlap); every declared local target counts always (`_local_targets`).
     """
-    if remote_backup is None or not getattr(remote_backup, "enabled", False):
+    d = _dataset_components(ds.name) if isinstance(ds.name, str) else None
+    if d is None:
         return
-    target = getattr(remote_backup, "target_dataset", None)
-    if not isinstance(target, str) or not target or not isinstance(ds.name, str):
-        return
-    t = _dataset_components(target)
-    d = _dataset_components(ds.name)
-    if d[: len(t)] == t:
-        where = "is" if len(d) == len(t) else "is below"
-        raise ValueError(
-            f"{key}: the dataset {where} remote_backup.target_dataset "
-            f"{target!r}. The server treats everything under the target as "
-            "received backups, so snapshotting or pruning a dataset there "
-            "would act on received data. Move the target to a dedicated "
-            "dataset that no configured dataset is at or below."
-        )
-    if ds.recursive is True and len(d) < len(t) and t[: len(d)] == d:
-        raise ValueError(
-            f"{key}: the dataset is recursive and is an ancestor of "
-            f"remote_backup.target_dataset {target!r}. Its recursive "
-            "snapshots (zfs snapshot -r) and prunes (zfs destroy -r) would "
-            "reach the received datasets under the target. Make the dataset "
-            "non-recursive, or move the target outside it."
-        )
+    if remote_backup is not None and getattr(remote_backup, "enabled", False):
+        target = getattr(remote_backup, "target_dataset", None)
+        if isinstance(target, str) and target:
+            t = _dataset_components(target)
+            if _is_prefix(t, d):
+                where = "is" if len(d) == len(t) else "is below"
+                raise ValueError(
+                    f"{key}: the dataset {where} remote_backup.target_dataset "
+                    f"{target!r}. The server treats everything under the target as "
+                    "received backups, so snapshotting or pruning a dataset there "
+                    "would act on received data. Move the target to a dedicated "
+                    "dataset that no configured dataset is at or below."
+                )
+            if ds.recursive is True and len(d) < len(t) and _is_prefix(d, t):
+                raise ValueError(
+                    f"{key}: the dataset is recursive and is an ancestor of "
+                    f"remote_backup.target_dataset {target!r}. Its recursive "
+                    "snapshots (zfs snapshot -r) and prunes (zfs destroy -r) would "
+                    "reach the received datasets under the target. Make the dataset "
+                    "non-recursive, or move the target outside it."
+                )
+    for dest_name, target in _local_targets(destinations):
+        t = _dataset_components(target)
+        if _is_prefix(t, d):
+            where = "is" if len(d) == len(t) else "is below"
+            raise ValueError(
+                f"{key}: the dataset {where} the target {target!r} of local "
+                f"destination {dest_name!r}. Everything under a local "
+                "destination's target is a received copy, so snapshotting or "
+                "pruning a dataset there would act on received data. Use a "
+                "dedicated target dataset that no configured dataset is at or "
+                "below."
+            )
+        if ds.recursive is True and len(d) < len(t) and _is_prefix(d, t):
+            raise ValueError(
+                f"{key}: the dataset is recursive and is an ancestor of the "
+                f"target {target!r} of local destination {dest_name!r}. Its "
+                "recursive snapshots (zfs snapshot -r) and prunes (zfs "
+                "destroy -r) would reach the received copies under the "
+                "target. Make the dataset non-recursive, or move the target "
+                "outside it."
+            )
+
+
+def _require_outside_target(ds: DatasetConfig, key: str, remote_backup: object) -> None:
+    """The remote-target half of `_require_outside_receive_targets` (the
+    pre-local-destination signature, kept for its callers)."""
+    _require_outside_receive_targets(ds, key, remote_backup, None)
+
+
+def _require_disjoint_receive_targets(
+    remote_backup: object, destinations: object
+) -> None:
+    """Refuse receive targets that overlap one another.
+
+    What bug this prevents: two targets that are equal, or one inside the
+    other, share received datasets. Each destination stamps its own
+    `org.zfsbackup:config` retention on `<target>/<client_id>/...` and its
+    own anchors, so the pruner of one would act on the other's copies and a
+    receive could hit a dataset another destination claims. The same holds
+    between a local target and an ENABLED remote target (the API worker
+    receives into the latter). Component-wise, like the dataset check; local
+    targets are every declared `zfs:` destination (`_local_targets`), the
+    remote one only while remote_backup is enabled.
+    """
+    parties: List[Tuple[str, str]] = [
+        (f"local destination {name!r}", target)
+        for name, target in _local_targets(destinations)
+    ]
+    if remote_backup is not None and getattr(remote_backup, "enabled", False):
+        target = getattr(remote_backup, "target_dataset", None)
+        if isinstance(target, str) and target:
+            parties.append(("remote_backup", target))
+    for i, (who_a, a) in enumerate(parties):
+        ca = _dataset_components(a)
+        for who_b, b in parties[i + 1:]:
+            cb = _dataset_components(b)
+            if not (_is_prefix(ca, cb) or _is_prefix(cb, ca)):
+                continue
+            if ca == cb:
+                how = "is the same dataset as"
+            elif _is_prefix(ca, cb):
+                how = "is an ancestor of"
+            else:
+                how = "is below"
+            raise ValueError(
+                f"the target {a!r} of {who_a} {how} the target {b!r} of "
+                f"{who_b}. Receive targets must be dedicated and disjoint: "
+                "copies under one would be pruned and overwritten as the "
+                "other's. Give each destination its own dataset that is "
+                "neither inside nor above another target."
+            )
 
 
 def validate_config(config: BackupConfig) -> List[str]:
@@ -1004,7 +1140,14 @@ def validate_config(config: BackupConfig) -> List[str]:
       `validate_retention_uniqueness` collision, per scope.
     - with remote backup ENABLED: a configured dataset (enabled or not) at or
       below `remote_backup.target_dataset`, or a `recursive` one that is a
-      strict ancestor of it (`_require_outside_target`).
+      strict ancestor of it; likewise for the target of EVERY declared
+      `zfs:` (local) destination, used or not
+      (`_require_outside_receive_targets`);
+    - receive targets that overlap one another: two local targets, or a local
+      target and the ENABLED remote target, equal or one inside the other
+      (`_require_disjoint_receive_targets`);
+    - a `zfs:` destination that carries a `server_fingerprint`
+      (`destination_problem`).
 
     Warns (returned, not raised):
 
@@ -1101,10 +1244,10 @@ def validate_config(config: BackupConfig) -> List[str]:
         # in `Destination.__post_init__` so a legacy plaintext row can still
         # be LOADED and fixed with the CLI; the daemon (which runs this on
         # every start and reload) refuses to run it.
-        problem = destination_url_problem(dest.url)
+        problem = destination_problem(dest)
         if problem is not None:
             raise ValueError(f"destinations[{name}]: {problem}")
-        # `destination_url_problem` judges the STRIPPED url, so it accepted
+        # `destination_problem` judges the STRIPPED url, so it accepted
         # "  https://h " -- which `save_config` then stored verbatim, while
         # `from_file` strips. Refused rather than stripped, for the same
         # reason as a non-canonical `server_fingerprint` below: the store
@@ -1170,6 +1313,11 @@ def validate_config(config: BackupConfig) -> List[str]:
                 "but enabling it will be refused"
             )
 
+    # Receive targets (every declared `zfs:` destination, and the remote
+    # target while enabled) must not overlap one another; the per-dataset
+    # half of the rule runs in the loop below.
+    _require_disjoint_receive_targets(config.remote_backup, config.destinations)
+
     # --- datasets ---
     for ds in config.datasets:
         key = f"datasets[{ds.name}]"
@@ -1190,7 +1338,9 @@ def validate_config(config: BackupConfig) -> List[str]:
                 "enabling it will be refused"
             )
         _require_positive_duration(ds.frequency, f"{key}.frequency", "frequency")
-        _require_outside_target(ds, key, config.remote_backup)
+        _require_outside_receive_targets(
+            ds, key, config.remote_backup, config.destinations
+        )
 
         if not ds.retention_rules:
             warnings.append(
@@ -1224,6 +1374,30 @@ def validate_config(config: BackupConfig) -> List[str]:
                     f"[{seen_destinations[remote.destination]}])"
                 )
             seen_destinations[remote.destination] = idx
+            local_dest = config.destinations[remote.destination]
+            local_target = getattr(local_dest, "target_dataset", None)
+            if (
+                getattr(local_dest, "is_local", False)
+                and isinstance(local_target, str)
+                and local_target
+                and isinstance(ds.name, str)
+                and isinstance(config.snapshot_prefix, str)
+            ):
+                too_long, may_be_long = _local_copy_name_findings(
+                    ds.name, config.snapshot_prefix, remote.destination,
+                    local_target,
+                )
+                if too_long is not None:
+                    # Like the name check above: only an ENABLED dataset is
+                    # ever sent, so a disabled one warns.
+                    if ds.enabled:
+                        raise ValueError(f"{key}.remote: {too_long}")
+                    warnings.append(
+                        f"{key}.remote: {too_long}; the dataset is disabled "
+                        "so it is ignored, but enabling it will be refused"
+                    )
+                elif may_be_long is not None:
+                    warnings.append(f"{key}.remote: {may_be_long}")
             if remote.frequency is not None:
                 _require_positive_duration(
                     remote.frequency,

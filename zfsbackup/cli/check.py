@@ -167,11 +167,16 @@ def daemon_entries(
 def client_certificate_entry(
     health: Any, config: Any, resolved: Any, now: datetime
 ) -> Optional[Any]:
-    """The client certificate's verdict, or `None` when no destination is
-    configured (the certificate is then not needed; no data is no entry).
-    Reads the certificate only, never a key."""
+    """The client certificate's verdict, or `None` when no https destination is
+    configured (the certificate is then not needed; no data is no entry --
+    a local `zfs:` destination has no server to present it to). Reads the
+    certificate only, never a key."""
     CheckEntry = health.CheckEntry
-    if not getattr(config, "destinations", None):
+    destinations = getattr(config, "destinations", None) or {}
+    if not any(
+        not getattr(d, "is_local", False)
+        for d in (destinations.values() if hasattr(destinations, "values") else destinations)
+    ):
         return None
     files = tlsfiles.client_identity_files(config, resolved)
     summary = tlsfiles.describe_certificate(files.cert)

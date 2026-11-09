@@ -27,6 +27,8 @@ import libzfseasy as zfs
 from libzfseasy.types import Dataset, Filesystem, Snapshot
 from libzfseasy.zfs import _zfs_cmd
 
+from _stream_support import FILESYSTEM_FORCED
+
 from zfsbackup.backup_manager import (
     PROP_ANCHOR_PREFIX,
     PROP_CLIENT_ID,
@@ -409,6 +411,26 @@ def _zfs_get_received(dataset, prop):
     )
     value = result.stdout.strip() if result.returncode == 0 else ''
     return value or None
+
+
+def _assert_forced_local(dataset):
+    """Every property the server forces onto a received filesystem (`FILESYSTEM_FORCED`) is a LOCAL value
+    of `dataset`. OpenZFS 2.1 skips `-o sharesmb=off` on a RAW receive and exits 0, so the copy would read
+    `sharesmb  on|off  inherited from <parent>`: the server sets the missing ones after the receive."""
+    for prop, expected in FILESYSTEM_FORCED.items():
+        assert _zfs_get_source(dataset, prop) == 'local', (
+            f'{prop} of {dataset} is {_zfs_get_source(dataset, prop)!r}, not local')
+        assert _zfs_get(dataset, prop) == expected, prop
+
+
+def _set_parent_sharesmb_on(dataset):
+    """`sharesmb=on` on `dataset` (the target the copy inherits from). Skips -- never errors -- when this
+    host cannot set it (no SMB share support, or no permission)."""
+    r = subprocess.run([_zfs_cmd(), 'set', 'sharesmb=on', dataset], capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip(f'zfs set sharesmb=on is not possible here: {r.stderr.strip()}')
+    if _zfs_get_source(dataset, 'sharesmb') != 'local':
+        pytest.skip('sharesmb=on did not stick on the target')
 
 
 def _snapshot_guids(dataset):
@@ -1905,6 +1927,9 @@ class _NewDatasetTests:
             assert e2e.server_local(prop) == expected, prop
             assert _zfs_get_received(e2e.server_ds, prop) is None, prop
 
+    def assert_forced_locally(self, e2e):
+        _assert_forced_local(e2e.server_ds)
+
     def assert_encryption_shape(self, e2e):
         if self.ROOT is None:
             assert e2e.server_prop('encryption') == 'off'
@@ -1940,10 +1965,30 @@ class _NewDatasetTests:
         assert list(e2e.server_snaps()) == [s1]
         assert e2e.server_snaps()[s1] == e2e.local_snaps()[s1]
         self.assert_owned_locally(e2e)
+        self.assert_forced_locally(e2e)
         self.assert_encryption_shape(e2e)
         assert e2e.server_prop('receive_resume_token') == '-'
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s1
         assert any(f'Sending full snapshot {e2e.source.name}@{s1}' in m for m in e2e.log_lines())
+
+    def test_the_forced_set_is_local_even_under_a_target_with_sharesmb_on(self, e2e):
+        """OpenZFS 2.1 leaves `sharesmb` unset on a raw receive (exit 0): the copy would inherit the
+        target's `on`. After the receive, and after an incremental one, `sharesmb` reads `off local`."""
+        _set_parent_sharesmb_on(e2e.target_root)
+        s1 = self.first_send(e2e)
+
+        assert e2e.cycle() is True
+
+        assert list(e2e.server_snaps()) == [s1]
+        assert _zfs_get_source(e2e.server_ds, 'sharesmb') == 'local'
+        assert _zfs_get(e2e.server_ds, 'sharesmb') == 'off'
+        self.assert_forced_locally(e2e)
+        e2e.write('more.bin', 1)
+        e2e.snapshot(1)
+        assert e2e.cycle() is True
+        assert len(e2e.server_snaps()) == 2
+        self.assert_forced_locally(e2e)
+        assert _zfs_get(e2e.target_root, 'sharesmb') == 'on'        # the target itself is untouched
 
     def test_server_copy_is_reported_for_what_the_server_holds(self, e2e):
         s1 = self.first_send(e2e)
@@ -1997,6 +2042,7 @@ class _NewDatasetTests:
         assert set(e2e.server_snaps()) == {s1, s2}
         assert e2e.server_snaps()[s2] == e2e.local_snaps()[s2]
         self.assert_owned_locally(e2e)
+        self.assert_forced_locally(e2e)
         self.assert_encryption_shape(e2e)
         assert any(f'incremental from {s1}' in m for m in e2e.log_lines())
         assert self.negotiate(e2e, [s2])['server_copy'] == self.COPY
@@ -2266,6 +2312,7 @@ class TestRealRawChain(_ChainTests):
         assert e2e.server_prop('encryption') == 'aes-256-gcm'
         assert e2e.server_prop('encryptionroot') == e2e.server_ds   # a raw copy is its own root ...
         assert e2e.server_prop('keystatus') == 'unavailable'        # ... and arrives without its key
+        _assert_forced_local(e2e.server_ds)                         # the forced set is local on a raw copy
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == more[-1]
         assert any(f'Sending 3 snapshots of {e2e.source.name} to {DEST}' in m for m in e2e.log_lines())
         assert not [r for r in e2e.caplog.records if r.name.startswith('zfsbackup.remote') and r.levelno >= logging.ERROR]

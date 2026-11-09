@@ -18,7 +18,7 @@ domain knowledge; the cross-agent workflow lives here (and is summarized in
 | `libzfseasy-implementation-planner` | opus / high | read-only | Findings → ordered plan for `libs/libzfseasy/` |
 | `zfsbackup-implementation-planner` | opus / high | read-only | Findings → ordered plan for `zfsbackup/` (incl. `store/`, `cli/`) |
 | `libzfseasy-developer` | sonnet / high | edit | `libs/libzfseasy/libzfseasy/types.py`, `zfs.py`, `__init__.py` |
-| `zfsbackup-developer` | sonnet / high | edit | Daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py`; the shared TLS/identity module `identity.py`; the support and shared modules, `packaging/**` and `pyproject.toml` (see the ownership table) |
+| `zfsbackup-developer` | sonnet / high | edit | Daemon core: `config/model.py`, `backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py`, `chain.py`, `receiver.py`, `local.py`; the shared TLS/identity module `identity.py`; the support and shared modules, `packaging/**` and `pyproject.toml` (see the ownership table) |
 | `zfsbackup-store-developer` | sonnet / high | edit | `zfsbackup/config/store/**` (incl. `migrations/`), `alembic.ini` — models, mapper, engine/session, migrations |
 | `zfsbackup-cli-developer` | sonnet / high | edit | `zfsbackup/cli/**` — the `zfsbackup-config` Click application |
 | `pytest-test-author` | sonnet / high | edit | Owns **all** pytest tests + `conftest.py` fixtures (both packages) |
@@ -35,7 +35,7 @@ into another's directory to save a handoff.
 | Path | Owner |
 |---|---|
 | `libs/libzfseasy/**` (incl. its `pyproject.toml` and README) | `libzfseasy-developer` |
-| `zfsbackup/__init__.py`, `zfsbackup/config/{__init__,model}.py`, `zfsbackup/{backup_manager,daemon,workers,remote,api}.py`, the supervisor support modules `zfsbackup/{daemonlock,stopflag,runtime_config,procident,sdnotify}.py`, the shared TLS/identity module `zfsbackup/identity.py` (also used by the CLI), the stdlib-only shared modules `zfsbackup/{protocol,version,logsetup,health,daemon_entry}.py`, the health collector `zfsbackup/health_collect.py`, the vendored `zfsbackup/_vendor/**`, and `packaging/**`, `debian/**`, `.github/workflows/deb.yml`, `pyproject.toml`, `poetry.lock` | `zfsbackup-developer` |
+| `zfsbackup/__init__.py`, `zfsbackup/config/{__init__,model}.py`, `zfsbackup/{backup_manager,daemon,workers,remote,api,chain,receiver,local}.py`, the supervisor support modules `zfsbackup/{daemonlock,stopflag,runtime_config,procident,sdnotify}.py`, the shared TLS/identity module `zfsbackup/identity.py` (also used by the CLI), the stdlib-only shared modules `zfsbackup/{protocol,version,logsetup,health,daemon_entry}.py`, the health collector `zfsbackup/health_collect.py`, the vendored `zfsbackup/_vendor/**`, and `packaging/**`, `debian/**`, `.github/workflows/deb.yml`, `pyproject.toml`, `poetry.lock` | `zfsbackup-developer` |
 | `zfsbackup/config/store/**` (incl. `store/migrations/`), `alembic.ini` | `zfsbackup-store-developer` |
 | `zfsbackup/cli/**` | `zfsbackup-cli-developer` |
 | `tests/**`, `conftest.py`, `.github/workflows/**` except `deb.yml` | `pytest-test-author` |

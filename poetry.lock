@@ -1566,7 +1566,7 @@ regex = ["regex"]
 
 [[package]]
 name = "libzfseasy"
-version = "1.0.0rc3"
+version = "1.0.0rc4"
 description = "Python interface to the ZFS utilities (zfs and zpool)"
 optional = false
 python-versions = ">=3.11"
@@ -3078,4 +3078,4 @@ h11 = ">=0.16.0,<1"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11"
-content-hash = "ce35abb7e2ba42f3aafb89ba637004294c80fc248e639d5cd7fcea6c994a40be"
+content-hash = "8c2073c133b0c10c548e8606df63d6d9cd1d7b157593f38b404708ab4f8bac46"

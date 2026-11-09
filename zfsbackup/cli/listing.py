@@ -42,12 +42,18 @@ Durations are shown as typed (`30d` stays `30d`, never `1M`).
     ]
 
     list destinations --json  ->  [
-      {"name": str, "url": str, "server_fingerprint": str | null, "datasets": [str, ...]}, ...
-    ]            # "server_fingerprint": the full pinned SHA-256 (64 lowercase hex), null =
-                 #   not enrolled; "datasets": the datasets that send to it, in stored order
+      {"name": str, "kind": "remote" | "local", "url": str,
+       "target_dataset": str | null, "server_fingerprint": str | null,
+       "datasets": [str, ...]}, ...
+    ]            # "kind": "local" for a `zfs:<dataset>` URL (a dataset on this host, no
+                 #   server), else "remote"; "target_dataset": the dataset of a local
+                 #   destination, null for a remote one; "server_fingerprint": the full
+                 #   pinned SHA-256 (64 lowercase hex), null = not enrolled (always null
+                 #   for a local destination); "datasets": the datasets that send to it,
+                 #   in stored order
 
 The text view's ENROLLED column shows the first 16 hex characters of the pinned
-fingerprint, or `not enrolled`.
+fingerprint, or `not enrolled`; a local destination has no server, so it shows `-`.
 
 `--enabled-only` keeps enabled datasets; for destinations it counts only enabled
 datasets as referrers and so drops a destination that no enabled dataset sends
@@ -174,7 +180,9 @@ def render_destinations(config: BackupConfig, *, enabled_only: bool = False, as_
     entries = [
         {
             "name": name,
+            "kind": "local" if dest.is_local else "remote",
             "url": dest.url,
+            "target_dataset": dest.target_dataset,
             "server_fingerprint": dest.server_fingerprint,
             "datasets": referrers.get(name, []),
         }
@@ -188,10 +196,15 @@ def render_destinations(config: BackupConfig, *, enabled_only: bool = False, as_
     rows = [
         [
             e["name"],
+            e["kind"],
             e["url"],
-            e["server_fingerprint"][:_FINGERPRINT_SHOWN] if e["server_fingerprint"] else "not enrolled",
+            (
+                "-" if e["kind"] == "local"
+                else e["server_fingerprint"][:_FINGERPRINT_SHOWN] if e["server_fingerprint"]
+                else "not enrolled"
+            ),
             ", ".join(e["datasets"]) if e["datasets"] else "-",
         ]
         for e in entries
     ]
-    return _table(["NAME", "URL", "ENROLLED", "DATASETS"], rows)
+    return _table(["NAME", "KIND", "URL", "ENROLLED", "DATASETS"], rows)

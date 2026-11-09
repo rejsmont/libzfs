@@ -6,11 +6,12 @@ import logging
 import os
 import re
 import socket
+import sys
 import uuid
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 import yaml
 
@@ -569,18 +570,125 @@ def normalize_fingerprint(value: str) -> str:
     return text
 
 
+#: The scheme-like prefix of a local destination URL: `zfs:<dataset>`. Exact
+#: lowercase; `ZFS:` is refused with a hint rather than folded, because the
+#: dataset that follows is case-sensitive and the prefix is not a URL scheme.
+LOCAL_DESTINATION_PREFIX = 'zfs:'
+
+_dataset_validator: Optional[Callable[[str], None]] = None
+
+
+def _get_dataset_validator() -> Callable[[str], None]:
+    """`libzfseasy.types.Validate.dataset`, the one dataset-name grammar.
+
+    `libzfseasy/__init__` resolves the `zfs` binary at import time and raises
+    on a host without one, but this module is imported by `zfsbackup-config`,
+    which must work there. So the validator is taken from `sys.modules` when
+    libzfseasy is already loaded (the daemon) and otherwise loaded from
+    `libzfseasy/types.py` by path (it imports only `re`/`typing`) without
+    executing the package `__init__`. Nothing here runs a zfs command. The
+    store's `mapper._get_dataset_validator` does the same.
+
+    Raises only `ImportError` when the validator cannot be had (libzfseasy
+    not importable, `types.py` missing or unreadable, or broken): never a
+    raw `FileNotFoundError`/`OSError`/`SyntaxError`. Not cached on failure."""
+    global _dataset_validator
+    if _dataset_validator is None:
+        loaded = sys.modules.get("libzfseasy.types")
+        if loaded is None:
+            import importlib.util  # noqa: PLC0415
+
+            try:
+                package = importlib.util.find_spec("libzfseasy")  # not executed
+                if package is None or not package.submodule_search_locations:
+                    raise ImportError("libzfseasy is not importable")
+                types_path = (
+                    Path(list(package.submodule_search_locations)[0]) / "types.py"
+                )
+                spec = importlib.util.spec_from_file_location(
+                    "_zfsbackup_libzfseasy_types", types_path
+                )
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"cannot load {types_path}")
+                loaded = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(loaded)
+            except ImportError:
+                raise
+            except Exception as e:  # OSError, SyntaxError, ValueError, ...
+                raise ImportError(
+                    f"libzfseasy/types.py cannot be loaded: {type(e).__name__}: {e}"
+                ) from e
+        try:
+            _dataset_validator = loaded.Validate.dataset
+        except AttributeError as e:
+            raise ImportError(
+                f"libzfseasy types module has no Validate.dataset: {e}"
+            ) from e
+    return _dataset_validator
+
+
+def _local_destination_problem(url: str, dataset: str) -> Optional[str]:
+    """Why `dataset` (the part of `url` after `zfs:`) is not a usable local
+    target, or `None`. Never echoes a control character raw: `url` is shown
+    with `!r`, and the dataset itself is not repeated."""
+    if not dataset:
+        return f"url {url!r} names no dataset; write zfs:<pool>/<dataset>"
+    if dataset.startswith('/'):
+        return (
+            f"url {url!r}: a local destination is zfs:<pool>/<dataset> -- not a "
+            "URL, so no '//' and no leading '/'"
+        )
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in dataset):
+        return f"url {url!r}: the dataset name contains a control character"
+    if '@' in dataset or '#' in dataset:
+        return (
+            f"url {url!r}: a local destination is a dataset, not a snapshot "
+            "('@') or bookmark ('#')"
+        )
+    try:
+        validate = _get_dataset_validator()
+    except ImportError as e:
+        # An installation problem, not a bad URL: say so, never raise.
+        return (
+            f"url {url!r}: the dataset name cannot be checked because "
+            f"libzfseasy's name validator is unavailable ({e})"
+        )
+    try:
+        validate(dataset)
+    except ValueError:
+        return (
+            f"url {url!r}: {dataset!r} is not a valid dataset name (ASCII "
+            "pool[/component...], at most 255 characters; the pool name starts "
+            "with a letter and uses letters, digits and _ . - only; no "
+            "leading, trailing or doubled '/')"
+        )
+    return None
+
+
 def destination_url_problem(url) -> Optional[str]:
     """Return why `url` is not an acceptable destination URL, or `None`.
 
-    Destinations are TLS-only: the URL must be `https://` with a host.
+    Two kinds. A remote destination is TLS-only: `https://` with a host.
     Plaintext `http://` is refused (there is no downgrade path). A port, if
     written, must be 1-65535: port 0 and an empty port (`https://host:`) are
-    refused rather than read as 443. Pure string handling, no I/O.
+    refused rather than read as 443. A local destination is `zfs:<dataset>`
+    (everything after the first `zfs:` is a dataset name, checked by the
+    dataset-name grammar and never URL-parsed, so a ':' inside it is fine);
+    the prefix is exact lowercase. Pure string handling, no I/O (the first
+    local check may import `libzfseasy/types.py` from disk).
     """
     if not isinstance(url, str) or not url.strip():
         return "url must be a non-empty string"
+    text = url.strip()
+    if text.startswith(LOCAL_DESTINATION_PREFIX):
+        return _local_destination_problem(text, text[len(LOCAL_DESTINATION_PREFIX):])
+    if text[:len(LOCAL_DESTINATION_PREFIX)].lower() == LOCAL_DESTINATION_PREFIX:
+        return (
+            f"url {text!r}: the local destination prefix is the exact lowercase "
+            "'zfs:' (zfs:<pool>/<dataset>)"
+        )
     try:
-        parts = urlsplit(url.strip())
+        parts = urlsplit(text)
         host = parts.hostname
         port = parts.port  # raises ValueError for a malformed port
     except ValueError as e:
@@ -593,7 +701,10 @@ def destination_url_problem(url) -> Optional[str]:
         )
     if scheme != 'https':
         what = f"scheme {scheme!r}" if scheme else "no scheme"
-        return f"url {url!r} has {what}; destinations must be https:// URLs"
+        return (
+            f"url {url!r} has {what}; destinations must be https:// URLs "
+            "(or zfs:<dataset> for a dataset on this host)"
+        )
     if not host:
         return f"url {url!r} has no host"
     if port == 0:
@@ -611,15 +722,18 @@ def destination_url_problem(url) -> Optional[str]:
 
 @dataclass
 class Destination:
-    """A remote server that accepts backup streams.
+    """Where backups go: a remote server that accepts backup streams
+    (`https://...`) or a dataset on this host (`zfs:<dataset>`, see
+    `is_local`).
 
     `server_fingerprint` is the pinned SHA-256 fingerprint of the server's
     certificate (64 lowercase hex), set by enrollment; `None` means the
     destination is not enrolled yet. It is normalised and validated on
-    construction. The URL scheme rule (https only) is a config-boundary
-    policy enforced by `BackupConfig.from_file` and `destination_url_problem`
-    (also used by the store's `validate_config`), not here, so a legacy row
-    can still be loaded and fixed.
+    construction. A local destination has no server and never carries one
+    (`destination_problem`). The URL rules are a config-boundary policy
+    enforced by `BackupConfig.from_file` and `destination_problem` (also used
+    by the store's `validate_config`), not here, so a legacy row can still be
+    loaded and fixed.
     """
     url: str
     server_fingerprint: Optional[str] = None
@@ -627,6 +741,39 @@ class Destination:
     def __post_init__(self):
         if self.server_fingerprint is not None:
             self.server_fingerprint = normalize_fingerprint(self.server_fingerprint)
+
+    @property
+    def is_local(self) -> bool:
+        """True for a `zfs:<dataset>` destination. Derived from `url` (not a
+        field, so the signature and equality are unchanged)."""
+        return isinstance(self.url, str) and self.url.strip().startswith(
+            LOCAL_DESTINATION_PREFIX
+        )
+
+    @property
+    def target_dataset(self) -> Optional[str]:
+        """The dataset of a local destination (the text after `zfs:`), `None`
+        for an https one. Not validated here (`destination_problem`)."""
+        if not self.is_local:
+            return None
+        return self.url.strip()[len(LOCAL_DESTINATION_PREFIX):]
+
+
+def destination_problem(dest) -> Optional[str]:
+    """Why `dest` (a `Destination`) is not acceptable, or `None`: its URL
+    (`destination_url_problem`) and the fingerprint-versus-kind rule -- a
+    `zfs:` destination has no server, so it never carries a
+    `server_fingerprint`. Pure; the one check the YAML loader, the store's
+    `validate_config` and the CLI share."""
+    problem = destination_url_problem(getattr(dest, 'url', None))
+    if problem is not None:
+        return problem
+    if getattr(dest, 'is_local', False) and getattr(dest, 'server_fingerprint', None):
+        return (
+            f"url {dest.url!r} is a local destination, which has no server and "
+            "no server_fingerprint; remove the server_fingerprint"
+        )
+    return None
 
 
 _CLIENT_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
@@ -1164,7 +1311,11 @@ class BackupConfig:
                 raise ValueError(
                     f"destinations[{dest_name}].server_fingerprint: {e}"
                 ) from None
-            destinations[dest_name] = Destination(url=url, server_fingerprint=fp)
+            dest = Destination(url=url, server_fingerprint=fp)
+            problem = destination_problem(dest)
+            if problem:
+                raise ValueError(f"destinations[{dest_name}]: {problem}")
+            destinations[dest_name] = dest
 
         for ds in datasets:
             for r in ds.remote:

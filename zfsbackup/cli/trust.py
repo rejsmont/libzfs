@@ -84,6 +84,7 @@ are UTC ISO-8601 strings (`2026-10-20T12:00:00Z`) or `null`::
 
 import json
 import os
+import shlex
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -833,6 +834,28 @@ def identity_set_client_id(state: Any, new_id: str, force: bool) -> None:
         "client, so the next remote backup of each dataset is a FULL send to "
         f"<target>/{new_id}; data under the old id on the servers is left in place"
     )
+
+    locals_ = sorted(
+        (name, dest.target_dataset)
+        for name, dest in snapshot.config.destinations.items() if dest.is_local
+    ) if previous else []
+    if locals_:
+        # A local destination keeps its copies at <target>/<client id>/...
+        # (the server's layout), so a new id is a new, empty place.
+        names = ", ".join(repr(name) for name, _ in locals_)
+        state.warn(
+            f"local destination(s) {names} keep their copies under <target>/{previous}/: with "
+            f"the new client id {new_id!r} the next backup to each is a FULL send into "
+            f"<target>/{new_id}/, and the copies under the old id are orphaned (nothing sends "
+            "to or prunes them to their rules any more; the copies carry the old client id, so "
+            "a rename would not adopt them). Keep the old tree as it is, or, only if you no "
+            "longer need those copies, destroy it by hand. Optional and DESTRUCTIVE, an "
+            "example only (check what it holds first):\n"
+            + "\n".join(
+                f"  zfs destroy -r {shlex.quote(f'{target}/{previous}')}"
+                for target in sorted({target for _, target in locals_})
+            )
+        )
 
     with _operator_errors():
         update = set_client_id(

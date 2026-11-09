@@ -72,6 +72,7 @@ from zfsbackup.cli.render import (
 )
 from zfsbackup.cli.write import (
     begin_reload,
+    ID_COMMITTED_MARK,
     commit_config,
     notify_daemon,
     release_database,
@@ -693,6 +694,7 @@ def _session(
             _anchor_warnings(original, canon)
             + _recreate_warnings(original, canon)
             + dotpath.pin_change_warnings(original, canon)
+            + dotpath.url_change_warnings(original, canon, snapshot.client_id)
             + dotpath.prefix_change_warnings(original, canon)
             + dotpath.raw_change_warnings(original, canon)
         ):
@@ -726,10 +728,15 @@ def _session(
                     f"kept in {directory / 'config.yaml'}"
                 )
             else:
-                exc.add_note(
-                    f"your edit is kept in {directory / 'config.yaml'}; nothing was "
-                    "written to the database"
+                # `commit_config` marks a failure after it had already stored
+                # a fresh client id: that one thing WAS written.
+                written = (
+                    "only this host's new client id was stored, the configuration "
+                    "itself was not changed"
+                    if getattr(exc, ID_COMMITTED_MARK, False)
+                    else "nothing was written to the database"
                 )
+                exc.add_note(f"your edit is kept in {directory / 'config.yaml'}; {written}")
         raise
     finally:
         if not keep:
@@ -815,8 +822,9 @@ def edit_destination(
         resolved, snapshot,
         header=_entry_header(
             "destination", name,
-            "A destination has a url: and, once enrolled, a server_fingerprint: (the pin; "
-            "leaving it out un-enrolls the destination).",
+            "A destination has a url: (https://HOST:PORT for a server, zfs:<dataset> for a "
+            "dataset on this host) and, once a server is enrolled, a server_fingerprint: (the "
+            "pin; leaving it out un-enrolls the destination; a zfs: destination has none).",
         ),
         initial_body=render_destination_fragment(dest), parse=_destination_parser(config, name),
         check_rename=False, warn=warn, editor=editor, allow_recreate=True, prompt=prompt,

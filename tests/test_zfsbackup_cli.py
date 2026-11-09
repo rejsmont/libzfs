@@ -102,6 +102,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+from types import SimpleNamespace
 import textwrap
 import threading
 import time
@@ -1046,6 +1047,16 @@ class TestWarnings:
                     replaced_destinations=0,
                 )
             monkeypatch.setattr(cli_main, "import_yaml", fake)
+            # The fake commits nothing, and `import` now reads the committed
+            # configuration back (to see whether a local destination needs a
+            # client id): give it one with no destinations.
+            monkeypatch.setattr(
+                cli_main, "read_snapshot",
+                lambda resolved, **kwargs: SimpleNamespace(
+                    config=SimpleNamespace(destinations={}), client_id=None,
+                    generation=0, store_id=1,
+                ),
+            )
         return install
 
     def test_library_warning_is_printed_as_warning_on_stderr(self, run, db, noisy_import):

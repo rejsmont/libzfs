@@ -1,6 +1,6 @@
 [project]
 name = "libzfseasy"
-version = "1.0.0rc3"
+version = "1.0.0rc4"
 description = "Python interface to the ZFS utilities (zfs and zpool)"
 authors = [{name = "Radoslaw Kamil Ejsmont", email = "radoslaw@ejsmont.net"}]
 license = "MIT"

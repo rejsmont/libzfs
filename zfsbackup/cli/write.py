@@ -23,6 +23,28 @@ slightly wrong::
   and `ConfigBusy` propagate; `errors.py` maps both to exit 75 with their
   messages. Nothing here ever retries: a conflict means the edit was made
   against a configuration that no longer exists.
+- A configuration that contains a local (`zfs:`) destination needs this host's
+  client id (its copies live under `<target>/<client id>/`). When the snapshot
+  has none, `commit_config` stores one first -- `generate_client_id()` through
+  the store's `set_client_id(expected_generation=..., expected_store_id=...)`,
+  which bumps the config generation by one -- and then writes with the new
+  generation, both under ONE writer lock hold, so no other writer can slip in
+  between and the original snapshot is still the compare-and-swap basis. The
+  id is announced on stdout ("generated this host's client id: ...") by the
+  next `begin_reload` for that generation -- after the writer lock is released
+  and after the daemon was asked to reload, like every other line printed
+  after a commit. On success the caller's single `begin_reload` covers both
+  generations and prints it; if the write that follows fails, the id stays
+  (it is committed and harmless), `commit_config` itself calls `begin_reload`
+  for the id's generation (so the daemon is asked once and the line is
+  printed) and the error propagates. An interrupt (^C) anywhere between the
+  id's commit and the config write takes that same path, because the id's
+  generation is recorded the moment `set_client_id` returns; the one window
+  that cannot be guarded is an interrupt INSIDE `set_client_id` after its
+  commit but before it returns, and there the daemon's 10 s poll of the
+  generation applies the id instead of a signal. A caller-held `lock` (never
+  the case for the id-less store this is for, in practice) gets the signal but
+  not the line: that waits for the next `begin_reload`.
 - After EVERY committed write `notify_daemon` asks the running daemon to
   reload, exactly once (`daemonlock.request_reload`: it verifies the daemon is
   the lock holder before signalling it with SIGHUP, and never signals
@@ -48,15 +70,17 @@ import click
 
 from zfsbackup import daemonlock
 from zfsbackup.cli.errors import CliError
-from zfsbackup.config import BackupConfig
+from zfsbackup.config import BackupConfig, generate_client_id
 from zfsbackup.config.store import (
     ConfigSnapshot,
     ResolvedConfigPath,
     WriteResult,
     dispose_all,
     read_config,
+    set_client_id,
     validate_config,
     write_config,
+    writer_lock,
 )
 
 __all__ = [
@@ -65,6 +89,7 @@ __all__ = [
     "await_applied",
     "notify_daemon",
     "COMMITTED_MARK",
+    "ID_COMMITTED_MARK",
     "read_snapshot",
     "release_database",
     "where_flag",
@@ -106,6 +131,74 @@ def read_snapshot(resolved: ResolvedConfigPath) -> ConfigSnapshot:
         release_database()
 
 
+#: Set (to True) on an exception that left `commit_config` after a fresh client
+#: id had been stored: the configuration was not written, the id was.
+ID_COMMITTED_MARK = "zfsbackup_client_id_committed"
+
+#: `(store_id, generation, client_id)` of a client id this process just stored
+#: and has not announced yet. `begin_reload` prints it when it is called for
+#: that very key, then forgets it.
+_pending_announcement: Optional[Tuple[Optional[int], int, str]] = None
+
+
+def _announce_client_id(client_id: str) -> None:
+    """Say the id was generated. Never raises: the id is already stored."""
+    try:
+        click.echo(f"generated this host's client id: {client_id}")
+    except OSError:  # BrokenPipeError, EIO, ENOSPC on the output stream
+        pass
+
+
+def _flush_announcement(generation: Optional[int], store_id: Optional[int]) -> None:
+    """Print the pending client-id line iff it belongs to the write
+    `(store_id, generation)` that `begin_reload` was just called for. Anything
+    else pending is stale (its caller never reloaded) and dropped."""
+    global _pending_announcement
+    pending, _pending_announcement = _pending_announcement, None
+    if pending is not None and pending[0] == store_id and pending[1] == generation:
+        _announce_client_id(pending[2])
+
+
+class _IdProgress:
+    """What `_write_with_client_id` committed before it stopped (the id's
+    `ClientIdUpdate`), so `commit_config` can still ask for the reload once."""
+
+    update = None
+
+
+def _write_with_client_id(
+    resolved: ResolvedConfigPath,
+    snapshot: ConfigSnapshot,
+    config: BackupConfig,
+    held: Path,
+    progress: _IdProgress,
+) -> WriteResult:
+    """Store a fresh client id, then `config`, under the writer lock `held`.
+
+    The id goes in with `set_client_id(expected_generation=snapshot's,
+    expected_store_id=snapshot's)`: a moved generation or a replaced file is
+    a `ConfigConflict` / `StoreIdConflict` before anything is written, and the
+    returned generation (the snapshot's plus one) is what the config write then
+    compares against. Nothing else can write in between (`held`). `progress`
+    records the committed id for the caller; nothing is printed here (the
+    lock is held)."""
+    progress.update = set_client_id(
+        resolved,
+        generate_client_id(),
+        expected_generation=snapshot.generation,
+        expected_store_id=snapshot.store_id,
+        lock=held,
+    )
+    release_database()
+    return write_config(
+        resolved,
+        config,
+        expected_generation=progress.update.generation,
+        expected_store_id=snapshot.store_id,
+        lock=held,
+    )
+
+
 def commit_config(
     resolved: ResolvedConfigPath,
     snapshot: ConfigSnapshot,
@@ -124,7 +217,13 @@ def commit_config(
     `warn` receives each `validate_config` warning once. Raises `ValueError`
     for an invalid `config` (nothing opened), `ConfigConflict` /
     `StoreIdConflict` / `ConfigBusy` (nothing written), and the store's
-    path/schema/storage errors.
+    path/schema/storage errors. "Nothing written" holds except for one case:
+    when the snapshot had no client id and `config` has a local destination, a
+    fresh id is committed first (its own generation bump), so a later failure
+    of the config write leaves the id stored. Then the daemon has already been
+    asked to reload (and the id line printed) before the exception propagates;
+    the exception then carries `ID_COMMITTED_MARK = True` so a caller that would say
+    "nothing was written" can say what is true.
 
     `announce=True` with a caller-held `lock` is refused: the notice may wait
     for the daemon, and nothing may wait while the writer lock is held.
@@ -134,24 +233,61 @@ def commit_config(
     for message in validate_config(config):
         warn(message)
     release_database()
+    needs_client_id = (
+        getattr(snapshot, "client_id", None) is None
+        and any(d.is_local for d in config.destinations.values())
+    )
+    progress = _IdProgress()
     try:
-        # `lock` is a writer lock the caller already holds (`paths.writer_lock`);
-        # `write_config` then reuses it instead of taking it again (the flock
-        # is not re-entrant).
-        result = write_config(
-            resolved,
-            config,
-            expected_generation=snapshot.generation,
-            expected_store_id=snapshot.store_id,
-            lock=lock,
-        )
-    finally:
-        # Whatever the write opened, nothing may stay pooled: the caller's
-        # retry loop may run `$EDITOR` next.
-        release_database()
+        try:
+            if needs_client_id and lock is None:
+                with writer_lock(resolved) as held:
+                    result = _write_with_client_id(resolved, snapshot, config, held, progress)
+            elif needs_client_id:
+                result = _write_with_client_id(resolved, snapshot, config, lock, progress)
+            else:
+                # `lock` is a writer lock the caller already holds (`paths.writer_lock`);
+                # `write_config` then reuses it instead of taking it again (the flock
+                # is not re-entrant).
+                result = write_config(
+                    resolved,
+                    config,
+                    expected_generation=snapshot.generation,
+                    expected_store_id=snapshot.store_id,
+                    lock=lock,
+                )
+        finally:
+            # Whatever the write opened, nothing may stay pooled: the caller's
+            # retry loop may run `$EDITOR` next.
+            release_database()
+    except BaseException as exc:
+        update = progress.update
+        if update is not None:
+            # The id is committed (the generation moved), the config was not:
+            # the writer lock is released now (unless the caller holds it), so
+            # ask the daemon to reload once -- which also prints the id line --
+            # and let the error through.
+            _stash_announcement(snapshot.store_id, update.generation, update.client_id)
+            begin_reload(
+                resolved, update.generation, snapshot.store_id,
+                announce_pending=lock is None,
+            )
+            try:
+                setattr(exc, ID_COMMITTED_MARK, True)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    if progress.update is not None:
+        # One reload covers both generations: the line belongs to the write's.
+        _stash_announcement(result.store_id, result.generation, progress.update.client_id)
     if announce:
         notify_daemon(resolved, result.generation, result.store_id)
     return result
+
+
+def _stash_announcement(store_id: Optional[int], generation: int, client_id: str) -> None:
+    global _pending_announcement
+    _pending_announcement = (store_id, generation, client_id)
 
 
 def where_flag(resolved) -> str:
@@ -329,17 +465,29 @@ def _unverified_line(updated: str, req: daemonlock.ReloadRequest) -> str:
 
 
 def begin_reload(
-    resolved: ResolvedConfigPath, generation: Optional[int], store_id: Optional[int] = None
+    resolved: ResolvedConfigPath,
+    generation: Optional[int],
+    store_id: Optional[int] = None,
+    *,
+    announce_pending: bool = True,
 ) -> daemonlock.ReloadRequest:
     """Ask the running daemon to reload, NOW. Call it immediately after a
     commit, before printing anything: a closed stdout must not cost the signal.
     Pass the result to `notify_daemon(..., request=...)` to report it. Never
-    raises (a failure is an `error` outcome)."""
+    raises (a failure is an `error` outcome).
+
+    The only line this prints is "generated this host's client id: ..." when
+    `commit_config` just stored one for this very write (so it comes after the
+    signal and after the writer lock is released); `announce_pending=False`
+    leaves it for the next call."""
     key = (store_id, generation) if store_id is not None and generation is not None else None
     try:
         return daemonlock.request_reload(resolved, skip_if_applied=key)
     except Exception as exc:  # noqa: BLE001 - the write is already durable
         return daemonlock.ReloadRequest("error", detail=f"{type(exc).__name__}: {exc}")
+    finally:
+        if announce_pending:
+            _flush_announcement(generation, store_id)
 
 
 def _daemon_notice(

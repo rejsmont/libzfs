@@ -113,6 +113,37 @@ Notes:
 
 ---
 
+## Release 1.0.0rc4
+
+**Run:** 2026-11-09, the 1.0.0rc4 tree (local destinations; the OpenZFS 2.1 raw `sharesmb` fix), shipped as
+`SRC_REF=WORKTREE` snapshots of `eeb2151` plus the harness fixes below, `zfsb-server` + `zfsb-client` (Ubuntu
+26.04, OpenZFS 2.4.1). Harness: **872 passed, 1 failed** on the first full run with every scenario, then **868
+passed, 5 failed** on the second, and scenario L1 alone **137 passed, 0 failed**. None of the failures is a
+product failure:
+
+- The chain moved from `remote.py` to `chain.py`, and the harness looked for it only in `remote.py`, so an earlier
+  run skipped scenarios B2 and M; the feature checks now search both files, and B2 and M ran in both full runs.
+- Scenario I waited for the server's snapshot COUNT to grow; the server's pruner dropped an old snapshot in the same
+  window. It now waits for a new snapshot name.
+- L1c's "warned once" checks (5) counted a second WARNING from a fresh pruning worker after a daemon restart that
+  fell inside the scenario's log window (a new worker warns once, by design); L1 alone passed every check.
+
+The other release checks: the local-destination scenario (`scenarios/test_local_destination.sh`, one VM, two
+pools) 155 / 0; the OpenZFS matrix with `tests/test_zfsbackup_real.py` and the new
+`tests/test_zfsbackup_real_local.py` on 2.1.5 384 passed, 5 skipped (four server-side `sharesmb=on` tests skip
+because Samba cannot create the share on the VM; the local ones cover it) and on 2.2.2, 2.3.9 and 2.4.1 388
+passed, 1 skipped each (the first 2.1 run found the raw `sharesmb` gap fixed in `6fe401c`);
+`test_config_permissions.sh` 321 / 0; the wheel install scenario on Ubuntu 22.04 (full run) and 24.04 (rerun after
+fixing a whole-second journal mark that also counted the previous start's line) 234 / 0 each; the `.deb` install
+scenario on Ubuntu 26.04 and Debian 13 241 / 0. The mocked suite: 23732 passed on macOS (Python 3.14) and in CI
+(Python 3.11–3.15, SQLAlchemy 2.0 and 2.1, the Debian 13 floors); not on the `zfsb-ci` system Pythons.
+
+**Lesson:** never launch two Multipass VMs at once on this host. The first attempt ran the local-destination
+scenario and the harness together; `zfsb-local` came up with `zfsb-server`'s address and its commands ran on the
+server. Both runs were discarded.
+
+---
+
 ## Release 1.0.0rc3
 
 **Run:** 2026-11-08, `SRC_REF=9e58061` (the 1.0.0rc3 tree: server copies keep the client's pool,

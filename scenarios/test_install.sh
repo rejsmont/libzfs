@@ -1115,11 +1115,12 @@ upgrade() {
     else
         check_re "the journal (ExecStartPre) says the schema is up to date" "Schema is up to date" "$ujl"
     fi
-    # a plain restart writes no second backup
-    umark=$(( $(jl_epoch) - 1 ))
+    # a plain restart writes no second backup. Count the lines the restart adds: a `--since` mark has whole-second
+    # granularity and can also catch the previous start's line when both fall in the same second.
+    local before; before="$(jl | grep -c 'Schema is up to date' | tr -d '[:space:]')"
     vsh "systemctl restart $UNIT"; rc=$?
     check "a plain restart exits 0" "0" "$rc"
-    check "... ExecStartPre found the schema up to date" "1" "$(jl --since @$umark | grep -c 'Schema is up to date' | tr -d '[:space:]')"
+    check "... ExecStartPre found the schema up to date" "1" "$(( $(jl | grep -c 'Schema is up to date' | tr -d '[:space:]') - before ))"
     check "... and wrote no (second) backup (still $MIGRATES backup file(s))" "$MIGRATES" "$(vsh "ls -1 $BAKDIR | grep -vc -- '-\(wal\|shm\)\$'" | tr -d '[:space:]')"
     check "the unit is active again" "active" "$(sd_prop ActiveState)"
     vsh "systemctl stop $UNIT" || true
