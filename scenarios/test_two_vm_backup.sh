@@ -1223,8 +1223,13 @@ echo
 step "SCENARIO I — received datasets are pruned NON-recursively (a received parent never takes its child's history)"
 # 1. the client dataset becomes recursive: true, which the server's copy receives with the next transfer
 cli_vm "$CLIENT_VM" set "datasets[${SOURCE_DS}].recursive" true | sed 's/^/    CLI: /'
-cnt_i="$(server_snaps | count)"
-if wait_for_server_count "$((cnt_i+1))" "$SNAP_TIMEOUT"; then pass "(I) a transfer ran after the client dataset became recursive"; else fail "(I) no transfer after the recursive change"; fi
+# A NEW snapshot name, not a higher count: the server's pruner may drop an old one in the same window.
+before_i="$(server_snaps | sort -u)"; waited=0; new_i=""
+until [ -n "$new_i" ] || [ "$waited" -ge "$SNAP_TIMEOUT" ]; do
+    new_i="$(server_snaps | sort -u | comm -13 <(printf '%s\n' "$before_i") -)"
+    [ -n "$new_i" ] || { sleep 3; waited=$((waited+3)); }
+done
+if [ -n "$new_i" ]; then pass "(I) a transfer ran after the client dataset became recursive"; else fail "(I) no transfer after the recursive change"; fi
 RCV="$(server_ds)"; RCV_CHILD="${RCV}/child"
 rec_prop="$(msh "$SERVER_VM" "'$PY' '$CFGPROP_PY' recursive \"\$(zfs get -H -o value org.zfsbackup:config '$RCV')\"" | tr -d '[:space:]')"
 check "(I) the server's received copy of the dataset carries recursive=true (the client's setting)" "true" "$rec_prop"
