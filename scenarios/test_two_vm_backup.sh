@@ -813,7 +813,7 @@ done
 # Milestone D B-2 (stream header check, inert server copies, ownership 409, retention-shrink warning): scenario L2.
 L2_READY=1
 for vm in "$SERVER_VM" "$CLIENT_VM"; do
-    if msh "$vm" "grep -q 'parse_stream_header' '$SRC_DIR/zfsbackup/api.py' && grep -q '_STREAM_REFUSAL_HINTS' '$SRC_DIR/zfsbackup/remote.py'"; then
+    if msh "$vm" "grep -q 'parse_stream_header' '$SRC_DIR/zfsbackup/api.py' && grep -qs '_STREAM_REFUSAL_HINTS' '$SRC_DIR/zfsbackup/remote.py' '$SRC_DIR/zfsbackup/chain.py'"; then
         info "$vm: shipped tree has the B-2 stream header check (api.py parse_stream_header) and the refusal hints (remote.py)"
     else
         warn "$vm: shipped tree ($SRC_REF) lacks the B-2 stream header check: scenario L2 will be skipped, L1a would FAIL"
@@ -821,17 +821,17 @@ for vm in "$SERVER_VM" "$CLIENT_VM"; do
     fi
 done
 
-# Milestone B (snapshot and send correctness): the `-i` chain over managed snapshots + the frozen send flags (B5, scenario B2 and
+# Milestone B (snapshot and send correctness; the chain lives in chain.py from 1.0.0rc4, remote.py before): the `-i` chain over managed snapshots + the frozen send flags (B5, scenario B2 and
 # the J additions), the prune fallback (B-4, scenario B2) and the raw / R0 / server_copy work (S6, scenario M).
 B2_READY=1; M_READY=1
 for vm in "$SERVER_VM" "$CLIENT_VM"; do
-    if msh "$vm" "grep -q '_plan_chain' '$SRC_DIR/zfsbackup/remote.py' && grep -q '_prune_stuck' '$SRC_DIR/zfsbackup/backup_manager.py'"; then
+    if msh "$vm" "grep -qs '_plan_chain' '$SRC_DIR/zfsbackup/remote.py' '$SRC_DIR/zfsbackup/chain.py' && grep -q '_prune_stuck' '$SRC_DIR/zfsbackup/backup_manager.py'"; then
         info "$vm: shipped tree has the B5 snapshot chain (remote.py _plan_chain) and the B-4 prune fallback"
     else
         warn "$vm: shipped tree ($SRC_REF) lacks the B5 chain / B-4 prune fallback: scenario B2 will be skipped, J5 may fail"
         B2_READY=0
     fi
-    if msh "$vm" "grep -q '_send_mode' '$SRC_DIR/zfsbackup/remote.py' && grep -q 'server_copy' '$SRC_DIR/zfsbackup/api.py'"; then
+    if msh "$vm" "grep -qs '_send_mode' '$SRC_DIR/zfsbackup/remote.py' '$SRC_DIR/zfsbackup/chain.py' && grep -q 'server_copy' '$SRC_DIR/zfsbackup/api.py'"; then
         info "$vm: shipped tree has raw sends (remote.py _send_mode) and server_copy in negotiate (api.py)"
     else
         warn "$vm: shipped tree ($SRC_REF) lacks the S6 raw / server_copy work: scenario M will be skipped"
@@ -847,7 +847,7 @@ for vm in "$SERVER_VM" "$CLIENT_VM"; do
 done
 # B-2b (the server never rolls its history back for a client): scenario R2c-R3 assert the refusal and its ERROR wording.
 for vm in "$SERVER_VM" "$CLIENT_VM"; do
-    msh "$vm" "grep -q '_rollback_permit' '$SRC_DIR/zfsbackup/remote.py' && grep -q 'decide_receive' '$SRC_DIR/zfsbackup/api.py'" \
+    msh "$vm" "grep -qs '_rollback_permit' '$SRC_DIR/zfsbackup/remote.py' '$SRC_DIR/zfsbackup/chain.py' && grep -q 'decide_receive' '$SRC_DIR/zfsbackup/api.py'" \
         || warn "$vm: shipped tree ($SRC_REF) lacks the B-2b rollback refusal (_rollback_permit / decide_receive): R2c, R2d, R2e and R3 will FAIL (ship the work tree: SRC_REF=WORKTREE)"
 done
 [ "$CK_READY" -eq 1 ] || warn "shipped tree ($SRC_REF) has no \`zfsbackup-config check\`: scenario CK will be skipped"

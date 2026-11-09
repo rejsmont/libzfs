@@ -813,6 +813,101 @@ def auto_zfs_pool(tmp_path_factory):
         yield from _auto_zfs_pool_local(tmp_path_factory)
 
 
+def _second_pool_local(first, tmp_path_factory):
+    """A second file-backed pool (`<first>_b`) for the cross-pool local-destination tests.
+
+    Created like the first (`truncate` + `sudo -n zpool create`, best-effort delegation); the first
+    pool's fixture has already decided whether `zfs`/`zpool` go through the sudo wrappers (`ZFS_CMD` set),
+    so a second pool that cannot be used without them yields `None` (skip), never an error. The image
+    directory is kept (`.image_dir`): a test that exports the pool imports it back with `zpool import -d`."""
+    import os
+    import subprocess
+    import types
+
+    from libzfseasy.zfs import _zfs_cmd
+
+    name = f'{first.name}_b'
+    disk_dir = tmp_path_factory.mktemp('zfs_pool2')
+    image = str(disk_dir / 'disk.img')
+    subprocess.run(['truncate', '-s', '512m', image], check=True)
+    if subprocess.run(['sudo', '-n', 'zpool', 'create', name, image],
+                      capture_output=True).returncode != 0:
+        yield None
+        return
+    try:
+        if not os.environ.get('ZFS_CMD'):
+            user = subprocess.run(['id', '-un'], capture_output=True, text=True).stdout.strip()
+            subprocess.run(
+                ['sudo', '-n', 'zfs', 'allow', '-u', user,
+                 'create,destroy,snapshot,clone,rename,mount,bookmark,receive,userprop,inherit,'
+                 'compression,mountpoint,quota,reservation,volsize,volblocksize', name],
+                capture_output=True,
+            )
+            probe = f'{name}/_probe'
+            ok = subprocess.run([_zfs_cmd(), 'create', probe], capture_output=True).returncode == 0
+            if ok:
+                subprocess.run([_zfs_cmd(), 'destroy', probe], capture_output=True)
+            else:
+                # no delegation and no wrappers (they belong to the first pool's fixture): not usable
+                yield None
+                return
+        yield types.SimpleNamespace(name=name, image_dir=str(disk_dir))
+    finally:
+        _destroy_second_pool(['sudo', '-n', 'zpool'], name, str(disk_dir))
+
+
+def _second_pool_multipass(vm_name, first, tmp_path_factory):
+    """The second pool inside the Multipass VM (same wrappers as the first, installed by its fixture)."""
+    import subprocess
+    import types
+
+    name = f'{first.name}_b'
+    image = f'/tmp/{name}.img'
+    prefix = ['multipass', 'exec', vm_name, '--']
+    subprocess.run(prefix + ['truncate', '-s', '512m', image], check=True)
+    if subprocess.run(prefix + ['sudo', 'zpool', 'create', name, image],
+                      capture_output=True).returncode != 0:
+        subprocess.run(prefix + ['rm', '-f', image], capture_output=True)
+        yield None
+        return
+    try:
+        yield types.SimpleNamespace(name=name, image_dir='/tmp')
+    finally:
+        _destroy_second_pool(prefix + ['sudo', 'zpool'], name, '/tmp')
+        subprocess.run(prefix + ['rm', '-f', image], capture_output=True)
+
+
+def _destroy_second_pool(zpool, name, image_dir):
+    """Destroy the second pool; a test that exported it and failed to import it back is repaired first."""
+    import subprocess
+
+    if subprocess.run(zpool + ['destroy', '-f', name], capture_output=True).returncode == 0:
+        return
+    subprocess.run(zpool + ['import', '-d', image_dir, '-f', name], capture_output=True)
+    subprocess.run(zpool + ['destroy', '-f', name], capture_output=True)
+
+
+@pytest.fixture(scope='session')
+def auto_zfs_pool2(auto_zfs_pool, tmp_path_factory):
+    """A SECOND throwaway file-backed pool (`<auto_zfs_pool>_b`), created and destroyed like `auto_zfs_pool`,
+    for the cross-pool local-destination tests (`tests/test_zfsbackup_real_local.py`).
+
+    -> `SimpleNamespace(name, image_dir)`, or `None` when the first pool is unavailable or this second one
+    cannot be created (dependent tests `pytest.skip`). `image_dir` is where `zpool import -d` finds the
+    image after a test exported the pool. Only requested by tests that need it (session scope, created
+    lazily), so the single-pool real tests never pay for it."""
+    import os
+
+    if auto_zfs_pool is None:
+        yield None
+        return
+    vm = os.environ.get('MULTIPASS_VM')
+    if vm:
+        yield from _second_pool_multipass(vm, auto_zfs_pool, tmp_path_factory)
+    else:
+        yield from _second_pool_local(auto_zfs_pool, tmp_path_factory)
+
+
 # Test markers
 def pytest_configure(config):
     """Register custom markers."""
