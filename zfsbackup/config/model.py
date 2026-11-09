@@ -1408,39 +1408,3 @@ class BackupConfig:
     @property
     def enabled_datasets(self) -> List[DatasetConfig]:
         return [ds for ds in self.datasets if ds.enabled]
-
-
-def shared_receive_target(config) -> Optional[str]:
-    """The backup target this host's own local destination shares with the
-    server, or `None`.
-
-    Returns the enabled `remote_backup.target_dataset` (a trailing `/`
-    stripped, nothing else: the store validator's `_dataset_components`
-    normalisation) when any *declared* local destination (`zfs:<dataset>`, enabled
-    or not referenced by any dataset) targets exactly that dataset,
-    component by component. Inside or above the target is not "shared" (the
-    store refuses those). The one definition of "shared" for the API's
-    reserved client id, the worker handing it over and the CLI's warnings.
-    Tolerant of a config built in code: no `remote_backup`, a disabled one, an
-    empty or non-string target, or no destinations all give `None`.
-    """
-    remote = getattr(config, 'remote_backup', None)
-    if remote is None or not getattr(remote, 'enabled', False):
-        return None
-    target = getattr(remote, 'target_dataset', None)
-    if not isinstance(target, str):
-        return None
-    target = target.rstrip('/')
-    if not target:
-        return None
-    wanted = target.split('/')
-    for dest in (getattr(config, 'destinations', None) or {}).values():
-        if not getattr(dest, 'is_local', False):
-            continue
-        local = getattr(dest, 'target_dataset', None)
-        if not isinstance(local, str):
-            continue
-        local = local.rstrip('/')
-        if local and local.split('/') == wanted:
-            return target
-    return None

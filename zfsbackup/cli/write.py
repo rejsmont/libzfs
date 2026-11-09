@@ -45,15 +45,6 @@ slightly wrong::
   generation applies the id instead of a signal. A caller-held `lock` (never
   the case for the id-less store this is for, in practice) gets the signal but
   not the line: that waits for the next `begin_reload`.
-- A configuration that shares a backup target with the server (a local
-  destination whose target is exactly `remote_backup.target_dataset`,
-  `config.shared_receive_target`) reserves this host's own client id on the
-  server. When that id is also bound in the trust tables (a loopback setup:
-  this host enrolled with its own server) the server refuses its receives, and
-  `commit_config` queues that check; `notify_daemon` prints the warning after its notice
-  for that generation (`shared_target_warning`; the trust tables are read only
-  through `zfsbackup.config.store`'s `list_clients`, and only there: after the
-  reload was requested and the writer lock released, never in between).
 - After EVERY committed write `notify_daemon` asks the running daemon to
   reload, exactly once (`daemonlock.request_reload`: it verifies the daemon is
   the lock holder before signalling it with SIGHUP, and never signals
@@ -73,19 +64,18 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import click
 
 from zfsbackup import daemonlock
 from zfsbackup.cli.errors import CliError
-from zfsbackup.config import BackupConfig, generate_client_id, shared_receive_target
+from zfsbackup.config import BackupConfig, generate_client_id
 from zfsbackup.config.store import (
     ConfigSnapshot,
     ResolvedConfigPath,
     WriteResult,
     dispose_all,
-    list_clients,
     read_config,
     set_client_id,
     validate_config,
@@ -103,10 +93,6 @@ __all__ = [
     "read_snapshot",
     "release_database",
     "where_flag",
-    "shared_local_destinations",
-    "own_id_bound",
-    "shared_target_warning",
-    "stored_shared_target_warning",
     "DEFAULT_RELOAD_WAIT",
 ]
 
@@ -294,15 +280,6 @@ def commit_config(
     if progress.update is not None:
         # One reload covers both generations: the line belongs to the write's.
         _stash_announcement(result.store_id, result.generation, progress.update.client_id)
-    global _pending_notice
-    _pending_notice = None
-    if shared_receive_target(config) is not None:
-        # Only queued: the trust tables are read after the reload was requested
-        # and the writer lock is released (`notify_daemon`), never before.
-        _pending_notice = (
-            result.store_id, result.generation, resolved, config,
-            getattr(snapshot, "client_id", None),
-        )
     if announce:
         notify_daemon(resolved, result.generation, result.store_id)
     return result
@@ -311,86 +288,6 @@ def commit_config(
 def _stash_announcement(store_id: Optional[int], generation: int, client_id: str) -> None:
     global _pending_announcement
     _pending_announcement = (store_id, generation, client_id)
-
-
-def shared_local_destinations(config: BackupConfig) -> Tuple[Optional[str], List[str]]:
-    """`(target, names)`: the server's target a local destination shares
-    (`shared_receive_target`, `None` when nothing is shared) and the sorted
-    names of the local destinations on it."""
-    target = shared_receive_target(config)
-    if target is None:
-        return None, []
-    wanted = target.split("/")
-    names = sorted(
-        name for name, dest in config.destinations.items()
-        if dest.is_local and dest.target_dataset.strip().rstrip("/").split("/") == wanted
-    )
-    return target, names
-
-
-def own_id_bound(resolved: ResolvedConfigPath, client_id: Optional[str]) -> bool:
-    """Is `client_id` bound in the trust tables to a live pin (a client of this
-    server already uses it)? Best effort, used to word notes and to warn: an
-    unreadable trust table is "no"."""
-    if not client_id:
-        return False
-    try:
-        clients = list_clients(resolved)
-    except Exception:  # noqa: BLE001 - cosmetic; never fail a committed write
-        return False
-    finally:
-        release_database()
-    return any(c.client_id == client_id and c.pins for c in clients)
-
-
-def shared_target_warning(
-    resolved: ResolvedConfigPath, config: BackupConfig, client_id: Optional[str]
-) -> Optional[str]:
-    """The loopback warning: `config` shares a target with the server while this
-    host's own `client_id` is bound in the trust tables, so the server refuses
-    that client's receives. `None` when either half is absent."""
-    target, names = shared_local_destinations(config)
-    if target is None or not own_id_bound(resolved, client_id):
-        return None
-    listed = ", ".join(repr(n) for n in names)
-    return (
-        f"local destination(s) {listed} share the server's target {target!r}, and this host's "
-        f"own client id {client_id!r} is enrolled with this server: the server now refuses "
-        f"receives from client {client_id!r}. Finish moving to the local destination with "
-        f"`zfsbackup-config{where_flag(resolved)} trust revoke --client {client_id}`"
-    )
-
-
-def stored_shared_target_warning(resolved: ResolvedConfigPath) -> Optional[str]:
-    """`shared_target_warning` for the configuration now stored (what `import`
-    committed). Best effort: `None` when it cannot be read."""
-    try:
-        snapshot = read_config(resolved)
-    except Exception:  # noqa: BLE001 - cosmetic; the write already happened
-        return None
-    finally:
-        release_database()
-    return shared_target_warning(resolved, snapshot.config, snapshot.client_id)
-
-
-#: `(store_id, generation, resolved, config, client_id)` of a write that left
-#: the configuration sharing a target with the server; `notify_daemon` decides
-#: and prints the loopback warning for it (`shared_target_warning`) after its
-#: notice, when called for that very key.
-_pending_notice: Optional[Tuple[Optional[int], int, ResolvedConfigPath, BackupConfig, Optional[str]]] = None
-
-
-def _flush_notice(generation: Optional[int], store_id: Optional[int]) -> None:
-    global _pending_notice
-    pending, _pending_notice = _pending_notice, None
-    if pending is None or pending[0] != store_id or pending[1] != generation:
-        return
-    try:
-        text = shared_target_warning(*pending[2:])
-        if text is not None:
-            _echo_warning(text)
-    except Exception:  # noqa: BLE001 - cosmetic; the write is committed and signalled
-        pass
 
 
 def where_flag(resolved) -> str:
@@ -805,4 +702,3 @@ def notify_daemon(
             click.echo(warning, err=True)
     except OSError:  # BrokenPipeError, EIO, ENOSPC on the output stream
         pass
-    _flush_notice(generation, store_id)

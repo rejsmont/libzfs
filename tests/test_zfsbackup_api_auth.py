@@ -2806,77 +2806,6 @@ class TestGatewayStoreCalls:
         assert calls == []                                    # nothing was written
         assert gateway.retire_predecessor("z") is True        # and the lock is usable again
 
-    # --- confirm_token_live (the reserved-client-id branch of /enroll) ------------------------
-
-    def test_confirm_token_live_calls_its_seam_with_the_database_and_the_keywords(self, tmp_path):
-        calls = []
-        gateway, _, _ = make_gateway(
-            tmp_path / "srv.tls",
-            confirm_token_live=lambda resolved, **kw: calls.append((resolved, kw)) or True,
-        )
-        assert gateway.confirm_token_live(secret_sha256="h", now=5.0, fingerprint="f") is True
-        assert calls == [(gateway._resolved, {"secret_sha256": "h", "now": 5.0, "fingerprint": "f"})]
-
-    def test_confirm_token_live_returns_the_seams_answer_unchanged(self, tmp_path):
-        answers = iter([True, False])
-        gateway, _, _ = make_gateway(
-            tmp_path / "srv.tls", confirm_token_live=lambda resolved, **kw: next(answers),
-        )
-        assert gateway.confirm_token_live() is True
-        assert gateway.confirm_token_live() is False
-
-    def test_the_constructor_works_when_the_keyword_is_omitted(self, tmp_path):
-        """Every other seam given, `confirm_token_live` not: the store's function is used."""
-        ident = make_gateway(tmp_path / "srv.tls")[1]
-        stub = StubTrust()
-        gateway = TrustGateway(
-            ident, object(), read_trust_key=stub.read_trust_key, read_trust=stub.read_trust,
-            enroll_client=lambda *a, **k: None, rotate_client=lambda *a, **k: None,
-            retire_predecessor=lambda *a: None, token_precheck=lambda *a, **k: True,
-            list_revoked=lambda *a: (),
-        )
-        assert gateway._confirm_token_live is store_trust.confirm_token_live
-
-    def test_an_injected_confirm_seam_is_used_and_the_others_keep_their_defaults(self, tmp_path):
-        seam = lambda resolved, **kw: True       # noqa: E731
-        gateway, _, _ = make_gateway(tmp_path / "srv.tls", confirm_token_live=seam)
-        assert gateway._confirm_token_live is seam
-        assert gateway._token_precheck is store_trust.token_precheck
-        assert gateway._enroll_client is store_trust.enroll_client
-
-    def test_confirm_token_live_runs_under_the_store_call_wait(self, tmp_path, monkeypatch):
-        calls = []
-        gateway, _, _ = make_gateway(
-            tmp_path / "srv.tls",
-            confirm_token_live=lambda resolved, **kw: calls.append(kw) or True,
-        )
-        monkeypatch.setattr(api_module, "STORE_CALL_WAIT", 0.2)
-        api_module._STORE_LOCK.acquire()
-        try:
-            started = time.monotonic()
-            with pytest.raises(ConfigBusy, match="another trust operation"):
-                gateway.confirm_token_live(secret_sha256="h")
-            assert 0.15 <= time.monotonic() - started < 3
-        finally:
-            api_module._STORE_LOCK.release()
-        assert calls == []
-        assert gateway.confirm_token_live(secret_sha256="h") is True
-
-    def test_confirm_token_live_against_the_real_store(self, tmp_path, tls_config_db):
-        from _api_support import RealTrust
-
-        trust = RealTrust(tls_config_db)
-        now = time.time()
-        token = trust.token(created_at=now, ttl=100)
-        secret = identity.secret_hash(identity.parse_token(token)[1])
-        ask = lambda at: trust.gateway.confirm_token_live(     # noqa: E731
-            secret_sha256=secret, server_fingerprint=trust.server_fp, client_id="host-q", now=at)
-        assert ask(now + 10) is True
-        assert trust.token_state() is TokenState.ACTIVE
-        assert ask(now + 500) is False                       # expired: latched
-        assert ask(now + 10) is False
-        assert store_trust.token_status(tls_config_db, now + 10).state is not TokenState.ACTIVE
-
     def test_the_timeout_is_a_503_retry_for_enroll_and_rotate_and_a_later_retry_for_retirement(
         self, mocker, tmp_path, monkeypatch, zfs
     ):
@@ -2971,7 +2900,6 @@ class TestGatewayStoreCalls:
         assert gateway._rotate_client is store_trust.rotate_client
         assert gateway._retire_predecessor is store_trust.retire_predecessor
         assert gateway._token_precheck is store_trust.token_precheck
-        assert gateway._confirm_token_live is store_trust.confirm_token_live
         assert gateway._read_trust is store_trust.read_trust
         assert gateway._read_trust_key is store_trust.read_trust_key
 
@@ -3014,7 +2942,7 @@ class TestApiUsesOnlyThePublicStoreApi:
                 used.add(node.attr)
         assert {"ConfigBusy", "EnrollOutcome", "NewPin", "RotateOutcome", "token_precheck",
                 "read_trust_key", "read_trust", "enroll_client", "rotate_client",
-                "retire_predecessor", "confirm_token_live"} <= used
+                "retire_predecessor"} <= used
         assert used <= set(store.__all__), used - set(store.__all__)
 
 

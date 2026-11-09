@@ -88,7 +88,7 @@ import shlex
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import yaml
 
@@ -97,7 +97,7 @@ from zfsbackup.cli.render import duration_literal, render_yaml
 from zfsbackup.config.store import destination_name_problem  # noqa: F401 - re-exported
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, Destination, Duration, RemoteDatasetConfig, RetentionRule,
-    destination_problem, shared_receive_target,
+    destination_problem,
 )
 
 __all__ = [
@@ -849,8 +849,7 @@ def _copies_path(target: str, client_id: Optional[str]) -> str:
 
 
 def destination_change_warnings(
-    name: str, old: Destination, new: Destination, client_id: Optional[str] = None,
-    *, shared: bool = False, own_id_bound: bool = False,
+    name: str, old: Destination, new: Destination, client_id: Optional[str] = None
 ) -> List[str]:
     """Warnings for a destination whose URL changed, when a local (`zfs:`)
     destination is on either side. A copy's place is the target plus this
@@ -858,11 +857,7 @@ def destination_change_warnings(
     is a FULL send, and the copies under the old target are orphaned (nothing
     sends to, prunes-to-rules or tracks them any more; they stay until
     destroyed or renamed by hand). https-to-https changes are the enrollment
-    warning's business. `shared` says the new local target is the server's own
-    target (`shared_receive_target`): a switch from a server to it continues
-    the copies already at `<target>/<client id>/` when this host is enrolled
-    with that server (`own_id_bound`, the loopback setup), so it is worded
-    differently."""
+    warning's business."""
     if old.url == new.url or not (old.is_local or new.is_local):
         return []
     where = f"destinations[{name}]"
@@ -884,22 +879,6 @@ def destination_change_warnings(
                 f"{where} changes from the local target {old.target_dataset!r} to the "
                 f"server {new.url}: the next send to it is a full send, and {tail}"
             )
-    elif shared and own_id_bound:
-        messages.append(
-            f"{where} changes from the server {old.url} to the local target "
-            f"{new.target_dataset!r}, which is the server's own target: if {old.url} is this "
-            f"host's own server, its copies at {_copies_path(new.target_dataset, client_id)} "
-            "are continued by the local destination (no full send, no rename). To finish, run "
-            f"`zfsbackup-config trust revoke --client {client_id}`; until then the server "
-            "refuses this host's receives"
-        )
-    elif shared:
-        messages.append(
-            f"{where} changes from the server {old.url} to the local target "
-            f"{new.target_dataset!r}, which is the server's own target: the next send is a "
-            "full send unless the copies already exist at "
-            f"{_copies_path(new.target_dataset, client_id)}"
-        )
     else:
         messages.append(
             f"{where} changes from the server {old.url} to the local target "
@@ -911,31 +890,17 @@ def destination_change_warnings(
 
 
 def url_change_warnings(
-    old: BackupConfig, new: BackupConfig, client_id: Optional[str] = None,
-    *, own_id_bound: Optional[Callable[[], bool]] = None,
+    old: BackupConfig, new: BackupConfig, client_id: Optional[str] = None
 ) -> List[str]:
-    """`destination_change_warnings` for every destination present in both.
-    `own_id_bound()` (called at most once, only when a destination switches
-    from a server to the shared target) says whether this host's client id is
-    bound in the trust tables; without it the answer is "no"."""
+    """`destination_change_warnings` for every destination present in both."""
     messages: List[str] = []
-    shared_target = shared_receive_target(new)
-    bound: Optional[bool] = None
     for name in sorted(old.destinations):
-        if name not in new.destinations:
-            continue
-        before, after = old.destinations[name], new.destinations[name]
-        shared = bool(
-            shared_target and after.is_local and not before.is_local
-            and after.target_dataset.strip().rstrip("/").split("/") == shared_target.split("/")
-        )
-        if shared and bound is None:
-            bound = bool(own_id_bound()) if own_id_bound is not None else False
-        messages.extend(
-            destination_change_warnings(
-                name, before, after, client_id, shared=shared, own_id_bound=bool(bound)
+        if name in new.destinations:
+            messages.extend(
+                destination_change_warnings(
+                    name, old.destinations[name], new.destinations[name], client_id
+                )
             )
-        )
     return messages
 
 

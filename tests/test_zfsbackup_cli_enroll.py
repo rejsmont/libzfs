@@ -773,63 +773,6 @@ class TestServerAnswers:
         fixed = srv.token(client_id=CID, replace=True)
         assert do_enroll(run, client, srv, fixed, fname="fixed").exit_code == 0
 
-    def test_a_reserved_client_id_is_explained_and_the_token_stays_usable(
-        self, run, client, make_server, reloads
-    ):
-        """The server's own local destination shares its backup target, so it reserves its own client id:
-        `/enroll` answers 409 `reserved_client_id` with the token unspent. The real server, the real CLI."""
-        srv = make_server(reserved_client_id=CID)
-        token = srv.token()
-        before = db_state(client)
-        result = do_enroll(run, client, srv, token)
-        assert result.exit_code == 1
-        err = " ".join(result.stderr.split())
-        assert "reserves this client id" in err
-        assert "the id of the server host itself" in err
-        assert "local destination shares the server's backup target" in err
-        assert "the token was not used and is still valid" in err
-        assert "zfsbackup-config identity set-client-id ID" in err and "--force" in err
-        assert "The same token works only if it is unscoped" in err
-        assert "stays tied to the reserved id" in err and "ask the server operator for a new one" in err
-        assert "Server: " in err                                   # the server's own text is appended
-        assert token not in result.stderr and token not in result.stdout
-        assert srv.token_state() == "active"
-        assert srv.pins() == {} and srv.clients() == {}
-        untouched(client, before, reloads)
-
-        # the fix the message names: another client id, the SAME token
-        seed_client_id(client, "another-host")
-        again = do_enroll(run, client, srv, token, fname="again")
-        assert again.exit_code == 0, again.stderr
-        assert srv.token_state() == "consumed"
-
-    def test_a_token_scoped_to_the_reserved_id_needs_a_new_token_after_the_id_change(
-        self, run, client, make_server, reloads
-    ):
-        """A live token scoped to the reserved id (e.g. issued before the target was shared) also gets the
-        409, unspent; after the id change the server refuses it (it stays tied to its scope), so the 409's
-        advice to ask for a new token is the right one, and a token for the new id then enrolls."""
-        srv = make_server(reserved_client_id=CID)
-        # The server host's own old loopback enrollment makes CID a known client, so a token can be scoped to it.
-        srv.pin(identity.ensure_identity(client.parent.parent / "loopback.tls", "client"), CID)
-        scoped = srv.token(client_id=CID)
-        result = do_enroll(run, client, srv, scoped)
-        assert result.exit_code == 1
-        err = " ".join(result.stderr.split())
-        assert "reserves this client id" in err and "works only if it is unscoped" in err
-        assert srv.token_state() == "active"
-
-        seed_client_id(client, "another-host")
-        refused = do_enroll(run, client, srv, scoped, fname="refused")
-        assert refused.exit_code == 1
-        assert "refused the token" in " ".join(refused.stderr.split())
-        assert srv.token_state() == "active"                       # a scope refusal never spends it
-        assert "another-host" not in srv.clients()
-
-        fresh = srv.token()                                         # the new token the advice asks for
-        assert do_enroll(run, client, srv, fresh, fname="fresh").exit_code == 0
-        assert "another-host" in srv.clients()
-
     def test_a_certificate_bound_to_another_id_says_how_to_resolve_it(
         self, run, client, make_server, reloads
     ):

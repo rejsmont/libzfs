@@ -48,7 +48,6 @@ import enum
 import logging
 import multiprocessing
 import os
-import shlex
 import signal
 import sys
 import threading
@@ -60,7 +59,7 @@ from typing import Iterable, List, Optional, Set, Tuple, Union
 
 from zfsbackup import health, logsetup, procident
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager, PruneResult
-from zfsbackup.config import BackupConfig, shared_receive_target
+from zfsbackup.config import BackupConfig
 from zfsbackup.stopflag import STOP_POLL, ReloadEpoch, StopFlag
 from zfsbackup.version import CodeSignature, code_signature
 
@@ -88,35 +87,6 @@ MIN_WORKER_INTERVAL = 1.0
 #: supervisor counts it as a turnover only when the worker's `born_epoch` is
 #: older than the current epoch; otherwise it is a crash.
 WORKER_EXIT_RELOAD = 3
-
-#: Seconds the REMOTE worker waits, when it leaves for a reload or an upgrade
-#: drain, for an abandoned `zfs` child that can WRITE a dataset (a local
-#: `receive` that survived SIGKILL) before it exits anyway with one WARNING:
-#: a hung local pool must not stop every offsite send for ever. The successor
-#: may then race that child (the documented residual).
-REMOTE_STUCK_WRITE_WAIT = 600
-
-#: `zfs`/`zpool` subcommands that only read: an abandoned child running one of
-#: them can never overlap a successor's write, so the remote worker does not
-#: wait for it. Anything else, and any label that cannot be classified, is
-#: treated as a writer.
-_READ_ONLY_SUBCOMMANDS = frozenset({
-    'list', 'get', 'send', 'holds', 'diff', 'status', 'history', 'events',
-    'version', 'userspace', 'groupspace', 'projectspace',
-})
-
-
-def stuck_child_may_write(label: str) -> bool:
-    """Can the abandoned child labelled `label` (`libzfseasy.StuckChild.label`:
-    the binary's base name and its subcommand, e.g. `zfs receive`) write a
-    dataset? Unclassifiable labels are writers."""
-    try:
-        words = shlex.split(label)
-    except ValueError:
-        return True
-    if len(words) < 2 or words[0] not in ('zfs', 'zpool'):
-        return True
-    return words[1] not in _READ_ONLY_SUBCOMMANDS
 
 #: The value the supervisor writes to the shared `ReloadEpoch` to drain the
 #: remote worker for an upgrade (S-8), the first stage of a two-stage drain
@@ -550,60 +520,6 @@ class _SupervisorWatch:
             if remaining <= 0:
                 return None
             self.stop_event.wait(timeout=min(STOP_POLL, remaining))
-
-    def _reload_drain_abort(self) -> bool:
-        """`StreamGate.wait_idle`'s abort callback while draining for a
-        reload or a restart: a stop or a gone supervisor ends the wait."""
-        return self._exit_reason() in (ExitReason.STOP, ExitReason.SUPERVISOR_GONE)
-
-    def _wait_for_stuck_children(self, logger, action: str) -> None:
-        """Before this process lets a successor start (plan S-14; the API
-        worker after its stream gate is idle, the remote worker after its
-        current dataset, both only on a reload or an upgrade drain): wait, in `STOP_POLL` slices, until
-        `libzfseasy.stuck_children()` is empty, i.e. until every `zfs` child a
-        timed-out handler call abandoned (it survived SIGKILL, typically a
-        D-state process on a hung pool) has exited. The registry dies with this
-        process, so a successor would start with it empty and could issue a
-        mutation (`zfs set`, `receive -A`, a local `zfs receive`) that overlaps
-        the abandoned one.
-        New requests keep getting the fast 503 retry meanwhile (the registry
-        refuses every timed call). A stop or a gone supervisor ends the wait
-        (`_reload_drain_abort`), exactly like the stream wait. One INFO when
-        it starts waiting and one when it ends."""
-        import libzfseasy
-
-        try:
-            stuck = libzfseasy.stuck_children()
-        except Exception:
-            logger.debug("stuck_children() failed", exc_info=True)
-            return
-        if not stuck:
-            return
-        listing = ", ".join(f"pid {c.pid} ({c.label})" for c in stuck)
-        logger.info(
-            f"waiting for {len(stuck)} timed-out zfs process(es) to exit before {action}: "
-            f"{listing}"
-        )
-        started = time.monotonic()
-        while True:
-            try:
-                stuck = libzfseasy.stuck_children()
-            except Exception:
-                logger.debug("stuck_children() failed", exc_info=True)
-                return
-            if not stuck:
-                logger.info(
-                    f"the timed-out zfs process(es) have exited after "
-                    f"{time.monotonic() - started:.0f} s; {action} now"
-                )
-                return
-            if self._reload_drain_abort():
-                logger.info(
-                    f"stopped waiting for {len(stuck)} timed-out zfs process(es) "
-                    f"after {time.monotonic() - started:.0f} s: stopping"
-                )
-                return
-            self.stop_event.wait(timeout=STOP_POLL)
 
 
 class BaseWorker(_SupervisorWatch, Process):
@@ -1109,80 +1025,6 @@ class RemoteBackupWorker(BaseWorker):
         # Built by `_before_loop` whenever the configuration has a local
         # destination (`_build_local_manager`), never later.
         self._local_manager = None
-
-    def _finish(self, reason: ExitReason, logger) -> None:
-        """A reload or an upgrade drain lets a successor start: a local
-        `zfs receive` child that survived SIGKILL (`_Pump.terminate()`, in
-        `libzfseasy.stuck_children()`) could still commit after this process
-        is gone, and the successor's registry starts empty. Wait for such
-        children first, bounded (`_wait_for_stuck_writes`). A stop does not
-        wait: nothing replaces the worker."""
-        if reason in (ExitReason.RELOAD, ExitReason.UPGRADE):
-            self._wait_for_stuck_writes(
-                logger, 'reloading' if reason is ExitReason.RELOAD else 'upgrading',
-            )
-            # A stop that aborted the wait changes what we are doing.
-            if self._exit_reason() is ExitReason.STOP:
-                reason = ExitReason.STOP
-        super()._finish(reason, logger)
-
-    def _wait_for_stuck_writes(self, logger, action: str) -> None:
-        """Wait, in `STOP_POLL` slices, until no abandoned child that can
-        WRITE a dataset (`stuck_child_may_write`; a hung `zfs list`/`get`/
-        `send` never matters) is left in `libzfseasy.stuck_children()`, at most
-        `REMOTE_STUCK_WRITE_WAIT` seconds. Unlike the API worker's wait
-        (`_wait_for_stuck_children`) only a STOP ends it early: under
-        forkserver a dead forkserver makes `_supervisor_gone()` true while the
-        supervisor lives, and the lost worker would be replaced at once with
-        no backoff; a really dead supervisor is covered by the bound. On
-        expiry: one WARNING naming the children, then the worker exits as
-        planned and the successor may race them. INFO at start and end."""
-        import libzfseasy
-
-        def writers():
-            return [c for c in libzfseasy.stuck_children() if stuck_child_may_write(c.label)]
-
-        try:
-            stuck = writers()
-        except Exception:
-            logger.debug("stuck_children() failed", exc_info=True)
-            return
-        if not stuck:
-            return
-        listing = ", ".join(f"pid {c.pid} ({c.label})" for c in stuck)
-        logger.info(
-            f"waiting for {len(stuck)} timed-out zfs process(es) to exit before {action} "
-            f"(only those that can write, at most {REMOTE_STUCK_WRITE_WAIT} s): {listing}"
-        )
-        started = time.monotonic()
-        while True:
-            try:
-                stuck = writers()
-            except Exception:
-                logger.debug("stuck_children() failed", exc_info=True)
-                return
-            elapsed = time.monotonic() - started
-            if not stuck:
-                logger.info(
-                    f"the timed-out zfs process(es) have exited after {elapsed:.0f} s; "
-                    f"{action} now"
-                )
-                return
-            if self._exit_reason() is ExitReason.STOP:
-                logger.info(
-                    f"stopped waiting for {len(stuck)} timed-out zfs process(es) "
-                    f"after {elapsed:.0f} s: stopping"
-                )
-                return
-            if elapsed >= REMOTE_STUCK_WRITE_WAIT:
-                listing = ", ".join(f"pid {c.pid} ({c.label})" for c in stuck)
-                logger.warning(
-                    f"gave up waiting for {len(stuck)} timed-out zfs process(es) that can "
-                    f"write after {elapsed:.0f} s: {listing}; {action} anyway, so the "
-                    "successor may race them"
-                )
-                return
-            self.stop_event.wait(timeout=min(STOP_POLL, REMOTE_STUCK_WRITE_WAIT - elapsed))
 
     def _get_interval(self, config: BackupConfig) -> float:
         freqs = [
@@ -2702,8 +2544,6 @@ class ApiWorker(_SupervisorWatch, Process):
     #: Class-level default, so a worker built by a test that bypasses
     #: `__init__` refuses to serve rather than serving without trust.
     config_db = None
-    #: This host's client id (the `Handoff`'s), for `create_app`'s reserved id.
-    client_id = None
     #: The app's `api.PeerLimits` (S-3), set by `_serve`; the trust-poll
     #: thread logs its hourly summary. `None`: nothing to flush.
     _peer_limits = None
@@ -2719,20 +2559,9 @@ class ApiWorker(_SupervisorWatch, Process):
         workers_lock=None,
         config_db=None,
         code_signature=None,
-        client_id: Optional[str] = None,
     ):
         """`config` is the supervisor's detached `BackupConfig`, dry-run
         already applied; see `BaseWorker`.
-
-        `client_id` is this host's id from the supervisor's `Handoff`. The
-        server reserves it (`create_app(reserved_client_id=)`) only while a
-        local destination shares the backup target
-        (`config.shared_receive_target`); otherwise it is unused here. The
-        reservation follows the configuration through the reload turnover,
-        which does not cut a receive already running for that id: this
-        worker drains it while the new remote worker may already send the
-        local copy, and ZFS refuses the overlapping receive (a failed or
-        redundant cycle, never a corrupt copy).
 
         `config_db` is the config database's `ResolvedConfigPath`. It is used
         for TLS only: the server identity in `<db>.tls/` and the pinned
@@ -2745,7 +2574,6 @@ class ApiWorker(_SupervisorWatch, Process):
         self.stop_event = stop_event
         self.log_level = log_level
         self.config_db = config_db
-        self.client_id = client_id
         self._watch_init(reload_epoch, born_epoch, workers_lock, code_signature)
         self._trust = None
 
@@ -2805,6 +2633,58 @@ class ApiWorker(_SupervisorWatch, Process):
         thread = threading.Thread(target=loop, name='trust-poll', daemon=True)
         thread.start()
         return stopped
+
+    def _reload_drain_abort(self) -> bool:
+        """`StreamGate.wait_idle`'s abort callback while draining for a
+        reload or a restart: a stop or a gone supervisor ends the wait."""
+        return self._exit_reason() in (ExitReason.STOP, ExitReason.SUPERVISOR_GONE)
+
+    def _wait_for_stuck_children(self, logger, action: str) -> None:
+        """After the stream gate is idle and before this process lets a
+        successor start (plan S-14): wait, in `STOP_POLL` slices, until
+        `libzfseasy.stuck_children()` is empty, i.e. until every `zfs` child a
+        timed-out handler call abandoned (it survived SIGKILL, typically a
+        D-state process on a hung pool) has exited. The registry dies with this
+        process, so a successor would start with it empty and could issue a
+        mutation (`zfs set`, `receive -A`) that overlaps the abandoned one.
+        New requests keep getting the fast 503 retry meanwhile (the registry
+        refuses every timed call). A stop or a gone supervisor ends the wait
+        (`_reload_drain_abort`), exactly like the stream wait. One INFO when
+        it starts waiting and one when it ends."""
+        import libzfseasy
+
+        try:
+            stuck = libzfseasy.stuck_children()
+        except Exception:
+            logger.debug("stuck_children() failed", exc_info=True)
+            return
+        if not stuck:
+            return
+        listing = ", ".join(f"pid {c.pid} ({c.label})" for c in stuck)
+        logger.info(
+            f"waiting for {len(stuck)} timed-out zfs process(es) to exit before {action}: "
+            f"{listing}"
+        )
+        started = time.monotonic()
+        while True:
+            try:
+                stuck = libzfseasy.stuck_children()
+            except Exception:
+                logger.debug("stuck_children() failed", exc_info=True)
+                return
+            if not stuck:
+                logger.info(
+                    f"the timed-out zfs process(es) have exited after "
+                    f"{time.monotonic() - started:.0f} s; {action} now"
+                )
+                return
+            if self._reload_drain_abort():
+                logger.info(
+                    f"stopped waiting for {len(stuck)} timed-out zfs process(es) "
+                    f"after {time.monotonic() - started:.0f} s: stopping"
+                )
+                return
+            self.stop_event.wait(timeout=STOP_POLL)
 
     def run(self) -> None:
         """Serve until stopped or until the configuration changes. Exits with
@@ -2908,14 +2788,7 @@ class ApiWorker(_SupervisorWatch, Process):
         # until a poll succeeds.
         gateway.refresh()
 
-        # A local destination that shares the backup target keeps its copies
-        # under `<target>/<this host's id>`: the server must not also serve a
-        # remote client bound to that id. The id rides the `Handoff`, so a
-        # change of id or of the sharing restarts this worker.
-        reserved = self.client_id if shared_receive_target(config) is not None else None
-        app = create_app(
-            config, gateway, identity.fingerprint, reserved_client_id=reserved
-        )
+        app = create_app(config, gateway, identity.fingerprint)
         gate = app.extensions['zfsbackup.stream_gate']
 
         try:

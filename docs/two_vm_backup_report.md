@@ -113,40 +113,6 @@ Notes:
 
 ---
 
-## Release 1.0.0rc5
-
-**Run:** 2026-11-09, the 1.0.0rc5 tree (a local destination may share the server's target; the server reserves the
-host's own client id while it does), shipped as `SRC_REF=WORKTREE` snapshots, `zfsb-server` + `zfsb-client` (Ubuntu
-26.04, OpenZFS 2.4.1). Harness: the full run with every scenario reached **968 passed, 0 failed** through the new
-scenario S's S2, then stopped on a bash 3.2 parse error in the harness (a `case` inside `$(...)`; the loop is now
-the function `s_copies_are_subsets`). Scenario S alone: **138 passed, 1 failed**, then **140 passed, 0 failed**.
-The one failure was the harness's: S3b probed the `/stream` route with a plain GET, which matches no endpoint
-(routing 400); the probe now sends the websocket upgrade headers and checks the 409's `reason`. Scenario S covers
-the server's own copies and a client's under one target, both pruned once by their stamped rules, the reserved
-id refused on `/enroll`, `/negotiate`, `/resume_token` and `/stream`, and the copies continuing incrementally after
-a prune.
-
-The other release checks: the local-destination scenario 155 / 0; the OpenZFS matrix with
-`tests/test_zfsbackup_real.py` and `tests/test_zfsbackup_real_local.py` (the new shared-target cases included) on
-2.1.5 392 passed, 5 skipped (four server-side `sharesmb=on` tests, Samba cannot create the share on the VM, and one
-mount test) and on 2.4.1 396 passed, 1 skipped, then 266 / 0 on 2.4.1 for the two files after the last test fixes;
-2.2.2 and 2.3.9 were not rerun. The mocked suite: 23924 passed on macOS (Python 3.14) and in CI (Python 3.11–3.15,
-SQLAlchemy 2.0 and 2.1, the Debian 13 floors). Not rerun, as packaging and permissions are unchanged since rc4:
-the install scenarios and `test_config_permissions.sh`.
-
-CI: the serial coverage jobs had grown to 41–57 minutes and the py3.14 jobs were cancelled at the 60-minute cap;
-the mocked suite now runs under `pytest -n auto` in every job (23–32 minutes on the hosted runners). An importer
-test raced on the slow Debian 13 runner (the second import's pre-lock schema check still held a read connection
-when the first import's cleanup looked for `-wal`/`-shm`); the test now waits until the second import reaches the
-writer lock.
-
-**Another `multipass exec` wedge:** in the local-destination run, `multipass exec … tail -n +643 <log>` piped
-into `grep | cut | tail | sed` on the host spun for 2.5 hours although the guest command had exited; neither known
-trigger applied (no host `/dev/null`, no exit 4). `kill -9` of that one client let the scenario finish. It is
-intermittent; a host pipe is not a guarantee.
-
----
-
 ## Release 1.0.0rc4
 
 **Run:** 2026-11-09, the 1.0.0rc4 tree (local destinations; the OpenZFS 2.1 raw `sharesmb` fix), shipped as

@@ -75,7 +75,6 @@ from zfsbackup.cli.write import (
     ID_COMMITTED_MARK,
     commit_config,
     notify_daemon,
-    own_id_bound,
     release_database,
     where_flag,
 )
@@ -695,10 +694,7 @@ def _session(
             _anchor_warnings(original, canon)
             + _recreate_warnings(original, canon)
             + dotpath.pin_change_warnings(original, canon)
-            + dotpath.url_change_warnings(
-                original, canon, snapshot.client_id,
-                own_id_bound=lambda: own_id_bound(resolved, snapshot.client_id),
-            )
+            + dotpath.url_change_warnings(original, canon, snapshot.client_id)
             + dotpath.prefix_change_warnings(original, canon)
             + dotpath.raw_change_warnings(original, canon)
         ):

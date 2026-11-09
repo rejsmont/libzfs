@@ -1,15 +1,3 @@
-zfsbackup (1.0.0~rc5-1) unstable; urgency=medium
-
-  * Fifth release candidate of 1.0.0.
-  * A local destination may target the server's own remote_backup target
-    dataset, so one dataset holds the remote clients' copies and this
-    host's own; while shared, the server reserves its own client id
-    (409 reserved_client_id) and the CLI refuses colliding ids.
-  * zfsbackup-config enroll explains a reserved client id; list
-    destinations marks a shared target.
-
- -- Radoslaw Kamil Ejsmont <radoslaw@ejsmont.net>  Mon, 09 Nov 2026 18:00:00 +0000
-
 zfsbackup (1.0.0~rc4-1) unstable; urgency=medium
 
   * Fourth release candidate of 1.0.0.

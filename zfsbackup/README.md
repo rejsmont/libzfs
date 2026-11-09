@@ -943,9 +943,8 @@ deleted dataset or snapshot, not against losing the pool.
    and prunes it, so put nothing else there. The configuration is refused (on `import`, `set`, `edit` and
    reload) when:
    - a configured dataset, enabled or not, is at or below the target, or a `recursive` one is above it;
-   - the target is at, below or above another local destination's target (declared, used or not), or below or
-     above the enabled `remote_backup.target_dataset` (it may be that target itself: see [Sharing the server's
-     target](#sharing-the-servers-target));
+   - the target is at, below or above another local destination's target (declared, used or not), or the enabled
+     `remote_backup.target_dataset`;
    - the URL is not `zfs:` plus a valid dataset name (the prefix is exactly lowercase; no `//`, no leading `/`,
      no `@` or `#`), or a `zfs:` destination has a `server_fingerprint`;
    - a copy's snapshot name, `<target>/<client_id>/<dataset>@<prefix>_<14 digits>`, would be over ZFS's 255
@@ -989,7 +988,7 @@ deleted dataset or snapshot, not against losing the pool.
 A source dataset `tank/data` is stored as `<target>/<client_id>/tank/data`, pool name included: the layout of
 [Operating the backup server](#operating-the-backup-server), and for the same reasons (same-named datasets in
 two pools never meet; two hosts can share one target pool; the pruner and `zfs rename` work on the copies
-unchanged; a loopback setup is continued in place or moved with one `zfs rename`, below). The containers the daemon creates
+unchanged; a loopback setup moves with one `zfs rename`, below). The containers the daemon creates
 (`<target>/<client_id>`, `<target>/<client_id>/<pool>` and any missing parent) are `canmount=noauto`.
 
 Every receive sets these as **local** values: `canmount=noauto`, `readonly=on`, `volmode=none`,
@@ -1033,12 +1032,11 @@ each one with the retention stamped on it (`org.zfsbackup:config`, the destinati
 refreshed at every send; a change that shortens the horizon is logged at WARNING), with this host's
 `snapshot_prefix`. The newest snapshot of a copy is always kept, as are the ones an anchor or pin protects, a
 held or a cloned one. Pruning is never recursive: each copy is its own dataset with its own retention. Only this
-host's own id is touched, so another host's tree in the same target is never listed or pruned by this pass
-(including an id that merely starts with ours, `host` and `host2`). The rules of a copy outlive a configuration
-change: the copy of a dataset you removed from the configuration keeps being pruned to its last rules, as long
-as a local destination with that target stays configured. If you remove the destination, its copies are no
-longer found and no longer pruned (on a [shared target](#sharing-the-servers-target) the server still prunes
-them, like any client's). The pruning worker's reads on a local target run under a 60 s limit each (a destroy under
+host's own id is touched, so another host's tree on a shared target is never listed or pruned (including an id
+that merely starts with ours, `host` and `host2`). The rules of a copy outlive a configuration change: the copy
+of a dataset you removed from the configuration keeps being pruned to its last rules, as long as a local
+destination with that target stays configured. If you remove the destination, its copies are no longer found
+and no longer pruned. The pruning worker's reads on a local target run under a 60 s limit each (a destroy under
 300 s, a target's whole discovery under 10 minutes): a target on a slow or suspended pool ends that pass
 with one WARNING per episode and destroys nothing.
 
@@ -1080,64 +1078,17 @@ newer snapshots are expendable, the message gives the `zfs destroy <copy>@<first
 them, and the next cycle continues. The other points of [Rejoining](#rejoining-seed-and-continue) apply here too,
 with `ssh` left out.
 
-### Sharing the server's target
-
-On a host that is also a backup server, a local destination may target the server's own
-`remote_backup.target_dataset` `T` itself (`url: "zfs:T"`; inside or above `T` stays refused). This host's copies
-then sit at `T/<client_id>/<pool>/<path>` next to the remote clients' `T/<their id>/…`, laid out, stamped and
-locked down exactly like theirs, so one dataset holds every backup. The server lists and prunes them like any
-client's copies (once: the pruning worker does not prune them again as local copies), and `zfsbackup-config
-check` shows them among the received datasets as well as under the local destination.
-
-While a local destination shares `T`, the server **reserves this host's own client id**, because a remote
-client bound to it would write into the same copies:
-- `/enroll` of that id is refused (409 with a live token, which is not used; an expired token is retired and
-  refused like any bad token), and so are `/negotiate`, `/stream` and
-  `/resume_token` from a client already bound to it (409, `reason: reserved_client_id`; a WARNING naming
-  `zfsbackup-config trust revoke --client <id>`, at most once an hour per id);
-- `zfsbackup-config trust token create --client-id <own id>` is refused, and so is `identity set-client-id ID`
-  when the server knows a client `ID` (enrolled or revoked) or its trust tables cannot be read (`--force` does
-  not override it);
-- while this host's own id is enrolled with its own server (a loopback setup), every configuration write and
-  `import` warns until you `trust revoke --client <id>`.
-
-A reload does not cut a receive that is already running: the outgoing API worker finishes it first. Whenever the
-new configuration's local sender could write where the outgoing API worker still receives (entering a shared
-target, or switching a loopback destination to `zfs:T`), the daemon starts the new remote worker only after the
-old API worker has exited, so the local send never decides on a copy that an older receive is still changing. The
-log says so ("waiting for the old api worker to finish its receives"), and `zfsbackup-config status` shows the
-new generation as applied only once it starts. While that wait lasts, this host's sends pause (the draining API worker
-answers new requests with a retryable 503, as on any reload). The API worker itself is never held back: only this
-host can send as its own id, and the new remote worker never starts before the old one has finished.
-
-`identity set-client-id` on a host that shares its target moves this host's copies to `T/<new id>/` (a full send)
-and releases the old id: the copies under `T/<old id>/` are then an ordinary client tree, still pruned by the
-server to their stamped rules, and a token scoped to the old id (`trust token create --client-id <old id>`) would
-hand them to another client.
-
-`zfsbackup-config list destinations` marks a shared target. Without a shared target nothing is reserved, so a
-loopback setup keeps working.
-
 ### Moving from a loopback setup
 
 If this host used to back itself up through its own API (a destination `https://127.0.0.1:…` enrolled with the
 host's own server, `remote_backup.target_dataset` `T`), its copies are already in the local layout:
 `T/<client_id>/<pool>/<path>`, stamped with the host's client id (the loopback destination only works when the
-server's binding equals the local id, so the id is the right one), the source dataset and the retention.
-
-**Keeping the copies in `T`** ([sharing the server's target](#sharing-the-servers-target)) needs no rename and no
-stop: keep the destination's name (the anchors and pins on the source datasets are keyed by it),
-`zfsbackup-config edit destination <name>`, set `url: "zfs:T"` and remove the `server_fingerprint`, then
-`zfsbackup-config trust revoke --client <client_id>` the host's own enrollment (the CLI reminds you; the server
-refuses that client's receives meanwhile). The next cycle continues the chain with an incremental step; check it
-with `zfsbackup-config check`.
-
-**Moving them to another target `L`**: a rename of the whole `T/<client_id>` tree to `L` continues the chain with
-no new full send:
+server's binding equals the local id, so the id is the right one), the source dataset and the retention. So a
+rename of the whole `T/<client_id>` tree to a new target `L` continues the chain with no new full send:
 
 1. Create `L` (`zfs create -o canmount=off …`). It must be on the **same pool** as `T` (`zfs rename` cannot cross
    pools; for another pool do not move, let the local destination start with a full send and destroy the old tree
-   later) and it must not be below or above `T` while `remote_backup` is enabled.
+   later) and it must not be at, below or above `T` while `remote_backup` is enabled.
 2. **Stop the daemon**, so no receive is running: `systemctl stop zfsbackup`.
 3. `sudo zfs rename T/<client_id> L/<client_id>` (`L/<client_id>` must not exist). The copies keep their
    `client_id` and `source_dataset` properties, which is what the daemon's ownership check and the pruner look
@@ -1164,8 +1115,7 @@ no new full send:
 - **`identity set-client-id`** changes the directory the copies live in: the next send to each local
   destination is a full send into `<target>/<new id>/`, and the copies under the old id are orphaned (they carry
   the old id, so a rename would not adopt them). The CLI warns and prints the optional, destructive `zfs
-  destroy -r` to remove the old tree once you no longer need it. On a [shared
-  target](#sharing-the-servers-target) the old tree is not orphaned: the server keeps pruning it.
+  destroy -r` to remove the old tree once you no longer need it.
 - **Changing a local target** (`set destinations.<name>.url`) is the same: a full send into the new target, and
   the old copies stay where they are. A change between `https://` and `zfs:` is refused while a
   `server_fingerprint` is set.

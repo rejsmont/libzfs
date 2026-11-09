@@ -162,21 +162,6 @@
 #            refused and recovers with `enroll --new-key` + a `--replace` token; (c) the server restored with no trust change serves the
 #            restored key and the clients' pins match; (d) a fingerprint revoked after the backup comes back with the restored DB and
 #            `trust revoke` before the daemon starts closes it
-#   S  a local destination that SHARES the server's own backup target (docs/local_destination_plan.md "Addendum - a local target shared with
-#      the server"; README "Sharing the server's target"; needs a tree with `shared_receive_target`, else skipped). Fresh pools, quiet config.
-#      The server VM backs a dataset of its own up with `zfs:<its remote_backup.target_dataset T>` while the client VM backs up to it over HTTPS:
-#        S0    setup: B (a second identity on the client VM) is enrolled under the server's OWN client id while the target is not yet
-#              shared; then the server's config is imported with the shared local destination (the CLI warns about the bound id)
-#        S1    both trees under T: T/<server id>/<pool>/<path> (written by a direct zfs send | zfs receive, no HTTP) next to T/<client id>/...;
-#              local client_id/source_dataset/config and the forced properties on every copy; baseline plus two incremental rounds; guids equal
-#        S2    the server prunes both trees by their STAMPED rules: backdated snapshots (names 2h40m-3h old) go from the copies whose retention is
-#              1h (the server's own copy, one client dataset) and stay on the copy whose retention is 1d; the newest stay; the chain continues
-#              incrementally; each snapshot destroyed once (a shared target's copies are not pruned a second time as local copies)
-#        S3    the reservation: `trust token create --client-id <server id>` exits 1; B's negotiate / resume_token / stream are 409
-#              reserved_client_id (ONE WARNING), /whoami still answers; a third identity C enrolling under the server's id gets 409 and its
-#              token stays usable (C then enrolls under its own id with it); `identity set-client-id` of an enrolled id is refused;
-#              nothing is created under T/<server id>; `list destinations` shows `local (shared)`; `trust revoke --client <server id>` clears B
-#      Not covered: the loopback -> shared switch of an already running host (a destination URL change with copies in place).
 # H, I and J need a real pool but little space (J: ~1.2 GiB per VM); they run after E-G, and also with --no-big.
 # E-G throttle the client's egress with `tc` (tbf) so a send lasts long enough to act on; the
 # throttle is always removed again (also on error). They write ~3 GiB per VM: the VMs need ~10G disk
@@ -200,8 +185,6 @@
 #   ./scenarios/test_two_vm_backup.sh --no-b2    # everything except scenario B2     (--no-j: everything except J)
 #   ./scenarios/test_two_vm_backup.sh --only-r   # provision, then only scenario R (restore)
 #   ./scenarios/test_two_vm_backup.sh --no-r     # everything except scenario R
-#   ./scenarios/test_two_vm_backup.sh --only-s   # provision, then only scenario S (local destination sharing the server's target)
-#   ./scenarios/test_two_vm_backup.sh --no-s     # everything except scenario S
 #   ./scenarios/test_two_vm_backup.sh --purge    # delete the two VMs (and only those) at the end
 #   SRC_REF=<commit-ish> ./scenarios/test_two_vm_backup.sh   # ship that tree instead of HEAD; SRC_REF=WORKTREE ships the
 #                                                # working tree as it is, untracked files included (built from a throwaway
@@ -270,8 +253,8 @@ SNAP_TIMEOUT=120         # ~4 snapshot periods
 
 # Flags
 PURGE=0; KEEP_POOLS=0; KEEP=0; BIG=1
-ONLY_J=0; ONLY_K=0; ONLY_L1=0; ONLY_L2=0; ONLY_M=0; ONLY_B2=0; ONLY_R=0; ONLY_S=0
-NO_J=0;   NO_K=0;   NO_L1=0;   NO_L2=0;   NO_M=0;   NO_B2=0;   NO_R=0;   NO_S=0
+ONLY_J=0; ONLY_K=0; ONLY_L1=0; ONLY_L2=0; ONLY_M=0; ONLY_B2=0; ONLY_R=0
+NO_J=0;   NO_K=0;   NO_L1=0;   NO_L2=0;   NO_M=0;   NO_B2=0;   NO_R=0
 for arg in "$@"; do
     case "$arg" in
         --purge)      PURGE=1 ;;
@@ -290,8 +273,6 @@ for arg in "$@"; do
         --no-b2)      NO_B2=1 ;;      # everything except scenario B2
         --only-r)     ONLY_R=1 ;;     # provision + scenario R (restore: files, datasets, raw, config backup) only
         --no-r)       NO_R=1 ;;       # everything except scenario R
-        --only-s)     ONLY_S=1 ;;     # provision + scenario S (a local destination sharing the server's target) only
-        --no-s)       NO_S=1 ;;       # everything except scenario S
         --no-j)       NO_J=1 ;;       # everything except scenario J
         --keep)       KEEP=1; KEEP_POOLS=1 ;;
         -h|--help)    grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -301,8 +282,8 @@ done
 
 # Which scenario blocks run. With any --only-X flag set, exactly the blocks flagged run (A-I count as "default" and run
 # only when no --only-X is given); otherwise everything runs except the blocks named by --no-X.
-ONLY_ANY=$((ONLY_J + ONLY_K + ONLY_L1 + ONLY_L2 + ONLY_M + ONLY_B2 + ONLY_R + ONLY_S))
-scn_enabled() { # scn_enabled j|k|l1|l2|m|b2|r|s
+ONLY_ANY=$((ONLY_J + ONLY_K + ONLY_L1 + ONLY_L2 + ONLY_M + ONLY_B2 + ONLY_R))
+scn_enabled() { # scn_enabled j|k|l1|l2|m|b2|r
     local up only no; up="$(printf '%s' "$1" | tr 'a-z' 'A-Z')"; only="ONLY_$up"; no="NO_$up"
     if [ "$ONLY_ANY" -gt 0 ]; then [ "${!only}" -eq 1 ]; else [ "${!no}" -eq 0 ]; fi
 }
@@ -476,11 +457,11 @@ put_config() { # put_config <vm> ; reads config text on stdin, installs it to $C
 # one from a crash would name a dead supervisor and a stale generation), <db>.writer.lock (CLI writer
 # lock) and <db>.workers.lock (held by workers; waited on by a restarted daemon). Also <db>.tls/: the
 # server's and the client's TLS identity (a fresh DB has no pins and no client id, so a stale certificate
-# next to it would only confuse a run) -- and the second and third client identities "B" (scenario K, S) and "C" (scenario S), each with its own DB + .tls. Daemons
+# next to it would only confuse a run) -- and scenario K's second client "B" (its own DB + .tls). Daemons
 # must be stopped first. Output suppressed in the guest.
 remove_config() {
     local vm="$1"
-    msh "$vm" "{ rm -f '$CFG' '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock' '$DB.workers.lock'; rm -rf '$TLS_DIR' '$TLS_DIR'.old-* /var/lib/zfsbackup-b /var/lib/zfsbackup-c; } >/dev/null 2>&1; true" || true
+    msh "$vm" "{ rm -f '$CFG' '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock' '$DB.workers.lock'; rm -rf '$TLS_DIR' '$TLS_DIR'.old-* /var/lib/zfsbackup-b; } >/dev/null 2>&1; true" || true
 }
 
 write_server_config() {
@@ -756,14 +737,12 @@ enroll_client() {
 # Authenticated (or not) HTTPS probes from the client VM with curl: probe <cert-base|none> <METHOD> <path> [json body].
 # <cert-base> is the path without .crt/.key. Prints the HTTP status ("000" if the TLS handshake itself failed); the
 # body is left in /tmp/zfsb-probe.json in the guest (probe_body). -k: curl cannot check our pin, zfsbackup's client does.
-# PROBE_HEADERS (optional): extra curl arguments, e.g. a websocket upgrade's headers (a websocket route only matches an
-# upgrade request; a plain GET to it is a routing 400 before any hook runs).
 probe() {
-    local cert="$1" method="$2" path="$3" body="${4:-}" certargs="" dataargs="" extraargs="${PROBE_HEADERS:-}"
+    local cert="$1" method="$2" path="$3" body="${4:-}" certargs="" dataargs=""
     [ "$cert" != none ] && certargs="--cert '${cert}.crt' --key '${cert}.key'"
     [ -n "$body" ] && dataargs="-H 'Content-Type: application/json' --data '$body'"
     # X-Zfsbackup-Protocol: every request names the wire protocol (plan S-5); without it an authenticated request is 426.
-    msh "$CLIENT_VM" "rm -f /tmp/zfsb-probe.json; curl -sk --connect-timeout 5 --max-time 20 -H 'X-Zfsbackup-Protocol: 1' $certargs $extraargs -X $method $dataargs -o /tmp/zfsb-probe.json -w '%{http_code}' 'https://${SERVER_IP}:${API_PORT}${path}'" | tr -d '[:space:]'
+    msh "$CLIENT_VM" "rm -f /tmp/zfsb-probe.json; curl -sk --connect-timeout 5 --max-time 20 -H 'X-Zfsbackup-Protocol: 1' $certargs -X $method $dataargs -o /tmp/zfsb-probe.json -w '%{http_code}' 'https://${SERVER_IP}:${API_PORT}${path}'" | tr -d '[:space:]'
 }
 probe_body() { msh "$CLIENT_VM" "cat /tmp/zfsb-probe.json 2>/dev/null"; }
 
@@ -872,18 +851,6 @@ for vm in "$SERVER_VM" "$CLIENT_VM"; do
         || warn "$vm: shipped tree ($SRC_REF) lacks the B-2b rollback refusal (_rollback_permit / decide_receive): R2c, R2d, R2e and R3 will FAIL (ship the work tree: SRC_REF=WORKTREE)"
 done
 [ "$CK_READY" -eq 1 ] || warn "shipped tree ($SRC_REF) has no \`zfsbackup-config check\`: scenario CK will be skipped"
-
-# A local destination that shares the server's target (feature/shared-local-target): scenario S. The tree's single definition of "shared"
-# is `shared_receive_target` in config/model.py; HEAD may predate it (ship the working tree: SRC_REF=WORKTREE).
-S_READY=1
-for vm in "$SERVER_VM" "$CLIENT_VM"; do
-    if msh "$vm" "grep -q 'shared_receive_target' '$SRC_DIR/zfsbackup/config/model.py'"; then
-        info "$vm: shipped tree has shared_receive_target (a local destination may share the server's target)"
-    else
-        warn "$vm: shipped tree ($SRC_REF) lacks shared_receive_target: scenario S will be skipped (SRC_REF=WORKTREE ships the working tree)"
-        S_READY=0
-    fi
-done
 [ "$R_READY" -eq 1 ] || warn "shipped tree ($SRC_REF) has no \`zfsbackup-config backup\`: scenario R will be skipped"
 
 SERVER_IP="$(vm_ip "$SERVER_VM")"; [ -n "$SERVER_IP" ] || die "could not determine $SERVER_VM IP"
@@ -3990,440 +3957,6 @@ else
     fi
     stop_daemon "$SERVER_VM"
     msh "$CLIENT_VM" "rm -f '$R_KEY' /root/zfsb-r-wrong.key /opt/zbr-recv.sh" || true
-fi
-
-# ═════════════ Scenario S: a local destination that shares the server's own backup target ═════════════
-# docs/local_destination_plan.md "Addendum - a local target shared with the server"; README "Sharing the server's target". Fresh pools and
-# DBs, J's quiet config (every dataset's snapshot frequency is 1d: every snapshot is one this scenario takes, with a name it chooses --
-# backdated names give the pruner something that has genuinely expired, with no planting on the server). Datasets:
-#   server  zbserver/own         -> local destination `selfcopy` = zfs:<T> (T = remote_backup.target_dataset)   copy retention 1h (dataset 1d)
-#   client  zbclient/data        -> https server1                                                              copy retention 1d
-#   client  zbclient/short       -> https server1, per-destination retention override                          copy retention 1h
-# so the three copies under T carry different STAMPED rules and the one server pruner must apply each to its own tree.
-# Identities: A is the real client (its daemon runs); B and C are extra identities on the client VM with their own DBs (K's trick), they
-# never run a daemon. B is enrolled under the SERVER'S OWN client id before the target becomes shared (the loopback-like situation the
-# README's warning is for); C tries to enroll under it afterwards.
-S_SRV_ID="${S_SRV_ID:-zfsb-s-srv}"; S_ID_C="zfsb-s-c"
-S_OWN_DS="${SERVER_POOL}/own"; S_CDATA_DS="${SOURCE_DS}"; S_CSHORT_DS="${CLIENT_POOL}/short"
-S_LOCAL_DEST="selfcopy"
-S_DB_C="/var/lib/zfsbackup-c/config.db"
-S_ANCHOR_OWN="org.zfsbackup:anchor.${S_LOCAL_DEST}"; S_ANCHOR_CLIENT="org.zfsbackup:anchor.${DEST_NAME}"
-S_FORCED="canmount:noauto readonly:on volmode:none mountpoint:none sharenfs:off sharesmb:off setuid:off exec:off devices:off"   # receiver.RECEIVE_PROPERTIES_FILESYSTEM
-S_COPY_OWN=""; S_COPY_DATA=""; S_COPY_SHORT=""
-S_N_OWN=""; S_N_DATA=""; S_N_SHORT=""                                 # the snapshots of the latest s_round
-S_ALL_OWN=(); S_ALL_DATA=(); S_ALL_SHORT=()                           # every snapshot taken, creation order
-S_REC_OWN=(); S_REC_DATA=(); S_REC_SHORT=()                           # ... those with a current name (those the 1h rule keeps)
-
-s_snaps()   { msh "$1" "zfs list -H -t snapshot -d 1 -s createtxg -o name '$2' 2>/dev/null" | sed 's/.*@//' | grep -v '^$' || true; }     # s_snaps <vm> <dataset>
-s_joined()  { s_snaps "$1" "$2" | tr '\n' ' ' | sed 's/ *$//'; }
-# s_copies_are_subsets: "yes" when every snapshot (name/guid) of each S copy is also on its source, else "no".
-# A function, not inline in $(...): bash 3.2 (macOS) misparses a `case` pattern's `)` inside a command substitution.
-s_copies_are_subsets() {
-    local ok=yes pair c s item
-    for pair in "$(s_fp "$SERVER_VM" "$S_COPY_OWN")|$(s_fp "$SERVER_VM" "$S_OWN_DS")" \
-                "$(s_fp "$SERVER_VM" "$S_COPY_SHORT")|$(s_fp "$CLIENT_VM" "$S_CSHORT_DS")" \
-                "$(s_fp "$SERVER_VM" "$S_COPY_DATA")|$(s_fp "$CLIENT_VM" "$S_CDATA_DS")"; do
-        c="${pair%%|*}"; s="${pair#*|}"
-        for item in $c; do
-            case " $s " in
-                *" $item "*) ;;
-                *) ok=no ;;
-            esac
-        done
-    done
-    echo "$ok"
-}
-
-s_fp()      { msh "$1" "zfs list -H -t snapshot -d 1 -s createtxg -o name,guid '$2' 2>/dev/null" | sed 's/.*@//' | tr '\t\n' ': ' | sed 's/ *$//'; }   # "snap:guid snap:guid"
-s_get()     { msh "$1" "zfs get -H -o value $2 '$3' 2>/dev/null" | tr -d '[:space:]'; }                                                 # s_get <vm> <prop> <dataset>
-s_src()     { msh "$1" "zfs get -H -o source $2 '$3' 2>/dev/null" | tr -d '[:space:]'; }
-s_cfg()     { msh "$SERVER_VM" "zfs get -H -o value -s local org.zfsbackup:config '$1' | base64 -d 2>/dev/null | '$PY' '$JGET_PY' '$2'" | tr -d '[:space:]'; }   # s_cfg <server ds> '<expr over the stamped config>'
-s_wait_snap() { local waited=0; until s_snaps "$1" "$2" | grep -qx "$3"; do [ "$waited" -ge "$4" ] && return 1; sleep 3; waited=$((waited+3)); done; }   # <vm> <ds> <snap> <timeout>
-s_append()  { msh "$1" "head -c 200000 /dev/urandom >> \$(zfs get -H -o value mountpoint '$2')/f.bin"; }                             # s_append <vm> <dataset>
-# s_snap <vm> <dataset> [seconds ago]: a managed snapshot named autosnap_<UTC then> (the 2s sleep keeps names apart); prints the short name
-s_snap()    { sleep 2; msh "$1" "n=autosnap_\$(date -u -d @\$(( \$(date +%s) - ${3:-0} )) +%Y%m%d%H%M%S); zfs snapshot '$2'@\$n && echo \$n" | tr -d '[:space:]'; }
-# s_round [seconds ago]: new data and one new snapshot on each of the three sources, in the order own, data, short (so also in txg order)
-s_round() {
-    local ago="${1:-0}"
-    s_append "$SERVER_VM" "$S_OWN_DS";    S_N_OWN="$(s_snap "$SERVER_VM" "$S_OWN_DS" "$ago")"
-    s_append "$CLIENT_VM" "$S_CDATA_DS";  S_N_DATA="$(s_snap "$CLIENT_VM" "$S_CDATA_DS" "$ago")"
-    s_append "$CLIENT_VM" "$S_CSHORT_DS"; S_N_SHORT="$(s_snap "$CLIENT_VM" "$S_CSHORT_DS" "$ago")"
-    S_ALL_OWN+=("$S_N_OWN"); S_ALL_DATA+=("$S_N_DATA"); S_ALL_SHORT+=("$S_N_SHORT")
-    if [ "$ago" -eq 0 ]; then S_REC_OWN+=("$S_N_OWN"); S_REC_DATA+=("$S_N_DATA"); S_REC_SHORT+=("$S_N_SHORT"); fi
-}
-s_round_arrived() {
-    s_snaps "$SERVER_VM" "$S_COPY_OWN" | grep -qx "$S_N_OWN" && s_snaps "$SERVER_VM" "$S_COPY_DATA" | grep -qx "$S_N_DATA" \
-        && s_snaps "$SERVER_VM" "$S_COPY_SHORT" | grep -qx "$S_N_SHORT"
-}
-s_wait_round() { # s_wait_round <label> <timeout>: the latest round is on all three copies
-    local deadline=$((SECONDS + $2))
-    until s_round_arrived; do
-        [ "$SECONDS" -ge "$deadline" ] && { fail "($1) the round ${S_N_OWN} / ${S_N_DATA} / ${S_N_SHORT} did not reach all three copies within ${2}s"; return 1; }
-        sleep 3
-    done
-    pass "($1) the round reached all three copies (own ${S_N_OWN}, data ${S_N_DATA}, short ${S_N_SHORT})"
-}
-s_wait_insync() { # s_wait_insync <timeout>: the server daemon has applied the stored configuration
-    local waited=0 v
-    while :; do
-        v="$(cli_jget "$SERVER_VM" 'd["verdict"]' status --json | tr -d '[:space:]')"
-        [ "$v" = "in-sync" ] && return 0
-        [ "$waited" -ge "$1" ] && { echo "    status verdict: ${v:-?}"; return 1; }
-        sleep 3; waited=$((waited+3))
-    done
-}
-# The properties every copy under T carries, whoever wrote it: LOCAL client_id/source_dataset/config, the stamped retention, the forced -o set
-s_check_copy() { # s_check_copy <label> <copy> <client id> <source dataset> <keep_for seconds the stamped config carries>
-    local label="$1" ds="$2" id="$3" src="$4" keep="$5" kv p v
-    check "($label) the copy exists and is a filesystem" "filesystem" "$(s_get "$SERVER_VM" type "$ds")"
-    check "($label) org.zfsbackup:client_id is $id, LOCAL" "$id local" "$(s_get "$SERVER_VM" org.zfsbackup:client_id "$ds") $(s_src "$SERVER_VM" org.zfsbackup:client_id "$ds")"
-    check "($label) org.zfsbackup:source_dataset is $src, LOCAL" "$src local" "$(s_get "$SERVER_VM" org.zfsbackup:source_dataset "$ds") $(s_src "$SERVER_VM" org.zfsbackup:source_dataset "$ds")"
-    check "($label) org.zfsbackup:config is LOCAL and names $src with a rule that keeps ${keep}s" "local $src $keep" \
-        "$(s_src "$SERVER_VM" org.zfsbackup:config "$ds") $(s_cfg "$ds" 'd["name"]') $(s_cfg "$ds" 'int(d["retention_rules"][0]["keep_for"])')"
-    for kv in $S_FORCED; do
-        p="${kv%%:*}"; v="${kv#*:}"
-        check "($label) $p is $v as a LOCAL property" "$v local" "$(s_get "$SERVER_VM" "$p" "$ds") $(s_src "$SERVER_VM" "$p" "$ds")"
-    done
-    check "($label) the copy holds no RECEIVED property (a plain stream carries none)" "0" "$(msh "$SERVER_VM" "zfs get -H -s received -o property all '$ds' | wc -l" | tr -d '[:space:]')"
-    check "($label) the copy is not mounted" "no" "$(s_get "$SERVER_VM" mounted "$ds")"
-}
-# C's own client DB (the K scenario's B, a third time): a disabled placeholder dataset and the destination, NOT pinned
-cli_c() { cli_dbvm "$CLIENT_VM" "$S_DB_C" "$@"; }
-put_config_c() {
-    msh "$CLIENT_VM" "mkdir -p /var/lib/zfsbackup-c" || die "could not create /var/lib/zfsbackup-c"
-    put_guest_file "$CLIENT_VM" /var/lib/zfsbackup-c/config.yaml <<EOF
-snapshot_prefix: "autosnap"
-check_interval: "1m"
-destinations:
-  ${DEST_NAME}:
-    url: "https://${SERVER_IP}:${API_PORT}"
-datasets:
-  - name: "${SOURCE_DS}"
-    enabled: false
-    frequency: "1h"
-    retention:
-      "1h": "1d"
-EOF
-    cli_c import --no-backup /var/lib/zfsbackup-c/config.yaml | sed 's/^/    CLI(C): /'
-}
-# The server's config once it shares T: its own dataset, backed up to `selfcopy` = zfs:<T>, copy retention 1h (the dataset's own: 1d)
-s_server_yaml() {
-    cat <<EOF
-# zfsbackup SERVER config sharing its target with a local destination (scenario S)
-snapshot_prefix: "autosnap"
-check_interval: "15s"
-prune_interval: "${SERVER_PRUNE}"
-api_host: "0.0.0.0"
-api_port: ${API_PORT}
-remote_backup:
-  enabled: true
-  target_dataset: "${TARGET_DS}"
-destinations:
-  ${S_LOCAL_DEST}:
-    url: "zfs:${TARGET_DS}"
-datasets:
-  - name: "${S_OWN_DS}"
-    enabled: true
-    frequency: "1d"
-    recursive: false
-    retention:
-      "1s": "1d"
-    remote:
-      - destination: ${S_LOCAL_DEST}
-        frequency: "30s"
-        retention:
-          "1s": "1h"
-EOF
-}
-
-echo
-step "SCENARIO S — a local destination that SHARES the server's backup target: both trees under it, pruned by their stamped rules, the server's own client id reserved"
-if ! scn_enabled s; then
-    info "scenario S skipped (--no-s / another --only-X)"
-elif [ "$S_READY" -ne 1 ]; then
-    warn "scenario S skipped: the shipped tree has no shared_receive_target (SRC_REF=WORKTREE ships the working tree)"
-else
-    TARGET_DS="${SERVER_POOL}/backups"
-    stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
-    remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"        # fresh DBs, fresh TLS dirs, no B, no C
-    recreate_pool "$SERVER_VM" "$SERVER_POOL"; recreate_pool "$CLIENT_VM" "$CLIENT_POOL"
-    msh "$SERVER_VM" "zfs create -p '$TARGET_DS' && zfs create '$S_OWN_DS'" || die "(S) failed to create $TARGET_DS / $S_OWN_DS"
-    msh "$CLIENT_VM" "zfs create '$S_CDATA_DS' && zfs create '$S_CSHORT_DS'" || die "(S) failed to create $S_CDATA_DS / $S_CSHORT_DS"
-    S_ALL_OWN=(); S_ALL_DATA=(); S_ALL_SHORT=(); S_REC_OWN=(); S_REC_DATA=(); S_REC_SHORT=()
-    SERVER_PRUNE="1h"; CLIENT_SNAP_FREQ="1d"; CLIENT_PRUNE="1h"
-    CLIENT_RETENTION_YAML=$'      "1s": "1d"'
-    PIN_FP=""; CLIENT_ID=""
-
-    # ── S0: setup. The target is NOT shared yet: the server has only its API; B is enrolled under the server's own id ──
-    echo
-    step "S0 — setup: the server has an id of its own and B is enrolled under it BEFORE the target is shared; then the config shares the target"
-    write_server_config                                            # remote_backup only (a disabled placeholder dataset), check_interval 1m
-    out="$(cli_vm "$SERVER_VM" identity set-client-id "$S_SRV_ID")"; rc=$?
-    printf '%s\n' "$out" | sed 's/^/    CLI(server): /'
-    [ "$rc" -eq 0 ] || die "(S0) identity set-client-id $S_SRV_ID failed on the server (exit $rc)"
-    check "(S0) the server's client id is $S_SRV_ID" "$S_SRV_ID" "$(cli_jget "$SERVER_VM" 'd["client_id"]' identity show --json | tr -d '[:space:]')"
-    start_daemon "$SERVER_VM"
-    wait_health || die "(S0) server API never became healthy"
-    smark_c="$(loglines "$CLIENT_VM")"; smark_s="$(loglines "$SERVER_VM")"    # (the logs are append-only across scenarios)
-
-    write_client_config "$SERVER_IP" "  - name: \"${S_CSHORT_DS}\"
-    enabled: true
-    frequency: \"1d\"
-    recursive: false
-    retention:
-      \"1s\": \"1d\"
-    remote:
-      - destination: ${DEST_NAME}
-        frequency: \"30s\"
-        retention:
-          \"1s\": \"1h\""
-    enroll_client                                                  # A: sets CLIENT_ID, PIN_FP
-    S_COPY_OWN="${TARGET_DS}/${S_SRV_ID}/${S_OWN_DS}"
-    S_COPY_DATA="${TARGET_DS}/${CLIENT_ID}/${S_CDATA_DS}"
-    S_COPY_SHORT="${TARGET_DS}/${CLIENT_ID}/${S_CSHORT_DS}"
-    check "(S0) the client id differs from the server's" "different" "$([ -n "$CLIENT_ID" ] && [ "$CLIENT_ID" != "$S_SRV_ID" ] && echo different || echo same)"
-
-    put_config_b
-    out="$(cli_b identity set-client-id "$S_SRV_ID")"; rc=$?
-    check "(S0) B takes the server's own id locally (nothing is enrolled in B's DB)" "0" "$rc"
-    mint_token || die "(S0) could not create a token on $SERVER_VM"
-    put_token "$CLIENT_VM" /tmp/zfsb-token-s-b || die "(S0) could not deliver the token file"
-    out="$(cli_b enroll "$DEST_NAME" --url "https://${SERVER_IP}:${API_PORT}" --token-file /tmp/zfsb-token-s-b)"; rc=$?
-    printf '%s\n' "$out" | sed 's/^/    CLI(B): /'
-    check "(S0) B enrolls under the server's own id while the target is not shared: exit 0" "0" "$rc"
-    check "(S0) the server pins B's certificate under $S_SRV_ID" "1" "$(trust_pins "$S_SRV_ID" | grep -c .)"
-    check "(S0) the server trusts two clients (A and B)" "2" "$(cli_jget "$SERVER_VM" 'len(d)' trust list --json | tr -d '[:space:]')"
-    S_B_BASE="${K_TLS_B}/client"
-    check "(S0) control: B's certificate is accepted on /whoami and bound to $S_SRV_ID (nothing is reserved yet)" "200 $S_SRV_ID" \
-        "$(probe "$S_B_BASE" GET /whoami) $(probe_body | sed -n 's/.*"client_id": *"\([^"]*\)".*/\1/p' | head -n1)"
-
-    # round 1 on all three sources before any sender runs: each copy starts with a FULL stream of exactly this snapshot
-    info "round 1: one snapshot on each of $S_OWN_DS (server), $S_CDATA_DS and $S_CSHORT_DS (client)"
-    s_round 0
-    S_R1_OWN="$S_N_OWN"; S_R1_DATA="$S_N_DATA"; S_R1_SHORT="$S_N_SHORT"
-
-    # share the target: import the server config with the local destination (the stored id stays: import never touches host_identity)
-    mark_s="$(loglines "$SERVER_VM")"
-    s_server_yaml | put_guest_file "$SERVER_VM" "$CFG"
-    out="$(cli_vm "$SERVER_VM" import --no-backup "$CFG")"; rc=$?
-    printf '%s\n' "$out" | sed 's/^/    CLI(server): /'
-    check "(S0) importing the config with a local destination on the server's own target: exit 0" "0" "$rc"
-    check_has "(S0) the CLI warns that the server now reserves its own id, which B is bound to (names trust revoke --client $S_SRV_ID)" "trust revoke --client ${S_SRV_ID}" "$out"
-    check "(S0) the server's client id is unchanged by the import" "$S_SRV_ID" "$(cli_jget "$SERVER_VM" 'd["client_id"]' identity show --json | tr -d '[:space:]')"
-    s_wait_insync 120 && pass "(S0) the running server daemon applied the shared configuration" || fail "(S0) the server daemon never reached in-sync"
-    wait_health || fail "(S0) the server API is not healthy after the reload"
-    mark_c="$(loglines "$CLIENT_VM")"
-    start_daemon "$CLIENT_VM"
-
-    # ── S1: both trees under T ──
-    echo
-    step "S1 — one dataset holds both trees: T/$S_SRV_ID/... (this host, a direct zfs send | zfs receive) next to T/$CLIENT_ID/... (the client, over HTTPS)"
-    wait_log_vm "$SERVER_VM" "$mark_s" "Backup complete: ${S_OWN_DS}@${S_R1_OWN} \(full\)" 150 \
-        && pass "(S1) log: the server's own baseline went out as a full send to its local destination" || fail "(S1) no 'Backup complete: ${S_OWN_DS}@${S_R1_OWN} (full)' on the server"
-    wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${S_CDATA_DS}@${S_R1_DATA} \(full\)" 150 \
-        && pass "(S1) log: the client's baseline of $S_CDATA_DS went out as a full send" || fail "(S1) no 'Backup complete: ${S_CDATA_DS}@${S_R1_DATA} (full)' on the client"
-    wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${S_CSHORT_DS}@${S_R1_SHORT} \(full\)" 90 \
-        && pass "(S1) log: the client's baseline of $S_CSHORT_DS went out as a full send" || fail "(S1) no 'Backup complete: ${S_CSHORT_DS}@${S_R1_SHORT} (full)' on the client"
-    check "(S1) the trees under $TARGET_DS are exactly T/$S_SRV_ID and T/$CLIENT_ID" "$(printf '%s\n%s\n' "$CLIENT_ID" "$S_SRV_ID" | LC_ALL=C sort | tr '\n' ' ')" \
-        "$(msh "$SERVER_VM" "zfs list -H -d 1 -t filesystem -o name '$TARGET_DS' | tail -n +2 | sed 's#.*/##' | LC_ALL=C sort | tr '\n' ' '")"
-    check "(S1) the server's own copy is at T/<server id>/<pool>/<path> = $S_COPY_OWN" "$S_R1_OWN" "$(s_joined "$SERVER_VM" "$S_COPY_OWN")"
-    check "(S1) the client's copies are at T/<client id>/<pool>/<path>: $S_COPY_DATA and $S_COPY_SHORT" "$S_R1_DATA $S_R1_SHORT" \
-        "$(s_joined "$SERVER_VM" "$S_COPY_DATA") $(s_joined "$SERVER_VM" "$S_COPY_SHORT")"
-    s_check_copy "S1 own"   "$S_COPY_OWN"   "$S_SRV_ID" "$S_OWN_DS"    "3600"
-    s_check_copy "S1 data"  "$S_COPY_DATA"  "$CLIENT_ID" "$S_CDATA_DS" "86400"
-    s_check_copy "S1 short" "$S_COPY_SHORT" "$CLIENT_ID" "$S_CSHORT_DS" "3600"
-    check "(S1) the server's own SOURCE dataset carries the dataset-level rule (1d); only its copy carries the destination's override (1h)" "86400" \
-        "$(msh "$SERVER_VM" "zfs get -H -o value org.zfsbackup:config '$S_OWN_DS' | base64 -d 2>/dev/null | '$PY' '$JGET_PY' 'int(d[\"retention_rules\"][0][\"keep_for\"])'" | tr -d '[:space:]')"
-    check "(S1) the server's own copy was written without any HTTP request (no /backup/$S_SRV_ID/ in the API log)" "0" \
-        "$(log_since_vm "$SERVER_VM" "$mark_s" | grep -c "/backup/${S_SRV_ID}/" || true)"
-    check_has "(S1) positive control: the client's copies did arrive through the API (POST .../backup/$CLIENT_ID/...)" "/backup/${CLIENT_ID}/" "$(log_since_vm "$SERVER_VM" "$mark_s")"
-
-    # two incremental rounds; the log names the base of every step
-    prev_own="$S_R1_OWN"; prev_data="$S_R1_DATA"; prev_short="$S_R1_SHORT"
-    for rd in 2 3; do
-        mark_c="$(loglines "$CLIENT_VM")"; mark_s="$(loglines "$SERVER_VM")"
-        info "round $rd"
-        s_round 0
-        if s_wait_round "S1 round $rd" 150; then
-            wait_log_vm "$SERVER_VM" "$mark_s" "Backup complete: ${S_OWN_DS}@${S_N_OWN} \(incremental from ${prev_own}\)" 30 \
-                && pass "(S1 round $rd) the server's own copy was updated INCREMENTALLY from $prev_own" || fail "(S1 round $rd) no incremental log line for $S_OWN_DS@$S_N_OWN"
-            wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${S_CDATA_DS}@${S_N_DATA} \(incremental from ${prev_data}\)" 30 \
-                && pass "(S1 round $rd) $S_CDATA_DS was sent INCREMENTALLY from $prev_data" || fail "(S1 round $rd) no incremental log line for $S_CDATA_DS@$S_N_DATA"
-            wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${S_CSHORT_DS}@${S_N_SHORT} \(incremental from ${prev_short}\)" 30 \
-                && pass "(S1 round $rd) $S_CSHORT_DS was sent INCREMENTALLY from $prev_short" || fail "(S1 round $rd) no incremental log line for $S_CSHORT_DS@$S_N_SHORT"
-        fi
-        prev_own="$S_N_OWN"; prev_data="$S_N_DATA"; prev_short="$S_N_SHORT"
-    done
-    check "(S1) every copy holds exactly its source's snapshots, with the SAME guids (own)"   "$(s_fp "$SERVER_VM" "$S_OWN_DS")"    "$(s_fp "$SERVER_VM" "$S_COPY_OWN")"
-    check "(S1) ... (data)"  "$(s_fp "$CLIENT_VM" "$S_CDATA_DS")"  "$(s_fp "$SERVER_VM" "$S_COPY_DATA")"
-    check "(S1) ... (short)" "$(s_fp "$CLIENT_VM" "$S_CSHORT_DS")" "$(s_fp "$SERVER_VM" "$S_COPY_SHORT")"
-    check "(S1) the anchors are the newest snapshots (own via ${S_LOCAL_DEST}, data and short via ${DEST_NAME})" "$S_N_OWN $S_N_DATA $S_N_SHORT" \
-        "$(zprop "$SERVER_VM" "$S_OWN_DS" "$S_ANCHOR_OWN") $(zprop "$CLIENT_VM" "$S_CDATA_DS" "$S_ANCHOR_CLIENT") $(zprop "$CLIENT_VM" "$S_CSHORT_DS" "$S_ANCHOR_CLIENT")"
-    check_lacks "(S1) no in-flight pin is left on any source" "." "$(zprop "$SERVER_VM" "$S_OWN_DS" "org.zfsbackup:inflight.${S_LOCAL_DEST}")$(zprop "$CLIENT_VM" "$S_CDATA_DS" "org.zfsbackup:inflight.${DEST_NAME}")$(zprop "$CLIENT_VM" "$S_CSHORT_DS" "org.zfsbackup:inflight.${DEST_NAME}")"
-    if [ "$CK_READY" -eq 1 ]; then
-        ck_run "$SERVER_VM" --json
-        check "(S1) the server's \`check\` lists the received datasets of BOTH clients, itself included" "yes" \
-            "$(ck_expr "$SERVER_VM" '"yes" if set(["'"$S_SRV_ID"'", "'"$CLIENT_ID"'"]) <= set(e.get("peer") for e in d["entries"] if e["source"] == "received") else "no"' | tr -d '[:space:]')"
-    fi
-    check_lacks "(S1) no traceback in the server log" "Traceback" "$(log_since_vm "$SERVER_VM" "$smark_s")"
-    check_lacks "(S1) no traceback in the client log" "Traceback" "$(log_since_vm "$CLIENT_VM" "$smark_c")"
-
-    # ── S2: the server prunes both trees by their stamped rules ──
-    echo
-    step "S2 — the server prunes both trees by their STAMPED rules: backdated snapshots expire on the 1h copies (own, short), not on the 1d copy (data)"
-    # three snapshots per source named 3h, 2h50m and 2h40m ago (txg order = name order), then a current one: the newest by txg is never an
-    # expired one. They go through the real send path first; the pruner (1h interval so far) is sped up only afterwards.
-    for ago in 10800 10200 9600; do s_round "$ago"; done
-    S_OLD_OWN=("${S_ALL_OWN[@]:3:3}"); S_OLD_DATA=("${S_ALL_DATA[@]:3:3}"); S_OLD_SHORT=("${S_ALL_SHORT[@]:3:3}")
-    s_round 0
-    s_wait_round "S2 backlog" 240
-    check "(S2) precondition: each source holds 7 snapshots (3 + 3 backdated + 1) and each copy the same 7, in the same order" "7 7 7 yes" \
-        "$(s_snaps "$SERVER_VM" "$S_OWN_DS" | count) $(s_snaps "$CLIENT_VM" "$S_CDATA_DS" | count) $(s_snaps "$CLIENT_VM" "$S_CSHORT_DS" | count) $([ "$(s_joined "$SERVER_VM" "$S_COPY_OWN")" = "${S_ALL_OWN[*]}" ] && [ "$(s_joined "$SERVER_VM" "$S_COPY_DATA")" = "${S_ALL_DATA[*]}" ] && [ "$(s_joined "$SERVER_VM" "$S_COPY_SHORT")" = "${S_ALL_SHORT[*]}" ] && echo yes || echo no)"
-    mark_s="$(loglines "$SERVER_VM")"
-    cli_vm "$SERVER_VM" set prune_interval 20s | sed 's/^/    CLI: /'
-    waited=0
-    until [ "$(s_joined "$SERVER_VM" "$S_COPY_OWN")" = "${S_REC_OWN[*]}" ] && [ "$(s_joined "$SERVER_VM" "$S_COPY_SHORT")" = "${S_REC_SHORT[*]}" ] || [ "$waited" -ge 240 ]; do
-        sleep 5; waited=$((waited+5))
-    done
-    sleep 50      # at least two more 20s cycles: nothing else may go, nothing may be destroyed twice
-    check "(S2) the server's OWN copy keeps only the snapshots its stamped 1h rule keeps (the three backdated ones are gone)" "${S_REC_OWN[*]}" "$(s_joined "$SERVER_VM" "$S_COPY_OWN")"
-    check "(S2) the client's SHORT copy (per-destination override 1h) lost its three backdated snapshots too" "${S_REC_SHORT[*]}" "$(s_joined "$SERVER_VM" "$S_COPY_SHORT")"
-    check "(S2) the client's DATA copy (1d) kept ALL seven, the backdated ones included: its rule is not the others'" "${S_ALL_DATA[*]}" "$(s_joined "$SERVER_VM" "$S_COPY_DATA")"
-    check "(S2) the newest snapshot of every copy is the one just sent" "$S_N_OWN $S_N_DATA $S_N_SHORT" \
-        "$(s_snaps "$SERVER_VM" "$S_COPY_OWN" | tail -n1) $(s_snaps "$SERVER_VM" "$S_COPY_DATA" | tail -n1) $(s_snaps "$SERVER_VM" "$S_COPY_SHORT" | tail -n1)"
-    check "(S2) the sources are untouched: each still holds all seven (the datasets' own rule is 1d)" "${S_ALL_OWN[*]}|${S_ALL_DATA[*]}|${S_ALL_SHORT[*]}" \
-        "$(s_joined "$SERVER_VM" "$S_OWN_DS")|$(s_joined "$CLIENT_VM" "$S_CDATA_DS")|$(s_joined "$CLIENT_VM" "$S_CSHORT_DS")"
-    slog="$(log_since_vm "$SERVER_VM" "$mark_s")"
-    s2_once=1
-    for x in "${S_OLD_OWN[@]}";   do [ "$(printf '%s\n' "$slog" | grep -cE "Pruning snapshots.*${S_COPY_OWN}@${x}")" = "1" ]   || { s2_once=0; echo "    not destroyed exactly once: ${S_COPY_OWN}@${x}"; }; done
-    for x in "${S_OLD_SHORT[@]}"; do [ "$(printf '%s\n' "$slog" | grep -cE "Pruning snapshots.*${S_COPY_SHORT}@${x}")" = "1" ] || { s2_once=0; echo "    not destroyed exactly once: ${S_COPY_SHORT}@${x}"; }; done
-    check "(S2) every expired snapshot was destroyed exactly once (the shared target's copies are not pruned again as local copies)" "1" "$s2_once"
-    check "(S2) nothing of the long copy, and no source snapshot, was offered to zfs destroy" "0" \
-        "$(printf '%s\n' "$slog" | grep -cE "Pruning snapshots.*(: |, )(${S_COPY_DATA}|${S_OWN_DS}|${S_CDATA_DS}|${S_CSHORT_DS})@" || true)"
-    check_lacks "(S2) no failed prune, no traceback in the server log" "Failed to prune|Traceback" "$slog"
-    # the chain goes on from the base the pruner had to keep
-    mark_c="$(loglines "$CLIENT_VM")"; mark_s="$(loglines "$SERVER_VM")"
-    prev_own="$S_N_OWN"; prev_data="$S_N_DATA"; prev_short="$S_N_SHORT"
-    s_round 0
-    if s_wait_round "S2 after the prune" 150; then
-        wait_log_vm "$SERVER_VM" "$mark_s" "Backup complete: ${S_OWN_DS}@${S_N_OWN} \(incremental from ${prev_own}\)" 30 \
-            && pass "(S2) after the prune the server's own copy continues INCREMENTALLY from $prev_own" || fail "(S2) no incremental log line for $S_OWN_DS@$S_N_OWN after the prune"
-        wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${S_CSHORT_DS}@${S_N_SHORT} \(incremental from ${prev_short}\)" 30 \
-            && pass "(S2) after the prune the client's short copy continues INCREMENTALLY from $prev_short" || fail "(S2) no incremental log line for $S_CSHORT_DS@$S_N_SHORT after the prune"
-        wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${S_CDATA_DS}@${S_N_DATA} \(incremental from ${prev_data}\)" 30 \
-            && pass "(S2) ... and so does the long copy (from $prev_data)" || fail "(S2) no incremental log line for $S_CDATA_DS@$S_N_DATA after the prune"
-    fi
-    check "(S2) guids still match on every copy that was pruned (own, short) and on the one that was not (data): the surviving snapshots are the sources' snapshots" "yes" \
-        "$(s_copies_are_subsets)"
-
-    # ── S3: the reservation ──
-    echo
-    step "S3 — the server reserves its own client id while it shares its target: no token for it, no enrollment under it, no receive for a client bound to it"
-    s3_tree="$(msh "$SERVER_VM" "zfs list -H -r -t filesystem -o name '$TARGET_DS/$S_SRV_ID' | LC_ALL=C sort | tr '\n' ' '")"
-    check "(S3) precondition: T/$S_SRV_ID holds exactly the server's own tree" "$TARGET_DS/$S_SRV_ID $TARGET_DS/$S_SRV_ID/${SERVER_POOL} $S_COPY_OWN " "$s3_tree"
-    s3_own_fp="$(s_fp "$SERVER_VM" "$S_COPY_OWN")"
-
-    # S3a: the CLI
-    tok_before="$(cli_jget "$SERVER_VM" 'd["state"] + " " + str(d["consumed_client_id"])' trust token show --json | tr -d '\r')"
-    out="$(cli_vm "$SERVER_VM" trust token create --client-id "$S_SRV_ID")"; rc=$?
-    printf '%s\n' "$out" | sed 's/^/    CLI(server): /'
-    check "(S3a) trust token create --client-id $S_SRV_ID (the server's own id) exits 1" "1" "$rc"
-    check_has "(S3a) the CLI says why: the server reserves its own id while a local destination shares its target" "reserves its own id" "$out"
-    check_lacks "(S3a) no token text in the output" "zfsb1\." "$out"
-    check "(S3a) no token was created: the token state is unchanged" "$tok_before" "$(cli_jget "$SERVER_VM" 'd["state"] + " " + str(d["consumed_client_id"])' trust token show --json | tr -d '\r')"
-    out="$(cli_vm "$SERVER_VM" list destinations)"
-    printf '%s\n' "$out" | sed 's/^/    CLI(server): /'
-    check_has "(S3a) list destinations on the server marks the destination \`local (shared)\`" "${S_LOCAL_DEST} +local \(shared\)" "$out"
-    check "(S3a) ... and its JSON has shared=true" "True" "$(cli_jget "$SERVER_VM" '[e["shared"] for e in d if e["name"] == "'"$S_LOCAL_DEST"'"][0]' list destinations --json | tr -d '[:space:]')"
-    check_lacks "(S3a) the client's own destination list shows nothing shared" "\(shared\)" "$(cli_vm "$CLIENT_VM" list destinations)"
-
-    # S3b: a client that is already bound to the id (B) gets 409 on every route that touches the tree; /whoami is unchanged
-    mark_s="$(loglines "$SERVER_VM")"
-    check "(S3b) B's certificate is still accepted on /whoami and bound to $S_SRV_ID (it is not unpinned)" "200 $S_SRV_ID" \
-        "$(probe "$S_B_BASE" GET /whoami) $(probe_body | sed -n 's/.*"client_id": *"\([^"]*\)".*/\1/p' | head -n1)"
-    s3_path="${S_SRV_ID}/${S_OWN_DS}"
-    code="$(probe "$S_B_BASE" POST "/backup/${s3_path}/negotiate" '{"snapshots": []}')"
-    check "(S3b) B (bound to $S_SRV_ID): POST negotiate for the server's own dataset: HTTP 409" "409" "$code"
-    check_has "(S3b) ... with reason reserved_client_id" '"reason": *"reserved_client_id"' "$(probe_body)"
-    code="$(probe "$S_B_BASE" GET "/backup/${s3_path}/resume_token")"
-    check "(S3b) B: GET resume_token: HTTP 409" "409" "$code"
-    check_has "(S3b) ... with reason reserved_client_id" '"reason": *"reserved_client_id"' "$(probe_body)"
-    # a real upgrade request (HTTP/1.1, Upgrade/Connection/Sec-WebSocket-*): only that matches the websocket route
-    code="$(PROBE_HEADERS="--http1.1 -H 'Upgrade: websocket' -H 'Connection: Upgrade' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='" \
-        probe "$S_B_BASE" GET "/backup/${s3_path}/stream")"
-    check "(S3b) B: a websocket upgrade to stream is refused before the upgrade: HTTP 409" "409" "$code"
-    check_has "(S3b) ... with reason reserved_client_id" '"reason": *"reserved_client_id"' "$(probe_body)"
-    msh "$CLIENT_VM" "rm -f /tmp/zfsb-probe.json" || true
-    slog="$(log_since_vm "$SERVER_VM" "$mark_s")"
-    check "(S3b) three refused requests, ONE server WARNING (hourly per id), naming the remedy" "1" "$(printf '%s\n' "$slog" | grep -cE "WARNING.*the server reserves client id '${S_SRV_ID}'")"
-    check_has "(S3b) ... trust revoke --client $S_SRV_ID" "WARNING.*trust revoke --client ${S_SRV_ID}" "$slog"
-    check "(S3b) the server's own tree is untouched (names and guids of the copy)" "$s3_own_fp" "$(s_fp "$SERVER_VM" "$S_COPY_OWN")"
-
-    # S3c: a NEW enrollment under the id (C): 409, the token is not spent, nothing is created
-    mark_s="$(loglines "$SERVER_VM")"
-    put_config_c
-    out="$(cli_c identity set-client-id "$S_SRV_ID")"; rc=$?
-    check "(S3c) C takes the server's own id locally (nothing is enrolled in C's DB)" "0" "$rc"
-    mint_token || die "(S3c) could not create a token on $SERVER_VM"
-    put_token "$CLIENT_VM" /tmp/zfsb-token-s-c || die "(S3c) could not deliver the token file"
-    out="$(cli_c enroll "$DEST_NAME" --url "https://${SERVER_IP}:${API_PORT}" --token-file /tmp/zfsb-token-s-c)"; rc=$?
-    printf '%s\n' "$out" | sed 's/^/    CLI(C): /'
-    check "(S3c) C enrolling as $S_SRV_ID with an UNSCOPED token: exit 1" "1" "$rc"
-    check_lacks "(S3c) the token text is not echoed" "zfsb1\." "$out"
-    case "$out" in
-        *[Rr]eserved*) pass "(S3c) the CLI names the reservation" ;;
-        *) fail "(S3c) \`enroll\` under the server's reserved id prints no word about the reservation" ;;
-    esac
-    check_has "(S3c) the server answered POST /enroll with 409" 'POST /enroll HTTP/1\.1[^"]*" 409' "$(log_since_vm "$SERVER_VM" "$mark_s")"
-    check "(S3c) the token is still ACTIVE on the server (the refusal came before it was consumed)" "active" "$(cli_jget "$SERVER_VM" 'd["state"]' trust token show --json | tr -d '[:space:]')"
-    check "(S3c) the server still trusts exactly A and B; $S_SRV_ID has its one pin (B's)" "2 1" \
-        "$(cli_jget "$SERVER_VM" 'len(d)' trust list --json | tr -d '[:space:]') $(trust_pins "$S_SRV_ID" | grep -c .)"
-    check "(S3c) nothing was created under T/$S_SRV_ID: the same filesystems as before" "$s3_tree" \
-        "$(msh "$SERVER_VM" "zfs list -H -r -t filesystem -o name '$TARGET_DS/$S_SRV_ID' | LC_ALL=C sort | tr '\n' ' '")"
-    check "(S3c) ... and T holds only the two trees" "$(printf '%s\n%s\n' "$CLIENT_ID" "$S_SRV_ID" | LC_ALL=C sort | tr '\n' ' ')" \
-        "$(msh "$SERVER_VM" "zfs list -H -d 1 -t filesystem -o name '$TARGET_DS' | tail -n +2 | sed 's#.*/##' | LC_ALL=C sort | tr '\n' ' '")"
-    check "(S3c) the server's own copy is untouched" "$s3_own_fp" "$(s_fp "$SERVER_VM" "$S_COPY_OWN")"
-    # the SAME token, with an id of its own
-    out="$(cli_c identity set-client-id "$S_ID_C")"; rc=$?
-    check "(S3c) C switches to its own id $S_ID_C" "0" "$rc"
-    out="$(cli_c enroll "$DEST_NAME" --url "https://${SERVER_IP}:${API_PORT}" --token-file /tmp/zfsb-token-s-c)"; rc=$?
-    printf '%s\n' "$out" | sed 's/^/    CLI(C): /'
-    check "(S3c) the SAME token now enrolls C: exit 0" "0" "$rc"
-    check "(S3c) the token is consumed, by $S_ID_C" "consumed $S_ID_C" "$(cli_jget "$SERVER_VM" 'd["state"] + " " + str(d["consumed_client_id"])' trust token show --json | tr -d '\r')"
-    check "(S3c) the server trusts three clients" "3" "$(cli_jget "$SERVER_VM" 'len(d)' trust list --json | tr -d '[:space:]')"
-
-    # S3d: set-client-id of an enrolled id is refused, --force or not
-    out="$(cli_vm "$SERVER_VM" identity set-client-id "$S_ID_C")"; rc=$?
-    printf '%s\n' "$out" | sed 's/^/    CLI(server): /'
-    check "(S3d) identity set-client-id $S_ID_C (an enrolled client's id) on the server: exit 1" "1" "$rc"
-    out="$(cli_vm "$SERVER_VM" identity set-client-id "$S_ID_C" --force)"; rc=$?
-    check "(S3d) ... --force does not override it: exit 1" "1" "$rc"
-    check "(S3d) the server's client id is unchanged" "$S_SRV_ID" "$(cli_jget "$SERVER_VM" 'd["client_id"]' identity show --json | tr -d '[:space:]')"
-
-    # S3e: the operator's remedy, and the shared target keeps working throughout
-    out="$(cli_vm "$SERVER_VM" trust revoke --client "$S_SRV_ID")"; rc=$?
-    printf '%s\n' "$out" | sed 's/^/    CLI(server): /'
-    check "(S3e) trust revoke --client $S_SRV_ID exits 0" "0" "$rc"
-    check "(S3e) $S_SRV_ID has no pinned certificate left" "" "$(trust_pins "$S_SRV_ID")"
-    sleep 5      # the API polls the trust generation every ~2s
-    check "(S3e) B's revoked certificate no longer reaches /whoami" "not-200" "$([ "$(probe "$S_B_BASE" GET /whoami)" = "200" ] && echo 200 || echo not-200)"
-    msh "$CLIENT_VM" "rm -f /tmp/zfsb-probe.json" || true
-    mark_c="$(loglines "$CLIENT_VM")"; mark_s="$(loglines "$SERVER_VM")"
-    prev_own="$S_N_OWN"; prev_data="$S_N_DATA"
-    s_round 0
-    if s_wait_round "S3 after the refusals" 150; then
-        wait_log_vm "$SERVER_VM" "$mark_s" "Backup complete: ${S_OWN_DS}@${S_N_OWN} \(incremental from ${prev_own}\)" 30 \
-            && pass "(S3e) the server's own copy kept getting incremental updates through all of it" || fail "(S3e) no incremental log line for $S_OWN_DS@$S_N_OWN"
-        wait_log_vm "$CLIENT_VM" "$mark_c" "Backup complete: ${S_CDATA_DS}@${S_N_DATA} \(incremental from ${prev_data}\)" 30 \
-            && pass "(S3e) ... and so did the client's" || fail "(S3e) no incremental log line for $S_CDATA_DS@$S_N_DATA"
-    fi
-    check "(S3e) the client's backups were never refused: no reserved-id WARNING for $CLIENT_ID" "0" \
-        "$(log_since_vm "$SERVER_VM" "$smark_s" | grep -cE "reserves client id '${CLIENT_ID}'" || true)"
-    check_lacks "(S3) no traceback in the server log for the whole scenario" "Traceback" "$(log_since_vm "$SERVER_VM" "$smark_s")"
-    check_lacks "(S3) no traceback in the client log for the whole scenario" "Traceback" "$(log_since_vm "$CLIENT_VM" "$smark_c")"
-
-    stop_daemon "$CLIENT_VM"; stop_daemon "$SERVER_VM"
-    msh "$CLIENT_VM" "rm -rf /var/lib/zfsbackup-b /var/lib/zfsbackup-c /tmp/zfsb-token-s-b /tmp/zfsb-token-s-c" || true
 fi
 
 # ─────────────────────────────── Report ─────────────────────────────────────

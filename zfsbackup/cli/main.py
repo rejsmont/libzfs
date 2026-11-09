@@ -81,10 +81,8 @@ from zfsbackup.cli.write import (
     begin_reload,
     commit_config,
     notify_daemon,
-    own_id_bound,
     read_snapshot,
     release_database,
-    stored_shared_target_warning,
     where_flag,
 )
 from zfsbackup.config import BackupConfig
@@ -626,20 +624,6 @@ def import_cmd(yaml_file: Path, no_backup: bool, config_path: Optional[str], ver
     if new_id is not None:
         click.echo(f"generated this host's client id: {new_id}")
     notify_daemon(resolved, generation, store_id, request=request)
-    # A shared target while this host is enrolled with its own server (loopback):
-    # the server now refuses that client. After the notice, like commit_config's.
-    if state.handler is not None:
-        state.handler.muted = True  # the read-back would repeat the file's warnings
-    try:
-        notice = stored_shared_target_warning(resolved)
-    finally:
-        if state.handler is not None:
-            state.handler.muted = False
-    if notice is not None:
-        try:
-            click.echo(f"warning: {notice}", err=True)
-        except OSError:
-            pass
 
 
 def _client_id_after_import(
@@ -1254,10 +1238,7 @@ def _edit(
         state.warn(message)
     # A destination that changed kind or local target: worded with this host's
     # client id (the copies' real path), which only the snapshot knows.
-    for message in dotpath.url_change_warnings(
-        config, change.config, snapshot.client_id,
-        own_id_bound=lambda: own_id_bound(resolved, snapshot.client_id),
-    ):
+    for message in dotpath.url_change_warnings(config, change.config, snapshot.client_id):
         state.warn(message)
 
     shown = change.scope or segs

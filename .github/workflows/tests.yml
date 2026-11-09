@@ -19,9 +19,8 @@ jobs:
   test:
     name: py${{ matrix.python }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # A wedged fork test must not burn hours. Run serially with coverage the
-    # suite outgrew this cap (41-57 min, macOS and py3.14 cancelled at 60), so
-    # every suite job runs it under xdist (-n auto): ~6 min on a laptop.
+    # A wedged fork test must not burn hours. The suite takes ~14 min on a
+    # laptop (real-daemon, forkserver and sd_notify tests), so allow headroom.
     timeout-minutes: 60
     # A matrix entry marked `experimental` may fail without failing the
     # workflow: it is reported, not enforced. No entry is experimental today
@@ -98,7 +97,7 @@ jobs:
           echo "ZPOOL_CMD=$RUNNER_TEMP/zfsstub/zpool" >> "$GITHUB_ENV"
 
       - name: Run the mocked test suite
-        run: poetry run pytest -n auto
+        run: poetry run pytest
 
       - name: Upload coverage
         # Coverage is informational for now -- no threshold is enforced.
@@ -157,7 +156,7 @@ jobs:
 
       - name: Run the mocked test suite
         run: >
-          poetry run pytest -n auto
+          poetry run pytest
           -W error::sqlalchemy.exc.SADeprecationWarning
           -W error::sqlalchemy.exc.SAWarning
 

@@ -40,7 +40,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy.exc import DatabaseError, OperationalError
 
-from zfsbackup.config import BackupConfig, shared_receive_target
+from zfsbackup.config import BackupConfig
 from zfsbackup.config.model import _same
 from zfsbackup.config.store import (
     CONFIG_PATH_ENV,
@@ -250,97 +250,6 @@ def _remote_worker_needed(config: BackupConfig) -> bool:
     has a `remote:` destination). The one definition behind
     `BackupDaemon._active_worker_names` and the pre-acceptance checks."""
     return any(ds.remote for ds in config.enabled_datasets)
-
-
-#: The workers that write received data into the backup target: the API worker
-#: (`zfs receive` for clients) and the remote worker (a local destination's
-#: `zfs receive`). They conflict only on one tree, `<target>/<client id>`; see
-#: `api_footprint` / `remote_footprint` and `receive_conflict`.
-_RECEIVE_WRITERS = ('api', 'remote')  # only `remote` is ever held
-
-#: Seconds before a spawn held by the receive-writer gate is tried again (the
-#: 5 s poll is what actually paces it; this only keeps the entry from being
-#: "due" in the very `_check_workers` call that set it).
-RECEIVE_GATE_RECHECK = 1.0
-
-
-def _clean_target(value) -> Optional[str]:
-    """A dataset name as `shared_receive_target` compares it (trailing `/`
-    stripped), or `None` for anything that is not a non-empty string."""
-    if not isinstance(value, str):
-        return None
-    return value.rstrip('/') or None
-
-
-def api_footprint(config: BackupConfig, client_id: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """What an API worker born on `config` can write: `(target, reserved id)`.
-    `target` is the enabled `remote_backup.target_dataset` it serves (`None`:
-    no server target, nothing to receive into); `reserved id` is this host's
-    client id while a local destination shares that target (the API refuses
-    every receive for it, `create_app(reserved_client_id=)`), else `None`.
-    Pure: no `zfs` call."""
-    remote = getattr(config, 'remote_backup', None)
-    target = None
-    if remote is not None and getattr(remote, 'enabled', False):
-        target = _clean_target(getattr(remote, 'target_dataset', None))
-    reserved = client_id if shared_receive_target(config) is not None else None
-    return target, reserved
-
-
-def remote_footprint(config: BackupConfig, client_id: Optional[str]) -> Tuple[frozenset, Optional[str]]:
-    """What a remote worker born on `config` can write: `(local targets,
-    client id)` -- every declared `zfs:` destination's target dataset, under
-    `<target>/<client id>`. With no client id the local sender skips every
-    destination, so it writes nothing. Pure: no `zfs` call."""
-    targets = set()
-    for dest in (getattr(config, 'destinations', None) or {}).values():
-        if getattr(dest, 'is_local', False) is True:
-            target = _clean_target(getattr(dest, 'target_dataset', None))
-            if target is not None:
-                targets.add(target)
-    return frozenset(targets), client_id
-
-
-def _datasets_overlap(a: str, b: str) -> bool:
-    """Equal, or one a dataset-path ancestor of the other (component-wise, so
-    `pool/a` and `pool/ab` do not overlap)."""
-    ca, cb = a.split('/'), b.split('/')
-    n = min(len(ca), len(cb))
-    return ca[:n] == cb[:n]
-
-
-def receive_conflict(api: Tuple[Optional[str], Optional[str]],
-                     remote: Tuple[frozenset, Optional[str]]) -> bool:
-    """Could an API worker with footprint `api` and a remote worker with
-    footprint `remote` both write into one tree? Only when the API serves a
-    target that overlaps (equals, or is an ancestor or a descendant of) a
-    target the local sender writes into, and the API does not reserve the
-    sender's client id (`reserved != client id`): a reserved id is refused by
-    the API, so it can never write there. A remote worker without a client id
-    writes nothing. Overlap, not equality, so the gate only ever holds more
-    than an equality test would. Only the remote side is ever held (see
-    `BackupDaemon._spawn_held_by_receive_writer`)."""
-    target, reserved = api
-    targets, client_id = remote
-    if client_id is None or target is None:
-        return False
-    return reserved != client_id and any(_datasets_overlap(target, t) for t in targets)
-
-
-class _Hold:
-    """One held `remote` spawn: the epoch the hold was logged for, the old
-    incarnation(s) it waits for (`{name: Process}`), the verb the spawn was
-    first asked with, when the hold began (`_monotonic()`) and when its
-    long-hold WARNING was last logged."""
-
-    __slots__ = ('epoch', 'blockers', 'first_verb', 'since', 'warned_at')
-
-    def __init__(self, epoch, blockers, first_verb, since):
-        self.epoch = epoch
-        self.blockers = blockers
-        self.first_verb = first_verb
-        self.since = since
-        self.warned_at: Optional[float] = None
 
 
 class _BindProblem(str):
@@ -1031,16 +940,6 @@ class BackupDaemon:
         #: `api` worker binds). `_try_reload` must not probe an address a
         #: live, possibly draining, API worker already holds.
         self._worker_addr: Dict[str, Tuple[str, int]] = {}
-        #: `(epoch, footprint)` of each live-or-dead `api`/`remote` incarnation,
-        #: recorded by `_spawn` from the `Handoff` it was forked under
-        #: (`api_footprint` / `remote_footprint`). A missing entry (a worker
-        #: recorded by hand, as tests do) never holds anything back.
-        self._worker_fp: Dict[str, Tuple[int, tuple]] = {}
-        #: `remote` spawns the receive-writer gate is holding, by name, as
-        #: `_Hold` records. The name is also in
-        #: `_restart_at` and `_deferred_spawns`, so the `due` loop retries it
-        #: and `applied=` waits.
-        self._receive_gate_held: Dict[str, '_Hold'] = {}
         #: Workers that survived SIGKILL and were left behind by
         #: `_shutdown_workers`. `main()` hard-exits when this is non-empty:
         #: multiprocessing's atexit handler would otherwise `join()` them
@@ -1217,24 +1116,13 @@ class BackupDaemon:
         #
         # The client id rides the same `Handoff` (a changed id is a reload,
         # never a separate value read here). The API worker gets the database
-        # path for its TLS identity and trust view (and the id, only while a local
-        # destination shares the backup target); the remote worker
+        # path for its TLS identity and trust view only; the remote worker
         # gets the TLS directory (its default client identity) and the id;
         # the pruning worker gets the id alone (its local copies' home).
         h = self._handoff
         extra = {}
         if name == 'api':
             extra['config_db'] = self.resolved_config
-            # Only while a local destination shares the backup target: the
-            # server then reserves this host's id (`create_app`). Otherwise
-            # the API worker is born exactly as before. This is also what
-            # decides whether the API and remote workers can both write into
-            # `<target>/<id>`: `api_footprint` / `remote_footprint` read the
-            # same test, and `_spawn_held_by_receive_writer` keeps a new remote
-            # worker from starting while an older API worker could still commit
-            # into the same tree.
-            if shared_receive_target(h.config) is not None:
-                extra['client_id'] = h.client_id
         elif name == 'remote':
             extra['tls_dir'] = _tls_dir(self.resolved_config)
             extra['client_id'] = h.client_id
@@ -1346,21 +1234,11 @@ class BackupDaemon:
         (no failure counted), the difference counts as one supervisor read
         towards confirming the drain, and `None` is returned. During a drain
         nothing is spawned at all.
-
-        **Receive-writer gate.** After the skew guard, a `remote` spawn that
-        an older API worker could still conflict with
-        (`_spawn_held_by_receive_writer`) is held the same way: returned as
-        `None`, retried by the `due` loop, no failure counted. A held turnover
-        keeps 'Reloaded' and a newly needed worker 'Started' when it is finally
-        forked.
         """
         if self._version_skew is not None:
             return None
         if self._spawn_blocked_by_skew(name):
             return None
-        if self._spawn_held_by_receive_writer(name, verb):
-            return None
-        verb = self._release_receive_hold(name, verb)
         dispose_all()
         if multiprocessing.get_start_method() == 'fork':
             others = [t.name for t in threading.enumerate() if t is not threading.current_thread()]
@@ -1385,10 +1263,6 @@ class BackupDaemon:
         self._started_at[name] = self._monotonic()
         self._lost.discard(name)
         self._worker_addr[name] = (h.config.api_host, h.config.api_port)
-        if name == 'api':
-            self._worker_fp[name] = (h.epoch, api_footprint(h.config, h.client_id))
-        elif name == 'remote':
-            self._worker_fp[name] = (h.epoch, remote_footprint(h.config, h.client_id))
         if self._tracks_orphans():
             self._worker_token[name] = procident.start_token(worker.pid)
             self._worker_fs[name] = self._current_forkserver()
@@ -1400,145 +1274,6 @@ class BackupDaemon:
         self._restart_at.pop(name, None)
         self._deferred_spawns = self._deferred_spawns - {name}
         return worker
-
-    def _spawn_held_by_receive_writer(self, name: str, verb: str = 'Started') -> bool:
-        """`_spawn`'s second guard: a new `remote` worker never starts beside
-        an older generation's API worker that could still commit into a tree
-        the new local sender writes.
-
-        Only the REMOTE side is held. The API worker and the remote worker
-        can both write into `<target>/<client id>`, but only while a local
-        destination overlaps the API's target AND the API does not reserve the
-        sender's client id (`receive_conflict` over `api_footprint` /
-        `remote_footprint`, recorded by `_spawn` for every incarnation). So a
-        NEW `remote` is held while an alive `api` of another epoch conflicts
-        with the new remote's footprint: a client-id change while shared, or a
-        loopback destination turned local with the server target moved or
-        disabled (or any other overlap the old API did not reserve) -- an API
-        receive can outlive its
-        loopback sender (`WS_FINAL_ACK_TIMEOUT`) and commit after the new
-        sender decided `-F`. Entering the shared target holds the new remote
-        behind the old, non-reserving API; leaving it holds nothing (the old
-        API reserved the id, so it never wrote there).
-
-        **A new `api` is never held** behind an old `remote`. The API writes
-        `<target>/<id>` only for a client BOUND to `<id>`, and the only holder
-        of a key for this host's own id is this host's own remote worker, which
-        never has two incarnations at once (same-kind succession: a respawn
-        waits for its predecessor's exit, and the remote worker waits for its
-        abandoned write children on a reload). Two hosts sharing one client id
-        is a misconfiguration and out of scope. Holding the API would take the
-        server offline for every client for as long as the old remote's current
-        dataset (hours), or for ever behind a stuck child.
-
-        Steady state (a crash restart on the same epoch) holds nothing. A held
-        worker goes into `_restart_at` (retried by the `due` loop of
-        `_check_workers` within a poll) and `_deferred_spawns` (so `applied=`
-        is published only once it exists). Nothing blocks or waits: the old
-        API worker leaves on its own at its next safe point, and a lost
-        forkserver orphan counts while its pid lives (`_drain_worker_running`).
-        A drain for an upgrade wins (`_spawn` returns before this check) and
-        every caller already refuses to fork into a shutdown. One INFO per
-        held worker per epoch, a WARNING once the hold has lasted
-        `RELOAD_DEFER_NOTICE` (`_log_receive_holds`); the release is logged by
-        `_release_receive_hold`.
-
-        **Residuals this does not close:** the gate watches worker PIDS, not
-        receive children.
-        - A worker killed by SIGKILL or the OOM killer, and the API worker's
-          `died` exit (the server thread died: it skips the stream-gate
-          drain), can leave a `zfs receive` child committing after the worker
-          pid is gone.
-        - An exception escaping `BaseWorker.run` before `_finish` (a crash,
-          exit 1) skips the remote worker's wait for its abandoned children.
-        - After a real supervisor death, or a stop followed by a new daemon,
-          the new daemon waits on `<db>.workers.lock`, which exec'd `zfs`
-          children do not hold.
-        - The remote worker's wait for abandoned write children
-          (`REMOTE_STUCK_WRITE_WAIT`) is bounded: on expiry it logs one
-          WARNING and exits, and the successor may race the child.
-        - The pruning worker's timed local destroys are not waited for
-          (pre-existing)."""
-        if name != 'remote':
-            return False
-        h = self._handoff
-        mine = remote_footprint(h.config, h.client_id)
-        recorded = self._worker_fp.get('api')
-        if not (
-            recorded is not None and recorded[0] != h.epoch
-            and receive_conflict(recorded[1], mine)
-            and self._drain_worker_running('api')
-        ):
-            return False
-        blockers = {'api': self._workers['api']}
-        now = self._monotonic()
-        self._restart_at[name] = now + RECEIVE_GATE_RECHECK
-        self._deferred_spawns = self._deferred_spawns | {name}
-        held = self._receive_gate_held.get(name)
-        new_line = held is None or held.epoch != h.epoch
-        if held is None:
-            held = self._receive_gate_held[name] = _Hold(h.epoch, blockers, verb, now)
-        elif verb == 'Reloaded':
-            held.first_verb = verb
-        held.epoch = h.epoch
-        held.blockers = blockers
-        if new_line:
-            logger.info(
-                "the receive targets changed: waiting for the old api worker to "
-                f"finish its receives before starting the remote worker on "
-                f"generation {_gen(h.key)}"
-            )
-        return True
-
-    def _log_receive_holds(self) -> None:
-        """A held spawn is not in `_workers`, so `_log_deferred_switches`
-        never mentions it: one WARNING per hold that has lasted
-        `RELOAD_DEFER_NOTICE`, then every `RELOAD_DEFER_REPEAT`, naming the
-        blocking old worker."""
-        now = self._monotonic()
-        for name, hold in sorted(self._receive_gate_held.items()):
-            if now - hold.since < RELOAD_DEFER_NOTICE:
-                continue
-            if hold.warned_at is not None and now - hold.warned_at < RELOAD_DEFER_REPEAT:
-                continue
-            hold.warned_at = now
-            who = ', '.join(
-                f"{other} worker (pid={getattr(w, 'pid', None)})"
-                for other, w in hold.blockers.items()
-            )
-            logger.warning(
-                f"the {name} worker has been waiting {now - hold.since:.0f}s for the "
-                f"old {who} to finish its receives (in-flight receives are never "
-                f"interrupted); it starts on generation {_gen(self._handoff.key)} "
-                "as soon as that worker has exited"
-            )
-
-    def _release_receive_hold(self, name: str, verb: str) -> str:
-        """`_spawn` is going ahead for `name`: if the gate was holding it, say
-        so once and return the verb it was first asked with (a held
-        turnover stays 'Reloaded', a newly needed worker 'Started', although
-        the `due` loop retries it as 'Restarted'). The wording says whether
-        the blocker finished or whether a later reload removed the conflict
-        while it still runs."""
-        held = self._receive_gate_held.pop(name, None)
-        if held is None:
-            return verb
-        still = [
-            other for other, w in held.blockers.items()
-            if self._workers.get(other) is w and self._drain_worker_running(other)
-        ]
-        gen = _gen(self._handoff.key)
-        if still:
-            logger.info(
-                f"the old {' and '.join(still)} worker no longer conflicts with the "
-                f"{name} worker on generation {gen}: starting it"
-            )
-        else:
-            logger.info(
-                f"the old {' and '.join(held.blockers)} worker has exited: starting the "
-                f"{name} worker on generation {gen}"
-            )
-        return held.first_verb if held.first_verb in ('Reloaded', 'Started') else verb
 
     def _forget_worker(self, name: str, *, keep_failures: bool = True) -> None:
         """Drop the bookkeeping of a worker that is gone for good (a turnover
@@ -1554,8 +1289,6 @@ class BackupDaemon:
         self._worker_token.pop(name, None)
         self._worker_fs.pop(name, None)
         self._worker_addr.pop(name, None)
-        self._worker_fp.pop(name, None)
-        self._receive_gate_held.pop(name, None)
         self._lost.discard(name)
         self._deferred_spawns = self._deferred_spawns - {name}
         if not keep_failures:
@@ -1723,29 +1456,6 @@ class BackupDaemon:
         during a shutdown any code 3 is just a normal exit. Respawning only
         a worker that is already dead is also what keeps the API port free:
         a replacement `ApiWorker` never exists beside the old one.
-
-        **Receive-writer gate (remote side only).** The API worker (client
-        receives) and the remote worker (a local destination's receive) can
-        both write into `<target>/<client id>`: when a local destination
-        overlaps the API's target and the API does not reserve the sender's
-        client id. The remote worker is respawned as soon as ITS old
-        incarnation exits, so without a gate the new local sender could decide
-        `-F` against a base while the old API worker, still draining (an API
-        receive can outlive its loopback sender), commits a newer snapshot, and
-        ZFS's overlapping-receive protection no longer applies once that
-        receive has exited. Each incarnation records a footprint at spawn
-        (`api_footprint`, `remote_footprint`) and
-        `_spawn_held_by_receive_writer` holds a new `remote` while an alive
-        `api` of another epoch conflicts with it (`receive_conflict`) --
-        turnover, crash restart and lost replacement alike, recomputed from
-        the incarnations alive now (lost forkserver workers count while their
-        pid lives). A new `api` is NEVER held (it would take the server
-        offline for every client; the rationale and the residuals are in
-        `_spawn_held_by_receive_writer`). Snapshot and pruning workers are not
-        affected; a worker the new config no longer needs is retired as
-        usual; a stop or an upgrade drain wins. The remote worker itself waits,
-        bounded, for abandoned write children before it exits for a reload or
-        an upgrade (`RemoteBackupWorker._wait_for_stuck_writes`).
 
         **Lost workers (forkserver death).** Under `forkserver` a dead
         forkserver makes `poll()` report every worker dead while they still
@@ -1948,7 +1658,6 @@ class BackupDaemon:
         if self._version_skew is None:
             # (A drain has its own periodic WARNING, `_log_version_drain`.)
             self._log_deferred_switches()
-            self._log_receive_holds()
         self._maybe_complete()
         if self._ready_pending and not self._deferred_spawns:
             self._ready_pending = False
@@ -1989,9 +1698,8 @@ class BackupDaemon:
         if self._applied_epoch >= h.epoch:
             return
         if self._deferred_spawns:
-            # A respawn the skew guard or the receive-writer gate deferred:
-            # that worker does not exist yet, so the generation is not
-            # applied by every worker.
+            # A respawn the skew guard deferred: that worker does not exist
+            # yet, so the generation is not applied by every worker.
             return
         for name in self._workers:
             if name in self._restart_at:

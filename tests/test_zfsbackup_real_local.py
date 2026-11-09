@@ -66,9 +66,7 @@ from zfsbackup.config import (
     DatasetConfig,
     Destination,
     RemoteDatasetConfig,
-    RemoteServerConfig,
     RetentionRule,
-    shared_receive_target,
 )
 from zfsbackup.health import ensure_status_dir, read_worker_status
 from zfsbackup.local import LocalBackupManager
@@ -356,8 +354,6 @@ class _RigTests:
     ROOT = None
     #: the target is created with `sharesmb=on`, which a copy inherits unless its own `sharesmb=off` is local
     TARGET_SHARESMB = False
-    #: the target is ALSO the enabled `remote_backup.target_dataset` (a local target shared with the server)
-    SHARED = False
 
     @pytest.fixture
     def rig(self, pools, tmp_path, caplog):
@@ -389,10 +385,7 @@ class _RigTests:
                 )],
                 destinations={DEST: Destination(url=f'zfs:{dst}')},
                 snapshot_prefix='autosnap',
-                remote_backup=(RemoteServerConfig(target_dataset=dst, enabled=True)
-                               if self.SHARED else None),
             )
-            assert (shared_receive_target(config) == dst) is self.SHARED
             manager = DatasetManager(config)
             mgr = LocalBackupManager(config, manager, client_id=CLIENT_ID)
             caplog.set_level(logging.DEBUG, logger='zfsbackup.local')
@@ -906,169 +899,6 @@ class TestRealLocalPruneNeverRecursive(_RigTests):
 
         assert set(rig.copy_snaps()) == {names[-1]}
         assert _snapshot_guids(child) == child_before
-
-
-# ---------------------------------------------------------------------------
-# A local target shared with the server (docs/local_destination_plan.md addendum)
-# ---------------------------------------------------------------------------
-
-#: The id of a remote client whose tree lives beside this host's own under the shared target.
-REMOTE_CLIENT = 'remote-host'
-
-
-class TestRealLocalSharedTarget(_RigTests):
-    """`T` is both the server's `remote_backup.target_dataset` and the target of the local destination:
-    this host's copies land at `T/<own id>/...` beside a remote client's `T/<its id>/...`, and ONE pruning
-    worker prunes both -- each by the retention stamped on it -- without touching the other tree.
-
-    The remote client's tree is planted the way a receive makes one (owned containers, a stamped leaf):
-    a true two-host setup needs a second machine; the server side only ever sees properties and
-    snapshots, which is what is planted. Not mutation-checked (the real tier needs a pool)."""
-
-    SHARED = True
-
-    @staticmethod
-    def plant_remote_leaf(rig, hours, keep_for, client_id=REMOTE_CLIENT, leaf_name='zfsbackup_remote'):
-        """`T/<client_id>/<pool>/<leaf_name>` (default: the remote client's), stamped by `client_id` with a
-        config that keeps 1h slots for `keep_for`, holding one snapshot per entry of `hours`.
-        -> `(leaf, {snapshot: guid})`."""
-        base = f'{rig.target}/{client_id}'
-        parent = f'{base}/{rig.pools.src}'
-        for container in (base, parent):
-            _zfs_run('create', '-u', '-o', 'canmount=noauto', '-o', f'{PROP_CLIENT_ID}={client_id}',
-                     container)
-        source = f'{rig.pools.src}/{leaf_name}'
-        leaf = f'{parent}/{leaf_name}'
-        config = DatasetConfig(
-            name=source, frequency=timedelta(hours=1),
-            retention_rules=[RetentionRule(timedelta(hours=1), keep_for)],
-        ).to_property()
-        _zfs_run('create', '-u', '-o', 'canmount=noauto', '-o', f'{PROP_CLIENT_ID}={client_id}',
-                 '-o', f'{PROP_SOURCE_DATASET}={source}', '-o', f'{PROP_CONFIG}={config}', leaf)
-        for h in hours:
-            _zfs_run('snapshot', f'{leaf}@{snap_name_at(h)}')
-        return leaf, _snapshot_guids(leaf)
-
-    def history(self, rig, hours):
-        names = []
-        for h in hours:
-            rig.write(f'f{h}.bin', 1)
-            names.append(rig.snapshot(h))
-        return names
-
-    def prune(self, rig, mocker, sdir):
-        worker = PruningWorker(rig.config, StopFlag(), status_dir=sdir, client_id=CLIENT_ID)
-        mocker.patch.object(worker, '_wait', return_value=ExitReason.STOP)
-        worker.run()
-        return _statuses(sdir, 'pruning-worker')
-
-    def test_both_trees_live_under_the_one_target_and_are_pruned_by_their_own_rules(
-            self, rig, sdir, mocker):
-        first = self.history(rig, [8])[0]
-        assert rig.cycle() is True
-        rest = self.history(rig, [7, 6, 0.2])
-        assert rig.cycle() is True
-        names = [first] + rest
-        assert set(rig.copy_snaps()) == set(names)
-
-        # this host's copy sits at T/<own id>/..., stamped like any client's copy
-        assert rig.copy == f'{rig.target}/{CLIENT_ID}/{rig.src}'
-        assert _zfs_get_local(rig.copy, PROP_CLIENT_ID) == CLIENT_ID
-        assert _zfs_get_local(rig.copy, PROP_SOURCE_DATASET) == rig.src
-
-        # a remote client's tree beside it, with a LONG retention: nothing of it may go
-        leaf, remote_before = self.plant_remote_leaf(rig, (9, 8, 0.3), timedelta(days=30))
-        assert leaf.startswith(f'{rig.target}/{REMOTE_CLIENT}/')
-        assert len(remote_before) == 3
-        source_before = rig.local_snaps()
-
-        records = self.prune(rig, mocker, sdir)
-
-        # the own copy: the stamped 1h/2h rule leaves only the newest
-        assert set(rig.copy_snaps()) == {names[-1]}
-        assert rig.copy_snaps()[names[-1]] == rig.local_snaps()[names[-1]]
-        # the remote client's tree: its own (long) rule keeps everything, its guids are unchanged
-        assert _snapshot_guids(leaf) == remote_before
-        assert rig.local_snaps() == source_before
-        # one prune record per tree, no duplicate listing of the own copy
-        assert records[('prune', rig.copy, None)].result == 'ok'
-        assert records[('prune', leaf, None)].result == 'ok'
-        assert records[('discover', rig.target, DEST)].result == 'ok'
-        assert records[('discover', rig.target, DEST)].detail == '1 local copy'
-
-        # the surviving newest is still the base of the next incremental step
-        newer = self.history(rig, [0.1])[0]
-        assert rig.cycle() is True
-        assert set(rig.copy_snaps()) == {names[-1], newer}
-        assert _snapshot_guids(leaf) == remote_before
-
-    def test_the_remote_clients_short_retention_prunes_only_its_own_tree(self, rig, sdir, mocker):
-        names = self.history(rig, [8, 7, 0.2])
-        assert rig.cycle() is True
-        leaf, remote_before = self.plant_remote_leaf(rig, (9, 8, 0.3), timedelta(hours=2))
-        own_before = rig.copy_snaps()
-        assert set(own_before) == {names[-1]}                  # a first full sends the newest only
-
-        self.prune(rig, mocker, sdir)
-
-        remaining = _snapshot_guids(leaf)
-        assert len(remaining) == 1 and set(remaining) <= set(remote_before)
-        newest_remote = max(remote_before, key=lambda n: n)
-        assert set(remaining) == {newest_remote} and remaining[newest_remote] == remote_before[newest_remote]
-        assert rig.copy_snaps() == own_before                  # the remote rule never reached our copy
-
-    def test_the_own_copy_is_listed_and_pruned_once_per_cycle(self, rig, sdir, mocker):
-        """The server's `received_datasets()` finds the own copy and the local discovery finds it again:
-        the pruning worker must keep ONE entry (the received one, untimed, `local_target is None`) and
-        call `prune_snapshots` once for the copy. Without the de-duplication the second pass would find
-        nothing to destroy, so only the listing and the call count can tell."""
-        self.history(rig, [8])
-        assert rig.cycle() is True
-        self.history(rig, [7, 6, 0.2])
-        assert rig.cycle() is True
-        assert len(rig.copy_snaps()) == 4
-        leaf, _ = self.plant_remote_leaf(rig, (1,), timedelta(days=1))
-
-        worker = PruningWorker(rig.config, StopFlag(), client_id=CLIENT_ID)
-        listed = worker._get_datasets(rig.manager)
-        assert [d.name for d in listed].count(rig.copy) == 1
-        assert len({d.name for d in listed}) == len(listed)
-        (entry,) = [d for d in listed if d.name == rig.copy]
-        assert entry.local_target is None                      # the received (server) entry won
-
-        calls = []
-        real = DatasetManager.prune_snapshots
-
-        def spy(manager, dsi, *args, **kwargs):
-            calls.append(dsi.name)
-            return real(manager, dsi, *args, **kwargs)
-
-        with mock.patch.object(DatasetManager, 'prune_snapshots', autospec=True, side_effect=spy):
-            self.prune(rig, mocker, sdir)
-
-        assert calls.count(rig.copy) == 1, calls
-        assert calls.count(leaf) == 1, calls
-        assert len(set(calls)) == len(calls), calls
-
-    def test_the_servers_discovery_lists_each_trees_own_id_and_the_local_discovery_only_ours(self, rig):
-        """`T/<own id>`, `T/<remote id>` and a prefix-sibling `T/<own id>x` are separate trees: the
-        server's `received_datasets()` lists all three under their own `client_id`, the local discovery
-        (`local_copies`) only the first."""
-        self.history(rig, [2])
-        assert rig.cycle() is True
-        remote_leaf, _ = self.plant_remote_leaf(rig, (1,), timedelta(days=1))
-        sibling = f'{CLIENT_ID}x'
-        sibling_leaf, _ = self.plant_remote_leaf(
-            rig, (1,), timedelta(days=1), client_id=sibling, leaf_name='zfsbackup_sibling')
-
-        found = {d.name: d for d in rig.manager.received_datasets()}
-        assert {rig.copy, remote_leaf, sibling_leaf} <= set(found)
-        for name, owner in ((rig.copy, CLIENT_ID), (remote_leaf, REMOTE_CLIENT), (sibling_leaf, sibling)):
-            assert _zfs_get_local(name, PROP_CLIENT_ID) == owner
-
-        local = {d.name for d in rig.manager.local_copies(CLIENT_ID)}
-        assert local == {rig.copy}
-        assert remote_leaf not in local and sibling_leaf not in local
 
 
 # ---------------------------------------------------------------------------

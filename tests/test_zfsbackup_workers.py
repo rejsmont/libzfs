@@ -1032,11 +1032,9 @@ EXTRA_KEYWORDS = {
 }
 
 #: The pruning worker's `client_id` (the local copies' home, 3.2) is declared
-#: after `code_signature`; so is the API worker's (this host's id, which the server
-#: reserves only while a local destination shares its target).
+#: after `code_signature`.
 TRAILING_KEYWORDS = {
     PruningWorker: ['client_id'],
-    ApiWorker: ['client_id'],
 }
 
 
@@ -1171,15 +1169,9 @@ class TestM9WorkerArguments:
         assert worker.client_id == 'host-1'
         assert PruningWorker(worker_config, multiprocessing.Event()).client_id is None
 
-    def test_the_api_worker_keeps_the_client_id(self, worker_config):
-        """Shared local target: the server reserves this host's own id."""
-        worker = ApiWorker(worker_config, multiprocessing.Event(), client_id='host-1')
-        assert worker.client_id == 'host-1'
-        assert ApiWorker(worker_config, multiprocessing.Event()).client_id is None
-
     def test_the_other_classes_do_not_take_each_others(self, worker_config):
         with pytest.raises(TypeError):
-            ApiWorker(worker_config, multiprocessing.Event(), tls_dir='x')
+            ApiWorker(worker_config, multiprocessing.Event(), client_id='x')
         with pytest.raises(TypeError):
             RemoteBackupWorker(worker_config, multiprocessing.Event(), config_db=object())
 

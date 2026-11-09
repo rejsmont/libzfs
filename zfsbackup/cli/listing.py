@@ -44,17 +44,13 @@ Durations are shown as typed (`30d` stays `30d`, never `1M`).
     list destinations --json  ->  [
       {"name": str, "kind": "remote" | "local", "url": str,
        "target_dataset": str | null, "server_fingerprint": str | null,
-       "datasets": [str, ...], "shared": bool}, ...
+       "datasets": [str, ...]}, ...
     ]            # "kind": "local" for a `zfs:<dataset>` URL (a dataset on this host, no
                  #   server), else "remote"; "target_dataset": the dataset of a local
                  #   destination, null for a remote one; "server_fingerprint": the full
                  #   pinned SHA-256 (64 lowercase hex), null = not enrolled (always null
                  #   for a local destination); "datasets": the datasets that send to it,
-                 #   in stored order; "shared": true for a local destination whose target
-                 #   is exactly the enabled `remote_backup.target_dataset` (this host's own
-                 #   copies then live beside the clients' under that target)
-
-The text view marks such a destination `local (shared)` in the KIND column.
+                 #   in stored order
 
 The text view's ENROLLED column shows the first 16 hex characters of the pinned
 fingerprint, or `not enrolled`; a local destination has no server, so it shows `-`.
@@ -68,7 +64,6 @@ import json
 from typing import Any, Dict, List, Optional
 
 from zfsbackup.cli.render import duration_literal
-from zfsbackup.cli.write import shared_local_destinations
 from zfsbackup.config import BackupConfig, DatasetConfig, RetentionRule
 
 __all__ = ["render_datasets", "render_destinations"]
@@ -182,7 +177,6 @@ def render_destinations(config: BackupConfig, *, enabled_only: bool = False, as_
         for r in ds.remote:
             referrers.setdefault(r.destination, []).append(ds.name)
 
-    _, shared = shared_local_destinations(config)
     entries = [
         {
             "name": name,
@@ -191,7 +185,6 @@ def render_destinations(config: BackupConfig, *, enabled_only: bool = False, as_
             "target_dataset": dest.target_dataset,
             "server_fingerprint": dest.server_fingerprint,
             "datasets": referrers.get(name, []),
-            "shared": name in shared,
         }
         for name, dest in sorted(config.destinations.items())
         if referrers.get(name) or not enabled_only
@@ -203,7 +196,7 @@ def render_destinations(config: BackupConfig, *, enabled_only: bool = False, as_
     rows = [
         [
             e["name"],
-            e["kind"] + (" (shared)" if e["shared"] else ""),
+            e["kind"],
             e["url"],
             (
                 "-" if e["kind"] == "local"
