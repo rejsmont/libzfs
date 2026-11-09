@@ -40,7 +40,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy.exc import DatabaseError, OperationalError
 
-from zfsbackup.config import BackupConfig
+from zfsbackup.config import BackupConfig, shared_receive_target
 from zfsbackup.config.model import _same
 from zfsbackup.config.store import (
     CONFIG_PATH_ENV,
@@ -1116,13 +1116,19 @@ class BackupDaemon:
         #
         # The client id rides the same `Handoff` (a changed id is a reload,
         # never a separate value read here). The API worker gets the database
-        # path for its TLS identity and trust view only; the remote worker
+        # path for its TLS identity and trust view (and the id, only while a local
+        # destination shares the backup target); the remote worker
         # gets the TLS directory (its default client identity) and the id;
         # the pruning worker gets the id alone (its local copies' home).
         h = self._handoff
         extra = {}
         if name == 'api':
             extra['config_db'] = self.resolved_config
+            # Only while a local destination shares the backup target: the
+            # server then reserves this host's id (`create_app`). Otherwise
+            # the API worker is born exactly as before.
+            if shared_receive_target(h.config) is not None:
+                extra['client_id'] = h.client_id
         elif name == 'remote':
             extra['tls_dir'] = _tls_dir(self.resolved_config)
             extra['client_id'] = h.client_id

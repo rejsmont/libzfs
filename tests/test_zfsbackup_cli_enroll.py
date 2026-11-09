@@ -773,6 +773,35 @@ class TestServerAnswers:
         fixed = srv.token(client_id=CID, replace=True)
         assert do_enroll(run, client, srv, fixed, fname="fixed").exit_code == 0
 
+    def test_a_reserved_client_id_is_explained_and_the_token_stays_usable(
+        self, run, client, make_server, reloads
+    ):
+        """The server's own local destination shares its backup target, so it reserves its own client id:
+        `/enroll` answers 409 `reserved_client_id` with the token unspent. The real server, the real CLI."""
+        srv = make_server(reserved_client_id=CID)
+        token = srv.token()
+        before = db_state(client)
+        result = do_enroll(run, client, srv, token)
+        assert result.exit_code == 1
+        err = " ".join(result.stderr.split())
+        assert "reserves this client id" in err
+        assert "the id of the server host itself" in err
+        assert "local destination shares the server's backup target" in err
+        assert "the token was not used and is still valid" in err
+        assert "zfsbackup-config identity set-client-id ID" in err and "--force" in err
+        assert "enroll again with the same token" in err
+        assert "Server: " in err                                   # the server's own text is appended
+        assert token not in result.stderr and token not in result.stdout
+        assert srv.token_state() == "active"
+        assert srv.pins() == {} and srv.clients() == {}
+        untouched(client, before, reloads)
+
+        # the fix the message names: another client id, the SAME token
+        seed_client_id(client, "another-host")
+        again = do_enroll(run, client, srv, token, fname="again")
+        assert again.exit_code == 0, again.stderr
+        assert srv.token_state() == "consumed"
+
     def test_a_certificate_bound_to_another_id_says_how_to_resolve_it(
         self, run, client, make_server, reloads
     ):

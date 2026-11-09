@@ -174,6 +174,15 @@ UNAUTHENTICATED_ENDPOINTS = frozenset({'health', 'enroll'})
 #: protocol would pin a client its daemon then cannot use.
 PROTOCOL_EXEMPT_ENDPOINTS = frozenset({'health'})
 
+#: The routes that read or write a client's tree under the backup target:
+#: refused for the reserved client id (`create_app(reserved_client_id=)`).
+RESERVED_CLIENT_ENDPOINTS = frozenset({
+    'backup_negotiate', 'backup_stream', 'backup_resume_token',
+})
+
+#: The `reason` of the 409 a reserved client id gets (routes and `/enroll`).
+RESERVED_CLIENT_REASON = 'reserved_client_id'
+
 #: The stream-header parser, the declared-base check, the canonical config, the
 #: retention-horizon helpers, the server snapshot rows and the `-F` decision live in
 #: `zfsbackup.receiver` (pure; shared with the local destination, which must not import
@@ -2129,6 +2138,7 @@ def create_app(
     *,
     clock: Callable[[], float] = time.time,
     peer_limits: Optional['PeerLimits'] = None,
+    reserved_client_id: Optional[str] = None,
 ) -> Flask:
     """The API's Flask app. There is no unauthenticated mode.
 
@@ -2146,6 +2156,12 @@ def create_app(
     (plan S-3), also published as `app.extensions['zfsbackup.peer_limits']` for
     the server (accept-time limits) and the trust-poll thread (the hourly
     summary); here it guards `/enroll` and throttles the refusal log lines.
+    `reserved_client_id` (default `None`: no reservation) is this host's own
+    client id while a local destination shares the server's target
+    (`config.shared_receive_target`; the API worker passes it): the copies
+    that destination writes live under `<target>/<that id>/`, so the server
+    refuses to also serve a remote client bound to it -- see "The reserved
+    client id" below.
 
     **Authentication** (`before_request`; it also runs on the websocket
     upgrade of `/stream`, so it is checked when a request or a stream
@@ -2183,6 +2199,23 @@ def create_app(
     `<target>/<bound id>/...`; `org.zfsbackup:client_id` is written from the
     binding, and an existing server dataset that records a different id is
     refused with 409.
+
+    **The reserved client id.** With `reserved_client_id` set, a client BOUND
+    to that id (`g.client_id`) is answered 409 `{"error", "reason":
+    "reserved_client_id"}` on `negotiate`, `stream` and `resume_token`, and an
+    `/enroll` that would bind it is refused the same way (below). The route
+    check runs in `_authenticate`, after authentication and the protocol check
+    (so 401/403/426 come first) and before the route: no `zfs` call, claim,
+    pending-map entry, header read, `receive -A` or spawn happens for such a
+    request, and a websocket upgrade is refused as an ordinary HTTP 409.
+    `/whoami`, `/rotate` and `/health` are unchanged. The operator frees the
+    id by revoking the remote client holding it (`zfsbackup-config trust
+    revoke --client <id>`); a reload restarts the API worker, so the
+    reservation follows the configuration. A reload does not cut a receive
+    already running for the reserved id: the old API worker drains it while
+    the new remote worker may already send the local copy into the same
+    dataset, and ZFS refuses the overlapping receive (a failed or redundant
+    cycle, never a corrupt copy).
 
     The trust endpoints' wire contract is in the docstrings of `enroll`,
     `rotate` and `whoami` below."""
@@ -2743,6 +2776,32 @@ def create_app(
             )
         return locked
 
+    def _reserved_message() -> str:
+        return (
+            f"client id {reserved_client_id!r} is reserved on this server: it is the "
+            f"id of the server host itself, whose local destination shares the backup "
+            f"target {target}. This client needs another client id and a new "
+            "enrollment (see \"Sharing the server's target\" in the zfsbackup README)"
+        )
+
+    def _reserved_refusal(what: str):
+        """The 409 for a request that would act as, or bind, the reserved
+        client id (`what` words the log line); one WARNING per hour (the
+        `reserved` kind of the peer-log throttle, keyed by the id), naming
+        the command that clears it. A pure refusal: no `zfs` call, no state."""
+        limits.log.log(
+            'reserved', reserved_client_id, logging.WARNING,
+            "API: refusing %s from %s: the server reserves client id %r because "
+            "its own local destination shares the backup target %s, so a remote "
+            "client bound to it is refused until the target is no longer shared; "
+            "to remove that client's trust: zfsbackup-config trust revoke "
+            "--client %s",
+            what, request.remote_addr, reserved_client_id, target, reserved_client_id,
+        )
+        return jsonify({
+            'error': _reserved_message(), 'reason': RESERVED_CLIENT_REASON,
+        }), 409
+
     @app.before_request
     def _authenticate():
         """Route authentication and the protocol check; see `create_app`.
@@ -2798,6 +2857,15 @@ def create_app(
             return jsonify({'error': 'client_id mismatch', 'bound': pin.client_id}), 403
         if pin.predecessor is not None:
             _retire_predecessor(fingerprint, pin.predecessor)
+        if (
+            reserved_client_id is not None
+            and pin.client_id == reserved_client_id
+            and request.endpoint in RESERVED_CLIENT_ENDPOINTS
+        ):
+            # Last, so authentication is complete, and before the route: no
+            # claim, `zfs` call, pending entry, header read or spawn. For
+            # `/stream` this refuses the websocket upgrade like a 401/403.
+            return _reserved_refusal(f"{request.method} {request.path}")
         return None
 
     @app.errorhandler(RequestEntityTooLarge)
@@ -3038,8 +3106,15 @@ def create_app(
         - Check order: shape 400 -> grammar 400 -> label 400 -> token parse
           400 -> token for another server 403 refused -> certificate 422 ->
           signature 403 -> in-flight cap 503 -> token pre-check 403 refused (read-only, before any
-          `zfs` call; also refuses a revoked certificate) -> `zfs.exists`
+          `zfs` call; also refuses a revoked certificate) -> reserved client
+          id 409 (only with `reserved_client_id`) -> `zfs.exists`
           503 -> the store (`enroll_client`, the authority).
+        - 409 `{"error", "reason": "reserved_client_id"}`: the id is this
+          host's own, reserved while a local destination shares the backup
+          target (`create_app`'s `reserved_client_id`). Decided after the
+          token pre-check, so only a holder of a valid token learns it, and
+          before any `zfs` call or trust write: the token was NOT spent and
+          stays valid. Not counted as a failed attempt towards the lockout.
         - 409 `{"error", "reason": "client_id_taken", "client_id", "hint"}`:
           the id is already known here (a client record, a revoked one, or an
           existing `<target>/<client_id>`) and the token is not scoped to it.
@@ -3152,6 +3227,14 @@ def create_app(
             # The pre-check cannot tell which; the client's answer is the
             # same uniform 403 either way.
             return failed('token or revoked certificate', (jsonify(ENROLL_REFUSED_ERROR), 403))
+        if reserved_client_id is not None and client_id == reserved_client_id:
+            # After the token pre-check (only a holder of a valid token, who
+            # proved possession of the key, learns the id is reserved) and
+            # before `enroll_client` consumes the token or writes any trust
+            # row; the token stays valid. Not `failed(...)`: a legitimate
+            # operator must not lock their own address out of `/enroll` by
+            # trying the reserved id, and the valid token rules out guessing.
+            return _reserved_refusal(f"enrollment as client {client_id!r}")
         try:
             client_root = Dataset(f"{target}/{client_id}")
         except Exception:

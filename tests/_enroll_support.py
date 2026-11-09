@@ -227,7 +227,7 @@ class RealServer:
 
     def __init__(self, base: Path, zfs: ZfsStub, *, remote: bool = True,
                  dry_run: bool = False, peer_limits=None, server_kwargs=None,
-                 record: bool = True) -> None:
+                 record: bool = True, reserved_client_id=None) -> None:
         base.parent.mkdir(parents=True, exist_ok=True)
         source = base.with_name(base.name + ".in.yaml")      # the import creates `base` itself
         source.write_text(REMOTE_ON if remote else REMOTE_OFF)
@@ -241,6 +241,8 @@ class RealServer:
         config.dry_run = dry_run
         # S-3: the app's own flood-control state unless a test supplies one
         extra = {} if peer_limits is None else {"peer_limits": peer_limits}
+        if reserved_client_id is not None:       # a local destination shares this server's target
+            extra["reserved_client_id"] = reserved_client_id
         self.app = api.create_app(config, self.trust.gateway, self.trust.server_fp, **extra)
         self._edits: Dict[str, Callable[[dict], None]] = {}
         if record:      # the recorder reads each body in full BEFORE the app: not for a stalled-body test

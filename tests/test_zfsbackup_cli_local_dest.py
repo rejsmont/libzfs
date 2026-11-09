@@ -258,14 +258,15 @@ class TestListLocal:
         assert data == [
             {"name": "loc", "kind": "local", "url": "zfs:backup/local",
              "target_dataset": "backup/local", "server_fingerprint": None,
-             "datasets": ["tank/a", "tank/c", "tank/two"]},
+             "datasets": ["tank/a", "tank/c", "tank/two"], "shared": False},
             {"name": "loc.two", "kind": "local", "url": "zfs:other/target",
              "target_dataset": "other/target", "server_fingerprint": None,
-             "datasets": ["tank/two"]},
+             "datasets": ["tank/two"], "shared": False},
             {"name": "offsite", "kind": "remote", "url": "https://offsite:8080",
-             "target_dataset": None, "server_fingerprint": FP, "datasets": ["tank/a", "tank/b"]},
+             "target_dataset": None, "server_fingerprint": FP, "datasets": ["tank/a", "tank/b"],
+             "shared": False},
             {"name": "spare", "kind": "remote", "url": "https://spare:8080",
-             "target_dataset": None, "server_fingerprint": None, "datasets": []},
+             "target_dataset": None, "server_fingerprint": None, "datasets": [], "shared": False},
         ]
         assert result.stderr == ""
 
@@ -1593,3 +1594,531 @@ class TestEditClientId:
         assert "new client id was stored" not in result.stderr
         assert host_client_id(rich) is None
         assert stored(rich).destinations["spare"].url == "https://spare:8080"
+
+
+# --------------------------------------------------------------------------
+# A local target shared with the server (docs/local_destination_plan.md addendum)
+# --------------------------------------------------------------------------
+
+SHARED_TARGET = "srv/backups"
+OTHER_ID = "other-host"
+
+#: The server's target is `srv/backups`; `usb` is a local destination (`USB_URL`), `spare` an
+#: unenrolled https one. `tank/a` sends to `usb`.
+SHARE_YAML = """\
+snapshot_prefix: "autosnap"
+check_interval: "5m"
+datasets:
+  - name: "tank/a"
+    frequency: "1h"
+    retention:
+      "1d": "30d"
+    remote:
+      - destination: "usb"
+remote_backup:
+  target_dataset: "srv/backups"
+  enabled: {remote_enabled}
+destinations:
+  usb:
+    url: "{usb_url}"
+  spare:
+    url: "https://spare:8080"
+"""
+
+
+def share_yaml(usb_url="zfs:srv/backups", remote_enabled="true"):
+    return SHARE_YAML.format(usb_url=usb_url, remote_enabled=remote_enabled)
+
+
+def pin_id(database, client_id, serial=0):
+    """Pin one certificate under `client_id` in the trust tables of `database`, through the real
+    store writers (what `/enroll` does on the server)."""
+    import time
+
+    from zfsbackup.config.store import EnrollOutcome, NewPin, create_token, enroll_client
+
+    resolved = resolve_config_path(str(database))
+    now = time.time()
+    _token, digest = identity.make_token(FP)
+    create_token(resolved, secret_sha256=digest, server_fingerprint=FP,
+                 created_at=now - 1, expires_at=now + 3600, lock=None)
+    pin = NewPin(f"{serial:02x}77aa88bb" + "3" * 54,
+                 "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n", now + 86400)
+    outcome = enroll_client(resolved, secret_sha256=digest, server_fingerprint=FP,
+                            client_id=client_id, pin=pin, now=now, dataset_exists=False)
+    dispose_all()
+    assert outcome == EnrollOutcome.ENROLLED
+
+
+@pytest.fixture
+def shared(run, db):
+    """A config that shares the server's target (`usb` -> zfs:srv/backups); `CID` stored; nobody enrolled."""
+    make_db(run, db, share_yaml())
+    seed_client_id(db, CID)
+    return db
+
+
+@pytest.fixture
+def unshared(run, db):
+    """The same, with `usb` on its own target; `CID` stored."""
+    make_db(run, db, share_yaml("zfs:other/target"))
+    seed_client_id(db, CID)
+    return db
+
+
+@pytest.fixture
+def loopback(unshared):
+    """`unshared` plus this host's own id `CID` enrolled with its own server (a loopback setup)."""
+    pin_id(unshared, CID)
+    return unshared
+
+
+def loopback_warnings(result):
+    return [w for w in warnings_in(result) if f"trust revoke --client {CID}" in w and "share" in w]
+
+
+class TestListShared:
+    def test_the_text_marks_the_shared_destination_only(self, run, shared):
+        rows = table(run("list", "destinations", "-c", shared))
+        assert rows[0][:2] == ["NAME", "KIND"]
+        kinds = {r[0]: " ".join(r[1:3]) if r[1] == "local" else r[1] for r in rows[1:]}
+        assert kinds["usb"].startswith("local (shared)")
+        assert kinds["spare"] == "remote"
+
+    def test_json_has_the_boolean_shared(self, run, shared):
+        data = {d["name"]: d for d in json.loads(run("list", "destinations", "--json", "-c", shared).stdout)}
+        assert data["usb"]["shared"] is True and data["spare"]["shared"] is False
+        assert all(type(d["shared"]) is bool for d in data.values())
+
+    def test_a_distinct_target_is_not_shared(self, run, unshared):
+        data = json.loads(run("list", "destinations", "--json", "-c", unshared).stdout)
+        assert [d["shared"] for d in data] == [False, False]
+        assert "(shared)" not in run("list", "destinations", "-c", unshared).stdout
+
+    def test_a_disabled_remote_backup_shares_nothing(self, run, db):
+        make_db(run, db, share_yaml(remote_enabled="false"))
+        data = json.loads(run("list", "destinations", "--json", "-c", db).stdout)
+        assert [d["shared"] for d in data] == [False, False]
+        assert "(shared)" not in run("list", "destinations", "-c", db).stdout
+
+    def test_enabled_only_keeps_the_marker(self, run, shared):
+        result = run("list", "destinations", "--enabled-only", "-c", shared)
+        assert "local (shared)" in result.stdout
+
+
+class TestTokenCreateRefusesTheOwnIdWhileShared:
+    def create(self, run, database, *args):
+        return run("trust", "token", "create", *args, "-c", database)
+
+    def test_the_hosts_own_id_is_refused_and_nothing_is_written(self, run, shared):
+        before, gen = db_state(shared), generation(shared)
+        result = self.create(run, shared, "--client-id", CID)
+        assert result.exit_code == 1
+        assert CID in result.stderr and "usb" in result.stderr and SHARED_TARGET in result.stderr
+        assert "zfsb1." not in result.stdout + result.stderr
+        assert db_state(shared) == before and generation(shared) == gen
+        assert not (shared.parent / (shared.name + ".tls")).exists(), "refused before anything is generated"
+        assert read_trust_token_state(shared) == "none"
+
+    def test_the_same_command_is_allowed_without_a_shared_target(self, run, unshared):
+        pin_id(unshared, CID)                      # a scoped token needs a known client
+        result = self.create(run, unshared, "--client-id", CID)
+        assert result.exit_code == 0, result.stderr
+        assert "zfsb1." in result.stdout
+
+    def test_another_id_is_allowed_while_shared(self, run, shared):
+        pin_id(shared, OTHER_ID)
+        result = self.create(run, shared, "--client-id", OTHER_ID)
+        assert result.exit_code == 0, result.stderr
+        assert "zfsb1." in result.stdout
+
+    def test_an_unscoped_token_is_allowed_while_shared(self, run, shared):
+        assert self.create(run, shared).exit_code == 0
+
+    def test_with_replace_it_is_still_refused(self, run, shared):
+        pin_id(shared, CID)
+        result = self.create(run, shared, "--client-id", CID, "--replace")
+        assert result.exit_code == 1
+
+    def test_without_a_stored_client_id_nothing_is_the_hosts_own(self, run, db):
+        make_db(run, db, share_yaml())
+        drop_client_id(db)
+        pin_id(db, CID)
+        assert self.create(run, db, "--client-id", CID).exit_code == 0
+
+
+def read_trust_token_state(database):
+    from zfsbackup.config.store import token_status
+    import time
+
+    try:
+        return token_status(resolve_config_path(str(database)), time.time()).state.value
+    finally:
+        dispose_all()
+
+
+class TestSetClientIdWhileShared:
+    def set_id(self, run, database, new_id, *args):
+        return run("identity", "set-client-id", new_id, *args, "-c", database)
+
+    def test_an_id_bound_to_a_live_pin_is_refused(self, run, shared):
+        pin_id(shared, OTHER_ID)
+        before, gen = db_state(shared), generation(shared)
+        result = self.set_id(run, shared, OTHER_ID)
+        assert result.exit_code == 1
+        assert OTHER_ID in result.stderr
+        assert host_client_id(shared) == CID
+        assert db_state(shared) == before and generation(shared) == gen
+
+    def test_force_does_not_override_it(self, run, shared):
+        pin_id(shared, OTHER_ID)
+        result = self.set_id(run, shared, OTHER_ID, "--force")
+        assert result.exit_code == 1 and host_client_id(shared) == CID
+
+    def test_an_id_with_a_revoked_client_record_is_refused_too(self, run, shared):
+        pin_id(shared, OTHER_ID)
+        assert run("trust", "revoke", "--client", OTHER_ID, "-c", shared).exit_code == 0
+        result = self.set_id(run, shared, OTHER_ID)
+        assert result.exit_code == 1 and host_client_id(shared) == CID
+        assert self.set_id(run, shared, OTHER_ID, "--force").exit_code == 1
+
+    def test_an_unreadable_trust_table_refuses(self, run, shared, monkeypatch):
+        def boom(*args, **kwargs):
+            raise RuntimeError("trust tables unreadable")
+
+        for module in (cli_write, trust_cli):
+            if hasattr(module, "list_clients"):
+                monkeypatch.setattr(module, "list_clients", boom)
+        result = self.set_id(run, shared, "free-id")
+        assert result.exit_code == 1 and host_client_id(shared) == CID
+
+    def test_an_id_nobody_holds_is_allowed(self, run, shared):
+        pin_id(shared, OTHER_ID)
+        result = self.set_id(run, shared, "free-id")
+        assert result.exit_code == 0, result.stderr
+        assert host_client_id(shared) == "free-id"
+
+    def test_the_same_id_is_allowed_without_a_shared_target(self, run, unshared):
+        pin_id(unshared, OTHER_ID)
+        result = self.set_id(run, unshared, OTHER_ID)
+        assert result.exit_code == 0, result.stderr
+        assert host_client_id(unshared) == OTHER_ID
+
+    def test_a_disabled_remote_backup_does_not_block_it(self, run, db):
+        make_db(run, db, share_yaml(remote_enabled="false"))
+        seed_client_id(db, CID)
+        pin_id(db, OTHER_ID)
+        assert self.set_id(run, db, OTHER_ID).exit_code == 0
+
+
+from zfsbackup.cli import trust as trust_cli  # noqa: E402
+
+
+class TestLoopbackWarning:
+    """A write (or `import`) whose RESULT shares the server's target while this host's own id is
+    enrolled with that server: the server now refuses that client, and the operator is told the
+    command that finishes the move. Printed after the `config updated` line."""
+
+    def assert_after_config_updated(self, result):
+        from _click_compat import interleaved
+
+        text = interleaved(result)
+        assert "config updated" in text
+        position = text.index(f"trust revoke --client {CID}")
+        assert text.index("config updated") < position
+
+    def test_set_into_a_shared_target_warns(self, run, loopback):
+        result = ok(run, loopback, "set", "destinations.usb.url", f"zfs:{SHARED_TARGET}")
+        (warned,) = loopback_warnings(result)
+        assert SHARED_TARGET in warned and CID in warned
+        self.assert_after_config_updated(result)
+
+    def test_edit_of_the_whole_config_warns(self, run, loopback, stub, scratch_tmp):
+        stub.plan([replace('url: "zfs:other/target"', f'url: "zfs:{SHARED_TARGET}"')])
+        result = edit(run, loopback, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert len(loopback_warnings(result)) == 1
+        self.assert_after_config_updated(result)
+
+    def test_edit_destination_warns(self, run, loopback, stub, scratch_tmp):
+        stub.plan([replace("zfs:other/target", f"zfs:{SHARED_TARGET}")])
+        result = edit(run, loopback, stub, "destination", "usb", "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert len(loopback_warnings(result)) == 1
+        self.assert_after_config_updated(result)
+
+    def test_import_warns(self, run, loopback, tmp_path):
+        source = write_yaml(tmp_path, share_yaml(), "shared.yaml")
+        result = run("import", source, "-c", loopback)
+        assert result.exit_code == 0, result.stderr
+        assert len(loopback_warnings(result)) == 1
+        self.assert_after_config_updated(result)
+
+    def test_any_later_write_of_a_shared_config_warns_again(self, run, loopback):
+        ok(run, loopback, "set", "destinations.usb.url", f"zfs:{SHARED_TARGET}")
+        result = ok(run, loopback, "set", "check_interval", "10m")
+        assert len(loopback_warnings(result)) == 1
+
+    def test_without_the_pin_there_is_no_warning(self, run, unshared):
+        result = ok(run, unshared, "set", "destinations.usb.url", f"zfs:{SHARED_TARGET}")
+        assert loopback_warnings(result) == []
+        assert "trust revoke" not in result.stderr
+
+    def test_a_pin_of_another_id_does_not_warn(self, run, unshared):
+        pin_id(unshared, OTHER_ID)
+        result = ok(run, unshared, "set", "destinations.usb.url", f"zfs:{SHARED_TARGET}")
+        assert loopback_warnings(result) == []
+
+    def test_without_a_shared_target_there_is_no_warning(self, run, loopback):
+        result = ok(run, loopback, "set", "check_interval", "10m")
+        assert "trust revoke" not in result.stderr
+        result = ok(run, loopback, "set", "destinations.usb.url", "zfs:another/target")
+        assert loopback_warnings(result) == []
+
+    def test_import_without_a_share_does_not_warn(self, run, loopback, tmp_path):
+        source = write_yaml(tmp_path, share_yaml("zfs:other/target"), "plain.yaml")
+        result = run("import", source, "-c", loopback)
+        assert result.exit_code == 0, result.stderr
+        assert "trust revoke" not in result.stderr
+
+
+class TestHttpsToTheSharedTarget:
+    """`destinations.spare.url` https -> `zfs:<the server's own target>`: through `set`, `edit` and
+    `edit destination`. Wording is asserted on stable fragments."""
+
+    TARGET_URL = f"zfs:{SHARED_TARGET}"
+
+    def switch_warning(self, result):
+        (warned,) = [w for w in warnings_in(result) if "changes from the server https://spare:8080" in w]
+        return warned
+
+    def stable_fragments(self, warned):
+        assert f"destinations[spare] changes from the server https://spare:8080 to the local target '{SHARED_TARGET}'" in warned
+        assert "server's own target" in warned
+        assert f"{SHARED_TARGET}/{CID}" in warned
+
+    def test_set_without_the_own_id_enrolled(self, run, unshared):
+        result = ok(run, unshared, "set", "destinations.spare.url", self.TARGET_URL)
+        warned = self.switch_warning(result)
+        self.stable_fragments(warned)
+        assert "full send" in warned
+        assert loopback_warnings(result) == []
+
+    def test_set_with_the_own_id_enrolled(self, run, loopback):
+        result = ok(run, loopback, "set", "destinations.spare.url", self.TARGET_URL)
+        warned = self.switch_warning(result)
+        self.stable_fragments(warned)
+        assert f"trust revoke --client {CID}" in warned
+        assert stored(loopback).destinations["spare"].url == self.TARGET_URL
+
+    def test_edit_without_the_own_id_enrolled(self, run, unshared, stub, scratch_tmp):
+        stub.plan([replace('url: "https://spare:8080"', f'url: "{self.TARGET_URL}"')])
+        result = edit(run, unshared, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        warned = self.switch_warning(result)
+        self.stable_fragments(warned)
+        assert "full send" in warned
+
+    def test_edit_with_the_own_id_enrolled(self, run, loopback, stub, scratch_tmp):
+        stub.plan([replace('url: "https://spare:8080"', f'url: "{self.TARGET_URL}"')])
+        result = edit(run, loopback, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        warned = self.switch_warning(result)
+        self.stable_fragments(warned)
+        assert f"trust revoke --client {CID}" in warned
+
+    def test_edit_destination_without_the_own_id_enrolled(self, run, unshared, stub, scratch_tmp):
+        stub.plan([replace("https://spare:8080", self.TARGET_URL)])
+        result = edit(run, unshared, stub, "destination", "spare", "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert "NameError" not in result.stderr
+        warned = self.switch_warning(result)
+        self.stable_fragments(warned)
+        assert stored(unshared).destinations["spare"].url == self.TARGET_URL
+
+    def test_edit_destination_with_the_own_id_enrolled(self, run, loopback, stub, scratch_tmp):
+        stub.plan([replace("https://spare:8080", self.TARGET_URL)])
+        result = edit(run, loopback, stub, "destination", "spare", "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert "NameError" not in result.stderr
+        warned = self.switch_warning(result)
+        self.stable_fragments(warned)
+        assert f"trust revoke --client {CID}" in warned
+
+    def test_a_switch_to_another_local_target_keeps_the_ordinary_wording(self, run, loopback):
+        result = ok(run, loopback, "set", "destinations.spare.url", "zfs:third/target")
+        warned = self.switch_warning(result)
+        assert "server's own target" not in warned and "third/target/host-1/" in warned
+
+    def test_a_disabled_remote_backup_is_not_the_servers_own_target(self, run, db):
+        make_db(run, db, share_yaml("zfs:other/target", remote_enabled="false"))
+        seed_client_id(db, CID)
+        result = ok(run, db, "set", "destinations.spare.url", self.TARGET_URL)
+        assert "server's own target" not in self.switch_warning(result)
+
+
+class TestSetClientIdSharedDetails:
+    """The refusal text for an unreadable trust table, `--force`, and the warning a committed change
+    of the id gives while the target is shared."""
+
+    def break_trust_reads(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise RuntimeError("trust tables unreadable")
+
+        for module in (cli_write, trust_cli):
+            if hasattr(module, "list_clients"):
+                monkeypatch.setattr(module, "list_clients", boom)
+
+    @pytest.mark.parametrize("force", [(), ("--force",)], ids=["plain", "force"])
+    def test_unreadable_trust_tables_refuse_with_a_message_saying_so(
+        self, run, shared, monkeypatch, force
+    ):
+        self.break_trust_reads(monkeypatch)
+        before, gen = db_state(shared), generation(shared)
+        result = run("identity", "set-client-id", "free-id", *force, "-c", shared)
+        assert result.exit_code == 1
+        assert "could not be read" in result.stderr
+        assert "--force does not override" in result.stderr
+        assert db_state(shared) == before and generation(shared) == gen
+        assert host_client_id(shared) == CID
+
+    def test_unreadable_trust_tables_do_not_matter_without_a_share(self, run, unshared, monkeypatch):
+        self.break_trust_reads(monkeypatch)
+        result = run("identity", "set-client-id", "free-id", "-c", unshared)
+        assert result.exit_code == 0, result.stderr
+
+    @pytest.mark.parametrize("how", ["live", "revoked"])
+    def test_a_live_or_revoked_client_with_that_id_refuses_even_with_force(self, run, shared, how):
+        pin_id(shared, OTHER_ID)
+        if how == "revoked":
+            assert run("trust", "revoke", "--client", OTHER_ID, "-c", shared).exit_code == 0
+        for force in ((), ("--force",)):
+            result = run("identity", "set-client-id", OTHER_ID, *force, "-c", shared)
+            assert result.exit_code == 1 and OTHER_ID in result.stderr
+        assert host_client_id(shared) == CID
+
+    def test_the_committed_change_warns_that_the_old_tree_stays_and_the_old_id_is_free(self, run, shared):
+        result = run("identity", "set-client-id", "free-id", "-c", shared)
+        assert result.exit_code == 0, result.stderr
+        warned = " ".join(" ".join(warnings_in(result)).split())
+        assert f"{SHARED_TARGET}/{CID}/ stay where they are" in warned
+        assert "the server keeps pruning them" in warned
+        assert f"{CID!r} is no longer reserved" in warned
+        assert f"do not create a token scoped to it (`trust token create --client-id {CID}`)" in warned
+        assert f"{SHARED_TARGET}/free-id/" in warned
+
+    def test_without_a_share_that_warning_is_not_given(self, run, unshared):
+        result = run("identity", "set-client-id", "free-id", "-c", unshared)
+        assert result.exit_code == 0, result.stderr
+        assert "no longer reserved" not in result.stderr and "keeps pruning" not in result.stderr
+
+
+class TestTrustTablesAreReadOnlyAfterTheReload:
+    """After a committed write the trust tables are read only once the daemon has been asked to
+    reload and the writer lock is free (never between `write_config` and `begin_reload`, never under the
+    lock) -- the rename path included."""
+
+    @pytest.fixture
+    def events(self, monkeypatch, db):
+        import fcntl
+
+        log = []
+
+        def lock_is_held():
+            path = str(db) + ".writer.lock"
+            try:
+                fd = open(path, "r+b")
+            except OSError:
+                return False
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return False
+            finally:
+                fd.close()
+
+        real_write, real_list = cli_write.write_config, cli_write.list_clients
+
+        def write(*args, **kwargs):
+            result = real_write(*args, **kwargs)
+            log.append(("write", None))
+            return result
+
+        def reload(resolved, *, skip_if_applied=None):
+            log.append(("reload", None))
+            return daemonlock.ReloadRequest("no-daemon")
+
+        def list_clients(*args, **kwargs):
+            log.append(("list_clients", lock_is_held()))
+            return real_list(*args, **kwargs)
+
+        monkeypatch.setattr(cli_write, "write_config", write)
+        monkeypatch.setattr(cli_write, "list_clients", list_clients)
+        monkeypatch.setattr(daemonlock, "request_reload", reload)
+        return log
+
+    def assert_ordered(self, log):
+        kinds = [k for k, _ in log]
+        assert "write" in kinds and "reload" in kinds, log
+        written, reloaded = kinds.index("write"), kinds.index("reload")
+        between = [e for e in log[written:reloaded] if e[0] == "list_clients"]
+        assert between == [], f"the trust tables were read between the write and the reload: {log}"
+        late = [e for e in log[reloaded:] if e[0] == "list_clients"]
+        assert late, f"the loopback check never read the trust tables: {log}"
+        assert all(held is False for k, held in log if k == "list_clients"), "read under the writer lock"
+
+    def test_set(self, run, loopback, events):
+        events.clear()
+        result = ok(run, loopback, "set", "destinations.usb.url", f"zfs:{SHARED_TARGET}")
+        assert len(loopback_warnings(result)) == 1
+        self.assert_ordered(events)
+
+    def test_set_of_an_unrelated_key_in_a_shared_config(self, run, loopback, events):
+        ok(run, loopback, "set", "destinations.usb.url", f"zfs:{SHARED_TARGET}")
+        events.clear()
+        ok(run, loopback, "set", "check_interval", "10m")
+        self.assert_ordered(events)
+
+    def test_edit(self, run, loopback, stub, scratch_tmp, events):
+        events.clear()
+        stub.plan([replace('url: "zfs:other/target"', f'url: "zfs:{SHARED_TARGET}"')])
+        result = edit(run, loopback, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert len(loopback_warnings(result)) == 1
+        self.assert_ordered(events)
+
+    def test_rename_dataset(self, run, loopback, events):
+        ok(run, loopback, "set", "destinations.usb.url", f"zfs:{SHARED_TARGET}")
+        events.clear()
+        result = run("rename", "dataset", "tank/a", "tank/b", "--force", "-c", loopback)
+        assert result.exit_code == 0, result.stderr
+        self.assert_ordered(events)
+
+    def test_a_config_that_is_not_shared_reads_nothing_after_the_write(self, run, loopback, events):
+        events.clear()
+        ok(run, loopback, "set", "check_interval", "10m")
+        kinds = [k for k, _ in events]
+        assert "write" in kinds
+        assert not [e for e in events[kinds.index("write"):] if e[0] == "list_clients"]
+
+
+class TestEditDestinationHttpsToTheSharedTarget:
+    def test_it_saves_and_prints_the_switch_warning_then_the_loopback_warning(
+        self, run, loopback, stub, scratch_tmp
+    ):
+        from _click_compat import interleaved
+
+        stub.plan([replace("https://spare:8080", f"zfs:{SHARED_TARGET}")])
+        result = edit(run, loopback, stub, "destination", "spare", "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert "Traceback" not in result.stderr and "NameError" not in result.stderr
+        assert stored(loopback).destinations["spare"].url == f"zfs:{SHARED_TARGET}"
+        (switch,) = [w for w in warnings_in(result) if "changes from the server https://spare:8080" in w]
+        (loop,) = loopback_warnings(result)
+        text = interleaved(result)
+        assert text.index("changes from the server https://spare:8080") < text.index("config updated")
+        assert text.index("config updated") < text.index(loop[len("warning: "):])
+        assert switch != loop

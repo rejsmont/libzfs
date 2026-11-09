@@ -278,7 +278,7 @@ class Authed:
 
     def __init__(self, config, *, client_id: Optional[str] = CLIENT_ID, gateway=None,
                  server_fp: str = SERVER_FP, clock: Optional[Callable[[], float]] = None,
-                 peer_limits=None):
+                 peer_limits=None, reserved_client_id: Optional[str] = None):
         self.config = config
         self.gateway = gateway if gateway is not None else FakeGateway()
         self.server_fp = server_fp
@@ -286,6 +286,8 @@ class Authed:
         kwargs = {} if clock is None else {"clock": clock}
         if peer_limits is not None:
             kwargs["peer_limits"] = peer_limits
+        if reserved_client_id is not None:
+            kwargs["reserved_client_id"] = reserved_client_id
         self.app = create_app(config, self.gateway, server_fp, **kwargs)
         self.app.testing = True
         self.who = self.cert_for(client_id) if client_id is not None else None

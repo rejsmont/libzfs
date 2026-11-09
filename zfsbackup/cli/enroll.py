@@ -54,7 +54,7 @@ client key promoted, certificate swapped) and the command then exits 1 with a
 message saying the server accepted but will refuse backups.
 
 Exit codes: 0 ok; 1 refused, pin mismatch, bad token, `client_id_taken`,
-`cert_bound_elsewhere`, other 4xx; 2 usage; 75 unreachable, timeout, 503 with
+`reserved_client_id`, `cert_bound_elsewhere`, other 4xx; 2 usage; 75 unreachable, timeout, 503 with
 `retry`, conflict or busy; 78 unusable database.
 
 Secrets. The token appears only in the request body. Server error texts are
@@ -763,6 +763,17 @@ def _enroll_failure(reply: _Reply, url: str, secrets: Tuple[str, ...],
             f"`zfsbackup-config trust token create --client-id {client_id}` "
             "(add --replace to drop the id's other certificates; without it they stay pinned "
             "there, which matters if this host's old key may be stolen)"
+        )
+    if status == 409 and reason == "reserved_client_id":
+        # The server's own local destination shares its backup target, so the
+        # server host's own client id is not available to a remote client.
+        return CliError(
+            f"{url} reserves this client id: it is the id of the server host itself, whose "
+            "local destination shares the server's backup target (the token was not used and "
+            "is still valid). Give this host another client id (`zfsbackup-config identity "
+            "set-client-id ID`; if this host is enrolled with other servers that needs --force "
+            "and enrolling with them again) and enroll again with the same token"
+            + (f"\nServer: {text}" if text else "")
         )
     if status == 409 and reason == "cert_bound_elsewhere":
         return CliError(

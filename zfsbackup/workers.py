@@ -59,7 +59,7 @@ from typing import Iterable, List, Optional, Set, Tuple, Union
 
 from zfsbackup import health, logsetup, procident
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager, PruneResult
-from zfsbackup.config import BackupConfig
+from zfsbackup.config import BackupConfig, shared_receive_target
 from zfsbackup.stopflag import STOP_POLL, ReloadEpoch, StopFlag
 from zfsbackup.version import CodeSignature, code_signature
 
@@ -2544,6 +2544,8 @@ class ApiWorker(_SupervisorWatch, Process):
     #: Class-level default, so a worker built by a test that bypasses
     #: `__init__` refuses to serve rather than serving without trust.
     config_db = None
+    #: This host's client id (the `Handoff`'s), for `create_app`'s reserved id.
+    client_id = None
     #: The app's `api.PeerLimits` (S-3), set by `_serve`; the trust-poll
     #: thread logs its hourly summary. `None`: nothing to flush.
     _peer_limits = None
@@ -2559,9 +2561,20 @@ class ApiWorker(_SupervisorWatch, Process):
         workers_lock=None,
         config_db=None,
         code_signature=None,
+        client_id: Optional[str] = None,
     ):
         """`config` is the supervisor's detached `BackupConfig`, dry-run
         already applied; see `BaseWorker`.
+
+        `client_id` is this host's id from the supervisor's `Handoff`. The
+        server reserves it (`create_app(reserved_client_id=)`) only while a
+        local destination shares the backup target
+        (`config.shared_receive_target`); otherwise it is unused here. The
+        reservation follows the configuration through the reload turnover,
+        which does not cut a receive already running for that id: this
+        worker drains it while the new remote worker may already send the
+        local copy, and ZFS refuses the overlapping receive (a failed or
+        redundant cycle, never a corrupt copy).
 
         `config_db` is the config database's `ResolvedConfigPath`. It is used
         for TLS only: the server identity in `<db>.tls/` and the pinned
@@ -2574,6 +2587,7 @@ class ApiWorker(_SupervisorWatch, Process):
         self.stop_event = stop_event
         self.log_level = log_level
         self.config_db = config_db
+        self.client_id = client_id
         self._watch_init(reload_epoch, born_epoch, workers_lock, code_signature)
         self._trust = None
 
@@ -2788,7 +2802,14 @@ class ApiWorker(_SupervisorWatch, Process):
         # until a poll succeeds.
         gateway.refresh()
 
-        app = create_app(config, gateway, identity.fingerprint)
+        # A local destination that shares the backup target keeps its copies
+        # under `<target>/<this host's id>`: the server must not also serve a
+        # remote client bound to that id. The id rides the `Handoff`, so a
+        # change of id or of the sharing restarts this worker.
+        reserved = self.client_id if shared_receive_target(config) is not None else None
+        app = create_app(
+            config, gateway, identity.fingerprint, reserved_client_id=reserved
+        )
         gate = app.extensions['zfsbackup.stream_gate']
 
         try:
