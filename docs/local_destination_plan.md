@@ -1,7 +1,7 @@
 # Local destination — implementation plan
 
-**Status: decisions settled 2026-11-08; implementation not started.** Written against master 727e3e3
-(v1.0.0rc3); line references point there.
+**Status: implemented on feature/local-destination.** Written against master 727e3e3 (v1.0.0rc3); line
+references point there.
 
 Goal: back configured datasets up to another dataset or pool on the **same host** with a direct
 `zfs send | zfs receive`, without HTTP, TLS or enrollment. Today the same result needs one daemon
@@ -219,3 +219,14 @@ Phase 1 is pure refactor and Phase 2 is inert, so each phase merges on its own.
 - **Health checks reading the copies directly**: the per dataset × destination anchor lag already covers
   it.
 - **`rename dataset` renaming local copies itself**: it prints the command for now.
+- **Slow target pools and the prune budget.** A local copy's prune runs each read (including the full
+  snapshot listing) under a 60 s budget and each destroy under 300 s. A cold, slow removable pool holding
+  thousands of copy snapshots could time out every cycle: safe (nothing is destroyed), but pruning would
+  not progress. Raise `LOCAL_PRUNE_COMMAND_BUDGET` if that is seen.
+- **Stuck pump children across worker incarnations.** The stuck-children registry is per process, so after
+  a reload, upgrade drain or crash the next remote worker does not know about a `zfs receive` left in D
+  state on a hung target pool. ZFS refuses the dangerous overlaps itself (an active receive owns its
+  target: a new receive, a resume and `receive -A` get EBUSY), so the cost is "dataset is busy" errors and
+  one more stuck process per incarnation while the pool stays hung — no corruption. The fix, if needed:
+  persist abandoned children (pid + start time) in the worker's status dir and treat a live recorded pid
+  as stuck in the successor; and pin the EBUSY behaviour with a capture in `test_openzfs_matrix.sh`.

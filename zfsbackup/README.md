@@ -9,6 +9,7 @@ An automated ZFS snapshot management daemon with configurable frequency and rete
 - 🔄 **Recursive Snapshots**: Support for recursive dataset snapshots
 - 🗑️ **Automatic Cleanup**: Automatically purge expired snapshots based on retention rules
 - 🔍 **Dry Run Mode**: Test configuration without making changes
+- 💾 **Remote and Local Backups**: send snapshots to another host over mutually authenticated TLS, or to a dataset or pool on the same host (a USB disk) with a direct `zfs send | zfs receive`
 - 📊 **Detailed Logging**: Comprehensive logging of all operations
 - ⚙️ **SQLite Config Store**: Config lives in a SQLite database; write it as YAML and import it
 
@@ -110,7 +111,8 @@ The order matters, because the unit refuses to start without a database (`Assert
    `sudo zfsbackup-config import /root/config.yaml`. This creates `/var/lib/zfsbackup/config.db`.
 2. **Check it** without starting anything: `sudo zfsbackupd --test-config`.
 3. **Remote backups, if you use them** (see [TLS and enrollment](#tls-and-enrollment)): on the server
-   `trust token create`; on each client `enroll DESTINATION --url … --token-file …`.
+   `trust token create`; on each client `enroll DESTINATION --url … --token-file …`. **Local destinations**
+   (`zfs:<dataset>`) need no enrollment, only their target dataset (see [Local destinations](#local-destinations)).
 4. **Start it and keep it enabled:** `sudo systemctl enable --now zfsbackup`, then `systemctl status zfsbackup`
    and `journalctl -u zfsbackup`. For the periodic health report, also `sudo systemctl enable --now
    zfsbackup-check.timer` (see [Monitoring](#monitoring)).
@@ -284,7 +286,8 @@ renames support `--dry-run`.
 
 ## TLS and enrollment
 
-Remote backup is HTTPS only, with mutual authentication. Both sides pin each other's certificate by its
+Remote backup is HTTPS only, with mutual authentication. (A destination on this host, `zfs:<dataset>`, uses
+none of this: see [Local destinations](#local-destinations).) Both sides pin each other's certificate by its
 SHA-256 fingerprint; there is no certificate authority, no host name check and no plaintext mode. The
 server accepts TLS 1.3 only, and every endpoint except `/health` and `/enroll` requires a client
 certificate the server has pinned. A client is known to the server by its **client id**, and the server
@@ -412,7 +415,8 @@ letter or digit) changes it. Every server then sees a new client and the next re
 send. It is refused while any destination is enrolled, because each server has this host's certificate
 bound to the old id; `--force` overrides that. The better way to move to a new id is to re-enroll with a
 `--client-id NEW` token. A change to the id bumps the configuration generation, so a running daemon
-reloads and hands the new id to its remote worker.
+reloads and hands the new id to its remote worker. The copies under a local destination are laid out under
+the id, so a new id starts new, empty ones (see [Local destinations](#local-destinations)).
 
 ### Firewall and the port
 
@@ -483,8 +487,10 @@ zfsbackupd --test-config -c /path/to/config.db
 - `dry_run`: Set to `true` to test without making changes (default: false)
 - `api_host`, `api_port`: where the API listens (default `127.0.0.1`, `8080`; see
   [Firewall and the port](#firewall-and-the-port))
-- `destinations`: client side, a mapping of name to `url` (`https://` only) and `server_fingerprint` (set by
-  `enroll`; a destination without one is not enrolled and is skipped)
+- `destinations`: client side, a mapping of name to `url` and `server_fingerprint`. A `url` is `https://HOST[:PORT]`
+  (a remote server; `http://` is refused; `server_fingerprint` is set by `enroll`, and a destination without
+  one is not enrolled and is skipped) or `zfs:<dataset>` (a dataset on this host, no server and no
+  fingerprint; see [Local destinations](#local-destinations))
 - `remote_backup`: server side, `target_dataset` (required, must exist) and `enabled` (default: true)
 
 ### Dataset Configuration
@@ -497,7 +503,7 @@ Each dataset can have:
 - `recursive`: Whether to snapshot child datasets (default: false)
 - `retention`: Dictionary of retention rules (default: `"1d": "30d"`); `retention: forever` never prunes
 - `remote`: a list of destinations to send to, each `destination` (a name from `destinations`) and optionally
-  `frequency` (default: the dataset's), `retention` (what the server keeps; default: the dataset's) and `raw`
+  `frequency` (default: the dataset's), `retention` (what the destination keeps; default: the dataset's) and `raw`
   (`auto`, the default: raw if and only if the dataset is encrypted; `true`; `false`)
 
 ### Retention Rules
@@ -664,7 +670,7 @@ often something is expected to happen. A lag is WARN from **2x** and CRIT from *
 | What | Measured | Expected interval |
 |---|---|---|
 | `snapshot` (client) | the newest managed snapshot of each enabled dataset | the dataset's `frequency`, but at least `check_interval` (the snapshot worker looks no more often) |
-| `anchor` (client) | the snapshot last sent to each destination | the larger of the dataset's interval (as above) and the destination's `frequency` |
+| `anchor` (client) | the snapshot last sent to each destination, remote or local | the larger of the dataset's interval (as above) and the destination's `frequency` |
 | `received` (server) | the newest snapshot of each received client dataset | the largest of that received dataset's own `frequency` and its remote frequencies (as the client sent them) |
 
 Also: a dataset with **no managed snapshot** is CRIT; a destination that has **not been sent to yet** is WARN
@@ -683,7 +689,8 @@ the server's copy shows only as lag (the client logs the reason once).
   configuration is only a WARN because the old configuration keeps running; `zfsbackup-config status` says why.
 - **`daemon/upgrade`**, only while the daemon drains for an in-place upgrade (see
   [Upgrading](#upgrading-and-downgrading)): WARN, never CRIT.
-- **`tls/client_certificate`**, only when destinations are configured: WARN when the certificate is missing
+- **`tls/client_certificate`**, only when an `https://` destination is configured (a local `zfs:` destination has
+  no server to present it to): WARN when the certificate is missing
   (not enrolled), unreadable or would not be accepted, or expires within 30 days; CRIT once it has expired
   (`identity rotate`); OK otherwise.
 - **`worker_snapshot`, `worker_prune`, `worker_send`** (subject the dataset, peer the destination for a send):
@@ -913,6 +920,210 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
   anywhere.
 - **Sizing.** Nothing limits a client's space or bandwidth (`zfs set quota=… <target>/<client_id>` does; see
   [First run](#first-run)); a host's remote sends run one after another.
+
+## Local destinations
+
+A destination whose URL is `zfs:<dataset>` is a dataset **on this host**. The daemon sends to it with a direct
+`zfs send | zfs receive`: no HTTP, no TLS, no enrollment and no server, so one host can keep a second copy of a
+dataset on another pool (a USB disk, a second array) or in another dataset of the same pool. It is the same
+chain as a remote backup: a full stream of the newest snapshot first, then incremental `-i` steps (every managed
+snapshot in between), a resumable receive (`zfs receive -s`), the same raw/plain rules, anchors and in-flight
+pins, and the same retention logic on the copy. A target on the same pool as the source protects against a
+deleted dataset or snapshot, not against losing the pool.
+
+### Setting one up
+
+1. **Create the target.** The daemon never creates it, and it must be dedicated:
+
+   ```bash
+   sudo zfs create -o canmount=off backup/zfsbackup
+   ```
+
+   `canmount=off` keeps the empty container from being mounted. The daemon enumerates everything below the target
+   and prunes it, so put nothing else there. The configuration is refused (on `import`, `set`, `edit` and
+   reload) when:
+   - a configured dataset, enabled or not, is at or below the target, or a `recursive` one is above it;
+   - the target is at, below or above another local destination's target (declared, used or not), or the enabled
+     `remote_backup.target_dataset`;
+   - the URL is not `zfs:` plus a valid dataset name (the prefix is exactly lowercase; no `//`, no leading `/`,
+     no `@` or `#`), or a `zfs:` destination has a `server_fingerprint`;
+   - a copy's snapshot name, `<target>/<client_id>/<dataset>@<prefix>_<14 digits>`, would be over ZFS's 255
+     characters even with a one-character client id (an enabled dataset is refused, a disabled one warns). A
+     warning also names the longest client id that still fits. A recursive dataset's children have longer names.
+
+2. **Configure it** (import YAML as usual, or `zfsbackup-config edit`):
+
+   ```yaml
+   destinations:
+     usb:
+       url: "zfs:backup/zfsbackup"       # no server_fingerprint, nothing to enroll
+
+   datasets:
+     - name: "tank/data"
+       frequency: "1h"
+       retention: { "1d": "1M" }
+       remote:
+         - destination: usb
+           frequency: "1d"               # optional: how often this destination is sent to
+           retention: { "1d": "1y" }     # optional: what the copy keeps (default: the dataset's)
+           raw: auto                     # auto (default): raw iff the dataset is encrypted; true; false
+   ```
+
+   The `remote:` entries mean the same as for an https destination, and a dataset can send to local and remote
+   destinations at once. `frequency`, `retention` and `raw` are per dataset and destination. Local and remote
+   sends run one after another in the same worker, in the order of the `remote:` list, so a long copy delays
+   the sends after it; a failure at one destination does not stop the others.
+
+3. **The client id.** The copies are laid out under this host's client id (below). A host that never enrolled has
+   none, so the `import`, `set` or `edit` that adds the first local destination generates one and prints
+   `generated this host's client id: …`; `zfsbackup-config identity show` shows it. Without an id the daemon
+   sends nothing to a local destination and logs why.
+
+4. **Check and start.** `zfsbackupd --test-config`, then reload or start the daemon. `list destinations` shows
+   the destination as kind `local`, with `-` under ENROLLED. `enroll` refuses a local destination, and `identity
+   rotate` skips it. `--dry-run` logs `[DRY RUN] … -> local <target>` and creates nothing.
+
+### Layout and what is forced onto a copy
+
+A source dataset `tank/data` is stored as `<target>/<client_id>/tank/data`, pool name included: the layout of
+[Operating the backup server](#operating-the-backup-server), and for the same reasons (same-named datasets in
+two pools never meet; two hosts can share one target pool; the pruner and `zfs rename` work on the copies
+unchanged; a loopback setup moves with one `zfs rename`, below). The containers the daemon creates
+(`<target>/<client_id>`, `<target>/<client_id>/<pool>` and any missing parent) are `canmount=noauto`.
+
+Every receive sets these as **local** values: `canmount=noauto`, `readonly=on`, `volmode=none`,
+`mountpoint=none`, `sharenfs=off`, `sharesmb=off`, `setuid=off`, `exec=off` and `devices=off` on a filesystem;
+`readonly=on` and `volmode=none` on a volume. It uses `-u` (never mounted) and `-h` (no holds from the stream).
+A copy also carries `org.zfsbackup:client_id`, `source_dataset` and `config` (the retention the pruner applies),
+set by the daemon at every send; never edit or `zfs inherit` them. A dataset below the target that the daemon
+did not create (no local `org.zfsbackup:client_id`), or that records another source dataset, is refused, with
+the command that adopts it on purpose in the log (`zfs set org.zfsbackup:client_id=<id> <ds>`).
+
+### Getting data back
+
+A copy is a dataset, so restoring is ZFS work. The safe route is a clone **outside the target tree** (a clone
+takes its properties from its new parent, so it can be mounted):
+
+```bash
+sudo zfs create -p tank/restore
+sudo zfs clone -o readonly=on -o canmount=on -o mountpoint=/mnt/restore/data \
+     backup/zfsbackup/<client_id>/tank/data@autosnap_20261021120000 tank/restore/data
+# … copy the files out, then:
+sudo zfs destroy tank/restore/data      # while it exists, its origin snapshot cannot be pruned
+```
+
+A volume is cloned with `-o volmode=dev` and read at `/dev/zvol/…`. To restore a whole dataset, send a snapshot
+back with the flags the daemon itself uses (`-L -c`, or `-w` for a raw copy; never `-p` or `-R`, which carry
+the copy's forced properties along) into a name that does not exist, with `zfs receive -u`; see
+[Restoring a whole dataset to the client](#restoring-a-whole-dataset-to-the-client) (no `ssh` is needed here).
+Because the copy is on your own host you may also, instead of cloning, set `mountpoint` and `canmount` on the
+copy itself and mount it, but only read-only (leave `readonly=on`), and unmount it before the next send:
+the next receive writes the forced values again, and a receive cannot proceed over a mounted dataset.
+
+A **raw** copy (an encrypted dataset) is its own encryption root and cannot be mounted or read until you load
+the source dataset's key (`zfs load-key backup/zfsbackup/<client_id>/tank/secret`); a clone of it is created
+without the key but mounts only once the key is loaded. Keep a copy of the key somewhere other than the pool
+that holds the data.
+
+### Retention and pruning of the copies
+
+The pruning worker finds this host's copies under `<target>/<client_id>` of every local destination, and prunes
+each one with the retention stamped on it (`org.zfsbackup:config`, the destination's rules as configured now,
+refreshed at every send; a change that shortens the horizon is logged at WARNING), with this host's
+`snapshot_prefix`. The newest snapshot of a copy is always kept, as are the ones an anchor or pin protects, a
+held or a cloned one. Pruning is never recursive: each copy is its own dataset with its own retention. Only this
+host's own id is touched, so another host's tree on a shared target is never listed or pruned (including an id
+that merely starts with ours, `host` and `host2`). The rules of a copy outlive a configuration change: the copy
+of a dataset you removed from the configuration keeps being pruned to its last rules, as long as a local
+destination with that target stays configured. If you remove the destination, its copies are no longer found
+and no longer pruned. The pruning worker's reads on a local target run under a 60 s limit each (a destroy under
+300 s, a target's whole discovery under 10 minutes): a target on a slow or suspended pool ends that pass
+with one WARNING per episode and destroys nothing.
+
+### Removable and USB pools
+
+- **A pool that is exported (or a disk that is unplugged)** makes the target disappear: the destination is
+  skipped with one message per episode ("the target dataset … does not exist; … import its pool if it is on an
+  exported one"), the other destinations carry on, and a line says it is usable again once it is back. The
+  sending resumes on its own when the pool is imported: the anchor keeps the last common snapshot on the
+  source, so the next cycle sends the whole chain of snapshots taken meanwhile. Until then `check` shows the
+  destination's lag growing and its sends and the pruning discovery failing, which is the intended signal that
+  nothing is being copied. A stream cut by an export is resumed from where it stopped.
+- **A pool that is suspended or hung** (`zpool status` says so) cannot stall the daemon: the checks that
+  precede a stream run under a 60 s limit and skip the destination for the cycle; a stream that moves no byte for
+  600 s is stopped (`zfs send` and `zfs receive` both, the partial receive is kept for a resume); and a
+  `zfs` process that survives SIGKILL (uninterruptible sleep on the hung pool) is abandoned with one WARNING.
+  While such a process exists, every time-limited `zfs` call in that worker is refused, so the local destinations
+  are skipped, and the log says so, until the process exits. Fix the pool (`zpool clear`, reconnect the disk);
+  the sending resumes by itself when the process is gone.
+- **Stopping the daemon** during a local copy behaves like a remote transfer: the supervisor gives the worker
+  its stop budget, then ends it, and the next cycle resumes the partial receive.
+
+### When a copy cannot be continued
+
+As for a server copy, the daemon never destroys or renames a copy by itself. It logs one ERROR and sends nothing
+for that dataset and destination when the copy is of the other kind (plain vs raw, or a changed `raw:`), when
+it and the source have no snapshot in common, when it holds snapshots the source does not (after a rollback or an
+in-place restore of the source), or when a placeholder parent blocks a full stream. The message names the
+fix. To keep the copy, move it **out of the target tree** on this host; the next cycle then sends a full stream:
+
+```bash
+sudo zfs create -p backup/aside
+sudo zfs rename backup/zfsbackup/<client_id>/tank/data backup/aside/<client_id>-data-$(date +%F)
+```
+
+(Inside the tree it would still be pruned, and its recorded source would get the new copy refused. Under an
+encrypted target the rules of [Renaming a server copy aside](#operating-the-backup-server) apply.) If the
+newer snapshots are expendable, the message gives the `zfs destroy <copy>@<first>%<last>` that removes just
+them, and the next cycle continues. The other points of [Rejoining](#rejoining-seed-and-continue) apply here too,
+with `ssh` left out.
+
+### Moving from a loopback setup
+
+If this host used to back itself up through its own API (a destination `https://127.0.0.1:…` enrolled with the
+host's own server, `remote_backup.target_dataset` `T`), its copies are already in the local layout:
+`T/<client_id>/<pool>/<path>`, stamped with the host's client id (the loopback destination only works when the
+server's binding equals the local id, so the id is the right one), the source dataset and the retention. So a
+rename of the whole `T/<client_id>` tree to a new target `L` continues the chain with no new full send:
+
+1. Create `L` (`zfs create -o canmount=off …`). It must be on the **same pool** as `T` (`zfs rename` cannot cross
+   pools; for another pool do not move, let the local destination start with a full send and destroy the old tree
+   later) and it must not be at, below or above `T` while `remote_backup` is enabled.
+2. **Stop the daemon**, so no receive is running: `systemctl stop zfsbackup`.
+3. `sudo zfs rename T/<client_id> L/<client_id>` (`L/<client_id>` must not exist). The copies keep their
+   `client_id` and `source_dataset` properties, which is what the daemon's ownership check and the pruner look
+   at. ZFS refuses the rename of a plain copy out of an encryption root it inherits (see [Renaming a server copy
+   aside](#operating-the-backup-server)): put `L` under the same encryption root as `T`, or fall back to a
+   full send. Raw copies move anywhere.
+4. **Keep the destination's name** (the anchors and pins on the source datasets are keyed by it) and change
+   what it is: `zfsbackup-config edit destination <name>`, set `url: "zfs:L"` and remove the
+   `server_fingerprint`. (A `set` of the URL is refused while a fingerprint is set; `rename destination` copies
+   the anchors if you do want a new name.) The CLI warns about a full send and orphaned copies; with the tree
+   moved that does not apply. Disable or remove `remote_backup` if nothing else uses it, and optionally `trust
+   revoke --client <client_id>` the host's own enrollment.
+5. `zfsbackupd --test-config`, start the daemon, and watch the first cycle: it should send an incremental
+   step, not a full stream (`zfsbackup-config check`).
+
+### Renames, the client id and monitoring
+
+- **`rename dataset`** (like for a remote) needs `--force` and prints, for each local destination, the copy's
+  real path and the exact `zfs rename` (plus `zfs set org.zfsbackup:source_dataset=<new name> …`) that moves it
+  within its parent. Otherwise the copy stays under the old name, orphaned (nothing sends to it, and it is no
+  longer pruned to its rules), and the new name starts with a full send. The CLI does not run these commands.
+- **`identity set-client-id`** changes the directory the copies live in: the next send to each local
+  destination is a full send into `<target>/<new id>/`, and the copies under the old id are orphaned (they carry
+  the old id, so a rename would not adopt them). The CLI warns and prints the optional, destructive `zfs
+  destroy -r` to remove the old tree once you no longer need it.
+- **Changing a local target** (`set destinations.<name>.url`) is the same: a full send into the new target, and
+  the old copies stay where they are. A change between `https://` and `zfs:` is refused while a
+  `server_fingerprint` is set.
+- **`check`** grades a local destination like a remote one: the `anchor` lag of each dataset × destination, and
+  the `worker_send` outcome of each attempt. The pruning worker's `worker_prune` entries include one `discover`
+  record per local target (subject the target, peer the destination, "N local copies"). There is no
+  `tls/client_certificate` entry when every destination is local, and no `received` entry (that is the server's).
+  The copies themselves are not read by `check`; the anchor lag covers them.
+- **Logs.** The messages start `<dataset> -> <destination>` and name the target or the copy; a pool that is
+  not there, a hung `zfs`, a refused stream and a stalled one each say what to do.
 
 ## Backing up the host
 
@@ -1242,6 +1453,9 @@ zfsbackupd --test-config -c /path/to/config.db
 - **The API address is in use** at startup: the daemon refuses to start until the port is free.
 
 ### Remote backups are not happening
+
+For a local `zfs:` destination see [Local destinations](#local-destinations): the usual causes are a target
+dataset that does not exist (or whose pool is exported), no client id, and a refused copy (the log names the fix).
 
 1. `zfsbackup-config check` (and `list destinations`): is the destination enrolled, and which side lags?
 2. `journalctl -u zfsbackup`: a 426 means client and server run different protocol versions; a
