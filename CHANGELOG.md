@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.0.0rc5 (2026-11-09)
+
+One backup dataset for remote clients and this host's own local copies.
+
+### Compatibility
+
+- **Wire protocol 1** and the **config schema head** are unchanged: no migration. A configuration whose local
+  destination targets the server's own `remote_backup.target_dataset` is refused by rc4 (move the local target
+  elsewhere before going back).
+- A server whose local destination shares its target now answers 409 `reserved_client_id` to a client bound to
+  the server host's own client id (`/enroll`, `/negotiate`, `/stream`, `/resume_token`). Without a shared target
+  nothing changes.
+
+### Changes
+
+- **A local destination may share the server's target.** On a host that is also a backup server, `url: "zfs:T"`
+  may name the server's own `remote_backup.target_dataset` `T` (inside or above it stays refused), so one dataset
+  holds the remote clients' copies and this host's own, at `T/<client_id>/…` like any client's. While shared, the
+  server reserves this host's client id: enrolling it and receives from a client bound to it are refused (409,
+  `reserved_client_id`), and the CLI refuses `trust token create --client-id` and `identity set-client-id` that
+  would collide. Moving from a loopback setup into the same `T` is now a URL change plus `trust revoke --client`,
+  with no `zfs rename`. See `zfsbackup/README.md`, "Sharing the server's target".
+- **`zfsbackup-config enroll`** explains a 409 `reserved_client_id` (the token is not used; give this host another
+  client id and enroll again).
+- **`zfsbackup-config list destinations`** marks a shared target (`local (shared)`, JSON `"shared"`).
+
 ## 1.0.0rc4 (2026-11-09)
 
 Local destinations: back a dataset up to another dataset or pool on the same host, with no server.
