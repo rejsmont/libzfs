@@ -1091,7 +1091,8 @@ check` shows them among the received datasets as well as under the local destina
 
 While a local destination shares `T`, the server **reserves this host's own client id**, because a remote
 client bound to it would write into the same copies:
-- `/enroll` of that id is refused (409, the token is not used), and so are `/negotiate`, `/stream` and
+- `/enroll` of that id is refused (409 with a live token, which is not used; an expired token is retired and
+  refused like any bad token), and so are `/negotiate`, `/stream` and
   `/resume_token` from a client already bound to it (409, `reason: reserved_client_id`; a WARNING naming
   `zfsbackup-config trust revoke --client <id>`, at most once an hour per id);
 - `zfsbackup-config trust token create --client-id <own id>` is refused, and so is `identity set-client-id ID`
@@ -1100,10 +1101,14 @@ client bound to it would write into the same copies:
 - while this host's own id is enrolled with its own server (a loopback setup), every configuration write and
   `import` warns until you `trust revoke --client <id>`.
 
-A reload does not cut a receive that is already running: the outgoing API worker finishes it while the new
-workers start, so for a few moments a remote client bound to the newly reserved id and this host's local send can
-both aim at the same copy. ZFS refuses the second receive, so the worst case is a failed or repeated cycle, never
-a damaged copy.
+A reload does not cut a receive that is already running: the outgoing API worker finishes it first. Whenever the
+new configuration's local sender could write where the outgoing API worker still receives (entering a shared
+target, or switching a loopback destination to `zfs:T`), the daemon starts the new remote worker only after the
+old API worker has exited, so the local send never decides on a copy that an older receive is still changing. The
+log says so ("waiting for the old api worker to finish its receives"), and `zfsbackup-config status` shows the
+new generation as applied only once it starts. While that wait lasts, this host's sends pause (the draining API worker
+answers new requests with a retryable 503, as on any reload). The API worker itself is never held back: only this
+host can send as its own id, and the new remote worker never starts before the old one has finished.
 
 `identity set-client-id` on a host that shares its target moves this host's copies to `T/<new id>/` (a full send)
 and releases the old id: the copies under `T/<old id>/` are then an ordinary client tree, still pruned by the

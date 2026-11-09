@@ -12,7 +12,10 @@ no other file owns (the validation matrix is in `test_zfsbackup_store_local_dest
   `/stream` upgrade answer 409 `reserved_client_id` to a client BOUND to the reserved id, after
   authentication and the protocol check, before any `zfs` call, claim, pending entry or spawn;
 * ``TestReservedClientIdEnroll`` -- `/enroll` refuses the id after the token pre-check, with the token unspent
-  and no lockout count;
+  and no lockout count; ``TestReservedClientIdEnrollTokenLiveness`` / ``...ConfirmWiring`` -- the branch asks
+  `confirm_token_live`: an EXPIRED matching token (True from `token_precheck`) is the uniform 403, latched
+  durably and counted towards the lockout, a live one is still the 409 and stays unspent (real store, then a
+  scripted gateway for the call order, arguments and 503 mapping);
 * ``TestReservedClientIdLog`` -- one WARNING per hour naming `trust revoke --client`;
 * ``TestApiWorkerPassesTheReservation`` -- `ApiWorker._serve` passes `reserved_client_id` only when shared;
   ``TestDaemonHandsOverTheClientId`` -- `BackupDaemon._new_worker` hands the id to the API worker only when
@@ -51,13 +54,16 @@ from zfsbackup import api as api_module
 from zfsbackup import identity
 from zfsbackup import workers as workers_module
 from zfsbackup.api import (
-    ENROLL_REFUSED_ERROR, RESERVED_CLIENT_ENDPOINTS, RESERVED_CLIENT_REASON,
+    ENROLL_REFUSED_ERROR, RESERVED_CLIENT_ENDPOINTS, RESERVED_CLIENT_REASON, TRUST_BUSY_ERROR,
+    TRUST_UNAVAILABLE_ERROR,
 )
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, Destination, RemoteServerConfig, shared_receive_target,
 )
 from zfsbackup.config import model as model_module
-from zfsbackup.config.store.trust import TokenState
+from zfsbackup.config.store import trust as store_trust
+from zfsbackup.config.store.errors import ConfigBusy
+from zfsbackup.config.store.trust import EnrollOutcome, TokenState
 from zfsbackup.daemon import BackupDaemon
 from zfsbackup.logsetup import PEER_LOGGER
 from zfsbackup.protocol import PROTOCOL_HEADER
@@ -526,6 +532,315 @@ class TestReservedClientIdEnroll:
         for _ in range(4):                       # more than ENROLL_MAX_IN_FLIGHT would allow if leaked
             assert _enroll(app, HOST, make_client_cert(), token).status_code == 409
         assert _enroll(app, OTHER, make_client_cert(), token).status_code == 200
+
+
+class _Clock:
+    """A settable clock for `create_app(clock=...)`."""
+
+    def __init__(self, now):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.fixture
+def timed_real(mocker, tls_config_db):
+    """`reserved_real` with a settable app clock (`app.clock`) and a token created at `app.t0`
+    that lives 100 s: `app.token_text` (created at t0 - 1, expires at t0 + 99)."""
+    clock = _Clock(time.time())
+    app = _real_app(mocker, tls_config_db, reserved_client_id=HOST, clock=clock)
+    app.clock, app.t0 = clock, clock.now
+    app.token_text = app.trust.token(created_at=app.t0, ttl=100)
+    return app
+
+
+def token_state_at(app, when):
+    return store_trust.token_status(app.trust.resolved, when).state
+
+
+@pytest.mark.integration
+class TestReservedClientIdEnrollTokenLiveness:
+    """The reserved-id branch of `/enroll` asks `confirm_token_live`: `token_precheck` is True for an
+    EXPIRED token whose credentials match (so that `enroll_client` can retire it), and the branch
+    returns before `enroll_client`, so without the confirmation an expired token earned the 409 and
+    was never latched (a clock stepping back revived it)."""
+
+    def test_an_expired_matching_token_is_the_uniform_403_not_the_reservation(self, timed_real, zfs):
+        app = timed_real
+        app.clock.now = app.t0 + 500
+        resp = _enroll(app, HOST, make_client_cert(), app.token_text)
+        assert resp.status_code == 403 and resp.get_json() == ENROLL_REFUSED_ERROR
+        assert RESERVED_CLIENT_REASON not in resp.get_data(as_text=True)
+
+    def test_the_expired_token_is_retired_durably(self, timed_real, zfs):
+        app = timed_real
+        assert token_state_at(app, app.t0 + 10) is TokenState.ACTIVE
+        app.clock.now = app.t0 + 500
+        assert _enroll(app, HOST, make_client_cert(), app.token_text).status_code == 403
+        assert token_state_at(app, app.t0 + 10) is not TokenState.ACTIVE      # latched
+        # The clock steps back into the window; another id, the same token: still dead.
+        app.clock.now = app.t0 + 10
+        cert = make_client_cert()
+        resp = _enroll(app, OTHER, cert, app.token_text)
+        assert resp.status_code == 403 and resp.get_json() == ENROLL_REFUSED_ERROR
+        assert app.trust.pins() == {} and app.trust.clients() == {}
+
+    def test_it_reaches_neither_zfs_nor_the_enrolling_writer_nor_a_trust_row(self, mocker, timed_real, zfs):
+        app = timed_real
+        spy = mocker.spy(app.gateway, "enroll_client")
+        key = app.trust.trust_key()
+        app.clock.now = app.t0 + 500
+        _enroll(app, HOST, make_client_cert(), app.token_text)
+        spy.assert_not_called()
+        _untouched(zfs)
+        assert app.trust.pins() == {} and app.trust.clients() == {}
+        assert app.trust.trust_key() == key          # the latch is not a trust change
+
+    def test_an_expired_token_counts_towards_the_lockout_like_any_dead_token(self, timed_real, zfs):
+        app = timed_real
+        app.clock.now = app.t0 + 500
+        statuses = [_enroll(app, HOST, make_client_cert(), app.token_text).status_code
+                    for _ in range(7)]
+        assert statuses[:5] == [403] * 5 and 429 in statuses
+
+    def test_a_live_token_is_still_the_409_and_stays_unspent(self, mocker, timed_real, zfs):
+        app = timed_real
+        spy = mocker.spy(app.gateway, "enroll_client")
+        key = app.trust.trust_key()
+        app.clock.now = app.t0 + 10
+        resp = _enroll(app, HOST, make_client_cert(), app.token_text)
+        assert resp.status_code == 409 and resp.get_json()["reason"] == RESERVED_CLIENT_REASON
+        assert token_state_at(app, app.t0 + 10) is TokenState.ACTIVE
+        assert app.trust.token_state() is TokenState.ACTIVE
+        spy.assert_not_called()
+        _untouched(zfs)
+        assert app.trust.pins() == {} and app.trust.clients() == {}
+        assert app.trust.trust_key() == key
+        assert app.limits.enroll.retry_after("127.0.0.1") == 0
+
+    def test_a_live_token_is_never_a_lockout_count_and_still_enrolls_another_id(self, timed_real, zfs):
+        app = timed_real
+        for _ in range(10):
+            assert _enroll(app, HOST, make_client_cert(), app.token_text).status_code == 409
+        cert = make_client_cert()
+        resp = _enroll(app, OTHER, cert, app.token_text)
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert cert.fingerprint in app.trust.pins()
+
+    def test_the_confirmation_is_asked_once_after_the_pre_check(self, mocker, timed_real, zfs):
+        app = timed_real
+        order = []
+        pre, conf = app.gateway.token_precheck, app.gateway.confirm_token_live
+        mocker.patch.object(app.gateway, "token_precheck",
+                            side_effect=lambda **k: order.append("precheck") or pre(**k))
+        mocker.patch.object(app.gateway, "confirm_token_live",
+                            side_effect=lambda **k: order.append("confirm") or conf(**k))
+        _enroll(app, HOST, make_client_cert(), app.token_text)
+        assert order == ["precheck", "confirm"]
+
+    def test_a_revoked_certificate_is_the_uniform_403_and_the_token_is_untouched(self, mocker, timed_real, zfs):
+        app = timed_real
+        cert = make_client_cert()
+        app.trust.enroll(cert, OTHER)
+        store_trust.revoke_pin(app.trust.resolved, cert.fingerprint, lock=None)
+        token = app.trust.token(created_at=app.t0, ttl=100)
+        conf = mocker.spy(app.gateway, "confirm_token_live")
+        resp = _enroll(app, HOST, cert, token)
+        assert resp.status_code == 403 and resp.get_json() == ENROLL_REFUSED_ERROR
+        conf.assert_not_called()                           # the pre-check already said no
+        assert token_state_at(app, app.t0 + 10) is TokenState.ACTIVE
+        _untouched(zfs)
+
+    def test_a_revocation_the_pre_check_missed_is_still_403_and_does_not_latch(self, mocker, timed_real, zfs):
+        """The confirmation re-checks the certificate under the write lock."""
+        app = timed_real
+        cert = make_client_cert()
+        app.trust.enroll(cert, OTHER)
+        store_trust.revoke_pin(app.trust.resolved, cert.fingerprint, lock=None)
+        token = app.trust.token(created_at=app.t0, ttl=100)
+        mocker.patch.object(app.gateway, "token_precheck", return_value=True)
+        conf = mocker.spy(app.gateway, "confirm_token_live")
+        resp = _enroll(app, HOST, cert, token)
+        assert resp.status_code == 403 and resp.get_json() == ENROLL_REFUSED_ERROR
+        conf.assert_called_once()
+        assert token_state_at(app, app.t0 + 10) is TokenState.ACTIVE
+        _untouched(zfs)
+
+    def test_a_live_token_scoped_to_another_id_is_the_uniform_403_and_stays_unspent(self, timed_real, zfs):
+        app = timed_real
+        app.trust.enroll(make_client_cert(), OTHER)
+        token = app.trust.token(client_id=OTHER, created_at=app.t0, ttl=100)
+        key = app.trust.trust_key()
+        resp = _enroll(app, HOST, make_client_cert(), token)
+        assert resp.status_code == 403 and resp.get_json() == ENROLL_REFUSED_ERROR
+        assert RESERVED_CLIENT_REASON not in resp.get_data(as_text=True)
+        assert token_state_at(app, app.t0 + 10) is TokenState.ACTIVE      # a scope refusal never latches
+        assert app.trust.trust_key() == key
+        _untouched(zfs)
+
+    def test_a_live_token_scoped_to_the_reserved_id_is_the_409(self, timed_real, zfs):
+        app = timed_real
+        app.trust.enroll(make_client_cert(), HOST)
+        token = app.trust.token(client_id=HOST, created_at=app.t0, ttl=100)
+        resp = _enroll(app, HOST, make_client_cert(), token)
+        assert resp.status_code == 409 and resp.get_json()["reason"] == RESERVED_CLIENT_REASON
+        assert token_state_at(app, app.t0 + 10) is TokenState.ACTIVE
+        _untouched(zfs)
+
+    def test_another_ids_expired_token_is_refused_by_enroll_client_as_before(self, mocker, timed_real, zfs):
+        app = timed_real
+        conf = mocker.spy(app.gateway, "confirm_token_live")
+        app.clock.now = app.t0 + 500
+        resp = _enroll(app, OTHER, make_client_cert(), app.token_text)
+        assert resp.status_code == 403 and resp.get_json() == ENROLL_REFUSED_ERROR
+        conf.assert_not_called()
+        assert token_state_at(app, app.t0 + 10) is not TokenState.ACTIVE
+
+    def test_without_a_reservation_the_host_id_and_an_expired_token_never_ask(self, mocker, tls_config_db, zfs):
+        clock = _Clock(time.time())
+        app = _real_app(mocker, tls_config_db, clock=clock)
+        token = app.trust.token(created_at=clock.now, ttl=100)
+        conf = mocker.spy(app.gateway, "confirm_token_live")
+        clock.now += 500
+        assert _enroll(app, HOST, make_client_cert(), token).status_code == 403
+        conf.assert_not_called()
+
+
+@pytest.mark.integration
+class TestReservedClientIdEnrollConfirmWiring:
+    """`/enroll`'s call of `trust.confirm_token_live`, with a scripted gateway."""
+
+    @pytest.fixture
+    def authed(self, mocker, zfs):
+        self.clock = _Clock(time.time())
+        return _authed(mocker, client_id=None, reserved_client_id=HOST, clock=self.clock)
+
+    @staticmethod
+    def enroll(authed, cid=HOST):
+        token = str(identity.make_token(authed.server_fp)[0])
+        cert = make_client_cert()
+        return _enroll(authed, cid, cert, token), cert, token
+
+    def test_a_live_token_is_the_409_with_no_zfs_and_no_enroll_call(self, authed, zfs):
+        resp, _, _ = self.enroll(authed)
+        assert resp.status_code == 409 and resp.get_json()["reason"] == RESERVED_CLIENT_REASON
+        assert len(authed.gateway.confirm_calls) == 1
+        assert authed.gateway.enroll_calls == []
+        _untouched(zfs)
+
+    def test_a_dead_token_is_the_uniform_403(self, authed, zfs):
+        authed.gateway.confirm_effect = False
+        resp, _, _ = self.enroll(authed)
+        assert resp.status_code == 403 and resp.get_json() == ENROLL_REFUSED_ERROR
+        assert RESERVED_CLIENT_REASON not in resp.get_data(as_text=True)
+        assert authed.gateway.enroll_calls == []
+        _untouched(zfs)
+
+    def test_a_dead_token_counts_towards_the_lockout(self, authed):
+        authed.gateway.confirm_effect = False
+        statuses = [self.enroll(authed)[0].status_code for _ in range(6)]
+        assert statuses == [403] * 5 + [429]
+
+    def test_four_dead_tokens_are_not_yet_a_lockout(self, authed):
+        authed.gateway.confirm_effect = False
+        assert [self.enroll(authed)[0].status_code for _ in range(4)] == [403] * 4
+        assert authed.limits.enroll.retry_after("127.0.0.1") == 0
+
+    def test_a_dead_token_is_logged_as_a_token_or_revoked_certificate_refusal(self, authed, caplog):
+        authed.gateway.confirm_effect = False
+        with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
+            resp, _, token = self.enroll(authed)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and warnings[0].endswith("refused: token or revoked certificate")
+        assert token not in caplog.text and token.split(".")[-1] not in caplog.text
+
+    def test_a_live_token_is_not_a_lockout_count(self, authed):
+        for _ in range(10):
+            assert self.enroll(authed)[0].status_code == 409
+        assert authed.limits.enroll.retry_after("127.0.0.1") == 0
+
+    def test_the_order_is_precheck_then_confirm_then_the_409_and_no_zfs(self, authed, zfs):
+        order = []
+        authed.gateway.precheck_effect = lambda **k: order.append("precheck") or True
+        authed.gateway.confirm_effect = lambda **k: order.append("confirm") or True
+        zfs.exists.side_effect = lambda *a: order.append("zfs") or False
+        authed.gateway.enroll_effect = lambda **k: order.append("store") or EnrollOutcome.ENROLLED
+        assert self.enroll(authed)[0].status_code == 409
+        assert order == ["precheck", "confirm"]
+
+    def test_a_refusing_pre_check_means_confirm_is_never_asked(self, authed):
+        authed.gateway.precheck_effect = False
+        assert self.enroll(authed)[0].status_code == 403
+        assert authed.gateway.confirm_calls == []
+
+    def test_it_is_called_with_the_hash_the_server_the_id_the_clock_and_the_certificate(self, authed):
+        resp, cert, token = self.enroll(authed)
+        (call,) = authed.gateway.confirm_calls
+        assert call == {
+            "secret_sha256": identity.secret_hash(identity.parse_token(token)[1]),
+            "server_fingerprint": authed.server_fp,
+            "client_id": HOST,
+            "now": self.clock,
+            "fingerprint": cert.fingerprint,
+        }
+        assert token.split(".")[-1] not in repr(call)
+        (pre,) = authed.gateway.precheck_calls
+        assert pre == {k: v for k, v in call.items() if k != "client_id"}   # the same question, scoped
+
+    def test_a_busy_confirmation_is_503_with_retry_and_not_a_failure(self, authed, zfs, caplog):
+        authed.gateway.confirm_effect = ConfigBusy("database is locked")
+        with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
+            for _ in range(10):
+                resp, _, _ = self.enroll(authed)
+                assert resp.status_code == 503 and resp.get_json() == TRUST_BUSY_ERROR
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert authed.limits.enroll.retry_after("127.0.0.1") == 0
+        assert authed.gateway.enroll_calls == [] and authed.gate.active == 0
+        _untouched(zfs)
+
+    @pytest.mark.parametrize("error", [RuntimeError("no such table: enrollment_tokens"), OSError("disk I/O error")])
+    def test_any_other_confirmation_failure_is_503_unavailable_and_leaks_nothing(
+        self, authed, zfs, caplog, error
+    ):
+        authed.gateway.confirm_effect = error
+        with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
+            resp, _, token = self.enroll(authed)
+        assert resp.status_code == 503 and resp.get_json() == TRUST_UNAVAILABLE_ERROR
+        assert str(error) not in resp.get_data(as_text=True)
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1 and str(error) in errors[0].getMessage()
+        assert token not in caplog.text and token.split(".")[-1] not in caplog.text
+        assert authed.limits.enroll.retry_after("127.0.0.1") == 0
+        assert authed.gateway.enroll_calls == []
+        _untouched(zfs)
+
+    def test_the_in_flight_slot_is_released_after_every_answer(self, authed):
+        for effect in (True, ConfigBusy("busy"), RuntimeError("down")) * 2:
+            authed.gateway.confirm_effect = effect
+            assert self.enroll(authed)[0].status_code in (409, 503)
+        authed.gateway.confirm_effect = True
+        assert self.enroll(authed, OTHER)[0].status_code == 200
+
+    def test_a_non_reserved_id_never_asks(self, authed, zfs):
+        resp, _, _ = self.enroll(authed, OTHER)
+        assert resp.status_code == 200
+        assert authed.gateway.confirm_calls == []
+        assert len(authed.gateway.precheck_calls) == 1 and len(authed.gateway.enroll_calls) == 1
+
+    @pytest.mark.parametrize("reserved", [None, "host-2"])
+    def test_without_a_matching_reservation_the_id_never_asks(self, mocker, zfs, reserved):
+        authed = _authed(mocker, client_id=None, reserved_client_id=reserved)
+        resp, _, _ = self.enroll(authed, HOST)
+        assert resp.status_code == 200
+        assert authed.gateway.confirm_calls == []
+
+    def test_a_dead_token_for_a_non_reserved_id_is_decided_by_enroll_client(self, authed):
+        authed.gateway.confirm_effect = False          # must not matter
+        authed.gateway.enroll_effect = EnrollOutcome.REFUSED
+        resp, _, _ = self.enroll(authed, OTHER)
+        assert resp.status_code == 403 and resp.get_json() == ENROLL_REFUSED_ERROR
+        assert authed.gateway.confirm_calls == []
 
 
 # ---------------------------------------------------------------------------

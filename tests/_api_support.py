@@ -7,7 +7,7 @@ Nothing here talks to ZFS and no socket is opened.
   with `cryptography` (no files); `sign` is the proof-of-possession signature.
 * `FakeGateway` -- a stub of everything `api.create_app` asks of a `TrustGateway`:
   `lookup`, `refresh`, `restart_reason`, `current_context` and the three store writers
-  (`token_precheck`, `enroll_client`, `rotate_client`, `retire_predecessor`), each scriptable and counted.
+  (`token_precheck`, `confirm_token_live`, `enroll_client`, `rotate_client`, `retire_predecessor`), each scriptable and counted.
 * `plain_client` / `buffered_client` -- test clients that send the wire protocol header
   (plan S-5, `protocol=None` for none) and the second of them a certificate.
 * `permissive_limits` -- an `api.PeerLimits` (S-3) that never refuses, for tests that open many
@@ -186,6 +186,10 @@ class FakeGateway:
         #: `token_precheck`'s answer: True (the default) lets `/enroll` go on to `zfs` and the store.
         self.precheck_effect = True
         self.precheck_calls: List[dict] = []
+        #: `confirm_token_live`'s answer: True (the default) is a live token (the reserved-client-id
+        #: branch of `/enroll` then answers 409); False is a dead or expired one (uniform 403).
+        self.confirm_effect = True
+        self.confirm_calls: List[dict] = []
         self.enroll_calls: List[dict] = []
         self.rotate_calls: List[dict] = []
         self.retire_calls: List[str] = []
@@ -214,6 +218,10 @@ class FakeGateway:
     def token_precheck(self, **kwargs) -> bool:
         self.precheck_calls.append(kwargs)
         return _effect(self.precheck_effect, **kwargs)
+
+    def confirm_token_live(self, **kwargs) -> bool:
+        self.confirm_calls.append(kwargs)
+        return _effect(self.confirm_effect, **kwargs)
 
     def enroll_client(self, **kwargs):
         self.enroll_calls.append(kwargs)

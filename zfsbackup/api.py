@@ -1151,6 +1151,10 @@ class TrustGateway:
     - `token_precheck()` is the store's read-only enrollment filter
       (`store.trust.token_precheck`): `/enroll` asks it before any `zfs`
       call. It never writes; `enroll_client` stays the authority.
+    - `confirm_token_live()` (`store.trust.confirm_token_live`) is the
+      reserved-id branch of `/enroll`: True iff the token is redeemable right
+      now. It never consumes a live token; an expired matching token is
+      latched (retired durably, as `enroll_client` would) and it answers False.
 
     **Fails closed.** Until the first successful read nobody is trusted: the
     context has no pins (a client certificate fails the handshake; a client
@@ -1193,14 +1197,15 @@ class TrustGateway:
         retire_predecessor: Optional[Callable] = None,
         token_precheck: Optional[Callable] = None,
         list_revoked: Optional[Callable] = None,
+        confirm_token_live: Optional[Callable] = None,
     ) -> None:
         """`identity` is the loaded server `identity.Identity`; `resolved`
         the `ResolvedConfigPath` of the config database. The callables are
         seams for tests; the defaults are `store.trust.read_trust_key`,
         `store.trust.read_trust`, `identity.server_context` and
         `store.trust.enroll_client` / `rotate_client` / `retire_predecessor` /
-        `token_precheck` / `list_revoked` (all through the
-        `zfsbackup.config.store` package).
+        `token_precheck` / `list_revoked` / `confirm_token_live` (all through
+        the `zfsbackup.config.store` package).
         With the default factory, rebuilds wait at most
         `GATEWAY_LOCK_TIMEOUT` for the identity lock; the initial context
         waits the identity module's default. A `context_factory` is called
@@ -1210,7 +1215,7 @@ class TrustGateway:
         (`ApiWorker`) then exits."""
         store = (
             read_trust_key, read_trust, enroll_client, rotate_client,
-            retire_predecessor, token_precheck, list_revoked,
+            retire_predecessor, token_precheck, list_revoked, confirm_token_live,
         )
         if any(f is None for f in store):
             from zfsbackup.config import store as _store
@@ -1221,6 +1226,7 @@ class TrustGateway:
             retire_predecessor = retire_predecessor or _store.retire_predecessor
             token_precheck = token_precheck or _store.token_precheck
             list_revoked = list_revoked or _store.list_revoked
+            confirm_token_live = confirm_token_live or _store.confirm_token_live
         server_context_fn = None
         if context_factory is None:
             from zfsbackup.identity import server_context
@@ -1246,6 +1252,7 @@ class TrustGateway:
         self._retire_predecessor = retire_predecessor
         self._token_precheck = token_precheck
         self._list_revoked = list_revoked
+        self._confirm_token_live = confirm_token_live
         self._lock = threading.Lock()
         #: Message of the read failure currently in effect (logged once).
         self._problem: Optional[str] = None
@@ -1308,6 +1315,17 @@ class TrustGateway:
         read-only filter `/enroll` runs before it spends a `zfs` call. Takes
         no write lock and writes nothing."""
         return _store_call(self._token_precheck, self._resolved, wait=STORE_CALL_WAIT, **kwargs)
+
+    def confirm_token_live(self, **kwargs) -> bool:
+        """`store.trust.confirm_token_live(resolved, **kwargs)` -> `bool`: True
+        iff the enrollment token is redeemable right now. Never consumes a live
+        token; an expired token whose credentials match is latched (retired
+        durably) and False is returned, so a refusal that does not reach
+        `enroll_client` (the reserved client id) cannot bypass the expiry
+        latch. A write, but only of that retirement."""
+        return _store_call(
+            self._confirm_token_live, self._resolved, wait=STORE_CALL_WAIT, **kwargs
+        )
 
     def list_revoked(self) -> tuple:
         """`store.trust.list_revoked(resolved)` -> every `RevokedPin`
@@ -3107,14 +3125,21 @@ def create_app(
           400 -> token for another server 403 refused -> certificate 422 ->
           signature 403 -> in-flight cap 503 -> token pre-check 403 refused (read-only, before any
           `zfs` call; also refuses a revoked certificate) -> reserved client
-          id 409 (only with `reserved_client_id`) -> `zfs.exists`
+          id: `confirm_token_live` (403 refused, counted; only with
+          `reserved_client_id`), then 409 -> `zfs.exists`
           503 -> the store (`enroll_client`, the authority).
         - 409 `{"error", "reason": "reserved_client_id"}`: the id is this
           host's own, reserved while a local destination shares the backup
           target (`create_app`'s `reserved_client_id`). Decided after the
-          token pre-check, so only a holder of a valid token learns it, and
-          before any `zfs` call or trust write: the token was NOT spent and
-          stays valid. Not counted as a failed attempt towards the lockout.
+          token pre-check and `confirm_token_live` (the token is redeemable
+          right now AND scoped to this id or unscoped: an expired token is
+          latched, retired durably, and a token scoped to another client id
+          is not live for this one -- both get the uniform 403 refusal,
+          counted as a failed attempt), so only a holder of a live,
+          applicable token learns the id is reserved. The only trust write
+          before this answer is that expiry latch, and no `zfs` call is made:
+          the token is NOT spent and stays valid. The 409 itself is not
+          counted as a failed attempt towards the lockout.
         - 409 `{"error", "reason": "client_id_taken", "client_id", "hint"}`:
           the id is already known here (a client record, a revoked one, or an
           existing `<target>/<client_id>`) and the token is not scoped to it.
@@ -3228,12 +3253,27 @@ def create_app(
             # same uniform 403 either way.
             return failed('token or revoked certificate', (jsonify(ENROLL_REFUSED_ERROR), 403))
         if reserved_client_id is not None and client_id == reserved_client_id:
-            # After the token pre-check (only a holder of a valid token, who
-            # proved possession of the key, learns the id is reserved) and
-            # before `enroll_client` consumes the token or writes any trust
-            # row; the token stays valid. Not `failed(...)`: a legitimate
+            # Before `enroll_client` consumes the token or writes any trust
+            # row, so this branch must do what `enroll_client`'s first checks
+            # would: `token_precheck` answers True for an EXPIRED token whose
+            # credentials match (on purpose, so `enroll_client` retires it
+            # durably), so `confirm_token_live` decides here -- True only for a
+            # token redeemable right now, an expired one is latched and
+            # refused with the same uniform 403 as `EnrollOutcome.REFUSED`.
+            # Only a holder of a live token, who proved possession of the key,
+            # learns the id is reserved, and the live token stays valid. The
+            # reservation answer itself is not `failed(...)`: a legitimate
             # operator must not lock their own address out of `/enroll` by
-            # trying the reserved id, and the valid token rules out guessing.
+            # trying the reserved id, and the live token rules out guessing.
+            try:
+                live = trust.confirm_token_live(
+                    secret_sha256=secret_sha256, server_fingerprint=own_fp, now=clock,
+                    fingerprint=cert_fp, client_id=client_id,
+                )
+            except Exception as e:
+                return _store_failure('enrollment', e)
+            if not live:
+                return failed('token or revoked certificate', (jsonify(ENROLL_REFUSED_ERROR), 403))
             return _reserved_refusal(f"enrollment as client {client_id!r}")
         try:
             client_root = Dataset(f"{target}/{client_id}")

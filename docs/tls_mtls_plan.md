@@ -870,8 +870,10 @@ carry a stable `reason`.
   "cert_pem", "signature": base64(sign(cert key, enrollment_payload(server_fp, client_id, cert_fp, secret_hash(secret))))}`.
   Order: shape 400 → grammar 400 → label 400 → token parse 400 → token fp ≠ own 403 refused → `check_client_cert`
   422 → signature 403 `bad_signature` → token pre-check 403 `refused` (read-only `token_precheck`, same body as a
-  store refusal; never reaches `zfs`) → reserved id 409 `reserved_client_id` (only while a local destination shares
-  the server's target and `client_id` is the server host's own id; token not spent, not counted as a failure) →
+  store refusal; never reaches `zfs`) → reserved id (only while a local destination shares the server's target and
+  `client_id` is the server host's own id): `confirm_token_live` decides — a live token in scope gets 409
+  `reserved_client_id` (token not spent, not counted as a failure); an expired one is retired durably (the expiry
+  latch) and, like a token scoped to another id, gets the uniform 403 `refused` (counted) →
   `zfs.exists(target/<id>)` 503 → store (`enroll_client`, the authority).
   200 `enrolled` | 200 `already_trusted` (live token only, not spent) | 403 `refused` (identical for every token
   problem) | 409 `client_id_taken` (+`hint`; token not spent) | 409 `reserved_client_id` (token not spent) | 409

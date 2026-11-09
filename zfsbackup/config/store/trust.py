@@ -19,8 +19,8 @@ Who writes what (the invariant this module exists to keep checkable)
   config generation; nothing else here touches the config generation.
 - **The trust tables have exactly two writers, both through this module:**
   the CLI (`create_token`, `revoke_token`, `revoke_pin`, `revoke_client`; under
-  the writer lock) and the API worker (`enroll_client`, `rotate_client`,
-  `retire_predecessor`). The API writers take NO flock: against the CLI they
+  the writer lock) and the API worker (`enroll_client`, `confirm_token_live`,
+  `rotate_client`, `retire_predecessor`). The API writers take NO flock: against the CLI they
   serialise only on SQLite's write lock (`BEGIN IMMEDIATE`), and against each
   other on `_API_WRITE_LOCK`, an in-process lock taken before the write
   connection is opened (so request threads queue on a lock that wakes them at
@@ -98,7 +98,7 @@ Time
 ----
 Every timestamp is POSIX seconds (float), passed in by the caller where the
 decision depends on it (`now`), so the API can use its own clock and tests a
-fake one. The API writers (`enroll_client`, `rotate_client`) take `now` as
+fake one. The API writers (`enroll_client`, `confirm_token_live`, `rotate_client`) take `now` as
 EITHER a number OR a zero-argument callable returning one (`time.time`): a
 callable is read again after the write lock is obtained and that reading is
 the one every decision and timestamp uses, so up to two busy timeouts of lock
@@ -169,6 +169,7 @@ __all__ = [
     "TrustKey",
     "TrustSnapshot",
     "TrustedPin",
+    "confirm_token_live",
     "create_token",
     "enroll_client",
     "ensure_client_id",
@@ -1398,6 +1399,95 @@ def _token_redeemable(
         # (the token may be valid once the clock is right again).
         return False
     return True
+
+
+def confirm_token_live(
+    resolved: ResolvedConfigPath,
+    *,
+    secret_sha256: object,
+    server_fingerprint: str,
+    client_id: str,
+    now: Clock,
+    fingerprint: Optional[str] = None,
+) -> bool:
+    """Would `enroll_client` redeem this token for `client_id` RIGHT NOW?
+
+    True iff `enroll_client`'s checks 0, 1 and 3's scope test would all pass:
+    the fingerprint, when given, is not revoked (0); the token exists, is
+    unspent, its server fingerprint and secret hash match and
+    `created_at <= now < expires_at` (1); and it is unscoped or scoped to
+    `client_id` (3). A token scoped to ANOTHER id is False, as `REFUSED` is
+    for `enroll_client`. It NEVER consumes a live token, never pins and never
+    bumps the trust generation.
+
+    The caller is `/enroll` when it must refuse an enrollment AS the client
+    id this host reserves (a local destination shares the backup target):
+    only a live token that `enroll_client` would have honoured earns the 409
+    `reserved_client_id` (and stays unspent); `token_precheck` alone is not
+    enough because it is True for an EXPIRED token with matching
+    credentials, on purpose, so that `enroll_client` can retire it.
+
+    The only write this function can make is that retirement (the expiry
+    latch: `consumed_at = now`, `consumed_fingerprint` NULL, exactly
+    `enroll_client`'s, committed although the answer is False; a clock that
+    later steps back into the token's window cannot revive it, and the caller
+    answers the same uniform 403 as for any other dead token). So it decides
+    from ONE read-only snapshot first and takes the write lock only when that
+    snapshot shows a matching EXPIRED token:
+
+    - wrong, absent, spent, future-dated or revoked -> False, no write lock
+      (an unauthenticated flood never takes it);
+    - live and in scope -> True, no write lock (a stale True is harmless: the
+      caller only answers 409 and changes nothing); live and scoped to
+      another id -> False, no write lock (`enroll_client` never latches it);
+    - matching but expired -> `_API_WRITE_LOCK` and one `BEGIN IMMEDIATE`
+      transaction (as `enroll_client`): `now` read again after the lock, then
+      check 0, check 1 (latches) and the scope test, in `enroll_client`'s
+      order, via the same helpers (`_token_worth_locking_for`, `_is_revoked`,
+      `_token_redeemable`).
+
+    No flock (the API worker calls this from a request thread); never nest it
+    inside another writer. `now`: POSIX seconds or a zero-argument callable
+    (see "Time"). `client_id` must satisfy the A7 grammar and
+    `server_fingerprint` (and `fingerprint`, if given) be a SHA-256
+    fingerprint (`ValueError`, a programming error: the API validates
+    first). A malformed `secret_sha256` is just False. Raises `ConfigBusy`,
+    `ConfigPathError`, `SchemaError`, as `enroll_client` does.
+    """
+    client_id = _client_id(client_id)
+    server_fp = normalize_fingerprint(server_fingerprint)
+    client_fp = None if fingerprint is None else normalize_fingerprint(fingerprint)
+    clock = _clock(now)
+
+    with _read_tx(resolved) as session:
+        row = _select_token(session)
+        read_now = clock()
+        # The credential comparison runs first and always (constant time),
+        # whatever the revoked check then says (as `token_precheck`).
+        worth = _token_worth_locking_for(
+            row, server_fp=server_fp, secret_sha256=secret_sha256, now=read_now,
+        )
+        if client_fp is not None and _is_revoked(session, client_fp):
+            return False
+        if not worth:
+            return False
+        if read_now < row.expires_at:
+            # Live: nothing to write. Scope is check 3 (never latches).
+            return row.client_id is None or row.client_id == client_id
+
+    with _api_writer(resolved), _write_tx(resolved) as session:
+        # Read after the write lock is held (see `enroll_client`). Returning
+        # (not raising) commits, so the expiry latch `_token_redeemable`
+        # wrote persists when it answers False.
+        now = clock()
+        if client_fp is not None and _is_revoked(session, client_fp):
+            return False
+        token = _select_token(session)
+        if not _token_redeemable(
+            session, token, server_fp=server_fp, secret_sha256=secret_sha256, now=now,
+        ):
+            return False
+        return token.client_id is None or token.client_id == client_id
 
 
 def enroll_client(
