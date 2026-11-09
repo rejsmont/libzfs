@@ -1108,8 +1108,10 @@ rename of the whole `T/<client_id>` tree to a new target `L` continues the chain
 
 - **`rename dataset`** (like for a remote) needs `--force` and prints, for each local destination, the copy's
   real path and the exact `zfs rename` (plus `zfs set org.zfsbackup:source_dataset=<new name> …`) that moves it
-  within its parent. Otherwise the copy stays under the old name, orphaned (nothing sends to it, and it is no
-  longer pruned to its rules), and the new name starts with a full send. The CLI does not run these commands.
+  within its parent. Otherwise the copy stays under the old name, orphaned, and the new name starts with a full
+  send. Nothing sends to the old copy any more, but the pruner still applies its last stamped retention, so its
+  history expires down to its newest snapshot: move it out of `<target>/<client id>/` (or destroy it) by hand
+  if you want to keep it. The CLI does not run these commands.
 - **`identity set-client-id`** changes the directory the copies live in: the next send to each local
   destination is a full send into `<target>/<new id>/`, and the copies under the old id are orphaned (they carry
   the old id, so a rename would not adopt them). The CLI warns and prints the optional, destructive `zfs

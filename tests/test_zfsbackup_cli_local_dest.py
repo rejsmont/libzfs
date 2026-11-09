@@ -836,6 +836,10 @@ class TestRenameDatasetLocal:
         assert ("`zfs set org.zfsbackup:source_dataset=tank/d backup/local/host-1/tank/d`"
                 in result.stderr)
         assert "zfs rename -p" not in result.stderr
+        # a copy left behind is still discovered and pruned (`local_copies`): say so
+        err = " ".join(result.stderr.split())
+        assert "the pruner still applies its last stamped retention" in err
+        assert "prunes it to its rules any more" not in err
 
     @pytest.mark.parametrize(
         "old, new",
@@ -852,6 +856,9 @@ class TestRenameDatasetLocal:
         assert "The parent path changes" in err and "orphaned" in err
         assert f"a full send into backup/local/host-1/{new}" in err
         assert "zfs rename" not in err and "zfs set" not in err   # a `-p` container is never adopted
+        flat = " ".join(err.split())
+        assert "the pruner still applies its last stamped retention" in flat
+        assert "move it out of backup/local/host-1/ by hand" in flat
 
     def test_a_top_level_rename_has_the_same_parent(self, run, db):
         make_db(run, db, ONE_LOCAL_YAML.replace("tank/forever", "tank").replace(

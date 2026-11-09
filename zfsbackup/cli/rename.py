@@ -25,9 +25,9 @@ written.
   copy's path from the client id and the dataset name, so a changed path means
   the next backup is likely a full send and the old server copy is orphaned.
   This tool never touches a server. For a local (`zfs:`) destination the note
-  names the real copy path (`<target>/<client id>/<old>` -> `.../<new>`) and the
-  exact `zfs rename` that moves it (`-p` when the parent changes); this tool
-  does not run it;
+  names the real copy path (`<target>/<client id>/<old>` -> `.../<new>`) and,
+  when the parent is unchanged, the exact `zfs rename` that moves it; this tool
+  does not run it. A copy left behind is still pruned to its last stamped rules;
 - `--clear-stale-props` removes `org.zfsbackup:config` and every
   `org.zfsbackup:anchor.*` and `org.zfsbackup:inflight.*` from the old dataset
   (an `inflight.*` pin is an anchor-like pin on the two snapshots of a send in
@@ -238,6 +238,15 @@ def _local_copy_path(target: str, client_id: str, name: str) -> str:
     return f"{target}/{client_id}/{name}"
 
 
+# The pruner discovers every stamped copy under <target>/<client id>/, whatever
+# the source is called now (`DatasetManager.local_copies`), so a copy left
+# behind by a rename is still pruned -- to its last stamped rules.
+_ORPHAN_PRUNED = (
+    "nothing sends to it any more, but the pruner still applies its last stamped "
+    "retention, so its history expires down to its newest snapshot"
+)
+
+
 def _local_note(
     snapshot: ConfigSnapshot, destination: str, target: str, old: str, new: str
 ) -> str:
@@ -260,8 +269,7 @@ def _local_note(
             "first: run, while no send to it is in progress, "
             f"`zfs rename {shlex.quote(old_path)} {shlex.quote(new_path)}` and then "
             f"`zfs set org.zfsbackup:source_dataset={shlex.quote(new)} {shlex.quote(new_path)}`; "
-            f"otherwise the copy at {old_path} stays where it is, orphaned (nothing sends "
-            "to it or prunes it to its rules any more)"
+            f"otherwise the copy at {old_path} stays where it is, orphaned: {_ORPHAN_PRUNED}"
         )
     # Another pool or a deeper path: the new parent would have to be created,
     # and a container made by `zfs rename -p` has no local client_id, so it is
@@ -270,8 +278,8 @@ def _local_note(
         header
         + "The parent path changes, so the copy cannot simply be renamed: the next backup "
         f"to it is a full send into {new_path}, and the copy at {old_path} stays where it "
-        "is, orphaned (nothing sends to it or prunes it to its rules any more; it can be "
-        "kept or destroyed by hand)"
+        f"is, orphaned: {_ORPHAN_PRUNED}; to keep its history, move it out of "
+        f"{target}/{cid}/ by hand (or destroy it)"
     )
 
 
