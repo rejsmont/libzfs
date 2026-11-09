@@ -772,7 +772,10 @@ def _enroll_failure(reply: _Reply, url: str, secrets: Tuple[str, ...],
             "local destination shares the server's backup target (the token was not used and "
             "is still valid). Give this host another client id (`zfsbackup-config identity "
             "set-client-id ID`; if this host is enrolled with other servers that needs --force "
-            "and enrolling with them again) and enroll again with the same token"
+            "and enrolling with them again) and enroll again. The same token works only if it "
+            "is unscoped; a token created with `trust token create --client-id` stays tied to "
+            "the reserved id, so then ask the server operator for a new one (unscoped, or "
+            "`--client-id ID` for the new id)"
             + (f"\nServer: {text}" if text else "")
         )
     if status == 409 and reason == "cert_bound_elsewhere":
