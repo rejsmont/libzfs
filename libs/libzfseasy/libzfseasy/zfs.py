@@ -2925,7 +2925,7 @@ class SendCommand(Command):
     def snapshot(cls, ds: Snapshot, since: Optional[Snapshot] = None, intermediate: bool = False,
                  replicate: bool = False, holds: bool = False, properties: bool = False, backup: bool = False,
                  raw: bool = False, compressed: bool = False, embed: bool = False, large_blocks: bool = False,
-                 skip_missing: bool = False) -> 'StreamHandle':
+                 skip_missing: bool = False, *, peek: bool = True) -> 'StreamHandle':
 
         """Generate a send stream for a given ZFS snapshot
 
@@ -2942,6 +2942,9 @@ class SendCommand(Command):
             embed: bool -- generate a more compact stream by using the embedded_data pool feature (default False)
             large_blocks: bool -- generate a stream which may contain blocks larger than 128KB (default False)
             skip_missing: bool -- skip over missing snapshots (default False)
+            peek: bool -- keyword-only. True (default): block until the stream's first byte or EOF before
+                returning, so a zfs that fails immediately raises here instead of from close(). False: return the
+                handle right after spawning, without reading; see `_exec_stream` for what the caller then owns
 
         Returns:
             StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
@@ -2953,11 +2956,11 @@ class SendCommand(Command):
                              properties=properties, backup=backup, raw=raw, compressed=compressed, embed=embed,
                              large_blocks=large_blocks, skip_missing=skip_missing) + [str(ds)]
 
-        return cls._exec_stream(cmd)
+        return cls._exec_stream(cmd, peek=peek)
 
     @classmethod
     def dataset(cls, ds: Dataset, since: Optional[Snapshot] = None, raw: bool = False, compressed: bool = False,
-                embed: bool = False, large_blocks: bool = False) -> 'StreamHandle':
+                embed: bool = False, large_blocks: bool = False, *, peek: bool = True) -> 'StreamHandle':
 
         """Generate a send stream for a given ZFS dataset
 
@@ -2968,6 +2971,9 @@ class SendCommand(Command):
             compressed: bool -- generate a more compact stream by using dataset compression (default False)
             embed: bool -- generate a more compact stream by using the embedded_data pool feature (default False)
             large_blocks: bool -- generate a stream which may contain blocks larger than 128KB (default False)
+            peek: bool -- keyword-only. True (default): block until the stream's first byte or EOF before
+                returning, so a zfs that fails immediately raises here instead of from close(). False: return the
+                handle right after spawning, without reading; see `_exec_stream` for what the caller then owns
 
         Returns:
             StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
@@ -2978,12 +2984,12 @@ class SendCommand(Command):
             cls._get_options(since=since, raw=raw, compressed=compressed, embed=embed,
                              large_blocks=large_blocks) + [str(ds)]
 
-        return cls._exec_stream(cmd)
+        return cls._exec_stream(cmd, peek=peek)
 
     @classmethod
     def redact(cls, ds: Snapshot, redact: Bookmark, since: Union[Snapshot, Bookmark, None] = None,
                properties: bool = False, compressed: bool = False, embed: bool = False,
-               large_blocks: bool = False) -> 'StreamHandle':
+               large_blocks: bool = False, *, peek: bool = True) -> 'StreamHandle':
 
         """Generate a redacted send stream
 
@@ -2995,6 +3001,9 @@ class SendCommand(Command):
             compressed: bool -- generate a more compact stream by using dataset compression (default False)
             embed: bool -- generate a more compact stream by using the embedded_data pool feature (default False)
             large_blocks: bool -- generate a stream which may contain blocks larger than 128KB (default False)
+            peek: bool -- keyword-only. True (default): block until the stream's first byte or EOF before
+                returning, so a zfs that fails immediately raises here instead of from close(). False: return the
+                handle right after spawning, without reading; see `_exec_stream` for what the caller then owns
 
         Returns:
             StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
@@ -3005,15 +3014,18 @@ class SendCommand(Command):
             cls._get_options(since=since, properties=properties, compressed=compressed, embed=embed,
                              large_blocks=large_blocks) + [str(ds)]
 
-        return cls._exec_stream(cmd)
+        return cls._exec_stream(cmd, peek=peek)
 
     @classmethod
-    def resume(cls, token: str, embed: bool = False) -> 'StreamHandle':
+    def resume(cls, token: str, embed: bool = False, *, peek: bool = True) -> 'StreamHandle':
         """Creates a send stream which resumes an interrupted receive
 
          Keyword arguments:
             token: str -- resume token generated by the receiving side
             embed: bool -- generate a more compact stream by using the embedded_data pool feature (default False)
+            peek: bool -- keyword-only. True (default): block until the stream's first byte or EOF before
+                returning, so a zfs that fails immediately raises here instead of from close(). False: return the
+                handle right after spawning, without reading; see `_exec_stream` for what the caller then owns
 
         Returns:
             StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
@@ -3024,7 +3036,7 @@ class SendCommand(Command):
         """
         _check_resume_token(token)
         cmd = [_zfs_cmd(), 'send'] + cls._get_options(embed=embed) + ['-t', token]
-        return cls._exec_stream(cmd)
+        return cls._exec_stream(cmd, peek=peek)
 
     @classmethod
     def resume_info(cls, token: str) -> ResumeToken:
@@ -3076,12 +3088,15 @@ class SendCommand(Command):
         return info
 
     @classmethod
-    def partial(cls, ds: Dataset, since: Optional[Snapshot] = None) -> 'StreamHandle':
+    def partial(cls, ds: Dataset, since: Optional[Snapshot] = None, *, peek: bool = True) -> 'StreamHandle':
         """Generate a send stream from a dataset that has been partially received
 
         Keyword arguments:
             ds: Filesystem -- source ZFS filesystem
             since: Snapshot -- generate incremental stream from the specified snapshot (default None)
+            peek: bool -- keyword-only. True (default): block until the stream's first byte or EOF before
+                returning, so a zfs that fails immediately raises here instead of from close(). False: return the
+                handle right after spawning, without reading; see `_exec_stream` for what the caller then owns
 
         Returns:
             StreamHandle -- context manager wrapping the stream; close()/__exit__ waits
@@ -3090,7 +3105,7 @@ class SendCommand(Command):
 
         cmd = [_zfs_cmd(), 'send'] + cls._get_options(since=since) + ['-S', str(ds)]
 
-        return cls._exec_stream(cmd)
+        return cls._exec_stream(cmd, peek=peek)
 
     @staticmethod
     def _get_options(**kwargs):
@@ -3128,7 +3143,21 @@ class SendCommand(Command):
         return cmd
 
     @classmethod
-    def _exec_stream(cls, cmd) -> 'StreamHandle':
+    def _exec_stream(cls, cmd, *, peek: bool = True) -> 'StreamHandle':
+        """Spawn a streaming child and wrap its stdout in a StreamHandle
+
+        With `peek=True` (default) this blocks in `peek(8)` until the child writes its first byte or closes
+        stdout. That turns an immediate failure (bad snapshot name, missing permission, ...) into an Exception
+        raised here, with the child reaped, and lets an empty successful stream return a handle on a finished
+        process. The wait is unbounded: a child stuck in D state before its first byte blocks the caller, and
+        the child is neither terminated nor registered as stuck.
+
+        With `peek=False` nothing is read: the handle is returned right after the stderr reader starts, so the
+        caller can bound the first read itself (non-blocking reads on `handle.fileno()` / the stream). There is
+        no early-failure detection: a child that fails at once shows up as EOF on the stream, and the caller must
+        call `close()` (or leave the `with` block) to get the Exception built from its stderr and exit code.
+        Everything else (stderr reader, terminate/poll/close semantics, stuck-child registry) is unchanged.
+        """
         _log_command(cmd)
         errors = _BoundedErrors()
         stderr_thread = None
@@ -3137,6 +3166,8 @@ class SendCommand(Command):
             # stderr is drained on its own thread from the start, so a child writing more than a pipe buffer of
             # diagnostics can neither block itself nor stall the stdout peek below.
             stderr_thread = cls._start_stderr_reader_bin(process, errors)
+            if not peek:
+                return StreamHandle(process, process.stdout, errors, stderr_thread)
             while True:
                 output = cls._exec_capture_bin(process, errors, stderr_thread)
                 if output is False:

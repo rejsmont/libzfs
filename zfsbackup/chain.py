@@ -17,8 +17,18 @@ the in-flight pin and the anchor. A subclass supplies the transport:
 * `_stream_step(...)` -- carry ONE started `zfs send` to the destination and
   return `_OK`, `_FAILED` or `_STOP`.
 
-`zfsbackup.remote.RemoteBackupManager` is the HTTPS / websocket subclass. This
-module imports neither `requests`, `websocket` nor `zfsbackup.identity`.
+`zfsbackup.remote.RemoteBackupManager` is the HTTPS / websocket subclass and
+`zfsbackup.local.LocalBackupManager` the same-host one (`zfs send` piped into
+`zfs receive`); the wording hooks (`_copy_noun`, `_receiver`, `_on_receiver`,
+...) let each name its receiving side, the defaults being the remote wording.
+This module imports neither `requests`, `websocket` nor `zfsbackup.identity`.
+
+Every subclass `_negotiate` must fill `_server_info`, `_server_newer` and
+`_server_newer_status` on success: a missing value fails OPEN (`absent` reads
+as a server that predates B-2b in `_settle_up_to_date`, a missing
+`server_copy` skips `_server_copy_matches`). `backup_dataset` passes
+`client_id` on unchecked: the subclass's `_ready_transport` must refuse
+without one.
 """
 
 import logging
@@ -67,13 +77,14 @@ class NegotiationFailed(Exception):
 
 
 
-def _retry_word(e: 'NegotiationFailed') -> str:
+def _retry_word(e: 'NegotiationFailed', busy_prefix: str = "server is busy") -> str:
     """How to say a retryable negotiate refusal in a log line: `reloading`,
-    `busy`, or `busy: <the server's reason>`."""
+    `busy`, or `busy: <the server's reason>`. `busy_prefix` is how the
+    refusal's text starts (`ChainSender._busy_prefix`)."""
     text = str(e)
     if 'reloading' in text:
         return "reloading"
-    reason = text[len("server is busy"):].lstrip(': ')
+    reason = text[len(busy_prefix):].lstrip(': ')
     return f"busy: {reason}" if reason else "busy"
 
 
@@ -167,6 +178,39 @@ class ChainSender:
     #: messages appear under the transport's logger name.
     _logger = logger
 
+    # Wording hooks: how the chain's log lines name the receiving side. The
+    # defaults are the remote (server) wording, byte for byte; a subclass with
+    # another kind of receiver (`zfsbackup.local`) overrides them.
+    #: The receiver's copy of a dataset ("the server copy X ...").
+    _copy_noun = "server copy"
+    #: The placeholder for that copy's name when it is not known.
+    _copy_placeholder = "<server dataset>"
+    #: The receiving side as a subject ("the server discards ...").
+    _receiver = "the server"
+    #: Where an operator acts on the copy ("abort it on the server").
+    _on_receiver = "on the server"
+    #: Where snapshots of the copy that this sender never sent were made.
+    _taken_on_receiver = "taken on the server"
+    #: Where a snapshot already sent is ("... is already on the server").
+    _at_receiver = "on the server"
+    #: The sending side ("a snapshot this host does not have").
+    _sender = "this host"
+    #: How a retryable negotiate refusal's text starts (`_retry_word`).
+    _busy_prefix = "server is busy"
+    #: The runbook section on moving a copy aside, and the one on rejoining
+    #: (`None`: no separate pointer).
+    _rename_doc = "README 'Renaming a server copy aside'"
+    _rejoin_doc: Optional[str] = "README 'Rejoining'"
+    #: The label of the once-per-episode key of a receiver's stream refusal
+    #: (`(f"{dataset} [{label}]", destination)`), cleared by `_record_step`.
+    _refusal_label = "server refusal"
+    #: Whether `zfs send` is started with libzfseasy's blocking start-up peek
+    #: (the default: an immediate failure raises from the start call). A
+    #: transport that bounds the stream's first record itself sets False: the
+    #: handle then comes back at once, and an immediate failure shows as EOF
+    #: with `close()` raising (`_send_kwargs`).
+    _send_peek = True
+
     def __init__(
         self,
         config: BackupConfig,
@@ -227,13 +271,13 @@ class ChainSender:
         count = self._token_skips[key] = self._token_skips.get(key, 0) + 1
         if count >= RESUME_TOKEN_SKIP_ERROR_AFTER and key not in self._token_error_logged:
             self._token_error_logged.add(key)
-            server_ds = self._server_info.get(key, (None, None))[1] or '<server dataset>'
+            server_ds = self._server_info.get(key, (None, None))[1] or self._copy_placeholder
             self._logger.error(
                 f"{dsi.name} -> {destination}: the resume-token check has skipped the last "
                 f"{count} cycles in a row ({reason}); nothing is sent for this dataset until "
                 "it passes, so the destination is falling behind. See the WARNINGs above for "
-                "the cause. If the server's partial receive of this dataset is no longer "
-                f"wanted, abort it on the server with `zfs receive -A {server_ds}`; the next "
+                f"the cause. If {self._receiver}'s partial receive of this dataset is no longer "
+                f"wanted, abort it {self._on_receiver} with `zfs receive -A {server_ds}`; the next "
                 "cycle then sends fresh"
             )
 
@@ -325,7 +369,8 @@ class ChainSender:
             # "unknown" as "no common snapshot" and start a full send.
             if e.reloading and not e.zfs_timeout:  # a zfs timeout was logged by `_negotiate`
                 self._logger.info(
-                    f"{self._peer(transport)} is {_retry_word(e)}; skipping {dsi.name} this cycle"
+                    f"{self._peer(transport)} is {_retry_word(e, self._busy_prefix)}; "
+                    f"skipping {dsi.name} this cycle"
                 )
             return False
         if not self._server_copy_matches(dsi, destination, mode):
@@ -404,10 +449,10 @@ class ChainSender:
             return True
         name = server_ds or dsi.name
         self._log_refusal_once(key, (
-            f"{dsi.name} -> {destination}: the server copy {name} is a {copy} copy but this "
-            f"dataset is now sent {mode}; nothing is sent. On the server, move the old copy "
-            f"aside with `zfs rename {name} <a name outside the backup target>` (see README "
-            f"'Renaming a server copy aside'); the next cycle sends a full {mode} stream"
+            f"{dsi.name} -> {destination}: the {self._copy_noun} {name} is a {copy} copy but this "
+            f"dataset is now sent {mode}; nothing is sent. {self._on_receiver_capitalized()}, "
+            f"move the old copy aside with `zfs rename {name} <a name outside the backup target>` "
+            f"(see {self._rename_doc}); the next cycle sends a full {mode} stream"
         ))
         return False
 
@@ -471,12 +516,12 @@ class ChainSender:
                 self._refusal_logged.pop(none_key, None)
                 return ()
             self._log_refusal_once(none_key, (
-                f"{dsi.name} -> {destination}: the server copy {server_ds} holds snapshots but "
-                "none of them is a snapshot this host still has, and a full stream cannot "
-                "replace it, so nothing is sent. To keep the server copy, on the server: "
-                f"zfs rename {server_ds} <a name outside the backup target> (the next cycle "
-                "sends a full stream; see README 'Renaming a server copy aside'). "
-                "See README 'Rejoining'"
+                f"{dsi.name} -> {destination}: the {self._copy_noun} {server_ds} holds snapshots "
+                f"but none of them is a snapshot {self._sender} still has, and a full stream "
+                f"cannot replace it, so nothing is sent. To keep the {self._copy_noun}, "
+                f"{self._on_receiver}: zfs rename {server_ds} <a name outside the backup target> "
+                f"(the next cycle sends a full stream; see {self._rename_doc})."
+                + self._rejoin_pointer()
             ))
             return None
         self._refusal_logged.pop(none_key, None)
@@ -487,7 +532,7 @@ class ChainSender:
             # written or sent (the stream would be refused with `listing`).
             self._refusal_logged.pop(key, None)
             self._log_warning_once(unknown_key, (
-                f"{dsi.name} -> {destination}: the server copy {server_ds} could not list "
+                f"{dsi.name} -> {destination}: the {self._copy_noun} {server_ds} could not list "
                 f"which of its snapshots are newer than {common_snap.name}, so nothing is sent "
                 "and no anchor is written this cycle; the next cycle retries"
             ))
@@ -516,8 +561,8 @@ class ChainSender:
                 # of the rollback ERROR, and send nothing this cycle.
                 self._log_warning_once(unreadable_key, (
                     f"{dsi.name} -> {destination}: cannot read the local anchor property "
-                    f"org.zfsbackup:anchor.{destination} ({e}), which decides whether the "
-                    f"server may discard its newer snapshot; nothing is sent this cycle"
+                    f"org.zfsbackup:anchor.{destination} ({e}), which decides whether "
+                    f"{self._receiver} may discard its newer snapshot; nothing is sent this cycle"
                 ))
                 return None
         self._refusal_logged.pop(unreadable_key, None)
@@ -539,15 +584,16 @@ class ChainSender:
         else:
             shown, destroy = f"{first}\u2026{last}", f"{first}%{last}"
         self._log_refusal_once(key, (
-            f"{dsi.name} -> {destination}: the server copy {server_ds} has {count} "
-            f"snapshot(s) newer than {common_snap.name} that this host does not have "
+            f"{dsi.name} -> {destination}: the {self._copy_noun} {server_ds} has {count} "
+            f"snapshot(s) newer than {common_snap.name} that {self._sender} does not have "
             f"({shown}), for example after a rollback or an in-place restore of this dataset, "
-            "or snapshots taken on the server. Sending would make the server destroy them, "
-            "so nothing is sent. To keep them, on the server: "
+            f"or snapshots {self._taken_on_receiver}. Sending would make {self._receiver} "
+            f"destroy them, so nothing is sent. To keep them, {self._on_receiver}: "
             f"zfs rename {server_ds} <a name outside the backup target> (the next cycle "
-            "sends a full stream; see README 'Renaming a server copy aside'). If they are "
+            f"sends a full stream; see {self._rename_doc}). If they are "
             f"expendable: zfs destroy {server_ds}@{destroy} "
-            "(the next cycle continues). See README 'Rejoining'"
+            "(the next cycle continues)."
+            + self._rejoin_pointer()
         ))
         return None
 
@@ -579,6 +625,15 @@ class ChainSender:
             self._logger.error(message)
         else:
             self._logger.debug(message)
+
+    def _on_receiver_capitalized(self) -> str:
+        """`_on_receiver` at the start of a sentence."""
+        text = self._on_receiver
+        return text[:1].upper() + text[1:]
+
+    def _rejoin_pointer(self) -> str:
+        """` See <the rejoin section>` to end a refusal with, or `''`."""
+        return f" See {self._rejoin_doc}" if self._rejoin_doc else ""
 
     def _warn_retention_collisions(self, dsi: DatasetInfo, destination: str) -> None:
         """Warn locally about retention-rule collisions in the ruleset that
@@ -655,8 +710,9 @@ class ChainSender:
                 + ' -> '.join(s.name for s in chain)
                 + f" ({len(chain)} step(s)) -> {self._where(transport)}"
                 + (
-                    f"; the server would be allowed to discard {self._discard_names(dsi, destination, discard)} "
-                    "(a snapshot it holds that this host does not)"
+                    f"; {self._receiver} would be allowed to discard "
+                    f"{self._discard_names(dsi, destination, discard)} "
+                    f"(a snapshot it holds that {self._sender} does not)"
                     if discard else ""
                 )
             )
@@ -698,7 +754,8 @@ class ChainSender:
             except NegotiationFailed as e:
                 if e.reloading and not e.zfs_timeout:
                     self._logger.info(
-                        f"{self._peer(transport)} is {_retry_word(e)}; {dsi.name} continues next cycle"
+                        f"{self._peer(transport)} is {_retry_word(e, self._busy_prefix)}; "
+                        f"{dsi.name} continues next cycle"
                     )
                 return False
             latest = snapshots[0]
@@ -809,16 +866,25 @@ class ChainSender:
             if prev:
                 self._logger.info(f"Sending incremental {dsi.name}: {prev.name} -> {step.name}")
                 return _SendStream(
-                    zfs.send.snapshot(step.snapshot, since=prev.snapshot, **options),
+                    zfs.send.snapshot(
+                        step.snapshot, since=prev.snapshot, **options, **self._send_kwargs()
+                    ),
                     'fresh', inflight_set, step, prev,
                 )
             self._logger.info(f"Sending full snapshot {dsi.name}@{step.name}")
             return _SendStream(
-                zfs.send.snapshot(step.snapshot, **options), 'fresh', inflight_set, step, None
+                zfs.send.snapshot(step.snapshot, **options, **self._send_kwargs()),
+                'fresh', inflight_set, step, None
             )
         except Exception as e:
             self._logger.error(f"Failed to start zfs send for {dsi.name}: {e}")
             return None
+
+    def _send_kwargs(self) -> dict:
+        """Extra keyword arguments for every `zfs.send.*` start: `{}` for the
+        default blocking start-up peek (so the remote calls are unchanged),
+        `{'peek': False}` when `_send_peek` is False."""
+        return {} if self._send_peek else {'peek': False}
 
     # --------------------------------------------- what a subclass provides
 
@@ -933,7 +999,7 @@ class ChainSender:
         cannot be confirmed while it was being sent: the pin stays)."""
         stream, mode, inflight_set, sent, base = started
 
-        self._refusal_logged.pop((f"{dsi.name} [server refusal]", destination), None)
+        self._refusal_logged.pop((f"{dsi.name} [{self._refusal_label}]", destination), None)
         old_anchor = self.local_manager.get_anchor(dsi, destination)
         keep_anchor = False
         if old_anchor and old_anchor != sent.name:
@@ -973,7 +1039,7 @@ class ChainSender:
                 if present is False:
                     self._logger.error(
                         f"{dsi.name}@{sent.name} was destroyed while it was being sent to "
-                        f"{destination}; the server has it but this host no longer does. "
+                        f"{destination}; {self._receiver} has it but {self._sender} no longer does. "
                         + (f"Putting the anchor back on {restore}. " if restore else "")
                         + "Stopping; the next cycle negotiates again"
                     )
@@ -1030,7 +1096,7 @@ class ChainSender:
         nothing in a dry run."""
         self._logger.debug(
             f"Nothing to send for {dsi.name} -> {destination}: "
-            f"{latest.name} is already on the server"
+            f"{latest.name} is already {self._at_receiver}"
         )
         self._token_ok(dsi, destination)
         if self.config.dry_run:
@@ -1056,7 +1122,7 @@ class ChainSender:
                 # `discard`. Left as it is; the pin stays too.
                 self._logger.debug(
                     f"{dsi.name} -> {destination}: the anchor {anchor!r} names a snapshot this "
-                    f"host does not have; left unchanged although {latest.name} is on the server"
+                    f"host does not have; left unchanged although {latest.name} is {self._at_receiver}"
                 )
                 return
             wrote = not newer
@@ -1178,7 +1244,7 @@ class ChainSender:
         except Exception as e:
             self._logger.warning(
                 f"cannot check the resume token of {dsi.name}: {e}; skipping this "
-                "cycle rather than risk discarding the server's partial progress "
+                f"cycle rather than risk discarding {self._receiver}'s partial progress "
                 "with a fresh send"
             )
             self._token_skipped(dsi, destination, f"cannot check the token: {e}")
@@ -1186,7 +1252,7 @@ class ChainSender:
         self._token_ok(dsi, destination)
         if isinstance(target, str):
             self._logger.warning(
-                f"Not resuming {dsi.name}: {target}; sending fresh (the server "
+                f"Not resuming {dsi.name}: {target}; sending fresh ({self._receiver} "
                 "discards its partial state)"
             )
             return 'fresh', None
@@ -1200,11 +1266,11 @@ class ChainSender:
         try:
             self._logger.info(f"Resuming interrupted transfer for {dsi.name}@{to_snap.name}")
             return 'resume', _SendStream(
-                zfs.send.resume(token), 'resume', pinned, to_snap, from_snap
+                zfs.send.resume(token, **self._send_kwargs()), 'resume', pinned, to_snap, from_snap
             )
         except Exception as e:
             self._logger.warning(
                 f"zfs send -t failed to start for {dsi.name}: {e}; sending "
-                "fresh (the server discards its partial state)"
+                f"fresh ({self._receiver} discards its partial state)"
             )
             return 'fresh', None

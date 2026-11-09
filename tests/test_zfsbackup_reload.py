@@ -2730,7 +2730,7 @@ class TestClientIdReload:
         assert remote.client_id == "host-a"
         assert remote.tls_dir is not None and str(remote.tls_dir).endswith("config.db.tls")
 
-    def test_only_the_remote_worker_gets_the_id_and_only_the_api_worker_the_database(
+    def test_only_the_remote_and_pruning_workers_get_the_id_and_only_the_api_worker_the_database(
         self, mocker, tmp_path
     ):
         w = self._world(mocker, tmp_path)
@@ -2738,6 +2738,9 @@ class TestClientIdReload:
         for made in w.made:
             if made.name == "remote":
                 assert (made.client_id, made.config_db) == ("host-a", None)
+            elif made.name == "pruning":
+                # 3.2: the home of the local copies (`<target>/<client_id>`); no TLS, no database.
+                assert (made.client_id, made.tls_dir, made.config_db) == ("host-a", None, None)
             elif made.name == "api":
                 assert (made.client_id, made.tls_dir, made.config_db) == (None, None, w.resolved)
             else:
@@ -2763,6 +2766,8 @@ class TestClientIdReload:
         assert {x.born_epoch for x in w.workers_made("remote")} == {0, 1}
         by_epoch = {x.born_epoch: x.client_id for x in w.workers_made("remote")}
         assert by_epoch == {0: "host-a", 1: "host-b"}        # the new worker has the new id
+        pruning = {x.born_epoch: x.client_id for x in w.workers_made("pruning")}
+        assert pruning == {0: "host-a", 1: "host-b"}         # 3.2: so has the pruning worker
         assert w.lock.state["applied"] == (STORE, 1)
 
     def test_the_summary_lists_client_id_as_a_changed_setting_and_logs_the_change(

@@ -1,5 +1,5 @@
 """Local destinations (`url: zfs:<dataset>`), plan item 2.1: the config model,
-the daemon's pre-start checks and the remote worker's temporary guard.
+the daemon's pre-start checks and the remote worker's dispatch to the local manager.
 
 * `destination_url_problem` / `destination_problem` / `Destination.is_local` /
   `.target_dataset` and `BackupConfig.from_file` (pure; no subprocess);
@@ -8,9 +8,9 @@ the daemon's pre-start checks and the remote worker's temporary guard.
   keeps working on a host without ZFS;
 * `daemon._remote_destinations` / `_local_destinations`, `_client_tls_problem`,
   `_tls_inputs`, `_candidate_warnings` and `_report_client_tls`;
-* `RemoteBackupWorker` handed a `zfs:` destination: the remote manager is never
-  asked about it, one WARNING per (dataset, destination) per incarnation, no
-  status record.
+* `RemoteBackupWorker` handed a `zfs:` destination: it goes to
+  `LocalBackupManager` and never to `RemoteBackupManager`; a mixed config sends
+  to both in one cycle, each with its own status record.
 
 Nothing here reaches a real `zfs`.
 """
@@ -638,17 +638,28 @@ def sdir(tmp_path):
 
 
 class Rig:
-    """A `RemoteBackupWorker` over a real status directory, a mocked manager
-    and a mocked `RemoteBackupManager`."""
+    """A `RemoteBackupWorker` over a real status directory, a mocked manager,
+    a mocked `RemoteBackupManager` (`rbm`) and a mocked `LocalBackupManager`
+    (`lbm`). `order` is every `backup_dataset` call of either, in order."""
 
     def __init__(self, mocker, sdir, destinations, names=("pool/a",), uses=None):
         self.sdir = sdir
         self.mocker = mocker
         uses = tuple(destinations) if uses is None else tuple(uses)
+        self.order = []
         self.rbm = MagicMock(name="RemoteBackupManager")
         self.rbm.backup_dataset.return_value = True
         self.rbm.last_problem.return_value = None
-        mocker.patch("zfsbackup.remote.RemoteBackupManager", return_value=self.rbm)
+        self.rbm.backup_dataset.side_effect = lambda dsi, rc, **kw: (
+            self.order.append(("remote", dsi.name, rc.destination)) or True
+        )
+        self.lbm = MagicMock(name="LocalBackupManager")
+        self.lbm.last_problem.return_value = None
+        self.lbm.backup_dataset.side_effect = lambda dsi, rc, **kw: (
+            self.order.append(("local", dsi.name, rc.destination)) or True
+        )
+        self.rbm_class = mocker.patch("zfsbackup.remote.RemoteBackupManager", return_value=self.rbm)
+        self.lbm_class = mocker.patch("zfsbackup.local.LocalBackupManager", return_value=self.lbm)
         self.config = BackupConfig(
             datasets=[
                 DatasetConfig(name=n, remote=[RemoteDatasetConfig(destination=d) for d in uses])
@@ -664,9 +675,10 @@ class Rig:
         self.manager.last_snapshot_error = None
         self.manager.last_received_error = None
         self.manager.get_anchor.return_value = None
+        self.manager.clock_behind.return_value = False
 
-    def worker(self):
-        return RemoteBackupWorker(self.config, StopFlag(), status_dir=self.sdir)
+    def worker(self, **kwargs):
+        return RemoteBackupWorker(self.config, StopFlag(), status_dir=self.sdir, **kwargs)
 
     def run(self, worker=None, cycles=1):
         worker = worker or self.worker()
@@ -687,69 +699,115 @@ class Rig:
         st = read_worker_status(self.sdir, "remote-backup-worker")
         return {r.key: r for r in st.records} if st is not None else {}
 
+    @staticmethod
+    def _sent(manager):
+        return [(c.args[0].name, c.args[1].destination) for c in manager.backup_dataset.call_args_list]
+
     def sent(self):
-        return [(c.args[0].name, c.args[1].destination) for c in self.rbm.backup_dataset.call_args_list]
+        return self._sent(self.rbm)
 
-
-def skipped_warnings(caplog):
-    return [
-        r.getMessage() for r in caplog.records
-        if r.levelno == logging.WARNING and "skipped: local destinations are not implemented" in r.getMessage()
-    ]
+    def sent_local(self):
+        return self._sent(self.lbm)
 
 
 @pytest.mark.unit
-class TestRemoteWorkerSkipsLocalDestinations:
+class TestRemoteWorkerSendsToLocalDestinations:
     @pytest.fixture
     def rig(self, mocker, sdir):
         return Rig(mocker, sdir, {"here": LOCAL})
 
-    def test_the_remote_manager_is_never_asked_about_a_local_destination(self, rig):
+    def test_a_local_destination_goes_to_the_local_manager(self, rig):
+        rig.run()
+        assert rig.sent_local() == [("pool/a", "here")]
+
+    def test_the_remote_manager_is_never_handed_a_local_destination(self, rig):
         rig.run()
         rig.rbm.backup_dataset.assert_not_called()
-        rig.manager.get_anchor.assert_not_called()
 
-    def test_it_stays_away_over_many_cycles(self, rig):
+    def test_it_is_sent_again_every_cycle(self, rig):
         rig.run(cycles=4)
-        rig.rbm.backup_dataset.assert_not_called()
-        rig.manager.get_anchor.assert_not_called()
-
-    def test_one_warning_per_dataset_and_destination_per_incarnation(self, rig, caplog):
-        caplog.set_level(logging.WARNING, logger="zfsbackup.workers")
-        rig.run(cycles=3)
-        warnings = skipped_warnings(caplog)
-        assert len(warnings) == 1
-        assert "pool/a" in warnings[0] and "here" in warnings[0] and "zfs:bk/backups" in warnings[0]
-
-    def test_a_new_incarnation_warns_again(self, rig, caplog):
-        caplog.set_level(logging.WARNING, logger="zfsbackup.workers")
-        rig.run(cycles=2)
-        assert len(skipped_warnings(caplog)) == 1
-        rig.run(cycles=2)                      # a fresh worker, as after a reload
-        assert len(skipped_warnings(caplog)) == 2
-
-    def test_the_warned_set_is_per_instance(self, rig):
-        a, b = rig.worker(), rig.worker()
-        rig.run(a)
-        assert a._local_warned == {("pool/a", "here")} and b._local_warned == set()
-
-    def test_each_dataset_and_destination_pair_warns_separately(self, mocker, sdir, caplog):
-        caplog.set_level(logging.WARNING, logger="zfsbackup.workers")
-        rig = Rig(mocker, sdir, {"here": LOCAL, "there": Destination(url="zfs:bk/o")},
-                  names=("pool/a", "pool/b"))
-        rig.run(cycles=2)
-        assert len(skipped_warnings(caplog)) == 4
+        assert rig.sent_local() == [("pool/a", "here")] * 4
         rig.rbm.backup_dataset.assert_not_called()
 
-    def test_no_record_is_written_for_the_local_destination(self, rig):
-        rig.run(cycles=2)
+    def test_the_local_manager_gets_the_dataset_info_the_destination_and_should_stop(self, rig):
+        rig.run()
+        (call,) = rig.lbm.backup_dataset.call_args_list
+        dsi, remote_cfg = call.args
+        assert dsi is rig.manager.datasets[0] and remote_cfg.destination == "here"
+        assert callable(call.kwargs["should_stop"])
+
+    def test_should_stop_follows_the_workers_exit_reason(self, rig):
+        seen = []
+        worker = rig.worker()
+        rig.lbm.backup_dataset.side_effect = lambda dsi, rc, **kw: (
+            seen.append(kw["should_stop"]()) or True
+        )
+        rig.run(worker)
+        assert seen == [False]
+        worker.stop_event.set()
+        assert worker._exit_reason() is not None
+
+    def test_no_not_implemented_warning_and_no_warned_set_remain(self, rig, caplog):
+        caplog.set_level(logging.WARNING)
+        worker = rig.run(cycles=2)
+        assert not hasattr(worker, "_local_warned")
+        assert "not implemented" not in caplog.text
+
+    def test_a_completed_send_is_recorded_for_the_local_destination(self, rig):
+        rig.run()
+        rec = rig.records()[("send", "pool/a", "here")]
+        assert rec.result == "ok" and rec.consecutive_failures == 0
+
+    def test_a_failed_send_is_recorded_with_the_local_managers_account(self, rig):
+        rig.lbm.backup_dataset.side_effect = None
+        rig.lbm.backup_dataset.return_value = False
+        rig.lbm.last_problem.return_value = "the target dataset bk/backups does not exist"
+        rig.run()
+        rec = rig.records()[("send", "pool/a", "here")]
+        assert rec.result == "error"
+        assert rec.last_error == "the target dataset bk/backups does not exist"
+        rig.lbm.last_problem.assert_called_with("pool/a", "here")
+        rig.rbm.last_problem.assert_not_called()
+
+    def test_a_failure_without_an_account_says_so(self, rig):
+        rig.lbm.backup_dataset.side_effect = None
+        rig.lbm.backup_dataset.return_value = False
+        rig.lbm.last_problem.return_value = None
+        rig.run()
+        assert rig.records()[("send", "pool/a", "here")].last_error == "not completed (see the journal)"
+
+    def test_a_stopped_cycle_records_neither_success_nor_failure(self, rig):
+        worker = rig.worker()
+
+        def stopped(dsi, rc, **kw):
+            worker.stop_event.set()
+            return False
+
+        rig.lbm.backup_dataset.side_effect = stopped
+        rig.run(worker)
         assert ("send", "pool/a", "here") not in rig.records()
-        assert not [k for k in rig.records() if k[0] == health.KIND_SEND]
+
+    def test_the_interval_check_applies_to_a_local_destination(self, rig):
+        rig.manager.get_anchor.return_value = "autosnap_20260101000000"
+        young = SimpleNamespace(name="autosnap_20260101000000", age=timedelta(minutes=10))
+        rig.manager.list_snapshots.return_value = [young]
+        rig.run()
+        rig.lbm.backup_dataset.assert_not_called()
+        assert [c.args[1] for c in rig.manager.get_anchor.call_args_list] == ["here"]
+
+    def test_an_anchor_older_than_the_frequency_makes_it_due(self, rig):
+        rig.manager.get_anchor.return_value = "autosnap_20260101000000"
+        old = SimpleNamespace(name="autosnap_20260101000000", age=timedelta(hours=2))
+        rig.manager.list_snapshots.return_value = [old]
+        rig.run()
+        assert rig.sent_local() == [("pool/a", "here")]
 
     def test_its_status_key_is_retained(self, rig):
         seed = StatusWriter(rig.sdir, "remote-backup-worker")
         seed.record("send", "pool/a", "here", ok=True)
         seed.flush(force=True)
+        rig.lbm.backup_dataset.side_effect = None
+        rig.lbm.backup_dataset.return_value = True
         rig.run()
         rec = rig.records()[("send", "pool/a", "here")]
         assert rec.result == "ok" and rec.consecutive_failures == 0
@@ -772,41 +830,54 @@ class TestRemoteWorkerMixedDestinations:
     def rig(self, mocker, sdir):
         return Rig(mocker, sdir, {"here": LOCAL, "off": HTTPS})
 
-    def test_the_https_destination_is_still_sent_in_the_same_cycle(self, rig):
+    def test_each_destination_goes_to_its_own_manager_in_the_same_cycle(self, rig):
         rig.run()
+        assert rig.sent_local() == [("pool/a", "here")]
         assert rig.sent() == [("pool/a", "off")]
 
-    def test_the_local_one_first_does_not_stop_the_https_one(self, mocker, sdir):
-        rig = Rig(mocker, sdir, {"off": HTTPS, "here": LOCAL}, uses=["here", "off"])
+    def test_they_are_sent_in_the_configured_order_local_first(self, rig):
         rig.run()
-        assert rig.sent() == [("pool/a", "off")]
+        assert rig.order == [("local", "pool/a", "here"), ("remote", "pool/a", "off")]
 
-    def test_the_local_one_last_does_not_disturb_the_https_one(self, mocker, sdir):
+    def test_they_are_sent_in_the_configured_order_remote_first(self, mocker, sdir):
         rig = Rig(mocker, sdir, {"off": HTTPS, "here": LOCAL}, uses=["off", "here"])
         rig.run()
-        assert rig.sent() == [("pool/a", "off")]
-        rig.rbm.backup_dataset.assert_called_once()
+        assert rig.order == [("remote", "pool/a", "off"), ("local", "pool/a", "here")]
 
-    def test_only_the_https_destination_is_recorded(self, rig):
+    def test_each_one_records_its_own_status(self, rig):
         rig.run()
         keys = {k for k in rig.records() if k[0] == health.KIND_SEND}
-        assert keys == {("send", "pool/a", "off")}
+        assert keys == {("send", "pool/a", "off"), ("send", "pool/a", "here")}
+        assert all(rig.records()[k].result == "ok" for k in keys)
+
+    def test_a_failed_local_send_is_charged_to_it_alone_and_the_remote_one_still_runs(self, rig):
+        rig.lbm.backup_dataset.side_effect = lambda dsi, rc, **kw: (
+            rig.order.append(("local", dsi.name, rc.destination)) or False
+        )
+        rig.lbm.last_problem.return_value = "local boom"
+        rig.run()
+        assert rig.records()[("send", "pool/a", "here")].result == "error"
+        assert rig.records()[("send", "pool/a", "here")].last_error == "local boom"
         assert rig.records()[("send", "pool/a", "off")].result == "ok"
+        assert rig.sent() == [("pool/a", "off")]
 
-    def test_a_failed_https_send_is_charged_to_it_alone(self, rig):
+    def test_a_failed_remote_send_is_charged_to_it_alone(self, rig):
+        rig.rbm.backup_dataset.side_effect = None
         rig.rbm.backup_dataset.return_value = False
-        rig.rbm.last_problem.return_value = "boom"
+        rig.rbm.last_problem.return_value = "remote boom"
         rig.run()
-        assert rig.records()[("send", "pool/a", "off")].result == "error"
-        assert ("send", "pool/a", "here") not in rig.records()
+        assert rig.records()[("send", "pool/a", "off")].last_error == "remote boom"
+        assert rig.records()[("send", "pool/a", "here")].result == "ok"
+        rig.lbm.last_problem.assert_not_called()
 
-    def test_the_anchor_is_read_for_the_https_destination_only(self, rig):
+    def test_the_anchor_is_read_for_both_destinations(self, rig):
         rig.run()
-        assert [c.args[1] for c in rig.manager.get_anchor.call_args_list] == ["off"]
+        assert [c.args[1] for c in rig.manager.get_anchor.call_args_list] == ["here", "off"]
 
-    def test_a_missing_destination_object_falls_through_to_the_old_path(self, mocker, sdir):
+    def test_a_missing_destination_object_goes_to_the_remote_manager(self, mocker, sdir):
         # An undeclared name is `from_file`'s to refuse; the worker must not
-        # treat it as local.
+        # treat it as local, and the remote manager says "unknown destination".
         rig = Rig(mocker, sdir, {"off": HTTPS}, uses=["off", "ghost"])
         rig.run()
         assert [d for _, d in rig.sent()] == ["off", "ghost"]
+        rig.lbm.backup_dataset.assert_not_called()

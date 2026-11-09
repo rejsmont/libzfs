@@ -2051,6 +2051,7 @@ class TestWorkerConfigHandoff:
                 'tls_dir': _daemon_module.identity.tls_dir(daemon.resolved_config.resolved_path),
                 'client_id': None,
             },
+            'pruning': {'client_id': None},   # 3.2: the local copies' home
         }.get(name, {})
         if guard:
             extra = {**extra, 'code_signature': daemon._code_signature.as_tuple()}
@@ -2333,6 +2334,45 @@ class TestClientIdAndTlsHandoffToRealChildren:
         assert record['tls_dir'] == str(literal_config_db.resolved_path) + '.tls'
 
     @pytest.mark.parametrize('method', _START_METHODS)
+    def test_the_pruning_worker_is_born_with_the_client_id_only(
+        self, supervisor, tmp_path, mocker, method
+    ):
+        """3.2: the local copies live under `<target>/<client_id>`; the pruning
+        worker gets the id from the same `Handoff` and nothing else (no TLS
+        directory, no database).
+
+        Mutation-checked (scratch copy): dropping the `pruning` branch of `_new_worker` fails 8 tests (the
+        two constructor-call tests, this one under 3 start methods, the Handoff one, and 2 in
+        `test_zfsbackup_reload.py::TestClientIdReload`)."""
+        from _config_handoff import RecordingPruningWorker
+
+        daemon, snapshot = supervisor
+        records = tmp_path / 'rec'
+        records.mkdir()
+        mocker.patch(
+            'zfsbackup.daemon.PruningWorker',
+            side_effect=_bind_recording(RecordingPruningWorker, method, records),
+        )
+        worker = daemon._spawn('pruning')
+        worker.join(120)
+        assert worker.exitcode == 0, f'{method} child failed'
+        assert type(worker._popen).__module__.endswith(_POPEN_MODULE[method])
+        (record,) = read_records(records)
+        assert record['client_id'] == 'host-7.example'
+        assert record['tls_dir'] == 'None' and record['config_db'] == 'None'
+        assert record['signature'] == config_signature(snapshot.config)
+
+    def test_the_pruning_worker_gets_the_handoffs_id_not_the_constructors(self, supervisor, mocker):
+        """A changed id is a reload: a worker built after it gets the new
+        `Handoff`'s id (config and id travel together)."""
+        daemon, _ = supervisor
+        factory = mocker.patch('zfsbackup.daemon.PruningWorker')
+        import dataclasses
+        daemon._handoff = dataclasses.replace(daemon._handoff, client_id='host-8.example')
+        daemon._new_worker('pruning')
+        assert factory.call_args.kwargs['client_id'] == 'host-8.example'
+
+    @pytest.mark.parametrize('method', _START_METHODS)
     def test_the_api_worker_is_born_with_the_config_database(
         self, supervisor, literal_config_db, tmp_path, mocker, method
     ):
@@ -2350,7 +2390,7 @@ class TestClientIdAndTlsHandoffToRealChildren:
         assert worker.exitcode == 0, f'{method} child failed'
         (record,) = read_records(records)
         assert record['config_db'] == str(literal_config_db.resolved_path)
-        assert record['client_id'] is None            # only the remote worker gets the id
+        assert record['client_id'] is None            # only the remote and pruning workers get the id
 
     @pytest.mark.parametrize('method', _START_METHODS)
     def test_the_other_workers_are_given_neither(self, supervisor, tmp_path, mocker, method):

@@ -1,19 +1,21 @@
 """Snapshot manager for creating and managing ZFS snapshots."""
 
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
+import contextlib
 import dataclasses
 import logging
 import re
 import shlex
 import sys
 import os
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import libzfseasy as zfs
 from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
-from libzfseasy.zfs import ZFSOutputError
+from libzfseasy.zfs import ZFSOutputError, ZFSTimeoutError
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, _collapse_retention_rules, client_id_problem,
     wire_config_problem,
@@ -46,6 +48,103 @@ SNAPSHOT_LIST_PROPERTIES = ['createtxg', 'guid', 'userrefs', 'clones', 'encrypti
 #: A clock this far (or `check_interval`, if longer) behind the newest
 #: snapshot's name is treated as wrong rather than as jitter.
 CLOCK_TOLERANCE = timedelta(minutes=5)
+
+#: The local discovery (`DatasetManager.local_copies`) runs each `zfs` command
+#: under `libzfseasy.timeout(LOCAL_DISCOVER_COMMAND_BUDGET)` and one local
+#: target's discovery under an overall `LOCAL_DISCOVER_BUDGET`, so a target on
+#: an exported or suspended pool ends in an error instead of wedging the
+#: pruning worker. The command budget equals `zfsbackup.local.LOCAL_ZFS_BUDGET`
+#: (not imported: the pruning worker must not load `zfsbackup.local` lazily
+#: mid-upgrade, S-8). The server's discovery (`received_datasets`) is untimed,
+#: as it always was.
+#:
+#: The overall budget is checked when a scope is entered, not during a
+#: command: a scope entered just before the deadline still runs its commands
+#: (the per-dataset fallback reads three properties in one scope), each up to
+#: `min(LOCAL_DISCOVER_COMMAND_BUDGET, time left)`, so one target's discovery
+#: can end up to about two minutes past `LOCAL_DISCOVER_BUDGET` (plus the
+#: seconds a timed-out child needs to be terminated).
+LOCAL_DISCOVER_COMMAND_BUDGET = 60.0
+LOCAL_DISCOVER_BUDGET = 600.0
+
+#: Pruning a LOCAL COPY (`DatasetInfo.local_target` set) runs each of its `zfs`
+#: commands under `libzfseasy.timeout`: the reads (snapshot listing, protection
+#: re-read) at `LOCAL_PRUNE_COMMAND_BUDGET`, a destroy at the longer
+#: `LOCAL_PRUNE_DESTROY_BUDGET` (destroying many snapshots on a slow USB disk
+#: legitimately takes a while). A target on a suspended pool (`failmode=wait`)
+#: may still answer a listing while `zfs destroy` sits in D state; without a
+#: budget that would wedge the whole pruning worker, and with it the pruning of
+#: every SOURCE dataset and every reload. Source datasets are never timed.
+LOCAL_PRUNE_COMMAND_BUDGET = 60.0
+LOCAL_PRUNE_DESTROY_BUDGET = 300.0
+
+
+class LocalDiscovery(NamedTuple):
+    """How the discovery of one local destination's copies went
+    (`DatasetManager.last_local_discovery`): `error` is `None` when it
+    worked, `count` the copies found (0 on an error)."""
+    destination: str
+    target: str
+    count: int
+    error: Optional[str]
+
+
+class _DiscoveryFailed(Exception):
+    """A discovery failure that is not an exception from `zfs` (its message
+    is the whole account): the target dataset does not exist."""
+
+
+def _failure_kind(failure: BaseException) -> str:
+    """The class of a failure of a local target, which the once-per-episode
+    WARNING is keyed on (the message varies: pids, seconds): `missing` (the
+    target does not exist), `stuck` (a `zfs` child that timed out earlier
+    survived SIGKILL and is still running: every timed call is refused at
+    once, whichever target it is for), `timeout`, or `other:<exception
+    type>`."""
+    if isinstance(failure, _DiscoveryFailed):
+        return 'missing'
+    if isinstance(failure, ZFSTimeoutError):
+        return 'stuck' if zfs.stuck_children() else 'timeout'
+    return f"other:{type(failure).__name__}"
+
+
+def _describe_failure(failure: BaseException) -> str:
+    if isinstance(failure, _DiscoveryFailed):
+        return str(failure)
+    text = f"{type(failure).__name__}: {failure}"
+    if isinstance(failure, ZFSTimeoutError):
+        stuck = zfs.stuck_children()
+        if stuck:
+            # Say what is hung: the stuck child may belong to another target
+            # (or an earlier command on this one), and a healthy target must
+            # not be reported as the hung one.
+            child = stuck[0]
+            text += (
+                f" [zfs is not answering: `{child.label}` (pid {child.pid}) timed out "
+                f"{max(0.0, time.monotonic() - child.since):.0f} s ago and is still running; "
+                "while it is, this worker's timed zfs calls, for any local target, are refused at once]"
+            )
+    return text
+
+
+def _no_scope():
+    """The scope of an untimed discovery."""
+    return contextlib.nullcontext()
+
+
+def _discovery_scope(deadline: float) -> Callable[[], 'contextlib.AbstractContextManager']:
+    """A `scope()` for `DatasetManager._discover_under`: each call returns a
+    `libzfseasy.timeout` of `LOCAL_DISCOVER_COMMAND_BUDGET` (less, near the
+    monotonic `deadline`) and raises `ZFSTimeoutError` once the deadline has
+    passed."""
+    def scope():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise ZFSTimeoutError(
+                f"the {LOCAL_DISCOVER_BUDGET:g} s budget for discovering local copies is spent"
+            )
+        return zfs.timeout(min(LOCAL_DISCOVER_COMMAND_BUDGET, left))
+    return scope
 
 
 # ── Module-level property helpers (item 14.1) ─────────────────────────────────
@@ -391,6 +490,10 @@ class DatasetInfo:
         # including ones dropped from `snapshots` for a missing `createtxg`:
         # a generated name that is already taken must not be created again.
         self.listed_names: Set[str] = set()
+        #: The local destination's target dataset (`zfs:<target>`) when this is
+        #: a copy found by `DatasetManager.local_copies`, else `None`. Its
+        #: pruning runs under timeouts (`LOCAL_PRUNE_*_BUDGET`).
+        self.local_target: Optional[str] = None
 
     @property
     def reference_time(self) -> datetime:
@@ -470,10 +573,34 @@ class DatasetManager:
         #: re-read failed (`None`: it did not). The failure is also logged;
         #: these let a worker record it without a changed return type (S-7).
         self.last_list_error: Optional[str] = None
+        # The exception behind `last_list_error` (`prune_snapshots` re-raises a
+        # timeout of a local copy's listing).
+        self._last_list_failure: Optional[BaseException] = None
         self.last_snapshot_error: Optional[str] = None
         #: Why the last `received_datasets()` could not enumerate the target
         #: (`None`: it could, or remote backup is off).
         self.last_received_error: Optional[str] = None
+        #: How the last `local_copies()` went, one entry per local
+        #: destination target it examined (see `LocalDiscovery`).
+        self.last_local_discovery: List[LocalDiscovery] = []
+        # Per local target: the skip memory of `_discover_under`, and the
+        # discovery error already announced at WARNING (once per episode).
+        self._local_skip_noted: Dict[str, Dict[str, str]] = {}
+        self._local_error_noted: Dict[str, str] = {}
+        #: Why the last `local_copies()` discovered nothing for a reason that
+        #: concerns every local destination (no client id, an invalid one), else
+        #: `None`. The worker then keeps the status records under all of them.
+        self.last_local_skip: Optional[str] = None
+        # The invalid client ids already warned about (once per incarnation).
+        self._bad_client_id_noted: Set[str] = set()
+        # Local targets whose pruning timed out THIS cycle (target -> why; reset
+        # by every `local_copies()`), so the rest of their copies are skipped
+        # without a `zfs` call; and the failure class already announced at
+        # WARNING per target (once per episode).
+        self._local_prune_blocked: Dict[str, str] = {}
+        self._local_prune_noted: Dict[str, str] = {}
+        # True while `prune_snapshots` runs a local copy under timeouts.
+        self._prune_timed = False
         self._reread_error: Optional[str] = None
 
     @property
@@ -539,10 +666,17 @@ class DatasetManager:
         The effective value, whatever its source (local, received or
         inherited -- `get_anchor` relies on seeing an inherited anchor), read
         with `zfs get -H -o value` (`zfs.get.value`): exact even when the
-        value holds a tab or newline, which a `zfs list -H` row cannot frame."""
+        value holds a tab or newline, which a `zfs list -H` row cannot frame.
+
+        While a local copy is being pruned (`_prune_timed`) a `ZFSTimeoutError`
+        propagates instead of reading as "unset": "could not read" must never
+        shrink the pruner's protect-set (`get_anchors`). Elsewhere (source
+        datasets, the senders) the read is untimed or handles it itself."""
         try:
             return zfs.get.value(ds, prop)
         except Exception as e:
+            if self._prune_timed and isinstance(e, ZFSTimeoutError):
+                raise
             logger.debug(f"Failed to read property {prop} from {ds.name}: {e!r}")
         return None
 
@@ -806,32 +940,207 @@ class DatasetManager:
         if not rb or not rb.enabled:
             return []
         target = rb.target_dataset.rstrip('/')
-        try:
-            all_ds = zfs.list(
-                roots=Dataset(target),
-                recursive=True,
-                # Volumes too: a client volume is received as a volume
-                # (`volmode=none`, never a device) and is pruned and
-                # health-checked like a filesystem. Nothing downstream
-                # assumes a mount: it lists snapshots under the name and
-                # destroys them.
-                types='filesystem,volume',
-            )
-        except Exception as e:
-            self.last_received_error = f"{type(e).__name__}: {e}"
-            logger.error(f"Failed to discover received datasets: {e!r}")
+        result, failure = self._discover_under(
+            target, should_stop=should_stop, noted=self._received_skip_noted
+        )
+        if failure is not None:
+            self.last_received_error = f"{type(failure).__name__}: {failure}"
+            logger.error(f"Failed to discover received datasets: {failure!r}")
             return []
+        return result
 
-        batch = self._received_property_batch(target, {ds.name for ds in all_ds})
+    def local_copies(
+        self, client_id: Optional[str], should_stop: Optional[Callable[[], bool]] = None
+    ) -> List[DatasetInfo]:
+        """Discover THIS host's copies under each local destination's target
+        (`zfs:<dataset>`): the datasets of `<target>/<client_id>/...` that
+        `LocalBackupManager` stamped with a local `client_id`, `source_dataset`
+        and `config`, for the pruner. They are found and checked exactly as the
+        server's received datasets are (`_discover_under`: names enumerated by
+        `zfs list`, the properties read in one framing-safe batch with the
+        exact per-dataset fallback, local values only, the home-path check,
+        `wire_config_problem`, never recursive), but ONLY under our own id:
+        another host's tree on a shared target -- including one whose id has
+        ours as a prefix (`A` and `Ax`: component-wise, never a string prefix)
+        -- is never listed, read or pruned. A child dataset without a local
+        `client_id` is not discovered (so not pruned).
+
+        Every `zfs` call here runs under `libzfseasy.timeout`
+        (`LOCAL_DISCOVER_COMMAND_BUDGET` per command, `LOCAL_DISCOVER_BUDGET`
+        in all for one target), so a target on an exported or suspended pool
+        ends that target's discovery with an error (one WARNING per episode),
+        never wedges the worker. Per-target outcomes are left in
+        `last_local_discovery` (one `LocalDiscovery` per local destination
+        with a usable target, in configuration order); a failed target
+        contributes no datasets. `should_stop` is as in `received_datasets`: a
+        stop ends the enumeration and the (partial) list is only for leaving.
+        With no client id nothing is discovered (the caller says why).
+
+        A local destination that no enabled dataset sends to any more is
+        still discovered when its target exists (the copies already there are
+        still ours to prune), but a missing target is then no error and leaves
+        no outcome at all: a destination that was declared and never used must
+        not report a failing discovery every cycle.
+
+        `last_local_skip` says why nothing was discovered for the whole
+        configuration (no client id, an invalid one), so that the caller keeps
+        the old outcomes instead of dropping them; the invalid id is warned
+        about once per manager (a worker incarnation)."""
+        self.last_local_discovery = []
+        self.last_local_skip = None
+        self._local_prune_blocked = {}
+        if client_id is None:
+            self.last_local_skip = "this host has no client id"
+            return []
+        id_problem = client_id_problem(client_id)
+        if id_problem is not None:
+            self.last_local_skip = f"the client id {client_id!r} is invalid ({id_problem})"
+            if client_id not in self._bad_client_id_noted:
+                self._bad_client_id_noted.add(client_id)
+                logger.warning(
+                    "Local copies are not pruned: the client id %r is invalid (%s)",
+                    client_id, id_problem,
+                )
+            else:
+                logger.debug("Local copies are not pruned: the client id %r is invalid", client_id)
+            return []
+        used = {r.destination for ds in self.config.enabled_datasets for r in (ds.remote or [])}
+        result: List[DatasetInfo] = []
+        seen_targets: Set[str] = set()
+        for name, dest in self.config.destinations.items():
+            if getattr(dest, 'is_local', False) is not True:
+                continue
+            target = (dest.target_dataset or '').rstrip('/')
+            if not target or target in seen_targets:
+                continue
+            seen_targets.add(target)
+            if should_stop is not None and should_stop():
+                return result
+            deadline = time.monotonic() + LOCAL_DISCOVER_BUDGET
+            found, failure = self._discover_under(
+                target, only_client_id=client_id, should_stop=should_stop,
+                noted=self._local_skip_noted.setdefault(target, {}),
+                scope=_discovery_scope(deadline),
+            )
+            if should_stop is not None and should_stop():
+                return result
+            if isinstance(failure, _DiscoveryFailed) and name not in used:
+                logger.debug(
+                    "Local destination %s (%s) is not used by any dataset and its target does "
+                    "not exist; nothing to discover", name, target,
+                )
+                self._local_error_noted.pop(target, None)
+                self._local_prune_noted.pop(target, None)
+                continue
+            if failure is not None or not found:
+                # No prune pass can run on this target this cycle, so a prune
+                # timeout noted earlier belongs to a finished episode: forget
+                # it, or the next one would be logged at DEBUG only.
+                self._local_prune_noted.pop(target, None)
+            error = None if failure is None else _describe_failure(failure)
+            if failure is not None:
+                kind = _failure_kind(failure)
+                if self._local_error_noted.get(target) != kind:
+                    self._local_error_noted[target] = kind
+                    logger.warning(
+                        "Cannot discover the local copies under %s (destination %s): %s; "
+                        "they are not pruned until this passes", target, name, error,
+                    )
+                else:
+                    logger.debug("Still cannot discover the local copies under %s: %s", target, error)
+                found = []
+            elif self._local_error_noted.pop(target, None) is not None:
+                logger.info("The local copies under %s can be discovered again", target)
+            for dsi in found:
+                dsi.local_target = target
+            self.last_local_discovery.append(LocalDiscovery(name, target, len(found), error))
+            result.extend(found)
+        for target in [t for t in self._local_error_noted if t not in seen_targets]:
+            del self._local_error_noted[target]
+        for target in [t for t in self._local_skip_noted if t not in seen_targets]:
+            del self._local_skip_noted[target]
+        for target in [t for t in self._local_prune_noted if t not in seen_targets]:
+            del self._local_prune_noted[target]
+        return result
+
+    def _discover_under(
+        self,
+        target: str,
+        only_client_id: Optional[str] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        *,
+        noted: Optional[Dict[str, str]] = None,
+        scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
+    ) -> Tuple[List[DatasetInfo], Optional[Exception]]:
+        """`(datasets, failure)`: the client datasets under `target`
+        (`received_datasets` documents the checks), or `([], exception)` if the
+        enumeration failed (the caller logs it). Nothing here raises.
+
+        `only_client_id` restricts it to `<target>/<only_client_id>` and what
+        lies under it (the enumeration and the batch read are rooted there,
+        and a dataset stamped with another id is refused); a missing
+        `<target>/<only_client_id>` under an existing `target` is no error,
+        there is simply nothing yet. `noted` is the skip memory
+        (`_received_skip_noted` for the server). `scope()` returns a context
+        manager every `zfs` call of the discovery runs in (the local
+        discovery's timeouts); it raises `ZFSTimeoutError` when the overall
+        budget is spent."""
+        scope = scope or _no_scope
+        root = target if only_client_id is None else f"{target}/{only_client_id}"
+        try:
+            with scope():
+                all_ds = zfs.list(
+                    roots=Dataset(root),
+                    recursive=True,
+                    # Volumes too: a client volume is received as a volume
+                    # (`volmode=none`, never a device) and is pruned and
+                    # health-checked like a filesystem. Nothing downstream
+                    # assumes a mount: it lists snapshots under the name and
+                    # destroys them.
+                    types='filesystem,volume',
+                )
+        except Exception as e:
+            if only_client_id is None or isinstance(e, ZFSTimeoutError):
+                return [], e
+            # The failure may be a missing `<target>/<id>` (nothing sent yet:
+            # the container appears with the first copy) or anything else.
+            # Ask zfs rather than read the message: a dataset NAME may contain
+            # "dataset does not exist".
+            try:
+                with scope():
+                    root_exists = zfs.exists(Dataset(root))
+                if root_exists:
+                    return [], e
+                with scope():
+                    target_exists = zfs.exists(Dataset(target))
+            except Exception as e2:
+                return [], e2
+            if target_exists:
+                return [], None
+            # The whole target is gone (an exported pool reads the same).
+            return [], _DiscoveryFailed(f"the target dataset {target} does not exist")
+
+        try:
+            batch = self._received_property_batch(
+                root, {ds.name for ds in all_ds}, scope, raise_timeout=only_client_id is not None
+            )
+        except ZFSTimeoutError as e:
+            return [], e
 
         result = []
-        noted = self._received_skip_noted
+        if noted is None:
+            noted = {}
         seen: Set[str] = set()
         for ds in all_ds:
             if should_stop is not None and should_stop():
-                return result
+                return result, None
             seen.add(ds.name)
-            dsi, problem = self._received_dataset_info(ds, target, batch.get(ds.name))
+            try:
+                dsi, problem = self._received_dataset_info(
+                    ds, target, batch.get(ds.name), only_client_id=only_client_id, scope=scope
+                )
+            except ZFSTimeoutError as e:
+                return [], e
             if dsi is not None:
                 noted.pop(ds.name, None)
                 result.append(dsi)
@@ -841,17 +1150,24 @@ class DatasetManager:
             if noted.get(ds.name) != problem:
                 noted[ds.name] = problem
                 logger.warning(
-                    "Skipping received dataset %r: %s; it is not pruned until this is fixed",
+                    "Skipping %s %r: %s; it is not pruned until this is fixed",
+                    'local copy' if only_client_id is not None else 'received dataset',
                     ds.name, problem,
                 )
             else:
-                logger.debug("Skipping received dataset %r: %s", ds.name, problem)
+                logger.debug(
+                    "Skipping %s %r: %s",
+                    'local copy' if only_client_id is not None else 'received dataset',
+                    ds.name, problem,
+                )
         for name in [n for n in noted if n not in seen]:
             del noted[name]
-        return result
+        return result, None
 
     def _received_property_batch(
-        self, target: str, listed: Set[str]
+        self, target: str, listed: Set[str],
+        scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
+        raise_timeout: bool = False,
     ) -> Dict[str, Tuple[Optional[str], Optional[str], bool]]:
         """Plan B-1d: `{name: (client_id, config, config_only_received)}` for
         every dataset of `listed` (the trusted name-only enumeration under
@@ -866,16 +1182,21 @@ class DatasetManager:
         Nothing in the batch can therefore remove a dataset from the result
         of `received_datasets`, only send it to the exact per-dataset path.
         Never raises: if the batch fails, it is empty (everything falls
-        back)."""
+        back) -- except a `ZFSTimeoutError` when `raise_timeout` (the local
+        discovery: a target that does not answer is not read dataset by
+        dataset, 60 s each)."""
         try:
-            rows = zfs.get.rows(
-                Dataset(target), [PROP_CLIENT_ID, PROP_CONFIG], types='filesystem,volume',
-                recursive=True, received=False,
-                # The caller's enumeration is the cross-check: a name it lists
-                # that was not read cleanly is sent to the fallback below.
-                verify_names=False,
-            )
+            with (scope or _no_scope)():
+                rows = zfs.get.rows(
+                    Dataset(target), [PROP_CLIENT_ID, PROP_CONFIG], types='filesystem,volume',
+                    recursive=True, received=False,
+                    # The caller's enumeration is the cross-check: a name it lists
+                    # that was not read cleanly is sent to the fallback below.
+                    verify_names=False,
+                )
         except Exception as e:
+            if raise_timeout and isinstance(e, ZFSTimeoutError):
+                raise
             logger.warning(
                 "Cannot read the properties of %s in one call (%r); reading them "
                 "one dataset at a time", target, e,
@@ -919,6 +1240,9 @@ class DatasetManager:
     def _received_dataset_info(
         self, ds: Dataset, target: str,
         props: Optional[Tuple[Optional[str], Optional[str], bool]] = None,
+        *,
+        only_client_id: Optional[str] = None,
+        scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
     ) -> Tuple[Optional[DatasetInfo], Optional[str]]:
         """`(DatasetInfo, None)` for a valid received client dataset (see
         `received_datasets`), else `(None, problem)` -- `problem` is `None`
@@ -928,15 +1252,23 @@ class DatasetManager:
 
         `props` is `(client_id, config, config_only_received)` from
         `_received_property_batch`; without it the properties are read here,
-        one `zfs.get.value` each (the exact path)."""
+        one `zfs.get.value` each (the exact path).
+
+        `only_client_id` (the local discovery) additionally refuses a dataset
+        whose local `client_id` is any other id, whatever its name. `scope`
+        wraps the `zfs` reads (timeouts); with `only_client_id`, a
+        `ZFSTimeoutError` propagates instead of becoming a problem."""
         if props is None:
             try:
-                client_id = zfs.get.value(ds, PROP_CLIENT_ID, sources='local')
-                config_value = zfs.get.value(ds, PROP_CONFIG, sources='local')
-                only_received = False
-                if client_id is None and config_value is None:
-                    only_received = zfs.get.value(ds, PROP_CONFIG, sources='received') is not None
+                with (scope or _no_scope)():
+                    client_id = zfs.get.value(ds, PROP_CLIENT_ID, sources='local')
+                    config_value = zfs.get.value(ds, PROP_CONFIG, sources='local')
+                    only_received = False
+                    if client_id is None and config_value is None:
+                        only_received = zfs.get.value(ds, PROP_CONFIG, sources='received') is not None
             except Exception as e:
+                if only_client_id is not None and isinstance(e, ZFSTimeoutError):
+                    raise
                 return None, f"cannot read its properties ({e!r})"
         else:
             client_id, config_value, only_received = props
@@ -957,6 +1289,11 @@ class DatasetManager:
         id_problem = client_id_problem(client_id)
         if id_problem is not None:
             return None, f"{PROP_CLIENT_ID}={client_id!r} is invalid: {id_problem}"
+        if only_client_id is not None and client_id != only_client_id:
+            return None, (
+                f"{PROP_CLIENT_ID}={client_id!r} is not this host's id {only_client_id!r}; "
+                "another host's copy is never pruned from here"
+            )
         home = f"{target}/{client_id}"
         if ds.name != home and not ds.name.startswith(home + '/'):
             return None, (
@@ -1175,10 +1512,16 @@ class DatasetManager:
     def list_snapshots(self, dsi: DatasetInfo, recursive: bool = False) -> List['SnapshotInfo']:
         """List all managed snapshots for a dataset."""
         self.last_list_error = None
+        self._last_list_failure = None
         try:
             return self._list_snapshots_strict(dsi, recursive)
         except Exception as e:
             self.last_list_error = f"{type(e).__name__}: {e}"
+            self._last_list_failure = e
+            if self._prune_timed and isinstance(e, ZFSTimeoutError):
+                # A local copy's pass: `prune_snapshots` announces the episode.
+                logger.debug(f"Failed to list snapshots for {dsi.name}: {e}")
+                return []
             logger.error(f"Failed to list snapshots for {dsi.name}: {e}")
             return []
 
@@ -1269,11 +1612,82 @@ class DatasetManager:
     def prune_snapshots(self, dsi: DatasetInfo) -> PruneResult:
         """Prune snapshots according to retention policy, skipping anchored
         snapshots. -> what the pass did (`PruneResult`); callers that only
-        want the side effect may ignore it."""
+        want the side effect may ignore it.
+
+        A SOURCE dataset is pruned untimed, as always. A LOCAL COPY
+        (`dsi.local_target`) runs every `zfs` command of its pass -- the
+        listing, the protection re-reads, the destroys -- under
+        `libzfseasy.timeout` (`LOCAL_PRUNE_COMMAND_BUDGET`, destroys
+        `LOCAL_PRUNE_DESTROY_BUDGET`), because the target can be on a pool that
+        suspends (`failmode=wait`): discovery may still answer while `zfs
+        destroy` sits in D state. A `ZFSTimeoutError` (a command that did not
+        finish, or the stuck-children fail-fast) ends that copy's pass with a
+        `skipped` result, skips the rest of the same target's copies for the
+        cycle (no `zfs` call; `local_copies` re-arms it) and is announced at
+        WARNING once per episode and failure class. It never enters the B-4
+        one-at-a-time retry or `_prune_stuck`: the destroy's outcome is
+        unknown and retrying a hung pool snapshot by snapshot would only hang
+        again. Untimed calls (the source datasets') are never refused by the
+        stuck-children registry (`libzfseasy._admit_timed` runs only for a
+        call under a timeout), so a stuck local destroy does not stop them.
+
+        An abandoned `zfs destroy` (it survived SIGKILL) is not waited for
+        when the worker leaves for a reload or an upgrade, unlike the API
+        worker's receive (`ApiWorker._wait_for_stuck_children`): the
+        successor's duplicate destroy of the same snapshot just gets "does not
+        exist" (or fails busy); the late destroy only carries out a decision
+        that was already allowed by the retention pass and by the protection
+        re-read made right before it (the newest snapshot of a copy -- the
+        only one that can be the next incremental base -- is never a
+        candidate), exactly like a destroy in flight when a worker is killed;
+        and a successor that finds the pool still suspended times out on its
+        first command and does nothing more -- whereas two overlapping
+        receives would corrupt the stream."""
+        target = dsi.local_target
+        if target is None:
+            return self._prune_snapshots(dsi)
+        blocked = self._local_prune_blocked.get(target)
+        if blocked is not None:
+            logger.debug("Not pruning %s: %s", dsi.name, blocked)
+            return PruneResult(skipped=blocked)
+        self._prune_timed = True
+        try:
+            with zfs.timeout(LOCAL_PRUNE_COMMAND_BUDGET):
+                result = self._prune_snapshots(dsi)
+        except ZFSTimeoutError as e:
+            return self._local_prune_timed_out(dsi, target, e)
+        finally:
+            self._prune_timed = False
+        if self._local_prune_noted.pop(target, None) is not None:
+            logger.info("The local copies under %s can be pruned again", target)
+        return result
+
+    def _local_prune_timed_out(self, dsi: DatasetInfo, target: str, failure: ZFSTimeoutError) -> PruneResult:
+        """A zfs command of a local copy's pass timed out (or was refused as
+        the registry holds a stuck child): block the rest of `target`'s copies
+        for this cycle and announce the episode (WARNING once per failure
+        class, DEBUG after)."""
+        kind = _failure_kind(failure)
+        text = _describe_failure(failure)
+        reason = (
+            f"the local target {target} did not answer while pruning {dsi.name} ({text}); "
+            "its other copies are skipped this cycle"
+        )
+        self._local_prune_blocked[target] = f"the local target {target} did not answer earlier in this cycle"
+        if self._local_prune_noted.get(target) != kind:
+            self._local_prune_noted[target] = kind
+            logger.warning("Not pruning the local copies under %s: %s", target, reason)
+        else:
+            logger.debug("Still not pruning the local copies under %s: %s", target, reason)
+        return PruneResult(skipped=reason)
+
+    def _prune_snapshots(self, dsi: DatasetInfo) -> PruneResult:
         self._reread_error = None
         snapshots = self.list_snapshots(dsi, recursive=False)
         if not snapshots:
             if self.last_list_error is not None:
+                if self._prune_timed and isinstance(self._last_list_failure, ZFSTimeoutError):
+                    raise self._last_list_failure
                 return PruneResult(skipped=f"cannot list snapshots: {self.last_list_error}")
             logger.debug(f"No snapshots to prune for {dsi.name}")
             self._forget_stuck(dsi, set())
@@ -1285,6 +1699,8 @@ class DatasetManager:
                 self._descendant_anchor_protection(dsi) if dsi.recursive else {}
             )
         except Exception as e:
+            if self._prune_timed and isinstance(e, ZFSTimeoutError):
+                raise
             # Unknown protect-set: pruning blind could destroy an incremental base.
             msg = f"Cannot read anchors for {dsi.name}; skipping pruning this cycle: {e}"
             if isinstance(e, ZFSOutputError):
@@ -1376,9 +1792,12 @@ class DatasetManager:
             if not batch:
                 continue
             try:
-                zfs.destroy([s.snapshot for s in batch], destroy=True, recursive=dsi.recursive)
+                with self._destroy_scope(dsi):
+                    zfs.destroy([s.snapshot for s in batch], destroy=True, recursive=dsi.recursive)
                 pruned += len(batch)
             except Exception as e:
+                if self._prune_timed and isinstance(e, ZFSTimeoutError):
+                    raise
                 # One bad member fails the whole call and destroys none of
                 # them. Retry each alone so the others still go.
                 logger.error(f"Failed to prune snapshot batch: {e}; retrying its snapshots one at a time")
@@ -1392,8 +1811,11 @@ class DatasetManager:
             if not self._still_prunable(dsi, [sni]):
                 continue
             try:
-                zfs.destroy([sni.snapshot], destroy=True, recursive=dsi.recursive)
+                with self._destroy_scope(dsi):
+                    zfs.destroy([sni.snapshot], destroy=True, recursive=dsi.recursive)
             except Exception as e:
+                if self._prune_timed and isinstance(e, ZFSTimeoutError):
+                    raise
                 logger.debug(f"Could not prune {sni.full_name}: {e}")
                 failed.append(sni)
                 continue
@@ -1415,6 +1837,13 @@ class DatasetManager:
         )
 
     # ── Prune fallback and stuck-snapshot memory (B4) ─────────────────────────
+
+    def _destroy_scope(self, dsi: DatasetInfo) -> 'contextlib.AbstractContextManager':
+        """The scope of one `zfs destroy`: the longer destroy budget for a
+        local copy (innermost `timeout` wins), nothing for a source dataset."""
+        if dsi.local_target is None:
+            return _no_scope()
+        return zfs.timeout(LOCAL_PRUNE_DESTROY_BUDGET)
 
     def _still_prunable(self, dsi: DatasetInfo, group: List['SnapshotInfo']) -> List['SnapshotInfo']:
         """`group` minus every snapshot that has become protected since the
@@ -1455,6 +1884,8 @@ class DatasetManager:
             protected = set(self._descendant_anchor_protection(dsi)) if dsi.recursive else set()
             protected |= set(self.get_anchors(dsi, own_properties_last=True))
         except Exception as e:
+            if self._prune_timed and isinstance(e, ZFSTimeoutError):
+                raise
             self._reread_error = str(e)
             logger.error(
                 f"Cannot re-read the anchors of {dsi.name}; not destroying "
@@ -1536,6 +1967,8 @@ class DatasetManager:
             fresh = {s.name: s for s in self._list_snapshots_strict(scratch)}
             listed = True
         except Exception as e:
+            if self._prune_timed and isinstance(e, ZFSTimeoutError):
+                raise
             logger.debug(f"Could not re-list {dsi.name} to explain a failed destroy: {e}")
         for sni in failed:
             current = fresh.get(sni.name)

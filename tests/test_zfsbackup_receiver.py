@@ -543,7 +543,7 @@ class TestOwnerVerdict:
         assert 'zfs set' not in verdict.message
 
     def test_the_same_id_is_confirmed(self):
-        assert owner_verdict(SERVER_DS, CLIENT, CLIENT) == OwnerVerdict(None, False, True)
+        assert owner_verdict(SERVER_DS, CLIENT, CLIENT) == OwnerVerdict(None, False, True, False)
 
     def test_the_empty_string_is_a_different_id_not_unowned(self):
         verdict = owner_verdict(SERVER_DS, '', CLIENT)
@@ -555,9 +555,14 @@ class TestOwnerVerdict:
             assert not (v.unowned and v.confirmed)
 
     def test_namedtuple_defaults_and_fields(self):
-        assert OwnerVerdict._fields == ('message', 'unowned', 'confirmed')
-        assert OwnerVerdict('m') == ('m', False, False)
-        assert OwnerVerdict(None) == (None, False, False)
+        assert OwnerVerdict._fields == ('message', 'unowned', 'confirmed', 'source_mismatch')
+        assert OwnerVerdict('m') == ('m', False, False, False)
+        assert OwnerVerdict(None) == (None, False, False, False)
+
+    def test_only_a_source_mismatch_sets_the_flag(self):
+        assert owner_verdict(SERVER_DS, None, CLIENT).source_mismatch is False
+        assert owner_verdict(SERVER_DS, 'client-2', CLIENT).source_mismatch is False
+        assert owner_verdict(SERVER_DS, CLIENT, CLIENT).source_mismatch is False
 
     def test_it_is_pure(self, record):
         """No zfs call is possible: the function takes no `zfs_call`."""
@@ -689,6 +694,7 @@ class TestOwnershipConflict:
         lib = FakeLib(value={PROP_CLIENT_ID: CLIENT})
         verdict, _ = self.check(zc, lib, {PROP_CLIENT_ID: CLIENT, PROP_SOURCE_DATASET: 'tank/other'})
         assert verdict.confirmed is True and verdict.unowned is False
+        assert verdict.source_mismatch is True
         assert verdict.message == (
             f"server dataset {SERVER_DS} already holds backups of 'tank/other'; "
             "refusing to mix in 'tank/data'"
@@ -698,11 +704,13 @@ class TestOwnershipConflict:
         lib = FakeLib(value={PROP_CLIENT_ID: CLIENT})
         verdict, _ = self.check(zc, lib, {PROP_SOURCE_DATASET: 'tank/other'})
         assert verdict.confirmed is True and 'already holds backups' in verdict.message
+        assert verdict.source_mismatch is True
 
     def test_ownership_problems_win_over_a_source_mismatch(self, zc):
         lib = FakeLib(value={})
         verdict, _ = self.check(zc, lib, {PROP_SOURCE_DATASET: 'tank/other'})
         assert verdict.unowned is True and 'refusing to adopt it' in verdict.message
+        assert verdict.source_mismatch is False
         lib = FakeLib(value={PROP_CLIENT_ID: 'client-2'})
         verdict, _ = self.check(zc, lib, {PROP_SOURCE_DATASET: 'tank/other'})
         assert "another client's" in verdict.message

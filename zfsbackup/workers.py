@@ -804,12 +804,19 @@ class PruningWorker(BaseWorker):
         workers_lock=None,
         status_dir=None,
         code_signature=None,
+        client_id: Optional[str] = None,
     ):
+        """`client_id` is this host's id from the supervisor's `Handoff` (the
+        same hand-over as `config`, so never one generation's config with
+        another's id): the local copies live under `<target>/<client_id>`
+        (`DatasetManager.local_copies`). `None`: they are not pruned."""
         super().__init__(
             'pruning-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
             status_dir=status_dir, code_signature=code_signature,
         )
+        self.client_id = client_id
+        self._no_client_id_warned = False
 
     _STATUS_KIND = health.KIND_PRUNE
     # One record per dataset per cycle: a forced write before each would be
@@ -820,6 +827,16 @@ class PruningWorker(BaseWorker):
     #: (`None`: remote backup is off).
     _received_error: Optional[str] = None
     _discover_target: Optional[str] = None
+    #: This cycle's local-copy discovery (`DatasetManager.last_local_discovery`
+    #: entries): each local destination's target is recorded as a `discover`
+    #: record under its own name and the destination's.
+    _local_discoveries: Tuple = ()
+    #: The local targets whose copies this cycle could not list (a failed
+    #: discovery, or -- for every local target -- no usable client id): like
+    #: `_received_error`, the list is then not the truth about what exists
+    #: there, so the records under THESE targets are kept (the others are
+    #: retained or dropped as usual).
+    _local_unknown: Tuple[str, ...] = ()
 
     def _get_interval(self, config: BackupConfig) -> float:
         return config.effective_prune_interval.total_seconds()
@@ -833,7 +850,75 @@ class PruningWorker(BaseWorker):
         if self._should_stop():
             return []
         self._note_received(manager, received)
-        return manager.datasets + received
+        local = self._local_copies(manager)
+        if self._should_stop():
+            return []
+        have = {d.name for d in manager.datasets} | {d.name for d in received}
+        return manager.datasets + received + [d for d in local if d.name not in have]
+
+    def _local_copies(self, manager: DatasetManager) -> List[DatasetInfo]:
+        """The copies under the local destinations' targets (this host's own
+        id only), for pruning, and one `discover` record per local target
+        (`dataset` = the target, `destination` = the destination's name, so
+        `check` tells them from the server's `discover` record and from each
+        other). Nothing happens, and nothing is recorded, with no local
+        destination in the config. No client id: no copies are discovered
+        (one WARNING per incarnation) and nothing is recorded -- the sender
+        refuses to run without one too."""
+        self._local_discoveries = ()
+        self._local_unknown = ()
+        config = manager.config
+        all_targets = tuple(
+            (d.target_dataset or '').rstrip('/') for d in config.destinations.values()
+            if getattr(d, 'is_local', False) is True and (d.target_dataset or '').rstrip('/')
+        )
+        if not all_targets:
+            return []
+        if self.client_id is None:
+            # Not knowing what exists: keep the records under every local target.
+            self._local_unknown = all_targets
+            if not self._no_client_id_warned:
+                self._no_client_id_warned = True
+                logging.getLogger(__name__).warning(
+                    f"{self.name}: this host has no client id, so the copies under its local "
+                    "destinations are not pruned until one is set (zfsbackup-config identity "
+                    "set-client-id ID)"
+                )
+            return []
+        local_copies = getattr(manager, 'local_copies', None)
+        if local_copies is None:
+            return []
+        try:
+            copies = local_copies(self.client_id, should_stop=self._should_stop)
+        except Exception as e:
+            self._local_unknown = all_targets
+            logging.getLogger(__name__).error(
+                f"{self.name} could not discover the local copies: {e!r}", exc_info=True
+            )
+            return []
+        if self._should_stop():
+            return []
+        self._local_discoveries = tuple(getattr(manager, 'last_local_discovery', ()) or ())
+        if getattr(manager, 'last_local_skip', None) is not None:
+            # Nothing was discovered for the whole configuration (an invalid
+            # client id): not the truth about what exists.
+            self._local_unknown = all_targets
+        else:
+            self._local_unknown = tuple(
+                d.target for d in self._local_discoveries if d.error is not None
+            )
+        for found in self._local_discoveries:
+            if found.error is not None:
+                self._record(
+                    health.KIND_DISCOVER, found.target, found.destination, ok=False,
+                    error=f"cannot list the local copies: {found.error}",
+                )
+            else:
+                self._record(
+                    health.KIND_DISCOVER, found.target, found.destination, ok=True,
+                    detail=f"{found.count} local cop{'y' if found.count == 1 else 'ies'}",
+                )
+        return copies
 
     def _note_received(self, manager: DatasetManager, received: List[DatasetInfo]) -> None:
         """Record how the enumeration of the received datasets went, under the
@@ -868,6 +953,17 @@ class PruningWorker(BaseWorker):
         keys = super()._status_keys(datasets)
         if self._discover_target is not None:
             keys.add((self._discover_target, None))
+        keys.update((d.target, d.destination) for d in self._local_discoveries)
+        if self._local_unknown and self._status is not None:
+            # A target whose copies could not be listed is not the truth about
+            # what exists under it: keep its `discover` record and the copies'
+            # records, and retain/drop everything else as usual.
+            for rec in self._status.records:
+                if any(
+                    rec.dataset == t or rec.dataset.startswith(t + '/')
+                    for t in self._local_unknown
+                ):
+                    keys.add((rec.dataset, rec.destination))
         return keys
 
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
@@ -884,7 +980,10 @@ class PruningWorker(BaseWorker):
 
 
 class RemoteBackupWorker(BaseWorker):
-    """Worker that periodically sends snapshots to configured remote destinations."""
+    """Worker that periodically sends snapshots to the configured destinations:
+    remote ones (`https://`, `zfsbackup.remote.RemoteBackupManager`) and local
+    ones (`zfs:<dataset>`, `zfsbackup.local.LocalBackupManager`), one after
+    another in the configured order, both managers built lazily."""
 
     #: Imports `zfsbackup.remote` lazily from disk: leaves for an upgrade drain
     #: first (stage 1).
@@ -913,7 +1012,8 @@ class RemoteBackupWorker(BaseWorker):
         same hand-over as `config`; a changed id is a reload, so a worker
         never runs with one generation's config and another's id. Both are
         passed to `RemoteBackupManager(config, manager, client_id=,
-        tls_dir=)`."""
+        tls_dir=)`; the client id also to `LocalBackupManager(config,
+        manager, client_id=)`, which lays the local copies out under it."""
         super().__init__(
             'remote-backup-worker', config, stop_event, log_level,
             reload_epoch=reload_epoch, born_epoch=born_epoch, workers_lock=workers_lock,
@@ -922,9 +1022,9 @@ class RemoteBackupWorker(BaseWorker):
         self.tls_dir = tls_dir
         self.client_id = client_id
         self._remote_manager = None
-        # (dataset, destination) pairs already warned about as local: one
-        # WARNING per pair per incarnation (see `_send_to_destinations`).
-        self._local_warned: Set[Tuple[str, str]] = set()
+        # Built by `_before_loop` whenever the configuration has a local
+        # destination (`_build_local_manager`), never later.
+        self._local_manager = None
 
     def _get_interval(self, config: BackupConfig) -> float:
         freqs = [
@@ -939,6 +1039,15 @@ class RemoteBackupWorker(BaseWorker):
         self._remote_manager = RemoteBackupManager(
             config, manager, client_id=self.client_id, tls_dir=self.tls_dir
         )
+        local_names = {
+            name for name, dest in config.destinations.items()
+            if getattr(dest, 'is_local', False) is True
+        }
+        # Imported here, right after the start-up version check, like
+        # `zfsbackup.remote` (S-8), whenever the configuration has a local
+        # destination: never mid-cycle.
+        if local_names:
+            self._build_local_manager(manager)
         # A reload or restart must not reset the resume-token skip counts:
         # carry them over from the previous incarnation's records.
         if self._status is not None:
@@ -949,8 +1058,34 @@ class RemoteBackupWorker(BaseWorker):
                 and r.result == health.RESULT_ERROR and r.consecutive_failures > 0
                 and (r.last_error or '').startswith(TOKEN_SKIP_NOTE)
             }
-            if counts:
-                self._remote_manager.seed_token_skips(counts)
+            remote_counts = {k: v for k, v in counts.items() if k[1] not in local_names}
+            local_counts = {k: v for k, v in counts.items() if k[1] in local_names}
+            if remote_counts:
+                self._remote_manager.seed_token_skips(remote_counts)
+            if local_counts and self._local_manager is not None:
+                self._local_manager.seed_token_skips(local_counts)
+
+    def _local_backup_manager(self, manager: DatasetManager):
+        """The `LocalBackupManager` for local (`zfs:<dataset>`) destinations.
+        `_before_loop` builds it (`_build_local_manager`, which imports
+        `zfsbackup.local` after the start-up version check) whenever a local
+        destination is configured; there is no lazy import mid-cycle, so a
+        miss here is an ERROR, raised to the per-destination handler (which
+        records it)."""
+        if self._local_manager is None:
+            logging.getLogger(__name__).error(
+                f"{self.name}: a local destination is used but no local backup manager was "
+                "built at start-up; not importing zfsbackup.local mid-cycle"
+            )
+            raise RuntimeError("the local backup manager was not built at start-up")
+        return self._local_manager
+
+    def _build_local_manager(self, manager: DatasetManager) -> None:
+        from zfsbackup.local import LocalBackupManager
+        self._local_manager = LocalBackupManager(
+            manager.config, manager, client_id=self.client_id
+        )
+        self._local_manager.begin_cycle()
 
     def _get_datasets(self, manager: DatasetManager) -> List[DatasetInfo]:
         # Called once at the top of every cycle: each destination's `/whoami`
@@ -958,6 +1093,8 @@ class RemoteBackupWorker(BaseWorker):
         # failed to load is retried.
         if self._remote_manager is not None:
             self._remote_manager.begin_cycle()
+        if self._local_manager is not None:
+            self._local_manager.begin_cycle()
         # Ancestors before descendants (by path depth; config order within a
         # depth, `sorted` is stable). A child sent first would make its
         # server parent an unowned placeholder with `create -p`, which a raw
@@ -972,8 +1109,10 @@ class RemoteBackupWorker(BaseWorker):
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
         if not dsi.config.remote:
             return
-        # The destination in hand, so that an exception is charged to it (the
-        # exception itself still propagates to the loop, as before).
+        # The destination in hand, so that an exception is charged to it. Each
+        # destination's own exceptions are caught in `_send_to_destinations`;
+        # this is the fallback for anything raised outside them, which still
+        # propagates to the loop.
         current: List[str] = []
         try:
             self._send_to_destinations(manager, dsi, current)
@@ -985,17 +1124,21 @@ class RemoteBackupWorker(BaseWorker):
                 )
             raise
 
-    def _record_send(self, dsi: DatasetInfo, destination: str, done: bool) -> None:
+    def _record_send(
+        self, dsi: DatasetInfo, destination: str, done: bool, sender=None
+    ) -> None:
         """Remember what `backup_dataset` returned. A `False` while an exit
         reason is pending is a stop or reload cutting the cycle short: neither
         a success nor a failure, so nothing is recorded. Otherwise `False` is
-        a failure, with the manager's own account of why when it has one."""
+        a failure, with the manager's own account of why when it has one.
+        `sender` is the manager that ran it (default: the remote one)."""
         if self._status is None:
             return
         if done:
             self._record(health.KIND_SEND, dsi.name, destination, ok=True)
         elif self._exit_reason() is None:
-            problem = self._remote_manager.last_problem(dsi.name, destination)
+            sender = self._remote_manager if sender is None else sender
+            problem = sender.last_problem(dsi.name, destination)
             self._record(
                 health.KIND_SEND, dsi.name, destination, ok=False,
                 error=problem if isinstance(problem, str) else 'not completed (see the journal)',
@@ -1014,49 +1157,65 @@ class RemoteBackupWorker(BaseWorker):
                 # Between destinations no stream is open: a safe point.
                 return
             current[:] = [remote_cfg.destination]
-            dest = manager.config.destinations.get(remote_cfg.destination)
-            if dest is not None and getattr(dest, 'is_local', False) is True:
-                # Temporary guard (replaced by the local backup manager): the
-                # remote manager, which speaks https only, must never be
-                # handed a `zfs:` destination. Nothing is recorded in the
-                # status file; `check` (health_collect._observe_local) sees
-                # no anchor, so it grades the destination WARN then CRIT
-                # ("not yet sent") until the local manager exists. That is
-                # the intended signal: nothing is being backed up.
-                key = (dsi.name, remote_cfg.destination)
-                if key not in self._local_warned:
-                    self._local_warned.add(key)
-                    logger.warning(
-                        f"Backup of {dsi.name} to {remote_cfg.destination} "
-                        f"({dest.url}) skipped: local destinations are not "
-                        "implemented yet"
+            # One destination's failure is its own: it is recorded against
+            # that destination and logged, and the dataset's remaining
+            # destinations still get their turn this cycle.
+            try:
+                self._send_to_destination(manager, dsi, remote_cfg, logger)
+            except Exception as e:
+                logger.error(
+                    f"{self.name} error on {dsi.name} -> {remote_cfg.destination}: {e}",
+                    exc_info=True,
+                )
+                # As in `_record_send`: an exception while a stop or reload is
+                # pending is most likely that stop cutting the work short
+                # (a killed child, a closed stream) -- neither a success nor
+                # a failure of the destination, so nothing is recorded.
+                if self._exit_reason() is None:
+                    self._record(
+                        health.KIND_SEND, dsi.name, remote_cfg.destination, ok=False,
+                        error=f"{type(e).__name__}: {e}",
                     )
-                continue
-            freq = (remote_cfg.frequency or dsi.config.frequency).total_seconds()
-            anchor_name = manager.get_anchor(dsi, remote_cfg.destination)
-            if anchor_name:
-                snapshots = manager.list_snapshots(dsi)
-                anchor = next((s for s in snapshots if s.name == anchor_name), None)
-                # An anchor dated beyond the clock tolerance in the future
-                # means the clock is behind it: its age says nothing, so the
-                # destination is due (`clock_behind` logs the ERROR once).
-                if (
-                    anchor
-                    and not manager.clock_behind(
-                        dsi, anchor, f"anchor for {remote_cfg.destination}"
-                    )
-                    and anchor.age.total_seconds() < freq
-                ):
-                    logger.debug(
-                        f"Backup of {dsi.name} to {remote_cfg.destination} not due yet"
-                    )
-                    continue
-            # `should_stop` is polled before every stream of the chain (never
-            # during one): no new stream during a stop or a reload (C3).
-            done = self._remote_manager.backup_dataset(
-                dsi, remote_cfg, should_stop=lambda: self._exit_reason() is not None
-            )
-            self._record_send(dsi, remote_cfg.destination, done)
+                    # The next destination may stream for hours: write this outcome now.
+                    self._flush_status(force=True)
+
+    def _send_to_destination(
+        self, manager: DatasetManager, dsi: DatasetInfo, remote_cfg, logger
+    ) -> None:
+        dest = manager.config.destinations.get(remote_cfg.destination)
+        # A local (`zfs:<dataset>`) destination goes to the local manager,
+        # anything else (an unknown name included: it says so) to the
+        # remote one, which speaks https only and must never be handed a
+        # `zfs:` destination. Same interval, order and records for both.
+        if dest is not None and getattr(dest, 'is_local', False) is True:
+            sender = self._local_backup_manager(manager)
+        else:
+            sender = self._remote_manager
+        freq = (remote_cfg.frequency or dsi.config.frequency).total_seconds()
+        anchor_name = manager.get_anchor(dsi, remote_cfg.destination)
+        if anchor_name:
+            snapshots = manager.list_snapshots(dsi)
+            anchor = next((s for s in snapshots if s.name == anchor_name), None)
+            # An anchor dated beyond the clock tolerance in the future
+            # means the clock is behind it: its age says nothing, so the
+            # destination is due (`clock_behind` logs the ERROR once).
+            if (
+                anchor
+                and not manager.clock_behind(
+                    dsi, anchor, f"anchor for {remote_cfg.destination}"
+                )
+                and anchor.age.total_seconds() < freq
+            ):
+                logger.debug(
+                    f"Backup of {dsi.name} to {remote_cfg.destination} not due yet"
+                )
+                return
+        # `should_stop` is polled before every stream of the chain (never
+        # during one): no new stream during a stop or a reload (C3).
+        done = sender.backup_dataset(
+            dsi, remote_cfg, should_stop=lambda: self._exit_reason() is not None
+        )
+        self._record_send(dsi, remote_cfg.destination, done, sender)
 
 
 #: At most this many connections are served (handshaking or in a request) at
