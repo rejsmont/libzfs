@@ -26,16 +26,19 @@ from libzfseasy import zfs as zfs_module
 from libzfseasy.types import Dataset, Filesystem
 
 from _openzfs_fixtures import VERSIONS, load_section
+from _stream_support import FILESYSTEM_FORCED, VOLUME_FORCED, capture_header, make_header
+from libzfseasy.zfs import PropertySource
 from zfsbackup import receiver
 from zfsbackup.backup_manager import (
     PROP_CLIENT_ID, PROP_CONFIG, PROP_SOURCE_DATASET, read_zfsbackup_properties,
 )
 from zfsbackup.receiver import (
-    ABORT_ALREADY_CLEAN, BadDatasetName, OwnerVerdict, RECEIVE_PROPERTIES_FILESYSTEM,
-    RECEIVE_PROPERTIES_VOLUME, SERVER_OWNED_PROPERTIES, abort_partial_receive,
-    ancestor_holds_partial_receive, client_dataset_problem, create_ancestors, local_client_id,
-    may_force, owner_verdict, ownership_conflict, receive_properties, resume_token,
-    server_copy_kind, server_dataset, start_receive,
+    ABORT_ALREADY_CLEAN, BadDatasetName, DMU_BACKUP_FEATURE_RAW, OwnerVerdict,
+    RECEIVE_PROPERTIES_FILESYSTEM, RECEIVE_PROPERTIES_VOLUME, SERVER_OWNED_PROPERTIES,
+    abort_partial_receive, ancestor_holds_partial_receive, client_dataset_problem, create_ancestors,
+    enforce_receive_properties, local_client_id, may_force, owner_verdict, ownership_conflict,
+    parse_stream_header, receive_properties, resume_token, server_copy_kind, server_dataset,
+    start_receive,
 )
 
 pytestmark = pytest.mark.unit
@@ -43,6 +46,13 @@ pytestmark = pytest.mark.unit
 TARGET = 'backup/srv'
 CLIENT = 'client-1'
 SERVER_DS = f'{TARGET}/{CLIENT}/tank/data'
+
+#: Headers as the real senders write them (OpenZFS 2.1.5 captures): `versioninfo` of a raw
+#: filesystem 0x5080011, a raw volume 0x5080001, a plain filesystem 0x11.
+RAW_FS = parse_stream_header(make_header('filesystem', versioninfo=0x5080011))
+RAW_VOL = parse_stream_header(make_header('volume', versioninfo=0x5080001))
+PLAIN_FS = parse_stream_header(make_header('filesystem', versioninfo=0x1080011))
+PLAIN_VOL = parse_stream_header(make_header('volume', versioninfo=0x1))
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +92,7 @@ class FakeLib:
     def __init__(self, **answers):
         self.answers = {
             'exists': True, 'list': [], 'value': {}, 'create': None, 'abort': None,
-            'filesystem': 'HANDLE',
+            'filesystem': 'HANDLE', 'sources': [], 'set': None,
         }
         self.answers.update(answers)
         self.fail = {}
@@ -107,9 +117,16 @@ class FakeLib:
         def filesystem(ds, **kwargs):
             return self._run('filesystem', ds, **kwargs)
 
+        def property_sources(ds, **kwargs):
+            return self._run('sources', ds, **kwargs)
+
+        def set_(ds, properties):
+            return self._run('set', ds, properties)
+
         self.exists = exists
+        self.set = set_
         self.list = list_
-        self.get = SimpleNamespace(value=value)
+        self.get = SimpleNamespace(value=value, property_sources=property_sources)
         self.create = create
         self.receive = SimpleNamespace(abort=abort, filesystem=filesystem)
 
@@ -166,7 +183,7 @@ class TestModuleShape:
         for name in (
             'server_copy_kind', 'resume_token', 'local_client_id', 'ownership_conflict',
             'ancestor_holds_partial_receive', 'create_ancestors', 'abort_partial_receive',
-            'may_force',
+            'may_force', 'enforce_receive_properties',
         ):
             params = list(inspect.signature(getattr(receiver, name)).parameters.values())
             assert params[0].name == 'zfs_call', name
@@ -175,7 +192,7 @@ class TestModuleShape:
         for name in (
             'server_copy_kind', 'resume_token', 'local_client_id', 'ownership_conflict',
             'ancestor_holds_partial_receive', 'create_ancestors', 'abort_partial_receive',
-            'may_force', 'start_receive',
+            'may_force', 'start_receive', 'enforce_receive_properties',
         ):
             param = inspect.signature(getattr(receiver, name)).parameters['lib']
             assert param.kind is inspect.Parameter.KEYWORD_ONLY, name
@@ -1100,6 +1117,289 @@ class TestMayForce:
         assert may_force(zc, self.FS, False, lib=lib) is False
 
 
+class TestStreamHeaderRaw:
+    """`StreamHeader.raw`: `DMU_BACKUP_FEATURE_RAW` among the feature flags (`versioninfo >> 2`)."""
+
+    def test_the_constant_is_feature_bit_24(self):
+        assert DMU_BACKUP_FEATURE_RAW == 1 << 24
+        assert 'DMU_BACKUP_FEATURE_RAW' in receiver.__all__
+
+    @pytest.mark.parametrize('version', VERSIONS)
+    @pytest.mark.parametrize('name, kind, raw', [
+        ('raw_full', 'filesystem', True), ('raw_incr', 'filesystem', True),
+        ('raw_p_inner', 'filesystem', True), ('raw_p_incr_inner', 'filesystem', True),
+        ('resume_raw_full', 'filesystem', True), ('resume_raw_incr', 'filesystem', True),
+        ('volume_raw_full', 'volume', True), ('volume_raw_incr', 'volume', True),
+        ('volume_raw_p_inner', 'volume', True),
+        ('plain_full', 'filesystem', False), ('plain_c', 'filesystem', False),
+        ('plain_L', 'filesystem', False), ('plain_Lc', 'filesystem', False),
+        ('plain_incr', 'filesystem', False), ('plain_p_inner', 'filesystem', False),
+        ('resume_plain_full', 'filesystem', False), ('resume_plain_incr', 'filesystem', False),
+        ('volume_full', 'volume', False), ('volume_Lc_full', 'volume', False),
+        ('volume_incr', 'volume', False), ('volume_p_inner', 'volume', False),
+    ])
+    def test_over_the_captured_headers(self, version, name, kind, raw):
+        header = parse_stream_header(capture_header(version, name))
+        assert header.kind == kind
+        assert header.raw is raw, (version, name, hex(header.versioninfo))
+
+    def test_the_real_raw_wordings_of_every_version_match_the_synthetic_ones(self):
+        """The real wordings of all four versions agree with the synthetic ones below."""
+        for version in VERSIONS:
+            assert parse_stream_header(capture_header(version, 'raw_full')).versioninfo == 0x5080011
+            assert parse_stream_header(capture_header(version, 'volume_raw_full')).versioninfo == 0x5080001
+
+    def test_synthetic_headers(self):
+        assert RAW_FS.raw is True and RAW_VOL.raw is True
+        assert PLAIN_FS.raw is False and PLAIN_VOL.raw is False
+
+    def test_the_default_synthetic_header_is_plain(self):
+        assert parse_stream_header(make_header()).raw is False
+        assert parse_stream_header(make_header('volume')).raw is False
+
+    @pytest.mark.parametrize('versioninfo, raw', [
+        (1 | (DMU_BACKUP_FEATURE_RAW << 2), True),            # nothing else set
+        (1 | (DMU_BACKUP_FEATURE_RAW << 2) | 0xFFF0, True),   # with other features
+        (1 | (1 << 2), False),                                # another feature bit
+        (1 | ((DMU_BACKUP_FEATURE_RAW >> 1) << 2), False),    # the neighbour below
+        (1 | ((DMU_BACKUP_FEATURE_RAW << 1) << 2), False),    # the neighbour above
+        (1, False),
+    ])
+    def test_only_the_raw_feature_bit_counts(self, versioninfo, raw):
+        header = parse_stream_header(make_header(versioninfo=versioninfo))
+        assert header.raw is raw
+
+    def test_the_shift_is_two_bits(self):
+        """`versioninfo` bit 26, not bit 24: bits 0-1 are the header type."""
+        assert parse_stream_header(make_header(versioninfo=1 | (1 << 26))).raw is True
+        assert parse_stream_header(make_header(versioninfo=1 | (1 << 24))).raw is False
+
+    def test_big_endian_headers(self):
+        assert parse_stream_header(make_header(versioninfo=0x5080011, big_endian=True)).raw is True
+        assert parse_stream_header(make_header(versioninfo=0x1080011, big_endian=True)).raw is False
+
+    def test_raw_is_a_property_not_a_field(self):
+        assert 'raw' not in receiver.StreamHeader._fields
+        assert isinstance(receiver.StreamHeader.raw, property)
+
+
+def src(name, prop, source='local'):
+    return PropertySource(name, prop, source)
+
+
+def local_rows(props, name=SERVER_DS):
+    return [src(name, p) for p in props]
+
+
+class TestEnforceReceiveProperties:
+    FS = Filesystem(SERVER_DS)
+
+    # -- plain streams: no zfs call at all ---------------------------------------------------------
+
+    @pytest.mark.parametrize('header', [PLAIN_FS, PLAIN_VOL], ids=['filesystem', 'volume'])
+    def test_a_plain_stream_runs_nothing(self, zc, record, header):
+        lib = FakeLib()
+        assert enforce_receive_properties(zc, self.FS, header, lib=lib) == []
+        assert record == [] and lib.log == []
+
+    @pytest.mark.parametrize('version', VERSIONS)
+    @pytest.mark.parametrize('name', ['plain_full', 'plain_Lc', 'plain_incr', 'volume_full',
+                                      'resume_plain_full'])
+    def test_a_plain_capture_runs_nothing(self, zc, record, version, name):
+        lib = FakeLib()
+        header = parse_stream_header(capture_header(version, name))
+        assert enforce_receive_properties(zc, self.FS, header, lib=lib) == []
+        assert record == [] and lib.log == []
+
+    def test_a_plain_stream_does_not_look_at_the_dataset(self, zc):
+        lib = FakeLib()
+        lib.fail['sources'] = Boom('never reached')
+        assert enforce_receive_properties(zc, self.FS, PLAIN_FS, lib=lib) == []
+
+    # -- raw, all local: one read, no write --------------------------------------------------------
+
+    def test_a_raw_filesystem_with_every_forced_property_local_writes_nothing(self, zc, record):
+        lib = FakeLib(sources=local_rows(FILESYSTEM_FORCED))
+        assert enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib) == []
+        assert called(record) == ['property_sources']
+        assert lib.names() == ['sources']
+
+    def test_the_read_is_value_free_and_local_only(self, zc, record):
+        lib = FakeLib(sources=local_rows(FILESYSTEM_FORCED))
+        enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib)
+        (name, args, kwargs), = lib.log
+        assert args == (self.FS,) and kwargs == {'sources': 'local'}
+
+    def test_other_local_properties_are_ignored(self, zc):
+        rows = local_rows(list(FILESYSTEM_FORCED) + ['org.zfsbackup:config', 'compression', 'quota'])
+        lib = FakeLib(sources=rows)
+        assert enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib) == []
+        assert lib.names() == ['sources']
+
+    def test_the_forced_set_is_what_receive_properties_says(self, zc):
+        """Every property the receive forces is checked, none other is demanded."""
+        lib = FakeLib(sources=[])
+        fixed = enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib)
+        assert fixed == sorted(FILESYSTEM_FORCED)
+        assert set(RECEIVE_PROPERTIES_FILESYSTEM) == set(FILESYSTEM_FORCED)
+
+    # -- raw, one missing --------------------------------------------------------------------------
+
+    def test_sharesmb_missing_sets_exactly_sharesmb_off(self, zc, record):
+        rows = local_rows(p for p in FILESYSTEM_FORCED if p != 'sharesmb')
+        lib = FakeLib(sources=rows)
+        assert enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib) == ['sharesmb']
+        assert lib.names() == ['sources', 'set']
+        (_, args, kwargs) = lib.log[1]
+        assert args == (self.FS, {'sharesmb': 'off'}) and kwargs == {}
+        assert called(record) == ['property_sources', 'set_']
+
+    def test_the_set_value_is_the_forced_one_for_each_property(self, zc):
+        for prop, value in FILESYSTEM_FORCED.items():
+            lib = FakeLib(sources=local_rows(p for p in FILESYSTEM_FORCED if p != prop))
+            assert enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib) == [prop]
+            assert lib.log[1][1][1] == {prop: value}, prop
+
+    def test_several_missing_are_set_in_one_call_and_returned_sorted(self, zc):
+        keep = {'canmount', 'readonly', 'volmode', 'mountpoint', 'setuid', 'exec', 'devices'}
+        lib = FakeLib(sources=local_rows(keep))
+        assert enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib) == ['sharenfs', 'sharesmb']
+        assert lib.names() == ['sources', 'set']
+        assert lib.log[1][1][1] == {'sharenfs': 'off', 'sharesmb': 'off'}
+
+    def test_nothing_local_sets_the_whole_forced_set(self, zc):
+        lib = FakeLib(sources=[])
+        enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib)
+        assert lib.log[1][1][1] == FILESYSTEM_FORCED
+
+    def test_the_set_gets_a_fresh_dict_not_the_module_constant(self, zc):
+        lib = FakeLib(sources=[])
+        enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib)
+        sent = lib.log[1][1][1]
+        assert sent is not RECEIVE_PROPERTIES_FILESYSTEM
+        sent.clear()
+        assert RECEIVE_PROPERTIES_FILESYSTEM == FILESYSTEM_FORCED
+
+    def test_a_row_of_another_dataset_is_not_this_datasets_value(self, zc):
+        rows = local_rows(p for p in FILESYSTEM_FORCED if p != 'sharesmb')
+        rows.append(src('backup/srv/other', 'sharesmb'))
+        lib = FakeLib(sources=rows)
+        assert enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib) == ['sharesmb']
+
+    # -- raw volume --------------------------------------------------------------------------------
+
+    def test_a_raw_volume_with_its_set_local_writes_nothing(self, zc):
+        lib = FakeLib(sources=local_rows(VOLUME_FORCED))
+        assert enforce_receive_properties(zc, self.FS, RAW_VOL, lib=lib) == []
+        assert lib.names() == ['sources']
+
+    def test_a_raw_volume_uses_the_volume_set_only(self, zc):
+        lib = FakeLib(sources=[])
+        assert enforce_receive_properties(zc, self.FS, RAW_VOL, lib=lib) == sorted(VOLUME_FORCED)
+        assert lib.log[1][1][1] == VOLUME_FORCED
+
+    def test_a_raw_volume_never_gets_sharesmb_or_canmount(self, zc):
+        lib = FakeLib(sources=[])
+        enforce_receive_properties(zc, self.FS, RAW_VOL, lib=lib)
+        sent = lib.log[1][1][1]
+        assert not {'sharesmb', 'sharenfs', 'canmount', 'mountpoint', 'setuid', 'exec',
+                    'devices'} & set(sent)
+
+    def test_a_raw_volume_missing_only_readonly(self, zc):
+        lib = FakeLib(sources=local_rows(['volmode']))
+        assert enforce_receive_properties(zc, self.FS, RAW_VOL, lib=lib) == ['readonly']
+        assert lib.log[1][1][1] == {'readonly': 'on'}
+
+    @pytest.mark.parametrize('version', VERSIONS)
+    def test_a_raw_volume_capture_is_a_volume_set(self, zc, version):
+        header = parse_stream_header(capture_header(version, 'volume_raw_full'))
+        lib = FakeLib(sources=[])
+        enforce_receive_properties(zc, self.FS, header, lib=lib)
+        assert lib.log[1][1][1] == VOLUME_FORCED
+
+    @pytest.mark.parametrize('version', VERSIONS)
+    def test_a_raw_filesystem_capture_is_a_filesystem_set(self, zc, version):
+        header = parse_stream_header(capture_header(version, 'raw_incr'))
+        lib = FakeLib(sources=[])
+        enforce_receive_properties(zc, self.FS, header, lib=lib)
+        assert lib.log[1][1][1] == FILESYSTEM_FORCED
+
+    # -- failures ----------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize('exc', [Boom('zfs said no'), ZFSTimeoutError('slow'), OSError('gone')])
+    def test_a_failing_read_propagates_and_nothing_is_set(self, zc, exc):
+        lib = FakeLib()
+        lib.fail['sources'] = exc
+        with pytest.raises(type(exc)):
+            enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib)
+        assert lib.names() == ['sources']
+
+    @pytest.mark.parametrize('exc', [Boom('permission denied'), ZFSTimeoutError('slow')])
+    def test_a_failing_set_propagates(self, zc, exc):
+        lib = FakeLib(sources=[])
+        lib.fail['set'] = exc
+        with pytest.raises(type(exc)):
+            enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib)
+        assert lib.names() == ['sources', 'set']
+
+    # -- zfs_call and lib --------------------------------------------------------------------------
+
+    def test_every_call_goes_through_zfs_call(self):
+        lib = FakeLib()
+        seen = []
+
+        def zfs_call(fn, *args, **kwargs):
+            seen.append(fn)
+            return [] if fn is lib.get.property_sources else None
+
+        assert enforce_receive_properties(zfs_call, self.FS, RAW_FS, lib=lib) == sorted(FILESYSTEM_FORCED)
+        assert seen == [lib.get.property_sources, lib.set]
+        assert lib.log == [] and lib.outside == []
+
+    def test_a_zfs_call_that_refuses_stops_the_function(self):
+        lib = FakeLib()
+
+        def refuse(fn, *args, **kwargs):
+            raise ZFSTimeoutError('the budget for this request is spent')
+
+        with pytest.raises(ZFSTimeoutError):
+            enforce_receive_properties(refuse, self.FS, RAW_FS, lib=lib)
+        assert lib.log == []
+
+    def test_nothing_runs_outside_zfs_call(self, zc):
+        lib = FakeLib()
+        enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib)
+        assert lib.outside == []
+
+    def test_the_name_filter_uses_the_string_form_of_the_dataset(self, zc):
+        lib = FakeLib(sources=local_rows(FILESYSTEM_FORCED))
+        assert enforce_receive_properties(zc, Dataset(SERVER_DS), RAW_FS, lib=lib) == []
+        assert enforce_receive_properties(zc, SERVER_DS, RAW_FS, lib=lib) == []
+
+    def test_the_override_is_used_instead_of_the_default(self, zc, monkeypatch):
+        default = FakeLib()
+        monkeypatch.setattr(receiver, 'zfs', default)
+        lib = FakeLib(sources=local_rows(FILESYSTEM_FORCED))
+        enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib)
+        assert lib.names() == ['sources'] and default.log == []
+
+    def test_the_default_is_looked_up_at_call_time(self, zc, monkeypatch):
+        default = FakeLib(sources=[])
+        monkeypatch.setattr(receiver, 'zfs', default)
+        assert enforce_receive_properties(zc, self.FS, RAW_FS) == sorted(FILESYSTEM_FORCED)
+        assert default.names() == ['sources', 'set']
+
+    def test_lib_is_keyword_only(self, zc):
+        with pytest.raises(TypeError):
+            enforce_receive_properties(zc, self.FS, RAW_FS, FakeLib())
+
+    def test_it_logs_nothing(self, zc, caplog):
+        lib = FakeLib(sources=[])
+        with caplog.at_level(logging.DEBUG):
+            enforce_receive_properties(zc, self.FS, RAW_FS, lib=lib)
+        assert caplog.records == []
+
+
 class TestStartReceive:
     FS = Filesystem(SERVER_DS)
     OWNED = {PROP_CONFIG: 'e30=', PROP_CLIENT_ID: CLIENT, PROP_SOURCE_DATASET: 'tank/data'}
@@ -1250,6 +1550,9 @@ class TestLibOverride:
         ('abort_partial_receive', lambda zc, lib: abort_partial_receive(zc, SERVER_DS, lib=lib),
          ['abort']),
         ('may_force', lambda zc, lib: may_force(zc, Filesystem(SERVER_DS), True, lib=lib), ['exists']),
+        ('enforce_receive_properties',
+         lambda zc, lib: enforce_receive_properties(zc, Filesystem(SERVER_DS), RAW_FS, lib=lib),
+         ['sources', 'set']),
     ])
     def test_every_function_honours_lib(self, zc, monkeypatch, name, call, expect):
         default = self.patched_default(monkeypatch)
@@ -1278,6 +1581,7 @@ class TestLibOverride:
         lambda zc: create_ancestors(zc, [SERVER_DS], CLIENT),
         lambda zc: abort_partial_receive(zc, SERVER_DS),
         lambda zc: may_force(zc, Filesystem(SERVER_DS), True),
+        lambda zc: enforce_receive_properties(zc, Filesystem(SERVER_DS), RAW_FS),
     ])
     def test_every_function_falls_back_to_the_module_zfs(self, zc, monkeypatch, call):
         default = self.patched_default(monkeypatch, value={PROP_CLIENT_ID: None}, list=token_row('1-x'))

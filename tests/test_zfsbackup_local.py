@@ -1622,6 +1622,267 @@ class TestStreamStepOutcomes:
         assert rig.mgr._pending.get(COPY) == 5.0
 
 
+HEADER_RAW = make_header('filesystem', versioninfo=0x5080011)          # a raw filesystem (2.1.5)
+HEADER_RAW_VOLUME = make_header('volume', versioninfo=0x5080001)       # a raw volume
+
+
+class TestStepEnforcesForcedProperties:
+    """OpenZFS 2.1 skips `-o sharesmb=off` on a RAW receive and exits 0: after a step whose receive
+    committed, `_enforce_forced_properties` reads which forced properties are local and `zfs set`s the
+    others, under a fresh `_Budget`. It never fails the step."""
+
+    COPY_FS = Filesystem(COPY)
+    DID_NOT_APPLY = f'{DS} -> {DEST}: zfs receive did not apply %s to {COPY}; set it after the receive'
+    CANNOT = (f'{DS} -> {DEST}: cannot make the forced properties of {COPY} local after the '
+              'receive; the next receive tries again')
+    AGAIN = f'{DS} -> {DEST}: the forced properties of {COPY} are local again'
+
+    def committed(self, rig, step, props, header=HEADER_RAW, **kw):
+        """A step whose receive creates the copy with `props` as its local properties."""
+        def add():
+            rig.host.add_copy(props={**owned_props(config=rig.canonical), **props})
+
+        receive = step.streams.receive(events=rig.host.events, on_commit=add)
+        return step.run(header + PAYLOAD, receive=receive, **kw)
+
+    # -- the three outcomes ------------------------------------------------------------------------
+
+    def test_every_forced_property_local_reads_once_and_writes_nothing(self, rig, step, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.local'):
+            assert self.committed(rig, step, FILESYSTEM_FORCED) == _OK
+        assert rig.host.of('sources') == [('sources', COPY, 'local')]
+        assert rig.host.of('set') == []
+        assert [r for r in records(caplog) if r[0] in ('INFO', 'WARNING', 'ERROR')] == []
+
+    def test_sharesmb_missing_is_set_to_off_and_nothing_else(self, rig, step, caplog):
+        props = {k: v for k, v in FILESYSTEM_FORCED.items() if k != 'sharesmb'}
+        with caplog.at_level(logging.INFO, logger='zfsbackup.local'):
+            assert self.committed(rig, step, props) == _OK
+        assert rig.host.of('set') == [('set', COPY, {'sharesmb': 'off'})]
+        assert rig.host.datasets[COPY].props['sharesmb'] == 'off'
+        assert messages(caplog, logging.INFO) == [self.DID_NOT_APPLY % 'sharesmb=off']
+        assert messages(caplog, logging.WARNING) == [] and messages(caplog, logging.ERROR) == []
+
+    def test_several_missing_are_set_in_one_command(self, rig, step, caplog):
+        with caplog.at_level(logging.INFO, logger='zfsbackup.local'):
+            assert self.committed(rig, step, {'canmount': 'noauto'}) == _OK
+        (event,) = rig.host.of('set')
+        assert event[2] == {k: v for k, v in FILESYSTEM_FORCED.items() if k != 'canmount'}
+        (info,) = messages(caplog, logging.INFO)
+        assert 'readonly=on' in info and 'sharesmb=off' in info and 'canmount' not in info
+
+    def test_the_read_follows_the_receive_and_the_write_the_read(self, rig, step):
+        self.committed(rig, step, {})
+        kinds = rig.host.kinds('start-receive', 'sources', 'set')
+        assert kinds == ['start-receive', 'sources', 'set']
+
+    @pytest.mark.parametrize('exc', [RuntimeError('zfs said no'), ZFSTimeoutError('slow'), OSError('gone')])
+    def test_a_failing_read_is_a_warning_and_the_step_succeeds(self, rig, step, caplog, exc):
+        rig.host.fail_on('sources', exc)
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.local'):
+            assert self.committed(rig, step, {}) == _OK
+        assert messages(caplog, logging.WARNING) == [self.CANNOT]
+        assert messages(caplog, logging.ERROR) == []
+        assert rig.host.of('set') == []
+        assert any(str(exc) in m for m in messages(caplog, logging.DEBUG))
+        assert COPY not in rig.mgr._pending
+
+    @pytest.mark.parametrize('exc', [RuntimeError('permission denied'), ZFSTimeoutError('slow')])
+    def test_a_failing_set_is_a_warning_and_the_step_succeeds(self, rig, step, caplog, exc):
+        rig.host.fail_on('set', exc)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.local'):
+            assert self.committed(rig, step, {}) == _OK
+        assert messages(caplog, logging.WARNING) == [self.CANNOT]
+        assert not [m for m in messages(caplog, logging.INFO) if 'did not apply' in m]
+
+    def test_the_warning_is_given_once_per_episode_and_recovery_is_announced(self, rig, step, caplog):
+        rig.host.fail_on('sources', RuntimeError('x'))
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.local'):
+            for _ in range(3):
+                assert self.committed(rig, step, FILESYSTEM_FORCED) == _OK
+            mine = [(lvl, m) for lvl, m in records(caplog) if m == self.CANNOT]
+            assert [lvl for lvl, _ in mine] == ['WARNING', 'DEBUG', 'DEBUG']
+            caplog.clear()
+            rig.host._fail.clear()
+            assert self.committed(rig, step, FILESYSTEM_FORCED) == _OK
+            assert messages(caplog, logging.INFO) == [self.AGAIN]
+            caplog.clear()
+            assert self.committed(rig, step, FILESYSTEM_FORCED) == _OK
+            assert messages(caplog, logging.INFO) == []
+            rig.host.fail_on('sources', RuntimeError('x'))
+            assert self.committed(rig, step, FILESYSTEM_FORCED) == _OK
+            assert messages(caplog, logging.WARNING) == [self.CANNOT]       # a new episode
+
+    def test_a_standing_enforcement_warning_is_never_reported_as_why_a_send_failed(self, rig, step):
+        rig.host.fail_on('sources', RuntimeError('x'))
+        assert self.committed(rig, step, {}) == _OK
+        assert rig.mgr.last_problem(DS, DEST) is None
+
+    def test_an_episode_is_per_dataset_and_destination(self, rig, step, caplog):
+        rig.host.fail_on('sources', RuntimeError('x'))
+        other = rig.dsi_for('pool/other')
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.local'):
+            self.committed(rig, step, {})
+            rig.mgr._enforce_forced_properties(Filesystem(f'{BASE}/pool/other'),
+                                               parse_header(HEADER_RAW), other, DEST)
+        assert len(messages(caplog, logging.WARNING)) == 2
+
+    # -- a step that did not commit ----------------------------------------------------------------
+
+    def test_a_failed_receive_enforces_nothing(self, rig, step):
+        receive = step.streams.receive(rc=1, stderr='cannot receive: no space', events=rig.host.events)
+        assert step.run(HEADER_RAW + PAYLOAD, receive=receive) == _FAILED
+        assert rig.host.of('sources') == [] and rig.host.of('set') == []
+
+    def test_a_dead_receive_enforces_nothing(self, rig, step):
+        receive = step.streams.receive(dead_rc=1, stderr='cannot receive', events=rig.host.events)
+        assert step.run(HEADER_RAW + PAYLOAD, receive=receive) == _FAILED
+        assert rig.host.of('sources') == []
+
+    def test_a_failed_send_enforces_nothing(self, rig, step):
+        send = step.streams.send(HEADER_RAW + PAYLOAD, rc=2, stderr='boom', events=rig.host.events)
+        assert step.run(send=send) == _FAILED
+        assert rig.host.of('sources') == []
+
+    def test_a_receive_that_does_not_commit_enforces_nothing(self, rig, step, mocker):
+        mocker.patch.object(local, 'LOCAL_COMMIT_TIMEOUT', 0.2)
+        receive = step.streams.receive(hang=True, events=rig.host.events)
+        assert step.run(HEADER_RAW + PAYLOAD, receive=receive) != _OK
+        assert rig.host.of('sources') == [] and rig.host.of('set') == []
+
+    def test_a_refused_stream_enforces_nothing(self, rig, step):
+        """A header the checks refuse (a compound stream) never reaches a receive."""
+        rig.owned_copy(copy_rows(S1))
+        bad = make_header('filesystem', versioninfo=0x5080010 | 2)
+        assert step.run(bad + PAYLOAD, mode='resume') == _FAILED
+        assert rig.host.start_calls == [] and rig.host.of('sources') == []
+
+    def test_a_receive_that_cannot_start_enforces_nothing(self, rig, step):
+        rig.host.start_error = RuntimeError('cannot receive: busy')
+        assert step.run(HEADER_RAW + PAYLOAD, receive=False) == _FAILED
+        assert rig.host.of('sources') == []
+
+    # -- plain streams -----------------------------------------------------------------------------
+
+    @pytest.mark.parametrize('header', [HEADER_FULL, HEADER_VOLUME], ids=['filesystem', 'volume'])
+    def test_a_plain_stream_runs_no_zfs_command_afterwards(self, rig, step, header):
+        rig.host.fail_on('sources', RuntimeError('never reached'))
+        rig.host.fail_on('set', RuntimeError('never reached'))
+        assert step.run(header + PAYLOAD) == _OK
+        assert rig.host.of('sources') == [] and rig.host.of('set') == []
+
+    # -- raw volume --------------------------------------------------------------------------------
+
+    def test_a_raw_volume_with_its_set_local_writes_nothing(self, rig, step):
+        assert self.committed(rig, step, VOLUME_FORCED, HEADER_RAW_VOLUME) == _OK
+        assert len(rig.host.of('sources')) == 1 and rig.host.of('set') == []
+
+    def test_a_raw_volume_gets_the_volume_set_only(self, rig, step):
+        assert self.committed(rig, step, {'volmode': 'none'}, HEADER_RAW_VOLUME) == _OK
+        assert rig.host.of('set') == [('set', COPY, {'readonly': 'on'})]
+
+    def test_a_raw_volume_never_gets_a_filesystem_property(self, rig, step):
+        self.committed(rig, step, {}, HEADER_RAW_VOLUME)
+        (event,) = rig.host.of('set')
+        assert event[2] == VOLUME_FORCED
+
+    # -- the budget --------------------------------------------------------------------------------
+
+    def test_the_commands_run_under_a_libzfseasy_timeout(self, rig, step):
+        import contextlib
+
+        @contextlib.contextmanager
+        def timeout(seconds):
+            rig.host.events.append(('timeout', seconds))
+            yield
+
+        rig.lib.timeout = timeout
+        self.committed(rig, step, {})
+        kinds = [e[0] for e in rig.host.events]
+        tail = [k for k in kinds[kinds.index('start-receive'):] if k in ('timeout', 'sources', 'set')]
+        assert tail == ['timeout', 'sources', 'timeout', 'set']
+
+    def test_the_budget_is_made_after_the_receive(self, rig, step, mocker):
+        real = local._Budget
+        events = rig.host.events
+        mocker.patch.object(local, '_Budget', lambda *a, **k: (events.append(('budget',)), real(*a, **k))[1])
+        self.committed(rig, step, {})
+        kinds = [e[0] for e in events]
+        assert kinds.index('budget', kinds.index('start-receive')) < kinds.index('sources')
+
+    def test_the_budget_is_fresh_whatever_the_receive_took(self, rig, step, mocker):
+        """A budget made before the receive would be spent by the time the receive committed."""
+        now = [1000.0]
+        real = local._Budget
+        mocker.patch.object(local, '_Budget', lambda *a, **k: real(*a, clock=lambda: now[0], **k))
+
+        def add():
+            now[0] += 1_000_000
+            rig.host.add_copy(props=owned_props(config=rig.canonical))
+
+        receive = step.streams.receive(events=rig.host.events, on_commit=add)
+        assert step.run(HEADER_RAW + PAYLOAD, receive=receive) == _OK
+        assert len(rig.host.of('sources')) == 1 and len(rig.host.of('set')) == 1
+
+
+def parse_header(raw):
+    return receiver.parse_stream_header(raw)
+
+
+class TestEnforcementThroughTheChain:
+    """`backup_dataset` over a raw stream: the enforcement runs after each committed step and the
+    chain does not notice it."""
+
+    def raw_sends(self, rig, streams, mocker):
+        sends = Sends(rig, streams, mocker)
+
+        def call(snapshot, since=None, **kwargs):
+            sends.calls.append((snapshot.short, since.short if since else None, kwargs))
+            header = make_header(
+                'filesystem', from_guid=default_guid(since.short) if since else 0,
+                to_guid=default_guid(snapshot.short), versioninfo=0x5080011,
+            )
+            return streams.send(header + PAYLOAD, events=rig.host.events)
+
+        mocker.patch('zfsbackup.chain.zfs.send.snapshot', side_effect=call)
+        return sends
+
+    def backup(self, rig):
+        return rig.mgr.backup_dataset(rig.dsi, RemoteDatasetConfig(destination=DEST))
+
+    def test_a_first_raw_full_send_sets_the_forced_properties_then_the_anchor_is_written(
+            self, rig, streams, mocker, snapshot_presence):
+        sends = self.raw_sends(rig, streams, mocker)
+        commits(rig, streams, S3)
+        assert self.backup(rig) is True
+        assert sends.calls and rig.ledger.anchor == S3
+        (event,) = rig.host.of('set')
+        assert event[1] == COPY and event[2] == FILESYSTEM_FORCED
+        kinds = rig.host.kinds('start-receive', 'sources', 'set')
+        assert kinds == ['start-receive', 'sources', 'set']
+
+    def test_a_failing_enforcement_does_not_stop_the_chain_or_the_anchor(
+            self, rig, streams, mocker, snapshot_presence, caplog):
+        self.raw_sends(rig, streams, mocker)
+        rig.owned_copy(copy_rows(S1))
+        rig.host.datasets[COPY].props.update(FILESYSTEM_FORCED)
+        rig.host.fail_on('sources', RuntimeError('x'))
+        commits(rig, streams, S2, S3)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.local'):
+            assert self.backup(rig) is True
+        assert rig.ledger.anchors() == [S2, S3]
+        assert len([m for m in messages(caplog, logging.WARNING) if 'forced properties' in m]) == 1
+
+    def test_every_step_of_a_chain_is_checked(self, rig, streams, mocker, snapshot_presence):
+        self.raw_sends(rig, streams, mocker)
+        rig.owned_copy(copy_rows(S1))
+        rig.host.datasets[COPY].props.update(FILESYSTEM_FORCED)
+        commits(rig, streams, S2, S3)
+        assert self.backup(rig) is True
+        assert len(rig.host.of('sources')) == 2
+        assert [e for e in rig.host.of('set') if 'sharesmb' in e[2]] == []   # (negotiate's own set aside)
+
+
 class TestStepOutcomeMessages:
     """`_step_outcome` on its own: every branch."""
 

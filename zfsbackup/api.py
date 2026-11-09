@@ -3885,6 +3885,43 @@ def create_app(
         finally:
             release_claim()
 
+    #: Receive targets whose enforcement failure was already announced at
+    #: WARNING; forgotten when an enforcement succeeds, so each episode is
+    #: announced once (DEBUG after). Bounded.
+    _enforce_noted: set = set()
+
+    def _enforce_forced_properties(server_fs, header: StreamHeader) -> None:
+        """After a receive that exited 0: `receiver.enforce_receive_properties`
+        under a fresh request budget. A failure (a timeout included) is a
+        WARNING once per target and episode, DEBUG after, and never the
+        stream's: the next receive checks again. Never raises."""
+        key = str(server_fs)
+        try:
+            _zfs_new_budget()
+            fixed = receiver.enforce_receive_properties(_zfs, server_fs, header, lib=zfs)
+        except Exception as e:
+            text = (
+                "cannot make the forced properties of %s local after the receive "
+                "(%s); the next receive tries again"
+            )
+            if key in _enforce_noted:
+                logger.debug(text, server_fs, e)
+            else:
+                if len(_enforce_noted) > 1024:
+                    _enforce_noted.clear()
+                _enforce_noted.add(key)
+                logger.warning(text, server_fs, e)
+            return
+        if key in _enforce_noted:
+            _enforce_noted.discard(key)
+            logger.info("the forced properties of %s are local again", server_fs)
+        if fixed:
+            forced = receiver.receive_properties(header.kind)
+            logger.info(
+                "zfs receive did not apply %s to %s; set it after the receive",
+                ', '.join(f'{p}={forced[p]}' for p in fixed), server_fs,
+            )
+
     def _receive_stream_locked(
         ws, client_id: str, dataset: str, server_dataset: str, mode: str,
         base: StreamBase, release_claim: Callable[[], None], session: StreamSession,
@@ -4245,7 +4282,8 @@ def create_app(
         # resumed receives, full and incremental. The outcome of `zfs receive`
         # is its EXIT STATUS (`writer.close()`), never its stderr: OpenZFS 2.1
         # prints a "sharesmb ... must be upgraded" line on raw receives that
-        # succeed.
+        # succeed, and leaves `sharesmb` unset (inherited), which
+        # `_enforce_forced_properties` sets after the receive.
         #
         # The server never creates a volume (`zfs create -V`): OpenZFS 2.4.1
         # oopses on `zfs create -V ... -o readonly=...`. Volumes only arrive
@@ -4277,6 +4315,29 @@ def create_app(
 
         reaped = False  # `writer.close()` already called on the write-error path
         closed_ok = False  # `writer.close()` returned: zfs receive exited 0
+        enforced = False
+
+        def enforce_after_close() -> None:
+            # Once `closed_ok` is True, on every path (done, cut or
+            # disconnect after the commit, an error after the last byte):
+            # every forced property LOCAL on the dataset (OpenZFS 2.1 skips
+            # `-o sharesmb=off` on a raw receive, and the copy would inherit
+            # its parent's value; a revoked client never sends another
+            # stream). Still before the claim is released, under a fresh
+            # budget (the receive's duration is the stream's, not zfs's).
+            # Never raises and never fails the stream: the snapshot is
+            # committed and the copy unmounted.
+            nonlocal enforced
+            if not closed_ok or enforced:
+                return
+            enforced = True
+            try:
+                _enforce_forced_properties(server_fs, header)
+            except Exception:
+                # `_enforce_forced_properties` swallows these itself; a belt
+                # for the handlers below, which must still release the claim.
+                logger.debug("enforcement after the receive of %s raised", server_dataset,
+                             exc_info=True)
 
         def note_cut(completed: bool) -> None:
             # Only for a session `SessionRegistry` cut. What is kept is
@@ -4355,6 +4416,7 @@ def create_app(
             reaped = True  # the handler below must not close a second time
             writer.close()
             closed_ok = True
+            enforce_after_close()
             # The dataset exists now with the owned values as local ones.
             _forget_pending(server_dataset)
             _refused_noted.difference_update(
@@ -4381,6 +4443,7 @@ def create_app(
                     closed_ok = True
                 except Exception:
                     pass
+            enforce_after_close()
             note_cut(closed_ok)
         except Exception as e:
             if not reaped:
@@ -4389,6 +4452,7 @@ def create_app(
                     closed_ok = True
                 except Exception:
                     pass
+            enforce_after_close()
             note_cut(closed_ok)
             # Reaped (or given up on): same ordering as the success path, the
             # claim goes before the client reads the error and retries.

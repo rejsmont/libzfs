@@ -5,6 +5,9 @@ zfsbackup (1.0.0~rc4-1) unstable; urgency=medium
     up to another dataset or pool on the same host with zfs send | zfs
     receive, no server or TLS; copies are laid out and locked down like
     server copies and pruned by their own retention.
+  * Fix: on OpenZFS 2.1 a raw receive skipped the forced sharesmb=off, so
+    a raw server copy could inherit the target's sharesmb; it is now set
+    after the receive.
   * A failure at one destination no longer skips the dataset's other
     destinations in that cycle.
   * libzfseasy: StreamHandle.terminate()/poll()/pid, and

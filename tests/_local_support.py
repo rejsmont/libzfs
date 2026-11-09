@@ -8,7 +8,7 @@ exit statuses (`FakeSend` / `FakeReceive`), so the real `_Pump` runs over them w
 * `FakeHost` -- a tiny ZFS host: datasets with their local properties, snapshots (`createtxg`,
   `guid`), a resume token, an encryption root. Every command it answers appends an event to
   `host.events` (`('exists', name)`, `('props', name)`, `('type', name)`, `('list-snaps', name,
-  strict)`, `('token', name)`, `('abort', name)`, `('set', name, props)`, `('create', name,
+  strict)`, `('token', name)`, `('abort', name)`, `('set', name, props)`, `('sources', name, sources)`, `('create', name,
   props)`, `('start-receive', ...)`), in the order it was asked, so a test can pin the order of
   checks. `host.fail_on(kind, exc, name=None)` makes a kind of command raise.
 * `FakeLib` -- the `libzfseasy` stand-in a test installs as `zfsbackup.local.zfs`; `timeout` and
@@ -26,6 +26,7 @@ from typing import Dict, List, Optional
 
 import libzfseasy
 from libzfseasy.types import Filesystem
+from libzfseasy.zfs import PropertySource
 
 from _snapshot_support import NO_TXG, listed_snapshot
 from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG, PROP_SOURCE_DATASET
@@ -126,7 +127,7 @@ class FakeLib:
 
     def __init__(self, host: FakeHost):
         self.host = host
-        self.get = types.SimpleNamespace(value=self._value)
+        self.get = types.SimpleNamespace(value=self._value, property_sources=self._property_sources)
         self.receive = types.SimpleNamespace(abort=self._abort, filesystem=self._receive)
         self.timeout = libzfseasy.timeout
 
@@ -187,6 +188,13 @@ class FakeLib:
         if prop in (PROP_CLIENT_ID, PROP_CONFIG, PROP_SOURCE_DATASET):
             return d.props.get(prop)
         return None
+
+    def _property_sources(self, ds, types='all', sources='all', **kw):
+        """`zfs get -H -o name,property,source -s local`: the dataset's own properties (every
+        property of the fake is a local one). Event `('sources', name, sources)`."""
+        name = str(ds)
+        self.host._note('sources', name, sources)
+        return [PropertySource(name, prop, 'local') for prop in self.host._ds(name).props]
 
     def _abort(self, ds):
         name = str(ds)

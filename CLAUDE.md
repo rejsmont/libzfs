@@ -219,7 +219,11 @@ a compound stream (`send -p`/`-R`/`-I`) is refused, the declared base must match
 (`stream_base_problem`; a base named without a guid must match the server's guid for that name), and the object
 type picks the forced `-o` set (`RECEIVE_PROPERTIES_FILESYSTEM`: canmount=noauto, readonly, volmode=none, mountpoint=none,
 share*/setuid/exec/devices off; `RECEIVE_PROPERTIES_VOLUME`: readonly, volmode=none only — a volume refuses
-`-o canmount`); `-h`, never `-x`. The header bytes are fed to `zfs receive` unchanged. Refusals carry a `reason`
+`-o canmount`); `-h`, never `-x`. OpenZFS 2.1 silently skips `-o sharesmb=off` on a RAW receive (exit 0), so after
+every receive that committed a raw stream (`StreamHeader.raw`), on every path incl. a cut after the commit, the server
+(and a local destination) runs `receiver.enforce_receive_properties`: it sets each forced property that is not LOCAL
+(sources only, so an operator's local value survives on 2.1 raw); a failure is a WARNING, never a failed stream.
+The header bytes are fed to `zfs receive` unchanged. Refusals carry a `reason`
 (no `retry`) and log one WARNING per (dataset, reason) until a stream succeeds. A dataset on the backup path without
 a LOCAL `client_id` is never adopted (409 naming `zfs set org.zfsbackup:client_id=<id> <ds>`, one WARNING);
 negotiate creates missing ancestors one level at a time (`zfs create -u -o canmount=noauto -o client_id`, no

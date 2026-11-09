@@ -36,6 +36,10 @@ Local destinations: back a dataset up to another dataset or pool on the same hos
   its parent is unchanged, the commands that move it; `identity set-client-id` warns that local copies are orphaned; `check` grades the
   client certificate only when an `https://` destination exists. An `import`, `set` or `edit` that adds the first
   local destination to a host without a client id generates one (`generated this host's client id: …`).
+- **Fix: raw copies on OpenZFS 2.1 could inherit `sharesmb`.** On 2.1 a raw `zfs receive` skips the forced
+  `-o sharesmb=off` (it prints "cannot receive sharesmb property … must be upgraded" and still succeeds), so a raw
+  server copy inherited the target's `sharesmb`. After every successful raw receive the server (and a local
+  destination) now sets any forced property that did not land locally. Plain receives and 2.2+ were not affected.
 - **A failure at one destination no longer abandons the dataset's other destinations.** An exception from one
   `remote:` entry is logged, recorded against that destination in the status file and `check`, and the rest of
   the dataset's destinations still get their turn in that cycle (remote destinations too).

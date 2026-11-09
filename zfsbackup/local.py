@@ -1183,7 +1183,45 @@ class LocalBackupManager(ChainSender):
         pump.attach_receive(receive)
         outcome = pump.run()
         pump.close()
-        return self._step_outcome(pump, outcome, dsi, destination, where, copy)
+        result = self._step_outcome(pump, outcome, dsi, destination, where, copy)
+        if result == _OK:
+            self._enforce_forced_properties(copy_fs, header, dsi, destination)
+        return result
+
+    def _enforce_forced_properties(self, copy_fs, header, dsi, destination) -> None:
+        """After a step whose receive committed: every property of the forced
+        set LOCAL on the copy (`receiver.enforce_receive_properties`; OpenZFS
+        2.1 skips `-o sharesmb=off` on a raw receive and the copy would inherit
+        its parent's value). A failure here is a WARNING once per (dataset,
+        destination) and episode (DEBUG after; INFO when an enforcement
+        succeeds again), never the step's: the snapshot is committed, the copy
+        is not mounted (`-u`, `canmount=noauto`, `mountpoint=none`), and the
+        next receive checks again. Never raises."""
+        # Not "<dataset> [...]": `last_problem` reads those as why a send
+        # failed, and this warning never fails a send.
+        key = (f"{dsi.name} (local property enforcement)", destination)
+        try:
+            fixed = receiver.enforce_receive_properties(_Budget(), copy_fs, header, lib=zfs)
+        except Exception as e:
+            # The same text every time (the error goes to DEBUG), so the
+            # once-per-episode memory compares equal.
+            self._log_warning_once(key, (
+                f"{dsi.name} -> {destination}: cannot make the forced properties of "
+                f"{copy_fs} local after the receive; the next receive tries again"
+            ))
+            self._logger.debug(f"{dsi.name} -> {destination}: enforcement error: {e}")
+            return
+        if self._refusal_logged.pop(key, None):
+            self._logger.info(
+                f"{dsi.name} -> {destination}: the forced properties of {copy_fs} are local again"
+            )
+        if fixed:
+            forced = receiver.receive_properties(header.kind)
+            self._logger.info(
+                f"{dsi.name} -> {destination}: zfs receive did not apply "
+                f"{', '.join(f'{p}={forced[p]}' for p in fixed)} to {copy_fs}; set it "
+                "after the receive"
+            )
 
     @staticmethod
     def _stuck_text(pump: _Pump) -> str:
@@ -1203,6 +1241,11 @@ class LocalBackupManager(ChainSender):
         stuck = self._stuck_text(pump)
         if outcome == PUMP_STALLED and pump.commit_timed_out:
             # The whole stream was delivered; the receive was still committing.
+            # If it does commit, the next cycle settles the step without a
+            # receive (the snapshot is found in the copy), so the forced
+            # properties (`_enforce_forced_properties`, which runs only after
+            # a step whose receive this process saw exit 0) wait for the next
+            # received snapshot.
             self._logger.error(
                 f"Transfer of {dsi.name} -> {where}: zfs receive into {copy} did not finish "
                 f"committing within {LOCAL_COMMIT_TIMEOUT:g} s after the end of the stream; it "

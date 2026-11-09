@@ -38,13 +38,15 @@ from zfsbackup.backup_manager import (
 from zfsbackup.config import DatasetConfig, wire_config_problem
 
 __all__ = [
-    'ABORT_ALREADY_CLEAN', 'BadDatasetName', 'CONFIG_TOO_LARGE_ERROR', 'DMU_BACKUP_MAGIC',
+    'ABORT_ALREADY_CLEAN', 'BadDatasetName', 'CONFIG_TOO_LARGE_ERROR', 'DMU_BACKUP_FEATURE_RAW',
+    'DMU_BACKUP_MAGIC',
     'DMU_COMPOUNDSTREAM', 'DMU_OST_ZFS', 'DMU_OST_ZVOL', 'DMU_SUBSTREAM', 'DRR_BEGIN',
     'DRR_RECORD_SIZE', 'OwnerVerdict', 'RECEIVE_PROPERTIES_FILESYSTEM',
     'RECEIVE_PROPERTIES_VOLUME', 'ReceiveDecision', 'SERVER_OWNED_PROPERTIES', 'ServerSnapshot',
     'StreamBase', 'StreamHeader', 'StreamHeaderError', 'ZFS_USER_PROPERTY_MAXLEN',
     'abort_partial_receive', 'ancestor_holds_partial_receive', 'canonical_dataset_config',
-    'client_dataset_problem', 'create_ancestors', 'decide_receive', 'format_horizon',
+    'client_dataset_problem', 'create_ancestors', 'decide_receive', 'enforce_receive_properties',
+    'format_horizon',
     'local_client_id', 'may_force', 'owner_verdict', 'ownership_conflict', 'parse_stream_header',
     'receive_properties', 'resume_token', 'retention_horizon', 'retention_shrink',
     'server_copy_kind', 'server_dataset', 'server_snapshots', 'snapshots_newer_than',
@@ -379,6 +381,40 @@ def receive_properties(kind: str) -> dict:
     return RECEIVE_PROPERTIES_VOLUME if kind == 'volume' else RECEIVE_PROPERTIES_FILESYSTEM
 
 
+def enforce_receive_properties(zfs_call: Callable, server_fs, header: 'StreamHeader', *,
+                               lib=None) -> List[str]:
+    """After a RAW receive that exited 0: `zfs set` every property of the
+    forced set (`receive_properties(header.kind)`) that is not a LOCAL value of
+    `server_fs`, to its forced value; -> the names set, sorted (normally empty:
+    one value-free `zfs get -s local`, nothing written). A plain stream
+    (`header.raw` False) returns `[]` without running anything.
+
+    Needed because a `-o` of `zfs receive` can be skipped without failing the
+    receive. OpenZFS 2.1 does it for `-o sharesmb=off` on a RAW stream: it
+    prints "cannot receive sharesmb property on <ds>: pool and or dataset must
+    be upgraded to set this property or value", exits 0, and the copy inherits
+    its parent's `sharesmb` (2.1.5, a raw full receive under a parent with
+    `sharesmb=on`: the copy reads `on  inherited from <parent>`, every other
+    forced value is local). A plain receive applies it on 2.1 (also into an
+    encrypted target), and 2.2+ apply it for raw streams too, so only a raw
+    stream is checked. A `zfs set sharesmb=off` after the receive works (the
+    key need not be loaded), and later incremental raw receives keep it. A
+    LOCAL value is taken as the receive's own: every receive passes the whole
+    set again. Raises if a `zfs` call fails (the snapshot is committed by then;
+    the caller decides what that means)."""
+    if not header.raw:
+        return []
+    lib = zfs if lib is None else lib
+    forced = receive_properties(header.kind)
+    name = str(server_fs)
+    rows = zfs_call(lib.get.property_sources, server_fs, sources='local')
+    local = {row.property for row in rows if row.name == name}
+    missing = {prop: value for prop, value in forced.items() if prop not in local}
+    if missing:
+        zfs_call(lib.set, server_fs, missing)
+    return sorted(missing)
+
+
 def may_force(zfs_call: Callable, server_fs, allowed: bool, *, lib=None) -> bool:
     """Whether the receive may pass `-F`: `allowed` (the `decide_receive`
     decision) AND the dataset exists now (asked again: the abort may have
@@ -403,8 +439,10 @@ def start_receive(
     snapshots against the pruner) and never `-x`. `force` (`-F`) only comes
     from `may_force`. The outcome of `zfs receive` is its EXIT STATUS
     (`StreamHandle.close()`), never its stderr: OpenZFS 2.1 prints a
-    "sharesmb ... must be upgraded" line on raw receives that succeed.
-    Not wrapped in a `zfs_call`: the receive is never timed."""
+    "sharesmb ... must be upgraded" line on raw receives that succeed, and
+    leaves that property unset, so the caller runs
+    `enforce_receive_properties` after a receive that exited 0. Not wrapped
+    in a `zfs_call`: the receive is never timed."""
     lib = zfs if lib is None else lib
     return lib.receive.filesystem(
         server_fs, props={**owned, **receive_properties(kind)},
@@ -436,6 +474,13 @@ DMU_OST_ZVOL = 3
 #: follows the record and is passed to `zfs receive` untouched.
 DMU_SUBSTREAM = 1
 DMU_COMPOUNDSTREAM = 2
+#: `DMU_GET_FEATUREFLAGS(drr_versioninfo)` = bits 2-31; `DMU_BACKUP_FEATURE_RAW`
+#: is feature bit 24 (`zfs send -w`, and the resume of a raw send). Checked
+#: against the M8 captures of 2.1.5/2.2.2/2.3.9/2.4.1: `0x5080011` (raw
+#: filesystem), `0x5080001` (raw volume), `0x1080011`/`0x11`/`0x1` (plain); the resume
+#: headers (`zfs send -t`) add the resume feature bits: `0x5480011` (raw
+#: resume), `0x1480011`/`0x1480001` (plain resume).
+DMU_BACKUP_FEATURE_RAW = 1 << 24
 
 
 class StreamHeader(NamedTuple):
@@ -446,6 +491,11 @@ class StreamHeader(NamedTuple):
     versioninfo: int
     to_name: str         # `pool/ds@snap` as the sender wrote it; for logging only
     big_endian: bool
+
+    @property
+    def raw(self) -> bool:
+        """A raw stream (`DMU_BACKUP_FEATURE_RAW` in the feature flags)."""
+        return bool((self.versioninfo >> 2) & DMU_BACKUP_FEATURE_RAW)
 
 
 class StreamHeaderError(ValueError):

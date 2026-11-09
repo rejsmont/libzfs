@@ -23,6 +23,7 @@ from _stream_support import (
 from _api_support import Authed, CLIENT_ID
 from _snapshot_support import listed_snapshot
 from libzfseasy.types import Dataset, Filesystem, Snapshot as ZFSSnapshot
+from libzfseasy.zfs import PropertySource
 from zfsbackup.backup_manager import (
     DatasetInfo, DatasetManager, SnapshotInfo, PROP_CLIENT_ID, PROP_CONFIG,
     PROP_SOURCE_DATASET,
@@ -751,6 +752,11 @@ class Stream:
         self.list = mocker.patch('zfsbackup.api.zfs.list', side_effect=self._list)
         self.create = mocker.patch('zfsbackup.api.zfs.create')
         self.set = mocker.patch('zfsbackup.api.zfs.set')
+        # The raw-stream check after the receive (`receiver.enforce_receive_properties`) reads
+        # which forced properties are LOCAL; the default answer is "all of them", so a raw
+        # stream sets nothing and no `zfs` is reached. Plain streams never call it.
+        self.sources = mocker.patch(
+            'zfsbackup.api.zfs.get.property_sources', side_effect=self._sources)
         self.abort = mocker.patch('zfsbackup.api.zfs.receive.abort')
         # What negotiate stored on the server dataset (plan B-1b): the stream
         # reads it (local source) and puts it in effect with `-o`.
@@ -771,6 +777,10 @@ class Stream:
         self.set.side_effect = lambda *a, **k: self.order.append('set')
         self.abort.side_effect = lambda *a, **k: self.order.append('abort')
         self.receive.side_effect = lambda *a, **k: (self.order.append('receive'), self.writer)[1]
+
+    def _sources(self, ds, *args, **kwargs):
+        self.order.append('sources')
+        return [PropertySource(str(ds), prop, 'local') for prop in FILESYSTEM_FORCED]
 
     def _get_value(self, ds, prop, *args, sources=None, **kwargs):
         self.reads.append((prop, sources))
