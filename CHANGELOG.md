@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (1.0.0rc4)
+## 1.0.0rc4 (2026-11-09)
 
 Local destinations: back a dataset up to another dataset or pool on the same host, with no server.
 
@@ -49,6 +49,12 @@ Local destinations: back a dataset up to another dataset or pool on the same hos
   `close()`.
 - Internal: the send chain moved out of `remote.py` into `zfsbackup/chain.py` (`ChainSender`) and the receive-side
   helpers out of `api.py` into `zfsbackup/receiver.py`; the remote client and the API behave as before.
+
+### Known limitations
+
+New in `zfsbackup/README.md` ("Known limitations", "Local destinations"): local and remote sends share one
+worker; a `zfs receive` stuck on a hung pool is not remembered across worker restarts (ZFS refuses the overlap,
+nothing is corrupted); an exported target pool makes `check` WARN then CRIT until it is imported again.
 
 ## 1.0.0rc3 (2026-11-08)
 

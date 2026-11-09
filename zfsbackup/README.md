@@ -1398,6 +1398,18 @@ list with background is in [docs/production_readiness_report.md](../docs/product
   again".
 - **There is no restore over the API.** Restoring is ZFS work done by an operator (see [Restoring data](#restoring-data)).
 
+**Local destinations**
+- **Local and remote sends share one worker** and run one after another; a long local full send delays the
+  host's remote sends in that cycle.
+- **A stuck `zfs receive` is not remembered across worker restarts.** If a copy's pool hangs so badly that a
+  receive survives SIGKILL, the next worker (after a reload, upgrade or crash) does not know about it: ZFS
+  refuses its sends to that copy as busy, and each new worker can leave one more stuck process, until the
+  pool recovers. Nothing is corrupted.
+- **An exported target pool turns `check` WARN, then CRIT** for every dataset sent to it, until the pool is
+  imported again (a removable disk that is usually detached will alert).
+- **Copies of a renamed dataset or a changed client id are not moved for you**: the CLI prints the commands
+  when they are safe, otherwise the copy is orphaned and the next send is full.
+
 **Operation**
 - **Stop the daemon to upgrade** (see [Upgrading](#upgrading-and-downgrading)). An in-place install is
   detected and the daemon drains and exits 76 for systemd to restart it, but a dependency-only upgrade and

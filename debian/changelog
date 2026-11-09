@@ -1,3 +1,17 @@
+zfsbackup (1.0.0~rc4-1) unstable; urgency=medium
+
+  * Fourth release candidate of 1.0.0.
+  * Local destinations: a destination with url zfs:<dataset> backs datasets
+    up to another dataset or pool on the same host with zfs send | zfs
+    receive, no server or TLS; copies are laid out and locked down like
+    server copies and pruned by their own retention.
+  * A failure at one destination no longer skips the dataset's other
+    destinations in that cycle.
+  * libzfseasy: StreamHandle.terminate()/poll()/pid, and
+    zfs.send.*(peek=False).
+
+ -- Radoslaw Kamil Ejsmont <radoslaw@ejsmont.net>  Mon, 09 Nov 2026 12:00:00 +0000
+
 zfsbackup (1.0.0~rc3-1) unstable; urgency=medium
 
   * Third release candidate of 1.0.0.
