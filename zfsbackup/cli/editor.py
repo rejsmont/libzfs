@@ -63,7 +63,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 import click
 import yaml
 
-from zfsbackup.cli import dotpath
+from zfsbackup.cli import copies, dotpath
 from zfsbackup.cli.errors import CliError
 from zfsbackup.cli.render import (
     render_dataset_fragment,
@@ -611,6 +611,20 @@ def _destination_parser(config: BackupConfig, name: str) -> Callable[[str], Back
     return parse
 
 
+# `edit --force` opens a NEW buffer rendered from the stored configuration; the
+# buffer kept after an abandoned edit is never reused. Say so.
+_COPIES_HINT = (
+    "Move the copies out and Retry (the buffer reopens), or change the buffer to keep those "
+    "datasets non-recursive. To write it anyway, abandon the edit and run `edit --force`: it "
+    "starts again from the STORED configuration, not from the kept buffer, so the same edits "
+    "have to be made again (the kept buffer's path is printed when the edit is abandoned)."
+)
+_COPIES_ABORT = (
+    "; `edit --force` starts from the stored configuration, not from the kept buffer, so "
+    "make the edits again (copy them from the kept buffer)"
+)
+
+
 def _session(
     resolved: ResolvedConfigPath,
     snapshot: ConfigSnapshot,
@@ -623,6 +637,7 @@ def _session(
     editor: Optional[str],
     allow_recreate: bool,
     prompt: bool,
+    force: bool = False,
 ) -> None:
     """The edit loop shared by the whole-config and single-entry commands."""
     if prompt and not _stdin_is_tty():
@@ -664,6 +679,7 @@ def _session(
                 return
 
             new: Optional[BackupConfig] = None
+            copies_refused = False
             if problem is None:
                 try:
                     new = parse(text)
@@ -677,6 +693,13 @@ def _session(
                     if problem is None:
                         for message in validate_config(new):
                             warn(message)
+                        # A refusal is a rejected buffer like any other (retry
+                        # or abandon); with `force` it is a warning. Read-only
+                        # ZFS look, before the write, outside the writer lock.
+                        problem = copies.check_copies(
+                            original, new, force=force, warn=warn, hint=_COPIES_HINT
+                        )
+                        copies_refused = problem is not None
                 except (ValueError, yaml.YAMLError) as exc:
                     problem = _describe_problem(exc, text)
 
@@ -687,6 +710,7 @@ def _session(
                 raise EditAborted(
                     "edit abandoned; nothing was written"
                     + ("" if prompt else " (--no-prompt never retries)")
+                    + (_COPIES_ABORT if copies_refused else "")
                 )
 
         assert new is not None
@@ -755,6 +779,7 @@ def edit_config(
     editor: Optional[str] = None,
     allow_recreate: bool = False,
     prompt: bool = True,
+    force: bool = False,
 ) -> None:
     """Run the whole-config edit described in the module docstring. Returns
     normally for a successful write and for "no changes"; raises otherwise
@@ -764,7 +789,7 @@ def edit_config(
         resolved, snapshot,
         header=_HEADER, initial_body=render_yaml(snapshot.config), parse=_parse_whole,
         check_rename=True, warn=warn, editor=editor,
-        allow_recreate=allow_recreate, prompt=prompt,
+        allow_recreate=allow_recreate, prompt=prompt, force=force,
     )
 
 
@@ -787,6 +812,7 @@ def edit_dataset(
     warn: Callable[[str], None],
     editor: Optional[str] = None,
     prompt: bool = True,
+    force: bool = False,
 ) -> None:
     """Edit one dataset's settings (never its name) in `$EDITOR`."""
     config = snapshot.config
@@ -803,6 +829,7 @@ def edit_dataset(
         ),
         initial_body=render_dataset_fragment(ds), parse=_dataset_parser(config, name),
         check_rename=False, warn=warn, editor=editor, allow_recreate=True, prompt=prompt,
+        force=force,
     )
 
 
@@ -814,6 +841,7 @@ def edit_destination(
     warn: Callable[[str], None],
     editor: Optional[str] = None,
     prompt: bool = True,
+    force: bool = False,
 ) -> None:
     """Edit one destination's `url` and `server_fingerprint` (never its name) in
     `$EDITOR`."""
@@ -832,4 +860,5 @@ def edit_destination(
         ),
         initial_body=render_destination_fragment(dest), parse=_destination_parser(config, name),
         check_rename=False, warn=warn, editor=editor, allow_recreate=True, prompt=prompt,
+        force=force,
     )

@@ -746,7 +746,11 @@ class Command:
         Two opt-ins act here, both read when the generator first runs: a still-running child is reported by the
         slow-command watchdog (`slow_command_warning`), and under `timeout()` stdout is read against a deadline
         (`_read_until`) and an expired call ends in `_expire` and `ZFSTimeoutError`. Without a timeout the path is the
-        plain `readline` loop."""
+        plain `readline` loop.
+
+        Fork: a process forked while the generator is live inherits it, but the child belongs to the original process.
+        In the fork the generator's cleanup leaves the child and its pipes alone (no signal, wait, close or stuck-child
+        registration; see `_forked`) and just ends; the original process still cleans up after itself."""
         _log_command(cmd)
         seconds = _timeout_var.get()
         if seconds is not None:
@@ -754,6 +758,7 @@ class Command:
         started = time.monotonic()
         errors = _BoundedErrors()
         process = None
+        owner = None  # the pid that spawned the child (see `_forked`)
         stderr_thread = None
         watchdog = None
         deadline = None if seconds is None else started + seconds
@@ -762,6 +767,7 @@ class Command:
         settled = False
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
+            owner = os.getpid()
             stderr_thread = cls._start_stderr_reader_lines(process, errors)
             watchdog = _SlowCommandWatchdog.for_command(cmd, getattr(process, 'pid', None))
             if watchdog is not None:
@@ -784,7 +790,7 @@ class Command:
                 try:
                     rc = yield from cls._read_until(process, fd, deadline)
                 except _DeadlineReached:
-                    error = cls._expire(process, stderr_thread, cmd, seconds)
+                    error = cls._expire(process, stderr_thread, cmd, seconds, owner)
                     settled = True  # the child is reaped or registered; the cleanup below must not repeat it
                     raise error from None
             if timed:
@@ -797,11 +803,16 @@ class Command:
             # The child first, the watchdog after: cancelling joins the watchdog's thread, and a second interrupt
             # arriving during that join must not skip the SIGTERM/SIGKILL below.
             try:
-                if not completed and not settled and process is not None and timed:
+                if cls._forked(owner):
+                    # A process forked from the one that spawned the child (this generator was inherited, then resumed,
+                    # closed or collected there): the child is the parent's, so nothing is signalled, waited for,
+                    # registered as stuck or closed here (see `_forked`).
+                    pass
+                elif not completed and not settled and process is not None and timed:
                     # Any exit other than the deadline (a consumer that raised, close() or GC of the generator, an
                     # interrupt): the same bounded sequence as an expiry, ending in the registry if the child survives
                     # SIGKILL. The original exception propagates afterwards.
-                    cls._reap_timed(process, stderr_thread, cmd)
+                    cls._reap_timed(process, stderr_thread, cmd, owner)
                 elif not completed and not settled and process is not None:
                     abandoned = cls._terminate_child(process, cmd)
                     if not abandoned:
@@ -809,10 +820,42 @@ class Command:
                         cls._join_stderr_reader(stderr_thread)
                         process.wait()
             finally:
-                if watchdog is not None:
-                    watchdog.cancel()
+                try:
+                    if process is not None:
+                        cls._close_child_pipes(process, stderr_thread, owner)
+                finally:
+                    if watchdog is not None:
+                        watchdog.cancel()
         if rc != 0:
             raise Exception(_failure_text(errors, rc))
+
+    @staticmethod
+    def _forked(owner) -> bool:
+        """True in a process forked from the one that spawned a child (`owner` is the spawner's pid, None before the
+        spawn). `os.fork()` leaves the generator, the `Popen` and its pipes in the forked process, but the child is
+        the parent's: it cannot be waited for or reaped there, and the parent's stderr reader (a thread that does not
+        exist after the fork) may have been inside `readline` holding the pipe's buffer lock, so closing the pipe in the
+        fork blocks for ever. The forked process therefore leaves the child and its pipes alone: no TERM/KILL, no
+        wait, no stuck-child registration and no close (the parent still owns and cleans all of it)."""
+        return owner is not None and os.getpid() != owner
+
+    @classmethod
+    def _close_child_pipes(cls, process, stderr_thread, owner=None) -> None:
+        """Close the parent's ends of a finished `_exec_lines` child's pipes, on every way out (completion, a non-zero
+        exit, an exception, an abandoned or closed generator, an expiry). Never blocks and never waits for the child.
+
+        stdout: this call is its only reader, so it is closed unconditionally (an abandoned child that still holds
+        the write end simply gets EPIPE if it ever writes). stderr: closed only once its reader thread has ended;
+        while the reader may still be inside the pipe (a stuck child, or a grandchild holding the write end) the fd
+        stays open, because closing a busy fd risks fd reuse (the stuck-child sweep or garbage collection closes it
+        later). Idempotent: `_reap_timed` may have closed them already. In a forked process (`_forked`) the pipes are
+        not ours and nothing is closed."""
+        if cls._forked(owner):
+            return
+        StreamHandle._close_pipe(getattr(process, 'stdout', None))
+        stderr = getattr(process, 'stderr', None)
+        if stderr is not None and (stderr_thread is None or not stderr_thread.is_alive()):
+            StreamHandle._close_pipe(stderr)
 
     @staticmethod
     def _timed_fd(process) -> Optional[int]:
@@ -880,7 +923,7 @@ class Command:
                 StreamHandle._close_pipe(process.stdout)
 
     @classmethod
-    def _reap_timed(cls, process, stderr_thread, cmd) -> bool:
+    def _reap_timed(cls, process, stderr_thread, cmd, owner=None) -> bool:
         """Get rid of the child of a timed call that ends early. Returns True if the child could not be killed.
 
         If the child is running: SIGTERM, wait up to `_EXPIRY_WAIT`; SIGKILL, wait up to `_EXPIRY_WAIT`. A child that
@@ -888,7 +931,10 @@ class Command:
         stdout is closed either way: this thread is its only reader. stderr is never closed while its reader may be
         blocked on it: for a reaped child the reader is given `_EXPIRY_JOIN` and the pipe is closed only if it ended;
         a stuck child's stderr stays open (closing a busy fd risks fd reuse) until a sweep finds the child gone. A
-        further interrupt while waiting kills the child and propagates."""
+        further interrupt while waiting kills the child and propagates. In a forked process (`_forked`) the child and
+        its pipes are the parent's: nothing is done and False is returned."""
+        if cls._forked(owner):
+            return False
         stuck = False
         try:
             if process.poll() is None:
@@ -921,10 +967,10 @@ class Command:
         return stuck
 
     @classmethod
-    def _expire(cls, process, stderr_thread, cmd, seconds) -> 'ZFSTimeoutError':
+    def _expire(cls, process, stderr_thread, cmd, seconds, owner=None) -> 'ZFSTimeoutError':
         """A timed call ran out of time with its child still running: reap it (`_reap_timed`) and build the
         `ZFSTimeoutError` to raise."""
-        stuck = cls._reap_timed(process, stderr_thread, cmd)
+        stuck = cls._reap_timed(process, stderr_thread, cmd, owner)
         message = f'{_command_label(cmd)} timed out after {seconds:g}s; outcome unknown'
         if stuck:
             message += f' (pid {process.pid} did not exit after SIGKILL)'
@@ -962,18 +1008,21 @@ class Command:
         printed (newline removed, indentation kept) for callers that parse structured stderr. The child is always
         reaped and the stderr thread joined (bounded, see `_join_stderr_reader`), even if the caller is interrupted.
         `env` replaces the child's environment when given (default: `_child_env()`, the C locale). Output is decoded as UTF-8 with
-        replacement, so odd bytes can neither raise nor kill the stderr reader (which would leave the child blocked on a full pipe)."""
+        replacement, so odd bytes can neither raise nor kill the stderr reader (which would leave the child blocked on a full pipe).
+        In a process forked mid-call the cleanup leaves the child and its pipes alone (see `_forked`)."""
         _log_command(cmd)
         errors = _BoundedErrors()
         process = None
         stderr_thread = None
         lines = []
         watchdog = None
+        owner = None  # the pid that spawned the child (see `_forked`)
         completed = False
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
                                        encoding='utf-8', errors='replace',
                                        env=_child_env() if env is None else env)
+            owner = os.getpid()
             if raw_stderr:
                 stderr = process.stderr
 
@@ -1005,14 +1054,18 @@ class Command:
             completed = True
         finally:
             try:  # the child before the watchdog, as in `_exec_lines`
-                if not completed and process is not None:
+                if not completed and process is not None and not cls._forked(owner):
                     if process.poll() is None:
                         process.kill()
                         process.wait()
                     cls._join_stderr_reader(stderr_thread)
             finally:
-                if watchdog is not None:
-                    watchdog.cancel()
+                try:
+                    if process is not None:
+                        cls._close_child_pipes(process, stderr_thread, owner)
+                finally:
+                    if watchdog is not None:
+                        watchdog.cancel()
         return lines, list(errors), rc
 
     @staticmethod

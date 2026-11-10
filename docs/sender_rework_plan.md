@@ -201,6 +201,29 @@ Order: B1.1 → B1.2 → B1.3 → B2 (they can run alongside A3–A6), then B3 a
 
 ## Follow-ups found during Track A (not yet scheduled)
 
+- **From the final A2d/A2e review (all low):**
+  1. The boundary retry gives up inside the `-r` FALLBACK. That fallback runs when an unrepresentable name sits below
+     the dataset, or when the argv bound is hit. The retry's strict re-listing, or `many`'s bound, fails again, so the
+     rest of the tree misses that period, with an ERROR. Use the non-strict listing for the `-r` retry, so only the
+     unrepresentable dataset itself misses `@N`.
+  2. The `_snapshot_tree` docstring still says a failure of `many` is not caught. It is now retried once.
+  3. `copies.py` given-up-target loop: the target's existence is cached before `pool_absent` runs, so a second label
+     for the same target can be skipped silently. The exception texts use `{target}` instead of `{label} ({target})`.
+  4. libzfseasy fork guard residuals (unreachable from zfsbackup): `watchdog.cancel()` in a fork takes an `Event`
+     lock the parent's watchdog thread may have held. A generator RESUMED to completion in a fork sees ECHILD →
+     returncode 0, a false success. Document it, or raise `RuntimeError` on resume in a fork; concurrency-reviewer.
+  5. `import` with an unreadable stored config runs the copies check before `import_yaml`'s own refusal (cosmetic).
+  6. CLAUDE.md prose (not the tests table) does not yet describe `cli/copies.py` and the `--force`/`--force-copies`
+     flags, the snapshot worker's depth order, ride and holder retry, or the libzfseasy fork guard. These belong to A5.
+
+- **A failed snapshot listing reads as "no snapshots" in `needs_snapshot` (pre-existing).** The dataset counts as due,
+  `create_snapshot` then fails ("already exists"), and the status record shows a creation failure instead of the
+  real cause, the listing. Make `needs_snapshot` report "unknown" on a list failure (no attempt, one ERROR naming the
+  listing).
+- **The A2e retry's holder listing runs on every failed tree command.** With a persistent failure (pool out of space)
+  that is one full recursive snapshot listing per cycle. It is acceptable, but could be skipped when the error is
+  clearly not a collision. Also, the retry error repeats itself when both attempts fail the same way (cosmetic).
+
 - **A configured child under a recursive parent, snapshotted first, blocks the parent's tree (pre-existing).** The
   snapshot worker walks datasets in config order. A configured enabled child with the same frequency as its recursive
   parent, listed before it, takes `@N` first. The parent's `snapshot -r` (or the A2c atomic list) then fails with
@@ -211,6 +234,14 @@ Order: B1.1 → B1.2 → B1.3 → B2 (they can run alongside A3–A6), then B3 a
   as its own snapshot for that period: no "already exists" WARNING, not a failure. It keeps its own retention and
   destinations, and takes extra snapshots only when its own frequency is higher. Tests: config order child-before-parent,
   equal and different frequencies, the parent's atomic snapshot covering the child, and the child's own pruning.
+  **Review follow-up (implemented):** a period boundary falling between the parent's and a configured child's turn
+  in one cycle, or one failed parent command, lets the child take `@N` alone. The parent's tree command then
+  collides. On ANY failure of the tree command, one name-only snapshot listing finds the source datasets that
+  already hold `@N`, and the command is retried ONCE as an atomic `many` over the rest. Those holders already have
+  their snapshot for the period, and they are not covered by the ride. No holders means the original error. A failed
+  retry fails the cycle, with no loop. A child-side skip was deliberately NOT done: the retry closes every miss, and
+  a skip could starve a child. The cost is that the rest of the tree gets `@N` one cycle later than the child, not
+  in the same atomic command.
 
 - **libzfseasy option order.** `zfs.inherit` emits `zfs inherit <prop> -S <ds>` (and `-r` likewise) with the option AFTER
   the property. glibc getopt permutes, so this works on Linux, but a BSD or illumos getopt stops at the first operand.

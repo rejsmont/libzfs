@@ -864,7 +864,7 @@ def destination_change_warnings(
     the copies already at `<target>/<client id>/` when this host is enrolled
     with that server (`own_id_bound`, the loopback setup), so it is worded
     differently."""
-    if old.url == new.url or not (old.is_local or new.is_local):
+    if _anchor_url(old.url) == _anchor_url(new.url) or not (old.is_local or new.is_local):
         return []
     where = f"destinations[{name}]"
     messages: List[str] = []
@@ -912,16 +912,19 @@ def destination_change_warnings(
 
 
 def _anchor_url(url: str) -> str:
-    """`url` as compared for "does this destination point elsewhere": a `zfs:`
-    target without surrounding blanks or a trailing `/` (`zfs:tank/bk/` and
-    `zfs:tank/bk` are the same dataset); any other URL verbatim."""
-    text = url.strip()
-    return text.rstrip("/") if text.startswith("zfs:") else url
+    """`url` as compared for "does this destination point elsewhere": without
+    surrounding blanks (the model strips them: `Destination.is_local` and
+    `target_dataset` read `url.strip()`, so a blanks-only change moves nothing).
+    There is deliberately NO `/` handling: a trailing `/` fails the dataset-name
+    grammar (`destination_url_problem`), so `zfs:tank/bk/` can never be stored
+    and the write that carries it is refused by `validate_config` right after
+    these warnings; treating it as "the same dataset" would only hide that."""
+    return url.strip()
 
 
 def stale_anchor_warnings(name: str, old: Destination, new: Destination, config: BackupConfig) -> List[str]:
     """When destination `name`'s URL (for a local destination its `zfs:` target;
-    a trailing `/` on a `zfs:` target does not count) changed: its anchors are
+    surrounding blanks do not count) changed: its anchors are
     keyed by the destination's NAME, so `org.zfsbackup:anchor.<name>` stays on
     every dataset that sends to it (descendants of recursive datasets included)
     and still describes the OLD copy. If the destination now points to a

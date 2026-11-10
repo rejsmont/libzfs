@@ -1012,11 +1012,25 @@ class TestListSkipRules:
         assert feed.argv == ['list', '-H', '-r', '-t', 'filesystem', '-o', 'name,type,compression', 'pool/a']
 
 
-class _TrackedProc(_Proc):
-    """A `_Proc` that notes whether it was reaped (`wait` or `poll` called)."""
+class _EofNotingReader(io.BufferedReader):
+    """A pipe that remembers whether a `readline` ever returned the empty bytes of EOF (the pipe is closed by the
+    time a test can look, so reading it afterwards would only prove it is closed)."""
 
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
+    eof_seen = False
+
+    def readline(self, *args):
+        line = super().readline(*args)
+        if line == b'':
+            self.eof_seen = True
+        return line
+
+
+class _TrackedProc(_Proc):
+    """A `_Proc` that notes whether it was reaped (`wait` or `poll` called) and whether stdout was read to EOF."""
+
+    def __init__(self, stdout=b'', *a, **kw):
+        super().__init__(stdout, *a, **kw)
+        self.stdout = _EofNotingReader(io.BytesIO(stdout))
         self.reaped = False
 
     def poll(self):
@@ -1198,7 +1212,8 @@ class TestListStrict:
         with pytest.raises(Exception, match='could not be trusted'):
             ListCommand()(strict=True)
         (proc,) = procs
-        assert proc.reaped and proc.stdout.read() == b''             # nothing left unread
+        assert proc.reaped and proc.stdout.eof_seen                  # nothing left unread
+        assert proc.stdout.closed and proc.stderr.closed             # and both pipes are closed afterwards
 
     @pytest.mark.unit
     @pytest.mark.subprocess

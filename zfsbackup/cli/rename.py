@@ -28,6 +28,14 @@ written.
   names the real copy path (`<target>/<client id>/<old>` -> `.../<new>`) and,
   when the parent is unchanged, the exact `zfs rename` that moves it; this tool
   does not run it. A copy left behind is still pruned to its last stamped rules;
+- renaming an enabled recursive dataset is checked like any change that makes a
+  name recursive (`copies.enforce_copies`, plan item A2d): backup copies found
+  below NEW refuse the rename (exit 1, nothing written) unless `--force-copies`.
+  A separate flag because `--force` already means "rename a dataset that has
+  remote destinations"; one flag for both would turn a deliberate acceptance of
+  a full send into a silent acceptance of snapshots into backup copies. A NEW
+  that does not exist in ZFS yet (the operator is about to `zfs rename`) holds
+  nothing to find; a failed look only warns;
 - `--clear-stale-props` removes `org.zfsbackup:config` and every
   `org.zfsbackup:anchor.*` and `org.zfsbackup:inflight.*` from the old dataset
   (an `inflight.*` pin is an anchor-like pin on the two snapshots of a send in
@@ -117,7 +125,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import click
 
 from zfsbackup import daemonlock
-from zfsbackup.cli import dotpath
+from zfsbackup.cli import copies, dotpath
 from zfsbackup.cli.errors import (
     EXIT_BUSY,
     EXIT_CONFIG,
@@ -719,7 +727,7 @@ def _clear_stale(
             + _inherit_commands(old, ordered)
         ) from None
     except ConfigBusy as exc:
-        left = [p for p in ordered if p not in cleared]
+        left = [p for p in ordered if p not in cleared and p not in kept]
         exc.add_note(
             f"the configuration was renamed, but the stale properties on {old!r} were NOT "
             "cleared (the writer lock was not free). Re-running the rename "
@@ -730,7 +738,8 @@ def _clear_stale(
         )
         raise
     except Exception as exc:  # noqa: BLE001
-        left = [p for p in ordered if p not in cleared]
+        # `kept` (received only: `inherit -S` would leave them) get no command.
+        left = [p for p in ordered if p not in cleared and p not in kept]
         # An unusable config database (path/schema/damaged file, read by the
         # gate) keeps its own wording and its exit code (78).
         code = exit_code_for(exc)
@@ -743,8 +752,11 @@ def _clear_stale(
         raise (ConfigUnusable if unusable else ConfigBusy if busy_store else CliError)(
             "the configuration was renamed, but clearing the stale properties on "
             f"{old!r} failed: {reason}. "
-            f"Cleared so far: {', '.join(cleared) or 'none'}. Still set, to clear by hand:\n"
-            + _inherit_commands(old, left)
+            f"Cleared so far: {', '.join(cleared) or 'none'}. "
+            + (
+                f"Still set, to clear by hand:\n{_inherit_commands(old, left)}"
+                if left else "Nothing else needs a command."
+            )
         ) from exc
     except BaseException as exc:
         exc.add_note(
@@ -837,6 +849,13 @@ def _interrupted_write(exc: BaseException, resolved: ResolvedConfigPath, what: s
 # rename dataset
 # --------------------------------------------------------------------------
 
+_RENAME_COPIES_HINT = (
+    "Move the copies out, keep the dataset non-recursive, or re-run with --force-copies to "
+    "rename anyway (the daemon then keeps the copies out of its snapshots itself, which are "
+    "no longer one `zfs snapshot -r`; it logs one ERROR per copy and `check` shows a "
+    "standing warning on the dataset until they are moved)."
+)
+
 
 def rename_dataset(
     resolved: ResolvedConfigPath,
@@ -845,6 +864,7 @@ def rename_dataset(
     new: str,
     *,
     force: bool = False,
+    force_copies: bool = False,
     clear_stale_props: bool = False,
     dry_run: bool = False,
     warn: Callable[[str], None],
@@ -905,6 +925,14 @@ def rename_dataset(
 
     new_config = _renamed_dataset_config(config, old, new)
     prefix = "[dry run] " if dry_run else ""
+
+    # An enabled recursive dataset renamed in the configuration is a newly
+    # recursive NAME (plan item A2d): look for backup copies below NEW, before the
+    # write (a read-only ZFS look; a failed look only warns). `--force` here is
+    # taken (remote destinations), so the override is its own flag.
+    copies.enforce_copies(
+        config, new_config, force=force_copies, warn=warn, hint=_RENAME_COPIES_HINT
+    )
 
     if unavailable is not None:
         warn(

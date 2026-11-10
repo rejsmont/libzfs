@@ -139,8 +139,12 @@ def _fake_zfs_everywhere(fake_zfs):
 
 
 @pytest.fixture
-def rich(run, db):
-    return make_db(run, db, RENAME_YAML)
+def rich(run, db, fake_zfs):
+    made = make_db(run, db, RENAME_YAML)
+    # RENAME_YAML has a recursive dataset, so the import's backup-copy check (A2d) looked at the fake
+    # (`zfs list tank/data`): the tests below count the calls the RENAME makes.
+    fake_zfs.clear_calls()
+    return made
 
 
 def names(database):
@@ -1913,6 +1917,72 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
         assert db_state(db) == state and stale.mutations == []
 
 
+class TestClearStaleKeptExclusion:
+    """`_clear_stale` failure path: the names that are only RECEIVED on the old dataset (`kept`: `inherit -S`
+    leaves them) get no `zfs inherit` command in the "to clear by hand" list, and when nothing is left the
+    message says so instead of printing an empty list."""
+
+    @pytest.fixture
+    def old_dataset(self, fake_zfs):
+        fake_zfs.add("tank/vm.01", {})
+        fake_zfs.set_prop("tank/vm.01", ANCHOR + "dc.two", "RCV", "received")     # kept: received only
+        fake_zfs.set_prop("tank/vm.01", ANCHOR + "offsite", "LOCAL")              # cleared, or fails
+        fake_zfs.set_prop("tank/vm.01", CONFIG_PROP, "cfg")
+        fake_zfs.add("tank/vm.02", {})
+        return fake_zfs
+
+    def clear(self, run, rich):
+        return run("rename", "dataset", "tank/vm.01", "tank/vm.02", "--clear-stale-props", "-c", rich)
+
+    def test_a_received_only_name_gets_no_command_when_a_later_clear_fails(self, run, rich, old_dataset):
+        old_dataset.fail("inherit", "tank/vm.01", ANCHOR + "offsite")
+        result = self.clear(run, rich)
+        assert result.exit_code == 1
+        err = result.stderr
+        assert "Cleared so far: none" in err
+        left = err.split("Still set, to clear by hand:")[1]
+        assert inherit_command(ANCHOR + "offsite", "tank/vm.01") in left
+        assert inherit_command(CONFIG_PROP, "tank/vm.01") in left
+        assert inherit_command(ANCHOR + "dc.two", "tank/vm.01") not in left       # received only: nothing to run
+        assert "Nothing else needs a command." not in err
+        assert old_dataset.value("tank/vm.01", ANCHOR + "dc.two") == "RCV"
+
+    def test_nothing_left_says_so_instead_of_an_empty_command_list(self, run, rich, fake_zfs, monkeypatch):
+        import contextlib
+
+        fake_zfs.add("tank/vm.01", {})
+        fake_zfs.set_prop("tank/vm.01", ANCHOR + "dc.two", "RCV", "received")     # the only stale property
+        fake_zfs.add("tank/vm.02", {})
+        real = rename._clear_gate
+
+        @contextlib.contextmanager
+        def failing_late(*args, **kwargs):
+            with real(*args, **kwargs):
+                yield
+            raise RuntimeError("late failure")             # after every property was dealt with
+
+        monkeypatch.setattr(rename, "_clear_gate", failing_late)
+        result = self.clear(run, rich)
+        assert result.exit_code == 1
+        err = result.stderr
+        assert "clearing the stale properties on 'tank/vm.01' failed: late failure" in err
+        assert "Cleared so far: none. Nothing else needs a command." in err
+        assert "Still set, to clear by hand" not in err and "zfs inherit" not in err
+        assert "tank/vm.02" in names(rich)
+
+    def test_a_busy_gate_lists_every_name_because_none_was_examined_yet(self, run, rich, old_dataset, monkeypatch):
+        import contextlib
+
+        @contextlib.contextmanager
+        def busy(*args, **kwargs):
+            raise ConfigBusy("writer lock held")
+            yield
+
+        monkeypatch.setattr(rename, "_clear_gate", busy)
+        result = self.clear(run, rich)
+        assert result.exit_code == 75
+        assert inherit_command(ANCHOR + "dc.two", "tank/vm.01") in result.stderr   # nothing was examined: all listed
+
 class TestRenameDatasetWithoutZfs:
     @pytest.fixture
     def no_zfs(self, monkeypatch):
@@ -3563,7 +3633,12 @@ def dataset_block(name, *, recursive=False, enabled=True, remote=("offsite",)):
 
 
 def tree_db(run, db, *blocks):
-    return make_db(run, db, TREE_YAML.format(extra="".join(blocks)))
+    # `--force`: several tests plant backup copies below the recursive parent BEFORE the import, which the
+    # import's backup-copy check (A2d) would refuse; what they test is what the RENAME does about them.
+    made = make_db(run, db, TREE_YAML.format(extra="".join(blocks)), force=True)
+    # That check also looked at ZFS for the recursive datasets; the tests count what the RENAME reads. (The fake is the module's autouse one: `$FAKEZFS_LOG` names its log.)
+    open(os.environ["FAKEZFS_LOG"], "w").close()
+    return made
 
 
 def grow_tree(fake):

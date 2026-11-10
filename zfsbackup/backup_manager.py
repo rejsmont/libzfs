@@ -1,7 +1,7 @@
 """Snapshot manager for creating and managing ZFS snapshots."""
 
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import Callable, Dict, FrozenSet, Iterable, List, Mapping, NamedTuple, Optional, Set, Tuple, Union
 import contextlib
 import dataclasses
 import logging
@@ -599,6 +599,14 @@ class _CopyTops(Dict[str, str]):
     covered: FrozenSet[str] = frozenset()
 
 
+class SnapshotRide(NamedTuple):
+    """`DatasetManager.ridden_snapshot`: the snapshot `snapshot` of a
+    configured dataset was created, in this cycle, by the snapshot of its
+    enabled recursive configured ancestor `ancestor`, and counts as its own."""
+    snapshot: str
+    ancestor: str
+
+
 class _InsideReceiveTarget(RuntimeError):
     """A recursive dataset to snapshot is itself at or below a receive target
     (`DatasetManager._snapshot_tree`). `first` is False after the first one of
@@ -673,6 +681,18 @@ class DatasetManager:
         # (dataset name, snapshot name) of generated names that already
         # exist (a clock that went backwards), announced at WARNING once.
         self._name_taken_noted: Set[Tuple[str, str]] = set()
+        # A2e: what the enabled RECURSIVE datasets' own `create_snapshot` created
+        # in the snapshot worker's current cycle (`begin_snapshot_cycle` clears
+        # it): dataset name -> (snapshot name, the names of the datasets the
+        # command covered, or `None` for every descendant: `snapshot -r`). A
+        # configured descendant whose own name for this period is that snapshot
+        # counts it as its own (`ridden_snapshot`).
+        self._tree_snapshots: Dict[str, Tuple[str, Optional[FrozenSet[str]]]] = {}
+        # (recursive dataset, snapshot name) whose retry without the holders
+        # of the name was announced (`_retry_without_holders`).
+        self._snapshot_holders_noted: Set[Tuple[str, str]] = set()
+        # What `_snapshot_tree` covered, handed to `create_snapshot`.
+        self._tree_cover: Optional[FrozenSet[str]] = None
         # (dataset name, snapshot name) -> why a destroy of it cannot go
         # through right now (held, cloned, or a failed single destroy). Such a
         # name is never put back into a batch; it is tried alone each cycle
@@ -1842,6 +1862,68 @@ class DatasetManager:
             logger.debug(f"Dataset {dsi.name}: {what} {snap.full_name} is still dated in the future")
         return True
 
+    def begin_snapshot_cycle(self) -> None:
+        """Forget what this cycle's recursive snapshots created (A2e). The
+        snapshot worker calls it at the top of every cycle, so only a snapshot
+        made in THIS cycle is ever taken to be an ancestor's."""
+        self._tree_snapshots.clear()
+
+    def _covering_snapshot(self, dsi: DatasetInfo, name: str) -> Optional[str]:
+        """The enabled recursive configured ancestor of `dsi` whose
+        `create_snapshot` in this cycle created `name` over `dsi` (its command
+        covered `dsi`), else `None`. Only the record of a SUCCESSFUL
+        `create_snapshot` since `begin_snapshot_cycle` counts: a name that
+        merely exists (an old one, a clock that went backwards) never does."""
+        if not self._tree_snapshots:
+            return None
+        for ancestor in self.datasets:
+            if ancestor is dsi or not ancestor.recursive or not dsi.name.startswith(ancestor.name + '/'):
+                continue
+            made = self._tree_snapshots.get(ancestor.name)
+            if made is None:
+                continue
+            made_name, cover = made
+            if made_name == name and (cover is None or dsi.name in cover):
+                return ancestor.name
+        return None
+
+    def ridden_snapshot(self, dsi: DatasetInfo) -> Optional[SnapshotRide]:
+        """A2e. `SnapshotRide` when the snapshot `dsi` would generate for this
+        period was just created over it by an enabled recursive configured
+        ancestor's snapshot in this cycle (`create_snapshot`'s own record,
+        not a re-read of who made it), else `None`. The dataset then has its
+        snapshot for the period: nothing to create, no "already exists"
+        WARNING, not a failure. The record only says the ancestor's command
+        covered `dsi`; one listing of `dsi` confirms it really holds the name
+        (a configured dataset that does not exist, or one created after the
+        ancestor's listing, does not), and a failed listing answers `None`, so
+        the dataset takes its normal path."""
+        if not self._tree_snapshots:
+            return None
+        name = self._generate_snapshot_name(dsi)
+        ancestor = self._covering_snapshot(dsi, name)
+        if ancestor is None:
+            return None
+        self.last_list_error = None
+        self._last_list_failure = None
+        try:
+            # Quiet on failure (DEBUG): `needs_snapshot` lists again right
+            # after and reports a failure once, at ERROR; one failed listing
+            # is one ERROR, not two.
+            self._list_snapshots_strict(dsi)
+        except Exception as e:
+            self.last_list_error = f"{type(e).__name__}: {e}"
+            self._last_list_failure = e
+            logger.debug(f"Dataset {dsi.name}: could not confirm the ridden snapshot {name}: {e}")
+            return None
+        if name not in dsi.listed_names:
+            return None
+        logger.debug(
+            f"Dataset {dsi.name}: snapshot {name} was created by the recursive snapshot of "
+            f"{ancestor} in this cycle; it counts as its own"
+        )
+        return SnapshotRide(name, ancestor)
+
     def needs_snapshot(self, dsi: DatasetInfo) -> bool:
         snapshots = self.list_snapshots(dsi, recursive=False)
         if not snapshots:
@@ -1862,6 +1944,15 @@ class DatasetManager:
         if needs:
             name = self._generate_snapshot_name(dsi)
             if name in dsi.listed_names or any(s.name == name for s in snapshots):
+                ancestor = self._covering_snapshot(dsi, name)
+                if ancestor is not None:
+                    # Not a backwards clock: the recursive snapshot of
+                    # `ancestor` created it a moment ago, in this cycle (A2e).
+                    logger.debug(
+                        f"Dataset {dsi.name}: snapshot {name} was created by the recursive "
+                        f"snapshot of {ancestor} in this cycle; it counts as its own"
+                    )
+                    return False
                 # A clock that went backwards regenerates a name that exists:
                 # `zfs snapshot` would fail on every cycle. Do nothing.
                 key = (dsi.name, name)
@@ -2015,6 +2106,7 @@ class DatasetManager:
         returns: the snapshot object is built from `dsi` and the name."""
         self.last_snapshot_error = None
         self.last_snapshot_note = None
+        self._tree_snapshots.pop(dsi.name, None)
         snap_name = self._generate_snapshot_name(dsi)
         full_name = f"{dsi.name}@{snap_name}"
         try:
@@ -2023,12 +2115,17 @@ class DatasetManager:
                 logger.info(f"[DRY RUN] Would create snapshot: {full_name}")
                 return None
             if dsi.recursive:
+                self._tree_cover = None
                 self._snapshot_tree(dsi, snap_name)
+                # The command succeeded: a configured descendant of `dsi` that
+                # it covered may count `snap_name` as its own this cycle (A2e).
+                self._tree_snapshots[dsi.name] = (snap_name, self._tree_cover)
             else:
                 zfs.snapshot(dsi.dataset, snap_name, recursive=False)
             snapshot = ZFSSnapshot(dsi.dataset, snap_name)
             logger.info(f"Successfully created snapshot: {full_name}")
         except _InsideReceiveTarget as e:
+            self._tree_snapshots.pop(dsi.name, None)
             self.last_snapshot_error = f"Failed to create snapshot {full_name}: {e}"
             # The refusal repeats every cycle until the configuration or the
             # layout changes: ERROR for the first, DEBUG for the rest.
@@ -2038,6 +2135,7 @@ class DatasetManager:
             )
             return None
         except Exception as e:
+            self._tree_snapshots.pop(dsi.name, None)
             self.last_snapshot_error = f"Failed to create snapshot {full_name}: {e}"
             logger.error(f"Failed to create snapshot {full_name}: {e}")
             return None
@@ -2092,14 +2190,29 @@ class DatasetManager:
         `last_snapshot_note` is set to a short standing warning whenever copies
         were left out or could not be told apart.
 
-        The command is atomic and fails as a whole: a collision on one child
-        (a name that exists there), or a source child destroyed or renamed
-        between the listing and the snapshot, fails the whole command, so
-        NOTHING is snapshotted that cycle (the next one lists again and
-        retries; `snapshot -r` has the same all-or-nothing behaviour for a
-        collision). A child created in that window misses this one snapshot
-        (the next period catches up), and a copy created in it gets one stray
-        snapshot. Source datasets are never timed."""
+        The check "`dsi` at or below a receive target" is config only and runs
+        BEFORE any zfs read, so a failing read can never fall back to
+        `snapshot -r` inside a target. After a successful `many`,
+        `self._tree_cover` holds the names it covered (`None` stays for
+        `snapshot -r`: every descendant), which `create_snapshot` records for
+        `ridden_snapshot` (A2e).
+
+        The command is atomic and fails as a whole: a source child destroyed
+        or renamed between the listing and the snapshot fails the whole
+        command, so NOTHING is snapshotted that cycle (the next one lists
+        again and retries). A child created in that window misses this one
+        snapshot (the next period catches up), and a copy created in it gets
+        one stray snapshot. A collision (a configured child that took the
+        same name first: a period boundary fell between this dataset's turn
+        and the child's, or this command failed once and the child snapshotted
+        itself) is retried once without the datasets that hold the name
+        (`_run_tree_command`), so it never locks the tree out of a period.
+        Source datasets are never timed."""
+        # Config only, before any zfs read: a read that fails must never get
+        # to fall back to `snapshot -r` inside a receive target.
+        at_target = self._receive_target_of(dsi.name)
+        if at_target is not None:
+            raise self._inside_target_refusal(dsi, at_target[1])
         tops: Dict[str, str] = {}
         sources: Optional[List[Dataset]] = None
         failure: Optional[str] = None
@@ -2111,20 +2224,13 @@ class DatasetManager:
             failure = f"{type(e).__name__}: {e}"
         if failure is None:
             if dsi.name in tops:
-                first = dsi.name not in self._snapshot_inside_target_noted
-                self._snapshot_inside_target_noted.add(dsi.name)
-                raise _InsideReceiveTarget(
-                    f"{dsi.name} is itself inside a backup copy ({tops[dsi.name]}): not snapshotting "
-                    "it (a configured dataset must be outside every receive target; remove it from "
-                    "the configuration or move it out with zfs rename)",
-                    first,
-                )
+                raise self._inside_target_refusal(dsi, tops[dsi.name])
             if dsi.name in self._snapshot_inside_target_noted:
                 self._snapshot_inside_target_noted.discard(dsi.name)
                 logger.info(f"{dsi.name} is no longer at or below a receive target")
         if failure is None and sources is not None:
             try:
-                zfs.snapshot.many(sources, snap_name)
+                self._run_tree_command(dsi, snap_name, sources)
             except ValueError as e:
                 # Raised before zfs runs (argv bound, names): nothing was created.
                 failure = f"ValueError: {e}"
@@ -2143,7 +2249,7 @@ class DatasetManager:
                 "backup copies below could not be told apart, so `zfs snapshot -r` was used and may "
                 f"have snapshotted into one ({failure})"
             )
-            zfs.snapshot(dsi.dataset, snap_name, recursive=True)
+            self._run_tree_command(dsi, snap_name, None)
             return
         if dsi.name in self._snapshot_fallback_noted:
             self._snapshot_fallback_noted.discard(dsi.name)
@@ -2153,7 +2259,7 @@ class DatasetManager:
             )
         if sources is None:
             # No copy below it.
-            zfs.snapshot(dsi.dataset, snap_name, recursive=True)
+            self._run_tree_command(dsi, snap_name, None)
         self._snapshot_copy_episodes(dsi, snap_name, tops)
         inside = getattr(tops, 'inside', None)
         if inside is not None and getattr(tops, 'covered', None):
@@ -2168,6 +2274,110 @@ class DatasetManager:
                 f"{len(names)} backup cop{'y' if len(names) == 1 else 'ies'} below "
                 f"{'was' if len(names) == 1 else 'were'} not snapshotted: {shown}"
             )
+
+    def _run_tree_command(self, dsi: DatasetInfo, snap_name: str, sources: Optional[List[Dataset]]) -> None:
+        """Run the tree's snapshot command: `zfs snapshot -r` (`sources is
+        None`) or the atomic `many` over `sources`, and set `self._tree_cover`
+        to what it covered (`None` for `-r`: every descendant). A `ValueError`
+        (raised before zfs runs) propagates untouched. A zfs failure is given
+        ONE retry by `_retry_without_holders`, which raises when it cannot
+        help, so the caller sees a failure exactly as before."""
+        try:
+            if sources is None:
+                zfs.snapshot(dsi.dataset, snap_name, recursive=True)
+                cover: Optional[FrozenSet[str]] = None
+            else:
+                zfs.snapshot.many(sources, snap_name)
+                cover = frozenset(d.name for d in sources)
+        except ValueError:
+            raise
+        except Exception as e:
+            cover = self._retry_without_holders(dsi, snap_name, sources, e)
+        self._tree_cover = cover
+
+    def _retry_without_holders(
+        self, dsi: DatasetInfo, snap_name: str, sources: Optional[List[Dataset]], error: Exception,
+    ) -> FrozenSet[str]:
+        """The tree command failed with `error`. When that is because some
+        datasets of the tree's SOURCE set already hold `snap_name` (a
+        configured child took it first: the period's boundary fell between
+        this dataset's turn and the child's, or an earlier failure of this
+        command let the child snapshot itself), a retry would collide for the
+        rest of the period and the whole tree would miss it. So: ONE
+        name-only `zfs list -H -r -t snapshot` of the tree finds the holders,
+        and the command is run ONCE more, atomically, over the other source
+        datasets (`zfs snapshot many`); the holders already have the period's
+        snapshot and their own record path handles them. Returns what the
+        retry covered (the holders are not in it).
+
+        The decision is made from the listing, never from the error text: the
+        OpenZFS captures in `tests/fixtures/openzfs/` hold no snapshot-name
+        collision (only `cannot create snapshot '<ds@name>': dataset is busy`
+        and M4's "multiple snapshots of same fs"), and libzfseasy forces
+        `LC_ALL=C` but a message can change between versions. A failure with
+        no holder (out of space, a source destroyed in the window) re-raises
+        `error` unchanged. So does an unreadable listing (DEBUG), a listing
+        in which `dsi` itself holds the name (a backwards clock, which
+        `needs_snapshot` already refuses) and a source list that cannot be
+        read for a `-r`. A failed retry raises a `RuntimeError` naming both
+        errors. Called at most once per `create_snapshot`, and never raises a
+        `ValueError` (the caller would turn that into a second attempt). The
+        listing is not strict: a row it drops is a holder it misses, and then
+        the retry fails like the first command did; it can never exclude a
+        dataset that does not hold the name. Source datasets are never timed."""
+        try:
+            holders = {
+                s.dataset.name for s in zfs.list(roots=dsi.dataset, types='snapshot', recursive=True)
+                if isinstance(s, ZFSSnapshot) and s.short == snap_name
+            }
+            if not holders:
+                raise error     # nothing collides: the failure is something else
+            # Only now the list of source datasets (for a `-r`, one more read).
+            everything = list(sources) if sources is not None else self._snapshot_sources(dsi, {})
+            held = holders & {d.name for d in everything}
+        except Exception as e:
+            if e is error:
+                raise
+            logger.debug(f"Dataset {dsi.name}: could not look for holders of {snap_name} after {error}: {e}")
+            raise error
+        if not held or dsi.name in held:
+            raise error
+        rest = [d for d in everything if d.name not in held]
+        try:
+            zfs.snapshot.many(rest, snap_name)
+        except Exception as e:
+            logger.debug(f"Dataset {dsi.name}: retry of {snap_name} without {len(held)} holder(s) failed: {e}")
+            raise RuntimeError(
+                f"{e} (retried once without the {len(held)} dataset(s) that already hold {snap_name}; "
+                f"the first attempt failed with: {error})"
+            ) from e
+        key = (dsi.name, snap_name)
+        shown = sorted(held)
+        listing = ', '.join(shown[:5]) + (f" +{len(shown) - 5}" if len(shown) > 5 else '')
+        if key not in self._snapshot_holders_noted:
+            self._snapshot_holders_noted = {k for k in self._snapshot_holders_noted if k[0] != dsi.name}
+            self._snapshot_holders_noted.add(key)
+            logger.info(
+                f"Snapshot {dsi.name}@{snap_name}: {len(held)} dataset(s) below already held {snap_name} "
+                f"and were left out of the atomic snapshot ({listing}); normal after a period boundary "
+                "that fell between two datasets' turns"
+            )
+        else:
+            logger.debug(f"Snapshot {dsi.name}@{snap_name}: left out the holders {listing}")
+        return frozenset(d.name for d in rest)
+
+    def _inside_target_refusal(self, dsi: DatasetInfo, why: str) -> '_InsideReceiveTarget':
+        """The refusal to snapshot a recursive `dsi` that is itself at or below
+        a receive target (`why`: `_receive_target_of`'s clause), to be raised.
+        `first` is True for the first of an episode."""
+        first = dsi.name not in self._snapshot_inside_target_noted
+        self._snapshot_inside_target_noted.add(dsi.name)
+        return _InsideReceiveTarget(
+            f"{dsi.name} is itself inside a backup copy ({why}): not snapshotting "
+            "it (a configured dataset must be outside every receive target; remove it from "
+            "the configuration or move it out with zfs rename)",
+            first,
+        )
 
     def _snapshot_copy_episodes(self, dsi: DatasetInfo, snap_name: str, tops: Dict[str, str]) -> None:
         """The once-per-episode ERROR / INFO lines of a successful
@@ -2188,13 +2398,16 @@ class DatasetManager:
                 f"{dsi.name}@{snap_name}, in one atomic command). Move it out of {dsi.name} "
                 f"(zfs rename {top} <a name outside {dsi.name}>) or make {dsi.name} non-recursive"
             )
-        for key in [
-            k for k in self._snapshot_copy_noted
-            if k[0] == dsi.name and (k[1] not in tops or k[1] in covered)
-        ]:
+        for key in [k for k in self._snapshot_copy_noted if k[0] == dsi.name and k[1] not in tops]:
             self._snapshot_copy_noted.discard(key)
             logger.info(f"{key[1]}, a backup copy below {dsi.name}, is gone; {dsi.name} is "
                         "snapshotted recursively again")
+        # A top that is now COVERED (`dsi` itself carries the marker) is not
+        # gone: the `dsi`-level episode below speaks for it, so its own one
+        # ends without a word.
+        self._snapshot_copy_noted.difference_update(
+            k for k in list(self._snapshot_copy_noted) if k[0] == dsi.name and k[1] in covered
+        )
         self._inside_episode(
             dsi, tops, self._snapshot_inside_copy_noted,
             f"only {dsi.name} itself is snapshotted (as {dsi.name}@{snap_name}); nothing below it is",
@@ -2257,7 +2470,14 @@ class DatasetManager:
         is itself a copy top cannot be told from a source's, so that falls back
         to `snapshot -r` too. Raises a `RuntimeError` naming `dsi` (cause
         chained) on any failure or a listing that does not contain `dsi` or has
-        a name outside it."""
+        a name outside it.
+
+        When `dsi` itself has or inherits a copy marker (`tops.inside`) every
+        descendant is a copy by inheritance, so the answer is `dsi` alone and
+        nothing is listed: a name below it that libzfseasy cannot represent
+        can then never force the fallback to `snapshot -r` into the copies."""
+        if getattr(tops, 'inside', None) is not None and dsi.name not in tops:
+            return [dsi.dataset]
         try:
             try:
                 listed = list(zfs.list(
@@ -2365,6 +2585,22 @@ class DatasetManager:
                     protected.setdefault(sni.name, f"retention of {child.name} keeps it")
         return protected
 
+    def copy_tops(self, config: DatasetConfig) -> Mapping[str, str]:
+        """The topmost backup copies at or below the dataset `config.name`,
+        `{top: why}`, shallowest first (the public form of `_copy_tops`, for
+        the CLI: it builds the `DatasetInfo` itself). Read-only (one
+        recursive value-free `zfs get`, plus one `zfs.exists` per candidate
+        receive target) and untimed here: wrap the call in
+        `libzfseasy.timeout`. The result carries two attributes (read them
+        with `getattr`): `.inside` is `(origin, source)` when the dataset
+        ITSELF has or inherits a copy marker (else `None`), and `.covered`
+        the frozenset of tops that exist only because of that (every child
+        inherits the marker); list the tops outside `.covered`. Raises on any
+        read failure (a `RuntimeError` naming the dataset, a
+        `ZFSTimeoutError` unchanged): never a partial answer. The caller
+        checks that the dataset exists first."""
+        return self._copy_tops(DatasetInfo(Dataset(config.name), config))
+
     def _copy_tops(self, dsi: DatasetInfo) -> Dict[str, str]:
         """The TOPMOST backup copies below the recursive `dsi`, as `{dataset:
         why}` (`why` is a clause for the ERROR), shallowest first. The result
@@ -2390,38 +2626,33 @@ class DatasetManager:
         known target is indistinguishable from a source child, and is
         treated as one. Raises (a `RuntimeError` naming `dsi`; a
         `ZFSTimeoutError` unchanged)."""
-        found = self._copy_roots(dsi.name)
         prefix = dsi.name + '/'
         why: Dict[str, str] = {}
-        for name, source in found.items():
-            if name.startswith(prefix):
-                why[name] = f"it has {PROP_CLIENT_ID} or {PROP_SOURCE_DATASET}, source: {source}"
-        # `dsi` itself has or inherits a marker: every child inherits it.
-        inside: Optional[Tuple[str, str]] = None
-        child_source = ''
-        own = found.get(dsi.name)
-        if own is not None:
-            if own.startswith('inherited'):
-                inside = (own[len('inherited from '):] or 'an ancestor', own)
-                child_source = own
-            else:
-                inside = (dsi.name, own)
-                child_source = f"inherited from {dsi.name}"
         from_target: Set[str] = set()
-        for target in self._receive_targets():
-            top = None
-            if target.startswith(prefix):
-                top = target
-                reason = f"it is the receive target {target}"
-            elif dsi.name == target or dsi.name.startswith(target + '/'):
-                top = dsi.name
-                reason = (
-                    f"{dsi.name} is itself at or below the receive target {target}, so "
-                    "everything below it is a copy"
-                )
-            if top is not None and top not in why:
-                why[top] = reason
-                from_target.add(top)
+        inside: Optional[Tuple[str, str]] = None
+        at_target = self._receive_target_of(dsi.name)
+        if at_target is not None:
+            # Config only: `dsi` is the top and everything below it is a copy,
+            # so the marker read (a zfs call that could fail) is not needed.
+            found: Dict[str, str] = {}
+            why[dsi.name] = at_target[1]
+            from_target.add(dsi.name)
+        else:
+            found = self._copy_roots(dsi.name)
+            for name, source in found.items():
+                if name.startswith(prefix):
+                    why[name] = f"it has {PROP_CLIENT_ID} or {PROP_SOURCE_DATASET}, source: {source}"
+            # `dsi` itself has or inherits a marker: every child inherits it.
+            own = found.get(dsi.name)
+            if own is not None:
+                if own.startswith('inherited'):
+                    inside = (own[len('inherited from '):] or 'an ancestor', own)
+                else:
+                    inside = (dsi.name, own)
+            for target in self._receive_targets():
+                if target.startswith(prefix) and target not in why:
+                    why[target] = f"it is the receive target {target}"
+                    from_target.add(target)
         tops: List[str] = []
         # Sorted, so an ancestor always precedes its descendants.
         for name in sorted(why):
@@ -2444,11 +2675,40 @@ class DatasetManager:
             result[top] = why[top]
         tops = _CopyTops(result)
         tops.inside = inside
+        # A top is covered when its marker is INHERITED from an origin that is
+        # `dsi` itself or above it (so `dsi` has or inherits the marker and
+        # the child is a copy only by that inheritance). Not "the same source
+        # string as `dsi`'s": `_copy_roots` keeps one source per dataset, and
+        # a `dsi` with a LOCAL `source_dataset` and an INHERITED `client_id`
+        # has children whose rows both read `inherited from ...`.
         tops.covered = frozenset(
             top for top in result
-            if inside is not None and top not in from_target and found.get(top) == child_source
+            if inside is not None and top not in from_target
+            and self._inherited_from_at_or_above(found.get(top), dsi.name)
         )
         return tops
+
+    @staticmethod
+    def _inherited_from_at_or_above(source: Optional[str], name: str) -> bool:
+        """True if `source` (`inherited from <origin>`, as `_copy_roots` keeps
+        it) names an origin that is `name` itself or one of its ancestors:
+        the marker comes through `name`, not from a dataset below it."""
+        if source is None or not source.startswith('inherited from '):
+            return False
+        origin = source[len('inherited from '):]
+        return bool(origin) and (name == origin or name.startswith(origin + '/'))
+
+    def _receive_target_of(self, name: str) -> Optional[Tuple[str, str]]:
+        """`(target, why)` if the dataset `name` is at or below one of
+        `_receive_targets()` (everything there is a copy; `validate_config`
+        refuses such a configuration), else `None`. Config only: no zfs call."""
+        for target in self._receive_targets():
+            if name == target or name.startswith(target + '/'):
+                return target, (
+                    f"{name} is itself at or below the receive target {target}, so "
+                    "everything below it is a copy"
+                )
+        return None
 
     def _copy_protection(self, dsi: DatasetInfo) -> Dict[str, str]:
         """For a RECURSIVE dataset: `{snapshot name: reason}` for every name
@@ -2513,16 +2773,18 @@ class DatasetManager:
                 "(older versions; the snapshot worker's fallback when it cannot read the copies) "
                 "also snapshots into the copy, and on a live replica that stops its incremental "
                 f"receives. Such a stray has the SAME createtxg as {dsi.name}@<name> (check: zfs "
-                f"get -H -o name,value createtxg {dsi.name}@<name> {top}@<name>); every other "
+                f"get -H -o name,value createtxg {dsi.name}@<name>; zfs get -r -t snapshot -H -o "
+                f"name,value createtxg {top}, which covers every dataset below it); every other "
                 "snapshot in the copy is received backup history, which must never be destroyed"
             )
-        for key in [
-            k for k in self._copy_protect_noted
-            if k[0] == dsi.name and (k[1] not in tops or k[1] in covered)
-        ]:
+        for key in [k for k in self._copy_protect_noted if k[0] == dsi.name and k[1] not in tops]:
             self._copy_protect_noted.discard(key)
             logger.info(f"{key[1]}, a backup copy below {dsi.name}, is gone; recursive pruning of "
                         f"{dsi.name} is no longer held back by it")
+        # Covered, not gone: the `dsi`-level episode below speaks for it.
+        self._copy_protect_noted.difference_update(
+            k for k in list(self._copy_protect_noted) if k[0] == dsi.name and k[1] in covered
+        )
         self._inside_episode(
             dsi, tops, self._copy_protect_inside_noted,
             f"a recursive destroy of {dsi.name}@<snapshot> would destroy that name in every copy "

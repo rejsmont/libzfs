@@ -532,15 +532,32 @@ class TestTheDatasetItself:
             next_cycle(clock)
         assert world.commands_of('snapshot') == []
 
-    def test_a_dataset_that_does_not_exist_is_a_fallback_that_zfs_then_refuses(self, mock_subprocess, clock, caplog):
-        """Nothing to read: the copy read fails, and the fallback's plain `snapshot -r` is exec'd (libzfseasy no
-        longer lists first) and refused by zfs: nothing is created, and there is no listing after it."""
+    def test_a_dataset_inside_a_target_that_does_not_exist_is_refused_before_any_read(
+            self, mock_subprocess, clock, caplog):
+        """A2e: the check is config only and runs first, so a dataset that does not exist (or whose read would fail)
+        never reaches the fallback's `snapshot -r`: no zfs call at all, nothing created."""
         world = SnapWorld(mock_subprocess)
         manager, dsi = make('bk/x', targets=['bk'])
         with caplog.at_level(INFO, logger=LOGGER):
             assert manager.create_snapshot(dsi) is None
-        assert world.commands_of('snapshot') == [['snapshot', '-r', f'bk/x@{NAME}']] and world.created == []
-        assert world.listings() == [] and world.argvs[-1][0] == 'snapshot', 'nothing is listed after a refusal'
+        assert world.argvs == [], 'not even the copy read'
+        assert world.created == []
+        assert f'bk/x is itself inside a backup copy' in manager.last_snapshot_error
+        assert fallback_errors(caplog) == [] and len(errors(caplog, 'Failed to create snapshot')) == 1
+
+    def test_a_dataset_that_does_not_exist_is_a_fallback_that_zfs_then_refuses(self, mock_subprocess, clock, caplog):
+        """Nothing to read (outside every target): the copy read fails, and the fallback's plain `snapshot -r` is
+        exec'd (libzfseasy no longer lists first) and refused by zfs: nothing is created. The refusal is a failure
+        of the tree command, so (A2e) ONE snapshot listing follows it to look for holders; it finds none (the
+        dataset does not exist), so the original error stands and nothing is retried."""
+        world = SnapWorld(mock_subprocess)
+        manager, dsi = make('pool/missing', targets=['bk'])
+        with caplog.at_level(INFO, logger=LOGGER):
+            assert manager.create_snapshot(dsi) is None
+        assert world.commands_of('snapshot') == [['snapshot', '-r', f'pool/missing@{NAME}']] and world.created == []
+        assert world.listings() == [] and world.argvs[-1][0] == 'list', 'no dataset listing after a refusal'
+        assert world.argvs[-1] == ['list', '-H', '-r', '-t', 'snapshot', '-o', 'name,type', 'pool/missing']
+        assert [a[0] for a in world.argvs].count('snapshot') == 1, 'no retry: there is no holder'
         assert 'does not exist' in manager.last_snapshot_error
         assert len(fallback_errors(caplog)) == 1
 
@@ -615,7 +632,9 @@ class TestInheritedMarker:
         manager, dsi = make()
         with caplog.at_level(INFO, logger=LOGGER):
             snap = manager.create_snapshot(dsi)
-        assert world.argvs == [copy_read_argv(DS), TREE_LIST, ['snapshot', f'{DS}@{NAME}'], SNAPSHOT_LIST]
+        # A2e: the dataset itself has the marker, so every child is a copy by inheritance: nothing is listed
+        assert world.argvs == [copy_read_argv(DS), ['snapshot', f'{DS}@{NAME}'], SNAPSHOT_LIST]
+        assert world.listings() == []
         assert world.snapshots_below(DS) == {DS: {NAME}}
         assert snap.full_name == f'{DS}@{NAME}'
 
@@ -717,6 +736,231 @@ class TestInheritedMarker:
             manager.create_snapshot(dsi)
         assert [m.split(' is a backup copy')[0] for m in copy_errors(caplog)] == [CH]
         assert len(inside_errors(caplog, DS)) == 1
+
+
+class TestCoveredIsDecidedByTheOrigin:
+    """Item 1: a top is COVERED (the dataset-level message speaks for it, and no `zfs rename <child>` advice is
+    given) when its marker is INHERITED from `dsi` itself or an ancestor of it. Not "the same source string as
+    `dsi`'s": `_copy_roots` keeps one source per dataset, and a `dsi` with a LOCAL `source_dataset` and an
+    INHERITED `client_id` has children whose rows both read `inherited from ...`."""
+
+    MIXED_OWN = [(PROP_CLIENT_ID, 'h1', 'inherited from pool'), (PROP_SOURCE_DATASET, 'pool/x', 'local')]
+    MIXED_CHILD = [(PROP_CLIENT_ID, 'h1', 'inherited from pool'), (PROP_SOURCE_DATASET, 'pool/x', f'inherited from {DS}')]
+
+    def mixed_world(self, mock_subprocess):
+        world = SnapWorld(mock_subprocess)
+        world.add(DS, self.MIXED_OWN).add(CH, self.MIXED_CHILD).add(GC, self.MIXED_CHILD)
+        world.add(VOL, self.MIXED_CHILD, ptype='volume')
+        return world
+
+    def test_a_local_source_dataset_and_an_inherited_client_id_cover_the_children(
+            self, mock_subprocess, clock, caplog):
+        world = self.mixed_world(mock_subprocess)
+        manager, dsi = make()
+        tops = manager._copy_tops(dsi)
+        assert set(tops) == {CH, VOL} and tops.covered == {CH, VOL}
+        assert tops.inside == (DS, 'local')
+        with caplog.at_level(INFO, logger=LOGGER):
+            assert manager.create_snapshot(dsi) is not None
+        assert copy_errors(caplog) == [], 'no per-child ERROR (its `zfs rename <child>` remedy would be wrong)'
+        (msg,) = inside_errors(caplog, DS)
+        assert 'it carries a local org.zfsbackup:client_id or org.zfsbackup:source_dataset' in msg
+        assert manager._snapshot_copy_noted == set() and manager._snapshot_inside_copy_noted == {(DS, DS)}
+        assert world.snapshots_below(DS) == {DS: {NAME}}
+
+    def test_the_same_with_the_marker_inherited_from_above_with_mixed_origins(self, mock_subprocess, clock, caplog):
+        """`client_id` is inherited from `pool` (above `dsi`) and `source_dataset` from `pool/data` (`dsi` itself):
+        each origin is at or above `dsi`, so the child is covered whichever row `_copy_roots` kept."""
+        world = SnapWorld(mock_subprocess)
+        mixed = [(PROP_CLIENT_ID, 'h1', 'inherited from pool'), (PROP_SOURCE_DATASET, 'x', 'inherited from pool/data')]
+        world.add(DS, [(PROP_CLIENT_ID, 'h1', 'inherited from pool')]).add(CH, mixed)
+        manager, dsi = make()
+        tops = manager._copy_tops(dsi)
+        assert tops.covered == {CH}
+        with caplog.at_level(INFO, logger=LOGGER):
+            manager.create_snapshot(dsi)
+        assert copy_errors(caplog) == [] and len(inside_errors(caplog, DS)) == 1
+
+    @pytest.mark.parametrize('source', ['local', 'received'])
+    def test_a_child_with_a_marker_of_its_own_is_not_covered(self, mock_subprocess, clock, source):
+        world = SnapWorld(mock_subprocess)
+        world.add(DS, inherited('pool')).add(CH, [(PROP_CLIENT_ID, 'h1', source)]).add(VOL, inherited('pool'), 'volume')
+        manager, dsi = make()
+        tops = manager._copy_tops(dsi)
+        assert set(tops) == {CH, VOL} and tops.covered == {VOL}
+
+    @pytest.mark.parametrize('source, covered', [
+        ('inherited from pool', True),                      # above dsi
+        (f'inherited from {DS}', True),                     # dsi itself
+        (f'inherited from {CH}', False),                    # BELOW dsi: the marker does not come through dsi
+        (f'inherited from {DS}x', False),                   # a longer name that dsi is a prefix of
+        ('inherited from pool/dat', False),                 # a name prefix of dsi is not an ancestor
+        ('inherited from pool/other', False),               # a sibling's branch
+        ('inherited from ', False),                         # no origin printed
+        ('inherited', False),
+        ('local', False), ('received', False), (None, False),
+    ], ids=['above', 'itself', 'below', 'longer-name', 'prefix-of-dsi', 'sibling', 'no-origin', 'bare-inherited',
+            'local', 'received', 'none'])
+    def test_the_origin_unit(self, source, covered):
+        assert DatasetManager._inherited_from_at_or_above(source, DS) is covered
+
+    def test_an_origin_below_dsi_does_not_cover(self, mock_subprocess, clock, mocker):
+        """`_copy_roots` (patched: the world cannot say a child inherits from a dataset below `dsi` that is not
+        itself a top) answers an origin below `dsi` for a top: it is a copy of its own, announced per child."""
+        SnapWorld(mock_subprocess).add(DS).add(CH).add(VOL, ptype='volume')
+        manager, dsi = make()
+        mocker.patch.object(DatasetManager, '_copy_roots', return_value={
+            DS: 'inherited from pool', VOL: f'inherited from {CH}', CH: 'inherited from pool'})
+        tops = manager._copy_tops(dsi)
+        assert set(tops) == {CH, VOL} and tops.covered == {CH}
+
+
+class TestAnInsideDatasetNeverListsItsChildren:
+    """Item 2: when `dsi` itself has or inherits a marker, every descendant is a copy by inheritance, so the
+    answer is `dsi` alone and NOTHING is listed: a name below it that libzfseasy cannot represent can then never
+    force the fallback to `snapshot -r` into the copies."""
+
+    def world(self, mock_subprocess, *extra):
+        world = SnapWorld(mock_subprocess)
+        world.add(DS, inherited('pool')).add(CH, inherited('pool')).add(VOL, inherited('pool'), ptype='volume')
+        for name in extra:
+            world.add(name, inherited('pool'))
+        return world
+
+    def test_an_unrepresentable_child_name_costs_nothing(self, mock_subprocess, clock, caplog):
+        world = self.world(mock_subprocess, DS + '/' + BAD)
+        manager, dsi = make()
+        with caplog.at_level(DEBUG, logger=LOGGER):
+            assert manager.create_snapshot(dsi) is not None
+        assert world.listings() == [], 'not even the recursive listing'
+        assert world.commands_of('snapshot') == [['snapshot', f'{DS}@{NAME}']], 'the dataset alone, no `-r`'
+        assert fallback_errors(caplog) == [] and manager._snapshot_fallback_noted == set()
+        assert world.snapshots_below(DS) == {DS: {NAME}}
+        assert manager.last_snapshot_error is None
+
+    def test_the_sources_unit_returns_the_dataset_alone_without_a_call(self, mock_subprocess, clock):
+        world = self.world(mock_subprocess)
+        manager, dsi = make()
+        tops = manager._copy_tops(dsi)
+        before = len(world.argvs)
+        assert [d.name for d in manager._snapshot_sources(dsi, tops)] == [DS]
+        assert len(world.argvs) == before
+
+    def test_a_dataset_that_is_not_inside_still_lists(self, world, clock):
+        manager, dsi = make()
+        manager.create_snapshot(dsi)
+        assert len(world.listings(recursive=True)) == 1
+
+
+class TestInsideAReceiveTargetNeverFallsBackToSnapshotR:
+    """Item 2: `dsi` at or below a receive target is refused from the configuration alone, BEFORE any zfs read, so
+    a failing read can never end in `snapshot -r` inside a target. (The fallback is for reads that fail on a
+    dataset that is NOT in a target.)"""
+
+    @pytest.mark.parametrize('what, fail', [
+        ('the copy read', lambda argv: argv[0] == 'get'),
+        ('the exists check', lambda argv: argv[:2] == ['list', '-H'] and argv[-1] == 'bk/x'),
+        ('every zfs call', lambda argv: True),
+    ])
+    def test_no_snapshot_command_whatever_fails(self, mock_subprocess, clock, caplog, what, fail):
+        world = SnapWorld(mock_subprocess)
+        world.add('bk').add('bk/x').add('bk/x/c')
+        world.fail(fail, 'cannot open: pool I/O is currently suspended')
+        manager, dsi = make('bk/x', targets=['bk'])
+        with caplog.at_level(DEBUG, logger=LOGGER):
+            assert manager.create_snapshot(dsi) is None
+        assert world.argvs == [], f'{what} is never reached'
+        assert world.commands_of('snapshot') == [] and world.created == []
+        assert fallback_errors(caplog) == [] and manager._snapshot_fallback_noted == set()
+        assert 'bk/x is itself inside a backup copy' in manager.last_snapshot_error
+
+    def test_copy_tops_at_a_target_does_not_read_the_markers_but_checks_existence(self, mock_subprocess, clock):
+        """The pruner's side (`_copy_tops` is shared): `dsi` is the top, the marker read is skipped, and the one
+        existence check of the top remains."""
+        world = SnapWorld(mock_subprocess)
+        world.add('bk').add('bk/x')
+        manager, dsi = make('bk/x', targets=['bk'])
+        tops = manager._copy_tops(dsi)
+        assert list(tops) == ['bk/x'] and 'receive target bk' in tops['bk/x']
+        assert tops.inside is None and tops.covered == frozenset()
+        assert world.verbs('get') == [] and len(world.verbs('list')) == 1
+
+    def test_copy_tops_at_a_target_whose_existence_check_fails_raises(self, mock_subprocess, clock):
+        world = SnapWorld(mock_subprocess)
+        world.add('bk').add('bk/x')
+        world.fail(lambda argv: argv[0] == 'list', 'cannot open: pool I/O is currently suspended')
+        manager, dsi = make('bk/x', targets=['bk'])
+        with pytest.raises(RuntimeError, match='cannot check whether bk/x, which receives copies, exists below bk/x'):
+            manager._copy_tops(dsi)
+
+    def test_copy_tops_at_a_target_that_does_not_exist_holds_nothing(self, mock_subprocess, clock):
+        SnapWorld(mock_subprocess)
+        manager, dsi = make('bk/x', targets=['bk'])
+        assert dict(manager._copy_tops(dsi)) == {}
+
+    @pytest.mark.parametrize('name, expected', [
+        ('bk', ('bk', 'bk is itself at or below the receive target bk, so everything below it is a copy')),
+        ('bk/x/y', ('bk', 'bk/x/y is itself at or below the receive target bk, so everything below it is a copy')),
+        ('bkx', None), ('pool/bk', None), ('b', None),
+    ])
+    def test_the_target_of_unit_is_config_only(self, mock_subprocess, clock, name, expected):
+        world = SnapWorld(mock_subprocess)
+        manager, _ = make(targets=['bk'])
+        assert manager._receive_target_of(name) == expected
+        assert world.argvs == []
+
+    def test_the_server_target_counts(self, mock_subprocess, clock):
+        world = SnapWorld(mock_subprocess)
+        manager, _ = make(server_target='srv/in')
+        assert manager._receive_target_of('srv/in/c1')[0] == 'srv/in'
+        assert manager._receive_target_of('srv/inx') is None and world.argvs == []
+
+
+class TestPublicCopyTops:
+    """`DatasetManager.copy_tops(config)`: the public form of `_copy_tops` (for the CLI), which builds the
+    `DatasetInfo` itself. Real `SnapWorld` cases: the same mapping, the same `.inside` and `.covered`."""
+
+    @staticmethod
+    def both(manager, dsi):
+        public = manager.copy_tops(dsi.config)
+        private = manager._copy_tops(dsi)
+        assert dict(public) == dict(private)
+        assert public.inside == private.inside and public.covered == private.covered
+        return public
+
+    def test_a_marked_copy_below(self, world, clock):
+        manager, dsi = make()
+        tops = self.both(manager, dsi)
+        assert list(tops) == [COPY] and PROP_CLIENT_ID in tops[COPY]
+        assert tops.inside is None and tops.covered == frozenset()
+
+    def test_an_inherited_marker_on_the_dataset(self, mock_subprocess, clock):
+        world = SnapWorld(mock_subprocess)
+        world.add(DS, inherited('pool')).add(CH, inherited('pool')).add(VOL, inherited('pool'), ptype='volume')
+        manager, dsi = make()
+        tops = self.both(manager, dsi)
+        assert set(tops) == {CH, VOL} and tops.covered == {CH, VOL}
+        assert tops.inside == ('pool', 'inherited from pool')
+
+    def test_a_receive_target_below(self, mock_subprocess, clock):
+        world = SnapWorld(mock_subprocess)
+        world.add(DS).add(CH).add(COPY)
+        manager, dsi = make(targets=[COPY])
+        tops = self.both(manager, dsi)
+        assert list(tops) == [COPY] and f'receive target {COPY}' in tops[COPY]
+
+    def test_it_builds_a_dataset_info_that_matches_the_config(self, world, clock, mocker):
+        manager, dsi = make()
+        spy = mocker.patch.object(manager, '_copy_tops', return_value={})
+        manager.copy_tops(dsi.config)
+        (arg,) = spy.call_args.args
+        assert arg.name == DS and arg.config is dsi.config and arg.dataset.name == DS
+
+    def test_a_failed_read_raises(self, world, clock):
+        world.fail(lambda argv: argv[0] == 'get', 'cannot open: pool I/O is currently suspended')
+        manager, dsi = make()
+        with pytest.raises(RuntimeError, match=f'at or below {DS}'):
+            manager.copy_tops(dsi.config)
 
 
 class TestSnapshotNote:
@@ -1290,42 +1534,65 @@ class TestKeyboardInterrupt:
 
 
 class TestCollision:
-    def test_a_name_that_exists_in_one_source_fails_the_whole_cycle_and_creates_nothing(
+    """A2e review follow-up: a configured child that already holds `@N` (the period boundary fell between two
+    datasets' turns) no longer fails the tree's command for good. The command is retried ONCE, atomically,
+    over the sources that do not hold the name (`_run_tree_command`). The full matrix is in
+    `test_zfsbackup_snapshot_ride.py::TestTheBoundaryRetry`."""
+
+    def test_a_name_that_exists_in_one_source_is_retried_without_it_and_the_rest_is_snapshotted(
             self, world, clock, caplog):
         world.add_snap(CH, NAME)                         # one child already has the name
         manager, dsi = make()
         with caplog.at_level(INFO, logger=LOGGER):
-            assert manager.create_snapshot(dsi) is None
-        assert 'already exists' in manager.last_snapshot_error and 'no snapshots were created' in manager.last_snapshot_error
-        assert world.commands_of('snapshot') == [['snapshot', f'{DS}@{NAME}', f'{CH}@{NAME}', f'{GC}@{NAME}', f'{VOL}@{NAME}']]
-        assert world.created == [] and world.names_of(DS) == set() and world.snapshots_below(COPY) == {}
+            assert manager.create_snapshot(dsi) is not None
+        assert manager.last_snapshot_error is None
+        failed = [a for a in world.argvs if a[0] == 'snapshot']
+        assert failed == [
+            ['snapshot', f'{DS}@{NAME}', f'{CH}@{NAME}', f'{GC}@{NAME}', f'{VOL}@{NAME}'],
+            ['snapshot', f'{DS}@{NAME}', f'{GC}@{NAME}', f'{VOL}@{NAME}'],
+        ], 'the atomic command, then ONE retry without the holder'
+        assert world.commands_of('snapshot') == failed, '(`commands` records a refused command too)'
+        assert [(d, s) for d, s, _ in world.created] == [(DS, NAME), (GC, NAME), (VOL, NAME)]
+        assert world.names_of(CH) == {NAME}, 'the holder keeps its one snapshot'
+        assert world.snapshots_below(COPY) == {}, 'nothing in the copy'
         assert fallback_errors(caplog) == [], 'a zfs failure is not "cannot tell the copies apart"'
-        assert copy_errors(caplog) == [], 'the copy error follows a successful snapshot'
-        assert len(errors(caplog, f'Failed to create snapshot {DS}@{NAME}')) == 1
+        assert errors(caplog, 'Failed to create snapshot') == []
+        assert len(copy_errors(caplog)) == 1, 'the copy error follows the successful snapshot'
+        assert manager._tree_snapshots[DS] == (NAME, frozenset({DS, GC, VOL})), 'the holder is not covered'
 
     def test_a_failure_of_many_never_retries_with_dash_r(self, world, clock):
         world.add_snap(GC, NAME)
         manager, dsi = make()
         manager.create_snapshot(dsi)
         assert all(a[1] != '-r' for a in world.commands_of('snapshot'))
+        assert all(a[1] != '-r' for a in world.argvs if a[0] == 'snapshot')
 
-    def test_the_next_cycle_after_a_collision_logs_the_copy_error_then(self, world, clock, caplog):
+    def test_the_next_cycle_after_a_collision_is_an_ordinary_one_and_the_copy_error_is_logged_once(
+            self, world, clock, caplog):
         world.add_snap(CH, NAME)
         manager, dsi = make()
         with caplog.at_level(INFO, logger=LOGGER):
-            assert manager.create_snapshot(dsi) is None
+            assert manager.create_snapshot(dsi) is not None
             next_cycle(clock)
             assert manager.create_snapshot(dsi) is not None
         assert len(copy_errors(caplog)) == 1
         assert world.snapshots_below(COPY) == {}
+        later = at(clock)
+        assert all(later in world.names_of(d) for d in (DS, CH, GC, VOL)), 'the whole tree, in one command'
+        assert world.commands_of('snapshot')[-1] == [
+            'snapshot', f'{DS}@{later}', f'{CH}@{later}', f'{GC}@{later}', f'{VOL}@{later}']
 
-    def test_the_same_failure_without_a_copy_is_what_snapshot_r_does(self, mock_subprocess, clock):
+    def test_the_same_collision_without_a_copy_snapshot_r_is_retried_without_the_holder(
+            self, mock_subprocess, clock):
         world = build_world(mock_subprocess, copy=False)
         world.add_snap(CH, NAME)
         manager, dsi = make()
-        assert manager.create_snapshot(dsi) is None
-        assert world.commands_of('snapshot') == [['snapshot', '-r', f'{DS}@{NAME}']] and world.created == []
-        assert 'already exists' in manager.last_snapshot_error
+        assert manager.create_snapshot(dsi) is not None
+        assert [a for a in world.argvs if a[0] == 'snapshot'][0] == ['snapshot', '-r', f'{DS}@{NAME}']
+        assert world.commands_of('snapshot')[-1] == ['snapshot', f'{DS}@{NAME}', f'{GC}@{NAME}', f'{VOL}@{NAME}']
+        assert len(world.commands_of('snapshot')) == 2
+        assert world.names_of(CH) == {NAME} and all(NAME in world.names_of(d) for d in (DS, GC, VOL))
+        assert manager.last_snapshot_error is None
 
     def test_a_dataset_whose_own_name_exists_collides_in_the_one_command_too(self, world, clock):
         world.add_snap(DS, NAME)
@@ -1373,6 +1640,35 @@ class TestCopyEpisodes:
                 next_cycle(clock)
                 manager.create_snapshot(dsi)
         assert len(records(caplog, INFO, 'is gone')) == 1
+
+    def test_a_copy_that_becomes_covered_is_not_gone_and_leaves_its_episode_silently(self, world, clock, caplog):
+        """Item 4: the dataset itself now carries/inherits the marker, so the copy is covered by the dataset-level
+        message: the per-copy episode ends WITHOUT the "is gone" INFO (the copy is right there)."""
+        manager, dsi = make()
+        with caplog.at_level(INFO, logger=LOGGER):
+            manager.create_snapshot(dsi)
+            assert manager._snapshot_copy_noted == {(DS, COPY)}
+            for name in (DS, CH, GC, VOL, COPY, COPY + '/h1', COPY + '/h1/pool'):
+                world.set_props(name, inherited('pool'))
+            next_cycle(clock)
+            manager.create_snapshot(dsi)
+        assert records(caplog, INFO, 'is gone') == []
+        assert manager._snapshot_copy_noted == set() and manager._snapshot_inside_copy_noted == {(DS, 'pool')}
+        assert len(copy_errors(caplog)) == 1 and len(inside_errors(caplog, DS)) == 1
+
+    def test_a_copy_that_is_really_gone_is_the_info_even_when_the_dataset_inherits_a_marker(
+            self, world, clock, caplog):
+        manager, dsi = make()
+        with caplog.at_level(INFO, logger=LOGGER):
+            manager.create_snapshot(dsi)
+            for name in (COPY, COPY + '/h1', COPY + '/h1/pool'):
+                world.drop(name)
+            for name in (DS, CH, GC, VOL):
+                world.set_props(name, inherited('pool'))
+            next_cycle(clock)
+            manager.create_snapshot(dsi)
+        assert len(records(caplog, INFO, f'{COPY}, a backup copy below {DS}, is gone')) == 1
+        assert manager._snapshot_copy_noted == set()
 
     def test_a_copy_that_comes_back_is_a_new_episode(self, world, clock, caplog):
         manager, dsi = make()

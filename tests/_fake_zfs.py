@@ -8,6 +8,8 @@ JSON file.
     $FAKEZFS_SLOW_INHERIT  seconds an `inherit` sleeps before acting, after appending a line
                      to $FAKEZFS_MARKER (lets a test act mid-inherit)
     $FAKEZFS_SLOW_SET      the same for `set`
+    $FAKEZFS_SLOW_READ  JSON ``{dataset or "*": seconds}``: a `list`/`get` of that dataset sleeps that long (after
+                     being logged, before it answers), for the timeout tests of the CLI's backup-copy check
     $FAKEZFS_FAIL    optional JSON list of ``[subcommand, dataset]`` or
                      ``[subcommand, dataset, property]`` rules (for ``list``/``get`` the third item is ``-r`` to fail only
                      the recursive call); a matching call fails with a message on stderr and exit 1
@@ -87,6 +89,15 @@ for rule in json.loads(os.environ.get("FAKEZFS_FAIL", "[]")):
     ):
         sys.stderr.write(f"fake zfs: {command} {name} failed on purpose\n")
         sys.exit(1)
+
+slow = json.loads(os.environ.get("FAKEZFS_SLOW_READ") or "{}")
+if command in ("list", "get") and slow:
+    import time
+
+    delay = slow.get(name, slow.get("*"))
+    if delay:
+        time.sleep(float(delay))
+
 
 def _value(raw):
     return raw["value"] if isinstance(raw, dict) else raw

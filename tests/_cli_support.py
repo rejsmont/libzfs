@@ -219,11 +219,14 @@ def write_yaml(directory: Path, text: str, name: str = "in.yaml") -> Path:
     return path
 
 
-def make_db(run: Cli, database: Path, text: str = RICH_YAML, *, name: str = "in.yaml") -> Path:
-    """Import `text` into a new database at `database`."""
+def make_db(
+    run: Cli, database: Path, text: str = RICH_YAML, *, name: str = "in.yaml", force: bool = False
+) -> Path:
+    """Import `text` into a new database at `database` (`force`: `import --force`, for a fixture that
+    plants backup copies below a recursive dataset BEFORE the import, which the import refuses)."""
     # `db` lives in tmp_path/cfg/, which the import creates: write the source beside it.
     source = write_yaml(database.parent.parent, text, name)
-    result = run("import", source, "-c", database)
+    result = run("import", source, "-c", database, *(["--force"] if force else []))
     assert result.exit_code == 0, result.stderr
     return database
 
@@ -333,6 +336,7 @@ class FakeZfs:
         )
         self.wrapper.chmod(0o755)
         self._fail: list = []
+        self._slow: dict = {}
 
     def env(self) -> dict:
         return {
@@ -341,6 +345,7 @@ class FakeZfs:
             "FAKEZFS_STATE": str(self.state_path),
             "FAKEZFS_LOG": str(self.log_path),
             "FAKEZFS_FAIL": json.dumps(self._fail),
+            "FAKEZFS_SLOW_READ": json.dumps(self._slow),
         }
 
     def add(self, name: str, props: dict = None) -> "FakeZfs":
@@ -395,6 +400,18 @@ class FakeZfs:
     @property
     def calls(self) -> list:
         return [json.loads(line) for line in self.log_path.read_text().splitlines()]
+
+    def clear_calls(self) -> "FakeZfs":
+        """Forget the calls so far (a fixture's `import` of a recursive dataset now looks at ZFS)."""
+        self.log_path.write_text("")
+        return self
+
+    def slow_read(self, seconds: float, dataset: str = "*") -> "FakeZfs":
+        """Every `list`/`get` of `dataset` (`*`: any) sleeps `seconds` after it is logged (a hung
+        pool, for the timeouts of the backup-copy check)."""
+        self._slow[dataset] = seconds
+        self._monkeypatch.setenv("FAKEZFS_SLOW_READ", json.dumps(self._slow))
+        return self
 
     def calls_of(self, *commands: str) -> list:
         return [c for c in self.calls if c and c[0] in commands]

@@ -2572,7 +2572,9 @@ class TestStaleAnchorSameCertificateLead:
 
 
 class TestStaleAnchorUrlNormalisation:
-    """`_anchor_url`: a `zfs:` target without surrounding blanks or a trailing `/` is the same dataset."""
+    """`_anchor_url` is `url.strip()` and nothing else: surrounding blanks are no change (the model strips
+    them too), a trailing `/` IS a change (such a URL fails the dataset-name grammar, so it is refused by
+    `validate_config` right after these warnings; treating it as "the same dataset" would only hide that)."""
 
     @pytest.fixture
     def config(self, tmp_path) -> BackupConfig:
@@ -2583,15 +2585,44 @@ class TestStaleAnchorUrlNormalisation:
 
         return dotpath.stale_anchor_warnings(name, Destination(url=old), Destination(url=new), config)
 
+    def change(self, old, new, name="loc2"):
+        from zfsbackup.config import Destination
+
+        return dotpath.destination_change_warnings(
+            name, Destination(url=old), Destination(url=new), "host-1"
+        )
+
+    BLANKS = [
+        ("zfs:backup/two", " zfs:backup/two "),
+        (" zfs:backup/two ", "zfs:backup/two"),
+        ("  zfs:backup/two", "zfs:backup/two\t"),
+        (" zfs:backup/two ", " zfs:backup/two "),
+    ]
+
+    @pytest.mark.parametrize("old, new", BLANKS)
+    def test_a_blanks_only_difference_gives_no_stale_anchor_warning(self, config, old, new):
+        assert self.warn(config, old, new) == []
+
+    @pytest.mark.parametrize("old, new", BLANKS)
+    def test_a_blanks_only_difference_gives_no_destination_change_warning(self, old, new):
+        assert self.change(old, new) == []
+
+    def test_a_blanks_only_difference_on_a_server_url_gives_no_stale_warning(self, config):
+        assert self.warn(config, "https://offsite:8080", " https://offsite:8080 ", name="offsite") == []
+
     @pytest.mark.parametrize("old, new", [
         ("zfs:backup/two", "zfs:backup/two/"),
         ("zfs:backup/two/", "zfs:backup/two"),
-        ("zfs:backup/two/", "zfs:backup/two/"),
-        ("zfs:backup/two", " zfs:backup/two "),
-        (" zfs:backup/two/ ", "zfs:backup/two"),
     ])
-    def test_a_blank_or_trailing_slash_difference_gives_no_warning(self, config, old, new):
-        assert self.warn(config, old, new) == []
+    def test_a_trailing_slash_is_a_difference_and_is_not_hidden(self, config, old, new):
+        (message,) = self.warn(config, old, new)
+        assert message.startswith("destinations[loc2] now points to a different place")
+        (change,) = self.change(old, new)
+        assert change.startswith("destinations[loc2] changes its local target")
+
+    def test_the_same_trailing_slash_on_both_sides_is_no_change(self, config):
+        assert self.warn(config, "zfs:backup/two/", "zfs:backup/two/") == []
+        assert self.change("zfs:backup/two/", "zfs:backup/two/") == []
 
     def test_a_real_target_change_still_warns_whatever_the_decoration(self, config):
         for old, new in [
@@ -2610,16 +2641,18 @@ class TestStaleAnchorUrlNormalisation:
     def test_a_zfs_url_with_a_trailing_slash_against_a_server_url_warns(self, config):
         assert len(self.warn(config, "zfs:backup/two/", "https://x:1")) == 1
 
-    def test_the_prefix_is_matched_exactly(self):
+    def test_anchor_url_strips_blanks_and_nothing_else(self):
         assert dotpath._anchor_url("ZFS:tank/x/") == "ZFS:tank/x/"
-        assert dotpath._anchor_url("zfs:tank/x/ ") == "zfs:tank/x"
+        assert dotpath._anchor_url("zfs:tank/x/ ") == "zfs:tank/x/"
+        assert dotpath._anchor_url(" zfs:tank/x") == "zfs:tank/x"
         assert dotpath._anchor_url("https://h:1/") == "https://h:1/"
+        assert dotpath._anchor_url(" https://h:1/ ") == "https://h:1/"
 
-    def test_url_change_warnings_gives_no_stale_warning_for_a_decoration_only_change(self, config, tmp_path):
+    def test_url_change_warnings_gives_no_stale_warning_for_a_blanks_only_change(self, config, tmp_path):
         from zfsbackup.config import Destination
 
         new = BackupConfig.from_file(write_yaml(tmp_path, ANCHOR_WARN_YAML, "norm2.yaml"))
-        new.destinations["loc2"] = Destination(url="zfs:backup/two/")
+        new.destinations["loc2"] = Destination(url=" " + config.destinations["loc2"].url + " ")
         messages = dotpath.url_change_warnings(config, new, "host-1")
         assert not [m for m in messages if "now points to a different place" in m]
 

@@ -59,7 +59,7 @@ from multiprocessing.synchronize import Event
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from zfsbackup import health, logsetup, procident
-from zfsbackup.backup_manager import DatasetInfo, DatasetManager, PruneResult
+from zfsbackup.backup_manager import DatasetInfo, DatasetManager, PruneResult, SnapshotRide
 from zfsbackup.config import BackupConfig, shared_receive_target
 from zfsbackup.stopflag import STOP_POLL, ReloadEpoch, StopFlag
 from zfsbackup.version import CodeSignature, code_signature
@@ -856,8 +856,29 @@ class SnapshotWorker(BaseWorker):
                 exc_info=True,
             )
 
+    def _get_datasets(self, manager: DatasetManager) -> List[DatasetInfo]:
+        # Ancestors before descendants (by path depth; config order within a
+        # depth, `sorted` is stable), so that an enabled recursive dataset's
+        # `snapshot -r` runs before a configured child takes the same name
+        # first and makes it fail with "already exists" every period (A2e).
+        # The manager forgets what the previous cycle's recursive snapshots
+        # created: only one made in THIS cycle may count as a child's own.
+        begin = getattr(manager, 'begin_snapshot_cycle', None)
+        if callable(begin):
+            begin()
+        return sorted(super()._get_datasets(manager), key=lambda d: d.name.count('/'))
+
     def _process_dataset(self, manager: DatasetManager, dsi: DatasetInfo) -> None:
         logger = logging.getLogger(__name__)
+        # A2e: the snapshot this dataset would take for this period was just
+        # created over it by a recursive ancestor in this cycle. That is its
+        # own snapshot for the period: nothing to create, and a success on
+        # the record, not a failure or an "already exists" WARNING.
+        ridden = getattr(manager, 'ridden_snapshot', None)
+        ride = ridden(dsi) if callable(ridden) else None
+        if isinstance(ride, SnapshotRide):
+            self._record(health.KIND_SNAPSHOT, dsi.name, ok=True, detail=ride.snapshot)
+            return
         if manager.needs_snapshot(dsi):
             logger.info(f"Dataset {dsi.name} needs snapshot")
             created = manager.create_snapshot(dsi)

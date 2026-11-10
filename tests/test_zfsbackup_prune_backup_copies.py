@@ -550,6 +550,29 @@ class TestTheDatasetInsideACopyIsOneEpisode:
         assert len(inside_errors(caplog, DS)) == 1
         assert manager._copy_protect_noted == {(DS, CH)} and manager._copy_protect_inside_noted == {(DS, 'pool')}
 
+    def test_a_local_source_dataset_and_an_inherited_client_id_cover_the_children(self, prune_pool, caplog):
+        """Item 1: `dsi` carries a LOCAL `source_dataset` and INHERITS `client_id`; its children's rows read
+        `inherited from ...` for both. They are copies only by inheritance: no per-child ERROR (and no `zfs
+        rename <child>` advice), one dataset-level one."""
+        own = [(PROP_CLIENT_ID, 'h1', 'inherited from pool'), (PROP_SOURCE_DATASET, 'x', 'local')]
+        child = [(PROP_CLIENT_ID, 'h1', 'inherited from pool'), (PROP_SOURCE_DATASET, 'x', f'inherited from {DS}')]
+        manager, dsi, fresh, olds = self.make(prune_pool, props=own, child_props=child)
+        with caplog.at_level(INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert copy_errors(caplog) == [], 'the children are covered'
+        assert len(inside_errors(caplog, DS)) == 1
+        assert manager._copy_protect_noted == set() and manager._copy_protect_inside_noted == {(DS, DS)}
+        assert prune_pool.names_of(DS) == {fresh, *olds}, 'the held names stay'
+
+    def test_a_child_with_a_marker_of_its_own_is_still_a_copy_of_its_own_with_mixed_sources(
+            self, prune_pool, caplog):
+        own = [(PROP_CLIENT_ID, 'h1', 'inherited from pool'), (PROP_SOURCE_DATASET, 'x', 'local')]
+        manager, dsi, fresh, olds = self.make(prune_pool, props=own)
+        prune_pool.props[CH] = [(PROP_CLIENT_ID, 'h1', 'received')]
+        with caplog.at_level(INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+        assert [m.split(' is a backup copy')[0] for m in copy_errors(caplog)] == [CH]
+
     def test_a_childless_dataset_says_nothing(self, prune_pool, caplog):
         manager, dsi = prune_manager(DS, recursive=True)
         prune_pool.populate(DS, old=3)
@@ -560,7 +583,8 @@ class TestTheDatasetInsideACopyIsOneEpisode:
 
     def test_the_covered_children_leave_the_per_copy_memory_when_the_marker_arrives(self, prune_pool, caplog):
         """A child that was announced as a copy of its own and then ONLY inherits the dataset's marker is covered:
-        its per-copy episode ends (INFO `is gone`), the dataset-level one begins."""
+        its per-copy episode ends WITHOUT a word (it is not gone: the copy is still there, and the dataset-level
+        ERROR that begins speaks for it)."""
         manager, dsi, fresh, olds = build(prune_pool)
         add_copy(prune_pool, COPY, olds)
         with caplog.at_level(INFO, logger='zfsbackup.backup_manager'):
@@ -571,8 +595,21 @@ class TestTheDatasetInsideACopyIsOneEpisode:
             prune_pool.snaps[DS] = [fresh, *olds]
             manager.prune_snapshots(dsi)
         assert len(copy_errors(caplog, COPY)) == 1
-        assert len(records(caplog, INFO, f'{COPY}, a backup copy below {DS}, is gone')) == 1
+        assert records(caplog, INFO, 'is gone') == [], 'covered is not gone: no INFO'
         assert manager._copy_protect_noted == set() and manager._copy_protect_inside_noted == {(DS, 'pool')}
+        assert len(inside_errors(caplog, DS)) == 1
+
+    def test_a_copy_that_is_really_gone_is_still_an_info(self, prune_pool, caplog):
+        manager, dsi, fresh, olds = build(prune_pool)
+        add_copy(prune_pool, COPY, olds)
+        with caplog.at_level(INFO, logger='zfsbackup.backup_manager'):
+            manager.prune_snapshots(dsi)
+            assert manager._copy_protect_noted == {(DS, COPY)}
+            prune_pool.props[COPY] = []                      # no marker any more: the copy is just a dataset
+            prune_pool.snaps[DS] = [fresh, *olds]
+            manager.prune_snapshots(dsi)
+        assert len(records(caplog, INFO, f'{COPY}, a backup copy below {DS}, is gone')) == 1
+        assert manager._copy_protect_noted == set()
 
     def test_the_two_memories_of_the_pruner_and_the_snapshot_worker_are_separate(self, prune_pool, caplog):
         manager, dsi, fresh, olds = self.make(prune_pool)
@@ -1114,6 +1151,15 @@ class TestCopyTopsFromReceiveTargets:
         assert top == DS and 'itself at or below the receive target' in why
         assert exists_calls() == [DS]
 
+    def test_a_dataset_at_a_target_never_reads_the_markers(self, tree):
+        """Item 2: config only (the dataset is the top, everything below it is a copy), so a marker read that
+        would fail cannot make the pass skip the dataset: only the existence check of the top runs."""
+        pool, fresh, olds = tree
+        pool.copy_read_error = RuntimeError('pool I/O is currently suspended')
+        manager, dsi = targeted(local=['pool'])
+        assert list(manager._copy_tops(dsi)) == [DS]
+        assert pool.copy_reads == 0 and exists_calls() == [DS]
+
     def test_only_snapshots_strictly_below_the_dataset_are_protected_when_it_is_the_top(self, tree):
         pool, fresh, olds = tree
         pool.snaps[CH] = [olds[2]]                                  # the child holds one name; DS holds all
@@ -1137,7 +1183,11 @@ class TestTheCopyErrorCarriesTheRemedy:
     `<prefix>_*` snapshots its source does not have, which is exactly how a replica's history is lost.)"""
 
     def check(self, error, dataset, top):
-        assert f"zfs get -H -o name,value createtxg {dataset}@<name> {top}@<name>" in error
+        # Item 3: two commands, the second recursive over the copy, so it reaches every dataset below it (the old
+        # `<top>@<name>` read only the top's own snapshot).
+        assert (f"zfs get -H -o name,value createtxg {dataset}@<name>; zfs get -r -t snapshot -H -o "
+                f"name,value createtxg {top}, which covers every dataset below it") in error
+        assert f'{top}@<name>' not in error, 'the old, top-only check is gone'
         assert f'has the SAME createtxg as {dataset}@<name>' in error
         assert 'must never be destroyed' in error and 'received backup history' in error
         assert 'older versions' in error and "the snapshot worker's fallback" in error

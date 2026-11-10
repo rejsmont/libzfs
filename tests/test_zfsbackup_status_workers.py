@@ -33,7 +33,7 @@ import pytest
 
 import _status_workers
 from _prune_support import prune_manager, prune_pool, records  # noqa: F401  (fixture)
-from _snapshot_support import listed_snapshot
+from _snapshot_support import frozen_clock, listed_snapshot  # noqa: F401  (frozen_clock: fixture)
 from zfsbackup import daemonlock, health, workers as workers_module
 from zfsbackup.backup_manager import DatasetManager, PruneResult
 from zfsbackup.config import (
@@ -567,6 +567,84 @@ class TestSnapshotWorkerInsideACopy:
         assert bad.consecutive_failures == 3 and bad.last_success is None
         cmds = world.commands_of('snapshot')
         assert cmds and not any(t.startswith('bk') for a in cmds for t in a[1:])
+
+
+@pytest.mark.unit
+class TestSnapshotWorkerRide:
+    """A2e: a configured child listed BEFORE its enabled recursive parent. The real run loop, manager and status
+    file over a fake `zfs` (`_snapshot_world.SnapWorld`): the parent is snapshotted first, the child rides along
+    and its record is an ok one carrying the parent's snapshot name, never an error."""
+
+    def test_both_records_are_ok_every_cycle_and_the_tree_is_snapshotted_once(
+            self, run, sdir, mocker, mock_subprocess, frozen_clock):
+        from _snapshot_world import SnapWorld
+        world = SnapWorld(mock_subprocess)
+        world.add('pool/a').add('pool/a/c').add('pool/a/c/g')
+        config = BackupConfig(
+            datasets=[DatasetConfig(name='pool/a/c'), DatasetConfig(name='pool/a', recursive=True)],
+            snapshot_prefix='autosnap',
+        )
+        mocker.patch.object(SnapshotWorker, '_before_loop')
+        worker = snapshot_worker(sdir, config)
+        manager = DatasetManager(config)
+        name = 'autosnap_20261022100000'
+        run(worker, manager, cycles=2)               # the second cycle, in the same period, has nothing to do
+        recs = by_key(status(sdir))
+        assert (recs[('snapshot', 'pool/a', None)].result, recs[('snapshot', 'pool/a', None)].detail) == ('ok', name)
+        child = recs[('snapshot', 'pool/a/c', None)]
+        assert (child.result, child.detail, child.last_error, child.consecutive_failures) == ('ok', name, None, 0)
+        assert child.last_success is not None
+        assert world.commands_of('snapshot') == [['snapshot', '-r', f'pool/a@{name}']]
+        assert world.names_of('pool/a/c') == {name} and world.names_of('pool/a/c/g') == {name}
+
+
+@pytest.mark.unit
+class TestSnapshotWorkerBoundaryRetry:
+    """A2e review follow-up: a configured child already holds the parent's name for the period (the boundary fell
+    between their turns, or an earlier failure let the child snapshot itself). The parent's tree command is
+    retried once without the holder, and the status file says so: an ok parent record, nothing recorded for the
+    child that was not due, and an error naming both failures when the retry fails too."""
+
+    NAME = 'autosnap_20261022100000'
+
+    def build(self, run, sdir, mocker, mock_subprocess):
+        from _snapshot_world import SnapWorld
+        world = SnapWorld(mock_subprocess)
+        world.add('pool/a').add('pool/a/c').add('pool/a/c/g')
+        world.add_snap('pool/a/c', self.NAME)               # the child took it first
+        config = BackupConfig(
+            datasets=[DatasetConfig(name='pool/a/c'), DatasetConfig(name='pool/a', recursive=True)],
+            snapshot_prefix='autosnap',
+        )
+        mocker.patch.object(SnapshotWorker, '_before_loop')
+        return world, snapshot_worker(sdir, config), DatasetManager(config)
+
+    def test_the_parent_is_ok_and_the_holder_is_not_snapshotted_twice(
+            self, run, sdir, mocker, mock_subprocess, frozen_clock):
+        world, worker, manager = self.build(run, sdir, mocker, mock_subprocess)
+        run(worker, manager, cycles=2)
+        recs = by_key(status(sdir))
+        parent = recs[('snapshot', 'pool/a', None)]
+        assert (parent.result, parent.detail, parent.last_error, parent.consecutive_failures) == (
+            'ok', self.NAME, None, 0)
+        assert ('snapshot', 'pool/a/c', None) not in recs, 'not due: it holds the period\'s snapshot'
+        argvs = world.snapshot_argvs()
+        assert argvs == [['snapshot', '-r', f'pool/a@{self.NAME}'],
+                         ['snapshot', f'pool/a@{self.NAME}', f'pool/a/c/g@{self.NAME}']], 'refused, then retried'
+        for dataset in ('pool/a', 'pool/a/c', 'pool/a/c/g'):
+            assert world.names_of(dataset) == {self.NAME}
+
+    def test_a_failed_retry_is_an_error_record_naming_both_failures(
+            self, run, sdir, mocker, mock_subprocess, frozen_clock):
+        world, worker, manager = self.build(run, sdir, mocker, mock_subprocess)
+        world.fail(lambda a: a[0] == 'snapshot' and '-r' not in a and f'pool/a/c@{self.NAME}' not in a, 'out of space')
+        run(worker, manager)
+        parent = by_key(status(sdir))[('snapshot', 'pool/a', None)]
+        assert parent.result == 'error' and parent.consecutive_failures == 1
+        assert 'ut of space' in parent.last_error and 'retried once' in parent.last_error
+        assert 'already exists' in parent.last_error, 'the first attempt\'s failure is named too'
+        assert len(world.snapshot_argvs()) == 2
+        assert world.names_of('pool/a') == set()
 
 
 @pytest.mark.unit

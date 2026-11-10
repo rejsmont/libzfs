@@ -127,6 +127,19 @@ class SnapWorld(ZfsWorld):
     def commands_of(self, verb: str) -> List[List[str]]:
         return [a for v, a in self.commands if v == verb]
 
+    def snapshot_argvs(self) -> List[List[str]]:
+        """EVERY `zfs snapshot` argv run, refused ones included. (`commands` records a command the world refused
+        for a collision or a missing dataset, but NOT one an injected `fail`/`fail_once` made exit 1: those are
+        answered before the world sees them. Count attempts here.)"""
+        return [a for a in self.argvs if a[0] == 'snapshot']
+
+    def holder_listings(self) -> List[List[str]]:
+        """The name-only recursive snapshot listings (`zfs list -H -r -t snapshot -o name,type <ds>`) run so far:
+        what `_retry_without_holders` reads to find who already holds the name."""
+        return [a for a in self.argvs
+                if a[0] == 'list' and '-r' in a and '-t' in a and a[a.index('-t') + 1] == 'snapshot'
+                and a[a.index('-o') + 1] == 'name,type']
+
     def _below(self, dataset: str) -> List[str]:
         return [d for d in self.datasets if d.startswith(dataset + '/')]
 
@@ -228,17 +241,21 @@ class SnapWorld(ZfsWorld):
 
 def make_manager(name: str = 'pool/data', *, recursive: bool = True, dry_run: bool = False,
                  targets: Iterable[str] = (), server_target: Optional[str] = None,
-                 retention: bool = True, extra: Iterable[DatasetConfig] = ()):
+                 retention: bool = True, extra: Iterable[DatasetConfig] = (),
+                 first: Iterable[DatasetConfig] = (), frequency: Optional[timedelta] = None):
     """`(manager, dsi)` for `name`: hourly, retention interval 1h / keep 2h when `retention` (so every old
     snapshot is a candidate and the newest is kept), `targets` as `zfs:` destinations and `server_target` as the
-    enabled server's receive target. No `remote:` entries, so no anchor reads."""
+    enabled server's receive target. No `remote:` entries, so no anchor reads. `extra` are configured AFTER `name`
+    (config order), `first` BEFORE it (A2e: a child listed before its parent); `frequency` is `name`'s (hourly
+    by default)."""
     from zfsbackup.backup_manager import DatasetManager
     parent = DatasetConfig(
         name=name, recursive=recursive,
+        **({'frequency': frequency} if frequency is not None else {}),
         retention_rules=[RetentionRule(timedelta(hours=1), timedelta(hours=2))] if retention else [],
     )
     config = BackupConfig(
-        datasets=[parent, *extra], snapshot_prefix='autosnap', dry_run=dry_run,
+        datasets=[*first, parent, *extra], snapshot_prefix='autosnap', dry_run=dry_run,
         destinations={f'local{i}': Destination(url=f'zfs:{t}') for i, t in enumerate(targets)},
         remote_backup=RemoteServerConfig(target_dataset=server_target, enabled=True) if server_target else None,
     )

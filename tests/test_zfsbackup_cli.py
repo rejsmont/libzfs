@@ -125,6 +125,7 @@ from _cli_support import (
     FakeDaemon,
     UNVERIFIED_LINUX_ONLY,
     fake_daemon,
+    fake_zfs,
     host_client_id,
     live_daemon,
     seed_client_id,
@@ -879,6 +880,16 @@ class TestErrorMapping:
         assert cli_errors.format_error(ValueError(), None) == ["ValueError"]
 
 
+@pytest.fixture
+def pool(fake_zfs):
+    """A fake `zfs` whose world holds the POOL of `config.example.yaml`'s datasets (`libzfs_test`).
+    An import of that file has an enabled recursive dataset, so the backup-copy check (A2d) looks
+    at ZFS: against the hermetic stub (which answers "does not exist" to everything) it would warn
+    that the pool is not imported, ahead of the error line the tests below assert on. With the
+    pool present and the dataset absent the check is silent, as it is on a real host."""
+    return fake_zfs.add("libzfs_test")
+
+
 class TestErrorMappingThroughTheCli:
     """The same table, driven through real invocations with the importer stubbed
     to raise: what the operator sees and what the shell sees."""
@@ -942,7 +953,7 @@ class TestErrorMappingThroughTheCli:
         assert "internal error" in result.stderr
         assert "damaged" not in result.stderr and "Traceback" not in result.stderr
 
-    def test_schema_error_is_78(self, run, db, failing_import):
+    def test_schema_error_is_78(self, run, db, failing_import, pool):
         failing_import(SchemaVersionMismatch("newer database"))
         result = run("import", EXAMPLE_YAML, "-c", db)
         assert result.exit_code == 78
@@ -986,7 +997,7 @@ class TestErrorMappingThroughTheCli:
         assert result.exit_code == 130
         assert "Traceback" not in result.stderr
 
-    def test_notes_are_printed_after_the_message(self, run, db, failing_import):
+    def test_notes_are_printed_after_the_message(self, run, db, failing_import, pool):
         exc = ValueError("bad value")
         exc.add_note("cleanup skipped: the file at X was left in place")
         failing_import(exc)
@@ -1428,16 +1439,20 @@ class TestImport:
 
     # ---- unreadable outgoing configuration --------------------------------
 
-    def test_unreadable_outgoing_is_refused_with_a_note_naming_no_backup(self, run, db):
+    def test_unreadable_outgoing_is_refused_with_a_note_naming_no_backup(self, run, db, pool):
         import_ok(run, db)
         empty_stored_config(db)
         before = digest(db)
         result = run("import", TEST_YAML, "-c", db)
         assert result.exit_code == 1
         lines = stderr_lines(result)
-        assert "cannot be read" in lines[0]
-        assert "No datasets configured" in lines[0]
-        assert any("--no-backup" in line for line in lines[1:])
+        # the backup-copy check (A2d) could not read the outgoing configuration either, and says what
+        # that costs; then the importer's refusal, as before
+        assert lines[0].startswith("warning: the stored configuration could not be read (")
+        assert "were not checked for backup copies left below a recursive dataset" in lines[0]
+        assert "cannot be read" in lines[1]
+        assert "No datasets configured" in lines[1]
+        assert any("--no-backup" in line for line in lines[2:])
         assert backups(db) == []
         assert digest(db) == before
         assert sidecars(db) == []
@@ -1516,7 +1531,7 @@ class TestImportOntoOrphanedSidecars:
         assert orphan.read_bytes() == b"orphaned pages"
         assert "Traceback" not in result.stderr
 
-    def test_message_names_every_orphan_and_the_way_out(self, run, db):
+    def test_message_names_every_orphan_and_the_way_out(self, run, db, pool):
         db.parent.mkdir(parents=True)
         for suffix in ("-wal", "-shm"):
             db.with_name(db.name + suffix).write_bytes(b"x")
@@ -2240,7 +2255,7 @@ class TestInterruptedImport:
 
         return install
 
-    def test_exit_130_prints_the_notes_and_does_not_assert_an_outcome(self, run, db, interrupted):
+    def test_exit_130_prints_the_notes_and_does_not_assert_an_outcome(self, run, db, interrupted, pool):
         interrupted("a note from the store")
         result = run("import", EXAMPLE_YAML, "-c", db)
         assert result.exit_code == 130
@@ -4220,7 +4235,11 @@ class TestSigtermInARealProcess:
     ):
         code, _, err = self._run(tmp_path, "block_import", "import", EXAMPLE_YAML, "-c", db)
         assert code == 143, err
-        first = [l for l in err.splitlines() if l][0]
+        # The driver has no `zfs` at all (`ZFS_CMD` scrubbed), so the import's backup-copy check
+        # (A2d) warns first that it could not look; the line under test is the first one after it.
+        lines = [l for l in err.splitlines() if l]
+        assert lines[0].startswith("warning: could not check whether this change leaves a backup copy")
+        first = lines[1]
         assert first.startswith("terminated -- the import may or may not have been applied; run ")
         assert "interrupted" not in err
         assert err.count("may or may not have been applied") == 1

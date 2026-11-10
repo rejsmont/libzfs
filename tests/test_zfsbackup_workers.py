@@ -1550,17 +1550,95 @@ class TestRemoteWorkerDatasetOrder:
         worker._remote_manager.begin_cycle.assert_called_once_with()
 
 
-class TestOtherWorkersKeepConfigOrder:
+class TestSnapshotWorkerIsDepthSortedOthersKeepConfigOrder:
     NAMES = ('tank/p/c', 'tank/p', 'tank/q/r', 'tank/q')
 
-    def test_the_snapshot_worker(self, worker_config):
+    def test_the_snapshot_worker_puts_ancestors_first_and_keeps_config_order_within_a_depth(self, worker_config):
+        """A2e: a depth sort (stable), so an enabled recursive parent snapshots before its configured child."""
         manager = MagicMock(datasets=_named(*self.NAMES))
         result = SnapshotWorker(worker_config, multiprocessing.Event())._get_datasets(manager)
-        assert [d.name for d in result] == list(self.NAMES)
+        assert [d.name for d in result] == ['tank/p', 'tank/q', 'tank/p/c', 'tank/q/r']
 
-    def test_the_pruning_worker(self, worker_config):
+    def test_the_pruning_worker_keeps_config_order(self, worker_config):
         received = _named('tank/backups/c1/z/y', 'tank/backups/c1/z')
         manager = MagicMock(datasets=_named(*self.NAMES))
         manager.received_datasets.return_value = received
         result = PruningWorker(worker_config, multiprocessing.Event())._get_datasets(manager)
         assert [d.name for d in result] == list(self.NAMES) + [d.name for d in received]
+
+
+class TestSnapshotWorkerOrderAndRide:
+    """A2e on the worker's side, over a mocked manager: `_get_datasets` depth-sorts (stable) and starts the
+    manager's cycle; `_process_dataset` records a ride as a success and creates nothing. The real manager over a fake
+    `zfs` is `test_zfsbackup_snapshot_ride.py`."""
+
+    @staticmethod
+    def worker(worker_config):
+        worker = SnapshotWorker(worker_config, multiprocessing.Event())
+        worker._record = MagicMock()
+        return worker
+
+    @staticmethod
+    def order(worker, *names):
+        manager = MagicMock(datasets=_named(*names))
+        return [d.name for d in worker._get_datasets(manager)], manager
+
+    def test_a_child_listed_before_its_parent_is_processed_after_it(self, worker_config):
+        names, _ = self.order(self.worker(worker_config), 'tank/data/child', 'tank/data')
+        assert names == ['tank/data', 'tank/data/child']
+
+    def test_equal_depth_keeps_config_order_and_mixed_depths_sort_by_depth(self, worker_config):
+        worker = self.worker(worker_config)
+        assert self.order(worker, 'tank/c', 'tank/a', 'tank/b')[0] == ['tank/c', 'tank/a', 'tank/b']
+        assert self.order(worker, 'tank/x/y', 'tank/b', 'tank/x', 'tank/a/c', 'tank/a')[0] == [
+            'tank/b', 'tank/x', 'tank/a', 'tank/x/y', 'tank/a/c']
+
+    def test_the_config_list_itself_is_not_reordered(self, worker_config):
+        manager = MagicMock(datasets=_named('tank/p/c', 'tank/p'))
+        before = list(manager.datasets)
+        self.worker(worker_config)._get_datasets(manager)
+        assert manager.datasets == before
+
+    def test_the_managers_cycle_begins_once_per_call_before_anything_is_processed(self, worker_config):
+        worker = self.worker(worker_config)
+        _, manager = self.order(worker, 'tank/a/b', 'tank/a')
+        manager.begin_snapshot_cycle.assert_called_once_with()
+        manager.needs_snapshot.assert_not_called()
+
+    def test_a_manager_without_the_hooks_still_works(self, worker_config):
+        """A stand-in manager (an older test double) has neither `begin_snapshot_cycle` nor `ridden_snapshot`."""
+        worker = self.worker(worker_config)
+        manager = MagicMock(spec=['datasets', 'needs_snapshot', 'create_snapshot', 'last_snapshot_note',
+                                  'last_snapshot_error'])
+        manager.datasets = _named('tank/p/c', 'tank/p')
+        assert [d.name for d in worker._get_datasets(manager)] == ['tank/p', 'tank/p/c']
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_1')
+        manager.last_snapshot_note = None
+        worker._process_dataset(manager, manager.datasets[1])      # tank/p
+        manager.create_snapshot.assert_called_once()
+        worker._record.assert_called_once_with('snapshot', 'tank/p', ok=True, detail='autosnap_1')
+
+    def test_a_ride_is_an_ok_record_with_the_name_and_creates_nothing(self, worker_config):
+        from zfsbackup.backup_manager import SnapshotRide
+        worker = self.worker(worker_config)
+        manager = MagicMock()
+        manager.ridden_snapshot.return_value = SnapshotRide('autosnap_20261022100000', 'tank/p')
+        dsi = _named('tank/p/c')[0]
+        worker._process_dataset(manager, dsi)
+        manager.ridden_snapshot.assert_called_once_with(dsi)
+        worker._record.assert_called_once_with('snapshot', 'tank/p/c', ok=True, detail='autosnap_20261022100000')
+        manager.needs_snapshot.assert_not_called()
+        manager.create_snapshot.assert_not_called()
+
+    @pytest.mark.parametrize('answer', [None, MagicMock(), 'autosnap_1', ('autosnap_1', 'tank/p')],
+                             ids=['none', 'a-mock', 'a-string', 'a-plain-tuple'])
+    def test_anything_but_a_ride_takes_the_normal_path(self, worker_config, answer):
+        """Only a `SnapshotRide` is a ride (a mocked manager's own `ridden_snapshot` answers a MagicMock)."""
+        worker = self.worker(worker_config)
+        manager = MagicMock()
+        manager.ridden_snapshot.return_value = answer
+        manager.needs_snapshot.return_value = False
+        worker._process_dataset(manager, _named('tank/p/c')[0])
+        manager.needs_snapshot.assert_called_once()
+        worker._record.assert_not_called()

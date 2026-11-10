@@ -71,7 +71,7 @@ import click
 import yaml
 
 from zfsbackup import daemonlock
-from zfsbackup.cli import backup, check as check_view, dotpath, editor, enroll, rename, status as status_view, trust
+from zfsbackup.cli import backup, check as check_view, copies, dotpath, editor, enroll, rename, status as status_view, trust
 from zfsbackup.cli.errors import BackupFailed, CliError, RetryLater, is_database_unusable, report
 from zfsbackup.cli.listing import render_datasets, render_destinations
 from zfsbackup.cli.render import render_yaml
@@ -340,6 +340,19 @@ def _common(func: Callable) -> Callable:
     return func
 
 
+_COPIES_FORCE = click.option(
+    "--force", is_flag=True, default=False,
+    help=(
+        "Write the change even if it would leave a backup copy below a recursive "
+        "dataset (a dataset made recursive that has copies below it, or a receive "
+        "target given up while its copies sit below a recursive dataset); the "
+        "refusal is printed as a warning instead. Not needed when ZFS cannot be "
+        "read: that only warns. (Unrelated to `rename --force`, `export --force` "
+        "and `identity set-client-id --force`.)"
+    ),
+)
+
+
 def _state(config_path: Optional[str], verbose: bool) -> State:
     state = click.get_current_context().find_object(State)
     if config_path:
@@ -558,11 +571,15 @@ _PRE_WRITE_ERRORS = (ValueError, TypeError, yaml.YAMLError, FileNotFoundError, C
         "replace a stored configuration that cannot be read."
     ),
 )
+@_COPIES_FORCE
 @_common
-def import_cmd(yaml_file: Path, no_backup: bool, config_path: Optional[str], verbose: bool) -> None:
+def import_cmd(
+    yaml_file: Path, no_backup: bool, force: bool, config_path: Optional[str], verbose: bool
+) -> None:
     state = _state(config_path, verbose)
     resolved = state.resolve()
     existed = _exists(resolved.resolved_path)
+    _check_import_copies(state, resolved, yaml_file, existed, force)
 
     # `import_yaml` logs its own "Replacing existing config store" warning
     # before the result is known; the warning below says the same thing and
@@ -640,6 +657,57 @@ def import_cmd(yaml_file: Path, no_backup: bool, config_path: Optional[str], ver
             click.echo(f"warning: {notice}", err=True)
         except OSError:
             pass
+
+
+def _check_import_copies(
+    state: "State", resolved: ResolvedConfigPath, yaml_file: Path, existed: bool, force: bool,
+) -> None:
+    """`copies.enforce_copies` for an import: the file's configuration against
+    the stored one, before anything is written. The file is parsed here and then
+    again by `import_yaml`, so only a REGULAR file is checked (a FIFO or
+    `/dev/stdin` can be read once; it is then not checked, with a warning). A file
+    that does not parse, or a stored configuration that cannot be read, is not
+    this check's business: `import_yaml` reports the first, and an unreadable
+    outgoing configuration counts as empty (every recursive dataset of the file
+    is then looked at, and no given-up target is, which one warning says). An import is a full replace
+    with no compare-and-swap, so unlike `set` a concurrent writer is not
+    detected between this look and the write."""
+    try:
+        regular = stat.S_ISREG(os.stat(yaml_file).st_mode)
+    except OSError:
+        return  # click already checked it exists; import_yaml will say more
+    if not regular:
+        state.warn(
+            f"{yaml_file} is not a regular file, so it was not checked for backup copies "
+            "below recursive datasets"
+        )
+        return
+    muted = state.handler is not None
+    if muted:
+        state.handler.muted = True  # import_yaml shows the file's warnings itself
+    try:
+        try:
+            new = BackupConfig.from_file(yaml_file)
+        except Exception:  # noqa: BLE001 - import_yaml reports a bad file
+            return
+        old: Optional[BackupConfig] = None
+        unreadable: Optional[str] = None
+        if existed:
+            try:
+                old = read_snapshot(resolved).config
+            except Exception as exc:  # noqa: BLE001 - treated as empty, said below
+                old = None
+                unreadable = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    finally:
+        if muted:
+            state.handler.muted = False
+    if unreadable is not None:
+        state.warn(
+            f"the stored configuration could not be read ({unreadable}), so receive targets "
+            "this import gives up were not checked for backup copies left below a recursive "
+            "dataset (only the recursive datasets of the file were looked at)"
+        )
+    copies.enforce_copies(old, new, force=force, warn=state.warn)
 
 
 def _client_id_after_import(
@@ -1240,6 +1308,7 @@ def _edit(
     state: State,
     path: str,
     apply: Callable[[BackupConfig, dotpath.Segs], "dotpath.Change"],
+    force: bool = False,
 ) -> None:
     """The shared flow of `set` and `unset`: snapshot, resolve, change in
     memory, validate, compare-and-swap write. The database is opened for
@@ -1267,6 +1336,10 @@ def _edit(
         click.echo(f"{dotpath.format_path(shown)} is {state_text}; nothing changed")
         return
 
+    # Before the write, outside the writer lock: the commit below is a
+    # compare-and-swap on the generation read above (see `copies`).
+    copies.enforce_copies(config, change.config, force=force, warn=state.warn)
+
     result = commit_config(resolved, snapshot, change.config, warn=state.warn, announce=False)
     # Request the reload BEFORE printing anything: a closed stdout must not
     # cost the signal.
@@ -1290,10 +1363,11 @@ def _edit(
 )
 @click.argument("path", metavar="PATH")
 @click.argument("value", metavar="VALUE")
+@_COPIES_FORCE
 @_common
-def set_cmd(path: str, value: str, config_path: Optional[str], verbose: bool) -> None:
+def set_cmd(path: str, value: str, force: bool, config_path: Optional[str], verbose: bool) -> None:
     state = _state(config_path, verbose)
-    _edit(state, path, lambda config, segs: dotpath.set_value(config, segs, value))
+    _edit(state, path, lambda config, segs: dotpath.set_value(config, segs, value), force)
 
 
 @cli.command(
@@ -1310,10 +1384,11 @@ def set_cmd(path: str, value: str, config_path: Optional[str], verbose: bool) ->
     ),
 )
 @click.argument("path", metavar="PATH")
+@_COPIES_FORCE
 @_common
-def unset_cmd(path: str, config_path: Optional[str], verbose: bool) -> None:
+def unset_cmd(path: str, force: bool, config_path: Optional[str], verbose: bool) -> None:
     state = _state(config_path, verbose)
-    _edit(state, path, dotpath.unset_value)
+    _edit(state, path, dotpath.unset_value, force)
 
 
 # --------------------------------------------------------------------------
@@ -1333,6 +1408,14 @@ _EDIT_OPTIONS = (
         help=(
             "Never prompt and do not require a terminal (for scripts and tests): "
             "a rejected buffer abandons the edit, exit 1, and is kept in a file."
+        ),
+    ),
+    click.option(
+        "--force", is_flag=True, default=False,
+        help=(
+            "Write the edit even if it would leave a backup copy below a recursive "
+            "dataset (checked against ZFS before the write; the refusal is printed as a "
+            "warning instead). Unrelated to `rename --force`."
         ),
     ),
 )
@@ -1371,30 +1454,30 @@ def _edit_options(func: Callable) -> Callable:
 @click.pass_context
 def edit_group(
     ctx: click.Context, allow_recreate: bool, editor_cmd: Optional[str], no_prompt: bool,
-    config_path: Optional[str], verbose: bool,
+    force: bool, config_path: Optional[str], verbose: bool,
 ) -> None:
     state = _state(config_path, verbose)
     if ctx.invoked_subcommand is not None:
         if allow_recreate:
             raise click.UsageError("--allow-recreate applies to the whole-config edit only")
-        ctx.meta[_EDIT_META] = (editor_cmd, no_prompt)
+        ctx.meta[_EDIT_META] = (editor_cmd, no_prompt, force)
         return
     resolved = state.resolve()
     snapshot = _read_with_baseline(state, resolved)
     editor.edit_config(
         resolved, snapshot,
         warn=state.warn, editor=editor_cmd,
-        allow_recreate=allow_recreate, prompt=not no_prompt,
+        allow_recreate=allow_recreate, prompt=not no_prompt, force=force,
     )
 
 
 def _entry_edit(
-    kind: str, name: str, editor_cmd: Optional[str], no_prompt: bool,
+    kind: str, name: str, editor_cmd: Optional[str], no_prompt: bool, force: bool,
     config_path: Optional[str], verbose: bool,
 ) -> None:
     state = _state(config_path, verbose)
-    inherited_editor, inherited_no_prompt = click.get_current_context().meta.get(
-        _EDIT_META, (None, False)
+    inherited_editor, inherited_no_prompt, inherited_force = click.get_current_context().meta.get(
+        _EDIT_META, (None, False, False)
     )
     resolved = state.resolve()
     snapshot = _read_with_baseline(state, resolved)
@@ -1403,6 +1486,7 @@ def _entry_edit(
         resolved, snapshot, name,
         warn=state.warn, editor=editor_cmd or inherited_editor,
         prompt=not (no_prompt or inherited_no_prompt),
+        force=force or inherited_force,
     )
 
 
@@ -1418,10 +1502,10 @@ def _entry_edit(
 @_edit_options
 @_common
 def edit_dataset_cmd(
-    name: str, editor_cmd: Optional[str], no_prompt: bool,
+    name: str, editor_cmd: Optional[str], no_prompt: bool, force: bool,
     config_path: Optional[str], verbose: bool,
 ) -> None:
-    _entry_edit("dataset", name, editor_cmd, no_prompt, config_path, verbose)
+    _entry_edit("dataset", name, editor_cmd, no_prompt, force, config_path, verbose)
 
 
 @edit_group.command(
@@ -1432,10 +1516,10 @@ def edit_dataset_cmd(
 @_edit_options
 @_common
 def edit_destination_cmd(
-    name: str, editor_cmd: Optional[str], no_prompt: bool,
+    name: str, editor_cmd: Optional[str], no_prompt: bool, force: bool,
     config_path: Optional[str], verbose: bool,
 ) -> None:
-    _entry_edit("destination", name, editor_cmd, no_prompt, config_path, verbose)
+    _entry_edit("destination", name, editor_cmd, no_prompt, force, config_path, verbose)
 
 
 # --------------------------------------------------------------------------
@@ -1463,6 +1547,8 @@ _DRY_RUN = click.option(
         "next backup is a full send and the old server copy is orphaned. The "
         "org.zfsbackup:* properties on the old ZFS dataset do not follow; "
         "--clear-stale-props removes them (refused while a daemon is running). "
+        "Renaming an enabled recursive dataset is refused when backup copies are "
+        "found below it, unless --force-copies. "
         "This does not rename the ZFS dataset."
     ),
 )
@@ -1473,13 +1559,21 @@ _DRY_RUN = click.option(
     help="Rename a dataset that has remote destinations (next backup is a full send).",
 )
 @click.option(
+    "--force-copies", is_flag=True, default=False,
+    help=(
+        "Rename an enabled recursive dataset even if backup copies are found below it "
+        "(the refusal is printed as a warning instead). Separate from --force, which "
+        "covers remote destinations."
+    ),
+)
+@click.option(
     "--clear-stale-props", is_flag=True, default=False,
     help="Clear org.zfsbackup:config and anchor.* on the old dataset after the rename.",
 )
 @_DRY_RUN
 @_common
 def rename_dataset_cmd(
-    old: str, new: str, force: bool, clear_stale_props: bool, dry_run: bool,
+    old: str, new: str, force: bool, force_copies: bool, clear_stale_props: bool, dry_run: bool,
     config_path: Optional[str], verbose: bool,
 ) -> None:
     state = _state(config_path, verbose)
@@ -1487,7 +1581,8 @@ def rename_dataset_cmd(
     snapshot = _read_with_baseline(state, resolved)
     rename.rename_dataset(
         resolved, snapshot, old, new,
-        force=force, clear_stale_props=clear_stale_props, dry_run=dry_run, warn=state.warn,
+        force=force, force_copies=force_copies, clear_stale_props=clear_stale_props,
+        dry_run=dry_run, warn=state.warn,
     )
 
 
